@@ -29,7 +29,7 @@ from sgl_jax.srt.hf_transformers_utils import (
     get_hf_text_config,
 )
 from sgl_jax.srt.server_args import ServerArgs
-from sgl_jax.srt.utils import get_bool_env_var, is_hip
+from python.sgl_jax.srt.utils.utils import get_bool_env_var, is_hip
 
 logger = logging.getLogger(__name__)
 
@@ -407,7 +407,7 @@ class ModelConfig:
 
         """
         from sgl_jax.srt.connector import create_remote_connector
-        from sgl_jax.srt.utils import is_remote_url
+        from python.sgl_jax.srt.utils.utils import is_remote_url
 
         if is_remote_url(self.model_path):
             logger.info("Pulling model configs from remote...")
