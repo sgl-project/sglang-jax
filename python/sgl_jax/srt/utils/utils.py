@@ -91,7 +91,7 @@ show_time_cost = False
 time_infos = {}
 
 HIP_FP8_E4M3_FNUZ_MAX = 224.0
-
+GBYTES = 1024 * 1024 * 1024
 
 # https://pytorch.org/docs/stable/notes/hip.html#checking-for-hip
 def is_hip() -> bool:
@@ -2892,7 +2892,6 @@ def parse_module_path(module_path, function_name, create_dummy):
         return final_module, getattr(final_module, function_name)
 
     return final_module, None
-
 
 # LoRA-related constants and utilities
 SUPPORTED_LORA_TARGET_MODULES = [
