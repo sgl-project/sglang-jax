@@ -3,8 +3,7 @@ from typing import TYPE_CHECKING, Optional
 
 import jax.numpy as jnp
 
-if TYPE_CHECKING:
-    from sgl_jax.srt.mem_cache.memory_pool import KVCache
+from sgl_jax.srt.mem_cache.memory_pool import KVCache
 
 
 class BaseTokenToKVPoolAllocator(abc.ABC):
@@ -89,20 +88,20 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
     def clear(self):
         # The padded slot 0 is used for writing dummy outputs from padded tokens.
-        self.free_pages = jnp.arange(1, self.size + 1, dtype=jnp.int32)
+        self.free_slots = jnp.arange(1, self.size + 1, dtype=jnp.int32)
         self.is_not_in_free_group = True
         self.free_group = []
 
     def available_size(self) -> int:
-        # To avoid minor "len(free_pages) * 1" overhead
-        return len(self.free_pages)
+        # To avoid minor "len(free_slots) * 1" overhead
+        return len(self.free_slots)
 
     def alloc(self, need_size: int) -> Optional[jnp.ndarray]:
-        if need_size > len(self.free_pages):
+        if need_size > self.available_size():
             return None
 
-        select_index = self.free_pages[:need_size]
-        self.free_pages = self.free_pages[need_size:]
+        select_index = self.free_slots[:need_size]
+        self.free_slots = self.free_slots[need_size:]
         return select_index
 
     def free(self, free_index: jnp.ndarray):
@@ -110,7 +109,7 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             return
 
         if self.is_not_in_free_group:
-            self.free_pages = jnp.concatenate([self.free_pages, free_index])
+            self.free_slots = jnp.concatenate([self.free_slots, free_index])
         else:
             self.free_group.append(free_index)
 
@@ -136,7 +135,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def alloc(self, need_size: int) -> Optional[jnp.ndarray]:
         # page-aligned allocation, returning contiguous indices of pages
         assert need_size % self.page_size == 0, "The allocation size should be page-aligned"
-        
+
         num_pages = need_size // self.page_size
         if num_pages > len(self.free_pages):
             return None
@@ -168,10 +167,10 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
         # Simplified allocation - for production would need more sophisticated logic
         out_indices = jnp.zeros(extend_num_tokens, dtype=jnp.int32)
-        
+
         # Update free pages
         self.free_pages = self.free_pages[total_new_pages:]
-        
+
         return out_indices
 
     def alloc_decode(
@@ -190,10 +189,10 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
         bs = len(seq_lens)
         out_indices = jnp.zeros(bs, dtype=jnp.int32)
-        
+
         # Update free pages
         self.free_pages = self.free_pages[total_new_pages:]
-        
+
         return out_indices
 
     def free(self, free_index: jnp.ndarray):
@@ -216,4 +215,4 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         return self._kvcache.get_cpu_copy(indices)
 
     def load_cpu_copy(self, kv_cache_cpu, indices):
-        return self._kvcache.load_cpu_copy(kv_cache_cpu, indices) 
+        return self._kvcache.load_cpu_copy(kv_cache_cpu, indices)

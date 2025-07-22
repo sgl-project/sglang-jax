@@ -49,9 +49,7 @@ class BaseReasoningFormatDetector:
         reasoning_text = splits[0]
         normal_text = splits[1].strip()
 
-        return StreamingParseResult(
-            normal_text=normal_text, reasoning_text=reasoning_text
-        )
+        return StreamingParseResult(normal_text=normal_text, reasoning_text=reasoning_text)
 
     def parse_streaming_increment(self, new_text: str) -> StreamingParseResult:
         """

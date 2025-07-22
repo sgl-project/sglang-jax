@@ -2,18 +2,22 @@ import heapq
 import time
 from collections import defaultdict
 from functools import partial
-from typing import TYPE_CHECKING, List, Optional, Tuple, Any
+from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import jax
 import jax.numpy as jnp
-from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
+import numpy as np
+from jax.sharding import NamedSharding
+from jax.sharding import PartitionSpec as P
 
+from sgl_jax.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sgl_jax.srt.mem_cache.base_prefix_cache import BasePrefixCache, MatchResult
 from sgl_jax.srt.mem_cache.memory_pool import ReqToTokenPool
-from sgl_jax.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+from sgl_jax.srt.utils.jax_utils import device_array
 
 if TYPE_CHECKING:
     pass
+
 
 class TreeNode:
     counter = 0
@@ -68,14 +72,11 @@ def _key_match_paged(key0: List, key1: List, page_size: int):
     return i
 
 
-class RadixCache(BasePrefixCache):    
+class RadixCache(BasePrefixCache):
     def __init__(
         self,
         req_to_token_pool: ReqToTokenPool,
         token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
-        mesh: Mesh,
-        kv_partition_axis_name: str = "tensor",
-        token_partition_axis_name: str = "data",
         page_size: int = 1,
         disable: bool = False,
         kv_head_num: int = 32,
@@ -87,7 +88,6 @@ class RadixCache(BasePrefixCache):
     ):
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
-        self.mesh = mesh
         self.page_size = page_size
         self.disable = disable
         self.kv_head_num = kv_head_num
@@ -98,63 +98,41 @@ class RadixCache(BasePrefixCache):
         self.enable_kv_cache_events = enable_kv_cache_events
         self.kv_event_queue = []
 
-        devices = jax.devices()
-        self.kv_partition_spec = P(None, None, None, None) # (layer_num, max_tokens, kv_head_num, head_dim)
-        self.token_partition_spec = P()  # (max_tokens)
-        if len(devices) > 1:
-            self.kv_partition_spec = P(None, None, kv_partition_axis_name, None)
-            self.token_partition_spec = P(token_partition_axis_name)
-
         self.process_id = jax.process_index()
         self.num_processes = jax.process_count()
         self.local_devices = jax.local_device_count()
 
+        self.cpu_device = jax.local_devices(backend="cpu")[0]
+
         if self.page_size == 1:
             self.key_match_fn = _key_match_page_size1
-            self.get_child_key_fn = lambda key: key[0]
+            self.get_child_key_fn = lambda key: int(key[0]) if hasattr(key[0], "item") else key[0]
         else:
             self.key_match_fn = partial(_key_match_paged, page_size=page_size)
-            self.get_child_key_fn = lambda key: tuple(key[:page_size])
+            # Ensure returning hashable types, convert numpy arrays to Python native types
+            self.get_child_key_fn = lambda key: tuple(
+                int(x) if hasattr(x, "item") else x for x in key[:page_size]
+            )
 
-        self._init_sharding_strategy()
+        self._init_cache_strategy()
         self.reset()
 
-    def _init_sharding_strategy(self):
+    def _init_cache_strategy(self):
         print(f"[process {self.process_id}] init JAX Radix Cache")
-        print(f"  mesh: {self.mesh}")
+        print(f"  cpu_device: {self.cpu_device}")
         print(f"  kv_head_num: {self.kv_head_num}")
         print(f"  head_dim: {self.head_dim}")
         print(f"  layer_num: {self.layer_num}")
-        
-        mesh_axis_names = self.mesh.axis_names
-        print(f"  mesh_axis_names: {mesh_axis_names}")
-            
-        self.kv_cache_sharding = NamedSharding(self.mesh, self.kv_partition_spec)
-        self.token_sharding = NamedSharding(self.mesh, self.token_partition_spec)
-        
-        print(f"  kv_cache_sharding: {self.kv_cache_sharding}")
-        print(f"  token_sharding: {self.token_sharding}")
 
-    def _create_sharded_kv_cache(self, shape: Tuple[int, ...]) -> jnp.ndarray:
-        if self.disable:
-            return jnp.zeros(shape, dtype=self.dtype)
-        
-        with self.mesh:
-            data = jnp.zeros(shape, dtype=self.dtype)
-            sharded_data = jax.device_put(data, self.kv_cache_sharding)
-            
-        return sharded_data
-
-    def _create_sharded_tokens(self, tokens: List[int]) -> jnp.ndarray:
+    def _create_tokens_data(self, tokens: List[int]) -> jnp.ndarray:
         if self.disable:
             return jnp.array(tokens, dtype=jnp.int32)
-        
-        token_array = jnp.array(tokens, dtype=jnp.int32)
-        
-        with self.mesh:
-            sharded_tokens = jax.device_put(token_array, NamedSharding(self.mesh, P()))
-            
-        return sharded_tokens
+
+        with jax.default_device(self.cpu_device):
+            token_array = jnp.array(tokens, dtype=jnp.int32)
+            cpu_tokens = jax.device_put(token_array, self.cpu_device)
+
+        return cpu_tokens
 
     def reset(self):
         self.root_node = TreeNode()
@@ -166,8 +144,13 @@ class RadixCache(BasePrefixCache):
 
     def match_prefix(self, key: List[int], **kwargs) -> MatchResult:
         if self.disable or len(key) == 0:
+            # create empty array on CPU
+            with jax.default_device(self.cpu_device):
+                empty_array = jnp.empty((0,), dtype=jnp.int32)
+                empty_array = jax.device_put(empty_array, self.cpu_device)
+
             return MatchResult(
-                device_indices=jnp.empty((0,), dtype=jnp.int32),
+                device_indices=empty_array,
                 last_device_node=self.root_node,
                 last_host_node=self.root_node,
                 host_hit_length=0,
@@ -178,7 +161,7 @@ class RadixCache(BasePrefixCache):
             key = key[:page_aligned_len]
 
         token_sequences, last_node = self._match_prefix_helper(self.root_node, key)
-        
+
         if token_sequences:
             valid_tokens = []
             for tokens in token_sequences:
@@ -187,14 +170,21 @@ class RadixCache(BasePrefixCache):
                         valid_tokens.extend(tokens)
                     elif isinstance(tokens, jnp.ndarray):
                         valid_tokens.extend(tokens.tolist())
-            
+
             if valid_tokens:
-                matched_tokens = jnp.array(valid_tokens, dtype=jnp.int32)
+                # create array on CPU
+                with jax.default_device(self.cpu_device):
+                    matched_tokens = jnp.array(valid_tokens, dtype=jnp.int32)
+                    matched_tokens = jax.device_put(matched_tokens, self.cpu_device)
             else:
-                matched_tokens = jnp.empty((0,), dtype=jnp.int32)
+                with jax.default_device(self.cpu_device):
+                    matched_tokens = jnp.empty((0,), dtype=jnp.int32)
+                    matched_tokens = jax.device_put(matched_tokens, self.cpu_device)
         else:
-            matched_tokens = jnp.empty((0,), dtype=jnp.int32)
-            
+            with jax.default_device(self.cpu_device):
+                matched_tokens = jnp.empty((0,), dtype=jnp.int32)
+                matched_tokens = jax.device_put(matched_tokens, self.cpu_device)
+
         return MatchResult(
             device_indices=matched_tokens,
             last_device_node=last_node,
@@ -207,18 +197,18 @@ class RadixCache(BasePrefixCache):
             return 0
 
         if value is None:
-            value = self._create_sharded_tokens(key)
+            value = self._create_tokens_data(key)
         elif isinstance(value, list):
-            value = self._create_sharded_tokens(value)
-        
+            value = self._create_tokens_data(value)
+
         return self._insert_helper(self.root_node, key, value)
 
     def cache_finished_req(self, req):
-        """缓存已完成的请求"""
+        """Cache completed requests"""
         if self.disable:
             kv_indices = self.req_to_token_pool.read(
-                req.req_pool_idx, 
-                len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0)
+                req.req_pool_idx,
+                len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0),
             )
             self.token_to_kv_pool_allocator.free(kv_indices)
             self.req_to_token_pool.free(req.req_pool_idx)
@@ -235,20 +225,16 @@ class RadixCache(BasePrefixCache):
             page_aligned_len = len(kv_indices)
             page_aligned_kv_indices = kv_indices
 
-        # Radix Cache 接管内存池中的一个引用
-        new_prefix_len = self.insert(
-            token_ids[:page_aligned_len], page_aligned_kv_indices
-        )
-        self.token_to_kv_pool_allocator.free(
-            kv_indices[len(req.prefix_indices):new_prefix_len]
-        )
+        # Radix Cache takes over one reference from memory pool
+        new_prefix_len = self.insert(token_ids[:page_aligned_len], page_aligned_kv_indices)
+        self.token_to_kv_pool_allocator.free(kv_indices[len(req.prefix_indices) : new_prefix_len])
 
-        # 移除请求槽位并释放缓存锁
+        # Remove request slot and release cache lock
         self.req_to_token_pool.free(req.req_pool_idx)
         self.dec_lock_ref(req.last_node)
 
     def cache_unfinished_req(self, req):
-        """缓存未完成的请求"""
+        """Cache incomplete requests"""
         if self.disable:
             return
 
@@ -263,56 +249,101 @@ class RadixCache(BasePrefixCache):
             page_aligned_kv_indices = kv_indices
         page_aligned_token_ids = token_ids[:page_aligned_len]
 
-        # Radix Cache 接管内存池中的一个引用
+        # Radix Cache takes over one reference from memory pool
         new_prefix_len = self.insert(page_aligned_token_ids, page_aligned_kv_indices)
-        self.token_to_kv_pool_allocator.free(
-            kv_indices[len(req.prefix_indices):new_prefix_len]
-        )
+        self.token_to_kv_pool_allocator.free(kv_indices[len(req.prefix_indices) : new_prefix_len])
 
-        # 前缀索引可能已更新，重新使用它
+        # Prefix indices may have been updated, reuse them
         new_match_result = self.match_prefix(page_aligned_token_ids)
-        new_indices = new_match_result.device_indices
+        new_indices = new_match_result.device_indices  # cpu
         new_last_node = new_match_result.last_device_node
-        
+
+        new_indices_device = device_array(self.req_to_token_pool.mesh, np.asarray(new_indices))
+
         self.req_to_token_pool.write(
             (req.req_pool_idx, slice(len(req.prefix_indices), len(new_indices))),
-            new_indices[len(req.prefix_indices):],
+            new_indices_device[len(req.prefix_indices) :],
         )
 
         self.dec_lock_ref(req.last_node)
         self.inc_lock_ref(new_last_node)
 
-        # `req.prefix_indices` 将在稍后的 `PrefillAdder::add_chunked_req` 中使用
+        # `req.prefix_indices` will be used later in `PrefillAdder::add_chunked_req`
         if self.page_size != 1:
-            req.prefix_indices = jnp.concatenate(
-                [new_indices, kv_indices[len(new_indices):]]
-            )
+            # create array on CPU
+            with jax.default_device(self.cpu_device):
+                req.prefix_indices = jnp.concatenate([new_indices, kv_indices[len(new_indices) :]])
+                req.prefix_indices = jax.device_put(req.prefix_indices, self.cpu_device)
         else:
             req.prefix_indices = new_indices
         req.last_node = new_last_node
 
     def get_cached_kv(self, token_ids: List[int]) -> Tuple[jnp.ndarray, int]:
         if self.disable:
-            return jnp.empty((self.layer_num, 0, self.kv_head_num, self.head_dim), dtype=self.dtype), 0
+            # create empty array on CPU
+            with jax.default_device(self.cpu_device):
+                empty_kv = jnp.empty(
+                    (self.layer_num, 0, self.kv_head_num, self.head_dim),
+                    dtype=self.dtype,
+                )
+                empty_kv = jax.device_put(empty_kv, self.cpu_device)
+            return (empty_kv, 0)
 
-        matched_tokens, last_node = self.match_prefix(token_ids)
+        match_result = self.match_prefix(token_ids)
+        matched_tokens = match_result.device_indices
+        last_node = match_result.last_device_node
         matched_len = len(matched_tokens)
 
         if matched_len == 0:
-            return jnp.empty((self.layer_num, 0, self.kv_head_num, self.head_dim), dtype=self.dtype), 0
+            # create empty array on CPU
+            with jax.default_device(self.cpu_device):
+                empty_kv = jnp.empty(
+                    (self.layer_num, 0, self.kv_head_num, self.head_dim),
+                    dtype=self.dtype,
+                )
+                empty_kv = jax.device_put(empty_kv, self.cpu_device)
+            return (empty_kv, 0)
 
-        kv_data_list = []
-        node = last_node
-        while node != self.root_node and node.value is not None:
-            if isinstance(node.value, jnp.ndarray) and node.value.ndim == 4:
-                kv_data_list.append(node.value)
-            node = node.parent
-
-        if kv_data_list:
-            kv_data_list.reverse()
-            kv_data = jnp.concatenate(kv_data_list, axis=1) 
+        # RadixCache stores token indices, not KV data directly
+        # We need to get the actual KV data from the KV pool using matched token indices
+        if matched_len == 0:
+            # No matched tokens, return empty KV data
+            with jax.default_device(self.cpu_device):
+                kv_data = jnp.empty(
+                    (self.layer_num, 0, self.kv_head_num, self.head_dim), dtype=self.dtype
+                )
+                kv_data = jax.device_put(kv_data, self.cpu_device)
         else:
-            kv_data = jnp.empty((self.layer_num, 0, self.kv_head_num, self.head_dim), dtype=self.dtype)
+            # get CPU copy of KV cache
+            kv_cache = self.token_to_kv_pool_allocator.get_kvcache()
+
+            # convert matched_tokens to numpy array for indexing
+            matched_tokens_np = jax.device_get(matched_tokens)
+
+            # get CPU copy
+            kv_cache_cpu = kv_cache.get_cpu_copy(matched_tokens_np)
+
+            # build result on CPU
+            k_data_list = []
+            v_data_list = []
+
+            for layer_id in range(self.layer_num):
+                k_host, v_host = kv_cache_cpu[layer_id]
+                k_data_list.append(k_host)
+                v_data_list.append(v_host)
+
+            # stack data on CPU
+            with jax.default_device(self.cpu_device):
+                k_data = jnp.stack(
+                    k_data_list, axis=0
+                )  # (layer_num, matched_len, head_num, head_dim)
+                v_data = jnp.stack(
+                    v_data_list, axis=0
+                )  # (layer_num, matched_len, head_num, head_dim)
+
+                # For this implementation, we return K data (could also return concatenated K,V)
+                kv_data = k_data
+                kv_data = jax.device_put(kv_data, self.cpu_device)
 
         return kv_data, matched_len
 
@@ -342,11 +373,11 @@ class RadixCache(BasePrefixCache):
             if x.lock_ref > 0:
                 continue
 
-            # 释放 KV 缓存内存
-            if x.value is not None and hasattr(x.value, '__len__'):
+            # Release KV cache memory
+            if x.value is not None and hasattr(x.value, "__len__"):
                 self.token_to_kv_pool_allocator.free(x.value)
                 num_evicted += len(x.value)
-            
+
             self._delete_leaf(x)
 
             if len(x.parent.children) == 0:
@@ -395,7 +426,7 @@ class RadixCache(BasePrefixCache):
 
     def protected_size(self):
         return self.protected_size_
-    
+
     def take_events(self):
         """Atomically takes all events and clears the queue."""
         if not self.enable_kv_cache_events:
@@ -418,11 +449,11 @@ class RadixCache(BasePrefixCache):
             prefix_len = self.key_match_fn(child.key, key)
             if prefix_len < len(child.key):
                 new_node = self._split_node(child.key, child, prefix_len)
-                token_sequences.append(new_node.key)
+                token_sequences.append(new_node.value)
                 node = new_node
                 break
             else:
-                token_sequences.append(child.key)
+                token_sequences.append(child.value)
                 node = child
                 key = key[prefix_len:]
 
@@ -437,14 +468,27 @@ class RadixCache(BasePrefixCache):
         new_node.parent = child.parent
         new_node.lock_ref = child.lock_ref
         new_node.key = child.key[:split_len]
-        
+
         if isinstance(child.value, jnp.ndarray) and child.value.ndim >= 2:
-            new_node.value = child.value[:, :split_len, :, :] if child.value.ndim == 4 else child.value[:split_len]
-            child.value = child.value[:, split_len:, :, :] if child.value.ndim == 4 else child.value[split_len:]
+            new_node.value = (
+                child.value[:, :split_len, :, :]
+                if child.value.ndim == 4
+                else child.value[:split_len]
+            )
+            child.value = (
+                child.value[:, split_len:, :, :]
+                if child.value.ndim == 4
+                else child.value[split_len:]
+            )
         else:
-            new_node.value = child.value[:split_len] if child.value else []
-            child.value = child.value[split_len:] if child.value else []
-            
+            # Handle non-ndarray values (lists, None, etc.)
+            if child.value is not None and len(child.value) > 0:
+                new_node.value = child.value[:split_len]
+                child.value = child.value[split_len:]
+            else:
+                new_node.value = []
+                child.value = []
+
         child.parent = new_node
         child.key = child.key[split_len:]
         new_node.parent.children[self.get_child_key_fn(key)] = new_node
@@ -465,11 +509,15 @@ class RadixCache(BasePrefixCache):
             prefix_len = self.key_match_fn(node.key, key)
             total_prefix_length += prefix_len
             key = key[prefix_len:]
-            
+
             if isinstance(value, jnp.ndarray) and value.ndim >= 2:
                 value = value[:, prefix_len:, :, :] if value.ndim == 4 else value[prefix_len:]
             else:
-                value = value[prefix_len:] if value else []
+                # Handle non-ndarray values (lists, None, etc.)
+                if value is not None and len(value) > 0:
+                    value = value[prefix_len:]
+                else:
+                    value = []
 
             if prefix_len < len(node.key):
                 new_node = self._split_node(node.key, node, prefix_len)
@@ -484,7 +532,7 @@ class RadixCache(BasePrefixCache):
             new_node.key = key
             new_node.value = value
             node.children[child_key] = new_node
-            
+
             node_size = self._get_node_size(new_node)
             self.evictable_size_ += node_size
 
@@ -496,13 +544,13 @@ class RadixCache(BasePrefixCache):
             value_info = f"JAX{node.value.shape}"
         elif node.value:
             value_info = f"len={len(node.value)}"
-            
+
         print(
             " " * indent,
             len(node.key),
             node.key[:10] if node.key else [],
             f"r={node.lock_ref}",
-            value_info
+            value_info,
         )
         for key, child in node.children.items():
             self._print_helper(child, indent + 2)
@@ -544,57 +592,3 @@ class RadixCache(BasePrefixCache):
                 stack.extend(cur_node.children.values())
 
         return ret_list
-
-# if __name__ == "__main__":
-#     devices = jax.devices()
-#     if len(devices) >= 4:
-#         mesh = Mesh(devices[:4], axis_names=('data', 'tensor'))
-#     else:
-#         mesh = Mesh(devices, axis_names=('data', 'tensor'))
-    
-#     print(f"mesh: {mesh}")
-    
-#     # 创建内存池和分配器
-#     req_pool = ReqToTokenPool(
-#         size=1024, 
-#         max_context_len=2048, 
-#         mesh=mesh
-#     )
-    
-#     kv_cache = MHATokenToKVPool(
-#         size=8192,
-#         page_size=1,
-#         dtype=jnp.bfloat16,
-#         head_num=32,
-#         head_dim=128,
-#         layer_num=24,
-#         mesh=mesh
-#     )
-    
-#     from .allocator import TokenToKVPoolAllocator
-#     allocator = TokenToKVPoolAllocator(
-#         size=8192,
-#         dtype=jnp.bfloat16,
-#         kvcache=kv_cache
-#     )
-    
-#     cache = RadixCache(
-#         req_to_token_pool=req_pool,
-#         token_to_kv_pool_allocator=allocator,
-#         mesh=mesh,
-#         page_size=1,
-#         kv_head_num=32,
-#         head_dim=128,
-#         layer_num=24,
-#         max_seq_len=2048,
-#         dtype=jnp.bfloat16
-#     )
-    
-#     print("\n=== JAX RadixCache 测试 ===")
-    
-#     # 基础功能测试
-#     tokens1 = [1, 2, 3, 4, 5]
-#     result1 = cache.match_prefix(tokens1)
-#     print(f"匹配结果: {result1.device_indices.shape}")
-    
-#     cache.pretty_print()

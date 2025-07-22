@@ -1,5 +1,5 @@
 import abc
-from typing import Any, List, NamedTuple, Optional, Tuple, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, List, NamedTuple, Optional, Tuple
 
 import jax.numpy as jnp
 
@@ -21,6 +21,7 @@ class MatchResult(NamedTuple):
         host_hit_length :   Length of the KV cache hit on the host, if applicable.
                             0 if HiCache is not enabled.
     """
+
     device_indices: jnp.ndarray
     last_device_node: Optional[TreeNode]
     last_host_node: Optional[TreeNode]
@@ -102,4 +103,4 @@ class BasePrefixCache(abc.ABC):
         raise NotImplementedError()
 
     def take_events(self):
-        return [] 
+        return []

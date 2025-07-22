@@ -5,9 +5,7 @@ import logging
 import pkgutil
 from dataclasses import dataclass, field
 from functools import lru_cache
-from typing import AbstractSet, Dict, List, Optional, Tuple, Type, Union
-
-import torch.nn as nn
+from typing import AbstractSet, Any, Dict, List, Optional, Tuple, Type, Union
 
 logger = logging.getLogger(__name__)
 
@@ -15,7 +13,7 @@ logger = logging.getLogger(__name__)
 @dataclass
 class _ModelRegistry:
     # Keyed by model_arch
-    models: Dict[str, Union[Type[nn.Module], str]] = field(default_factory=dict)
+    models: Dict[str, Union[Type[Any], str]] = field(default_factory=dict)
 
     def get_supported_archs(self) -> AbstractSet[str]:
         return self.models.keys()
@@ -34,7 +32,7 @@ class _ModelRegistry:
             f"Supported architectures: {all_supported_archs}"
         )
 
-    def _try_load_model_cls(self, model_arch: str) -> Optional[Type[nn.Module]]:
+    def _try_load_model_cls(self, model_arch: str) -> Optional[Type[Any]]:
         if model_arch not in self.models:
             return None
 
@@ -50,9 +48,7 @@ class _ModelRegistry:
             logger.warning("No model architectures are specified")
 
         # filter out support architectures
-        normalized_arch = list(
-            filter(lambda model: model in self.models, architectures)
-        )
+        normalized_arch = list(filter(lambda model: model in self.models, architectures))
 
         # make sure Transformers backend is put at the last as a fallback
         if len(normalized_arch) != len(architectures):
@@ -62,7 +58,7 @@ class _ModelRegistry:
     def resolve_model_cls(
         self,
         architectures: Union[str, List[str]],
-    ) -> Tuple[Type[nn.Module], str]:
+    ) -> Tuple[Type[Any], str]:
         architectures = self._normalize_archs(architectures)
 
         for arch in architectures:
@@ -76,7 +72,7 @@ class _ModelRegistry:
 @lru_cache()
 def import_model_classes():
     model_arch_name_to_cls = {}
-    package_name = "sglang.srt.models"
+    package_name = "sgl_jax.srt.models"
     package = importlib.import_module(package_name)
     for _, name, ispkg in pkgutil.iter_modules(package.__path__, package_name + "."):
         if not ispkg:
@@ -87,9 +83,7 @@ def import_model_classes():
                 continue
             if hasattr(module, "EntryClass"):
                 entry = module.EntryClass
-                if isinstance(
-                    entry, list
-                ):  # To support multiple model classes in one module
+                if isinstance(entry, list):  # To support multiple model classes in one module
                     for tmp in entry:
                         assert (
                             tmp.__name__ not in model_arch_name_to_cls

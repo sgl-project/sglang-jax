@@ -1,11 +1,8 @@
-# Adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/config.py
 import enum
 import json
 import logging
 from dataclasses import dataclass, field
 from typing import List, Optional, Union
-
-from sgl_jax.srt.utils.utils import is_hip
 
 logger = logging.getLogger(__name__)
 
@@ -74,16 +71,3 @@ class LoadConfig:
 
         load_format = self.load_format.lower()
         self.load_format = LoadFormat(load_format)
-
-        rocm_not_supported_load_format: List[str] = []
-        if is_hip() and load_format in rocm_not_supported_load_format:
-            rocm_supported_load_format = [
-                f
-                for f in LoadFormat.__members__
-                if (f not in rocm_not_supported_load_format)
-            ]
-            raise ValueError(
-                f"load format '{load_format}' is not supported in ROCm. "
-                f"Supported load formats are "
-                f"{rocm_supported_load_format}"
-            )
