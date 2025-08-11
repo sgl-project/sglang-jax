@@ -1,16 +1,3 @@
-# Copyright 2023-2024 SGLang Team
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-# ==============================================================================
 """
 Store information about a forward batch.
 
@@ -32,14 +19,18 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import IntEnum, auto
 from functools import total_ordering
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 import jax
 
 if TYPE_CHECKING:
     from sgl_jax.srt.layers.attention.base_attn_backend import AttentionBackend
-    from sgl_jax.srt.mem_cache.memory_pool import KVCache, ReqToTokenPool
+    from sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch
+    from sgl_jax.srt.mem_cache.memory_pool import KVCache
     from sgl_jax.srt.model_executor.model_runner import ModelRunner
+    from sgl_jax.srt.sampling.sampling_batch_info import SamplingBatchInfo
+
+from jax.tree_util import register_pytree_node_class
 
 
 class ForwardMode(IntEnum):
@@ -131,6 +122,7 @@ class CaptureHiddenMode(IntEnum):
         return self.value < other.value
 
 
+@register_pytree_node_class
 @dataclass
 class ForwardBatch:
     """Store all inputs of a forward pass."""
@@ -141,10 +133,10 @@ class ForwardBatch:
     batch_size: int
     # The input ids [total_tokens]
     input_ids: jax.Array
+    # The indices of requests in the req_to_token_pool
+    req_pool_indices: jax.Array
     # The sequence length for each request [batch_size]
     seq_lens: jax.Array
-    # cache loc
-    cache_loc: jax.Array
     # decode token position in kv cache
     out_cache_loc: jax.Array
     # Position information [total_tokens]
@@ -153,10 +145,71 @@ class ForwardBatch:
     extend_start_loc: jax.Array = None
 
     # kv cache
-    req_to_token_pool: ReqToTokenPool = None
     token_to_kv_pool: KVCache = None
     attn_backend: AttentionBackend = None
 
+    cache_loc: jax.Array = None
+
+    # For extend
+    extend_prefix_lens: Optional[jax.Array] = None
+    extend_seq_lens: Optional[jax.Array] = None
+
+    def print_array_shape(self):
+        print(f"================ForwardBatch Jax Array Shape ")
+        print(f"input_ids.sharding: {self.input_ids.sharding}")
+        print(f"req_pool_indices.sharding: {self.req_pool_indices.sharding}")
+        print(f"seq_lens.sharding: {self.seq_lens.sharding}")
+        print(f"out_cache_loc.sharding: {self.out_cache_loc.sharding}")
+        print(f"positions.sharding: {self.positions.sharding}")
+        print(f"extend_start_loc.sharding: {self.extend_start_loc.sharding}")
+        print(f"cache_loc.sharding: {self.cache_loc.sharding}")
+        print(f"extend_prefix_lens.sharding: {self.extend_prefix_lens.sharding if self.extend_prefix_lens is not None and isinstance(self.extend_prefix_lens,jax.Array) else self.forward_mode}")
+        print(f"extend_seq_lens.sharding: {self.extend_seq_lens.sharding if self.extend_seq_lens is not None and isinstance(self.extend_prefix_lens,jax.Array) else self.forward_mode}")
+
+        self.token_to_kv_pool.print_array_shape()
+        self.attn_backend.print_array_shape()
+
+    def tree_flatten(self):
+        children = (
+            self.input_ids,
+            self.req_pool_indices,
+            self.seq_lens,
+            self.out_cache_loc,
+            self.positions,
+            self.extend_start_loc,
+            self.token_to_kv_pool,
+            self.attn_backend,
+            self.cache_loc,
+            self.extend_prefix_lens,
+            self.extend_seq_lens,
+        )
+
+        aux_data = {
+            "forward_mode": self.forward_mode,
+            "batch_size": self.batch_size,
+        }
+        return (children, aux_data)
+
+    @classmethod
+    def tree_unflatten(cls, aux_data, children):
+        obj = cls.__new__(cls)
+
+        obj.forward_mode = aux_data["forward_mode"]
+        obj.batch_size = aux_data["batch_size"]
+
+        obj.input_ids = children[0]
+        obj.req_pool_indices = children[1]
+        obj.seq_lens = children[2]
+        obj.out_cache_loc = children[3]
+        obj.positions = children[4]
+        obj.extend_start_loc = children[5]
+        obj.token_to_kv_pool = children[6]
+        obj.attn_backend = children[7]
+        obj.cache_loc = children[8]
+        obj.extend_prefix_lens = children[9]
+        obj.extend_seq_lens = children[10]
+
+        return obj
 
     @classmethod
     def init_new(
@@ -169,11 +222,13 @@ class ForwardBatch:
             batch_size=len(batch.seq_lens),
             input_ids=batch.input_ids,
             seq_lens=batch.seq_lens,
-            cache_loc=batch.cache_loc,
             out_cache_loc=batch.out_cache_loc,
             positions=batch.positions,
             extend_start_loc=batch.extend_start_loc,
-            req_to_token_pool=model_runner.req_to_token_pool,
+            req_pool_indices=batch.req_pool_indices,
             token_to_kv_pool=model_runner.token_to_kv_pool,
             attn_backend=model_runner.attn_backend,
+            cache_loc=batch.cache_loc,
+            extend_prefix_lens=batch.extend_prefix_lens,
+            extend_seq_lens=batch.extend_seq_lens,
         )

@@ -1,18 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
-from typing import Any, List, Tuple
-
-GBYTES = 1024 * 1024 * 1024
-
-_megacore = False
-
-
-def enable_megacore() -> None:
-    global _megacore
-    _megacore = True
-
-
-def get_megacore() -> bool:
-    return _megacore
+import jax
+import jax.numpy as jnp
+from jax.sharding import NamedSharding, PartitionSpec
 
 
 def get_num_kv_heads_by_tp(num_kv_heads: int, tp_size: int) -> int:
@@ -24,33 +13,54 @@ def get_num_kv_heads_by_tp(num_kv_heads: int, tp_size: int) -> int:
         return tp_size
 
 
-def hbm_usage_bytes(devices: Any) -> List[Tuple[int, int]]:
-    usage = []
-    for device in devices:
-        hbm_used = device.memory_stats()["bytes_in_use"]
-        hbm_limit = device.memory_stats()["bytes_limit"]
-        usage.append((hbm_used, hbm_limit))
+def get_available_device_memory(device, distributed=False, empty_cache=True):
+    """
+    Get available memory for device:device_id.
+    When distributed is True, the available memory is the minimum available memory of all devices.
+    """
+    if device == "tpu":
+        devices = jax.local_devices()
+        if empty_cache:
+            jax.clear_caches()
+        avail_mem = []
+        for dev in devices:
+            stats = dev.memory_stats()
+            avail_mem.append(stats["bytes_limit"] - stats["bytes_in_use"])
+        avail_mem = jnp.array([min(avail_mem) / (1 << 10)], dtype=jnp.float32)
+    elif device == "cpu":
+        import psutil
 
-    return usage
-
-
-def hbm_usage_gb(devices: Any) -> List[Tuple[float, float]]:
-    usage = hbm_usage_bytes(devices)
-    usage = [(round(used / GBYTES, 2), round(limit / GBYTES, 2))
-             for used, limit in usage]
-    return usage
-
-
-def get_padded_head_dim(head_dim: int) -> int:
-    """Pads head_dim up to the nearest multiple of 128 for kernel performance."""
-    # Details can be seen at: tpu_commons/kernels/ragged_kv_cache_update.py::_kv_cache_update()
-    return (head_dim + 127) // 128 * 128
-
-
-def get_padded_num_heads(num_heads: int, sharding_size: int) -> int:
-    if num_heads >= sharding_size:
-        assert num_heads % sharding_size == 0
+        memory = psutil.virtual_memory()
+        free_gpu_memory = memory.available
+        avail_mem = jnp.array([free_gpu_memory / (1 << 10)], dtype=jnp.float32)
     else:
-        assert sharding_size % num_heads == 0
-        num_heads = sharding_size
-    return num_heads
+        raise ValueError(f"Invalid device: {device}")
+
+    if distributed:
+
+        # Use pmap to find the minimum available memory across all devices.
+        mesh = jax.make_mesh((jax.process_count(), 4), ("node", "device"))
+
+        with jax.sharding.use_mesh(mesh=mesh):
+
+            @jax.shard_map(mesh=mesh, in_specs=PartitionSpec(None), out_specs=PartitionSpec(None))
+            def _get_available_memory_distributed(a):
+                return jax.lax.pmin(a, axis_name="node")
+
+        # We broadcast the local min memory to all devices and then find the global min.
+        # i64 dtype cannot be all-reduce min
+        assert (
+            avail_mem.dtype != jnp.float64 and avail_mem.dtype != jnp.int64
+        ), "avail_mem must be i32 dtype"
+        global_min_mem = _get_available_memory_distributed(avail_mem)[0]
+        free_gpu_memory = global_min_mem.item()
+    else:
+        free_gpu_memory = avail_mem.min().item()
+
+    return int(free_gpu_memory * (1 << 10))
+
+
+def device_array(mesh, data, sharding=None, **kwargs) -> jax.Array:
+    if sharding is None:
+        sharding = NamedSharding(mesh, PartitionSpec(None))
+    return jax.device_put(data, device=sharding, **kwargs)

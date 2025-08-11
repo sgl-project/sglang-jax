@@ -1,0 +1,97 @@
+import logging
+from pathlib import Path
+from typing import Optional
+
+import jax
+
+from sgl_jax.srt.managers.io_struct import ProfileReq, ProfileReqOutput, ProfileReqType
+
+logger = logging.getLogger(__name__)
+
+
+class SchedulerProfilerMixin:
+    def init_profier(self):
+        self.profiler_output_dir: Optional[str] = None
+        self.profile_id: Optional[str] = None
+        self.profiler_start_forward_ct: Optional[int] = None
+        self.profiler_target_forward_ct: Optional[int] = None
+        self.profile_steps: Optional[int] = None
+        self.profile_in_progress: bool = False
+
+    def start_profile(
+        self,
+        output_dir: Optional[str],
+        start_step: Optional[int],
+        num_steps: Optional[int],
+        profile_id: str,
+    ) -> ProfileReqOutput:
+        if self.profile_in_progress:
+            return ProfileReqOutput(
+                success=False,
+                message="Profiling is already in progress. Call /stop_profile first.",
+            )
+
+        if output_dir is None:
+            output_dir = os.getenv("SGLANG_JAX_PROFILER_DIR", "/tmp")
+
+        self.profiler_output_dir = output_dir
+        self.profile_id = profile_id
+
+        if start_step:
+            self.profiler_start_forward_ct = max(start_step, self.forward_ct + 1)
+
+        if num_steps:
+            self.profile_steps = num_steps
+            if start_step:
+                self.profiler_target_forward_ct = self.profiler_start_forward_ct + num_steps
+            else:
+                self.profiler_target_forward_ct = self.forward_ct + num_steps
+            # The caller will be notified when reaching profiler_target_forward_ct
+        else:
+            self.profiler_target_forward_ct = None
+
+        if start_step:
+            return ProfileReqOutput(success=True, message="Succeeded")
+
+        logger.info(
+            f"Profiling starts. Traces will be saved to: {self.profiler_output_dir} (with profile id: {self.profile_id})",
+        )
+        jax.profiler.start_trace(self.profiler_output_dir)
+        self.profile_in_progress = True
+        return ProfileReqOutput(success=True, message="Succeeded")
+
+    def stop_profile(self) -> ProfileReqOutput | None:
+        if not self.profile_in_progress:
+            return ProfileReqOutput(
+                success=False,
+                message="Profiling is not in progress. Call /start_profile first.",
+            )
+
+        if not Path(self.profiler_output_dir).exists():
+            Path(self.profiler_output_dir).mkdir(parents=True, exist_ok=True)
+
+        logger.info("Stop profiling...")
+        jax.profiler.stop_trace()
+
+        logger.info(
+            "Profiling done. Traces are saved to: %s",
+            self.profiler_output_dir,
+        )
+        self.profile_in_progress = False
+        self.profiler_start_forward_ct = None
+
+        return ProfileReqOutput(success=True, message="Succeeded.")
+
+    def _profile_batch_predicate(self, batch):
+        if self.profiler_target_forward_ct and self.profiler_target_forward_ct <= self.forward_ct:
+            self.stop_profile()
+        if self.profiler_start_forward_ct and self.profiler_start_forward_ct == self.forward_ct:
+            self.start_profile(self.profiler_output_dir, None, self.profile_steps, self.profile_id)
+
+    def profile(self, recv_req: ProfileReq):
+        if recv_req.type == ProfileReqType.START_PROFILE:
+            return self.start_profile(
+                recv_req.output_dir, recv_req.start_step, recv_req.num_steps, recv_req.profile_id
+            )
+        else:
+            return self.stop_profile()

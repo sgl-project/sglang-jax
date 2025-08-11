@@ -1,0 +1,83 @@
+name: PR Test
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+concurrency:
+  group: pr-test-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # check-changes:
+  #   runs-on: ubuntu-latest
+  #   outputs:
+  #     src: ${{ steps.filter.outputs.src }}
+  #   steps:
+  #     - name: Checkout code
+  #       uses: actions/checkout@v4
+
+      # TODO: use it after public
+      # - name: Detect file changes
+      #   id: filter
+      #   uses: dorny/paths-filter@v3
+      #   with:
+      #     filters: |
+      #       src:
+      #         - "python/**"
+      #         - "scripts/**"
+      #         - "test/**"
+      #         - ".github/workflows/pr-test.yml"
+
+  simple-test:
+    # needs: check-changes
+    if: github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - name: Install the latest version of uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          version: "latest"
+          python-version: "3.10"
+      - name: Install skypilot and login
+        run: |
+          uv venv --seed ~/sky
+          source ~/sky/bin/activate
+          uv pip install 'skypilot[gcp]'
+      - name: Run SkyPilot job
+        run: |
+          source ~/sky/bin/activate
+          sky api login --endpoint ${{ secrets.SKYPILOT_ENDPOINT }}
+      - name: Launch Server
+        run: |
+          source ~/sky/bin/activate
+          export USERNAME=${{ secrets.USERNAME }}
+          export GIT_TOKEN=${{ secrets.GIT_TOKEN }}
+          bash scripts/launch_tpu.sh tpu-v6e-1 ${{ github.ref }}
+      - name: Run test
+        timeout-minutes: 10
+        run: |
+          source ~/sky/bin/activate
+          sky exec sgl-jax-ci-tpu-v6e-1 -- "cd sgl-jax && uv run python test/srt/run_suite.py --suite per-commit" 
+
+  pr-test-finish:
+    needs: [
+      simple-test,
+    ]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check all dependent job statuses
+        run: |
+          results=(${{ join(needs.*.result, ' ') }})
+          for result in "${results[@]}"; do
+            if [ "$result" = "failure" ] || [ "$result" = "cancelled" ]; then
+              echo "Job failed with result: $result"
+              exit 1
+            fi
+          done
+          echo "All jobs completed successfully"
+          exit 0

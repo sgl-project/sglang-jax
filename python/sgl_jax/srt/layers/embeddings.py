@@ -58,7 +58,7 @@ class Embed(nnx.Module):
         None
         """
         self.embedding = nnx.Param(
-            nnx.with_partitioning(default_embed_init, (None, "tensor"))(
+            nnx.with_partitioning(default_embed_init, (None, None))(
                 rngs.params(), (num_embeddings, features), param_dtype
             )
         )
@@ -79,13 +79,10 @@ class Embed(nnx.Module):
           with an additional `features` dimension appended.
         """
         if not jnp.issubdtype(inputs.dtype, jnp.integer):
-            raise ValueError(
-                'Input type must be an integer or unsigned integer.')
+            raise ValueError("Input type must be an integer or unsigned integer.")
         # Use take because fancy indexing numpy arrays with JAX indices does not
         # work correctly.
-        (embedding,) = self.promote_dtype(
-            (self.embedding.value,), dtype=self.dtype, inexact=False
-        )
+        (embedding,) = self.promote_dtype((self.embedding.value,), dtype=self.dtype, inexact=False)
         if self.num_embeddings == 1:
             return jnp.broadcast_to(embedding, inputs.shape + (self.features,))
         return jnp.take(embedding, inputs, axis=0)
@@ -103,9 +100,7 @@ class Embed(nnx.Module):
           Commonly used for weight-sharing between embeddings and logit transform
           in NLP models.
         """
-        query, embedding = self.promote_dtype(
-            (query, self.embedding.value), dtype=self.dtype
-        )
+        query, embedding = self.promote_dtype((query, self.embedding.value), dtype=self.dtype)
         return jnp.dot(query, embedding.T)
 
 
@@ -124,13 +119,12 @@ class ParallelLMHead(Embed):
             features=features,
             dtype=dtype,
             param_dtype=param_dtype,
-            rngs=rngs
+            rngs=rngs,
         )
         if use_bias:
             self.bias = nnx.Param(
                 nnx.with_partitioning(nnx.initializers.constant(0.0), (None, "tensor"))(
-                    rngs.params(), (self.num_embeddings,
-                                    self.features), dtype
+                    rngs.params(), (self.num_embeddings, self.features), dtype
                 )
             )
         else:
@@ -144,6 +138,7 @@ class ParallelLMHead(Embed):
     def __call__(self, input_):
         del input_
         raise RuntimeError("LMHead's weights should be used in the sampler.")
+
 
 class RotaryEmbedding(nnx.Module):
     """Rotary Position Embedding.
@@ -195,16 +190,20 @@ class RotaryEmbedding(nnx.Module):
           a Tuple of jax.Array of shape [B*S, H] which includes the inputs together with
           the rotary position embedding incorporated in it.
         """
-        return rotary_embedding_forward(positions, query, key, self.cos_sin_cache, self.rotary_dim, self.head_size, self.is_neox_style)
+        return rotary_embedding_forward(
+            positions,
+            query,
+            key,
+            self.cos_sin_cache,
+            self.rotary_dim,
+            self.head_size,
+            self.is_neox_style,
+        )
 
     def _compute_inv_freq(self, base: Union[int, float]) -> jax.Array:
         """Compute the inverse frequency."""
         inv_freq = 1.0 / (
-            base
-            ** (
-                jnp.arange(0, self.rotary_dim, 2,
-                           dtype=jnp.float32) / self.rotary_dim
-            )
+            base ** (jnp.arange(0, self.rotary_dim, 2, dtype=jnp.float32) / self.rotary_dim)
         )
         return inv_freq
 
@@ -218,7 +217,7 @@ class RotaryEmbedding(nnx.Module):
         return cache
 
 
-@partial(jax.jit, static_argnames=["rotary_dim", "head_size", "is_neox_style"])
+#@partial(jax.jit, static_argnames=["rotary_dim", "head_size", "is_neox_style"])
 def rotary_embedding_forward(
     positions: jax.Array,
     query: jax.Array,
@@ -228,8 +227,7 @@ def rotary_embedding_forward(
     head_size: int,
     is_neox_style: bool,
 ) -> Tuple[jax.Array, jax.Array]:
-    """Rotary Position Embedding.
-    """
+    """Rotary Position Embedding."""
     positions = positions.flatten()
     num_tokens = positions.shape[0]
     cos_sin = cos_sin_cache.take(positions, axis=0)
@@ -237,22 +235,21 @@ def rotary_embedding_forward(
 
     query_shape = query.shape
     query = query.reshape(num_tokens, -1, head_size)
-    query_rot = query[..., : rotary_dim]
+    query_rot = query[..., :rotary_dim]
     query_pass = query[..., rotary_dim:]
     query_rot = _apply_rotary_emb(query_rot, cos, sin, is_neox_style)
-    query = jnp.concatenate((query_rot, query_pass),
-                            axis=-1).reshape(query_shape)
+    query = jnp.concatenate((query_rot, query_pass), axis=-1).reshape(query_shape)
 
     key_shape = key.shape
     key = key.reshape(num_tokens, -1, head_size)
-    key_rot = key[..., : rotary_dim]
+    key_rot = key[..., :rotary_dim]
     key_pass = key[..., rotary_dim:]
     key_rot = _apply_rotary_emb(key_rot, cos, sin, is_neox_style)
     key = jnp.concatenate((key_rot, key_pass), axis=-1).reshape(key_shape)
     return query, key
 
 
-@partial(jax.jit, static_argnames=["is_neox_style"])
+#@partial(jax.jit, static_argnames=["is_neox_style"])
 def _apply_rotary_emb(
     x: jax.Array,
     cos: jax.Array,
