@@ -88,7 +88,9 @@ class SamplingBatchInfo:
     @classmethod
     def generate_for_precompile(cls, bs: int, vocab_size: int, mesh: mesh_lib.Mesh):
         # device = batch.device
-        temperatures = jnp.array([1.0 for _ in range(bs)], dtype=jnp.float32).reshape(-1, 1)
+        temperatures = jnp.array([1.0 for _ in range(bs)], dtype=jnp.float32).reshape(
+            -1, 1
+        )
         top_ps = jnp.array([1.0 for _ in range(bs)], dtype=jnp.float32)
         top_ks = jnp.array([-1 for _ in range(bs)], dtype=jnp.int32)
         min_ps = jnp.array([0.0 for _ in range(bs)], dtype=jnp.float32)
@@ -194,7 +196,6 @@ class SamplingBatchInfo:
         self.need_top_p_sampling |= other.need_top_p_sampling
         self.need_top_k_sampling |= other.need_top_k_sampling
         self.need_min_p_sampling |= other.need_min_p_sampling
-
 
 
 def merge_bias_tensor(

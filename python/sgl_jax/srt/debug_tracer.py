@@ -73,7 +73,11 @@ class TensorJSONEncoder(json.JSONEncoder):
                     "__tensor_type__": "jax",
                     "shape": list(obj.shape),
                     "dtype": str(obj.dtype),
-                    "data": (obj.tolist() if obj.size < 100 else f"<array too large: {obj.shape}>"),
+                    "data": (
+                        obj.tolist()
+                        if obj.size < 100
+                        else f"<array too large: {obj.shape}>"
+                    ),
                 }
             except Exception:
                 return {
@@ -129,7 +133,9 @@ class UnifiedDebugTracer:
                 if model_path:
                     auto_tokenizer = get_tokenizer(model_path, trust_remote_code=True)
                     self._tokenizer = auto_tokenizer
-                    print(f"Tokenizer automatically extracted from model config: {model_path}")
+                    print(
+                        f"Tokenizer automatically extracted from model config: {model_path}"
+                    )
             except Exception as e:
                 print(f"Warning: Could not auto-extract tokenizer from model: {str(e)}")
 
@@ -237,17 +243,24 @@ class UnifiedDebugTracer:
             if isinstance(input_ids[0], list):  # Batch
                 input_texts = []
                 for seq in input_ids:
-                    input_texts.append(self._tokenizer.decode(seq, skip_special_tokens=False))
+                    input_texts.append(
+                        self._tokenizer.decode(seq, skip_special_tokens=False)
+                    )
                 return {
                     "input_text": input_texts,
                     "input_text_clean": [
-                        self._tokenizer.decode(seq, skip_special_tokens=True) for seq in input_ids
+                        self._tokenizer.decode(seq, skip_special_tokens=True)
+                        for seq in input_ids
                     ],
                 }
             else:
                 return {
-                    "input_text": self._tokenizer.decode(input_ids, skip_special_tokens=False),
-                    "input_text_clean": self._tokenizer.decode(input_ids, skip_special_tokens=True),
+                    "input_text": self._tokenizer.decode(
+                        input_ids, skip_special_tokens=False
+                    ),
+                    "input_text_clean": self._tokenizer.decode(
+                        input_ids, skip_special_tokens=True
+                    ),
                 }
         except Exception as e:
             return {"input_decode_error": str(e)}
@@ -262,7 +275,9 @@ class UnifiedDebugTracer:
 
                 predicted_tokens = []
                 for token_id in predicted_token_ids:
-                    token_text = self._tokenizer.decode([token_id], skip_special_tokens=False)
+                    token_text = self._tokenizer.decode(
+                        [token_id], skip_special_tokens=False
+                    )
                     predicted_tokens.append(
                         {
                             "token_id": token_id,
@@ -279,7 +294,9 @@ class UnifiedDebugTracer:
                     top_logits, top_indices = torch.topk(logits, top_k, dim=-1)
                     top_predictions = []
 
-                    for logit_vals, token_ids in zip(top_logits.cpu(), top_indices.cpu()):
+                    for logit_vals, token_ids in zip(
+                        top_logits.cpu(), top_indices.cpu()
+                    ):
                         if len(logit_vals.shape) == 0:
                             logit_vals = [logit_vals.item()]
                             token_ids = [token_ids.item()]
@@ -298,7 +315,9 @@ class UnifiedDebugTracer:
                                     "logit": logit_val,
                                     "token_text": token_text,
                                     "probability": float(
-                                        torch.softmax(torch.tensor([logit_val]), dim=0)[0].item()
+                                        torch.softmax(torch.tensor([logit_val]), dim=0)[
+                                            0
+                                        ].item()
                                     ),
                                 }
                             )
@@ -320,22 +339,33 @@ class UnifiedDebugTracer:
             complete_conversation = ""
             all_tokens = []
 
-            if self._tokenizer and self._accumulated_inputs and self._accumulated_outputs:
+            if (
+                self._tokenizer
+                and self._accumulated_inputs
+                and self._accumulated_outputs
+            ):
                 try:
                     for step_input in self._accumulated_inputs:
                         if "input_ids" in step_input:
                             input_ids = step_input["input_ids"]
                             if isinstance(input_ids, list):
-                                if len(input_ids) > 0 and isinstance(input_ids[0], list):
+                                if len(input_ids) > 0 and isinstance(
+                                    input_ids[0], list
+                                ):
                                     all_tokens.extend(input_ids[0])
                                 else:
                                     all_tokens.extend(input_ids)
 
                     for step_output in self._accumulated_outputs:
                         predicted_tokens = step_output.get("predicted_tokens", [])
-                        if isinstance(predicted_tokens, list) and len(predicted_tokens) > 0:
+                        if (
+                            isinstance(predicted_tokens, list)
+                            and len(predicted_tokens) > 0
+                        ):
                             if isinstance(predicted_tokens[0], dict):
-                                all_tokens.extend([t.get("token_id", 0) for t in predicted_tokens])
+                                all_tokens.extend(
+                                    [t.get("token_id", 0) for t in predicted_tokens]
+                                )
 
                     if all_tokens:
                         complete_conversation = self._tokenizer.decode(
@@ -349,7 +379,9 @@ class UnifiedDebugTracer:
                 "session_info": {
                     "total_forward_steps": self._forward_count,
                     "session_duration": (
-                        time.time() - self._session_start_time if self._session_start_time else 0
+                        time.time() - self._session_start_time
+                        if self._session_start_time
+                        else 0
                     ),
                     "session_status": "completed",
                     "model_class": self._model_class_name,
@@ -359,7 +391,9 @@ class UnifiedDebugTracer:
                 "step_by_step_outputs": self._accumulated_outputs,
                 "all_forward_records": all_records,
                 "summary": {
-                    "total_tensor_records": sum(len(records) for records in all_records.values()),
+                    "total_tensor_records": sum(
+                        len(records) for records in all_records.values()
+                    ),
                     "record_keys": list(all_records.keys()),
                     "successful_steps": len(self._accumulated_outputs),
                     "has_complete_conversation": len(complete_conversation) > 0,
@@ -369,7 +403,9 @@ class UnifiedDebugTracer:
 
             timestamp = int(time.time())
             if self._model_class_name:
-                filename = f"{self._model_class_name}_inference_session_{timestamp}.json"
+                filename = (
+                    f"{self._model_class_name}_inference_session_{timestamp}.json"
+                )
             else:
                 filename = f"inference_session_{timestamp}.json"
 
@@ -378,7 +414,9 @@ class UnifiedDebugTracer:
             filepath = os.path.join(debug_dir, filename)
 
             with open(filepath, "w", encoding="utf-8") as f:
-                json.dump(debug_info, f, indent=2, ensure_ascii=False, cls=TensorJSONEncoder)
+                json.dump(
+                    debug_info, f, indent=2, ensure_ascii=False, cls=TensorJSONEncoder
+                )
 
             self._accumulated_inputs = []
             self._accumulated_outputs = []
@@ -406,7 +444,9 @@ class UnifiedDebugTracer:
                 "session_info": {
                     "total_forward_steps": self._forward_count,
                     "session_duration": (
-                        time.time() - self._session_start_time if self._session_start_time else 0
+                        time.time() - self._session_start_time
+                        if self._session_start_time
+                        else 0
                     ),
                     "session_status": "forced_save_in_progress",
                     "model_class": self._model_class_name,
@@ -415,7 +455,9 @@ class UnifiedDebugTracer:
                 "step_by_step_outputs": self._accumulated_outputs,
                 "all_forward_records": all_records,
                 "summary": {
-                    "total_tensor_records": sum(len(records) for records in all_records.values()),
+                    "total_tensor_records": sum(
+                        len(records) for records in all_records.values()
+                    ),
                     "record_keys": list(all_records.keys()),
                     "successful_steps": len(self._accumulated_outputs),
                 },
@@ -426,7 +468,9 @@ class UnifiedDebugTracer:
             filepath = os.path.join(debug_dir, filename)
 
             with open(filepath, "w", encoding="utf-8") as f:
-                json.dump(debug_info, f, indent=2, ensure_ascii=False, cls=TensorJSONEncoder)
+                json.dump(
+                    debug_info, f, indent=2, ensure_ascii=False, cls=TensorJSONEncoder
+                )
 
             print(f"Forced save completed: {filepath}")
             return filepath
@@ -546,7 +590,9 @@ class UnifiedDebugTracer:
                     module_type = "embedding"
                     layer_id = "all"
                 elif (
-                    "rmsnorm" in stage_lower or "layernorm" in stage_lower or "norm" in stage_lower
+                    "rmsnorm" in stage_lower
+                    or "layernorm" in stage_lower
+                    or "norm" in stage_lower
                 ):
                     module_type = "layernorm"
                     # Check if it's final norm
@@ -597,7 +643,9 @@ class UnifiedDebugTracer:
                     can_concretize = True
                 else:
                     # If no jax available, try using basic attributes
-                    can_concretize = hasattr(tensor, "shape") and hasattr(tensor, "dtype")
+                    can_concretize = hasattr(tensor, "shape") and hasattr(
+                        tensor, "dtype"
+                    )
             except Exception:
                 can_concretize = False
 
@@ -665,7 +713,9 @@ class UnifiedDebugTracer:
                     module_type = "embedding"
                     layer_id = "all"
                 elif (
-                    "rmsnorm" in stage_lower or "layernorm" in stage_lower or "norm" in stage_lower
+                    "rmsnorm" in stage_lower
+                    or "layernorm" in stage_lower
+                    or "norm" in stage_lower
                 ):
                     module_type = "layernorm"
                     # Check if it's final norm
@@ -756,7 +806,9 @@ class UnifiedDebugTracer:
     def disable(self):
         self.enabled = False
 
-    def compare_frameworks(self, jax_key: str, pytorch_key: str, tolerance: float = 1e-5) -> bool:
+    def compare_frameworks(
+        self, jax_key: str, pytorch_key: str, tolerance: float = 1e-5
+    ) -> bool:
         jax_records = self.get_records(jax_key)
         pytorch_records = self.get_records(pytorch_key)
 
@@ -796,7 +848,9 @@ class UnifiedDebugTracer:
                 if flag in jax_record and flag in pytorch_record:
                     match = jax_record[flag] == pytorch_record[flag]
                     status = "✅" if match else "❌"
-                    print(f"  {flag}: {jax_record[flag]} vs {pytorch_record[flag]} {status}")
+                    print(
+                        f"  {flag}: {jax_record[flag]} vs {pytorch_record[flag]} {status}"
+                    )
                     if not match:
                         all_match = False
 
@@ -804,7 +858,9 @@ class UnifiedDebugTracer:
 
         return all_match
 
-    def compare_records(self, other_records: List[Dict], tolerance: float = 1e-5) -> bool:
+    def compare_records(
+        self, other_records: List[Dict], tolerance: float = 1e-5
+    ) -> bool:
         all_records = []
         for records_list in self.records.values():
             all_records.extend(records_list)
@@ -815,7 +871,10 @@ class UnifiedDebugTracer:
 
         all_match = True
         for i, (record1, record2) in enumerate(zip(all_records, other_records)):
-            if record1["name"] != record2["name"] or record1["stage"] != record2["stage"]:
+            if (
+                record1["name"] != record2["name"]
+                or record1["stage"] != record2["stage"]
+            ):
                 print(f"Record {i}: name/stage mismatch")
                 all_match = False
                 continue
@@ -824,7 +883,9 @@ class UnifiedDebugTracer:
                 if key in record1 and key in record2:
                     diff = abs(record1[key] - record2[key])
                     if diff > tolerance:
-                        print(f"Record {i} ({record1['name']}): {key} differs by {diff:.8f}")
+                        print(
+                            f"Record {i} ({record1['name']}): {key} differs by {diff:.8f}"
+                        )
                         all_match = False
 
             for key in ["has_nan", "has_inf"]:
@@ -918,7 +979,9 @@ class UnifiedDebugTracer:
             stats["layers"] = safe_sort(list(stats["layers"]))
             stats["steps"] = safe_sort(list(stats["steps"]))
             if stats["total_records"] > 0:
-                stats["avg_tensor_size"] = stats["total_elements"] / stats["total_records"]
+                stats["avg_tensor_size"] = (
+                    stats["total_elements"] / stats["total_records"]
+                )
 
         for layer_id, stats in layer_stats.items():
             stats["dtypes"] = list(stats["dtypes"])
@@ -984,7 +1047,11 @@ def trace_function(
 
             if context_info:
                 context_str = "_".join(
-                    [f"{k}_{v}" for k, v in context_info.items() if k != "context_error"]
+                    [
+                        f"{k}_{v}"
+                        for k, v in context_info.items()
+                        if k != "context_error"
+                    ]
                 )
                 if context_str:
                     stage_name = f"{stage_name}_{context_str}"
@@ -996,7 +1063,9 @@ def trace_function(
 
                 for key, value in kwargs.items():
                     if hasattr(value, "shape"):
-                        global_tracer.print(value, f"{func_name}_input_{key}", stage_name)
+                        global_tracer.print(
+                            value, f"{func_name}_input_{key}", stage_name
+                        )
 
             result = func(*args, **kwargs)
 
@@ -1006,7 +1075,9 @@ def trace_function(
                 elif isinstance(result, (tuple, list)):
                     for i, item in enumerate(result):
                         if hasattr(item, "shape"):
-                            global_tracer.print(item, f"{func_name}_output_{i}", stage_name)
+                            global_tracer.print(
+                                item, f"{func_name}_output_{i}", stage_name
+                            )
                 elif hasattr(result, "__dict__"):
                     for attr_name in dir(result):
                         if not attr_name.startswith("_"):

@@ -8,6 +8,7 @@ from typing import Dict, List, Optional, Tuple, Union
 import jax
 import jax.numpy as jnp
 import numpy as np
+from jax._src import dtypes
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 from jax.sharding import Mesh, NamedSharding
@@ -114,7 +115,9 @@ class ReqToTokenPool:
     def clear(self):
         """Clear all allocation states"""
         self.free_slots = list(range(self.size))
-        self.req_to_token = jnp.zeros((self.size, self.max_context_len), dtype=self.dtype)
+        self.req_to_token = jnp.zeros(
+            (self.size, self.max_context_len), dtype=self.dtype
+        )
         self.req_to_token = jax.device_put(self.req_to_token, self.token_sharding)
 
 
@@ -217,20 +220,15 @@ class MHATokenToKVPool(KVCache):
         start_layer: Optional[int] = None,
         end_layer: Optional[int] = None,
     ):
-        super().__init__(size, page_size, dtype, layer_num, mesh, start_layer, end_layer)
+        super().__init__(
+            size, page_size, dtype, layer_num, mesh, start_layer, end_layer
+        )
         self.head_num = head_num
         self.head_dim = head_dim
         self.kv_partition_axis = kv_partition_axis
 
         self._create_buffers()
         self._calculate_memory_usage()
-
-    def print_array_shape(self):
-        print(f"===MHATokenToKVPool shape")
-        for i in range(len(self.k_buffer)):
-            print(f"k_buffer[{i}] sharding: {self.k_buffer[i].sharding}")
-            print(f"v_buffer[{i}] sharding: {self.v_buffer[i].sharding}")
-
 
     def tree_flatten(self):
         parent_children, parent_aux_data = super().tree_flatten()
@@ -311,7 +309,9 @@ class MHATokenToKVPool(KVCache):
                 self.v_buffer.append(v_buf)
 
         end_time = time.time()
-        print(f"Total time to create {self.layer_num} buffers: {end_time - start_time:.2f} seconds")
+        print(
+            f"Total time to create {self.layer_num} buffers: {end_time - start_time:.2f} seconds"
+        )
 
     def _calculate_memory_usage(self):
         """Calculate memory usage"""
@@ -379,10 +379,13 @@ class MHATokenToKVPool(KVCache):
             loc=loc,
             k_cache=self.k_buffer[layer_idx],
             v_cache=self.v_buffer[layer_idx],
+            page_size=self.page_size,
             kv_partition_axis=self.kv_partition_axis,
         )
 
-    def get_kv_data(self, layer_id: int, indices: jnp.ndarray) -> Tuple[jnp.ndarray, jnp.ndarray]:
+    def get_kv_data(
+        self, layer_id: int, indices: jnp.ndarray
+    ) -> Tuple[jnp.ndarray, jnp.ndarray]:
         """Get KV data at specified positions"""
         layer_idx = layer_id - self.start_layer
         k_data = self.k_buffer[layer_idx][indices]
@@ -442,22 +445,14 @@ class MHATokenToKVPool(KVCache):
 
 
 def _set_kv_buffer(
-    # layer_id: int,
-    # loc: jax.Array,
     k: jax.Array,
     v: jax.Array,
     loc: jax.Array,
     k_cache: jax.Array,
     v_cache: jax.Array,
+    page_size: int,
     kv_partition_axis: str = "tensor",
 ):
-    # original impl
-    # assert loc.shape[0] == cache_k.shape[0] == cache_v.shape[0], "Batch size mismatch"
-
-    # k_cache = k_cache.at[layer_id, loc].set(cache_k)
-    # v_cache = v_cache.at[layer_id, loc].set(cache_v)
-
-    # update in-place
     """
     k: jax.Array,          # [total_tokens, num_heads, head_dim]
     v: jax.Array,          # [total_tokens, num_heads, head_dim]
@@ -465,20 +460,15 @@ def _set_kv_buffer(
     k_cache: jax.Array,
     v_cache: jax.Array,
     """
-    # k_cache_layer=k_cache[layer_id]
-    # v_cache_layer=v_cache[layer_id]
-    # if os.environ.get("JAX_PLATFORM") == "tpu":
     k_cache, v_cache = update_kv_cache(
         k,
         v,
         loc,
         k_cache,
         v_cache,
+        page_size=page_size,
         kv_partition_axis=kv_partition_axis,
     )
-    # else:
-    # k_cache = k_cache.at[loc].set(k)
-    # v_cache = v_cache.at[loc].set(v)
 
     return k_cache, v_cache
 
@@ -489,7 +479,7 @@ def update_kv_cache(
     loc: jax.Array,  # [total_tokens], -1 for padding
     k_cache: jax.Array,
     v_cache: jax.Array,
-    use_vectorized: bool = True,
+    page_size: int = 1,
     kv_partition_axis: str = "tensor",
 ):
     """
@@ -506,14 +496,15 @@ def update_kv_cache(
     Returns:
         Updated k_cache and v_cache
     """
-    if use_vectorized:
-        return update_kv_cache_vectorized(
-            k, v, loc, k_cache, v_cache, kv_partition_axis=kv_partition_axis
-        )
-    else:
-        return update_kv_cache_token_by_token(
-            k, v, loc, k_cache, v_cache, kv_partition_axis=kv_partition_axis
-        )
+    return update_kv_cache_vectorized(
+        k,
+        v,
+        loc,
+        k_cache,
+        v_cache,
+        page_size=page_size,
+        kv_partition_axis=kv_partition_axis,
+    )
 
 
 def cdiv(a: int, b: int) -> int:
@@ -521,10 +512,9 @@ def cdiv(a: int, b: int) -> int:
     return -(a // -b)
 
 
-def _kv_cache_update_kernel(
+def kv_cache_update_kernel(
     # Prefetch
-    slices_ref,  # [3, padded_num_slices], list of (kv_cache_start,
-    # new_kv_start, slice_len)
+    slices_ref,  # [3, padded_num_slices], list of (kv_cache_start, new_kv_start, slice_len)
     # Input
     new_kv_hbm_ref,  # [num_tokens, num_combined_kv_heads, head_dim]
     kv_cache_hbm_ref,  # [total_num_pages * page_size, num_combined_kv_heads,
@@ -572,19 +562,52 @@ def _kv_cache_update_kernel(
         async_copy.wait()
 
 
+def get_num_slices_per_block(new_kv: jax.Array, kv_cache: jax.Array):
+    """
+    new_kv: [total_num_token, num_combined_kv_heads, head_dim]
+    kv_cache: [max_num_tokens, num_combined_kv_heads, head_dim]
+    """
+    assert (
+        new_kv.dtype == kv_cache.dtype
+    ), f"new_kv.dtype={new_kv.dtype} is not equal to kv_cache.dtype={kv_cache.dtype}"
+    assert new_kv.dtype != jnp.float16, f"new_kv.dtype={new_kv.dtype} is not supported"
+
+    bits = dtypes.bit_width(kv_cache.dtype)
+    assert bits % 8 == 0, f"bits={bits} is not divisible by 8"
+
+    bytes_per_element = bits // 8
+
+    total_num_token = new_kv.shape[0]
+    kv_head_num = new_kv.shape[1]
+    head_dim = new_kv.shape[2]
+
+    max_num_slices_per_block = VMEM_SIZE // (
+        bytes_per_element * PAGE_SIZE * kv_head_num * head_dim
+    )
+    assert (
+        max_num_slices_per_block > 0
+    ), f"max_num_slices_per_block={max_num_slices_per_block} is not greater than 0"
+
+    return (
+        total_num_token
+        if total_num_token < max_num_slices_per_block
+        else max_num_slices_per_block
+    )
+
+
 # @partial(
 #     jax.jit,
 #     static_argnames=["page_size", "num_slices_per_block"],
 # )
 def kv_cache_update(
-    new_kv: jax.Array,  # [total_num_token, num_combined_kv_heads, head_dim]
+    new_kv: jax.Array,  # [total_num_token, num_kv_heads, head_dim]
     # [3, slices], list of (kv_cache_start, new_kv_start, slice_len)
     slices: jax.Array,
-    # [max_num_tokens, num_combined_kv_heads, head_dim]
+    # [max_num_tokens, num_kv_heads, head_dim]
     kv_cache: jax.Array,
     num_kv_update_slices: jax.Array,  # [1]
     *,
-    page_size: int = 1024,
+    page_size: int = 1,  # because we treat each token as an independent query
     num_slices_per_block: int = 8,
     kv_partition_axis: str = "tensor",
 ):
@@ -593,9 +616,13 @@ def kv_cache_update(
     @jax.shard_map(
         mesh=mesh,
         in_specs=(
-            P(None, kv_partition_axis, None),  # new_kv - consistent with KV cache sharding
+            P(
+                None, kv_partition_axis, None
+            ),  # new_kv - consistent with KV cache sharding
             P(None, None),  # slices
-            P(None, kv_partition_axis, None),  # kv_cache - consistent with KV cache sharding
+            P(
+                None, kv_partition_axis, None
+            ),  # kv_cache - consistent with KV cache sharding
             P(None),  # num_kv_update_slices
         ),
         out_specs=P(
@@ -604,12 +631,27 @@ def kv_cache_update(
         check_vma=False,
     )
     def _kv_cache_update_wrapper(new_kv, slices, kv_cache, num_kv_update_slices):
-        new_kv = new_kv.astype(jnp.bfloat16)
-        kv_cache = kv_cache.astype(jnp.bfloat16)
         assert (
             slices.shape[1] % num_slices_per_block == 0
         ), f"slices.shape[1]={slices.shape[1]} is not divisible by num_slices_per_block={num_slices_per_block}"
         _, num_combined_kv_heads, head_dim = new_kv.shape
+
+        original_kv_heads = num_combined_kv_heads
+        padding_added = False
+        # padding kv heads for tiling 2
+        if num_combined_kv_heads % 2 == 1:
+            padding_added = True
+
+            pad_shape = (new_kv.shape[0], 1, new_kv.shape[2])
+            new_kv_pad = jnp.zeros(pad_shape, dtype=new_kv.dtype)
+            new_kv = jnp.concatenate([new_kv, new_kv_pad], axis=1)
+
+            cache_pad_shape = (kv_cache.shape[0], 1, kv_cache.shape[2])
+            kv_cache_pad = jnp.zeros(cache_pad_shape, dtype=kv_cache.dtype)
+            kv_cache = jnp.concatenate([kv_cache, kv_cache_pad], axis=1)
+
+            num_combined_kv_heads = new_kv.shape[1]
+
         assert (
             kv_cache.shape[1] == num_combined_kv_heads
         ), f"kv_cache.shape[1]={kv_cache.shape[1]} is not equal to num_combined_kv_heads={num_combined_kv_heads}"
@@ -631,7 +673,7 @@ def kv_cache_update(
         scalar_prefetches = [slices]
         scratch = pltpu.VMEM(
             (num_slices_per_block, page_size, num_combined_kv_heads, head_dim),
-            jnp.bfloat16,
+            new_kv.dtype,
         )
 
         scratch_shapes = [
@@ -640,7 +682,7 @@ def kv_cache_update(
         ]
 
         kernel = pl.pallas_call(
-            _kv_cache_update_kernel,
+            kv_cache_update_kernel,
             grid_spec=pltpu.PrefetchScalarGridSpec(
                 num_scalar_prefetch=len(scalar_prefetches),
                 in_specs=in_specs,
@@ -651,14 +693,18 @@ def kv_cache_update(
             out_shape=out_shape,
             input_output_aliases={len(scalar_prefetches) + 1: 0},
         )
-        new_kv = new_kv.astype(jnp.bfloat16)
-        kv_cache = kv_cache.astype(jnp.bfloat16)
-        return kernel(*scalar_prefetches, new_kv, kv_cache)[0]
+
+        result = kernel(*scalar_prefetches, new_kv, kv_cache)[0]
+
+        # reset padded kv heads
+        if padding_added and result.shape[1] > original_kv_heads:
+            result = result[:, :original_kv_heads, :]
+        return result
 
     return _kv_cache_update_wrapper(new_kv, slices, kv_cache, num_kv_update_slices)
 
 
-def _get_slot_mapping(
+def get_slot_mapping(
     num_slices_per_block: int,
     kv_cache_start_loc: jax.Array,
     new_kv_start_loc: jax.Array,
@@ -671,24 +717,26 @@ def _get_slot_mapping(
         * num_slices_per_block
     )
     slot_mapping = jnp.pad(
-        slot_mapping, [[0, padded_size - slot_mapping.shape[0]], [0, 0]], constant_values=0
+        slot_mapping,
+        [[0, padded_size - slot_mapping.shape[0]], [0, 0]],
+        constant_values=0,
     )
     slot_mapping = jnp.transpose(slot_mapping)
     return slot_mapping.astype(jnp.int32)
 
 
-VME_SIZE = 32 * 1024 * 1024  # 32MB
-NUM_SLICES_PER_BLOCK = 4
-PAGE_SIZE = 1024
+VMEM_SIZE = 32 * 1024 * 1024  # 32MB
+PAGE_SIZE = 1
 
 
-#@jax.jit
+# @jax.jit
 def update_kv_cache_vectorized(
     k: jax.Array,  # [total_tokens, num_heads, head_dim]
     v: jax.Array,  # [total_tokens, num_heads, head_dim]
     loc: jax.Array,  # [total_tokens], -1 for padding
     k_cache: jax.Array,
     v_cache: jax.Array,
+    page_size: int,
     kv_partition_axis: str = "tensor",
 ):
     """
@@ -704,8 +752,11 @@ def update_kv_cache_vectorized(
 
     # Create the 'slices' array for the kernel
     # This contains information for all tokens, but padding tokens have slice_lens=0
-    slot_mapping = _get_slot_mapping(
-        num_slices_per_block=NUM_SLICES_PER_BLOCK,
+    # num_slices_per_block = get_num_slices_per_block(k, k_cache)
+    num_slices_per_block = 4
+
+    slot_mapping = get_slot_mapping(
+        num_slices_per_block=num_slices_per_block,
         kv_cache_start_loc=kv_cache_locs,
         new_kv_start_loc=new_kv_locs,
         slice_lens=slice_lens,
@@ -718,8 +769,8 @@ def update_kv_cache_vectorized(
         slices=slot_mapping,
         kv_cache=k_cache,
         num_kv_update_slices=num_kv_update_slices,
-        page_size=PAGE_SIZE,
-        num_slices_per_block=NUM_SLICES_PER_BLOCK,
+        page_size=page_size,
+        num_slices_per_block=num_slices_per_block,
         kv_partition_axis=kv_partition_axis,
     )
 
@@ -728,139 +779,12 @@ def update_kv_cache_vectorized(
         slices=slot_mapping,
         kv_cache=v_cache,
         num_kv_update_slices=num_kv_update_slices,
-        page_size=PAGE_SIZE,
-        num_slices_per_block=NUM_SLICES_PER_BLOCK,
+        page_size=page_size,
+        num_slices_per_block=num_slices_per_block,
         kv_partition_axis=kv_partition_axis,
     )
 
     return k_cache, v_cache
-
-
-# @jax.jit
-def update_kv_cache_token_by_token(
-    k: jax.Array,  # [total_tokens, num_heads, head_dim]
-    v: jax.Array,  # [total_tokens, num_heads, head_dim]
-    # [total_tokens] total_tokens is the padding tokens, if the value is -1, it means the token is padding
-    loc: jax.Array,
-    k_cache: jax.Array,
-    v_cache: jax.Array,
-    kv_partition_axis: str = "tensor",
-):
-    """
-    Token-by-token KV cache update to avoid contiguity issues.
-    Each kernel call processes exactly 1 token with batch_size=1,
-    eliminating any memory contiguity requirements.
-
-    For padding tokens (where loc == -1), set the corresponding parameters
-    to 0 to ignore them.
-    """
-    total_tokens = loc.shape[0]
-
-    def update_single_token_step(token_pos, cache_state):
-        k_cache, v_cache = cache_state
-
-        # Use dynamic_slice instead of regular slicing for JIT compatibility
-        single_k = jax.lax.dynamic_slice(
-            k, (token_pos, 0, 0), (1, k.shape[1], k.shape[2])
-        )  # [1, num_heads, head_dim]
-        single_v = jax.lax.dynamic_slice(
-            v, (token_pos, 0, 0), (1, v.shape[1], v.shape[2])
-        )  # [1, num_heads, head_dim]
-
-        # Handle padding: if loc[token_pos] == -1, set length to 0 to ignore
-        current_loc = jax.lax.dynamic_slice(loc, (token_pos,), (1,))[0]
-        is_padding = current_loc == -1
-
-        # Set length to 0 for padding tokens to ignore them
-        single_seq_lens = jax.lax.cond(
-            is_padding,
-            lambda: jnp.array([0], dtype=jnp.int32),
-            lambda: jnp.array([1], dtype=jnp.int32),
-        )
-
-        # for single token, the start location in k,v tensor is always 0
-        # since we're processing k[token_pos:token_pos+1]
-        single_kv_start_loc = jnp.array([0], dtype=jnp.int32)
-        # for single token, the cache start location is loc[token_pos]
-        single_kv_cache_start_loc = jax.lax.cond(
-            is_padding,
-            lambda: jnp.array([0], dtype=jnp.int32),
-            lambda: jnp.array([current_loc], dtype=jnp.int32),
-        )
-
-        # batch_size=1, seq_len=1 (or 0 for padding)
-        updated_k_cache, updated_v_cache = _update_single_token(
-            single_k,
-            single_v,
-            k_cache,
-            v_cache,
-            single_seq_lens,
-            single_kv_start_loc,
-            single_kv_cache_start_loc,
-            kv_partition_axis=kv_partition_axis,
-        )
-
-        return (updated_k_cache, updated_v_cache)
-
-    # Use fori_loop to replace Python for loop
-    initial_state = (k_cache, v_cache)
-    final_k_cache, final_v_cache = jax.lax.fori_loop(
-        0, total_tokens, update_single_token_step, initial_state
-    )
-
-    return final_k_cache, final_v_cache
-
-
-def _update_single_token(
-    k: jax.Array,  # [1, num_heads, head_dim] - single token
-    v: jax.Array,  # [1, num_heads, head_dim] - single token
-    k_cache: jax.Array,
-    v_cache: jax.Array,
-    seq_lens: jax.Array,  # [1] - 1 for valid tokens, 0 for padding
-    kv_start_loc: jax.Array,  # [1] - start position in k,v tensor (always 0)
-    # [1] - position in cache (or 0 for padding)
-    kv_cache_start_loc: jax.Array,
-    kv_partition_axis: str = "tensor",
-):
-    # For padding tokens (seq_lens[0] == 0), skip the update
-    def do_update():
-        batch_size = 1
-        num_kv_update_slices = jnp.array([batch_size], dtype=jnp.int32)
-
-        get_slot_mapping = partial(
-            _get_slot_mapping,
-            kv_cache_start_loc=kv_cache_start_loc,
-            new_kv_start_loc=kv_start_loc,
-            slice_lens=seq_lens,
-        )
-        slot_mapping = get_slot_mapping(NUM_SLICES_PER_BLOCK)
-
-        updated_k_cache = kv_cache_update(
-            k,
-            slot_mapping,
-            k_cache,
-            num_kv_update_slices,
-            num_slices_per_block=NUM_SLICES_PER_BLOCK,
-            page_size=PAGE_SIZE,
-            kv_partition_axis=kv_partition_axis,
-        )
-        updated_v_cache = kv_cache_update(
-            v,
-            slot_mapping,
-            v_cache,
-            num_kv_update_slices,
-            num_slices_per_block=NUM_SLICES_PER_BLOCK,
-            page_size=PAGE_SIZE,
-            kv_partition_axis=kv_partition_axis,
-        )
-        return updated_k_cache, updated_v_cache
-
-    def skip_update():
-        return k_cache, v_cache
-
-    # Use cond to skip update for padding tokens
-    is_valid = seq_lens[0] > 0
-    return jax.lax.cond(is_valid, do_update, skip_update)
 
 
 # @partial(jax.jit, static_argnames=["layer_id"])
@@ -880,9 +804,6 @@ def _set_kv_cache(
     v_cache: jax.Array,
 ) -> Tuple[jax.Array, jax.Array]:
     assert loc.shape[0] == k.shape[0] == v.shape[0], "Batch size mismatch"
-    # print(f"layer_id: {layer_id}, loc.shape: {loc.shape}, loc: {loc}")
-    # print(f"k_cache: {k_cache.shape}, k: {k.shape}")
-    # print(f"v_cache: {v_cache.shape}, v: {v.shape}")
 
     k_cache = v_cache.at[layer_id, loc].set(k)
     v_cache = v_cache.at[layer_id, loc].set(v)
@@ -904,7 +825,9 @@ class MLATokenToKVPool(KVCache):
         start_layer: Optional[int] = None,
         end_layer: Optional[int] = None,
     ):
-        super().__init__(size, page_size, dtype, layer_num, mesh, start_layer, end_layer)
+        super().__init__(
+            size, page_size, dtype, layer_num, mesh, start_layer, end_layer
+        )
         self.kv_lora_rank = kv_lora_rank
         self.qk_rope_head_dim = qk_rope_head_dim
         self.kv_partition_axis = kv_partition_axis
@@ -943,7 +866,8 @@ class MLATokenToKVPool(KVCache):
         self.mem_usage = kv_size / GB
 
         logger.info(
-            f"JAX MLA KV Cache allocated. #tokens: {self.size}, " f"KV size: {kv_size / GB:.2f} GB"
+            f"JAX MLA KV Cache allocated. #tokens: {self.size}, "
+            f"KV size: {kv_size / GB:.2f} GB"
         )
 
     def get_kv_size_bytes(self):
@@ -988,7 +912,9 @@ class MLATokenToKVPool(KVCache):
         layer_idx = layer_id - self.start_layer
         # Concatenate nope and rope components
         cache_k_combined = jnp.concatenate([cache_k_nope, cache_k_rope], axis=-1)
-        self.kv_buffer[layer_idx] = self.kv_buffer[layer_idx].at[loc].set(cache_k_combined)
+        self.kv_buffer[layer_idx] = (
+            self.kv_buffer[layer_idx].at[loc].set(cache_k_combined)
+        )
 
     def get_cpu_copy(self, indices):
         """Get CPU copy of KV cache for specified indices"""
@@ -1003,4 +929,6 @@ class MLATokenToKVPool(KVCache):
         for layer_id in range(self.layer_num):
             kv_host = kv_cache_host[layer_id]
             kv_device = jax.device_put(kv_host, self.kv_sharding)
-            self.kv_buffer[layer_id] = self.kv_buffer[layer_id].at[indices].set(kv_device)
+            self.kv_buffer[layer_id] = (
+                self.kv_buffer[layer_id].at[indices].set(kv_device)
+            )

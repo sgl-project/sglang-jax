@@ -28,21 +28,34 @@ from sgl_jax.srt.managers.io_struct import (
     ProfileReq,
     TokenizedGenerateReqInput,
 )
-from sgl_jax.srt.managers.schedule_batch import Req, ScheduleBatch, global_server_args_dict
-from sgl_jax.srt.managers.schedule_policy import AddReqResult, PrefillAdder, SchedulePolicy
-from sgl_jax.srt.managers.scheduler_output_processor_mixin import SchedulerOutputProcessorMixin
+from sgl_jax.srt.managers.schedule_batch import (
+    Req,
+    ScheduleBatch,
+    global_server_args_dict,
+)
+from sgl_jax.srt.managers.schedule_policy import (
+    AddReqResult,
+    PrefillAdder,
+    SchedulePolicy,
+)
+from sgl_jax.srt.managers.scheduler_metrics_mixin import SchedulerMetricsMixin
+from sgl_jax.srt.managers.scheduler_output_processor_mixin import (
+    SchedulerOutputProcessorMixin,
+)
 from sgl_jax.srt.managers.scheduler_profiler_mixing import SchedulerProfilerMixin
 from sgl_jax.srt.managers.tp_worker import ModelWorker
 from sgl_jax.srt.managers.utils import validate_input_length
 from sgl_jax.srt.mem_cache.radix_cache import RadixCache
+from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
 from sgl_jax.srt.server_args import PortArgs, ServerArgs
 from sgl_jax.srt.utils.common_utils import (
-    JAX_PRECOMPILE_DEFAULT_BS_PADDINGS,
-    JAX_PRECOMPILE_DEFAULT_TOKEN_PADDINGS,
+    JAX_PRECOMPILE_DEFAULT_DECODE_BS_PADDINGS,
+    JAX_PRECOMPILE_DEFAULT_PREFILL_TOKEN_PADDINGS,
     configure_logger,
     get_bool_env_var,
     get_zmq_socket,
     kill_itself_when_parent_died,
+    pyspy_dump_schedulers,
     set_random_seed,
 )
 from sgl_jax.srt.utils.mesh_utils import create_device_mesh
@@ -80,6 +93,7 @@ class GenerationBatchResult:
 class Scheduler(
     SchedulerOutputProcessorMixin,
     SchedulerProfilerMixin,
+    SchedulerMetricsMixin,
 ):
     """
     A scheduler that manages a tensor parallel TPU worker, which managaes fixed multi TPU devices.
@@ -136,9 +150,13 @@ class Scheduler(
                     context, zmq.PUSH, port_args.detokenizer_ipc_name, False
                 )
 
-            self.recv_from_rpc = get_zmq_socket(context, zmq.DEALER, port_args.rpc_ipc_name, False)
+            self.recv_from_rpc = get_zmq_socket(
+                context, zmq.DEALER, port_args.rpc_ipc_name, False
+            )
             if self.nnodes > 1:
-                self.publisher = get_zmq_socket(context, zmq.PUB, self.pub_sub_addr, bind=True)
+                self.publisher = get_zmq_socket(
+                    context, zmq.PUB, self.pub_sub_addr, bind=True
+                )
                 self.publisher_sync = get_zmq_socket(
                     context, zmq.REP, self.pub_sub_sync_addr, bind=True
                 )
@@ -149,7 +167,9 @@ class Scheduler(
             self.send_to_tokenizer = SimpleNamespace(send_pyobj=lambda x: None)
             self.send_to_detokenizer = SimpleNamespace(send_pyobj=lambda x: None)
             if self.nnodes > 1:
-                self.subscriber = get_zmq_socket(context, zmq.SUB, self.pub_sub_addr, bind=False)
+                self.subscriber = get_zmq_socket(
+                    context, zmq.SUB, self.pub_sub_addr, bind=False
+                )
                 self.subscriber.setsockopt(zmq.SUBSCRIBE, b"")
                 self.subscriber.setsockopt(zmq.RCVTIMEO, 5000)
                 self.subscriber_sync = get_zmq_socket(
@@ -164,7 +184,9 @@ class Scheduler(
 
         # init distribution
         if self.nnodes > 1:
-            jax.distributed.initialize(server_args.dist_init_addr, self.nnodes, self.node_rank)
+            jax.distributed.initialize(
+                server_args.dist_init_addr, self.nnodes, self.node_rank
+            )
         self.mesh = create_device_mesh(
             ici_parallelism=[-1, self.tp_size, 1, 1], dcn_parallelism=[1, 1, 1, 1]
         )
@@ -209,6 +231,8 @@ class Scheduler(
         self.forward_ct_decode = 0
         self.num_generated_tokens = 0
         self.last_prefill_tokens = 0
+        self.last_decode_stats_tic = time.perf_counter()
+        self.last_prefill_stats_tic = time.perf_counter()
         self.num_retracted_reqs: int = 0
         self.num_paused_reqs: int = 0
 
@@ -217,13 +241,17 @@ class Scheduler(
             self.schedule_policy,
             self.tree_cache,
         )
-        assert server_args.schedule_conservativeness >= 0, "Invalid schedule_conservativeness"
+        assert (
+            server_args.schedule_conservativeness >= 0
+        ), "Invalid schedule_conservativeness"
         self.init_new_token_ratio = min(
-            global_config.default_init_new_token_ratio * server_args.schedule_conservativeness,
+            global_config.default_init_new_token_ratio
+            * server_args.schedule_conservativeness,
             1.0,
         )
         self.min_new_token_ratio = min(
-            self.init_new_token_ratio * global_config.default_min_new_token_ratio_factor,
+            self.init_new_token_ratio
+            * global_config.default_min_new_token_ratio_factor,
             1.0,
         )
         self.new_token_ratio_decay = (
@@ -238,6 +266,8 @@ class Scheduler(
         self.parent_process = psutil.Process().parent()
 
         self.init_profier()
+
+        self.init_metrics()
 
         # Init request dispatcher
         self._request_dispatcher = TypeBasedDispatcher(
@@ -264,12 +294,16 @@ class Scheduler(
                 message = self.publisher_sync.recv_string()
                 if message == "READY":
                     ready_count += 1
-                    logger.info(f"[Publisher {self.node_rank}] receives {ready_count} READY signal")
+                    logger.info(
+                        f"[Publisher {self.node_rank}] receives {ready_count} READY signal"
+                    )
                     self.publisher_sync.send_string("ACK")
                 else:
                     self.publisher_sync.send_string("NACK")
         except zmq.Again:
-            logger.error(f"[Publisher {self.node_rank}] fail to synchronize due to timeout")
+            logger.error(
+                f"[Publisher {self.node_rank}] fail to synchronize due to timeout"
+            )
             return False
         except Exception as e:
             logger.error(f"[Publisher {self.node_rank}] encounters error: {e}")
@@ -286,10 +320,14 @@ class Scheduler(
                 logger.info(f"[Subscriber {self.node_rank}] succeeds to synchronizes!")
                 return True
             else:
-                logger.error(f"[Subscriber {self.node_rank}] fails to synchroinze with ack: {ack}")
+                logger.error(
+                    f"[Subscriber {self.node_rank}] fails to synchroinze with ack: {ack}"
+                )
                 return False
         except Exception as e:
-            logger.error(f"[Subscriber {self.node_rank}] fails to synchronize with error: {e}")
+            logger.error(
+                f"[Subscriber {self.node_rank}] fails to synchronize with error: {e}"
+            )
             return False
 
     def sync_pub_sub(self):
@@ -317,7 +355,9 @@ class Scheduler(
 
     def init_memory_pool_and_cache(self):
         server_args = self.server_args
-        self.req_to_token_pool, self.token_to_kv_pool_allocator = self.tp_worker.get_memory_pool()
+        self.req_to_token_pool, self.token_to_kv_pool_allocator = (
+            self.tp_worker.get_memory_pool()
+        )
 
         self.tree_cache = RadixCache(
             req_to_token_pool=self.req_to_token_pool,
@@ -359,7 +399,9 @@ class Scheduler(
                 self.publisher.send(serialized_data)
                 return True
             except Exception as e:
-                logger.error(f"[Publisher {self.node_rank}] fails to send data with error: {e}")
+                logger.error(
+                    f"[Publisher {self.node_rank}] fails to send data with error: {e}"
+                )
         return False
 
     def run_subscriber(self):
@@ -385,7 +427,9 @@ class Scheduler(
         else:
             recv_reqs = self.run_subscriber()
             if recv_reqs is None:
-                raise ReceiveDataError(f"[Subscriber {self.node_rank}] fails to receive data")
+                raise ReceiveDataError(
+                    f"[Subscriber {self.node_rank}] fails to receive data"
+                )
         return recv_reqs
 
     def recv_requests(self) -> List[Req]:
@@ -475,8 +519,11 @@ class Scheduler(
 
     def get_internal_state(self, recv_req: GetInternalStateReq):
         ret = dict(global_server_args_dict)
+        ret["last_gen_throughput"] = self.last_gen_throughput
         ret["memory_usage"] = {
-            "kvcache": round(self.token_to_kv_pool_allocator.get_kvcache().mem_usage, 2),
+            "kvcache": round(
+                self.token_to_kv_pool_allocator.get_kvcache().mem_usage, 2
+            ),
             "token_capacity": int(self.max_total_num_tokens),
         }
 
@@ -599,7 +646,11 @@ class Scheduler(
         if len(can_run_list) == 0:
             return None
 
-        self.waiting_queue = [x for x in self.waiting_queue if x not in set(can_run_list)]
+        self.waiting_queue = [
+            x for x in self.waiting_queue if x not in set(can_run_list)
+        ]
+
+        self.log_prefill_stats(adder, can_run_list, running_bs)
 
         # Create a new batch
         new_batch = ScheduleBatch.init_new(
@@ -666,24 +717,27 @@ class Scheduler(
 
         # Run forward
         assert self.is_generation
+
         model_worker_batch = batch.get_model_worker_batch(
-            self.max_req_len,
+            self.max_running_requests,
+            self.max_total_num_tokens,
             (
-                self.server_args.jax_precompile_bs_paddings
-                if self.server_args.jax_precompile_bs_paddings is not None
-                else JAX_PRECOMPILE_DEFAULT_BS_PADDINGS
+                self.server_args.jax_precompile_decode_bs_paddings
+                if self.server_args.jax_precompile_decode_bs_paddings is not None
+                else JAX_PRECOMPILE_DEFAULT_DECODE_BS_PADDINGS
             ),
             (
-                self.server_args.jax_precompile_token_paddings
-                if self.server_args.jax_precompile_token_paddings is not None
-                else JAX_PRECOMPILE_DEFAULT_TOKEN_PADDINGS
+                self.server_args.jax_precompile_prefill_token_paddings
+                if self.server_args.jax_precompile_prefill_token_paddings is not None
+                else JAX_PRECOMPILE_DEFAULT_PREFILL_TOKEN_PADDINGS
             ),
         )
 
-        logits_output, next_token_ids = self.tp_worker.forward_batch_generation(model_worker_batch)
+        logits_output, next_token_ids = self.tp_worker.forward_batch_generation(
+            model_worker_batch
+        )
 
         bid = model_worker_batch.bid
-
         batch.output_ids = next_token_ids
 
         # These 2 values are needed for processing the output, but the values can be
@@ -694,7 +748,9 @@ class Scheduler(
         else:
             extend_input_len_per_req = None
         if batch.return_logprob:
-            extend_logprob_start_len_per_req = [req.extend_logprob_start_len for req in batch.reqs]
+            extend_logprob_start_len_per_req = [
+                req.extend_logprob_start_len for req in batch.reqs
+            ]
         else:
             extend_logprob_start_len_per_req = None
 
@@ -784,7 +840,9 @@ class Scheduler(
             reqs = self.running_batch.reqs + self.cur_batch.reqs
 
         for req in reqs:
-            if not req.finished() and (recv_req.abort_all or req.rid.startswith(recv_req.rid)):
+            if not req.finished() and (
+                recv_req.abort_all or req.rid.startswith(recv_req.rid)
+            ):
                 # Abort method 3: set `to_abort=True`
                 # The request will still run one decode forward pass.
                 # Then we reuse all existing code to clean up the KV cache allocation.

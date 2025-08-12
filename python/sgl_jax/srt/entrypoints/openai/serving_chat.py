@@ -45,7 +45,9 @@ logger = logging.getLogger(__name__)
 class OpenAIServingChat(OpenAIServingBase):
     """Handler for /v1/chat/completions requests"""
 
-    def __init__(self, tokenizer_manager: TokenizerManager, template_manager: TemplateManager):
+    def __init__(
+        self, tokenizer_manager: TokenizerManager, template_manager: TemplateManager
+    ):
         super().__init__(tokenizer_manager)
         self.template_manager = template_manager
 
@@ -57,8 +59,10 @@ class OpenAIServingChat(OpenAIServingBase):
         request: ChatCompletionRequest,
     ) -> tuple[GenerateReqInput, ChatCompletionRequest]:
         """Convert OpenAI chat completion request to internal format"""
+        is_multimodal = self.tokenizer_manager.model_config.is_multimodal
+
         # Process messages and apply chat template
-        processed_messages = self._process_messages(request)
+        processed_messages = self._process_messages(request, is_multimodal)
 
         # Build sampling parameters
         sampling_params = self._build_sampling_params(
@@ -83,7 +87,9 @@ class OpenAIServingChat(OpenAIServingBase):
 
         return adapted_request, request
 
-    def _process_messages(self, request: ChatCompletionRequest) -> MessageProcessingResult:
+    def _process_messages(
+        self, request: ChatCompletionRequest, is_multimodal: bool
+    ) -> MessageProcessingResult:
         """Process chat messages and apply chat template"""
         tool_call_constraint = None
 
@@ -106,9 +112,9 @@ class OpenAIServingChat(OpenAIServingBase):
 
         # Use chat template
         if self.template_manager.chat_template_name is None:
-            result = self._apply_jinja_template(request, tools)
+            result = self._apply_jinja_template(request, tools, is_multimodal)
         else:
-            result = self._apply_conversation_template(request)
+            result = self._apply_conversation_template(request, is_multimodal)
 
         result.tool_call_constraint = tool_call_constraint
         return result
@@ -117,6 +123,7 @@ class OpenAIServingChat(OpenAIServingBase):
         self,
         request: ChatCompletionRequest,
         tools: Optional[List[Dict]],
+        is_multimodal: bool,
     ) -> MessageProcessingResult:
         """Apply Jinja chat template"""
         prompt = ""
@@ -144,7 +151,9 @@ class OpenAIServingChat(OpenAIServingBase):
                 modalities,
             )
 
-            if "tool_calls" in processed_msg and isinstance(processed_msg.get("tool_calls"), list):
+            if "tool_calls" in processed_msg and isinstance(
+                processed_msg.get("tool_calls"), list
+            ):
                 for call in processed_msg["tool_calls"]:
                     try:
                         if "arguments" in call["function"] and isinstance(
@@ -155,14 +164,19 @@ class OpenAIServingChat(OpenAIServingBase):
                             )
                     except json.JSONDecodeError as e:
                         # Log a warning or error if JSON parsing fails for arguments
-                        logger.warning(f"Failed to parse tool call arguments as JSON: {e}")
+                        logger.warning(
+                            f"Failed to parse tool call arguments as JSON: {e}"
+                        )
                         # Decide whether to continue or raise the exception based on desired behavior
                         continue  # Or raise e if strict parsing is required
             openai_compatible_messages.append(processed_msg)
 
         # Handle assistant prefix for continue_final_message
         assistant_prefix = None
-        if openai_compatible_messages and openai_compatible_messages[-1]["role"] == "assistant":
+        if (
+            openai_compatible_messages
+            and openai_compatible_messages[-1]["role"] == "assistant"
+        ):
             if request.continue_final_message:
                 assistant_prefix = openai_compatible_messages[-1]["content"]
                 openai_compatible_messages = openai_compatible_messages[:-1]
@@ -196,7 +210,11 @@ Assistant: {% endif %}"""
             #  This except branch will be triggered when the chosen model
             #  has a different tools input format that is not compatible
             #  with openAI's apply_chat_template tool_call format, like Mistral.
-            tools = [t if "function" in t else {"function": t} for t in tools] if tools else None
+            tools = (
+                [t if "function" in t else {"function": t} for t in tools]
+                if tools
+                else None
+            )
             prompt_ids = self.tokenizer_manager.tokenizer.apply_chat_template(
                 openai_compatible_messages,
                 tokenize=True,
@@ -210,6 +228,9 @@ Assistant: {% endif %}"""
             if encoded and encoded[0] == self.tokenizer_manager.tokenizer.bos_token_id:
                 encoded = encoded[1:]
             prompt_ids += encoded
+
+        if is_multimodal:
+            prompt = self.tokenizer_manager.tokenizer.decode(prompt_ids)
 
         stop = request.stop
         image_data = image_data if image_data else None
@@ -229,6 +250,7 @@ Assistant: {% endif %}"""
     def _apply_conversation_template(
         self,
         request: ChatCompletionRequest,
+        is_multimodal: bool,
     ) -> MessageProcessingResult:
         """Apply conversation template"""
         prompt = ""
@@ -271,6 +293,9 @@ Assistant: {% endif %}"""
                 stop.append(request.stop)
             else:
                 stop.extend(request.stop)
+
+        if not is_multimodal:
+            prompt_ids = self.tokenizer_manager.tokenizer.encode(prompt)
 
         return MessageProcessingResult(
             prompt=prompt,
@@ -319,7 +344,9 @@ Assistant: {% endif %}"""
             pass
         elif request.response_format and request.response_format.type == "json_object":
             sampling_params["json_schema"] = '{"type": "object"}'
-        elif request.response_format and request.response_format.type == "structural_tag":
+        elif (
+            request.response_format and request.response_format.type == "structural_tag"
+        ):
             # TODO: implement convert_json_schema_to_str function
             # sampling_params["structural_tag"] = convert_json_schema_to_str(
             #     request.response_format.model_dump(by_alias=True)
@@ -400,7 +427,9 @@ Assistant: {% endif %}"""
                     choice_logprobs = self._process_streaming_logprobs(
                         content, n_prev_tokens.get(index, 0)
                     )
-                    n_prev_tokens[index] = len(content["meta_info"]["output_token_logprobs"])
+                    n_prev_tokens[index] = len(
+                        content["meta_info"]["output_token_logprobs"]
+                    )
 
                 finish_reason = content["meta_info"]["finish_reason"]
                 finish_reason_type = finish_reason["type"] if finish_reason else None
@@ -479,7 +508,8 @@ Assistant: {% endif %}"""
                             delta=DeltaMessage(content=delta if delta else None),
                             finish_reason=(
                                 None
-                                if request.stream_options and request.stream_options.include_usage
+                                if request.stream_options
+                                and request.stream_options.include_usage
                                 else finish_reason_type
                             ),
                             matched_stop=(
@@ -523,7 +553,9 @@ Assistant: {% endif %}"""
                 for index, choice_hidden_states in hidden_states.items():
                     if choice_hidden_states:
                         last_token_hidden_states = (
-                            choice_hidden_states[-1] if len(choice_hidden_states) > 1 else []
+                            choice_hidden_states[-1]
+                            if len(choice_hidden_states) > 1
+                            else []
                         )
                         hidden_states_chunk = ChatCompletionStreamResponse(
                             id=content["meta_info"]["id"],
@@ -531,7 +563,9 @@ Assistant: {% endif %}"""
                             choices=[
                                 ChatCompletionResponseStreamChoice(
                                     index=index,
-                                    delta=DeltaMessage(hidden_states=last_token_hidden_states),
+                                    delta=DeltaMessage(
+                                        hidden_states=last_token_hidden_states
+                                    ),
                                     finish_reason=finish_reason_type,
                                 )
                             ],
@@ -614,7 +648,9 @@ Assistant: {% endif %}"""
             reasoning_parser = self.tokenizer_manager.server_args.reasoning_parser
             if reasoning_parser and request.separate_reasoning:
                 try:
-                    parser = ReasoningParser(model_type=reasoning_parser, stream_reasoning=False)
+                    parser = ReasoningParser(
+                        model_type=reasoning_parser, stream_reasoning=False
+                    )
                     reasoning_text, text = parser.parse_non_stream(text)
                 except Exception as e:
                     logger.error(f"Reasoning parsing error: {e}")
@@ -677,14 +713,18 @@ Assistant: {% endif %}"""
         """
         token_logprobs = []
 
-        for token_idx, (token, logprob) in enumerate(zip(logprobs.tokens, logprobs.token_logprobs)):
+        for token_idx, (token, logprob) in enumerate(
+            zip(logprobs.tokens, logprobs.token_logprobs)
+        ):
             token_bytes = list(token.encode("utf-8"))
             top_logprobs = []
             if logprobs.top_logprobs:
                 # - Non-streaming (use_token_index=True): uses token_idx for full data
                 # - Streaming (use_token_index=False): uses index 0 for pre-sliced data
                 top_logprobs_idx = token_idx if use_token_index else 0
-                for top_token, top_logprob in logprobs.top_logprobs[top_logprobs_idx].items():
+                for top_token, top_logprob in logprobs.top_logprobs[
+                    top_logprobs_idx
+                ].items():
                     top_token_bytes = list(top_token.encode("utf-8"))
                     top_logprobs.append(
                         TopLogprob(
@@ -751,8 +791,12 @@ Assistant: {% endif %}"""
     ) -> ChoiceLogprobs:
         """Process logprobs for streaming response"""
         logprobs = to_openai_style_logprobs(
-            output_token_logprobs=content["meta_info"]["output_token_logprobs"][n_prev_token:],
-            output_top_logprobs=content["meta_info"].get("output_top_logprobs", [])[n_prev_token:],
+            output_token_logprobs=content["meta_info"]["output_token_logprobs"][
+                n_prev_token:
+            ],
+            output_top_logprobs=content["meta_info"].get("output_top_logprobs", [])[
+                n_prev_token:
+            ],
         )
 
         token_logprobs = self._process_logprobs_tokens(logprobs, use_token_index=False)

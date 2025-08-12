@@ -24,7 +24,9 @@ def print_cache_sharding_info(cache, mesh, req_pool, allocator, process_id):
     print(f"[PROCESS {process_id}] Local device count: {len(jax.local_devices())}")
     print(f"[PROCESS {process_id}] Global device count: {len(jax.devices())}")
     print(f"[PROCESS {process_id}] Mesh axes: {mesh.axis_names}")
-    print(f"[PROCESS {process_id}] Local mesh device layout: {mesh.local_mesh.devices.shape}")
+    print(
+        f"[PROCESS {process_id}] Local mesh device layout: {mesh.local_mesh.devices.shape}"
+    )
     print(f"[PROCESS {process_id}] Global mesh device layout: {mesh.devices.shape}")
     print(f"[PROCESS {process_id}] Local mesh: {mesh.local_mesh}")
     print(f"[PROCESS {process_id}] Global mesh: {mesh}")
@@ -34,7 +36,9 @@ def print_cache_sharding_info(cache, mesh, req_pool, allocator, process_id):
         full_name = f"{prefix}.{name}" if prefix else name
 
         if hasattr(obj, "sharding") and obj.sharding is not None:
-            print(f"[PROCESS {process_id}] [SHARDING] {full_name}: sharding={obj.sharding}")
+            print(
+                f"[PROCESS {process_id}] [SHARDING] {full_name}: sharding={obj.sharding}"
+            )
             if hasattr(obj, "addressable_shards"):
                 for i, shard in enumerate(obj.addressable_shards):
                     print(
@@ -45,7 +49,9 @@ def print_cache_sharding_info(cache, mesh, req_pool, allocator, process_id):
                 f"[PROCESS {process_id}] [SHARDING] {full_name}: Unsharded, shape={obj.shape}, device={getattr(obj, 'device', 'unknown')}"
             )
         else:
-            print(f"[PROCESS {process_id}] [SHARDING] {full_name}: Non-JAX array, type={type(obj)}")
+            print(
+                f"[PROCESS {process_id}] [SHARDING] {full_name}: Non-JAX array, type={type(obj)}"
+            )
 
     # Print RadixCache's sharding information
     if hasattr(cache, "kv_cache_sharding"):
@@ -53,7 +59,9 @@ def print_cache_sharding_info(cache, mesh, req_pool, allocator, process_id):
             f"[PROCESS {process_id}] [CACHE] KV cache sharding strategy: {cache.kv_cache_sharding}"
         )
     if hasattr(cache, "token_sharding"):
-        print(f"[PROCESS {process_id}] [CACHE] Token sharding strategy: {cache.token_sharding}")
+        print(
+            f"[PROCESS {process_id}] [CACHE] Token sharding strategy: {cache.token_sharding}"
+        )
 
     # Print ReqToTokenPool's sharding information
     print_sharding(req_pool.req_to_token, "req_to_token_pool.req_to_token")
@@ -106,7 +114,9 @@ def create_multi_process_radix_cache(process_id, tp_size=8):
 
         import numpy as np
 
-        devices_reshaped = np.array(local_devices).reshape(local_data_size, local_tensor_size)
+        devices_reshaped = np.array(local_devices).reshape(
+            local_data_size, local_tensor_size
+        )
         mesh = Mesh(devices_reshaped, ("data", "tensor"))
     else:
         # If local devices are insufficient, use single axis
@@ -136,7 +146,9 @@ def create_multi_process_radix_cache(process_id, tp_size=8):
     )
 
     # Create allocator
-    allocator = TokenToKVPoolAllocator(size=pool_size_per_device, dtype=dtype, kvcache=kv_cache)
+    allocator = TokenToKVPoolAllocator(
+        size=pool_size_per_device, dtype=dtype, kvcache=kv_cache
+    )
 
     # Create RadixCache, each process independent
     cache = RadixCache(
@@ -167,11 +179,15 @@ def test_basic_radix_cache_operations(cache, process_id):
 
         # Test matching
         match_result = cache.match_prefix(key)
-        print(f"[PROCESS {process_id}] Match result length: {len(match_result.device_indices)}")
+        print(
+            f"[PROCESS {process_id}] Match result length: {len(match_result.device_indices)}"
+        )
 
         # Test getting KV data
         kv_data, matched_len = cache.get_cached_kv(key)
-        print(f"[PROCESS {process_id}] KV data shape: {kv_data.shape}, match length: {matched_len}")
+        print(
+            f"[PROCESS {process_id}] KV data shape: {kv_data.shape}, match length: {matched_len}"
+        )
 
     # Test cache size
     print(f"[PROCESS {process_id}] Cache status:")
@@ -196,7 +212,12 @@ def test_memory_usage(cache, process_id, pool_size_per_device):
 
     # Theoretical KV cache size per device
     theoretical_kv_size = (
-        pool_size_per_device * kv_head_num * head_dim * 2 * layer_num * bytes_per_element
+        pool_size_per_device
+        * kv_head_num
+        * head_dim
+        * 2
+        * layer_num
+        * bytes_per_element
     )  # 2 for K and V
     theoretical_kv_size_gb = theoretical_kv_size / (1024**3)
 
@@ -233,7 +254,9 @@ def test_cross_process_isolation(cache, process_id):
         print(f"[PROCESS {process_id}] Inserting key{i+1}: {key}")
         cache.insert(key)
         match_result = cache.match_prefix(key)
-        print(f"[PROCESS {process_id}] Key{i+1} match result: {len(match_result.device_indices)}")
+        print(
+            f"[PROCESS {process_id}] Key{i+1} match result: {len(match_result.device_indices)}"
+        )
 
     # Test cache status
     print(f"[PROCESS {process_id}] Process-specific cache status:")
@@ -252,8 +275,12 @@ def main():
     coordinator_address = os.environ.get("COORDINATOR_ADDRESS", "localhost:12345")
     tp_size = int(os.environ.get("TP_SIZE", "8"))
 
-    print(f"[PROCESS {process_id}] Starting multi-process environment initialization...")
-    print(f"[PROCESS {process_id}] Process ID: {process_id}, total processes: {num_processes}")
+    print(
+        f"[PROCESS {process_id}] Starting multi-process environment initialization..."
+    )
+    print(
+        f"[PROCESS {process_id}] Process ID: {process_id}, total processes: {num_processes}"
+    )
     print(f"[PROCESS {process_id}] Coordinator address: {coordinator_address}")
     print(f"[PROCESS {process_id}] TP size: {tp_size}")
 
@@ -277,7 +304,9 @@ def main():
 
     try:
         # Create multi-process RadixCache
-        cache, mesh, req_pool, allocator = create_multi_process_radix_cache(process_id, tp_size)
+        cache, mesh, req_pool, allocator = create_multi_process_radix_cache(
+            process_id, tp_size
+        )
 
         # Print sharding information
         print_cache_sharding_info(cache, mesh, req_pool, allocator, process_id)

@@ -77,14 +77,28 @@ class LogitsProcessorOutput:
 
         obj.next_token_top_logprobs_val = aux_data["next_token_top_logprobs_val"]
         obj.next_token_top_logprobs_idx = aux_data["next_token_top_logprobs_idx"]
-        obj.next_token_token_ids_logprobs_val = aux_data["next_token_token_ids_logprobs_val"]
-        obj.next_token_token_ids_logprobs_idx = aux_data["next_token_token_ids_logprobs_idx"]
+        obj.next_token_token_ids_logprobs_val = aux_data[
+            "next_token_token_ids_logprobs_val"
+        ]
+        obj.next_token_token_ids_logprobs_idx = aux_data[
+            "next_token_token_ids_logprobs_idx"
+        ]
         obj.input_top_logprobs_val = aux_data["input_top_logprobs_val"]
         obj.input_top_logprobs_idx = aux_data["input_top_logprobs_idx"]
         obj.input_token_ids_logprobs_val = aux_data["input_token_ids_logprobs_val"]
         obj.input_token_ids_logprobs_idx = aux_data["input_token_ids_logprobs_idx"]
 
         return obj
+
+    def truncate_logits_processor_output(self, idx: jax.Array):
+        for field in dataclasses.fields(self):
+            value = getattr(self, field.name)
+            if value is None:
+                continue
+            if isinstance(value, jax.Array) or isinstance(value, list):
+                # 注意：对于 jax.Array，切片操作是合法的；对于 list，也可以切片
+                truncated = value[idx]
+                setattr(self, field.name, truncated)
 
 
 class LogitsProcessor(nnx.Module):

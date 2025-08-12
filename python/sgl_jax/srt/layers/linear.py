@@ -48,9 +48,9 @@ class LinearBase(nnx.Module):
         )
         if use_bias:
             self.bias = nnx.Param(
-                nnx.with_partitioning(nnx.initializers.zeros_init(), (kernel_axes[-1],))(
-                    rngs.params(), (output_size,), params_dtype
-                )
+                nnx.with_partitioning(
+                    nnx.initializers.zeros_init(), (kernel_axes[-1],)
+                )(rngs.params(), (output_size,), params_dtype)
             )
         else:
             self.bias = None

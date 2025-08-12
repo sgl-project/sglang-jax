@@ -5,7 +5,10 @@ from jax.sharding import Mesh
 
 from sgl_jax.srt.configs.load_config import LoadConfig
 from sgl_jax.srt.configs.model_config import ModelConfig
-from sgl_jax.srt.model_loader.arch import get_architecture_class_name, get_model_architecture
+from sgl_jax.srt.model_loader.arch import (
+    get_architecture_class_name,
+    get_model_architecture,
+)
 from sgl_jax.srt.model_loader.loader import BaseModelLoader, get_model_loader
 
 

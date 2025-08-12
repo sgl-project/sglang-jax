@@ -183,8 +183,12 @@ class TokenizerManager:
         self.resume_memory_occupation_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
-        self.flush_cache_communicator = _Communicator(self.send_to_scheduler, server_args.dp_size)
-        self.profile_communicator = _Communicator(self.send_to_scheduler, server_args.dp_size)
+        self.flush_cache_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
+        self.profile_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
         self.get_internal_state_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
@@ -232,7 +236,6 @@ class TokenizerManager:
             ]
         )
         self.wait_timeout = int(os.environ.get("SGLANG_WAIT_TIMEOUT", "4"))
-        logger.info(f"tokenizer_manager wait_timeout: {self.wait_timeout}")
 
     async def generate_request(
         self,
@@ -264,7 +267,9 @@ class TokenizerManager:
             async for response in self._wait_one_response(obj, state, request):
                 yield response
         else:
-            async for response in self._handle_batch_request(obj, request, created_time):
+            async for response in self._handle_batch_request(
+                obj, request, created_time
+            ):
                 yield response
 
     async def _tokenize_one_request(
@@ -301,7 +306,10 @@ class TokenizerManager:
 
         # Check total tokens (input + max_new_tokens)
         max_new_tokens = obj.sampling_params.get("max_new_tokens")
-        if max_new_tokens is not None and (max_new_tokens + input_token_num) >= self.context_len:
+        if (
+            max_new_tokens is not None
+            and (max_new_tokens + input_token_num) >= self.context_len
+        ):
             total_tokens = max_new_tokens + input_token_num
             error_msg = (
                 f"Requested token count exceeds the model's maximum context length "
@@ -312,7 +320,9 @@ class TokenizerManager:
             )
             raise ValueError(error_msg)
 
-    def _validate_input_ids_in_vocab(self, input_ids: List[int], vocab_size: int) -> None:
+    def _validate_input_ids_in_vocab(
+        self, input_ids: List[int], vocab_size: int
+    ) -> None:
         if any(id >= vocab_size for id in input_ids):
             raise ValueError(
                 f"The input_ids {input_ids} contains values greater than the vocab size ({vocab_size})."
@@ -371,7 +381,9 @@ class TokenizerManager:
         for i, req in enumerate(requests):
             # self._validate_token_len(obj[i], input_ids_list[i])
             tokenized_objs.append(
-                self._create_tokenized_object(req, req.text, input_ids_list[i], None, None)
+                self._create_tokenized_object(
+                    req, req.text, input_ids_list[i], None, None
+                )
             )
         logger.debug(f"Completed batch processing for {batch_size} requests")
         return tokenized_objs
@@ -536,7 +548,9 @@ class TokenizerManager:
             rid_to_index = {rid: i for i, rid in enumerate(rids)}
             task_map = {asyncio.create_task(gen.__anext__()): gen for gen in generators}
             while task_map:
-                done, _ = await asyncio.wait(task_map.keys(), return_when=asyncio.FIRST_COMPLETED)
+                done, _ = await asyncio.wait(
+                    task_map.keys(), return_when=asyncio.FIRST_COMPLETED
+                )
 
                 for task in done:
                     gen = task_map.pop(task)
@@ -553,10 +567,9 @@ class TokenizerManager:
         return (await self.flush_cache_communicator(FlushCacheReqInput()))[0]
 
     def abort_request(self, rid: str = "", abort_all: bool = False):
-        rid_key = rid[0] if isinstance(rid, list) else rid
-        if not abort_all and rid_key not in self.rid_to_state:
+        if not abort_all and rid not in self.rid_to_state:
             return
-        req = AbortReq(rid_key, abort_all)
+        req = AbortReq(rid, abort_all)
         self.send_to_scheduler.send_pyobj(req)
 
     async def start_profile(
@@ -564,6 +577,8 @@ class TokenizerManager:
         output_dir: Optional[str] = None,
         start_step: Optional[int] = None,
         num_steps: Optional[int] = None,
+        host_tracer_level: Optional[int] = None,
+        python_tracer_level: Optional[int] = None,
     ):
         self.auto_create_handle_loop()
         req = ProfileReq(
@@ -571,6 +586,8 @@ class TokenizerManager:
             output_dir=output_dir,
             start_step=start_step,
             num_steps=num_steps,
+            host_tracer_level=host_tracer_level,
+            python_tracer_level=python_tracer_level,
             profile_id=str(time.time()),
         )
         return await self._execute_profile(req)
@@ -636,7 +653,9 @@ class TokenizerManager:
 
     async def get_internal_state(self) -> List[Dict[Any, Any]]:
         req = GetInternalStateReq()
-        responses: List[GetInternalStateReqOutput] = await self.get_internal_state_communicator(req)
+        responses: List[GetInternalStateReqOutput] = (
+            await self.get_internal_state_communicator(req)
+        )
         # Many DP ranks
         return [res.internal_state for res in responses]
 
@@ -648,8 +667,12 @@ class TokenizerManager:
                 self.current_load = internal_state[0]["load"]
         return {"load": self.current_load}
 
-    async def set_internal_state(self, obj: SetInternalStateReq) -> SetInternalStateReqOutput:
-        responses: List[SetInternalStateReqOutput] = await self.set_internal_state_communicator(obj)
+    async def set_internal_state(
+        self, obj: SetInternalStateReq
+    ) -> SetInternalStateReqOutput:
+        responses: List[SetInternalStateReqOutput] = (
+            await self.set_internal_state_communicator(obj)
+        )
         return [res.internal_state for res in responses]
 
     def get_log_request_metadata(self):
@@ -701,7 +724,9 @@ class TokenizerManager:
             elif self.log_requests_level == 3:
                 max_length = 1 << 30
             else:
-                raise ValueError(f"Invalid --log-requests-level: {self.log_requests_level=}")
+                raise ValueError(
+                    f"Invalid --log-requests-level: {self.log_requests_level=}"
+                )
         return max_length, skip_names, out_skip_names
 
     def configure_logging(self, obj: ConfigureLoggingReq):
@@ -723,7 +748,7 @@ class TokenizerManager:
         async def abort_request():
             await asyncio.sleep(2)
             if obj.is_single:
-                self.abort_request(obj.rid[0])
+                self.abort_request(obj.rid)
             else:
                 for rid in obj.rid:
                     self.abort_request(rid)
@@ -738,7 +763,9 @@ class TokenizerManager:
 
         self.no_create_loop = True
         loop = asyncio.get_event_loop()
-        self.asyncio_tasks.add(loop.create_task(print_exception_wrapper(self.handle_loop)))
+        self.asyncio_tasks.add(
+            loop.create_task(print_exception_wrapper(self.handle_loop))
+        )
 
         self.event_loop = loop
 
@@ -748,14 +775,18 @@ class TokenizerManager:
             signal_handler = SignalHandler(self)
             loop.add_signal_handler(signal.SIGTERM, signal_handler.sigterm_handler)
             # Update the signal handler for the process. It overrides the sigquit handler in the launch phase.
-            loop.add_signal_handler(signal.SIGQUIT, signal_handler.running_phase_sigquit_handler)
+            loop.add_signal_handler(
+                signal.SIGQUIT, signal_handler.running_phase_sigquit_handler
+            )
         else:
             logger.warning(
                 "Signal handler is not added because the tokenizer manager is "
                 "not in the main thread. This disables graceful shutdown of the "
                 "tokenizer manager when SIGTERM is received."
             )
-        self.asyncio_tasks.add(loop.create_task(print_exception_wrapper(self.sigterm_watchdog)))
+        self.asyncio_tasks.add(
+            loop.create_task(print_exception_wrapper(self.sigterm_watchdog))
+        )
 
     def dump_requests_before_crash(self):
         if self.crash_dump_performed:
@@ -776,7 +807,9 @@ class TokenizerManager:
         unfinished_requests = []
         for rid, state in self.rid_to_state.items():
             if not state.finished:
-                unfinished_requests.append((state.obj, {}, state.created_time, time.time()))
+                unfinished_requests.append(
+                    (state.obj, {}, state.created_time, time.time())
+                )
         if unfinished_requests:
             data_to_dump.extend(unfinished_requests)
 
@@ -826,7 +859,9 @@ class TokenizerManager:
                 )
                 break
 
-            logger.info(f"Gracefully exiting... remaining number of requests {remain_num_req}")
+            logger.info(
+                f"Gracefully exiting... remaining number of requests {remain_num_req}"
+            )
             if remain_num_req > 0:
                 await asyncio.sleep(5)
             else:
@@ -869,7 +904,8 @@ class TokenizerManager:
                     state,
                     state.obj.top_logprobs_num,
                     state.obj.token_ids_logprob,
-                    state.obj.return_text_in_logprobs and not self.server_args.skip_tokenizer_init,
+                    state.obj.return_text_in_logprobs
+                    and not self.server_args.skip_tokenizer_init,
                     recv_obj,
                     i,
                 )
@@ -940,10 +976,18 @@ class TokenizerManager:
             return
 
         if len(recv_obj.input_token_logprobs_val) > 0:
-            state.input_token_logprobs_val.extend(recv_obj.input_token_logprobs_val[recv_obj_index])
-            state.input_token_logprobs_idx.extend(recv_obj.input_token_logprobs_idx[recv_obj_index])
-        state.output_token_logprobs_val.extend(recv_obj.output_token_logprobs_val[recv_obj_index])
-        state.output_token_logprobs_idx.extend(recv_obj.output_token_logprobs_idx[recv_obj_index])
+            state.input_token_logprobs_val.extend(
+                recv_obj.input_token_logprobs_val[recv_obj_index]
+            )
+            state.input_token_logprobs_idx.extend(
+                recv_obj.input_token_logprobs_idx[recv_obj_index]
+            )
+        state.output_token_logprobs_val.extend(
+            recv_obj.output_token_logprobs_val[recv_obj_index]
+        )
+        state.output_token_logprobs_idx.extend(
+            recv_obj.output_token_logprobs_idx[recv_obj_index]
+        )
         meta_info["input_token_logprobs"] = self.detokenize_logprob_tokens(
             state.input_token_logprobs_val,
             state.input_token_logprobs_idx,
@@ -957,10 +1001,18 @@ class TokenizerManager:
 
         if top_logprobs_num > 0:
             if len(recv_obj.input_top_logprobs_val) > 0:
-                state.input_top_logprobs_val.extend(recv_obj.input_top_logprobs_val[recv_obj_index])
-                state.input_top_logprobs_idx.extend(recv_obj.input_top_logprobs_idx[recv_obj_index])
-            state.output_top_logprobs_val.extend(recv_obj.output_top_logprobs_val[recv_obj_index])
-            state.output_top_logprobs_idx.extend(recv_obj.output_top_logprobs_idx[recv_obj_index])
+                state.input_top_logprobs_val.extend(
+                    recv_obj.input_top_logprobs_val[recv_obj_index]
+                )
+                state.input_top_logprobs_idx.extend(
+                    recv_obj.input_top_logprobs_idx[recv_obj_index]
+                )
+            state.output_top_logprobs_val.extend(
+                recv_obj.output_top_logprobs_val[recv_obj_index]
+            )
+            state.output_top_logprobs_idx.extend(
+                recv_obj.output_top_logprobs_idx[recv_obj_index]
+            )
             meta_info["input_top_logprobs"] = self.detokenize_top_logprobs_tokens(
                 state.input_top_logprobs_val,
                 state.input_top_logprobs_idx,
@@ -991,10 +1043,12 @@ class TokenizerManager:
                 state.input_token_ids_logprobs_idx,
                 return_text_in_logprobs,
             )
-            meta_info["output_token_ids_logprobs"] = self.detokenize_top_logprobs_tokens(
-                state.output_token_ids_logprobs_val,
-                state.output_token_ids_logprobs_idx,
-                return_text_in_logprobs,
+            meta_info["output_token_ids_logprobs"] = (
+                self.detokenize_top_logprobs_tokens(
+                    state.output_token_ids_logprobs_val,
+                    state.output_token_ids_logprobs_idx,
+                    return_text_in_logprobs,
+                )
             )
 
     def detokenize_logprob_tokens(
@@ -1034,7 +1088,9 @@ class TokenizerManager:
         return ret
 
     def dump_requests(self, state: ReqState, out_dict: dict):
-        self.dump_request_list.append((state.obj, out_dict, state.created_time, time.time()))
+        self.dump_request_list.append(
+            (state.obj, out_dict, state.created_time, time.time())
+        )
 
         if len(self.dump_request_list) >= self.dump_requests_threshold:
             filename = os.path.join(
@@ -1061,7 +1117,9 @@ class TokenizerManager:
 
     def record_request_for_crash_dump(self, state: ReqState, out_dict: dict):
         current_time = time.time()
-        self.crash_dump_request_list.append((state.obj, out_dict, state.created_time, current_time))
+        self.crash_dump_request_list.append(
+            (state.obj, out_dict, state.created_time, current_time)
+        )
         # Remove requests older than 5 minutes based on finish time
         while (
             self.crash_dump_request_list
@@ -1153,7 +1211,9 @@ class TokenizerManager:
                 sampling_params={"max_new_tokens": 1},
             )
         else:
-            raise ValueError("Invalid combination of query/items types for score_request.")
+            raise ValueError(
+                "Invalid combination of query/items types for score_request."
+            )
 
         results = await self.generate_request(batch_request, request).__anext__()
         scores = []
@@ -1161,19 +1221,25 @@ class TokenizerManager:
         for result in results:
             # Get logprobs for each token
             logprobs = {}
-            for logprob, token_id, _ in result["meta_info"].get("output_token_ids_logprobs", [])[0]:
+            for logprob, token_id, _ in result["meta_info"].get(
+                "output_token_ids_logprobs", []
+            )[0]:
                 if token_id in label_token_ids:
                     logprobs[token_id] = logprob
 
             # Get scores in order of label_token_ids
-            score_list = [logprobs.get(token_id, float("-inf")) for token_id in label_token_ids]
+            score_list = [
+                logprobs.get(token_id, float("-inf")) for token_id in label_token_ids
+            ]
 
             # Apply softmax to logprobs if needed
             if apply_softmax:
                 score_list = jax.nn.softmax(jnp.asarray(score_list), axis=0).tolist()
             else:
                 # Convert logprobs to probabilities if not using softmax
-                score_list = [math.exp(x) if x != float("-inf") else 0.0 for x in score_list]
+                score_list = [
+                    math.exp(x) if x != float("-inf") else 0.0 for x in score_list
+                ]
 
             scores.append(score_list)
 
@@ -1207,7 +1273,9 @@ class SignalHandler:
         self.tokenizer_manager.gracefully_exit = True
 
     def running_phase_sigquit_handler(self, signum=None, frame=None):
-        logger.error("Received sigquit from a child process. It usually means the child failed.")
+        logger.error(
+            "Received sigquit from a child process. It usually means the child failed."
+        )
         self.tokenizer_manager.dump_requests_before_crash()
         kill_process_tree(os.getpid())
 

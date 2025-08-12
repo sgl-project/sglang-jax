@@ -43,7 +43,9 @@ def get_available_device_memory(device, distributed=False, empty_cache=True):
 
         with jax.sharding.use_mesh(mesh=mesh):
 
-            @jax.shard_map(mesh=mesh, in_specs=PartitionSpec(None), out_specs=PartitionSpec(None))
+            @jax.shard_map(
+                mesh=mesh, in_specs=PartitionSpec(None), out_specs=PartitionSpec(None)
+            )
             def _get_available_memory_distributed(a):
                 return jax.lax.pmin(a, axis_name="node")
 

@@ -63,7 +63,7 @@ def run_eval(args):
     else:
         raise ValueError(f"Invalid eval name: {args.eval_name}")
 
-    if args.max_tokens is not None:
+    if hasattr(args, "max_tokens") and args.max_tokens is not None:
         max_tokens = args.max_tokens
     else:
         max_tokens = 2048

@@ -57,7 +57,9 @@ class TestRadixCache(unittest.TestCase):
             mesh=mesh,
         )
 
-        allocator = TokenToKVPoolAllocator(size=self.pool_size, dtype=self.dtype, kvcache=kv_cache)
+        allocator = TokenToKVPoolAllocator(
+            size=self.pool_size, dtype=self.dtype, kvcache=kv_cache
+        )
 
         return mesh, req_pool, allocator
 
@@ -81,7 +83,10 @@ class TestRadixCache(unittest.TestCase):
 
         # create memory pool
         req_pool = ReqToTokenPool(
-            size=1024, max_context_len=self.max_seq_len, mesh=mesh, token_partition_axis="data"
+            size=1024,
+            max_context_len=self.max_seq_len,
+            mesh=mesh,
+            token_partition_axis="data",
         )
 
         # create KV cache
@@ -97,7 +102,9 @@ class TestRadixCache(unittest.TestCase):
         )
 
         # create allocator
-        allocator = TokenToKVPoolAllocator(size=self.pool_size, dtype=self.dtype, kvcache=kv_cache)
+        allocator = TokenToKVPoolAllocator(
+            size=self.pool_size, dtype=self.dtype, kvcache=kv_cache
+        )
 
         return mesh, req_pool, allocator
 
@@ -124,7 +131,9 @@ class TestRadixCache(unittest.TestCase):
 
     def _print_cache_sharding_info(self, cache, mesh, req_pool, allocator):
         print("\n" + "=" * 60)
-        print(f"[MESH INFO] device number: {len(self.devices)}, Mesh axis: {mesh.axis_names}")
+        print(
+            f"[MESH INFO] device number: {len(self.devices)}, Mesh axis: {mesh.axis_names}"
+        )
         print(f"[MESH INFO] Mesh device layout: {mesh.devices.shape}")
         print(f"[MESH INFO] Mesh: {mesh}")
 
@@ -430,7 +439,9 @@ class TestRadixCache(unittest.TestCase):
         # since there is no actual KV data, get_cpu_copy will use token values as indices
         # this will return data at the corresponding position in the KV cache (usually zero values, because the cache is initialized to zero)
         # verify that the returned data is not empty, but contains zero value data
-        self.assertEqual(kv_data.shape[1], matched_len, "returned KV data length should match")
+        self.assertEqual(
+            kv_data.shape[1], matched_len, "returned KV data length should match"
+        )
 
         # verify data content - should be all zero (because KV cache is initialized to zero)
         kv_data_cpu = jax.device_get(kv_data)
@@ -455,7 +466,9 @@ class TestRadixCache(unittest.TestCase):
     def test_kv_cache_events(self):
         mesh, req_pool, allocator = self._create_auto_device_setup()
 
-        cache = self._create_radix_cache(mesh, req_pool, allocator, enable_kv_cache_events=True)
+        cache = self._create_radix_cache(
+            mesh, req_pool, allocator, enable_kv_cache_events=True
+        )
 
         # test event queue
         events = cache.take_events()
@@ -524,7 +537,9 @@ class TestRadixCache(unittest.TestCase):
         # verify device type (should be CPU)
         if hasattr(device_indices, "device"):
             device_str = str(device_indices.device)
-            self.assertIn("cpu", device_str.lower(), f"Expected CPU device, got: {device_str}")
+            self.assertIn(
+                "cpu", device_str.lower(), f"Expected CPU device, got: {device_str}"
+            )
 
         # check array content correctness
         self.assertEqual(len(device_indices), len(key))
@@ -552,7 +567,9 @@ class TestRadixCache(unittest.TestCase):
         device_indices = match_result.device_indices
         if hasattr(device_indices, "device"):
             device_str = str(device_indices.device)
-            self.assertIn("cpu", device_str.lower(), f"Expected CPU device, got: {device_str}")
+            self.assertIn(
+                "cpu", device_str.lower(), f"Expected CPU device, got: {device_str}"
+            )
 
         # verify content
         self.assertEqual(len(device_indices), len(prefix_key))
@@ -572,7 +589,9 @@ class TestRadixCache(unittest.TestCase):
         if hasattr(device_indices, "device"):
             device_str = str(device_indices.device)
             self.assertIn(
-                "cpu", device_str.lower(), f"Expected CPU device for empty array, got: {device_str}"
+                "cpu",
+                device_str.lower(),
+                f"Expected CPU device for empty array, got: {device_str}",
             )
 
         # test no match
@@ -596,7 +615,13 @@ class MockRequest:
     """mock request object for testing cache request functionality"""
 
     def __init__(
-        self, req_pool_idx, origin_input_ids, output_ids, fill_ids, prefix_indices, last_node
+        self,
+        req_pool_idx,
+        origin_input_ids,
+        output_ids,
+        fill_ids,
+        prefix_indices,
+        last_node,
     ):
         self.req_pool_idx = req_pool_idx
         self.origin_input_ids = origin_input_ids
@@ -623,7 +648,10 @@ class TestRadixCacheWithRequests(unittest.TestCase):
         mesh = Mesh([self.devices[0]], axis_names=("tensor",))
 
         self.req_pool = ReqToTokenPool(
-            size=1024, max_context_len=self.max_seq_len, mesh=mesh, token_partition_axis="tensor"
+            size=1024,
+            max_context_len=self.max_seq_len,
+            mesh=mesh,
+            token_partition_axis="tensor",
         )
 
         # use tensor axis for single device (but not actually sharded)
@@ -659,7 +687,9 @@ class TestRadixCacheWithRequests(unittest.TestCase):
     def _print_cache_sharding_info(self, cache, mesh, req_pool, allocator):
         """print cache related sharding information"""
         print("\n" + "=" * 60)
-        print(f"[MESH INFO] device count: {len(self.devices)}, Mesh axis: {mesh.axis_names}")
+        print(
+            f"[MESH INFO] device count: {len(self.devices)}, Mesh axis: {mesh.axis_names}"
+        )
         print(f"[MESH INFO] Mesh device layout: {mesh.devices.shape}")
         print(f"[MESH INFO] Mesh: {mesh}")
 

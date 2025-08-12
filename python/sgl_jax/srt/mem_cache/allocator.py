@@ -1,9 +1,13 @@
 import abc
-from typing import TYPE_CHECKING, Optional
+import logging
+from typing import Optional
 
 import jax.numpy as jnp
+import numpy as np
 
 from sgl_jax.srt.mem_cache.memory_pool import KVCache
+
+logger = logging.getLogger(__name__)
 
 
 class BaseTokenToKVPoolAllocator(abc.ABC):
@@ -88,7 +92,7 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
     def clear(self):
         # The padded slot 0 is used for writing dummy outputs from padded tokens.
-        self.free_slots = jnp.arange(1, self.size + 1, dtype=jnp.int32)
+        self.free_slots = np.arange(1, self.size + 1, dtype=np.int32)
         self.is_not_in_free_group = True
         self.free_group = []
 
@@ -102,14 +106,14 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
         select_index = self.free_slots[:need_size]
         self.free_slots = self.free_slots[need_size:]
-        return select_index
+        return jnp.array(select_index)
 
     def free(self, free_index: jnp.ndarray):
         if free_index.size == 0:
             return
 
         if self.is_not_in_free_group:
-            self.free_slots = jnp.concatenate([self.free_slots, free_index])
+            self.free_slots = np.concatenate([self.free_slots, np.array(free_index)])
         else:
             self.free_group.append(free_index)
 
@@ -134,7 +138,9 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
     def alloc(self, need_size: int) -> Optional[jnp.ndarray]:
         # page-aligned allocation, returning contiguous indices of pages
-        assert need_size % self.page_size == 0, "The allocation size should be page-aligned"
+        assert (
+            need_size % self.page_size == 0
+        ), "The allocation size should be page-aligned"
 
         num_pages = need_size // self.page_size
         if num_pages > len(self.free_pages):

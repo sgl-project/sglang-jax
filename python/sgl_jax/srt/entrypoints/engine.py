@@ -95,10 +95,13 @@ class Engine(EngineBase):
         self.scheduler_info = scheduler_info
 
         context = zmq.Context(2)
-        self.send_to_rpc = get_zmq_socket(context, zmq.DEALER, self.port_args.rpc_ipc_name, True)
+        self.send_to_rpc = get_zmq_socket(
+            context, zmq.DEALER, self.port_args.rpc_ipc_name, True
+        )
 
     def generate(
         self,
+        prompt: Optional[Union[List[str], str]] = None,
         sampling_params: Optional[Union[List[Dict], Dict]] = None,
         # The token ids for text; one can either specify text or input_ids.
         input_ids: Optional[Union[List[List[int]], List[int]]] = None,
@@ -114,6 +117,7 @@ class Engine(EngineBase):
         """
 
         obj = GenerateReqInput(
+            text=prompt,
             input_ids=input_ids,
             sampling_params=sampling_params,
             return_logprob=return_logprob,
@@ -242,7 +246,9 @@ class Engine(EngineBase):
 
     def get_server_info(self):
         loop = asyncio.get_event_loop()
-        internal_states = loop.run_until_complete(self.tokenizer_manager.get_internal_state())
+        internal_states = loop.run_until_complete(
+            self.tokenizer_manager.get_internal_state()
+        )
         return {
             **dataclasses.asdict(self.tokenizer_manager.server_args),
             **self.scheduler_info,
@@ -253,12 +259,16 @@ class Engine(EngineBase):
     def release_memory_occupation(self, tags: Optional[List[str]] = None):
         obj = ReleaseMemoryOccupationReqInput(tags=tags)
         loop = asyncio.get_event_loop()
-        return loop.run_until_complete(self.tokenizer_manager.release_memory_occupation(obj, None))
+        return loop.run_until_complete(
+            self.tokenizer_manager.release_memory_occupation(obj, None)
+        )
 
     def resume_memory_occupation(self, tags: Optional[List[str]] = None):
         obj = ResumeMemoryOccupationReqInput(tags=tags)
         loop = asyncio.get_event_loop()
-        return loop.run_until_complete(self.tokenizer_manager.resume_memory_occupation(obj, None))
+        return loop.run_until_complete(
+            self.tokenizer_manager.resume_memory_occupation(obj, None)
+        )
 
     def score(
         self,
@@ -341,7 +351,9 @@ def _set_envs_and_config():
     def sigchld_handler(signum, frame):
         pid, exitcode = os.waitpid(0, os.WNOHANG)
         if exitcode != 0:
-            logger.warning(f"Child process unexpectedly failed with {exitcode=}. {pid=}")
+            logger.warning(
+                f"Child process unexpectedly failed with {exitcode=}. {pid=}"
+            )
 
     signal.signal(signal.SIGCHLD, sigchld_handler)
 
@@ -349,7 +361,9 @@ def _set_envs_and_config():
     # The child processes will send SIGQUIT to this process when any error happens
     # This process then clean up the whole process tree
     def sigquit_handler(signum, frame):
-        logger.error("Received sigquit from a child process. It usually means the child failed.")
+        logger.error(
+            "Received sigquit from a child process. It usually means the child failed."
+        )
         kill_process_tree(os.getpid())
 
     signal.signal(signal.SIGQUIT, sigquit_handler)
@@ -450,7 +464,9 @@ def _launch_subprocesses(
             raise
 
         if data["status"] != "ready":
-            raise RuntimeError("Initialization failed. Please see the error messages above.")
+            raise RuntimeError(
+                "Initialization failed. Please see the error messages above."
+            )
         scheduler_infos.append(data)
 
     # Assume all schedulers have the same scheduler_info

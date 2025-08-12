@@ -31,8 +31,8 @@ from fastapi.responses import ORJSONResponse
 
 logger = logging.getLogger(__name__)
 
-JAX_PRECOMPILE_DEFAULT_TOKEN_PADDINGS = [1 << i for i in range(6, 10)]
-JAX_PRECOMPILE_DEFAULT_BS_PADDINGS = [1 << i for i in range(4)]
+JAX_PRECOMPILE_DEFAULT_PREFILL_TOKEN_PADDINGS = [1 << i for i in range(6, 10)]
+JAX_PRECOMPILE_DEFAULT_DECODE_BS_PADDINGS = [1 << i for i in range(4)]
 
 _warned_bool_env_var_keys = set()
 
@@ -116,7 +116,9 @@ def set_ulimit(target_soft_limit=65535):
     target_soft_limit_stack_size = 1024 * target_soft_limit
     if current_soft < target_soft_limit_stack_size:
         try:
-            resource.setrlimit(resource_type, (target_soft_limit_stack_size, current_hard))
+            resource.setrlimit(
+                resource_type, (target_soft_limit_stack_size, current_hard)
+            )
         except ValueError as e:
             logger.warning(f"Fail to set RLIMIT_STACK: {e}")
 
@@ -168,7 +170,9 @@ def configure_logger(server_args, prefix: str = ""):
     )
 
 
-def get_zmq_socket(context: zmq.Context, socket_type: zmq.SocketType, endpoint: str, bind: bool):
+def get_zmq_socket(
+    context: zmq.Context, socket_type: zmq.SocketType, endpoint: str, bind: bool
+):
     mem = psutil.virtual_memory()
     total_mem = mem.total / 1024**3
     available_mem = mem.available / 1024**3
@@ -215,7 +219,9 @@ def delete_directory(dirpath):
         print(f"Warning: {dirpath} : {e.strerror}")
 
 
-def dataclass_to_string_truncated(data, max_length=2048, skip_names: Optional[Set[str]] = None):
+def dataclass_to_string_truncated(
+    data, max_length=2048, skip_names: Optional[Set[str]] = None
+):
     if skip_names is None:
         skip_names = set()
     if isinstance(data, str):
@@ -267,7 +273,9 @@ def pyspy_dump_schedulers():
         pid = psutil.Process().pid
         # Command to run py-spy with the PID
         cmd = f"py-spy dump --pid {pid}"
-        result = subprocess.run(cmd, shell=True, capture_output=True, text=True, check=True)
+        result = subprocess.run(
+            cmd, shell=True, capture_output=True, text=True, check=True
+        )
         logger.error(f"Pyspy dump for PID {pid}:\n{result.stdout}")
     except subprocess.CalledProcessError as e:
         logger.error(f"Pyspy failed to dump PID {pid}. Error: {e.stderr}")
@@ -286,7 +294,9 @@ def kill_itself_when_parent_died():
 def set_uvicorn_logging_configs():
     from uvicorn.config import LOGGING_CONFIG
 
-    LOGGING_CONFIG["formatters"]["default"]["fmt"] = "[%(asctime)s] %(levelprefix)s %(message)s"
+    LOGGING_CONFIG["formatters"]["default"][
+        "fmt"
+    ] = "[%(asctime)s] %(levelprefix)s %(message)s"
     LOGGING_CONFIG["formatters"]["default"]["datefmt"] = "%Y-%m-%d %H:%M:%S"
     LOGGING_CONFIG["formatters"]["access"][
         "fmt"
@@ -333,7 +343,9 @@ def launch_dummy_health_check_server(host, port):
 
     try:
         loop = asyncio.get_running_loop()
-        logger.info(f"Dummy health check server scheduled on existing loop at {host}:{port}")
+        logger.info(
+            f"Dummy health check server scheduled on existing loop at {host}:{port}"
+        )
         loop.create_task(server.serve())
 
     except RuntimeError:
@@ -371,7 +383,9 @@ def retry(
             if not should_retry(e):
                 raise Exception(f"retry() observe errors that should not be retried.")
 
-            delay = min(initial_delay * (2**try_index), max_delay) * (0.75 + 0.25 * random.random())
+            delay = min(initial_delay * (2**try_index), max_delay) * (
+                0.75 + 0.25 * random.random()
+            )
 
             logger.warning(
                 f"retry() failed once ({try_index}th try, maximum {max_retry} retries). Will delay {delay:.2f}s and retry. Error: {e}"
@@ -389,7 +403,9 @@ def lru_cache_frozenset(maxsize=128):
         except TypeError:
             # Not hashable; convert based on type
             if isinstance(o, (dict)):
-                return frozenset((_to_hashable(k), _to_hashable(v)) for k, v in o.items())
+                return frozenset(
+                    (_to_hashable(k), _to_hashable(v)) for k, v in o.items()
+                )
             elif isinstance(o, set):
                 return frozenset(_to_hashable(v) for v in o)
             elif isinstance(o, (list, tuple)) or (
@@ -405,7 +421,9 @@ def lru_cache_frozenset(maxsize=128):
         @functools.wraps(func)
         def wrapper(*args, **kwargs):
             h_args = tuple(_to_hashable(a) for a in args)
-            h_kwargs = frozenset((_to_hashable(k), _to_hashable(v)) for k, v in kwargs.items())
+            h_kwargs = frozenset(
+                (_to_hashable(k), _to_hashable(v)) for k, v in kwargs.items()
+            )
             key = (h_args, h_kwargs)
             if key in cache:
                 cache.move_to_end(key)

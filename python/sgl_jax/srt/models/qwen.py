@@ -15,7 +15,7 @@ from sgl_jax.srt.layers.linear import LinearBase
 from sgl_jax.srt.layers.logits_processor import LogitsProcessor
 from sgl_jax.srt.layers.radix_attention import RadixAttention
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
-from sgl_jax.srt.utils.weight_utils import load_hf_weights
+from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
 
 logger = logging.getLogger(__name__)
 
@@ -71,7 +71,9 @@ class QWenMLP(nnx.Module):
 
 
 # @jax.jit
-def _mlp_forward(hidden_states: jax.Array, w1: jax.Array, w2: jax.Array, c_proj: jax.Array):
+def _mlp_forward(
+    hidden_states: jax.Array, w1: jax.Array, w2: jax.Array, c_proj: jax.Array
+):
     a1 = jnp.dot(hidden_states, w1)
     a2 = jnp.dot(hidden_states, w2)
     intermediate_parallel = a1 * jax.nn.silu(a2)
@@ -177,7 +179,9 @@ class QWenBlock(nnx.Module):
     ):
         self.layer_id = layer_id
 
-        self.ln_1 = RMSNorm(config.hidden_size, epsilon=config.layer_norm_epsilon, rngs=rngs)
+        self.ln_1 = RMSNorm(
+            config.hidden_size, epsilon=config.layer_norm_epsilon, rngs=rngs
+        )
 
         rope_theta = getattr(config, "rope_theta", 10000)
         rope_scaling = getattr(config, "rope_scaling", None)
@@ -192,7 +196,9 @@ class QWenBlock(nnx.Module):
             rngs=rngs,
         )
 
-        self.ln_2 = RMSNorm(config.hidden_size, epsilon=config.layer_norm_epsilon, rngs=rngs)
+        self.ln_2 = RMSNorm(
+            config.hidden_size, epsilon=config.layer_norm_epsilon, rngs=rngs
+        )
 
         self.mlp = QWenMLP(
             config.hidden_size,
@@ -253,7 +259,10 @@ class QWenModel(nnx.Module):
     """QWen model"""
 
     def __init__(
-        self, config: PretrainedConfig, dtype: jnp.dtype = jnp.float16, rngs: nnx.Rngs = None
+        self,
+        config: PretrainedConfig,
+        dtype: jnp.dtype = jnp.float16,
+        rngs: nnx.Rngs = None,
     ):
         vocab_size = ((config.vocab_size + 63) // 64) * 64
 
@@ -275,7 +284,9 @@ class QWenModel(nnx.Module):
             for i in range(config.num_hidden_layers)
         ]
 
-        self.ln_f = RMSNorm(config.hidden_size, epsilon=config.layer_norm_epsilon, rngs=rngs)
+        self.ln_f = RMSNorm(
+            config.hidden_size, epsilon=config.layer_norm_epsilon, rngs=rngs
+        )
 
     @trace_function(stage="TRANSFORMER", include_args=False, include_output=True)
     def __call__(
@@ -306,7 +317,9 @@ class QWenModel(nnx.Module):
 class QWenLMHeadModel(nnx.Module):
     """QWen language head model"""
 
-    def __init__(self, config: ModelConfig, rngs: nnx.Rngs = None, mesh: jax.sharding.Mesh = None):
+    def __init__(
+        self, config: ModelConfig, rngs: nnx.Rngs = None, mesh: jax.sharding.Mesh = None
+    ):
         self.mesh = mesh
         self.config = config
         self.dtype = config.dtype
@@ -326,81 +339,92 @@ class QWenLMHeadModel(nnx.Module):
     def load_weights(self, rng_key: jax.Array):
         self.rng = nnx.Rngs(rng_key)
 
+        loader = WeightLoader(
+            model=self, model_config=self.config, mesh=self.mesh, dtype=self.dtype
+        )
+
+        weight_mappings = self._create_qwen_weight_mappings()
+
+        loader.load_weights_from_safetensors(weight_mappings)
+        logger.info("Qwen weights loaded successfully!")
+
+    def _create_qwen_weight_mappings(self) -> dict:
         mappings = {
-            "transformer.wte": ("transformer.embed_tokens.embedding", (None, None)),
-            "transformer.ln_f": ("transformer.ln_f.weight", (None,)),
+            "transformer.wte.weight": WeightMapping(
+                target_path="transformer.embed_tokens.embedding",
+                sharding=(None, None),
+                transpose=False,
+            ),
+            "transformer.ln_f.weight": WeightMapping(
+                target_path="transformer.ln_f.weight", sharding=(None,), transpose=False
+            ),
         }
 
-        if not self.config.hf_config.tie_word_embeddings:
-            mappings.update(
-                {
-                    "lm_head": ("lm_head.embedding", (None, None)),
-                }
+        if not getattr(self.config.hf_config, "tie_word_embeddings", True):
+            mappings["lm_head.weight"] = WeightMapping(
+                target_path="lm_head.embedding", sharding=(None, None), transpose=False
             )
 
         num_layers = self.config.hf_config.num_hidden_layers
         for layer_idx in range(num_layers):
-            mappings.update(
-                {
-                    f"transformer.h.{layer_idx}.ln_1": (
-                        f"transformer.h.{layer_idx}.ln_1.weight",
-                        (None,),
-                    ),
-                    f"transformer.h.{layer_idx}.ln_2": (
-                        f"transformer.h.{layer_idx}.ln_2.weight",
-                        (None,),
-                    ),
-                }
-            )
+            layer_mappings = self._create_layer_mappings(layer_idx)
+            mappings.update(layer_mappings)
 
-            mappings.update(
-                {
-                    f"transformer.h.{layer_idx}.attn.c_attn": (
-                        [
-                            f"transformer.h.{layer_idx}.attn.q_proj.weight",
-                            f"transformer.h.{layer_idx}.attn.k_proj.weight",
-                            f"transformer.h.{layer_idx}.attn.v_proj.weight",
-                        ],
-                        (None, "tensor"),
-                    ),
-                    f"transformer.h.{layer_idx}.attn.c_attn.bias": (
-                        [
-                            f"transformer.h.{layer_idx}.attn.q_proj.bias",
-                            f"transformer.h.{layer_idx}.attn.k_proj.bias",
-                            f"transformer.h.{layer_idx}.attn.v_proj.bias",
-                        ],
-                        (None,),
-                    ),
-                    f"transformer.h.{layer_idx}.attn.c_proj": (
-                        f"transformer.h.{layer_idx}.attn.c_proj.weight",
-                        ("tensor", None),
-                    ),
-                }
-            )
+        return mappings
 
-            mappings.update(
-                {
-                    f"transformer.h.{layer_idx}.mlp.w1": (
-                        f"transformer.h.{layer_idx}.mlp.w1.weight",
-                        (None, "tensor"),
-                    ),
-                    f"transformer.h.{layer_idx}.mlp.w2": (
-                        f"transformer.h.{layer_idx}.mlp.w2.weight",
-                        (None, "tensor"),
-                    ),
-                    f"transformer.h.{layer_idx}.mlp.c_proj": (
-                        f"transformer.h.{layer_idx}.mlp.c_proj.weight",
-                        ("tensor", None),
-                    ),
-                }
-            )
-        load_hf_weights(
-            model_config=self.config,
-            model=self,
-            mappings=mappings,
-            mesh=self.mesh,
-            dtype=self.dtype,
-        )
+    def _create_layer_mappings(self, layer_idx: int) -> dict:
+        prefix = f"transformer.h.{layer_idx}"
+
+        return {
+            f"{prefix}.ln_1.weight": WeightMapping(
+                target_path=f"{prefix}.ln_1.weight", sharding=(None,), transpose=False
+            ),
+            f"{prefix}.ln_2.weight": WeightMapping(
+                target_path=f"{prefix}.ln_2.weight", sharding=(None,), transpose=False
+            ),
+            f"{prefix}.attn.c_attn.weight": WeightMapping(
+                target_path=[
+                    f"{prefix}.attn.q_proj.weight",
+                    f"{prefix}.attn.k_proj.weight",
+                    f"{prefix}.attn.v_proj.weight",
+                ],
+                sharding=(None, "tensor"),
+                transpose=True,
+                head_dim_padding=True,
+                kv_head_padding=True,
+            ),
+            f"{prefix}.attn.c_attn.bias": WeightMapping(
+                target_path=[
+                    f"{prefix}.attn.q_proj.bias",
+                    f"{prefix}.attn.k_proj.bias",
+                    f"{prefix}.attn.v_proj.bias",
+                ],
+                sharding=(None,),
+                transpose=False,
+                head_dim_padding=True,
+                kv_head_padding=True,
+            ),  # bias 不转置
+            f"{prefix}.attn.c_proj.weight": WeightMapping(
+                target_path=f"{prefix}.attn.c_proj.weight",
+                sharding=("tensor", None),
+                transpose=True,
+            ),
+            f"{prefix}.mlp.w1.weight": WeightMapping(
+                target_path=f"{prefix}.mlp.w1.weight",
+                sharding=(None, "tensor"),
+                transpose=True,
+            ),
+            f"{prefix}.mlp.w2.weight": WeightMapping(
+                target_path=f"{prefix}.mlp.w2.weight",
+                sharding=(None, "tensor"),
+                transpose=True,
+            ),
+            f"{prefix}.mlp.c_proj.weight": WeightMapping(
+                target_path=f"{prefix}.mlp.c_proj.weight",
+                sharding=("tensor", None),
+                transpose=True,
+            ),
+        }
 
     def __call__(
         self,
@@ -408,7 +432,9 @@ class QWenLMHeadModel(nnx.Module):
         positions: jax.Array,
         forward_batch: ForwardBatch,
     ):
-        hidden_states, layers_k, layers_v = self.transformer(input_ids, positions, forward_batch)
+        hidden_states, layers_k, layers_v = self.transformer(
+            input_ids, positions, forward_batch
+        )
         result = self.logits_processor(hidden_states, self.lm_head, forward_batch)
 
         if global_tracer.is_session_active():
@@ -416,7 +442,10 @@ class QWenLMHeadModel(nnx.Module):
 
             output_data = {"output_type": str(type(result).__name__)}
 
-            if hasattr(result, "next_token_logits") and result.next_token_logits is not None:
+            if (
+                hasattr(result, "next_token_logits")
+                and result.next_token_logits is not None
+            ):
                 output_data.update(
                     {
                         "logits": result.next_token_logits,

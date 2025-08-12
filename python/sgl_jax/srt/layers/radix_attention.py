@@ -59,26 +59,12 @@ class RadixAttention(nnx.Module):
 
         k = k.reshape(-1, self.kv_head_num, self.qk_head_dim)
         v = v.reshape(-1, self.kv_head_num, self.v_head_dim)
-        # print(f"===========print mesh: {jax.sharding.get_abstract_mesh()}")
-        # print(f"===========[before with] k, shape: {k.shape}, k.sharding: {k.sharding}")
-        # print(f"===========[before with] v, shape: {v.shape}, v.sharding: {v.sharding}")
-        # for i,shard in enumerate(k.addressable_shards):
-        #    print(f"[before k][{i}] {shard.data.shape}")
-        # for i,shard in enumerate(v.addressable_shards):
-        #    print(f"[before v][{i}] {shard.data.shape}")
         k = jax.lax.with_sharding_constraint(
             k, NamedSharding(jax.sharding.get_abstract_mesh(), P(None, "tensor", None))
         )
         v = jax.lax.with_sharding_constraint(
             v, NamedSharding(jax.sharding.get_abstract_mesh(), P(None, "tensor", None))
         )
-        # print(f"===========[after with] k, shape: {k.shape}, k.sharding: {k.sharding}")
-        # print(f"===========[after with] v, shape: {v.shape}, v.sharding: {v.sharding}")
-        # for i,shard in enumerate(k.addressable_shards):
-        #    print(f"[after k][{i}] {shard.data.shape}")
-        # for i,shard in enumerate(v.addressable_shards):
-        #    print(f"[after v][{i}] {shard.data.shape}")
-
         attn_output, k, v = forward_batch.attn_backend(
             q,
             k,

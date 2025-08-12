@@ -14,15 +14,18 @@ from jax.experimental.multihost_utils import broadcast_one_to_all
 
 from sgl_jax.srt.configs.model_config import ModelConfig
 from sgl_jax.srt.layers.logits_processor import LogitsProcessorOutput
-from sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch, global_server_args_dict
+from sgl_jax.srt.managers.schedule_batch import (
+    ModelWorkerBatch,
+    global_server_args_dict,
+)
 from sgl_jax.srt.mem_cache.memory_pool import ReqToTokenPool
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sgl_jax.srt.model_executor.model_runner import MockModelRunner, ModelRunner
 from sgl_jax.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sgl_jax.srt.server_args import ServerArgs
 from sgl_jax.srt.utils.common_utils import (
-    JAX_PRECOMPILE_DEFAULT_BS_PADDINGS,
-    JAX_PRECOMPILE_DEFAULT_TOKEN_PADDINGS,
+    JAX_PRECOMPILE_DEFAULT_DECODE_BS_PADDINGS,
+    JAX_PRECOMPILE_DEFAULT_PREFILL_TOKEN_PADDINGS,
 )
 from sgl_jax.srt.utils.jax_utils import device_array
 
@@ -94,7 +97,9 @@ class ModelWorker:
             self.max_total_num_tokens - 1,
         )
         self.max_req_input_len = self.max_req_len - 5
-        assert self.max_req_len > 0 and self.max_req_input_len > 0, "Memory pool size is too small"
+        assert (
+            self.max_req_len > 0 and self.max_req_input_len > 0
+        ), "Memory pool size is too small"
 
         # Sync random seed across TP workers
         # Each process may have different random_seed. After broadcast, all processes will have the same random_seed.
@@ -104,15 +109,15 @@ class ModelWorker:
         self.worker = self
 
         # precompile
-        self.precompile_token_paddings = (
-            server_args.jax_precompile_token_paddings
-            if server_args.jax_precompile_token_paddings is not None
-            else JAX_PRECOMPILE_DEFAULT_TOKEN_PADDINGS
+        self.precompile_prefill_token_paddings = (
+            server_args.jax_precompile_prefill_token_paddings
+            if server_args.jax_precompile_prefill_token_paddings is not None
+            else JAX_PRECOMPILE_DEFAULT_PREFILL_TOKEN_PADDINGS
         )
-        self.precompile_bs_paddings = (
-            server_args.jax_precompile_bs_paddings
-            if server_args.jax_precompile_bs_paddings is not None
-            else JAX_PRECOMPILE_DEFAULT_BS_PADDINGS
+        self.precompile_decode_bs_paddings = (
+            server_args.jax_precompile_decode_bs_paddings
+            if server_args.jax_precompile_decode_bs_paddings is not None
+            else JAX_PRECOMPILE_DEFAULT_DECODE_BS_PADDINGS
         )
 
     def run_precompile(self):
@@ -122,7 +127,9 @@ class ModelWorker:
     def precompile_extend(self):
         start_time = time.perf_counter()
         logger.info(f"[EXTEND] begin to precompile")
-        for pair in itertools.product(self.precompile_bs_paddings, self.precompile_token_paddings):
+        for pair in itertools.product(
+            [1, self.max_running_requests], self.precompile_prefill_token_paddings
+        ):
             pair = list(pair)
             bs, num_tokens = pair[0], pair[1]
             logger.info(f"[EXTEND] precompile ({bs=}, {num_tokens=})")
@@ -132,7 +139,6 @@ class ModelWorker:
             model_worker_batch = self.generate_model_worker_batch(
                 bs, num_tokens, ForwardMode.EXTEND
             )
-            # model_worker_batch.print_batch_shape()
             self.forward_batch_generation(model_worker_batch=model_worker_batch)
 
         end_time = time.perf_counter()
@@ -149,12 +155,12 @@ class ModelWorker:
         invalid_positions = np.array([0] * (num_tokens - bs), dtype=jnp.int32)
         if mode == ForwardMode.EXTEND:
             valid_cache_loc = np.arange(bs)
-            invalid_cache_loc = np.array([0] * (bs * self.max_req_len - bs))
+            invalid_cache_loc = np.array([0] * (self.max_total_num_tokens - bs))
         else:
             valid_cache_loc = np.arange(bs * 2)
-            padding_size = bs * self.max_req_len - bs * 2
+            padding_size = self.max_total_num_tokens - bs * 2
             if padding_size < 0:
-                padding_size = bs * 2 - bs * self.max_req_len
+                padding_size = bs * 2 - bs * self.max_total_num_tokens
             invalid_cache_loc = np.array([0] * (padding_size))
         return ModelWorkerBatch(
             bid=1,
@@ -162,10 +168,13 @@ class ModelWorker:
             input_ids=device_array(
                 self.mesh, np.concat([valid_input_ids, invalid_input_ids], axis=0)
             ),
+            real_input_ids_len=len(valid_input_ids),
+            real_bs=bs,
             req_pool_indices=device_array(self.mesh, np.arange(bs, dtype=jnp.int32)),
             seq_lens=device_array(self.mesh, np.array([1] * bs, dtype=jnp.int32)),
             out_cache_loc=device_array(
-                self.mesh, np.concat([valid_out_cache_loc, invalid_out_cache_loc], axis=0)
+                self.mesh,
+                np.concat([valid_out_cache_loc, invalid_out_cache_loc], axis=0),
             ),
             return_logprob=False,
             sampling_info=SamplingBatchInfo.generate_for_precompile(
@@ -179,16 +188,26 @@ class ModelWorker:
             cache_loc=device_array(
                 self.mesh, np.concat([valid_cache_loc, invalid_cache_loc], axis=0)
             ),
-            extend_prefix_lens=jnp.array([0] * bs) if mode == ForwardMode.EXTEND else None,
-            extend_seq_lens=jnp.array([1] * bs) if mode == ForwardMode.EXTEND else None,
+            extend_prefix_lens=(
+                device_array(self.mesh, np.array([0] * bs))
+                if mode == ForwardMode.EXTEND
+                else None
+            ),
+            extend_seq_lens=(
+                device_array(self.mesh, np.array([1] * bs))
+                if mode == ForwardMode.EXTEND
+                else None
+            ),
         )
 
     def precompile_decode(self):
         start_time = time.perf_counter()
         logger.info(f"[DECODE] begin to precompile")
-        for bs in self.precompile_bs_paddings:
+        for bs in self.precompile_decode_bs_paddings:
             logger.info(f"[DECODE] precompile ({bs=})")
-            model_worker_batch = self.generate_model_worker_batch(bs, bs, ForwardMode.DECODE)
+            model_worker_batch = self.generate_model_worker_batch(
+                bs, bs, ForwardMode.DECODE
+            )
             self.forward_batch_generation(model_worker_batch=model_worker_batch)
 
         end_time = time.perf_counter()
@@ -218,7 +237,10 @@ class ModelWorker:
         return getattr(self.model_runner.model, "pad_input_ids", None)
 
     def get_memory_pool(self):
-        return (self.model_runner.req_to_token_pool, self.model_runner.token_to_kv_pool_allocator)
+        return (
+            self.model_runner.req_to_token_pool,
+            self.model_runner.token_to_kv_pool_allocator,
+        )
 
     def forward_batch_generation(
         self,
@@ -227,6 +249,8 @@ class ModelWorker:
         skip_sample: bool = False,
     ) -> Tuple[Union[LogitsProcessorOutput, jax.Array], Optional[jax.Array]]:
         forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
+        import jax._src.test_util as jtu
+
         logits_output = self.model_runner.forward(forward_batch)
 
         if launch_done is not None:
@@ -237,7 +261,13 @@ class ModelWorker:
         else:
             next_token_ids = self.model_runner.sample(logits_output, model_worker_batch)
 
-        return logits_output, next_token_ids
+        idx = model_worker_batch.extend_start_loc[: model_worker_batch.real_bs]
+        if model_worker_batch.forward_mode == ForwardMode.EXTEND:
+            idx = np.cumsum(
+                model_worker_batch.extend_seq_lens[: model_worker_batch.real_bs] - 1
+            )
+
+        return logits_output.truncate_logits_processor_output(idx), next_token_ids[idx]
 
 
 class MockModelWorker:
@@ -285,7 +315,9 @@ class MockModelWorker:
             self.max_total_num_tokens - 1,
         )
         self.max_req_input_len = self.max_req_len - 5
-        assert self.max_req_len > 0 and self.max_req_input_len > 0, "Memory pool size is too small"
+        assert (
+            self.max_req_len > 0 and self.max_req_input_len > 0
+        ), "Memory pool size is too small"
 
         # A reference make this class has the same member as TpModelWorkerClient
         self.worker = self

@@ -93,10 +93,13 @@ class HumanEval(Eval):
 
         def fn(sample: Dict[str, str]):
             prompt_messages = [
-                sampler._pack_message(role="user", content=instruction + sample["prompt"])
+                sampler._pack_message(
+                    role="user", content=instruction + sample["prompt"]
+                )
             ]
             completions = [
-                find_code(sampler(prompt_messages)) for _ in range(self._num_samples_per_task)
+                find_code(sampler(prompt_messages))
+                for _ in range(self._num_samples_per_task)
             ]
             results = evaluate_functional_correctness(sample, completions)
             total = len(results)
@@ -124,5 +127,7 @@ class HumanEval(Eval):
                 },
             )
 
-        results = common.map_with_progress(fn, self.examples, num_threads=self._num_threads)
+        results = common.map_with_progress(
+            fn, self.examples, num_threads=self._num_threads
+        )
         return common.aggregate_results(results)

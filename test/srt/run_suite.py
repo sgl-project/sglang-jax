@@ -1,14 +1,16 @@
 import argparse
 import glob
+import os
+import signal
+import subprocess
+import sys
+import threading
 import time
 from dataclasses import dataclass
-from typing import List, Optional, Callable
-import os
-import subprocess
-import threading
-import signal
+from typing import Callable, List, Optional
+
 import psutil
-import sys
+
 
 @dataclass
 class TestFile:
@@ -38,6 +40,7 @@ def run_with_timeout(
         raise RuntimeError()
 
     return ret_value[0]
+
 
 def kill_process_tree(parent_pid, include_parent: bool = True, skip_pid: int = None):
     """Kill the process and all its child processes."""
@@ -77,6 +80,7 @@ def kill_process_tree(parent_pid, include_parent: bool = True, skip_pid: int = N
         except psutil.NoSuchProcess:
             pass
 
+
 def run_unittest_files(files: List[TestFile], timeout_per_file: float):
     tic = time.perf_counter()
     success = True
@@ -96,7 +100,10 @@ def run_unittest_files(files: List[TestFile], timeout_per_file: float):
             tic = time.perf_counter()
 
             process = subprocess.Popen(
-                ["uv", "run", "python3", filename], stdout=None, stderr=None, env=os.environ
+                ["uv", "run", "python3", filename],
+                stdout=None,
+                stderr=None,
+                env=os.environ,
             )
             process.wait()
             elapsed = time.perf_counter() - tic
@@ -131,40 +138,32 @@ def run_unittest_files(files: List[TestFile], timeout_per_file: float):
 
     return 0 if success else -1
 
+
 suites = {
     "per-commit": [
-        TestFile("test/srt/test_tpu_availability.py", 30),
+        TestFile("test/srt/test_tpu_availability.py", 3),
     ],
     "per-commit-tpu-v6e-1": [
-        
+        TestFile("test/srt/test_tpu_availability.py", 3),
+        TestFile("test/srt/test_abort.py", 20),
+        TestFile("test/srt/test_qwen_models.py", 30),
+        TestFile("test/srt/openai_server/basic/test_protocol.py", 10),
+        TestFile("test/srt/openai_server/basic/test_serving_chat.py", 10),
+        TestFile("test/srt/openai_server/basic/test_serving_completions.py", 10),
+        TestFile("test/srt/openai_server/basic/test_openai_server.py", 10),
     ],
-    "per-commit-tpu-v6e-2": [
-        
-    ],
+    "per-commit-tpu-v6e-2": [],
     "per-commit-tpu-v6e-4": [
-        
+        TestFile("test/srt/test_base_tp.py", 45),
+        TestFile("test/srt/test_precompile.py", 300),
     ],
-    "per-commit-tpu-v6e-8": [
-        
-    ],
-    "per-commit-tpu-v6e-16": [
-        
-    ],
-    "per-commit-tpu-v6e-32": [
-        
-    ],
-    "per-commit-tpu-v6e-128": [
-    
-    ],
-    "per-commit-cpu": [
-        
-    ],
-    "nightly": [
-        
-    ],
-    "sglang_dependency_test": [
-        
-    ],
+    "per-commit-tpu-v6e-8": [],
+    "per-commit-tpu-v6e-16": [],
+    "per-commit-tpu-v6e-32": [],
+    "per-commit-tpu-v6e-128": [],
+    "per-commit-cpu": [],
+    "nightly": [],
+    "sglang_dependency_test": [],
 }
 
 

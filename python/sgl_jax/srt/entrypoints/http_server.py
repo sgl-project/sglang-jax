@@ -107,8 +107,12 @@ async def lifespan(fast_api_app: FastAPI):
     fast_api_app.state.openai_serving_embedding = OpenAIServingEmbedding(
         _global_state.tokenizer_manager, _global_state.template_manager
     )
-    fast_api_app.state.openai_serving_score = OpenAIServingScore(_global_state.tokenizer_manager)
-    fast_api_app.state.openai_serving_rerank = OpenAIServingRerank(_global_state.tokenizer_manager)
+    fast_api_app.state.openai_serving_score = OpenAIServingScore(
+        _global_state.tokenizer_manager
+    )
+    fast_api_app.state.openai_serving_rerank = OpenAIServingRerank(
+        _global_state.tokenizer_manager
+    )
 
     server_args: ServerArgs = fast_api_app.server_args
     if server_args.warmups is not None:
@@ -279,12 +283,18 @@ async def generate_request(obj: GenerateReqInput, request: Request):
 
         async def stream_results() -> AsyncIterator[bytes]:
             try:
-                async for out in _global_state.tokenizer_manager.generate_request(obj, request):
-                    yield b"data: " + orjson.dumps(out, option=orjson.OPT_NON_STR_KEYS) + b"\n\n"
+                async for out in _global_state.tokenizer_manager.generate_request(
+                    obj, request
+                ):
+                    yield b"data: " + orjson.dumps(
+                        out, option=orjson.OPT_NON_STR_KEYS
+                    ) + b"\n\n"
             except ValueError as e:
                 out = {"error": {"message": str(e)}}
                 logger.error(f"[http_server] Error: {e}")
-                yield b"data: " + orjson.dumps(out, option=orjson.OPT_NON_STR_KEYS) + b"\n\n"
+                yield b"data: " + orjson.dumps(
+                    out, option=orjson.OPT_NON_STR_KEYS
+                ) + b"\n\n"
             yield b"data: [DONE]\n\n"
 
         return StreamingResponse(
@@ -294,7 +304,9 @@ async def generate_request(obj: GenerateReqInput, request: Request):
         )
     else:
         try:
-            ret = await _global_state.tokenizer_manager.generate_request(obj, request).__anext__()
+            ret = await _global_state.tokenizer_manager.generate_request(
+                obj, request
+            ).__anext__()
             return ret
         except ValueError as e:
             logger.error(f"[http_server] Error: {e}")
@@ -316,7 +328,9 @@ async def generate_from_file_request(file: UploadFile, request: Request):
     )
 
     try:
-        ret = await _global_state.tokenizer_manager.generate_request(obj, request).__anext__()
+        ret = await _global_state.tokenizer_manager.generate_request(
+            obj, request
+        ).__anext__()
         return ret
     except ValueError as e:
         logger.error(f"Error: {e}")
@@ -327,7 +341,9 @@ async def generate_from_file_request(file: UploadFile, request: Request):
 async def encode_request(obj: EmbeddingReqInput, request: Request):
     """Handle an embedding request."""
     try:
-        ret = await _global_state.tokenizer_manager.generate_request(obj, request).__anext__()
+        ret = await _global_state.tokenizer_manager.generate_request(
+            obj, request
+        ).__anext__()
         return ret
     except ValueError as e:
         return _create_error_response(e)
@@ -337,7 +353,9 @@ async def encode_request(obj: EmbeddingReqInput, request: Request):
 async def classify_request(obj: EmbeddingReqInput, request: Request):
     """Handle a reward model request. Now the arguments and return values are the same as embedding models."""
     try:
-        ret = await _global_state.tokenizer_manager.generate_request(obj, request).__anext__()
+        ret = await _global_state.tokenizer_manager.generate_request(
+            obj, request
+        ).__anext__()
         return ret
     except ValueError as e:
         return _create_error_response(e)
@@ -364,6 +382,8 @@ async def start_profile_async(obj: Optional[ProfileReqInput] = None):
         output_dir=obj.output_dir,
         start_step=obj.start_step,
         num_steps=obj.num_steps,
+        host_tracer_level=obj.host_tracer_level,
+        python_tracer_level=obj.python_tracer_level,
     )
     return Response(
         content="Start profiling.\n",
@@ -382,7 +402,9 @@ async def stop_profile_async():
 
 
 @app.api_route("/release_memory_occupation", methods=["GET", "POST"])
-async def release_memory_occupation(obj: ReleaseMemoryOccupationReqInput, request: Request):
+async def release_memory_occupation(
+    obj: ReleaseMemoryOccupationReqInput, request: Request
+):
     """Release GPU memory occupation temporarily."""
     try:
         await _global_state.tokenizer_manager.release_memory_occupation(obj, request)
@@ -391,7 +413,9 @@ async def release_memory_occupation(obj: ReleaseMemoryOccupationReqInput, reques
 
 
 @app.api_route("/resume_memory_occupation", methods=["GET", "POST"])
-async def resume_memory_occupation(obj: ResumeMemoryOccupationReqInput, request: Request):
+async def resume_memory_occupation(
+    obj: ResumeMemoryOccupationReqInput, request: Request
+):
     """Resume GPU memory occupation."""
     try:
         await _global_state.tokenizer_manager.resume_memory_occupation(obj, request)
@@ -434,7 +458,9 @@ async def configure_logging(obj: ConfigureLoggingReq, request: Request):
 async def abort_request(obj: AbortReq, request: Request):
     """Abort a request."""
     try:
-        _global_state.tokenizer_manager.abort_request(rid=obj.rid, abort_all=obj.abort_all)
+        _global_state.tokenizer_manager.abort_request(
+            rid=obj.rid, abort_all=obj.abort_all
+        )
         return Response(status_code=200)
     except Exception as e:
         return _create_error_response(e)
@@ -454,7 +480,9 @@ async def parse_function_call_request(obj: ParseFunctionCallReq, request: Reques
     # 3) Organize the response content
     response_data = {
         "normal_text": normal_text,
-        "calls": [call.model_dump() for call in calls],  # Convert pydantic objects to dictionaries
+        "calls": [
+            call.model_dump() for call in calls
+        ],  # Convert pydantic objects to dictionaries
     }
 
     return ORJSONResponse(content=response_data, status_code=200)
@@ -512,9 +540,13 @@ async def openai_v1_completions(request: CompletionRequest, raw_request: Request
 
 
 @app.post("/v1/chat/completions", dependencies=[Depends(validate_json_request)])
-async def openai_v1_chat_completions(request: ChatCompletionRequest, raw_request: Request):
+async def openai_v1_chat_completions(
+    request: ChatCompletionRequest, raw_request: Request
+):
     """OpenAI-compatible chat completion endpoint."""
-    return await raw_request.app.state.openai_serving_chat.handle_request(request, raw_request)
+    return await raw_request.app.state.openai_serving_chat.handle_request(
+        request, raw_request
+    )
 
 
 @app.post(
@@ -524,7 +556,9 @@ async def openai_v1_chat_completions(request: ChatCompletionRequest, raw_request
 )
 async def openai_v1_embeddings(request: EmbeddingRequest, raw_request: Request):
     """OpenAI-compatible embeddings endpoint."""
-    return await raw_request.app.state.openai_serving_embedding.handle_request(request, raw_request)
+    return await raw_request.app.state.openai_serving_embedding.handle_request(
+        request, raw_request
+    )
 
 
 @app.get("/v1/models", response_class=ORJSONResponse)
@@ -576,25 +610,37 @@ async def sagemaker_health() -> Response:
 
 
 @app.post("/invocations")
-async def sagemaker_chat_completions(request: ChatCompletionRequest, raw_request: Request):
+async def sagemaker_chat_completions(
+    request: ChatCompletionRequest, raw_request: Request
+):
     """OpenAI-compatible chat completion endpoint."""
-    return await raw_request.app.state.openai_serving_chat.handle_request(request, raw_request)
+    return await raw_request.app.state.openai_serving_chat.handle_request(
+        request, raw_request
+    )
 
 
 @app.post("/v1/score", dependencies=[Depends(validate_json_request)])
 async def v1_score_request(request: ScoringRequest, raw_request: Request):
     """Endpoint for the decoder-only scoring API. See Engine.score() for detailed documentation."""
-    return await raw_request.app.state.openai_serving_score.handle_request(request, raw_request)
+    return await raw_request.app.state.openai_serving_score.handle_request(
+        request, raw_request
+    )
 
 
-@app.api_route("/v1/rerank", methods=["POST", "PUT"], dependencies=[Depends(validate_json_request)])
+@app.api_route(
+    "/v1/rerank", methods=["POST", "PUT"], dependencies=[Depends(validate_json_request)]
+)
 async def v1_rerank_request(request: V1RerankReqInput, raw_request: Request):
     """Endpoint for reranking documents based on query relevance."""
-    return await raw_request.app.state.openai_serving_rerank.handle_request(request, raw_request)
+    return await raw_request.app.state.openai_serving_rerank.handle_request(
+        request, raw_request
+    )
 
 
 def _create_error_response(e):
-    return ORJSONResponse({"error": {"message": str(e)}}, status_code=HTTPStatus.BAD_REQUEST)
+    return ORJSONResponse(
+        {"error": {"message": str(e)}}, status_code=HTTPStatus.BAD_REQUEST
+    )
 
 
 def launch_server(
@@ -708,13 +754,7 @@ def _execute_server_warmup(
     else:
         json_data["text"] = ["The capital city of France is"] * server_args.dp_size
         if server_args.dp_size == 1:
-            json_data["input_text"] = json_data["input_text"][0]
-
-    # Debug dumping
-    if server_args.debug_tensor_dump_input_file:
-        json_data.pop("text", None)
-        json_data["input_ids"] = np.load(server_args.debug_tensor_dump_input_file).tolist()
-        json_data["sampling_params"]["max_new_tokens"] = 0
+            json_data["text"] = json_data["text"][0]
 
     try:
         res = requests.post(

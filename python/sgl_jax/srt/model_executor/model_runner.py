@@ -7,6 +7,7 @@ from typing import Optional, Tuple, Union
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from flax import nnx
 from jax._src import mesh as mesh_lib
 from jax.sharding import NamedSharding
@@ -112,7 +113,7 @@ class ModelRunner:
     def initialize_jit(self):
         self.graphdef, self.state = nnx.split(self.model)
 
-        @partial(jax.jit)
+        @jax.jit
         def run_model(graphdef, state, *args):
             model = nnx.merge(graphdef, state)
             return model(*args)
@@ -123,7 +124,9 @@ class ModelRunner:
         pass
 
     def get_available_device_memory(self):
-        min_available_device_memory = get_available_device_memory(self.device, distributed=False)
+        min_available_device_memory = get_available_device_memory(
+            self.device, distributed=False
+        )
 
         # Check memory for tensor parallelism
         local_device_memory = get_available_device_memory(self.device)
@@ -148,7 +151,9 @@ class ModelRunner:
         )
         self.dtype = self.model_config.dtype
         self.start_layer = getattr(self.model, "start_layer", 0)
-        self.end_layer = getattr(self.model, "end_layer", self.model_config.num_hidden_layers)
+        self.end_layer = getattr(
+            self.model, "end_layer", self.model_config.num_hidden_layers
+        )
         self.num_effective_layers = self.end_layer - self.start_layer
 
     def profile_max_num_token(self):
@@ -159,7 +164,9 @@ class ModelRunner:
         # Get accurate memory information using TPU-specific methods
         # Use tpu_info for memory information
         available_device_memory = self.get_available_device_memory()
-        available_kv_cache_bytes = max(available_device_memory * self.mem_fraction_static, 0)
+        available_kv_cache_bytes = max(
+            available_device_memory * self.mem_fraction_static, 0
+        )
 
         cell_size = (
             self.model_config.get_num_kv_heads(self.tp_size)
@@ -194,7 +201,9 @@ class ModelRunner:
         elif self.server_args.kv_cache_dtype == "bf16":
             self.kv_cache_dtype = jnp.bfloat16
         else:
-            raise ValueError(f"Unsupported kv_cache_dtype: {self.server_args.kv_cache_dtype}.")
+            raise ValueError(
+                f"Unsupported kv_cache_dtype: {self.server_args.kv_cache_dtype}."
+            )
         logger.info(f"ModelRunner kv_cache_dtype: {self.kv_cache_dtype}")
         # Profile maximum number of tokens
         self.max_total_num_tokens = self.profile_max_num_token()
@@ -203,7 +212,9 @@ class ModelRunner:
         if max_num_reqs is None:
             max_num_reqs = min(
                 max(
-                    int(self.max_total_num_tokens / self.model_config.context_len * 512),
+                    int(
+                        self.max_total_num_tokens / self.model_config.context_len * 512
+                    ),
                     2048,
                 ),
                 4096,
@@ -226,11 +237,15 @@ class ModelRunner:
 
         # Align to page size
         self.max_total_num_tokens = (
-            self.max_total_num_tokens // self.server_args.page_size * self.server_args.page_size
+            self.max_total_num_tokens
+            // self.server_args.page_size
+            * self.server_args.page_size
         )
 
         if self.max_total_num_tokens <= 0:
-            raise RuntimeError("Not enough memory. Please try to increase --mem-fraction-static.")
+            raise RuntimeError(
+                "Not enough memory. Please try to increase --mem-fraction-static."
+            )
 
         # Create request to token pool if not already created
         if self.req_to_token_pool is None:
@@ -281,26 +296,40 @@ class ModelRunner:
         self.attn_backend = self._get_attention_backend()
 
     def _get_attention_backend(self):
-        from sgl_jax.srt.layers.attention.native_backend import NativeAttention
+        if self.server_args.attention_backend == "native":
+            from sgl_jax.srt.layers.attention.native_backend import NativeAttention
 
-        return NativeAttention(self.num_attn_heads, self.num_kv_heads)
+            return NativeAttention(self.num_attn_heads, self.num_kv_heads)
+        elif self.server_args.attention_backend == "fa":
+            from sgl_jax.srt.layers.attention.flashattention_backend import (
+                FlashAttention,
+            )
 
-    def _forward(self, input_ids: jax.Array, positions: jax.Array, forward_batch: ForwardBatch):
-        #jax.debug.print(
-        #    f"[mode = {forward_batch.forward_mode}] padded input_ids: {len(input_ids)}, padded batch_size: {forward_batch.batch_size}"
-        #)
-        import jax._src.test_util as jtu
-        with jtu.count_pjit_cpp_cache_miss() as count:
-            result, layers_k, layers_v = self.model_fn(
-                        self.state, input_ids, positions, forward_batch
-                ) 
-            #jax.debug.print(f"[mode = {forward_batch.forward_mode}] CACHE_MISS count: {count()}")
+            return FlashAttention(
+                self.num_attn_heads,
+                self.num_kv_heads,
+                self.model_config.head_dim,
+                page_size=self.page_size,
+            )
+        else:
+            raise ValueError(
+                f"Unsupported attention backend: {self.server_args.attention_backend}"
+            )
+
+    def _forward(
+        self, input_ids: jax.Array, positions: jax.Array, forward_batch: ForwardBatch
+    ):
+        result, layers_k, layers_v = self.model_fn(
+            self.state, input_ids, positions, forward_batch
+        )
 
         self._set_kv_cache_after_forward(layers_k, layers_v, forward_batch)
 
         return result
 
-    def _set_kv_cache_after_forward(self, layers_k, layers_v, forward_batch: ForwardBatch):
+    def _set_kv_cache_after_forward(
+        self, layers_k, layers_v, forward_batch: ForwardBatch
+    ):
         # set sharding for layers_k and layers_v
         start_idx = forward_batch.token_to_kv_pool.start_layer
         end_idx = start_idx + len(layers_k)
@@ -309,7 +338,9 @@ class ModelRunner:
 
     def forward_decode(self, forward_batch: ForwardBatch) -> LogitsProcessorOutput:
         self.attn_backend.init_forward_metadata(forward_batch)
-        return self._forward(forward_batch.input_ids, forward_batch.positions, forward_batch)
+        return self._forward(
+            forward_batch.input_ids, forward_batch.positions, forward_batch
+        )
 
     def forward_extend(
         self,
@@ -318,7 +349,9 @@ class ModelRunner:
     ) -> LogitsProcessorOutput:
         if not skip_attn_backend_init:
             self.attn_backend.init_forward_metadata(forward_batch)
-        return self._forward(forward_batch.input_ids, forward_batch.positions, forward_batch)
+        return self._forward(
+            forward_batch.input_ids, forward_batch.positions, forward_batch
+        )
 
     def forward_idle(self, forward_batch: ForwardBatch) -> LogitsProcessorOutput:
         # TODO: implement
@@ -382,41 +415,6 @@ class ModelRunner:
             model_worker_batch.sampling_info,
         )
         return next_token_ids
-
-
-def print_forward_info(
-    state, input_ids: jax.Array, positions: jax.Array, forward_batch: ForwardBatch
-):
-    if forward_batch.forward_mode == ForwardMode.DECODE:
-        print(f"input_ids.shape: {input_ids.shape}")
-        print(f"positions.shape: {positions.shape}")
-        print(
-            f"forward_batch input_ids: {forward_batch.input_ids.shape if forward_batch.input_ids is not None else None}"
-        )
-        print(
-            f"forward_batch req_pool_indices: {forward_batch.req_pool_indices.shape if forward_batch.req_pool_indices is not None else None}"
-        )
-        print(
-            f"forward_batch seq_lens: {forward_batch.seq_lens.shape if forward_batch.seq_lens is not None else None}"
-        )
-        print(
-            f"forward_batch out_cache_loc: {forward_batch.out_cache_loc.shape if forward_batch.out_cache_loc is not None else None}"
-        )
-        print(
-            f"forward_batch positions: {forward_batch.positions.shape if forward_batch.positions is not None else None}"
-        )
-        print(
-            f"forward_batch extend_start_loc: {forward_batch.extend_start_loc.shape if forward_batch.extend_start_loc is not None else None}"
-        )
-        print(
-            f"forward_batch cache_loc: {forward_batch.cache_loc.shape if forward_batch.cache_loc is not None else None}"
-        )
-        print(
-            f"forward_batch extend_prefix_lens: {forward_batch.extend_prefix_lens.shape if forward_batch.extend_prefix_lens is not None else None}"
-        )
-        print(
-            f"forward_batch extend_seq_lens: {forward_batch.extend_seq_lens.shape if forward_batch.extend_seq_lens is not None else None}"
-        )
 
 
 class MockModelRunner(ModelRunner):

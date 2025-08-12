@@ -63,7 +63,9 @@ def top_k_top_p_min_p_sampling_from_probs_torch(
     rng: nnx.Rngs,
 ):
     """A top-k, top-p and min-p sampling implementation with native pytorch operations."""
-    probs_sort, probs_idx = _sample_part_a(probs, top_ks, top_ps, need_min_p_sampling, min_ps)
+    probs_sort, probs_idx = _sample_part_a(
+        probs, top_ks, top_ps, need_min_p_sampling, min_ps
+    )
 
     sampled_index = random.categorical(rng, probs_sort).reshape(-1, 1)
 
@@ -72,7 +74,9 @@ def top_k_top_p_min_p_sampling_from_probs_torch(
 
 @partial(jax.jit, static_argnames=("need_min_p_sampling"))
 def _sample_part_a(probs, top_ks, top_ps, need_min_p_sampling: bool, min_ps):
-    probs_sort = jnp.sort(probs, axis=-1)[:, ::-1]  # Sort and reverse for descending order
+    probs_sort = jnp.sort(probs, axis=-1)[
+        :, ::-1
+    ]  # Sort and reverse for descending order
     probs_idx = jnp.argsort(probs, axis=-1)[:, ::-1]
     probs_sum = jnp.cumsum(probs_sort, axis=-1)
 

@@ -67,7 +67,9 @@ class GateLogit(nnx.Module):
 
         if self.use_bias:
             bias_shape = self.features
-            bias_axes = self.kernel_axes[-len(self.features) :] if self.kernel_axes else ()
+            bias_axes = (
+                self.kernel_axes[-len(self.features) :] if self.kernel_axes else ()
+            )
             self.bias = nnx.Param(
                 nnx.with_partitioning(nnx.initializers.zeros_init(), bias_axes)(
                     rngs.params(), bias_shape, self.weight_dtype
@@ -85,7 +87,9 @@ class GateLogit(nnx.Module):
         kernel = jnp.asarray(self.kernel.value, self.dtype)
         output = jnp.dot(inputs, kernel)
 
-        global_tracer.print(output, f"gate_raw_output", f"moe_gate_layer_id_{self.layer_id}")
+        global_tracer.print(
+            output, f"gate_raw_output", f"moe_gate_layer_id_{self.layer_id}"
+        )
 
         if self.score_func:
             if self.score_func == "softmax":
@@ -102,9 +106,13 @@ class GateLogit(nnx.Module):
         if self.use_bias and self.bias is not None:
             bias = jnp.asarray(self.bias.value, self.dtype)
             output += bias
-            global_tracer.print(output, f"gate_after_bias", f"moe_gate_layer_id_{self.layer_id}")
+            global_tracer.print(
+                output, f"gate_after_bias", f"moe_gate_layer_id_{self.layer_id}"
+            )
 
-        global_tracer.print(output, f"gate_final_output", f"moe_gate_layer_id_{self.layer_id}")
+        global_tracer.print(
+            output, f"gate_final_output", f"moe_gate_layer_id_{self.layer_id}"
+        )
 
         return output
 
@@ -197,8 +205,12 @@ class Qwen3MoE(nnx.Module):
         inputs = inputs.astype(self.dtype)
         total_tokens, hidden_dim = inputs.shape
 
-        global_tracer.print(inputs, f"moe_input", f"moe_sparse_layer_id_{self.layer_id}")
-        global_tracer.print(router_logits, f"router_logits", f"moe_sparse_layer_id_{self.layer_id}")
+        global_tracer.print(
+            inputs, f"moe_input", f"moe_sparse_layer_id_{self.layer_id}"
+        )
+        global_tracer.print(
+            router_logits, f"router_logits", f"moe_sparse_layer_id_{self.layer_id}"
+        )
 
         if router_logits.shape[0] != total_tokens:
             raise ValueError(
@@ -210,7 +222,9 @@ class Qwen3MoE(nnx.Module):
         else:
             output = self._expert_parallel_forward_with_shard_map(inputs, router_logits)
 
-        global_tracer.print(output, f"moe_final_output", f"moe_sparse_layer_id_{self.layer_id}")
+        global_tracer.print(
+            output, f"moe_final_output", f"moe_sparse_layer_id_{self.layer_id}"
+        )
         return output
 
     @nnx.jit
@@ -224,13 +238,17 @@ class Qwen3MoE(nnx.Module):
             expert_shard_id = data_index * tensor_size + tensor_index
 
             # topk
-            top_k_logits, top_k_indices = jax.lax.top_k(router_logits, self.num_experts_per_tok)
-            top_k_weights = jax.nn.softmax(top_k_logits.astype(jnp.bfloat16), axis=-1).astype(
-                self.dtype
+            top_k_logits, top_k_indices = jax.lax.top_k(
+                router_logits, self.num_experts_per_tok
             )
+            top_k_weights = jax.nn.softmax(
+                top_k_logits.astype(jnp.bfloat16), axis=-1
+            ).astype(self.dtype)
 
             # qwen3 moe norm_topk_prob=true
-            top_k_weights = top_k_weights / jnp.sum(top_k_weights, axis=-1, keepdims=True)
+            top_k_weights = top_k_weights / jnp.sum(
+                top_k_weights, axis=-1, keepdims=True
+            )
 
             if hidden_states.ndim == 2:
                 total_tokens = hidden_states.shape[0]
@@ -239,21 +257,28 @@ class Qwen3MoE(nnx.Module):
                 batch_size, seq_len = hidden_states.shape[0], hidden_states.shape[1]
                 total_tokens = batch_size * seq_len
             # Permute
-            x, sorted_selected_experts, weights, group_sizes, selected_experts = self._permute(
-                hidden_states, top_k_indices, top_k_weights
+            x, sorted_selected_experts, weights, group_sizes, selected_experts = (
+                self._permute(hidden_states, top_k_indices, top_k_weights)
             )
 
             # EP Dispatch
             if self.expert_parallel_size > 1:
-                x, local_group_sizes, selected_experts = self._expert_all_to_all_dispatch(
-                    x, group_sizes, selected_experts, expert_shard_id
+                x, local_group_sizes, selected_experts = (
+                    self._expert_all_to_all_dispatch(
+                        x, group_sizes, selected_experts, expert_shard_id
+                    )
                 )
             else:
                 local_group_sizes = group_sizes
 
             # GMM
             intermediate_output = self._gmm_compute_with_sharded_weights(
-                x, local_group_sizes, selected_experts, w0_weights, w1_weights, wo_weights
+                x,
+                local_group_sizes,
+                selected_experts,
+                w0_weights,
+                w1_weights,
+                wo_weights,
             )
 
             # EP Combine
@@ -265,7 +290,11 @@ class Qwen3MoE(nnx.Module):
 
             # Unpermute
             output = self._unpermute(
-                intermediate_output, sorted_selected_experts, weights, batch_size, seq_len
+                intermediate_output,
+                sorted_selected_experts,
+                weights,
+                batch_size,
+                seq_len,
             )
             return output
 
@@ -286,9 +315,13 @@ class Qwen3MoE(nnx.Module):
     def _gmm_compute_with_sharded_weights(
         self, x, local_group_sizes, selected_experts, w0_kernel, w1_kernel, wo_kernel
     ):
-        global_tracer.print(x, f"gmm_sharded_input_x", f"moe_compute_layer_id_{self.layer_id}")
         global_tracer.print(
-            w0_kernel, f"gmm_sharded_w0_kernel_shape", f"moe_compute_layer_id_{self.layer_id}"
+            x, f"gmm_sharded_input_x", f"moe_compute_layer_id_{self.layer_id}"
+        )
+        global_tracer.print(
+            w0_kernel,
+            f"gmm_sharded_w0_kernel_shape",
+            f"moe_compute_layer_id_{self.layer_id}",
         )
         global_tracer.print(
             local_group_sizes,
@@ -297,19 +330,29 @@ class Qwen3MoE(nnx.Module):
         )
 
         if x.shape[0] == 0:
-            empty_output = jnp.zeros((0, wo_kernel.shape[-1]), dtype=x.dtype)  # (0, hidden_dim)
+            empty_output = jnp.zeros(
+                (0, wo_kernel.shape[-1]), dtype=x.dtype
+            )  # (0, hidden_dim)
             global_tracer.print(
-                empty_output, f"gmm_sharded_empty_output", f"moe_compute_layer_id_{self.layer_id}"
+                empty_output,
+                f"gmm_sharded_empty_output",
+                f"moe_compute_layer_id_{self.layer_id}",
             )
             return empty_output
 
         # gate
         layer_w0 = jax.lax.ragged_dot(
-            lhs=x, rhs=w0_kernel, group_sizes=local_group_sizes, preferred_element_type=self.dtype
+            lhs=x,
+            rhs=w0_kernel,
+            group_sizes=local_group_sizes,
+            preferred_element_type=self.dtype,
         )
         # up
         layer_w1 = jax.lax.ragged_dot(
-            lhs=x, rhs=w1_kernel, group_sizes=local_group_sizes, preferred_element_type=self.dtype
+            lhs=x,
+            rhs=w1_kernel,
+            group_sizes=local_group_sizes,
+            preferred_element_type=self.dtype,
         )
 
         # activation
@@ -332,15 +375,21 @@ class Qwen3MoE(nnx.Module):
         return intermediate_output
 
     def _single_device_forward(self, inputs, router_logits):
-        top_k_logits, top_k_indices = jax.lax.top_k(router_logits, self.num_experts_per_tok)
-        top_k_weights = jax.nn.softmax(top_k_logits.astype(jnp.float32), axis=-1).astype(self.dtype)
+        top_k_logits, top_k_indices = jax.lax.top_k(
+            router_logits, self.num_experts_per_tok
+        )
+        top_k_weights = jax.nn.softmax(
+            top_k_logits.astype(jnp.float32), axis=-1
+        ).astype(self.dtype)
 
         top_k_weights = top_k_weights / jnp.sum(top_k_weights, axis=-1, keepdims=True)
 
         return self._single_device_forward_impl(inputs, top_k_indices, top_k_weights)
 
     def _single_device_forward_impl(self, inputs, top_k_indices, top_k_weights):
-        global_tracer.print(inputs, f"moe_local_input", f"moe_compute_layer_id_{self.layer_id}")
+        global_tracer.print(
+            inputs, f"moe_local_input", f"moe_compute_layer_id_{self.layer_id}"
+        )
 
         num_tokens = inputs.shape[0] * (inputs.shape[1] if inputs.ndim > 1 else 1)
         inputs_flat = inputs.reshape(num_tokens, -1)
@@ -356,7 +405,9 @@ class Qwen3MoE(nnx.Module):
         )
 
         global_tracer.print(
-            expert_weights, f"expert_weights_matrix", f"moe_compute_layer_id_{self.layer_id}"
+            expert_weights,
+            f"expert_weights_matrix",
+            f"moe_compute_layer_id_{self.layer_id}",
         )
 
         all_wi_0 = self.wi_0.value
@@ -366,15 +417,21 @@ class Qwen3MoE(nnx.Module):
         layer_w0 = jnp.einsum("th,ehd->ted", inputs_flat, all_wi_0)
         layer_w1 = jnp.einsum("th,ehd->ted", inputs_flat, all_wi_1)
 
-        global_tracer.print(layer_w0, f"layer_w0_output", f"moe_compute_layer_id_{self.layer_id}")
-        global_tracer.print(layer_w1, f"layer_w1_output", f"moe_compute_layer_id_{self.layer_id}")
+        global_tracer.print(
+            layer_w0, f"layer_w0_output", f"moe_compute_layer_id_{self.layer_id}"
+        )
+        global_tracer.print(
+            layer_w1, f"layer_w1_output", f"moe_compute_layer_id_{self.layer_id}"
+        )
 
         activated = jax.nn.silu(layer_w0) * layer_w1
         expert_outputs = jnp.einsum("ted,edh->teh", activated, all_wo)
         final_output = jnp.einsum("te,teh->th", expert_weights, expert_outputs)
 
         global_tracer.print(
-            final_output, f"moe_local_final_output", f"moe_compute_layer_id_{self.layer_id}"
+            final_output,
+            f"moe_local_final_output",
+            f"moe_compute_layer_id_{self.layer_id}",
         )
         return final_output.reshape(inputs.shape).astype(self.dtype)
 
@@ -392,7 +449,9 @@ class Qwen3MoE(nnx.Module):
         sorted_selected_experts = jnp.argsort(flatten_selected_experts)
         sorted_indices = sorted_selected_experts // self.num_experts_per_tok
 
-        sorted_inputs = jnp.take(inputs_2d, indices=sorted_indices, axis=0).astype(self.dtype)
+        sorted_inputs = jnp.take(inputs_2d, indices=sorted_indices, axis=0).astype(
+            self.dtype
+        )
 
         group_sizes = jnp.bincount(flatten_selected_experts, length=self.num_experts)
 
@@ -403,14 +462,24 @@ class Qwen3MoE(nnx.Module):
             total_repeat_length=flatten_selected_experts.shape[0],
         )
 
-        return sorted_inputs, sorted_selected_experts, top_k_weights, group_sizes, sorted_experts
+        return (
+            sorted_inputs,
+            sorted_selected_experts,
+            top_k_weights,
+            group_sizes,
+            sorted_experts,
+        )
 
     def _expert_all_to_all_dispatch(
         self, data, global_group_sizes, sorted_experts, expert_shard_id
     ):
-        return self._simple_dispatch(data, global_group_sizes, sorted_experts, expert_shard_id)
+        return self._simple_dispatch(
+            data, global_group_sizes, sorted_experts, expert_shard_id
+        )
 
-    def _simple_dispatch(self, data, global_group_sizes, sorted_experts, expert_shard_id):
+    def _simple_dispatch(
+        self, data, global_group_sizes, sorted_experts, expert_shard_id
+    ):
         local_expert_size = self.experts_per_device
 
         # compute each token's expert shard
@@ -420,7 +489,9 @@ class Qwen3MoE(nnx.Module):
         belongs_to_this_shard = divided_assignments == expert_shard_id
 
         local_experts = jnp.where(
-            belongs_to_this_shard, jnp.mod(sorted_experts, local_expert_size), local_expert_size
+            belongs_to_this_shard,
+            jnp.mod(sorted_experts, local_expert_size),
+            local_expert_size,
         )
 
         valid_indices = jnp.nonzero(belongs_to_this_shard, size=data.shape[0])[0]
@@ -433,13 +504,17 @@ class Qwen3MoE(nnx.Module):
         valid_experts_for_bincount = jnp.where(
             valid_expert_mask, local_experts_extracted, local_expert_size
         )
-        local_group_sizes = jnp.bincount(valid_experts_for_bincount, length=local_expert_size)
+        local_group_sizes = jnp.bincount(
+            valid_experts_for_bincount, length=local_expert_size
+        )
 
         global_tracer.print(
             local_data, f"cpu_dispatch_output", f"moe_dispatch_layer_id_{self.layer_id}"
         )
         global_tracer.print(
-            local_group_sizes, f"cpu_dispatch_group_sizes", f"moe_dispatch_layer_id_{self.layer_id}"
+            local_group_sizes,
+            f"cpu_dispatch_group_sizes",
+            f"moe_dispatch_layer_id_{self.layer_id}",
         )
 
         return local_data, local_group_sizes, local_experts_extracted
@@ -449,11 +524,12 @@ class Qwen3MoE(nnx.Module):
     ):
         local_expert_size = self.experts_per_device
         reshaped_group_sizes = jnp.sum(
-            global_group_sizes.reshape(self.expert_parallel_size, local_expert_size), axis=1
+            global_group_sizes.reshape(self.expert_parallel_size, local_expert_size),
+            axis=1,
         )
 
-        input_offsets, send_sizes, output_offsets, recv_sizes = self._get_ragged_all_to_all_params(
-            reshaped_group_sizes, expert_shard_id
+        input_offsets, send_sizes, output_offsets, recv_sizes = (
+            self._get_ragged_all_to_all_params(reshaped_group_sizes, expert_shard_id)
         )
 
         buffer_size = int(self.expert_parallel_size * data.shape[0])
@@ -473,13 +549,21 @@ class Qwen3MoE(nnx.Module):
             communicated_data, global_group_sizes, local_expert_size, expert_shard_id
         )
 
-        global_tracer.print(x, f"ragged_dispatch_output", f"moe_dispatch_layer_id_{self.layer_id}")
+        global_tracer.print(
+            x, f"ragged_dispatch_output", f"moe_dispatch_layer_id_{self.layer_id}"
+        )
         return x, local_group_sizes, selected_experts
 
-    def _expert_all_to_all_collect(self, data, global_group_sizes, expert_shard_id, target_size):
-        return self._cpu_simple_collect(data, global_group_sizes, expert_shard_id, target_size)
+    def _expert_all_to_all_collect(
+        self, data, global_group_sizes, expert_shard_id, target_size
+    ):
+        return self._cpu_simple_collect(
+            data, global_group_sizes, expert_shard_id, target_size
+        )
 
-    def _cpu_simple_collect(self, data, global_group_sizes, expert_shard_id, target_size):
+    def _cpu_simple_collect(
+        self, data, global_group_sizes, expert_shard_id, target_size
+    ):
         """
         Gathers variable-sized data from all expert devices into a single, correctly
         ordered tensor using a JIT-compatible scatter-and-sum pattern.
@@ -492,7 +576,9 @@ class Qwen3MoE(nnx.Module):
 
         # Calculate the start and end indices for this device's data in the global buffer.
         cumsum = jnp.cumsum(tokens_per_device)
-        start_indices = jnp.concatenate([jnp.array([0], dtype=tokens_per_device.dtype), cumsum])
+        start_indices = jnp.concatenate(
+            [jnp.array([0], dtype=tokens_per_device.dtype), cumsum]
+        )
         my_start_index = start_indices[expert_shard_id]
         my_end_index = start_indices[expert_shard_id + 1]
 
@@ -520,16 +606,22 @@ class Qwen3MoE(nnx.Module):
 
         return result
 
-    def _ragged_all_to_all_collect(self, data, global_group_sizes, expert_shard_id, target_size):
+    def _ragged_all_to_all_collect(
+        self, data, global_group_sizes, expert_shard_id, target_size
+    ):
         """TPU/GPU: Use ragged_all_to_all for collection"""
         local_expert_size = self.experts_per_device
         reshaped_group_sizes = jnp.sum(
-            global_group_sizes.reshape(self.expert_parallel_size, local_expert_size), axis=1
+            global_group_sizes.reshape(self.expert_parallel_size, local_expert_size),
+            axis=1,
         )
 
         # Calculate ragged_all_to_all parameters (transpose version for collection)
-        input_offsets, send_sizes, output_offsets, recv_sizes = self._get_ragged_all_to_all_params(
-            reshaped_group_sizes.T, expert_shard_id  # Note that transposition is needed here
+        input_offsets, send_sizes, output_offsets, recv_sizes = (
+            self._get_ragged_all_to_all_params(
+                reshaped_group_sizes.T,
+                expert_shard_id,  # Note that transposition is needed here
+            )
         )
 
         # Create output buffer
@@ -555,14 +647,18 @@ class Qwen3MoE(nnx.Module):
         input_offsets = jnp.zeros(self.expert_parallel_size, dtype=jnp.int32)
         send_sizes = jnp.repeat(group_sizes[shard_id], self.expert_parallel_size)
 
-        output_offset = jnp.concatenate((jnp.array([0]), jnp.cumsum(group_sizes[:-1])))[shard_id]
+        output_offset = jnp.concatenate((jnp.array([0]), jnp.cumsum(group_sizes[:-1])))[
+            shard_id
+        ]
         output_offsets = jnp.repeat(output_offset, self.expert_parallel_size)
 
         recv_sizes = group_sizes
 
         return input_offsets, send_sizes, output_offsets, recv_sizes
 
-    def _local_permute_for_ragged(self, inputs, global_group_sizes, local_expert_size, shard_index):
+    def _local_permute_for_ragged(
+        self, inputs, global_group_sizes, local_expert_size, shard_index
+    ):
         local_group_sizes = global_group_sizes[
             shard_index * local_expert_size : (shard_index + 1) * local_expert_size
         ]
@@ -579,7 +675,9 @@ class Qwen3MoE(nnx.Module):
 
         return sorted_inputs, local_group_sizes, sorted_experts_ids
 
-    def _unpermute(self, intermediate, sorted_selected_experts, weights, batch_size, seq_len):
+    def _unpermute(
+        self, intermediate, sorted_selected_experts, weights, batch_size, seq_len
+    ):
         global_tracer.print(
             intermediate, f"unpermute_input", f"moe_combine_layer_id_{self.layer_id}"
         )
@@ -588,7 +686,9 @@ class Qwen3MoE(nnx.Module):
             f"unpermute_sorted_experts",
             f"moe_combine_layer_id_{self.layer_id}",
         )
-        global_tracer.print(weights, f"unpermute_weights", f"moe_combine_layer_id_{self.layer_id}")
+        global_tracer.print(
+            weights, f"unpermute_weights", f"moe_combine_layer_id_{self.layer_id}"
+        )
 
         expected_tokens = sorted_selected_experts.shape[0]
         actual_tokens = intermediate.shape[0]
@@ -609,7 +709,9 @@ class Qwen3MoE(nnx.Module):
                 )
             else:
                 padding_size = expected_tokens - actual_tokens
-                padding = jnp.zeros((padding_size, intermediate.shape[1]), dtype=intermediate.dtype)
+                padding = jnp.zeros(
+                    (padding_size, intermediate.shape[1]), dtype=intermediate.dtype
+                )
                 intermediate = jnp.concatenate([intermediate, padding], axis=0)
                 global_tracer.print(
                     jnp.array([2, actual_tokens, expected_tokens, padding_size]),
@@ -622,14 +724,18 @@ class Qwen3MoE(nnx.Module):
 
         total_tokens = weights.shape[0] * weights.shape[1] // self.num_experts_per_tok
 
-        reshaped_weights = jnp.reshape(weights, (total_tokens, self.num_experts_per_tok))
+        reshaped_weights = jnp.reshape(
+            weights, (total_tokens, self.num_experts_per_tok)
+        )
         reshaped_intermediate = jnp.reshape(
             unsort_intermediate,
             (total_tokens, self.num_experts_per_tok, -1),
         )
 
         global_tracer.print(
-            reshaped_weights, f"unpermute_reshaped_weights", f"moe_combine_layer_id_{self.layer_id}"
+            reshaped_weights,
+            f"unpermute_reshaped_weights",
+            f"moe_combine_layer_id_{self.layer_id}",
         )
         global_tracer.print(
             reshaped_intermediate,
@@ -656,6 +762,8 @@ class Qwen3MoE(nnx.Module):
             final_output = output.reshape(batch_size, seq_len, -1).astype(self.dtype)
 
         global_tracer.print(
-            final_output, f"unpermute_final_output", f"moe_combine_layer_id_{self.layer_id}"
+            final_output,
+            f"unpermute_final_output",
+            f"moe_combine_layer_id_{self.layer_id}",
         )
         return final_output

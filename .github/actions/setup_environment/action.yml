@@ -1,0 +1,52 @@
+name: 'Setup'
+description: 'Setup'
+inputs:
+  accelerator:
+    description: 'Accelerator'
+    required: true
+    default: 'tpu-v6e-1'
+  test_type:
+    description: 'Test type (e.g., e2e, performance)'
+    required: false
+    default: ''
+  skypilot_endpoint:
+    description: 'SkyPilot endpoint URL'
+    required: true
+  username:
+    description: 'Username for authentication'
+    required: true
+  git_token:
+    description: 'Git token for authentication'
+    required: true
+runs:
+  using: "composite"
+  steps:
+    - name: Install the latest version of uv
+      uses: astral-sh/setup-uv@v4
+      with:
+        version: "latest"
+        python-version: "3.10"
+    - name: Install skypilot and login
+      shell: bash
+      run: |
+        uv venv --seed ~/sky
+        source ~/sky/bin/activate
+        uv pip install 'skypilot[gcp]'
+    - name: Run SkyPilot job
+      shell: bash
+      run: |
+        source ~/sky/bin/activate
+        sky api login --endpoint ${{ inputs.skypilot_endpoint }}
+    - name: Launch Server
+      shell: bash
+      run: |
+        source ~/sky/bin/activate
+        export USERNAME=${{ inputs.username }}
+        export GIT_TOKEN=${{ inputs.git_token }}
+        bash scripts/launch_tpu.sh ${{ inputs.accelerator }} ${{ github.ref }} ${{ inputs.test_type }}
+    - name: Cleanup on Launch Failure
+      if: failure()
+      shell: bash
+      run: |
+        source ~/sky/bin/activate
+        bash scripts/cleanup_cluster.sh ${{ inputs.accelerator }} ${{ github.ref }} ${{ inputs.test_type }}

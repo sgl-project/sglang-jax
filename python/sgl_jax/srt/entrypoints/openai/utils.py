@@ -29,7 +29,9 @@ def to_openai_style_logprobs(
     def append_top_logprobs(top_logprobs):
         for tokens in top_logprobs:
             if tokens is not None:
-                ret_logprobs.top_logprobs.append({token[2]: token[0] for token in tokens})
+                ret_logprobs.top_logprobs.append(
+                    {token[2]: token[0] for token in tokens}
+                )
             else:
                 ret_logprobs.top_logprobs.append(None)
 
