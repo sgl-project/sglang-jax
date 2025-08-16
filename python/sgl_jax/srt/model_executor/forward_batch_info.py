@@ -154,21 +154,6 @@ class ForwardBatch:
     extend_prefix_lens: Optional[jax.Array] = None
     extend_seq_lens: Optional[jax.Array] = None
 
-    def print_array_shape(self):
-        print(f"================ForwardBatch Jax Array Shape ")
-        print(f"input_ids.sharding: {self.input_ids.sharding}")
-        print(f"req_pool_indices.sharding: {self.req_pool_indices.sharding}")
-        print(f"seq_lens.sharding: {self.seq_lens.sharding}")
-        print(f"out_cache_loc.sharding: {self.out_cache_loc.sharding}")
-        print(f"positions.sharding: {self.positions.sharding}")
-        print(f"extend_start_loc.sharding: {self.extend_start_loc.sharding}")
-        print(f"cache_loc.sharding: {self.cache_loc.sharding}")
-        print(f"extend_prefix_lens.sharding: {self.extend_prefix_lens.sharding if self.extend_prefix_lens is not None and isinstance(self.extend_prefix_lens,jax.Array) else self.forward_mode}")
-        print(f"extend_seq_lens.sharding: {self.extend_seq_lens.sharding if self.extend_seq_lens is not None and isinstance(self.extend_prefix_lens,jax.Array) else self.forward_mode}")
-
-        self.token_to_kv_pool.print_array_shape()
-        self.attn_backend.print_array_shape()
-
     def tree_flatten(self):
         children = (
             self.input_ids,

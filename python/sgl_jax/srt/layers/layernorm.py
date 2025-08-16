@@ -19,7 +19,9 @@ class RMSNorm(nnx.Module):
     ):
         self.variance_epsilon = epsilon
         self.weight = nnx.Param(
-            nnx.with_partitioning(nnx.initializers.ones, kernel_axes)(rngs.params(), (hidden_size,))
+            nnx.with_partitioning(nnx.initializers.ones, kernel_axes)(
+                rngs.params(), (hidden_size,)
+            )
         )
 
     def __call__(
@@ -29,8 +31,10 @@ class RMSNorm(nnx.Module):
         return rmsnorm_forward(x, residual, self.weight, self.variance_epsilon)
 
 
-#@partial(jax.jit, static_argnames=["epsilon"])
-def rmsnorm_forward(x, residual, weight, epsilon) -> Union[jax.Array, Tuple[jax.Array, jax.Array]]:
+# @partial(jax.jit, static_argnames=["epsilon"])
+def rmsnorm_forward(
+    x, residual, weight, epsilon
+) -> Union[jax.Array, Tuple[jax.Array, jax.Array]]:
     orig_dtype = x.dtype
     x_f32 = jnp.asarray(x, jnp.float32)
     if residual is not None:

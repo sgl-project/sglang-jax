@@ -12,7 +12,11 @@ import jax
 
 from sgl_jax.srt.hf_transformers_utils import check_gguf_file, get_config
 from sgl_jax.srt.reasoning_parser import ReasoningParser
-from sgl_jax.srt.utils.common_utils import is_remote_url, is_valid_ipv6_address, nullable_str
+from sgl_jax.srt.utils.common_utils import (
+    is_remote_url,
+    is_valid_ipv6_address,
+    nullable_str,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -104,17 +108,20 @@ class ServerArgs:
     # Optimization/debug options
     disable_radix_cache: bool = False
     allow_auto_truncate: bool = False
+    enable_tokenizer_batch_encode: bool = False
 
     # Jax distribution info
     jax_proc_id: int = None
     jax_num_procs: int = None
 
     xla_backend: str = "tpu"
+    # Kernel backend
+    attention_backend: Optional[str] = "native"
 
     max_seq_len: int = 4096
 
-    jax_precompile_token_paddings: Optional[List[int]] = None
-    jax_precompile_bs_paddings: Optional[List[int]] = None
+    jax_precompile_prefill_token_paddings: Optional[List[int]] = None
+    jax_precompile_decode_bs_paddings: Optional[List[int]] = None
 
     disable_jax_precompile: bool = False
 
@@ -150,9 +157,9 @@ class ServerArgs:
                 self.mem_fraction_static = 0.88
 
         # GGUF
-        if (self.load_format == "auto" or self.load_format == "gguf") and check_gguf_file(
-            self.model_path
-        ):
+        if (
+            self.load_format == "auto" or self.load_format == "gguf"
+        ) and check_gguf_file(self.model_path):
             self.quantization = self.load_format = "gguf"
 
         if is_remote_url(self.model_path):
@@ -646,6 +653,11 @@ class ServerArgs:
             action="store_true",
             help="Allow automatically truncating requests that exceed the maximum input length instead of returning an error.",
         )
+        parser.add_argument(
+            "--enable-tokenizer-batch-encode",
+            action="store_true",
+            help="Enable batch tokenization for improved performance when processing multiple text inputs. Do not use with image inputs, pre-tokenized input_ids, or input_embeds.",
+        )
 
         parser.add_argument(
             "--jax-proc-id",
@@ -672,21 +684,32 @@ class ServerArgs:
             help="maximum sequence length",
         )
         parser.add_argument(
-            "--jax-precompile-token-paddings",
+            "--jax-precompile-prefill-token-paddings",
             type=int,
             nargs="+",
-            help="Set the list of buckets for jax jit",
+            help="Set the list of buckets for jax jit only for the prefill phase",
         )
         parser.add_argument(
-            "--jax-precompile-bs-paddings",
+            "--jax-precompile-decode-bs-paddings",
             type=int,
             nargs="+",
-            help="Set the list of batch sizes for jax jit",
+            help="Set the list of batch sizes for jax jit only for the decode phase",
         )
         parser.add_argument(
             "--disable-jax-precompile",
             action="store_true",
             help="whether disable jax precompile",
+        )
+        # Kernel backend
+        parser.add_argument(
+            "--attention-backend",
+            type=str,
+            choices=[
+                "native",
+                "fa",
+            ],
+            default=ServerArgs.attention_backend,
+            help="Choose the kernels for attention layers.",
         )
 
     @classmethod
@@ -714,7 +737,9 @@ class ServerArgs:
         return hf_config
 
     def check_server_args(self):
-        assert (self.tp_size) % self.nnodes == 0, "tp_size must be divisible by number of nodes"
+        assert (
+            self.tp_size
+        ) % self.nnodes == 0, "tp_size must be divisible by number of nodes"
 
 
 def prepare_server_args(argv: List[str]) -> ServerArgs:
@@ -772,9 +797,13 @@ class PortArgs:
             rpc_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
             metrics_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
             pub_sub_addr=(
-                f"tcp://{dist_init_host}:{port_base + 4}" if server_args.nnodes > 1 else None
+                f"tcp://{dist_init_host}:{port_base + 4}"
+                if server_args.nnodes > 1
+                else None
             ),
             pub_sub_sync_addr=(
-                f"tcp://{dist_init_host}:{port_base + 5}" if server_args.nnodes > 1 else None
+                f"tcp://{dist_init_host}:{port_base + 5}"
+                if server_args.nnodes > 1
+                else None
             ),
         )

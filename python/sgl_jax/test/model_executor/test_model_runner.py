@@ -31,7 +31,9 @@ class TestModelRunner(unittest.TestCase):
         """Set up ModelRunner"""
         num_processes = int(os.environ.get("SGL_JAX_NUM_PROCESSES", 1))
         process_id = int(os.environ.get("SGL_JAX_PROCESS_ID", 0))
-        coordinator_address = os.environ.get("SGL_JAX_COORDINATOR_ADDRESS", "localhost:10000")
+        coordinator_address = os.environ.get(
+            "SGL_JAX_COORDINATOR_ADDRESS", "localhost:10000"
+        )
         if num_processes > 1:
             jax.distributed.initialize(
                 coordinator_address=coordinator_address,
@@ -105,35 +107,46 @@ class TestModelRunner(unittest.TestCase):
         # Check if it's a local path and has tokenizer files
         if model_path.exists():
             tokenizer_files = ["tokenizer_config.json"]
-            has_tokenizer = any((model_path / file).exists() for file in tokenizer_files)
+            has_tokenizer = any(
+                (model_path / file).exists() for file in tokenizer_files
+            )
 
             if has_tokenizer:
                 print(f"Using local tokenizer from: {model_path}")
                 try:
-                    return AutoTokenizer.from_pretrained(str(model_path), trust_remote_code=True)
+                    return AutoTokenizer.from_pretrained(
+                        str(model_path), trust_remote_code=True
+                    )
                 except Exception as e:
                     print(f"  Failed to load local tokenizer: {e}")
 
         # Use HuggingFace model with network error handling
         try:
             print(f"Loading tokenizer from HuggingFace: {self.model_path}")
-            return AutoTokenizer.from_pretrained(self.model_path, trust_remote_code=True)
+            return AutoTokenizer.from_pretrained(
+                self.model_path, trust_remote_code=True
+            )
         except Exception as e:
             print(f"Failed to load tokenizer from HuggingFace: {e}")
-            raise RuntimeError(f"Could not load tokenizer from local path or HuggingFace: {e}")
+            raise RuntimeError(
+                f"Could not load tokenizer from local path or HuggingFace: {e}"
+            )
 
     def _new_forward_batch(self, input_ids, positions):
         """Create a ForwardBatch for testing."""
         total_tokens = sum(len(ids) for ids in input_ids)
         req_pool_indices = self.model_runner.req_to_token_pool.alloc(len(input_ids))
-        cache_loc_index = self.model_runner.token_to_kv_pool_allocator.alloc(total_tokens)
+        cache_loc_index = self.model_runner.token_to_kv_pool_allocator.alloc(
+            total_tokens
+        )
         # out_cache_loc = self.model_runner.token_to_kv_pool_allocator.alloc(len(input_ids))
 
         # write to req_to_token_pool
         pt = 0
         for i, input in enumerate(input_ids):
             self.model_runner.req_to_token_pool.write(
-                (req_pool_indices[i], slice(0, len(input))), cache_loc_index[pt : pt + len(input)]
+                (req_pool_indices[i], slice(0, len(input))),
+                cache_loc_index[pt : pt + len(input)],
             )
             pt += len(input)
 
@@ -141,6 +154,8 @@ class TestModelRunner(unittest.TestCase):
             bid=0,
             forward_mode=ForwardMode.EXTEND,
             input_ids=jnp.array(input_ids).flatten(),
+            real_input_ids_len=sum(input_ids),
+            real_bs=len(input_ids),
             req_pool_indices=jnp.array(req_pool_indices),
             seq_lens=jnp.array([len(ids) for ids in input_ids]),
             out_cache_loc=cache_loc_index,
@@ -160,7 +175,9 @@ class TestModelRunner(unittest.TestCase):
 
     def _update_forward_batch(self, forward_batch: ForwardBatch, output_ids: jax.Array):
         """Update the forward batch with the next token ids."""
-        out_cache_loc = self.model_runner.token_to_kv_pool_allocator.alloc(len(output_ids))
+        out_cache_loc = self.model_runner.token_to_kv_pool_allocator.alloc(
+            len(output_ids)
+        )
 
         forward_batch.forward_mode = ForwardMode.DECODE
         forward_batch.input_ids = output_ids.flatten()
@@ -180,7 +197,9 @@ class TestModelRunner(unittest.TestCase):
             )
 
         forward_batch.out_cache_loc = jnp.array(out_cache_loc)
-        forward_batch.seq_lens = jnp.array([seq_len + 1 for seq_len in forward_batch.seq_lens])
+        forward_batch.seq_lens = jnp.array(
+            [seq_len + 1 for seq_len in forward_batch.seq_lens]
+        )
 
         token_indices_with_all_reqs = self.model_runner.req_to_token_pool.req_to_token[
             forward_batch.req_pool_indices
@@ -219,7 +238,9 @@ class TestModelRunner(unittest.TestCase):
             extend_output.next_token_logits.shape, (1, self.model_config.vocab_size)
         )  # (batch_size, vocab_size)
 
-        print(f" Extend phase completed. Output shape: {extend_output.next_token_logits.shape}")
+        print(
+            f" Extend phase completed. Output shape: {extend_output.next_token_logits.shape}"
+        )
 
         # Step 2: Multiple decode phases (generation)
         # Continue from the extend batch for proper KV cache continuity
@@ -265,7 +286,9 @@ class TestModelRunner(unittest.TestCase):
                 print("Debug trace not saved")
         # Verify all decode outputs have consistent shapes
         for output in decode_outputs:
-            self.assertEqual(output.next_token_logits.shape, (1, self.model_config.vocab_size))
+            self.assertEqual(
+                output.next_token_logits.shape, (1, self.model_config.vocab_size)
+            )
             self.assertEqual(output.next_token_logits.dtype, jnp.bfloat16)
         self.assertEqual(current_token.shape, (1, 1))  # (batch_size, 1)
         # Assertions for final verification

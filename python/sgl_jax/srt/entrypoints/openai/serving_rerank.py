@@ -4,7 +4,11 @@ from typing import Any, Dict, List, Optional, Union
 from fastapi import Request
 from fastapi.responses import ORJSONResponse
 
-from sgl_jax.srt.entrypoints.openai.protocol import ErrorResponse, RerankResponse, V1RerankReqInput
+from sgl_jax.srt.entrypoints.openai.protocol import (
+    ErrorResponse,
+    RerankResponse,
+    V1RerankReqInput,
+)
 from sgl_jax.srt.entrypoints.openai.serving_base import OpenAIServingBase
 from sgl_jax.srt.managers.io_struct import EmbeddingReqInput
 

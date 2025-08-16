@@ -89,9 +89,13 @@ class SchedulePolicy:
         prefix_computed = False
         if isinstance(policy, CacheAwarePolicy):
             prefix_computed = True
-            temporary_deprioritized = self._compute_prefix_matches(waiting_queue, policy)
+            temporary_deprioritized = self._compute_prefix_matches(
+                waiting_queue, policy
+            )
             if policy == CacheAwarePolicy.LPM:
-                SchedulePolicy._sort_by_longest_prefix(waiting_queue, temporary_deprioritized)
+                SchedulePolicy._sort_by_longest_prefix(
+                    waiting_queue, temporary_deprioritized
+                )
             elif policy == CacheAwarePolicy.DFS_WEIGHT:
                 SchedulePolicy._sort_by_dfs_weight(waiting_queue, self.tree_cache)
             else:
@@ -114,7 +118,9 @@ class SchedulePolicy:
             return CacheAgnosticPolicy.FCFS
         return self.policy
 
-    def _validate_and_adjust_policy(self, policy: str, tree_cache: BasePrefixCache) -> Policy:
+    def _validate_and_adjust_policy(
+        self, policy: str, tree_cache: BasePrefixCache
+    ) -> Policy:
         """
         Validates the policy and adjusts it if necessary based on tree cache settings.
         """
@@ -156,8 +162,10 @@ class SchedulePolicy:
             # threshold means we cannot use in-batch prefix caching for short prefixes.
             # It is kind of common when the engine is long running (e.g., imagine the prefix "the").
             if len(r.prefix_indices) <= IN_BATCH_PREFIX_CACHING_CHECK_THRESHOLD:
-                in_batch_matching_prefixes, _, _, _ = self.waiting_queue_radix_tree.match_prefix(
-                    rid=r.rid, key=prefix_ids
+                in_batch_matching_prefixes, _, _, _ = (
+                    self.waiting_queue_radix_tree.match_prefix(
+                        rid=r.rid, key=prefix_ids
+                    )
                 )
                 if (
                     len(in_batch_matching_prefixes)
@@ -178,12 +186,16 @@ class SchedulePolicy:
         """Sorts the waiting queue based on the longest prefix match."""
         waiting_queue.sort(
             key=lambda r: (
-                -len(r.prefix_indices) if r.rid not in temporary_deprioritized else float("inf")
+                -len(r.prefix_indices)
+                if r.rid not in temporary_deprioritized
+                else float("inf")
             )
         )
 
     @staticmethod
-    def _sort_by_dfs_weight(waiting_queue: List[Req], tree_cache: BasePrefixCache) -> None:
+    def _sort_by_dfs_weight(
+        waiting_queue: List[Req], tree_cache: BasePrefixCache
+    ) -> None:
         """Sorts the waiting queue based on a depth-first search weighting."""
         last_node_to_reqs = defaultdict(list)
         for req in waiting_queue:
@@ -228,7 +240,9 @@ class SchedulePolicy:
         childs = [child for child in cur_node.children.values()]
         childs.sort(key=lambda x: -node_to_priority[x])
         for child in childs:
-            SchedulePolicy._get_dfs_priority(child, node_to_priority, last_node_to_reqs, q)
+            SchedulePolicy._get_dfs_priority(
+                child, node_to_priority, last_node_to_reqs, q
+            )
         q.extend(last_node_to_reqs[cur_node])
 
 
@@ -277,7 +291,8 @@ class PrefillAdder:
     @property
     def rem_total_tokens(self):
         available_and_evictable = (
-            self.token_to_kv_pool_allocator.available_size() + self.tree_cache.evictable_size()
+            self.token_to_kv_pool_allocator.available_size()
+            + self.tree_cache.evictable_size()
         )
 
         return available_and_evictable - self.rem_total_token_offset
@@ -285,7 +300,8 @@ class PrefillAdder:
     @property
     def cur_rem_tokens(self):
         available_and_evictable = (
-            self.token_to_kv_pool_allocator.available_size() + self.tree_cache.evictable_size()
+            self.token_to_kv_pool_allocator.available_size()
+            + self.tree_cache.evictable_size()
         )
 
         return available_and_evictable - self.cur_rem_token_offset
@@ -302,7 +318,9 @@ class PrefillAdder:
 
         return AddReqResult.CONTINUE
 
-    def _update_prefill_budget(self, prefix_len: int, extend_input_len: int, max_new_tokens: int):
+    def _update_prefill_budget(
+        self, prefix_len: int, extend_input_len: int, max_new_tokens: int
+    ):
         # TODO(lsyin): check this workaround logic, which only ensures the prefill will not out of memory, and may be too conservative
         extend_input_len = extend_input_len
 
@@ -323,8 +341,12 @@ class PrefillAdder:
 
     def add_one_req_ignore_eos(self, req: Req):
         def add_req_state(r, insert_sort=False):
-            new_token_ratio = 1.0 if r.sampling_params.ignore_eos else self.new_token_ratio
-            tokens_left = r.sampling_params.max_new_tokens * new_token_ratio - len(r.output_ids)
+            new_token_ratio = (
+                1.0 if r.sampling_params.ignore_eos else self.new_token_ratio
+            )
+            tokens_left = r.sampling_params.max_new_tokens * new_token_ratio - len(
+                r.output_ids
+            )
             tokens_occupied = len(r.origin_input_ids) + len(r.output_ids)
 
             if tokens_left <= 0:

@@ -49,13 +49,17 @@ class MockJAXModel:
             print(f"{prefix}dict ({len(pytree)} keys):")
             for key, value in pytree.items():
                 print(f"{prefix}  {key}:")
-                self._print_pytree_structure(value, prefix + "    ", max_depth, current_depth + 1)
+                self._print_pytree_structure(
+                    value, prefix + "    ", max_depth, current_depth + 1
+                )
         elif isinstance(pytree, (list, tuple)):
             type_name = "list" if isinstance(pytree, list) else "tuple"
             print(f"{prefix}{type_name} ({len(pytree)} items):")
             for i, item in enumerate(pytree):
                 print(f"{prefix}  [{i}]:")
-                self._print_pytree_structure(item, prefix + "    ", max_depth, current_depth + 1)
+                self._print_pytree_structure(
+                    item, prefix + "    ", max_depth, current_depth + 1
+                )
         elif hasattr(pytree, "shape") and hasattr(pytree, "dtype"):
             shape = pytree.shape
             dtype = pytree.dtype
@@ -68,7 +72,11 @@ class MockJAXModel:
                     memory_bytes = pytree.nbytes
                 else:
                     # Estimate memory usage
-                    dtype_size = pytree.dtype.itemsize if hasattr(pytree.dtype, "itemsize") else 4
+                    dtype_size = (
+                        pytree.dtype.itemsize
+                        if hasattr(pytree.dtype, "itemsize")
+                        else 4
+                    )
                     memory_bytes = size * dtype_size
 
                 if memory_bytes >= 1024**3:  # GB
@@ -113,9 +121,7 @@ class MockJAXModel:
                     # For 1D tensors, show head and tail 3 elements
                     if shape[0] <= 6:
                         preview_data = pytree[:]
-                        data_preview = (
-                            f"\n{prefix}  All {shape[0]} elements:\n{prefix}    {preview_data}"
-                        )
+                        data_preview = f"\n{prefix}  All {shape[0]} elements:\n{prefix}    {preview_data}"
                     else:
                         head_elements = pytree[:3]
                         tail_elements = pytree[-3:]
@@ -148,7 +154,9 @@ class TestJAXModelLoader(CustomTestCase):
     """Test cases for JAXModelLoader"""
 
     def setUp(self):
-        self.mesh = create_device_mesh(ici_parallelism=[-1, 1, 1, 1], dcn_parallelism=[1, 1, 1, 1])
+        self.mesh = create_device_mesh(
+            ici_parallelism=[-1, 1, 1, 1], dcn_parallelism=[1, 1, 1, 1]
+        )
 
         self.test_model_path = os.environ.get("MODEL_PATH", "/tmp/test_jax_model")
         self.load_config = LoadConfig(load_format=LoadFormat.JAX)
@@ -178,13 +186,17 @@ class TestJAXModelLoader(CustomTestCase):
         invalid_config = LoadConfig(load_format=LoadFormat.AUTO)
         with self.assertRaises(ValueError) as context:
             JAXModelLoader(invalid_config)
-        self.assertIn("JAXModelLoader only supports JAX load format", str(context.exception))
+        self.assertIn(
+            "JAXModelLoader only supports JAX load format", str(context.exception)
+        )
 
     def test_prepare_jax_weights_local_path(self):
         """Test preparing JAX weights from local path"""
         loader = JAXModelLoader(self.load_config)
 
-        hf_folder, hf_weights_files = loader._prepare_jax_weights(self.mock_model_path, None)
+        hf_folder, hf_weights_files = loader._prepare_jax_weights(
+            self.mock_model_path, None
+        )
 
         self.assertEqual(hf_folder, self.mock_model_path)
         self.assertEqual(len(hf_weights_files), 1)
@@ -207,15 +219,21 @@ class TestJAXModelLoader(CustomTestCase):
         if not os.path.exists(self.test_model_path):
             self.skipTest(f"Real model path {self.test_model_path} not found")
 
-        msgpack_files = [f for f in os.listdir(self.test_model_path) if f.endswith(".msgpack")]
+        msgpack_files = [
+            f for f in os.listdir(self.test_model_path) if f.endswith(".msgpack")
+        ]
         if not msgpack_files:
             self.skipTest(f"No .msgpack files found in {self.test_model_path}")
 
-        model_config = ModelConfig(model_path=self.test_model_path, model_override_args="{}")
+        model_config = ModelConfig(
+            model_path=self.test_model_path, model_override_args="{}"
+        )
 
         loader = JAXModelLoader(self.load_config)
 
-        with patch("sgl_jax.srt.model_loader.loader.get_model_architecture") as mock_arch:
+        with patch(
+            "sgl_jax.srt.model_loader.loader.get_model_architecture"
+        ) as mock_arch:
             mock_arch.return_value = (MockJAXModel, None)
             model = loader.load_model(
                 model_config=model_config,

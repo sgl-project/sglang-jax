@@ -2,7 +2,7 @@ default_stages: [pre-commit, pre-push, manual]
 
 repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks
-    rev: v5.0.0
+    rev: v6.0.0
     hooks:
       - id: check-symlinks
       - id: destroyed-symlinks
@@ -35,6 +35,17 @@ repos:
     rev: 24.10.0
     hooks:
       - id: black-jupyter
+        # exclude: >
+        #   (?x)^(
+        #     python/sgl_jax/srt/entrypoints/openai/serving_rerank\.py|
+        #     python/sgl_jax/srt/entrypoints/openai/serving_score\.py|
+        #     python/sgl_jax/srt/managers/detokenizer_manager\.py|
+        #     python/sgl_jax/srt/model_loader/__init__\.py|
+        #     python/sgl_jax/srt/managers/tp_worker\.py|
+        #     python/sgl_jax/srt/managers/scheduler_output_processor_mixin\.py|
+        #     python/sgl_jax/srt/managers/scheduler\.py|
+        #     python/sgl_jax/srt/server_args\.py
+        #   )$
   - repo: https://github.com/codespell-project/codespell
     rev: v2.4.1
     hooks:

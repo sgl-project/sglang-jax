@@ -3,7 +3,11 @@ from typing import Union
 
 from fastapi import Request
 
-from sgl_jax.srt.entrypoints.openai.protocol import ErrorResponse, ScoringRequest, ScoringResponse
+from sgl_jax.srt.entrypoints.openai.protocol import (
+    ErrorResponse,
+    ScoringRequest,
+    ScoringResponse,
+)
 from sgl_jax.srt.entrypoints.openai.serving_base import OpenAIServingBase
 
 logger = logging.getLogger(__name__)

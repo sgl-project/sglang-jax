@@ -76,16 +76,21 @@ class SamplingParams:
 
     def verify(self, vocab_size):
         if self.temperature < 0.0:
-            raise ValueError(f"temperature must be non-negative, got {self.temperature}.")
+            raise ValueError(
+                f"temperature must be non-negative, got {self.temperature}."
+            )
         if not 0.0 < self.top_p <= 1.0:
             raise ValueError(f"top_p must be in (0, 1], got {self.top_p}.")
         if not 0.0 <= self.min_p <= 1.0:
             raise ValueError(f"min_p must be in [0, 1], got {self.min_p}.")
         if self.top_k < 1 or self.top_k == -1:
-            raise ValueError(f"top_k must be -1 (disable) or at least 1, got {self.top_k}.")
+            raise ValueError(
+                f"top_k must be -1 (disable) or at least 1, got {self.top_k}."
+            )
         if not -2.0 <= self.frequency_penalty <= 2.0:
             raise ValueError(
-                "frequency_penalty must be in [-2, 2], got " f"{self.frequency_penalty}."
+                "frequency_penalty must be in [-2, 2], got "
+                f"{self.frequency_penalty}."
             )
         if not -2.0 <= self.presence_penalty <= 2.0:
             raise ValueError(
@@ -93,15 +98,19 @@ class SamplingParams:
             )
         if not 0.0 <= self.repetition_penalty <= 2.0:
             raise ValueError(
-                "repetition_penalty must be in [0, 2], got " f"{self.repetition_penalty}."
+                "repetition_penalty must be in [0, 2], got "
+                f"{self.repetition_penalty}."
             )
         if not 0 <= self.min_new_tokens:
             raise ValueError(
-                f"min_new_tokens must be in [0, max_new_tokens], got " f"{self.min_new_tokens}."
+                f"min_new_tokens must be in [0, max_new_tokens], got "
+                f"{self.min_new_tokens}."
             )
         if self.max_new_tokens is not None:
             if self.max_new_tokens < 0:
-                raise ValueError(f"max_new_tokens must be at least 0, got {self.max_new_tokens}.")
+                raise ValueError(
+                    f"max_new_tokens must be at least 0, got {self.max_new_tokens}."
+                )
             if not self.min_new_tokens <= self.max_new_tokens:
                 raise ValueError(
                     f"min_new_tokens must be in [0, max_new_tokens({self.max_new_tokens})], got "
@@ -111,7 +120,8 @@ class SamplingParams:
             for token_id in self.logit_bias:
                 if not 0 <= int(token_id) < vocab_size:
                     raise ValueError(
-                        f"logit_bias must has keys in [0, {vocab_size - 1}], got " f"{token_id}."
+                        f"logit_bias must has keys in [0, {vocab_size - 1}], got "
+                        f"{token_id}."
                     )
         grammars = [
             self.json_schema,

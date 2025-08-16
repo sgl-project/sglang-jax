@@ -74,22 +74,32 @@ class ModelConfig:
         )
 
         self.hf_text_config = get_hf_text_config(self.hf_config)
-        self.attention_chunk_size = getattr(self.hf_text_config, "attention_chunk_size", None)
+        self.attention_chunk_size = getattr(
+            self.hf_text_config, "attention_chunk_size", None
+        )
 
-        if is_draft_model and self.hf_config.architectures[0] == "DeepseekV3ForCausalLM":
+        if (
+            is_draft_model
+            and self.hf_config.architectures[0] == "DeepseekV3ForCausalLM"
+        ):
             self.hf_config.architectures[0] = "DeepseekV3ForCausalLMNextN"
 
         if is_draft_model and self.hf_config.architectures[0] == "MiMoForCausalLM":
             self.hf_config.architectures[0] = "MiMoMTP"
         # Check model type
-        self.is_generation = is_generation_model(self.hf_config.architectures, is_embedding)
+        self.is_generation = is_generation_model(
+            self.hf_config.architectures, is_embedding
+        )
+        self.is_multimodal = False
         self.dtype = _get_and_verify_dtype(self.hf_text_config, dtype)
 
         # Derive context length
         derived_context_len = get_context_length(self.hf_text_config)
         if context_length is not None:
             if context_length > derived_context_len:
-                if get_bool_env_var("SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN", default="True"):
+                if get_bool_env_var(
+                    "SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN", default="True"
+                ):
                     logger.warning(
                         f"Warning: User-specified context_length ({context_length}) is greater than the derived context_length ({derived_context_len}). "
                         f"This may lead to incorrect model outputs or CUDA errors."
@@ -115,11 +125,15 @@ class ModelConfig:
 
         self.attention_arch = AttentionArch.MHA
         self.num_attention_heads = self.hf_text_config.num_attention_heads
-        self.num_key_value_heads = getattr(self.hf_text_config, "num_key_value_heads", None)
+        self.num_key_value_heads = getattr(
+            self.hf_text_config, "num_key_value_heads", None
+        )
 
         # for Dbrx and MPT models
         if self.hf_config.model_type in ["dbrx", "mpt"]:
-            self.num_key_value_heads = getattr(self.hf_config.attn_config, "kv_n_heads", None)
+            self.num_key_value_heads = getattr(
+                self.hf_config.attn_config, "kv_n_heads", None
+            )
 
         if self.num_key_value_heads is None:
             self.num_key_value_heads = self.num_attention_heads
@@ -160,10 +174,13 @@ class ModelConfig:
         # multi_query flag is ignored and we use n_head_kv for the number of
         # KV heads.
         falcon_model_types = ["falcon", "RefinedWeb", "RefinedWebModel"]
-        new_decoder_arch_falcon = self.hf_config.model_type in falcon_model_types and getattr(
-            self.hf_config, "new_decoder_architecture", False
+        new_decoder_arch_falcon = (
+            self.hf_config.model_type in falcon_model_types
+            and getattr(self.hf_config, "new_decoder_architecture", False)
         )
-        if not new_decoder_arch_falcon and getattr(self.hf_text_config, "multi_query", False):
+        if not new_decoder_arch_falcon and getattr(
+            self.hf_text_config, "multi_query", False
+        ):
             # Multi-query attention, only one KV head.
             # Currently, tensor parallelism is not supported in this case.
             return 1
@@ -226,7 +243,9 @@ class ModelConfig:
                 if hf_api.file_exists(self.model_path, "hf_quant_config.json"):
                     quant_cfg = modelopt_quant_config
             elif os.path.exists(os.path.join(self.model_path, "hf_quant_config.json")):
-                quant_config_file = os.path.join(self.model_path, "hf_quant_config.json")
+                quant_config_file = os.path.join(
+                    self.model_path, "hf_quant_config.json"
+                )
                 with open(quant_config_file) as f:
                     quant_config_dict = json.load(f)
                 json_quant_configs = quant_config_dict["quantization"]
@@ -245,7 +264,9 @@ class ModelConfig:
         if eos_ids is None:
             eos_ids = set()
         if self.hf_generation_config:
-            generation_eos_ids = getattr(self.hf_generation_config, "eos_token_id", None)
+            generation_eos_ids = getattr(
+                self.hf_generation_config, "eos_token_id", None
+            )
             if generation_eos_ids:
                 generation_eos_ids = (
                     {generation_eos_ids}

@@ -312,7 +312,9 @@ class Req:
 
         if first_iter:
             self.read_offset = len(self.origin_input_ids_unpadded)
-            self.surr_offset = max(self.read_offset - INIT_INCREMENTAL_DETOKENIZATION_OFFSET, 0)
+            self.surr_offset = max(
+                self.read_offset - INIT_INCREMENTAL_DETOKENIZATION_OFFSET, 0
+            )
 
         all_ids = self.origin_input_ids_unpadded + self.output_ids
         return all_ids[self.surr_offset :], self.read_offset - self.surr_offset
@@ -328,7 +330,9 @@ class Req:
             return
 
         if len(self.output_ids) >= self.sampling_params.max_new_tokens:
-            self.finished_reason = FINISH_LENGTH(length=self.sampling_params.max_new_tokens)
+            self.finished_reason = FINISH_LENGTH(
+                length=self.sampling_params.max_new_tokens
+            )
             return
 
         last_token_id = self.output_ids[-1]
@@ -344,14 +348,20 @@ class Req:
             if self.eos_token_ids:
                 if any(hasattr(token_id, "item") for token_id in self.eos_token_ids):
                     self.eos_token_ids = {
-                        int(token_id.item()) if hasattr(token_id, "item") else int(token_id)
+                        (
+                            int(token_id.item())
+                            if hasattr(token_id, "item")
+                            else int(token_id)
+                        )
                         for token_id in self.eos_token_ids
                     }
                 matched_eos |= last_token_id in self.eos_token_ids
             if self.tokenizer is not None:
                 matched_eos |= last_token_id == self.tokenizer.eos_token_id
                 if self.tokenizer.additional_stop_token_ids:
-                    matched_eos |= last_token_id in self.tokenizer.additional_stop_token_ids
+                    matched_eos |= (
+                        last_token_id in self.tokenizer.additional_stop_token_ids
+                    )
             if matched_eos:
                 self.finished_reason = FINISH_MATCHED_TOKEN(matched=last_token_id)
                 return
@@ -383,7 +393,9 @@ class Req:
         # set it to one token to skip the long prefill
         self.origin_input_ids = [0]
         self.return_logprob = False
-        self.finished_reason = FINISH_ABORT(error_msg, HTTPStatus.BAD_REQUEST, "BadRequestError")
+        self.finished_reason = FINISH_ABORT(
+            error_msg, HTTPStatus.BAD_REQUEST, "BadRequestError"
+        )
 
     def __repr__(self):
         return (
@@ -452,6 +464,7 @@ class ScheduleBatch:
     # Stream
     has_stream: bool = False
 
+    # device mesh
     mesh: mesh_lib.Mesh = None
 
     @classmethod
@@ -582,14 +595,20 @@ class ScheduleBatch:
                 if global_start_idx < req.logprob_start_len:
                     global_start_idx = req.logprob_start_len
 
-                logprob_token_ids = req.origin_input_ids[global_start_idx + 1 : global_end_idx + 1]
+                logprob_token_ids = req.origin_input_ids[
+                    global_start_idx + 1 : global_end_idx + 1
+                ]
                 extend_input_logprob_token_ids.extend(logprob_token_ids)
 
                 # We will need req.extend_input_len - req.extend_logprob_start_len number of
                 # tokens, and logprob_token_ids is for input logprob, so pad the rest of them by 0.
                 extend_input_logprob_token_ids.extend(
                     [0]
-                    * (req.extend_input_len - req.extend_logprob_start_len - len(logprob_token_ids))
+                    * (
+                        req.extend_input_len
+                        - req.extend_logprob_start_len
+                        - len(logprob_token_ids)
+                    )
                 )
 
         if self.return_logprob:
@@ -662,7 +681,10 @@ class ScheduleBatch:
         retracted_reqs = []
         seq_lens_cpu = jax.device_get(self.seq_lens)
         first_iter = True
-        while _get_available_size() < get_required_tokens(len(sorted_indices)) or first_iter:
+        while (
+            _get_available_size() < get_required_tokens(len(sorted_indices))
+            or first_iter
+        ):
             if len(sorted_indices) == 1:
                 # Corner case: only one request left
                 assert (
@@ -770,7 +792,9 @@ class ScheduleBatch:
         keep_indices: Optional[List[int]] = None,
     ):
         if keep_indices is None:
-            keep_indices = [i for i in range(len(self.reqs)) if not self.reqs[i].finished()]
+            keep_indices = [
+                i for i in range(len(self.reqs)) if not self.reqs[i].finished()
+            ]
 
         if keep_indices is None or len(keep_indices) == 0:
             # Filter out all requests
@@ -781,7 +805,9 @@ class ScheduleBatch:
             # No need to filter
             return
 
-        keep_indices_device = device_array(self.mesh, jnp.array(keep_indices, dtype=jnp.int32))
+        keep_indices_device = device_array(
+            self.mesh, jnp.array(keep_indices, dtype=jnp.int32)
+        )
 
         self.reqs = [self.reqs[i] for i in keep_indices]
         self.req_pool_indices = self.req_pool_indices[keep_indices_device]
@@ -807,13 +833,18 @@ class ScheduleBatch:
         # needs to be called with pre-merged Batch.reqs.
         self.sampling_info.merge_batch(other.sampling_info, other.mesh)
 
-        self.req_pool_indices = jnp.concat([self.req_pool_indices, other.req_pool_indices])
+        self.req_pool_indices = jnp.concat(
+            [self.req_pool_indices, other.req_pool_indices]
+        )
         self.seq_lens = jnp.concat([self.seq_lens, other.seq_lens])
         self.out_cache_loc = None
         self.seq_lens_sum += other.seq_lens_sum
         if self.output_ids is not None:
             self.output_ids = jnp.concat(
-                [self.output_ids[: len(self.seq_lens)], other.output_ids[: len(other.seq_lens)]]
+                [
+                    self.output_ids[: len(self.seq_lens)],
+                    other.output_ids[: len(other.seq_lens)],
+                ]
             )
         if self.return_logprob and other.return_logprob:
             self.top_logprobs_nums.extend(other.top_logprobs_nums)
@@ -831,168 +862,205 @@ class ScheduleBatch:
 
     def get_model_worker_batch(
         self,
-        max_seq_len: int,
+        max_running_requests: int,
+        max_total_num_tokens: int,
         bs_paddings: list,
         token_paddings: list,
     ) -> ModelWorkerBatch:
-        # jax.debug.print(
-        #     f"[mode = {self.forward_mode}] real input_ids: {len(self.input_ids)}, real batch_size: {self.batch_size}"
-        # )
         if self.forward_mode.is_decode_or_idle():
             extend_seq_lens = extend_prefix_lens = extend_logprob_start_lens = None
             token_paddings = bs_paddings
         else:
-            extend_seq_lens = jnp.array(self.extend_lens, dtype=jnp.int32)
-            extend_prefix_lens = jnp.array(self.prefix_lens, dtype=jnp.int32)
-            extend_logprob_start_lens = jnp.array(self.extend_logprob_start_lens, dtype=jnp.int32)
+            extend_seq_lens = np.array(self.extend_lens, dtype=np.int32)
+            extend_prefix_lens = np.array(self.prefix_lens, dtype=np.int32)
+            bs_paddings = [1, max_running_requests]
 
         global bid
         bid += 1
+
+        input_ids_cpu = jax.device_get(self.input_ids.flatten())
+        real_input_ids_len = len(input_ids_cpu)
+        out_cache_loc_cpu = jax.device_get(self.out_cache_loc)
+        seq_lens_cpu = jax.device_get(self.seq_lens)
+        real_bs = len(seq_lens_cpu)
+        req_pool_indices_cpu = jax.device_get(self.req_pool_indices)
+        token_indices_with_all_reqs = jax.device_get(
+            self.req_to_token_pool.req_to_token[self.req_pool_indices]
+        )
 
         # padding seq
         # extend & decode: input_ids, positions, out_cache_loc, cache_loc
         padding_size = 0
         token_paddings.sort()
         for size in token_paddings:
-            if size >= len(self.input_ids):
-                padding_size = size - len(self.input_ids)
+            if size >= len(input_ids_cpu):
+                padding_size = size - len(input_ids_cpu)
                 break
-        self.input_ids = self.input_ids.flatten()
+
         if padding_size > 0:
-            self.input_ids = jnp.concat(
+            input_ids_cpu = np.concat(
                 [
-                    self.input_ids,
-                    jnp.array([0] * padding_size, dtype=self.input_ids.dtype),
+                    input_ids_cpu,
+                    np.array([0] * padding_size, dtype=input_ids_cpu.dtype),
                 ],
                 axis=0,
             )
 
-        padded_input_ids_len = len(self.input_ids)
-        out_cache_loc_num_to_padding = padded_input_ids_len - len(self.out_cache_loc)
-        # jax.debug.print(f"[get_model_worker_batch before padding] out_cache_loc, sharding: {self.out_cache_loc.sharding}")
+        padded_input_ids_len = len(input_ids_cpu)
+        out_cache_loc_num_to_padding = padded_input_ids_len - len(out_cache_loc_cpu)
         if out_cache_loc_num_to_padding > 0:
-            self.out_cache_loc = jnp.concatenate(
+            out_cache_loc_cpu = np.concatenate(
                 [
-                    jnp.array(np.asarray(self.out_cache_loc)),
-                    jnp.array([-1] * out_cache_loc_num_to_padding, dtype=self.out_cache_loc.dtype),
+                    out_cache_loc_cpu,
+                    np.array(
+                        [-1] * out_cache_loc_num_to_padding,
+                        dtype=out_cache_loc_cpu.dtype,
+                    ),
                 ],
                 axis=0,
             )
+
         # Calculate positions and extend_start_loc after padding
         if self.forward_mode.is_extend():
             # For prefill: create positions for each token in sequences
             # Calculate total tokens without padding first
-            total_tokens_before_padding = sum([extend_len for extend_len in self.extend_lens])
-            positions = jnp.concatenate(
+            total_tokens_before_padding = sum(
+                [extend_len for extend_len in self.extend_lens]
+            )
+            positions = np.concatenate(
                 [
-                    jnp.arange(prefix_len, seq_len, dtype=self.seq_lens.dtype)
-                    for seq_len, prefix_len in zip(self.seq_lens, self.prefix_lens)
+                    np.arange(prefix_len, seq_len, dtype=seq_lens_cpu.dtype)
+                    for seq_len, prefix_len in zip(seq_lens_cpu, self.prefix_lens)
                 ]
             )
 
-            # print(f"[schedule_batch] positions before padding: {positions.shape}")
-
             # If input_ids was padded, pad positions too
-            if len(self.input_ids) > total_tokens_before_padding:
-                padding_size = len(self.input_ids) - total_tokens_before_padding
-                positions = jnp.concatenate(
-                    [positions, jnp.zeros(padding_size, dtype=positions.dtype)]
+            padding_size = len(input_ids_cpu) - total_tokens_before_padding
+            if padding_size:
+                positions = np.concatenate(
+                    [positions, np.zeros(padding_size, dtype=positions.dtype)]
                 )
-            # print(f"[schedule_batch] padding_size: {padding_size}, total_tokens_before_padding: {total_tokens_before_padding}")
 
             # Start location of each sequence in the flattened array
-            extend_start_loc = jnp.cumsum(
-                jnp.concatenate([jnp.array([0]), extend_seq_lens[:-1]]), dtype=self.seq_lens.dtype
+            extend_start_loc = np.cumsum(
+                np.concatenate([np.array([0]), extend_seq_lens[:-1]]),
+                dtype=seq_lens_cpu.dtype,
             )
         else:
             # For decode: each sequence contributes one token at the next position (seq_len)
             # Create positions for actual tokens (one per sequence at seq_len)
-            batch_positions = self.seq_lens  # Next position is current seq_len
+            batch_positions = seq_lens_cpu  # Next position is current seq_len
             # Create positions array matching the length of input_ids (including padding)
-            positions = jnp.zeros(len(self.input_ids), dtype=batch_positions.dtype)
+            positions = np.zeros(len(input_ids_cpu), dtype=batch_positions.dtype)
             # Fill in the actual positions for the real tokens
-            positions = positions.at[: len(batch_positions)].set(batch_positions)
+            # positions = positions.at[: len(batch_positions)].set(batch_positions)
+            positions[: len(batch_positions)] = batch_positions
             # The padding tokens (if any) will have position 0, which is fine for padding
             # For decode, extend_start_loc is typically not used but we'll set it anyway
-            extend_start_loc = jnp.arange(len(self.seq_lens), dtype=self.seq_lens.dtype)
+            extend_start_loc = np.arange(len(seq_lens_cpu), dtype=seq_lens_cpu.dtype)
 
         # padding bs: req_pool_indices, seq_lens, extend_start_loc, extend_prefix_lens, extend_seq_lens
         bs_padding_size = 0
-        selected_bs = self.batch_size
+        # if self.forward_mode.is_extend():
+        #     bs_padding_size = max_running_requests - len(seq_lens_cpu)
+        # else:
         bs_paddings.sort()
         for size in bs_paddings:
-            if size >= len(self.seq_lens):
-                bs_padding_size = size - len(self.seq_lens)
-                selected_bs = size
+            if size >= len(seq_lens_cpu):
+                bs_padding_size = size - len(seq_lens_cpu)
                 break
 
-        token_indices_with_all_reqs = self.req_to_token_pool.req_to_token[self.req_pool_indices]
-        # print(f"[schedule_batch] positions: {positions.shape}")
-        # print(f"[schedule_batch] input_ids: {self.input_ids.shape}")
-        cache_loc_list = []
-        for seq_idx in range(self.seq_lens.shape[0]):
-            seq_len = self.seq_lens[seq_idx]
-            cache_loc_list.append(np.asarray(token_indices_with_all_reqs[seq_idx][:seq_len]))
-        cache_loc = jnp.concatenate(cache_loc_list, axis=0)
-        input_len = self.input_ids.shape[0]
-        total_cache_loc_size = selected_bs * max_seq_len
-        if total_cache_loc_size > cache_loc.shape[0]:
-            cache_loc = jnp.pad(
-                cache_loc, (0, total_cache_loc_size - cache_loc.shape[0]), constant_values=0
+        total_cache_size = sum(seq_lens_cpu)
+
+        cache_loc_flat = np.zeros(total_cache_size, dtype=np.int32)
+
+        offset = 0
+        for seq_idx in range(len(seq_lens_cpu)):
+            seq_len = seq_lens_cpu[seq_idx]
+            if seq_len > 0:  # Only process non-empty sequences
+                cache_loc_flat[offset : offset + seq_len] = token_indices_with_all_reqs[
+                    seq_idx, :seq_len
+                ]
+                offset += seq_len
+
+        total_cache_loc_size = max_total_num_tokens
+        if total_cache_loc_size > len(cache_loc_flat):
+            cache_loc_cpu = np.pad(
+                cache_loc_flat,
+                (0, total_cache_loc_size - len(cache_loc_flat)),
+                constant_values=0,
             )
 
-        req_pool_indices_padding = self.req_pool_indices
-        seq_lens_padding = self.seq_lens
+        # seq_lens_padding = self.seq_lens
         if bs_padding_size > 0:
-            invalid_req_pool_indices = jnp.array(
-                [-1] * bs_padding_size, dtype=self.req_pool_indices.dtype
+            invalid_req_pool_indices = np.array(
+                [-1] * bs_padding_size, dtype=req_pool_indices_cpu.dtype
             )
-            req_pool_indices_padding = jnp.concat(
-                [jnp.array(np.asarray(self.req_pool_indices)), invalid_req_pool_indices], axis=0
+            req_pool_indices_cpu = np.concat(
+                [
+                    req_pool_indices_cpu,
+                    invalid_req_pool_indices,
+                ],
+                axis=0,
             )
-            invalid_seq_lens = jnp.array([0] * bs_padding_size, dtype=self.seq_lens.dtype)
-            seq_lens_padding = jnp.concat([self.seq_lens, invalid_seq_lens], axis=0)
+            invalid_seq_lens = np.array([0] * bs_padding_size, dtype=seq_lens_cpu.dtype)
+            seq_lens_cpu = np.concat([seq_lens_cpu, invalid_seq_lens], axis=0)
             if self.forward_mode.is_extend():
-                invalid_extend_start_loc = jnp.array(
+                invalid_extend_start_loc = np.array(
                     [extend_start_loc[-1] + extend_seq_lens[-1]] * bs_padding_size,
                     dtype=extend_start_loc.dtype,
                 )
-                extend_start_loc = jnp.concat([extend_start_loc, invalid_extend_start_loc], axis=0)
-                invalid_extend_prefix_lens = jnp.array(
+                extend_start_loc = np.concat(
+                    [extend_start_loc, invalid_extend_start_loc], axis=0
+                )
+                invalid_extend_prefix_lens = np.array(
                     [0] * bs_padding_size, dtype=extend_prefix_lens.dtype
                 )
-                extend_prefix_lens = jnp.concat(
+                extend_prefix_lens = np.concat(
                     [extend_prefix_lens, invalid_extend_prefix_lens], axis=0
                 )
-                invalid_extend_seq_lens = jnp.array(
+                invalid_extend_seq_lens = np.array(
                     [0] * bs_padding_size, dtype=extend_seq_lens.dtype
                 )
-                extend_seq_lens = jnp.concat([extend_seq_lens, invalid_extend_seq_lens], axis=0)
-            else:
-                invalid_extend_start_loc = jnp.array(
-                    [len(self.seq_lens)] * bs_padding_size, dtype=extend_start_loc.dtype
+                extend_seq_lens = np.concat(
+                    [extend_seq_lens, invalid_extend_seq_lens], axis=0
                 )
-                extend_start_loc = jnp.concat([extend_start_loc, invalid_extend_start_loc], axis=0)
+            else:
+                invalid_extend_start_loc = np.array(
+                    [len(seq_lens_cpu)] * bs_padding_size, dtype=extend_start_loc.dtype
+                )
+                extend_start_loc = np.concat(
+                    [extend_start_loc, invalid_extend_start_loc], axis=0
+                )
 
-        # self.out_cache_loc = jax.device_put(self.out_cache_loc, self.input_ids.sharding)
-        # jax.debug.print(f"[get_model_worker_batch after device_put] out_cache_loc, sharding: {self.out_cache_loc.sharding}")
         return ModelWorkerBatch(
             bid=bid,
             forward_mode=self.forward_mode,
             input_ids=device_array(
-                self.mesh, jnp.array(np.asarray(self.input_ids), dtype=self.input_ids.dtype)
+                self.mesh,
+                input_ids_cpu,
             ),
-            req_pool_indices=device_array(self.mesh, req_pool_indices_padding),
-            seq_lens=device_array(self.mesh, seq_lens_padding),
-            out_cache_loc=device_array(self.mesh, self.out_cache_loc),
+            real_input_ids_len=real_input_ids_len,
+            real_bs=real_bs,
+            req_pool_indices=device_array(self.mesh, req_pool_indices_cpu),
+            seq_lens=device_array(self.mesh, seq_lens_cpu),
+            out_cache_loc=device_array(self.mesh, out_cache_loc_cpu),
             return_logprob=self.return_logprob,
             sampling_info=self.sampling_info,
             extend_input_logprob_token_ids=self.extend_input_logprob_token_ids,
             positions=device_array(self.mesh, positions),
             extend_start_loc=device_array(self.mesh, extend_start_loc),
-            cache_loc=device_array(self.mesh, cache_loc),
-            extend_prefix_lens=extend_prefix_lens,
-            extend_seq_lens=extend_seq_lens,
+            cache_loc=device_array(self.mesh, cache_loc_cpu),
+            extend_prefix_lens=(
+                device_array(self.mesh, extend_prefix_lens)
+                if self.forward_mode == ForwardMode.EXTEND
+                else None
+            ),
+            extend_seq_lens=(
+                device_array(self.mesh, extend_seq_lens)
+                if self.forward_mode == ForwardMode.EXTEND
+                else None
+            ),
         )
 
     def copy(self):
@@ -1025,11 +1093,11 @@ class ScheduleBatch:
         evictable_size = self.tree_cache.evictable_size()
         return f"Available tokens: {available_size + evictable_size} ({available_size=} + {evictable_size=})\n"
 
-    def __str__(self):
-        return (
-            f"ScheduleBatch(forward_mode={self.forward_mode.name if self.forward_mode else 'None'}, "
-            f"#req={(len(self.reqs))})"
-        )
+    # def __str__(self):
+    #     return (
+    #         f"ScheduleBatch(forward_mode={self.forward_mode.name if self.forward_mode else 'None'}, "
+    #         f"#req={(len(self.reqs))})"
+    #     )
 
 
 @dataclasses.dataclass
@@ -1040,6 +1108,9 @@ class ModelWorkerBatch:
     forward_mode: ForwardMode
     # The input ids
     input_ids: jax.Array
+    # the length is outof padding
+    real_input_ids_len: int
+    real_bs: int
     # The sequence length
     seq_lens: jax.Array
     # The indices of output tokens in the token_to_kv_pool_allocator
@@ -1063,3 +1134,13 @@ class ModelWorkerBatch:
     extend_prefix_lens: Optional[jax.Array] = None
 
     extend_seq_lens: Optional[jax.Array] = None
+
+    def print_array(self):
+        print(f"========ModelWorkerBatch")
+        print(f"{self.input_ids.shape=}, {self.input_ids.sharding=}")
+        print(f"{self.seq_lens.shape=}, {self.seq_lens.sharding=}")
+        print(f"{self.out_cache_loc.shape=}, {self.out_cache_loc.sharding=}")
+        print(f"{self.req_pool_indices.shape=}, {self.req_pool_indices.sharding=}")
+        print(f"{self.positions.shape=}, {self.positions.sharding=}")
+        print(f"{self.extend_start_loc.shape=}, {self.extend_start_loc.sharding=}")
+        print(f"{self.cache_loc.shape=}, {self.cache_loc.sharding=}")

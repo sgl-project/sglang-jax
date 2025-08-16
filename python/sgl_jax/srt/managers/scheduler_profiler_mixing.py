@@ -1,4 +1,5 @@
 import logging
+import os
 from pathlib import Path
 from typing import Optional
 
@@ -23,6 +24,8 @@ class SchedulerProfilerMixin:
         output_dir: Optional[str],
         start_step: Optional[int],
         num_steps: Optional[int],
+        host_tracer_level: Optional[int],
+        python_tracer_level: Optional[int],
         profile_id: str,
     ) -> ProfileReqOutput:
         if self.profile_in_progress:
@@ -43,10 +46,11 @@ class SchedulerProfilerMixin:
         if num_steps:
             self.profile_steps = num_steps
             if start_step:
-                self.profiler_target_forward_ct = self.profiler_start_forward_ct + num_steps
+                self.profiler_target_forward_ct = (
+                    self.profiler_start_forward_ct + num_steps
+                )
             else:
                 self.profiler_target_forward_ct = self.forward_ct + num_steps
-            # The caller will be notified when reaching profiler_target_forward_ct
         else:
             self.profiler_target_forward_ct = None
 
@@ -56,7 +60,20 @@ class SchedulerProfilerMixin:
         logger.info(
             f"Profiling starts. Traces will be saved to: {self.profiler_output_dir} (with profile id: {self.profile_id})",
         )
-        jax.profiler.start_trace(self.profiler_output_dir)
+
+        profiler_options = jax.profiler.ProfileOptions()
+        if host_tracer_level:
+            profiler_options.host_tracer_level = host_tracer_level
+        if python_tracer_level:
+            profiler_options.python_tracer_level = python_tracer_level
+
+        print(f"profiler_options: {profiler_options}")
+
+        jax.profiler.start_trace(
+            self.profiler_output_dir,
+            profiler_options=profiler_options,
+        )
+
         self.profile_in_progress = True
         return ProfileReqOutput(success=True, message="Succeeded")
 
@@ -83,15 +100,28 @@ class SchedulerProfilerMixin:
         return ProfileReqOutput(success=True, message="Succeeded.")
 
     def _profile_batch_predicate(self, batch):
-        if self.profiler_target_forward_ct and self.profiler_target_forward_ct <= self.forward_ct:
+        if (
+            self.profiler_target_forward_ct
+            and self.profiler_target_forward_ct <= self.forward_ct
+        ):
             self.stop_profile()
-        if self.profiler_start_forward_ct and self.profiler_start_forward_ct == self.forward_ct:
-            self.start_profile(self.profiler_output_dir, None, self.profile_steps, self.profile_id)
+        if (
+            self.profiler_start_forward_ct
+            and self.profiler_start_forward_ct == self.forward_ct
+        ):
+            self.start_profile(
+                self.profiler_output_dir, None, self.profile_steps, self.profile_id
+            )
 
     def profile(self, recv_req: ProfileReq):
         if recv_req.type == ProfileReqType.START_PROFILE:
             return self.start_profile(
-                recv_req.output_dir, recv_req.start_step, recv_req.num_steps, recv_req.profile_id
+                recv_req.output_dir,
+                recv_req.start_step,
+                recv_req.num_steps,
+                recv_req.host_tracer_level,
+                recv_req.python_tracer_level,
+                recv_req.profile_id,
             )
         else:
             return self.stop_profile()

@@ -1,3 +1,4 @@
+import logging
 from typing import Any, Dict, Optional, Tuple
 
 import jax
@@ -7,17 +8,17 @@ from jax import numpy as jnp
 from jax.sharding import PartitionSpec
 from transformers import PretrainedConfig
 
+from sgl_jax.srt.configs.model_config import ModelConfig
 from sgl_jax.srt.debug_tracer import global_tracer, trace_function
 from sgl_jax.srt.layers.embeddings import Embed, ParallelLMHead, RotaryEmbedding
 from sgl_jax.srt.layers.layernorm import RMSNorm
 from sgl_jax.srt.layers.linear import LinearBase
 from sgl_jax.srt.layers.logits_processor import LogitsProcessor
+from sgl_jax.srt.layers.radix_attention import RadixAttention
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
-from sgl_jax.srt.utils import (
-    flatten_pytree_with_paths,
-    get_expected_param_paths,
-    update_state_recursive,
-)
+from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
+
+logger = logging.getLogger(__name__)
 
 
 class QWen3Attention(nnx.Module):
@@ -33,11 +34,13 @@ class QWen3Attention(nnx.Module):
         rms_norm_eps: float = None,
         layer_id: int = 0,
         attention_bias: bool = False,
+        dtype: jnp.dtype = jnp.bfloat16,
         rngs: nnx.Rngs = None,
     ):
         self.layer_id = layer_id
         assert num_heads % num_kv_heads == 0
-        self.head_dim = head_dim or hidden_size // num_heads
+        head_dim_original = head_dim or hidden_size // num_heads
+        self.head_dim = (head_dim_original + 127) // 128 * 128
 
         self.q_size = num_heads * self.head_dim
         self.kv_size = num_kv_heads * self.head_dim
@@ -52,6 +55,7 @@ class QWen3Attention(nnx.Module):
             use_bias=attention_bias,
             kernel_axes=(None, "tensor"),
             rngs=rngs,
+            params_dtype=dtype,
         )
         self.k_proj = LinearBase(
             input_size=hidden_size,
@@ -59,6 +63,7 @@ class QWen3Attention(nnx.Module):
             use_bias=attention_bias,
             kernel_axes=(None, "tensor"),
             rngs=rngs,
+            params_dtype=dtype,
         )
         self.v_proj = LinearBase(
             input_size=hidden_size,
@@ -66,6 +71,7 @@ class QWen3Attention(nnx.Module):
             use_bias=attention_bias,
             kernel_axes=(None, "tensor"),
             rngs=rngs,
+            params_dtype=dtype,
         )
         self.o_proj = LinearBase(
             input_size=num_heads * self.head_dim,
@@ -73,6 +79,7 @@ class QWen3Attention(nnx.Module):
             use_bias=attention_bias,
             kernel_axes=("tensor", None),
             rngs=rngs,
+            params_dtype=dtype,
         )
         self.rotary_emb = RotaryEmbedding(
             head_size=self.head_dim,
@@ -80,13 +87,15 @@ class QWen3Attention(nnx.Module):
             max_position_embeddings=max_position_embeddings,
             base=rope_theta,
             is_neox_style=False,
-            dtype=jnp.bfloat16,
+            dtype=dtype,
         )
 
-        self.attn = Attention(
+        self.attn = RadixAttention(
             num_heads=num_heads,
+            head_dim=self.head_dim,
+            scaling=self.scaling,
             num_kv_heads=num_kv_heads,
-            scale=self.scaling,
+            layer_id=layer_id,
         )
 
     @trace_function(stage="ATTENTION", include_args=False, include_output=True)
@@ -109,13 +118,10 @@ class QWen3Attention(nnx.Module):
         k = k_by_head.reshape(k.shape)
 
         q, k = self.rotary_emb(positions, q, k)
-        global_tracer.print(q, f"rotary_emb_output_q", f"attention_layer_id_{self.layer_id}")
-        global_tracer.print(k, f"rotary_emb_output_k", f"attention_layer_id_{self.layer_id}")
-        attn_output = self.attn(q, k, v, forward_batch=forward_batch, is_causal=True)
-        global_tracer.print(attn_output, f"attn_output", f"attention_layer_id_{self.layer_id}")
+        attn_output, k, v = self.attn(q, k, v, forward_batch=forward_batch)
 
         output, _ = self.o_proj(attn_output)
-        return output
+        return output, k, v
 
 
 class Qwen3MLP(nnx.Module):
@@ -177,7 +183,13 @@ class Qwen3MLP(nnx.Module):
 
 
 class QWen3DecoderLayer(nnx.Module):
-    def __init__(self, config: PretrainedConfig, layer_id: int = 0, rngs: nnx.Rngs = None):
+    def __init__(
+        self,
+        config: PretrainedConfig,
+        layer_id: int = 0,
+        dtype: jnp.dtype = jnp.bfloat16,
+        rngs: nnx.Rngs = None,
+    ):
         self.layer_id = layer_id
         self.hidden_size = config.hidden_size
         rope_theta = getattr(config, "rope_theta", 1000000)
@@ -195,6 +207,7 @@ class QWen3DecoderLayer(nnx.Module):
             rms_norm_eps=config.rms_norm_eps,
             layer_id=layer_id,
             attention_bias=config.attention_bias,
+            dtype=dtype,
             rngs=rngs,
         )
 
@@ -202,9 +215,12 @@ class QWen3DecoderLayer(nnx.Module):
             hidden_size=config.hidden_size,
             intermediate_size=config.intermediate_size,
             layer_id=layer_id,
+            dtype=dtype,
             rngs=rngs,
         )
-        self.input_layernorm = RMSNorm(config.hidden_size, epsilon=config.rms_norm_eps, rngs=rngs)
+        self.input_layernorm = RMSNorm(
+            config.hidden_size, epsilon=config.rms_norm_eps, rngs=rngs
+        )
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, epsilon=config.rms_norm_eps, rngs=rngs
         )
@@ -223,7 +239,7 @@ class QWen3DecoderLayer(nnx.Module):
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
 
-        hidden_states = self.self_attn(
+        hidden_states, k, v = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
             forward_batch=forward_batch,
@@ -231,29 +247,36 @@ class QWen3DecoderLayer(nnx.Module):
 
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         global_tracer.print(
-            hidden_states, f"post_attention_layernorm_output", f"decoder_layer_id_{self.layer_id}"
+            hidden_states,
+            f"post_attention_layernorm_output",
+            f"decoder_layer_id_{self.layer_id}",
         )
         hidden_states = self.mlp(hidden_states)
 
-        return hidden_states, residual
+        return hidden_states, residual, k, v
 
 
 class QWen3Model(nnx.Module):
-    def __init__(self, config: PretrainedConfig, rngs: nnx.Rngs = None):
-        self.config = config
-        self.padding_idx = config.pad_token_id
-        self.vocab_size = config.vocab_size
+    def __init__(
+        self,
+        config: PretrainedConfig,
+        dtype: jnp.dtype = jnp.bfloat16,
+        rngs: nnx.Rngs = None,
+    ):
 
         self.embed_tokens = Embed(
             num_embeddings=config.vocab_size,
             features=config.hidden_size,
             rngs=rngs,
+            dtype=dtype,
+            param_dtype=dtype,
         )
 
         self.layers = [
             QWen3DecoderLayer(
                 config=config,
                 layer_id=i,
+                dtype=dtype,
                 rngs=rngs,
             )
             for i in range(config.num_hidden_layers)
@@ -270,18 +293,32 @@ class QWen3Model(nnx.Module):
     ):
         residual = None
         hidden_states = self.embed_tokens(input_ids)
+        layers_k = []
+        layers_v = []
         for layer in self.layers:
-            hidden_states, residual = layer(positions, hidden_states, forward_batch, residual)
+            hidden_states, residual, k, v = layer(
+                positions, hidden_states, forward_batch, residual
+            )
+            layers_k.append(k)
+            layers_v.append(v)
+
         hidden_states, _ = self.norm(hidden_states, residual)
-        return hidden_states
+        return hidden_states, layers_k, layers_v
 
 
-class Qwen3ForCausalLMJaxModel(nnx.Module):
-    def __init__(self, config: PretrainedConfig, rngs: nnx.Rngs = None):
+class Qwen3ForCausalLM(nnx.Module):
+    def __init__(
+        self, config: ModelConfig, rngs: nnx.Rngs = None, mesh: jax.sharding.Mesh = None
+    ):
+        self.mesh = mesh
         self.config = config
-        self.model = QWen3Model(config, rngs)
-        self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size, rngs=rngs)
-        self.logits_processor = LogitsProcessor(config.vocab_size)
+        self.dtype = config.dtype
+        logger.info(f"QWen3ForCausalLMModel config dtype: {self.dtype}")
+        self.transformer = QWen3Model(config.hf_config, dtype=self.dtype, rngs=rngs)
+        self.lm_head = ParallelLMHead(
+            config.hf_config.vocab_size, config.hidden_size, rngs=rngs
+        )
+        self.logits_processor = LogitsProcessor(config.hf_config.vocab_size)
         self._setup_debug_tracer()
 
     def _setup_debug_tracer(self):
@@ -290,19 +327,151 @@ class Qwen3ForCausalLMJaxModel(nnx.Module):
         except Exception as e:
             print(f"Warning: Could not setup debug tracer: {str(e)}")
 
-    def load_pytree_weights(self, pytree):
-        flat_weights = flatten_pytree_with_paths(pytree)
-        model_state = nnx.state(self)
-        expected_paths = get_expected_param_paths(model_state)
-        missing_paths = expected_paths - set(flat_weights.keys())
-        if missing_paths:
-            raise ValueError(f"Missing weights for parameters: {sorted(missing_paths)}")
+    def load_weights(self, rng_key: jax.Array):
+        self.rng = nnx.Rngs(rng_key)
 
-        update_state_recursive(model_state, flat_weights)
+        loader = WeightLoader(
+            model=self, model_config=self.config, mesh=self.mesh, dtype=self.dtype
+        )
 
-        pspecs = nnx.get_partition_spec(model_state)
-        pstate = jax.lax.with_sharding_constraint(model_state, pspecs)
-        nnx.update(self, pstate)
+        weight_mappings = self._create_qwen3_weight_mappings()
+
+        loader.load_weights_from_safetensors(weight_mappings)
+        logger.info("Qwen3 weights loaded successfully!")
+
+    def _create_qwen3_weight_mappings(self) -> dict:
+        mappings = {
+            "model.embed_tokens.weight": WeightMapping(
+                target_path="transformer.embed_tokens.embedding",
+                sharding=(None, None),
+                transpose=False,
+            ),
+            "model.norm.weight": WeightMapping(
+                target_path="transformer.norm.weight", sharding=(None,), transpose=False
+            ),
+        }
+
+        if not getattr(self.config.hf_config, "tie_word_embeddings", True):
+            mappings["lm_head.weight"] = WeightMapping(
+                target_path="lm_head.embedding", sharding=(None, None), transpose=False
+            )
+
+        num_layers = self.config.hf_config.num_hidden_layers
+        for layer_idx in range(num_layers):
+            layer_mappings = self._create_layer_mappings(layer_idx)
+            mappings.update(layer_mappings)
+
+        return mappings
+
+    def _create_layer_mappings(self, layer_idx: int) -> dict:
+        prefix = f"model.layers.{layer_idx}"
+        target_prefix = f"transformer.layers.{layer_idx}"
+
+        num_heads = self.config.hf_config.num_attention_heads
+        num_kv_heads = self.config.hf_config.num_key_value_heads
+        hidden_size = self.config.hf_config.hidden_size
+        head_dim_original = getattr(
+            self.config.hf_config, "head_dim", hidden_size // num_heads
+        )
+
+        mappings = {
+            f"{prefix}.input_layernorm.weight": WeightMapping(
+                target_path=f"{target_prefix}.input_layernorm.weight",
+                sharding=(None,),
+                transpose=False,
+            ),
+            f"{prefix}.post_attention_layernorm.weight": WeightMapping(
+                target_path=f"{target_prefix}.post_attention_layernorm.weight",
+                sharding=(None,),
+                transpose=False,
+            ),
+            f"{prefix}.self_attn.q_proj.weight": WeightMapping(
+                target_path=f"{target_prefix}.self_attn.q_proj.weight",
+                sharding=(None, "tensor"),
+                transpose=True,
+                head_dim_padding=True,
+                kv_head_padding=False,
+            ),
+            f"{prefix}.self_attn.k_proj.weight": WeightMapping(
+                target_path=f"{target_prefix}.self_attn.k_proj.weight",
+                sharding=(None, "tensor"),
+                transpose=True,
+                head_dim_padding=True,
+                kv_head_padding=True,
+            ),
+            f"{prefix}.self_attn.v_proj.weight": WeightMapping(
+                target_path=f"{target_prefix}.self_attn.v_proj.weight",
+                sharding=(None, "tensor"),
+                transpose=True,
+                head_dim_padding=True,
+                kv_head_padding=True,
+            ),
+            f"{prefix}.self_attn.o_proj.weight": WeightMapping(
+                target_path=f"{target_prefix}.self_attn.o_proj.weight",
+                sharding=("tensor", None),
+                transpose=True,
+                head_dim_padding=True,
+                kv_head_padding=False,
+            ),
+            f"{prefix}.self_attn.q_norm.weight": WeightMapping(
+                target_path=f"{target_prefix}.self_attn.q_norm.weight",
+                sharding=(None,),
+                transpose=False,
+            ),
+            f"{prefix}.self_attn.k_norm.weight": WeightMapping(
+                target_path=f"{target_prefix}.self_attn.k_norm.weight",
+                sharding=(None,),
+                transpose=False,
+            ),
+            f"{prefix}.mlp.gate_proj.weight": WeightMapping(
+                target_path=f"{target_prefix}.mlp.gate_proj.weight",
+                sharding=(None, "tensor"),
+                transpose=True,
+            ),
+            f"{prefix}.mlp.up_proj.weight": WeightMapping(
+                target_path=f"{target_prefix}.mlp.up_proj.weight",
+                sharding=(None, "tensor"),
+                transpose=True,
+            ),
+            f"{prefix}.mlp.down_proj.weight": WeightMapping(
+                target_path=f"{target_prefix}.mlp.down_proj.weight",
+                sharding=("tensor", None),
+                transpose=True,
+            ),
+        }
+
+        if getattr(self.config.hf_config, "attention_bias", False):
+            bias_mappings = {
+                f"{prefix}.self_attn.q_proj.bias": WeightMapping(
+                    target_path=f"{target_prefix}.self_attn.q_proj.bias",
+                    sharding=(None,),
+                    transpose=False,
+                    head_dim_padding=True,
+                    kv_head_padding=False,
+                ),
+                f"{prefix}.self_attn.k_proj.bias": WeightMapping(
+                    target_path=f"{target_prefix}.self_attn.k_proj.bias",
+                    sharding=(None,),
+                    transpose=False,
+                    head_dim_padding=True,
+                    kv_head_padding=True,
+                ),
+                f"{prefix}.self_attn.v_proj.bias": WeightMapping(
+                    target_path=f"{target_prefix}.self_attn.v_proj.bias",
+                    sharding=(None,),
+                    transpose=False,
+                    head_dim_padding=True,
+                    kv_head_padding=True,
+                ),
+                f"{prefix}.self_attn.o_proj.bias": WeightMapping(
+                    target_path=f"{target_prefix}.self_attn.o_proj.bias",
+                    sharding=(None,),
+                    transpose=False,
+                ),
+            }
+            mappings.update(bias_mappings)
+
+        return mappings
 
     def __call__(
         self,
@@ -310,9 +479,32 @@ class Qwen3ForCausalLMJaxModel(nnx.Module):
         positions: jax.Array,
         forward_batch: ForwardBatch,
     ):
-        hidden_states = self.model(input_ids, positions, forward_batch)
+        hidden_states, layers_k, layers_v = self.transformer(
+            input_ids, positions, forward_batch
+        )
         result = self.logits_processor(hidden_states, self.lm_head, forward_batch)
-        return result
+
+        if global_tracer.is_session_active():
+            input_data = {"input_ids": input_ids, "input_shape": list(input_ids.shape)}
+
+            output_data = {"output_type": str(type(result).__name__)}
+
+            if (
+                hasattr(result, "next_token_logits")
+                and result.next_token_logits is not None
+            ):
+                output_data.update(
+                    {
+                        "logits": result.next_token_logits,
+                        "logits_shape": list(result.next_token_logits.shape),
+                    }
+                )
+
+            global_tracer.accumulate_step(input_data, output_data)
+
+            if global_tracer.should_auto_save():
+                global_tracer.end_session()
+        return result, layers_k, layers_v
 
 
-EntryClass = Qwen3ForCausalLMJaxModel
+EntryClass = Qwen3ForCausalLM

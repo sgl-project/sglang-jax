@@ -82,7 +82,9 @@ class JsonSchemaResponseFormat(BaseModel):
 class FileRequest(BaseModel):
     # https://platform.openai.com/docs/api-reference/files/create
     file: bytes  # The File object (not file name) to be uploaded
-    purpose: str = "batch"  # The intended purpose of the uploaded file, default is "batch"
+    purpose: str = (
+        "batch"  # The intended purpose of the uploaded file, default is "batch"
+    )
 
 
 class FileResponse(BaseModel):
@@ -101,7 +103,9 @@ class FileDeleteResponse(BaseModel):
 
 
 class BatchRequest(BaseModel):
-    input_file_id: str  # The ID of an uploaded file that contains requests for the new batch
+    input_file_id: (
+        str  # The ID of an uploaded file that contains requests for the new batch
+    )
     endpoint: str  # The endpoint to be used for all requests in the batch
     completion_window: str  # The time frame within which the batch should be processed
     metadata: Optional[dict] = None  # Optional custom metadata for the batch
@@ -453,7 +457,9 @@ class ChatCompletionResponseChoice(BaseModel):
     message: ChatMessage
     logprobs: Optional[Union[LogProbs, ChoiceLogprobs]] = None
     finish_reason: Optional[
-        Literal["stop", "length", "tool_calls", "content_filter", "function_call", "abort"]
+        Literal[
+            "stop", "length", "tool_calls", "content_filter", "function_call", "abort"
+        ]
     ] = None
     matched_stop: Union[None, int, str] = None
     hidden_states: Optional[object] = None
@@ -495,7 +501,9 @@ class ChatCompletionResponseStreamChoice(BaseModel):
     delta: DeltaMessage
     logprobs: Optional[Union[LogProbs, ChoiceLogprobs]] = None
     finish_reason: Optional[
-        Literal["stop", "length", "tool_calls", "content_filter", "function_call", "abort"]
+        Literal[
+            "stop", "length", "tool_calls", "content_filter", "function_call", "abort"
+        ]
     ] = None
     matched_stop: Union[None, int, str] = None
 
@@ -514,7 +522,9 @@ class MultimodalEmbeddingInput(BaseModel):
     image: Optional[str] = None
 
 
-EmbeddingInput = Union[List[int], List[List[int]], str, List[str], List[MultimodalEmbeddingInput]]
+EmbeddingInput = Union[
+    List[int], List[List[int]], str, List[str], List[MultimodalEmbeddingInput]
+]
 
 
 class EmbeddingRequest(BaseModel):
@@ -544,11 +554,15 @@ class EmbeddingResponse(BaseModel):
 
 
 class ScoringRequest(BaseModel):
-    query: Optional[Union[str, List[int]]] = None  # Query text or pre-tokenized token IDs
+    query: Optional[Union[str, List[int]]] = (
+        None  # Query text or pre-tokenized token IDs
+    )
     items: Optional[Union[str, List[str], List[List[int]]]] = (
         None  # Item text(s) or pre-tokenized token IDs
     )
-    label_token_ids: Optional[List[int]] = None  # Token IDs to compute probabilities for
+    label_token_ids: Optional[List[int]] = (
+        None  # Token IDs to compute probabilities for
+    )
     apply_softmax: bool = False
     item_first: bool = False
     model: str

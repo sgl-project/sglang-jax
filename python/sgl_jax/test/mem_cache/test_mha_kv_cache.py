@@ -442,8 +442,12 @@ class TestMHAKVCache(unittest.TestCase):
 
             # Check first layer data
             k_host, v_host = cpu_copy[0]
-            self.assertEqual(k_host.shape, (num_tokens, config["head_num"], config["head_dim"]))
-            self.assertEqual(v_host.shape, (num_tokens, config["head_num"], config["head_dim"]))
+            self.assertEqual(
+                k_host.shape, (num_tokens, config["head_num"], config["head_dim"])
+            )
+            self.assertEqual(
+                v_host.shape, (num_tokens, config["head_num"], config["head_dim"])
+            )
 
             # Test loading CPU copy back
             new_locations = jnp.arange(10, 10 + num_tokens)
@@ -501,7 +505,9 @@ class TestMHAKVCache(unittest.TestCase):
 
         print("\n--- Test 2: Multi-device scenario (tensor parallel sharding) ---")
         # Use head count divisible by 4 to ensure sharding across 4 devices
-        multi_head_num = 32  # 32 heads can be sharded across 4 devices, 8 heads per device
+        multi_head_num = (
+            32  # 32 heads can be sharded across 4 devices, 8 heads per device
+        )
 
         with mesh_multi:
             kv_pool_multi = MHATokenToKVPool(
@@ -580,10 +586,12 @@ class TestMHAKVCache(unittest.TestCase):
 
             # Create test data - use different values per head for verification
             test_k = jnp.zeros(
-                (num_test_tokens, shard_head_num, config["head_dim"]), dtype=config["dtype"]
+                (num_test_tokens, shard_head_num, config["head_dim"]),
+                dtype=config["dtype"],
             )
             test_v = jnp.zeros(
-                (num_test_tokens, shard_head_num, config["head_dim"]), dtype=config["dtype"]
+                (num_test_tokens, shard_head_num, config["head_dim"]),
+                dtype=config["dtype"],
             )
 
             # Set different values for each head
@@ -617,7 +625,9 @@ class TestMHAKVCache(unittest.TestCase):
                 self.assertTrue(jnp.allclose(stored_v, expected_v, rtol=1e-5))
 
                 # Verify data distribution after sharding
-                print(f"Position {loc}: K shape={stored_k.shape}, V shape={stored_v.shape}")
+                print(
+                    f"Position {loc}: K shape={stored_k.shape}, V shape={stored_v.shape}"
+                )
                 print(
                     f"Position {loc}: K first 3 head values={stored_k[:3, 0]}, V first 3 head values={stored_v[:3, 0]}"
                 )
@@ -715,7 +725,9 @@ class TestMHAKVCache(unittest.TestCase):
             print(f"Tensor parallel device count: {tensor_parallel_size}")
             print(f"Elements per device: {elements_per_device:,}")
             print(f"Size per device per layer: {size_per_device_mb:.2f} MB")
-            print(f"Total size per device: {size_per_device_mb * large_config['layer_num']:.2f} MB")
+            print(
+                f"Total size per device: {size_per_device_mb * large_config['layer_num']:.2f} MB"
+            )
 
             # Verify actual sharding situation
             print(f"\n--- Actual sharding verification ---")
@@ -735,7 +747,9 @@ class TestMHAKVCache(unittest.TestCase):
                     )
 
                     # Verify correct head count per shard
-                    expected_heads_per_device = large_config["head_num"] // tensor_parallel_size
+                    expected_heads_per_device = (
+                        large_config["head_num"] // tensor_parallel_size
+                    )
                     self.assertEqual(shard.data.shape[1], expected_heads_per_device)
 
             # Verify total memory usage statistics
@@ -768,7 +782,9 @@ def run_all_tests():
         print("\n🎉 All MHA KV Cache tests passed!")
         return True
     else:
-        print(f"\nERROR: {len(result.failures)} test(s) failed, {len(result.errors)} error(s)")
+        print(
+            f"\nERROR: {len(result.failures)} test(s) failed, {len(result.errors)} error(s)"
+        )
         return False
 
 

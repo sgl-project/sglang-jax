@@ -32,7 +32,9 @@ class OpenAIServingBase(ABC):
                 return self.create_error_response(error_msg)
 
             # Convert to internal format
-            adapted_request, processed_request = self._convert_to_internal_request(request)
+            adapted_request, processed_request = self._convert_to_internal_request(
+                request
+            )
 
             # Note(Xinyuan): raw_request below is only used for detecting the connection of the client
             if hasattr(request, "stream") and request.stream:

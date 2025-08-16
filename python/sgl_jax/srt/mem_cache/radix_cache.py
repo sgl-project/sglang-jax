@@ -2,21 +2,16 @@ import heapq
 import time
 from collections import defaultdict
 from functools import partial
-from typing import TYPE_CHECKING, List, Optional, Tuple
+from typing import List, Optional, Tuple
 
 import jax
 import jax.numpy as jnp
 import numpy as np
-from jax.sharding import NamedSharding
-from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sgl_jax.srt.mem_cache.base_prefix_cache import BasePrefixCache, MatchResult
 from sgl_jax.srt.mem_cache.memory_pool import ReqToTokenPool
 from sgl_jax.srt.utils.jax_utils import device_array
-
-if TYPE_CHECKING:
-    pass
 
 
 class TreeNode:
@@ -106,23 +101,16 @@ class RadixCache(BasePrefixCache):
 
         if self.page_size == 1:
             self.key_match_fn = _key_match_page_size1
-            self.get_child_key_fn = lambda key: int(key[0]) if hasattr(key[0], "item") else key[0]
+            self.get_child_key_fn = lambda key: (
+                int(key[0]) if hasattr(key[0], "item") else key[0]
+            )
         else:
             self.key_match_fn = partial(_key_match_paged, page_size=page_size)
             # Ensure returning hashable types, convert numpy arrays to Python native types
             self.get_child_key_fn = lambda key: tuple(
                 int(x) if hasattr(x, "item") else x for x in key[:page_size]
             )
-
-        self._init_cache_strategy()
         self.reset()
-
-    def _init_cache_strategy(self):
-        print(f"[process {self.process_id}] init JAX Radix Cache")
-        print(f"  cpu_device: {self.cpu_device}")
-        print(f"  kv_head_num: {self.kv_head_num}")
-        print(f"  head_dim: {self.head_dim}")
-        print(f"  layer_num: {self.layer_num}")
 
     def _create_tokens_data(self, tokens: List[int]) -> jnp.ndarray:
         if self.disable:
@@ -226,8 +214,12 @@ class RadixCache(BasePrefixCache):
             page_aligned_kv_indices = kv_indices
 
         # Radix Cache takes over one reference from memory pool
-        new_prefix_len = self.insert(token_ids[:page_aligned_len], page_aligned_kv_indices)
-        self.token_to_kv_pool_allocator.free(kv_indices[len(req.prefix_indices) : new_prefix_len])
+        new_prefix_len = self.insert(
+            token_ids[:page_aligned_len], page_aligned_kv_indices
+        )
+        self.token_to_kv_pool_allocator.free(
+            kv_indices[len(req.prefix_indices) : new_prefix_len]
+        )
 
         # Remove request slot and release cache lock
         self.req_to_token_pool.free(req.req_pool_idx)
@@ -251,14 +243,18 @@ class RadixCache(BasePrefixCache):
 
         # Radix Cache takes over one reference from memory pool
         new_prefix_len = self.insert(page_aligned_token_ids, page_aligned_kv_indices)
-        self.token_to_kv_pool_allocator.free(kv_indices[len(req.prefix_indices) : new_prefix_len])
+        self.token_to_kv_pool_allocator.free(
+            kv_indices[len(req.prefix_indices) : new_prefix_len]
+        )
 
         # Prefix indices may have been updated, reuse them
         new_match_result = self.match_prefix(page_aligned_token_ids)
         new_indices = new_match_result.device_indices  # cpu
         new_last_node = new_match_result.last_device_node
 
-        new_indices_device = device_array(self.req_to_token_pool.mesh, np.asarray(new_indices))
+        new_indices_device = device_array(
+            self.req_to_token_pool.mesh, np.asarray(new_indices)
+        )
 
         self.req_to_token_pool.write(
             (req.req_pool_idx, slice(len(req.prefix_indices), len(new_indices))),
@@ -272,7 +268,9 @@ class RadixCache(BasePrefixCache):
         if self.page_size != 1:
             # create array on CPU
             with jax.default_device(self.cpu_device):
-                req.prefix_indices = jnp.concatenate([new_indices, kv_indices[len(new_indices) :]])
+                req.prefix_indices = jnp.concatenate(
+                    [new_indices, kv_indices[len(new_indices) :]]
+                )
                 req.prefix_indices = jax.device_put(req.prefix_indices, self.cpu_device)
         else:
             req.prefix_indices = new_indices
@@ -310,7 +308,8 @@ class RadixCache(BasePrefixCache):
             # No matched tokens, return empty KV data
             with jax.default_device(self.cpu_device):
                 kv_data = jnp.empty(
-                    (self.layer_num, 0, self.kv_head_num, self.head_dim), dtype=self.dtype
+                    (self.layer_num, 0, self.kv_head_num, self.head_dim),
+                    dtype=self.dtype,
                 )
                 kv_data = jax.device_put(kv_data, self.cpu_device)
         else:
@@ -511,7 +510,11 @@ class RadixCache(BasePrefixCache):
             key = key[prefix_len:]
 
             if isinstance(value, jnp.ndarray) and value.ndim >= 2:
-                value = value[:, prefix_len:, :, :] if value.ndim == 4 else value[prefix_len:]
+                value = (
+                    value[:, prefix_len:, :, :]
+                    if value.ndim == 4
+                    else value[prefix_len:]
+                )
             else:
                 # Handle non-ndarray values (lists, None, etc.)
                 if value is not None and len(value) > 0:

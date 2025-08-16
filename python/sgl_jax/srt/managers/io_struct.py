@@ -1,3 +1,4 @@
+import copy
 import uuid
 from dataclasses import dataclass
 from enum import Enum
@@ -94,7 +95,7 @@ class TokenizedGenerateReqInput:
     return_logprob: Optional[Union[List[bool], bool]] = None
     # If return logprobs, the start location in the prompt for returning logprobs.
     # By default, this value is "-1", which means it will only return logprobs for output tokens.
-    logprob_start_len: Optional[Union[List[int], int]] = None
+    logprob_start_len: Optional[Union[List[int], int]] = -1
     # If return logprobs, the number of top logprobs to return at each position.
     top_logprobs_num: Optional[Union[List[int], int]] = None
     # If return logprobs, the token ids to return logprob for.
@@ -142,6 +143,8 @@ class GenerateReqInput:
     top_logprobs_num: Optional[Union[List[int], int]] = None
     # If return logprobs, the token ids to return logprob for.
     token_ids_logprob: Optional[Union[List[List[int]], List[int]]] = None
+    # Whether to detokenize tokens in text in the returned logprobs.
+    return_text_in_logprobs: bool = False
 
     def _normalize_rid(self, num):
         """Normalize request IDs for batch processing."""
@@ -161,7 +164,175 @@ class GenerateReqInput:
             raise ValueError("The rid should be a string or a list of strings.")
 
     def normalize_batch_and_arguments(self):
-        self._normalize_rid(num=self.batch_size)
+        self._validate_inputs()
+        self._determine_batch_size()
+        self._handle_parallel_sampling()
+
+        if self.is_single:
+            self._normalize_single_inputs()
+        else:
+            self._normalize_batch_inputs()
+
+    def _normalize_single_inputs(self):
+        """Normalize inputs for a single example."""
+        if self.sampling_params is None:
+            self.sampling_params = {}
+        if self.rid is None:
+            self.rid = uuid.uuid4().hex
+        if self.return_logprob is None:
+            self.return_logprob = False
+        if self.logprob_start_len is None:
+            self.logprob_start_len = -1
+        if self.top_logprobs_num is None:
+            self.top_logprobs_num = 0
+        if not self.token_ids_logprob:  # covers both None and []
+            self.token_ids_logprob = None
+
+    def _handle_parallel_sampling(self):
+        """Handle parallel sampling parameters and adjust batch size if needed."""
+        # Determine parallel sample count
+        if self.sampling_params is None:
+            self.parallel_sample_num = 1
+            return
+        elif isinstance(self.sampling_params, dict):
+            self.parallel_sample_num = self.sampling_params.get("n", 1)
+        else:  # isinstance(self.sampling_params, list):
+            self.parallel_sample_num = self.sampling_params[0].get("n", 1)
+            for sampling_params in self.sampling_params:
+                if self.parallel_sample_num != sampling_params.get("n", 1):
+                    raise ValueError(
+                        "The parallel_sample_num should be the same for all samples in sample params."
+                    )
+
+    def _normalize_batch_inputs(self):
+        """Normalize inputs for a batch of examples, including parallel sampling expansion."""
+        # Calculate expanded batch size
+        if self.parallel_sample_num == 1:
+            num = self.batch_size
+        else:
+            # Expand parallel_sample_num
+            num = self.batch_size * self.parallel_sample_num
+
+        # Expand input based on type
+        self._expand_inputs(num)
+        self._normalize_rid(num)
+        self._normalize_sampling_params(num)
+        self._normalize_logprob_params(num)
+
+    def _expand_inputs(self, num):
+        """Expand the main inputs (text, input_ids, input_embeds) for parallel sampling."""
+        if self.text is not None:
+            if not isinstance(self.text, list):
+                raise ValueError("Text should be a list for batch processing.")
+            self.text = self.text * self.parallel_sample_num
+        elif self.input_ids is not None:
+            if not isinstance(self.input_ids, list) or not isinstance(
+                self.input_ids[0], list
+            ):
+                raise ValueError(
+                    "input_ids should be a list of lists for batch processing."
+                )
+            self.input_ids = self.input_ids * self.parallel_sample_num
+        elif self.input_embeds is not None:
+            if not isinstance(self.input_embeds, list):
+                raise ValueError("input_embeds should be a list for batch processing.")
+            self.input_embeds = self.input_embeds * self.parallel_sample_num
+
+    def _validate_inputs(self):
+        """Validate that the input configuration is valid."""
+        if (
+            self.text is None and self.input_ids is None and self.input_embeds is None
+        ) or (
+            self.text is not None
+            and self.input_ids is not None
+            and self.input_embeds is not None
+        ):
+            raise ValueError(
+                "Either text, input_ids or input_embeds should be provided."
+            )
+
+    def _normalize_sampling_params(self, num):
+        """Normalize sampling parameters for batch processing."""
+        if self.sampling_params is None:
+            self.sampling_params = [{}] * num
+        elif isinstance(self.sampling_params, dict):
+            self.sampling_params = [self.sampling_params] * num
+        else:  # Already a list
+            self.sampling_params = self.sampling_params * self.parallel_sample_num
+
+    def _determine_batch_size(self):
+        """Determine if this is a single example or a batch and the batch size."""
+        if self.text is not None:
+            if isinstance(self.text, str):
+                self.is_single = True
+                self.batch_size = 1
+            else:
+                self.is_single = False
+                self.batch_size = len(self.text)
+            self.input_embeds = None
+        elif self.input_ids is not None:
+            if len(self.input_ids) == 0:
+                raise ValueError("input_ids cannot be empty.")
+            if isinstance(self.input_ids[0], int):
+                self.is_single = True
+                self.batch_size = 1
+            else:
+                self.is_single = False
+                self.batch_size = len(self.input_ids)
+            self.input_embeds = None
+        else:
+            if isinstance(self.input_embeds[0][0], float):
+                self.is_single = True
+                self.batch_size = 1
+            else:
+                self.is_single = False
+                self.batch_size = len(self.input_embeds)
+
+    def _normalize_logprob_params(self, num):
+        """Normalize logprob-related parameters for batch processing."""
+
+        # Helper function to normalize a parameter
+        def normalize_param(param, default_value, param_name):
+            if param is None:
+                return [default_value] * num
+            elif not isinstance(param, list):
+                return [param] * num
+            else:
+                if self.parallel_sample_num > 1:
+                    raise ValueError(
+                        f"Cannot use list {param_name} with parallel_sample_num > 1"
+                    )
+                return param
+
+        # Normalize each logprob parameter
+        self.return_logprob = normalize_param(
+            self.return_logprob, False, "return_logprob"
+        )
+        self.logprob_start_len = normalize_param(
+            self.logprob_start_len, -1, "logprob_start_len"
+        )
+        self.top_logprobs_num = normalize_param(
+            self.top_logprobs_num, 0, "top_logprobs_num"
+        )
+
+        # Handle token_ids_logprob specially due to its nested structure
+        if not self.token_ids_logprob:  # covers both None and []
+            self.token_ids_logprob = [None] * num
+        elif not isinstance(self.token_ids_logprob, list):
+            self.token_ids_logprob = [[self.token_ids_logprob] for _ in range(num)]
+        elif not isinstance(self.token_ids_logprob[0], list):
+            self.token_ids_logprob = [
+                copy.deepcopy(self.token_ids_logprob) for _ in range(num)
+            ]
+        elif self.parallel_sample_num > 1:
+            raise ValueError(
+                "Cannot use list token_ids_logprob with parallel_sample_num > 1"
+            )
+
+    def regenerate_rid(self):
+        """Generate a new request ID and return it."""
+        self.rid = uuid.uuid4().hex
+        return self.rid
 
     def __getitem__(self, i):
         return GenerateReqInput(
@@ -173,6 +344,7 @@ class GenerateReqInput:
             logprob_start_len=self.logprob_start_len[i],
             top_logprobs_num=self.top_logprobs_num[i],
             token_ids_logprob=self.token_ids_logprob[i],
+            return_text_in_logprobs=self.return_text_in_logprobs,
             stream=self.stream,
         )
 
@@ -284,6 +456,16 @@ class ProfileReqInput:
     output_dir: Optional[str] = None
     start_step: Optional[int] = None
     num_steps: Optional[int] = None
+    # Sets the trace level for host-side activities.
+    # 0: Disables host (CPU) tracing entirely.
+    # 1: Enables tracing of only user-instrumented TraceMe events (this is the default).
+    # 2: Includes level 1 traces plus high-level program execution details like expensive XLA operations.
+    # 3: Includes level 2 traces plus more verbose, low-level program execution details such as cheap XLA operations.
+    host_tracer_level: Optional[int] = None
+    # Controls whether Python tracing is enabled.
+    # 0: Disables Python function call tracing.
+    # 1: Enables Python tracing (this is the default).
+    python_tracer_level: Optional[int] = None
 
 
 class ProfileReqType(Enum):
@@ -297,6 +479,8 @@ class ProfileReq:
     output_dir: Optional[str] = None
     start_step: Optional[int] = None
     num_steps: Optional[int] = None
+    host_tracer_level: Optional[int] = None
+    python_tracer_level: Optional[int] = None
     profile_id: Optional[str] = None
 
 

@@ -1,5 +1,3 @@
-# Adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/model_executor/models/registry.py
-
 import importlib
 import logging
 import pkgutil
@@ -48,7 +46,9 @@ class _ModelRegistry:
             logger.warning("No model architectures are specified")
 
         # filter out support architectures
-        normalized_arch = list(filter(lambda model: model in self.models, architectures))
+        normalized_arch = list(
+            filter(lambda model: model in self.models, architectures)
+        )
 
         # make sure Transformers backend is put at the last as a fallback
         if len(normalized_arch) != len(architectures):
@@ -83,7 +83,9 @@ def import_model_classes():
                 continue
             if hasattr(module, "EntryClass"):
                 entry = module.EntryClass
-                if isinstance(entry, list):  # To support multiple model classes in one module
+                if isinstance(
+                    entry, list
+                ):  # To support multiple model classes in one module
                     for tmp in entry:
                         assert (
                             tmp.__name__ not in model_arch_name_to_cls

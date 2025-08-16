@@ -7,7 +7,7 @@ import numpy as np
 from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 
-from sgl_jax.srt.mem_cache.memory_pool import MHATokenToKVPool, update_kv_cache
+from sgl_jax.srt.mem_cache.memory_pool import update_kv_cache
 
 
 class TestKVCache(unittest.TestCase):
@@ -83,7 +83,10 @@ class TestKVCache(unittest.TestCase):
             loc = jnp.zeros(total_tokens, dtype=jnp.int32)
             loc = loc.at[::2].set(all_locs[: total_tokens // 2])
             loc = loc.at[1::2].set(
-                all_locs[total_tokens // 2 : total_tokens // 2 + (total_tokens - total_tokens // 2)]
+                all_locs[
+                    total_tokens // 2 : total_tokens // 2
+                    + (total_tokens - total_tokens // 2)
+                ]
             )
         else:
             # All valid tokens
@@ -107,30 +110,12 @@ class TestKVCache(unittest.TestCase):
     def test_kv_cache_update_vectorized(self):
         """Test vectorized KV cache update without padding."""
         total_tokens = 16
-        k, v, loc, k_cache, v_cache = self.generate_test_data(total_tokens, add_padding=False)
+        k, v, loc, k_cache, v_cache = self.generate_test_data(
+            total_tokens, add_padding=False
+        )
 
         # Test with vectorized approach
-        updated_k_cache, updated_v_cache = update_kv_cache(
-            k, v, loc, k_cache, v_cache, use_vectorized=True
-        )
-
-        # Expected result
-        expected_k_cache, expected_v_cache = self.expected_update_kv_cache(
-            k, v, loc, k_cache, v_cache
-        )
-
-        self.assertTrue(jnp.allclose(updated_k_cache, expected_k_cache))
-        self.assertTrue(jnp.allclose(updated_v_cache, expected_v_cache))
-
-    def test_kv_cache_update_token_by_token(self):
-        """Test token-by-token KV cache update without padding."""
-        total_tokens = 8  # Smaller for token-by-token test
-        k, v, loc, k_cache, v_cache = self.generate_test_data(total_tokens, add_padding=False)
-
-        # Test with token-by-token approach
-        updated_k_cache, updated_v_cache = update_kv_cache(
-            k, v, loc, k_cache, v_cache, use_vectorized=False
-        )
+        updated_k_cache, updated_v_cache = update_kv_cache(k, v, loc, k_cache, v_cache)
 
         # Expected result
         expected_k_cache, expected_v_cache = self.expected_update_kv_cache(
@@ -143,12 +128,12 @@ class TestKVCache(unittest.TestCase):
     def test_kv_cache_update_with_padding_vectorized(self):
         """Test vectorized KV cache update with padding tokens."""
         total_tokens = 12
-        k, v, loc, k_cache, v_cache = self.generate_test_data(total_tokens, add_padding=True)
+        k, v, loc, k_cache, v_cache = self.generate_test_data(
+            total_tokens, add_padding=True
+        )
 
         # Test with vectorized approach
-        updated_k_cache, updated_v_cache = update_kv_cache(
-            k, v, loc, k_cache, v_cache, use_vectorized=True
-        )
+        updated_k_cache, updated_v_cache = update_kv_cache(k, v, loc, k_cache, v_cache)
 
         # Expected result (should ignore padding tokens where loc == -1)
         expected_k_cache, expected_v_cache = self.expected_update_kv_cache(
@@ -171,28 +156,12 @@ class TestKVCache(unittest.TestCase):
                     # Cache at this position should remain as original (zeros in this case)
                     continue  # We don't update cache for padding tokens
 
-    def test_kv_cache_update_with_padding_token_by_token(self):
-        """Test token-by-token KV cache update with padding tokens."""
-        total_tokens = 8  # Smaller for token-by-token test
-        k, v, loc, k_cache, v_cache = self.generate_test_data(total_tokens, add_padding=True)
-
-        # Test with token-by-token approach
-        updated_k_cache, updated_v_cache = update_kv_cache(
-            k, v, loc, k_cache, v_cache, use_vectorized=False
-        )
-
-        # Expected result (should ignore padding tokens where loc == -1)
-        expected_k_cache, expected_v_cache = self.expected_update_kv_cache(
-            k, v, loc, k_cache, v_cache
-        )
-
-        self.assertTrue(jnp.allclose(updated_k_cache, expected_k_cache))
-        self.assertTrue(jnp.allclose(updated_v_cache, expected_v_cache))
-
     def test_all_padding_tokens(self):
         """Test case where all tokens are padding tokens."""
         total_tokens = 4
-        k, v, _, k_cache, v_cache = self.generate_test_data(total_tokens, add_padding=False)
+        k, v, _, k_cache, v_cache = self.generate_test_data(
+            total_tokens, add_padding=False
+        )
 
         # Make all tokens padding
         loc = jnp.full((total_tokens,), -1, dtype=jnp.int32)
@@ -202,30 +171,11 @@ class TestKVCache(unittest.TestCase):
         original_v_cache = v_cache.copy()
 
         # Test both approaches
-        for use_vectorized in [True, False]:
-            updated_k_cache, updated_v_cache = update_kv_cache(
-                k, v, loc, k_cache, v_cache, use_vectorized=use_vectorized
-            )
+        updated_k_cache, updated_v_cache = update_kv_cache(k, v, loc, k_cache, v_cache)
 
-            # Cache should remain unchanged since all tokens are padding
-            self.assertTrue(jnp.allclose(updated_k_cache, original_k_cache))
-            self.assertTrue(jnp.allclose(updated_v_cache, original_v_cache))
-
-    def test_consistency_vectorized_vs_token_by_token(self):
-        """Test that vectorized and token-by-token approaches give same results."""
-        total_tokens = 8
-        k, v, loc, k_cache, v_cache = self.generate_test_data(total_tokens, add_padding=True)
-
-        # Test both approaches on the same data
-        k_cache_vec, v_cache_vec = update_kv_cache(k, v, loc, k_cache, v_cache, use_vectorized=True)
-
-        k_cache_token, v_cache_token = update_kv_cache(
-            k, v, loc, k_cache, v_cache, use_vectorized=False
-        )
-
-        # Results should be identical
-        self.assertTrue(jnp.allclose(k_cache_vec, k_cache_token))
-        self.assertTrue(jnp.allclose(v_cache_vec, v_cache_token))
+        # Cache should remain unchanged since all tokens are padding
+        self.assertTrue(jnp.allclose(updated_k_cache, original_k_cache))
+        self.assertTrue(jnp.allclose(updated_v_cache, original_v_cache))
 
     def test_mesh_sharded_kv_cache_correctness(self):
         """Test KV cache correctness with mesh sharding - independent buffer creation and verification"""
@@ -266,15 +216,21 @@ class TestKVCache(unittest.TestCase):
             print(f"Independently created V buffer sharding: {v_buffer.sharding}")
 
             # Step 2: Verify actual sharding by checking device distribution
-            print("--- Verifying cross-device sharding of independently created buffers ---")
+            print(
+                "--- Verifying cross-device sharding of independently created buffers ---"
+            )
             tensor_parallel_size = mesh.shape["tensor"]
             heads_per_device = shard_head_num // tensor_parallel_size
 
             print(f"Total heads: {shard_head_num}")
             print(f"Tensor parallelism size: {tensor_parallel_size}")
             print(f"Expected heads per device: {heads_per_device}")
-            print(f"K buffer addressable shards count: {len(k_buffer.addressable_shards)}")
-            print(f"V buffer addressable shards count: {len(v_buffer.addressable_shards)}")
+            print(
+                f"K buffer addressable shards count: {len(k_buffer.addressable_shards)}"
+            )
+            print(
+                f"V buffer addressable shards count: {len(v_buffer.addressable_shards)}"
+            )
 
             # Check sharding effectiveness on independent buffers
             k_shard_shapes = []
@@ -286,7 +242,9 @@ class TestKVCache(unittest.TestCase):
                 v_shape = v_shard.data.shape
                 k_shard_shapes.append(k_shape)
                 v_shard_shapes.append(v_shape)
-                print(f"Device {device_idx}: K shard shape {k_shape}, V shard shape {v_shape}")
+                print(
+                    f"Device {device_idx}: K shard shape {k_shape}, V shard shape {v_shape}"
+                )
 
             # Verify sharding worked correctly
             is_sharded = not all(shape[1] == shard_head_num for shape in k_shard_shapes)
@@ -314,7 +272,9 @@ class TestKVCache(unittest.TestCase):
                 print(
                     "WARNING: Detected that all devices have complete head data, possibly replication instead of sharding"
                 )
-                print("This could be due to JAX auto-optimization or mesh configuration issues")
+                print(
+                    "This could be due to JAX auto-optimization or mesh configuration issues"
+                )
 
             # Step 3: Test update_kv_cache with independently created buffers
             print("--- Testing update_kv_cache operations on independent buffers ---")
@@ -344,7 +304,7 @@ class TestKVCache(unittest.TestCase):
 
             # Test update_kv_cache function with independently created buffers
             updated_k_cache, updated_v_cache = update_kv_cache(
-                update_k, update_v, update_locations, k_buffer, v_buffer, use_vectorized=True
+                update_k, update_v, update_locations, k_buffer, v_buffer
             )
 
             print(f"Updated K cache sharding: {updated_k_cache.sharding}")
@@ -365,7 +325,9 @@ class TestKVCache(unittest.TestCase):
                 v_mean = float(jnp.mean(stored_v))
                 print(f"Position {loc}: K value {k_mean:.3f}, V value {v_mean:.3f}")
 
-            print("PASS: update_kv_cache works correctly on independently created sharded buffers")
+            print(
+                "PASS: update_kv_cache works correctly on independently created sharded buffers"
+            )
 
             # Step 5: Additional verification - check if sharding is maintained after operations
             final_k_shard_shapes = [
@@ -379,10 +341,14 @@ class TestKVCache(unittest.TestCase):
             for device_idx, (k_shape, v_shape) in enumerate(
                 zip(final_k_shard_shapes, final_v_shard_shapes)
             ):
-                print(f"Device {device_idx}: final K shard {k_shape}, final V shard {v_shape}")
+                print(
+                    f"Device {device_idx}: final K shard {k_shape}, final V shard {v_shape}"
+                )
 
             # Check if sharding is preserved or if the result is replicated
-            final_is_sharded = not all(shape[1] == shard_head_num for shape in final_k_shard_shapes)
+            final_is_sharded = not all(
+                shape[1] == shard_head_num for shape in final_k_shard_shapes
+            )
 
             if final_is_sharded:
                 # Ensure sharding consistency is maintained
@@ -398,7 +364,9 @@ class TestKVCache(unittest.TestCase):
                 )
                 print("PASS: Sharding consistency maintained after operation")
             else:
-                print("WARNING: Results replicated to all devices after update_kv_cache operation")
+                print(
+                    "WARNING: Results replicated to all devices after update_kv_cache operation"
+                )
                 print(
                     "This indicates that update_kv_cache function does not preserve input sharding strategy"
                 )

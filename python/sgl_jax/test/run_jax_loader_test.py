@@ -136,11 +136,17 @@ def main():
         help="Specific test method to run (e.g., test_load_model_with_custom_path)",
     )
 
-    parser.add_argument("--verbose", "-v", action="store_true", help="Verbose test output")
+    parser.add_argument(
+        "--verbose", "-v", action="store_true", help="Verbose test output"
+    )
 
-    parser.add_argument("--check-jax", action="store_true", help="Check JAX dependencies and exit")
+    parser.add_argument(
+        "--check-jax", action="store_true", help="Check JAX dependencies and exit"
+    )
 
-    parser.add_argument("--check-deps", action="store_true", help="Check all dependencies and exit")
+    parser.add_argument(
+        "--check-deps", action="store_true", help="Check all dependencies and exit"
+    )
 
     parser.add_argument(
         "--create-sample",
@@ -187,7 +193,9 @@ def main():
 
     print("\nRunning JAXModelLoader tests...")
 
-    success = run_tests(test_name=args.test, model_path=args.model_path, verbose=args.verbose)
+    success = run_tests(
+        test_name=args.test, model_path=args.model_path, verbose=args.verbose
+    )
 
     if success:
         print("\n✓ All tests passed!")

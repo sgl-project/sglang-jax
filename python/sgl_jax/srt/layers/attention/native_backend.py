@@ -10,6 +10,7 @@ from sgl_jax.srt.layers.attention.base_attn_backend import AttentionBackend
 from sgl_jax.srt.layers.radix_attention import AttentionType, RadixAttention
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 
+
 @register_pytree_node_class
 class NativeAttention(AttentionBackend):
     """Native Attention layer for variable-length sequences using ForwardBatch."""
@@ -24,6 +25,7 @@ class NativeAttention(AttentionBackend):
             self.num_kv_heads = num_kv_heads
         else:
             self.num_kv_heads = num_attn_heads
+        # self.rngs = rngs
 
     def print_array_shape(self):
         print(f"==NativaAttention shape")
@@ -35,7 +37,9 @@ class NativeAttention(AttentionBackend):
 
     @classmethod
     def tree_unflatten(cls, aux_data, children):
-        return cls(num_attn_heads=aux_data["num_heads"], num_kv_heads=aux_data["num_kv_heads"])
+        return cls(
+            num_attn_heads=aux_data["num_heads"], num_kv_heads=aux_data["num_kv_heads"]
+        )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init the metadata for a forward pass."""
@@ -57,7 +61,9 @@ class NativeAttention(AttentionBackend):
         Returns:
             Tuple of (output tensor of shape [total_tokens, hidden_size], k, v)
         """
-        k_buffer, v_buffer = self._get_and_update_kv_cache(k, v, forward_batch, layer.layer_id)
+        k_buffer, v_buffer = self._get_and_update_kv_cache(
+            k, v, forward_batch, layer.layer_id
+        )
 
         if layer.scaling is None:
             scale = 1.0 / jnp.sqrt(layer.head_dim)

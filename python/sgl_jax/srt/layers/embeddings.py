@@ -82,7 +82,9 @@ class Embed(nnx.Module):
             raise ValueError("Input type must be an integer or unsigned integer.")
         # Use take because fancy indexing numpy arrays with JAX indices does not
         # work correctly.
-        (embedding,) = self.promote_dtype((self.embedding.value,), dtype=self.dtype, inexact=False)
+        (embedding,) = self.promote_dtype(
+            (self.embedding.value,), dtype=self.dtype, inexact=False
+        )
         if self.num_embeddings == 1:
             return jnp.broadcast_to(embedding, inputs.shape + (self.features,))
         return jnp.take(embedding, inputs, axis=0)
@@ -100,7 +102,9 @@ class Embed(nnx.Module):
           Commonly used for weight-sharing between embeddings and logit transform
           in NLP models.
         """
-        query, embedding = self.promote_dtype((query, self.embedding.value), dtype=self.dtype)
+        query, embedding = self.promote_dtype(
+            (query, self.embedding.value), dtype=self.dtype
+        )
         return jnp.dot(query, embedding.T)
 
 
@@ -203,7 +207,8 @@ class RotaryEmbedding(nnx.Module):
     def _compute_inv_freq(self, base: Union[int, float]) -> jax.Array:
         """Compute the inverse frequency."""
         inv_freq = 1.0 / (
-            base ** (jnp.arange(0, self.rotary_dim, 2, dtype=jnp.float32) / self.rotary_dim)
+            base
+            ** (jnp.arange(0, self.rotary_dim, 2, dtype=jnp.float32) / self.rotary_dim)
         )
         return inv_freq
 
@@ -217,7 +222,7 @@ class RotaryEmbedding(nnx.Module):
         return cache
 
 
-#@partial(jax.jit, static_argnames=["rotary_dim", "head_size", "is_neox_style"])
+# @partial(jax.jit, static_argnames=["rotary_dim", "head_size", "is_neox_style"])
 def rotary_embedding_forward(
     positions: jax.Array,
     query: jax.Array,
@@ -249,7 +254,7 @@ def rotary_embedding_forward(
     return query, key
 
 
-#@partial(jax.jit, static_argnames=["is_neox_style"])
+# @partial(jax.jit, static_argnames=["is_neox_style"])
 def _apply_rotary_emb(
     x: jax.Array,
     cos: jax.Array,

@@ -50,11 +50,14 @@ class JAXModelLoader(BaseModelLoader):
                 model_config.revision,
             )
 
-    def __init__(self, load_config: LoadConfig, rngs: jax.Array, mesh: jax.sharding.Mesh):
+    def __init__(
+        self, load_config: LoadConfig, rngs: jax.Array, mesh: jax.sharding.Mesh
+    ):
         super().__init__(load_config)
         if load_config.load_format != LoadFormat.JAX:
             raise ValueError(
-                f"JAXModelLoader only supports JAX load format, " f"got {load_config.load_format}"
+                f"JAXModelLoader only supports JAX load format, "
+                f"got {load_config.load_format}"
             )
 
         self.rng = rngs
@@ -111,7 +114,9 @@ class JAXModelLoader(BaseModelLoader):
             jit_model = create_jit_model(model)
         return jit_model
 
-    def _maybe_download_from_modelscope(self, model: str, revision: Optional[str]) -> Optional[str]:
+    def _maybe_download_from_modelscope(
+        self, model: str, revision: Optional[str]
+    ) -> Optional[str]:
         if get_bool_env_var("SGLANG_USE_MODELSCOPE"):
             # download model from ModelScope hub,
             # lazy import so that modelscope is not required for normal use.

@@ -34,6 +34,12 @@ dependencies = [
     "typing-extensions~=4.14.1",
     "uvicorn~=0.35.0",
     "uvloop~=0.21.0",
+    "psutil",
+    "httpx",
+    "openai",
+    "pandas",
+    "aiohttp",
+    "pybase64",
 ]
 
 [project.optional-dependencies]
@@ -61,11 +67,3 @@ exclude = [
     "scripts*",
     "tests*",
 ]
-
-[tool.black]
-line-length = 100
-target-version = ["py38"]
-
-[tool.isort]
-profile = "black"
-line_length = 100
