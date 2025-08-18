@@ -73,6 +73,7 @@ class ServerArgs:
 
     # Data parallel
     dp_size: int = 1
+    enable_dp_attention: bool = False
 
     # Logging
     log_level: str = "info"
@@ -614,6 +615,12 @@ class ServerArgs:
             type=int,
             default=ServerArgs.dp_size,
             help="The data parallelism size.",
+        )
+        parser.add_argument(
+            "--enable-dp-attention",
+            action="store_true",
+            default=ServerArgs.enable_dp_attention,
+            help="Enable data parallel attention.",
         )
 
         # Multi-node distributed serving

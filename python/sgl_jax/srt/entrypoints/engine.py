@@ -23,6 +23,9 @@ setattr(threading, "_register_atexit", lambda *args, **kwargs: None)
 import uvloop
 
 from sgl_jax.srt.entrypoints.EngineBase import EngineBase
+from sgl_jax.srt.managers.data_parallel_controller import (
+    run_data_parallel_controller_process,
+)
 from sgl_jax.srt.managers.detokenizer_manager import run_detokenizer_process
 from sgl_jax.srt.managers.io_struct import (
     EmbeddingReqInput,
@@ -372,6 +375,30 @@ def _set_envs_and_config():
     mp.set_start_method("spawn", force=True)
 
 
+def _launch_dp_subprocesses(server_args: ServerArgs, port_args: PortArgs):
+    """Launch DP-aware subprocesses via DataParallel controller."""
+    scheduler_procs = []
+    scheduler_pipe_readers = []
+
+    # Launch DataParallel controller on all nodes
+    # Controller will launch scheduler and handle communication
+    logger.info(f"Launching DataParallel controller on node {server_args.node_rank}")
+    controller_reader, controller_writer = mp.Pipe(duplex=False)
+    controller_proc = mp.Process(
+        target=run_data_parallel_controller_process,
+        args=(
+            server_args,
+            port_args,
+            controller_writer,
+        ),
+    )
+    controller_proc.start()
+    scheduler_procs.append(controller_proc)
+    scheduler_pipe_readers.append(controller_reader)
+
+    return scheduler_procs, scheduler_pipe_readers
+
+
 def _launch_subprocesses(
     server_args, port_args: Optional[PortArgs] = None
 ) -> Tuple[TokenizerManager, TemplateManager, Dict]:
@@ -391,8 +418,10 @@ def _launch_subprocesses(
     )
 
     scheduler_procs = []
+    scheduler_pipe_readers = []
+
     if server_args.dp_size == 1:
-        scheduler_pipe_readers = []
+        # Standard single-node deployment
         reader, writer = mp.Pipe(duplex=False)
         proc = mp.Process(
             target=run_scheduler_process,
@@ -408,7 +437,13 @@ def _launch_subprocesses(
         scheduler_procs.append(proc)
         scheduler_pipe_readers.append(reader)
     else:
-        pass
+        # Multi-node DP deployment
+        if server_args.enable_dp_attention:
+            scheduler_procs, scheduler_pipe_readers = _launch_dp_subprocesses(
+                server_args, port_args
+            )
+        else:
+            raise NotImplementedError("DP without DP attention is not implemented yet")
 
     if server_args.node_rank >= 1:
         # In multi-node cases, non-zero rank nodes do not need to run tokenizer or detokenizer,
