@@ -93,15 +93,31 @@ class WeightLoader:
     ):
         params = nnx.state(self.model)
 
+        regular_mappings = {}
+        moe_mappings = {}
+
+        for key, mapping in weight_mappings.items():
+            if key.startswith("__MOE_EXPERTS__"):
+                moe_mappings[key] = mapping
+            else:
+                regular_mappings[key] = mapping
+
+        expert_weights = {}
+
         for hf_key, hf_weight in self._iterate_weights():
-            if hf_key in weight_mappings:
-                mapping = weight_mappings[hf_key]
+            if hf_key in regular_mappings:
+                mapping = regular_mappings[hf_key]
                 if isinstance(mapping, (str, list)):
                     mapping = WeightMapping(target_path=mapping)
 
                 self._process_and_assign_weight(params, hf_key, hf_weight, mapping)
+            elif "mlp.experts." in hf_key and hf_key.endswith(".weight"):
+                expert_weights[hf_key] = hf_weight.astype(self.dtype)
             else:
                 logger.warning(f"No mapping found for weight: {hf_key}")
+
+        if moe_mappings:
+            self._process_moe_expert_weights(params, moe_mappings, expert_weights)
 
         nnx.update(self.model, params)
 
@@ -424,3 +440,45 @@ class WeightLoader:
                         weight, pad_size, axis=1 if weight.ndim > 1 else 0
                     )
         return weight
+
+    def _process_moe_expert_weights(
+        self,
+        params: nnx.State,
+        moe_mappings: Dict[str, WeightMapping],
+        expert_weights: Dict[str, jax.Array],
+    ):
+        logger.info("Stacking expert weights...")
+
+        for moe_key, mapping in moe_mappings.items():
+            if (
+                not isinstance(mapping.target_path, list)
+                or len(mapping.target_path) < 2
+            ):
+                logger.warning(f"Invalid MoE mapping for {moe_key}")
+                continue
+
+            target_path = mapping.target_path[0]
+            expert_keys = mapping.target_path[1:]
+
+            collected_weights = []
+            for expert_key in expert_keys:
+                if expert_key in expert_weights:
+                    weight = expert_weights[expert_key]
+                    if mapping.transpose and not expert_key.endswith(".bias"):
+                        weight = jnp.transpose(weight, (1, 0))
+                    collected_weights.append(weight)
+                else:
+                    logger.warning(f"Missing expert weight: {expert_key}")
+
+            if len(collected_weights) == len(expert_keys):
+                stacked_weight = jnp.stack(collected_weights, axis=0)
+
+                device_experts = stacked_weight
+
+                sharded_weight = self._shard_weight(device_experts, mapping.sharding)
+                model_param = self._get_param(params, target_path)
+                model_param.value = sharded_weight
+            else:
+                logger.error(f"Could not collect all expert weights for {target_path}")
+
+        logger.info("MoE expert weights processing completed.")
