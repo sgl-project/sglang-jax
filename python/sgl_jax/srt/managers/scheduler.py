@@ -46,6 +46,7 @@ from sgl_jax.srt.managers.scheduler_profiler_mixing import SchedulerProfilerMixi
 from sgl_jax.srt.managers.tp_worker import ModelWorker
 from sgl_jax.srt.managers.utils import validate_input_length
 from sgl_jax.srt.mem_cache.radix_cache import RadixCache
+from sgl_jax.srt.mem_cache.chunk_cache import ChunkCache
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
 from sgl_jax.srt.server_args import PortArgs, ServerArgs
 from sgl_jax.srt.utils.common_utils import (
@@ -127,7 +128,11 @@ class Scheduler(
         self.stream_interval = server_args.stream_interval
         self.max_seq_len = server_args.max_seq_len
         self.page_size = server_args.page_size
-
+        self.chunked_prefill_size = server_args.chunked_prefill_size
+        self.chunked_req = None
+        self.is_mixed_chunk = (
+            self.chunked_prefill_size is not None and server_args.enable_mixed_chunked_prefill
+        )
         # Init inter-process communication
         context = zmq.Context(2)
 
@@ -359,16 +364,26 @@ class Scheduler(
             self.tp_worker.get_memory_pool()
         )
 
-        self.tree_cache = RadixCache(
-            req_to_token_pool=self.req_to_token_pool,
-            token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
-            page_size=self.page_size,
-            disable=server_args.disable_radix_cache,
-            kv_head_num=self.model_config.get_num_kv_heads(self.tp_size),
-            head_dim=self.model_config.head_dim,
-            layer_num=self.model_config.num_hidden_layers,
-            max_seq_len=server_args.max_seq_len,
-        )
+        # Choose cache type based on configuration
+        if server_args.disable_radix_cache:
+            # Use ChunkCache when RadixCache is disabled
+            self.tree_cache = ChunkCache(
+                req_to_token_pool=self.req_to_token_pool,
+                token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                page_size=self.page_size,
+            )
+        else:
+            # Use RadixCache when enabled
+            self.tree_cache = RadixCache(
+                req_to_token_pool=self.req_to_token_pool,
+                token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                page_size=self.page_size,
+                disable=server_args.disable_radix_cache,
+                kv_head_num=self.model_config.get_num_kv_heads(self.tp_size),
+                head_dim=self.model_config.head_dim,
+                layer_num=self.model_config.num_hidden_layers,
+                max_seq_len=server_args.max_seq_len,
+            )
 
         self.decode_mem_cache_buf_multiplier = 1
 
@@ -569,11 +584,18 @@ class Scheduler(
         return num_used, token_usage, available_size, evictable_size
 
     def get_next_batch_to_run(self) -> Optional[ScheduleBatch]:
+        # Handle chunked prefill exclusions
+        chunked_req_to_exclude = []
+        if self.chunked_req:
+            chunked_req_to_exclude.append(self.chunked_req)
+            self.tree_cache.cache_unfinished_req(self.chunked_req)
+            self.req_to_token_pool.free(self.chunked_req.req_pool_idx)
+        
         # Merge the prefill batch into the running batch
         if self.last_batch and self.last_batch.forward_mode.is_extend():
-            # Filter batch
+            # Filter batch to exclude chunked requests
             last_bs = self.last_batch.batch_size
-            self.last_batch.filter_batch()
+            self.last_batch.filter_batch(chunked_req_to_exclude=chunked_req_to_exclude)
             if self.last_batch.batch_size < last_bs:
                 self.running_batch.batch_is_full = False
 
@@ -587,7 +609,6 @@ class Scheduler(
 
         new_batch = self.get_new_batch_prefill()
 
-        # if new_batch is not None:
         if new_batch:
             # Run prefill first if possible
             ret = new_batch
@@ -621,7 +642,13 @@ class Scheduler(
             self.running_batch,
             self.new_token_ratio,
             self.max_prefill_tokens,
+            self.chunked_prefill_size,  # 传入chunk size
+            running_bs if self.is_mixed_chunk else 0,  # mixed mode token count
         )
+
+        if self.chunked_req is not None:
+            self.chunked_req.init_next_round_input(self.tree_cache)
+            self.chunked_req = adder.add_chunked_req(self.chunked_req)
 
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
@@ -634,12 +661,19 @@ class Scheduler(
                 break
 
             req.init_next_round_input(self.tree_cache)
-            res = adder.add_one_req(req)
+            res = adder.add_one_req(req, has_chunked_req=(self.chunked_req is not None))
 
             if res != AddReqResult.CONTINUE:
                 if res == AddReqResult.NO_TOKEN:
                     self.running_batch.batch_is_full = True
                 break
+
+        if adder.new_chunked_req is not None:
+            assert self.chunked_req is None
+            self.chunked_req = adder.new_chunked_req
+
+        if self.chunked_req:
+            self.chunked_req.is_chunked += 1
 
         # Update waiting queue
         can_run_list: List[Req] = adder.can_run_list
@@ -661,11 +695,23 @@ class Scheduler(
             self.model_config,
             False,
             self.mesh,
+            chunked_req=self.chunked_req,
         )
 
         new_batch.prepare_for_extend()
 
         new_batch.decoding_reqs = None
+
+        if (
+            self.is_mixed_chunk
+            and not self.running_batch.is_empty()
+            and not new_batch.return_logprob
+            and not self.running_batch.return_logprob
+        ):
+            # 合并到运行批次中
+            self.running_batch.filter_batch()
+            self.running_batch.merge_batch(new_batch)
+            return self.running_batch
 
         return new_batch
 

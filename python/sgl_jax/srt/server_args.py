@@ -52,6 +52,8 @@ class ServerArgs:
     mem_fraction_static: Optional[float] = None
     max_running_requests: Optional[int] = None
     max_total_tokens: Optional[int] = None
+    chunked_prefill_size: Optional[int] = None
+    enable_mixed_chunked_prefill: bool = False
     max_prefill_tokens: int = 16384
     schedule_policy: str = "fcfs"
     schedule_conservativeness: float = 1.0
@@ -164,7 +166,12 @@ class ServerArgs:
 
         if is_remote_url(self.model_path):
             self.load_format = "remote"
-
+        
+        if self.chunked_prefill_size is None:
+            self.chunked_prefill_size = 8192 # TODO: simple default to 8k, maybe need to calculate based on the tpu memory
+        if self.chunked_prefill_size < 0:
+            self.chunked_prefill_size = None
+            
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
         # Model and tokenizer
@@ -379,6 +386,17 @@ class ServerArgs:
             type=int,
             default=ServerArgs.max_prefill_tokens,
             help="The maximum number of tokens in a prefill batch. The real bound will be the maximum of this value and the model's maximum context length.",
+        )
+        parser.add_argument(
+            "--chunked-prefill-size",
+            type=int,
+            default=ServerArgs.chunked_prefill_size,
+            help="The maximum number of tokens in a chunked prefill batch. The real bound will be the maximum of this value and the model's maximum context length.",
+        )
+        parser.add_argument(
+            "--enable-mixed-chunked-prefill",
+            action="store_true",
+            help="Enable mixed chunked prefill mode.",
         )
         parser.add_argument(
             "--schedule-policy",

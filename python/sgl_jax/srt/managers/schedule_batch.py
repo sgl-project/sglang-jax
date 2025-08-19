@@ -190,6 +190,9 @@ class Req:
         # For retraction
         self.is_retracted = False
 
+        # For chunked prefill
+        self.is_chunked = 0
+
         # Incremental streamining
         self.send_token_offset: int = 0
         self.send_decode_id_offset: int = 0
@@ -427,6 +430,8 @@ class ScheduleBatch:
     # This is an optimization to reduce the overhead of the prefill check.
     batch_is_full: bool = False
 
+    chunked_req: Optional[Req] = None
+
     # Sampling info
     sampling_info: SamplingBatchInfo = None
     next_batch_sampling_info: SamplingBatchInfo = None
@@ -477,6 +482,7 @@ class ScheduleBatch:
         model_config: ModelConfig,
         enable_custom_logit_processor: bool = False,
         mesh: mesh_lib.Mesh = None,
+        chunked_req: Optional[Req] = None,
     ):
         return_logprob = any(req.return_logprob for req in reqs)
 
@@ -489,6 +495,7 @@ class ScheduleBatch:
             return_logprob=return_logprob,
             has_stream=any(req.stream for req in reqs),
             mesh=mesh,
+            chunked_req=chunked_req,
         )
 
     @property
@@ -789,11 +796,16 @@ class ScheduleBatch:
 
     def filter_batch(
         self,
+        chunked_req_to_exclude: Optional[List[Req]] = None,
         keep_indices: Optional[List[int]] = None,
     ):
+        if chunked_req_to_exclude is None:
+            chunked_req_to_exclude = []
+
         if keep_indices is None:
             keep_indices = [
-                i for i in range(len(self.reqs)) if not self.reqs[i].finished()
+                i for i in range(len(self.reqs)) 
+                if not self.reqs[i].finished() and self.reqs[i] not in chunked_req_to_exclude
             ]
 
         if keep_indices is None or len(keep_indices) == 0:
@@ -1072,9 +1084,8 @@ class ScheduleBatch:
             out_cache_loc=self.out_cache_loc,
             return_logprob=self.return_logprob,
             decoding_reqs=self.decoding_reqs,
-            global_num_tokens=self.global_num_tokens,
-            global_num_tokens_for_logprob=self.global_num_tokens_for_logprob,
-            is_extend_in_batch=self.is_extend_in_batch,
+            chunked_req=self.chunked_req,
+            mesh=self.mesh,
         )
 
     def _evict_tree_cache_if_needed(

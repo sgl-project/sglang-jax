@@ -81,6 +81,8 @@ class ModelWorker:
         self.device = server_args.device
 
         # Profile number of tokens
+        self.chunked_prefill_size = server_args.chunked_prefill_size
+        
         self.max_total_num_tokens = self.model_runner.max_total_num_tokens
         self.max_prefill_tokens = server_args.max_prefill_tokens
         self.max_running_requests = min(
