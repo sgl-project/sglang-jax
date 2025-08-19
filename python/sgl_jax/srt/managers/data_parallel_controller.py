@@ -50,7 +50,7 @@ class DataParallelController:
 
         # Launch local scheduler first
         self.scheduler_proc = None
-        attn_tp_size, dp_rank = compute_dp_attention_world_info(
+        attn_tp_size, attn_dp_rank, dp_rank = compute_dp_attention_world_info(
             self.server_args.enable_dp_attention,
             self.server_args.node_rank,
             self.server_args.tp_size,

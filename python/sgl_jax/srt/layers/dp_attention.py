@@ -14,8 +14,9 @@ def compute_dp_attention_world_info(
     attn_tp_size = tp_size // dp_size
     if not enable_dp_attention:
         return attn_tp_size, 0
-    attn_dp_rank = (node_rank * node_tp_size) // attn_tp_size
-    return attn_tp_size, attn_dp_rank
+    dp_rank = (node_rank * node_tp_size) // attn_tp_size
+    attn_dp_rank = node_rank - dp_rank * (attn_tp_size // node_tp_size)
+    return attn_tp_size, attn_dp_rank, dp_rank
 
 
 def should_run_publisher(server_args) -> bool:
@@ -40,12 +41,12 @@ def should_run_publisher(server_args) -> bool:
     tp_size = server_args.tp_size  # Total number of schedulers
     tp_rank = server_args.node_rank  # This scheduler's global rank
 
-    attn_tp_rank, attn_tp_size, attn_dp_rank = compute_dp_attention_world_info(
+    attn_tp_size, attn_dp_rank, dp_rank = compute_dp_attention_world_info(
         server_args.enable_dp_attention,
         tp_rank,  # This scheduler's global rank
         tp_size,  # Total number of schedulers
         server_args.dp_size,  # Number of DP groups
     )
 
-    # Only the scheduler with attn_tp_rank == 0 in each DP group runs publisher
-    return attn_tp_rank == 0
+    # Only the scheduler with attn_dp_rank == 0 in each DP group runs publisher
+    return attn_dp_rank == 0

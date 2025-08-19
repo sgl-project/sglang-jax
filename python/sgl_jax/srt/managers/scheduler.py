@@ -499,7 +499,7 @@ class Scheduler(
         # Import here to avoid circular dependency
         from sgl_jax.srt.layers.dp_attention import compute_dp_attention_world_info
 
-        attn_tp_size, attn_dp_rank = compute_dp_attention_world_info(
+        attn_tp_size, attn_dp_rank, dp_rank = compute_dp_attention_world_info(
             self.server_args.enable_dp_attention,
             self.node_rank,  # tp_rank = scheduler's global rank
             self.server_args.tp_size,  # total schedulers
@@ -507,10 +507,10 @@ class Scheduler(
         )
 
         return {
-            "dp_group_id": attn_dp_rank,  # Which DP group this scheduler belongs to
-            "rank_in_group": attn_tp_rank,  # Rank within the DP group
+            "dp_group_id": dp_rank,  # Which DP group this scheduler belongs to
+            "rank_in_group": attn_dp_rank,  # Rank within the DP group
             "group_size": attn_tp_size,  # Number of schedulers in this DP group
-            "is_publisher": (attn_tp_rank == 0),  # Is this the publisher for the group
+            "is_publisher": (attn_dp_rank == 0),  # Is this the publisher for the group
         }
 
     def _should_run_publisher_zmq(self) -> bool:
