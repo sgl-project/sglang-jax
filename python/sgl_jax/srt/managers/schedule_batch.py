@@ -854,13 +854,16 @@ class ScheduleBatch:
         self.seq_lens = jnp.concat([self.seq_lens, other.seq_lens])
         self.out_cache_loc = None
         self.seq_lens_sum += other.seq_lens_sum
-        if self.output_ids is not None:
+        if self.output_ids is not None and other.output_ids is not None:
             self.output_ids = jnp.concat(
                 [
                     self.output_ids[: len(self.seq_lens)],
                     other.output_ids[: len(other.seq_lens)],
                 ]
             )
+        elif other.output_ids is not None:
+            # If self.output_ids is None but other.output_ids is not, use other's
+            self.output_ids = other.output_ids[: len(other.seq_lens)]
         if self.return_logprob and other.return_logprob:
             self.top_logprobs_nums.extend(other.top_logprobs_nums)
             self.token_ids_logprobs.extend(other.token_ids_logprobs)
