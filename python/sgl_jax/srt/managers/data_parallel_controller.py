@@ -231,7 +231,9 @@ def run_data_parallel_controller_process(
             }
         )
         if server_args.node_rank == 0:
+            logger.debug(f"Node {server_args.node_rank} running event loop")
             controller.event_loop()
+        logger.debug(f"Node {server_args.node_rank} scheduler joined")
         for proc in controller.scheduler_procs:
             proc.join()
             logger.error(
