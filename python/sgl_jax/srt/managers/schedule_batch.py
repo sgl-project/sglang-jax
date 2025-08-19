@@ -948,7 +948,7 @@ class ScheduleBatch:
         else:
             extend_seq_lens = np.array(self.extend_lens, dtype=np.int32)
             extend_prefix_lens = np.array(self.prefix_lens, dtype=np.int32)
-            bs_paddings = [1, max_running_requests]
+            bs_paddings = [max_running_requests]
 
         global bid
         bid += 1

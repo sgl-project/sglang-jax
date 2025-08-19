@@ -149,7 +149,7 @@ class ModelWorker:
         start_time = time.perf_counter()
         logger.info(f"[EXTEND] begin to precompile")
         for pair in itertools.product(
-            [1, self.max_running_requests], self.precompile_prefill_token_paddings
+            [self.max_running_requests], self.precompile_prefill_token_paddings
         ):
             pair = list(pair)
             bs, num_tokens = pair[0], pair[1]
