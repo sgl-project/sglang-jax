@@ -48,7 +48,6 @@ class DataParallelController:
 
         # Launch local scheduler first
         self.scheduler_proc = None
-        self.scheduler_pipe_reader = None
         self._launch_local_scheduler()
 
         # Only node 0 sets up communication to all DP ranks
@@ -58,9 +57,17 @@ class DataParallelController:
         # Round-robin counter for request dispatching
         self.round_robin_counter = 0
 
-    def _launch_local_scheduler(self):
+    def _launch_local_scheduler(
+        self,
+        server_args: ServerArgs,
+        port_args: PortArgs,
+        dp_rank: int,
+        ready_event: threading.Event,
+    ):
         """Launch scheduler on current node."""
-        logger.info(f"Launching scheduler for DP rank {self.server_args.node_rank}")
+        logger.info(
+            f"Launching scheduler for Node rank {self.server_args.node_rank} DP rank {dp_rank}"
+        )
         reader, writer = mp.Pipe(duplex=False)
 
         # Import scheduler function when needed
@@ -77,7 +84,9 @@ class DataParallelController:
         )
         proc.start()
         self.scheduler_proc = proc
-        self.scheduler_pipe_reader = reader
+        scheduler_info = reader.recv()
+        ready_event.set()
+        return scheduler_info
 
     def _setup_dp_communication(self):
         """Set up ZMQ communication to all DP rank schedulers (only on node 0)."""
@@ -164,11 +173,6 @@ class DataParallelController:
             self.round_robin_counter = (self.round_robin_counter + 1) % len(
                 self.workers
             )
-
-    def get_scheduler_info(self):
-        """Get scheduler info from local scheduler."""
-        data = self.scheduler_pipe_reader.recv()
-        return data
 
     def event_loop(self):
         """Main event loop for processing requests (only on node 0)."""
