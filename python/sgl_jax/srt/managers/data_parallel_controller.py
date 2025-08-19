@@ -7,6 +7,7 @@ import signal
 import threading
 import time
 
+import psutil
 import zmq
 
 try:
