@@ -160,61 +160,30 @@ def run_data_parallel_controller_process(
     port_args: PortArgs,
     pipe_writer,
 ):
-    """Run the data parallel controller process."""
-    if setproctitle is not None:
-        setproctitle.setproctitle("sgl-jax::data_parallel_controller")
-
-    # Kill itself when the parent process is dead
-    def kill_itself_when_parent_died():
-        parent_process_id = os.getppid()
-
-        def monitor_parent():
-            while True:
-                try:
-                    if os.getppid() != parent_process_id:
-                        logger.warning("Parent process died. Killing controller.")
-                        os.kill(os.getpid(), signal.SIGTERM)
-                        break
-                except:
-                    os.kill(os.getpid(), signal.SIGTERM)
-                    break
-                time.sleep(1)
-
-        monitor_thread = threading.Thread(target=monitor_parent, daemon=True)
-        monitor_thread.start()
-
-    kill_itself_when_parent_died()
+    setproctitle.setproctitle("sgl-jax::data_parallel_controller")
+    configure_logger(server_args)
+    parent_process = psutil.Process.parent()
 
     try:
         controller = DataParallelController(server_args, port_args)
-
-        # Wait for local scheduler to be ready
-        scheduler_info = controller.get_scheduler_info()
-
-        # Send ready signal with scheduler info
         pipe_writer.send(
             {
                 "status": "ready",
-                "controller_rank": server_args.node_rank,
-                **scheduler_info,
+                "max_total_num_tokens": controller.max_total_num_tokens,
+                "max_req_input_len": controller.max_req_input_len,
             }
         )
-
-        # Start event loop (only for node 0)
         if server_args.node_rank == 0:
             controller.event_loop()
-
-        # If not node 0, wait for scheduler process
         for proc in controller.scheduler_procs:
             proc.join()
             logger.error(
                 f"Scheduler or DataParallelController {proc.pid} terminated with {proc.exitcode}"
             )
-
     except Exception:
         traceback = get_exception_traceback()
         logger.error(f"DataParallelController hit an exception: {traceback}")
-        pipe_writer.send({"status": "error", "error": traceback})
-        # Send signal to parent to kill the whole process tree
-        parent_process = os.getppid()
-        os.kill(parent_process, signal.SIGQUIT)
+        parent_process.send_signal(signal.SIGQUIT)
+    finally:
+        # we need to destruct mp.Manager() in balance_meta
+        balance_meta.destructor()

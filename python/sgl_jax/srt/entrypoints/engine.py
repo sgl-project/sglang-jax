@@ -375,28 +375,28 @@ def _set_envs_and_config():
     mp.set_start_method("spawn", force=True)
 
 
-def _launch_dp_subprocesses(server_args: ServerArgs, port_args: PortArgs):
-    """Launch DP-aware subprocesses via DataParallel controller."""
-    scheduler_procs = []
-    scheduler_pipe_readers = []
+# def run_data_parallel_controller_process(server_args: ServerArgs, port_args: PortArgs):
+#     """Launch DP-aware subprocesses via DataParallel controller."""
+#     scheduler_procs = []
+#     scheduler_pipe_readers = []
 
-    # Launch DataParallel controller on all nodes
-    # Controller will launch scheduler and handle communication
-    logger.info(f"Launching DataParallel controller on node {server_args.node_rank}")
-    controller_reader, controller_writer = mp.Pipe(duplex=False)
-    controller_proc = mp.Process(
-        target=run_data_parallel_controller_process,
-        args=(
-            server_args,
-            port_args,
-            controller_writer,
-        ),
-    )
-    controller_proc.start()
-    scheduler_procs.append(controller_proc)
-    scheduler_pipe_readers.append(controller_reader)
+#     # Launch DataParallel controller on all nodes
+#     # Controller will launch scheduler and handle communication
+#     logger.info(f"Launching DataParallel controller on node {server_args.node_rank}")
+#     controller_reader, controller_writer = mp.Pipe(duplex=False)
+#     controller_proc = mp.Process(
+#         target=run_data_parallel_controller_process,
+#         args=(
+#             server_args,
+#             port_args,
+#             controller_writer,
+#         ),
+#     )
+#     controller_proc.start()
+#     scheduler_procs.append(controller_proc)
+#     scheduler_pipe_readers.append(controller_reader)
 
-    return scheduler_procs, scheduler_pipe_readers
+#     return scheduler_procs, scheduler_pipe_readers
 
 
 def _launch_subprocesses(
@@ -438,12 +438,18 @@ def _launch_subprocesses(
         scheduler_pipe_readers.append(reader)
     else:
         # Multi-node DP deployment
-        if server_args.enable_dp_attention:
-            scheduler_procs, scheduler_pipe_readers = _launch_dp_subprocesses(
-                server_args, port_args
-            )
-        else:
-            raise NotImplementedError("DP without DP attention is not implemented yet")
+        reader, writer = mp.Pipe(duplex=False)
+        proc = mp.Process(
+            target=run_data_parallel_controller_process,
+            args=(
+                server_args,
+                port_args,
+                writer,
+            ),
+        )
+        proc.start()
+        scheduler_procs.append(proc)
+        scheduler_pipe_readers.append(reader)
 
     if server_args.node_rank >= 1:
         # In multi-node cases, non-zero rank nodes do not need to run tokenizer or detokenizer,
