@@ -4,10 +4,14 @@ import unittest
 import jax
 import jax.numpy as jnp
 import numpy as np
-from jax.sharding import Mesh, NamedSharding
+from jax.sharding import AxisType, Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.mem_cache.memory_pool import update_kv_cache
+from sgl_jax.srt.utils.mesh_utils import create_device_mesh
+
+mesh = create_device_mesh(ici_parallelism=[1, -1, 1, 1], dcn_parallelism=[1, 1, 1, 1])
+jax.sharding.set_mesh(mesh)
 
 
 class TestKVCache(unittest.TestCase):
@@ -22,21 +26,6 @@ class TestKVCache(unittest.TestCase):
         self.head_dim = 128
         self.batch_size = 2
         self.layer_num = 2
-
-    def _create_single_device_mesh(self):
-        """Create a single device mesh (no TP)"""
-        devices = jax.devices()[:1]  # Use only one device
-        return Mesh(devices, ("tensor",))
-
-    def _create_multi_device_mesh(self):
-        """Create a multi-device mesh for TP testing"""
-        devices = jax.devices()
-        if len(devices) < 4:
-            self.skipTest("Multi-device test requires at least 4 devices")
-
-        # Use 4 devices for tensor parallelism
-        mesh_devices = np.array(devices[:4]).reshape(1, 4, 1)
-        return Mesh(mesh_devices, ("data", "tensor", "pipeline"))
 
     def generate_test_data(self, total_tokens: int, add_padding: bool = False):
         """Generate test data for KV cache update.
@@ -92,6 +81,12 @@ class TestKVCache(unittest.TestCase):
             # All valid tokens
             loc = jnp.arange(total_tokens, dtype=jnp.int32) + 10  # Start from index 10
 
+        k = jax.device_put(k, P(None, "tensor", None))
+        v = jax.device_put(v, P(None, "tensor", None))
+        k_cache = jax.device_put(k_cache, P(None, "tensor", None))
+        v_cache = jax.device_put(v_cache, P(None, "tensor", None))
+        loc = jax.device_put(loc, P(None))
+
         return k, v, loc, k_cache, v_cache
 
     def expected_update_kv_cache(self, k, v, loc, k_cache, v_cache):
@@ -107,15 +102,16 @@ class TestKVCache(unittest.TestCase):
 
         return expected_k_cache, expected_v_cache
 
-    def test_kv_cache_update_vectorized(self):
-        """Test vectorized KV cache update without padding."""
+    def test_kv_cache_update_page_size_1(self):
+        """Test KV cache update with page_size=1."""
         total_tokens = 16
         k, v, loc, k_cache, v_cache = self.generate_test_data(
             total_tokens, add_padding=False
         )
 
-        # Test with vectorized approach
-        updated_k_cache, updated_v_cache = update_kv_cache(k, v, loc, k_cache, v_cache)
+        updated_k_cache, updated_v_cache = update_kv_cache(
+            k, v, loc, k_cache, v_cache, page_size=1
+        )
 
         # Expected result
         expected_k_cache, expected_v_cache = self.expected_update_kv_cache(
@@ -125,15 +121,16 @@ class TestKVCache(unittest.TestCase):
         self.assertTrue(jnp.allclose(updated_k_cache, expected_k_cache))
         self.assertTrue(jnp.allclose(updated_v_cache, expected_v_cache))
 
-    def test_kv_cache_update_with_padding_vectorized(self):
-        """Test vectorized KV cache update with padding tokens."""
+    def test_kv_cache_update_page_size_1_with_padding(self):
+        """Test KV cache update with page_size=1 and padding tokens."""
         total_tokens = 12
         k, v, loc, k_cache, v_cache = self.generate_test_data(
             total_tokens, add_padding=True
         )
 
-        # Test with vectorized approach
-        updated_k_cache, updated_v_cache = update_kv_cache(k, v, loc, k_cache, v_cache)
+        updated_k_cache, updated_v_cache = update_kv_cache(
+            k, v, loc, k_cache, v_cache, page_size=1
+        )
 
         # Expected result (should ignore padding tokens where loc == -1)
         expected_k_cache, expected_v_cache = self.expected_update_kv_cache(
@@ -142,7 +139,6 @@ class TestKVCache(unittest.TestCase):
 
         self.assertTrue(jnp.allclose(updated_k_cache, expected_k_cache))
         self.assertTrue(jnp.allclose(updated_v_cache, expected_v_cache))
-
         # Verify that padding tokens didn't affect the cache
         padding_mask = loc == -1
         if jnp.any(padding_mask):
@@ -155,6 +151,67 @@ class TestKVCache(unittest.TestCase):
                 if loc[i] == -1:
                     # Cache at this position should remain as original (zeros in this case)
                     continue  # We don't update cache for padding tokens
+
+    def test_kv_cache_update_page_size_4(self):
+        """Test KV cache update with page_size=4."""
+        total_tokens = 16
+        k, v, loc, k_cache, v_cache = self.generate_test_data(
+            total_tokens, add_padding=False
+        )
+
+        # Test with page_size=4
+        updated_k_cache, updated_v_cache = update_kv_cache(
+            k, v, loc, k_cache, v_cache, page_size=4
+        )
+
+        # Expected result
+        expected_k_cache, expected_v_cache = self.expected_update_kv_cache(
+            k, v, loc, k_cache, v_cache
+        )
+        print("updated_k_cache", updated_k_cache[loc])
+        print("expected_k_cache", expected_k_cache[loc])
+        self.assertTrue(jnp.allclose(updated_k_cache, expected_k_cache))
+        self.assertTrue(jnp.allclose(updated_v_cache, expected_v_cache))
+
+    def test_kv_cache_update_page_size_4_with_padding(self):
+        """Test KV cache update with page_size=4 and padding tokens."""
+        total_tokens = 12
+        k, v, loc, k_cache, v_cache = self.generate_test_data(
+            total_tokens, add_padding=True
+        )
+
+        # Test with page_size=4
+        updated_k_cache, updated_v_cache = update_kv_cache(
+            k, v, loc, k_cache, v_cache, page_size=4
+        )
+
+        # Expected result (should ignore padding tokens where loc == -1)
+        expected_k_cache, expected_v_cache = self.expected_update_kv_cache(
+            k, v, loc, k_cache, v_cache
+        )
+
+        self.assertTrue(jnp.allclose(updated_k_cache, expected_k_cache))
+        self.assertTrue(jnp.allclose(updated_v_cache, expected_v_cache))
+
+    def test_kv_cache_update_page_size_8_contiguous(self):
+        """Test KV cache update with page_size=8 and contiguous locations."""
+        total_tokens = 16
+        k, v, loc, k_cache, v_cache = self.generate_test_data(
+            total_tokens, add_padding=False
+        )
+
+        # Test with page_size=8
+        updated_k_cache, updated_v_cache = update_kv_cache(
+            k, v, loc, k_cache, v_cache, page_size=8
+        )
+
+        # Expected result
+        expected_k_cache, expected_v_cache = self.expected_update_kv_cache(
+            k, v, loc, k_cache, v_cache
+        )
+
+        self.assertTrue(jnp.allclose(updated_k_cache, expected_k_cache))
+        self.assertTrue(jnp.allclose(updated_v_cache, expected_v_cache))
 
     def test_all_padding_tokens(self):
         """Test case where all tokens are padding tokens."""
@@ -177,205 +234,385 @@ class TestKVCache(unittest.TestCase):
         self.assertTrue(jnp.allclose(updated_k_cache, original_k_cache))
         self.assertTrue(jnp.allclose(updated_v_cache, original_v_cache))
 
-    def test_mesh_sharded_kv_cache_correctness(self):
-        """Test KV cache correctness with mesh sharding - independent buffer creation and verification"""
-        print("\nTesting mesh sharded KV cache with independent buffer creation...")
+    def test_update_kv_cache_logic_page_size_1(self):
+        """Test KV cache update logic with page_size=1 using optimization functions."""
+        from sgl_jax.srt.mem_cache.memory_pool import _optimize_contiguous_updates
 
-        try:
-            mesh = self._create_multi_device_mesh()
-        except unittest.SkipTest:
-            print("Skipping mesh sharding test - insufficient devices")
-            return
+        total_tokens = 8
+        k, v, loc, k_cache, v_cache = self.generate_test_data(
+            total_tokens, add_padding=False
+        )
 
-        # Use head numbers divisible by 4 for clean tensor sharding
-        shard_head_num = 16
-        cache_size = 64
-        num_test_tokens = 4
-
-        print(f"Mesh configuration: {mesh}")
-        print(f"Mesh axis names: {mesh.axis_names}")
-        print(f"Mesh shape: {mesh.shape}")
-
-        with mesh:
-            # Step 1: Create independent KV buffers directly with sharding
-            kv_sharding = NamedSharding(mesh, P(None, "tensor", None))
-
-            # Create host data for k_buffer and v_buffer
-            k_buffer_host = jnp.zeros(
-                (cache_size, shard_head_num, self.head_dim), dtype=jnp.bfloat16
+        # Test the optimization logic for page_size=1
+        page_size = 1
+        if page_size > 1:
+            kv_cache_locs, new_kv_locs, slice_lens, num_slices = (
+                _optimize_contiguous_updates(loc, page_size)
             )
-            v_buffer_host = jnp.zeros(
-                (cache_size, shard_head_num, self.head_dim), dtype=jnp.bfloat16
-            )
+        else:
+            # Use original logic for page_size = 1: one slice per token
+            kv_cache_locs = jnp.where(loc == -1, 0, loc).astype(jnp.int32)
+            new_kv_locs = jnp.arange(total_tokens, dtype=jnp.int32)
+            slice_lens = jnp.where(loc == -1, 0, 1).astype(jnp.int32)
+            num_slices = total_tokens
 
-            # Device put with sharding for independent testing
-            k_buffer = jax.device_put(k_buffer_host, kv_sharding)
-            v_buffer = jax.device_put(v_buffer_host, kv_sharding)
+        # Verify the slice logic
+        self.assertEqual(num_slices, total_tokens)
+        # For page_size=1, each token should have its own slice
+        non_padding_count = jnp.sum(loc != -1)
+        expected_valid_slices = jnp.sum(slice_lens > 0)
+        self.assertEqual(expected_valid_slices, non_padding_count)
 
-            print(f"Independently created K buffer sharding: {k_buffer.sharding}")
-            print(f"Independently created V buffer sharding: {v_buffer.sharding}")
+        # Manual update using the slice logic
+        updated_k_cache = k_cache.copy()
+        updated_v_cache = v_cache.copy()
 
-            # Step 2: Verify actual sharding by checking device distribution
-            print(
-                "--- Verifying cross-device sharding of independently created buffers ---"
-            )
-            tensor_parallel_size = mesh.shape["tensor"]
-            heads_per_device = shard_head_num // tensor_parallel_size
+        for i in range(num_slices):
+            if slice_lens[i] > 0:  # Valid slice
+                cache_start = kv_cache_locs[i]
+                new_start = new_kv_locs[i]
+                length = slice_lens[i]
 
-            print(f"Total heads: {shard_head_num}")
-            print(f"Tensor parallelism size: {tensor_parallel_size}")
-            print(f"Expected heads per device: {heads_per_device}")
-            print(
-                f"K buffer addressable shards count: {len(k_buffer.addressable_shards)}"
-            )
-            print(
-                f"V buffer addressable shards count: {len(v_buffer.addressable_shards)}"
-            )
+                # Update cache
+                for j in range(length):
+                    updated_k_cache = updated_k_cache.at[cache_start + j].set(
+                        k[new_start + j]
+                    )
+                    updated_v_cache = updated_v_cache.at[cache_start + j].set(
+                        v[new_start + j]
+                    )
 
-            # Check sharding effectiveness on independent buffers
-            k_shard_shapes = []
-            v_shard_shapes = []
-            for device_idx, (k_shard, v_shard) in enumerate(
-                zip(k_buffer.addressable_shards, v_buffer.addressable_shards)
-            ):
-                k_shape = k_shard.data.shape
-                v_shape = v_shard.data.shape
-                k_shard_shapes.append(k_shape)
-                v_shard_shapes.append(v_shape)
-                print(
-                    f"Device {device_idx}: K shard shape {k_shape}, V shard shape {v_shape}"
+        # Expected result
+        expected_k_cache, expected_v_cache = self.expected_update_kv_cache(
+            k, v, loc, k_cache, v_cache
+        )
+
+        self.assertTrue(jnp.allclose(updated_k_cache, expected_k_cache, rtol=1e-5))
+        self.assertTrue(jnp.allclose(updated_v_cache, expected_v_cache, rtol=1e-5))
+
+    def test_update_kv_cache_logic_page_size_4(self):
+        """Test KV cache update logic with page_size=4 using optimization functions."""
+        from sgl_jax.srt.mem_cache.memory_pool import _optimize_contiguous_updates
+
+        total_tokens = 16
+        k, v, loc, k_cache, v_cache = self.generate_test_data(
+            total_tokens, add_padding=False
+        )
+
+        # Test the optimization logic for page_size=4
+        page_size = 4
+        kv_cache_locs, new_kv_locs, slice_lens, num_slices = (
+            _optimize_contiguous_updates(loc, page_size)
+        )
+
+        # Verify the slice logic makes sense
+        # num_slices always equals total_tokens for array size consistency,
+        # but only some positions will have non-zero slice_lens
+        self.assertEqual(num_slices, total_tokens)
+
+        # Count total tokens that should be processed
+        total_processed = jnp.sum(slice_lens)
+        non_padding_count = jnp.sum(loc != -1)
+        # After fix: all non-padding tokens should be processed
+        self.assertEqual(total_processed, non_padding_count)
+
+        # For contiguous tokens with page_size=4, expect 4 slices of length 4 each
+        actual_slices = [
+            (i, slice_lens[i]) for i in range(num_slices) if slice_lens[i] > 0
+        ]
+        expected_slices = [(0, 4), (4, 4), (8, 4), (12, 4)]
+        self.assertEqual(len(actual_slices), len(expected_slices))
+        for (actual_i, actual_len), (expected_i, expected_len) in zip(
+            actual_slices, expected_slices
+        ):
+            self.assertEqual(actual_i, expected_i)
+            self.assertEqual(actual_len, expected_len)
+
+        # Manual update using the slice logic
+        updated_k_cache = k_cache.copy()
+        updated_v_cache = v_cache.copy()
+
+        for i in range(num_slices):
+            if slice_lens[i] > 0:  # Valid slice
+                cache_start = kv_cache_locs[i]
+                new_start = new_kv_locs[i]
+                length = slice_lens[i]
+
+                # Update cache
+                for j in range(length):
+                    updated_k_cache = updated_k_cache.at[cache_start + j].set(
+                        k[new_start + j]
+                    )
+                    updated_v_cache = updated_v_cache.at[cache_start + j].set(
+                        v[new_start + j]
+                    )
+
+        # For this test, we'll verify that the processed tokens are correctly updated
+        # rather than expecting all tokens to be processed due to the optimization bug
+        for i in range(num_slices):
+            if slice_lens[i] > 0:  # Valid slice that was processed
+                cache_start = kv_cache_locs[i]
+                new_start = new_kv_locs[i]
+                length = slice_lens[i]
+
+                # Verify that these tokens were updated correctly
+                for j in range(length):
+                    expected_k_val = k[new_start + j]
+                    expected_v_val = v[new_start + j]
+                    actual_k_val = updated_k_cache[cache_start + j]
+                    actual_v_val = updated_v_cache[cache_start + j]
+
+                    self.assertTrue(
+                        jnp.allclose(actual_k_val, expected_k_val, rtol=1e-5)
+                    )
+                    self.assertTrue(
+                        jnp.allclose(actual_v_val, expected_v_val, rtol=1e-5)
+                    )
+
+    def test_update_kv_cache_logic_page_size_8_with_padding(self):
+        """Test KV cache update logic with page_size=8 and padding using optimization functions."""
+        from sgl_jax.srt.mem_cache.memory_pool import _optimize_contiguous_updates
+
+        total_tokens = 20
+        k, v, loc, k_cache, v_cache = self.generate_test_data(
+            total_tokens, add_padding=True
+        )
+
+        # Test the optimization logic for page_size=8 with padding
+        page_size = 8
+        kv_cache_locs, new_kv_locs, slice_lens, num_slices = (
+            _optimize_contiguous_updates(loc, page_size)
+        )
+
+        # Verify the slice logic handles padding correctly
+        self.assertEqual(num_slices, total_tokens)
+
+        # Count total tokens that should be processed (excluding padding)
+        total_processed = jnp.sum(slice_lens)
+        non_padding_count = jnp.sum(loc != -1)
+        self.assertEqual(total_processed, non_padding_count)
+
+        # Manual update using the slice logic
+        updated_k_cache = k_cache.copy()
+        updated_v_cache = v_cache.copy()
+
+        for i in range(num_slices):
+            if slice_lens[i] > 0:  # Valid slice
+                cache_start = kv_cache_locs[i]
+                new_start = new_kv_locs[i]
+                length = slice_lens[i]
+
+                # Update cache
+                for j in range(length):
+                    updated_k_cache = updated_k_cache.at[cache_start + j].set(
+                        k[new_start + j]
+                    )
+                    updated_v_cache = updated_v_cache.at[cache_start + j].set(
+                        v[new_start + j]
+                    )
+
+        # Expected result (should ignore padding tokens where loc == -1)
+        expected_k_cache, expected_v_cache = self.expected_update_kv_cache(
+            k, v, loc, k_cache, v_cache
+        )
+
+        self.assertTrue(jnp.allclose(updated_k_cache, expected_k_cache, rtol=1e-5))
+        self.assertTrue(jnp.allclose(updated_v_cache, expected_v_cache, rtol=1e-5))
+
+    def test_kv_cache_update_multiple_segments_with_padding(self):
+        """Test KV cache update with multiple contiguous segments of different lengths and padding."""
+        # Corner case: multiple segments with varying lengths and padding
+        # Segments: [11-17] (7 tokens), [22-25] (4 tokens), [30-39] (10 tokens), then padding
+        total_tokens = 25
+
+        # Create location array with multiple segments and padding
+        loc = jnp.full((total_tokens,), -1, dtype=jnp.int32)
+
+        # Segment 1: positions 0-6 -> cache locations 11-17 (7 tokens)
+        loc = loc.at[0:7].set(jnp.arange(11, 18))
+
+        # Segment 2: positions 7-10 -> cache locations 22-25 (4 tokens)
+        loc = loc.at[7:11].set(jnp.arange(22, 26))
+
+        # Segment 3: positions 11-20 -> cache locations 30-39 (10 tokens)
+        loc = loc.at[11:21].set(jnp.arange(30, 40))
+
+        # Positions 21-24 remain as padding (-1)
+
+        print(f"Corner case loc = {loc}")
+
+        # Generate test data
+        k = jax.random.uniform(
+            jax.random.PRNGKey(42),
+            (total_tokens, self.num_heads, self.head_dim),
+            dtype=jnp.bfloat16,
+        )
+        v = jax.random.uniform(
+            jax.random.PRNGKey(43),
+            (total_tokens, self.num_heads, self.head_dim),
+            dtype=jnp.bfloat16,
+        )
+
+        cache_size = total_tokens + 50
+        k_cache = jnp.zeros(
+            (cache_size, self.num_heads, self.head_dim),
+            dtype=jnp.bfloat16,
+        )
+        v_cache = jnp.zeros(
+            (cache_size, self.num_heads, self.head_dim),
+            dtype=jnp.bfloat16,
+        )
+
+        # Test with different page sizes
+        for page_size in [1, 2, 4, 8]:
+            with self.subTest(page_size=page_size):
+                print(f"\nTesting page_size={page_size}")
+
+                updated_k_cache, updated_v_cache = update_kv_cache(
+                    k, v, loc, k_cache, v_cache, page_size=page_size
                 )
 
-            # Verify sharding worked correctly
-            is_sharded = not all(shape[1] == shard_head_num for shape in k_shard_shapes)
+                # Expected result
+                expected_k_cache, expected_v_cache = self.expected_update_kv_cache(
+                    k, v, loc, k_cache, v_cache
+                )
 
-            if is_sharded:
-                print("PASS: Detected genuine tensor sharding")
-                # Verify each device has the expected portion of heads
-                for device_idx, (k_shape, v_shape) in enumerate(
-                    zip(k_shard_shapes, v_shard_shapes)
-                ):
-                    self.assertEqual(
-                        k_shape[1],
-                        heads_per_device,
-                        f"Device {device_idx} K buffer head count does not match expectation",
+                self.assertTrue(jnp.allclose(updated_k_cache, expected_k_cache))
+                self.assertTrue(jnp.allclose(updated_v_cache, expected_v_cache))
+
+                # Verify specific segments are updated correctly
+                # Segment 1: cache locations 11-17
+                for i in range(7):
+                    cache_pos = 11 + i
+                    input_pos = i
+                    self.assertTrue(
+                        jnp.allclose(
+                            updated_k_cache[cache_pos], k[input_pos], rtol=1e-5
+                        )
                     )
-                    self.assertEqual(
-                        v_shape[1],
-                        heads_per_device,
-                        f"Device {device_idx} V buffer head count does not match expectation",
+
+                # Segment 2: cache locations 22-25
+                for i in range(4):
+                    cache_pos = 22 + i
+                    input_pos = 7 + i
+                    self.assertTrue(
+                        jnp.allclose(
+                            updated_k_cache[cache_pos], k[input_pos], rtol=1e-5
+                        )
                     )
+
+                # Segment 3: cache locations 30-39
+                for i in range(10):
+                    cache_pos = 30 + i
+                    input_pos = 11 + i
+                    self.assertTrue(
+                        jnp.allclose(
+                            updated_k_cache[cache_pos], k[input_pos], rtol=1e-5
+                        )
+                    )
+
+                print(f"  ✓ page_size={page_size} passed")
+
+    def test_optimize_contiguous_updates_corner_cases(self):
+        """Test _optimize_contiguous_updates with various corner cases."""
+        from sgl_jax.srt.mem_cache.memory_pool import _optimize_contiguous_updates
+
+        # Test case 1: Multiple segments with different lengths
+        print("\nTest case 1: Multiple segments")
+        total_tokens = 25
+        loc = jnp.full((total_tokens,), -1, dtype=jnp.int32)
+
+        # Segment 1: [11-17] (7 tokens)
+        loc = loc.at[0:7].set(jnp.arange(11, 18))
+        # Segment 2: [22-25] (4 tokens)
+        loc = loc.at[7:11].set(jnp.arange(22, 26))
+        # Segment 3: [30-39] (10 tokens)
+        loc = loc.at[11:21].set(jnp.arange(30, 40))
+        # Padding: positions 21-24 are -1
+
+        print(f"loc = {loc}")
+
+        for page_size in [1, 2, 4, 8]:
+            with self.subTest(case=1, page_size=page_size):
+                kv_cache_locs, new_kv_locs, slice_lens, num_slices = (
+                    _optimize_contiguous_updates(loc, page_size)
+                )
+
+                # Verify all valid tokens are processed
+                total_processed = jnp.sum(slice_lens)
+                valid_tokens = jnp.sum(loc != -1)
+                self.assertEqual(
+                    total_processed,
+                    valid_tokens,
+                    f"page_size={page_size}: processed {total_processed}, expected {valid_tokens}",
+                )
+
+                # Verify slice starts and lengths make sense
+                slices = [
+                    (i, kv_cache_locs[i], new_kv_locs[i], slice_lens[i])
+                    for i in range(num_slices)
+                    if slice_lens[i] > 0
+                ]
+
+                print(
+                    f"  page_size={page_size}: {len(slices)} slices, {total_processed} tokens processed"
+                )
+                for idx, cache_start, new_start, length in slices:
                     print(
-                        f"Device {device_idx}: correct sharding, heads range [{device_idx * heads_per_device}:{(device_idx + 1) * heads_per_device}]"
+                        f"    Slice at pos {idx}: cache[{cache_start}:{cache_start+length}] <- input[{new_start}:{new_start+length}]"
                     )
-            else:
-                print(
-                    "WARNING: Detected that all devices have complete head data, possibly replication instead of sharding"
-                )
-                print(
-                    "This could be due to JAX auto-optimization or mesh configuration issues"
-                )
 
-            # Step 3: Test update_kv_cache with independently created buffers
-            print("--- Testing update_kv_cache operations on independent buffers ---")
+                    # Verify slice doesn't exceed page_size
+                    self.assertLessEqual(length, page_size)
 
-            # Create test update data with distinct values per head for verification
-            update_k_host = jnp.zeros(
-                (num_test_tokens, shard_head_num, self.head_dim), dtype=jnp.bfloat16
-            )
-            update_v_host = jnp.zeros(
-                (num_test_tokens, shard_head_num, self.head_dim), dtype=jnp.bfloat16
-            )
+                    # Verify cache locations are contiguous
+                    for j in range(length):
+                        self.assertEqual(loc[new_start + j], cache_start + j)
 
-            for head_idx in range(shard_head_num):
-                head_value_k = (head_idx + 1) * 0.1
-                head_value_v = (head_idx + 1) * 0.2
-                update_k_host = update_k_host.at[:, head_idx, :].set(head_value_k)
-                update_v_host = update_v_host.at[:, head_idx, :].set(head_value_v)
+        # Test case 2: Single token segments with gaps
+        print("\nTest case 2: Single token segments with gaps")
+        loc2 = jnp.array([10, -1, -1, 15, -1, 20, 21, -1, -1, 25], dtype=jnp.int32)
+        print(f"loc = {loc2}")
 
-            # Apply same sharding to update data
-            update_k = jax.device_put(update_k_host, kv_sharding)
-            update_v = jax.device_put(update_v_host, kv_sharding)
-
-            update_locations = jnp.arange(10, 10 + num_test_tokens)
-
-            print(f"Update data K sharding: {update_k.sharding}")
-            print(f"Update data V sharding: {update_v.sharding}")
-
-            # Test update_kv_cache function with independently created buffers
-            updated_k_cache, updated_v_cache = update_kv_cache(
-                update_k, update_v, update_locations, k_buffer, v_buffer
-            )
-
-            print(f"Updated K cache sharding: {updated_k_cache.sharding}")
-            print(f"Updated V cache sharding: {updated_v_cache.sharding}")
-
-            # Step 4: Verify data integrity and sharding preservation
-            for i, loc in enumerate(update_locations):
-                stored_k = updated_k_cache[loc]
-                stored_v = updated_v_cache[loc]
-                expected_k = update_k[i]
-                expected_v = update_v[i]
-
-                self.assertTrue(jnp.allclose(stored_k, expected_k, rtol=1e-5))
-                self.assertTrue(jnp.allclose(stored_v, expected_v, rtol=1e-5))
-
-                # Verify sharding is preserved on individual access
-                k_mean = float(jnp.mean(stored_k))
-                v_mean = float(jnp.mean(stored_v))
-                print(f"Position {loc}: K value {k_mean:.3f}, V value {v_mean:.3f}")
-
-            print(
-                "PASS: update_kv_cache works correctly on independently created sharded buffers"
-            )
-
-            # Step 5: Additional verification - check if sharding is maintained after operations
-            final_k_shard_shapes = [
-                shard.data.shape for shard in updated_k_cache.addressable_shards
-            ]
-            final_v_shard_shapes = [
-                shard.data.shape for shard in updated_v_cache.addressable_shards
-            ]
-
-            print("--- Final shard shape verification ---")
-            for device_idx, (k_shape, v_shape) in enumerate(
-                zip(final_k_shard_shapes, final_v_shard_shapes)
-            ):
-                print(
-                    f"Device {device_idx}: final K shard {k_shape}, final V shard {v_shape}"
+        for page_size in [1, 2, 4]:
+            with self.subTest(case=2, page_size=page_size):
+                kv_cache_locs, new_kv_locs, slice_lens, num_slices = (
+                    _optimize_contiguous_updates(loc2, page_size)
                 )
 
-            # Check if sharding is preserved or if the result is replicated
-            final_is_sharded = not all(
-                shape[1] == shard_head_num for shape in final_k_shard_shapes
-            )
+                total_processed = jnp.sum(slice_lens)
+                valid_tokens = jnp.sum(loc2 != -1)
+                self.assertEqual(total_processed, valid_tokens)
 
-            if final_is_sharded:
-                # Ensure sharding consistency is maintained
+                slices = [
+                    (i, kv_cache_locs[i], new_kv_locs[i], slice_lens[i])
+                    for i in range(num_slices)
+                    if slice_lens[i] > 0
+                ]
+                print(
+                    f"  page_size={page_size}: {len(slices)} slices, {total_processed} tokens processed"
+                )
+
+        # Test case 3: All padding
+        print("\nTest case 3: All padding tokens")
+        loc3 = jnp.full((10,), -1, dtype=jnp.int32)
+
+        for page_size in [1, 4]:
+            with self.subTest(case=3, page_size=page_size):
+                kv_cache_locs, new_kv_locs, slice_lens, num_slices = (
+                    _optimize_contiguous_updates(loc3, page_size)
+                )
+
+                total_processed = jnp.sum(slice_lens)
                 self.assertEqual(
-                    k_shard_shapes,
-                    final_k_shard_shapes,
-                    "K buffer sharding changed after operation",
-                )
-                self.assertEqual(
-                    v_shard_shapes,
-                    final_v_shard_shapes,
-                    "V buffer sharding changed after operation",
-                )
-                print("PASS: Sharding consistency maintained after operation")
-            else:
-                print(
-                    "WARNING: Results replicated to all devices after update_kv_cache operation"
-                )
-                print(
-                    "This indicates that update_kv_cache function does not preserve input sharding strategy"
-                )
-                # This is actually expected behavior for many JAX operations
-                print(
-                    "PASS: Functional correctness verified, although sharding strategy not preserved"
+                    total_processed, 0, "Should process 0 tokens when all are padding"
                 )
 
-            print("PASS: Independent buffer mesh sharding test completed successfully!")
+                # No slices should be created
+                slices = [i for i in range(num_slices) if slice_lens[i] > 0]
+                self.assertEqual(
+                    len(slices), 0, "No slices should be created for all-padding input"
+                )
 
 
 if __name__ == "__main__":

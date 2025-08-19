@@ -189,6 +189,7 @@ class KVCache(abc.ABC):
         loc: jnp.ndarray,
         cache_k: jnp.ndarray,
         cache_v: jnp.ndarray,
+        is_decode: bool,
     ) -> None:
         raise NotImplementedError()
 
@@ -316,7 +317,7 @@ class MHATokenToKVPool(KVCache):
     def _calculate_memory_usage(self):
         """Calculate memory usage"""
         k_size = (
-            self.size
+            (self.size + self.page_size)
             * self.head_num
             * self.head_dim
             * jnp.dtype(self.dtype).itemsize
@@ -333,7 +334,7 @@ class MHATokenToKVPool(KVCache):
     def get_kv_size_bytes(self):
         """Calculate KV cache size in bytes"""
         k_size = (
-            self.size
+            (self.size + self.page_size)
             * self.head_num
             * self.head_dim
             * jnp.dtype(self.dtype).itemsize
@@ -357,6 +358,7 @@ class MHATokenToKVPool(KVCache):
         loc: jax.Array,
         k: jax.Array,  # [total_tokens, num_heads, head_dim]
         v: jax.Array,  # [total_tokens, num_heads, head_dim]
+        is_decode: bool = False,
     ) -> None:
         """
         Set KV cache data using JAX-style interface with padding support.
@@ -372,6 +374,7 @@ class MHATokenToKVPool(KVCache):
         """
         layer_idx = layer_id - self.start_layer
 
+        page_size = 1 if is_decode else self.page_size
         # Use the token-by-token update implementation
         self.k_buffer[layer_idx], self.v_buffer[layer_idx] = _set_kv_buffer(
             k=k,
@@ -379,7 +382,7 @@ class MHATokenToKVPool(KVCache):
             loc=loc,
             k_cache=self.k_buffer[layer_idx],
             v_cache=self.v_buffer[layer_idx],
-            page_size=self.page_size,
+            page_size=page_size,
             kv_partition_axis=self.kv_partition_axis,
         )
 
@@ -510,6 +513,101 @@ def update_kv_cache(
 def cdiv(a: int, b: int) -> int:
     """Ceiling division."""
     return -(a // -b)
+
+
+def _optimize_contiguous_updates(
+    loc: jax.Array,  # [total_tokens], -1 for padding
+    page_size: int,
+) -> tuple[jax.Array, jax.Array, jax.Array, int]:
+    """
+    Optimize KV cache updates by grouping contiguous locations into page_size chunks.
+
+    Args:
+        loc: Location index array [total_tokens], -1 for padding tokens
+        page_size: Page size (must be > 1)
+
+    Returns:
+        kv_cache_locs: Start locations in cache for each slice
+        new_kv_locs: Start locations in new_kv for each slice
+        slice_lens: Length of each slice (0 means skip this position)
+        num_slices: Total number of slices (equals total_tokens for array size consistency)
+    """
+    total_tokens = loc.shape[0]
+    valid_mask = loc != -1
+    indices = jnp.arange(total_tokens)
+
+    # Detect contiguous segments
+    is_continuous_to_next = valid_mask[:-1] & valid_mask[1:] & (loc[1:] == loc[:-1] + 1)
+    is_continuous_to_next = jnp.concatenate([is_continuous_to_next, jnp.array([False])])
+
+    # Mark segment starts
+    is_segment_start = valid_mask & jnp.concatenate(
+        [
+            jnp.array([True]),
+            ~is_continuous_to_next[:-1],
+        ]
+    )
+
+    # Simple approach: compute remaining tokens from each position by looking ahead
+    # For each position i, count how many contiguous valid tokens exist starting from i
+    remaining_in_segment = jnp.zeros(total_tokens, dtype=jnp.int32)
+
+    # Use scan to compute remaining tokens efficiently
+    def compute_remaining(carry, x):
+        i, valid, is_cont_next = x
+        next_remaining = carry
+
+        # Current remaining = 1 (for self) + next_remaining (if continuous)
+        current_remaining = jnp.where(
+            valid, 1 + jnp.where(is_cont_next, next_remaining, 0), 0
+        )
+        return current_remaining, current_remaining
+
+    # Scan backwards to compute remaining tokens
+    # We manually reverse inputs and use reverse=False, then reverse the output
+    _, remaining_in_segment = jax.lax.scan(
+        compute_remaining,
+        0,  # initial carry
+        (indices[::-1], valid_mask[::-1], is_continuous_to_next[::-1]),
+        reverse=False,
+    )
+    remaining_in_segment = remaining_in_segment[::-1]
+
+    # Now generate slices
+    def compute_slice_info(carry, x):
+        i, valid, is_seg_start, remaining = x
+        tokens_since_segment_start = carry
+
+        # Reset counter at segment start
+        new_tokens_since_start = jnp.where(
+            valid & is_seg_start,
+            0,
+            jnp.where(
+                valid, tokens_since_segment_start + 1, tokens_since_segment_start
+            ),
+        )
+
+        # Start slice at segment start or every page_size tokens within segment
+        is_slice_start = valid & (
+            is_seg_start | (new_tokens_since_start % page_size == 0)
+        )
+
+        # Slice length is min(page_size, remaining tokens in segment)
+        slice_len = jnp.where(is_slice_start, jnp.minimum(page_size, remaining), 0)
+
+        return new_tokens_since_start, (is_slice_start, slice_len)
+
+    _, (slice_starts, slice_lengths) = jax.lax.scan(
+        compute_slice_info,
+        -1,  # tokens_since_segment_start
+        (indices, valid_mask, is_segment_start, remaining_in_segment),
+    )
+
+    kv_cache_locs = jnp.where(slice_starts, loc, 0)
+    new_kv_locs = jnp.where(slice_starts, indices, 0)
+    slice_lens = slice_lengths
+
+    return kv_cache_locs, new_kv_locs, slice_lens, total_tokens
 
 
 def kv_cache_update_kernel(
@@ -740,18 +838,25 @@ def update_kv_cache_vectorized(
     kv_partition_axis: str = "tensor",
 ):
     """
-    Vectorized KV cache update that handles padding by setting slice_lens to 0
-    for invalid tokens instead of using where operations.
+    Vectorized KV cache update that handles padding and supports page_size > 1
+    by grouping contiguous tokens into page-sized chunks for efficient updates.
     """
     total_tokens = loc.shape[0]
     loc = loc.astype(jnp.int32)
-    kv_cache_locs = jnp.where(loc == -1, 0, loc).astype(jnp.int32)
-    new_kv_locs = jnp.arange(total_tokens, dtype=jnp.int32)
-    # Set slice_lens to 0 for padding tokens (where loc == -1), 1 for valid tokens
-    slice_lens = jnp.where(loc == -1, 0, 1).astype(jnp.int32)
 
-    # Create the 'slices' array for the kernel
-    # This contains information for all tokens, but padding tokens have slice_lens=0
+    # Choose strategy based on page_size
+    if page_size > 1:
+        # Use optimized contiguous grouping for page_size > 1
+        kv_cache_locs, new_kv_locs, slice_lens, num_slices = (
+            _optimize_contiguous_updates(loc, page_size)
+        )
+    else:
+        # Use original logic for page_size = 1: one slice per token
+        kv_cache_locs = jnp.where(loc == -1, 0, loc).astype(jnp.int32)
+        new_kv_locs = jnp.arange(total_tokens, dtype=jnp.int32)
+        slice_lens = jnp.where(loc == -1, 0, 1).astype(jnp.int32)
+        num_slices = total_tokens
+
     # num_slices_per_block = get_num_slices_per_block(k, k_cache)
     num_slices_per_block = 4
 
@@ -762,7 +867,7 @@ def update_kv_cache_vectorized(
         slice_lens=slice_lens,
     )
 
-    num_kv_update_slices = jnp.array([total_tokens], dtype=jnp.int32)
+    num_kv_update_slices = jnp.array([num_slices], dtype=jnp.int32)
 
     k_cache = kv_cache_update(
         new_kv=k,
@@ -792,23 +897,6 @@ def _get_kv_buffer(
     layer_id: int, k_cache: jax.Array, v_cache: jax.Array
 ) -> Tuple[jax.Array, jax.Array]:
     return k_cache[layer_id], v_cache[layer_id]
-
-
-# @partial(jax.jit, static_argnames=["layer_id"])
-def _set_kv_cache(
-    layer_id: int,
-    loc: jax.Array,
-    k: jax.Array,
-    v: jax.Array,
-    k_cache: jax.Array,
-    v_cache: jax.Array,
-) -> Tuple[jax.Array, jax.Array]:
-    assert loc.shape[0] == k.shape[0] == v.shape[0], "Batch size mismatch"
-
-    k_cache = v_cache.at[layer_id, loc].set(k)
-    v_cache = v_cache.at[layer_id, loc].set(v)
-
-    return k_cache, v_cache
 
 
 class MLATokenToKVPool(KVCache):
@@ -896,6 +984,7 @@ class MLATokenToKVPool(KVCache):
         loc: jnp.ndarray,
         cache_k: jnp.ndarray,
         cache_v: jnp.ndarray,
+        is_decode: bool = False,
     ) -> None:
         """Set KV cache data for MLA"""
         layer_idx = layer_id - self.start_layer

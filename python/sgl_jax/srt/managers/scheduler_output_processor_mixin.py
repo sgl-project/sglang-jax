@@ -50,7 +50,7 @@ class SchedulerOutputProcessorMixin:
         )
 
         # Move next_token_ids and logprobs to cpu
-        next_token_ids = jax.device_get(next_token_ids)
+        next_token_ids = jax.device_get(next_token_ids).tolist()
         if batch.return_logprob:
             if logits_output.next_token_logprobs is not None:
                 logits_output.next_token_logprobs = jax.device_get(
@@ -109,7 +109,7 @@ class SchedulerOutputProcessorMixin:
         self.num_generated_tokens += len(batch.reqs)
 
         # spec decoding handles output logprobs inside verify process.
-        next_token_ids = jax.device_get(next_token_ids)
+        next_token_ids = jax.device_get(next_token_ids).tolist()
         if batch.return_logprob:
             next_token_logprobs = jax.device_get(logits_output.next_token_logprobs)
 
