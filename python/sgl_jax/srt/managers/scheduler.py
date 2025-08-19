@@ -245,7 +245,7 @@ class Scheduler(
             f"Node {self.node_rank} attn_tp_size: {attn_tp_size}, attn_dp_rank: {attn_dp_rank}, dp_rank: {dp_rank}"
         )
         self.mesh = create_device_mesh(
-            ici_parallelism=[-1, self.attn_tp_size, 1, 1], dcn_parallelism=[1, 1, 1, 1]
+            ici_parallelism=[-1, attn_tp_size, 1, 1], dcn_parallelism=[1, 1, 1, 1]
         )
 
         self.tp_worker = ModelWorker(
