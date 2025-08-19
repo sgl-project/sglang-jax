@@ -53,6 +53,7 @@ class ServerArgs:
     max_running_requests: Optional[int] = None
     max_total_tokens: Optional[int] = None
     max_prefill_tokens: int = 16384
+    chunked_prefill_size: Optional[int] = None
     schedule_policy: str = "fcfs"
     schedule_conservativeness: float = 1.0
     page_size: int = 1
@@ -155,6 +156,10 @@ class ServerArgs:
                 self.mem_fraction_static = 0.5 / jax.process_count()
             else:
                 self.mem_fraction_static = 0.88
+
+        # Set chunked prefill size
+        if self.chunked_prefill_size is None:
+            self.chunked_prefill_size = 4096
 
         # GGUF
         if (
@@ -373,6 +378,12 @@ class ServerArgs:
             default=ServerArgs.max_total_tokens,
             help="The maximum number of tokens in the memory pool. If not specified, it will be automatically calculated based on the memory usage fraction. "
             "This option is typically used for development and debugging purposes.",
+        )
+        parser.add_argument(
+            "--chunked-prefill-size",
+            type=int,
+            default=ServerArgs.chunked_prefill_size,
+            help="The maximum number of tokens in a chunk for the chunked prefill. Setting this to -1 means disabling chunked prefill.",
         )
         parser.add_argument(
             "--max-prefill-tokens",
@@ -740,6 +751,13 @@ class ServerArgs:
         assert (
             self.tp_size
         ) % self.nnodes == 0, "tp_size must be divisible by number of nodes"
+
+        # Check chunked prefill
+        # Skip validation if chunked prefill is disabled (i.e., size <= 0).
+        if self.chunked_prefill_size > 0:
+            assert (
+                self.chunked_prefill_size % self.page_size == 0
+            ), "chunked_prefill_size must be divisible by page_size"
 
 
 def prepare_server_args(argv: List[str]) -> ServerArgs:

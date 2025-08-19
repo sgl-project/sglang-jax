@@ -261,6 +261,7 @@ class PrefillAdder:
         running_batch: ScheduleBatch,
         new_token_ratio: float,
         rem_input_tokens: int,
+        rem_chunk_tokens: Optional[int],
     ):
         self.page_size = page_size
         self.tree_cache = tree_cache
@@ -268,12 +269,14 @@ class PrefillAdder:
         self.running_batch = running_batch
         self.new_token_ratio = new_token_ratio
         self.rem_input_tokens = rem_input_tokens
+        self.rem_chunk_tokens = rem_chunk_tokens
 
         self.rem_total_token_offset = 0
         self.cur_rem_token_offset = 0
 
         self.req_states = None
         self.can_run_list = []
+        self.new_chunked_req = None
         self.log_hit_tokens = 0
         # TODO(lsyin): report the real input tokens excluding page alignment
         self.log_input_tokens = 0
@@ -315,10 +318,30 @@ class PrefillAdder:
         if self.rem_total_tokens <= 0 or self.cur_rem_tokens <= 0:
             return AddReqResult.NO_TOKEN
 
-        if self.rem_input_tokens <= 0:
+        if self.rem_input_tokens <= 0 or (
+            self.rem_chunk_tokens is not None and self.rem_chunk_tokens <= 0
+        ):
             return AddReqResult.OTHER
 
         return AddReqResult.CONTINUE
+
+    def add_chunked_req(self, req: Req):
+        truncated = req.extend_input_len > self.rem_chunk_tokens
+        req.extend_input_len = min(req.extend_input_len, self.rem_chunk_tokens)
+        req.fill_ids = req.fill_ids[: len(req.prefix_indices) + req.extend_input_len]
+        self.can_run_list.append(req)
+        self._update_prefill_budget(
+            0,
+            req.extend_input_len,
+            (
+                min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS_ESTIMATION)
+                if not truncated
+                else 0
+            ),
+        )
+
+        # Return if chunked prefill not finished
+        return req if truncated else None
 
     def _update_prefill_budget(
         self, prefix_len: int, extend_input_len: int, max_new_tokens: int
@@ -329,6 +352,8 @@ class PrefillAdder:
         self.rem_total_token_offset += extend_input_len + max_new_tokens
         self.cur_rem_token_offset += extend_input_len
         self.rem_input_tokens -= extend_input_len
+        if self.rem_chunk_tokens is not None:
+            self.rem_chunk_tokens -= extend_input_len
 
         self.log_hit_tokens += prefix_len
         self.log_input_tokens += extend_input_len
@@ -391,13 +416,29 @@ class PrefillAdder:
                 return AddReqResult.NO_TOKEN
             tokens_freed += tokens_occupied
 
-        # Non-chunked prefill
-        self.can_run_list.append(req)
-        self._update_prefill_budget(
-            0,
-            req.extend_input_len,
-            min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS_ESTIMATION),
-        )
+        if (
+            self.rem_chunk_tokens is None  # chunked prefill is disabled
+            or req.extend_input_len <= self.rem_chunk_tokens  # it is the last chunk
+        ):
+            # Non-chunked prefill
+            self.can_run_list.append(req)
+            self._update_prefill_budget(
+                0,
+                req.extend_input_len,
+                min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS_ESTIMATION),
+            )
+        else:
+            if self.rem_chunk_tokens == 0:
+                return AddReqResult.OTHER
+
+            # Chunked prefill
+            trunc_len = self.rem_chunk_tokens
+
+            req.extend_input_len = trunc_len
+            req.fill_ids = req.fill_ids[:trunc_len]
+            self.can_run_list.append(req)
+            self.new_chunked_req = req
+            self._update_prefill_budget(0, trunc_len, 0)
 
         return self.budget_state()
 
@@ -430,16 +471,31 @@ class PrefillAdder:
             if input_tokens >= self.rem_input_tokens and len(self.can_run_list) != 0:
                 return AddReqResult.OTHER
 
-            # Non-chunked prefill
-            self.can_run_list.append(req)
-            self.tree_cache.inc_lock_ref(req.last_node)
-            self._update_prefill_budget(
-                prefix_len,
-                input_tokens,
-                min(
-                    req.sampling_params.max_new_tokens,
-                    CLIP_MAX_NEW_TOKENS_ESTIMATION,
-                ),
-            )
+            if self.rem_chunk_tokens is None or input_tokens <= self.rem_chunk_tokens:
+                # Non-chunked prefill
+                self.can_run_list.append(req)
+                self.tree_cache.inc_lock_ref(req.last_node)
+                self._update_prefill_budget(
+                    prefix_len,
+                    input_tokens,
+                    min(
+                        req.sampling_params.max_new_tokens,
+                        CLIP_MAX_NEW_TOKENS_ESTIMATION,
+                    ),
+                )
+            else:
+                # Make sure at least one page is available
+                trunc_len = self.rem_chunk_tokens - self.page_size + 1
+                if trunc_len <= 0:
+                    return AddReqResult.OTHER
+
+                # Chunked prefill
+                req.extend_input_len = trunc_len
+                req.fill_ids = req.fill_ids[: len(req.prefix_indices) + trunc_len]
+
+                self.can_run_list.append(req)
+                self.new_chunked_req = req
+                self.tree_cache.inc_lock_ref(req.last_node)
+                self._update_prefill_budget(prefix_len, trunc_len, 0)
 
         return self.budget_state()

@@ -14,8 +14,6 @@ ScheduleBatch -> ModelWorkerBatch -> ForwardBatch
   It will be transformed from CPU scheduler to GPU model runner.
 - ForwardBatch is managed by `model_runner.py::ModelRunner`.
   It contains low-level tensor data. Most of the data consists of GPU tensors.
-
-TODO(lmzheng): ModelWorkerBatch seems a bit redundant and we consider removing it in the future.
 """
 
 import dataclasses
@@ -186,6 +184,11 @@ class Req:
         self.extend_logprob_start_len = 0
         self.last_node: Any = None
         self.last_host_node: Any = None
+
+        # Whether or not if it is chunked. It increments whenever
+        # it is chunked, and decrement whenever chunked request is
+        # processed.
+        self.is_chunked = 0
 
         # For retraction
         self.is_retracted = False
@@ -386,6 +389,7 @@ class Req:
         self.temp_input_top_logprobs_val = None
         self.temp_input_top_logprobs_idx = None
         self.extend_logprob_start_len = 0
+        self.is_chunked = 0
         self.req_pool_idx = None
         self.already_computed = 0
 
@@ -426,6 +430,8 @@ class ScheduleBatch:
     # the check of whether to prefill new requests.
     # This is an optimization to reduce the overhead of the prefill check.
     batch_is_full: bool = False
+
+    chunked_req: Optional[Req] = None
 
     # Sampling info
     sampling_info: SamplingBatchInfo = None
@@ -478,6 +484,7 @@ class ScheduleBatch:
         tree_cache: BasePrefixCache,
         model_config: ModelConfig,
         enable_custom_logit_processor: bool = False,
+        chunked_req: Optional[Req] = None,
         mesh: mesh_lib.Mesh = None,
     ):
         return_logprob = any(req.return_logprob for req in reqs)
@@ -490,6 +497,7 @@ class ScheduleBatch:
             model_config=model_config,
             return_logprob=return_logprob,
             has_stream=any(req.stream for req in reqs),
+            chunked_req=chunked_req,
             mesh=mesh,
         )
 
@@ -864,11 +872,19 @@ class ScheduleBatch:
 
     def filter_batch(
         self,
+        chunked_req_to_exclude: Optional[Union[Req, List[Req]]] = None,
         keep_indices: Optional[List[int]] = None,
     ):
         if keep_indices is None:
+            if isinstance(chunked_req_to_exclude, Req):
+                chunked_req_to_exclude = [chunked_req_to_exclude]
+            elif chunked_req_to_exclude is None:
+                chunked_req_to_exclude = []
             keep_indices = [
-                i for i in range(len(self.reqs)) if not self.reqs[i].finished()
+                i
+                for i in range(len(self.reqs))
+                if not self.reqs[i].finished()
+                and self.reqs[i] not in chunked_req_to_exclude
             ]
 
         if keep_indices is None or len(keep_indices) == 0:
@@ -937,8 +953,8 @@ class ScheduleBatch:
 
     def get_model_worker_batch(
         self,
-        max_running_requests: int,
         max_total_num_tokens: int,
+        prefill_padded_batch_size: int,
         bs_paddings: list,
         token_paddings: list,
     ) -> ModelWorkerBatch:
@@ -948,7 +964,7 @@ class ScheduleBatch:
         else:
             extend_seq_lens = np.array(self.extend_lens, dtype=np.int32)
             extend_prefix_lens = np.array(self.prefix_lens, dtype=np.int32)
-            bs_paddings = [max_running_requests]
+            bs_paddings = [prefill_padded_batch_size]
 
         global bid
         bid += 1
