@@ -467,6 +467,8 @@ class ScheduleBatch:
     # device mesh
     mesh: mesh_lib.Mesh = None
 
+    cache_miss_count: int = 0
+
     @classmethod
     def init_new(
         cls,

@@ -88,6 +88,7 @@ class GenerationBatchResult:
     extend_input_len_per_req: List[int]
     extend_logprob_start_len_per_req: List[int]
     bid: int
+    cache_miss_count: int
 
 
 class Scheduler(
@@ -722,20 +723,12 @@ class Scheduler(
         model_worker_batch = batch.get_model_worker_batch(
             self.max_running_requests,
             self.max_total_num_tokens,
-            (
-                self.server_args.jax_precompile_decode_bs_paddings
-                if self.server_args.jax_precompile_decode_bs_paddings is not None
-                else JAX_PRECOMPILE_DEFAULT_DECODE_BS_PADDINGS
-            ),
-            (
-                self.server_args.jax_precompile_prefill_token_paddings
-                if self.server_args.jax_precompile_prefill_token_paddings is not None
-                else JAX_PRECOMPILE_DEFAULT_PREFILL_TOKEN_PADDINGS
-            ),
+            self.tp_worker.precompile_decode_bs_paddings,
+            self.tp_worker.precompile_prefill_token_paddings,
         )
 
-        logits_output, next_token_ids = self.tp_worker.forward_batch_generation(
-            model_worker_batch
+        logits_output, next_token_ids, cache_miss_count = (
+            self.tp_worker.forward_batch_generation(model_worker_batch)
         )
 
         bid = model_worker_batch.bid
@@ -761,6 +754,7 @@ class Scheduler(
             extend_input_len_per_req=extend_input_len_per_req,
             extend_logprob_start_len_per_req=extend_logprob_start_len_per_req,
             bid=bid,
+            cache_miss_count=cache_miss_count,
         )
 
         return ret
