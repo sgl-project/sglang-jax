@@ -772,6 +772,7 @@ class Scheduler(
             self.prefill_padded_batch_size,
             self.tp_worker.precompile_decode_bs_paddings,
             self.tp_worker.precompile_prefill_token_paddings,
+            self.page_size,
         )
 
         logits_output, next_token_ids, cache_miss_count = (

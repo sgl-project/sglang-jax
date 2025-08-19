@@ -965,6 +965,7 @@ class ScheduleBatch:
         prefill_padded_batch_size: int,
         bs_paddings: list,
         token_paddings: list,
+        page_size: int,
     ) -> ModelWorkerBatch:
         if self.forward_mode.is_decode_or_idle():
             extend_seq_lens = extend_prefix_lens = extend_logprob_start_lens = None
@@ -1068,16 +1069,25 @@ class ScheduleBatch:
 
         total_cache_size = sum(seq_lens_cpu)
 
-        cache_loc_flat = np.zeros(total_cache_size, dtype=np.int32)
-
+        # cache_loc_flat = np.zeros(total_cache_size, dtype=np.int32)
+        cache_loc_flat = []
         offset = 0
         for seq_idx in range(len(seq_lens_cpu)):
             seq_len = seq_lens_cpu[seq_idx]
             if seq_len > 0:  # Only process non-empty sequences
-                cache_loc_flat[offset : offset + seq_len] = token_indices_with_all_reqs[
-                    seq_idx, :seq_len
-                ]
+                tmp = token_indices_with_all_reqs[seq_idx, :seq_len].tolist()
+                aligned_tmp = align_to_size(tmp, page_size, 0)
+                cache_loc_flat.extend(aligned_tmp)
                 offset += seq_len
+
+        # offset = 0
+        # for seq_idx in range(len(seq_lens_cpu)):
+        #     seq_len = seq_lens_cpu[seq_idx]
+        #     if seq_len > 0:  # Only process non-empty sequences
+        #         cache_loc_flat[offset : offset + seq_len] = token_indices_with_all_reqs[
+        #             seq_idx, :seq_len
+        #         ]
+        #         offset += seq_len
 
         total_cache_loc_size = max_total_num_tokens
         if total_cache_loc_size > len(cache_loc_flat):
@@ -1191,6 +1201,11 @@ class ScheduleBatch:
         available_size = self.token_to_kv_pool_allocator.available_size()
         evictable_size = self.tree_cache.evictable_size()
         return f"Available tokens: {available_size + evictable_size} ({available_size=} + {evictable_size=})\n"
+
+
+def align_to_size(l: list, size: int, value: int = 0) -> list:
+    align_len = (len(l) + size - 1) // size * size
+    return l[:] + [value] * (align_len - len(l))
 
 
 @dataclasses.dataclass
