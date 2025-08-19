@@ -436,14 +436,17 @@ class PrefillAdder:
             # Apply chunked prefill
             trunc_len = self.rem_chunk_tokens
             original_extend_len = req.extend_input_len
+            
+            # For the current batch, use truncated values
             req.extend_input_len = trunc_len
             req.fill_ids = req.fill_ids[:len(req.prefix_indices) + trunc_len]
             
             self.can_run_list.append(req)
-            self.new_chunked_req = req
             self._update_prefill_budget(len(req.prefix_indices), trunc_len, 0)
             
-            req.extend_input_len = original_extend_len - trunc_len
+            # Create chunked request for next round with remaining length
+            self.new_chunked_req = req
+            # Note: extend_input_len will be reset in init_next_round_input before next use
             
             return AddReqResult.OTHER
 
