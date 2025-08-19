@@ -95,23 +95,67 @@ class DataParallelController:
         self.workers = [None] * self.server_args.dp_size
 
         # Create port args for each DP rank to get their scheduler addresses
-        for dp_rank in range(self.server_args.dp_size):
-            if dp_rank == 0:
-                # Node 0 uses the original port_args
-                scheduler_port_args = self.port_args
-            else:
-                # Other nodes get new port args
-                # Note: We need to know the address of other nodes' schedulers
-                # For now, we'll create port args but won't connect until we know addresses
-                scheduler_port_args = PortArgs.init_new(self.server_args, dp_rank)
+        if self.server_args.enable_dp_attention:
+            dp_port_args = self.launch_dp_attention_schedulers(
+                self.server_args, self.port_args
+            )
+        else:
+            dp_port_args = self.launch_dp_schedulers(self.server_args, self.port_args)
 
-            # Connect to this DP rank's scheduler
+        if self.server_args.node_rank == 0:
             self.workers[dp_rank] = get_zmq_socket(
                 self.context,
                 zmq.PUSH,
-                scheduler_port_args.scheduler_input_ipc_name,
+                dp_port_args[dp_rank].scheduler_input_ipc_name,
                 True,
             )
+
+    def launch_dp_schedulers(self, server_args, port_args):
+        base_gpu_id = 0
+
+        threads = []
+        sockets = []
+        dp_port_args = []
+        ready_events = []
+        for dp_rank in range(server_args.dp_size):
+            tmp_port_args = PortArgs.init_new(server_args)
+            tmp_port_args.tokenizer_ipc_name = port_args.tokenizer_ipc_name
+            tmp_port_args.detokenizer_ipc_name = port_args.detokenizer_ipc_name
+            dp_port_args.append(tmp_port_args)
+
+            # This port is checked free in PortArgs.init_new.
+            # We hold it first so that the next dp worker gets a different port
+            sockets.append(bind_port(tmp_port_args.nccl_port))
+
+            ready_event = threading.Event()
+            ready_events.append(ready_event)
+
+            # Create a thread for each worker
+            thread = threading.Thread(
+                target=self.launch_tensor_parallel_group_thread,
+                args=(server_args, tmp_port_args, base_gpu_id, dp_rank, ready_event),
+            )
+            threads.append(thread)
+            base_gpu_id += server_args.tp_size * server_args.gpu_id_step
+
+        # Free all sockets before starting the threads to launch TP workers
+        for sock in sockets:
+            sock.close()
+
+        # Start all threads
+        for thread in threads:
+            thread.start()
+        for event in ready_events:
+            event.wait()
+
+        return dp_port_args
+
+    def launch_dp_attention_schedulers(self, server_args, port_args):
+        self.launch_tensor_parallel_group(server_args, port_args, 0, None)
+        dp_port_args = []
+        for dp_rank in range(server_args.dp_size):
+            dp_port_args.append(PortArgs.init_new(server_args, dp_rank))
+        return dp_port_args
 
     def round_robin_scheduler(self, req):
         """Dispatch request using round-robin strategy."""
@@ -136,7 +180,6 @@ class DataParallelController:
         while True:
             try:
                 # Non-blocking receive
-                jax.experimental.multihost_utils.broadcast_one_to_all
                 recv_req = self.recv_from_tokenizer.recv_pyobj(zmq.NOBLOCK)
 
                 if isinstance(
