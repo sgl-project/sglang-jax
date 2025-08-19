@@ -527,68 +527,6 @@ class ScheduleBatch:
 
         return out_cache_loc
 
-    def alloc_paged_token_slots_extend(
-        self,
-        prefix_lens: jax.Array,
-        seq_lens: jax.Array,
-        last_loc: jax.Array,
-        extend_num_tokens: int,
-        backup_state: bool = False,
-    ):
-        num_tokens = (
-            extend_num_tokens
-            + len(seq_lens) * self.token_to_kv_pool_allocator.page_size
-        )
-        self._evict_tree_cache_if_needed(num_tokens)
-
-        if backup_state:
-            state = self.token_to_kv_pool_allocator.backup_state()
-
-        out_cache_loc = self.token_to_kv_pool_allocator.alloc_extend(
-            prefix_lens, seq_lens, last_loc, extend_num_tokens
-        )
-        if out_cache_loc is None:
-            error_msg = (
-                f"Prefill out of memory. Try to lower your batch size.\n"
-                f"Try to allocate {extend_num_tokens} tokens.\n"
-                f"{self._available_and_evictable_str()}"
-            )
-            logger.error(error_msg)
-            raise RuntimeError(error_msg)
-
-        if backup_state:
-            return out_cache_loc, state
-        else:
-            return out_cache_loc
-
-    def alloc_paged_token_slots_decode(
-        self,
-        seq_lens: jax.Array,
-        last_loc: jax.Array,
-        backup_state: bool = False,
-    ):
-        num_tokens = len(seq_lens) * self.token_to_kv_pool_allocator.page_size
-
-        self._evict_tree_cache_if_needed(num_tokens)
-
-        if backup_state:
-            state = self.token_to_kv_pool_allocator.backup_state()
-
-        out_cache_loc = self.token_to_kv_pool_allocator.alloc_decode(seq_lens, last_loc)
-        if out_cache_loc is None:
-            error_msg = (
-                f"Decode out of memory. Try to lower your batch size.\n"
-                f"Try to allocate {len(seq_lens)} tokens.\n"
-                f"{self._available_and_evictable_str()}"
-            )
-            logger.error(error_msg)
-            raise RuntimeError(error_msg)
-
-        if backup_state:
-            return out_cache_loc, state
-        else:
-            return out_cache_loc
-
     def prepare_for_extend(self):
         self.forward_mode = ForwardMode.EXTEND
 
@@ -607,7 +545,6 @@ class ScheduleBatch:
         req_pool_indices_device = jnp.array(req_pool_indices, dtype=jnp.int32)
         input_ids_device = jnp.array(sum(input_ids, []), dtype=jnp.int32)
         seq_lens_device = jnp.array(seq_lens, dtype=jnp.int32)
-        prefix_lens_device = jnp.array(prefix_lens, dtype=jnp.int32)
 
         # Copy prefix and do some basic check
         extend_input_logprob_token_ids = []
@@ -680,17 +617,8 @@ class ScheduleBatch:
             extend_input_logprob_token_ids = None
 
         # Allocate memory
-        if self.token_to_kv_pool_allocator.page_size == 1:
-            out_cache_loc = self.alloc_token_slots(extend_num_tokens)
-        else:
-            last_loc = get_last_loc(
-                self.req_to_token_pool.req_to_token,
-                req_pool_indices_device,
-                prefix_lens_device,
-            )
-            out_cache_loc = self.alloc_paged_token_slots_extend(
-                prefix_lens_device, seq_lens_device, last_loc, extend_num_tokens
-            )
+        assert self.token_to_kv_pool_allocator.page_size == 1
+        out_cache_loc = self.alloc_token_slots(extend_num_tokens)
 
         # Set fields
         self.input_ids = input_ids_device
@@ -725,12 +653,10 @@ class ScheduleBatch:
         )
 
     def new_page_count_next_decode(self):
-        page_size = self.token_to_kv_pool_allocator.page_size
-        if page_size == 1:
-            return len(self.reqs)
-        # In the decoding phase, the length of a request's KV cache should be
-        # the total length of the request minus 1
-        return sum(1 for req in self.reqs if (req.seqlen - 1) % page_size == 0)
+        assert (
+            self.token_to_kv_pool_allocator.page_size == 1
+        ), "token_to_kv_pool_allocator.page_size must be 1"
+        return len(self.reqs)
 
     def check_decode_mem(self, buf_multiplier=1):
         num_tokens = (
@@ -836,6 +762,12 @@ class ScheduleBatch:
         self.forward_mode = ForwardMode.DECODE
         bs = len(self.reqs)
 
+        # note: is_required = False
+        # if self.sampling_info.penalizer_orchestrator.is_required:
+        #     self.sampling_info.penalizer_orchestrator.cumulate_output_tokens(
+        #         self.output_ids.astype(jnp.int32)
+        #     )
+
         # Update fields
         self.input_ids = self.output_ids
         self.output_ids = None
@@ -846,15 +778,10 @@ class ScheduleBatch:
         self.seq_lens_sum += bs
 
         # Allocate memory
-        if self.token_to_kv_pool_allocator.page_size == 1:
-            self.out_cache_loc = self.alloc_token_slots(bs)
-        else:
-            last_loc = self.req_to_token_pool.req_to_token[
-                self.req_pool_indices, self.seq_lens - 2
-            ]
-            self.out_cache_loc = self.alloc_paged_token_slots_decode(
-                self.seq_lens, last_loc
-            )
+        assert (
+            self.token_to_kv_pool_allocator.page_size == 1
+        ), "token_to_kv_pool_allocator page_size must be 1"
+        self.out_cache_loc = self.alloc_token_slots(bs)
 
         self.req_to_token_pool.write(
             (self.req_pool_indices, locs), self.out_cache_loc.astype(jnp.int32)
@@ -1217,26 +1144,3 @@ class ModelWorkerBatch:
         print(f"{self.positions.shape=}, {self.positions.sharding=}")
         print(f"{self.extend_start_loc.shape=}, {self.extend_start_loc.sharding=}")
         print(f"{self.cache_loc.shape=}, {self.cache_loc.sharding=}")
-
-
-def get_last_loc(
-    req_to_token: jax.Array,
-    req_pool_indices_device: jax.Array,
-    prefix_lens_device: jax.Array,
-) -> jax.Array:
-    # TODO: support through Pallas
-    impl = get_last_loc_jax
-
-    return impl(req_to_token, req_pool_indices_device, prefix_lens_device)
-
-
-def get_last_loc_jax(
-    req_to_token: jax.Array,
-    req_pool_indices_device: jax.Array,
-    prefix_lens_device: jax.Array,
-) -> jax.Array:
-    return jnp.where(
-        prefix_lens_device > 0,
-        req_to_token[req_pool_indices_device, prefix_lens_device - 1],
-        jnp.full_like(prefix_lens_device, -1),
-    )
