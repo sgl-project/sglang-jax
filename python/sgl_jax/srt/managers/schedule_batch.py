@@ -898,7 +898,7 @@ class ScheduleBatch:
 
         input_ids_cpu = jax.device_get(self.input_ids.flatten())
         real_input_ids_len = len(input_ids_cpu)
-        out_cache_loc_cpu = jax.device_get(self.out_cache_loc)
+        out_cache_loc_cpu = jax.device_get(self.out_cache_loc) if self.out_cache_loc is not None else None
         seq_lens_cpu = jax.device_get(self.seq_lens)
         real_bs = len(seq_lens_cpu)
         req_pool_indices_cpu = jax.device_get(self.req_pool_indices)
@@ -925,18 +925,22 @@ class ScheduleBatch:
             )
 
         padded_input_ids_len = len(input_ids_cpu)
-        out_cache_loc_num_to_padding = padded_input_ids_len - len(out_cache_loc_cpu)
-        if out_cache_loc_num_to_padding > 0:
-            out_cache_loc_cpu = np.concatenate(
-                [
-                    out_cache_loc_cpu,
-                    np.array(
-                        [-1] * out_cache_loc_num_to_padding,
-                        dtype=out_cache_loc_cpu.dtype,
-                    ),
-                ],
-                axis=0,
-            )
+        if out_cache_loc_cpu is not None:
+            out_cache_loc_num_to_padding = padded_input_ids_len - len(out_cache_loc_cpu)
+            if out_cache_loc_num_to_padding > 0:
+                out_cache_loc_cpu = np.concatenate(
+                    [
+                        out_cache_loc_cpu,
+                        np.array(
+                            [-1] * out_cache_loc_num_to_padding,
+                            dtype=out_cache_loc_cpu.dtype,
+                        ),
+                    ],
+                    axis=0,
+                )
+        else:
+            # If out_cache_loc is None, create a new array with all -1s
+            out_cache_loc_cpu = np.array([-1] * padded_input_ids_len, dtype=np.int32)
 
         # Calculate positions and extend_start_loc after padding
         if self.forward_mode.is_extend():
