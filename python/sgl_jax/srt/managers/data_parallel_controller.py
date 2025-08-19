@@ -56,6 +56,9 @@ class DataParallelController:
             self.server_args.tp_size,
             self.server_args.dp_size,
         )
+        self.attn_tp_size = attn_tp_size
+        self.attn_dp_rank = attn_dp_rank
+        self.dp_rank = dp_rank
         logger.debug(
             f"DP rank: {dp_rank}, attn_dp_rank: {attn_dp_rank}, attn_tp_size: {attn_tp_size}"
         )
