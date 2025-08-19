@@ -974,9 +974,9 @@ class ScheduleBatch:
             batch_positions = seq_lens_cpu  # Next position is current seq_len
             # Create positions array matching the length of input_ids (including padding)
             positions = np.zeros(len(input_ids_cpu), dtype=batch_positions.dtype)
-            # Fill in the actual positions for the real tokens
-            # positions = positions.at[: len(batch_positions)].set(batch_positions)
-            positions[: len(batch_positions)] = batch_positions
+            # Fill in the actual positions for the real tokens, ensuring we don't exceed array bounds
+            num_real_tokens = min(len(batch_positions), len(positions))
+            positions[:num_real_tokens] = batch_positions[:num_real_tokens]
             # The padding tokens (if any) will have position 0, which is fine for padding
             # For decode, extend_start_loc is typically not used but we'll set it anyway
             extend_start_loc = np.arange(len(seq_lens_cpu), dtype=seq_lens_cpu.dtype)
