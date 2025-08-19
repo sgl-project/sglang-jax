@@ -208,7 +208,6 @@ def run_data_parallel_controller_process(
     pipe_writer,
 ):
     setproctitle.setproctitle("sgl-jax::data_parallel_controller")
-    configure_logger(server_args)
     parent_process = psutil.Process.parent()
 
     try:
