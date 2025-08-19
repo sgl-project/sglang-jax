@@ -15,6 +15,7 @@ try:
 except ImportError:
     setproctitle = None
 
+from sgl_jax.srt.layers.dp_attention import compute_dp_attention_world_info
 from sgl_jax.srt.managers.io_struct import (
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
@@ -49,7 +50,13 @@ class DataParallelController:
 
         # Launch local scheduler first
         self.scheduler_proc = None
-        self._launch_local_scheduler()
+        attn_tp_size, dp_rank = compute_dp_attention_world_info(
+            self.server_args.enable_dp_attention,
+            self.server_args.node_rank,
+            self.server_args.tp_size,
+            self.server_args.dp_size,
+        )
+        self._launch_local_scheduler(self.server_args, self.port_args, dp_rank, None)
 
         # Only node 0 sets up communication to all DP ranks
         if server_args.node_rank == 0:
@@ -79,7 +86,7 @@ class DataParallelController:
             args=(
                 self.server_args,
                 self.port_args,
-                None,
+                dp_rank,
                 writer,
             ),
         )
@@ -231,6 +238,3 @@ def run_data_parallel_controller_process(
         traceback = get_exception_traceback()
         logger.error(f"DataParallelController hit an exception: {traceback}")
         parent_process.send_signal(signal.SIGQUIT)
-    finally:
-        # we need to destruct mp.Manager() in balance_meta
-        balance_meta.destructor()

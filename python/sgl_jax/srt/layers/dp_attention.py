@@ -4,32 +4,18 @@ from typing import Tuple
 
 
 def compute_dp_attention_world_info(
-    enable_dp_attention: bool, tp_rank: int, tp_size: int, dp_size: int
-) -> Tuple[int, int, int]:
-    """
-    Compute DP attention world information.
-
-    Args:
-        enable_dp_attention: Whether DP attention is enabled
-        tp_rank: Tensor parallel rank (global scheduler rank)
-        tp_size: Total tensor parallel size (total number of schedulers)
-        dp_size: Data parallel size (number of DP groups)
-
-    Returns:
-        Tuple of (attn_tp_rank, attn_tp_size, attn_dp_rank)
-        - attn_tp_rank: The TP rank within this DP group (0 means first scheduler in group)
-        - attn_tp_size: Number of schedulers per DP group
-        - attn_dp_rank: Which DP group this scheduler belongs to
-    """
+    enable_dp_attention: bool,
+    node_rank: int,
+    tp_size: int,
+    dp_size: int,
+    node_tp_size: Optional[int] = 4,
+) -> Tuple[int, int]:
+    # dp rank, attention tp size
+    attn_tp_size = tp_size // dp_size
     if not enable_dp_attention:
-        return tp_rank, tp_size, 0
-
-    # Calculate DP group structure
-    attn_tp_size = tp_size // dp_size  # Number of schedulers per DP group
-    attn_dp_rank = tp_rank // attn_tp_size  # Which DP group this scheduler belongs to
-    attn_tp_rank = tp_rank % attn_tp_size  # Rank within the DP group
-
-    return attn_tp_rank, attn_tp_size, attn_dp_rank
+        return attn_tp_size, 0
+    attn_dp_rank = (node_rank * node_tp_size) // attn_tp_size
+    return attn_tp_size, attn_dp_rank
 
 
 def should_run_publisher(server_args) -> bool:
