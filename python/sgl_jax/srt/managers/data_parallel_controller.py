@@ -95,7 +95,7 @@ class DataParallelController:
             args=(
                 self.server_args,
                 self.port_args,
-                dp_rank,
+                self.dp_rank,
                 writer,
             ),
         )
@@ -129,12 +129,13 @@ class DataParallelController:
             dp_port_args = self.launch_dp_schedulers(self.server_args, self.port_args)
 
         if self.server_args.node_rank == 0:
-            self.workers[dp_rank] = get_zmq_socket(
-                self.context,
-                zmq.PUSH,
-                dp_port_args[dp_rank].scheduler_input_ipc_name,
-                True,
-            )
+            for dp_rank in range(self.server_args.dp_size):
+                self.workers[dp_rank] = get_zmq_socket(
+                    self.context,
+                    zmq.PUSH,
+                    dp_port_args[dp_rank].scheduler_input_ipc_name,
+                    True,
+                )
 
     def launch_dp_schedulers(self, server_args, port_args):
         base_gpu_id = 0
