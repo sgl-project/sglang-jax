@@ -1,6 +1,6 @@
 """Data parallel attention utilities for sgl-jax."""
 
-from typing import Tuple
+from typing import Optional, Tuple
 
 
 def compute_dp_attention_world_info(
