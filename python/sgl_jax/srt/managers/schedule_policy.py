@@ -255,12 +255,14 @@ class AddReqResult(Enum):
 class PrefillAdder:
     def __init__(
         self,
+        page_size: int,
         tree_cache: BasePrefixCache,
         token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
         running_batch: ScheduleBatch,
         new_token_ratio: float,
         rem_input_tokens: int,
     ):
+        self.page_size = page_size
         self.tree_cache = tree_cache
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
         self.running_batch = running_batch
@@ -307,7 +309,7 @@ class PrefillAdder:
         return available_and_evictable - self.cur_rem_token_offset
 
     def ceil_paged_tokens(self, tokens: int) -> int:
-        raise NotImplementedError()
+        return -(-tokens // self.page_size) * self.page_size
 
     def budget_state(self):
         if self.rem_total_tokens <= 0 or self.cur_rem_tokens <= 0:
@@ -322,7 +324,7 @@ class PrefillAdder:
         self, prefix_len: int, extend_input_len: int, max_new_tokens: int
     ):
         # TODO(lsyin): check this workaround logic, which only ensures the prefill will not out of memory, and may be too conservative
-        extend_input_len = extend_input_len
+        extend_input_len = self.ceil_paged_tokens(extend_input_len)
 
         self.rem_total_token_offset += extend_input_len + max_new_tokens
         self.cur_rem_token_offset += extend_input_len
@@ -340,6 +342,11 @@ class PrefillAdder:
             self.tree_cache.dec_lock_ref(last_node)
 
     def add_one_req_ignore_eos(self, req: Req):
+        if self.ceil_paged_tokens(req.extend_input_len) > min(
+            self.cur_rem_tokens, self.rem_total_tokens
+        ):
+            return AddReqResult.NO_TOKEN
+
         def add_req_state(r, insert_sort=False):
             new_token_ratio = (
                 1.0 if r.sampling_params.ignore_eos else self.new_token_ratio
@@ -403,7 +410,8 @@ class PrefillAdder:
         )
 
         # adjusting the input_tokens based on host_hit_length and page_size
-        real_input_tokens = req.extend_input_len
+        real_input_tokens = req.extend_input_len - req.host_hit_length
+        real_input_tokens = self.ceil_paged_tokens(real_input_tokens)
         prefix_len = len(req.prefix_indices)
 
         if total_tokens >= self.rem_total_tokens:
@@ -417,7 +425,7 @@ class PrefillAdder:
             if total_tokens >= self.rem_total_tokens:
                 return AddReqResult.NO_TOKEN
 
-            input_tokens = req.extend_input_len
+            input_tokens = self.ceil_paged_tokens(req.extend_input_len)
 
             if input_tokens >= self.rem_input_tokens and len(self.can_run_list) != 0:
                 return AddReqResult.OTHER

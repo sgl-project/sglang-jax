@@ -12,7 +12,7 @@ from sgl_jax.test.test_utils import (
 )
 
 
-class TestBaseTp(CustomTestCase):
+class TestPageSizeGreaterThanOne(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_MODEL_NAME_FOR_TEST
@@ -25,26 +25,22 @@ class TestBaseTp(CustomTestCase):
             other_args=[
                 "--trust-remote-code",
                 "--skip-server-warmup",
-                "--dist-init-addr",
-                "0.0.0.0:10011",
-                "--nnodes",
-                "1",
-                "--tp-size",
-                "4",
                 "--random-seed",
                 "3",
-                "--node-rank",
-                "0",
                 "--mem-fraction-static",
-                "0.1",
+                "0.2",
                 "--max-prefill-tokens",
-                "4096",
+                "8192",
                 "--download-dir",
                 "/tmp/",
                 "--dtype",
                 "bfloat16",
+                "--attention-backend",
+                "fa",
                 "--jax-precompile-prefill-token-paddings",
                 "16384",
+                "--page-size",
+                "128",
             ],
             env={
                 "JAX_COMPILATION_CACHE_DIR": "/tmp/jax_compilation_cache",
@@ -66,6 +62,7 @@ class TestBaseTp(CustomTestCase):
         )
 
         metrics = run_eval(args)
+        print(metrics)
         self.assertGreater(metrics["score"], 0.2)
 
 

@@ -301,6 +301,13 @@ class ModelRunner:
 
             return NativeAttention(self.num_attn_heads, self.num_kv_heads)
         elif self.server_args.attention_backend == "fa":
+            # FlashAttention requires num_kv_heads to be even for bfloat16 dtype packing
+            # For odd num_kv_heads, we handle it by replicating KV heads at runtime
+            if self.num_kv_heads % 2 != 0:
+                logger.info(
+                    f"FlashAttention: num_kv_heads={self.num_kv_heads} is odd. "
+                    "Will replicate KV heads at runtime to satisfy even requirement."
+                )
             from sgl_jax.srt.layers.attention.flashattention_backend import (
                 FlashAttention,
             )

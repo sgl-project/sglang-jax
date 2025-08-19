@@ -268,10 +268,10 @@ class RadixCache(BasePrefixCache):
         if self.page_size != 1:
             # create array on CPU
             with jax.default_device(self.cpu_device):
+                kv_indices_cpu = jax.device_put(kv_indices, self.cpu_device)
                 req.prefix_indices = jnp.concatenate(
-                    [new_indices, kv_indices[len(new_indices) :]]
+                    [new_indices, kv_indices_cpu[len(new_indices) :]]
                 )
-                req.prefix_indices = jax.device_put(req.prefix_indices, self.cpu_device)
         else:
             req.prefix_indices = new_indices
         req.last_node = new_last_node

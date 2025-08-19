@@ -74,4 +74,6 @@ class SchedulerMetricsMixin:
             f"#queue-req: {len(self.waiting_queue)}, "
         )
 
+        msg += f"#cache_miss: {batch.cache_miss_count}"
+
         logger.info(msg)

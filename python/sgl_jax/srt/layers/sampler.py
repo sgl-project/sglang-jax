@@ -37,7 +37,7 @@ class Sampler(nnx.Module):
         )
 
         if sampling_info.is_all_greedy:
-            batch_next_token_ids = jnp.argmax(logits, -1).reshape(-1, 1)
+            batch_next_token_ids = jnp.argmax(logits, -1).flatten()
         else:
             # Post process logits
             probs = jnp.divide(logits, sampling_info.temperatures)
@@ -97,4 +97,4 @@ def _sample_part_a(probs, top_ks, top_ps, need_min_p_sampling: bool, min_ps):
 @partial(jax.jit)
 def _sample_part_b(probs_idx, sampled_index):
     probs_idx = probs_idx.astype(jnp.int32)
-    return jnp.take_along_axis(probs_idx, axis=1, indices=sampled_index).reshape(-1, 1)
+    return jnp.take_along_axis(probs_idx, axis=1, indices=sampled_index).flatten()

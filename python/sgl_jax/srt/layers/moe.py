@@ -117,7 +117,7 @@ class GateLogit(nnx.Module):
         return output
 
 
-class Qwen3MoE(nnx.Module):
+class FuseMoE(nnx.Module):
     def __init__(
         self,
         config,
@@ -200,7 +200,7 @@ class Qwen3MoE(nnx.Module):
     @trace_function(stage="MOE_SPARSE_FORWARD", include_args=False, include_output=True)
     def __call__(self, inputs, router_logits=None):
         if router_logits is None:
-            raise ValueError("router_logits is required for Qwen3MoE")
+            raise ValueError("router_logits is required for FuseMoE")
 
         inputs = inputs.astype(self.dtype)
         total_tokens, hidden_dim = inputs.shape
@@ -245,7 +245,7 @@ class Qwen3MoE(nnx.Module):
                 top_k_logits.astype(jnp.bfloat16), axis=-1
             ).astype(self.dtype)
 
-            # qwen3 moe norm_topk_prob=true
+            # fuse moe norm_topk_prob=true
             top_k_weights = top_k_weights / jnp.sum(
                 top_k_weights, axis=-1, keepdims=True
             )

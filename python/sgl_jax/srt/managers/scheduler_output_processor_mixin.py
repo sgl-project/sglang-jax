@@ -42,15 +42,17 @@ class SchedulerOutputProcessorMixin:
             next_token_ids,
             extend_input_len_per_req,
             extend_logprob_start_len_per_req,
+            cache_miss_count,
         ) = (
             result.logits_output,
             result.next_token_ids,
             result.extend_input_len_per_req,
             result.extend_logprob_start_len_per_req,
+            result.cache_miss_count,
         )
 
         # Move next_token_ids and logprobs to cpu
-        next_token_ids = jax.device_get(next_token_ids)
+        next_token_ids = jax.device_get(next_token_ids).tolist()
         if batch.return_logprob:
             if logits_output.next_token_logprobs is not None:
                 logits_output.next_token_logprobs = jax.device_get(
@@ -95,6 +97,13 @@ class SchedulerOutputProcessorMixin:
 
         self.set_next_batch_sampling_info_done(batch)
 
+        batch.cache_miss_count = cache_miss_count
+
+        if cache_miss_count > 0:
+            logger.info(
+                f"Prefill batch. #bid: {result.bid}, #cache_miss: {cache_miss_count}"
+            )
+
         self.stream_output(batch.reqs, batch.return_logprob, skip_stream_req)
 
     def process_batch_result_decode(
@@ -102,14 +111,15 @@ class SchedulerOutputProcessorMixin:
         batch: ScheduleBatch,
         result: GenerationBatchResult,
     ):
-        logits_output, next_token_ids = (
+        logits_output, next_token_ids, cache_miss_count = (
             result.logits_output,
             result.next_token_ids,
+            result.cache_miss_count,
         )
         self.num_generated_tokens += len(batch.reqs)
 
         # spec decoding handles output logprobs inside verify process.
-        next_token_ids = jax.device_get(next_token_ids)
+        next_token_ids = jax.device_get(next_token_ids).tolist()
         if batch.return_logprob:
             next_token_logprobs = jax.device_get(logits_output.next_token_logprobs)
 
@@ -152,8 +162,12 @@ class SchedulerOutputProcessorMixin:
         self.token_to_kv_pool_allocator.free_group_end()
 
         self.forward_ct_decode = (self.forward_ct_decode + 1) % (1 << 30)
+        batch.cache_miss_count = cache_miss_count
 
-        if self.forward_ct_decode % self.server_args.decode_log_interval == 0:
+        if (
+            self.forward_ct_decode % self.server_args.decode_log_interval == 0
+            or batch.cache_miss_count > 0
+        ):
             self.log_decode_stats(running_batch=batch)
 
     def add_input_logprob_return_values(

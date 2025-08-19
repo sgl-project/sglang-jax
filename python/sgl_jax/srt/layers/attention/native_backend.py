@@ -120,11 +120,11 @@ class NativeAttention(AttentionBackend):
         """
         if forward_batch.forward_mode == ForwardMode.EXTEND:
             forward_batch.token_to_kv_pool.set_kv_buffer(
-                layer_id, forward_batch.out_cache_loc, k, v
+                layer_id, forward_batch.out_cache_loc, k, v, is_decode=False
             )
         else:
             forward_batch.token_to_kv_pool.set_kv_buffer(
-                layer_id, forward_batch.out_cache_loc, k, v
+                layer_id, forward_batch.out_cache_loc, k, v, is_decode=True
             )
 
         k, v = forward_batch.token_to_kv_pool.get_kv_buffer(layer_id)
