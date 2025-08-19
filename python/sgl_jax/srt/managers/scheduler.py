@@ -616,6 +616,7 @@ class Scheduler(
 
         # Prefill policy
         adder = PrefillAdder(
+            self.page_size,
             self.tree_cache,
             self.token_to_kv_pool_allocator,
             self.running_batch,
