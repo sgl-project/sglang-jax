@@ -2,11 +2,10 @@ import functools
 import time
 
 import jax
-import jax.numpy as jnp
 import numpy as np
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
-from utils import create_bench_data, create_random_start_loc
+from utils import create_bench_data, create_input_params
 
 from sgl_jax.srt.mem_cache.memory_pool import (
     cdiv,
@@ -22,6 +21,7 @@ def benchmark_backend(
     kv_cache_start_loc,
     new_kv_start_loc,
     slice_lens,
+    update_slices_num,
     num_slices_per_block,
     page_size=1,
 ):
@@ -35,8 +35,9 @@ def benchmark_backend(
         jax.jit,
         static_argnames=["page_size", "num_slices_per_block"],
     )
-    def wrap_kv_cache_update(new_value, cache, slices, page_size, num_slices_per_block):
-        num_kv_update_slices = new_value.shape[0]
+    def wrap_kv_cache_update(
+        new_value, cache, slices, page_size, num_kv_update_slices, num_slices_per_block
+    ):
         num_kv_heads = new_value.shape[1]
         head_dim = new_value.shape[2]
         in_specs = [
@@ -74,7 +75,7 @@ def benchmark_backend(
 
     # warmup
     out = wrap_kv_cache_update(
-        new_value, cache, slices, page_size, num_slices_per_block
+        new_value, cache, slices, page_size, update_slices_num, num_slices_per_block
     )
     jax.block_until_ready(out)
 
@@ -83,7 +84,7 @@ def benchmark_backend(
     for i in range(3):
         start = time.perf_counter()
         out = wrap_kv_cache_update(
-            new_value, cache, slices, page_size, num_slices_per_block
+            new_value, cache, slices, page_size, update_slices_num, num_slices_per_block
         )
         jax.block_until_ready(out)
         times.append(time.perf_counter() - start)
@@ -92,9 +93,10 @@ def benchmark_backend(
 
 
 def main():
-    head_num_config = [2, 4, 8, 16]
-    max_cache_len_config = [10000, 20000, 40000, 80000, 120000]
-    new_kv_len_config = [100, 500, 1000, 2000, 5000, 10000, 20000, 30000, 50000]
+    page_size = 128
+    head_num_config = [8, 16]
+    max_cache_len_config = [80000, 120000]
+    new_kv_len_config = [10000, 20000, 30000, 50000]
     head_dim_config = [128]
 
     configs = []
@@ -109,12 +111,17 @@ def main():
     for config in configs:
         head_num, max_cache_len, new_value_len, head_dim = config
         new_value, cache = create_bench_data(
-            max_cache_len, new_value_len, head_num, head_dim
+            max_cache_len,
+            new_value_len,
+            head_num,
+            head_dim,
         )
-        max_num_slices_per_block_config = get_num_slices_per_block(new_value, cache)
-        random_cache_loc = create_random_start_loc(max_cache_len, new_value_len)
-        new_value_start_loc = jnp.arange(new_value_len, dtype=jnp.int32)
-        slice_lens = jnp.ones(new_value_len, dtype=jnp.int32)
+        max_num_slices_per_block_config = get_num_slices_per_block(
+            new_value, cache, page_size
+        )
+        random_cache_loc, slice_lens, new_value_start_loc, update_slices_num = (
+            create_input_params(max_cache_len, new_value_len, page_size=page_size)
+        )
 
         print(
             f"###### HEAD_NUM: {head_num}, MAX_CACHE_LEN: {max_cache_len}, NEW_KV_LEN: {new_value_len}, HEAD_DIM: {head_dim} ######"
@@ -128,7 +135,9 @@ def main():
                 random_cache_loc,
                 new_value_start_loc,
                 slice_lens,
+                update_slices_num,
                 nspb,
+                page_size=page_size,
             )
 
             print(

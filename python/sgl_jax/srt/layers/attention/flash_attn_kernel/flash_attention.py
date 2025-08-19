@@ -34,8 +34,9 @@ DEFAULT_MASK_VALUE = -0.7 * float(jnp.finfo(jnp.dtype("float32")).max)
 
 TUNED_BLOCK_SIZES = {
     "TPU v6": {
-        # (q_dtype, kv_dtype, num_q_heads_per_blk, num_kv_heads_per_blk, head_dim, page_size, total_input_tokens, pages_per_seq)
-        ("bfloat16", "bfloat16", 2, 2, 128, 1, 1024): (8, 32),
+        # (q_dtype, kv_dtype, num_kv_heads_per_blk, head_dim, page_size)
+        ("bfloat16", "bfloat16", 8, 128, 128): (16, 32),
+        ("bfloat16", "bfloat16", 16, 128, 128): (8, 32),
         # go/keep-sorted end
     },
 }
@@ -44,12 +45,9 @@ TUNED_BLOCK_SIZES = {
 def get_tuned_block_sizes(
     q_dtype,
     kv_dtype,
-    num_q_heads_per_blk,
     num_kv_heads_per_blk,
     head_dim,
     page_size,
-    total_input_tokens,
-    pages_per_seq,
 ) -> tuple[int, int]:
     """Look up for the best (num_kv_pages_per_blk, num_queries_per_blk) from auto-tuned table."""
     tpu_version = tbs.get_tpu_version()
@@ -58,11 +56,9 @@ def get_tuned_block_sizes(
     key = (
         q_dtype,
         kv_dtype,
-        num_q_heads_per_blk,
         num_kv_heads_per_blk,
         head_dim,
         page_size,
-        pages_per_seq,
     )
     key = tbs.simplify_key(key)
     device_name = tbs.get_device_name()

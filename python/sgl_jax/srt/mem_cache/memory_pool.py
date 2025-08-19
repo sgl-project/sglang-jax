@@ -660,7 +660,7 @@ def kv_cache_update_kernel(
         async_copy.wait()
 
 
-def get_num_slices_per_block(new_kv: jax.Array, kv_cache: jax.Array):
+def get_num_slices_per_block(new_kv: jax.Array, kv_cache: jax.Array, page_size=128):
     """
     new_kv: [total_num_token, num_combined_kv_heads, head_dim]
     kv_cache: [max_num_tokens, num_combined_kv_heads, head_dim]
@@ -680,7 +680,7 @@ def get_num_slices_per_block(new_kv: jax.Array, kv_cache: jax.Array):
     head_dim = new_kv.shape[2]
 
     max_num_slices_per_block = VMEM_SIZE // (
-        bytes_per_element * PAGE_SIZE * kv_head_num * head_dim
+        bytes_per_element * page_size * kv_head_num * head_dim
     )
     assert (
         max_num_slices_per_block > 0
