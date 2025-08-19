@@ -796,7 +796,7 @@ class PortArgs:
             dist_init_addr = server_args.dist_init_addr.split(":")
             dist_init_host, dist_init_port = dist_init_addr
             port_base = int(dist_init_port) + 1
-        if not server_args.enable_dp_attention:
+        if not server_args.enable_dp_attention and server_args.nnodes == 1:
             return PortArgs(
                 tokenizer_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
                 scheduler_input_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
@@ -833,17 +833,20 @@ class PortArgs:
             detokenizer_port = port_base + 1
             rpc_port = port_base + 2
             metrics_ipc_name = port_base + 3
+            pub_sub_port = port_base + 4
+            pub_sub_sync_port = port_base + 5
             if dp_rank is None:
                 # TokenizerManager to DataParallelController
-                scheduler_input_port = port_base + 4
+                scheduler_input_port = port_base + 6 + 1
             else:
-                scheduler_input_port = port_base + 4 + 1 + dp_rank
+                scheduler_input_port = port_base + 6 + 1 + dp_rank
 
             return PortArgs(
                 tokenizer_ipc_name=f"tcp://{dist_init_host}:{port_base}",
                 scheduler_input_ipc_name=f"tcp://{dist_init_host}:{scheduler_input_port}",
                 detokenizer_ipc_name=f"tcp://{dist_init_host}:{detokenizer_port}",
-                nccl_port=nccl_port,
                 rpc_ipc_name=f"tcp://{dist_init_host}:{rpc_port}",
                 metrics_ipc_name=f"tcp://{dist_init_host}:{metrics_ipc_name}",
+                pub_sub_addr=f"tcp://{dist_init_host}:{pub_sub_port}",
+                pub_sub_sync_addr=f"tcp://{dist_init_host}:{pub_sub_sync_port}",
             )
