@@ -108,17 +108,38 @@ class ModelWorker:
         # A reference make this class has the same member as TpModelWorkerClient
         self.worker = self
 
+        # normalize server_args.jax_precompile_prefill_token_paddings
+        # ensure every token padding value is not less than max_runnig_requests
+        self.normalize_token_paddings(server_args, self.max_running_requests)
+
         # precompile
         self.precompile_prefill_token_paddings = (
             server_args.jax_precompile_prefill_token_paddings
-            if server_args.jax_precompile_prefill_token_paddings is not None
-            else JAX_PRECOMPILE_DEFAULT_PREFILL_TOKEN_PADDINGS
         )
         self.precompile_decode_bs_paddings = (
             server_args.jax_precompile_decode_bs_paddings
             if server_args.jax_precompile_decode_bs_paddings is not None
             else JAX_PRECOMPILE_DEFAULT_DECODE_BS_PADDINGS
         )
+
+    def normalize_token_paddings(
+        self, server_args: ServerArgs, max_running_requests: int
+    ):
+        normalized_token_paddings = []
+        if server_args.jax_precompile_prefill_token_paddings is None:
+            server_args.jax_precompile_prefill_token_paddings = (
+                JAX_PRECOMPILE_DEFAULT_PREFILL_TOKEN_PADDINGS
+            )
+        for item in server_args.jax_precompile_prefill_token_paddings:
+            if item >= self.max_running_requests:
+                normalized_token_paddings.append(item)
+        if len(normalized_token_paddings) == 0:
+            normalized_token_paddings.append(self.max_running_requests)
+            logger.warning(
+                f"Every padding of {server_args.jax_precompile_prefill_token_paddings=} is less than {max_running_requests=}, so set token_paddings as {normalized_token_paddings}"
+            )
+
+        server_args.jax_precompile_prefill_token_paddings = normalized_token_paddings
 
     def run_precompile(self):
         self.precompile_extend()
@@ -247,11 +268,15 @@ class ModelWorker:
         model_worker_batch: ModelWorkerBatch,
         launch_done: Optional[threading.Event] = None,
         skip_sample: bool = False,
-    ) -> Tuple[Union[LogitsProcessorOutput, jax.Array], Optional[jax.Array]]:
+    ) -> Tuple[Union[LogitsProcessorOutput, jax.Array, int], Optional[jax.Array]]:
         forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
+
+        cache_miss_count = 0
         import jax._src.test_util as jtu
 
-        logits_output = self.model_runner.forward(forward_batch)
+        with jtu.count_pjit_cpp_cache_miss() as count:
+            logits_output = self.model_runner.forward(forward_batch)
+            cache_miss_count = count()
 
         if launch_done is not None:
             launch_done.set()
@@ -267,7 +292,11 @@ class ModelWorker:
                 model_worker_batch.extend_seq_lens[: model_worker_batch.real_bs] - 1
             )
 
-        return logits_output.truncate_logits_processor_output(idx), next_token_ids[idx]
+        return (
+            logits_output.truncate_logits_processor_output(idx),
+            next_token_ids[idx],
+            cache_miss_count,
+        )
 
 
 class MockModelWorker:
