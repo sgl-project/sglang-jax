@@ -233,6 +233,16 @@ class Scheduler(
             jax.distributed.initialize(
                 server_args.dist_init_addr, self.nnodes, self.node_rank
             )
+        logger.debug(f"Node {self.node_rank} initialized JAX distributed")
+        attn_tp_size, attn_dp_rank, dp_rank = compute_dp_attention_world_info(
+            self.server_args.enable_dp_attention,
+            self.node_rank,
+            self.server_args.tp_size,
+            self.server_args.dp_size,
+        )
+        logger.debug(
+            f"Node {self.node_rank} attn_tp_size: {attn_tp_size}, attn_dp_rank: {attn_dp_rank}, dp_rank: {dp_rank}"
+        )
         self.mesh = create_device_mesh(
             ici_parallelism=[-1, self.tp_size, 1, 1], dcn_parallelism=[1, 1, 1, 1]
         )
