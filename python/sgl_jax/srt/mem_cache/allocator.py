@@ -57,8 +57,8 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
     def merge_and_sort_free(self):
         if len(self.release_pages) > 0:
             self.free_pages = np.concatenate((self.free_pages, self.release_pages))
-            self.free_pages, _ = np.sort(self.free_pages)
-            self.release_pages = np.empty((0,), dtype=self.release_pages.dtype)
+            self.free_pages = np.sort(self.free_pages)
+            self.release_pages = np.empty((0,), dtype=np.int32)
 
     def get_cpu_copy(self, *args, **kwargs):
         # JAX equivalent would be device_get

@@ -70,8 +70,8 @@ class FlashAttention(AttentionBackend):
         num_kv_heads,
         head_dim,
         vmem_limit_bytes: int = 32 * (1 << 20),  # 32MB
-        max_num_kv_pages_per_block: int = 64,
-        max_num_queries_per_block: int = 256,
+        max_num_kv_pages_per_block: int = 16,
+        max_num_queries_per_block: int = 32,
         page_size: int = 1,
     ):
         self.vmem_limit_bytes = vmem_limit_bytes
