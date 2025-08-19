@@ -24,6 +24,7 @@ except ImportError:
 from sgl_jax.global_config import global_config
 from sgl_jax.srt.configs.model_config import ModelConfig
 from sgl_jax.srt.hf_transformers_utils import get_tokenizer
+from sgl_jax.srt.layers.dp_attention import compute_dp_attention_world_info
 from sgl_jax.srt.layers.logits_processor import LogitsProcessorOutput
 from sgl_jax.srt.managers.dp_batch_sync import create_dp_batch_synchronizer
 from sgl_jax.srt.managers.dp_communication import create_dp_communicator
