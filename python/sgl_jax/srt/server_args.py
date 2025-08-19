@@ -432,6 +432,23 @@ class ServerArgs:
             action="store_true",
             help="Disable the hybrid SWA memory.",
         )
+        parser.add_argument(
+            "--attention-window-size",
+            type=int,
+            default=ServerArgs.attention_window_size,
+            help="Sliding window size for attention. When specified, enables sliding window attention.",
+        )
+        parser.add_argument(
+            "--enable-swa",
+            action="store_true",
+            help="Enable sliding window attention.",
+        )
+        parser.add_argument(
+            "--swa-chunk-size",
+            type=int,
+            default=ServerArgs.swa_chunk_size,
+            help="Chunk size for SWA eviction.",
+        )
 
         # Runtime options
         parser.add_argument(

@@ -193,7 +193,8 @@ class Req:
         # For chunked prefill
         self.is_chunked = 0
         
-        self.evicted_seqlen_local = 0
+        # For SWA (Sliding Window Attention)
+        self.evicted_seqlen_local = 0  # Number of tokens evicted locally for SWA
 
         # Incremental streamining
         self.send_token_offset: int = 0
