@@ -40,7 +40,7 @@ class TestPageSizeGreaterThanOne(CustomTestCase):
                 "--jax-precompile-prefill-token-paddings",
                 "16384",
                 "--page-size",
-                "128"
+                "128",
             ],
             env={
                 "JAX_COMPILATION_CACHE_DIR": "/tmp/jax_compilation_cache",
