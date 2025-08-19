@@ -56,6 +56,9 @@ class DataParallelController:
             self.server_args.tp_size,
             self.server_args.dp_size,
         )
+        logger.debug(
+            f"DP rank: {dp_rank}, attn_dp_rank: {attn_dp_rank}, attn_tp_size: {attn_tp_size}"
+        )
         self._launch_local_scheduler(self.server_args, self.port_args, dp_rank, None)
 
         # Only node 0 sets up communication to all DP ranks

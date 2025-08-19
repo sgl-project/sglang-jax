@@ -438,6 +438,9 @@ def _launch_subprocesses(
         scheduler_pipe_readers.append(reader)
     else:
         # Multi-node DP deployment
+        logger.debug(
+            f"Launching DataParallel controller on node {server_args.node_rank}"
+        )
         reader, writer = mp.Pipe(duplex=False)
         proc = mp.Process(
             target=run_data_parallel_controller_process,
