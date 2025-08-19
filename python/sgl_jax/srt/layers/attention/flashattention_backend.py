@@ -198,8 +198,22 @@ class FlashAttention(AttentionBackend):
         out_specs = P(None, kv_partition_axis)
 
         def _ragged_paged_attention(*args):
+            q, k_buffer, v_buffer = args[:3]
+            other_args = args[3:]
+
+            # Handle FlashAttention even head requirement by replicating KV heads if needed
+            # This preserves GQA semantics: multiple Q heads share the same KV head
+            if k_buffer.shape[-2] % 2 != 0:
+                # Replicate the KV heads to make the count even
+                # For GQA, this is semantically correct as Q heads share KV heads anyway
+                k_buffer = jnp.concatenate([k_buffer, k_buffer[..., -1:, :]], axis=-2)
+                v_buffer = jnp.concatenate([v_buffer, v_buffer[..., -1:, :]], axis=-2)
+
             return ragged_paged_attention(
-                *args,
+                q,
+                k_buffer,
+                v_buffer,
+                *other_args,
                 sm_scale=scale,
                 sliding_window=None,
                 soft_cap=None,
