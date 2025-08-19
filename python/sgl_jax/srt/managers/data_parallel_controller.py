@@ -174,7 +174,7 @@ class DataParallelController:
         return dp_port_args
 
     def launch_dp_attention_schedulers(self, server_args, port_args):
-        self.launch_tensor_parallel_group(server_args, port_args, 0, None)
+        # self.launch_tensor_parallel_group(server_args, port_args, 0, None)
         dp_port_args = []
         for dp_rank in range(server_args.dp_size):
             dp_port_args.append(PortArgs.init_new(server_args, dp_rank))
