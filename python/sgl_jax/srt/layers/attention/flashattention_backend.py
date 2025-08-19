@@ -217,8 +217,12 @@ class FlashAttention(AttentionBackend):
             check_vma=False,
         )(
             q.reshape(q.shape[0], -1, self.head_dim),
-            k_buffer[:, None, :, :],
-            v_buffer[:, None, :, :],
+            k_buffer.reshape(
+                k_buffer.shape[0] // self.page_size, self.page_size, -1, self.head_dim
+            ),
+            v_buffer.reshape(
+                v_buffer.shape[0] // self.page_size, self.page_size, -1, self.head_dim
+            ),
             self.forward_metadata.page_indices,
             self.forward_metadata.cu_q_lens,
             self.forward_metadata.cu_kv_lens,
@@ -243,11 +247,11 @@ class FlashAttention(AttentionBackend):
         """
         if forward_batch.forward_mode == ForwardMode.EXTEND:
             forward_batch.token_to_kv_pool.set_kv_buffer(
-                layer_id, forward_batch.out_cache_loc, k, v
+                layer_id, forward_batch.out_cache_loc, k, v, is_decode=False
             )
         else:
             forward_batch.token_to_kv_pool.set_kv_buffer(
-                layer_id, forward_batch.out_cache_loc, k, v
+                layer_id, forward_batch.out_cache_loc, k, v, is_decode=True
             )
 
         return forward_batch.token_to_kv_pool.get_kv_buffer(layer_id)

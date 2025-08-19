@@ -346,6 +346,7 @@ class PrefillAdder:
             self.cur_rem_tokens, self.rem_total_tokens
         ):
             return AddReqResult.NO_TOKEN
+
         def add_req_state(r, insert_sort=False):
             new_token_ratio = (
                 1.0 if r.sampling_params.ignore_eos else self.new_token_ratio

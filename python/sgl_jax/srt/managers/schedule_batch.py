@@ -526,7 +526,7 @@ class ScheduleBatch:
             raise RuntimeError(error_msg)
 
         return out_cache_loc
-    
+
     def alloc_paged_token_slots_extend(
         self,
         prefix_lens: jax.Array,
