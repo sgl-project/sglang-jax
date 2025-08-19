@@ -60,6 +60,9 @@ class ServerArgs:
     page_size: int = 1
     swa_full_tokens_ratio: float = 0.8
     disable_hybrid_swa_memory: bool = False
+    attention_window_size: Optional[int] = None  # Sliding window size for attention
+    enable_swa: bool = False  # Enable sliding window attention
+    swa_chunk_size: int = 256  # Chunk size for SWA eviction
 
     # Runtime options
     device: Optional[str] = None

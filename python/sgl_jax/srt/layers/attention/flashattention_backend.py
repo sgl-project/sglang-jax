@@ -73,6 +73,7 @@ class FlashAttention(AttentionBackend):
         max_num_kv_pages_per_block: int = 64,
         max_num_queries_per_block: int = 256,
         page_size: int = 1,
+        sliding_window: int = None,
     ):
         self.vmem_limit_bytes = vmem_limit_bytes
         self.num_heads = num_attn_heads
@@ -84,6 +85,7 @@ class FlashAttention(AttentionBackend):
         self.max_num_kv_pages_per_block = max_num_kv_pages_per_block
         self.max_num_queries_per_block = max_num_queries_per_block
         self.page_size = page_size
+        self.sliding_window = sliding_window
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init the metadata for a forward pass."""
@@ -139,6 +141,7 @@ class FlashAttention(AttentionBackend):
             "max_num_kv_pages_per_block": self.max_num_kv_pages_per_block,
             "max_num_queries_per_block": self.max_num_queries_per_block,
             "page_size": self.page_size,
+            "sliding_window": self.sliding_window,
         }
         return (children, aux_data)
 
@@ -152,6 +155,7 @@ class FlashAttention(AttentionBackend):
             aux_data["max_num_kv_pages_per_block"],
             aux_data["max_num_queries_per_block"],
             aux_data["page_size"],
+            aux_data.get("sliding_window", None),
         )
 
         obj.forward_metadata = children[0]
@@ -215,7 +219,7 @@ class FlashAttention(AttentionBackend):
                 v_buffer,
                 *other_args,
                 sm_scale=scale,
-                sliding_window=None,
+                sliding_window=self.sliding_window,
                 soft_cap=None,
                 mask_value=None,
                 num_kv_pages_per_block=self.forward_metadata.num_kv_pages_per_block,

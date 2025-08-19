@@ -46,7 +46,7 @@ from sgl_jax.srt.managers.scheduler_profiler_mixing import SchedulerProfilerMixi
 from sgl_jax.srt.managers.tp_worker import ModelWorker
 from sgl_jax.srt.managers.utils import validate_input_length
 from sgl_jax.srt.mem_cache.radix_cache import RadixCache
-from sgl_jax.srt.mem_cache.chunk_cache import ChunkCache
+from sgl_jax.srt.mem_cache.chunk_cache import ChunkCache, SWAChunkCache
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
 from sgl_jax.srt.server_args import PortArgs, ServerArgs
 from sgl_jax.srt.utils.common_utils import (
@@ -366,12 +366,18 @@ class Scheduler(
 
         # Choose cache type based on configuration
         if server_args.disable_radix_cache:
-            # Use ChunkCache when RadixCache is disabled
-            self.tree_cache = ChunkCache(
-                req_to_token_pool=self.req_to_token_pool,
-                token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
-                page_size=self.page_size,
-            )
+            if server_args.enable_swa:
+                self.tree_cache = SWAChunkCache(
+                    req_to_token_pool=self.req_to_token_pool,
+                    token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                    page_size=self.page_size,
+                )
+            else:
+                self.tree_cache = ChunkCache(
+                    req_to_token_pool=self.req_to_token_pool,
+                    token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                    page_size=self.page_size,
+                )
         else:
             # Use RadixCache when enabled
             self.tree_cache = RadixCache(
@@ -699,6 +705,16 @@ class Scheduler(
         )
 
         new_batch.prepare_for_extend()
+
+        if self.server_args.enable_swa and hasattr(self.tree_cache, 'evict_swa'):
+            for req in can_run_list:
+                if req.extend_input_len > 0:
+                    prelen = len(req.prefix_indices) + req.extend_input_len
+                    self.tree_cache.evict_swa(
+                        req, 
+                        prelen, 
+                        self.server_args.swa_chunk_size
+                    )
 
         new_batch.decoding_reqs = None
 
