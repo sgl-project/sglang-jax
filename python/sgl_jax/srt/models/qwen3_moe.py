@@ -13,7 +13,7 @@ from sgl_jax.srt.layers.embeddings import Embed, ParallelLMHead, RotaryEmbedding
 from sgl_jax.srt.layers.layernorm import RMSNorm
 from sgl_jax.srt.layers.linear import LinearBase
 from sgl_jax.srt.layers.logits_processor import LogitsProcessor
-from sgl_jax.srt.layers.moe import FuseMoE, GateLogit
+from sgl_jax.srt.layers.moe import EPMoE, GateLogit
 from sgl_jax.srt.layers.radix_attention import RadixAttention
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
 from sgl_jax.srt.models.qwen3 import Qwen3MLP
@@ -186,7 +186,7 @@ class QWen3MoeDecoderLayer(nnx.Module):
                 rngs=rngs,
             )
             with mesh:
-                self.mlp = FuseMoE(
+                self.mlp = EPMoE(
                     config=config,
                     num_experts=num_experts,
                     num_experts_per_tok=num_experts_per_tok,

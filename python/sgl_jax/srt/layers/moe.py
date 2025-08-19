@@ -117,7 +117,7 @@ class GateLogit(nnx.Module):
         return output
 
 
-class FuseMoE(nnx.Module):
+class EPMoE(nnx.Module):
     def __init__(
         self,
         config,
@@ -200,7 +200,7 @@ class FuseMoE(nnx.Module):
     @trace_function(stage="MOE_SPARSE_FORWARD", include_args=False, include_output=True)
     def __call__(self, inputs, router_logits=None):
         if router_logits is None:
-            raise ValueError("router_logits is required for FuseMoE")
+            raise ValueError("router_logits is required for EPMoE")
 
         inputs = inputs.astype(self.dtype)
         total_tokens, hidden_dim = inputs.shape
@@ -245,7 +245,7 @@ class FuseMoE(nnx.Module):
                 top_k_logits.astype(jnp.bfloat16), axis=-1
             ).astype(self.dtype)
 
-            # fuse moe norm_topk_prob=true
+            # ep moe norm_topk_prob=true
             top_k_weights = top_k_weights / jnp.sum(
                 top_k_weights, axis=-1, keepdims=True
             )
