@@ -209,7 +209,7 @@ def run_data_parallel_controller_process(
     pipe_writer,
 ):
     setproctitle.setproctitle("sgl-jax::data_parallel_controller")
-    parent_process = psutil.Process.parent(self)
+    parent_process = psutil.Process().parent()
 
     try:
         controller = DataParallelController(server_args, port_args)
