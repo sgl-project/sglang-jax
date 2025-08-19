@@ -499,7 +499,7 @@ class Scheduler(
         # Import here to avoid circular dependency
         from sgl_jax.srt.layers.dp_attention import compute_dp_attention_world_info
 
-        attn_tp_rank, attn_tp_size, attn_dp_rank = compute_dp_attention_world_info(
+        attn_tp_size, attn_dp_rank = compute_dp_attention_world_info(
             self.server_args.enable_dp_attention,
             self.node_rank,  # tp_rank = scheduler's global rank
             self.server_args.tp_size,  # total schedulers

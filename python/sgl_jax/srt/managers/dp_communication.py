@@ -195,7 +195,7 @@ def create_dp_communicator(server_args) -> Optional[DPGroupCommunicator]:
     # Import here to avoid circular dependency
     from sgl_jax.srt.layers.dp_attention import compute_dp_attention_world_info
 
-    attn_tp_rank, attn_tp_size, attn_dp_rank = compute_dp_attention_world_info(
+    attn_tp_size, attn_dp_rank = compute_dp_attention_world_info(
         server_args.enable_dp_attention,
         server_args.node_rank,  # tp_rank = scheduler's global rank
         server_args.tp_size,  # total schedulers
