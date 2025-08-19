@@ -345,6 +345,8 @@ class PrefillAdder:
         truncated = req.extend_input_len > self.rem_chunk_tokens
         req.extend_input_len = min(req.extend_input_len, self.rem_chunk_tokens)
         req.fill_ids = req.fill_ids[: len(req.prefix_indices) + req.extend_input_len]
+        # Recalculate extend_input_len based on the truncated fill_ids
+        req.extend_input_len = len(req.fill_ids) - len(req.prefix_indices)
         
         self.can_run_list.append(req)
         self._update_prefill_budget(
