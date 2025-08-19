@@ -13,7 +13,7 @@ from transformers import AutoTokenizer
 from sgl_jax.srt.configs.load_config import LoadConfig, LoadFormat
 from sgl_jax.srt.configs.model_config import ModelConfig
 from sgl_jax.srt.debug_tracer import global_tracer
-from sgl_jax.srt.layers.logits_processor import LogitsProcessorOutput
+from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessorOutput
 from sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch
 from sgl_jax.srt.mem_cache.memory_pool import ReqToTokenPool
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
@@ -168,7 +168,6 @@ class TestModelRunner(unittest.TestCase):
                 top_ps=jnp.full((1, 1), 1.0),
                 top_ks=jnp.ones((1, 1)),
                 min_ps=jnp.full((1, 1), 0.0),
-                vocab_size=self.model_config.vocab_size,
             ),
         )
         return worker_batch
@@ -227,7 +226,9 @@ class TestModelRunner(unittest.TestCase):
         model_worker_batch = self._new_forward_batch(extend_input_ids, extend_positions)
         extend_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
         with self.mesh:
-            extend_output = self.model_runner.forward(extend_batch)
+            extend_output = self.model_runner.forward(
+                extend_batch, LogitsMetadata.from_model_worker_batch(model_worker_batch)
+            )
 
         # Verify forward_pass_id incremented
         self.assertEqual(self.model_runner.forward_pass_id, 1)
@@ -259,7 +260,10 @@ class TestModelRunner(unittest.TestCase):
             print(f"step {step} current_token: {current_token}")
             current_batch = self._update_forward_batch(current_batch, current_token)
             with self.mesh:
-                decode_output = self.model_runner.forward(current_batch)
+                decode_output = self.model_runner.forward(
+                    current_batch,
+                    LogitsMetadata.from_model_worker_batch(model_worker_batch),
+                )
             decode_outputs.append(decode_output)
 
             # Verify decode output shape

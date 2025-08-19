@@ -362,7 +362,9 @@ async def async_request_sglang_generate(
             "stream": not args.disable_stream,
             "lora_path": request_func_input.lora_name,
             "return_logprob": args.return_logprob,
-            "logprob_start_len": -1,
+            "logprob_start_len": 1,
+            "top_logprobs_num": 3,
+            "token_ids_logprob": [9370, 105180],
             **request_func_input.extra_request_body,
         }
 
@@ -427,6 +429,8 @@ async def async_request_sglang_generate(
                     output.success = True
                     output.latency = latency
                     output.output_len = output_len
+
+                    print(f"[response] {response=}")
                 else:
                     output.error = response.reason or ""
                     output.success = False
@@ -639,7 +643,6 @@ def is_file_valid_json(path):
     if not os.path.isfile(path):
         return False
 
-    # TODO can fuse into the real file open later
     try:
         with open(path) as f:
             json.load(f)

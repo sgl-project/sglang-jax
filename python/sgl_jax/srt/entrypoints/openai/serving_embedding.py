@@ -3,7 +3,6 @@ from typing import Any, Dict, List, Optional, Union
 from fastapi import Request
 from fastapi.responses import ORJSONResponse
 
-# from sgl_jax.srt.conversation import generate_embedding_convs  # TODO: implement embedding conversation generation
 from sgl_jax.srt.entrypoints.openai.protocol import (
     EmbeddingObject,
     EmbeddingRequest,
@@ -92,7 +91,6 @@ class OpenAIServingEmbedding(OpenAIServingBase):
                 generate_prompts = []
                 # Check if we have a chat template for multimodal embeddings
                 if self.template_manager.chat_template_name is not None:
-                    # TODO: implement generate_embedding_convs function
                     # convs = generate_embedding_convs(
                     #     texts, images, self.template_manager.chat_template_name
                     # )

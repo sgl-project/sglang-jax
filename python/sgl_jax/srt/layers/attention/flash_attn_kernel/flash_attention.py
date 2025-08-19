@@ -571,8 +571,6 @@ def ragged_paged_attention_kernel(
 
             @pl.when(next_heads_blk_idx < num_heads_blks)
             def prefetch_next_kv_blk():
-                # TODO(jevinjiang): reuse the same buffer if it is already prefetched!
-                # TODO(jevinjiang): only fetch effective dynamic size to hold kv_len and
                 # DMA to fixed size buffer!
                 next_async_copy_kv = create_kv_async_copy_descriptors(
                     next_heads_blk_idx, next_seq_idx, next_kv_blk_idx, next_buf_idx
@@ -606,7 +604,6 @@ def ragged_paged_attention_kernel(
                     v = v.astype(q_ref.dtype)
                 kv_head_idx = kv_head_chunk_idx
                 q_head_idx = kv_head_idx * num_q_heads_per_kv_head
-                # TODO(jevinjiang): extra handling for packed type that can start at
                 # unaligned position!
                 q = fold_on_2nd_minor(
                     q_ref[:, q_head_idx : q_head_idx + num_q_heads_per_kv_head, :]
@@ -663,7 +660,6 @@ def get_min_heads_per_blk(num_q_heads, num_kv_heads, q_dtype, kv_dtype):
         x //= packing
         return x in (1, 2, 4, 8) or x % 8 == 0
 
-    # TODO(jevinjiang): support unaligned number of heads!
     if not can_be_xla_fully_tiled(num_kv_heads, kv_packing):
         raise ValueError(
             f"Not implemented: {num_kv_heads=} can not be XLA fully tiled."
@@ -672,7 +668,6 @@ def get_min_heads_per_blk(num_q_heads, num_kv_heads, q_dtype, kv_dtype):
         num_q_heads % num_kv_heads == 0
     ), f"num_q_heads is not divisible by num_kv_heads, {num_q_heads=}, {num_kv_heads=}"
     ratio = num_q_heads // num_kv_heads
-    # TODO(jevinjiang): we can choose smaller tiling for packed type if large
     # second minor tiling is not on.
     max_kv_tiling = 8 * kv_packing
     min_kv_heads = max_kv_tiling if num_kv_heads % max_kv_tiling == 0 else num_kv_heads
@@ -786,7 +781,6 @@ def ragged_paged_attention(
     ]
     out_specs = q_block_spec
     lm_scratch = pltpu.VMEM(
-        # TODO(jevinjiang): use 128 instead of 1 is due to Mosaic does not support
         # unaligned slicing!
         (num_kv_heads_per_blk, num_q_per_blk * num_q_heads_per_kv_head, 128),
         jnp.float32,

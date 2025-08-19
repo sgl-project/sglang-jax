@@ -15,7 +15,7 @@ from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.configs.load_config import LoadConfig, LoadFormat
 from sgl_jax.srt.configs.model_config import AttentionArch, MockModelConfig, ModelConfig
-from sgl_jax.srt.layers.logits_processor import LogitsProcessorOutput
+from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessorOutput
 from sgl_jax.srt.layers.sampler import Sampler
 from sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch
 from sgl_jax.srt.mem_cache.allocator import (
@@ -97,7 +97,7 @@ class ModelRunner:
         server_args = self.server_args
 
         # Load the model
-        self.sampler = Sampler(nnx.Rngs(0))
+        self.sampler = Sampler(nnx.Rngs(server_args.random_seed))
         self.load_model()
 
         self.initialize_jit()
@@ -118,7 +118,12 @@ class ModelRunner:
             model = nnx.merge(graphdef, state)
             return model(*args)
 
+        def compute_logits(graphdef, state, *args):
+            model = nnx.merge(graphdef, state)
+            return model.compute_logits(*args)
+
         self.model_fn = partial(run_model, self.graphdef)
+        self.compute_logits = partial(compute_logits, self.graphdef)
 
     def model_specific_adjustment(self):
         pass
@@ -347,15 +352,26 @@ class ModelRunner:
             )
 
     def _forward(
-        self, input_ids: jax.Array, positions: jax.Array, forward_batch: ForwardBatch
+        self,
+        input_ids: jax.Array,
+        positions: jax.Array,
+        forward_batch: ForwardBatch,
+        logits_metadata: LogitsMetadata,
     ):
-        result, layers_k, layers_v = self.model_fn(
-            self.state, input_ids, positions, forward_batch
-        )
+        cache_miss_count = 0
+        import jax._src.test_util as jtu
+
+        with jtu.count_pjit_cpp_cache_miss() as count:
+            hidden_states, layers_k, layers_v = self.model_fn(
+                self.state, input_ids, positions, forward_batch
+            )
+            cache_miss_count = count()
+
+        result = self.compute_logits(self.state, hidden_states, logits_metadata)
 
         self._set_kv_cache_after_forward(layers_k, layers_v, forward_batch)
 
-        return result
+        return result, cache_miss_count
 
     def _set_kv_cache_after_forward(
         self, layers_k, layers_v, forward_batch: ForwardBatch
@@ -366,47 +382,60 @@ class ModelRunner:
         forward_batch.token_to_kv_pool.k_buffer[start_idx:end_idx] = layers_k
         forward_batch.token_to_kv_pool.v_buffer[start_idx:end_idx] = layers_v
 
-    def forward_decode(self, forward_batch: ForwardBatch) -> LogitsProcessorOutput:
+    def forward_decode(
+        self, forward_batch: ForwardBatch, logits_metadata: LogitsMetadata
+    ) -> Tuple[LogitsProcessorOutput, int]:
         self.attn_backend.init_forward_metadata(forward_batch)
         return self._forward(
-            forward_batch.input_ids, forward_batch.positions, forward_batch
+            forward_batch.input_ids,
+            forward_batch.positions,
+            forward_batch,
+            logits_metadata,
         )
 
     def forward_extend(
         self,
         forward_batch: ForwardBatch,
+        logits_metadata: LogitsMetadata,
         skip_attn_backend_init: bool = False,
-    ) -> LogitsProcessorOutput:
+    ) -> Tuple[LogitsProcessorOutput, int]:
         if not skip_attn_backend_init:
             self.attn_backend.init_forward_metadata(forward_batch)
         return self._forward(
-            forward_batch.input_ids, forward_batch.positions, forward_batch
+            forward_batch.input_ids,
+            forward_batch.positions,
+            forward_batch,
+            logits_metadata,
         )
 
-    def forward_idle(self, forward_batch: ForwardBatch) -> LogitsProcessorOutput:
-        # TODO: implement
+    def forward_idle(
+        self, forward_batch: ForwardBatch
+    ) -> Tuple[LogitsProcessorOutput, int]:
         raise NotImplementedError("forward_idle is not implemented")
 
     def forward(
         self,
         forward_batch: ForwardBatch,
+        logits_metadata: LogitsMetadata,
         skip_attn_backend_init: bool = False,
-    ) -> Tuple[Union[LogitsProcessorOutput], bool]:
+    ) -> Tuple[LogitsProcessorOutput, int]:
         self.forward_pass_id += 1
 
-        return self._forward_raw(forward_batch, skip_attn_backend_init)
+        return self._forward_raw(forward_batch, logits_metadata, skip_attn_backend_init)
 
     def _forward_raw(
         self,
         forward_batch: ForwardBatch,
+        logits_metadata: LogitsMetadata,
         skip_attn_backend_init: bool,
-    ) -> Tuple[Union[LogitsProcessorOutput], bool]:
+    ) -> Tuple[LogitsProcessorOutput, int]:
         with self.mesh, jax.sharding.use_mesh(self.mesh):
             if forward_batch.forward_mode.is_decode():
-                ret = self.forward_decode(forward_batch)
+                ret = self.forward_decode(forward_batch, logits_metadata)
             elif forward_batch.forward_mode.is_extend():
                 ret = self.forward_extend(
                     forward_batch,
+                    logits_metadata,
                     skip_attn_backend_init=skip_attn_backend_init,
                 )
             elif forward_batch.forward_mode.is_idle():
@@ -443,6 +472,10 @@ class ModelRunner:
         next_token_ids = self.sampler(
             logits_output,
             model_worker_batch.sampling_info,
+            model_worker_batch.return_logprob,
+            model_worker_batch.top_logprobs_nums,
+            model_worker_batch.token_ids_logprobs,
+            self.mesh,
         )
         return next_token_ids
 

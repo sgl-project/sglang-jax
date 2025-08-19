@@ -178,7 +178,6 @@ def get_tokenizer(
             raise ValueError("Cannot use the fast tokenizer in slow tokenizer mode.")
         kwargs["use_fast"] = False
 
-    # TODO(Xinyuan): Remove this once we have a proper tokenizer for Devstral
     if tokenizer_name == "mistralai/Devstral-Small-2505":
         tokenizer_name = "mistralai/Mistral-Small-3.1-24B-Instruct-2503"
 

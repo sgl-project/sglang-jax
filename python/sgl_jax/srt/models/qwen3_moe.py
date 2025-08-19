@@ -12,7 +12,7 @@ from sgl_jax.srt.debug_tracer import global_tracer, trace_function
 from sgl_jax.srt.layers.embeddings import Embed, ParallelLMHead, RotaryEmbedding
 from sgl_jax.srt.layers.layernorm import RMSNorm
 from sgl_jax.srt.layers.linear import LinearBase
-from sgl_jax.srt.layers.logits_processor import LogitsProcessor
+from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
 from sgl_jax.srt.layers.moe import EPMoE, GateLogit
 from sgl_jax.srt.layers.radix_attention import RadixAttention
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
@@ -494,6 +494,15 @@ class Qwen3MoeForCausalLM(nnx.Module):
                 )
 
         return mappings
+
+    def compute_logits(
+        self,
+        hidden_states: jax.Array,
+        logits_metadata: LogitsMetadata,
+    ):
+        return self.logits_processor(
+            hidden_states, self.lm_head, logits_metadata, self.mesh
+        )
 
     @trace_function(
         stage="MOE_CAUSAL_LM_FORWARD", include_args=False, include_output=True

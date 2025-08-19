@@ -660,7 +660,6 @@ class TokenizerManager:
         return [res.internal_state for res in responses]
 
     async def get_load(self) -> dict:
-        # TODO(lsyin): fake load report server
         if not self.current_load_lock.locked():
             async with self.current_load_lock:
                 internal_state = await self.get_internal_state()
@@ -974,7 +973,6 @@ class TokenizerManager:
     ):
         if recv_obj.input_token_logprobs_val is None:
             return
-
         if len(recv_obj.input_token_logprobs_val) > 0:
             state.input_token_logprobs_val.extend(
                 recv_obj.input_token_logprobs_val[recv_obj_index]
@@ -1073,7 +1071,6 @@ class TokenizerManager:
         token_logprobs_idx: List[int],
         decode_to_text: bool,
     ):
-        # TODO: The current implementation only batches the detokenization for top-k tokens per single position.
         # We should batch all top-k tokens in all positions.
         ret = []
         for i in range(len(token_logprobs_val)):

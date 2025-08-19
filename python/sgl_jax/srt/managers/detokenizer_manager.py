@@ -78,9 +78,7 @@ class DetokenizerManager:
 
         self._request_dispatcher = TypeBasedDispatcher(
             [
-                # (BatchEmbeddingOut, self.handle_batch_embedding_out),  # TODO: Not defined in io_struct.py
                 (BatchTokenIDOut, self.handle_batch_token_id_out),
-                # (BatchMultimodalDecodeReq, self.handle_multimodal_decode_req),  # TODO: Not defined in io_struct.py
             ]
         )
 
@@ -103,8 +101,6 @@ class DetokenizerManager:
         if not matched:
             return output
 
-        # TODO(lmzheng): handle the case where multiple stop strs are hit
-
         # Trim stop str.
         if isinstance(matched, str) and isinstance(output, str):
             pos = output.find(matched)
@@ -116,7 +112,6 @@ class DetokenizerManager:
             return output[:-1]
         return output
 
-    # TODO: Commented out because BatchEmbeddingOut is not defined in io_struct.py
     # def handle_batch_embedding_out(self, recv_obj: BatchEmbeddingOut):
     #     # If it is embedding model, no detokenization is needed.
     #     return recv_obj
@@ -210,7 +205,6 @@ class DetokenizerManager:
                 flattened.append(flat_ids)
             return flattened
 
-        # TODO(lmzheng): handle skip_special_tokens/spaces_between_special_tokens per request
         flattened_surr_ids = flatten_token_ids(surr_ids)
 
         surr_texts = self.tokenizer.batch_decode(
@@ -262,7 +256,6 @@ class DetokenizerManager:
             s.sent_offset = len(output_str)
             output_strs.append(incremental_output)
 
-        # TODO: Commented out because BatchStrOut is not defined in io_struct.py
         return BatchStrOut(
             rids=recv_obj.rids,
             finished_reasons=recv_obj.finished_reasons,

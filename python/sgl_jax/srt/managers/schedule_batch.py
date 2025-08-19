@@ -32,7 +32,7 @@ from sgl_jax.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sgl_jax.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sgl_jax.srt.mem_cache.chunk_cache import ChunkCache
 from sgl_jax.srt.mem_cache.memory_pool import ReqToTokenPool
-from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
+from sgl_jax.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
 from sgl_jax.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sgl_jax.srt.sampling.sampling_params import SamplingParams
 from sgl_jax.srt.server_args import ServerArgs
@@ -197,7 +197,6 @@ class Req:
         # Incremental streamining
         self.send_token_offset: int = 0
         self.send_decode_id_offset: int = 0
-        # TODO (Byron): send_output_token_logprobs_offset and send_decode_id_offset can be different in disaggregation mode
         # because the decode server does not have the first output token logprobs
         self.send_output_token_logprobs_offset: int = 0
 
@@ -476,6 +475,9 @@ class ScheduleBatch:
 
     cache_miss_count: int = 0
 
+    # Whether to return hidden states
+    return_hidden_states: bool = False
+
     @classmethod
     def init_new(
         cls,
@@ -502,7 +504,6 @@ class ScheduleBatch:
             mesh=mesh,
         )
 
-    @property
     def batch_size(self):
         return len(self.reqs)
 
@@ -844,16 +845,6 @@ class ScheduleBatch:
         self.seq_lens = jnp.empty(0, jnp.int32)
         self.out_cache_loc = jnp.empty(0, jnp.int32)
         self.req_pool_indices = jnp.empty(0, jnp.int32)
-
-        # (self.input_ids, self.seq_lens, self.out_cache_loc, self.req_pool_indices) = device_array(
-        #     self.mesh,
-        #     (
-        #         jnp.empty(0, jnp.int32),
-        #         jnp.empty(0, jnp.int32),
-        #         jnp.empty(0, jnp.int32),
-        #         jnp.empty(0, jnp.int32),
-        #     ),
-        # )
         self.seq_lens_sum = 0
         self.extend_num_tokens = 0
         self.sampling_info = SamplingBatchInfo.from_schedule_batch(
@@ -867,6 +858,7 @@ class ScheduleBatch:
 
         # Update fields
         self.input_ids = self.output_ids
+
         self.output_ids = None
 
         locs = self.seq_lens.copy()
@@ -970,6 +962,7 @@ class ScheduleBatch:
 
         self.return_logprob |= other.return_logprob
         self.has_stream |= other.has_stream
+        self.return_hidden_states |= other.return_hidden_states
 
     def get_model_worker_batch(
         self,
@@ -986,9 +979,12 @@ class ScheduleBatch:
             extend_seq_lens = np.array(self.extend_lens, dtype=np.int32)
             extend_prefix_lens = np.array(self.prefix_lens, dtype=np.int32)
             bs_paddings = [prefill_padded_batch_size]
+            extend_logprob_start_lens = self.extend_logprob_start_lens
 
         global bid
         bid += 1
+
+        # print(f"[get_model_worker_batch] {self.input_ids.shape=}, {self.input_ids=}")
 
         input_ids_cpu = jax.device_get(self.input_ids.flatten())
         real_input_ids_len = len(input_ids_cpu)
@@ -1102,6 +1098,7 @@ class ScheduleBatch:
         #         offset += seq_len
 
         total_cache_loc_size = max_total_num_tokens
+        cache_loc_cpu = cache_loc_flat
         if total_cache_loc_size > len(cache_loc_flat):
             cache_loc_cpu = np.pad(
                 cache_loc_flat,
@@ -1161,13 +1158,13 @@ class ScheduleBatch:
                 input_ids_cpu,
             ),
             real_input_ids_len=real_input_ids_len,
-            real_bs=real_bs,
             req_pool_indices=device_array(self.mesh, req_pool_indices_cpu),
             seq_lens=device_array(self.mesh, seq_lens_cpu),
             out_cache_loc=device_array(self.mesh, out_cache_loc_cpu),
             return_logprob=self.return_logprob,
+            top_logprobs_nums=self.top_logprobs_nums,
+            token_ids_logprobs=self.token_ids_logprobs,
             sampling_info=self.sampling_info,
-            extend_input_logprob_token_ids=self.extend_input_logprob_token_ids,
             positions=device_array(self.mesh, positions),
             extend_start_loc=device_array(self.mesh, extend_start_loc),
             cache_loc=device_array(self.mesh, cache_loc_cpu),
@@ -1181,6 +1178,10 @@ class ScheduleBatch:
                 if self.forward_mode == ForwardMode.EXTEND
                 else None
             ),
+            extend_logprob_start_lens=extend_logprob_start_lens,
+            extend_input_logprob_token_ids=self.extend_input_logprob_token_ids,
+            real_bs=real_bs,
+            capture_hidden_mode=CaptureHiddenMode.NULL,
         )
 
     def copy(self):
@@ -1232,7 +1233,6 @@ class ModelWorkerBatch:
     input_ids: jax.Array
     # the length is outof padding
     real_input_ids_len: int
-    real_bs: int
     # The sequence length
     seq_lens: jax.Array
     # The indices of output tokens in the token_to_kv_pool_allocator
@@ -1249,23 +1249,32 @@ class ModelWorkerBatch:
     cache_loc: jax.Array
 
     # For logprob
-    return_logprob: bool = False
-    extend_input_logprob_token_ids: Optional[jax.Array] = None
+    return_logprob: bool
+    top_logprobs_nums: Optional[List[int]]
+    token_ids_logprobs: Optional[List[List[int]]]
 
     # For extend
-    extend_prefix_lens: Optional[jax.Array] = None
+    # extend_num_tokens: Optional[int]
+    extend_seq_lens: Optional[jax.Array]
+    extend_prefix_lens: Optional[jax.Array]
+    # extend_start_loc: Optional[jax.Array] = None
+    # extend_prefix_lens_cpu: Optional[List[int]] = None
+    # extend_seq_lens_cpu: Optional[List[int]] = None
+    # extend_logprob_start_lens_cpu: Optional[List[int]] = None
+    extend_logprob_start_lens: Optional[List[int]]
+    # extend_input_logprob_token_ids_device: Optional[jax.Array] = None
+    extend_input_logprob_token_ids: Optional[jax.Array]
 
-    extend_seq_lens: Optional[jax.Array] = None
+    # For padding
+    real_bs: int
 
-    def print_array(self):
-        print(f"========ModelWorkerBatch")
-        print(f"{self.input_ids.shape=}, {self.input_ids.sharding=}")
-        print(f"{self.seq_lens.shape=}, {self.seq_lens.sharding=}")
-        print(f"{self.out_cache_loc.shape=}, {self.out_cache_loc.sharding=}")
-        print(f"{self.req_pool_indices.shape=}, {self.req_pool_indices.sharding=}")
-        print(f"{self.positions.shape=}, {self.positions.sharding=}")
-        print(f"{self.extend_start_loc.shape=}, {self.extend_start_loc.sharding=}")
-        print(f"{self.cache_loc.shape=}, {self.cache_loc.sharding=}")
+    capture_hidden_mode: CaptureHiddenMode = None
+
+    # For logits and logprobs post processing
+    temp_scaled_logprobs: bool = False
+    temperature: jax.Array = None
+    top_p_normalized_logprobs: bool = False
+    top_p: jax.Array = None
 
 
 def get_last_loc(
@@ -1273,7 +1282,6 @@ def get_last_loc(
     req_pool_indices_device: jax.Array,
     prefix_lens_device: jax.Array,
 ) -> jax.Array:
-    # TODO: support through Pallas
     impl = get_last_loc_jax
 
     return impl(req_to_token, req_pool_indices_device, prefix_lens_device)

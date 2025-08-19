@@ -278,7 +278,6 @@ class PrefillAdder:
         self.can_run_list = []
         self.new_chunked_req = None
         self.log_hit_tokens = 0
-        # TODO(lsyin): report the real input tokens excluding page alignment
         self.log_input_tokens = 0
 
         if running_batch is not None:
@@ -346,7 +345,6 @@ class PrefillAdder:
     def _update_prefill_budget(
         self, prefix_len: int, extend_input_len: int, max_new_tokens: int
     ):
-        # TODO(lsyin): check this workaround logic, which only ensures the prefill will not out of memory, and may be too conservative
         extend_input_len = self.ceil_paged_tokens(extend_input_len)
 
         self.rem_total_token_offset += extend_input_len + max_new_tokens
