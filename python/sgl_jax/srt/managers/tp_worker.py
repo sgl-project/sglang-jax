@@ -313,20 +313,22 @@ class ModelWorker:
         if launch_done is not None:
             launch_done.set()
 
-        if skip_sample:
-            next_token_ids = None
-        else:
-            next_token_ids = self.model_runner.sample(logits_output, model_worker_batch)
-
         idx = model_worker_batch.extend_start_loc[: model_worker_batch.real_bs]
         if model_worker_batch.forward_mode == ForwardMode.EXTEND:
             idx = np.cumsum(
                 model_worker_batch.extend_seq_lens[: model_worker_batch.real_bs] - 1
             )
 
+        logits_output.truncate_logits_processor_output(idx)
+
+        if skip_sample:
+            next_token_ids = None
+        else:
+            next_token_ids = self.model_runner.sample(logits_output, model_worker_batch)
+
         return (
-            logits_output.truncate_logits_processor_output(idx),
-            next_token_ids[idx],
+            logits_output,
+            next_token_ids,
             cache_miss_count,
         )
 
