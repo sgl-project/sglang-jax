@@ -239,7 +239,9 @@ def run_data_parallel_controller_process(
     parent_process = psutil.Process().parent()
 
     try:
+        logger.debug(f"Node {server_args.node_rank} DataParallelController started")
         controller = DataParallelController(server_args, port_args)
+        logger.debug(f"Node {server_args.node_rank} DataParallelController launched")
         pipe_writer.send(
             {
                 "status": "ready",
