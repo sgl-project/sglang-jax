@@ -242,11 +242,10 @@ def run_data_parallel_controller_process(
             logger.debug(f"Node {server_args.node_rank} running event loop")
             controller.event_loop()
         logger.debug(f"Node {server_args.node_rank} scheduler joined")
-        for proc in controller.scheduler_procs:
-            proc.join()
-            logger.error(
-                f"Scheduler or DataParallelController {proc.pid} terminated with {proc.exitcode}"
-            )
+        controller.scheduler_proc.join()
+        logger.error(
+            f"Scheduler or DataParallelController {controller.scheduler_proc.pid} terminated with {controller.scheduler_proc.exitcode}"
+        )
     except Exception:
         traceback = get_exception_traceback()
         logger.error(f"DataParallelController hit an exception: {traceback}")
