@@ -1091,6 +1091,7 @@ def run_scheduler_process(
     # Create a scheduler and run the event loop
     try:
         scheduler = Scheduler(server_args, port_args)
+        # 非Node 0的scheduler准备好之后需要通知data parallel controller
         pipe_writer.send(
             {
                 "status": "ready",

@@ -66,7 +66,7 @@ class DataParallelController:
         self._launch_local_scheduler(
             self.server_args, self.port_args, dp_rank, ready_event
         )
-
+        logger.debug(f"Node {self.server_args.node_rank} Scheduler launched")
         # Only node 0 sets up communication to all DP ranks
         if server_args.node_rank == 0:
             self._setup_dp_communication()
@@ -139,47 +139,49 @@ class DataParallelController:
                 )
 
     def launch_dp_schedulers(self, server_args, port_args):
-        base_gpu_id = 0
+        pass
+        # base_gpu_id = 0
 
-        threads = []
-        sockets = []
-        dp_port_args = []
-        ready_events = []
-        for dp_rank in range(server_args.dp_size):
-            tmp_port_args = PortArgs.init_new(server_args)
-            tmp_port_args.tokenizer_ipc_name = port_args.tokenizer_ipc_name
-            tmp_port_args.detokenizer_ipc_name = port_args.detokenizer_ipc_name
-            dp_port_args.append(tmp_port_args)
+        # threads = []
+        # sockets = []
+        # dp_port_args = []
+        # ready_events = []
+        # for dp_rank in range(server_args.dp_size):
+        #     tmp_port_args = PortArgs.init_new(server_args)
+        #     tmp_port_args.tokenizer_ipc_name = port_args.tokenizer_ipc_name
+        #     tmp_port_args.detokenizer_ipc_name = port_args.detokenizer_ipc_name
+        #     dp_port_args.append(tmp_port_args)
 
-            # This port is checked free in PortArgs.init_new.
-            # We hold it first so that the next dp worker gets a different port
-            sockets.append(bind_port(tmp_port_args.nccl_port))
+        #     # This port is checked free in PortArgs.init_new.
+        #     # We hold it first so that the next dp worker gets a different port
+        #     sockets.append(bind_port(tmp_port_args.nccl_port))
 
-            ready_event = threading.Event()
-            ready_events.append(ready_event)
+        #     ready_event = threading.Event()
+        #     ready_events.append(ready_event)
 
-            # Create a thread for each worker
-            thread = threading.Thread(
-                target=self.launch_tensor_parallel_group_thread,
-                args=(server_args, tmp_port_args, base_gpu_id, dp_rank, ready_event),
-            )
-            threads.append(thread)
-            base_gpu_id += server_args.tp_size * server_args.gpu_id_step
+        #     # Create a thread for each worker
+        #     thread = threading.Thread(
+        #         target=self.launch_tensor_parallel_group_thread,
+        #         args=(server_args, tmp_port_args, base_gpu_id, dp_rank, ready_event),
+        #     )
+        #     threads.append(thread)
+        #     base_gpu_id += server_args.tp_size * server_args.gpu_id_step
 
-        # Free all sockets before starting the threads to launch TP workers
-        for sock in sockets:
-            sock.close()
+        # # Free all sockets before starting the threads to launch TP workers
+        # for sock in sockets:
+        #     sock.close()
 
-        # Start all threads
-        for thread in threads:
-            thread.start()
-        for event in ready_events:
-            event.wait()
+        # # Start all threads
+        # for thread in threads:
+        #     thread.start()
+        # for event in ready_events:
+        #     event.wait()
 
-        return dp_port_args
+        # return dp_port_args
 
     def launch_dp_attention_schedulers(self, server_args, port_args):
         # self.launch_tensor_parallel_group(server_args, port_args, 0, None)
+        logger.debug(f"Launching DP attention schedulers")
         dp_port_args = []
         for dp_rank in range(server_args.dp_size):
             dp_port_args.append(PortArgs.init_new(server_args, dp_rank))
