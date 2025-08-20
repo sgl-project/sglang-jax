@@ -69,31 +69,39 @@ class SchedulerOutputProcessorMixin:
             if req.is_retracted:
                 continue
 
-            # req output_ids are set here
-            req.output_ids.append(next_token_id)
-            req.check_finished()
+            if req.is_chunked <= 0:
+                # req output_ids are set here
+                req.output_ids.append(next_token_id)
+                req.check_finished()
 
-            if req.finished():
-                self.tree_cache.cache_finished_req(req)
-            elif not batch.decoding_reqs or req not in batch.decoding_reqs:
-                # This updates radix so others can match
-                self.tree_cache.cache_unfinished_req(req)
+                if req.finished():
+                    self.tree_cache.cache_finished_req(req)
+                elif not batch.decoding_reqs or req not in batch.decoding_reqs:
+                    # This updates radix so others can match
+                    self.tree_cache.cache_unfinished_req(req)
 
-            if req.return_logprob:
-                assert extend_logprob_start_len_per_req is not None
-                assert extend_input_len_per_req is not None
-                extend_logprob_start_len = extend_logprob_start_len_per_req[i]
-                extend_input_len = extend_input_len_per_req[i]
-                num_input_logprobs = extend_input_len - extend_logprob_start_len
-                self.add_logprob_return_values(
-                    i,
-                    req,
-                    logprob_pt,
-                    next_token_ids,
-                    num_input_logprobs,
-                    logits_output,
-                )
-                logprob_pt += num_input_logprobs
+                if req.return_logprob:
+                    assert extend_logprob_start_len_per_req is not None
+                    assert extend_input_len_per_req is not None
+                    extend_logprob_start_len = extend_logprob_start_len_per_req[i]
+                    extend_input_len = extend_input_len_per_req[i]
+                    num_input_logprobs = extend_input_len - extend_logprob_start_len
+                    self.add_logprob_return_values(
+                        i,
+                        req,
+                        logprob_pt,
+                        next_token_ids,
+                        num_input_logprobs,
+                        logits_output,
+                    )
+                    logprob_pt += num_input_logprobs
+                else:
+                    # being chunked reqs' prefill is not finished
+                    req.is_chunked -= 1
+                    # There is only at most one request being currently chunked.
+                    # Because this request does not finish prefill,
+                    # we don't want to stream the request currently being chunked.
+                    skip_stream_req = req
 
         self.set_next_batch_sampling_info_done(batch)
 
@@ -111,7 +119,6 @@ class SchedulerOutputProcessorMixin:
         batch: ScheduleBatch,
         result: GenerationBatchResult,
     ):
-        skip_stream_req = None
         logits_output, next_token_ids, cache_miss_count = (
             result.logits_output,
             result.next_token_ids,
@@ -133,37 +140,33 @@ class SchedulerOutputProcessorMixin:
             if req.is_retracted:
                 continue
 
-            if req.is_chunked <= 0:
-                req.output_ids.append(next_token_id)
+            req.output_ids.append(next_token_id)
 
-                req.check_finished()
-                if req.finished():
-                    self.tree_cache.cache_finished_req(req)
+            req.check_finished()
+            if req.finished():
+                self.tree_cache.cache_finished_req(req)
 
-                if req.return_logprob:
-                    # speculative worker handles logprob in speculative decoding
-                    req.output_token_logprobs_val.append(next_token_logprobs[i])
-                    req.output_token_logprobs_idx.append(next_token_id)
-                    if req.top_logprobs_num > 0:
-                        req.output_top_logprobs_val.append(
-                            logits_output.next_token_top_logprobs_val[i]
-                        )
-                        req.output_top_logprobs_idx.append(
-                            logits_output.next_token_top_logprobs_idx[i]
-                        )
-                    if req.token_ids_logprob is not None:
-                        req.output_token_ids_logprobs_val.append(
-                            logits_output.next_token_token_ids_logprobs_val[i]
-                        )
-                        req.output_token_ids_logprobs_idx.append(
-                            logits_output.next_token_token_ids_logprobs_idx[i]
-                        )
-            else:
-                req.is_chunked -= 1
-                skip_stream_req = req
+            if req.return_logprob:
+                # speculative worker handles logprob in speculative decoding
+                req.output_token_logprobs_val.append(next_token_logprobs[i])
+                req.output_token_logprobs_idx.append(next_token_id)
+                if req.top_logprobs_num > 0:
+                    req.output_top_logprobs_val.append(
+                        logits_output.next_token_top_logprobs_val[i]
+                    )
+                    req.output_top_logprobs_idx.append(
+                        logits_output.next_token_top_logprobs_idx[i]
+                    )
+                if req.token_ids_logprob is not None:
+                    req.output_token_ids_logprobs_val.append(
+                        logits_output.next_token_token_ids_logprobs_val[i]
+                    )
+                    req.output_token_ids_logprobs_idx.append(
+                        logits_output.next_token_token_ids_logprobs_idx[i]
+                    )
 
         self.set_next_batch_sampling_info_done(batch)
-        self.stream_output(batch.reqs, batch.return_logprob, skip_stream_req)
+        self.stream_output(batch.reqs, batch.return_logprob)
         self.token_to_kv_pool_allocator.free_group_end()
 
         self.forward_ct_decode = (self.forward_ct_decode + 1) % (1 << 30)
