@@ -156,8 +156,8 @@ class DPGroupCommunicator:
                     result = pickle.loads(serialized_bytes)
                 else:
                     result = {}
-
-            logger.debug(f"Inter-group broadcast: {len(result)} groups distributed")
+            if len(result) > 0:
+                logger.debug(f"Inter-group broadcast: {len(result)} groups distributed")
             return result
 
         except Exception as e:
