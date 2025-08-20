@@ -30,6 +30,7 @@ from sgl_jax.global_config import global_config
 from sgl_jax.srt.configs.model_config import ModelConfig
 from sgl_jax.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sgl_jax.srt.mem_cache.base_prefix_cache import BasePrefixCache
+from sgl_jax.srt.mem_cache.chunk_cache import ChunkCache
 from sgl_jax.srt.mem_cache.memory_pool import ReqToTokenPool
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
 from sgl_jax.srt.sampling.sampling_batch_info import SamplingBatchInfo
@@ -781,22 +782,29 @@ class ScheduleBatch:
             req = self.reqs[idx]
             retracted_reqs.append(req)
 
-            # TODO: apply more fine-grained retraction
-            last_uncached_pos = (
-                len(req.prefix_indices) // server_args.page_size
-            ) * server_args.page_size
-            token_indices = self.req_to_token_pool.req_to_token[
-                req.req_pool_idx, last_uncached_pos : seq_lens_cpu[idx]
-            ]
-            self.token_to_kv_pool_allocator.free(token_indices)
-            self.req_to_token_pool.free(req.req_pool_idx)
+            if isinstance(self.tree_cache, ChunkCache):
+                # ChunkCache does not have eviction
+                token_indices = self.req_to_token_pool.req_to_token[
+                    req.req_pool_idx, : seq_lens_cpu[idx]
+                ]
+                self.token_to_kv_pool_allocator.free(token_indices)
+                self.req_to_token_pool.free(req.req_pool_idx)
+            else:
+                last_uncached_pos = (
+                    len(req.prefix_indices) // server_args.page_size
+                ) * server_args.page_size
+                token_indices = self.req_to_token_pool.req_to_token[
+                    req.req_pool_idx, last_uncached_pos : seq_lens_cpu[idx]
+                ]
+                self.token_to_kv_pool_allocator.free(token_indices)
+                self.req_to_token_pool.free(req.req_pool_idx)
 
-            # release the last node
-            self.tree_cache.dec_lock_ref(req.last_node)
+                # release the last node
+                self.tree_cache.dec_lock_ref(req.last_node)
 
-            # NOTE(lsyin): we should use the newly evictable memory instantly.
-            num_tokens = len(sorted_indices) * global_config.retract_decode_steps
-            self._evict_tree_cache_if_needed(num_tokens)
+                # NOTE(lsyin): we should use the newly evictable memory instantly.
+                num_tokens = len(sorted_indices) * global_config.retract_decode_steps
+                self._evict_tree_cache_if_needed(num_tokens)
 
             req.reset_for_retract()
 
@@ -1052,9 +1060,6 @@ class ScheduleBatch:
 
         # padding bs: req_pool_indices, seq_lens, extend_start_loc, extend_prefix_lens, extend_seq_lens
         bs_padding_size = 0
-        # if self.forward_mode.is_extend():
-        #     bs_padding_size = max_running_requests - len(seq_lens_cpu)
-        # else:
         bs_paddings.sort()
         for size in bs_paddings:
             if size >= len(seq_lens_cpu):
@@ -1172,6 +1177,9 @@ class ScheduleBatch:
         self,
         num_tokens: int,
     ) -> None:
+        if isinstance(self.tree_cache, ChunkCache):
+            return
+
         if self.token_to_kv_pool_allocator.available_size() < num_tokens:
             if self.tree_cache is not None:
                 self.tree_cache.evict(num_tokens)
@@ -1183,12 +1191,6 @@ class ScheduleBatch:
         available_size = self.token_to_kv_pool_allocator.available_size()
         evictable_size = self.tree_cache.evictable_size()
         return f"Available tokens: {available_size + evictable_size} ({available_size=} + {evictable_size=})\n"
-
-    # def __str__(self):
-    #     return (
-    #         f"ScheduleBatch(forward_mode={self.forward_mode.name if self.forward_mode else 'None'}, "
-    #         f"#req={(len(self.reqs))})"
-    #     )
 
 
 @dataclasses.dataclass

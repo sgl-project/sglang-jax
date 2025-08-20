@@ -45,6 +45,7 @@ from sgl_jax.srt.managers.scheduler_output_processor_mixin import (
 from sgl_jax.srt.managers.scheduler_profiler_mixing import SchedulerProfilerMixin
 from sgl_jax.srt.managers.tp_worker import ModelWorker
 from sgl_jax.srt.managers.utils import validate_input_length
+from sgl_jax.srt.mem_cache.chunk_cache import ChunkCache
 from sgl_jax.srt.mem_cache.radix_cache import RadixCache
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
 from sgl_jax.srt.server_args import PortArgs, ServerArgs
@@ -368,16 +369,25 @@ class Scheduler(
             self.tp_worker.get_memory_pool()
         )
 
-        self.tree_cache = RadixCache(
-            req_to_token_pool=self.req_to_token_pool,
-            token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
-            page_size=self.page_size,
-            disable=server_args.disable_radix_cache,
-            kv_head_num=self.model_config.get_num_kv_heads(self.tp_size),
-            head_dim=self.model_config.head_dim,
-            layer_num=self.model_config.num_hidden_layers,
-            max_seq_len=server_args.max_seq_len,
-        )
+        if (
+            server_args.chunked_prefill_size is not None
+            and server_args.disable_radix_cache
+        ):
+            self.tree_cache = ChunkCache(
+                req_to_token_pool=self.req_to_token_pool,
+                token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+            )
+        else:
+            self.tree_cache = RadixCache(
+                req_to_token_pool=self.req_to_token_pool,
+                token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                page_size=self.page_size,
+                disable=server_args.disable_radix_cache,
+                kv_head_num=self.model_config.get_num_kv_heads(self.tp_size),
+                head_dim=self.model_config.head_dim,
+                layer_num=self.model_config.num_hidden_layers,
+                max_seq_len=server_args.max_seq_len,
+            )
 
         self.decode_mem_cache_buf_multiplier = 1
 
