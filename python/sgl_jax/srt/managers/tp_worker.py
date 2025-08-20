@@ -83,6 +83,7 @@ class ModelWorker:
         # Profile number of tokens
         self.max_total_num_tokens = self.model_runner.max_total_num_tokens
         self.max_prefill_tokens = server_args.max_prefill_tokens
+        self.chunked_prefill_size = server_args.chunked_prefill_size
         self.max_running_requests = min(
             (
                 self.max_total_num_tokens // 2
@@ -126,17 +127,26 @@ class ModelWorker:
         self, server_args: ServerArgs, max_running_requests: int
     ):
         normalized_token_paddings = []
+
         if server_args.jax_precompile_prefill_token_paddings is None:
             server_args.jax_precompile_prefill_token_paddings = (
                 JAX_PRECOMPILE_DEFAULT_PREFILL_TOKEN_PADDINGS
             )
+
+        prefill_padded_batch_size, prefill_max_padded_num_tokens = (
+            self.get_prefill_padded_size()
+        )
         for item in server_args.jax_precompile_prefill_token_paddings:
-            if item >= self.max_running_requests:
+            if (
+                item >= prefill_padded_batch_size
+                and item <= prefill_max_padded_num_tokens
+            ):
                 normalized_token_paddings.append(item)
+
         if len(normalized_token_paddings) == 0:
-            normalized_token_paddings.append(self.max_running_requests)
+            normalized_token_paddings.append(prefill_padded_batch_size)
             logger.warning(
-                f"Every padding of {server_args.jax_precompile_prefill_token_paddings=} is less than {max_running_requests=}, so set token_paddings as {normalized_token_paddings}"
+                f"No valid padding found in {server_args.jax_precompile_prefill_token_paddings=} within range [{prefill_padded_batch_size}, {prefill_max_padded_num_tokens}], so set token_paddings as {normalized_token_paddings}"
             )
 
         server_args.jax_precompile_prefill_token_paddings = normalized_token_paddings
@@ -148,9 +158,9 @@ class ModelWorker:
     def precompile_extend(self):
         start_time = time.perf_counter()
         logger.info(f"[EXTEND] begin to precompile")
-        for pair in itertools.product(
-            [self.max_running_requests], self.precompile_prefill_token_paddings
-        ):
+
+        bs, _ = self.get_prefill_padded_size()
+        for pair in itertools.product([bs], self.precompile_prefill_token_paddings):
             pair = list(pair)
             bs, num_tokens = pair[0], pair[1]
             logger.info(f"[EXTEND] precompile ({bs=}, {num_tokens=})")
@@ -164,6 +174,28 @@ class ModelWorker:
 
         end_time = time.perf_counter()
         logger.info("[EXTEND] precompile finished in %.0f secs", end_time - start_time)
+
+    def get_prefill_padded_size(self):
+        """Calculate padded batch size and token count for prefill operations.
+
+        Returns:
+            tuple: (padded_batch_size, padded_max_num_tokens)
+                - padded_batch_size: Maximum batch size for prefill, constrained by max_running_requests
+                - padded_max_num_tokens: Maximum tokens for prefill, using chunked_prefill_size if enabled
+        """
+        # Use chunked prefill size if enabled (> 0), otherwise use max prefill tokens
+        # Take minimum with max_prefill_tokens as upper bound
+        padded_max_num_tokens = self.max_prefill_tokens
+        if (
+            self.chunked_prefill_size > 0
+            and padded_max_num_tokens > self.chunked_prefill_size
+        ):
+            padded_max_num_tokens = self.chunked_prefill_size
+
+        # Batch size is constrained by both max_running_requests and available tokens
+        padded_batch_size = min(self.max_running_requests, padded_max_num_tokens)
+
+        return padded_batch_size, padded_max_num_tokens
 
     def generate_model_worker_batch(
         self, bs: int, num_tokens: int, mode: ForwardMode

@@ -237,6 +237,14 @@ class Scheduler(
         self.num_retracted_reqs: int = 0
         self.num_paused_reqs: int = 0
 
+        # Init chunked prefill
+        self.chunked_prefill_size = server_args.chunked_prefill_size
+        if self.chunked_prefill_size <= 0:  # -1 means disable
+            self.chunked_prefill_size = None
+        self.chunked_req = None
+
+        self.prefill_padded_batch_size, _ = self.tp_worker.get_prefill_padded_size()
+
         # Init schedule policy and new token estimation
         self.policy = SchedulePolicy(
             self.schedule_policy,
@@ -570,11 +578,25 @@ class Scheduler(
         return num_used, token_usage, available_size, evictable_size
 
     def get_next_batch_to_run(self) -> Optional[ScheduleBatch]:
+        chunked_req_to_exclude = set()
+        if self.chunked_req:
+            # Move the chunked request out of the batch so that we can merge
+            # only finished requests to running_batch.
+            chunked_req_to_exclude.add(self.chunked_req)
+            self.tree_cache.cache_unfinished_req(self.chunked_req)
+            # chunked request keeps its rid but will get a new req_pool_idx
+            self.req_to_token_pool.free(self.chunked_req.req_pool_idx)
+
         # Merge the prefill batch into the running batch
         if self.last_batch and self.last_batch.forward_mode.is_extend():
+            if self.last_batch.chunked_req is not None:
+                chunked_req_to_exclude.add(self.last_batch.chunked_req)
+
             # Filter batch
             last_bs = self.last_batch.batch_size
-            self.last_batch.filter_batch()
+            self.last_batch.filter_batch(
+                chunked_req_to_exclude=list(chunked_req_to_exclude)
+            )
             if self.last_batch.batch_size < last_bs:
                 self.running_batch.batch_is_full = False
 
@@ -604,7 +626,9 @@ class Scheduler(
 
     def get_new_batch_prefill(self) -> Optional[ScheduleBatch]:
         # Handle the cases where prefill is not allowed
-        if self.running_batch.batch_is_full or len(self.waiting_queue) == 0:
+        if (
+            self.running_batch.batch_is_full or len(self.waiting_queue) == 0
+        ) and self.chunked_req is None:
             return None
 
         running_bs = len(self.running_batch.reqs)
@@ -623,7 +647,12 @@ class Scheduler(
             self.running_batch,
             self.new_token_ratio,
             self.max_prefill_tokens,
+            self.chunked_prefill_size,
         )
+
+        if self.chunked_req is not None:
+            self.chunked_req.init_next_round_input()
+            self.chunked_req = adder.add_chunked_req(self.chunked_req)
 
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
@@ -652,6 +681,13 @@ class Scheduler(
             x for x in self.waiting_queue if x not in set(can_run_list)
         ]
 
+        if adder.new_chunked_req is not None:
+            assert self.chunked_req is None
+            self.chunked_req = adder.new_chunked_req
+
+        if self.chunked_req:
+            self.chunked_req.is_chunked += 1
+
         self.log_prefill_stats(adder, can_run_list, running_bs)
 
         # Create a new batch
@@ -662,6 +698,7 @@ class Scheduler(
             self.tree_cache,
             self.model_config,
             False,
+            self.chunked_req,
             self.mesh,
         )
 
@@ -721,8 +758,8 @@ class Scheduler(
         assert self.is_generation
 
         model_worker_batch = batch.get_model_worker_batch(
-            self.max_running_requests,
             self.max_total_num_tokens,
+            self.prefill_padded_batch_size,
             self.tp_worker.precompile_decode_bs_paddings,
             self.tp_worker.precompile_prefill_token_paddings,
         )

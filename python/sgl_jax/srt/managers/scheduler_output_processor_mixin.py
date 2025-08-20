@@ -111,6 +111,7 @@ class SchedulerOutputProcessorMixin:
         batch: ScheduleBatch,
         result: GenerationBatchResult,
     ):
+        skip_stream_req = None
         logits_output, next_token_ids, cache_miss_count = (
             result.logits_output,
             result.next_token_ids,
@@ -132,33 +133,37 @@ class SchedulerOutputProcessorMixin:
             if req.is_retracted:
                 continue
 
-            req.output_ids.append(next_token_id)
+            if req.is_chunked <= 0:
+                req.output_ids.append(next_token_id)
 
-            req.check_finished()
-            if req.finished():
-                self.tree_cache.cache_finished_req(req)
+                req.check_finished()
+                if req.finished():
+                    self.tree_cache.cache_finished_req(req)
 
-            if req.return_logprob:
-                # speculative worker handles logprob in speculative decoding
-                req.output_token_logprobs_val.append(next_token_logprobs[i])
-                req.output_token_logprobs_idx.append(next_token_id)
-                if req.top_logprobs_num > 0:
-                    req.output_top_logprobs_val.append(
-                        logits_output.next_token_top_logprobs_val[i]
-                    )
-                    req.output_top_logprobs_idx.append(
-                        logits_output.next_token_top_logprobs_idx[i]
-                    )
-                if req.token_ids_logprob is not None:
-                    req.output_token_ids_logprobs_val.append(
-                        logits_output.next_token_token_ids_logprobs_val[i]
-                    )
-                    req.output_token_ids_logprobs_idx.append(
-                        logits_output.next_token_token_ids_logprobs_idx[i]
-                    )
+                if req.return_logprob:
+                    # speculative worker handles logprob in speculative decoding
+                    req.output_token_logprobs_val.append(next_token_logprobs[i])
+                    req.output_token_logprobs_idx.append(next_token_id)
+                    if req.top_logprobs_num > 0:
+                        req.output_top_logprobs_val.append(
+                            logits_output.next_token_top_logprobs_val[i]
+                        )
+                        req.output_top_logprobs_idx.append(
+                            logits_output.next_token_top_logprobs_idx[i]
+                        )
+                    if req.token_ids_logprob is not None:
+                        req.output_token_ids_logprobs_val.append(
+                            logits_output.next_token_token_ids_logprobs_val[i]
+                        )
+                        req.output_token_ids_logprobs_idx.append(
+                            logits_output.next_token_token_ids_logprobs_idx[i]
+                        )
+            else:
+                req.is_chunked -= 1
+                skip_stream_req = req
 
         self.set_next_batch_sampling_info_done(batch)
-        self.stream_output(batch.reqs, batch.return_logprob)
+        self.stream_output(batch.reqs, batch.return_logprob, skip_stream_req)
         self.token_to_kv_pool_allocator.free_group_end()
 
         self.forward_ct_decode = (self.forward_ct_decode + 1) % (1 << 30)
