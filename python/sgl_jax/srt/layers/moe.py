@@ -473,7 +473,7 @@ class EPMoE(nnx.Module):
     def _expert_all_to_all_dispatch(
         self, data, global_group_sizes, sorted_experts, expert_shard_id
     ):
-        return self._simple_dispatch(
+        return self._ragged_all_to_all_dispatch(
             data, global_group_sizes, sorted_experts, expert_shard_id
         )
 
@@ -557,7 +557,7 @@ class EPMoE(nnx.Module):
     def _expert_all_to_all_collect(
         self, data, global_group_sizes, expert_shard_id, target_size
     ):
-        return self._cpu_simple_collect(
+        return self._ragged_all_to_all_collect(
             data, global_group_sizes, expert_shard_id, target_size
         )
 
