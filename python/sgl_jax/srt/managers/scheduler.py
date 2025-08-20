@@ -578,7 +578,7 @@ class Scheduler(
             # Tier 1: Node 0 receives requests and distributes to DP group leaders
             recv_reqs = self._collect_external_requests()
 
-            if recv_reqs:
+            if recv_reqs and len(recv_reqs) > 0:
                 # Distribute requests round-robin to DP group leaders
                 distributed_reqs = self._distribute_requests_to_dp_groups(recv_reqs)
                 # Node 0 keeps requests assigned to its own DP group
@@ -592,6 +592,7 @@ class Scheduler(
             # All non-node-0 schedulers: receive requests from the global distribution
             my_group_reqs = self._receive_requests_from_node0()
 
+        logger.debug(f"Node {self.node_rank} my_group_reqs: {my_group_reqs}")
         # Note: No Tier 2 needed! All nodes already have the distribution map
         # and can extract their own group's requests directly
 
