@@ -116,10 +116,10 @@ def main():
 
     page_size = 128
     batch_size_config = [8, 16, 32]
-    seq_len_config = [1024, 2048]
-    head_num_config = [2, 4, 8, 16]
+    seq_len_config = [1024, 2048, 4096]
+    head_num_config = [2, 4, 8]
     head_dim_config = [128]
-    max_kv_cache_tokens_config = [120000]
+    max_kv_cache_tokens_config = [160000]
     all_combinations = []
     for max_kv_cache_tokens in max_kv_cache_tokens_config:
         for batch_size in batch_size_config:

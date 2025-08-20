@@ -13,8 +13,6 @@ from sgl_jax.srt.layers.attention.flash_attn_kernel.flash_attention import (
 from sgl_jax.srt.layers.radix_attention import RadixAttention
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 
-CACHE_LOC_PADDING_BUCKETS = [128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536]
-
 
 @register_pytree_node_class
 @dataclass
@@ -29,8 +27,6 @@ class FlashAttentionMetadata:
     cu_q_lens: jax.Array = None
     cu_kv_lens: jax.Array = None
     page_indices: jax.Array = None
-    num_kv_pages_per_block: int = None
-    num_queries_per_block: int = None
 
     def tree_flatten(self):
         children = (
@@ -40,17 +36,12 @@ class FlashAttentionMetadata:
             self.page_indices,
         )
 
-        aux_data = {
-            "num_kv_pages_per_block": self.num_kv_pages_per_block,
-            "num_queries_per_block": self.num_queries_per_block,
-        }
+        aux_data = {}
         return (children, aux_data)
 
     @classmethod
     def tree_unflatten(cls, aux_data, children):
         obj = cls.__new__(cls)
-        obj.num_kv_pages_per_block = aux_data["num_kv_pages_per_block"]
-        obj.num_queries_per_block = aux_data["num_queries_per_block"]
 
         obj.num_seqs = children[0]
         obj.cu_q_lens = children[1]
@@ -70,8 +61,6 @@ class FlashAttention(AttentionBackend):
         num_kv_heads,
         head_dim,
         vmem_limit_bytes: int = 32 * (1 << 20),  # 32MB
-        max_num_kv_pages_per_block: int = 16,
-        max_num_queries_per_block: int = 32,
         page_size: int = 1,
     ):
         self.vmem_limit_bytes = vmem_limit_bytes
@@ -81,8 +70,6 @@ class FlashAttention(AttentionBackend):
         else:
             self.num_kv_heads = num_attn_heads
         self.head_dim = head_dim
-        self.max_num_kv_pages_per_block = max_num_kv_pages_per_block
-        self.max_num_queries_per_block = max_num_queries_per_block
         self.page_size = page_size
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
@@ -94,9 +81,6 @@ class FlashAttention(AttentionBackend):
         metadata.page_indices = (selected_cache_locs // self.page_size).astype(
             jnp.int32
         )
-
-        metadata.num_kv_pages_per_block = self.max_num_kv_pages_per_block
-        metadata.num_queries_per_block = self.max_num_queries_per_block
 
         if forward_batch.forward_mode == ForwardMode.EXTEND:
             metadata.cu_q_lens = jnp.concatenate(
@@ -136,8 +120,6 @@ class FlashAttention(AttentionBackend):
             "num_kv_heads": self.num_kv_heads,
             "vmem_limit_bytes": self.vmem_limit_bytes,
             "head_dim": self.head_dim,
-            "max_num_kv_pages_per_block": self.max_num_kv_pages_per_block,
-            "max_num_queries_per_block": self.max_num_queries_per_block,
             "page_size": self.page_size,
         }
         return (children, aux_data)
@@ -149,8 +131,6 @@ class FlashAttention(AttentionBackend):
             aux_data["num_kv_heads"],
             aux_data["head_dim"],
             aux_data["vmem_limit_bytes"],
-            aux_data["max_num_kv_pages_per_block"],
-            aux_data["max_num_queries_per_block"],
             aux_data["page_size"],
         )
 
@@ -218,8 +198,6 @@ class FlashAttention(AttentionBackend):
                 sliding_window=None,
                 soft_cap=None,
                 mask_value=None,
-                num_kv_pages_per_block=self.forward_metadata.num_kv_pages_per_block,
-                num_queries_per_block=self.forward_metadata.num_queries_per_block,
                 vmem_limit_bytes=self.vmem_limit_bytes,
             )
 
@@ -269,13 +247,3 @@ class FlashAttention(AttentionBackend):
             )
 
         return forward_batch.token_to_kv_pool.get_kv_buffer(layer_id)
-
-
-def get_cache_loc_padding_size_per_seq(max_seq_len_in_batch: int) -> int:
-    """
-    Get the padding size for each sequence in the bucket.
-    """
-    for bucket in CACHE_LOC_PADDING_BUCKETS:
-        if bucket >= max_seq_len_in_batch:
-            return bucket
-    assert False, "No bucket is greater than max_seq_len_in_batch"

@@ -35,11 +35,47 @@ DEFAULT_MASK_VALUE = -0.7 * float(jnp.finfo(jnp.dtype("float32")).max)
 TUNED_BLOCK_SIZES = {
     "TPU v6": {
         # (q_dtype, kv_dtype, num_kv_heads_per_blk, head_dim, page_size)
+        ("bfloat16", "bfloat16", 2, 128, 128): (16, 32),
+        ("bfloat16", "bfloat16", 4, 128, 128): (8, 32),
         ("bfloat16", "bfloat16", 8, 128, 128): (16, 32),
         ("bfloat16", "bfloat16", 16, 128, 128): (8, 32),
+        ("bfloat16", "bfloat16", 32, 128, 128): (8, 32),
         # go/keep-sorted end
     },
 }
+
+
+def next_power_of_2(x: int):
+    """Finds the smallest power of 2 >= x using bit manipulation.
+
+    Args:
+      x: The input number (should be an integer).
+
+    Returns:
+      The smallest integer power of 2 that is >= x.
+    """
+    assert x > 0
+    if x == 1:
+        return 1
+    return 1 << (x - 1).bit_length()
+
+
+def simplify_key(key):
+    """Simplify the key to reduce the number of combinations."""
+    (
+        q_dtype,
+        kv_dtype,
+        num_kv_heads_per_blk,
+        head_dim,
+        page_size,
+    ) = key
+    return (
+        jnp.dtype(q_dtype).name,
+        jnp.dtype(kv_dtype).name,
+        next_power_of_2(num_kv_heads_per_blk),
+        (head_dim + 127) // 128 * 128,
+        next_power_of_2(page_size),
+    )
 
 
 def get_tuned_block_sizes(
@@ -60,15 +96,15 @@ def get_tuned_block_sizes(
         head_dim,
         page_size,
     )
-    key = tbs.simplify_key(key)
+    key = simplify_key(key)
     device_name = tbs.get_device_name()
 
     # Default block sizes.
-    bkv, bq = (128, 32)
+    bkv, bq = (8, 32)
     if device_name in TUNED_BLOCK_SIZES:
         if key in TUNED_BLOCK_SIZES[device_name]:
             bkv, bq = TUNED_BLOCK_SIZES[device_name][key]
-    return (min(pages_per_seq, bkv), min(total_input_tokens, bq))
+    return (bkv, bq)
 
 
 class MultiPageAsyncCopyDescriptor:
@@ -767,7 +803,13 @@ def ragged_paged_attention(
     num_q_per_blk = num_queries_per_block
     num_kv_pages_per_blk = num_kv_pages_per_block
     if num_q_per_blk is None or num_kv_pages_per_blk is None:
-        assert False, "num_q_per_blk or num_kv_pages_per_blk is None"
+        num_kv_pages_per_blk, num_q_per_blk = get_tuned_block_sizes(
+            q.dtype,
+            k_cache.dtype,
+            num_kv_heads,
+            head_dim,
+            page_size,
+        )
 
     num_q_heads_per_kv_head = num_q_heads // num_kv_heads
     num_q_blks = cdiv(num_q_tokens, num_q_per_blk)
