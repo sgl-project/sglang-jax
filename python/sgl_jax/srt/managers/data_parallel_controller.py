@@ -234,8 +234,8 @@ def run_data_parallel_controller_process(
         pipe_writer.send(
             {
                 "status": "ready",
-                "max_total_num_tokens": controller.max_total_num_tokens,
-                "max_req_input_len": controller.max_req_input_len,
+                "max_total_num_tokens": 1000000,  # controller.max_total_num_tokens,
+                "max_req_input_len": 1000000,  # controller.max_req_input_len,
             }
         )
         if server_args.node_rank == 0:
