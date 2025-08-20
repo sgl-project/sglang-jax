@@ -101,8 +101,15 @@ class DataParallelController:
         )
         proc.start()
         self.scheduler_proc = proc
+        logger.debug(
+            f"Node {self.server_args.node_rank} Scheduler started and waiting for info"
+        )
         scheduler_info = reader.recv()
+        logger.debug(
+            f"Node {self.server_args.node_rank} Scheduler Info: {scheduler_info}"
+        )
         ready_event.set()
+        logger.debug(f"Node {self.server_args.node_rank} Scheduler ready and set event")
         return scheduler_info
 
     def _setup_dp_communication(self):
