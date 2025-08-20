@@ -591,8 +591,8 @@ class Scheduler(
         else:
             # All non-node-0 schedulers: receive requests from the global distribution
             my_group_reqs = self._receive_requests_from_node0()
-
-        logger.debug(f"Node {self.node_rank} my_group_reqs: {my_group_reqs}")
+        if len(my_group_reqs) > 0:
+            logger.debug(f"Node {self.node_rank} my_group_reqs: {my_group_reqs}")
         # Note: No Tier 2 needed! All nodes already have the distribution map
         # and can extract their own group's requests directly
 
@@ -1098,7 +1098,7 @@ def run_scheduler_process(
                 "max_req_input_len": scheduler.max_req_input_len,
             }
         )
-
+        logger.info(f"Node {server_args.node_rank} scheduler ready")
         scheduler.event_loop_normal()
 
     except Exception:
