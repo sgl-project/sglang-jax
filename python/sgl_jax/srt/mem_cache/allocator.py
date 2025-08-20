@@ -1,6 +1,6 @@
 import abc
 import logging
-from typing import Optional
+from typing import List, Optional
 
 import jax.numpy as jnp
 import numpy as np
@@ -168,9 +168,9 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
     def alloc_extend(
         self,
-        prefix_lens: jnp.ndarray,
-        seq_lens: jnp.ndarray,
-        last_loc: jnp.ndarray,
+        prefix_lens: List[int],
+        seq_lens: List[int],
+        last_loc: List[int],
         extend_num_tokens: int,
     ) -> Optional[jnp.ndarray]:
         # Convert to numpy for internal operations
@@ -274,8 +274,8 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
     def alloc_decode(
         self,
-        seq_lens: jnp.ndarray,
-        last_loc: jnp.ndarray,
+        seq_lens: List[int],
+        last_loc: List[int],
     ) -> Optional[jnp.ndarray]:
         # Convert inputs to numpy for calculations
         seq_lens_np = np.array(seq_lens)

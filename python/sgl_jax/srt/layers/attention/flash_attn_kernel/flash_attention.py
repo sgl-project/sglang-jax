@@ -225,6 +225,7 @@ def static_validate_inputs(
     cu_q_lens: jax.Array,  # i32[max_num_seqs + 1]
     cu_kv_lens: jax.Array,  # i32[max_num_seqs + 1]
     num_seqs: jax.Array,  # i32[1]
+    seq_lens: jax.Array,  # i32[max_num_seqs]
     *,
     # These inputs are optional. If not specified, we will not validate them.
     sm_scale: float | None = None,
@@ -263,11 +264,12 @@ def static_validate_inputs(
         cu_kv_lens.dtype != jnp.int32
         or page_indices.dtype != jnp.int32
         or cu_q_lens.dtype != jnp.int32
+        or seq_lens.dtype != jnp.int32
     ):
         raise ValueError(
-            "The dtype of `kv_lens`, `page_indices`, and `cu_q_lens` must be"
+            "The dtype of `kv_lens`, `page_indices`, `cu_q_lens`, and `seq_lens` must be"
             f" int32. Got {cu_kv_lens.dtype=}, {page_indices.dtype=},"
-            f" {cu_q_lens.dtype=}."
+            f" {cu_q_lens.dtype=}, {seq_lens.dtype=}."
         )
     if num_q_heads % num_kv_heads != 0:
         raise ValueError(f"{num_q_heads=} must be divisible by {num_kv_heads=}")
@@ -347,6 +349,7 @@ def ragged_paged_attention_kernel(
     cu_kv_lens_ref,  # [max_num_seqs + 1]
     seq_buf_idx_ref,
     num_seqs_ref,
+    seq_lens_ref,
     # Input
     q_ref,  # [num_q_per_blk, num_q_heads_per_blk, head_dim]
     k_cache_hbm_ref,  # [total_num_pages, page_size, num_kv_heads, head_dim]
@@ -435,8 +438,23 @@ def ragged_paged_attention_kernel(
         q_end = cu_q_lens_ref[cur_seq_idx + 1]
         q_len = q_end - q_start
         kv_start = cu_kv_lens_ref[cur_seq_idx]
-        kv_end = cu_kv_lens_ref[cur_seq_idx + 1]
+        kv_end = cu_kv_lens_ref[cur_seq_idx + 1]  # 保持页面计算的一致性
         kv_len = kv_end - kv_start
+        
+        # 安全地获取实际序列长度，添加边界检查
+        actual_kv_len = lax.select(
+            cur_seq_idx < seq_lens_ref.shape[0],
+            seq_lens_ref[cur_seq_idx],
+            kv_len  # 如果越界，使用对齐长度作为fallback
+        )
+        
+        # 确保 actual_kv_len 不超过对齐长度，并且不为负数
+        actual_kv_len = jnp.minimum(jnp.maximum(actual_kv_len, 0), kv_len)
+        
+        pl.debug_print("cur_seq_idx={}", cur_seq_idx)
+        pl.debug_print("seq_lens_ref.shape[0]={}", seq_lens_ref.shape[0])
+        pl.debug_print("actual_kv_len={}", actual_kv_len)
+        pl.debug_print("aligned_kv_len={}", kv_len)
 
         def get_next_prefetch_ids(heads_blk_idx, cur_seq_idx, kv_blk_idx, cur_buf_idx):
             next_kv_blk_idx = kv_blk_idx + 1
@@ -475,6 +493,7 @@ def ragged_paged_attention_kernel(
             head_acc_ref,  # [num_q_per_blk, num_q_heads_per_kv_head, head_dim]
             *,
             kv_blk_idx,
+            actual_kv_len,  # 新增：实际序列长度
         ):
             assert q.shape == (
                 num_q_per_blk * num_q_heads_per_kv_head,
@@ -517,8 +536,10 @@ def ragged_paged_attention_kernel(
                 )
 
             # kv lens will be contracting dim, we should mask out the NaNs.
+            # 使用实际序列长度而不是对齐长度，但确保不会是负数
+            effective_kv_len = jnp.maximum(actual_kv_len - kv_len_start, 0)
             kv_mask = (
-                lax.broadcasted_iota(jnp.int32, k.shape, 0) < kv_len - kv_len_start
+                lax.broadcasted_iota(jnp.int32, k.shape, 0) < effective_kv_len
             )
             k = jnp.where(kv_mask, k.astype(jnp.float32), 0).astype(k.dtype)
             v = jnp.where(kv_mask, v.astype(jnp.float32), 0).astype(v.dtype)
@@ -531,7 +552,7 @@ def ragged_paged_attention_kernel(
             store_end = jnp.minimum(q_end - q_len_start, num_q_per_blk)
 
             row_ids = (
-                (kv_len - q_len)
+                (actual_kv_len - q_len)
                 + q_len_start
                 - q_start
                 + jax.lax.broadcasted_iota(
@@ -607,7 +628,7 @@ def ragged_paged_attention_kernel(
 
         def is_valid_kv_blk_in_cur_seq(kv_states):
             kv_blk_idx, _ = kv_states
-            return kv_blk_idx * num_kv_per_blk < kv_len
+            return kv_blk_idx * num_kv_per_blk < actual_kv_len
 
         def compute_with_kv_blk_in_cur_seq(kv_states):
             kv_blk_idx, cur_buf_idx = kv_states
@@ -667,6 +688,7 @@ def ragged_paged_attention_kernel(
                     m_ref.at[kv_head_idx],
                     acc_ref.at[:, q_head_idx : q_head_idx + num_q_heads_per_kv_head, :],
                     kv_blk_idx=kv_blk_idx,
+                    actual_kv_len=actual_kv_len,
                 )
             return kv_blk_idx + 1, next_buf_idx
 
@@ -737,6 +759,7 @@ def ragged_paged_attention(
     cu_q_lens: jax.Array,  # i32[max_num_seqs + 1]
     cu_kv_lens: jax.Array,  # i32[max_num_seqs + 1]
     num_seqs: jax.Array,  # i32[1]
+    seq_lens: jax.Array,  # i32[padded_num_seqs]
     *,
     sm_scale: float = 1.0,
     sliding_window: int | None = None,
@@ -782,6 +805,7 @@ def ragged_paged_attention(
         cu_q_lens,
         cu_kv_lens,
         num_seqs,
+        seq_lens,
         sm_scale=sm_scale,
         sliding_window=sliding_window,
         soft_cap=soft_cap,
@@ -865,6 +889,7 @@ def ragged_paged_attention(
         cu_kv_lens,
         jnp.array((0, 0), jnp.int32),  # seq_idx, buf_idx
         num_seqs,
+        seq_lens,
     )
     kernel = pl.pallas_call(
         functools.partial(

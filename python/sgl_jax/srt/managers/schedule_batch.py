@@ -540,9 +540,9 @@ class ScheduleBatch:
 
     def alloc_paged_token_slots_extend(
         self,
-        prefix_lens: jax.Array,
-        seq_lens: jax.Array,
-        last_loc: jax.Array,
+        prefix_lens: List[int],
+        seq_lens: List[int],
+        last_loc: List[int],
         extend_num_tokens: int,
         backup_state: bool = False,
     ):
@@ -574,8 +574,8 @@ class ScheduleBatch:
 
     def alloc_paged_token_slots_decode(
         self,
-        seq_lens: jax.Array,
-        last_loc: jax.Array,
+        seq_lens: List[int],
+        last_loc: List[int],
         backup_state: bool = False,
     ):
         num_tokens = len(seq_lens) * self.token_to_kv_pool_allocator.page_size
@@ -700,7 +700,7 @@ class ScheduleBatch:
                 prefix_lens_device,
             )
             out_cache_loc = self.alloc_paged_token_slots_extend(
-                prefix_lens_device, seq_lens_device, last_loc, extend_num_tokens
+                prefix_lens, seq_lens, jax.device_get(last_loc).tolist(), extend_num_tokens
             )
 
         # Set fields
@@ -871,7 +871,7 @@ class ScheduleBatch:
                 self.req_pool_indices, self.seq_lens - 2
             ]
             self.out_cache_loc = self.alloc_paged_token_slots_decode(
-                self.seq_lens, last_loc
+                jax.device_get(self.seq_lens).tolist(), jax.device_get(last_loc).tolist()
             )
 
         self.req_to_token_pool.write(

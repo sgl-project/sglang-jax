@@ -27,6 +27,7 @@ class FlashAttentionMetadata:
     cu_q_lens: jax.Array = None
     cu_kv_lens: jax.Array = None
     page_indices: jax.Array = None
+    seq_lens: jax.Array = None
 
     def tree_flatten(self):
         children = (
@@ -34,6 +35,7 @@ class FlashAttentionMetadata:
             self.cu_q_lens,
             self.cu_kv_lens,
             self.page_indices,
+            self.seq_lens,
         )
 
         aux_data = {}
@@ -47,6 +49,7 @@ class FlashAttentionMetadata:
         obj.cu_q_lens = children[1]
         obj.cu_kv_lens = children[2]
         obj.page_indices = children[3]
+        obj.seq_lens = children[4]
 
         return obj
 
@@ -101,17 +104,19 @@ class FlashAttention(AttentionBackend):
         else:
             raise ValueError(f"Invalid forward mode: {forward_batch.forward_mode}")
 
-        metadata.cu_kv_lens = jnp.concatenate(
-            [
-                jnp.array([0], dtype=jnp.int32),
-                jnp.cumsum(forward_batch.seq_lens),
-            ]
-        )
+        metadata.seq_lens = jnp.copy(forward_batch.seq_lens)
+        
+        aligned_seq_lens = ((forward_batch.seq_lens + self.page_size - 1) // self.page_size) * self.page_size
+        metadata.cu_kv_lens = jnp.concatenate([
+            jnp.array([0], dtype=jnp.int32),
+            jnp.cumsum(aligned_seq_lens),
+        ])
+
         metadata.num_seqs = jnp.sum(
             forward_batch.seq_lens > 0, dtype=jnp.int32
         ).reshape(
             1,
-        )
+        )        
 
         self.forward_metadata = metadata
 
@@ -178,6 +183,7 @@ class FlashAttention(AttentionBackend):
             P(),  # cu_q_lens
             P(),  # cu_kv_lens
             P(),  # num_seqs
+            P(),  # seq_lens
         )
         out_specs = P(None, self.kv_partition_axis)
 
@@ -225,6 +231,7 @@ class FlashAttention(AttentionBackend):
             self.forward_metadata.cu_q_lens,
             self.forward_metadata.cu_kv_lens,
             self.forward_metadata.num_seqs,
+            self.forward_metadata.seq_lens,
         )
 
         return (
