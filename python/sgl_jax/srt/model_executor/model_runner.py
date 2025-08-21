@@ -390,6 +390,8 @@ class ModelRunner:
         skip_attn_backend_init: bool,
     ) -> Tuple[Union[LogitsProcessorOutput], bool]:
         print(f"[MODEL_RUNNER] _forward_raw called, mode={forward_batch.forward_mode}")
+        test_get1 = jax.device_get(forward_batch)
+        print(f"[MODEL_RUNNER] before test_get1: {test_get1}")
         with self.mesh, jax.sharding.use_mesh(self.mesh):
             if forward_batch.forward_mode.is_decode():
                 print(f"[MODEL_RUNNER] Using decode mode")
@@ -407,8 +409,8 @@ class ModelRunner:
                 raise ValueError(f"Invalid forward mode: {forward_batch.forward_mode}")
 
         print(f"[MODEL_RUNNER] _forward_raw completed, returning result")
-        test_get = jax.device_get(forward_batch)
-        print(f"[MODEL_RUNNER] ret: {test_get}")
+        test_get2 = jax.device_get(forward_batch)
+        print(f"[MODEL_RUNNER] after test_get2: {test_get2}")
         return ret
 
     def _preprocess_logits(
