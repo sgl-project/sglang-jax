@@ -86,7 +86,7 @@ class DataParallelController:
             target=run_scheduler_process,
             args=(
                 self.server_args,
-                self.port_args,
+                PortArgs.init_new(self.server_args, dp_rank),
                 self.dp_rank,
                 writer,
             ),
