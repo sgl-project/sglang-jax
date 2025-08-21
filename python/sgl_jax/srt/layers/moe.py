@@ -653,32 +653,37 @@ class EPMoE(nnx.Module):
         """TPU/GPU: Use ragged_all_to_all for collection - inverse of dispatch"""
         local_expert_size = self.experts_per_device
         
-        # For collect, we reverse the dispatch communication pattern
-        # In dispatch: reshaped_group_sizes[i] = how much device i receives
-        # In collect: reshaped_group_sizes[i] = how much device i sends back
-        reshaped_group_sizes = jnp.sum(
-            global_group_sizes.reshape(self.expert_parallel_size, local_expert_size),
-            axis=1,
+        # Calculate how much data each device should contribute to the final result
+        reshaped_group_sizes = global_group_sizes.reshape(
+            self.expert_parallel_size, local_expert_size
         )
+        tokens_per_device = jnp.sum(reshaped_group_sizes, axis=1)
 
-        # Collect is the transpose of dispatch communication
-        # Swap send/recv roles and offsets
-        recv_offsets, recv_sizes, send_offsets, send_sizes = (
-            self._get_ragged_all_to_all_params(reshaped_group_sizes, expert_shard_id)
-        )
+        # For collect: each device sends all its processed data
+        # input_offsets: all zeros (read from start of each device's data)
+        input_offsets = jnp.zeros(self.expert_parallel_size, dtype=jnp.int32)
+        
+        # send_sizes: this device sends all its data to all other devices
+        send_sizes = jnp.repeat(data.shape[0], self.expert_parallel_size)
+        
+        # output_offsets: where each device's data should go in the final result
+        cumsum_tokens = jnp.cumsum(jnp.concatenate([jnp.array([0]), tokens_per_device]))
+        output_offsets = cumsum_tokens[:-1]  # Remove the last element
+        
+        # recv_sizes: how much data we receive from each device
+        recv_sizes = tokens_per_device
 
         # Create output buffer with target size
         output_shape = jnp.zeros((target_size, data.shape[1]), dtype=data.dtype)
 
         print(f"[RAGGED_COLLECT] About to call ragged_all_to_all - target_size={target_size}")
-        # Execute ragged_all_to_all with swapped parameters
         result = jax.lax.ragged_all_to_all(
             data,
             output_shape,
-            send_offsets,    # input_offsets: where to read from input
-            send_sizes,      # send_sizes: how much this device sends
-            recv_offsets,    # output_offsets: where to place in output  
-            recv_sizes,      # recv_sizes: how much this device receives
+            input_offsets,
+            send_sizes,
+            output_offsets,
+            recv_sizes,
             axis_name=("data", "tensor"),
         )
         print(f"[RAGGED_COLLECT] ragged_all_to_all completed - output.shape={result.shape}")
