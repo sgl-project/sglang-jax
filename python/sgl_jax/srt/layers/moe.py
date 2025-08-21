@@ -609,9 +609,13 @@ class EPMoE(nnx.Module):
             communicated_data, f"ragged_dispatch_output", f"moe_dispatch_layer_id_{self.layer_id}"
         )
         
-        # 纯 EP 情况下，ragged_all_to_all 后直接返回数据和原始 group_sizes
-        # 不需要 local_permute 步骤
-        return communicated_data, global_group_sizes, sorted_experts, None
+        # 纯 EP 情况下，需要计算当前设备上专家的 local_group_sizes
+        # 每个设备只负责部分专家，所以需要提取对应的 group_sizes
+        start_expert_idx = expert_shard_id * local_expert_size
+        end_expert_idx = start_expert_idx + local_expert_size
+        local_group_sizes = global_group_sizes[start_expert_idx:end_expert_idx]
+        
+        return communicated_data, local_group_sizes, sorted_experts, None
 
     def _expert_all_to_all_collect(
         self, data, global_group_sizes, expert_shard_id, target_size, local_sorted_indices=None
