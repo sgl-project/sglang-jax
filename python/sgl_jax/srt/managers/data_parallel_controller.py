@@ -20,15 +20,9 @@ from sgl_jax.srt.managers.io_struct import (
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
 )
+from sgl_jax.srt.managers.scheduler import run_scheduler_process
 from sgl_jax.srt.server_args import PortArgs, ServerArgs
 from sgl_jax.srt.utils import get_zmq_socket
-
-
-# Import scheduler only when needed to avoid circular dependencies
-def _import_scheduler():
-    from sgl_jax.srt.managers.scheduler import run_scheduler_process
-
-    return run_scheduler_process
 
 
 def get_exception_traceback():
@@ -86,9 +80,6 @@ class DataParallelController:
             f"Launching scheduler for Node rank {self.server_args.node_rank} DP rank {dp_rank}"
         )
         reader, writer = mp.Pipe(duplex=False)
-
-        # Import scheduler function when needed
-        run_scheduler_process = _import_scheduler()
 
         proc = mp.Process(
             target=run_scheduler_process,
