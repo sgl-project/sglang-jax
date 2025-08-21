@@ -149,14 +149,15 @@ class EPMoE(nnx.Module):
         self.experts_per_device = num_experts // self.expert_parallel_size
         expert_kernel_axes = (("data", "tensor"), None, None)
 
-        # 在纯EP设置中，没有独立的tensor parallelism，使用完整的hidden_size
-        # EP的并行是在专家维度，不是hidden维度
-        hidden_size_per_partition = config.hidden_size
+        # 在纯EP设置中，hidden维度不被切分，专家维度被切分
+        # MoE的输入输出都应该是完整的hidden_size
+        input_hidden_size = config.hidden_size
+        output_hidden_size = config.hidden_size
         
         self.wi_0 = nnx.Param(
             nnx.with_partitioning(nnx.initializers.normal(), expert_kernel_axes)(
                 rngs.params(),
-                (self.experts_per_device, hidden_size_per_partition, intermediate_dim),
+                (self.experts_per_device, input_hidden_size, intermediate_dim),
                 weight_dtype,
             )
         )
@@ -164,7 +165,7 @@ class EPMoE(nnx.Module):
         self.wi_1 = nnx.Param(
             nnx.with_partitioning(nnx.initializers.normal(), expert_kernel_axes)(
                 rngs.params(),
-                (self.experts_per_device, hidden_size_per_partition, intermediate_dim),
+                (self.experts_per_device, input_hidden_size, intermediate_dim),
                 weight_dtype,
             )
         )
@@ -172,7 +173,7 @@ class EPMoE(nnx.Module):
         self.wo = nnx.Param(
             nnx.with_partitioning(nnx.initializers.normal(), expert_kernel_axes)(
                 rngs.params(),
-                (self.experts_per_device, intermediate_dim, hidden_size_per_partition),
+                (self.experts_per_device, intermediate_dim, output_hidden_size),
                 weight_dtype,
             )
         )
@@ -518,21 +519,19 @@ class EPMoE(nnx.Module):
     def _expert_all_to_all_dispatch(
         self, data, global_group_sizes, sorted_experts, expert_shard_id
     ):
-        print(f"[DISPATCH] Layer {self.layer_id} shard {expert_shard_id}: START - data.shape={data.shape}, use_ragged={self.can_use_ragged}")
+        print(f"[DISPATCH] Layer {self.layer_id} shard {expert_shard_id}: START - data.shape={data.shape}")
         
-        if self.can_use_ragged:
-            print(f"[DISPATCH] Layer {self.layer_id} shard {expert_shard_id}: Using ragged_all_to_all")
-            result = self._ragged_all_to_all_dispatch(
-                data, global_group_sizes, sorted_experts, expert_shard_id
-            )
-        else:
-            print(f"[DISPATCH] Layer {self.layer_id} shard {expert_shard_id}: Using simple dispatch")
-            result = self._simple_dispatch(
-                data, global_group_sizes, sorted_experts, expert_shard_id
-            )
-        jax.block_until_ready(result)
-        print(f"[DISPATCH] Layer {self.layer_id} shard {expert_shard_id}: END - result.shape={result[0].shape}")
-        return result
+        # 在纯 EP 中，dispatch 阶段只做 local_permute，不做 all_to_all
+        # 按照 MaxText lines 661-668 的逻辑
+        local_expert_size = self.experts_per_device
+        
+        # 使用 MaxText 的 local_permute 逻辑（is_offset=True）
+        x, local_sorted_indices, local_group_sizes, selected_experts = self._local_permute_with_offset(
+            data, global_group_sizes, local_expert_size, expert_shard_id, sorted_experts
+        )
+        
+        print(f"[DISPATCH] Layer {self.layer_id} shard {expert_shard_id}: END - result.shape={x.shape}")
+        return x, local_group_sizes, selected_experts, local_sorted_indices
 
     def _simple_dispatch(
         self, data, global_group_sizes, sorted_experts, expert_shard_id
@@ -580,33 +579,26 @@ class EPMoE(nnx.Module):
         self, data, global_group_sizes, sorted_experts, expert_shard_id
     ):
         """
-        完全按照 MaxText 的 dispatch 实现 (lines 625-659)
+        基于能工作版本的 dispatch 实现，但修正输出维度
         """
         local_expert_size = self.experts_per_device
         
-        # 步骤1：计算 reshaped_group_sizes（MaxText line 628）
-        reshaped_group_sizes = jnp.sum(global_group_sizes.reshape(-1, local_expert_size), axis=1)
-        
-        # 步骤2：gather all_shards_group_sizes（MaxText line 631）
-        # 使用真正的 all_gather 收集所有 shard 的 reshaped_group_sizes
-        all_shards_group_sizes = jax.lax.all_gather(
-            reshaped_group_sizes, axis_name=("data", "tensor"), axis=0
+        # 步骤1：计算 reshaped_group_sizes（与之前版本一致）
+        reshaped_group_sizes = jnp.sum(
+            global_group_sizes.reshape(self.expert_parallel_size, local_expert_size),
+            axis=1,
         )
-        
-        # 步骤3：纯 EP 使用 reshaped_group_sizes（MaxText lines 710-721）
-        input_offsets, send_sizes, output_offsets, recv_sizes = self._get_all_to_all_params(
-            reshaped_group_sizes, expert_shard_id, self.expert_parallel_size, is_batch_sharded=False
+
+        # 步骤2：使用之前能工作的参数计算
+        input_offsets, send_sizes, output_offsets, recv_sizes = (
+            self._get_ragged_all_to_all_params(reshaped_group_sizes, expert_shard_id)
         )
-        
-        # 步骤4：计算输出形状（MaxText lines 687-690）  
-        # data.shape[0] 等于 total_tokens * num_experts_per_tok，这里 total_tokens 已经是 batch_size * seq_len 的结果
-        original_inputs_first_dim = data.shape[0]  # 实际等于 batch_size * sequence_length * self.num_experts_per_tok
-        output_shape = jnp.zeros(
-            (original_inputs_first_dim, data.shape[1] // self._get_tensor_parallelism_size()),
-            dtype=data.dtype,
-        )
-        
-        # 步骤5：执行 ragged_all_to_all（MaxText lines 713-721）
+
+        # 步骤3：关键修复 - 使用正确的 buffer_size 计算
+        buffer_size = int(self.expert_parallel_size * data.shape[0])
+        output_shape = jnp.zeros((buffer_size, data.shape[1]), dtype=data.dtype)
+
+        # 步骤4：执行 ragged_all_to_all
         communicated_data = jax.lax.ragged_all_to_all(
             data,
             output_shape,
@@ -616,37 +608,48 @@ class EPMoE(nnx.Module):
             recv_sizes,
             axis_name=("data", "tensor"),
         )
-        
+
+        # 步骤5：使用之前版本的 local_permute
+        x, local_group_sizes, selected_experts = self._local_permute_for_ragged(
+            communicated_data, global_group_sizes, local_expert_size, expert_shard_id
+        )
+
         global_tracer.print(
-            communicated_data, f"ragged_dispatch_output", f"moe_dispatch_layer_id_{self.layer_id}"
+            x, f"ragged_dispatch_output", f"moe_dispatch_layer_id_{self.layer_id}"
         )
         
-        # 纯 EP 情况下，需要像 MaxText 一样做 local_permute 处理
-        # 从全局数据中筛选和重排当前设备负责的专家数据
-        sorted_inputs, local_group_sizes, sorted_expert_ids, local_sorted_indices = self._local_permute_with_offset(
-            communicated_data, global_group_sizes, local_expert_size, expert_shard_id, sorted_experts
-        )
-        
-        return sorted_inputs, local_group_sizes, sorted_expert_ids, local_sorted_indices
+        return x, local_group_sizes, selected_experts, None  # 保持接口一致
 
     def _expert_all_to_all_collect(
         self, data, global_group_sizes, expert_shard_id, target_size, local_sorted_indices=None
     ):
-        print(f"[COLLECT] Layer {self.layer_id} shard {expert_shard_id}: START - data.shape={data.shape}, target_size={target_size}, use_ragged={self.can_use_ragged}")
+        print(f"[COLLECT] Layer {self.layer_id} shard {expert_shard_id}: START - data.shape={data.shape}, target_size={target_size}")
         
-        if self.can_use_ragged:
-            print(f"[COLLECT] Layer {self.layer_id} shard {expert_shard_id}: Using ragged_all_to_all")
-            result = self._ragged_all_to_all_collect(
-                data, global_group_sizes, expert_shard_id, target_size, local_sorted_indices
-            )
-        else:
-            print(f"[COLLECT] Layer {self.layer_id} shard {expert_shard_id}: Using simple collect")
-            result = self._cpu_simple_collect(
-                data, global_group_sizes, expert_shard_id, target_size
-            )
-            
-        print(f"[COLLECT] Layer {self.layer_id} shard {expert_shard_id}: END - result.shape={result.shape}")
-        return result
+        # 按照 MaxText lines 710-721 的纯 EP collect 逻辑
+        local_expert_size = self.experts_per_device
+        reshaped_group_sizes = jnp.sum(global_group_sizes.reshape(-1, local_expert_size), axis=1)
+        
+        # 使用 MaxText 的 get_all_to_all_params
+        input_offsets, send_sizes, output_offsets, recv_sizes = self._get_all_to_all_params(
+            reshaped_group_sizes, expert_shard_id, self.expert_parallel_size, is_batch_sharded=False
+        )
+        
+        # 创建输出形状（MaxText lines 687-690）
+        output_shape = jnp.zeros((target_size, data.shape[1]), dtype=data.dtype)
+        
+        # 执行 ragged_all_to_all（MaxText lines 713-721）
+        intermediate_output = jax.lax.ragged_all_to_all(
+            data,
+            output_shape,
+            input_offsets,
+            send_sizes,
+            output_offsets,
+            recv_sizes,
+            axis_name=("data", "tensor"),
+        )
+        
+        print(f"[COLLECT] Layer {self.layer_id} shard {expert_shard_id}: END - result.shape={intermediate_output.shape}")
+        return intermediate_output
 
     def _cpu_simple_collect(
         self, data, global_group_sizes, expert_shard_id, target_size
@@ -726,7 +729,7 @@ class EPMoE(nnx.Module):
         original_inputs_first_dim = target_size  # 这应该等于 batch_size * sequence_length * self.num_experts_per_tok
         
         output_buffer = jnp.zeros(
-            (target_size, data.shape[1] // self._get_tensor_parallelism_size()),  # 考虑tensor parallelism
+            (target_size, data.shape[1]),  # 保持原始hidden维度
             dtype=data.dtype,
         )
         
@@ -808,6 +811,20 @@ class EPMoE(nnx.Module):
         send_sizes = transform_array(all_shards_group_sizes, shard_id, "SEND_SIZE", is_batch_sharded)
         output_offsets = transform_array(all_shards_group_sizes, shard_id, "OUTPUT_OFFSET", is_batch_sharded)
         recv_sizes = transform_array(all_shards_group_sizes, shard_id, "RECV_SIZE", is_batch_sharded)
+        return input_offsets, send_sizes, output_offsets, recv_sizes
+
+    def _get_ragged_all_to_all_params(self, reshaped_group_sizes, expert_shard_id):
+        """
+        之前能工作版本的参数计算方法
+        """
+        # 简单的参数计算逻辑，基于之前能工作的版本
+        input_offsets = jnp.zeros(self.expert_parallel_size, dtype=jnp.int32)
+        send_sizes = jnp.repeat(reshaped_group_sizes[expert_shard_id], self.expert_parallel_size)
+        
+        cumsum_sizes = jnp.cumsum(reshaped_group_sizes)
+        output_offsets = jnp.concatenate([jnp.array([0]), cumsum_sizes[:-1]])
+        recv_sizes = reshaped_group_sizes
+        
         return input_offsets, send_sizes, output_offsets, recv_sizes
 
     def _local_permute_with_offset(
