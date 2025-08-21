@@ -52,16 +52,22 @@ class SchedulerOutputProcessorMixin:
         )
 
         # Move next_token_ids and logprobs to cpu
+        print("device get next_token_ids start")
         next_token_ids = jax.device_get(next_token_ids).tolist()
+        print("device get next_token_ids end")
         if batch.return_logprob:
             if logits_output.next_token_logprobs is not None:
+                print("device get logits_output.next_token_logprobs start")
                 logits_output.next_token_logprobs = jax.device_get(
                     logits_output.next_token_logprobs
                 )
+                print("device get logits_output.next_token_logprobs end")
             if logits_output.input_token_logprobs is not None:
+                print("device get logits_output.input_token_logprobs start")
                 logits_output.input_token_logprobs = tuple(
                     jax.device_get(logits_output.input_token_logprobs)
                 )
+                print("device get logits_output.input_token_logprobs end")
 
         # Check finish conditions
         logprob_pt = 0
