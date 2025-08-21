@@ -171,9 +171,13 @@ class DataParallelController:
                     # Dispatch tokenized requests using round-robin
                     self.round_robin_scheduler(recv_req)
                 else:
-                    # Send other control messages to all workers
-                    for worker in self.workers:
-                        worker.send_pyobj(recv_req)
+                    logger.info(
+                        f"Node {self.server_args.node_rank} received control message: {recv_req}"
+                    )
+                    pass
+                    # # Send other control messages to all workers
+                    # for worker in self.workers:
+                    #     worker.send_pyobj(recv_req)
 
             except zmq.ZMQError:
                 # No message available, sleep briefly to avoid busy waiting
