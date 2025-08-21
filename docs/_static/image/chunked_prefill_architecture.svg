@@ -1,0 +1,130 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg width="800" height="450" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <!-- Gradients for different batch types -->
+    <linearGradient id="prefillGradient" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" style="stop-color:#ff6b6b;stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#ff8e8e;stop-opacity:1" />
+    </linearGradient>
+
+    <linearGradient id="decodeGradient" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" style="stop-color:#4ecdc4;stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#7ee7e0;stop-opacity:1" />
+    </linearGradient>
+
+    <linearGradient id="chunkedGradient" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" style="stop-color:#ff9f43;stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#feca57;stop-opacity:1" />
+    </linearGradient>
+  </defs>
+
+  <!-- Title -->
+  <text x="400" y="30" text-anchor="middle" font-family="Arial, sans-serif" font-size="20" font-weight="bold" fill="#333">
+    Traditional Prefill vs Chunked Prefill
+  </text>
+
+  <!-- Traditional Batching Section -->
+  <text x="50" y="70" font-family="Arial, sans-serif" font-size="16" font-weight="bold" fill="#333">
+    Traditional Prefill (Large Request):
+  </text>
+
+  <!-- Large Prefill Request -->
+  <rect x="50" y="90" width="300" height="60" rx="5" fill="url(#prefillGradient)" stroke="#333" stroke-width="1"/>
+  <text x="200" y="115" text-anchor="middle" font-family="Arial, sans-serif" font-size="12" fill="white" font-weight="bold">
+    Large Prefill Request
+  </text>
+  <text x="200" y="130" text-anchor="middle" font-family="Arial, sans-serif" font-size="10" fill="white">
+    (May exceed memory limits)
+  </text>
+
+  <!-- X mark for failure -->
+  <text x="370" y="125" font-family="Arial, sans-serif" font-size="24" fill="#e74c3c">✗</text>
+  <text x="390" y="125" font-family="Arial, sans-serif" font-size="12" fill="#e74c3c">Memory overflow</text>
+
+  <!-- Separator Line -->
+  <line x1="50" y1="190" x2="750" y2="190" stroke="#ddd" stroke-width="2"/>
+
+  <!-- Chunked Prefill Section -->
+  <text x="50" y="230" font-family="Arial, sans-serif" font-size="16" font-weight="bold" fill="#333">
+    Chunked Prefill (Same Request Split):
+  </text>
+
+  <!-- Chunked Batch 1 -->
+  <rect x="50" y="250" width="120" height="50" rx="5" fill="url(#chunkedGradient)" stroke="#333" stroke-width="1"/>
+  <text x="110" y="270" text-anchor="middle" font-family="Arial, sans-serif" font-size="11" fill="white" font-weight="bold">
+    Prefill Chunk 1
+  </text>
+  <text x="110" y="285" text-anchor="middle" font-family="Arial, sans-serif" font-size="9" fill="white">
+    (Tokens 0-2048)
+  </text>
+
+  <!-- Arrow 1 -->
+  <path d="M 180 275 L 200 275" stroke="#333" stroke-width="2" marker-end="url(#arrowhead)"/>
+
+  <!-- Chunked Batch 2 -->
+  <rect x="210" y="250" width="120" height="50" rx="5" fill="url(#chunkedGradient)" stroke="#333" stroke-width="1"/>
+  <text x="270" y="270" text-anchor="middle" font-family="Arial, sans-serif" font-size="11" fill="white" font-weight="bold">
+    Prefill Chunk 2
+  </text>
+  <text x="270" y="285" text-anchor="middle" font-family="Arial, sans-serif" font-size="9" fill="white">
+    (Tokens 2048-4096)
+  </text>
+
+  <!-- Arrow 2 -->
+  <path d="M 340 275 L 360 275" stroke="#333" stroke-width="2" marker-end="url(#arrowhead)"/>
+
+  <!-- Chunked Batch 3 -->
+  <rect x="370" y="250" width="120" height="50" rx="5" fill="url(#chunkedGradient)" stroke="#333" stroke-width="1"/>
+  <text x="430" y="270" text-anchor="middle" font-family="Arial, sans-serif" font-size="11" fill="white" font-weight="bold">
+    Prefill Chunk 3
+  </text>
+  <text x="430" y="285" text-anchor="middle" font-family="Arial, sans-serif" font-size="9" fill="white">
+    (Tokens 4096-N)
+  </text>
+
+  <!-- Arrow 3 -->
+  <path d="M 500 275 L 520 275" stroke="#333" stroke-width="2" marker-end="url(#arrowhead)"/>
+
+  <!-- Decode phase starts -->
+  <rect x="530" y="250" width="100" height="50" rx="5" fill="url(#decodeGradient)" stroke="#333" stroke-width="1"/>
+  <text x="580" y="270" text-anchor="middle" font-family="Arial, sans-serif" font-size="11" fill="white" font-weight="bold">
+    Decode Phase
+  </text>
+  <text x="580" y="285" text-anchor="middle" font-family="Arial, sans-serif" font-size="9" fill="white">
+    (Generation)
+  </text>
+
+  <!-- Check mark for success -->
+  <text x="320" y="330" font-family="Arial, sans-serif" font-size="16" fill="#27ae60">✓ Fits in memory, processes successfully</text>
+
+  <!-- Legend -->
+  <text x="50" y="380" font-family="Arial, sans-serif" font-size="14" font-weight="bold" fill="#333">
+    Legend:
+  </text>
+
+  <!-- Traditional Prefill Legend -->
+  <rect x="50" y="395" width="20" height="15" fill="url(#prefillGradient)"/>
+  <text x="80" y="407" font-family="Arial, sans-serif" font-size="12" fill="#333">
+    Traditional Large Prefill (may exceed memory)
+  </text>
+
+  <!-- Chunked Prefill Legend -->
+  <rect x="350" y="395" width="20" height="15" fill="url(#chunkedGradient)"/>
+  <text x="380" y="407" font-family="Arial, sans-serif" font-size="12" fill="#333">
+    Chunked Prefill (fits within memory limits)
+  </text>
+
+  <!-- Decode Legend -->
+  <rect x="50" y="420" width="20" height="15" fill="url(#decodeGradient)"/>
+  <text x="80" y="432" font-family="Arial, sans-serif" font-size="12" fill="#333">
+    Decode Phase (token generation after prefill complete)
+  </text>
+
+  <!-- Arrow marker definition -->
+  <defs>
+    <marker id="arrowhead" markerWidth="10" markerHeight="7"
+     refX="0" refY="3.5" orient="auto">
+      <polygon points="0 0, 10 3.5, 0 7" fill="#333" />
+    </marker>
+  </defs>
+</svg>
