@@ -584,6 +584,7 @@ class EPMoE(nnx.Module):
         # 步骤5：准备发送数据 - 按目标 shard 排序
         sort_indices = jnp.argsort(target_shards)
         sorted_data = jnp.take(data, indices=sort_indices, axis=0)
+        # 获取排序后的 expert IDs，这些是接收方需要知道的信息
         sorted_expert_ids = jnp.take(sorted_experts, indices=sort_indices)
         
         # 步骤6：计算输出缓冲区大小
@@ -607,12 +608,6 @@ class EPMoE(nnx.Module):
             axis_name=("data", "tensor"),
         )
         
-        # 步骤8：使用 dynamic_slice 代替动态索引来截取有效数据
-        valid_received_data = jax.lax.dynamic_slice(
-            communicated_data,
-            start_indices=[0, 0],
-            slice_sizes=[total_recv_size, communicated_data.shape[1]]
-        )
         
         # 步骤9：计算本地 expert 分组
         local_group_sizes = jax.lax.dynamic_slice(
@@ -621,20 +616,37 @@ class EPMoE(nnx.Module):
             slice_sizes=[local_expert_size]
         )
         
-        # 步骤10：使用 _local_permute_for_ragged 来处理 expert 分配
-        # 这个函数已经正确处理了 mask 和动态大小问题
-        _, final_local_group_sizes, local_expert_assignments = self._local_permute_for_ragged(
-            valid_received_data, 
-            global_group_sizes, 
-            local_expert_size, 
-            expert_shard_id
-        )
+        # 步骤10：直接处理接收到的数据，使用 mask 来处理有效范围
+        # 计算实际接收的 token 数量
+        actual_recv_size = jnp.sum(recv_counts)
+        
+        # 使用 mask 来获取有效数据，避免动态切片
+        max_tokens = communicated_data.shape[0]
+        valid_mask = jnp.arange(max_tokens) < actual_recv_size
+        
+        # 用累积和创建 expert 分配
+        cumsum_local = jnp.concatenate([jnp.array([0]), jnp.cumsum(local_group_sizes)])
+        
+        # 为每个接收到的 token 分配 expert ID
+        token_positions = jnp.arange(max_tokens)
+        expert_assignments = jnp.zeros(max_tokens, dtype=jnp.int32)
+        
+        # 使用矢量化的方式分配 expert
+        for expert_idx in range(local_expert_size):
+            start_pos = cumsum_local[expert_idx]
+            end_pos = cumsum_local[expert_idx + 1]
+            expert_mask = (token_positions >= start_pos) & (token_positions < end_pos) & valid_mask
+            expert_assignments = jnp.where(expert_mask, expert_idx, expert_assignments)
+        
+        # 应用 valid_mask 来获取最终结果
+        final_data = jnp.where(valid_mask[:, None], communicated_data, 0.0)
+        final_expert_assignments = jnp.where(valid_mask, expert_assignments, -1)
         
         global_tracer.print(
-            valid_received_data, f"ragged_dispatch_output", f"moe_dispatch_layer_id_{self.layer_id}"
+            final_data, f"ragged_dispatch_output", f"moe_dispatch_layer_id_{self.layer_id}"
         )
         
-        return valid_received_data, final_local_group_sizes, local_expert_assignments
+        return final_data, local_group_sizes, final_expert_assignments
 
     def _expert_all_to_all_collect(
         self, data, global_group_sizes, expert_shard_id, target_size
