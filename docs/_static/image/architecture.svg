@@ -1,0 +1,85 @@
+<svg width="800" height="620" xmlns="http://www.w3.org/2000/svg">
+  <!-- Title -->
+  <text x="400" y="25" text-anchor="middle" font-family="Arial, sans-serif" font-size="18" font-weight="bold" fill="#333">SGLang-JAX Multi-Process Architecture</text>
+
+  <!-- Main Process -->
+  <rect x="50" y="50" width="700" height="120" rx="8" fill="#e1f5fe" stroke="#1976d2" stroke-width="2"/>
+  <text x="400" y="75" text-anchor="middle" font-family="Arial, sans-serif" font-size="14" font-weight="bold" fill="#1976d2">Main Process</text>
+
+  <!-- TokenizerManager -->
+  <rect x="70" y="85" width="660" height="70" rx="5" fill="#ffffff" stroke="#42a5f5" stroke-width="1"/>
+  <text x="400" y="105" text-anchor="middle" font-family="Arial, sans-serif" font-size="12" font-weight="bold" fill="#1976d2">TokenizerManager</text>
+  <text x="180" y="125" font-family="Arial, sans-serif" font-size="10" fill="#333">• Text Tokenization Processing</text>
+  <text x="180" y="140" font-family="Arial, sans-serif" font-size="10" fill="#333">• Request/Response Coordination</text>
+  <text x="470" y="125" font-family="Arial, sans-serif" font-size="10" fill="#333">• Response Handling</text>
+  <text x="470" y="140" font-family="Arial, sans-serif" font-size="10" fill="#333">• Streaming Output Coordination</text>
+
+  <!-- ZMQ IPC Connection -->
+  <line x1="400" y1="170" x2="400" y2="210" stroke="#666" stroke-width="2" stroke-dasharray="5,5"/>
+  <text x="410" y="190" font-family="Arial, sans-serif" font-size="10" fill="#666">ZMQ IPC</text>
+
+  <!-- Connection split -->
+  <line x1="250" y1="210" x2="550" y2="210" stroke="#666" stroke-width="1"/>
+  <line x1="250" y1="210" x2="250" y2="230" stroke="#666" stroke-width="1"/>
+  <line x1="550" y1="210" x2="550" y2="230" stroke="#666" stroke-width="1"/>
+
+  <!-- Scheduler Process 1 -->
+  <rect x="50" y="230" width="300" height="220" rx="8" fill="#f3e5f5" stroke="#7b1fa2" stroke-width="2"/>
+  <text x="200" y="255" text-anchor="middle" font-family="Arial, sans-serif" font-size="14" font-weight="bold" fill="#7b1fa2">Scheduler Process 1</text>
+
+  <!-- Scheduler 1 -->
+  <rect x="70" y="265" width="260" height="80" rx="5" fill="#ffffff" stroke="#ab47bc" stroke-width="1"/>
+  <text x="200" y="285" text-anchor="middle" font-family="Arial, sans-serif" font-size="12" font-weight="bold" fill="#7b1fa2">Scheduler</text>
+  <text x="85" y="305" font-family="Arial, sans-serif" font-size="9" fill="#333">• Dynamic Batch Scheduling</text>
+  <text x="85" y="320" font-family="Arial, sans-serif" font-size="9" fill="#333">• Memory Pool Management</text>
+  <text x="85" y="335" font-family="Arial, sans-serif" font-size="9" fill="#333">• Batch Size Optimization</text>
+
+  <!-- ModelRunner 1 -->
+  <rect x="70" y="355" width="260" height="60" rx="5" fill="#fff3e0" stroke="#f57c00" stroke-width="1"/>
+  <text x="200" y="375" text-anchor="middle" font-family="Arial, sans-serif" font-size="12" font-weight="bold" fill="#f57c00">ModelRunner</text>
+  <text x="85" y="390" font-family="Arial, sans-serif" font-size="9" fill="#333">• JAX/Flax Model Execution</text>
+  <text x="85" y="405" font-family="Arial, sans-serif" font-size="9" fill="#333">• JIT Compilation and Cache</text>
+
+  <!-- Memory Cache 1 -->
+  <rect x="70" y="425" width="260" height="15" rx="3" fill="#e8f5e8" stroke="#388e3c" stroke-width="1"/>
+  <text x="200" y="435" text-anchor="middle" font-family="Arial, sans-serif" font-size="9" fill="#388e3c">Memory Cache (RadixCache and ChunkCache)</text>
+
+  <!-- Scheduler Process N -->
+  <rect x="450" y="230" width="300" height="220" rx="8" fill="#f3e5f5" stroke="#7b1fa2" stroke-width="2"/>
+  <text x="600" y="255" text-anchor="middle" font-family="Arial, sans-serif" font-size="14" font-weight="bold" fill="#7b1fa2">Scheduler Process N</text>
+
+  <!-- Scheduler N -->
+  <rect x="470" y="265" width="260" height="80" rx="5" fill="#ffffff" stroke="#ab47bc" stroke-width="1"/>
+  <text x="600" y="285" text-anchor="middle" font-family="Arial, sans-serif" font-size="12" font-weight="bold" fill="#7b1fa2">Scheduler</text>
+  <text x="485" y="305" font-family="Arial, sans-serif" font-size="9" fill="#333">• Dynamic Batch Scheduling</text>
+  <text x="485" y="320" font-family="Arial, sans-serif" font-size="9" fill="#333">• Memory Pool Management</text>
+  <text x="485" y="335" font-family="Arial, sans-serif" font-size="9" fill="#333">• Batch Size Optimization</text>
+
+  <!-- ModelRunner N -->
+  <rect x="470" y="355" width="260" height="60" rx="5" fill="#fff3e0" stroke="#f57c00" stroke-width="1"/>
+  <text x="600" y="375" text-anchor="middle" font-family="Arial, sans-serif" font-size="12" font-weight="bold" fill="#f57c00">ModelRunner</text>
+  <text x="485" y="390" font-family="Arial, sans-serif" font-size="9" fill="#333">• JAX/Flax Model Execution</text>
+  <text x="485" y="405" font-family="Arial, sans-serif" font-size="9" fill="#333">• JIT Compilation and Cache</text>
+
+  <!-- Memory Cache N -->
+  <rect x="470" y="425" width="260" height="15" rx="3" fill="#e8f5e8" stroke="#388e3c" stroke-width="1"/>
+  <text x="600" y="435" text-anchor="middle" font-family="Arial, sans-serif" font-size="9" fill="#388e3c">Memory Cache (RadixCache and ChunkCache)</text>
+
+  <!-- Connection lines from schedulers -->
+  <line x1="200" y1="450" x2="200" y2="470" stroke="#666" stroke-width="1"/>
+  <line x1="600" y1="450" x2="600" y2="470" stroke="#666" stroke-width="1"/>
+  <line x1="200" y1="470" x2="600" y2="470" stroke="#666" stroke-width="1"/>
+  <line x1="400" y1="470" x2="400" y2="490" stroke="#666" stroke-width="2" stroke-dasharray="5,5"/>
+  <text x="410" y="480" font-family="Arial, sans-serif" font-size="10" fill="#666">ZMQ IPC</text>
+
+  <!-- Detokenizer Process -->
+  <rect x="150" y="490" width="500" height="100" rx="8" fill="#e8f5e8" stroke="#388e3c" stroke-width="2"/>
+  <text x="400" y="515" text-anchor="middle" font-family="Arial, sans-serif" font-size="14" font-weight="bold" fill="#388e3c">Detokenizer Process</text>
+
+  <!-- DetokenizerManager -->
+  <rect x="170" y="525" width="460" height="55" rx="5" fill="#ffffff" stroke="#66bb6a" stroke-width="1"/>
+  <text x="400" y="545" text-anchor="middle" font-family="Arial, sans-serif" font-size="12" font-weight="bold" fill="#388e3c">DetokenizerManager</text>
+  <text x="185" y="560" font-family="Arial, sans-serif" font-size="9" fill="#333">• Token ID to Text Conversion</text>
+  <text x="185" y="572" font-family="Arial, sans-serif" font-size="9" fill="#333">• Incremental Text Generation (Streaming)</text>
+  <text x="400" y="572" font-family="Arial, sans-serif" font-size="9" fill="#333">• Output Formatting</text>
+</svg>
