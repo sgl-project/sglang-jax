@@ -351,9 +351,7 @@ class ModelWorker:
             print(f"[TP_WORKER] extend_seq_lens sliced")
             extend_seq_lens_minus_1 = extend_seq_lens_slice - 1
             print(f"[TP_WORKER] extend_seq_lens minus 1 computed")
-            idx = np.cumsum(extend_seq_lens_minus_1)
-            print(f"[TP_WORKER] cumsum computed, idx.shape: {idx.shape}, idx: {idx}")
-        
+            idx = np.cumsum(extend_seq_lens_minus_1)        
         print(f"[TP_WORKER] idx computation completed")
 
         print(f"[TP_WORKER] Preparing return values")
@@ -361,7 +359,6 @@ class ModelWorker:
         if next_token_ids is not None:
             print(f"[TP_WORKER] next_token_ids.shape: {next_token_ids.shape}")
             print(f"[TP_WORKER] next_token_ids.dtype: {next_token_ids.dtype}")
-            print(f"[TP_WORKER] idx: {idx}")
             
         truncated_logits = logits_output.truncate_logits_processor_output(idx)
         print(f"[TP_WORKER] Logits truncated")
