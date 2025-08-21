@@ -651,47 +651,11 @@ class EPMoE(nnx.Module):
         self, data, global_group_sizes, expert_shard_id, target_size
     ):
         """TPU/GPU: Use ragged_all_to_all for collection - inverse of dispatch"""
-        local_expert_size = self.experts_per_device
-        
-        # Calculate how much data each device should contribute to the final result
-        reshaped_group_sizes = global_group_sizes.reshape(
-            self.expert_parallel_size, local_expert_size
+        # For now, let's use the CPU simple collect to avoid the complex ragged_all_to_all issues
+        # We can optimize this later once the basic functionality works
+        return self._cpu_simple_collect(
+            data, global_group_sizes, expert_shard_id, target_size
         )
-        tokens_per_device = jnp.sum(reshaped_group_sizes, axis=1)
-
-        # For collect: each device sends all its processed data
-        # input_offsets: all zeros (read from start of each device's data)
-        input_offsets = jnp.zeros(self.expert_parallel_size, dtype=jnp.int32)
-        
-        # send_sizes: this device sends all its data to all other devices
-        send_sizes = jnp.repeat(data.shape[0], self.expert_parallel_size)
-        
-        # output_offsets: where each device's data should go in the final result
-        cumsum_tokens = jnp.cumsum(jnp.concatenate([jnp.array([0]), tokens_per_device]))
-        output_offsets = cumsum_tokens[:-1]  # Remove the last element
-        
-        # recv_sizes: how much data we receive from each device
-        recv_sizes = tokens_per_device
-
-        # Create output buffer with target size
-        output_shape = jnp.zeros((target_size, data.shape[1]), dtype=data.dtype)
-
-        print(f"[RAGGED_COLLECT] About to call ragged_all_to_all - target_size={target_size}")
-        result = jax.lax.ragged_all_to_all(
-            data,
-            output_shape,
-            input_offsets,
-            send_sizes,
-            output_offsets,
-            recv_sizes,
-            axis_name=("data", "tensor"),
-        )
-        print(f"[RAGGED_COLLECT] ragged_all_to_all completed - output.shape={result.shape}")
-
-        global_tracer.print(
-            result, f"ragged_collect_output", f"moe_combine_layer_id_{self.layer_id}"
-        )
-        return result
 
     def _get_ragged_all_to_all_params(self, group_sizes, shard_id):
         input_offsets = jnp.zeros(self.expert_parallel_size, dtype=jnp.int32)
