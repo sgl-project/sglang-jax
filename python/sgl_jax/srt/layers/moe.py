@@ -180,6 +180,7 @@ class EPMoE(nnx.Module):
 
         # Detect device capabilities for choosing communication strategy
         self.can_use_ragged, self.primary_device = self._detect_device_capabilities()
+        print(f"[MOE] Layer {layer_id}: can_use_ragged={self.can_use_ragged}, device={self.primary_device}, ep_size={expert_parallel_size}")
 
     def _detect_device_capabilities(self):
         try:
@@ -208,6 +209,8 @@ class EPMoE(nnx.Module):
         inputs = inputs.astype(self.dtype)
         total_tokens, hidden_dim = inputs.shape
 
+        print(f"[MOE] Forward layer {self.layer_id}: tokens={total_tokens}, ep_size={self.expert_parallel_size}, use_ragged={self.can_use_ragged}")
+
         global_tracer.print(
             inputs, f"moe_input", f"moe_sparse_layer_id_{self.layer_id}"
         )
@@ -221,10 +224,13 @@ class EPMoE(nnx.Module):
             )
 
         if self.expert_parallel_size == 1:
+            print(f"[MOE] Layer {self.layer_id}: Using single device forward")
             output = self._single_device_forward(inputs, router_logits)
         else:
+            print(f"[MOE] Layer {self.layer_id}: Using expert parallel forward with shard_map")
             output = self._expert_parallel_forward_with_shard_map(inputs, router_logits)
 
+        print(f"[MOE] Layer {self.layer_id}: Forward completed")
         global_tracer.print(
             output, f"moe_final_output", f"moe_sparse_layer_id_{self.layer_id}"
         )
@@ -476,14 +482,21 @@ class EPMoE(nnx.Module):
     def _expert_all_to_all_dispatch(
         self, data, global_group_sizes, sorted_experts, expert_shard_id
     ):
+        print(f"[DISPATCH] Layer {self.layer_id} shard {expert_shard_id}: START - data.shape={data.shape}, use_ragged={self.can_use_ragged}")
+        
         if self.can_use_ragged:
-            return self._ragged_all_to_all_dispatch(
+            print(f"[DISPATCH] Layer {self.layer_id} shard {expert_shard_id}: Using ragged_all_to_all")
+            result = self._ragged_all_to_all_dispatch(
                 data, global_group_sizes, sorted_experts, expert_shard_id
             )
         else:
-            return self._simple_dispatch(
+            print(f"[DISPATCH] Layer {self.layer_id} shard {expert_shard_id}: Using simple dispatch")
+            result = self._simple_dispatch(
                 data, global_group_sizes, sorted_experts, expert_shard_id
             )
+            
+        print(f"[DISPATCH] Layer {self.layer_id} shard {expert_shard_id}: END - result.shape={result[0].shape}")
+        return result
 
     def _simple_dispatch(
         self, data, global_group_sizes, sorted_experts, expert_shard_id
@@ -544,6 +557,7 @@ class EPMoE(nnx.Module):
         buffer_size = self.expert_parallel_size * data.shape[0]
         output_shape = jnp.zeros((buffer_size, data.shape[1]), dtype=data.dtype)
 
+        print(f"[RAGGED_DISPATCH] About to call ragged_all_to_all - buffer_size={buffer_size}")
         communicated_data = jax.lax.ragged_all_to_all(
             data,
             output_shape,
@@ -553,6 +567,7 @@ class EPMoE(nnx.Module):
             recv_sizes,
             axis_name=("data", "tensor"),
         )
+        print(f"[RAGGED_DISPATCH] ragged_all_to_all completed - output.shape={communicated_data.shape}")
 
         x, local_group_sizes, selected_experts = self._local_permute_for_ragged(
             communicated_data, global_group_sizes, local_expert_size, expert_shard_id
@@ -566,14 +581,21 @@ class EPMoE(nnx.Module):
     def _expert_all_to_all_collect(
         self, data, global_group_sizes, expert_shard_id, target_size
     ):
+        print(f"[COLLECT] Layer {self.layer_id} shard {expert_shard_id}: START - data.shape={data.shape}, target_size={target_size}, use_ragged={self.can_use_ragged}")
+        
         if self.can_use_ragged:
-            return self._ragged_all_to_all_collect(
+            print(f"[COLLECT] Layer {self.layer_id} shard {expert_shard_id}: Using ragged_all_to_all")
+            result = self._ragged_all_to_all_collect(
                 data, global_group_sizes, expert_shard_id, target_size
             )
         else:
-            return self._cpu_simple_collect(
+            print(f"[COLLECT] Layer {self.layer_id} shard {expert_shard_id}: Using simple collect")
+            result = self._cpu_simple_collect(
                 data, global_group_sizes, expert_shard_id, target_size
             )
+            
+        print(f"[COLLECT] Layer {self.layer_id} shard {expert_shard_id}: END - result.shape={result.shape}")
+        return result
 
     def _cpu_simple_collect(
         self, data, global_group_sizes, expert_shard_id, target_size
@@ -643,6 +665,7 @@ class EPMoE(nnx.Module):
         # Create output buffer with target size
         output_shape = jnp.zeros((target_size, data.shape[1]), dtype=data.dtype)
 
+        print(f"[RAGGED_COLLECT] About to call ragged_all_to_all - target_size={target_size}")
         # Execute ragged_all_to_all with swapped parameters
         result = jax.lax.ragged_all_to_all(
             data,
@@ -653,6 +676,7 @@ class EPMoE(nnx.Module):
             recv_sizes,      # recv_sizes: how much this device receives
             axis_name=("data", "tensor"),
         )
+        print(f"[RAGGED_COLLECT] ragged_all_to_all completed - output.shape={result.shape}")
 
         global_tracer.print(
             result, f"ragged_collect_output", f"moe_combine_layer_id_{self.layer_id}"
@@ -690,17 +714,27 @@ class EPMoE(nnx.Module):
             slice_sizes=[local_expert_size]
         )
 
-        # Simple approach: just return the inputs and group sizes directly
-        # Let the ragged_dot handle the grouping internally
+        # Calculate the correct total repeat length based on local group sizes
+        total_local_tokens = jnp.sum(local_group_sizes)
+        
+        # For JIT compatibility, we need a static upper bound
+        # Use the input size as the maximum possible tokens for this shard
+        max_possible_tokens = inputs.shape[0]
+        
         expert_indices = jnp.repeat(
             jnp.arange(local_expert_size),
             local_group_sizes,
-            total_repeat_length=inputs.shape[0],  # Use input shape as fixed length
+            total_repeat_length=max_possible_tokens,
         )
+        
+        # Only use the valid portion
+        valid_expert_indices = expert_indices[:total_local_tokens]
 
-        sorted_indices = jnp.argsort(expert_indices)
-        sorted_inputs = jnp.take(inputs, indices=sorted_indices, axis=0)
-        sorted_experts_ids = expert_indices[sorted_indices]
+        sorted_indices = jnp.argsort(valid_expert_indices)
+        # Only process the valid tokens
+        valid_inputs = inputs[:total_local_tokens]
+        sorted_inputs = jnp.take(valid_inputs, indices=sorted_indices, axis=0)
+        sorted_experts_ids = valid_expert_indices[sorted_indices]
 
         return sorted_inputs, local_group_sizes, sorted_experts_ids
 
