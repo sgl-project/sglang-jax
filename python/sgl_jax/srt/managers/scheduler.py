@@ -555,15 +555,6 @@ class Scheduler(
     def recv_requests(self) -> List[Req]:
         """Receive and distribute requests using two-tier DP architecture."""
 
-        if self.server_args.enable_dp_attention and self.server_args.dp_size > 1:
-            # DP attention enabled: use two-tier distribution
-            return self._recv_requests_dp_mode()
-        else:
-            # Traditional mode: single-tier distribution
-            return self._recv_requests_traditional_mode()
-
-    def _recv_requests_traditional_mode(self) -> List[Req]:
-        """Traditional request reception and broadcasting (non-DP mode)."""
         if self.node_rank == 0:
             recv_reqs = []
 
@@ -582,37 +573,10 @@ class Scheduler(
                 recv_reqs.append(recv_rpc)
         else:
             recv_reqs = None
-
-        if self.nnodes > 1:
-            recv_reqs = self.broadcast_pyobj(recv_reqs)
+        logger.info(f"Node {self.node_rank} recv_reqs: {recv_reqs}")
+        # if self.nnodes > 1:
+        #     recv_reqs = self.broadcast_pyobj(recv_reqs)
         return recv_reqs
-
-    def _recv_requests_dp_mode(self) -> List[Req]:
-        """DP mode: two-tier request distribution."""
-
-        if self.node_rank == 0:
-            # Tier 1: Node 0 receives requests and distributes to DP group leaders
-            recv_reqs = self._collect_external_requests()
-
-            if recv_reqs and len(recv_reqs) > 0:
-                # Distribute requests round-robin to DP group leaders
-                distributed_reqs = self._distribute_requests_to_dp_groups(recv_reqs)
-                # Node 0 keeps requests assigned to its own DP group
-                my_group_reqs = distributed_reqs.get(
-                    self._dp_group_info["dp_group_id"], []
-                )
-            else:
-                my_group_reqs = []
-
-        else:
-            # All non-node-0 schedulers: receive requests from the global distribution
-            my_group_reqs = self._receive_requests_from_node0()
-        if len(my_group_reqs) > 0:
-            logger.debug(f"Node {self.node_rank} my_group_reqs: {my_group_reqs}")
-        # Note: No Tier 2 needed! All nodes already have the distribution map
-        # and can extract their own group's requests directly
-
-        return my_group_reqs
 
     def _collect_external_requests(self) -> List[Req]:
         """Collect requests from external sources (tokenizer + RPC)."""
