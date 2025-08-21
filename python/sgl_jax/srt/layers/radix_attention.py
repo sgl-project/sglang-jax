@@ -3,6 +3,7 @@
 from enum import Enum
 
 import jax
+import jax.numpy as jnp
 from flax import nnx
 from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
@@ -73,5 +74,4 @@ class RadixAttention(nnx.Module):
             forward_batch,
             **kwargs,
         )
-
         return attn_output, k, v

@@ -1,8 +1,10 @@
+from __future__ import annotations
+
 import heapq
 import time
 from collections import defaultdict
 from functools import partial
-from typing import List, Optional, Tuple
+from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import jax
 import jax.numpy as jnp
@@ -12,6 +14,9 @@ from sgl_jax.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sgl_jax.srt.mem_cache.base_prefix_cache import BasePrefixCache, MatchResult
 from sgl_jax.srt.mem_cache.memory_pool import ReqToTokenPool
 from sgl_jax.srt.utils.jax_utils import device_array
+
+if TYPE_CHECKING:
+    from sgl_jax.srt.managers.schedule_batch import Req
 
 
 class TreeNode:

@@ -125,9 +125,17 @@ class FlashAttention(AttentionBackend):
             1,
         )
 
-        return metadata
-
         # self.forward_metadata = metadata
+        if forward_batch.traced_cache_indices is not None:
+            jax.debug.print("==== Forward metadata ====")
+            jax.debug.print("metadata.page_indices: {}", metadata.page_indices)
+            jax.debug.print("metadata.cu_q_lens: {}", metadata.cu_q_lens)
+            jax.debug.print("metadata.seq_lens: {}", metadata.seq_lens)
+            jax.debug.print("metadata.cu_kv_lens: {}", metadata.cu_kv_lens)
+            jax.debug.print("metadata.num_seqs: {}", metadata.num_seqs)
+            jax.debug.print("aligned_seq_lens: {}", aligned_seq_lens)
+
+        return metadata
 
     def tree_flatten(self):
         children = (self.forward_metadata,)
@@ -268,7 +276,49 @@ class FlashAttention(AttentionBackend):
                 layer_id, forward_batch.out_cache_loc, k, v, is_decode=True
             )
 
-        return forward_batch.token_to_kv_pool.get_kv_buffer(layer_id)
+        k_buffer, v_buffer = forward_batch.token_to_kv_pool.get_kv_buffer(layer_id)
+        # DEBUG: Commented out to avoid TracerBoolConversionError during JIT compilation
+        # The boolean check `forward_batch.traced_token_indices is not None` cannot be evaluated
+        # on traced values in JIT context. This debug code can be re-enabled by making the
+        # traced_token_indices check static or restructuring the debugging approach.
+        #
+        if forward_batch.traced_cache_indices is not None and layer_id < 4:
+            k_at_cache_locs = k_buffer[forward_batch.traced_cache_indices].flatten()
+            v_at_cache_locs = v_buffer[forward_batch.traced_cache_indices].flatten()
+
+            k_mean = jnp.mean(k_at_cache_locs)
+            k_min = jnp.min(k_at_cache_locs)
+            k_max = jnp.max(k_at_cache_locs)
+            k_std = jnp.std(k_at_cache_locs)
+
+            v_mean = jnp.mean(v_at_cache_locs)
+            v_min = jnp.min(v_at_cache_locs)
+            v_max = jnp.max(v_at_cache_locs)
+            v_std = jnp.std(v_at_cache_locs)
+
+            jax.debug.print(
+                "=== KV CACHE STATS (Layer {}, kv cache len: {}, req_index: {}) forward_mode {} ===",
+                layer_id,
+                len(forward_batch.traced_cache_indices),
+                forward_batch.traced_req_indices,
+                forward_batch.forward_mode,
+            )
+            jax.debug.print(
+                "K stats - mean: {}, min: {}, max: {}, std: {}",
+                k_mean,
+                k_min,
+                k_max,
+                k_std,
+            )
+            jax.debug.print(
+                "V stats - mean: {}, min: {}, max: {}, std: {}",
+                v_mean,
+                v_min,
+                v_max,
+                v_std,
+            )
+
+        return k_buffer, v_buffer
 
     @staticmethod
     def get_max_running_reqests(max_context_len: int, page_size: int) -> int:

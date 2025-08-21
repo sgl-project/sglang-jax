@@ -619,6 +619,66 @@ class ScheduleBatch:
         else:
             return out_cache_loc
 
+    def mix_with_running(self, running_batch: "ScheduleBatch"):
+        # DEBUG: Add detailed logging for mixed batch operations
+        print(f"=== mix_with_running DEBUG ===")
+        print(f"BEFORE mixing:")
+        print(f"  self.forward_mode: {self.forward_mode}")
+        print(f"  self.batch_size(): {self.batch_size()}")
+        print(f"  self.input_ids shape: {self.input_ids.shape}")
+        print(f"  self.out_cache_loc shape: {self.out_cache_loc.shape}")
+        print(f"  running_batch.forward_mode: {running_batch.forward_mode}")
+        print(f"  running_batch.batch_size(): {running_batch.batch_size()}")
+        print(f"  running_batch.input_ids shape: {running_batch.input_ids.shape}")
+        print(
+            f"  running_batch.out_cache_loc shape: {running_batch.out_cache_loc.shape}"
+        )
+
+        # Use EXTEND instead of MIXED for precompile cache hit
+        self.forward_mode = ForwardMode.EXTEND
+        running_bs = running_batch.batch_size()
+        print(f"  setting forward_mode to: {self.forward_mode}")
+
+        for i, req in enumerate(running_batch.reqs):
+            print(
+                f"  running_batch req {i}: extend_input_len before: {getattr(req, 'extend_input_len', 'None')}"
+            )
+            req.fill_ids = req.origin_input_ids + req.output_ids
+            req.extend_input_len = 1
+            print(
+                f"  running_batch req {i}: extend_input_len after: {req.extend_input_len}"
+            )
+
+        input_ids = jnp.concatenate([self.input_ids, running_batch.input_ids])
+        out_cache_loc = jnp.concatenate(
+            [self.out_cache_loc, running_batch.out_cache_loc]
+        )
+
+        print(f"  concatenated input_ids shape: {input_ids.shape}")
+        print(f"  concatenated out_cache_loc shape: {out_cache_loc.shape}")
+
+        self.merge_batch(running_batch)
+        self.input_ids = input_ids
+        self.out_cache_loc = out_cache_loc
+
+        delta = -1
+        # NOTE: prefix_indices is what has been cached, but we don't cache each decode step
+        self.prefix_lens.extend(
+            [
+                len(r.origin_input_ids) + len(r.output_ids) + delta
+                for r in running_batch.reqs
+            ]
+        )
+        decode_extend_lens = [1] * running_bs
+        print(f"  Adding decode extend_lens: {decode_extend_lens}")
+        self.extend_lens.extend(decode_extend_lens)
+        self.extend_num_tokens += running_bs
+        self.extend_logprob_start_lens.extend([0] * running_bs)
+
+        print(f"  After mixing - total extend_lens: {self.extend_lens}")
+        print(f"  Total extend_num_tokens: {self.extend_num_tokens}")
+        print(f"=== End mix_with_running DEBUG ===\n")
+
     def prepare_for_extend(self):
         self.forward_mode = ForwardMode.EXTEND
 
@@ -646,13 +706,34 @@ class ScheduleBatch:
         # Copy prefix and do some basic check
         extend_input_logprob_token_ids = []
 
+        # DEBUG: Add detailed logging for prepare_for_extend
+        print(f"=== prepare_for_extend DEBUG ===")
+        print(f"forward_mode: {self.forward_mode}")
+        print(f"batch_size: {len(reqs)}")
+        print(f"seq_lens: {seq_lens}")
+        print(f"prefix_lens: {prefix_lens}")
+        print(f"extend_lens: {extend_lens}")
+        print(f"req_pool_indices: {req_pool_indices}")
+
         for i, (req, seq_len, pre_len) in enumerate(zip(reqs, seq_lens, prefix_lens)):
+            print(f"  Processing req {i} (rid: {req.rid}):")
+            print(
+                f"    seq_len: {seq_len}, pre_len: {pre_len}, extend_input_len: {req.extend_input_len}"
+            )
+            print(f"    is_chunked: {getattr(req, 'is_chunked', False)}")
+            print(f"    old req_pool_idx: {getattr(req, 'req_pool_idx', None)}")
+            print(f"    new req_pool_idx: {req_pool_indices[i]}")
+            print(f"    prefix_indices length: {len(req.prefix_indices)}")
+
             req.req_pool_idx = req_pool_indices[i]
             assert seq_len - pre_len == req.extend_input_len
             # note: req.prefix_indices is located on CPU, so we have to extract values then device_put
             # prefix_indices_device = jnp.array(np.asarray(req.prefix_indices))
             prefix_indices = req.prefix_indices
             if pre_len > 0:
+                print(
+                    f"    Writing prefix to pool: (req_pool_idx={req.req_pool_idx}, slice(0, {pre_len}))"
+                )
                 # note: prefix_indices has to locate on device, or will meet Received incompatible devices for jitted computation
                 self.req_to_token_pool.write(
                     (req.req_pool_idx, slice(0, pre_len)), prefix_indices
@@ -762,6 +843,21 @@ class ScheduleBatch:
             self,
             self.model_config.vocab_size,
         )
+
+        # # DEBUG: 对比测试 - 基础数据
+        # print(f"=== BATCH DATA DEBUG ===")
+        # print(f"Mode: {'MIXED' if hasattr(self, 'decoding_reqs') and self.decoding_reqs else 'NON-MIXED'}")
+        # print(f"forward_mode: {self.forward_mode}")
+        # print(f"batch_size: {len(self.reqs)}")
+        # for i, req in enumerate(self.reqs):
+        #     print(f"  Req {i} ({req.rid}): is_chunked={req.is_chunked}, req_pool_idx={req.req_pool_idx}")
+        #     print(f"    fill_ids: {len(req.fill_ids)}, prefix_indices: {len(req.prefix_indices)}, extend_input_len: {req.extend_input_len}")
+        #     print(f"    seq_len: {len(req.origin_input_ids + req.output_ids)}")
+
+        # print(f"extend_lens: {self.extend_lens}")
+        # print(f"prefix_lens: {self.prefix_lens}")
+        # print(f"seq_lens: {self.seq_lens}")
+        # print()
 
     def new_page_count_next_decode(self):
         page_size = self.token_to_kv_pool_allocator.page_size
@@ -1004,6 +1100,7 @@ class ScheduleBatch:
         page_size: int,
         prefill_cache_loc_paddings: List,
         decode_cache_loc_paddings: List,
+        traced_req_indices: List[int],
     ) -> ModelWorkerBatch:
         if self.forward_mode.is_decode_or_idle():
             extend_seq_lens = extend_prefix_lens = extend_logprob_start_lens = None
@@ -1098,6 +1195,7 @@ class ScheduleBatch:
             # For decode: each sequence contributes one token at the next position (seq_len)
             # Create positions for actual tokens (one per sequence at seq_len)
             batch_positions = seq_lens_cpu - 1
+            batch_positions = seq_lens_cpu - 1  # Next position is current seq_len
             # Create positions array matching the length of input_ids (including padding)
             positions_cpu = np.zeros(len(input_ids_cpu), dtype=batch_positions.dtype)
             # Fill in the actual positions for the real tokens
@@ -1106,6 +1204,17 @@ class ScheduleBatch:
             # The padding tokens (if any) will have position 0, which is fine for padding
             # For decode, extend_start_loc is typically not used but we'll set it anyway
             extend_start_loc = np.arange(len(seq_lens_cpu), dtype=seq_lens_cpu.dtype)
+
+        # # DEBUG: Position Encoding 对比
+        # print(f"=== POSITION ENCODING DEBUG ===")
+        # if self.forward_mode.is_extend():
+        #     print(f"extend_seq_lens: {extend_seq_lens}")
+        #     print(f"prefix_lens: {self.prefix_lens}")
+        # print(f"seq_lens: {seq_lens_cpu}")
+        # print(f"positions length: {len(positions)}")
+        # print(f"positions sample: {positions[:20]}...")
+        # print(f"extend_start_loc: {extend_start_loc}")
+        # print()
 
         # padding bs: req_pool_indices, seq_lens, extend_start_loc, extend_prefix_lens, extend_seq_lens
         bs_padding_size = 0
@@ -1130,6 +1239,27 @@ class ScheduleBatch:
         # note: to avoid aligned cache_loc_flat is greater than max_total_num_tokens, add max_bs * page_size
         # total_cache_loc_size = max_total_num_tokens + max_bs * page_size
         total_cache_loc_size = cache_loc_paddings[select_bs_index]
+        traced_token_indices = []
+        for req_idx in traced_req_indices:
+            start_loc = extend_start_loc[req_idx]
+            input_len = extend_seq_lens[req_idx] if extend_seq_lens is not None else 1
+            end_loc = start_loc + input_len
+            traced_token_indices.extend(range(start_loc, end_loc))
+
+        # padding traced_token_indices
+        if len(traced_token_indices) > 0:
+            traced_token_indices_padding_size = 0
+            if extend_seq_lens is not None and len(traced_token_indices) > 1:
+                traced_token_indices_padding_size = 8192 - len(traced_token_indices)
+            if traced_token_indices_padding_size > 0:
+                traced_token_indices = np.concatenate(
+                    [
+                        traced_token_indices,
+                        np.zeros(traced_token_indices_padding_size, dtype=jnp.int32),
+                    ]
+                )
+
+        total_cache_loc_size = cache_loc_paddings[select_bs_index]
         cache_loc_cpu = cache_loc_flat
         assert total_cache_loc_size >= len(cache_loc_flat)
         cache_loc_cpu = np.pad(
@@ -1137,6 +1267,37 @@ class ScheduleBatch:
             (0, total_cache_loc_size - len(cache_loc_flat)),
             constant_values=0,
         )
+
+        # DEBUG: KV Cache 映射对比
+        traced_cache_indices = []
+        if len(traced_req_indices) > 0:
+            # 对每个sequence显示cache mapping
+            for req_idx in traced_req_indices:
+                print(f"=== CACHE MAPPING DEBUG ===")
+                print(f"req_pool_indices: {req_pool_indices_cpu[traced_req_indices]}")
+                print(f"traced_token_indices: {traced_token_indices}")
+                seq_len = seq_lens_cpu[req_idx]
+                if seq_len > 0:
+                    req_pool_idx = req_pool_indices_cpu[req_idx]
+                    cache_indices = token_indices_with_all_reqs[req_idx, :seq_len]
+                    traced_cache_indices.extend(cache_indices)
+                    print(
+                        f"  Seq {req_idx}: req_pool_idx={req_pool_idx}, seq_len={seq_len}"
+                    )
+                    print(
+                        f"    cache_indices: {cache_indices[:min(10, len(cache_indices))]}..."
+                    )
+
+        if len(traced_cache_indices) > 0 and len(traced_cache_indices) < 4096:
+            traced_cache_indices_padded_size = 4096 - len(traced_cache_indices)
+            traced_cache_indices = np.concatenate(
+                [
+                    traced_cache_indices,
+                    np.array(
+                        [traced_cache_indices[-1]] * traced_cache_indices_padded_size
+                    ),
+                ]
+            )
 
         # seq_lens_padding = self.seq_lens
         if bs_padding_size > 0:
@@ -1180,6 +1341,49 @@ class ScheduleBatch:
                     [extend_start_loc, invalid_extend_start_loc], axis=0
                 )
 
+        # DEBUG: Final batch creation logging
+        print(f"=== ModelWorkerBatch creation DEBUG ===")
+        print(f"forward_mode: {self.forward_mode}")
+        print(f"forward_mode == EXTEND: {self.forward_mode == ForwardMode.EXTEND}")
+        print(f"batch_size (total): {len(self.reqs)}")
+        print(f"seq_lens_cpu: {seq_lens_cpu}")
+        print(f"input_ids_cpu length: {len(input_ids_cpu)}")
+        print(f"real_input_ids_len: {real_input_ids_len}")
+
+        # Check if we have mixed batch (prefill + decode)
+        has_mixed_reqs = (
+            hasattr(self, "decoding_reqs") and self.decoding_reqs is not None
+        )
+        if has_mixed_reqs:
+            print(f"MIXED BATCH DETECTED!")
+            print(f"  Prefill requests: {len(self.reqs)}")
+            print(
+                f"  Decode requests: {len(self.decoding_reqs) if self.decoding_reqs else 0}"
+            )
+            print(
+                f"  Total requests: {len(self.reqs) + (len(self.decoding_reqs) if self.decoding_reqs else 0)}"
+            )
+
+        if self.forward_mode == ForwardMode.EXTEND:
+            print(f"extend_seq_lens will be set: {extend_seq_lens}")
+            print(f"extend_seq_lens length: {len(extend_seq_lens)}")
+            print(f"extend_seq_lens sum: {sum(extend_seq_lens)}")
+            print(f"extend_prefix_lens will be set: {extend_prefix_lens}")
+
+            # CRITICAL: Check if extend_seq_lens matches expected token count
+            expected_total_tokens = real_input_ids_len
+            actual_total_from_extend = sum(extend_seq_lens)
+            print(f"  Expected total tokens: {expected_total_tokens}")
+            print(f"  Actual total from extend_seq_lens: {actual_total_from_extend}")
+            if expected_total_tokens != actual_total_from_extend:
+                print(
+                    f"  WARNING: Token count mismatch! This could cause indexing errors."
+                )
+        else:
+            print(f"extend_seq_lens will be None")
+            print(f"extend_prefix_lens will be None")
+        print(f"=== End batch creation DEBUG ===\n")
+
         return ModelWorkerBatch(
             bid=bid,
             forward_mode=self.forward_mode,
@@ -1206,6 +1410,21 @@ class ScheduleBatch:
             real_bs=real_bs,
             capture_hidden_mode=CaptureHiddenMode.NULL,
             launch_done=self.launch_done,
+            traced_req_indices=(
+                device_array(self.mesh, np.array(traced_req_indices))
+                if len(traced_req_indices) > 0
+                else None
+            ),
+            traced_token_indices=(
+                device_array(self.mesh, np.array(traced_token_indices))
+                if len(traced_token_indices) > 0
+                else None
+            ),
+            traced_cache_indices=(
+                device_array(self.mesh, np.array(traced_cache_indices))
+                if len(traced_cache_indices) > 0
+                else None
+            ),
         )
 
     def copy(self):
@@ -1295,6 +1514,10 @@ class ModelWorkerBatch:
 
     # Events
     launch_done: Optional[threading.Event] = None
+
+    traced_req_indices: Optional[jax.Array] = None
+    traced_token_indices: Optional[jax.Array] = None
+    traced_cache_indices: Optional[jax.Array] = None
 
 
 def get_last_loc(

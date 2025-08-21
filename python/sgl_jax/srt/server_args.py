@@ -54,6 +54,7 @@ class ServerArgs:
     max_total_tokens: Optional[int] = None
     max_prefill_tokens: int = 16384
     chunked_prefill_size: Optional[int] = None
+    enable_mixed_chunk: bool = False
     schedule_policy: str = "fcfs"
     schedule_conservativeness: float = 1.0
     page_size: int = 1
@@ -385,6 +386,11 @@ class ServerArgs:
             type=int,
             default=ServerArgs.chunked_prefill_size,
             help="The maximum number of tokens in a chunk for the chunked prefill. Setting this to -1 means disabling chunked prefill.",
+        )
+        parser.add_argument(
+            "--enable-mixed-chunk",
+            action="store_true",
+            help="Enabling mixing prefill and decode in a batch when using chunked prefill.",
         )
         parser.add_argument(
             "--max-prefill-tokens",

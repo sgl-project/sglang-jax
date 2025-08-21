@@ -90,7 +90,7 @@ def get_available_device_memory(device, distributed=False, empty_cache=True):
         # Use pmap to find the minimum available memory across all devices.
         mesh = jax.make_mesh((jax.process_count(), 4), ("node", "device"))
 
-        with jax.sharding.use_mesh(mesh=mesh):
+        with jax.sharding.set_mesh(mesh=mesh):
 
             @jax.shard_map(
                 mesh=mesh, in_specs=PartitionSpec(None), out_specs=PartitionSpec(None)

@@ -756,7 +756,7 @@ class UnifiedDebugTracer:
     def _print_stats(self, stats: Dict[str, Any], key: str):
         if "error" in stats:
             print(
-                f"[{stats['stage']}] {stats['name']}: shape={stats['shape']}, dtype={stats['dtype']}, error={stats['error']}"
+                f"[{stats['stage']}] {stats['name']}: shape={list(stats['shape'])}, error={stats['error']}"
             )
         elif stats.get("tracing_context", False):
             # Special handling in JAX tracing context
@@ -767,8 +767,8 @@ class UnifiedDebugTracer:
                 step_info = f"[Step {stats['forward_step']}]"
 
             print(
-                f"{step_info}[{framework}][{stats['stage']}] {stats['name']}: shape={stats['shape']}, "
-                f"dtype={stats['dtype']}, TRACED_CONTEXT{extra}"
+                f"{step_info}[{framework}][{stats['stage']}] {stats['name']}: shape={list(stats['shape'])}, "
+                f"TRACED_CONTEXT{extra}"
             )
         else:
             framework = stats["framework"].upper()
@@ -785,7 +785,7 @@ class UnifiedDebugTracer:
                 step_info = f"[Step {stats['forward_step']}]"
 
             print(
-                f"{step_info}[{framework}][{stats['stage']}] {stats['name']}: shape={stats['shape']}, "
+                f"{step_info}[{framework}][{stats['stage']}] {stats['name']}: shape={list(stats['shape'])}, "
                 f"min={stats['min']:.6f}, max={stats['max']:.6f}, "
                 f"mean={stats['mean']:.6f}, std={stats['std']:.6f}{nan_inf}{extra}"
             )
@@ -1097,3 +1097,203 @@ def trace_function(
 
 
 global_tracer = UnifiedDebugTracer()
+
+
+def debug_print(
+    tensor, name: str, stage: str = "", extra_info: str = "", filter_indices=None
+):
+    """
+    Debug print function using jax.debug.print for model layer inputs/outputs.
+    Only prints when filter_indices exists, and uses only first 32 indices for stats.
+
+    For jax.Array, prints: shape, min, max, mean, std, dtype, has_nan, has_inf
+    Uses jax.debug.print which works in both jit-compiled and eager mode.
+
+    Args:
+        tensor: jax.Array or any tensor-like object to debug
+        name: Name identifier for the tensor
+        stage: Stage identifier (e.g., "layer_0_attention", "mlp_output")
+        extra_info: Additional information to display
+        filter_indices: jax.Array of indices to filter tensor data, only prints if not None
+
+    Example:
+        debug_print(input_ids, "input_ids", "embedding", filter_indices=traced_indices)
+        debug_print(attention_output, "attn_out", "layer_0_attention", filter_indices=traced_indices)
+    """
+    import jax
+
+    # Only print if filter_indices exists
+    if filter_indices is None:
+        return
+
+    if tensor is None:
+        if stage:
+            jax.debug.print("[{}] {}: None", stage, name)
+        else:
+            jax.debug.print("{}: None", name)
+        return
+
+    jnp = _get_jax_numpy()
+
+    try:
+        # Check if it's a JAX array
+        if hasattr(tensor, "shape") and hasattr(tensor, "dtype"):
+            # Always compute stats using JAX operations (works in both eager and compiled mode)
+            if jnp is not None:
+                try:
+                    # Use traced_token_indices to filter tensor data for statistics
+                    stats_tensor = tensor
+                    subset_info = ""
+
+                    # Filter tensor data using these indices
+                    stats_tensor = tensor[filter_indices[:32]]
+                    subset_info = " (traced_first32)"
+
+                    # Use JAX operations for statistics
+                    min_val = jnp.min(stats_tensor)
+                    max_val = jnp.max(stats_tensor)
+                    mean_val = jnp.mean(stats_tensor)
+
+                    if stats_tensor.size > 1:
+                        std_val = jnp.std(stats_tensor, ddof=0)
+                    else:
+                        std_val = jnp.array(0.0)
+
+                    has_nan = jnp.any(jnp.isnan(stats_tensor))
+                    has_inf = jnp.any(jnp.isinf(stats_tensor))
+
+                    # Use jax.debug.print with format string and values
+                    if stage and extra_info:
+                        jax.debug.print(
+                            "[{}] {}: shape={} min={} max={} mean={} std={} nan={} inf={}{} {}",
+                            stage,
+                            name,
+                            list(tensor.shape),
+                            min_val,
+                            max_val,
+                            mean_val,
+                            std_val,
+                            has_nan,
+                            has_inf,
+                            subset_info,
+                            extra_info,
+                        )
+                    elif stage:
+                        jax.debug.print(
+                            "[{}] {}: shape={} min={} max={} mean={} std={} nan={} inf={}{}",
+                            stage,
+                            name,
+                            list(tensor.shape),
+                            min_val,
+                            max_val,
+                            mean_val,
+                            std_val,
+                            has_nan,
+                            has_inf,
+                            subset_info,
+                        )
+                    elif extra_info:
+                        jax.debug.print(
+                            "{}: shape={} min={} max={} mean={} std={} nan={} inf={}{} {}",
+                            name,
+                            list(tensor.shape),
+                            min_val,
+                            max_val,
+                            mean_val,
+                            std_val,
+                            has_nan,
+                            has_inf,
+                            subset_info,
+                            extra_info,
+                        )
+                    else:
+                        jax.debug.print(
+                            "{}: shape={} min={} max={} mean={} std={} nan={} inf={}{}",
+                            name,
+                            list(tensor.shape),
+                            min_val,
+                            max_val,
+                            mean_val,
+                            std_val,
+                            has_nan,
+                            has_inf,
+                            subset_info,
+                        )
+
+                except Exception as e:
+                    # Fallback if statistical computation fails
+                    if stage and extra_info:
+                        jax.debug.print(
+                            "[{}] {}: shape={} stats_error={} {}",
+                            stage,
+                            name,
+                            list(tensor.shape),
+                            str(e),
+                            extra_info,
+                        )
+                    elif stage:
+                        jax.debug.print(
+                            "[{}] {}: shape={} stats_error={}",
+                            stage,
+                            name,
+                            list(tensor.shape),
+                            str(e),
+                        )
+                    elif extra_info:
+                        jax.debug.print(
+                            "{}: shape={} stats_error={} {}",
+                            name,
+                            list(tensor.shape),
+                            str(e),
+                            extra_info,
+                        )
+                    else:
+                        jax.debug.print(
+                            "{}: shape={} stats_error={}",
+                            name,
+                            list(tensor.shape),
+                            str(e),
+                        )
+            else:
+                # No JAX available, basic info only
+                if stage and extra_info:
+                    jax.debug.print(
+                        "[{}] {}: shape={} NO_JAX {}",
+                        stage,
+                        name,
+                        list(tensor.shape),
+                        extra_info,
+                    )
+                elif stage:
+                    jax.debug.print(
+                        "[{}] {}: shape={} NO_JAX", stage, name, list(tensor.shape)
+                    )
+                elif extra_info:
+                    jax.debug.print(
+                        "{}: shape={} NO_JAX {}", name, list(tensor.shape), extra_info
+                    )
+                else:
+                    jax.debug.print("{}: shape={} NO_JAX", name, list(tensor.shape))
+
+        else:
+            # Not a tensor-like object
+            if stage and extra_info:
+                jax.debug.print(
+                    "[{}] {}: {} {}", stage, name, type(tensor).__name__, extra_info
+                )
+            elif stage:
+                jax.debug.print("[{}] {}: {}", stage, name, type(tensor).__name__)
+            elif extra_info:
+                jax.debug.print("{}: {} {}", name, type(tensor).__name__, extra_info)
+            else:
+                jax.debug.print("{}: {}", name, type(tensor).__name__)
+
+    except Exception as e:
+        if stage:
+            jax.debug.print("[{}] {}: error={}", stage, name, str(e))
+        else:
+            jax.debug.print("{}: error={}", name, str(e))
+
+
+# Alias for convenience
+dbg = debug_print

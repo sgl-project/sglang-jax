@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 import logging
-import threading
-import time
 from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 
 import jax
@@ -190,6 +188,9 @@ class SchedulerOutputProcessorMixin:
             req.check_finished()
             if req.finished():
                 self.tree_cache.cache_finished_req(req)
+                print(
+                    f"{req.rid} \n{req.origin_input_text} \n{req.decoded_text} \n{req.origin_input_ids} \n{req.output_ids=}"
+                )
 
             if req.return_logprob:
                 # speculative worker handles logprob in speculative decoding

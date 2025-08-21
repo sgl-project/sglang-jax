@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any, Optional
 
 import numpy as np
+import jax
 from jax import numpy as jnp
 
 from sgl_jax.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
@@ -21,6 +22,7 @@ class ChunkCache(BasePrefixCache):
     ):
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
+        self.cpu_device = jax.local_devices(backend="cpu")[0]
 
     def reset(self):
         pass
@@ -46,8 +48,7 @@ class ChunkCache(BasePrefixCache):
             req.req_pool_idx, : len(req.fill_ids)
         ]
 
-        # `req.prefix_indices` will be used in `PrefillAdder::add_chunked_req` later
-        req.prefix_indices = kv_indices
+        req.prefix_indices = jax.device_put(kv_indices, self.cpu_device)
 
     def evict(self, num_tokens: int):
         pass

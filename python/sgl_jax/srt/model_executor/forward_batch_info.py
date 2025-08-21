@@ -157,6 +157,10 @@ class ForwardBatch:
     extend_prefix_lens: Optional[jax.Array] = None
     extend_seq_lens: Optional[jax.Array] = None
 
+    traced_req_indices: Optional[jax.Array] = None
+    traced_token_indices: Optional[jax.Array] = None
+    traced_cache_indices: Optional[jax.Array] = None
+
     def tree_flatten(self):
         children = (
             self.input_ids,
@@ -170,6 +174,9 @@ class ForwardBatch:
             self.cache_loc,
             self.extend_prefix_lens,
             self.extend_seq_lens,
+            self.traced_req_indices,
+            self.traced_token_indices,
+            self.traced_cache_indices,
         )
 
         aux_data = {
@@ -196,6 +203,9 @@ class ForwardBatch:
         obj.cache_loc = children[8]
         obj.extend_prefix_lens = children[9]
         obj.extend_seq_lens = children[10]
+        obj.traced_req_indices = children[11]
+        obj.traced_token_indices = children[12]
+        obj.traced_cache_indices = children[13]
 
         return obj
 
@@ -248,4 +258,7 @@ class ForwardBatch:
                 if batch.extend_seq_lens is not None
                 else None
             ),
+            traced_req_indices=batch.traced_req_indices,
+            traced_token_indices=batch.traced_token_indices,
+            traced_cache_indices=batch.traced_cache_indices,
         )

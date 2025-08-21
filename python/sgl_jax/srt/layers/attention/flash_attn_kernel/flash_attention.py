@@ -25,6 +25,7 @@ import jax.experimental.pallas.ops.tpu.ragged_paged_attention.tuned_block_sizes 
 import jax.numpy as jnp
 from jax import lax
 from jax._src import dtypes
+from jax._src.lax.lax import Precision
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 from jax.sharding import PartitionSpec as P
@@ -302,6 +303,40 @@ def ref_ragged_paged_attention(
         q = queries[q_start:q_end]
         k = k_pages[indices, :, :, :].reshape(-1, num_kv_heads, head_dim)[:kv_len]
         v = v_pages[indices, :, :, :].reshape(-1, num_kv_heads, head_dim)[:kv_len]
+
+        k_at_cache_locs = k.flatten()
+        v_at_cache_locs = v.flatten()
+
+        k_mean = jnp.mean(k_at_cache_locs)
+        k_min = jnp.min(k_at_cache_locs)
+        k_max = jnp.max(k_at_cache_locs)
+        k_std = jnp.std(k_at_cache_locs)
+
+        v_mean = jnp.mean(v_at_cache_locs)
+        v_min = jnp.min(v_at_cache_locs)
+        v_max = jnp.max(v_at_cache_locs)
+        v_std = jnp.std(v_at_cache_locs)
+
+        print(f"=== REF kv cache len: {len(indices)}, kv_len: {kv_len}, q_len: {q_len}")
+        print(
+            f"=== REF indices first 10: {indices[:10] if len(indices) > 10 else indices}"
+        )
+        print(f"=== REF k.shape after reconstruction: {k.shape}")
+        print(f"=== REF v.shape after reconstruction: {v.shape}")
+        jax.debug.print(
+            "K stats - mean: {}, min: {}, max: {}, std: {}",
+            k_mean,
+            k_min,
+            k_max,
+            k_std,
+        )
+        jax.debug.print(
+            "V stats - mean: {}, min: {}, max: {}, std: {}",
+            v_mean,
+            v_min,
+            v_max,
+            v_std,
+        )
         if k_scale is not None:
             k = k.astype(jnp.float32) * k_scale
             k = k.astype(q.dtype)

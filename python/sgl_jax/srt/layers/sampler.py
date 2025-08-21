@@ -1,5 +1,5 @@
 from functools import partial
-from typing import List
+from typing import List, Optional
 
 import jax
 import numpy as np
@@ -24,6 +24,7 @@ class Sampler(nnx.Module):
         return_logprob: bool,
         top_logprobs_nums: List[int],
         token_ids_logprobs: List[List[int]],
+        traced_req_indices: jax.Array = None,
         mesh: Mesh = None,
     ):
         """Run a sampler & compute logprobs and update logits_output accordingly.
@@ -38,10 +39,31 @@ class Sampler(nnx.Module):
                 compute output logprobs It is used for speculative decoding which
                 performs sampling in draft workers.
         """
+        # DEBUG: Add logging for sampler input
+        print(f"=== Sampler DEBUG ===")
+        print(
+            f"logits_output.next_token_logits shape: {logits_output.next_token_logits.shape}"
+        )
+        print(f"return_logprob: {return_logprob}")
+        print(f"top_logprobs_nums: {top_logprobs_nums}")
+        print(f"sampling_info.is_all_greedy: {sampling_info.is_all_greedy}")
+
         logits = jnp.reshape(
             logits_output.next_token_logits,
             (-1, logits_output.next_token_logits.shape[-1]),
         )
+        print(f"reshaped logits shape: {logits.shape}")
+
+        if traced_req_indices is not None:
+            traced_logits = logits[traced_req_indices]
+            jax.debug.print(
+                "[SAMPLER_LOGITS] traced_req_indices: {}, logits mean: {}, std: {}, min: {}, max: {}",
+                traced_req_indices,
+                jnp.mean(traced_logits),
+                jnp.std(traced_logits),
+                jnp.min(traced_logits),
+                jnp.max(traced_logits),
+            )
 
         if sampling_info.is_all_greedy:
             batch_next_token_ids = jnp.argmax(logits, -1).flatten()
@@ -82,6 +104,11 @@ class Sampler(nnx.Module):
                 np.arange(len(batch_next_token_ids)),
                 batch_next_token_ids,
             ]
+
+        if traced_req_indices is not None:
+            print(
+                f"[NEXT_TOKEN_IDS] shape: {batch_next_token_ids.shape}, tokens: {batch_next_token_ids[traced_req_indices]}"
+            )
 
         return batch_next_token_ids
 

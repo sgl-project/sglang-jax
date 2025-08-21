@@ -426,7 +426,7 @@ class ModelRunner:
         logits_metadata: LogitsMetadata,
         skip_attn_backend_init: bool,
     ) -> Tuple[LogitsProcessorOutput, int]:
-        with self.mesh, jax.sharding.use_mesh(self.mesh):
+        with self.mesh, jax.sharding.set_mesh(self.mesh):
             if forward_batch.forward_mode.is_decode():
                 ret = self.forward_decode(forward_batch, logits_metadata)
             elif forward_batch.forward_mode.is_extend():
@@ -472,6 +472,7 @@ class ModelRunner:
             model_worker_batch.return_logprob,
             model_worker_batch.top_logprobs_nums,
             model_worker_batch.token_ids_logprobs,
+            model_worker_batch.traced_req_indices,
             self.mesh,
         )
         return next_token_ids_device

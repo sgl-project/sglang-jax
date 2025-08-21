@@ -73,7 +73,10 @@ class OpenAIServingChat(OpenAIServingBase):
         if isinstance(processed_messages.prompt_ids, str):
             prompt_kwargs = {"text": processed_messages.prompt_ids}
         else:
-            prompt_kwargs = {"input_ids": processed_messages.prompt_ids}
+            prompt_kwargs = {
+                "input_ids": processed_messages.prompt_ids,
+                "text": f"{request.messages}",
+            }
 
         adapted_request = GenerateReqInput(
             **prompt_kwargs,

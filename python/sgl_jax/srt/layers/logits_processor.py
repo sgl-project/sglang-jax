@@ -178,6 +178,8 @@ class LogitsMetadata:
 
         return obj
 
+    traced_req_indices: jax.Array = None
+
     @classmethod
     def from_model_worker_batch(cls, batch: ModelWorkerBatch, mesh: Mesh = None):
         if batch.forward_mode.is_extend() and batch.return_logprob:
@@ -218,6 +220,7 @@ class LogitsMetadata:
                 mesh if mesh is not None else jax.sharding.get_abstract_mesh(),
                 batch.extend_input_logprob_token_ids,
             ),
+            traced_req_indices=batch.traced_req_indices,
         )
 
 
@@ -244,22 +247,27 @@ class LogitsProcessor(nnx.Module):
             logits_metadata.forward_mode.is_extend()
             and not logits_metadata.extend_return_logprob
         ):
-            # Prefill without input logprobs.
-            # if logits_metadata.padded_static_len < 0:
-            #    last_index = jnp.cumsum(logits_metadata.extend_seq_lens, dim=0) - 1
-            # else:
-            #     # If padding_static length is 5 and extended_seq_lens is [2, 3],
-            #     # then our batch looks like [t00, t01, p, p, p, t10, t11, t12, p, p]
-            #     # and this retrieves t01 and t12, which are the valid last tokens
-            #     idx = device_array(jax.sharding.get_abstract_mesh(),np.arange(len(logits_metadata.extend_seq_lens)))
-            #     last_index = (
-            #         idx * logits_metadata.padded_static_len
-            #         + logits_metadata.extend_seq_lens
-            #         - 1
-            #     )
+            # DEBUG: Add logging for EXTEND mode token indexing
+            jax.debug.print("=== LogitsProcessor EXTEND mode DEBUG ===")
+            jax.debug.print("extend_seq_lens: {}", logits_metadata.extend_seq_lens)
+            jax.debug.print(
+                "extend_seq_lens_cpu: {}", logits_metadata.extend_seq_lens_cpu
+            )
+            jax.debug.print("hidden_states shape: {}", hidden_states.shape)
 
             last_index = jnp.cumsum(logits_metadata.extend_seq_lens, axis=0) - 1
+            jax.debug.print("computed last_index: {}", last_index)
+            jax.debug.print(
+                "last_index range check: min={}, max={}, hidden_states_len={}",
+                jnp.min(last_index),
+                jnp.max(last_index),
+                hidden_states.shape[0],
+            )
+
             pruned_states = hidden_states[last_index]
+            jax.debug.print("pruned_states shape: {}", pruned_states.shape)
+            jax.debug.print("=== End LogitsProcessor DEBUG ===\n")
+
             sample_indices = None
             input_logprob_indices = None
         else:
@@ -313,6 +321,21 @@ class LogitsProcessor(nnx.Module):
             input_logprob_indices = device_array(
                 mesh,
                 np.array(input_logprob_indices, dtype=jnp.int64),
+            )
+
+        # Debug: Print hidden states for EXTEND mode
+        if logits_metadata.traced_req_indices is not None:
+            traced_hidden_states = pruned_states[logits_metadata.traced_req_indices]
+            jax.debug.print(
+                "[HIDDEN_STATES] forward_mode: {}, extend_seq_lens: {}, mean: {}, std: {}, min: {}, max: {}, return_logprob: {}, content: {}",
+                logits_metadata.forward_mode,
+                logits_metadata.extend_seq_lens,
+                jnp.mean(traced_hidden_states),
+                jnp.std(traced_hidden_states),
+                jnp.min(traced_hidden_states),
+                jnp.max(traced_hidden_states),
+                logits_metadata.extend_return_logprob,
+                traced_hidden_states,
             )
 
         # Compute logits for both input and sampled tokens.
@@ -501,7 +524,9 @@ class LogitsProcessor(nnx.Module):
             dtype=lm_head.dtype,
         )
 
-        logits = jnp.dot(hidden_states, embedding.T)
+        logits = jnp.dot(
+            hidden_states, embedding.T, preferred_element_type=jnp.float32
+        ).astype(hidden_states.dtype)
 
         logits = (
             logits[:, : self.vocab_size]
@@ -512,51 +537,6 @@ class LogitsProcessor(nnx.Module):
         return logits
 
 
-# @partial(jax.jit, static_argnums=(3, 5, 6))
-def _logits_processor_forward_extend(
-    hidden_states: jax.Array,
-    extend_start_loc: jax.Array,
-    extend_seq_lens: jax.Array,
-    promote_dtype: PromoteDtypeFn,
-    embedding: Param,
-    dtype: jnp.dtype,
-    vocab_size: int,
-):
-    last_token_indices = extend_start_loc + extend_seq_lens - 1
-    # Shape: [batch_size, hidden_size]
-    last_hidden_states = hidden_states[last_token_indices]
-
-    return _lm_head_forward(
-        last_hidden_states,
-        embedding,
-        promote_dtype,
-        dtype,
-        vocab_size,
-    )
-
-
-# @partial(jax.jit, static_argnums=(1, 3, 4, 5))
-def _logits_processor_forward_decode(
-    hidden_states: jax.Array,
-    promote_dtype: PromoteDtypeFn,
-    embedding: Param,
-    dtype: jnp.dtype,
-    batch_size: int,
-    vocab_size: int,
-):
-    last_token_indices = jnp.arange(batch_size)
-    # Shape: [batch_size, hidden_size]
-    last_hidden_states = hidden_states[last_token_indices]
-    return _lm_head_forward(
-        last_hidden_states,
-        embedding,
-        promote_dtype,
-        dtype,
-        vocab_size,
-    )
-
-
-# @partial(jax.jit, static_argnums=(2, 3, 4))
 def _lm_head_forward(
     last_hidden_states: jax.Array,
     embedding: Param,
@@ -567,7 +547,9 @@ def _lm_head_forward(
     last_hidden_states, embedding = promote_dtype(
         (last_hidden_states, embedding.value), dtype=dtype
     )
-    logits = jnp.dot(last_hidden_states, embedding.T)
+    logits = jnp.dot(
+        last_hidden_states, embedding.T, preferred_element_type=jnp.float32
+    ).astype(last_hidden_states.dtype)
 
     logits = logits[:, :vocab_size] if logits.ndim > 1 else logits[:vocab_size]
     return logits

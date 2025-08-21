@@ -74,19 +74,6 @@ class NativeAttention(AttentionBackend):
         ):
             is_causal = False
 
-        # token_indices_with_all_reqs = forward_batch.req_to_token_pool.req_to_token[
-        #     forward_batch.req_pool_indices
-        # ]
-        # cache_loc_list = []
-        # for seq_idx in range(forward_batch.seq_lens.shape[0]):
-        #     seq_len = forward_batch.seq_lens[seq_idx]
-        #     cache_loc_list.append(token_indices_with_all_reqs[seq_idx][:seq_len])
-        # cache_loc = jnp.concatenate(cache_loc_list, axis=0)
-
-        # q_len = q.shape[0]
-        # if q_len > cache_loc.shape[0]:
-        #     cache_loc = jnp.pad(cache_loc, (0, q_len - cache_loc.shape[0]), constant_values=0)
-
         attn_output = forward_attention(
             q,
             k_buffer,

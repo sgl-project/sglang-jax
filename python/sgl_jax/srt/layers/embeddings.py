@@ -105,7 +105,9 @@ class Embed(nnx.Module):
         query, embedding = self.promote_dtype(
             (query, self.embedding.value), dtype=self.dtype
         )
-        return jnp.dot(query, embedding.T)
+        return jnp.dot(query, embedding.T, preferred_element_type=jnp.float32).astype(
+            query.dtype
+        )
 
 
 class ParallelLMHead(Embed):

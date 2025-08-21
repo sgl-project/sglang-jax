@@ -151,7 +151,7 @@ class ModelWorker:
         # padding cache_loc_paddings
         # note: the length of following two cache_loc_paddings must keep the same to length of separate bs_paddings.
         self.precompile_prefill_cache_loc_paddings = [
-            self.prefill_max_padded_num_tokens * self.prefill_padded_batch_size
+            self.model_config.context_len * self.prefill_padded_batch_size
         ]
         self.precompile_decode_cache_loc_paddings = [
             item * self.max_req_len for item in self.precompile_decode_bs_paddings

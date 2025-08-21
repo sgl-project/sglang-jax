@@ -8,7 +8,7 @@ from jax.sharding import PartitionSpec
 from transformers import PretrainedConfig
 
 from sgl_jax.srt.configs.model_config import ModelConfig
-from sgl_jax.srt.debug_tracer import global_tracer, trace_function
+from sgl_jax.srt.debug_tracer import debug_print, global_tracer, trace_function
 from sgl_jax.srt.layers.embeddings import Embed, ParallelLMHead, RotaryEmbedding
 from sgl_jax.srt.layers.layernorm import RMSNorm
 from sgl_jax.srt.layers.linear import LinearBase
@@ -62,26 +62,15 @@ class QWenMLP(nnx.Module):
 
     @trace_function(stage="MLP", include_args=False, include_output=True)
     def __call__(self, hidden_states: jnp.ndarray):
-        return _mlp_forward(
-            hidden_states,
-            self.w1.weight.value,
-            self.w2.weight.value,
-            self.c_proj.weight.value,
-        )
-
-
-# @jax.jit
-def _mlp_forward(
-    hidden_states: jax.Array, w1: jax.Array, w2: jax.Array, c_proj: jax.Array
-):
-    a1 = jnp.dot(hidden_states, w1)
-    a2 = jnp.dot(hidden_states, w2)
-    intermediate_parallel = a1 * jax.nn.silu(a2)
-    intermediate_parallel = jax.lax.with_sharding_constraint(
-        intermediate_parallel, PartitionSpec(None, "tensor")
-    )
-    output = jnp.dot(intermediate_parallel, c_proj)
-    return output
+        a1 = jnp.dot(
+            hidden_states, self.w1.weight.value, preferred_element_type=jnp.float32
+        ).astype(hidden_states.dtype)
+        a2 = jnp.dot(
+            hidden_states, self.w2.weight.value, preferred_element_type=jnp.float32
+        ).astype(hidden_states.dtype)
+        intermediate_parallel = a1 * jax.nn.silu(a2)
+        output = jnp.dot(intermediate_parallel, self.c_proj.weight.value)
+        return output
 
 
 class QWenAttention(nnx.Module):
@@ -217,40 +206,42 @@ class QWenBlock(nnx.Module):
     ) -> tuple[jax.Array, jax.Array, jax.Array]:
         residual = hidden_states
 
-        global_tracer.print(
-            hidden_states,
-            f"RMSNorm_pre_attn_input",
-            f"rmsnorm_layer_id_{self.layer_id}",
-        )
         hidden_states = self.ln_1(hidden_states)
-        global_tracer.print(
-            hidden_states,
-            f"RMSNorm_pre_attn_output",
-            f"rmsnorm_layer_id_{self.layer_id}",
-        )
-
+        if self.layer_id < 4:
+            debug_print(
+                hidden_states,
+                "attn_input",
+                f"layer_{self.layer_id}",
+                filter_indices=forward_batch.traced_token_indices,
+            )
         attn_output, k, v = self.attn(
             positions=positions,
             hidden_states=hidden_states,
             forward_batch=forward_batch,
             layer_id=self.layer_id,
         )
-
         hidden_states = residual + attn_output
 
         residual = hidden_states
 
-        global_tracer.print(
-            hidden_states, f"RMSNorm_pre_mlp_input", f"rmsnorm_layer_id_{self.layer_id}"
-        )
         hidden_states = self.ln_2(hidden_states)
-        global_tracer.print(
-            hidden_states,
-            f"RMSNorm_pre_mlp_output",
-            f"rmsnorm_layer_id_{self.layer_id}",
-        )
+
+        if self.layer_id < 4:
+            debug_print(
+                hidden_states,
+                "mlp_input",
+                f"layer_{self.layer_id}",
+                filter_indices=forward_batch.traced_token_indices,
+            )
 
         hidden_states = self.mlp(hidden_states)
+        if self.layer_id < 4:
+            debug_print(
+                hidden_states,
+                "mlp_ouput",
+                f"layer_{self.layer_id}",
+                filter_indices=forward_batch.traced_token_indices,
+            )
         hidden_states = residual + hidden_states
         return hidden_states, k, v
 
@@ -295,9 +286,23 @@ class QWenModel(nnx.Module):
         positions: jax.Array,
         forward_batch: ForwardBatch,
     ):
-        global_tracer.print(input_ids, "embedding_input", "embedding_all")
+        debug_print(
+            input_ids,
+            "embedding_input",
+            "embedding_all",
+            filter_indices=forward_batch.traced_token_indices,
+        )
+        if forward_batch.traced_token_indices is not None:
+            jax.debug.print(
+                "input_ids: {}", input_ids[forward_batch.traced_token_indices]
+            )
         hidden_states = self.embed_tokens(input_ids)
-        global_tracer.print(hidden_states, "embedding_output", "embedding_all")
+        debug_print(
+            hidden_states,
+            "embedding_output",
+            "embedding_all",
+            filter_indices=forward_batch.traced_token_indices,
+        )
 
         layers_k = []
         layers_v = []
@@ -307,9 +312,19 @@ class QWenModel(nnx.Module):
             layers_k.append(k)
             layers_v.append(v)
 
-        global_tracer.print(hidden_states, "RMSNorm_final_input", "rmsnorm_final")
+        debug_print(
+            hidden_states,
+            "RMSNorm_final_input",
+            "rmsnorm_final",
+            filter_indices=forward_batch.traced_token_indices,
+        )
         hidden_states = self.ln_f(hidden_states)
-        global_tracer.print(hidden_states, "RMSNorm_final_output", "rmsnorm_final")
+        debug_print(
+            hidden_states,
+            "RMSNorm_final_output",
+            "rmsnorm_final",
+            filter_indices=forward_batch.traced_token_indices,
+        )
 
         return hidden_states, layers_k, layers_v
 
