@@ -318,7 +318,7 @@ class EPMoE(nnx.Module):
                 )
 
             # Unpermute
-            output = self._unpermute(
+            output = self.unpermute(
                 intermediate_output,
                 sorted_selected_experts,
                 weights,
@@ -502,6 +502,7 @@ class EPMoE(nnx.Module):
             sorted_experts,
         )
 
+
     def _expert_all_to_all_dispatch(
         self, data, global_group_sizes, sorted_experts, expert_shard_id
     ):
@@ -580,23 +581,23 @@ class EPMoE(nnx.Module):
             reshaped_group_sizes, axis_name=("data", "tensor"), axis=0
         )
         
-        # 步骤3：使用 MaxText 的 get_all_to_all_params（MaxText lines 632-634）
+        # 步骤3：纯 EP 使用 reshaped_group_sizes（MaxText lines 710-721）
         input_offsets, send_sizes, output_offsets, recv_sizes = self._get_all_to_all_params(
-            all_shards_group_sizes, expert_shard_id, self.expert_parallel_size
+            reshaped_group_sizes, expert_shard_id, self.expert_parallel_size, is_batch_sharded=False
         )
         
-        # 步骤4：计算 buffer_size（MaxText lines 639-645）
-        buffer_size = int(
-            self.expert_parallel_size
-            * data.shape[0]  # 类似于 per_device_batch_size * max_target_length
-            * self.num_experts_per_tok
+        # 步骤4：计算输出形状（MaxText lines 687-690）  
+        # data.shape[0] 等于 total_tokens * num_experts_per_tok，这里 total_tokens 已经是 batch_size * seq_len 的结果
+        original_inputs_first_dim = data.shape[0]  # 实际等于 batch_size * sequence_length * self.num_experts_per_tok
+        output_shape = jnp.zeros(
+            (original_inputs_first_dim, data.shape[1] // self._get_tensor_parallelism_size()),
+            dtype=data.dtype,
         )
-        output_buffer = jnp.zeros((buffer_size, data.shape[1]), dtype=data.dtype)
         
-        # 步骤5：执行 ragged_all_to_all（MaxText lines 647-655）
+        # 步骤5：执行 ragged_all_to_all（MaxText lines 713-721）
         communicated_data = jax.lax.ragged_all_to_all(
             data,
-            output_buffer,
+            output_shape,
             input_offsets,
             send_sizes,
             output_offsets,
@@ -604,20 +605,13 @@ class EPMoE(nnx.Module):
             axis_name=("data", "tensor"),
         )
         
-        # 步骤6：使用 local_permute（MaxText lines 657-659）
-        sorted_inputs, local_group_sizes, sorted_expert_ids, local_sorted_indices = self._local_permute_for_ragged(
-            communicated_data, 
-            global_group_sizes, 
-            local_expert_size, 
-            expert_shard_id
-        )
-        
-        
         global_tracer.print(
-            sorted_inputs, f"ragged_dispatch_output", f"moe_dispatch_layer_id_{self.layer_id}"
+            communicated_data, f"ragged_dispatch_output", f"moe_dispatch_layer_id_{self.layer_id}"
         )
         
-        return sorted_inputs, local_group_sizes, sorted_expert_ids, local_sorted_indices
+        # 纯 EP 情况下，ragged_all_to_all 后直接返回数据和原始 group_sizes
+        # 不需要 local_permute 步骤
+        return communicated_data, global_group_sizes, sorted_experts, None
 
     def _expert_all_to_all_collect(
         self, data, global_group_sizes, expert_shard_id, target_size, local_sorted_indices=None
@@ -691,59 +685,52 @@ class EPMoE(nnx.Module):
         """
         local_expert_size = self.experts_per_device
         
-        # 步骤1：局部反排列（MaxText line 693）
+        # 步骤1：局部反排列（MaxText line 693） 
         if local_sorted_indices is not None:
             # locally unpermute back to the original order
             local_output = jnp.take(data, indices=jnp.argsort(local_sorted_indices), axis=0)
         else:
             local_output = data
         
-        # 步骤2：计算 reshaped_group_sizes 和准备转置的 all_shards_group_sizes
+        # 步骤2：重新构建 all_shards_group_sizes（与 dispatch 阶段一致）
         reshaped_group_sizes = jnp.sum(global_group_sizes.reshape(-1, local_expert_size), axis=1)
         
-        # 模拟在 dispatch 阶段保存的 all_shards_group_sizes
-        all_shards_group_sizes = jnp.tile(reshaped_group_sizes[None, :], (self.expert_parallel_size, 1))
+        # 与 dispatch 阶段一样，重新计算 all_shards_group_sizes
+        all_shards_group_sizes = jax.lax.all_gather(
+            reshaped_group_sizes, axis_name=("data", "tensor"), axis=0
+        )
         
-        # 步骤3：使用转置的 all_shards_group_sizes（MaxText line 695）
-        transposed_all_shards_group_sizes = jnp.transpose(all_shards_group_sizes)
-        
-        # 步骤4：使用 MaxText 的 get_all_to_all_params（MaxText lines 694-696）
+        # 步骤3：纯 EP 使用 reshaped_group_sizes（与 dispatch 保持一致）
         input_offsets, send_sizes, output_offsets, recv_sizes = self._get_all_to_all_params(
-            transposed_all_shards_group_sizes, expert_shard_id, self.expert_parallel_size
+            reshaped_group_sizes, expert_shard_id, self.expert_parallel_size, is_batch_sharded=False
         )
         
-        # 验证数据大小一致性
-        total_send = jnp.sum(send_sizes)
-        total_recv = jnp.sum(recv_sizes)
-        actual_data_size = data.shape[0]
+        # 步骤4：创建输出缓冲区（MaxText lines 687-690）
+        # 验证目标大小，确保与预期一致（MaxText line 685-686）
+        original_inputs_first_dim = target_size  # 这应该等于 batch_size * sequence_length * self.num_experts_per_tok
         
-        jax.debug.print(
-            "[RAGGED_COLLECT] Expert shard {shard_id}: data_size={data_size}, total_send={total_send}, total_recv={total_recv}, target_size={target_size}",
-            shard_id=expert_shard_id,
-            data_size=actual_data_size,
-            total_send=total_send,
-            total_recv=total_recv,
-            target_size=target_size
+        output_buffer = jnp.zeros(
+            (target_size, data.shape[1] // self._get_tensor_parallelism_size()),  # 考虑tensor parallelism
+            dtype=data.dtype,
         )
         
-        # 步骤5：创建输出缓冲区（MaxText lines 687-690）
-        output_buffer = jnp.zeros((target_size, data.shape[1]), dtype=data.dtype)
+        # 步骤5：执行 ragged_all_to_all（MaxText lines 697-705）
+        intermediate_output = jax.lax.ragged_all_to_all(
+            local_output,
+            output_buffer,
+            input_offsets,
+            send_sizes,
+            output_offsets,
+            recv_sizes,
+            axis_name=("data", "tensor"),
+        )
         
-        # 步骤6：执行 ragged_all_to_all（MaxText lines 697-705）
-        try:
-            collected_data = jax.lax.ragged_all_to_all(
-                local_output,
-                output_buffer,
-                input_offsets,
-                send_sizes,
-                output_offsets,
-                recv_sizes,
-                axis_name=("data", "tensor"),
-            )
-            return collected_data
-            
-        except Exception as e:
-            return self._cpu_simple_collect(data, global_group_sizes, expert_shard_id, target_size)
+        return intermediate_output
+        
+    def _get_tensor_parallelism_size(self):
+        """获取tensor parallelism size"""
+        mesh_shape = self.mesh.shape
+        return mesh_shape.get("tensor", 1) if hasattr(mesh_shape, 'get') else 1
 
     def _get_all_to_all_params(self, all_shards_group_sizes, shard_id, num_expert_parallelism, is_batch_sharded=True):
         """
@@ -846,95 +833,63 @@ class EPMoE(nnx.Module):
         # Also return the sorted indices for later unpermute in collect
         return sorted_inputs, local_group_sizes, sorted_experts_ids, sorted_indices
 
-    def _unpermute(
-        self, intermediate, sorted_selected_experts, weights, batch_size, seq_len
-    ):
-        global_tracer.print(
-            intermediate, f"unpermute_input", f"moe_combine_layer_id_{self.layer_id}"
-        )
-        global_tracer.print(
-            sorted_selected_experts,
-            f"unpermute_sorted_experts",
-            f"moe_combine_layer_id_{self.layer_id}",
-        )
-        global_tracer.print(
-            weights, f"unpermute_weights", f"moe_combine_layer_id_{self.layer_id}"
-        )
+    def unpermute(self, intermediate, sorted_selected_experts, weights, batch_size, sequence_length):
+        """Unpermute tokens to original order and combine weights."""
 
-        expected_tokens = sorted_selected_experts.shape[0]
-        actual_tokens = intermediate.shape[0]
-
-        global_tracer.print(
-            jnp.array([actual_tokens, expected_tokens]),
-            f"unpermute_token_count_check",
-            f"moe_combine_layer_id_{self.layer_id}",
-        )
-
-        if actual_tokens != expected_tokens:
-            if actual_tokens > expected_tokens:
-                intermediate = intermediate[:expected_tokens]
-                global_tracer.print(
-                    jnp.array([1, actual_tokens, expected_tokens]),
-                    f"unpermute_truncated",
-                    f"moe_combine_layer_id_{self.layer_id}",
-                )
-            else:
-                padding_size = expected_tokens - actual_tokens
-                padding = jnp.zeros(
-                    (padding_size, intermediate.shape[1]), dtype=intermediate.dtype
-                )
-                intermediate = jnp.concatenate([intermediate, padding], axis=0)
-                global_tracer.print(
-                    jnp.array([2, actual_tokens, expected_tokens, padding_size]),
-                    f"unpermute_padded",
-                    f"moe_combine_layer_id_{self.layer_id}",
-                )
-
-        argsort_indices = jnp.argsort(sorted_selected_experts)
-        unsort_intermediate = jnp.take(intermediate, indices=argsort_indices, axis=0)
-
-        total_tokens = weights.shape[0] * weights.shape[1] // self.num_experts_per_tok
-
-        reshaped_weights = jnp.reshape(
-            weights, (total_tokens, self.num_experts_per_tok)
-        )
+        unsort_intermediate = jnp.take(intermediate, indices=jnp.argsort(sorted_selected_experts), axis=0)
+        reshaped_weights = jnp.reshape(weights, (-1, self.num_experts_per_tok))
         reshaped_intermediate = jnp.reshape(
             unsort_intermediate,
-            (total_tokens, self.num_experts_per_tok, -1),
+            (reshaped_weights.shape[0], self.num_experts_per_tok, -1),
         )
+        with jax.named_scope("weight_sum"):
+            output = jnp.einsum(
+                "BKE,BK -> BE",
+                reshaped_intermediate.astype(jnp.float32),
+                reshaped_weights.astype(jnp.float32),
+            )
+        return output.reshape(batch_size, sequence_length, -1).astype(self.dtype)
 
-        global_tracer.print(
-            reshaped_weights,
-            f"unpermute_reshaped_weights",
-            f"moe_combine_layer_id_{self.layer_id}",
-        )
-        global_tracer.print(
-            reshaped_intermediate,
-            f"unpermute_reshaped_intermediate",
-            f"moe_combine_layer_id_{self.layer_id}",
-        )
+    # def _unpermute(
+    #     self, intermediate, sorted_selected_experts, weights, batch_size, seq_len
+    # ):
+    #     expected_tokens = sorted_selected_experts.shape[0]
+    #     actual_tokens = intermediate.shape[0]
 
-        intermediate_fp32 = reshaped_intermediate.astype(jnp.float32)
-        weights_fp32 = reshaped_weights.astype(jnp.float32)
+    #     if actual_tokens != expected_tokens:
+    #         if actual_tokens > expected_tokens:
+    #             intermediate = intermediate[:expected_tokens]
+    #         else:
+    #             padding_size = expected_tokens - actual_tokens
+    #             padding = jnp.zeros(
+    #                 (padding_size, intermediate.shape[1]), dtype=intermediate.dtype
+    #             )
+    #             intermediate = jnp.concatenate([intermediate, padding], axis=0)
 
-        output = jnp.einsum(
-            "BKE,BK -> BE",
-            intermediate_fp32,
-            weights_fp32,
-        )
+    #     argsort_indices = jnp.argsort(sorted_selected_experts)
+    #     unsort_intermediate = jnp.take(intermediate, indices=argsort_indices, axis=0)
 
-        global_tracer.print(
-            output, f"unpermute_einsum_output", f"moe_combine_layer_id_{self.layer_id}"
-        )
+    #     total_tokens = weights.shape[0] * weights.shape[1] // self.num_experts_per_tok
 
-        if len(weights.shape) == 2:
-            final_output = output.astype(self.dtype)
-        else:
-            final_output = output.reshape(batch_size, seq_len, -1).astype(self.dtype)
+    #     reshaped_weights = jnp.reshape(
+    #         weights, (total_tokens, self.num_experts_per_tok)
+    #     )
+    #     reshaped_intermediate = jnp.reshape(
+    #         unsort_intermediate,
+    #         (total_tokens, self.num_experts_per_tok, -1),
+    #     )
 
-        global_tracer.print(
-            final_output,
-            f"unpermute_final_output",
-            f"moe_combine_layer_id_{self.layer_id}",
-        )
-        return final_output
+    #     intermediate_fp32 = reshaped_intermediate.astype(jnp.float32)
+    #     weights_fp32 = reshaped_weights.astype(jnp.float32)
+
+    #     output = jnp.einsum(
+    #         "BKE,BK -> BE",
+    #         intermediate_fp32,
+    #         weights_fp32,
+    #     )
+
+    #     if len(weights.shape) == 2:
+    #         final_output = output.astype(self.dtype)
+    #     else:
+    #         final_output = output.reshape(batch_size, seq_len, -1).astype(self.dtype)
+    #     return final_output
