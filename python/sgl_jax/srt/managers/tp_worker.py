@@ -280,53 +280,26 @@ class ModelWorker:
         with jtu.count_pjit_cpp_cache_miss() as count:
             logits_output = self.model_runner.forward(forward_batch)
             cache_miss_count = count()
-        print(f"[TP_WORKER] model_runner.forward completed, cache_miss_count={cache_miss_count}")
-        
-        # 检查 logits_output 的基本属性
-        print(f"[TP_WORKER] logits_output type: {type(logits_output)}")
-        print(f"[TP_WORKER] hasattr next_token_logits: {hasattr(logits_output, 'next_token_logits')}")
 
         if launch_done is not None:
-            print(f"[TP_WORKER] Setting launch_done")
             launch_done.set()
-            print(f"[TP_WORKER] launch_done set")
 
-        print(f"[TP_WORKER] Checking skip_sample={skip_sample}")
         if skip_sample:
-            print(f"[TP_WORKER] Skipping sampling")
             next_token_ids = None
         else:
-            print(f"[TP_WORKER] Calling model_runner.sample")
             next_token_ids = self.model_runner.sample(logits_output, model_worker_batch)
-            print(f"[TP_WORKER] Sampling completed")
 
-        print(f"[TP_WORKER] Processing indices")
-        print(f"[TP_WORKER] model_worker_batch.real_bs: {model_worker_batch.real_bs}")
-        print(f"[TP_WORKER] model_worker_batch.forward_mode: {model_worker_batch.forward_mode}")
-        
-        print(f"[TP_WORKER] Getting extend_start_loc")
         idx = model_worker_batch.extend_start_loc[: model_worker_batch.real_bs]
-        print(f"[TP_WORKER] extend_start_loc obtained")
+        test_get = jax.device_get(idx)
+        print(f"[TP_WORKER] idx: {test_get}")
         
         if model_worker_batch.forward_mode == ForwardMode.EXTEND:
-            print(f"[TP_WORKER] Computing cumsum for EXTEND mode")
-            print(f"[TP_WORKER] extend_seq_lens shape: {model_worker_batch.extend_seq_lens.shape}")
             extend_seq_lens_slice = model_worker_batch.extend_seq_lens[: model_worker_batch.real_bs]
-            print(f"[TP_WORKER] extend_seq_lens sliced")
             extend_seq_lens_minus_1 = extend_seq_lens_slice - 1
-            print(f"[TP_WORKER] extend_seq_lens minus 1 computed")
             idx = np.cumsum(extend_seq_lens_minus_1)
-            jax.debug.breakpoint()        
-        print(f"[TP_WORKER] idx computation completed")
 
-        print(f"[TP_WORKER] Preparing return values")
-        print(f"[TP_WORKER] next_token_ids type: {type(next_token_ids)}")
         if next_token_ids is not None:
-            print(f"[TP_WORKER] next_token_ids.shape: {next_token_ids.shape}")
-            print(f"[TP_WORKER] next_token_ids.dtype: {next_token_ids.dtype}")
-            
-        truncated_logits = logits_output.truncate_logits_processor_output(idx)
-        print(f"[TP_WORKER] Logits truncated")
+            truncated_logits = logits_output.truncate_logits_processor_output(idx)
         
         if next_token_ids is not None:
             print(f"[TP_WORKER] About to index next_token_ids")
