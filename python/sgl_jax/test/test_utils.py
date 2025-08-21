@@ -361,7 +361,7 @@ def generate_server_args() -> ServerArgs:
         jax_num_procs=None,
         xla_backend="tpu",
         max_seq_len=4096,
-        jax_precompile_prefill_token_paddings=[1, 8],
+        jax_precompile_extend_token_paddings=[1, 8],
         disable_jax_precompile=False,
     )
 

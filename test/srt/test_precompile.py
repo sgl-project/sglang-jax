@@ -38,8 +38,8 @@ def get_forward_batch(
             else JAX_PRECOMPILE_DEFAULT_DECODE_BS_PADDINGS
         ),
         (
-            server_args.jax_precompile_prefill_token_paddings
-            if server_args.jax_precompile_prefill_token_paddings is not None
+            server_args.jax_precompile_extend_token_paddings
+            if server_args.jax_precompile_extend_token_paddings is not None
             else JAX_PRECOMPILE_DEFAULT_PREFILL_TOKEN_PADDINGS
         ),
     )
@@ -54,7 +54,7 @@ class TestPrecompile(CustomTestCase):
         # setup ServerArgs
         server_args = generate_server_args()
         # update server_args
-        server_args.jax_precompile_prefill_token_paddings = [1, 4096]
+        server_args.jax_precompile_extend_token_paddings = [1, 4096]
         server_args.jax_precompile_decode_bs_paddings = [1, 2]
         server_args.disable_jax_precompile = False
         print(f"Complete to generate server_args: {server_args}")

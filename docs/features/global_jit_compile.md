@@ -16,9 +16,11 @@ The wrapped forward function is named as `run_model`, which is used by extend an
 Cache Miss is unacceptable for `run_model` because it results a few seconds to a several tens of seconds compile time. In order to improve the performance, precompile and padding are necessary. Precompile is executed before Scheduler's loop. The precompile includes extend and decode phase. The former pads the input parameters with token_paddings and the latter pads them with bs_paddings. Both phases need to pad tokens(like input_ids, positions, etc.) and batch_size.
 
 #### extend padding
+
 `--jax-precompile-extend-token-paddings` is used to configure the token padding list. extend padding uses a fixed batch_size to make a tradeoff between performance and precompile time. So the padding pair will be {bs = fixed_bs, num_tokens = token1}, {bs = fixed_bs, num_tokens = token2} and so on. The fixed batch_size is calculated through `get_extend_padded_size()` which takes the `max_extend_tokens`, `chunked_extend_size` and `max_running_requests` into the consideration.
 
 #### Decode padding
+
 `--jax-precompile-decode-bs-paddings` is used to configure the bs padding list. Decode padding pair likes {bs = bs1, num_tokens = bs1}, {bs = bs2, num_tokens = bs2} and so on.
 
 
