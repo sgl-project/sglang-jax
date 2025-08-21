@@ -517,7 +517,7 @@ class EPMoE(nnx.Module):
             result = self._simple_dispatch(
                 data, global_group_sizes, sorted_experts, expert_shard_id
             )
-            
+        jax.block_until_ready(result)
         print(f"[DISPATCH] Layer {self.layer_id} shard {expert_shard_id}: END - result.shape={result[0].shape}")
         return result
 
@@ -603,8 +603,6 @@ class EPMoE(nnx.Module):
             recv_sizes,
             axis_name=("data", "tensor"),
         )
-        test_get = jax.device_get(communicated_data)
-        print(f"[RAGGED_ALL_TO_ALL] Layer {self.layer_id} shard {expert_shard_id}: communicated_data: {test_get}")
         
         # 步骤6：使用 local_permute（MaxText lines 657-659）
         sorted_inputs, local_group_sizes, sorted_expert_ids, local_sorted_indices = self._local_permute_for_ragged(
