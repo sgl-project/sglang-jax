@@ -727,12 +727,20 @@ class EPMoE(nnx.Module):
             total_repeat_length=max_possible_tokens,
         )
         
-        # Only use the valid portion
-        valid_expert_indices = expert_indices[:total_local_tokens]
+        # Use dynamic_slice instead of dynamic indexing for JIT compatibility
+        valid_expert_indices = jax.lax.dynamic_slice(
+            expert_indices, 
+            start_indices=[0], 
+            slice_sizes=[total_local_tokens]
+        )
 
         sorted_indices = jnp.argsort(valid_expert_indices)
-        # Only process the valid tokens
-        valid_inputs = inputs[:total_local_tokens]
+        # Use dynamic_slice for inputs as well
+        valid_inputs = jax.lax.dynamic_slice(
+            inputs,
+            start_indices=[0, 0],
+            slice_sizes=[total_local_tokens, inputs.shape[1]]
+        )
         sorted_inputs = jnp.take(valid_inputs, indices=sorted_indices, axis=0)
         sorted_experts_ids = valid_expert_indices[sorted_indices]
 
