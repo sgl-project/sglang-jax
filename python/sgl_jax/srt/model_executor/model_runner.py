@@ -326,11 +326,15 @@ class ModelRunner:
     def _forward(
         self, input_ids: jax.Array, positions: jax.Array, forward_batch: ForwardBatch
     ):
+        print(f"[MODEL_RUNNER] Calling model_fn")
         result, layers_k, layers_v = self.model_fn(
             self.state, input_ids, positions, forward_batch
         )
+        print(f"[MODEL_RUNNER] model_fn completed, result type={type(result)}")
 
+        print(f"[MODEL_RUNNER] Setting KV cache")
         self._set_kv_cache_after_forward(layers_k, layers_v, forward_batch)
+        print(f"[MODEL_RUNNER] KV cache set, returning result")
 
         return result
 
@@ -354,11 +358,18 @@ class ModelRunner:
         forward_batch: ForwardBatch,
         skip_attn_backend_init: bool = False,
     ) -> LogitsProcessorOutput:
+        print(f"[MODEL_RUNNER] forward_extend called")
         if not skip_attn_backend_init:
+            print(f"[MODEL_RUNNER] Initializing attention backend")
             self.attn_backend.init_forward_metadata(forward_batch)
-        return self._forward(
+            print(f"[MODEL_RUNNER] Attention backend initialized")
+        
+        print(f"[MODEL_RUNNER] Calling _forward")
+        result = self._forward(
             forward_batch.input_ids, forward_batch.positions, forward_batch
         )
+        print(f"[MODEL_RUNNER] _forward completed, returning from forward_extend")
+        return result
 
     def forward_idle(self, forward_batch: ForwardBatch) -> LogitsProcessorOutput:
         # TODO: implement
@@ -378,19 +389,24 @@ class ModelRunner:
         forward_batch: ForwardBatch,
         skip_attn_backend_init: bool,
     ) -> Tuple[Union[LogitsProcessorOutput], bool]:
+        print(f"[MODEL_RUNNER] _forward_raw called, mode={forward_batch.forward_mode}")
         with self.mesh, jax.sharding.use_mesh(self.mesh):
             if forward_batch.forward_mode.is_decode():
+                print(f"[MODEL_RUNNER] Using decode mode")
                 ret = self.forward_decode(forward_batch)
             elif forward_batch.forward_mode.is_extend():
+                print(f"[MODEL_RUNNER] Using extend mode")
                 ret = self.forward_extend(
                     forward_batch,
                     skip_attn_backend_init=skip_attn_backend_init,
                 )
             elif forward_batch.forward_mode.is_idle():
+                print(f"[MODEL_RUNNER] Using idle mode")
                 ret = self.forward_idle(forward_batch)
             else:
                 raise ValueError(f"Invalid forward mode: {forward_batch.forward_mode}")
 
+        print(f"[MODEL_RUNNER] _forward_raw completed, returning result")
         return ret
 
     def _preprocess_logits(
