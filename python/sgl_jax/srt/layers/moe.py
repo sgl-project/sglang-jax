@@ -549,52 +549,46 @@ class EPMoE(nnx.Module):
         self, data, global_group_sizes, sorted_experts, expert_shard_id
     ):
         """
-        Fixed implementation using _local_permute_for_ragged with mask to solve dynamic shape issues
+        Use ragged_all_to_all for dispatch with proper dynamic shape handling
         """
         local_expert_size = self.experts_per_device
-        
-        # Calculate how much data each device should send to other devices
         reshaped_group_sizes = jnp.sum(
             global_group_sizes.reshape(self.expert_parallel_size, local_expert_size),
             axis=1,
         )
-        
-        # Get the slice of global_group_sizes for this shard using dynamic_slice
-        local_group_sizes = jax.lax.dynamic_slice(
-            global_group_sizes,
-            start_indices=[expert_shard_id * local_expert_size],
-            slice_sizes=[local_expert_size]
+
+        input_offsets, send_sizes, output_offsets, recv_sizes = (
+            self._get_ragged_all_to_all_params(reshaped_group_sizes, expert_shard_id)
         )
+
+        # Fix the dynamic shape issue by using a static upper bound for buffer size
+        # The maximum possible output size is when all tokens are assigned to this shard
+        max_possible_tokens = data.shape[0] * self.expert_parallel_size
         
-        # Create expert assignments for local data
-        expert_indices = jnp.arange(local_expert_size)
-        local_expert_assignments = jnp.repeat(
-            expert_indices,
-            repeats=local_group_sizes,
-            total_repeat_length=data.shape[0],  # Use static shape from input data
+        # Create output buffer with fixed size
+        output_buffer = jnp.zeros((max_possible_tokens, data.shape[1]), dtype=data.dtype)
+
+        print(f"[RAGGED_DISPATCH] About to call ragged_all_to_all - max_buffer_size={max_possible_tokens}")
+        communicated_data = jax.lax.ragged_all_to_all(
+            data,
+            output_buffer,
+            input_offsets,
+            send_sizes,
+            output_offsets,
+            recv_sizes,
+            axis_name=("data", "tensor"),
         )
-        
-        # Calculate actual number of valid tokens for this shard
-        total_local_tokens = jnp.sum(local_group_sizes)
-        
-        # Use masking approach to handle variable sizes in JIT-compatible way
-        valid_mask = jnp.arange(data.shape[0]) < total_local_tokens
-        
-        # Apply mask to get valid data and expert assignments
-        masked_expert_assignments = jnp.where(valid_mask, local_expert_assignments, -1)
-        
-        # Sort by expert assignment (invalid ones go to end due to -1)
-        sort_indices = jnp.argsort(masked_expert_assignments)
-        sorted_data = jnp.take(data, indices=sort_indices, axis=0)
-        sorted_expert_ids = jnp.take(local_expert_assignments, indices=sort_indices)
-        
-        # Return the permuted data - this avoids the ragged_all_to_all dynamic shape issue
-        # by handling the permutation locally with masks
+        print(f"[RAGGED_DISPATCH] ragged_all_to_all completed - output.shape={communicated_data.shape}")
+
+        # Use _local_permute_for_ragged to handle the received data with proper masking
+        x, local_group_sizes, selected_experts = self._local_permute_for_ragged(
+            communicated_data, global_group_sizes, local_expert_size, expert_shard_id
+        )
+
         global_tracer.print(
-            sorted_data, f"ragged_dispatch_output", f"moe_dispatch_layer_id_{self.layer_id}"
+            x, f"ragged_dispatch_output", f"moe_dispatch_layer_id_{self.layer_id}"
         )
-        
-        return sorted_data, local_group_sizes, sorted_expert_ids
+        return x, local_group_sizes, selected_experts
 
     def _expert_all_to_all_collect(
         self, data, global_group_sizes, expert_shard_id, target_size
