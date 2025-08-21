@@ -282,19 +282,42 @@ class ModelWorker:
             cache_miss_count = count()
         print(f"[TP_WORKER] model_runner.forward completed, cache_miss_count={cache_miss_count}")
         
-        # 检查 logits_output 的健康状态  
-        if hasattr(logits_output, 'next_token_logits') and logits_output.next_token_logits is not None:
-            logits_sum = jnp.sum(logits_output.next_token_logits)
-            logits_has_nan = jnp.any(jnp.isnan(logits_output.next_token_logits))
-            logits_has_inf = jnp.any(jnp.isinf(logits_output.next_token_logits))
-            
-            jax.debug.print(
-                "[TP_WORKER] Logits health check - sum={sum}, has_nan={has_nan}, has_inf={has_inf}, shape={shape}",
-                sum=logits_sum,
-                has_nan=logits_has_nan,
-                has_inf=logits_has_inf,
-                shape=logits_output.next_token_logits.shape
-            )
+        # 检查 logits_output 的基本属性
+        print(f"[TP_WORKER] logits_output type: {type(logits_output)}")
+        print(f"[TP_WORKER] hasattr next_token_logits: {hasattr(logits_output, 'next_token_logits')}")
+        
+        if hasattr(logits_output, 'next_token_logits'):
+            print(f"[TP_WORKER] next_token_logits is None: {logits_output.next_token_logits is None}")
+            if logits_output.next_token_logits is not None:
+                print(f"[TP_WORKER] next_token_logits shape: {logits_output.next_token_logits.shape}")
+                print(f"[TP_WORKER] next_token_logits dtype: {logits_output.next_token_logits.dtype}")
+                
+                # 使用更安全的健康检查
+                try:
+                    print(f"[TP_WORKER] About to compute logits sum...")
+                    logits_sum = jnp.sum(logits_output.next_token_logits)
+                    print(f"[TP_WORKER] Logits sum computed")
+                    
+                    print(f"[TP_WORKER] About to check for NaN...")
+                    logits_has_nan = jnp.any(jnp.isnan(logits_output.next_token_logits))
+                    print(f"[TP_WORKER] NaN check completed")
+                    
+                    print(f"[TP_WORKER] About to check for Inf...")
+                    logits_has_inf = jnp.any(jnp.isinf(logits_output.next_token_logits))
+                    print(f"[TP_WORKER] Inf check completed")
+                    
+                    jax.debug.print(
+                        "[TP_WORKER] Logits health check - sum={sum}, has_nan={has_nan}, has_inf={has_inf}, shape={shape}",
+                        sum=logits_sum,
+                        has_nan=logits_has_nan,
+                        has_inf=logits_has_inf,
+                        shape=logits_output.next_token_logits.shape
+                    )
+                    print(f"[TP_WORKER] Health check debug print completed")
+                except Exception as e:
+                    print(f"[TP_WORKER] ERROR during logits health check: {e}")
+            else:
+                print(f"[TP_WORKER] next_token_logits is None, skipping health check")
 
         if launch_done is not None:
             print(f"[TP_WORKER] Setting launch_done")
