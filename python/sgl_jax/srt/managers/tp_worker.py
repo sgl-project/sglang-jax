@@ -269,29 +269,41 @@ class ModelWorker:
         launch_done: Optional[threading.Event] = None,
         skip_sample: bool = False,
     ) -> Tuple[Union[LogitsProcessorOutput, jax.Array, int], Optional[jax.Array]]:
+        print(f"[TP_WORKER] forward_batch_generation called")
         forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
+        print(f"[TP_WORKER] ForwardBatch initialized")
 
         cache_miss_count = 0
         import jax._src.test_util as jtu
 
+        print(f"[TP_WORKER] About to call model_runner.forward")
         with jtu.count_pjit_cpp_cache_miss() as count:
             logits_output = self.model_runner.forward(forward_batch)
             cache_miss_count = count()
+        print(f"[TP_WORKER] model_runner.forward completed, cache_miss_count={cache_miss_count}")
 
         if launch_done is not None:
+            print(f"[TP_WORKER] Setting launch_done")
             launch_done.set()
+            print(f"[TP_WORKER] launch_done set")
 
+        print(f"[TP_WORKER] Checking skip_sample={skip_sample}")
         if skip_sample:
+            print(f"[TP_WORKER] Skipping sampling")
             next_token_ids = None
         else:
+            print(f"[TP_WORKER] Calling model_runner.sample")
             next_token_ids = self.model_runner.sample(logits_output, model_worker_batch)
+            print(f"[TP_WORKER] Sampling completed")
 
+        print(f"[TP_WORKER] Processing indices")
         idx = model_worker_batch.extend_start_loc[: model_worker_batch.real_bs]
         if model_worker_batch.forward_mode == ForwardMode.EXTEND:
             idx = np.cumsum(
                 model_worker_batch.extend_seq_lens[: model_worker_batch.real_bs] - 1
             )
 
+        print(f"[TP_WORKER] Preparing return values")
         return (
             logits_output.truncate_logits_processor_output(idx),
             next_token_ids[idx],
