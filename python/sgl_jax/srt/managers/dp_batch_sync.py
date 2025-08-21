@@ -183,7 +183,7 @@ class DPBatchSynchronizer:
                     # Check if we got real all_gather results or fallback
                     if all_data.shape[0] == 1:
                         # Only got our own data back, use fallback
-                        logger.info(
+                        logger.debug(
                             "all_gather returned single process data, using fallback"
                         )
                         return self._fallback_exchange_batch_info(local_info)
@@ -240,7 +240,7 @@ class DPBatchSynchronizer:
         Fallback method when all_gather is not available.
         Uses conservative assumptions based on local information.
         """
-        logger.info("Using fallback batch sync (conservative assumptions)")
+        logger.debug("Using fallback batch sync (conservative assumptions)")
 
         result = {self.dp_group_id: local_info}
 
