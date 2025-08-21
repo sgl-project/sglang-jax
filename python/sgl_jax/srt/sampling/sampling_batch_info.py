@@ -127,7 +127,7 @@ class SamplingBatchInfo:
         min_ps = np.array([r.sampling_params.min_p for r in reqs], dtype=jnp.float32)
 
         temperatures_device = device_array(batch.mesh, temperatures)
-        top_ps_device = device_array(batch.mesh, top_ks)
+        top_ps_device = device_array(batch.mesh, top_ps)
         top_ks_device = device_array(batch.mesh, top_ks)
         min_ps_device = device_array(batch.mesh, min_ps)
 
