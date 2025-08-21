@@ -462,7 +462,6 @@ class EPMoE(nnx.Module):
         sorted_experts = jnp.repeat(
             expert_indices,
             repeats=group_sizes,
-            total_repeat_length=flatten_selected_experts.shape[0],
         )
 
         return (
@@ -690,10 +689,12 @@ class EPMoE(nnx.Module):
             slice_sizes=[local_expert_size]
         )
 
+        # Simple approach: just return the inputs and group sizes directly
+        # Let the ragged_dot handle the grouping internally
         expert_indices = jnp.repeat(
             jnp.arange(local_expert_size),
             local_group_sizes,
-            total_repeat_length=jnp.sum(local_group_sizes),
+            total_repeat_length=inputs.shape[0],  # Use input shape as fixed length
         )
 
         sorted_indices = jnp.argsort(expert_indices)
