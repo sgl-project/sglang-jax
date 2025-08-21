@@ -451,9 +451,6 @@ class Scheduler(
         """A normal scheduler loop."""
         while True:
             recv_reqs = self.recv_requests()
-            if len(recv_reqs) == 0:
-                time.sleep(0.001)
-                continue
             self.process_input_requests(recv_reqs)
             batch = self.get_next_batch_to_run()
             self.cur_batch = batch
@@ -787,16 +784,13 @@ class Scheduler(
                 ret = None
 
         # DP Attention: Synchronize batch across DP groups
-        if (
-            self._dp_batch_synchronizer
-            and self._dp_batch_synchronizer.is_dp_sync_enabled()
-        ):
+        if self.server_args.enable_dp_attention:
             ret = self._dp_batch_synchronizer.prepare_dp_sync_batch(ret)
 
             # If DP synchronizer indicates we need an idle batch, create one
             if ret is None and self._dp_batch_synchronizer.needs_idle_batch():
                 ret = self.get_idle_batch()
-                logger.debug(
+                logger.info(
                     f"DP group {self._dp_group_info['dp_group_id']}: Created idle batch for DP sync"
                 )
 

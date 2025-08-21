@@ -346,8 +346,7 @@ class DPBatchSynchronizer:
         return self.enable_dp_attention and self.dp_size > 1
 
     def needs_idle_batch(self) -> bool:
-
-        return getattr(self, "_needs_idle_batch", False)
+        return self._needs_idle_batch
 
 
 def create_dp_batch_synchronizer(

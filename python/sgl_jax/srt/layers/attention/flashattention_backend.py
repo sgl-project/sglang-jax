@@ -177,6 +177,13 @@ class FlashAttention(AttentionBackend):
         Returns:
             Output tensor of shape [total_tokens, hidden_size]
         """
+        if forward_batch.forward_mode == ForwardMode.IDLE:
+            return (
+                jnp.zeros_like(q),
+                jnp.zeros_like(k),
+                jnp.zeros_like(v),
+            )
+
         k_buffer, v_buffer = self._get_and_set_kv_cache(
             k, v, forward_batch, layer.layer_id
         )
