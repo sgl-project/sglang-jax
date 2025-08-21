@@ -607,8 +607,12 @@ class EPMoE(nnx.Module):
             axis_name=("data", "tensor"),
         )
         
-        # 步骤8：截取有效的接收数据
-        valid_received_data = communicated_data[:total_recv_size]
+        # 步骤8：使用 dynamic_slice 代替动态索引来截取有效数据
+        valid_received_data = jax.lax.dynamic_slice(
+            communicated_data,
+            start_indices=[0, 0],
+            slice_sizes=[total_recv_size, communicated_data.shape[1]]
+        )
         
         # 步骤9：计算本地 expert 分组
         local_group_sizes = jax.lax.dynamic_slice(
@@ -617,19 +621,20 @@ class EPMoE(nnx.Module):
             slice_sizes=[local_expert_size]
         )
         
-        # 步骤10：生成本地 expert 标识
-        local_expert_indices = jnp.arange(local_expert_size)
-        local_expert_assignments = jnp.repeat(
-            local_expert_indices,
-            repeats=local_group_sizes,
-            total_repeat_length=total_recv_size,
+        # 步骤10：使用 _local_permute_for_ragged 来处理 expert 分配
+        # 这个函数已经正确处理了 mask 和动态大小问题
+        _, final_local_group_sizes, local_expert_assignments = self._local_permute_for_ragged(
+            valid_received_data, 
+            global_group_sizes, 
+            local_expert_size, 
+            expert_shard_id
         )
         
         global_tracer.print(
             valid_received_data, f"ragged_dispatch_output", f"moe_dispatch_layer_id_{self.layer_id}"
         )
         
-        return valid_received_data, local_group_sizes, local_expert_assignments
+        return valid_received_data, final_local_group_sizes, local_expert_assignments
 
     def _expert_all_to_all_collect(
         self, data, global_group_sizes, expert_shard_id, target_size
