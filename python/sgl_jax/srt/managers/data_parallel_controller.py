@@ -115,9 +115,10 @@ class DataParallelController:
         self.context = zmq.Context(1 + self.server_args.dp_size)
 
         # Receive from tokenizer
-        self.recv_from_tokenizer = get_zmq_socket(
-            self.context, zmq.PULL, self.port_args.scheduler_input_ipc_name, False
-        )
+        if self.server_args.node_rank == 0:
+            self.recv_from_tokenizer = get_zmq_socket(
+                self.context, zmq.PULL, self.port_args.scheduler_input_ipc_name, False
+            )
 
         # Initialize connections to each DP rank's scheduler
         self.workers = [None] * self.server_args.dp_size
