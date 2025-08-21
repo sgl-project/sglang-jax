@@ -407,6 +407,8 @@ class ModelRunner:
                 raise ValueError(f"Invalid forward mode: {forward_batch.forward_mode}")
 
         print(f"[MODEL_RUNNER] _forward_raw completed, returning result")
+        test_get = jax.device_get(forward_batch)
+        print(f"[MODEL_RUNNER] ret: {test_get}")
         return ret
 
     def _preprocess_logits(
