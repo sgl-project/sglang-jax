@@ -149,10 +149,14 @@ class EPMoE(nnx.Module):
         self.experts_per_device = num_experts // self.expert_parallel_size
         expert_kernel_axes = (("data", "tensor"), None, None)
 
+        # 在纯EP设置中，没有独立的tensor parallelism，使用完整的hidden_size
+        # EP的并行是在专家维度，不是hidden维度
+        hidden_size_per_partition = config.hidden_size
+        
         self.wi_0 = nnx.Param(
             nnx.with_partitioning(nnx.initializers.normal(), expert_kernel_axes)(
                 rngs.params(),
-                (self.experts_per_device, config.hidden_size, intermediate_dim),
+                (self.experts_per_device, hidden_size_per_partition, intermediate_dim),
                 weight_dtype,
             )
         )
@@ -160,7 +164,7 @@ class EPMoE(nnx.Module):
         self.wi_1 = nnx.Param(
             nnx.with_partitioning(nnx.initializers.normal(), expert_kernel_axes)(
                 rngs.params(),
-                (self.experts_per_device, config.hidden_size, intermediate_dim),
+                (self.experts_per_device, hidden_size_per_partition, intermediate_dim),
                 weight_dtype,
             )
         )
@@ -168,7 +172,7 @@ class EPMoE(nnx.Module):
         self.wo = nnx.Param(
             nnx.with_partitioning(nnx.initializers.normal(), expert_kernel_axes)(
                 rngs.params(),
-                (self.experts_per_device, intermediate_dim, config.hidden_size),
+                (self.experts_per_device, intermediate_dim, hidden_size_per_partition),
                 weight_dtype,
             )
         )
@@ -354,6 +358,14 @@ class EPMoE(nnx.Module):
             w0_kernel,
             f"gmm_sharded_w0_kernel_shape",
             f"moe_compute_layer_id_{self.layer_id}",
+        )
+        
+        # 调试维度信息
+        jax.debug.print(
+            "[GMM_DEBUG] Layer {layer_id}: x.shape={x_shape}, w0.shape={w0_shape}",
+            layer_id=self.layer_id,
+            x_shape=x.shape,
+            w0_shape=w0_kernel.shape
         )
         global_tracer.print(
             local_group_sizes,
@@ -732,9 +744,13 @@ class EPMoE(nnx.Module):
         return intermediate_output
         
     def _get_tensor_parallelism_size(self):
-        """获取tensor parallelism size"""
-        mesh_shape = self.mesh.shape
-        return mesh_shape.get("tensor", 1) if hasattr(mesh_shape, 'get') else 1
+        """
+        获取tensor parallelism size
+        在纯EP设置中，没有独立的tensor parallelism，所以返回1
+        因为EP使用的是 ("data", "tensor") 组合，不是独立的TP
+        """
+        # 在纯EP设置中，tensor轴是EP的一部分，不是独立的TP
+        return 1
 
     def _get_all_to_all_params(self, all_shards_group_sizes, shard_id, num_expert_parallelism, is_batch_sharded=True):
         """
