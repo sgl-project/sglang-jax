@@ -462,6 +462,7 @@ class EPMoE(nnx.Module):
         sorted_experts = jnp.repeat(
             expert_indices,
             repeats=group_sizes,
+            total_repeat_length=bsz_times_seq_len * self.num_experts_per_tok,
         )
 
         return (
