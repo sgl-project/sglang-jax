@@ -23,6 +23,7 @@ from sgl_jax.srt.managers.io_struct import (
 from sgl_jax.srt.managers.scheduler import run_scheduler_process
 from sgl_jax.srt.server_args import PortArgs, ServerArgs
 from sgl_jax.srt.utils import get_zmq_socket
+from sgl_jax.srt.utils.common_utils import configure_logger
 
 
 def get_exception_traceback():
@@ -228,7 +229,7 @@ def run_data_parallel_controller_process(
 ):
     setproctitle.setproctitle("sgl-jax::data_parallel_controller")
     parent_process = psutil.Process().parent()
-
+    configure_logger(server_args, prefix=f"DPController{server_args.node_rank}")
     try:
         logger.debug(f"Node {server_args.node_rank} DataParallelController started")
         controller = DataParallelController(server_args, port_args)
