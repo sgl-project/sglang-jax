@@ -297,11 +297,24 @@ class ModelWorker:
             print(f"[TP_WORKER] Sampling completed")
 
         print(f"[TP_WORKER] Processing indices")
+        print(f"[TP_WORKER] model_worker_batch.real_bs: {model_worker_batch.real_bs}")
+        print(f"[TP_WORKER] model_worker_batch.forward_mode: {model_worker_batch.forward_mode}")
+        
+        print(f"[TP_WORKER] Getting extend_start_loc")
         idx = model_worker_batch.extend_start_loc[: model_worker_batch.real_bs]
+        print(f"[TP_WORKER] extend_start_loc obtained")
+        
         if model_worker_batch.forward_mode == ForwardMode.EXTEND:
-            idx = np.cumsum(
-                model_worker_batch.extend_seq_lens[: model_worker_batch.real_bs] - 1
-            )
+            print(f"[TP_WORKER] Computing cumsum for EXTEND mode")
+            print(f"[TP_WORKER] extend_seq_lens shape: {model_worker_batch.extend_seq_lens.shape}")
+            extend_seq_lens_slice = model_worker_batch.extend_seq_lens[: model_worker_batch.real_bs]
+            print(f"[TP_WORKER] extend_seq_lens sliced")
+            extend_seq_lens_minus_1 = extend_seq_lens_slice - 1
+            print(f"[TP_WORKER] extend_seq_lens minus 1 computed")
+            idx = np.cumsum(extend_seq_lens_minus_1)
+            print(f"[TP_WORKER] cumsum computed")
+        
+        print(f"[TP_WORKER] idx computation completed")
 
         print(f"[TP_WORKER] Preparing return values")
         print(f"[TP_WORKER] next_token_ids type: {type(next_token_ids)}")
