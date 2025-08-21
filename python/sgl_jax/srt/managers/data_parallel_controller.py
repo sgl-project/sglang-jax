@@ -133,7 +133,7 @@ class DataParallelController:
                     self.context,
                     zmq.PUSH,
                     dp_port_args[dp_rank].scheduler_input_ipc_name,
-                    True,
+                    False,
                 )
 
     def launch_dp_schedulers(self, server_args, port_args):
