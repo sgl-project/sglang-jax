@@ -217,29 +217,41 @@ class QWen3MoeDecoderLayer(nnx.Module):
         forward_batch: ForwardBatch,
         residual: Optional[jax.Array] = None,
     ) -> Tuple[jax.Array, jax.Array]:
+        print(f"[LAYER] Starting layer forward, is_moe={self.is_moe_layer}")
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
+        print(f"[LAYER] Input layernorm completed")
 
+        print(f"[LAYER] Starting self attention")
         hidden_states, k, v = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
             forward_batch=forward_batch,
         )
+        print(f"[LAYER] Self attention completed")
 
+        print(f"[LAYER] Post-attention layernorm start")
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        print(f"[LAYER] Post-attention layernorm completed")
+        
         print("MLP start")
         if self.is_moe_layer:
+            print(f"[LAYER] Computing router logits")
             router_logits = self.moe_gate(hidden_states)
+            print(f"[LAYER] Router logits computed, calling MLP")
             mlp_output = self.mlp(hidden_states, router_logits=router_logits)
+            print(f"[LAYER] MLP completed, applying output")
             hidden_states = mlp_output
             print("MLP end")
         else:
+            print(f"[LAYER] Regular MLP forward")
             hidden_states = self.mlp(hidden_states)
             print("MLP end")
 
+        print(f"[LAYER] About to return from layer")
         return hidden_states, residual, k, v
 
 
@@ -285,21 +297,28 @@ class QWen3MoeModel(nnx.Module):
         positions: jax.Array,
         forward_batch: ForwardBatch,
     ) -> jax.Array:
+        print(f"[TRANSFORMER] Starting forward pass, input_ids.shape={input_ids.shape}")
         hidden_states = self.embed_tokens(input_ids)
+        print(f"[TRANSFORMER] Embed tokens completed, hidden_states.shape={hidden_states.shape}")
         residual = None
         layers_k = []
         layers_v = []
-        for layer in self.layers:
+        
+        for layer_idx, layer in enumerate(self.layers):
+            print(f"[TRANSFORMER] Starting layer {layer_idx}")
             hidden_states, residual, k, v = layer(
                 positions, hidden_states, forward_batch, residual
             )
+            print(f"[TRANSFORMER] Layer {layer_idx} completed, hidden_states.shape={hidden_states.shape}")
             layers_k.append(k)
             layers_v.append(v)
 
+        print(f"[TRANSFORMER] All layers completed, applying final norm")
         if residual is not None:
             hidden_states, residual = self.norm(hidden_states, residual)
         else:
             hidden_states = self.norm(hidden_states)
+        print(f"[TRANSFORMER] Final norm completed, returning result")
 
         return hidden_states, layers_k, layers_v
 
