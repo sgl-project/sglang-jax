@@ -230,14 +230,16 @@ class EPMoE(nnx.Module):
             print(f"[MOE] Layer {self.layer_id}: Using expert parallel forward with shard_map")
             output = self._expert_parallel_forward_with_shard_map(inputs, router_logits)
 
-        print(f"[MOE] Layer {self.layer_id}: Forward completed")
+        print(f"[MOE] Layer {self.layer_id}: Forward completed, output.shape={output.shape}")
         global_tracer.print(
             output, f"moe_final_output", f"moe_sparse_layer_id_{self.layer_id}"
         )
+        print(f"[MOE] Layer {self.layer_id}: About to return output")
         return output
 
     @nnx.jit
     def _expert_parallel_forward_with_shard_map(self, inputs, router_logits):
+        print(f"[SHARD_MAP] Layer {self.layer_id}: Starting shard_map forward")
         def _internal_moe_computation(
             hidden_states, router_logits, w0_weights, w1_weights, wo_weights
         ):
@@ -307,7 +309,8 @@ class EPMoE(nnx.Module):
             )
             return output
 
-        return shard_map(
+        print(f"[SHARD_MAP] Layer {self.layer_id}: About to call shard_map")
+        result = shard_map(
             _internal_moe_computation,
             mesh=self.mesh,
             in_specs=(
@@ -320,6 +323,8 @@ class EPMoE(nnx.Module):
             out_specs=P(None),
             check_rep=False,
         )(inputs, router_logits, self.wi_0.value, self.wi_1.value, self.wo.value)
+        print(f"[SHARD_MAP] Layer {self.layer_id}: shard_map completed, result.shape={result.shape}")
+        return result
 
     def _gmm_compute_with_sharded_weights(
         self, x, local_group_sizes, selected_experts, w0_kernel, w1_kernel, wo_kernel

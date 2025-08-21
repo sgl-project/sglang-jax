@@ -230,13 +230,15 @@ class QWen3MoeDecoderLayer(nnx.Module):
         )
 
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
-
+        print("MLP start")
         if self.is_moe_layer:
             router_logits = self.moe_gate(hidden_states)
             mlp_output = self.mlp(hidden_states, router_logits=router_logits)
             hidden_states = mlp_output
+            print("MLP end")
         else:
             hidden_states = self.mlp(hidden_states)
+            print("MLP end")
 
         return hidden_states, residual, k, v
 
