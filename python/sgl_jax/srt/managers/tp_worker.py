@@ -304,9 +304,26 @@ class ModelWorker:
             )
 
         print(f"[TP_WORKER] Preparing return values")
+        print(f"[TP_WORKER] next_token_ids type: {type(next_token_ids)}")
+        if next_token_ids is not None:
+            print(f"[TP_WORKER] next_token_ids.shape: {next_token_ids.shape}")
+            print(f"[TP_WORKER] next_token_ids.dtype: {next_token_ids.dtype}")
+            print(f"[TP_WORKER] idx: {idx}")
+            
+        truncated_logits = logits_output.truncate_logits_processor_output(idx)
+        print(f"[TP_WORKER] Logits truncated")
+        
+        if next_token_ids is not None:
+            print(f"[TP_WORKER] About to index next_token_ids")
+            indexed_next_token_ids = next_token_ids[idx]
+            print(f"[TP_WORKER] next_token_ids indexed, shape: {indexed_next_token_ids.shape}")
+        else:
+            indexed_next_token_ids = None
+            
+        print(f"[TP_WORKER] Returning final result")
         return (
-            logits_output.truncate_logits_processor_output(idx),
-            next_token_ids[idx],
+            truncated_logits,
+            indexed_next_token_ids,
             cache_miss_count,
         )
 
