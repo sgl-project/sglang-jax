@@ -741,12 +741,7 @@ class EPMoE(nnx.Module):
             total_send=total_send,
             target_size=target_size
         )
-        
-        # 检查数据大小不匹配的情况
-        size_mismatch = my_data_size != total_send
-        if size_mismatch:
-            print(f"[RAGGED_COLLECT] ERROR: Data size mismatch, falling back to simple collect")
-            return self._cpu_simple_collect(data, global_group_sizes, expert_shard_id, target_size)
+    
         
         # 步骤3：创建输出缓冲区
         output_buffer = jnp.zeros((target_size, data.shape[1]), dtype=data.dtype)
