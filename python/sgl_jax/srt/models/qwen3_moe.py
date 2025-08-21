@@ -185,18 +185,19 @@ class QWen3MoeDecoderLayer(nnx.Module):
                 layer_id=layer_id,
                 rngs=rngs,
             )
-            self.mlp = EPMoE(
-                config=config,
-                num_experts=num_experts,
-                num_experts_per_tok=num_experts_per_tok,
-                intermediate_dim=moe_intermediate_size,
-                mesh=mesh,
-                expert_parallel_size=expert_parallel_size,
-                weight_dtype=dtype,
-                dtype=dtype,
-                layer_id=layer_id,
-                rngs=rngs,
-            )
+            with mesh:
+                self.mlp = EPMoE(
+                    config=config,
+                    num_experts=num_experts,
+                    num_experts_per_tok=num_experts_per_tok,
+                    intermediate_dim=moe_intermediate_size,
+                    mesh=mesh,
+                    expert_parallel_size=expert_parallel_size,
+                    weight_dtype=dtype,
+                    dtype=dtype,
+                    layer_id=layer_id,
+                    rngs=rngs,
+                )
             self.is_moe_layer = True
 
         self.input_layernorm = RMSNorm(
