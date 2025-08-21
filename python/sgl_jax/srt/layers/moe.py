@@ -549,46 +549,87 @@ class EPMoE(nnx.Module):
         self, data, global_group_sizes, sorted_experts, expert_shard_id
     ):
         """
-        Use ragged_all_to_all for dispatch with proper dynamic shape handling
+        正确的 ragged_all_to_all dispatch 流程：
+        1. 根据 sorted_experts 确定每个 token 应该发送到哪个 shard
+        2. 计算每个 shard 应该发送/接收多少数据
+        3. 使用 ragged_all_to_all 进行通信
+        4. 对接收到的数据进行本地排序
         """
         local_expert_size = self.experts_per_device
-        reshaped_group_sizes = jnp.sum(
-            global_group_sizes.reshape(self.expert_parallel_size, local_expert_size),
-            axis=1,
-        )
-
-        input_offsets, send_sizes, output_offsets, recv_sizes = (
-            self._get_ragged_all_to_all_params(reshaped_group_sizes, expert_shard_id)
-        )
-
-        # Fix the dynamic shape issue by using a static upper bound for buffer size
-        # The maximum possible output size is when all tokens are assigned to this shard
-        max_possible_tokens = data.shape[0] * self.expert_parallel_size
         
-        # Create output buffer with fixed size
-        output_buffer = jnp.zeros((max_possible_tokens, data.shape[1]), dtype=data.dtype)
-
-        print(f"[RAGGED_DISPATCH] About to call ragged_all_to_all - max_buffer_size={max_possible_tokens}")
+        # 步骤1：根据 sorted_experts 计算每个 token 的目标 shard
+        # sorted_experts 包含每个 token 的 expert ID (0 到 num_experts-1)
+        target_shards = jnp.floor_divide(sorted_experts, local_expert_size).astype(jnp.int32)
+        
+        # 步骤2：计算发送到每个 shard 的 token 数量
+        send_counts = jnp.bincount(
+            target_shards, 
+            length=self.expert_parallel_size
+        )
+        
+        # 步骤3：计算接收数量 - 这需要通过 all_gather 获取所有 shard 的 send_counts
+        all_send_counts = jax.lax.all_gather(
+            send_counts, 
+            axis_name=("data", "tensor"),
+            axis=0
+        )  # shape: (expert_parallel_size, expert_parallel_size)
+        
+        # 每个 shard 接收的数量是所有其他 shard 发送给它的总和
+        recv_counts = all_send_counts[:, expert_shard_id]
+        
+        # 步骤4：计算 ragged_all_to_all 的参数
+        send_offsets = jnp.concatenate([jnp.array([0]), jnp.cumsum(send_counts)[:-1]])
+        recv_offsets = jnp.concatenate([jnp.array([0]), jnp.cumsum(recv_counts)[:-1]])
+        
+        # 步骤5：准备发送数据 - 按目标 shard 排序
+        sort_indices = jnp.argsort(target_shards)
+        sorted_data = jnp.take(data, indices=sort_indices, axis=0)
+        sorted_expert_ids = jnp.take(sorted_experts, indices=sort_indices)
+        
+        # 步骤6：计算输出缓冲区大小
+        total_recv_size = jnp.sum(recv_counts)
+        max_possible_recv = data.shape[0] * self.expert_parallel_size
+        
+        # 使用静态上界避免动态 shape 问题
+        output_buffer = jnp.zeros((max_possible_recv, data.shape[1]), dtype=data.dtype)
+        
+        print(f"[RAGGED_DISPATCH] send_counts={send_counts}, recv_counts={recv_counts}")
+        print(f"[RAGGED_DISPATCH] total_recv_size={total_recv_size}, max_buffer={max_possible_recv}")
+        
+        # 步骤7：执行 ragged_all_to_all 通信
         communicated_data = jax.lax.ragged_all_to_all(
-            data,
+            sorted_data,
             output_buffer,
-            input_offsets,
-            send_sizes,
-            output_offsets,
-            recv_sizes,
+            send_offsets,
+            send_counts,
+            recv_offsets,
+            recv_counts,
             axis_name=("data", "tensor"),
         )
-        print(f"[RAGGED_DISPATCH] ragged_all_to_all completed - output.shape={communicated_data.shape}")
-
-        # Use _local_permute_for_ragged to handle the received data with proper masking
-        x, local_group_sizes, selected_experts = self._local_permute_for_ragged(
-            communicated_data, global_group_sizes, local_expert_size, expert_shard_id
+        
+        # 步骤8：截取有效的接收数据
+        valid_received_data = communicated_data[:total_recv_size]
+        
+        # 步骤9：计算本地 expert 分组
+        local_group_sizes = jax.lax.dynamic_slice(
+            global_group_sizes,
+            start_indices=[expert_shard_id * local_expert_size],
+            slice_sizes=[local_expert_size]
         )
-
+        
+        # 步骤10：生成本地 expert 标识
+        local_expert_indices = jnp.arange(local_expert_size)
+        local_expert_assignments = jnp.repeat(
+            local_expert_indices,
+            repeats=local_group_sizes,
+            total_repeat_length=total_recv_size,
+        )
+        
         global_tracer.print(
-            x, f"ragged_dispatch_output", f"moe_dispatch_layer_id_{self.layer_id}"
+            valid_received_data, f"ragged_dispatch_output", f"moe_dispatch_layer_id_{self.layer_id}"
         )
-        return x, local_group_sizes, selected_experts
+        
+        return valid_received_data, local_group_sizes, local_expert_assignments
 
     def _expert_all_to_all_collect(
         self, data, global_group_sizes, expert_shard_id, target_size
