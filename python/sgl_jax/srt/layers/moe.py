@@ -227,7 +227,6 @@ class EPMoE(nnx.Module):
         )
         return output
 
-    @nnx.jit
     def _expert_parallel_forward_with_shard_map(self, inputs, router_logits):
         def _internal_moe_computation(
             hidden_states, router_logits, w0_weights, w1_weights, wo_weights
@@ -473,13 +472,6 @@ class EPMoE(nnx.Module):
     def _expert_all_to_all_dispatch(
         self, data, global_group_sizes, sorted_experts, expert_shard_id
     ):
-        return self._simple_dispatch(
-            data, global_group_sizes, sorted_experts, expert_shard_id
-        )
-
-    def _simple_dispatch(
-        self, data, global_group_sizes, sorted_experts, expert_shard_id
-    ):
         local_expert_size = self.experts_per_device
 
         # compute each token's expert shard
@@ -519,54 +511,28 @@ class EPMoE(nnx.Module):
 
         return local_data, local_group_sizes, local_experts_extracted
 
-    def _ragged_all_to_all_dispatch(
-        self, data, global_group_sizes, sorted_experts, expert_shard_id
-    ):
-        local_expert_size = self.experts_per_device
-        reshaped_group_sizes = jnp.sum(
-            global_group_sizes.reshape(self.expert_parallel_size, local_expert_size),
-            axis=1,
-        )
-
-        input_offsets, send_sizes, output_offsets, recv_sizes = (
-            self._get_ragged_all_to_all_params(reshaped_group_sizes, expert_shard_id)
-        )
-
-        buffer_size = int(self.expert_parallel_size * data.shape[0])
-        output_shape = jnp.zeros((buffer_size, data.shape[1]), dtype=data.dtype)
-
-        communicated_data = jax.lax.ragged_all_to_all(
-            data,
-            output_shape,
-            input_offsets,
-            send_sizes,
-            output_offsets,
-            recv_sizes,
-            axis_name=("data", "tensor"),
-        )
-
-        x, local_group_sizes, selected_experts = self._local_permute_for_ragged(
-            communicated_data, global_group_sizes, local_expert_size, expert_shard_id
-        )
-
-        global_tracer.print(
-            x, f"ragged_dispatch_output", f"moe_dispatch_layer_id_{self.layer_id}"
-        )
-        return x, local_group_sizes, selected_experts
+    def _get_all_to_all_params(self, group_sizes, shard_id):
+        """Generate parameters for ragged_all_to_all based on MaxText implementation."""
+        # Input offsets: data always starts at 0 for each shard
+        input_offsets = jnp.zeros(self.expert_parallel_size, dtype=group_sizes.dtype)
+        
+        # Send sizes: how much data this shard sends to each other shard
+        send_sizes = jnp.repeat(group_sizes[shard_id], self.expert_parallel_size)
+        
+        # Output offsets: where to place received data in output buffer
+        output_offset = jnp.concatenate((jnp.array([0]), jnp.cumsum(group_sizes[:-1])))[shard_id]
+        output_offsets = jnp.repeat(output_offset, self.expert_parallel_size)
+        
+        # Receive sizes: how much data to receive from each shard
+        recv_sizes = group_sizes
+        
+        return input_offsets, send_sizes, output_offsets, recv_sizes
 
     def _expert_all_to_all_collect(
         self, data, global_group_sizes, expert_shard_id, target_size
     ):
-        return self._cpu_simple_collect(
-            data, global_group_sizes, expert_shard_id, target_size
-        )
-
-    def _cpu_simple_collect(
-        self, data, global_group_sizes, expert_shard_id, target_size
-    ):
         """
-        Gathers variable-sized data from all expert devices into a single, correctly
-        ordered tensor using a JIT-compatible scatter-and-sum pattern.
+        Gathers variable-sized data from all expert devices using ragged_all_to_all.
         """
         # Calculate the number of tokens to be handled by each device.
         reshaped_group_sizes = global_group_sizes.reshape(
@@ -574,60 +540,15 @@ class EPMoE(nnx.Module):
         )
         tokens_per_device = jnp.sum(reshaped_group_sizes, axis=1)
 
-        # Calculate the start and end indices for this device's data in the global buffer.
-        cumsum = jnp.cumsum(tokens_per_device)
-        start_indices = jnp.concatenate(
-            [jnp.array([0], dtype=tokens_per_device.dtype), cumsum]
+        # Get parameters for ragged_all_to_all
+        input_offsets, send_sizes, output_offsets, recv_sizes = self._get_all_to_all_params(
+            tokens_per_device, expert_shard_id
         )
-        my_start_index = start_indices[expert_shard_id]
-        my_end_index = start_indices[expert_shard_id + 1]
-
-        # JIT-safe scatter operation.
-        # This block constructs a buffer of the full `target_size` for the local device,
-        # with this device's data placed in the correct slice. This avoids creating
-        # intermediate tensors with dynamic shapes, which is required for JIT compilation.
-        output_indices = jnp.arange(target_size)
-        source_indices = output_indices - my_start_index
-
-        # Create a mask for the slice this device is responsible for.
-        mask = (output_indices >= my_start_index) & (output_indices < my_end_index)
-
-        # Gather from source `data`, using a safe index (0) for out-of-bounds access.
-        # The mask ensures these gathered-but-invalid values are discarded.
-        safe_source_indices = jnp.where(mask, source_indices, 0)
-        gathered_data = data[safe_source_indices]
-
-        # Place the gathered data into the buffer using the mask.
-        local_result_buffer = jnp.where(mask[:, None], gathered_data, 0.0)
-
-        # Sum the buffers from all devices. Since each buffer is zero outside its
-        # assigned slice, this sum is equivalent to a concatenation.
-        result = jax.lax.psum(local_result_buffer, axis_name=("data", "tensor"))
-
-        return result
-
-    def _ragged_all_to_all_collect(
-        self, data, global_group_sizes, expert_shard_id, target_size
-    ):
-        """TPU/GPU: Use ragged_all_to_all for collection"""
-        local_expert_size = self.experts_per_device
-        reshaped_group_sizes = jnp.sum(
-            global_group_sizes.reshape(self.expert_parallel_size, local_expert_size),
-            axis=1,
-        )
-
-        # Calculate ragged_all_to_all parameters (transpose version for collection)
-        input_offsets, send_sizes, output_offsets, recv_sizes = (
-            self._get_ragged_all_to_all_params(
-                reshaped_group_sizes.T,
-                expert_shard_id,  # Note that transposition is needed here
-            )
-        )
-
-        # Create output buffer
+        
+        # Create output shape buffer
         output_shape = jnp.zeros((target_size, data.shape[1]), dtype=data.dtype)
 
-        # Execute ragged_all_to_all
+        # Use ragged_all_to_all to gather data from all devices
         result = jax.lax.ragged_all_to_all(
             data,
             output_shape,
@@ -635,45 +556,10 @@ class EPMoE(nnx.Module):
             send_sizes,
             output_offsets,
             recv_sizes,
-            axis_name=("data", "tensor"),
+            axis_name=("data", "tensor")
         )
 
-        global_tracer.print(
-            result, f"ragged_collect_output", f"moe_combine_layer_id_{self.layer_id}"
-        )
         return result
-
-    def _get_ragged_all_to_all_params(self, group_sizes, shard_id):
-        input_offsets = jnp.zeros(self.expert_parallel_size, dtype=jnp.int32)
-        send_sizes = jnp.repeat(group_sizes[shard_id], self.expert_parallel_size)
-
-        output_offset = jnp.concatenate((jnp.array([0]), jnp.cumsum(group_sizes[:-1])))[
-            shard_id
-        ]
-        output_offsets = jnp.repeat(output_offset, self.expert_parallel_size)
-
-        recv_sizes = group_sizes
-
-        return input_offsets, send_sizes, output_offsets, recv_sizes
-
-    def _local_permute_for_ragged(
-        self, inputs, global_group_sizes, local_expert_size, shard_index
-    ):
-        local_group_sizes = global_group_sizes[
-            shard_index * local_expert_size : (shard_index + 1) * local_expert_size
-        ]
-
-        expert_indices = jnp.repeat(
-            jnp.arange(local_expert_size),
-            local_group_sizes,
-            total_repeat_length=jnp.sum(local_group_sizes),
-        )
-
-        sorted_indices = jnp.argsort(expert_indices)
-        sorted_inputs = jnp.take(inputs, indices=sorted_indices, axis=0)
-        sorted_experts_ids = expert_indices[sorted_indices]
-
-        return sorted_inputs, local_group_sizes, sorted_experts_ids
 
     def _unpermute(
         self, intermediate, sorted_selected_experts, weights, batch_size, seq_len
