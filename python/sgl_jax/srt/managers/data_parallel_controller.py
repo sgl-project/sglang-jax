@@ -131,7 +131,7 @@ class DataParallelController:
                     self.context,
                     zmq.PUSH,
                     dp_port_args[dp_rank].scheduler_input_ipc_name,
-                    False,
+                    True,
                 )
 
     def get_dp_port_args(self, server_args):
