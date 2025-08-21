@@ -281,6 +281,20 @@ class ModelWorker:
             logits_output = self.model_runner.forward(forward_batch)
             cache_miss_count = count()
         print(f"[TP_WORKER] model_runner.forward completed, cache_miss_count={cache_miss_count}")
+        
+        # 检查 logits_output 的健康状态  
+        if hasattr(logits_output, 'next_token_logits') and logits_output.next_token_logits is not None:
+            logits_sum = jnp.sum(logits_output.next_token_logits)
+            logits_has_nan = jnp.any(jnp.isnan(logits_output.next_token_logits))
+            logits_has_inf = jnp.any(jnp.isinf(logits_output.next_token_logits))
+            
+            jax.debug.print(
+                "[TP_WORKER] Logits health check - sum={sum}, has_nan={has_nan}, has_inf={has_inf}, shape={shape}",
+                sum=logits_sum,
+                has_nan=logits_has_nan,
+                has_inf=logits_has_inf,
+                shape=logits_output.next_token_logits.shape
+            )
 
         if launch_done is not None:
             print(f"[TP_WORKER] Setting launch_done")

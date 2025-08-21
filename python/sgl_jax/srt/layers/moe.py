@@ -231,6 +231,24 @@ class EPMoE(nnx.Module):
             output = self._expert_parallel_forward_with_shard_map(inputs, router_logits)
 
         print(f"[MOE] Layer {self.layer_id}: Forward completed, output.shape={output.shape}")
+        
+        # 检查输出数据的健康状态
+        output_sum = jnp.sum(output)
+        output_has_nan = jnp.any(jnp.isnan(output))
+        output_has_inf = jnp.any(jnp.isinf(output))
+        output_min = jnp.min(output)
+        output_max = jnp.max(output)
+        
+        jax.debug.print(
+            "[MOE] Layer {layer_id}: Output health check - sum={sum}, has_nan={has_nan}, has_inf={has_inf}, min={min}, max={max}",
+            layer_id=self.layer_id,
+            sum=output_sum,
+            has_nan=output_has_nan,
+            has_inf=output_has_inf,
+            min=output_min,
+            max=output_max
+        )
+        
         global_tracer.print(
             output, f"moe_final_output", f"moe_sparse_layer_id_{self.layer_id}"
         )
@@ -572,8 +590,19 @@ class EPMoE(nnx.Module):
         max_possible_recv = data.shape[0] * self.expert_parallel_size
         output_buffer = jnp.zeros((max_possible_recv, data.shape[1]), dtype=data.dtype)
         
-        print(f"[RAGGED_DISPATCH] reshaped_group_sizes={reshaped_group_sizes}")
-        print(f"[RAGGED_DISPATCH] send_sizes={send_sizes}, recv_sizes={recv_sizes}")
+        # 验证通信参数的一致性
+        total_send = jnp.sum(send_sizes)
+        total_recv = jnp.sum(recv_sizes)
+        
+        jax.debug.print(
+            "[RAGGED_DISPATCH] Expert shard {shard_id}: data_shape={data_shape}, total_send={total_send}, total_recv={total_recv}",
+            shard_id=expert_shard_id,
+            data_shape=data.shape,
+            total_send=total_send,
+            total_recv=total_recv
+        )
+        
+        print(f"[RAGGED_DISPATCH] About to call ragged_all_to_all...")
         
         # 步骤4：执行 ragged_all_to_all 通信
         communicated_data = jax.lax.ragged_all_to_all(
@@ -585,6 +614,8 @@ class EPMoE(nnx.Module):
             recv_sizes,
             axis_name=("data", "tensor"),
         )
+        
+        print(f"[RAGGED_DISPATCH] ragged_all_to_all completed, output.shape={communicated_data.shape}")
         
         # 步骤5：使用 MaxText 的 local_permute 逻辑处理接收数据
         # 这里调用我们的 _local_permute_for_ragged 函数
@@ -669,65 +700,75 @@ class EPMoE(nnx.Module):
         self, data, global_group_sizes, expert_shard_id, target_size
     ):
         """
-        基于 MaxText 官方实现的正确 collect 流程:
-        1. 本地数据不需要 unpermute（因为我们已经是按 expert 排序的）
-        2. 使用转置的 group_sizes 计算 collect 的通信参数
-        3. 执行 ragged_all_to_all 收集数据回原始位置
+        简化的 ragged_all_to_all collect 实现，使用对称的通信逻辑
         """
         local_expert_size = self.experts_per_device
         
-        # 步骤1：计算用于 collect 的通信参数
-        # MaxText 在 collect 时使用转置的 group_sizes
+        # 步骤1：使用与 dispatch 完全相同的基础参数
         reshaped_group_sizes = jnp.sum(
             global_group_sizes.reshape(self.expert_parallel_size, local_expert_size), 
             axis=1
         )
         
-        # 对于 collect，我们需要转置通信参数
-        # 发送方现在变成接收方，接收方现在变成发送方
-        transposed_group_sizes = global_group_sizes.reshape(
-            self.expert_parallel_size, local_expert_size
-        ).T  # 转置: shape 变为 (local_expert_size, expert_parallel_size)
+        # 步骤2：计算 collect 的通信参数（dispatch 的逆向）
+        # 在 dispatch 中：shard[i] 发送 reshaped_group_sizes[i] 个 token 到当前 expert_shard
+        # 在 collect 中：当前 expert_shard 发送处理后的数据回 shard[i]
         
-        # 计算这个 shard 要发送的数据量（等于本地 expert 处理的数据量）
+        # 当前 expert shard 的本地数据大小
         local_group_sizes = jax.lax.dynamic_slice(
             global_group_sizes,
             start_indices=[expert_shard_id * local_expert_size],
             slice_sizes=[local_expert_size]
         )
-        local_send_size = jnp.sum(local_group_sizes)
+        my_data_size = jnp.sum(local_group_sizes)
         
-        # 每个目标 shard 接收的数据量等于它们原来发送给我们的数据量
-        recv_sizes = reshaped_group_sizes
+        # 计算发送和接收参数
+        # 我们向每个 shard 发送它们原来发送给我们的数据量
+        send_sizes = reshaped_group_sizes  # 发送给每个 shard 的数量
+        recv_sizes = reshaped_group_sizes  # 从每个 shard 接收的数量（应该是对称的）
         
         # 计算偏移量
-        send_offsets = jnp.zeros(self.expert_parallel_size, dtype=jnp.int32)
-        send_sizes = jnp.repeat(local_send_size, self.expert_parallel_size)
-        
+        send_offsets = jnp.concatenate([jnp.array([0]), jnp.cumsum(send_sizes)[:-1]])
         recv_offsets = jnp.concatenate([jnp.array([0]), jnp.cumsum(recv_sizes)[:-1]])
         
-        # 步骤2：创建输出缓冲区
+        # 验证数据大小
+        total_send = jnp.sum(send_sizes)
+        
+        jax.debug.print(
+            "[RAGGED_COLLECT] Expert shard {shard_id}: my_data_size={my_data_size}, total_send={total_send}, target_size={target_size}",
+            shard_id=expert_shard_id,
+            my_data_size=my_data_size,
+            total_send=total_send,
+            target_size=target_size
+        )
+        
+        # 检查数据大小不匹配的情况
+        size_mismatch = my_data_size != total_send
+        if size_mismatch:
+            print(f"[RAGGED_COLLECT] ERROR: Data size mismatch, falling back to simple collect")
+            return self._cpu_simple_collect(data, global_group_sizes, expert_shard_id, target_size)
+        
+        # 步骤3：创建输出缓冲区
         output_buffer = jnp.zeros((target_size, data.shape[1]), dtype=data.dtype)
         
-        print(f"[RAGGED_COLLECT] local_send_size={local_send_size}, recv_sizes={recv_sizes}")
-        print(f"[RAGGED_COLLECT] send_sizes={send_sizes}, target_size={target_size}")
-        
-        # 步骤3：执行 ragged_all_to_all 收集
-        collected_data = jax.lax.ragged_all_to_all(
-            data,
-            output_buffer,
-            send_offsets,
-            send_sizes,
-            recv_offsets,
-            recv_sizes,
-            axis_name=("data", "tensor"),
-        )
-        
-        global_tracer.print(
-            collected_data, f"ragged_collect_output", f"moe_collect_layer_id_{self.layer_id}"
-        )
-        
-        return collected_data
+        # 步骤4：执行 ragged_all_to_all 收集
+        try:
+            collected_data = jax.lax.ragged_all_to_all(
+                data,
+                output_buffer,
+                send_offsets,
+                send_sizes,
+                recv_offsets,
+                recv_sizes,
+                axis_name=("data", "tensor"),
+            )
+            print(f"[RAGGED_COLLECT] ragged_all_to_all completed successfully")
+            return collected_data
+            
+        except Exception as e:
+            print(f"[RAGGED_COLLECT] ERROR in ragged_all_to_all: {e}")
+            print(f"[RAGGED_COLLECT] Falling back to CPU simple collect")
+            return self._cpu_simple_collect(data, global_group_sizes, expert_shard_id, target_size)
 
     def _get_ragged_all_to_all_params(self, group_sizes, shard_id):
         input_offsets = jnp.zeros(self.expert_parallel_size, dtype=jnp.int32)
