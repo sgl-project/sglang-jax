@@ -128,20 +128,9 @@ def main():
                 num_heads,
                 head_dim=head_dim,
             )
-
-            results.append(
-                {
-                    "config": f"B{batch_size}_S{seq_len}_H{num_heads}",
-                    "flash_ms": flash_time * 1000,
-                }
-            )
+            print(f'cost: {flash_time*1000}ms')
             print()
 
-        print("=" * 80)
-        print("-" * 80)
-
-        for r in results:
-            print(f"{r['config']:<15} {r['flash_ms']:<11.2f}")
 
 
 if __name__ == "__main__":
