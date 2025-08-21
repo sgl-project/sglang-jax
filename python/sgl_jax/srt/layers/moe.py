@@ -519,19 +519,9 @@ class EPMoE(nnx.Module):
     def _expert_all_to_all_dispatch(
         self, data, global_group_sizes, sorted_experts, expert_shard_id
     ):
-        print(f"[DISPATCH] Layer {self.layer_id} shard {expert_shard_id}: START - data.shape={data.shape}")
-        
-        # 在纯 EP 中，dispatch 阶段只做 local_permute，不做 all_to_all
-        # 按照 MaxText lines 661-668 的逻辑
-        local_expert_size = self.experts_per_device
-        
-        # 使用 MaxText 的 local_permute 逻辑（is_offset=True）
-        x, local_sorted_indices, local_group_sizes, selected_experts = self._local_permute_with_offset(
-            data, global_group_sizes, local_expert_size, expert_shard_id, sorted_experts
+        return self._simple_dispatch(
+            data, global_group_sizes, sorted_experts, expert_shard_id
         )
-        
-        print(f"[DISPATCH] Layer {self.layer_id} shard {expert_shard_id}: END - result.shape={x.shape}")
-        return x, local_group_sizes, selected_experts, local_sorted_indices
 
     def _simple_dispatch(
         self, data, global_group_sizes, sorted_experts, expert_shard_id
