@@ -59,7 +59,10 @@ class DataParallelController:
         )
         ready_event = threading.Event()
         self._launch_local_scheduler(
-            self.server_args, self.port_args, dp_rank, ready_event
+            self.server_args,
+            PortArgs.init_new(self.server_args, dp_rank),
+            dp_rank,
+            ready_event,
         )
         logger.debug(f"Node {self.server_args.node_rank} Scheduler launched")
         # Only node 0 sets up communication to all DP ranks
@@ -86,7 +89,7 @@ class DataParallelController:
             target=run_scheduler_process,
             args=(
                 self.server_args,
-                PortArgs.init_new(self.server_args, dp_rank),
+                port_args,
                 self.dp_rank,
                 writer,
             ),
@@ -131,7 +134,7 @@ class DataParallelController:
                     self.context,
                     zmq.PUSH,
                     dp_port_args[dp_rank].scheduler_input_ipc_name,
-                    True,
+                    False,
                 )
 
     def get_dp_port_args(self, server_args):
