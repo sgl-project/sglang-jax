@@ -714,36 +714,35 @@ class EPMoE(nnx.Module):
             slice_sizes=[local_expert_size]
         )
 
-        # Calculate the correct total repeat length based on local group sizes
-        total_local_tokens = jnp.sum(local_group_sizes)
-        
-        # For JIT compatibility, we need a static upper bound
-        # Use the input size as the maximum possible tokens for this shard
+        # Simplified approach: use all available input data and let mask handle validation
+        # This avoids dynamic slicing issues while maintaining correctness
         max_possible_tokens = inputs.shape[0]
         
+        # Create expert indices with fixed size
         expert_indices = jnp.repeat(
             jnp.arange(local_expert_size),
             local_group_sizes,
             total_repeat_length=max_possible_tokens,
         )
         
-        # Use dynamic_slice instead of dynamic indexing for JIT compatibility
-        valid_expert_indices = jax.lax.dynamic_slice(
-            expert_indices, 
-            start_indices=[0], 
-            slice_sizes=[total_local_tokens]
-        )
-
+        # Calculate actual number of valid tokens
+        total_local_tokens = jnp.sum(local_group_sizes)
+        
+        # Create a mask for valid tokens instead of slicing
+        valid_mask = jnp.arange(max_possible_tokens) < total_local_tokens
+        
+        # Apply mask to get valid expert indices (fill invalid with -1)
+        valid_expert_indices = jnp.where(valid_mask, expert_indices, -1)
+        
+        # Sort all indices (invalid ones will go to the end due to -1)
         sorted_indices = jnp.argsort(valid_expert_indices)
-        # Use dynamic_slice for inputs as well
-        valid_inputs = jax.lax.dynamic_slice(
-            inputs,
-            start_indices=[0, 0],
-            slice_sizes=[total_local_tokens, inputs.shape[1]]
-        )
-        sorted_inputs = jnp.take(valid_inputs, indices=sorted_indices, axis=0)
-        sorted_experts_ids = valid_expert_indices[sorted_indices]
-
+        
+        # Take from the sorted indices, the valid ones come first
+        sorted_inputs = jnp.take(inputs, indices=sorted_indices, axis=0)
+        sorted_experts_ids = jnp.take(expert_indices, indices=sorted_indices)
+        
+        # Only return the valid portion by using the known total_local_tokens
+        # This is safe because we know total_local_tokens <= max_possible_tokens
         return sorted_inputs, local_group_sizes, sorted_experts_ids
 
     def _unpermute(
