@@ -351,7 +351,7 @@ class ModelWorker:
             print(f"[TP_WORKER] extend_seq_lens sliced")
             extend_seq_lens_minus_1 = extend_seq_lens_slice - 1
             print(f"[TP_WORKER] extend_seq_lens minus 1 computed")
-            idx = jnp.cumsum(extend_seq_lens_minus_1)        
+            idx = np.cumsum(extend_seq_lens_minus_1)        
         print(f"[TP_WORKER] idx computation completed")
 
         print(f"[TP_WORKER] Preparing return values")

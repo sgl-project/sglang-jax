@@ -575,25 +575,14 @@ class EPMoE(nnx.Module):
         reshaped_group_sizes = jnp.sum(global_group_sizes.reshape(-1, local_expert_size), axis=1)
         
         # 步骤2：gather all_shards_group_sizes（MaxText line 631）
-        # 这里我们模拟 all_gather 的结果，假设所有 shard 的 reshaped_group_sizes 相同
-        # 在实际环境中应该是 lax.all_gather(reshaped_group_sizes, axis_name="expert")
-        all_shards_group_sizes = jnp.tile(reshaped_group_sizes[None, :], (self.expert_parallel_size, 1))
+        # 使用真正的 all_gather 收集所有 shard 的 reshaped_group_sizes
+        all_shards_group_sizes = jax.lax.all_gather(
+            reshaped_group_sizes, axis_name=("data", "tensor"), axis=0
+        )
         
         # 步骤3：使用 MaxText 的 get_all_to_all_params（MaxText lines 632-634）
         input_offsets, send_sizes, output_offsets, recv_sizes = self._get_all_to_all_params(
             all_shards_group_sizes, expert_shard_id, self.expert_parallel_size
-        )
-        
-        # 验证通信参数
-        total_send = jnp.sum(send_sizes)
-        total_recv = jnp.sum(recv_sizes)
-        
-        jax.debug.print(
-            "[RAGGED_DISPATCH] Expert shard {shard_id}: data_shape_0={data_shape_0}, total_send={total_send}, total_recv={total_recv}",
-            shard_id=expert_shard_id,
-            data_shape_0=data.shape[0],
-            total_send=total_send,
-            total_recv=total_recv
         )
         
         # 步骤4：计算 buffer_size（MaxText lines 639-645）
