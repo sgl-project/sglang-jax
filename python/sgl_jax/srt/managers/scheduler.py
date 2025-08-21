@@ -451,6 +451,9 @@ class Scheduler(
         """A normal scheduler loop."""
         while True:
             recv_reqs = self.recv_requests()
+            if len(recv_reqs) == 0:
+                time.sleep(0.001)
+                continue
             self.process_input_requests(recv_reqs)
             batch = self.get_next_batch_to_run()
             self.cur_batch = batch
@@ -572,8 +575,9 @@ class Scheduler(
                     break
                 recv_reqs.append(recv_rpc)
         else:
-            recv_reqs = None
+            recv_reqs = []
         logger.info(f"Node {self.node_rank} recv_reqs: {recv_reqs}")
+        time.sleep(10)
         # if self.nnodes > 1:
         #     recv_reqs = self.broadcast_pyobj(recv_reqs)
         return recv_reqs
