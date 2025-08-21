@@ -609,13 +609,13 @@ class EPMoE(nnx.Module):
             communicated_data, f"ragged_dispatch_output", f"moe_dispatch_layer_id_{self.layer_id}"
         )
         
-        # 纯 EP 情况下，需要计算当前设备上专家的 local_group_sizes
-        # 每个设备只负责部分专家，所以需要提取对应的 group_sizes
-        start_expert_idx = expert_shard_id * local_expert_size
-        end_expert_idx = start_expert_idx + local_expert_size
-        local_group_sizes = global_group_sizes[start_expert_idx:end_expert_idx]
+        # 纯 EP 情况下，需要像 MaxText 一样做 local_permute 处理
+        # 从全局数据中筛选和重排当前设备负责的专家数据
+        sorted_inputs, local_group_sizes, sorted_expert_ids, local_sorted_indices = self._local_permute_with_offset(
+            communicated_data, global_group_sizes, local_expert_size, expert_shard_id, sorted_experts
+        )
         
-        return communicated_data, local_group_sizes, sorted_experts, None
+        return sorted_inputs, local_group_sizes, sorted_expert_ids, local_sorted_indices
 
     def _expert_all_to_all_collect(
         self, data, global_group_sizes, expert_shard_id, target_size, local_sorted_indices=None
@@ -794,47 +794,34 @@ class EPMoE(nnx.Module):
         recv_sizes = transform_array(all_shards_group_sizes, shard_id, "RECV_SIZE", is_batch_sharded)
         return input_offsets, send_sizes, output_offsets, recv_sizes
 
-    def _local_permute_for_ragged(
-        self, inputs, global_group_sizes, local_expert_size, shard_index
+    def _local_permute_with_offset(
+        self, inputs, global_group_sizes, local_expert_size, shard_index, global_sorted_experts
     ):
-        # Use dynamic_slice instead of dynamic indexing for JIT compatibility
-        start_index = shard_index * local_expert_size
-        local_group_sizes = jax.lax.dynamic_slice(
-            global_group_sizes, 
-            start_indices=[start_index], 
-            slice_sizes=[local_expert_size]
+        """
+        基于 MaxText local_permute 的 is_offset=True 逻辑
+        从全局排序的数据中筛选当前设备负责的专家数据
+        """
+        # 步骤1：计算 local_group_sizes（对应当前设备负责的专家）
+        start_idx = shard_index * local_expert_size
+        end_idx = start_idx + local_expert_size
+        local_group_sizes = global_group_sizes[start_idx:end_idx]
+        
+        # 步骤2：is_offset=True 逻辑 - 筛选属于当前 shard 的数据
+        # 判断每个 token 属于哪个 expert shard
+        divided_assignments = jnp.floor_divide(global_sorted_experts, local_expert_size)
+        
+        # 筛选属于当前 shard 的数据，其他数据标记为 local_expert_size（无效）
+        expert_indices = jnp.where(
+            divided_assignments == shard_index, 
+            jnp.mod(global_sorted_experts, local_expert_size), 
+            local_expert_size  # 标记为无效
         )
-
-        # Simplified approach: use all available input data and let mask handle validation
-        # This avoids dynamic slicing issues while maintaining correctness
-        max_possible_tokens = inputs.shape[0]
         
-        # Create expert indices with fixed size
-        expert_indices = jnp.repeat(
-            jnp.arange(local_expert_size),
-            local_group_sizes,
-            total_repeat_length=max_possible_tokens,
-        )
-        
-        # Calculate actual number of valid tokens
-        total_local_tokens = jnp.sum(local_group_sizes)
-        
-        # Create a mask for valid tokens instead of slicing
-        valid_mask = jnp.arange(max_possible_tokens) < total_local_tokens
-        
-        # Apply mask to get valid expert indices (fill invalid with -1)
-        valid_expert_indices = jnp.where(valid_mask, expert_indices, -1)
-        
-        # Sort all indices (invalid ones will go to the end due to -1)
-        sorted_indices = jnp.argsort(valid_expert_indices)
-        
-        # Take from the sorted indices, the valid ones come first
+        # 步骤3：重新排序（无效数据会排到最后）
+        sorted_indices = jnp.argsort(expert_indices)
         sorted_inputs = jnp.take(inputs, indices=sorted_indices, axis=0)
-        sorted_experts_ids = jnp.take(expert_indices, indices=sorted_indices)
+        sorted_experts_ids = expert_indices[sorted_indices]
         
-        # Only return the valid portion by using the known total_local_tokens
-        # This is safe because we know total_local_tokens <= max_possible_tokens
-        # Also return the sorted indices for later unpermute in collect
         return sorted_inputs, local_group_sizes, sorted_experts_ids, sorted_indices
 
     def unpermute(self, intermediate, sorted_selected_experts, weights, batch_size, sequence_length):
@@ -854,46 +841,3 @@ class EPMoE(nnx.Module):
             )
         return output.reshape(batch_size, sequence_length, -1).astype(self.dtype)
 
-    # def _unpermute(
-    #     self, intermediate, sorted_selected_experts, weights, batch_size, seq_len
-    # ):
-    #     expected_tokens = sorted_selected_experts.shape[0]
-    #     actual_tokens = intermediate.shape[0]
-
-    #     if actual_tokens != expected_tokens:
-    #         if actual_tokens > expected_tokens:
-    #             intermediate = intermediate[:expected_tokens]
-    #         else:
-    #             padding_size = expected_tokens - actual_tokens
-    #             padding = jnp.zeros(
-    #                 (padding_size, intermediate.shape[1]), dtype=intermediate.dtype
-    #             )
-    #             intermediate = jnp.concatenate([intermediate, padding], axis=0)
-
-    #     argsort_indices = jnp.argsort(sorted_selected_experts)
-    #     unsort_intermediate = jnp.take(intermediate, indices=argsort_indices, axis=0)
-
-    #     total_tokens = weights.shape[0] * weights.shape[1] // self.num_experts_per_tok
-
-    #     reshaped_weights = jnp.reshape(
-    #         weights, (total_tokens, self.num_experts_per_tok)
-    #     )
-    #     reshaped_intermediate = jnp.reshape(
-    #         unsort_intermediate,
-    #         (total_tokens, self.num_experts_per_tok, -1),
-    #     )
-
-    #     intermediate_fp32 = reshaped_intermediate.astype(jnp.float32)
-    #     weights_fp32 = reshaped_weights.astype(jnp.float32)
-
-    #     output = jnp.einsum(
-    #         "BKE,BK -> BE",
-    #         intermediate_fp32,
-    #         weights_fp32,
-    #     )
-
-    #     if len(weights.shape) == 2:
-    #         final_output = output.astype(self.dtype)
-    #     else:
-    #         final_output = output.reshape(batch_size, seq_len, -1).astype(self.dtype)
-    #     return final_output
