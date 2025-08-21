@@ -524,7 +524,7 @@ class Qwen3MoeForCausalLM(nnx.Module):
             input_ids, positions, forward_batch
         )
         result = self.logits_processor(hidden_states, self.lm_head, forward_batch)
-        print(f"[TRANSFORMER] Logits processor completed, result.shape={result.shape}")
+        print(f"[TRANSFORMER] Logits processor completed")
         if global_tracer.is_session_active():
             input_data = {"input_ids": input_ids, "input_shape": list(input_ids.shape)}
 
