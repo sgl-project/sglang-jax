@@ -33,7 +33,8 @@ pre-commit run --all-files
 
 If you add a new feature or fix a bug, please add corresponding unit tests to ensure coverage and prevent regression.
 SGLang-Jax uses Python's built-in [unittest](https://docs.python.org/3/library/unittest.html) framework.
-For detailed instructions on running tests and integrating them into CI, refer to #TODO.
+For detailed instructions on running tests and integrating them into CI, refer to [test/README.md](https://github.com/sgl-project/sglang-jax/tree/main/test/README.md).
+
 
 ## Write documentations
 
@@ -44,7 +45,7 @@ If your code changes the model output, please run the accuracy tests. A quick sa
 
 ```
 # Launch a server
-python3 -m sgl-jax.launch_server --model Qwen-7B-Chat
+python3 -m sgl_jax.launch_server --model-path Qwen/Qwen-7B-Chat --trust-remote-code  --dist-init-addr=0.0.0.0:10011 --nnodes=1  --tp-size=4 --device=tpu --random-seed=3 --node-rank=0 --mem-fraction-static=0.2 --max-prefill-tokens=8192 --download-dir=/tmp --jax-precompile-prefill-token-paddings 5120 --dtype=bfloat16  --skip-server-warmup --attention-backend=fa --jax-precompile-decode-bs-paddings 10 --port 30000
 
 # Evaluate By EvolScope
 evalscope eval  --model Qwen-7B-Chat --api-url http://127.0.0.1:30000/v1/chat/completions --api-key EMPTY --eval-type service --datasets gsm8k --eval-batch-size 8 --limit 500
@@ -56,10 +57,11 @@ Also, do not rely on the "Latency/Output throughput" from this script, as it is 
 
 GSM8K is too easy for state-of-the-art models nowadays. Please try your own more challenging accuracy tests.
 You can find additional accuracy eval examples in:
-- [test_eval_accuracy_large.py](https://github.com/sgl-project/sglang/blob/main/test/srt/test_eval_accuracy_large.py) ##TODO
+- [test_eval_accuracy_large.py](https://github.com/sgl-project/sglang-jax/blob/main/test/srt/test_eval_accuracy_large.py)
 
 ## Benchmark the speed
-Waiting for completion.
+Refer to [Benchmark and Profiling](./benchmark_and_profiling.md)
+
 
 ## Request a review
 Waiting for completion
@@ -71,6 +73,6 @@ Waiting for completion
 
 ## Tips for newcomers
 
-TODO
+Waiting for completion
 
 Thank you for your interest in SGLang-Jax. Happy coding!

@@ -82,7 +82,6 @@ class GateLogit(nnx.Module):
     def __call__(self, inputs: jax.Array) -> Tuple[jax.Array, Optional[jax.Array]]:
         inputs = jnp.asarray(inputs, self.dtype)
 
-
         kernel = jnp.asarray(self.kernel.value, self.dtype)
         output = jnp.dot(inputs, kernel)
 
@@ -93,7 +92,6 @@ class GateLogit(nnx.Module):
                 output = jax.nn.sigmoid(output)
             elif self.score_func == "tanh":
                 output = jax.nn.tanh(output)
-
 
         if self.use_bias and self.bias is not None:
             bias = jnp.asarray(self.bias.value, self.dtype)
@@ -357,9 +355,7 @@ class EPMoE(nnx.Module):
 
         return final_output.reshape(inputs.shape).astype(self.dtype)
 
-    def _expert_all_to_all_dispatch(
-        self, data, sorted_experts, expert_shard_id
-    ):
+    def _expert_all_to_all_dispatch(self, data, sorted_experts, expert_shard_id):
         local_expert_size = self.experts_per_device
 
         # compute each token's expert shard
@@ -393,10 +389,12 @@ class EPMoE(nnx.Module):
     def _get_all_to_all_params(self, group_sizes, shard_id):
         input_offsets = jnp.zeros(self.expert_parallel_size, dtype=group_sizes.dtype)
         send_sizes = jnp.repeat(group_sizes[shard_id], self.expert_parallel_size)
-        output_offset = jnp.concatenate((jnp.array([0]), jnp.cumsum(group_sizes[:-1])))[shard_id]
+        output_offset = jnp.concatenate((jnp.array([0]), jnp.cumsum(group_sizes[:-1])))[
+            shard_id
+        ]
         output_offsets = jnp.repeat(output_offset, self.expert_parallel_size)
         recv_sizes = group_sizes
-        
+
         return input_offsets, send_sizes, output_offsets, recv_sizes
 
     def _expert_all_to_all_collect(
@@ -409,10 +407,10 @@ class EPMoE(nnx.Module):
         tokens_per_device = jnp.sum(reshaped_group_sizes, axis=1)
 
         # Get parameters for ragged_all_to_all
-        input_offsets, send_sizes, output_offsets, recv_sizes = self._get_all_to_all_params(
-            tokens_per_device, expert_shard_id
+        input_offsets, send_sizes, output_offsets, recv_sizes = (
+            self._get_all_to_all_params(tokens_per_device, expert_shard_id)
         )
-        
+
         # Create output shape buffer
         output_shape = jnp.zeros((target_size, data.shape[1]), dtype=data.dtype)
 
@@ -424,7 +422,7 @@ class EPMoE(nnx.Module):
             send_sizes,
             output_offsets,
             recv_sizes,
-            axis_name=("data", "tensor")
+            axis_name=("data", "tensor"),
         )
 
         return result

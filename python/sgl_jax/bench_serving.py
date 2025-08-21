@@ -1513,7 +1513,7 @@ def run_benchmark(args_: argparse.Namespace):
     if args.tokenize_prompt:
         assert (
             args.backend == "sgl-jax"
-        ), "`--tokenize-prompt` only compatible with `--backend sglang` currently"
+        ), "`--tokenize-prompt` only compatible with `--backend sgl-jax` currently"
 
     # Set url
     if args.port is None:
