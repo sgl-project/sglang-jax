@@ -312,7 +312,7 @@ class ModelWorker:
             extend_seq_lens_minus_1 = extend_seq_lens_slice - 1
             print(f"[TP_WORKER] extend_seq_lens minus 1 computed")
             idx = np.cumsum(extend_seq_lens_minus_1)
-            print(f"[TP_WORKER] cumsum computed, idx.shape: {idx.shape}")
+            print(f"[TP_WORKER] cumsum computed, idx.shape: {idx.shape}, idx: {idx}")
         
         print(f"[TP_WORKER] idx computation completed")
 
