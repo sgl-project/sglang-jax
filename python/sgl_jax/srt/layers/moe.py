@@ -798,13 +798,21 @@ class EPMoE(nnx.Module):
         self, inputs, global_group_sizes, local_expert_size, shard_index, global_sorted_experts
     ):
         """
-        基于 MaxText local_permute 的 is_offset=True 逻辑
-        从全局排序的数据中筛选当前设备负责的专家数据
+        基于 MaxText local_permute 的 is_offset=True 逻辑，使用 JIT 兼容语法
         """
-        # 步骤1：计算 local_group_sizes（对应当前设备负责的专家）
-        start_idx = shard_index * local_expert_size
-        end_idx = start_idx + local_expert_size
-        local_group_sizes = global_group_sizes[start_idx:end_idx]
+        # 步骤1：使用 dynamic_slice_in_dim 提取本地专家的 group sizes（JIT 兼容）
+        # 注意：global_group_sizes 需要是 2D 形状 [num_batch_shards, num_experts]
+        # 但我们的是 1D，所以先添加维度
+        global_group_sizes_2d = global_group_sizes[None, :]  # [1, num_experts]
+        
+        # Slice the count of local expert IDs in each batch shard.
+        # all_shard_local_sizes.shape: [expert_shard, local_expert_size] 
+        all_shard_local_sizes = jax.lax.dynamic_slice_in_dim(
+            global_group_sizes_2d, shard_index * local_expert_size, local_expert_size, axis=1
+        )        
+        # Total count of the local expert IDs is the sum of the counts across all batch shards,
+        # since all batch shards will send their contributions to the current expert shard.
+        local_group_size = jnp.sum(all_shard_local_sizes, axis=0)
         
         # 步骤2：is_offset=True 逻辑 - 筛选属于当前 shard 的数据
         # 判断每个 token 属于哪个 expert shard
@@ -822,7 +830,7 @@ class EPMoE(nnx.Module):
         sorted_inputs = jnp.take(inputs, indices=sorted_indices, axis=0)
         sorted_experts_ids = expert_indices[sorted_indices]
         
-        return sorted_inputs, local_group_sizes, sorted_experts_ids, sorted_indices
+        return sorted_inputs, local_group_size, sorted_experts_ids, sorted_indices
 
     def unpermute(self, intermediate, sorted_selected_experts, weights, batch_size, sequence_length):
         """Unpermute tokens to original order and combine weights."""
