@@ -21,12 +21,13 @@ try:
 except ImportError:
     setproctitle = None
 
+from jax.experimental.multihost_utils import process_allgather
+
 from sgl_jax.global_config import global_config
 from sgl_jax.srt.configs.model_config import ModelConfig
 from sgl_jax.srt.hf_transformers_utils import get_tokenizer
 from sgl_jax.srt.layers.dp_attention import compute_dp_attention_world_info
 from sgl_jax.srt.layers.logits_processor import LogitsProcessorOutput
-from sgl_jax.srt.managers.dp_batch_sync import create_dp_batch_synchronizer
 from sgl_jax.srt.managers.dp_communication import create_dp_communicator
 from sgl_jax.srt.managers.io_struct import (
     AbortReq,
@@ -132,11 +133,6 @@ class Scheduler(
 
         # Create DP communicator for JAX-based broadcasting (replaces ZMQ pub/sub)
         self._dp_communicator = create_dp_communicator(server_args)
-
-        # Create DP batch synchronizer for handling batch shape consistency
-        self._dp_batch_synchronizer = create_dp_batch_synchronizer(
-            server_args, self._dp_group_info
-        )
 
         # Round-robin counter for distributing requests to DP groups (only used by node 0)
         self._dp_round_robin_counter = 0
@@ -782,18 +778,16 @@ class Scheduler(
                 ret = self.running_batch if not self.running_batch.is_empty() else None
             else:
                 ret = None
-
+        logger.info(f"before dp sync Node {self.node_rank} ret: {ret}")
         # DP Attention: Synchronize batch across DP groups
         if self.server_args.enable_dp_attention:
-            ret = self._dp_batch_synchronizer.prepare_dp_sync_batch(ret)
-
-            # If DP synchronizer indicates we need an idle batch, create one
-            if ret is None and self._dp_batch_synchronizer.needs_idle_batch():
+            # 执行all gather, 统计信息, 决定当前scheduler是否需要idle batch
+            local_batch_size = ret.batch_size if ret is not None else 0
+            batch_size_list = process_allgather(local_batch_size)
+            is_idle = all(size == 0 for size in batch_size_list)
+            if not is_idle:
                 ret = self.get_idle_batch()
-                logger.info(
-                    f"DP group {self._dp_group_info['dp_group_id']}: Created idle batch for DP sync"
-                )
-
+        logger.info(f"after dp sync Node {self.node_rank} ret: {ret}")
         return ret
 
     def get_new_batch_prefill(self) -> Optional[ScheduleBatch]:
