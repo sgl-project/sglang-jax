@@ -590,18 +590,17 @@ class EPMoE(nnx.Module):
         total_recv = jnp.sum(recv_sizes)
         
         jax.debug.print(
-            "[RAGGED_DISPATCH] Expert shard {shard_id}: data_shape={data_shape}, total_send={total_send}, total_recv={total_recv}",
+            "[RAGGED_DISPATCH] Expert shard {shard_id}: data_shape_0={data_shape_0}, total_send={total_send}, total_recv={total_recv}",
             shard_id=expert_shard_id,
-            data_shape=data.shape,
+            data_shape_0=data.shape[0],
             total_send=total_send,
             total_recv=total_recv
         )
         
-        # 步骤3：计算输出缓冲区大小（基于实际接收量）
-        total_expected_recv = jnp.sum(recv_sizes)
-        output_buffer = jnp.zeros((total_expected_recv, data.shape[1]), dtype=data.dtype)
-        
-        print(f"[RAGGED_DISPATCH] About to call ragged_all_to_all...")
+        # 步骤3：计算输出缓冲区大小（使用静态上界避免 JIT 问题）
+        # 使用保守的上界：原始数据大小 * expert_parallel_size
+        max_possible_recv = data.shape[0] * self.expert_parallel_size
+        output_buffer = jnp.zeros((max_possible_recv, data.shape[1]), dtype=data.dtype)
         
         # 步骤4：执行 ragged_all_to_all 通信
         communicated_data = jax.lax.ragged_all_to_all(
@@ -613,8 +612,6 @@ class EPMoE(nnx.Module):
             recv_sizes,
             axis_name=("data", "tensor"),
         )
-        
-        print(f"[RAGGED_DISPATCH] ragged_all_to_all completed, output.shape={communicated_data.shape}")
         
         # 步骤5：使用 local_permute 处理接收数据
         sorted_inputs, local_group_sizes, sorted_expert_ids = self._local_permute_for_ragged(
@@ -746,12 +743,9 @@ class EPMoE(nnx.Module):
                 recv_sizes,
                 axis_name=("data", "tensor"),
             )
-            print(f"[RAGGED_COLLECT] ragged_all_to_all completed successfully")
             return collected_data
             
         except Exception as e:
-            print(f"[RAGGED_COLLECT] ERROR in ragged_all_to_all: {e}")
-            print(f"[RAGGED_COLLECT] Falling back to CPU simple collect")
             return self._cpu_simple_collect(data, global_group_sizes, expert_shard_id, target_size)
 
 
