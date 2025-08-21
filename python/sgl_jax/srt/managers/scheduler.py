@@ -248,6 +248,22 @@ class Scheduler(
             ici_parallelism=[-1, attn_tp_size, 1, 1], dcn_parallelism=[1, 1, 1, 1]
         )
 
+        # 添加JAX设备信息日志
+        local_devices = jax.local_devices()
+        global_devices = jax.devices()
+        logger.info(
+            f"Node {self.node_rank} - JAX设备信息: "
+            f"local_devices数量: {len(local_devices)}, "
+            f"global_devices数量: {len(global_devices)}, "
+            f"local_devices: {[str(d) for d in local_devices]}, "
+            f"global_devices: {[str(d) for d in global_devices]}"
+        )
+        logger.info(
+            f"Node {self.node_rank} - Mesh信息: "
+            f"mesh_shape: {self.mesh.shape}, "
+            f"mesh_axes: {self.mesh.axis_names}"
+        )
+
         self.tp_worker = ModelWorker(
             server_args=server_args,
             mesh=self.mesh,
