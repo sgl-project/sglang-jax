@@ -43,7 +43,7 @@ class TestBaseTp(CustomTestCase):
                 "/tmp/",
                 "--dtype",
                 "bfloat16",
-                "--jax-precompile-extend-token-paddings",
+                "--jax-precompile-prefill-token-paddings",
                 "16384",
             ],
             env={

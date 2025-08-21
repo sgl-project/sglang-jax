@@ -109,13 +109,13 @@ class ModelWorker:
         # A reference make this class has the same member as TpModelWorkerClient
         self.worker = self
 
-        # normalize server_args.jax_precompile_extend_token_paddings
+        # normalize server_args.jax_precompile_prefill_token_paddings
         # ensure every token padding value is not less than max_runnig_requests
         self.normalize_token_paddings(server_args, self.max_running_requests)
 
         # precompile
         self.precompile_prefill_token_paddings = (
-            server_args.jax_precompile_extend_token_paddings
+            server_args.jax_precompile_prefill_token_paddings
         )
         self.precompile_decode_bs_paddings = (
             server_args.jax_precompile_decode_bs_paddings
@@ -128,15 +128,15 @@ class ModelWorker:
     ):
         normalized_token_paddings = []
 
-        if server_args.jax_precompile_extend_token_paddings is None:
-            server_args.jax_precompile_extend_token_paddings = (
+        if server_args.jax_precompile_prefill_token_paddings is None:
+            server_args.jax_precompile_prefill_token_paddings = (
                 JAX_PRECOMPILE_DEFAULT_PREFILL_TOKEN_PADDINGS
             )
 
         prefill_padded_batch_size, prefill_max_padded_num_tokens = (
             self.get_prefill_padded_size()
         )
-        for item in server_args.jax_precompile_extend_token_paddings:
+        for item in server_args.jax_precompile_prefill_token_paddings:
             if (
                 item >= prefill_padded_batch_size
                 and item <= prefill_max_padded_num_tokens
@@ -146,10 +146,10 @@ class ModelWorker:
         if len(normalized_token_paddings) == 0:
             normalized_token_paddings.append(prefill_padded_batch_size)
             logger.warning(
-                f"No valid padding found in {server_args.jax_precompile_extend_token_paddings=} within range [{prefill_padded_batch_size}, {prefill_max_padded_num_tokens}], so set token_paddings as {normalized_token_paddings}"
+                f"No valid padding found in {server_args.jax_precompile_prefill_token_paddings=} within range [{prefill_padded_batch_size}, {prefill_max_padded_num_tokens}], so set token_paddings as {normalized_token_paddings}"
             )
 
-        server_args.jax_precompile_extend_token_paddings = normalized_token_paddings
+        server_args.jax_precompile_prefill_token_paddings = normalized_token_paddings
 
     def run_precompile(self):
         self.precompile_extend()

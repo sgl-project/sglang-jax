@@ -19,7 +19,7 @@ JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache python3 -u -m sgl_jax.launch_server \
     --mem-fraction-static=0.2 \
     --max-prefill-tokens=8192 \
     --download-dir=/tmp \
-    --jax-precompile-extend-token-paddings 16384 \
+    --jax-precompile-prefill-token-paddings 16384 \
     --dtype=bfloat16 \
     --skip-server-warmup \
     --attention-backend=fa
