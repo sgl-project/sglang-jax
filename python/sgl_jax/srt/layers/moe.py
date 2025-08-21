@@ -173,10 +173,10 @@ class EPMoE(nnx.Module):
             )
         )
 
-        state = nnx.state(self)
-        pspecs = nnx.get_partition_spec(state)
-        sharded_state = jax.lax.with_sharding_constraint(state, pspecs)
-        nnx.update(self, sharded_state)
+        # state = nnx.state(self)
+        # pspecs = nnx.get_partition_spec(state)
+        # sharded_state = jax.lax.with_sharding_constraint(state, pspecs)
+        # nnx.update(self, sharded_state)
 
         # Detect device capabilities for choosing communication strategy
         self.can_use_ragged, self.primary_device = self._detect_device_capabilities()
