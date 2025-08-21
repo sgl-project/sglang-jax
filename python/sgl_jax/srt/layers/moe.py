@@ -178,6 +178,9 @@ class EPMoE(nnx.Module):
         sharded_state = jax.lax.with_sharding_constraint(state, pspecs)
         nnx.update(self, sharded_state)
 
+        # Detect device capabilities for choosing communication strategy
+        self.can_use_ragged, self.primary_device = self._detect_device_capabilities()
+
     def _detect_device_capabilities(self):
         try:
             devices = jax.devices()
@@ -473,9 +476,14 @@ class EPMoE(nnx.Module):
     def _expert_all_to_all_dispatch(
         self, data, global_group_sizes, sorted_experts, expert_shard_id
     ):
-        return self._simple_dispatch(
-            data, global_group_sizes, sorted_experts, expert_shard_id
-        )
+        if self.can_use_ragged:
+            return self._ragged_all_to_all_dispatch(
+                data, global_group_sizes, sorted_experts, expert_shard_id
+            )
+        else:
+            return self._simple_dispatch(
+                data, global_group_sizes, sorted_experts, expert_shard_id
+            )
 
     def _simple_dispatch(
         self, data, global_group_sizes, sorted_experts, expert_shard_id
@@ -532,7 +540,8 @@ class EPMoE(nnx.Module):
             self._get_ragged_all_to_all_params(reshaped_group_sizes, expert_shard_id)
         )
 
-        buffer_size = int(self.expert_parallel_size * data.shape[0])
+        # Avoid int() conversion for JIT compatibility
+        buffer_size = self.expert_parallel_size * data.shape[0]
         output_shape = jnp.zeros((buffer_size, data.shape[1]), dtype=data.dtype)
 
         communicated_data = jax.lax.ragged_all_to_all(
@@ -557,9 +566,14 @@ class EPMoE(nnx.Module):
     def _expert_all_to_all_collect(
         self, data, global_group_sizes, expert_shard_id, target_size
     ):
-        return self._cpu_simple_collect(
-            data, global_group_sizes, expert_shard_id, target_size
-        )
+        if self.can_use_ragged:
+            return self._ragged_all_to_all_collect(
+                data, global_group_sizes, expert_shard_id, target_size
+            )
+        else:
+            return self._cpu_simple_collect(
+                data, global_group_sizes, expert_shard_id, target_size
+            )
 
     def _cpu_simple_collect(
         self, data, global_group_sizes, expert_shard_id, target_size
@@ -645,11 +659,18 @@ class EPMoE(nnx.Module):
 
     def _get_ragged_all_to_all_params(self, group_sizes, shard_id):
         input_offsets = jnp.zeros(self.expert_parallel_size, dtype=jnp.int32)
-        send_sizes = jnp.repeat(group_sizes[shard_id], self.expert_parallel_size)
+        
+        # Use dynamic indexing for JIT compatibility
+        shard_group_size = jax.lax.dynamic_slice(
+            group_sizes, start_indices=[shard_id], slice_sizes=[1]
+        )[0]
+        send_sizes = jnp.repeat(shard_group_size, self.expert_parallel_size)
 
-        output_offset = jnp.concatenate((jnp.array([0]), jnp.cumsum(group_sizes[:-1])))[
-            shard_id
-        ]
+        # Calculate cumulative offsets using dynamic indexing
+        cumsum_sizes = jnp.cumsum(jnp.concatenate([jnp.array([0]), group_sizes]))
+        output_offset = jax.lax.dynamic_slice(
+            cumsum_sizes, start_indices=[shard_id], slice_sizes=[1]
+        )[0]
         output_offsets = jnp.repeat(output_offset, self.expert_parallel_size)
 
         recv_sizes = group_sizes
@@ -659,9 +680,13 @@ class EPMoE(nnx.Module):
     def _local_permute_for_ragged(
         self, inputs, global_group_sizes, local_expert_size, shard_index
     ):
-        local_group_sizes = global_group_sizes[
-            shard_index * local_expert_size : (shard_index + 1) * local_expert_size
-        ]
+        # Use dynamic_slice instead of dynamic indexing for JIT compatibility
+        start_index = shard_index * local_expert_size
+        local_group_sizes = jax.lax.dynamic_slice(
+            global_group_sizes, 
+            start_indices=[start_index], 
+            slice_sizes=[local_expert_size]
+        )
 
         expert_indices = jnp.repeat(
             jnp.arange(local_expert_size),
