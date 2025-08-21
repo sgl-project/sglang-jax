@@ -306,12 +306,15 @@ class ModelWorker:
                     logits_has_inf = jnp.any(jnp.isinf(logits_output.next_token_logits))
                     print(f"[TP_WORKER] Inf check completed")
                     
+                    print(f"[TP_WORKER] About to check shape")
+                    logits_shape = logits_output.next_token_logits.shape
+                    print(f"[TP_WORKER] Logits shape: {logits_shape}")
                     jax.debug.print(
                         "[TP_WORKER] Logits health check - sum={sum}, has_nan={has_nan}, has_inf={has_inf}, shape={shape}",
                         sum=logits_sum,
                         has_nan=logits_has_nan,
                         has_inf=logits_has_inf,
-                        shape=logits_output.next_token_logits.shape
+                        shape=logits_shape
                     )
                     print(f"[TP_WORKER] Health check debug print completed")
                 except Exception as e:
