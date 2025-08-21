@@ -128,7 +128,6 @@ class DataParallelController:
             dp_port_args = self.launch_dp_schedulers(self.server_args, self.port_args)
 
         if self.server_args.node_rank == 0:
-            time.sleep(3600000)
             for dp_rank in range(self.server_args.dp_size):
                 self.workers[dp_rank] = get_zmq_socket(
                     self.context,
