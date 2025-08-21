@@ -597,10 +597,27 @@ class EPMoE(nnx.Module):
         print(f"[RAGGED_DISPATCH] send_counts={send_counts}, recv_counts={recv_counts}")
         print(f"[RAGGED_DISPATCH] total_recv_size={total_recv_size}, max_buffer={max_possible_recv}")
         
-        # 步骤7：执行 ragged_all_to_all 通信
-        communicated_data = jax.lax.ragged_all_to_all(
+        # 步骤7：同时传输数据和 expert ID 信息
+        # 将 expert ID 转换为本地 expert ID (expert_id % local_expert_size)
+        local_expert_ids = jnp.mod(sorted_expert_ids, local_expert_size).astype(jnp.float32)
+        
+        # 扩展数据，将 expert ID 作为额外的维度添加到数据中
+        # 这样我们可以通过一次 ragged_all_to_all 同时传输数据和 expert ID
+        extended_data = jnp.concatenate([
             sorted_data,
-            output_buffer,
+            local_expert_ids[:, None]  # 添加 expert ID 作为最后一列
+        ], axis=1)
+        
+        # 创建扩展的输出缓冲区
+        extended_output_buffer = jnp.zeros(
+            (max_possible_recv, data.shape[1] + 1), 
+            dtype=data.dtype
+        )
+        
+        # 执行 ragged_all_to_all 通信（数据 + expert ID）
+        communicated_extended_data = jax.lax.ragged_all_to_all(
+            extended_data,
+            extended_output_buffer,
             send_offsets,
             send_counts,
             recv_offsets,
@@ -608,39 +625,25 @@ class EPMoE(nnx.Module):
             axis_name=("data", "tensor"),
         )
         
+        # 步骤8：分离数据和 expert ID
+        actual_recv_size = jnp.sum(recv_counts)
+        max_tokens = communicated_extended_data.shape[0]
+        valid_mask = jnp.arange(max_tokens) < actual_recv_size
         
-        # 步骤9：计算本地 expert 分组
+        # 分离数据和 expert ID
+        received_data = communicated_extended_data[:, :-1]  # 除了最后一列的所有数据
+        received_expert_ids = communicated_extended_data[:, -1].astype(jnp.int32)  # 最后一列是 expert ID
+        
+        # 应用 mask 获取有效数据
+        final_data = jnp.where(valid_mask[:, None], received_data, 0.0)
+        final_expert_assignments = jnp.where(valid_mask, received_expert_ids, -1)
+        
+        # 计算本地 expert 分组（用于后续的 GMM 计算）
         local_group_sizes = jax.lax.dynamic_slice(
             global_group_sizes,
             start_indices=[expert_shard_id * local_expert_size],
             slice_sizes=[local_expert_size]
         )
-        
-        # 步骤10：直接处理接收到的数据，使用 mask 来处理有效范围
-        # 计算实际接收的 token 数量
-        actual_recv_size = jnp.sum(recv_counts)
-        
-        # 使用 mask 来获取有效数据，避免动态切片
-        max_tokens = communicated_data.shape[0]
-        valid_mask = jnp.arange(max_tokens) < actual_recv_size
-        
-        # 用累积和创建 expert 分配
-        cumsum_local = jnp.concatenate([jnp.array([0]), jnp.cumsum(local_group_sizes)])
-        
-        # 为每个接收到的 token 分配 expert ID
-        token_positions = jnp.arange(max_tokens)
-        expert_assignments = jnp.zeros(max_tokens, dtype=jnp.int32)
-        
-        # 使用矢量化的方式分配 expert
-        for expert_idx in range(local_expert_size):
-            start_pos = cumsum_local[expert_idx]
-            end_pos = cumsum_local[expert_idx + 1]
-            expert_mask = (token_positions >= start_pos) & (token_positions < end_pos) & valid_mask
-            expert_assignments = jnp.where(expert_mask, expert_idx, expert_assignments)
-        
-        # 应用 valid_mask 来获取最终结果
-        final_data = jnp.where(valid_mask[:, None], communicated_data, 0.0)
-        final_expert_assignments = jnp.where(valid_mask, expert_assignments, -1)
         
         global_tracer.print(
             final_data, f"ragged_dispatch_output", f"moe_dispatch_layer_id_{self.layer_id}"
