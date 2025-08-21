@@ -623,32 +623,34 @@ class EPMoE(nnx.Module):
     def _ragged_all_to_all_collect(
         self, data, global_group_sizes, expert_shard_id, target_size
     ):
-        """TPU/GPU: Use ragged_all_to_all for collection"""
+        """TPU/GPU: Use ragged_all_to_all for collection - inverse of dispatch"""
         local_expert_size = self.experts_per_device
+        
+        # For collect, we reverse the dispatch communication pattern
+        # In dispatch: reshaped_group_sizes[i] = how much device i receives
+        # In collect: reshaped_group_sizes[i] = how much device i sends back
         reshaped_group_sizes = jnp.sum(
             global_group_sizes.reshape(self.expert_parallel_size, local_expert_size),
             axis=1,
         )
 
-        # Calculate ragged_all_to_all parameters (transpose version for collection)
-        input_offsets, send_sizes, output_offsets, recv_sizes = (
-            self._get_ragged_all_to_all_params(
-                reshaped_group_sizes.T,
-                expert_shard_id,  # Note that transposition is needed here
-            )
+        # Collect is the transpose of dispatch communication
+        # Swap send/recv roles and offsets
+        recv_offsets, recv_sizes, send_offsets, send_sizes = (
+            self._get_ragged_all_to_all_params(reshaped_group_sizes, expert_shard_id)
         )
 
-        # Create output buffer
+        # Create output buffer with target size
         output_shape = jnp.zeros((target_size, data.shape[1]), dtype=data.dtype)
 
-        # Execute ragged_all_to_all
+        # Execute ragged_all_to_all with swapped parameters
         result = jax.lax.ragged_all_to_all(
             data,
             output_shape,
-            input_offsets,
-            send_sizes,
-            output_offsets,
-            recv_sizes,
+            send_offsets,    # input_offsets: where to read from input
+            send_sizes,      # send_sizes: how much this device sends
+            recv_offsets,    # output_offsets: where to place in output  
+            recv_sizes,      # recv_sizes: how much this device receives
             axis_name=("data", "tensor"),
         )
 
