@@ -168,6 +168,9 @@ class DataParallelController:
                 if isinstance(
                     recv_req, (TokenizedGenerateReqInput, TokenizedEmbeddingReqInput)
                 ):
+                    logger.info(
+                        f"Node {self.server_args.node_rank} received tokenized request: {recv_req}"
+                    )
                     # Dispatch tokenized requests using round-robin
                     self.round_robin_scheduler(recv_req)
                 else:
