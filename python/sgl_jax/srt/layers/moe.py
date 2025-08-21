@@ -195,7 +195,7 @@ class EPMoE(nnx.Module):
                 f"device_capabilities_cpu_ragged",
                 f"moe_device_layer_id_{self.layer_id}",
             )
-
+            print(f"can_use_ragged: {can_use_ragged}, primary_device: {primary_device}")
             return can_use_ragged, primary_device
         except Exception as e:
             return False, "cpu"
