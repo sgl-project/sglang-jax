@@ -610,7 +610,10 @@ def run_bench_offline_throughput(model, other_args):
         "/tmp/",
         "--dtype",
         "bfloat16",
-        "--model-path",
+        "--jax-precompile-decode-bs-paddings",
+        "10",
+        "--jax-precompile-prefill-token-paddings",
+        "16384" "--model-path",
         model,
         *[str(x) for x in other_args],
     ]

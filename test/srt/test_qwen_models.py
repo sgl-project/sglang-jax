@@ -35,6 +35,10 @@ class TestQwenModel(CustomTestCase):
                 "/tmp/",
                 "--dtype",
                 "bfloat16",
+                "--jax-precompile-decode-bs-paddings",
+                "10",
+                "--jax-precompile-prefill-token-paddings",
+                "16384",
             ],
             env={
                 "JAX_COMPILATION_CACHE_DIR": "/tmp/jax_compilation_cache",

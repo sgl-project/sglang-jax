@@ -10,6 +10,15 @@ secrets:
 
 
 setup: |
-  git clone https://${USERNAME}:${GIT_TOKEN}@github.com/sgl-project/sglang-jax.git
-  cd sglang-jax && git fetch origin $REF:$REF && git checkout $REF
+  if [ -d "sglang-jax" ]; then
+    cd sglang-jax
+    git remote set-url origin https://${USERNAME}:${GIT_TOKEN}@github.com/sgl-project/sglang-jax.git
+    git fetch origin
+    git clean -fd
+    git reset --hard origin/$REF
+  else
+    git clone https://${USERNAME}:${GIT_TOKEN}@github.com/sgl-project/sglang-jax.git
+    cd sglang-jax
+    git checkout $REF
+  fi
   uv pip install -e python/
