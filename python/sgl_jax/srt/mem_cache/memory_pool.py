@@ -306,8 +306,8 @@ class MHATokenToKVPool(KVCache):
                 v_buf = jax.make_array_from_callback(
                     buffer_shape, self.kv_sharding, create_kv_callback
                 )
-                self.k_buffer.append(jax.array_ref(k_buf))
-                self.v_buffer.append(jax.array_ref(v_buf))
+                self.k_buffer.append(k_buf)
+                self.v_buffer.append(v_buf)
 
         end_time = time.time()
         print(
@@ -374,8 +374,12 @@ class MHATokenToKVPool(KVCache):
         """
         layer_idx = layer_id - self.start_layer
 
-        self.k_buffer[layer_idx][loc] = k
-        self.v_buffer[layer_idx][loc] = v
+        k_buffer_ref = jax.array_ref(self.k_buffer[layer_idx])
+        v_buffer_ref = jax.array_ref(self.v_buffer[layer_idx])
+        k_buffer_ref[loc] = k
+        v_buffer_ref[loc] = v
+        self.k_buffer[layer_idx] = jax.ref.freeze(k_buffer_ref)
+        self.v_buffer[layer_idx] = jax.ref.freeze(v_buffer_ref)
 
     def get_kv_data(
         self, layer_id: int, indices: jnp.ndarray

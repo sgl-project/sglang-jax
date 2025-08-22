@@ -131,7 +131,7 @@ class TestPrecompile(CustomTestCase):
         # run forward_extend
         import jax._src.test_util as jtu
 
-        with jtu.count_pjit_cpp_cache_miss() as count, TestPrecompile.mesh, jax.sharding.use_mesh(
+        with jtu.count_pjit_cpp_cache_miss() as count, TestPrecompile.mesh, jax.sharding.set_mesh(
             TestPrecompile.mesh
         ):
             # extend: bs = 1

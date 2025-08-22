@@ -351,8 +351,6 @@ class ModelRunner:
             self.state, input_ids, positions, forward_batch
         )
 
-        self._set_kv_cache_after_forward(layers_k, layers_v, forward_batch)
-
         return result
 
     def _set_kv_cache_after_forward(
@@ -399,7 +397,7 @@ class ModelRunner:
         forward_batch: ForwardBatch,
         skip_attn_backend_init: bool,
     ) -> Tuple[Union[LogitsProcessorOutput], bool]:
-        with self.mesh, jax.sharding.use_mesh(self.mesh):
+        with self.mesh, jax.sharding.set_mesh(self.mesh):
             if forward_batch.forward_mode.is_decode():
                 ret = self.forward_decode(forward_batch)
             elif forward_batch.forward_mode.is_extend():
