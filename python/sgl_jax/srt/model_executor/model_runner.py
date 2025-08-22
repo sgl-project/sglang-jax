@@ -354,8 +354,7 @@ class ModelRunner:
         )
 
     def forward_idle(self, forward_batch: ForwardBatch) -> LogitsProcessorOutput:
-        # TODO: implement
-        raise NotImplementedError("forward_idle is not implemented")
+        return self.forward(forward_batch)
 
     def forward(
         self,
