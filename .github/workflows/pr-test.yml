@@ -47,7 +47,7 @@ jobs:
         run: |
           source ~/sky/bin/activate
           CLUSTER_NAME=$(bash scripts/get_cluster_name.sh tpu-v6e-1 ${{ github.ref }} e2e)
-          sky exec "$CLUSTER_NAME" -- 'set -e; cd sgl-jax; uv run python test/srt/run_suite.py --suite per-commit-tpu-v6e-1'
+          sky exec "$CLUSTER_NAME" -- 'set -e; cd sglang-jax; uv run python test/srt/run_suite.py --suite per-commit-tpu-v6e-1'
 
   e2e-test-4-tpu:
     if: github.event.pull_request.draft == false
@@ -70,7 +70,7 @@ jobs:
         run: |
           source ~/sky/bin/activate
           CLUSTER_NAME=$(bash scripts/get_cluster_name.sh tpu-v6e-4 ${{ github.ref }} e2e)
-          sky exec "$CLUSTER_NAME" -- 'set -e; cd sgl-jax; uv run python test/srt/run_suite.py --suite per-commit-tpu-v6e-4'
+          sky exec "$CLUSTER_NAME" -- 'set -e; cd sglang-jax; uv run python test/srt/run_suite.py --suite per-commit-tpu-v6e-4'
 
   performance-test-1-tpu:
     if: github.event.pull_request.draft == false
@@ -93,35 +93,35 @@ jobs:
         run: |
           source ~/sky/bin/activate
           CLUSTER_NAME=$(bash scripts/get_cluster_name.sh tpu-v6e-1 ${{ github.ref }} performance)
-          sky exec "$CLUSTER_NAME" -- 'set -e; cd sgl-jax/test/srt; uv run python -m unittest test_bench_one_batch.TestBenchOneBatch.test_bs1_default'
+          sky exec "$CLUSTER_NAME" -- 'set -e; cd sglang-jax/test/srt; uv run python -m unittest test_bench_one_batch.TestBenchOneBatch.test_bs1_default'
 
       # - name: Benchmark online latency
       #   timeout-minutes: 10
       #   run: |
       #     source ~/sky/bin/activate
       #     CLUSTER_NAME=$(bash scripts/get_cluster_name.sh tpu-v6e-1 ${{ github.ref }} performance)
-      #     sky exec "$CLUSTER_NAME" -- 'set -e; cd sgl-jax/test/srt; python3 -m unittest test_bench_serving.TestBenchServing.test_online_latency_default'
+      #     sky exec "$CLUSTER_NAME" -- 'set -e; cd sglang-jax/test/srt; python3 -m unittest test_bench_serving.TestBenchServing.test_online_latency_default'
 
       # - name: Benchmark offline throughput (w/o RadixAttention)
       #   timeout-minutes: 10
       #   run: |
       #     source ~/sky/bin/activate
       #     CLUSTER_NAME=$(bash scripts/get_cluster_name.sh tpu-v6e-1 ${{ github.ref }} performance)
-      #     sky exec "$CLUSTER_NAME" -- 'set -e; cd sgl-jax/test/srt; python3 -m unittest test_bench_serving.TestBenchServing.test_offline_throughput_without_radix_cache'
+      #     sky exec "$CLUSTER_NAME" -- 'set -e; cd sglang-jax/test/srt; python3 -m unittest test_bench_serving.TestBenchServing.test_offline_throughput_without_radix_cache'
 
       # - name: Benchmark offline throughput (Non-streaming, small batch size)
       #   timeout-minutes: 10
       #   run: |
       #     source ~/sky/bin/activate
       #     CLUSTER_NAME=$(bash scripts/get_cluster_name.sh tpu-v6e-1 ${{ github.ref }} performance)
-      #     sky exec "$CLUSTER_NAME" -- 'set -e; cd sgl-jax/test/srt; python3 -m unittest test_bench_serving.TestBenchServing.test_offline_throughput_non_stream_small_batch_size'
+      #     sky exec "$CLUSTER_NAME" -- 'set -e; cd sglang-jax/test/srt; python3 -m unittest test_bench_serving.TestBenchServing.test_offline_throughput_non_stream_small_batch_size'
 
       # - name: Benchmark offline throughput
       #   timeout-minutes: 10
       #   run: |
       #     source ~/sky/bin/activate
       #     CLUSTER_NAME=$(bash scripts/get_cluster_name.sh tpu-v6e-1 ${{ github.ref }} performance)
-      #     sky exec "$CLUSTER_NAME" -- 'set -e; cd sgl-jax/test/srt; python3 -m unittest test_bench_serving.TestBenchServing.test_offline_throughput_default'
+      #     sky exec "$CLUSTER_NAME" -- 'set -e; cd sglang-jax/test/srt; python3 -m unittest test_bench_serving.TestBenchServing.test_offline_throughput_default'
 
 
   performance-test-4-tpu:
@@ -160,7 +160,7 @@ jobs:
         run: |
           source ~/sky/bin/activate
           CLUSTER_NAME=$(bash scripts/get_cluster_name.sh tpu-v6e-1 ${{ github.ref }} accuracy)
-          sky exec "$CLUSTER_NAME" -- 'set -e; cd sgl-jax/test/srt; python3 test_eval_accuracy_large.py'
+          sky exec "$CLUSTER_NAME" -- 'set -e; cd sglang-jax/test/srt; python3 test_eval_accuracy_large.py'
 
   pr-test-finish:
     needs: [

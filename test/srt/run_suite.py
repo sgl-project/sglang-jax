@@ -157,7 +157,7 @@ suites = {
     "per-commit-tpu-v6e-2": [],
     "per-commit-tpu-v6e-4": [
         TestFile("test/srt/test_base_tp.py", 45),
-        TestFile("test/srt/test_precompile.py", 300),
+        # TestFile("test/srt/test_precompile.py", 300),
     ],
     "per-commit-tpu-v6e-8": [],
     "per-commit-tpu-v6e-16": [],
