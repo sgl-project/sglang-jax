@@ -159,63 +159,6 @@ class MultiPageAsyncCopyDescriptor:
         return self._k_vmem_buf, self._v_vmem_buf
 
 
-def ref_ragged_paged_attention(
-    queries: jax.Array,  # [max_num_batched_tokens, num_q_heads, head_dim]
-    k_pages: jax.Array,  # [total_num_pages, page_size, num_kv_heads, head_dim]
-    v_pages: jax.Array,  # [total_num_pages, page_size, num_kv_heads, head_dim]
-    kv_lens: jax.Array,  # i32[max_num_seqs]
-    page_indices: jax.Array,  # i32[max_num_seqs, pages_per_seq]
-    cu_q_lens: jax.Array,  # i32[max_num_seqs + 1]
-    num_seqs: jax.Array,  # i32[1],
-    *,
-    sm_scale: float = 1.0,
-    sliding_window: int | None = None,
-    soft_cap: float | None = None,
-    mask_value: float | None = DEFAULT_MASK_VALUE,
-    k_scale: float | None = None,
-    v_scale: float | None = None,
-):
-    if mask_value is None:
-        mask_value = DEFAULT_MASK_VALUE
-    _, _, num_kv_heads, head_dim = k_pages.shape
-    num_q_heads = queries.shape[1]
-    assert num_q_heads % num_kv_heads == 0
-    num_query_per_kv = num_q_heads // num_kv_heads
-    outputs = []
-    for i in range(num_seqs[0]):
-        q_start = cu_q_lens[i]
-        q_end = cu_q_lens[i + 1]
-        q_len = q_end - q_start
-        kv_len = kv_lens[i]
-        indices = page_indices[i]
-        q = queries[q_start:q_end]
-        k = k_pages[indices, :, :, :].reshape(-1, num_kv_heads, head_dim)[:kv_len]
-        v = v_pages[indices, :, :, :].reshape(-1, num_kv_heads, head_dim)[:kv_len]
-        if k_scale is not None:
-            k = k.astype(jnp.float32) * k_scale
-            k = k.astype(q.dtype)
-        if v_scale is not None:
-            v = v.astype(jnp.float32) * v_scale
-            v = v.astype(q.dtype)
-        k = jnp.repeat(k, num_query_per_kv, axis=1)
-        v = jnp.repeat(v, num_query_per_kv, axis=1)
-        attn = jnp.einsum("qhd,khd->hqk", q, k, preferred_element_type=jnp.float32)
-        attn *= sm_scale
-        q_span = (kv_len - q_len) + jax.lax.broadcasted_iota(jnp.int32, attn.shape, 1)
-        kv_span = jax.lax.broadcasted_iota(jnp.int32, attn.shape, 2)
-        mask = q_span < kv_span
-        if sliding_window is not None:
-            mask = jnp.logical_or(mask, q_span - sliding_window >= kv_span)
-        if soft_cap is not None:
-            attn = soft_cap * jnp.tanh(attn / soft_cap)
-        attn += jnp.where(mask, mask_value, 0.0)
-        attn = jax.nn.softmax(attn, axis=-1).astype(v.dtype)
-        out = jnp.einsum("hqk,khd->qhd", attn, v).astype(queries.dtype)
-        outputs.append(out)
-
-    return jnp.concatenate(outputs, axis=0)
-
-
 # Expect to run these checks during compile time.
 def static_validate_inputs(
     q: jax.Array,  # [max_num_batched_tokens, num_q_heads, head_dim]
@@ -440,17 +383,17 @@ def ragged_paged_attention_kernel(
         kv_start = cu_kv_lens_ref[cur_seq_idx]
         kv_end = cu_kv_lens_ref[cur_seq_idx + 1]  # 保持页面计算的一致性
         kv_len = kv_end - kv_start
-        
+
         # 安全地获取实际序列长度，添加边界检查
         actual_kv_len = lax.select(
             cur_seq_idx < seq_lens_ref.shape[0],
             seq_lens_ref[cur_seq_idx],
-            kv_len  # 如果越界，使用对齐长度作为fallback
+            kv_len,  # 如果越界，使用对齐长度作为fallback
         )
-        
+
         # 确保 actual_kv_len 不超过对齐长度，并且不为负数
         actual_kv_len = jnp.minimum(jnp.maximum(actual_kv_len, 0), kv_len)
-        
+
         pl.debug_print("cur_seq_idx={}", cur_seq_idx)
         pl.debug_print("seq_lens_ref.shape[0]={}", seq_lens_ref.shape[0])
         pl.debug_print("actual_kv_len={}", actual_kv_len)
@@ -538,9 +481,7 @@ def ragged_paged_attention_kernel(
             # kv lens will be contracting dim, we should mask out the NaNs.
             # 使用实际序列长度而不是对齐长度，但确保不会是负数
             effective_kv_len = jnp.maximum(actual_kv_len - kv_len_start, 0)
-            kv_mask = (
-                lax.broadcasted_iota(jnp.int32, k.shape, 0) < effective_kv_len
-            )
+            kv_mask = lax.broadcasted_iota(jnp.int32, k.shape, 0) < effective_kv_len
             k = jnp.where(kv_mask, k.astype(jnp.float32), 0).astype(k.dtype)
             v = jnp.where(kv_mask, v.astype(jnp.float32), 0).astype(v.dtype)
 
