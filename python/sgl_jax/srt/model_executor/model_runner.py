@@ -354,7 +354,12 @@ class ModelRunner:
         )
 
     def forward_idle(self, forward_batch: ForwardBatch) -> LogitsProcessorOutput:
-        return self.forward(forward_batch)
+        return LogitsProcessorOutput(
+            next_token_logits=jnp.zeros(
+                (forward_batch.real_bs, self.model_config.vocab_size),
+                dtype=self.dtype,
+            )
+        )
 
     def forward(
         self,
