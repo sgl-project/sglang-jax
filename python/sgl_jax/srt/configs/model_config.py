@@ -276,13 +276,29 @@ class ModelConfig:
 
         # Store original values for reference
         self._original_num_key_value_heads = self.num_key_value_heads
-        self._original_hf_num_key_value_heads = self.hf_text_config.num_key_value_heads
+
+        # Handle cases where HF config doesn't have num_key_value_heads (MHA models)
+        if hasattr(self.hf_text_config, "num_key_value_heads"):
+            self._original_hf_num_key_value_heads = (
+                self.hf_text_config.num_key_value_heads
+            )
+        else:
+            # For MHA models without this attribute, it equals num_attention_heads
+            self._original_hf_num_key_value_heads = (
+                self.hf_text_config.num_attention_heads
+            )
 
         # CRITICAL: Set to TOTAL padded count for global sharding
         # JAX tensor parallel will automatically shard this across devices
         padded_total = padded_per_device * tensor_parallel_size
         self.num_key_value_heads = padded_total
-        self.hf_text_config.num_key_value_heads = padded_total
+
+        # Only set HF config if the attribute exists, otherwise create it
+        if hasattr(self.hf_text_config, "num_key_value_heads"):
+            self.hf_text_config.num_key_value_heads = padded_total
+        else:
+            # For MHA models, dynamically add the attribute
+            setattr(self.hf_text_config, "num_key_value_heads", padded_total)
 
     # adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/config.py
     def _parse_quant_hf_config(self):
