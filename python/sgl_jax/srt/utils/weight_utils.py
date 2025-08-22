@@ -88,6 +88,23 @@ class WeightLoader:
         else:
             self.sharding_size = 1
 
+        self.original_num_kv_heads_per_device = model_config.get_original_num_kv_heads(
+            self.sharding_size
+        )
+        self.padded_num_kv_heads_per_device = (
+            model_config.get_num_kv_heads_with_padding(self.sharding_size)
+        )
+        self.needs_kv_padding = model_config.needs_kv_heads_padding(self.sharding_size)
+        self.kv_padding_strategy = model_config.get_kv_padding_strategy()
+
+        if self.needs_kv_padding:
+            model_type = "GQA" if model_config.is_gqa_model() else "MHA"
+            logger.info(
+                f"KV projection weights padding enabled for {model_type} model: "
+                f"k_proj/v_proj weights will be padded from {self.original_num_kv_heads_per_device} "
+                f"to {self.padded_num_kv_heads_per_device} heads using {self.kv_padding_strategy} strategy"
+            )
+
     def load_weights_from_safetensors(
         self, weight_mappings: Dict[str, Union[str, List[str], WeightMapping]]
     ):
@@ -425,21 +442,151 @@ class WeightLoader:
             pad_size = self.sharding_size // self.num_kv_heads
             if pad_size > 1:
                 if hf_key.endswith(".bias"):
-                    return jnp.repeat(weight, pad_size, axis=0)
+                    weight = jnp.repeat(weight, pad_size, axis=0)
                 else:
-                    return jnp.repeat(
+                    weight = jnp.repeat(
                         weight, pad_size, axis=1 if weight.ndim > 1 else 0
                     )
         elif "q_proj" in hf_key and self.sharding_size > 1:
             pad_size = self.sharding_size // self.num_heads
             if pad_size > 1:
                 if hf_key.endswith(".bias"):
-                    return jnp.repeat(weight, pad_size, axis=0)
+                    weight = jnp.repeat(weight, pad_size, axis=0)
                 else:
-                    return jnp.repeat(
+                    weight = jnp.repeat(
                         weight, pad_size, axis=1 if weight.ndim > 1 else 0
                     )
+
+        # handle tiling padding for k_proj and v_proj
+        if (
+            any(proj in hf_key for proj in ["k_proj", "v_proj"])
+            and self.needs_kv_padding
+        ):
+            weight = self._pad_kv_projection_weight(weight, hf_key)
+
         return weight
+
+    def _pad_kv_projection_weight(self, weight: jax.Array, hf_key: str) -> jax.Array:
+        if not self.needs_kv_padding:
+            return weight
+
+        if hf_key.endswith(".bias"):
+            padding_size = (
+                self.padded_num_kv_heads_per_device
+                - self.original_num_kv_heads_per_device
+            ) * self.head_dim
+
+            if self.kv_padding_strategy == "replicate":
+                num_heads_to_add = (
+                    self.padded_num_kv_heads_per_device
+                    - self.original_num_kv_heads_per_device
+                )
+                num_original_heads = self.original_num_kv_heads_per_device
+
+                if num_heads_to_add == num_original_heads:
+                    interleaved_pieces = []
+                    for head_idx in range(num_original_heads):
+                        start_idx = head_idx * self.head_dim
+                        end_idx = (head_idx + 1) * self.head_dim
+                        original_head_bias = weight[start_idx:end_idx]
+                        interleaved_pieces.extend(
+                            [original_head_bias, original_head_bias]
+                        )
+
+                    return jnp.concatenate(interleaved_pieces, axis=0)
+                else:
+                    padding_pieces = []
+                    for i in range(num_heads_to_add):
+                        head_idx_to_copy = i % num_original_heads
+                        start_idx = head_idx_to_copy * self.head_dim
+                        end_idx = (head_idx_to_copy + 1) * self.head_dim
+                        head_bias_to_copy = weight[start_idx:end_idx]
+                        padding_pieces.append(head_bias_to_copy)
+
+                    if padding_pieces:
+                        padding = jnp.concatenate(padding_pieces, axis=0)
+                    else:
+                        padding = jnp.zeros((0,), dtype=weight.dtype)
+            else:
+                padding = jnp.zeros((padding_size,), dtype=weight.dtype)
+
+            return jnp.concatenate([weight, padding], axis=0)
+        else:
+            hidden_size, kv_dim = weight.shape
+
+            original_total_kv_heads = (
+                self.original_num_kv_heads_per_device * self.sharding_size
+            )
+            expected_kv_dim_total = original_total_kv_heads * self.head_dim
+            expected_kv_dim_per_device = (
+                self.original_num_kv_heads_per_device * self.head_dim
+            )
+
+            if kv_dim == expected_kv_dim_total:
+                expected_kv_dim = expected_kv_dim_total
+            elif kv_dim == expected_kv_dim_per_device:
+                expected_kv_dim = expected_kv_dim_per_device
+            else:
+                assert (
+                    False
+                ), f"Expected kv_dim={expected_kv_dim_total} (total) or {expected_kv_dim_per_device} (per-device), got {kv_dim}"
+
+            if kv_dim == expected_kv_dim_total:
+                padding_size = (
+                    self.padded_num_kv_heads_per_device * self.sharding_size
+                    - self.original_num_kv_heads_per_device * self.sharding_size
+                ) * self.head_dim
+            else:
+                padding_size = (
+                    self.padded_num_kv_heads_per_device
+                    - self.original_num_kv_heads_per_device
+                ) * self.head_dim
+
+            if self.kv_padding_strategy == "replicate":
+                num_heads_to_add = (
+                    self.padded_num_kv_heads_per_device
+                    - self.original_num_kv_heads_per_device
+                )
+                if kv_dim == expected_kv_dim_total:
+                    num_heads_to_add *= self.sharding_size
+                    num_original_heads = (
+                        self.original_num_kv_heads_per_device * self.sharding_size
+                    )
+                else:
+                    num_original_heads = self.original_num_kv_heads_per_device
+
+                # For GQA, we want each head to be duplicated in-place
+                # E.g., [head_0, head_1, head_2, head_3] -> [head_0, head_0, head_1, head_1, head_2, head_2, head_3, head_3]
+                if num_heads_to_add == num_original_heads:
+                    # Special case: duplicate each head once (most common for GQA)
+                    # Interleave original heads with their copies
+                    interleaved_pieces = []
+                    for head_idx in range(num_original_heads):
+                        start_idx = head_idx * self.head_dim
+                        end_idx = (head_idx + 1) * self.head_dim
+                        original_head = weight[:, start_idx:end_idx]
+                        # Add original head and its copy
+                        interleaved_pieces.extend([original_head, original_head])
+
+                    return jnp.concatenate(interleaved_pieces, axis=1)
+                else:
+                    padding_pieces = []
+                    for i in range(num_heads_to_add):
+                        head_idx_to_copy = i % num_original_heads
+                        start_idx = head_idx_to_copy * self.head_dim
+                        end_idx = (head_idx_to_copy + 1) * self.head_dim
+                        head_to_copy = weight[:, start_idx:end_idx]
+                        padding_pieces.append(head_to_copy)
+
+                    if padding_pieces:
+                        padding = jnp.concatenate(padding_pieces, axis=1)
+                    else:
+                        # No padding needed
+                        padding = jnp.zeros((weight.shape[0], 0), dtype=weight.dtype)
+            else:  # zero padding
+                padding = jnp.zeros((hidden_size, padding_size), dtype=weight.dtype)
+
+            return jnp.concatenate([weight, padding], axis=1)
 
     def _process_moe_expert_weights(
         self,

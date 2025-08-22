@@ -734,21 +734,10 @@ def kv_cache_update(
         ), f"slices.shape[1]={slices.shape[1]} is not divisible by num_slices_per_block={num_slices_per_block}"
         _, num_combined_kv_heads, head_dim = new_kv.shape
 
-        original_kv_heads = num_combined_kv_heads
-        padding_added = False
-        # padding kv heads for tiling 2
-        if num_combined_kv_heads % 2 == 1:
-            padding_added = True
-
-            pad_shape = (new_kv.shape[0], 1, new_kv.shape[2])
-            new_kv_pad = jnp.zeros(pad_shape, dtype=new_kv.dtype)
-            new_kv = jnp.concatenate([new_kv, new_kv_pad], axis=1)
-
-            cache_pad_shape = (kv_cache.shape[0], 1, kv_cache.shape[2])
-            kv_cache_pad = jnp.zeros(cache_pad_shape, dtype=kv_cache.dtype)
-            kv_cache = jnp.concatenate([kv_cache, kv_cache_pad], axis=1)
-
-            num_combined_kv_heads = new_kv.shape[1]
+        assert num_combined_kv_heads % 2 == 0, (
+            f"num_combined_kv_heads={num_combined_kv_heads} should be even after pre-padding. "
+            "This indicates a configuration issue with kv heads padding."
+        )
 
         assert (
             kv_cache.shape[1] == num_combined_kv_heads
@@ -794,9 +783,6 @@ def kv_cache_update(
 
         result = kernel(*scalar_prefetches, new_kv, kv_cache)[0]
 
-        # reset padded kv heads
-        if padding_added and result.shape[1] > original_kv_heads:
-            result = result[:, :original_kv_heads, :]
         return result
 
     return _kv_cache_update_wrapper(new_kv, slices, kv_cache, num_kv_update_slices)

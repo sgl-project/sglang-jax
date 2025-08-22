@@ -168,7 +168,10 @@ class ModelConfig:
 
     # adapted from https://github.com/vllm-project/vllm/blob/main/vllm/config.py#L289
     def get_total_num_kv_heads(self) -> int:
-        """Returns the total number of KV heads."""
+        """Returns the total number of KV heads (original, not padded)."""
+        # Use original value if it was overridden for TP
+        if hasattr(self, "_original_hf_num_key_value_heads"):
+            return self._original_hf_num_key_value_heads
         # For GPTBigCode & Falcon:
         # NOTE: for falcon, when new_decoder_architecture is True, the
         # multi_query flag is ignored and we use n_head_kv for the number of
@@ -223,6 +226,63 @@ class ModelConfig:
         # case where the number of KV heads is smaller than the tensor
         # parallel size so each GPU has at least one KV head.
         return max(1, total_num_kv_heads // tensor_parallel_size)
+
+    def get_num_kv_heads_with_padding(self, tensor_parallel_size: int) -> int:
+        original_kv_heads = self.get_num_kv_heads(tensor_parallel_size)
+        return original_kv_heads + (original_kv_heads % 2)
+
+    def get_original_num_kv_heads(self, tensor_parallel_size: int) -> int:
+        return self.get_num_kv_heads(tensor_parallel_size)
+
+    def needs_kv_heads_padding(self, tensor_parallel_size: int) -> bool:
+        return self.get_num_kv_heads(tensor_parallel_size) % 2 == 1
+
+    def is_gqa_model(self) -> bool:
+        return self.get_total_num_kv_heads() < self.num_attention_heads
+
+    def get_kv_padding_strategy(self) -> str:
+        if self.is_gqa_model():
+            # GQA models should replicate existing kv heads to maintain attention semantics
+            return "replicate"
+        else:
+            # MHA models can use zero padding since all heads are equivalent
+            return "zero"
+
+    def log_kv_heads_padding_info(self, tensor_parallel_size: int):
+        """Log KV heads padding information during initialization."""
+        original_kv_heads = self.get_original_num_kv_heads(tensor_parallel_size)
+        padded_kv_heads = self.get_num_kv_heads_with_padding(tensor_parallel_size)
+        needs_padding = self.needs_kv_heads_padding(tensor_parallel_size)
+
+        if needs_padding:
+            model_type = "GQA" if self.is_gqa_model() else "MHA"
+            total_original = self.get_total_num_kv_heads()
+            total_padded = padded_kv_heads * tensor_parallel_size
+
+            logger.info(
+                f"KV heads padding enabled for {model_type} model: "
+                f"original_kv_heads_per_device={original_kv_heads} -> padded={padded_kv_heads} "
+                f"(total: {total_original} -> {total_padded}) for tiling optimization"
+            )
+        else:
+            logger.info(
+                f"KV heads padding not needed: kv_heads_per_device={original_kv_heads} is already even"
+            )
+
+    def configure_for_tensor_parallel(self, tensor_parallel_size: int):
+        """Configure model config for tensor parallel execution with padding."""
+        # Get per-device counts
+        padded_per_device = self.get_num_kv_heads_with_padding(tensor_parallel_size)
+
+        # Store original values for reference
+        self._original_num_key_value_heads = self.num_key_value_heads
+        self._original_hf_num_key_value_heads = self.hf_text_config.num_key_value_heads
+
+        # CRITICAL: Set to TOTAL padded count for global sharding
+        # JAX tensor parallel will automatically shard this across devices
+        padded_total = padded_per_device * tensor_parallel_size
+        self.num_key_value_heads = padded_total
+        self.hf_text_config.num_key_value_heads = padded_total
 
     # adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/config.py
     def _parse_quant_hf_config(self):
