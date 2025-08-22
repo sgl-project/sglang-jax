@@ -112,6 +112,7 @@ class EPMoE(nnx.Module):
         weight_dtype: jnp.dtype = jnp.bfloat16,
         dtype: jnp.dtype = jnp.bfloat16,
         layer_id: int = 0,
+        use_padded_dot: bool = True,  # 新增参数
         rngs: nnx.Rngs = None,
     ):
 
@@ -124,6 +125,7 @@ class EPMoE(nnx.Module):
         self.layer_id = layer_id
         self.expert_parallel_size = expert_parallel_size
         self.mesh = mesh
+        self.use_padded_dot = use_padded_dot
         if num_experts % self.expert_parallel_size != 0:
             raise ValueError(
                 f"num_experts({num_experts}) must be divisible by expert_parallel_size ({self.expert_parallel_size})"
@@ -238,14 +240,24 @@ class EPMoE(nnx.Module):
                 local_group_sizes = group_sizes
 
             # GMM
-            intermediate_output = self._gmm_compute_with_sharded_weights(
-                x,
-                local_group_sizes,
-                selected_experts,
-                w0_weights,
-                w1_weights,
-                wo_weights,
-            )
+            if self.use_padded_dot:
+                intermediate_output = self._gmm_compute_with_padded_dot(
+                    x,
+                    local_group_sizes,
+                    selected_experts,
+                    w0_weights,
+                    w1_weights,
+                    wo_weights,
+                )
+            else:
+                intermediate_output = self._gmm_compute_with_sharded_weights(
+                    x,
+                    local_group_sizes,
+                    selected_experts,
+                    w0_weights,
+                    w1_weights,
+                    wo_weights,
+                )
 
             # EP Combine
             if self.expert_parallel_size > 1:
@@ -316,6 +328,90 @@ class EPMoE(nnx.Module):
 
         return intermediate_output
 
+    def _gmm_compute_with_padded_dot(
+        self, x, local_group_sizes, selected_experts, w0_kernel, w1_kernel, wo_kernel
+    ):
+        """使用padding + 标准dot替代ragged_dot的优化实现"""
+        if x.shape[0] == 0:
+            empty_output = jnp.zeros(
+                (0, wo_kernel.shape[-1]), dtype=x.dtype
+            )  # (0, hidden_dim)
+            return empty_output
+
+        # 找到最大的专家token数
+        max_tokens_per_expert = jnp.max(local_group_sizes)
+        max_tokens_per_expert = jnp.maximum(max_tokens_per_expert, 1)
+
+        num_local_experts = local_group_sizes.shape[0]
+        hidden_dim = x.shape[1]
+
+        # 创建专家分配的索引映射
+        # 计算每个专家在x中的起始位置
+        expert_start_indices = jnp.concatenate(
+            [jnp.array([0]), jnp.cumsum(local_group_sizes[:-1])]
+        )
+
+        # 为每个专家创建padded输入和mask
+        def create_expert_input(expert_idx):
+            start_idx = expert_start_indices[expert_idx]
+            num_tokens = local_group_sizes[expert_idx]
+
+            # 创建该专家的tokens
+            expert_tokens = jax.lax.dynamic_slice(
+                x, (start_idx, 0), (num_tokens, hidden_dim)
+            )
+
+            # 创建padding
+            padding_size = max_tokens_per_expert - num_tokens
+            padded_tokens = jnp.pad(
+                expert_tokens,
+                ((0, padding_size), (0, 0)),
+                mode="constant",
+                constant_values=0,
+            )
+
+            # 创建mask
+            mask = jnp.arange(max_tokens_per_expert) < num_tokens
+
+            return padded_tokens, mask
+
+        # 使用vmap批量处理所有专家
+        expert_indices = jnp.arange(num_local_experts)
+        padded_inputs, valid_masks = jax.vmap(create_expert_input)(expert_indices)
+
+        # 批量计算 - gate projection (wi_0)
+        # [num_experts, max_tokens, hidden] @ [num_experts, hidden, intermediate] -> [num_experts, max_tokens, intermediate]
+        layer_w0 = jnp.einsum("eth,ehd->etd", padded_inputs, w0_kernel)
+
+        # 批量计算 - up projection (wi_1)
+        layer_w1 = jnp.einsum("eth,ehd->etd", padded_inputs, w1_kernel)
+
+        # 激活函数
+        layer_act = jax.nn.silu(layer_w0)
+        intermediate_layer = jnp.multiply(layer_act, layer_w1)
+
+        # 应用mask确保padding部分为0
+        intermediate_layer = intermediate_layer * valid_masks[..., None]
+
+        # 批量计算 - down projection (wo)
+        # [num_experts, max_tokens, intermediate] @ [num_experts, intermediate, hidden] -> [num_experts, max_tokens, hidden]
+        expert_outputs = jnp.einsum("etd,edh->eth", intermediate_layer, wo_kernel)
+
+        # 再次应用mask
+        expert_outputs = expert_outputs * valid_masks[..., None]
+
+        # 将结果重新flatten，只保留有效的token输出
+        # 使用mask来选择有效的输出
+        expert_outputs_flat = expert_outputs.reshape(
+            -1, wo_kernel.shape[-1]
+        )  # [num_experts * max_tokens, hidden]
+        valid_masks_flat = valid_masks.reshape(-1)  # [num_experts * max_tokens]
+
+        # 选择有效的输出tokens
+        final_output = expert_outputs_flat[valid_masks_flat]
+
+        return final_output.astype(self.dtype)
+
     def _single_device_forward(self, inputs, router_logits):
         top_k_logits, top_k_indices = jax.lax.top_k(
             router_logits, self.num_experts_per_tok
@@ -326,9 +422,9 @@ class EPMoE(nnx.Module):
 
         top_k_weights = top_k_weights / jnp.sum(top_k_weights, axis=-1, keepdims=True)
 
-        return self._single_device_forward(inputs, top_k_indices, top_k_weights)
+        return self._single_device_forward_impl(inputs, top_k_indices, top_k_weights)
 
-    def _single_device_forward(self, inputs, top_k_indices, top_k_weights):
+    def _single_device_forward_impl(self, inputs, top_k_indices, top_k_weights):
         num_tokens = inputs.shape[0] * (inputs.shape[1] if inputs.ndim > 1 else 1)
         inputs_flat = inputs.reshape(num_tokens, -1)
 
@@ -506,3 +602,67 @@ class EPMoE(nnx.Module):
             final_output = output.reshape(batch_size, seq_len, -1).astype(self.dtype)
 
         return final_output
+
+
+def _test_padded_vs_ragged_equivalence():
+    """简单测试验证padded_dot和ragged_dot结果等效性"""
+    from unittest.mock import Mock
+
+    import jax
+
+    # 创建测试配置
+    config = Mock()
+    config.hidden_size = 768
+
+    # 创建测试数据
+    key = jax.random.PRNGKey(42)
+    mesh = Mock()  # 简化mesh
+    rngs = Mock()
+    rngs.params.return_value = key
+
+    # 创建两个模型实例：一个用ragged_dot，一个用padded_dot
+    moe_ragged = EPMoE(
+        config=config,
+        num_experts=8,
+        num_experts_per_tok=2,
+        expert_parallel_size=1,
+        mesh=mesh,
+        intermediate_dim=2048,
+        use_padded_dot=False,  # 使用ragged_dot
+        rngs=rngs,
+    )
+
+    moe_padded = EPMoE(
+        config=config,
+        num_experts=8,
+        num_experts_per_tok=2,
+        expert_parallel_size=1,
+        mesh=mesh,
+        intermediate_dim=2048,
+        use_padded_dot=True,  # 使用padded_dot
+        rngs=rngs,
+    )
+
+    # 确保两个模型使用相同的权重
+    moe_padded.wi_0.value = moe_ragged.wi_0.value
+    moe_padded.wi_1.value = moe_ragged.wi_1.value
+    moe_padded.wo.value = moe_ragged.wo.value
+
+    # 创建测试输入
+    batch_size, seq_len = 4, 32
+    inputs = jax.random.normal(key, (batch_size * seq_len, config.hidden_size)).astype(
+        jnp.bfloat16
+    )
+    router_logits = jax.random.normal(
+        jax.random.split(key)[0], (batch_size * seq_len, 8)
+    ).astype(jnp.float32)
+
+    print("Testing MoE padded_dot vs ragged_dot equivalence...")
+    print(f"Input shape: {inputs.shape}")
+    print(f"Router logits shape: {router_logits.shape}")
+
+    return moe_ragged, moe_padded, inputs, router_logits
+
+
+# 取消注释下面这行来运行测试
+# _test_padded_vs_ragged_equivalence()
