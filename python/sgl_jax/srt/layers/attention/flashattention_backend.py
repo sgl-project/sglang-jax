@@ -62,6 +62,7 @@ class FlashAttention(AttentionBackend):
         head_dim,
         vmem_limit_bytes: int = 32 * (1 << 20),  # 32MB
         page_size: int = 1,
+        kv_partition_axis: str = "tensor",
     ):
         self.vmem_limit_bytes = vmem_limit_bytes
         self.num_heads = num_attn_heads
@@ -71,6 +72,7 @@ class FlashAttention(AttentionBackend):
             self.num_kv_heads = num_attn_heads
         self.head_dim = head_dim
         self.page_size = page_size
+        self.kv_partition_axis = kv_partition_axis
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init the metadata for a forward pass."""
@@ -167,27 +169,31 @@ class FlashAttention(AttentionBackend):
             scale = layer.scaling
 
         in_specs = (
-            P(None, kv_partition_axis),  # q shape: [batched_tokens, head_num, head_dim]
-            P(None, None, kv_partition_axis, None),  # k_buffer sha
-            P(None, None, kv_partition_axis, None),  # v_buffer
+            P(
+                None, self.kv_partition_axis
+            ),  # q shape: [batched_tokens, head_num, head_dim]
+            P(None, None, self.kv_partition_axis, None),  # k_buffer sha
+            P(None, None, self.kv_partition_axis, None),  # v_buffer
             P(),  # page_indices
             P(),  # cu_q_lens
             P(),  # cu_kv_lens
             P(),  # num_seqs
         )
-        out_specs = P(None, kv_partition_axis)
+        out_specs = P(None, self.kv_partition_axis)
 
         def _ragged_paged_attention(*args):
             q, k_buffer, v_buffer = args[:3]
             other_args = args[3:]
 
-            # Handle FlashAttention even head requirement by replicating KV heads if needed
-            # This preserves GQA semantics: multiple Q heads share the same KV head
-            if k_buffer.shape[-2] % 2 != 0:
-                # Replicate the KV heads to make the count even
-                # For GQA, this is semantically correct as Q heads share KV heads anyway
-                k_buffer = jnp.concatenate([k_buffer, k_buffer[..., -1:, :]], axis=-2)
-                v_buffer = jnp.concatenate([v_buffer, v_buffer[..., -1:, :]], axis=-2)
+            # Since we now use pre-padded kv heads, ensure they are always even
+            assert k_buffer.shape[-2] % 2 == 0, (
+                f"k_buffer kv_heads={k_buffer.shape[-2]} should be even after pre-padding. "
+                "This indicates a configuration issue with kv heads padding."
+            )
+            assert v_buffer.shape[-2] % 2 == 0, (
+                f"v_buffer kv_heads={v_buffer.shape[-2]} should be even after pre-padding. "
+                "This indicates a configuration issue with kv heads padding."
+            )
 
             return ragged_paged_attention(
                 q,
