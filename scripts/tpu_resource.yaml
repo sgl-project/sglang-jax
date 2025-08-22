@@ -10,6 +10,6 @@ secrets:
 
 
 setup: |
-  git clone https://${USERNAME}:${GIT_TOKEN}@github.com/Furion-cn/sgl-jax.git
-  cd sgl-jax && git fetch origin $REF:$REF && git checkout $REF
+  git clone https://${USERNAME}:${GIT_TOKEN}@github.com/sgl-project/sglang-jax.git
+  cd sglang-jax && git fetch origin $REF:$REF && git checkout $REF
   uv pip install -e python/

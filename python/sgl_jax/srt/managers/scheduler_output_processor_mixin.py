@@ -95,13 +95,13 @@ class SchedulerOutputProcessorMixin:
                         logits_output,
                     )
                     logprob_pt += num_input_logprobs
-                else:
-                    # being chunked reqs' prefill is not finished
-                    req.is_chunked -= 1
-                    # There is only at most one request being currently chunked.
-                    # Because this request does not finish prefill,
-                    # we don't want to stream the request currently being chunked.
-                    skip_stream_req = req
+            else:
+                # being chunked reqs' prefill is not finished
+                req.is_chunked -= 1
+                # There is only at most one request being currently chunked.
+                # Because this request does not finish prefill,
+                # we don't want to stream the request currently being chunked.
+                skip_stream_req = req
 
         self.set_next_batch_sampling_info_done(batch)
 
