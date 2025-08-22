@@ -350,48 +350,60 @@ class EPMoE(nnx.Module):
         # 创建一个大的padded tensor来容纳所有数据
         # 使用gather操作来高效地重新排列数据
 
-        # 为每个专家和位置创建全局索引
-        expert_indices = jnp.repeat(
-            jnp.arange(num_local_experts), max_tokens_per_expert
+        # 避免动态repeat，使用静态的最大可能值
+        # 假设最坏情况：所有tokens都分配给一个专家
+        MAX_TOKENS_PER_EXPERT = x.shape[0]  # 这是一个静态上界
+
+        # 但我们只使用实际需要的部分
+        actual_max_tokens = jnp.minimum(MAX_TOKENS_PER_EXPERT, max_tokens_per_expert)
+
+        # 使用静态形状创建padded数据
+        padded_inputs = jnp.zeros(
+            (num_local_experts, MAX_TOKENS_PER_EXPERT, hidden_dim), dtype=x.dtype
         )
-        position_indices = jnp.tile(
-            jnp.arange(max_tokens_per_expert), num_local_experts
+        valid_masks = jnp.zeros(
+            (num_local_experts, MAX_TOKENS_PER_EXPERT), dtype=jnp.bool_
         )
 
-        # 计算每个(expert, position)对应的原始token索引
+        # 计算每个专家的起始索引
         expert_start_indices = jnp.concatenate(
             [jnp.array([0]), jnp.cumsum(local_group_sizes[:-1])]
         )
 
-        def compute_source_indices(expert_pos_pair):
-            expert_idx, pos_in_expert = expert_pos_pair
+        # 为每个专家创建数据
+        def create_expert_data(expert_idx):
             expert_start = expert_start_indices[expert_idx]
             expert_size = local_group_sizes[expert_idx]
 
-            # 如果position超出了专家的token数量，使用padding
-            is_valid = pos_in_expert < expert_size
-            source_idx = jnp.where(
-                is_valid, expert_start + pos_in_expert, 0
-            )  # padding用0
+            # 创建这个专家的tokens和mask
+            expert_tokens = jnp.zeros(
+                (MAX_TOKENS_PER_EXPERT, hidden_dim), dtype=x.dtype
+            )
+            expert_mask = jnp.zeros(MAX_TOKENS_PER_EXPERT, dtype=jnp.bool_)
 
-            return source_idx, is_valid
+            # 填充有效的tokens
+            def fill_position(pos):
+                is_valid = pos < expert_size
+                source_idx = jnp.clip(expert_start + pos, 0, x.shape[0] - 1)
+                token = jnp.where(
+                    is_valid, x[source_idx], jnp.zeros(hidden_dim, dtype=x.dtype)
+                )
+                return token, is_valid
 
-        # 使用vmap高效计算所有源索引
-        expert_pos_pairs = jnp.stack([expert_indices, position_indices], axis=1)
-        source_indices, valid_flags = jax.vmap(compute_source_indices)(expert_pos_pairs)
+            # 使用vmap处理所有位置
+            positions = jnp.arange(MAX_TOKENS_PER_EXPERT)
+            tokens, masks = jax.vmap(fill_position)(positions)
 
-        # 使用gather操作高效地重新排列数据
-        # 对于无效位置，我们仍然会从x[0]取值，但会用mask置零
-        gathered_tokens = x[source_indices]  # [num_experts * max_tokens, hidden]
+            return tokens, masks
 
-        # 应用mask，将无效位置置零
-        masked_tokens = gathered_tokens * valid_flags[:, None]
-
-        # reshape到最终形状
-        padded_inputs = masked_tokens.reshape(
-            num_local_experts, max_tokens_per_expert, hidden_dim
+        # 使用vmap处理所有专家
+        padded_inputs, valid_masks = jax.vmap(create_expert_data)(
+            jnp.arange(num_local_experts)
         )
-        valid_masks = valid_flags.reshape(num_local_experts, max_tokens_per_expert)
+
+        # 裁剪到实际需要的大小
+        padded_inputs = padded_inputs[:, :actual_max_tokens, :]
+        valid_masks = valid_masks[:, :actual_max_tokens]
 
         # 批量计算 - gate projection (wi_0)
         # [num_experts, max_tokens, hidden] @ [num_experts, hidden, intermediate] -> [num_experts, max_tokens, intermediate]
