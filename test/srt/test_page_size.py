@@ -39,6 +39,8 @@ class TestPageSizeGreaterThanOne(CustomTestCase):
                 "fa",
                 "--jax-precompile-prefill-token-paddings",
                 "16384",
+                "--jax-precompile-decode-bs-paddings",
+                "10",
                 "--page-size",
                 "128",
             ],
