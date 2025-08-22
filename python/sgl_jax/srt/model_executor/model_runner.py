@@ -319,6 +319,9 @@ class ModelRunner:
     def _forward(
         self, input_ids: jax.Array, positions: jax.Array, forward_batch: ForwardBatch
     ):
+        logger.info(
+            f"model runner mesh: {self.mesh}, local devices: {jax.local_devices()}"
+        )
         result, layers_k, layers_v = self.model_fn(
             self.state, input_ids, positions, forward_batch
         )
