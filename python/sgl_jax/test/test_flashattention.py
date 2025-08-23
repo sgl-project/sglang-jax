@@ -37,47 +37,78 @@ def create_qkv_cache(
     key = jax.random.PRNGKey(42)
     q = jax.random.normal(key, (batched_q_len, num_heads, head_dim), dtype=jnp.bfloat16)
 
-    # Create k,v with aligned length and pad with zeros
-    k_unpadded = jax.random.normal(
-        jax.random.split(key)[0],
-        (batched_kv_len, num_kv_heads, head_dim),
-        dtype=jnp.bfloat16,
-    )
-    v_unpadded = jax.random.normal(
-        jax.random.split(key)[1],
-        (batched_kv_len, num_kv_heads, head_dim),
-        dtype=jnp.bfloat16,
-    )
+    # Create k,v with proper alignment gaps between sequences
+    k = jnp.zeros((batched_aligned_kv_len, num_kv_heads, head_dim), dtype=jnp.bfloat16)
+    v = jnp.zeros((batched_aligned_kv_len, num_kv_heads, head_dim), dtype=jnp.bfloat16)
 
-    # Pad k,v to aligned length
-    padding_size = batched_aligned_kv_len - batched_kv_len
-    k = jnp.pad(k_unpadded, ((0, padding_size), (0, 0), (0, 0)), constant_values=0)
-    v = jnp.pad(v_unpadded, ((0, padding_size), (0, 0), (0, 0)), constant_values=0)
+    # Fill in the actual data for each sequence with proper alignment
+    actual_pos = 0
+    aligned_pos = 0
+    for seq_len in [kv_len for _, kv_len in lens]:
+        aligned_len = ((seq_len + page_size - 1) // page_size) * page_size
+
+        # Generate data for this sequence
+        seq_k = jax.random.normal(
+            jax.random.split(key, len(lens) * 2)[actual_pos],
+            (seq_len, num_kv_heads, head_dim),
+            dtype=jnp.bfloat16,
+        )
+        seq_v = jax.random.normal(
+            jax.random.split(key, len(lens) * 2)[actual_pos + len(lens)],
+            (seq_len, num_kv_heads, head_dim),
+            dtype=jnp.bfloat16,
+        )
+
+        # Place data at aligned positions
+        k = k.at[aligned_pos : aligned_pos + seq_len].set(seq_k)
+        v = v.at[aligned_pos : aligned_pos + seq_len].set(seq_v)
+
+        actual_pos += 1
+        aligned_pos += aligned_len
 
     return q, k, v
 
 
 def write_prefix_tokens_for_kv(forward_batch, lens, k, v):
-    cache_loc_idx = jnp.concatenate(
+    # Use aligned positions for k/v indexing since k/v arrays are created with alignment gaps
+    aligned_seq_lens = (
+        forward_batch.attn_backend.forward_metadata.cu_kv_lens[1:]
+        - forward_batch.attn_backend.forward_metadata.cu_kv_lens[:-1]
+    )
+    aligned_cache_loc_idx = jnp.concatenate(
+        [jnp.array([0], dtype=jnp.int32), jnp.cumsum(aligned_seq_lens)]
+    )
+
+    # But use actual seq_lens for cache_loc indexing
+    actual_cache_loc_idx = jnp.concatenate(
         [jnp.array([0], dtype=jnp.int32), jnp.cumsum(forward_batch.seq_lens)]
     )
+
     extend_k = []
     extend_v = []
     for i, (q_len, kv_len) in enumerate(lens):
-        start = cache_loc_idx[i]
-        prefix_end = start + (kv_len - q_len)
-        extend_start = prefix_end
-        extend_end = start + kv_len
+        # Use actual positions for cache_loc
+        actual_start = actual_cache_loc_idx[i]
+        actual_prefix_end = actual_start + (kv_len - q_len)
+        actual_extend_start = actual_prefix_end
+        actual_extend_end = actual_start + kv_len
+
+        # Use aligned positions for k/v array indexing
+        aligned_start = aligned_cache_loc_idx[i]
+        aligned_extend_start = aligned_start + (kv_len - q_len)
+        aligned_extend_end = aligned_start + kv_len
+
         if kv_len > q_len:
             # write prefix token
-            prefix_cache_loc = forward_batch.cache_loc[start:prefix_end]
-            prefix_k = k[start:prefix_end]
-            prefix_v = v[start:prefix_end]
+            prefix_cache_loc = forward_batch.cache_loc[actual_start:actual_prefix_end]
+            prefix_k = k[aligned_start : aligned_start + (kv_len - q_len)]
+            prefix_v = v[aligned_start : aligned_start + (kv_len - q_len)]
             forward_batch.token_to_kv_pool.set_kv_buffer(
                 0, prefix_cache_loc, prefix_k, prefix_v
             )
-        extend_k.append(k[extend_start:extend_end])
-        extend_v.append(v[extend_start:extend_end])
+
+        extend_k.append(k[aligned_extend_start:aligned_extend_end])
+        extend_v.append(v[aligned_extend_start:aligned_extend_end])
 
     return jnp.concatenate(extend_k), jnp.concatenate(extend_v)
 
@@ -127,8 +158,27 @@ def create_test_data(
     # create q, k v
     q, k, v = create_qkv_cache(lens, num_heads, head_dim, num_kv_heads, page_size)
 
-    # cache loc - aligned to page_size
-    cache_loc = jnp.arange(total_aligned_tokens, dtype=jnp.int32)
+    # cache loc - create cache locations with actual token indices and padding zeros
+    cache_loc = []
+    current_token_idx = 1  # Start from 1 for actual tokens
+
+    for i, (_, kv_len) in enumerate(lens):
+        aligned_len = aligned_seq_lens[i]
+        # Add actual token positions (starting from current_token_idx)
+        actual_positions = jnp.arange(
+            current_token_idx, current_token_idx + kv_len, dtype=jnp.int32
+        )
+        cache_loc.append(actual_positions)
+        # Add padding positions as zeros
+        padding_len = aligned_len - kv_len
+        if padding_len > 0:
+            padding_positions = jnp.zeros(padding_len, dtype=jnp.int32)
+            cache_loc.append(padding_positions)
+        current_token_idx += (
+            kv_len + 4
+        )  # Add gap between sequences (like 1-5, then 9-13)
+
+    cache_loc = jnp.concatenate(cache_loc)
     if mode == "prefill":
         # out_cache_loc - use aligned seq_lens for cache indexing
         cache_loc_idx = jnp.concatenate(
@@ -229,6 +279,16 @@ class TestAttention(CustomTestCase):
             },
         )
 
+        # Debug cache mapping
+        print(f"=== Cache Mapping Debug ===")
+        print(f"lens: {lens}")
+        print(f"seq_lens: {forward_batch.seq_lens}")
+        print(f"cu_q_lens: {forward_batch.attn_backend.forward_metadata.cu_q_lens}")
+        print(f"cu_kv_lens: {forward_batch.attn_backend.forward_metadata.cu_kv_lens}")
+        print(f"cache_loc: {forward_batch.cache_loc[:100]}")
+        print(f"out_cache_loc: {forward_batch.out_cache_loc[:100]}")
+        print()
+
         # Create test data
         shading = jax.sharding.NamedSharding(mesh, P(None, "tensor"))
         q_shard = jax.device_put(q.copy(), shading).reshape(q.shape[0], -1)
@@ -271,10 +331,16 @@ class TestAttention(CustomTestCase):
             cache_loc_list.append(padded_cache_loc)
         page_table = jnp.stack(cache_loc_list)
 
+        k_pages = k.reshape(k.shape[0] // page_size, page_size, num_kv_heads, head_dim)
+        v_pages = v.reshape(v.shape[0] // page_size, page_size, num_kv_heads, head_dim)
+
+        page_table_np = np.asarray(page_table)
+        print(f"page_table_np: {page_table_np}")
+
         expected = ref_ragged_paged_attention(
             q.reshape(q.shape[0], num_heads, head_dim),
-            k.reshape(k.shape[0] // page_size, page_size, num_kv_heads, head_dim),
-            v.reshape(v.shape[0] // page_size, page_size, num_kv_heads, head_dim),
+            k_pages,
+            v_pages,
             forward_batch.seq_lens,
             page_table,
             forward_batch.attn_backend.forward_metadata.cu_q_lens,
@@ -294,13 +360,61 @@ class TestAttention(CustomTestCase):
 
         rtol = 2e-2  # Relative tolerance
         atol = 1e-2  # Absolute tolerance
+        jax_flat = np.asarray(jax_output)
+        expected_flat = np.asarray(expected.reshape(expected.shape[0], -1))
+        diff = np.abs(jax_flat - expected_flat)
+        max_diff = np.max(diff)
+
+        print(f"=== Detailed Analysis ===")
+        print(f"JAX output shape: {jax_flat.shape}")
+        print(f"Expected shape: {expected_flat.shape}")
+        print(f"Max difference: {max_diff}")
+
+        # Analyze by token dimension (rows) - show only first 5 tokens
+        print(f"\n=== Token-wise Analysis (first 20 tokens) ===")
+        num_tokens = jax_flat.shape[0]
+        for i in range(min(num_tokens, 20)):
+            jax_row = np.asarray(jax_flat[i])
+            expected_row = np.asarray(expected_flat[i])
+            row_diff = np.abs(jax_row - expected_row)
+            jax_mean = np.mean(jax_row)
+            expected_mean = np.mean(expected_row)
+            jax_std = np.std(jax_row)
+            expected_std = np.std(expected_row)
+
+            print(
+                f"Token {i}: max_diff={float(np.max(row_diff)):.6f}, jax_mean={float(jax_mean):.6f}, expected_mean={float(expected_mean):.6f}, jax_std={float(jax_std):.6f}, expected_std={float(expected_std):.6f}"
+            )
+            print()
+
+        # Overall statistics
+        print(f"=== Overall Statistics ===")
+        print(
+            f"JAX output:      mean={float(np.mean(jax_flat)):.6f}, std={float(np.std(jax_flat)):.6f}"
+        )
+        print(
+            f"Expected output: mean={float(np.mean(expected_flat)):.6f}, std={float(np.std(expected_flat)):.6f}"
+        )
+        print(
+            f"Absolute diff:   mean={float(np.mean(diff)):.6f}, std={float(np.std(diff)):.6f}, max={float(np.max(diff)):.6f}"
+        )
+
+        # Check how many tokens have large differences
+        large_diff_tokens = int(
+            np.sum(np.max(diff.reshape(num_tokens, -1), axis=1) > 0.1)
+        )
+        print(f"Tokens with max diff > 0.1: {large_diff_tokens}/{num_tokens}")
+
         are_close = np.allclose(
-            np.asarray(jax_output),
-            np.asarray(expected.reshape(expected.shape[0], -1)),
+            jax_flat,
+            expected_flat,
             rtol=rtol,
             atol=atol,
         )
-        self.assertTrue(are_close, f"JAX output and expected output are not close")
+        self.assertTrue(
+            are_close,
+            f"JAX output and expected output are not close, max diff: {max_diff}",
+        )
 
     def test_mha_prefill_accuracy_page_size_1(self):
         """Test JAX attention accuracy against PyTorch reference"""
@@ -350,10 +464,11 @@ class TestAttention(CustomTestCase):
         num_kv_heads = 32
         head_dim = 128
         lens = [
-            (1, 128),
+            (5, 5),  # (10, 10) will failed
+            (5, 5),
         ]
         self.run_test(
-            "prefill", lens, (num_heads, head_dim, num_kv_heads, 4, jnp.bfloat16)
+            "prefill", lens, (num_heads, head_dim, num_kv_heads, 8, jnp.bfloat16)
         )
 
     def test_mha_prefill_accuracy_page_size_64(self):

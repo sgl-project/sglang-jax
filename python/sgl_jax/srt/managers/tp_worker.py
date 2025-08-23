@@ -144,7 +144,7 @@ class ModelWorker:
                 normalized_token_paddings.append(item)
 
         if len(normalized_token_paddings) == 0:
-            normalized_token_paddings.append(prefill_padded_batch_size)
+            normalized_token_paddings.append(prefill_max_padded_num_tokens)
             logger.warning(
                 f"No valid padding found in {server_args.jax_precompile_prefill_token_paddings=} within range [{prefill_padded_batch_size}, {prefill_max_padded_num_tokens}], so set token_paddings as {normalized_token_paddings}"
             )

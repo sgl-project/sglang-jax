@@ -44,7 +44,7 @@ class TestEvalAccuracyLarge(CustomTestCase):
                 "--node-rank",
                 "0",
                 "--mem-fraction-static",
-                "0.2",
+                "0.4",
                 "--max-prefill-tokens",
                 "4096",
                 "--download-dir",
@@ -54,9 +54,15 @@ class TestEvalAccuracyLarge(CustomTestCase):
                 "fa",
                 "bfloat16",
                 "--jax-precompile-decode-bs-paddings",
-                "10",
+                "64",
                 "--jax-precompile-prefill-token-paddings",
                 "16384",
+                "--chunked-prefill-size",
+                "-1",
+                "--attention-backend",
+                "fa",
+                "--max-running-requests",
+                "64",
             ],
             env={
                 "JAX_COMPILATION_CACHE_DIR": "/tmp/jax_compilation_cache",
@@ -67,57 +73,58 @@ class TestEvalAccuracyLarge(CustomTestCase):
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
 
-    # def test_mmlu(self):
-    #     args = SimpleNamespace(
-    #         base_url=self.base_url,
-    #         model=self.model,
-    #         eval_name="mmlu",
-    #         num_examples=5000,
-    #         num_threads=1024,
-    #     )
+    def test_mmlu(self):
+        args = SimpleNamespace(
+            base_url=self.base_url,
+            model=self.model,
+            eval_name="mmlu",
+            num_examples=1024,
+            num_threads=1024,
+        )
 
-    #     metrics = run_eval(args)
+        metrics = run_eval(args)
 
-    #     if is_in_ci():
-    #         write_github_step_summary(f"### test_mmlu\n" f'{metrics["score"]=:.4f}\n')
+        if is_in_ci():
+            write_github_step_summary(f"### test_mmlu\n" f'{metrics["score"]=:.4f}\n')
+        print("mmlu metrics", metrics)
 
-    #     self.assertGreater(metrics["score"], 0.70)
+        self.assertGreater(metrics["score"], 0.43)
 
-    # def test_human_eval(self):
-    #     args = SimpleNamespace(
-    #         base_url=self.base_url,
-    #         model=self.model,
-    #         eval_name="humaneval",
-    #         num_examples=None,
-    #         num_threads=1024,
-    #     )
+    def test_human_eval(self):
+        args = SimpleNamespace(
+            base_url=self.base_url,
+            model=self.model,
+            eval_name="humaneval",
+            num_examples=None,
+            num_threads=1024,
+        )
 
-    #     metrics = run_eval(args)
+        metrics = run_eval(args)
 
-    #     if is_in_ci():
-    #         write_github_step_summary(
-    #             f"### test_human_eval\n" f'{metrics["score"]=:.4f}\n'
-    #         )
+        if is_in_ci():
+            write_github_step_summary(
+                f"### test_human_eval\n" f'{metrics["score"]=:.4f}\n'
+            )
+        print("human eval metrics", metrics)
+        self.assertGreater(metrics["score"], 0.3)
 
-    #     self.assertGreater(metrics["score"], 0.64)
+    def test_mgsm_en(self):
+        args = SimpleNamespace(
+            base_url=self.base_url,
+            model=self.model,
+            eval_name="mgsm_en",
+            num_examples=1024,
+            num_threads=1024,
+        )
 
-    # def test_mgsm_en(self):
-    #     args = SimpleNamespace(
-    #         base_url=self.base_url,
-    #         model=self.model,
-    #         eval_name="mgsm_en",
-    #         num_examples=None,
-    #         num_threads=1024,
-    #     )
+        metrics = run_eval(args)
 
-    #     metrics = run_eval(args)
-
-    #     if is_in_ci():
-    #         write_github_step_summary(
-    #             f"### test_mgsm_en\n" f'{metrics["score"]=:.4f}\n'
-    #         )
-
-    #     self.assertGreater(metrics["score"], 0.835)
+        if is_in_ci():
+            write_github_step_summary(
+                f"### test_mgsm_en\n" f'{metrics["score"]=:.4f}\n'
+            )
+        print("mgsm en metrics", metrics)
+        self.assertGreater(metrics["score"], 0.4)
 
 
 if __name__ == "__main__":

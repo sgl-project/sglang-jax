@@ -156,7 +156,7 @@ jobs:
           sky exec "$CLUSTER_NAME" -- 'set -e; if [ ! -d "human-eval" ] || [ -z "$(ls -A human-eval)" ]; then git clone https://github.com/merrymercy/human-eval.git; fi; cd human-eval; uv pip install -e .'
 
       - name: Evaluate accuracy
-        timeout-minutes: 50
+        timeout-minutes: 60
         run: |
           source ~/sky/bin/activate
           CLUSTER_NAME=$(bash scripts/get_cluster_name.sh tpu-v6e-1 ${{ github.ref }} accuracy)
