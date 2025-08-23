@@ -70,45 +70,38 @@ def create_qkv_cache(
 
 
 def write_prefix_tokens_for_kv(forward_batch, lens, k, v):
+    page_size = forward_batch.attn_backend.page_size
     # Use aligned positions for k/v indexing since k/v arrays are created with alignment gaps
     aligned_seq_lens = (
-        forward_batch.attn_backend.forward_metadata.cu_kv_lens[1:]
-        - forward_batch.attn_backend.forward_metadata.cu_kv_lens[:-1]
-    )
+        (forward_batch.seq_lens + page_size - 1) // page_size
+    ) * page_size
     aligned_cache_loc_idx = jnp.concatenate(
         [jnp.array([0], dtype=jnp.int32), jnp.cumsum(aligned_seq_lens)]
-    )
-
-    # But use actual seq_lens for cache_loc indexing
-    actual_cache_loc_idx = jnp.concatenate(
-        [jnp.array([0], dtype=jnp.int32), jnp.cumsum(forward_batch.seq_lens)]
     )
 
     extend_k = []
     extend_v = []
     for i, (q_len, kv_len) in enumerate(lens):
-        # Use actual positions for cache_loc
-        actual_start = actual_cache_loc_idx[i]
-        actual_prefix_end = actual_start + (kv_len - q_len)
-        actual_extend_start = actual_prefix_end
-        actual_extend_end = actual_start + kv_len
+        start = aligned_cache_loc_idx[i]
+        prefix_end = start + (kv_len - q_len)
+        extend_start = prefix_end
+        extend_end = start + kv_len
 
-        # Use aligned positions for k/v array indexing
-        aligned_start = aligned_cache_loc_idx[i]
-        aligned_extend_start = aligned_start + (kv_len - q_len)
-        aligned_extend_end = aligned_start + kv_len
+        print(
+            f"start: {start}, prefix_end: {prefix_end}, extend_start: {extend_start}, extend_end: {extend_end}"
+        )
 
         if kv_len > q_len:
             # write prefix token
-            prefix_cache_loc = forward_batch.cache_loc[actual_start:actual_prefix_end]
-            prefix_k = k[aligned_start : aligned_start + (kv_len - q_len)]
-            prefix_v = v[aligned_start : aligned_start + (kv_len - q_len)]
+            prefix_cache_loc = forward_batch.cache_loc[start:prefix_end]
+            prefix_k = k[start:prefix_end]
+            prefix_v = v[start:prefix_end]
             forward_batch.token_to_kv_pool.set_kv_buffer(
                 0, prefix_cache_loc, prefix_k, prefix_v
             )
 
-        extend_k.append(k[aligned_extend_start:aligned_extend_end])
-        extend_v.append(v[aligned_extend_start:aligned_extend_end])
+        extend_k.append(k[extend_start:extend_end])
+        extend_v.append(v[extend_start:extend_end])
 
     return jnp.concatenate(extend_k), jnp.concatenate(extend_v)
 
@@ -158,27 +151,27 @@ def create_test_data(
     # create q, k v
     q, k, v = create_qkv_cache(lens, num_heads, head_dim, num_kv_heads, page_size)
 
-    # cache loc - create cache locations with actual token indices and padding zeros
-    cache_loc = []
-    current_token_idx = 1  # Start from 1 for actual tokens
+    # cache loc - match schedule_batch.py logic with align_to_size
+    def align_to_size(l, size, value=0):
+        align_len = (len(l) + size - 1) // size * size
+        return l + [value] * (align_len - len(l))
+
+    cache_loc_flat = []
+    current_aligned_pos = 0  # Track aligned position in k/v cache
 
     for i, (_, kv_len) in enumerate(lens):
-        aligned_len = aligned_seq_lens[i]
-        # Add actual token positions (starting from current_token_idx)
-        actual_positions = jnp.arange(
-            current_token_idx, current_token_idx + kv_len, dtype=jnp.int32
+        # Create token indices for this sequence based on actual k/v storage position
+        seq_token_indices = list(
+            range(current_aligned_pos, current_aligned_pos + kv_len)
         )
-        cache_loc.append(actual_positions)
-        # Add padding positions as zeros
-        padding_len = aligned_len - kv_len
-        if padding_len > 0:
-            padding_positions = jnp.zeros(padding_len, dtype=jnp.int32)
-            cache_loc.append(padding_positions)
-        current_token_idx += (
-            kv_len + 4
-        )  # Add gap between sequences (like 1-5, then 9-13)
+        # Apply alignment padding to this sequence
+        aligned_seq_indices = align_to_size(seq_token_indices, page_size, 0)
+        cache_loc_flat.extend(aligned_seq_indices)
+        # Move to next aligned position (matches k/v storage)
+        aligned_len = ((kv_len + page_size - 1) // page_size) * page_size
+        current_aligned_pos += aligned_len
 
-    cache_loc = jnp.concatenate(cache_loc)
+    cache_loc = jnp.array(cache_loc_flat, dtype=jnp.int32)
     if mode == "prefill":
         # out_cache_loc - use aligned seq_lens for cache indexing
         cache_loc_idx = jnp.concatenate(
@@ -286,6 +279,7 @@ class TestAttention(CustomTestCase):
         print(f"cu_q_lens: {forward_batch.attn_backend.forward_metadata.cu_q_lens}")
         print(f"cu_kv_lens: {forward_batch.attn_backend.forward_metadata.cu_kv_lens}")
         print(f"cache_loc: {forward_batch.cache_loc[:100]}")
+        print(f"cache_loc[100:200]: {forward_batch.cache_loc[100:200]}")
         print(f"out_cache_loc: {forward_batch.out_cache_loc[:100]}")
         print()
 
@@ -313,20 +307,18 @@ class TestAttention(CustomTestCase):
 
         padding_size = 4096
         cache_loc_list = []
-        # Use aligned cache locations for start computation
+
         aligned_seq_lens = (
-            forward_batch.attn_backend.forward_metadata.cu_kv_lens[1:]
-            - forward_batch.attn_backend.forward_metadata.cu_kv_lens[:-1]
-        )
+            (forward_batch.seq_lens + page_size - 1) // page_size
+        ) * page_size
         cache_start_loc = jnp.concatenate(
             [jnp.zeros(1, dtype=jnp.int32), jnp.cumsum(aligned_seq_lens)]
         )
         for i in range(forward_batch.batch_size):
             start = cache_start_loc[i]
-            # Only use actual sequence length for the valid portion
-            actual_seq_len = forward_batch.seq_lens[i]
-            cache_loc = forward_batch.cache_loc[start : start + actual_seq_len]
-            padded_size = padding_size - actual_seq_len
+            end = start + forward_batch.seq_lens[i]
+            cache_loc = forward_batch.cache_loc[start:end]
+            padded_size = padding_size - forward_batch.seq_lens[i]
             padded_cache_loc = jnp.pad(cache_loc, (0, padded_size), constant_values=0)
             cache_loc_list.append(padded_cache_loc)
         page_table = jnp.stack(cache_loc_list)
@@ -336,6 +328,13 @@ class TestAttention(CustomTestCase):
 
         page_table_np = np.asarray(page_table)
         print(f"page_table_np: {page_table_np}")
+        print(f"k_pages.shape: {k_pages.shape}")
+        print(f"v_pages.shape: {v_pages.shape}")
+        print(f"q.shape: {q.shape}")
+        print(f"seq_lens: {forward_batch.seq_lens}")
+        print(f"cu_q_lens: {forward_batch.attn_backend.forward_metadata.cu_q_lens}")
+        print(f"num_seqs: {forward_batch.attn_backend.forward_metadata.num_seqs}")
+        print(f"page_table.shape: {page_table.shape}")
 
         expected = ref_ragged_paged_attention(
             q.reshape(q.shape[0], num_heads, head_dim),
@@ -457,18 +456,51 @@ class TestAttention(CustomTestCase):
             "decode", lens, (num_heads, head_dim, num_kv_heads, 1, jnp.bfloat16)
         )
 
-    def test_mha_prefill_accuracy_page_size_4(self):
+    def test_mha_prefill_accuracy_page_size_8_success(self):
         """Test JAX attention accuracy against PyTorch reference"""
         # Parameters
         num_heads = 32
         num_kv_heads = 32
         head_dim = 128
         lens = [
-            (5, 5),  # (10, 10) will failed
+            (5, 5),
             (5, 5),
         ]
         self.run_test(
             "prefill", lens, (num_heads, head_dim, num_kv_heads, 8, jnp.bfloat16)
+        )
+
+    def test_mha_prefill_accuracy_page_size_8_failed(self):
+        """
+        Test JAX attention accuracy against PyTorch reference
+        This test case will failed when batch size > 2, the second batch tokens will has wrong value, the first and third batch tokens are correct.
+        """
+        # Parameters
+        num_heads = 32
+        num_kv_heads = 32
+        head_dim = 128
+        lens = [
+            (5, 5),
+            (5, 5),
+            (5, 5),
+        ]
+        self.run_test(
+            "prefill", lens, (num_heads, head_dim, num_kv_heads, 8, jnp.bfloat16)
+        )
+
+    def test_mha_decode_accuracy_page_size_8(self):
+        """Test JAX attention accuracy against native fa"""
+        # Parameters
+        num_heads = 32
+        num_kv_heads = 32
+        head_dim = 128
+        lens = [
+            (1, 3),
+            (1, 5),
+            (1, 5),
+        ]
+        self.run_test(
+            "decode", lens, (num_heads, head_dim, num_kv_heads, 8, jnp.bfloat16)
         )
 
     def test_mha_prefill_accuracy_page_size_64(self):
