@@ -19,6 +19,19 @@ mesh = create_device_mesh(ici_parallelism=[1, -1, 1, 1], dcn_parallelism=[1, 1, 
 jax.sharding.set_mesh(mesh)
 
 
+def unique_in_original_order(arr: jax.Array) -> jax.Array:
+    unique_info = jnp.unique_all(arr)
+    unique_values = unique_info.values
+    original_indices = unique_info.indices
+
+    # Sort the original indices to get the correct order
+    sorted_order = jnp.argsort(original_indices)
+
+    # Reorder the unique values based on the sorted indices
+    unique_in_original_order = unique_values[sorted_order]
+    return unique_in_original_order
+
+
 def create_qkv_cache(
     lens,
     num_heads,
@@ -318,28 +331,20 @@ class TestAttention(CustomTestCase):
             start = cache_start_loc[i]
             end = start + forward_batch.seq_lens[i]
             cache_loc = forward_batch.cache_loc[start:end]
-            padded_size = padding_size - forward_batch.seq_lens[i]
-            padded_cache_loc = jnp.pad(cache_loc, (0, padded_size), constant_values=0)
-            cache_loc_list.append(padded_cache_loc)
+            page_indices_for_seq = cache_loc // page_size
+            page_indices_unique = unique_in_original_order(page_indices_for_seq)
+            padded_page_indices = jnp.pad(
+                jnp.array(page_indices_unique, dtype=jnp.int32),
+                (0, padding_size - len(page_indices_unique)),
+                constant_values=0,
+            )
+            cache_loc_list.append(padded_page_indices)
         page_table = jnp.stack(cache_loc_list)
-
-        k_pages = k.reshape(k.shape[0] // page_size, page_size, num_kv_heads, head_dim)
-        v_pages = v.reshape(v.shape[0] // page_size, page_size, num_kv_heads, head_dim)
-
-        page_table_np = np.asarray(page_table)
-        print(f"page_table_np: {page_table_np}")
-        print(f"k_pages.shape: {k_pages.shape}")
-        print(f"v_pages.shape: {v_pages.shape}")
-        print(f"q.shape: {q.shape}")
-        print(f"seq_lens: {forward_batch.seq_lens}")
-        print(f"cu_q_lens: {forward_batch.attn_backend.forward_metadata.cu_q_lens}")
-        print(f"num_seqs: {forward_batch.attn_backend.forward_metadata.num_seqs}")
-        print(f"page_table.shape: {page_table.shape}")
 
         expected = ref_ragged_paged_attention(
             q.reshape(q.shape[0], num_heads, head_dim),
-            k_pages,
-            v_pages,
+            k.reshape(k.shape[0] // page_size, page_size, num_kv_heads, head_dim),
+            v.reshape(v.shape[0] // page_size, page_size, num_kv_heads, head_dim),
             forward_batch.seq_lens,
             page_table,
             forward_batch.attn_backend.forward_metadata.cu_q_lens,
@@ -348,7 +353,7 @@ class TestAttention(CustomTestCase):
         )
         jax.block_until_ready(expected)
 
-        @jax.jit
+        # @jax.jit
         def jit_attn(q, k, v, forward_batch):
             out = attn(q, k, v, forward_batch)
             return out
@@ -456,21 +461,7 @@ class TestAttention(CustomTestCase):
             "decode", lens, (num_heads, head_dim, num_kv_heads, 1, jnp.bfloat16)
         )
 
-    def test_mha_prefill_accuracy_page_size_8_success(self):
-        """Test JAX attention accuracy against PyTorch reference"""
-        # Parameters
-        num_heads = 32
-        num_kv_heads = 32
-        head_dim = 128
-        lens = [
-            (5, 5),
-            (5, 5),
-        ]
-        self.run_test(
-            "prefill", lens, (num_heads, head_dim, num_kv_heads, 8, jnp.bfloat16)
-        )
-
-    def test_mha_prefill_accuracy_page_size_8_failed(self):
+    def test_mha_prefill_accuracy_page_size_8(self):
         """
         Test JAX attention accuracy against PyTorch reference
         This test case will failed when batch size > 2, the second batch tokens will has wrong value, the first and third batch tokens are correct.
@@ -480,8 +471,8 @@ class TestAttention(CustomTestCase):
         num_kv_heads = 32
         head_dim = 128
         lens = [
-            (5, 5),
-            (5, 5),
+            (5, 17),
+            (5, 33),
             (5, 5),
         ]
         self.run_test(
@@ -495,8 +486,8 @@ class TestAttention(CustomTestCase):
         num_kv_heads = 32
         head_dim = 128
         lens = [
-            (1, 3),
-            (1, 5),
+            (1, 17),
+            (1, 6),
             (1, 5),
         ]
         self.run_test(

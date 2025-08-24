@@ -1,8 +1,8 @@
 """
-简化的JAX版本Flash Attention模拟器
+Simplified JAX Flash Attention Simulator
 
-这个版本避免了复杂的动态操作，专注于模拟核心的attention计算逻辑，
-便于调试page_size > 1情况下的精度问题。
+This version avoids complex dynamic operations and focuses on simulating core attention computation logic,
+making it easier to debug precision issues when page_size > 1.
 """
 
 import functools
@@ -16,7 +16,7 @@ DEFAULT_MASK_VALUE = -0.7 * float(jnp.finfo(jnp.dtype("float32")).max)
 
 
 def cdiv(a, b):
-    """向上整除"""
+    """Ceiling division"""
     return (a + b - 1) // b
 
 
@@ -39,15 +39,15 @@ def simple_jax_ragged_paged_attention_simulator(
     debug_print: bool = True,
 ) -> jax.Array:
     """
-    简化的JAX模拟器版本的ragged paged attention
+    Simplified JAX simulator version of ragged paged attention
 
-    这个版本重建KV cache为完整格式，然后使用与ref_ragged_paged_attention类似的逻辑，
-    但加入了对page alignment的模拟。
+    This version reconstructs the KV cache into full format, then uses logic similar to ref_ragged_paged_attention,
+    but with simulation of page alignment.
     """
     if mask_value is None:
         mask_value = DEFAULT_MASK_VALUE
 
-    # 获取基本形状信息
+    # Get basic shape information
     num_q_tokens, num_q_heads, head_dim = q.shape
     total_pages, page_size, num_kv_heads, _ = k_cache.shape
     num_q_heads_per_kv_head = num_q_heads // num_kv_heads
@@ -67,11 +67,11 @@ def simple_jax_ragged_paged_attention_simulator(
         print(f"page_indices shape: {page_indices.shape}")
         print(f"page_indices: {page_indices}")
 
-    # 重建完整的KV缓存
-    # 计算总的对齐KV长度
+    # Reconstruct complete KV cache
+    # Calculate total aligned KV length
     max_aligned_kv_len = jnp.max(cu_kv_lens)
 
-    # 创建重建后的K, V数组
+    # Create reconstructed K, V arrays
     k_reconstructed = jnp.zeros(
         (max_aligned_kv_len, num_kv_heads, head_dim), dtype=k_cache.dtype
     )
@@ -79,7 +79,7 @@ def simple_jax_ragged_paged_attention_simulator(
         (max_aligned_kv_len, num_kv_heads, head_dim), dtype=v_cache.dtype
     )
 
-    # 重建每个序列的KV数据
+    # Reconstruct KV data for each sequence
     for seq_idx in range(int(num_seqs[0])):
         kv_start = cu_kv_lens[seq_idx]
         kv_end = cu_kv_lens[seq_idx + 1]
@@ -91,14 +91,14 @@ def simple_jax_ragged_paged_attention_simulator(
                 f"  kv_start: {kv_start}, kv_end: {kv_end}, aligned_kv_len: {aligned_kv_len}"
             )
 
-        # 计算这个序列需要的页面范围
-        start_page_idx = kv_start // page_size
-        end_page_idx = cdiv(kv_end, page_size)
+        # Calculate page range needed for this sequence - aligned with pallas kernel logic
+        start_page_idx = cdiv(cu_kv_lens[seq_idx], page_size)
+        end_page_idx = cdiv(cu_kv_lens[seq_idx + 1], page_size)
 
         if debug_print:
             print(f"  start_page_idx: {start_page_idx}, end_page_idx: {end_page_idx}")
 
-        # 收集页面数据
+        # Collect page data
         seq_k_pages = []
         seq_v_pages = []
 
@@ -113,25 +113,24 @@ def simple_jax_ragged_paged_attention_simulator(
                         f"    page_offset {page_offset}: abs_page_idx {abs_page_idx} -> page_idx {page_idx}"
                     )
 
-        # 拼接页面
+        # Concatenate pages
         if seq_k_pages:
             seq_k_full = jnp.concatenate(seq_k_pages, axis=0)
             seq_v_full = jnp.concatenate(seq_v_pages, axis=0)
 
-            # 计算在页面拼接数组中的有效范围
-            in_page_start = kv_start % (len(seq_k_pages) * page_size)
-            in_page_end = in_page_start + aligned_kv_len  # 使用对齐长度，这是关键！
+            # Calculate valid range in page concatenated array
+            in_page_start = 0
+            in_page_end = aligned_kv_len  # Use aligned length, this is key!
             in_page_end = min(in_page_end, seq_k_full.shape[0])
 
             if debug_print:
                 print(f"  seq_k_full.shape: {seq_k_full.shape}")
                 print(f"  in_page_start: {in_page_start}, in_page_end: {in_page_end}")
 
-            # 提取对齐长度的数据
+            # Extract data with aligned length
             seq_k = seq_k_full[in_page_start:in_page_end]
             seq_v = seq_v_full[in_page_start:in_page_end]
 
-            # 放入重建数组的正确位置
             k_reconstructed = k_reconstructed.at[kv_start:kv_end].set(seq_k)
             v_reconstructed = v_reconstructed.at[kv_start:kv_end].set(seq_v)
 
@@ -140,7 +139,7 @@ def simple_jax_ragged_paged_attention_simulator(
         print(f"k_reconstructed.shape: {k_reconstructed.shape}")
         print(f"v_reconstructed.shape: {v_reconstructed.shape}")
 
-    # 现在使用重建后的KV执行类似ref_ragged_paged_attention的逻辑
+    # Now use reconstructed KV to execute logic similar to ref_ragged_paged_attention
     outputs = []
     for i in range(int(num_seqs[0])):
         q_start = cu_q_lens[i]
@@ -151,7 +150,6 @@ def simple_jax_ragged_paged_attention_simulator(
         kv_end = cu_kv_lens[i + 1]
         aligned_kv_len = kv_end - kv_start
 
-        # 获取实际序列长度（这是关键差异！）
         if i < seq_lens.shape[0]:
             actual_kv_len = seq_lens[i]
         else:
@@ -164,10 +162,7 @@ def simple_jax_ragged_paged_attention_simulator(
             print(f"  kv_start: {kv_start}, kv_end: {kv_end}")
             print(f"  aligned_kv_len: {aligned_kv_len}, actual_kv_len: {actual_kv_len}")
 
-        # 获取query
         seq_q = q[q_start:q_end]
-
-        # 获取重建后的KV，但只取实际长度
         seq_k = k_reconstructed[kv_start : kv_start + actual_kv_len]
         seq_v = v_reconstructed[kv_start : kv_start + actual_kv_len]
 
@@ -176,7 +171,6 @@ def simple_jax_ragged_paged_attention_simulator(
             print(f"  seq_k.shape: {seq_k.shape}")
             print(f"  seq_v.shape: {seq_v.shape}")
 
-        # 应用K/V缩放
         if k_scale is not None:
             seq_k = seq_k.astype(jnp.float32) * k_scale
             seq_k = seq_k.astype(seq_q.dtype)
@@ -184,21 +178,21 @@ def simple_jax_ragged_paged_attention_simulator(
             seq_v = seq_v.astype(jnp.float32) * v_scale
             seq_v = seq_v.astype(seq_q.dtype)
 
-        # 处理GQA：重复KV heads
+        # Process GQA: repeat KV heads
         seq_k = jnp.repeat(seq_k, num_q_heads_per_kv_head, axis=1)
         seq_v = jnp.repeat(seq_v, num_q_heads_per_kv_head, axis=1)
 
-        # 计算attention
         attn = jnp.einsum(
             "qhd,khd->hqk", seq_q, seq_k, preferred_element_type=jnp.float32
         )
         attn *= sm_scale
 
-        # 构建causal mask - 关键：与原kernel保持一致的逻辑
+        # Build causal mask - key: match original kernel logic
         q_span = (actual_kv_len - q_len) + jax.lax.broadcasted_iota(
             jnp.int32, attn.shape, 1
         )
         kv_span = jax.lax.broadcasted_iota(jnp.int32, attn.shape, 2)
+
         mask = q_span < kv_span
 
         if sliding_window is not None:
@@ -223,76 +217,3 @@ def simple_jax_ragged_paged_attention_simulator(
         print("=== End Simple JAX Simulator Debug Info ===\n")
 
     return final_output
-
-
-def test_simple_simulator():
-    """测试简化模拟器的基本功能"""
-    # 创建测试数据
-    page_size = 8
-    num_q_heads = 4
-    num_kv_heads = 2
-    head_dim = 64
-
-    # 测试案例：3个序列，复现失败的情况
-    seq_lens = jnp.array([5, 5, 5], dtype=jnp.int32)  # 实际序列长度
-    aligned_seq_lens = (
-        (seq_lens + page_size - 1) // page_size
-    ) * page_size  # 对齐后的长度
-
-    total_q_tokens = jnp.sum(seq_lens)
-    total_aligned_kv = jnp.sum(aligned_seq_lens)
-    total_pages = total_aligned_kv // page_size
-
-    print(f"Test setup:")
-    print(f"seq_lens: {seq_lens}")
-    print(f"aligned_seq_lens: {aligned_seq_lens}")
-    print(f"total_q_tokens: {total_q_tokens}")
-    print(f"total_aligned_kv: {total_aligned_kv}")
-    print(f"total_pages: {total_pages}")
-
-    # 创建测试输入
-    key = jax.random.PRNGKey(42)
-    q = jax.random.normal(
-        key, (total_q_tokens, num_q_heads, head_dim), dtype=jnp.bfloat16
-    )
-    k_cache = jax.random.normal(
-        jax.random.split(key, 2)[0],
-        (total_pages, page_size, num_kv_heads, head_dim),
-        dtype=jnp.bfloat16,
-    )
-    v_cache = jax.random.normal(
-        jax.random.split(key, 2)[1],
-        (total_pages, page_size, num_kv_heads, head_dim),
-        dtype=jnp.bfloat16,
-    )
-
-    page_indices = jnp.arange(total_pages, dtype=jnp.int32)
-    cu_q_lens = jnp.concatenate([jnp.array([0]), jnp.cumsum(seq_lens)])
-    cu_kv_lens = jnp.concatenate([jnp.array([0]), jnp.cumsum(aligned_seq_lens)])
-    num_seqs = jnp.array([3])
-
-    print(f"cu_q_lens: {cu_q_lens}")
-    print(f"cu_kv_lens: {cu_kv_lens}")
-
-    # 运行简化模拟器
-    output = simple_jax_ragged_paged_attention_simulator(
-        q,
-        k_cache,
-        v_cache,
-        page_indices,
-        cu_q_lens,
-        cu_kv_lens,
-        num_seqs,
-        seq_lens,
-        sm_scale=1.0 / jnp.sqrt(head_dim),
-        debug_print=True,
-    )
-
-    print(f"Final test output shape: {output.shape}")
-    print("Simple test completed!")
-
-    return output
-
-
-if __name__ == "__main__":
-    test_simple_simulator()
