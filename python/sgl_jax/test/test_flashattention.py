@@ -353,7 +353,7 @@ class TestAttention(CustomTestCase):
         )
         jax.block_until_ready(expected)
 
-        # @jax.jit
+        @jax.jit
         def jit_attn(q, k, v, forward_batch):
             out = attn(q, k, v, forward_batch)
             return out

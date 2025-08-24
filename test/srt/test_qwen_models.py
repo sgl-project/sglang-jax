@@ -60,7 +60,7 @@ class TestQwenModel(CustomTestCase):
         )
 
         metrics = run_eval(args)
-        self.assertGreater(metrics["score"], 0.2)
+        self.assertGreater(metrics["score"], 0.45)
 
 
 if __name__ == "__main__":

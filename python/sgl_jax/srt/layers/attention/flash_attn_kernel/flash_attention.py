@@ -35,6 +35,11 @@ DEFAULT_MASK_VALUE = -0.7 * float(jnp.finfo(jnp.dtype("float32")).max)
 TUNED_BLOCK_SIZES = {
     "TPU v6": {
         # (q_dtype, kv_dtype, num_kv_heads_per_blk, head_dim, page_size)
+        ("bfloat16", "bfloat16", 2, 128, 64): (32, 64),
+        ("bfloat16", "bfloat16", 4, 128, 64): (32, 64),
+        ("bfloat16", "bfloat16", 8, 128, 64): (16, 64),
+        ("bfloat16", "bfloat16", 16, 128, 64): (16, 64),
+        ("bfloat16", "bfloat16", 32, 128, 64): (16, 64),
         ("bfloat16", "bfloat16", 2, 128, 128): (16, 32),
         ("bfloat16", "bfloat16", 4, 128, 128): (8, 32),
         ("bfloat16", "bfloat16", 8, 128, 128): (16, 32),
@@ -381,23 +386,10 @@ def ragged_paged_attention_kernel(
         q_end = cu_q_lens_ref[cur_seq_idx + 1]
         q_len = q_end - q_start
         kv_start = cu_kv_lens_ref[cur_seq_idx]
-        kv_end = cu_kv_lens_ref[cur_seq_idx + 1]  # 保持页面计算的一致性
+        kv_end = cu_kv_lens_ref[cur_seq_idx + 1]
         kv_len = kv_end - kv_start
 
-        # 安全地获取实际序列长度，添加边界检查
-        actual_kv_len = lax.select(
-            cur_seq_idx < seq_lens_ref.shape[0],
-            seq_lens_ref[cur_seq_idx],
-            kv_len,  # 如果越界，使用对齐长度作为fallback
-        )
-
-        # 确保 actual_kv_len 不超过对齐长度，并且不为负数
-        actual_kv_len = jnp.minimum(jnp.maximum(actual_kv_len, 0), kv_len)
-
-        pl.debug_print("cur_seq_idx={}", cur_seq_idx)
-        pl.debug_print("seq_lens_ref.shape[0]={}", seq_lens_ref.shape[0])
-        pl.debug_print("actual_kv_len={}", actual_kv_len)
-        pl.debug_print("aligned_kv_len={}", kv_len)
+        actual_kv_len = seq_lens_ref[cur_seq_idx]
 
         def get_next_prefetch_ids(heads_blk_idx, cur_seq_idx, kv_blk_idx, cur_buf_idx):
             next_kv_blk_idx = kv_blk_idx + 1
@@ -436,7 +428,7 @@ def ragged_paged_attention_kernel(
             head_acc_ref,  # [num_q_per_blk, num_q_heads_per_kv_head, head_dim]
             *,
             kv_blk_idx,
-            actual_kv_len,  # 新增：实际序列长度
+            actual_kv_len,
         ):
             assert q.shape == (
                 num_q_per_blk * num_q_heads_per_kv_head,
@@ -478,9 +470,7 @@ def ragged_paged_attention_kernel(
                     kv_blk_idx == 0, jnp.full_like(ref, init_val), ref[...]
                 )
 
-            # kv lens will be contracting dim, we should mask out the NaNs.
-            # 使用实际序列长度而不是对齐长度，但确保不会是负数
-            effective_kv_len = jnp.maximum(actual_kv_len - kv_len_start, 0)
+            effective_kv_len = actual_kv_len - kv_len_start
             kv_mask = lax.broadcasted_iota(jnp.int32, k.shape, 0) < effective_kv_len
             k = jnp.where(kv_mask, k.astype(jnp.float32), 0).astype(k.dtype)
             v = jnp.where(kv_mask, v.astype(jnp.float32), 0).astype(v.dtype)

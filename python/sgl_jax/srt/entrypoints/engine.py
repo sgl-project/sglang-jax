@@ -354,6 +354,7 @@ def _set_envs_and_config():
             logger.warning(
                 f"Child process unexpectedly failed with {exitcode=}. {pid=}"
             )
+            logger.warning(f"Child process {pid=} frame={frame}")
 
     signal.signal(signal.SIGCHLD, sigchld_handler)
 

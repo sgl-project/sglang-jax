@@ -21,7 +21,7 @@ def benchmark_backend(
 ):
     if backend_type == "flash":
         if mode == "prefill":
-            q, k, v, _, page_indices, cu_q_lens, cu_kv_lens, num_seqs, _, _ = (
+            q, k, v, _, page_indices, cu_q_lens, cu_kv_lens, num_seqs, seq_lens, _ = (
                 create_prefill_uniform_data(
                     batch_size,
                     seq_len,
@@ -32,7 +32,7 @@ def benchmark_backend(
                 )
             )
         elif mode == "decode":
-            q, k, v, _, page_indices, cu_q_lens, cu_kv_lens, num_seqs, _, _ = (
+            q, k, v, _, page_indices, cu_q_lens, cu_kv_lens, num_seqs, seq_lens, _ = (
                 create_decode_uniform_data(
                     batch_size, seq_len, max_kv_cache_tokens_num, num_heads, head_dim
                 )
@@ -52,6 +52,7 @@ def benchmark_backend(
             cu_q_lens,
             cu_kv_lens,
             num_seqs,
+            seq_lens,
             sm_scale,
         ):
             return ragged_paged_attention(
@@ -62,6 +63,7 @@ def benchmark_backend(
                 cu_q_lens,
                 cu_kv_lens,
                 num_seqs,
+                seq_lens,
                 sm_scale=sm_scale,
                 num_kv_pages_per_block=8,
                 num_queries_per_block=32,
@@ -76,6 +78,7 @@ def benchmark_backend(
             cu_q_lens,
             cu_kv_lens,
             num_seqs,
+            seq_lens,
             head_dim**-0.5,
         )
     else:

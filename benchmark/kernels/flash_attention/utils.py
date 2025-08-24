@@ -115,7 +115,7 @@ def create_decode_uniform_data(
     seed=42,
 ):
     seq_len_cpu = uniform_kv_len + 1
-    seq_len = jnp.array([seq_len_cpu] * batch_size, dtype=jnp.int32)
+    seq_lens = jnp.array([seq_len_cpu] * batch_size, dtype=jnp.int32)
     cu_q_lens = jnp.concatenate(
         [
             jnp.array([0], dtype=jnp.int32),
@@ -142,7 +142,7 @@ def create_decode_uniform_data(
         seed=seed,
     )
     page_indices, cache_loc = create_page_indices_data(
-        batch_size, batch_size * uniform_kv_len, seq_len, page_size=page_size
+        batch_size, batch_size * uniform_kv_len, seq_lens, page_size=page_size
     )
     num_seqs = jnp.array([batch_size], dtype=jnp.int32)
     return (
@@ -154,6 +154,6 @@ def create_decode_uniform_data(
         cu_q_lens,
         cu_kv_lens,
         num_seqs,
-        seq_len,
+        seq_lens,
         cache_loc,
     )

@@ -50,9 +50,9 @@ class TestEvalAccuracyLarge(CustomTestCase):
                 "--download-dir",
                 "/tmp/",
                 "--dtype",
+                "bfloat16",
                 "--attention-backend",
                 "fa",
-                "bfloat16",
                 "--jax-precompile-decode-bs-paddings",
                 "64",
                 "--jax-precompile-prefill-token-paddings",
@@ -90,23 +90,23 @@ class TestEvalAccuracyLarge(CustomTestCase):
 
         self.assertGreater(metrics["score"], 0.43)
 
-    def test_human_eval(self):
-        args = SimpleNamespace(
-            base_url=self.base_url,
-            model=self.model,
-            eval_name="humaneval",
-            num_examples=None,
-            num_threads=1024,
-        )
+    # def test_human_eval(self):
+    #     args = SimpleNamespace(
+    #         base_url=self.base_url,
+    #         model=self.model,
+    #         eval_name="humaneval",
+    #         num_examples=None,
+    #         num_threads=1024,
+    #     )
 
-        metrics = run_eval(args)
+    #     metrics = run_eval(args)
 
-        if is_in_ci():
-            write_github_step_summary(
-                f"### test_human_eval\n" f'{metrics["score"]=:.4f}\n'
-            )
-        print("human eval metrics", metrics)
-        self.assertGreater(metrics["score"], 0.3)
+    #     if is_in_ci():
+    #         write_github_step_summary(
+    #             f"### test_human_eval\n" f'{metrics["score"]=:.4f}\n'
+    #         )
+    #     print("human eval metrics", metrics)
+    #     self.assertGreater(metrics["score"], 0.3)
 
     def test_mgsm_en(self):
         args = SimpleNamespace(

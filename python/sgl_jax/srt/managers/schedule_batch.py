@@ -700,7 +700,10 @@ class ScheduleBatch:
                 prefix_lens_device,
             )
             out_cache_loc = self.alloc_paged_token_slots_extend(
-                prefix_lens, seq_lens, jax.device_get(last_loc).tolist(), extend_num_tokens
+                prefix_lens,
+                seq_lens,
+                jax.device_get(last_loc).tolist(),
+                extend_num_tokens,
             )
 
         # Set fields
@@ -756,6 +759,14 @@ class ScheduleBatch:
     def retract_decode(self, server_args: ServerArgs):
         """Retract the decoding requests when there is not enough memory."""
         sorted_indices = list(range(len(self.reqs)))
+
+        sorted_indices.sort(
+            key=lambda i: (
+                len(self.reqs[i].output_ids),
+                -len(self.reqs[i].origin_input_ids),
+            ),
+            reverse=True,
+        )
 
         def get_required_tokens(num_reqs: int):
             return num_reqs * global_config.retract_decode_steps
@@ -871,7 +882,8 @@ class ScheduleBatch:
                 self.req_pool_indices, self.seq_lens - 2
             ]
             self.out_cache_loc = self.alloc_paged_token_slots_decode(
-                jax.device_get(self.seq_lens).tolist(), jax.device_get(last_loc).tolist()
+                jax.device_get(self.seq_lens).tolist(),
+                jax.device_get(last_loc).tolist(),
             )
 
         self.req_to_token_pool.write(
@@ -1096,6 +1108,8 @@ class ScheduleBatch:
                 (0, total_cache_loc_size - len(cache_loc_flat)),
                 constant_values=0,
             )
+        else:
+            cache_loc_cpu = np.array(cache_loc_flat, dtype=np.int32)
 
         # seq_lens_padding = self.seq_lens
         if bs_padding_size > 0:

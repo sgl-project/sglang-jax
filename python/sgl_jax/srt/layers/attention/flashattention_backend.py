@@ -10,9 +10,6 @@ from sgl_jax.srt.layers.attention.base_attn_backend import AttentionBackend
 from sgl_jax.srt.layers.attention.flash_attn_kernel.flash_attention import (
     ragged_paged_attention,
 )
-from sgl_jax.srt.layers.attention.flash_attn_kernel.jax_flash_attention_simulator import (
-    simple_jax_ragged_paged_attention_simulator,
-)
 from sgl_jax.srt.layers.radix_attention import RadixAttention
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 
@@ -240,28 +237,6 @@ class FlashAttention(AttentionBackend):
             self.forward_metadata.num_seqs,
             self.forward_metadata.seq_lens,
         )
-
-        # attn_output = simple_jax_ragged_paged_attention_simulator(
-        #     q.reshape(q.shape[0], -1, self.head_dim),
-        #     k_buffer.reshape(
-        #         k_buffer.shape[0] // self.page_size, self.page_size, -1, self.head_dim
-        #     ),
-        #     v_buffer.reshape(
-        #         v_buffer.shape[0] // self.page_size, self.page_size, -1, self.head_dim
-        #     ),
-        #     self.forward_metadata.page_indices,
-        #     self.forward_metadata.cu_q_lens,
-        #     self.forward_metadata.cu_kv_lens,
-        #     self.forward_metadata.num_seqs,
-        #     self.forward_metadata.seq_lens,
-        #     sm_scale=scale,
-        #     sliding_window=None,
-        #     soft_cap=None,
-        #     mask_value=None,
-        #     k_scale=None,
-        #     v_scale=None,
-        #     debug_print=False,
-        # )
 
         return (
             attn_output.reshape(q.shape[0], -1),

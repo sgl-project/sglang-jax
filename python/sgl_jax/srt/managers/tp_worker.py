@@ -51,6 +51,7 @@ class ModelWorker:
         )
 
         self.mesh = mesh
+        self.page_size = server_args.page_size
 
         # Sync random seed across TP workers
         # Each process may have different random_seed. After broadcast, all processes will have the same random_seed.
@@ -192,8 +193,10 @@ class ModelWorker:
         ):
             padded_max_num_tokens = self.chunked_prefill_size
 
-        # Batch size is constrained by both max_running_requests and available tokens
-        padded_batch_size = min(self.max_running_requests, padded_max_num_tokens)
+        # Batch size is constrained by both max_running_requests and available tokens divide by page_size
+        padded_batch_size = min(
+            self.max_running_requests, padded_max_num_tokens // self.page_size
+        )
 
         return padded_batch_size, padded_max_num_tokens
 
@@ -209,12 +212,19 @@ class ModelWorker:
         if mode == ForwardMode.EXTEND:
             valid_cache_loc = np.arange(bs)
             invalid_cache_loc = np.array([0] * (self.max_total_num_tokens - bs))
-        else:
-            valid_cache_loc = np.arange(bs * 2)
-            padding_size = self.max_total_num_tokens - bs * 2
+        elif mode == ForwardMode.DECODE:
+            aligned_bs = bs
+            valid_cache_loc = np.arange(aligned_bs)
+            padding_size = self.max_total_num_tokens - aligned_bs
             if padding_size < 0:
-                padding_size = bs * 2 - bs * self.max_total_num_tokens
-            invalid_cache_loc = np.array([0] * (padding_size))
+                raise ValueError(f"decode mode padding_size < 0: {padding_size}")
+            invalid_cache_loc = np.array([0] * (padding_size), dtype=jnp.int32)
+        else:
+            raise ValueError(f"Invalid forward mode: {mode}")
+
+        logger.info(
+            f"mode is {mode} len of valid_cache_loc: {len(valid_cache_loc)}, len of invalid_cache_loc: {len(invalid_cache_loc)}"
+        )
         return ModelWorkerBatch(
             bid=1,
             forward_mode=mode,

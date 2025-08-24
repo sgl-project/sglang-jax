@@ -27,8 +27,10 @@ class TestPageSizeGreaterThanOne(CustomTestCase):
                 "--skip-server-warmup",
                 "--random-seed",
                 "3",
+                "--tp-size",
+                "4",
                 "--mem-fraction-static",
-                "0.2",
+                "0.4",
                 "--max-prefill-tokens",
                 "8192",
                 "--download-dir",
@@ -40,9 +42,11 @@ class TestPageSizeGreaterThanOne(CustomTestCase):
                 "--jax-precompile-prefill-token-paddings",
                 "16384",
                 "--jax-precompile-decode-bs-paddings",
-                "10",
+                "64",
                 "--page-size",
-                "128",
+                "64",
+                "--max-running-requests",
+                "64",
             ],
             env={
                 "JAX_COMPILATION_CACHE_DIR": "/tmp/jax_compilation_cache",
@@ -65,7 +69,7 @@ class TestPageSizeGreaterThanOne(CustomTestCase):
 
         metrics = run_eval(args)
         print(metrics)
-        self.assertGreater(metrics["score"], 0.2)
+        self.assertGreater(metrics["score"], 0.45)
 
 
 if __name__ == "__main__":
