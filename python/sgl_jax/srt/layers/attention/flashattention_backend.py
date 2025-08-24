@@ -208,7 +208,7 @@ class FlashAttention(AttentionBackend):
                 "This indicates a configuration issue with kv heads padding."
             )
 
-            return simple_jax_ragged_paged_attention_simulator(
+            return ragged_paged_attention(
                 q,
                 k_buffer,
                 v_buffer,
@@ -240,6 +240,28 @@ class FlashAttention(AttentionBackend):
             self.forward_metadata.num_seqs,
             self.forward_metadata.seq_lens,
         )
+
+        # attn_output = simple_jax_ragged_paged_attention_simulator(
+        #     q.reshape(q.shape[0], -1, self.head_dim),
+        #     k_buffer.reshape(
+        #         k_buffer.shape[0] // self.page_size, self.page_size, -1, self.head_dim
+        #     ),
+        #     v_buffer.reshape(
+        #         v_buffer.shape[0] // self.page_size, self.page_size, -1, self.head_dim
+        #     ),
+        #     self.forward_metadata.page_indices,
+        #     self.forward_metadata.cu_q_lens,
+        #     self.forward_metadata.cu_kv_lens,
+        #     self.forward_metadata.num_seqs,
+        #     self.forward_metadata.seq_lens,
+        #     sm_scale=scale,
+        #     sliding_window=None,
+        #     soft_cap=None,
+        #     mask_value=None,
+        #     k_scale=None,
+        #     v_scale=None,
+        #     debug_print=False,
+        # )
 
         return (
             attn_output.reshape(q.shape[0], -1),
