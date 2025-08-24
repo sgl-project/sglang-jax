@@ -10,6 +10,9 @@ from sgl_jax.srt.layers.attention.base_attn_backend import AttentionBackend
 from sgl_jax.srt.layers.attention.flash_attn_kernel.flash_attention import (
     ragged_paged_attention,
 )
+from sgl_jax.srt.layers.attention.flash_attn_kernel.jax_flash_attention_simulator import (
+    simple_jax_ragged_paged_attention_simulator,
+)
 from sgl_jax.srt.layers.radix_attention import RadixAttention
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 
@@ -105,18 +108,22 @@ class FlashAttention(AttentionBackend):
             raise ValueError(f"Invalid forward mode: {forward_batch.forward_mode}")
 
         metadata.seq_lens = jnp.copy(forward_batch.seq_lens)
-        
-        aligned_seq_lens = ((forward_batch.seq_lens + self.page_size - 1) // self.page_size) * self.page_size
-        metadata.cu_kv_lens = jnp.concatenate([
-            jnp.array([0], dtype=jnp.int32),
-            jnp.cumsum(aligned_seq_lens),
-        ])
+
+        aligned_seq_lens = (
+            (forward_batch.seq_lens + self.page_size - 1) // self.page_size
+        ) * self.page_size
+        metadata.cu_kv_lens = jnp.concatenate(
+            [
+                jnp.array([0], dtype=jnp.int32),
+                jnp.cumsum(aligned_seq_lens),
+            ]
+        )
 
         metadata.num_seqs = jnp.sum(
             forward_batch.seq_lens > 0, dtype=jnp.int32
         ).reshape(
             1,
-        )        
+        )
 
         self.forward_metadata = metadata
 
@@ -201,7 +208,7 @@ class FlashAttention(AttentionBackend):
                 "This indicates a configuration issue with kv heads padding."
             )
 
-            return ragged_paged_attention(
+            return simple_jax_ragged_paged_attention_simulator(
                 q,
                 k_buffer,
                 v_buffer,
