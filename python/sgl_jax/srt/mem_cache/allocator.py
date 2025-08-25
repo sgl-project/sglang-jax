@@ -33,7 +33,7 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         return ""
 
     def available_size(self) -> int:
-        return len(self.free_pages) * self.page_size
+        return (len(self.free_pages) + len(self.release_pages)) * self.page_size
 
     def get_kvcache(self) -> KVCache:
         return self._kvcache
