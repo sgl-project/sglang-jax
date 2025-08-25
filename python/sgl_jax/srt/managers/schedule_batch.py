@@ -926,7 +926,8 @@ class ScheduleBatch:
                 [local_token_size, local_bs_size, local_cache_size], dtype=jnp.int32
             )
             # All-gather to get sizes from all devices
-            all_sizes = jax.lax.all_gather(local_sizes, axis_name="data")
+            with self.mesh:
+                all_sizes = jax.lax.all_gather(local_sizes, axis_name="data")
             # Calculate global max sizes
             global_max_token_size = jnp.max(all_sizes[:, 0]).item()
             global_max_bs_size = jnp.max(all_sizes[:, 1]).item()
