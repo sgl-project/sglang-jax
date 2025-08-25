@@ -786,12 +786,27 @@ class Scheduler(
         # DP Attention: Synchronize batch across DP groups
         if self.server_args.enable_dp_attention:
             # 执行all gather, 统计信息, 决定当前scheduler是否需要idle batch
-            local_batch_size = np.array(
+            num_local_devices = jax.local_device_count()
+
+            # Create batch_size_list with proper shape
+            local_batch_size = jnp.array(
                 [ret.batch_size if ret is not None else 0], dtype=np.int32
             )
+
+            # Pad or tile to match number of local devices
+            if local_batch_size.shape[0] < num_local_devices:
+                # Option 1: Pad with zeros
+                local_batch_size_list = jnp.pad(
+                    local_batch_size,
+                    (0, num_local_devices - local_batch_size.shape[0]),
+                    mode="constant",
+                    constant_values=0,
+                )
+            else:
+                local_batch_size_list = local_batch_size
             batch_size_list = jax.pmap(
                 lambda x: jax.lax.all_gather(x, "i"), axis_name="i"
-            )(local_batch_size)
+            )(local_batch_size_list)
             logger.info(f"Node {self.node_rank} batch_size_list: {batch_size_list}")
             is_all_idle = all(size == 0 for size in batch_size_list)
             if not is_all_idle and ret is None:
