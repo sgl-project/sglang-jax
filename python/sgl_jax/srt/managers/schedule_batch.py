@@ -884,14 +884,33 @@ class ScheduleBatch:
         global bid
         bid += 1
 
-        input_ids_cpu = jax.device_get(self.input_ids.flatten())
+        input_ids_cpu = (
+            jax.device_get(self.input_ids.flatten())
+            if self.input_ids is not None and len(self.input_ids) > 0
+            else []
+        )
         real_input_ids_len = len(input_ids_cpu)
-        out_cache_loc_cpu = jax.device_get(self.out_cache_loc)
-        seq_lens_cpu = jax.device_get(self.seq_lens)
+        out_cache_loc_cpu = (
+            jax.device_get(self.out_cache_loc)
+            if self.out_cache_loc is not None and len(self.out_cache_loc) > 0
+            else []
+        )
+        seq_lens_cpu = (
+            jax.device_get(self.seq_lens)
+            if self.seq_lens is not None and len(self.seq_lens) > 0
+            else []
+        )
         real_bs = len(seq_lens_cpu)
-        req_pool_indices_cpu = jax.device_get(self.req_pool_indices)
-        token_indices_with_all_reqs = jax.device_get(
-            self.req_to_token_pool.req_to_token[self.req_pool_indices]
+        req_pool_indices_cpu = (
+            jax.device_get(self.req_pool_indices)
+            if self.req_pool_indices is not None and len(self.req_pool_indices) > 0
+            else []
+        )
+        token_indices_with_all_reqs = (
+            jax.device_get(self.req_to_token_pool.req_to_token[self.req_pool_indices])
+            if self.req_to_token_pool.req_to_token is not None
+            and len(self.req_to_token_pool.req_to_token[self.req_pool_indices]) > 0
+            else []
         )
 
         # All-gather padding sizes from all devices to ensure consistent padding
