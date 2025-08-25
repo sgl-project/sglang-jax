@@ -13,6 +13,7 @@ from types import SimpleNamespace
 from typing import Dict, List, Optional, Union
 
 import jax
+import numpy as np
 import psutil
 import zmq
 
