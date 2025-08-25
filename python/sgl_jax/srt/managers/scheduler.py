@@ -768,7 +768,8 @@ class Scheduler(
                     self.running_batch.merge_batch(self.last_batch)
 
         new_batch = self.get_new_batch_prefill()
-
+        logging.info(f"Node {self.node_rank} new_batch: {new_batch}")
+        time.sleep(10)
         # if new_batch is not None:
         if new_batch:
             # Run prefill first if possible

@@ -125,7 +125,9 @@ class SamplingBatchInfo:
         top_ps = np.array([r.sampling_params.top_p for r in reqs], dtype=jnp.float32)
         top_ks = np.array([r.sampling_params.top_k for r in reqs], dtype=jnp.int32)
         min_ps = np.array([r.sampling_params.min_p for r in reqs], dtype=jnp.float32)
-
+        logging.info(
+            f"temperatures.shape={temperatures.shape}, top_ps.shape={top_ps.shape}, top_ks.shape={top_ks.shape}, min_ps.shape={min_ps.shape}"
+        )
         temperatures_device = device_array(batch.mesh, temperatures)
         top_ps_device = device_array(batch.mesh, top_ps)
         top_ks_device = device_array(batch.mesh, top_ks)
