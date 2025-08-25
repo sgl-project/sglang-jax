@@ -27,7 +27,6 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from jax._src import mesh as mesh_lib
-from jax.experimental.multihost_utils import process_allgather
 
 from sgl_jax.global_config import global_config
 from sgl_jax.srt.configs.model_config import ModelConfig
@@ -923,11 +922,11 @@ class ScheduleBatch:
         # Gather sizes from all devices
         if self.enable_dp_attention:
             # Collect local sizes into arrays for all-gather
-            local_sizes = np.array(
+            local_sizes = jnp.array(
                 [local_token_size, local_bs_size, local_cache_size], dtype=jnp.int32
             )
             # All-gather to get sizes from all devices
-            all_sizes = process_allgather(local_sizes)
+            all_sizes = jax.lax.all_gather(local_sizes, axis_name="data")
             # Calculate global max sizes
             global_max_token_size = jnp.max(all_sizes[:, 0]).item()
             global_max_bs_size = jnp.max(all_sizes[:, 1]).item()

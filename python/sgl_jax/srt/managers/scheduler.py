@@ -787,12 +787,8 @@ class Scheduler(
                 [ret.batch_size if ret is not None else 0], dtype=np.int32
             )
             logger.info(f"Node {self.node_rank} local_batch_size: {local_batch_size}")
-            # todo bugfix: process_allgather is not working
-            try:
-                batch_size_list = process_allgather(local_batch_size)
-            except Exception as e:
-                logger.error(f"Node {self.node_rank} process_allgather failed: {e}")
-                batch_size_list = [1] * self.server_args.nnodes
+            batch_size_list = jax.lax.all_gather(local_batch_size, axis_name="data")
+            logger.info(f"Node {self.node_rank} batch_size_list: {batch_size_list}")
             is_all_idle = all(size == 0 for size in batch_size_list)
             if not is_all_idle and ret is None:
                 ret = self.get_idle_batch()
