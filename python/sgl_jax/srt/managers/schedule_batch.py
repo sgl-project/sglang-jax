@@ -869,7 +869,7 @@ class ScheduleBatch:
         token_paddings: list,
     ) -> ModelWorkerBatch:
         logging.info(
-            f"schedule_batch.get_model_worker_batch: {self.forward_mode.name} input_ids.shape={self.input_ids.shape}, out_cache_loc.shape={self.out_cache_loc.shape}, seq_lens.shape={self.seq_lens.shape}, req_pool_indices.shape={self.req_pool_indices.shape}, output_ids.shape={self.output_ids.shape}"
+            f"schedule_batch.get_model_worker_batch: {self.forward_mode.name} input_ids.shape={self.input_ids.shape if self.input_ids is not None else None}, out_cache_loc.shape={self.out_cache_loc.shape if self.out_cache_loc is not None else None}, seq_lens.shape={self.seq_lens.shape if self.seq_lens is not None else None}, req_pool_indices.shape={self.req_pool_indices.shape if self.req_pool_indices is not None else None}, output_ids.shape={self.output_ids.shape if self.output_ids is not None else None}"
         )
         if self.forward_mode.is_decode_or_idle():
             extend_seq_lens = extend_prefix_lens = extend_logprob_start_lens = None
