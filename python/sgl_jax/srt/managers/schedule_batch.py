@@ -902,7 +902,7 @@ class ScheduleBatch:
             f"schedule_batch.get_model_worker_batch: {self.forward_mode.name} local_token_size={local_token_size}, local_bs_size={local_bs_size}, local_cache_size={local_cache_size}"
         )
         # Gather sizes from all devices
-        if self.server_args.enable_dp_attention:
+        if self.enable_dp_attention:
             # Collect local sizes into arrays for all-gather
             local_sizes = jnp.array(
                 [local_token_size, local_bs_size, local_cache_size], dtype=jnp.int32
