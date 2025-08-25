@@ -17,6 +17,8 @@ import jax.numpy as jnp
 import numpy as np
 from jax._src import mesh as mesh_lib
 
+from sgl_jax.srt.utils.mesh_utils import create_device_mesh
+
 logger = logging.getLogger(__name__)
 
 
@@ -128,10 +130,15 @@ class SamplingBatchInfo:
         logging.info(
             f"temperatures.shape={temperatures.shape}, top_ps.shape={top_ps.shape}, top_ks.shape={top_ks.shape}, min_ps.shape={min_ps.shape}"
         )
-        temperatures_device = device_array(batch.mesh, temperatures)
-        top_ps_device = device_array(batch.mesh, top_ps)
-        top_ks_device = device_array(batch.mesh, top_ks)
-        min_ps_device = device_array(batch.mesh, min_ps)
+        mesh = create_device_mesh(
+            ici_parallelism=[-1, 1, 1, 1],
+            dcn_parallelism=[1, 1, 1, 1],
+            devices=jax.local_devices(),
+        )
+        temperatures_device = device_array(mesh, temperatures)
+        top_ps_device = device_array(mesh, top_ps)
+        top_ks_device = device_array(mesh, top_ks)
+        min_ps_device = device_array(mesh, min_ps)
 
         # temperatures_device, top_ps_device, top_ks_device, min_ps_device = device_array(
         #     batch.mesh, (temperatures, top_ps, top_ks, min_ps)
