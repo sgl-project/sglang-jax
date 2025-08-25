@@ -804,6 +804,9 @@ class Scheduler(
                 )
             else:
                 local_batch_size_list = local_batch_size
+            logger.info(
+                f"Node {self.node_rank} local_batch_size_list: {local_batch_size_list}"
+            )
             batch_size_list = jax.pmap(
                 lambda x: jax.lax.all_gather(x, "i"), axis_name="i"
             )(local_batch_size_list)
