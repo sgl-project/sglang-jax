@@ -789,30 +789,15 @@ class Scheduler(
             logger.info(f"Node {self.node_rank} 11111111111")
             num_local_devices = jax.local_device_count()
             logger.info(f"Node {self.node_rank} num_local_devices: {num_local_devices}")
+            bsz = ret.batch_size if ret is not None else 0
             # Create batch_size_list with proper shape
-            local_batch_size = np.array(
-                [ret.batch_size if ret is not None else 0], dtype=np.int32
-            )
+            local_batch_size = np.array([bsz, bsz, bsz, bsz], dtype=np.int32)
             logger.info(
                 f"Node {self.node_rank} local_batch_size22222: {local_batch_size}"
             )
-            # Pad or tile to match number of local devices
-            if local_batch_size.shape[0] < num_local_devices:
-                # Option 1: Pad with zeros
-                local_batch_size_list = np.pad(
-                    local_batch_size,
-                    (0, num_local_devices - local_batch_size.shape[0]),
-                    mode="constant",
-                    constant_values=0,
-                )
-            else:
-                local_batch_size_list = local_batch_size
-            logger.info(
-                f"Node {self.node_rank} local_batch_size_list: {local_batch_size_list}"
-            )
             batch_size_list = jax.pmap(
                 lambda x: jax.lax.all_gather(x, "i"), axis_name="i"
-            )(local_batch_size_list)
+            )(local_batch_size)
             logger.info(f"Node {self.node_rank} batch_size_list: {batch_size_list}")
             is_all_idle = all(size == 0 for size in batch_size_list.flatten())
             if not is_all_idle and ret is None:
