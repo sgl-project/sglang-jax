@@ -767,8 +767,6 @@ class Scheduler(
                     self.running_batch.merge_batch(self.last_batch)
 
         new_batch = self.get_new_batch_prefill()
-        if new_batch is None and self.server_args.enable_dp_attention:
-            new_batch = self.get_idle_batch()
         # if new_batch is not None:
         if new_batch:
             # Run prefill first if possible
