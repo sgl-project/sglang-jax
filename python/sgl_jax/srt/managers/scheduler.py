@@ -790,7 +790,7 @@ class Scheduler(
             num_local_devices = jax.local_device_count()
             logger.info(f"Node {self.node_rank} num_local_devices: {num_local_devices}")
             # Create batch_size_list with proper shape
-            local_batch_size = jnp.array(
+            local_batch_size = np.array(
                 [ret.batch_size if ret is not None else 0], dtype=np.int32
             )
             logger.info(
@@ -799,7 +799,7 @@ class Scheduler(
             # Pad or tile to match number of local devices
             if local_batch_size.shape[0] < num_local_devices:
                 # Option 1: Pad with zeros
-                local_batch_size_list = jnp.pad(
+                local_batch_size_list = np.pad(
                     local_batch_size,
                     (0, num_local_devices - local_batch_size.shape[0]),
                     mode="constant",
