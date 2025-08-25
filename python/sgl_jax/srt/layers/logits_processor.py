@@ -307,14 +307,6 @@ class LogitsProcessor(nnx.Module):
             else:
                 assert False, "Should never reach"
 
-        def get_topk(arr, topk):
-            sorted_indices = jnp.argsort(arr, axis=1)[:, -topk:]
-            sorted_values = jnp.take_along_axis(arr, sorted_indices, axis=1)
-
-            topk_indices = jnp.flip(sorted_indices, axis=1)
-            topk_values = jnp.flip(sorted_values, axis=1)
-            return topk_values, topk_indices
-
         if not logits_metadata.extend_return_logprob:
             # Decode mode or extend mode without return_logprob.
             return LogitsProcessorOutput(

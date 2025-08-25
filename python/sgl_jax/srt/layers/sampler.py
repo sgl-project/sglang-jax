@@ -65,14 +65,6 @@ class Sampler(nnx.Module):
             if return_logprob:
                 logprobs = jnp.log(probs).clip(min=jnp.finfo(probs.dtype).min)
 
-        def get_topk(arr, topk):
-            sorted_indices = jnp.argsort(arr, axis=1)[:, -topk:]
-            sorted_values = jnp.take_along_axis(arr, sorted_indices, axis=1)
-
-            topk_indices = jnp.flip(sorted_indices, axis=1)
-            topk_values = jnp.flip(sorted_values, axis=1)
-            return topk_values, topk_indices
-
         if return_logprob:
             if any(x > 0 for x in top_logprobs_nums):
                 (
