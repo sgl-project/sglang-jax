@@ -786,6 +786,7 @@ class Scheduler(
             local_batch_size = np.array(
                 [ret.batch_size if ret is not None else 0], dtype=np.int32
             )
+            logger.info(f"Node {self.node_rank} local_batch_size: {local_batch_size}")
             # todo bugfix: process_allgather is not working
             try:
                 batch_size_list = process_allgather(local_batch_size)
