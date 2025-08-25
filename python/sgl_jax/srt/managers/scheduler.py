@@ -572,7 +572,6 @@ class Scheduler(
         else:
             recv_reqs = []
         logger.info(f"Node {self.node_rank} recv_reqs: {recv_reqs}")
-        time.sleep(10)
         # if self.nnodes > 1:
         #     recv_reqs = self.broadcast_pyobj(recv_reqs)
         return recv_reqs
@@ -769,7 +768,7 @@ class Scheduler(
 
         new_batch = self.get_new_batch_prefill()
         logging.info(f"Node {self.node_rank} new_batch: {new_batch}")
-        time.sleep(10)
+        time.sleep(30)
         # if new_batch is not None:
         if new_batch:
             # Run prefill first if possible
