@@ -783,8 +783,9 @@ class Scheduler(
         if self.server_args.enable_dp_attention:
             # 执行all gather, 统计信息, 决定当前scheduler是否需要idle batch
             local_batch_size = ret.batch_size if ret is not None else 0
-            batch_size_list = jax.lax.all_gather(local_batch_size, axis_name="data")
-            is_idle = all(size == 0 for size in batch_size_list)
+            # todo bugfix: process_allgather is not working
+            # batch_size_list = process_allgather(local_batch_size)
+            is_idle = False
             if not is_idle and ret is None:
                 ret = self.get_idle_batch()
         logger.info(f"after dp sync Node {self.node_rank} ret: {ret}")
