@@ -926,6 +926,7 @@ class ScheduleBatch:
             local_sizes = jnp.array(
                 [local_token_size, local_bs_size, local_cache_size], dtype=jnp.int32
             )
+            local_sizes = np.array(local_sizes_list, dtype=np.int32)
             # All-gather to get sizes from all devices
             all_sizes = process_allgather(local_sizes)
             # Calculate global max sizes
