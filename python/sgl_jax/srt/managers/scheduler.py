@@ -780,16 +780,16 @@ class Scheduler(
                 ret = self.running_batch if not self.running_batch.is_empty() else None
             else:
                 ret = None
-        # logger.info(f"before dp sync Node {self.node_rank} ret: {ret}")
-        # # DP Attention: Synchronize batch across DP groups
-        # if self.server_args.enable_dp_attention:
-        #     # 执行all gather, 统计信息, 决定当前scheduler是否需要idle batch
-        #     local_batch_size = ret.batch_size if ret is not None else 0
-        #     batch_size_list = process_allgather(local_batch_size)
-        #     is_idle = all(size == 0 for size in batch_size_list)
-        #     if not is_idle:
-        #         ret = self.get_idle_batch()
-        # logger.info(f"after dp sync Node {self.node_rank} ret: {ret}")
+        logger.info(f"before dp sync Node {self.node_rank} ret: {ret}")
+        # DP Attention: Synchronize batch across DP groups
+        if self.server_args.enable_dp_attention:
+            # 执行all gather, 统计信息, 决定当前scheduler是否需要idle batch
+            local_batch_size = ret.batch_size if ret is not None else 0
+            batch_size_list = process_allgather(local_batch_size)
+            is_idle = all(size == 0 for size in batch_size_list)
+            if not is_idle:
+                ret = self.get_idle_batch()
+        logger.info(f"after dp sync Node {self.node_rank} ret: {ret}")
         return ret
 
     def get_new_batch_prefill(self) -> Optional[ScheduleBatch]:

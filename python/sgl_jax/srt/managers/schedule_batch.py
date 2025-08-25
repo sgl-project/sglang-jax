@@ -27,6 +27,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from jax._src import mesh as mesh_lib
+from jax.experimental.multihost_utils import process_allgather
 
 from sgl_jax.global_config import global_config
 from sgl_jax.srt.configs.model_config import ModelConfig
@@ -891,12 +892,39 @@ class ScheduleBatch:
             self.req_to_token_pool.req_to_token[self.req_pool_indices]
         )
 
+        # All-gather padding sizes from all devices to ensure consistent padding
+        local_token_size = len(input_ids_cpu)
+        local_bs_size = len(seq_lens_cpu)
+        local_cache_size = sum(seq_lens_cpu)
+        logging.info(
+            f"schedule_batch.get_model_worker_batch: {self.forward_mode.name} local_token_size={local_token_size}, local_bs_size={local_bs_size}, local_cache_size={local_cache_size}"
+        )
+        # Gather sizes from all devices
+        if self.server_args.enable_dp_attention:
+            # Collect local sizes into arrays for all-gather
+            local_sizes = jnp.array(
+                [local_token_size, local_bs_size, local_cache_size], dtype=jnp.int32
+            )
+            # All-gather to get sizes from all devices
+            all_sizes = process_allgather(local_sizes)
+            # Calculate global max sizes
+            global_max_token_size = jnp.max(all_sizes[:, 0]).item()
+            global_max_bs_size = jnp.max(all_sizes[:, 1]).item()
+            global_max_cache_size = jnp.max(all_sizes[:, 2]).item()
+        else:
+            global_max_token_size = local_token_size
+            global_max_bs_size = local_bs_size
+            global_max_cache_size = local_cache_size
+        logging.info(
+            f"schedule_batch.get_model_worker_batch: {self.forward_mode.name} global_max_token_size={global_max_token_size}, global_max_bs_size={global_max_bs_size}, global_max_cache_size={global_max_cache_size}"
+        )
         # padding seq
         # extend & decode: input_ids, positions, out_cache_loc, cache_loc
         padding_size = 0
         token_paddings.sort()
+        # Use global max token size for consistent padding
         for size in token_paddings:
-            if size >= len(input_ids_cpu):
+            if size >= global_max_token_size:
                 padding_size = size - len(input_ids_cpu)
                 break
 
@@ -964,12 +992,10 @@ class ScheduleBatch:
 
         # padding bs: req_pool_indices, seq_lens, extend_start_loc, extend_prefix_lens, extend_seq_lens
         bs_padding_size = 0
-        # if self.forward_mode.is_extend():
-        #     bs_padding_size = max_running_requests - len(seq_lens_cpu)
-        # else:
         bs_paddings.sort()
+        # Use global max batch size for consistent padding
         for size in bs_paddings:
-            if size >= len(seq_lens_cpu):
+            if size >= global_max_bs_size:
                 bs_padding_size = size - len(seq_lens_cpu)
                 break
 
@@ -986,7 +1012,8 @@ class ScheduleBatch:
                 ]
                 offset += seq_len
 
-        total_cache_loc_size = max_total_num_tokens
+        # Use global max cache size for consistent cache_loc padding
+        total_cache_loc_size = max(max_total_num_tokens, global_max_cache_size)
         if total_cache_loc_size > len(cache_loc_flat):
             cache_loc_cpu = np.pad(
                 cache_loc_flat,
