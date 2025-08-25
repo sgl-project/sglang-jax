@@ -798,13 +798,13 @@ class Scheduler(
             batch_size_list = jax.pmap(
                 lambda x: jax.lax.all_gather(x, "i"), axis_name="i"
             )(local_batch_size)
-
-            logger.info(
-                f"Node {self.node_rank} batch_size_list: {np.array(batch_size_list)}"
-            )
-            is_all_idle = all(size == 0 for size in np.array(batch_size_list).flatten())
-            if not is_all_idle and ret is None:
-                ret = self.get_idle_batch()
+            jax.block_until_ready(batch_size_list)
+            # logger.info(
+            #     f"Node {self.node_rank} batch_size_list: {np.array(batch_size_list)}"
+            # )
+            # is_all_idle = all(size == 0 for size in np.array(batch_size_list).flatten())
+            # if not is_all_idle and ret is None:
+            #     ret = self.get_idle_batch()
         logger.info(f"after dp sync Node {self.node_rank} ret: {ret}")
         if ret is not None:
             ret.enable_dp_attention = self.server_args.enable_dp_attention
