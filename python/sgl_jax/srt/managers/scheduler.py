@@ -751,6 +751,7 @@ class Scheduler(
         token_usage = num_used / self.max_total_num_tokens
         return num_used, token_usage, available_size, evictable_size
 
+    @jax.pmap(axis_name="data")
     def get_next_batch_to_run(self) -> Optional[ScheduleBatch]:
         # Merge the prefill batch into the running batch
         if self.last_batch and self.last_batch.forward_mode.is_extend():

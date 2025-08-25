@@ -927,6 +927,7 @@ class ScheduleBatch:
             )
             # All-gather to get sizes from all devices
             with self.mesh:
+                logger.info(f"mesh.axis_names: {self.mesh.axis_names}")
                 all_sizes = jax.lax.all_gather(local_sizes, axis_name="data")
             # Calculate global max sizes
             global_max_token_size = jnp.max(all_sizes[:, 0]).item()
