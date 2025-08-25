@@ -13,7 +13,7 @@ from sgl_jax.srt.debug_tracer import global_tracer, trace_function
 from sgl_jax.srt.layers.embeddings import Embed, ParallelLMHead, RotaryEmbedding
 from sgl_jax.srt.layers.layernorm import RMSNorm
 from sgl_jax.srt.layers.linear import LinearBase
-from sgl_jax.srt.layers.logits_processor import LogitsProcessor
+from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
 from sgl_jax.srt.layers.radix_attention import RadixAttention
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
 from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
@@ -472,6 +472,15 @@ class Qwen3ForCausalLM(nnx.Module):
             mappings.update(bias_mappings)
 
         return mappings
+
+    def compute_logits(
+        self,
+        hidden_states: jax.Array,
+        logits_metadata: LogitsMetadata,
+    ):
+        return self.logits_processor(
+            hidden_states, self.lm_head, logits_metadata, self.mesh
+        )
 
     def __call__(
         self,

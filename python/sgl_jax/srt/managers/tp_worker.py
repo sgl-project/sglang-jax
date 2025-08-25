@@ -13,13 +13,17 @@ from flax import nnx
 from jax.experimental.multihost_utils import broadcast_one_to_all
 
 from sgl_jax.srt.configs.model_config import ModelConfig
-from sgl_jax.srt.layers.logits_processor import LogitsProcessorOutput
+from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessorOutput
 from sgl_jax.srt.managers.schedule_batch import (
     ModelWorkerBatch,
     global_server_args_dict,
 )
 from sgl_jax.srt.mem_cache.memory_pool import ReqToTokenPool
-from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sgl_jax.srt.model_executor.forward_batch_info import (
+    CaptureHiddenMode,
+    ForwardBatch,
+    ForwardMode,
+)
 from sgl_jax.srt.model_executor.model_runner import MockModelRunner, ModelRunner
 from sgl_jax.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sgl_jax.srt.server_args import ServerArgs
@@ -118,10 +122,14 @@ class ModelWorker:
         self.precompile_prefill_token_paddings = (
             server_args.jax_precompile_prefill_token_paddings
         )
+        default_bs_padding = JAX_PRECOMPILE_DEFAULT_DECODE_BS_PADDINGS + [
+            self.max_running_requests
+        ]
+        default_bs_padding.sort()
         self.precompile_decode_bs_paddings = (
             server_args.jax_precompile_decode_bs_paddings
             if server_args.jax_precompile_decode_bs_paddings is not None
-            else JAX_PRECOMPILE_DEFAULT_DECODE_BS_PADDINGS
+            else default_bs_padding
         )
 
     def normalize_token_paddings(
@@ -261,6 +269,10 @@ class ModelWorker:
                 if mode == ForwardMode.EXTEND
                 else None
             ),
+            top_logprobs_nums=None,
+            token_ids_logprobs=None,
+            extend_logprob_start_lens=None,
+            capture_hidden_mode=CaptureHiddenMode.NULL,
         )
 
     def precompile_decode(self):
@@ -288,7 +300,6 @@ class ModelWorker:
             global_server_args_dict,
             self.model_runner.req_to_token_pool.size,
             self.model_runner.req_to_token_pool.max_context_len,
-            # TODO: model_runner.token_to_kv_pool define in ModelRunner.init_memory_pool
             self.model_runner.token_to_kv_pool.size,
         )
 
@@ -296,7 +307,6 @@ class ModelWorker:
         return self.model_runner.tp_group
 
     def get_pad_input_ids_func(self):
-        # TODO: model_runner.model define in ModelRunner.load_model
         return getattr(self.model_runner.model, "pad_input_ids", None)
 
     def get_memory_pool(self):
@@ -313,21 +323,17 @@ class ModelWorker:
     ) -> Tuple[Union[LogitsProcessorOutput, jax.Array, int], Optional[jax.Array]]:
         forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
 
-        cache_miss_count = 0
-        import jax._src.test_util as jtu
-
-        with jtu.count_pjit_cpp_cache_miss() as count:
-            logits_output = self.model_runner.forward(forward_batch)
-            cache_miss_count = count()
+        logits_output, cache_miss_count = self.model_runner.forward(
+            forward_batch,
+            logits_metadata=LogitsMetadata.from_model_worker_batch(
+                model_worker_batch, self.mesh
+            ),
+        )
 
         if launch_done is not None:
             launch_done.set()
 
         idx = model_worker_batch.extend_start_loc[: model_worker_batch.real_bs]
-        if model_worker_batch.forward_mode == ForwardMode.EXTEND:
-            idx = np.cumsum(
-                model_worker_batch.extend_seq_lens[: model_worker_batch.real_bs] - 1
-            )
 
         logits_output.truncate_logits_processor_output(idx)
 
@@ -371,7 +377,6 @@ class MockModelWorker:
         )
 
         # Profile number of tokens
-        # TODO: model_runner.max_total_num_tokens define in ModelRunner.init_memory_pool
         self.max_total_num_tokens = self.model_runner.max_total_num_tokens
         self.max_prefill_tokens = server_args.max_prefill_tokens
         self.max_running_requests = min(
@@ -406,7 +411,6 @@ class MockModelWorker:
             global_server_args_dict,
             self.model_runner.req_to_token_pool.size,
             self.model_runner.req_to_token_pool.max_context_len,
-            # TODO: model_runner.token_to_kv_pool define in ModelRunner.init_memory_pool
             self.model_runner.token_to_kv_pool.size,
         )
 

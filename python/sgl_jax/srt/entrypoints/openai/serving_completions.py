@@ -5,7 +5,6 @@ from typing import Any, AsyncGenerator, Dict, List, Union
 from fastapi import Request
 from fastapi.responses import ORJSONResponse, StreamingResponse
 
-# from sgl_jax.srt.code_completion_parser import generate_completion_prompt_from_request  # TODO: implement code completion parser
 from sgl_jax.srt.entrypoints.openai.protocol import (
     CompletionRequest,
     CompletionResponse,
@@ -55,7 +54,6 @@ class OpenAIServingCompletion(OpenAIServingBase):
         # Process prompt
         prompt = request.prompt
         if self.template_manager.completion_template_name is not None:
-            # TODO: implement generate_completion_prompt_from_request function
             # prompt = generate_completion_prompt_from_request(request)
             pass
 
@@ -403,7 +401,6 @@ class OpenAIServingCompletion(OpenAIServingBase):
 
     def _prepare_echo_prompts(self, request: CompletionRequest) -> List[str]:
         """Prepare echo prompts for non-streaming response"""
-        # TODO: handle the case prompt is token ids
         if isinstance(request.prompt, list) and isinstance(request.prompt[0], str):
             # for the case of multiple str prompts
             return request.prompt

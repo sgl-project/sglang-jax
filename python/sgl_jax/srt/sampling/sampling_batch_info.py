@@ -33,12 +33,6 @@ class SamplingBatchInfo:
     top_ks: jax.Array
     min_ps: jax.Array
 
-    # Masking tensors for grammar-guided structured outputs
-    vocab_size: int
-
-    # Handle logit bias
-    # logit_bias: Optional[jax.Array] = None
-
     # Whether all requests use greedy sampling
     is_all_greedy: bool = False
 
@@ -60,7 +54,6 @@ class SamplingBatchInfo:
         )
 
         aux_data = {
-            "vocab_size": self.vocab_size,
             "is_all_greedy": self.is_all_greedy,
             "need_top_p_sampling": self.need_top_p_sampling,
             "need_top_k_sampling": self.need_top_k_sampling,
@@ -77,7 +70,6 @@ class SamplingBatchInfo:
         obj.top_ks = children[2]
         obj.min_ps = children[3]
 
-        obj.vocab_size = aux_data["vocab_size"]
         obj.is_all_greedy = aux_data["is_all_greedy"]
         obj.need_top_p_sampling = aux_data["need_top_p_sampling"]
         obj.need_top_k_sampling = aux_data["need_top_k_sampling"]
@@ -109,8 +101,6 @@ class SamplingBatchInfo:
             need_top_p_sampling=False,
             need_top_k_sampling=True,
             need_min_p_sampling=False,
-            vocab_size=vocab_size,
-            # logit_bias=None,
         )
         return ret
 
@@ -153,7 +143,6 @@ class SamplingBatchInfo:
             need_top_p_sampling=any(r.sampling_params.top_p != 1.0 for r in reqs),
             need_top_k_sampling=any(r.sampling_params.top_k != TOP_K_ALL for r in reqs),
             need_min_p_sampling=any(r.sampling_params.min_p > 0 for r in reqs),
-            vocab_size=vocab_size,
         )
         return ret
 
@@ -174,9 +163,6 @@ class SamplingBatchInfo:
         ]:
             value = getattr(self, item, None)
             setattr(self, item, value[keep_indices_device])
-
-        # if self.logit_bias is not None:
-        #     self.logit_bias = self.logit_bias[keep_indices_device]
 
     def merge_batch(self, other: "SamplingBatchInfo", mesh: mesh_lib.Mesh):
         # Note: because the __len()__ operator is defined on the temperatures tensor,

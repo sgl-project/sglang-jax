@@ -337,7 +337,6 @@ Assistant: {% endif %}"""
         }
 
         if request.response_format and request.response_format.type == "json_schema":
-            # TODO: implement convert_json_schema_to_str function
             # sampling_params["json_schema"] = convert_json_schema_to_str(
             #     request.response_format.json_schema.schema_
             # )
@@ -347,7 +346,6 @@ Assistant: {% endif %}"""
         elif (
             request.response_format and request.response_format.type == "structural_tag"
         ):
-            # TODO: implement convert_json_schema_to_str function
             # sampling_params["structural_tag"] = convert_json_schema_to_str(
             #     request.response_format.model_dump(by_alias=True)
             # )
@@ -366,7 +364,6 @@ Assistant: {% endif %}"""
         elif tool_call_constraint:
             constraint_type, constraint_value = tool_call_constraint
             if constraint_type == "structural_tag":
-                # TODO: implement convert_json_schema_to_str function
                 # sampling_params[constraint_type] = convert_json_schema_to_str(
                 #     constraint_value.model_dump(by_alias=True)
                 # )

@@ -57,10 +57,10 @@ class SchedulerOutputProcessorMixin:
             if logits_output.next_token_logprobs is not None:
                 logits_output.next_token_logprobs = jax.device_get(
                     logits_output.next_token_logprobs
-                )
+                ).astype(float)
             if logits_output.input_token_logprobs is not None:
                 logits_output.input_token_logprobs = tuple(
-                    jax.device_get(logits_output.input_token_logprobs)
+                    jax.device_get(logits_output.input_token_logprobs).astype(float)
                 )
 
         # Check finish conditions
@@ -103,7 +103,22 @@ class SchedulerOutputProcessorMixin:
                 # we don't want to stream the request currently being chunked.
                 skip_stream_req = req
 
-        self.set_next_batch_sampling_info_done(batch)
+                # Incrementally update input logprobs.
+                if req.return_logprob:
+                    extend_logprob_start_len = extend_logprob_start_len_per_req[i]
+                    extend_input_len = extend_input_len_per_req[i]
+                    if extend_logprob_start_len < extend_input_len:
+                        # Update input logprobs.
+                        num_input_logprobs = extend_input_len - extend_logprob_start_len
+                        self.add_input_logprob_return_values(
+                            i,
+                            req,
+                            logits_output,
+                            logprob_pt,
+                            num_input_logprobs,
+                            last_prefill_chunk=False,
+                        )
+                        logprob_pt += num_input_logprobs
 
         batch.cache_miss_count = cache_miss_count
 
@@ -129,7 +144,9 @@ class SchedulerOutputProcessorMixin:
         # spec decoding handles output logprobs inside verify process.
         next_token_ids = jax.device_get(next_token_ids).tolist()
         if batch.return_logprob:
-            next_token_logprobs = jax.device_get(logits_output.next_token_logprobs)
+            next_token_logprobs = jax.device_get(
+                logits_output.next_token_logprobs
+            ).astype(float)
 
         self.token_to_kv_pool_allocator.free_group_begin()
 
@@ -165,7 +182,6 @@ class SchedulerOutputProcessorMixin:
                         logits_output.next_token_token_ids_logprobs_idx[i]
                     )
 
-        self.set_next_batch_sampling_info_done(batch)
         self.stream_output(batch.reqs, batch.return_logprob)
         self.token_to_kv_pool_allocator.free_group_end()
 
@@ -522,7 +538,7 @@ class SchedulerOutputProcessorMixin:
 
         # Send to detokenizer
         if rids:
-            tmp = BatchTokenIDOut(
+            out = BatchTokenIDOut(
                 rids,
                 finished_reasons,
                 decoded_texts,
@@ -549,4 +565,4 @@ class SchedulerOutputProcessorMixin:
                 output_token_ids_logprobs_idx,
                 output_hidden_states,
             )
-            self.send_to_detokenizer.send_pyobj(tmp)
+            self.send_to_detokenizer.send_pyobj(out)

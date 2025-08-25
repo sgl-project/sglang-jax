@@ -50,8 +50,6 @@ from sgl_jax.srt.mem_cache.radix_cache import RadixCache
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
 from sgl_jax.srt.server_args import PortArgs, ServerArgs
 from sgl_jax.srt.utils.common_utils import (
-    JAX_PRECOMPILE_DEFAULT_DECODE_BS_PADDINGS,
-    JAX_PRECOMPILE_DEFAULT_PREFILL_TOKEN_PADDINGS,
     configure_logger,
     get_bool_env_var,
     get_zmq_socket,
@@ -563,8 +561,7 @@ class Scheduler(
 
         if memory_leak:
             msg = "token_to_kv_pool_allocator memory leak detected! " f"{token_msg}"
-            # remove when modelWorker is OK, TODO: aolemila
-            # raise ValueError(msg)
+            raise ValueError(msg)
 
         req_total_size = self.req_to_token_pool.size
 
@@ -574,8 +571,7 @@ class Scheduler(
                 f"available_size={len(self.req_to_token_pool.free_slots)}, "
                 f"total_size={self.req_to_token_pool.size}\n"
             )
-            # remove when modelWorker is OK, TODO: aolemila
-            # raise ValueError(msg)
+            raise ValueError(msg)
 
     def check_tree_cache(self):
         pass
@@ -603,11 +599,11 @@ class Scheduler(
                 chunked_req_to_exclude.add(self.last_batch.chunked_req)
 
             # Filter batch
-            last_bs = self.last_batch.batch_size
+            last_bs = self.last_batch.batch_size()
             self.last_batch.filter_batch(
                 chunked_req_to_exclude=list(chunked_req_to_exclude)
             )
-            if self.last_batch.batch_size < last_bs:
+            if self.last_batch.batch_size() < last_bs:
                 self.running_batch.batch_is_full = False
 
             # Merge the new batch into the running batch
@@ -720,7 +716,7 @@ class Scheduler(
 
     def update_running_batch(self, batch: ScheduleBatch) -> Optional[ScheduleBatch]:
         """Update the current running decoding batch."""
-        initial_bs = batch.batch_size
+        initial_bs = batch.batch_size()
 
         batch.filter_batch()
         if batch.is_empty():
@@ -729,7 +725,7 @@ class Scheduler(
 
         # Check if decode out of memory
         if not batch.check_decode_mem(self.decode_mem_cache_buf_multiplier) or (
-            TEST_RETRACT and batch.batch_size > 10
+            TEST_RETRACT and batch.batch_size() > 10
         ):
             old_ratio = self.new_token_ratio
 
@@ -750,7 +746,7 @@ class Scheduler(
                 self.min_new_token_ratio,
             )
 
-        if batch.batch_size < initial_bs:
+        if batch.batch_size() < initial_bs:
             batch.batch_is_full = False
 
         # Update batch arrays
@@ -812,12 +808,11 @@ class Scheduler(
         batch: ScheduleBatch,
         result: Union[GenerationBatchResult],
     ):
+
         if batch.forward_mode.is_decode():
             self.process_batch_result_decode(batch, result)
         elif batch.forward_mode.is_extend():
             self.process_batch_result_prefill(batch, result)
-        elif batch.forward_mode.is_dummy_first():
-            self.set_next_batch_sampling_info_done(batch)
 
     def get_idle_batch(self):
         idle_batch = ScheduleBatch.init_new(

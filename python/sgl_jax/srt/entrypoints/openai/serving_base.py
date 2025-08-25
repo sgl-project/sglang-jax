@@ -63,7 +63,6 @@ class OpenAIServingBase(ABC):
         """Generate request ID based on request type"""
         return None
 
-        # TODO(chang): the rid is used in io_strcut check and often violates `The rid should be a list` AssertionError
         # Temporarily return None in this function until the rid logic is clear.
         if rid := getattr(request, "rid", None):
             return rid
@@ -122,7 +121,6 @@ class OpenAIServingBase(ABC):
         param: Optional[str] = None,
     ) -> ORJSONResponse:
         """Create an error response"""
-        # TODO: remove fastapi dependency in openai and move response handling to the entrypoint
         error = ErrorResponse(
             object="error",
             message=message,

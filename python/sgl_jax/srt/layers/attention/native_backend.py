@@ -27,9 +27,6 @@ class NativeAttention(AttentionBackend):
             self.num_kv_heads = num_attn_heads
         # self.rngs = rngs
 
-    def print_array_shape(self):
-        print(f"==NativaAttention shape")
-
     def tree_flatten(self):
         children = ()
         aux_data = {"num_heads": self.num_heads, "num_kv_heads": self.num_kv_heads}
@@ -77,7 +74,6 @@ class NativeAttention(AttentionBackend):
         ):
             is_causal = False
 
-        # TODO: optimize here
         # token_indices_with_all_reqs = forward_batch.req_to_token_pool.req_to_token[
         #     forward_batch.req_pool_indices
         # ]

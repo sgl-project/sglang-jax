@@ -158,6 +158,7 @@ suites = {
         TestFile("test/srt/test_base_tp.py", 45),
         TestFile("test/srt/test_page_size.py", 30),
         # TestFile("test/srt/test_precompile.py", 300),
+        TestFile("test/srt/test_logprobs.py", 120),
     ],
     "per-commit-tpu-v6e-8": [],
     "per-commit-tpu-v6e-16": [],
