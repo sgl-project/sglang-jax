@@ -783,7 +783,7 @@ class Scheduler(
         # DP Attention: Synchronize batch across DP groups
         if self.server_args.enable_dp_attention:
             # 执行all gather, 统计信息, 决定当前scheduler是否需要idle batch
-            local_batch_size = np.array(
+            local_batch_size = jnp.array(
                 [ret.batch_size if ret is not None else 0], dtype=np.int32
             )
             logger.info(f"Node {self.node_rank} local_batch_size: {local_batch_size}")
