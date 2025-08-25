@@ -784,6 +784,7 @@ class Scheduler(
             # 执行all gather, 统计信息, 决定当前scheduler是否需要idle batch
             local_batch_size = ret.batch_size if ret is not None else 0
             batch_size_list = process_allgather(local_batch_size)
+            jax.block_until_ready(batch_size_list)
             is_idle = all(size == 0 for size in batch_size_list)
             if not is_idle:
                 ret = self.get_idle_batch()
