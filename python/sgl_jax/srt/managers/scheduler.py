@@ -23,6 +23,7 @@ try:
 except ImportError:
     setproctitle = None
 
+from jax.experimental import shard_map
 from jax.experimental.multihost_utils import process_allgather
 from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
@@ -785,26 +786,27 @@ class Scheduler(
         logger.info(f"before dp sync Node {self.node_rank} ret: {ret}")
         # DP Attention: Synchronize batch across DP groups
         if self.server_args.enable_dp_attention:
-            # 执行all gather, 统计信息, 决定当前scheduler是否需要idle batch
-            logger.info(f"Node {self.node_rank} 11111111111")
-            num_local_devices = jax.local_device_count()
-            logger.info(f"Node {self.node_rank} num_local_devices: {num_local_devices}")
-            bsz = ret.batch_size if ret is not None else 0
-            # Create batch_size_list with proper shape
-            local_batch_size = np.array([bsz, bsz, bsz, bsz], dtype=np.int32)
-            logger.info(
-                f"Node {self.node_rank} local_batch_size22222: {local_batch_size}"
+            mesh = Mesh(jax.devices(backend="cpu"), ("i",))
+
+            @functools.partial(
+                shard_map.shard_map,
+                mesh=mesh,
+                in_specs=P(None),
+                out_specs=P(None),
+                check_rep=False,
             )
-            batch_size_list = jax.pmap(
-                lambda x: jax.lax.all_gather(x, "i"), axis_name="i"
-            )(local_batch_size)
-            jax.block_until_ready(batch_size_list)
-            # logger.info(
-            #     f"Node {self.node_rank} batch_size_list: {np.array(batch_size_list)}"
-            # )
-            # is_all_idle = all(size == 0 for size in np.array(batch_size_list).flatten())
-            # if not is_all_idle and ret is None:
-            #     ret = self.get_idle_batch()
+            def f(x):
+                return jax.lax.all_gather(x, "i")
+
+            batch_size_list = f(
+                np.array([ret.batch_size if ret is not None else 0], dtype=np.int32)
+            )
+            logger.info(
+                f"Node {self.node_rank} batch_size_list: {np.array(batch_size_list)}"
+            )
+            is_all_idle = all(size == 0 for size in np.array(batch_size_list).flatten())
+            if not is_all_idle and ret is None:
+                ret = self.get_idle_batch()
         logger.info(f"after dp sync Node {self.node_rank} ret: {ret}")
         if ret is not None:
             ret.enable_dp_attention = self.server_args.enable_dp_attention
