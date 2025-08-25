@@ -24,6 +24,8 @@ except ImportError:
     setproctitle = None
 
 from jax.experimental.multihost_utils import process_allgather
+from jax.sharding import Mesh, NamedSharding
+from jax.sharding import PartitionSpec as P
 
 from sgl_jax.global_config import global_config
 from sgl_jax.srt.configs.model_config import ModelConfig
