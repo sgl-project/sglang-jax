@@ -782,7 +782,9 @@ class Scheduler(
         # DP Attention: Synchronize batch across DP groups
         if self.server_args.enable_dp_attention:
             # 执行all gather, 统计信息, 决定当前scheduler是否需要idle batch
-            local_batch_size = ret.batch_size if ret is not None else 0
+            local_batch_size = np.array(
+                [ret.batch_size if ret is not None else 0], dtype=np.int32
+            )
             # todo bugfix: process_allgather is not working
             try:
                 batch_size_list = process_allgather(local_batch_size)
