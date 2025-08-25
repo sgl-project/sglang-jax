@@ -751,7 +751,6 @@ class Scheduler(
         token_usage = num_used / self.max_total_num_tokens
         return num_used, token_usage, available_size, evictable_size
 
-    @jax.pmap(axis_name="data")
     def get_next_batch_to_run(self) -> Optional[ScheduleBatch]:
         # Merge the prefill batch into the running batch
         if self.last_batch and self.last_batch.forward_mode.is_extend():
@@ -789,10 +788,8 @@ class Scheduler(
                 [ret.batch_size if ret is not None else 0], dtype=np.int32
             )
             logger.info(f"Node {self.node_rank} local_batch_size: {local_batch_size}")
-            with self.mesh:
-                batch_size_list = jax.lax.all_gather(
-                    local_batch_size, axis_name=("data")
-                )
+            with jax.sharding.use_mesh(mesh=mesh):
+                batch_size_list = jax.lax.all_gather(local_batch_size, axis_name="data")
             logger.info(f"Node {self.node_rank} batch_size_list: {batch_size_list}")
             is_all_idle = all(size == 0 for size in batch_size_list)
             if not is_all_idle and ret is None:
