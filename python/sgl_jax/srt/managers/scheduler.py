@@ -789,7 +789,9 @@ class Scheduler(
             )
             logger.info(f"Node {self.node_rank} local_batch_size: {local_batch_size}")
             with self.mesh:
-                batch_size_list = jax.lax.all_gather(local_batch_size, axis_name="data")
+                batch_size_list = jax.lax.all_gather(
+                    local_batch_size, axis_name=("data")
+                )
             logger.info(f"Node {self.node_rank} batch_size_list: {batch_size_list}")
             is_all_idle = all(size == 0 for size in batch_size_list)
             if not is_all_idle and ret is None:
