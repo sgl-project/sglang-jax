@@ -923,10 +923,10 @@ class ScheduleBatch:
         # Gather sizes from all devices
         if self.enable_dp_attention:
             # Collect local sizes into arrays for all-gather
-            local_sizes = jnp.array(
+            local_sizes_list = jnp.array(
                 [local_token_size, local_bs_size, local_cache_size], dtype=jnp.int32
             )
-            local_sizes = np.array(local_sizes_list, dtype=np.int32)
+            local_sizes = np.array(local_sizes, dtype=np.int32)
             # All-gather to get sizes from all devices
             all_sizes = process_allgather(local_sizes)
             # Calculate global max sizes
