@@ -1,6 +1,7 @@
 """A scheduler that manages a tensor parallel TPU worker."""
 
 import faulthandler
+import functools
 import logging
 import os
 import pickle
