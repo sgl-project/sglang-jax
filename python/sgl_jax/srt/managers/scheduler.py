@@ -243,7 +243,7 @@ class Scheduler(
         self.mesh = create_device_mesh(
             ici_parallelism=[-1, attn_tp_size, 1, 1],
             dcn_parallelism=[1, 1, 1, 1],
-            devices=jax.local_devices(),
+            devices=jax.devices(),
         )
 
         # 添加JAX设备信息日志
