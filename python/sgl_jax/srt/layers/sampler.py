@@ -43,7 +43,7 @@ class Sampler(nnx.Module):
             probs = jnp.divide(logits, sampling_info.temperatures)
             _, new_rng = jax.random.split(self.rngs.params())
             # A slower fallback implementation with torch native operations.
-            batch_next_token_ids = top_k_top_p_min_p_sampling_from_probs_torch(
+            batch_next_token_ids = top_k_top_p_min_p_sampling_from_probs_jax(
                 probs,
                 sampling_info.top_ks,
                 sampling_info.top_ps,
@@ -54,7 +54,7 @@ class Sampler(nnx.Module):
         return batch_next_token_ids
 
 
-def top_k_top_p_min_p_sampling_from_probs_torch(
+def top_k_top_p_min_p_sampling_from_probs_jax(
     probs: jax.Array,
     top_ks: jax.Array,
     top_ps: jax.Array,

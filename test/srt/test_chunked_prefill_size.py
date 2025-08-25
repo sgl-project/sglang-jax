@@ -36,9 +36,11 @@ class TestChunkedPrefillSize(CustomTestCase):
                 "--dtype",
                 "bfloat16",
                 "--jax-precompile-decode-bs-paddings",
-                "10",
+                "64",
                 "--jax-precompile-prefill-token-paddings",
                 "16384",
+                "--max-running-requests",
+                "64",
             ],
             env={
                 "JAX_COMPILATION_CACHE_DIR": "/tmp/jax_compilation_cache",

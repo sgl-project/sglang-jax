@@ -35,6 +35,11 @@ DEFAULT_MASK_VALUE = -0.7 * float(jnp.finfo(jnp.dtype("float32")).max)
 TUNED_BLOCK_SIZES = {
     "TPU v6": {
         # (q_dtype, kv_dtype, num_kv_heads_per_blk, head_dim, page_size)
+        ("bfloat16", "bfloat16", 2, 128, 64): (32, 64),
+        ("bfloat16", "bfloat16", 4, 128, 64): (32, 64),
+        ("bfloat16", "bfloat16", 8, 128, 64): (16, 64),
+        ("bfloat16", "bfloat16", 16, 128, 64): (16, 64),
+        ("bfloat16", "bfloat16", 32, 128, 64): (16, 64),
         ("bfloat16", "bfloat16", 2, 128, 128): (16, 32),
         ("bfloat16", "bfloat16", 4, 128, 128): (8, 32),
         ("bfloat16", "bfloat16", 8, 128, 128): (16, 32),
@@ -159,63 +164,6 @@ class MultiPageAsyncCopyDescriptor:
         return self._k_vmem_buf, self._v_vmem_buf
 
 
-def ref_ragged_paged_attention(
-    queries: jax.Array,  # [max_num_batched_tokens, num_q_heads, head_dim]
-    k_pages: jax.Array,  # [total_num_pages, page_size, num_kv_heads, head_dim]
-    v_pages: jax.Array,  # [total_num_pages, page_size, num_kv_heads, head_dim]
-    kv_lens: jax.Array,  # i32[max_num_seqs]
-    page_indices: jax.Array,  # i32[max_num_seqs, pages_per_seq]
-    cu_q_lens: jax.Array,  # i32[max_num_seqs + 1]
-    num_seqs: jax.Array,  # i32[1],
-    *,
-    sm_scale: float = 1.0,
-    sliding_window: int | None = None,
-    soft_cap: float | None = None,
-    mask_value: float | None = DEFAULT_MASK_VALUE,
-    k_scale: float | None = None,
-    v_scale: float | None = None,
-):
-    if mask_value is None:
-        mask_value = DEFAULT_MASK_VALUE
-    _, _, num_kv_heads, head_dim = k_pages.shape
-    num_q_heads = queries.shape[1]
-    assert num_q_heads % num_kv_heads == 0
-    num_query_per_kv = num_q_heads // num_kv_heads
-    outputs = []
-    for i in range(num_seqs[0]):
-        q_start = cu_q_lens[i]
-        q_end = cu_q_lens[i + 1]
-        q_len = q_end - q_start
-        kv_len = kv_lens[i]
-        indices = page_indices[i]
-        q = queries[q_start:q_end]
-        k = k_pages[indices, :, :, :].reshape(-1, num_kv_heads, head_dim)[:kv_len]
-        v = v_pages[indices, :, :, :].reshape(-1, num_kv_heads, head_dim)[:kv_len]
-        if k_scale is not None:
-            k = k.astype(jnp.float32) * k_scale
-            k = k.astype(q.dtype)
-        if v_scale is not None:
-            v = v.astype(jnp.float32) * v_scale
-            v = v.astype(q.dtype)
-        k = jnp.repeat(k, num_query_per_kv, axis=1)
-        v = jnp.repeat(v, num_query_per_kv, axis=1)
-        attn = jnp.einsum("qhd,khd->hqk", q, k, preferred_element_type=jnp.float32)
-        attn *= sm_scale
-        q_span = (kv_len - q_len) + jax.lax.broadcasted_iota(jnp.int32, attn.shape, 1)
-        kv_span = jax.lax.broadcasted_iota(jnp.int32, attn.shape, 2)
-        mask = q_span < kv_span
-        if sliding_window is not None:
-            mask = jnp.logical_or(mask, q_span - sliding_window >= kv_span)
-        if soft_cap is not None:
-            attn = soft_cap * jnp.tanh(attn / soft_cap)
-        attn += jnp.where(mask, mask_value, 0.0)
-        attn = jax.nn.softmax(attn, axis=-1).astype(v.dtype)
-        out = jnp.einsum("hqk,khd->qhd", attn, v).astype(queries.dtype)
-        outputs.append(out)
-
-    return jnp.concatenate(outputs, axis=0)
-
-
 # Expect to run these checks during compile time.
 def static_validate_inputs(
     q: jax.Array,  # [max_num_batched_tokens, num_q_heads, head_dim]
@@ -225,6 +173,7 @@ def static_validate_inputs(
     cu_q_lens: jax.Array,  # i32[max_num_seqs + 1]
     cu_kv_lens: jax.Array,  # i32[max_num_seqs + 1]
     num_seqs: jax.Array,  # i32[1]
+    seq_lens: jax.Array,  # i32[max_num_seqs]
     *,
     # These inputs are optional. If not specified, we will not validate them.
     sm_scale: float | None = None,
@@ -263,11 +212,12 @@ def static_validate_inputs(
         cu_kv_lens.dtype != jnp.int32
         or page_indices.dtype != jnp.int32
         or cu_q_lens.dtype != jnp.int32
+        or seq_lens.dtype != jnp.int32
     ):
         raise ValueError(
-            "The dtype of `kv_lens`, `page_indices`, and `cu_q_lens` must be"
+            "The dtype of `kv_lens`, `page_indices`, `cu_q_lens`, and `seq_lens` must be"
             f" int32. Got {cu_kv_lens.dtype=}, {page_indices.dtype=},"
-            f" {cu_q_lens.dtype=}."
+            f" {cu_q_lens.dtype=}, {seq_lens.dtype=}."
         )
     if num_q_heads % num_kv_heads != 0:
         raise ValueError(f"{num_q_heads=} must be divisible by {num_kv_heads=}")
@@ -347,6 +297,7 @@ def ragged_paged_attention_kernel(
     cu_kv_lens_ref,  # [max_num_seqs + 1]
     seq_buf_idx_ref,
     num_seqs_ref,
+    seq_lens_ref,
     # Input
     q_ref,  # [num_q_per_blk, num_q_heads_per_blk, head_dim]
     k_cache_hbm_ref,  # [total_num_pages, page_size, num_kv_heads, head_dim]
@@ -438,6 +389,8 @@ def ragged_paged_attention_kernel(
         kv_end = cu_kv_lens_ref[cur_seq_idx + 1]
         kv_len = kv_end - kv_start
 
+        actual_kv_len = seq_lens_ref[cur_seq_idx]
+
         def get_next_prefetch_ids(heads_blk_idx, cur_seq_idx, kv_blk_idx, cur_buf_idx):
             next_kv_blk_idx = kv_blk_idx + 1
             is_last_kv_blk = next_kv_blk_idx * num_kv_per_blk >= kv_len
@@ -475,6 +428,7 @@ def ragged_paged_attention_kernel(
             head_acc_ref,  # [num_q_per_blk, num_q_heads_per_kv_head, head_dim]
             *,
             kv_blk_idx,
+            actual_kv_len,
         ):
             assert q.shape == (
                 num_q_per_blk * num_q_heads_per_kv_head,
@@ -516,10 +470,8 @@ def ragged_paged_attention_kernel(
                     kv_blk_idx == 0, jnp.full_like(ref, init_val), ref[...]
                 )
 
-            # kv lens will be contracting dim, we should mask out the NaNs.
-            kv_mask = (
-                lax.broadcasted_iota(jnp.int32, k.shape, 0) < kv_len - kv_len_start
-            )
+            effective_kv_len = actual_kv_len - kv_len_start
+            kv_mask = lax.broadcasted_iota(jnp.int32, k.shape, 0) < effective_kv_len
             k = jnp.where(kv_mask, k.astype(jnp.float32), 0).astype(k.dtype)
             v = jnp.where(kv_mask, v.astype(jnp.float32), 0).astype(v.dtype)
 
@@ -531,7 +483,7 @@ def ragged_paged_attention_kernel(
             store_end = jnp.minimum(q_end - q_len_start, num_q_per_blk)
 
             row_ids = (
-                (kv_len - q_len)
+                (actual_kv_len - q_len)
                 + q_len_start
                 - q_start
                 + jax.lax.broadcasted_iota(
@@ -607,7 +559,7 @@ def ragged_paged_attention_kernel(
 
         def is_valid_kv_blk_in_cur_seq(kv_states):
             kv_blk_idx, _ = kv_states
-            return kv_blk_idx * num_kv_per_blk < kv_len
+            return kv_blk_idx * num_kv_per_blk < actual_kv_len
 
         def compute_with_kv_blk_in_cur_seq(kv_states):
             kv_blk_idx, cur_buf_idx = kv_states
@@ -667,6 +619,7 @@ def ragged_paged_attention_kernel(
                     m_ref.at[kv_head_idx],
                     acc_ref.at[:, q_head_idx : q_head_idx + num_q_heads_per_kv_head, :],
                     kv_blk_idx=kv_blk_idx,
+                    actual_kv_len=actual_kv_len,
                 )
             return kv_blk_idx + 1, next_buf_idx
 
@@ -737,6 +690,7 @@ def ragged_paged_attention(
     cu_q_lens: jax.Array,  # i32[max_num_seqs + 1]
     cu_kv_lens: jax.Array,  # i32[max_num_seqs + 1]
     num_seqs: jax.Array,  # i32[1]
+    seq_lens: jax.Array,  # i32[padded_num_seqs]
     *,
     sm_scale: float = 1.0,
     sliding_window: int | None = None,
@@ -782,6 +736,7 @@ def ragged_paged_attention(
         cu_q_lens,
         cu_kv_lens,
         num_seqs,
+        seq_lens,
         sm_scale=sm_scale,
         sliding_window=sliding_window,
         soft_cap=soft_cap,
@@ -865,6 +820,7 @@ def ragged_paged_attention(
         cu_kv_lens,
         jnp.array((0, 0), jnp.int32),  # seq_idx, buf_idx
         num_seqs,
+        seq_lens,
     )
     kernel = pl.pallas_call(
         functools.partial(

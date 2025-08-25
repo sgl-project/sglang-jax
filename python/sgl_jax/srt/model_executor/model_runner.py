@@ -249,6 +249,8 @@ class ModelRunner:
                 "Not enough memory. Please try to increase --mem-fraction-static."
             )
 
+        logger.info(f"ModelRunner max_total_num_tokens: {self.max_total_num_tokens}")
+
         # Create request to token pool if not already created
         if self.req_to_token_pool is None:
             self.req_to_token_pool = ReqToTokenPool(

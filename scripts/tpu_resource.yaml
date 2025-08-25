@@ -14,3 +14,4 @@ setup: |
   git clone https://${USERNAME}:${GIT_TOKEN}@github.com/sgl-project/sglang-jax.git
   cd sglang-jax && git fetch origin $REF:$REF && git checkout $REF
   uv pip install -e python/
+  bash scripts/killall_sglang.sh

@@ -540,9 +540,9 @@ class ScheduleBatch:
 
     def alloc_paged_token_slots_extend(
         self,
-        prefix_lens: jax.Array,
-        seq_lens: jax.Array,
-        last_loc: jax.Array,
+        prefix_lens: List[int],
+        seq_lens: List[int],
+        last_loc: List[int],
         extend_num_tokens: int,
         backup_state: bool = False,
     ):
@@ -574,8 +574,8 @@ class ScheduleBatch:
 
     def alloc_paged_token_slots_decode(
         self,
-        seq_lens: jax.Array,
-        last_loc: jax.Array,
+        seq_lens: List[int],
+        last_loc: List[int],
         backup_state: bool = False,
     ):
         num_tokens = len(seq_lens) * self.token_to_kv_pool_allocator.page_size
@@ -700,7 +700,10 @@ class ScheduleBatch:
                 prefix_lens_device,
             )
             out_cache_loc = self.alloc_paged_token_slots_extend(
-                prefix_lens_device, seq_lens_device, last_loc, extend_num_tokens
+                prefix_lens,
+                seq_lens,
+                jax.device_get(last_loc).tolist(),
+                extend_num_tokens,
             )
 
         # Set fields
@@ -756,6 +759,14 @@ class ScheduleBatch:
     def retract_decode(self, server_args: ServerArgs):
         """Retract the decoding requests when there is not enough memory."""
         sorted_indices = list(range(len(self.reqs)))
+
+        sorted_indices.sort(
+            key=lambda i: (
+                len(self.reqs[i].output_ids),
+                -len(self.reqs[i].origin_input_ids),
+            ),
+            reverse=True,
+        )
 
         def get_required_tokens(num_reqs: int):
             return num_reqs * global_config.retract_decode_steps
@@ -871,7 +882,8 @@ class ScheduleBatch:
                 self.req_pool_indices, self.seq_lens - 2
             ]
             self.out_cache_loc = self.alloc_paged_token_slots_decode(
-                self.seq_lens, last_loc
+                jax.device_get(self.seq_lens).tolist(),
+                jax.device_get(last_loc).tolist(),
             )
 
         self.req_to_token_pool.write(
@@ -965,6 +977,7 @@ class ScheduleBatch:
         prefill_padded_batch_size: int,
         bs_paddings: list,
         token_paddings: list,
+        page_size: int,
     ) -> ModelWorkerBatch:
         if self.forward_mode.is_decode_or_idle():
             extend_seq_lens = extend_prefix_lens = extend_logprob_start_lens = None
@@ -1068,16 +1081,25 @@ class ScheduleBatch:
 
         total_cache_size = sum(seq_lens_cpu)
 
-        cache_loc_flat = np.zeros(total_cache_size, dtype=np.int32)
-
+        # cache_loc_flat = np.zeros(total_cache_size, dtype=np.int32)
+        cache_loc_flat = []
         offset = 0
         for seq_idx in range(len(seq_lens_cpu)):
             seq_len = seq_lens_cpu[seq_idx]
             if seq_len > 0:  # Only process non-empty sequences
-                cache_loc_flat[offset : offset + seq_len] = token_indices_with_all_reqs[
-                    seq_idx, :seq_len
-                ]
+                tmp = token_indices_with_all_reqs[seq_idx, :seq_len].tolist()
+                aligned_tmp = align_to_size(tmp, page_size, 0)
+                cache_loc_flat.extend(aligned_tmp)
                 offset += seq_len
+
+        # offset = 0
+        # for seq_idx in range(len(seq_lens_cpu)):
+        #     seq_len = seq_lens_cpu[seq_idx]
+        #     if seq_len > 0:  # Only process non-empty sequences
+        #         cache_loc_flat[offset : offset + seq_len] = token_indices_with_all_reqs[
+        #             seq_idx, :seq_len
+        #         ]
+        #         offset += seq_len
 
         total_cache_loc_size = max_total_num_tokens
         if total_cache_loc_size > len(cache_loc_flat):
@@ -1086,6 +1108,8 @@ class ScheduleBatch:
                 (0, total_cache_loc_size - len(cache_loc_flat)),
                 constant_values=0,
             )
+        else:
+            cache_loc_cpu = np.array(cache_loc_flat, dtype=np.int32)
 
         # seq_lens_padding = self.seq_lens
         if bs_padding_size > 0:
@@ -1191,6 +1215,11 @@ class ScheduleBatch:
         available_size = self.token_to_kv_pool_allocator.available_size()
         evictable_size = self.tree_cache.evictable_size()
         return f"Available tokens: {available_size + evictable_size} ({available_size=} + {evictable_size=})\n"
+
+
+def align_to_size(l: list, size: int, value: int = 0) -> list:
+    align_len = (len(l) + size - 1) // size * size
+    return l[:] + [value] * (align_len - len(l))
 
 
 @dataclasses.dataclass

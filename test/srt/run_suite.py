@@ -147,7 +147,6 @@ suites = {
         TestFile("test/srt/test_tpu_availability.py", 3),
         TestFile("test/srt/test_abort.py", 20),
         TestFile("test/srt/test_qwen_models.py", 30),
-        # TestFile("test/srt/test_page_size.py", 30),
         TestFile("test/srt/test_chunked_prefill_size.py", 30),
         TestFile("test/srt/openai_server/basic/test_protocol.py", 10),
         TestFile("test/srt/openai_server/basic/test_serving_chat.py", 10),
@@ -157,6 +156,7 @@ suites = {
     "per-commit-tpu-v6e-2": [],
     "per-commit-tpu-v6e-4": [
         TestFile("test/srt/test_base_tp.py", 45),
+        TestFile("test/srt/test_page_size.py", 30),
         # TestFile("test/srt/test_precompile.py", 300),
     ],
     "per-commit-tpu-v6e-8": [],
