@@ -790,6 +790,8 @@ class Scheduler(
             if not is_idle:
                 ret = self.get_idle_batch()
         logger.info(f"after dp sync Node {self.node_rank} ret: {ret}")
+        if ret is not None:
+            ret.enable_dp_attention = self.server_args.enable_dp_attention
         return ret
 
     def get_new_batch_prefill(self) -> Optional[ScheduleBatch]:

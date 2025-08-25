@@ -468,6 +468,8 @@ class ScheduleBatch:
     # device mesh
     mesh: mesh_lib.Mesh = None
 
+    enable_dp_attention: bool = False
+
     @classmethod
     def init_new(
         cls,
