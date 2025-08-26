@@ -8,11 +8,13 @@ import signal
 import sys
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Dict, List, Optional, Union
 
 import jax
+import numpy as np
 import psutil
 import setproctitle
 import zmq
@@ -44,6 +46,7 @@ from sgl_jax.srt.managers.scheduler_output_processor_mixin import (
 )
 from sgl_jax.srt.managers.scheduler_profiler_mixing import SchedulerProfilerMixin
 from sgl_jax.srt.managers.tp_worker import ModelWorker
+from sgl_jax.srt.managers.tp_worker_overlap_thread import ModelWorkerClient
 from sgl_jax.srt.managers.utils import validate_input_length
 from sgl_jax.srt.mem_cache.chunk_cache import ChunkCache
 from sgl_jax.srt.mem_cache.radix_cache import RadixCache
@@ -127,6 +130,7 @@ class Scheduler(
         self.stream_interval = server_args.stream_interval
         self.max_seq_len = server_args.max_seq_len
         self.page_size = server_args.page_size
+        self.enable_overlap = not server_args.disable_overlap_schedule
 
         # Init inter-process communication
         context = zmq.Context(2)
@@ -182,6 +186,10 @@ class Scheduler(
         # Init tokenizer
         self.init_tokenizer()
 
+        if not self.is_generation:
+            self.enable_overlap = False
+            logger.info("Overlap scheduler is disabled for embedding models.")
+
         # init distribution
         if self.nnodes > 1:
             jax.distributed.initialize(
@@ -191,7 +199,12 @@ class Scheduler(
             ici_parallelism=[-1, self.tp_size, 1, 1], dcn_parallelism=[1, 1, 1, 1]
         )
 
-        self.tp_worker = ModelWorker(
+        if self.enable_overlap:
+            TpWorkerClass = ModelWorkerClient
+        else:
+            TpWorkerClass = ModelWorker
+
+        self.tp_worker = TpWorkerClass(
             server_args=server_args,
             mesh=self.mesh,
         )
@@ -406,6 +419,50 @@ class Scheduler(
 
             self.last_batch = batch
 
+    def event_loop_overlap(self):
+        """A scheduler loop that overlaps the CPU processing and Accelerator computation."""
+        self.result_queue = deque()
+
+        while True:
+            recv_reqs = self.recv_requests()
+            self.process_input_requests(recv_reqs)
+
+            batch = self.get_next_batch_to_run()
+            self.cur_batch = batch
+
+            if batch:
+                batch.launch_done = threading.Event()
+                result = self.run_batch(batch)
+                self.result_queue.append((batch.copy(), result))
+
+                if self.last_batch is None:
+                    # Create a dummy first batch to start the pipeline for overlap schedule.
+                    # It is now used for triggering the sampling_info_done event.
+                    tmp_batch = ScheduleBatch(
+                        reqs=None,
+                        forward_mode=ForwardMode.DUMMY_FIRST,
+                        next_batch_sampling_info=self.tp_worker.cur_sampling_info,
+                    )
+                    self.process_batch_result(tmp_batch, None, batch.launch_done)
+
+            if self.last_batch:
+                # Process the results of the last batch
+                tmp_batch, tmp_result = self.result_queue.popleft()
+                tmp_batch.next_batch_sampling_info = (
+                    self.tp_worker.cur_sampling_info if batch else None
+                )
+                # NOTE: we should use current launched batch's launch_done event Instead of the last batch's
+                self.process_batch_result(
+                    tmp_batch, tmp_result, batch.launch_done if batch else None
+                )
+            elif batch is None:
+                # When the server is idle, do self-check and re-init some states
+                self.check_memory()
+                self.check_tree_cache()
+                self.new_token_ratio = self.init_new_token_ratio
+
+            self.last_batch = batch
+
     def run_publisher(self, recv_reqs):
         retry_count = 0
         while retry_count < 3:
@@ -605,7 +662,7 @@ class Scheduler(
                 self.running_batch.batch_is_full = False
 
             # Merge the new batch into the running batch
-            if not self.last_batch.is_empty():
+            if not self.last_batch.is_empty() and not self.last_batch.is_prefill_only:
                 if self.running_batch.is_empty():
                     self.running_batch = self.last_batch
                 else:
@@ -701,6 +758,7 @@ class Scheduler(
             self.token_to_kv_pool_allocator,
             self.tree_cache,
             self.model_config,
+            self.enable_overlap,
             False,
             self.chunked_req,
             self.mesh,
@@ -761,23 +819,34 @@ class Scheduler(
         # Run forward
         assert self.is_generation
 
+        (
+            prefill_padded_batch_size,
+            precompile_prefill_token_paddings,
+            precompile_decode_bs_paddings,
+            precompile_prefill_cache_loc_paddings,
+            precompile_decode_cache_loc_paddings,
+        ) = self.tp_worker.get_precompile_paddings()
         model_worker_batch = batch.get_model_worker_batch(
-            self.tp_worker.prefill_padded_batch_size,
-            self.tp_worker.precompile_decode_bs_paddings,
-            self.tp_worker.precompile_prefill_token_paddings,
-            self.tp_worker.page_size,
-            self.tp_worker.precompile_prefill_cache_loc_paddings,
-            self.tp_worker.precompile_decode_cache_loc_paddings,
+            prefill_padded_batch_size,
+            precompile_decode_bs_paddings,
+            precompile_prefill_token_paddings,
+            self.page_size,
+            precompile_prefill_cache_loc_paddings,
+            precompile_decode_cache_loc_paddings,
         )
 
-        logits_output, next_token_ids_device, cache_miss_count = (
-            self.tp_worker.forward_batch_generation(model_worker_batch)
-        )
-
-        # next_token_ids = jax.device_get(next_token_ids_device)
+        if self.enable_overlap:
+            logits_output, next_token_ids, cache_miss_count = (
+                self.tp_worker.forward_batch_generation(model_worker_batch)
+            )
+        else:
+            logits_output, next_token_ids_device, cache_miss_count = (
+                self.tp_worker.forward_batch_generation(model_worker_batch)
+            )
+            next_token_ids = np.array(jax.device_get(next_token_ids_device))
 
         bid = model_worker_batch.bid
-        # batch.output_ids = next_token_ids_device
+        batch.output_ids = next_token_ids
 
         # These 2 values are needed for processing the output, but the values can be
         # modified by overlap schedule. So we have to copy them here so that
@@ -795,7 +864,7 @@ class Scheduler(
 
         ret = GenerationBatchResult(
             logits_output=logits_output,
-            next_token_ids=next_token_ids_device,
+            next_token_ids=next_token_ids.tolist(),
             extend_input_len_per_req=extend_input_len_per_req,
             extend_logprob_start_len_per_req=extend_logprob_start_len_per_req,
             bid=bid,
@@ -808,12 +877,19 @@ class Scheduler(
         self,
         batch: ScheduleBatch,
         result: Union[GenerationBatchResult],
+        launch_done: Optional[threading.Event] = None,
     ):
 
         if batch.forward_mode.is_decode():
             self.process_batch_result_decode(batch, result)
         elif batch.forward_mode.is_extend():
             self.process_batch_result_prefill(batch, result)
+        elif batch.forward_mode.is_idle():
+            if self.enable_overlap:
+                self.tp_worker.resolve_last_batch_result(launch_done)
+                self.set_next_batch_sampling_info_done(batch)
+        elif batch.forward_mode.is_dummy_first():
+            self.set_next_batch_sampling_info_done(batch)
 
     def get_idle_batch(self):
         idle_batch = ScheduleBatch.init_new(
@@ -822,6 +898,7 @@ class Scheduler(
             self.token_to_kv_pool_allocator,
             self.tree_cache,
             self.model_config,
+            self.enable_overlap,
             self.server_args.enable_custom_logit_processor,
             self.mesh,
         )
@@ -829,7 +906,8 @@ class Scheduler(
         return idle_batch
 
     def set_next_batch_sampling_info_done(self, batch: ScheduleBatch):
-        pass
+        if batch.next_batch_sampling_info:
+            batch.next_batch_sampling_info.sampling_info_done.set()
 
     def watchdog_thread(self):
         """A watch dog thread that will try to kill the server itself if one forward batch takes too long."""
@@ -920,7 +998,10 @@ def run_scheduler_process(
             }
         )
 
-        scheduler.event_loop_normal()
+        if scheduler.enable_overlap:
+            scheduler.event_loop_overlap()
+        else:
+            scheduler.event_loop_normal()
 
     except Exception:
         traceback = get_exception_traceback()

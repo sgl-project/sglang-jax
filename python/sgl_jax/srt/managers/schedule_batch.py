@@ -18,6 +18,7 @@ ScheduleBatch -> ModelWorkerBatch -> ForwardBatch
 
 import dataclasses
 import logging
+import threading
 from http import HTTPStatus
 from typing import Any, List, Optional, Set, Tuple, Union
 
@@ -426,6 +427,7 @@ class ScheduleBatch:
     # Batch configs
     model_config: ModelConfig = None
     forward_mode: ForwardMode = None
+    enable_overlap: bool = False
     # Tell whether the current running batch is full so that we can skip
     # the check of whether to prefill new requests.
     # This is an optimization to reduce the overhead of the prefill check.
@@ -477,6 +479,12 @@ class ScheduleBatch:
     # Whether to return hidden states
     return_hidden_states: bool = False
 
+    # Whether this batch is prefill-only (no token generation needed)
+    is_prefill_only: bool = False
+
+    # Events
+    launch_done: Optional[threading.Event] = None
+
     @classmethod
     def init_new(
         cls,
@@ -485,6 +493,7 @@ class ScheduleBatch:
         token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
         tree_cache: BasePrefixCache,
         model_config: ModelConfig,
+        enable_overlap: bool,
         enable_custom_logit_processor: bool = False,
         chunked_req: Optional[Req] = None,
         mesh: mesh_lib.Mesh = None,
@@ -498,9 +507,13 @@ class ScheduleBatch:
             tree_cache=tree_cache,
             model_config=model_config,
             return_logprob=return_logprob,
+            enable_overlap=enable_overlap,
             has_stream=any(req.stream for req in reqs),
             chunked_req=chunked_req,
             mesh=mesh,
+            is_prefill_only=all(
+                req.sampling_params.max_new_tokens == 0 for req in reqs
+            ),
         )
 
     def batch_size(self):
@@ -759,7 +772,11 @@ class ScheduleBatch:
             return len(self.reqs)
         # In the decoding phase, the length of a request's KV cache should be
         # the total length of the request minus 1
-        return sum(1 for req in self.reqs if (req.seqlen - 1) % page_size == 0)
+        return (
+            sum(1 for req in self.reqs if req.seqlen % page_size == 0)
+            if self.enable_overlap
+            else sum(1 for req in self.reqs if (req.seqlen - 1) % page_size == 0)
+        )
 
     def check_decode_mem(self, buf_multiplier=1):
         num_tokens = (
@@ -877,7 +894,10 @@ class ScheduleBatch:
 
         locs = self.seq_lens.copy()
 
-        self.seq_lens = np.add(self.seq_lens, 1)
+        if self.enable_overlap:
+            self.seq_lens = self.seq_lens + 1
+        else:
+            self.seq_lens = np.add(self.seq_lens, 1)
         self.seq_lens_sum += bs
 
         # Allocate memory
@@ -1005,7 +1025,14 @@ class ScheduleBatch:
         global bid
         bid += 1
 
-        input_ids_cpu = self.input_ids.flatten()
+        if self.input_ids is None:
+            print(
+                f"input_ids is None forward_mode: {self.forward_mode=}, enable_overlap: {self.enable_overlap}, reqs: {self.reqs=}"
+            )
+            input_ids_cpu = np.empty(0, dtype=np.int32)
+        else:
+            input_ids_cpu = self.input_ids.flatten()
+
         real_input_ids_len = len(input_ids_cpu)
         out_cache_loc_cpu = self.out_cache_loc
         seq_lens_cpu = self.seq_lens
@@ -1184,6 +1211,19 @@ class ScheduleBatch:
             extend_input_logprob_token_ids=self.extend_input_logprob_token_ids,
             real_bs=real_bs,
             capture_hidden_mode=CaptureHiddenMode.NULL,
+            launch_done=self.launch_done,
+        )
+
+    def copy(self):
+        # Only contain fields that will be used by process_batch_result
+        return ScheduleBatch(
+            reqs=self.reqs,
+            model_config=self.model_config,
+            forward_mode=self.forward_mode,
+            out_cache_loc=self.out_cache_loc,
+            return_logprob=self.return_logprob,
+            decoding_reqs=self.decoding_reqs,
+            is_prefill_only=self.is_prefill_only,
         )
 
     def _evict_tree_cache_if_needed(
@@ -1258,6 +1298,9 @@ class ModelWorkerBatch:
     temperature: np.ndarray = None
     top_p_normalized_logprobs: bool = False
     top_p: np.ndarray = None
+
+    # Events
+    launch_done: Optional[threading.Event] = None
 
 
 def get_last_loc(
