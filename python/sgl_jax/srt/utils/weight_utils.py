@@ -485,7 +485,22 @@ class WeightLoader:
                 )
                 num_original_heads = self.original_num_kv_heads_per_device
 
-                if num_heads_to_add == num_original_heads:
+                original_total_kv_heads = self.model_config.get_total_num_kv_heads()
+
+                if (
+                    num_heads_to_add == num_original_heads
+                    and self.sharding_size <= original_total_kv_heads
+                ):
+                    interleaved_pieces = []
+                    for head_idx in range(num_original_heads):
+                        start_idx = head_idx * self.head_dim
+                        end_idx = (head_idx + 1) * self.head_dim
+                        original_head_bias = weight[start_idx:end_idx]
+                        interleaved_pieces.extend(
+                            [original_head_bias, original_head_bias]
+                        )
+                    return jnp.concatenate(interleaved_pieces, axis=0)
+                elif self.sharding_size > original_total_kv_heads:
                     interleaved_pieces = []
                     for head_idx in range(num_original_heads):
                         start_idx = head_idx * self.head_dim
@@ -495,7 +510,17 @@ class WeightLoader:
                             [original_head_bias, original_head_bias]
                         )
 
-                    return jnp.concatenate(interleaved_pieces, axis=0)
+                    pattern = jnp.concatenate(interleaved_pieces, axis=0)
+                    total_heads_needed = (
+                        self.padded_num_kv_heads_per_device * self.sharding_size
+                    )
+                    pattern_heads = num_original_heads * 2
+                    num_pattern_repeats = total_heads_needed // pattern_heads
+
+                    final_pieces = []
+                    for _ in range(num_pattern_repeats):
+                        final_pieces.append(pattern)
+                    return jnp.concatenate(final_pieces, axis=0)
                 else:
                     padding_pieces = []
                     for i in range(num_heads_to_add):
@@ -509,10 +534,34 @@ class WeightLoader:
                         padding = jnp.concatenate(padding_pieces, axis=0)
                     else:
                         padding = jnp.zeros((0,), dtype=weight.dtype)
-            else:
-                padding = jnp.zeros((padding_size,), dtype=weight.dtype)
+            else:  # zero padding for MHA models
+                original_total_kv_heads = self.model_config.get_total_num_kv_heads()
 
-            return jnp.concatenate([weight, padding], axis=0)
+                if self.sharding_size > original_total_kv_heads:
+                    padded_pieces = []
+                    for head_idx in range(self.original_num_kv_heads_per_device):
+                        start_idx = head_idx * self.head_dim
+                        end_idx = (head_idx + 1) * self.head_dim
+                        original_head_bias = weight[start_idx:end_idx]
+                        zero_head_bias = jnp.zeros((self.head_dim,), dtype=weight.dtype)
+                        padded_pieces.extend([original_head_bias, zero_head_bias])
+
+                    pattern = jnp.concatenate(padded_pieces, axis=0)
+                    total_heads_needed = (
+                        self.padded_num_kv_heads_per_device * self.sharding_size
+                    )
+                    pattern_heads = (
+                        self.original_num_kv_heads_per_device * 2
+                    )  # each head + zero
+                    num_pattern_repeats = total_heads_needed // pattern_heads
+
+                    final_pieces = []
+                    for _ in range(num_pattern_repeats):
+                        final_pieces.append(pattern)
+                    return jnp.concatenate(final_pieces, axis=0)
+                else:
+                    padding = jnp.zeros((padding_size,), dtype=weight.dtype)
+                    return jnp.concatenate([weight, padding], axis=0)
         else:
             hidden_size, kv_dim = weight.shape
 
@@ -557,20 +606,38 @@ class WeightLoader:
                 else:
                     num_original_heads = self.original_num_kv_heads_per_device
 
-                # For GQA, we want each head to be duplicated in-place
-                # E.g., [head_0, head_1, head_2, head_3] -> [head_0, head_0, head_1, head_1, head_2, head_2, head_3, head_3]
-                if num_heads_to_add == num_original_heads:
-                    # Special case: duplicate each head once (most common for GQA)
-                    # Interleave original heads with their copies
+                original_total_kv_heads = self.model_config.get_total_num_kv_heads()
+
+                if (
+                    num_heads_to_add == num_original_heads
+                    and self.sharding_size <= original_total_kv_heads
+                ):
                     interleaved_pieces = []
                     for head_idx in range(num_original_heads):
                         start_idx = head_idx * self.head_dim
                         end_idx = (head_idx + 1) * self.head_dim
                         original_head = weight[:, start_idx:end_idx]
-                        # Add original head and its copy
+                        interleaved_pieces.extend([original_head, original_head])
+                    return jnp.concatenate(interleaved_pieces, axis=1)
+                elif self.sharding_size > original_total_kv_heads:
+                    interleaved_pieces = []
+                    for head_idx in range(num_original_heads):
+                        start_idx = head_idx * self.head_dim
+                        end_idx = (head_idx + 1) * self.head_dim
+                        original_head = weight[:, start_idx:end_idx]
                         interleaved_pieces.extend([original_head, original_head])
 
-                    return jnp.concatenate(interleaved_pieces, axis=1)
+                    pattern = jnp.concatenate(interleaved_pieces, axis=1)
+                    total_heads_needed = (
+                        self.padded_num_kv_heads_per_device * self.sharding_size
+                    )
+                    pattern_heads = num_original_heads * 2
+                    num_pattern_repeats = total_heads_needed // pattern_heads
+
+                    final_pieces = []
+                    for _ in range(num_pattern_repeats):
+                        final_pieces.append(pattern)
+                    return jnp.concatenate(final_pieces, axis=1)
                 else:
                     padding_pieces = []
                     for i in range(num_heads_to_add):
@@ -585,10 +652,36 @@ class WeightLoader:
                     else:
                         # No padding needed
                         padding = jnp.zeros((weight.shape[0], 0), dtype=weight.dtype)
-            else:  # zero padding
-                padding = jnp.zeros((hidden_size, padding_size), dtype=weight.dtype)
+            else:  # zero padding for MHA models
+                original_total_kv_heads = self.model_config.get_total_num_kv_heads()
 
-            return jnp.concatenate([weight, padding], axis=1)
+                if self.sharding_size > original_total_kv_heads:
+                    padded_pieces = []
+                    for head_idx in range(self.original_num_kv_heads_per_device):
+                        start_idx = head_idx * self.head_dim
+                        end_idx = (head_idx + 1) * self.head_dim
+                        original_head = weight[:, start_idx:end_idx]
+                        zero_head = jnp.zeros(
+                            (weight.shape[0], self.head_dim), dtype=weight.dtype
+                        )
+                        padded_pieces.extend([original_head, zero_head])
+
+                    pattern = jnp.concatenate(padded_pieces, axis=1)
+                    total_heads_needed = (
+                        self.padded_num_kv_heads_per_device * self.sharding_size
+                    )
+                    pattern_heads = (
+                        self.original_num_kv_heads_per_device * 2
+                    )  # each head + zero
+                    num_pattern_repeats = total_heads_needed // pattern_heads
+
+                    final_pieces = []
+                    for _ in range(num_pattern_repeats):
+                        final_pieces.append(pattern)
+                    return jnp.concatenate(final_pieces, axis=1)
+                else:
+                    padding = jnp.zeros((hidden_size, padding_size), dtype=weight.dtype)
+                    return jnp.concatenate([weight, padding], axis=1)
 
     def _process_moe_expert_weights(
         self,
