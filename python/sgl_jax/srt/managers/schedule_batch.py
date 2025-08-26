@@ -29,7 +29,7 @@ import jax.numpy as jnp
 import numpy as np
 from jax._src import mesh as mesh_lib
 from jax.experimental import shard_map
-from jax.sharding import Mesh
+from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 
 from sgl_jax.global_config import global_config
