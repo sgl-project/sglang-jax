@@ -555,7 +555,7 @@ class TestAttention(CustomTestCase):
             "prefill", lens, (num_heads, head_dim, num_kv_heads, 64, jnp.bfloat16)
         )
 
-    def test_gqa_decode_accuracy_page_size_greater_1(self):
+    def test_gqa_decode_accuracy_page_size_64(self):
         """Test JAX attention accuracy against native fa"""
         # Parameters
         num_heads = 32
