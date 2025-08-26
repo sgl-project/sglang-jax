@@ -372,11 +372,8 @@ class RadixCache(BasePrefixCache):
             if x.lock_ref > 0:
                 continue
 
-            # Release KV cache memory
-            if x.value is not None and hasattr(x.value, "__len__"):
-                self.token_to_kv_pool_allocator.free(x.value)
-                num_evicted += len(x.value)
-
+            self.token_to_kv_pool_allocator.free(x.value)
+            num_evicted += len(x.value)
             self._delete_leaf(x)
 
             if len(x.parent.children) == 0:
@@ -389,10 +386,9 @@ class RadixCache(BasePrefixCache):
         delta = 0
         while node != self.root_node:
             if node.lock_ref == 0:
-                node_size = self._get_node_size(node)
-                self.evictable_size_ -= node_size
-                self.protected_size_ += node_size
-                delta -= node_size
+                self.evictable_size_ -= len(node.value)
+                self.protected_size_ += len(node.value)
+                delta -= len(node.value)
             node.lock_ref += 1
             node = node.parent
         return delta
@@ -404,21 +400,12 @@ class RadixCache(BasePrefixCache):
         delta = 0
         while node != self.root_node:
             if node.lock_ref == 1:
-                node_size = self._get_node_size(node)
-                self.evictable_size_ += node_size
-                self.protected_size_ -= node_size
-                delta += node_size
+                self.evictable_size_ += len(node.value)
+                self.protected_size_ -= len(node.value)
+                delta += len(node.value)
             node.lock_ref -= 1
             node = node.parent
         return delta
-
-    def _get_node_size(self, node: TreeNode) -> int:
-        if node.value is None:
-            return 0
-        if isinstance(node.value, jnp.ndarray):
-            return node.value.shape[1] if node.value.ndim >= 2 else node.value.shape[0]
-        else:
-            return len(node.value) if node.value else 0
 
     def evictable_size(self):
         return self.evictable_size_
@@ -535,9 +522,7 @@ class RadixCache(BasePrefixCache):
             new_node.key = key
             new_node.value = value
             node.children[child_key] = new_node
-
-            node_size = self._get_node_size(new_node)
-            self.evictable_size_ += node_size
+            self.evictable_size_ += len(value)
 
         return total_prefix_length
 
@@ -569,15 +554,14 @@ class RadixCache(BasePrefixCache):
             if v == node:
                 break
         del node.parent.children[k]
-        node_size = self._get_node_size(node)
-        self.evictable_size_ -= node_size
+        self.evictable_size_ -= len(node.key)
 
     def _total_size_helper(self):
         total_size = 0
         stack = [self.root_node]
         while stack:
             current_node = stack.pop()
-            total_size += self._get_node_size(current_node)
+            total_size += len(current_node.value)
             for child in current_node.children.values():
                 if not child.evicted:
                     stack.append(child)
