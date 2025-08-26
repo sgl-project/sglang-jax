@@ -34,6 +34,7 @@ class SchedulerOutputProcessorMixin:
         self: Scheduler,
         batch: ScheduleBatch,
         result: Union[GenerationBatchResult],
+        launch_done: Optional[threading.Event] = None,
     ):
         skip_stream_req = None
 
@@ -51,19 +52,23 @@ class SchedulerOutputProcessorMixin:
             result.extend_logprob_start_len_per_req,
             result.cache_miss_count,
         )
-
-        # Move next_token_ids and logprobs to cpu
-        next_token_ids = jax.device_get(next_token_ids).tolist()
-        batch.output_ids = np.array(next_token_ids, dtype=np.int32)
-        if batch.return_logprob:
-            if logits_output.next_token_logprobs is not None:
-                logits_output.next_token_logprobs = jax.device_get(
-                    logits_output.next_token_logprobs
-                ).astype(float)
-            if logits_output.input_token_logprobs is not None:
-                logits_output.input_token_logprobs = tuple(
-                    jax.device_get(logits_output.input_token_logprobs).astype(float)
-                )
+        if self.enable_overlap:
+            logits_output, next_token_ids, cache_miss_count = (
+                self.tp_worker.resolve_last_batch_result(launch_done)
+            )
+        else:
+            # Move next_token_ids and logprobs to cpu
+            next_token_ids = jax.device_get(next_token_ids).tolist()
+            if batch.return_logprob:
+                if logits_output.next_token_logprobs is not None:
+                    logits_output.next_token_logprobs = jax.device_get(
+                        logits_output.next_token_logprobs
+                    ).astype(float)
+                if logits_output.input_token_logprobs is not None:
+                    logits_output.input_token_logprobs = tuple(
+                        jax.device_get(logits_output.input_token_logprobs).astype(float)
+                    )
+        # batch.output_ids = np.array(next_token_ids, dtype=np.int32)
 
         # Check finish conditions
         logprob_pt = 0
@@ -137,6 +142,7 @@ class SchedulerOutputProcessorMixin:
         self: Scheduler,
         batch: ScheduleBatch,
         result: GenerationBatchResult,
+        launch_done: Optional[threading.Event] = None,
     ):
         logits_output, next_token_ids, cache_miss_count = (
             result.logits_output,
@@ -145,13 +151,20 @@ class SchedulerOutputProcessorMixin:
         )
         self.num_generated_tokens += len(batch.reqs)
 
-        # spec decoding handles output logprobs inside verify process.
-        next_token_ids = jax.device_get(next_token_ids).tolist()
-        batch.output_ids = np.array(next_token_ids, dtype=np.int32)
-        if batch.return_logprob:
-            next_token_logprobs = jax.device_get(
-                logits_output.next_token_logprobs
-            ).astype(float)
+        if self.enable_overlap:
+            logits_output, next_token_ids, cache_miss_count = (
+                self.tp_worker.resolve_last_batch_result(launch_done)
+            )
+            next_token_logprobs = logits_output.next_token_logprobs
+        else:
+            # spec decoding handles output logprobs inside verify process.
+            next_token_ids = jax.device_get(next_token_ids).tolist()
+            if batch.return_logprob:
+                next_token_logprobs = jax.device_get(
+                    logits_output.next_token_logprobs
+                ).astype(float)
+
+        # batch.output_ids = np.array(next_token_ids, dtype=np.int32)
 
         self.token_to_kv_pool_allocator.free_group_begin()
 
@@ -160,6 +173,18 @@ class SchedulerOutputProcessorMixin:
         # We should ignore using next_token_ids for spec decoding cases.
         for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
             if req.is_retracted:
+                continue
+
+            if self.enable_overlap and req.finished():
+                if self.page_size == 1:
+                    self.token_to_kv_pool_allocator.free(batch.out_cache_loc[i : i + 1])
+                else:
+                    if (
+                        len(req.origin_input_ids) + len(req.output_ids) - 1
+                    ) % self.page_size == 0:
+                        self.token_to_kv_pool_allocator.free(
+                            batch.out_cache_loc[i : i + 1]
+                        )
                 continue
 
             req.output_ids.append(next_token_id)
@@ -187,6 +212,7 @@ class SchedulerOutputProcessorMixin:
                         logits_output.next_token_token_ids_logprobs_idx[i]
                     )
 
+        self.set_next_batch_sampling_info_done(batch)
         self.stream_output(
             batch.reqs, batch.return_logprob, cache_miss_count=cache_miss_count
         )

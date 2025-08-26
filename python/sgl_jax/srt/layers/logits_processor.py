@@ -263,12 +263,12 @@ class LogitsProcessor(nnx.Module):
                 mesh,
                 np.array(
                     sample_indices,
-                    dtype=jnp.int64,
+                    dtype=jnp.int32,
                 ),
             )
             input_logprob_indices = device_array(
                 mesh,
-                np.array(input_logprob_indices, dtype=jnp.int64),
+                np.array(input_logprob_indices, dtype=jnp.int32),
             )
 
         # Compute logits for both input and sampled tokens.
