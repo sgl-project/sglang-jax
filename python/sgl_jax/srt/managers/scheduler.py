@@ -72,7 +72,6 @@ from sgl_jax.srt.utils.common_utils import (
     pyspy_dump_schedulers,
     set_random_seed,
 )
-from sgl_jax.srt.utils.jax_utils import all_gather_by_cpu
 from sgl_jax.srt.utils.mesh_utils import create_device_mesh
 from sgl_jax.utils import TypeBasedDispatcher, get_exception_traceback
 
@@ -252,6 +251,7 @@ class Scheduler(
             dcn_parallelism=[1, 1, 1, 1],
             devices=jax.devices(),
         )
+        mesh_cpu = Mesh(jax.devices(backend="cpu"), ("host",))
 
         # 添加JAX设备信息日志
         local_devices = jax.local_devices()
@@ -361,6 +361,16 @@ class Scheduler(
             logger.info(f"[Scheduler] begins to run worker precompile.")
             self.tp_worker.run_precompile()
             logger.info(f"[Scheduler] completes worker precompile.")
+
+    @functools.partial(
+        shard_map.shard_map,
+        mesh=self.mesh_cpu,
+        in_specs=P(None),
+        out_specs=P(None),
+        check_rep=False,
+    )
+    def all_gather_by_cpu(x: jax.Array) -> jax.Array:
+        return jax.lax.all_gather(x, "host")
 
     def sync_pub(self):
         logger.info(
