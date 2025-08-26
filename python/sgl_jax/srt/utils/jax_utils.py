@@ -62,7 +62,7 @@ def get_available_device_memory(device, distributed=False, empty_cache=True):
     return int(free_gpu_memory * (1 << 10))
 
 
-def device_array(mesh, data, sharding=None, **kwargs) -> jax.Array:
+def device_array(mesh, *data, sharding=None, **kwargs) -> jax.Array:
     if sharding is None:
         sharding = NamedSharding(mesh, PartitionSpec(None))
-    return jax.device_put(data, device=sharding, **kwargs)
+    return jax.device_put(*data, device=sharding, **kwargs)

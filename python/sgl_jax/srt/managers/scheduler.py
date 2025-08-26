@@ -83,7 +83,7 @@ class ReceiveDataError(Exception):
 @dataclass
 class GenerationBatchResult:
     logits_output: Optional[LogitsProcessorOutput]
-    next_token_ids: Optional[List[int]]
+    next_token_ids: Optional[List[int]]  # on device
     extend_input_len_per_req: List[int]
     extend_logprob_start_len_per_req: List[int]
     bid: int
@@ -770,12 +770,14 @@ class Scheduler(
             self.tp_worker.precompile_decode_cache_loc_paddings,
         )
 
-        logits_output, next_token_ids, cache_miss_count = (
+        logits_output, next_token_ids_device, cache_miss_count = (
             self.tp_worker.forward_batch_generation(model_worker_batch)
         )
 
+        # next_token_ids = jax.device_get(next_token_ids_device)
+
         bid = model_worker_batch.bid
-        batch.output_ids = next_token_ids
+        # batch.output_ids = next_token_ids_device
 
         # These 2 values are needed for processing the output, but the values can be
         # modified by overlap schedule. So we have to copy them here so that
@@ -793,7 +795,7 @@ class Scheduler(
 
         ret = GenerationBatchResult(
             logits_output=logits_output,
-            next_token_ids=next_token_ids,
+            next_token_ids=next_token_ids_device,
             extend_input_len_per_req=extend_input_len_per_req,
             extend_logprob_start_len_per_req=extend_logprob_start_len_per_req,
             bid=bid,

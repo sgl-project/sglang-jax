@@ -253,39 +253,26 @@ class ModelWorker:
         return ModelWorkerBatch(
             bid=1,
             forward_mode=mode,
-            input_ids=device_array(
-                self.mesh, np.concat([valid_input_ids, invalid_input_ids], axis=0)
-            ),
+            input_ids=np.concat([valid_input_ids, invalid_input_ids], axis=0),
             real_input_ids_len=len(valid_input_ids),
             real_bs=bs,
-            req_pool_indices=device_array(self.mesh, np.arange(bs, dtype=jnp.int32)),
-            seq_lens=device_array(self.mesh, np.array([1] * bs, dtype=jnp.int32)),
-            out_cache_loc=device_array(
-                self.mesh,
-                np.concat([valid_out_cache_loc, invalid_out_cache_loc], axis=0),
+            req_pool_indices=np.arange(bs, dtype=jnp.int32),
+            seq_lens=np.array([1] * bs, dtype=jnp.int32),
+            out_cache_loc=np.concat(
+                [valid_out_cache_loc, invalid_out_cache_loc], axis=0
             ),
             return_logprob=False,
             sampling_info=SamplingBatchInfo.generate_for_precompile(
                 bs, self.model_config.vocab_size, self.mesh
             ),
             extend_input_logprob_token_ids=None,
-            positions=device_array(
-                self.mesh, np.concat([valid_positions, invalid_positions], axis=0)
-            ),
-            extend_start_loc=device_array(self.mesh, np.arange(bs, dtype=jnp.int64)),
-            cache_loc=device_array(
-                self.mesh, np.concat([valid_cache_loc, invalid_cache_loc], axis=0)
-            ),
+            positions=np.concat([valid_positions, invalid_positions], axis=0),
+            extend_start_loc=np.arange(bs, dtype=jnp.int64),
+            cache_loc=np.concat([valid_cache_loc, invalid_cache_loc], axis=0),
             extend_prefix_lens=(
-                device_array(self.mesh, np.array([0] * bs))
-                if mode == ForwardMode.EXTEND
-                else None
+                np.array([0] * bs) if mode == ForwardMode.EXTEND else None
             ),
-            extend_seq_lens=(
-                device_array(self.mesh, np.array([1] * bs))
-                if mode == ForwardMode.EXTEND
-                else None
-            ),
+            extend_seq_lens=np.array([1] * bs) if mode == ForwardMode.EXTEND else None,
             top_logprobs_nums=None,
             token_ids_logprobs=None,
             extend_logprob_start_lens=None,
@@ -359,13 +346,15 @@ class ModelWorker:
         logits_output.truncate_logits_processor_output(idx)
 
         if skip_sample:
-            next_token_ids = None
+            next_token_ids_device = None
         else:
-            next_token_ids = self.model_runner.sample(logits_output, model_worker_batch)
+            next_token_ids_device = self.model_runner.sample(
+                logits_output, model_worker_batch
+            )
 
         return (
             logits_output,
-            next_token_ids,
+            next_token_ids_device,
             cache_miss_count,
         )
 

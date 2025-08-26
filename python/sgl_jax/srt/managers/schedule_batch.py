@@ -438,13 +438,12 @@ class ScheduleBatch:
     next_batch_sampling_info: SamplingBatchInfo = None
 
     # Batched arguments to model runner
-    input_ids: jax.Array = None  # shape: [b], int32
-    input_embeds: jax.Array = None  # shape: [b, hidden_size], float32
-    req_pool_indices: jax.Array = None  # shape: [b], int32
-    seq_lens: jax.Array = None  # shape: [b], int32
+    input_ids: np.ndarray = None  # shape: [b], int32
+    req_pool_indices: np.ndarray = None  # shape: [b], int32
+    seq_lens: np.ndarray = None  # shape: [b], int32
     # The output locations of the KV cache
-    out_cache_loc: jax.Array = None  # shape: [b], int32
-    output_ids: jax.Array = None  # shape: [b], int32
+    out_cache_loc: np.ndarray = None  # shape: [b], int32
+    output_ids: np.ndarray = None  # shape: [b], int32
 
     # The sum of all sequence lengths
     seq_lens_sum: int = None
@@ -622,10 +621,14 @@ class ScheduleBatch:
         prefix_lens = [len(r.prefix_indices) for r in reqs]
         extend_lens = [r.extend_input_len for r in reqs]
 
-        req_pool_indices_device = jnp.array(req_pool_indices, dtype=jnp.int32)
-        input_ids_device = jnp.array(sum(input_ids, []), dtype=jnp.int32)
-        seq_lens_device = jnp.array(seq_lens, dtype=jnp.int32)
-        prefix_lens_device = jnp.array(prefix_lens, dtype=jnp.int32)
+        # req_pool_indices_device = jnp.array(req_pool_indices, dtype=jnp.int32)
+        # input_ids_device = jnp.array(sum(input_ids, []), dtype=jnp.int32)
+        # seq_lens_device = jnp.array(seq_lens, dtype=jnp.int32)
+        # prefix_lens_device = jnp.array(prefix_lens, dtype=jnp.int32)
+        req_pool_indices_cpu = np.array(req_pool_indices, dtype=np.int32)
+        input_ids_cpu = np.array(sum(input_ids, []), dtype=np.int32)
+        seq_lens_cpu = np.array(seq_lens, dtype=np.int32)
+        prefix_lens_cpu = np.array(prefix_lens, dtype=np.int32)
 
         # Copy prefix and do some basic check
         extend_input_logprob_token_ids = []
@@ -635,9 +638,12 @@ class ScheduleBatch:
             assert seq_len - pre_len == req.extend_input_len
             # note: req.prefix_indices is located on CPU, so we have to extract values then device_put
             prefix_indices_device = jnp.array(np.asarray(req.prefix_indices))
+            # prefix_indices = req.prefix_indices
             if pre_len > 0:
+                # note: prefix_indices has to locate on device, or will meet Received incompatible devices for jitted computation
                 self.req_to_token_pool.write(
-                    (req.req_pool_idx, slice(0, pre_len)), prefix_indices_device
+                    (req.req_pool_idx, slice(0, pre_len)),
+                    prefix_indices_device,  # prefix_indices
                 )
 
             req.cached_tokens += pre_len - req.already_computed
@@ -701,23 +707,25 @@ class ScheduleBatch:
         if self.token_to_kv_pool_allocator.page_size == 1:
             out_cache_loc = self.alloc_token_slots(extend_num_tokens)
         else:
-            last_loc = get_last_loc(
+            last_loc_device = get_last_loc(
                 self.req_to_token_pool.req_to_token,
-                req_pool_indices_device,
-                prefix_lens_device,
+                req_pool_indices_cpu,
+                prefix_lens_cpu,
             )
             out_cache_loc = self.alloc_paged_token_slots_extend(
                 prefix_lens,
                 seq_lens,
-                jax.device_get(last_loc).tolist(),
+                jax.device_get(last_loc_device).tolist(),
                 extend_num_tokens,
             )
 
         # Set fields
-        self.input_ids = input_ids_device
-        self.req_pool_indices = req_pool_indices_device
-        self.seq_lens = seq_lens_device
-        self.out_cache_loc = out_cache_loc
+        self.input_ids = input_ids_cpu
+        self.req_pool_indices = req_pool_indices_cpu
+        self.seq_lens = seq_lens_cpu
+        self.out_cache_loc = jax.device_get(
+            out_cache_loc
+        )  # todo: tmp to remove jax.device_get
         self.seq_lens_sum = sum(seq_lens)
 
         if self.return_logprob:
@@ -782,7 +790,7 @@ class ScheduleBatch:
             return self.token_to_kv_pool_allocator.available_size()
 
         retracted_reqs = []
-        seq_lens_cpu = jax.device_get(self.seq_lens)
+        seq_lens_cpu = self.seq_lens
         first_iter = True
         while (
             _get_available_size() < get_required_tokens(len(sorted_indices))
@@ -847,10 +855,10 @@ class ScheduleBatch:
 
     def prepare_for_idle(self):
         self.forward_mode = ForwardMode.IDLE
-        self.input_ids = jnp.empty(0, jnp.int32)
-        self.seq_lens = jnp.empty(0, jnp.int32)
-        self.out_cache_loc = jnp.empty(0, jnp.int32)
-        self.req_pool_indices = jnp.empty(0, jnp.int32)
+        self.input_ids = np.empty(0, jnp.int32)
+        self.seq_lens = np.empty(0, jnp.int32)
+        self.out_cache_loc = np.empty(0, jnp.int32)
+        self.req_pool_indices = np.empty(0, jnp.int32)
         self.seq_lens_sum = 0
         self.extend_num_tokens = 0
         self.sampling_info = SamplingBatchInfo.from_schedule_batch(
@@ -869,23 +877,25 @@ class ScheduleBatch:
 
         locs = self.seq_lens.copy()
 
-        self.seq_lens = jnp.add(self.seq_lens, 1)
+        self.seq_lens = np.add(self.seq_lens, 1)
         self.seq_lens_sum += bs
 
         # Allocate memory
         if self.token_to_kv_pool_allocator.page_size == 1:
-            self.out_cache_loc = self.alloc_token_slots(bs)
+            out_cache_loc = self.alloc_token_slots(bs)
         else:
             last_loc = self.req_to_token_pool.req_to_token[
                 self.req_pool_indices, self.seq_lens - 2
             ]
-            self.out_cache_loc = self.alloc_paged_token_slots_decode(
-                jax.device_get(self.seq_lens).tolist(),
-                jax.device_get(last_loc).tolist(),
+            out_cache_loc = self.alloc_paged_token_slots_decode(
+                self.seq_lens.tolist(),
+                last_loc.tolist(),
             )
-
+        self.out_cache_loc = jax.device_get(
+            out_cache_loc
+        )  # todo: aolemila, remove jax.device_get
         self.req_to_token_pool.write(
-            (self.req_pool_indices, locs), self.out_cache_loc.astype(jnp.int32)
+            (self.req_pool_indices, locs), out_cache_loc.astype(np.int32)
         )
 
     def filter_batch(
@@ -914,16 +924,18 @@ class ScheduleBatch:
             # No need to filter
             return
 
-        keep_indices_device = device_array(
-            self.mesh, jnp.array(keep_indices, dtype=jnp.int32)
-        )
+        # keep_indices_device = device_array(
+        #     self.mesh, jnp.array(keep_indices, dtype=jnp.int32)
+        # )
 
         self.reqs = [self.reqs[i] for i in keep_indices]
-        self.req_pool_indices = self.req_pool_indices[keep_indices_device]
-        self.seq_lens = self.seq_lens[keep_indices_device]
+        self.req_pool_indices = self.req_pool_indices[keep_indices]
+        self.seq_lens = self.seq_lens[keep_indices]
         self.out_cache_loc = None
         self.seq_lens_sum = self.seq_lens.sum().item()
-        self.output_ids = self.output_ids[keep_indices_device]
+        self.output_ids = (
+            self.output_ids[keep_indices] if self.output_ids is not None else None
+        )
         self.return_logprob = any(req.return_logprob for req in self.reqs)
         if self.return_logprob:
             self.top_logprobs_nums = [self.top_logprobs_nums[i] for i in keep_indices]
@@ -934,7 +946,7 @@ class ScheduleBatch:
 
         self.has_stream = any(req.stream for req in self.reqs)
 
-        self.sampling_info.filter_batch(keep_indices, keep_indices_device)
+        self.sampling_info.filter_batch(np.array(keep_indices))
 
     def merge_batch(self, other: "ScheduleBatch"):
         # Penalizer orchestrator must be merged before Batch.reqs is merged. This is because
@@ -942,14 +954,14 @@ class ScheduleBatch:
         # needs to be called with pre-merged Batch.reqs.
         self.sampling_info.merge_batch(other.sampling_info, other.mesh)
 
-        self.req_pool_indices = jnp.concat(
+        self.req_pool_indices = np.concat(
             [self.req_pool_indices, other.req_pool_indices]
         )
-        self.seq_lens = jnp.concat([self.seq_lens, other.seq_lens])
+        self.seq_lens = np.concat([self.seq_lens, other.seq_lens])
         self.out_cache_loc = None
         self.seq_lens_sum += other.seq_lens_sum
         if self.output_ids is not None:
-            self.output_ids = jnp.concat(
+            self.output_ids = np.concat(
                 [
                     self.output_ids[: len(self.seq_lens)],
                     other.output_ids[: len(other.seq_lens)],
@@ -993,12 +1005,12 @@ class ScheduleBatch:
         global bid
         bid += 1
 
-        input_ids_cpu = jax.device_get(self.input_ids.flatten())
+        input_ids_cpu = self.input_ids.flatten()
         real_input_ids_len = len(input_ids_cpu)
-        out_cache_loc_cpu = jax.device_get(self.out_cache_loc)
-        seq_lens_cpu = jax.device_get(self.seq_lens)
+        out_cache_loc_cpu = self.out_cache_loc
+        seq_lens_cpu = self.seq_lens
         real_bs = len(seq_lens_cpu)
-        req_pool_indices_cpu = jax.device_get(self.req_pool_indices)
+        req_pool_indices_cpu = self.req_pool_indices
         token_indices_with_all_reqs = jax.device_get(
             self.req_to_token_pool.req_to_token[self.req_pool_indices]
         )
@@ -1027,7 +1039,7 @@ class ScheduleBatch:
             out_cache_loc_cpu = np.concatenate(
                 [
                     out_cache_loc_cpu,
-                    np.array(
+                    jnp.array(
                         [-1] * out_cache_loc_num_to_padding,
                         dtype=out_cache_loc_cpu.dtype,
                     ),
@@ -1042,7 +1054,7 @@ class ScheduleBatch:
             total_tokens_before_padding = sum(
                 [extend_len for extend_len in self.extend_lens]
             )
-            positions = np.concatenate(
+            positions_cpu = np.concatenate(
                 [
                     np.arange(prefix_len, seq_len, dtype=seq_lens_cpu.dtype)
                     for seq_len, prefix_len in zip(seq_lens_cpu, self.prefix_lens)
@@ -1052,8 +1064,8 @@ class ScheduleBatch:
             # If input_ids was padded, pad positions too
             padding_size = len(input_ids_cpu) - total_tokens_before_padding
             if padding_size:
-                positions = np.concatenate(
-                    [positions, np.zeros(padding_size, dtype=positions.dtype)]
+                positions_cpu = np.concatenate(
+                    [positions_cpu, np.zeros(padding_size, dtype=positions_cpu.dtype)]
                 )
 
             # Start location of each sequence in the flattened array
@@ -1066,10 +1078,10 @@ class ScheduleBatch:
             # Create positions for actual tokens (one per sequence at seq_len)
             batch_positions = seq_lens_cpu  # Next position is current seq_len
             # Create positions array matching the length of input_ids (including padding)
-            positions = np.zeros(len(input_ids_cpu), dtype=batch_positions.dtype)
+            positions_cpu = np.zeros(len(input_ids_cpu), dtype=batch_positions.dtype)
             # Fill in the actual positions for the real tokens
             # positions = positions.at[: len(batch_positions)].set(batch_positions)
-            positions[: len(batch_positions)] = batch_positions
+            positions_cpu[: len(batch_positions)] = batch_positions
             # The padding tokens (if any) will have position 0, which is fine for padding
             # For decode, extend_start_loc is typically not used but we'll set it anyway
             extend_start_loc = np.arange(len(seq_lens_cpu), dtype=seq_lens_cpu.dtype)
@@ -1084,7 +1096,6 @@ class ScheduleBatch:
                 select_bs_index = i
                 break
 
-        # cache_loc_flat = np.zeros(total_cache_size, dtype=np.int32)
         cache_loc_flat = []
         offset = 0
         for seq_idx in range(len(seq_lens_cpu)):
@@ -1151,49 +1162,28 @@ class ScheduleBatch:
         return ModelWorkerBatch(
             bid=bid,
             forward_mode=self.forward_mode,
-            input_ids=device_array(
-                self.mesh,
-                input_ids_cpu,
-            ),
+            input_ids=input_ids_cpu,
             real_input_ids_len=real_input_ids_len,
-            req_pool_indices=device_array(self.mesh, req_pool_indices_cpu),
-            seq_lens=device_array(self.mesh, seq_lens_cpu),
-            out_cache_loc=device_array(self.mesh, out_cache_loc_cpu),
+            req_pool_indices=req_pool_indices_cpu,
+            seq_lens=seq_lens_cpu,
+            out_cache_loc=out_cache_loc_cpu,
             return_logprob=self.return_logprob,
             top_logprobs_nums=self.top_logprobs_nums,
             token_ids_logprobs=self.token_ids_logprobs,
             sampling_info=self.sampling_info,
-            positions=device_array(self.mesh, positions),
-            extend_start_loc=device_array(self.mesh, extend_start_loc),
-            cache_loc=device_array(self.mesh, cache_loc_cpu),
+            positions=positions_cpu,
+            extend_start_loc=extend_start_loc,
+            cache_loc=cache_loc_cpu,
             extend_prefix_lens=(
-                device_array(self.mesh, extend_prefix_lens)
-                if self.forward_mode == ForwardMode.EXTEND
-                else None
+                extend_prefix_lens if self.forward_mode == ForwardMode.EXTEND else None
             ),
             extend_seq_lens=(
-                device_array(self.mesh, extend_seq_lens)
-                if self.forward_mode == ForwardMode.EXTEND
-                else None
+                extend_seq_lens if self.forward_mode == ForwardMode.EXTEND else None
             ),
             extend_logprob_start_lens=extend_logprob_start_lens,
             extend_input_logprob_token_ids=self.extend_input_logprob_token_ids,
             real_bs=real_bs,
             capture_hidden_mode=CaptureHiddenMode.NULL,
-        )
-
-    def copy(self):
-        # Only contain fields that will be used by process_batch_result
-        return ScheduleBatch(
-            reqs=self.reqs,
-            model_config=self.model_config,
-            forward_mode=self.forward_mode,
-            out_cache_loc=self.out_cache_loc,
-            return_logprob=self.return_logprob,
-            decoding_reqs=self.decoding_reqs,
-            global_num_tokens=self.global_num_tokens,
-            global_num_tokens_for_logprob=self.global_num_tokens_for_logprob,
-            is_extend_in_batch=self.is_extend_in_batch,
         )
 
     def _evict_tree_cache_if_needed(
@@ -1228,23 +1218,23 @@ class ModelWorkerBatch:
     # The forward mode
     forward_mode: ForwardMode
     # The input ids
-    input_ids: jax.Array
+    input_ids: np.ndarray
     # the length is outof padding
     real_input_ids_len: int
     # The sequence length
-    seq_lens: jax.Array
+    seq_lens: np.ndarray
     # The indices of output tokens in the token_to_kv_pool_allocator
-    out_cache_loc: jax.Array
+    out_cache_loc: np.ndarray
     # The indices of requests in the req_to_token_pool
-    req_pool_indices: jax.Array
+    req_pool_indices: np.ndarray
     # Sampling info
     sampling_info: SamplingBatchInfo
     # Position information [total_tokens]
-    positions: jax.Array
+    positions: np.ndarray
     # Start position for each sequence in extend mode [batch_size]
-    extend_start_loc: jax.Array
+    extend_start_loc: np.ndarray
     # cache_loc
-    cache_loc: jax.Array
+    cache_loc: np.ndarray
 
     # For logprob
     return_logprob: bool
@@ -1253,15 +1243,10 @@ class ModelWorkerBatch:
 
     # For extend
     # extend_num_tokens: Optional[int]
-    extend_seq_lens: Optional[jax.Array]
-    extend_prefix_lens: Optional[jax.Array]
-    # extend_start_loc: Optional[jax.Array] = None
-    # extend_prefix_lens_cpu: Optional[List[int]] = None
-    # extend_seq_lens_cpu: Optional[List[int]] = None
-    # extend_logprob_start_lens_cpu: Optional[List[int]] = None
+    extend_seq_lens: Optional[np.ndarray]
+    extend_prefix_lens: Optional[np.ndarray]
     extend_logprob_start_lens: Optional[List[int]]
-    # extend_input_logprob_token_ids_device: Optional[jax.Array] = None
-    extend_input_logprob_token_ids: Optional[jax.Array]
+    extend_input_logprob_token_ids: Optional[np.ndarray]
 
     # For padding
     real_bs: int
@@ -1270,28 +1255,28 @@ class ModelWorkerBatch:
 
     # For logits and logprobs post processing
     temp_scaled_logprobs: bool = False
-    temperature: jax.Array = None
+    temperature: np.ndarray = None
     top_p_normalized_logprobs: bool = False
-    top_p: jax.Array = None
+    top_p: np.ndarray = None
 
 
 def get_last_loc(
     req_to_token: jax.Array,
-    req_pool_indices_device: jax.Array,
-    prefix_lens_device: jax.Array,
+    req_pool_indices: np.ndarray,
+    prefix_lens: np.ndarray,
 ) -> jax.Array:
     impl = get_last_loc_jax
 
-    return impl(req_to_token, req_pool_indices_device, prefix_lens_device)
+    return impl(req_to_token, req_pool_indices, prefix_lens)
 
 
 def get_last_loc_jax(
     req_to_token: jax.Array,
-    req_pool_indices_device: jax.Array,
-    prefix_lens_device: jax.Array,
+    req_pool_indices: np.ndarray,
+    prefix_lens: np.ndarray,
 ) -> jax.Array:
     return jnp.where(
-        prefix_lens_device > 0,
-        req_to_token[req_pool_indices_device, prefix_lens_device - 1],
-        jnp.full_like(prefix_lens_device, -1),
+        prefix_lens > 0,
+        req_to_token[req_pool_indices, prefix_lens - 1],
+        jnp.full_like(prefix_lens, -1),
     )
