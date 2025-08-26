@@ -430,7 +430,6 @@ class ScheduleBatch:
     # This is an optimization to reduce the overhead of the prefill check.
     batch_is_full: bool = False
 
-    batch_size_list: np.ndarray = []
     # Sampling info
     sampling_info: SamplingBatchInfo = None
     next_batch_sampling_info: SamplingBatchInfo = None
