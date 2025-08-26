@@ -277,10 +277,17 @@ class EPMoE(nnx.Module):
         max_padding_size = jax.lax.pmax(x.shape[0], axis_name=("data", "tensor"))
         original_size = x.shape[0]
 
-        x = jnp.pad(x, ((0, max_padding_size - x.shape[0]), (0, 0)))
-        local_group_sizes = jnp.pad(
-            local_group_sizes, (0, max_padding_size - x.shape[0])
+        # Create padded tensors with fixed max size
+        padded_x = jnp.zeros((max_padding_size, x.shape[1]), dtype=x.dtype)
+        padded_x = padded_x.at[:original_size].set(x)
+
+        padded_group_sizes = jnp.zeros(max_padding_size, dtype=local_group_sizes.dtype)
+        padded_group_sizes = padded_group_sizes.at[: len(local_group_sizes)].set(
+            local_group_sizes
         )
+
+        x = padded_x
+        local_group_sizes = padded_group_sizes
 
         # Create expert indices for masking
         expert_indices = jnp.repeat(
