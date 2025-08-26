@@ -873,12 +873,9 @@ class ScheduleBatch:
         bs_paddings: list,
         token_paddings: list,
     ) -> ModelWorkerBatch:
-        logging.info(
-            f"schedule_batch.get_model_worker_batch: {self.forward_mode.name} input_ids.shape={self.input_ids.shape if self.input_ids is not None else None}, out_cache_loc.shape={self.out_cache_loc.shape if self.out_cache_loc is not None else None}, seq_lens.shape={self.seq_lens.shape if self.seq_lens is not None else None}, req_pool_indices.shape={self.req_pool_indices.shape if self.req_pool_indices is not None else None}, output_ids.shape={self.output_ids.shape if self.output_ids is not None else None}"
-        )
         if self.forward_mode.is_decode_or_idle():
             extend_seq_lens = extend_prefix_lens = extend_logprob_start_lens = None
-            token_paddings = bs_paddings
+            # token_paddings = bs_paddings
         else:
             extend_seq_lens = np.array(self.extend_lens, dtype=np.int32)
             extend_prefix_lens = np.array(self.prefix_lens, dtype=np.int32)
@@ -886,20 +883,10 @@ class ScheduleBatch:
 
         global bid
         bid += 1
-        logging.info(
-            f"schedule_batch.get_model_worker_batch: {self.forward_mode.name} bid: {bid} input_ids {self.input_ids}"
-        )
-        for i, shard in enumerate(self.input_ids.addressable_shards):
-            logging.info(
-                f"schedule_batch.get_model_worker_batch: {self.forward_mode.name} shard {i} {shard}"
-            )
         input_ids_cpu = np.array(
             self.input_ids
             if self.input_ids is not None and len(self.input_ids) > 0
             else []
-        )
-        logging.info(
-            f"schedule_batch.get_model_worker_batch: {self.forward_mode.name} input_ids_cpu: {input_ids_cpu}"
         )
         real_input_ids_len = len(input_ids_cpu)
         out_cache_loc_cpu = np.array(
@@ -907,16 +894,10 @@ class ScheduleBatch:
             if self.out_cache_loc is not None and len(self.out_cache_loc) > 0
             else []
         )
-        logging.info(
-            f"schedule_batch.get_model_worker_batch: {self.forward_mode.name} out_cache_loc_cpu: {out_cache_loc_cpu}"
-        )
         seq_lens_cpu = np.array(
             self.seq_lens
             if self.seq_lens is not None and len(self.seq_lens) > 0
             else []
-        )
-        logging.info(
-            f"schedule_batch.get_model_worker_batch: {self.forward_mode.name} seq_lens_cpu: {seq_lens_cpu}"
         )
         real_bs = len(seq_lens_cpu)
         req_pool_indices_cpu = np.array(
@@ -926,9 +907,6 @@ class ScheduleBatch:
                 else []
             ),
             dtype=np.int32,
-        )
-        logging.info(
-            f"schedule_batch.get_model_worker_batch: {self.forward_mode.name} req_pool_indices_cpu: {req_pool_indices_cpu}"
         )
 
         token_indices_with_all_reqs = np.array(
@@ -940,24 +918,15 @@ class ScheduleBatch:
             ),
             dtype=np.int32,
         )
-        logging.info(
-            f"schedule_batch.get_model_worker_batch: {self.forward_mode.name} token_indices_with_all_reqs: {token_indices_with_all_reqs}"
-        )
         # All-gather padding sizes from all devices to ensure consistent padding
         local_token_size = len(input_ids_cpu)
         local_bs_size = len(seq_lens_cpu)
         local_cache_size = sum(seq_lens_cpu)
-        logging.info(
-            f"schedule_batch.get_model_worker_batch: {self.forward_mode.name} local_token_size={local_token_size}, local_bs_size={local_bs_size}, local_cache_size={local_cache_size}"
-        )
         # Gather sizes from all devices
         if self.enable_dp_attention:
             # Collect local sizes into arrays for all-gather
             local_sizes = np.array(
                 [local_token_size, local_bs_size, local_cache_size], dtype=np.int32
-            )
-            logging.info(
-                f"schedule_batch.get_model_worker_batch: {self.forward_mode.name} local_sizes: {local_sizes}"
             )
             mesh_cpu = Mesh(jax.devices(backend="cpu"), ("host",))
             all_sizes = functools.partial(
@@ -967,9 +936,6 @@ class ScheduleBatch:
                 out_specs=P(None),
                 check_rep=False,
             )(lambda x: jax.lax.all_gather(x, "host"))(local_sizes)
-            logging.info(
-                f"schedule_batch.get_model_worker_batch: {self.forward_mode.name} all_size: {all_sizes}"
-            )
             # Calculate global max sizes
             global_max_token_size = jnp.max(all_sizes[:, 0]).item()
             global_max_bs_size = jnp.max(all_sizes[:, 1]).item()
@@ -990,7 +956,9 @@ class ScheduleBatch:
             if size >= global_max_token_size:
                 padding_size = size - len(input_ids_cpu)
                 break
-
+        logging.info(
+            f"schedule_batch.get_model_worker_batch: {self.forward_mode.name} padding_size={padding_size}"
+        )
         if padding_size > 0:
             input_ids_cpu = np.concat(
                 [
