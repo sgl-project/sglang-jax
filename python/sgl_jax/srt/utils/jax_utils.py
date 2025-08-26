@@ -4,7 +4,7 @@ import functools
 import jax
 import jax.numpy as jnp
 from jax.experimental import shard_map
-from jax.sharding import NamedSharding, PartitionSpec
+from jax.sharding import Mesh, NamedSharding, PartitionSpec
 
 
 def get_num_kv_heads_by_tp(num_kv_heads: int, tp_size: int) -> int:
