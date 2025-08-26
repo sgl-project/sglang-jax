@@ -32,6 +32,8 @@ from sgl_jax.srt.utils.common_utils import get_bool_env_var, retry
 
 DEFAULT_MODEL_NAME_FOR_TEST = "Qwen/Qwen-7B-Chat"
 DEFAULT_SMALL_MODEL_NAME_FOR_TEST = "Qwen/Qwen-1_8B-Chat"
+QWEN3_8B = "Qwen/Qwen3-8B"
+QWEN3_MOE_30B = "Qwen/Qwen3-30B-A3B"
 
 DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH = 600
 
