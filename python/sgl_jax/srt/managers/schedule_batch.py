@@ -930,14 +930,18 @@ class ScheduleBatch:
         logging.info(
             f"schedule_batch.get_model_worker_batch: {self.forward_mode.name} req_pool_indices_cpu: {req_pool_indices_cpu}"
         )
+        jax.block_until_ready(self.req_to_token_pool.req_to_token)
         logging.info(
             f"schedule_batch.get_model_worker_batch: {self.forward_mode.name} req_to_token_pool.req_to_token: {self.req_to_token_pool.req_to_token}"
         )
         token_indices_with_all_reqs = np.array(
-            self.req_to_token_pool.req_to_token[req_pool_indices_cpu]
-            if self.req_to_token_pool.req_to_token is not None
-            and len(self.req_to_token_pool.req_to_token[req_pool_indices_cpu]) > 0
-            else []
+            (
+                self.req_to_token_pool.req_to_token[req_pool_indices_cpu]
+                if self.req_to_token_pool.req_to_token is not None
+                and len(self.req_to_token_pool.req_to_token[req_pool_indices_cpu]) > 0
+                else []
+            ),
+            dtype=np.int32,
         )
         logging.info(
             f"schedule_batch.get_model_worker_batch: {self.forward_mode.name} token_indices_with_all_reqs: {token_indices_with_all_reqs}"
