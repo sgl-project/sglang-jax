@@ -36,11 +36,11 @@ class ReqToTokenPool:
         self.dtype = dtype
 
         # Create sharded request to token mapping table
-        self.req_to_token = jnp.zeros((size, max_context_len), dtype=dtype)
+        self.req_to_token = np.zeros((size, max_context_len), dtype=dtype)
 
         # Use data sharding strategy
-        self.token_sharding = NamedSharding(mesh, P(None, None))
-        self.req_to_token = jax.device_put(self.req_to_token, self.token_sharding)
+        # self.token_sharding = NamedSharding(mesh, P(None, None))
+        # self.req_to_token = jax.device_put(self.req_to_token, self.token_sharding)
 
         # Use simple list to manage free slots (non-JAX array)
         self.free_slots = list(range(size))
@@ -77,13 +77,13 @@ class ReqToTokenPool:
         if isinstance(indices, tuple) and len(indices) == 2:
             # Handle (req_idx, slice) case
             req_idx, slice_obj = indices
-            self.req_to_token = self.req_to_token.at[req_idx, slice_obj].set(values)
+            self.req_to_token[req_idx, slice_obj] = values
         else:
             # Handle direct indexing case
             print(f"{indices=} {values=}")
-            self.req_to_token = self.req_to_token.at[indices].set(values)
+            self.req_to_token[indices] = values
 
-    def read(self, req_idx: int, length: int) -> jnp.ndarray:
+    def read(self, req_idx: int, length: int) -> np.ndarray:
         """Read token indices from specified request slot"""
         return self.req_to_token[req_idx, :length]
 
@@ -105,20 +105,20 @@ class ReqToTokenPool:
         if isinstance(free_index, int):
             self.free_slots.append(free_index)
             # Clear corresponding memory region
-            self.req_to_token = self.req_to_token.at[free_index].set(0)
+            self.req_to_token[free_index] = 0
         else:
             self.free_slots.extend(free_index)
             # Batch clear
             for idx in free_index:
-                self.req_to_token = self.req_to_token.at[idx].set(0)
+                self.req_to_token[idx] = 0
 
     def clear(self):
         """Clear all allocation states"""
         self.free_slots = list(range(self.size))
-        self.req_to_token = jnp.zeros(
+        self.req_to_token = np.zeros(
             (self.size, self.max_context_len), dtype=self.dtype
         )
-        self.req_to_token = jax.device_put(self.req_to_token, self.token_sharding)
+        # self.req_to_token = jax.device_put(self.req_to_token, self.token_sharding)
 
 
 @register_pytree_node_class

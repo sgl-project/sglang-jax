@@ -930,11 +930,7 @@ class ScheduleBatch:
         logging.info(
             f"schedule_batch.get_model_worker_batch: {self.forward_mode.name} req_pool_indices_cpu: {req_pool_indices_cpu}"
         )
-        jax.block_until_ready(self.req_to_token_pool.req_to_token)
-        small_sample = jax.device_get(self.req_to_token_pool.req_to_token[:2, :10])
-        logging.info(
-            f"schedule_batch.get_model_worker_batch: {self.forward_mode.name} req_to_token_pool.req_to_token: {self.req_to_token_pool.req_to_token} small_sample: {small_sample}"
-        )
+
         token_indices_with_all_reqs = np.array(
             (
                 self.req_to_token_pool.req_to_token[req_pool_indices_cpu]
