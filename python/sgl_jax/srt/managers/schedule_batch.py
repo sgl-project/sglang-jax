@@ -1097,35 +1097,58 @@ class ScheduleBatch:
         logging.info(
             f"schedule_batch.get_model_worker_batch: {self.forward_mode.name} input_ids_cpu.shape={input_ids_cpu.shape if input_ids_cpu is not None else None}, out_cache_loc_cpu.shape={out_cache_loc_cpu.shape if out_cache_loc_cpu is not None else None}, seq_lens_cpu.shape={seq_lens_cpu.shape if seq_lens_cpu is not None else None}, req_pool_indices_cpu.shape={req_pool_indices_cpu.shape if req_pool_indices_cpu is not None else None}, positions.shape={positions.shape if positions is not None else None}, extend_start_loc.shape={extend_start_loc.shape if extend_start_loc is not None else None}, cache_loc_cpu.shape={cache_loc_cpu.shape if cache_loc_cpu is not None else None}, extend_prefix_lens.shape={extend_prefix_lens.shape if extend_prefix_lens is not None else None}, extend_seq_lens.shape={extend_seq_lens.shape if extend_seq_lens is not None else None}"
         )
+        data_sharding = NamedSharding(self.mesh, P("data"))
         input_ids_cpu = jax.make_array_from_process_local_data(
-            input_ids_cpu, self.mesh, P(None)
-        )
-        out_cache_loc_cpu = jax.make_array_from_process_local_data(
-            out_cache_loc_cpu, self.mesh, P(None)
-        )
-        seq_lens_cpu = jax.make_array_from_process_local_data(
-            seq_lens_cpu, self.mesh, P(None)
-        )
-        req_pool_indices_cpu = jax.make_array_from_process_local_data(
-            req_pool_indices_cpu, self.mesh, P(None)
-        )
-        positions = jax.make_array_from_process_local_data(
-            positions, self.mesh, P(None)
-        )
-        extend_start_loc = jax.make_array_from_process_local_data(
-            extend_start_loc, self.mesh, P(None)
-        )
-        cache_loc_cpu = jax.make_array_from_process_local_data(
-            cache_loc_cpu, self.mesh, P(None)
-        )
-        extend_prefix_lens = jax.make_array_from_process_local_data(
-            extend_prefix_lens, self.mesh, P(None)
-        )
-        extend_seq_lens = jax.make_array_from_process_local_data(
-            extend_seq_lens, self.mesh, P(None)
+            data_sharding, input_ids_cpu
         )
         logging.info(
-            f"schedule_batch.get_model_worker_batch: {self.forward_mode.name} input_ids_cpu.shape={input_ids_cpu.shape if input_ids_cpu is not None else None}, out_cache_loc_cpu.shape={out_cache_loc_cpu.shape if out_cache_loc_cpu is not None else None}, seq_lens_cpu.shape={seq_lens_cpu.shape if seq_lens_cpu is not None else None}, req_pool_indices_cpu.shape={req_pool_indices_cpu.shape if req_pool_indices_cpu is not None else None}, positions.shape={positions.shape if positions is not None else None}, extend_start_loc.shape={extend_start_loc.shape if extend_start_loc is not None else None}, cache_loc_cpu.shape={cache_loc_cpu.shape if cache_loc_cpu is not None else None}, extend_prefix_lens.shape={extend_prefix_lens.shape if extend_prefix_lens is not None else None}, extend_seq_lens.shape={extend_seq_lens.shape if extend_seq_lens is not None else None}"
+            f"schedule_batch.get_model_worker_batch: {self.forward_mode.name} input_ids_cpu.shape={input_ids_cpu.shape if input_ids_cpu is not None else None}"
+        )
+        out_cache_loc_cpu = jax.make_array_from_process_local_data(
+            data_sharding, out_cache_loc_cpu
+        )
+        logging.info(
+            f"schedule_batch.get_model_worker_batch: {self.forward_mode.name} out_cache_loc_cpu.shape={out_cache_loc_cpu.shape if out_cache_loc_cpu is not None else None}"
+        )
+        seq_lens_cpu = jax.make_array_from_process_local_data(
+            data_sharding, seq_lens_cpu
+        )
+        logging.info(
+            f"schedule_batch.get_model_worker_batch: {self.forward_mode.name} seq_lens_cpu.shape={seq_lens_cpu.shape if seq_lens_cpu is not None else None}"
+        )
+        req_pool_indices_cpu = jax.make_array_from_process_local_data(
+            data_sharding, req_pool_indices_cpu
+        )
+        logging.info(
+            f"schedule_batch.get_model_worker_batch: {self.forward_mode.name} req_pool_indices_cpu.shape={req_pool_indices_cpu.shape if req_pool_indices_cpu is not None else None}"
+        )
+        positions = jax.make_array_from_process_local_data(data_sharding, positions)
+        logging.info(
+            f"schedule_batch.get_model_worker_batch: {self.forward_mode.name} positions.shape={positions.shape if positions is not None else None}"
+        )
+        extend_start_loc = jax.make_array_from_process_local_data(
+            data_sharding, extend_start_loc
+        )
+        logging.info(
+            f"schedule_batch.get_model_worker_batch: {self.forward_mode.name} extend_start_loc.shape={extend_start_loc.shape if extend_start_loc is not None else None}"
+        )
+        cache_loc_cpu = jax.make_array_from_process_local_data(
+            data_sharding, cache_loc_cpu
+        )
+        logging.info(
+            f"schedule_batch.get_model_worker_batch: {self.forward_mode.name} cache_loc_cpu.shape={cache_loc_cpu.shape if cache_loc_cpu is not None else None}"
+        )
+        extend_prefix_lens = jax.make_array_from_process_local_data(
+            data_sharding, extend_prefix_lens
+        )
+        logging.info(
+            f"schedule_batch.get_model_worker_batch: {self.forward_mode.name} extend_prefix_lens.shape={extend_prefix_lens.shape if extend_prefix_lens is not None else None}"
+        )
+        extend_seq_lens = jax.make_array_from_process_local_data(
+            data_sharding, extend_seq_lens
+        )
+        logging.info(
+            f"schedule_batch.get_model_worker_batch: {self.forward_mode.name} extend_seq_lens.shape={extend_seq_lens.shape if extend_seq_lens is not None else None}"
         )
         return ModelWorkerBatch(
             bid=bid,
