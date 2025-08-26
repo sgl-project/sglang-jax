@@ -889,7 +889,7 @@ class ScheduleBatch:
         logging.info(
             f"schedule_batch.get_model_worker_batch: {self.forward_mode.name} bid: {bid} input_ids {self.input_ids}"
         )
-        for i, shard in self.input_ids.addressable_shards:
+        for i, shard in enumerate(self.input_ids.addressable_shards):
             logging.info(
                 f"schedule_batch.get_model_worker_batch: {self.forward_mode.name} shard {i} {shard}"
             )
