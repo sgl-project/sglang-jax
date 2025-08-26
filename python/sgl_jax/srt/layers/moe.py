@@ -161,19 +161,6 @@ class EPMoE(nnx.Module):
         sharded_state = jax.lax.with_sharding_constraint(state, pspecs)
         nnx.update(self, sharded_state)
 
-    def _detect_device_capabilities(self):
-        try:
-            devices = jax.devices()
-            is_cpu_only = all(device.platform == "cpu" for device in devices)
-            can_use_ragged = not is_cpu_only and hasattr(jax.lax, "ragged_all_to_all")
-
-            device_types = [device.platform for device in devices]
-            primary_device = device_types[0] if device_types else "unknown"
-
-            return can_use_ragged, primary_device
-        except Exception as e:
-            return False, "cpu"
-
     @trace_function(stage="MOE_SPARSE_FORWARD", include_args=False, include_output=True)
     def __call__(self, inputs, router_logits=None):
         if router_logits is None:
@@ -241,7 +228,6 @@ class EPMoE(nnx.Module):
             intermediate_output = self._gmm_compute_with_sharded_weights(
                 x,
                 local_group_sizes,
-                selected_experts,
                 w0_weights,
                 w1_weights,
                 wo_weights,
@@ -279,7 +265,7 @@ class EPMoE(nnx.Module):
         )(inputs, router_logits, self.wi_0.value, self.wi_1.value, self.wo.value)
 
     def _gmm_compute_with_sharded_weights(
-        self, x, local_group_sizes, selected_experts, w0_kernel, w1_kernel, wo_kernel
+        self, x, local_group_sizes, w0_kernel, w1_kernel, wo_kernel
     ):
         if x.shape[0] == 0:
             empty_output = jnp.zeros(
@@ -287,34 +273,53 @@ class EPMoE(nnx.Module):
             )  # (0, hidden_dim)
             return empty_output
 
-        # gate
-        layer_w0 = jax.lax.ragged_dot(
-            lhs=x,
-            rhs=w0_kernel,
-            group_sizes=local_group_sizes,
-            preferred_element_type=self.dtype,
+        # padding for use normal dot
+        max_padding_size = jax.lax.pmax(x.shape[0], axis_name=("data", "tensor"))
+        original_size = x.shape[0]
+
+        x = jnp.pad(x, ((0, max_padding_size - x.shape[0]), (0, 0)))
+        local_group_sizes = jnp.pad(
+            local_group_sizes, (0, max_padding_size - x.shape[0])
         )
-        # up
-        layer_w1 = jax.lax.ragged_dot(
-            lhs=x,
-            rhs=w1_kernel,
-            group_sizes=local_group_sizes,
-            preferred_element_type=self.dtype,
+
+        # Create expert indices for masking
+        expert_indices = jnp.repeat(
+            jnp.arange(len(local_group_sizes)), local_group_sizes
         )
+        mask = (
+            expert_indices[:, None] == jnp.arange(len(local_group_sizes))[None, :]
+        )  # (total_tokens, num_experts)
+
+        # gate - einsum with masking
+        layer_w0_all = jnp.einsum(
+            "th,ehd->ted", x, w0_kernel
+        )  # (total_tokens, num_experts, intermediate_dim)
+        layer_w0 = jnp.sum(
+            layer_w0_all * mask[:, :, None], axis=1
+        )  # (total_tokens, intermediate_dim)
+
+        # up - einsum with masking
+        layer_w1_all = jnp.einsum(
+            "th,ehd->ted", x, w1_kernel
+        )  # (total_tokens, num_experts, intermediate_dim)
+        layer_w1 = jnp.sum(
+            layer_w1_all * mask[:, :, None], axis=1
+        )  # (total_tokens, intermediate_dim)
 
         # activation
         layer_act = jax.nn.silu(layer_w0)
         intermediate_layer = jnp.multiply(layer_act, layer_w1)
 
-        # down
-        intermediate_output = jax.lax.ragged_dot(
-            lhs=intermediate_layer,
-            rhs=wo_kernel,
-            group_sizes=local_group_sizes,
-            preferred_element_type=self.dtype,
-        )
+        # down - einsum with masking
+        intermediate_output_all = jnp.einsum(
+            "td,edh->teh", intermediate_layer, wo_kernel
+        )  # (total_tokens, num_experts, hidden_dim)
+        intermediate_output = jnp.sum(
+            intermediate_output_all * mask[:, :, None], axis=1
+        )  # (total_tokens, hidden_dim)
 
-        return intermediate_output
+        # Remove padding before returning
+        return intermediate_output[:original_size]
 
     def _single_device_forward(self, inputs, router_logits):
         top_k_logits, top_k_indices = jax.lax.top_k(
