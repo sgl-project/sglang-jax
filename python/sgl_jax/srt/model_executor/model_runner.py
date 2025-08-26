@@ -357,6 +357,7 @@ class ModelRunner:
         )
 
     def forward_idle(self, forward_batch: ForwardBatch) -> LogitsProcessorOutput:
+        self.attn_backend.init_forward_metadata(forward_batch)
         return self._forward(
             forward_batch.input_ids, forward_batch.positions, forward_batch
         )
