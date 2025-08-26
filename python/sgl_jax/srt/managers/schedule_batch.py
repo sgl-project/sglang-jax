@@ -887,8 +887,12 @@ class ScheduleBatch:
         global bid
         bid += 1
         logging.info(
-            f"schedule_batch.get_model_worker_batch: {self.forward_mode.name} bid: {bid}"
+            f"schedule_batch.get_model_worker_batch: {self.forward_mode.name} bid: {bid} input_ids {self.input_ids}"
         )
+        for i, shard in self.input_ids.addressable_shards:
+            logging.info(
+                f"schedule_batch.get_model_worker_batch: {self.forward_mode.name} shard {i} {shard}"
+            )
         input_ids_cpu = (
             jax.device_get(self.input_ids.flatten())
             if self.input_ids is not None and len(self.input_ids) > 0
