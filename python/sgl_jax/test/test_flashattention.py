@@ -278,7 +278,7 @@ class TestAttention(CustomTestCase):
             num_kv_heads,
             page_size,
             model_config={
-                "num_kv_heads": num_heads,
+                "num_kv_heads": num_kv_heads,
                 "head_dim": head_dim,
                 "num_hidden_layers": 1,
                 "bf16": is_bf16,
