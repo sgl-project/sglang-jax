@@ -920,9 +920,12 @@ class ScheduleBatch:
         )
         real_bs = len(seq_lens_cpu)
         req_pool_indices_cpu = np.array(
-            self.req_pool_indices
-            if self.req_pool_indices is not None and len(self.req_pool_indices) > 0
-            else []
+            (
+                self.req_pool_indices
+                if self.req_pool_indices is not None and len(self.req_pool_indices) > 0
+                else []
+            ),
+            dtype=np.int32,
         )
         logging.info(
             f"schedule_batch.get_model_worker_batch: {self.forward_mode.name} req_pool_indices_cpu: {req_pool_indices_cpu}"
