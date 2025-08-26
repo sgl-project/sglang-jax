@@ -798,7 +798,7 @@ class Scheduler(
         logger.info(f"before dp sync Node {self.node_rank} ret: {ret}")
         # DP Attention: Synchronize batch across DP groups
         if self.server_args.enable_dp_attention:
-            batch_size_list = all_gather_by_cpu(
+            batch_size_list = self.all_gather_by_cpu(
                 np.array([ret.batch_size if ret is not None else 0], dtype=np.int32)
             )
             logger.info(
