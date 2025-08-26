@@ -524,6 +524,9 @@ class ScheduleBatch:
     def alloc_token_slots(self, num_tokens: int, backup_state: bool = False):
         self._evict_tree_cache_if_needed(num_tokens)
 
+        if backup_state:
+            state = self.token_to_kv_pool_allocator.backup_state()
+
         out_cache_loc = self.token_to_kv_pool_allocator.alloc(num_tokens)
         if out_cache_loc is None:
             phase_str = "Prefill" if self.forward_mode.is_extend() else "Decode"
@@ -537,7 +540,10 @@ class ScheduleBatch:
                 self.tree_cache.pretty_print()
             raise RuntimeError(error_msg)
 
-        return out_cache_loc
+        if backup_state:
+            return out_cache_loc, state
+        else:
+            return out_cache_loc
 
     def alloc_paged_token_slots_extend(
         self,

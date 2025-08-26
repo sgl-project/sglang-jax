@@ -104,21 +104,12 @@ class ReqToTokenPool:
         """Free request slots"""
         if isinstance(free_index, int):
             self.free_slots.append(free_index)
-            # Clear corresponding memory region
-            self.req_to_token = self.req_to_token.at[free_index].set(0)
         else:
             self.free_slots.extend(free_index)
-            # Batch clear
-            for idx in free_index:
-                self.req_to_token = self.req_to_token.at[idx].set(0)
 
     def clear(self):
         """Clear all allocation states"""
         self.free_slots = list(range(self.size))
-        self.req_to_token = jnp.zeros(
-            (self.size, self.max_context_len), dtype=self.dtype
-        )
-        self.req_to_token = jax.device_put(self.req_to_token, self.token_sharding)
 
 
 @register_pytree_node_class

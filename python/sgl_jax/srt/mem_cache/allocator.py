@@ -178,6 +178,11 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         prefix_lens_np = np.array(prefix_lens)
         last_loc_np = np.array(last_loc)
 
+        if self.debug_mode:
+            assert np.all(
+                (last_loc_np + 1) % self.page_size == prefix_lens_np % self.page_size
+            ), f"last_loc_np: {last_loc_np}, prefix_lens_np: {prefix_lens_np}"
+
         batch_size = len(seq_lens_np)
         extend_lens = seq_lens_np - prefix_lens_np
 
@@ -195,7 +200,6 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
         # Get pages for allocation
         allocated_pages = self.free_pages[:total_new_pages].copy()
-        self.free_pages = self.free_pages[total_new_pages:]
 
         # Allocate indices using three-part strategy
         out_indices = np.zeros(extend_num_tokens, dtype=np.int32)
@@ -258,18 +262,9 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
                 ] = part3_indices
                 current_output_idx += remaining_tokens
                 page_idx += 1
-
-        # Debug validation
-        if self.debug_mode:
-            # Verify that last_loc+1 aligns with prefix_lens in page position
-            for seq_idx in range(batch_size):
-                if extend_lens[seq_idx] > 0:
-                    expected_pos = (last_loc_np[seq_idx] + 1) % self.page_size
-                    actual_pos = prefix_lens_np[seq_idx] % self.page_size
-                    assert (
-                        expected_pos == actual_pos
-                    ), f"Seq {seq_idx}: last_loc+1 pos {expected_pos} != prefix_len pos {actual_pos}"
-
+        # page_idx is the number of new pages allocated
+        total_new_pages = page_idx
+        self.free_pages = self.free_pages[total_new_pages:]
         return jnp.array(out_indices)
 
     def alloc_decode(
@@ -280,6 +275,11 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         # Convert inputs to numpy for calculations
         seq_lens_np = np.array(seq_lens)
         last_loc_np = np.array(last_loc)
+
+        if self.debug_mode:
+            assert np.all(
+                (last_loc_np + 2) % self.page_size == seq_lens_np % self.page_size
+            ), f"last_loc_np: {last_loc_np}, seq_lens_np: {seq_lens_np}"
 
         batch_size = len(seq_lens_np)
         pre_lens = seq_lens_np - 1
@@ -298,7 +298,6 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
         # Allocate new pages
         allocated_pages = self.free_pages[:total_new_pages].copy()
-        self.free_pages = self.free_pages[total_new_pages:]
 
         out_indices = np.zeros(batch_size, dtype=np.int32)
         page_idx = 0
@@ -313,16 +312,9 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
                 # Sequence continues in current page - allocate next position
                 out_indices[seq_idx] = last_loc_np[seq_idx] + 1
 
-        # Debug validation
-        if self.debug_mode:
-            for seq_idx in range(batch_size):
-                # Verify that last_loc+2 aligns with seq_lens in page position
-                expected_pos = (last_loc_np[seq_idx] + 2) % self.page_size
-                actual_pos = seq_lens_np[seq_idx] % self.page_size
-                assert (
-                    expected_pos == actual_pos
-                ), f"Seq {seq_idx}: last_loc+2 pos {expected_pos} != seq_len pos {actual_pos}"
-
+        # page_idx is the number of new pages allocated
+        total_new_pages = page_idx
+        self.free_pages = self.free_pages[total_new_pages:]
         return jnp.array(out_indices)
 
     def free(self, free_index: jnp.ndarray):
@@ -336,6 +328,9 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             self.release_pages = np.concatenate([free_page_indices, self.release_pages])
         else:
             self.free_group.append(np.array(free_index))
+
+        if self.debug_mode:
+            assert len(np.unique(self.free_pages)) == len(self.free_pages)
 
     def clear(self):
         # The padded slot 0 is used for writing dummy outputs from padded tokens.
