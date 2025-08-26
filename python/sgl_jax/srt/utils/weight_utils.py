@@ -439,7 +439,9 @@ class WeightLoader:
             any(proj in hf_key for proj in ["k_proj", "v_proj"])
             and self.sharding_size > 1
         ):
-            pad_size = self.sharding_size // self.num_kv_heads
+            # Use original total kv heads to calculate pad_size correctly
+            original_total_kv_heads = self.model_config.get_total_num_kv_heads()
+            pad_size = self.sharding_size // original_total_kv_heads
             if pad_size > 1:
                 if hf_key.endswith(".bias"):
                     weight = jnp.repeat(weight, pad_size, axis=0)
