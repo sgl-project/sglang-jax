@@ -196,7 +196,7 @@ def run_data_parallel_controller_process(
 ):
     setproctitle.setproctitle("sgl-jax::data_parallel_controller")
     parent_process = psutil.Process().parent()
-    configure_logger(server_args, prefix=f"DPController-{server_args.node_rank}")
+    configure_logger(server_args, prefix=f" DPController:{server_args.node_rank}")
     try:
         logger.debug(f"Node {server_args.node_rank} DataParallelController started")
         controller = DataParallelController(server_args, port_args)

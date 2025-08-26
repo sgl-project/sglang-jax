@@ -931,9 +931,9 @@ class ScheduleBatch:
             f"schedule_batch.get_model_worker_batch: {self.forward_mode.name} req_to_token_pool.req_to_token: {self.req_to_token_pool.req_to_token}"
         )
         token_indices_with_all_reqs = np.array(
-            self.req_to_token_pool.req_to_token[self.req_pool_indices_cpu]
+            self.req_to_token_pool.req_to_token[req_pool_indices_cpu]
             if self.req_to_token_pool.req_to_token is not None
-            and len(self.req_to_token_pool.req_to_token[self.req_pool_indices_cpu]) > 0
+            and len(self.req_to_token_pool.req_to_token[req_pool_indices_cpu]) > 0
             else []
         )
         logging.info(
