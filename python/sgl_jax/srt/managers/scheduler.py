@@ -1069,7 +1069,7 @@ def run_scheduler_process(
     # Generate the prefix
     prefix = ""
     if server_args.nnodes > 1:
-        prefix += f" NP{server_args.node_rank}"
+        prefix += f"Scheduler-{server_args.node_rank}"
 
     # Config the process
     kill_itself_when_parent_died()
