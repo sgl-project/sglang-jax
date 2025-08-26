@@ -960,7 +960,7 @@ class ScheduleBatch:
                 f"schedule_batch.get_model_worker_batch: {self.forward_mode.name} local_sizes: {local_sizes}"
             )
             mesh_cpu = Mesh(jax.devices(backend="cpu"), ("host",))
-            all_size = functools.partial(
+            all_sizes = functools.partial(
                 shard_map.shard_map,
                 mesh=mesh_cpu,
                 in_specs=P(None),
