@@ -251,7 +251,7 @@ class Scheduler(
             dcn_parallelism=[1, 1, 1, 1],
             devices=jax.devices(),
         )
-        mesh_cpu = Mesh(jax.devices(backend="cpu"), ("host",))
+        self.mesh_cpu = Mesh(jax.devices(backend="cpu"), ("host",))
 
         # 添加JAX设备信息日志
         local_devices = jax.local_devices()
@@ -362,15 +362,14 @@ class Scheduler(
             self.tp_worker.run_precompile()
             logger.info(f"[Scheduler] completes worker precompile.")
 
-    @functools.partial(
-        shard_map.shard_map,
-        mesh=self.mesh_cpu,
-        in_specs=P(None),
-        out_specs=P(None),
-        check_rep=False,
-    )
-    def all_gather_by_cpu(x: jax.Array) -> jax.Array:
-        return jax.lax.all_gather(x, "host")
+        # Define all_gather_by_cpu function
+        self.all_gather_by_cpu = functools.partial(
+            shard_map.shard_map,
+            mesh=self.mesh_cpu,
+            in_specs=P(None),
+            out_specs=P(None),
+            check_rep=False,
+        )(lambda x: jax.lax.all_gather(x, "host"))
 
     def sync_pub(self):
         logger.info(

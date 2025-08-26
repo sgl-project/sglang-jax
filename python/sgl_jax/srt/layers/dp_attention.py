@@ -9,11 +9,11 @@ def compute_dp_attention_world_info(
     tp_size: int,
     dp_size: int,
     node_tp_size: Optional[int] = 4,
-) -> Tuple[int, int]:
+) -> Tuple[int, int, int]:
     # dp rank, attention tp size
     attn_tp_size = tp_size // dp_size
     if not enable_dp_attention:
-        return attn_tp_size, 0
+        return attn_tp_size, 0, 0
     dp_rank = (node_rank * node_tp_size) // attn_tp_size
     attn_dp_rank = node_rank - dp_rank * (attn_tp_size // node_tp_size)
     return attn_tp_size, attn_dp_rank, dp_rank
