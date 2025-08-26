@@ -893,8 +893,8 @@ class ScheduleBatch:
             logging.info(
                 f"schedule_batch.get_model_worker_batch: {self.forward_mode.name} shard {i} {shard}"
             )
-        input_ids_cpu = (
-            jax.device_get(self.input_ids.flatten())
+        input_ids_cpu = np.array(
+            self.input_ids.flatten()
             if self.input_ids is not None and len(self.input_ids) > 0
             else []
         )
@@ -902,16 +902,16 @@ class ScheduleBatch:
             f"schedule_batch.get_model_worker_batch: {self.forward_mode.name} input_ids_cpu: {input_ids_cpu}"
         )
         real_input_ids_len = len(input_ids_cpu)
-        out_cache_loc_cpu = (
-            jax.device_get(self.out_cache_loc)
+        out_cache_loc_cpu = np.array(
+            self.out_cache_loc
             if self.out_cache_loc is not None and len(self.out_cache_loc) > 0
             else []
         )
         logging.info(
             f"schedule_batch.get_model_worker_batch: {self.forward_mode.name} out_cache_loc_cpu: {out_cache_loc_cpu}"
         )
-        seq_lens_cpu = (
-            jax.device_get(self.seq_lens)
+        seq_lens_cpu = np.array(
+            self.seq_lens
             if self.seq_lens is not None and len(self.seq_lens) > 0
             else []
         )
@@ -919,16 +919,16 @@ class ScheduleBatch:
             f"schedule_batch.get_model_worker_batch: {self.forward_mode.name} seq_lens_cpu: {seq_lens_cpu}"
         )
         real_bs = len(seq_lens_cpu)
-        req_pool_indices_cpu = (
-            jax.device_get(self.req_pool_indices)
+        req_pool_indices_cpu = np.array(
+            self.req_pool_indices
             if self.req_pool_indices is not None and len(self.req_pool_indices) > 0
             else []
         )
         logging.info(
             f"schedule_batch.get_model_worker_batch: {self.forward_mode.name} req_pool_indices_cpu: {req_pool_indices_cpu}"
         )
-        token_indices_with_all_reqs = (
-            jax.device_get(self.req_to_token_pool.req_to_token[self.req_pool_indices])
+        token_indices_with_all_reqs = np.array(
+            self.req_to_token_pool.req_to_token[self.req_pool_indices]
             if self.req_to_token_pool.req_to_token is not None
             and len(self.req_to_token_pool.req_to_token[self.req_pool_indices]) > 0
             else []
@@ -946,8 +946,8 @@ class ScheduleBatch:
         # Gather sizes from all devices
         if self.enable_dp_attention:
             # Collect local sizes into arrays for all-gather
-            local_sizes = jnp.array(
-                [local_token_size, local_bs_size, local_cache_size], dtype=jnp.int32
+            local_sizes = np.array(
+                [local_token_size, local_bs_size, local_cache_size], dtype=np.int32
             )
             logging.info(
                 f"schedule_batch.get_model_worker_batch: {self.forward_mode.name} local_sizes: {local_sizes}"
