@@ -894,7 +894,7 @@ class ScheduleBatch:
                 f"schedule_batch.get_model_worker_batch: {self.forward_mode.name} shard {i} {shard}"
             )
         input_ids_cpu = np.array(
-            self.input_ids.flatten()
+            self.input_ids
             if self.input_ids is not None and len(self.input_ids) > 0
             else []
         )
