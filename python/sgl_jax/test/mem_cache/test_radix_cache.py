@@ -58,7 +58,9 @@ class TestRadixCache(unittest.TestCase):
         )
 
         allocator = TokenToKVPoolAllocator(
-            size=self.pool_size, dtype=self.dtype, kvcache=kv_cache
+            # size=self.pool_size, dtype=self.dtype, kvcache=kv_cache
+            size=self.pool_size,
+            kvcache=kv_cache,
         )
 
         return mesh, req_pool, allocator
@@ -103,7 +105,9 @@ class TestRadixCache(unittest.TestCase):
 
         # create allocator
         allocator = TokenToKVPoolAllocator(
-            size=self.pool_size, dtype=self.dtype, kvcache=kv_cache
+            # size=self.pool_size, dtype=self.dtype, kvcache=kv_cache
+            size=self.pool_size,
+            kvcache=kv_cache,
         )
 
         return mesh, req_pool, allocator
@@ -667,7 +671,9 @@ class TestRadixCacheWithRequests(unittest.TestCase):
         )
 
         self.allocator = TokenToKVPoolAllocator(
-            size=self.pool_size, dtype=self.dtype, kvcache=kv_cache
+            # size=self.pool_size, dtype=self.dtype, kvcache=kv_cache
+            size=self.pool_size,
+            kvcache=kv_cache,
         )
 
         self.cache = RadixCache(

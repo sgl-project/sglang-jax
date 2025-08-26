@@ -267,8 +267,7 @@ class ModelRunner:
             self.req_to_token_pool = ReqToTokenPool(
                 size=max_num_reqs + 1,
                 max_context_len=self.model_config.context_len + 4,
-                mesh=self.mesh,
-                dtype=jnp.int32,
+                dtype=np.int32,
             )
 
         self.model_config.log_kv_heads_padding_info(self.tp_size)
@@ -296,14 +295,14 @@ class ModelRunner:
             if self.page_size == 1:
                 self.token_to_kv_pool_allocator = TokenToKVPoolAllocator(
                     size=self.max_total_num_tokens,
-                    dtype=self.kv_cache_dtype,
+                    # dtype=self.kv_cache_dtype,
                     kvcache=self.token_to_kv_pool,
                 )
             else:
                 self.token_to_kv_pool_allocator = PagedTokenToKVPoolAllocator(
                     size=self.max_total_num_tokens,
                     page_size=self.page_size,
-                    dtype=self.kv_cache_dtype,
+                    # dtype=self.kv_cache_dtype,
                     kvcache=self.token_to_kv_pool,
                 )
 
@@ -466,7 +465,7 @@ class ModelRunner:
         self._preprocess_logits(logits_output, model_worker_batch.sampling_info)
 
         # Sample the next tokens
-        next_token_ids = self.sampler(
+        next_token_ids_device = self.sampler(
             logits_output,
             model_worker_batch.sampling_info,
             model_worker_batch.return_logprob,
@@ -474,7 +473,7 @@ class ModelRunner:
             model_worker_batch.token_ids_logprobs,
             self.mesh,
         )
-        return next_token_ids
+        return next_token_ids_device
 
 
 class MockModelRunner(ModelRunner):
@@ -515,8 +514,7 @@ class MockModelRunner(ModelRunner):
         self.req_to_token_pool = ReqToTokenPool(
             size=max_num_reqs + 1,
             max_context_len=self.model_config.context_len + 4,
-            mesh=mesh,
-            dtype=jnp.int32,
+            dtype=np.int32,
         )
 
         self.model_config.log_kv_heads_padding_info(self.tp_size)

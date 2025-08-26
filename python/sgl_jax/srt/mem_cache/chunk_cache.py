@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any, Optional
 
+import numpy as np
 from jax import numpy as jnp
 
 from sgl_jax.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
@@ -26,7 +27,7 @@ class ChunkCache(BasePrefixCache):
 
     def match_prefix(self, **unused_kwargs) -> MatchResult:
         return MatchResult(
-            device_indices=jnp.empty((0,), dtype=jnp.int32),
+            device_indices=np.empty((0,), dtype=np.int32),
             last_device_node=None,
             last_host_node=None,
         )
