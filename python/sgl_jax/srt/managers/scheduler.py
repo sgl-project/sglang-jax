@@ -676,6 +676,9 @@ class Scheduler(
             stream=recv_req.stream,
             eos_token_ids=self.model_config.hf_eos_token_id,
         )
+        logging.info(f"req.input_ids: {req.input_ids}")
+        for i, shard in enumerate(req.input_ids.addressable_shards):
+            logging.info(f"req.input_ids shard {i} {shard}")
         req.tokenizer = self.tokenizer
 
         # Validate prompt length
