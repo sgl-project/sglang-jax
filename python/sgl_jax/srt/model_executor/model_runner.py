@@ -113,10 +113,10 @@ class ModelRunner:
     def initialize_jit(self):
         self.graphdef, self.state = nnx.split(self.model)
 
-        @jax.jit
-        def run_model(graphdef, state, *args):
+        @partial(jax.jit, donate_argnames=["forward_batch"])
+        def run_model(graphdef, state, input_ids, positions, forward_batch):
             model = nnx.merge(graphdef, state)
-            return model(*args)
+            return model(input_ids, positions, forward_batch)
 
         def compute_logits(graphdef, state, *args):
             model = nnx.merge(graphdef, state)

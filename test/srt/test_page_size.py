@@ -30,7 +30,7 @@ class TestPageSizeGreaterThanOne(CustomTestCase):
                 "--tp-size",
                 "4",
                 "--mem-fraction-static",
-                "0.4",
+                "0.65",
                 "--max-prefill-tokens",
                 "8192",
                 "--download-dir",
@@ -62,7 +62,7 @@ class TestPageSizeGreaterThanOne(CustomTestCase):
             base_url=self.base_url,
             model=self.model,
             eval_name="mmlu",
-            num_examples=64,
+            num_examples=128,
             num_threads=64,
             max_tokens=1024,
         )
