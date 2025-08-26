@@ -44,6 +44,7 @@ from sgl_jax.srt.managers.scheduler_output_processor_mixin import (
 )
 from sgl_jax.srt.managers.scheduler_profiler_mixing import SchedulerProfilerMixin
 from sgl_jax.srt.managers.tp_worker import ModelWorker
+from sgl_jax.srt.managers.tp_worker_overlap_thread import ModelWorkerClient
 from sgl_jax.srt.managers.utils import validate_input_length
 from sgl_jax.srt.mem_cache.chunk_cache import ChunkCache
 from sgl_jax.srt.mem_cache.radix_cache import RadixCache
@@ -191,7 +192,12 @@ class Scheduler(
             ici_parallelism=[-1, self.tp_size, 1, 1], dcn_parallelism=[1, 1, 1, 1]
         )
 
-        self.tp_worker = ModelWorker(
+        if self.enable_overlap:
+            TpWorkerClass = ModelWorkerClient
+        else:
+            TpWorkerClass = ModelWorker
+
+        self.tp_worker = TpWorkerClass(
             server_args=server_args,
             mesh=self.mesh,
         )

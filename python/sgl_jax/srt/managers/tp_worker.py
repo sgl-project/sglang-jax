@@ -303,9 +303,6 @@ class ModelWorker:
             self.model_runner.token_to_kv_pool.size,
         )
 
-    def get_tp_group(self):
-        return self.model_runner.tp_group
-
     def get_pad_input_ids_func(self):
         return getattr(self.model_runner.model, "pad_input_ids", None)
 
@@ -330,12 +327,12 @@ class ModelWorker:
             ),
         )
 
+        # TODO: waiting for aolemila review
+        idx = model_worker_batch.extend_start_loc[: model_worker_batch.real_bs]
+        logits_output.truncate_logits_processor_output(idx)
+
         if launch_done is not None:
             launch_done.set()
-
-        idx = model_worker_batch.extend_start_loc[: model_worker_batch.real_bs]
-
-        logits_output.truncate_logits_processor_output(idx)
 
         if skip_sample:
             next_token_ids = None
