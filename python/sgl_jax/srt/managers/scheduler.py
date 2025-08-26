@@ -72,6 +72,7 @@ from sgl_jax.srt.utils.common_utils import (
     pyspy_dump_schedulers,
     set_random_seed,
 )
+from sgl_jax.srt.utils.jax_utils import all_gather_by_cpu
 from sgl_jax.srt.utils.mesh_utils import create_device_mesh
 from sgl_jax.utils import TypeBasedDispatcher, get_exception_traceback
 
@@ -787,19 +788,7 @@ class Scheduler(
         logger.info(f"before dp sync Node {self.node_rank} ret: {ret}")
         # DP Attention: Synchronize batch across DP groups
         if self.server_args.enable_dp_attention:
-            mesh = Mesh(jax.devices(backend="cpu"), ("i",))
-
-            @functools.partial(
-                shard_map.shard_map,
-                mesh=mesh,
-                in_specs=P(None),
-                out_specs=P(None),
-                check_rep=False,
-            )
-            def f(x):
-                return jax.lax.all_gather(x, "i")
-
-            batch_size_list = f(
+            batch_size_list = all_gather_by_cpu(
                 np.array([ret.batch_size if ret is not None else 0], dtype=np.int32)
             )
             logger.info(

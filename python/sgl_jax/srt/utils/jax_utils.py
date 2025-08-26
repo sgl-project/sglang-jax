@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
+import functools
+
 import jax
 import jax.numpy as jnp
+from jax.experimental import shard_map
 from jax.sharding import NamedSharding, PartitionSpec
 
 
@@ -66,3 +69,17 @@ def device_array(mesh, data, sharding=None, **kwargs) -> jax.Array:
     if sharding is None:
         sharding = NamedSharding(mesh, PartitionSpec(None))
     return jax.device_put(data, device=sharding, **kwargs)
+
+
+mesh_cpu = Mesh(jax.devices(backend="cpu"), ("host",))
+
+
+@functools.partial(
+    shard_map.shard_map,
+    mesh=mesh_cpu,
+    in_specs=P(None),
+    out_specs=P(None),
+    check_rep=False,
+)
+def all_gather_by_cpu(x: jax.Array) -> jax.Array:
+    return jax.lax.all_gather(x, "host")
