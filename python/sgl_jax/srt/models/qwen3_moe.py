@@ -8,7 +8,6 @@ from jax.sharding import get_abstract_mesh
 from transformers import PretrainedConfig
 
 from python.sgl_jax.srt.configs.model_config import ModelConfig
-from sgl_jax.srt.debug_tracer import global_tracer, trace_function
 from sgl_jax.srt.layers.embeddings import Embed, ParallelLMHead, RotaryEmbedding
 from sgl_jax.srt.layers.layernorm import RMSNorm
 from sgl_jax.srt.layers.linear import LinearBase
@@ -98,7 +97,6 @@ class QWen3MoeAttention(nnx.Module):
             layer_id=layer_id,
         )
 
-    @trace_function(stage="ATTENTION", include_args=False, include_output=True)
     def __call__(
         self,
         positions: jax.Array,
@@ -208,9 +206,6 @@ class QWen3MoeDecoderLayer(nnx.Module):
             config.hidden_size, epsilon=config.rms_norm_eps, rngs=rngs
         )
 
-    @trace_function(
-        stage="MOE_DECODER_LAYER_FORWARD", include_args=False, include_output=True
-    )
     def __call__(
         self,
         positions: jax.Array,
@@ -275,9 +270,6 @@ class QWen3MoeModel(nnx.Module):
 
         self.norm = RMSNorm(config.hidden_size, epsilon=config.rms_norm_eps, rngs=rngs)
 
-    @trace_function(
-        stage="MOE_TRANSFORMER_FORWARD", include_args=False, include_output=True
-    )
     def __call__(
         self,
         input_ids: jax.Array,
@@ -321,13 +313,6 @@ class Qwen3MoeForCausalLM(nnx.Module):
             config.hf_config.vocab_size, config.hidden_size, rngs=rngs
         )
         self.logits_processor = LogitsProcessor(config.hf_config.vocab_size)
-        self._setup_debug_tracer()
-
-    def _setup_debug_tracer(self):
-        try:
-            global_tracer.set_model(self)
-        except Exception as e:
-            print(f"Warning: Could not setup debug tracer: {str(e)}")
 
     def load_weights(self, rng_key: jax.Array):
         self.rng = nnx.Rngs(rng_key)
@@ -369,13 +354,6 @@ class Qwen3MoeForCausalLM(nnx.Module):
     def _create_moe_layer_mappings(self, layer_idx: int, is_mlp_layer: bool) -> dict:
         prefix = f"model.layers.{layer_idx}"
         target_prefix = f"transformer.layers.{layer_idx}"
-
-        num_heads = self.config.hf_config.num_attention_heads
-        num_kv_heads = self.config.hf_config.num_key_value_heads
-        hidden_size = self.config.hf_config.hidden_size
-        head_dim_original = getattr(
-            self.config.hf_config, "head_dim", hidden_size // num_heads
-        )
 
         mappings = {
             f"{prefix}.input_layernorm.weight": WeightMapping(
@@ -504,9 +482,6 @@ class Qwen3MoeForCausalLM(nnx.Module):
             hidden_states, self.lm_head, logits_metadata, self.mesh
         )
 
-    @trace_function(
-        stage="MOE_CAUSAL_LM_FORWARD", include_args=False, include_output=True
-    )
     def __call__(
         self,
         input_ids: jax.Array,
@@ -516,29 +491,8 @@ class Qwen3MoeForCausalLM(nnx.Module):
         hidden_states, layers_k, layers_v = self.transformer(
             input_ids, positions, forward_batch
         )
-        result = self.logits_processor(
-            hidden_states, self.lm_head, forward_batch, self.mesh
-        )
 
-        if global_tracer.is_session_active():
-            input_data = {"input_ids": input_ids, "input_shape": list(input_ids.shape)}
-
-            output_data = {"output_type": str(type(result).__name__)}
-
-            if (
-                hasattr(result, "next_token_logits")
-                and result.next_token_logits is not None
-            ):
-                output_data.update(
-                    {"next_token_logits": result.next_token_logits.shape}
-                )
-
-            global_tracer.accumulate_step(input_data, output_data)
-
-            if global_tracer.should_auto_save():
-                global_tracer.end_session()
-
-        return result, layers_k, layers_v
+        return hidden_states, layers_k, layers_v
 
 
 EntryClass = Qwen3MoeForCausalLM

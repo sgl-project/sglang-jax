@@ -9,7 +9,6 @@ from jax.sharding import PartitionSpec
 from transformers import PretrainedConfig
 
 from sgl_jax.srt.configs.model_config import ModelConfig
-from sgl_jax.srt.debug_tracer import global_tracer, trace_function
 from sgl_jax.srt.layers.embeddings import Embed, ParallelLMHead, RotaryEmbedding
 from sgl_jax.srt.layers.layernorm import RMSNorm
 from sgl_jax.srt.layers.linear import LinearBase
@@ -98,7 +97,6 @@ class QWen3Attention(nnx.Module):
             layer_id=layer_id,
         )
 
-    @trace_function(stage="ATTENTION", include_args=False, include_output=True)
     def __call__(
         self,
         positions: jax.Array,
@@ -164,18 +162,12 @@ class Qwen3MLP(nnx.Module):
 
         self.act_fn = jax.nn.silu
 
-    @trace_function(stage="MLP", include_args=False, include_output=True)
     def __call__(self, hidden_states: jnp.ndarray):
         a1, _ = self.gate_proj(hidden_states)
         a2, _ = self.up_proj(hidden_states)
-        global_tracer.print(a1, f"a1_output", f"mlp_layer_id_{self.layer_id}")
-        global_tracer.print(a2, f"a2_output", f"mlp_layer_id_{self.layer_id}")
         intermediate_parallel = a2 * self.act_fn(a1)
         intermediate_parallel = jax.lax.with_sharding_constraint(
             intermediate_parallel, PartitionSpec(None, "tensor")
-        )
-        global_tracer.print(
-            intermediate_parallel, f"act_fn_output", f"mlp_layer_id_{self.layer_id}"
         )
         output, _ = self.down_proj(intermediate_parallel)
 
@@ -225,7 +217,6 @@ class QWen3DecoderLayer(nnx.Module):
             config.hidden_size, epsilon=config.rms_norm_eps, rngs=rngs
         )
 
-    @trace_function(stage="QWen3DecoderLayer", include_args=False, include_output=True)
     def __call__(
         self,
         positions: jax.Array,
@@ -246,11 +237,6 @@ class QWen3DecoderLayer(nnx.Module):
         )
 
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
-        global_tracer.print(
-            hidden_states,
-            f"post_attention_layernorm_output",
-            f"decoder_layer_id_{self.layer_id}",
-        )
         hidden_states = self.mlp(hidden_states)
 
         return hidden_states, residual, k, v
@@ -284,7 +270,6 @@ class QWen3Model(nnx.Module):
 
         self.norm = RMSNorm(config.hidden_size, epsilon=config.rms_norm_eps, rngs=rngs)
 
-    @trace_function(stage="TRANSFORMER", include_args=False, include_output=True)
     def __call__(
         self,
         input_ids: jax.Array,
@@ -319,13 +304,6 @@ class Qwen3ForCausalLM(nnx.Module):
             config.hf_config.vocab_size, config.hidden_size, rngs=rngs
         )
         self.logits_processor = LogitsProcessor(config.hf_config.vocab_size)
-        self._setup_debug_tracer()
-
-    def _setup_debug_tracer(self):
-        try:
-            global_tracer.set_model(self)
-        except Exception as e:
-            print(f"Warning: Could not setup debug tracer: {str(e)}")
 
     def load_weights(self, rng_key: jax.Array):
         self.rng = nnx.Rngs(rng_key)
@@ -491,31 +469,8 @@ class Qwen3ForCausalLM(nnx.Module):
         hidden_states, layers_k, layers_v = self.transformer(
             input_ids, positions, forward_batch
         )
-        result = self.logits_processor(
-            hidden_states, self.lm_head, forward_batch, self.mesh
-        )
 
-        if global_tracer.is_session_active():
-            input_data = {"input_ids": input_ids, "input_shape": list(input_ids.shape)}
-
-            output_data = {"output_type": str(type(result).__name__)}
-
-            if (
-                hasattr(result, "next_token_logits")
-                and result.next_token_logits is not None
-            ):
-                output_data.update(
-                    {
-                        "logits": result.next_token_logits,
-                        "logits_shape": list(result.next_token_logits.shape),
-                    }
-                )
-
-            global_tracer.accumulate_step(input_data, output_data)
-
-            if global_tracer.should_auto_save():
-                global_tracer.end_session()
-        return result, layers_k, layers_v
+        return hidden_states, layers_k, layers_v
 
 
 EntryClass = Qwen3ForCausalLM
