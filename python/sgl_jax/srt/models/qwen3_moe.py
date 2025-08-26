@@ -132,6 +132,7 @@ class QWen3MoeDecoderLayer(nnx.Module):
         dtype: jnp.dtype = jnp.bfloat16,
         rngs: nnx.Rngs = None,
         mesh: jax.sharding.Mesh = None,
+        max_total_tokens: int = 32768,
     ):
         self.layer_id = layer_id
         self.hidden_size = config.hidden_size
@@ -197,6 +198,7 @@ class QWen3MoeDecoderLayer(nnx.Module):
                     weight_dtype=dtype,
                     dtype=dtype,
                     layer_id=layer_id,
+                    max_total_tokens=max_total_tokens,
                     rngs=rngs,
                 )
             self.is_moe_layer = True
@@ -249,6 +251,7 @@ class QWen3MoeModel(nnx.Module):
         dtype: jnp.dtype = jnp.bfloat16,
         rngs: nnx.Rngs = None,
         mesh: jax.sharding.Mesh = None,
+        max_total_tokens: int = 32768,
     ):
         self.config = config
         self.padding_idx = config.pad_token_id
@@ -269,6 +272,7 @@ class QWen3MoeModel(nnx.Module):
                 dtype=dtype,
                 rngs=rngs,
                 mesh=mesh,
+                max_total_tokens=max_total_tokens,
             )
             for i in range(config.num_hidden_layers)
         ]
@@ -315,7 +319,11 @@ class Qwen3MoeForCausalLM(nnx.Module):
         self.dtype = config.dtype
         logger.info(f"QWen3MoeForCausalLMModel config dtype: {self.dtype}")
         self.transformer = QWen3MoeModel(
-            config.hf_config, dtype=self.dtype, rngs=rngs, mesh=mesh
+            config.hf_config,
+            dtype=self.dtype,
+            rngs=rngs,
+            mesh=mesh,
+            max_total_tokens=config.max_total_tokens,
         )
         self.lm_head = ParallelLMHead(
             config.hf_config.vocab_size, config.hidden_size, rngs=rngs

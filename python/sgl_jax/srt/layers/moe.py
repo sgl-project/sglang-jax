@@ -112,6 +112,7 @@ class EPMoE(nnx.Module):
         weight_dtype: jnp.dtype = jnp.bfloat16,
         dtype: jnp.dtype = jnp.bfloat16,
         layer_id: int = 0,
+        max_total_tokens: int = 32768,
         rngs: nnx.Rngs = None,
     ):
 
@@ -124,6 +125,7 @@ class EPMoE(nnx.Module):
         self.layer_id = layer_id
         self.expert_parallel_size = expert_parallel_size
         self.mesh = mesh
+        self.max_total_tokens = max_total_tokens
         if num_experts % self.expert_parallel_size != 0:
             raise ValueError(
                 f"num_experts({num_experts}) must be divisible by expert_parallel_size ({self.expert_parallel_size})"
@@ -273,45 +275,36 @@ class EPMoE(nnx.Module):
             )  # (0, hidden_dim)
             return empty_output
 
-        # padding for use normal dot
+        # JIT-friendly padding using lax.cond and fixed buffer size
         max_padding_size = jax.lax.pmax(x.shape[0], axis_name=("data", "tensor"))
         original_size = x.shape[0]
 
-        # Create padded tensors with fixed max size
-        padded_x = jnp.zeros((max_padding_size, x.shape[1]), dtype=x.dtype)
-        padded_x = padded_x.at[:original_size].set(x)
+        # Use configured max tokens as buffer size (from server_args)
+        # You need to pass this from config - e.g., self.max_total_tokens
+        buffer_size = max_padding_size  # Will be within max_total_tokens limit
 
-        padded_group_sizes = jnp.zeros(max_padding_size, dtype=local_group_sizes.dtype)
-        padded_group_sizes = padded_group_sizes.at[: len(local_group_sizes)].set(
-            local_group_sizes
-        )
+        # Create buffers with concrete shapes using configured max tokens
+        x_buffer = jnp.zeros((self.max_total_tokens, x.shape[1]), dtype=x.dtype)
+        group_buffer = jnp.zeros(self.max_total_tokens, dtype=local_group_sizes.dtype)
 
-        x = padded_x
-        local_group_sizes = padded_group_sizes
+        # Fill buffers
+        x_padded = x_buffer.at[:original_size].set(x)
+        x_final = jax.lax.dynamic_slice(x_padded, (0, 0), (buffer_size, x.shape[1]))
+
+        group_padded = group_buffer.at[: len(local_group_sizes)].set(local_group_sizes)
+        group_final = jax.lax.dynamic_slice(group_padded, (0,), (buffer_size,))
 
         # Create expert indices for masking
-        expert_indices = jnp.repeat(
-            jnp.arange(len(local_group_sizes)), local_group_sizes
-        )
-        mask = (
-            expert_indices[:, None] == jnp.arange(len(local_group_sizes))[None, :]
-        )  # (total_tokens, num_experts)
+        expert_indices = jnp.repeat(jnp.arange(len(group_final)), group_final)
+        mask = expert_indices[:, None] == jnp.arange(len(group_final))[None, :]
 
         # gate - einsum with masking
-        layer_w0_all = jnp.einsum(
-            "th,ehd->ted", x, w0_kernel
-        )  # (total_tokens, num_experts, intermediate_dim)
-        layer_w0 = jnp.sum(
-            layer_w0_all * mask[:, :, None], axis=1
-        )  # (total_tokens, intermediate_dim)
+        layer_w0_all = jnp.einsum("th,ehd->ted", x_final, w0_kernel)
+        layer_w0 = jnp.sum(layer_w0_all * mask[:, :, None], axis=1)
 
         # up - einsum with masking
-        layer_w1_all = jnp.einsum(
-            "th,ehd->ted", x, w1_kernel
-        )  # (total_tokens, num_experts, intermediate_dim)
-        layer_w1 = jnp.sum(
-            layer_w1_all * mask[:, :, None], axis=1
-        )  # (total_tokens, intermediate_dim)
+        layer_w1_all = jnp.einsum("th,ehd->ted", x_final, w1_kernel)
+        layer_w1 = jnp.sum(layer_w1_all * mask[:, :, None], axis=1)
 
         # activation
         layer_act = jax.nn.silu(layer_w0)
@@ -320,13 +313,15 @@ class EPMoE(nnx.Module):
         # down - einsum with masking
         intermediate_output_all = jnp.einsum(
             "td,edh->teh", intermediate_layer, wo_kernel
-        )  # (total_tokens, num_experts, hidden_dim)
+        )
         intermediate_output = jnp.sum(
             intermediate_output_all * mask[:, :, None], axis=1
-        )  # (total_tokens, hidden_dim)
+        )
 
-        # Remove padding before returning
-        return intermediate_output[:original_size]
+        # Return original size
+        return jax.lax.dynamic_slice(
+            intermediate_output, (0, 0), (original_size, intermediate_output.shape[1])
+        )
 
     def _single_device_forward(self, inputs, router_logits):
         top_k_logits, top_k_indices = jax.lax.top_k(
