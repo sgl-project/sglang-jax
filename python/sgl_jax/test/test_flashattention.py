@@ -424,7 +424,7 @@ class TestAttention(CustomTestCase):
         """Test JAX attention accuracy against PyTorch reference"""
         # Parameters
         num_heads = 32
-        num_kv_heads = 32
+        num_kv_heads = 8
         head_dim = 128
         lens = [
             (1, 128),
@@ -531,6 +531,48 @@ class TestAttention(CustomTestCase):
             (1, 1024),
             (1, 1025),
         ]
+        self.run_test(
+            "decode", lens, (num_heads, head_dim, num_kv_heads, 64, jnp.bfloat16)
+        )
+
+    def test_gqa_prefill_accuracy_page_size_64(self):
+        """Test JAX attention accuracy against PyTorch reference"""
+        # Parameters
+        num_heads = 32
+        num_kv_heads = 8
+        head_dim = 128
+        lens = [
+            (1, 128),
+            (3, 20),
+            (64, 64),
+            (20, 20),
+            (125, 125),
+            (1024, 1024),
+            (123, 522),
+            (1, 511),
+        ]
+        self.run_test(
+            "prefill", lens, (num_heads, head_dim, num_kv_heads, 64, jnp.bfloat16)
+        )
+
+    def test_gqa_decode_accuracy_page_size_greater_1(self):
+        """Test JAX attention accuracy against native fa"""
+        # Parameters
+        num_heads = 32
+        num_kv_heads = 8
+        head_dim = 128
+        lens = [
+            (1, 119),
+            (1, 127),
+            (1, 128),
+            (1, 129),
+            (1, 133),
+            (1, 1001),
+            (1, 1023),
+            (1, 1024),
+            (1, 1025),
+        ]
+
         self.run_test(
             "decode", lens, (num_heads, head_dim, num_kv_heads, 64, jnp.bfloat16)
         )
