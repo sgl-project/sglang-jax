@@ -804,6 +804,7 @@ class Scheduler(
                 f"Node {self.node_rank} batch_size_list: {np.array(batch_size_list)}"
             )
             is_all_idle = all(size == 0 for size in np.array(batch_size_list).flatten())
+            ret.batch_size_list = batch_size_list
             if not is_all_idle and ret is None:
                 ret = self.get_idle_batch()
         logger.info(f"after dp sync Node {self.node_rank} ret: {ret}")

@@ -19,6 +19,7 @@ TODO(lmzheng): ModelWorkerBatch seems a bit redundant and we consider removing i
 """
 
 import dataclasses
+import functools
 import logging
 from http import HTTPStatus
 from typing import Any, List, Optional, Set, Tuple, Union
@@ -27,6 +28,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from jax._src import mesh as mesh_lib
+from jax.experimental import shard_map
+from jax.sharding import PartitionSpec as P
 
 from sgl_jax.global_config import global_config
 from sgl_jax.srt.configs.model_config import ModelConfig
@@ -427,6 +430,7 @@ class ScheduleBatch:
     # This is an optimization to reduce the overhead of the prefill check.
     batch_is_full: bool = False
 
+    batch_size_list: np.ndarray = []
     # Sampling info
     sampling_info: SamplingBatchInfo = None
     next_batch_sampling_info: SamplingBatchInfo = None
@@ -925,10 +929,19 @@ class ScheduleBatch:
             local_sizes = jnp.array(
                 [local_token_size, local_bs_size, local_cache_size], dtype=jnp.int32
             )
-            # All-gather to get sizes from all devices
-            with self.mesh:
-                logger.info(f"mesh.axis_names: {self.mesh.axis_names}")
-                all_sizes = jax.lax.all_gather(local_sizes, axis_name="data")
+            logging.info(
+                f"schedule_batch.get_model_worker_batch: {self.forward_mode.name} local_sizes: {local_sizes}"
+            )
+            all_size = functools.partial(
+                shard_map.shard_map,
+                mesh=mesh_cpu,
+                in_specs=P(None),
+                out_specs=P(None),
+                check_rep=False,
+            )(lambda x: jax.lax.all_gather(x, "host"))(local_sizes)
+            logging.info(
+                f"schedule_batch.get_model_worker_batch: {self.forward_mode.name} all_size: {all_size}"
+            )
             # Calculate global max sizes
             global_max_token_size = jnp.max(all_sizes[:, 0]).item()
             global_max_bs_size = jnp.max(all_sizes[:, 1]).item()
