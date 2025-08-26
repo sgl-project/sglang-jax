@@ -886,11 +886,16 @@ class ScheduleBatch:
 
         global bid
         bid += 1
-
+        logging.info(
+            f"schedule_batch.get_model_worker_batch: {self.forward_mode.name} bid: {bid}"
+        )
         input_ids_cpu = (
             jax.device_get(self.input_ids.flatten())
             if self.input_ids is not None and len(self.input_ids) > 0
             else []
+        )
+        logging.info(
+            f"schedule_batch.get_model_worker_batch: {self.forward_mode.name} input_ids_cpu: {input_ids_cpu}"
         )
         real_input_ids_len = len(input_ids_cpu)
         out_cache_loc_cpu = (
@@ -898,10 +903,16 @@ class ScheduleBatch:
             if self.out_cache_loc is not None and len(self.out_cache_loc) > 0
             else []
         )
+        logging.info(
+            f"schedule_batch.get_model_worker_batch: {self.forward_mode.name} out_cache_loc_cpu: {out_cache_loc_cpu}"
+        )
         seq_lens_cpu = (
             jax.device_get(self.seq_lens)
             if self.seq_lens is not None and len(self.seq_lens) > 0
             else []
+        )
+        logging.info(
+            f"schedule_batch.get_model_worker_batch: {self.forward_mode.name} seq_lens_cpu: {seq_lens_cpu}"
         )
         real_bs = len(seq_lens_cpu)
         req_pool_indices_cpu = (
@@ -909,13 +920,18 @@ class ScheduleBatch:
             if self.req_pool_indices is not None and len(self.req_pool_indices) > 0
             else []
         )
+        logging.info(
+            f"schedule_batch.get_model_worker_batch: {self.forward_mode.name} req_pool_indices_cpu: {req_pool_indices_cpu}"
+        )
         token_indices_with_all_reqs = (
             jax.device_get(self.req_to_token_pool.req_to_token[self.req_pool_indices])
             if self.req_to_token_pool.req_to_token is not None
             and len(self.req_to_token_pool.req_to_token[self.req_pool_indices]) > 0
             else []
         )
-
+        logging.info(
+            f"schedule_batch.get_model_worker_batch: {self.forward_mode.name} token_indices_with_all_reqs: {token_indices_with_all_reqs}"
+        )
         # All-gather padding sizes from all devices to ensure consistent padding
         local_token_size = len(input_ids_cpu)
         local_bs_size = len(seq_lens_cpu)
