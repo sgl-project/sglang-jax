@@ -650,13 +650,12 @@ class ScheduleBatch:
             req.req_pool_idx = req_pool_indices[i]
             assert seq_len - pre_len == req.extend_input_len
             # note: req.prefix_indices is located on CPU, so we have to extract values then device_put
-            prefix_indices_device = jnp.array(np.asarray(req.prefix_indices))
-            # prefix_indices = req.prefix_indices
+            # prefix_indices_device = jnp.array(np.asarray(req.prefix_indices))
+            prefix_indices = req.prefix_indices
             if pre_len > 0:
                 # note: prefix_indices has to locate on device, or will meet Received incompatible devices for jitted computation
                 self.req_to_token_pool.write(
-                    (req.req_pool_idx, slice(0, pre_len)),
-                    prefix_indices_device,  # prefix_indices
+                    (req.req_pool_idx, slice(0, pre_len)), prefix_indices
                 )
 
             req.cached_tokens += pre_len - req.already_computed
@@ -736,9 +735,7 @@ class ScheduleBatch:
         self.input_ids = input_ids_cpu
         self.req_pool_indices = req_pool_indices_cpu
         self.seq_lens = seq_lens_cpu
-        self.out_cache_loc = jax.device_get(
-            out_cache_loc
-        )  # todo: tmp to remove jax.device_get
+        self.out_cache_loc = out_cache_loc
         self.seq_lens_sum = sum(seq_lens)
 
         if self.return_logprob:
@@ -902,20 +899,17 @@ class ScheduleBatch:
 
         # Allocate memory
         if self.token_to_kv_pool_allocator.page_size == 1:
-            out_cache_loc = self.alloc_token_slots(bs)
+            self.out_cache_loc = self.alloc_token_slots(bs)
         else:
             last_loc = self.req_to_token_pool.req_to_token[
                 self.req_pool_indices, self.seq_lens - 2
             ]
-            out_cache_loc = self.alloc_paged_token_slots_decode(
+            self.out_cache_loc = self.alloc_paged_token_slots_decode(
                 self.seq_lens.tolist(),
                 last_loc.tolist(),
             )
-        self.out_cache_loc = jax.device_get(
-            out_cache_loc
-        )  # todo: aolemila, remove jax.device_get
         self.req_to_token_pool.write(
-            (self.req_pool_indices, locs), out_cache_loc.astype(np.int32)
+            (self.req_pool_indices, locs), self.out_cache_loc.astype(np.int32)
         )
 
     def filter_batch(

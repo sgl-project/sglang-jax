@@ -270,8 +270,8 @@ class ModelWorker:
             input_ids=np.concat([valid_input_ids, invalid_input_ids], axis=0),
             real_input_ids_len=len(valid_input_ids),
             real_bs=bs,
-            req_pool_indices=np.arange(bs, dtype=jnp.int32),
-            seq_lens=np.array([1] * bs, dtype=jnp.int32),
+            req_pool_indices=np.arange(bs, dtype=np.int32),
+            seq_lens=np.array([1] * bs, dtype=np.int32),
             out_cache_loc=np.concat(
                 [valid_out_cache_loc, invalid_out_cache_loc], axis=0
             ),

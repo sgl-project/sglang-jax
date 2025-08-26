@@ -112,15 +112,15 @@ class RadixCache(BasePrefixCache):
             )
         self.reset()
 
-    def _create_tokens_data(self, tokens: List[int]) -> jnp.ndarray:
+    def _create_tokens_data(self, tokens: List[int]) -> np.ndarray:
         if self.disable:
-            return jnp.array(tokens, dtype=jnp.int32)
+            return np.array(tokens, dtype=np.int32)
 
-        with jax.default_device(self.cpu_device):
-            token_array = jnp.array(tokens, dtype=jnp.int32)
-            cpu_tokens = jax.device_put(token_array, self.cpu_device)
+        # with jax.default_device(self.cpu_device):
+        #    token_array = jnp.array(tokens, dtype=jnp.int32)
+        #    cpu_tokens = jax.device_put(token_array, self.cpu_device)
 
-        return cpu_tokens
+        return np.array(tokens, dtype=np.int32)
 
     def reset(self):
         self.root_node = TreeNode()
@@ -133,9 +133,10 @@ class RadixCache(BasePrefixCache):
     def match_prefix(self, key: List[int], **kwargs) -> MatchResult:
         if self.disable or len(key) == 0:
             # create empty array on CPU
-            with jax.default_device(self.cpu_device):
-                empty_array = jnp.empty((0,), dtype=jnp.int32)
-                empty_array = jax.device_put(empty_array, self.cpu_device)
+            # with jax.default_device(self.cpu_device):
+            #     empty_array = jnp.empty((0,), dtype=jnp.int32)
+            #     empty_array = jax.device_put(empty_array, self.cpu_device)
+            empty_array = np.empty((0,), dtype=np.int32)
 
             return MatchResult(
                 device_indices=empty_array,
@@ -156,22 +157,25 @@ class RadixCache(BasePrefixCache):
                 if tokens is not None and len(tokens) > 0:
                     if isinstance(tokens, (list, tuple)):
                         valid_tokens.extend(tokens)
-                    elif isinstance(tokens, jnp.ndarray):
+                    elif isinstance(tokens, np.ndarray):
                         valid_tokens.extend(tokens.tolist())
 
             if valid_tokens:
                 # create array on CPU
-                with jax.default_device(self.cpu_device):
-                    matched_tokens = jnp.array(valid_tokens, dtype=jnp.int32)
-                    matched_tokens = jax.device_put(matched_tokens, self.cpu_device)
+                # with jax.default_device(self.cpu_device):
+                #     matched_tokens = jnp.array(valid_tokens, dtype=jnp.int32)
+                #     matched_tokens = jax.device_put(matched_tokens, self.cpu_device)
+                matched_tokens = np.array(valid_tokens, dtype=np.int32)
             else:
-                with jax.default_device(self.cpu_device):
-                    matched_tokens = jnp.empty((0,), dtype=jnp.int32)
-                    matched_tokens = jax.device_put(matched_tokens, self.cpu_device)
+                # with jax.default_device(self.cpu_device):
+                #     matched_tokens = jnp.empty((0,), dtype=jnp.int32)
+                #     matched_tokens = jax.device_put(matched_tokens, self.cpu_device)
+                matched_tokens = np.empty((0,), dtype=np.int32)
         else:
-            with jax.default_device(self.cpu_device):
-                matched_tokens = jnp.empty((0,), dtype=jnp.int32)
-                matched_tokens = jax.device_put(matched_tokens, self.cpu_device)
+            # with jax.default_device(self.cpu_device):
+            #    matched_tokens = jnp.empty((0,), dtype=jnp.int32)
+            #    matched_tokens = jax.device_put(matched_tokens, self.cpu_device)
+            matched_tokens = np.empty((0,), dtype=np.int32)
 
         return MatchResult(
             device_indices=matched_tokens,
@@ -252,13 +256,13 @@ class RadixCache(BasePrefixCache):
         new_indices = new_match_result.device_indices  # cpu
         new_last_node = new_match_result.last_device_node
 
-        new_indices_device = device_array(
-            self.req_to_token_pool.mesh, np.asarray(new_indices)
-        )
+        # new_indices_device = device_array(
+        #     self.req_to_token_pool.mesh, np.asarray(new_indices)
+        # )
 
         self.req_to_token_pool.write(
             (req.req_pool_idx, slice(len(req.prefix_indices), len(new_indices))),
-            new_indices_device[len(req.prefix_indices) :],
+            new_indices[len(req.prefix_indices) :],
         )
 
         self.dec_lock_ref(req.last_node)
@@ -267,18 +271,21 @@ class RadixCache(BasePrefixCache):
         # `req.prefix_indices` will be used later in `PrefillAdder::add_chunked_req`
         if self.page_size != 1:
             # create array on CPU
-            with jax.default_device(self.cpu_device):
-                kv_indices_cpu = jax.device_put(kv_indices, self.cpu_device)
-                req.prefix_indices = jnp.concatenate(
-                    [new_indices, kv_indices_cpu[len(new_indices) :]]
-                )
+            req.prefix_indices = np.concat(
+                [new_indices, kv_indices[len(new_indices) :]]
+            )
+            # with jax.default_device(self.cpu_device):
+            #     kv_indices_cpu = jax.device_put(kv_indices, self.cpu_device)
+            #     req.prefix_indices = jnp.concatenate(
+            #         [new_indices, kv_indices_cpu[len(new_indices) :]]
+            #     )
         else:
             req.prefix_indices = new_indices
         req.last_node = new_last_node
 
+    # note: get_cached_kv is only used by test, skip to replace jnp with np
     def get_cached_kv(self, token_ids: List[int]) -> Tuple[jnp.ndarray, int]:
         if self.disable:
-            # create empty array on CPU
             with jax.default_device(self.cpu_device):
                 empty_kv = jnp.empty(
                     (self.layer_num, 0, self.kv_head_num, self.head_dim),
@@ -500,7 +507,7 @@ class RadixCache(BasePrefixCache):
 
     def _print_helper(self, node: TreeNode, indent: int):
         value_info = ""
-        if isinstance(node.value, jnp.ndarray):
+        if isinstance(node.value, np.ndarray):
             value_info = f"JAX{node.value.shape}"
         elif node.value:
             value_info = f"len={len(node.value)}"

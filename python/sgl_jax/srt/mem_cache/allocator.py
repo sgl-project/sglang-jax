@@ -16,12 +16,12 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         self,
         size: int,
         page_size: int,
-        dtype: jnp.dtype,
+        # dtype: jnp.dtype,
         kvcache: KVCache,
     ):
         self.size = size
         self.page_size = page_size
-        self.dtype = dtype
+        # self.dtype = dtype
         self._kvcache = kvcache
 
         self.free_pages = None
@@ -79,11 +79,11 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         raise NotImplementedError()
 
     @abc.abstractmethod
-    def alloc(self, need_size: int) -> Optional[jnp.ndarray]:
+    def alloc(self, need_size: int) -> Optional[np.ndarray]:
         raise NotImplementedError()
 
     @abc.abstractmethod
-    def free(self, free_index: jnp.ndarray):
+    def free(self, free_index: np.ndarray):
         raise NotImplementedError()
 
 
@@ -91,10 +91,11 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def __init__(
         self,
         size: int,
-        dtype: jnp.dtype,
+        # dtype: jnp.dtype,
         kvcache: KVCache,
     ):
-        super().__init__(size, 1, dtype, kvcache)  # page_size=1 for token-level
+        # super().__init__(size, 1, dtype, kvcache)  # page_size=1 for token-level
+        super().__init__(size, 1, kvcache)  # page_size=1 for token-level
         self.clear()
 
     def clear(self):
@@ -107,15 +108,15 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         # To avoid minor "len(free_slots) * 1" overhead
         return len(self.free_slots)
 
-    def alloc(self, need_size: int) -> Optional[jnp.ndarray]:
+    def alloc(self, need_size: int) -> Optional[np.ndarray]:
         if need_size > self.available_size():
             return None
 
         select_index = self.free_slots[:need_size]
         self.free_slots = self.free_slots[need_size:]
-        return jnp.array(select_index)
+        return select_index
 
-    def free(self, free_index: jnp.ndarray):
+    def free(self, free_index: np.ndarray):
         if free_index.size == 0:
             return
 
@@ -136,16 +137,17 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self,
         size: int,
         page_size: int,
-        dtype: jnp.dtype,
+        # dtype: jnp.dtype,
         kvcache: KVCache,
         debug_mode: bool = False,
     ):
-        super().__init__(size, page_size, dtype, kvcache)
+        # super().__init__(size, page_size, dtype, kvcache)
+        super().__init__(size, page_size, kvcache)
         self.num_pages = size // page_size
         self.debug_mode = debug_mode
         self.clear()
 
-    def alloc(self, need_size: int) -> Optional[jnp.ndarray]:
+    def alloc(self, need_size: int) -> Optional[np.ndarray]:
         # page-aligned allocation, returning contiguous indices of pages
         assert (
             need_size % self.page_size == 0
@@ -164,7 +166,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         page_indices = out_pages[:, None] * self.page_size + np.arange(self.page_size)
         out_indices = page_indices.reshape(-1)
 
-        return jnp.array(out_indices)
+        return out_indices
 
     def alloc_extend(
         self,
@@ -172,7 +174,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         seq_lens: List[int],
         last_loc: List[int],
         extend_num_tokens: int,
-    ) -> Optional[jnp.ndarray]:
+    ) -> Optional[np.ndarray]:
         # Convert to numpy for internal operations
         seq_lens_np = np.array(seq_lens)
         prefix_lens_np = np.array(prefix_lens)
@@ -265,13 +267,13 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         # page_idx is the number of new pages allocated
         total_new_pages = page_idx
         self.free_pages = self.free_pages[total_new_pages:]
-        return jnp.array(out_indices)
+        return out_indices
 
     def alloc_decode(
         self,
         seq_lens: List[int],
         last_loc: List[int],
-    ) -> Optional[jnp.ndarray]:
+    ) -> Optional[np.ndarray]:
         # Convert inputs to numpy for calculations
         seq_lens_np = np.array(seq_lens)
         last_loc_np = np.array(last_loc)
@@ -315,9 +317,9 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         # page_idx is the number of new pages allocated
         total_new_pages = page_idx
         self.free_pages = self.free_pages[total_new_pages:]
-        return jnp.array(out_indices)
+        return out_indices
 
-    def free(self, free_index: jnp.ndarray):
+    def free(self, free_index: np.ndarray):
         if free_index.size == 0:
             return
 
