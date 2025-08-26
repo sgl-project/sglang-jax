@@ -968,7 +968,7 @@ class ScheduleBatch:
                 check_rep=False,
             )(lambda x: jax.lax.all_gather(x, "host"))(local_sizes)
             logging.info(
-                f"schedule_batch.get_model_worker_batch: {self.forward_mode.name} all_size: {all_size}"
+                f"schedule_batch.get_model_worker_batch: {self.forward_mode.name} all_size: {all_sizes}"
             )
             # Calculate global max sizes
             global_max_token_size = jnp.max(all_sizes[:, 0]).item()
