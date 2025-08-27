@@ -133,7 +133,10 @@ class FlashAttention(AttentionBackend):
         self.forward_metadata = metadata
 
     def tree_flatten(self):
-        children = (self.forward_metadata,)
+        if not hasattr(self, "forward_metadata"):
+            children = ()
+        else:
+            children = (self.forward_metadata,)
         aux_data = {
             "num_heads": self.num_heads,
             "num_kv_heads": self.num_kv_heads,
@@ -157,7 +160,8 @@ class FlashAttention(AttentionBackend):
             aux_data["page_size"],
         )
 
-        obj.forward_metadata = children[0]
+        if children and len(children) > 0:
+            obj.forward_metadata = children[0]
 
         return obj
 
