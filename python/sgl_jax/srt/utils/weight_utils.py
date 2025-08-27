@@ -97,6 +97,14 @@ class WeightLoader:
         self.needs_kv_padding = model_config.needs_kv_heads_padding(self.sharding_size)
         self.kv_padding_strategy = model_config.get_kv_padding_strategy()
 
+        original_total_kv_heads = model_config.get_total_num_kv_heads()
+        assert self.sharding_size <= original_total_kv_heads, (
+            f"Tensor parallel size ({self.sharding_size}) cannot be greater than "
+            f"total number of KV heads ({original_total_kv_heads}). "
+            f"This would require duplicating KV heads which breaks attention semantics. "
+            f"Please reduce tp_size to {original_total_kv_heads} or fewer."
+        )
+
         if self.needs_kv_padding:
             model_type = "GQA" if model_config.is_gqa_model() else "MHA"
             logger.info(
