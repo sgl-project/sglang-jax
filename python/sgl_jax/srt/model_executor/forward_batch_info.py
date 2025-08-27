@@ -169,6 +169,7 @@ class ForwardBatch:
             self.cache_loc,
             self.extend_prefix_lens,
             self.extend_seq_lens,
+            self.enable_dp_attention,
         )
 
         aux_data = {
@@ -195,6 +196,7 @@ class ForwardBatch:
         obj.cache_loc = children[8]
         obj.extend_prefix_lens = children[9]
         obj.extend_seq_lens = children[10]
+        obj.enable_dp_attention = children[11]
 
         return obj
 
