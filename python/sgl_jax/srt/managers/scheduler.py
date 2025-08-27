@@ -871,6 +871,7 @@ class Scheduler(
             self.model_config,
             False,
             self.mesh,
+            self.server_args.enable_dp_attention,
         )
 
         new_batch.prepare_for_extend()
@@ -995,6 +996,7 @@ class Scheduler(
             self.model_config,
             self.server_args.enable_custom_logit_processor,
             self.mesh,
+            self.server_args.enable_dp_attention,
         )
         idle_batch.prepare_for_idle()
         return idle_batch

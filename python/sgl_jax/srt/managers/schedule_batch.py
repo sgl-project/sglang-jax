@@ -483,6 +483,7 @@ class ScheduleBatch:
         model_config: ModelConfig,
         enable_custom_logit_processor: bool = False,
         mesh: mesh_lib.Mesh = None,
+        enable_dp_attention: bool = False,
     ):
         return_logprob = any(req.return_logprob for req in reqs)
 
@@ -495,6 +496,7 @@ class ScheduleBatch:
             return_logprob=return_logprob,
             has_stream=any(req.stream for req in reqs),
             mesh=mesh,
+            enable_dp_attention=enable_dp_attention,
         )
 
     @property
