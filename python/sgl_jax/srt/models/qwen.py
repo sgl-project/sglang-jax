@@ -5,7 +5,9 @@ import jax
 import jax.numpy as jnp
 from flax import nnx
 from jax.experimental import multihost_utils
+from jax.sharding import Mesh
 from jax.sharding import PartitionSpec
+from jax.sharding import PartitionSpec as P
 from transformers import PretrainedConfig
 
 from python.sgl_jax.srt.utils.jax_utils import device_array
