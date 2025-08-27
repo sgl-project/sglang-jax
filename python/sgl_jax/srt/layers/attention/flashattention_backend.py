@@ -98,7 +98,10 @@ class FlashAttention(AttentionBackend):
         metadata.num_kv_pages_per_block = self.max_num_kv_pages_per_block
         metadata.num_queries_per_block = self.max_num_queries_per_block
 
-        if forward_batch.forward_mode == ForwardMode.EXTEND:
+        if (
+            forward_batch.forward_mode == ForwardMode.EXTEND
+            or forward_batch.forward_mode == ForwardMode.IDLE
+        ):
             metadata.cu_q_lens = jnp.concatenate(
                 [
                     jnp.array([0], dtype=jnp.int32),
