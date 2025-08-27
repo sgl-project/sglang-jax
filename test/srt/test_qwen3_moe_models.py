@@ -46,7 +46,8 @@ class TestQwenModel(CustomTestCase):
                 "--dist-init-addr",
                 "0.0.0.0:10011",
                 "--node-rank",
-                "0" "--attention-backend",
+                "0",
+                "--attention-backend",
                 "fa",
             ],
             env={
