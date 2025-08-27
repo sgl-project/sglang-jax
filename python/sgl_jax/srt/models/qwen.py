@@ -4,6 +4,7 @@ from typing import Any, Dict, Optional
 import jax
 import jax.numpy as jnp
 from flax import nnx
+from jax.experimental import multihost_utils
 from jax.sharding import PartitionSpec
 from transformers import PretrainedConfig
 
@@ -247,7 +248,7 @@ class QWenBlock(nnx.Module):
         logger.info(f"after attention hidden_states shape{hidden_states.shape}")
 
         if forward_batch.enable_dp_attention:
-            hidden_states = device_array(self.mesh, hidden_states)
+            hidden_states = multihost_utils.process_allgather(hidden_states)
             logger.info(f"after attention dp hidden_states shape{hidden_states.shape}")
 
         residual = hidden_states
