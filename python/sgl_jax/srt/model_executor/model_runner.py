@@ -414,7 +414,7 @@ class ModelRunner:
         model_worker_batch: ModelWorkerBatch,
     ) -> jax.Array:
         if logits_output is None:
-            return jax.array([], dtype=jnp.int32)
+            return jnp.array([], dtype=jnp.int32)
         """Sample and compute logprobs and update logits_output.
 
         Args:
