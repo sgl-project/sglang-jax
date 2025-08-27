@@ -308,9 +308,14 @@ class QWenModel(nnx.Module):
             hidden_states, k, v = layer(positions, hidden_states, forward_batch)
             layers_k.append(k)
             layers_v.append(v)
-
+        logger.info(
+            f"hidden_states: {hidden_states} {hidden_states.dtype} {hidden_states.shape}"
+        )
         global_tracer.print(hidden_states, "RMSNorm_final_input", "rmsnorm_final")
         hidden_states = self.ln_f(hidden_states)
+        logger.info(
+            f"hidden_states: {hidden_states} {hidden_states.dtype} {hidden_states.shape}"
+        )
         global_tracer.print(hidden_states, "RMSNorm_final_output", "rmsnorm_final")
 
         return hidden_states, layers_k, layers_v
