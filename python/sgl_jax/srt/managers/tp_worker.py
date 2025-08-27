@@ -266,7 +266,7 @@ class ModelWorker:
             idx = np.cumsum(
                 model_worker_batch.extend_seq_lens[: model_worker_batch.real_bs] - 1
             )
-        if logits_output is None:
+        if forward_batch.forward_mode == ForwardMode.IDLE:
             return LogitsProcessorOutput(
                 next_token_logits=jnp.array([]),
             ), jnp.array([], dtype=jnp.int32)
