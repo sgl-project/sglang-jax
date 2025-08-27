@@ -398,6 +398,12 @@ class ModelRunner:
     def _preprocess_logits(
         self, logits_output: LogitsProcessorOutput, sampling_info: SamplingBatchInfo
     ):
+        if logits_output is None:
+            logits_output = LogitsProcessorOutput(
+                next_token_logits=jnp.zeros(
+                    (1, 1, self.model_config.vocab_size), dtype=self.dtype
+                )
+            )
         logits_output.next_token_logits = sampling_info.apply_logits_bias(
             logits_output.next_token_logits
         )
