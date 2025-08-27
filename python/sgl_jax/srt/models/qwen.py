@@ -252,7 +252,7 @@ class QWenBlock(nnx.Module):
         )
 
         if forward_batch.enable_dp_attention:
-            mesh_tpu = Mesh(jax.devices(), ("data", "tensor", None, None))
+            mesh_tpu = Mesh(jax.devices(), ("data", "tensor", "expert", "pipeline"))
             hidden_states = functools.partial(
                 shard_map.shard_map,
                 mesh=mesh_tpu,
