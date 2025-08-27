@@ -245,7 +245,9 @@ class QWenBlock(nnx.Module):
         if attn_output is not None:
             hidden_states = residual + attn_output
 
-        logger.info(f"after attention hidden_states shape{hidden_states.shape}")
+        logger.info(
+            f"after attention hidden_states shape{hidden_states.shape} {forward_batch.enable_dp_attention}"
+        )
 
         if forward_batch.enable_dp_attention:
             hidden_states = multihost_utils.process_allgather(hidden_states)
