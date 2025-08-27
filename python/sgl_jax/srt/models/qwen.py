@@ -432,6 +432,17 @@ class QWenLMHeadModel(nnx.Module):
         positions: jax.Array,
         forward_batch: ForwardBatch,
     ):
+        jax.debug.print(
+            "input_ids: {input_ids} {dtype}", input_ids=input_ids, dtype=input_ids.dtype
+        )
+        jax.debug.print(
+            "positions: {positions} {dtype}", positions=positions, dtype=positions.dtype
+        )
+        jax.debug.print(
+            "forward_batch: {forward_batch} {dtype}",
+            forward_batch=forward_batch,
+            dtype=forward_batch.dtype,
+        )
         hidden_states, layers_k, layers_v = self.transformer(
             input_ids, positions, forward_batch
         )
