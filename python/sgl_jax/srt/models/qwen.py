@@ -1,3 +1,4 @@
+import functools
 import logging
 from typing import Any, Dict, Optional
 
@@ -254,7 +255,7 @@ class QWenBlock(nnx.Module):
 
         if forward_batch.enable_dp_attention:
             hidden_states = functools.partial(
-                shard_map.shard_map,
+                jax.shard_map,
                 mesh=self.mesh,
                 in_specs=P(None),
                 out_specs=P(None),
