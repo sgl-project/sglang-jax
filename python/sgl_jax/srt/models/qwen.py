@@ -261,6 +261,7 @@ class QWenBlock(nnx.Module):
                 out_specs=P(None),
                 check_rep=False,
             )(lambda x: jax.lax.all_gather(x, "data"))(hidden_states)
+            hidden_states = jnp.cumsum(hidden_states, axis=0)
             logger.info(f"after attention dp hidden_states shape{hidden_states.shape}")
 
         residual = hidden_states
