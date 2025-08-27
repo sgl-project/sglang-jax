@@ -1159,6 +1159,7 @@ class ScheduleBatch:
             input_ids=device_array(
                 self.mesh,
                 input_ids_cpu,
+                dtype=jnp.int32,
             ),
             real_input_ids_len=real_input_ids_len,
             real_bs=real_bs,
@@ -1168,7 +1169,7 @@ class ScheduleBatch:
             return_logprob=self.return_logprob,
             sampling_info=self.sampling_info,
             extend_input_logprob_token_ids=self.extend_input_logprob_token_ids,
-            positions=device_array(self.mesh, positions),
+            positions=device_array(self.mesh, positions, dtype=jnp.int32),
             extend_start_loc=device_array(self.mesh, extend_start_loc),
             cache_loc=device_array(self.mesh, cache_loc_cpu),
             extend_prefix_lens=(
