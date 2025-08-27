@@ -154,6 +154,8 @@ class ForwardBatch:
     extend_prefix_lens: Optional[jax.Array] = None
     extend_seq_lens: Optional[jax.Array] = None
 
+    enable_dp_attention: bool = False
+
     def tree_flatten(self):
         children = (
             self.input_ids,
@@ -216,4 +218,5 @@ class ForwardBatch:
             cache_loc=batch.cache_loc,
             extend_prefix_lens=batch.extend_prefix_lens,
             extend_seq_lens=batch.extend_seq_lens,
+            enable_dp_attention=batch.enable_dp_attention,
         )

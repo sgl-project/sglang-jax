@@ -228,7 +228,9 @@ class QWenBlock(nnx.Module):
             f"RMSNorm_pre_attn_output",
             f"rmsnorm_layer_id_{self.layer_id}",
         )
-
+        logger.info(
+            f"before attention hidden_states shape{hidden_states.shape} mode {forward_batch.forward_mode}"
+        )
         attn_output, k, v = self.attn(
             positions=positions,
             hidden_states=hidden_states,
@@ -237,6 +239,12 @@ class QWenBlock(nnx.Module):
         )
 
         hidden_states = residual + attn_output
+
+        logger.info(f"after attention hidden_states shape{hidden_states.shape}")
+
+        if forward_batch.enable_dp_attention:
+            # hidden_states = hidden_states / forward_batch.attn_dp_size
+            logger.info(f"after attention dp hidden_states shape{hidden_states.shape}")
 
         residual = hidden_states
 

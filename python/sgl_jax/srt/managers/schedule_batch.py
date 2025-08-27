@@ -1182,6 +1182,7 @@ class ScheduleBatch:
                 if self.forward_mode == ForwardMode.EXTEND
                 else None
             ),
+            enable_dp_attention=self.enable_dp_attention,
         )
 
     def copy(self):
@@ -1255,6 +1256,8 @@ class ModelWorkerBatch:
     extend_prefix_lens: Optional[jax.Array] = None
 
     extend_seq_lens: Optional[jax.Array] = None
+
+    enable_dp_attention: bool = False
 
     def print_array(self):
         print(f"========ModelWorkerBatch")
