@@ -19,6 +19,7 @@ from sgl_jax.srt.layers.linear import LinearBase
 from sgl_jax.srt.layers.logits_processor import LogitsProcessor
 from sgl_jax.srt.layers.radix_attention import RadixAttention
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
+from sgl_jax.srt.utils.mesh_utils import create_device_mesh
 from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
 
 logger = logging.getLogger(__name__)
@@ -252,10 +253,9 @@ class QWenBlock(nnx.Module):
         )
 
         if forward_batch.enable_dp_attention:
-            mesh_tpu = Mesh(jax.devices(), ("data", "tensor", "expert", "pipeline"))
             hidden_states = functools.partial(
                 shard_map.shard_map,
-                mesh=mesh_tpu,
+                mesh=self.mesh,
                 in_specs=P(None),
                 out_specs=P(None),
                 check_rep=False,
