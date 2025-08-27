@@ -7,6 +7,7 @@ from flax import nnx
 from jax.sharding import PartitionSpec
 from transformers import PretrainedConfig
 
+from python.sgl_jax.srt.utils.jax_utils import device_array
 from sgl_jax.srt.configs.model_config import ModelConfig
 from sgl_jax.srt.debug_tracer import global_tracer, trace_function
 from sgl_jax.srt.layers.embeddings import Embed, ParallelLMHead, RotaryEmbedding
@@ -178,6 +179,7 @@ class QWenBlock(nnx.Module):
         layer_id: int = 0,
         dtype: jnp.dtype = jnp.float16,
         rngs: nnx.Rngs = None,
+        mesh: jax.sharding.Mesh = None,
     ):
         self.layer_id = layer_id
 
@@ -197,7 +199,7 @@ class QWenBlock(nnx.Module):
             dtype=dtype,
             rngs=rngs,
         )
-
+        self.mesh = mesh
         self.ln_2 = RMSNorm(
             config.hidden_size, epsilon=config.layer_norm_epsilon, rngs=rngs
         )
@@ -245,7 +247,7 @@ class QWenBlock(nnx.Module):
         logger.info(f"after attention hidden_states shape{hidden_states.shape}")
 
         if forward_batch.enable_dp_attention:
-            # hidden_states = hidden_states / forward_batch.attn_dp_size
+            hidden_states = device_array(self.mesh, hidden_states)
             logger.info(f"after attention dp hidden_states shape{hidden_states.shape}")
 
         residual = hidden_states
@@ -273,6 +275,7 @@ class QWenModel(nnx.Module):
         config: PretrainedConfig,
         dtype: jnp.dtype = jnp.float16,
         rngs: nnx.Rngs = None,
+        mesh: jax.sharding.Mesh = None,
     ):
         vocab_size = ((config.vocab_size + 63) // 64) * 64
 
@@ -290,6 +293,7 @@ class QWenModel(nnx.Module):
                 layer_id=i,
                 dtype=dtype,
                 rngs=rngs,
+                mesh=mesh,
             )
             for i in range(config.num_hidden_layers)
         ]
@@ -342,7 +346,9 @@ class QWenLMHeadModel(nnx.Module):
         self.config = config
         self.dtype = config.dtype
         logger.info(f"QWenLMHeadModel config dtype: {self.dtype}")
-        self.transformer = QWenModel(config.hf_config, dtype=self.dtype, rngs=rngs)
+        self.transformer = QWenModel(
+            config.hf_config, dtype=self.dtype, rngs=rngs, mesh=mesh
+        )
         vocab_size = ((config.hf_config.vocab_size + 63) // 64) * 64
         self.lm_head = ParallelLMHead(vocab_size, config.hidden_size, rngs=rngs)
         self.logits_processor = LogitsProcessor(vocab_size)
