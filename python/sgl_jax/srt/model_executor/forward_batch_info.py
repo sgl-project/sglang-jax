@@ -169,12 +169,12 @@ class ForwardBatch:
             self.cache_loc,
             self.extend_prefix_lens,
             self.extend_seq_lens,
-            self.enable_dp_attention,
         )
 
         aux_data = {
             "forward_mode": self.forward_mode,
             "batch_size": self.batch_size,
+            "enable_dp_attention": self.enable_dp_attention,
         }
         return (children, aux_data)
 
@@ -184,6 +184,7 @@ class ForwardBatch:
 
         obj.forward_mode = aux_data["forward_mode"]
         obj.batch_size = aux_data["batch_size"]
+        obj.enable_dp_attention = aux_data["enable_dp_attention"]
 
         obj.input_ids = children[0]
         obj.req_pool_indices = children[1]
@@ -196,7 +197,6 @@ class ForwardBatch:
         obj.cache_loc = children[8]
         obj.extend_prefix_lens = children[9]
         obj.extend_seq_lens = children[10]
-        obj.enable_dp_attention = children[11]
 
         return obj
 
