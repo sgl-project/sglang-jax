@@ -49,6 +49,8 @@ class TestQwenModel(CustomTestCase):
                 "0",
                 "--attention-backend",
                 "fa",
+                "--max-running-requests",
+                "64",
             ],
             env={
                 "JAX_COMPILATION_CACHE_DIR": "/tmp/jax_compilation_cache",
