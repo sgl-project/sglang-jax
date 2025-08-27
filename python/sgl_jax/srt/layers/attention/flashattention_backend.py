@@ -180,15 +180,22 @@ class FlashAttention(AttentionBackend):
         Returns:
             Output tensor of shape [total_tokens, hidden_size]
         """
-        if forward_batch.forward_mode == ForwardMode.IDLE:
-            return (
-                jnp.zeros_like(q),
-                jnp.zeros_like(k),
-                jnp.zeros_like(v),
-            )
-
+        # if forward_batch.forward_mode == ForwardMode.IDLE:
+        #     return (
+        #         jnp.zeros_like(q),
+        #         jnp.zeros_like(k),
+        #         jnp.zeros_like(v),
+        #
+        jax.debug.print(
+            "forward_batch.forward_mode: {mode}", mode=forward_batch.forward_mode
+        )
         k_buffer, v_buffer = self._get_and_set_kv_cache(
             k, v, forward_batch, layer.layer_id
+        )
+        jax.debug.print(
+            "k_buffer: {k_buffer}, v_buffer: {v_buffer}",
+            k_buffer=k_buffer,
+            v_buffer=v_buffer,
         )
 
         if layer.scaling is None:

@@ -319,15 +319,17 @@ class ModelRunner:
     def _forward(
         self, input_ids: jax.Array, positions: jax.Array, forward_batch: ForwardBatch
     ):
-        logger.info(
-            f"model runner mesh: {self.mesh}, local devices: {jax.local_devices()}"
+        jax.debug.print(
+            "model runner mesh: {mesh}, local devices: {local_devices}",
+            mesh=self.mesh,
+            local_devices=jax.local_devices(),
         )
         result, layers_k, layers_v = self.model_fn(
             self.state, input_ids, positions, forward_batch
         )
-
+        jax.debug.print("result: {result}", result=result)
         self._set_kv_cache_after_forward(layers_k, layers_v, forward_batch)
-
+        jax.debug.print("after set kv cache")
         return result
 
     def _set_kv_cache_after_forward(
@@ -357,7 +359,7 @@ class ModelRunner:
         )
 
     def forward_idle(self, forward_batch: ForwardBatch) -> LogitsProcessorOutput:
-        self.attn_backend.init_forward_metadata(forward_batch)
+        # self.attn_backend.init_forward_metadata(forward_batch)
         return self._forward(
             forward_batch.input_ids, forward_batch.positions, forward_batch
         )
