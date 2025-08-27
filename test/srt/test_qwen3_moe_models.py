@@ -36,7 +36,7 @@ class TestQwenModel(CustomTestCase):
                 "--dtype",
                 "bfloat16",
                 "--jax-precompile-decode-bs-paddings",
-                "10",
+                "64",
                 "--jax-precompile-prefill-token-paddings",
                 "16384",
                 "--tp-size",
