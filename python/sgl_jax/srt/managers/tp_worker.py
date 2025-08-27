@@ -266,7 +266,10 @@ class ModelWorker:
             idx = np.cumsum(
                 model_worker_batch.extend_seq_lens[: model_worker_batch.real_bs] - 1
             )
-
+        if logits_output is None:
+            return LogitsProcessorOutput(
+                next_token_logits=jnp.array([]),
+            ), jnp.array([], dtype=jnp.int32)
         return logits_output.truncate_logits_processor_output(idx), next_token_ids[idx]
 
 
