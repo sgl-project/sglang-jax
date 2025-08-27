@@ -432,13 +432,13 @@ class QWenLMHeadModel(nnx.Module):
         positions: jax.Array,
         forward_batch: ForwardBatch,
     ):
-        jax.debug.print(
+        logger.info(
             "input_ids: {input_ids} {dtype}", input_ids=input_ids, dtype=input_ids.dtype
         )
-        jax.debug.print(
+        logger.info(
             "positions: {positions} {dtype}", positions=positions, dtype=positions.dtype
         )
-        jax.debug.print(
+        logger.info(
             "forward_batch: {forward_batch}",
             forward_batch=forward_batch,
         )
