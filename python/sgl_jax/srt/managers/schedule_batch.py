@@ -1129,6 +1129,7 @@ class ScheduleBatch:
             f"schedule_batch.get_model_worker_batch: {self.forward_mode.name} req_pool_indices_cpu.shape={req_pool_indices_cpu.shape if req_pool_indices_cpu is not None else None}"
         )
         positions = jax.make_array_from_process_local_data(data_sharding, positions)
+        positions = positions.astype(jnp.int32)
         logging.info(
             f"schedule_batch.get_model_worker_batch: {self.forward_mode.name} positions.shape={positions.shape if positions is not None else None}"
         )
