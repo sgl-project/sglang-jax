@@ -296,6 +296,7 @@ class QWenModel(nnx.Module):
         forward_batch: ForwardBatch,
     ):
         global_tracer.print(input_ids, "embedding_input", "embedding_all")
+        logger.info(f"input_ids: {input_ids} {input_ids.dtype}")
         hidden_states = self.embed_tokens(input_ids)
         global_tracer.print(hidden_states, "embedding_output", "embedding_all")
 
@@ -303,6 +304,7 @@ class QWenModel(nnx.Module):
         layers_v = []
 
         for layer in self.h:
+            logger.info(f"positions: {positions} {positions.dtype} {layer.layer_id}")
             hidden_states, k, v = layer(positions, hidden_states, forward_batch)
             layers_k.append(k)
             layers_v.append(v)
@@ -432,16 +434,9 @@ class QWenLMHeadModel(nnx.Module):
         positions: jax.Array,
         forward_batch: ForwardBatch,
     ):
-        logger.info(
-            "input_ids: {input_ids} {dtype}", input_ids=input_ids, dtype=input_ids.dtype
-        )
-        logger.info(
-            "positions: {positions} {dtype}", positions=positions, dtype=positions.dtype
-        )
-        logger.info(
-            "forward_batch: {forward_batch}",
-            forward_batch=forward_batch,
-        )
+        logger.info(f"input_ids: {input_ids} {input_ids.dtype}")
+        logger.info(f"positions: {positions} {positions.dtype}")
+        logger.info(f"forward_batch: {forward_batch}")
         hidden_states, layers_k, layers_v = self.transformer(
             input_ids, positions, forward_batch
         )
