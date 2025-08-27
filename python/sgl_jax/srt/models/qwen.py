@@ -5,7 +5,7 @@ from typing import Any, Dict, Optional
 import jax
 import jax.numpy as jnp
 from flax import nnx
-from jax.experimental import multihost_utils
+from jax.experimental import multihost_utils, shard_map
 from jax.sharding import Mesh
 from jax.sharding import PartitionSpec
 from jax.sharding import PartitionSpec as P
