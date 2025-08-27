@@ -280,7 +280,6 @@ class QWenBlock(nnx.Module):
 
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
-        jax.experimental.multihost_utils.sync_global_devices("qwen")
         return hidden_states, k, v
 
 
