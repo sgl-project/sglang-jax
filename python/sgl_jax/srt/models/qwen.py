@@ -239,8 +239,8 @@ class QWenBlock(nnx.Module):
             forward_batch=forward_batch,
             layer_id=self.layer_id,
         )
-
-        hidden_states = residual + attn_output
+        if attn_output is not None:
+            hidden_states = residual + attn_output
 
         logger.info(f"after attention hidden_states shape{hidden_states.shape}")
 
@@ -316,8 +316,9 @@ class QWenModel(nnx.Module):
         for layer in self.h:
             logger.info(f"positions: {positions} {positions.dtype} {layer.layer_id}")
             hidden_states, k, v = layer(positions, hidden_states, forward_batch)
-            layers_k.append(k)
-            layers_v.append(v)
+            if k is not None and v is not None:
+                layers_k.append(k)
+                layers_v.append(v)
         logger.info(
             f"hidden_states: {hidden_states} {hidden_states.dtype} {hidden_states.shape}"
         )
