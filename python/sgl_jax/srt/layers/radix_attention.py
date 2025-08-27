@@ -54,6 +54,8 @@ class RadixAttention(nnx.Module):
         forward_batch: ForwardBatch,
         **kwargs,
     ):
+        if forward_batch.forward_mode.is_idle():
+            return None, None, None
         assert k is not None
         assert v is not None
 
