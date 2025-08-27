@@ -250,7 +250,7 @@ class QWenBlock(nnx.Module):
         )
 
         if forward_batch.enable_dp_attention:
-            hidden_states = multihost_utils.process_allgather(hidden_states)
+            hidden_states = jax.lax.all_gather(hidden_states, axis_name="data")
             logger.info(f"after attention dp hidden_states shape{hidden_states.shape}")
 
         residual = hidden_states
