@@ -176,7 +176,7 @@ class FlashAttention(AttentionBackend):
         kv_partition_axis: str = "tensor",
     ):
         if not hasattr(self, "forward_metadata"):
-            pass
+            return
         """
         Args:
             q, k, v: Input tensors of shape [total_tokens, hidden_size]
