@@ -884,9 +884,12 @@ class ScheduleBatch:
         global bid
         bid += 1
         input_ids_cpu = np.array(
-            self.input_ids
-            if self.input_ids is not None and len(self.input_ids) > 0
-            else []
+            (
+                self.input_ids
+                if self.input_ids is not None and len(self.input_ids) > 0
+                else []
+            ),
+            dtype=np.int32,
         )
         real_input_ids_len = len(input_ids_cpu)
         out_cache_loc_cpu = np.array(
@@ -1156,11 +1159,7 @@ class ScheduleBatch:
         return ModelWorkerBatch(
             bid=bid,
             forward_mode=self.forward_mode,
-            input_ids=device_array(
-                self.mesh,
-                input_ids_cpu,
-                dtype=jnp.int32,
-            ),
+            input_ids=device_array(self.mesh, input_ids_cpu),
             real_input_ids_len=real_input_ids_len,
             real_bs=real_bs,
             req_pool_indices=device_array(self.mesh, req_pool_indices_cpu),
@@ -1169,7 +1168,7 @@ class ScheduleBatch:
             return_logprob=self.return_logprob,
             sampling_info=self.sampling_info,
             extend_input_logprob_token_ids=self.extend_input_logprob_token_ids,
-            positions=device_array(self.mesh, positions, dtype=jnp.int32),
+            positions=device_array(self.mesh, positions),
             extend_start_loc=device_array(self.mesh, extend_start_loc),
             cache_loc=device_array(self.mesh, cache_loc_cpu),
             extend_prefix_lens=(
