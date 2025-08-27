@@ -324,6 +324,8 @@ class ModelRunner:
             mesh=self.mesh,
             local_devices=jax.local_devices(),
         )
+        if forward_batch.forward_mode.is_idle():
+            return None
         result, layers_k, layers_v = self.model_fn(
             self.state, input_ids, positions, forward_batch
         )
