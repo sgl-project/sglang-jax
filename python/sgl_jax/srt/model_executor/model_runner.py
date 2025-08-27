@@ -327,7 +327,6 @@ class ModelRunner:
         result, layers_k, layers_v = self.model_fn(
             self.state, input_ids, positions, forward_batch
         )
-        jax.debug.print("result: {result}", result=result)
         if layers_k is not None and len(layers_k) > 0:
             self._set_kv_cache_after_forward(layers_k, layers_v, forward_batch)
         jax.debug.print("after set kv cache")
