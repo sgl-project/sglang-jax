@@ -175,6 +175,8 @@ class FlashAttention(AttentionBackend):
         attention_mask: jax.Array = None,
         kv_partition_axis: str = "tensor",
     ):
+        if hasattr(self, "forward_metadata"):
+            pass
         """
         Args:
             q, k, v: Input tensors of shape [total_tokens, hidden_size]
