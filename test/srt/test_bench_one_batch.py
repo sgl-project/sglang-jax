@@ -25,7 +25,7 @@ class TestBenchOneBatch(CustomTestCase):
                 f"### test_bs1_default (qwen-7b-chat)\n"
                 f"output_throughput: {output_throughput:.2f} token/s\n"
             )
-            self.assertGreater(output_throughput, 34)
+            self.assertGreater(output_throughput, 80)
 
 
 if __name__ == "__main__":

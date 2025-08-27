@@ -920,6 +920,9 @@ class TokenizerManager:
             if getattr(recv_obj, "output_hidden_states", None):
                 meta_info["hidden_states"] = recv_obj.output_hidden_states[i]
 
+            if getattr(recv_obj, "cache_miss_count", None) is not None:
+                meta_info["cache_miss_count"] = recv_obj.cache_miss_count
+
             if isinstance(recv_obj, BatchStrOut):
                 state.text += recv_obj.output_strs[i]
                 out_dict = {

@@ -199,7 +199,7 @@ class Scheduler(
         # Get token and memory info from the model worker
         (
             self.max_total_num_tokens,  # total requests
-            self.max_prefill_tokens,  # The maximum number of tokens in a prefill batch
+            self.max_prefill_tokens,
             self.max_running_requests,
             self.max_req_len,
             self.max_req_input_len,
@@ -241,8 +241,6 @@ class Scheduler(
         if self.chunked_prefill_size <= 0:  # -1 means disable
             self.chunked_prefill_size = None
         self.chunked_req = None
-
-        self.prefill_padded_batch_size, _ = self.tp_worker.get_prefill_padded_size()
 
         # Init schedule policy and new token estimation
         self.policy = SchedulePolicy(
@@ -764,11 +762,12 @@ class Scheduler(
         assert self.is_generation
 
         model_worker_batch = batch.get_model_worker_batch(
-            self.max_total_num_tokens,
-            self.prefill_padded_batch_size,
+            self.tp_worker.prefill_padded_batch_size,
             self.tp_worker.precompile_decode_bs_paddings,
             self.tp_worker.precompile_prefill_token_paddings,
-            self.page_size,
+            self.tp_worker.page_size,
+            self.tp_worker.precompile_prefill_cache_loc_paddings,
+            self.tp_worker.precompile_decode_cache_loc_paddings,
         )
 
         logits_output, next_token_ids, cache_miss_count = (

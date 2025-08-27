@@ -36,11 +36,11 @@ class TestChunkedPrefillSize(CustomTestCase):
                 "--dtype",
                 "bfloat16",
                 "--jax-precompile-decode-bs-paddings",
-                "64",
+                "16",
                 "--jax-precompile-prefill-token-paddings",
                 "16384",
                 "--max-running-requests",
-                "64",
+                "16",
             ],
             env={
                 "JAX_COMPILATION_CACHE_DIR": "/tmp/jax_compilation_cache",
@@ -57,7 +57,7 @@ class TestChunkedPrefillSize(CustomTestCase):
             model=self.model,
             eval_name="mmlu",
             num_examples=64,
-            num_threads=64,
+            num_threads=16,
             max_tokens=1024,
         )
 

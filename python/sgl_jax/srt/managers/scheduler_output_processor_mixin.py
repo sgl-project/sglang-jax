@@ -127,7 +127,9 @@ class SchedulerOutputProcessorMixin:
                 f"Prefill batch. #bid: {result.bid}, #cache_miss: {cache_miss_count}"
             )
 
-        self.stream_output(batch.reqs, batch.return_logprob, skip_stream_req)
+        self.stream_output(
+            batch.reqs, batch.return_logprob, skip_stream_req, cache_miss_count
+        )
 
     def process_batch_result_decode(
         self: Scheduler,
@@ -182,7 +184,9 @@ class SchedulerOutputProcessorMixin:
                         logits_output.next_token_token_ids_logprobs_idx[i]
                     )
 
-        self.stream_output(batch.reqs, batch.return_logprob)
+        self.stream_output(
+            batch.reqs, batch.return_logprob, cache_miss_count=cache_miss_count
+        )
         self.token_to_kv_pool_allocator.free_group_end()
 
         self.forward_ct_decode = (self.forward_ct_decode + 1) % (1 << 30)
@@ -364,16 +368,18 @@ class SchedulerOutputProcessorMixin:
         reqs: List[Req],
         return_logprob: bool,
         skip_req: Optional[Req] = None,
+        cache_miss_count: int = None,
     ):
         """Stream the output to detokenizer."""
         assert self.is_generation
-        self.stream_output_generation(reqs, return_logprob, skip_req)
+        self.stream_output_generation(reqs, return_logprob, skip_req, cache_miss_count)
 
     def stream_output_generation(
         self: Scheduler,
         reqs: List[Req],
         return_logprob: bool,
         skip_req: Optional[Req] = None,
+        cache_miss_count: int = None,
     ):
         rids = []
         finished_reasons: List[BaseFinishReason] = []
@@ -564,5 +570,6 @@ class SchedulerOutputProcessorMixin:
                 output_token_ids_logprobs_val,
                 output_token_ids_logprobs_idx,
                 output_hidden_states,
+                cache_miss_count,
             )
             self.send_to_detokenizer.send_pyobj(out)

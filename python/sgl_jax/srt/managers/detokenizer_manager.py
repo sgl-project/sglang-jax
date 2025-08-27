@@ -277,6 +277,7 @@ class DetokenizerManager:
             output_token_ids_logprobs_val=recv_obj.output_token_ids_logprobs_val,
             output_token_ids_logprobs_idx=recv_obj.output_token_ids_logprobs_idx,
             output_hidden_states=recv_obj.output_hidden_states,
+            cache_miss_count=recv_obj.cache_miss_count,
         )
 
 

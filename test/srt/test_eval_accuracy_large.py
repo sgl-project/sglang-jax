@@ -63,6 +63,8 @@ class TestEvalAccuracyLarge(CustomTestCase):
                 "fa",
                 "--max-running-requests",
                 "64",
+                "--page-size",
+                "64",
             ],
             env={
                 "JAX_COMPILATION_CACHE_DIR": "/tmp/jax_compilation_cache",

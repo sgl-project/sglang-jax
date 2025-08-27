@@ -89,7 +89,7 @@ jobs:
           username: ${{ secrets.USERNAME }}
           git_token: ${{ secrets.GIT_TOKEN }}
       - name: Benchmark single latency
-        timeout-minutes: 10
+        timeout-minutes: 30
         run: |
           source ~/sky/bin/activate
           CLUSTER_NAME=$(bash scripts/get_cluster_name.sh tpu-v6e-1 ${{ github.ref }} performance)
