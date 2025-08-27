@@ -249,9 +249,6 @@ class ModelWorker:
         skip_sample: bool = False,
     ) -> Tuple[Union[LogitsProcessorOutput, jax.Array], Optional[jax.Array]]:
         forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
-        logger.info(
-            f"forward_batch.enable_dp_attention {forward_batch.enable_dp_attention}"
-        )
         import jax._src.test_util as jtu
 
         logits_output = self.model_runner.forward(forward_batch)
