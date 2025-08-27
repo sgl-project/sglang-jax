@@ -250,7 +250,14 @@ class QWenBlock(nnx.Module):
         )
 
         if forward_batch.enable_dp_attention:
-            hidden_states = jax.lax.all_gather(hidden_states, axis_name="data")
+            mesh_tpu = Mesh(jax.devices(), ("data", "tensor", None, None))
+            hidden_states = functools.partial(
+                shard_map.shard_map,
+                mesh=mesh_tpu,
+                in_specs=P(None),
+                out_specs=P(None),
+                check_rep=False,
+            )(lambda x: jax.lax.all_gather(x, "data"))(hidden_states)
             logger.info(f"after attention dp hidden_states shape{hidden_states.shape}")
 
         residual = hidden_states
