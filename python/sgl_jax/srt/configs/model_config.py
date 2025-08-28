@@ -220,12 +220,10 @@ class ModelConfig:
 
     def get_num_kv_heads(self, tensor_parallel_size) -> int:
         """Returns the number of KV heads per GPU."""
+        from sgl_jax.srt.utils.jax_utils import get_num_kv_heads_by_tp
+
         total_num_kv_heads = self.get_total_num_kv_heads()
-        # If tensor parallelism is used, we divide the number of KV heads by
-        # the tensor parallel size. We will replicate the KV heads in the
-        # case where the number of KV heads is smaller than the tensor
-        # parallel size so each GPU has at least one KV head.
-        return max(1, total_num_kv_heads // tensor_parallel_size)
+        return get_num_kv_heads_by_tp(total_num_kv_heads, tensor_parallel_size)
 
     def get_num_kv_heads_with_padding(self, tensor_parallel_size: int) -> int:
         original_kv_heads = self.get_num_kv_heads(tensor_parallel_size)
@@ -236,6 +234,27 @@ class ModelConfig:
 
     def needs_kv_heads_padding(self, tensor_parallel_size: int) -> bool:
         return self.get_num_kv_heads(tensor_parallel_size) % 2 == 1
+
+    def get_num_kv_head_replicas(self, tensor_parallel_size: int) -> int:
+        """Returns the number of replicas for each original KV head."""
+        from sgl_jax.srt.utils.jax_utils import get_num_kv_head_replicas
+
+        total_num_kv_heads = self.get_total_num_kv_heads()
+        return get_num_kv_head_replicas(total_num_kv_heads, tensor_parallel_size)
+
+    def needs_kv_head_replication(self, tensor_parallel_size: int) -> bool:
+        """Returns True if KV heads need to be replicated across devices."""
+        total_num_kv_heads = self.get_total_num_kv_heads()
+        return tensor_parallel_size >= total_num_kv_heads
+
+    def get_original_kv_head_id(self, tp_rank: int, tensor_parallel_size: int) -> int:
+        """Returns which original KV head this device should use."""
+        from sgl_jax.srt.utils.jax_utils import get_original_kv_head_id
+
+        total_num_kv_heads = self.get_total_num_kv_heads()
+        return get_original_kv_head_id(
+            tp_rank, total_num_kv_heads, tensor_parallel_size
+        )
 
     def is_gqa_model(self) -> bool:
         return self.get_total_num_kv_heads() < self.num_attention_heads
@@ -249,20 +268,30 @@ class ModelConfig:
             return "zero"
 
     def log_kv_heads_padding_info(self, tensor_parallel_size: int):
-        """Log KV heads padding information during initialization."""
+        """Log KV heads padding and replication information during initialization."""
         original_kv_heads = self.get_original_num_kv_heads(tensor_parallel_size)
         padded_kv_heads = self.get_num_kv_heads_with_padding(tensor_parallel_size)
         needs_padding = self.needs_kv_heads_padding(tensor_parallel_size)
+        needs_replication = self.needs_kv_head_replication(tensor_parallel_size)
+        num_replicas = self.get_num_kv_head_replicas(tensor_parallel_size)
+
+        model_type = "GQA" if self.is_gqa_model() else "MHA"
+        total_original = self.get_total_num_kv_heads()
+
+        if needs_replication:
+            logger.info(
+                f"KV heads replication enabled for {model_type} model: "
+                f"total_kv_heads={total_original}, tp_size={tensor_parallel_size}, "
+                f"each device gets {original_kv_heads} head(s), "
+                f"each original head replicated {num_replicas} times"
+            )
 
         if needs_padding:
-            model_type = "GQA" if self.is_gqa_model() else "MHA"
-            total_original = self.get_total_num_kv_heads()
             total_padded = padded_kv_heads * tensor_parallel_size
-
             logger.info(
-                f"KV heads padding enabled for {model_type} model: "
-                f"original_kv_heads_per_device={original_kv_heads} -> padded={padded_kv_heads} "
-                f"(total: {total_original} -> {total_padded}) for tiling optimization"
+                f"KV heads padding enabled: "
+                f"kv_heads_per_device={original_kv_heads} -> padded={padded_kv_heads} "
+                f"(total effective: {total_padded}) for tiling optimization"
             )
         else:
             logger.info(

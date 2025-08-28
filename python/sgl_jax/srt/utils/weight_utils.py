@@ -97,13 +97,16 @@ class WeightLoader:
         self.needs_kv_padding = model_config.needs_kv_heads_padding(self.sharding_size)
         self.kv_padding_strategy = model_config.get_kv_padding_strategy()
 
-        original_total_kv_heads = model_config.get_total_num_kv_heads()
-        assert self.sharding_size <= original_total_kv_heads, (
-            f"Tensor parallel size ({self.sharding_size}) cannot be greater than "
-            f"total number of KV heads ({original_total_kv_heads}). "
-            f"This would require duplicating KV heads which breaks attention semantics. "
-            f"Please reduce tp_size to {original_total_kv_heads} or fewer."
+        # New replication support
+        self.needs_kv_replication = model_config.needs_kv_head_replication(
+            self.sharding_size
         )
+        self.num_kv_head_replicas = model_config.get_num_kv_head_replicas(
+            self.sharding_size
+        )
+        self.total_original_kv_heads = model_config.get_total_num_kv_heads()
+
+        # Remove the restrictive assert - now we support tp_size > kv_heads via replication
 
         if self.needs_kv_padding:
             model_type = "GQA" if model_config.is_gqa_model() else "MHA"
@@ -443,29 +446,16 @@ class WeightLoader:
         return weight
 
     def _apply_kv_head_padding(self, weight: jax.Array, hf_key: str) -> jax.Array:
+        """Apply KV head padding/replication logic based on sglang approach."""
+
+        # Handle KV head replication when tp_size >= total_kv_heads
         if (
             any(proj in hf_key for proj in ["k_proj", "v_proj"])
-            and self.sharding_size > 1
+            and self.needs_kv_replication
         ):
-            pad_size = self.sharding_size // self.num_kv_heads
-            if pad_size > 1:
-                if hf_key.endswith(".bias"):
-                    weight = jnp.repeat(weight, pad_size, axis=0)
-                else:
-                    weight = jnp.repeat(
-                        weight, pad_size, axis=1 if weight.ndim > 1 else 0
-                    )
-        elif "q_proj" in hf_key and self.sharding_size > 1:
-            pad_size = self.sharding_size // self.num_heads
-            if pad_size > 1:
-                if hf_key.endswith(".bias"):
-                    weight = jnp.repeat(weight, pad_size, axis=0)
-                else:
-                    weight = jnp.repeat(
-                        weight, pad_size, axis=1 if weight.ndim > 1 else 0
-                    )
+            weight = self._prepare_kv_weights_for_replication(weight, hf_key)
 
-        # handle tiling padding for k_proj and v_proj
+        # Handle traditional padding for tiling optimization (when each device has < 2 heads)
         if (
             any(proj in hf_key for proj in ["k_proj", "v_proj"])
             and self.needs_kv_padding
@@ -473,6 +463,57 @@ class WeightLoader:
             weight = self._pad_kv_projection_weight(weight, hf_key)
 
         return weight
+
+    def _prepare_kv_weights_for_replication(
+        self, weight: jax.Array, hf_key: str
+    ) -> jax.Array:
+        """
+        Prepare KV weights for replication across devices.
+        When tp_size >= total_kv_heads, we need to replicate original heads.
+        This method prepares the weights so that JAX sharding will distribute them correctly.
+        """
+        if not self.needs_kv_replication:
+            return weight
+
+        if hf_key.endswith(".bias"):
+            # For bias: prepare replicated bias for all devices
+            # Each original head will be replicated across multiple devices
+            replicated_bias_parts = []
+
+            for original_head_id in range(self.total_original_kv_heads):
+                start_idx = original_head_id * self.head_dim
+                end_idx = (original_head_id + 1) * self.head_dim
+                original_head_bias = weight[start_idx:end_idx]
+
+                # Replicate this head for all its assigned devices
+                for _ in range(self.num_kv_head_replicas):
+                    replicated_bias_parts.append(original_head_bias)
+
+            # Concatenate all replicated parts
+            replicated_weight = jnp.concatenate(replicated_bias_parts, axis=0)
+
+        else:
+            # For weight matrix: prepare replicated weights for all devices
+            replicated_weight_parts = []
+
+            for original_head_id in range(self.total_original_kv_heads):
+                start_idx = original_head_id * self.head_dim
+                end_idx = (original_head_id + 1) * self.head_dim
+                original_head_weight = weight[:, start_idx:end_idx]
+
+                # Replicate this head for all its assigned devices
+                for _ in range(self.num_kv_head_replicas):
+                    replicated_weight_parts.append(original_head_weight)
+
+            # Concatenate all replicated parts along head dimension
+            replicated_weight = jnp.concatenate(replicated_weight_parts, axis=1)
+
+        logger.debug(
+            f"KV head replication for {hf_key}: {weight.shape} -> {replicated_weight.shape} "
+            f"(original_kv_heads={self.total_original_kv_heads}, replicas={self.num_kv_head_replicas})"
+        )
+
+        return replicated_weight
 
     def _pad_kv_projection_weight(self, weight: jax.Array, hf_key: str) -> jax.Array:
         if not self.needs_kv_padding:
