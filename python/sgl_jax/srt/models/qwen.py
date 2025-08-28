@@ -166,7 +166,7 @@ class QWenAttention(nnx.Module):
         forward_batch: ForwardBatch,
         layer_id: int,
     ) -> tuple[jax.Array, jax.Array, jax.Array]:
-        if forward_batch.forward_mode.is_idle():
+        if True:
             return None, None, None
         q, _ = self.q_proj(hidden_states)
         k, _ = self.k_proj(hidden_states)
