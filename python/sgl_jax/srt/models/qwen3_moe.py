@@ -7,7 +7,7 @@ from jax import numpy as jnp
 from jax.sharding import get_abstract_mesh
 from transformers import PretrainedConfig
 
-from python.sgl_jax.srt.configs.model_config import ModelConfig
+from sgl_jax.srt.configs.model_config import ModelConfig
 from sgl_jax.srt.layers.embeddings import Embed, ParallelLMHead, RotaryEmbedding
 from sgl_jax.srt.layers.layernorm import RMSNorm
 from sgl_jax.srt.layers.linear import LinearBase
