@@ -273,10 +273,10 @@ class ModelRunner:
 
         padded_kv_heads_total = padded_kv_heads_per_device * self.tp_size
 
-        if padded_kv_heads_per_device < self.tp_size:
-            kv_partition_axis = "data"
-        else:
-            kv_partition_axis = "tensor"
+        # if padded_kv_heads_per_device < self.tp_size:
+        #     kv_partition_axis = "data"
+        # else:
+        #     kv_partition_axis = "tensor"
 
         kv_cache_head_num = padded_kv_heads_total
         logger.info(f"KV cache padded head num: {kv_cache_head_num}")
@@ -289,7 +289,7 @@ class ModelRunner:
             head_dim=self.model_config.head_dim,
             layer_num=self.model_config.num_hidden_layers,
             mesh=self.mesh,
-            kv_partition_axis=kv_partition_axis,
+            kv_partition_axis="tensor",
         )
 
         # Create KV pool allocator
