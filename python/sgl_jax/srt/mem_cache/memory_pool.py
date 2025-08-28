@@ -208,7 +208,6 @@ class MHATokenToKVPool(KVCache):
         head_dim: int,
         layer_num: int,
         mesh: Mesh,
-        kv_partition_axis: str = "tensor",
         start_layer: Optional[int] = None,
         end_layer: Optional[int] = None,
     ):
@@ -217,7 +216,7 @@ class MHATokenToKVPool(KVCache):
         )
         self.head_num = head_num
         self.head_dim = head_dim
-        self.kv_partition_axis = kv_partition_axis
+        self.kv_partition_axis = "tensor"
 
         self._create_buffers()
         self._calculate_memory_usage()
