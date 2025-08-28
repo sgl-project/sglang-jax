@@ -797,15 +797,20 @@ class Scheduler(
         logger.info(f"before dp sync Node {self.node_rank} ret: {ret}")
         # DP Attention: Synchronize batch across DP groups
         if self.server_args.enable_dp_attention:
-            batch_size_list = self.all_gather_by_cpu(
-                np.array([ret.batch_size if ret is not None else 0], dtype=np.int32)
-            )
-            logger.info(
-                f"Node {self.node_rank} batch_size_list: {np.array(batch_size_list)}"
-            )
-            is_all_idle = all(size == 0 for size in np.array(batch_size_list).flatten())
-            if not is_all_idle and ret is None:
-                ret = self.get_idle_batch()
+            try:
+                batch_size_list = self.all_gather_by_cpu(
+                    np.array([ret.batch_size if ret is not None else 0], dtype=np.int32)
+                )
+                logger.info(
+                    f"Node {self.node_rank} batch_size_list: {np.array(batch_size_list)}"
+                )
+                is_all_idle = all(
+                    size == 0 for size in np.array(batch_size_list).flatten()
+                )
+                if not is_all_idle and ret is None:
+                    ret = self.get_idle_batch()
+            except Exception as e:
+                logger.error(f"Node {self.node_rank} all_gather_by_cpu failed: {e}")
         logger.info(f"after dp sync Node {self.node_rank} ret: {ret}")
         if ret is not None:
             ret.enable_dp_attention = self.server_args.enable_dp_attention
