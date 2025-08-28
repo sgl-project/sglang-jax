@@ -97,7 +97,6 @@ class WeightLoader:
         self.needs_kv_padding = model_config.needs_kv_heads_padding(self.sharding_size)
         self.kv_padding_strategy = model_config.get_kv_padding_strategy()
 
-        # New replication support
         self.needs_kv_replication = model_config.needs_kv_head_replication(
             self.sharding_size
         )
@@ -105,8 +104,6 @@ class WeightLoader:
             self.sharding_size
         )
         self.total_original_kv_heads = model_config.get_total_num_kv_heads()
-
-        # Remove the restrictive assert - now we support tp_size > kv_heads via replication
 
         if self.needs_kv_padding:
             model_type = "GQA" if model_config.is_gqa_model() else "MHA"
