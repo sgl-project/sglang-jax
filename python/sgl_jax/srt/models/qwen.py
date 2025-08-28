@@ -254,14 +254,20 @@ class QWenBlock(nnx.Module):
         )
 
         if forward_batch.enable_dp_attention:
-            hidden_states = functools.partial(
-                shard_map.shard_map,
-                mesh=self.mesh,
-                in_specs=P(None),
-                out_specs=P(None),
-                check_rep=False,
-            )(lambda x: jax.lax.all_gather(x, "data"))(hidden_states)
-            hidden_states = jnp.squeeze(hidden_states[0])
+            logger.info(f"before attention dp hidden_states shape{hidden_states.shape}")
+            try:
+                hidden_states = functools.partial(
+                    shard_map.shard_map,
+                    mesh=self.mesh,
+                    in_specs=P(None),
+                    out_specs=P(None),
+                    check_rep=False,
+                )(lambda x: jax.lax.all_gather(x, "data"))(hidden_states)
+                hidden_states = jnp.squeeze(hidden_states[0])
+            except Exception as e:
+                logger.error(
+                    f"after attention dp hidden_states shape{hidden_states.shape} {hidden_states} {e}"
+                )
             logger.info(
                 f"after attention dp hidden_states shape{hidden_states.shape} {hidden_states}"
             )
@@ -328,6 +334,7 @@ class QWenModel(nnx.Module):
         global_tracer.print(input_ids, "embedding_input", "embedding_all")
         logger.info(f"input_ids: {input_ids} {input_ids.dtype}")
         hidden_states = self.embed_tokens(input_ids)
+        logger.info(f"hiddenstate shape after embedding {hidden_states.shape}")
         global_tracer.print(hidden_states, "embedding_output", "embedding_all")
 
         layers_k = []
