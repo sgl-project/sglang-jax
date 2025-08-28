@@ -46,7 +46,7 @@ class TestEvalAccuracyLarge(CustomTestCase):
                 "--mem-fraction-static",
                 "0.4",
                 "--max-prefill-tokens",
-                "4096",
+                "16384",
                 "--download-dir",
                 "/tmp/",
                 "--dtype",
