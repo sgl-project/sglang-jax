@@ -29,6 +29,8 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 from jax.sharding import PartitionSpec as P
 
+from sgl_jax.srt.utils import cdiv
+
 DEFAULT_MASK_VALUE = -0.7 * float(jnp.finfo(jnp.dtype("float32")).max)
 
 
@@ -638,11 +640,6 @@ def ragged_paged_attention_kernel(
     seq_buf_idx_ref[0] = lax.select(seq_idx < num_seqs, seq_idx, 0)
     seq_buf_idx_ref[1] = buf_idx
     o_ref[...] = acc_ref[...].astype(q_ref.dtype)
-
-
-def cdiv(a, b):
-    assert b != 0, f"b is equal to 0, {b=}"
-    return (a + b - 1) // b
 
 
 def get_dtype_packing(dtype):

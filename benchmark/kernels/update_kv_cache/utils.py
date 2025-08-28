@@ -1,10 +1,7 @@
 import jax
 import jax.numpy as jnp
 
-
-def cdiv(a, b):
-    assert b != 0
-    return (a + b - 1) // b
+from sgl_jax.srt.utils import cdiv
 
 
 def create_bench_data(

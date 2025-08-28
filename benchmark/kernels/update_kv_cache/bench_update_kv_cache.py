@@ -8,11 +8,11 @@ from jax.experimental.pallas import tpu as pltpu
 from utils import create_bench_data, create_input_params
 
 from sgl_jax.srt.mem_cache.memory_pool import (
-    cdiv,
     get_num_slices_per_block,
     get_slot_mapping,
     kv_cache_update_kernel,
 )
+from sgl_jax.srt.utils import cdiv
 
 
 def benchmark_backend(

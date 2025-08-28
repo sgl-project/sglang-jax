@@ -126,6 +126,11 @@ class NativeAttention(AttentionBackend):
         k, v = forward_batch.token_to_kv_pool.get_kv_buffer(layer_id)
         return k, v
 
+    @staticmethod
+    def get_max_running_reqests(max_context_len: int, page_size: int) -> int:
+        # native attention backend do not care the max running requests
+        return 4096
+
 
 # @partial(jax.jit, static_argnames=["num_heads", "num_kv_heads", "is_causal", "mode"])
 def forward_attention(

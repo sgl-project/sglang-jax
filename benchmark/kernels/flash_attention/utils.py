@@ -1,7 +1,7 @@
 import jax
 import jax.numpy as jnp
 
-from sgl_jax.srt.layers.attention.flash_attn_kernel.flash_attention import cdiv
+from sgl_jax.srt.utils import cdiv
 
 
 def create_kv_cache_data(
