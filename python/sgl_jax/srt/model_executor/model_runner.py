@@ -279,6 +279,7 @@ class ModelRunner:
             kv_partition_axis = "tensor"
 
         kv_cache_head_num = padded_kv_heads_total
+        logger.info(f"KV cache padded head num: {kv_cache_head_num}")
 
         self.token_to_kv_pool = MHATokenToKVPool(
             size=self.max_total_num_tokens,
