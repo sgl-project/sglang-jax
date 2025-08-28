@@ -269,11 +269,11 @@ class MHATokenToKVPool(KVCache):
         """Create sharded KV cache buffers with proper distributed allocation"""
         self.kv_sharding = NamedSharding(self.mesh, P(None, self.kv_partition_axis))
 
-        print(f"Creating buffers for {self.layer_num} layers")
+        logger.info(f"Creating buffers for {self.layer_num} layers")
         start_time = time.time()
 
         buffer_shape = (self.size + self.page_size, self.head_num, self.head_dim)
-        print(
+        logger.info(
             f"Total KV cachememory per layer: {buffer_shape[0] * buffer_shape[1] * buffer_shape[2] * 2 / 1024**3:.2f} GB, dtype: {self.dtype}"
         )
         with self.mesh:
@@ -301,7 +301,7 @@ class MHATokenToKVPool(KVCache):
                 self.v_buffer.append(v_buf)
 
         end_time = time.time()
-        print(
+        logger.info(
             f"Total time to create {self.layer_num} buffers: {end_time - start_time:.2f} seconds"
         )
 

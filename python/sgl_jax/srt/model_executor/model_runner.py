@@ -309,10 +309,6 @@ class ModelRunner:
 
         # Log memory usage
         total_cache_size = self.token_to_kv_pool.mem_usage
-        logger.info(
-            f"Memory pool initialized. Total KV cache size: {total_cache_size:.2f} GB, "
-            f"Max tokens: {self.max_total_num_tokens}, Max requests: {max_num_reqs}"
-        )
 
     def init_attention_backend(self):
         """Init attention kernel backend."""
