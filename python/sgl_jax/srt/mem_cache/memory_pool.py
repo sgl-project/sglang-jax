@@ -289,6 +289,7 @@ class MHATokenToKVPool(KVCache):
                         buffer_shape[1] // tensor_size,
                         buffer_shape[2],
                     )
+                    logger.info(f"Creating KV cache for {local_shape}")
                     return jnp.zeros(local_shape, dtype=self.dtype)
 
                 k_buf = jax.make_array_from_callback(
