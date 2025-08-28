@@ -114,6 +114,10 @@ class ModelWorker:
         # A reference make this class has the same member as TpModelWorkerClient
         self.worker = self
 
+        self.prefill_padded_batch_size, self.prefill_max_padded_num_tokens = (
+            self.get_prefill_padded_size()
+        )
+
         # normalize server_args.jax_precompile_prefill_token_paddings
         # ensure every token padding value is not less than max_runnig_requests
         self.normalize_token_paddings(server_args, self.max_running_requests)
@@ -122,15 +126,31 @@ class ModelWorker:
         self.precompile_prefill_token_paddings = (
             server_args.jax_precompile_prefill_token_paddings
         )
-        default_bs_padding = JAX_PRECOMPILE_DEFAULT_DECODE_BS_PADDINGS + [
-            self.max_running_requests
+
+        bs_padding_list = []
+        if server_args.jax_precompile_decode_bs_paddings is not None:
+            server_args.jax_precompile_decode_bs_paddings.sort()
+            for bs in server_args.jax_precompile_decode_bs_paddings:
+                if bs <= self.max_running_requests:
+                    bs_padding_list.append(bs)
+            if len(bs_padding_list) == 0:
+                bs_padding_list.append(self.max_running_requests)
+        else:
+            bs_padding_list = JAX_PRECOMPILE_DEFAULT_DECODE_BS_PADDINGS + [
+                self.max_running_requests
+            ]
+            bs_padding_list.sort()
+
+        self.precompile_decode_bs_paddings = bs_padding_list
+
+        # padding cache_loc_paddings
+        # note: the length of following two cache_loc_paddings must keep the same to length of separate bs_paddings.
+        self.precompile_prefill_cache_loc_paddings = [
+            self.prefill_max_padded_num_tokens * self.prefill_padded_batch_size
         ]
-        default_bs_padding.sort()
-        self.precompile_decode_bs_paddings = (
-            server_args.jax_precompile_decode_bs_paddings
-            if server_args.jax_precompile_decode_bs_paddings is not None
-            else default_bs_padding
-        )
+        self.precompile_decode_cache_loc_paddings = [
+            item * self.max_req_len for item in self.precompile_decode_bs_paddings
+        ]
 
     def normalize_token_paddings(
         self, server_args: ServerArgs, max_running_requests: int
@@ -141,21 +161,17 @@ class ModelWorker:
             server_args.jax_precompile_prefill_token_paddings = (
                 JAX_PRECOMPILE_DEFAULT_PREFILL_TOKEN_PADDINGS
             )
-
-        prefill_padded_batch_size, prefill_max_padded_num_tokens = (
-            self.get_prefill_padded_size()
-        )
         for item in server_args.jax_precompile_prefill_token_paddings:
             if (
-                item >= prefill_padded_batch_size
-                and item <= prefill_max_padded_num_tokens
+                item >= self.prefill_padded_batch_size
+                and item <= self.prefill_max_padded_num_tokens
             ):
                 normalized_token_paddings.append(item)
 
         if len(normalized_token_paddings) == 0:
-            normalized_token_paddings.append(prefill_max_padded_num_tokens)
+            normalized_token_paddings.append(self.prefill_max_padded_num_tokens)
             logger.warning(
-                f"No valid padding found in {server_args.jax_precompile_prefill_token_paddings=} within range [{prefill_padded_batch_size}, {prefill_max_padded_num_tokens}], so set token_paddings as {normalized_token_paddings}"
+                f"No valid padding found in {server_args.jax_precompile_prefill_token_paddings=} within range [{self.prefill_padded_batch_size=}, {self.prefill_max_padded_num_tokens=}], so set token_paddings as {normalized_token_paddings}"
             )
 
         server_args.jax_precompile_prefill_token_paddings = normalized_token_paddings
@@ -177,8 +193,13 @@ class ModelWorker:
                 logger.warning(f"{bs=} > {num_tokens=}, skip this pair")
                 continue
             model_worker_batch = self.generate_model_worker_batch(
-                bs, num_tokens, ForwardMode.EXTEND
+                bs,
+                num_tokens,
+                ForwardMode.EXTEND,
+                bs,
+                self.precompile_prefill_cache_loc_paddings[-1],
             )
+
             self.forward_batch_generation(model_worker_batch=model_worker_batch)
 
         end_time = time.perf_counter()
@@ -209,7 +230,12 @@ class ModelWorker:
         return padded_batch_size, padded_max_num_tokens
 
     def generate_model_worker_batch(
-        self, bs: int, num_tokens: int, mode: ForwardMode
+        self,
+        bs: int,
+        num_tokens: int,
+        mode: ForwardMode,
+        max_bs: int,
+        max_cache_loc_size: int,
     ) -> ModelWorkerBatch:
         valid_input_ids = np.array([1] * bs, dtype=jnp.int32)
         invalid_input_ids = np.array([0] * (num_tokens - bs), dtype=jnp.int32)
@@ -217,22 +243,13 @@ class ModelWorker:
         invalid_out_cache_loc = np.array([-1] * (num_tokens - bs), dtype=jnp.int32)
         valid_positions = np.array([0] * bs, dtype=jnp.int32)
         invalid_positions = np.array([0] * (num_tokens - bs), dtype=jnp.int32)
-        if mode == ForwardMode.EXTEND:
-            valid_cache_loc = np.arange(bs)
-            invalid_cache_loc = np.array([0] * (self.max_total_num_tokens - bs))
-        elif mode == ForwardMode.DECODE:
-            aligned_bs = bs
-            valid_cache_loc = np.arange(aligned_bs)
-            padding_size = self.max_total_num_tokens - aligned_bs
-            if padding_size < 0:
-                raise ValueError(f"decode mode padding_size < 0: {padding_size}")
-            invalid_cache_loc = np.array([0] * (padding_size), dtype=jnp.int32)
-        else:
-            raise ValueError(f"Invalid forward mode: {mode}")
+        invalid_cache_loc_size = max_cache_loc_size - bs
+        if invalid_cache_loc_size < 0:
+            raise ValueError(f"padding cache_loc_size {invalid_cache_loc_size} < 0!")
 
-        logger.info(
-            f"mode is {mode} len of valid_cache_loc: {len(valid_cache_loc)}, len of invalid_cache_loc: {len(invalid_cache_loc)}"
-        )
+        valid_cache_loc = np.arange(bs)
+        invalid_cache_loc = np.array([0] * (invalid_cache_loc_size), dtype=jnp.int32)
+
         return ModelWorkerBatch(
             bid=1,
             forward_mode=mode,
@@ -281,7 +298,11 @@ class ModelWorker:
         for bs in self.precompile_decode_bs_paddings:
             logger.info(f"[DECODE] precompile ({bs=})")
             model_worker_batch = self.generate_model_worker_batch(
-                bs, bs, ForwardMode.DECODE
+                bs,
+                bs,
+                ForwardMode.DECODE,
+                max(self.precompile_decode_bs_paddings),
+                bs * self.max_req_len,
             )
             self.forward_batch_generation(model_worker_batch=model_worker_batch)
 

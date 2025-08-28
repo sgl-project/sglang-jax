@@ -196,6 +196,27 @@ class ForwardBatch:
 
         return obj
 
+    def __repr__(self) -> str:
+        jax_array_fields = []
+
+        for field_name in [
+            "input_ids",
+            "req_pool_indices",
+            "seq_lens",
+            "out_cache_loc",
+            "positions",
+            "extend_start_loc",
+            "cache_loc",
+            "extend_prefix_lens",
+            "extend_seq_lens",
+        ]:
+            value = getattr(self, field_name, None)
+            if value is not None and isinstance(value, jax.Array):
+                jax_array_fields.append(f"{field_name}={value.shape}")
+
+        jax_arrays_str = ", ".join(jax_array_fields)
+        return f"ForwardBatch(forward_mode={self.forward_mode}, batch_size={self.batch_size}, {jax_arrays_str})"
+
     @classmethod
     def init_new(
         cls,

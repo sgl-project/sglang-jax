@@ -36,7 +36,7 @@ class TestQwenModel(CustomTestCase):
                 "--dtype",
                 "bfloat16",
                 "--jax-precompile-decode-bs-paddings",
-                "64",
+                "16",
                 "--jax-precompile-prefill-token-paddings",
                 "16384",
                 "--tp-size",
@@ -50,6 +50,8 @@ class TestQwenModel(CustomTestCase):
                 "--attention-backend",
                 "fa",
                 "--max-running-requests",
+                "16",
+                "--page-size",
                 "64",
             ],
             env={
@@ -67,7 +69,7 @@ class TestQwenModel(CustomTestCase):
             model=self.model,
             eval_name="mmlu",
             num_examples=64,
-            num_threads=64,
+            num_threads=16,
             max_tokens=1024,
         )
 

@@ -17,13 +17,13 @@ def run_curl(args):
     payload = {
         "sampling_params": {
             "temperature": args.temperature,
-            "max_new_tokens": args.max_new_tokens,
+            "max_new_tokens": getattr(args, "max_new_tokens", 10),
         },
         "text": args.text,
-        "return_logprob": args.return_logprob,
-        "top_logprobs_num": args.top_logprobs_num,
-        "token_ids_logprob": args.token_ids_logprob,
-        "logprob_start_len": args.logprob_start_len,
+        "return_logprob": getattr(args, "return_logprob", False),
+        "top_logprobs_num": getattr(args, "top_logprobs_num", 0),
+        "token_ids_logprob": getattr(args, "token_ids_logprob", None),
+        "logprob_start_len": getattr(args, "logprob_start_len", -1),
     }
 
     headers = {"Content-Type": "application/json"}
@@ -54,42 +54,34 @@ if __name__ == "__main__":
     parser.add_argument(
         "--base-url",
         type=str,
-        default=None,
     )
     parser.add_argument(
         "--text",
         type=str,
-        default="the capital of France is",
     )
     parser.add_argument(
         "--temperature",
         type=int,
-        default=0,
     )
     parser.add_argument(
         "--max-new-tokens",
         type=int,
-        default=6,
     )
     parser.add_argument(
         "--return-logprob",
         type=bool,
-        default=False,
     )
     parser.add_argument(
         "--top-logprobs-num",
         type=int,
-        default=None,
     )
     parser.add_argument(
         "--token-ids-logprob",
         type=list,
-        default=None,
     )
     parser.add_argument(
         "--logprob-start-len",
         type=int,
-        default=None,
     )
     args = parser.parse_args()
 

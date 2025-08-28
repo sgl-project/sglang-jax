@@ -972,25 +972,26 @@ class ScheduleBatch:
 
     def get_model_worker_batch(
         self,
-        max_total_num_tokens: int,
         prefill_padded_batch_size: int,
         bs_paddings: list,
         token_paddings: list,
         page_size: int,
+        prefill_cache_loc_paddings: List,
+        decode_cache_loc_paddings: List,
     ) -> ModelWorkerBatch:
         if self.forward_mode.is_decode_or_idle():
             extend_seq_lens = extend_prefix_lens = extend_logprob_start_lens = None
             token_paddings = bs_paddings
+            cache_loc_paddings = decode_cache_loc_paddings
         else:
             extend_seq_lens = np.array(self.extend_lens, dtype=np.int32)
             extend_prefix_lens = np.array(self.prefix_lens, dtype=np.int32)
             bs_paddings = [prefill_padded_batch_size]
             extend_logprob_start_lens = self.extend_logprob_start_lens
+            cache_loc_paddings = prefill_cache_loc_paddings
 
         global bid
         bid += 1
-
-        # print(f"[get_model_worker_batch] {self.input_ids.shape=}, {self.input_ids=}")
 
         input_ids_cpu = jax.device_get(self.input_ids.flatten())
         real_input_ids_len = len(input_ids_cpu)
@@ -1076,12 +1077,12 @@ class ScheduleBatch:
         # padding bs: req_pool_indices, seq_lens, extend_start_loc, extend_prefix_lens, extend_seq_lens
         bs_padding_size = 0
         bs_paddings.sort()
-        for size in bs_paddings:
+        select_bs_index = -1
+        for i, size in enumerate(bs_paddings):
             if size >= len(seq_lens_cpu):
                 bs_padding_size = size - len(seq_lens_cpu)
+                select_bs_index = i
                 break
-
-        total_cache_size = sum(seq_lens_cpu)
 
         # cache_loc_flat = np.zeros(total_cache_size, dtype=np.int32)
         cache_loc_flat = []
@@ -1094,25 +1095,16 @@ class ScheduleBatch:
                 cache_loc_flat.extend(aligned_tmp)
                 offset += seq_len
 
-        # offset = 0
-        # for seq_idx in range(len(seq_lens_cpu)):
-        #     seq_len = seq_lens_cpu[seq_idx]
-        #     if seq_len > 0:  # Only process non-empty sequences
-        #         cache_loc_flat[offset : offset + seq_len] = token_indices_with_all_reqs[
-        #             seq_idx, :seq_len
-        #         ]
-        #         offset += seq_len
-
-        total_cache_loc_size = max_total_num_tokens
+        # note: to avoid aligned cache_loc_flat is greater than max_total_num_tokens, add max_bs * page_size
+        # total_cache_loc_size = max_total_num_tokens + max_bs * page_size
+        total_cache_loc_size = cache_loc_paddings[select_bs_index]
         cache_loc_cpu = cache_loc_flat
-        if total_cache_loc_size > len(cache_loc_flat):
-            cache_loc_cpu = np.pad(
-                cache_loc_flat,
-                (0, total_cache_loc_size - len(cache_loc_flat)),
-                constant_values=0,
-            )
-        else:
-            cache_loc_cpu = np.array(cache_loc_flat, dtype=np.int32)
+        assert total_cache_loc_size >= len(cache_loc_flat)
+        cache_loc_cpu = np.pad(
+            cache_loc_flat,
+            (0, total_cache_loc_size - len(cache_loc_flat)),
+            constant_values=0,
+        )
 
         # seq_lens_padding = self.seq_lens
         if bs_padding_size > 0:

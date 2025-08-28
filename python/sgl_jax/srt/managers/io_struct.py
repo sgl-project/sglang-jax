@@ -40,6 +40,9 @@ class BatchStrOut:
     # Hidden states
     output_hidden_states: List[List[float]]
 
+    # Cache miss count
+    cache_miss_count: int = None
+
 
 @dataclass
 class BatchTokenIDOut:
@@ -79,6 +82,9 @@ class BatchTokenIDOut:
 
     # Hidden states
     output_hidden_states: List[List[float]]
+
+    # Cache miss count
+    cache_miss_count: int = None
 
 
 @dataclass
