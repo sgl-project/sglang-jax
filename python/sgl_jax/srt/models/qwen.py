@@ -268,7 +268,7 @@ class QWenBlock(nnx.Module):
         # global_tracer.print(
         #     hidden_states, f"RMSNorm_pre_mlp_input", f"rmsnorm_layer_id_{self.layer_id}"
         # )
-        hidden_states = self.ln_2(hidden_states)
+        # hidden_states = self.ln_2(hidden_states)
         logger.info("after ln_2 ......................")
         global_tracer.print(
             hidden_states,
@@ -276,7 +276,7 @@ class QWenBlock(nnx.Module):
             f"rmsnorm_layer_id_{self.layer_id}",
         )
 
-        hidden_states = self.mlp(hidden_states)
+        # hidden_states = self.mlp(hidden_states)
         logger.info("after mlp ......................")
         hidden_states = residual + hidden_states
         return hidden_states, k, v
