@@ -3,6 +3,7 @@
 import logging
 import os
 from functools import partial
+from math import log
 from typing import Optional, Tuple, Union
 
 import jax
@@ -319,17 +320,16 @@ class ModelRunner:
     def _forward(
         self, input_ids: jax.Array, positions: jax.Array, forward_batch: ForwardBatch
     ):
-        jax.debug.print(
-            "model runner mesh: {mesh}, local devices: {local_devices}",
-            mesh=self.mesh,
-            local_devices=jax.local_devices(),
-        )
+
         result, layers_k, layers_v = self.model_fn(
             self.state, input_ids, positions, forward_batch
         )
+        logger.info("after result, layers_k, layers_v = self.model_fn")
         if layers_k is not None and len(layers_k) > 0:
             self._set_kv_cache_after_forward(layers_k, layers_v, forward_batch)
-        jax.debug.print("after set kv cache")
+        logger.info(
+            "after self._set_kv_cache_after_forward(layers_k, layers_v, forward_batch)"
+        )
         return result
 
     def _set_kv_cache_after_forward(
