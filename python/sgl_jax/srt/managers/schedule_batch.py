@@ -1109,6 +1109,9 @@ class ScheduleBatch:
             f"schedule_batch.get_model_worker_batch: {self.forward_mode.name} input_ids_cpu.shape={input_ids_cpu.shape if input_ids_cpu is not None else None}, out_cache_loc_cpu.shape={out_cache_loc_cpu.shape if out_cache_loc_cpu is not None else None}, seq_lens_cpu.shape={seq_lens_cpu.shape if seq_lens_cpu is not None else None}, req_pool_indices_cpu.shape={req_pool_indices_cpu.shape if req_pool_indices_cpu is not None else None}, positions.shape={positions.shape if positions is not None else None}, extend_start_loc.shape={extend_start_loc.shape if extend_start_loc is not None else None}, cache_loc_cpu.shape={cache_loc_cpu.shape if cache_loc_cpu is not None else None}, extend_prefix_lens.shape={extend_prefix_lens.shape if extend_prefix_lens is not None else None}, extend_seq_lens.shape={extend_seq_lens.shape if extend_seq_lens is not None else None}"
         )
         data_sharding = NamedSharding(self.mesh, P(None))
+        logging.info(
+            f"schedule_batch.get_model_worker_batch: {self.forward_mode.name} input_ids_cpu = {input_ids_cpu} sum = {np.sum(input_ids_cpu)}"
+        )
         input_ids_cpu = jax.make_array_from_process_local_data(
             data_sharding, input_ids_cpu
         )
