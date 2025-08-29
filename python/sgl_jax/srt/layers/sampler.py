@@ -49,7 +49,7 @@ class Sampler(nnx.Module):
                 logprobs = jax.nn.log_softmax(logits, axis=-1)
         else:
             # Post process logits
-            logits = jnp.divide(logits, sampling_info.temperatures)
+            logits = jnp.divide(logits, sampling_info.temperatures.flatten())
             probs = jax.nn.softmax(logits, axis=-1)
             _, new_rng = jax.random.split(self.rngs.params())
             # A slower fallback implementation with torch native operations.
@@ -151,6 +151,10 @@ def _sample_part_a(probs, top_ks, top_ps, need_min_p_sampling: bool, min_ps):
         min_p_mask = probs_sort < min_p_thresholds.reshape(-1, 1)
         probs_sort = jnp.where(min_p_mask, 0.0, probs_sort)
 
+    probs_sum_filtered = jnp.sum(probs_sort, axis=-1, keepdims=True)
+    probs_sort = jnp.where(
+        probs_sum_filtered > 0, probs_sort / probs_sum_filtered, probs_sort
+    )
     return probs_sort, probs_idx
 
 
