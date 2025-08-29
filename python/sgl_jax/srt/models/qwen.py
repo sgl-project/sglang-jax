@@ -246,20 +246,20 @@ class QWenBlock(nnx.Module):
         if attn_output is not None:
             hidden_states = residual + attn_output
 
-        if forward_batch.enable_dp_attention:
-            try:
-                hidden_states = functools.partial(
-                    shard_map.shard_map,
-                    mesh=self.mesh,
-                    in_specs=P(None),
-                    out_specs=P(None),
-                    check_rep=False,
-                )(lambda x: jax.lax.all_gather(x, "data"))(hidden_states)
-                hidden_states = jnp.squeeze(hidden_states[0])
-            except Exception as e:
-                logger.error(
-                    f"after attention dp hidden_states shape{hidden_states.shape} {hidden_states} {e}"
-                )
+        # if forward_batch.enable_dp_attention:
+        #     try:
+        #         hidden_states = functools.partial(
+        #             shard_map.shard_map,
+        #             mesh=self.mesh,
+        #             in_specs=P(None),
+        #             out_specs=P(None),
+        #             check_rep=False,
+        #         )(lambda x: jax.lax.all_gather(x, "data"))(hidden_states)
+        #         hidden_states = jnp.squeeze(hidden_states[0])
+        #     except Exception as e:
+        #         logger.error(
+        #             f"after attention dp hidden_states shape{hidden_states.shape} {hidden_states} {e}"
+        #         )
 
         residual = hidden_states
 
