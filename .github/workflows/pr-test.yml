@@ -164,11 +164,7 @@ jobs:
 
   pr-test-finish:
     needs: [
-      #e2e-test-1-tpu,
       e2e-test-4-tpu,
-      #performance-test-1-tpu,
-      #performance-test-4-tpu,
-      #accuracy-test-1-tpu,
     ]
     runs-on: self-hosted
     steps:
