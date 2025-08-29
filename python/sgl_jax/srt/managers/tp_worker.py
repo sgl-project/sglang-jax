@@ -252,7 +252,7 @@ class ModelWorker:
         import jax._src.test_util as jtu
 
         logits_output = self.model_runner.forward(forward_batch)
-
+        logger.info(f"after logits_output = self.model_runner.forward(forward_batch)")
         if launch_done is not None:
             launch_done.set()
 
@@ -271,6 +271,7 @@ class ModelWorker:
             return LogitsProcessorOutput(
                 next_token_logits=jnp.array([]),
             ), jnp.array([], dtype=jnp.int32)
+        logger.info(f"before return forward_batch_generation")
         if next_token_ids is None:
             return logits_output.truncate_logits_processor_output(idx), []
         return logits_output.truncate_logits_processor_output(idx), next_token_ids[idx]
