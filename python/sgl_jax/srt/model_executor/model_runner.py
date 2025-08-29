@@ -273,11 +273,6 @@ class ModelRunner:
 
         padded_kv_heads_total = padded_kv_heads_per_device * self.tp_size
 
-        if padded_kv_heads_per_device < self.tp_size:
-            kv_partition_axis = "data"
-        else:
-            kv_partition_axis = "tensor"
-
         kv_cache_head_num = padded_kv_heads_total
 
         self.token_to_kv_pool = MHATokenToKVPool(
@@ -288,7 +283,6 @@ class ModelRunner:
             head_dim=self.model_config.head_dim,
             layer_num=self.model_config.num_hidden_layers,
             mesh=self.mesh,
-            kv_partition_axis=kv_partition_axis,
         )
 
         # Create KV pool allocator
@@ -306,13 +300,6 @@ class ModelRunner:
                     dtype=self.kv_cache_dtype,
                     kvcache=self.token_to_kv_pool,
                 )
-
-        # Log memory usage
-        total_cache_size = self.token_to_kv_pool.mem_usage
-        logger.info(
-            f"Memory pool initialized. Total KV cache size: {total_cache_size:.2f} GB, "
-            f"Max tokens: {self.max_total_num_tokens}, Max requests: {max_num_reqs}"
-        )
 
     def init_attention_backend(self):
         """Init attention kernel backend."""

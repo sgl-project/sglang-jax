@@ -4,13 +4,62 @@ import jax.numpy as jnp
 from jax.sharding import NamedSharding, PartitionSpec
 
 
-def get_num_kv_heads_by_tp(num_kv_heads: int, tp_size: int) -> int:
-    if tp_size <= num_kv_heads:
-        assert num_kv_heads % tp_size == 0
-        return num_kv_heads
+def get_num_kv_heads_by_tp(total_num_kv_heads: int, tp_size: int) -> int:
+    """
+    Calculate the number of KV heads per device for tensor parallelism.
+
+    Args:
+        total_num_kv_heads: Total number of KV heads in the model
+        tp_size: Tensor parallel size (number of devices)
+
+    Returns:
+        Number of KV heads per device
+    """
+    if tp_size >= total_num_kv_heads:
+        # When tp_size >= total_kv_heads, each device gets 1 KV head
+        # Multiple devices will replicate the same original KV head
+        return 1
     else:
-        assert tp_size % num_kv_heads == 0
-        return tp_size
+        # Normal case: divide KV heads across devices
+        return (total_num_kv_heads + tp_size - 1) // tp_size
+
+
+def get_num_kv_head_replicas(total_num_kv_heads: int, tp_size: int) -> int:
+    """
+    Calculate how many replicas each original KV head has across devices.
+
+    Args:
+        total_num_kv_heads: Total number of KV heads in the model
+        tp_size: Tensor parallel size (number of devices)
+
+    Returns:
+        Number of replicas per original KV head
+    """
+    if tp_size >= total_num_kv_heads:
+        return (tp_size + total_num_kv_heads - 1) // total_num_kv_heads
+    else:
+        return 1
+
+
+def get_original_kv_head_id(tp_rank: int, total_num_kv_heads: int, tp_size: int) -> int:
+    """
+    Determine which original KV head this device should replicate.
+
+    Args:
+        tp_rank: Current device rank (0-based)
+        total_num_kv_heads: Total number of KV heads in the model
+        tp_size: Tensor parallel size
+
+    Returns:
+        ID of the original KV head to replicate (0-based)
+    """
+    if tp_size >= total_num_kv_heads:
+        num_kv_head_replicas = get_num_kv_head_replicas(total_num_kv_heads, tp_size)
+        return tp_rank // num_kv_head_replicas
+    else:
+        # Normal case: each device gets a different range of KV heads
+        kv_heads_per_device = get_num_kv_heads_by_tp(total_num_kv_heads, tp_size)
+        return (tp_rank * kv_heads_per_device) % total_num_kv_heads
 
 
 def get_available_device_memory(device, distributed=False, empty_cache=True):

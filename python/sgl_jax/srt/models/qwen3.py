@@ -38,8 +38,7 @@ class QWen3Attention(nnx.Module):
     ):
         self.layer_id = layer_id
         assert num_heads % num_kv_heads == 0
-        head_dim_original = head_dim or hidden_size // num_heads
-        self.head_dim = (head_dim_original + 127) // 128 * 128
+        self.head_dim = head_dim or hidden_size // num_heads
 
         self.q_size = num_heads * self.head_dim
         self.kv_size = num_kv_heads * self.head_dim
@@ -85,7 +84,7 @@ class QWen3Attention(nnx.Module):
             rotary_dim=self.head_dim,
             max_position_embeddings=max_position_embeddings,
             base=rope_theta,
-            is_neox_style=False,
+            is_neox_style=True,
             dtype=dtype,
         )
 
@@ -346,11 +345,7 @@ class Qwen3ForCausalLM(nnx.Module):
         target_prefix = f"transformer.layers.{layer_idx}"
 
         num_heads = self.config.hf_config.num_attention_heads
-        num_kv_heads = self.config.hf_config.num_key_value_heads
         hidden_size = self.config.hf_config.hidden_size
-        head_dim_original = getattr(
-            self.config.hf_config, "head_dim", hidden_size // num_heads
-        )
 
         mappings = {
             f"{prefix}.input_layernorm.weight": WeightMapping(
