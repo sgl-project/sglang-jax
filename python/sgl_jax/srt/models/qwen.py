@@ -1,5 +1,6 @@
 import functools
 import logging
+from math import log
 from typing import Any, Dict, Optional
 
 import jax
@@ -243,6 +244,7 @@ class QWenBlock(nnx.Module):
             forward_batch=forward_batch,
             layer_id=self.layer_id,
         )
+        logger.info("after attention................")
         if attn_output is not None:
             hidden_states = residual + attn_output
 
@@ -267,6 +269,7 @@ class QWenBlock(nnx.Module):
             hidden_states, f"RMSNorm_pre_mlp_input", f"rmsnorm_layer_id_{self.layer_id}"
         )
         hidden_states = self.ln_2(hidden_states)
+        logger.info("after ln_2 ......................")
         global_tracer.print(
             hidden_states,
             f"RMSNorm_pre_mlp_output",
@@ -274,6 +277,7 @@ class QWenBlock(nnx.Module):
         )
 
         hidden_states = self.mlp(hidden_states)
+        logger.info("after mlp ......................")
         hidden_states = residual + hidden_states
         return hidden_states, k, v
 
