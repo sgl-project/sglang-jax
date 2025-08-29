@@ -3,6 +3,7 @@ import unittest
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from types import SimpleNamespace
 
+import openai
 import requests
 
 from sgl_jax.srt.utils import kill_process_tree
@@ -26,7 +27,6 @@ class TestFeatures(CustomTestCase):
     - Abort
     - CacheMiss
     - Logprobs
-
 
     """
 
