@@ -237,9 +237,6 @@ class QWenBlock(nnx.Module):
             f"RMSNorm_pre_attn_output",
             f"rmsnorm_layer_id_{self.layer_id}",
         )
-        logger.info(
-            f"before attention hidden_states shape{hidden_states.shape} mode {forward_batch.forward_mode}"
-        )
         attn_output, k, v = self.attn(
             positions=positions,
             hidden_states=hidden_states,
@@ -249,12 +246,7 @@ class QWenBlock(nnx.Module):
         if attn_output is not None:
             hidden_states = residual + attn_output
 
-        logger.info(
-            f"after attention hidden_states shape{hidden_states.shape} {forward_batch.enable_dp_attention}"
-        )
-
         if forward_batch.enable_dp_attention:
-            logger.info(f"before attention dp hidden_states shape{hidden_states.shape}")
             try:
                 hidden_states = functools.partial(
                     shard_map.shard_map,
@@ -268,9 +260,6 @@ class QWenBlock(nnx.Module):
                 logger.error(
                     f"after attention dp hidden_states shape{hidden_states.shape} {hidden_states} {e}"
                 )
-            logger.info(
-                f"after attention dp hidden_states shape{hidden_states.shape} {hidden_states}"
-            )
 
         residual = hidden_states
 
@@ -332,7 +321,6 @@ class QWenModel(nnx.Module):
         forward_batch: ForwardBatch,
     ):
         global_tracer.print(input_ids, "embedding_input", "embedding_all")
-        logger.info(f"input_ids: {input_ids} {input_ids.dtype}")
         hidden_states = self.embed_tokens(input_ids)
         global_tracer.print(hidden_states, "embedding_output", "embedding_all")
 
@@ -474,7 +462,6 @@ class QWenLMHeadModel(nnx.Module):
         positions: jax.Array,
         forward_batch: ForwardBatch,
     ):
-        logger.info(f"input_ids: {input_ids} {input_ids.dtype}")
         positions = positions.astype(jnp.int32)
         hidden_states, layers_k, layers_v = self.transformer(
             input_ids, positions, forward_batch
