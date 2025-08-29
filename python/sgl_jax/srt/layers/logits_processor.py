@@ -1,4 +1,5 @@
 import dataclasses
+import logging
 from functools import partial
 from typing import List, Optional
 
@@ -196,7 +197,10 @@ def _lm_head_forward(
     last_hidden_states, embedding = promote_dtype(
         (last_hidden_states, embedding.value), dtype=dtype
     )
-    logits = jnp.dot(last_hidden_states, embedding.T)
+    logger.info("before jnp.dot(last_hidden_states, embedding.T)")
+    # logits = jnp.dot(last_hidden_states, embedding.T)
+    logits = last_hidden_states
+    # logger.info("after jnp.dot(last_hidden_states, embedding.T)")
 
-    logits = logits[:, :vocab_size] if logits.ndim > 1 else logits[:vocab_size]
+    # logits = logits[:, :vocab_size] if logits.ndim > 1 else logits[:vocab_size]
     return logits
