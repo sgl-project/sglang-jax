@@ -799,9 +799,10 @@ class Scheduler(
         # DP Attention: Synchronize batch across DP groups
         if self.server_args.enable_dp_attention:
             try:
-                batch_size_list = self.all_gather_by_cpu(
-                    np.array([ret.batch_size if ret is not None else 0], dtype=np.int32)
-                )
+                batch_size_list = np.array([1, 0, 0, 0])
+                # self.all_gather_by_cpu(
+                #     np.array([ret.batch_size if ret is not None else 0], dtype=np.int32)
+                # )
                 logger.info(
                     f"Node {self.node_rank} batch_size_list: {np.array(batch_size_list)}"
                 )
