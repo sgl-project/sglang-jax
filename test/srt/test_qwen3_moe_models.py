@@ -30,7 +30,7 @@ class TestQwenModel(CustomTestCase):
                 "--mem-fraction-static",
                 "0.1",
                 "--max-prefill-tokens",
-                "4096",
+                "16384",
                 "--download-dir",
                 "/tmp/",
                 "--dtype",

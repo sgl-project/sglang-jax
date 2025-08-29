@@ -1076,7 +1076,7 @@ class ScheduleBatch:
         else:
             # For decode: each sequence contributes one token at the next position (seq_len)
             # Create positions for actual tokens (one per sequence at seq_len)
-            batch_positions = seq_lens_cpu  # Next position is current seq_len
+            batch_positions = seq_lens_cpu - 1
             # Create positions array matching the length of input_ids (including padding)
             positions_cpu = np.zeros(len(input_ids_cpu), dtype=batch_positions.dtype)
             # Fill in the actual positions for the real tokens
