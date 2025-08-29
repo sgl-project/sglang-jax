@@ -232,7 +232,7 @@ class QWenBlock(nnx.Module):
             f"RMSNorm_pre_attn_input",
             f"rmsnorm_layer_id_{self.layer_id}",
         )
-        hidden_states = self.ln_1(hidden_states)
+        # hidden_states = self.ln_1(hidden_states)
         global_tracer.print(
             hidden_states,
             f"RMSNorm_pre_attn_output",
