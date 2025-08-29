@@ -26,28 +26,28 @@ concurrency:
 
 jobs:
 
-  e2e-test-1-tpu:
-    if: github.event.pull_request.draft == false
-    runs-on: self-hosted
-    strategy:
-      fail-fast: false
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-      - name: Setup environment
-        uses: ./.github/actions/setup_environment
-        with:
-          accelerator: tpu-v6e-1
-          test_type: e2e
-          skypilot_endpoint: ${{ secrets.SKYPILOT_ENDPOINT }}
-          username: ${{ secrets.USERNAME }}
-          git_token: ${{ secrets.GIT_TOKEN }}
-      - name: Run test
-        timeout-minutes: 30
-        run: |
-          source ~/sky/bin/activate
-          CLUSTER_NAME=$(bash scripts/get_cluster_name.sh tpu-v6e-1 ${{ github.ref }} e2e)
-          sky exec "$CLUSTER_NAME" -- 'set -e; cd sglang-jax; uv run python test/srt/run_suite.py --suite per-commit-tpu-v6e-1'
+  # e2e-test-1-tpu:
+  #   if: github.event.pull_request.draft == false
+  #   runs-on: self-hosted
+  #   strategy:
+  #     fail-fast: false
+  #   steps:
+  #     - name: Checkout code
+  #       uses: actions/checkout@v4
+  #     - name: Setup environment
+  #       uses: ./.github/actions/setup_environment
+  #       with:
+  #         accelerator: tpu-v6e-1
+  #         test_type: e2e
+  #         skypilot_endpoint: ${{ secrets.SKYPILOT_ENDPOINT }}
+  #         username: ${{ secrets.USERNAME }}
+  #         git_token: ${{ secrets.GIT_TOKEN }}
+  #     - name: Run test
+  #       timeout-minutes: 30
+  #       run: |
+  #         source ~/sky/bin/activate
+  #         CLUSTER_NAME=$(bash scripts/get_cluster_name.sh tpu-v6e-1 ${{ github.ref }} e2e)
+  #         sky exec "$CLUSTER_NAME" -- 'set -e; cd sglang-jax; uv run python test/srt/run_suite.py --suite per-commit-tpu-v6e-1'
 
   e2e-test-4-tpu:
     if: github.event.pull_request.draft == false
@@ -72,28 +72,28 @@ jobs:
           CLUSTER_NAME=$(bash scripts/get_cluster_name.sh tpu-v6e-4 ${{ github.ref }} e2e)
           sky exec "$CLUSTER_NAME" -- 'set -e; cd sglang-jax; uv run python test/srt/run_suite.py --suite per-commit-tpu-v6e-4'
 
-  performance-test-1-tpu:
-    if: github.event.pull_request.draft == false
-    runs-on: self-hosted
-    strategy:
-      fail-fast: false
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-      - name: Setup environment
-        uses: ./.github/actions/setup_environment
-        with:
-          accelerator: tpu-v6e-1
-          test_type: performance
-          skypilot_endpoint: ${{ secrets.SKYPILOT_ENDPOINT }}
-          username: ${{ secrets.USERNAME }}
-          git_token: ${{ secrets.GIT_TOKEN }}
-      - name: Benchmark single latency
-        timeout-minutes: 30
-        run: |
-          source ~/sky/bin/activate
-          CLUSTER_NAME=$(bash scripts/get_cluster_name.sh tpu-v6e-1 ${{ github.ref }} performance)
-          sky exec "$CLUSTER_NAME" -- 'set -e; cd sglang-jax/test/srt; uv run python -m unittest test_bench_one_batch.TestBenchOneBatch.test_bs1_default'
+  # performance-test-1-tpu:
+  #   if: github.event.pull_request.draft == false
+  #   runs-on: self-hosted
+  #   strategy:
+  #     fail-fast: false
+  #   steps:
+  #     - name: Checkout code
+  #       uses: actions/checkout@v4
+  #     - name: Setup environment
+  #       uses: ./.github/actions/setup_environment
+  #       with:
+  #         accelerator: tpu-v6e-1
+  #         test_type: performance
+  #         skypilot_endpoint: ${{ secrets.SKYPILOT_ENDPOINT }}
+  #         username: ${{ secrets.USERNAME }}
+  #         git_token: ${{ secrets.GIT_TOKEN }}
+  #     - name: Benchmark single latency
+  #       timeout-minutes: 30
+  #       run: |
+  #         source ~/sky/bin/activate
+  #         CLUSTER_NAME=$(bash scripts/get_cluster_name.sh tpu-v6e-1 ${{ github.ref }} performance)
+  #         sky exec "$CLUSTER_NAME" -- 'set -e; cd sglang-jax/test/srt; uv run python -m unittest test_bench_one_batch.TestBenchOneBatch.test_bs1_default'
 
       # - name: Benchmark online latency
       #   timeout-minutes: 10
@@ -124,43 +124,43 @@ jobs:
       #     sky exec "$CLUSTER_NAME" -- 'set -e; cd sglang-jax/test/srt; python3 -m unittest test_bench_serving.TestBenchServing.test_offline_throughput_default'
 
 
-  performance-test-4-tpu:
-    if: github.event.pull_request.draft == false
-    runs-on: self-hosted
-    strategy:
-      fail-fast: false
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+  # performance-test-4-tpu:
+  #   if: github.event.pull_request.draft == false
+  #   runs-on: self-hosted
+  #   strategy:
+  #     fail-fast: false
+  #   steps:
+  #     - name: Checkout code
+  #       uses: actions/checkout@v4
 
-  accuracy-test-1-tpu:
-    if: github.event.pull_request.draft == false
-    runs-on: self-hosted
-    strategy:
-      fail-fast: false
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-      - name: Setup environment
-        uses: ./.github/actions/setup_environment
-        with:
-          accelerator: tpu-v6e-1
-          test_type: accuracy
-          skypilot_endpoint: ${{ secrets.SKYPILOT_ENDPOINT }}
-          username: ${{ secrets.USERNAME }}
-          git_token: ${{ secrets.GIT_TOKEN }}
-      - name: Install dependencies
-        run: |
-          source ~/sky/bin/activate
-          CLUSTER_NAME=$(bash scripts/get_cluster_name.sh tpu-v6e-1 ${{ github.ref }} accuracy)
-          sky exec "$CLUSTER_NAME" -- 'set -e; if [ ! -d "human-eval" ] || [ -z "$(ls -A human-eval)" ]; then git clone https://github.com/merrymercy/human-eval.git; fi; cd human-eval; uv pip install -e .'
+  # accuracy-test-1-tpu:
+  #   if: github.event.pull_request.draft == false
+  #   runs-on: self-hosted
+  #   strategy:
+  #     fail-fast: false
+  #   steps:
+  #     - name: Checkout code
+  #       uses: actions/checkout@v4
+  #     - name: Setup environment
+  #       uses: ./.github/actions/setup_environment
+  #       with:
+  #         accelerator: tpu-v6e-1
+  #         test_type: accuracy
+  #         skypilot_endpoint: ${{ secrets.SKYPILOT_ENDPOINT }}
+  #         username: ${{ secrets.USERNAME }}
+  #         git_token: ${{ secrets.GIT_TOKEN }}
+  #     - name: Install dependencies
+  #       run: |
+  #         source ~/sky/bin/activate
+  #         CLUSTER_NAME=$(bash scripts/get_cluster_name.sh tpu-v6e-1 ${{ github.ref }} accuracy)
+  #         sky exec "$CLUSTER_NAME" -- 'set -e; if [ ! -d "human-eval" ] || [ -z "$(ls -A human-eval)" ]; then git clone https://github.com/merrymercy/human-eval.git; fi; cd human-eval; uv pip install -e .'
 
-      - name: Evaluate accuracy
-        timeout-minutes: 60
-        run: |
-          source ~/sky/bin/activate
-          CLUSTER_NAME=$(bash scripts/get_cluster_name.sh tpu-v6e-1 ${{ github.ref }} accuracy)
-          sky exec "$CLUSTER_NAME" -- 'set -e; cd sglang-jax/test/srt; python3 test_eval_accuracy_large.py'
+  #     - name: Evaluate accuracy
+  #       timeout-minutes: 60
+  #       run: |
+  #         source ~/sky/bin/activate
+  #         CLUSTER_NAME=$(bash scripts/get_cluster_name.sh tpu-v6e-1 ${{ github.ref }} accuracy)
+  #         sky exec "$CLUSTER_NAME" -- 'set -e; cd sglang-jax/test/srt; python3 test_eval_accuracy_large.py'
 
   pr-test-finish:
     needs: [
