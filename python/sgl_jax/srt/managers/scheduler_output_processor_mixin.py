@@ -48,15 +48,13 @@ class SchedulerOutputProcessorMixin:
             result.extend_input_len_per_req,
             result.extend_logprob_start_len_per_req,
         )
-        logger.info(
-            f"process_batch_result_prefill: {batch.forward_mode.name} next_token_ids = {next_token_ids}"
-        )
+        logger.info(f"process_batch_result_prefill: {batch.forward_mode.name} 11111111")
         # if next_token_ids is not None and len(next_token_id) > 0:
         #     return
         # # Move next_token_ids and logprobs to cpu
         # next_token_ids = jax.device_get(next_token_ids)
         logger.info(
-            f"process_batch_result_prefill: {batch.forward_mode.name} next_token_ids = {next_token_ids}"
+            f"process_batch_result_prefill: {batch.forward_mode.name} 222222222"
         )
         if batch.return_logprob:
             if logits_output.next_token_logprobs is not None:

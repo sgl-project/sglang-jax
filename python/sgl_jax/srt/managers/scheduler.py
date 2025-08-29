@@ -471,7 +471,7 @@ class Scheduler(
 
             if batch:
                 result = self.run_batch(batch)
-                logger.info(f"run_batch: {batch.forward_mode.name} result = {result}")
+                logger.info(f"run_batch: {batch.forward_mode.name}")
                 self.process_batch_result(batch, result)
             else:
                 # When the server is idle, do self-check and re-init some states
@@ -953,9 +953,7 @@ class Scheduler(
         logits_output, next_token_ids = self.tp_worker.forward_batch_generation(
             model_worker_batch
         )
-        logger.info(
-            f"run_batch: {model_worker_batch.forward_mode.name} next_token_ids = {next_token_ids}"
-        )
+        logger.info(f"after forward run_batch: {model_worker_batch.forward_mode.name}")
         bid = model_worker_batch.bid
         batch.output_ids = next_token_ids
 
@@ -980,7 +978,7 @@ class Scheduler(
             extend_logprob_start_len_per_req=extend_logprob_start_len_per_req,
             bid=bid,
         )
-        logger.info(f"run_batch: {model_worker_batch.forward_mode.name} ret = {ret}")
+        logger.info(f"run_batch: {model_worker_batch.forward_mode.name}")
         return ret
 
     def process_batch_result(
