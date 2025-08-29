@@ -22,6 +22,9 @@ from functools import total_ordering
 from typing import TYPE_CHECKING, Optional
 
 import jax
+import jax.numpy as jnp
+
+from sgl_jax.srt.utils.jax_utils import device_array
 
 if TYPE_CHECKING:
     from sgl_jax.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -226,15 +229,23 @@ class ForwardBatch:
         return cls(
             forward_mode=batch.forward_mode,
             batch_size=len(batch.seq_lens),
-            input_ids=batch.input_ids,
-            seq_lens=batch.seq_lens,
-            out_cache_loc=batch.out_cache_loc,
-            positions=batch.positions,
-            extend_start_loc=batch.extend_start_loc,
-            req_pool_indices=batch.req_pool_indices,
+            input_ids=device_array(model_runner.mesh, batch.input_ids),
+            seq_lens=jnp.array(batch.seq_lens),
+            out_cache_loc=jnp.array(batch.out_cache_loc),
+            positions=jnp.array(batch.positions),
+            extend_start_loc=jnp.array(batch.extend_start_loc),
+            req_pool_indices=jnp.array(batch.req_pool_indices),
             token_to_kv_pool=model_runner.token_to_kv_pool,
             attn_backend=model_runner.attn_backend,
-            cache_loc=batch.cache_loc,
-            extend_prefix_lens=batch.extend_prefix_lens,
-            extend_seq_lens=batch.extend_seq_lens,
+            cache_loc=jnp.array(batch.cache_loc),
+            extend_prefix_lens=(
+                jnp.array(batch.extend_prefix_lens)
+                if batch.extend_prefix_lens is not None
+                else None
+            ),
+            extend_seq_lens=(
+                jnp.array(batch.extend_seq_lens)
+                if batch.extend_seq_lens is not None
+                else None
+            ),
         )

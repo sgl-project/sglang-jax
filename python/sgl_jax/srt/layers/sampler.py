@@ -79,10 +79,7 @@ class Sampler(nnx.Module):
                 ) = get_token_ids_logprobs(logprobs, token_ids_logprobs)
 
             logits_output.next_token_logprobs = logprobs[
-                device_array(
-                    mesh if mesh is not None else jax.sharding.get_abstract_mesh(),
-                    np.arange(len(batch_next_token_ids)),
-                ),
+                np.arange(len(batch_next_token_ids)),
                 batch_next_token_ids,
             ]
 

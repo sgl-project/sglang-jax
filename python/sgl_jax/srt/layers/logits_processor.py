@@ -98,26 +98,11 @@ class LogitsProcessorOutput:
 
         return obj
 
-    def truncate_logits_processor_output(self, idx: jax.Array):
+    def truncate_logits_processor_output(self, idx: np.ndarray):
         # note: here only need to truncate next_token_logits and hidden_states
         self.next_token_logits = self.next_token_logits[idx]
         if self.hidden_states is not None:
             self.hidden_states = self.hidden_states[idx]
-
-        # for field in dataclasses.fields(self):
-        #     value = getattr(self, field.name)
-        #     if value is None:
-        #         continue
-        #     if isinstance(value, jax.Array):
-        #         truncated = value[idx]
-        #         setattr(self, field.name, truncated)
-        #     elif isinstance(value, list):
-        #         if len(value) > 0 and len(idx.shape) == 1:
-        #             idx_list = idx.tolist() if hasattr(idx, 'tolist') else [int(idx)]
-        #             truncated = [value[i] for i in idx_list if i < len(value)]
-        #         else:
-        #             truncated = value
-        #         setattr(self, field.name, truncated)
 
 
 @dataclasses.dataclass

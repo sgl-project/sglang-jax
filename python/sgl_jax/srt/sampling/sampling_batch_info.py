@@ -28,7 +28,7 @@ class SamplingBatchInfo:
     """
 
     # Basic batched sampling params
-    temperatures: jax.Array
+    temperatures: jax.array
     top_ps: jax.Array
     top_ks: jax.Array
     min_ps: jax.Array
@@ -80,12 +80,12 @@ class SamplingBatchInfo:
     @classmethod
     def generate_for_precompile(cls, bs: int, vocab_size: int, mesh: mesh_lib.Mesh):
         # device = batch.device
-        temperatures = jnp.array([1.0 for _ in range(bs)], dtype=jnp.float32).reshape(
+        temperatures = np.array([1.0 for _ in range(bs)], dtype=jnp.float32).reshape(
             -1, 1
         )
-        top_ps = jnp.array([1.0 for _ in range(bs)], dtype=jnp.float32)
-        top_ks = jnp.array([-1 for _ in range(bs)], dtype=jnp.int32)
-        min_ps = jnp.array([0.0 for _ in range(bs)], dtype=jnp.float32)
+        top_ps = np.array([1.0 for _ in range(bs)], dtype=jnp.float32)
+        top_ks = np.array([-1 for _ in range(bs)], dtype=jnp.int32)
+        min_ps = np.array([0.0 for _ in range(bs)], dtype=jnp.float32)
 
         temperatures_device = device_array(mesh, temperatures)
         top_ps_device = device_array(mesh, top_ps)
@@ -107,7 +107,6 @@ class SamplingBatchInfo:
     @classmethod
     def from_schedule_batch(cls, batch: ScheduleBatch, vocab_size: int):
         reqs = batch.reqs
-        # device = batch.device
         temperatures = np.array(
             [r.sampling_params.temperature for r in reqs],
             dtype=jnp.float32,
@@ -116,23 +115,13 @@ class SamplingBatchInfo:
         top_ks = np.array([r.sampling_params.top_k for r in reqs], dtype=jnp.int32)
         min_ps = np.array([r.sampling_params.min_p for r in reqs], dtype=jnp.float32)
 
-        temperatures_device = device_array(batch.mesh, temperatures)
-        top_ps_device = device_array(batch.mesh, top_ks)
-        top_ks_device = device_array(batch.mesh, top_ks)
-        min_ps_device = device_array(batch.mesh, min_ps)
-
-        # temperatures_device, top_ps_device, top_ks_device, min_ps_device = device_array(
-        #     batch.mesh, (temperatures, top_ps, top_ks, min_ps)
-        # )
-
-        # logit_bias = None
-        # if any(r.sampling_params.logit_bias is not None for r in reqs):
-        #     logit_bias = np.zeros(len(reqs), vocab_size)
-        #     logit_bias = device_array(batch.mesh, logit_bias)
-        #     for i, r in enumerate(reqs):
-        #         if r.sampling_params.logit_bias is not None:
-        #             for key, value in r.sampling_params.logit_bias.items():
-        #                 logit_bias[i, int(key)] = value
+        # temperatures_device = device_array(batch.mesh, temperatures)
+        # top_ps_device = device_array(batch.mesh, top_ps)
+        # top_ks_device = device_array(batch.mesh, top_ks)
+        # min_ps_device = device_array(batch.mesh, min_ps)
+        (temperatures_device, top_ps_device, top_ks_device, min_ps_device) = (
+            device_array(batch.mesh, (temperatures, top_ps, top_ks, min_ps))
+        )
 
         ret = cls(
             temperatures=temperatures_device,
@@ -150,11 +139,9 @@ class SamplingBatchInfo:
         return len(self.temperatures)
 
     def apply_logits_bias(self, logits: jax.Array):
-        # if self.logit_bias is not None:
-        #     return logits + self.logit_bias
         return logits
 
-    def filter_batch(self, keep_indices: List[int], keep_indices_device: jax.Array):
+    def filter_batch(self, keep_indices: np.ndarray):
         for item in [
             "temperatures",
             "top_ps",
@@ -162,7 +149,7 @@ class SamplingBatchInfo:
             "min_ps",
         ]:
             value = getattr(self, item, None)
-            setattr(self, item, value[keep_indices_device])
+            setattr(self, item, value[keep_indices])
 
     def merge_batch(self, other: "SamplingBatchInfo", mesh: mesh_lib.Mesh):
         # Note: because the __len()__ operator is defined on the temperatures tensor,

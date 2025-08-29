@@ -6,6 +6,7 @@ import time
 from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 
 import jax
+import numpy as np
 
 from sgl_jax.srt.layers.logits_processor import LogitsProcessorOutput
 from sgl_jax.srt.managers.io_struct import BatchTokenIDOut
@@ -53,6 +54,7 @@ class SchedulerOutputProcessorMixin:
 
         # Move next_token_ids and logprobs to cpu
         next_token_ids = jax.device_get(next_token_ids).tolist()
+        batch.output_ids = np.array(next_token_ids, dtype=np.int32)
         if batch.return_logprob:
             if logits_output.next_token_logprobs is not None:
                 logits_output.next_token_logprobs = jax.device_get(
@@ -145,6 +147,7 @@ class SchedulerOutputProcessorMixin:
 
         # spec decoding handles output logprobs inside verify process.
         next_token_ids = jax.device_get(next_token_ids).tolist()
+        batch.output_ids = np.array(next_token_ids, dtype=np.int32)
         if batch.return_logprob:
             next_token_logprobs = jax.device_get(
                 logits_output.next_token_logprobs
