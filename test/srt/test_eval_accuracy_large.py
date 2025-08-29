@@ -38,7 +38,7 @@ class TestEvalAccuracyLarge(CustomTestCase):
                 "--nnodes",
                 "1",
                 "--tp-size",
-                "1",
+                "4",
                 "--random-seed",
                 "3",
                 "--node-rank",

@@ -155,6 +155,7 @@ suites = {
         TestFile("test/srt/openai_server/basic/test_protocol.py", 10),
         TestFile("test/srt/openai_server/basic/test_serving_chat.py", 10),
         TestFile("test/srt/openai_server/basic/test_serving_completions.py", 10),
+        TestFile("test/srt/openai_server/basic/test_openai_server.py", 10),
         TestFile("test/srt/test_qwen3_moe_models.py", 45),
         TestFile("test/srt/test_features.py", 30),
         TestFile("test/srt/test_bench_one_batch.py", 15),
