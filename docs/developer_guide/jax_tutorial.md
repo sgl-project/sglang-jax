@@ -38,14 +38,14 @@ We recommend following this path to systematically master JAX and Pallas.
 For a beginner, the most important thing is to understand the JAX "way of thinking."
 
 1. **Start with the Official Tutorials:**
-  
+
   - **Must-Read:** [JAX 101 Tutorial](https://jax.readthedocs.io/en/latest/jax-101/index.html). This is the best introductory material, bar none. Spend a few hours going through it completely and run every code example yourself.
   - **Core Concepts:** You need to focus on the differences between JAX and NumPy (especially immutability) and master JAX's three core function transformations:
     - `jax.jit()`: Understand how it compiles functions into high-performance code.
     - `jax.vmap()`: Grasp its magic of automatically converting a function that processes a single data point into one that handles a batch, saving you from writing manual loops.
     - `jax.grad()`: While not used directly for training in our inference project, understanding it is key to grasping the JAX ecosystem.
 2. **Learning Resources:**
-  
+
   - **Official Documentation:** The [JAX Documentation](https://jax.readthedocs.io/en/latest/) is your most reliable friend.
   - **Code Examples:** Read through well-regarded open-source JAX projects like [Flax](https://github.com/google/flax) (a neural network library for JAX) to see how others structure their JAX code.
 
@@ -66,12 +66,12 @@ Once you have a handle on the basics of JAX, you can start learning how to manag
 Pallas is an advanced topic. We **do not recommend** diving into Pallas until you have a deep understanding of JAX's core and distributed programming.
 
 1. **What is Pallas?**
-  
+
   - Pallas is an extension to JAX that allows you to write custom, low-level computation "kernels" using Python syntax.
   - If JAX lets you drive an F1 car, Pallas gives you the toolkit to design and build the engine for that car yourself.
   - In `sglang-jax`, we use Pallas to implement operators with extreme performance requirements, like FlashAttention. This allows us to bypass some of JAX's higher-level abstractions to communicate more directly with the hardware, squeezing out every last drop of performance.
 2. **How to Learn Pallas?**
-  
+
   - **When to start:** You should only consider Pallas when you've hit a performance bottleneck and are certain that standard JAX operators can no longer meet your needs.
   - **Resources:**
     - Read the [Pallas Official Documentation](https://jax.readthedocs.io/en/latest/pallas/index.html).
