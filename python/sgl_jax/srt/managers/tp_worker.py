@@ -271,6 +271,8 @@ class ModelWorker:
             return LogitsProcessorOutput(
                 next_token_logits=jnp.array([]),
             ), jnp.array([], dtype=jnp.int32)
+        if next_token_ids is None:
+            return logits_output.truncate_logits_processor_output(idx), None
         return logits_output.truncate_logits_processor_output(idx), next_token_ids[idx]
 
 
