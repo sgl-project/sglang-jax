@@ -245,8 +245,8 @@ class QWenBlock(nnx.Module):
             layer_id=self.layer_id,
         )
         logger.info("after attention................")
-        if attn_output is not None:
-            hidden_states = residual + attn_output
+        # if attn_output is not None:
+        #     hidden_states = residual + attn_output
 
         # if forward_batch.enable_dp_attention:
         #     try:
@@ -263,11 +263,11 @@ class QWenBlock(nnx.Module):
         #             f"after attention dp hidden_states shape{hidden_states.shape} {hidden_states} {e}"
         #         )
 
-        residual = hidden_states
+        # residual = hidden_states
 
-        global_tracer.print(
-            hidden_states, f"RMSNorm_pre_mlp_input", f"rmsnorm_layer_id_{self.layer_id}"
-        )
+        # global_tracer.print(
+        #     hidden_states, f"RMSNorm_pre_mlp_input", f"rmsnorm_layer_id_{self.layer_id}"
+        # )
         hidden_states = self.ln_2(hidden_states)
         logger.info("after ln_2 ......................")
         global_tracer.print(
