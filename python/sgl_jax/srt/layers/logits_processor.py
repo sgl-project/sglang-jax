@@ -197,7 +197,7 @@ def _lm_head_forward(
     last_hidden_states, embedding = promote_dtype(
         (last_hidden_states, embedding.value), dtype=dtype
     )
-    logger.info("before jnp.dot(last_hidden_states, embedding.T)")
+    logging.info("before jnp.dot(last_hidden_states, embedding.T)")
     # logits = jnp.dot(last_hidden_states, embedding.T)
     logits = last_hidden_states
     # logger.info("after jnp.dot(last_hidden_states, embedding.T)")
