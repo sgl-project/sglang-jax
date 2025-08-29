@@ -481,8 +481,6 @@ class QWenLMHeadModel(nnx.Module):
     ):
         logger.info(f"input_ids: {input_ids} {input_ids.dtype}")
         positions = positions.astype(jnp.int32)
-        logger.info(f"positions: {positions} {positions.dtype}")
-        logger.info(f"forward_batch: {forward_batch}")
         hidden_states, layers_k, layers_v = self.transformer(
             input_ids, positions, forward_batch
         )
