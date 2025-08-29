@@ -492,29 +492,29 @@ class QWenLMHeadModel(nnx.Module):
             "after result = self.logits_processor(hidden_states, self.lm_head, forward_batch)"
         )
 
-        # if global_tracer.is_session_active():
-        #     logger.info("before global_tracer.accumulate_step")
-        #     input_data = {"input_ids": input_ids, "input_shape": list(input_ids.shape)}
-        #     logger.info("before output_data =}111111")
-        #     output_data = {"output_type": str(type(result).__name__)}
-        #     logger.info("before output_data =}222222")
-        #     if (
-        #         hasattr(result, "next_token_logits")
-        #         and result.next_token_logits is not None
-        #     ):
-        #         logger.info("3333333333333")
-        #         output_data.update(
-        #             {
-        #                 "logits": result.next_token_logits,
-        #                 "logits_shape": list(result.next_token_logits.shape),
-        #             }
-        #         )
-        #     logger.info("444444444444444")
-        #     global_tracer.accumulate_step(input_data, output_data)
-        #     logger.info("5555555555555555")
+        if True:
+            logger.info("before global_tracer.accumulate_step")
+            input_data = {"input_ids": input_ids, "input_shape": list(input_ids.shape)}
+            logger.info("before output_data =}111111")
+            output_data = {"output_type": str(type(result).__name__)}
+            logger.info("before output_data =}222222")
+            if (
+                hasattr(result, "next_token_logits")
+                and result.next_token_logits is not None
+            ):
+                logger.info("3333333333333")
+                output_data.update(
+                    {
+                        "logits": result.next_token_logits,
+                        "logits_shape": list(result.next_token_logits.shape),
+                    }
+                )
+            logger.info("444444444444444")
+            # global_tracer.accumulate_step(input_data, output_data)
+            logger.info("5555555555555555")
 
-        #     if global_tracer.should_auto_save():
-        #         global_tracer.end_session()
+            # if global_tracer.should_auto_save():
+            #     global_tracer.end_session()
         return result, layers_k, layers_v
 
 
