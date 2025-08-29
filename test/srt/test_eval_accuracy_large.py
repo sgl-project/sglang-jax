@@ -46,7 +46,7 @@ class TestEvalAccuracyLarge(CustomTestCase):
                 "--mem-fraction-static",
                 "0.4",
                 "--max-prefill-tokens",
-                "16384",
+                "8192",
                 "--download-dir",
                 "/tmp/",
                 "--dtype",
@@ -56,7 +56,7 @@ class TestEvalAccuracyLarge(CustomTestCase):
                 "--jax-precompile-decode-bs-paddings",
                 "64",
                 "--jax-precompile-prefill-token-paddings",
-                "16384",
+                "8192",
                 "--chunked-prefill-size",
                 "-1",
                 "--attention-backend",
@@ -81,7 +81,7 @@ class TestEvalAccuracyLarge(CustomTestCase):
             model=self.model,
             eval_name="mmlu",
             num_examples=1024,
-            num_threads=1024,
+            num_threads=64,
         )
 
         metrics = run_eval(args)
@@ -116,7 +116,7 @@ class TestEvalAccuracyLarge(CustomTestCase):
             model=self.model,
             eval_name="mgsm_en",
             num_examples=1024,
-            num_threads=1024,
+            num_threads=64,
         )
 
         metrics = run_eval(args)
