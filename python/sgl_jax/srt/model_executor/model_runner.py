@@ -114,7 +114,7 @@ class ModelRunner:
     def initialize_jit(self):
         self.graphdef, self.state = nnx.split(self.model)
 
-        @jax.jit
+        # @jax.jit
         def run_model(graphdef, state, *args):
             model = nnx.merge(graphdef, state)
             return model(*args)
