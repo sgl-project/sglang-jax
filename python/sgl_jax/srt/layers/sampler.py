@@ -123,9 +123,20 @@ def top_k_top_p_min_p_sampling_from_probs_jax(
     rng: nnx.Rngs,
 ):
     """A top-k, top-p and min-p sampling implementation with native pytorch operations."""
+    import logging
+
+    logger = logging.getLogger(__name__)
+
+    logger.info(
+        f"Input probs shape: {probs.shape}, min: {jnp.min(probs)}, max: {jnp.max(probs)}"
+    )
+    logger.info(f"top_ks: {top_ks}, top_ps: {top_ps}")
+
     probs_sort, probs_idx = _sample_part_a(
         probs, top_ks, top_ps, need_min_p_sampling, min_ps
     )
+
+    logger.info(f"After filtering - probs_sort sum: {jnp.sum(probs_sort, axis=-1)}")
 
     sampled_index = random.categorical(rng, probs_sort).reshape(-1, 1)
 
@@ -160,8 +171,24 @@ def _sample_part_a(probs, top_ks, top_ps, need_min_p_sampling: bool, min_ps):
 
 # @partial(jax.jit)
 def _sample_part_b(probs_idx, sampled_index):
+    import logging
+
+    logger = logging.getLogger(__name__)
+
     probs_idx = probs_idx.astype(jnp.int32)
-    return jnp.take_along_axis(probs_idx, axis=1, indices=sampled_index).flatten()
+
+    # Debug logging
+    logger.info(f"sampled_index shape: {sampled_index.shape}, values: {sampled_index}")
+    logger.info(
+        f"probs_idx shape: {probs_idx.shape}, min: {jnp.min(probs_idx)}, max: {jnp.max(probs_idx)}"
+    )
+
+    result = jnp.take_along_axis(probs_idx, axis=1, indices=sampled_index).flatten()
+    logger.info(
+        f"final token_ids: {result}, min: {jnp.min(result)}, max: {jnp.max(result)}"
+    )
+
+    return result
 
 
 def top_p_normalize_probs_jax(
