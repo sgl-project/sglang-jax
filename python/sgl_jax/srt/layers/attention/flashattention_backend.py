@@ -12,6 +12,7 @@ from sgl_jax.srt.layers.attention.flash_attn_kernel.flash_attention import (
 )
 from sgl_jax.srt.layers.radix_attention import RadixAttention
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sgl_jax.srt.utils import cdiv
 
 
 @register_pytree_node_class
@@ -266,3 +267,12 @@ class FlashAttention(AttentionBackend):
             )
 
         return forward_batch.token_to_kv_pool.get_kv_buffer(layer_id)
+
+    @staticmethod
+    def get_max_running_reqests(max_context_len: int, page_size: int) -> int:
+        num_page_per_req = cdiv(max_context_len, page_size)
+        res = 1024 * 1024 // 2 // num_page_per_req // 4
+        assert (
+            res > 0
+        ), f"max running requests: {res} must larger than 0, please increase page size or decrease max context length"
+        return res

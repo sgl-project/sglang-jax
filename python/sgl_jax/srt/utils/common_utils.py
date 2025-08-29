@@ -438,3 +438,8 @@ def lru_cache_frozenset(maxsize=128):
         return wrapper
 
     return decorator
+
+
+def cdiv(a, b):
+    assert b != 0, f"b is equal to 0, {b=}"
+    return (a + b - 1) // b

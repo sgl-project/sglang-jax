@@ -15,6 +15,8 @@ from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 from jax.tree_util import register_pytree_node_class
 
+from sgl_jax.srt.utils import cdiv
+
 logger = logging.getLogger(__name__)
 
 GB = 1024 * 1024 * 1024
@@ -499,11 +501,6 @@ def update_kv_cache(
         page_size=page_size,
         kv_partition_axis=kv_partition_axis,
     )
-
-
-def cdiv(a: int, b: int) -> int:
-    """Ceiling division."""
-    return -(a // -b)
 
 
 def _optimize_contiguous_updates(

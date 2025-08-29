@@ -31,3 +31,7 @@ class AttentionBackend(nnx.Module):
     ):
         """Run forward on an attention layer."""
         raise NotImplementedError()
+
+    @staticmethod
+    def get_max_running_reqests(max_context_len: int, page_size: int) -> int:
+        raise NotImplementedError()

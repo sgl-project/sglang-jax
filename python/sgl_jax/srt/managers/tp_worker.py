@@ -90,12 +90,17 @@ class ModelWorker:
         self.max_prefill_tokens = server_args.max_prefill_tokens
         self.chunked_prefill_size = server_args.chunked_prefill_size
         self.max_running_requests = min(
-            (
-                self.max_total_num_tokens // 2
-                if server_args.max_running_requests is None
-                else server_args.max_running_requests
-            ),
-            self.model_runner.req_to_token_pool.size,
+            [
+                (
+                    self.max_total_num_tokens // 2
+                    if server_args.max_running_requests is None
+                    else server_args.max_running_requests
+                ),
+                self.model_runner.req_to_token_pool.size,
+                self.model_runner.attn_backend.get_max_running_reqests(
+                    self.model_config.context_len, self.page_size
+                ),
+            ]
         )
         assert self.max_running_requests > 0, "max_running_request is zero"
         self.max_req_len = min(
