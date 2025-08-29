@@ -950,9 +950,12 @@ class Scheduler(
             ),
         )
 
-        logits_output, next_token_ids = self.tp_worker.forward_batch_generation(
-            model_worker_batch
-        )
+        # logits_output, next_token_ids = self.tp_worker.forward_batch_generation(
+        #     model_worker_batch
+        # )
+        if not forward_batch.forward_mode.is_idle():
+            logits_output = np.array([])
+            next_token_ids = np.array([])
         logger.info(f"after forward run_batch: {model_worker_batch.forward_mode.name}")
         bid = model_worker_batch.bid
         batch.output_ids = next_token_ids
