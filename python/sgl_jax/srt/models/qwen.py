@@ -334,26 +334,21 @@ class QWenModel(nnx.Module):
         global_tracer.print(input_ids, "embedding_input", "embedding_all")
         logger.info(f"input_ids: {input_ids} {input_ids.dtype}")
         hidden_states = self.embed_tokens(input_ids)
-        logger.info(f"hiddenstate shape after embedding {hidden_states.shape}")
         global_tracer.print(hidden_states, "embedding_output", "embedding_all")
 
         layers_k = []
         layers_v = []
 
         for layer in self.h:
-            logger.info(f"positions: {positions} {positions.dtype} {layer.layer_id}")
+            logger.info(f"layer {layer.layer_id}")
             hidden_states, k, v = layer(positions, hidden_states, forward_batch)
             if k is not None and v is not None:
                 layers_k.append(k)
                 layers_v.append(v)
-        logger.info(
-            f"hidden_states: {hidden_states} {hidden_states.dtype} {hidden_states.shape}"
-        )
+
         global_tracer.print(hidden_states, "RMSNorm_final_input", "rmsnorm_final")
         hidden_states = self.ln_f(hidden_states)
-        logger.info(
-            f"hidden_states: {hidden_states} {hidden_states.dtype} {hidden_states.shape}"
-        )
+
         global_tracer.print(hidden_states, "RMSNorm_final_output", "rmsnorm_final")
 
         return hidden_states, layers_k, layers_v
