@@ -259,7 +259,8 @@ class ModelWorker:
         if skip_sample:
             next_token_ids = None
         else:
-            next_token_ids = self.model_runner.sample(logits_output, model_worker_batch)
+            # next_token_ids = self.model_runner.sample(logits_output, model_worker_batch)
+            next_token_ids = None
 
         idx = model_worker_batch.extend_start_loc[: model_worker_batch.real_bs]
         if model_worker_batch.forward_mode == ForwardMode.EXTEND:
