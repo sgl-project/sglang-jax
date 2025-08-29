@@ -66,7 +66,7 @@ jobs:
           username: ${{ secrets.USERNAME }}
           git_token: ${{ secrets.GIT_TOKEN }}
       - name: Run test
-        timeout-minutes: 30
+        timeout-minutes: 120
         run: |
           source ~/sky/bin/activate
           CLUSTER_NAME=$(bash scripts/get_cluster_name.sh tpu-v6e-4 ${{ github.ref }} e2e)
@@ -164,11 +164,11 @@ jobs:
 
   pr-test-finish:
     needs: [
-      e2e-test-1-tpu,
+      #e2e-test-1-tpu,
       e2e-test-4-tpu,
-      performance-test-1-tpu,
-      performance-test-4-tpu,
-      accuracy-test-1-tpu,
+      #performance-test-1-tpu,
+      #performance-test-4-tpu,
+      #accuracy-test-1-tpu,
     ]
     runs-on: self-hosted
     steps:

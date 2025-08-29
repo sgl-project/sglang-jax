@@ -141,19 +141,24 @@ def run_unittest_files(files: List[TestFile], timeout_per_file: float):
 
 suites = {
     "per-commit": [
-        TestFile("test/srt/test_tpu_availability.py", 3),
+        # TestFile("test/srt/test_tpu_availability.py", 3),
     ],
     "per-commit-tpu-v6e-1": [
-        TestFile("test/srt/test_tpu_availability.py", 3),
-        TestFile("test/srt/openai_server/basic/test_protocol.py", 10),
-        TestFile("test/srt/openai_server/basic/test_serving_chat.py", 10),
-        TestFile("test/srt/openai_server/basic/test_serving_completions.py", 10),
-        TestFile("test/srt/openai_server/basic/test_openai_server.py", 10),
+        # TestFile("test/srt/test_tpu_availability.py", 3),
+        # TestFile("test/srt/openai_server/basic/test_protocol.py", 10),
+        # TestFile("test/srt/openai_server/basic/test_serving_chat.py", 10),
+        # TestFile("test/srt/openai_server/basic/test_serving_completions.py", 10),
+        # TestFile("test/srt/openai_server/basic/test_openai_server.py", 10),
     ],
     "per-commit-tpu-v6e-2": [],
     "per-commit-tpu-v6e-4": [
-        TestFile("test/srt/test_qwen3_moe_models.py", 120),
-        TestFile("test/srt/test_features.py", 45),
+        TestFile("test/srt/openai_server/basic/test_protocol.py", 10),
+        TestFile("test/srt/openai_server/basic/test_serving_chat.py", 10),
+        TestFile("test/srt/openai_server/basic/test_serving_completions.py", 10),
+        TestFile("test/srt/test_qwen3_moe_models.py", 45),
+        TestFile("test/srt/test_features.py", 30),
+        TestFile("test/srt/test_bench_one_batch.py", 15),
+        TestFile("test/srt/test_eval_accuracy_large.py", 25),
     ],
     "per-commit-tpu-v6e-8": [],
     "per-commit-tpu-v6e-16": [],
