@@ -48,7 +48,7 @@ class TestEvalAccuracyLarge(CustomTestCase):
                 "--max-prefill-tokens",
                 "8192",
                 "--download-dir",
-                "/tmp/",
+                "/dev/shm/",
                 "--dtype",
                 "bfloat16",
                 "--attention-backend",
