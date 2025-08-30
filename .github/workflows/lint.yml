@@ -4,7 +4,7 @@ on: [ pull_request ]
 
 jobs:
   lint:
-    runs-on: self-hosted
+    runs-on: cpu-runner
     steps:
       - uses: actions/checkout@v4
 
