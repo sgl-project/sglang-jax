@@ -128,9 +128,6 @@ class LogitsMetadata:
     top_p_normalized_logprobs: bool = False
     top_p: jax.Array = None
 
-    # for padding
-    real_bs: int = -1
-
     def tree_flatten(self):
         children = (
             self.extend_seq_lens,
@@ -152,7 +149,7 @@ class LogitsMetadata:
             "token_ids_logprobs": self.token_ids_logprobs,
             "temp_scaled_logprobs": self.temp_scaled_logprobs,
             "top_p_normalized_logprobs": self.top_p_normalized_logprobs,
-            "real_bs": self.real_bs,
+            # "real_bs": self.real_bs,
         }
 
         return (children, aux_data)
@@ -178,7 +175,6 @@ class LogitsMetadata:
         obj.token_ids_logprobs = aux_data["token_ids_logprobs"]
         obj.temp_scaled_logprobs = aux_data["temp_scaled_logprobs"]
         obj.top_p_normalized_logprobs = aux_data["top_p_normalized_logprobs"]
-        obj.real_bs = aux_data["real_bs"]
 
         return obj
 
@@ -222,7 +218,6 @@ class LogitsMetadata:
                 mesh if mesh is not None else jax.sharding.get_abstract_mesh(),
                 batch.extend_input_logprob_token_ids,
             ),
-            real_bs=batch.real_bs,
         )
 
 
@@ -278,12 +273,11 @@ class LogitsProcessor(nnx.Module):
             input_logprob_indices_pt = 0
             input_logprob_indices = []
             pt, pruned_states = 0, []
-            real_req_count = 0
             for extend_logprob_start_len, extend_len in zip(
                 logits_metadata.extend_logprob_start_lens_cpu,
                 logits_metadata.extend_seq_lens_cpu,
             ):
-                if real_req_count >= logits_metadata.real_bs:
+                if extend_len == 0:
                     break
 
                 # It can happen in chunked prefill. We still need to sample 1 token,
@@ -307,8 +301,6 @@ class LogitsProcessor(nnx.Module):
                     ]
                 )
                 input_logprob_indices_pt += extend_len - start_len
-
-                real_req_count += 1
 
             pruned_states = jnp.concat(pruned_states)
             sample_indices = device_array(
