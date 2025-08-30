@@ -26,28 +26,20 @@ concurrency:
 
 jobs:
 
-  # e2e-test-1-tpu:
-  #   if: github.event.pull_request.draft == false
-  #   runs-on: self-hosted
-  #   strategy:
-  #     fail-fast: false
-  #   steps:
-  #     - name: Checkout code
-  #       uses: actions/checkout@v4
-  #     - name: Setup environment
-  #       uses: ./.github/actions/setup_environment
-  #       with:
-  #         accelerator: tpu-v6e-1
-  #         test_type: e2e
-  #         skypilot_endpoint: ${{ secrets.SKYPILOT_ENDPOINT }}
-  #         username: ${{ secrets.USERNAME }}
-  #         git_token: ${{ secrets.GIT_TOKEN }}
-  #     - name: Run test
-  #       timeout-minutes: 30
-  #       run: |
-  #         source ~/sky/bin/activate
-  #         CLUSTER_NAME=$(bash scripts/get_cluster_name.sh tpu-v6e-1 ${{ github.ref }} e2e)
-  #         sky exec "$CLUSTER_NAME" -- 'set -e; cd sglang-jax; uv run python test/srt/run_suite.py --suite per-commit-tpu-v6e-1'
+  e2e-test-1-tpu:
+    if: github.event.pull_request.draft == false
+    runs-on: tpuv6e-1
+    strategy:
+      fail-fast: false
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - name: Run test
+        timeout-minutes: 120
+        run: |
+          uv venv && uv pip install -e python/
+          bash scripts/killall_sglang.sh
+          uv run python test/srt/run_suite.py --suite per-commit-tpu-v6e-1
 
   e2e-test-4-tpu:
     if: github.event.pull_request.draft == false
@@ -156,6 +148,7 @@ jobs:
 
   pr-test-finish:
     needs: [
+      e2e-test-1-tpu,
       e2e-test-4-tpu,
     ]
     runs-on: self-hosted
