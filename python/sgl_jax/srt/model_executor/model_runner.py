@@ -268,7 +268,7 @@ class ModelRunner:
                 size=max_num_reqs + 1,
                 max_context_len=self.model_config.context_len + 4,
                 mesh=self.mesh,
-                dtype=jnp.int32,
+                dtype=np.int32,
             )
 
         self.model_config.log_kv_heads_padding_info(self.tp_size)
@@ -380,7 +380,6 @@ class ModelRunner:
     ) -> Tuple[LogitsProcessorOutput, int]:
         fm = self.get_initialized_forward_metadata_fn(forward_batch)
         self.attn_backend.forward_metadata = fm
-        # self.attn_backend.init_forward_metadata(forward_batch)
         return self._forward(
             forward_batch.input_ids,
             forward_batch.positions,
@@ -395,7 +394,6 @@ class ModelRunner:
         skip_attn_backend_init: bool = False,
     ) -> Tuple[LogitsProcessorOutput, int]:
         if not skip_attn_backend_init:
-            # self.attn_backend.init_forward_metadata(forward_batch)
             fm = self.get_initialized_forward_metadata_fn(forward_batch)
             self.attn_backend.forward_metadata = fm
         return self._forward(
@@ -516,7 +514,7 @@ class MockModelRunner(ModelRunner):
             size=max_num_reqs + 1,
             max_context_len=self.model_config.context_len + 4,
             mesh=mesh,
-            dtype=jnp.int32,
+            dtype=np.int32,
         )
 
         self.model_config.log_kv_heads_padding_info(self.tp_size)

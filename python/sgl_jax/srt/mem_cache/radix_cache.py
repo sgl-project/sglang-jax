@@ -252,13 +252,13 @@ class RadixCache(BasePrefixCache):
         new_indices = new_match_result.device_indices  # cpu
         new_last_node = new_match_result.last_device_node
 
-        new_indices_device = device_array(
-            self.req_to_token_pool.mesh, np.asarray(new_indices)
-        )
+        # new_indices_device = device_array(
+        #     self.req_to_token_pool.mesh, np.asarray(new_indices)
+        # )
 
         self.req_to_token_pool.write(
             (req.req_pool_idx, slice(len(req.prefix_indices), len(new_indices))),
-            new_indices_device[len(req.prefix_indices) :],
+            new_indices[len(req.prefix_indices) :],
         )
 
         self.dec_lock_ref(req.last_node)

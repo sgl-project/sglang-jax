@@ -29,7 +29,7 @@ class ReqToTokenPool:
         size: int,
         max_context_len: int,
         mesh: Mesh,
-        dtype: jnp.dtype = jnp.int32,
+        dtype: np.dtype = np.int32,
         token_partition_axis: str = "data",
     ):
         self.size = size
@@ -38,11 +38,11 @@ class ReqToTokenPool:
         self.dtype = dtype
 
         # Create sharded request to token mapping table
-        self.req_to_token = jnp.zeros((size, max_context_len), dtype=dtype)
+        self.req_to_token = np.zeros((size, max_context_len), dtype=dtype)
 
         # Use data sharding strategy
-        self.token_sharding = NamedSharding(mesh, P(None, None))
-        self.req_to_token = jax.device_put(self.req_to_token, self.token_sharding)
+        # self.token_sharding = NamedSharding(mesh, P(None, None))
+        # self.req_to_token = jax.device_put(self.req_to_token, self.token_sharding)
 
         # Use simple list to manage free slots (non-JAX array)
         self.free_slots = list(range(size))
@@ -79,11 +79,13 @@ class ReqToTokenPool:
         if isinstance(indices, tuple) and len(indices) == 2:
             # Handle (req_idx, slice) case
             req_idx, slice_obj = indices
-            self.req_to_token = self.req_to_token.at[req_idx, slice_obj].set(values)
+            # self.req_to_token = self.req_to_token.at[req_idx, slice_obj].set(values)
+            self.req_to_token[req_idx, slice_obj] = values
         else:
             # Handle direct indexing case
             print(f"{indices=} {values=}")
-            self.req_to_token = self.req_to_token.at[indices].set(values)
+            # self.req_to_token = self.req_to_token.at[indices].set(values)
+            self.req_to_token[indices] = values
 
     def read(self, req_idx: int, length: int) -> jnp.ndarray:
         """Read token indices from specified request slot"""

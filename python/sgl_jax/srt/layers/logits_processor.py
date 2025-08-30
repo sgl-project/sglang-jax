@@ -178,6 +178,57 @@ class LogitsMetadata:
 
         return obj
 
+    def tree_flatten(self):
+        children = (
+            self.extend_seq_lens,
+            self.extend_input_logprob_token_ids_device,
+            self.temperature,
+            self.top_p,
+        )
+
+        aux_data = {
+            "forward_mode": self.forward_mode,
+            "capture_hidden_mode": self.capture_hidden_mode,
+            "extend_return_logprob": self.extend_return_logprob,
+            "extend_return_top_logprob": self.extend_return_top_logprob,
+            "extend_token_ids_logprob": self.extend_token_ids_logprob,
+            "extend_seq_lens_cpu": self.extend_seq_lens_cpu,
+            "extend_logprob_start_lens_cpu": self.extend_logprob_start_lens_cpu,
+            "extend_logprob_pruned_lens_cpu": self.extend_logprob_pruned_lens_cpu,
+            "top_logprobs_nums": self.top_logprobs_nums,
+            "token_ids_logprobs": self.token_ids_logprobs,
+            "temp_scaled_logprobs": self.temp_scaled_logprobs,
+            "top_p_normalized_logprobs": self.top_p_normalized_logprobs,
+            "real_bs": self.real_bs,
+        }
+
+        return (children, aux_data)
+
+    @classmethod
+    def tree_unflatten(cls, aux_data, children):
+        obj = cls.__new__(cls)
+
+        obj.extend_seq_lens = children[0]
+        obj.extend_input_logprob_token_ids_device = children[1]
+        obj.temperature = children[2]
+        obj.top_p = children[3]
+
+        obj.forward_mode = aux_data["forward_mode"]
+        obj.capture_hidden_mode = aux_data["capture_hidden_mode"]
+        obj.extend_return_logprob = aux_data["extend_return_logprob"]
+        obj.extend_return_top_logprob = aux_data["extend_return_top_logprob"]
+        obj.extend_token_ids_logprob = aux_data["extend_token_ids_logprob"]
+        obj.extend_seq_lens_cpu = aux_data["extend_seq_lens_cpu"]
+        obj.extend_logprob_start_lens_cpu = aux_data["extend_logprob_start_lens_cpu"]
+        obj.extend_logprob_pruned_lens_cpu = aux_data["extend_logprob_pruned_lens_cpu"]
+        obj.top_logprobs_nums = aux_data["top_logprobs_nums"]
+        obj.token_ids_logprobs = aux_data["token_ids_logprobs"]
+        obj.temp_scaled_logprobs = aux_data["temp_scaled_logprobs"]
+        obj.top_p_normalized_logprobs = aux_data["top_p_normalized_logprobs"]
+        obj.real_bs = aux_data["real_bs"]
+
+        return obj
+
     @classmethod
     def from_model_worker_batch(cls, batch: ModelWorkerBatch, mesh: Mesh = None):
         if batch.forward_mode.is_extend() and batch.return_logprob:
