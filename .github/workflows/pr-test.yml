@@ -60,8 +60,8 @@ jobs:
       - name: Run test
         timeout-minutes: 120
         run: |
-          bash scripts/killall_sglang.sh
           uv venv && uv pip install -e python/
+          bash scripts/killall_sglang.sh
           uv run python test/srt/run_suite.py --suite per-commit-tpu-v6e-4
 
   # performance-test-1-tpu:
