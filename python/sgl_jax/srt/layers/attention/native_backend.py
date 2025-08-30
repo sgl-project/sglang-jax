@@ -40,7 +40,7 @@ class NativeAttention(AttentionBackend):
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init the metadata for a forward pass."""
-        pass
+        return None
 
     def __call__(
         self,

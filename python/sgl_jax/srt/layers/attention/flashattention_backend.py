@@ -125,7 +125,9 @@ class FlashAttention(AttentionBackend):
             1,
         )
 
-        self.forward_metadata = metadata
+        return metadata
+
+        # self.forward_metadata = metadata
 
     def tree_flatten(self):
         children = (self.forward_metadata,)
