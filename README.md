@@ -2,7 +2,9 @@
 
 SGL-JAX is a high-performance, JAX-based inference engine for Large Language Models (LLMs), specifically optimized for Google TPUs. It is engineered from the ground up to deliver exceptional throughput and low latency for the most demanding LLM serving workloads.
 
-The engine integrates state-of-the-art techniques to maximize hardware utilization and serving efficiency, making it an ideal solution for deploying large-scale models in production with TPU.
+The engine incorporates state-of-the-art techniques to maximize hardware utilization and serving efficiency, making it ideal for deploying large-scale models in production on TPUs.
+
+[![Pypi](https://img.shields.io/badge/pypi-sglang--jax-orange.svg)](https://pypi.org/project/sglang-jax) [![License](https://img.shields.io/badge/license-Apache--2.0-green.svg)](https://github.com/sgl-project/sglang-jax?tab=Apache-2.0-1-ov-file#readme)
 
 ## Key Features
 
@@ -23,84 +25,18 @@ SGL-JAX operates on a distributed architecture designed for scalability and perf
 4.  **Model Runner**: Manages the actual JAX-based model execution, including the forward pass, attention computation, and KV cache operations.
 5.  **Radix Cache**: A global, memory-efficient KV cache that is shared across all requests, enabling prefix reuse and reducing the memory footprint.
 
-## Quick Start
+---
 
-Follow these steps to get a model server up and running.
+## Getting Started
 
-### 1. Installation
-
-First, clone the repository and install the necessary dependencies. It is recommended to do this in a virtual environment.
-
-```bash
-git clone https://github.com/your-org/sgl-jax.git
-cd sgl-jax/python
-pip install -e .
-```
-
-### 2. Launch the Server
-
-You can launch the OpenAI-compatible API server using the `sgl_jax.launch_server` module.
-
-```bash
-# Example: Launching a server for Qwen1.5-7B-Chat
-python -m sgl_jax.launch_server \
-    --model-path Qwen/Qwen1.5-7B-Chat \
-    --tp-size 4 \
-    --port 8000 \
-    --host 0.0.0.0
-```
-
-**Key Arguments**:
-*   `--model-path`: The path to the model on the Hugging Face Hub or a local directory.
-*   `--tp-size`: The number of TPU devices to use for tensor parallelism.
-*   `--port`: The port for the API server.
-*   `--host`: The host address to bind the server to.
-
-### 3. Send a Request
-
-Once the server is running, you can interact with it using any OpenAI-compatible client, such as `curl` or the `openai` Python library.
-
-#### Using `curl`:
-
-```bash
-curl http://localhost:8000/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "Qwen/Qwen1.5-7B-Chat",
-    "messages": [
-      {"role": "system", "content": "You are a helpful assistant."},
-      {"role": "user", "content": "Hello, what is JAX?"}
-    ],
-    "max_tokens": 100,
-    "temperature": 0.7
-  }'
-```
-
-#### Using the `openai` Python client:
-
-```python
-import openai
-
-# Point the client to the local server
-client = openai.OpenAI(
-    api_key="your-api-key",  # Can be any string
-    base_url="http://localhost:8000/v1"
-)
-
-response = client.chat.completions.create(
-  model="Qwen/Qwen1.5-7B-Chat",
-  messages=[
-    {"role": "system", "content": "You are a helpful assistant."},
-    {"role": "user", "content": "Hello, what is JAX?"}
-  ]
-)
-
-print(response.choices[0].message.content)
-```
+- [Install SGL-JAX](https://github.com/sgl-project/sglang-jax/blob/main/docs/get_started/install.md)
+- [Quick Start](https://github.com/sgl-project/sglang-jax/blob/main/docs/basic_usage/qwen.md)
+- [Benchmark and Profiling](https://github.com/sgl-project/sglang-jax/blob/main/docs/developer_guide/benchmark_and_profiling.md)
+- [Contribution Guide](https://github.com/sgl-project/sglang-jax/blob/main/docs/developer_guide/contribution_guide.md)
 
 ## Documentation
 
-For more features and usage details, please read the documents in the [`docs`](./docs/) directory.
+For more features and usage details, please read the documents in the [`docs`](https://github.com/sgl-project/sglang-jax/tree/main/docs) directory.
 
 ## Supported Models
 
@@ -112,7 +48,7 @@ SGL-JAX is designed for easy extension to new model architectures. It currently 
 
 ## Performance and Benchmarking
 
-Performance is a core focus of SGL-JAX. The engine is continuously benchmarked to ensure high throughput and low latency. For detailed performance evaluation and to run the benchmarks yourself, please see the scripts located in the `benchmark/` and `python/sgl_jax/` directories (e.g., `bench_serving.py`).
+For detailed performance evaluation and to run the benchmarks yourself, please see the scripts located in the `benchmark/` and `python/sgl_jax/` directories (e.g., `bench_serving.py`).
 
 ## Testing
 
