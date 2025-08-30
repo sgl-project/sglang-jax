@@ -234,6 +234,15 @@ class ModelWorker:
 
         return padded_batch_size, padded_max_num_tokens
 
+    def get_precompile_paddings(self):
+        return (
+            self.prefill_padded_batch_size,
+            self.precompile_prefill_token_paddings,
+            self.precompile_decode_bs_paddings,
+            self.precompile_prefill_cache_loc_paddings,
+            self.precompile_decode_cache_loc_paddings,
+        )
+
     def generate_model_worker_batch(
         self,
         bs: int,
@@ -272,7 +281,7 @@ class ModelWorker:
             ),
             extend_input_logprob_token_ids=None,
             positions=np.concat([valid_positions, invalid_positions], axis=0),
-            extend_start_loc=np.arange(bs, dtype=jnp.int64),
+            extend_start_loc=np.arange(bs, dtype=np.int64),
             cache_loc=np.concat([valid_cache_loc, invalid_cache_loc], axis=0),
             extend_prefix_lens=(
                 np.array([0] * bs) if mode == ForwardMode.EXTEND else None
@@ -316,9 +325,6 @@ class ModelWorker:
             self.model_runner.token_to_kv_pool.size,
         )
 
-    def get_tp_group(self):
-        return self.model_runner.tp_group
-
     def get_pad_input_ids_func(self):
         return getattr(self.model_runner.model, "pad_input_ids", None)
 
@@ -343,12 +349,11 @@ class ModelWorker:
             ),
         )
 
+        idx = model_worker_batch.extend_start_loc[: model_worker_batch.real_bs]
+        logits_output.truncate_logits_processor_output(idx)
+
         if launch_done is not None:
             launch_done.set()
-
-        idx = model_worker_batch.extend_start_loc[: model_worker_batch.real_bs]
-
-        logits_output.truncate_logits_processor_output(idx)
 
         if skip_sample:
             next_token_ids_device = None

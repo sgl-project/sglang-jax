@@ -137,6 +137,8 @@ class GenerateReqInput:
     rid: Optional[Union[List[str], str]] = None
     text: Optional[Union[List[str], str]] = None
     input_ids: List[int] = None
+    # The embeddings for input_ids; one can specify either text or input_ids or input_embeds.
+    input_embeds: Optional[Union[List[List[List[float]]], List[List[float]]]] = None
     sampling_params: Optional[Any] = (
         None  # Using Any for now to avoid SamplingParams serialization issues
     )

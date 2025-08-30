@@ -110,6 +110,7 @@ class ServerArgs:
     disable_radix_cache: bool = False
     allow_auto_truncate: bool = False
     enable_tokenizer_batch_encode: bool = False
+    disable_overlap_schedule: bool = False
 
     # Jax distribution info
     jax_proc_id: int = None
@@ -390,6 +391,11 @@ class ServerArgs:
             type=int,
             default=ServerArgs.max_prefill_tokens,
             help="The maximum number of tokens in a prefill batch. The real bound will be the maximum of this value and the model's maximum context length.",
+        )
+        parser.add_argument(
+            "--disable-overlap-schedule",
+            action="store_true",
+            help="Disable the overlap scheduler, which overlaps the CPU scheduler with GPU model worker.",
         )
         parser.add_argument(
             "--schedule-policy",

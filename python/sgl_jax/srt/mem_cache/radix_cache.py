@@ -454,34 +454,18 @@ class RadixCache(BasePrefixCache):
         new_node.parent = child.parent
         new_node.lock_ref = child.lock_ref
         new_node.key = child.key[:split_len]
-
-        if isinstance(child.value, jnp.ndarray) and child.value.ndim >= 2:
-            new_node.value = (
-                child.value[:, :split_len, :, :]
-                if child.value.ndim == 4
-                else child.value[:split_len]
-            )
-            child.value = (
-                child.value[:, split_len:, :, :]
-                if child.value.ndim == 4
-                else child.value[split_len:]
-            )
-        else:
-            # Handle non-ndarray values (lists, None, etc.)
-            if child.value is not None and len(child.value) > 0:
-                new_node.value = child.value[:split_len]
-                child.value = child.value[split_len:]
-            else:
-                new_node.value = []
-                child.value = []
-
+        new_node.value = child.value[:split_len]
         child.parent = new_node
         child.key = child.key[split_len:]
+        child.value = child.value[split_len:]
         new_node.parent.children[self.get_child_key_fn(key)] = new_node
 
         return new_node
 
     def _insert_helper(self, node: TreeNode, key: List, value):
+        if isinstance(value, jnp.ndarray):
+            assert value.ndim == 1, "value must be a 1D array"
+
         node.last_access_time = time.monotonic()
         if len(key) == 0:
             return 0
@@ -495,19 +479,7 @@ class RadixCache(BasePrefixCache):
             prefix_len = self.key_match_fn(node.key, key)
             total_prefix_length += prefix_len
             key = key[prefix_len:]
-
-            if isinstance(value, jnp.ndarray) and value.ndim >= 2:
-                value = (
-                    value[:, prefix_len:, :, :]
-                    if value.ndim == 4
-                    else value[prefix_len:]
-                )
-            else:
-                # Handle non-ndarray values (lists, None, etc.)
-                if value is not None and len(value) > 0:
-                    value = value[prefix_len:]
-                else:
-                    value = []
+            value = value[prefix_len:]
 
             if prefix_len < len(node.key):
                 new_node = self._split_node(node.key, node, prefix_len)

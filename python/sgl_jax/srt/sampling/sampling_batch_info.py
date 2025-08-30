@@ -12,6 +12,8 @@ from sgl_jax.srt.utils.jax_utils import device_array
 if TYPE_CHECKING:
     from sgl_jax.srt.managers.schedule_batch import ScheduleBatch
 
+import threading
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -45,6 +47,9 @@ class SamplingBatchInfo:
     # Whether any request needs min_p sampling
     need_min_p_sampling: bool = False
 
+    # An event used for overlap schedule
+    sampling_info_done: Optional[threading.Event] = None
+
     def tree_flatten(self):
         children = (
             self.temperatures,
@@ -58,6 +63,7 @@ class SamplingBatchInfo:
             "need_top_p_sampling": self.need_top_p_sampling,
             "need_top_k_sampling": self.need_top_k_sampling,
             "need_min_p_sampling": self.need_min_p_sampling,
+            "sampling_info_done": self.sampling_info_done,
         }
         return (children, aux_data)
 
@@ -74,6 +80,7 @@ class SamplingBatchInfo:
         obj.need_top_p_sampling = aux_data["need_top_p_sampling"]
         obj.need_top_k_sampling = aux_data["need_top_k_sampling"]
         obj.need_min_p_sampling = aux_data["need_min_p_sampling"]
+        obj.sampling_info_done = aux_data["sampling_info_done"]
 
         return obj
 
@@ -101,6 +108,7 @@ class SamplingBatchInfo:
             need_top_p_sampling=False,
             need_top_k_sampling=True,
             need_min_p_sampling=False,
+            sampling_info_done=None,
         )
         return ret
 
