@@ -113,15 +113,21 @@ class ModelRunner:
     def initialize_jit(self):
         self.graphdef, self.state = nnx.split(self.model)
 
+        @partial(jax.jit)
+        def get_initialized_forward_metadata(forward_batch):
+            return self.attn_backend.init_forward_metadata(forward_batch=forward_batch)
+
         @partial(jax.jit, donate_argnames=["forward_batch"])
         def run_model(graphdef, state, input_ids, positions, forward_batch):
             model = nnx.merge(graphdef, state)
             return model(input_ids, positions, forward_batch)
 
+        @partial(jax.jit)
         def compute_logits(graphdef, state, *args):
             model = nnx.merge(graphdef, state)
             return model.compute_logits(*args)
 
+        self.get_initialized_forward_metadata_fn = get_initialized_forward_metadata
         self.model_fn = partial(run_model, self.graphdef)
         self.compute_logits = partial(compute_logits, self.graphdef)
 
@@ -372,7 +378,9 @@ class ModelRunner:
     def forward_decode(
         self, forward_batch: ForwardBatch, logits_metadata: LogitsMetadata
     ) -> Tuple[LogitsProcessorOutput, int]:
-        self.attn_backend.init_forward_metadata(forward_batch)
+        fm = self.get_initialized_forward_metadata_fn(forward_batch)
+        self.attn_backend.forward_metadata = fm
+        # self.attn_backend.init_forward_metadata(forward_batch)
         return self._forward(
             forward_batch.input_ids,
             forward_batch.positions,
@@ -387,7 +395,9 @@ class ModelRunner:
         skip_attn_backend_init: bool = False,
     ) -> Tuple[LogitsProcessorOutput, int]:
         if not skip_attn_backend_init:
-            self.attn_backend.init_forward_metadata(forward_batch)
+            # self.attn_backend.init_forward_metadata(forward_batch)
+            fm = self.get_initialized_forward_metadata_fn(forward_batch)
+            self.attn_backend.forward_metadata = fm
         return self._forward(
             forward_batch.input_ids,
             forward_batch.positions,

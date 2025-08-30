@@ -105,6 +105,7 @@ class LogitsProcessorOutput:
             self.hidden_states = self.hidden_states[idx]
 
 
+@register_pytree_node_class
 @dataclasses.dataclass
 class LogitsMetadata:
     forward_mode: ForwardMode
@@ -127,8 +128,55 @@ class LogitsMetadata:
     top_p_normalized_logprobs: bool = False
     top_p: jax.Array = None
 
-    # for padding
-    real_bs: int = -1
+    def tree_flatten(self):
+        children = (
+            self.extend_seq_lens,
+            self.extend_input_logprob_token_ids_device,
+            self.temperature,
+            self.top_p,
+        )
+
+        aux_data = {
+            "forward_mode": self.forward_mode,
+            "capture_hidden_mode": self.capture_hidden_mode,
+            "extend_return_logprob": self.extend_return_logprob,
+            "extend_return_top_logprob": self.extend_return_top_logprob,
+            "extend_token_ids_logprob": self.extend_token_ids_logprob,
+            "extend_seq_lens_cpu": self.extend_seq_lens_cpu,
+            "extend_logprob_start_lens_cpu": self.extend_logprob_start_lens_cpu,
+            "extend_logprob_pruned_lens_cpu": self.extend_logprob_pruned_lens_cpu,
+            "top_logprobs_nums": self.top_logprobs_nums,
+            "token_ids_logprobs": self.token_ids_logprobs,
+            "temp_scaled_logprobs": self.temp_scaled_logprobs,
+            "top_p_normalized_logprobs": self.top_p_normalized_logprobs,
+            # "real_bs": self.real_bs,
+        }
+
+        return (children, aux_data)
+
+    @classmethod
+    def tree_unflatten(cls, aux_data, children):
+        obj = cls.__new__(cls)
+
+        obj.extend_seq_lens = children[0]
+        obj.extend_input_logprob_token_ids_device = children[1]
+        obj.temperature = children[2]
+        obj.top_p = children[3]
+
+        obj.forward_mode = aux_data["forward_mode"]
+        obj.capture_hidden_mode = aux_data["capture_hidden_mode"]
+        obj.extend_return_logprob = aux_data["extend_return_logprob"]
+        obj.extend_return_top_logprob = aux_data["extend_return_top_logprob"]
+        obj.extend_token_ids_logprob = aux_data["extend_token_ids_logprob"]
+        obj.extend_seq_lens_cpu = aux_data["extend_seq_lens_cpu"]
+        obj.extend_logprob_start_lens_cpu = aux_data["extend_logprob_start_lens_cpu"]
+        obj.extend_logprob_pruned_lens_cpu = aux_data["extend_logprob_pruned_lens_cpu"]
+        obj.top_logprobs_nums = aux_data["top_logprobs_nums"]
+        obj.token_ids_logprobs = aux_data["token_ids_logprobs"]
+        obj.temp_scaled_logprobs = aux_data["temp_scaled_logprobs"]
+        obj.top_p_normalized_logprobs = aux_data["top_p_normalized_logprobs"]
+
+        return obj
 
     @classmethod
     def from_model_worker_batch(cls, batch: ModelWorkerBatch, mesh: Mesh = None):
@@ -170,7 +218,6 @@ class LogitsMetadata:
                 mesh if mesh is not None else jax.sharding.get_abstract_mesh(),
                 batch.extend_input_logprob_token_ids,
             ),
-            real_bs=batch.real_bs,
         )
 
 
@@ -226,12 +273,11 @@ class LogitsProcessor(nnx.Module):
             input_logprob_indices_pt = 0
             input_logprob_indices = []
             pt, pruned_states = 0, []
-            real_req_count = 0
             for extend_logprob_start_len, extend_len in zip(
                 logits_metadata.extend_logprob_start_lens_cpu,
                 logits_metadata.extend_seq_lens_cpu,
             ):
-                if real_req_count >= logits_metadata.real_bs:
+                if extend_len == 0:
                     break
 
                 # It can happen in chunked prefill. We still need to sample 1 token,
@@ -255,8 +301,6 @@ class LogitsProcessor(nnx.Module):
                     ]
                 )
                 input_logprob_indices_pt += extend_len - start_len
-
-                real_req_count += 1
 
             pruned_states = jnp.concat(pruned_states)
             sample_indices = device_array(
