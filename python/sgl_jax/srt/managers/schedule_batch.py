@@ -650,13 +650,13 @@ class ScheduleBatch:
             req.req_pool_idx = req_pool_indices[i]
             assert seq_len - pre_len == req.extend_input_len
             # note: req.prefix_indices is located on CPU, so we have to extract values then device_put
-            prefix_indices_device = jnp.array(np.asarray(req.prefix_indices))
+            # prefix_indices_device = jnp.array(np.asarray(req.prefix_indices))
             # prefix_indices = req.prefix_indices
             if pre_len > 0:
                 # note: prefix_indices has to locate on device, or will meet Received incompatible devices for jitted computation
                 self.req_to_token_pool.write(
                     (req.req_pool_idx, slice(0, pre_len)),
-                    prefix_indices_device,  # prefix_indices
+                    req.prefix_indices,  # prefix_indices_device
                 )
 
             req.cached_tokens += pre_len - req.already_computed
@@ -756,7 +756,7 @@ class ScheduleBatch:
         for i in range(bs):
             self.req_to_token_pool.write(
                 (req_pool_indices[i], slice(prefix_lens[i], seq_lens[i])),
-                out_cache_loc[pt : pt + extend_lens[i]],
+                self.out_cache_loc[pt : pt + extend_lens[i]],
             )
             pt += extend_lens[i]
 
@@ -915,7 +915,7 @@ class ScheduleBatch:
             out_cache_loc
         )  # todo: aolemila, remove jax.device_get
         self.req_to_token_pool.write(
-            (self.req_pool_indices, locs), out_cache_loc.astype(np.int32)
+            (self.req_pool_indices, locs), self.out_cache_loc.astype(np.int32)
         )
 
     def filter_batch(

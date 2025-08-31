@@ -268,7 +268,7 @@ class ModelRunner:
                 size=max_num_reqs + 1,
                 max_context_len=self.model_config.context_len + 4,
                 mesh=self.mesh,
-                dtype=jnp.int32,
+                dtype=np.int32,
             )
 
         self.model_config.log_kv_heads_padding_info(self.tp_size)
@@ -516,7 +516,7 @@ class MockModelRunner(ModelRunner):
             size=max_num_reqs + 1,
             max_context_len=self.model_config.context_len + 4,
             mesh=mesh,
-            dtype=jnp.int32,
+            dtype=np.int32,
         )
 
         self.model_config.log_kv_heads_padding_info(self.tp_size)

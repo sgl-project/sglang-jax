@@ -256,9 +256,12 @@ class RadixCache(BasePrefixCache):
             self.req_to_token_pool.mesh, np.asarray(new_indices)
         )
 
+        new_indices_cpu = jax.device_get(new_indices)
+
         self.req_to_token_pool.write(
             (req.req_pool_idx, slice(len(req.prefix_indices), len(new_indices))),
-            new_indices_device[len(req.prefix_indices) :],
+            # new_indices_device[len(req.prefix_indices) :],
+            new_indices_cpu[len(req.prefix_indices) :],
         )
 
         self.dec_lock_ref(req.last_node)
