@@ -452,18 +452,46 @@ class LogitsProcessor(nnx.Module):
         last position (e.g., extend without input logprobs). The caller should
         guarantee the given hidden_states follow this constraint.
         """
+        import logging
+
+        logger = logging.getLogger(__name__)
+
+        logger.info(
+            f"_get_logits input - hidden_states shape: {hidden_states.shape}, dtype: {hidden_states.dtype}"
+        )
+        logger.info(
+            f"_get_logits input - hidden_states min: {jnp.min(hidden_states)}, max: {jnp.max(hidden_states)}"
+        )
+
         hidden_states, embedding = lm_head.promote_dtype(
             (hidden_states, lm_head.embedding.value),
             dtype=lm_head.dtype,
         )
 
+        logger.info(
+            f"After promote_dtype - hidden_states shape: {hidden_states.shape}, dtype: {hidden_states.dtype}"
+        )
+        logger.info(
+            f"After promote_dtype - embedding shape: {embedding.shape}, dtype: {embedding.dtype}"
+        )
+
         logits = jnp.dot(hidden_states, embedding.T)
+
+        logger.info(f"Raw logits shape: {logits.shape}, dtype: {logits.dtype}")
+        logger.info(f"Raw logits min: {jnp.min(logits)}, max: {jnp.max(logits)}")
+        logger.info(f"Raw logits contains NaN: {jnp.any(jnp.isnan(logits))}")
+        logger.info(f"Raw logits contains inf: {jnp.any(jnp.isinf(logits))}")
 
         logits = (
             logits[:, : self.vocab_size]
             if logits.ndim > 1
             else logits[: self.vocab_size]
         )
+
+        logger.info(
+            f"Final logits shape: {logits.shape}, vocab_size: {self.vocab_size}"
+        )
+        logger.info(f"Final logits min: {jnp.min(logits)}, max: {jnp.max(logits)}")
 
         return logits
 
