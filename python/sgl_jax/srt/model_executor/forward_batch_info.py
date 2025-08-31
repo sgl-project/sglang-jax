@@ -19,7 +19,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import IntEnum, auto
 from functools import total_ordering
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, List, Optional
 
 import jax
 import jax.numpy as jnp
@@ -157,6 +157,9 @@ class ForwardBatch:
     extend_prefix_lens: Optional[jax.Array] = None
     extend_seq_lens: Optional[jax.Array] = None
 
+    trace_request_ids: Optional[List[str]] = None
+    trace_request_objects: Optional[List] = None
+
     def tree_flatten(self):
         children = (
             self.input_ids,
@@ -184,6 +187,8 @@ class ForwardBatch:
 
         obj.forward_mode = aux_data["forward_mode"]
         obj.batch_size = aux_data["batch_size"]
+        obj.trace_request_ids = None  # Will be set separately, not part of pytree
+        obj.trace_request_objects = None  # Will be set separately, not part of pytree
 
         obj.input_ids = children[0]
         obj.req_pool_indices = children[1]
@@ -226,7 +231,7 @@ class ForwardBatch:
         batch: ModelWorkerBatch,
         model_runner: ModelRunner,
     ):
-        return cls(
+        obj = cls(
             forward_mode=batch.forward_mode,
             batch_size=len(batch.seq_lens),
             input_ids=device_array(model_runner.mesh, batch.input_ids),
@@ -249,3 +254,7 @@ class ForwardBatch:
                 else None
             ),
         )
+        # Set trace fields separately (not part of JAX pytree)
+        obj.trace_request_ids = getattr(batch, "trace_request_ids", None)
+        obj.trace_request_objects = getattr(batch, "trace_request_objects", None)
+        return obj

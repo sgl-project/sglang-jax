@@ -492,7 +492,7 @@ class Qwen3MoeForCausalLM(nnx.Module):
             input_ids, positions, forward_batch
         )
 
-        return hidden_states, layers_k, layers_v
+        return hidden_states, layers_k, layers_v, True
 
 
 EntryClass = Qwen3MoeForCausalLM

@@ -28,6 +28,8 @@ from sgl_jax.srt.managers.io_struct import (
     GetInternalStateReq,
     GetInternalStateReqOutput,
     ProfileReq,
+    SetInternalStateReq,
+    SetInternalStateReqOutput,
     TokenizedGenerateReqInput,
 )
 from sgl_jax.srt.managers.schedule_batch import (
@@ -51,6 +53,7 @@ from sgl_jax.srt.managers.utils import validate_input_length
 from sgl_jax.srt.mem_cache.chunk_cache import ChunkCache
 from sgl_jax.srt.mem_cache.radix_cache import RadixCache
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
+from sgl_jax.srt.precision_tracer import precision_tracer
 from sgl_jax.srt.server_args import PortArgs, ServerArgs
 from sgl_jax.srt.utils.common_utils import (
     configure_logger,
@@ -295,6 +298,7 @@ class Scheduler(
                 (AbortReq, self.abort_request),
                 (ProfileReq, self.profile),
                 (GetInternalStateReq, self.get_internal_state),
+                (SetInternalStateReq, self.set_internal_state),
             ]
         )
 
@@ -600,6 +604,56 @@ class Scheduler(
         }
 
         return GetInternalStateReqOutput(internal_state=ret)
+
+    def set_internal_state(self, recv_req: SetInternalStateReq):
+        """Handle internal state updates, including precision tracer configuration"""
+        success = True
+        error_msg = ""
+
+        try:
+            if "precision_tracer" in recv_req.state_data:
+                tracer_config = recv_req.state_data["precision_tracer"]
+
+                # Update precision_tracer state in this process
+                if "trace_active" in tracer_config:
+                    precision_tracer._trace_active = tracer_config["trace_active"]
+                    logger.info(
+                        f"[SCHEDULER] Updated trace_active to: {precision_tracer._trace_active}"
+                    )
+
+                    # Reset counters when starting trace
+                    if tracer_config["trace_active"]:
+                        precision_tracer._request_counter = 0
+                        precision_tracer._completed_requests_count = 0
+                        precision_tracer._request_traces = {}
+                        logger.info(
+                            f"[SCHEDULER] Reset request_counter, completed_count and traces"
+                        )
+
+                if "max_requests" in tracer_config:
+                    precision_tracer._max_requests = tracer_config["max_requests"]
+                    logger.info(
+                        f"[SCHEDULER] Updated max_requests to: {precision_tracer._max_requests}"
+                    )
+
+                if "output_file" in tracer_config:
+                    precision_tracer._trace_output_file = tracer_config["output_file"]
+                    logger.info(
+                        f"[SCHEDULER] Updated output_file to: {precision_tracer._trace_output_file}"
+                    )
+
+                logger.info(
+                    f"[SCHEDULER] Precision tracer state updated: {tracer_config}"
+                )
+
+        except Exception as e:
+            success = False
+            error_msg = str(e)
+            logger.info(f"[SCHEDULER] Error updating internal state: {error_msg}")
+
+        return SetInternalStateReqOutput(
+            request_id=recv_req.request_id, success=success, error_msg=error_msg
+        )
 
     def _add_request_to_queue(self, req: Req):
         req.queue_time_start = time.perf_counter()

@@ -8,7 +8,6 @@ from jax.sharding import PartitionSpec
 from transformers import PretrainedConfig
 
 from sgl_jax.srt.configs.model_config import ModelConfig
-from sgl_jax.srt.debug_tracer import global_tracer, trace_function
 from sgl_jax.srt.layers.embeddings import Embed, ParallelLMHead, RotaryEmbedding
 from sgl_jax.srt.layers.layernorm import RMSNorm
 from sgl_jax.srt.layers.linear import LinearBase
@@ -60,7 +59,6 @@ class QWenMLP(nnx.Module):
 
         self.act_func = jax.nn.silu
 
-    @trace_function(stage="MLP", include_args=False, include_output=True)
     def __call__(self, hidden_states: jnp.ndarray):
         return _mlp_forward(
             hidden_states,
@@ -152,7 +150,6 @@ class QWenAttention(nnx.Module):
             layer_id=layer_id,
         )
 
-    @trace_function(stage="ATTENTION", include_args=False, include_output=True)
     def __call__(
         self,
         positions: jax.Array,
@@ -208,7 +205,6 @@ class QWenBlock(nnx.Module):
             rngs=rngs,
         )
 
-    @trace_function(stage="BLOCK", include_args=False, include_output=True)
     def __call__(
         self,
         positions: jax.Array,
@@ -217,17 +213,7 @@ class QWenBlock(nnx.Module):
     ) -> tuple[jax.Array, jax.Array, jax.Array]:
         residual = hidden_states
 
-        global_tracer.print(
-            hidden_states,
-            f"RMSNorm_pre_attn_input",
-            f"rmsnorm_layer_id_{self.layer_id}",
-        )
         hidden_states = self.ln_1(hidden_states)
-        global_tracer.print(
-            hidden_states,
-            f"RMSNorm_pre_attn_output",
-            f"rmsnorm_layer_id_{self.layer_id}",
-        )
 
         attn_output, k, v = self.attn(
             positions=positions,
@@ -240,15 +226,7 @@ class QWenBlock(nnx.Module):
 
         residual = hidden_states
 
-        global_tracer.print(
-            hidden_states, f"RMSNorm_pre_mlp_input", f"rmsnorm_layer_id_{self.layer_id}"
-        )
         hidden_states = self.ln_2(hidden_states)
-        global_tracer.print(
-            hidden_states,
-            f"RMSNorm_pre_mlp_output",
-            f"rmsnorm_layer_id_{self.layer_id}",
-        )
 
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
@@ -288,16 +266,13 @@ class QWenModel(nnx.Module):
             config.hidden_size, epsilon=config.layer_norm_epsilon, rngs=rngs
         )
 
-    @trace_function(stage="TRANSFORMER", include_args=False, include_output=True)
     def __call__(
         self,
         input_ids: jax.Array,
         positions: jax.Array,
         forward_batch: ForwardBatch,
     ):
-        global_tracer.print(input_ids, "embedding_input", "embedding_all")
         hidden_states = self.embed_tokens(input_ids)
-        global_tracer.print(hidden_states, "embedding_output", "embedding_all")
 
         layers_k = []
         layers_v = []
@@ -307,9 +282,7 @@ class QWenModel(nnx.Module):
             layers_k.append(k)
             layers_v.append(v)
 
-        global_tracer.print(hidden_states, "RMSNorm_final_input", "rmsnorm_final")
         hidden_states = self.ln_f(hidden_states)
-        global_tracer.print(hidden_states, "RMSNorm_final_output", "rmsnorm_final")
 
         return hidden_states, layers_k, layers_v
 
@@ -328,13 +301,6 @@ class QWenLMHeadModel(nnx.Module):
         vocab_size = ((config.hf_config.vocab_size + 63) // 64) * 64
         self.lm_head = ParallelLMHead(vocab_size, config.hidden_size, rngs=rngs)
         self.logits_processor = LogitsProcessor(vocab_size)
-        self._setup_debug_tracer()
-
-    def _setup_debug_tracer(self):
-        try:
-            global_tracer.set_model(self)
-        except Exception as e:
-            print(f"Warning: Could not setup debug tracer: {str(e)}")
 
     def load_weights(self, rng_key: jax.Array):
         self.rng = nnx.Rngs(rng_key)
@@ -444,7 +410,7 @@ class QWenLMHeadModel(nnx.Module):
         hidden_states, layers_k, layers_v = self.transformer(
             input_ids, positions, forward_batch
         )
-        return hidden_states, layers_k, layers_v
+        return hidden_states, layers_k, layers_v, True
 
 
 EntryClass = QWenLMHeadModel

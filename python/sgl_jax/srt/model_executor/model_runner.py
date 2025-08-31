@@ -26,6 +26,7 @@ from sgl_jax.srt.mem_cache.allocator import (
 from sgl_jax.srt.mem_cache.memory_pool import MHATokenToKVPool, ReqToTokenPool
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sgl_jax.srt.model_loader.loader import JAXModelLoader
+from sgl_jax.srt.precision_tracer import precision_tracer
 from sgl_jax.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sgl_jax.srt.server_args import ServerArgs
 from sgl_jax.srt.utils.common_utils import get_bool_env_var
@@ -89,6 +90,11 @@ class ModelRunner:
         )
         # Model-specific adjustment
         self.model_specific_adjustment()
+
+        # Initialize precision tracer enable state
+        precision_tracer.set_enable_precision_tracer(
+            server_args.enable_precision_tracer
+        )
 
         # If it is a draft model, tp_group can be different
         self.initialize()
@@ -355,7 +361,7 @@ class ModelRunner:
         import jax._src.test_util as jtu
 
         with jtu.count_pjit_cpp_cache_miss() as count:
-            hidden_states, layers_k, layers_v = self.model_fn(
+            hidden_states, layers_k, layers_v, _ = self.model_fn(
                 self.state, input_ids, positions, forward_batch
             )
             cache_miss_count = count()
@@ -418,6 +424,31 @@ class ModelRunner:
     ) -> Tuple[LogitsProcessorOutput, int]:
         self.forward_pass_id += 1
 
+        # Set request IDs for tracing
+
+        if (
+            hasattr(forward_batch, "trace_request_ids")
+            and forward_batch.trace_request_ids
+            and precision_tracer._trace_active
+        ):
+            # Start tracing for each request in the batch
+            request_objects = getattr(forward_batch, "trace_request_objects", None)
+            for i, trace_request_id in enumerate(forward_batch.trace_request_ids):
+                req_obj = (
+                    request_objects[i]
+                    if request_objects and i < len(request_objects)
+                    else None
+                )
+                if trace_request_id not in precision_tracer._request_traces:
+                    precision_tracer.start_request_trace(trace_request_id, req_obj)
+
+            # Set current request ID context (use first request for simplicity)
+            precision_tracer._current_request_id = (
+                forward_batch.trace_request_ids[0]
+                if forward_batch.trace_request_ids
+                else None
+            )
+
         return self._forward_raw(forward_batch, logits_metadata, skip_attn_backend_init)
 
     def _forward_raw(
@@ -426,6 +457,9 @@ class ModelRunner:
         logits_metadata: LogitsMetadata,
         skip_attn_backend_init: bool,
     ) -> Tuple[LogitsProcessorOutput, int]:
+        # for compatibility, 0.6.3 need to use use_mesh. set_mesh is not have __entry__ attribute.
+        # on jax 0.7.1, we need to use set_mesh.
+        # with self.mesh, jax.sharding.set_mesh(self.mesh):
         with self.mesh, jax.sharding.use_mesh(self.mesh):
             if forward_batch.forward_mode.is_decode():
                 ret = self.forward_decode(forward_batch, logits_metadata)

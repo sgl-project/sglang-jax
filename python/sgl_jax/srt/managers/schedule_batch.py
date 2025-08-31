@@ -34,6 +34,7 @@ from sgl_jax.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sgl_jax.srt.mem_cache.chunk_cache import ChunkCache
 from sgl_jax.srt.mem_cache.memory_pool import ReqToTokenPool
 from sgl_jax.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
+from sgl_jax.srt.precision_tracer import precision_tracer
 from sgl_jax.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sgl_jax.srt.sampling.sampling_params import SamplingParams
 from sgl_jax.srt.server_args import ServerArgs
@@ -1206,7 +1207,48 @@ class ScheduleBatch:
             real_bs=real_bs,
             capture_hidden_mode=CaptureHiddenMode.NULL,
             launch_done=self.launch_done,
+            trace_request_ids=(
+                self._generate_trace_request_ids(real_bs)
+                if precision_tracer._trace_active
+                else None
+            ),
+            trace_request_objects=(
+                self.reqs[:real_bs] if precision_tracer._trace_active else None
+            ),
         )
+
+    def _generate_trace_request_ids(self, real_bs: int) -> List[str]:
+        """Generate trace request IDs and increment counter for new logical requests"""
+        from sgl_jax.srt.precision_tracer import precision_tracer
+
+        request_ids = []
+        for req in self.reqs[:real_bs]:
+            # Use unique rid for request_id, not content_hash
+            request_id = str(req.rid)
+
+            # Only increment for truly new request_ids
+            if precision_tracer._trace_active:
+                if request_id not in precision_tracer._request_id_to_number:
+                    # Check if we've reached the limit before incrementing
+                    if (
+                        precision_tracer._max_requests
+                        and precision_tracer._completed_requests_count
+                        >= precision_tracer._max_requests
+                    ):
+                        precision_tracer.stop_trace()
+                        break
+
+                    precision_tracer._request_counter += 1
+                    precision_tracer._request_id_to_number[request_id] = (
+                        precision_tracer._request_counter
+                    )
+                    logger.info(
+                        f"Starting trace for request {precision_tracer._request_counter}: {request_id}"
+                    )
+
+            request_ids.append(request_id)
+
+        return request_ids
 
     def copy(self):
         # Only contain fields that will be used by process_batch_result
@@ -1295,6 +1337,11 @@ class ModelWorkerBatch:
 
     # Events
     launch_done: Optional[threading.Event] = None
+
+    # Trace request IDs for precision tracing [batch_size]
+    trace_request_ids: Optional[List[str]] = None
+    # Request objects for hash computation
+    trace_request_objects: Optional[List] = None
 
 
 def get_last_loc(

@@ -12,13 +12,13 @@ from transformers import AutoTokenizer
 
 from sgl_jax.srt.configs.load_config import LoadConfig, LoadFormat
 from sgl_jax.srt.configs.model_config import ModelConfig
-from sgl_jax.srt.debug_tracer import global_tracer
 from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessorOutput
 from sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch
 from sgl_jax.srt.mem_cache.memory_pool import ReqToTokenPool
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sgl_jax.srt.model_executor.model_runner import ModelRunner
 from sgl_jax.srt.model_loader.loader import JAXModelLoader
+from sgl_jax.srt.precision_tracer import precision_tracer
 from sgl_jax.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sgl_jax.srt.server_args import ServerArgs
 from sgl_jax.test.test_utils import create_device_mesh
@@ -60,9 +60,9 @@ class TestModelRunner(unittest.TestCase):
 
         # Create RNG
         self.rng = nnx.Rngs(42)
-        self.enable_debug_tracer = os.environ.get("ENABLE_DEBUG_TRACER", "1")
-        if self.enable_debug_tracer == "1":
-            print("debug tracer enabled")
+        self.enable_precision_tracer = os.environ.get("ENABLE_PRECISION_TRACER", "1")
+        if self.enable_precision_tracer == "1":
+            print("precision tracer enabled")
         # Create model config for Qwen-7B
         self.model_path = os.environ.get("MODEL_PATH", "/models/Qwen-7B")
         self.model_config = ModelConfig(
@@ -216,8 +216,8 @@ class TestModelRunner(unittest.TestCase):
         """Test complete forward pass."""
         # Step 1: Extend phase (prefill)
         tokenizer = self._get_tokenizer()
-        if self.enable_debug_tracer == "1":
-            global_tracer.start_session()
+        if self.enable_precision_tracer == "1":
+            precision_tracer.start_trace()
         text = "1+1=?"
         encoded = tokenizer.encode(text, return_tensors="pt")
         extend_input_ids = [encoded[0].tolist()]
@@ -281,13 +281,13 @@ class TestModelRunner(unittest.TestCase):
             all_generated_tokens.append(current_token)
             print(f"step {step} current_token added: {current_token}")
 
-        if self.enable_debug_tracer == "1":
-            print("Ending debug tracer session...")
-            debug_file = global_tracer.end_session()
+        if self.enable_precision_tracer == "1":
+            print("Ending precision tracer session...")
+            debug_file = precision_tracer.stop_trace()
             if debug_file:
-                print(f"Debug trace saved to: {debug_file}")
+                print(f"Precision trace saved to: {debug_file}")
             else:
-                print("Debug trace not saved")
+                print("Precision trace not saved")
         # Verify all decode outputs have consistent shapes
         for output in decode_outputs:
             self.assertEqual(
