@@ -799,15 +799,21 @@ class Scheduler(
         # DP Attention: Synchronize batch across DP groups
         if self.server_args.enable_dp_attention:
             try:
-                batch_size_list = np.array([1, 0, 0, 0])
-                # self.all_gather_by_cpu(
-                #     np.array([ret.batch_size if ret is not None else 0], dtype=np.int32)
-                # )
+                local_num_tokens = 0
+                if ret is None:
+                    local_num_tokens = 0
+                elif ret.forward_mode.is_decode():
+                    local_num_tokens = ret.batch_size
+                else:
+                    local_num_tokens = ret.extend_num_tokens
+                global_num_tokens = self.all_gather_by_cpu(
+                    np.array([local_num_tokens], dtype=np.int32)
+                )
                 logger.info(
-                    f"Node {self.node_rank} batch_size_list: {np.array(batch_size_list)}"
+                    f"Node {self.node_rank} global_num_tokens: {np.array(global_num_tokens)}"
                 )
                 is_all_idle = all(
-                    size == 0 for size in np.array(batch_size_list).flatten()
+                    size == 0 for size in np.array(global_num_tokens).flatten()
                 )
                 if not is_all_idle and ret is None:
                     ret = self.get_idle_batch()
