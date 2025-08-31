@@ -4,7 +4,7 @@ Welcome to the `sglang-jax` project! This document is designed to help new devel
 
 #### Why We Chose JAX
 
-Among the many deep learning frameworks available (like PyTorch and TensorFlow), we chose JAX as our core backend for three key advantages that are crucial for building a high-performance inference system for large language models.
+Among the many deep learning frameworks available (like PyTorch and TensorFlow), we choose JAX as our core backend for three key advantages that are crucial for building a high-performance inference system for large language models.
 
 **1. Native Distributed Semantics**
 
