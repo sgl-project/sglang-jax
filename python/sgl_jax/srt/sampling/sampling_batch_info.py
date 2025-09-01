@@ -124,10 +124,10 @@ class SamplingBatchInfo:
             ici_parallelism=[-1, 1, 1, 1],
             dcn_parallelism=[1, 1, 1, 1],
             devices=jax.local_devices(),
+        )
         top_ps = np.array([r.sampling_params.top_p for r in reqs], dtype=np.float32)
         top_ks = np.array([r.sampling_params.top_k for r in reqs], dtype=np.int32)
         min_ps = np.array([r.sampling_params.min_p for r in reqs], dtype=np.float32)
-
 
         (temperatures_device, top_ps_device, top_ks_device, min_ps_device) = (
             device_array(mesh, (temperatures, top_ps, top_ks, min_ps))
