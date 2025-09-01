@@ -23,6 +23,10 @@ from typing import TYPE_CHECKING, Optional
 
 import jax
 import jax.numpy as jnp
+import numpy as np
+from jax._src import mesh as mesh_lib
+from jax.sharding import Mesh, NamedSharding
+from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.utils.jax_utils import device_array
 
@@ -222,30 +226,58 @@ class ForwardBatch:
 
     @classmethod
     def init_new(
-        cls,
-        batch: ModelWorkerBatch,
-        model_runner: ModelRunner,
+        cls, batch: ModelWorkerBatch, model_runner: ModelRunner, mesh: mesh_lib
     ):
-        return cls(
-            forward_mode=batch.forward_mode,
-            batch_size=len(batch.seq_lens),
-            input_ids=device_array(model_runner.mesh, batch.input_ids),
-            seq_lens=jnp.array(batch.seq_lens),
-            out_cache_loc=jnp.array(batch.out_cache_loc),
-            positions=jnp.array(batch.positions),
-            extend_start_loc=jnp.array(batch.extend_start_loc),
-            req_pool_indices=jnp.array(batch.req_pool_indices),
-            token_to_kv_pool=model_runner.token_to_kv_pool,
-            attn_backend=model_runner.attn_backend,
-            cache_loc=jnp.array(batch.cache_loc),
-            extend_prefix_lens=(
-                jnp.array(batch.extend_prefix_lens)
+        data_sharding = NamedSharding(mesh, P(None))
+        global_input_ids = jax.make_array_from_process_local_data(
+            data_sharding, batch.input_ids
+        )
+        global_out_cache_loc = jax.make_array_from_process_local_data(
+            data_sharding, batch.out_cache_loc
+        )
+        global_seq_lens = jax.make_array_from_process_local_data(
+            data_sharding, batch.seq_lens
+        )
+        global_positions = jax.make_array_from_process_local_data(
+            data_sharding, batch.positions
+        )
+        global_extend_start_loc = jax.make_array_from_process_local_data(
+            data_sharding, batch.extend_start_loc
+        )
+        global_req_pool_indices = jax.make_array_from_process_local_data(
+            data_sharding, batch.req_pool_indices
+        )
+        global_cache_loc = jax.make_array_from_process_local_data(
+            data_sharding, batch.cache_loc
+        )
+        global_extend_prefix_lens = jax.make_array_from_process_local_data(
+            data_sharding,
+            (
+                np.array(batch.extend_prefix_lens)
                 if batch.extend_prefix_lens is not None
                 else None
             ),
-            extend_seq_lens=(
-                jnp.array(batch.extend_seq_lens)
+        )
+        global_extend_seq_lens = jax.make_array_from_process_local_data(
+            data_sharding,
+            (
+                np.array(batch.extend_seq_lens)
                 if batch.extend_seq_lens is not None
                 else None
             ),
+        )
+        return cls(
+            forward_mode=batch.forward_mode,
+            batch_size=len(batch.seq_lens),
+            input_ids=global_input_ids,
+            seq_lens=global_seq_lens,
+            out_cache_loc=global_out_cache_loc,
+            positions=global_positions,
+            extend_start_loc=global_extend_start_loc,
+            req_pool_indices=global_req_pool_indices,
+            token_to_kv_pool=model_runner.token_to_kv_pool,
+            attn_backend=model_runner.attn_backend,
+            cache_loc=global_cache_loc,
+            extend_prefix_lens=global_extend_prefix_lens,
+            extend_seq_lens=global_extend_seq_lens,
         )
