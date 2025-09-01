@@ -452,7 +452,7 @@ class ModelRunner:
                     skip_attn_backend_init=skip_attn_backend_init,
                 )
             elif forward_batch.forward_mode.is_idle():
-                ret = self.forward_idle(forward_batch)
+                ret = self.forward_idle(forward_batch, logits_metadata=logits_metadata)
             else:
                 raise ValueError(f"Invalid forward mode: {forward_batch.forward_mode}")
 
