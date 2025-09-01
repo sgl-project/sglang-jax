@@ -23,6 +23,9 @@ setattr(threading, "_register_atexit", lambda *args, **kwargs: None)
 import uvloop
 
 from sgl_jax.srt.entrypoints.EngineBase import EngineBase
+from sgl_jax.srt.managers.data_parallel_controller import (
+    run_data_parallel_controller_process,
+)
 from sgl_jax.srt.managers.detokenizer_manager import run_detokenizer_process
 from sgl_jax.srt.managers.io_struct import (
     EmbeddingReqInput,
@@ -392,8 +395,10 @@ def _launch_subprocesses(
     )
 
     scheduler_procs = []
+    scheduler_pipe_readers = []
+
     if server_args.dp_size == 1:
-        scheduler_pipe_readers = []
+        # Standard single-node deployment
         reader, writer = mp.Pipe(duplex=False)
         proc = mp.Process(
             target=run_scheduler_process,
@@ -409,7 +414,19 @@ def _launch_subprocesses(
         scheduler_procs.append(proc)
         scheduler_pipe_readers.append(reader)
     else:
-        pass
+        # Multi-node DP deployment
+        reader, writer = mp.Pipe(duplex=False)
+        proc = mp.Process(
+            target=run_data_parallel_controller_process,
+            args=(
+                server_args,
+                port_args,
+                writer,
+            ),
+        )
+        proc.start()
+        scheduler_procs.append(proc)
+        scheduler_pipe_readers.append(reader)
 
     if server_args.node_rank >= 1:
         # In multi-node cases, non-zero rank nodes do not need to run tokenizer or detokenizer,
