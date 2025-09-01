@@ -257,14 +257,14 @@ class Scheduler(
         local_devices = jax.local_devices()
         global_devices = jax.devices()
         logger.info(
-            f"Node {self.node_rank} - JAX设备信息: "
-            f"local_devices数量: {len(local_devices)}, "
-            f"global_devices数量: {len(global_devices)}, "
+            f"Node {self.node_rank} - JAX devices info: "
+            f"local_devices nums: {len(local_devices)}, "
+            f"global_devices nums: {len(global_devices)}, "
             f"local_devices: {[str(d) for d in local_devices]}, "
             f"global_devices: {[str(d) for d in global_devices]}"
         )
         logger.info(
-            f"Node {self.node_rank} - Mesh信息: "
+            f"Node {self.node_rank} - Mesh info: "
             f"mesh_shape: {self.mesh.shape}, "
             f"mesh_axes: {self.mesh.axis_names}"
         )
@@ -363,13 +363,19 @@ class Scheduler(
             logger.info(f"[Scheduler] completes worker precompile.")
 
         # Define all_gather_by_cpu function
-        self.all_gather_by_cpu = functools.partial(
-            shard_map.shard_map,
-            mesh=self.mesh_cpu,
-            in_specs=P(None),
-            out_specs=P(None),
-            check_rep=False,
-        )(lambda x: jax.lax.all_gather(x, "host"))
+        try:
+            self.all_gather_by_cpu = functools.partial(
+                shard_map.shard_map,
+                mesh=self.mesh_cpu,
+                in_specs=P(None),
+                out_specs=P(None),
+                check_rep=False,
+            )(lambda x: jax.lax.all_gather(x, "host"))
+            logger.info(f"Successfully defined all_gather_by_cpu function")
+        except Exception as e:
+            logger.error(f"Error defining all_gather_by_cpu: {e}")
+            # use process_allgather as fallback
+            self.all_gather_by_cpu = lambda x: process_allgather(x)
 
     def sync_pub(self):
         logger.info(
@@ -824,7 +830,18 @@ class Scheduler(
             logger.info(
                 f"Node {self.node_rank} global_num_tokens: {np.array(global_array)}"
             )
-            is_all_idle = all(size == 0 for size in np.array(global_array)[:, 0])
+            try:
+                global_array_np = np.array(global_array)
+                if len(global_array_np.shape) >= 2 and global_array_np.shape[1] > 0:
+                    is_all_idle = all(size == 0 for size in global_array_np[:, 0])
+                else:
+                    logger.warning(
+                        f"Unexpected global_array shape: {global_array_np.shape}, using fallback"
+                    )
+                    is_all_idle = all(size == 0 for size in global_array_np.flatten())
+            except Exception as e:
+                logger.error(f"Error checking is_all_idle: {e}")
+                is_all_idle = False
             if not is_all_idle and ret is None:
                 ret = self.get_idle_batch()
             if ret is not None:

@@ -954,9 +954,24 @@ class ScheduleBatch:
                 logger.info(
                     f"all_sizes_array shape: {all_sizes_array.shape}, dtype: {all_sizes_array.dtype}"
                 )
-                global_max_token_size = np.max(all_sizes_array[:, 1]).item()
-                global_max_bs_size = np.max(all_sizes_array[:, 2]).item()
-                global_max_cache_size = np.max(all_sizes_array[:, 3]).item()
+                # 设置默认值，以防np.max操作失败
+                global_max_token_size = 1
+                global_max_bs_size = 1
+                global_max_cache_size = 1
+
+                try:
+                    if all_sizes_array.shape[1] > 1:
+                        global_max_token_size = np.max(all_sizes_array[:, 1]).item()
+                    if all_sizes_array.shape[1] > 2:
+                        global_max_bs_size = np.max(all_sizes_array[:, 2]).item()
+                    if all_sizes_array.shape[1] > 3:
+                        global_max_cache_size = np.max(all_sizes_array[:, 3]).item()
+                    logger.info(
+                        f"Successfully calculated max sizes: token={global_max_token_size}, bs={global_max_bs_size}, cache={global_max_cache_size}"
+                    )
+                except Exception as e:
+                    logger.error(f"Error calculating max sizes: {e}")
+                    logger.error(f"Using default values instead")
                 logger.info(
                     f"max sizes calculated: {global_max_token_size}, {global_max_bs_size}, {global_max_cache_size}"
                 )
