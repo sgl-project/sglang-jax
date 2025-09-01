@@ -298,10 +298,8 @@ class QWenModel(nnx.Module):
         global_tracer.print(input_ids, "embedding_input", "embedding_all")
         hidden_states = self.embed_tokens(input_ids)
         global_tracer.print(hidden_states, "embedding_output", "embedding_all")
-        jax.debug.print(
-            "hidden_states shape: {}", hidden_states.addressable_data(0).shape
-        )
-        jax.debug.print("hidden_states: {}", hidden_states.addressable_data(0))
+        jax.debug.print("hidden_states shape: {}", hidden_states.shape)
+        jax.debug.print("hidden_states: {}", hidden_states)
 
         layers_k = []
         layers_v = []
