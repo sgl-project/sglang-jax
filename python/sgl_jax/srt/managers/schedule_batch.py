@@ -905,20 +905,17 @@ class ScheduleBatch:
 
         # Allocate memory
         if self.token_to_kv_pool_allocator.page_size == 1:
-            out_cache_loc = self.alloc_token_slots(bs)
+            self.out_cache_loc = self.alloc_token_slots(bs)
         else:
             last_loc = self.req_to_token_pool.req_to_token[
                 self.req_pool_indices, self.seq_lens - 2
             ]
-            out_cache_loc = self.alloc_paged_token_slots_decode(
+            self.out_cache_loc = self.alloc_paged_token_slots_decode(
                 self.seq_lens.tolist(),
                 last_loc.tolist(),
             )
-        self.out_cache_loc = jax.device_get(
-            out_cache_loc
-        )  # todo: aolemila, remove jax.device_get
         self.req_to_token_pool.write(
-            (self.req_pool_indices, locs), out_cache_loc.astype(np.int32)
+            (self.req_pool_indices, locs), self.out_cache_loc.astype(np.int32)
         )
 
     def filter_batch(
