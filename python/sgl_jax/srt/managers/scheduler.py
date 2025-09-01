@@ -819,9 +819,7 @@ class Scheduler(
                 ],
                 dtype=np.int32,
             )
-            global_array = jax.experimental.multihost_utils.process_allgather(
-                local_array
-            )
+            global_array = self.all_gather_by_cpu(local_array)
             logger.info(f"local array and global array {local_array} {global_array}")
             logger.info(
                 f"Node {self.node_rank} global_num_tokens: {np.array(global_array)}"
