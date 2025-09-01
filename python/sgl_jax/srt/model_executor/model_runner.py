@@ -344,6 +344,15 @@ class ModelRunner:
                 f"Unsupported attention backend: {self.server_args.attention_backend}"
             )
 
+    def _forward_idle(
+        self,
+        input_ids: jax.Array,
+        positions: jax.Array,
+        forward_batch: ForwardBatch,
+        logits_metadata: LogitsMetadata,
+    ):
+        pass
+
     def _forward(
         self,
         input_ids: jax.Array,
@@ -406,9 +415,16 @@ class ModelRunner:
         )
 
     def forward_idle(
-        self, forward_batch: ForwardBatch
+        self,
+        forward_batch: ForwardBatch,
+        logits_metadata: LogitsMetadata,
     ) -> Tuple[LogitsProcessorOutput, int]:
-        raise NotImplementedError("forward_idle is not implemented")
+        raise self._forward(
+            forward_batch.input_ids,
+            forward_batch.positions,
+            forward_batch,
+            logits_metadata,
+        )
 
     def forward(
         self,
