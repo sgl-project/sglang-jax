@@ -1150,6 +1150,7 @@ class Scheduler(
             self.model_config,
             self.enable_overlap,
             self.server_args.enable_custom_logit_processor,
+            None,
             self.mesh,
         )
         idle_batch.prepare_for_idle()
