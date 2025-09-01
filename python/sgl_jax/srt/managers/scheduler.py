@@ -467,6 +467,7 @@ class Scheduler(
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
             batch = self.get_next_batch_to_run()
+            logger.info(f"get_next_batch_to_run: {batch}")
             self.cur_batch = batch
 
             if batch:
@@ -941,7 +942,7 @@ class Scheduler(
 
         # Run forward
         assert self.is_generation
-
+        logger.info("before get_model_worker_batch")
         model_worker_batch = batch.get_model_worker_batch(
             self.max_running_requests,
             self.max_total_num_tokens,
@@ -956,7 +957,7 @@ class Scheduler(
                 else JAX_PRECOMPILE_DEFAULT_PREFILL_TOKEN_PADDINGS
             ),
         )
-
+        logger.info("after get_model_worker_batch")
         # logits_output, next_token_ids = self.tp_worker.forward_batch_generation(
         #     model_worker_batch
         # )
