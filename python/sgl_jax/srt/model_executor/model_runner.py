@@ -419,6 +419,9 @@ class ModelRunner:
         forward_batch: ForwardBatch,
         logits_metadata: LogitsMetadata,
     ) -> Tuple[LogitsProcessorOutput, int]:
+        # self.attn_backend.init_forward_metadata(forward_batch)
+        fm = self.get_initialized_forward_metadata_fn(forward_batch)
+        self.attn_backend.forward_metadata = fm
         raise self._forward(
             forward_batch.input_ids,
             forward_batch.positions,
