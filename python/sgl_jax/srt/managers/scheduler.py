@@ -1068,7 +1068,7 @@ class Scheduler(
 
         # Run forward
         assert self.is_generation
-
+        logger.info("before get_model_worker_batch")
         (
             prefill_padded_batch_size,
             precompile_prefill_token_paddings,
@@ -1084,7 +1084,7 @@ class Scheduler(
             precompile_prefill_cache_loc_paddings,
             precompile_decode_cache_loc_paddings,
         )
-
+        logger.info("after get_model_worker_batch")
         if self.enable_overlap:
             logits_output, next_token_ids, cache_miss_count = (
                 self.tp_worker.forward_batch_generation(model_worker_batch)
@@ -1094,7 +1094,7 @@ class Scheduler(
                 self.tp_worker.forward_batch_generation(model_worker_batch)
             )
             next_token_ids = np.array(jax.device_get(next_token_ids_device))
-
+        logger.info("after forward_batch_generation")
         bid = model_worker_batch.bid
         batch.output_ids = next_token_ids
 
