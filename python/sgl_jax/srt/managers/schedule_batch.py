@@ -939,11 +939,12 @@ class ScheduleBatch:
             )
             # mesh_cpu = Mesh(jax.devices(backend="cpu"), ("host",))
             all_sizes = jax.experimental.multihost_utils.process_allgather(local_sizes)
+            logger.info("after get allsizes")
             # Calculate global max sizes
             global_max_token_size = jnp.max(all_sizes[:, 0]).item()
             global_max_bs_size = jnp.max(all_sizes[:, 1]).item()
             global_max_cache_size = jnp.max(all_sizes[:, 2]).item()
-            logger.info(f"---------------all size {all_sizes}")
+            # logger.info(f"---------------all size {all_sizes}")
         else:
             global_max_token_size = local_token_size
             global_max_bs_size = local_bs_size
