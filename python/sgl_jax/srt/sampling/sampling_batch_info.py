@@ -8,6 +8,7 @@ from jax.tree_util import register_pytree_node_class
 
 from sgl_jax.srt.sampling.sampling_params import TOP_K_ALL
 from sgl_jax.srt.utils.jax_utils import device_array
+from sgl_jax.srt.utils.mesh_utils import create_device_mesh
 
 if TYPE_CHECKING:
     from sgl_jax.srt.managers.schedule_batch import ScheduleBatch
@@ -119,25 +120,17 @@ class SamplingBatchInfo:
             [r.sampling_params.temperature for r in reqs],
             dtype=np.float32,
         ).reshape(-1, 1)
+        mesh = create_device_mesh(
+            ici_parallelism=[-1, 1, 1, 1],
+            dcn_parallelism=[1, 1, 1, 1],
+            devices=jax.local_devices(),
         top_ps = np.array([r.sampling_params.top_p for r in reqs], dtype=np.float32)
         top_ks = np.array([r.sampling_params.top_k for r in reqs], dtype=np.int32)
         min_ps = np.array([r.sampling_params.min_p for r in reqs], dtype=np.float32)
 
-        temperatures_all = jax.experimental.multihost_utils.process_allgather(
-            temperatures
-        )
-        top_ks_all = jax.experimental.multihost_utils.process_allgather(top_ks)
-        top_ps_all = jax.experimental.multihost_utils.process_allgather(top_ps)
-        min_ps_all = jax.experimental.multihost_utils.process_allgather(min_ps)
-        # temperatures_device = device_array(batch.mesh, temperatures)
-        # top_ps_device = device_array(batch.mesh, top_ps)
-        # top_ks_device = device_array(batch.mesh, top_ks)
-        # min_ps_device = device_array(batch.mesh, min_ps)
-        logger.info(f"device_put_sample_info, {batch.mesh}")
+
         (temperatures_device, top_ps_device, top_ks_device, min_ps_device) = (
-            device_array(
-                batch.mesh, (temperatures_all, top_ps_all, top_ks_all, min_ps_all)
-            )
+            device_array(mesh, (temperatures, top_ps, top_ks, min_ps))
         )
 
         ret = cls(
