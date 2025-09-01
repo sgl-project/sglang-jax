@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from math import log
+
 """
 Store information about requests and batches.
 
@@ -945,10 +947,11 @@ class ScheduleBatch:
             # mesh_cpu = Mesh(jax.devices(backend="cpu"), ("host",))
             all_sizes = self.global_array
             logger.info("after get allsizes")
+            logger.info(f"global array {all_sizes}")
             # Calculate global max sizes
-            global_max_token_size = jnp.max(all_sizes[:, 1]).item()
-            global_max_bs_size = jnp.max(all_sizes[:, 2]).item()
-            global_max_cache_size = jnp.max(all_sizes[:, 3]).item()
+            global_max_token_size = np.max(all_sizes[:, 1]).item()
+            global_max_bs_size = np.max(all_sizes[:, 2]).item()
+            global_max_cache_size = np.max(all_sizes[:, 3]).item()
             # logger.info(f"---------------all size {all_sizes}")
         else:
             global_max_token_size = local_token_size
