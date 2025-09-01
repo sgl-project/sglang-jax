@@ -238,6 +238,7 @@ class QWenBlock(nnx.Module):
             hidden_states = residual + attn_output
         else:
             hidden_states = hidden_states
+            k, v = None, None
 
         residual = hidden_states
         # process all gather

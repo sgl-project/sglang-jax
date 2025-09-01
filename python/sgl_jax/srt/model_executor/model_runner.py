@@ -370,8 +370,8 @@ class ModelRunner:
             cache_miss_count = count()
 
         result = self.compute_logits(self.state, hidden_states, logits_metadata)
-
-        self._set_kv_cache_after_forward(layers_k, layers_v, forward_batch)
+        if not forward_batch.forward_mode.is_idle():
+            self._set_kv_cache_after_forward(layers_k, layers_v, forward_batch)
 
         return result, cache_miss_count
 
