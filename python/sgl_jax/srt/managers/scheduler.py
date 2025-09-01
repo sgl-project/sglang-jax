@@ -883,7 +883,7 @@ class Scheduler(
                 ret = self.running_batch if not self.running_batch.is_empty() else None
             else:
                 ret = None
-        logger.info(f"before dp sync Node {self.node_rank} ret: {ret}")
+        logger.info(f"before dp sync Node {self.node_rank}")
         # DP Attention: Synchronize batch across DP groups
         global_array = None
         if self.server_args.enable_dp_attention:
@@ -1018,7 +1018,7 @@ class Scheduler(
         new_batch.prepare_for_extend()
 
         new_batch.decoding_reqs = None
-
+        logger.info("after get_new_batch_prefill")
         return new_batch
 
     def update_running_batch(self, batch: ScheduleBatch) -> Optional[ScheduleBatch]:
