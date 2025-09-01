@@ -235,9 +235,9 @@ class QWenBlock(nnx.Module):
                 forward_batch=forward_batch,
                 layer_id=self.layer_id,
             )
+            hidden_states = residual + attn_output
         else:
             hidden_states = hidden_states
-        hidden_states = residual + attn_output
 
         residual = hidden_states
         # process all gather
