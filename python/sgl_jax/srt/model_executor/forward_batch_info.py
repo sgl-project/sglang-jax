@@ -37,7 +37,11 @@ if TYPE_CHECKING:
     from sgl_jax.srt.model_executor.model_runner import ModelRunner
     from sgl_jax.srt.sampling.sampling_batch_info import SamplingBatchInfo
 
+import logging
+
 from jax.tree_util import register_pytree_node_class
+
+logger = logging.getLogger(__name__)
 
 
 class ForwardMode(IntEnum):
@@ -232,24 +236,32 @@ class ForwardBatch:
         global_input_ids = jax.make_array_from_process_local_data(
             data_sharding, batch.input_ids
         )
+        logger.info(f"global_input_ids {global_input_ids.shape}")
         global_out_cache_loc = jax.make_array_from_process_local_data(
             data_sharding, batch.out_cache_loc
         )
+        logger.info(f"global_out_cache_loc {global_out_cache_loc.shape}")
         global_seq_lens = jax.make_array_from_process_local_data(
             data_sharding, batch.seq_lens
         )
+        logger.info(f"global_seq_lens {global_seq_lens.shape}")
         global_positions = jax.make_array_from_process_local_data(
             data_sharding, batch.positions
         )
+        logger.info(f"global_positions {global_positions.shape}")
         global_extend_start_loc = jax.make_array_from_process_local_data(
             data_sharding, batch.extend_start_loc
         )
+        logger.info(f"global_extend_start_loc {global_extend_start_loc.shape}")
         global_req_pool_indices = jax.make_array_from_process_local_data(
             data_sharding, batch.req_pool_indices
         )
+        logger.info(f"global_req_pool_indices {global_req_pool_indices.shape}")
         global_cache_loc = jax.make_array_from_process_local_data(
             data_sharding, batch.cache_loc
         )
+        logger.info(f"global_cache_loc {global_cache_loc.shape}")
+
         global_extend_prefix_lens = (
             jax.make_array_from_process_local_data(
                 data_sharding,
@@ -258,6 +270,10 @@ class ForwardBatch:
             if batch.extend_prefix_lens is not None
             else None
         )
+        logger.info(
+            f"global_extend_prefix_lens {global_extend_prefix_lens.shape if global_extend_prefix_lens is not None else None}"
+        )
+
         global_extend_seq_lens = (
             jax.make_array_from_process_local_data(
                 data_sharding,
@@ -266,6 +282,10 @@ class ForwardBatch:
             if batch.extend_seq_lens is not None
             else None
         )
+        logger.info(
+            f"global_extend_prefix_lens {global_extend_seq_lens.shape if global_extend_seq_lens is not None else None}"
+        )
+
         return cls(
             forward_mode=batch.forward_mode,
             batch_size=len(batch.seq_lens),
