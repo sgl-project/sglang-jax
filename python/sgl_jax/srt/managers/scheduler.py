@@ -1129,17 +1129,17 @@ class Scheduler(
         result: Union[GenerationBatchResult],
         launch_done: Optional[threading.Event] = None,
     ):
-
-        if batch.forward_mode.is_decode():
-            self.process_batch_result_decode(batch, result)
-        elif batch.forward_mode.is_extend():
-            self.process_batch_result_prefill(batch, result)
-        elif batch.forward_mode.is_idle():
-            if self.enable_overlap:
-                self.tp_worker.resolve_last_batch_result(launch_done)
-                self.set_next_batch_sampling_info_done(batch)
-        elif batch.forward_mode.is_dummy_first():
-            self.set_next_batch_sampling_info_done(batch)
+        pass
+        # if batch.forward_mode.is_decode():
+        #     self.process_batch_result_decode(batch, result)
+        # elif batch.forward_mode.is_extend():
+        #     self.process_batch_result_prefill(batch, result)
+        # elif batch.forward_mode.is_idle():
+        #     if self.enable_overlap:
+        #         self.tp_worker.resolve_last_batch_result(launch_done)
+        #         self.set_next_batch_sampling_info_done(batch)
+        # elif batch.forward_mode.is_dummy_first():
+        #     self.set_next_batch_sampling_info_done(batch)
 
     def get_idle_batch(self):
         idle_batch = ScheduleBatch.init_new(
