@@ -8,6 +8,7 @@ from jax.tree_util import register_pytree_node_class
 
 from sgl_jax.srt.layers.attention.base_attn_backend import AttentionBackend
 from sgl_jax.srt.layers.radix_attention import AttentionType, RadixAttention
+from sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 
 
@@ -38,8 +39,8 @@ class NativeAttention(AttentionBackend):
             num_attn_heads=aux_data["num_heads"], num_kv_heads=aux_data["num_kv_heads"]
         )
 
-    def init_forward_metadata(self, forward_batch: ForwardBatch):
-        """Init the metadata for a forward pass."""
+    def get_forward_metadata(self, batch: ModelWorkerBatch):
+        """Init the metadata for a forward pass and return it."""
         return None
 
     def __call__(

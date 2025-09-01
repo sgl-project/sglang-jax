@@ -98,11 +98,12 @@ class LogitsProcessorOutput:
 
         return obj
 
-    def truncate_logits_processor_output(self, idx: np.ndarray):
+    def truncate_logits_processor_output(self, batch: ModelWorkerBatch):
         # note: here only need to truncate next_token_logits and hidden_states
-        self.next_token_logits = self.next_token_logits[idx]
-        if self.hidden_states is not None:
-            self.hidden_states = self.hidden_states[idx]
+        self.next_token_logits = jax.lax.dynamic_slice_in_dim(
+            self.next_token_logits, 0, batch.real_bs, axis=0
+        )
+        assert not batch.capture_hidden_mode.need_capture()
 
 
 @register_pytree_node_class
@@ -181,7 +182,7 @@ class LogitsMetadata:
     @classmethod
     def from_model_worker_batch(cls, batch: ModelWorkerBatch, mesh: Mesh = None):
         if batch.forward_mode.is_extend() and batch.return_logprob:
-            extend_seq_lens_cpu = jax.device_get(batch.extend_seq_lens).tolist()
+            extend_seq_lens_cpu = batch.extend_seq_lens.tolist()
 
             extend_return_top_logprob = any(x > 0 for x in batch.top_logprobs_nums)
             extend_token_ids_logprob = any(
@@ -199,8 +200,8 @@ class LogitsMetadata:
         else:
             extend_return_logprob = extend_return_top_logprob = (
                 extend_token_ids_logprob
-            ) = extend_logprob_pruned_lens_cpu = False
-            extend_seq_lens_cpu = None
+            ) = False
+            extend_logprob_pruned_lens_cpu = extend_seq_lens_cpu = None
 
         return cls(
             forward_mode=batch.forward_mode,
@@ -210,7 +211,9 @@ class LogitsMetadata:
             extend_token_ids_logprob=extend_token_ids_logprob,
             extend_seq_lens=batch.extend_seq_lens,
             extend_seq_lens_cpu=extend_seq_lens_cpu,
-            extend_logprob_start_lens_cpu=batch.extend_logprob_start_lens,
+            extend_logprob_start_lens_cpu=(
+                batch.extend_logprob_start_lens if batch.return_logprob else None
+            ),
             extend_logprob_pruned_lens_cpu=extend_logprob_pruned_lens_cpu,
             top_logprobs_nums=batch.top_logprobs_nums,
             token_ids_logprobs=batch.token_ids_logprobs,

@@ -54,6 +54,7 @@ from sgl_jax.srt.mem_cache.chunk_cache import ChunkCache
 from sgl_jax.srt.mem_cache.radix_cache import RadixCache
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
 from sgl_jax.srt.precision_tracer import precision_tracer
+from sgl_jax.srt.sampling.sampling_batch_info import SamplingMetadata
 from sgl_jax.srt.server_args import PortArgs, ServerArgs
 from sgl_jax.srt.utils.common_utils import (
     configure_logger,
@@ -303,13 +304,13 @@ class Scheduler(
         )
 
         if not server_args.disable_jax_precompile:
-            logger.info(f"[Scheduler] begins to run worker precompile.")
+            logger.info(f"[Scheduler] Begins to run worker precompile.")
             self.tp_worker.run_precompile()
-            logger.info(f"[Scheduler] completes worker precompile.")
+            logger.info(f"[Scheduler] Completes worker precompile.")
 
     def sync_pub(self):
         logger.info(
-            f"[Publisher {self.node_rank}] begins to synchronize, wait {self.nnodes-1} Subscribers"
+            f"[Publisher {self.node_rank}] Begins to synchronize, wait {self.nnodes-1} Subscribers"
         )
         ready_count = 0
         try:
@@ -325,31 +326,31 @@ class Scheduler(
                     self.publisher_sync.send_string("NACK")
         except zmq.Again:
             logger.error(
-                f"[Publisher {self.node_rank}] fail to synchronize due to timeout"
+                f"[Publisher {self.node_rank}] Fails to synchronize due to timeout"
             )
             return False
         except Exception as e:
-            logger.error(f"[Publisher {self.node_rank}] encounters error: {e}")
+            logger.error(f"[Publisher {self.node_rank}] Encounters error: {e}")
             return False
-        logger.info(f"[Publisher {self.node_rank}] succeeds to synchronize!")
+        logger.info(f"[Publisher {self.node_rank}] Succeeds to synchronize!")
         return True
 
     def sync_sub(self):
-        logger.info(f"[Subscriber {self.node_rank}] begins to synchronize")
+        logger.info(f"[Subscriber {self.node_rank}] Begins to synchronize")
         try:
             self.subscriber_sync.send_string("READY")
             ack = self.subscriber_sync.recv_string()
             if ack == "ACK":
-                logger.info(f"[Subscriber {self.node_rank}] succeeds to synchronizes!")
+                logger.info(f"[Subscriber {self.node_rank}] Succeeds to synchronizes!")
                 return True
             else:
                 logger.error(
-                    f"[Subscriber {self.node_rank}] fails to synchroinze with ack: {ack}"
+                    f"[Subscriber {self.node_rank}] Fails to synchroinze with ack: {ack}"
                 )
                 return False
         except Exception as e:
             logger.error(
-                f"[Subscriber {self.node_rank}] fails to synchronize with error: {e}"
+                f"[Subscriber {self.node_rank}] Fails to synchronize with error: {e}"
             )
             return False
 
@@ -476,7 +477,7 @@ class Scheduler(
                 return True
             except Exception as e:
                 logger.error(
-                    f"[Publisher {self.node_rank}] fails to send data with error: {e}"
+                    f"[Publisher {self.node_rank}] Fails to send data with error: {e}"
                 )
         return False
 
@@ -488,23 +489,23 @@ class Scheduler(
                 return pickle.loads(serialized_data)
             except zmq.Again:
                 logger.error(
-                    f"[Subscriber {self.node_rank}] fails to receive data with timeout, and try again"
+                    f"[Subscriber {self.node_rank}] Fails to receive data with timeout, and try again"
                 )
             except Exception as e:
                 logger.error(
-                    f"[Subscriber {self.node_rank}] fails to receive or deserialize with error: {e}, and try again"
+                    f"[Subscriber {self.node_rank}] Fails to receive or deserialize with error: {e}, and try again"
                 )
         return None
 
     def broadcast_pyobj(self, recv_reqs):
         if self.node_rank == 0:
             if not self.run_publisher(recv_reqs):
-                raise SendDataError(f"[Publisher {self.node_rank}] fails to send data")
+                raise SendDataError(f"[Publisher {self.node_rank}] Fails to send data")
         else:
             recv_reqs = self.run_subscriber()
             if recv_reqs is None:
                 raise ReceiveDataError(
-                    f"[Subscriber {self.node_rank}] fails to receive data"
+                    f"[Subscriber {self.node_rank}] Fails to receive data"
                 )
         return recv_reqs
 
@@ -886,15 +887,30 @@ class Scheduler(
             self.page_size,
         )
 
+        sampling_metadata = SamplingMetadata.from_model_worker_batch(
+            model_worker_batch,
+            len(model_worker_batch.seq_lens) - model_worker_batch.real_bs,
+            self.mesh,
+            # model_worker_batch.return_logprob,
+            # model_worker_batch.top_logprobs_nums,
+            # model_worker_batch.token_ids_logprobs,
+        )
+
         if self.enable_overlap:
             logits_output, next_token_ids, cache_miss_count = (
-                self.tp_worker.forward_batch_generation(model_worker_batch)
+                self.tp_worker.forward_batch_generation(
+                    model_worker_batch, sampling_metadata=sampling_metadata
+                )
             )
         else:
             logits_output, next_token_ids_device, cache_miss_count = (
-                self.tp_worker.forward_batch_generation(model_worker_batch)
+                self.tp_worker.forward_batch_generation(
+                    model_worker_batch, sampling_metadata=sampling_metadata
+                )
             )
-            next_token_ids = np.array(jax.device_get(next_token_ids_device))
+            next_token_ids = np.array(jax.device_get(next_token_ids_device))[
+                : model_worker_batch.real_bs
+            ]
 
         bid = model_worker_batch.bid
         batch.output_ids = next_token_ids

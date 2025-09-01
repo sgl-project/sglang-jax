@@ -3,6 +3,8 @@ from typing import Tuple
 
 import jax
 import jax.numpy as jnp
+import numpy as np
+from jax.sharding import Mesh
 from jax.sharding import PartitionSpec as P
 from jax.tree_util import register_pytree_node_class
 
@@ -11,8 +13,10 @@ from sgl_jax.srt.layers.attention.flash_attn_kernel.flash_attention import (
     ragged_paged_attention,
 )
 from sgl_jax.srt.layers.radix_attention import RadixAttention
+from sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sgl_jax.srt.utils import cdiv
+from sgl_jax.srt.utils.jax_utils import device_array
 
 
 @register_pytree_node_class
@@ -78,56 +82,55 @@ class FlashAttention(AttentionBackend):
         self.head_dim = head_dim
         self.page_size = page_size
         self.kv_partition_axis = kv_partition_axis
-        self.forward_metadata = None
+        self.forward_metadata = FlashAttentionMetadata()
 
-    def init_forward_metadata(self, forward_batch: ForwardBatch):
-        """Init the metadata for a forward pass."""
+    def get_forward_metadata(self, batch: ModelWorkerBatch):
+        """Return the metadata for a forward pass."""
         metadata = FlashAttentionMetadata()
 
-        indices = jnp.arange(0, len(forward_batch.cache_loc), self.page_size)
-        selected_cache_locs = forward_batch.cache_loc[indices]
-        metadata.page_indices = (selected_cache_locs // self.page_size).astype(
-            jnp.int32
-        )
+        indices = np.arange(0, len(batch.cache_loc), self.page_size)
+        selected_cache_locs = batch.cache_loc[indices]
+        page_indices = (selected_cache_locs // self.page_size).astype(np.int32)
 
-        if forward_batch.forward_mode == ForwardMode.EXTEND:
-            metadata.cu_q_lens = jnp.concatenate(
+        if batch.forward_mode == ForwardMode.EXTEND:
+            cu_q_lens = np.concatenate(
                 [
-                    jnp.array([0], dtype=jnp.int32),
-                    jnp.cumsum(forward_batch.extend_seq_lens),
+                    np.array([0], dtype=np.int32),
+                    np.cumsum(batch.extend_seq_lens),
                 ]
             )
-        elif forward_batch.forward_mode == ForwardMode.DECODE:
-            metadata.cu_q_lens = jnp.concatenate(
+        elif batch.forward_mode == ForwardMode.DECODE:
+            cu_q_lens = jnp.concatenate(
                 [
-                    jnp.array([0], dtype=jnp.int32),
-                    jnp.cumsum(jnp.ones(forward_batch.batch_size, dtype=jnp.int32)),
+                    np.array([0], dtype=jnp.int32),
+                    np.cumsum(jnp.ones(len(batch.seq_lens), dtype=np.int32)),
                 ]
             )
         else:
-            raise ValueError(f"Invalid forward mode: {forward_batch.forward_mode}")
+            raise ValueError(f"Invalid forward mode: {batch.forward_mode}")
 
-        metadata.seq_lens = jnp.copy(forward_batch.seq_lens)
+        seq_lens = np.copy(batch.seq_lens)
 
         aligned_seq_lens = (
-            (forward_batch.seq_lens + self.page_size - 1) // self.page_size
+            (batch.seq_lens + self.page_size - 1) // self.page_size
         ) * self.page_size
-        metadata.cu_kv_lens = jnp.concatenate(
+        cu_kv_lens = np.concatenate(
             [
-                jnp.array([0], dtype=jnp.int32),
-                jnp.cumsum(aligned_seq_lens),
+                np.array([0], dtype=np.int32),
+                np.cumsum(aligned_seq_lens),
             ]
         )
 
-        metadata.num_seqs = jnp.sum(
-            forward_batch.seq_lens > 0, dtype=jnp.int32
-        ).reshape(
+        num_seqs = np.sum(batch.seq_lens > 0, dtype=np.int32).reshape(
             1,
         )
+        metadata.num_seqs = jnp.array(num_seqs)
+        metadata.cu_q_lens = jnp.array(cu_q_lens)
+        metadata.cu_kv_lens = jnp.array(cu_kv_lens)
+        metadata.page_indices = jnp.array(page_indices)
+        metadata.seq_lens = jnp.array(seq_lens)
 
         return metadata
-
-        # self.forward_metadata = metadata
 
     def tree_flatten(self):
         children = (self.forward_metadata,)

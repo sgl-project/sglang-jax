@@ -10,12 +10,14 @@ from sgl_jax.srt.layers.attention.flash_attn_kernel.flash_attention import (
 )
 from sgl_jax.srt.layers.attention.flashattention_backend import FlashAttention
 from sgl_jax.srt.layers.radix_attention import RadixAttention
+from sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch
 from sgl_jax.srt.mem_cache.memory_pool import MHATokenToKVPool
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sgl_jax.srt.model_executor.model_runner import ModelRunner
 from sgl_jax.srt.utils.mesh_utils import create_device_mesh
 from sgl_jax.test.test_utils import CustomTestCase
 
-mesh = create_device_mesh(ici_parallelism=[1, -1, 1, 1], dcn_parallelism=[1, 1, 1, 1])
+mesh = create_device_mesh(ici_parallelism=[1, -1, 1], dcn_parallelism=[1, 1, 1])
 jax.sharding.set_mesh(mesh)
 
 
@@ -231,6 +233,28 @@ def create_test_data(
     )
     forward_mode = ForwardMode.EXTEND if mode == "prefill" else ForwardMode.DECODE
 
+    mwb = ModelWorkerBatch(
+        bid=1,
+        forward_mode=forward_mode,
+        input_ids=np.asarray(input_ids),
+        real_input_ids_len=input_ids.shape[0],
+        seq_lens=np.asarray(seq_lens),
+        out_cache_loc=np.asarray(out_cache_loc),
+        req_pool_indices=np.asarray(req_pool_indices),
+        sampling_info=None,
+        positions=np.asarray(positions),
+        extend_start_loc=np.asarray(extend_start_loc),
+        cache_loc=np.asarray(cache_loc),
+        extend_seq_lens=np.asarray(extend_seq_lens),
+        extend_prefix_lens=np.asarray(extend_prefix_lens),
+        return_logprob=False,
+        top_logprobs_nums=None,
+        token_ids_logprobs=None,
+        extend_logprob_start_lens=None,
+        extend_input_logprob_token_ids=None,
+        real_bs=seq_lens.shape[0],
+    )
+
     fb = ForwardBatch(
         forward_mode=forward_mode,
         batch_size=batch_size,
@@ -246,7 +270,8 @@ def create_test_data(
         extend_prefix_lens=extend_prefix_lens,
         extend_seq_lens=extend_seq_lens,
     )
-    attention_backend.init_forward_metadata(fb)
+
+    attention_backend.forward_metadata = attention_backend.get_forward_metadata(mwb)
     return fb, q, k, v
 
 

@@ -9,6 +9,7 @@ from flax import nnx
 
 if TYPE_CHECKING:
     from sgl_jax.srt.layers.radix_attention import RadixAttention
+    from sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch
     from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
 
 
@@ -16,8 +17,8 @@ class AttentionBackend(nnx.Module):
     """The base class of attention backends"""
 
     @abstractmethod
-    def init_forward_metadata(self, forward_batch: ForwardBatch):
-        """Init the metadata for a forward pass."""
+    def get_forward_metadata(self, batch: ModelWorkerBatch):
+        """Init the metadata for a forward pass and return it"""
         raise NotImplementedError()
 
     def __call__(

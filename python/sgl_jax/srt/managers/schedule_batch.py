@@ -720,7 +720,7 @@ class ScheduleBatch:
         if self.token_to_kv_pool_allocator.page_size == 1:
             out_cache_loc = self.alloc_token_slots(extend_num_tokens)
         else:
-            last_loc_device = get_last_loc(
+            last_loc_cpu = get_last_loc(
                 self.req_to_token_pool.req_to_token,
                 req_pool_indices_cpu,
                 prefix_lens_cpu,
@@ -728,7 +728,7 @@ class ScheduleBatch:
             out_cache_loc = self.alloc_paged_token_slots_extend(
                 prefix_lens,
                 seq_lens,
-                jax.device_get(last_loc_device).tolist(),
+                last_loc_cpu.tolist(),
                 extend_num_tokens,
             )
 
@@ -939,10 +939,6 @@ class ScheduleBatch:
             # No need to filter
             return
 
-        # keep_indices_device = device_array(
-        #     self.mesh, jnp.array(keep_indices, dtype=jnp.int32)
-        # )
-
         self.reqs = [self.reqs[i] for i in keep_indices]
         self.req_pool_indices = self.req_pool_indices[keep_indices]
         self.seq_lens = self.seq_lens[keep_indices]
@@ -1058,7 +1054,7 @@ class ScheduleBatch:
             out_cache_loc_cpu = np.concatenate(
                 [
                     out_cache_loc_cpu,
-                    jnp.array(
+                    np.array(
                         [-1] * out_cache_loc_num_to_padding,
                         dtype=out_cache_loc_cpu.dtype,
                     ),
@@ -1342,22 +1338,22 @@ class ModelWorkerBatch:
 
 
 def get_last_loc(
-    req_to_token: jax.Array,
+    req_to_token: np.ndarray,
     req_pool_indices: np.ndarray,
     prefix_lens: np.ndarray,
-) -> jax.Array:
+) -> np.ndarray:
     impl = get_last_loc_jax
 
     return impl(req_to_token, req_pool_indices, prefix_lens)
 
 
 def get_last_loc_jax(
-    req_to_token: jax.Array,
+    req_to_token: np.ndarray,
     req_pool_indices: np.ndarray,
     prefix_lens: np.ndarray,
-) -> jax.Array:
-    return jnp.where(
+) -> np.ndarray:
+    return np.where(
         prefix_lens > 0,
         req_to_token[req_pool_indices, prefix_lens - 1],
-        jnp.full_like(prefix_lens, -1),
+        np.full_like(prefix_lens, -1),
     )
