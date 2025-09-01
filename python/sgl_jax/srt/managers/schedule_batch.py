@@ -798,6 +798,10 @@ class ScheduleBatch:
         self.req_to_token_pool.write(
             (self.req_pool_indices, locs), self.out_cache_loc.astype(jnp.int32)
         )
+        self.sampling_info = SamplingBatchInfo.from_schedule_batch(
+            self,
+            self.model_config.vocab_size,
+        )
 
     def filter_batch(
         self,
