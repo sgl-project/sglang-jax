@@ -216,30 +216,31 @@ class QWenBlock(nnx.Module):
         forward_batch: ForwardBatch,
     ) -> tuple[jax.Array, jax.Array, jax.Array]:
         residual = hidden_states
+        if not forward_batch.forward_mode.is_idle():
+            global_tracer.print(
+                hidden_states,
+                f"RMSNorm_pre_attn_input",
+                f"rmsnorm_layer_id_{self.layer_id}",
+            )
+            hidden_states = self.ln_1(hidden_states)
+            global_tracer.print(
+                hidden_states,
+                f"RMSNorm_pre_attn_output",
+                f"rmsnorm_layer_id_{self.layer_id}",
+            )
 
-        global_tracer.print(
-            hidden_states,
-            f"RMSNorm_pre_attn_input",
-            f"rmsnorm_layer_id_{self.layer_id}",
-        )
-        hidden_states = self.ln_1(hidden_states)
-        global_tracer.print(
-            hidden_states,
-            f"RMSNorm_pre_attn_output",
-            f"rmsnorm_layer_id_{self.layer_id}",
-        )
-
-        attn_output, k, v = self.attn(
-            positions=positions,
-            hidden_states=hidden_states,
-            forward_batch=forward_batch,
-            layer_id=self.layer_id,
-        )
-
+            attn_output, k, v = self.attn(
+                positions=positions,
+                hidden_states=hidden_states,
+                forward_batch=forward_batch,
+                layer_id=self.layer_id,
+            )
+        else:
+            hidden_states = hidden_states
         hidden_states = residual + attn_output
 
         residual = hidden_states
-
+        # process all gather
         global_tracer.print(
             hidden_states, f"RMSNorm_pre_mlp_input", f"rmsnorm_layer_id_{self.layer_id}"
         )
@@ -252,6 +253,7 @@ class QWenBlock(nnx.Module):
 
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
+        # process scatter
         return hidden_states, k, v
 
 
