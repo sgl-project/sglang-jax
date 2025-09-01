@@ -645,11 +645,16 @@ class ScheduleBatch:
 
         # Copy prefix and do some basic check
         extend_input_logprob_token_ids = []
-
+        logger.info(
+            "before for i, (req, seq_len, pre_len) in enumerate(zip(reqs, seq_lens, prefix_lens))"
+        )
         for i, (req, seq_len, pre_len) in enumerate(zip(reqs, seq_lens, prefix_lens)):
             req.req_pool_idx = req_pool_indices[i]
             assert seq_len - pre_len == req.extend_input_len
             # note: req.prefix_indices is located on CPU, so we have to extract values then device_put
+            logger.info(
+                "before prefix_indices_device = jnp.array(np.asarray(req.prefix_indices))"
+            )
             prefix_indices_device = jnp.array(np.asarray(req.prefix_indices))
             # prefix_indices = req.prefix_indices
             if pre_len > 0:
@@ -761,6 +766,7 @@ class ScheduleBatch:
             pt += extend_lens[i]
 
         # Build sampling info
+        logger.info("SamplingBatchInfo.from_schedule_batch")
         self.sampling_info = SamplingBatchInfo.from_schedule_batch(
             self,
             self.model_config.vocab_size,
