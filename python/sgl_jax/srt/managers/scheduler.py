@@ -1014,7 +1014,7 @@ class Scheduler(
             self.chunked_req,
             self.mesh,
         )
-
+        logger.info("before new_batch.prepare_for_extend")
         new_batch.prepare_for_extend()
 
         new_batch.decoding_reqs = None
