@@ -949,9 +949,20 @@ class ScheduleBatch:
             logger.info("after get allsizes")
             logger.info(f"global array {all_sizes}")
             # Calculate global max sizes
-            global_max_token_size = np.max(all_sizes[:, 1]).item()
-            global_max_bs_size = np.max(all_sizes[:, 2]).item()
-            global_max_cache_size = np.max(all_sizes[:, 3]).item()
+            try:
+                all_sizes_array = np.array(all_sizes)
+                logger.info(
+                    f"all_sizes_array shape: {all_sizes_array.shape}, dtype: {all_sizes_array.dtype}"
+                )
+                global_max_token_size = np.max(all_sizes_array[:, 1]).item()
+                global_max_bs_size = np.max(all_sizes_array[:, 2]).item()
+                global_max_cache_size = np.max(all_sizes_array[:, 3]).item()
+                logger.info(
+                    f"max sizes calculated: {global_max_token_size}, {global_max_bs_size}, {global_max_cache_size}"
+                )
+            except Exception as e:
+                logger.error(f"Error calculating max sizes: {e}")
+                raise e
             # logger.info(f"---------------all size {all_sizes}")
         else:
             global_max_token_size = local_token_size
