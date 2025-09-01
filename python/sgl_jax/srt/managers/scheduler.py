@@ -1,6 +1,7 @@
 """A scheduler that manages a tensor parallel TPU worker."""
 
 import faulthandler
+import functools
 import logging
 import os
 import pickle
@@ -14,15 +15,28 @@ from types import SimpleNamespace
 from typing import Dict, List, Optional, Union
 
 import jax
+import jax.numpy as jnp
 import numpy as np
 import psutil
 import setproctitle
 import zmq
 
+try:
+    import setproctitle
+except ImportError:
+    setproctitle = None
+
+from jax.experimental import shard_map
+from jax.experimental.multihost_utils import process_allgather
+from jax.sharding import Mesh, NamedSharding
+from jax.sharding import PartitionSpec as P
+
 from sgl_jax.global_config import global_config
 from sgl_jax.srt.configs.model_config import ModelConfig
 from sgl_jax.srt.hf_transformers_utils import get_tokenizer
+from sgl_jax.srt.layers.dp_attention import compute_dp_attention_world_info
 from sgl_jax.srt.layers.logits_processor import LogitsProcessorOutput
+from sgl_jax.srt.managers.dp_communication import create_dp_communicator
 from sgl_jax.srt.managers.io_struct import (
     AbortReq,
     GetInternalStateReq,
@@ -53,6 +67,8 @@ from sgl_jax.srt.mem_cache.radix_cache import RadixCache
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
 from sgl_jax.srt.server_args import PortArgs, ServerArgs
 from sgl_jax.srt.utils.common_utils import (
+    JAX_PRECOMPILE_DEFAULT_DECODE_BS_PADDINGS,
+    JAX_PRECOMPILE_DEFAULT_PREFILL_TOKEN_PADDINGS,
     configure_logger,
     get_bool_env_var,
     get_zmq_socket,
@@ -86,7 +102,7 @@ class ReceiveDataError(Exception):
 @dataclass
 class GenerationBatchResult:
     logits_output: Optional[LogitsProcessorOutput]
-    next_token_ids: Optional[List[int]]  # on device
+    next_token_ids: Optional[List[int]]
     extend_input_len_per_req: List[int]
     extend_logprob_start_len_per_req: List[int]
     bid: int
@@ -122,8 +138,27 @@ class Scheduler(
         self.server_args = server_args
         self.node_rank = server_args.node_rank
         self.nnodes = server_args.nnodes
-        self.pub_sub_addr = port_args.pub_sub_addr
-        self.pub_sub_sync_addr = port_args.pub_sub_sync_addr
+
+        # Calculate DP group info for this scheduler
+        self._dp_group_info = self._calculate_dp_group_info()
+
+        # Create DP communicator for JAX-based broadcasting (replaces ZMQ pub/sub)
+        self._dp_communicator = create_dp_communicator(server_args)
+
+        # Round-robin counter for distributing requests to DP groups (only used by node 0)
+        self._dp_round_robin_counter = 0
+
+        # Keep original pub_sub addresses for backward compatibility (node 0 only)
+        if server_args.enable_dp_attention and server_args.nnodes > 1:
+            # With DP attention, only node 0 uses traditional pub/sub for fallback
+            self.pub_sub_addr = port_args.pub_sub_addr if self.node_rank == 0 else None
+            self.pub_sub_sync_addr = (
+                port_args.pub_sub_sync_addr if self.node_rank == 0 else None
+            )
+        else:
+            # Without DP attention, use original logic
+            self.pub_sub_addr = port_args.pub_sub_addr
+            self.pub_sub_sync_addr = port_args.pub_sub_sync_addr
         self.tp_size = server_args.tp_size
         self.schedule_policy = server_args.schedule_policy
         self.skip_tokenizer_init = server_args.skip_tokenizer_init
@@ -134,6 +169,9 @@ class Scheduler(
 
         # Init inter-process communication
         context = zmq.Context(2)
+
+        # Determine if this scheduler should run publisher or subscriber based on DP group info
+        is_publisher = self._dp_group_info["is_publisher"]
 
         if self.node_rank == 0:
             self.recv_from_tokenizer = get_zmq_socket(
@@ -157,7 +195,20 @@ class Scheduler(
             self.recv_from_rpc = get_zmq_socket(
                 context, zmq.DEALER, port_args.rpc_ipc_name, False
             )
-            if self.nnodes > 1:
+        else:
+            self.recv_from_tokenizer = None
+            self.recv_from_rpc = None
+            self.send_to_tokenizer = SimpleNamespace(send_pyobj=lambda x: None)
+            self.send_to_detokenizer = SimpleNamespace(send_pyobj=lambda x: None)
+
+        # Set up traditional ZMQ pub/sub only for non-DP cases or fallback
+        if (
+            self.nnodes > 1
+            and self.pub_sub_addr
+            and not server_args.enable_dp_attention
+        ):
+            # Traditional ZMQ pub/sub (only for non-DP cases)
+            if self.node_rank == 0:
                 self.publisher = get_zmq_socket(
                     context, zmq.PUB, self.pub_sub_addr, bind=True
                 )
@@ -165,12 +216,7 @@ class Scheduler(
                     context, zmq.REP, self.pub_sub_sync_addr, bind=True
                 )
                 self.num_subscribers = self.nnodes - 1
-        else:
-            self.recv_from_tokenizer = None
-            self.recv_from_rpc = None
-            self.send_to_tokenizer = SimpleNamespace(send_pyobj=lambda x: None)
-            self.send_to_detokenizer = SimpleNamespace(send_pyobj=lambda x: None)
-            if self.nnodes > 1:
+            else:
                 self.subscriber = get_zmq_socket(
                     context, zmq.SUB, self.pub_sub_addr, bind=False
                 )
@@ -180,7 +226,12 @@ class Scheduler(
                     context, zmq.REQ, self.pub_sub_sync_addr, bind=False
                 )
 
-        if self.nnodes > 1:
+        # Sync pub/sub only for traditional ZMQ setup (non-DP cases)
+        if (
+            self.nnodes > 1
+            and not server_args.enable_dp_attention
+            and self.pub_sub_addr
+        ):
             self.sync_pub_sub()
 
         # Init tokenizer
@@ -195,10 +246,36 @@ class Scheduler(
             jax.distributed.initialize(
                 server_args.dist_init_addr, self.nnodes, self.node_rank
             )
-        self.mesh = create_device_mesh(
-            ici_parallelism=[-1, self.tp_size, 1, 1], dcn_parallelism=[1, 1, 1, 1]
+        logger.debug(f"Node {self.node_rank} initialized JAX distributed")
+        attn_tp_size, attn_dp_rank, dp_rank = compute_dp_attention_world_info(
+            self.server_args.enable_dp_attention,
+            self.node_rank,
+            self.server_args.tp_size,
+            self.server_args.dp_size,
         )
-
+        logger.debug(
+            f"Node {self.node_rank} attn_tp_size: {attn_tp_size}, attn_dp_rank: {attn_dp_rank}, dp_rank: {dp_rank}"
+        )
+        self.mesh = create_device_mesh(
+            ici_parallelism=[-1, attn_tp_size, 1, 1],
+            dcn_parallelism=[1, 1, 1, 1],
+            devices=jax.devices(),
+        )
+        self.mesh_cpu = Mesh(jax.devices(backend="cpu"), ("host",))
+        local_devices = jax.local_devices()
+        global_devices = jax.devices()
+        logger.info(
+            f"Node {self.node_rank} - JAX devices info: "
+            f"local_devices nums: {len(local_devices)}, "
+            f"global_devices nums: {len(global_devices)}, "
+            f"local_devices: {[str(d) for d in local_devices]}, "
+            f"global_devices: {[str(d) for d in global_devices]}"
+        )
+        logger.info(
+            f"Node {self.node_rank} - Mesh info: "
+            f"mesh_shape: {self.mesh.shape}, "
+            f"mesh_axes: {self.mesh.axis_names}"
+        )
         if self.enable_overlap:
             TpWorkerClass = ModelWorkerClient
         else:
@@ -303,6 +380,21 @@ class Scheduler(
             self.tp_worker.run_precompile()
             logger.info(f"[Scheduler] completes worker precompile.")
 
+        # Define all_gather_by_cpu function
+        try:
+            self.all_gather_by_cpu = functools.partial(
+                shard_map.shard_map,
+                mesh=self.mesh_cpu,
+                in_specs=P(None),
+                out_specs=P(None),
+                check_rep=False,
+            )(lambda x: jax.lax.all_gather(x, "host"))
+            logger.info(f"Successfully defined all_gather_by_cpu function")
+        except Exception as e:
+            logger.error(f"Error defining all_gather_by_cpu: {e}")
+            # use process_allgather as fallback
+            self.all_gather_by_cpu = lambda x: process_allgather(x)
+
     def sync_pub(self):
         logger.info(
             f"[Publisher {self.node_rank}] begins to synchronize, wait {self.nnodes-1} Subscribers"
@@ -351,7 +443,9 @@ class Scheduler(
 
     def sync_pub_sub(self):
         success = False
-        if self.node_rank == 0:
+        is_publisher = self._dp_group_info["is_publisher"]
+
+        if is_publisher:
             success = self.sync_pub()
         else:
             success = self.sync_sub()
@@ -493,7 +587,12 @@ class Scheduler(
         return None
 
     def broadcast_pyobj(self, recv_reqs):
-        if self.node_rank == 0:
+        """Broadcast requests using traditional ZMQ (for non-DP mode)."""
+
+        # Traditional ZMQ pub/sub for backward compatibility
+        should_publish = self._should_run_publisher_zmq()
+
+        if should_publish:
             if not self.run_publisher(recv_reqs):
                 raise SendDataError(f"[Publisher {self.node_rank}] fails to send data")
         else:
@@ -503,6 +602,46 @@ class Scheduler(
                     f"[Subscriber {self.node_rank}] fails to receive data"
                 )
         return recv_reqs
+
+    def _calculate_dp_group_info(self):
+        """Calculate DP group information for this scheduler."""
+        if not self.server_args.enable_dp_attention or self.server_args.dp_size == 1:
+            # No DP groups, use original logic
+            return {
+                "dp_group_id": 0,
+                "rank_in_group": self.node_rank,
+                "group_size": self.server_args.nnodes,
+                "is_publisher": (self.node_rank == 0),
+            }
+
+        # Import here to avoid circular dependency
+        from sgl_jax.srt.layers.dp_attention import compute_dp_attention_world_info
+
+        attn_tp_size, attn_dp_rank, dp_rank = compute_dp_attention_world_info(
+            self.server_args.enable_dp_attention,
+            self.node_rank,  # tp_rank = scheduler's global rank
+            self.server_args.tp_size,  # total schedulers
+            self.server_args.dp_size,  # number of DP groups
+        )
+
+        return {
+            "dp_group_id": dp_rank,  # Which DP group this scheduler belongs to
+            "rank_in_group": attn_dp_rank,  # Rank within the DP group
+            "group_size": attn_tp_size,  # Number of schedulers in this DP group
+            "is_publisher": (attn_dp_rank == 0),  # Is this the publisher for the group
+        }
+
+    def _should_run_publisher_zmq(self) -> bool:
+        """
+        Determine if current scheduler should run ZMQ publisher or subscriber.
+        This is only used for fallback cases when JAX broadcast is not available.
+        """
+        if self.server_args.enable_dp_attention:
+            # For DP cases, use DP group logic
+            return self._dp_group_info["is_publisher"]
+        else:
+            # For non-DP cases, use original logic
+            return self.node_rank == 0
 
     def recv_requests(self) -> List[Req]:
         """Receive results at node_rank = 0 and broadcast it to all other Node ranks."""
@@ -523,11 +662,73 @@ class Scheduler(
                     break
                 recv_reqs.append(recv_rpc)
         else:
-            recv_reqs = None
-
-        if self.nnodes > 1:
-            recv_reqs = self.broadcast_pyobj(recv_reqs)
+            recv_reqs = []
+        logger.info(f"Node {self.node_rank} recv_reqs: {recv_reqs}")
+        # if self.nnodes > 1:
+        #     recv_reqs = self.broadcast_pyobj(recv_reqs)
         return recv_reqs
+
+    def _collect_external_requests(self) -> List[Req]:
+        """Collect requests from external sources (tokenizer + RPC)."""
+        recv_reqs = []
+
+        while True:
+            try:
+                recv_req = self.recv_from_tokenizer.recv_pyobj(zmq.NOBLOCK)
+            except zmq.ZMQError:
+                break
+            recv_reqs.append(recv_req)
+
+        while True:
+            try:
+                recv_rpc = self.recv_from_rpc.recv_pyobj(zmq.NOBLOCK)
+            except zmq.ZMQError:
+                break
+            recv_reqs.append(recv_rpc)
+
+        return recv_reqs
+
+    def _distribute_requests_to_dp_groups(self, requests: List[Req]) -> dict:
+        """Distribute requests round-robin to DP groups."""
+        dp_group_requests = {}
+
+        for req in requests:
+            # Round-robin assignment to DP groups
+            target_group = self._dp_round_robin_counter % self.server_args.dp_size
+
+            if target_group not in dp_group_requests:
+                dp_group_requests[target_group] = []
+            dp_group_requests[target_group].append(req)
+
+            self._dp_round_robin_counter = (
+                self._dp_round_robin_counter + 1
+            ) % self.server_args.dp_size
+
+        # Send requests to other DP group leaders using JAX global broadcast
+        # This will broadcast the entire distribution map to all nodes
+        distributed_requests = self._send_requests_to_dp_group_leaders(
+            dp_group_requests
+        )
+
+        return distributed_requests
+
+    def _send_requests_to_dp_group_leaders(self, dp_group_requests: dict):
+        """Send requests to DP group leaders using JAX global broadcast."""
+        if self._dp_communicator:
+            # Use JAX global broadcast to send distribution map to all nodes
+            return self._dp_communicator.broadcast_inter_group_requests(
+                dp_group_requests
+            )
+        return dp_group_requests
+
+    def _receive_requests_from_node0(self) -> List[Req]:
+        """DP group leaders (non-node-0) receive requests from node 0."""
+        if self._dp_communicator:
+            # Receive the global distribution map from node 0
+            all_requests = self._dp_communicator.broadcast_inter_group_requests({})
+            # Extract requests for this DP group
+            return self._dp_communicator.get_requests_for_my_group(all_requests)
+        return []
 
     def process_input_requests(self, recv_reqs: List):
         for recv_req in recv_reqs:
@@ -682,7 +883,57 @@ class Scheduler(
                 ret = self.running_batch if not self.running_batch.is_empty() else None
             else:
                 ret = None
+        logger.info(f"before dp sync Node {self.node_rank} ret: {ret}")
+        # DP Attention: Synchronize batch across DP groups
+        global_array = None
+        if self.server_args.enable_dp_attention:
+            local_num_tokens = 0
+            if ret is None:
+                local_num_tokens = 0
+            elif ret.forward_mode.is_decode():
+                local_num_tokens = ret.batch_size
+            else:
+                local_num_tokens = ret.extend_num_tokens
+            local_token_size = ret.input_ids.shape[0] if ret is not None else 0
+            local_bs_size = ret.seq_lens.shape[0] if ret is not None else 0
+            local_cache_size = sum(ret.seq_lens) if ret is not None else 0
+            local_array = np.array(
+                [
+                    local_num_tokens,
+                    local_token_size,
+                    local_bs_size,
+                    local_cache_size,
+                ],
+                dtype=np.int32,
+            )
+            global_array = self.all_gather_by_cpu(local_array)
+            logger.info(f"local array and global array {local_array} {global_array}")
+            logger.info(
+                f"Node {self.node_rank} global_num_tokens: {np.array(global_array)}"
+            )
+            try:
+                global_array_np = np.array(global_array)
+                if len(global_array_np.shape) >= 2 and global_array_np.shape[1] > 0:
+                    is_all_idle = all(size == 0 for size in global_array_np[:, 0])
+                else:
+                    logger.warning(
+                        f"Unexpected global_array shape: {global_array_np.shape}, using fallback"
+                    )
+                    is_all_idle = all(size == 0 for size in global_array_np.flatten())
+            except Exception as e:
+                logger.error(f"Error checking is_all_idle: {e}")
+                is_all_idle = False
+            if not is_all_idle and ret is None:
+                logger.info("Not all idle, get idle batch")
+                ret = self.get_idle_batch()
+            if ret is not None:
+                ret.global_array = global_array
+                ret.enable_dp_attention = True
 
+        logger.info(f"after dp sync Node {self.node_rank} ret: {ret}")
+        if ret is not None:
+            ret.enable_dp_attention = self.server_args.enable_dp_attention
+            ret.global_array = global_array
         return ret
 
     def get_new_batch_prefill(self) -> Optional[ScheduleBatch]:
@@ -1002,6 +1253,7 @@ def run_scheduler_process(
             scheduler.event_loop_overlap()
         else:
             scheduler.event_loop_normal()
+        logger.info(f"Node {server_args.node_rank} scheduler ready")
 
     except Exception:
         traceback = get_exception_traceback()
