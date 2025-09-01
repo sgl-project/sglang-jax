@@ -748,11 +748,12 @@ class ScheduleBatch:
 
     def prepare_for_idle(self):
         self.forward_mode = ForwardMode.IDLE
+        logger.info("before prepare_for_idle")
         self.input_ids = jnp.empty(0, jnp.int32)
         self.seq_lens = jnp.empty(0, jnp.int32)
         self.out_cache_loc = jnp.empty(0, jnp.int32)
         self.req_pool_indices = jnp.empty(0, jnp.int32)
-
+        logger.info("after prepare_for_idle")
         # (self.input_ids, self.seq_lens, self.out_cache_loc, self.req_pool_indices) = device_array(
         #     self.mesh,
         #     (
