@@ -823,13 +823,17 @@ class Scheduler(
                 global_array = jax.experimental.multihost_utils.process_allgather(
                     local_array
                 )
-
+                logger.info(
+                    f"local array and global array {local_array} {global_array}"
+                )
                 logger.info(
                     f"Node {self.node_rank} global_num_tokens: {np.array(global_array)}"
                 )
                 is_all_idle = all(size == 0 for size in np.array(global_array)[:, 0])
                 if not is_all_idle and ret is None:
                     ret = self.get_idle_batch()
+                if ret is not None:
+                    ret.global_array = global_array
             except Exception as e:
                 logger.error(f"Node {self.node_rank} all_gather_by_cpu failed: {e}")
         logger.info(f"after dp sync Node {self.node_rank} ret: {ret}")
