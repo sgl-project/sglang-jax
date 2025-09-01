@@ -119,12 +119,12 @@ class ServerArgs:
 
     xla_backend: str = "tpu"
     # Kernel backend
-    attention_backend: Optional[str] = "native"
+    attention_backend: Optional[str] = "fa"
 
     max_seq_len: int = 4096
 
-    jax_precompile_prefill_token_paddings: Optional[List[int]] = None
-    jax_precompile_decode_bs_paddings: Optional[List[int]] = None
+    precompile_token_paddings: Optional[List[int]] = None
+    precompile_bs_paddings: Optional[List[int]] = None
 
     disable_jax_precompile: bool = False
 
@@ -707,16 +707,16 @@ class ServerArgs:
             help="maximum sequence length",
         )
         parser.add_argument(
-            "--jax-precompile-prefill-token-paddings",
+            "--precompile-token-paddings",
             type=int,
             nargs="+",
-            help="Set the list of buckets for jax jit only for the prefill phase",
+            help="Set the list of token buckets for jax jit",
         )
         parser.add_argument(
-            "--jax-precompile-decode-bs-paddings",
+            "--precompile-bs-paddings",
             type=int,
             nargs="+",
-            help="Set the list of batch sizes for jax jit only for the decode phase",
+            help="Set the list of batch sizes buckets for jax jit",
         )
         parser.add_argument(
             "--disable-jax-precompile",

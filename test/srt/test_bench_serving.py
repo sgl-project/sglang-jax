@@ -33,9 +33,9 @@ class TestBenchServing(CustomTestCase):
                 "bfloat16",
                 "--mem-fraction-static",
                 "0.1",
-                "--jax-precompile-decode-bs-paddings",
+                "--precompile-bs-paddings",
                 "10",
-                "--jax-precompile-prefill-token-paddings",
+                "--precompile-token-paddings",
                 "16384",
             ],
         )

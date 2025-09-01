@@ -11,6 +11,7 @@ import jax.numpy as jnp
 import numpy as np
 from flax import nnx
 from jax.experimental.multihost_utils import broadcast_one_to_all
+from tqdm import tqdm
 
 from sgl_jax.srt.configs.model_config import ModelConfig
 from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessorOutput
@@ -28,10 +29,9 @@ from sgl_jax.srt.model_executor.model_runner import MockModelRunner, ModelRunner
 from sgl_jax.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sgl_jax.srt.server_args import ServerArgs
 from sgl_jax.srt.utils.common_utils import (
-    JAX_PRECOMPILE_DEFAULT_DECODE_BS_PADDINGS,
-    JAX_PRECOMPILE_DEFAULT_PREFILL_TOKEN_PADDINGS,
+    PRECOMPILE_DEFAULT_BS_PADDINGS,
+    PRECOMPILE_DEFAULT_TOKEN_PADDINGS,
 )
-from sgl_jax.srt.utils.jax_utils import device_array
 
 logger = logging.getLogger(__name__)
 
@@ -119,67 +119,59 @@ class ModelWorker:
         # A reference make this class has the same member as TpModelWorkerClient
         self.worker = self
 
-        self.prefill_padded_batch_size, self.prefill_max_padded_num_tokens = (
-            self.get_prefill_padded_size()
+        self.max_padded_batch_size, self.max_padded_num_tokens = (
+            self.get_max_padded_size()
         )
-
-        # normalize server_args.jax_precompile_prefill_token_paddings
-        # ensure every token padding value is not less than max_runnig_requests
-        self.normalize_token_paddings(server_args, self.max_running_requests)
 
         # precompile
-        self.precompile_prefill_token_paddings = (
-            server_args.jax_precompile_prefill_token_paddings
+        self.precompile_token_paddings = server_args.precompile_token_paddings
+
+        # normalize server_args.precompile_token_paddings
+        # ensure every token padding value is not less than max_runnig_requests
+        self.normalize_token_paddings()
+
+        bs_padding_list = (
+            server_args.precompile_bs_paddings
+            if server_args.precompile_bs_paddings is not None
+            else PRECOMPILE_DEFAULT_BS_PADDINGS
         )
-
-        bs_padding_list = []
-        if server_args.jax_precompile_decode_bs_paddings is not None:
-            server_args.jax_precompile_decode_bs_paddings.sort()
-            for bs in server_args.jax_precompile_decode_bs_paddings:
-                if bs <= self.max_running_requests:
-                    bs_padding_list.append(bs)
-            if len(bs_padding_list) == 0:
-                bs_padding_list.append(self.max_running_requests)
-        else:
-            bs_padding_list = JAX_PRECOMPILE_DEFAULT_DECODE_BS_PADDINGS + [
-                self.max_running_requests
-            ]
-            bs_padding_list.sort()
-
-        self.precompile_decode_bs_paddings = bs_padding_list
+        self.precompile_bs_paddings = []
+        for bs in bs_padding_list:
+            if bs <= self.max_padded_batch_size:
+                self.precompile_bs_paddings.append(bs)
+        self.precompile_bs_paddings.sort()
+        if (
+            len(self.precompile_bs_paddings) == 0
+            or self.precompile_bs_paddings[-1] < self.max_padded_batch_size
+        ):
+            self.precompile_bs_paddings.append(self.max_padded_batch_size)
 
         # padding cache_loc_paddings
         # note: the length of following two cache_loc_paddings must keep the same to length of separate bs_paddings.
-        self.precompile_prefill_cache_loc_paddings = [
-            self.prefill_max_padded_num_tokens * self.prefill_padded_batch_size
-        ]
-        self.precompile_decode_cache_loc_paddings = [
-            item * self.max_req_len for item in self.precompile_decode_bs_paddings
+        self.precompile_cache_loc_paddings = [
+            item * self.max_req_len for item in self.precompile_bs_paddings
         ]
 
-    def normalize_token_paddings(
-        self, server_args: ServerArgs, max_running_requests: int
-    ):
+    def normalize_token_paddings(self):
         normalized_token_paddings = []
 
-        if server_args.jax_precompile_prefill_token_paddings is None:
-            server_args.jax_precompile_prefill_token_paddings = (
-                JAX_PRECOMPILE_DEFAULT_PREFILL_TOKEN_PADDINGS
-            )
-        for item in server_args.jax_precompile_prefill_token_paddings:
+        if self.precompile_token_paddings is None:
+            self.precompile_token_paddings = PRECOMPILE_DEFAULT_TOKEN_PADDINGS
+        for item in self.precompile_token_paddings:
             if (
-                item >= self.prefill_padded_batch_size
-                and item <= self.prefill_max_padded_num_tokens
+                item >= self.max_padded_batch_size
+                and item <= self.max_padded_num_tokens
             ):
                 normalized_token_paddings.append(item)
 
-        if len(normalized_token_paddings) == 0:
-            normalized_token_paddings.append(self.prefill_max_padded_num_tokens)
-            logger.warning(
-                f"No valid padding found in {server_args.jax_precompile_prefill_token_paddings=} within range [{self.prefill_padded_batch_size=}, {self.prefill_max_padded_num_tokens=}], so set token_paddings as {normalized_token_paddings}"
-            )
+        normalized_token_paddings.sort()
+        if (
+            len(normalized_token_paddings) == 0
+            or normalized_token_paddings[-1] < self.max_padded_num_tokens
+        ):
+            normalized_token_paddings.append(self.max_padded_num_tokens)
 
-        server_args.jax_precompile_prefill_token_paddings = normalized_token_paddings
+        self.precompile_token_paddings = normalized_token_paddings
 
     def run_precompile(self):
         self.precompile_extend()
@@ -187,60 +179,62 @@ class ModelWorker:
 
     def precompile_extend(self):
         start_time = time.perf_counter()
-        logger.info(f"[EXTEND] begin to precompile")
+        logger.info(
+            f"[EXTEND] begin to precompile bs_paddings={self.precompile_bs_paddings[-1:]} token_paddings={self.precompile_token_paddings}"
+        )
 
-        bs, _ = self.get_prefill_padded_size()
-        for pair in itertools.product([bs], self.precompile_prefill_token_paddings):
-            pair = list(pair)
-            bs, num_tokens = pair[0], pair[1]
-            logger.info(f"[EXTEND] precompile ({bs=}, {num_tokens=})")
-            if bs > num_tokens:
-                logger.warning(f"{bs=} > {num_tokens=}, skip this pair")
-                continue
-            model_worker_batch = self.generate_model_worker_batch(
-                bs,
-                num_tokens,
-                ForwardMode.EXTEND,
-                bs,
-                self.precompile_prefill_cache_loc_paddings[-1],
-            )
+        bs, _ = self.get_max_padded_size()
+        pairs = list(itertools.product([bs], self.precompile_token_paddings))
 
-            self.forward_batch_generation(model_worker_batch=model_worker_batch)
+        with tqdm(pairs, desc="[EXTEND] PRECOMPILE", leave=False) as pbar:
+            for pair in pbar:
+                pair = list(pair)
+                bs, num_tokens = pair[0], pair[1]
+                pbar.set_postfix(bs=bs, tokens=num_tokens)
+                if bs > num_tokens:
+                    logger.warning(f"{bs=} > {num_tokens=}, skip this pair")
+                    continue
+                model_worker_batch = self.generate_model_worker_batch(
+                    bs,
+                    num_tokens,
+                    ForwardMode.EXTEND,
+                    bs,
+                    self.precompile_cache_loc_paddings[-1],
+                )
+                self.forward_batch_generation(model_worker_batch=model_worker_batch)
 
         end_time = time.perf_counter()
         logger.info("[EXTEND] precompile finished in %.0f secs", end_time - start_time)
 
-    def get_prefill_padded_size(self):
-        """Calculate padded batch size and token count for prefill operations.
+    def get_max_padded_size(self):
+        """Calculate the max padded batch size and token nums.
 
         Returns:
-            tuple: (padded_batch_size, padded_max_num_tokens)
-                - padded_batch_size: Maximum batch size for prefill, constrained by max_running_requests
-                - padded_max_num_tokens: Maximum tokens for prefill, using chunked_prefill_size if enabled
+            tuple: (max_padded_batch_size, max_padded_num_tokens)
+                - max_padded_batch_size: Maximum batch size, constrained by max_running_requests
+                - max_padded_num_tokens: Maximum tokens, using chunked_prefill_size if enabled
         """
         # Use chunked prefill size if enabled (> 0), otherwise use max prefill tokens
         # Take minimum with max_prefill_tokens as upper bound
-        padded_max_num_tokens = self.max_prefill_tokens
+        max_padded_num_tokens = self.max_prefill_tokens
         if (
             self.chunked_prefill_size > 0
-            and padded_max_num_tokens > self.chunked_prefill_size
+            and max_padded_num_tokens > self.chunked_prefill_size
         ):
-            padded_max_num_tokens = self.chunked_prefill_size
+            max_padded_num_tokens = self.chunked_prefill_size
 
         # Batch size is constrained by both max_running_requests and available tokens divide by page_size
-        padded_batch_size = min(
-            self.max_running_requests, padded_max_num_tokens // self.page_size
+        max_padded_batch_size = min(
+            self.max_running_requests, max_padded_num_tokens // self.page_size
         )
 
-        return padded_batch_size, padded_max_num_tokens
+        return max_padded_batch_size, max_padded_num_tokens
 
     def get_precompile_paddings(self):
         return (
-            self.prefill_padded_batch_size,
-            self.precompile_prefill_token_paddings,
-            self.precompile_decode_bs_paddings,
-            self.precompile_prefill_cache_loc_paddings,
-            self.precompile_decode_cache_loc_paddings,
+            self.precompile_token_paddings,
+            self.precompile_bs_paddings,
+            self.precompile_cache_loc_paddings,
         )
 
     def generate_model_worker_batch(
@@ -295,17 +289,23 @@ class ModelWorker:
 
     def precompile_decode(self):
         start_time = time.perf_counter()
-        logger.info(f"[DECODE] begin to precompile")
-        for bs in self.precompile_decode_bs_paddings:
-            logger.info(f"[DECODE] precompile ({bs=})")
-            model_worker_batch = self.generate_model_worker_batch(
-                bs,
-                bs,
-                ForwardMode.DECODE,
-                max(self.precompile_decode_bs_paddings),
-                bs * self.max_req_len,
-            )
-            self.forward_batch_generation(model_worker_batch=model_worker_batch)
+        logger.info(
+            f"[DECODE] begin to precompile bs_paddings={self.precompile_bs_paddings}"
+        )
+
+        with tqdm(
+            self.precompile_bs_paddings, desc="[DECODE] PRECOMPILE", leave=False
+        ) as pbar:
+            for bs in pbar:
+                pbar.set_postfix(bs=bs)
+                model_worker_batch = self.generate_model_worker_batch(
+                    bs,
+                    bs,
+                    ForwardMode.DECODE,
+                    max(self.precompile_bs_paddings),
+                    bs * self.max_req_len,
+                )
+                self.forward_batch_generation(model_worker_batch=model_worker_batch)
 
         end_time = time.perf_counter()
         logger.info("[DECODE] precompile finished in %.0f secs", end_time - start_time)

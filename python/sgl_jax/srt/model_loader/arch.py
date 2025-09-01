@@ -71,7 +71,6 @@ def get_model_architecture(model_config: ModelConfig) -> Tuple[Any, str]:
 
     architectures = getattr(model_config.hf_config, "architectures", [])
     supported_archs = ModelRegistry.get_supported_archs()
-    print(f"supported_archs: {supported_archs}")
     is_native_supported = any(arch in supported_archs for arch in architectures)
     if not is_native_supported or model_config.model_impl == ModelImpl.TRANSFORMERS:
         architectures = resolve_transformers_arch(model_config, architectures)

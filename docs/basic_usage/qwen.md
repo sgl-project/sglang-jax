@@ -16,19 +16,17 @@ JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache python3 -u -m sgl_jax.launch_server \
     --device=tpu \
     --random-seed=3 \
     --node-rank=0 \
-    --mem-fraction-static=0.2 \
+    --mem-fraction-static=0.8 \
     --max-prefill-tokens=8192 \
     --download-dir=/tmp \
-    --jax-precompile-prefill-token-paddings 16384 \
     --dtype=bfloat16 \
-    --skip-server-warmup \
-    --attention-backend=fa
+    --skip-server-warmup
 ```
 
 ## Configuration Tips
 
 ### Memory Management
-Set `--mem-fraction-static 0.2` for optimal TPU memory utilization. For larger models or batch sizes, adjust `--max-prefill-tokens` accordingly.
+Set `--mem-fraction-static 0.8` for optimal TPU memory utilization. For larger models or batch sizes, adjust `--max-prefill-tokens` accordingly.
 
 ### TPU Optimization
 - **FlashAttention Backend**: Use `--attention-backend fa` for TPU-optimized attention

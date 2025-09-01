@@ -709,6 +709,20 @@ def get_min_heads_per_blk(num_q_heads, num_kv_heads, q_dtype, kv_dtype):
     return num_q_heads, num_kv_heads
 
 
+@functools.partial(
+    jax.jit,
+    static_argnames=[
+        "sm_scale",
+        "mask_value",
+        "num_kv_pages_per_block",
+        "num_queries_per_block",
+        "vmem_limit_bytes",
+        "sliding_window",
+        "soft_cap",
+        "k_scale",
+        "v_scale",
+    ],
+)
 def ragged_paged_attention(
     q: jax.Array,  # [max_num_batched_tokens, num_q_heads, head_dim]
     k_cache: jax.Array,  # [total_num_pages, page_size, num_k_heads, head_dim]

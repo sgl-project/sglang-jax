@@ -52,7 +52,6 @@ DEFAULT_URL_FOR_TEST = f"http://127.0.0.1:{DEFAULT_PORT_FOR_SRT_TEST_RUNNER + 10
 mesh_axes = [
     "data",  # data parallelism
     "tensor",  # tensor parallelism
-    "pipeline",  # pipeline parallelism
     "expert",  # expert parallelism
 ]
 
@@ -363,7 +362,7 @@ def generate_server_args() -> ServerArgs:
         jax_num_procs=None,
         xla_backend="tpu",
         max_seq_len=4096,
-        jax_precompile_prefill_token_paddings=[1, 8],
+        precompile_token_paddings=[1, 8],
         disable_jax_precompile=False,
     )
 
@@ -612,9 +611,9 @@ def run_bench_offline_throughput(model, other_args):
         "/tmp/",
         "--dtype",
         "bfloat16",
-        "--jax-precompile-decode-bs-paddings",
+        "--precompile-bs-paddings",
         "16",
-        "--jax-precompile-prefill-token-paddings",
+        "--precompile-token-paddings",
         "4096",
         "--page-size",
         "64",
