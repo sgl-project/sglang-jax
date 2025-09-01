@@ -938,14 +938,10 @@ class ScheduleBatch:
                 [local_token_size, local_bs_size, local_cache_size], dtype=np.int32
             )
             try:
-                mesh_cpu = Mesh(jax.devices(backend="cpu"), ("host",))
-                all_sizes = functools.partial(
-                    shard_map.shard_map,
-                    mesh=mesh_cpu,
-                    in_specs=P(None),
-                    out_specs=P(None),
-                    check_rep=False,
-                )(lambda x: jax.lax.all_gather(x, "host"))(local_sizes)
+                # mesh_cpu = Mesh(jax.devices(backend="cpu"), ("host",))
+                all_sizes = jax.experimental.multihost_utils.process_allgather(
+                    local_sizes
+                )
                 # Calculate global max sizes
                 global_max_token_size = jnp.max(all_sizes[:, 0]).item()
             except Exception as e:
