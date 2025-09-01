@@ -127,6 +127,7 @@ class SamplingBatchInfo:
         # top_ps_device = device_array(batch.mesh, top_ps)
         # top_ks_device = device_array(batch.mesh, top_ks)
         # min_ps_device = device_array(batch.mesh, min_ps)
+        logger.info(f"device_put_sample_info, {batch.mesh}")
         (temperatures_device, top_ps_device, top_ks_device, min_ps_device) = (
             device_array(batch.mesh, (temperatures, top_ps, top_ks, min_ps))
         )
