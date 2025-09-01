@@ -130,6 +130,7 @@ class SamplingBatchInfo:
         logging.info(
             f"temperatures.shape={temperatures.shape}, top_ps.shape={top_ps.shape}, top_ks.shape={top_ks.shape}, min_ps.shape={min_ps.shape}"
         )
+        # fixme 这里需要所有设备一起参与一起处理
         mesh = create_device_mesh(
             ici_parallelism=[-1, 1, 1, 1],
             dcn_parallelism=[1, 1, 1, 1],

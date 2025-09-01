@@ -764,10 +764,10 @@ class ScheduleBatch:
         # )
         self.seq_lens_sum = 0
         self.extend_num_tokens = 0
-        # self.sampling_info = SamplingBatchInfo.from_schedule_batch(
-        #     self,
-        #     self.model_config.vocab_size,
-        # )
+        self.sampling_info = SamplingBatchInfo.from_schedule_batch(
+            self,
+            self.model_config.vocab_size,
+        )
         logger.info("after prepare_for_idle")
 
     def prepare_for_decode(self):
@@ -803,6 +803,7 @@ class ScheduleBatch:
         self,
         keep_indices: Optional[List[int]] = None,
     ):
+
         if keep_indices is None:
             keep_indices = [
                 i for i in range(len(self.reqs)) if not self.reqs[i].finished()
