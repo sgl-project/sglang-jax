@@ -122,14 +122,21 @@ class SamplingBatchInfo:
         top_ps = np.array([r.sampling_params.top_p for r in reqs], dtype=jnp.float32)
         top_ks = np.array([r.sampling_params.top_k for r in reqs], dtype=jnp.int32)
         min_ps = np.array([r.sampling_params.min_p for r in reqs], dtype=jnp.float32)
-
+        temperatures_all = jax.experimental.multihost_utils.process_allgather(
+            temperatures
+        )
+        top_ks_all = jax.experimental.multihost_utils.process_allgather(top_ks)
+        top_ps_all = jax.experimental.multihost_utils.process_allgather(top_ps)
+        min_ps_all = jax.experimental.multihost_utils.process_allgather(min_ps)
         # temperatures_device = device_array(batch.mesh, temperatures)
         # top_ps_device = device_array(batch.mesh, top_ps)
         # top_ks_device = device_array(batch.mesh, top_ks)
         # min_ps_device = device_array(batch.mesh, min_ps)
         logger.info(f"device_put_sample_info, {batch.mesh}")
         (temperatures_device, top_ps_device, top_ks_device, min_ps_device) = (
-            device_array(batch.mesh, (temperatures, top_ps, top_ks, min_ps))
+            device_array(
+                batch.mesh, (temperatures_all, top_ps_all, top_ks_all, min_ps_all)
+            )
         )
 
         ret = cls(
