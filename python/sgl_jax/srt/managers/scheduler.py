@@ -843,6 +843,7 @@ class Scheduler(
                 logger.error(f"Error checking is_all_idle: {e}")
                 is_all_idle = False
             if not is_all_idle and ret is None:
+                logger.info("Not all idle, get idle batch")
                 ret = self.get_idle_batch()
             if ret is not None:
                 ret.global_array = global_array
