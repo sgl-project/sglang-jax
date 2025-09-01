@@ -304,6 +304,7 @@ class ModelRunner:
                     page_size=self.page_size,
                     # dtype=self.kv_cache_dtype,
                     kvcache=self.token_to_kv_pool,
+                    debug_mode=True,
                 )
 
     def init_attention_backend(self):

@@ -211,7 +211,7 @@ class RadixCache(BasePrefixCache):
 
         if self.page_size != 1:
             page_aligned_len = len(kv_indices) // self.page_size * self.page_size
-            page_aligned_kv_indices = kv_indices[:page_aligned_len]
+            page_aligned_kv_indices = kv_indices[:page_aligned_len].copy()
             self.token_to_kv_pool_allocator.free(kv_indices[page_aligned_len:])
         else:
             page_aligned_len = len(kv_indices)
@@ -239,7 +239,7 @@ class RadixCache(BasePrefixCache):
 
         if self.page_size != 1:
             page_aligned_len = len(kv_indices) // self.page_size * self.page_size
-            page_aligned_kv_indices = kv_indices[:page_aligned_len]
+            page_aligned_kv_indices = kv_indices[:page_aligned_len].copy()
         else:
             page_aligned_len = len(kv_indices)
             page_aligned_kv_indices = kv_indices
@@ -461,11 +461,11 @@ class RadixCache(BasePrefixCache):
         new_node.parent = child.parent
         new_node.lock_ref = child.lock_ref
         new_node.key = child.key[:split_len]
-        new_node.value = child.value[:split_len]
+        new_node.value = child.value[:split_len].copy()
 
         child.parent = new_node
         child.key = child.key[split_len:]
-        child.value = child.value[split_len:]
+        child.value = child.value[split_len:].copy()
         new_node.parent.children[self.get_child_key_fn(key)] = new_node
 
         return new_node

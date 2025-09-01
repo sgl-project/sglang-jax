@@ -56,8 +56,8 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
 
     def merge_and_sort_free(self):
         if len(self.release_pages) > 0:
-            self.free_pages = np.concatenate((self.free_pages, self.release_pages))
-            self.free_pages = np.sort(self.free_pages)
+            combined = np.concatenate((self.free_pages, self.release_pages))
+            self.free_pages = np.sort(np.unique(combined))
             self.release_pages = np.empty((0,), dtype=np.int32)
 
     def get_cpu_copy(self, *args, **kwargs):
@@ -112,7 +112,7 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if need_size > self.available_size():
             return None
 
-        select_index = self.free_slots[:need_size]
+        select_index = self.free_slots[:need_size].copy()
         self.free_slots = self.free_slots[need_size:]
         return select_index
 
@@ -159,7 +159,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if num_pages > len(self.free_pages):
             return None
 
-        out_pages = self.free_pages[:num_pages]
+        out_pages = self.free_pages[:num_pages].copy()
         self.free_pages = self.free_pages[num_pages:]
 
         # Generate contiguous indices using numpy internally

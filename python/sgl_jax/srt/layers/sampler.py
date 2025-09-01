@@ -122,17 +122,16 @@ def top_k_top_p_min_p_sampling_from_probs_jax(
     need_min_p_sampling: bool,
     rng: nnx.Rngs,
 ):
-    """A top-k, top-p and min-p sampling implementation with native pytorch operations."""
+    """A top-k, top-p and min-p sampling implementation with native jax operations."""
     probs_sort, probs_idx = _sample_part_a(
         probs, top_ks, top_ps, need_min_p_sampling, min_ps
     )
 
-    sampled_index = random.categorical(rng, probs_sort).reshape(-1, 1)
+    sampled_index = random.categorical(rng, jnp.log(probs_sort)).reshape(-1, 1)
 
     return _sample_part_b(probs_idx, sampled_index)
 
 
-# @partial(jax.jit, static_argnames=("need_min_p_sampling"))
 def _sample_part_a(probs, top_ks, top_ps, need_min_p_sampling: bool, min_ps):
     probs_sort = jnp.sort(probs, axis=-1)[
         :, ::-1
@@ -154,7 +153,6 @@ def _sample_part_a(probs, top_ks, top_ps, need_min_p_sampling: bool, min_ps):
     return probs_sort, probs_idx
 
 
-# @partial(jax.jit)
 def _sample_part_b(probs_idx, sampled_index):
     probs_idx = probs_idx.astype(jnp.int32)
     return jnp.take_along_axis(probs_idx, axis=1, indices=sampled_index).flatten()
