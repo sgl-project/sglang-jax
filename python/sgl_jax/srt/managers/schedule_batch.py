@@ -767,6 +767,8 @@ class ScheduleBatch:
 
         # Build sampling info
         logger.info("SamplingBatchInfo.from_schedule_batch")
+
+    def device_put_sample_info(self):
         self.sampling_info = SamplingBatchInfo.from_schedule_batch(
             self,
             self.model_config.vocab_size,
@@ -884,10 +886,10 @@ class ScheduleBatch:
         self.req_pool_indices = np.empty(0, jnp.int32)
         self.seq_lens_sum = 0
         self.extend_num_tokens = 0
-        self.sampling_info = SamplingBatchInfo.from_schedule_batch(
-            self,
-            self.model_config.vocab_size,
-        )
+        # self.sampling_info = SamplingBatchInfo.from_schedule_batch(
+        #     self,
+        #     self.model_config.vocab_size,
+        # )
 
     def prepare_for_decode(self):
         self.forward_mode = ForwardMode.DECODE
