@@ -28,23 +28,16 @@ class ReqToTokenPool:
         self,
         size: int,
         max_context_len: int,
-        mesh: Mesh,
-        dtype: jnp.dtype = jnp.int32,
-        token_partition_axis: str = "data",
+        dtype: np.dtype = np.int32,
     ):
         self.size = size
         self.max_context_len = max_context_len
-        self.mesh = mesh
         self.dtype = dtype
 
         # Create sharded request to token mapping table
-        self.req_to_token = jnp.zeros((size, max_context_len), dtype=dtype)
+        self.req_to_token = np.zeros((size, max_context_len), dtype=dtype)
 
-        # Use data sharding strategy
-        self.token_sharding = NamedSharding(mesh, P(None, None))
-        self.req_to_token = jax.device_put(self.req_to_token, self.token_sharding)
-
-        # Use simple list to manage free slots (non-JAX array)
+        # Use simple list to manage free slots
         self.free_slots = list(range(size))
 
     def tree_flatten(self):
@@ -52,9 +45,7 @@ class ReqToTokenPool:
         aux_data = {
             "size": self.size,
             "max_context_len": self.max_context_len,
-            "mesh": self.mesh,
             "dtype": self.dtype,
-            "token_sharding": self.token_sharding,
             "free_slots": self.free_slots,
         }
         return (children, aux_data)
@@ -65,9 +56,7 @@ class ReqToTokenPool:
 
         obj.size = aux_data["size"]
         obj.max_context_len = aux_data["max_context_len"]
-        obj.mesh = aux_data["mesh"]
         obj.dtype = aux_data["dtype"]
-        obj.token_sharding = aux_data["token_sharding"]
         obj.free_slots = aux_data["free_slots"]
 
         obj.req_to_token = children[0]
@@ -79,15 +68,15 @@ class ReqToTokenPool:
         if isinstance(indices, tuple) and len(indices) == 2:
             # Handle (req_idx, slice) case
             req_idx, slice_obj = indices
-            self.req_to_token = self.req_to_token.at[req_idx, slice_obj].set(values)
+            self.req_to_token[req_idx, slice_obj] = values
         else:
             # Handle direct indexing case
             print(f"{indices=} {values=}")
-            self.req_to_token = self.req_to_token.at[indices].set(values)
+            self.req_to_token[indices] = values
 
-    def read(self, req_idx: int, length: int) -> jnp.ndarray:
+    def read(self, req_idx: int, length: int) -> np.ndarray:
         """Read token indices from specified request slot"""
-        return self.req_to_token[req_idx, :length]
+        return self.req_to_token[req_idx, :length].copy()
 
     def available_size(self) -> int:
         """Return number of available request slots"""
@@ -816,18 +805,18 @@ def update_kv_cache_vectorized(
     total_tokens = loc.shape[0]
     loc = loc.astype(jnp.int32)
 
-    # Choose strategy based on page_size
-    if page_size > 1:
-        # Use optimized contiguous grouping for page_size > 1
-        kv_cache_locs, new_kv_locs, slice_lens, num_slices = (
-            _optimize_contiguous_updates(loc, page_size)
-        )
-    else:
-        # Use original logic for page_size = 1: one slice per token
-        kv_cache_locs = jnp.where(loc == -1, 0, loc).astype(jnp.int32)
-        new_kv_locs = jnp.arange(total_tokens, dtype=jnp.int32)
-        slice_lens = jnp.where(loc == -1, 0, 1).astype(jnp.int32)
-        num_slices = total_tokens
+    # # Choose strategy based on page_size
+    # if page_size > 1:
+    #     # Use optimized contiguous grouping for page_size > 1
+    #     kv_cache_locs, new_kv_locs, slice_lens, num_slices = (
+    #         _optimize_contiguous_updates(loc, page_size)
+    #     )
+    # else:
+    # Use original logic for page_size = 1: one slice per token
+    kv_cache_locs = jnp.where(loc == -1, 0, loc).astype(jnp.int32)
+    new_kv_locs = jnp.arange(total_tokens, dtype=jnp.int32)
+    slice_lens = jnp.where(loc == -1, 0, 1).astype(jnp.int32)
+    num_slices = total_tokens
 
     # num_slices_per_block = get_num_slices_per_block(k, k_cache)
     num_slices_per_block = 4

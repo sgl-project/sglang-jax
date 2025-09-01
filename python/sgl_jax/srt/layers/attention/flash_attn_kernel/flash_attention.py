@@ -77,6 +77,11 @@ TUNED_BLOCK_SIZES = {
         ("bfloat16", "bfloat16", 8, 128, 128): (16, 32),
         ("bfloat16", "bfloat16", 16, 128, 128): (8, 32),
         ("bfloat16", "bfloat16", 32, 128, 128): (8, 32),
+        ("bfloat16", "bfloat16", 2, 128, 256): (16, 32),
+        ("bfloat16", "bfloat16", 4, 128, 256): (8, 32),
+        ("bfloat16", "bfloat16", 8, 128, 256): (16, 32),
+        ("bfloat16", "bfloat16", 16, 128, 256): (8, 32),
+        ("bfloat16", "bfloat16", 32, 128, 256): (8, 32),
         # go/keep-sorted end
     },
 }

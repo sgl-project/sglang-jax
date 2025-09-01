@@ -147,7 +147,9 @@ def create_multi_process_radix_cache(process_id, tp_size=8):
 
     # Create allocator
     allocator = TokenToKVPoolAllocator(
-        size=pool_size_per_device, dtype=dtype, kvcache=kv_cache
+        # size=pool_size_per_device, dtype=dtype, kvcache=kv_cache
+        size=pool_size_per_device,
+        kvcache=kv_cache,
     )
 
     # Create RadixCache, each process independent
