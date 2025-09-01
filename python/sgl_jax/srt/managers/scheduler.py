@@ -891,7 +891,7 @@ class Scheduler(
             if ret is None:
                 local_num_tokens = 0
             elif ret.forward_mode.is_decode():
-                local_num_tokens = ret.batch_size
+                local_num_tokens = ret.batch_size()
             else:
                 local_num_tokens = ret.extend_num_tokens
             local_token_size = ret.input_ids.shape[0] if ret is not None else 0
