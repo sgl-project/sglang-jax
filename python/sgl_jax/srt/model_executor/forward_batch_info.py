@@ -250,21 +250,21 @@ class ForwardBatch:
         global_cache_loc = jax.make_array_from_process_local_data(
             data_sharding, batch.cache_loc
         )
-        global_extend_prefix_lens = jax.make_array_from_process_local_data(
-            data_sharding,
-            (
-                np.array(batch.extend_prefix_lens)
-                if batch.extend_prefix_lens is not None
-                else None
-            ),
+        global_extend_prefix_lens = (
+            jax.make_array_from_process_local_data(
+                data_sharding,
+                np.array(batch.extend_prefix_lens),
+            )
+            if batch.extend_prefix_lens is not None
+            else None
         )
-        global_extend_seq_lens = jax.make_array_from_process_local_data(
-            data_sharding,
-            (
-                np.array(batch.extend_seq_lens)
-                if batch.extend_seq_lens is not None
-                else None
-            ),
+        global_extend_seq_lens = (
+            jax.make_array_from_process_local_data(
+                data_sharding,
+                np.array(batch.extend_seq_lens),
+            )
+            if batch.extend_seq_lens is not None
+            else None
         )
         return cls(
             forward_mode=batch.forward_mode,
