@@ -482,6 +482,9 @@ class ScheduleBatch:
     # Whether this batch is prefill-only (no token generation needed)
     is_prefill_only: bool = False
 
+    enable_dp_attention = False
+    global_array: jax.Array = None
+
     # Events
     launch_done: Optional[threading.Event] = None
 
@@ -1052,10 +1055,16 @@ class ScheduleBatch:
 
         # padding seq
         # extend & decode: input_ids, positions, out_cache_loc, cache_loc
+        global_max_input_ids_cpu = len(input_ids_cpu)
+        global_max_seq_lens = len(seq_lens_cpu)
+        if self.enable_dp_attention:
+            all_sizes = np.array(self.global_array)
+            global_max_input_ids_cpu = np.max(all_sizes[:, 1])
+            global_max_seq_lens = np.max(all_sizes[:, 2])
         padding_size = 0
         token_paddings.sort()
         for size in token_paddings:
-            if size >= len(input_ids_cpu):
+            if size >= global_max_input_ids_cpu:
                 padding_size = size - len(input_ids_cpu)
                 break
 
@@ -1126,7 +1135,7 @@ class ScheduleBatch:
         bs_paddings.sort()
         select_bs_index = -1
         for i, size in enumerate(bs_paddings):
-            if size >= len(seq_lens_cpu):
+            if size >= global_max_seq_lens:
                 bs_padding_size = size - len(seq_lens_cpu)
                 select_bs_index = i
                 break
