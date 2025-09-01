@@ -937,6 +937,7 @@ class ScheduleBatch:
             local_sizes = np.array(
                 [local_token_size, local_bs_size, local_cache_size], dtype=np.int32
             )
+            local_sizes = jax.device_put_replicated(local_sizes, jax.devices())
             logger.info(
                 f"before get allsizes {jax.tree_util.tree_leaves(local_sizes)} {jax.tree_util.tree_structure(local_sizes)}"
             )
