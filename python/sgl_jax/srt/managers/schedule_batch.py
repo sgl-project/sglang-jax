@@ -1075,7 +1075,7 @@ class ScheduleBatch:
             out_cache_loc_cpu = np.concatenate(
                 [
                     out_cache_loc_cpu,
-                    jnp.array(
+                    np.array(
                         [-1] * out_cache_loc_num_to_padding,
                         dtype=out_cache_loc_cpu.dtype,
                     ),
