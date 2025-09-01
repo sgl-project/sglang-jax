@@ -809,7 +809,7 @@ class Scheduler(
                 else:
                     local_num_tokens = ret.extend_num_tokens
                 local_token_size = ret.input_ids.shape[0] if ret is not None else 0
-                local_bs_size = ret.seq_lens.shape(0) if ret is not None else 0
+                local_bs_size = ret.seq_lens.shape[0] if ret is not None else 0
                 local_cache_size = sum(ret.seq_lens) if ret is not None else 0
                 local_array = np.array(
                     [
