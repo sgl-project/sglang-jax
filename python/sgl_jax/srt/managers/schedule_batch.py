@@ -937,6 +937,9 @@ class ScheduleBatch:
             local_sizes = np.array(
                 [local_token_size, local_bs_size, local_cache_size], dtype=np.int32
             )
+            logger.info(
+                f"before get allsizes {jax.tree_util.tree_leaves(local_sizes)} {jax.tree_util.tree_structure(local_sizes)}"
+            )
             # mesh_cpu = Mesh(jax.devices(backend="cpu"), ("host",))
             all_sizes = jax.experimental.multihost_utils.process_allgather(local_sizes)
             logger.info("after get allsizes")
