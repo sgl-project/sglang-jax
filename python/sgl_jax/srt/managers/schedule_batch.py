@@ -765,6 +765,7 @@ class ScheduleBatch:
             self,
             self.model_config.vocab_size,
         )
+        logger.info("after prepare_for_idle")
 
     def prepare_for_decode(self):
         self.forward_mode = ForwardMode.DECODE
@@ -927,6 +928,9 @@ class ScheduleBatch:
         local_token_size = len(input_ids_cpu)
         local_bs_size = len(seq_lens_cpu)
         local_cache_size = sum(seq_lens_cpu)
+        logger.info(
+            f"schedule_batch.get_model_worker_batch: {self.forward_mode.name} local_token_size={local_token_size}, local_bs_size={local_bs_size}, local_cache_size={local_cache_size}"
+        )
         # Gather sizes from all devices
         if self.enable_dp_attention:
             # Collect local sizes into arrays for all-gather
@@ -948,6 +952,7 @@ class ScheduleBatch:
                 logging.error(f"schedule_batch.get_model_worker_batch: {e}")
             global_max_bs_size = jnp.max(all_sizes[:, 1]).item()
             global_max_cache_size = jnp.max(all_sizes[:, 2]).item()
+            logger.info(f"---------------all size {all_sizes}")
         else:
             global_max_token_size = local_token_size
             global_max_bs_size = local_bs_size
