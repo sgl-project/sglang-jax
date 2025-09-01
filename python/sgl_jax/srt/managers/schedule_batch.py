@@ -1041,9 +1041,9 @@ class ScheduleBatch:
         seq_lens_cpu = self.seq_lens
         real_bs = len(seq_lens_cpu)
         req_pool_indices_cpu = self.req_pool_indices
-        token_indices_with_all_reqs = jax.device_get(
-            self.req_to_token_pool.req_to_token[self.req_pool_indices]
-        )
+        token_indices_with_all_reqs = self.req_to_token_pool.req_to_token[
+            self.req_pool_indices
+        ]
 
         # padding seq
         # extend & decode: input_ids, positions, out_cache_loc, cache_loc
