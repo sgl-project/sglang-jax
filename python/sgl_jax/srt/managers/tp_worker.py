@@ -4,7 +4,7 @@ import itertools
 import logging
 import threading
 import time
-from typing import Optional, Tuple, Union
+from typing import Any, Optional, Tuple, Union
 
 import jax
 import jax.numpy as jnp
@@ -339,10 +339,12 @@ class ModelWorker:
         model_worker_batch: ModelWorkerBatch,
         launch_done: Optional[threading.Event] = None,
         skip_sample: bool = False,
-    ) -> Tuple[Union[LogitsProcessorOutput, jax.Array, int], Optional[jax.Array]]:
+    ) -> tuple[Any, Any | None, Any]:
+        logger.info("before ForwardBatch.init_new")
         forward_batch = ForwardBatch.init_new(
             model_worker_batch, self.model_runner, self.mesh
         )
+        logger.info("after ForwardBatch.init_new")
 
         logits_output, cache_miss_count = self.model_runner.forward(
             forward_batch,
@@ -350,20 +352,20 @@ class ModelWorker:
                 model_worker_batch, self.mesh
             ),
         )
-
+        logger.info("after self.model_runner.forward")
         idx = model_worker_batch.extend_start_loc[: model_worker_batch.real_bs]
         logits_output.truncate_logits_processor_output(idx)
-
+        logger.info("logits_output.truncate_logits_processor_output(idx)")
         if launch_done is not None:
             launch_done.set()
-
+        logger.info("launch_done.set()")
         if skip_sample:
             next_token_ids_device = None
         else:
             next_token_ids_device = self.model_runner.sample(
                 logits_output, model_worker_batch
             )
-
+        logger.info("after next_token_ids_device = self.model_runner.sample")
         return (
             logits_output,
             next_token_ids_device,
