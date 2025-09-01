@@ -128,6 +128,8 @@ class ServerArgs:
 
     disable_jax_precompile: bool = False
 
+    enable_custom_logit_processor: bool = False
+
     def __post_init__(self):
         # Set missing default values
         if self.tokenizer_path is None:
@@ -578,7 +580,11 @@ class ServerArgs:
             default=None,
             help="Config in json format for NVIDIA dynamo KV event publishing. Publishing will be enabled if this flag is used.",
         )
-
+        parser.add_argument(
+            "--enable-custom-logit-processor",
+            action="store_true",
+            help="Enable users to pass custom logit processors to the server (disabled by default for security)",
+        )
         # API related
         parser.add_argument(
             "--api-key",
