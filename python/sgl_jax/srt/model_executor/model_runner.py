@@ -426,14 +426,14 @@ class ModelRunner:
         logits_metadata: LogitsMetadata,
         skip_attn_backend_init: bool,
     ) -> Tuple[LogitsProcessorOutput, int]:
-        return [
+        return (
             LogitsProcessorOutput(
                 next_token_logits=jnp.zeros(
                     (1, 1, self.model_config.vocab_size), dtype=self.dtype
                 )
             ),
             0,
-        ]
+        )
         with self.mesh, jax.sharding.use_mesh(self.mesh):
             if forward_batch.forward_mode.is_decode():
                 ret = self.forward_decode(forward_batch, logits_metadata)
