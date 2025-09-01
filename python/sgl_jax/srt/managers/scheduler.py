@@ -932,8 +932,7 @@ class Scheduler(
 
         logger.info(f"after dp sync Node {self.node_rank} ret: {ret}")
         if ret is not None:
-            ret.enable_dp_attention = self.server_args.enable_dp_attention
-            ret.global_array = global_array
+            ret.device_put_sample_info()
         return ret
 
     def get_new_batch_prefill(self) -> Optional[ScheduleBatch]:

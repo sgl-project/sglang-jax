@@ -758,6 +758,9 @@ class ScheduleBatch:
             pt += extend_lens[i]
 
         # Build sampling info
+        logger.info("SamplingBatchInfo.from_schedule_batch")
+
+    def device_put_sample_info(self):
         self.sampling_info = SamplingBatchInfo.from_schedule_batch(
             self,
             self.model_config.vocab_size,
@@ -875,10 +878,10 @@ class ScheduleBatch:
         self.req_pool_indices = np.empty(0, jnp.int32)
         self.seq_lens_sum = 0
         self.extend_num_tokens = 0
-        self.sampling_info = SamplingBatchInfo.from_schedule_batch(
-            self,
-            self.model_config.vocab_size,
-        )
+        # self.sampling_info = SamplingBatchInfo.from_schedule_batch(
+        #     self,
+        #     self.model_config.vocab_size,
+        # )
 
     def prepare_for_decode(self):
         self.forward_mode = ForwardMode.DECODE
@@ -899,17 +902,20 @@ class ScheduleBatch:
 
         # Allocate memory
         if self.token_to_kv_pool_allocator.page_size == 1:
-            self.out_cache_loc = self.alloc_token_slots(bs)
+            out_cache_loc = self.alloc_token_slots(bs)
         else:
             last_loc = self.req_to_token_pool.req_to_token[
                 self.req_pool_indices, self.seq_lens - 2
             ]
-            self.out_cache_loc = self.alloc_paged_token_slots_decode(
+            out_cache_loc = self.alloc_paged_token_slots_decode(
                 self.seq_lens.tolist(),
                 last_loc.tolist(),
             )
+        self.out_cache_loc = jax.device_get(
+            out_cache_loc
+        )  # todo: aolemila, remove jax.device_get
         self.req_to_token_pool.write(
-            (self.req_pool_indices, locs), self.out_cache_loc.astype(np.int32)
+            (self.req_pool_indices, locs), out_cache_loc.astype(np.int32)
         )
 
     def filter_batch(
