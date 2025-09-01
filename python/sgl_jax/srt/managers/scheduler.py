@@ -899,10 +899,10 @@ class Scheduler(
             local_cache_size = sum(ret.seq_lens) if ret is not None else 0
             local_array = np.array(
                 [
-                    local_num_tokens,
-                    local_token_size,
-                    local_bs_size,
-                    local_cache_size,
+                    int(local_num_tokens),
+                    int(local_token_size),
+                    int(local_bs_size),
+                    int(local_cache_size),
                 ],
                 dtype=np.int32,
             )
