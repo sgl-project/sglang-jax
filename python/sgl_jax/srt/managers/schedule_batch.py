@@ -472,6 +472,7 @@ class ScheduleBatch:
     mesh: mesh_lib.Mesh = None
 
     enable_dp_attention: bool = False
+    global_array: jax.Array = None
 
     @classmethod
     def init_new(
@@ -934,20 +935,20 @@ class ScheduleBatch:
         # Gather sizes from all devices
         if self.enable_dp_attention:
             # Collect local sizes into arrays for all-gather
-            local_sizes = np.array(
-                [local_token_size, local_bs_size, local_cache_size], dtype=np.int32
-            )
-            local_sizes = jax.device_put_replicated(local_sizes, jax.devices())
-            logger.info(
-                f"before get allsizes {jax.tree_util.tree_leaves(local_sizes)} {jax.tree_util.tree_structure(local_sizes)}"
-            )
+            # local_sizes = np.array(
+            #     [local_token_size, local_bs_size, local_cache_size], dtype=np.int32
+            # )
+            # local_sizes = jax.device_put_replicated(local_sizes, jax.devices())
+            # logger.info(
+            #     f"before get allsizes {jax.tree_util.tree_leaves(local_sizes)} {jax.tree_util.tree_structure(local_sizes)}"
+            # )
             # mesh_cpu = Mesh(jax.devices(backend="cpu"), ("host",))
-            all_sizes = jax.experimental.multihost_utils.process_allgather(local_sizes)
+            all_sizes = self.global_array
             logger.info("after get allsizes")
             # Calculate global max sizes
-            global_max_token_size = jnp.max(all_sizes[:, 0]).item()
-            global_max_bs_size = jnp.max(all_sizes[:, 1]).item()
-            global_max_cache_size = jnp.max(all_sizes[:, 2]).item()
+            global_max_token_size = jnp.max(all_sizes[:, 1]).item()
+            global_max_bs_size = jnp.max(all_sizes[:, 2]).item()
+            global_max_cache_size = jnp.max(all_sizes[:, 3]).item()
             # logger.info(f"---------------all size {all_sizes}")
         else:
             global_max_token_size = local_token_size

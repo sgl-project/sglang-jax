@@ -798,6 +798,7 @@ class Scheduler(
                 ret = None
         logger.info(f"before dp sync Node {self.node_rank} ret: {ret}")
         # DP Attention: Synchronize batch across DP groups
+        global_array = None
         if self.server_args.enable_dp_attention:
             try:
                 local_num_tokens = 0
@@ -807,15 +808,26 @@ class Scheduler(
                     local_num_tokens = ret.batch_size
                 else:
                     local_num_tokens = ret.extend_num_tokens
-                global_num_tokens = self.all_gather_by_cpu(
-                    np.array([local_num_tokens], dtype=np.int32)
+                local_token_size = ret.input_ids.shape[0] if ret is not None else 0
+                local_bs_size = ret.seq_lens.shape(0) if ret is not None else 0
+                local_cache_size = sum(ret.seq_lens) if ret is not None else 0
+                local_array = np.array(
+                    [
+                        local_num_tokens,
+                        local_token_size,
+                        local_bs_size,
+                        local_cache_size,
+                    ],
+                    dtype=np.int32,
                 )
+                global_array = jax.experimental.multihost_utils.process_allgather(
+                    local_array
+                )
+
                 logger.info(
-                    f"Node {self.node_rank} global_num_tokens: {np.array(global_num_tokens)}"
+                    f"Node {self.node_rank} global_num_tokens: {np.array(global_array)}"
                 )
-                is_all_idle = all(
-                    size == 0 for size in np.array(global_num_tokens).flatten()
-                )
+                is_all_idle = all(size == 0 for size in np.array(global_array)[:, 0])
                 if not is_all_idle and ret is None:
                     ret = self.get_idle_batch()
             except Exception as e:
@@ -823,6 +835,7 @@ class Scheduler(
         logger.info(f"after dp sync Node {self.node_rank} ret: {ret}")
         if ret is not None:
             ret.enable_dp_attention = self.server_args.enable_dp_attention
+            ret.global_array = global_array
         return ret
 
     def get_new_batch_prefill(self) -> Optional[ScheduleBatch]:
