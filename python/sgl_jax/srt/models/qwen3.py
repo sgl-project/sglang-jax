@@ -298,11 +298,11 @@ class QWen3Model(nnx.Module):
                 return True
 
             transformer_callback_flag = jax.pure_callback(
-                transformer_trace_callback, jnp.bool, hidden_states
+                transformer_trace_callback, jnp.int32(0), hidden_states
             )
             return hidden_states, layers_k, layers_v, transformer_callback_flag
         else:
-            return hidden_states, layers_k, layers_v, jnp.bool(True)
+            return hidden_states, layers_k, layers_v, jnp.int32(0)
 
 
 class Qwen3ForCausalLM(nnx.Module):
