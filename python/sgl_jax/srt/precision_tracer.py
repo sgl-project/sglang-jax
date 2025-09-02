@@ -60,6 +60,7 @@ class PrecisionTracer:
         self._trace_output_file = None
         self._verbose_logging = False  # Control console output during tracing
         self._enable_precision_tracer = False  # Global enable/disable switch
+        self._delayed_records = {}  # Cache for records from JIT callbacks
 
     def set_enable_precision_tracer(self, enabled: bool):
         """Set the global enable/disable switch for precision tracer"""
@@ -88,6 +89,7 @@ class PrecisionTracer:
         self._request_counter = 0
         self._completed_requests_count = 0
         self._request_id_to_number = {}  # Reset request ID to number mapping
+        self._delayed_records = {}  # Clear any previous delayed records
         self._max_requests = req_num
         self._verbose_logging = verbose_logging
 
@@ -179,17 +181,26 @@ class PrecisionTracer:
 
         pid = os.getpid()
 
+        # Check if we have delayed records for this request
+        with self.lock:
+            delayed_records = self._delayed_records.pop(request_id, [])
+
         self._request_traces[request_id] = {
             "request_id": request_id,
             "request_number": request_number,
             "start_time": time.time(),
-            "precision_records": [],
+            "precision_records": delayed_records,  # Start with any delayed records
             "status": "active",
             "content_hash": (
                 self._compute_request_hash(req_content) if req_content else None
             ),
             "process_id": pid,
         }
+
+        if delayed_records:
+            logger.debug(
+                f"Applied {len(delayed_records)} delayed precision records to request {request_id}"
+            )
 
         return request_id
 
@@ -201,28 +212,37 @@ class PrecisionTracer:
         if request_id is None:
             request_id = self._current_request_id
 
-        if request_id and request_id in self._request_traces:
-            trace_data = self._request_traces[request_id]
-            trace_data["end_time"] = time.time()
-            trace_data["duration"] = trace_data["end_time"] - trace_data["start_time"]
-            trace_data["status"] = "completed"
+        with self.lock:  # Protect request_traces access during cleanup
+            if request_id and request_id in self._request_traces:
+                trace_data = self._request_traces[
+                    request_id
+                ].copy()  # Make a copy before deletion
+                trace_data["end_time"] = time.time()
+                trace_data["duration"] = (
+                    trace_data["end_time"] - trace_data["start_time"]
+                )
+                trace_data["status"] = "completed"
 
-            # Save to JSONL file
-            try:
-                with open(self._trace_output_file, "a", encoding="utf-8") as f:
-                    json.dump(trace_data, f, cls=TensorJSONEncoder, ensure_ascii=False)
-                    f.write("\n")
-            except Exception as e:
-                logger.error(f"Error saving request trace: {e}")
+                # Remove from active traces immediately
+                del self._request_traces[request_id]
+                self._completed_requests_count += 1
+            else:
+                return  # Request not found, nothing to do
 
-            # Clean up and increment completed count
-            del self._request_traces[request_id]
-            self._completed_requests_count += 1
-            logger.info(
-                f"Request trace completed ({self._completed_requests_count}/{self._max_requests}): {request_id}"
-            )
-            if request_id == self._current_request_id:
-                self._current_request_id = None
+        # Save to JSONL file (outside the main lock to avoid blocking)
+        try:
+            with open(self._trace_output_file, "a", encoding="utf-8") as f:
+                json.dump(trace_data, f, cls=TensorJSONEncoder, ensure_ascii=False)
+                f.write("\n")
+                f.flush()  # Ensure data is written immediately
+        except Exception as e:
+            logger.error(f"Error saving request trace: {e}")
+
+        logger.info(
+            f"Request trace completed ({self._completed_requests_count}/{self._max_requests}): {request_id}"
+        )
+        if request_id == self._current_request_id:
+            self._current_request_id = None
 
     def record(
         self,
@@ -267,17 +287,31 @@ class PrecisionTracer:
                 f"No specific request_ids, using all active traces: {request_ids_to_process}"
             )
 
-        # Add stats to all relevant requests
-        for req_id in request_ids_to_process:
-            if req_id and req_id in self._request_traces:
-                # Create a copy of stats for each request
-                req_stats = stats.copy()
-                req_stats["request_id"] = req_id
-                self._request_traces[req_id]["precision_records"].append(req_stats)
-            elif req_id:
-                logger.warning(
-                    f"Request ID mismatch: {req_id} not in traces {list(self._request_traces.keys())}"
-                )
+        # Handle case where callback executes after some requests have ended
+        if not request_ids_to_process:
+            logger.warning(
+                f"No request IDs available for precision record - this may happen when callback executes after request completion"
+            )
+            return  # Skip recording if no requests to associate with
+
+        # Add stats to all relevant requests with thread safety
+        with self.lock:  # Protect request_traces access
+            for req_id in request_ids_to_process:
+                if req_id and req_id in self._request_traces:
+                    # Create a copy of stats for each request
+                    req_stats = stats.copy()
+                    req_stats["request_id"] = req_id
+                    self._request_traces[req_id]["precision_records"].append(req_stats)
+                elif req_id:
+                    # Store delayed record for requests that have already ended
+                    if req_id not in self._delayed_records:
+                        self._delayed_records[req_id] = []
+                    req_stats = stats.copy()
+                    req_stats["request_id"] = req_id
+                    self._delayed_records[req_id].append(req_stats)
+                    logger.debug(
+                        f"Stored delayed precision record for completed request {req_id}"
+                    )
 
         # Set the first request ID for display purposes
         if request_ids_to_process:
