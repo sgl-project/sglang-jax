@@ -484,6 +484,7 @@ class QWenLMHeadModel(nnx.Module):
         hidden_states, layers_k, layers_v = self.transformer(
             input_ids, positions, forward_batch
         )
+        logger.info("after transformer")
         return hidden_states, layers_k, layers_v
 
 
