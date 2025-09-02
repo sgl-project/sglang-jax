@@ -58,7 +58,7 @@ def rmsnorm_forward(
     logger.info("rmsnorm input 8 ")
     out = y * weight
     logger.info("rmsnorm input 9 ")
-    output = (out).astype(orig_dtype)
+    output = out
     logger.info("rmsnorm input 10 ")
     if residual is None:
         return output
