@@ -474,11 +474,11 @@ class Qwen3ForCausalLM(nnx.Module):
         positions: jax.Array,
         forward_batch: ForwardBatch,
     ):
-        hidden_states, layers_k, layers_v, layers_callback_flag = self.transformer(
+        hidden_states, layers_k, layers_v, _ = self.transformer(
             input_ids, positions, forward_batch
         )
 
-        return hidden_states, layers_k, layers_v, layers_callback_flag
+        return hidden_states, layers_k, layers_v
 
 
 EntryClass = Qwen3ForCausalLM
