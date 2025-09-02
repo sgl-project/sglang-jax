@@ -335,6 +335,7 @@ class QWenModel(nnx.Module):
             logger.info(f"after layer {layer.layer_id}")
             layers_k.append(k)
             layers_v.append(v)
+        jax.debug.visualize_array_sharding(hidden_states)
         logger.info("before ln_f")
         global_tracer.print(hidden_states, "RMSNorm_final_input", "rmsnorm_final")
         hidden_states = self.ln_f(hidden_states)
