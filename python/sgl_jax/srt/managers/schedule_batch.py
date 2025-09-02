@@ -1209,11 +1209,13 @@ class ScheduleBatch:
             launch_done=self.launch_done,
             trace_request_ids=(
                 self._generate_trace_request_ids(real_bs)
-                if precision_tracer._trace_active
+                if precision_tracer._enable_precision_tracer
                 else None
             ),
             trace_request_objects=(
-                self.reqs[:real_bs] if precision_tracer._trace_active else None
+                self.reqs[:real_bs]
+                if precision_tracer._enable_precision_tracer
+                else None
             ),
         )
 

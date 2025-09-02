@@ -235,7 +235,16 @@ class PrecisionTracer:
         request_ids: Optional[List[str]] = None,
         seq_lens: Optional[Any] = None,
     ):
+        # Debug logging to track what's happening
+        logger.info(f"[DEBUG] record() called: name={name}, stage={stage}")
+        logger.info(
+            f"[DEBUG] _enable_precision_tracer={self._enable_precision_tracer}, _trace_active={self._trace_active}"
+        )
+        logger.info(f"[DEBUG] request_ids={request_ids}, seq_lens={seq_lens}")
+        logger.info(f"[DEBUG] active_traces={list(self._request_traces.keys())}")
+
         if not self._enable_precision_tracer or not self._trace_active:
+            logger.info(f"[DEBUG] Skipping record - tracer not active")
             return
 
         if tensor is None:
