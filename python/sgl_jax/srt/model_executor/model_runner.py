@@ -3,6 +3,7 @@
 import logging
 import os
 from functools import partial
+from math import log
 from typing import Optional, Tuple, Union
 
 import jax
@@ -368,7 +369,7 @@ class ModelRunner:
                 self.state, input_ids, positions, forward_batch
             )
             cache_miss_count = count()
-
+        logger.info("before compute_logits")
         result = self.compute_logits(self.state, hidden_states, logits_metadata)
         if not forward_batch.forward_mode.is_idle():
             self._set_kv_cache_after_forward(layers_k, layers_v, forward_batch)
@@ -458,7 +459,7 @@ class ModelRunner:
                 ret = self.forward_idle(forward_batch, logits_metadata=logits_metadata)
             else:
                 raise ValueError(f"Invalid forward mode: {forward_batch.forward_mode}")
-
+        logger.info("after forward_raw")
         return ret
 
     def _preprocess_logits(
