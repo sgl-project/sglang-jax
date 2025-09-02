@@ -7,7 +7,6 @@ from jax.experimental.shard_map import shard_map
 from jax.sharding import Mesh
 from jax.sharding import PartitionSpec as P
 
-from sgl_jax.srt.debug_tracer import trace_function
 from sgl_jax.srt.layers import linear
 
 
@@ -78,7 +77,6 @@ class GateLogit(nnx.Module):
         else:
             self.bias = None
 
-    @trace_function(stage="MOE_GATE_FORWARD", include_args=False, include_output=True)
     def __call__(self, inputs: jax.Array) -> Tuple[jax.Array, Optional[jax.Array]]:
         inputs = jnp.asarray(inputs, self.dtype)
 
@@ -174,7 +172,6 @@ class EPMoE(nnx.Module):
         except Exception as e:
             return False, "cpu"
 
-    @trace_function(stage="MOE_SPARSE_FORWARD", include_args=False, include_output=True)
     def __call__(self, inputs, router_logits=None):
         if router_logits is None:
             raise ValueError("router_logits is required for EPMoE")

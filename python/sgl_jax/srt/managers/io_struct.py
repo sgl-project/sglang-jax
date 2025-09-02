@@ -1,4 +1,5 @@
 import copy
+import time
 import uuid
 from dataclasses import dataclass
 from enum import Enum
@@ -578,3 +579,38 @@ class VertexGenerateReqInput(GenerateReqInput):
     """Vertex AI compatible generate request input."""
 
     pass
+
+
+@dataclass
+class StartTraceReqInput(RpcReqInput):
+    """Request to start precision tracing."""
+
+    req_num: Optional[int] = None  # Maximum number of requests to trace
+    output_file: Optional[str] = None  # Output file path
+    request_id: str = ""  # Override base class field with default
+
+    def __post_init__(self):
+        if not self.request_id:
+            self.request_id = f"start_trace_{int(time.time())}"
+
+
+@dataclass
+class StopTraceReqInput(RpcReqInput):
+    """Request to stop precision tracing."""
+
+    request_id: str = ""  # Override base class field with default
+
+    def __post_init__(self):
+        if not self.request_id:
+            self.request_id = f"stop_trace_{int(time.time())}"
+
+
+@dataclass
+class TraceStatusReqInput(RpcReqInput):
+    """Request to get trace status."""
+
+    request_id: str = ""  # Override base class field with default
+
+    def __post_init__(self):
+        if not self.request_id:
+            self.request_id = f"trace_status_{int(time.time())}"

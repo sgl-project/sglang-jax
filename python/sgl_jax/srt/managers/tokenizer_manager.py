@@ -672,7 +672,15 @@ class TokenizerManager:
         responses: List[SetInternalStateReqOutput] = (
             await self.set_internal_state_communicator(obj)
         )
-        return [res.internal_state for res in responses]
+        return (
+            responses[0]
+            if responses
+            else SetInternalStateReqOutput(
+                request_id=obj.request_id,
+                success=False,
+                error_msg="No response from scheduler",
+            )
+        )
 
     def get_log_request_metadata(self):
         max_length = None

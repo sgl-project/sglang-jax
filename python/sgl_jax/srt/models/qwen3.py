@@ -15,6 +15,7 @@ from sgl_jax.srt.layers.linear import LinearBase
 from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
 from sgl_jax.srt.layers.radix_attention import RadixAttention
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
+from sgl_jax.srt.precision_tracer import precision_tracer
 from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
 
 logger = logging.getLogger(__name__)
@@ -287,7 +288,21 @@ class QWen3Model(nnx.Module):
             layers_v.append(v)
 
         hidden_states, _ = self.norm(hidden_states, residual)
-        return hidden_states, layers_k, layers_v
+
+        # Conditional precision tracing - only use jax.pure_callback when tracer is enabled
+        # This avoids performance impact from jax.pure_callback when precision tracing is disabled
+        if precision_tracer._enable_precision_tracer:
+
+            def transformer_trace_callback(tensor):
+                precision_tracer.record(tensor, "transformer_output", "TRANSFORMER")
+                return True
+
+            transformer_callback_flag = jax.pure_callback(
+                transformer_trace_callback, jnp.int32(0), hidden_states
+            )
+            return hidden_states, layers_k, layers_v, transformer_callback_flag
+        else:
+            return hidden_states, layers_k, layers_v, jnp.bool_(True)
 
 
 class Qwen3ForCausalLM(nnx.Module):
@@ -461,11 +476,11 @@ class Qwen3ForCausalLM(nnx.Module):
         positions: jax.Array,
         forward_batch: ForwardBatch,
     ):
-        hidden_states, layers_k, layers_v = self.transformer(
+        hidden_states, layers_k, layers_v, callback_flag = self.transformer(
             input_ids, positions, forward_batch
         )
 
-        return hidden_states, layers_k, layers_v
+        return hidden_states, layers_k, layers_v, callback_flag
 
 
 EntryClass = Qwen3ForCausalLM

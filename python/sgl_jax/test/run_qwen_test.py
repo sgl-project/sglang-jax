@@ -63,16 +63,16 @@ def check_transformers_dependencies():
 
 
 def run_tests(
-    test_name=None, model_path=None, verbose=False, enable_debug_tracer=False
+    test_name=None, model_path=None, verbose=False, enable_precision_tracer=False
 ):
     """Run the QWen JAXModelLoader tests"""
     env = os.environ.copy()
     if model_path:
         env["MODEL_PATH"] = model_path
         print(f"Using model path: {model_path}")
-    if enable_debug_tracer:
-        print("✓ Enable debug tracer", enable_debug_tracer)
-        env["ENABLE_DEBUG_TRACER"] = "true"
+    if enable_precision_tracer:
+        print("✓ Enable precision tracer", enable_precision_tracer)
+        env["ENABLE_PRECISION_TRACER"] = "true"
     if test_name:
         test_target = f"test_qwen_load_weights.TestQWenLoadWeights.{test_name}"
     else:
@@ -254,9 +254,9 @@ def main():
         "--list-tests", action="store_true", help="List all available test methods"
     )
     parser.add_argument(
-        "--enable-debug-tracer",
+        "--enable-precision-tracer",
         action="store_true",
-        help="Enable debug tracer for debugging purposes.",
+        help="Enable precision tracer for debugging purposes.",
     )
 
     args = parser.parse_args()
@@ -319,7 +319,7 @@ def main():
         test_name=args.test,
         model_path=args.model_path,
         verbose=args.verbose,
-        enable_debug_tracer=args.enable_debug_tracer,
+        enable_precision_tracer=args.enable_precision_tracer,
     )
 
     if success:

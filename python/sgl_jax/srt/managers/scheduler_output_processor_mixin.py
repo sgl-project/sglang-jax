@@ -11,6 +11,7 @@ import numpy as np
 from sgl_jax.srt.layers.logits_processor import LogitsProcessorOutput
 from sgl_jax.srt.managers.io_struct import BatchTokenIDOut
 from sgl_jax.srt.managers.schedule_batch import BaseFinishReason, Req, ScheduleBatch
+from sgl_jax.srt.precision_tracer import precision_tracer
 
 if TYPE_CHECKING:
     from sgl_jax.srt.managers.scheduler import (
@@ -81,6 +82,11 @@ class SchedulerOutputProcessorMixin:
                 req.check_finished()
 
                 if req.finished():
+                    # End trace for finished request
+                    if precision_tracer._trace_active:
+                        request_id = str(req.rid)
+                        if request_id in precision_tracer._request_traces:
+                            precision_tracer.end_request_trace(request_id)
                     self.tree_cache.cache_finished_req(req)
                 elif not batch.decoding_reqs or req not in batch.decoding_reqs:
                     # This updates radix so others can match
@@ -189,6 +195,11 @@ class SchedulerOutputProcessorMixin:
 
             req.check_finished()
             if req.finished():
+                # End trace for finished request
+                if precision_tracer._trace_active:
+                    request_id = str(req.rid)
+                    if request_id in precision_tracer._request_traces:
+                        precision_tracer.end_request_trace(request_id)
                 self.tree_cache.cache_finished_req(req)
 
             if req.return_logprob:

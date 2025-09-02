@@ -60,9 +60,13 @@ from sgl_jax.srt.managers.io_struct import (
     ResumeMemoryOccupationReqInput,
     SeparateReasoningReqInput,
     SetInternalStateReq,
+    StartTraceReqInput,
+    StopTraceReqInput,
+    TraceStatusReqInput,
 )
 from sgl_jax.srt.managers.template_manager import TemplateManager
 from sgl_jax.srt.managers.tokenizer_manager import TokenizerManager
+from sgl_jax.srt.precision_tracer import precision_tracer
 from sgl_jax.srt.reasoning_parser import ReasoningParser
 from sgl_jax.srt.server_args import ServerArgs
 from sgl_jax.srt.utils import (
@@ -401,6 +405,129 @@ async def stop_profile_async():
     )
 
 
+@app.api_route("/start_trace", methods=["GET", "POST"])
+async def start_trace_async(obj: Optional[StartTraceReqInput] = None):
+    """Start precision tracing."""
+    if obj is None:
+        obj = StartTraceReqInput()
+    try:
+        # Check if precision tracer is globally enabled
+        if not precision_tracer._enable_precision_tracer:
+            return ORJSONResponse(
+                content={
+                    "message": "Precision tracer is disabled. Server must be started with --enable-precision-tracer flag.",
+                    "status": "error",
+                },
+                status_code=400,
+            )
+
+        # Start trace in main process
+        precision_tracer.start_trace(req_num=obj.req_num, output_file=obj.output_file)
+
+        # Also send trace state to scheduler process via set_internal_state
+        print(f"[HTTP] Sending trace state to scheduler...")
+        trace_state = {
+            "precision_tracer": {
+                "trace_active": True,
+                "max_requests": obj.req_num,
+                "output_file": precision_tracer._trace_output_file,
+            }
+        }
+        # Send trace state to scheduler in background (non-blocking)
+        import asyncio
+
+        async def send_trace_state():
+            try:
+                result = await _global_state.tokenizer_manager.set_internal_state(
+                    SetInternalStateReq(
+                        request_id="trace_state", state_data=trace_state
+                    )
+                )
+                print(f"[HTTP] Set internal state result: {result}")
+            except Exception as e:
+                print(f"[HTTP] Error setting internal state: {e}")
+
+        # Start the task but don't wait for it
+        asyncio.create_task(send_trace_state())
+
+        return ORJSONResponse(
+            content={
+                "message": "Precision tracing started successfully.",
+                "status": "ok",
+                "req_num": obj.req_num,
+                "output_file": precision_tracer._trace_output_file,
+            },
+            status_code=200,
+        )
+    except Exception as e:
+        return ORJSONResponse(
+            content={
+                "message": f"Failed to start tracing: {str(e)}",
+                "status": "error",
+            },
+            status_code=500,
+        )
+
+
+@app.api_route("/stop_trace", methods=["GET", "POST"])
+async def stop_trace_async(obj: Optional[StopTraceReqInput] = None):
+    """Stop precision tracing."""
+    try:
+        # Stop trace in main process
+        output_file = precision_tracer.stop_trace()
+
+        # Also send trace state to scheduler process via set_internal_state
+        trace_state = {
+            "precision_tracer": {
+                "trace_active": False,
+                "max_requests": None,
+                "output_file": None,
+            }
+        }
+        await _global_state.tokenizer_manager.set_internal_state(
+            SetInternalStateReq(request_id="trace_state", state_data=trace_state)
+        )
+
+        return ORJSONResponse(
+            content={
+                "message": "Precision tracing stopped successfully.",
+                "status": "ok",
+                "output_file": output_file,
+            },
+            status_code=200,
+        )
+    except Exception as e:
+        return ORJSONResponse(
+            content={"message": f"Failed to stop tracing: {str(e)}", "status": "error"},
+            status_code=500,
+        )
+
+
+@app.api_route("/trace_status", methods=["GET", "POST"])
+async def trace_status_async(obj: Optional[TraceStatusReqInput] = None):
+    """Get precision tracing status."""
+    try:
+        return ORJSONResponse(
+            content={
+                "status": "ok",
+                "trace_active": precision_tracer._trace_active,
+                "request_counter": precision_tracer._request_counter,
+                "max_requests": precision_tracer._max_requests,
+                "output_file": precision_tracer._trace_output_file,
+                "active_request_traces": len(precision_tracer._request_traces),
+            },
+            status_code=200,
+        )
+    except Exception as e:
+        return ORJSONResponse(
+            content={
+                "message": f"Failed to get trace status: {str(e)}",
+                "status": "error",
+            },
+            status_code=500,
+        )
+
+
 @app.api_route("/release_memory_occupation", methods=["GET", "POST"])
 async def release_memory_occupation(
     obj: ReleaseMemoryOccupationReqInput, request: Request
@@ -663,6 +790,9 @@ def launch_server(
     1. The HTTP server, Engine, and TokenizerManager both run in the main process.
     2. Inter-process communication is done through IPC (each process uses a different port) via the ZMQ library.
     """
+    # Initialize precision tracer enable state in HTTP server process
+    precision_tracer.set_enable_precision_tracer(server_args.enable_precision_tracer)
+
     tokenizer_manager, template_manager, scheduler_info = _launch_subprocesses(
         server_args=server_args, port_args=None
     )
