@@ -364,11 +364,11 @@ class ModelRunner:
         cache_miss_count = 0
         import jax._src.test_util as jtu
 
-        with jtu.count_pjit_cpp_cache_miss() as count:
-            hidden_states, layers_k, layers_v = self.model_fn(
-                self.state, input_ids, positions, forward_batch
-            )
-            cache_miss_count = count()
+        # with jtu.count_pjit_cpp_cache_miss() as count:
+        hidden_states, layers_k, layers_v = self.model_fn(
+            self.state, input_ids, positions, forward_batch
+        )
+        # cache_miss_count = count()
         logger.info("before compute_logits")
         result = self.compute_logits(self.state, hidden_states, logits_metadata)
         if not forward_batch.forward_mode.is_idle():
