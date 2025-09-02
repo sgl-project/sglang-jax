@@ -339,7 +339,7 @@ class QWenModel(nnx.Module):
         global_tracer.print(hidden_states, "RMSNorm_final_input", "rmsnorm_final")
         hidden_states = self.ln_f(hidden_states)
         global_tracer.print(hidden_states, "RMSNorm_final_output", "rmsnorm_final")
-        logger.info(f"after ln_f {hidden_states[:,:]}")
+        logger.info(f"after ln_f {hidden_states[0,0]}")
         time.sleep(100)
         return hidden_states, layers_k, layers_v
 
@@ -463,10 +463,11 @@ class QWenLMHeadModel(nnx.Module):
         hidden_states: jax.Array,
         logits_metadata: LogitsMetadata,
     ):
+        import time
+
         time.sleep(100)
 
         logger.info("start compute_logits")
-        import time
 
         ret = self.logits_processor(
             hidden_states, self.lm_head, logits_metadata, self.mesh
