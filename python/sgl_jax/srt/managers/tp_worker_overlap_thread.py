@@ -151,12 +151,13 @@ class ModelWorkerClient:
         This function is called to resolve the last batch result and
         wait for the current batch to be launched. Used in overlap mode.
         """
+        logger.info("resolve_last_batch_result")
         _, logits_output, next_token_ids, cache_miss_count = self.output_queue.get()
-
+        logger.info(f"get logits_output {logits_output} {next_token_ids}")
         if launch_done is not None:
             launch_done.wait()
         # JAX handles synchronization automatically, no explicit sync needed
-
+        logger.info("after wait launch_done")
         if logits_output.next_token_logprobs is not None:
             logits_output.next_token_logprobs = (
                 logits_output.next_token_logprobs.tolist()
@@ -165,6 +166,9 @@ class ModelWorkerClient:
                 logits_output.input_token_logprobs = tuple(
                     logits_output.input_token_logprobs.tolist()
                 )
+        logger.info(
+            f"after get logits_output {logits_output} {next_token_ids} {cache_miss_count}"
+        )
         # next_token_ids = next_token_ids.tolist()
         return logits_output, next_token_ids, cache_miss_count
 
