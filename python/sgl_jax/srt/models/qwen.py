@@ -269,7 +269,7 @@ class QWenBlock(nnx.Module):
 
         hidden_states = self.mlp(hidden_states)
         logger.info(f"after mlp hiddenstate shape {hidden_states.shape}")
-        hidden_states = hidden_states[:, 0, :]
+        hidden_states = hidden_states[0, :, :]
         logger.info(f"after mlp hiddenstate shape {hidden_states.shape}")
         hidden_states = residual + hidden_states
         # process scatter
