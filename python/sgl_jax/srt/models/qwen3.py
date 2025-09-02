@@ -291,14 +291,28 @@ class QWen3Model(nnx.Module):
 
         # Conditional precision tracing - only use jax.pure_callback when tracer is enabled
         # This avoids performance impact from jax.pure_callback when precision tracing is disabled
-        if precision_tracer._enable_precision_tracer:
+        if (
+            precision_tracer._enable_precision_tracer
+            and hasattr(forward_batch, "trace_request_ids")
+            and forward_batch.trace_request_ids
+        ):
 
-            def transformer_trace_callback(tensor):
-                precision_tracer.record(tensor, "transformer_output", "TRANSFORMER")
+            def transformer_trace_callback(tensor, trace_request_ids, seq_lens):
+                precision_tracer.record(
+                    tensor,
+                    "transformer_output",
+                    "TRANSFORMER",
+                    request_ids=trace_request_ids,
+                    seq_lens=seq_lens,
+                )
                 return True
 
             transformer_callback_flag = jax.pure_callback(
-                transformer_trace_callback, jnp.int32(0), hidden_states
+                transformer_trace_callback,
+                jnp.bool_(True),
+                hidden_states,
+                forward_batch.trace_request_ids,
+                forward_batch.seq_lens,
             )
             return hidden_states, layers_k, layers_v, transformer_callback_flag
         else:

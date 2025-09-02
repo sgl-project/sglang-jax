@@ -232,6 +232,8 @@ class PrecisionTracer:
         extra_info: str = "",
         request_id: Optional[str] = None,
         forward_batch: Optional[Any] = None,
+        request_ids: Optional[List[str]] = None,
+        seq_lens: Optional[Any] = None,
     ):
         if not self._enable_precision_tracer or not self._trace_active:
             return
@@ -249,7 +251,9 @@ class PrecisionTracer:
         request_ids_to_process = []
 
         # Get request IDs from various sources
-        if request_id:
+        if request_ids:
+            request_ids_to_process = request_ids
+        elif request_id:
             request_ids_to_process = [request_id]
         elif (
             forward_batch
@@ -268,16 +272,23 @@ class PrecisionTracer:
             )
 
         # Add stats to all relevant requests
-        for req_id in request_ids_to_process:
-            if req_id and req_id in self._request_traces:
-                # Create a copy of stats for each request
-                req_stats = stats.copy()
-                req_stats["request_id"] = req_id
-                self._request_traces[req_id]["precision_records"].append(req_stats)
-            elif req_id:
-                logger.warning(
-                    f"Request ID mismatch: {req_id} not in traces {list(self._request_traces.keys())}"
-                )
+        if seq_lens is not None and len(request_ids_to_process) > 1:
+            # Split tensor by sequence lengths for batch processing
+            self._record_split_tensor_stats(
+                tensor, name, stage, extra_info, request_ids_to_process, seq_lens
+            )
+        else:
+            # Use the same stats for all requests (single request or fallback)
+            for req_id in request_ids_to_process:
+                if req_id and req_id in self._request_traces:
+                    # Create a copy of stats for each request
+                    req_stats = stats.copy()
+                    req_stats["request_id"] = req_id
+                    self._request_traces[req_id]["precision_records"].append(req_stats)
+                elif req_id:
+                    logger.warning(
+                        f"Request ID mismatch: {req_id} not in traces {list(self._request_traces.keys())}"
+                    )
 
         # Set the first request ID for display purposes
         if request_ids_to_process:
@@ -436,6 +447,65 @@ class PrecisionTracer:
             }
 
         return stats
+
+    def _record_split_tensor_stats(
+        self,
+        tensor: Any,
+        name: str,
+        stage: str,
+        extra_info: str,
+        request_ids: List[str],
+        seq_lens: Any,
+    ):
+        """Split tensor by sequence lengths and record stats for each request separately"""
+        try:
+            # Convert seq_lens to list if it's a JAX array
+            if hasattr(seq_lens, "tolist"):
+                seq_lens_list = seq_lens.tolist()
+            else:
+                seq_lens_list = list(seq_lens)
+
+            # Split tensor by sequence lengths
+            start_idx = 0
+            for i, (req_id, seq_len) in enumerate(zip(request_ids, seq_lens_list)):
+                if req_id and req_id in self._request_traces:
+                    # Extract the portion of tensor for this request
+                    end_idx = start_idx + seq_len
+                    req_tensor = tensor[start_idx:end_idx]
+
+                    # Compute stats for this specific request's data
+                    req_stats = self._compute_jax_stats(
+                        req_tensor, name, stage, extra_info
+                    )
+                    req_stats["request_id"] = req_id
+                    req_stats["sequence_length"] = seq_len
+                    req_stats["batch_position"] = i
+
+                    # Add to the specific request's records
+                    self._request_traces[req_id]["precision_records"].append(req_stats)
+
+                    logger.debug(
+                        f"Split tensor stats for {req_id}: shape={req_tensor.shape}, "
+                        f"seq_len={seq_len}, batch_pos={i}"
+                    )
+
+                    start_idx = end_idx
+                elif req_id:
+                    logger.warning(
+                        f"Request ID mismatch: {req_id} not in traces {list(self._request_traces.keys())}"
+                    )
+                    start_idx += seq_len
+
+        except Exception as e:
+            logger.error(f"Error in split tensor stats: {e}")
+            # Fallback to original method
+            stats = self._compute_jax_stats(tensor, name, stage, extra_info)
+            for req_id in request_ids:
+                if req_id and req_id in self._request_traces:
+                    req_stats = stats.copy()
+                    req_stats["request_id"] = req_id
+                    req_stats["split_error"] = str(e)
+                    self._request_traces[req_id]["precision_records"].append(req_stats)
 
     def _record_stats(self, stats: Dict[str, Any], key: str):
         # Skip console output if verbose logging is disabled during tracing

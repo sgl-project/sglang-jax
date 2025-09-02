@@ -421,7 +421,7 @@ async def start_trace_async(obj: Optional[StartTraceReqInput] = None):
             )
 
         precision_tracer.start_trace(req_num=obj.req_num, output_file=obj.output_file)
-        print(f"[HTTP] Sending trace state to scheduler...")
+        logger.info(f"[HTTP] Sending trace state to scheduler...")
         trace_state = {
             "precision_tracer": {
                 "trace_active": True,
@@ -434,9 +434,9 @@ async def start_trace_async(obj: Optional[StartTraceReqInput] = None):
             result = await _global_state.tokenizer_manager.set_internal_state(
                 SetInternalStateReq(request_id="trace_state", state_data=trace_state)
             )
-            print(f"[HTTP] Set internal state result: {result}")
+            logger.info(f"[HTTP] Set internal state result: {result}")
         except Exception as e:
-            print(f"[HTTP] Error setting internal state: {e}")
+            logger.info(f"[HTTP] Error setting internal state: {e}")
             precision_tracer.stop_trace()
             return ORJSONResponse(
                 content={
