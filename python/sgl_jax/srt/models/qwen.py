@@ -298,17 +298,20 @@ class QWenModel(nnx.Module):
         positions: jax.Array,
         forward_batch: ForwardBatch,
     ):
+        logger.info("before embedding")
         global_tracer.print(input_ids, "embedding_input", "embedding_all")
         hidden_states = self.embed_tokens(input_ids)
         global_tracer.print(hidden_states, "embedding_output", "embedding_all")
         jax.debug.print("hidden_states shape: {}", hidden_states.shape)
         jax.debug.print("hidden_states: {}", hidden_states)
-
+        logger.info("after embedding")
         layers_k = []
         layers_v = []
 
         for layer in self.h:
+            logger.info(f"start layer {layer.layer_id}")
             hidden_states, k, v = layer(positions, hidden_states, forward_batch)
+            logger.info(f"after layer {layer.layer_id}")
             layers_k.append(k)
             layers_v.append(v)
 
