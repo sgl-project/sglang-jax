@@ -411,7 +411,6 @@ async def start_trace_async(obj: Optional[StartTraceReqInput] = None):
     if obj is None:
         obj = StartTraceReqInput()
     try:
-        # Check if precision tracer is globally enabled
         if not precision_tracer._enable_precision_tracer:
             return ORJSONResponse(
                 content={
@@ -421,10 +420,7 @@ async def start_trace_async(obj: Optional[StartTraceReqInput] = None):
                 status_code=400,
             )
 
-        # Start trace in main process
         precision_tracer.start_trace(req_num=obj.req_num, output_file=obj.output_file)
-
-        # Also send trace state to scheduler process via set_internal_state
         print(f"[HTTP] Sending trace state to scheduler...")
         trace_state = {
             "precision_tracer": {
@@ -433,22 +429,22 @@ async def start_trace_async(obj: Optional[StartTraceReqInput] = None):
                 "output_file": precision_tracer._trace_output_file,
             }
         }
-        # Send trace state to scheduler in background (non-blocking)
-        import asyncio
 
-        async def send_trace_state():
-            try:
-                result = await _global_state.tokenizer_manager.set_internal_state(
-                    SetInternalStateReq(
-                        request_id="trace_state", state_data=trace_state
-                    )
-                )
-                print(f"[HTTP] Set internal state result: {result}")
-            except Exception as e:
-                print(f"[HTTP] Error setting internal state: {e}")
-
-        # Start the task but don't wait for it
-        asyncio.create_task(send_trace_state())
+        try:
+            result = await _global_state.tokenizer_manager.set_internal_state(
+                SetInternalStateReq(request_id="trace_state", state_data=trace_state)
+            )
+            print(f"[HTTP] Set internal state result: {result}")
+        except Exception as e:
+            print(f"[HTTP] Error setting internal state: {e}")
+            precision_tracer.stop_trace()
+            return ORJSONResponse(
+                content={
+                    "message": f"Failed to sync trace state to scheduler: {e}",
+                    "status": "error",
+                },
+                status_code=500,
+            )
 
         return ORJSONResponse(
             content={
@@ -473,10 +469,8 @@ async def start_trace_async(obj: Optional[StartTraceReqInput] = None):
 async def stop_trace_async(obj: Optional[StopTraceReqInput] = None):
     """Stop precision tracing."""
     try:
-        # Stop trace in main process
         output_file = precision_tracer.stop_trace()
-
-        # Also send trace state to scheduler process via set_internal_state
+        print(f"[HTTP] Sending stop trace state to scheduler...")
         trace_state = {
             "precision_tracer": {
                 "trace_active": False,
@@ -484,9 +478,22 @@ async def stop_trace_async(obj: Optional[StopTraceReqInput] = None):
                 "output_file": None,
             }
         }
-        await _global_state.tokenizer_manager.set_internal_state(
-            SetInternalStateReq(request_id="trace_state", state_data=trace_state)
-        )
+
+        try:
+            result = await _global_state.tokenizer_manager.set_internal_state(
+                SetInternalStateReq(request_id="trace_state", state_data=trace_state)
+            )
+            print(f"[HTTP] Stop trace internal state result: {result}")
+        except Exception as e:
+            print(f"[HTTP] Error stopping trace state to scheduler: {e}")
+            return ORJSONResponse(
+                content={
+                    "message": f"Trace stopped locally but failed to sync to scheduler: {e}",
+                    "status": "warning",
+                    "output_file": output_file,
+                },
+                status_code=200,
+            )
 
         return ORJSONResponse(
             content={
