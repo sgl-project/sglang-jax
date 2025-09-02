@@ -366,6 +366,7 @@ class ModelWorker:
                 logits_output, model_worker_batch
             )
         logger.info("after next_token_ids_device = self.model_runner.sample")
+        time.sleep(1000)
         return (
             logits_output,
             next_token_ids_device,
