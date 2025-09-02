@@ -225,29 +225,26 @@ class QWenBlock(nnx.Module):
     ) -> tuple[jax.Array, jax.Array, jax.Array]:
         residual = hidden_states
         logger.info(f"before attn hiddenstate shape {hidden_states.shape}")
-        if not forward_batch.forward_mode.is_idle():
-            global_tracer.print(
-                hidden_states,
-                f"RMSNorm_pre_attn_input",
-                f"rmsnorm_layer_id_{self.layer_id}",
-            )
-            hidden_states = self.ln_1(hidden_states)
-            global_tracer.print(
-                hidden_states,
-                f"RMSNorm_pre_attn_output",
-                f"rmsnorm_layer_id_{self.layer_id}",
-            )
+        global_tracer.print(
+            hidden_states,
+            f"RMSNorm_pre_attn_input",
+            f"rmsnorm_layer_id_{self.layer_id}",
+        )
+        hidden_states = self.ln_1(hidden_states)
+        global_tracer.print(
+            hidden_states,
+            f"RMSNorm_pre_attn_output",
+            f"rmsnorm_layer_id_{self.layer_id}",
+        )
 
-            attn_output, k, v = self.attn(
-                positions=positions,
-                hidden_states=hidden_states,
-                forward_batch=forward_batch,
-                layer_id=self.layer_id,
-            )
-            hidden_states = residual + attn_output
-        else:
-            hidden_states = hidden_states
-            k, v = None, None
+        attn_output, k, v = self.attn(
+            positions=positions,
+            hidden_states=hidden_states,
+            forward_batch=forward_batch,
+            layer_id=self.layer_id,
+        )
+        hidden_states = residual + attn_output
+
         logger.info(f"after attn hiddenstate shape {hidden_states.shape}")
         residual = hidden_states
         # Remove shard_map all_gather to avoid memory overflow (87.62G > 31.25G)
