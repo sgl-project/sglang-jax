@@ -117,7 +117,7 @@ class ModelRunner:
         def get_initialized_forward_metadata(forward_batch):
             return self.attn_backend.init_forward_metadata(forward_batch=forward_batch)
 
-        @partial(jax.jit, donate_argnames=["forward_batch"])
+        @partial(jax.jit, donate_argnames=["forward_batch"], axis_name=("data",))
         def run_model(graphdef, state, input_ids, positions, forward_batch):
             model = nnx.merge(graphdef, state)
             return model(input_ids, positions, forward_batch)
