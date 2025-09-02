@@ -31,6 +31,17 @@ def resolve_future_token_ids(input_ids, future_token_ids_map):
     )
 
 
+@jax.jit
+def set_future_token_ids(future_token_ids_map, future_token_ids_ct, next_token_ids):
+    # The start index must be a tuple, one element per dimension of the array.
+    start_indices = (future_token_ids_ct + 1,)
+
+    # jax.lax.dynamic_update_slice is the correct tool for this job.
+    return jax.lax.dynamic_update_slice(
+        future_token_ids_map, next_token_ids, start_indices
+    )
+
+
 class ModelWorkerClient:
     """A tensor parallel model worker."""
 
@@ -60,6 +71,9 @@ class ModelWorkerClient:
         )
         self.forward_thread.start()
         self.parent_process = psutil.Process().parent()
+
+    def get_model_runner(self):
+        return self.worker.get_model_runner()
 
     def get_worker_info(self):
         return self.worker.get_worker_info()
@@ -111,9 +125,10 @@ class ModelWorkerClient:
             batch_pt += 1
 
             # Resolve future tokens in the input
-            input_ids = model_worker_batch.input_ids
-            input_ids = resolve_future_token_ids(input_ids, self.future_token_ids_map)
-            model_worker_batch.input_ids = input_ids
+            input_ids = model_worker_batch.forward_batch.input_ids
+            model_worker_batch.forward_batch.input_ids = resolve_future_token_ids(
+                input_ids, self.future_token_ids_map
+            )
 
             # Run forward
             logits_output, next_token_ids_device, cache_miss_count = (
@@ -126,11 +141,9 @@ class ModelWorkerClient:
             )
 
             # Update the future token ids map
-            # Only count non-padded sequences (seq_lens > 0)
-            effective_bs = model_worker_batch.real_bs
-            self.future_token_ids_map = self.future_token_ids_map.at[
-                future_token_ids_ct + 1 : future_token_ids_ct + effective_bs + 1
-            ].set(next_token_ids_device[:effective_bs])
+            self.future_token_ids_map = set_future_token_ids(
+                self.future_token_ids_map, future_token_ids_ct, next_token_ids_device
+            )
 
             # Copy results to the CPU
             if model_worker_batch.return_logprob:
@@ -201,15 +214,15 @@ class ModelWorkerClient:
 
         # Allocate output future objects
         # Only count non-padded sequences (seq_lens > 0)
-        effective_bs = model_worker_batch.real_bs
+        bs = len(model_worker_batch.seq_lens)
         future_next_token_ids = np.arange(
             -(self.future_token_ids_ct + 1),
-            -(self.future_token_ids_ct + 1 + effective_bs),
+            -(self.future_token_ids_ct + 1 + bs),
             -1,
             dtype=np.int32,
         )
         self.future_token_ids_ct = (
-            self.future_token_ids_ct + effective_bs
+            self.future_token_ids_ct + bs
         ) % self.future_token_ids_limit
         return None, future_next_token_ids, 0
 
@@ -223,10 +236,13 @@ class ModelWorkerClient:
             precompile_bs_paddings,
             _,
         ) = self.get_precompile_paddings()
-        token_paddings = precompile_token_paddings + precompile_bs_paddings
+        token_paddings = precompile_bs_paddings
         for token_padding in token_paddings:
             input_ids = jnp.arange(0, token_padding, dtype=jnp.int32)
             resolve_future_token_ids(input_ids, self.future_token_ids_map)
+            set_future_token_ids(
+                self.future_token_ids_map, self.future_token_ids_ct, input_ids
+            )
         end_time = time.perf_counter()
         logger.info(
             f"[ModelWorkerClient] Completes resolve_future_token_ids precompile. Time cost: {end_time - start_time} seconds"

@@ -11,7 +11,6 @@ import numpy as np
 from sgl_jax.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sgl_jax.srt.mem_cache.base_prefix_cache import BasePrefixCache, MatchResult
 from sgl_jax.srt.mem_cache.memory_pool import ReqToTokenPool
-from sgl_jax.srt.utils.jax_utils import device_array
 
 
 class TreeNode:
@@ -116,10 +115,6 @@ class RadixCache(BasePrefixCache):
         if self.disable:
             return np.array(tokens, dtype=np.int32)
 
-        # with jax.default_device(self.cpu_device):
-        #    token_array = jnp.array(tokens, dtype=jnp.int32)
-        #    cpu_tokens = jax.device_put(token_array, self.cpu_device)
-
         return np.array(tokens, dtype=np.int32)
 
     def reset(self):
@@ -132,10 +127,6 @@ class RadixCache(BasePrefixCache):
 
     def match_prefix(self, key: List[int], **kwargs) -> MatchResult:
         if self.disable or len(key) == 0:
-            # create empty array on CPU
-            # with jax.default_device(self.cpu_device):
-            #     empty_array = jnp.empty((0,), dtype=jnp.int32)
-            #     empty_array = jax.device_put(empty_array, self.cpu_device)
             empty_array = np.empty((0,), dtype=np.int32)
 
             return MatchResult(
@@ -161,20 +152,10 @@ class RadixCache(BasePrefixCache):
                         valid_tokens.extend(tokens.tolist())
 
             if valid_tokens:
-                # create array on CPU
-                # with jax.default_device(self.cpu_device):
-                #     matched_tokens = jnp.array(valid_tokens, dtype=jnp.int32)
-                #     matched_tokens = jax.device_put(matched_tokens, self.cpu_device)
                 matched_tokens = np.array(valid_tokens, dtype=np.int32)
             else:
-                # with jax.default_device(self.cpu_device):
-                #     matched_tokens = jnp.empty((0,), dtype=jnp.int32)
-                #     matched_tokens = jax.device_put(matched_tokens, self.cpu_device)
                 matched_tokens = np.empty((0,), dtype=np.int32)
         else:
-            # with jax.default_device(self.cpu_device):
-            #    matched_tokens = jnp.empty((0,), dtype=jnp.int32)
-            #    matched_tokens = jax.device_put(matched_tokens, self.cpu_device)
             matched_tokens = np.empty((0,), dtype=np.int32)
 
         return MatchResult(
@@ -255,10 +236,6 @@ class RadixCache(BasePrefixCache):
         new_match_result = self.match_prefix(page_aligned_token_ids)
         new_indices = new_match_result.device_indices  # cpu
         new_last_node = new_match_result.last_device_node
-
-        # new_indices_device = device_array(
-        #     self.req_to_token_pool.mesh, np.asarray(new_indices)
-        # )
 
         self.req_to_token_pool.write(
             (req.req_pool_idx, slice(len(req.prefix_indices), len(new_indices))),

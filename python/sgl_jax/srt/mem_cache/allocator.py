@@ -2,7 +2,6 @@ import abc
 import logging
 from typing import List, Optional
 
-import jax.numpy as jnp
 import numpy as np
 
 from sgl_jax.srt.mem_cache.memory_pool import KVCache
@@ -16,7 +15,6 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         self,
         size: int,
         page_size: int,
-        # dtype: jnp.dtype,
         kvcache: KVCache,
     ):
         self.size = size
@@ -91,7 +89,6 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def __init__(
         self,
         size: int,
-        # dtype: jnp.dtype,
         kvcache: KVCache,
     ):
         # super().__init__(size, 1, dtype, kvcache)  # page_size=1 for token-level
@@ -137,7 +134,6 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self,
         size: int,
         page_size: int,
-        # dtype: jnp.dtype,
         kvcache: KVCache,
         debug_mode: bool = False,
     ):

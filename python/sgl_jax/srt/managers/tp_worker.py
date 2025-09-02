@@ -373,6 +373,9 @@ class ModelWorker:
         end_time = time.perf_counter()
         logger.info("[DECODE] Precompile finished in %.0f secs", end_time - start_time)
 
+    def get_model_runner(self):
+        return self.model_runner
+
     def get_worker_info(self):
         return (
             self.max_total_num_tokens,
@@ -405,7 +408,14 @@ class ModelWorker:
         sampling_metadata: SamplingMetadata = None,
         forward_metadata=None,
     ) -> Tuple[Union[LogitsProcessorOutput, jax.Array, int], Optional[jax.Array]]:
-        forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
+        # Use pre-initialized ForwardBatch if available (for overlap scheduling optimization)
+        if (
+            hasattr(model_worker_batch, "forward_batch")
+            and model_worker_batch.forward_batch is not None
+        ):
+            forward_batch = model_worker_batch.forward_batch
+        else:
+            forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
 
         if forward_metadata is None:
             self.worker.model_runner.attn_backend.forward_metadata = (
