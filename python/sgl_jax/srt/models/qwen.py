@@ -250,13 +250,8 @@ class QWenBlock(nnx.Module):
             k, v = None, None
         logger.info(f"after attn hiddenstate shape {hidden_states.shape}")
         residual = hidden_states
-        hidden_states = functools.partial(
-            shard_map.shard_map,
-            mesh=self.mesh,
-            in_specs=P(None),
-            out_specs=P(None),
-            check_rep=False,
-        )(lambda x: jax.lax.all_gather(x, "data"))(hidden_states)
+        # Remove shard_map all_gather to avoid memory overflow (87.62G > 31.25G)
+        # Each all_gather creates 1.28G * 32 layers = 40.96G temporary memory
         logger.info(f"after allgather hiddenstate shape {hidden_states.shape}")
         global_tracer.print(
             hidden_states, f"RMSNorm_pre_mlp_input", f"rmsnorm_layer_id_{self.layer_id}"
