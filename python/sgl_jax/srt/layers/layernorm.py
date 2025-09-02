@@ -54,8 +54,12 @@ def rmsnorm_forward(
 
     y = jnp.asarray(x_f32 * lax.rsqrt(mean2 + epsilon), jnp.float32)
     logger.info("rmsnorm input 7 ")
-    output = (y * jnp.asarray(weight, jnp.float32)).astype(orig_dtype)
+    weight = jnp.asarray(weight, jnp.float32)
     logger.info("rmsnorm input 8 ")
+    out = y * weight
+    logger.info("rmsnorm input 9 ")
+    output = (out).astype(orig_dtype)
+    logger.info("rmsnorm input 10 ")
     if residual is None:
         return output
     else:
