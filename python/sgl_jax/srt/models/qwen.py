@@ -231,6 +231,7 @@ class QWenBlock(nnx.Module):
             f"rmsnorm_layer_id_{self.layer_id}",
         )
         hidden_states = self.ln_1(hidden_states)
+        logger.info(f"after ln1 hiddenstate shape {hidden_states.shape}")
         global_tracer.print(
             hidden_states,
             f"RMSNorm_pre_attn_output",
@@ -243,9 +244,10 @@ class QWenBlock(nnx.Module):
             forward_batch=forward_batch,
             layer_id=self.layer_id,
         )
+        logger.info(f"after attn hiddenstate shape {hidden_states.shape}")
         hidden_states = residual + attn_output
 
-        logger.info(f"after attn hiddenstate shape {hidden_states.shape}")
+        logger.info(f"after residual hiddenstate shape {hidden_states.shape}")
         residual = hidden_states
         # Remove shard_map all_gather to avoid memory overflow (87.62G > 31.25G)
         # Each all_gather creates 1.28G * 32 layers = 40.96G temporary memory
