@@ -1,4 +1,5 @@
 import dataclasses
+import logging
 from functools import partial
 from typing import List, Optional
 
@@ -22,6 +23,8 @@ from sgl_jax.srt.model_executor.forward_batch_info import (
     ForwardMode,
 )
 from sgl_jax.srt.utils.jax_utils import device_array
+
+logger = logging.getLogger(__name__)
 
 
 @register_pytree_node_class
@@ -236,6 +239,7 @@ class LogitsProcessor(nnx.Module):
         logits_metadata: LogitsMetadata,
         mesh: Mesh,
     ) -> LogitsProcessorOutput:
+        logger.info("start compute logits processor")
         if logits_metadata.forward_mode.is_decode_or_idle():
             pruned_states = hidden_states
             sample_indices = None

@@ -436,9 +436,12 @@ class QWenLMHeadModel(nnx.Module):
         hidden_states: jax.Array,
         logits_metadata: LogitsMetadata,
     ):
-        return self.logits_processor(
+        logger.info("start compute_logits")
+        ret = self.logits_processor(
             hidden_states, self.lm_head, logits_metadata, self.mesh
         )
+        logger.info(f"return compute_logits {ret}")
+        return ret
 
     def __call__(
         self,
