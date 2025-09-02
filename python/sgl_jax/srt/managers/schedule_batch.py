@@ -1011,7 +1011,7 @@ class ScheduleBatch:
         prefill_cache_loc_paddings: List,
         decode_cache_loc_paddings: List,
     ) -> ModelWorkerBatch:
-        if self.forward_mode.is_decode():
+        if self.forward_mode.is_decode_or_idle():
             extend_seq_lens = extend_prefix_lens = extend_logprob_start_lens = None
             token_paddings = bs_paddings
             cache_loc_paddings = decode_cache_loc_paddings
@@ -1021,13 +1021,11 @@ class ScheduleBatch:
             bs_paddings = [prefill_padded_batch_size]
             extend_logprob_start_lens = self.extend_logprob_start_lens
             cache_loc_paddings = prefill_cache_loc_paddings
-        else:
-            extend_seq_lens = extend_prefix_lens = extend_logprob_start_lens = None
-            token_paddings = list(dict.fromkeys(token_paddings + bs_paddings))
-            bs_paddings = list(dict.fromkeys(bs_paddings + [prefill_padded_batch_size]))
-            cache_loc_paddings = list(
-                dict.fromkeys(prefill_cache_loc_paddings + decode_cache_loc_paddings)
-            )
+        token_paddings = list(dict.fromkeys(token_paddings + bs_paddings))
+        bs_paddings = list(dict.fromkeys(bs_paddings + [prefill_padded_batch_size]))
+        cache_loc_paddings = list(
+            dict.fromkeys(prefill_cache_loc_paddings + decode_cache_loc_paddings)
+        )
         global bid
         bid += 1
 
