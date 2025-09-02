@@ -5,6 +5,7 @@ import jax
 import jax.numpy as jnp
 from flax import nnx
 from jax import numpy as jnp
+from jax.experimental import io_callback
 from jax.sharding import PartitionSpec
 from transformers import PretrainedConfig
 
@@ -299,11 +300,8 @@ class QWen3Model(nnx.Module):
                 precision_tracer.record(tensor, "transformer_output", "TRANSFORMER")
                 return jnp.array(0)
 
-            hidden_states_gathered = jax.lax.all_gather(
-                hidden_states, axis_name="tensor"
-            )
-            call_back_flag = jax.pure_callback(
-                transformer_trace_callback, jnp.array(0), hidden_states_gathered
+            call_back_flag = io_callback(
+                transformer_trace_callback, jnp.array(0), hidden_states
             )
         layers_callback_flag.append(call_back_flag)
         return hidden_states, layers_k, layers_v, layers_callback_flag
