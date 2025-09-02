@@ -361,7 +361,7 @@ class ModelRunner:
         import jax._src.test_util as jtu
 
         with jtu.count_pjit_cpp_cache_miss() as count:
-            hidden_states, layers_k, layers_v, _ = self.model_fn(
+            hidden_states, layers_k, layers_v, callback_flag = self.model_fn(
                 self.state, input_ids, positions, forward_batch
             )
             cache_miss_count = count()
