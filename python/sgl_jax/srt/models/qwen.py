@@ -242,7 +242,11 @@ class QWenBlock(nnx.Module):
             k, v = None, None
         logger.info(f"after attn hiddenstate shape {hidden_states.shape}")
         residual = hidden_states
-        hidden_states = jax.experimental.multihost_utils.process_allgather(
+        # Use jax.lax.all_gather instead of process_allgather in JIT context
+        # hidden_states = jax.experimental.multihost_utils.process_allgather(
+        #     hidden_states
+        # )
+        hidden_states = jax.pmap(lambda x: jax.lax.all_gather(x, "i"), axis_name="i")(
             hidden_states
         )
         logger.info(f"after allgather hiddenstate shape {hidden_states.shape}")
