@@ -2,6 +2,7 @@
 
 import logging
 import os
+import time
 from functools import partial
 from math import log
 from typing import Optional, Tuple, Union
@@ -370,6 +371,7 @@ class ModelRunner:
         )
         # cache_miss_count = count()
         logger.info("before compute_logits")
+        time.sleep(100)
         result = self.compute_logits(self.state, hidden_states, logits_metadata)
         if not forward_batch.forward_mode.is_idle():
             self._set_kv_cache_after_forward(layers_k, layers_v, forward_batch)
