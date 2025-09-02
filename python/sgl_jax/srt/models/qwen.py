@@ -216,6 +216,7 @@ class QWenBlock(nnx.Module):
         forward_batch: ForwardBatch,
     ) -> tuple[jax.Array, jax.Array, jax.Array]:
         residual = hidden_states
+        logger.info(f"before attn hiddenstate shape {hidden_states.shape}")
         if not forward_batch.forward_mode.is_idle():
             global_tracer.print(
                 hidden_states,
@@ -239,7 +240,7 @@ class QWenBlock(nnx.Module):
         else:
             hidden_states = hidden_states
             k, v = None, None
-
+        logger.info(f"after attn hiddenstate shape {hidden_states.shape}")
         residual = hidden_states
         # process all gather
         global_tracer.print(
