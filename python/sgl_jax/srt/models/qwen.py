@@ -322,6 +322,7 @@ class QWenModel(nnx.Module):
         logger.info("before embedding")
         global_tracer.print(input_ids, "embedding_input", "embedding_all")
         hidden_states = self.embed_tokens(input_ids)
+        jax.debug.visualize_array_sharding(hidden_states)
         global_tracer.print(hidden_states, "embedding_output", "embedding_all")
         jax.debug.print("hidden_states shape: {}", hidden_states.shape)
         jax.debug.print("hidden_states: {}", hidden_states)
@@ -341,6 +342,7 @@ class QWenModel(nnx.Module):
         hidden_states = self.ln_f(hidden_states)
         global_tracer.print(hidden_states, "RMSNorm_final_output", "rmsnorm_final")
         logger.info("after ln_f")
+        jax.debug.visualize_array_sharding(hidden_states)
         return hidden_states, layers_k, layers_v
 
 
