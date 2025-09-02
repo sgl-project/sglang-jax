@@ -463,10 +463,11 @@ class QWenLMHeadModel(nnx.Module):
         hidden_states: jax.Array,
         logits_metadata: LogitsMetadata,
     ):
+        time.sleep(100)
+
         logger.info("start compute_logits")
         import time
 
-        time.sleep(100)
         ret = self.logits_processor(
             hidden_states, self.lm_head, logits_metadata, self.mesh
         )
