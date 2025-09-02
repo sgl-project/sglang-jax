@@ -320,11 +320,6 @@ class ModelRunner:
     def _get_attention_backend(self):
         padded_kv_heads = self.model_config.get_num_kv_heads_with_padding(self.tp_size)
 
-        if padded_kv_heads < self.tp_size:
-            kv_partition_axis = "data"
-        else:
-            kv_partition_axis = "tensor"
-
         if self.server_args.attention_backend == "native":
             from sgl_jax.srt.layers.attention.native_backend import NativeAttention
 
@@ -343,7 +338,6 @@ class ModelRunner:
                 padded_kv_heads,
                 self.model_config.head_dim,
                 page_size=self.page_size,
-                kv_partition_axis=kv_partition_axis,
             )
         else:
             raise ValueError(
