@@ -339,8 +339,7 @@ class QWenModel(nnx.Module):
         global_tracer.print(hidden_states, "RMSNorm_final_input", "rmsnorm_final")
         hidden_states = self.ln_f(hidden_states)
         global_tracer.print(hidden_states, "RMSNorm_final_output", "rmsnorm_final")
-        logger.info(f"after ln_f {hidden_states[0,0]}")
-        time.sleep(100)
+        logger.info("after ln_f")
         return hidden_states, layers_k, layers_v
 
 
