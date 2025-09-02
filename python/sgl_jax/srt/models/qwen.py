@@ -317,8 +317,9 @@ class QWenModel(nnx.Module):
         logger.info("before embedding")
         global_tracer.print(input_ids, "embedding_input", "embedding_all")
         hidden_states = self.embed_tokens(input_ids)
-        jax.debug.breakpoint()
-        jax.debug.print("hidden_states shape: {}", hidden_states[:, 0])
+        jax.debug.print(
+            "*********************hidden_states shape: {}", hidden_states[:, 0]
+        )
         global_tracer.print(hidden_states, "embedding_output", "embedding_all")
         logger.info("after embedding")
         layers_k = []
