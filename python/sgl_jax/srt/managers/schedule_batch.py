@@ -1048,8 +1048,13 @@ class ScheduleBatch:
         global_max_seq_lens = len(seq_lens_cpu)
         if self.enable_dp_attention:
             all_sizes = np.array(self.global_array)
+            logger.info(f"get model worker batch all sizes")
             global_max_input_ids_cpu = np.max(all_sizes[:, 1])
             global_max_seq_lens = np.max(all_sizes[:, 2])
+            logger.info(
+                f"get model worker batch all sizes ---------- {global_max_input_ids_cpu} {global_max_seq_lens}"
+            )
+
         padding_size = 0
         token_paddings.sort()
         for size in token_paddings:
