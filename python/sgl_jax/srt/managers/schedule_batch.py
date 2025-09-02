@@ -1022,6 +1022,7 @@ class ScheduleBatch:
             extend_logprob_start_lens = self.extend_logprob_start_lens
             cache_loc_paddings = prefill_cache_loc_paddings
         else:
+            extend_seq_lens = extend_prefix_lens = extend_logprob_start_lens = None
             token_paddings = list(dict.fromkeys(token_paddings + bs_paddings))
             bs_paddings = list(dict.fromkeys(bs_paddings + [prefill_padded_batch_size]))
             cache_loc_paddings = list(
