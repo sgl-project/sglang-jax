@@ -462,6 +462,7 @@ class QWenLMHeadModel(nnx.Module):
         logits_metadata: LogitsMetadata,
     ):
         logger.info("start compute_logits")
+        time.sleep(100)
         ret = self.logits_processor(
             hidden_states, self.lm_head, logits_metadata, self.mesh
         )
