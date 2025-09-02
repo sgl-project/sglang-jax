@@ -1,5 +1,6 @@
 from functools import partial
 from typing import Optional, Sequence, Tuple, Union
+from venv import logger
 
 import jax
 import jax.numpy as jnp
@@ -35,14 +36,26 @@ class RMSNorm(nnx.Module):
 def rmsnorm_forward(
     x, residual, weight, epsilon
 ) -> Union[jax.Array, Tuple[jax.Array, jax.Array]]:
+    logger.info("rmsnorm input 1 ")
     orig_dtype = x.dtype
+    logger.info("rmsnorm input 2 ")
+
     x_f32 = jnp.asarray(x, jnp.float32)
+    logger.info("rmsnorm input 3 ")
+
     if residual is not None:
         x_f32 += jnp.asarray(residual, jnp.float32)
+        logger.info("rmsnorm input 4 ")
+
         residual = x_f32.astype(orig_dtype)
+        logger.info("rmsnorm input 5 ")
     mean2 = jnp.mean(lax.square(x_f32), axis=-1, keepdims=True)
+    logger.info("rmsnorm input 6 ")
+
     y = jnp.asarray(x_f32 * lax.rsqrt(mean2 + epsilon), jnp.float32)
+    logger.info("rmsnorm input 7 ")
     output = (y * jnp.asarray(weight, jnp.float32)).astype(orig_dtype)
+    logger.info("rmsnorm input 8 ")
     if residual is None:
         return output
     else:
