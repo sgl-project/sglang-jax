@@ -242,7 +242,10 @@ class QWenBlock(nnx.Module):
             k, v = None, None
         logger.info(f"after attn hiddenstate shape {hidden_states.shape}")
         residual = hidden_states
-        # process all gather
+        hidden_states = jax.experimental.multihost_utils.process_allgather(
+            hidden_states
+        )
+        logger.info(f"after allgather hiddenstate shape {hidden_states.shape}")
         global_tracer.print(
             hidden_states, f"RMSNorm_pre_mlp_input", f"rmsnorm_layer_id_{self.layer_id}"
         )
