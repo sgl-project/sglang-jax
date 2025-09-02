@@ -1,10 +1,14 @@
+import functools
 import logging
 from typing import Any, Dict, Optional
 
 import jax
 import jax.numpy as jnp
 from flax import nnx
+from jax.experimental import shard_map
+from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec
+from jax.sharding import PartitionSpec as P
 from transformers import PretrainedConfig
 
 from sgl_jax.srt.configs.model_config import ModelConfig
@@ -18,6 +22,8 @@ from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
 from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
 
 logger = logging.getLogger(__name__)
+
+mesh = None
 
 
 class QWenMLP(nnx.Module):
@@ -176,13 +182,14 @@ class QWenBlock(nnx.Module):
         layer_id: int = 0,
         dtype: jnp.dtype = jnp.float16,
         rngs: nnx.Rngs = None,
+        mesh: jax.sharding.Mesh = None,
     ):
         self.layer_id = layer_id
 
         self.ln_1 = RMSNorm(
             config.hidden_size, epsilon=config.layer_norm_epsilon, rngs=rngs
         )
-
+        self.mesh = mesh
         rope_theta = getattr(config, "rope_theta", 10000)
         rope_scaling = getattr(config, "rope_scaling", None)
         self.attn = QWenAttention(
@@ -242,8 +249,13 @@ class QWenBlock(nnx.Module):
             k, v = None, None
         logger.info(f"after attn hiddenstate shape {hidden_states.shape}")
         residual = hidden_states
-        # Use jax.lax.all_gather with data axis for multi-host communication
-        hidden_states = jax.lax.all_gather(hidden_states, axis_name="data", axis=0)
+        hidden_states = functools.partial(
+            shard_map.shard_map,
+            mesh=self.mesh,
+            in_specs=P(None),
+            out_specs=P(None),
+            check_rep=False,
+        )(lambda x: jax.lax.all_gather(x, "data"))(hidden_states)
         logger.info(f"after allgather hiddenstate shape {hidden_states.shape}")
         global_tracer.print(
             hidden_states, f"RMSNorm_pre_mlp_input", f"rmsnorm_layer_id_{self.layer_id}"
@@ -272,6 +284,7 @@ class QWenModel(nnx.Module):
         config: PretrainedConfig,
         dtype: jnp.dtype = jnp.float16,
         rngs: nnx.Rngs = None,
+        mesh: jax.sharding.Mesh = None,
     ):
         vocab_size = ((config.vocab_size + 63) // 64) * 64
 
@@ -289,6 +302,7 @@ class QWenModel(nnx.Module):
                 layer_id=i,
                 dtype=dtype,
                 rngs=rngs,
+                mesh=mesh,
             )
             for i in range(config.num_hidden_layers)
         ]
@@ -338,7 +352,9 @@ class QWenLMHeadModel(nnx.Module):
         self.config = config
         self.dtype = config.dtype
         logger.info(f"QWenLMHeadModel config dtype: {self.dtype}")
-        self.transformer = QWenModel(config.hf_config, dtype=self.dtype, rngs=rngs)
+        self.transformer = QWenModel(
+            config.hf_config, dtype=self.dtype, rngs=rngs, mesh=self.mesh
+        )
         vocab_size = ((config.hf_config.vocab_size + 63) // 64) * 64
         self.lm_head = ParallelLMHead(vocab_size, config.hidden_size, rngs=rngs)
         self.logits_processor = LogitsProcessor(vocab_size)
