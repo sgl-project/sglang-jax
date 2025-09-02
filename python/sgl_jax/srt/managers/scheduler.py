@@ -1120,7 +1120,7 @@ class Scheduler(
             bid=bid,
             cache_miss_count=cache_miss_count,
         )
-
+        logger.info(f"node {self.server_args.node_rank} get ret {ret}")
         return ret
 
     def process_batch_result(
