@@ -843,7 +843,7 @@ class ScheduleBatch:
                 # release the last node
                 self.tree_cache.dec_lock_ref(req.last_node)
 
-                # NOTE(lsyin): we should use the newly evictable memory instantly.
+                # NOTE: we should use the newly evictable memory instantly.
                 num_tokens = len(sorted_indices) * global_config.retract_decode_steps
                 self._evict_tree_cache_if_needed(num_tokens)
 
@@ -999,23 +999,20 @@ class ScheduleBatch:
 
     def get_model_worker_batch(
         self,
-        prefill_padded_batch_size: int,
-        bs_paddings: list,
         token_paddings: list,
+        bs_paddings: list,
+        cache_loc_paddings: List,
         page_size: int,
-        prefill_cache_loc_paddings: List,
-        decode_cache_loc_paddings: List,
     ) -> ModelWorkerBatch:
         if self.forward_mode.is_decode_or_idle():
             extend_seq_lens = extend_prefix_lens = extend_logprob_start_lens = None
             token_paddings = bs_paddings
-            cache_loc_paddings = decode_cache_loc_paddings
         else:
             extend_seq_lens = np.array(self.extend_lens, dtype=np.int32)
             extend_prefix_lens = np.array(self.prefix_lens, dtype=np.int32)
-            bs_paddings = [prefill_padded_batch_size]
+            bs_paddings = bs_paddings[-1:]
+            cache_loc_paddings = cache_loc_paddings[-1:]
             extend_logprob_start_lens = self.extend_logprob_start_lens
-            cache_loc_paddings = prefill_cache_loc_paddings
 
         global bid
         bid += 1

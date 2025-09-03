@@ -199,7 +199,7 @@ class Scheduler(
                 server_args.dist_init_addr, self.nnodes, self.node_rank
             )
         self.mesh = create_device_mesh(
-            ici_parallelism=[-1, self.tp_size, 1, 1], dcn_parallelism=[1, 1, 1, 1]
+            ici_parallelism=[-1, self.tp_size, 1], dcn_parallelism=[1, 1, 1]
         )
 
         if self.enable_overlap:
@@ -874,19 +874,16 @@ class Scheduler(
         assert self.is_generation
 
         (
-            prefill_padded_batch_size,
-            precompile_prefill_token_paddings,
-            precompile_decode_bs_paddings,
-            precompile_prefill_cache_loc_paddings,
-            precompile_decode_cache_loc_paddings,
+            precompile_token_paddings,
+            precompile_bs_paddings,
+            precompile_cache_loc_paddings,
         ) = self.tp_worker.get_precompile_paddings()
+
         model_worker_batch = batch.get_model_worker_batch(
-            prefill_padded_batch_size,
-            precompile_decode_bs_paddings,
-            precompile_prefill_token_paddings,
+            precompile_token_paddings,
+            precompile_bs_paddings,
+            precompile_cache_loc_paddings,
             self.page_size,
-            precompile_prefill_cache_loc_paddings,
-            precompile_decode_cache_loc_paddings,
         )
 
         if self.enable_overlap:

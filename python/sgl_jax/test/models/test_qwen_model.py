@@ -23,7 +23,7 @@ class TestQwenModel(unittest.TestCase):
 
     def setUp(self):
         self.mesh = create_device_mesh(
-            ici_parallelism=[-1, 1, 1, 1], dcn_parallelism=[1, 1, 1, 1]
+            ici_parallelism=[-1, 1, 1], dcn_parallelism=[1, 1, 1]
         )
         # Model path for local model and tokenizer
         self.test_model_path = os.environ.get(

@@ -31,8 +31,8 @@ from fastapi.responses import ORJSONResponse
 
 logger = logging.getLogger(__name__)
 
-JAX_PRECOMPILE_DEFAULT_PREFILL_TOKEN_PADDINGS = [1 << i for i in range(6, 10)]
-JAX_PRECOMPILE_DEFAULT_DECODE_BS_PADDINGS = [64]
+PRECOMPILE_DEFAULT_TOKEN_PADDINGS = [1 << i for i in range(6, 14)]
+PRECOMPILE_DEFAULT_BS_PADDINGS = [1 << i for i in range(0, 7)]
 
 _warned_bool_env_var_keys = set()
 

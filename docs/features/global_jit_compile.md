@@ -15,13 +15,13 @@ The wrapped forward function is named as `run_model`, which is used by prefill a
 
 Cache Miss is unacceptable for `run_model` because it results a few seconds to a several tens of seconds compile time. In order to improve the performance, precompile and padding are necessary. Precompile is executed before Scheduler's loop. The precompile includes prefill and decode phase. The former pads the input parameters with token_paddings and the latter pads them with bs_paddings. Both phases need to pad tokens(like input_ids, positions, etc.) and batch_size.
 
-#### prefill padding
+#### token padding
 
-`--jax-precompile-prefill-token-paddings` is used to configure the token padding list. Prefill padding uses a fixed batch_size to make a tradeoff between performance and precompile time. So the padding pair will be {bs = fixed_bs, num_tokens = token1}, {bs = fixed_bs, num_tokens = token2} and so on. The fixed batch_size is calculated through `get_prefill_padded_size()` which takes the `max_prefill_tokens`, `chunked_prefill_size` and `max_running_requests` into the consideration.
+`--precompile-token-paddings` is used to configure the token padding list. Token padding uses a fixed batch_size to make a tradeoff between performance and precompile time. So the padding pair will be {bs = fixed_bs, num_tokens = token1}, {bs = fixed_bs, num_tokens = token2} and so on. The fixed batch_size is calculated through `get_max_padded_size()` which takes the `max_prefill_tokens`, `chunked_prefill_size` and `max_running_requests` into the consideration.
 
-#### Decode padding
+#### batch size padding
 
-`--jax-precompile-decode-bs-paddings` is used to configure the bs padding list. Decode padding pair likes {bs = bs1, num_tokens = bs1}, {bs = bs2, num_tokens = bs2} and so on.
+`--precompile-bs-paddings` is used to configure the batch size padding list. Decode padding pair likes {bs = bs1, num_tokens = bs1}, {bs = bs2, num_tokens = bs2} and so on.
 
 
 
@@ -159,8 +159,8 @@ JIT Forward is default to use.
 
 ### Precompile and padding
 
-- `--jax-precompile-prefill-token-paddings`: set like 8192 16384
-- `--jax-precompile-decode-bs-paddings`: set like 1 10 32
+- `--precompile-token-paddings`: set like 8192 16384
+- `--precompile-bs-paddings`: set like 1 10 32
 - `--disable-jax-precompile`: default to False
 - `--max-running-requests`
 - `--max-prefill-tokens`

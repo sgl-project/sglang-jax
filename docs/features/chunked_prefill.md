@@ -135,7 +135,7 @@ python -m sgl_jax.launch_server \
     --model-path Qwen/Qwen-7B \
     --chunked-prefill-size 2048 \
     --disable-radix-cache \
-    --mem-fraction-static 0.4
+    --mem-fraction-static 0.8
 ```
 
 ### Parameter Tuning

@@ -55,6 +55,5 @@ def fill_unspecified_parallelism(
 mesh_axes = [
     "data",  # data parallelism
     "tensor",  # tensor parallelism
-    "pipeline",  # pipeline parallelism
     "expert",  # expert parallelism
 ]

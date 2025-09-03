@@ -20,7 +20,7 @@ pip install --upgrade pip
 pip install -e "python[all]"
 
 # Run Qwen-7B Model
-JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache python3 -u -m sgl_jax.launch_server --model-path Qwen/Qwen-7B-Chat --trust-remote-code  --dist-init-addr=0.0.0.0:10011 --nnodes=1  --tp-size=4 --device=tpu --random-seed=3 --node-rank=0 --mem-fraction-static=0.2 --max-prefill-tokens=8192 --download-dir=/tmp --jax-precompile-prefill-token-paddings 5120 --dtype=bfloat16  --skip-server-warmup --attention-backend=fa --jax-precompile-decode-bs-paddings 10 --host 0.0.0.0 --port 30000
+JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache python3 -u -m sgl_jax.launch_server --model-path Qwen/Qwen-7B-Chat --trust-remote-code  --dist-init-addr=0.0.0.0:10011 --nnodes=1  --tp-size=4 --device=tpu --random-seed=3 --node-rank=0 --mem-fraction-static=0.8 --max-prefill-tokens=8192 --download-dir=/tmp --dtype=bfloat16  --skip-server-warmup --host 0.0.0.0 --port 30000
 ```
 
 ## Method 3: Using docker
@@ -63,7 +63,7 @@ setup: |
 run: |
   cd sglang-jax
   pip install -e "python[all]"
-  JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache python3 -u -m sgl_jax.launch_server --model-path Qwen/Qwen-7B-Chat --trust-remote-code  --dist-init-addr=0.0.0.0:10011 --nnodes=1  --tp-size=4 --device=tpu --random-seed=3 --node-rank=0 --mem-fraction-static=0.2 --max-prefill-tokens=8192 --download-dir=/tmp --jax-precompile-prefill-token-paddings 5120 --dtype=bfloat16  --skip-server-warmup --attention-backend=fa --jax-precompile-decode-bs-paddings 10 --host 0.0.0.0 --port 30000
+  JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache python3 -u -m sgl_jax.launch_server --model-path Qwen/Qwen-7B-Chat --trust-remote-code  --dist-init-addr=0.0.0.0:10011 --nnodes=1  --tp-size=4 --device=tpu --random-seed=3 --node-rank=0 --mem-fraction-static=0.8 --max-prefill-tokens=8192 --download-dir=/tmp --dtype=bfloat16  --skip-server-warmup --attention-backend=fa --host 0.0.0.0 --port 30000
 ```
 
 </details>

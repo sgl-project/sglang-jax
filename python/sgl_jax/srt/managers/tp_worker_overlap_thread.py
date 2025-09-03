@@ -16,10 +16,6 @@ import psutil
 from sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch
 from sgl_jax.srt.managers.tp_worker import ModelWorker
 from sgl_jax.srt.server_args import ServerArgs
-from sgl_jax.srt.utils.common_utils import (
-    JAX_PRECOMPILE_DEFAULT_DECODE_BS_PADDINGS,
-    JAX_PRECOMPILE_DEFAULT_PREFILL_TOKEN_PADDINGS,
-)
 from sgl_jax.utils import get_exception_traceback
 
 logger = logging.getLogger(__name__)
@@ -79,8 +75,8 @@ class ModelWorkerClient:
     def get_kv_cache(self):
         return self.worker.model_runner.token_to_kv_pool
 
-    def get_prefill_padded_size(self):
-        return self.worker.get_prefill_padded_size()
+    def get_max_padded_size(self):
+        return self.worker.get_max_padded_size()
 
     def get_precompile_paddings(self):
         return self.worker.get_precompile_paddings()
@@ -201,15 +197,11 @@ class ModelWorkerClient:
             f"[ModelWorkerClient] begins to run resolve_future_token_ids precompile."
         )
         (
-            _,
-            precompile_prefill_token_paddings,
-            precompile_decode_bs_paddings,
-            _,
+            precompile_token_paddings,
+            precompile_bs_paddings,
             _,
         ) = self.get_precompile_paddings()
-        token_paddings = (
-            precompile_prefill_token_paddings + precompile_decode_bs_paddings
-        )
+        token_paddings = precompile_token_paddings + precompile_bs_paddings
         for token_padding in token_paddings:
             input_ids = jnp.arange(0, token_padding, dtype=jnp.int32)
             resolve_future_token_ids(input_ids, self.future_token_ids_map)
@@ -217,7 +209,6 @@ class ModelWorkerClient:
         logger.info(
             f"[ModelWorkerClient] completes resolve_future_token_ids precompile. Time cost: {end_time - start_time} seconds"
         )
-
         self.worker.run_precompile()
 
     def __delete__(self):

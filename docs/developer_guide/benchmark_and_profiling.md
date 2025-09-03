@@ -23,7 +23,7 @@
 ```bash
 
 # start server
-python3 -m sgl_jax.launch_server --model-path Qwen/Qwen-7B-Chat --trust-remote-code  --dist-init-addr=0.0.0.0:10011 --nnodes=1  --tp-size=4 --device=tpu --random-seed=3 --node-rank=0 --mem-fraction-static=0.2 --max-prefill-tokens=8192 --download-dir=/tmp --jax-precompile-prefill-token-paddings 16384 --dtype=bfloat16  --skip-server-warmup --attention-backend=fa
+python3 -m sgl_jax.launch_server --model-path Qwen/Qwen-7B-Chat --trust-remote-code  --dist-init-addr=0.0.0.0:10011 --nnodes=1  --tp-size=4 --device=tpu --random-seed=3 --node-rank=0 --mem-fraction-static=0.8 --max-prefill-tokens=8192 --download-dir=/tmp --dtype=bfloat16  --skip-server-warmup
 
 # send request to start profile
 curl -X POST 'http://127.0.0.1:30000/start_profile' -d '{"output_dir": "/home/profile", "num_steps": 5}' -H 'Content-Type: application/json'
