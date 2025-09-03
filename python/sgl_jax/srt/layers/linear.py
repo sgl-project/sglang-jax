@@ -65,7 +65,6 @@ class LinearBase(nnx.Module):
         logger.info("linear input 1 ")
         jax.debug.print(f"x shape weight shape {x.shape} {self.weight.value.shape}")
         jax.debug.visualize_array_sharding(self.weight.value)
-        jax.debug.print(self.weight.value.dtype)
 
         x = jnp.arange(16 * 4096, dtype=jnp.bfloat16).reshape(16, 4096)
         jax.debug.visualize_array_sharding(x)
