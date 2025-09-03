@@ -64,8 +64,10 @@ class LinearBase(nnx.Module):
         # Access the underlying JAX array using .value property
         logger.info("linear input 1 ")
         jax.debug.print(f"x shape weight shape {x.shape} {self.weight.value.shape}")
-        jax.debug.visualize_array_sharding(x)
         jax.debug.visualize_array_sharding(self.weight.value)
+        x = jnp.arange(16 * 4096, dtype=jnp.bfloat16).reshape(16, 4096)
+        jax.debug.visualize_array_sharding(x)
+
         output = jnp.dot(x, self.weight.value)
         logger.info("linear input 2 ")
         if bias is not None:
