@@ -18,6 +18,7 @@ def benchmark_backend(
     num_heads,
     head_dim=128,
     max_kv_cache_tokens_num=120000,
+    page_size=128,
 ):
     if backend_type == "flash":
         if mode == "prefill":
@@ -29,12 +30,18 @@ def benchmark_backend(
                     max_kv_cache_tokens_num,
                     num_heads,
                     head_dim,
+                    page_size=page_size,
                 )
             )
         elif mode == "decode":
             q, k, v, _, page_indices, cu_q_lens, cu_kv_lens, num_seqs, seq_lens, _ = (
                 create_decode_uniform_data(
-                    batch_size, seq_len, max_kv_cache_tokens_num, num_heads, head_dim
+                    batch_size,
+                    seq_len,
+                    max_kv_cache_tokens_num,
+                    num_heads,
+                    head_dim,
+                    page_size=page_size,
                 )
             )
 
@@ -101,6 +108,7 @@ def benchmark_backend(
 
 
 def main():
+    page_size = 128
     bench_modes = ["prefill", "decode"]
     num_head_config = [2, 4, 8, 16]
     seq_len_config = [1024, 2048, 4096]
@@ -130,6 +138,7 @@ def main():
                 seq_len,
                 num_heads,
                 head_dim=head_dim,
+                page_size=page_size,
             )
 
             results.append(
