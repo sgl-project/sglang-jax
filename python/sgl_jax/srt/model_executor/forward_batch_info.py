@@ -234,7 +234,7 @@ class ForwardBatch:
     ):
         logger.info(f"local_input_ids {batch.input_ids}")
         data_sharding = NamedSharding(mesh, P("data"))
-        global_shape = (4 * batch.input_ids[0],)
+        global_shape = (4 * batch.input_ids.shape[0],)
         logger.info(f"global shape {global_shape}")
         global_input_ids = jax.make_array_from_process_local_data(
             data_sharding, batch.input_ids, global_shape
