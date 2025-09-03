@@ -233,7 +233,7 @@ class ForwardBatch:
         cls, batch: ModelWorkerBatch, model_runner: ModelRunner, mesh: mesh_lib
     ):
         logger.info(f"local_input_ids {batch.input_ids}")
-        data_sharding = NamedSharding(mesh, P(None))
+        data_sharding = NamedSharding(mesh, P("data"))
         global_input_ids = jax.make_array_from_process_local_data(
             data_sharding, batch.input_ids
         )
