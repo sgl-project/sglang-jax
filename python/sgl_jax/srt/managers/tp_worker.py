@@ -26,7 +26,7 @@ from sgl_jax.srt.model_executor.forward_batch_info import (
     ForwardMode,
 )
 from sgl_jax.srt.model_executor.model_runner import MockModelRunner, ModelRunner
-from sgl_jax.srt.sampling.sampling_batch_info import SamplingBatchInfo
+from sgl_jax.srt.sampling.sampling_batch_info import SamplingBatchInfo, SamplingMetadata
 from sgl_jax.srt.server_args import ServerArgs
 from sgl_jax.srt.utils.common_utils import (
     PRECOMPILE_DEFAULT_BS_PADDINGS,
@@ -201,10 +201,41 @@ class ModelWorker:
                     bs,
                     self.precompile_cache_loc_paddings[-1],
                 )
-                self.forward_batch_generation(model_worker_batch=model_worker_batch)
+
+                sampling_metadata = SamplingMetadata.from_model_worker_batch(
+                    model_worker_batch, 0, self.mesh
+                )
+
+                self.model_runner.attn_backend.forward_metadata = (
+                    self.worker.model_runner.attn_backend.get_forward_metadata(
+                        model_worker_batch
+                    )
+                )
+
+                # forward
+                logger.info(f"[EXTEND] Precompile forward ({bs=}, {num_tokens=})")
+                logits_output, _ = self.model_runner.forward(
+                    ForwardBatch.init_new(model_worker_batch, self.model_runner),
+                    logits_metadata=LogitsMetadata.from_model_worker_batch(
+                        model_worker_batch, self.mesh
+                    ),
+                )
+
+                # sample
+                for is_all_greedy, need_min_p_sampling in itertools.product(
+                    [True, False], [True, False]
+                ):
+                    (
+                        sampling_metadata.is_all_greedy,
+                        sampling_metadata.need_min_p_sampling,
+                    ) = (is_all_greedy, need_min_p_sampling)
+                    logger.info(
+                        f"[EXTEND] Precompile sample ({bs=}, {num_tokens=}, {is_all_greedy=}, {need_min_p_sampling=})"
+                    )
+                    self.model_runner.sample(logits_output, sampling_metadata)
 
         end_time = time.perf_counter()
-        logger.info("[EXTEND] precompile finished in %.0f secs", end_time - start_time)
+        logger.info("[EXTEND] Precompile finished in %.0f secs", end_time - start_time)
 
     def get_max_padded_size(self):
         """Calculate the max padded batch size and token nums.
@@ -271,7 +302,9 @@ class ModelWorker:
             ),
             return_logprob=False,
             sampling_info=SamplingBatchInfo.generate_for_precompile(
-                bs, self.model_config.vocab_size, self.mesh
+                bs,
+                self.model_config.vocab_size,
+                self.mesh,
             ),
             extend_input_logprob_token_ids=None,
             positions=np.concat([valid_positions, invalid_positions], axis=0),
@@ -305,10 +338,40 @@ class ModelWorker:
                     max(self.precompile_bs_paddings),
                     bs * self.max_req_len,
                 )
-                self.forward_batch_generation(model_worker_batch=model_worker_batch)
+                sampling_metadata = SamplingMetadata.from_model_worker_batch(
+                    model_worker_batch, 0, self.mesh
+                )
+
+                self.model_runner.attn_backend.forward_metadata = (
+                    self.worker.model_runner.attn_backend.get_forward_metadata(
+                        model_worker_batch
+                    )
+                )
+
+                # forward
+                logger.info(f"[DECODE] Precompile forward ({bs=})")
+                logits_output, _ = self.model_runner.forward(
+                    ForwardBatch.init_new(model_worker_batch, self.model_runner),
+                    logits_metadata=LogitsMetadata.from_model_worker_batch(
+                        model_worker_batch, self.mesh
+                    ),
+                )
+
+                # sample
+                for is_all_greedy, need_min_p_sampling in itertools.product(
+                    [True, False], [True, False]
+                ):
+                    (
+                        sampling_metadata.is_all_greedy,
+                        sampling_metadata.need_min_p_sampling,
+                    ) = (is_all_greedy, need_min_p_sampling)
+                    logger.info(
+                        f"[DECODE] Precompile sample ({bs=}, {is_all_greedy=}, {need_min_p_sampling=})"
+                    )
+                    self.model_runner.sample(logits_output, sampling_metadata)
 
         end_time = time.perf_counter()
-        logger.info("[DECODE] precompile finished in %.0f secs", end_time - start_time)
+        logger.info("[DECODE] Precompile finished in %.0f secs", end_time - start_time)
 
     def get_worker_info(self):
         return (
@@ -339,9 +402,19 @@ class ModelWorker:
         model_worker_batch: ModelWorkerBatch,
         launch_done: Optional[threading.Event] = None,
         skip_sample: bool = False,
+        sampling_metadata: SamplingMetadata = None,
+        forward_metadata=None,
     ) -> Tuple[Union[LogitsProcessorOutput, jax.Array, int], Optional[jax.Array]]:
         forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
 
+        if forward_metadata is None:
+            self.worker.model_runner.attn_backend.forward_metadata = (
+                self.worker.model_runner.attn_backend.get_forward_metadata(
+                    model_worker_batch
+                )
+            )
+
+        self.model_runner.attn_backend.forward_metadata = forward_metadata
         logits_output, cache_miss_count = self.model_runner.forward(
             forward_batch,
             logits_metadata=LogitsMetadata.from_model_worker_batch(
@@ -349,23 +422,25 @@ class ModelWorker:
             ),
         )
 
-        idx = model_worker_batch.extend_start_loc[: model_worker_batch.real_bs]
-        logits_output.truncate_logits_processor_output(idx)
-
         if launch_done is not None:
             launch_done.set()
 
+        sample_cache_miss_count = 0
         if skip_sample:
             next_token_ids_device = None
         else:
-            next_token_ids_device = self.model_runner.sample(
-                logits_output, model_worker_batch
-            )
+            import jax._src.test_util as jtu
+
+            with jtu.count_pjit_cpp_cache_miss() as count:
+                next_token_ids_device = self.model_runner.sample(
+                    logits_output, sampling_metadata
+                )
+                sample_cache_miss_count = count()
 
         return (
             logits_output,
             next_token_ids_device,
-            cache_miss_count,
+            cache_miss_count + sample_cache_miss_count,
         )
 
 

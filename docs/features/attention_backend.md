@@ -8,7 +8,7 @@ SGLang JAX adopts a plugin-based design pattern for Attention Backends, enabling
 ### Abstract Base Class Design
 All attention backends inherit from the `AttentionBackend` base class (`python/sgl_jax/srt/layers/attention/base_attn_backend.py`), which defines two core abstract methods:
 
-- `init_forward_metadata(forward_batch)`: Initialize metadata required for forward pass
+- `get_forward_metadata(forward_batch)`: Initialize metadata required for forward pass and return it
 - `__call__(q, k, v, layer, forward_batch, **kwargs)`: Execute the actual attention computation
 
 ### Unified Interface Design
@@ -38,11 +38,11 @@ class YourCustomAttention(AttentionBackend):
 
 ### 2. Implement Required Methods
 
-#### ```init_forward_metadata``` Method
+#### ```get_forward_metadata``` Method
 ```python
-def init_forward_metadata(self, forward_batch: ForwardBatch):
-    """Initialize forward pass metadata"""
-    # Create your required metadata based on forward_batch
+def get_forward_metadata(self, batch: ModelWorkerBatch):
+    """get forward pass metadata"""
+    # Create your required metadata based on model_worker_batch and return it
     # e.g., compute sequence lengths, create indices, etc.
     pass
 ```

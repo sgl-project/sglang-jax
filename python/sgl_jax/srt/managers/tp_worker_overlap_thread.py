@@ -15,6 +15,7 @@ import psutil
 
 from sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch
 from sgl_jax.srt.managers.tp_worker import ModelWorker
+from sgl_jax.srt.sampling.sampling_batch_info import SamplingMetadata
 from sgl_jax.srt.server_args import ServerArgs
 from sgl_jax.utils import get_exception_traceback
 
@@ -94,7 +95,12 @@ class ModelWorkerClient:
         batch_lists = [None] * 2
 
         while True:
-            model_worker_batch, future_token_ids_ct = self.input_queue.get()
+            (
+                model_worker_batch,
+                future_token_ids_ct,
+                sampling_metadata,
+                forward_metadata,
+            ) = self.input_queue.get()
             if not model_worker_batch:
                 break
 
@@ -112,7 +118,10 @@ class ModelWorkerClient:
             # Run forward
             logits_output, next_token_ids_device, cache_miss_count = (
                 self.worker.forward_batch_generation(
-                    model_worker_batch, model_worker_batch.launch_done
+                    model_worker_batch,
+                    model_worker_batch.launch_done,
+                    sampling_metadata=sampling_metadata,
+                    forward_metadata=forward_metadata,
                 )
             )
 
@@ -165,7 +174,9 @@ class ModelWorkerClient:
         return logits_output, next_token_ids, cache_miss_count
 
     def forward_batch_generation(
-        self, model_worker_batch: ModelWorkerBatch
+        self,
+        model_worker_batch: ModelWorkerBatch,
+        sampling_metadata: SamplingMetadata,
     ) -> Tuple[None, jax.Array, int]:
         # Create a new copy of sampling_info because it will be updated in-place by the scheduler for the next batch.
         sampling_info = model_worker_batch.sampling_info
@@ -174,8 +185,19 @@ class ModelWorkerClient:
             sampling_info_done=threading.Event(),
         )
 
+        forward_metadata = self.worker.model_runner.attn_backend.get_forward_metadata(
+            model_worker_batch
+        )
+
         # Push a new batch to the queue (JAX handles synchronization automatically)
-        self.input_queue.put((model_worker_batch, self.future_token_ids_ct))
+        self.input_queue.put(
+            (
+                model_worker_batch,
+                self.future_token_ids_ct,
+                sampling_metadata,
+                forward_metadata,
+            )
+        )
 
         # Allocate output future objects
         # Only count non-padded sequences (seq_lens > 0)
@@ -194,7 +216,7 @@ class ModelWorkerClient:
     def run_precompile(self):
         start_time = time.perf_counter()
         logger.info(
-            f"[ModelWorkerClient] begins to run resolve_future_token_ids precompile."
+            f"[ModelWorkerClient] Begins to run resolve_future_token_ids precompile."
         )
         (
             precompile_token_paddings,
@@ -207,9 +229,9 @@ class ModelWorkerClient:
             resolve_future_token_ids(input_ids, self.future_token_ids_map)
         end_time = time.perf_counter()
         logger.info(
-            f"[ModelWorkerClient] completes resolve_future_token_ids precompile. Time cost: {end_time - start_time} seconds"
+            f"[ModelWorkerClient] Completes resolve_future_token_ids precompile. Time cost: {end_time - start_time} seconds"
         )
         self.worker.run_precompile()
 
     def __delete__(self):
-        self.input_queue.put((None, None))
+        self.input_queue.put((None, None, None, None))

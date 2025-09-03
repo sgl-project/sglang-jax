@@ -19,7 +19,7 @@ from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch, ForwardM
 from sgl_jax.srt.model_executor.model_runner import ModelRunner
 from sgl_jax.srt.model_loader.loader import JAXModelLoader
 from sgl_jax.srt.precision_tracer import precision_tracer
-from sgl_jax.srt.sampling.sampling_batch_info import SamplingBatchInfo
+from sgl_jax.srt.sampling.sampling_batch_info import SamplingBatchInfo, SamplingMetadata
 from sgl_jax.srt.server_args import ServerArgs
 from sgl_jax.test.test_utils import create_device_mesh
 
@@ -250,7 +250,10 @@ class TestModelRunner(unittest.TestCase):
 
         # Sample the first token from extend output
         current_token = self.model_runner.sampler(
-            extend_output, sampling_info=model_worker_batch.sampling_info
+            extend_output,
+            sampling_metadata=SamplingMetadata.from_model_worker_batch(
+                model_worker_batch.sampling_info
+            ),
         )
 
         # Collect all generated tokens
@@ -276,7 +279,10 @@ class TestModelRunner(unittest.TestCase):
 
             # Sample next token for the next iteration
             current_token = self.model_runner.sampler(
-                decode_output, sampling_info=model_worker_batch.sampling_info
+                decode_output,
+                sampling_metadata=SamplingMetadata.from_model_worker_batch(
+                    model_worker_batch.sampling_info
+                ),
             )
             all_generated_tokens.append(current_token)
             print(f"step {step} current_token added: {current_token}")

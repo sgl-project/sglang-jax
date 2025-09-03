@@ -27,7 +27,7 @@ from sgl_jax.srt.mem_cache.memory_pool import MHATokenToKVPool, ReqToTokenPool
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sgl_jax.srt.model_loader.loader import JAXModelLoader
 from sgl_jax.srt.precision_tracer import precision_tracer
-from sgl_jax.srt.sampling.sampling_batch_info import SamplingBatchInfo
+from sgl_jax.srt.sampling.sampling_batch_info import SamplingBatchInfo, SamplingMetadata
 from sgl_jax.srt.server_args import ServerArgs
 from sgl_jax.srt.utils.common_utils import get_bool_env_var
 from sgl_jax.srt.utils.jax_utils import get_available_device_memory
@@ -117,25 +117,27 @@ class ModelRunner:
         self.init_attention_backend()
 
     def initialize_jit(self):
-        self.graphdef, self.state = nnx.split(self.model)
-
-        @partial(jax.jit)
-        def get_initialized_forward_metadata(forward_batch):
-            return self.attn_backend.init_forward_metadata(forward_batch=forward_batch)
+        self.model_graphdef, self.model_state = nnx.split(self.model)
+        self.sampler_graphdef, self.sampler_state = nnx.split(self.sampler)
 
         @partial(jax.jit, donate_argnames=["forward_batch"])
-        def run_model(graphdef, state, input_ids, positions, forward_batch):
+        def jitted_run_model(graphdef, state, input_ids, positions, forward_batch):
             model = nnx.merge(graphdef, state)
             return model(input_ids, positions, forward_batch)
 
         @partial(jax.jit)
-        def compute_logits(graphdef, state, *args):
+        def jitted_compute_logits(graphdef, state, *args):
             model = nnx.merge(graphdef, state)
             return model.compute_logits(*args)
 
-        self.get_initialized_forward_metadata_fn = get_initialized_forward_metadata
-        self.model_fn = partial(run_model, self.graphdef)
-        self.compute_logits = partial(compute_logits, self.graphdef)
+        @partial(jax.jit)
+        def jitted_sampler(graphdef, state, *args):
+            sampler = nnx.merge(graphdef, state)
+            return sampler(*args)
+
+        self.jitted_run_model = partial(jitted_run_model, self.model_graphdef)
+        self.jitted_compute_logits = partial(jitted_compute_logits, self.model_graphdef)
+        self.jitted_sampler = partial(jitted_sampler, self.sampler_graphdef)
 
     def model_specific_adjustment(self):
         pass
@@ -361,12 +363,21 @@ class ModelRunner:
         import jax._src.test_util as jtu
 
         with jtu.count_pjit_cpp_cache_miss() as count:
-            hidden_states, layers_k, layers_v, _ = self.model_fn(
-                self.state, input_ids, positions, forward_batch
+            hidden_states, layers_k, layers_v, _ = self.jitted_run_model(
+                self.model_state, input_ids, positions, forward_batch
             )
-            cache_miss_count = count()
+            forward_cache_miss = count()
 
-        result = self.compute_logits(self.state, hidden_states, logits_metadata)
+            if not logits_metadata.extend_return_logprob:
+                result = self.jitted_compute_logits(
+                    self.model_state, hidden_states, logits_metadata
+                )
+                compute_logits_cache_miss = count()
+            else:
+                result = self.model.compute_logits(hidden_states, logits_metadata)
+                compute_logits_cache_miss = 0
+
+            cache_miss_count = forward_cache_miss + compute_logits_cache_miss
 
         self._set_kv_cache_after_forward(layers_k, layers_v, forward_batch)
 
@@ -381,38 +392,12 @@ class ModelRunner:
         forward_batch.token_to_kv_pool.k_buffer[start_idx:end_idx] = layers_k
         forward_batch.token_to_kv_pool.v_buffer[start_idx:end_idx] = layers_v
 
-    def forward_decode(
-        self, forward_batch: ForwardBatch, logits_metadata: LogitsMetadata
-    ) -> Tuple[LogitsProcessorOutput, int]:
-        fm = self.get_initialized_forward_metadata_fn(forward_batch)
-        self.attn_backend.forward_metadata = fm
-        # self.attn_backend.init_forward_metadata(forward_batch)
-        return self._forward(
-            forward_batch.input_ids,
-            forward_batch.positions,
-            forward_batch,
-            logits_metadata,
-        )
-
-    def forward_extend(
+    def forward_idle(
         self,
+        input_ids: jax.Array,
+        positions: jax.Array,
         forward_batch: ForwardBatch,
         logits_metadata: LogitsMetadata,
-        skip_attn_backend_init: bool = False,
-    ) -> Tuple[LogitsProcessorOutput, int]:
-        if not skip_attn_backend_init:
-            # self.attn_backend.init_forward_metadata(forward_batch)
-            fm = self.get_initialized_forward_metadata_fn(forward_batch)
-            self.attn_backend.forward_metadata = fm
-        return self._forward(
-            forward_batch.input_ids,
-            forward_batch.positions,
-            forward_batch,
-            logits_metadata,
-        )
-
-    def forward_idle(
-        self, forward_batch: ForwardBatch
     ) -> Tuple[LogitsProcessorOutput, int]:
         raise NotImplementedError("forward_idle is not implemented")
 
@@ -420,10 +405,8 @@ class ModelRunner:
         self,
         forward_batch: ForwardBatch,
         logits_metadata: LogitsMetadata,
-        skip_attn_backend_init: bool = False,
     ) -> Tuple[LogitsProcessorOutput, int]:
         self.forward_pass_id += 1
-
         # Set request IDs for tracing
 
         if (
@@ -449,25 +432,26 @@ class ModelRunner:
                 else None
             )
 
-        return self._forward_raw(forward_batch, logits_metadata, skip_attn_backend_init)
+        return self._forward_raw(forward_batch, logits_metadata)
 
     def _forward_raw(
         self,
         forward_batch: ForwardBatch,
         logits_metadata: LogitsMetadata,
-        skip_attn_backend_init: bool,
     ) -> Tuple[LogitsProcessorOutput, int]:
         # for compatibility, 0.6.3 need to use use_mesh. set_mesh is not have __entry__ attribute.
         # on jax 0.7.1, we need to use set_mesh.
-        # with jax.sharding.set_mesh(self.mesh):
+        # with self.mesh, jax.sharding.set_mesh(self.mesh):
         with jax.sharding.use_mesh(self.mesh):
-            if forward_batch.forward_mode.is_decode():
-                ret = self.forward_decode(forward_batch, logits_metadata)
-            elif forward_batch.forward_mode.is_extend():
-                ret = self.forward_extend(
+            if (
+                forward_batch.forward_mode.is_decode()
+                or forward_batch.forward_mode.is_extend()
+            ):
+                ret = self._forward(
+                    forward_batch.input_ids,
+                    forward_batch.positions,
                     forward_batch,
                     logits_metadata,
-                    skip_attn_backend_init=skip_attn_backend_init,
                 )
             elif forward_batch.forward_mode.is_idle():
                 ret = self.forward_idle(forward_batch)
@@ -486,7 +470,7 @@ class ModelRunner:
     def sample(
         self,
         logits_output: LogitsProcessorOutput,
-        model_worker_batch: ModelWorkerBatch,
+        sampling_metadata: SamplingMetadata,
     ) -> jax.Array:
         """Sample and compute logprobs and update logits_output.
 
@@ -497,17 +481,16 @@ class ModelRunner:
         Returns:
             A list of next_token_ids
         """
-        self._preprocess_logits(logits_output, model_worker_batch.sampling_info)
-
         # Sample the next tokens
-        next_token_ids_device = self.sampler(
-            logits_output,
-            model_worker_batch.sampling_info,
-            model_worker_batch.return_logprob,
-            model_worker_batch.top_logprobs_nums,
-            model_worker_batch.token_ids_logprobs,
-            self.mesh,
-        )
+        if not sampling_metadata.return_logprob:
+            next_token_ids_device = self.jitted_sampler(
+                self.sampler_state, logits_output, sampling_metadata
+            )
+        else:
+            next_token_ids_device = self.sampler(
+                logits_output,
+                sampling_metadata,
+            )
         return next_token_ids_device
 
 

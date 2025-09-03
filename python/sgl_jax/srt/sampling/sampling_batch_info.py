@@ -4,13 +4,14 @@ import dataclasses
 import logging
 from typing import TYPE_CHECKING, Callable, List, Optional
 
+from jax.sharding import Mesh
 from jax.tree_util import register_pytree_node_class
 
 from sgl_jax.srt.sampling.sampling_params import TOP_K_ALL
 from sgl_jax.srt.utils.jax_utils import device_array
 
 if TYPE_CHECKING:
-    from sgl_jax.srt.managers.schedule_batch import ScheduleBatch
+    from sgl_jax.srt.managers.schedule_batch import ScheduleBatch, ModelWorkerBatch
 
 import threading
 
@@ -24,16 +25,128 @@ logger = logging.getLogger(__name__)
 
 @register_pytree_node_class
 @dataclasses.dataclass
+class SamplingMetadata:
+    """
+    SamplingMetadata is used as input parameter for jitted sample function.
+    """
+
+    # logprob
+    return_logprob: (
+        bool  # only jit for return_logprob=False, support true in the future
+    )
+    top_logprobs_nums: Optional[List[int]]
+    token_ids_logprobs: Optional[List[List[int]]]
+
+    # sample
+    temperatures: jax.Array
+    top_ps: jax.Array
+    top_ks: jax.Array
+    min_ps: jax.Array
+    is_all_greedy: bool = False
+    need_min_p_sampling: bool = False
+
+    def tree_flatten(self):
+        children = (
+            self.temperatures,
+            self.top_ps,
+            self.top_ks,
+            self.min_ps,
+        )
+
+        aux_data = {
+            "return_logprob": self.return_logprob,
+            "top_logprobs_nums": self.top_logprobs_nums,
+            "token_ids_logprobs": self.token_ids_logprobs,
+            "is_all_greedy": self.is_all_greedy,
+            "need_min_p_sampling": self.need_min_p_sampling,
+        }
+        return (children, aux_data)
+
+    @classmethod
+    def tree_unflatten(cls, aux_data, children):
+        obj = cls.__new__(cls)
+
+        obj.temperatures = children[0]
+        obj.top_ps = children[1]
+        obj.top_ks = children[2]
+        obj.min_ps = children[3]
+
+        obj.return_logprob = aux_data["return_logprob"]
+        obj.top_logprobs_nums = aux_data["top_logprobs_nums"]
+        obj.token_ids_logprobs = aux_data["token_ids_logprobs"]
+        obj.is_all_greedy = aux_data["is_all_greedy"]
+        obj.need_min_p_sampling = aux_data["need_min_p_sampling"]
+
+        return obj
+
+    @classmethod
+    def from_model_worker_batch(
+        cls,
+        batch: ModelWorkerBatch,
+        pad_size: int = 0,
+        mesh: Mesh = None,
+        # return_logprob: bool=False,
+        # top_logprobs_nums: Optional[List[int]]=None,
+        # token_ids_logprobs: Optional[List[List[int]]]=None,
+    ) -> SamplingMetadata:
+        padded_temperatures = np.concat(
+            [
+                batch.sampling_info.temperatures,
+                np.array(
+                    [1.0] * pad_size, dtype=batch.sampling_info.temperatures.dtype
+                ),
+            ]
+        ).reshape(-1, 1)
+        padded_top_ps = np.concat(
+            [
+                batch.sampling_info.top_ps,
+                np.array([1.0] * pad_size, dtype=batch.sampling_info.top_ps.dtype),
+            ]
+        )
+        padded_top_ks = np.concat(
+            [
+                batch.sampling_info.top_ks,
+                np.array([-1] * pad_size, dtype=batch.sampling_info.top_ks.dtype),
+            ]
+        )
+        padded_min_ps = np.concat(
+            [
+                batch.sampling_info.min_ps,
+                np.array([0.0] * pad_size, dtype=batch.sampling_info.min_ps.dtype),
+            ]
+        )
+
+        (temperatures_device, top_ps_device, top_ks_device, min_ps_device) = (
+            device_array(
+                mesh, (padded_temperatures, padded_top_ps, padded_top_ks, padded_min_ps)
+            )
+        )
+
+        return cls(
+            return_logprob=batch.return_logprob,
+            top_logprobs_nums=batch.top_logprobs_nums,
+            token_ids_logprobs=batch.token_ids_logprobs,
+            temperatures=temperatures_device,
+            top_ps=top_ps_device,
+            top_ks=top_ks_device,
+            min_ps=min_ps_device,
+            is_all_greedy=batch.sampling_info.is_all_greedy,
+            need_min_p_sampling=batch.sampling_info.need_min_p_sampling,
+        )
+
+
+# @register_pytree_node_class
+@dataclasses.dataclass
 class SamplingBatchInfo:
     """
     keep the array on device same to sglang
     """
 
     # Basic batched sampling params
-    temperatures: jax.array
-    top_ps: jax.Array
-    top_ks: jax.Array
-    min_ps: jax.Array
+    temperatures: np.ndarray
+    top_ps: np.ndarray
+    top_ks: np.ndarray
+    min_ps: np.ndarray
 
     # Whether all requests use greedy sampling
     is_all_greedy: bool = False
@@ -50,60 +163,57 @@ class SamplingBatchInfo:
     # An event used for overlap schedule
     sampling_info_done: Optional[threading.Event] = None
 
-    def tree_flatten(self):
-        children = (
-            self.temperatures,
-            self.top_ps,
-            self.top_ks,
-            self.min_ps,
-        )
+    # def tree_flatten(self):
+    #     children = (
+    #         self.temperatures,
+    #         self.top_ps,
+    #         self.top_ks,
+    #         self.min_ps,
+    #     )
 
-        aux_data = {
-            "is_all_greedy": self.is_all_greedy,
-            "need_top_p_sampling": self.need_top_p_sampling,
-            "need_top_k_sampling": self.need_top_k_sampling,
-            "need_min_p_sampling": self.need_min_p_sampling,
-            "sampling_info_done": self.sampling_info_done,
-        }
-        return (children, aux_data)
+    #     aux_data = {
+    #         "is_all_greedy": self.is_all_greedy,
+    #         "need_top_p_sampling": self.need_top_p_sampling,
+    #         "need_top_k_sampling": self.need_top_k_sampling,
+    #         "need_min_p_sampling": self.need_min_p_sampling,
+    #         "sampling_info_done": self.sampling_info_done,
+    #     }
+    #     return (children, aux_data)
+
+    # @classmethod
+    # def tree_unflatten(cls, aux_data, children):
+    #     obj = cls.__new__(cls)
+
+    #     obj.temperatures = children[0]
+    #     obj.top_ps = children[1]
+    #     obj.top_ks = children[2]
+    #     obj.min_ps = children[3]
+
+    #     obj.is_all_greedy = aux_data["is_all_greedy"]
+    #     obj.need_top_p_sampling = aux_data["need_top_p_sampling"]
+    #     obj.need_top_k_sampling = aux_data["need_top_k_sampling"]
+    #     obj.need_min_p_sampling = aux_data["need_min_p_sampling"]
+    #     obj.sampling_info_done = aux_data["sampling_info_done"]
+
+    #     return obj
 
     @classmethod
-    def tree_unflatten(cls, aux_data, children):
-        obj = cls.__new__(cls)
+    def generate_for_precompile(cls, bs: int, vocab_size: int, mesh: Mesh):
+        temperatures = np.array([1.0 for _ in range(bs)], dtype=np.float32)
+        top_ps = np.array([1.0 for _ in range(bs)], dtype=np.float32)
+        top_ks = np.array([-1 for _ in range(bs)], dtype=np.int32)
+        min_ps = np.array([0.0 for _ in range(bs)], dtype=np.float32)
 
-        obj.temperatures = children[0]
-        obj.top_ps = children[1]
-        obj.top_ks = children[2]
-        obj.min_ps = children[3]
-
-        obj.is_all_greedy = aux_data["is_all_greedy"]
-        obj.need_top_p_sampling = aux_data["need_top_p_sampling"]
-        obj.need_top_k_sampling = aux_data["need_top_k_sampling"]
-        obj.need_min_p_sampling = aux_data["need_min_p_sampling"]
-        obj.sampling_info_done = aux_data["sampling_info_done"]
-
-        return obj
-
-    @classmethod
-    def generate_for_precompile(cls, bs: int, vocab_size: int, mesh: mesh_lib.Mesh):
-        # device = batch.device
-        temperatures = np.array([1.0 for _ in range(bs)], dtype=jnp.float32).reshape(
-            -1, 1
-        )
-        top_ps = np.array([1.0 for _ in range(bs)], dtype=jnp.float32)
-        top_ks = np.array([-1 for _ in range(bs)], dtype=jnp.int32)
-        min_ps = np.array([0.0 for _ in range(bs)], dtype=jnp.float32)
-
-        temperatures_device = device_array(mesh, temperatures)
-        top_ps_device = device_array(mesh, top_ps)
-        top_ks_device = device_array(mesh, top_ks)
-        min_ps_device = device_array(mesh, min_ps)
+        # temperatures_device = device_array(mesh, temperatures)
+        # top_ps_device = device_array(mesh, top_ps)
+        # top_ks_device = device_array(mesh, top_ks)
+        # min_ps_device = device_array(mesh, min_ps)
 
         ret = cls(
-            temperatures=temperatures_device,
-            top_ps=top_ps_device,
-            top_ks=top_ks_device,
-            min_ps=min_ps_device,
+            temperatures=temperatures,
+            top_ps=top_ps,
+            top_ks=top_ks,
+            min_ps=min_ps,
             is_all_greedy=True,
             need_top_p_sampling=False,
             need_top_k_sampling=True,
@@ -118,7 +228,7 @@ class SamplingBatchInfo:
         temperatures = np.array(
             [r.sampling_params.temperature for r in reqs],
             dtype=np.float32,
-        ).reshape(-1, 1)
+        )
         top_ps = np.array([r.sampling_params.top_p for r in reqs], dtype=np.float32)
         top_ks = np.array([r.sampling_params.top_k for r in reqs], dtype=np.int32)
         min_ps = np.array([r.sampling_params.min_p for r in reqs], dtype=np.float32)
@@ -127,15 +237,15 @@ class SamplingBatchInfo:
         # top_ps_device = device_array(batch.mesh, top_ps)
         # top_ks_device = device_array(batch.mesh, top_ks)
         # min_ps_device = device_array(batch.mesh, min_ps)
-        (temperatures_device, top_ps_device, top_ks_device, min_ps_device) = (
-            device_array(batch.mesh, (temperatures, top_ps, top_ks, min_ps))
-        )
+        # (temperatures_device, top_ps_device, top_ks_device, min_ps_device) = (
+        #     device_array(batch.mesh, (temperatures, top_ps, top_ks, min_ps))
+        # )
 
         ret = cls(
-            temperatures=temperatures_device,
-            top_ps=top_ps_device,
-            top_ks=top_ks_device,
-            min_ps=min_ps_device,
+            temperatures=temperatures,
+            top_ps=top_ps,
+            top_ks=top_ks,
+            min_ps=min_ps,
             is_all_greedy=all(r.sampling_params.top_k <= 1 for r in reqs),
             need_top_p_sampling=any(r.sampling_params.top_p != 1.0 for r in reqs),
             need_top_k_sampling=any(r.sampling_params.top_k != TOP_K_ALL for r in reqs),
@@ -159,7 +269,7 @@ class SamplingBatchInfo:
             value = getattr(self, item, None)
             setattr(self, item, value[keep_indices])
 
-    def merge_batch(self, other: "SamplingBatchInfo", mesh: mesh_lib.Mesh):
+    def merge_batch(self, other: "SamplingBatchInfo", mesh: Mesh):
         # Note: because the __len()__ operator is defined on the temperatures tensor,
         # please make sure any merge operation with len(self) or len(other) is done before
         # the merge operation of the temperatures tensor below.
@@ -171,7 +281,7 @@ class SamplingBatchInfo:
         ]:
             self_val = getattr(self, item, None)
             other_val = getattr(other, item, None)
-            setattr(self, item, jnp.concat([self_val, other_val]))
+            setattr(self, item, np.concat([self_val, other_val]))
 
         self.is_all_greedy &= other.is_all_greedy
         self.need_top_p_sampling |= other.need_top_p_sampling

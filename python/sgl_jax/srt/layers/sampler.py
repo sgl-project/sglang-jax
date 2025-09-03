@@ -9,7 +9,7 @@ from jax import random
 from jax.sharding import Mesh
 
 from sgl_jax.srt.layers.logits_processor import LogitsProcessorOutput
-from sgl_jax.srt.sampling.sampling_batch_info import SamplingBatchInfo
+from sgl_jax.srt.sampling.sampling_batch_info import SamplingBatchInfo, SamplingMetadata
 from sgl_jax.srt.utils.jax_utils import device_array
 
 
@@ -20,11 +20,10 @@ class Sampler(nnx.Module):
     def __call__(
         self,
         logits_output: LogitsProcessorOutput,
-        sampling_info: SamplingBatchInfo,
-        return_logprob: bool,
-        top_logprobs_nums: List[int],
-        token_ids_logprobs: List[List[int]],
-        mesh: Mesh = None,
+        sampling_metadata: SamplingMetadata,
+        # return_logprob: bool,
+        # top_logprobs_nums: List[int],
+        # token_ids_logprobs: List[List[int]],
     ):
         """Run a sampler & compute logprobs and update logits_output accordingly.
 
@@ -43,40 +42,42 @@ class Sampler(nnx.Module):
             (-1, logits_output.next_token_logits.shape[-1]),
         )
 
-        if sampling_info.is_all_greedy:
+        if sampling_metadata.is_all_greedy:
             batch_next_token_ids = jnp.argmax(logits, -1).flatten()
-            if return_logprob:
+            if sampling_metadata.return_logprob:
                 logprobs = jax.nn.log_softmax(logits, axis=-1)
         else:
             # Post process logits
-            logits = jnp.divide(logits, sampling_info.temperatures)
+            logits = jnp.divide(logits, sampling_metadata.temperatures)
             probs = jax.nn.softmax(logits, axis=-1)
             _, new_rng = jax.random.split(self.rngs.params())
             # A slower fallback implementation with torch native operations.
             batch_next_token_ids = top_k_top_p_min_p_sampling_from_probs_jax(
                 probs,
-                sampling_info.top_ks,
-                sampling_info.top_ps,
-                sampling_info.min_ps,
-                sampling_info.need_min_p_sampling,
+                sampling_metadata.top_ks,
+                sampling_metadata.top_ps,
+                sampling_metadata.min_ps,
+                sampling_metadata.need_min_p_sampling,
                 new_rng,
             )
 
-            if return_logprob:
+            if sampling_metadata.return_logprob:
                 logprobs = jnp.log(probs).clip(min=jnp.finfo(probs.dtype).min)
 
-        if return_logprob:
-            if any(x > 0 for x in top_logprobs_nums):
+        if sampling_metadata.return_logprob:
+            if any(x > 0 for x in sampling_metadata.top_logprobs_nums):
                 (
                     logits_output.next_token_top_logprobs_val,
                     logits_output.next_token_top_logprobs_idx,
-                ) = get_top_logprobs(logprobs, top_logprobs_nums)
+                ) = get_top_logprobs(logprobs, sampling_metadata.top_logprobs_nums)
 
-            if any(x is not None for x in token_ids_logprobs):
+            if any(x is not None for x in sampling_metadata.token_ids_logprobs):
                 (
                     logits_output.next_token_token_ids_logprobs_val,
                     logits_output.next_token_token_ids_logprobs_idx,
-                ) = get_token_ids_logprobs(logprobs, token_ids_logprobs)
+                ) = get_token_ids_logprobs(
+                    logprobs, sampling_metadata.token_ids_logprobs
+                )
 
             logits_output.next_token_logprobs = logprobs[
                 np.arange(len(batch_next_token_ids)),
