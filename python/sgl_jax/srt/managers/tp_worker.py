@@ -409,10 +409,7 @@ class ModelWorker:
         forward_metadata=None,
     ) -> Tuple[Union[LogitsProcessorOutput, jax.Array, int], Optional[jax.Array]]:
         # Use pre-initialized ForwardBatch if available (for overlap scheduling optimization)
-        if (
-            hasattr(model_worker_batch, "forward_batch")
-            and model_worker_batch.forward_batch is not None
-        ):
+        if model_worker_batch.forward_batch is not None:
             forward_batch = model_worker_batch.forward_batch
         else:
             forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)

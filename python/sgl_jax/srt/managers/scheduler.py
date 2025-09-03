@@ -908,6 +908,7 @@ class Scheduler(
                     model_worker_batch, sampling_metadata=sampling_metadata
                 )
             )
+            next_token_ids = next_token_ids[: model_worker_batch.real_bs]
         else:
             logits_output, next_token_ids_device, cache_miss_count = (
                 self.tp_worker.forward_batch_generation(

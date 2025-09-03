@@ -12,11 +12,13 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import psutil
+from jax.sharding import NamedSharding, PartitionSpec
 
 from sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch
 from sgl_jax.srt.managers.tp_worker import ModelWorker
 from sgl_jax.srt.sampling.sampling_batch_info import SamplingMetadata
 from sgl_jax.srt.server_args import ServerArgs
+from sgl_jax.srt.utils.jax_utils import device_array
 from sgl_jax.utils import get_exception_traceback
 
 logger = logging.getLogger(__name__)
@@ -61,7 +63,8 @@ class ModelWorkerClient:
         self.future_token_ids_map = jnp.zeros(
             (self.max_running_requests * 5,), dtype=jnp.int32
         )
-
+        sharding = NamedSharding(mesh, PartitionSpec(None))
+        self.future_token_ids_map = jax.device_put(self.future_token_ids_map, sharding)
         # Launch threads
         self.input_queue = Queue()
         self.output_queue = Queue()
@@ -236,13 +239,23 @@ class ModelWorkerClient:
             precompile_bs_paddings,
             _,
         ) = self.get_precompile_paddings()
-        token_paddings = precompile_bs_paddings
+        max_padding_bs, _ = self.get_max_padded_size()
+        bs_paddings = precompile_bs_paddings + [max_padding_bs]
+        token_paddings = bs_paddings + precompile_token_paddings
         for token_padding in token_paddings:
-            input_ids = jnp.arange(0, token_padding, dtype=jnp.int32)
+            input_ids = device_array(
+                self.worker.mesh, jnp.arange(0, token_padding, dtype=jnp.int32)
+            )
             resolve_future_token_ids(input_ids, self.future_token_ids_map)
+        logger.info(f"[ModelWorkerClient] precompile {token_paddings} done")
+        for bs_padding in bs_paddings:
+            input_ids = device_array(
+                self.worker.mesh, jnp.arange(0, bs_padding, dtype=jnp.int32)
+            )
             set_future_token_ids(
                 self.future_token_ids_map, self.future_token_ids_ct, input_ids
             )
+        logger.info(f"[ModelWorkerClient] precompile {bs_paddings} done")
         end_time = time.perf_counter()
         logger.info(
             f"[ModelWorkerClient] Completes resolve_future_token_ids precompile. Time cost: {end_time - start_time} seconds"
