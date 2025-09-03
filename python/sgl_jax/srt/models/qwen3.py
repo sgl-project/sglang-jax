@@ -309,13 +309,52 @@ class QWen3Model(nnx.Module):
                 )
                 logger.info(f"[DEBUG] transformer_trace_callback: seq_lens={seq_lens}")
 
-                precision_tracer.record(
-                    tensor,
-                    "transformer_output",
-                    "TRANSFORMER",
-                    request_ids=trace_request_ids,
-                    seq_lens=seq_lens,
-                )
+                # 检查 tracer 是否仍然活跃
+                if not precision_tracer._trace_active:
+                    logger.warning(
+                        f"[DEBUG] transformer_trace_callback: tracer no longer active, skipping"
+                    )
+                    return True
+
+                # 只为仍然活跃的请求记录数据
+                if trace_request_ids:
+                    active_request_ids = []
+                    for rid in trace_request_ids:
+                        if (
+                            rid in precision_tracer._request_traces
+                            and precision_tracer._request_traces[rid]["status"]
+                            == "active"
+                        ):
+                            active_request_ids.append(rid)
+                        else:
+                            logger.warning(
+                                f"[DEBUG] transformer_trace_callback: request {rid} not active, skipping"
+                            )
+
+                    logger.info(
+                        f"[DEBUG] transformer_trace_callback: active_request_ids={active_request_ids}"
+                    )
+
+                    if active_request_ids:
+                        precision_tracer.record(
+                            tensor,
+                            "transformer_output",
+                            "TRANSFORMER",
+                            request_ids=active_request_ids,
+                            seq_lens=seq_lens,
+                        )
+                        logger.info(
+                            f"[DEBUG] transformer_trace_callback: recorded for {len(active_request_ids)} active requests"
+                        )
+                    else:
+                        logger.warning(
+                            f"[DEBUG] transformer_trace_callback: no active requests found"
+                        )
+                else:
+                    logger.warning(
+                        f"[DEBUG] transformer_trace_callback: no trace_request_ids provided"
+                    )
+
                 return True
 
             # Pack forward_batch info into a tuple for the callback

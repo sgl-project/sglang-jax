@@ -1223,10 +1223,19 @@ class ScheduleBatch:
         """Generate trace request IDs and increment counter for new logical requests"""
         from sgl_jax.srt.precision_tracer import precision_tracer
 
+        logger.info(
+            f"[DEBUG] _generate_trace_request_ids called with real_bs={real_bs}"
+        )
+        logger.info(f"[DEBUG] Current batch forward_mode: {self.forward_mode}")
+        logger.info(
+            f"[DEBUG] Request rids in batch: {[str(req.rid) for req in self.reqs[:real_bs]]}"
+        )
+
         request_ids = []
-        for req in self.reqs[:real_bs]:
+        for i, req in enumerate(self.reqs[:real_bs]):
             # Use unique rid for request_id, not content_hash
             request_id = str(req.rid)
+            logger.info(f"[DEBUG] Processing request {i}: rid={request_id}")
 
             # Only increment for truly new request_ids
             if precision_tracer._trace_active:
@@ -1237,6 +1246,9 @@ class ScheduleBatch:
                         and precision_tracer._completed_requests_count
                         >= precision_tracer._max_requests
                     ):
+                        logger.info(
+                            f"[DEBUG] Reached max requests limit, stopping trace"
+                        )
                         precision_tracer.stop_trace()
                         break
 
@@ -1245,11 +1257,16 @@ class ScheduleBatch:
                         precision_tracer._request_counter
                     )
                     logger.info(
-                        f"Starting trace for request {precision_tracer._request_counter}: {request_id}"
+                        f"[DEBUG] Starting trace for request {precision_tracer._request_counter}: {request_id}"
+                    )
+                else:
+                    logger.info(
+                        f"[DEBUG] Request {request_id} already has trace number: {precision_tracer._request_id_to_number[request_id]}"
                     )
 
             request_ids.append(request_id)
 
+        logger.info(f"[DEBUG] Generated trace_request_ids: {request_ids}")
         return request_ids
 
     def copy(self):

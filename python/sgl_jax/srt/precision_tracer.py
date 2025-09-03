@@ -196,33 +196,73 @@ class PrecisionTracer:
     def end_request_trace(self, request_id: Optional[str] = None):
         """End tracing for a request and save to JSONL"""
         if not self._trace_active:
+            logger.debug(f"[DEBUG] end_request_trace called but tracer not active")
             return
 
         if request_id is None:
             request_id = self._current_request_id
 
+        logger.info(f"[DEBUG] Attempting to end trace for request: {request_id}")
+        logger.info(
+            f"[DEBUG] Current active traces: {list(self._request_traces.keys())}"
+        )
+
         if request_id and request_id in self._request_traces:
             trace_data = self._request_traces[request_id]
+
+            # 添加统计信息
+            num_records = len(trace_data["precision_records"])
+            logger.info(
+                f"[DEBUG] Ending trace for {request_id}: {num_records} precision records collected"
+            )
+
+            # 检查是否有空的 precision_records
+            if num_records == 0:
+                logger.warning(
+                    f"[WARNING] Request {request_id} ended with no precision records!"
+                )
+            else:
+                # 统计不同阶段的记录数量
+                stage_counts = {}
+                for record in trace_data["precision_records"]:
+                    stage = record.get("stage", "unknown")
+                    stage_counts[stage] = stage_counts.get(stage, 0) + 1
+                logger.info(
+                    f"[DEBUG] Request {request_id} precision records by stage: {stage_counts}"
+                )
+
             trace_data["end_time"] = time.time()
             trace_data["duration"] = trace_data["end_time"] - trace_data["start_time"]
             trace_data["status"] = "completed"
+            trace_data["num_precision_records"] = num_records
 
             # Save to JSONL file
             try:
                 with open(self._trace_output_file, "a", encoding="utf-8") as f:
                     json.dump(trace_data, f, cls=TensorJSONEncoder, ensure_ascii=False)
                     f.write("\n")
+                logger.info(
+                    f"[DEBUG] Successfully saved trace data for {request_id} to {self._trace_output_file}"
+                )
             except Exception as e:
-                logger.error(f"Error saving request trace: {e}")
+                logger.error(f"Error saving request trace for {request_id}: {e}")
 
             # Clean up and increment completed count
             del self._request_traces[request_id]
             self._completed_requests_count += 1
             logger.info(
-                f"Request trace completed ({self._completed_requests_count}/{self._max_requests}): {request_id}"
+                f"[DEBUG] Request trace completed ({self._completed_requests_count}/{self._max_requests}): {request_id}"
             )
             if request_id == self._current_request_id:
                 self._current_request_id = None
+                logger.info(f"[DEBUG] Cleared current_request_id")
+        else:
+            logger.warning(
+                f"[WARNING] Attempted to end trace for non-existent or already completed request: {request_id}"
+            )
+            logger.warning(
+                f"[WARNING] Available traces: {list(self._request_traces.keys())}"
+            )
 
     def record(
         self,
@@ -281,6 +321,11 @@ class PrecisionTracer:
             )
 
         # Add stats to all relevant requests
+        logger.info(
+            f"[DEBUG] Processing {len(request_ids_to_process)} request_ids: {request_ids_to_process}"
+        )
+        logger.info(f"[DEBUG] seq_lens: {seq_lens}, tensor.shape: {tensor.shape}")
+
         if seq_lens is not None and len(request_ids_to_process) > 1:
             # Check if this is decode mode (tensor first dim == batch_size) or extend mode (tensor first dim == sum of seq_lens)
             total_seq_lens = sum(
@@ -289,47 +334,90 @@ class PrecisionTracer:
             is_decode_mode = tensor.shape[0] == len(request_ids_to_process)
             is_extend_mode = tensor.shape[0] == total_seq_lens
 
+            # 增加更宽松的匹配条件
+            is_likely_decode = abs(tensor.shape[0] - len(request_ids_to_process)) <= 1
+            is_likely_extend = abs(tensor.shape[0] - total_seq_lens) <= len(
+                request_ids_to_process
+            )
+
             logger.info(
                 f"[DEBUG] Mode detection: tensor_tokens={tensor.shape[0]}, batch_size={len(request_ids_to_process)}, total_seq_lens={total_seq_lens}"
             )
             logger.info(
                 f"[DEBUG] is_decode_mode={is_decode_mode}, is_extend_mode={is_extend_mode}"
             )
+            logger.info(
+                f"[DEBUG] is_likely_decode={is_likely_decode}, is_likely_extend={is_likely_extend}"
+            )
 
-            if is_decode_mode:
+            if is_decode_mode or (is_likely_decode and not is_extend_mode):
                 # Decode mode: each request gets one token, split by batch position
+                logger.info(f"[DEBUG] Using decode mode processing")
                 self._record_decode_tensor_stats(
                     tensor, name, stage, extra_info, request_ids_to_process, seq_lens
                 )
-            elif is_extend_mode:
+            elif is_extend_mode or (is_likely_extend and not is_decode_mode):
                 # Extend/prefill mode: split tensor by sequence lengths
+                logger.info(f"[DEBUG] Using extend mode processing")
                 self._record_split_tensor_stats(
                     tensor, name, stage, extra_info, request_ids_to_process, seq_lens
                 )
             else:
                 logger.warning(
-                    f"[WARNING] Cannot determine mode: tensor_tokens={tensor.shape[0]}, batch_size={len(request_ids_to_process)}, total_seq_lens={total_seq_lens}"
+                    f"[WARNING] Mode detection uncertain: tensor_tokens={tensor.shape[0]}, batch_size={len(request_ids_to_process)}, total_seq_lens={total_seq_lens}"
                 )
-                # Fallback to shared stats
-                for req_id in request_ids_to_process:
+                # Enhanced fallback with per-request stats
+                for i, req_id in enumerate(request_ids_to_process):
                     if req_id and req_id in self._request_traces:
+                        # 检查请求状态，只为活跃请求记录
+                        if self._request_traces[req_id]["status"] == "active":
+                            req_stats = stats.copy()
+                            req_stats["request_id"] = req_id
+                            req_stats["batch_position"] = i
+                            req_stats["mode_detection_failed"] = True
+                            req_stats["fallback_reason"] = (
+                                f"tensor_shape={tensor.shape}, batch_size={len(request_ids_to_process)}, total_seq_lens={total_seq_lens}"
+                            )
+                            self._request_traces[req_id]["precision_records"].append(
+                                req_stats
+                            )
+                            logger.info(
+                                f"[DEBUG] Added fallback stats for active request {req_id}"
+                            )
+                        else:
+                            logger.warning(
+                                f"[DEBUG] Skipping inactive request {req_id} (status: {self._request_traces[req_id]['status']})"
+                            )
+                    elif req_id:
+                        logger.warning(
+                            f"[DEBUG] Request ID {req_id} not in active traces, creating temporary record"
+                        )
+                        # 对于不在 traces 中的请求，记录警告但不创建记录
+                        pass
+        else:
+            # Use the same stats for all requests (single request or fallback)
+            logger.info(f"[DEBUG] Using single request or simple fallback processing")
+            for i, req_id in enumerate(request_ids_to_process):
+                if req_id and req_id in self._request_traces:
+                    # 检查请求状态，只为活跃请求记录
+                    if self._request_traces[req_id]["status"] == "active":
+                        # Create a copy of stats for each request
                         req_stats = stats.copy()
                         req_stats["request_id"] = req_id
-                        req_stats["mode_detection_failed"] = True
+                        req_stats["batch_position"] = i
                         self._request_traces[req_id]["precision_records"].append(
                             req_stats
                         )
-        else:
-            # Use the same stats for all requests (single request or fallback)
-            for req_id in request_ids_to_process:
-                if req_id and req_id in self._request_traces:
-                    # Create a copy of stats for each request
-                    req_stats = stats.copy()
-                    req_stats["request_id"] = req_id
-                    self._request_traces[req_id]["precision_records"].append(req_stats)
+                        logger.info(
+                            f"[DEBUG] Added simple stats for active request {req_id}"
+                        )
+                    else:
+                        logger.warning(
+                            f"[DEBUG] Skipping inactive request {req_id} (status: {self._request_traces[req_id]['status']})"
+                        )
                 elif req_id:
                     logger.warning(
-                        f"Request ID mismatch: {req_id} not in traces {list(self._request_traces.keys())}"
+                        f"[DEBUG] Request ID mismatch: {req_id} not in traces {list(self._request_traces.keys())}"
                     )
 
         # Set the first request ID for display purposes
@@ -512,6 +600,13 @@ class PrecisionTracer:
             # Each request gets exactly one token: tensor[i] for request i
             for i, req_id in enumerate(request_ids):
                 if req_id and req_id in self._request_traces:
+                    # 检查请求状态，只为活跃请求记录
+                    if self._request_traces[req_id]["status"] != "active":
+                        logger.warning(
+                            f"[DEBUG] Skipping decode stats for inactive request {req_id} (status: {self._request_traces[req_id]['status']})"
+                        )
+                        continue
+
                     if i >= tensor.shape[0]:
                         logger.warning(
                             f"[WARNING] Request index {i} >= tensor batch size {tensor.shape[0]} for req {req_id}"
@@ -544,7 +639,7 @@ class PrecisionTracer:
                     self._request_traces[req_id]["precision_records"].append(req_stats)
 
                     logger.info(
-                        f"[DEBUG] Added decode stats for {req_id}: batch_pos={i}"
+                        f"[DEBUG] Added decode stats for active request {req_id}: batch_pos={i}"
                     )
                 elif req_id:
                     logger.warning(
@@ -593,11 +688,19 @@ class PrecisionTracer:
             start_idx = 0
             for i, (req_id, seq_len) in enumerate(zip(request_ids, seq_lens_list)):
                 if req_id and req_id in self._request_traces:
+                    # 检查请求状态，只为活跃请求记录
+                    if self._request_traces[req_id]["status"] != "active":
+                        logger.warning(
+                            f"[DEBUG] Skipping split tensor stats for inactive request {req_id} (status: {self._request_traces[req_id]['status']})"
+                        )
+                        start_idx += seq_len
+                        continue
+
                     # Extract the portion of tensor for this request
                     end_idx = start_idx + seq_len
 
                     logger.info(
-                        f"[DEBUG] Processing req {req_id}: start_idx={start_idx}, end_idx={end_idx}, seq_len={seq_len}"
+                        f"[DEBUG] Processing active req {req_id}: start_idx={start_idx}, end_idx={end_idx}, seq_len={seq_len}"
                     )
 
                     if start_idx >= tensor.shape[0]:
@@ -631,12 +734,13 @@ class PrecisionTracer:
                     req_stats["request_id"] = req_id
                     req_stats["sequence_length"] = seq_len
                     req_stats["batch_position"] = i
+                    req_stats["mode"] = "extend"
 
                     # Add to the specific request's records
                     self._request_traces[req_id]["precision_records"].append(req_stats)
 
                     logger.info(
-                        f"[DEBUG] Added split tensor stats for {req_id}: shape={req_tensor.shape}, "
+                        f"[DEBUG] Added split tensor stats for active request {req_id}: shape={req_tensor.shape}, "
                         f"seq_len={seq_len}, batch_pos={i}"
                     )
 

@@ -85,8 +85,21 @@ class SchedulerOutputProcessorMixin:
                     # End trace for finished request
                     if precision_tracer._trace_active:
                         request_id = str(req.rid)
+                        logger.info(
+                            f"[DEBUG] Request {request_id} finished, attempting to end trace"
+                        )
                         if request_id in precision_tracer._request_traces:
+                            logger.info(
+                                f"[DEBUG] Found active trace for finished request {request_id}"
+                            )
                             precision_tracer.end_request_trace(request_id)
+                        else:
+                            logger.warning(
+                                f"[DEBUG] No active trace found for finished request {request_id}"
+                            )
+                            logger.warning(
+                                f"[DEBUG] Available traces: {list(precision_tracer._request_traces.keys())}"
+                            )
                     self.tree_cache.cache_finished_req(req)
                 elif not batch.decoding_reqs or req not in batch.decoding_reqs:
                     # This updates radix so others can match
@@ -198,8 +211,21 @@ class SchedulerOutputProcessorMixin:
                 # End trace for finished request
                 if precision_tracer._trace_active:
                     request_id = str(req.rid)
+                    logger.info(
+                        f"[DEBUG] Request {request_id} finished (decode mode), attempting to end trace"
+                    )
                     if request_id in precision_tracer._request_traces:
+                        logger.info(
+                            f"[DEBUG] Found active trace for finished request {request_id} (decode mode)"
+                        )
                         precision_tracer.end_request_trace(request_id)
+                    else:
+                        logger.warning(
+                            f"[DEBUG] No active trace found for finished request {request_id} (decode mode)"
+                        )
+                        logger.warning(
+                            f"[DEBUG] Available traces: {list(precision_tracer._request_traces.keys())}"
+                        )
                 self.tree_cache.cache_finished_req(req)
 
             if req.return_logprob:

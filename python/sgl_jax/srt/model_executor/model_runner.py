@@ -425,29 +425,75 @@ class ModelRunner:
         self.forward_pass_id += 1
 
         # Set request IDs for tracing
+        logger.info(
+            f"[DEBUG] Forward pass {self.forward_pass_id}: batch_size={forward_batch.batch_size}, forward_mode={forward_batch.forward_mode}"
+        )
 
         if (
             hasattr(forward_batch, "trace_request_ids")
             and forward_batch.trace_request_ids
             and precision_tracer._trace_active
         ):
+            logger.info(
+                f"[DEBUG] Processing trace_request_ids: {forward_batch.trace_request_ids}"
+            )
+            logger.info(
+                f"[DEBUG] Current active traces: {list(precision_tracer._request_traces.keys())}"
+            )
+
             # Start tracing for each request in the batch
             request_objects = getattr(forward_batch, "trace_request_objects", None)
+            active_request_ids = []
+
             for i, trace_request_id in enumerate(forward_batch.trace_request_ids):
                 req_obj = (
                     request_objects[i]
                     if request_objects and i < len(request_objects)
                     else None
                 )
-                if trace_request_id not in precision_tracer._request_traces:
-                    precision_tracer.start_request_trace(trace_request_id, req_obj)
 
-            # Set current request ID context (use first request for simplicity)
-            precision_tracer._current_request_id = (
-                forward_batch.trace_request_ids[0]
-                if forward_batch.trace_request_ids
-                else None
-            )
+                if trace_request_id not in precision_tracer._request_traces:
+                    logger.info(
+                        f"[DEBUG] Starting new trace for request {trace_request_id}"
+                    )
+                    precision_tracer.start_request_trace(trace_request_id, req_obj)
+                    active_request_ids.append(trace_request_id)
+                elif (
+                    precision_tracer._request_traces[trace_request_id]["status"]
+                    != "active"
+                ):
+                    # 如果请求已存在但处于非活跃状态，重新激活
+                    logger.info(
+                        f"[DEBUG] Reactivating trace for request {trace_request_id}"
+                    )
+                    precision_tracer._request_traces[trace_request_id][
+                        "status"
+                    ] = "active"
+                    active_request_ids.append(trace_request_id)
+                else:
+                    logger.info(
+                        f"[DEBUG] Request {trace_request_id} already has active trace"
+                    )
+                    active_request_ids.append(trace_request_id)
+
+            # Set current request ID context (use first active request)
+            if active_request_ids:
+                precision_tracer._current_request_id = active_request_ids[0]
+                logger.info(
+                    f"[DEBUG] Set current request ID to: {precision_tracer._current_request_id}"
+                )
+            else:
+                precision_tracer._current_request_id = None
+                logger.warning(f"[DEBUG] No active request IDs found")
+        else:
+            if not hasattr(forward_batch, "trace_request_ids"):
+                logger.debug(
+                    f"[DEBUG] forward_batch has no trace_request_ids attribute"
+                )
+            elif not forward_batch.trace_request_ids:
+                logger.debug(f"[DEBUG] trace_request_ids is empty")
+            elif not precision_tracer._trace_active:
+                logger.debug(f"[DEBUG] precision_tracer is not active")
 
         return self._forward_raw(forward_batch, logits_metadata, skip_attn_backend_init)
 
