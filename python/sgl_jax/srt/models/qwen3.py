@@ -303,6 +303,12 @@ class QWen3Model(nnx.Module):
                     forward_batch_info[1] if len(forward_batch_info) > 1 else None
                 )
 
+                # Debug logging in callback
+                logger.info(
+                    f"[DEBUG] transformer_trace_callback: trace_request_ids={trace_request_ids}"
+                )
+                logger.info(f"[DEBUG] transformer_trace_callback: seq_lens={seq_lens}")
+
                 precision_tracer.record(
                     tensor,
                     "transformer_output",
@@ -316,6 +322,14 @@ class QWen3Model(nnx.Module):
             forward_batch_info = (
                 getattr(forward_batch, "trace_request_ids", None),
                 getattr(forward_batch, "seq_lens", None),
+            )
+
+            # Debug what we're packing
+            logger.info(
+                f"[DEBUG] Before callback: forward_batch.trace_request_ids={getattr(forward_batch, 'trace_request_ids', 'NOT_FOUND')}"
+            )
+            logger.info(
+                f"[DEBUG] Before callback: forward_batch.seq_lens={getattr(forward_batch, 'seq_lens', 'NOT_FOUND')}"
             )
 
             transformer_callback_flag = jax.pure_callback(
@@ -403,9 +417,6 @@ class Qwen3ForCausalLM(nnx.Module):
     def _create_layer_mappings(self, layer_idx: int) -> dict:
         prefix = f"model.layers.{layer_idx}"
         target_prefix = f"transformer.layers.{layer_idx}"
-
-        num_heads = self.config.hf_config.num_attention_heads
-        hidden_size = self.config.hf_config.hidden_size
 
         mappings = {
             f"{prefix}.input_layernorm.weight": WeightMapping(

@@ -282,10 +282,43 @@ class PrecisionTracer:
 
         # Add stats to all relevant requests
         if seq_lens is not None and len(request_ids_to_process) > 1:
-            # Split tensor by sequence lengths for batch processing
-            self._record_split_tensor_stats(
-                tensor, name, stage, extra_info, request_ids_to_process, seq_lens
+            # Check if this is decode mode (tensor first dim == batch_size) or extend mode (tensor first dim == sum of seq_lens)
+            total_seq_lens = sum(
+                seq_lens.tolist() if hasattr(seq_lens, "tolist") else seq_lens
             )
+            is_decode_mode = tensor.shape[0] == len(request_ids_to_process)
+            is_extend_mode = tensor.shape[0] == total_seq_lens
+
+            logger.info(
+                f"[DEBUG] Mode detection: tensor_tokens={tensor.shape[0]}, batch_size={len(request_ids_to_process)}, total_seq_lens={total_seq_lens}"
+            )
+            logger.info(
+                f"[DEBUG] is_decode_mode={is_decode_mode}, is_extend_mode={is_extend_mode}"
+            )
+
+            if is_decode_mode:
+                # Decode mode: each request gets one token, split by batch position
+                self._record_decode_tensor_stats(
+                    tensor, name, stage, extra_info, request_ids_to_process, seq_lens
+                )
+            elif is_extend_mode:
+                # Extend/prefill mode: split tensor by sequence lengths
+                self._record_split_tensor_stats(
+                    tensor, name, stage, extra_info, request_ids_to_process, seq_lens
+                )
+            else:
+                logger.warning(
+                    f"[WARNING] Cannot determine mode: tensor_tokens={tensor.shape[0]}, batch_size={len(request_ids_to_process)}, total_seq_lens={total_seq_lens}"
+                )
+                # Fallback to shared stats
+                for req_id in request_ids_to_process:
+                    if req_id and req_id in self._request_traces:
+                        req_stats = stats.copy()
+                        req_stats["request_id"] = req_id
+                        req_stats["mode_detection_failed"] = True
+                        self._request_traces[req_id]["precision_records"].append(
+                            req_stats
+                        )
         else:
             # Use the same stats for all requests (single request or fallback)
             for req_id in request_ids_to_process:
@@ -456,6 +489,79 @@ class PrecisionTracer:
             }
 
         return stats
+
+    def _record_decode_tensor_stats(
+        self,
+        tensor: Any,
+        name: str,
+        stage: str,
+        extra_info: str,
+        request_ids: List[str],
+        seq_lens: Any,
+    ):
+        """Record tensor stats for decode mode where each request gets one token"""
+        try:
+            logger.info(
+                f"[DEBUG] _record_decode_tensor_stats: tensor.shape={tensor.shape}"
+            )
+            logger.info(
+                f"[DEBUG] Processing {len(request_ids)} requests in decode mode"
+            )
+
+            # In decode mode, tensor.shape[0] == len(request_ids)
+            # Each request gets exactly one token: tensor[i] for request i
+            for i, req_id in enumerate(request_ids):
+                if req_id and req_id in self._request_traces:
+                    if i >= tensor.shape[0]:
+                        logger.warning(
+                            f"[WARNING] Request index {i} >= tensor batch size {tensor.shape[0]} for req {req_id}"
+                        )
+                        break
+
+                    # Get the single token for this request
+                    req_tensor = tensor[
+                        i : i + 1
+                    ]  # Keep as [1, hidden_dim] to avoid dimension issues
+
+                    logger.info(
+                        f"[DEBUG] Decode req {req_id}: batch_pos={i}, req_tensor.shape={req_tensor.shape}"
+                    )
+
+                    # Compute stats for this request's token
+                    req_stats = self._compute_jax_stats(
+                        req_tensor, name, stage, extra_info
+                    )
+                    req_stats["request_id"] = req_id
+                    req_stats["sequence_length"] = (
+                        seq_lens.tolist()[i]
+                        if hasattr(seq_lens, "tolist")
+                        else seq_lens[i]
+                    )
+                    req_stats["batch_position"] = i
+                    req_stats["mode"] = "decode"
+
+                    # Add to the specific request's records
+                    self._request_traces[req_id]["precision_records"].append(req_stats)
+
+                    logger.info(
+                        f"[DEBUG] Added decode stats for {req_id}: batch_pos={i}"
+                    )
+                elif req_id:
+                    logger.warning(
+                        f"[WARNING] Request ID {req_id} not in active traces"
+                    )
+
+        except Exception as e:
+            logger.error(f"Error in decode tensor stats: {e}")
+            # Fallback: give each request the same stats
+            for i, req_id in enumerate(request_ids):
+                if req_id and req_id in self._request_traces:
+                    req_stats = self._compute_jax_stats(tensor, name, stage, extra_info)
+                    req_stats["request_id"] = req_id
+                    req_stats["decode_error"] = str(e)
+                    req_stats["batch_position"] = i
+                    req_stats["mode"] = "decode_fallback"
+                    self._request_traces[req_id]["precision_records"].append(req_stats)
 
     def _record_split_tensor_stats(
         self,
