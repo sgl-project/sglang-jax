@@ -474,13 +474,49 @@ class PrecisionTracer:
             else:
                 seq_lens_list = list(seq_lens)
 
+            logger.info(
+                f"[DEBUG] _record_split_tensor_stats: tensor.shape={tensor.shape}"
+            )
+            logger.info(f"[DEBUG] request_ids={request_ids}")
+            logger.info(f"[DEBUG] seq_lens_list={seq_lens_list}")
+            logger.info(
+                f"[DEBUG] tensor total tokens={tensor.shape[0] if len(tensor.shape) > 0 else 0}"
+            )
+
             # Split tensor by sequence lengths
             start_idx = 0
             for i, (req_id, seq_len) in enumerate(zip(request_ids, seq_lens_list)):
                 if req_id and req_id in self._request_traces:
                     # Extract the portion of tensor for this request
                     end_idx = start_idx + seq_len
+
+                    logger.info(
+                        f"[DEBUG] Processing req {req_id}: start_idx={start_idx}, end_idx={end_idx}, seq_len={seq_len}"
+                    )
+
+                    if start_idx >= tensor.shape[0]:
+                        logger.warning(
+                            f"[WARNING] start_idx {start_idx} >= tensor.shape[0] {tensor.shape[0]} for req {req_id}"
+                        )
+                        break
+
+                    if end_idx > tensor.shape[0]:
+                        logger.warning(
+                            f"[WARNING] end_idx {end_idx} > tensor.shape[0] {tensor.shape[0]} for req {req_id}, clipping to tensor end"
+                        )
+                        end_idx = tensor.shape[0]
+
                     req_tensor = tensor[start_idx:end_idx]
+                    logger.info(
+                        f"[DEBUG] req_tensor.shape for {req_id}: {req_tensor.shape}"
+                    )
+
+                    if req_tensor.shape[0] == 0:
+                        logger.warning(
+                            f"[WARNING] Empty tensor for req {req_id}, skipping"
+                        )
+                        start_idx = end_idx
+                        continue
 
                     # Compute stats for this specific request's data
                     req_stats = self._compute_jax_stats(
@@ -493,8 +529,8 @@ class PrecisionTracer:
                     # Add to the specific request's records
                     self._request_traces[req_id]["precision_records"].append(req_stats)
 
-                    logger.debug(
-                        f"Split tensor stats for {req_id}: shape={req_tensor.shape}, "
+                    logger.info(
+                        f"[DEBUG] Added split tensor stats for {req_id}: shape={req_tensor.shape}, "
                         f"seq_len={seq_len}, batch_pos={i}"
                     )
 

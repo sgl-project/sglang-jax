@@ -343,6 +343,27 @@ class Qwen3ForCausalLM(nnx.Module):
         )
         self.logits_processor = LogitsProcessor(config.hf_config.vocab_size)
 
+    def __call__(
+        self,
+        input_ids: jax.Array,
+        positions: jax.Array,
+        forward_batch: ForwardBatch,
+    ):
+        hidden_states, layers_k, layers_v, callback_flag = self.transformer(
+            input_ids, positions, forward_batch
+        )
+
+        return hidden_states, layers_k, layers_v, callback_flag
+
+    def compute_logits(
+        self,
+        hidden_states: jax.Array,
+        logits_metadata: LogitsMetadata,
+    ):
+        return self.logits_processor(
+            hidden_states, self.lm_head, logits_metadata, self.mesh
+        )
+
     def load_weights(self, rng_key: jax.Array):
         self.rng = nnx.Rngs(rng_key)
 
@@ -484,27 +505,6 @@ class Qwen3ForCausalLM(nnx.Module):
             mappings.update(bias_mappings)
 
         return mappings
-
-    def compute_logits(
-        self,
-        hidden_states: jax.Array,
-        logits_metadata: LogitsMetadata,
-    ):
-        return self.logits_processor(
-            hidden_states, self.lm_head, logits_metadata, self.mesh
-        )
-
-    def __call__(
-        self,
-        input_ids: jax.Array,
-        positions: jax.Array,
-        forward_batch: ForwardBatch,
-    ):
-        hidden_states, layers_k, layers_v, callback_flag = self.transformer(
-            input_ids, positions, forward_batch
-        )
-
-        return hidden_states, layers_k, layers_v, callback_flag
 
 
 EntryClass = Qwen3ForCausalLM
