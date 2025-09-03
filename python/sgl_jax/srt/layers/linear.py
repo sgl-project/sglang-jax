@@ -63,6 +63,9 @@ class LinearBase(nnx.Module):
         bias = self.bias if not self.skip_bias_add else None
         # Access the underlying JAX array using .value property
         logger.info("linear input 1 ")
+        jax.debug.print(f"x shape weight shape {x.shape} {self.weight.value.shape}")
+        jax.debug.visualize_array_sharding(x)
+        jax.debug.visualize_array_sharding(self.weight.value)
         output = jnp.dot(x, self.weight.value)
         logger.info("linear input 2 ")
         if bias is not None:
