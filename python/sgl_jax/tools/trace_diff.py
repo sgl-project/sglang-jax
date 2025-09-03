@@ -1,11 +1,3 @@
-#!/usr/bin/env python3
-"""
-JSONL Trace Comparison Tool
-
-Compares two JSONL trace files by content_hash and displays differences
-with color-coded output similar to difflib.
-"""
-
 import argparse
 import json
 import sys
@@ -13,8 +5,6 @@ from typing import Dict, List, Optional, Set, Tuple
 
 
 class Colors:
-    """ANSI color codes for terminal output"""
-
     RED = "\033[91m"
     GREEN = "\033[92m"
     YELLOW = "\033[93m"
@@ -25,9 +15,12 @@ class Colors:
     BOLD = "\033[1m"
     RESET = "\033[0m"
 
+    BG_RED = "\033[48;5;124m"
+    BG_GREEN = "\033[48;5;28m"
+    BG_YELLOW = "\033[48;5;178m"
+
 
 def load_jsonl(file_path: str) -> List[Dict]:
-    """Load a JSONL file and return list of JSON objects"""
     try:
         with open(file_path, "r", encoding="utf-8") as f:
             return [json.loads(line.strip()) for line in f if line.strip()]
@@ -37,7 +30,6 @@ def load_jsonl(file_path: str) -> List[Dict]:
 
 
 def group_by_content_hash(traces: List[Dict]) -> Dict[str, List[Dict]]:
-    """Group traces by content_hash"""
     groups = {}
     for trace in traces:
         content_hash = trace.get("content_hash")
@@ -49,176 +41,228 @@ def group_by_content_hash(traces: List[Dict]) -> Dict[str, List[Dict]]:
 
 
 def compare_precision_records(
-    records1: List[Dict], records2: List[Dict], tolerance: float = 1e-6
+    records1: Dict, records2: Dict, tolerance: float = 1e-6
 ) -> Tuple[bool, List[str]]:
-    """Compare precision records between two traces with detailed hierarchical output"""
     differences = []
+    all_match = True
 
-    if len(records1) != len(records2):
+    if isinstance(records1, list) or isinstance(records2, list):
+        differences.append("Legacy format detected - basic comparison only")
+        return len(records1) == len(records2), differences
+
+    # Compare structure: prefill and decode categories
+    categories1 = set(records1.keys()) if isinstance(records1, dict) else set()
+    categories2 = set(records2.keys()) if isinstance(records2, dict) else set()
+
+    if categories1 != categories2:
+        differences.append(f"Category mismatch: {categories1} vs {categories2}")
+        return False, differences
+
+    # Compare each category (prefill, decode)
+    for category in sorted(categories1):
+        tokens1 = records1.get(category, [])
+        tokens2 = records2.get(category, [])
+
+        category_match, category_diffs = compare_token_groups(
+            category, tokens1, tokens2, tolerance
+        )
+
+        if not category_match:
+            all_match = False
+            differences.extend(category_diffs)
+
+    return all_match, differences
+
+
+def compare_token_groups(
+    category: str, tokens1: List[Dict], tokens2: List[Dict], tolerance: float = 1e-6
+) -> Tuple[bool, List[str]]:
+    """Compare token groups within a category (prefill/decode)"""
+    differences = []
+    all_match = True
+
+    if len(tokens1) != len(tokens2):
         differences.append(
-            f"❌ Record count mismatch: {len(records1)} vs {len(records2)}"
+            f"  {category}: Token count mismatch: {len(tokens1)} vs {len(tokens2)}"
         )
         return False, differences
 
-    all_match = True
+    # Compare each token group
+    for i, (token1, token2) in enumerate(zip(tokens1, tokens2)):
+        token_idx1 = token1.get("token_idx", i)
+        token_idx2 = token2.get("token_idx", i)
 
-    # Group records by layer_id and module_type for better organization
-    layer_groups1 = {}
-    layer_groups2 = {}
-
-    for rec in records1:
-        layer_id = rec.get("layer_id", "unknown")
-        module_type = rec.get("module_type", "unknown")
-        key = f"{layer_id}_{module_type}"
-        if key not in layer_groups1:
-            layer_groups1[key] = []
-        layer_groups1[key].append(rec)
-
-    for rec in records2:
-        layer_id = rec.get("layer_id", "unknown")
-        module_type = rec.get("module_type", "unknown")
-        key = f"{layer_id}_{module_type}"
-        if key not in layer_groups2:
-            layer_groups2[key] = []
-        layer_groups2[key].append(rec)
-
-    # Compare by groups
-    all_keys = set(layer_groups1.keys()) | set(layer_groups2.keys())
-
-    for key in sorted(all_keys):
-        layer_id, module_type = key.split("_", 1)
-        layer_display = (
-            f"Layer {layer_id}" if layer_id != "unknown" else "Unknown Layer"
-        )
-        module_display = (
-            module_type.title() if module_type != "unknown" else "Unknown Module"
-        )
-
-        group1 = layer_groups1.get(key, [])
-        group2 = layer_groups2.get(key, [])
-
-        if len(group1) != len(group2):
+        if token_idx1 != token_idx2:
             differences.append(
-                f"❌ {layer_display} | {module_display} | Record count: {len(group1)} vs {len(group2)}"
+                f"    {category}[{i}]: Token index mismatch: {token_idx1} vs {token_idx2}"
             )
             all_match = False
             continue
 
-        # Compare records within the group
-        for i, (rec1, rec2) in enumerate(zip(group1, group2)):
-            record_prefix = f"{layer_display} | {module_type.title()} | {rec1.get('name', 'unnamed')}"
+        # Compare records within this token group
+        records1 = token1.get("records", [])
+        records2 = token2.get("records", [])
 
-            # Compare key fields
-            for field in ["stage", "name", "shape", "dtype"]:
-                val1, val2 = rec1.get(field), rec2.get(field)
-                if val1 != val2:
-                    differences.append(
-                        f"❌ {record_prefix} | {field}: {val1} vs {val2}"
-                    )
-                    all_match = False
+        token_match, token_diffs = compare_token_records(
+            category, token_idx1, records1, records2, tolerance
+        )
 
-            # Compare numerical values with tolerance
-            for field in ["min", "max", "mean", "std"]:
-                val1, val2 = rec1.get(field), rec2.get(field)
-                if val1 is not None and val2 is not None:
-                    if isinstance(val1, (int, float)) and isinstance(
-                        val2, (int, float)
-                    ):
-                        diff = abs(val1 - val2)
-                        if diff > tolerance:
-                            differences.append(
-                                f"❌ {record_prefix} | {field}: {val1:.6f} vs {val2:.6f} (diff: {diff:.6f})"
-                            )
-                            all_match = False
-                    elif val1 != val2:
+        if not token_match:
+            all_match = False
+            differences.extend(token_diffs)
+
+    return all_match, differences
+
+
+def compare_token_records(
+    category: str,
+    token_idx: int,
+    records1: List[Dict],
+    records2: List[Dict],
+    tolerance: float = 1e-6,
+) -> Tuple[bool, List[str]]:
+    """Compare records within a single token group"""
+    differences = []
+    all_match = True
+
+    if len(records1) != len(records2):
+        differences.append(
+            f"    {category}[{token_idx}]: Record count mismatch: {len(records1)} vs {len(records2)}"
+        )
+        return False, differences
+
+    # Group records by layer and module for alignment
+    def group_records(records):
+        groups = {}
+        for rec in records:
+            layer_id = rec.get("layer_id", "unknown")
+            module_type = rec.get("module_type", "unknown")
+            name = rec.get("name", "unnamed")
+            key = f"{layer_id}_{module_type}_{name}"
+            groups[key] = rec
+        return groups
+
+    groups1 = group_records(records1)
+    groups2 = group_records(records2)
+
+    all_keys = set(groups1.keys()) | set(groups2.keys())
+
+    for key in sorted(all_keys):
+        layer_id, module_type, name = key.split("_", 2)
+
+        if key not in groups1:
+            differences.append(
+                f"      {category}[{token_idx}] {layer_id}.{module_type}.{name}: Missing in trace 1"
+            )
+            all_match = False
+            continue
+
+        if key not in groups2:
+            differences.append(
+                f"      {category}[{token_idx}] {layer_id}.{module_type}.{name}: Missing in trace 2"
+            )
+            all_match = False
+            continue
+
+        rec1, rec2 = groups1[key], groups2[key]
+
+        # Compare basic fields
+        for field in ["stage", "shape", "dtype"]:
+            val1, val2 = rec1.get(field), rec2.get(field)
+            if val1 != val2:
+                differences.append(
+                    f"        {category}[{token_idx}] {layer_id}.{module_type}.{name}.{field}: MISMATCH|{val1}|{val2}"
+                )
+                all_match = False
+            else:
+                differences.append(
+                    f"        {category}[{token_idx}] {layer_id}.{module_type}.{name}.{field}: MATCH|{val1}"
+                )
+
+        # Compare numerical values
+        for field in ["min", "max", "mean", "std"]:
+            val1, val2 = rec1.get(field), rec2.get(field)
+            if val1 is not None and val2 is not None:
+                if isinstance(val1, (int, float)) and isinstance(val2, (int, float)):
+                    diff = abs(val1 - val2)
+                    if diff > tolerance:
                         differences.append(
-                            f"❌ {record_prefix} | {field}: {val1} vs {val2}"
+                            f"        {category}[{token_idx}] {layer_id}.{module_type}.{name}.{field}: MISMATCH|{val1:.6f}|{val2:.6f}|{diff:.6f}"
                         )
                         all_match = False
-
-            # Compare boolean flags
-            for field in ["has_nan", "has_inf"]:
-                val1, val2 = rec1.get(field), rec2.get(field)
-                if val1 != val2:
+                    else:
+                        differences.append(
+                            f"        {category}[{token_idx}] {layer_id}.{module_type}.{name}.{field}: MATCH|{val1:.6f}|{val2:.6f}|{diff:.6f}"
+                        )
+                elif val1 != val2:
                     differences.append(
-                        f"❌ {record_prefix} | {field}: {val1} vs {val2}"
+                        f"        {category}[{token_idx}] {layer_id}.{module_type}.{name}.{field}: MISMATCH|{val1}|{val2}"
                     )
                     all_match = False
+                else:
+                    differences.append(
+                        f"        {category}[{token_idx}] {layer_id}.{module_type}.{name}.{field}: MATCH|{val1}"
+                    )
 
-            # Compare token-level statistics if available
+        # Compare boolean flags
+        for field in ["has_nan", "has_inf"]:
+            val1, val2 = rec1.get(field), rec2.get(field)
+            if val1 != val2:
+                differences.append(
+                    f"        {category}[{token_idx}] {layer_id}.{module_type}.{name}.{field}: MISMATCH|{val1}|{val2}"
+                )
+                all_match = False
+            else:
+                differences.append(
+                    f"        {category}[{token_idx}] {layer_id}.{module_type}.{name}.{field}: MATCH|{val1}"
+                )
+
+        # For decode, compare token_stats if present
+        if category == "decode":
             token_stats1 = rec1.get("token_stats", [])
             token_stats2 = rec2.get("token_stats", [])
 
             if token_stats1 and token_stats2:
                 if len(token_stats1) != len(token_stats2):
                     differences.append(
-                        f"❌ {record_prefix} | token_stats count: {len(token_stats1)} vs {len(token_stats2)}"
+                        f"        {category}[{token_idx}] {layer_id}.{module_type}.{name}.token_stats: Length mismatch {len(token_stats1)} vs {len(token_stats2)}"
                     )
                     all_match = False
                 else:
                     # Compare token-level stats
-                    for token_stat1, token_stat2 in zip(token_stats1, token_stats2):
-                        token_idx = token_stat1.get("token_idx", "unknown")
-                        token_prefix = f"{record_prefix} | Token[{token_idx}]"
-
-                        # Compare token-level numerical values
-                        for token_field in ["min", "max", "mean", "std", "value"]:
-                            tval1, tval2 = token_stat1.get(
-                                token_field
-                            ), token_stat2.get(token_field)
-                            if tval1 is not None and tval2 is not None:
-                                if isinstance(tval1, (int, float)) and isinstance(
-                                    tval2, (int, float)
+                    for ts_idx, (ts1, ts2) in enumerate(
+                        zip(token_stats1, token_stats2)
+                    ):
+                        for ts_field in ["min", "max", "mean", "std", "value"]:
+                            ts_val1, ts_val2 = ts1.get(ts_field), ts2.get(ts_field)
+                            if ts_val1 is not None and ts_val2 is not None:
+                                if isinstance(ts_val1, (int, float)) and isinstance(
+                                    ts_val2, (int, float)
                                 ):
-                                    diff = abs(tval1 - tval2)
-                                    if diff > tolerance:
+                                    ts_diff = abs(ts_val1 - ts_val2)
+                                    if ts_diff > tolerance:
                                         differences.append(
-                                            f"❌ {token_prefix} | {token_field}: {tval1:.6f} vs {tval2:.6f} (diff: {diff:.6f})"
+                                            f"          {category}[{token_idx}] {layer_id}.{module_type}.{name}.token[{ts_idx}].{ts_field}: MISMATCH|{ts_val1:.6f}|{ts_val2:.6f}|{ts_diff:.6f}"
                                         )
                                         all_match = False
-                                elif tval1 != tval2:
+                                    else:
+                                        differences.append(
+                                            f"          {category}[{token_idx}] {layer_id}.{module_type}.{name}.token[{ts_idx}].{ts_field}: MATCH|{ts_val1:.6f}|{ts_val2:.6f}|{ts_diff:.6f}"
+                                        )
+                                elif ts_val1 != ts_val2:
                                     differences.append(
-                                        f"❌ {token_prefix} | {token_field}: {tval1} vs {tval2}"
+                                        f"          {category}[{token_idx}] {layer_id}.{module_type}.{name}.token[{ts_idx}].{ts_field}: MISMATCH|{ts_val1}|{ts_val2}"
                                     )
                                     all_match = False
-
-                        # Compare token-level boolean flags
-                        for token_field in ["has_nan", "has_inf"]:
-                            tval1, tval2 = token_stat1.get(
-                                token_field
-                            ), token_stat2.get(token_field)
-                            if tval1 != tval2:
-                                differences.append(
-                                    f"❌ {token_prefix} | {token_field}: {tval1} vs {tval2}"
-                                )
-                                all_match = False
+                                else:
+                                    differences.append(
+                                        f"          {category}[{token_idx}] {layer_id}.{module_type}.{name}.token[{ts_idx}].{ts_field}: MATCH|{ts_val1}"
+                                    )
             elif token_stats1 or token_stats2:
-                # One has token stats, the other doesn't
                 differences.append(
-                    f"❌ {record_prefix} | token_stats availability: {bool(token_stats1)} vs {bool(token_stats2)}"
+                    f"        {category}[{token_idx}] {layer_id}.{module_type}.{name}.token_stats: Availability mismatch {bool(token_stats1)} vs {bool(token_stats2)}"
                 )
                 all_match = False
-
-            # Add tensor statistics summary for context
-            if not all_match and i == 0:  # Only for first record in group to avoid spam
-                shape1 = rec1.get("shape", "unknown")
-                shape2 = rec2.get("shape", "unknown")
-                seq_len1 = rec1.get("sequence_length")
-                seq_len2 = rec2.get("sequence_length")
-
-                if shape1 == shape2:
-                    shape_info = f"📊 Tensor shape: {shape1}"
-                    if seq_len1 is not None:
-                        shape_info += f" (seq_len: {seq_len1})"
-                    differences.append(f"    {shape_info}")
-                else:
-                    differences.append(
-                        f"    📊 Tensor shapes differ: {shape1} vs {shape2}"
-                    )
-                    if seq_len1 is not None and seq_len2 is not None:
-                        differences.append(
-                            f"    📊 Sequence lengths: {seq_len1} vs {seq_len2}"
-                        )
 
     return all_match, differences
 
@@ -237,60 +281,181 @@ def print_diff_header(content_hash: str, trace1: Dict, trace2: Dict):
     print("=" * 80)
 
 
-def print_match_status(is_match: bool, differences: List[str]):
-    """Print match status with colors and detailed hierarchy"""
-    if is_match:
-        print(f"{Colors.GREEN}✓ MATCH{Colors.RESET}")
+def format_comparison_result(message: str) -> str:
+    """Format comparison result with appropriate colors"""
+    if "|" not in message:
+        return message
+
+    parts = message.split("|")
+    if len(parts) < 2:
+        return message
+
+    status = parts[0]
+    if status == "MATCH":
+        if len(parts) == 2:
+            # Simple match: MATCH|value
+            return f"{Colors.BG_GREEN}{Colors.WHITE} ✓ {parts[1]} {Colors.RESET}"
+        elif len(parts) == 4:
+            # Numerical match with diff: MATCH|val1|val2|diff
+            return f"{Colors.BG_GREEN}{Colors.WHITE} ✓ {parts[1]} ≈ {parts[2]} (diff: {parts[3]}) {Colors.RESET}"
+        else:
+            return f"{Colors.BG_GREEN}{Colors.WHITE} ✓ {parts[1]} {Colors.RESET}"
+    elif status == "MISMATCH":
+        if len(parts) == 3:
+            # Simple mismatch: MISMATCH|val1|val2
+            return f"{Colors.BG_RED}{Colors.WHITE} ✗ {parts[1]} ≠ {parts[2]} {Colors.RESET}"
+        elif len(parts) == 4:
+            # Numerical mismatch: MISMATCH|val1|val2|diff
+            return f"{Colors.BG_RED}{Colors.WHITE} ✗ {parts[1]} ≠ {parts[2]} (diff: {parts[3]}) {Colors.RESET}"
+        else:
+            return f"{Colors.BG_RED}{Colors.WHITE} ✗ {parts[1]} {Colors.RESET}"
+
+    return message
+
+
+def print_tree_differences(differences: List[str]):
+    """Print differences in a tree-like structure with color coding"""
+    if not differences:
+        print(f"{Colors.BG_GREEN}{Colors.WHITE} ALL MATCH {Colors.RESET}")
+        return
+
+    has_mismatches = any("MISMATCH" in diff for diff in differences)
+    if has_mismatches:
+        print(f"{Colors.RED}DIFFERENCES FOUND:{Colors.RESET}")
     else:
-        print(f"{Colors.RED}✗ DIFFERENCES FOUND:{Colors.RESET}")
+        print(f"{Colors.GREEN}ALL VALUES MATCH:{Colors.RESET}")
 
-        # Group differences by layer for better readability
-        layer_groups = {}
-        other_diffs = []
+    # Group differences by category and token for tree display
+    tree = {}
 
-        for diff in differences:
-            if "Layer " in diff and "|" in diff:
-                # Extract layer info
-                parts = diff.split("|", 1)
-                if len(parts) >= 1:
-                    layer_info = parts[0].strip()
-                    if layer_info not in layer_groups:
-                        layer_groups[layer_info] = []
-                    layer_groups[layer_info].append(diff)
-                else:
-                    other_diffs.append(diff)
-            else:
-                other_diffs.append(diff)
+    for diff in differences:
+        parts = diff.split(": ", 1)
+        if len(parts) != 2:
+            continue
 
-        # Print layer-grouped differences
-        for layer_info in sorted(layer_groups.keys()):
-            print(f"\n  {Colors.BOLD}{Colors.BLUE}{layer_info}:{Colors.RESET}")
-            layer_diffs = layer_groups[layer_info]
+        path = parts[0].strip()
+        message = parts[1].strip()
 
-            for diff in layer_diffs[:20]:  # Limit per layer
-                if diff.startswith("❌"):
-                    print(f"    {Colors.RED}{diff}{Colors.RESET}")
-                elif diff.startswith("    📊"):
-                    print(f"      {Colors.YELLOW}{diff[4:]}{Colors.RESET}")
-                else:
-                    print(f"    {diff}")
-
-        # Print other differences
-        if other_diffs:
-            print(f"\n  {Colors.BOLD}Other Differences:{Colors.RESET}")
-            for diff in other_diffs[:10]:
-                print(f"    {Colors.RED}{diff}{Colors.RESET}")
-            if len(other_diffs) > 10:
-                print(
-                    f"    {Colors.YELLOW}... and {len(other_diffs) - 10} more general differences{Colors.RESET}"
+        # Parse the hierarchical path
+        if "[" in path and "]" in path:
+            # Extract category and token info
+            if "prefill[" in path or "decode[" in path:
+                category_part = path.split("[")[0].strip()
+                rest = path.split("]", 1)[1].strip() if "]" in path else ""
+                token_part = (
+                    path.split("[")[1].split("]")[0]
+                    if "[" in path and "]" in path
+                    else "0"
                 )
+
+                if category_part not in tree:
+                    tree[category_part] = {}
+                if token_part not in tree[category_part]:
+                    tree[category_part][token_part] = []
+
+                tree[category_part][token_part].append(f"{rest}: {message}")
+            else:
+                # Other format
+                if "other" not in tree:
+                    tree["other"] = {"0": []}
+                tree["other"]["0"].append(diff)
+        else:
+            # Top-level difference
+            if "root" not in tree:
+                tree["root"] = {"0": []}
+            tree["root"]["0"].append(diff)
+
+    # Print tree structure
+    for category in sorted(tree.keys()):
+        if category == "root":
+            continue
+        print(f"\n{Colors.BOLD}{category.upper()}:{Colors.RESET}")
+
+        tokens = tree[category]
+        for token_idx in sorted(
+            tokens.keys(), key=lambda x: int(x) if x.isdigit() else 999
+        ):
+            token_diffs = tokens[token_idx]
+            if len(token_diffs) > 0:
+                print(f"  Token[{token_idx}]:")
+
+                # Group by layer/module
+                layer_groups = {}
+                for diff in token_diffs:
+                    if " " in diff:
+                        layer_part = diff.split(" ")[0] if " " in diff else diff
+                        if layer_part not in layer_groups:
+                            layer_groups[layer_part] = []
+                        layer_groups[layer_part].append(diff)
+                    else:
+                        if "misc" not in layer_groups:
+                            layer_groups["misc"] = []
+                        layer_groups["misc"].append(diff)
+
+                for layer in sorted(layer_groups.keys()):
+                    if layer != "misc":
+                        print(f"    {layer}:")
+
+                    # Separate matches and mismatches for better organization
+                    matches = []
+                    mismatches = []
+                    others = []
+
+                    for diff in layer_groups[layer]:
+                        if ": " in diff:
+                            field_msg = diff.split(": ", 1)[1]
+                            if "MATCH" in field_msg:
+                                matches.append(field_msg)
+                            elif "MISMATCH" in field_msg:
+                                mismatches.append(field_msg)
+                            else:
+                                others.append(field_msg)
+                        else:
+                            others.append(diff)
+
+                    # Show mismatches first (more important)
+                    for msg in mismatches[:3]:  # Limit output
+                        formatted = format_comparison_result(msg)
+                        print(f"      {formatted}")
+
+                    # Then show matches
+                    for msg in matches[:3]:  # Limit output
+                        formatted = format_comparison_result(msg)
+                        print(f"      {formatted}")
+
+                    # Then others
+                    for msg in others[:2]:
+                        print(f"      {Colors.YELLOW}{msg}{Colors.RESET}")
+
+                    total_items = len(mismatches) + len(matches) + len(others)
+                    shown_items = (
+                        min(3, len(mismatches))
+                        + min(3, len(matches))
+                        + min(2, len(others))
+                    )
+                    if total_items > shown_items:
+                        print(
+                            f"      {Colors.YELLOW}... and {total_items - shown_items} more{Colors.RESET}"
+                        )
+
+    # Print root-level differences
+    if "root" in tree:
+        print(f"\n{Colors.BOLD}GENERAL:{Colors.RESET}")
+        for diff in tree["root"]["0"][:10]:
+            formatted = format_comparison_result(diff)
+            print(f"  {formatted}")
+
+
+def print_match_status(is_match: bool, differences: List[str]):
+    """Print match status with tree-like hierarchy"""
+    print_tree_differences(differences)
 
 
 def compare_trace_files(
     file1: str, file2: str, tolerance: float = 1e-6, show_matches: bool = False
 ) -> bool:
     """
-    Compare two JSONL trace files by content_hash with detailed hierarchical output
+    Compare two JSONL trace files by content_hash with tree-structured output
 
     Args:
         file1, file2: Paths to JSONL trace files
@@ -369,13 +534,8 @@ def compare_trace_files(
             trace = traces[0]
             records = trace.get("precision_records", [])
             print(
-                f"  {Colors.YELLOW}−{Colors.RESET} {content_hash} (Request ID: {trace.get('request_id', 'N/A')})"
+                f"  {Colors.YELLOW}-{Colors.RESET} {content_hash} (Request ID: {trace.get('request_id', 'N/A')})"
             )
-            print(f"    📊 {len(records)} precision records")
-            if records:
-                print(
-                    f"    🔍 Layers: {', '.join(set(str(r.get('layer_id', 'unknown')) for r in records[:5]))}"
-                )
 
     if only_in_2:
         print(f"\n{Colors.YELLOW}Content hashes only in file 2:{Colors.RESET}")
@@ -386,11 +546,6 @@ def compare_trace_files(
             print(
                 f"  {Colors.YELLOW}+{Colors.RESET} {content_hash} (Request ID: {trace.get('request_id', 'N/A')})"
             )
-            print(f"    📊 {len(records)} precision records")
-            if records:
-                print(
-                    f"    🔍 Layers: {', '.join(set(str(r.get('layer_id', 'unknown')) for r in records[:5]))}"
-                )
 
     # Summary
     print(f"\n{Colors.BOLD}Summary:{Colors.RESET}")
@@ -400,16 +555,16 @@ def compare_trace_files(
     print(f"  {Colors.YELLOW}Only in file 2: {len(only_in_2)}{Colors.RESET}")
 
     if all_match and len(only_in_1) == 0 and len(only_in_2) == 0:
-        print(f"\n{Colors.GREEN}{Colors.BOLD}✓ All traces match!{Colors.RESET}")
+        print(f"\n{Colors.GREEN}{Colors.BOLD}All traces match!{Colors.RESET}")
         return True
     else:
-        print(f"\n{Colors.RED}{Colors.BOLD}✗ Traces have differences{Colors.RESET}")
+        print(f"\n{Colors.RED}{Colors.BOLD}Traces have differences{Colors.RESET}")
         return False
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Compare two JSONL trace files by content_hash",
+        description="Compare two JSONL trace files by content_hash with token-level tree display",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:

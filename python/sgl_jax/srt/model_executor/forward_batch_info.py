@@ -130,6 +130,8 @@ class CaptureHiddenMode(IntEnum):
 class ForwardBatch:
     """Store all inputs of a forward pass."""
 
+    # The batch id
+    bid: int
     # The forward mode
     forward_mode: ForwardMode
     # The batch size
@@ -162,6 +164,7 @@ class ForwardBatch:
 
     def tree_flatten(self):
         children = (
+            self.bid,
             self.input_ids,
             self.req_pool_indices,
             self.seq_lens,
@@ -187,20 +190,21 @@ class ForwardBatch:
 
         obj.forward_mode = aux_data["forward_mode"]
         obj.batch_size = aux_data["batch_size"]
-        obj.trace_request_ids = None  # Will be set separately, not part of pytree
-        obj.trace_request_objects = None  # Will be set separately, not part of pytree
+        obj.trace_request_ids = None
+        obj.trace_request_objects = None
 
-        obj.input_ids = children[0]
-        obj.req_pool_indices = children[1]
-        obj.seq_lens = children[2]
-        obj.out_cache_loc = children[3]
-        obj.positions = children[4]
-        obj.extend_start_loc = children[5]
-        obj.token_to_kv_pool = children[6]
-        obj.attn_backend = children[7]
-        obj.cache_loc = children[8]
-        obj.extend_prefix_lens = children[9]
-        obj.extend_seq_lens = children[10]
+        obj.bid = children[0]
+        obj.input_ids = children[1]
+        obj.req_pool_indices = children[2]
+        obj.seq_lens = children[3]
+        obj.out_cache_loc = children[4]
+        obj.positions = children[5]
+        obj.extend_start_loc = children[6]
+        obj.token_to_kv_pool = children[7]
+        obj.attn_backend = children[8]
+        obj.cache_loc = children[9]
+        obj.extend_prefix_lens = children[10]
+        obj.extend_seq_lens = children[11]
 
         return obj
 
@@ -232,6 +236,7 @@ class ForwardBatch:
         model_runner: ModelRunner,
     ):
         obj = cls(
+            bid=batch.bid,
             forward_mode=batch.forward_mode,
             batch_size=len(batch.seq_lens),
             input_ids=device_array(model_runner.mesh, batch.input_ids),
@@ -254,7 +259,4 @@ class ForwardBatch:
                 else None
             ),
         )
-        # Set trace fields separately (not part of JAX pytree)
-        obj.trace_request_ids = getattr(batch, "trace_request_ids", None)
-        obj.trace_request_objects = getattr(batch, "trace_request_objects", None)
         return obj
