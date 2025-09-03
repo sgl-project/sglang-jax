@@ -167,12 +167,19 @@ class QWenAttention(nnx.Module):
         forward_batch: ForwardBatch,
         layer_id: int,
     ) -> tuple[jax.Array, jax.Array, jax.Array]:
+        logger.info("qwen attention input 1 ")
         q, _ = self.q_proj(hidden_states)
+        logger.info("qwen attention input 2 ")
         k, _ = self.k_proj(hidden_states)
+        logger.info("qwen attention input 3 ")
         v, _ = self.v_proj(hidden_states)
+        logger.info("qwen attention input 4 ")
         q, k = self.rotary_emb(positions, q, k)
+        logger.info("qwen attention input 5 ")
         attn_output, k, v = self.attn(q, k, v, forward_batch=forward_batch)
+        logger.info("qwen attention input 6 ")
         output, _ = self.c_proj(attn_output)
+        logger.info("qwen attention input 7 ")
         return output, k, v
 
 
