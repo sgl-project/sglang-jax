@@ -394,6 +394,22 @@ def ragged_paged_attention_kernel(
         )
         return async_copy_kv
 
+    def strided_load_kv(ref, start, step):
+        if ref.dtype == jnp.float32:
+            return ref[start::step, :]
+        packing = get_dtype_packing(ref.dtype)
+        assert ref.dtype == jnp.bfloat16
+        assert step % packing == 0
+        b_start = start // packing
+        b_offset = start % packing
+        b_step = step // packing
+        b_ref = ref.bitcast(jnp.int32)
+        b = b_ref[b_start::b_step, :]
+        bw = 32 // packing
+        b = jnp.right_shift(b, bw * b_offset)
+        b = jnp.left_shift(b, bw * (packing - 1))
+        return pltpu.bitcast(b, jnp.float32).astype(jnp.bfloat16)
+
     def fold_on_2nd_minor(vec):
         assert vec.dtype == jnp.bfloat16 or vec.dtype == jnp.float32
         assert len(vec.shape) >= 2
@@ -617,20 +633,16 @@ def ragged_paged_attention_kernel(
             cur_async_copy_kv = create_kv_async_copy_descriptors(
                 heads_blk_idx, cur_seq_idx, kv_blk_idx, cur_buf_idx
             )
+            kv_to_load_shape = (
+                num_kv_pages_per_blk * page_size * num_kv_heads_per_blk,
+                head_dim,
+            )
             k_ref, v_ref = cur_async_copy_kv.wait()
-            k_ref = k_ref.reshape(
-                num_kv_pages_per_blk * page_size,
-                num_kv_heads_per_blk,
-                head_dim,
-            )
-            v_ref = v_ref.reshape(
-                num_kv_pages_per_blk * page_size,
-                num_kv_heads_per_blk,
-                head_dim,
-            )
+            k_ref = k_ref.reshape(kv_to_load_shape)
+            v_ref = v_ref.reshape(kv_to_load_shape)
             for kv_head_chunk_idx in range(0, num_kv_heads_per_blk):
-                k = k_ref[:, kv_head_chunk_idx, :]
-                v = v_ref[:, kv_head_chunk_idx, :]
+                k = strided_load_kv(k_ref, kv_head_chunk_idx, num_kv_heads_per_blk)
+                v = strided_load_kv(v_ref, kv_head_chunk_idx, num_kv_heads_per_blk)
                 if k_scale is not None:
                     # NOTE: Conversion between arbitrary data types is not supported.
                     # That's why it is converted to float32 first.

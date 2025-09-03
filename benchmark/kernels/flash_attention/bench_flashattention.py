@@ -17,7 +17,7 @@ def benchmark_backend(
     seq_len,
     num_heads,
     head_dim=128,
-    max_kv_cache_tokens_num=120000,
+    max_kv_cache_tokens_num=160000,
 ):
     if backend_type == "flash":
         if mode == "prefill":
@@ -65,7 +65,7 @@ def benchmark_backend(
                 num_seqs,
                 seq_lens,
                 sm_scale=sm_scale,
-                num_kv_pages_per_block=8,
+                num_kv_pages_per_block=16,
                 num_queries_per_block=32,
             )
 
@@ -102,9 +102,9 @@ def benchmark_backend(
 
 def main():
     bench_modes = ["prefill", "decode"]
-    num_head_config = [2, 4, 8, 16]
-    seq_len_config = [1024, 2048, 4096]
-    batch_size_config = [1, 2, 4, 8, 10]
+    num_head_config = [8]
+    seq_len_config = [2048]
+    batch_size_config = [16]
     head_dim_config = [128]
     all_combined_config = []
     for batch_size in batch_size_config:

@@ -110,7 +110,7 @@ def create_decode_uniform_data(
     max_kv_cache_tokens,
     head_num,
     head_dim,
-    page_size=1,
+    page_size=128,
     dtype=jnp.bfloat16,
     seed=42,
 ):
@@ -126,7 +126,7 @@ def create_decode_uniform_data(
         [
             jnp.array([0], dtype=jnp.int32),
             jnp.cumsum(
-                jnp.array([uniform_kv_len] * batch_size, dtype=jnp.int32),
+                jnp.array([seq_len_cpu] * batch_size, dtype=jnp.int32),
                 dtype=jnp.int32,
             ),
         ]

@@ -27,7 +27,7 @@ def benchmark_backend(
     scale = head_dim**-0.5
 
     if mode == "prefill":
-        q, k, v, kv_lens, page_indices, cu_q_lens, cu_kv_lens, num_seqs, _, _ = (
+        q, k, v, kv_lens, page_indices, cu_q_lens, cu_kv_lens, num_seqs, seq_lens, _ = (
             create_prefill_uniform_data(
                 batch_size,
                 seq_len,
@@ -39,7 +39,7 @@ def benchmark_backend(
             )
         )
     elif mode == "decode":
-        q, k, v, kv_lens, page_indices, cu_q_lens, cu_kv_lens, num_seqs, _, _ = (
+        q, k, v, kv_lens, page_indices, cu_q_lens, cu_kv_lens, num_seqs, seq_lens, _ = (
             create_decode_uniform_data(
                 batch_size,
                 seq_len,
@@ -62,6 +62,7 @@ def benchmark_backend(
         cu_q_lens,
         cu_kv_lens,
         num_seqs,
+        seq_lens,
         sm_scale,
         num_kv_pages_per_block,
         num_queries_per_block,
@@ -74,6 +75,7 @@ def benchmark_backend(
             cu_q_lens,
             cu_kv_lens,
             num_seqs,
+            seq_lens,
             sm_scale=sm_scale,
             num_kv_pages_per_block=num_kv_pages_per_block,
             num_queries_per_block=num_queries_per_block,
@@ -88,6 +90,7 @@ def benchmark_backend(
         cu_q_lens,
         cu_kv_lens,
         num_seqs,
+        seq_lens,
         scale,
         num_kv_pages_per_block,
         num_queries_per_block,
@@ -115,9 +118,9 @@ def main():
     print()
 
     page_size = 128
-    batch_size_config = [8, 16, 32]
-    seq_len_config = [1024, 2048, 4096]
-    head_num_config = [2, 4, 8]
+    batch_size_config = [16]
+    seq_len_config = [2048]
+    head_num_config = [8]
     head_dim_config = [128]
     max_kv_cache_tokens_config = [160000]
     all_combinations = []
