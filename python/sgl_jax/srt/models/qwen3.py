@@ -224,11 +224,17 @@ class QWen3DecoderLayer(nnx.Module):
         forward_batch: ForwardBatch,
         residual: Optional[jax.Array] = None,
     ) -> Tuple[jax.Array, jax.Array]:
+        layer_callback_flag = []
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
+
+        layer_norm_callback_flag = precision_tracer.jit_pure_callback_record(
+            hidden_states, "input_layernorm_output", "INPUT_LAYERNORM", self.layer_id
+        )
+        layer_callback_flag.append(layer_norm_callback_flag)
 
         hidden_states, k, v = self.self_attn(
             positions=positions,
@@ -236,7 +242,6 @@ class QWen3DecoderLayer(nnx.Module):
             forward_batch=forward_batch,
         )
 
-        layer_callback_flag = []
         attn_callback_flag = precision_tracer.jit_pure_callback_record(
             hidden_states, "self_attn_output", "SELF_ATTN", self.layer_id
         )
