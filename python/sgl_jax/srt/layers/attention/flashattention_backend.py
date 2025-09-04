@@ -129,7 +129,6 @@ class FlashAttention(AttentionBackend):
         metadata.cu_kv_lens = jnp.array(cu_kv_lens)
         metadata.page_indices = jnp.array(page_indices)
         metadata.seq_lens = jnp.array(seq_lens)
-
         return metadata
 
     def tree_flatten(self):

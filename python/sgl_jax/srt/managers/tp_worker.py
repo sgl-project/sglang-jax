@@ -89,20 +89,31 @@ class ModelWorker:
         self.max_total_num_tokens = self.model_runner.max_total_num_tokens
         self.max_prefill_tokens = server_args.max_prefill_tokens
         self.chunked_prefill_size = server_args.chunked_prefill_size
-        self.max_running_requests = min(
-            [
-                (
-                    self.max_total_num_tokens // 2
-                    if server_args.max_running_requests is None
-                    else server_args.max_running_requests
-                ),
-                self.model_runner.req_to_token_pool.size,
-                self.model_runner.attn_backend.get_max_running_reqests(
-                    self.model_config.context_len, self.page_size
-                ),
-            ]
+
+        # Calculate max_running_requests from different constraints
+        attn_backend_limit = self.model_runner.attn_backend.get_max_running_reqests(
+            self.model_config.context_len, self.page_size
         )
+        server_limit = (
+            self.max_total_num_tokens // 2
+            if server_args.max_running_requests is None
+            else server_args.max_running_requests
+        )
+        pool_limit = self.model_runner.req_to_token_pool.size
+        constraints = [server_limit, pool_limit, attn_backend_limit]
+        self.max_running_requests = min(constraints)
+        # Log each constraint for debugging
+        logger.info(f"Max running requests constraints:")
+        logger.info(
+            f"  - Server limit: {server_limit} {'(max_total_tokens//2)' if server_args.max_running_requests is None else '(configured)'}"
+        )
+        logger.info(f"  - Token pool size: {pool_limit}")
+        logger.info(
+            f"  - Attention backend: {attn_backend_limit} (context_len={self.model_config.context_len}, page_size={self.page_size})"
+        )
+        logger.info(f"  → Final max_running_requests: {self.max_running_requests}")
         assert self.max_running_requests > 0, "max_running_request is zero"
+
         self.max_req_len = min(
             self.model_config.context_len - 1,
             self.max_total_num_tokens - 1,
@@ -198,44 +209,39 @@ class ModelWorker:
                     bs,
                     num_tokens,
                     ForwardMode.EXTEND,
-                    bs,
                     self.precompile_cache_loc_paddings[-1],
                 )
-
-                sampling_metadata = SamplingMetadata.from_model_worker_batch(
-                    model_worker_batch, 0, self.mesh
-                )
-
-                self.model_runner.attn_backend.forward_metadata = (
-                    self.worker.model_runner.attn_backend.get_forward_metadata(
-                        model_worker_batch
-                    )
-                )
-
-                # forward
-                logger.info(f"[EXTEND] Precompile forward ({bs=}, {num_tokens=})")
-                logits_output, _ = self.model_runner.forward(
-                    ForwardBatch.init_new(model_worker_batch, self.model_runner),
-                    logits_metadata=LogitsMetadata.from_model_worker_batch(
-                        model_worker_batch, self.mesh
-                    ),
-                )
-
-                # sample
-                for is_all_greedy, need_min_p_sampling in itertools.product(
-                    [True, False], [True, False]
-                ):
-                    (
-                        sampling_metadata.is_all_greedy,
-                        sampling_metadata.need_min_p_sampling,
-                    ) = (is_all_greedy, need_min_p_sampling)
-                    logger.info(
-                        f"[EXTEND] Precompile sample ({bs=}, {num_tokens=}, {is_all_greedy=}, {need_min_p_sampling=})"
-                    )
-                    self.model_runner.sample(logits_output, sampling_metadata)
+                self.forward_batch_generation(model_worker_batch, None, True)
 
         end_time = time.perf_counter()
         logger.info("[EXTEND] Precompile finished in %.0f secs", end_time - start_time)
+
+    def precompile_decode(self):
+        start_time = time.perf_counter()
+        logger.info(
+            f"[DECODE] begin to precompile bs_paddings={self.precompile_bs_paddings}"
+        )
+
+        with tqdm(
+            self.precompile_bs_paddings, desc="[DECODE] PRECOMPILE", leave=False
+        ) as pbar:
+            for bs in pbar:
+                pbar.set_postfix(bs=bs)
+                model_worker_batch = self.generate_model_worker_batch(
+                    bs,
+                    bs,
+                    ForwardMode.DECODE,
+                    bs * self.max_req_len,
+                )
+                sampling_metadata = SamplingMetadata.from_model_worker_batch(
+                    model_worker_batch, 0, self.mesh
+                )
+                self.forward_batch_generation(
+                    model_worker_batch, None, False, sampling_metadata
+                )
+
+        end_time = time.perf_counter()
+        logger.info("[DECODE] Precompile finished in %.0f secs", end_time - start_time)
 
     def get_max_padded_size(self):
         """Calculate the max padded batch size and token nums.
@@ -255,9 +261,7 @@ class ModelWorker:
             max_padded_num_tokens = self.chunked_prefill_size
 
         # Batch size is constrained by both max_running_requests and available tokens divide by page_size
-        max_padded_batch_size = min(
-            self.max_running_requests, max_padded_num_tokens // self.page_size
-        )
+        max_padded_batch_size = min(self.max_running_requests, max_padded_num_tokens)
 
         return max_padded_batch_size, max_padded_num_tokens
 
@@ -273,7 +277,6 @@ class ModelWorker:
         bs: int,
         num_tokens: int,
         mode: ForwardMode,
-        max_bs: int,
         max_cache_loc_size: int,
     ) -> ModelWorkerBatch:
         valid_input_ids = np.array([1] * bs, dtype=jnp.int32)
@@ -303,8 +306,6 @@ class ModelWorker:
             return_logprob=False,
             sampling_info=SamplingBatchInfo.generate_for_precompile(
                 bs,
-                self.model_config.vocab_size,
-                self.mesh,
             ),
             extend_input_logprob_token_ids=None,
             positions=np.concat([valid_positions, invalid_positions], axis=0),
@@ -319,59 +320,6 @@ class ModelWorker:
             extend_logprob_start_lens=None,
             capture_hidden_mode=CaptureHiddenMode.NULL,
         )
-
-    def precompile_decode(self):
-        start_time = time.perf_counter()
-        logger.info(
-            f"[DECODE] begin to precompile bs_paddings={self.precompile_bs_paddings}"
-        )
-
-        with tqdm(
-            self.precompile_bs_paddings, desc="[DECODE] PRECOMPILE", leave=False
-        ) as pbar:
-            for bs in pbar:
-                pbar.set_postfix(bs=bs)
-                model_worker_batch = self.generate_model_worker_batch(
-                    bs,
-                    bs,
-                    ForwardMode.DECODE,
-                    max(self.precompile_bs_paddings),
-                    bs * self.max_req_len,
-                )
-                sampling_metadata = SamplingMetadata.from_model_worker_batch(
-                    model_worker_batch, 0, self.mesh
-                )
-
-                self.model_runner.attn_backend.forward_metadata = (
-                    self.worker.model_runner.attn_backend.get_forward_metadata(
-                        model_worker_batch
-                    )
-                )
-
-                # forward
-                logger.info(f"[DECODE] Precompile forward ({bs=})")
-                logits_output, _ = self.model_runner.forward(
-                    ForwardBatch.init_new(model_worker_batch, self.model_runner),
-                    logits_metadata=LogitsMetadata.from_model_worker_batch(
-                        model_worker_batch, self.mesh
-                    ),
-                )
-
-                # sample
-                for is_all_greedy, need_min_p_sampling in itertools.product(
-                    [True, False], [True, False]
-                ):
-                    (
-                        sampling_metadata.is_all_greedy,
-                        sampling_metadata.need_min_p_sampling,
-                    ) = (is_all_greedy, need_min_p_sampling)
-                    logger.info(
-                        f"[DECODE] Precompile sample ({bs=}, {is_all_greedy=}, {need_min_p_sampling=})"
-                    )
-                    self.model_runner.sample(logits_output, sampling_metadata)
-
-        end_time = time.perf_counter()
-        logger.info("[DECODE] Precompile finished in %.0f secs", end_time - start_time)
 
     def get_model_runner(self):
         return self.model_runner
@@ -415,7 +363,7 @@ class ModelWorker:
             forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
 
         if forward_metadata is None:
-            self.worker.model_runner.attn_backend.forward_metadata = (
+            forward_metadata = (
                 self.worker.model_runner.attn_backend.get_forward_metadata(
                     model_worker_batch
                 )

@@ -240,8 +240,8 @@ class ModelWorkerClient:
             _,
         ) = self.get_precompile_paddings()
         max_padding_bs, _ = self.get_max_padded_size()
-        bs_paddings = precompile_bs_paddings + [max_padding_bs]
-        token_paddings = bs_paddings + precompile_token_paddings
+        bs_paddings = sorted(set(precompile_bs_paddings + [max_padding_bs]))
+        token_paddings = sorted(set(bs_paddings + precompile_token_paddings))
         for token_padding in token_paddings:
             input_ids = device_array(
                 self.worker.mesh, jnp.arange(0, token_padding, dtype=jnp.int32)
