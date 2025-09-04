@@ -9,7 +9,6 @@ from transformers import PretrainedConfig
 
 from sgl_jax.srt.configs.model_config import ModelConfig
 from sgl_jax.srt.layers.embeddings import Embed, ParallelLMHead, RotaryEmbedding
-from sgl_jax.srt.layers.layernorm import RMSNorm
 from sgl_jax.srt.layers.linear import LinearBase
 from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
 from sgl_jax.srt.layers.moe import EPMoE, GateLogit
@@ -19,6 +18,8 @@ from sgl_jax.srt.models.qwen3 import Qwen3MLP
 from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
 
 logger = logging.getLogger(__name__)
+
+init_fn = nnx.initializers.uniform()
 
 
 class QWen3MoeAttention(nnx.Module):
@@ -41,13 +42,27 @@ class QWen3MoeAttention(nnx.Module):
         assert num_heads % num_kv_heads == 0
 
         self.head_dim = head_dim or hidden_size // num_heads
+        self.q_head_num = num_heads
+        self.kv_head_num = num_kv_heads
 
         self.q_size = num_heads * self.head_dim
         self.kv_size = num_kv_heads * self.head_dim
         self.scaling = self.head_dim**-0.5
 
-        self.q_norm = RMSNorm(self.head_dim, epsilon=rms_norm_eps, rngs=rngs)
-        self.k_norm = RMSNorm(self.head_dim, epsilon=rms_norm_eps, rngs=rngs)
+        self.q_norm = nnx.RMSNorm(
+            self.head_dim,
+            epsilon=rms_norm_eps,
+            param_dtype=dtype,
+            scale_init=nnx.with_partitioning(init_fn, (None,)),
+            rngs=rngs,
+        )
+        self.k_norm = nnx.RMSNorm(
+            self.head_dim,
+            epsilon=rms_norm_eps,
+            param_dtype=dtype,
+            scale_init=nnx.with_partitioning(init_fn, (None,)),
+            rngs=rngs,
+        )
 
         self.q_proj = LinearBase(
             input_size=hidden_size,
@@ -107,13 +122,12 @@ class QWen3MoeAttention(nnx.Module):
         k, _ = self.k_proj(hidden_states)
         v, _ = self.v_proj(hidden_states)
 
-        q_by_head = q.reshape(-1, self.head_dim)
-        q_by_head = self.q_norm(q_by_head)
-        q = q_by_head.reshape(q.shape)
+        q = q.reshape(-1, self.q_head_num, self.head_dim)
+        k = k.reshape(-1, self.kv_head_num, self.head_dim)
+        v = v.reshape(-1, self.kv_head_num, self.head_dim)
 
-        k_by_head = k.reshape(-1, self.head_dim)
-        k_by_head = self.k_norm(k_by_head)
-        k = k_by_head.reshape(k.shape)
+        q = self.q_norm(q)
+        k = self.k_norm(k)
 
         q, k = self.rotary_emb(positions, q, k)
         attn_output, k, v = self.attn(q, k, v, forward_batch=forward_batch)
@@ -199,11 +213,19 @@ class QWen3MoeDecoderLayer(nnx.Module):
                 )
             self.is_moe_layer = True
 
-        self.input_layernorm = RMSNorm(
-            config.hidden_size, epsilon=config.rms_norm_eps, rngs=rngs
+        self.input_layernorm = nnx.RMSNorm(
+            config.hidden_size,
+            epsilon=config.rms_norm_eps,
+            param_dtype=dtype,
+            scale_init=nnx.with_partitioning(init_fn, (None,)),
+            rngs=rngs,
         )
-        self.post_attention_layernorm = RMSNorm(
-            config.hidden_size, epsilon=config.rms_norm_eps, rngs=rngs
+        self.post_attention_layernorm = nnx.RMSNorm(
+            config.hidden_size,
+            epsilon=config.rms_norm_eps,
+            param_dtype=dtype,
+            scale_init=nnx.with_partitioning(init_fn, (None,)),
+            rngs=rngs,
         )
 
     def __call__(
@@ -217,7 +239,9 @@ class QWen3MoeDecoderLayer(nnx.Module):
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
         else:
-            hidden_states, residual = self.input_layernorm(hidden_states, residual)
+            hidden_states += residual
+            residual = hidden_states
+            hidden_states = self.input_layernorm(hidden_states)
 
         hidden_states, k, v = self.self_attn(
             positions=positions,
@@ -225,7 +249,9 @@ class QWen3MoeDecoderLayer(nnx.Module):
             forward_batch=forward_batch,
         )
 
-        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        hidden_states += residual
+        residual = hidden_states
+        hidden_states = self.post_attention_layernorm(hidden_states)
 
         if self.is_moe_layer:
             router_logits = self.moe_gate(hidden_states)
@@ -268,7 +294,13 @@ class QWen3MoeModel(nnx.Module):
             for i in range(config.num_hidden_layers)
         ]
 
-        self.norm = RMSNorm(config.hidden_size, epsilon=config.rms_norm_eps, rngs=rngs)
+        self.norm = nnx.RMSNorm(
+            config.hidden_size,
+            epsilon=config.rms_norm_eps,
+            param_dtype=dtype,
+            scale_init=nnx.with_partitioning(init_fn, (None,)),
+            rngs=rngs,
+        )
 
     def __call__(
         self,
@@ -288,7 +320,8 @@ class QWen3MoeModel(nnx.Module):
             layers_v.append(v)
 
         if residual is not None:
-            hidden_states, residual = self.norm(hidden_states, residual)
+            hidden_states += residual
+            hidden_states = self.norm(hidden_states)
         else:
             hidden_states = self.norm(hidden_states)
 
@@ -331,7 +364,7 @@ class Qwen3MoeForCausalLM(nnx.Module):
                 transpose=False,
             ),
             "model.norm.weight": WeightMapping(
-                target_path="transformer.norm.weight", sharding=(None,), transpose=False
+                target_path="transformer.norm.scale", sharding=(None,), transpose=False
             ),
         }
 
@@ -357,12 +390,12 @@ class Qwen3MoeForCausalLM(nnx.Module):
 
         mappings = {
             f"{prefix}.input_layernorm.weight": WeightMapping(
-                target_path=f"{target_prefix}.input_layernorm.weight",
+                target_path=f"{target_prefix}.input_layernorm.scale",
                 sharding=(None,),
                 transpose=False,
             ),
             f"{prefix}.post_attention_layernorm.weight": WeightMapping(
-                target_path=f"{target_prefix}.post_attention_layernorm.weight",
+                target_path=f"{target_prefix}.post_attention_layernorm.scale",
                 sharding=(None,),
                 transpose=False,
             ),
@@ -389,12 +422,12 @@ class Qwen3MoeForCausalLM(nnx.Module):
                 transpose=True,
             ),
             f"{prefix}.self_attn.q_norm.weight": WeightMapping(
-                target_path=f"{target_prefix}.self_attn.q_norm.weight",
+                target_path=f"{target_prefix}.self_attn.q_norm.scale",
                 sharding=(None,),
                 transpose=False,
             ),
             f"{prefix}.self_attn.k_norm.weight": WeightMapping(
-                target_path=f"{target_prefix}.self_attn.k_norm.weight",
+                target_path=f"{target_prefix}.self_attn.k_norm.scale",
                 sharding=(None,),
                 transpose=False,
             ),

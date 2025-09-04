@@ -57,14 +57,6 @@ class RadixAttention(nnx.Module):
         assert k is not None
         assert v is not None
 
-        k = k.reshape(-1, self.kv_head_num, self.qk_head_dim)
-        v = v.reshape(-1, self.kv_head_num, self.v_head_dim)
-        k = jax.lax.with_sharding_constraint(
-            k, NamedSharding(jax.sharding.get_abstract_mesh(), P(None, "tensor", None))
-        )
-        v = jax.lax.with_sharding_constraint(
-            v, NamedSharding(jax.sharding.get_abstract_mesh(), P(None, "tensor", None))
-        )
         attn_output, k, v = forward_batch.attn_backend(
             q,
             k,

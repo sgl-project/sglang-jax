@@ -9,7 +9,6 @@ from transformers import PretrainedConfig
 
 from sgl_jax.srt.configs.model_config import ModelConfig
 from sgl_jax.srt.layers.embeddings import Embed, ParallelLMHead, RotaryEmbedding
-from sgl_jax.srt.layers.layernorm import RMSNorm
 from sgl_jax.srt.layers.linear import LinearBase
 from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
 from sgl_jax.srt.layers.radix_attention import RadixAttention
@@ -17,6 +16,8 @@ from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
 from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
 
 logger = logging.getLogger(__name__)
+
+init_fn = nnx.initializers.uniform()
 
 
 class QWenMLP(nnx.Module):
@@ -97,6 +98,7 @@ class QWenAttention(nnx.Module):
         self.hidden_size = hidden_size
         self.num_heads = num_heads
         head_size = hidden_size // num_heads
+        self.head_size = head_size
         self.scaling = head_size**-0.5
 
         self.q_proj = LinearBase(
@@ -160,6 +162,11 @@ class QWenAttention(nnx.Module):
         q, _ = self.q_proj(hidden_states)
         k, _ = self.k_proj(hidden_states)
         v, _ = self.v_proj(hidden_states)
+
+        q = q.reshape(-1, self.num_heads, self.head_size)
+        k = k.reshape(-1, self.num_heads, self.head_size)
+        v = v.reshape(-1, self.num_heads, self.head_size)
+
         q, k = self.rotary_emb(positions, q, k)
         attn_output, k, v = self.attn(q, k, v, forward_batch=forward_batch)
         output, _ = self.c_proj(attn_output)
@@ -176,8 +183,12 @@ class QWenBlock(nnx.Module):
     ):
         self.layer_id = layer_id
 
-        self.ln_1 = RMSNorm(
-            config.hidden_size, epsilon=config.layer_norm_epsilon, rngs=rngs
+        self.ln_1 = nnx.RMSNorm(
+            config.hidden_size,
+            epsilon=config.layer_norm_epsilon,
+            param_dtype=dtype,
+            scale_init=nnx.with_partitioning(init_fn, (None,)),
+            rngs=rngs,
         )
 
         rope_theta = getattr(config, "rope_theta", 10000)
@@ -193,8 +204,12 @@ class QWenBlock(nnx.Module):
             rngs=rngs,
         )
 
-        self.ln_2 = RMSNorm(
-            config.hidden_size, epsilon=config.layer_norm_epsilon, rngs=rngs
+        self.ln_2 = nnx.RMSNorm(
+            config.hidden_size,
+            epsilon=config.layer_norm_epsilon,
+            param_dtype=dtype,
+            scale_init=nnx.with_partitioning(init_fn, (None,)),
+            rngs=rngs,
         )
 
         self.mlp = QWenMLP(
@@ -262,8 +277,12 @@ class QWenModel(nnx.Module):
             for i in range(config.num_hidden_layers)
         ]
 
-        self.ln_f = RMSNorm(
-            config.hidden_size, epsilon=config.layer_norm_epsilon, rngs=rngs
+        self.ln_f = nnx.RMSNorm(
+            config.hidden_size,
+            epsilon=config.layer_norm_epsilon,
+            param_dtype=dtype,
+            scale_init=nnx.with_partitioning(init_fn, (None,)),
+            rngs=rngs,
         )
 
     def __call__(
@@ -322,7 +341,7 @@ class QWenLMHeadModel(nnx.Module):
                 transpose=False,
             ),
             "transformer.ln_f.weight": WeightMapping(
-                target_path="transformer.ln_f.weight", sharding=(None,), transpose=False
+                target_path="transformer.ln_f.scale", sharding=(None,), transpose=False
             ),
         }
 
@@ -343,10 +362,10 @@ class QWenLMHeadModel(nnx.Module):
 
         return {
             f"{prefix}.ln_1.weight": WeightMapping(
-                target_path=f"{prefix}.ln_1.weight", sharding=(None,), transpose=False
+                target_path=f"{prefix}.ln_1.scale", sharding=(None,), transpose=False
             ),
             f"{prefix}.ln_2.weight": WeightMapping(
-                target_path=f"{prefix}.ln_2.weight", sharding=(None,), transpose=False
+                target_path=f"{prefix}.ln_2.scale", sharding=(None,), transpose=False
             ),
             f"{prefix}.attn.c_attn.weight": WeightMapping(
                 target_path=[
