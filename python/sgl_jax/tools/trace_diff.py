@@ -41,7 +41,10 @@ def group_by_content_hash(traces: List[Dict]) -> Dict[str, List[Dict]]:
 
 
 def compare_precision_records(
-    records1: Dict, records2: Dict, tolerance: float = 1e-6
+    records1: Dict,
+    records2: Dict,
+    tolerance: float = 1e-6,
+    max_decode_tokens: Optional[int] = None,
 ) -> Tuple[bool, List[str]]:
     differences = []
     all_match = True
@@ -58,13 +61,21 @@ def compare_precision_records(
         differences.append(f"Category mismatch: {categories1} vs {categories2}")
         return False, differences
 
-    # Compare each category (prefill, decode)
-    for category in sorted(categories1):
+    # Compare each category (prefill, decode) - ensure prefill comes first
+    def category_sort_key(category):
+        if category == "prefill":
+            return 0
+        elif category == "decode":
+            return 1
+        else:
+            return 2
+
+    for category in sorted(categories1, key=category_sort_key):
         tokens1 = records1.get(category, [])
         tokens2 = records2.get(category, [])
 
         category_match, category_diffs = compare_token_groups(
-            category, tokens1, tokens2, tolerance
+            category, tokens1, tokens2, tolerance, max_decode_tokens
         )
 
         if not category_match:
@@ -75,20 +86,40 @@ def compare_precision_records(
 
 
 def compare_token_groups(
-    category: str, tokens1: List[Dict], tokens2: List[Dict], tolerance: float = 1e-6
+    category: str,
+    tokens1: List[Dict],
+    tokens2: List[Dict],
+    tolerance: float = 1e-6,
+    max_decode_tokens: Optional[int] = None,
 ) -> Tuple[bool, List[str]]:
     """Compare token groups within a category (prefill/decode)"""
     differences = []
     all_match = True
 
+    # Apply max_decode_tokens limit for decode category
+    if category == "decode" and max_decode_tokens is not None:
+        original_len1, original_len2 = len(tokens1), len(tokens2)
+        tokens1 = tokens1[:max_decode_tokens]
+        tokens2 = tokens2[:max_decode_tokens]
+        if original_len1 > max_decode_tokens or original_len2 > max_decode_tokens:
+            differences.append(
+                f"  {category}: Limited comparison to first {max_decode_tokens} tokens (original: {original_len1} vs {original_len2})"
+            )
+
     if len(tokens1) != len(tokens2):
         differences.append(
             f"  {category}: Token count mismatch: {len(tokens1)} vs {len(tokens2)}"
         )
-        return False, differences
+        all_match = False
+        # Continue comparing up to the shorter length
+        min_length = min(len(tokens1), len(tokens2))
+    else:
+        min_length = len(tokens1)
 
-    # Compare each token group
-    for i, (token1, token2) in enumerate(zip(tokens1, tokens2)):
+    # Compare each token group up to the shorter length
+    for i in range(min_length):
+        token1 = tokens1[i]
+        token2 = tokens2[i]
         token_idx1 = token1.get("token_idx", i)
         token_idx2 = token2.get("token_idx", i)
 
@@ -110,6 +141,14 @@ def compare_token_groups(
         if not token_match:
             all_match = False
             differences.extend(token_diffs)
+
+    # Add information about skipped tokens if lengths differ
+    if len(tokens1) != len(tokens2):
+        skipped_count = abs(len(tokens1) - len(tokens2))
+        longer_file = "file1" if len(tokens1) > len(tokens2) else "file2"
+        differences.append(
+            f"  {category}: {skipped_count} tokens skipped from {longer_file} (compared first {min_length} tokens)"
+        )
 
     return all_match, differences
 
@@ -365,8 +404,18 @@ def print_tree_differences(differences: List[str]):
                 tree["root"] = {"0": []}
             tree["root"]["0"].append(diff)
 
-    # Print tree structure
-    for category in sorted(tree.keys()):
+    # Print tree structure - ensure prefill comes first
+    def display_category_sort_key(category):
+        if category == "prefill":
+            return 0
+        elif category == "decode":
+            return 1
+        elif category == "root":
+            return 999  # root always last
+        else:
+            return 2
+
+    for category in sorted(tree.keys(), key=display_category_sort_key):
         if category == "root":
             continue
         print(f"\n{Colors.BOLD}{category.upper()}:{Colors.RESET}")
@@ -392,51 +441,103 @@ def print_tree_differences(differences: List[str]):
                             layer_groups["misc"] = []
                         layer_groups["misc"].append(diff)
 
-                for layer in sorted(layer_groups.keys()):
-                    if layer != "misc":
-                        print(f"    {layer}:")
+                # Sort and group by layer number for better organization
+                def parse_layer_module(layer_key):
+                    """Parse layer key like '1.SELF.ATTN_self_attn_output.std' into (layer_num, module_type)"""
+                    if layer_key == "misc":
+                        return (999, "misc")
 
-                    # Separate matches and mismatches for better organization
-                    matches = []
-                    mismatches = []
-                    others = []
-
-                    for diff in layer_groups[layer]:
-                        if ": " in diff:
-                            field_msg = diff.split(": ", 1)[1]
-                            if "MATCH" in field_msg:
-                                matches.append(field_msg)
-                            elif "MISMATCH" in field_msg:
-                                mismatches.append(field_msg)
+                    # Find the first dot to extract layer number
+                    first_dot = layer_key.find(".")
+                    if first_dot > 0:
+                        layer_part = layer_key[:first_dot]
+                        if layer_part.isdigit():
+                            # Extract module type after layer number (e.g., "SELF.ATTN", "INPUT.LAYERNORM", "MLP")
+                            remaining = layer_key[first_dot + 1 :]
+                            # Get the module type part before the first underscore
+                            if "_" in remaining:
+                                before_underscore = remaining.split("_")[0]
+                                # Special handling for MLP pattern
+                                if before_underscore.startswith("MLP."):
+                                    module_type = "MLP"
+                                else:
+                                    module_type = before_underscore
                             else:
-                                others.append(field_msg)
-                        else:
-                            others.append(diff)
+                                # If no underscore, take the remaining as module type
+                                module_type = remaining
+                            return (int(layer_part), module_type)
 
-                    # Show mismatches first (more important)
-                    for msg in mismatches[:3]:  # Limit output
-                        formatted = format_comparison_result(msg)
-                        print(f"      {formatted}")
+                    return (999, layer_key)
 
-                    # Then show matches
-                    for msg in matches[:3]:  # Limit output
-                        formatted = format_comparison_result(msg)
-                        print(f"      {formatted}")
+                # Group by layer number first
+                layers_by_num = {}
+                for layer_key in layer_groups.keys():
+                    layer_num, module_type = parse_layer_module(layer_key)
+                    if layer_num not in layers_by_num:
+                        layers_by_num[layer_num] = {}
+                    layers_by_num[layer_num][layer_key] = layer_groups[layer_key]
 
-                    # Then others
-                    for msg in others[:2]:
-                        print(f"      {Colors.YELLOW}{msg}{Colors.RESET}")
+                # Display with separators
+                for layer_num in sorted(layers_by_num.keys()):
+                    if layer_num != 999:  # Skip misc for layer separator
+                        print(f"    {Colors.BLUE}{'=' * 50}{Colors.RESET}")
+                        print(f"    {Colors.BOLD}Layer {layer_num}{Colors.RESET}")
+                        print(f"    {Colors.BLUE}{'=' * 50}{Colors.RESET}")
 
-                    total_items = len(mismatches) + len(matches) + len(others)
-                    shown_items = (
-                        min(3, len(mismatches))
-                        + min(3, len(matches))
-                        + min(2, len(others))
+                    layer_modules = layers_by_num[layer_num]
+                    module_keys = sorted(
+                        layer_modules.keys(), key=lambda x: parse_layer_module(x)[1]
                     )
-                    if total_items > shown_items:
-                        print(
-                            f"      {Colors.YELLOW}... and {total_items - shown_items} more{Colors.RESET}"
+
+                    for i, layer_key in enumerate(module_keys):
+                        # Add module separator between different modules in the same layer
+                        if i > 0:
+                            print(f"    {Colors.CYAN}{'-' * 30}{Colors.RESET}")
+
+                        if layer_key != "misc":
+                            print(f"    {layer_key}:")
+
+                        # Separate matches and mismatches for better organization
+                        matches = []
+                        mismatches = []
+                        others = []
+
+                        for diff in layer_modules[layer_key]:
+                            if ": " in diff:
+                                field_msg = diff.split(": ", 1)[1]
+                                if "MATCH" in field_msg:
+                                    matches.append(field_msg)
+                                elif "MISMATCH" in field_msg:
+                                    mismatches.append(field_msg)
+                                else:
+                                    others.append(field_msg)
+                            else:
+                                others.append(diff)
+
+                        # Show mismatches first (more important)
+                        for msg in mismatches[:3]:  # Limit output
+                            formatted = format_comparison_result(msg)
+                            print(f"      {formatted}")
+
+                        # Then show matches
+                        for msg in matches[:3]:  # Limit output
+                            formatted = format_comparison_result(msg)
+                            print(f"      {formatted}")
+
+                        # Then others
+                        for msg in others[:2]:
+                            print(f"      {Colors.YELLOW}{msg}{Colors.RESET}")
+
+                        total_items = len(mismatches) + len(matches) + len(others)
+                        shown_items = (
+                            min(3, len(mismatches))
+                            + min(3, len(matches))
+                            + min(2, len(others))
                         )
+                        if total_items > shown_items:
+                            print(
+                                f"      {Colors.YELLOW}... and {total_items - shown_items} more{Colors.RESET}"
+                            )
 
     # Print root-level differences
     if "root" in tree:
@@ -452,7 +553,11 @@ def print_match_status(is_match: bool, differences: List[str]):
 
 
 def compare_trace_files(
-    file1: str, file2: str, tolerance: float = 1e-6, show_matches: bool = False
+    file1: str,
+    file2: str,
+    tolerance: float = 1e-6,
+    show_matches: bool = False,
+    max_decode_tokens: Optional[int] = None,
 ) -> bool:
     """
     Compare two JSONL trace files by content_hash with tree-structured output
@@ -461,6 +566,7 @@ def compare_trace_files(
         file1, file2: Paths to JSONL trace files
         tolerance: Numerical tolerance for floating point comparisons
         show_matches: Whether to show matching traces (default: only show differences)
+        max_decode_tokens: Maximum number of decode tokens to compare (default: compare all)
 
     Returns:
         True if all traces match, False otherwise
@@ -513,7 +619,9 @@ def compare_trace_files(
         records1 = trace1.get("precision_records", [])
         records2 = trace2.get("precision_records", [])
 
-        is_match, differences = compare_precision_records(records1, records2, tolerance)
+        is_match, differences = compare_precision_records(
+            records1, records2, tolerance, max_decode_tokens
+        )
 
         if is_match:
             match_count += 1
@@ -571,6 +679,7 @@ Examples:
   python trace_diff.py trace1.jsonl trace2.jsonl
   python trace_diff.py trace1.jsonl trace2.jsonl --tolerance 1e-4
   python trace_diff.py trace1.jsonl trace2.jsonl --show-matches
+  python trace_diff.py trace1.jsonl trace2.jsonl --max-decode-tokens 5
         """,
     )
 
@@ -588,6 +697,12 @@ Examples:
         action="store_true",
         help="Show matching traces (default: only show differences)",
     )
+    parser.add_argument(
+        "--max-decode-tokens",
+        type=int,
+        default=None,
+        help="Maximum number of decode tokens to compare (default: compare all)",
+    )
 
     args = parser.parse_args()
 
@@ -603,9 +718,15 @@ Examples:
     print(f"  File 1: {args.file1}")
     print(f"  File 2: {args.file2}")
     print(f"  Tolerance: {args.tolerance}")
+    if args.max_decode_tokens:
+        print(f"  Max decode tokens: {args.max_decode_tokens}")
 
     success = compare_trace_files(
-        args.file1, args.file2, tolerance=args.tolerance, show_matches=args.show_matches
+        args.file1,
+        args.file2,
+        tolerance=args.tolerance,
+        show_matches=args.show_matches,
+        max_decode_tokens=args.max_decode_tokens,
     )
 
     return 0 if success else 1
