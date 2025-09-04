@@ -891,9 +891,6 @@ class Scheduler(
             model_worker_batch,
             len(model_worker_batch.seq_lens) - model_worker_batch.real_bs,
             self.mesh,
-            # model_worker_batch.return_logprob,
-            # model_worker_batch.top_logprobs_nums,
-            # model_worker_batch.token_ids_logprobs,
         )
 
         if self.enable_overlap:

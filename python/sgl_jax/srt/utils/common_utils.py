@@ -32,7 +32,7 @@ from fastapi.responses import ORJSONResponse
 logger = logging.getLogger(__name__)
 
 PRECOMPILE_DEFAULT_TOKEN_PADDINGS = [1 << i for i in range(6, 14)]
-PRECOMPILE_DEFAULT_BS_PADDINGS = [1 << i for i in range(0, 7)]
+PRECOMPILE_DEFAULT_BS_PADDINGS = [1 << i for i in range(0, 9)]
 
 _warned_bool_env_var_keys = set()
 

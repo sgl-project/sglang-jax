@@ -4,6 +4,7 @@ from typing import List
 import jax
 import numpy as np
 from flax import nnx
+from jax import lax
 from jax import numpy as jnp
 from jax import random
 from jax.sharding import Mesh
@@ -17,13 +18,70 @@ class Sampler(nnx.Module):
     def __init__(self, rngs: nnx.Rngs = None):
         self.rngs = rngs
 
+    def _greedy_sampling(self, operands):
+        """Greedy sampling branch"""
+        logits, _, _ = operands
+        batch_next_token_ids = jnp.argmax(logits, -1).flatten()
+        logprobs = jax.nn.log_softmax(logits, axis=-1)
+        return batch_next_token_ids, logprobs
+
+    def _regular_sampling(self, operands):
+        """Regular sampling branch"""
+        logits, sampling_metadata, rng = operands
+
+        # Post process logits
+        processed_logits = jnp.divide(logits, sampling_metadata.temperatures).astype(
+            logits.dtype
+        )
+
+        probs = jax.nn.softmax(processed_logits, axis=-1)
+
+        batch_next_token_ids = top_k_top_p_min_p_sampling_from_probs_jax(
+            probs,
+            sampling_metadata.top_ks,
+            sampling_metadata.top_ps,
+            sampling_metadata.min_ps,
+            sampling_metadata.need_min_p_sampling,
+            rng,
+        )
+
+        logprobs = jnp.log(probs).clip(min=jnp.finfo(probs.dtype).min)
+        return batch_next_token_ids, logprobs
+
+    def _process_logprob_results(self, operands):
+        """Process logprob results when return_logprob=True"""
+        logits_output, sampling_metadata, batch_next_token_ids, logprobs = operands
+
+        # Set next_token_logprobs
+        logits_output.next_token_logprobs = logprobs[
+            np.arange(len(batch_next_token_ids)),
+            batch_next_token_ids,
+        ]
+
+        # Set top_logprobs if needed
+        if sampling_metadata.top_logprobs_nums is not None and any(
+            x > 0 for x in sampling_metadata.top_logprobs_nums
+        ):
+            (
+                logits_output.next_token_top_logprobs_val,
+                logits_output.next_token_top_logprobs_idx,
+            ) = get_top_logprobs(logprobs, sampling_metadata.top_logprobs_nums)
+
+        # Set token_ids_logprobs if needed
+        if sampling_metadata.token_ids_logprobs is not None and any(
+            x is not None for x in sampling_metadata.token_ids_logprobs
+        ):
+            (
+                logits_output.next_token_token_ids_logprobs_val,
+                logits_output.next_token_token_ids_logprobs_idx,
+            ) = get_token_ids_logprobs(logprobs, sampling_metadata.token_ids_logprobs)
+
+        return None
+
     def __call__(
         self,
         logits_output: LogitsProcessorOutput,
         sampling_metadata: SamplingMetadata,
-        # return_logprob: bool,
-        # top_logprobs_nums: List[int],
-        # token_ids_logprobs: List[List[int]],
     ):
         """Run a sampler & compute logprobs and update logits_output accordingly.
 
@@ -42,47 +100,28 @@ class Sampler(nnx.Module):
             (-1, logits_output.next_token_logits.shape[-1]),
         )
 
-        if sampling_metadata.is_all_greedy:
-            batch_next_token_ids = jnp.argmax(logits, -1).flatten()
-            if sampling_metadata.return_logprob:
-                logprobs = jax.nn.log_softmax(logits, axis=-1)
-        else:
-            # Post process logits
-            logits = jnp.divide(logits, sampling_metadata.temperatures)
-            probs = jax.nn.softmax(logits, axis=-1)
-            _, new_rng = jax.random.split(self.rngs.params())
-            # A slower fallback implementation with torch native operations.
-            batch_next_token_ids = top_k_top_p_min_p_sampling_from_probs_jax(
-                probs,
-                sampling_metadata.top_ks,
-                sampling_metadata.top_ps,
-                sampling_metadata.min_ps,
-                sampling_metadata.need_min_p_sampling,
-                new_rng,
-            )
+        _, rng = jax.random.split(self.rngs.params())
 
-            if sampling_metadata.return_logprob:
-                logprobs = jnp.log(probs).clip(min=jnp.finfo(probs.dtype).min)
+        operands = (logits, sampling_metadata, rng)
+        batch_next_token_ids, logprobs = lax.cond(
+            sampling_metadata.is_all_greedy,
+            self._greedy_sampling,
+            self._regular_sampling,
+            operands,
+        )
 
-        if sampling_metadata.return_logprob:
-            if any(x > 0 for x in sampling_metadata.top_logprobs_nums):
-                (
-                    logits_output.next_token_top_logprobs_val,
-                    logits_output.next_token_top_logprobs_idx,
-                ) = get_top_logprobs(logprobs, sampling_metadata.top_logprobs_nums)
-
-            if any(x is not None for x in sampling_metadata.token_ids_logprobs):
-                (
-                    logits_output.next_token_token_ids_logprobs_val,
-                    logits_output.next_token_token_ids_logprobs_idx,
-                ) = get_token_ids_logprobs(
-                    logprobs, sampling_metadata.token_ids_logprobs
-                )
-
-            logits_output.next_token_logprobs = logprobs[
-                np.arange(len(batch_next_token_ids)),
-                batch_next_token_ids,
-            ]
+        logprob_operands = (
+            logits_output,
+            sampling_metadata,
+            batch_next_token_ids,
+            logprobs,
+        )
+        lax.cond(
+            sampling_metadata.return_logprob,
+            self._process_logprob_results,
+            lambda operands: None,
+            logprob_operands,
+        )
 
         return batch_next_token_ids
 
@@ -125,7 +164,7 @@ def top_k_top_p_min_p_sampling_from_probs_jax(
 ):
     """A top-k, top-p and min-p sampling implementation with native jax operations."""
     probs_sort, probs_idx = _sample_part_a(
-        probs, top_ks, top_ps, need_min_p_sampling, min_ps
+        probs, top_ks, top_ps, min_ps, need_min_p_sampling
     )
 
     sampled_index = random.categorical(rng, jnp.log(probs_sort)).reshape(-1, 1)
@@ -133,7 +172,15 @@ def top_k_top_p_min_p_sampling_from_probs_jax(
     return _sample_part_b(probs_idx, sampled_index)
 
 
-def _sample_part_a(probs, top_ks, top_ps, need_min_p_sampling: bool, min_ps):
+def _apply_min_p_filter(operands):
+    """Apply min_p filtering when need_min_p_sampling=True"""
+    probs_sort, min_ps = operands
+    min_p_thresholds = probs_sort[:, 0] * min_ps
+    min_p_mask = probs_sort < min_p_thresholds.reshape(-1, 1)
+    return jnp.where(min_p_mask, 0.0, probs_sort)
+
+
+def _sample_part_a(probs, top_ks, top_ps, min_ps, need_min_p_sampling: bool):
     probs_sort = jnp.sort(probs, axis=-1)[
         :, ::-1
     ]  # Sort and reverse for descending order
@@ -146,10 +193,14 @@ def _sample_part_a(probs, top_ks, top_ps, need_min_p_sampling: bool, min_ps):
     top_p_mask = (probs_sum - probs_sort) > top_ps.reshape(-1, 1)
     probs_sort = jnp.where(top_p_mask, 0.0, probs_sort)
 
-    if need_min_p_sampling:
-        min_p_thresholds = probs_sort[:, 0] * min_ps
-        min_p_mask = probs_sort < min_p_thresholds.reshape(-1, 1)
-        probs_sort = jnp.where(min_p_mask, 0.0, probs_sort)
+    # Use lax.cond to avoid recompilation due to need_min_p_sampling changes
+    min_p_operands = (probs_sort, min_ps)
+    probs_sort = lax.cond(
+        need_min_p_sampling,
+        _apply_min_p_filter,
+        lambda operands: operands[0],  # No min_p filtering, just return probs_sort
+        min_p_operands,
+    )
 
     return probs_sort, probs_idx
 
