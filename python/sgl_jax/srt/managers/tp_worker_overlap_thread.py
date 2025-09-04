@@ -12,11 +12,13 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import psutil
+from jax.sharding import NamedSharding, PartitionSpec
 
 from sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch
 from sgl_jax.srt.managers.tp_worker import ModelWorker
 from sgl_jax.srt.sampling.sampling_batch_info import SamplingMetadata
 from sgl_jax.srt.server_args import ServerArgs
+from sgl_jax.srt.utils.jax_utils import device_array
 from sgl_jax.utils import get_exception_traceback
 
 logger = logging.getLogger(__name__)
@@ -28,6 +30,17 @@ def resolve_future_token_ids(input_ids, future_token_ids_map):
         input_ids < 0,
         future_token_ids_map[jnp.clip(-input_ids, a_min=0)],
         input_ids,
+    )
+
+
+@jax.jit
+def set_future_token_ids(future_token_ids_map, future_token_ids_ct, next_token_ids):
+    # The start index must be a tuple, one element per dimension of the array.
+    start_indices = (future_token_ids_ct + 1,)
+
+    # jax.lax.dynamic_update_slice is the correct tool for this job.
+    return jax.lax.dynamic_update_slice(
+        future_token_ids_map, next_token_ids, start_indices
     )
 
 
@@ -50,7 +63,8 @@ class ModelWorkerClient:
         self.future_token_ids_map = jnp.zeros(
             (self.max_running_requests * 5,), dtype=jnp.int32
         )
-
+        sharding = NamedSharding(mesh, PartitionSpec(None))
+        self.future_token_ids_map = jax.device_put(self.future_token_ids_map, sharding)
         # Launch threads
         self.input_queue = Queue()
         self.output_queue = Queue()
@@ -60,6 +74,9 @@ class ModelWorkerClient:
         )
         self.forward_thread.start()
         self.parent_process = psutil.Process().parent()
+
+    def get_model_runner(self):
+        return self.worker.get_model_runner()
 
     def get_worker_info(self):
         return self.worker.get_worker_info()
@@ -111,9 +128,10 @@ class ModelWorkerClient:
             batch_pt += 1
 
             # Resolve future tokens in the input
-            input_ids = model_worker_batch.input_ids
-            input_ids = resolve_future_token_ids(input_ids, self.future_token_ids_map)
-            model_worker_batch.input_ids = input_ids
+            input_ids = model_worker_batch.forward_batch.input_ids
+            model_worker_batch.forward_batch.input_ids = resolve_future_token_ids(
+                input_ids, self.future_token_ids_map
+            )
 
             # Run forward
             logits_output, next_token_ids_device, cache_miss_count = (
@@ -126,11 +144,9 @@ class ModelWorkerClient:
             )
 
             # Update the future token ids map
-            # Only count non-padded sequences (seq_lens > 0)
-            effective_bs = model_worker_batch.real_bs
-            self.future_token_ids_map = self.future_token_ids_map.at[
-                future_token_ids_ct + 1 : future_token_ids_ct + effective_bs + 1
-            ].set(next_token_ids_device[:effective_bs])
+            self.future_token_ids_map = set_future_token_ids(
+                self.future_token_ids_map, future_token_ids_ct, next_token_ids_device
+            )
 
             # Copy results to the CPU
             if model_worker_batch.return_logprob:
@@ -201,15 +217,15 @@ class ModelWorkerClient:
 
         # Allocate output future objects
         # Only count non-padded sequences (seq_lens > 0)
-        effective_bs = model_worker_batch.real_bs
+        bs = len(model_worker_batch.seq_lens)
         future_next_token_ids = np.arange(
             -(self.future_token_ids_ct + 1),
-            -(self.future_token_ids_ct + 1 + effective_bs),
+            -(self.future_token_ids_ct + 1 + bs),
             -1,
             dtype=np.int32,
         )
         self.future_token_ids_ct = (
-            self.future_token_ids_ct + effective_bs
+            self.future_token_ids_ct + bs
         ) % self.future_token_ids_limit
         return None, future_next_token_ids, 0
 
@@ -223,10 +239,23 @@ class ModelWorkerClient:
             precompile_bs_paddings,
             _,
         ) = self.get_precompile_paddings()
-        token_paddings = precompile_token_paddings + precompile_bs_paddings
+        max_padding_bs, _ = self.get_max_padded_size()
+        bs_paddings = precompile_bs_paddings + [max_padding_bs]
+        token_paddings = bs_paddings + precompile_token_paddings
         for token_padding in token_paddings:
-            input_ids = jnp.arange(0, token_padding, dtype=jnp.int32)
+            input_ids = device_array(
+                self.worker.mesh, jnp.arange(0, token_padding, dtype=jnp.int32)
+            )
             resolve_future_token_ids(input_ids, self.future_token_ids_map)
+        logger.info(f"[ModelWorkerClient] precompile {token_paddings} done")
+        for bs_padding in bs_paddings:
+            input_ids = device_array(
+                self.worker.mesh, jnp.arange(0, bs_padding, dtype=jnp.int32)
+            )
+            set_future_token_ids(
+                self.future_token_ids_map, self.future_token_ids_ct, input_ids
+            )
+        logger.info(f"[ModelWorkerClient] precompile {bs_paddings} done")
         end_time = time.perf_counter()
         logger.info(
             f"[ModelWorkerClient] Completes resolve_future_token_ids precompile. Time cost: {end_time - start_time} seconds"

@@ -897,11 +897,18 @@ class Scheduler(
         )
 
         if self.enable_overlap:
+            # Pre-initialize ForwardBatch for overlap scheduling optimization
+            from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
+
+            model_worker_batch.forward_batch = ForwardBatch.init_new(
+                model_worker_batch, self.tp_worker.get_model_runner()
+            )
             logits_output, next_token_ids, cache_miss_count = (
                 self.tp_worker.forward_batch_generation(
                     model_worker_batch, sampling_metadata=sampling_metadata
                 )
             )
+            next_token_ids = next_token_ids[: model_worker_batch.real_bs]
         else:
             logits_output, next_token_ids_device, cache_miss_count = (
                 self.tp_worker.forward_batch_generation(

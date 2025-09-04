@@ -22,8 +22,6 @@ import threading
 from http import HTTPStatus
 from typing import Any, List, Optional, Set, Tuple, Union
 
-import jax
-import jax.numpy as jnp
 import numpy as np
 from jax._src import mesh as mesh_lib
 
@@ -635,10 +633,6 @@ class ScheduleBatch:
         prefix_lens = [len(r.prefix_indices) for r in reqs]
         extend_lens = [r.extend_input_len for r in reqs]
 
-        # req_pool_indices_device = jnp.array(req_pool_indices, dtype=jnp.int32)
-        # input_ids_device = jnp.array(sum(input_ids, []), dtype=jnp.int32)
-        # seq_lens_device = jnp.array(seq_lens, dtype=jnp.int32)
-        # prefix_lens_device = jnp.array(prefix_lens, dtype=jnp.int32)
         req_pool_indices_cpu = np.array(req_pool_indices, dtype=np.int32)
         input_ids_cpu = np.array(sum(input_ids, []), dtype=np.int32)
         seq_lens_cpu = np.array(seq_lens, dtype=np.int32)
@@ -650,8 +644,7 @@ class ScheduleBatch:
         for i, (req, seq_len, pre_len) in enumerate(zip(reqs, seq_lens, prefix_lens)):
             req.req_pool_idx = req_pool_indices[i]
             assert seq_len - pre_len == req.extend_input_len
-            # note: req.prefix_indices is located on CPU, so we have to extract values then device_put
-            # prefix_indices_device = jnp.array(np.asarray(req.prefix_indices))
+
             prefix_indices = req.prefix_indices
             if pre_len > 0:
                 # note: prefix_indices has to locate on device, or will meet Received incompatible devices for jitted computation
@@ -870,10 +863,10 @@ class ScheduleBatch:
 
     def prepare_for_idle(self):
         self.forward_mode = ForwardMode.IDLE
-        self.input_ids = np.empty(0, jnp.int32)
-        self.seq_lens = np.empty(0, jnp.int32)
-        self.out_cache_loc = np.empty(0, jnp.int32)
-        self.req_pool_indices = np.empty(0, jnp.int32)
+        self.input_ids = np.empty(0, np.int32)
+        self.seq_lens = np.empty(0, np.int32)
+        self.out_cache_loc = np.empty(0, np.int32)
+        self.req_pool_indices = np.empty(0, np.int32)
         self.seq_lens_sum = 0
         self.extend_num_tokens = 0
         self.sampling_info = SamplingBatchInfo.from_schedule_batch(
@@ -1026,9 +1019,9 @@ class ScheduleBatch:
         seq_lens_cpu = self.seq_lens
         real_bs = len(seq_lens_cpu)
         req_pool_indices_cpu = self.req_pool_indices
-        token_indices_with_all_reqs = jax.device_get(
-            self.req_to_token_pool.req_to_token[self.req_pool_indices]
-        )
+        token_indices_with_all_reqs = self.req_to_token_pool.req_to_token[
+            self.req_pool_indices
+        ]
 
         # padding seq
         # extend & decode: input_ids, positions, out_cache_loc, cache_loc
@@ -1335,6 +1328,8 @@ class ModelWorkerBatch:
     trace_request_ids: Optional[List[str]] = None
     # Request objects for hash computation
     trace_request_objects: Optional[List] = None
+    # Pre-initialized ForwardBatch for overlap scheduling optimization
+    forward_batch: Optional[Any] = None
 
 
 def get_last_loc(
