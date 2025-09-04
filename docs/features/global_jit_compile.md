@@ -2,18 +2,20 @@
 
 ## Goals
 
-1. To improve the performance, wrap the forward process(excluding sample) with JIT and padding.
-2. To avoid cache miss during forward, we support precompile and padding.
+1. To improve the performance, wrap forward, logits and sample with JIT and padding separately.
+2. To avoid cache miss, we support precompile and padding.
 
 ## Design
 
 ### JIT Forward
 
-The wrapped forward function is named as `run_model`, which is used by prefill and decode. The input parameter `forward_batch` has to be registered as a PyTree. At the same time, the subclasses in it are required to register too. Besides, we use `nnx.split` and `nnx.merge` on model to keep satisfy the `jit` requirements.
+The wrapped forward function is `jitted_run_model`, `jitted_compute_logits` and `jitted_sampler`, which are used by prefill and decode. The input parameter `forward_batch`, `logits_metadata` and `sampling_metadata` have to be registered as PyTrees. At the same time, the subclasses in it are required to register too. Besides, we use `nnx.split` and `nnx.merge` on model to keep satisfy the `jit` requirements.
+
+Note: `return_logprob` is not supported in `jitted_compute_logits` and `jitted_sampler`, this feature with jit may be supported in the future.
 
 ### Precompile and padding
 
-Cache Miss is unacceptable for `run_model` because it results a few seconds to a several tens of seconds compile time. In order to improve the performance, precompile and padding are necessary. Precompile is executed before Scheduler's loop. The precompile includes prefill and decode phase. The former pads the input parameters with token_paddings and the latter pads them with bs_paddings. Both phases need to pad tokens(like input_ids, positions, etc.) and batch_size.
+Cache miss is unacceptable because it results a few seconds to a several tens of seconds compile time. In order to improve the performance, precompile and padding are necessary. Precompile is executed before Scheduler's loop. The precompile includes prefill and decode phase. The former pads the input parameters with token_paddings and the latter pads them with bs_paddings. Both phases need to pad tokens(like input_ids, positions, etc.) and batch_size.
 
 #### token padding
 
@@ -118,14 +120,14 @@ def initialize_jit(self):
     self.graphdef, self.state = nnx.split(self.model)
 
     @jax.jit
-    def run_model(graphdef, state, *args):
+    def jitted_run_model(graphdef, state, *args):
         model = nnx.merge(graphdef, state)
         return model(*args)
 
-    self.model_fn = partial(run_model, self.graphdef)
+    self.jitted_run_model = partial(jitted_run_model, self.graphdef)
 
 # forward
-result, layers_k, layers_v = self.model_fn(
+result, layers_k, layers_v = self.jitted_run_model(
     self.state, input_ids, positions, forward_batch
 )
 ```
@@ -146,7 +148,7 @@ As mentioned above, padding use {bs = *bs*, num_tokens = *token*}:
 
 The following fields are required to padding:
 - input_ids/out_cache_loc/positions: pad its length to num_tokens
-- cache_loc: pad its length to the product of batch_size * max_token, see details at `precompile_prefill_cache_loc_paddings` and `precompile_decode_cache_loc_paddings`
+- cache_loc: pad its length to the product of batch_size * max_req_len
 - req_pool_indices/seq_lens/req_pool_indices/extend_start_loc: pad its length to batch size
 - extend_prefix_lens/extend_seq_lens: pad its length to batch size only for prefill
 
@@ -163,5 +165,4 @@ JIT Forward is default to use.
 - `--precompile-bs-paddings`: set like 1 10 32
 - `--disable-jax-precompile`: default to False
 - `--max-running-requests`
-- `--max-prefill-tokens`
 - `--chunked-prefill-size`

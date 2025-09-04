@@ -150,10 +150,4 @@ def filter_batch(
 
 ## Usage
 
-### Configuration
-
-Configure dynamic continuous batching through server arguments:
-- `--max-running-requests`
-- `--page-size`
-
-The dynamic continuous batching system in SGLang JAX provides a robust foundation for efficient LLM serving, automatically adapting to varying workloads while maximizing resource utilization and minimizing latency.
+It is supported automatically.
