@@ -66,7 +66,7 @@ class LinearBase(nnx.Module):
         jax.debug.print(f"x shape weight shape {x.shape} {self.weight.value.shape}")
         jax.debug.visualize_array_sharding(self.weight.value)
 
-        x = jnp.arange(16 * 4096, dtype=jnp.bfloat16).reshape(16, 4096)
+        x = jnp.arange(4 * 4096, dtype=jnp.bfloat16).reshape(4, 4096)
         jax.debug.visualize_array_sharding(x)
 
         output = jnp.dot(x, self.weight.value)
