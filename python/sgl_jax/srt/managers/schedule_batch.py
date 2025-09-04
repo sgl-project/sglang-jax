@@ -1313,6 +1313,10 @@ class ModelWorkerBatch:
     # Events
     launch_done: Optional[threading.Event] = None
 
+    # Pre-initialized ForwardBatch for overlap scheduling optimization
+    forward_batch: Optional[Any] = None
+
+
 def get_last_loc(
     req_to_token: np.ndarray,
     req_pool_indices: np.ndarray,
