@@ -154,51 +154,35 @@ class MultiPageAsyncCopyDescriptor:
 
     def __init__(
         self,
-        k_pages_hbm_ref,  # [total_num_pages, page_size, num_kv_heads_per_blk, head_dim]
-        k_vmem_buf,  # [num_kv_pages_per_blk, page_size, num_kv_heads_per_blk, head_dim]
-        v_pages_hbm_ref,  # [total_num_pages, page_size, num_kv_heads_per_blk, head_dim]
-        v_vmem_buf,  # [num_kv_pages_per_blk, page_size, num_kv_heads_per_blk, head_dim]
-        k_sem,
-        v_sem,
+        pages_hbm_ref,  # [total_num_pages, page_size, num_kv_heads_per_blk, head_dim]
+        vmem_buf,  # [num_kv_pages_per_blk, page_size, num_kv_heads_per_blk, head_dim]
+        sem,
         page_indices_ref,  # i32[num_pages]
         metadata,  # [start_page_idx, end_page_idx]
     ):
-        self._k_vmem_buf = k_vmem_buf
-        self._v_vmem_buf = v_vmem_buf
+        self._vmem_buf = vmem_buf
         start_page_idx, end_page_idx = metadata
-        self._k_async_copies = []
-        self._v_async_copies = []
-        for i in range(k_vmem_buf.shape[0]):
+        self._async_copies = []
+        for i in range(vmem_buf.shape[0]):
             page_idx = start_page_idx + i
             page_idx = jax.lax.select(page_idx < end_page_idx, page_idx, 0)
-            self._k_async_copies.append(
+            self._async_copies.append(
                 pltpu.make_async_copy(
-                    k_pages_hbm_ref.at[page_indices_ref[page_idx]],
-                    k_vmem_buf.at[i],
-                    k_sem,
-                )
-            )
-            self._v_async_copies.append(
-                pltpu.make_async_copy(
-                    v_pages_hbm_ref.at[page_indices_ref[page_idx]],
-                    v_vmem_buf.at[i],
-                    v_sem,
+                    pages_hbm_ref.at[page_indices_ref[page_idx]],
+                    vmem_buf.at[i],
+                    sem,
                 )
             )
 
     def start(self):
         """Starts the async copies."""
-        for async_copy in self._k_async_copies:
-            async_copy.start()
-        for async_copy in self._v_async_copies:
+        for async_copy in self._async_copies:
             async_copy.start()
 
     def wait(self):
-        for async_copy in self._k_async_copies:
+        for async_copy in self._async_copies:
             async_copy.wait()
-        for async_copy in self._v_async_copies:
-            async_copy.wait()
-        return self._k_vmem_buf, self._v_vmem_buf
+        return self._vmem_buf
 
 
 # Expect to run these checks during compile time.
@@ -344,8 +328,7 @@ def ragged_paged_attention_kernel(
     # Scratch
     k_bufs,  # [2, num_kv_pages_per_blk, page_size, num_k_heads_per_blk, head_dim]
     v_bufs,  # [2, num_kv_pages_per_blk, page_size, num_v_heads_per_blk, head_dim]
-    k_sems,  # [2, 2]
-    v_sems,  # [2, 2]
+    sems,  # [2, 2]
     l_ref,  # [num_kv_heads_per_blk, num_q_per_blk * num_q_heads_per_kv_head, 128]
     m_ref,  # [num_kv_heads_per_blk, num_q_per_blk * num_q_heads_per_kv_head, 128]
     acc_ref,  # [num_q_per_blk, num_q_heads_per_blk, head_dim]
@@ -382,17 +365,37 @@ def ragged_paged_attention_kernel(
         end_kv_page_idx = cdiv(cu_kv_lens_ref[seq_idx + 1], page_size)
         metadata = (start_kv_page_idx, end_kv_page_idx)
         heads_start = heads_blk_idx * num_kv_heads_per_blk
-        async_copy_kv = MultiPageAsyncCopyDescriptor(
+        async_copy_k = MultiPageAsyncCopyDescriptor(
             k_cache_hbm_ref.at[:, :, pl.ds(heads_start, num_kv_heads_per_blk), :],
             k_bufs.at[buf_idx],
-            v_cache_hbm_ref.at[:, :, pl.ds(heads_start, num_kv_heads_per_blk), :],
-            v_bufs.at[buf_idx],
-            k_sems.at[buf_idx],
-            v_sems.at[buf_idx],
+            sems.at[buf_idx, 0],
             page_indices_ref,
             metadata,
         )
-        return async_copy_kv
+        async_copy_v = MultiPageAsyncCopyDescriptor(
+            v_cache_hbm_ref.at[:, :, pl.ds(heads_start, num_kv_heads_per_blk), :],
+            v_bufs.at[buf_idx],
+            sems.at[buf_idx, 1],
+            page_indices_ref,
+            metadata,
+        )
+        return async_copy_k, async_copy_v
+
+    def strided_load_kv(ref, start, step):
+        if ref.dtype == jnp.float32:
+            return ref[start::step, :]
+        packing = get_dtype_packing(ref.dtype)
+        assert ref.dtype == jnp.bfloat16
+        assert step % packing == 0
+        b_start = start // packing
+        b_offset = start % packing
+        b_step = step // packing
+        b_ref = ref.bitcast(jnp.int32)
+        b = b_ref[b_start::b_step, :]
+        bw = 32 // packing
+        b = jnp.right_shift(b, bw * b_offset)
+        b = jnp.left_shift(b, bw * (packing - 1))
+        return pltpu.bitcast(b, jnp.float32).astype(jnp.bfloat16)
 
     def fold_on_2nd_minor(vec):
         assert vec.dtype == jnp.bfloat16 or vec.dtype == jnp.float32
@@ -405,10 +408,11 @@ def ragged_paged_attention_kernel(
 
     @pl.when(heads_blk_idx + q_blk_idx == 0)
     def prefetch_first_kv_blk():
-        async_copy_kv = create_kv_async_copy_descriptors(
+        async_copy_k, async_copy_v = create_kv_async_copy_descriptors(
             heads_blk_idx, init_seq_idx, 0, init_buf_idx
         )
-        async_copy_kv.start()
+        async_copy_k.start()
+        async_copy_v.start()
 
     def is_cur_q_blk_needed(q_states):
         done, cur_seq_idx, _ = q_states
@@ -609,28 +613,32 @@ def ragged_paged_attention_kernel(
             @pl.when(next_heads_blk_idx < num_heads_blks)
             def prefetch_next_kv_blk():
                 # DMA to fixed size buffer!
-                next_async_copy_kv = create_kv_async_copy_descriptors(
+                next_async_copy_k, next_async_copy_v = create_kv_async_copy_descriptors(
                     next_heads_blk_idx, next_seq_idx, next_kv_blk_idx, next_buf_idx
                 )
-                next_async_copy_kv.start()
+                next_async_copy_k.start()
+                next_async_copy_v.start()
 
-            cur_async_copy_kv = create_kv_async_copy_descriptors(
+            cur_async_copy_k, cur_async_copy_v = create_kv_async_copy_descriptors(
                 heads_blk_idx, cur_seq_idx, kv_blk_idx, cur_buf_idx
             )
-            k_ref, v_ref = cur_async_copy_kv.wait()
-            k_ref = k_ref.reshape(
-                num_kv_pages_per_blk * page_size,
-                num_kv_heads_per_blk,
+            k_ref = cur_async_copy_k.wait().reshape(
+                num_kv_pages_per_blk * page_size * num_kv_heads_per_blk,
                 head_dim,
             )
-            v_ref = v_ref.reshape(
-                num_kv_pages_per_blk * page_size,
-                num_kv_heads_per_blk,
+            v_ref = cur_async_copy_v.wait().reshape(
+                num_kv_pages_per_blk * page_size * num_kv_heads_per_blk,
                 head_dim,
             )
-            for kv_head_chunk_idx in range(0, num_kv_heads_per_blk):
-                k = k_ref[:, kv_head_chunk_idx, :]
-                v = v_ref[:, kv_head_chunk_idx, :]
+            for kv_head_idx in range(0, num_kv_heads_per_blk):
+                q_head_idx = kv_head_idx * num_q_heads_per_kv_head
+                # TODO(jevinjiang): extra handling for packed type that can start at
+                # unaligned position!
+                q = fold_on_2nd_minor(
+                    q_ref[:, q_head_idx : q_head_idx + num_q_heads_per_kv_head, :]
+                )
+                k = strided_load_kv(k_ref, kv_head_idx, num_kv_heads_per_blk)
+                v = strided_load_kv(v_ref, kv_head_idx, num_kv_heads_per_blk)
                 if k_scale is not None:
                     # NOTE: Conversion between arbitrary data types is not supported.
                     # That's why it is converted to float32 first.
@@ -639,12 +647,6 @@ def ragged_paged_attention_kernel(
                 if v_scale is not None:
                     v = v.astype(jnp.float32) * v_scale
                     v = v.astype(q_ref.dtype)
-                kv_head_idx = kv_head_chunk_idx
-                q_head_idx = kv_head_idx * num_q_heads_per_kv_head
-                # unaligned position!
-                q = fold_on_2nd_minor(
-                    q_ref[:, q_head_idx : q_head_idx + num_q_heads_per_kv_head, :]
-                )
                 flash_attention(
                     q,
                     k,
@@ -848,8 +850,7 @@ def ragged_paged_attention(
     scratch_shapes = [
         double_kv_buf_scratch,  # k_bufs
         double_kv_buf_scratch,  # v_bufs
-        pltpu.SemaphoreType.DMA((2,)),  # Semaphores for k double buffers.
-        pltpu.SemaphoreType.DMA((2,)),  # Semaphores for k double buffers.
+        pltpu.SemaphoreType.DMA((2, 2)),  # Semaphores for k, v double buffers.
         lm_scratch,  # l_ref
         lm_scratch,  # m_ref
         acc_scratch,
