@@ -4,9 +4,9 @@ import logging
 import os
 import threading
 import time
-import uuid
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional
 
+import jax
 import jax.numpy as jnp
 
 logger = logging.getLogger(__name__)
@@ -45,26 +45,143 @@ class TensorJSONEncoder(json.JSONEncoder):
             return f"<non-serializable object: {type(obj).__name__}>"
 
 
+class PrecisionTracerRequestMetadata:
+    def __init__(self, request_id, request_input_ids, forward_mode):
+        self.request_id = request_id
+        self.input_hash = hashlib.md5(
+            str(request_input_ids).encode("utf-8")
+        ).hexdigest()[:16]
+        self.request_input_ids = request_input_ids
+        self.input_len = len(request_input_ids)
+        self.forward_mode = forward_mode
+
+    def to_dict(self):
+        return {
+            "request_id": self.request_id,
+            "input_hash": self.input_hash,
+            "input_len": self.input_len,
+            "forward_mode": self.forward_mode,
+        }
+
+
+class PrecisionTracerRecord:
+    def __init__(
+        self,
+        bid,
+        request_id,
+        request_idx,
+        start_time,
+        precision_records,
+        status,
+        content_hash,
+        process_id,
+    ):
+        self.bid = bid
+        self.request_id = request_id
+        self.request_idx = request_idx
+        self.start_time = start_time
+        self.end_time = None
+        self.duration = None
+        self.precision_records = {
+            "prefill": [],
+            "decode": [],
+        }
+        self.status = status
+        self.content_hash = content_hash
+        self.process_id = process_id
+
+    def to_dict(self):
+        return {
+            "bid": self.bid,
+            "request_id": self.request_id,
+            "request_idx": self.request_idx,
+            "start_time": self.start_time,
+            "end_time": self.end_time,
+            "duration": self.duration,
+            "precision_records": self.precision_records,
+            "status": self.status,
+            "content_hash": self.content_hash,
+            "process_id": self.process_id,
+        }
+
+
 class PrecisionTracer:
     def __init__(self):
-        self.records = {}
         self.lock = threading.Lock()
 
-        # Request coloring and precision tracking
-        self._request_traces = {}
-        self._current_request_id = None
-        self._request_counter = 0
-        self._completed_requests_count = 0
-        self._request_id_to_number = {}  # Map request_id to request_number
+        # setting
         self._trace_active = False
         self._trace_output_file = None
-        self._verbose_logging = False  # Control console output during tracing
-        self._enable_precision_tracer = False  # Global enable/disable switch
+        self._verbose_logging = False
+        self._enable_precision_tracer = False
+
+        # counter
+        self._max_requests = 0
+        self._completed_requests_count = 0
+        self._request_counter = 0
+
+        # metadata
+        self._current_batch_id = None
+        self._records: Dict[str, PrecisionTracerRecord] = {}
+        self._batch_requests_mapping: Dict[
+            int, List[PrecisionTracerRequestMetadata]
+        ] = {}
+
+        self._token_counters: Dict[str, int] = {}
+        self._last_forward_pass_id: Dict[str, int] = {}
+        self._current_forward_pass_id: int = -1
 
     def set_enable_precision_tracer(self, enabled: bool):
-        """Set the global enable/disable switch for precision tracer"""
         self._enable_precision_tracer = enabled
         logger.info(f"Precision tracer globally {'enabled' if enabled else 'disabled'}")
+
+    def get_trace_active(self):
+        with self.lock:
+            return self._trace_active
+
+    def get_max_requests(self):
+        with self.lock:
+            return self._max_requests
+
+    def get_completed_requests_count(self):
+        with self.lock:
+            return self._completed_requests_count
+
+    def get_request_counter(self):
+        with self.lock:
+            return self._request_counter
+
+    def add_request_counter(self):
+        with self.lock:
+            self._request_counter += 1
+
+    def get_completed_requests_count(self):
+        with self.lock:
+            return self._completed_requests_count
+
+    def add_completed_requests_count(self):
+        with self.lock:
+            self._completed_requests_count += 1
+
+    def set_request_status_to_completed(self, request_id: str):
+        with self.lock:
+            self._records[request_id].status = "completed"
+
+    def set_end_time_and_duration(self, request_id: str):
+        with self.lock:
+            self._records[request_id].end_time = time.time()
+            self._records[request_id].duration = (
+                self._records[request_id].end_time
+                - self._records[request_id].start_time
+            )
+
+    def add_request_to_batch_requests_mapping(
+        self, batch_id: int, request_metadata: PrecisionTracerRequestMetadata
+    ):
+        with self.lock:
+            if batch_id not in self._batch_requests_mapping:
+                self._batch_requests_mapping[batch_id] = []
+            self._batch_requests_mapping[batch_id].append(request_metadata)
 
     def start_trace(
         self,
@@ -72,36 +189,39 @@ class PrecisionTracer:
         output_file: Optional[str] = None,
         verbose_logging: bool = False,
     ):
-        """Start tracing requests with optional request number limit and console logging control"""
         if not self._enable_precision_tracer:
             logger.warning(
                 "Precision tracer is disabled. Enable with --enable-precision-tracer"
             )
-            return None
+            return
 
         if self._trace_active:
-            print("Request tracing already active, stopping current trace first...")
-            self.stop_trace()
+            return
 
+        logger.info("set trace activate is true")
         self._trace_active = True
-        self._request_traces = {}
-        self._request_counter = 0
-        self._completed_requests_count = 0
-        self._request_id_to_number = {}  # Reset request ID to number mapping
-        self._max_requests = req_num
         self._verbose_logging = verbose_logging
 
-        # Setup output file
-        if output_file:
-            self._trace_output_file = output_file
-        else:
-            timestamp = int(time.time())
-            self._trace_output_file = f"debug_outputs/request_traces_{timestamp}.jsonl"
+        self._max_requests = req_num
+        self._completed_requests_count = 0
+        self._request_counter = 0
 
-        # Ensure output directory exists
+        self._current_batch_id = None
+        self._records: dict[str, PrecisionTracerRecord] = {}
+        self._batch_requests_mapping: dict[
+            int, list[PrecisionTracerRequestMetadata]
+        ] = {}
+        self._token_counters: dict[str, int] = {}
+        self._last_forward_pass_id: dict[str, int] = {}
+
+        if not output_file:
+            raise ValueError("output_file is required")
+
+        self._trace_output_file = output_file
+        logger.info(f"Trace output file: {self._trace_output_file}")
+
         os.makedirs(os.path.dirname(self._trace_output_file), exist_ok=True)
 
-        # Clear existing file
         with open(self._trace_output_file, "w") as f:
             pass
 
@@ -112,126 +232,99 @@ class PrecisionTracer:
             logger.info("Verbose console logging disabled during tracing")
 
     def stop_trace(self):
-        """Stop request tracing"""
         if not self._trace_active:
             logger.info("No active request tracing")
-            return None
+            return
 
         self._trace_active = False
         output_file = self._trace_output_file
+        self._trace_output_file = None
+
+        try:
+            with open(output_file, "a", encoding="utf-8") as f:
+                for _, record in self._records.items():
+                    record_dict = record.to_dict()
+                    json.dump(record_dict, f, cls=TensorJSONEncoder, ensure_ascii=False)
+                    f.write("\n")
+
+            logger.info(f"Saved {len(self._records)} request traces to: {output_file}")
+
+        except Exception as e:
+            logger.error(f"Error saving traces to {output_file}: {e}")
+
+        self._records.clear()
+        self._batch_requests_mapping.clear()
+        self._token_counters.clear()
+        self._last_forward_pass_id.clear()
         logger.info(f"Request tracing stopped. Traces saved to: {output_file}")
         return output_file
 
-    def _compute_request_hash(self, req_content):
-        """Compute a reproducible hash for request content for comparison purposes"""
-        if isinstance(req_content, str):
-            content_str = req_content
-        elif hasattr(req_content, "origin_input_text"):
-            # Handle Req object - always use input_ids as primary identifier for reproducibility
-            if (
-                hasattr(req_content, "origin_input_ids")
-                and req_content.origin_input_ids
-            ):
-                content_str = str(req_content.origin_input_ids)
-            else:
-                content_str = req_content.origin_input_text or ""
-
-            # Also include sampling params for uniqueness
-            if hasattr(req_content, "sampling_params"):
-                content_str += f"_temp{req_content.sampling_params.temperature if req_content.sampling_params else 0}"
-                content_str += f"_maxlen{req_content.sampling_params.max_new_tokens if req_content.sampling_params else 0}"
-        elif hasattr(req_content, "origin_input_ids"):
-            # Handle cases where we have input_ids but no text
-            content_str = str(req_content.origin_input_ids)
-        else:
-            content_str = str(req_content)
-
-        hash_result = hashlib.md5(content_str.encode("utf-8")).hexdigest()[:8]
-        return hash_result
-
-    def start_request_trace(self, request_id: Optional[str] = None, req_content=None):
-        """Start tracing a new request"""
-
-        if not self._trace_active:
-            return None
-
-        # Check if we've completed enough requests FIRST
-        if self._max_requests and self._completed_requests_count >= self._max_requests:
-            self.stop_trace()
-            return None
-
-        # Use provided request_id if available (from scheduler), otherwise generate unique one
-        if request_id is None:
-            if req_content is not None:
-                request_id = str(req_content.rid)  # 直接使用 rid，不加前缀
-            else:
-                request_id = str(uuid.uuid4())
-
-        # Check if we already have this request in active traces
-        if request_id in self._request_traces:
-            return request_id
-
-        # Counter is now incremented at scheduler level, not here
-        self._current_request_id = request_id
-
-        # Get request number from scheduler assignment
-        request_number = self._request_id_to_number.get(request_id, "unknown")
-
-        pid = os.getpid()
-
-        self._request_traces[request_id] = {
-            "request_id": request_id,
-            "request_number": request_number,
-            "start_time": time.time(),
-            "precision_records": [],
-            "status": "active",
-            "content_hash": (
-                self._compute_request_hash(req_content) if req_content else None
-            ),
-            "process_id": pid,
-        }
-
-        return request_id
-
-    def end_request_trace(self, request_id: Optional[str] = None):
-        """End tracing for a request and save to JSONL"""
+    def start_batch_trace(self, batch_id: int):
         if not self._trace_active:
             return
 
-        if request_id is None:
-            request_id = self._current_request_id
+        with self.lock:
+            requests_in_batch = self._batch_requests_mapping.get(batch_id, [])
 
-        if request_id and request_id in self._request_traces:
-            trace_data = self._request_traces[request_id]
-            trace_data["end_time"] = time.time()
-            trace_data["duration"] = trace_data["end_time"] - trace_data["start_time"]
-            trace_data["status"] = "completed"
+            if len(requests_in_batch) == 0:
+                logger.warning(f"Batch {batch_id} has no requests to trace")
+                return
 
-            # Save to JSONL file
-            try:
-                with open(self._trace_output_file, "a", encoding="utf-8") as f:
-                    json.dump(trace_data, f, cls=TensorJSONEncoder, ensure_ascii=False)
-                    f.write("\n")
-            except Exception as e:
-                logger.error(f"Error saving request trace: {e}")
+            self._current_batch_id = batch_id
+            process_pid = os.getpid()
+            for idx, request_metadata in enumerate(requests_in_batch):
+                # prefill
+                if request_metadata.forward_mode == 1:
+                    request_idx = self._completed_requests_count + idx
+                    record = PrecisionTracerRecord(
+                        bid=batch_id,
+                        request_id=request_metadata.request_id,
+                        request_idx=request_idx,
+                        start_time=time.time(),
+                        precision_records=None,
+                        status="active",
+                        content_hash=request_metadata.input_hash,
+                        process_id=process_pid,
+                    )
+                    self._records[request_metadata.request_id] = record
+                    self._token_counters[request_metadata.request_id] = 0
+                    self._last_forward_pass_id[request_metadata.request_id] = -1
 
-            # Clean up and increment completed count
-            del self._request_traces[request_id]
-            self._completed_requests_count += 1
-            logger.info(
-                f"Request trace completed ({self._completed_requests_count}/{self._max_requests}): {request_id}"
+    def set_current_forward_pass_id(self, forward_pass_id: int):
+        """Set the current forward pass ID for tracking inference steps"""
+        if not self._trace_active:
+            return
+        self._current_forward_pass_id = forward_pass_id
+
+    def jit_pure_callback_record(
+        self, tensor: Any, name: str, stage: str, layer_id: Optional[int] = None
+    ) -> bool:
+        if self._enable_precision_tracer:
+            full_stage = (
+                f"{stage}_layer_id_{layer_id}" if layer_id is not None else stage
             )
-            if request_id == self._current_request_id:
-                self._current_request_id = None
+
+            def trace_callback(tensor):
+                # Debug logging to check what stage is being passed
+                if self._trace_active:
+                    logger.debug(
+                        f"Recording tensor {name} with stage: {full_stage}, layer_id: {layer_id}"
+                    )
+                precision_tracer.record(tensor, name, full_stage)
+                return True
+
+            # pure_callback must have a return value, otherwise, it will be removed by the jit compiler's optimization
+            callback_flag = jax.pure_callback(trace_callback, jnp.bool_(True), tensor)
+
+            return callback_flag
+        else:
+            return jnp.bool_(True)
 
     def record(
         self,
         tensor: Any,
         name: str,
         stage: str = "",
-        extra_info: str = "",
-        request_id: Optional[str] = None,
-        forward_batch: Optional[Any] = None,
     ):
         if not self._enable_precision_tracer or not self._trace_active:
             return
@@ -240,60 +333,114 @@ class PrecisionTracer:
             logger.info(f"[{stage}] {name}: None")
             return
 
-        key = f"{stage}_{name}" if stage else name
-
-        # Only handle JAX arrays now
-        stats = self._compute_jax_stats(tensor, name, stage, extra_info)
-
-        # Add request coloring - handle batch scenarios
-        request_ids_to_process = []
-
-        # Get request IDs from various sources
-        if request_id:
-            request_ids_to_process = [request_id]
-        elif (
-            forward_batch
-            and hasattr(forward_batch, "trace_request_ids")
-            and forward_batch.trace_request_ids
-        ):
-            request_ids_to_process = forward_batch.trace_request_ids
-        elif self._current_request_id:
-            request_ids_to_process = [self._current_request_id]
-
-        # If no specific request IDs found, add to all active traces (for JIT callbacks)
-        if not request_ids_to_process and self._request_traces:
-            request_ids_to_process = list(self._request_traces.keys())
-            logger.debug(
-                f"No specific request_ids, using all active traces: {request_ids_to_process}"
+        with self.lock:
+            request_in_batch = self._batch_requests_mapping.get(
+                self._current_batch_id, []
             )
+            current_batch_id = self._current_batch_id
 
-        # Add stats to all relevant requests
-        for req_id in request_ids_to_process:
-            if req_id and req_id in self._request_traces:
-                # Create a copy of stats for each request
-                req_stats = stats.copy()
-                req_stats["request_id"] = req_id
-                self._request_traces[req_id]["precision_records"].append(req_stats)
-            elif req_id:
-                logger.warning(
-                    f"Request ID mismatch: {req_id} not in traces {list(self._request_traces.keys())}"
-                )
+        if len(request_in_batch) == 0:
+            logger.warning(f"Batch {current_batch_id} has no requests to trace")
+            return
 
-        # Set the first request ID for display purposes
-        if request_ids_to_process:
-            stats["request_id"] = request_ids_to_process[0]
-            if len(request_ids_to_process) > 1:
-                stats["batch_request_count"] = len(request_ids_to_process)
+        prisicion_infos = self._calculate_tensor_pricision_info(
+            tensor, name, stage, request_in_batch
+        )
 
         with self.lock:
-            if key not in self.records:
-                self.records[key] = []
-            self.records[key].append(stats)
+            for req_id, data in prisicion_infos.items():
+                if req_id in self._records:
+                    forward_mode = request_in_batch[0].forward_mode
+                    category = "prefill" if forward_mode == 1 else "decode"
 
-        self._record_stats(stats, key)
+                    precision_records = self._records[req_id].precision_records
 
-    def _compute_jax_stats(
-        self, tensor: Any, name: str, stage: str, extra_info: str
+                    if category not in precision_records:
+                        precision_records[category] = []
+
+                    if category == "prefill":
+                        current_token_group = None
+                        if len(precision_records[category]) > 0:
+                            current_token_group = precision_records[category][-1]
+
+                        if current_token_group is None:
+                            current_token_group = {
+                                "token_idx": 0,
+                                "category": category,
+                                "records": [],
+                            }
+                            precision_records[category].append(current_token_group)
+
+                            if "sequence_length" in data:
+                                self._token_counters[req_id] = data["sequence_length"]
+                            else:
+                                self._token_counters[req_id] = 1
+
+                        record_with_metadata = data.copy()
+                        current_token_group["records"].append(record_with_metadata)
+
+                    else:
+                        # For decode, use forward_pass_id to determine when to start new token group
+                        current_token_idx = self._token_counters.get(req_id, 0)
+                        last_forward_pass_id = self._last_forward_pass_id.get(
+                            req_id, -1
+                        )
+
+                        # Check if this is a new forward pass (new inference step)
+                        is_new_forward_pass = (
+                            hasattr(self, "_current_forward_pass_id")
+                            and self._current_forward_pass_id != last_forward_pass_id
+                        )
+
+                        # If this is a new forward pass, increment token counter
+                        if is_new_forward_pass and last_forward_pass_id != -1:
+                            current_token_idx = self._token_counters.get(req_id, 0) + 1
+                            self._token_counters[req_id] = current_token_idx
+                            self._last_forward_pass_id[req_id] = (
+                                self._current_forward_pass_id
+                            )
+
+                        # Look for existing token group at current position
+                        current_token_group = None
+                        for token_group in precision_records[category]:
+                            if token_group["token_idx"] == current_token_idx:
+                                current_token_group = token_group
+                                break
+
+                        # If no existing token group, create one
+                        if current_token_group is None:
+                            current_token_group = {
+                                "token_idx": current_token_idx,
+                                "category": category,
+                                "records": [],
+                            }
+                            precision_records[category].append(current_token_group)
+                            # Update forward pass id for first record of this token
+                            if hasattr(self, "_current_forward_pass_id"):
+                                self._last_forward_pass_id[req_id] = (
+                                    self._current_forward_pass_id
+                                )
+
+                        # Add record to the token group
+                        record_with_metadata = data.copy()
+                        current_token_group["records"].append(record_with_metadata)
+
+                else:
+                    logger.warning(f"Request {req_id} not found in records")
+                    continue
+
+        for req_id, data in prisicion_infos.items():
+            if req_id in self._records:
+                stats_with_req_id = data.copy()
+                stats_with_req_id["request_id"] = req_id
+                self._verbose_logging_console(stats_with_req_id)
+
+    def _calculate_tensor_pricision_info(
+        self,
+        tensor: Any,
+        name: str,
+        stage: str,
+        request_in_batch: List[PrecisionTracerRequestMetadata],
     ) -> Dict[str, Any]:
         try:
             try:
@@ -302,147 +449,234 @@ class PrecisionTracer:
                 can_concretize = True
             except Exception:
                 can_concretize = False
+            layer_id, module_type = self._parse_layer_and_module(stage)
 
-            if can_concretize:
-                if tensor.size > 1:
-                    std_val = float(jnp.std(tensor, ddof=0).item())
+            if not hasattr(tensor, "shape") or len(tensor.shape) == 0:
+                raise ValueError("Tensor has no valid shape")
+
+            total_batch_size = tensor.shape[0]
+            current_idx = 0
+            result = {}
+
+            for idx, req_meta in enumerate(request_in_batch):
+                req_id = req_meta.request_id
+                if req_meta.forward_mode == 1:
+                    seq_len = req_meta.input_len
                 else:
-                    std_val = 0.0
+                    seq_len = 1
 
-                stats = {
-                    "framework": "jax",
-                    "name": name,
-                    "stage": stage,
-                    "shape": tuple(tensor.shape),
-                    "dtype": str(tensor.dtype),
-                    "min": float(jnp.min(tensor).item()),
-                    "max": float(jnp.max(tensor).item()),
-                    "mean": float(jnp.mean(tensor).item()),
-                    "std": std_val,
-                    "has_nan": bool(jnp.any(jnp.isnan(tensor)).item()),
-                    "has_inf": bool(jnp.any(jnp.isinf(tensor)).item()),
-                    "extra_info": extra_info,
-                }
-
-                # Add per-token statistics for sequence data (when first dim > 1)
-                if len(tensor.shape) >= 2 and tensor.shape[0] > 1:
-                    # Assume first dimension is sequence length (batch size or tokens)
-                    seq_len = tensor.shape[0]
-                    token_stats = []
-
-                    # Sample a few tokens for detailed analysis (avoid too much data)
-                    sample_indices = (
-                        [0, seq_len // 4, seq_len // 2, 3 * seq_len // 4, seq_len - 1]
-                        if seq_len > 4
-                        else list(range(seq_len))
+                if current_idx + seq_len > total_batch_size:
+                    logger.error(
+                        f"[TENSOR_DEBUG] ERROR: Request {req_id} requires {seq_len} tokens, "
+                        f"but only {total_batch_size - current_idx} left in tensor of shape {tensor.shape}. "
+                        f"Current position: {current_idx}"
                     )
-                    sample_indices = [i for i in sample_indices if 0 <= i < seq_len]
+                    continue
 
-                    for token_idx in sample_indices:
-                        token_tensor = tensor[token_idx]
-                        if token_tensor.size > 1:
-                            token_stats.append(
-                                {
-                                    "token_idx": token_idx,
-                                    "min": float(jnp.min(token_tensor).item()),
-                                    "max": float(jnp.max(token_tensor).item()),
-                                    "mean": float(jnp.mean(token_tensor).item()),
-                                    "std": float(jnp.std(token_tensor, ddof=0).item()),
-                                    "has_nan": bool(
-                                        jnp.any(jnp.isnan(token_tensor)).item()
-                                    ),
-                                    "has_inf": bool(
-                                        jnp.any(jnp.isinf(token_tensor)).item()
-                                    ),
-                                }
-                            )
-                        else:
-                            token_stats.append(
-                                {
-                                    "token_idx": token_idx,
-                                    "value": float(token_tensor.item()),
-                                    "has_nan": bool(jnp.isnan(token_tensor).item()),
-                                    "has_inf": bool(jnp.isinf(token_tensor).item()),
-                                }
-                            )
+                slice_tensor = jnp.take(
+                    tensor, jnp.arange(current_idx, current_idx + seq_len), axis=0
+                )
+                current_idx += seq_len
 
-                    stats["token_stats"] = token_stats
-                    stats["sequence_length"] = seq_len
-            else:
-                stats = {
-                    "framework": "jax",
-                    "name": name,
-                    "stage": stage,
-                    "shape": tuple(tensor.shape),
-                    "dtype": str(tensor.dtype),
-                    "min": "traced",
-                    "max": "traced",
-                    "mean": "traced",
-                    "std": "traced",
-                    "has_nan": "traced",
-                    "has_inf": "traced",
-                    "extra_info": extra_info,
-                    "tracing_context": True,
-                }
+                is_prefill = req_meta.forward_mode == 1
 
-            # Extract layer_id and module_type
-            layer_id = "unknown"
-            module_type = "unknown"
+                if can_concretize:
+                    stats = self._compute_stats(
+                        slice_tensor, name, stage, layer_id, module_type, is_prefill
+                    )
+                else:
+                    stats = self._traced_stats(
+                        name,
+                        stage,
+                        slice_tensor.shape,
+                        str(slice_tensor.dtype),
+                        layer_id,
+                        module_type,
+                    )
 
-            if "_layer_id_" in stage:
-                parts = stage.split("_layer_id_")
-                if len(parts) >= 2:
-                    try:
-                        layer_id = int(parts[1].split("_")[0])
-                        module_type = parts[0]
-                    except (ValueError, IndexError):
-                        pass
-            elif stage:
-                stage_lower = stage.lower()
-                if "attention" in stage_lower:
-                    module_type = "attention"
-                elif "mlp" in stage_lower:
-                    module_type = "mlp"
-                elif "block" in stage_lower:
-                    module_type = "block"
-                elif "transformer" in stage_lower:
-                    module_type = "transformer"
-                    layer_id = "all"
+                result[req_id] = stats
 
-                # Extract layer_id (if exists)
-                import re
-
-                layer_match = re.search(r"layer_id[_-](\d+)", stage, re.IGNORECASE)
-                if layer_match:
-                    try:
-                        layer_id = int(layer_match.group(1))
-                    except ValueError:
-                        pass
-
-            stats["layer_id"] = layer_id
-            stats["module_type"] = module_type
+            return result
 
         except Exception as e:
+            result = {}
+            for req_meta in request_in_batch:
+                result[req_meta.request_id] = {
+                    "framework": "jax",
+                    "name": name,
+                    "stage": stage,
+                    "shape": (
+                        tuple(tensor.shape) if hasattr(tensor, "shape") else "unknown"
+                    ),
+                    "dtype": (
+                        str(tensor.dtype) if hasattr(tensor, "dtype") else "unknown"
+                    ),
+                    "error": str(e),
+                    "layer_id": "unknown",
+                    "module_type": "unknown",
+                }
+            return result
+
+    def _parse_layer_and_module(self, stage: str):
+        layer_id = "unknown"
+        module_type = "unknown"
+
+        if self._trace_active:
+            logger.debug(f"Parsing stage: '{stage}'")
+
+        if "_layer_id_" in stage:
+            parts = stage.split("_layer_id_")
+            if len(parts) >= 2:
+                try:
+                    layer_id = int(parts[1].split("_")[0])
+                    module_type = parts[0]
+                    if self._trace_active:
+                        logger.debug(
+                            f"Parsed from _layer_id_ format: layer_id={layer_id}, module_type={module_type}"
+                        )
+                    return layer_id, module_type
+                except (ValueError, IndexError) as e:
+                    if self._trace_active:
+                        logger.debug(f"Failed to parse _layer_id_ format: {e}")
+                    pass
+
+        if stage:
+            stage_lower = stage.lower()
+            if "attention" in stage_lower or "attn" in stage_lower:
+                module_type = "attention"
+            elif "mlp" in stage_lower:
+                module_type = "mlp"
+            elif "block" in stage_lower:
+                module_type = "block"
+            elif "transformer" in stage_lower:
+                module_type = "transformer"
+                layer_id = "all"
+
+            import re
+
+            # Look for layer_id in various formats
+            layer_match = re.search(r"layer_id[_-](\d+)", stage, re.IGNORECASE)
+            if not layer_match:
+                # Also try to find layer id in other formats like "layer_0", "L0", etc.
+                layer_match = re.search(r"layer[_-]?(\d+)", stage, re.IGNORECASE)
+            if not layer_match:
+                # Try "L" followed by digits
+                layer_match = re.search(r"L(\d+)", stage, re.IGNORECASE)
+
+            if layer_match:
+                try:
+                    layer_id = int(layer_match.group(1))
+                except ValueError:
+                    pass
+
+        return layer_id, module_type
+
+    def _compute_stats(
+        self,
+        tensor,
+        name: str,
+        stage: str,
+        layer_id,
+        module_type,
+        is_prefill: bool = False,
+    ):
+        try:
+            shape = tensor.shape
+            dtype = str(tensor.dtype)
+
+            if tensor.size > 1:
+                std_val = float(jnp.std(tensor, ddof=0).item())
+            else:
+                std_val = 0.0
+
             stats = {
                 "framework": "jax",
                 "name": name,
                 "stage": stage,
-                "shape": tuple(tensor.shape) if hasattr(tensor, "shape") else (),
-                "dtype": str(tensor.dtype) if hasattr(tensor, "dtype") else "unknown",
-                "extra_info": extra_info,
-                "layer_id": "unknown",
-                "module_type": "unknown",
-                "error": str(e),
+                "shape": tuple(shape),
+                "dtype": dtype,
+                "min": float(jnp.min(tensor).item()),
+                "max": float(jnp.max(tensor).item()),
+                "mean": float(jnp.mean(tensor).item()),
+                "std": std_val,
+                "has_nan": bool(jnp.any(jnp.isnan(tensor)).item()),
+                "has_inf": bool(jnp.any(jnp.isinf(tensor)).item()),
+                "layer_id": layer_id,
+                "module_type": module_type,
             }
 
-        return stats
+            if len(shape) >= 2 and shape[0] > 1 and not is_prefill:
+                seq_len = shape[0]
 
-    def _record_stats(self, stats: Dict[str, Any], key: str):
-        # Skip console output if verbose logging is disabled during tracing
+                sample_indices = list(range(seq_len))
+
+                token_stats = []
+                for idx in sample_indices:
+                    t = tensor[idx]
+                    if t.size > 1:
+                        token_stats.append(
+                            {
+                                "token_idx": idx,
+                                "min": float(jnp.min(t).item()),
+                                "max": float(jnp.max(t).item()),
+                                "mean": float(jnp.mean(t).item()),
+                                "std": float(jnp.std(t, ddof=0).item()),
+                                "has_nan": bool(jnp.any(jnp.isnan(t)).item()),
+                                "has_inf": bool(jnp.any(jnp.isinf(t)).item()),
+                            }
+                        )
+                    else:
+                        val = t.item()
+                        token_stats.append(
+                            {
+                                "token_idx": idx,
+                                "value": float(val),
+                                "has_nan": bool(jnp.isnan(t).item()),
+                                "has_inf": bool(jnp.isinf(t).item()),
+                            }
+                        )
+
+                stats["token_stats"] = token_stats
+                stats["sequence_length"] = seq_len
+            elif len(shape) >= 2 and shape[0] > 1 and is_prefill:
+                stats["sequence_length"] = shape[0]
+
+            return stats
+
+        except Exception as e:
+            return {
+                "framework": "jax",
+                "name": name,
+                "stage": stage,
+                "shape": tuple(tensor.shape),
+                "dtype": str(tensor.dtype),
+                "error": str(e),
+                "layer_id": layer_id,
+                "module_type": module_type,
+            }
+
+    def _traced_stats(self, name: str, stage: str, shape, dtype, layer_id, module_type):
+        return {
+            "framework": "jax",
+            "name": name,
+            "stage": stage,
+            "shape": shape,
+            "dtype": dtype,
+            "min": "traced",
+            "max": "traced",
+            "mean": "traced",
+            "std": "traced",
+            "has_nan": "traced",
+            "has_inf": "traced",
+            "layer_id": layer_id,
+            "module_type": module_type,
+            "tracing_context": True,
+        }
+
+    def _verbose_logging_console(self, stats: Dict[str, Any]):
         if self._trace_active and not self._verbose_logging:
             return
 
-        # Add request ID info if available
         req_info = ""
         if "request_id" in stats:
             req_id_short = (
@@ -452,7 +686,6 @@ class PrecisionTracer:
             )
             req_info = f"[Req:{req_id_short}]"
 
-            # Add batch info if multiple requests
             if "batch_request_count" in stats:
                 req_info += f"[Batch:{stats['batch_request_count']}]"
 
@@ -461,7 +694,6 @@ class PrecisionTracer:
                 f"{req_info}[{stats['stage']}] {stats['name']}: shape={stats['shape']}, dtype={stats['dtype']}, error={stats['error']}"
             )
         elif stats.get("tracing_context", False):
-            # Special handling in JAX tracing context
             framework = stats["framework"].upper()
             extra = f" {stats.get('extra_info', '')}" if stats.get("extra_info") else ""
             print(
@@ -482,16 +714,6 @@ class PrecisionTracer:
                 f"min={stats['min']:.6f}, max={stats['max']:.6f}, "
                 f"mean={stats['mean']:.6f}, std={stats['std']:.6f}{nan_inf}{extra}"
             )
-
-    def get_records(self, key: str = None) -> Union[Dict[str, List], List]:
-        with self.lock:
-            if key is None:
-                return dict(self.records)
-            return self.records.get(key, [])
-
-    def clear_records(self):
-        with self.lock:
-            self.records.clear()
 
 
 precision_tracer = PrecisionTracer()

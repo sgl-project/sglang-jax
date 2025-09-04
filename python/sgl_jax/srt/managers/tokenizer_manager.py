@@ -669,6 +669,7 @@ class TokenizerManager:
     async def set_internal_state(
         self, obj: SetInternalStateReq
     ) -> SetInternalStateReqOutput:
+        self.auto_create_handle_loop()
         responses: List[SetInternalStateReqOutput] = (
             await self.set_internal_state_communicator(obj)
         )

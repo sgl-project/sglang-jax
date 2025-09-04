@@ -82,11 +82,18 @@ class SchedulerOutputProcessorMixin:
                 req.check_finished()
 
                 if req.finished():
-                    # End trace for finished request
-                    if precision_tracer._trace_active:
-                        request_id = str(req.rid)
-                        if request_id in precision_tracer._request_traces:
-                            precision_tracer.end_request_trace(request_id)
+                    if precision_tracer.get_trace_active():
+                        precision_tracer.set_request_status_to_completed(req.rid)
+                        precision_tracer.add_completed_requests_count()
+                        precision_tracer.set_end_time_and_duration(req.rid)
+                        logger.info(
+                            f"Request trace completed ({precision_tracer.get_completed_requests_count()}/{precision_tracer.get_max_requests()}): {req.rid}"
+                        )
+                        if (
+                            precision_tracer.get_completed_requests_count()
+                            >= precision_tracer.get_max_requests()
+                        ):
+                            precision_tracer.stop_trace()
                     self.tree_cache.cache_finished_req(req)
                 elif not batch.decoding_reqs or req not in batch.decoding_reqs:
                     # This updates radix so others can match
@@ -196,10 +203,18 @@ class SchedulerOutputProcessorMixin:
             req.check_finished()
             if req.finished():
                 # End trace for finished request
-                if precision_tracer._trace_active:
-                    request_id = str(req.rid)
-                    if request_id in precision_tracer._request_traces:
-                        precision_tracer.end_request_trace(request_id)
+                if precision_tracer.get_trace_active():
+                    precision_tracer.set_request_status_to_completed(req.rid)
+                    precision_tracer.add_completed_requests_count()
+                    precision_tracer.set_end_time_and_duration(req.rid)
+                    logger.info(
+                        f"Request trace completed ({precision_tracer.get_completed_requests_count()}/{precision_tracer.get_max_requests()}): {req.rid}"
+                    )
+                    if (
+                        precision_tracer.get_completed_requests_count()
+                        >= precision_tracer.get_max_requests()
+                    ):
+                        precision_tracer.stop_trace()
                 self.tree_cache.cache_finished_req(req)
 
             if req.return_logprob:

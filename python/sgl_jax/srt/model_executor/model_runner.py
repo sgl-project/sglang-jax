@@ -407,31 +407,8 @@ class ModelRunner:
         logits_metadata: LogitsMetadata,
     ) -> Tuple[LogitsProcessorOutput, int]:
         self.forward_pass_id += 1
-        # Set request IDs for tracing
-
-        if (
-            hasattr(forward_batch, "trace_request_ids")
-            and forward_batch.trace_request_ids
-            and precision_tracer._trace_active
-        ):
-            # Start tracing for each request in the batch
-            request_objects = getattr(forward_batch, "trace_request_objects", None)
-            for i, trace_request_id in enumerate(forward_batch.trace_request_ids):
-                req_obj = (
-                    request_objects[i]
-                    if request_objects and i < len(request_objects)
-                    else None
-                )
-                if trace_request_id not in precision_tracer._request_traces:
-                    precision_tracer.start_request_trace(trace_request_id, req_obj)
-
-            # Set current request ID context (use first request for simplicity)
-            precision_tracer._current_request_id = (
-                forward_batch.trace_request_ids[0]
-                if forward_batch.trace_request_ids
-                else None
-            )
-
+        precision_tracer.start_batch_trace(forward_batch.bid)
+        precision_tracer.set_current_forward_pass_id(self.forward_pass_id)
         return self._forward_raw(forward_batch, logits_metadata)
 
     def _forward_raw(

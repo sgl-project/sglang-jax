@@ -236,10 +236,20 @@ class QWen3DecoderLayer(nnx.Module):
             forward_batch=forward_batch,
         )
 
+        layer_callback_flag = []
+        attn_callback_flag = precision_tracer.jit_pure_callback_record(
+            hidden_states, "self_attn_output", "SELF_ATTN", self.layer_id
+        )
+        layer_callback_flag.append(attn_callback_flag)
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         hidden_states = self.mlp(hidden_states)
 
-        return hidden_states, residual, k, v
+        mlp_callback_flag = precision_tracer.jit_pure_callback_record(
+            hidden_states, "mlp_output", "MLP", self.layer_id
+        )
+        layer_callback_flag.append(mlp_callback_flag)
+
+        return hidden_states, residual, k, v, layer_callback_flag
 
 
 class QWen3Model(nnx.Module):
@@ -280,29 +290,22 @@ class QWen3Model(nnx.Module):
         hidden_states = self.embed_tokens(input_ids)
         layers_k = []
         layers_v = []
+        layers_callback_flag = []
         for layer in self.layers:
-            hidden_states, residual, k, v = layer(
+            hidden_states, residual, k, v, callback_flag = layer(
                 positions, hidden_states, forward_batch, residual
             )
             layers_k.append(k)
             layers_v.append(v)
+            layers_callback_flag.extend(callback_flag)
 
         hidden_states, _ = self.norm(hidden_states, residual)
 
-        # Conditional precision tracing - only use jax.pure_callback when tracer is enabled
-        # This avoids performance impact from jax.pure_callback when precision tracing is disabled
-        if precision_tracer._enable_precision_tracer:
-
-            def transformer_trace_callback(tensor):
-                precision_tracer.record(tensor, "transformer_output", "TRANSFORMER")
-                return True
-
-            transformer_callback_flag = jax.pure_callback(
-                transformer_trace_callback, jnp.int32(0), hidden_states
-            )
-            return hidden_states, layers_k, layers_v, transformer_callback_flag
-        else:
-            return hidden_states, layers_k, layers_v, jnp.bool_(True)
+        callback_flag = precision_tracer.jit_pure_callback_record(
+            hidden_states, "transformer_output", "TRANSFORMER"
+        )
+        layers_callback_flag.append(callback_flag)
+        return hidden_states, layers_k, layers_v, layers_callback_flag
 
 
 class Qwen3ForCausalLM(nnx.Module):
@@ -358,9 +361,6 @@ class Qwen3ForCausalLM(nnx.Module):
     def _create_layer_mappings(self, layer_idx: int) -> dict:
         prefix = f"model.layers.{layer_idx}"
         target_prefix = f"transformer.layers.{layer_idx}"
-
-        num_heads = self.config.hf_config.num_attention_heads
-        hidden_size = self.config.hf_config.hidden_size
 
         mappings = {
             f"{prefix}.input_layernorm.weight": WeightMapping(
@@ -476,11 +476,11 @@ class Qwen3ForCausalLM(nnx.Module):
         positions: jax.Array,
         forward_batch: ForwardBatch,
     ):
-        hidden_states, layers_k, layers_v, callback_flag = self.transformer(
+        hidden_states, layers_k, layers_v, layers_callback_flag = self.transformer(
             input_ids, positions, forward_batch
         )
 
-        return hidden_states, layers_k, layers_v, callback_flag
+        return hidden_states, layers_k, layers_v, layers_callback_flag
 
 
 EntryClass = Qwen3ForCausalLM

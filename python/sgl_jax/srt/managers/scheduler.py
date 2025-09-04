@@ -617,6 +617,9 @@ class Scheduler(
 
                 # Update precision_tracer state in this process
                 if "trace_active" in tracer_config:
+                    logger.info(
+                        f"[SCHEDULER] check trace_active: {precision_tracer.get_trace_active()}"
+                    )
                     precision_tracer._trace_active = tracer_config["trace_active"]
                     logger.info(
                         f"[SCHEDULER] Updated trace_active to: {precision_tracer._trace_active}"
