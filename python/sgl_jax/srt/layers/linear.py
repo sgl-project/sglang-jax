@@ -67,9 +67,11 @@ class LinearBase(nnx.Module):
         jax.debug.visualize_array_sharding(self.weight.value)
 
         x = jnp.arange(4 * 4096, dtype=jnp.bfloat16).reshape(4, 4096)
-        jax.debug.visualize_array_sharding(x)
+        y = jnp.arange(4096 * 16, dtype=jnp.bfloat16).reshape(4096, 16)
 
-        output = jnp.dot(x, self.weight.value)
+        output = jnp.dot(x, y)
+        jax.debug.visualize_array_sharding(output)
+
         logger.info("linear input 2 ")
         if bias is not None:
             output = output + bias.value
