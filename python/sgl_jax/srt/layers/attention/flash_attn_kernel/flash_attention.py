@@ -294,7 +294,13 @@ def ref_ragged_paged_attention(
             v = v.astype(q.dtype)
         k = jnp.repeat(k, num_query_per_kv, axis=1)
         v = jnp.repeat(v, num_query_per_kv, axis=1)
-        attn = jnp.einsum("qhd,khd->hqk", q, k, preferred_element_type=jnp.float32)
+        attn = jnp.einsum(
+            "qhd,khd->hqk",
+            q,
+            k,
+            preferred_element_type=jnp.float32,
+            precision=lax.Precision.HIGHEST,
+        )
         attn *= sm_scale
         q_span = (kv_len - q_len) + jax.lax.broadcasted_iota(jnp.int32, attn.shape, 1)
         kv_span = jax.lax.broadcasted_iota(jnp.int32, attn.shape, 2)
@@ -305,7 +311,9 @@ def ref_ragged_paged_attention(
             attn = soft_cap * jnp.tanh(attn / soft_cap)
         attn += jnp.where(mask, mask_value, 0.0)
         attn = jax.nn.softmax(attn, axis=-1).astype(v.dtype)
-        out = jnp.einsum("hqk,khd->qhd", attn, v).astype(queries.dtype)
+        out = jnp.einsum(
+            "hqk,khd->qhd", attn, v, precision=lax.Precision.HIGHEST
+        ).astype(queries.dtype)
         outputs.append(out)
 
     return jnp.concatenate(outputs, axis=0)
@@ -517,7 +525,13 @@ def ragged_paged_attention_kernel(
             v = jnp.where(kv_mask, v.astype(jnp.float32), 0).astype(v.dtype)
 
             qk = (
-                jnp.einsum("nd,md->nm", q, k, preferred_element_type=jnp.float32)
+                jnp.einsum(
+                    "nd,md->nm",
+                    q,
+                    k,
+                    preferred_element_type=jnp.float32,
+                    precision=lax.Precision.HIGHEST,
+                )
                 * sm_scale
             )
             store_start = jnp.maximum(q_start - q_len_start, 0)
