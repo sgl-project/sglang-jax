@@ -174,6 +174,7 @@ class QWenAttention(nnx.Module):
         logger.info("qwen attention input 3 ")
         v, _ = self.v_proj(hidden_states)
         logger.info("qwen attention input 4 ")
+        time.sleep(100)
         q, k = self.rotary_emb(positions, q, k)
         logger.info("qwen attention input 5 ")
         attn_output, k, v = self.attn(q, k, v, forward_batch=forward_batch)
