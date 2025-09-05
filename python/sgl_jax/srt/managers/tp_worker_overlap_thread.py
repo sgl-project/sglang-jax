@@ -63,6 +63,7 @@ class ModelWorkerClient:
         self.future_token_ids_map = jnp.zeros(
             (self.max_running_requests * 5,), dtype=jnp.int32
         )
+        self.mesh = mesh
         sharding = NamedSharding(mesh, PartitionSpec(None))
         self.future_token_ids_map = jax.device_put(self.future_token_ids_map, sharding)
         # Launch threads
@@ -202,7 +203,7 @@ class ModelWorkerClient:
         )
 
         forward_metadata = self.worker.model_runner.attn_backend.get_forward_metadata(
-            model_worker_batch
+            model_worker_batch, self.mesh
         )
 
         # Push a new batch to the queue (JAX handles synchronization automatically)
@@ -247,7 +248,6 @@ class ModelWorkerClient:
                 self.worker.mesh, jnp.arange(0, token_padding, dtype=jnp.int32)
             )
             resolve_future_token_ids(input_ids, self.future_token_ids_map)
-        logger.info(f"[ModelWorkerClient] precompile {token_paddings} done")
         for bs_padding in bs_paddings:
             input_ids = device_array(
                 self.worker.mesh, jnp.arange(0, bs_padding, dtype=jnp.int32)
@@ -255,7 +255,6 @@ class ModelWorkerClient:
             set_future_token_ids(
                 self.future_token_ids_map, self.future_token_ids_ct, input_ids
             )
-        logger.info(f"[ModelWorkerClient] precompile {bs_paddings} done")
         end_time = time.perf_counter()
         logger.info(
             f"[ModelWorkerClient] Completes resolve_future_token_ids precompile. Time cost: {end_time - start_time} seconds"

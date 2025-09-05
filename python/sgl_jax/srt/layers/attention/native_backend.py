@@ -1,9 +1,8 @@
-from functools import partial
-from typing import TYPE_CHECKING, Optional, Tuple
+from typing import Tuple
 
 import jax
 import jax.numpy as jnp
-from flax import nnx
+from jax.sharding import Mesh
 from jax.tree_util import register_pytree_node_class
 
 from sgl_jax.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -39,7 +38,7 @@ class NativeAttention(AttentionBackend):
             num_attn_heads=aux_data["num_heads"], num_kv_heads=aux_data["num_kv_heads"]
         )
 
-    def get_forward_metadata(self, batch: ModelWorkerBatch):
+    def get_forward_metadata(self, batch: ModelWorkerBatch, mesh: Mesh):
         """Init the metadata for a forward pass and return it."""
         return None
 

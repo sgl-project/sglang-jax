@@ -4,8 +4,8 @@ from abc import abstractmethod
 from typing import TYPE_CHECKING
 
 import jax
-import jax.numpy as jnp
 from flax import nnx
+from jax.sharding import Mesh
 
 if TYPE_CHECKING:
     from sgl_jax.srt.layers.radix_attention import RadixAttention
@@ -17,7 +17,7 @@ class AttentionBackend(nnx.Module):
     """The base class of attention backends"""
 
     @abstractmethod
-    def get_forward_metadata(self, batch: ModelWorkerBatch):
+    def get_forward_metadata(self, batch: ModelWorkerBatch, mesh: Mesh):
         """Init the metadata for a forward pass and return it"""
         raise NotImplementedError()
 

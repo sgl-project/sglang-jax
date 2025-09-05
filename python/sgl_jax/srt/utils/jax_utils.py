@@ -113,5 +113,5 @@ def get_available_device_memory(device, distributed=False, empty_cache=True):
 
 def device_array(mesh, *data, sharding=None, **kwargs) -> jax.Array:
     if sharding is None:
-        sharding = NamedSharding(mesh, PartitionSpec(None))
+        sharding = NamedSharding(mesh, PartitionSpec())
     return jax.device_put(*data, device=sharding, **kwargs)

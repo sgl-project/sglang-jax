@@ -104,15 +104,14 @@ class JAXModelLoader(BaseModelLoader):
         rng_key = self.rng.default.key.value
         model.load_weights(rng_key)
 
-        @nnx.jit(donate_argnames=("model",))
-        def create_jit_model(model):
-            state = nnx.state(model)
-            nnx.update(model, state)
-            return model
-
+        # Apply sharding constraints after loading
         with self.mesh:
-            jit_model = create_jit_model(model)
-        return jit_model
+            state = nnx.state(model)
+            pspecs = nnx.get_partition_spec(state)
+            sharded_state = jax.lax.with_sharding_constraint(state, pspecs)
+            nnx.update(model, sharded_state)
+
+        return model
 
     def _maybe_download_from_modelscope(
         self, model: str, revision: Optional[str]

@@ -84,7 +84,7 @@ class FlashAttention(AttentionBackend):
         self.kv_partition_axis = kv_partition_axis
         self.forward_metadata = FlashAttentionMetadata()
 
-    def get_forward_metadata(self, batch: ModelWorkerBatch):
+    def get_forward_metadata(self, batch: ModelWorkerBatch, mesh: Mesh):
         """Return the metadata for a forward pass."""
         metadata = FlashAttentionMetadata()
 
@@ -124,11 +124,12 @@ class FlashAttention(AttentionBackend):
         num_seqs = np.sum(batch.seq_lens > 0, dtype=np.int32).reshape(
             1,
         )
-        metadata.num_seqs = jnp.array(num_seqs)
-        metadata.cu_q_lens = jnp.array(cu_q_lens)
-        metadata.cu_kv_lens = jnp.array(cu_kv_lens)
-        metadata.page_indices = jnp.array(page_indices)
-        metadata.seq_lens = jnp.array(seq_lens)
+
+        metadata.num_seqs = device_array(mesh, num_seqs)
+        metadata.cu_q_lens = device_array(mesh, cu_q_lens)
+        metadata.cu_kv_lens = device_array(mesh, cu_kv_lens)
+        metadata.page_indices = device_array(mesh, page_indices)
+        metadata.seq_lens = device_array(mesh, seq_lens)
         return metadata
 
     def tree_flatten(self):

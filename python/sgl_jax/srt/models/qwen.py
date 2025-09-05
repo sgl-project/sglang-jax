@@ -287,17 +287,17 @@ class QWenModel(nnx.Module):
 
     def __call__(
         self,
-        input_ids: jax.Array,
-        positions: jax.Array,
         forward_batch: ForwardBatch,
     ):
-        hidden_states = self.embed_tokens(input_ids)
+        hidden_states = self.embed_tokens(forward_batch.input_ids)
 
         layers_k = []
         layers_v = []
 
         for layer in self.h:
-            hidden_states, k, v = layer(positions, hidden_states, forward_batch)
+            hidden_states, k, v = layer(
+                forward_batch.positions, hidden_states, forward_batch
+            )
             layers_k.append(k)
             layers_v.append(v)
 
@@ -319,7 +319,7 @@ class QWenLMHeadModel(nnx.Module):
         self.transformer = QWenModel(config.hf_config, dtype=self.dtype, rngs=rngs)
         vocab_size = ((config.hf_config.vocab_size + 63) // 64) * 64
         self.lm_head = ParallelLMHead(vocab_size, config.hidden_size, rngs=rngs)
-        self.logits_processor = LogitsProcessor(vocab_size)
+        self.logits_processor = LogitsProcessor(vocab_size, self.lm_head, self.mesh)
 
     def load_weights(self, rng_key: jax.Array):
         self.rng = nnx.Rngs(rng_key)
@@ -411,25 +411,14 @@ class QWenLMHeadModel(nnx.Module):
             ),
         }
 
-    def compute_logits(
-        self,
-        hidden_states: jax.Array,
-        logits_metadata: LogitsMetadata,
-    ):
-        return self.logits_processor(
-            hidden_states, self.lm_head, logits_metadata, self.mesh
-        )
-
     def __call__(
         self,
-        input_ids: jax.Array,
-        positions: jax.Array,
         forward_batch: ForwardBatch,
+        logits_metadata: LogitsMetadata,
     ):
-        hidden_states, layers_k, layers_v = self.transformer(
-            input_ids, positions, forward_batch
-        )
-        return hidden_states, layers_k, layers_v, True
+        hidden_states, layers_k, layers_v = self.transformer(forward_batch)
+        output = self.logits_processor(hidden_states, logits_metadata)
+        return output, layers_k, layers_v, True
 
 
 EntryClass = QWenLMHeadModel

@@ -9,9 +9,9 @@
 
 ### JIT Forward
 
-The wrapped forward function is `jitted_run_model`, `jitted_compute_logits` and `jitted_sampler`, which are used by prefill and decode. The input parameter `forward_batch`, `logits_metadata` and `sampling_metadata` have to be registered as PyTrees. At the same time, the subclasses in it are required to register too. Besides, we use `nnx.split` and `nnx.merge` on model to keep satisfy the `jit` requirements.
+The wrapped forward function is `jitted_run_model` and `jitted_sampler`, which are used by prefill and decode. The input parameter `forward_batch`, `logits_metadata` and `sampling_metadata` have to be registered as PyTrees. At the same time, the subclasses in it are required to register too. Besides, we use `nnx.split` and `nnx.merge` on model to keep satisfy the `jit` requirements.
 
-Note: `return_logprob` is not supported in `jitted_compute_logits` and `jitted_sampler`, this feature with jit may be supported in the future.
+Note: `return_logprob` is not supported in `jitted_sampler`, this feature with jit may be supported in the future.
 
 ### Precompile and padding
 
@@ -124,11 +124,11 @@ def initialize_jit(self):
         model = nnx.merge(graphdef, state)
         return model(*args)
 
-    self.jitted_run_model = partial(jitted_run_model, self.graphdef)
+    self.jitted_run_model = partial(jitted_run_model, self.graphdef, self.state)
 
 # forward
 result, layers_k, layers_v = self.jitted_run_model(
-    self.state, input_ids, positions, forward_batch
+    forward_batch, logits_metadata
 )
 ```
 
