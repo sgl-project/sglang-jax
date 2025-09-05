@@ -248,12 +248,12 @@ class QWenBlock(nnx.Module):
         hidden_states = jax.device_put(
             hidden_states, NamedSharding(self.mesh, P("data", None))
         )
+        jax.block_until_ready(hidden_states)
         for i in range(len(hidden_states.addressable_shards)):
             jax.debug.print(
-                f"hidden_states data {i} {hidden_states.addressable_shards[i].data}"
-            )
-            jax.debug.print(
-                f"hidden_states data shape {i} {hidden_states.addressable_shards[i].data.shape}"
+                "hidden_states data {} shard_shape {}",
+                i,
+                hidden_states.addressable_shards[i].data.shape,
             )
         attn_output, k, v = self.attn(
             positions=positions,
