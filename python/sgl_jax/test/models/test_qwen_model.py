@@ -27,11 +27,7 @@ class TestQwenModel(unittest.TestCase):
     def setUp(self):
         # 依据传入参数，动态选择 mesh 拓扑（默认与原逻辑一致）
         # 当多节点运行时，dcn_parallelism 使用 (nnodes, 1, 1, 1)
-        nnodes = int(os.environ.get("NNODES", 1))
-        dist_init_addr = os.environ.get("DIST_INIT_ADDR", "localhost:10000")
-        node_rank = int(os.environ.get("NODE_RANK", 0))
-        jax.distributed.initialize(dist_init_addr, nnodes, node_rank)
-        print("initialize jax distributed")
+
         self.mesh = create_device_mesh(
             ici_parallelism=[1, 16, 1, 1], dcn_parallelism=[1, 1, 1, 1]
         )
@@ -591,4 +587,9 @@ class TestQwenModel(unittest.TestCase):
 
 
 if __name__ == "__main__":
+    nnodes = int(os.environ.get("NNODES", 1))
+    dist_init_addr = os.environ.get("DIST_INIT_ADDR", "localhost:10000")
+    node_rank = int(os.environ.get("NODE_RANK", 0))
+    jax.distributed.initialize(dist_init_addr, nnodes, node_rank)
+    print("initialize jax distributed")
     unittest.main()
