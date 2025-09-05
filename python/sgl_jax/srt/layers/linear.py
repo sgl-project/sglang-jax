@@ -58,6 +58,7 @@ class LinearBase(nnx.Module):
     def __call__(self, x: jax.Array) -> Tuple[jax.Array, Optional[jax.Array]]:
         """Forward pass of the linear layer."""
         bias = self.bias if not self.skip_bias_add else None
+        jax.debug.visualize_array_sharding(self.weight.value)
         # Access the underlying JAX array using .value property
         output = jnp.dot(x, self.weight.value)
         if bias is not None:
