@@ -549,7 +549,12 @@ def ragged_paged_attention_kernel(
             qk += jnp.where(causal_mask, mask_value, 0.0)
             m_curr = jnp.max(qk, axis=1, keepdims=True)
             s_curr = jnp.exp(qk - m_curr)
-            qkv = jnp.dot(s_curr, v, preferred_element_type=jnp.float32)
+            qkv = jnp.dot(
+                s_curr,
+                v,
+                preferred_element_type=jnp.float32,
+                precision=lax.Precision.HIGHEST,
+            )
             lm_store_shape = head_m_ref.shape
             m_curr = jnp.broadcast_to(m_curr, lm_store_shape)
             l_curr = jnp.broadcast_to(s_curr.sum(axis=1, keepdims=True), lm_store_shape)
