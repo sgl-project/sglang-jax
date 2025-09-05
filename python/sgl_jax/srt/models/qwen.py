@@ -245,6 +245,7 @@ class QWenBlock(nnx.Module):
             f"rmsnorm_layer_id_{self.layer_id}",
         )
         jax.debug.visualize_array_sharding(hidden_states)
+        jax.debug.print(hidden_states[0])
         jax.debug.print("mock Linear Base weight start*****************************")
         mock_weight = jnp.arange(4096 * 4096).reshape(4096, 4096)
         mock_weight = jax.device_put(
