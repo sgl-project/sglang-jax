@@ -29,7 +29,7 @@ class TestQwenModel(unittest.TestCase):
         # 当多节点运行时，dcn_parallelism 使用 (nnodes, 1, 1, 1)
 
         self.mesh = create_device_mesh(
-            ici_parallelism=[1, 16, 1, 1], dcn_parallelism=[1, 1, 1, 1]
+            ici_parallelism=[4, 4, 1, 1], dcn_parallelism=[1, 1, 1, 1]
         )
         # Model path for local model and tokenizer
         self.test_model_path = os.environ.get(
