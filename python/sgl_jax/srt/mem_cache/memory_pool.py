@@ -444,15 +444,14 @@ def _set_kv_buffer(
     k_cache: jax.Array,
     v_cache: jax.Array,
     """
-    k_cache, v_cache = update_kv_cache(
-        k,
-        v,
-        loc,
-        k_cache,
-        v_cache,
-        page_size=page_size,
-        kv_partition_axis=kv_partition_axis,
-    )
+    k_cache_ref = jax.array_ref(k_cache)
+    v_cache_ref = jax.array_ref(v_cache)
+
+    k_cache_ref.at[loc].set(k)
+    v_cache_ref.at[loc].set(v)
+
+    k_cache = jax.ref.freeze(k_cache_ref)
+    v_cache = jax.ref.freeze(v_cache_ref)
 
     return k_cache, v_cache
 
@@ -489,101 +488,6 @@ def update_kv_cache(
         page_size=page_size,
         kv_partition_axis=kv_partition_axis,
     )
-
-
-def _optimize_contiguous_updates(
-    loc: jax.Array,  # [total_tokens], -1 for padding
-    page_size: int,
-) -> tuple[jax.Array, jax.Array, jax.Array, int]:
-    """
-    Optimize KV cache updates by grouping contiguous locations into page_size chunks.
-
-    Args:
-        loc: Location index array [total_tokens], -1 for padding tokens
-        page_size: Page size (must be > 1)
-
-    Returns:
-        kv_cache_locs: Start locations in cache for each slice
-        new_kv_locs: Start locations in new_kv for each slice
-        slice_lens: Length of each slice (0 means skip this position)
-        num_slices: Total number of slices (equals total_tokens for array size consistency)
-    """
-    total_tokens = loc.shape[0]
-    valid_mask = loc != -1
-    indices = jnp.arange(total_tokens)
-
-    # Detect contiguous segments
-    is_continuous_to_next = valid_mask[:-1] & valid_mask[1:] & (loc[1:] == loc[:-1] + 1)
-    is_continuous_to_next = jnp.concatenate([is_continuous_to_next, jnp.array([False])])
-
-    # Mark segment starts
-    is_segment_start = valid_mask & jnp.concatenate(
-        [
-            jnp.array([True]),
-            ~is_continuous_to_next[:-1],
-        ]
-    )
-
-    # Simple approach: compute remaining tokens from each position by looking ahead
-    # For each position i, count how many contiguous valid tokens exist starting from i
-    remaining_in_segment = jnp.zeros(total_tokens, dtype=jnp.int32)
-
-    # Use scan to compute remaining tokens efficiently
-    def compute_remaining(carry, x):
-        i, valid, is_cont_next = x
-        next_remaining = carry
-
-        # Current remaining = 1 (for self) + next_remaining (if continuous)
-        current_remaining = jnp.where(
-            valid, 1 + jnp.where(is_cont_next, next_remaining, 0), 0
-        )
-        return current_remaining, current_remaining
-
-    # Scan backwards to compute remaining tokens
-    # We manually reverse inputs and use reverse=False, then reverse the output
-    _, remaining_in_segment = jax.lax.scan(
-        compute_remaining,
-        0,  # initial carry
-        (indices[::-1], valid_mask[::-1], is_continuous_to_next[::-1]),
-        reverse=False,
-    )
-    remaining_in_segment = remaining_in_segment[::-1]
-
-    # Now generate slices
-    def compute_slice_info(carry, x):
-        i, valid, is_seg_start, remaining = x
-        tokens_since_segment_start = carry
-
-        # Reset counter at segment start
-        new_tokens_since_start = jnp.where(
-            valid & is_seg_start,
-            0,
-            jnp.where(
-                valid, tokens_since_segment_start + 1, tokens_since_segment_start
-            ),
-        )
-
-        # Start slice at segment start or every page_size tokens within segment
-        is_slice_start = valid & (
-            is_seg_start | (new_tokens_since_start % page_size == 0)
-        )
-
-        # Slice length is min(page_size, remaining tokens in segment)
-        slice_len = jnp.where(is_slice_start, jnp.minimum(page_size, remaining), 0)
-
-        return new_tokens_since_start, (is_slice_start, slice_len)
-
-    _, (slice_starts, slice_lengths) = jax.lax.scan(
-        compute_slice_info,
-        -1,  # tokens_since_segment_start
-        (indices, valid_mask, is_segment_start, remaining_in_segment),
-    )
-
-    kv_cache_locs = jnp.where(slice_starts, loc, 0)
-    new_kv_locs = jnp.where(slice_starts, indices, 0)
-    slice_lens = slice_lengths
-
-    return kv_cache_locs, new_kv_locs, slice_lens, total_tokens
 
 
 def kv_cache_update_kernel(
