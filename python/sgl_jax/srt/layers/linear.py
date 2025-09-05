@@ -1,11 +1,8 @@
-import logging
 from typing import Any, Callable, Iterable, Optional, Sequence, Tuple, Union
 
 import jax
 from flax import nnx
 from jax import numpy as jnp
-
-logger = logging.getLogger(__name__)
 
 
 def _canonicalize_tuple(x):
@@ -62,17 +59,8 @@ class LinearBase(nnx.Module):
         """Forward pass of the linear layer."""
         bias = self.bias if not self.skip_bias_add else None
         # Access the underlying JAX array using .value property
-        logger.info("linear input 1 ")
-        jax.debug.visualize_array_sharding(self.weight.value)
-
-        # output = jnp.dot(
-        #     jnp.arange(32 * 4096, dtype=jnp.bfloat16).reshape(32, 4096),
-        #     self.weight.value,
-        # )
-
-        logger.info("linear input 2 ")
-
-        # if bias is not None:
-        #     output = output + bias.value
+        output = jnp.dot(x, self.weight.value)
+        if bias is not None:
+            output = output + bias.value
         output_bias = self.bias if self.skip_bias_add else None
-        return jnp.arange(32 * 4096, dtype=jnp.bfloat16).reshape(32, 4096), output_bias
+        return output, output_bias
