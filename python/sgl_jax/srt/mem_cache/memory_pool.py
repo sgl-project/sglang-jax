@@ -819,7 +819,10 @@ def update_kv_cache_vectorized(
     num_slices = total_tokens
 
     # num_slices_per_block = get_num_slices_per_block(k, k_cache)
-    num_slices_per_block = 4
+    if page_size == 1:
+        num_slices_per_block = 4
+    else:
+        num_slices_per_block = page_size
 
     slot_mapping = get_slot_mapping(
         num_slices_per_block=num_slices_per_block,
