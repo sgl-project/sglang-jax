@@ -248,7 +248,7 @@ class QWenBlock(nnx.Module):
         jax.debug.print("mock Linear Base weight start*****************************")
         mock_weight = jnp.arange(4096 * 4096).reshape(4096, 4096)
         mock_weight = jax.device_put(
-            mock_weight, NamedSharding(self.mesh, P(None, "tensor"))
+            mock_weight, NamedSharding(self.mesh, P("tensor", None))
         )
         jax.block_until_ready(mock_weight)
         jax.debug.visualize_array_sharding(mock_weight)
