@@ -46,6 +46,9 @@ class LinearBase(nnx.Module):
                 rngs.params(), (input_size, output_size), params_dtype
             )
         )
+        jax.debug.print("LinearBase weight start*****************************")
+        jax.debug.visualize_array_sharding(self.weight.value)
+        jax.debug.print("LinearBase weight end*****************************")
         if use_bias:
             self.bias = nnx.Param(
                 nnx.with_partitioning(
