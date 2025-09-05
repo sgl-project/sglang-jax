@@ -168,10 +168,6 @@ class QWenAttention(nnx.Module):
         layer_id: int,
     ) -> tuple[jax.Array, jax.Array, jax.Array]:
         logger.info("qwen attention input 1 ")
-        hidden_states = jnp.arange(32 * 4096).reshape(32, 4096)
-        hidden_states = jax.device_put(
-            hidden_states, NamedSharding(forward_batch.mesh, P("data", None))
-        )
         q, _ = self.q_proj(hidden_states)
         logger.info("qwen attention input 2 ")
         # k, _ = self.k_proj(hidden_states)
@@ -248,7 +244,10 @@ class QWenBlock(nnx.Module):
             f"RMSNorm_pre_attn_output",
             f"rmsnorm_layer_id_{self.layer_id}",
         )
-
+        hidden_states = jnp.arange(32 * 4096).reshape(32, 4096)
+        hidden_states = jax.device_put(
+            hidden_states, NamedSharding(self.mesh, P("data", None))
+        )
         attn_output, k, v = self.attn(
             positions=positions,
             hidden_states=hidden_states,
