@@ -298,7 +298,7 @@ def ref_ragged_paged_attention(
             "qhd,khd->hqk",
             q,
             k,
-            preferred_element_type=jnp.float32,
+            # preferred_element_type=jnp.float32,
             precision=lax.Precision.HIGHEST,
         )
         attn *= sm_scale
@@ -529,7 +529,7 @@ def ragged_paged_attention_kernel(
                     "nd,md->nm",
                     q,
                     k,
-                    preferred_element_type=jnp.float32,
+                    # preferred_element_type=jnp.float32,
                     precision=lax.Precision.HIGHEST,
                 )
                 * sm_scale
@@ -566,7 +566,7 @@ def ragged_paged_attention_kernel(
             qkv = jnp.dot(
                 s_curr,
                 v,
-                preferred_element_type=jnp.float32,
+                # preferred_element_type=jnp.float32,
                 precision=lax.Precision.HIGHEST,
             )
             lm_store_shape = head_m_ref.shape
