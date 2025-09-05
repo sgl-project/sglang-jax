@@ -254,6 +254,13 @@ class QWenBlock(nnx.Module):
             forward_batch=forward_batch,
             layer_id=self.layer_id,
         )
+        for i in range(len(hidden_states.addressable_shards)):
+            jax.debug.print(
+                f"hidden_states data {i} {hidden_states.addressable_shards[i].data}"
+            )
+            jax.debug.print(
+                f"hidden_states data shape {i} {hidden_states.addressable_shards[i].data.shape}"
+            )
         logger.info(f"after attn hiddenstate shape {hidden_states.shape}")
         hidden_states = hidden_states
 
