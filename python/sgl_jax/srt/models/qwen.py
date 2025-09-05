@@ -244,7 +244,7 @@ class QWenBlock(nnx.Module):
             f"RMSNorm_pre_attn_output",
             f"rmsnorm_layer_id_{self.layer_id}",
         )
-        hidden_states = jnp.arange(32 * 4096).reshape(32, 4096)
+        # hidden_states = jnp.arange(32 * 4096).reshape(32, 4096)
         hidden_states = jax.device_put(
             hidden_states, NamedSharding(self.mesh, P("data", None))
         )
