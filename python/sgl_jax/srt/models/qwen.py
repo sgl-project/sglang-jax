@@ -168,7 +168,7 @@ class QWenAttention(nnx.Module):
         layer_id: int,
     ) -> tuple[jax.Array, jax.Array, jax.Array]:
         logger.info("qwen attention input 1 ")
-        # q, _ = self.q_proj(hidden_states)
+        q, _ = self.q_proj(hidden_states)
         # logger.info("qwen attention input 2 ")
         # k, _ = self.k_proj(hidden_states)
         # logger.info("qwen attention input 3 ")
