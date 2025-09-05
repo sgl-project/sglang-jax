@@ -88,8 +88,6 @@ class ModelRunner:
             rngs=rngs,
             mesh=self.mesh,
         )
-        # Model-specific adjustment
-        self.model_specific_adjustment()
 
         # Initialize precision tracer enable state
         precision_tracer.set_enable_precision_tracer(
@@ -117,30 +115,24 @@ class ModelRunner:
         self.init_attention_backend()
 
     def initialize_jit(self):
-        self.model_graphdef, self.model_state = nnx.split(self.model)
-        self.sampler_graphdef, self.sampler_state = nnx.split(self.sampler)
+        # Split model to avoid capturing large constants
+        model_def, model_state = nnx.split(self.model)
+        sampler_def, sampler_state = nnx.split(self.sampler)
 
-        @partial(jax.jit, donate_argnames=["forward_batch"])
-        def jitted_run_model(graphdef, state, input_ids, positions, forward_batch):
-            model = nnx.merge(graphdef, state)
-            return model(input_ids, positions, forward_batch)
+        @partial(
+            jax.jit, donate_argnames=["forward_batch"]
+        )  # donate forward_batch (index 2)
+        def jitted_run_model(model_def, model_state, forward_batch, logits_metadata):
+            model = nnx.merge(model_def, model_state)
+            return model(forward_batch, logits_metadata)
 
-        @partial(jax.jit)
-        def jitted_compute_logits(graphdef, state, *args):
-            model = nnx.merge(graphdef, state)
-            return model.compute_logits(*args)
-
-        @partial(jax.jit)
-        def jitted_sampler(graphdef, state, *args):
-            sampler = nnx.merge(graphdef, state)
+        @jax.jit
+        def jitted_sampler(sampler_def, sampler_state, *args):
+            sampler = nnx.merge(sampler_def, sampler_state)
             return sampler(*args)
 
-        self.jitted_run_model = partial(jitted_run_model, self.model_graphdef)
-        self.jitted_compute_logits = partial(jitted_compute_logits, self.model_graphdef)
-        self.jitted_sampler = partial(jitted_sampler, self.sampler_graphdef)
-
-    def model_specific_adjustment(self):
-        pass
+        self.jitted_run_model = partial(jitted_run_model, model_def, model_state)
+        self.jitted_sampler = partial(jitted_sampler, sampler_def, sampler_state)
 
     def get_available_device_memory(self):
         min_available_device_memory = get_available_device_memory(
@@ -170,6 +162,7 @@ class ModelRunner:
         self.model = self.model_loader.load_model(
             model_config=self.model_config,
         )
+
         self.dtype = self.model_config.dtype
         self.start_layer = getattr(self.model, "start_layer", 0)
         self.end_layer = getattr(
@@ -354,8 +347,6 @@ class ModelRunner:
 
     def _forward(
         self,
-        input_ids: jax.Array,
-        positions: jax.Array,
         forward_batch: ForwardBatch,
         logits_metadata: LogitsMetadata,
     ):
@@ -363,25 +354,13 @@ class ModelRunner:
         import jax._src.test_util as jtu
 
         with jtu.count_pjit_cpp_cache_miss() as count:
-            hidden_states, layers_k, layers_v, _ = self.jitted_run_model(
-                self.model_state, input_ids, positions, forward_batch
+            output, layers_k, layers_v, _ = self.jitted_run_model(
+                forward_batch, logits_metadata
             )
-            forward_cache_miss = count()
-
-            if not logits_metadata.extend_return_logprob:
-                result = self.jitted_compute_logits(
-                    self.model_state, hidden_states, logits_metadata
-                )
-                compute_logits_cache_miss = count()
-            else:
-                result = self.model.compute_logits(hidden_states, logits_metadata)
-                compute_logits_cache_miss = 0
-
-            cache_miss_count = forward_cache_miss + compute_logits_cache_miss
-
+            cache_miss_count = count()
         self._set_kv_cache_after_forward(layers_k, layers_v, forward_batch)
 
-        return result, cache_miss_count
+        return output, cache_miss_count
 
     def _set_kv_cache_after_forward(
         self, layers_k, layers_v, forward_batch: ForwardBatch
@@ -394,8 +373,6 @@ class ModelRunner:
 
     def forward_idle(
         self,
-        input_ids: jax.Array,
-        positions: jax.Array,
         forward_batch: ForwardBatch,
         logits_metadata: LogitsMetadata,
     ) -> Tuple[LogitsProcessorOutput, int]:
@@ -424,14 +401,9 @@ class ModelRunner:
                 forward_batch.forward_mode.is_decode()
                 or forward_batch.forward_mode.is_extend()
             ):
-                ret = self._forward(
-                    forward_batch.input_ids,
-                    forward_batch.positions,
-                    forward_batch,
-                    logits_metadata,
-                )
+                ret = self._forward(forward_batch, logits_metadata)
             elif forward_batch.forward_mode.is_idle():
-                ret = self.forward_idle(forward_batch)
+                ret = self.forward_idle(forward_batch, logits_metadata)
             else:
                 raise ValueError(f"Invalid forward mode: {forward_batch.forward_mode}")
 
@@ -458,17 +430,10 @@ class ModelRunner:
         Returns:
             A list of next_token_ids
         """
-        # Sample the next tokens
-        if not sampling_metadata.return_logprob:
-            next_token_ids_device = self.jitted_sampler(
-                self.sampler_state, logits_output, sampling_metadata
-            )
-        else:
-            next_token_ids_device = self.sampler(
-                logits_output,
-                sampling_metadata,
-            )
-        return next_token_ids_device
+        return self.jitted_sampler(
+            logits_output,
+            sampling_metadata,
+        )
 
 
 class MockModelRunner(ModelRunner):

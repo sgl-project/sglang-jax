@@ -365,7 +365,7 @@ class ModelWorker:
         if forward_metadata is None:
             forward_metadata = (
                 self.worker.model_runner.attn_backend.get_forward_metadata(
-                    model_worker_batch
+                    model_worker_batch, self.mesh
                 )
             )
 

@@ -180,11 +180,7 @@ class Qwen3MLP(nnx.Module):
         a1, _ = self.gate_proj(hidden_states)
         a2, _ = self.up_proj(hidden_states)
         intermediate_parallel = a2 * self.act_fn(a1)
-        intermediate_parallel = jax.lax.with_sharding_constraint(
-            intermediate_parallel, PartitionSpec(None, "tensor")
-        )
         output, _ = self.down_proj(intermediate_parallel)
-
         return output
 
 
@@ -319,18 +315,16 @@ class QWen3Model(nnx.Module):
 
     def __call__(
         self,
-        input_ids: jax.Array,
-        positions: jax.Array,
         forward_batch: ForwardBatch,
     ):
         residual = None
-        hidden_states = self.embed_tokens(input_ids)
+        hidden_states = self.embed_tokens(forward_batch.input_ids)
         layers_k = []
         layers_v = []
         layers_callback_flag = []
         for layer in self.layers:
             hidden_states, residual, k, v, callback_flag = layer(
-                positions, hidden_states, forward_batch, residual
+                forward_batch.positions, hidden_states, forward_batch, residual
             )
             layers_k.append(k)
             layers_v.append(v)
@@ -359,7 +353,9 @@ class Qwen3ForCausalLM(nnx.Module):
         self.lm_head = ParallelLMHead(
             config.hf_config.vocab_size, config.hidden_size, rngs=rngs
         )
-        self.logits_processor = LogitsProcessor(config.hf_config.vocab_size)
+        self.logits_processor = LogitsProcessor(
+            config.hf_config.vocab_size, self.lm_head, self.mesh
+        )
 
     def load_weights(self, rng_key: jax.Array):
         self.rng = nnx.Rngs(rng_key)
@@ -500,26 +496,16 @@ class Qwen3ForCausalLM(nnx.Module):
 
         return mappings
 
-    def compute_logits(
-        self,
-        hidden_states: jax.Array,
-        logits_metadata: LogitsMetadata,
-    ):
-        return self.logits_processor(
-            hidden_states, self.lm_head, logits_metadata, self.mesh
-        )
-
     def __call__(
         self,
-        input_ids: jax.Array,
-        positions: jax.Array,
         forward_batch: ForwardBatch,
+        logits_metadata: LogitsMetadata,
     ):
         hidden_states, layers_k, layers_v, layers_callback_flag = self.transformer(
-            input_ids, positions, forward_batch
+            forward_batch
         )
-
-        return hidden_states, layers_k, layers_v, layers_callback_flag
+        output = self.logits_processor(hidden_states, logits_metadata)
+        return output, layers_k, layers_v, layers_callback_flag
 
 
 EntryClass = Qwen3ForCausalLM

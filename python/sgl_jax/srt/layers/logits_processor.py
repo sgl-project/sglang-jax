@@ -7,20 +7,12 @@ import jax.nn as nn
 import jax.numpy as jnp
 import numpy as np
 from flax import nnx
-from flax.nnx import Param
-from flax.nnx.nn import dtypes
-from flax.typing import PromoteDtypeFn
-from jax.sharding import Mesh, NamedSharding
-from jax.sharding import PartitionSpec as P
+from jax.sharding import Mesh
 from jax.tree_util import register_pytree_node_class
 
 from sgl_jax.srt.layers.embeddings import Embed
 from sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch
-from sgl_jax.srt.model_executor.forward_batch_info import (
-    CaptureHiddenMode,
-    ForwardBatch,
-    ForwardMode,
-)
+from sgl_jax.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
 from sgl_jax.srt.utils.jax_utils import device_array
 
 
@@ -150,7 +142,6 @@ class LogitsMetadata:
             "token_ids_logprobs": self.token_ids_logprobs,
             "temp_scaled_logprobs": self.temp_scaled_logprobs,
             "top_p_normalized_logprobs": self.top_p_normalized_logprobs,
-            # "real_bs": self.real_bs,
         }
 
         return (children, aux_data)
@@ -203,13 +194,15 @@ class LogitsMetadata:
             ) = False
             extend_logprob_pruned_lens_cpu = extend_seq_lens_cpu = None
 
+        mesh = mesh if mesh is not None else jax.sharding.get_abstract_mesh()
+
         return cls(
             forward_mode=batch.forward_mode,
             capture_hidden_mode=batch.capture_hidden_mode,
             extend_return_logprob=extend_return_logprob,
             extend_return_top_logprob=extend_return_top_logprob,
             extend_token_ids_logprob=extend_token_ids_logprob,
-            extend_seq_lens=batch.extend_seq_lens,
+            extend_seq_lens=device_array(mesh, batch.extend_seq_lens),
             extend_seq_lens_cpu=extend_seq_lens_cpu,
             extend_logprob_start_lens_cpu=(
                 batch.extend_logprob_start_lens if batch.return_logprob else None
@@ -218,7 +211,7 @@ class LogitsMetadata:
             top_logprobs_nums=batch.top_logprobs_nums,
             token_ids_logprobs=batch.token_ids_logprobs,
             extend_input_logprob_token_ids_device=device_array(
-                mesh if mesh is not None else jax.sharding.get_abstract_mesh(),
+                mesh,
                 batch.extend_input_logprob_token_ids,
             ),
         )
@@ -227,17 +220,15 @@ class LogitsMetadata:
 class LogitsProcessor(nnx.Module):
     """Logits processor for the model."""
 
-    _requires_weight_loading = False
-
-    def __init__(self, vocab_size: int):
+    def __init__(self, vocab_size: int, lm_head: Embed, mesh: Mesh):
         self.vocab_size = vocab_size
+        self.lm_head = lm_head
+        self.mesh = mesh
 
     def __call__(
         self,
         hidden_states: jax.Array,
-        lm_head: Embed,
         logits_metadata: LogitsMetadata,
-        mesh: Mesh,
     ) -> LogitsProcessorOutput:
         if logits_metadata.forward_mode.is_decode_or_idle():
             pruned_states = hidden_states
@@ -247,20 +238,6 @@ class LogitsProcessor(nnx.Module):
             logits_metadata.forward_mode.is_extend()
             and not logits_metadata.extend_return_logprob
         ):
-            # Prefill without input logprobs.
-            # if logits_metadata.padded_static_len < 0:
-            #    last_index = jnp.cumsum(logits_metadata.extend_seq_lens, dim=0) - 1
-            # else:
-            #     # If padding_static length is 5 and extended_seq_lens is [2, 3],
-            #     # then our batch looks like [t00, t01, p, p, p, t10, t11, t12, p, p]
-            #     # and this retrieves t01 and t12, which are the valid last tokens
-            #     idx = device_array(jax.sharding.get_abstract_mesh(),np.arange(len(logits_metadata.extend_seq_lens)))
-            #     last_index = (
-            #         idx * logits_metadata.padded_static_len
-            #         + logits_metadata.extend_seq_lens
-            #         - 1
-            #     )
-
             last_index = jnp.cumsum(logits_metadata.extend_seq_lens, axis=0) - 1
             pruned_states = hidden_states[last_index]
             sample_indices = None
@@ -283,11 +260,6 @@ class LogitsProcessor(nnx.Module):
                 if extend_len == 0:
                     break
 
-                # It can happen in chunked prefill. We still need to sample 1 token,
-                # But we don't want to include it in input logprob.
-                # if extend_len == extend_logprob_start_len:
-                #     start_len = extend_logprob_start_len - 1
-                # else:
                 start_len = extend_logprob_start_len
 
                 # We always need at least 1 token to sample because that's required
@@ -307,19 +279,19 @@ class LogitsProcessor(nnx.Module):
 
             pruned_states = jnp.concat(pruned_states)
             sample_indices = device_array(
-                mesh,
+                self.mesh,
                 np.array(
                     sample_indices,
                     dtype=jnp.int64,
                 ),
             )
             input_logprob_indices = device_array(
-                mesh,
+                self.mesh,
                 np.array(input_logprob_indices, dtype=jnp.int64),
             )
 
         # Compute logits for both input and sampled tokens.
-        logits = self._get_logits(pruned_states, lm_head, logits_metadata)
+        logits = self._get_logits(pruned_states, self.lm_head)
         sampled_logits = (
             logits[sample_indices] if sample_indices is not None else logits
         )
@@ -352,7 +324,7 @@ class LogitsProcessor(nnx.Module):
 
             # Normalize the logprob w/o temperature, top-p
             pruned_lens = device_array(
-                mesh,
+                self.mesh,
                 np.array(
                     logits_metadata.extend_logprob_pruned_lens_cpu,
                 ),
@@ -390,7 +362,7 @@ class LogitsProcessor(nnx.Module):
                 input_token_ids_logprobs_val = input_token_ids_logprobs_idx = None
 
             input_token_logprobs = input_logprobs[
-                device_array(mesh, np.arange(input_logprobs.shape[0])),
+                device_array(self.mesh, np.arange(input_logprobs.shape[0])),
                 logits_metadata.extend_input_logprob_token_ids_device,
             ]
 
@@ -490,8 +462,6 @@ class LogitsProcessor(nnx.Module):
         self,
         hidden_states: jax.Array,
         lm_head: Embed,
-        logits_metadata: LogitsMetadata,
-        embedding_bias: Optional[jax.Array] = None,
     ) -> jax.Array:
         """Get logits from hidden_states.
 
@@ -513,64 +483,3 @@ class LogitsProcessor(nnx.Module):
         )
 
         return logits
-
-
-# @partial(jax.jit, static_argnums=(3, 5, 6))
-def _logits_processor_forward_extend(
-    hidden_states: jax.Array,
-    extend_start_loc: jax.Array,
-    extend_seq_lens: jax.Array,
-    promote_dtype: PromoteDtypeFn,
-    embedding: Param,
-    dtype: jnp.dtype,
-    vocab_size: int,
-):
-    last_token_indices = extend_start_loc + extend_seq_lens - 1
-    # Shape: [batch_size, hidden_size]
-    last_hidden_states = hidden_states[last_token_indices]
-
-    return _lm_head_forward(
-        last_hidden_states,
-        embedding,
-        promote_dtype,
-        dtype,
-        vocab_size,
-    )
-
-
-# @partial(jax.jit, static_argnums=(1, 3, 4, 5))
-def _logits_processor_forward_decode(
-    hidden_states: jax.Array,
-    promote_dtype: PromoteDtypeFn,
-    embedding: Param,
-    dtype: jnp.dtype,
-    batch_size: int,
-    vocab_size: int,
-):
-    last_token_indices = jnp.arange(batch_size)
-    # Shape: [batch_size, hidden_size]
-    last_hidden_states = hidden_states[last_token_indices]
-    return _lm_head_forward(
-        last_hidden_states,
-        embedding,
-        promote_dtype,
-        dtype,
-        vocab_size,
-    )
-
-
-# @partial(jax.jit, static_argnums=(2, 3, 4))
-def _lm_head_forward(
-    last_hidden_states: jax.Array,
-    embedding: Param,
-    promote_dtype: PromoteDtypeFn,
-    dtype: jnp.dtype,
-    vocab_size: int,
-):
-    last_hidden_states, embedding = promote_dtype(
-        (last_hidden_states, embedding.value), dtype=dtype
-    )
-    logits = jnp.dot(last_hidden_states, embedding.T)
-
-    logits = logits[:, :vocab_size] if logits.ndim > 1 else logits[:vocab_size]
-    return logits
