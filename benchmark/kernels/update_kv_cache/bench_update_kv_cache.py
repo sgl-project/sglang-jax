@@ -81,35 +81,50 @@ def benchmark_backend(
 
     # run
     times = []
-    for i in range(3):
-        start = time.perf_counter()
-        out = wrap_kv_cache_update(
-            new_value, cache, slices, page_size, update_slices_num, num_slices_per_block
-        )
-        jax.block_until_ready(out)
-        times.append(time.perf_counter() - start)
+    with jax.profiler.trace("/home/gcpuser/aolemila/profile_update/"):
+        for i in range(3):
+            start = time.perf_counter()
+            out = wrap_kv_cache_update(
+                new_value,
+                cache,
+                slices,
+                page_size,
+                update_slices_num,
+                num_slices_per_block,
+            )
+            jax.block_until_ready(out)
+            times.append(time.perf_counter() - start)
 
     return np.mean(times)
 
 
 def main():
-    page_size = 128
-    head_num_config = [8, 16]
-    max_cache_len_config = [80000, 120000]
-    new_kv_len_config = [10000, 20000, 30000, 50000]
+    head_num_config = [8, 16, 32]
+    max_cache_len_config = [80000, 160000, 320000, 640000, 1280000]
+    new_kv_len_config = [1024, 2048, 4096, 9182, 16384]
     head_dim_config = [128]
+    page_sizes = [64, 128, 256]
 
     configs = []
     for head_num in head_num_config:
         for max_cache_len in max_cache_len_config:
             for new_value_len in new_kv_len_config:
                 for head_dim in head_dim_config:
-                    configs.append((head_num, max_cache_len, new_value_len, head_dim))
+                    for page_size in page_sizes:
+                        configs.append(
+                            (
+                                head_num,
+                                max_cache_len,
+                                new_value_len,
+                                head_dim,
+                                page_size,
+                            )
+                        )
 
     num_slices_per_block_config = [2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096]
 
     for config in configs:
-        head_num, max_cache_len, new_value_len, head_dim = config
+        head_num, max_cache_len, new_value_len, head_dim, page_size = config
         new_value, cache = create_bench_data(
             max_cache_len,
             new_value_len,
@@ -124,9 +139,11 @@ def main():
         )
 
         print(
-            f"###### HEAD_NUM: {head_num}, MAX_CACHE_LEN: {max_cache_len}, NEW_KV_LEN: {new_value_len}, HEAD_DIM: {head_dim} ######"
+            f"###### HEAD_NUM: {head_num}, MAX_CACHE_LEN: {max_cache_len}, NEW_KV_LEN: {new_value_len}, HEAD_DIM: {head_dim} , PAGE_SIZE: {page_size} ######"
         )
 
+        min_cost = 1 << 30
+        fastest_num_slices_per_block = 0
         for num_slices_per_block in num_slices_per_block_config:
             nspb = min(max_num_slices_per_block_config, num_slices_per_block)
             cost = benchmark_backend(
@@ -140,9 +157,16 @@ def main():
                 page_size=page_size,
             )
 
+            if cost < min_cost:
+                min_cost = cost
+                fastest_num_slices_per_block = num_slices_per_block
             print(
                 f"[num_slices_per_block={num_slices_per_block}] avg cost: {cost*1000} ms"
             )
+
+        print(
+            f"Fastest [num_slices_per_block={fastest_num_slices_per_block}] costs: {min_cost*1000} ms"
+        )
 
 
 if __name__ == "__main__":
