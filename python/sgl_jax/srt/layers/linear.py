@@ -65,7 +65,7 @@ class LinearBase(nnx.Module):
         logger.info("linear input 1 ")
         jax.debug.visualize_array_sharding(self.weight.value)
 
-        output = jnp.dot(x, y)
+        output = jnp.dot(x, self.weight.value)
 
         logger.info("linear input 2 ")
 
