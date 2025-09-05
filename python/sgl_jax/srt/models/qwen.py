@@ -244,17 +244,18 @@ class QWenBlock(nnx.Module):
             f"RMSNorm_pre_attn_output",
             f"rmsnorm_layer_id_{self.layer_id}",
         )
+        jax.debug.visualize_array_sharding(hidden_states)
         # hidden_states = jnp.arange(32 * 4096).reshape(32, 4096)
-        hidden_states = jax.device_put(
-            hidden_states, NamedSharding(self.mesh, P("data", None))
-        )
-        jax.block_until_ready(hidden_states)
-        for i in range(len(hidden_states.addressable_shards)):
-            jax.debug.print(
-                "hidden_states data {} shard_shape {}",
-                i,
-                hidden_states.addressable_shards[i].data.shape,
-            )
+        # hidden_states = jax.device_put(
+        #     hidden_states, NamedSharding(self.mesh, P("data", None))
+        # )
+        # jax.block_until_ready(hidden_states)
+        # for i in range(len(hidden_states.addressable_shards)):
+        #     jax.debug.print(
+        #         "hidden_states data {} shard_shape {}",
+        #         i,
+        #         hidden_states.addressable_shards[i].data.shape,
+        # )
         attn_output, k, v = self.attn(
             positions=positions,
             hidden_states=hidden_states,
