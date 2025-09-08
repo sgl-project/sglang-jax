@@ -1,4 +1,5 @@
 import logging
+import time
 from typing import Any, Dict, Optional, Tuple
 
 import jax
@@ -357,6 +358,8 @@ class Qwen3ForCausalLM(nnx.Module):
         )
 
     def load_weights(self, rng_key: jax.Array):
+        logger.info("start load weights************************************")
+        time.sleep(100)
         self.rng = nnx.Rngs(rng_key)
 
         loader = WeightLoader(
@@ -364,9 +367,11 @@ class Qwen3ForCausalLM(nnx.Module):
         )
 
         weight_mappings = self._create_qwen3_weight_mappings()
-
+        logger.info("start load weights************************************")
+        time.sleep(100)
         loader.load_weights_from_safetensors(weight_mappings)
         logger.info("Qwen3 weights loaded successfully!")
+        logger.info("end load weights************************************")
 
     def _create_qwen3_weight_mappings(self) -> dict:
         mappings = {
