@@ -360,11 +360,6 @@ class Qwen3ForCausalLM(nnx.Module):
         self.dtype = config.dtype
         logger.info(f"QWen3ForCausalLMModel config dtype: {self.dtype}")
 
-        # Monitor TPU memory before transformer initialization
-        logger.info("=== TPU Memory Before Transformer Init ===")
-        logger.info(f"JAX devices: {[str(d) for d in jax.devices()]}")
-        logger.info(f"JAX default device: {jax.default_device()}")
-        logger.info(f"Mesh devices: {mesh.devices if mesh else 'No mesh'}")
         try:
             result = subprocess.run(
                 ["tpu-info"], capture_output=True, text=True, timeout=10
