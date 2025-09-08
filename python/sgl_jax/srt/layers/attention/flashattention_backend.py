@@ -9,9 +9,10 @@ from jax.sharding import PartitionSpec as P
 from jax.tree_util import register_pytree_node_class
 
 from sgl_jax.srt.layers.attention.base_attn_backend import AttentionBackend
-from sgl_jax.srt.layers.attention.flash_attn_kernel.flash_attention import (
+from sgl_jax.srt.layers.attention.flash_attn_kernel.flash_attention_v3 import (
     ragged_paged_attention,
 )
+from sgl_jax.srt.layers.attention.flash_attn_kernel.util import get_dtype_packing
 from sgl_jax.srt.layers.radix_attention import RadixAttention
 from sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
@@ -33,6 +34,7 @@ class FlashAttentionMetadata:
     cu_kv_lens: jax.Array = None
     page_indices: jax.Array = None
     seq_lens: jax.Array = None
+    distribution: jax.Array = None
 
     def tree_flatten(self):
         children = (
@@ -41,6 +43,7 @@ class FlashAttentionMetadata:
             self.cu_kv_lens,
             self.page_indices,
             self.seq_lens,
+            self.distribution,
         )
 
         aux_data = {}
@@ -55,6 +58,7 @@ class FlashAttentionMetadata:
         obj.cu_kv_lens = children[2]
         obj.page_indices = children[3]
         obj.seq_lens = children[4]
+        obj.distribution = children[5]
 
         return obj
 
@@ -91,6 +95,7 @@ class FlashAttention(AttentionBackend):
         indices = np.arange(0, len(batch.cache_loc), self.page_size)
         selected_cache_locs = batch.cache_loc[indices]
         page_indices = (selected_cache_locs // self.page_size).astype(np.int32)
+        batch_size = len(batch.seq_lens)
 
         if batch.forward_mode == ForwardMode.EXTEND:
             cu_q_lens = np.concatenate(
@@ -99,6 +104,7 @@ class FlashAttention(AttentionBackend):
                     np.cumsum(batch.extend_seq_lens),
                 ]
             )
+            distribution = jnp.array([0, batch_size, batch_size], jnp.int32)
         elif batch.forward_mode == ForwardMode.DECODE:
             cu_q_lens = jnp.concatenate(
                 [
@@ -106,6 +112,7 @@ class FlashAttention(AttentionBackend):
                     np.cumsum(jnp.ones(len(batch.seq_lens), dtype=np.int32)),
                 ]
             )
+            distribution = jnp.array([batch_size, batch_size, batch_size], jnp.int32)
         else:
             raise ValueError(f"Invalid forward mode: {batch.forward_mode}")
 
@@ -125,6 +132,7 @@ class FlashAttention(AttentionBackend):
             1,
         )
 
+        metadata.distribution = device_array(mesh, distribution)
         metadata.num_seqs = device_array(mesh, num_seqs)
         metadata.cu_q_lens = device_array(mesh, cu_q_lens)
         metadata.cu_kv_lens = device_array(mesh, cu_kv_lens)
@@ -176,10 +184,6 @@ class FlashAttention(AttentionBackend):
         Returns:
             Output tensor of shape [total_tokens, hidden_size]
         """
-        k_buffer, v_buffer = self._get_and_set_kv_cache(
-            k, v, forward_batch, layer.layer_id
-        )
-
         if layer.scaling is None:
             scale = 1.0 / jnp.sqrt(layer.head_dim)
         else:
@@ -189,34 +193,55 @@ class FlashAttention(AttentionBackend):
             P(
                 None, self.kv_partition_axis
             ),  # q shape: [batched_tokens, head_num, head_dim]
-            P(None, None, self.kv_partition_axis, None),  # k_buffer sha
+            P(None, self.kv_partition_axis),  # k
+            P(None, self.kv_partition_axis),  # v
+            P(None, None, self.kv_partition_axis, None),  # k_buffer
             P(None, None, self.kv_partition_axis, None),  # v_buffer
+            P(),  # seq_lens
             P(),  # page_indices
             P(),  # cu_q_lens
-            P(),  # cu_kv_lens
-            P(),  # num_seqs
-            P(),  # seq_lens
+            P(),  # distribution
         )
-        out_specs = P(None, self.kv_partition_axis)
+        out_specs = (
+            P(None, self.kv_partition_axis),  # attn_weight
+            P(None, None, self.kv_partition_axis, None),  # key cache
+            P(None, None, self.kv_partition_axis, None),  # v cache
+        )
 
         def _ragged_paged_attention(*args):
-            q, k_buffer, v_buffer = args[:3]
-            other_args = args[3:]
+            q, k, v, k_cache, v_cache = args[:5]
+            other_args = args[5:]
+
+            kv_packing = get_dtype_packing(k_cache.dtype)
+            k_cache = k_cache.reshape(
+                *k_cache.shape[:2],
+                k_cache.shape[2] // kv_packing,
+                kv_packing,
+                self.head_dim,
+            )
+            v_cache = v_cache.reshape(
+                *v_cache.shape[:2],
+                v_cache.shape[2] // kv_packing,
+                kv_packing,
+                self.head_dim,
+            )
 
             # Since we now use pre-padded kv heads, ensure they are always even
-            assert k_buffer.shape[-2] % 2 == 0, (
-                f"k_buffer kv_heads={k_buffer.shape[-2]} should be even after pre-padding. "
+            assert k_cache.shape[-2] % 2 == 0, (
+                f"k_buffer kv_heads={k_cache.shape[-2]} should be even after pre-padding. "
                 "This indicates a configuration issue with kv heads padding."
             )
-            assert v_buffer.shape[-2] % 2 == 0, (
-                f"v_buffer kv_heads={v_buffer.shape[-2]} should be even after pre-padding. "
+            assert v_cache.shape[-2] % 2 == 0, (
+                f"v_buffer kv_heads={v_cache.shape[-2]} should be even after pre-padding. "
                 "This indicates a configuration issue with kv heads padding."
             )
 
-            return ragged_paged_attention(
+            attn, k_cache, v_cache = ragged_paged_attention(
                 q,
-                k_buffer,
-                v_buffer,
+                k,
+                v,
+                k_cache,
+                v_cache,
                 *other_args,
                 sm_scale=scale,
                 sliding_window=None,
@@ -224,8 +249,14 @@ class FlashAttention(AttentionBackend):
                 mask_value=None,
                 vmem_limit_bytes=self.vmem_limit_bytes,
             )
+            return (
+                attn,
+                k_cache.reshape(k_cache.shape[:2], -1, k_cache[-1]),
+                v_cache.reshape(v_cache.shape[:2], -1, v_cache[-1]),
+            )
 
-        attn_output = jax.shard_map(
+        k_cache, v_cache = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+        attn_output, k_cache, v_cache = jax.shard_map(
             _ragged_paged_attention,
             mesh=jax.sharding.get_abstract_mesh(),
             in_specs=in_specs,
@@ -233,23 +264,24 @@ class FlashAttention(AttentionBackend):
             check_vma=False,
         )(
             q.reshape(q.shape[0], -1, self.head_dim),
-            k_buffer.reshape(
-                k_buffer.shape[0] // self.page_size, self.page_size, -1, self.head_dim
+            k.reshape(q.shape[0], -1, self.head_dim),
+            v.reshape(q.shape[0], -1, self.head_dim),
+            k_cache.reshape(
+                k_cache.shape[0] // self.page_size, self.page_size, -1, self.head_dim
             ),
-            v_buffer.reshape(
-                v_buffer.shape[0] // self.page_size, self.page_size, -1, self.head_dim
+            v_cache.reshape(
+                v_cache.shape[0] // self.page_size, self.page_size, -1, self.head_dim
             ),
+            self.forward_metadata.seq_lens,
             self.forward_metadata.page_indices,
             self.forward_metadata.cu_q_lens,
-            self.forward_metadata.cu_kv_lens,
-            self.forward_metadata.num_seqs,
-            self.forward_metadata.seq_lens,
+            self.forward_metadata.distribution,
         )
 
         return (
             attn_output.reshape(q.shape[0], -1),
-            k_buffer,
-            v_buffer,
+            k_cache,
+            v_cache,
         )
 
     def _get_and_set_kv_cache(

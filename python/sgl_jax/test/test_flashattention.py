@@ -256,6 +256,7 @@ def create_test_data(
     )
 
     fb = ForwardBatch(
+        bid=1,
         forward_mode=forward_mode,
         batch_size=batch_size,
         input_ids=input_ids,
@@ -270,7 +271,7 @@ def create_test_data(
         extend_prefix_lens=extend_prefix_lens,
         extend_seq_lens=extend_seq_lens,
     )
-    fb.attn_backend.forward_metadata = attention_backend.init_forward_metadata(fb)
+    fb.attn_backend.forward_metadata = attention_backend.get_forward_metadata(mwb, mesh)
     return fb, q, k, v
 
 
