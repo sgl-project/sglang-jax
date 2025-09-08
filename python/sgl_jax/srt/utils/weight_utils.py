@@ -129,7 +129,9 @@ class WeightLoader:
                 regular_mappings[key] = mapping
 
         expert_weights = {}
+        logger.info("start iterate weights************************************")
 
+        time.sleep(100)
         for hf_key, hf_weight in self._iterate_weights():
             if hf_key in regular_mappings:
                 mapping = regular_mappings[hf_key]
@@ -141,6 +143,7 @@ class WeightLoader:
                 expert_weights[hf_key] = hf_weight.astype(self.dtype)
             else:
                 logger.warning(f"No mapping found for weight: {hf_key}")
+        logger.info("end iterate weights************************************")
         time.sleep(100)
         if moe_mappings:
             self._process_moe_expert_weights(params, moe_mappings, expert_weights)
