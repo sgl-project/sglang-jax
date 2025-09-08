@@ -77,8 +77,11 @@ class JAXModelLoader(BaseModelLoader):
         hf_folder = self.download_model(model_config)
         model_config.model_path = hf_folder
         # Initialize JAX model
+        logger.info("start initialize model************************************")
+        time.sleep(100)
         model = self._initialize_model(model_config)
-
+        logger.info("end initialize model************************************")
+        time.sleep(100)
         # Load weights
         jit_model = self._get_model(model, model_config)
 
