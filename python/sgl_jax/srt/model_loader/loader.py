@@ -101,15 +101,14 @@ class JAXModelLoader(BaseModelLoader):
         # Create model directly - random initialization is fast and will be immediately overwritten
         # The "double initialization" cost is minimal since load_weights replaces all parameters
         logger.info("start create mode1l************************************")
-        time.sleep(100)
-        model = model_class(model_config, self.rng, self.mesh)
+        # time.sleep(100)
+        with self.mesh:
+            model = model_class(model_config, self.rng, self.mesh)
         logger.info("start load weights2************************************")
-        time.sleep(100)
         # Load actual weights, which overwrites the random initialization
         rng_key = self.rng.default.key.value
         model.load_weights(rng_key)
         logger.info("end load weights3***********************************")
-        time.sleep(100)
         # Apply sharding constraints after loading
         with self.mesh:
             state = nnx.state(model)
