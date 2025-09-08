@@ -69,7 +69,7 @@ class FlashAttention(AttentionBackend):
         num_attn_heads,
         num_kv_heads,
         head_dim,
-        vmem_limit_bytes: int = 64 * (1 << 20),  # 32MB
+        vmem_limit_bytes: int = 128 * (1 << 20),  # 32MB
         page_size: int = 1,
         kv_partition_axis: str = "tensor",
     ):
