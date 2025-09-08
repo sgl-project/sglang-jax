@@ -256,6 +256,7 @@ def create_test_data(
     )
 
     fb = ForwardBatch(
+        bid=1,
         forward_mode=forward_mode,
         batch_size=batch_size,
         input_ids=input_ids,

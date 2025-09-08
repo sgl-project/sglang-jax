@@ -406,6 +406,29 @@ def ragged_paged_attention_kernel(
             vec = vec.astype(jnp.float32)
         return vec.reshape(-1, last_dim)
 
+    def batch_load_all_heads_kv(k_ref, v_ref, num_kv_heads_per_blk):
+        k_heads = []
+        v_heads = []
+
+        for head_idx in range(num_kv_heads_per_blk):
+            k_head = strided_load_kv(k_ref, head_idx, num_kv_heads_per_blk)
+            v_head = strided_load_kv(v_ref, head_idx, num_kv_heads_per_blk)
+            k_heads.append(k_head)
+            v_heads.append(v_head)
+
+        return jnp.stack(k_heads, axis=0), jnp.stack(v_heads, axis=0)
+
+    def batch_prepare_queries(q_ref, num_kv_heads_per_blk, num_q_heads_per_kv_head):
+        q_heads = []
+        for kv_head_idx in range(num_kv_heads_per_blk):
+            q_head_idx = kv_head_idx * num_q_heads_per_kv_head
+            q = fold_on_2nd_minor(
+                q_ref[:, q_head_idx : q_head_idx + num_q_heads_per_kv_head, :]
+            )
+            q_heads.append(q)
+
+        return jnp.stack(q_heads, axis=0)
+
     @pl.when(heads_blk_idx + q_blk_idx == 0)
     def prefetch_first_kv_blk():
         async_copy_k, async_copy_v = create_kv_async_copy_descriptors(
@@ -461,65 +484,80 @@ def ragged_paged_attention_kernel(
             return next_heads_blk_idx, next_seq_idx, next_kv_blk_idx, next_buf_idx
 
         def flash_attention(
-            q,  # [num_q_per_blk * num_q_heads_per_kv_head, head_dim]
-            k,  # [num_kv_per_blk, head_dim]
-            v,  # [num_kv_per_blk, head_dim]
-            head_l_ref,  # [num_q_per_blk * num_q_heads_per_kv_head, 128]
-            head_m_ref,  # [num_q_per_blk * num_q_heads_per_kv_head, 128]
-            head_acc_ref,  # [num_q_per_blk, num_q_heads_per_kv_head, head_dim]
+            q_batch,  # [num_kv_heads_per_blk, num_q_per_blk * num_q_heads_per_kv_head, head_dim]
+            k_batch,  # [num_kv_heads_per_blk, num_kv_per_blk_batch, head_dim]
+            v_batch,  # [num_kv_heads_per_blk, num_kv_per_blk_batch, head_dim]
+            l_ref,  # [num_kv_heads_per_blk, num_q_per_blk * num_q_heads_per_kv_head, 128]
+            m_ref,  # [num_kv_heads_per_blk, num_q_per_blk * num_q_heads_per_kv_head, 128]
+            acc_ref,  # [num_q_per_blk, num_q_heads_per_blk, head_dim]
             *,
             kv_blk_idx,
             actual_kv_len,
+            sm_scale,
+            mask_value,
+            q_start,
+            q_end,
+            q_len,
+            q_len_start,
+            kv_len_start,
+            sliding_window=None,
+            soft_cap=None,
+            k_scale=None,
+            v_scale=None,
         ):
-            assert q.shape == (
-                num_q_per_blk * num_q_heads_per_kv_head,
-                head_dim,
-            ), f"q.shape is not correct, {q.shape=}, expected shape=({num_q_per_blk}, {num_q_heads_per_kv_head}, {head_dim})."
-            assert (
-                k.shape
-                == v.shape
-                == (
-                    num_kv_per_blk,
-                    head_dim,
-                )
-            ), f"k.shape or v.shape is not correct, {k.shape=} {v.shape=}, expected shape=({num_kv_per_blk}, {head_dim})."
-            assert k.dtype == v.dtype
-            assert (
-                head_m_ref.shape
-                == head_l_ref.shape
-                == (
-                    num_q_per_blk * num_q_heads_per_kv_head,
-                    128,
-                )
-            ), f"head_m_ref.shape or head_l_ref.shape is not correct, {head_m_ref.shape=} {head_l_ref.shape=}, expected shape=({num_q_per_blk*num_q_heads_per_kv_head}, 128)."
-            assert head_acc_ref.shape == (
-                num_q_per_blk,
-                num_q_heads_per_kv_head,
-                head_dim,
-            ), f"head_acc_ref.shape is not correct, {head_acc_ref.shape=}, expected shape=({num_q_per_blk}, {num_q_heads_per_kv_head}, {head_dim})."
-            kv_len_start = kv_blk_idx * num_kv_per_blk
+            num_kv_heads_per_blk_batch, num_kv_per_blk_batch, head_dim_batch = (
+                k_batch.shape
+            )
 
-            def masked_store(ref, val, start, end, group=1):
-                iota = lax.broadcasted_iota(jnp.int32, ref.shape, 0) // group
-                mask = jnp.logical_and(iota >= start, iota < end)
-                pl.store(
-                    ref, idx=tuple(slice(None) for _ in ref.shape), val=val, mask=mask
-                )
-
-            def load_with_init(ref, init_val):
+            def load_with_init_batch(ref, init_val):
                 return jnp.where(
                     kv_blk_idx == 0, jnp.full_like(ref, init_val), ref[...]
                 )
 
-            effective_kv_len = actual_kv_len - kv_len_start
-            kv_mask = lax.broadcasted_iota(jnp.int32, k.shape, 0) < effective_kv_len
-            k = jnp.where(kv_mask, k.astype(jnp.float32), 0).astype(k.dtype)
-            v = jnp.where(kv_mask, v.astype(jnp.float32), 0).astype(v.dtype)
+            def masked_store_batch(ref, val, start, end, group=1):
+                iota = lax.broadcasted_iota(jnp.int32, ref.shape, 1) // group
+                mask_bool = jnp.logical_and(iota >= start, iota < end)
+                pl.store(
+                    ref,
+                    idx=tuple(slice(None) for _ in ref.shape),
+                    val=val,
+                    mask=mask_bool,
+                )
 
-            qk = (
-                jnp.einsum("nd,md->nm", q, k, preferred_element_type=jnp.float32)
+            kv_len_start = kv_blk_idx * num_kv_per_blk_batch
+
+            if k_scale is not None:
+                k_batch = k_batch.astype(jnp.float32) * k_scale
+                k_batch = k_batch.astype(q_batch.dtype)
+            if v_scale is not None:
+                v_batch = v_batch.astype(jnp.float32) * v_scale
+                v_batch = v_batch.astype(q_batch.dtype)
+
+            effective_kv_len = actual_kv_len - kv_len_start
+            kv_indices = lax.broadcasted_iota(jnp.int32, k_batch.shape[:-1], 1)
+            kv_mask_int = (kv_indices < effective_kv_len).astype(jnp.int32)
+            kv_mask_expanded = jnp.expand_dims(kv_mask_int, axis=-1)
+            kv_mask_broadcast = jnp.broadcast_to(kv_mask_expanded, k_batch.shape)
+
+            k_batch = jnp.where(
+                kv_mask_broadcast > 0, k_batch.astype(jnp.float32), 0
+            ).astype(k_batch.dtype)
+            v_batch = jnp.where(
+                kv_mask_broadcast > 0, v_batch.astype(jnp.float32), 0
+            ).astype(v_batch.dtype)
+
+            q_batch_f32 = q_batch.astype(jnp.float32)
+            k_batch_f32 = k_batch.astype(jnp.float32)
+            qk_batch = (
+                jnp.einsum(
+                    "hqd,hkd->hqk",
+                    q_batch_f32,
+                    k_batch_f32,
+                    preferred_element_type=jnp.float32,
+                )
                 * sm_scale
-            )
+            )  # [num_kv_heads_per_blk, num_q_total, num_kv_per_blk_batch]
+
             store_start = jnp.maximum(q_start - q_len_start, 0)
             store_end = jnp.minimum(q_end - q_len_start, num_q_per_blk)
 
@@ -527,76 +565,117 @@ def ragged_paged_attention_kernel(
                 (actual_kv_len - q_len)
                 + q_len_start
                 - q_start
-                + jax.lax.broadcasted_iota(
-                    jnp.int32,
-                    (num_q_per_blk * num_q_heads_per_kv_head, num_kv_per_blk),
-                    0,
-                )
+                + jax.lax.broadcasted_iota(jnp.int32, qk_batch.shape, 1)
                 // num_q_heads_per_kv_head
             )
             col_ids = kv_len_start + jax.lax.broadcasted_iota(
-                jnp.int32,
-                (num_q_per_blk * num_q_heads_per_kv_head, num_kv_per_blk),
-                1,
+                jnp.int32, qk_batch.shape, 2
             )
+
             causal_mask = row_ids < col_ids
             if sliding_window is not None:
                 causal_mask = jnp.logical_or(
                     causal_mask, row_ids - sliding_window >= col_ids
                 )
+
             if soft_cap is not None:
-                qk = soft_cap * jnp.tanh(qk / soft_cap)
-            qk += jnp.where(causal_mask, mask_value, 0.0)
-            m_curr = jnp.max(qk, axis=1, keepdims=True)
-            s_curr = jnp.exp(qk - m_curr)
-            qkv = jnp.dot(s_curr, v, preferred_element_type=jnp.float32)
-            lm_store_shape = head_m_ref.shape
-            m_curr = jnp.broadcast_to(m_curr, lm_store_shape)
-            l_curr = jnp.broadcast_to(s_curr.sum(axis=1, keepdims=True), lm_store_shape)
-            m_prev = load_with_init(head_m_ref, -jnp.inf)
-            l_prev = load_with_init(head_l_ref, 0.0)
-            m_next = jnp.maximum(m_prev, m_curr)
-            masked_store(
-                head_m_ref, m_next, store_start, store_end, num_q_heads_per_kv_head
-            )
-            alpha = jnp.exp(m_prev - m_next)
-            beta = jnp.exp(m_curr - m_next)
-            l_alpha = alpha * l_prev
-            l_next = l_alpha + beta * l_curr
-            l_next_safe = jnp.where(l_next == 0.0, 1.0, l_next)
-            masked_store(
-                head_l_ref,
-                l_next_safe,
-                store_start,
-                store_end,
-                num_q_heads_per_kv_head,
+                qk_batch = soft_cap * jnp.tanh(qk_batch / soft_cap)
+
+            qk_batch += jnp.where(causal_mask, mask_value, 0.0)
+
+            m_curr = jnp.max(
+                qk_batch, axis=-1, keepdims=True
+            )  # [num_kv_heads_per_blk, num_q_total, 1]
+            s_curr = jnp.exp(qk_batch - m_curr)
+
+            v_batch_f32 = v_batch.astype(jnp.float32)
+            qkv_batch = jnp.einsum(
+                "hqk,hkd->hqd", s_curr, v_batch_f32, preferred_element_type=jnp.float32
             )
 
-            def broadcast_to_shape(arr, shape):
-                if arr.shape == shape:
-                    return arr
-                assert len(arr.shape) == len(shape)
-                assert arr.shape[0] == shape[0]
-                assert shape[1] % arr.shape[1] == 0
-                # no-op concatenation.
-                return jnp.concatenate(
-                    [arr for _ in range(shape[1] // arr.shape[1])], axis=1
+            lm_store_shape = m_ref.shape
+            m_curr_expanded = jnp.broadcast_to(m_curr, lm_store_shape)
+            l_curr_expanded = jnp.broadcast_to(
+                s_curr.sum(axis=-1, keepdims=True), lm_store_shape
+            )
+
+            m_prev = load_with_init_batch(m_ref, -jnp.inf)
+            l_prev = load_with_init_batch(l_ref, 0.0)
+
+            m_next = jnp.maximum(m_prev, m_curr_expanded)
+            masked_store_batch(
+                m_ref, m_next, store_start, store_end, num_q_heads_per_kv_head
+            )
+
+            alpha = jnp.exp(m_prev - m_next)
+            beta = jnp.exp(m_curr_expanded - m_next)
+            l_alpha = alpha * l_prev
+            l_next = l_alpha + beta * l_curr_expanded
+            l_next_safe = jnp.where(l_next == 0.0, 1.0, l_next)
+
+            masked_store_batch(
+                l_ref, l_next_safe, store_start, store_end, num_q_heads_per_kv_head
+            )
+
+            def broadcast_to_qkv_shape(arr, target_shape):
+                return jnp.broadcast_to(arr, target_shape)
+
+            o_curr = load_with_init_batch(acc_ref, 0.0)
+
+            # o_curr: [num_q_per_blk, num_q_heads_per_blk, head_dim]
+            o_curr_list = []
+            for kv_head_idx in range(num_kv_heads_per_blk_batch):
+                q_head_start = kv_head_idx * num_q_heads_per_kv_head
+                q_head_end = q_head_start + num_q_heads_per_kv_head
+                kv_head_slice = o_curr[
+                    :, q_head_start:q_head_end, :
+                ]  # [num_q_per_blk, num_q_heads_per_kv_head, head_dim]
+                kv_head_data = kv_head_slice.reshape(
+                    num_q_per_blk * num_q_heads_per_kv_head, head_dim_batch
+                )
+                o_curr_list.append(kv_head_data)
+            o_curr_reshaped = jnp.stack(o_curr_list, axis=0)
+
+            l_alpha_broadcast = broadcast_to_qkv_shape(l_alpha, qkv_batch.shape)
+            beta_broadcast = broadcast_to_qkv_shape(beta, qkv_batch.shape)
+            l_next_safe_broadcast = broadcast_to_qkv_shape(l_next_safe, qkv_batch.shape)
+
+            out_batch = lax.div(
+                l_alpha_broadcast * o_curr_reshaped + beta_broadcast * qkv_batch,
+                l_next_safe_broadcast,
+            )
+
+            # [num_q_per_blk, num_q_heads_per_blk, head_dim]
+            out_batch_reshaped = out_batch.reshape(
+                num_kv_heads_per_blk_batch,
+                num_q_per_blk,
+                num_q_heads_per_kv_head,
+                head_dim_batch,
+            )
+
+            out_heads_list = []
+            for kv_head_idx in range(num_kv_heads_per_blk_batch):
+                kv_head_output = out_batch_reshaped[
+                    kv_head_idx
+                ]  # [num_q_per_blk, num_q_heads_per_kv_head, head_dim]
+                out_heads_list.append(kv_head_output)
+
+            out_reshaped = jnp.concatenate(
+                out_heads_list, axis=1
+            )  # [num_q_per_blk, num_q_heads_per_blk, head_dim]
+
+            def masked_store_acc(ref, val, start, end):
+                # [num_q_per_blk, num_q_heads_per_blk, head_dim]
+                iota = lax.broadcasted_iota(jnp.int32, ref.shape, 0)
+                mask_bool = jnp.logical_and(iota >= start, iota < end)
+                pl.store(
+                    ref,
+                    idx=tuple(slice(None) for _ in ref.shape),
+                    val=val,
+                    mask=mask_bool,
                 )
 
-            o_curr = load_with_init(head_acc_ref, 0.0).reshape(-1, head_dim)
-            l_alpha = broadcast_to_shape(l_alpha, qkv.shape)
-            beta = broadcast_to_shape(beta, qkv.shape)
-            l_next_safe = broadcast_to_shape(l_next_safe, qkv.shape)
-            out = lax.div(
-                l_alpha * o_curr + beta * qkv,
-                l_next_safe,
-            )
-            masked_store(
-                head_acc_ref,
-                out.reshape(head_acc_ref.shape),
-                store_start,
-                store_end,
-            )
+            masked_store_acc(acc_ref, out_reshaped, store_start, store_end)
 
         def is_valid_kv_blk_in_cur_seq(kv_states):
             kv_blk_idx, _ = kv_states
@@ -630,33 +709,36 @@ def ragged_paged_attention_kernel(
                 num_kv_pages_per_blk * page_size * num_kv_heads_per_blk,
                 head_dim,
             )
-            for kv_head_idx in range(0, num_kv_heads_per_blk):
-                q_head_idx = kv_head_idx * num_q_heads_per_kv_head
-                # TODO(jevinjiang): extra handling for packed type that can start at
-                # unaligned position!
-                q = fold_on_2nd_minor(
-                    q_ref[:, q_head_idx : q_head_idx + num_q_heads_per_kv_head, :]
-                )
-                k = strided_load_kv(k_ref, kv_head_idx, num_kv_heads_per_blk)
-                v = strided_load_kv(v_ref, kv_head_idx, num_kv_heads_per_blk)
-                if k_scale is not None:
-                    # NOTE: Conversion between arbitrary data types is not supported.
-                    # That's why it is converted to float32 first.
-                    k = k.astype(jnp.float32) * k_scale
-                    k = k.astype(q_ref.dtype)
-                if v_scale is not None:
-                    v = v.astype(jnp.float32) * v_scale
-                    v = v.astype(q_ref.dtype)
-                flash_attention(
-                    q,
-                    k,
-                    v,
-                    l_ref.at[kv_head_idx],
-                    m_ref.at[kv_head_idx],
-                    acc_ref.at[:, q_head_idx : q_head_idx + num_q_heads_per_kv_head, :],
-                    kv_blk_idx=kv_blk_idx,
-                    actual_kv_len=actual_kv_len,
-                )
+
+            q_batch = batch_prepare_queries(
+                q_ref, num_kv_heads_per_blk, num_q_heads_per_kv_head
+            )
+
+            k_batch, v_batch = batch_load_all_heads_kv(
+                k_ref, v_ref, num_kv_heads_per_blk
+            )
+
+            flash_attention(
+                q_batch,
+                k_batch,
+                v_batch,
+                l_ref,  # [num_kv_heads_per_blk, num_q_per_blk * num_q_heads_per_kv_head, 128]
+                m_ref,  # [num_kv_heads_per_blk, num_q_per_blk * num_q_heads_per_kv_head, 128]
+                acc_ref,  # [num_q_per_blk, num_q_heads_per_blk, head_dim]
+                kv_blk_idx=kv_blk_idx,
+                actual_kv_len=actual_kv_len,
+                sm_scale=sm_scale,
+                mask_value=mask_value,
+                q_start=q_start,
+                q_end=q_end,
+                q_len=q_len,
+                q_len_start=q_len_start,
+                kv_len_start=kv_blk_idx * num_kv_per_blk,
+                sliding_window=sliding_window,
+                soft_cap=soft_cap,
+                k_scale=k_scale,
+                v_scale=v_scale,
+            )
             return kv_blk_idx + 1, next_buf_idx
 
         _, next_buf_idx = lax.while_loop(
