@@ -125,11 +125,15 @@ class FlashAttention(AttentionBackend):
             1,
         )
 
-        metadata.num_seqs = device_array(mesh, num_seqs)
-        metadata.cu_q_lens = device_array(mesh, cu_q_lens)
-        metadata.cu_kv_lens = device_array(mesh, cu_kv_lens)
-        metadata.page_indices = device_array(mesh, page_indices)
-        metadata.seq_lens = device_array(mesh, seq_lens)
+        (
+            metadata.num_seqs,
+            metadata.cu_q_lens,
+            metadata.cu_kv_lens,
+            metadata.page_indices,
+            metadata.seq_lens,
+        ) = device_array(
+            mesh, (num_seqs, cu_q_lens, cu_kv_lens, page_indices, seq_lens)
+        )
         return metadata
 
     def tree_flatten(self):

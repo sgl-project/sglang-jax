@@ -1106,28 +1106,45 @@ class ScheduleBatch:
                 select_bs_index = i
                 break
 
-        cache_loc_flat = []
-        offset = 0
-        for seq_idx in range(len(seq_lens_cpu)):
-            seq_len = seq_lens_cpu[seq_idx]
-            if seq_len > 0:  # Only process non-empty sequences
-                tmp = token_indices_with_all_reqs[seq_idx, :seq_len].tolist()
-                aligned_tmp = align_to_size(tmp, page_size, 0)
-                cache_loc_flat.extend(aligned_tmp)
-                offset += seq_len
+        cache_loc_flat = np.array([], dtype=np.int32)
+        if len(seq_lens_cpu) > 0:
+            # Filter out empty sequences
+            valid_mask = seq_lens_cpu > 0
+            if np.any(valid_mask):
+                valid_indices = np.where(valid_mask)[0]
+                valid_seq_lens = seq_lens_cpu[valid_mask]
 
-        # note: to avoid aligned cache_loc_flat is greater than max_total_num_tokens, add max_bs * page_size
-        # total_cache_loc_size = max_total_num_tokens + max_bs * page_size
+                # Calculate aligned lengths for all valid sequences at once
+                aligned_lengths = (
+                    (valid_seq_lens + page_size - 1) // page_size
+                ) * page_size
+                total_aligned_length = np.sum(aligned_lengths)
+
+                # Pre-allocate the result array
+                cache_loc_flat = np.empty(total_aligned_length, dtype=np.int32)
+
+                # Fill the array efficiently
+                offset = 0
+                for i, (seq_idx, seq_len, aligned_len) in enumerate(
+                    zip(valid_indices, valid_seq_lens, aligned_lengths)
+                ):
+                    # Copy the actual data
+                    cache_loc_flat[offset : offset + seq_len] = (
+                        token_indices_with_all_reqs[seq_idx, :seq_len]
+                    )
+                    # Padding is already zero from initialization
+                    offset += aligned_len
+
+        offset = np.sum(seq_lens_cpu[seq_lens_cpu > 0]) if len(seq_lens_cpu) > 0 else 0
+
         total_cache_loc_size = cache_loc_paddings[select_bs_index]
-        cache_loc_cpu = cache_loc_flat
         assert total_cache_loc_size >= len(cache_loc_flat)
-        cache_loc_cpu = np.pad(
-            cache_loc_flat,
-            (0, total_cache_loc_size - len(cache_loc_flat)),
-            constant_values=0,
-        )
 
-        # seq_lens_padding = self.seq_lens
+        # Optimized: use np.empty since padding area won't be accessed
+        cache_loc_cpu = np.empty(total_cache_loc_size, dtype=np.int32)
+        if len(cache_loc_flat) > 0:
+            cache_loc_cpu[: len(cache_loc_flat)] = cache_loc_flat
+
         if bs_padding_size > 0:
             invalid_req_pool_indices = np.array(
                 [-1] * bs_padding_size, dtype=req_pool_indices_cpu.dtype
