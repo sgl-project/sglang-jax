@@ -5,7 +5,6 @@ import jax
 import jax.numpy as jnp
 from flax import nnx
 from jax import numpy as jnp
-from jax.sharding import PartitionSpec
 from transformers import PretrainedConfig
 
 from sgl_jax.srt.configs.model_config import ModelConfig

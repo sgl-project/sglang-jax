@@ -7,11 +7,9 @@ from flax import nnx
 from jax import lax
 from jax import numpy as jnp
 from jax import random
-from jax.sharding import Mesh
 
 from sgl_jax.srt.layers.logits_processor import LogitsProcessorOutput
-from sgl_jax.srt.sampling.sampling_batch_info import SamplingBatchInfo, SamplingMetadata
-from sgl_jax.srt.utils.jax_utils import device_array
+from sgl_jax.srt.sampling.sampling_batch_info import SamplingMetadata
 
 
 class Sampler(nnx.Module):

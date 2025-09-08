@@ -22,7 +22,6 @@ from functools import total_ordering
 from typing import TYPE_CHECKING, List, Optional
 
 import jax
-from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.utils.jax_utils import device_array
 
@@ -31,7 +30,6 @@ if TYPE_CHECKING:
     from sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch
     from sgl_jax.srt.mem_cache.memory_pool import KVCache
     from sgl_jax.srt.model_executor.model_runner import ModelRunner
-    from sgl_jax.srt.sampling.sampling_batch_info import SamplingBatchInfo
 
 from jax.tree_util import register_pytree_node_class
 
@@ -164,7 +162,6 @@ class ForwardBatch:
 
     def tree_flatten(self):
         children = (
-            self.bid,
             self.input_ids,
             self.req_pool_indices,
             self.seq_lens,
@@ -193,18 +190,17 @@ class ForwardBatch:
         obj.trace_request_ids = None
         obj.trace_request_objects = None
 
-        obj.bid = children[0]
-        obj.input_ids = children[1]
-        obj.req_pool_indices = children[2]
-        obj.seq_lens = children[3]
-        obj.out_cache_loc = children[4]
-        obj.positions = children[5]
-        obj.extend_start_loc = children[6]
-        obj.token_to_kv_pool = children[7]
-        obj.attn_backend = children[8]
-        obj.cache_loc = children[9]
-        obj.extend_prefix_lens = children[10]
-        obj.extend_seq_lens = children[11]
+        obj.input_ids = children[0]
+        obj.req_pool_indices = children[1]
+        obj.seq_lens = children[2]
+        obj.out_cache_loc = children[3]
+        obj.positions = children[4]
+        obj.extend_start_loc = children[5]
+        obj.token_to_kv_pool = children[6]
+        obj.attn_backend = children[7]
+        obj.cache_loc = children[8]
+        obj.extend_prefix_lens = children[9]
+        obj.extend_seq_lens = children[10]
 
         return obj
 
@@ -235,28 +231,45 @@ class ForwardBatch:
         batch: ModelWorkerBatch,
         model_runner: ModelRunner,
     ):
+        (
+            input_ids,
+            seq_lens,
+            out_cache_loc,
+            positions,
+            extend_start_loc,
+            req_pool_indices,
+            cache_loc,
+            extend_prefix_lens,
+            extend_seq_lens,
+        ) = device_array(
+            model_runner.mesh,
+            (
+                batch.input_ids,
+                batch.seq_lens,
+                batch.out_cache_loc,
+                batch.positions,
+                batch.extend_start_loc,
+                batch.req_pool_indices,
+                batch.cache_loc,
+                batch.extend_prefix_lens,
+                batch.extend_seq_lens,
+            ),
+        )
         obj = cls(
             bid=batch.bid,
             forward_mode=batch.forward_mode,
             batch_size=len(batch.seq_lens),
-            input_ids=device_array(model_runner.mesh, batch.input_ids),
-            seq_lens=device_array(model_runner.mesh, batch.seq_lens),
-            out_cache_loc=device_array(model_runner.mesh, batch.out_cache_loc),
-            positions=device_array(model_runner.mesh, batch.positions),
-            extend_start_loc=device_array(model_runner.mesh, batch.extend_start_loc),
-            req_pool_indices=device_array(model_runner.mesh, batch.req_pool_indices),
+            input_ids=input_ids,
+            seq_lens=seq_lens,
+            out_cache_loc=out_cache_loc,
+            positions=positions,
+            extend_start_loc=extend_start_loc,
+            req_pool_indices=req_pool_indices,
+            cache_loc=cache_loc,
+            extend_prefix_lens=extend_prefix_lens,
+            extend_seq_lens=extend_seq_lens,
             token_to_kv_pool=model_runner.token_to_kv_pool,
             attn_backend=model_runner.attn_backend,
-            cache_loc=device_array(model_runner.mesh, batch.cache_loc),
-            extend_prefix_lens=(
-                device_array(model_runner.mesh, batch.extend_prefix_lens)
-                if batch.extend_prefix_lens is not None
-                else None
-            ),
-            extend_seq_lens=(
-                device_array(model_runner.mesh, batch.extend_seq_lens)
-                if batch.extend_seq_lens is not None
-                else None
-            ),
         )
+
         return obj

@@ -669,10 +669,10 @@ def get_num_slices_per_block(new_kv: jax.Array, kv_cache: jax.Array, page_size=1
     )
 
 
-# @partial(
-#     jax.jit,
-#     static_argnames=["page_size", "num_slices_per_block"],
-# )
+@partial(
+    jax.jit,
+    static_argnames=["page_size", "num_slices_per_block", "kv_partition_axis"],
+)
 def kv_cache_update(
     new_kv: jax.Array,  # [total_num_token, num_kv_heads, head_dim]
     # [3, slices], list of (kv_cache_start, new_kv_start, slice_len)
@@ -788,7 +788,6 @@ VMEM_SIZE = 32 * 1024 * 1024  # 32MB
 PAGE_SIZE = 1
 
 
-# @jax.jit
 def update_kv_cache_vectorized(
     k: jax.Array,  # [total_tokens, num_heads, head_dim]
     v: jax.Array,  # [total_tokens, num_heads, head_dim]

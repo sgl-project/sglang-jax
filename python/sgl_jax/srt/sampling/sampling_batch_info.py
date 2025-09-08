@@ -31,9 +31,7 @@ class SamplingMetadata:
     """
 
     # logprob
-    return_logprob: (
-        bool  # only jit for return_logprob=False, support true in the future
-    )
+    return_logprob: bool
     top_logprobs_nums: Optional[List[int]]
     token_ids_logprobs: Optional[List[List[int]]]
 

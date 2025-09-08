@@ -115,24 +115,45 @@ class ModelRunner:
         self.init_attention_backend()
 
     def initialize_jit(self):
-        # Split model to avoid capturing large constants
         model_def, model_state = nnx.split(self.model)
+        model_state_leaves, model_state_def = jax.tree_util.tree_flatten(model_state)
         sampler_def, sampler_state = nnx.split(self.sampler)
+        sampler_state_leaves, sampler_state_def = jax.tree_util.tree_flatten(
+            sampler_state
+        )
 
         @partial(
-            jax.jit, donate_argnames=["forward_batch"]
-        )  # donate forward_batch (index 2)
-        def jitted_run_model(model_def, model_state, forward_batch, logits_metadata):
+            jax.jit,
+            donate_argnames=["forward_batch"],
+            static_argnames=["model_state_def"],
+        )
+        def jitted_run_model(
+            model_def,
+            model_state_def,
+            model_state_leaves,
+            forward_batch,
+            logits_metadata,
+        ):
+            model_state = jax.tree_util.tree_unflatten(
+                model_state_def, model_state_leaves
+            )
             model = nnx.merge(model_def, model_state)
             return model(forward_batch, logits_metadata)
 
-        @jax.jit
-        def jitted_sampler(sampler_def, sampler_state, *args):
-            sampler = nnx.merge(sampler_def, sampler_state)
+        @partial(jax.jit, static_argnames=["sampler_state_def"])
+        def jitted_sampler(sampler_def, sampler_state_def, sampler_state_leaves, *args):
+            model_state = jax.tree_util.tree_unflatten(
+                sampler_state_def, sampler_state_leaves
+            )
+            sampler = nnx.merge(sampler_def, model_state)
             return sampler(*args)
 
-        self.jitted_run_model = partial(jitted_run_model, model_def, model_state)
-        self.jitted_sampler = partial(jitted_sampler, sampler_def, sampler_state)
+        self.jitted_run_model = partial(
+            jitted_run_model, model_def, model_state_def, model_state_leaves
+        )
+        self.jitted_sampler = partial(
+            jitted_sampler, sampler_def, sampler_state_def, sampler_state_leaves
+        )
 
     def get_available_device_memory(self):
         min_available_device_memory = get_available_device_memory(
