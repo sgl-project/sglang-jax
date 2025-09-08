@@ -3,6 +3,7 @@ import glob
 import logging
 import math
 import os
+import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -140,7 +141,7 @@ class WeightLoader:
                 expert_weights[hf_key] = hf_weight.astype(self.dtype)
             else:
                 logger.warning(f"No mapping found for weight: {hf_key}")
-
+        time.sleep(100)
         if moe_mappings:
             self._process_moe_expert_weights(params, moe_mappings, expert_weights)
 
