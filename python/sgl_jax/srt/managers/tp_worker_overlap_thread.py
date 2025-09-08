@@ -123,8 +123,6 @@ class ModelWorkerClient:
                 break
 
             # Keep a reference of model_worker_batch by storing it into a list.
-            # Otherwise, the tensor members of model_worker_batch will be released
-            # by pytorch and cause CUDA illegal memory access errors.
             batch_lists[batch_pt % 2] = model_worker_batch
             batch_pt += 1
 
@@ -135,7 +133,7 @@ class ModelWorkerClient:
             )
 
             # Run forward
-            logits_output, next_token_ids_device, cache_miss_count = (
+            logits_output, next_token_ids, cache_miss_count = (
                 self.worker.forward_batch_generation(
                     model_worker_batch,
                     model_worker_batch.launch_done,
@@ -146,23 +144,8 @@ class ModelWorkerClient:
 
             # Update the future token ids map
             self.future_token_ids_map = set_future_token_ids(
-                self.future_token_ids_map, future_token_ids_ct, next_token_ids_device
+                self.future_token_ids_map, future_token_ids_ct, next_token_ids
             )
-
-            # Copy results to the CPU
-            if model_worker_batch.return_logprob:
-                logits_output.next_token_logprobs = jax.device_get(
-                    logits_output.next_token_logprobs
-                )
-                if logits_output.input_token_logprobs is not None:
-                    logits_output.input_token_logprobs = jax.device_get(
-                        logits_output.input_token_logprobs
-                    )
-            if logits_output.hidden_states is not None:
-                logits_output.hidden_states = jax.device_get(
-                    logits_output.hidden_states
-                )
-            next_token_ids = jax.device_get(next_token_ids_device).tolist()
 
             self.output_queue.put(
                 (None, logits_output, next_token_ids, cache_miss_count)
@@ -174,20 +157,21 @@ class ModelWorkerClient:
         wait for the current batch to be launched. Used in overlap mode.
         """
         _, logits_output, next_token_ids, cache_miss_count = self.output_queue.get()
+        if logits_output.next_token_logprobs is not None:
+            logits_output.next_token_logprobs = jax.device_get(
+                logits_output.next_token_logprobs
+            ).tolist()
+        if logits_output.input_token_logprobs is not None:
+            logits_output.input_token_logprobs = jax.device_get(
+                logits_output.input_token_logprobs
+            ).tolist()
+        if logits_output.hidden_states is not None:
+            logits_output.hidden_states = jax.device_get(logits_output.hidden_states)
+        next_token_ids = jax.device_get(next_token_ids).tolist()
 
         if launch_done is not None:
             launch_done.wait()
-        # JAX handles synchronization automatically, no explicit sync needed
 
-        if logits_output.next_token_logprobs is not None:
-            logits_output.next_token_logprobs = (
-                logits_output.next_token_logprobs.tolist()
-            )
-            if logits_output.input_token_logprobs is not None:
-                logits_output.input_token_logprobs = tuple(
-                    logits_output.input_token_logprobs.tolist()
-                )
-        # next_token_ids = next_token_ids.tolist()
         return logits_output, next_token_ids, cache_miss_count
 
     def forward_batch_generation(
