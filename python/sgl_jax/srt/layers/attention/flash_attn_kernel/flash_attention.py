@@ -72,7 +72,7 @@ TUNED_BLOCK_SIZES = {
         ("bfloat16", "bfloat16", 8, 128, 64): (16, 64),
         ("bfloat16", "bfloat16", 16, 128, 64): (16, 64),
         ("bfloat16", "bfloat16", 32, 128, 64): (16, 64),
-        ("bfloat16", "bfloat16", 2, 128, 128): (16, 32),
+        ("bfloat16", "bfloat16", 2, 128, 128): (32, 64),
         ("bfloat16", "bfloat16", 4, 128, 128): (8, 32),
         ("bfloat16", "bfloat16", 8, 128, 128): (16, 32),
         ("bfloat16", "bfloat16", 16, 128, 128): (8, 32),
@@ -945,6 +945,7 @@ def ragged_paged_attention(
         num_seqs,
         seq_lens,
     )
+
     kernel = pl.pallas_call(
         functools.partial(
             ragged_paged_attention_kernel,
