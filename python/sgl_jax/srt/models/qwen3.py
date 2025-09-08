@@ -286,7 +286,9 @@ class QWen3Model(nnx.Module):
         dtype: jnp.dtype = jnp.bfloat16,
         rngs: nnx.Rngs = None,
     ):
-
+        logger.info(
+            f"QWen3Model: Creating embedding layer (vocab_size={config.vocab_size}, hidden_size={config.hidden_size})"
+        )
         self.embed_tokens = Embed(
             num_embeddings=config.vocab_size,
             features=config.hidden_size,
@@ -295,6 +297,9 @@ class QWen3Model(nnx.Module):
             param_dtype=dtype,
         )
 
+        logger.info(
+            f"QWen3Model: Creating {config.num_hidden_layers} transformer layers"
+        )
         self.layers = [
             QWen3DecoderLayer(
                 config=config,
@@ -305,6 +310,7 @@ class QWen3Model(nnx.Module):
             for i in range(config.num_hidden_layers)
         ]
 
+        logger.info("QWen3Model: Creating final layer norm")
         self.norm = nnx.RMSNorm(
             config.hidden_size,
             epsilon=config.rms_norm_eps,
@@ -312,6 +318,7 @@ class QWen3Model(nnx.Module):
             scale_init=nnx.with_partitioning(init_fn, (None,)),
             rngs=rngs,
         )
+        logger.info("QWen3Model: Initialization complete")
 
     def __call__(
         self,
@@ -345,17 +352,102 @@ class Qwen3ForCausalLM(nnx.Module):
     def __init__(
         self, config: ModelConfig, rngs: nnx.Rngs = None, mesh: jax.sharding.Mesh = None
     ):
+        import os
+        import subprocess
+
         self.mesh = mesh
         self.config = config
         self.dtype = config.dtype
         logger.info(f"QWen3ForCausalLMModel config dtype: {self.dtype}")
+
+        # Monitor TPU memory before transformer initialization
+        logger.info("=== TPU Memory Before Transformer Init ===")
+        logger.info(f"JAX devices: {[str(d) for d in jax.devices()]}")
+        logger.info(f"JAX default device: {jax.default_device()}")
+        logger.info(f"Mesh devices: {mesh.devices if mesh else 'No mesh'}")
+        try:
+            result = subprocess.run(
+                ["tpu-info"], capture_output=True, text=True, timeout=10
+            )
+            if result.returncode == 0:
+                logger.info(f"TPU Info Output:\n{result.stdout}")
+            else:
+                logger.info(
+                    f"tpu-info failed with return code {result.returncode}: {result.stderr}"
+                )
+        except subprocess.TimeoutExpired:
+            logger.info("tpu-info command timed out")
+        except FileNotFoundError:
+            logger.info("tpu-info command not found")
+        except Exception as e:
+            logger.info(f"Error running tpu-info: {e}")
+
         self.transformer = QWen3Model(config.hf_config, dtype=self.dtype, rngs=rngs)
+
+        # Monitor TPU memory after transformer initialization
+        logger.info("=== TPU Memory After Transformer Init ===")
+        try:
+            result = subprocess.run(
+                ["tpu-info"], capture_output=True, text=True, timeout=10
+            )
+            if result.returncode == 0:
+                logger.info(f"TPU Info Output:\n{result.stdout}")
+            else:
+                logger.info(
+                    f"tpu-info failed with return code {result.returncode}: {result.stderr}"
+                )
+        except subprocess.TimeoutExpired:
+            logger.info("tpu-info command timed out")
+        except FileNotFoundError:
+            logger.info("tpu-info command not found")
+        except Exception as e:
+            logger.info(f"Error running tpu-info: {e}")
+
         self.lm_head = ParallelLMHead(
             config.hf_config.vocab_size, config.hidden_size, rngs=rngs
         )
+
+        # Monitor TPU memory after lm_head initialization
+        logger.info("=== TPU Memory After LM Head Init ===")
+        try:
+            result = subprocess.run(
+                ["tpu-info"], capture_output=True, text=True, timeout=10
+            )
+            if result.returncode == 0:
+                logger.info(f"TPU Info Output:\n{result.stdout}")
+            else:
+                logger.info(
+                    f"tpu-info failed with return code {result.returncode}: {result.stderr}"
+                )
+        except subprocess.TimeoutExpired:
+            logger.info("tpu-info command timed out")
+        except FileNotFoundError:
+            logger.info("tpu-info command not found")
+        except Exception as e:
+            logger.info(f"Error running tpu-info: {e}")
+
         self.logits_processor = LogitsProcessor(
             config.hf_config.vocab_size, self.lm_head, self.mesh
         )
+
+        # Monitor TPU memory after logits_processor initialization
+        logger.info("=== TPU Memory After LogitsProcessor Init ===")
+        try:
+            result = subprocess.run(
+                ["tpu-info"], capture_output=True, text=True, timeout=10
+            )
+            if result.returncode == 0:
+                logger.info(f"TPU Info Output:\n{result.stdout}")
+            else:
+                logger.info(
+                    f"tpu-info failed with return code {result.returncode}: {result.stderr}"
+                )
+        except subprocess.TimeoutExpired:
+            logger.info("tpu-info command timed out")
+        except FileNotFoundError:
+            logger.info("tpu-info command not found")
+        except Exception as e:
+            logger.info(f"Error running tpu-info: {e}")
 
     def load_weights(self, rng_key: jax.Array):
         logger.info("start load weights************************************")
