@@ -117,6 +117,11 @@ class WeightLoader:
     def load_weights_from_safetensors(
         self, weight_mappings: Dict[str, Union[str, List[str], WeightMapping]]
     ):
+        import subprocess
+
+        logger.info("=== TPU Memory Before Weight Loading ===")
+        self._print_tpu_info()
+
         params = nnx.state(self.model)
 
         regular_mappings = {}
@@ -129,26 +134,90 @@ class WeightLoader:
                 regular_mappings[key] = mapping
 
         expert_weights = {}
-        # logger.info("start iterate weights************************************")
+        logger.info("=== Starting Weight Iteration ===")
+        self._print_tpu_info()
 
-        # time.sleep(100)
+        weight_count = 0
         for hf_key, hf_weight in self._iterate_weights():
+            weight_count += 1
+            logger.info(
+                f"Processing weight {weight_count}: {hf_key} (shape: {hf_weight.shape})"
+            )
+
             if hf_key in regular_mappings:
                 mapping = regular_mappings[hf_key]
                 if isinstance(mapping, (str, list)):
                     mapping = WeightMapping(target_path=mapping)
 
                 self._process_and_assign_weight(params, hf_key, hf_weight, mapping)
+
+                # Monitor TPU memory after processing large weights
+                if hf_weight.size > 50_000_000:  # > 50M parameters
+                    logger.info(
+                        f"=== TPU Memory After Processing Large Weight {hf_key} ==="
+                    )
+                    self._print_tpu_info()
+
             elif "mlp.experts." in hf_key and hf_key.endswith(".weight"):
                 expert_weights[hf_key] = hf_weight.astype(self.dtype)
             else:
                 logger.warning(f"No mapping found for weight: {hf_key}")
-        # logger.info("end iterate weights************************************")
-        # time.sleep(100)
-        if moe_mappings:
-            self._process_moe_expert_weights(params, moe_mappings, expert_weights)
 
+        logger.info("=== TPU Memory After All Weights Processed ===")
+        self._print_tpu_info()
+
+        if moe_mappings:
+            logger.info("=== Processing MoE Expert Weights ===")
+            self._process_moe_expert_weights(params, moe_mappings, expert_weights)
+            logger.info("=== TPU Memory After MoE Processing ===")
+            self._print_tpu_info()
+
+        logger.info("=== Applying Final Model Update ===")
         nnx.update(self.model, params)
+
+        logger.info("=== TPU Memory After Model Update ===")
+        self._print_tpu_info()
+
+    def _print_tpu_info(self):
+        import subprocess
+
+        try:
+            result = subprocess.run(
+                ["tpu-info"], capture_output=True, text=True, timeout=10
+            )
+            if result.returncode == 0:
+                # Extract only the memory usage table
+                lines = result.stdout.split("\n")
+                memory_section = False
+                memory_lines = []
+
+                for line in lines:
+                    if "TPU Runtime Utilization" in line or "HBM Usage" in line:
+                        memory_section = True
+                    elif memory_section and line.strip() == "":
+                        break
+                    elif memory_section:
+                        memory_lines.append(line)
+
+                if memory_lines:
+                    logger.info("TPU Memory Usage:")
+                    for line in memory_lines[
+                        :10
+                    ]:  # Show first 10 lines of memory section
+                        logger.info(f"  {line}")
+                else:
+                    # Fallback to full output if parsing fails
+                    logger.info(f"TPU Info Output:\n{result.stdout}")
+            else:
+                logger.info(
+                    f"tpu-info failed with return code {result.returncode}: {result.stderr}"
+                )
+        except subprocess.TimeoutExpired:
+            logger.info("tpu-info command timed out")
+        except FileNotFoundError:
+            logger.info("tpu-info command not found")
+        except Exception as e:
+            logger.info(f"Error running tpu-info: {e}")
 
     def _iterate_weights(self):
 
@@ -159,14 +228,32 @@ class WeightLoader:
             raise RuntimeError(f"Cannot find any *.safetensors files in {model_path}")
 
         weights_files.sort()
+        logger.info(f"Found {len(weights_files)} safetensors files to load")
 
-        for st_file in weights_files:
-            logger.info(f"Loading weights from {st_file}")
+        for file_idx, st_file in enumerate(weights_files):
+            logger.info(
+                f"Loading weights from file {file_idx+1}/{len(weights_files)}: {st_file}"
+            )
+            logger.info(f"=== TPU Memory Before Loading File {file_idx+1} ===")
+            self._print_tpu_info()
+
             with jax.default_device(jax.local_devices(backend="cpu")[0]):
+                logger.info(
+                    f"Loading with CPU device: {jax.local_devices(backend='cpu')[0]}"
+                )
                 with safe_open(st_file, framework="flax") as f:
-                    for name in f.keys():
+                    weight_names = list(f.keys())
+                    logger.info(f"File contains {len(weight_names)} weights")
+
+                    for name_idx, name in enumerate(weight_names):
                         weight_tensor = f.get_tensor(name)
+                        logger.info(
+                            f"  Loaded weight {name_idx+1}/{len(weight_names)}: {name} (shape: {weight_tensor.shape}, size: {weight_tensor.size:,})"
+                        )
                         yield name, weight_tensor
+
+            logger.info(f"=== TPU Memory After Loading File {file_idx+1} ===")
+            self._print_tpu_info()
 
     def _process_and_assign_weight(
         self,
@@ -354,9 +441,37 @@ class WeightLoader:
             )
 
     def _shard_weight(self, weight: jax.Array, sharding: tuple) -> jax.Array:
+        mesh_size = math.prod(self.mesh.axis_sizes)
+
         if math.prod(self.mesh.axis_sizes) == 1:
-            return jax.device_put(weight, self.mesh.devices.flatten()[0])
-        return jax.device_put(weight, NamedSharding(self.mesh, P(*sharding)))
+            target_device = self.mesh.devices.flatten()[0]
+            logger.info(
+                f"Single device mode: placing weight {weight.shape} on {target_device}"
+            )
+            return jax.device_put(weight, target_device)
+        else:
+            sharding_spec = NamedSharding(self.mesh, P(*sharding))
+
+            # Always log sharding for significant weights
+            if weight.size > 1_000_000:  # > 1M parameters
+                logger.info(
+                    f"Sharding weight: shape={weight.shape}, size={weight.size:,}, sharding={sharding}"
+                )
+                logger.info(
+                    f"  Using devices: {[str(d) for d in self.mesh.devices.flatten()]}"
+                )
+                logger.info(f"  Sharding spec: {sharding_spec}")
+
+                # Monitor TPU memory before and after sharding large weights
+                if weight.size > 100_000_000:  # > 100M parameters
+                    logger.info("=== TPU Memory Before Sharding Large Weight ===")
+                    self._print_tpu_info()
+                    result = jax.device_put(weight, sharding_spec)
+                    logger.info("=== TPU Memory After Sharding Large Weight ===")
+                    self._print_tpu_info()
+                    return result
+
+            return jax.device_put(weight, sharding_spec)
 
     def _get_param(self, params: nnx.State, path: str) -> nnx.State:
         keys = path.split(".")
