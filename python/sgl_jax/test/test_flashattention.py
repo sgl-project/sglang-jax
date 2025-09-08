@@ -130,7 +130,7 @@ def create_test_data(
     page_size,
     input_ids=None,
     model_config=None,
-    max_total_token_size=200000,
+    max_total_token_size=710016,
 ):
     """Create a real ForwardBatch for testing."""
     assert mode in ["prefill", "decode"]
@@ -256,6 +256,7 @@ def create_test_data(
     )
 
     fb = ForwardBatch(
+        bid=1,
         forward_mode=forward_mode,
         batch_size=batch_size,
         input_ids=input_ids,
@@ -270,7 +271,9 @@ def create_test_data(
         extend_prefix_lens=extend_prefix_lens,
         extend_seq_lens=extend_seq_lens,
     )
-    fb.attn_backend.forward_metadata = attention_backend.init_forward_metadata(fb)
+    fb.attn_backend.forward_metadata = attention_backend.get_forward_metadata(
+        mwb, mesh=mesh
+    )
     return fb, q, k, v
 
 
@@ -318,11 +321,10 @@ class TestAttention(CustomTestCase):
         print(f"cache_loc: {forward_batch.cache_loc[:100]}")
         print(f"cache_loc[100:200]: {forward_batch.cache_loc[100:200]}")
         print(f"out_cache_loc: {forward_batch.out_cache_loc[:100]}")
-        print()
 
         # Create test data
         shading = jax.sharding.NamedSharding(mesh, P(None, "tensor"))
-        q_shard = jax.device_put(q.copy(), shading).reshape(q.shape[0], -1)
+        q_shard = jax.device_put(q.copy(), shading)
         k_cache_shard = jax.device_put(k.copy(), shading)
         v_cache_shard = jax.device_put(v.copy(), shading)
 
@@ -330,8 +332,6 @@ class TestAttention(CustomTestCase):
         extend_k, extend_v = write_prefix_tokens_for_kv(
             forward_batch, lens, k_cache_shard, v_cache_shard
         )
-        extend_k = extend_k.reshape(extend_k.shape[0], -1)
-        extend_v = extend_v.reshape(extend_v.shape[0], -1)
 
         # JAX attention
         attn = RadixAttention(

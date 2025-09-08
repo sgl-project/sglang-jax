@@ -163,9 +163,9 @@ class FlashAttention(AttentionBackend):
 
     def __call__(
         self,
-        q: jax.Array,  # [total_tokens, hidden_size]
-        k: jax.Array,  # [total_tokens, hidden_size]
-        v: jax.Array,  # [total_tokens, hidden_size]
+        q: jax.Array,  # [total_tokens, num_heads, head_dim]
+        k: jax.Array,  # [total_tokens, num_heads, head_dim]
+        v: jax.Array,  # [total_tokens, num_heads, head_dim]
         layer: RadixAttention,
         forward_batch: ForwardBatch,
         attention_mask: jax.Array = None,
@@ -173,7 +173,7 @@ class FlashAttention(AttentionBackend):
     ):
         """
         Args:
-            q, k, v: Input tensors of shape [total_tokens, hidden_size]
+            q, k, v: Input tensors of shape [total_tokens, num_heads, head_dim]
             forward_batch: ForwardBatch object containing seq_lens and batch_size
             attention_mask: Optional attention mask
             is_causal: Whether to apply causal masking
