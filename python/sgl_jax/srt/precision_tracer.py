@@ -46,7 +46,9 @@ class TensorJSONEncoder(json.JSONEncoder):
 
 
 class PrecisionTracerRequestMetadata:
-    def __init__(self, request_id, request_input_ids, forward_mode):
+    def __init__(
+        self, request_id, request_input_ids, forward_mode, is_chunked=0, chunk_info=None
+    ):
         self.request_id = request_id
         self.input_hash = hashlib.md5(
             str(request_input_ids).encode("utf-8")
@@ -54,6 +56,8 @@ class PrecisionTracerRequestMetadata:
         self.request_input_ids = request_input_ids
         self.input_len = len(request_input_ids)
         self.forward_mode = forward_mode
+        self.is_chunked = is_chunked
+        self.chunk_info = chunk_info or {}
 
     def to_dict(self):
         return {
@@ -61,6 +65,8 @@ class PrecisionTracerRequestMetadata:
             "input_hash": self.input_hash,
             "input_len": self.input_len,
             "forward_mode": self.forward_mode,
+            "is_chunked": self.is_chunked,
+            "chunk_info": self.chunk_info,
         }
 
 
@@ -130,6 +136,11 @@ class PrecisionTracer:
         self._token_counters: Dict[str, int] = {}
         self._last_forward_pass_id: Dict[str, int] = {}
         self._current_forward_pass_id: int = -1
+
+        # chunked prefill support
+        self._chunked_matrices: Dict[str, Dict[str, List[Any]]] = {}
+        self._chunked_metadata: Dict[str, Dict[str, Any]] = {}
+        self._chunked_completion_status: Dict[str, bool] = {}
 
     def set_enable_precision_tracer(self, enabled: bool):
         self._enable_precision_tracer = enabled
@@ -256,6 +267,9 @@ class PrecisionTracer:
         self._batch_requests_mapping.clear()
         self._token_counters.clear()
         self._last_forward_pass_id.clear()
+        self._chunked_matrices.clear()
+        self._chunked_metadata.clear()
+        self._chunked_completion_status.clear()
         logger.info(f"Request tracing stopped. Traces saved to: {output_file}")
         return output_file
 
@@ -341,6 +355,13 @@ class PrecisionTracer:
 
         if len(request_in_batch) == 0:
             logger.warning(f"Batch {current_batch_id} has no requests to trace")
+            return
+
+        # Check if any request in batch is chunked prefill
+        has_chunked_prefill = self._has_chunked_prefill_requests(request_in_batch)
+
+        if has_chunked_prefill:
+            self._handle_chunked_prefill(tensor, name, stage, request_in_batch)
             return
 
         prisicion_infos = self._calculate_tensor_pricision_info(
@@ -434,6 +455,221 @@ class PrecisionTracer:
                 stats_with_req_id = data.copy()
                 stats_with_req_id["request_id"] = req_id
                 self._verbose_logging_console(stats_with_req_id)
+
+    def _has_chunked_prefill_requests(
+        self, request_in_batch: List[PrecisionTracerRequestMetadata]
+    ) -> bool:
+        """Check if any request in the batch is chunked prefill."""
+        for req_meta in request_in_batch:
+            # Check if this is a prefill mode request that is chunked
+            if req_meta.forward_mode == 1 and req_meta.is_chunked > 0:
+                return True
+        return False
+
+    def _handle_chunked_prefill(
+        self,
+        tensor: Any,
+        name: str,
+        stage: str,
+        request_in_batch: List[PrecisionTracerRequestMetadata],
+    ):
+        """Handle tensor recording for chunked prefill requests."""
+        for req_meta in request_in_batch:
+            req_id = req_meta.request_id
+
+            # Store the tensor chunk
+            self._store_chunked_tensor(req_id, name, stage, tensor, req_meta)
+
+            # Check if all chunks are complete for this request
+            if self._is_chunked_prefill_complete(req_id, name, stage):
+                self._process_complete_chunked_prefill(req_id, name, stage)
+
+    def _store_chunked_tensor(
+        self,
+        req_id: str,
+        name: str,
+        stage: str,
+        tensor: Any,
+        req_meta: PrecisionTracerRequestMetadata,
+    ):
+        """Store a tensor chunk for later concatenation."""
+        # Create unique key for this tensor type using a separator that won't conflict
+        tensor_key = f"{name}||{stage}"
+
+        # Initialize storage if needed
+        if req_id not in self._chunked_matrices:
+            self._chunked_matrices[req_id] = {}
+            self._chunked_metadata[req_id] = {}
+
+        if tensor_key not in self._chunked_matrices[req_id]:
+            self._chunked_matrices[req_id][tensor_key] = []
+            self._chunked_metadata[req_id][tensor_key] = {
+                "name": name,
+                "stage": stage,
+                "req_meta": req_meta,
+                "chunk_count": 0,
+                "expected_chunks": None,
+            }
+
+        # Store the tensor chunk
+        self._chunked_matrices[req_id][tensor_key].append(tensor)
+        self._chunked_metadata[req_id][tensor_key]["chunk_count"] += 1
+
+        logger.debug(
+            f"Stored chunk {self._chunked_metadata[req_id][tensor_key]['chunk_count']} "
+            f"for {req_id}:{tensor_key}"
+        )
+
+    def _is_chunked_prefill_complete(self, req_id: str, name: str, stage: str) -> bool:
+        """Check if all chunks for a specific tensor are complete."""
+        tensor_key = f"{name}||{stage}"
+
+        if (
+            req_id not in self._chunked_matrices
+            or tensor_key not in self._chunked_matrices[req_id]
+        ):
+            return False
+
+        # Check if this request has been marked as complete
+        if req_id in self._chunked_completion_status:
+            return self._chunked_completion_status[req_id]
+
+        # For now, accumulate chunks until explicitly completed
+        # This will be enhanced with proper scheduling integration
+        return False
+
+    def mark_chunked_prefill_complete(self, req_id: str):
+        """Mark a chunked prefill request as complete for processing."""
+        self._chunked_completion_status[req_id] = True
+        logger.debug(f"Marked chunked prefill complete for request {req_id}")
+
+        # Process all stored tensors for this request
+        if req_id in self._chunked_matrices:
+            tensor_keys = list(self._chunked_matrices[req_id].keys())
+            for tensor_key in tensor_keys:
+                parts = tensor_key.split("||")
+                if len(parts) == 2:
+                    name, stage = parts
+                    self._process_complete_chunked_prefill(req_id, name, stage)
+
+    def _process_complete_chunked_prefill(self, req_id: str, name: str, stage: str):
+        """Concatenate chunks and compute final statistics."""
+        tensor_key = f"{name}||{stage}"
+
+        if (
+            req_id not in self._chunked_matrices
+            or tensor_key not in self._chunked_matrices[req_id]
+        ):
+            logger.warning(f"No chunks found for {req_id}:{tensor_key}")
+            return
+
+        chunks = self._chunked_matrices[req_id][tensor_key]
+        metadata = self._chunked_metadata[req_id][tensor_key]
+
+        logger.debug(f"Processing {len(chunks)} chunks for {req_id}:{tensor_key}")
+
+        try:
+            # Concatenate all chunks along the sequence dimension (axis=0)
+            concatenated_tensor = jnp.concatenate(chunks, axis=0)
+            logger.debug(
+                f"Concatenated tensor for {req_id}:{tensor_key} - "
+                f"Shape: {concatenated_tensor.shape}, "
+                f"Min: {jnp.min(concatenated_tensor):.2f}, "
+                f"Max: {jnp.max(concatenated_tensor):.2f}"
+            )
+
+            # Create a single request metadata for processing
+            # Update the input length to reflect the concatenated tensor
+            req_meta = metadata["req_meta"]
+            original_input_len = req_meta.input_len
+            req_meta.input_len = concatenated_tensor.shape[0]  # Use concatenated length
+            request_in_batch = [req_meta]
+
+            logger.debug(
+                f"Updated input_len from {original_input_len} to {req_meta.input_len} for concatenated tensor"
+            )
+
+            # Calculate precision info for the concatenated tensor
+            precision_infos = self._calculate_tensor_pricision_info(
+                concatenated_tensor, name, stage, request_in_batch
+            )
+
+            # Process the results same as regular (non-chunked) requests
+            with self.lock:
+                for req_id_key, data in precision_infos.items():
+                    if req_id_key in self._records:
+                        forward_mode = req_meta.forward_mode
+                        category = "prefill" if forward_mode == 1 else "decode"
+
+                        precision_records = self._records[req_id_key].precision_records
+
+                        if category not in precision_records:
+                            precision_records[category] = []
+
+                        # Add metadata indicating this was from chunked prefill
+                        data["chunked_prefill"] = True
+                        data["chunk_count"] = len(chunks)
+
+                        # Create token group for chunked prefill
+                        current_token_group = {
+                            "token_idx": 0,
+                            "category": category,
+                            "records": [],
+                        }
+
+                        if "sequence_length" in data:
+                            self._token_counters[req_id_key] = data["sequence_length"]
+                        else:
+                            self._token_counters[req_id_key] = 1
+
+                        record_with_metadata = data.copy()
+                        current_token_group["records"].append(record_with_metadata)
+                        precision_records[category].append(current_token_group)
+
+                    # Verbose logging
+                    stats_with_req_id = data.copy()
+                    stats_with_req_id["request_id"] = req_id_key
+                    self._verbose_logging_console(stats_with_req_id)
+
+            # Clean up stored chunks
+            del self._chunked_matrices[req_id][tensor_key]
+            del self._chunked_metadata[req_id][tensor_key]
+
+            # Clean up empty entries
+            if not self._chunked_matrices[req_id]:
+                del self._chunked_matrices[req_id]
+            if not self._chunked_metadata[req_id]:
+                del self._chunked_metadata[req_id]
+
+            # Clean up completion status if all tensors processed
+            if (
+                req_id not in self._chunked_matrices
+                and req_id in self._chunked_completion_status
+            ):
+                del self._chunked_completion_status[req_id]
+
+            logger.debug(
+                f"Completed processing chunked prefill for {req_id}:{tensor_key}"
+            )
+
+        except Exception as e:
+            logger.error(
+                f"Error processing chunked prefill for {req_id}:{tensor_key}: {e}"
+            )
+            # Clean up on error
+            if (
+                req_id in self._chunked_matrices
+                and tensor_key in self._chunked_matrices[req_id]
+            ):
+                del self._chunked_matrices[req_id][tensor_key]
+            if (
+                req_id in self._chunked_metadata
+                and tensor_key in self._chunked_metadata[req_id]
+            ):
+                del self._chunked_metadata[req_id][tensor_key]
+            # Clean up completion status on error
+            if req_id in self._chunked_completion_status:
+                del self._chunked_completion_status[req_id]
 
     def _calculate_tensor_pricision_info(
         self,
