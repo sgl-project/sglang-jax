@@ -62,12 +62,18 @@ class Embed(nnx.Module):
         None
         """
         param = rngs.params()
+        partitioned_init = nnx.with_partitioning(default_embed_init, (None, None))
+
         logger.info("Embed1: Creating embedding layer")
         self._print_tpu_info()
-        time.sleep(100)
-        fn = nnx.with_partitioning(default_embed_init, (None, None))(
-            param, (num_embeddings, features), param_dtype
-        )
+        time.sleep(30)
+        # 步骤1：创建带分片信息的初始化器
+
+        # 步骤2：调用初始化器创建实际的权重张量
+        fn = partitioned_init(param, (num_embeddings, features), param_dtype)
+        # fn = nnx.with_partitioning(default_embed_init, (None, None))(
+        #     param, (num_embeddings, features), param_dtype
+        # )
         logger.info("Embed2: Creating embedding layer")
         self._print_tpu_info()
         time.sleep(100)
