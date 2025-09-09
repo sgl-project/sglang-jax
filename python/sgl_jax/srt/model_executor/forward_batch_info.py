@@ -247,7 +247,11 @@ class ForwardBatch:
         logger.info(f"  {log_array('seq_lens', batch.seq_lens)}")
         logger.info(f"  {log_array('out_cache_loc', batch.out_cache_loc)}")
         logger.info(f"  {log_array('positions', batch.positions)}")
+        logger.info(f"  {log_array('extend_start_loc', batch.extend_start_loc)}")
         logger.info(f"  {log_array('req_pool_indices', batch.req_pool_indices)}")
+        logger.info(f"  {log_array('cache_loc', batch.cache_loc)}")
+        logger.info(f"  {log_array('extend_prefix_lens', batch.extend_prefix_lens)}")
+        logger.info(f"  {log_array('extend_seq_lens', batch.extend_seq_lens)}")
 
         (
             input_ids,

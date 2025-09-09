@@ -1045,7 +1045,7 @@ class ScheduleBatch:
             input_ids_cpu = np.concat(
                 [
                     input_ids_cpu,
-                    np.array([0] * padding_size, dtype=input_ids_cpu.dtype),
+                    np.zeros(padding_size, dtype=input_ids_cpu.dtype),
                 ],
                 axis=0,
             )
@@ -1169,7 +1169,7 @@ class ScheduleBatch:
                 ],
                 axis=0,
             )
-            invalid_seq_lens = np.array([0] * bs_padding_size, dtype=seq_lens_cpu.dtype)
+            invalid_seq_lens = np.zeros(bs_padding_size, dtype=seq_lens_cpu.dtype)
             seq_lens_cpu = np.concat([seq_lens_cpu, invalid_seq_lens], axis=0)
             if self.forward_mode.is_extend():
                 invalid_extend_start_loc = np.array(
