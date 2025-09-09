@@ -57,10 +57,9 @@ class Embed(nnx.Module):
         Returns:
         None
         """
-        key = rngs.params()
         self.embedding = nnx.Param(
             nnx.with_partitioning(default_embed_init, (None, None))(
-                key, (num_embeddings, features), param_dtype
+                rngs.params(), (num_embeddings, features), param_dtype
             )
         )
 
@@ -127,10 +126,9 @@ class ParallelLMHead(Embed):
             rngs=rngs,
         )
         if use_bias:
-            key = rngs.params()
             self.bias = nnx.Param(
                 nnx.with_partitioning(nnx.initializers.constant(0.0), (None, "tensor"))(
-                    key, (self.num_embeddings, self.features), dtype
+                    rngs.params(), (self.num_embeddings, self.features), dtype
                 )
             )
         else:
