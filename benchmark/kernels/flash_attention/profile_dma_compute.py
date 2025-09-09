@@ -70,25 +70,25 @@ def benchmark_separated():
         print(f"Average time: {avg_time:.3f} ms")
         return avg_time
 
-    # 测试不同配置来分析瓶颈
+    # 测试不同配置来分析瓶颈（调整为32M VMEM友好的配置）
     results = {}
 
-    # 1. DMA密集型：小块，频繁传输
+    # 1. 极小块：测试DMA开销极限
+    results["Tiny_blocks"] = benchmark_config(
+        "极小块 (最大DMA开销)", kv_pages=1, q_block=8
+    )
+
+    # 2. DMA密集型：小块，频繁传输
     results["DMA_intensive"] = benchmark_config(
         "DMA密集型 (小块频繁传输)", kv_pages=2, q_block=16
     )
 
-    # 2. 计算密集型：大块，减少传输
-    results["Compute_intensive"] = benchmark_config(
-        "计算密集型 (大块少传输)", kv_pages=32, q_block=64
-    )
-
     # 3. 中等配置：平衡
-    results["Balanced"] = benchmark_config("平衡配置", kv_pages=8, q_block=32)
+    results["Balanced"] = benchmark_config("平衡配置", kv_pages=4, q_block=16)
 
-    # 4. 极小块：测试DMA开销极限
-    results["Tiny_blocks"] = benchmark_config(
-        "极小块 (最大DMA开销)", kv_pages=1, q_block=8
+    # 4. 计算密集型：稍大块，减少传输（调小避免OOM）
+    results["Compute_intensive"] = benchmark_config(
+        "计算密集型 (大块少传输)", kv_pages=8, q_block=24
     )
 
     print(f"\n{'='*50}")
