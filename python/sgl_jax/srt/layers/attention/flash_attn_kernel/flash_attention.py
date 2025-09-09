@@ -480,7 +480,9 @@ def ragged_paged_attention_kernel(
                 heads_blk_idx + 1,
                 heads_blk_idx,
             )
-            next_buf_idx = lax.select(cur_buf_idx == 0, 1, 0)
+            # 动态缓冲：根据实际缓冲深度循环
+            buffer_depth = k_bufs.shape[0]
+            next_buf_idx = (cur_buf_idx + 1) % buffer_depth
             return next_heads_blk_idx, next_seq_idx, next_kv_blk_idx, next_buf_idx
 
         def flash_attention(
@@ -919,9 +921,29 @@ def ragged_paged_attention(
         (num_q_per_blk, num_q_heads_per_blk, head_dim),
         jnp.float32,
     )
-    double_kv_buf_scratch = pltpu.VMEM(
+    # 动态缓冲深度：根据VMEM限制自动选择最优缓冲深度
+    if vmem_limit_bytes is None:
+        buffer_depth = 2  # 默认双缓冲
+    else:
+        # 根据VMEM大小动态选择缓冲深度
+        single_buffer_size = (
+            num_kv_pages_per_blk * page_size * num_kv_heads_per_blk * head_dim * 2
+        )  # K+V
+        if k_cache.dtype == jnp.bfloat16:
+            single_buffer_size *= 2  # bfloat16 = 2 bytes
+
+        max_buffers = vmem_limit_bytes // (
+            single_buffer_size * 4
+        )  # 保守估计，留25%给其他用途
+        buffer_depth = min(max(2, max_buffers), 4)  # 限制在2-4之间
+
+    print(
+        f"🔄 Dynamic buffering: using {buffer_depth} buffers (VMEM: {vmem_limit_bytes//1024//1024 if vmem_limit_bytes else 'default'}MB)"
+    )
+
+    dynamic_kv_buf_scratch = pltpu.VMEM(
         (
-            2,  # For double buffering during DMA copies.
+            buffer_depth,  # 动态缓冲深度
             num_kv_pages_per_blk,
             page_size,
             num_kv_heads_per_blk,
@@ -930,9 +952,11 @@ def ragged_paged_attention(
         k_cache.dtype,
     )
     scratch_shapes = [
-        double_kv_buf_scratch,  # k_bufs
-        double_kv_buf_scratch,  # v_bufs
-        pltpu.SemaphoreType.DMA((2, 2)),  # Semaphores for k, v double buffers.
+        dynamic_kv_buf_scratch,  # k_bufs
+        dynamic_kv_buf_scratch,  # v_bufs
+        pltpu.SemaphoreType.DMA(
+            (buffer_depth, 2)
+        ),  # Semaphores for k, v dynamic buffers.
         lm_scratch,  # l_ref
         lm_scratch,  # m_ref
         acc_scratch,
