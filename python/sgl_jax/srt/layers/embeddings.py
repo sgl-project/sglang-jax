@@ -14,6 +14,8 @@
 
 """Embedding Layers."""
 
+import logging
+import time
 from functools import partial
 from typing import Optional, Tuple, Union
 
@@ -23,6 +25,8 @@ from flax import nnx
 from flax.nnx.nn import dtypes
 from flax.nnx.nn.linear import default_embed_init
 from flax.typing import PromoteDtypeFn
+
+logger = logging.getLogger(__name__)
 
 
 class Embed(nnx.Module):
@@ -57,12 +61,17 @@ class Embed(nnx.Module):
         Returns:
         None
         """
+        logger.info("Embed: Creating embedding layer")
+        self._print_tpu_info()
+        time.sleep(100)
         self.embedding = nnx.Param(
             nnx.with_partitioning(default_embed_init, (None, None))(
                 rngs.params(), (num_embeddings, features), param_dtype
             )
         )
-
+        logger.info("Embed: Creating embedding layer")
+        self._print_tpu_info()
+        time.sleep(100)
         self.num_embeddings = num_embeddings
         self.features = features
         self.dtype = dtype or self.embedding.value.dtype
