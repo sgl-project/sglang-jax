@@ -5,6 +5,9 @@ import jax.numpy as jnp
 import numpy as np
 from jax.sharding import PartitionSpec as P
 
+# from sgl_jax.srt.layers.attention.flash_attn_kernel.v2.kernel import (
+#     ref_ragged_paged_attention,
+# )
 from sgl_jax.srt.layers.attention.flash_attn_kernel.flash_attention import (
     ref_ragged_paged_attention,
 )
@@ -372,6 +375,7 @@ class TestAttention(CustomTestCase):
             forward_batch.seq_lens,
             page_table,
             forward_batch.attn_backend.forward_metadata.cu_q_lens,
+            # forward_batch.attn_backend.forward_metadata.cu_kv_lens,
             forward_batch.attn_backend.forward_metadata.num_seqs,
             sm_scale=head_dim**-0.5,
         )
