@@ -952,9 +952,6 @@ def ragged_paged_attention(
     )
     # 固定三阶段流水线：DMA -> Preprocess -> Compute
     buffer_depth = 3  # 专为三阶段流水线设计
-    print(
-        f"🚀 Three-stage pipeline: Stage1(DMA) | Stage2(Preprocess) | Stage3(Compute)"
-    )
 
     triple_kv_buf_scratch = pltpu.VMEM(
         (
