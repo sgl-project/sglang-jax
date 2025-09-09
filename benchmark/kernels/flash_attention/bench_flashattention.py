@@ -129,7 +129,8 @@ def main():
             (4, 4096, 16, 128),  # Large: B4_S4096_H16
         ]
         print("Starting JAX profiling for Flash Attention...")
-        profiler.start_trace("./flash_attention_profile")
+        # Enable detailed TPU profiling to see inside pallas kernels
+        profiler.start_trace("./flash_attention_profile", create_perfetto_link=True)
     else:
         # Original full benchmark configs
         num_head_config = [2, 4, 8, 16]
