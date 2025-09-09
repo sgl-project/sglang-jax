@@ -565,7 +565,6 @@ def update_fused_kv_cache_vectorized(
         kv_cache_start_loc=kv_cache_locs,
         new_kv_start_loc=new_kv_locs,
         slice_lens=slice_lens,
-        num_slices=num_slices,
     )
 
     # Perform the fused update
