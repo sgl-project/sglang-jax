@@ -2,6 +2,7 @@ import dataclasses
 import logging
 import os
 from abc import ABC, abstractmethod
+from turtle import mode
 from typing import Any, List, Optional, Tuple
 
 import huggingface_hub
@@ -98,18 +99,21 @@ class JAXModelLoader(BaseModelLoader):
     def _get_model(self, model_class: Any, model_config: ModelConfig) -> nnx.Module:
         # Create model directly - random initialization is fast and will be immediately overwritten
         # The "double initialization" cost is minimal since load_weights replaces all parameters
-        model = model_class(model_config, self.rng, self.mesh)
 
-        # Load actual weights, which overwrites the random initialization
-        rng_key = self.rng.default.key.value
-        model.load_weights(rng_key)
-
-        # Apply sharding constraints after loading
-        with self.mesh:
+        @nnx.jit
+        def create_model():
+            model = model_class(model_config, self.rng, self.mesh)
             state = nnx.state(model)
             pspecs = nnx.get_partition_spec(state)
             sharded_state = jax.lax.with_sharding_constraint(state, pspecs)
             nnx.update(model, sharded_state)
+            return model
+
+        with self.mesh:
+            model = create_model()
+
+        rng_key = self.rng.default.key.value
+        model.load_weights(rng_key)
 
         return model
 
