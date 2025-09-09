@@ -33,35 +33,36 @@ def benchmark_separated():
         )
     )
 
-    @jax.jit
-    def flash_attention_with_config(num_kv_pages_per_block, num_queries_per_block):
-        return ragged_paged_attention(
-            q,
-            k,
-            v,
-            page_indices,
-            cu_q_lens,
-            cu_kv_lens,
-            num_seqs,
-            seq_lens,
-            sm_scale=head_dim**-0.5,
-            num_kv_pages_per_block=num_kv_pages_per_block,
-            num_queries_per_block=num_queries_per_block,
-        )
-
     def benchmark_config(name, kv_pages, q_block):
         print(f"\n=== {name} ===")
         print(f"KV pages per block: {kv_pages}, Queries per block: {q_block}")
 
+        # 为每个配置创建单独的jit函数
+        @jax.jit
+        def flash_attention_config():
+            return ragged_paged_attention(
+                q,
+                k,
+                v,
+                page_indices,
+                cu_q_lens,
+                cu_kv_lens,
+                num_seqs,
+                seq_lens,
+                sm_scale=head_dim**-0.5,
+                num_kv_pages_per_block=kv_pages,
+                num_queries_per_block=q_block,
+            )
+
         # 预热
-        result = flash_attention_with_config(kv_pages, q_block)
+        result = flash_attention_config()
         jax.block_until_ready(result)
 
         # 测试
         times = []
         for i in range(5):
             start = time.perf_counter()
-            result = flash_attention_with_config(kv_pages, q_block)
+            result = flash_attention_config()
             jax.block_until_ready(result)
             times.append(time.perf_counter() - start)
 
