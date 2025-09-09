@@ -396,7 +396,7 @@ class ModelRunner:
         # for compatibility, 0.6.3 need to use use_mesh. set_mesh is not have __entry__ attribute.
         # on jax 0.7.1, we need to use set_mesh.
         # with self.mesh, jax.sharding.set_mesh(self.mesh):
-        with jax.sharding.use_mesh(self.mesh):
+        with jax.sharding.set_mesh(self.mesh):
             if (
                 forward_batch.forward_mode.is_decode()
                 or forward_batch.forward_mode.is_extend()

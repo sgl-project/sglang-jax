@@ -730,7 +730,7 @@ def ref_ragged_paged_attention(
         mask_value = DEFAULT_MASK_VALUE
     _, _, num_kv_heads, head_dim = k_pages.shape
     num_q_heads = queries.shape[1]
-    assert num_q_heads % num_kv_heads == 0
+    assert num_q_heads % num_kv_heads == 0, f"num_q_heads % num_kv_heads == 0"
     num_query_per_kv = num_q_heads // num_kv_heads
     outputs = []
     for i in range(num_seqs[0]):

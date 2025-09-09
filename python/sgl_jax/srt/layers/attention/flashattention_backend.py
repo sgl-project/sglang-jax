@@ -246,13 +246,12 @@ class FlashAttention(AttentionBackend):
                 sm_scale=scale,
                 sliding_window=None,
                 soft_cap=None,
-                mask_value=None,
                 vmem_limit_bytes=self.vmem_limit_bytes,
             )
             return (
                 attn,
-                k_cache.reshape(k_cache.shape[:2], -1, k_cache[-1]),
-                v_cache.reshape(v_cache.shape[:2], -1, v_cache[-1]),
+                k_cache.reshape(*k_cache.shape[:2], -1, k_cache.shape[-1]),
+                v_cache.reshape(*v_cache.shape[:2], -1, v_cache.shape[-1]),
             )
 
         k_cache, v_cache = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)

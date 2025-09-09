@@ -134,6 +134,7 @@ def create_test_data(
 ):
     """Create a real ForwardBatch for testing."""
     assert mode in ["prefill", "decode"]
+    max_context_len = 8192
     batch_size = len(lens)
     # Create sequence lengths array
     seq_lens = jnp.array([kv_len for _, kv_len in lens], dtype=jnp.int32)
@@ -181,6 +182,10 @@ def create_test_data(
         )
         # Apply alignment padding to this sequence
         aligned_seq_indices = align_to_size(seq_token_indices, page_size, 0)
+        # padding to max_context_len
+        aligned_seq_indices = aligned_seq_indices + [0] * (
+            max_context_len - len(aligned_seq_indices)
+        )
         cache_loc_flat.extend(aligned_seq_indices)
         # Move to next aligned position (matches k/v storage)
         aligned_len = ((kv_len + page_size - 1) // page_size) * page_size
