@@ -234,9 +234,21 @@ class ForwardBatch:
         batch: ModelWorkerBatch,
         model_runner: ModelRunner,
     ):
-        logger.info(
-            f"[DEBUG] device_array input_ids: shape={batch.input_ids.shape}, last_5={batch.input_ids[-5:] if len(batch.input_ids) > 0 else 'empty'}"
-        )
+        def log_array(name, arr):
+            if arr is not None and len(arr) > 0:
+                return (
+                    f"{name}: shape={arr.shape}, dtype={arr.dtype}, last_5={arr[-5:]}"
+                )
+            else:
+                return f"{name}: None/empty"
+
+        logger.info(f"[DEBUG] device_array inputs:")
+        logger.info(f"  {log_array('input_ids', batch.input_ids)}")
+        logger.info(f"  {log_array('seq_lens', batch.seq_lens)}")
+        logger.info(f"  {log_array('out_cache_loc', batch.out_cache_loc)}")
+        logger.info(f"  {log_array('positions', batch.positions)}")
+        logger.info(f"  {log_array('req_pool_indices', batch.req_pool_indices)}")
+
         (
             input_ids,
             seq_lens,
