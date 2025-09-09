@@ -289,6 +289,8 @@ class QWen3Model(nnx.Module):
         logger.info(
             f"QWen3Model: Creating embedding layer (vocab_size={config.vocab_size}, hidden_size={config.hidden_size})"
         )
+        self._print_tpu_info()
+        time.sleep(100)
         self.embed_tokens = Embed(
             num_embeddings=config.vocab_size,
             features=config.hidden_size,
@@ -296,7 +298,9 @@ class QWen3Model(nnx.Module):
             dtype=dtype,
             param_dtype=dtype,
         )
-
+        logger.info("QWen3Model: Creating embed tokens")
+        self._print_tpu_info()
+        time.sleep(100)
         logger.info(
             f"QWen3Model: Creating {config.num_hidden_layers} transformer layers"
         )
@@ -309,8 +313,9 @@ class QWen3Model(nnx.Module):
             )
             for i in range(config.num_hidden_layers)
         ]
-
         logger.info("QWen3Model: Creating final layer norm")
+        self._print_tpu_info()
+        time.sleep(100)
         self.norm = nnx.RMSNorm(
             config.hidden_size,
             epsilon=config.rms_norm_eps,
@@ -319,6 +324,8 @@ class QWen3Model(nnx.Module):
             rngs=rngs,
         )
         logger.info("QWen3Model: Initialization complete")
+        self._print_tpu_info()
+        time.sleep(100)
 
     def __call__(
         self,
@@ -362,7 +369,7 @@ class Qwen3ForCausalLM(nnx.Module):
 
         logger.info("=== TPU Memory Before Model Init ===")
         self._print_tpu_info()
-        time.sleep(100)
+        # time.sleep(100)
         self.transformer = QWen3Model(config.hf_config, dtype=self.dtype, rngs=rngs)
 
         logger.info("=== TPU Memory After Transformer Init ===")
