@@ -58,7 +58,7 @@ class Embed(nnx.Module):
         None
         """
         self.embedding = nnx.Param(
-            nnx.with_partitioning(default_embed_init, (None, None))(
+            nnx.with_partitioning(default_embed_init, (None, "tensor"))(
                 rngs.params(), (num_embeddings, features), param_dtype
             )
         )
