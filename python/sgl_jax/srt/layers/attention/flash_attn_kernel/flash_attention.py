@@ -701,6 +701,9 @@ def ragged_paged_attention_kernel(
                 next_async_copy_k.start()
                 next_async_copy_v.start()
 
+            # 调用Stage1：启动下一轮DMA（与当前计算并行）
+            stage1_async_dma()
+
             # 等待当前DMA完成
             cur_async_copy_k, cur_async_copy_v = create_kv_async_copy_descriptors(
                 heads_blk_idx, cur_seq_idx, kv_blk_idx, cur_buf_idx
@@ -949,25 +952,15 @@ def ragged_paged_attention(
         (num_q_per_blk, num_q_heads_per_blk, head_dim),
         jnp.float32,
     )
-    # 动态缓冲深度：根据VMEM限制自动选择最优缓冲深度
-    if vmem_limit_bytes is None:
-        buffer_depth = 2  # 默认双缓冲
-    else:
-        # 根据VMEM大小动态选择缓冲深度
-        single_buffer_size = (
-            num_kv_pages_per_blk * page_size * num_kv_heads_per_blk * head_dim * 2
-        )  # K+V
-        if k_cache.dtype == jnp.bfloat16:
-            single_buffer_size *= 2  # bfloat16 = 2 bytes
+    # 固定三阶段流水线：DMA -> Preprocess -> Compute
+    buffer_depth = 3  # 专为三阶段流水线设计
+    print(
+        f"🚀 Three-stage pipeline: Stage1(DMA) | Stage2(Preprocess) | Stage3(Compute)"
+    )
 
-        max_buffers = vmem_limit_bytes // (
-            single_buffer_size * 4
-        )  # 保守估计，留25%给其他用途
-        buffer_depth = min(max(2, max_buffers), 4)  # 限制在2-4之间
-
-    dynamic_kv_buf_scratch = pltpu.VMEM(
+    triple_kv_buf_scratch = pltpu.VMEM(
         (
-            buffer_depth,  # 动态缓冲深度
+            buffer_depth,  # 三缓冲：支持完整的三阶段流水线
             num_kv_pages_per_blk,
             page_size,
             num_kv_heads_per_blk,
@@ -976,11 +969,11 @@ def ragged_paged_attention(
         k_cache.dtype,
     )
     scratch_shapes = [
-        dynamic_kv_buf_scratch,  # k_bufs
-        dynamic_kv_buf_scratch,  # v_bufs
+        triple_kv_buf_scratch,  # k_bufs
+        triple_kv_buf_scratch,  # v_bufs
         pltpu.SemaphoreType.DMA(
             (buffer_depth, 2)
-        ),  # Semaphores for k, v dynamic buffers.
+        ),  # Semaphores for 3-stage pipeline buffers.
         lm_scratch,  # l_ref
         lm_scratch,  # m_ref
         acc_scratch,
