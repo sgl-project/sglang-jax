@@ -180,9 +180,7 @@ class FlashAttention(AttentionBackend):
         Returns:
             Output tensor of shape [total_tokens, hidden_size]
         """
-        k_buffer, v_buffer = self._get_and_set_kv_cache(
-            k, v, forward_batch, layer.layer_id
-        )
+        kv_buffer = self._get_and_set_kv_cache(k, v, forward_batch, layer.layer_id)
 
         if layer.scaling is None:
             scale = 1.0 / jnp.sqrt(layer.head_dim)
@@ -193,8 +191,7 @@ class FlashAttention(AttentionBackend):
             P(
                 None, self.kv_partition_axis
             ),  # q shape: [batched_tokens, head_num, head_dim]
-            P(None, None, self.kv_partition_axis, None),  # k_buffer sha
-            P(None, None, self.kv_partition_axis, None),  # v_buffer
+            P(None, None, self.kv_partition_axis, None),  # kv_buffer (fused K&V)
             P(),  # page_indices
             P(),  # cu_q_lens
             P(),  # cu_kv_lens
@@ -204,23 +201,19 @@ class FlashAttention(AttentionBackend):
         out_specs = P(None, self.kv_partition_axis)
 
         def _ragged_paged_attention(*args):
-            q, k_buffer, v_buffer = args[:3]
-            other_args = args[3:]
+            q, kv_buffer = args[:2]
+            other_args = args[2:]
 
             # Since we now use pre-padded kv heads, ensure they are always even
-            assert k_buffer.shape[-2] % 2 == 0, (
-                f"k_buffer kv_heads={k_buffer.shape[-2]} should be even after pre-padding. "
-                "This indicates a configuration issue with kv heads padding."
-            )
-            assert v_buffer.shape[-2] % 2 == 0, (
-                f"v_buffer kv_heads={v_buffer.shape[-2]} should be even after pre-padding. "
-                "This indicates a configuration issue with kv heads padding."
+            # KV buffer has shape [..., num_kv_heads * 2, head_dim] where first half is K, second half is V
+            assert kv_buffer.shape[-2] % 4 == 0, (
+                f"kv_buffer fused_heads={kv_buffer.shape[-2]} should be divisible by 4 after pre-padding. "
+                "This indicates a configuration issue with kv heads padding for fused KV cache."
             )
 
             return ragged_paged_attention(
                 q,
-                k_buffer,
-                v_buffer,
+                kv_buffer,
                 *other_args,
                 sm_scale=scale,
                 sliding_window=None,
@@ -237,11 +230,8 @@ class FlashAttention(AttentionBackend):
             check_vma=False,
         )(
             q.reshape(q.shape[0], -1, self.head_dim),
-            k_buffer.reshape(
-                k_buffer.shape[0] // self.page_size, self.page_size, -1, self.head_dim
-            ),
-            v_buffer.reshape(
-                v_buffer.shape[0] // self.page_size, self.page_size, -1, self.head_dim
+            kv_buffer.reshape(
+                kv_buffer.shape[0] // self.page_size, self.page_size, -1, self.head_dim
             ),
             self.forward_metadata.page_indices,
             self.forward_metadata.cu_q_lens,
@@ -252,8 +242,7 @@ class FlashAttention(AttentionBackend):
 
         return (
             attn_output.reshape(q.shape[0], -1),
-            k_buffer,
-            v_buffer,
+            kv_buffer,
         )
 
     def _get_and_set_kv_cache(
@@ -262,9 +251,9 @@ class FlashAttention(AttentionBackend):
         v: jax.Array,
         forward_batch: ForwardBatch,
         layer_id: int,
-    ) -> Tuple[jax.Array, jax.Array]:
+    ) -> jax.Array:
         """
-        Get the kv cache from the forward batch.
+        Get the fused kv cache from the forward batch.
         """
         if forward_batch.forward_mode == ForwardMode.EXTEND:
             forward_batch.token_to_kv_pool.set_kv_buffer(
@@ -275,7 +264,7 @@ class FlashAttention(AttentionBackend):
                 layer_id, forward_batch.out_cache_loc, k, v, is_decode=True
             )
 
-        return forward_batch.token_to_kv_pool.get_kv_buffer(layer_id)
+        return forward_batch.token_to_kv_pool.get_fused_kv_buffer(layer_id)
 
     @staticmethod
     def get_max_running_reqests(max_context_len: int, page_size: int) -> int:

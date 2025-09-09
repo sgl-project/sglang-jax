@@ -129,10 +129,10 @@ class QWen3Attention(nnx.Module):
         k = self.k_norm(k)
 
         q, k = self.rotary_emb(positions, q, k)
-        attn_output, k, v = self.attn(q, k, v, forward_batch=forward_batch)
-
+        attn_output, kv_buffer = self.attn(q, k, v, forward_batch=forward_batch)
         output, _ = self.o_proj(attn_output)
-        return output, k, v
+
+        return output, kv_buffer
 
 
 class Qwen3MLP(nnx.Module):
@@ -318,15 +318,13 @@ class QWen3Model(nnx.Module):
     ):
         residual = None
         hidden_states = self.embed_tokens(forward_batch.input_ids)
-        layers_k = []
-        layers_v = []
+        layers_kv = []
         layers_callback_flag = []
         for layer in self.layers:
-            hidden_states, residual, k, v, callback_flag = layer(
+            hidden_states, residual, kv, callback_flag = layer(
                 forward_batch.positions, hidden_states, forward_batch, residual
             )
-            layers_k.append(k)
-            layers_v.append(v)
+            layers_kv.append(kv)
             layers_callback_flag.extend(callback_flag)
 
         if residual is not None:
@@ -337,7 +335,7 @@ class QWen3Model(nnx.Module):
             hidden_states, "transformer_output", "TRANSFORMER"
         )
         layers_callback_flag.append(callback_flag)
-        return hidden_states, layers_k, layers_v, layers_callback_flag
+        return hidden_states, layers_kv, layers_callback_flag
 
 
 class Qwen3ForCausalLM(nnx.Module):
@@ -500,11 +498,9 @@ class Qwen3ForCausalLM(nnx.Module):
         forward_batch: ForwardBatch,
         logits_metadata: LogitsMetadata,
     ):
-        hidden_states, layers_k, layers_v, layers_callback_flag = self.transformer(
-            forward_batch
-        )
+        hidden_states, layers_kv, layers_callback_flag = self.transformer(forward_batch)
         output = self.logits_processor(hidden_states, logits_metadata)
-        return output, layers_k, layers_v, layers_callback_flag
+        return output, layers_kv, layers_callback_flag
 
 
 EntryClass = Qwen3ForCausalLM

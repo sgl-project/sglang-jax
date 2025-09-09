@@ -168,9 +168,9 @@ class QWenAttention(nnx.Module):
         v = v.reshape(-1, self.num_heads, self.head_size)
 
         q, k = self.rotary_emb(positions, q, k)
-        attn_output, k, v = self.attn(q, k, v, forward_batch=forward_batch)
+        attn_output, kv_buffer = self.attn(q, k, v, forward_batch=forward_batch)
         output, _ = self.c_proj(attn_output)
-        return output, k, v
+        return output, kv_buffer
 
 
 class QWenBlock(nnx.Module):
@@ -230,12 +230,15 @@ class QWenBlock(nnx.Module):
 
         hidden_states = self.ln_1(hidden_states)
 
-        attn_output, k, v = self.attn(
+        attn_output, kv_buffer = self.attn(
             positions=positions,
             hidden_states=hidden_states,
             forward_batch=forward_batch,
             layer_id=self.layer_id,
         )
+
+        # Both k and v point to the same fused buffer
+        k, v = kv_buffer, kv_buffer
 
         hidden_states = residual + attn_output
 
@@ -291,19 +294,17 @@ class QWenModel(nnx.Module):
     ):
         hidden_states = self.embed_tokens(forward_batch.input_ids)
 
-        layers_k = []
-        layers_v = []
+        layers_kv = []
 
         for layer in self.h:
-            hidden_states, k, v = layer(
+            hidden_states, kv = layer(
                 forward_batch.positions, hidden_states, forward_batch
             )
-            layers_k.append(k)
-            layers_v.append(v)
+            layers_kv.append(kv)
 
         hidden_states = self.ln_f(hidden_states)
 
-        return hidden_states, layers_k, layers_v
+        return hidden_states, layers_kv
 
 
 class QWenLMHeadModel(nnx.Module):
@@ -416,9 +417,9 @@ class QWenLMHeadModel(nnx.Module):
         forward_batch: ForwardBatch,
         logits_metadata: LogitsMetadata,
     ):
-        hidden_states, layers_k, layers_v = self.transformer(forward_batch)
+        hidden_states, layers_kv = self.transformer(forward_batch)
         output = self.logits_processor(hidden_states, logits_metadata)
-        return output, layers_k, layers_v, True
+        return output, layers_kv, True
 
 
 EntryClass = QWenLMHeadModel

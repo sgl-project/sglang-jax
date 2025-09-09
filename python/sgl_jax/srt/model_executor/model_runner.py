@@ -375,22 +375,16 @@ class ModelRunner:
         import jax._src.test_util as jtu
 
         with jtu.count_pjit_cpp_cache_miss() as count:
-            output, layers_k, layers_v, _ = self.jitted_run_model(
-                forward_batch, logits_metadata
-            )
+            output, layers_kv, _ = self.jitted_run_model(forward_batch, logits_metadata)
             cache_miss_count = count()
-        self._set_kv_cache_after_forward(layers_k, layers_v, forward_batch)
+        self._set_kv_cache_after_forward(layers_kv, forward_batch)
 
         return output, cache_miss_count
 
-    def _set_kv_cache_after_forward(
-        self, layers_k, layers_v, forward_batch: ForwardBatch
-    ):
-        # set sharding for layers_k and layers_v
+    def _set_kv_cache_after_forward(self, layers_kv, forward_batch: ForwardBatch):
         start_idx = forward_batch.token_to_kv_pool.start_layer
-        end_idx = start_idx + len(layers_k)
-        forward_batch.token_to_kv_pool.k_buffer[start_idx:end_idx] = layers_k
-        forward_batch.token_to_kv_pool.v_buffer[start_idx:end_idx] = layers_v
+        end_idx = start_idx + len(layers_kv)
+        forward_batch.token_to_kv_pool.kv_buffer[start_idx:end_idx] = layers_kv
 
     def forward_idle(
         self,

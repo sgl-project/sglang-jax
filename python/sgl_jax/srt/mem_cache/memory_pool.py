@@ -215,7 +215,7 @@ class MHATokenToKVPool(KVCache):
     def tree_flatten(self):
         parent_children, parent_aux_data = super().tree_flatten()
 
-        children = (self.k_buffer, self.v_buffer) + parent_children
+        children = (self.kv_buffer,) + parent_children  # Single fused KV buffer
         aux_data = {
             **parent_aux_data,
             "head_num": self.head_num,
@@ -227,8 +227,8 @@ class MHATokenToKVPool(KVCache):
 
     @classmethod
     def tree_unflatten(cls, aux_data, children):
-        k_buffer, v_buffer = children[0], children[1]
-        parent_children = children[2:] if len(children) > 2 else ()
+        kv_buffer = children[0]  # Single fused KV buffer
+        parent_children = children[1:] if len(children) > 1 else ()
 
         obj = object.__new__(cls)
 
@@ -250,88 +250,108 @@ class MHATokenToKVPool(KVCache):
         obj.kv_partition_axis = aux_data["kv_partition_axis"]
         obj.kv_sharding = aux_data["kv_sharding"]
 
-        obj.k_buffer = k_buffer
-        obj.v_buffer = v_buffer
+        obj.kv_buffer = kv_buffer  # Fused KV buffer
 
         return obj
 
     def _create_buffers(self):
-        """Create sharded KV cache buffers with proper distributed allocation"""
+        """Create sharded fused KV cache buffers with proper distributed allocation"""
         self.kv_sharding = NamedSharding(self.mesh, P(None, self.kv_partition_axis))
 
-        logger.info(f"Creating buffers for {self.layer_num} layers")
+        logger.info(f"Creating fused KV buffers for {self.layer_num} layers")
         start_time = time.time()
 
-        buffer_shape = (self.size + self.page_size, self.head_num, self.head_dim)
+        # Fused buffer shape: head_num * 2 for both K and V heads
+        fused_buffer_shape = (
+            self.size + self.page_size,
+            self.head_num * 2,
+            self.head_dim,
+        )
         logger.info(
-            f"Total KV cachememory per layer: {buffer_shape[0] * buffer_shape[1] * buffer_shape[2] * 2 / 1024**3:.2f} GB, dtype: {self.dtype}"
+            f"Total fused KV cache memory per layer: {fused_buffer_shape[0] * fused_buffer_shape[1] * fused_buffer_shape[2] / 1024**3:.2f} GB, dtype: {self.dtype}"
         )
         with self.mesh:
-            self.k_buffer = []
-            self.v_buffer = []
+            self.kv_buffer = []
 
             for _ in range(self.layer_num):
                 tensor_size = self.mesh.shape.get(self.kv_partition_axis, 1)
 
-                def create_kv_callback(index):
+                def create_fused_kv_callback(index):
                     local_shape = (
-                        buffer_shape[0],
-                        buffer_shape[1] // tensor_size,
-                        buffer_shape[2],
+                        fused_buffer_shape[0],
+                        fused_buffer_shape[1] // tensor_size,  # Fused heads dimension
+                        fused_buffer_shape[2],
                     )
                     return jnp.zeros(local_shape, dtype=self.dtype)
 
-                k_buf = jax.make_array_from_callback(
-                    buffer_shape, self.kv_sharding, create_kv_callback
+                kv_buf = jax.make_array_from_callback(
+                    fused_buffer_shape, self.kv_sharding, create_fused_kv_callback
                 )
-                v_buf = jax.make_array_from_callback(
-                    buffer_shape, self.kv_sharding, create_kv_callback
-                )
-                self.k_buffer.append(k_buf)
-                self.v_buffer.append(v_buf)
+                self.kv_buffer.append(kv_buf)
 
         end_time = time.time()
         logger.info(
-            f"Total time to create {self.layer_num} buffers: {end_time - start_time:.2f} seconds"
+            f"Total time to create {self.layer_num} fused KV buffers: {end_time - start_time:.2f} seconds"
         )
 
     def _calculate_memory_usage(self):
-        """Calculate memory usage"""
-        k_size = (
+        """Calculate memory usage for fused KV cache"""
+        # Fused KV buffer contains both K and V in single buffer
+        fused_kv_size = (
             (self.size + self.page_size)
             * self.head_num
+            * 2  # * 2 for K and V heads fused together
             * self.head_dim
             * jnp.dtype(self.dtype).itemsize
             * self.layer_num
         )
-        v_size = k_size  # K and V have same size
-        self.mem_usage = (k_size + v_size) / GB
+        self.mem_usage = fused_kv_size / GB
 
+        # For logging compatibility, show equivalent K/V sizes
+        equivalent_k_size = fused_kv_size / 2
+        equivalent_v_size = fused_kv_size / 2
         logger.info(
-            f"JAX KV Cache allocated. #tokens: {self.size}, "
-            f"K size: {k_size / GB:.2f} GB, V size: {v_size / GB:.2f} GB"
+            f"JAX Fused KV Cache allocated. #tokens: {self.size}, "
+            f"Total fused size: {fused_kv_size / GB:.2f} GB (equivalent K: {equivalent_k_size / GB:.2f} GB, V: {equivalent_v_size / GB:.2f} GB)"
         )
 
     def get_kv_size_bytes(self):
-        """Calculate KV cache size in bytes"""
-        k_size = (
+        """Calculate fused KV cache size in bytes"""
+        fused_kv_size = (
             (self.size + self.page_size)
             * self.head_num
+            * 2  # * 2 for fused K and V heads
             * self.head_dim
             * jnp.dtype(self.dtype).itemsize
             * self.layer_num
         )
-        v_size = k_size
-        return k_size, v_size
+        # Return equivalent K/V sizes for compatibility
+        equivalent_k_size = fused_kv_size / 2
+        equivalent_v_size = fused_kv_size / 2
+        return equivalent_k_size, equivalent_v_size
 
     def get_key_buffer(self, layer_id: int) -> jnp.ndarray:
-        return self.k_buffer[layer_id - self.start_layer]
+        """Extract K buffer from fused KV cache"""
+        fused_kv = self.kv_buffer[layer_id - self.start_layer]
+        # K heads are in the first half: [:, :self.head_num, :]
+        return fused_kv[:, : self.head_num, :]
 
     def get_value_buffer(self, layer_id: int) -> jnp.ndarray:
-        return self.v_buffer[layer_id - self.start_layer]
+        """Extract V buffer from fused KV cache"""
+        fused_kv = self.kv_buffer[layer_id - self.start_layer]
+        # V heads are in the second half: [:, self.head_num:, :]
+        return fused_kv[:, self.head_num :, :]
 
     def get_kv_buffer(self, layer_id: int) -> Tuple[jnp.ndarray, jnp.ndarray]:
-        return _get_kv_buffer(layer_id, self.k_buffer, self.v_buffer)
+        """Get K and V buffers from fused cache"""
+        fused_kv = self.kv_buffer[layer_id - self.start_layer]
+        k_buffer = fused_kv[:, : self.head_num, :]  # First half: K heads
+        v_buffer = fused_kv[:, self.head_num :, :]  # Second half: V heads
+        return k_buffer, v_buffer
+
+    def get_fused_kv_buffer(self, layer_id: int) -> jnp.ndarray:
+        """Get the fused KV buffer directly (for FlashAttention backend)"""
+        return self.kv_buffer[layer_id - self.start_layer]
 
     def set_kv_buffer(
         self,
@@ -342,27 +362,29 @@ class MHATokenToKVPool(KVCache):
         is_decode: bool = False,
     ) -> None:
         """
-        Set KV cache data using JAX-style interface with padding support.
-        This method uses the token-by-token update approach to avoid contiguity issues.
+        Set fused KV cache data using JAX-style interface with padding support.
+        This method fuses K and V data and writes to the unified buffer.
 
         Args:
             layer_id: Which layer to update
             k: Key tensor [total_tokens, num_heads, head_dim]
             v: Value tensor [total_tokens, num_heads, head_dim]
-            seq_lens: Sequence lengths [batch_size]
-            kv_start_loc: Start positions in k,v tensors [batch_size]
-            kv_cache_start_loc: Start positions in cache [batch_size]
+            loc: Cache locations to update
+            is_decode: Whether this is decode mode
         """
         layer_idx = layer_id - self.start_layer
 
         page_size = 1 if is_decode else self.page_size
-        # Use the token-by-token update implementation
-        self.k_buffer[layer_idx], self.v_buffer[layer_idx] = _set_kv_buffer(
-            k=k,
-            v=v,
+
+        # Fuse K and V tensors: [total_tokens, num_heads * 2, head_dim]
+        # Layout: [K_heads..., V_heads...]
+        fused_kv = jnp.concatenate([k, v], axis=1)  # Concatenate along head dimension
+
+        # Use the fused KV update implementation
+        self.kv_buffer[layer_idx] = _set_fused_kv_buffer(
+            fused_kv=fused_kv,
             loc=loc,
-            k_cache=self.k_buffer[layer_idx],
-            v_cache=self.v_buffer[layer_idx],
+            kv_cache=self.kv_buffer[layer_idx],
             page_size=page_size,
             kv_partition_axis=self.kv_partition_axis,
         )
@@ -455,6 +477,111 @@ def _set_kv_buffer(
     )
 
     return k_cache, v_cache
+
+
+def _set_fused_kv_buffer(
+    fused_kv: jax.Array,  # [total_tokens, num_heads * 2, head_dim] - K and V fused
+    loc: jax.Array,  # [total_tokens] - cache locations, -1 for padding
+    kv_cache: jax.Array,  # [cache_size, num_heads * 2, head_dim] - fused cache buffer
+    page_size: int,
+    kv_partition_axis: str = "tensor",
+):
+    """
+    Set fused KV cache data where K and V heads are concatenated in the head dimension.
+
+    Args:
+        fused_kv: Fused KV tensor [total_tokens, num_heads * 2, head_dim]
+                 Layout: [K_heads..., V_heads...]
+        loc: Location indices [total_tokens], -1 for padding tokens
+        kv_cache: Fused KV cache buffer [cache_size, num_heads * 2, head_dim]
+        page_size: Page size for updates
+        kv_partition_axis: Partitioning axis
+
+    Returns:
+        Updated fused KV cache
+    """
+    kv_cache = update_fused_kv_cache(
+        fused_kv,
+        loc,
+        kv_cache,
+        page_size=page_size,
+        kv_partition_axis=kv_partition_axis,
+    )
+    return kv_cache
+
+
+def update_fused_kv_cache(
+    fused_kv: jax.Array,  # [total_tokens, num_heads * 2, head_dim]
+    loc: jax.Array,  # [total_tokens], -1 for padding
+    kv_cache: jax.Array,  # [cache_size, num_heads * 2, head_dim] - fused cache
+    page_size: int = 1,
+    kv_partition_axis: str = "tensor",
+):
+    """
+    Update fused KV cache where K and V are stored together in the head dimension.
+    This is adapted from update_kv_cache but works with fused KV data.
+    """
+    # Reuse the existing vectorized update logic but for fused data
+    return update_fused_kv_cache_vectorized(
+        fused_kv,
+        loc,
+        kv_cache,
+        page_size=page_size,
+        kv_partition_axis=kv_partition_axis,
+    )
+
+
+def update_fused_kv_cache_vectorized(
+    fused_kv: jax.Array,  # [total_tokens, num_heads * 2, head_dim]
+    loc: jax.Array,  # [total_tokens], -1 for padding
+    kv_cache: jax.Array,  # [cache_size, num_heads * 2, head_dim]
+    page_size: int,
+    kv_partition_axis: str = "tensor",
+):
+    """
+    Vectorized fused KV cache update. Treats the fused KV as a single tensor
+    with num_heads * 2 heads (first half K, second half V).
+    """
+    total_tokens = loc.shape[0]
+    loc = loc.astype(jnp.int32)
+
+    # Use the same update logic as the original but treat fused_kv as a single tensor
+    kv_cache_locs = jnp.where(loc == -1, 0, loc).astype(jnp.int32)
+    new_kv_locs = jnp.arange(total_tokens, dtype=jnp.int32)
+    slice_lens = jnp.where(loc == -1, 0, 1).astype(jnp.int32)
+    num_slices = total_tokens
+
+    # Get optimal parameters for fused update
+    num_slices_per_block = get_best_num_slices_per_block(
+        fused_kv.shape[1],  # num_heads * 2 (fused)
+        kv_cache.shape[0],  # cache_len
+        fused_kv.shape[0],  # new_kv_len
+        fused_kv.shape[2],  # head_dim
+        page_size,
+    )
+
+    slot_mapping = get_slot_mapping(
+        num_slices_per_block=num_slices_per_block,
+        kv_cache_start_loc=kv_cache_locs,
+        new_kv_start_loc=new_kv_locs,
+        slice_lens=slice_lens,
+        num_slices=num_slices,
+    )
+
+    # Perform the fused update
+    num_kv_update_slices = jnp.array([num_slices], dtype=jnp.int32)
+
+    updated_kv_cache = kv_cache_update(
+        new_kv=fused_kv,
+        slices=slot_mapping,
+        kv_cache=kv_cache,
+        num_kv_update_slices=num_kv_update_slices,
+        page_size=page_size,
+        num_slices_per_block=num_slices_per_block,
+        kv_partition_axis=kv_partition_axis,
+    )
+
+    return updated_kv_cache
 
 
 def update_kv_cache(
