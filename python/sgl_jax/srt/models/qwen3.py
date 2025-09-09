@@ -286,11 +286,7 @@ class QWen3Model(nnx.Module):
         dtype: jnp.dtype = jnp.bfloat16,
         rngs: nnx.Rngs = None,
     ):
-        logger.info(
-            f"QWen3Model: Creating embedding layer (vocab_size={config.vocab_size}, hidden_size={config.hidden_size})"
-        )
-        self._print_tpu_info()
-        time.sleep(100)
+
         self.embed_tokens = Embed(
             num_embeddings=config.vocab_size,
             features=config.hidden_size,
@@ -416,8 +412,6 @@ class Qwen3ForCausalLM(nnx.Module):
         self.dtype = config.dtype
         logger.info(f"QWen3ForCausalLMModel config dtype: {self.dtype}")
 
-        logger.info("=== TPU Memory Before Model Init ===")
-        self._print_tpu_info()
         # time.sleep(100)
         self.transformer = QWen3Model(config.hf_config, dtype=self.dtype, rngs=rngs)
 
