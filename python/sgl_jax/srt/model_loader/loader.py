@@ -109,15 +109,16 @@ class JAXModelLoader(BaseModelLoader):
             return rng_keys
 
         keys = extract_keys(self.rng)
+        default_key = self.rng.default.key.value
 
         @nnx.jit
-        def create_model(rng_keys):
+        def create_model(rng_keys, default_key):
             # Create a new RNG with the extracted keys
             from flax import nnx
 
-            temp_rng = nnx.Rngs(default=jax.random.PRNGKey(42))
+            temp_rng = nnx.Rngs(default=default_key)
             # Override the params method to return the pre-extracted key
-            temp_rng._params_key = rng_keys.get("params", jax.random.PRNGKey(42))
+            temp_rng._params_key = rng_keys.get("params", default_key)
             temp_rng.params = lambda: temp_rng._params_key
 
             model = model_class(model_config, temp_rng, self.mesh)
@@ -128,7 +129,7 @@ class JAXModelLoader(BaseModelLoader):
             return model
 
         with self.mesh:
-            model = create_model(keys)
+            model = create_model(keys, default_key)
 
         rng_key = self.rng.default.key.value
         model.load_weights(rng_key)
