@@ -692,17 +692,13 @@ def ragged_paged_attention_kernel(
             )
 
             # === STAGE 1: DMA (异步数据传输) ===
-            @pl.when(next_heads_blk_idx < num_heads_blks)
-            def stage1_async_dma():
-                # 启动下一轮DMA，与当前计算并行
+            # 仅在有下一块时启动DMA（与当前计算并行）
+            if next_heads_blk_idx < num_heads_blks:
                 next_async_copy_k, next_async_copy_v = create_kv_async_copy_descriptors(
                     next_heads_blk_idx, next_seq_idx, next_kv_blk_idx, next_buf_idx
                 )
                 next_async_copy_k.start()
                 next_async_copy_v.start()
-
-            # 调用Stage1：启动下一轮DMA（与当前计算并行）
-            stage1_async_dma()
 
             # 等待当前DMA完成
             cur_async_copy_k, cur_async_copy_v = create_kv_async_copy_descriptors(
