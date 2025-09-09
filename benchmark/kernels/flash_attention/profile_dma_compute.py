@@ -52,6 +52,7 @@ def benchmark_separated():
                 sm_scale=head_dim**-0.5,
                 num_kv_pages_per_block=kv_pages,
                 num_queries_per_block=q_block,
+                vmem_limit_bytes=64 * 1024 * 1024,  # 64MB VMEM limit
             )
 
         # 预热
@@ -70,7 +71,7 @@ def benchmark_separated():
         print(f"Average time: {avg_time:.3f} ms")
         return avg_time
 
-    # 测试不同配置来分析瓶颈（调整为32M VMEM友好的配置）
+    # 测试不同配置来分析瓶颈（64MB VMEM，可以使用更大配置）
     results = {}
 
     # 1. 极小块：测试DMA开销极限
@@ -80,15 +81,22 @@ def benchmark_separated():
 
     # 2. DMA密集型：小块，频繁传输
     results["DMA_intensive"] = benchmark_config(
-        "DMA密集型 (小块频繁传输)", kv_pages=2, q_block=16
+        "DMA密集型 (小块频繁传输)", kv_pages=4, q_block=16
     )
 
-    # 3. 中等配置：平衡
-    results["Balanced"] = benchmark_config("平衡配置", kv_pages=4, q_block=16)
+    # 3. 平衡配置：当前默认
+    results["Balanced"] = benchmark_config(
+        "平衡配置 (当前默认)", kv_pages=8, q_block=32
+    )
 
-    # 4. 计算密集型：稍大块，减少传输（调小避免OOM）
+    # 4. 大块配置：减少DMA开销
+    results["Large_blocks"] = benchmark_config(
+        "大块配置 (减少DMA)", kv_pages=16, q_block=48
+    )
+
+    # 5. 超大块：测试性能极限（64MB VMEM）
     results["Compute_intensive"] = benchmark_config(
-        "计算密集型 (大块少传输)", kv_pages=8, q_block=24
+        "超大块 (最少DMA)", kv_pages=32, q_block=64
     )
 
     print(f"\n{'='*50}")
@@ -99,11 +107,13 @@ def benchmark_separated():
     compute_intensive = results["Compute_intensive"]
     tiny_blocks = results["Tiny_blocks"]
     balanced = results["Balanced"]
+    large_blocks = results["Large_blocks"]
 
-    print(f"DMA密集型:    {dma_intensive:.3f} ms")
-    print(f"计算密集型:   {compute_intensive:.3f} ms")
-    print(f"平衡配置:     {balanced:.3f} ms")
     print(f"极小块:       {tiny_blocks:.3f} ms")
+    print(f"DMA密集型:    {dma_intensive:.3f} ms")
+    print(f"平衡配置:     {balanced:.3f} ms")
+    print(f"大块配置:     {large_blocks:.3f} ms")
+    print(f"超大块:       {compute_intensive:.3f} ms")
 
     # 分析瓶颈
     if tiny_blocks > dma_intensive * 1.5:
