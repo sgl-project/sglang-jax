@@ -1035,6 +1035,9 @@ class ScheduleBatch:
                 break
 
         if padding_size > 0:
+            logger.info(
+                f"[DEBUG] Padding input_ids: orig_len={len(input_ids_cpu)}, pad_size={padding_size}, dtype={input_ids_cpu.dtype}"
+            )
             input_ids_cpu = np.concat(
                 [
                     input_ids_cpu,
@@ -1042,10 +1045,16 @@ class ScheduleBatch:
                 ],
                 axis=0,
             )
+            logger.info(
+                f"[DEBUG] After padding: len={len(input_ids_cpu)}, last_5={input_ids_cpu[-5:]}"
+            )
 
         padded_input_ids_len = len(input_ids_cpu)
         out_cache_loc_num_to_padding = padded_input_ids_len - len(out_cache_loc_cpu)
         if out_cache_loc_num_to_padding > 0:
+            logger.info(
+                f"[DEBUG] Padding cache_loc: orig_len={len(out_cache_loc_cpu)}, pad_size={out_cache_loc_num_to_padding}"
+            )
             out_cache_loc_cpu = np.concatenate(
                 [
                     out_cache_loc_cpu,
