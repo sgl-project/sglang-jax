@@ -16,12 +16,15 @@ ScheduleBatch -> ModelWorkerBatch -> ForwardBatch
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from enum import IntEnum, auto
 from functools import total_ordering
 from typing import TYPE_CHECKING, List, Optional
 
 import jax
+
+logger = logging.getLogger(__name__)
 
 from sgl_jax.srt.utils.jax_utils import device_array
 
@@ -231,6 +234,9 @@ class ForwardBatch:
         batch: ModelWorkerBatch,
         model_runner: ModelRunner,
     ):
+        logger.info(
+            f"[DEBUG] device_array input_ids: shape={batch.input_ids.shape}, last_5={batch.input_ids[-5:] if len(batch.input_ids) > 0 else 'empty'}"
+        )
         (
             input_ids,
             seq_lens,
