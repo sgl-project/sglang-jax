@@ -1153,8 +1153,8 @@ class ScheduleBatch:
         total_cache_loc_size = cache_loc_paddings[select_bs_index]
         assert total_cache_loc_size >= len(cache_loc_flat)
 
-        # Optimized: use np.empty since padding area won't be accessed
-        cache_loc_cpu = np.empty(total_cache_loc_size, dtype=np.int32)
+        # Use np.zeros to ensure initialized memory for multiprocess consistency
+        cache_loc_cpu = np.zeros(total_cache_loc_size, dtype=np.int32)
         if len(cache_loc_flat) > 0:
             cache_loc_cpu[: len(cache_loc_flat)] = cache_loc_flat
 
