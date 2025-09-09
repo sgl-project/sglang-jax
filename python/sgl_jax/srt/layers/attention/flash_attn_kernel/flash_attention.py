@@ -693,7 +693,9 @@ def ragged_paged_attention_kernel(
 
             # === STAGE 1: DMA (异步数据传输) ===
             # 仅在有下一块时启动DMA（与当前计算并行）
-            if next_heads_blk_idx < num_heads_blks:
+            @pl.when(next_heads_blk_idx < num_heads_blks)
+            def prefetch_next_kv_blk():
+                # DMA to fixed size buffer!
                 next_async_copy_k, next_async_copy_v = create_kv_async_copy_descriptors(
                     next_heads_blk_idx, next_seq_idx, next_kv_blk_idx, next_buf_idx
                 )
