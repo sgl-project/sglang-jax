@@ -785,7 +785,9 @@ class Scheduler(
 
             req.init_next_round_input(self.tree_cache)
             res = adder.add_one_req(req)
-
+            logger.info("*****************************************")
+            logger.info(f"recv request input_ids {req.origin_input_ids}")
+            logger.info("*****************************************")
             if res != AddReqResult.CONTINUE:
                 if res == AddReqResult.NO_TOKEN:
                     self.running_batch.batch_is_full = True
