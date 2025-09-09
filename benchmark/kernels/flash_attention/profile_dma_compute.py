@@ -127,11 +127,10 @@ def benchmark_separated():
             dma_only_kernel,
             out_shape=jax.ShapeDtypeStruct((1,), jnp.float32),
             grid_spec=pltpu.PrefetchScalarGridSpec(
-                num_scalar_prefetch=1,
+                num_scalar_prefetch=1,  # page_indices is scalar prefetch
                 in_specs=[
                     pl.BlockSpec(memory_space=pltpu.ANY),  # k_cache
                     pl.BlockSpec(memory_space=pltpu.ANY),  # v_cache
-                    pl.BlockSpec(memory_space=pltpu.ANY),  # page_indices
                 ],
                 out_specs=pl.BlockSpec((1,), lambda *_: (0,)),
                 grid=(1,),
@@ -214,7 +213,9 @@ def benchmark_separated():
 
     # 预热
     print("Warming up...")
-    _ = dma_test(sample_page_indices, k, v)
+    _ = dma_test(
+        k, v, sample_page_indices
+    )  # 修正参数顺序：k, v是普通输入，page_indices是scalar prefetch
     _ = compute_test(sample_q, sample_k, sample_v)
 
     # 测试DMA
@@ -222,7 +223,7 @@ def benchmark_separated():
     dma_times = []
     for i in range(5):
         start = time.perf_counter()
-        result = dma_test(sample_page_indices, k, v)
+        result = dma_test(k, v, sample_page_indices)  # 修正参数顺序
         jax.block_until_ready(result)
         dma_times.append(time.perf_counter() - start)
 
