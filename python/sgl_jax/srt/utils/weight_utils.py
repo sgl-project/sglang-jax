@@ -462,41 +462,18 @@ class WeightLoader:
 
             # Always log sharding for significant weights
             if weight.size > 1_000_000:  # > 1M parameters
-                logger.info(
-                    f"Sharding weight: shape={weight.shape}, size={weight.size:,}, sharding={sharding}"
-                )
-                logger.info(
-                    f"  Using devices: {[str(d) for d in self.mesh.devices.flatten()]}"
-                )
-                logger.info(f"  Sharding spec: {sharding_spec}")
-
-                # Special handling for (None, None) sharding - this means replicate across all devices
-                if sharding == (None, None):
-                    logger.info(
-                        "  Note: (None, None) sharding means REPLICATE across all devices"
-                    )
-                    logger.info("  Each device should get a full copy of this weight")
 
                 # Monitor TPU memory before and after sharding large weights
                 if weight.size > 100_000_000:  # > 100M parameters
                     logger.info("=== TPU Memory Before Sharding Large Weight ===")
                     self._print_tpu_info()
 
-                    # Debug: inspect the sharding behavior
-                    logger.info(f"Weight current device: {weight.device()}")
-                    logger.info(
-                        f"Weight sharding before device_put: {getattr(weight, 'sharding', 'No sharding info')}"
-                    )
-
+                    time.sleep(100)
                     result = jax.device_put(weight, sharding_spec)
-
-                    logger.info(
-                        f"Result device placement after device_put: {result.device()}"
-                    )
-                    logger.info(f"Result sharding after device_put: {result.sharding}")
 
                     logger.info("=== TPU Memory After Sharding Large Weight ===")
                     self._print_tpu_info()
+                    time.sleep(100)
                     return result
 
             return jax.device_put(weight, sharding_spec)
