@@ -908,9 +908,13 @@ class Scheduler(
             # Pre-initialize ForwardBatch for overlap scheduling optimization
             from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
 
+            logger.info(
+                f"[DEBUG] Before ForwardBatch.init_new: input_ids unchanged check={model_worker_batch.input_ids[-5:]}"
+            )
             model_worker_batch.forward_batch = ForwardBatch.init_new(
                 model_worker_batch, self.tp_worker.get_model_runner()
             )
+            logger.info(f"[DEBUG] After ForwardBatch.init_new: completed")
             logits_output, next_token_ids, cache_miss_count = (
                 self.tp_worker.forward_batch_generation(
                     model_worker_batch, sampling_metadata=sampling_metadata
