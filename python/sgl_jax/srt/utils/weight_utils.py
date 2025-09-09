@@ -244,7 +244,7 @@ class WeightLoader:
             )
             logger.info(f"=== TPU Memory Before Loading File {file_idx+1} ===")
             self._print_tpu_info()
-
+            time.sleep(100)
             with jax.default_device(jax.local_devices(backend="cpu")[0]):
                 logger.info(
                     f"Loading with CPU device: {jax.local_devices(backend='cpu')[0]}"
@@ -262,6 +262,7 @@ class WeightLoader:
 
             logger.info(f"=== TPU Memory After Loading File {file_idx+1} ===")
             self._print_tpu_info()
+            time.sleep(100)
 
     def _process_and_assign_weight(
         self,
