@@ -360,79 +360,66 @@ class Qwen3ForCausalLM(nnx.Module):
         self.dtype = config.dtype
         logger.info(f"QWen3ForCausalLMModel config dtype: {self.dtype}")
 
-        try:
-            result = subprocess.run(
-                ["tpu-info"], capture_output=True, text=True, timeout=10
-            )
-            if result.returncode == 0:
-                logger.info(f"TPU Info Output:\n{result.stdout}")
-            else:
-                logger.info(
-                    f"tpu-info failed with return code {result.returncode}: {result.stderr}"
-                )
-        except subprocess.TimeoutExpired:
-            logger.info("tpu-info command timed out")
-        except FileNotFoundError:
-            logger.info("tpu-info command not found")
-        except Exception as e:
-            logger.info(f"Error running tpu-info: {e}")
+        logger.info("=== TPU Memory Before Model Init ===")
+        self._print_tpu_info()
 
         self.transformer = QWen3Model(config.hf_config, dtype=self.dtype, rngs=rngs)
 
-        # Monitor TPU memory after transformer initialization
         logger.info("=== TPU Memory After Transformer Init ===")
-        try:
-            result = subprocess.run(
-                ["tpu-info"], capture_output=True, text=True, timeout=10
-            )
-            if result.returncode == 0:
-                logger.info(f"TPU Info Output:\n{result.stdout}")
-            else:
-                logger.info(
-                    f"tpu-info failed with return code {result.returncode}: {result.stderr}"
-                )
-        except subprocess.TimeoutExpired:
-            logger.info("tpu-info command timed out")
-        except FileNotFoundError:
-            logger.info("tpu-info command not found")
-        except Exception as e:
-            logger.info(f"Error running tpu-info: {e}")
+        self._print_tpu_info()
 
         self.lm_head = ParallelLMHead(
             config.hf_config.vocab_size, config.hidden_size, rngs=rngs
         )
 
-        # Monitor TPU memory after lm_head initialization
         logger.info("=== TPU Memory After LM Head Init ===")
-        try:
-            result = subprocess.run(
-                ["tpu-info"], capture_output=True, text=True, timeout=10
-            )
-            if result.returncode == 0:
-                logger.info(f"TPU Info Output:\n{result.stdout}")
-            else:
-                logger.info(
-                    f"tpu-info failed with return code {result.returncode}: {result.stderr}"
-                )
-        except subprocess.TimeoutExpired:
-            logger.info("tpu-info command timed out")
-        except FileNotFoundError:
-            logger.info("tpu-info command not found")
-        except Exception as e:
-            logger.info(f"Error running tpu-info: {e}")
+        self._print_tpu_info()
 
         self.logits_processor = LogitsProcessor(
             config.hf_config.vocab_size, self.lm_head, self.mesh
         )
 
-        # Monitor TPU memory after logits_processor initialization
         logger.info("=== TPU Memory After LogitsProcessor Init ===")
+        self._print_tpu_info()
+
+    def _print_tpu_info(self):
+        import re
+        import subprocess
+
         try:
             result = subprocess.run(
                 ["tpu-info"], capture_output=True, text=True, timeout=10
             )
             if result.returncode == 0:
-                logger.info(f"TPU Info Output:\n{result.stdout}")
+                # Extract only memory usage numbers
+                lines = result.stdout.split("\n")
+                memory_usage = []
+
+                for line in lines:
+                    # Look for lines with memory usage pattern like "│ 0      │ 1.35 GiB / 31.25 GiB │"
+                    if re.search(r"│\s*\d+\s*│.*GiB.*/", line):
+                        # Extract device ID and memory usage
+                        match = re.search(
+                            r"│\s*(\d+)\s*│\s*([0-9.]+)\s*GiB\s*/\s*([0-9.]+)\s*GiB",
+                            line,
+                        )
+                        if match:
+                            device_id = match.group(1)
+                            used = float(match.group(2))
+                            total = float(match.group(3))
+                            percentage = (used / total) * 100
+                            memory_usage.append(
+                                f"TPU{device_id}: {used:.2f}GiB/{total:.2f}GiB ({percentage:.1f}%)"
+                            )
+
+                if memory_usage:
+                    logger.info("TPU Memory: " + " | ".join(memory_usage))
+                else:
+                    # Fallback: just show a simple summary
+                    logger.info("TPU memory info parsing failed, showing raw output")
+                    for line in lines:
+                        if "GiB" in line and "│" in line:
+                            logger.info(f"  {line.strip()}")
             else:
                 logger.info(
                     f"tpu-info failed with return code {result.returncode}: {result.stderr}"
@@ -445,8 +432,7 @@ class Qwen3ForCausalLM(nnx.Module):
             logger.info(f"Error running tpu-info: {e}")
 
     def load_weights(self, rng_key: jax.Array):
-        logger.info("start load weights************************************")
-        time.sleep(100)
+        logger.info("=== Starting Weight Loading ===")
         self.rng = nnx.Rngs(rng_key)
 
         loader = WeightLoader(
@@ -454,11 +440,8 @@ class Qwen3ForCausalLM(nnx.Module):
         )
 
         weight_mappings = self._create_qwen3_weight_mappings()
-        logger.info("start load weights************************************")
-        time.sleep(100)
         loader.load_weights_from_safetensors(weight_mappings)
         logger.info("Qwen3 weights loaded successfully!")
-        logger.info("end load weights************************************")
 
     def _create_qwen3_weight_mappings(self) -> dict:
         mappings = {
