@@ -37,6 +37,16 @@ class SchedulerProfilerMixin:
         if output_dir is None:
             output_dir = os.getenv("SGLANG_JAX_PROFILER_DIR", "/tmp")
 
+        # check permission for output_dir
+        tmp_output_dir = output_dir
+        while not os.path.exists(tmp_output_dir):
+            tmp_output_dir = os.path.dirname(tmp_output_dir)
+        if not os.access(tmp_output_dir, os.W_OK):
+            return ProfileReqOutput(
+                success=False,
+                message=f"no permission to write the {output_dir}",
+            )
+
         self.profiler_output_dir = output_dir
         self.profile_id = profile_id
 
