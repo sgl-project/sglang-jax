@@ -1,8 +1,10 @@
+import argparse
 import functools
 import time
 
 import jax
 import numpy as np
+from jax import profiler
 from utils import create_decode_uniform_data, create_prefill_uniform_data
 
 from sgl_jax.srt.layers.attention.flash_attn_kernel.flash_attention import (
@@ -108,52 +110,104 @@ def benchmark_backend(
 
 
 def main():
+    parser = argparse.ArgumentParser(description="Flash Attention Benchmark")
+    parser.add_argument(
+        "--profiler",
+        action="store_true",
+        help="Enable JAX profiler with reduced configs",
+    )
+    args = parser.parse_args()
+
     page_size = 128
     bench_modes = ["prefill", "decode"]
-    num_head_config = [2, 4, 8, 16]
-    seq_len_config = [1024, 2048, 4096]
-    batch_size_config = [1, 2, 4, 8, 10]
-    head_dim_config = [128]
-    all_combined_config = []
-    for batch_size in batch_size_config:
-        for seq_len in seq_len_config:
-            for num_heads in num_head_config:
-                for head_dim in head_dim_config:
-                    all_combined_config.append(
-                        (batch_size, seq_len, num_heads, head_dim)
-                    )
+
+    if args.profiler:
+        # Reduced configs for profiling - just a few representative cases
+        all_combined_config = [
+            (1, 1024, 4, 128),  # Small: B1_S1024_H4
+            (2, 2048, 8, 128),  # Medium: B2_S2048_H8
+            (4, 4096, 16, 128),  # Large: B4_S4096_H16
+        ]
+        print("Starting JAX profiling for Flash Attention...")
+        profiler.start_trace("./flash_attention_profile")
+    else:
+        # Original full benchmark configs
+        num_head_config = [2, 4, 8, 16]
+        seq_len_config = [1024, 2048, 4096]
+        batch_size_config = [1, 2, 4, 8, 10]
+        head_dim_config = [128]
+        all_combined_config = []
+        for batch_size in batch_size_config:
+            for seq_len in seq_len_config:
+                for num_heads in num_head_config:
+                    for head_dim in head_dim_config:
+                        all_combined_config.append(
+                            (batch_size, seq_len, num_heads, head_dim)
+                        )
 
     results = []
-    for mode in bench_modes:
-        print(f"[{mode.upper()}] BENCHMARK RESULTS SUMMARY")
-        for i, (batch_size, seq_len, num_heads, head_dim) in enumerate(
-            all_combined_config
-        ):
-            print(f"Config: batch={batch_size}, seq_len={seq_len}, heads={num_heads}")
 
-            flash_time = benchmark_backend(
-                mode,
-                "flash",
-                batch_size,
-                seq_len,
-                num_heads,
-                head_dim=head_dim,
-                page_size=page_size,
-            )
+    try:
+        for mode in bench_modes:
+            if args.profiler:
+                print(f"[{mode.upper()}] PROFILING BENCHMARK")
+            else:
+                print(f"[{mode.upper()}] BENCHMARK RESULTS SUMMARY")
 
-            results.append(
-                {
-                    "config": f"B{batch_size}_S{seq_len}_H{num_heads}",
-                    "flash_ms": flash_time * 1000,
-                }
-            )
-            print()
+            for i, (batch_size, seq_len, num_heads, head_dim) in enumerate(
+                all_combined_config
+            ):
+                print(
+                    f"Config: batch={batch_size}, seq_len={seq_len}, heads={num_heads}"
+                )
 
-        print("=" * 80)
-        print("-" * 80)
+                flash_time = benchmark_backend(
+                    mode,
+                    "flash",
+                    batch_size,
+                    seq_len,
+                    num_heads,
+                    head_dim=head_dim,
+                    page_size=page_size,
+                )
 
-        for r in results:
-            print(f"{r['config']:<15} {r['flash_ms']:<11.2f}")
+                if args.profiler:
+                    results.append(
+                        {
+                            "config": f"B{batch_size}_S{seq_len}_H{num_heads}_{mode}",
+                            "flash_ms": flash_time * 1000,
+                        }
+                    )
+                    print(f"Time: {flash_time * 1000:.2f}ms")
+                else:
+                    results.append(
+                        {
+                            "config": f"B{batch_size}_S{seq_len}_H{num_heads}",
+                            "flash_ms": flash_time * 1000,
+                        }
+                    )
+                print()
+
+            if not args.profiler:
+                print("=" * 80)
+                print("-" * 80)
+                for r in results:
+                    print(f"{r['config']:<15} {r['flash_ms']:<11.2f}")
+                results = []  # Clear for next mode
+
+    finally:
+        if args.profiler:
+            print("=" * 80)
+            print("PROFILING RESULTS SUMMARY")
+            print("-" * 80)
+            for r in results:
+                print(f"{r['config']:<20} {r['flash_ms']:<11.2f}ms")
+
+            # Stop profiling and save results
+            print("\nStopping profiler...")
+            profiler.stop_trace()
+            print("Profiling data saved to ./flash_attention_profile")
+            print("View with: tensorboard --logdir=./flash_attention_profile")
 
 
 if __name__ == "__main__":
