@@ -264,7 +264,7 @@ class RadixCache(BasePrefixCache):
     def get_cached_kv(self, token_ids: List[int]) -> Tuple[jnp.ndarray, int]:
         if self.disable:
             with jax.default_device(self.cpu_device):
-                empty_kv = jnp.empty(
+                empty_kv = jnp.zeros(
                     (self.layer_num, 0, self.kv_head_num, self.head_dim),
                     dtype=self.dtype,
                 )
@@ -279,7 +279,7 @@ class RadixCache(BasePrefixCache):
         if matched_len == 0:
             # create empty array on CPU
             with jax.default_device(self.cpu_device):
-                empty_kv = jnp.empty(
+                empty_kv = jnp.zeros(
                     (self.layer_num, 0, self.kv_head_num, self.head_dim),
                     dtype=self.dtype,
                 )
@@ -291,7 +291,7 @@ class RadixCache(BasePrefixCache):
         if matched_len == 0:
             # No matched tokens, return empty KV data
             with jax.default_device(self.cpu_device):
-                kv_data = jnp.empty(
+                kv_data = jnp.zeros(
                     (self.layer_num, 0, self.kv_head_num, self.head_dim),
                     dtype=self.dtype,
                 )

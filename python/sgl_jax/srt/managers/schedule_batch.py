@@ -1134,7 +1134,7 @@ class ScheduleBatch:
                 total_aligned_length = np.sum(aligned_lengths)
 
                 # Pre-allocate the result array
-                cache_loc_flat = np.empty(total_aligned_length, dtype=np.int32)
+                cache_loc_flat = np.zeros(total_aligned_length, dtype=np.int32)
 
                 # Fill the array efficiently
                 offset = 0
@@ -1153,10 +1153,18 @@ class ScheduleBatch:
         total_cache_loc_size = cache_loc_paddings[select_bs_index]
         assert total_cache_loc_size >= len(cache_loc_flat)
 
-        # Optimized: use np.empty since padding area won't be accessed
+        # Use np.empty for performance, then initialize padding area explicitly
         cache_loc_cpu = np.empty(total_cache_loc_size, dtype=np.int32)
         if len(cache_loc_flat) > 0:
             cache_loc_cpu[: len(cache_loc_flat)] = cache_loc_flat
+        # Initialize padding area to ensure multiprocess consistency
+        if len(cache_loc_flat) < total_cache_loc_size:
+            cache_loc_cpu[len(cache_loc_flat) :] = 0
+
+        # Debug cache_loc construction
+        logger.info(
+            f"[NODE_DEBUG] cache_loc construction: cache_loc_flat.len={len(cache_loc_flat)}, total_size={total_cache_loc_size}, cache_loc_flat.sum={np.sum(cache_loc_flat) if len(cache_loc_flat) > 0 else 0}"
+        )
 
         if bs_padding_size > 0:
             invalid_req_pool_indices = np.array(
