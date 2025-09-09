@@ -362,25 +362,26 @@ class Qwen3ForCausalLM(nnx.Module):
 
         logger.info("=== TPU Memory Before Model Init ===")
         self._print_tpu_info()
-
+        time.sleep(100)
         self.transformer = QWen3Model(config.hf_config, dtype=self.dtype, rngs=rngs)
 
         logger.info("=== TPU Memory After Transformer Init ===")
         self._print_tpu_info()
-
+        time.sleep(100)
         self.lm_head = ParallelLMHead(
             config.hf_config.vocab_size, config.hidden_size, rngs=rngs
         )
 
         logger.info("=== TPU Memory After LM Head Init ===")
         self._print_tpu_info()
-
+        time.sleep(100)
         self.logits_processor = LogitsProcessor(
             config.hf_config.vocab_size, self.lm_head, self.mesh
         )
 
         logger.info("=== TPU Memory After LogitsProcessor Init ===")
         self._print_tpu_info()
+        time.sleep(100)
 
     def _print_tpu_info(self):
         import re
