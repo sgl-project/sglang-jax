@@ -61,11 +61,12 @@ class Embed(nnx.Module):
         Returns:
         None
         """
+        param = rngs.params()
         logger.info("Embed1: Creating embedding layer")
         self._print_tpu_info()
         time.sleep(100)
         fn = nnx.with_partitioning(default_embed_init, (None, None))(
-            rngs.params(), (num_embeddings, features), param_dtype
+            param, (num_embeddings, features), param_dtype
         )
         logger.info("Embed2: Creating embedding layer")
         self._print_tpu_info()
