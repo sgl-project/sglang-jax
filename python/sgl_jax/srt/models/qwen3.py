@@ -354,6 +354,55 @@ class QWen3Model(nnx.Module):
         layers_callback_flag.append(callback_flag)
         return hidden_states, layers_k, layers_v, layers_callback_flag
 
+    def _print_tpu_info(self):
+        import re
+        import subprocess
+
+        try:
+            result = subprocess.run(
+                ["tpu-info"], capture_output=True, text=True, timeout=10
+            )
+            if result.returncode == 0:
+                # Extract only memory usage numbers
+                lines = result.stdout.split("\n")
+                memory_usage = []
+
+                for line in lines:
+                    # Look for lines with memory usage pattern like "│ 0      │ 1.35 GiB / 31.25 GiB │"
+                    if re.search(r"│\s*\d+\s*│.*GiB.*/", line):
+                        # Extract device ID and memory usage
+                        match = re.search(
+                            r"│\s*(\d+)\s*│\s*([0-9.]+)\s*GiB\s*/\s*([0-9.]+)\s*GiB",
+                            line,
+                        )
+                        if match:
+                            device_id = match.group(1)
+                            used = float(match.group(2))
+                            total = float(match.group(3))
+                            percentage = (used / total) * 100
+                            memory_usage.append(
+                                f"TPU{device_id}: {used:.2f}GiB/{total:.2f}GiB ({percentage:.1f}%)"
+                            )
+
+                if memory_usage:
+                    logger.info("TPU Memory: " + " | ".join(memory_usage))
+                else:
+                    # Fallback: just show a simple summary
+                    logger.info("TPU memory info parsing failed, showing raw output")
+                    for line in lines:
+                        if "GiB" in line and "│" in line:
+                            logger.info(f"  {line.strip()}")
+            else:
+                logger.info(
+                    f"tpu-info failed with return code {result.returncode}: {result.stderr}"
+                )
+        except subprocess.TimeoutExpired:
+            logger.info("tpu-info command timed out")
+        except FileNotFoundError:
+            logger.info("tpu-info command not found")
+        except Exception as e:
+            logger.info(f"Error running tpu-info: {e}")
+
 
 class Qwen3ForCausalLM(nnx.Module):
     def __init__(
