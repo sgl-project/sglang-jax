@@ -69,19 +69,19 @@ TUNED_BLOCK_SIZES = {
         ("bfloat16", "bfloat16", 32, 128, 32): (32, 64),
         ("bfloat16", "bfloat16", 2, 128, 64): (32, 64),
         ("bfloat16", "bfloat16", 4, 128, 64): (32, 64),
-        ("bfloat16", "bfloat16", 8, 128, 64): (16, 64),
-        ("bfloat16", "bfloat16", 16, 128, 64): (16, 64),
-        ("bfloat16", "bfloat16", 32, 128, 64): (16, 64),
+        ("bfloat16", "bfloat16", 8, 128, 64): (64, 128),
+        ("bfloat16", "bfloat16", 16, 128, 64): (24, 48),
+        ("bfloat16", "bfloat16", 32, 128, 64): (24, 48),
         ("bfloat16", "bfloat16", 2, 128, 128): (16, 32),
-        ("bfloat16", "bfloat16", 4, 128, 128): (8, 32),
-        ("bfloat16", "bfloat16", 8, 128, 128): (16, 32),
+        ("bfloat16", "bfloat16", 4, 128, 128): (16, 32),
+        ("bfloat16", "bfloat16", 8, 128, 128): (8, 32),
         ("bfloat16", "bfloat16", 16, 128, 128): (8, 32),
         ("bfloat16", "bfloat16", 32, 128, 128): (8, 32),
-        ("bfloat16", "bfloat16", 2, 128, 256): (16, 32),
-        ("bfloat16", "bfloat16", 4, 128, 256): (8, 32),
-        ("bfloat16", "bfloat16", 8, 128, 256): (16, 32),
-        ("bfloat16", "bfloat16", 16, 128, 256): (8, 32),
-        ("bfloat16", "bfloat16", 32, 128, 256): (8, 32),
+        ("bfloat16", "bfloat16", 2, 128, 256): (32, 64),
+        ("bfloat16", "bfloat16", 4, 128, 256): (16, 64),
+        ("bfloat16", "bfloat16", 8, 128, 256): (32, 64),
+        ("bfloat16", "bfloat16", 16, 128, 256): (16, 32),
+        ("bfloat16", "bfloat16", 32, 128, 256): (16, 64),
         # go/keep-sorted end
     },
 }
@@ -526,28 +526,23 @@ def ragged_paged_attention_kernel(
 
             kv_len_start = kv_blk_idx * num_kv_per_blk_batch
 
-            if k_scale is not None:
-                k_batch = k_batch.astype(jnp.float32) * k_scale
-                k_batch = k_batch.astype(q_batch.dtype)
-            if v_scale is not None:
-                v_batch = v_batch.astype(jnp.float32) * v_scale
-                v_batch = v_batch.astype(q_batch.dtype)
-
-            effective_kv_len = actual_kv_len - kv_len_start
-            kv_indices = lax.broadcasted_iota(jnp.int32, k_batch.shape[:-1], 1)
-            kv_mask_int = (kv_indices < effective_kv_len).astype(jnp.int32)
-            kv_mask_expanded = jnp.expand_dims(kv_mask_int, axis=-1)
-            kv_mask_broadcast = jnp.broadcast_to(kv_mask_expanded, k_batch.shape)
-
-            k_batch = jnp.where(
-                kv_mask_broadcast > 0, k_batch.astype(jnp.float32), 0
-            ).astype(k_batch.dtype)
-            v_batch = jnp.where(
-                kv_mask_broadcast > 0, v_batch.astype(jnp.float32), 0
-            ).astype(v_batch.dtype)
-
             q_batch_f32 = q_batch.astype(jnp.float32)
             k_batch_f32 = k_batch.astype(jnp.float32)
+            v_batch_f32 = v_batch.astype(jnp.float32)
+
+            if k_scale is not None:
+                k_batch_f32 = k_batch_f32 * k_scale
+            if v_scale is not None:
+                v_batch_f32 = v_batch_f32 * v_scale
+
+            effective_kv_len = actual_kv_len - kv_len_start
+            kv_indices = lax.broadcasted_iota(jnp.int32, k_batch_f32.shape[:-1], 1)
+            kv_mask_int = (kv_indices < effective_kv_len).astype(jnp.int32)
+            kv_mask_expanded = jnp.expand_dims(kv_mask_int, axis=-1)
+            kv_mask_broadcast = jnp.broadcast_to(kv_mask_expanded, k_batch_f32.shape)
+
+            k_batch_f32 = jnp.where(kv_mask_broadcast > 0, k_batch_f32, 0.0)
+            v_batch_f32 = jnp.where(kv_mask_broadcast > 0, v_batch_f32, 0.0)
             qk_batch = (
                 jnp.einsum(
                     "hqd,hkd->hqk",
@@ -588,7 +583,6 @@ def ragged_paged_attention_kernel(
             )  # [num_kv_heads_per_blk, num_q_total, 1]
             s_curr = jnp.exp(qk_batch - m_curr)
 
-            v_batch_f32 = v_batch.astype(jnp.float32)
             qkv_batch = jnp.einsum(
                 "hqk,hkd->hqd", s_curr, v_batch_f32, preferred_element_type=jnp.float32
             )
@@ -962,12 +956,13 @@ def ragged_paged_attention(
             grid=grid,
             scratch_shapes=scratch_shapes,
         ),
-        compiler_params=pltpu.CompilerParams(
+        compiler_params=pltpu.TPUCompilerParams(
             dimension_semantics=(
                 "arbitrary",
                 "arbitrary",
             ),
             vmem_limit_bytes=vmem_limit_bytes,
+            disable_bounds_checks=True,
         ),
         out_shape=jax.ShapeDtypeStruct(shape=q.shape, dtype=q.dtype),
         name="ragged_paged_attention_kernel",

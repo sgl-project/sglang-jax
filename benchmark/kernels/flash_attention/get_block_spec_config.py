@@ -79,6 +79,7 @@ def benchmark_backend(
             sm_scale=sm_scale,
             num_kv_pages_per_block=num_kv_pages_per_block,
             num_queries_per_block=num_queries_per_block,
+            vmem_limit_bytes=64 * (1 << 20),
         )
 
     attn = functools.partial(
