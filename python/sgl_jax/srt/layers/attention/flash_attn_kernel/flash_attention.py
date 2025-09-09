@@ -707,7 +707,7 @@ def ragged_paged_attention_kernel(
                 heads_blk_idx, cur_seq_idx, kv_blk_idx, cur_buf_idx
             )
 
-            # === STAGE 2: PREPROCESS (数据预处理) ===
+            # === STAGE 2: PREPROCESS (完整的数据预处理) ===
             def stage2_preprocess():
                 # Step 2a: 等待DMA完成并reshape
                 k_raw = cur_async_copy_k.wait()
@@ -722,7 +722,7 @@ def ragged_paged_attention_kernel(
                     head_dim,
                 )
 
-                # Step 2b: 数据格式转换和scaling (在这里完成，不在计算阶段)
+                # Step 2b: 数据格式转换和scaling (一次性完成，Stage3不再处理)
                 if k_scale is not None:
                     k_ref = k_ref.astype(jnp.float32) * k_scale
                     k_ref = k_ref.astype(q_ref.dtype)
@@ -738,36 +738,178 @@ def ragged_paged_attention_kernel(
                     k_ref, v_ref, num_kv_heads_per_blk
                 )
 
+                # Step 2d: 预处理mask和长度计算（避免Stage3重复）
+                effective_kv_len = actual_kv_len - (kv_blk_idx * num_kv_per_blk)
+                kv_indices = lax.broadcasted_iota(jnp.int32, k_batch.shape[:-1], 1)
+                kv_mask_int = (kv_indices < effective_kv_len).astype(jnp.int32)
+                kv_mask_expanded = jnp.expand_dims(kv_mask_int, axis=-1)
+                kv_mask_broadcast = jnp.broadcast_to(kv_mask_expanded, k_batch.shape)
+
+                # 应用mask，转换为计算就绪的float32格式
+                k_batch = jnp.where(
+                    kv_mask_broadcast > 0, k_batch.astype(jnp.float32), 0
+                ).astype(
+                    jnp.float32
+                )  # 直接输出float32，避免Stage3转换
+                v_batch = jnp.where(
+                    kv_mask_broadcast > 0, v_batch.astype(jnp.float32), 0
+                ).astype(
+                    jnp.float32
+                )  # 直接输出float32，避免Stage3转换
+
+                q_batch = q_batch.astype(jnp.float32)  # 统一为float32
+
                 return q_batch, k_batch, v_batch
 
             # 执行预处理阶段
             q_batch, k_batch, v_batch = stage2_preprocess()
 
-            # === STAGE 3: COMPUTE (纯计算，无数据IO) ===
+            # === STAGE 3: PURE COMPUTE (纯矩阵运算，零预处理) ===
             def stage3_pure_compute():
-                flash_attention(
-                    q_batch,
-                    k_batch,
-                    v_batch,
-                    l_ref,
-                    m_ref,
-                    acc_ref,
-                    kv_blk_idx=kv_blk_idx,
-                    actual_kv_len=actual_kv_len,
-                    sm_scale=sm_scale,
-                    mask_value=mask_value,
-                    q_start=q_start,
-                    q_end=q_end,
-                    q_len=q_len,
-                    q_len_start=q_len_start,
-                    kv_len_start=kv_blk_idx * num_kv_per_blk,
-                    sliding_window=sliding_window,
-                    soft_cap=soft_cap,
-                    k_scale=None,  # 已在预处理阶段完成
-                    v_scale=None,  # 已在预处理阶段完成
+                # 数据已在Stage2完全准备好，这里只做核心数学计算
+
+                # 直接计算QK^T（数据已经是float32）
+                qk_batch = (
+                    jnp.einsum(
+                        "hqd,hkd->hqk",
+                        q_batch,  # 已经是float32
+                        k_batch,  # 已经是float32，已应用mask
+                        preferred_element_type=jnp.float32,
+                    )
+                    * sm_scale
                 )
 
-            # 执行纯计算阶段
+                # 计算causal mask
+                store_start = jnp.maximum(q_start - q_len_start, 0)
+                store_end = jnp.minimum(q_end - q_len_start, num_q_per_blk)
+
+                row_ids = (
+                    (actual_kv_len - q_len)
+                    + q_len_start
+                    - q_start
+                    + jax.lax.broadcasted_iota(jnp.int32, qk_batch.shape, 1)
+                    // num_q_heads_per_kv_head
+                )
+                col_ids = (kv_blk_idx * num_kv_per_blk) + jax.lax.broadcasted_iota(
+                    jnp.int32, qk_batch.shape, 2
+                )
+
+                causal_mask = row_ids < col_ids
+                if sliding_window is not None:
+                    causal_mask = jnp.logical_or(
+                        causal_mask, row_ids - sliding_window >= col_ids
+                    )
+
+                if soft_cap is not None:
+                    qk_batch = soft_cap * jnp.tanh(qk_batch / soft_cap)
+
+                qk_batch += jnp.where(causal_mask, mask_value, 0.0)
+
+                # Online softmax更新
+                m_curr = jnp.max(qk_batch, axis=-1, keepdims=True)
+                s_curr = jnp.exp(qk_batch - m_curr)
+
+                qkv_batch = jnp.einsum(
+                    "hqk,hkd->hqd", s_curr, v_batch, preferred_element_type=jnp.float32
+                )
+
+                # 更新状态（l_ref, m_ref, acc_ref）
+                lm_store_shape = m_ref.shape
+                m_curr_expanded = jnp.broadcast_to(m_curr, lm_store_shape)
+                l_curr_expanded = jnp.broadcast_to(
+                    s_curr.sum(axis=-1, keepdims=True), lm_store_shape
+                )
+
+                def load_with_init_batch(ref, init_val):
+                    return jnp.where(
+                        kv_blk_idx == 0, jnp.full_like(ref, init_val), ref[...]
+                    )
+
+                def masked_store_batch(ref, val, start, end, group=1):
+                    iota = lax.broadcasted_iota(jnp.int32, ref.shape, 1) // group
+                    mask_bool = jnp.logical_and(iota >= start, iota < end)
+                    pl.store(
+                        ref,
+                        idx=tuple(slice(None) for _ in ref.shape),
+                        val=val,
+                        mask=mask_bool,
+                    )
+
+                m_prev = load_with_init_batch(m_ref, -jnp.inf)
+                l_prev = load_with_init_batch(l_ref, 0.0)
+
+                m_next = jnp.maximum(m_prev, m_curr_expanded)
+                masked_store_batch(
+                    m_ref, m_next, store_start, store_end, num_q_heads_per_kv_head
+                )
+
+                alpha = jnp.exp(m_prev - m_next)
+                beta = jnp.exp(m_curr_expanded - m_next)
+                l_alpha = alpha * l_prev
+                l_next = l_alpha + beta * l_curr_expanded
+                l_next_safe = jnp.where(l_next == 0.0, 1.0, l_next)
+
+                masked_store_batch(
+                    l_ref, l_next_safe, store_start, store_end, num_q_heads_per_kv_head
+                )
+
+                # 更新输出累加器
+                o_curr = load_with_init_batch(acc_ref, 0.0)
+
+                # 重构输出（适配batch格式）
+                o_curr_list = []
+                for kv_head_idx in range(num_kv_heads_per_blk):
+                    q_head_start = kv_head_idx * num_q_heads_per_kv_head
+                    q_head_end = q_head_start + num_q_heads_per_kv_head
+                    kv_head_slice = o_curr[:, q_head_start:q_head_end, :]
+                    kv_head_data = kv_head_slice.reshape(
+                        num_q_per_blk * num_q_heads_per_kv_head, head_dim
+                    )
+                    o_curr_list.append(kv_head_data)
+                o_curr_reshaped = jnp.stack(o_curr_list, axis=0)
+
+                def broadcast_to_qkv_shape(arr, target_shape):
+                    return jnp.broadcast_to(arr, target_shape)
+
+                l_alpha_broadcast = broadcast_to_qkv_shape(l_alpha, qkv_batch.shape)
+                beta_broadcast = broadcast_to_qkv_shape(beta, qkv_batch.shape)
+                l_next_safe_broadcast = broadcast_to_qkv_shape(
+                    l_next_safe, qkv_batch.shape
+                )
+
+                out_batch = lax.div(
+                    l_alpha_broadcast * o_curr_reshaped + beta_broadcast * qkv_batch,
+                    l_next_safe_broadcast,
+                )
+
+                # 重构输出格式
+                out_batch_reshaped = out_batch.reshape(
+                    num_kv_heads_per_blk,
+                    num_q_per_blk,
+                    num_q_heads_per_kv_head,
+                    head_dim,
+                )
+
+                out_heads_list = []
+                for kv_head_idx in range(num_kv_heads_per_blk):
+                    kv_head_output = out_batch_reshaped[kv_head_idx]
+                    out_heads_list.append(kv_head_output)
+
+                out_reshaped = jnp.concatenate(out_heads_list, axis=1)
+
+                def masked_store_acc(ref, val, start, end):
+                    iota = lax.broadcasted_iota(jnp.int32, ref.shape, 0)
+                    mask_bool = jnp.logical_and(iota >= start, iota < end)
+                    pl.store(
+                        ref,
+                        idx=tuple(slice(None) for _ in ref.shape),
+                        val=val,
+                        mask=mask_bool,
+                    )
+
+                masked_store_acc(acc_ref, out_reshaped, store_start, store_end)
+
+            # 执行纯计算阶段（零预处理）
             stage3_pure_compute()
 
             return kv_blk_idx + 1, next_buf_idx
