@@ -883,11 +883,17 @@ class Scheduler(
             precompile_cache_loc_paddings,
         ) = self.tp_worker.get_precompile_paddings()
 
+        logger.info(
+            f"[DEBUG] Before get_model_worker_batch: batch.seq_lens_sum={batch.seq_lens_sum}, paddings={precompile_token_paddings[:3]}..."
+        )
         model_worker_batch = batch.get_model_worker_batch(
             precompile_token_paddings,
             precompile_bs_paddings,
             precompile_cache_loc_paddings,
             self.page_size,
+        )
+        logger.info(
+            f"[DEBUG] After get_model_worker_batch: input_ids.shape={model_worker_batch.input_ids.shape}, last_5={model_worker_batch.input_ids[-5:] if len(model_worker_batch.input_ids) > 0 else 'empty'}"
         )
 
         sampling_metadata = SamplingMetadata.from_model_worker_batch(

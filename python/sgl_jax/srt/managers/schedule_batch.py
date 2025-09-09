@@ -1029,11 +1029,15 @@ class ScheduleBatch:
         # extend & decode: input_ids, positions, out_cache_loc, cache_loc
         padding_size = 0
         token_paddings.sort()
+        logger.info(
+            f"[DEBUG] Before padding calc: input_len={len(input_ids_cpu)}, token_paddings={token_paddings}"
+        )
         for size in token_paddings:
             if size >= len(input_ids_cpu):
                 padding_size = size - len(input_ids_cpu)
                 break
 
+        logger.info(f"[DEBUG] Padding decision: padding_size={padding_size}")
         if padding_size > 0:
             logger.info(
                 f"[DEBUG] Padding input_ids: orig_len={len(input_ids_cpu)}, pad_size={padding_size}, dtype={input_ids_cpu.dtype}"
