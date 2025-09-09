@@ -37,39 +37,39 @@ DEFAULT_MASK_VALUE = -0.7 * float(jnp.finfo(jnp.dtype("float32")).max)
 TUNED_BLOCK_SIZES = {
     "TPU v6": {
         # (q_dtype, kv_dtype, num_kv_heads_per_blk, head_dim, page_size)
-        ("bfloat16", "bfloat16", 2, 128, 1): (64, 256),
-        ("bfloat16", "bfloat16", 4, 128, 1): (64, 256),
-        ("bfloat16", "bfloat16", 8, 128, 1): (64, 256),
-        ("bfloat16", "bfloat16", 16, 128, 1): (64, 256),
-        ("bfloat16", "bfloat16", 32, 128, 1): (64, 256),
-        ("bfloat16", "bfloat16", 2, 128, 2): (64, 256),
-        ("bfloat16", "bfloat16", 4, 128, 2): (64, 256),
-        ("bfloat16", "bfloat16", 8, 128, 2): (64, 256),
-        ("bfloat16", "bfloat16", 16, 128, 2): (64, 256),
-        ("bfloat16", "bfloat16", 32, 128, 2): (64, 256),
-        ("bfloat16", "bfloat16", 2, 128, 4): (64, 256),
-        ("bfloat16", "bfloat16", 4, 128, 4): (64, 256),
-        ("bfloat16", "bfloat16", 8, 128, 4): (64, 256),
-        ("bfloat16", "bfloat16", 16, 128, 4): (64, 256),
-        ("bfloat16", "bfloat16", 32, 128, 4): (64, 256),
-        ("bfloat16", "bfloat16", 2, 128, 8): (64, 256),
-        ("bfloat16", "bfloat16", 4, 128, 8): (64, 256),
-        ("bfloat16", "bfloat16", 8, 128, 8): (64, 256),
-        ("bfloat16", "bfloat16", 16, 128, 8): (64, 256),
-        ("bfloat16", "bfloat16", 32, 128, 8): (64, 256),
-        ("bfloat16", "bfloat16", 2, 128, 16): (64, 128),
-        ("bfloat16", "bfloat16", 4, 128, 16): (64, 128),
-        ("bfloat16", "bfloat16", 8, 128, 16): (64, 128),
-        ("bfloat16", "bfloat16", 16, 128, 16): (64, 128),
-        ("bfloat16", "bfloat16", 32, 128, 16): (64, 128),
-        ("bfloat16", "bfloat16", 2, 128, 32): (64, 128),
-        ("bfloat16", "bfloat16", 4, 128, 32): (64, 128),
-        ("bfloat16", "bfloat16", 8, 128, 32): (32, 64),
-        ("bfloat16", "bfloat16", 16, 128, 32): (32, 64),
-        ("bfloat16", "bfloat16", 32, 128, 32): (32, 64),
-        ("bfloat16", "bfloat16", 2, 128, 64): (32, 64),
-        ("bfloat16", "bfloat16", 4, 128, 64): (32, 64),
-        ("bfloat16", "bfloat16", 8, 128, 64): (32, 64),
+        ("bfloat16", "bfloat16", 2, 128, 1): (128, 512),
+        ("bfloat16", "bfloat16", 4, 128, 1): (128, 512),
+        ("bfloat16", "bfloat16", 8, 128, 1): (128, 512),
+        ("bfloat16", "bfloat16", 16, 128, 1): (128, 512),
+        ("bfloat16", "bfloat16", 32, 128, 1): (128, 512),
+        ("bfloat16", "bfloat16", 2, 128, 2): (128, 512),
+        ("bfloat16", "bfloat16", 4, 128, 2): (128, 512),
+        ("bfloat16", "bfloat16", 8, 128, 2): (128, 512),
+        ("bfloat16", "bfloat16", 16, 128, 2): (128, 512),
+        ("bfloat16", "bfloat16", 32, 128, 2): (128, 512),
+        ("bfloat16", "bfloat16", 2, 128, 4): (128, 512),
+        ("bfloat16", "bfloat16", 4, 128, 4): (128, 512),
+        ("bfloat16", "bfloat16", 8, 128, 4): (128, 512),
+        ("bfloat16", "bfloat16", 16, 128, 4): (128, 512),
+        ("bfloat16", "bfloat16", 32, 128, 4): (128, 512),
+        ("bfloat16", "bfloat16", 2, 128, 8): (128, 512),
+        ("bfloat16", "bfloat16", 4, 128, 8): (128, 512),
+        ("bfloat16", "bfloat16", 8, 128, 8): (128, 512),
+        ("bfloat16", "bfloat16", 16, 128, 8): (128, 512),
+        ("bfloat16", "bfloat16", 32, 128, 8): (128, 512),
+        ("bfloat16", "bfloat16", 2, 128, 16): (128, 256),
+        ("bfloat16", "bfloat16", 4, 128, 16): (128, 256),
+        ("bfloat16", "bfloat16", 8, 128, 16): (128, 256),
+        ("bfloat16", "bfloat16", 16, 128, 16): (128, 256),
+        ("bfloat16", "bfloat16", 32, 128, 16): (128, 256),
+        ("bfloat16", "bfloat16", 2, 128, 32): (128, 256),
+        ("bfloat16", "bfloat16", 4, 128, 32): (128, 256),
+        ("bfloat16", "bfloat16", 8, 128, 32): (128, 256),
+        ("bfloat16", "bfloat16", 16, 128, 32): (64, 128),
+        ("bfloat16", "bfloat16", 32, 128, 32): (64, 128),
+        ("bfloat16", "bfloat16", 2, 128, 64): (64, 128),
+        ("bfloat16", "bfloat16", 4, 128, 64): (64, 128),
+        ("bfloat16", "bfloat16", 8, 128, 64): (64, 128),
         ("bfloat16", "bfloat16", 16, 128, 64): (24, 48),
         ("bfloat16", "bfloat16", 32, 128, 64): (24, 48),
         ("bfloat16", "bfloat16", 2, 128, 128): (16, 48),
@@ -77,11 +77,11 @@ TUNED_BLOCK_SIZES = {
         ("bfloat16", "bfloat16", 8, 128, 128): (16, 48),
         ("bfloat16", "bfloat16", 16, 128, 128): (16, 48),
         ("bfloat16", "bfloat16", 32, 128, 128): (16, 48),
-        ("bfloat16", "bfloat16", 2, 128, 256): (16, 32),
-        ("bfloat16", "bfloat16", 4, 128, 256): (8, 32),
-        ("bfloat16", "bfloat16", 8, 128, 256): (16, 32),
-        ("bfloat16", "bfloat16", 16, 128, 256): (8, 32),
-        ("bfloat16", "bfloat16", 32, 128, 256): (8, 32),
+        ("bfloat16", "bfloat16", 2, 128, 256): (32, 64),
+        ("bfloat16", "bfloat16", 4, 128, 256): (16, 64),
+        ("bfloat16", "bfloat16", 8, 128, 256): (32, 64),
+        ("bfloat16", "bfloat16", 16, 128, 256): (16, 3642),
+        ("bfloat16", "bfloat16", 32, 128, 256): (16, 64),
         # go/keep-sorted end
     },
 }
@@ -691,56 +691,84 @@ def ragged_paged_attention_kernel(
                 )
             )
 
+            # === STAGE 1: DMA (异步数据传输) ===
             @pl.when(next_heads_blk_idx < num_heads_blks)
-            def prefetch_next_kv_blk():
-                # DMA to fixed size buffer!
+            def stage1_async_dma():
+                # 启动下一轮DMA，与当前计算并行
                 next_async_copy_k, next_async_copy_v = create_kv_async_copy_descriptors(
                     next_heads_blk_idx, next_seq_idx, next_kv_blk_idx, next_buf_idx
                 )
                 next_async_copy_k.start()
                 next_async_copy_v.start()
 
+            # 等待当前DMA完成
             cur_async_copy_k, cur_async_copy_v = create_kv_async_copy_descriptors(
                 heads_blk_idx, cur_seq_idx, kv_blk_idx, cur_buf_idx
             )
-            k_ref = cur_async_copy_k.wait().reshape(
-                num_kv_pages_per_blk * page_size * num_kv_heads_per_blk,
-                head_dim,
-            )
-            v_ref = cur_async_copy_v.wait().reshape(
-                num_kv_pages_per_blk * page_size * num_kv_heads_per_blk,
-                head_dim,
-            )
 
-            q_batch = batch_prepare_queries(
-                q_ref, num_kv_heads_per_blk, num_q_heads_per_kv_head
-            )
+            # === STAGE 2: PREPROCESS (数据预处理) ===
+            def stage2_preprocess():
+                # Step 2a: 等待DMA完成并reshape
+                k_raw = cur_async_copy_k.wait()
+                v_raw = cur_async_copy_v.wait()
 
-            k_batch, v_batch = batch_load_all_heads_kv(
-                k_ref, v_ref, num_kv_heads_per_blk
-            )
+                k_ref = k_raw.reshape(
+                    num_kv_pages_per_blk * page_size * num_kv_heads_per_blk,
+                    head_dim,
+                )
+                v_ref = v_raw.reshape(
+                    num_kv_pages_per_blk * page_size * num_kv_heads_per_blk,
+                    head_dim,
+                )
 
-            flash_attention(
-                q_batch,
-                k_batch,
-                v_batch,
-                l_ref,  # [num_kv_heads_per_blk, num_q_per_blk * num_q_heads_per_kv_head, 128]
-                m_ref,  # [num_kv_heads_per_blk, num_q_per_blk * num_q_heads_per_kv_head, 128]
-                acc_ref,  # [num_q_per_blk, num_q_heads_per_blk, head_dim]
-                kv_blk_idx=kv_blk_idx,
-                actual_kv_len=actual_kv_len,
-                sm_scale=sm_scale,
-                mask_value=mask_value,
-                q_start=q_start,
-                q_end=q_end,
-                q_len=q_len,
-                q_len_start=q_len_start,
-                kv_len_start=kv_blk_idx * num_kv_per_blk,
-                sliding_window=sliding_window,
-                soft_cap=soft_cap,
-                k_scale=k_scale,
-                v_scale=v_scale,
-            )
+                # Step 2b: 数据格式转换和scaling (在这里完成，不在计算阶段)
+                if k_scale is not None:
+                    k_ref = k_ref.astype(jnp.float32) * k_scale
+                    k_ref = k_ref.astype(q_ref.dtype)
+                if v_scale is not None:
+                    v_ref = v_ref.astype(jnp.float32) * v_scale
+                    v_ref = v_ref.astype(q_ref.dtype)
+
+                # Step 2c: 准备批量数据结构
+                q_batch = batch_prepare_queries(
+                    q_ref, num_kv_heads_per_blk, num_q_heads_per_kv_head
+                )
+                k_batch, v_batch = batch_load_all_heads_kv(
+                    k_ref, v_ref, num_kv_heads_per_blk
+                )
+
+                return q_batch, k_batch, v_batch
+
+            # 执行预处理阶段
+            q_batch, k_batch, v_batch = stage2_preprocess()
+
+            # === STAGE 3: COMPUTE (纯计算，无数据IO) ===
+            def stage3_pure_compute():
+                flash_attention(
+                    q_batch,
+                    k_batch,
+                    v_batch,
+                    l_ref,
+                    m_ref,
+                    acc_ref,
+                    kv_blk_idx=kv_blk_idx,
+                    actual_kv_len=actual_kv_len,
+                    sm_scale=sm_scale,
+                    mask_value=mask_value,
+                    q_start=q_start,
+                    q_end=q_end,
+                    q_len=q_len,
+                    q_len_start=q_len_start,
+                    kv_len_start=kv_blk_idx * num_kv_per_blk,
+                    sliding_window=sliding_window,
+                    soft_cap=soft_cap,
+                    k_scale=None,  # 已在预处理阶段完成
+                    v_scale=None,  # 已在预处理阶段完成
+                )
+
+            # 执行纯计算阶段
+            stage3_pure_compute()
+
             return kv_blk_idx + 1, next_buf_idx
 
         _, next_buf_idx = lax.while_loop(
@@ -936,10 +964,6 @@ def ragged_paged_attention(
             single_buffer_size * 4
         )  # 保守估计，留25%给其他用途
         buffer_depth = min(max(2, max_buffers), 4)  # 限制在2-4之间
-
-    print(
-        f"🔄 Dynamic buffering: using {buffer_depth} buffers (VMEM: {vmem_limit_bytes//1024//1024 if vmem_limit_bytes else 'default'}MB)"
-    )
 
     dynamic_kv_buf_scratch = pltpu.VMEM(
         (
