@@ -179,6 +179,7 @@ class WeightLoader:
         self._print_tpu_info()
 
     def _print_tpu_info(self):
+        import re
         import subprocess
 
         try:
@@ -186,28 +187,35 @@ class WeightLoader:
                 ["tpu-info"], capture_output=True, text=True, timeout=10
             )
             if result.returncode == 0:
-                # Extract only the memory usage table
+                # Extract only memory usage numbers
                 lines = result.stdout.split("\n")
-                memory_section = False
-                memory_lines = []
+                memory_usage = []
 
                 for line in lines:
-                    if "TPU Runtime Utilization" in line or "HBM Usage" in line:
-                        memory_section = True
-                    elif memory_section and line.strip() == "":
-                        break
-                    elif memory_section:
-                        memory_lines.append(line)
+                    # Look for lines with memory usage pattern like "│ 0      │ 1.35 GiB / 31.25 GiB │"
+                    if re.search(r"│\s*\d+\s*│.*GiB.*/", line):
+                        # Extract device ID and memory usage
+                        match = re.search(
+                            r"│\s*(\d+)\s*│\s*([0-9.]+)\s*GiB\s*/\s*([0-9.]+)\s*GiB",
+                            line,
+                        )
+                        if match:
+                            device_id = match.group(1)
+                            used = float(match.group(2))
+                            total = float(match.group(3))
+                            percentage = (used / total) * 100
+                            memory_usage.append(
+                                f"TPU{device_id}: {used:.2f}GiB/{total:.2f}GiB ({percentage:.1f}%)"
+                            )
 
-                if memory_lines:
-                    logger.info("TPU Memory Usage:")
-                    for line in memory_lines[
-                        :10
-                    ]:  # Show first 10 lines of memory section
-                        logger.info(f"  {line}")
+                if memory_usage:
+                    logger.info("TPU Memory: " + " | ".join(memory_usage))
                 else:
-                    # Fallback to full output if parsing fails
-                    logger.info(f"TPU Info Output:\n{result.stdout}")
+                    # Fallback: just show a simple summary
+                    logger.info("TPU memory info parsing failed, showing raw output")
+                    for line in lines:
+                        if "GiB" in line and "│" in line:
+                            logger.info(f"  {line.strip()}")
             else:
                 logger.info(
                     f"tpu-info failed with return code {result.returncode}: {result.stderr}"
