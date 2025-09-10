@@ -110,12 +110,10 @@ class SamplingMetadata:
                 np.array([0.0] * pad_size, dtype=batch.sampling_info.min_ps.dtype),
             ]
         )
-
-        (temperatures_device, top_ps_device, top_ks_device, min_ps_device) = (
-            device_array(
-                mesh, (padded_temperatures, padded_top_ps, padded_top_ks, padded_min_ps)
-            )
-        )
+        temperatures_device = device_array(mesh, padded_temperatures)
+        top_ps_device = device_array(mesh, padded_top_ps)
+        top_ks_device = device_array(mesh, padded_top_ks)
+        min_ps_device = device_array(mesh, padded_min_ps)
 
         return cls(
             return_logprob=batch.return_logprob,
