@@ -214,11 +214,12 @@ class FlashAttention(AttentionBackend):
             q, kv_buffer = args[:2]
             other_args = args[2:]
 
-            # Since we now use pre-padded kv heads, ensure they are always even
-            # KV buffer has shape [..., num_kv_heads * 2, head_dim] where first half is K, second half is V
-            assert kv_buffer.shape[-2] % 4 == 0, (
-                f"kv_buffer fused_heads={kv_buffer.shape[-2]} should be divisible by 4 after pre-padding. "
-                "This indicates a configuration issue with kv heads padding for fused KV cache."
+            # Page_size dimension fusion: KV buffer has shape [num_pages, page_size * 2, num_heads, head_dim]
+            # First page_size slots are K pages, second page_size slots are V pages
+            # num_heads (shape[-2]) should be even after pre-padding
+            assert kv_buffer.shape[-2] % 2 == 0, (
+                f"kv_buffer num_heads={kv_buffer.shape[-2]} should be even after pre-padding. "
+                "This indicates a configuration issue with kv heads padding."
             )
 
             return ragged_paged_attention(
