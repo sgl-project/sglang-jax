@@ -390,15 +390,6 @@ class MHATokenToKVPool(KVCache):
         # The buffer layout is fixed at creation time with self.page_size
         # Changing page_size for decode mode breaks indexing!
 
-        # Debug fusion process
-        jax.debug.print(
-            "DEBUG page_size fusion: k.shape={k_shape}, v.shape={v_shape}, is_decode={is_decode}, buffer_page_size={buffer_ps}",
-            k_shape=k.shape,
-            v_shape=v.shape,
-            is_decode=is_decode,
-            buffer_ps=self.page_size,
-        )
-
         # Use the page_size dimension fused KV update implementation
         # ALWAYS use self.page_size for consistent indexing with buffer layout
         self.kv_buffer[layer_idx] = _set_page_fused_kv_buffer(
@@ -665,36 +656,6 @@ def update_page_fused_kv_cache_vectorized(
         page_size,
         page_indices * page_size * 2 + page_size + within_page_offsets,
     ).astype(jnp.int32)
-
-    # Debug: print location array info
-    valid_mask = loc >= 0
-    num_valid = jnp.sum(valid_mask)
-    jax.debug.print(
-        "DEBUG loc analysis: shape={shape}, num_valid={valid}, first_valid_10={first_valid}, padding_ratio={pad_ratio:.2f}",
-        shape=loc.shape,
-        valid=num_valid,
-        first_valid=loc[jnp.where(valid_mask, size=10)[0]],
-        pad_ratio=(loc.shape[0] - num_valid) / loc.shape[0],
-    )
-
-    # Quick sanity check - if most tokens are padding, that's the problem!
-    jax.debug.print(
-        "DEBUG sanity check: input_tokens={input}, cache_positions={cache}, padding_tokens={pad}",
-        input=k.shape[0],
-        cache=num_valid,
-        pad=loc.shape[0] - num_valid,
-    )
-
-    # Debug: print some example mappings
-    jax.debug.print(
-        "DEBUG index mapping: loc[0]={loc0}, page_idx={page_idx}, within_offset={within_offset}, k_loc={k_loc}, v_loc={v_loc}, page_size={ps}",
-        loc0=loc[0],
-        page_idx=page_indices[0],
-        within_offset=within_page_offsets[0],
-        k_loc=k_cache_locs[0],
-        v_loc=v_cache_locs[0],
-        ps=page_size,
-    )
 
     # Combine K and V locations
     combined_cache_locs = jnp.concatenate([k_cache_locs, v_cache_locs])
