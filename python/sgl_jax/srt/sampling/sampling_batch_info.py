@@ -110,6 +110,19 @@ class SamplingMetadata:
                 np.array([0.0] * pad_size, dtype=batch.sampling_info.min_ps.dtype),
             ]
         )
+        logger.info(
+            f"----------------1 {padded_temperatures} {padded_temperatures.shape} {np.sum(padded_temperatures)}"
+        )
+        logger.info(
+            f"----------------2 {padded_top_ps} {padded_top_ps.shape} {np.sum(padded_top_ps)}"
+        )
+        logger.info(
+            f"----------------3 {padded_top_ks} {padded_top_ks.shape} {np.sum(padded_top_ks)}"
+        )
+        logger.info(
+            f"----------------4 {padded_min_ps} {padded_min_ps.shape} {np.sum(padded_min_ps)}"
+        )
+
         temperatures_device = device_array(mesh, padded_temperatures)
         top_ps_device = device_array(mesh, padded_top_ps)
         top_ks_device = device_array(mesh, padded_top_ks)
