@@ -234,9 +234,6 @@ class ForwardBatch:
         batch: ModelWorkerBatch,
         model_runner: ModelRunner,
     ):
-        logger.info(
-            f"[DEBUG] device_array input_ids: shape={batch.input_ids.shape}, last_5={batch.input_ids[-5:] if len(batch.input_ids) > 0 else 'empty'}"
-        )
         (
             input_ids,
             seq_lens,
