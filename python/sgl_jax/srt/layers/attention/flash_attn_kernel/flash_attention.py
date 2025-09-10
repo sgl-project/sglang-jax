@@ -395,7 +395,7 @@ def ragged_paged_attention_kernel(
         b_start = start // packing
         b_offset = start % packing
         b_step = step // packing
-        b_ref = ref.bitcast(jnp.int32)
+        b_ref = pltpu.bitcast(ref, jnp.int32)
         b = b_ref[b_start::b_step, :]
         bw = 32 // packing
         b = jnp.right_shift(b, bw * b_offset)
