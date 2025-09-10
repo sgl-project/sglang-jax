@@ -661,17 +661,30 @@ def update_page_fused_kv_cache_vectorized(
     ).astype(jnp.int32)
 
     # V locations: second page_size slots of each page
+    # IMPORTANT: padding V tokens should go to page_size (page 0's V section), not 0
     v_cache_locs = jnp.where(
-        loc == -1, 0, page_indices * page_size * 2 + page_size + within_page_offsets
+        loc == -1,
+        page_size,
+        page_indices * page_size * 2 + page_size + within_page_offsets,
     ).astype(jnp.int32)
 
     # Debug: print location array info
+    valid_mask = loc >= 0
+    num_valid = jnp.sum(valid_mask)
     jax.debug.print(
-        "DEBUG loc array: shape={shape}, first_5={first5}, last_5={last5}, unique_count_approx={unique}",
+        "DEBUG loc analysis: shape={shape}, num_valid={valid}, first_valid_10={first_valid}, padding_ratio={pad_ratio:.2f}",
         shape=loc.shape,
-        first5=loc[:5],
-        last5=loc[-5:],
-        unique=jnp.sum(loc >= 0),  # Count of non-padding tokens
+        valid=num_valid,
+        first_valid=loc[jnp.where(valid_mask, size=10)[0]],
+        pad_ratio=(loc.shape[0] - num_valid) / loc.shape[0],
+    )
+
+    # Quick sanity check - if most tokens are padding, that's the problem!
+    jax.debug.print(
+        "DEBUG sanity check: input_tokens={input}, cache_positions={cache}, padding_tokens={pad}",
+        input=k.shape[0],
+        cache=num_valid,
+        pad=loc.shape[0] - num_valid,
     )
 
     # Debug: print some example mappings
