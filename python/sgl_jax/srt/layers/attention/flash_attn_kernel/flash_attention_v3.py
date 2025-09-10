@@ -222,6 +222,7 @@ def _ragged_paged_attention_kernel(
     kv_lens_ref,  # [max_num_seqs]
     page_indices_ref,  # [max_num_seqs * pages_per_seq]
     cu_q_lens_ref,  # [max_num_seqs + 1]
+    cu_kv_lens_ref,  # [max_num_seqs + 1]
     # TODO(jevinjiang): merge these into one so we can save SMEM.
     distribution_ref,  # [3] (decode_end, prefill_end, mixed_end)
     sem_ids_ref,  # [3] (bq_sem_idx, bkv_sem_idx, bo_sem_idx)
@@ -279,13 +280,7 @@ def _ragged_paged_attention_kernel(
         kv_packing,
         _,
     ) = k_cache_hbm_ref.shape
-    max_num_seqs = kv_lens_ref.shape[0]
-    num_page_indices = page_indices_ref.shape[0]
-    assert (
-        num_page_indices % max_num_seqs == 0
-    ), f"num_page_indices % max_num_seqs must equal to 0"
-    pages_per_seq = num_page_indices // max_num_seqs
-    num_kv_heads_x2 = actual_num_kv_heads * kv_packing
+
     num_q_heads_per_kv_head = num_q_heads_per_kv_head_per_packing * q_packing
     q_dtype = q_hbm_ref.dtype
     kv_dtype = k_cache_hbm_ref.dtype
@@ -320,7 +315,6 @@ def _ragged_paged_attention_kernel(
     debug_print("[RPA debug] mixed_end={}", mixed_end)
     debug_print("[RPA debug] bkv_p={}", bkv_p)
     debug_print("[RPA debug] page_size={}", page_size)
-    debug_print("[RPA debug] pages_per_seq={}", pages_per_seq)
     debug_print("[RPA debug] bkv_sz={}", bkv_sz)
     debug_print("[RPA debug] bq_sz={}", bq_sz)
     debug_print("[RPA debug] q_start={}", q_start)
@@ -432,7 +426,8 @@ def _ragged_paged_attention_kernel(
         bkv_sz_frm_new = jnp.minimum(
             jnp.maximum(bkv_sz - kv_left_frm_cache, 0), kv_left_frm_new
         )
-        page_indices_offset = seq_idx * pages_per_seq + kv_p_start
+        page_indices_offset = cdiv(cu_kv_lens_ref[seq_idx], page_size) + kv_p_start
+        # page_indices_offset = seq_idx * pages_per_seq + kv_p_start
 
         # Make sure the current bkv buffer is safe to overwrite.
         wait_update_kv_cache(bkv_sem_idx)
@@ -513,7 +508,8 @@ def _ragged_paged_attention_kernel(
         kv_p_end = cdiv(offset + update_sz, page_size)
         ignore = offset % page_size
         p_ignore = kv_p_start - bkv_id * bkv_p
-        page_indices_offset = seq_idx * pages_per_seq + kv_p_start
+        page_indices_offset = cdiv(cu_kv_lens_ref[seq_idx], page_size) + kv_p_start
+        # page_indices_offset = seq_idx * pages_per_seq + kv_p_start
 
         k_cache_hbm_shape = updated_k_cache_hbm_ref.shape
         k_cache_hbm_ref = updated_k_cache_hbm_ref.reshape(
@@ -1022,9 +1018,6 @@ def dynamic_validate_inputs(
     total_num_pages = kv_cache.shape[0]
     page_size = kv_cache.shape[1]
     max_num_seqs = kv_lens.shape[0]
-    num_page_indices = page_indices.shape[0]
-    assert num_page_indices % max_num_seqs == 0, f"num_page_indices % max_num_seqs == 0"
-    pages_per_seq = num_page_indices // max_num_seqs
 
     i, j, k = distribution
     if not (i <= j <= k):
@@ -1205,6 +1198,7 @@ def ragged_paged_attention(
     kv_lens: jax.Array,  # i32[max_num_seqs]
     page_indices: jax.Array,  # i32[max_num_seqs * pages_per_seq]
     cu_q_lens: jax.Array,  # i32[max_num_seqs + 1]
+    cu_kv_lens: jax.Array,  # i32[max_num_seqs + 1]
     distribution: jax.Array,  # i32[3]
     *,
     sm_scale: float = 1.0,
@@ -1235,6 +1229,8 @@ def ragged_paged_attention(
       page_indices: flattened page indices look-up table by (seq_id, page_id).
       cu_q_lens: the cumulative sum of the effective query lengths. Similar to
         kv_lens, only the first num_seqs+1 values are valid.
+      cu_kv_lens_ref: the cumulative sum of the effective kv lengths in kv_cache.
+        Only the first num_seqs+1 values are valid.
       distribution: (i, j, k) represents that sequences[0:i] are decode-only,
         sequences[i:j] are chunked-prefill-only, and sequences[j:k] are mixed. The
         k is also the total number of sequences.
@@ -1295,11 +1291,6 @@ def ragged_paged_attention(
     ) = q.shape
     page_size = k_cache.shape[1]
     max_num_seqs = kv_lens.shape[0]
-    num_page_indices = page_indices.shape[0]
-    assert (
-        num_page_indices % max_num_seqs == 0
-    ), f"num_page_indices % max_num_seqs must equal to 0"
-    pages_per_seq = num_page_indices // max_num_seqs
     num_q_heads_per_kv_head = num_q_heads_per_kv_head_per_q_packing * q_packing
 
     bkv_p = num_kv_pages_per_block
@@ -1313,7 +1304,7 @@ def ragged_paged_attention(
             head_dim,
             page_size,
             max_num_tokens,
-            pages_per_seq,
+            8,
         )
     bkv_sz = bkv_p * page_size
     if vmem_limit_bytes is None:
@@ -1396,6 +1387,7 @@ def ragged_paged_attention(
         # TODO(jevinjiang): can we use ragged page_indices to save some smem?
         page_indices,
         cu_q_lens,
+        cu_kv_lens,
         distribution,
         # (bq_sem_idx, bkv_sem_idx, bo_sem_idx)
         jnp.zeros((3,), jnp.int32),

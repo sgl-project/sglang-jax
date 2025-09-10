@@ -200,6 +200,7 @@ class FlashAttention(AttentionBackend):
             P(),  # seq_lens
             P(),  # page_indices
             P(),  # cu_q_lens
+            P(),  # cu_kv_lens
             P(),  # distribution
         )
         out_specs = (
@@ -274,13 +275,14 @@ class FlashAttention(AttentionBackend):
             self.forward_metadata.seq_lens,
             self.forward_metadata.page_indices,
             self.forward_metadata.cu_q_lens,
+            self.forward_metadata.cu_kv_lens,
             self.forward_metadata.distribution,
         )
 
         return (
             attn_output.reshape(q.shape[0], -1),
-            k_cache,
-            v_cache,
+            k_cache.reshape(-1, self.num_kv_heads, self.head_dim),
+            v_cache.reshape(-1, self.num_kv_heads, self.head_dim),
         )
 
     def _get_and_set_kv_cache(
