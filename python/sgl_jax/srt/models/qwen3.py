@@ -255,7 +255,7 @@ class QWen3DecoderLayer(nnx.Module):
         )
         layer_callback_flag.append(layer_norm_callback_flag)
 
-        hidden_states, k, v = self.self_attn(
+        hidden_states, kv = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
             forward_batch=forward_batch,
@@ -275,7 +275,7 @@ class QWen3DecoderLayer(nnx.Module):
         )
         layer_callback_flag.append(mlp_callback_flag)
 
-        return hidden_states, residual, k, v, layer_callback_flag
+        return hidden_states, residual, kv, layer_callback_flag
 
 
 class QWen3Model(nnx.Module):
