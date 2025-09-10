@@ -232,7 +232,7 @@ class FlashAttention(AttentionBackend):
             out_specs=out_specs,
             check_vma=False,
         )(
-            q,  # Keep original shape: [total_tokens, num_heads, head_dim] - no reshape needed
+            q.reshape(q.shape[0], -1, self.head_dim),
             kv_buffer,  # Already in correct format: [num_pages, page_size * 2, num_kv_heads, head_dim]
             self.forward_metadata.page_indices,
             self.forward_metadata.cu_q_lens,
