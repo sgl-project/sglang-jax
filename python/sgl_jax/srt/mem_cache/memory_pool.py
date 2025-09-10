@@ -665,6 +665,17 @@ def update_page_fused_kv_cache_vectorized(
         loc == -1, 0, page_indices * page_size * 2 + page_size + within_page_offsets
     ).astype(jnp.int32)
 
+    # Debug: print some example mappings
+    jax.debug.print(
+        "DEBUG index mapping: loc[0]={loc0}, page_idx={page_idx}, within_offset={within_offset}, k_loc={k_loc}, v_loc={v_loc}, page_size={ps}",
+        loc0=loc[0],
+        page_idx=page_indices[0],
+        within_offset=within_page_offsets[0],
+        k_loc=k_cache_locs[0],
+        v_loc=v_cache_locs[0],
+        ps=page_size,
+    )
+
     # Combine K and V locations
     combined_cache_locs = jnp.concatenate([k_cache_locs, v_cache_locs])
     combined_new_locs = jnp.arange(total_tokens * 2, dtype=jnp.int32)
