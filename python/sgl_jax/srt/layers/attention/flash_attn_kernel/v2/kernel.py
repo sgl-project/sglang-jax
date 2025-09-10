@@ -274,7 +274,7 @@ def _ragged_paged_attention_kernel(
         if debug_mode:
             pl.debug_print(msg, *args)
 
-    debug_mode = True
+    # debug_mode = True
 
     # debug_print()
     assert q_hbm_ref.shape == o_hbm_ref.shape
@@ -832,10 +832,10 @@ def _ragged_paged_attention_kernel(
         bitwidth = 32 // kv_packing
         repack_ty = jnp.dtype(f"uint{bitwidth}")
         lst = []
-        for i in range(0, kv_packing, 2):
-            k = (k >> (i * bitwidth)).astype(repack_ty)
-            v = (v >> (i * bitwidth)).astype(repack_ty)
-            lst.append(_mask_kv(k, v))
+        for i in range(kv_packing):
+            k_shifted = (k >> (i * bitwidth)).astype(repack_ty)
+            v_shifted = (v >> (i * bitwidth)).astype(repack_ty)
+            lst.append(_mask_kv(k_shifted, v_shifted))
         return lst
 
     def broadcast_minor(src, shape):
@@ -939,8 +939,7 @@ def _ragged_paged_attention_kernel(
                     return
 
                 # Flash attention with cur bkv and bq
-                # NOTE: kv_packing is divided by 2 because k and v are packed together.
-                heads_per_load = max(1, kv_packing // 2)
+                heads_per_load = max(1, kv_packing)
                 for kv_head_start in range(0, actual_num_kv_heads):
                     bkv_lst = strided_load_bkv(
                         bkv_sem_idx,
