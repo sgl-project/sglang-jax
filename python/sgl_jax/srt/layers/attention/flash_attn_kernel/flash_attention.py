@@ -416,14 +416,18 @@ def ragged_paged_attention_kernel(
         # ref shape: [pages, seq, fused_heads, head_dim] where fused_heads = num_kv_heads_per_blk * 2
         # offset: 0 for K heads, 1 for V heads
 
-        pages, seq_len, fused_heads, head_dim = ref.shape
+        # Use a simpler approach with explicit loops to avoid complex indexing
+        # that TPU doesn't support
+        results = []
+        for head_idx in range(num_kv_heads_per_blk):
+            # Calculate the actual head index in the fused array
+            actual_head_idx = head_idx * 2 + offset
+            # Extract this head: [pages, seq, head_dim]
+            head_data = ref[:, :, actual_head_idx, :]
+            results.append(head_data)
 
-        # Simple approach: reshape to separate K and V pairs, then extract
-        # [pages, seq, fused_heads, head_dim] -> [pages, seq, num_kv_heads_per_blk, 2, head_dim]
-        kv_pairs = ref.reshape(pages, seq_len, num_kv_heads_per_blk, 2, head_dim)
-
-        # Extract K (offset=0) or V (offset=1)
-        return kv_pairs[:, :, :, offset, :]
+        # Stack along the head dimension: [pages, seq, num_kv_heads_per_blk, head_dim]
+        return jnp.stack(results, axis=2)
 
     def fold_on_2nd_minor(vec):
         assert vec.dtype == jnp.bfloat16 or vec.dtype == jnp.float32
