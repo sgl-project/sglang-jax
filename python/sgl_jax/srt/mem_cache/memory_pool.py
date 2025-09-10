@@ -631,81 +631,82 @@ def update_page_fused_kv_cache_vectorized(
     kv_partition_axis: str = "tensor",
 ):
     """
-    Vectorized page-fused KV cache update where K and V are stacked in page_size dimension.
-    K occupies slots [0:page_size], V occupies slots [page_size:2*page_size]
+    Native page-fused KV cache update using Pallas kernel directly.
+    The key insight: reshape 4D cache to 3D and use clever indexing.
     """
     total_tokens = loc.shape[0]
     loc = loc.astype(jnp.int32)
 
-    # For page_size fusion, we need to update K and V portions separately
-    # but they share the same cache locations and slot mapping
+    # Step 1: Stack K and V data for batch processing
+    # Shape: [total_tokens * 2, num_heads, head_dim] where first half is K, second half is V
+    stacked_kv = jnp.concatenate(
+        [k, v], axis=0
+    )  # [total_tokens * 2, num_heads, head_dim]
 
-    kv_cache_locs = jnp.where(loc == -1, 0, loc).astype(jnp.int32)
-    new_kv_locs = jnp.arange(total_tokens, dtype=jnp.int32)
-    slice_lens = jnp.where(loc == -1, 0, 1).astype(jnp.int32)
-    num_slices = total_tokens
+    # Step 2: Reshape 4D cache to 3D for kernel
+    # [num_pages, page_size * 2, num_heads, head_dim] -> [num_pages * page_size * 2, num_heads, head_dim]
+    flattened_cache = kv_cache.reshape(-1, kv_cache.shape[2], kv_cache.shape[3])
+
+    # Step 3: Create location mappings for both K and V
+    # For each token at location `loc[i]`, we need:
+    # - K goes to: page_idx * page_size * 2 + within_page_offset
+    # - V goes to: page_idx * page_size * 2 + page_size + within_page_offset
+
+    page_indices = loc // page_size  # Which page
+    within_page_offsets = loc % page_size  # Offset within page
+
+    # K locations: first page_size slots of each page
+    k_cache_locs = jnp.where(
+        loc == -1, 0, page_indices * page_size * 2 + within_page_offsets
+    ).astype(jnp.int32)
+
+    # V locations: second page_size slots of each page
+    v_cache_locs = jnp.where(
+        loc == -1, 0, page_indices * page_size * 2 + page_size + within_page_offsets
+    ).astype(jnp.int32)
+
+    # Combine K and V locations
+    combined_cache_locs = jnp.concatenate([k_cache_locs, v_cache_locs])
+    combined_new_locs = jnp.arange(total_tokens * 2, dtype=jnp.int32)
+
+    # Slice lengths: 0 for padding tokens, 1 for valid tokens
+    k_slice_lens = jnp.where(loc == -1, 0, 1).astype(jnp.int32)
+    v_slice_lens = jnp.where(loc == -1, 0, 1).astype(jnp.int32)
+    combined_slice_lens = jnp.concatenate([k_slice_lens, v_slice_lens])
+
+    num_slices = total_tokens * 2
 
     # Get optimal parameters
     num_slices_per_block = get_best_num_slices_per_block(
-        k.shape[1],  # num_heads
-        kv_cache.shape[0]
-        * kv_cache.shape[1]
-        // 2,  # effective cache_len (only count K or V portion)
-        k.shape[0],  # new_kv_len
-        k.shape[2],  # head_dim
+        stacked_kv.shape[1],  # num_heads
+        flattened_cache.shape[0],  # total cache length
+        stacked_kv.shape[0],  # new_kv_len (K + V)
+        stacked_kv.shape[2],  # head_dim
         page_size,
     )
 
     slot_mapping = get_slot_mapping(
         num_slices_per_block=num_slices_per_block,
-        kv_cache_start_loc=kv_cache_locs,
-        new_kv_start_loc=new_kv_locs,
-        slice_lens=slice_lens,
+        kv_cache_start_loc=combined_cache_locs,
+        new_kv_start_loc=combined_new_locs,
+        slice_lens=combined_slice_lens,
     )
 
     num_kv_update_slices = jnp.array([num_slices], dtype=jnp.int32)
 
-    # Extract K and V portions of the cache
-    k_cache = kv_cache[:, :page_size, :, :].reshape(
-        -1, kv_cache.shape[2], kv_cache.shape[3]
-    )
-    v_cache = kv_cache[:, page_size:, :, :].reshape(
-        -1, kv_cache.shape[2], kv_cache.shape[3]
-    )
-
-    # Update K and V caches separately
-    updated_k_cache = kv_cache_update(
-        new_kv=k,
+    # Single kernel call to update both K and V
+    updated_flattened_cache = kv_cache_update(
+        new_kv=stacked_kv,
         slices=slot_mapping,
-        kv_cache=k_cache,
+        kv_cache=flattened_cache,
         num_kv_update_slices=num_kv_update_slices,
         page_size=page_size,
         num_slices_per_block=num_slices_per_block,
         kv_partition_axis=kv_partition_axis,
     )
 
-    updated_v_cache = kv_cache_update(
-        new_kv=v,
-        slices=slot_mapping,
-        kv_cache=v_cache,
-        num_kv_update_slices=num_kv_update_slices,
-        page_size=page_size,
-        num_slices_per_block=num_slices_per_block,
-        kv_partition_axis=kv_partition_axis,
-    )
-
-    # Reconstruct the page-fused cache
-    updated_k_cache_reshaped = updated_k_cache.reshape(
-        kv_cache.shape[0], page_size, kv_cache.shape[2], kv_cache.shape[3]
-    )
-    updated_v_cache_reshaped = updated_v_cache.reshape(
-        kv_cache.shape[0], page_size, kv_cache.shape[2], kv_cache.shape[3]
-    )
-
-    # Stack K and V in the page_size dimension
-    updated_kv_cache = jnp.concatenate(
-        [updated_k_cache_reshaped, updated_v_cache_reshaped], axis=1
-    )
+    # Reshape back to 4D format
+    updated_kv_cache = updated_flattened_cache.reshape(kv_cache.shape)
 
     return updated_kv_cache
 
