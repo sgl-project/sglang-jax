@@ -55,7 +55,7 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
     def merge_and_sort_free(self):
         if len(self.release_pages) > 0:
             combined = np.concatenate((self.free_pages, self.release_pages))
-            self.free_pages = np.sort(np.unique(combined))
+            self.free_pages = np.sort(combined)  # No duplicates, just sort
             self.release_pages = np.empty((0,), dtype=np.int32)
 
     def get_cpu_copy(self, *args, **kwargs):
@@ -322,8 +322,11 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if self.is_not_in_free_group:
             # Convert to numpy for internal operations
             free_index_np = np.array(free_index)
-            free_page_indices = np.unique(free_index_np // self.page_size)
-            self.release_pages = np.concatenate([free_page_indices, self.release_pages])
+            free_pages = np.unique(free_index_np // self.page_size)
+            free_pages = np.setdiff1d(free_pages, self.release_pages)
+            free_pages = np.setdiff1d(free_pages, self.free_pages)
+            if len(free_pages) > 0:
+                self.release_pages = np.concatenate([free_pages, self.release_pages])
         else:
             self.free_group.append(np.array(free_index))
 

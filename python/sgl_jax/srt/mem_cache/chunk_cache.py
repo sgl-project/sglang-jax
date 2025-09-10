@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any, Optional
 
+import jax
 import numpy as np
 from jax import numpy as jnp
 
@@ -42,12 +43,9 @@ class ChunkCache(BasePrefixCache):
         self.token_to_kv_pool_allocator.free(kv_indices)
 
     def cache_unfinished_req(self, req: Req):
-        kv_indices = self.req_to_token_pool.req_to_token[
+        req.prefix_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, : len(req.fill_ids)
         ]
-
-        # `req.prefix_indices` will be used in `PrefillAdder::add_chunked_req` later
-        req.prefix_indices = kv_indices
 
     def evict(self, num_tokens: int):
         pass

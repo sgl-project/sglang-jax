@@ -61,26 +61,11 @@ class QWenMLP(nnx.Module):
         self.act_func = jax.nn.silu
 
     def __call__(self, hidden_states: jnp.ndarray):
-        return _mlp_forward(
-            hidden_states,
-            self.w1.weight.value,
-            self.w2.weight.value,
-            self.c_proj.weight.value,
-        )
-
-
-# @jax.jit
-def _mlp_forward(
-    hidden_states: jax.Array, w1: jax.Array, w2: jax.Array, c_proj: jax.Array
-):
-    a1 = jnp.dot(hidden_states, w1)
-    a2 = jnp.dot(hidden_states, w2)
-    intermediate_parallel = a1 * jax.nn.silu(a2)
-    intermediate_parallel = jax.lax.with_sharding_constraint(
-        intermediate_parallel, PartitionSpec(None, "tensor")
-    )
-    output = jnp.dot(intermediate_parallel, c_proj)
-    return output
+        a1, _ = self.w1(hidden_states)
+        a2, _ = self.w2(hidden_states)
+        intermediate_parallel = a1 * jax.nn.silu(a2)
+        output, _ = self.c_proj(intermediate_parallel)
+        return output
 
 
 class QWenAttention(nnx.Module):
@@ -229,20 +214,15 @@ class QWenBlock(nnx.Module):
         residual = hidden_states
 
         hidden_states = self.ln_1(hidden_states)
-
         attn_output, k, v = self.attn(
             positions=positions,
             hidden_states=hidden_states,
             forward_batch=forward_batch,
             layer_id=self.layer_id,
         )
-
         hidden_states = residual + attn_output
-
         residual = hidden_states
-
         hidden_states = self.ln_2(hidden_states)
-
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
         return hidden_states, k, v

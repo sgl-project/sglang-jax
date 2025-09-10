@@ -21,7 +21,6 @@ setattr(threading, "_register_atexit", lambda *args, **kwargs: None)
 
 from contextlib import asynccontextmanager
 
-import numpy as np
 import orjson
 import requests
 import uvicorn
@@ -72,7 +71,6 @@ from sgl_jax.srt.reasoning_parser import ReasoningParser
 from sgl_jax.srt.server_args import ServerArgs
 from sgl_jax.srt.utils import (
     add_api_key_middleware,
-    delete_directory,
     get_bool_env_var,
     kill_process_tree,
     set_uvicorn_logging_configs,

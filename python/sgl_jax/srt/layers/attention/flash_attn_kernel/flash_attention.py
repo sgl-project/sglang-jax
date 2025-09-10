@@ -25,6 +25,7 @@ import jax.experimental.pallas.ops.tpu.ragged_paged_attention.tuned_block_sizes 
 import jax.numpy as jnp
 from jax import lax
 from jax._src import dtypes
+from jax._src.lax.lax import Precision
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 from jax.sharding import PartitionSpec as P

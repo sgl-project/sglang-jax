@@ -258,6 +258,9 @@ class Scheduler(
         if self.chunked_prefill_size <= 0:  # -1 means disable
             self.chunked_prefill_size = None
         self.chunked_req = None
+        self.is_mixed_chunk = (
+            self.chunked_prefill_size is not None and server_args.enable_mixed_chunk
+        )
 
         # Init schedule policy and new token estimation
         self.policy = SchedulePolicy(
@@ -767,6 +770,7 @@ class Scheduler(
             self.new_token_ratio,
             self.max_prefill_tokens,
             self.chunked_prefill_size,
+            running_bs if self.is_mixed_chunk else 0,
         )
 
         if self.chunked_req is not None:
@@ -824,7 +828,23 @@ class Scheduler(
 
         new_batch.prepare_for_extend()
 
-        new_batch.decoding_reqs = None
+        # Mixed-style chunked prefill
+        if (
+            self.is_mixed_chunk
+            and not self.running_batch.is_empty()
+            and not (new_batch.return_logprob or self.running_batch.return_logprob)
+        ):
+            self.running_batch.filter_batch()
+            if not self.running_batch.is_empty():
+                self.running_batch.prepare_for_decode()
+                new_batch.mix_with_running(self.running_batch)
+                new_batch.decoding_reqs = self.running_batch.reqs
+
+            self.running_batch = ScheduleBatch(
+                reqs=[], batch_is_full=self.running_batch.batch_is_full, mesh=self.mesh
+            )
+        else:
+            new_batch.decoding_reqs = None
 
         return new_batch
 

@@ -23,6 +23,7 @@ from http import HTTPStatus
 from typing import Any, List, Optional, Set, Tuple, Union
 
 import numpy as np
+from jax import numpy as jnp
 from jax._src import mesh as mesh_lib
 
 from sgl_jax.global_config import global_config
@@ -620,6 +621,36 @@ class ScheduleBatch:
         else:
             return out_cache_loc
 
+    def mix_with_running(self, running_batch: "ScheduleBatch"):
+        # Use EXTEND instead of MIXED for precompile cache hit
+        self.forward_mode = ForwardMode.EXTEND
+        running_bs = running_batch.batch_size()
+
+        for i, req in enumerate(running_batch.reqs):
+            req.fill_ids = req.origin_input_ids + req.output_ids
+            req.extend_input_len = 1
+
+        input_ids = jnp.concatenate([self.input_ids, running_batch.input_ids])
+        out_cache_loc = jnp.concatenate(
+            [self.out_cache_loc, running_batch.out_cache_loc]
+        )
+
+        self.merge_batch(running_batch)
+        self.input_ids = input_ids
+        self.out_cache_loc = out_cache_loc
+
+        delta = 0 if self.enable_overlap else -1
+        # NOTE: prefix_indices is what has been cached, but we don't cache each decode step
+        self.prefix_lens.extend(
+            [
+                len(r.origin_input_ids) + len(r.output_ids) + delta
+                for r in running_batch.reqs
+            ]
+        )
+        self.extend_lens.extend([1] * running_bs)
+        self.extend_num_tokens += running_bs
+        self.extend_logprob_start_lens.extend([0] * running_bs)
+
     def prepare_for_extend(self):
         self.forward_mode = ForwardMode.EXTEND
 
@@ -1009,9 +1040,6 @@ class ScheduleBatch:
         bid += 1
 
         if self.input_ids is None:
-            print(
-                f"input_ids is None forward_mode: {self.forward_mode=}, enable_overlap: {self.enable_overlap}, reqs: {self.reqs=}"
-            )
             input_ids_cpu = np.empty(0, dtype=np.int32)
         else:
             input_ids_cpu = self.input_ids.flatten()
@@ -1096,7 +1124,6 @@ class ScheduleBatch:
             # For decode, extend_start_loc is typically not used but we'll set it anyway
             extend_start_loc = np.arange(len(seq_lens_cpu), dtype=seq_lens_cpu.dtype)
 
-        # padding bs: req_pool_indices, seq_lens, extend_start_loc, extend_prefix_lens, extend_seq_lens
         bs_padding_size = 0
         bs_paddings.sort()
         select_bs_index = -1
@@ -1140,7 +1167,6 @@ class ScheduleBatch:
         total_cache_loc_size = cache_loc_paddings[select_bs_index]
         assert total_cache_loc_size >= len(cache_loc_flat)
 
-        # Use np.empty for performance, then initialize padding area explicitly
         cache_loc_cpu = np.empty(total_cache_loc_size, dtype=np.int32)
         if len(cache_loc_flat) > 0:
             cache_loc_cpu[: len(cache_loc_flat)] = cache_loc_flat
