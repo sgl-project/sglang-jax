@@ -420,23 +420,28 @@ def ragged_paged_attention_kernel(
             # For float32, we can use direct strided access
             return ref[:, :, offset::2, :]
 
-        # For bfloat16, use bitcast approach similar to strided_load_kv
-        packing = get_dtype_packing(ref.dtype)
-        assert ref.dtype == jnp.bfloat16
-        assert 2 % packing == 0  # step = 2 for interleaved access
+        # For bfloat16, we need to be more careful about the reshape
+        # The issue is that strided_load_kv works on the first dimension, but we need
+        # to work on the head dimension (third dimension)
 
         pages, seq_len, fused_heads, head_dim = ref.shape
 
-        # Reshape to work on the head dimension
-        # [pages, seq, fused_heads, head_dim] -> [pages * seq * head_dim, fused_heads]
-        ref_reshaped = ref.reshape(-1, fused_heads)
+        # Transpose to put head dimension first: [fused_heads, pages, seq, head_dim]
+        ref_transposed = jnp.transpose(ref, (2, 0, 1, 3))
 
-        # Use strided_load_kv on the reshaped tensor
+        # Reshape to make head dimension the first: [fused_heads, pages * seq * head_dim]
+        ref_reshaped = ref_transposed.reshape(fused_heads, -1)
+
+        # Use strided_load_kv to extract every 2nd head starting from offset
         extracted = strided_load_kv(ref_reshaped, offset, 2)  # step=2 for interleaved
 
-        # Reshape back to original structure but with half the heads
-        # [pages * seq * head_dim, num_kv_heads_per_blk] -> [pages, seq, num_kv_heads_per_blk, head_dim]
-        return extracted.reshape(pages, seq_len, num_kv_heads_per_blk, head_dim)
+        # Reshape back: [num_kv_heads_per_blk, pages * seq * head_dim] -> [num_kv_heads_per_blk, pages, seq, head_dim]
+        extracted_reshaped = extracted.reshape(
+            num_kv_heads_per_blk, pages, seq_len, head_dim
+        )
+
+        # Transpose back to original order: [pages, seq, num_kv_heads_per_blk, head_dim]
+        return jnp.transpose(extracted_reshaped, (1, 2, 0, 3))
 
     def fold_on_2nd_minor(vec):
         assert vec.dtype == jnp.bfloat16 or vec.dtype == jnp.float32
