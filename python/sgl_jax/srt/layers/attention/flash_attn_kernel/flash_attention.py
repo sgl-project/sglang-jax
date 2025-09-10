@@ -289,14 +289,17 @@ def ref_ragged_paged_attention(
             :kv_len
         ]
         # Extract from interleaved layout: k1,v1,k2,v2,k3,v3 -> separate K and V
-        k = fused_kv[:, ::2, :]  # K heads: every 2nd starting from 0
-        v = fused_kv[:, 1::2, :]  # V heads: every 2nd starting from 1
+        # Convert to float32 to enable strided access on TPU
+        fused_kv_f32 = fused_kv.astype(jnp.float32)
+        k = fused_kv_f32[:, ::2, :]  # K heads: every 2nd starting from 0
+        v = fused_kv_f32[:, 1::2, :]  # V heads: every 2nd starting from 1
         if k_scale is not None:
-            k = k.astype(jnp.float32) * k_scale
-            k = k.astype(q.dtype)
+            k = k * k_scale  # Already in float32
         if v_scale is not None:
-            v = v.astype(jnp.float32) * v_scale
-            v = v.astype(q.dtype)
+            v = v * v_scale  # Already in float32
+        # Convert back to original dtype for consistency
+        k = k.astype(q.dtype)
+        v = v.astype(q.dtype)
         k = jnp.repeat(k, num_query_per_kv, axis=1)
         v = jnp.repeat(v, num_query_per_kv, axis=1)
         attn = jnp.einsum("qhd,khd->hqk", q, k, preferred_element_type=jnp.float32)
@@ -534,8 +537,9 @@ def ragged_paged_attention_kernel(
             kv_len_start = kv_blk_idx * num_kv_per_blk_batch
 
             q_batch_f32 = q_batch.astype(jnp.float32)
-            k_batch_f32 = k_batch.astype(jnp.float32)
-            v_batch_f32 = v_batch.astype(jnp.float32)
+            # k_batch and v_batch are already float32 from the strided access conversion
+            k_batch_f32 = k_batch
+            v_batch_f32 = v_batch
 
             if k_scale is not None:
                 k_batch_f32 = k_batch_f32 * k_scale
@@ -707,8 +711,10 @@ def ragged_paged_attention_kernel(
             )  # [num_kv_pages_per_blk, page_size, num_kv_heads_per_blk * 2, head_dim]
 
             # Split interleaved KV data: k1,v1,k2,v2,k3,v3 -> separate K and V
-            k_data = fused_kv_data[:, :, ::2, :]  # K heads: every 2nd starting from 0
-            v_data = fused_kv_data[:, :, 1::2, :]  # V heads: every 2nd starting from 1
+            # Convert to float32 to enable strided access on TPU
+            fused_kv_f32 = fused_kv_data.astype(jnp.float32)
+            k_data = fused_kv_f32[:, :, ::2, :]  # K heads: every 2nd starting from 0
+            v_data = fused_kv_f32[:, :, 1::2, :]  # V heads: every 2nd starting from 1
 
             k_ref = k_data.reshape(
                 num_kv_pages_per_blk * page_size * num_kv_heads_per_blk,
