@@ -386,29 +386,27 @@ class MHATokenToKVPool(KVCache):
         """
         layer_idx = layer_id - self.start_layer
 
-        page_size = 1 if is_decode else self.page_size
-
-        # Fuse K and V tensors in page_size dimension: [total_tokens, num_heads, head_dim] -> [total_tokens, num_heads, head_dim]
-        # We'll stack K and V in the page dimension during the cache update process
-        # K goes to slots [0:page_size], V goes to slots [page_size:2*page_size]
-
-        # For page_size dimension fusion, we don't pre-concatenate K and V
-        # Instead, we handle the fusion in the update function
+        # CRITICAL: Always use self.page_size for index calculation consistency
+        # The buffer layout is fixed at creation time with self.page_size
+        # Changing page_size for decode mode breaks indexing!
 
         # Debug fusion process
         jax.debug.print(
-            "DEBUG page_size fusion: k.shape={k_shape}, v.shape={v_shape}",
+            "DEBUG page_size fusion: k.shape={k_shape}, v.shape={v_shape}, is_decode={is_decode}, buffer_page_size={buffer_ps}",
             k_shape=k.shape,
             v_shape=v.shape,
+            is_decode=is_decode,
+            buffer_ps=self.page_size,
         )
 
         # Use the page_size dimension fused KV update implementation
+        # ALWAYS use self.page_size for consistent indexing with buffer layout
         self.kv_buffer[layer_idx] = _set_page_fused_kv_buffer(
             k=k,
             v=v,
             loc=loc,
             kv_cache=self.kv_buffer[layer_idx],
-            page_size=page_size,
+            page_size=self.page_size,  # FIXED: use consistent page_size
             kv_partition_axis=self.kv_partition_axis,
         )
 
