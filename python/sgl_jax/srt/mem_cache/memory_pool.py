@@ -665,6 +665,15 @@ def update_page_fused_kv_cache_vectorized(
         loc == -1, 0, page_indices * page_size * 2 + page_size + within_page_offsets
     ).astype(jnp.int32)
 
+    # Debug: print location array info
+    jax.debug.print(
+        "DEBUG loc array: shape={shape}, first_5={first5}, last_5={last5}, unique_count_approx={unique}",
+        shape=loc.shape,
+        first5=loc[:5],
+        last5=loc[-5:],
+        unique=jnp.sum(loc >= 0),  # Count of non-padding tokens
+    )
+
     # Debug: print some example mappings
     jax.debug.print(
         "DEBUG index mapping: loc[0]={loc0}, page_idx={page_idx}, within_offset={within_offset}, k_loc={k_loc}, v_loc={v_loc}, page_size={ps}",
