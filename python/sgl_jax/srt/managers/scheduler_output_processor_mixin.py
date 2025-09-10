@@ -2,11 +2,9 @@ from __future__ import annotations
 
 import logging
 import threading
-import time
 from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 
 import jax
-import numpy as np
 
 from sgl_jax.srt.layers.logits_processor import LogitsProcessorOutput
 from sgl_jax.srt.managers.io_struct import BatchTokenIDOut
@@ -68,12 +66,16 @@ class SchedulerOutputProcessorMixin:
                     logits_output.input_token_logprobs = tuple(
                         jax.device_get(logits_output.input_token_logprobs).astype(float)
                     )
-        # batch.output_ids = np.array(next_token_ids, dtype=np.int32)
 
         # Check finish conditions
         logprob_pt = 0
         for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
             if req.is_retracted:
+                continue
+
+            if self.is_mixed_chunk and self.enable_overlap and req.finished():
+                j = len(batch.out_cache_loc) - len(batch.reqs) + i
+                self.token_to_kv_pool_allocator.free(batch.out_cache_loc[j : j + 1])
                 continue
 
             if req.is_chunked <= 0:
@@ -140,12 +142,6 @@ class SchedulerOutputProcessorMixin:
                         logprob_pt += num_input_logprobs
 
         batch.cache_miss_count = cache_miss_count
-
-        if cache_miss_count > 0:
-            logger.info(
-                f"Prefill batch. #bid: {result.bid}, #cache_miss: {cache_miss_count}"
-            )
-
         self.stream_output(
             batch.reqs, batch.return_logprob, skip_stream_req, cache_miss_count
         )

@@ -41,8 +41,6 @@ class TestEvalAccuracyLarge(CustomTestCase):
                 "4",
                 "--random-seed",
                 "3",
-                "--node-rank",
-                "0",
                 "--mem-fraction-static",
                 "0.4",
                 "--max-prefill-tokens",

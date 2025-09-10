@@ -4,18 +4,18 @@ from types import SimpleNamespace
 from sgl_jax.srt.utils import kill_process_tree
 from sgl_jax.test.run_eval import run_eval
 from sgl_jax.test.test_utils import (
+    DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
-    QWEN3_MOE_30B,
     CustomTestCase,
     popen_launch_server,
 )
 
 
-class TestQwenModel(CustomTestCase):
+class TestChunkedPrefillSize(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model = QWEN3_MOE_30B
+        cls.model = DEFAULT_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
             cls.model,
@@ -27,26 +27,18 @@ class TestQwenModel(CustomTestCase):
                 "--skip-server-warmup",
                 "--random-seed",
                 "3",
-                "--max-prefill-tokens",
-                "16384",
+                "--mem-fraction-static",
+                "0.8",
                 "--download-dir",
-                "/dev/shm/",
+                "/tmp/",
                 "--dtype",
                 "bfloat16",
-                "--precompile-bs-paddings",
-                "16",
-                "--precompile-token-paddings",
-                "16384",
-                "--tp-size",
-                "4",
-                "--nnodes",
-                "1",
-                "--dist-init-addr",
-                "0.0.0.0:10011",
                 "--max-running-requests",
-                "16",
-                "--page-size",
-                "64",
+                "256",
+                "--chunked-prefill-size",
+                "512",
+                "--disable-radix-cache",
+                "--enable-mixed-chunk",
             ],
             env={
                 "JAX_COMPILATION_CACHE_DIR": "/tmp/jax_compilation_cache",
@@ -62,8 +54,8 @@ class TestQwenModel(CustomTestCase):
             base_url=self.base_url,
             model=self.model,
             eval_name="mmlu",
-            num_examples=64,
-            num_threads=16,
+            num_examples=512,
+            num_threads=64,
             max_tokens=1024,
         )
 

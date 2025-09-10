@@ -249,16 +249,10 @@ class GenerateReqInput:
 
     def _validate_inputs(self):
         """Validate that the input configuration is valid."""
-        if (
-            self.text is None and self.input_ids is None and self.input_embeds is None
-        ) or (
-            self.text is not None
-            and self.input_ids is not None
-            and self.input_embeds is not None
+        if (self.text is None and self.input_ids is None) or (
+            self.text is not None and self.input_ids is not None
         ):
-            raise ValueError(
-                "Either text, input_ids or input_embeds should be provided."
-            )
+            raise ValueError("Either text or input_ids should be provided.")
 
     def _normalize_sampling_params(self, num):
         """Normalize sampling parameters for batch processing."""

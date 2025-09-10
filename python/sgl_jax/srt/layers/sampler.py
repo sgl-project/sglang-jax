@@ -1,5 +1,5 @@
 from functools import partial
-from typing import List
+from typing import List, Optional
 
 import jax
 import numpy as np
@@ -93,6 +93,7 @@ class Sampler(nnx.Module):
                 compute output logprobs It is used for speculative decoding which
                 performs sampling in draft workers.
         """
+
         logits = jnp.reshape(
             logits_output.next_token_logits,
             (-1, logits_output.next_token_logits.shape[-1]),

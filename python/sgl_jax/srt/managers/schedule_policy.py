@@ -262,17 +262,20 @@ class PrefillAdder:
         new_token_ratio: float,
         rem_input_tokens: int,
         rem_chunk_tokens: Optional[int],
+        mixed_with_decode_tokens: int = 0,
     ):
         self.page_size = page_size
         self.tree_cache = tree_cache
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
         self.running_batch = running_batch
         self.new_token_ratio = new_token_ratio
-        self.rem_input_tokens = rem_input_tokens
+        self.rem_input_tokens = rem_input_tokens - mixed_with_decode_tokens
         self.rem_chunk_tokens = rem_chunk_tokens
+        if self.rem_chunk_tokens is not None:
+            self.rem_chunk_tokens -= mixed_with_decode_tokens
 
-        self.rem_total_token_offset = 0
-        self.cur_rem_token_offset = 0
+        self.rem_total_token_offset = mixed_with_decode_tokens
+        self.cur_rem_token_offset = mixed_with_decode_tokens
 
         self.req_states = None
         self.can_run_list = []
@@ -325,8 +328,9 @@ class PrefillAdder:
         return AddReqResult.CONTINUE
 
     def add_chunked_req(self, req: Req):
-        truncated = req.extend_input_len > self.rem_chunk_tokens
-        req.extend_input_len = min(req.extend_input_len, self.rem_chunk_tokens)
+        _rem_tokens = min(self.rem_chunk_tokens, int(self.rem_total_tokens))
+        truncated = req.extend_input_len > _rem_tokens
+        req.extend_input_len = min(req.extend_input_len, _rem_tokens)
         req.fill_ids = req.fill_ids[: len(req.prefix_indices) + req.extend_input_len]
         self.can_run_list.append(req)
         self._update_prefill_budget(
@@ -403,7 +407,9 @@ class PrefillAdder:
         else:
             add_req_state(req, insert_sort=True)
 
-        cur_rem_tokens = self.cur_rem_tokens - len(req.origin_input_ids)
+        cur_rem_tokens = self.cur_rem_tokens - self.ceil_paged_tokens(
+            req.extend_input_len
+        )
         tokens_freed = 0
         for i, (tokens_left, tokens_occupied) in enumerate(self.req_states):
             # tokens_left gives a reservative calculation as the last token is not stored
@@ -426,7 +432,7 @@ class PrefillAdder:
                 min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS_ESTIMATION),
             )
         else:
-            if self.rem_chunk_tokens == 0:
+            if self.rem_chunk_tokens <= 0:
                 return AddReqResult.OTHER
 
             # Chunked prefill
@@ -483,7 +489,7 @@ class PrefillAdder:
                 )
             else:
                 # Make sure at least one page is available
-                trunc_len = self.rem_chunk_tokens - self.page_size + 1
+                trunc_len = self.rem_chunk_tokens // self.page_size * self.page_size
                 if trunc_len <= 0:
                     return AddReqResult.OTHER
 
