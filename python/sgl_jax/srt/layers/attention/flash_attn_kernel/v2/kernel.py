@@ -248,7 +248,9 @@ def _ragged_paged_attention_kernel(
     updated_k_cache_hbm_ref,  # [total_num_pages, page_size, actual_num_kv_heads, head_dim] - separate updated K cache
     updated_v_cache_hbm_ref,  # [total_num_pages, page_size, actual_num_kv_heads, head_dim] - separate updated V cache
     # Scratch
-    bkv_x2_ref,  # [2, bkv_sz, actual_num_kv_heads, head_dim] - now for separate K/V processing
+    # bkv_x2_ref,  # [2, bkv_sz, actual_num_kv_heads, head_dim] - now for separate K/V processing
+    bk_x2_ref,  # [2, bkv_sz, actual_num_kv_heads, head_dim] - now for separate K/V processing
+    bv_x2_ref,  # [2, bkv_sz, actual_num_kv_heads, head_dim] - now for separate K/V processing
     bq_x2_ref,  # [2, actual_num_kv_heads, bq_sz, num_q_heads_per_kv_head // q_packing, q_packing, head_dim]
     bo_x2_ref,  # [2, actual_num_kv_heads, bq_sz, num_q_heads_per_kv_head // q_packing, q_packing, head_dim]
     sems,  # [4, 2]
@@ -268,6 +270,13 @@ def _ragged_paged_attention_kernel(
     bq_sz,
     debug_mode: bool = False,
 ):
+    def debug_print(msg, *args):
+        if debug_mode:
+            pl.debug_print(msg, *args)
+
+    debug_mode = True
+
+    # debug_print()
     assert q_hbm_ref.shape == o_hbm_ref.shape
     assert q_hbm_ref.shape[-1] == k_cache_hbm_ref.shape[-1] == v_cache_hbm_ref.shape[-1]
     assert k_cache_hbm_ref.shape == v_cache_hbm_ref.shape
@@ -308,7 +317,7 @@ def _ragged_paged_attention_kernel(
 
     # Define packing variables
     kv_packing = get_dtype_packing(kv_dtype)
-    num_kv_heads_x2 = align_to(actual_num_kv_heads * 2, kv_packing)
+    num_kv_heads = align_to(actual_num_kv_heads, kv_packing)
 
     assert head_dim % 128 == 0
     bkv_sz = bkv_p * page_size
@@ -322,10 +331,6 @@ def _ragged_paged_attention_kernel(
     q_end = cu_q_lens_ref[seq_idx + 1]
     q_len = q_end - q_start
     kv_len = kv_lens_ref[seq_idx]
-
-    def debug_print(msg, *args):
-        if debug_mode:
-            pl.debug_print(msg, *args)
 
     debug_print("[RPA debug] ======= In loop seq_idx={}", seq_idx)
     debug_print("[RPA debug] num_seqs={}", num_seqs)
@@ -417,7 +422,7 @@ def _ragged_paged_attention_kernel(
 
     def _fetch_bk(seq_idx, bkv_idx, bkv_sem_idx, *, wait=False):
         sem = sems.at[0, bkv_sem_idx]
-        vmem_ref = bkv_x2_ref.at[bkv_sem_idx]  # This will hold K data
+        vmem_ref = bk_x2_ref.at[bkv_sem_idx]  # This will hold K data
 
         kv_len = kv_lens_ref[seq_idx]
         kv_len_start = bkv_idx * bkv_sz
@@ -493,7 +498,7 @@ def _ragged_paged_attention_kernel(
 
     def _fetch_bv(seq_idx, bkv_idx, bkv_sem_idx, *, wait=False):
         sem = sems.at[0, bkv_sem_idx]
-        vmem_ref = bkv_x2_ref.at[
+        vmem_ref = bv_x2_ref.at[
             bkv_sem_idx + 1
         ]  # This will hold V data (use next buffer)
 
@@ -572,7 +577,7 @@ def _ragged_paged_attention_kernel(
 
     def _update_k_cache(seq_idx, bkv_sem_idx, offset, update_sz, *, wait=False):
         sem = sems.at[3, bkv_sem_idx]
-        vmem_ref = bkv_x2_ref.at[bkv_sem_idx]  # K data buffer
+        vmem_ref = bk_x2_ref.at[bkv_sem_idx]  # K data buffer
         bkv_id = offset // bkv_sz
         kv_p_start = offset // page_size
         kv_p_end = cdiv(offset + update_sz, page_size)
@@ -621,7 +626,7 @@ def _ragged_paged_attention_kernel(
 
     def _update_v_cache(seq_idx, bkv_sem_idx, offset, update_sz, *, wait=False):
         sem = sems.at[3, bkv_sem_idx]
-        vmem_ref = bkv_x2_ref.at[bkv_sem_idx + 1]  # V data buffer (use next buffer)
+        vmem_ref = bv_x2_ref.at[bkv_sem_idx + 1]  # V data buffer (use next buffer)
         bkv_id = offset // bkv_sz
         kv_p_start = offset // page_size
         kv_p_end = cdiv(offset + update_sz, page_size)
@@ -794,8 +799,14 @@ def _ragged_paged_attention_kernel(
         assert step % kv_packing == 0
         start //= kv_packing
         step //= kv_packing
-        kv_ref = (
-            bkv_x2_ref.bitcast(jnp.uint32)
+        k_ref = (
+            bk_x2_ref.bitcast(jnp.uint32)
+            .at[bkv_sem_idx]
+            .reshape(bkv_sz * step, head_dim)
+        )
+
+        v_ref = (
+            bv_x2_ref.bitcast(jnp.uint32)
             .at[bkv_sem_idx]
             .reshape(bkv_sz * step, head_dim)
         )
@@ -810,17 +821,20 @@ def _ragged_paged_attention_kernel(
             return (k, v)
 
         if kv_packing == 1:
-            k = strided_load(kv_ref, start, step, dtype=kv_dtype)
-            v = strided_load(kv_ref, start + 1, step, dtype=kv_dtype)
+            k = strided_load(k_ref, start, step, dtype=kv_dtype)
+            v = strided_load(v_ref, start, step, dtype=kv_dtype)
+            # k2 = strided_load(k_ref, start + 1, step, dtype=kv_dtype)
             return [_mask_kv(k, v)]
 
-        kv = strided_load(kv_ref, start, step)
+        # kv = strided_load(kv_ref, start, step)
+        k = strided_load(k_ref, start, step)
+        v = strided_load(v_ref, start, step)
         bitwidth = 32 // kv_packing
         repack_ty = jnp.dtype(f"uint{bitwidth}")
         lst = []
         for i in range(0, kv_packing, 2):
-            k = (kv >> (i * bitwidth)).astype(repack_ty)
-            v = (kv >> ((i + 1) * bitwidth)).astype(repack_ty)
+            k = (k >> (i * bitwidth)).astype(repack_ty)
+            v = (v >> (i * bitwidth)).astype(repack_ty)
             lst.append(_mask_kv(k, v))
         return lst
 
@@ -927,11 +941,11 @@ def _ragged_paged_attention_kernel(
                 # Flash attention with cur bkv and bq
                 # NOTE: kv_packing is divided by 2 because k and v are packed together.
                 heads_per_load = max(1, kv_packing // 2)
-                for kv_head_start in range(0, actual_num_kv_heads, heads_per_load):
+                for kv_head_start in range(0, actual_num_kv_heads):
                     bkv_lst = strided_load_bkv(
                         bkv_sem_idx,
-                        kv_head_start * 2,
-                        num_kv_heads_x2,
+                        kv_head_start,
+                        num_kv_heads,
                         bkv_bitmask=bkv_bitmask,
                     )
                     assert len(bkv_lst) == heads_per_load
@@ -1516,9 +1530,14 @@ def ragged_paged_attention(
         pl.BlockSpec(memory_space=pltpu.HBM),  # updated v_cache
     ]
 
-    bkv_double_buf = pltpu.VMEM(
+    bk_double_buf = pltpu.VMEM(
         (2, bkv_sz, *k_cache.shape[2:]),  # [2, bkv_sz, actual_num_kv_heads, head_dim]
         k_cache.dtype,
+    )
+
+    bv_double_buf = pltpu.VMEM(
+        (2, bkv_sz, *v_cache.shape[2:]),  # [2, bkv_sz, actual_num_kv_heads, head_dim]
+        v_cache.dtype,
     )
 
     bq_double_buf = pltpu.VMEM(
@@ -1540,7 +1559,8 @@ def ragged_paged_attention(
     )
 
     scratch_shapes = [
-        bkv_double_buf,  # Double buffering for kv block.
+        bk_double_buf,  # Double buffering for k block.
+        bv_double_buf,  # Double buffering for v block.
         bq_double_buf,  # Double buffering for q block.
         bo_double_buf,  # Double buffering for output block.
         # Semaphores for double buffering of bkv, bq, bo and bkv_update.
@@ -1602,8 +1622,9 @@ def ragged_paged_attention(
                 jax.ShapeDtypeStruct(shape=v_cache.shape, dtype=v_cache.dtype),
             ],
             input_output_aliases={
-                10: 1,
-                11: 2,
+                8: 0,
+                11: 1,
+                12: 2,
             },  # k_cache->updated_k_cache, v_cache->updated_v_cache
             name=scope_name,
         )

@@ -252,7 +252,7 @@ class FlashAttention(AttentionBackend):
                 sm_scale=scale,
                 sliding_window=None,
                 soft_cap=None,
-                mask_value=None,
+                # mask_value=None,
                 vmem_limit_bytes=self.vmem_limit_bytes,
             )
 
