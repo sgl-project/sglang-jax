@@ -701,9 +701,11 @@ def ragged_paged_attention_kernel(
                 heads_blk_idx, cur_seq_idx, kv_blk_idx, cur_buf_idx
             )
             # Wait for fused KV data and separate K and V
-            fused_kv_data = (
-                cur_async_copy_fused_kv.wait()
-            )  # [num_kv_pages_per_blk, page_size, copied_heads_count, head_dim]
+            fused_kv_buf = cur_async_copy_fused_kv.wait()
+            # Get the actual array data from the buffer reference
+            fused_kv_data = fused_kv_buf[
+                ...
+            ]  # [num_kv_pages_per_blk, page_size, copied_heads_count, head_dim]
 
             # Extract K and V heads from the copied complete fused data using dynamic_slice
             total_num_kv_heads = fused_kv_heads_per_blk // 2
