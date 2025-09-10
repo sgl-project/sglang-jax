@@ -371,15 +371,13 @@ def ragged_paged_attention_kernel(
         metadata = (start_kv_page_idx, end_kv_page_idx)
 
         # For fused KV cache: [K_heads (0:total_num_kv_heads), V_heads (total_num_kv_heads:2*total_num_kv_heads)]
-        # We copy the K heads and V heads for this block, but they're not contiguous
-        # So we copy from the start of K heads to end of V heads for this block
+        # To avoid traced values in slice indices, we always copy the entire fused KV data
+        # and use dynamic_slice to extract the needed K and V heads
         total_num_kv_heads = fused_kv_heads_per_blk // 2
-        k_heads_start = heads_blk_idx * num_kv_heads_per_blk
 
-        # The copy size is always constant: total_num_kv_heads + num_kv_heads_per_blk
-        # This covers from K_start to V_end for this block
-        fused_heads_start = k_heads_start
-        fused_heads_count = total_num_kv_heads + num_kv_heads_per_blk
+        # Copy all fused heads to avoid traced slice indices
+        fused_heads_start = 0
+        fused_heads_count = fused_kv_heads_per_blk
 
         async_copy_fused_kv = MultiPageAsyncCopyDescriptor(
             kv_cache_hbm_ref.at[:, :, pl.ds(fused_heads_start, fused_heads_count), :],
@@ -707,18 +705,24 @@ def ragged_paged_attention_kernel(
                 cur_async_copy_fused_kv.wait()
             )  # [num_kv_pages_per_blk, page_size, copied_heads_count, head_dim]
 
-            # Extract K and V heads from the copied data
-            # K heads are at the beginning of the copied range
-            k_data = fused_kv_data[:, :, :num_kv_heads_per_blk, :]  # K heads
-
-            # V heads are offset by total_num_kv_heads in the copied range
-            # (since we copy from k_heads_start, V heads start at total_num_kv_heads - k_heads_start)
+            # Extract K and V heads from the copied complete fused data using dynamic_slice
             total_num_kv_heads = fused_kv_heads_per_blk // 2
             k_heads_start = heads_blk_idx * num_kv_heads_per_blk
-            v_heads_offset = total_num_kv_heads - k_heads_start
-            v_data = fused_kv_data[
-                :, :, v_heads_offset : v_heads_offset + num_kv_heads_per_blk, :
-            ]  # V heads
+            v_heads_start = total_num_kv_heads + heads_blk_idx * num_kv_heads_per_blk
+
+            # Use dynamic_slice to extract K heads
+            k_data = lax.dynamic_slice(
+                fused_kv_data,
+                (0, 0, k_heads_start, 0),
+                (num_kv_pages_per_blk, page_size, num_kv_heads_per_blk, head_dim),
+            )
+
+            # Use dynamic_slice to extract V heads
+            v_data = lax.dynamic_slice(
+                fused_kv_data,
+                (0, 0, v_heads_start, 0),
+                (num_kv_pages_per_blk, page_size, num_kv_heads_per_blk, head_dim),
+            )
 
             k_ref = k_data.reshape(
                 num_kv_pages_per_blk * page_size * num_kv_heads_per_blk,
