@@ -1161,11 +1161,6 @@ class ScheduleBatch:
         if len(cache_loc_flat) < total_cache_loc_size:
             cache_loc_cpu[len(cache_loc_flat) :] = 0
 
-        # Debug cache_loc construction
-        logger.info(
-            f"[NODE_DEBUG] cache_loc construction: cache_loc_flat.len={len(cache_loc_flat)}, total_size={total_cache_loc_size}, cache_loc_flat.sum={np.sum(cache_loc_flat) if len(cache_loc_flat) > 0 else 0}"
-        )
-
         if bs_padding_size > 0:
             invalid_req_pool_indices = np.array(
                 [-1] * bs_padding_size, dtype=req_pool_indices_cpu.dtype
