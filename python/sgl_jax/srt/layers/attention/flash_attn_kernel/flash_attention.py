@@ -412,36 +412,18 @@ def ragged_paged_attention_kernel(
         return pltpu.bitcast(b, jnp.float32).astype(jnp.bfloat16)
 
     def extract_interleaved_kv(ref, offset, num_kv_heads_per_blk):
-        """Extract K or V from interleaved KV data using bitcast for bfloat16"""
+        """Extract K or V from interleaved KV data"""
         # ref shape: [pages, seq, fused_heads, head_dim] where fused_heads = num_kv_heads_per_blk * 2
         # offset: 0 for K heads, 1 for V heads
 
-        if ref.dtype == jnp.float32:
-            # For float32, we can use direct strided access
-            return ref[:, :, offset::2, :]
-
-        # For bfloat16, we need to be more careful about the reshape
-        # The issue is that strided_load_kv works on the first dimension, but we need
-        # to work on the head dimension (third dimension)
-
         pages, seq_len, fused_heads, head_dim = ref.shape
 
-        # Transpose to put head dimension first: [fused_heads, pages, seq, head_dim]
-        ref_transposed = jnp.transpose(ref, (2, 0, 1, 3))
+        # Simple approach: reshape to separate K and V pairs, then extract
+        # [pages, seq, fused_heads, head_dim] -> [pages, seq, num_kv_heads_per_blk, 2, head_dim]
+        kv_pairs = ref.reshape(pages, seq_len, num_kv_heads_per_blk, 2, head_dim)
 
-        # Reshape to make head dimension the first: [fused_heads, pages * seq * head_dim]
-        ref_reshaped = ref_transposed.reshape(fused_heads, -1)
-
-        # Use strided_load_kv to extract every 2nd head starting from offset
-        extracted = strided_load_kv(ref_reshaped, offset, 2)  # step=2 for interleaved
-
-        # Reshape back: [num_kv_heads_per_blk, pages * seq * head_dim] -> [num_kv_heads_per_blk, pages, seq, head_dim]
-        extracted_reshaped = extracted.reshape(
-            num_kv_heads_per_blk, pages, seq_len, head_dim
-        )
-
-        # Transpose back to original order: [pages, seq, num_kv_heads_per_blk, head_dim]
-        return jnp.transpose(extracted_reshaped, (1, 2, 0, 3))
+        # Extract K (offset=0) or V (offset=1)
+        return kv_pairs[:, :, :, offset, :]
 
     def fold_on_2nd_minor(vec):
         assert vec.dtype == jnp.bfloat16 or vec.dtype == jnp.float32
