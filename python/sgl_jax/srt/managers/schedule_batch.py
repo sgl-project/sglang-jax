@@ -1029,19 +1029,12 @@ class ScheduleBatch:
         # extend & decode: input_ids, positions, out_cache_loc, cache_loc
         padding_size = 0
         token_paddings.sort()
-        logger.info(
-            f"[DEBUG] Before padding calc: input_len={len(input_ids_cpu)}, token_paddings={token_paddings}"
-        )
         for size in token_paddings:
             if size >= len(input_ids_cpu):
                 padding_size = size - len(input_ids_cpu)
                 break
 
-        logger.info(f"[DEBUG] Padding decision: padding_size={padding_size}")
         if padding_size > 0:
-            logger.info(
-                f"[DEBUG] Padding input_ids: orig_len={len(input_ids_cpu)}, pad_size={padding_size}, dtype={input_ids_cpu.dtype}"
-            )
             input_ids_cpu = np.concat(
                 [
                     input_ids_cpu,
@@ -1049,16 +1042,10 @@ class ScheduleBatch:
                 ],
                 axis=0,
             )
-            logger.info(
-                f"[DEBUG] After padding: len={len(input_ids_cpu)}, last_5={input_ids_cpu[-5:]}"
-            )
 
         padded_input_ids_len = len(input_ids_cpu)
         out_cache_loc_num_to_padding = padded_input_ids_len - len(out_cache_loc_cpu)
         if out_cache_loc_num_to_padding > 0:
-            logger.info(
-                f"[DEBUG] Padding cache_loc: orig_len={len(out_cache_loc_cpu)}, pad_size={out_cache_loc_num_to_padding}"
-            )
             out_cache_loc_cpu = np.concatenate(
                 [
                     out_cache_loc_cpu,
@@ -1134,7 +1121,7 @@ class ScheduleBatch:
                 total_aligned_length = np.sum(aligned_lengths)
 
                 # Pre-allocate the result array
-                cache_loc_flat = np.empty(total_aligned_length, dtype=np.int32)
+                cache_loc_flat = np.zeros(total_aligned_length, dtype=np.int32)
 
                 # Fill the array efficiently
                 offset = 0
@@ -1153,10 +1140,13 @@ class ScheduleBatch:
         total_cache_loc_size = cache_loc_paddings[select_bs_index]
         assert total_cache_loc_size >= len(cache_loc_flat)
 
-        # Optimized: use np.empty since padding area won't be accessed
+        # Use np.empty for performance, then initialize padding area explicitly
         cache_loc_cpu = np.empty(total_cache_loc_size, dtype=np.int32)
         if len(cache_loc_flat) > 0:
             cache_loc_cpu[: len(cache_loc_flat)] = cache_loc_flat
+        # Initialize padding area to ensure multiprocess consistency
+        if len(cache_loc_flat) < total_cache_loc_size:
+            cache_loc_cpu[len(cache_loc_flat) :] = 0
 
         if bs_padding_size > 0:
             invalid_req_pool_indices = np.array(
