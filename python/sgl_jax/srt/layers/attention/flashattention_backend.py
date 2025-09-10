@@ -206,12 +206,12 @@ class FlashAttention(AttentionBackend):
             q, kv_buffer = args[:2]
             other_args = args[2:]
 
-            # Page_size dimension fusion: KV buffer has shape [num_pages, page_size * 2, num_heads, head_dim]
+            # Page_size dimension fusion: KV buffer has shape [num_pages, page_size * 2, num_kv_heads, head_dim]
             # First page_size slots are K pages, second page_size slots are V pages
-            # num_heads (shape[-2]) should be even after pre-padding
+            # TPU requires KV heads to be even for tiling (hardware constraint)
             assert kv_buffer.shape[-2] % 2 == 0, (
-                f"kv_buffer num_heads={kv_buffer.shape[-2]} should be even after pre-padding. "
-                "This indicates a configuration issue with kv heads padding."
+                f"kv_buffer num_kv_heads={kv_buffer.shape[-2]} should be even for TPU tiling requirement. "
+                f"Backend config: num_kv_heads={self.num_kv_heads}. Need to pad KV heads to even number."
             )
 
             return ragged_paged_attention(
@@ -232,8 +232,8 @@ class FlashAttention(AttentionBackend):
             out_specs=out_specs,
             check_vma=False,
         )(
-            q.reshape(q.shape[0], -1, self.head_dim),
-            kv_buffer,  # Already in correct format: [num_pages, page_size * 2, num_heads, head_dim]
+            q,  # Keep original shape: [total_tokens, num_heads, head_dim] - no reshape needed
+            kv_buffer,  # Already in correct format: [num_pages, page_size * 2, num_kv_heads, head_dim]
             self.forward_metadata.page_indices,
             self.forward_metadata.cu_q_lens,
             self.forward_metadata.cu_kv_lens,
@@ -242,7 +242,7 @@ class FlashAttention(AttentionBackend):
         )
 
         return (
-            attn_output.reshape(q.shape[0], -1),
+            attn_output.reshape(q.shape[0], self.num_heads * self.head_dim),
             kv_buffer,
         )
 

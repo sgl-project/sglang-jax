@@ -397,7 +397,8 @@ class Scheduler(
                 token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
                 page_size=self.page_size,
                 disable=server_args.disable_radix_cache,
-                kv_head_num=self.model_config.get_num_kv_heads(self.tp_size),
+                kv_head_num=self.model_config.num_key_value_heads
+                // self.tp_size,  # Use padded KV heads for TPU requirement
                 head_dim=self.model_config.head_dim,
                 layer_num=self.model_config.num_hidden_layers,
                 max_seq_len=server_args.max_seq_len,
