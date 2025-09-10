@@ -288,9 +288,17 @@ def ref_ragged_paged_attention(
         fused_kv = kv_pages[indices, :, :, :].reshape(-1, fused_kv_heads, head_dim)[
             :kv_len
         ]
-        # Extract from [K..., V...] format (pre-processed outside)
-        k = fused_kv[:, :num_kv_heads, :]  # First half: K heads
-        v = fused_kv[:, num_kv_heads:, :]  # Second half: V heads
+        # Extract from interleaved format: k1,v1,k2,v2,k3,v3 -> separate K and V
+        # Use reshape to avoid strided access issues
+        seq_len, fused_heads, head_dim = fused_kv.shape
+        num_kv_heads = fused_heads // 2
+
+        # Reshape to separate K and V: [seq_len, num_heads, 2, head_dim]
+        kv_reshaped = fused_kv.reshape(seq_len, num_kv_heads, 2, head_dim)
+
+        # Extract K and V data
+        k = kv_reshaped[:, :, 0, :]  # K heads
+        v = kv_reshaped[:, :, 1, :]  # V heads
         if k_scale is not None:
             k = k.astype(jnp.float32) * k_scale
             k = k.astype(q.dtype)
@@ -402,6 +410,33 @@ def ragged_paged_attention_kernel(
         b = jnp.right_shift(b, bw * b_offset)
         b = jnp.left_shift(b, bw * (packing - 1))
         return pltpu.bitcast(b, jnp.float32).astype(jnp.bfloat16)
+
+    def extract_interleaved_kv(ref, offset, num_kv_heads_per_blk):
+        """Extract K or V from interleaved KV data using bitcast for bfloat16"""
+        # ref shape: [pages, seq, fused_heads, head_dim] where fused_heads = num_kv_heads_per_blk * 2
+        # offset: 0 for K heads, 1 for V heads
+
+        if ref.dtype == jnp.float32:
+            # For float32, we can use direct strided access
+            return ref[:, :, offset::2, :]
+
+        # For bfloat16, use bitcast approach similar to strided_load_kv
+        packing = get_dtype_packing(ref.dtype)
+        assert ref.dtype == jnp.bfloat16
+        assert 2 % packing == 0  # step = 2 for interleaved access
+
+        pages, seq_len, fused_heads, head_dim = ref.shape
+
+        # Reshape to work on the head dimension
+        # [pages, seq, fused_heads, head_dim] -> [pages * seq * head_dim, fused_heads]
+        ref_reshaped = ref.reshape(-1, fused_heads)
+
+        # Use strided_load_kv on the reshaped tensor
+        extracted = strided_load_kv(ref_reshaped, offset, 2)  # step=2 for interleaved
+
+        # Reshape back to original structure but with half the heads
+        # [pages * seq * head_dim, num_kv_heads_per_blk] -> [pages, seq, num_kv_heads_per_blk, head_dim]
+        return extracted.reshape(pages, seq_len, num_kv_heads_per_blk, head_dim)
 
     def fold_on_2nd_minor(vec):
         assert vec.dtype == jnp.bfloat16 or vec.dtype == jnp.float32
@@ -706,13 +741,13 @@ def ragged_paged_attention_kernel(
                 cur_async_copy_fused_kv.wait()
             )  # [num_kv_pages_per_blk, page_size, num_kv_heads_per_blk * 2, head_dim]
 
-            # Split KV data: now in [K..., V...] format (pre-processed outside kernel)
-            k_data = fused_kv_data[
-                :, :, :num_kv_heads_per_blk, :
-            ]  # First half: K heads
-            v_data = fused_kv_data[
-                :, :, num_kv_heads_per_blk:, :
-            ]  # Second half: V heads
+            # Split interleaved KV data: k1,v1,k2,v2,k3,v3 -> separate K and V
+            k_data = extract_interleaved_kv(
+                fused_kv_data, 0, num_kv_heads_per_blk
+            )  # K heads
+            v_data = extract_interleaved_kv(
+                fused_kv_data, 1, num_kv_heads_per_blk
+            )  # V heads
 
             k_ref = k_data.reshape(
                 num_kv_pages_per_blk * page_size * num_kv_heads_per_blk,
@@ -844,8 +879,7 @@ def ragged_paged_attention(
     Args:
       q: concatenated all sequences' queries.
       kv_cache: paged KV cache with K and V interleaved on head dimension.
-                Input: [k1, v1, k2, v2, k3, v3, ...] format.
-                Pre-processed to: [k1, k2, k3, v1, v2, v3, ...] format before kernel.
+                Layout: [k1, v1, k2, v2, k3, v3, ...]. Uses bitcast for efficient extraction.
       page_indices: the first index indicates which page to use in the kv cache
       page_indices: the first index indicates which page to use in the kv cache
         for each sequence. Only the first num_seqs values are valid.
@@ -891,24 +925,6 @@ def ragged_paged_attention(
     _, page_size, fused_kv_heads, _ = kv_cache.shape
     num_kv_heads = fused_kv_heads // 2  # Split fused KV heads back to K and V
 
-    # Pre-process: Convert interleaved KV cache to separated K and V caches
-    # This avoids complex processing inside the Pallas kernel
-    total_pages, page_size, _, head_dim_kv = kv_cache.shape
-
-    # Convert to float32 for strided access, then separate K and V
-    kv_cache_f32 = kv_cache.astype(jnp.float32)
-
-    # Reshape to separate K and V: [total_pages, page_size, num_kv_heads, 2, head_dim]
-    kv_reshaped = kv_cache_f32.reshape(
-        total_pages, page_size, num_kv_heads, 2, head_dim_kv
-    )
-
-    # Extract K and V caches
-    k_cache = kv_reshaped[:, :, :, 0, :].astype(kv_cache.dtype)  # K cache
-    v_cache = kv_reshaped[:, :, :, 1, :].astype(kv_cache.dtype)  # V cache
-
-    # Concatenate K and V back for the kernel (now in [K..., V...] format)
-    kv_cache_separated = jnp.concatenate([k_cache, v_cache], axis=2)
     num_q_heads_per_blk, num_kv_heads_per_blk = get_min_heads_per_blk(
         num_q_heads, num_kv_heads, q.dtype, kv_cache.dtype
     )
@@ -1008,4 +1024,4 @@ def ragged_paged_attention(
         name="ragged_paged_attention_kernel",
     )
 
-    return kernel(*scalar_prefetches, q, kv_cache_separated)
+    return kernel(*scalar_prefetches, q, kv_cache)
