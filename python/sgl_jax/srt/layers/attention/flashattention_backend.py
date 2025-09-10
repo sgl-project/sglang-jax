@@ -199,7 +199,9 @@ class FlashAttention(AttentionBackend):
             P(
                 None, self.kv_partition_axis
             ),  # q shape: [batched_tokens, head_num, head_dim]
-            P(None, None, self.kv_partition_axis, None),  # kv_buffer (fused K&V)
+            P(
+                None, None, self.kv_partition_axis, None
+            ),  # kv_buffer: [num_pages, page_size*2, num_heads, head_dim]
             P(),  # page_indices
             P(),  # cu_q_lens
             P(),  # cu_kv_lens
@@ -238,9 +240,7 @@ class FlashAttention(AttentionBackend):
             check_vma=False,
         )(
             q.reshape(q.shape[0], -1, self.head_dim),
-            kv_buffer.reshape(
-                kv_buffer.shape[0] // self.page_size, self.page_size, -1, self.head_dim
-            ),
+            kv_buffer,  # Already in correct format: [num_pages, page_size * 2, num_heads, head_dim]
             self.forward_metadata.page_indices,
             self.forward_metadata.cu_q_lens,
             self.forward_metadata.cu_kv_lens,
