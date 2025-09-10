@@ -182,6 +182,14 @@ class FlashAttention(AttentionBackend):
         """
         kv_buffer = self._get_and_set_kv_cache(k, v, forward_batch, layer.layer_id)
 
+        # Debug: check shapes and data
+        jax.debug.print(
+            "DEBUG FlashAttn: k.shape={k_shape}, v.shape={v_shape}, kv_buffer.shape={kv_shape}",
+            k_shape=k.shape,
+            v_shape=v.shape,
+            kv_shape=kv_buffer.shape,
+        )
+
         if layer.scaling is None:
             scale = 1.0 / jnp.sqrt(layer.head_dim)
         else:

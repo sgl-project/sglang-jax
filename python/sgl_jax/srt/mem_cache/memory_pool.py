@@ -380,6 +380,14 @@ class MHATokenToKVPool(KVCache):
         # Layout: [K_heads..., V_heads...]
         fused_kv = jnp.concatenate([k, v], axis=1)  # Concatenate along head dimension
 
+        # Debug fusion process
+        jax.debug.print(
+            "DEBUG fusion: k.shape={k_shape}, v.shape={v_shape}, fused_kv.shape={fused_shape}",
+            k_shape=k.shape,
+            v_shape=v.shape,
+            fused_shape=fused_kv.shape,
+        )
+
         # Use the fused KV update implementation
         self.kv_buffer[layer_idx] = _set_fused_kv_buffer(
             fused_kv=fused_kv,
