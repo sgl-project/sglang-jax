@@ -256,7 +256,7 @@ def static_validate_inputs(
 
 def ref_ragged_paged_attention(
     queries: jax.Array,  # [max_num_batched_tokens, num_q_heads, head_dim]
-    kv_pages: jax.Array,  # [total_num_pages, page_size, num_kv_heads * 2, head_dim] - K&V fused
+    kv_pages: jax.Array,  # [total_num_pages, page_size, num_kv_heads * 2, head_dim] - K&V interleaved
     kv_lens: jax.Array,  # i32[max_num_seqs]
     page_indices: jax.Array,  # i32[max_num_seqs, pages_per_seq]
     cu_q_lens: jax.Array,  # i32[max_num_seqs + 1]
@@ -284,12 +284,13 @@ def ref_ragged_paged_attention(
         kv_len = kv_lens[i]
         indices = page_indices[i]
         q = queries[q_start:q_end]
-        # Extract fused KV data and separate into K and V
+        # Extract fused KV data and separate into K and V from interleaved format
         fused_kv = kv_pages[indices, :, :, :].reshape(-1, fused_kv_heads, head_dim)[
             :kv_len
         ]
-        k = fused_kv[:, :num_kv_heads, :]  # First half: K heads
-        v = fused_kv[:, num_kv_heads:, :]  # Second half: V heads
+        # Extract from interleaved layout: k1,v1,k2,v2,k3,v3 -> separate K and V
+        k = fused_kv[:, ::2, :]  # K heads: every 2nd starting from 0
+        v = fused_kv[:, 1::2, :]  # V heads: every 2nd starting from 1
         if k_scale is not None:
             k = k.astype(jnp.float32) * k_scale
             k = k.astype(q.dtype)
@@ -325,12 +326,12 @@ def ragged_paged_attention_kernel(
     seq_lens_ref,
     # Input
     q_ref,  # [num_q_per_blk, num_q_heads_per_blk, head_dim]
-    kv_cache_hbm_ref,  # [total_num_pages, page_size, num_kv_heads * 2, head_dim] - K&V fused
+    kv_cache_hbm_ref,  # [total_num_pages, page_size, num_kv_heads * 2, head_dim] - K&V interleaved
     # Output
     o_ref,  # [num_q_per_blk, num_q_heads_per_blk, head_dim]
     # Scratch
-    kv_bufs,  # [2, num_kv_pages_per_blk, page_size, num_kv_heads_per_blk * 2, head_dim] - Fused K&V
-    sems,  # [2, 1] - Single semaphore for fused KV operation
+    kv_bufs,  # [2, num_kv_pages_per_blk, page_size, num_kv_heads_per_blk * 2, head_dim] - Interleaved K&V
+    sems,  # [2, 1] - Single semaphore for interleaved KV operation
     l_ref,  # [num_kv_heads_per_blk, num_q_per_blk * num_q_heads_per_kv_head, 128]
     m_ref,  # [num_kv_heads_per_blk, num_q_per_blk * num_q_heads_per_kv_head, 128]
     acc_ref,  # [num_q_per_blk, num_q_heads_per_blk, head_dim]
@@ -370,12 +371,12 @@ def ragged_paged_attention_kernel(
         end_kv_page_idx = cdiv(cu_kv_lens_ref[seq_idx + 1], page_size)
         metadata = (start_kv_page_idx, end_kv_page_idx)
 
-        # For fused KV cache: copy both K and V heads together
-        # KV layout: [K_heads (0:num_kv_heads), V_heads (num_kv_heads:2*num_kv_heads)]
+        # For fused KV cache: copy both K and V heads together in interleaved format
+        # KV layout: [k1, v1, k2, v2, k3, v3, ...] interleaved K and V heads
         fused_heads_start = (
             heads_blk_idx * num_kv_heads_per_blk * 2
-        )  # *2 because K+V are fused
-        fused_heads_count = num_kv_heads_per_blk * 2  # Both K and V heads
+        )  # *2 because K+V are interleaved
+        fused_heads_count = num_kv_heads_per_blk * 2  # Both K and V heads interleaved
 
         async_copy_fused_kv = MultiPageAsyncCopyDescriptor(
             kv_cache_hbm_ref.at[:, :, pl.ds(fused_heads_start, fused_heads_count), :],
@@ -416,6 +417,8 @@ def ragged_paged_attention_kernel(
         v_heads = []
 
         for head_idx in range(num_kv_heads_per_blk):
+            # k_ref and v_ref are already separated from the interleaved data
+            # so we can use the original indexing logic
             k_head = strided_load_kv(k_ref, head_idx, num_kv_heads_per_blk)
             v_head = strided_load_kv(v_ref, head_idx, num_kv_heads_per_blk)
             k_heads.append(k_head)
@@ -703,9 +706,9 @@ def ragged_paged_attention_kernel(
                 cur_async_copy_fused_kv.wait()
             )  # [num_kv_pages_per_blk, page_size, num_kv_heads_per_blk * 2, head_dim]
 
-            # Split fused KV data: first half is K, second half is V
-            k_data = fused_kv_data[:, :, :num_kv_heads_per_blk, :]  # K heads
-            v_data = fused_kv_data[:, :, num_kv_heads_per_blk:, :]  # V heads
+            # Split interleaved KV data: k1,v1,k2,v2,k3,v3 -> separate K and V
+            k_data = fused_kv_data[:, :, ::2, :]  # K heads: every 2nd starting from 0
+            v_data = fused_kv_data[:, :, 1::2, :]  # V heads: every 2nd starting from 1
 
             k_ref = k_data.reshape(
                 num_kv_pages_per_blk * page_size * num_kv_heads_per_blk,
@@ -815,7 +818,7 @@ def get_min_heads_per_blk(num_q_heads, num_kv_heads, q_dtype, kv_dtype):
 )
 def ragged_paged_attention(
     q: jax.Array,  # [max_num_batched_tokens, num_q_heads, head_dim]
-    kv_cache: jax.Array,  # [total_num_pages, page_size, num_kv_heads * 2, head_dim] - K and V fused
+    kv_cache: jax.Array,  # [total_num_pages, page_size, num_kv_heads * 2, head_dim] - K and V interleaved
     page_indices: jax.Array,  # i32[num_pages]
     cu_q_lens: jax.Array,  # i32[max_num_seqs + 1]
     cu_kv_lens: jax.Array,  # i32[max_num_seqs + 1]
@@ -836,8 +839,8 @@ def ragged_paged_attention(
 
     Args:
       q: concatenated all sequences' queries.
-      kv_cache: paged KV cache with K and V fused on head dimension.
-                Layout: [K_heads..., V_heads...]. Normally in HBM.
+      kv_cache: paged KV cache with K and V interleaved on head dimension.
+                Layout: [k1, v1, k2, v2, k3, v3, ...]. Normally in HBM.
       page_indices: the first index indicates which page to use in the kv cache
       page_indices: the first index indicates which page to use in the kv cache
         for each sequence. Only the first num_seqs values are valid.
