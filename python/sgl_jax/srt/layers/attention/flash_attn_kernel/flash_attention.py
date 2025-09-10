@@ -370,12 +370,15 @@ def ragged_paged_attention_kernel(
         end_kv_page_idx = cdiv(cu_kv_lens_ref[seq_idx + 1], page_size)
         metadata = (start_kv_page_idx, end_kv_page_idx)
 
-        # For fused KV cache: copy both K and V heads together
-        # KV layout: [K_heads (0:num_kv_heads), V_heads (num_kv_heads:2*num_kv_heads)]
-        fused_heads_start = (
-            heads_blk_idx * num_kv_heads_per_blk * 2
-        )  # *2 because K+V are fused
-        fused_heads_count = num_kv_heads_per_blk * 2  # Both K and V heads
+        # For fused KV cache: [K_heads (0:total_num_kv_heads), V_heads (total_num_kv_heads:2*total_num_kv_heads)]
+        # We copy the K heads and V heads for this block, but they're not contiguous
+        # So we copy from the start of K heads to end of V heads for this block
+        total_num_kv_heads = fused_kv_heads_per_blk // 2
+        k_heads_start = heads_blk_idx * num_kv_heads_per_blk
+        v_heads_end = total_num_kv_heads + (heads_blk_idx + 1) * num_kv_heads_per_blk
+
+        fused_heads_start = k_heads_start
+        fused_heads_count = v_heads_end - k_heads_start
 
         async_copy_fused_kv = MultiPageAsyncCopyDescriptor(
             kv_cache_hbm_ref.at[:, :, pl.ds(fused_heads_start, fused_heads_count), :],
@@ -701,11 +704,19 @@ def ragged_paged_attention_kernel(
             # Wait for fused KV data and separate K and V
             fused_kv_data = (
                 cur_async_copy_fused_kv.wait()
-            )  # [num_kv_pages_per_blk, page_size, num_kv_heads_per_blk * 2, head_dim]
+            )  # [num_kv_pages_per_blk, page_size, copied_heads_count, head_dim]
 
-            # Split fused KV data: first half is K, second half is V
+            # Extract K and V heads from the copied data
+            # K heads are at the beginning of the copied range
             k_data = fused_kv_data[:, :, :num_kv_heads_per_blk, :]  # K heads
-            v_data = fused_kv_data[:, :, num_kv_heads_per_blk:, :]  # V heads
+
+            # V heads are offset by total_num_kv_heads - k_heads_start in the copied range
+            total_num_kv_heads = fused_kv_heads_per_blk // 2
+            k_heads_start = heads_blk_idx * num_kv_heads_per_blk
+            v_heads_offset = total_num_kv_heads - k_heads_start
+            v_data = fused_kv_data[
+                :, :, v_heads_offset : v_heads_offset + num_kv_heads_per_blk, :
+            ]  # V heads
 
             k_ref = k_data.reshape(
                 num_kv_pages_per_blk * page_size * num_kv_heads_per_blk,
