@@ -181,9 +181,6 @@ class FlashAttention(AttentionBackend):
             Output tensor of shape [total_tokens, hidden_size]
         """
         kv_buffer = self._get_and_set_kv_cache(k, v, forward_batch, layer.layer_id)
-        full_kv_cache = forward_batch.token_to_kv_pool.get_fused_kv_buffer(
-            layer.layer_id
-        )
 
         if layer.scaling is None:
             scale = 1.0 / jnp.sqrt(layer.head_dim)
@@ -233,11 +230,8 @@ class FlashAttention(AttentionBackend):
             check_vma=False,
         )(
             q.reshape(q.shape[0], -1, self.head_dim),
-            full_kv_cache.reshape(
-                full_kv_cache.shape[0] // self.page_size,
-                self.page_size,
-                -1,
-                self.head_dim,
+            kv_buffer.reshape(
+                kv_buffer.shape[0] // self.page_size, self.page_size, -1, self.head_dim
             ),
             self.forward_metadata.page_indices,
             self.forward_metadata.cu_q_lens,
@@ -270,9 +264,7 @@ class FlashAttention(AttentionBackend):
                 layer_id, forward_batch.out_cache_loc, k, v, is_decode=True
             )
 
-        # Return the NEW fused KV data (not the entire cache buffer)
-        fused_kv = jnp.concatenate([k, v], axis=1)  # [K_heads..., V_heads...]
-        return fused_kv
+        return forward_batch.token_to_kv_pool.get_fused_kv_buffer(layer_id)
 
     @staticmethod
     def get_max_running_reqests(max_context_len: int, page_size: int) -> int:
