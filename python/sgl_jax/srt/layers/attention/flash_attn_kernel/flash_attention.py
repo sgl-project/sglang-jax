@@ -188,7 +188,7 @@ class MultiPageAsyncCopyDescriptor:
 # Expect to run these checks during compile time.
 def static_validate_inputs(
     q: jax.Array,  # [max_num_batched_tokens, num_q_heads, head_dim]
-    kv_cache: jax.Array,  # [total_num_pages, page_size, num_kv_heads * 2, head_dim]
+    kv_cache: jax.Array,  # [total_num_pages, page_size, num_kv_heads, head_dim * 2]
     page_indices: jax.Array,  # i32[num_pages]
     cu_q_lens: jax.Array,  # i32[max_num_seqs + 1]
     cu_kv_lens: jax.Array,  # i32[max_num_seqs + 1]
@@ -208,11 +208,14 @@ def static_validate_inputs(
     vmem_limit_bytes: int | None = None,
 ):
     _, num_q_heads, head_dim = q.shape
-    _, _, fused_kv_heads, head_dim_k = kv_cache.shape
-    # Fused KV cache has num_kv_heads * 2 heads (K heads + V heads)
-    assert fused_kv_heads % 2 == 0, f"fused KV heads {fused_kv_heads} must be even"
-    num_kv_heads = fused_kv_heads // 2
-    assert num_kv_heads % 2 == 0
+    _, _, num_kv_heads, head_dim_fused = kv_cache.shape
+    # Head_dim concatenated KV cache has shape [pages, page_size, num_kv_heads, head_dim * 2]
+    assert (
+        head_dim_fused == head_dim * 2
+    ), f"Expected head_dim_fused={head_dim * 2}, got {head_dim_fused}"
+    assert (
+        num_kv_heads % 2 == 0
+    ), f"num_kv_heads={num_kv_heads} must be even for TPU tiling"
     assert isinstance(k_scale, float) or k_scale is None
     assert isinstance(v_scale, float) or v_scale is None
 
@@ -256,7 +259,7 @@ def static_validate_inputs(
 
 def ref_ragged_paged_attention(
     queries: jax.Array,  # [max_num_batched_tokens, num_q_heads, head_dim]
-    kv_pages: jax.Array,  # [total_num_pages, page_size, num_kv_heads * 2, head_dim] - K&V interleaved
+    kv_pages: jax.Array,  # [total_num_pages, page_size, num_kv_heads, head_dim * 2] - K&V concatenated in head_dim
     kv_lens: jax.Array,  # i32[max_num_seqs]
     page_indices: jax.Array,  # i32[max_num_seqs, pages_per_seq]
     cu_q_lens: jax.Array,  # i32[max_num_seqs + 1]
@@ -271,8 +274,8 @@ def ref_ragged_paged_attention(
 ):
     if mask_value is None:
         mask_value = DEFAULT_MASK_VALUE
-    _, _, fused_kv_heads, head_dim = kv_pages.shape
-    num_kv_heads = fused_kv_heads // 2  # Split fused KV heads back to separate counts
+    _, _, num_kv_heads, head_dim_fused = kv_pages.shape
+    head_dim = head_dim_fused // 2  # Extract original head_dim from concatenated format
     num_q_heads = queries.shape[1]
     assert num_q_heads % num_kv_heads == 0
     num_query_per_kv = num_q_heads // num_kv_heads
@@ -284,21 +287,16 @@ def ref_ragged_paged_attention(
         kv_len = kv_lens[i]
         indices = page_indices[i]
         q = queries[q_start:q_end]
-        # Extract fused KV data and separate into K and V from interleaved format
-        fused_kv = kv_pages[indices, :, :, :].reshape(-1, fused_kv_heads, head_dim)[
+        # Extract fused KV data and separate into K and V from head_dim concatenated format
+        fused_kv = kv_pages[indices, :, :, :].reshape(-1, num_kv_heads, head_dim_fused)[
             :kv_len
         ]
-        # Extract from interleaved format: k1,v1,k2,v2,k3,v3 -> separate K and V
-        # Use reshape to avoid strided access issues
-        seq_len, fused_heads, head_dim = fused_kv.shape
-        num_kv_heads = fused_heads // 2
+        # Extract from head_dim concatenated format: [k_dims, v_dims] -> separate K and V
+        seq_len, actual_num_kv_heads, concat_head_dim = fused_kv.shape
 
-        # Reshape to separate K and V: [seq_len, num_heads, 2, head_dim]
-        kv_reshaped = fused_kv.reshape(seq_len, num_kv_heads, 2, head_dim)
-
-        # Extract K and V data
-        k = kv_reshaped[:, :, 0, :]  # K heads
-        v = kv_reshaped[:, :, 1, :]  # V heads
+        # Extract K and V data from concatenated head_dim
+        k = fused_kv[:, :, :head_dim]  # First half: K heads
+        v = fused_kv[:, :, head_dim:]  # Second half: V heads
         if k_scale is not None:
             k = k.astype(jnp.float32) * k_scale
             k = k.astype(q.dtype)
@@ -905,8 +903,8 @@ def ragged_paged_attention(
     if mask_value is None:
         mask_value = DEFAULT_MASK_VALUE
     num_q_tokens, num_q_heads, head_dim = q.shape
-    _, page_size, fused_kv_heads, _ = kv_cache.shape
-    num_kv_heads = fused_kv_heads // 2  # Split fused KV heads back to K and V
+    _, page_size, num_kv_heads, head_dim_fused = kv_cache.shape
+    # In head_dim concatenated format, num_kv_heads is already the correct value
 
     num_q_heads_per_blk, num_kv_heads_per_blk = get_min_heads_per_blk(
         num_q_heads, num_kv_heads, q.dtype, kv_cache.dtype
