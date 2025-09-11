@@ -243,7 +243,7 @@ class FlashAttention(AttentionBackend):
                 fused_kv_buffer.shape[0] // self.page_size,
                 self.page_size,
                 -1,
-                self.head_dim * 2,
+                self.head_dim,  # Head interleaving: heads dimension is heads*2, head_dim stays same
             ),
             self.forward_metadata.page_indices,
             self.forward_metadata.cu_q_lens,
