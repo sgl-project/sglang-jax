@@ -50,7 +50,7 @@ def test_import_and_basic_syntax():
             2,
             8,
             8,
-        )  # [tokens, heads * 2, head_dim] head interleaving
+        )  # [tokens, heads * 2, head_dim] head interleaving tpu_commons v3
 
         extracted_k = extract_k_from_fused_kv(fused_kv)
         extracted_v = extract_v_from_fused_kv(fused_kv)

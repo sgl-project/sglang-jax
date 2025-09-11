@@ -425,11 +425,13 @@ def ragged_paged_attention_kernel(
         mask_value = DEFAULT_MASK_VALUE
     num_q_per_blk, num_q_heads_per_blk, head_dim = q_ref.shape
     num_seqs = num_seqs_ref[0]
-    # kv_bufs shape: [2, num_kv_pages_per_blk, page_size, num_kv_heads_per_blk, head_dim * 2]
-    _, num_kv_pages_per_blk, page_size, num_kv_heads_per_blk, fused_head_dim = (
-        kv_bufs.shape
-    )
-    assert fused_head_dim == head_dim * 2  # Verify fused dimension
+    # kv_bufs shape: [2, num_kv_pages_per_blk, page_size, num_kv_heads_per_blk * 2, head_dim]
+    _, num_kv_pages_per_blk, page_size, fused_heads, actual_head_dim = kv_bufs.shape
+    assert actual_head_dim == head_dim  # Verify head_dim dimension
+    num_kv_heads_per_blk = fused_heads // 2  # Extract from fused heads
+    assert (
+        fused_heads == num_kv_heads_per_blk * 2
+    )  # Verify tpu_commons head interleaving
     num_kv_per_blk = num_kv_pages_per_blk * page_size
     num_q_heads_per_kv_head = num_q_heads_per_blk // num_kv_heads_per_blk
     heads_blk_idx, q_blk_idx = (
@@ -867,15 +869,41 @@ def ragged_paged_attention_kernel(
             cur_async_copy_kv = create_fused_kv_async_copy_descriptor(
                 heads_blk_idx, cur_seq_idx, kv_blk_idx, cur_buf_idx
             )
-            # tpu_commons v3 头交替布局：避免不必要的 reshape，支持头交替
+            # tpu_commons v3 存储格式：头交替布局
             kv_buf_fused = (
                 cur_async_copy_kv.wait()
             )  # [num_kv_pages_per_blk, page_size, num_kv_heads_per_blk * 2, head_dim]
 
-            # tpu_commons v3 真正的逻辑：保持融合状态，用strided_load_bkv提取
+            # tpu_commons v3 格式：头交替格式
             kv_ref_fused = kv_buf_fused.reshape(
                 num_kv_pages_per_blk * page_size, num_kv_heads_per_blk * 2, head_dim
-            )  # [total_kv_tokens, heads*2, head_dim] - 保持融合状态!
+            )  # [total_kv_tokens, heads*2, head_dim] - tpu_commons头交替格式!
+
+            def batch_load_all_heads_kv_tpu_commons_exact(
+                kv_ref_fused, num_kv_heads_per_blk
+            ):
+                """
+                完全按照 tpu_commons v3 的批量加载逻辑：处理 [tokens, heads*2, head_dim] 头交替格式
+                """
+                tokens, fused_heads, head_dim = kv_ref_fused.shape
+                assert fused_heads == num_kv_heads_per_blk * 2  # 验证头交替格式
+
+                k_heads = []
+                v_heads = []
+
+                # tpu_commons v3 逻辑：头交替访问 K 和 V
+                for kv_head_idx in range(num_kv_heads_per_blk):
+                    # 头交替格式：K在偶数索引，V在奇数索引
+                    k_idx = kv_head_idx * 2  # 0, 2, 4, ...
+                    v_idx = kv_head_idx * 2 + 1  # 1, 3, 5, ...
+
+                    k = kv_ref_fused[:, k_idx, :]  # [tokens, head_dim]
+                    v = kv_ref_fused[:, v_idx, :]  # [tokens, head_dim]
+
+                    k_heads.append(k)
+                    v_heads.append(v)
+
+                return jnp.stack(k_heads, axis=0), jnp.stack(v_heads, axis=0)
 
             q_batch = batch_prepare_queries(
                 q_ref, num_kv_heads_per_blk, num_q_heads_per_kv_head

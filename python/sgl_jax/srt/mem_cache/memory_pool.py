@@ -28,7 +28,7 @@ def merge_kv(k: jax.Array, v: jax.Array) -> jax.Array:
 
     Returns:
         Merged tensor [num_tokens, num_kv_heads * 2, head_dim] with head interleaving
-        Layout: [K0,V0,K1,V1,K2,V2...] in heads dimension
+        Layout: [K0,V0,K1,V1,K2,V2...] in heads dimension (tpu_commons v3 exact)
     """
     assert (
         k.shape == v.shape
@@ -45,32 +45,20 @@ def merge_kv(k: jax.Array, v: jax.Array) -> jax.Array:
     return kv_fused
 
 
+# Note: tpu_commons v3 doesn't have extract functions - it uses strided_load_bkv directly
+# These functions are kept only for backward compatibility with existing code
+
+
 def extract_k_from_fused_kv(kv: jax.Array) -> jax.Array:
-    """
-    Extract k tensor from fused KV cache following tpu_commons v3 head interleaving logic.
-
-    Args:
-        kv: Fused KV tensor [num_tokens, num_kv_heads * 2, head_dim] with head interleaving
-
-    Returns:
-        k tensor [num_tokens, num_kv_heads, head_dim]
-    """
-    # tpu_commons v3 logic: K is at even indices (0, 2, 4, ...)
-    return kv[:, ::2, :]  # Extract even-indexed heads
+    """Extract k tensor from fused KV cache (compatibility function)."""
+    # Head interleaving: K is at even indices (0, 2, 4, ...)
+    return kv[:, ::2, :]
 
 
 def extract_v_from_fused_kv(kv: jax.Array) -> jax.Array:
-    """
-    Extract v tensor from fused KV cache following tpu_commons v3 head interleaving logic.
-
-    Args:
-        kv: Fused KV tensor [num_tokens, num_kv_heads * 2, head_dim] with head interleaving
-
-    Returns:
-        v tensor [num_tokens, num_kv_heads, head_dim]
-    """
-    # tpu_commons v3 logic: V is at odd indices (1, 3, 5, ...)
-    return kv[:, 1::2, :]  # Extract odd-indexed heads
+    """Extract v tensor from fused KV cache (compatibility function)."""
+    # Head interleaving: V is at odd indices (1, 3, 5, ...)
+    return kv[:, 1::2, :]
 
 
 logger = logging.getLogger(__name__)
@@ -335,8 +323,9 @@ class MHATokenToKVPool(KVCache):
                 def create_fused_kv_callback(index):
                     local_shape = (
                         fused_buffer_shape[0],
-                        fused_buffer_shape[1] // tensor_size,
-                        fused_buffer_shape[2],
+                        fused_buffer_shape[1]
+                        // tensor_size,  # num_kv_heads * 2 sharded
+                        fused_buffer_shape[2],  # head_dim not sharded
                     )
                     return jnp.zeros(local_shape, dtype=self.dtype)
 
