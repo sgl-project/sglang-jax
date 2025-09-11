@@ -487,15 +487,108 @@ def ragged_paged_attention_kernel(
             vec = vec.astype(jnp.float32)
         return vec.reshape(-1, last_dim)
 
-    def batch_load_all_heads_kv(k_ref, v_ref, num_kv_heads_per_blk):
+    def strided_load(ref, start, step, *, dtype=None):
+        """
+        tpu_commons v3 的完整 strided_load 实现，不简化任何细节！
+        """
+        assert get_dtype_packing(ref.dtype) == 1
+        assert len(ref.shape) == 2
+        r, l = ref.shape  # noqa
+        assert l % 128 == 0
+        folds = l // 128
+        ref = ref.reshape(r * folds, 128)
+        start *= folds
+        step *= folds
+        vec = jnp.concatenate([ref[start + i :: step] for i in range(folds)], axis=1)
+        if dtype is not None:
+            vec = pltpu.bitcast(vec, dtype)
+        return vec
+
+    def strided_load_bkv_exact_tpu_commons(
+        kv_ref_fused, start, step, kv_packing=1, bkv_bitmask=None
+    ):
+        """
+        完全按照 tpu_commons v3 的 strided_load_bkv 实现，不简化任何细节！
+        """
+        kv_dtype = kv_ref_fused.dtype
+
+        # tpu_commons v3 的完整逻辑
+        assert start % kv_packing == 0
+        assert step % kv_packing == 0
+        start //= kv_packing
+        step //= kv_packing
+
+        # 重要：bitcast 到 uint32 进行位操作，就像 tpu_commons v3
+        kv_ref_uint32 = pltpu.bitcast(kv_ref_fused, jnp.uint32)
+        total_tokens, fused_heads, head_dim = kv_ref_fused.shape
+        kv_ref = kv_ref_uint32.reshape(total_tokens * step, head_dim)
+
+        def _mask_kv(k, v):
+            """tpu_commons v3 的完整 masking 逻辑"""
+            if bkv_bitmask is not None:
+                k = pltpu.bitcast(k, jnp.uint32)
+                v = pltpu.bitcast(v, jnp.uint32)
+                k = k & bkv_bitmask
+                v = v & bkv_bitmask
+                k = pltpu.bitcast(k, kv_dtype)
+                v = pltpu.bitcast(v, kv_dtype)
+            return (k, v)
+
+        if kv_packing == 1:
+            # tpu_commons v3: 简单情况的完整逻辑
+            k = strided_load(kv_ref, start, step, dtype=kv_dtype)
+            v = strided_load(kv_ref, start + 1, step, dtype=kv_dtype)  # 关键：start + 1
+            return [_mask_kv(k, v)]
+
+        # tpu_commons v3: 复杂 bit packing 的完整实现，不简化！
+        kv = strided_load(kv_ref, start, step)
+        bitwidth = 32 // kv_packing
+        repack_ty = jnp.dtype(f"uint{bitwidth}")
+        lst = []
+
+        for i in range(0, kv_packing, 2):
+            # tpu_commons v3 的完整位操作逻辑
+            k = (kv >> (i * bitwidth)).astype(repack_ty)
+            v = (kv >> ((i + 1) * bitwidth)).astype(repack_ty)
+            lst.append(_mask_kv(k, v))
+
+        return lst
+
+    def batch_load_all_heads_kv_tpu_commons_exact(
+        kv_ref_fused, num_kv_heads_per_blk, bkv_bitmask=None
+    ):
+        """
+        完全按照 tpu_commons v3 的批量加载逻辑，不简化任何细节！
+        """
         k_heads = []
         v_heads = []
 
-        for head_idx in range(num_kv_heads_per_blk):
-            k_head = strided_load_kv(k_ref, head_idx, num_kv_heads_per_blk)
-            v_head = strided_load_kv(v_ref, head_idx, num_kv_heads_per_blk)
-            k_heads.append(k_head)
-            v_heads.append(v_head)
+        # tpu_commons v3 的完整逻辑：按 heads_per_load 分组处理
+        kv_packing = get_dtype_packing(kv_ref_fused.dtype)
+        heads_per_load = max(1, kv_packing // 2)  # tpu_commons v3 的分组策略
+
+        num_kv_heads_x2 = num_kv_heads_per_blk * 2  # 总头数 * 2
+
+        for kv_head_start in range(0, num_kv_heads_per_blk, heads_per_load):
+            # 完全按照 tpu_commons v3 的调用方式
+            bkv_lst = strided_load_bkv_exact_tpu_commons(
+                kv_ref_fused,
+                start=kv_head_start * 2,  # 头索引 * 2
+                step=num_kv_heads_x2,  # 总头数 * 2
+                kv_packing=kv_packing,
+                bkv_bitmask=bkv_bitmask,
+            )
+
+            # 处理返回的 K,V 对列表
+            for i in range(heads_per_load):
+                kv_head_idx = kv_head_start + i
+                if kv_head_idx >= num_kv_heads_per_blk:
+                    break
+
+                if i < len(bkv_lst):
+                    bk, bv = bkv_lst[i]
+                    k_heads.append(bk)
+                    v_heads.append(bv)
 
         return jnp.stack(k_heads, axis=0), jnp.stack(v_heads, axis=0)
 
@@ -774,26 +867,22 @@ def ragged_paged_attention_kernel(
             cur_async_copy_kv = create_fused_kv_async_copy_descriptor(
                 heads_blk_idx, cur_seq_idx, kv_blk_idx, cur_buf_idx
             )
-            # VMEM 优化：避免不必要的 reshape，4D 切片后再 reshape
+            # tpu_commons v3 头交替布局：避免不必要的 reshape，支持头交替
             kv_buf_fused = (
                 cur_async_copy_kv.wait()
-            )  # [num_kv_pages_per_blk, page_size, num_kv_heads_per_blk, head_dim * 2]
+            )  # [num_kv_pages_per_blk, page_size, num_kv_heads_per_blk * 2, head_dim]
 
-            # Extract k and v directly from 4D tensor, then reshape only once
-            # 这比先 reshape 再切片更高效，减少 VMEM 内存操作
-            k_ref = kv_buf_fused[..., :head_dim].reshape(
-                num_kv_pages_per_blk * page_size * num_kv_heads_per_blk, head_dim
-            )
-            v_ref = kv_buf_fused[..., head_dim:].reshape(
-                num_kv_pages_per_blk * page_size * num_kv_heads_per_blk, head_dim
-            )
+            # tpu_commons v3 真正的逻辑：保持融合状态，用strided_load_bkv提取
+            kv_ref_fused = kv_buf_fused.reshape(
+                num_kv_pages_per_blk * page_size, num_kv_heads_per_blk * 2, head_dim
+            )  # [total_kv_tokens, heads*2, head_dim] - 保持融合状态!
 
             q_batch = batch_prepare_queries(
                 q_ref, num_kv_heads_per_blk, num_q_heads_per_kv_head
             )
 
-            k_batch, v_batch = batch_load_all_heads_kv(
-                k_ref, v_ref, num_kv_heads_per_blk
+            k_batch, v_batch = batch_load_all_heads_kv_tpu_commons_exact(
+                kv_ref_fused, num_kv_heads_per_blk
             )
 
             flash_attention(
@@ -985,8 +1074,8 @@ def ragged_paged_attention(
             2,  # For double buffering during DMA copies.
             num_kv_pages_per_blk,
             page_size,
-            num_kv_heads_per_blk,
-            head_dim * 2,  # Fused K and V
+            num_kv_heads_per_blk * 2,  # Head interleaving: [K0,V0,K1,V1,...]
+            head_dim,  # tpu_commons v3 layout
         ),
         kv_cache_fused.dtype,
     )

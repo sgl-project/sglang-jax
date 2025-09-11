@@ -46,7 +46,11 @@ def test_import_and_basic_syntax():
     try:
         fused_kv = merge_kv(k, v)
         print(f"Fused KV shape: {fused_kv.shape}")
-        assert fused_kv.shape == (2, 4, 16)  # [tokens, heads, head_dim * 2]
+        assert fused_kv.shape == (
+            2,
+            8,
+            8,
+        )  # [tokens, heads * 2, head_dim] head interleaving
 
         extracted_k = extract_k_from_fused_kv(fused_kv)
         extracted_v = extract_v_from_fused_kv(fused_kv)

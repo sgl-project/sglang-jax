@@ -20,54 +20,57 @@ from sgl_jax.srt.utils import cdiv
 
 def merge_kv(k: jax.Array, v: jax.Array) -> jax.Array:
     """
-    Merge k and v tensors following tpu_commons v3 logic.
+    Merge k and v tensors following tpu_commons v3 exact logic.
 
     Args:
         k: Key tensor [num_tokens, num_kv_heads, head_dim]
         v: Value tensor [num_tokens, num_kv_heads, head_dim]
 
     Returns:
-        Merged tensor [num_tokens, num_kv_heads, head_dim * 2] with k and v concatenated in head_dim
+        Merged tensor [num_tokens, num_kv_heads * 2, head_dim] with head interleaving
+        Layout: [K0,V0,K1,V1,K2,V2...] in heads dimension
     """
     assert (
         k.shape == v.shape
     ), f"k and v must have same shape, got {k.shape} vs {v.shape}"
 
-    # Concatenate k and v along head_dim dimension, following tpu_commons logic
-    # Each kv_head will have [k_features, v_features] concatenated
-    kv_fused = jnp.concatenate(
-        [k, v], axis=-1
-    )  # [num_tokens, num_kv_heads, head_dim * 2]
+    num_tokens, num_kv_heads, head_dim = k.shape
+
+    # tpu_commons v3 exact logic: concat then reshape to head interleaving
+    kv_concat = jnp.concatenate([k, v], axis=-1)  # [tokens, heads, head_dim*2]
+    kv_fused = kv_concat.reshape(
+        num_tokens, num_kv_heads * 2, head_dim
+    )  # Head interleaving!
 
     return kv_fused
 
 
 def extract_k_from_fused_kv(kv: jax.Array) -> jax.Array:
     """
-    Extract k tensor from fused KV cache following tpu_commons v3 logic.
+    Extract k tensor from fused KV cache following tpu_commons v3 head interleaving logic.
 
     Args:
-        kv: Fused KV tensor [num_tokens, num_kv_heads, head_dim * 2]
+        kv: Fused KV tensor [num_tokens, num_kv_heads * 2, head_dim] with head interleaving
 
     Returns:
         k tensor [num_tokens, num_kv_heads, head_dim]
     """
-    head_dim = kv.shape[-1] // 2
-    return kv[:, :, :head_dim]
+    # tpu_commons v3 logic: K is at even indices (0, 2, 4, ...)
+    return kv[:, ::2, :]  # Extract even-indexed heads
 
 
 def extract_v_from_fused_kv(kv: jax.Array) -> jax.Array:
     """
-    Extract v tensor from fused KV cache following tpu_commons v3 logic.
+    Extract v tensor from fused KV cache following tpu_commons v3 head interleaving logic.
 
     Args:
-        kv: Fused KV tensor [num_tokens, num_kv_heads, head_dim * 2]
+        kv: Fused KV tensor [num_tokens, num_kv_heads * 2, head_dim] with head interleaving
 
     Returns:
         v tensor [num_tokens, num_kv_heads, head_dim]
     """
-    head_dim = kv.shape[-1] // 2
-    return kv[:, :, head_dim:]
+    # tpu_commons v3 logic: V is at odd indices (1, 3, 5, ...)
+    return kv[:, 1::2, :]  # Extract odd-indexed heads
 
 
 logger = logging.getLogger(__name__)
@@ -314,11 +317,11 @@ class MHATokenToKVPool(KVCache):
         logger.info(f"Creating fused KV buffers for {self.layer_num} layers")
         start_time = time.time()
 
-        # Fused KV cache shape: [size, num_kv_heads, head_dim * 2] (k and v concatenated in head_dim)
+        # Fused KV cache shape: [size, num_kv_heads * 2, head_dim] (head interleaving like tpu_commons v3)
         fused_buffer_shape = (
             self.size + self.page_size,
-            self.head_num,
-            self.head_dim * 2,
+            self.head_num * 2,  # Head interleaving: [K0,V0,K1,V1,...]
+            self.head_dim,
         )
         logger.info(
             f"Total fused KV cache memory per layer: {fused_buffer_shape[0] * fused_buffer_shape[1] * fused_buffer_shape[2] / 1024**3:.2f} GB, dtype: {self.dtype}"
@@ -353,7 +356,7 @@ class MHATokenToKVPool(KVCache):
             (self.size + self.page_size)
             * self.head_num  # num_kv_heads
             * self.head_dim
-            * 2  # head_dim * 2 (k and v concatenated)
+            * 2  # num_heads * 2 (head interleaving)
             * jnp.dtype(self.dtype).itemsize
             * self.layer_num
         )
@@ -370,7 +373,7 @@ class MHATokenToKVPool(KVCache):
             (self.size + self.page_size)
             * self.head_num  # num_kv_heads
             * self.head_dim
-            * 2  # head_dim * 2 (k and v concatenated)
+            * 2  # num_heads * 2 (head interleaving)
             * jnp.dtype(self.dtype).itemsize
             * self.layer_num
         )
@@ -502,9 +505,9 @@ def _set_fused_kv_buffer(
     Update fused KV cache with new fused KV data.
 
     Args:
-        fused_kv: Fused KV tensor [total_tokens, num_kv_heads, head_dim * 2]
+        fused_kv: Fused KV tensor [total_tokens, num_kv_heads * 2, head_dim]
         loc: Location indices [total_tokens], -1 for padding tokens
-        kv_cache: Fused KV cache buffer [cache_size, num_kv_heads, head_dim * 2]
+        kv_cache: Fused KV cache buffer [cache_size, num_kv_heads * 2, head_dim]
         page_size: Page size for vectorized updates
         kv_partition_axis: Partition axis for sharding
 
@@ -550,9 +553,9 @@ def _set_kv_buffer(
 
 
 def update_fused_kv_cache(
-    fused_kv: jax.Array,  # [total_tokens, num_kv_heads, head_dim * 2]
+    fused_kv: jax.Array,  # [total_tokens, num_kv_heads * 2, head_dim]
     loc: jax.Array,  # [total_tokens], -1 for padding
-    kv_cache: jax.Array,  # [cache_size, num_kv_heads, head_dim * 2]
+    kv_cache: jax.Array,  # [cache_size, num_kv_heads * 2, head_dim]
     page_size: int = 1,
     kv_partition_axis: str = "tensor",
 ) -> jax.Array:
@@ -560,7 +563,7 @@ def update_fused_kv_cache(
     Main fused KV cache update function.
 
     Args:
-        fused_kv: Fused KV tensor [total_tokens, num_kv_heads, head_dim * 2]
+        fused_kv: Fused KV tensor [total_tokens, num_kv_heads * 2, head_dim]
         loc: Location indices [total_tokens], -1 for padding tokens
         kv_cache: Fused KV cache buffer
         page_size: Page size for vectorized updates
@@ -980,9 +983,9 @@ def update_kv_cache_vectorized(
 
 
 def update_fused_kv_cache_vectorized(
-    fused_kv: jax.Array,  # [total_tokens, num_kv_heads, head_dim * 2]
+    fused_kv: jax.Array,  # [total_tokens, num_kv_heads * 2, head_dim]
     loc: jax.Array,  # [total_tokens], -1 for padding
-    kv_cache: jax.Array,  # [cache_size, num_kv_heads, head_dim * 2]
+    kv_cache: jax.Array,  # [cache_size, num_kv_heads * 2, head_dim]
     page_size: int,
     kv_partition_axis: str = "tensor",
 ) -> jax.Array:
@@ -1004,7 +1007,7 @@ def update_fused_kv_cache_vectorized(
         fused_kv.shape[1],  # num_kv_heads
         kv_cache.shape[0],
         fused_kv.shape[0],
-        fused_kv.shape[2],  # head_dim * 2
+        fused_kv.shape[2],  # head_dim (after interleaving)
         page_size,
     )
 
