@@ -1042,10 +1042,15 @@ def ragged_paged_attention(
     if mask_value is None:
         mask_value = DEFAULT_MASK_VALUE
     num_q_tokens, num_q_heads, head_dim = q.shape
-    _, page_size, num_kv_heads, fused_head_dim = kv_cache_fused.shape
+    _, page_size, num_kv_heads_interleaved, actual_head_dim = kv_cache_fused.shape
+    # Head interleaving format: num_kv_heads_interleaved = num_kv_heads * 2
     assert (
-        fused_head_dim == head_dim * 2
-    ), f"Expected fused head_dim={head_dim * 2}, got {fused_head_dim}"
+        actual_head_dim == head_dim
+    ), f"Expected head_dim={head_dim}, got {actual_head_dim}"
+    assert (
+        num_kv_heads_interleaved % 2 == 0
+    ), f"Head interleaving requires even number of heads, got {num_kv_heads_interleaved}"
+    num_kv_heads = num_kv_heads_interleaved // 2  # Extract actual KV heads count
     num_q_heads_per_blk, num_kv_heads_per_blk = get_min_heads_per_blk(
         num_q_heads, num_kv_heads, q.dtype, kv_cache_fused.dtype
     )
