@@ -372,6 +372,7 @@ class TestAttention(CustomTestCase):
             forward_batch.seq_lens,
             page_table,
             forward_batch.attn_backend.forward_metadata.cu_q_lens,
+            # forward_batch.attn_backend.forward_metadata.cu_kv_lens,
             forward_batch.attn_backend.forward_metadata.num_seqs,
             sm_scale=head_dim**-0.5,
         )
