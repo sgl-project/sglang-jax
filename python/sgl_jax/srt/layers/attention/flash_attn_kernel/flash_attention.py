@@ -962,8 +962,7 @@ def ragged_paged_attention(
     )
     in_specs = [
         q_block_spec,
-        pl.BlockSpec(memory_space=pltpu.ANY),
-        pl.BlockSpec(memory_space=pltpu.ANY),
+        pl.BlockSpec(memory_space=pltpu.ANY),  # fused kv_cache
     ]
     out_specs = q_block_spec
     lm_scratch = pltpu.VMEM(
