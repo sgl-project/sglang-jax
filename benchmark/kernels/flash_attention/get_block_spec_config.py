@@ -6,7 +6,7 @@ from math import inf
 
 import jax
 import numpy as np
-from utils import create_decode_uniform_data, create_prefill_uniform_data
+from utils import create_decode_uniform_data_fused, create_prefill_uniform_data_fused
 
 from sgl_jax.srt.layers.attention.flash_attn_kernel.flash_attention import (
     ragged_paged_attention,
@@ -27,27 +27,43 @@ def benchmark_backend(
     scale = head_dim**-0.5
 
     if mode == "prefill":
-        q, k, v, kv_lens, page_indices, cu_q_lens, cu_kv_lens, num_seqs, seq_lens, _ = (
-            create_prefill_uniform_data(
-                batch_size,
-                seq_len,
-                seq_len,
-                max_kv_cache_tokens,
-                num_heads,
-                head_dim,
-                page_size=page_size,
-            )
+        (
+            q,
+            kv_cache_fused,
+            kv_lens,
+            page_indices,
+            cu_q_lens,
+            cu_kv_lens,
+            num_seqs,
+            seq_lens,
+            _,
+        ) = create_prefill_uniform_data_fused(
+            batch_size,
+            seq_len,
+            seq_len,
+            max_kv_cache_tokens,
+            num_heads,
+            head_dim,
+            page_size=page_size,
         )
     elif mode == "decode":
-        q, k, v, kv_lens, page_indices, cu_q_lens, cu_kv_lens, num_seqs, seq_lens, _ = (
-            create_decode_uniform_data(
-                batch_size,
-                seq_len,
-                max_kv_cache_tokens,
-                num_heads,
-                head_dim,
-                page_size=page_size,
-            )
+        (
+            q,
+            kv_cache_fused,
+            kv_lens,
+            page_indices,
+            cu_q_lens,
+            cu_kv_lens,
+            num_seqs,
+            seq_lens,
+            _,
+        ) = create_decode_uniform_data_fused(
+            batch_size,
+            seq_len,
+            max_kv_cache_tokens,
+            num_heads,
+            head_dim,
+            page_size=page_size,
         )
 
     @functools.partial(
@@ -56,8 +72,7 @@ def benchmark_backend(
     )
     def jitted_attn(
         q,
-        k,
-        v,
+        kv_cache_fused,
         page_indices,
         cu_q_lens,
         cu_kv_lens,
@@ -69,8 +84,7 @@ def benchmark_backend(
     ):
         return ragged_paged_attention(
             q,
-            k,
-            v,
+            kv_cache_fused,
             page_indices,
             cu_q_lens,
             cu_kv_lens,
@@ -85,8 +99,7 @@ def benchmark_backend(
     attn = functools.partial(
         jitted_attn,
         q,
-        k,
-        v,
+        kv_cache_fused,
         page_indices,
         cu_q_lens,
         cu_kv_lens,
