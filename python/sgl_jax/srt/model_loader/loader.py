@@ -96,31 +96,9 @@ class JAXModelLoader(BaseModelLoader):
         return model_class
 
     def _get_model(self, model_class: Any, model_config: ModelConfig) -> nnx.Module:
-        # Create model directly - random initialization is fast and will be immediately overwritten
-        # The "double initialization" cost is minimal since load_weights replaces all parameters
-
-        # Extract RNG keys outside JIT boundary to avoid trace level conflicts
-        rng_keys = {}
-
-        def extract_keys(rngs):
-            if hasattr(rngs, "params"):
-                rng_keys["params"] = rngs.params()
-            return rng_keys
-
-        keys = extract_keys(self.rng)
-        default_key = self.rng.default.key.value
-
         @nnx.jit
-        def create_model(rng_keys, default_key):
-            # Create a new RNG with the extracted keys
-            from flax import nnx
-
-            temp_rng = nnx.Rngs(default=default_key)
-            # Override the params method to return the pre-extracted key
-            temp_rng._params_key = rng_keys.get("params", default_key)
-            temp_rng.params = lambda: temp_rng._params_key
-
-            model = model_class(model_config, temp_rng, self.mesh)
+        def create_model(rng: nnx.Rngs):
+            model = model_class(model_config, rng, self.mesh)
             state = nnx.state(model)
             pspecs = nnx.get_partition_spec(state)
             sharded_state = jax.lax.with_sharding_constraint(state, pspecs)
@@ -128,7 +106,7 @@ class JAXModelLoader(BaseModelLoader):
             return model
 
         with self.mesh:
-            model = create_model(keys, default_key)
+            model = create_model(self.rng)
 
         rng_key = self.rng.default.key.value
         model.load_weights(rng_key)
