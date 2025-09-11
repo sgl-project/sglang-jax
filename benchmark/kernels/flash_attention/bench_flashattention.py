@@ -22,27 +22,45 @@ def benchmark_backend(
 ):
     if backend_type == "flash":
         if mode == "prefill":
-            q, k, v, _, page_indices, cu_q_lens, cu_kv_lens, num_seqs, seq_lens, _ = (
-                create_prefill_uniform_data(
-                    batch_size,
-                    seq_len,
-                    seq_len,
-                    max_kv_cache_tokens_num,
-                    num_heads,
-                    head_dim,
-                    page_size=page_size,
-                )
+            (
+                q,
+                kv_fused,
+                _,
+                page_indices,
+                cu_q_lens,
+                cu_kv_lens,
+                num_seqs,
+                seq_lens,
+                _,
+            ) = create_prefill_uniform_data(
+                batch_size,
+                seq_len,
+                seq_len,
+                max_kv_cache_tokens_num,
+                num_heads,
+                head_dim,
+                page_size=page_size,
+                fused_kv=True,
             )
         elif mode == "decode":
-            q, k, v, _, page_indices, cu_q_lens, cu_kv_lens, num_seqs, seq_lens, _ = (
-                create_decode_uniform_data(
-                    batch_size,
-                    seq_len,
-                    max_kv_cache_tokens_num,
-                    num_heads,
-                    head_dim,
-                    page_size=page_size,
-                )
+            (
+                q,
+                kv_fused,
+                _,
+                page_indices,
+                cu_q_lens,
+                cu_kv_lens,
+                num_seqs,
+                seq_lens,
+                _,
+            ) = create_decode_uniform_data(
+                batch_size,
+                seq_len,
+                max_kv_cache_tokens_num,
+                num_heads,
+                head_dim,
+                page_size=page_size,
+                fused_kv=True,
             )
 
         @functools.partial(
@@ -53,8 +71,7 @@ def benchmark_backend(
         )
         def jitted_attn(
             q,
-            k,
-            v,
+            kv_fused,
             page_indices,
             cu_q_lens,
             cu_kv_lens,
@@ -64,8 +81,8 @@ def benchmark_backend(
         ):
             return ragged_paged_attention(
                 q,
-                k,
-                v,
+                kv_fused,
+                None,  # v parameter not used when kv_fused is provided
                 page_indices,
                 cu_q_lens,
                 cu_kv_lens,
@@ -79,8 +96,7 @@ def benchmark_backend(
         attn = functools.partial(
             jitted_attn,
             q,
-            k,
-            v,
+            kv_fused,
             page_indices,
             cu_q_lens,
             cu_kv_lens,

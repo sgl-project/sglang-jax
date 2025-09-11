@@ -5,18 +5,41 @@ from sgl_jax.srt.utils import cdiv
 
 
 def create_kv_cache_data(
-    max_kv_cache_tokens, head_num, head_dim, page_size=128, dtype=jnp.bfloat16, seed=42
+    max_kv_cache_tokens,
+    head_num,
+    head_dim,
+    page_size=128,
+    dtype=jnp.bfloat16,
+    seed=42,
+    fused=False,
 ):
     key = jax.random.PRNGKey(seed)
     keys = jax.random.split(key, 3)
     total_num_pages = cdiv(max_kv_cache_tokens, page_size)
-    k = jax.random.normal(
-        keys[1], (total_num_pages, page_size, head_num, head_dim), dtype=dtype
+
+    if fused:
+        # Create fused KV cache in interleaved format [k1, v1, k2, v2, ...]
+        fused_kv = jax.random.normal(
+            keys[1], (total_num_pages, page_size, head_num * 2, head_dim), dtype=dtype
+        )
+        return fused_kv
+    else:
+        k = jax.random.normal(
+            keys[1], (total_num_pages, page_size, head_num, head_dim), dtype=dtype
+        )
+        v = jax.random.normal(
+            keys[2], (total_num_pages, page_size, head_num, head_dim), dtype=dtype
+        )
+        return k, v
+
+
+def create_fused_kv_cache_data(
+    max_kv_cache_tokens, head_num, head_dim, page_size=128, dtype=jnp.bfloat16, seed=42
+):
+    """Create fused KV cache data in interleaved format for FlashAttention backend"""
+    return create_kv_cache_data(
+        max_kv_cache_tokens, head_num, head_dim, page_size, dtype, seed, fused=True
     )
-    v = jax.random.normal(
-        keys[2], (total_num_pages, page_size, head_num, head_dim), dtype=dtype
-    )
-    return k, v
 
 
 def create_q_data(total_tokens, head_num, head_dim, dtype=jnp.bfloat16, seed=42):
@@ -61,6 +84,7 @@ def create_prefill_uniform_data(
     page_size=128,
     dtype=jnp.bfloat16,
     seed=42,
+    fused_kv=False,
 ):
     seq_lens = jnp.array([uniform_q_len] * batch_size, dtype=jnp.int32)
     cu_q_lens = jnp.concatenate(
@@ -77,31 +101,58 @@ def create_prefill_uniform_data(
     )
     kv_lens = seq_lens.copy()
     q = create_q_data(batch_size * uniform_q_len, head_num, head_dim, dtype, seed)
-    k_cache, v_cache = create_kv_cache_data(
-        max_kv_cache_tokens,
-        head_num,
-        head_dim,
-        page_size=page_size,
-        dtype=dtype,
-        seed=seed,
-    )
-    page_indices, cache_loc = create_page_indices_data(
-        batch_size, batch_size * uniform_kv_len, seq_lens, page_size=page_size
-    )
 
-    num_seqs = jnp.array([batch_size], dtype=jnp.int32)
-    return (
-        q,
-        k_cache,
-        v_cache,
-        kv_lens,
-        page_indices,
-        cu_q_lens,
-        cu_kv_lens,
-        num_seqs,
-        seq_lens,
-        cache_loc,
-    )
+    if fused_kv:
+        # Return fused KV cache in interleaved format
+        kv_cache_fused = create_fused_kv_cache_data(
+            max_kv_cache_tokens,
+            head_num,
+            head_dim,
+            page_size=page_size,
+            dtype=dtype,
+            seed=seed,
+        )
+        page_indices, cache_loc = create_page_indices_data(
+            batch_size, batch_size * uniform_kv_len, seq_lens, page_size=page_size
+        )
+        num_seqs = jnp.array([batch_size], dtype=jnp.int32)
+        return (
+            q,
+            kv_cache_fused,
+            kv_lens,
+            page_indices,
+            cu_q_lens,
+            cu_kv_lens,
+            num_seqs,
+            seq_lens,
+            cache_loc,
+        )
+    else:
+        # Return separate K and V caches (legacy format)
+        k_cache, v_cache = create_kv_cache_data(
+            max_kv_cache_tokens,
+            head_num,
+            head_dim,
+            page_size=page_size,
+            dtype=dtype,
+            seed=seed,
+        )
+        page_indices, cache_loc = create_page_indices_data(
+            batch_size, batch_size * uniform_kv_len, seq_lens, page_size=page_size
+        )
+        num_seqs = jnp.array([batch_size], dtype=jnp.int32)
+        return (
+            q,
+            k_cache,
+            v_cache,
+            kv_lens,
+            page_indices,
+            cu_q_lens,
+            cu_kv_lens,
+            num_seqs,
+            seq_lens,
+            cache_loc,
+        )
 
 
 def create_decode_uniform_data(
@@ -113,6 +164,7 @@ def create_decode_uniform_data(
     page_size=1,
     dtype=jnp.bfloat16,
     seed=42,
+    fused_kv=False,
 ):
     seq_len_cpu = uniform_kv_len + 1
     seq_lens = jnp.array([seq_len_cpu] * batch_size, dtype=jnp.int32)
@@ -133,27 +185,55 @@ def create_decode_uniform_data(
     )
     kv_lens = jnp.array([seq_len_cpu] * batch_size, dtype=jnp.int32)
     q = create_q_data(batch_size, head_num, head_dim, dtype, seed)
-    k_cache, v_cache = create_kv_cache_data(
-        max_kv_cache_tokens,
-        head_num,
-        head_dim,
-        page_size=page_size,
-        dtype=dtype,
-        seed=seed,
-    )
-    page_indices, cache_loc = create_page_indices_data(
-        batch_size, batch_size * uniform_kv_len, seq_lens, page_size=page_size
-    )
-    num_seqs = jnp.array([batch_size], dtype=jnp.int32)
-    return (
-        q,
-        k_cache,
-        v_cache,
-        kv_lens,
-        page_indices,
-        cu_q_lens,
-        cu_kv_lens,
-        num_seqs,
-        seq_lens,
-        cache_loc,
-    )
+
+    if fused_kv:
+        # Return fused KV cache in interleaved format
+        kv_cache_fused = create_fused_kv_cache_data(
+            max_kv_cache_tokens,
+            head_num,
+            head_dim,
+            page_size=page_size,
+            dtype=dtype,
+            seed=seed,
+        )
+        page_indices, cache_loc = create_page_indices_data(
+            batch_size, batch_size * uniform_kv_len, seq_lens, page_size=page_size
+        )
+        num_seqs = jnp.array([batch_size], dtype=jnp.int32)
+        return (
+            q,
+            kv_cache_fused,
+            kv_lens,
+            page_indices,
+            cu_q_lens,
+            cu_kv_lens,
+            num_seqs,
+            seq_lens,
+            cache_loc,
+        )
+    else:
+        # Return separate K and V caches (legacy format)
+        k_cache, v_cache = create_kv_cache_data(
+            max_kv_cache_tokens,
+            head_num,
+            head_dim,
+            page_size=page_size,
+            dtype=dtype,
+            seed=seed,
+        )
+        page_indices, cache_loc = create_page_indices_data(
+            batch_size, batch_size * uniform_kv_len, seq_lens, page_size=page_size
+        )
+        num_seqs = jnp.array([batch_size], dtype=jnp.int32)
+        return (
+            q,
+            k_cache,
+            v_cache,
+            kv_lens,
+            page_indices,
+            cu_q_lens,
+            cu_kv_lens,
+            num_seqs,
+            seq_lens,
+            cache_loc,
+        )
