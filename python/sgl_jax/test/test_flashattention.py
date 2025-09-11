@@ -5,9 +5,6 @@ import jax.numpy as jnp
 import numpy as np
 from jax.sharding import PartitionSpec as P
 
-# from sgl_jax.srt.layers.attention.flash_attn_kernel.v2.kernel import (
-#     ref_ragged_paged_attention,
-# )
 from sgl_jax.srt.layers.attention.flash_attn_kernel.flash_attention import (
     ref_ragged_paged_attention,
 )
