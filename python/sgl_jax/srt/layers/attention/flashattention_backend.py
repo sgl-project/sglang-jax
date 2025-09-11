@@ -206,11 +206,12 @@ class FlashAttention(AttentionBackend):
             q, kv_buffer = args[:2]
             other_args = args[2:]
 
-            # KV buffer has shape [..., num_kv_heads, head_dim * 2] in head_dim concatenated format
-            # Ensure kv_heads is even for TPU tiling requirements
-            num_kv_heads = kv_buffer.shape[-2]
-            assert num_kv_heads % 2 == 0, (
-                f"num_kv_heads={num_kv_heads} should be even for TPU tiling requirements. "
+            # KV buffer has shape [..., actual_num_kv_heads, head_dim * 2] in head_dim concatenated format
+            # The actual_num_kv_heads comes from the memory pool and may be different from self.num_kv_heads
+            # which represents per-device heads
+            actual_num_kv_heads = kv_buffer.shape[-2]
+            assert actual_num_kv_heads % 2 == 0, (
+                f"actual_num_kv_heads={actual_num_kv_heads} should be even for TPU tiling requirements. "
                 f"kv_buffer shape: {kv_buffer.shape}"
             )
 
@@ -236,8 +237,8 @@ class FlashAttention(AttentionBackend):
             kv_buffer.reshape(
                 kv_buffer.shape[0] // self.page_size,
                 self.page_size,
-                self.num_kv_heads,
-                self.head_dim * 2,
+                kv_buffer.shape[1],  # actual num_kv_heads from memory pool
+                kv_buffer.shape[2],  # head_dim * 2
             ),
             self.forward_metadata.page_indices,
             self.forward_metadata.cu_q_lens,
