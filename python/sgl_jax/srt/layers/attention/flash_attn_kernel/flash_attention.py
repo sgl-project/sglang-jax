@@ -404,11 +404,11 @@ def ragged_paged_attention_kernel(
     seq_lens_ref,
     # Input
     q_ref,  # [num_q_per_blk, num_q_heads_per_blk, head_dim]
-    kv_cache_hbm_ref,  # [total_num_pages, page_size, num_kv_heads, head_dim * 2]  # FUSED!
+    kv_cache_hbm_ref,  # [total_num_pages, page_size, num_kv_heads * 2, head_dim]  # HEAD INTERLEAVING!
     # Output
     o_ref,  # [num_q_per_blk, num_q_heads_per_blk, head_dim]
     # Scratch
-    kv_bufs,  # [2, num_kv_pages_per_blk, page_size, num_kv_heads_per_blk, head_dim * 2]  # FUSED!
+    kv_bufs,  # [2, num_kv_pages_per_blk, page_size, num_kv_heads_per_blk * 2, head_dim]  # HEAD INTERLEAVING!
     sems,  # [2, 2]
     l_ref,  # [num_kv_heads_per_blk, num_q_per_blk * num_q_heads_per_kv_head, 128]
     m_ref,  # [num_kv_heads_per_blk, num_q_per_blk * num_q_heads_per_kv_head, 128]
@@ -454,9 +454,15 @@ def ragged_paged_attention_kernel(
         metadata = (start_kv_page_idx, end_kv_page_idx)
         heads_start = heads_blk_idx * num_kv_heads_per_blk
 
-        # Single async copy for fused KV cache
+        # Head interleaving format: each KV head becomes 2 heads [K, V]
+        heads_start_interleaved = heads_start * 2
+        num_heads_interleaved = num_kv_heads_per_blk * 2
+
+        # Single async copy for head interleaving KV cache
         async_copy_kv = MultiPageAsyncCopyDescriptor(
-            kv_cache_hbm_ref.at[:, :, pl.ds(heads_start, num_kv_heads_per_blk), :],
+            kv_cache_hbm_ref.at[
+                :, :, pl.ds(heads_start_interleaved, num_heads_interleaved), :
+            ],
             kv_bufs.at[buf_idx],
             sems.at[buf_idx, 0],  # Only need one semaphore for fused copy
             page_indices_ref,
