@@ -82,7 +82,6 @@ def benchmark_backend(
             return ragged_paged_attention(
                 q,
                 kv_fused,
-                None,  # v parameter not used when kv_fused is provided
                 page_indices,
                 cu_q_lens,
                 cu_kv_lens,
