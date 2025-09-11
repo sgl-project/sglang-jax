@@ -186,12 +186,25 @@ class FlashAttention(AttentionBackend):
         Returns:
             Output tensor of shape [total_tokens, hidden_size]
         """
-        kv_buffer = self._get_and_set_kv_cache(k, v, forward_batch, layer.layer_id)
+        # Always get interleaved kv_buffer for cache operations
+        kv_buffer_interleaved = self._get_and_set_kv_cache(
+            k, v, forward_batch, layer.layer_id
+        )
 
         if layer.scaling is None:
             scale = 1.0 / jnp.sqrt(layer.head_dim)
         else:
             scale = layer.scaling
+
+        # Convert to head_dim concat format if TPU Commons optimization is enabled
+        if self.use_tpu_commons_optimization:
+            kv_buffer_for_computation = (
+                forward_batch.token_to_kv_pool._convert_interleaved_to_head_dim_concat(
+                    kv_buffer_interleaved
+                )
+            )
+        else:
+            kv_buffer_for_computation = kv_buffer_interleaved
 
         in_specs = (
             P(
@@ -259,11 +272,13 @@ class FlashAttention(AttentionBackend):
             check_vma=False,
         )(
             q.reshape(q.shape[0], -1, self.head_dim),
-            kv_buffer.reshape(
-                kv_buffer.shape[0] // self.page_size,
+            kv_buffer_for_computation.reshape(
+                kv_buffer_for_computation.shape[0] // self.page_size,
                 self.page_size,
-                kv_buffer.shape[1],  # heads dimension (varies by format)
-                kv_buffer.shape[2],  # last dimension (varies by format)
+                kv_buffer_for_computation.shape[
+                    1
+                ],  # heads dimension (varies by format)
+                kv_buffer_for_computation.shape[2],  # last dimension (varies by format)
             ),
             self.forward_metadata.page_indices,
             self.forward_metadata.cu_q_lens,
@@ -274,7 +289,7 @@ class FlashAttention(AttentionBackend):
 
         return (
             attn_output.reshape(q.shape[0], -1),
-            kv_buffer,
+            kv_buffer_interleaved,  # Return the original interleaved buffer for consistency
         )
 
     def _get_and_set_kv_cache(
@@ -300,14 +315,9 @@ class FlashAttention(AttentionBackend):
                 layer_id, forward_batch.out_cache_loc, k, v, is_decode=True
             )
 
-        if self.use_tpu_commons_optimization:
-            # TPU Commons strategy: convert interleaved storage to head_dim concat for computation
-            return forward_batch.token_to_kv_pool.get_head_dim_concat_kv_buffer(
-                layer_id
-            )
-        else:
-            # Standard strategy: use interleaved format directly
-            return forward_batch.token_to_kv_pool.get_fused_kv_buffer(layer_id)
+        # Always return interleaved format for cache consistency
+        # TPU Commons optimization will convert to head_dim concat format later for computation
+        return forward_batch.token_to_kv_pool.get_fused_kv_buffer(layer_id)
 
     def _convert_head_dim_concat_to_interleaved_for_kernel(
         self, head_dim_concat_kv: jax.Array
