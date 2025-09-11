@@ -255,6 +255,88 @@ def static_validate_inputs(
     del mask_value  # No consstraints on mask_value.
 
 
+def ref_ragged_paged_attention_fused(
+    queries: jax.Array,  # [max_num_batched_tokens, num_q_heads, head_dim]
+    kv_pages_fused: jax.Array,  # [total_num_pages, page_size, num_kv_heads, head_dim * 2]
+    kv_lens: jax.Array,  # i32[max_num_seqs]
+    page_indices: jax.Array,  # i32[max_num_seqs, pages_per_seq]
+    cu_q_lens: jax.Array,  # i32[max_num_seqs + 1]
+    num_seqs: jax.Array,  # i32[1],
+    *,
+    sm_scale: float = 1.0,
+    sliding_window: int | None = None,
+    soft_cap: float | None = None,
+    mask_value: float | None = DEFAULT_MASK_VALUE,
+    k_scale: float | None = None,
+    v_scale: float | None = None,
+):
+    """
+    Ragged paged attention reference implementation with fused KV cache.
+
+    This version accepts a fused KV cache where k and v are concatenated
+    along the head_dim axis, following tpu_commons v3 layout.
+
+    Args:
+        queries: Query tensor [max_num_batched_tokens, num_q_heads, head_dim]
+        kv_pages_fused: Fused KV cache [total_num_pages, page_size, num_kv_heads, head_dim * 2]
+                       Each kv_head contains [k_features, v_features]
+        Other args: Same as original ref_ragged_paged_attention
+    """
+    if mask_value is None:
+        mask_value = DEFAULT_MASK_VALUE
+
+    head_dim = queries.shape[-1]
+    num_q_heads = queries.shape[1]
+    num_kv_heads = kv_pages_fused.shape[-2]
+    assert num_q_heads % num_kv_heads == 0
+    num_query_per_kv = num_q_heads // num_kv_heads
+
+    outputs = []
+    for i in range(num_seqs[0]):
+        q_start = cu_q_lens[i]
+        q_end = cu_q_lens[i + 1]
+        q_len = q_end - q_start
+        kv_len = kv_lens[i]
+        indices = page_indices[i]
+        q = queries[q_start:q_end]
+
+        # Key change: extract k and v from fused KV cache
+        kv_fused = kv_pages_fused[indices, :, :, :].reshape(
+            -1, num_kv_heads, head_dim * 2
+        )[:kv_len]
+        k = kv_fused[:, :, :head_dim]  # Extract k from first half
+        v = kv_fused[:, :, head_dim:]  # Extract v from second half
+
+        # Apply scaling if provided
+        if k_scale is not None:
+            k = k.astype(jnp.float32) * k_scale
+            k = k.astype(q.dtype)
+        if v_scale is not None:
+            v = v.astype(jnp.float32) * v_scale
+            v = v.astype(q.dtype)
+
+        # Repeat for GQA
+        k = jnp.repeat(k, num_query_per_kv, axis=1)
+        v = jnp.repeat(v, num_query_per_kv, axis=1)
+
+        # Compute attention (same as original)
+        attn = jnp.einsum("qhd,khd->hqk", q, k, preferred_element_type=jnp.float32)
+        attn *= sm_scale
+        q_span = (kv_len - q_len) + jax.lax.broadcasted_iota(jnp.int32, attn.shape, 1)
+        kv_span = jax.lax.broadcasted_iota(jnp.int32, attn.shape, 2)
+        mask = q_span < kv_span
+        if sliding_window is not None:
+            mask = jnp.logical_or(mask, q_span - sliding_window >= kv_span)
+        if soft_cap is not None:
+            attn = soft_cap * jnp.tanh(attn / soft_cap)
+        attn += jnp.where(mask, mask_value, 0.0)
+        attn = jax.nn.softmax(attn, axis=-1).astype(v.dtype)
+        out = jnp.einsum("hqk,khd->qhd", attn, v).astype(queries.dtype)
+        outputs.append(out)
+
+    return jnp.concatenate(outputs, axis=0)
+
+
 def ref_ragged_paged_attention(
     queries: jax.Array,  # [max_num_batched_tokens, num_q_heads, head_dim]
     k_pages: jax.Array,  # [total_num_pages, page_size, num_kv_heads, head_dim]
@@ -322,13 +404,11 @@ def ragged_paged_attention_kernel(
     seq_lens_ref,
     # Input
     q_ref,  # [num_q_per_blk, num_q_heads_per_blk, head_dim]
-    k_cache_hbm_ref,  # [total_num_pages, page_size, num_kv_heads, head_dim]
-    v_cache_hbm_ref,  # [total_num_pages, page_size, num_kv_heads, head_dim]
+    kv_cache_hbm_ref,  # [total_num_pages, page_size, num_kv_heads, head_dim * 2]  # FUSED!
     # Output
     o_ref,  # [num_q_per_blk, num_q_heads_per_blk, head_dim]
     # Scratch
-    k_bufs,  # [2, num_kv_pages_per_blk, page_size, num_k_heads_per_blk, head_dim]
-    v_bufs,  # [2, num_kv_pages_per_blk, page_size, num_v_heads_per_blk, head_dim]
+    kv_bufs,  # [2, num_kv_pages_per_blk, page_size, num_kv_heads_per_blk, head_dim * 2]  # FUSED!
     sems,  # [2, 2]
     l_ref,  # [num_kv_heads_per_blk, num_q_per_blk * num_q_heads_per_kv_head, 128]
     m_ref,  # [num_kv_heads_per_blk, num_q_per_blk * num_q_heads_per_kv_head, 128]
@@ -345,8 +425,11 @@ def ragged_paged_attention_kernel(
         mask_value = DEFAULT_MASK_VALUE
     num_q_per_blk, num_q_heads_per_blk, head_dim = q_ref.shape
     num_seqs = num_seqs_ref[0]
-    assert k_bufs.shape == v_bufs.shape
-    _, num_kv_pages_per_blk, page_size, num_kv_heads_per_blk, _ = k_bufs.shape
+    # kv_bufs shape: [2, num_kv_pages_per_blk, page_size, num_kv_heads_per_blk, head_dim * 2]
+    _, num_kv_pages_per_blk, page_size, num_kv_heads_per_blk, fused_head_dim = (
+        kv_bufs.shape
+    )
+    assert fused_head_dim == head_dim * 2  # Verify fused dimension
     num_kv_per_blk = num_kv_pages_per_blk * page_size
     num_q_heads_per_kv_head = num_q_heads_per_blk // num_kv_heads_per_blk
     heads_blk_idx, q_blk_idx = (
@@ -359,28 +442,25 @@ def ragged_paged_attention_kernel(
     q_len_start = q_blk_idx * num_q_per_blk
     q_len_end = q_len_start + num_q_per_blk
 
-    def create_kv_async_copy_descriptors(heads_blk_idx, seq_idx, kv_blk_idx, buf_idx):
+    def create_fused_kv_async_copy_descriptor(
+        heads_blk_idx, seq_idx, kv_blk_idx, buf_idx
+    ):
         start_kv_page_idx = (
             cdiv(cu_kv_lens_ref[seq_idx], page_size) + kv_blk_idx * num_kv_pages_per_blk
         )
         end_kv_page_idx = cdiv(cu_kv_lens_ref[seq_idx + 1], page_size)
         metadata = (start_kv_page_idx, end_kv_page_idx)
         heads_start = heads_blk_idx * num_kv_heads_per_blk
-        async_copy_k = MultiPageAsyncCopyDescriptor(
-            k_cache_hbm_ref.at[:, :, pl.ds(heads_start, num_kv_heads_per_blk), :],
-            k_bufs.at[buf_idx],
-            sems.at[buf_idx, 0],
+
+        # Single async copy for fused KV cache
+        async_copy_kv = MultiPageAsyncCopyDescriptor(
+            kv_cache_hbm_ref.at[:, :, pl.ds(heads_start, num_kv_heads_per_blk), :],
+            kv_bufs.at[buf_idx],
+            sems.at[buf_idx, 0],  # Only need one semaphore for fused copy
             page_indices_ref,
             metadata,
         )
-        async_copy_v = MultiPageAsyncCopyDescriptor(
-            v_cache_hbm_ref.at[:, :, pl.ds(heads_start, num_kv_heads_per_blk), :],
-            v_bufs.at[buf_idx],
-            sems.at[buf_idx, 1],
-            page_indices_ref,
-            metadata,
-        )
-        return async_copy_k, async_copy_v
+        return async_copy_kv
 
     def strided_load_kv(ref, start, step):
         if ref.dtype == jnp.float32:
@@ -432,11 +512,10 @@ def ragged_paged_attention_kernel(
 
     @pl.when(heads_blk_idx + q_blk_idx == 0)
     def prefetch_first_kv_blk():
-        async_copy_k, async_copy_v = create_kv_async_copy_descriptors(
+        async_copy_kv = create_fused_kv_async_copy_descriptor(
             heads_blk_idx, init_seq_idx, 0, init_buf_idx
         )
-        async_copy_k.start()
-        async_copy_v.start()
+        async_copy_kv.start()
 
     def is_cur_q_blk_needed(q_states):
         done, cur_seq_idx, _ = q_states
@@ -687,23 +766,21 @@ def ragged_paged_attention_kernel(
             @pl.when(next_heads_blk_idx < num_heads_blks)
             def prefetch_next_kv_blk():
                 # DMA to fixed size buffer!
-                next_async_copy_k, next_async_copy_v = create_kv_async_copy_descriptors(
+                next_async_copy_kv = create_fused_kv_async_copy_descriptor(
                     next_heads_blk_idx, next_seq_idx, next_kv_blk_idx, next_buf_idx
                 )
-                next_async_copy_k.start()
-                next_async_copy_v.start()
+                next_async_copy_kv.start()
 
-            cur_async_copy_k, cur_async_copy_v = create_kv_async_copy_descriptors(
+            cur_async_copy_kv = create_fused_kv_async_copy_descriptor(
                 heads_blk_idx, cur_seq_idx, kv_blk_idx, cur_buf_idx
             )
-            k_ref = cur_async_copy_k.wait().reshape(
+            kv_ref_fused = cur_async_copy_kv.wait().reshape(
                 num_kv_pages_per_blk * page_size * num_kv_heads_per_blk,
-                head_dim,
+                head_dim * 2,  # Fused dimension
             )
-            v_ref = cur_async_copy_v.wait().reshape(
-                num_kv_pages_per_blk * page_size * num_kv_heads_per_blk,
-                head_dim,
-            )
+            # Extract k and v from fused KV in VMEM
+            k_ref = kv_ref_fused[:, :head_dim]  # First half is k
+            v_ref = kv_ref_fused[:, head_dim:]  # Second half is v
 
             q_batch = batch_prepare_queries(
                 q_ref, num_kv_heads_per_blk, num_q_heads_per_kv_head
@@ -804,8 +881,7 @@ def get_min_heads_per_blk(num_q_heads, num_kv_heads, q_dtype, kv_dtype):
 )
 def ragged_paged_attention(
     q: jax.Array,  # [max_num_batched_tokens, num_q_heads, head_dim]
-    k_cache: jax.Array,  # [total_num_pages, page_size, num_k_heads, head_dim]
-    v_cache: jax.Array,  # [total_num_pages, page_size, num_v_heads, head_dim]
+    kv_cache_fused: jax.Array,  # [total_num_pages, page_size, num_kv_heads, head_dim * 2]
     page_indices: jax.Array,  # i32[num_pages]
     cu_q_lens: jax.Array,  # i32[max_num_seqs + 1]
     cu_kv_lens: jax.Array,  # i32[max_num_seqs + 1]
@@ -848,31 +924,16 @@ def ragged_paged_attention(
     Returns:
       The output of the attention.
     """
-    static_validate_inputs(
-        q,
-        k_cache,
-        v_cache,
-        page_indices,
-        cu_q_lens,
-        cu_kv_lens,
-        num_seqs,
-        seq_lens,
-        sm_scale=sm_scale,
-        sliding_window=sliding_window,
-        soft_cap=soft_cap,
-        mask_value=mask_value,
-        k_scale=k_scale,
-        v_scale=v_scale,
-        num_kv_pages_per_block=num_kv_pages_per_block,
-        num_queries_per_block=num_queries_per_block,
-        vmem_limit_bytes=vmem_limit_bytes,
-    )
+    # TODO: Update static_validate_inputs for fused KV cache
     if mask_value is None:
         mask_value = DEFAULT_MASK_VALUE
     num_q_tokens, num_q_heads, head_dim = q.shape
-    _, page_size, num_kv_heads, _ = k_cache.shape
+    _, page_size, num_kv_heads, fused_head_dim = kv_cache_fused.shape
+    assert (
+        fused_head_dim == head_dim * 2
+    ), f"Expected fused head_dim={head_dim * 2}, got {fused_head_dim}"
     num_q_heads_per_blk, num_kv_heads_per_blk = get_min_heads_per_blk(
-        num_q_heads, num_kv_heads, q.dtype, k_cache.dtype
+        num_q_heads, num_kv_heads, q.dtype, kv_cache_fused.dtype
     )
 
     num_q_per_blk = num_queries_per_block
@@ -880,7 +941,7 @@ def ragged_paged_attention(
     if num_q_per_blk is None or num_kv_pages_per_blk is None:
         num_kv_pages_per_blk, num_q_per_blk = get_tuned_block_sizes(
             q.dtype,
-            k_cache.dtype,
+            kv_cache_fused.dtype,
             num_kv_heads,
             head_dim,
             page_size,
@@ -914,20 +975,19 @@ def ragged_paged_attention(
         (num_q_per_blk, num_q_heads_per_blk, head_dim),
         jnp.float32,
     )
-    double_kv_buf_scratch = pltpu.VMEM(
+    double_fused_kv_buf_scratch = pltpu.VMEM(
         (
             2,  # For double buffering during DMA copies.
             num_kv_pages_per_blk,
             page_size,
             num_kv_heads_per_blk,
-            head_dim,
+            head_dim * 2,  # Fused K and V
         ),
-        k_cache.dtype,
+        kv_cache_fused.dtype,
     )
     scratch_shapes = [
-        double_kv_buf_scratch,  # k_bufs
-        double_kv_buf_scratch,  # v_bufs
-        pltpu.SemaphoreType.DMA((2, 2)),  # Semaphores for k, v double buffers.
+        double_fused_kv_buf_scratch,  # fused kv_bufs
+        pltpu.SemaphoreType.DMA((2, 2)),  # Semaphores for double buffers.
         lm_scratch,  # l_ref
         lm_scratch,  # m_ref
         acc_scratch,
@@ -969,4 +1029,4 @@ def ragged_paged_attention(
         name="ragged_paged_attention_kernel",
     )
 
-    return kernel(*scalar_prefetches, q, k_cache, v_cache)
+    return kernel(*scalar_prefetches, q, kv_cache_fused)

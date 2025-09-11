@@ -180,7 +180,7 @@ class FlashAttention(AttentionBackend):
         Returns:
             Output tensor of shape [total_tokens, hidden_size]
         """
-        k_buffer, v_buffer = self._get_and_set_kv_cache(
+        fused_kv_buffer = self._get_and_set_kv_cache(
             k, v, forward_batch, layer.layer_id
         )
 
@@ -204,24 +204,18 @@ class FlashAttention(AttentionBackend):
         out_specs = P(None, self.kv_partition_axis)
 
         def _ragged_paged_attention(*args):
-            q, k_buffer, v_buffer = args[:3]
-            other_args = args[3:]
+            q, fused_kv_buffer = args[:2]
+            other_args = args[2:]
 
-            # Since we now use pre-padded kv heads, ensure they are always even
-            assert k_buffer.shape[-2] % 2 == 0, (
-                f"k_buffer kv_heads={k_buffer.shape[-2]} should be even after pre-padding. "
-                "This indicates a configuration issue with kv heads padding."
-            )
-            assert v_buffer.shape[-2] % 2 == 0, (
-                f"v_buffer kv_heads={v_buffer.shape[-2]} should be even after pre-padding. "
-                "This indicates a configuration issue with kv heads padding."
-            )
-
+            # Pass the fused KV buffer directly to the kernel
             return ragged_paged_attention(
                 q,
-                k_buffer,
-                v_buffer,
-                *other_args,
+                kv_cache_fused=fused_kv_buffer,
+                page_indices=other_args[0],
+                cu_q_lens=other_args[1],
+                cu_kv_lens=other_args[2],
+                num_seqs=other_args[3],
+                seq_lens=other_args[4],
                 sm_scale=scale,
                 sliding_window=None,
                 soft_cap=None,
@@ -232,16 +226,24 @@ class FlashAttention(AttentionBackend):
         attn_output = jax.shard_map(
             _ragged_paged_attention,
             mesh=jax.sharding.get_abstract_mesh(),
-            in_specs=in_specs,
-            out_specs=out_specs,
+            in_specs=(
+                P(None, self.kv_partition_axis),  # q
+                P(None, None, self.kv_partition_axis, None),  # fused_kv_buffer
+                P(),  # page_indices
+                P(),  # cu_q_lens
+                P(),  # cu_kv_lens
+                P(),  # num_seqs
+                P(),  # seq_lens
+            ),
+            out_specs=P(None, self.kv_partition_axis),
             check_vma=False,
         )(
             q.reshape(q.shape[0], -1, self.head_dim),
-            k_buffer.reshape(
-                k_buffer.shape[0] // self.page_size, self.page_size, -1, self.head_dim
-            ),
-            v_buffer.reshape(
-                v_buffer.shape[0] // self.page_size, self.page_size, -1, self.head_dim
+            fused_kv_buffer.reshape(
+                fused_kv_buffer.shape[0] // self.page_size,
+                self.page_size,
+                -1,
+                self.head_dim * 2,
             ),
             self.forward_metadata.page_indices,
             self.forward_metadata.cu_q_lens,
@@ -252,8 +254,7 @@ class FlashAttention(AttentionBackend):
 
         return (
             attn_output.reshape(q.shape[0], -1),
-            k_buffer,
-            v_buffer,
+            fused_kv_buffer,
         )
 
     def _get_and_set_kv_cache(
@@ -262,9 +263,9 @@ class FlashAttention(AttentionBackend):
         v: jax.Array,
         forward_batch: ForwardBatch,
         layer_id: int,
-    ) -> Tuple[jax.Array, jax.Array]:
+    ) -> jax.Array:
         """
-        Get the kv cache from the forward batch.
+        Get the fused kv cache from the forward batch.
         """
         if forward_batch.forward_mode == ForwardMode.EXTEND:
             forward_batch.token_to_kv_pool.set_kv_buffer(
@@ -275,7 +276,9 @@ class FlashAttention(AttentionBackend):
                 layer_id, forward_batch.out_cache_loc, k, v, is_decode=True
             )
 
-        return forward_batch.token_to_kv_pool.get_kv_buffer(layer_id)
+        # Return the fused KV buffer directly
+        layer_idx = layer_id - forward_batch.token_to_kv_pool.start_layer
+        return forward_batch.token_to_kv_pool.kv_buffer[layer_idx]
 
     @staticmethod
     def get_max_running_reqests(max_context_len: int, page_size: int) -> int:
