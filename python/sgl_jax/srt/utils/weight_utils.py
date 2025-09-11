@@ -144,6 +144,7 @@ class WeightLoader:
 
         if moe_mappings:
             self._process_moe_expert_weights(params, moe_mappings, expert_weights)
+            nnx.update(self.model, params)
 
     def _iterate_weights(self):
 
