@@ -27,12 +27,12 @@ DEFAULT_MASK_VALUE = -0.7 * float(jnp.finfo(jnp.dtype("float32")).max)
 
 
 def ref_ragged_paged_attention(
-    queries: jax.Array,  # [max_num_batched_tokens, num_q_heads, head_dim]
+    queries: jax.Array,  # [padded_num_tokens, num_q_heads, head_dim]
     k_pages: jax.Array,  # [total_num_pages, page_size, num_kv_heads, head_dim]
     v_pages: jax.Array,  # [total_num_pages, page_size, num_kv_heads, head_dim]
-    kv_lens: jax.Array,  # i32[max_num_seqs]
-    page_indices: jax.Array,  # i32[max_num_seqs, pages_per_seq]
-    cu_q_lens: jax.Array,  # i32[max_num_seqs + 1]
+    kv_lens: jax.Array,  # i32[padded_batch_size]
+    page_indices: jax.Array,  # i32[(padded_batch_size * model_context_len + page_size - 1) // page_size]
+    cu_q_lens: jax.Array,  # i32[padded_batch_size + 1]
     num_seqs: jax.Array,  # i32[1],
     *,
     sm_scale: float = 1.0,
@@ -161,18 +161,18 @@ def get_kv_cache_shape(
 
 def _ragged_paged_attention_kernel(
     # Prefetch
-    kv_lens_ref,  # [max_num_seqs]
-    page_indices_ref,  # [max_num_seqs * pages_per_seq]
-    cu_q_lens_ref,  # [max_num_seqs + 1]
-    cu_kv_lens_ref,  # [max_num_seqs + 1]
+    kv_lens_ref,  # [padded_batch_size]
+    page_indices_ref,  # [(padded_batch_size * model_context_len + page_size - 1) // page_size]
+    cu_q_lens_ref,  # [padded_batch_size + 1]
+    cu_kv_lens_ref,  # [padded_batch_size + 1]
     distribution_ref,  # [3] (decode_end, prefill_end, mixed_end)
     sem_ids_ref,  # [3] (bq_sem_idx, bkv_sem_idx, bo_sem_idx)
     bo_ids_ref,  # [4] (bo_sem_0_seq_idx, bo_sem_1_seq_idx, bo_sem_0_bo_idx, bo_sem_1_bo_idx)
     bkv_update_ids_ref,  # [6] (bkv_sem_0_seq_idx, bkv_sem_1_seq_idx, bkv_sem_0_offset, bkv_sem_1_offset, bkv_sem_0_sz, bkv_sem_1_sz)
     # Input
-    q_hbm_ref,  # [actual_num_kv_heads, max_num_tokens, num_q_heads_per_kv_head // q_packing, q_packing, head_dim]
-    k_hbm_ref,  # [max_num_tokens, num_kv_heads // kv_packing, kv_packing, head_dim]
-    v_hbm_ref,  # [max_num_tokens, num_kv_heads // kv_packing, kv_packing, head_dim]
+    q_hbm_ref,  # [actual_num_kv_heads, padded_num_tokens, num_q_heads_per_kv_head // q_packing, q_packing, head_dim]
+    k_hbm_ref,  # [padded_num_tokens, num_kv_heads // kv_packing, kv_packing, head_dim]
+    v_hbm_ref,  # [padded_num_tokens, num_kv_heads // kv_packing, kv_packing, head_dim]
     k_cache_hbm_ref,  # [total_num_pages, page_size, num_kv_heads // kv_packing, kv_packing, head_dim]
     v_cache_hbm_ref,  # [total_num_pages, page_size, num_kv_heads // kv_packing, kv_packing, head_dim]
     # Output
@@ -1215,15 +1215,15 @@ def static_validate_inputs(
     donate_argnames=("k_cache", "v_cache"),
 )
 def ragged_paged_attention(
-    queries: jax.Array,  # [max_num_tokens, actual_num_q_heads, actual_head_dim]
-    keys: jax.Array,  # [max_num_tokens, actual_num_kv_heads, actual_head_dim]
-    values: jax.Array,  # [max_num_tokens, actual_num_kv_heads, actual_head_dim]
+    queries: jax.Array,  # [padded_num_tokens, actual_num_q_heads, actual_head_dim]
+    keys: jax.Array,  # [padded_num_tokens, actual_num_kv_heads, actual_head_dim]
+    values: jax.Array,  # [padded_num_tokens, actual_num_kv_heads, actual_head_dim]
     k_cache: jax.Array,  # [total_num_pages, page_size, actual_num_kv_heads, actual_head_dim]
     v_cache: jax.Array,  # [total_num_pages, page_size, actual_num_kv_heads, actual_head_dim]
-    kv_lens: jax.Array,  # i32[max_num_seqs]
-    page_indices: jax.Array,  # i32[max_num_seqs * pages_per_seq]
-    cu_q_lens: jax.Array,  # i32[max_num_seqs + 1]
-    cu_kv_lens: jax.Array,  # i32[max_num_seqs + 1]
+    kv_lens: jax.Array,  # i32[padded_batch_size]
+    page_indices: jax.Array,  # i32[(padded_batch_size * model_context_len + page_size - 1) // page_size]
+    cu_q_lens: jax.Array,  # i32[padded_batch_size + 1]
+    cu_kv_lens: jax.Array,  # i32[padded_batch_size + 1]
     distribution: jax.Array,  # i32[3]
     *,
     sm_scale: float = 1.0,
@@ -1250,7 +1250,7 @@ def ragged_paged_attention(
       values: concatenated all sequences' values (quantized).
       kv_cache: paged KV cache with TPU-friendly shape.
       kv_lens: padded kv lengths. Only the first num_seqs values are valid.
-      page_indices: flattened page indices look-up table by (seq_id, page_id).
+      page_indices: flattened page indices look-up table.
       cu_q_lens: the cumulative sum of the effective query lengths. Similar to
         kv_lens, only the first num_seqs+1 values are valid.
       distribution: (i, j, k) represents that sequences[0:i] are decode-only,
