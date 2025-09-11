@@ -334,7 +334,7 @@ def ragged_paged_attention_kernel(
     seq_lens_ref,
     # Input
     q_ref,  # [num_q_per_blk, num_q_heads_per_blk, head_dim]
-    kv_cache_hbm_ref,  # [total_num_pages, page_size, num_kv_heads * 2, head_dim] - K&V interleaved
+    kv_cache_hbm_ref,  # [total_num_pages, page_size, num_kv_heads, head_dim * 2] - K&V concatenated in head_dim
     # Output
     o_ref,  # [num_q_per_blk, num_q_heads_per_blk, head_dim]
     # Scratch
@@ -411,23 +411,17 @@ def ragged_paged_attention_kernel(
         b = jnp.left_shift(b, bw * (packing - 1))
         return pltpu.bitcast(b, jnp.float32).astype(jnp.bfloat16)
 
-    def extract_interleaved_kv(ref, offset, num_kv_heads_per_blk):
-        """Extract K or V from interleaved KV data"""
-        # ref shape: [pages, seq, fused_heads, head_dim] where fused_heads = num_kv_heads_per_blk * 2
-        # offset: 0 for K heads, 1 for V heads
+    def extract_head_dim_fused_kv(ref, is_v_heads, head_dim):
+        """Extract K or V from head_dim concatenated KV data"""
+        # ref shape: [pages, seq, num_kv_heads, head_dim * 2] where last dim is [k_dims, v_dims]
+        # is_v_heads: False for K heads, True for V heads
 
-        # Use a simpler approach with explicit loops to avoid complex indexing
-        # that TPU doesn't support
-        results = []
-        for head_idx in range(num_kv_heads_per_blk):
-            # Calculate the actual head index in the fused array
-            actual_head_idx = head_idx * 2 + offset
-            # Extract this head: [pages, seq, head_dim]
-            head_data = ref[:, :, actual_head_idx, :]
-            results.append(head_data)
-
-        # Stack along the head dimension: [pages, seq, num_kv_heads_per_blk, head_dim]
-        return jnp.stack(results, axis=2)
+        if is_v_heads:
+            # Extract V heads from second half: [..., head_dim:]
+            return ref[:, :, :, head_dim:]
+        else:
+            # Extract K heads from first half: [..., :head_dim]
+            return ref[:, :, :, :head_dim]
 
     def fold_on_2nd_minor(vec):
         assert vec.dtype == jnp.bfloat16 or vec.dtype == jnp.float32
@@ -730,15 +724,13 @@ def ragged_paged_attention_kernel(
             # Wait for fused KV data and separate K and V
             fused_kv_data = (
                 cur_async_copy_fused_kv.wait()
-            )  # [num_kv_pages_per_blk, page_size, num_kv_heads_per_blk * 2, head_dim]
+            )  # [num_kv_pages_per_blk, page_size, num_kv_heads_per_blk, head_dim * 2]
 
-            # Split interleaved KV data: k1,v1,k2,v2,k3,v3 -> separate K and V
-            k_data = extract_interleaved_kv(
-                fused_kv_data, 0, num_kv_heads_per_blk
+            # Split head_dim concatenated KV data: [k_dims, v_dims] -> separate K and V
+            k_data = extract_head_dim_fused_kv(
+                fused_kv_data, False, head_dim
             )  # K heads
-            v_data = extract_interleaved_kv(
-                fused_kv_data, 1, num_kv_heads_per_blk
-            )  # V heads
+            v_data = extract_head_dim_fused_kv(fused_kv_data, True, head_dim)  # V heads
 
             k_ref = k_data.reshape(
                 num_kv_pages_per_blk * page_size * num_kv_heads_per_blk,
@@ -848,7 +840,7 @@ def get_min_heads_per_blk(num_q_heads, num_kv_heads, q_dtype, kv_dtype):
 )
 def ragged_paged_attention(
     q: jax.Array,  # [max_num_batched_tokens, num_q_heads, head_dim]
-    kv_cache: jax.Array,  # [total_num_pages, page_size, num_kv_heads * 2, head_dim] - K and V interleaved
+    kv_cache: jax.Array,  # [total_num_pages, page_size, num_kv_heads, head_dim * 2] - K and V concatenated in head_dim
     page_indices: jax.Array,  # i32[num_pages]
     cu_q_lens: jax.Array,  # i32[max_num_seqs + 1]
     cu_kv_lens: jax.Array,  # i32[max_num_seqs + 1]
