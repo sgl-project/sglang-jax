@@ -260,15 +260,15 @@ class MHATokenToKVPool(KVCache):
             self.mesh, P(None, self.kv_partition_axis, None)
         )
 
-        logger.info(f"Creating head_dim fused KV buffers for {self.layer_num} layers")
+        logger.info(f"Creating interleaved KV buffers for {self.layer_num} layers")
         start_time = time.time()
 
-        # Head_dim fused buffer shape: K and V concatenated in head_dim dimension
-        # Layout: [tokens, num_heads, head_dim * 2] where head_dim*2 = [K_dims, V_dims]
+        # Interleaved fused buffer shape: K and V interleaved in head dimension
+        # Layout: [tokens, num_heads * 2, head_dim] where heads = [k1, v1, k2, v2, ...]
         fused_buffer_shape = (
             self.size + self.page_size,
-            self.head_num,
-            self.head_dim * 2,  # K and V concatenated in head_dim
+            self.head_num * 2,  # K and V interleaved: [k1, v1, k2, v2, ...]
+            self.head_dim,
         )
         logger.info(
             f"Total fused KV cache memory per layer: {fused_buffer_shape[0] * fused_buffer_shape[1] * fused_buffer_shape[2] / 1024**3:.2f} GB, dtype: {self.dtype}"
@@ -335,45 +335,43 @@ class MHATokenToKVPool(KVCache):
         return equivalent_k_size, equivalent_v_size
 
     def get_key_buffer(self, layer_id: int) -> jnp.ndarray:
-        """Extract K buffer from head_dim fused KV cache"""
+        """Extract K buffer from interleaved KV cache"""
         fused_kv = self.kv_buffer[layer_id - self.start_layer]
-        # Extract K from head_dim concatenation: [tokens, heads, head_dim*2]
-        # K is the first half: [:, :, :head_dim]
-        return fused_kv[:, :, : self.head_dim]
+        # Extract K from interleaved format: [tokens, heads*2, head_dim]
+        # K heads are at even indices: [0, 2, 4, ...]
+        return fused_kv[:, ::2, :]
 
     def get_value_buffer(self, layer_id: int) -> jnp.ndarray:
-        """Extract V buffer from head_dim fused KV cache"""
+        """Extract V buffer from interleaved KV cache"""
         fused_kv = self.kv_buffer[layer_id - self.start_layer]
-        # Extract V from head_dim concatenation: [tokens, heads, head_dim*2]
-        # V is the second half: [:, :, head_dim:]
-        return fused_kv[:, :, self.head_dim :]
+        # Extract V from interleaved format: [tokens, heads*2, head_dim]
+        # V heads are at odd indices: [1, 3, 5, ...]
+        return fused_kv[:, 1::2, :]
 
     def get_kv_buffer(self, layer_id: int) -> Tuple[jnp.ndarray, jnp.ndarray]:
-        """Get K and V buffers from head_dim fused cache"""
-        fused_kv = self.kv_buffer[layer_id - self.start_layer]
-        # Extract from head_dim concatenation: [tokens, heads, head_dim*2]
-        k_buffer = fused_kv[:, :, : self.head_dim]  # First half
-        v_buffer = fused_kv[:, :, self.head_dim :]  # Second half
-        return k_buffer, v_buffer
+        """Get K and V buffers from interleaved cache"""
+        return self.get_key_buffer(layer_id), self.get_value_buffer(layer_id)
 
     def get_fused_kv_buffer(self, layer_id: int) -> jnp.ndarray:
         """Get the fused KV buffer directly (for FlashAttention backend)"""
         return self.kv_buffer[layer_id - self.start_layer]
 
-    def _fuse_kv_head_dim(self, k: jax.Array, v: jax.Array) -> jax.Array:
+    def _interleave_kv_heads(self, k: jax.Array, v: jax.Array) -> jax.Array:
         """
-        Fuse K and V by concatenating in head_dim dimension: [k_dims, v_dims]
+        Fuse K and V by interleaving heads: [k1, v1, k2, v2, ...]
 
         Args:
             k: Key tensor [total_tokens, num_heads, head_dim]
             v: Value tensor [total_tokens, num_heads, head_dim]
 
         Returns:
-            Head_dim fused tensor [total_tokens, num_heads, head_dim * 2]
+            Interleaved tensor [total_tokens, num_heads * 2, head_dim]
         """
-        # Concatenate K and V in the head_dim dimension (axis=-1)
-        # Layout: [k_dim1, k_dim2, ..., k_dimN, v_dim1, v_dim2, ..., v_dimN]
-        return jnp.concatenate([k, v], axis=-1)
+        # Stack K and V and reshape to interleaved format
+        # Layout: [k1, v1, k2, v2, k3, v3, ...]
+        return jnp.stack([k, v], axis=-2).reshape(
+            k.shape[0], k.shape[1] * 2, k.shape[2]
+        )
 
     def set_kv_buffer(
         self,
@@ -398,12 +396,12 @@ class MHATokenToKVPool(KVCache):
 
         page_size = 1 if is_decode else self.page_size
 
-        # Fuse K and V tensors in head_dim dimension: [total_tokens, num_heads, head_dim * 2]
-        # Layout: [k_dims, v_dims] for each head
-        fused_kv = self._fuse_kv_head_dim(k, v)
+        # Fuse K and V tensors in interleaved format: [total_tokens, num_heads * 2, head_dim]
+        # Layout: [k1, v1, k2, v2, ...] for heads
+        fused_kv = self._interleave_kv_heads(k, v)
 
-        # Use the head_dim fused KV update implementation
-        self.kv_buffer[layer_idx] = _set_head_dim_fused_kv_buffer(
+        # Use the interleaved KV update implementation
+        self.kv_buffer[layer_idx] = _set_interleaved_kv_buffer(
             fused_kv=fused_kv,
             loc=loc,
             kv_cache=self.kv_buffer[layer_idx],
@@ -501,28 +499,28 @@ def _set_kv_buffer(
     return k_cache, v_cache
 
 
-def _set_head_dim_fused_kv_buffer(
-    fused_kv: jax.Array,  # [total_tokens, num_heads, head_dim * 2] - K and V in head_dim
+def _set_interleaved_kv_buffer(
+    fused_kv: jax.Array,  # [total_tokens, num_heads * 2, head_dim] - K and V interleaved
     loc: jax.Array,  # [total_tokens] - cache locations, -1 for padding
-    kv_cache: jax.Array,  # [cache_size, num_heads, head_dim * 2] - head_dim fused cache buffer
+    kv_cache: jax.Array,  # [cache_size, num_heads * 2, head_dim] - interleaved cache buffer
     page_size: int,
     kv_partition_axis: str = "tensor",
 ):
     """
-    Set head_dim fused KV cache data where K and V are concatenated in head_dim dimension.
+    Set interleaved KV cache data where K and V heads are interleaved.
 
     Args:
-        fused_kv: Head_dim fused KV tensor [total_tokens, num_heads, head_dim * 2]
-                 Layout: [k_dims, v_dims] for each head
+        fused_kv: Interleaved KV tensor [total_tokens, num_heads * 2, head_dim]
+                 Layout: [k1, v1, k2, v2, ...] for heads
         loc: Location indices [total_tokens], -1 for padding tokens
-        kv_cache: Head_dim fused KV cache buffer [cache_size, num_heads, head_dim * 2]
+        kv_cache: Interleaved KV cache buffer [cache_size, num_heads * 2, head_dim]
         page_size: Page size for updates
         kv_partition_axis: Partitioning axis
 
     Returns:
-        Updated head_dim fused KV cache
+        Updated interleaved KV cache
     """
-    kv_cache = update_head_dim_fused_kv_cache(
+    kv_cache = update_interleaved_kv_cache(
         fused_kv,
         loc,
         kv_cache,
@@ -532,19 +530,19 @@ def _set_head_dim_fused_kv_buffer(
     return kv_cache
 
 
-def update_head_dim_fused_kv_cache(
-    fused_kv: jax.Array,  # [total_tokens, num_heads, head_dim * 2]
+def update_interleaved_kv_cache(
+    fused_kv: jax.Array,  # [total_tokens, num_heads * 2, head_dim]
     loc: jax.Array,  # [total_tokens], -1 for padding
-    kv_cache: jax.Array,  # [cache_size, num_heads, head_dim * 2] - head_dim fused cache
+    kv_cache: jax.Array,  # [cache_size, num_heads * 2, head_dim] - interleaved cache
     page_size: int = 1,
     kv_partition_axis: str = "tensor",
 ):
     """
-    Update head_dim fused KV cache where K and V are concatenated in head_dim dimension.
+    Update interleaved KV cache where K and V heads are interleaved.
     This is the TPU Commons style implementation with better performance.
     """
-    # Use the vectorized update logic for head_dim fused data
-    return update_head_dim_fused_kv_cache_vectorized(
+    # Use the vectorized update logic for interleaved data
+    return update_interleaved_kv_cache_vectorized(
         fused_kv,
         loc,
         kv_cache,
@@ -553,21 +551,21 @@ def update_head_dim_fused_kv_cache(
     )
 
 
-def update_head_dim_fused_kv_cache_vectorized(
-    fused_kv: jax.Array,  # [total_tokens, num_heads, head_dim * 2]
+def update_interleaved_kv_cache_vectorized(
+    fused_kv: jax.Array,  # [total_tokens, num_heads * 2, head_dim]
     loc: jax.Array,  # [total_tokens], -1 for padding
-    kv_cache: jax.Array,  # [cache_size, num_heads, head_dim * 2]
+    kv_cache: jax.Array,  # [cache_size, num_heads * 2, head_dim]
     page_size: int,
     kv_partition_axis: str = "tensor",
 ):
     """
-    Vectorized head_dim fused KV cache update. TPU Commons style implementation.
-    K and V are concatenated in head_dim dimension for better cache performance.
+    Vectorized interleaved KV cache update. TPU Commons style implementation.
+    K and V heads are interleaved for better cache performance.
     """
     total_tokens = loc.shape[0]
     loc = loc.astype(jnp.int32)
 
-    # Simplified update logic for head_dim fused data - treats as single tensor
+    # Simplified update logic for interleaved data - treats as single tensor
     kv_cache_locs = jnp.where(loc == -1, 0, loc).astype(jnp.int32)
     new_kv_locs = jnp.arange(total_tokens, dtype=jnp.int32)
     slice_lens = jnp.where(loc == -1, 0, 1).astype(jnp.int32)

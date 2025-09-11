@@ -193,7 +193,7 @@ class FlashAttention(AttentionBackend):
             ),  # q shape: [batched_tokens, head_num, head_dim]
             P(
                 None, None, self.kv_partition_axis, None
-            ),  # kv_buffer shape: [pages, page_size, num_kv_heads, head_dim * 2]
+            ),  # kv_buffer shape: [pages, page_size, num_kv_heads * 2, head_dim]
             P(),  # page_indices
             P(),  # cu_q_lens
             P(),  # cu_kv_lens
@@ -206,14 +206,17 @@ class FlashAttention(AttentionBackend):
             q, kv_buffer = args[:2]
             other_args = args[2:]
 
-            # KV buffer has shape [..., actual_num_kv_heads, head_dim * 2] in head_dim concatenated format
-            # The actual_num_kv_heads comes from the memory pool and may be different from self.num_kv_heads
-            # which represents per-device heads
-            actual_num_kv_heads = kv_buffer.shape[-2]
-            assert actual_num_kv_heads % 2 == 0, (
-                f"actual_num_kv_heads={actual_num_kv_heads} should be even for TPU tiling requirements. "
+            # KV buffer has shape [..., fused_kv_heads, head_dim] in interleaved format [k1, v1, k2, v2, ...]
+            # Ensure kv_heads is even for TPU tiling requirements
+            fused_kv_heads = kv_buffer.shape[-2]
+            assert fused_kv_heads % 2 == 0, (
+                f"fused_kv_heads={fused_kv_heads} should be even for interleaved format. "
                 f"kv_buffer shape: {kv_buffer.shape}"
             )
+            num_kv_heads = fused_kv_heads // 2
+            assert (
+                num_kv_heads % 2 == 0
+            ), f"num_kv_heads={num_kv_heads} should be even for TPU tiling requirements."
 
             return ragged_paged_attention(
                 q,
@@ -237,8 +240,10 @@ class FlashAttention(AttentionBackend):
             kv_buffer.reshape(
                 kv_buffer.shape[0] // self.page_size,
                 self.page_size,
-                kv_buffer.shape[1],  # actual num_kv_heads from memory pool
-                kv_buffer.shape[2],  # head_dim * 2
+                kv_buffer.shape[
+                    1
+                ],  # fused_kv_heads = num_kv_heads * 2 from memory pool
+                kv_buffer.shape[2],  # head_dim
             ),
             self.forward_metadata.page_indices,
             self.forward_metadata.cu_q_lens,
@@ -262,8 +267,8 @@ class FlashAttention(AttentionBackend):
         """
         Get the fused kv cache from the forward batch.
 
-        The memory pool stores K and V concatenated in head_dim: shape [..., num_kv_heads, head_dim * 2]
-        The kernel now directly supports this head_dim concatenated format.
+        The memory pool stores K and V in interleaved format: shape [..., num_kv_heads * 2, head_dim]
+        The kernel directly supports this interleaved format.
         """
         if forward_batch.forward_mode == ForwardMode.EXTEND:
             forward_batch.token_to_kv_pool.set_kv_buffer(
