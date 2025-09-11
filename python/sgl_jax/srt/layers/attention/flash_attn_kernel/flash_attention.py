@@ -774,13 +774,19 @@ def ragged_paged_attention_kernel(
             cur_async_copy_kv = create_fused_kv_async_copy_descriptor(
                 heads_blk_idx, cur_seq_idx, kv_blk_idx, cur_buf_idx
             )
-            kv_ref_fused = cur_async_copy_kv.wait().reshape(
-                num_kv_pages_per_blk * page_size * num_kv_heads_per_blk,
-                head_dim * 2,  # Fused dimension
+            # VMEM 优化：避免不必要的 reshape，4D 切片后再 reshape
+            kv_buf_fused = (
+                cur_async_copy_kv.wait()
+            )  # [num_kv_pages_per_blk, page_size, num_kv_heads_per_blk, head_dim * 2]
+
+            # Extract k and v directly from 4D tensor, then reshape only once
+            # 这比先 reshape 再切片更高效，减少 VMEM 内存操作
+            k_ref = kv_buf_fused[..., :head_dim].reshape(
+                num_kv_pages_per_blk * page_size * num_kv_heads_per_blk, head_dim
             )
-            # Extract k and v from fused KV in VMEM
-            k_ref = kv_ref_fused[:, :head_dim]  # First half is k
-            v_ref = kv_ref_fused[:, head_dim:]  # Second half is v
+            v_ref = kv_buf_fused[..., head_dim:].reshape(
+                num_kv_pages_per_blk * page_size * num_kv_heads_per_blk, head_dim
+            )
 
             q_batch = batch_prepare_queries(
                 q_ref, num_kv_heads_per_blk, num_q_heads_per_kv_head
