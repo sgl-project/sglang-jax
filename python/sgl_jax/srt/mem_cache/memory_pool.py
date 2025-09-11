@@ -49,16 +49,8 @@ def merge_kv(k: jax.Array, v: jax.Array) -> jax.Array:
 # These functions are kept only for backward compatibility with existing code
 
 
-def extract_k_from_fused_kv(kv: jax.Array) -> jax.Array:
-    """Extract k tensor from fused KV cache (compatibility function)."""
-    # Head interleaving: K is at even indices (0, 2, 4, ...)
-    return kv[:, ::2, :]
-
-
-def extract_v_from_fused_kv(kv: jax.Array) -> jax.Array:
-    """Extract v tensor from fused KV cache (compatibility function)."""
-    # Head interleaving: V is at odd indices (1, 3, 5, ...)
-    return kv[:, 1::2, :]
+# Note: tpu_commons v3 doesn't use extract functions!
+# They use strided_load_bkv directly with start+1 offset inside the kernel.
 
 
 logger = logging.getLogger(__name__)
@@ -197,15 +189,13 @@ class KVCache(abc.ABC):
         return obj
 
     @abc.abstractmethod
-    def get_key_buffer(self, layer_id: int) -> jnp.ndarray:
-        raise NotImplementedError()
+    def get_fused_kv_buffer(self, layer_id: int) -> jnp.ndarray:
+        """Get fused KV buffer directly following tpu_commons v3 design.
 
-    @abc.abstractmethod
-    def get_value_buffer(self, layer_id: int) -> jnp.ndarray:
-        raise NotImplementedError()
-
-    @abc.abstractmethod
-    def get_kv_buffer(self, layer_id: int) -> Tuple[jnp.ndarray, jnp.ndarray]:
+        Returns:
+            Fused KV buffer with shape [size, num_kv_heads * 2, head_dim]
+            where heads are interleaved: [K0,V0,K1,V1,K2,V2...]
+        """
         raise NotImplementedError()
 
     @abc.abstractmethod
@@ -371,19 +361,13 @@ class MHATokenToKVPool(KVCache):
         v_size = fused_kv_size // 2
         return k_size, v_size
 
-    def get_key_buffer(self, layer_id: int) -> jnp.ndarray:
-        fused_kv = self.kv_buffer[layer_id - self.start_layer]
-        return extract_k_from_fused_kv(fused_kv)
+    def get_fused_kv_buffer(self, layer_id: int) -> jnp.ndarray:
+        """Get fused KV buffer directly following tpu_commons v3 design.
 
-    def get_value_buffer(self, layer_id: int) -> jnp.ndarray:
-        fused_kv = self.kv_buffer[layer_id - self.start_layer]
-        return extract_v_from_fused_kv(fused_kv)
-
-    def get_kv_buffer(self, layer_id: int) -> Tuple[jnp.ndarray, jnp.ndarray]:
-        fused_kv = self.kv_buffer[layer_id - self.start_layer]
-        k = extract_k_from_fused_kv(fused_kv)
-        v = extract_v_from_fused_kv(fused_kv)
-        return k, v
+        This is the correct way - flash attention uses strided_load_bkv inside
+        the kernel to extract K and V, not pre-separated buffers.
+        """
+        return self.kv_buffer[layer_id - self.start_layer]
 
     def set_kv_buffer(
         self,
@@ -425,8 +409,8 @@ class MHATokenToKVPool(KVCache):
         """Get KV data at specified positions"""
         layer_idx = layer_id - self.start_layer
         fused_kv_data = self.kv_buffer[layer_idx][indices]
-        k_data = extract_k_from_fused_kv(fused_kv_data)
-        v_data = extract_v_from_fused_kv(fused_kv_data)
+        k_data = fused_kv_data[:, ::2, :]  # Head interleaving: K at even indices
+        v_data = fused_kv_data[:, 1::2, :]  # Head interleaving: V at odd indices
         return k_data, v_data
 
     def get_cpu_copy(self, indices):
@@ -434,9 +418,9 @@ class MHATokenToKVPool(KVCache):
         kv_cache_host = []
         for layer_id in range(self.layer_num):
             fused_kv_host = jax.device_get(self.kv_buffer[layer_id][indices])
-            # Extract k and v from fused format for compatibility
-            k_host = extract_k_from_fused_kv(fused_kv_host)
-            v_host = extract_v_from_fused_kv(fused_kv_host)
+            # Extract k and v from fused format using head interleaving
+            k_host = fused_kv_host[:, ::2, :]  # Head interleaving: K at even indices
+            v_host = fused_kv_host[:, 1::2, :]  # Head interleaving: V at odd indices
             kv_cache_host.append([k_host, v_host])
         return kv_cache_host
 
@@ -1153,15 +1137,13 @@ class MLATokenToKVPool(KVCache):
         )
         return kv_size
 
-    def get_key_buffer(self, layer_id: int) -> jnp.ndarray:
+    def get_fused_kv_buffer(self, layer_id: int) -> jnp.ndarray:
+        """Get fused buffer for MLA architecture.
+
+        Note: MLA has different architecture than standard MHA,
+        but we provide this interface for compatibility.
+        """
         return self.kv_buffer[layer_id - self.start_layer]
-
-    def get_value_buffer(self, layer_id: int) -> jnp.ndarray:
-        # For MLA, value is part of the combined buffer
-        return self.kv_buffer[layer_id - self.start_layer][..., : self.kv_lora_rank]
-
-    def get_kv_buffer(self, layer_id: int) -> Tuple[jnp.ndarray, jnp.ndarray]:
-        return self.get_key_buffer(layer_id), self.get_value_buffer(layer_id)
 
     def set_kv_buffer(
         self,

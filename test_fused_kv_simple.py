@@ -16,11 +16,7 @@ def test_import_and_basic_syntax():
     print("Testing imports...")
 
     try:
-        from sgl_jax.srt.mem_cache.memory_pool import (
-            extract_k_from_fused_kv,
-            extract_v_from_fused_kv,
-            merge_kv,
-        )
+        from sgl_jax.srt.mem_cache.memory_pool import merge_kv
 
         print("✅ Memory pool imports successful")
     except Exception as e:
@@ -52,8 +48,9 @@ def test_import_and_basic_syntax():
             8,
         )  # [tokens, heads * 2, head_dim] head interleaving tpu_commons v3
 
-        extracted_k = extract_k_from_fused_kv(fused_kv)
-        extracted_v = extract_v_from_fused_kv(fused_kv)
+        # tpu_commons v3 head interleaving: directly test with indexing
+        extracted_k = fused_kv[:, ::2, :]  # Even indices: K0, K1, K2...
+        extracted_v = fused_kv[:, 1::2, :]  # Odd indices: V0, V1, V2...
 
         assert jnp.allclose(k, extracted_k)
         assert jnp.allclose(v, extracted_v)

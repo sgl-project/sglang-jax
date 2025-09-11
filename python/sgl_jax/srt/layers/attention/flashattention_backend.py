@@ -276,9 +276,8 @@ class FlashAttention(AttentionBackend):
                 layer_id, forward_batch.out_cache_loc, k, v, is_decode=True
             )
 
-        # Return the fused KV buffer directly
-        layer_idx = layer_id - forward_batch.token_to_kv_pool.start_layer
-        return forward_batch.token_to_kv_pool.kv_buffer[layer_idx]
+        # Return the fused KV buffer using proper interface
+        return forward_batch.token_to_kv_pool.get_fused_kv_buffer(layer_id)
 
     @staticmethod
     def get_max_running_reqests(max_context_len: int, page_size: int) -> int:

@@ -556,44 +556,6 @@ def ragged_paged_attention_kernel(
 
         return lst
 
-    def batch_load_all_heads_kv_tpu_commons_exact(
-        kv_ref_fused, num_kv_heads_per_blk, bkv_bitmask=None
-    ):
-        """
-        完全按照 tpu_commons v3 的批量加载逻辑，不简化任何细节！
-        """
-        k_heads = []
-        v_heads = []
-
-        # tpu_commons v3 的完整逻辑：按 heads_per_load 分组处理
-        kv_packing = get_dtype_packing(kv_ref_fused.dtype)
-        heads_per_load = max(1, kv_packing // 2)  # tpu_commons v3 的分组策略
-
-        num_kv_heads_x2 = num_kv_heads_per_blk * 2  # 总头数 * 2
-
-        for kv_head_start in range(0, num_kv_heads_per_blk, heads_per_load):
-            # 完全按照 tpu_commons v3 的调用方式
-            bkv_lst = strided_load_bkv_exact_tpu_commons(
-                kv_ref_fused,
-                start=kv_head_start * 2,  # 头索引 * 2
-                step=num_kv_heads_x2,  # 总头数 * 2
-                kv_packing=kv_packing,
-                bkv_bitmask=bkv_bitmask,
-            )
-
-            # 处理返回的 K,V 对列表
-            for i in range(heads_per_load):
-                kv_head_idx = kv_head_start + i
-                if kv_head_idx >= num_kv_heads_per_blk:
-                    break
-
-                if i < len(bkv_lst):
-                    bk, bv = bkv_lst[i]
-                    k_heads.append(bk)
-                    v_heads.append(bv)
-
-        return jnp.stack(k_heads, axis=0), jnp.stack(v_heads, axis=0)
-
     def batch_prepare_queries(q_ref, num_kv_heads_per_blk, num_q_heads_per_kv_head):
         q_heads = []
         for kv_head_idx in range(num_kv_heads_per_blk):
@@ -879,29 +841,39 @@ def ragged_paged_attention_kernel(
                 num_kv_pages_per_blk * page_size, num_kv_heads_per_blk * 2, head_dim
             )  # [total_kv_tokens, heads*2, head_dim] - tpu_commons头交替格式!
 
-            def batch_load_all_heads_kv_tpu_commons_exact(
-                kv_ref_fused, num_kv_heads_per_blk
+            def batch_load_kv_using_strided_load_bkv(
+                kv_ref_fused, num_kv_heads_per_blk, bkv_bitmask=None
             ):
                 """
-                完全按照 tpu_commons v3 的批量加载逻辑：处理 [tokens, heads*2, head_dim] 头交替格式
+                使用真正的 tpu_commons v3 strided_load_bkv 逻辑，不简化！
+                完全按照 tpu_commons v3 的批量加载方式，使用 strided_load_bkv
                 """
-                tokens, fused_heads, head_dim = kv_ref_fused.shape
-                assert fused_heads == num_kv_heads_per_blk * 2  # 验证头交替格式
-
                 k_heads = []
                 v_heads = []
 
-                # tpu_commons v3 逻辑：头交替访问 K 和 V
-                for kv_head_idx in range(num_kv_heads_per_blk):
-                    # 头交替格式：K在偶数索引，V在奇数索引
-                    k_idx = kv_head_idx * 2  # 0, 2, 4, ...
-                    v_idx = kv_head_idx * 2 + 1  # 1, 3, 5, ...
+                # tpu_commons v3 的完整逻辑：按 heads_per_load 分组处理
+                kv_packing = get_dtype_packing(kv_ref_fused.dtype)
+                heads_per_load = max(1, kv_packing // 2)  # tpu_commons v3 的分组策略
+                num_kv_heads_x2 = num_kv_heads_per_blk * 2  # 总头数 * 2
 
-                    k = kv_ref_fused[:, k_idx, :]  # [tokens, head_dim]
-                    v = kv_ref_fused[:, v_idx, :]  # [tokens, head_dim]
-
-                    k_heads.append(k)
-                    v_heads.append(v)
+                for kv_head_start in range(0, num_kv_heads_per_blk, heads_per_load):
+                    # 完全按照 tpu_commons v3 的调用方式
+                    bkv_lst = strided_load_bkv_exact_tpu_commons(
+                        kv_ref_fused,
+                        start=kv_head_start * 2,  # 头索引 * 2
+                        step=num_kv_heads_x2,  # 总头数 * 2
+                        kv_packing=kv_packing,
+                        bkv_bitmask=bkv_bitmask,
+                    )
+                    # 处理返回的 K,V 对列表
+                    for i in range(heads_per_load):
+                        kv_head_idx = kv_head_start + i
+                        if kv_head_idx >= num_kv_heads_per_blk:
+                            break
+                        if i < len(bkv_lst):
+                            bk, bv = bkv_lst[i]
+                            k_heads.append(bk)
+                            v_heads.append(bv)
 
                 return jnp.stack(k_heads, axis=0), jnp.stack(v_heads, axis=0)
 
@@ -909,7 +881,7 @@ def ragged_paged_attention_kernel(
                 q_ref, num_kv_heads_per_blk, num_q_heads_per_kv_head
             )
 
-            k_batch, v_batch = batch_load_all_heads_kv_tpu_commons_exact(
+            k_batch, v_batch = batch_load_kv_using_strided_load_bkv(
                 kv_ref_fused, num_kv_heads_per_blk
             )
 
