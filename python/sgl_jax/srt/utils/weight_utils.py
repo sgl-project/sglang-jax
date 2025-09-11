@@ -140,11 +140,10 @@ class WeightLoader:
                 expert_weights[hf_key] = hf_weight.astype(self.dtype)
             else:
                 logger.warning(f"No mapping found for weight: {hf_key}")
+            nnx.update(self.model, params)
 
         if moe_mappings:
             self._process_moe_expert_weights(params, moe_mappings, expert_weights)
-
-        nnx.update(self.model, params)
 
     def _iterate_weights(self):
 
