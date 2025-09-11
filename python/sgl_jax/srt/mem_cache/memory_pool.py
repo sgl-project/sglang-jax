@@ -356,6 +356,85 @@ class MHATokenToKVPool(KVCache):
         """Get the fused KV buffer directly (for FlashAttention backend)"""
         return self.kv_buffer[layer_id - self.start_layer]
 
+    def _convert_interleaved_to_head_dim_concat(
+        self, interleaved_kv: jax.Array
+    ) -> jax.Array:
+        """
+        Convert from interleaved format to head_dim concatenated format.
+        TPU Commons style conversion - exact same as their reshape logic.
+
+        Args:
+            interleaved_kv: [tokens, num_kv_heads * 2, head_dim] in [k1,v1,k2,v2,...] format
+
+        Returns:
+            head_dim_concat_kv: [tokens, num_kv_heads, head_dim * 2] in [k_dims,v_dims] per head format
+        """
+        tokens, fused_heads, head_dim = interleaved_kv.shape
+        num_kv_heads = fused_heads // 2
+
+        # TPU Commons style direct reshape: exactly what they do in their code
+        # gathered_kv.reshape(-1, num_kv_heads_x2, head_dim).reshape(-1, actual_num_kv_heads, head_dim * 2)
+        head_dim_concat = interleaved_kv.reshape(tokens, num_kv_heads, head_dim * 2)
+
+        return head_dim_concat
+
+    def _convert_head_dim_concat_to_interleaved(
+        self, head_dim_concat_kv: jax.Array
+    ) -> jax.Array:
+        """
+        Convert from head_dim concatenated format to interleaved format.
+        Reverse of the TPU Commons style conversion.
+
+        Args:
+            head_dim_concat_kv: [tokens, num_kv_heads, head_dim * 2] in [k_dims,v_dims] per head format
+
+        Returns:
+            interleaved_kv: [tokens, num_kv_heads * 2, head_dim] in [k1,v1,k2,v2,...] format
+        """
+        tokens, num_kv_heads, doubled_head_dim = head_dim_concat_kv.shape
+        head_dim = doubled_head_dim // 2
+
+        # Reverse of TPU Commons reshape: direct reshape back to interleaved
+        interleaved = head_dim_concat_kv.reshape(tokens, num_kv_heads * 2, head_dim)
+
+        return interleaved
+
+    def get_head_dim_concat_kv_buffer(self, layer_id: int) -> jnp.ndarray:
+        """
+        Get KV buffer in head_dim concatenated format for easier computation.
+        TPU Commons style: [tokens, num_kv_heads, head_dim * 2] where each head is [k_dims, v_dims]
+        """
+        interleaved_kv = self.get_fused_kv_buffer(layer_id)
+        return self._convert_interleaved_to_head_dim_concat(interleaved_kv)
+
+    def get_key_buffer_simple(self, layer_id: int) -> jnp.ndarray:
+        """
+        Extract K buffer using TPU Commons style simple slicing.
+        More efficient for computation than strided access.
+        """
+        head_dim_concat_kv = self.get_head_dim_concat_kv_buffer(layer_id)
+        # Simple slice: K is first half of concatenated dimension
+        return head_dim_concat_kv[:, :, : self.head_dim]
+
+    def get_value_buffer_simple(self, layer_id: int) -> jnp.ndarray:
+        """
+        Extract V buffer using TPU Commons style simple slicing.
+        More efficient for computation than strided access.
+        """
+        head_dim_concat_kv = self.get_head_dim_concat_kv_buffer(layer_id)
+        # Simple slice: V is second half of concatenated dimension
+        return head_dim_concat_kv[:, :, self.head_dim :]
+
+    def get_kv_buffer_simple(self, layer_id: int) -> Tuple[jnp.ndarray, jnp.ndarray]:
+        """
+        Get K and V buffers using TPU Commons style simple slicing.
+        More efficient for batch processing than strided access.
+        """
+        head_dim_concat_kv = self.get_head_dim_concat_kv_buffer(layer_id)
+        k = head_dim_concat_kv[:, :, : self.head_dim]
+        v = head_dim_concat_kv[:, :, self.head_dim :]
+        return k, v
+
     def _interleave_kv_heads(self, k: jax.Array, v: jax.Array) -> jax.Array:
         """
         Fuse K and V by interleaving heads: [k1, v1, k2, v2, ...]

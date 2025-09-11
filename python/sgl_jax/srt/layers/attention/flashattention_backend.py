@@ -72,6 +72,7 @@ class FlashAttention(AttentionBackend):
         vmem_limit_bytes: int = 64 * (1 << 20),  # 64MB
         page_size: int = 1,
         kv_partition_axis: str = "tensor",
+        use_tpu_commons_optimization: bool = True,  # TPU Commons dual format optimization
     ):
         self.vmem_limit_bytes = vmem_limit_bytes
         self.num_heads = num_attn_heads
@@ -82,6 +83,7 @@ class FlashAttention(AttentionBackend):
         self.head_dim = head_dim
         self.page_size = page_size
         self.kv_partition_axis = kv_partition_axis
+        self.use_tpu_commons_optimization = use_tpu_commons_optimization
         self.forward_metadata = FlashAttentionMetadata()
 
     def get_forward_metadata(self, batch: ModelWorkerBatch, mesh: Mesh):
@@ -144,6 +146,7 @@ class FlashAttention(AttentionBackend):
             "vmem_limit_bytes": self.vmem_limit_bytes,
             "head_dim": self.head_dim,
             "page_size": self.page_size,
+            "use_tpu_commons_optimization": self.use_tpu_commons_optimization,
         }
         return (children, aux_data)
 
@@ -155,6 +158,9 @@ class FlashAttention(AttentionBackend):
             aux_data["head_dim"],
             aux_data["vmem_limit_bytes"],
             aux_data["page_size"],
+            use_tpu_commons_optimization=aux_data.get(
+                "use_tpu_commons_optimization", True
+            ),
         )
 
         obj.forward_metadata = children[0]
@@ -206,17 +212,33 @@ class FlashAttention(AttentionBackend):
             q, kv_buffer = args[:2]
             other_args = args[2:]
 
-            # KV buffer has shape [..., fused_kv_heads, head_dim] in interleaved format [k1, v1, k2, v2, ...]
-            # Ensure kv_heads is even for TPU tiling requirements
-            fused_kv_heads = kv_buffer.shape[-2]
-            assert fused_kv_heads % 2 == 0, (
-                f"fused_kv_heads={fused_kv_heads} should be even for interleaved format. "
-                f"kv_buffer shape: {kv_buffer.shape}"
-            )
-            num_kv_heads = fused_kv_heads // 2
-            assert (
-                num_kv_heads % 2 == 0
-            ), f"num_kv_heads={num_kv_heads} should be even for TPU tiling requirements."
+            if self.use_tpu_commons_optimization:
+                # TPU Commons optimization: head_dim concatenated format [..., num_kv_heads, head_dim * 2]
+                num_kv_heads = kv_buffer.shape[-2]
+                head_dim_doubled = kv_buffer.shape[-1]
+                assert head_dim_doubled == self.head_dim * 2, (
+                    f"Expected head_dim_doubled={self.head_dim * 2}, got {head_dim_doubled}. "
+                    f"kv_buffer shape: {kv_buffer.shape}"
+                )
+                assert (
+                    num_kv_heads % 2 == 0
+                ), f"num_kv_heads={num_kv_heads} should be even for TPU tiling requirements."
+
+                # Convert back to interleaved format for kernel
+                kv_buffer = self._convert_head_dim_concat_to_interleaved_for_kernel(
+                    kv_buffer
+                )
+            else:
+                # Standard interleaved format [..., fused_kv_heads, head_dim] [k1, v1, k2, v2, ...]
+                fused_kv_heads = kv_buffer.shape[-2]
+                assert fused_kv_heads % 2 == 0, (
+                    f"fused_kv_heads={fused_kv_heads} should be even for interleaved format. "
+                    f"kv_buffer shape: {kv_buffer.shape}"
+                )
+                num_kv_heads = fused_kv_heads // 2
+                assert (
+                    num_kv_heads % 2 == 0
+                ), f"num_kv_heads={num_kv_heads} should be even for TPU tiling requirements."
 
             return ragged_paged_attention(
                 q,
@@ -240,10 +262,8 @@ class FlashAttention(AttentionBackend):
             kv_buffer.reshape(
                 kv_buffer.shape[0] // self.page_size,
                 self.page_size,
-                kv_buffer.shape[
-                    1
-                ],  # fused_kv_heads = num_kv_heads * 2 from memory pool
-                kv_buffer.shape[2],  # head_dim
+                kv_buffer.shape[1],  # heads dimension (varies by format)
+                kv_buffer.shape[2],  # last dimension (varies by format)
             ),
             self.forward_metadata.page_indices,
             self.forward_metadata.cu_q_lens,
@@ -267,8 +287,9 @@ class FlashAttention(AttentionBackend):
         """
         Get the fused kv cache from the forward batch.
 
-        The memory pool stores K and V in interleaved format: shape [..., num_kv_heads * 2, head_dim]
-        The kernel directly supports this interleaved format.
+        Uses TPU Commons dual format strategy:
+        - Storage: interleaved format [..., num_kv_heads * 2, head_dim] for memory efficiency
+        - Computation: head_dim concat format [..., num_kv_heads, head_dim * 2] for simple slicing
         """
         if forward_batch.forward_mode == ForwardMode.EXTEND:
             forward_batch.token_to_kv_pool.set_kv_buffer(
@@ -279,8 +300,31 @@ class FlashAttention(AttentionBackend):
                 layer_id, forward_batch.out_cache_loc, k, v, is_decode=True
             )
 
-        # Get head_dim concatenated KV buffer: [..., num_kv_heads, head_dim * 2]
-        return forward_batch.token_to_kv_pool.get_fused_kv_buffer(layer_id)
+        if self.use_tpu_commons_optimization:
+            # TPU Commons strategy: convert interleaved storage to head_dim concat for computation
+            return forward_batch.token_to_kv_pool.get_head_dim_concat_kv_buffer(
+                layer_id
+            )
+        else:
+            # Standard strategy: use interleaved format directly
+            return forward_batch.token_to_kv_pool.get_fused_kv_buffer(layer_id)
+
+    def _convert_head_dim_concat_to_interleaved_for_kernel(
+        self, head_dim_concat_kv: jax.Array
+    ) -> jax.Array:
+        """
+        Convert head_dim concatenated format back to interleaved format for kernel.
+        This is needed when using TPU Commons optimization.
+        """
+        *batch_dims, num_kv_heads, doubled_head_dim = head_dim_concat_kv.shape
+        head_dim = doubled_head_dim // 2
+
+        # Simple reshape - reverse of TPU Commons conversion
+        interleaved = head_dim_concat_kv.reshape(
+            *batch_dims, num_kv_heads * 2, head_dim
+        )
+
+        return interleaved
 
     @staticmethod
     def get_max_running_reqests(max_context_len: int, page_size: int) -> int:
