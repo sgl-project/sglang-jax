@@ -524,34 +524,48 @@ def ragged_paged_attention_kernel(
         total_tokens, fused_heads, head_dim = kv_ref_fused.shape
         kv_ref = kv_ref_fused.bitcast(jnp.uint32).reshape(total_tokens * step, head_dim)
 
-        def _mask_kv(k, v):
-            """tpu_commons v3 的完整 masking 逻辑"""
+        def _mask_kv_uint32(k_uint32, v_uint32):
+            """tpu_commons v3 masking logic on uint32 data"""
             if bkv_bitmask is not None:
-                k = pltpu.bitcast(k, jnp.uint32)
-                v = pltpu.bitcast(v, jnp.uint32)
-                k = k & bkv_bitmask
-                v = v & bkv_bitmask
-                k = pltpu.bitcast(k, kv_dtype)
-                v = pltpu.bitcast(v, kv_dtype)
+                k_uint32 = k_uint32 & bkv_bitmask
+                v_uint32 = v_uint32 & bkv_bitmask
+            # Convert back to original dtype via bitcast uint32 -> float32 -> target
+            k = pltpu.bitcast(k_uint32, jnp.float32).astype(kv_dtype)
+            v = pltpu.bitcast(v_uint32, jnp.float32).astype(kv_dtype)
             return (k, v)
 
         if kv_packing == 1:
-            # tpu_commons v3: 简单情况的完整逻辑
+            # tpu_commons v3: 简单情况，直接 strided_load 到目标类型
             k = strided_load(kv_ref, start, step, dtype=kv_dtype)
             v = strided_load(kv_ref, start + 1, step, dtype=kv_dtype)  # 关键：start + 1
-            return [_mask_kv(k, v)]
+            # For simple case, convert to uint32 for masking if needed
+            if bkv_bitmask is not None:
+                k_uint32 = pltpu.bitcast(k.astype(jnp.float32), jnp.uint32)
+                v_uint32 = pltpu.bitcast(v.astype(jnp.float32), jnp.uint32)
+                return [_mask_kv_uint32(k_uint32, v_uint32)]
+            else:
+                return [(k, v)]
 
-        # tpu_commons v3: 复杂 bit packing 的完整实现，不简化！
-        kv = strided_load(kv_ref, start, step)
+        # tpu_commons v3: 复杂 bit packing，始终在 uint32 级别操作
+        kv = strided_load(kv_ref, start, step)  # 加载为 uint32
         bitwidth = 32 // kv_packing
-        repack_ty = jnp.dtype(f"uint{bitwidth}")
+        mask = (1 << bitwidth) - 1  # Create mask for extracting bits
         lst = []
 
         for i in range(0, kv_packing, 2):
-            # tpu_commons v3 的完整位操作逻辑
-            k = (kv >> (i * bitwidth)).astype(repack_ty)
-            v = (kv >> ((i + 1) * bitwidth)).astype(repack_ty)
-            lst.append(_mask_kv(k, v))
+            # tpu_commons v3 方式：提取位但保持在 uint32，然后移位对齐
+            k_bits = (kv >> (i * bitwidth)) & mask
+            v_bits = (kv >> ((i + 1) * bitwidth)) & mask
+
+            # 将提取的位移位到正确位置 (对于 bfloat16，高16位是有效位)
+            if kv_dtype == jnp.bfloat16:
+                k_uint32 = k_bits << 16  # 移到高16位
+                v_uint32 = v_bits << 16  # 移到高16位
+            else:
+                k_uint32 = k_bits
+                v_uint32 = v_bits
+
+            lst.append(_mask_kv_uint32(k_uint32, v_uint32))
 
         return lst
 
