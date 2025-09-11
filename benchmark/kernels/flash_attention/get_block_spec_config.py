@@ -24,7 +24,7 @@ def benchmark_backend(
 ):
     scale = head_dim**-0.5
 
-    if max_num_batched_tokens > 128:
+    if max_num_batched_tokens > 256:
         (
             q,
             k,
@@ -48,7 +48,7 @@ def benchmark_backend(
             head_dim,
             page_size=page_size,
         )
-    elif max_num_batched_tokens <= 128:
+    elif max_num_batched_tokens <= 256:
         (
             q,
             k,
