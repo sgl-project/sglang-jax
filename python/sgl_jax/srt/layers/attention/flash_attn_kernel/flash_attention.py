@@ -307,13 +307,11 @@ def ref_ragged_paged_attention_fused(
         k = kv_fused[:, :, :head_dim]  # Extract k from first half
         v = kv_fused[:, :, head_dim:]  # Extract v from second half
 
-        # Apply scaling if provided
+        # Apply scaling if provided (combine to single type conversion)
         if k_scale is not None:
-            k = k.astype(jnp.float32) * k_scale
-            k = k.astype(q.dtype)
+            k = (k.astype(jnp.float32) * k_scale).astype(q.dtype)
         if v_scale is not None:
-            v = v.astype(jnp.float32) * v_scale
-            v = v.astype(q.dtype)
+            v = (v.astype(jnp.float32) * v_scale).astype(q.dtype)
 
         # Repeat for GQA
         k = jnp.repeat(k, num_query_per_kv, axis=1)
@@ -370,11 +368,9 @@ def ref_ragged_paged_attention(
         k = k_pages[indices, :, :, :].reshape(-1, num_kv_heads, head_dim)[:kv_len]
         v = v_pages[indices, :, :, :].reshape(-1, num_kv_heads, head_dim)[:kv_len]
         if k_scale is not None:
-            k = k.astype(jnp.float32) * k_scale
-            k = k.astype(q.dtype)
+            k = (k.astype(jnp.float32) * k_scale).astype(q.dtype)
         if v_scale is not None:
-            v = v.astype(jnp.float32) * v_scale
-            v = v.astype(q.dtype)
+            v = (v.astype(jnp.float32) * v_scale).astype(q.dtype)
         k = jnp.repeat(k, num_query_per_kv, axis=1)
         v = jnp.repeat(v, num_query_per_kv, axis=1)
         attn = jnp.einsum("qhd,khd->hqk", q, k, preferred_element_type=jnp.float32)
@@ -693,12 +689,16 @@ def ragged_paged_attention_kernel(
 
             effective_kv_len = actual_kv_len - kv_len_start
             kv_indices = lax.broadcasted_iota(jnp.int32, k_batch_f32.shape[:-1], 1)
-            kv_mask_int = (kv_indices < effective_kv_len).astype(jnp.int32)
-            kv_mask_expanded = jnp.expand_dims(kv_mask_int, axis=-1)
+            kv_mask = (
+                kv_indices < effective_kv_len
+            )  # Keep as boolean, avoid int32 conversion
+            kv_mask_expanded = jnp.expand_dims(kv_mask, axis=-1)
             kv_mask_broadcast = jnp.broadcast_to(kv_mask_expanded, k_batch_f32.shape)
 
-            k_batch_f32 = jnp.where(kv_mask_broadcast > 0, k_batch_f32, 0.0)
-            v_batch_f32 = jnp.where(kv_mask_broadcast > 0, v_batch_f32, 0.0)
+            k_batch_f32 = jnp.where(
+                kv_mask_broadcast, k_batch_f32, 0.0
+            )  # Direct boolean condition
+            v_batch_f32 = jnp.where(kv_mask_broadcast, v_batch_f32, 0.0)
             qk_batch = (
                 jnp.einsum(
                     "hqd,hkd->hqk",
