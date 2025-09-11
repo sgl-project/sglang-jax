@@ -115,12 +115,12 @@ class JAXModelLoader(BaseModelLoader):
             # Create a new RNG with the extracted keys
             from flax import nnx
 
-            temp_rng = nnx.Rngs(default=default_key)
-            # Override the params method to return the pre-extracted key
-            temp_rng._params_key = rng_keys.get("params", default_key)
-            temp_rng.params = lambda: temp_rng._params_key
+            # temp_rng = nnx.Rngs(default=default_key)
+            # # Override the params method to return the pre-extracted key
+            # temp_rng._params_key = rng_keys.get("params", default_key)
+            # temp_rng.params = lambda: temp_rng._params_key
 
-            model = model_class(model_config, temp_rng, self.mesh)
+            model = model_class(model_config, self.rng, self.mesh)
             state = nnx.state(model)
             pspecs = nnx.get_partition_spec(state)
             sharded_state = jax.lax.with_sharding_constraint(state, pspecs)
