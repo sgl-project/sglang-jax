@@ -520,10 +520,9 @@ def ragged_paged_attention_kernel(
         start //= kv_packing
         step //= kv_packing
 
-        # 重要：bitcast 到 uint32 进行位操作，就像 tpu_commons v3
-        kv_ref_uint32 = pltpu.bitcast(kv_ref_fused, jnp.uint32)
+        # 重要：VMEM 引用使用 .bitcast() 方法，就像 tpu_commons v3
         total_tokens, fused_heads, head_dim = kv_ref_fused.shape
-        kv_ref = kv_ref_uint32.reshape(total_tokens * step, head_dim)
+        kv_ref = kv_ref_fused.bitcast(jnp.uint32).reshape(total_tokens * step, head_dim)
 
         def _mask_kv(k, v):
             """tpu_commons v3 的完整 masking 逻辑"""
