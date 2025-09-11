@@ -191,7 +191,7 @@ class ModelWorker:
     def precompile_extend(self):
         start_time = time.perf_counter()
         logger.info(
-            f"[EXTEND] begin to precompile bs_paddings={self.precompile_bs_paddings[-1:]} token_paddings={self.precompile_token_paddings}"
+            f"[EXTEND] Begin to precompile bs_paddings={self.precompile_bs_paddings[-1:]} token_paddings={self.precompile_token_paddings}"
         )
 
         bs, _ = self.get_max_padded_size()
@@ -219,7 +219,7 @@ class ModelWorker:
     def precompile_decode(self):
         start_time = time.perf_counter()
         logger.info(
-            f"[DECODE] begin to precompile bs_paddings={self.precompile_bs_paddings}"
+            f"[DECODE] Begin to precompile bs_paddings={self.precompile_bs_paddings}"
         )
 
         with tqdm(
