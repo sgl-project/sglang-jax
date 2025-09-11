@@ -1317,9 +1317,7 @@ def ragged_paged_attention(
     page_size = k_cache.shape[1]
     max_num_seqs = kv_lens.shape[0]
     num_page_indices = page_indices.shape[0]
-    # assert num_page_indices % max_num_seqs == 0
     pages_per_seq = num_page_indices // max_num_seqs
-    print(f"[ragged_per_seq] {num_page_indices=}, {max_num_seqs=}, {pages_per_seq=}")
     num_q_heads_per_kv_head = num_q_heads_per_kv_head_per_q_packing * q_packing
 
     bkv_p = num_kv_pages_per_block
@@ -1336,8 +1334,11 @@ def ragged_paged_attention(
             pages_per_seq,
         )
     kv_packing = get_dtype_packing(k_cache.dtype)
+    if page_size == 1:
+        bkv_p = bkv_p // 2
+        if bkv_p == 0:
+            bkv_p = 1
     bkv_p = align_to(bkv_p, kv_packing)
-    print(f"[get_tuned_block_sizes] {bkv_p=}")
     bkv_sz = bkv_p * page_size
     if vmem_limit_bytes is None:
         vmem_limit_bytes = int(

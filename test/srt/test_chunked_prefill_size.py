@@ -36,7 +36,7 @@ class TestChunkedPrefillSize(CustomTestCase):
                 "--max-running-requests",
                 "256",
                 "--chunked-prefill-size",
-                "512",
+                "2048",
                 "--disable-radix-cache",
                 "--enable-mixed-chunk",
             ],
