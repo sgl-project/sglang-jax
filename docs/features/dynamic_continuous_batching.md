@@ -67,9 +67,14 @@ The scheduler dynamically assembles batches using the `PrefillAdder`:
 def get_new_batch_prefill(self) -> Optional[ScheduleBatch]:
     # Create prefill adder with resource constraints
     adder = PrefillAdder(
-        self.page_size, self.tree_cache, self.token_to_kv_pool_allocator,
-        self.running_batch, self.new_token_ratio, self.max_prefill_tokens,
-        self.chunked_prefill_size
+        self.page_size,
+        self.tree_cache,
+        self.token_to_kv_pool_allocator,
+        self.running_batch,
+        self.new_token_ratio,
+        self.max_prefill_tokens,
+        self.chunked_prefill_size,
+        running_bs if self.is_mixed_chunk else 0,
     )
 
     # Add requests until resource limits
@@ -143,8 +148,8 @@ def filter_batch(
 
     # Update arrays and request lists
     self.reqs = [self.reqs[i] for i in keep_indices]
-    self.req_pool_indices = self.req_pool_indices[keep_indices_device]
-    self.seq_lens = self.seq_lens[keep_indices_device]
+    self.req_pool_indices = self.req_pool_indices[keep_indices]
+    self.seq_lens = self.seq_lens[keep_indices]
 ```
 
 
