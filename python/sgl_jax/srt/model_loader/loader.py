@@ -1,6 +1,7 @@
 import dataclasses
 import logging
 import os
+import time
 from abc import ABC, abstractmethod
 from typing import Any, List, Optional, Tuple
 
@@ -78,7 +79,6 @@ class JAXModelLoader(BaseModelLoader):
         model_config.model_path = hf_folder
         # Initialize JAX model
         model = self._initialize_model(model_config)
-
         # Load weights
         jit_model = self._get_model(model, model_config)
 
@@ -125,13 +125,12 @@ class JAXModelLoader(BaseModelLoader):
             pspecs = nnx.get_partition_spec(state)
             sharded_state = jax.lax.with_sharding_constraint(state, pspecs)
             nnx.update(model, sharded_state)
+            rng_key = self.rng.default.key.value
+            model.load_weights(rng_key)
             return model
 
         with self.mesh:
             model = create_model(keys, default_key)
-
-        rng_key = self.rng.default.key.value
-        model.load_weights(rng_key)
 
         return model
 
