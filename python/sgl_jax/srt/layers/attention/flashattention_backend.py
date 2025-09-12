@@ -198,30 +198,27 @@ class FlashAttention(AttentionBackend):
         Returns:
             Output tensor of shape [total_tokens, hidden_size]
         """
-        k_buffer, v_buffer = self._get_and_set_kv_cache(
-            k, v, forward_batch, layer.layer_id
-        )
+        kv_cache_fused = self._get_fused_kv_cache(forward_batch, layer.layer_id)
 
         if layer.scaling is None:
             scale = 1.0 / jnp.sqrt(layer.head_dim)
         else:
             scale = layer.scaling
 
-        # Prepare separate K/V caches for V2 kernel
-        # k_buffer and v_buffer are already 3D: [total_tokens, num_kv_heads, head_dim]
-        # Reshape to paged format: [num_pages, page_size, num_kv_heads, head_dim]
-        total_tokens = k_buffer.shape[0]
+        # Prepare fused KV cache for paged format: [num_pages, page_size, num_kv_heads * 2, head_dim]
+        total_tokens = kv_cache_fused.shape[0]
         num_pages = total_tokens // self.page_size
-
-        k_cache = k_buffer.reshape(num_pages, self.page_size, -1, self.head_dim)
-        v_cache = v_buffer.reshape(num_pages, self.page_size, -1, self.head_dim)
+        kv_cache_fused_paged = kv_cache_fused.reshape(
+            num_pages, self.page_size, -1, self.head_dim
+        )
 
         in_specs = (
             P(None, self.kv_partition_axis),  # queries
             P(None, self.kv_partition_axis),  # keys (new tokens)
             P(None, self.kv_partition_axis),  # values (new tokens)
-            P(None, None, self.kv_partition_axis, None),  # k_cache
-            P(None, None, self.kv_partition_axis, None),  # v_cache
+            P(
+                None, None, self.kv_partition_axis, None
+            ),  # kv_cache_fused (head interleaved)
             P(),  # kv_lens
             P(),  # page_indices
             P(),  # cu_q_lens
@@ -230,37 +227,35 @@ class FlashAttention(AttentionBackend):
         )
         out_specs = (
             P(None, self.kv_partition_axis),  # attention output
-            P(None, self.kv_partition_axis, None),  # updated k_cache
-            P(None, self.kv_partition_axis, None),  # updated v_cache
+            P(
+                None, self.kv_partition_axis, None
+            ),  # updated kv_cache_fused (head interleaved) - 3D: [total_tokens, num_kv_heads*2, head_dim]
         )
 
-        def _ragged_paged_attention_with_separate_kv(*args):
-            queries, keys, values, k_cache, v_cache = args[:5]
-            other_args = args[5:]
+        def _ragged_paged_attention_with_fused_kv(*args):
+            queries, keys, values, kv_cache_fused = args[:4]
+            other_args = args[4:]
 
-            # Directly call V2 kernel with separate k_cache and v_cache
-            result, updated_k_cache, updated_v_cache = ragged_paged_attention(
+            # Call fused KV kernel with head interleaving
+            result, updated_kv_cache_fused = ragged_paged_attention(
                 queries,
                 keys,
                 values,
-                k_cache,
-                v_cache,
+                kv_cache_fused,
                 *other_args,
                 sm_scale=scale,
                 sliding_window=None,
                 soft_cap=None,
-                # mask_value=None,
                 vmem_limit_bytes=self.vmem_limit_bytes,
             )
 
-            return result, updated_k_cache, updated_v_cache
+            return result, updated_kv_cache_fused
 
         (
             attn_output,
-            k_buffer,
-            v_buffer,
-        ) = jax.shard_map(  # V2 handles KV cache updates internally
-            _ragged_paged_attention_with_separate_kv,
+            updated_kv_cache_fused,
+        ) = jax.shard_map(  # Fused KV kernel handles cache updates internally
+            _ragged_paged_attention_with_fused_kv,
             mesh=jax.sharding.get_abstract_mesh(),
             in_specs=in_specs,
             out_specs=out_specs,
@@ -269,8 +264,7 @@ class FlashAttention(AttentionBackend):
             q.reshape(q.shape[0], -1, self.head_dim),
             k.reshape(k.shape[0], -1, self.head_dim),
             v.reshape(v.shape[0], -1, self.head_dim),
-            k_cache,
-            v_cache,
+            kv_cache_fused_paged,
             self.forward_metadata.seq_lens,
             self.forward_metadata.page_indices,
             self.forward_metadata.cu_q_lens,
@@ -278,34 +272,17 @@ class FlashAttention(AttentionBackend):
             self.forward_metadata.distribution,
         )
 
-        # V2 kernel internally updates the KV cache, so we don't need to handle updated_kv_cache
-
         return (
             attn_output.reshape(q.shape[0], -1),
-            k_buffer,
-            v_buffer,
+            updated_kv_cache_fused,
         )
 
-    def _get_and_set_kv_cache(
+    def _get_fused_kv_cache(
         self,
-        k: jax.Array,
-        v: jax.Array,
         forward_batch: ForwardBatch,
         layer_id: int,
-    ) -> Tuple[jax.Array, jax.Array]:
-        """
-        Get the kv cache from the forward batch.
-        """
-        # if forward_batch.forward_mode == ForwardMode.EXTEND:
-        #     forward_batch.token_to_kv_pool.set_kv_buffer(
-        #         layer_id, forward_batch.out_cache_loc, k, v, is_decode=False
-        #     )
-        # else:
-        #     forward_batch.token_to_kv_pool.set_kv_buffer(
-        #         layer_id, forward_batch.out_cache_loc, k, v, is_decode=True
-        #     )
-
-        return forward_batch.token_to_kv_pool.get_kv_buffer(layer_id)
+    ) -> jax.Array:
+        return forward_batch.token_to_kv_pool.get_fused_kv_buffer(layer_id)
 
     @staticmethod
     def get_max_running_reqests(max_context_len: int, page_size: int) -> int:

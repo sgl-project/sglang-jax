@@ -153,9 +153,9 @@ class QWenAttention(nnx.Module):
         v = v.reshape(-1, self.num_heads, self.head_size)
 
         q, k = self.rotary_emb(positions, q, k)
-        attn_output, k, v = self.attn(q, k, v, forward_batch=forward_batch)
+        attn_output, kv_fused = self.attn(q, k, v, forward_batch=forward_batch)
         output, _ = self.c_proj(attn_output)
-        return output, k, v
+        return output, kv_fused
 
 
 class QWenBlock(nnx.Module):
@@ -214,7 +214,7 @@ class QWenBlock(nnx.Module):
         residual = hidden_states
 
         hidden_states = self.ln_1(hidden_states)
-        attn_output, k, v = self.attn(
+        attn_output, kv_fused = self.attn(
             positions=positions,
             hidden_states=hidden_states,
             forward_batch=forward_batch,
@@ -225,7 +225,7 @@ class QWenBlock(nnx.Module):
         hidden_states = self.ln_2(hidden_states)
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
-        return hidden_states, k, v
+        return hidden_states, kv_fused
 
 
 class QWenModel(nnx.Module):
@@ -271,19 +271,17 @@ class QWenModel(nnx.Module):
     ):
         hidden_states = self.embed_tokens(forward_batch.input_ids)
 
-        layers_k = []
-        layers_v = []
+        layers_kv_fused = []
 
         for layer in self.h:
-            hidden_states, k, v = layer(
+            hidden_states, kv_fused = layer(
                 forward_batch.positions, hidden_states, forward_batch
             )
-            layers_k.append(k)
-            layers_v.append(v)
+            layers_kv_fused.append(kv_fused)
 
         hidden_states = self.ln_f(hidden_states)
 
-        return hidden_states, layers_k, layers_v
+        return hidden_states, layers_kv_fused
 
 
 class QWenLMHeadModel(nnx.Module):
@@ -396,9 +394,9 @@ class QWenLMHeadModel(nnx.Module):
         forward_batch: ForwardBatch,
         logits_metadata: LogitsMetadata,
     ):
-        hidden_states, layers_k, layers_v = self.transformer(forward_batch)
+        hidden_states, layers_kv_fused = self.transformer(forward_batch)
         output = self.logits_processor(hidden_states, logits_metadata)
-        return output, layers_k, layers_v, True
+        return output, layers_kv_fused, True
 
 
 EntryClass = QWenLMHeadModel
