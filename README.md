@@ -27,6 +27,16 @@ SGL-JAX operates on a distributed architecture designed for scalability and perf
 
 ---
 
+## Community & Adopters
+
+We are grateful for the contributions and support from our community. SGL-JAX is adopted and contributed to by:
+
+- [sii-research](https://github.com/sii-research)
+- [inclusionAI](https://github.com/inclusionAI)
+- primatrixAI
+
+---
+
 ## Getting Started
 
 - [Install SGL-JAX](https://github.com/sgl-project/sglang-jax/blob/main/docs/get_started/install.md)
