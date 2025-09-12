@@ -131,7 +131,7 @@ class ModelWorkerClient:
             model_worker_batch.forward_batch.input_ids = resolve_future_token_ids(
                 input_ids, self.future_token_ids_map
             )
-
+            logger.info(f"start to forward")
             # Run forward
             logits_output, next_token_ids, cache_miss_count = (
                 self.worker.forward_batch_generation(
@@ -141,7 +141,7 @@ class ModelWorkerClient:
                     forward_metadata=forward_metadata,
                 )
             )
-
+            logger.info(f"after forward")
             # Update the future token ids map
             self.future_token_ids_map = set_future_token_ids(
                 self.future_token_ids_map, future_token_ids_ct, next_token_ids
