@@ -130,10 +130,10 @@ class QWen3MoeAttention(nnx.Module):
         k = self.k_norm(k)
 
         q, k = self.rotary_emb(positions, q, k)
-        attn_output, k, v = self.attn(q, k, v, forward_batch=forward_batch)
+        attn_output, kv_fused = self.attn(q, k, v, forward_batch=forward_batch)
 
         output, _ = self.c_proj(attn_output)
-        return output, k, v
+        return output, kv_fused
 
 
 class QWen3MoeDecoderLayer(nnx.Module):
@@ -243,7 +243,7 @@ class QWen3MoeDecoderLayer(nnx.Module):
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
 
-        hidden_states, k, v = self.self_attn(
+        hidden_states, kv_fused = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
             forward_batch=forward_batch,
@@ -260,7 +260,7 @@ class QWen3MoeDecoderLayer(nnx.Module):
         else:
             hidden_states = self.mlp(hidden_states)
 
-        return hidden_states, residual, k, v
+        return hidden_states, residual, kv_fused
 
 
 class QWen3MoeModel(nnx.Module):
@@ -308,14 +308,12 @@ class QWen3MoeModel(nnx.Module):
     ) -> jax.Array:
         hidden_states = self.embed_tokens(forward_batch.input_ids)
         residual = None
-        layers_k = []
-        layers_v = []
+        layers_kv_fused = []
         for layer in self.layers:
-            hidden_states, residual, k, v = layer(
+            hidden_states, residual, kv_fused = layer(
                 forward_batch.positions, hidden_states, forward_batch, residual
             )
-            layers_k.append(k)
-            layers_v.append(v)
+            layers_kv_fused.append(kv_fused)
 
         if residual is not None:
             hidden_states += residual
@@ -323,7 +321,7 @@ class QWen3MoeModel(nnx.Module):
         else:
             hidden_states = self.norm(hidden_states)
 
-        return hidden_states, layers_k, layers_v
+        return hidden_states, layers_kv_fused
 
 
 class Qwen3MoeForCausalLM(nnx.Module):
@@ -511,9 +509,9 @@ class Qwen3MoeForCausalLM(nnx.Module):
         forward_batch: ForwardBatch,
         logits_metadata: LogitsMetadata,
     ):
-        hidden_states, layers_k, layers_v = self.transformer(forward_batch)
+        hidden_states, layers_kv_fused = self.transformer(forward_batch)
         output = self.logits_processor(hidden_states, logits_metadata)
-        return output, layers_k, layers_v, True
+        return output, layers_kv_fused, True
 
 
 EntryClass = Qwen3MoeForCausalLM

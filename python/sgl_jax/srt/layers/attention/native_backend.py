@@ -8,6 +8,7 @@ from jax.tree_util import register_pytree_node_class
 from sgl_jax.srt.layers.attention.base_attn_backend import AttentionBackend
 from sgl_jax.srt.layers.radix_attention import AttentionType, RadixAttention
 from sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch
+from sgl_jax.srt.mem_cache.memory_pool import merge_kv
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 
 
@@ -89,7 +90,9 @@ class NativeAttention(AttentionBackend):
             forward_batch.forward_mode,
         )
 
-        return attn_output, k_buffer, v_buffer
+        kv_fused = merge_kv(k, v)
+
+        return attn_output, kv_fused
 
     def _get_and_update_kv_cache(
         self,
@@ -157,15 +160,24 @@ def forward_attention(
     k_cache = jnp.take(k_cache, loc, axis=0)
     v_cache = jnp.take(v_cache, loc, axis=0)
 
-    num_tokens, hidden_size = q.shape
-    head_dim = hidden_size // num_heads
+    # Handle both 2D and 3D input formats for q
+    if len(q.shape) == 2:
+        # Traditional format: [num_tokens, hidden_size]
+        num_tokens, hidden_size = q.shape
+        head_dim = hidden_size // num_heads
+        q_heads = q.reshape(num_tokens, num_heads, head_dim)
+    else:
+        # Already in multi-head format: [num_tokens, num_heads, head_dim]
+        num_tokens, num_heads_input, head_dim = q.shape
+        assert (
+            num_heads_input == num_heads
+        ), f"Expected {num_heads} heads, got {num_heads_input}"
+        hidden_size = num_heads * head_dim  # Calculate hidden_size for proper reshaping
+        q_heads = q
 
-    # Reshape to multi-head format
-    # q: [num_tokens, num_heads, head_dim]
-    # k, v: [total_prefix_len, num_heads, head_dim]
-    q_heads = q.reshape(num_tokens, num_heads, head_dim)
-    k_heads = k_cache.reshape(k_cache.shape[0], num_kv_heads, head_dim)
-    v_heads = v_cache.reshape(v_cache.shape[0], num_kv_heads, head_dim)
+    # KV cache from get_kv_buffer is already in multi-head format: [cache_size, num_kv_heads, head_dim]
+    k_heads = k_cache
+    v_heads = v_cache
 
     # Transpose for efficient matrix operations
     # q: shape of (num_heads, num_tokens, head_dim)
