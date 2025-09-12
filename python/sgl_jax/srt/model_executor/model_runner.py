@@ -102,6 +102,7 @@ class ModelRunner:
 
         # Load the model
         self.sampler = Sampler(nnx.Rngs(server_args.random_seed))
+        total_device_memory = self.get_available_device_memory()
         self.load_model()
 
         self.initialize_jit()
@@ -110,6 +111,7 @@ class ModelRunner:
         self.init_memory_pool(
             server_args.max_running_requests,
             server_args.max_total_tokens,
+            total_device_memory,
         )
 
         self.init_attention_backend()
@@ -191,7 +193,7 @@ class ModelRunner:
         )
         self.num_effective_layers = self.end_layer - self.start_layer
 
-    def profile_max_num_token(self):
+    def profile_max_num_token(self, total_device_memory: int):
         """
         Profile the maximum number of tokens that can fit in memory.
         Uses tpu_info to get accurate TPU memory information.
@@ -199,9 +201,14 @@ class ModelRunner:
         # Get accurate memory information using TPU-specific methods
         # Use tpu_info for memory information
         available_device_memory = self.get_available_device_memory()
-        available_kv_cache_bytes = max(
-            available_device_memory * self.mem_fraction_static, 0
+        available_kv_cache_bytes = available_device_memory - total_device_memory * (
+            1 - self.mem_fraction_static
         )
+
+        if available_kv_cache_bytes <= 0:
+            raise RuntimeError(
+                "Not enough memory. Please try to increase --mem-fraction-static."
+            )
 
         cell_size = (
             self.model_config.get_num_kv_heads_with_padding(self.tp_size)
@@ -228,6 +235,7 @@ class ModelRunner:
         self,
         max_num_reqs: Optional[int] = None,
         max_total_tokens: Optional[int] = None,
+        total_device_memory: Optional[int] = None,
     ):
         """Initialize memory pool for KV cache."""
         # Set KV cache data type
@@ -241,7 +249,7 @@ class ModelRunner:
             )
         logger.info(f"ModelRunner kv_cache_dtype: {self.kv_cache_dtype}")
         # Profile maximum number of tokens
-        self.max_total_num_tokens = self.profile_max_num_token()
+        self.max_total_num_tokens = self.profile_max_num_token(total_device_memory)
 
         # Calculate max number of requests if not provided
         if max_num_reqs is None:
