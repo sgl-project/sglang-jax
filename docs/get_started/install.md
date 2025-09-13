@@ -16,7 +16,7 @@ git clone https://github.com/sgl-project/sglang-jax
 cd sglang-jax
 
 # Install the python packages
-pip install --upgrade pip
+pip install --upgrade pip setuptools packaging
 pip install -e "python[all]"
 
 # Run Qwen-7B Model
