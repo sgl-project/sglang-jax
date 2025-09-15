@@ -6,6 +6,8 @@ import os
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple, Union
 
+from tqdm import tqdm
+
 import jax
 import jax.numpy as jnp
 from flax import nnx
@@ -147,7 +149,6 @@ class WeightLoader:
             nnx.update(self.model, params)
 
     def _iterate_weights(self):
-
         model_path = self.model_config.model_path
         weights_files = glob.glob(os.path.join(model_path, "*.safetensors"))
 
@@ -156,13 +157,16 @@ class WeightLoader:
 
         weights_files.sort()
 
-        for st_file in weights_files:
-            logger.info(f"Loading weights from {st_file}")
-            with jax.default_device(jax.local_devices(backend="cpu")[0]):
-                with safe_open(st_file, framework="flax") as f:
-                    for name in f.keys():
-                        weight_tensor = f.get_tensor(name)
-                        yield name, weight_tensor
+        with tqdm(weights_files, desc="[LOADING] MODEL WEIGHTS", unit="file") as pbar:
+            for st_file in pbar:
+                filename = os.path.basename(st_file)
+                pbar.set_postfix({"file": filename})
+                
+                with jax.default_device(jax.local_devices(backend="cpu")[0]):
+                    with safe_open(st_file, framework="flax") as f:
+                        for name in f.keys():
+                            weight_tensor = f.get_tensor(name)
+                            yield name, weight_tensor
 
     def _process_and_assign_weight(
         self,
@@ -640,38 +644,38 @@ class WeightLoader:
         moe_mappings: Dict[str, WeightMapping],
         expert_weights: Dict[str, jax.Array],
     ):
-        logger.info("Stacking expert weights...")
+        with tqdm(moe_mappings.items(), desc="[STACKING] MOE EXPERTS", unit="layer") as pbar:
+            for moe_key, mapping in pbar:
+                layer_name = moe_key.replace("__MOE_EXPERTS__", "")
+                pbar.set_postfix({"layer": layer_name})
+                
+                if (
+                    not isinstance(mapping.target_path, list)
+                    or len(mapping.target_path) < 2
+                ):
+                    logger.warning(f"Invalid MoE mapping for {moe_key}")
+                    continue
 
-        for moe_key, mapping in moe_mappings.items():
-            if (
-                not isinstance(mapping.target_path, list)
-                or len(mapping.target_path) < 2
-            ):
-                logger.warning(f"Invalid MoE mapping for {moe_key}")
-                continue
+                target_path = mapping.target_path[0]
+                expert_keys = mapping.target_path[1:]
 
-            target_path = mapping.target_path[0]
-            expert_keys = mapping.target_path[1:]
+                collected_weights = []
+                for expert_key in expert_keys:
+                    if expert_key in expert_weights:
+                        weight = expert_weights[expert_key]
+                        if mapping.transpose and not expert_key.endswith(".bias"):
+                            weight = jnp.transpose(weight, (1, 0))
+                        collected_weights.append(weight)
+                    else:
+                        logger.warning(f"Missing expert weight: {expert_key}")
 
-            collected_weights = []
-            for expert_key in expert_keys:
-                if expert_key in expert_weights:
-                    weight = expert_weights[expert_key]
-                    if mapping.transpose and not expert_key.endswith(".bias"):
-                        weight = jnp.transpose(weight, (1, 0))
-                    collected_weights.append(weight)
+                if len(collected_weights) == len(expert_keys):
+                    stacked_weight = jnp.stack(collected_weights, axis=0)
+
+                    device_experts = stacked_weight
+
+                    sharded_weight = self._shard_weight(device_experts, mapping.sharding)
+                    model_param = self._get_param(params, target_path)
+                    model_param.value = sharded_weight
                 else:
-                    logger.warning(f"Missing expert weight: {expert_key}")
-
-            if len(collected_weights) == len(expert_keys):
-                stacked_weight = jnp.stack(collected_weights, axis=0)
-
-                device_experts = stacked_weight
-
-                sharded_weight = self._shard_weight(device_experts, mapping.sharding)
-                model_param = self._get_param(params, target_path)
-                model_param.value = sharded_weight
-            else:
-                logger.error(f"Could not collect all expert weights for {target_path}")
-
-        logger.info("MoE expert weights processing completed.")
+                    logger.error(f"Could not collect all expert weights for {target_path}")

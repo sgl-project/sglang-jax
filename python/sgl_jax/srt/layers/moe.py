@@ -8,6 +8,7 @@ from jax.sharding import Mesh
 from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.layers import linear
+from sgl_jax.srt.layers.gmm.megablox_gmm_backend import gmm
 
 
 class GateLogit(nnx.Module):
@@ -284,19 +285,36 @@ class EPMoE(nnx.Module):
             )  # (0, hidden_dim)
             return empty_output
 
+        m, k = x.shape[0], x.shape[1]
+        n_gate = w0_kernel.shape[2]
+        n_down = wo_kernel.shape[2]
+        
+        default_tile_size = (512, 1024, 1024)
+        tiling_gate = (
+            min(default_tile_size[0], m),
+            min(default_tile_size[1], k),
+            min(default_tile_size[2], n_gate),
+        )
+        tiling_down = (
+            min(default_tile_size[0], m),
+            min(default_tile_size[1], n_gate),
+            min(default_tile_size[2], n_down),
+        )
         # gate
-        layer_w0 = jax.lax.ragged_dot(
+        layer_w0 = gmm(
             lhs=x,
             rhs=w0_kernel,
             group_sizes=local_group_sizes,
             preferred_element_type=self.dtype,
+            tiling=tiling_gate,
         )
         # up
-        layer_w1 = jax.lax.ragged_dot(
+        layer_w1 = gmm(
             lhs=x,
             rhs=w1_kernel,
             group_sizes=local_group_sizes,
             preferred_element_type=self.dtype,
+            tiling=tiling_gate,
         )
 
         # activation
@@ -304,11 +322,12 @@ class EPMoE(nnx.Module):
         intermediate_layer = jnp.multiply(layer_act, layer_w1)
 
         # down
-        intermediate_output = jax.lax.ragged_dot(
+        intermediate_output = gmm(
             lhs=intermediate_layer,
             rhs=wo_kernel,
             group_sizes=local_group_sizes,
             preferred_element_type=self.dtype,
+            tiling=tiling_down,
         )
 
         return intermediate_output
