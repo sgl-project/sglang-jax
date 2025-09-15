@@ -362,9 +362,7 @@ async def async_request_sglang_generate(
             "stream": not args.disable_stream,
             "lora_path": request_func_input.lora_name,
             "return_logprob": args.return_logprob,
-            "logprob_start_len": 1,
-            "top_logprobs_num": 3,
-            "token_ids_logprob": [9370, 105180],
+            "logprob_start_len": -1,
             **request_func_input.extra_request_body,
         }
 
