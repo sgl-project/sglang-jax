@@ -288,7 +288,7 @@ class EPMoE(nnx.Module):
         m, k = x.shape[0], x.shape[1]
         n_gate = w0_kernel.shape[2]
         n_down = wo_kernel.shape[2]
-        
+
         default_tile_size = (512, 1024, 1024)
         tiling_gate = (
             min(default_tile_size[0], m),

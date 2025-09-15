@@ -6,14 +6,13 @@ import os
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple, Union
 
-from tqdm import tqdm
-
 import jax
 import jax.numpy as jnp
 from flax import nnx
 from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 from safetensors import safe_open
+from tqdm import tqdm
 
 from sgl_jax.srt.configs.model_config import ModelConfig
 
@@ -161,7 +160,7 @@ class WeightLoader:
             for st_file in pbar:
                 filename = os.path.basename(st_file)
                 pbar.set_postfix({"file": filename})
-                
+
                 with jax.default_device(jax.local_devices(backend="cpu")[0]):
                     with safe_open(st_file, framework="flax") as f:
                         for name in f.keys():
@@ -644,11 +643,13 @@ class WeightLoader:
         moe_mappings: Dict[str, WeightMapping],
         expert_weights: Dict[str, jax.Array],
     ):
-        with tqdm(moe_mappings.items(), desc="[STACKING] MOE EXPERTS", unit="layer") as pbar:
+        with tqdm(
+            moe_mappings.items(), desc="[STACKING] MOE EXPERTS", unit="layer"
+        ) as pbar:
             for moe_key, mapping in pbar:
                 layer_name = moe_key.replace("__MOE_EXPERTS__", "")
                 pbar.set_postfix({"layer": layer_name})
-                
+
                 if (
                     not isinstance(mapping.target_path, list)
                     or len(mapping.target_path) < 2
@@ -674,8 +675,12 @@ class WeightLoader:
 
                     device_experts = stacked_weight
 
-                    sharded_weight = self._shard_weight(device_experts, mapping.sharding)
+                    sharded_weight = self._shard_weight(
+                        device_experts, mapping.sharding
+                    )
                     model_param = self._get_param(params, target_path)
                     model_param.value = sharded_weight
                 else:
-                    logger.error(f"Could not collect all expert weights for {target_path}")
+                    logger.error(
+                        f"Could not collect all expert weights for {target_path}"
+                    )
