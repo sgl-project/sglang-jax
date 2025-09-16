@@ -297,6 +297,13 @@ class EPMoE(nnx.Module):
             m, n_gate, n_down, num_groups=self.num_experts
         )
 
+        jax.debug.print(
+            "optimal_tiling_gate: {optimal_tiling_gate}", optimal_tiling_gate
+        )
+        jax.debug.print(
+            "optimal_tiling_down: {optimal_tiling_down}", optimal_tiling_down
+        )
+
         tiling_gate = (
             min(optimal_tiling_gate[0], m),
             min(optimal_tiling_gate[1], k),
