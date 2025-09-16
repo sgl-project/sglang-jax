@@ -9,6 +9,7 @@ from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.layers import linear
 from sgl_jax.srt.layers.gmm.megablox_gmm_backend import gmm
+from sgl_jax.srt.layers.gmm.tiling_manager import get_optimal_tiling_for_gmm
 
 
 class GateLogit(nnx.Module):
@@ -289,16 +290,23 @@ class EPMoE(nnx.Module):
         n_gate = w0_kernel.shape[2]
         n_down = wo_kernel.shape[2]
 
-        default_tile_size = (512, 1024, 1024)
+        # Get optimal tiling parameters for gate and down projections
+        optimal_tiling_gate = get_optimal_tiling_for_gmm(
+            m, k, n_gate, num_groups=self.num_experts
+        )
+        optimal_tiling_down = get_optimal_tiling_for_gmm(
+            m, n_gate, n_down, num_groups=self.num_experts
+        )
+
         tiling_gate = (
-            min(default_tile_size[0], m),
-            min(default_tile_size[1], k),
-            min(default_tile_size[2], n_gate),
+            min(optimal_tiling_gate[0], m),
+            min(optimal_tiling_gate[1], k),
+            min(optimal_tiling_gate[2], n_gate),
         )
         tiling_down = (
-            min(default_tile_size[0], m),
-            min(default_tile_size[1], n_gate),
-            min(default_tile_size[2], n_down),
+            min(optimal_tiling_down[0], m),
+            min(optimal_tiling_down[1], n_gate),
+            min(optimal_tiling_down[2], n_down),
         )
         # gate
         layer_w0 = gmm(
