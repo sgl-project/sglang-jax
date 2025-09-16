@@ -244,8 +244,18 @@ class ModelWorker:
                 for seq_length in self.precompile_token_paddings:
                     m = batch_size * seq_length
 
-                    # Don't exceed system limits
+                    # Filter out invalid shapes at the source
                     if m > self.max_padded_num_tokens:
+                        logger.debug(
+                            f"[GMM AUTO-TUNE] Skipping shape with m={m} (exceeds max_padded_num_tokens={self.max_padded_num_tokens})"
+                        )
+                        continue
+
+                    # Skip very small problems that are not worth tuning
+                    if m < 64 or hidden_size < 64 or target_intermediate_size < 64:
+                        logger.debug(
+                            f"[GMM AUTO-TUNE] Skipping tiny shape m={m}, k={hidden_size}, n={target_intermediate_size}"
+                        )
                         continue
 
                     # Add shapes for gate/up projections (hidden -> intermediate)
@@ -276,18 +286,11 @@ class ModelWorker:
                 for i, (m, k, n, num_groups) in enumerate(pbar):
                     pbar.set_postfix(shape=f"m={m},k={k},n={n},g={num_groups}")
 
-                    try:
-                        optimal_tiling = tuner.tune_for_problem_size(
-                            m, k, n, num_groups, use_cache=True, verbose=False
-                        )
-                        cache_key = tuner._get_cache_key(m, k, n, num_groups)
-                        results[cache_key] = optimal_tiling
-
-                    except Exception as e:
-                        logger.warning(
-                            f"[GMM AUTO-TUNE] Failed to tune shape (m={m}, k={k}, n={n}, g={num_groups}): {e}"
-                        )
-                        continue
+                    optimal_tiling = tuner.tune_for_problem_size(
+                        m, k, n, num_groups, use_cache=True
+                    )
+                    cache_key = tuner._get_cache_key(m, k, n, num_groups)
+                    results[cache_key] = optimal_tiling
 
             end_time = time.perf_counter()
             logger.info(

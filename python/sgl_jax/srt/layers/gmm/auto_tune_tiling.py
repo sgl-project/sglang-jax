@@ -1,5 +1,6 @@
 import functools
 import json
+import logging
 import os
 import time
 from typing import Dict, List, Optional, Tuple
@@ -9,6 +10,8 @@ import jax.numpy as jnp
 import numpy as np
 
 from sgl_jax.srt.layers.gmm.megablox_gmm_backend import gmm
+
+logger = logging.getLogger(__name__)
 
 
 class TilingAutoTuner:
@@ -111,7 +114,7 @@ class TilingAutoTuner:
 
         candidates = []
 
-        # Add some heuristic-based candidates
+        # Generate all valid combinations
         for tm in tile_sizes:
             if tm > m:
                 continue
@@ -123,8 +126,8 @@ class TilingAutoTuner:
                         continue
                     candidates.append((tm, tk, tn))
 
-        # Add default configuration
-        default_tiling = (512, 1024, 1024)
+        # Add default configuration if not already present
+        default_tiling = (min(512, m), min(1024, k), min(1024, n))
         if default_tiling not in candidates:
             candidates.append(default_tiling)
 
@@ -140,7 +143,6 @@ class TilingAutoTuner:
         n: int,
         num_groups: int,
         use_cache: bool = True,
-        verbose: bool = True,
     ) -> Tuple[int, int, int]:
         """Tune tiling parameters for a specific problem size."""
 
@@ -154,14 +156,12 @@ class TilingAutoTuner:
         if use_cache:
             cached_result = self._load_cached_result(cache_key)
             if cached_result is not None:
-                if verbose:
-                    print(f"Using cached tiling for {cache_key}: {cached_result}")
+                logger.debug(f"Using cached tiling for {cache_key}: {cached_result}")
                 return cached_result
 
-        if verbose:
-            print(
-                f"Tuning tiling for problem size: m={m}, k={k}, n={n}, groups={num_groups}"
-            )
+        logger.debug(
+            f"Tuning tiling for problem size: m={m}, k={k}, n={n}, groups={num_groups}"
+        )
 
         # Create test data
         lhs, rhs, group_sizes = self._create_test_data(m, k, n, num_groups)
@@ -169,40 +169,36 @@ class TilingAutoTuner:
         # Generate candidate tilings
         candidates = self._generate_tiling_candidates(m, k, n)
 
-        if verbose:
-            print(f"Testing {len(candidates)} tiling candidates...")
-
         best_tiling = None
         best_time = float("inf")
+        failed_count = 0
 
         for i, tiling in enumerate(candidates):
             try:
                 avg_time = self._benchmark_tiling(lhs, rhs, group_sizes, tiling)
-
-                if verbose:
-                    print(
-                        f"  {i+1:2d}/{len(candidates)}: {tiling} -> {avg_time*1000:.2f} ms"
-                    )
-
                 if avg_time < best_time:
                     best_time = avg_time
                     best_tiling = tiling
 
             except Exception as e:
-                if verbose:
-                    print(f"  {i+1:2d}/{len(candidates)}: {tiling} -> ERROR: {e}")
+                failed_count += 1
+                logger.debug(f"Tiling {tiling} failed: {type(e).__name__}: {e}")
                 continue
 
+        # Handle results
         if best_tiling is None:
-            # Fallback to default
-            best_tiling = (512, 1024, 1024)
-            if verbose:
-                print(f"All tilings failed, using default: {best_tiling}")
+            # All candidates failed, use default
+            best_tiling = (min(512, m), min(1024, k), min(1024, n))
+            logger.warning(
+                f"[GMM AUTO-TUNE] All {len(candidates)} tiling candidates failed for problem (m={m}, k={k}, n={n}, groups={num_groups}), using default {best_tiling}"
+            )
         else:
-            if verbose:
-                print(f"Best tiling: {best_tiling} ({best_time*1000:.2f} ms)")
+            if failed_count > 0:
+                logger.warning(
+                    f"[GMM AUTO-TUNE] {failed_count}/{len(candidates)} tiling candidates failed for problem (m={m}, k={k}, n={n}, groups={num_groups})"
+                )
 
-            # Save to cache
+            # Save successful result to cache
             if use_cache:
                 self._save_cached_result(cache_key, best_tiling, best_time)
 
