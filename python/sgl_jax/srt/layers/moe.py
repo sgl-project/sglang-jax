@@ -298,10 +298,12 @@ class EPMoE(nnx.Module):
         )
 
         jax.debug.print(
-            "optimal_tiling_gate: {optimal_tiling_gate}", optimal_tiling_gate
+            "optimal_tiling_gate: {optimal_tiling_gate}",
+            optimal_tiling_gate=optimal_tiling_gate,
         )
         jax.debug.print(
-            "optimal_tiling_down: {optimal_tiling_down}", optimal_tiling_down
+            "optimal_tiling_down: {optimal_tiling_down}",
+            optimal_tiling_down=optimal_tiling_down,
         )
 
         tiling_gate = (
