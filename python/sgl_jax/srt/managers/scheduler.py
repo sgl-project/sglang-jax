@@ -306,15 +306,15 @@ class Scheduler(
             ]
         )
 
-        if not server_args.disable_jax_precompile:
-            logger.info(f"[Scheduler] Begins to run worker precompile.")
-            self.tp_worker.run_precompile()
-            logger.info(f"[Scheduler] Completes worker precompile.")
-
         if not server_args.disable_gmm_auto_tune:
             logger.info(f"[Scheduler] Begins to run GMM auto-tuning.")
             self.tp_worker.run_gmm_auto_tune()
             logger.info(f"[Scheduler] Completes GMM auto-tuning.")
+
+        if not server_args.disable_jax_precompile:
+            logger.info(f"[Scheduler] Begins to run worker precompile.")
+            self.tp_worker.run_precompile()
+            logger.info(f"[Scheduler] Completes worker precompile.")
 
     def sync_pub(self):
         logger.info(
