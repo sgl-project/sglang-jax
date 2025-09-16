@@ -1,0 +1,90 @@
+pull_request_rules:
+- name: label-documentation
+  description: Automatically apply documentation label
+  conditions:
+    - or:
+      - files~=^[^/]+\.md$
+      - files~=^docs/
+  actions:
+    label:
+      add:
+        - documentation
+
+- name: label-ci-build
+  description: Automatically apply ci/build label
+  conditions:
+    - or:
+      - files~=^\.github/
+  actions:
+    label:
+      add:
+        - ci/build
+
+- name: label-deepseek
+  description: Automatically apply deepseek label
+  conditions:
+    - or:
+      - files~=^test/srt/.*deepseek.*\.py
+      - files~=^python/sgl_jax/srt/models/.*deepseek.*\.py
+      - title~=(?i)DeepSeek
+  actions:
+    label:
+      add:
+        - deepseek
+
+- name: label-new-model
+  description: Automatically apply new-model label
+  conditions:
+    - and:
+      - files~=^python/sgl_jax/srt/models/
+      - files=python/sgl_jax/srt/models/registry.py
+  actions:
+    label:
+      add:
+        - new-model
+
+- name: label-performance
+  description: Automatically apply performance label
+  conditions:
+    - or:
+      - files~=^benchmark/
+  actions:
+    label:
+      add:
+        - performance
+
+- name: label-qwen
+  description: Automatically apply qwen label
+  conditions:
+    - or:
+      - files~=^test/srt/.*qwen.*\.py
+      - files~=^python/sgl_jax/srt/models/.*qwen.*\.py
+      - title~=(?i)Qwen
+  actions:
+    label:
+      add:
+        - qwen
+
+- name: ping author on conflicts and add 'needs-rebase' label
+  conditions:
+      - conflict
+      - -closed
+  actions:
+    label:
+      add:
+        - needs-rebase
+    comment:
+      message: |
+       This pull request has merge conflicts that must be resolved before it can be
+       merged. Please rebase the PR, @{{author}}.
+
+       https://docs.github.com/en/pull-requests/collaborating-with-pull-requests/working-with-forks/syncing-a-fork
+
+- name: remove 'needs-rebase' label when conflict is resolved
+  conditions:
+      - -conflict
+      - -closed
+  actions:
+    label:
+      remove:
+        - needs-rebase
