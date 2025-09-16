@@ -311,6 +311,11 @@ class Scheduler(
             self.tp_worker.run_precompile()
             logger.info(f"[Scheduler] Completes worker precompile.")
 
+        if not server_args.disable_gmm_auto_tune:
+            logger.info(f"[Scheduler] Begins to run GMM auto-tuning.")
+            self.tp_worker.run_gmm_auto_tune()
+            logger.info(f"[Scheduler] Completes GMM auto-tuning.")
+
     def sync_pub(self):
         logger.info(
             f"[Publisher {self.node_rank}] Begins to synchronize, wait {self.nnodes-1} Subscribers"

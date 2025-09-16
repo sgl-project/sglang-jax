@@ -129,6 +129,9 @@ class ServerArgs:
 
     disable_jax_precompile: bool = False
 
+    # GMM auto tune
+    disable_gmm_auto_tune: bool = False
+
     def __post_init__(self):
         # Set missing default values
         if self.tokenizer_path is None:
@@ -737,6 +740,11 @@ class ServerArgs:
             "--disable-jax-precompile",
             action="store_true",
             help="whether disable jax precompile",
+        )
+        parser.add_argument(
+            "--disable-gmm-auto-tune",
+            action="store_true",
+            help="Disable automatic tuning of GMM (Grouped Matrix Multiplication) tiling parameters at startup",
         )
         # Kernel backend
         parser.add_argument(

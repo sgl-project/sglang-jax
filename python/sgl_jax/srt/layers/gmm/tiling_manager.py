@@ -4,13 +4,18 @@ import threading
 from typing import Dict, Optional, Tuple
 
 
+def get_default_cache_dir() -> str:
+    """Get the default cache directory from environment variable or fallback."""
+    return os.environ.get("GMM_TUNE_CACHE_DIR", "tuning_cache")
+
+
 class TilingManager:
     """Manages optimal tiling parameters for GMM operations."""
 
     _instance = None
     _lock = threading.Lock()
 
-    def __new__(cls, cache_dir: str = "tuning_cache"):
+    def __new__(cls, cache_dir: Optional[str] = None):
         if cls._instance is None:
             with cls._lock:
                 if cls._instance is None:
@@ -18,11 +23,11 @@ class TilingManager:
                     cls._instance._initialized = False
         return cls._instance
 
-    def __init__(self, cache_dir: str = "tuning_cache"):
+    def __init__(self, cache_dir: Optional[str] = None):
         if self._initialized:
             return
 
-        self.cache_dir = cache_dir
+        self.cache_dir = cache_dir or get_default_cache_dir()
         self.tiling_cache: Dict[str, Tuple[int, int, int]] = {}
         self.default_tiling = (512, 1024, 1024)
         self._load_all_cached_tilings()
@@ -117,7 +122,7 @@ class TilingManager:
 _global_tiling_manager = None
 
 
-def get_tiling_manager(cache_dir: str = "tuning_cache") -> TilingManager:
+def get_tiling_manager(cache_dir: Optional[str] = None) -> TilingManager:
     """Get the global tiling manager instance."""
     global _global_tiling_manager
     if _global_tiling_manager is None:

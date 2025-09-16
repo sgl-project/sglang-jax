@@ -2,6 +2,10 @@
 
 import itertools
 import logging
+import os
+
+# Add import for GMM auto tune
+import sys
 import threading
 import time
 from typing import Optional, Tuple, Union
@@ -28,6 +32,22 @@ from sgl_jax.srt.model_executor.forward_batch_info import (
 from sgl_jax.srt.model_executor.model_runner import MockModelRunner, ModelRunner
 from sgl_jax.srt.sampling.sampling_batch_info import SamplingBatchInfo, SamplingMetadata
 from sgl_jax.srt.server_args import ServerArgs
+
+sys.path.insert(
+    0,
+    os.path.join(
+        os.path.dirname(__file__),
+        "..",
+        "..",
+        "..",
+        "benchmark",
+        "kernels",
+        "megablox_gmm",
+    ),
+)
+from auto_tune_tiling import TilingAutoTuner
+
+from sgl_jax.srt.layers.gmm.tiling_manager import get_default_cache_dir
 from sgl_jax.srt.utils.common_utils import (
     PRECOMPILE_DEFAULT_BS_PADDINGS,
     PRECOMPILE_DEFAULT_TOKEN_PADDINGS,
@@ -183,6 +203,116 @@ class ModelWorker:
             normalized_token_paddings.append(self.max_padded_num_tokens)
 
         self.precompile_token_paddings = normalized_token_paddings
+
+    def run_gmm_auto_tune(self):
+        """Auto-tune GMM tiling parameters for MoE layers."""
+        start_time = time.perf_counter()
+        logger.info("[GMM AUTO-TUNE] Starting GMM tiling parameter auto-tuning")
+
+        try:
+            # Get model configuration
+            hf_config = self.model_config.hf_config
+
+            # Check if this is a MoE model
+            num_experts = getattr(hf_config, "num_experts", None)
+            if num_experts is None:
+                logger.info(
+                    "[GMM AUTO-TUNE] Non-MoE model detected, skipping GMM auto-tuning"
+                )
+                return
+
+            logger.info(
+                f"[GMM AUTO-TUNE] MoE model detected with {num_experts} experts"
+            )
+
+            # Get model dimensions
+            hidden_size = getattr(hf_config, "hidden_size", 4096)
+            intermediate_size = getattr(hf_config, "intermediate_size", None)
+            moe_intermediate_size = getattr(hf_config, "moe_intermediate_size", None)
+
+            # Use MoE intermediate size if available, otherwise fall back to regular intermediate size
+            target_intermediate_size = (
+                moe_intermediate_size or intermediate_size or hidden_size * 4
+            )
+
+            logger.info(
+                f"[GMM AUTO-TUNE] Model config: hidden_size={hidden_size}, "
+                f"intermediate_size={target_intermediate_size}, num_experts={num_experts}"
+            )
+
+            # Generate typical shapes based on model config and expected batch/sequence sizes
+            batch_sizes = [1, 2, 4, 8, 16]
+            seq_lengths = [512, 1024, 2048, 4096]
+
+            shapes = []
+            for batch_size in batch_sizes:
+                for seq_len in seq_lengths:
+                    m = batch_size * seq_len
+                    # Don't exceed reasonable limits
+                    if m > self.max_padded_num_tokens:
+                        continue
+
+                    # Add shapes for gate/up projections (hidden -> intermediate)
+                    shapes.append(
+                        (m, hidden_size, target_intermediate_size, num_experts)
+                    )
+
+                    # Add shapes for down projections (intermediate -> hidden)
+                    shapes.append(
+                        (m, target_intermediate_size, hidden_size, num_experts)
+                    )
+
+            if not shapes:
+                logger.warning("[GMM AUTO-TUNE] No valid shapes to tune, skipping")
+                return
+
+            # Initialize auto-tuner with environment variable cache directory
+            cache_dir = get_default_cache_dir()
+            tuner = TilingAutoTuner(cache_dir=cache_dir)
+            logger.info(f"[GMM AUTO-TUNE] Using cache directory: {cache_dir}")
+
+            # Tune for each shape
+            results = {}
+            total_shapes = len(shapes)
+            logger.info(f"[GMM AUTO-TUNE] Tuning {total_shapes} shape configurations")
+
+            with tqdm(shapes, desc="[GMM AUTO-TUNE] Progress", leave=False) as pbar:
+                for i, (m, k, n, num_groups) in enumerate(pbar):
+                    pbar.set_postfix(shape=f"m={m},k={k},n={n},g={num_groups}")
+
+                    try:
+                        optimal_tiling = tuner.tune_for_problem_size(
+                            m, k, n, num_groups, use_cache=True, verbose=False
+                        )
+                        cache_key = tuner._get_cache_key(m, k, n, num_groups)
+                        results[cache_key] = optimal_tiling
+
+                    except Exception as e:
+                        logger.warning(
+                            f"[GMM AUTO-TUNE] Failed to tune shape (m={m}, k={k}, n={n}, g={num_groups}): {e}"
+                        )
+                        continue
+
+            end_time = time.perf_counter()
+            logger.info(
+                f"[GMM AUTO-TUNE] Completed in {end_time - start_time:.1f} seconds"
+            )
+            logger.info(
+                f"[GMM AUTO-TUNE] Successfully tuned {len(results)}/{total_shapes} configurations"
+            )
+
+            if results:
+                logger.info("[GMM AUTO-TUNE] Sample results:")
+                for i, (key, tiling) in enumerate(list(results.items())[:3]):
+                    logger.info(f"[GMM AUTO-TUNE]   {key} -> {tiling}")
+                if len(results) > 3:
+                    logger.info(f"[GMM AUTO-TUNE]   ... and {len(results) - 3} more")
+
+        except Exception as e:
+            logger.error(f"[GMM AUTO-TUNE] Auto-tuning failed: {e}")
+            logger.info(
+                "[GMM AUTO-TUNE] Continuing without auto-tuning, will use default tiling parameters"
+            )
 
     def run_precompile(self):
         self.precompile_extend()
