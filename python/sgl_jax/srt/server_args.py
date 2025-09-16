@@ -128,8 +128,6 @@ class ServerArgs:
     precompile_bs_paddings: Optional[List[int]] = None
 
     disable_jax_precompile: bool = False
-
-    # GMM auto tune
     disable_gmm_auto_tune: bool = False
 
     def __post_init__(self):

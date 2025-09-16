@@ -191,15 +191,13 @@ class ModelWorker:
         self.precompile_token_paddings = normalized_token_paddings
 
     def run_gmm_auto_tune(self):
-        """Auto-tune GMM tiling parameters for MoE layers."""
         start_time = time.perf_counter()
         logger.info("[GMM AUTO-TUNE] Starting GMM tiling parameter auto-tuning")
 
         try:
-            # Get model configuration
             hf_config = self.model_config.hf_config
 
-            # Check if this is a MoE model
+            # check if this is a MoE model
             num_experts = getattr(hf_config, "num_experts", None)
             if num_experts is None:
                 logger.info(
@@ -211,12 +209,10 @@ class ModelWorker:
                 f"[GMM AUTO-TUNE] MoE model detected with {num_experts} experts"
             )
 
-            # Get model dimensions
             hidden_size = getattr(hf_config, "hidden_size", 4096)
             intermediate_size = getattr(hf_config, "intermediate_size", None)
             moe_intermediate_size = getattr(hf_config, "moe_intermediate_size", None)
 
-            # Use MoE intermediate size if available, otherwise fall back to regular intermediate size
             target_intermediate_size = (
                 moe_intermediate_size or intermediate_size or hidden_size * 4
             )
@@ -272,12 +268,10 @@ class ModelWorker:
                 logger.warning("[GMM AUTO-TUNE] No valid shapes to tune, skipping")
                 return
 
-            # Initialize auto-tuner with environment variable cache directory
             cache_dir = get_default_cache_dir()
             tuner = TilingAutoTuner(cache_dir=cache_dir)
             logger.info(f"[GMM AUTO-TUNE] Using cache directory: {cache_dir}")
 
-            # Tune for each shape
             results = {}
             total_shapes = len(shapes)
             logger.info(f"[GMM AUTO-TUNE] Tuning {total_shapes} shape configurations")
@@ -286,7 +280,7 @@ class ModelWorker:
                 for i, (m, k, n, num_groups) in enumerate(pbar):
                     pbar.set_postfix(shape=f"m={m},k={k},n={n},g={num_groups}")
 
-                    optimal_tiling = tuner.tune_for_problem_size(
+                    optimal_tiling = tuner.tune_for_target_size(
                         m, k, n, num_groups, use_cache=True
                     )
                     cache_key = tuner._get_cache_key(m, k, n, num_groups)

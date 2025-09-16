@@ -290,7 +290,6 @@ class EPMoE(nnx.Module):
         n_gate = w0_kernel.shape[2]
         n_down = wo_kernel.shape[2]
 
-        # Get optimal tiling parameters for gate and down projections
         optimal_tiling_gate = get_optimal_tiling_for_gmm(
             m, k, n_gate, num_groups=self.num_experts
         )

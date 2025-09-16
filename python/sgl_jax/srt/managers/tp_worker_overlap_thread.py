@@ -246,8 +246,6 @@ class ModelWorkerClient:
         self.worker.run_precompile()
 
     def run_gmm_auto_tune(self):
-        """Auto-tune GMM tiling parameters for MoE layers."""
-        # Delegate to the underlying worker
         self.worker.run_gmm_auto_tune()
 
     def __delete__(self):
