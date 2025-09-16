@@ -45,8 +45,7 @@ sys.path.insert(
         "megablox_gmm",
     ),
 )
-from auto_tune_tiling import TilingAutoTuner
-
+from sgl_jax.srt.layers.gmm.auto_tune_tiling import TilingAutoTuner
 from sgl_jax.srt.layers.gmm.tiling_manager import get_default_cache_dir
 from sgl_jax.srt.utils.common_utils import (
     PRECOMPILE_DEFAULT_BS_PADDINGS,
