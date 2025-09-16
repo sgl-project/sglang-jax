@@ -1,5 +1,6 @@
 """Auto-tuned block sizes for ragged paged attention."""
 
+import jax
 import jax.numpy as jnp
 
 from sgl_jax.srt.layers.attention.flash_attn_kernel.util import (
@@ -319,6 +320,22 @@ TUNED_BLOCK_SIZES = {
                     8192: (8, 32),
                 },
                 "q_head-64_kv_head-16_head-256": {
+                    1024: (4, 16),
+                    2048: (4, 16),
+                    256: (2, 16),
+                    4096: (4, 16),
+                    512: (4, 16),
+                    8192: (4, 16),
+                },
+                "q_head-64_kv_head-32_head-128": {
+                    1024: (8, 32),
+                    2048: (8, 32),
+                    256: (2, 32),
+                    4096: (8, 32),
+                    512: (4, 16),
+                    8192: (8, 32),
+                },
+                "q_head-64_kv_head-32_head-256": {
                     1024: (4, 16),
                     2048: (4, 16),
                     256: (2, 16),
@@ -2524,6 +2541,7 @@ def get_tuned_block_sizes(
 ) -> tuple[int, int]:
     """Look up for the best (num_kv_pages_per_blk, num_queries_per_blk) from auto-tuned table."""
     tpu_version = get_tpu_version()
+
     if tpu_version < 4:
         raise NotImplementedError("TPU version must be 4 or higher.")
     keys = get_simplified_key(
@@ -2538,7 +2556,7 @@ def get_tuned_block_sizes(
     device, page_size, dtypes, head_dims, max_model_len = keys
 
     # Default block sizes.
-    bkv_p, bq = (2048 // page_size, 32)
+    bkv_p, bq = (1024 // page_size, 32)
     if tpu_version == 4:
         # TPUv4 has much smaller VMEM size so we pick fixed block sizes.
         bkv_p, bq = (512 // page_size, 32)
@@ -2553,7 +2571,6 @@ def get_tuned_block_sizes(
                         tb = tb[head_dims]
                         if max_model_len in tb:
                             bkv_p, bq = tb[max_model_len]
-
     return (min(pages_per_seq, bkv_p), min(max_num_tokens, bq))
 
 
