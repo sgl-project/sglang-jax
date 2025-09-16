@@ -18,6 +18,8 @@ from jax.experimental.multihost_utils import broadcast_one_to_all
 from tqdm import tqdm
 
 from sgl_jax.srt.configs.model_config import ModelConfig
+from sgl_jax.srt.layers.gmm.auto_tune_tiling import TilingAutoTuner
+from sgl_jax.srt.layers.gmm.tiling_manager import get_default_cache_dir
 from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessorOutput
 from sgl_jax.srt.managers.schedule_batch import (
     ModelWorkerBatch,
@@ -32,21 +34,6 @@ from sgl_jax.srt.model_executor.forward_batch_info import (
 from sgl_jax.srt.model_executor.model_runner import MockModelRunner, ModelRunner
 from sgl_jax.srt.sampling.sampling_batch_info import SamplingBatchInfo, SamplingMetadata
 from sgl_jax.srt.server_args import ServerArgs
-
-sys.path.insert(
-    0,
-    os.path.join(
-        os.path.dirname(__file__),
-        "..",
-        "..",
-        "..",
-        "benchmark",
-        "kernels",
-        "megablox_gmm",
-    ),
-)
-from sgl_jax.srt.layers.gmm.auto_tune_tiling import TilingAutoTuner
-from sgl_jax.srt.layers.gmm.tiling_manager import get_default_cache_dir
 from sgl_jax.srt.utils.common_utils import (
     PRECOMPILE_DEFAULT_BS_PADDINGS,
     PRECOMPILE_DEFAULT_TOKEN_PADDINGS,
@@ -239,15 +226,25 @@ class ModelWorker:
                 f"intermediate_size={target_intermediate_size}, num_experts={num_experts}"
             )
 
-            # Generate typical shapes based on model config and expected batch/sequence sizes
-            batch_sizes = [1, 2, 4, 8, 16]
-            seq_lengths = [512, 1024, 2048, 4096]
+            # Use precompile parameters to generate realistic tuning shapes
+            # precompile_token_paddings = seq_length, precompile_bs_paddings = batch_size
+            # Generate all combinations: m = batch_size * seq_length
+            logger.info(
+                f"[GMM AUTO-TUNE] Using precompile parameters for shape generation"
+            )
+            logger.info(
+                f"[GMM AUTO-TUNE] Batch size paddings: {self.precompile_bs_paddings}"
+            )
+            logger.info(
+                f"[GMM AUTO-TUNE] Sequence length paddings: {self.precompile_token_paddings}"
+            )
 
             shapes = []
-            for batch_size in batch_sizes:
-                for seq_len in seq_lengths:
-                    m = batch_size * seq_len
-                    # Don't exceed reasonable limits
+            for batch_size in self.precompile_bs_paddings:
+                for seq_length in self.precompile_token_paddings:
+                    m = batch_size * seq_length
+
+                    # Don't exceed system limits
                     if m > self.max_padded_num_tokens:
                         continue
 

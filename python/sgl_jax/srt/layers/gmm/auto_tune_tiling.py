@@ -14,7 +14,7 @@ from sgl_jax.srt.layers.gmm.megablox_gmm_backend import gmm
 class TilingAutoTuner:
     """Auto-tuner for megablox GMM tiling parameters."""
 
-    def __init__(self, cache_dir: str = "tuning_cache"):
+    def __init__(self, cache_dir: str = "/tmp/tune_cache"):
         self.cache_dir = cache_dir
         os.makedirs(cache_dir, exist_ok=True)
 

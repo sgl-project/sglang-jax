@@ -6,7 +6,7 @@ from typing import Dict, Optional, Tuple
 
 def get_default_cache_dir() -> str:
     """Get the default cache directory from environment variable or fallback."""
-    return os.environ.get("GMM_TUNE_CACHE_DIR", "tuning_cache")
+    return os.environ.get("GMM_TUNE_CACHE_DIR", "/tmp/tune_cache")
 
 
 class TilingManager:
