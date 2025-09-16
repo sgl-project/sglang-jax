@@ -1,6 +1,5 @@
 """Auto-tuned block sizes for ragged paged attention."""
 
-import jax
 import jax.numpy as jnp
 
 from sgl_jax.srt.layers.attention.flash_attn_kernel.util import (
