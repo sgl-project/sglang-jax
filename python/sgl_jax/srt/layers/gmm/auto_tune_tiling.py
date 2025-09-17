@@ -121,6 +121,23 @@ class TilingAutoTuner:
 
         return candidates
 
+    def _format_failure_summary(self, failure_reasons: dict) -> str:
+        """Format failure reasons into a readable summary."""
+        if not failure_reasons:
+            return "None"
+
+        summary_parts = []
+        for error_type, details in failure_reasons.items():
+            count = details["count"]
+            examples = details["examples"]
+            if count == 1 and examples:
+                summary_parts.append(f"{error_type}(1): {examples[0]}")
+            else:
+                example_str = f" e.g. {examples[0]}" if examples else ""
+                summary_parts.append(f"{error_type}({count}){example_str}")
+
+        return "; ".join(summary_parts)
+
     def tune_for_target_size(
         self,
         m: int,
@@ -151,6 +168,7 @@ class TilingAutoTuner:
         best_tiling = None
         best_time = float("inf")
         failed_count = 0
+        failure_reasons = {}  # Track failure reasons
 
         for i, tiling in enumerate(candidates):
             try:
@@ -161,18 +179,34 @@ class TilingAutoTuner:
 
             except Exception as e:
                 failed_count += 1
-                logger.debug(f"Tiling {tiling} failed: {type(e).__name__}: {e}")
+                error_type = type(e).__name__
+                error_msg = str(e)
+                # Group similar errors
+                if error_type not in failure_reasons:
+                    failure_reasons[error_type] = {"count": 0, "examples": []}
+                failure_reasons[error_type]["count"] += 1
+                if (
+                    len(failure_reasons[error_type]["examples"]) < 3
+                ):  # Keep max 3 examples
+                    failure_reasons[error_type]["examples"].append(
+                        f"{tiling}: {error_msg}"
+                    )
+                logger.debug(f"Tiling {tiling} failed: {error_type}: {error_msg}")
                 continue
 
         if best_tiling is None:
             best_tiling = (min(512, m), min(1024, k), min(1024, n))
+            failure_summary = self._format_failure_summary(failure_reasons)
             logger.warning(
-                f"[GMM AUTO-TUNE] All {len(candidates)} tiling candidates failed for problem (m={m}, k={k}, n={n}, groups={num_groups}), using default {best_tiling}"
+                f"[GMM AUTO-TUNE] All {len(candidates)} tiling candidates failed for problem (m={m}, k={k}, n={n}, groups={num_groups}), using default {best_tiling}. "
+                f"Failure reasons: {failure_summary}"
             )
         else:
             if failed_count > 0:
+                failure_summary = self._format_failure_summary(failure_reasons)
                 logger.warning(
-                    f"[GMM AUTO-TUNE] {failed_count}/{len(candidates)} tiling candidates failed for problem (m={m}, k={k}, n={n}, groups={num_groups})"
+                    f"[GMM AUTO-TUNE] {failed_count}/{len(candidates)} tiling candidates failed for problem (m={m}, k={k}, n={n}, groups={num_groups}). "
+                    f"Failure reasons: {failure_summary}"
                 )
 
             if use_cache:

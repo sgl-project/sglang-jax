@@ -222,9 +222,11 @@ class ModelWorker:
                 f"intermediate_size={target_intermediate_size}, num_experts={num_experts}"
             )
 
+            # Get num_experts_per_tok for proper MoE token expansion
+            num_experts_per_tok = getattr(hf_config, "num_experts_per_tok", 8)
             # Use precompile parameters to generate realistic tuning shapes
             # precompile_token_paddings = seq_length, precompile_bs_paddings = batch_size
-            # Generate all combinations: m = batch_size * seq_length
+            # Generate all combinations: m = batch_size * seq_length * num_experts_per_tok (MoE expansion)
             logger.info(
                 f"[GMM AUTO-TUNE] Using precompile parameters for shape generation"
             )
@@ -234,11 +236,13 @@ class ModelWorker:
             logger.info(
                 f"[GMM AUTO-TUNE] Sequence length paddings: {self.precompile_token_paddings}"
             )
+            logger.info(f"[GMM AUTO-TUNE] Experts per token: {num_experts_per_tok}")
 
             shapes = []
             for batch_size in self.precompile_bs_paddings:
                 for seq_length in self.precompile_token_paddings:
-                    m = batch_size * seq_length
+                    # MoE expands tokens: each token processes num_experts_per_tok experts
+                    m = batch_size * seq_length * num_experts_per_tok
 
                     # Filter out invalid shapes at the source
                     if m > self.max_padded_num_tokens:
