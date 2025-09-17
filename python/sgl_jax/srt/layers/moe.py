@@ -211,7 +211,6 @@ class EPMoE(nnx.Module):
             w0_weights,
             w1_weights,
             wo_weights,
-            gmm_tiling_configs,
         ):
             data_index = jax.lax.axis_index("data")
             tensor_index = jax.lax.axis_index("tensor")
@@ -289,7 +288,6 @@ class EPMoE(nnx.Module):
                 P(("data", "tensor"), None, None),  # w0_weights
                 P(("data", "tensor"), None, None),  # w1_weights
                 P(("data", "tensor"), None, None),  # wo_weights
-                P(None),  # gmm_tiling_configs
             ),
             out_specs=P(None),
             check_rep=False,
@@ -299,7 +297,6 @@ class EPMoE(nnx.Module):
             self.wi_0.value,
             self.wi_1.value,
             self.wo.value,
-            gmm_tiling_configs,
         )
 
     def _gmm_compute_with_sharded_weights(
