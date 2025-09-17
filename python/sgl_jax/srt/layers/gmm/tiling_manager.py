@@ -3,8 +3,6 @@ import os
 import threading
 from typing import Dict, Optional, Tuple
 
-import jax
-
 
 def get_default_cache_dir() -> str:
     return os.environ.get("GMM_TUNE_CACHE_DIR", "/tmp/tune_cache")
@@ -28,8 +26,7 @@ class TilingManager:
 
         self.cache_dir = cache_dir or get_default_cache_dir()
         self.tiling_cache: Dict[str, Tuple[int, int, int]] = {}
-        # TPU-compliant default tiling that works for small decode cases
-        self.default_tiling = (8, 1024, 1024)  # Small tm for decode compatibility
+        self.default_tiling = (8, 1024, 1024)
         self._load_all_cached_tilings()
         self._initialized = True
 
@@ -58,20 +55,7 @@ class TilingManager:
     ) -> Tuple[int, int, int]:
         cache_key = self._get_cache_key(m, k, n, num_groups)
 
-        jax.debug.print(
-            "[TilingManager] Looking for cache_key: {cache_key}",
-            cache_key=cache_key,
-        )
-        jax.debug.print(
-            "[TilingManager] Cache dir: {cache_dir}",
-            cache_dir=self.cache_dir,
-        )
-
         if cache_key in self.tiling_cache:
-            jax.debug.print(
-                "[TilingManager] Found exact match: {tiling}",
-                tiling=self.tiling_cache[cache_key],
-            )
             return self.tiling_cache[cache_key]
 
         # Try to find a close match with same k, n, num_groups but different m
@@ -93,25 +77,11 @@ class TilingManager:
                             abs(cached_m - m) / max(cached_m, m) < 0.5
                             or min(cached_m, m) <= 256
                         )
-                    ):  # Within 50% of cached m, or for small sizes use any available
-                        jax.debug.print(
-                            "[TilingManager] Found close match {cached_key}: {tiling}",
-                            cached_key=cached_key,
-                            tiling=tiling,
-                        )
+                    ):
                         return tiling
                 except ValueError:
                     continue
 
-        # fallback to default
-        jax.debug.print(
-            "[TilingManager] No match found, using default: {default_tiling}",
-            default_tiling=self.default_tiling,
-        )
-        jax.debug.print(
-            "[TilingManager] Available cache keys: {cache_keys}",
-            cache_keys=list(self.tiling_cache.keys()),
-        )
         return self.default_tiling
 
 
