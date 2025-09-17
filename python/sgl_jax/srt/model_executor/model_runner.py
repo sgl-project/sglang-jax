@@ -180,8 +180,6 @@ class ModelRunner:
         return min_available_device_memory
 
     def load_model(self):
-        self.model_config.configure_for_tensor_parallel(self.tp_size)
-
         self.model = self.model_loader.load_model(
             model_config=self.model_config,
         )
@@ -211,7 +209,7 @@ class ModelRunner:
             )
 
         cell_size = (
-            self.model_config.get_num_kv_heads_with_padding(self.tp_size)
+            self.model_config.get_num_kv_heads(self.tp_size)
             * self.model_config.head_dim
             * self.model_config.num_hidden_layers
             * 2
@@ -300,21 +298,12 @@ class ModelRunner:
                 dtype=np.int32,
             )
 
-        self.model_config.log_kv_heads_padding_info(self.tp_size)
-
-        padded_kv_heads_per_device = self.model_config.get_num_kv_heads_with_padding(
-            self.tp_size
-        )
-
-        padded_kv_heads_total = padded_kv_heads_per_device * self.tp_size
-
-        kv_cache_head_num = padded_kv_heads_total
-
+        # Create KV cache pool
         self.token_to_kv_pool = MHATokenToKVPool(
             size=self.max_total_num_tokens,
             page_size=self.page_size,
             dtype=self.kv_cache_dtype,
-            head_num=kv_cache_head_num,
+            head_num=self.model_config.get_total_num_kv_heads(),
             head_dim=self.model_config.head_dim,
             layer_num=self.model_config.num_hidden_layers,
             mesh=self.mesh,
@@ -342,32 +331,20 @@ class ModelRunner:
         self.attn_backend = self._get_attention_backend()
 
     def _get_attention_backend(self):
-        padded_kv_heads = self.model_config.get_num_kv_heads_with_padding(self.tp_size)
-
-        if padded_kv_heads < self.tp_size:
-            kv_partition_axis = "data"
-        else:
-            kv_partition_axis = "tensor"
-
         if self.server_args.attention_backend == "native":
             from sgl_jax.srt.layers.attention.native_backend import NativeAttention
 
-            return NativeAttention(self.num_attn_heads, padded_kv_heads)
+            return NativeAttention(self.num_attn_heads, self.num_kv_heads)
         elif self.server_args.attention_backend == "fa":
-            assert padded_kv_heads % 2 == 0, (
-                f"Padded kv_heads={padded_kv_heads} should be even. "
-                "This indicates a configuration issue with kv heads padding."
-            )
             from sgl_jax.srt.layers.attention.flashattention_backend import (
                 FlashAttention,
             )
 
             return FlashAttention(
                 self.num_attn_heads,
-                padded_kv_heads,
+                self.num_kv_heads,
                 self.model_config.head_dim,
                 page_size=self.page_size,
-                kv_partition_axis=kv_partition_axis,
             )
         else:
             raise ValueError(
@@ -502,18 +479,12 @@ class MockModelRunner(ModelRunner):
             dtype=np.int32,
         )
 
-        self.model_config.log_kv_heads_padding_info(self.tp_size)
-
-        padded_kv_heads_per_device = self.model_config.get_num_kv_heads_with_padding(
-            self.tp_size
-        )
         self.token_to_kv_pool = MHATokenToKVPool(
             size=self.max_total_num_tokens,
             page_size=self.page_size,
             dtype=self.kv_cache_dtype,
-            head_num=padded_kv_heads_per_device,
+            head_num=self.model_config.get_num_kv_heads(self.tp_size),
             head_dim=self.model_config.head_dim,
             layer_num=self.model_config.num_hidden_layers,
             mesh=mesh,
-            kv_partition_axis="tensor",
         )
