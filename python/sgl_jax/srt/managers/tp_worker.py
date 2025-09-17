@@ -19,7 +19,10 @@ from tqdm import tqdm
 
 from sgl_jax.srt.configs.model_config import ModelConfig
 from sgl_jax.srt.layers.gmm.auto_tune_tiling import TilingAutoTuner
-from sgl_jax.srt.layers.gmm.tiling_manager import get_default_cache_dir
+from sgl_jax.srt.layers.gmm.tiling_manager import (
+    get_default_cache_dir,
+    load_all_gmm_tiling_configs,
+)
 from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessorOutput
 from sgl_jax.srt.managers.schedule_batch import (
     ModelWorkerBatch,
@@ -87,6 +90,9 @@ class ModelWorker:
             req_to_token_pool=req_to_token_pool,
             rngs=nnx.Rngs(self.random_seed),
         )
+
+        # Initialize empty GMM tiling configs (will be populated after auto-tune)
+        self.gmm_tiling_configs = {}
 
         # set infer devices
         self.device = server_args.device
@@ -325,13 +331,15 @@ class ModelWorker:
 
             # Load all GMM tiling configurations into memory for fast access
             logger.info("[GMM AUTO-TUNE] Loading tiling configurations into memory")
-            self.model_runner.load_all_gmm_tiling_configs()
+            self.gmm_tiling_configs = load_all_gmm_tiling_configs()
 
         except Exception as e:
             logger.error(f"[GMM AUTO-TUNE] Auto-tuning failed: {e}")
             logger.info(
                 "[GMM AUTO-TUNE] Continuing without auto-tuning, will use default tiling parameters"
             )
+            # Initialize empty configs for fallback
+            self.gmm_tiling_configs = {}
 
     def run_precompile(self):
         self.precompile_extend()
@@ -420,6 +428,9 @@ class ModelWorker:
             self.precompile_bs_paddings,
             self.precompile_cache_loc_paddings,
         )
+
+    def get_gmm_tiling_configs(self):
+        return self.gmm_tiling_configs
 
     def generate_model_worker_batch(
         self,

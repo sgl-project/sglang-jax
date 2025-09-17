@@ -913,6 +913,7 @@ class Scheduler(
             precompile_bs_paddings,
             precompile_cache_loc_paddings,
             self.page_size,
+            self.tp_worker.get_gmm_tiling_configs(),
         )
 
         sampling_metadata = SamplingMetadata.from_model_worker_batch(

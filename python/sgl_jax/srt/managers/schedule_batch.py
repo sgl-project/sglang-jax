@@ -1025,6 +1025,9 @@ class ScheduleBatch:
         bs_paddings: list,
         cache_loc_paddings: List,
         page_size: int,
+        gmm_tiling_configs: Optional[
+            Dict[Tuple[int, int, int, int], Tuple[int, int, int]]
+        ] = None,
     ) -> ModelWorkerBatch:
         if self.forward_mode.is_decode_or_idle():
             extend_seq_lens = extend_prefix_lens = extend_logprob_start_lens = None
@@ -1244,6 +1247,7 @@ class ScheduleBatch:
             real_bs=real_bs,
             capture_hidden_mode=CaptureHiddenMode.NULL,
             launch_done=self.launch_done,
+            gmm_tiling_configs=gmm_tiling_configs,
         )
 
     def _generate_trace_info(self, real_bs: int, bid: int) -> List[str]:
@@ -1349,6 +1353,11 @@ class ModelWorkerBatch:
     real_bs: int
 
     capture_hidden_mode: CaptureHiddenMode = None
+
+    # GMM tiling configurations: (m, k, n, num_groups) -> (tile_m, tile_k, tile_n)
+    gmm_tiling_configs: Optional[
+        Dict[Tuple[int, int, int, int], Tuple[int, int, int]]
+    ] = None
 
     # For logits and logprobs post processing
     temp_scaled_logprobs: bool = False

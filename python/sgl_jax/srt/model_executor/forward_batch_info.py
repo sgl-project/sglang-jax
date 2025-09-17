@@ -265,7 +265,8 @@ class ForwardBatch:
                 batch.extend_seq_lens,
             ),
         )
-        gmm_tiling_configs_cpu = model_runner.get_gmm_tiling_configs_for_batch()
+        # Get GMM tiling configurations from batch (loaded into memory after auto-tune)
+        gmm_tiling_configs_cpu = batch.gmm_tiling_configs
         gmm_tiling_configs = (
             device_array(model_runner.mesh, gmm_tiling_configs_cpu)
             if gmm_tiling_configs_cpu

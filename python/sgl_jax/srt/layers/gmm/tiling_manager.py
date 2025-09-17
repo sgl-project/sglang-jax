@@ -100,3 +100,59 @@ def get_optimal_tiling_for_gmm(
 ) -> Tuple[int, int, int]:
     manager = get_tiling_manager()
     return manager.get_optimal_tiling(m, k, n, num_groups)
+
+
+def load_all_gmm_tiling_configs():
+    """Load all auto-tune GMM tiling configurations into memory after auto-tune completes."""
+    import json
+    import os
+
+    configs = {}
+    cache_dir = get_default_cache_dir()
+
+    if not os.path.exists(cache_dir):
+        print(f"[TilingManager] No auto-tune cache directory found at {cache_dir}")
+        return configs
+
+    loaded_count = 0
+
+    # Load all auto-tune results from cache files
+    for filename in os.listdir(cache_dir):
+        if not filename.endswith(".json"):
+            continue
+
+        cache_file = os.path.join(cache_dir, filename)
+        try:
+            with open(cache_file, "r") as f:
+                data = json.load(f)
+
+            if "optimal_tiling" not in data:
+                continue
+
+            # Parse cache key: m{m}_k{k}_n{n}_g{num_groups}
+            cache_key = filename[:-5]  # Remove .json extension
+            parts = cache_key.split("_")
+            if len(parts) != 4:
+                continue
+
+            try:
+                m = int(parts[0][1:])  # Remove 'm' prefix
+                k = int(parts[1][1:])  # Remove 'k' prefix
+                n = int(parts[2][1:])  # Remove 'n' prefix
+                num_groups = int(parts[3][1:])  # Remove 'g' prefix
+
+                # Store in memory cache
+                key = (m, k, n, num_groups)
+                configs[key] = tuple(data["optimal_tiling"])
+                loaded_count += 1
+
+            except ValueError:
+                continue
+
+        except Exception:
+            continue
+
+    print(
+        f"[TilingManager] Loaded {loaded_count} GMM tiling configurations into memory"
+    )
+    return configs
