@@ -256,7 +256,8 @@ class ModelWorker:
                 # Decode: m = batch_size * num_experts_per_tok
                 m = actual_tokens * num_experts_per_tok
 
-                if m < 64 or hidden_size < 64 or target_intermediate_size < 64:
+                # For decode, allow smaller m values (down to 8 for batch_size=1)
+                if m < 8 or hidden_size < 64 or target_intermediate_size < 64:
                     continue
 
                 # Note: GMM only requires m to be divisible by tile_m, not num_experts
