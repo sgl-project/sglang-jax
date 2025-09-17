@@ -3,7 +3,7 @@ import jax.numpy as jnp
 
 from sgl_jax.srt.layers.gmm.megablox_gmm_kernel.gmm import gmm as gmm_kernel
 
-gmm = jax.custom_vjp(gmm_kernel, nondiff_argnums=(3, 4, 7, 8))
+gmm = jax.custom_vjp(gmm_kernel, nondiff_argnums=(3, 4, 7, 8, 10))
 
 
 def _gmm_fwd(
