@@ -161,6 +161,92 @@ class EPMoE(nnx.Module):
         sharded_state = jax.lax.with_sharding_constraint(state, pspecs)
         nnx.update(self, sharded_state)
 
+        # Preload GMM tiling configurations to avoid runtime cache misses
+        self._preload_gmm_tilings()
+
+    def _preload_gmm_tilings(self):
+        """Preload GMM tiling configurations from auto-tune cache files to avoid runtime cache misses."""
+        import json
+        import os
+
+        from sgl_jax.srt.layers.gmm.tiling_manager import get_default_cache_dir
+
+        self.gmm_tiling_cache = {}
+        cache_dir = get_default_cache_dir()
+
+        if not os.path.exists(cache_dir):
+            print(
+                f"[EPMoE] No auto-tune cache directory found at {cache_dir}, skipping preload"
+            )
+            return
+
+        loaded_count = 0
+
+        # Load all auto-tune results from cache files
+        for filename in os.listdir(cache_dir):
+            if not filename.endswith(".json"):
+                continue
+
+            cache_file = os.path.join(cache_dir, filename)
+            try:
+                with open(cache_file, "r") as f:
+                    data = json.load(f)
+
+                if "optimal_tiling" not in data:
+                    continue
+
+                # Parse cache key to extract parameters: m{m}_k{k}_n{n}_g{num_groups}
+                cache_key = filename[:-5]  # Remove .json extension
+                parts = cache_key.split("_")
+                if len(parts) != 4:
+                    continue
+
+                try:
+                    m = int(parts[0][1:])  # Remove 'm' prefix
+                    k = int(parts[1][1:])  # Remove 'k' prefix
+                    n = int(parts[2][1:])  # Remove 'n' prefix
+                    num_groups = int(parts[3][1:])  # Remove 'g' prefix
+
+                    # Store in cache with our key format: (m, k, n, num_groups)
+                    key = (m, k, n, num_groups)
+                    self.gmm_tiling_cache[key] = tuple(data["optimal_tiling"])
+                    loaded_count += 1
+
+                except ValueError:
+                    # Skip malformed cache keys
+                    continue
+
+            except Exception:
+                # Skip corrupted cache files
+                continue
+
+        print(
+            f"[EPMoE] Preloaded {loaded_count} GMM tiling configurations from auto-tune cache"
+        )
+
+    def _get_preloaded_tiling(self, m: int, k: int, n: int, num_groups: int):
+        """Get tiling from preloaded cache, fallback to runtime lookup if not found."""
+        key = (m, k, n, num_groups)
+        if key in self.gmm_tiling_cache:
+            # Cache hit - return preloaded tiling
+            return self.gmm_tiling_cache[key]
+
+        # Cache miss - use runtime lookup (should be rare)
+        jax.debug.print(
+            "[EPMoE] Cache miss for tiling key: m={m}, k={k}, n={n}, num_groups={num_groups}",
+            m=m,
+            k=k,
+            n=n,
+            num_groups=num_groups,
+        )
+        from sgl_jax.srt.layers.gmm.tiling_manager import get_optimal_tiling_for_gmm
+
+        tiling = get_optimal_tiling_for_gmm(m, k, n, num_groups)
+
+        # Cache the result for future use
+        self.gmm_tiling_cache[key] = tiling
+        return tiling
+
     def _detect_device_capabilities(self):
         try:
             devices = jax.devices()
@@ -290,22 +376,22 @@ class EPMoE(nnx.Module):
         n_gate = w0_kernel.shape[2]
         n_down = wo_kernel.shape[2]
 
-        optimal_tiling_gate = get_optimal_tiling_for_gmm(
-            m, k, n_gate, num_groups=self.num_experts
-        )
-        optimal_tiling_down = get_optimal_tiling_for_gmm(
-            m, n_gate, n_down, num_groups=self.num_experts
+        # Use preloaded tiling cache for better performance and reliability
+        optimal_tiling_gate = self._get_preloaded_tiling(m, k, n_gate, self.num_experts)
+        optimal_tiling_down = self._get_preloaded_tiling(
+            m, n_gate, n_down, self.num_experts
         )
 
+        # Convert to Python integers for static tiling parameters
         tiling_gate = (
-            min(optimal_tiling_gate[0], m),
-            min(optimal_tiling_gate[1], k),
-            min(optimal_tiling_gate[2], n_gate),
+            int(min(optimal_tiling_gate[0], m)),
+            int(min(optimal_tiling_gate[1], k)),
+            int(min(optimal_tiling_gate[2], n_gate)),
         )
         tiling_down = (
-            min(optimal_tiling_down[0], m),
-            min(optimal_tiling_down[1], n_gate),
-            min(optimal_tiling_down[2], n_down),
+            int(min(optimal_tiling_down[0], m)),
+            int(min(optimal_tiling_down[1], n_gate)),
+            int(min(optimal_tiling_down[2], n_down)),
         )
         # gate
         layer_w0 = gmm(

@@ -200,9 +200,6 @@ class ModelWorker:
             # check if this is a MoE model
             num_experts = getattr(hf_config, "num_experts", None)
             if num_experts is None:
-                logger.info(
-                    "[GMM AUTO-TUNE] Non-MoE model detected, skipping GMM auto-tuning"
-                )
                 return
 
             logger.info(
@@ -222,11 +219,8 @@ class ModelWorker:
                 f"intermediate_size={target_intermediate_size}, num_experts={num_experts}"
             )
 
-            # Get num_experts_per_tok for proper MoE token expansion
             num_experts_per_tok = getattr(hf_config, "num_experts_per_tok", 8)
-            # Use precompile parameters to generate realistic tuning shapes
-            # precompile_token_paddings = seq_length, precompile_bs_paddings = batch_size
-            # Generate all combinations: m = batch_size * seq_length * num_experts_per_tok (MoE expansion)
+            # Generate all combinations: m = batch_size * seq_length * num_experts_per_tok
             logger.info(
                 f"[GMM AUTO-TUNE] Using precompile parameters for shape generation"
             )
@@ -244,10 +238,9 @@ class ModelWorker:
             shapes = []
             skipped_count = 0
 
-            # First, add decode-specific shapes (seq_length = 1)
             logger.info(f"[GMM AUTO-TUNE] Adding decode-specific shapes (seq_length=1)")
             for batch_size in self.precompile_bs_paddings:
-                seq_length = 1  # Decode always has seq_length = 1
+                seq_length = 1
                 actual_tokens = batch_size * seq_length  # = batch_size
 
                 if actual_tokens > self.max_padded_num_tokens:
@@ -256,29 +249,22 @@ class ModelWorker:
                 # Decode: m = batch_size * num_experts_per_tok
                 m = actual_tokens * num_experts_per_tok
 
-                # For decode, allow smaller m values (down to 8 for batch_size=1)
                 if m < 8 or hidden_size < 64 or target_intermediate_size < 64:
                     continue
-
-                # Note: GMM only requires m to be divisible by tile_m, not num_experts
-                # This check will be done during tiling candidate generation
 
                 # Add shapes for decode gate/up projections (hidden -> intermediate)
                 shapes.append((m, hidden_size, target_intermediate_size, num_experts))
                 # Add shapes for decode down projections (intermediate -> hidden)
                 shapes.append((m, target_intermediate_size, hidden_size, num_experts))
 
-            # Then, add prefill shapes (variable seq_length)
             logger.info(f"[GMM AUTO-TUNE] Adding prefill shapes (variable seq_length)")
             total_combinations = len(self.precompile_bs_paddings) + (
                 len(self.precompile_bs_paddings) * len(self.precompile_token_paddings)
             )
             for batch_size in self.precompile_bs_paddings:
                 for seq_length in self.precompile_token_paddings:
-                    # Calculate actual token count first (before MoE expansion)
                     actual_tokens = batch_size * seq_length
 
-                    # Filter out invalid shapes based on actual token count
                     if actual_tokens > self.max_padded_num_tokens:
                         skipped_count += 1
                         logger.debug(
@@ -286,10 +272,8 @@ class ModelWorker:
                         )
                         continue
 
-                    # Now calculate m for MoE (after filtering)
                     m = actual_tokens * num_experts_per_tok
 
-                    # Skip very small problems that are not worth tuning
                     if m < 64 or hidden_size < 64 or target_intermediate_size < 64:
                         skipped_count += 1
                         logger.debug(
@@ -297,15 +281,10 @@ class ModelWorker:
                         )
                         continue
 
-                    # Note: GMM only requires m to be divisible by tile_m, not num_experts
-                    # This check will be done during tiling candidate generation
-
-                    # Add shapes for gate/up projections (hidden -> intermediate)
                     shapes.append(
                         (m, hidden_size, target_intermediate_size, num_experts)
                     )
 
-                    # Add shapes for down projections (intermediate -> hidden)
                     shapes.append(
                         (m, target_intermediate_size, hidden_size, num_experts)
                     )
@@ -326,12 +305,6 @@ class ModelWorker:
             total_shapes = len(shapes)
             logger.info(f"[GMM AUTO-TUNE] Tuning {total_shapes} shape configurations")
 
-            # Show sample of shapes that will be tuned
-            if shapes:
-                logger.debug(
-                    f"[GMM AUTO-TUNE] Sample shapes to tune: {shapes[:3]}{'...' if len(shapes) > 3 else ''}"
-                )
-
             with tqdm(shapes, desc="[GMM AUTO-TUNE] Progress", leave=False) as pbar:
                 for i, (m, k, n, num_groups) in enumerate(pbar):
                     pbar.set_postfix(shape=f"m={m},k={k},n={n},g={num_groups}")
@@ -349,13 +322,6 @@ class ModelWorker:
             logger.info(
                 f"[GMM AUTO-TUNE] Successfully tuned {len(results)}/{total_shapes} configurations"
             )
-
-            if results:
-                logger.info("[GMM AUTO-TUNE] Sample results:")
-                for i, (key, tiling) in enumerate(list(results.items())[:3]):
-                    logger.info(f"[GMM AUTO-TUNE]   {key} -> {tiling}")
-                if len(results) > 3:
-                    logger.info(f"[GMM AUTO-TUNE]   ... and {len(results) - 3} more")
 
         except Exception as e:
             logger.error(f"[GMM AUTO-TUNE] Auto-tuning failed: {e}")
