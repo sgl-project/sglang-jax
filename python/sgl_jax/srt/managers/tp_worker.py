@@ -479,6 +479,7 @@ class ModelWorker:
             token_ids_logprobs=None,
             extend_logprob_start_lens=None,
             capture_hidden_mode=CaptureHiddenMode.NULL,
+            gmm_tiling_configs=self.gmm_tiling_configs,
         )
 
     def get_model_runner(self):

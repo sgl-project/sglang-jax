@@ -164,6 +164,8 @@ class EPMoE(nnx.Module):
         self, gmm_tiling_configs, m: int, k: int, n: int, num_groups: int
     ):
         key = (m, k, n, num_groups)
+        if gmm_tiling_configs is None:
+            return (8, 1024, 1024)  # Default fallback when configs not loaded
         return gmm_tiling_configs.get(key, (8, 1024, 1024))  # Default fallback
 
     def _detect_device_capabilities(self):
