@@ -254,7 +254,13 @@ class QWen3MoeDecoderLayer(nnx.Module):
         hidden_states = self.post_attention_layernorm(hidden_states)
         if self.is_moe_layer:
             router_logits = self.moe_gate(hidden_states)
-            mlp_output = self.mlp(hidden_states, router_logits=router_logits)
+            # Extract GMM tiling configs from forward_batch for lightweight passing
+            gmm_tiling_configs = getattr(forward_batch, "gmm_tiling_configs", None)
+            mlp_output = self.mlp(
+                hidden_states,
+                router_logits=router_logits,
+                gmm_tiling_configs=gmm_tiling_configs,
+            )
             hidden_states = mlp_output
         else:
             hidden_states = self.mlp(hidden_states)

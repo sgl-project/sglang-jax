@@ -460,6 +460,65 @@ class ModelRunner:
             sampling_metadata,
         )
 
+    def load_all_gmm_tiling_configs(self):
+        """Load all auto-tune GMM tiling configurations into memory after auto-tune completes."""
+        import json
+        import os
+
+        from sgl_jax.srt.layers.gmm.tiling_manager import get_default_cache_dir
+
+        self.gmm_tiling_configs = {}
+        cache_dir = get_default_cache_dir()
+
+        if not os.path.exists(cache_dir):
+            print(f"[ModelRunner] No auto-tune cache directory found at {cache_dir}")
+            return
+
+        loaded_count = 0
+
+        # Load all auto-tune results from cache files
+        for filename in os.listdir(cache_dir):
+            if not filename.endswith(".json"):
+                continue
+
+            cache_file = os.path.join(cache_dir, filename)
+            try:
+                with open(cache_file, "r") as f:
+                    data = json.load(f)
+
+                if "optimal_tiling" not in data:
+                    continue
+
+                # Parse cache key: m{m}_k{k}_n{n}_g{num_groups}
+                cache_key = filename[:-5]  # Remove .json extension
+                parts = cache_key.split("_")
+                if len(parts) != 4:
+                    continue
+
+                try:
+                    m = int(parts[0][1:])  # Remove 'm' prefix
+                    k = int(parts[1][1:])  # Remove 'k' prefix
+                    n = int(parts[2][1:])  # Remove 'n' prefix
+                    num_groups = int(parts[3][1:])  # Remove 'g' prefix
+
+                    # Store in memory cache
+                    key = (m, k, n, num_groups)
+                    self.gmm_tiling_configs[key] = tuple(data["optimal_tiling"])
+                    loaded_count += 1
+
+                except ValueError:
+                    continue
+
+            except Exception:
+                continue
+
+        print(
+            f"[ModelRunner] Loaded {loaded_count} GMM tiling configurations into memory"
+        )
+
+    def get_gmm_tiling_configs_for_batch(self):
+        return self.gmm_tiling_configs
+
 
 class MockModelRunner(ModelRunner):
     def __init__(

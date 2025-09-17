@@ -9,7 +9,6 @@ from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.layers import linear
 from sgl_jax.srt.layers.gmm.megablox_gmm_backend import gmm
-from sgl_jax.srt.layers.gmm.tiling_manager import get_optimal_tiling_for_gmm
 
 
 class GateLogit(nnx.Module):
@@ -161,91 +160,11 @@ class EPMoE(nnx.Module):
         sharded_state = jax.lax.with_sharding_constraint(state, pspecs)
         nnx.update(self, sharded_state)
 
-        # Preload GMM tiling configurations to avoid runtime cache misses
-        self._preload_gmm_tilings()
-
-    def _preload_gmm_tilings(self):
-        """Preload GMM tiling configurations from auto-tune cache files to avoid runtime cache misses."""
-        import json
-        import os
-
-        from sgl_jax.srt.layers.gmm.tiling_manager import get_default_cache_dir
-
-        self.gmm_tiling_cache = {}
-        cache_dir = get_default_cache_dir()
-
-        if not os.path.exists(cache_dir):
-            print(
-                f"[EPMoE] No auto-tune cache directory found at {cache_dir}, skipping preload"
-            )
-            return
-
-        loaded_count = 0
-
-        # Load all auto-tune results from cache files
-        for filename in os.listdir(cache_dir):
-            if not filename.endswith(".json"):
-                continue
-
-            cache_file = os.path.join(cache_dir, filename)
-            try:
-                with open(cache_file, "r") as f:
-                    data = json.load(f)
-
-                if "optimal_tiling" not in data:
-                    continue
-
-                # Parse cache key to extract parameters: m{m}_k{k}_n{n}_g{num_groups}
-                cache_key = filename[:-5]  # Remove .json extension
-                parts = cache_key.split("_")
-                if len(parts) != 4:
-                    continue
-
-                try:
-                    m = int(parts[0][1:])  # Remove 'm' prefix
-                    k = int(parts[1][1:])  # Remove 'k' prefix
-                    n = int(parts[2][1:])  # Remove 'n' prefix
-                    num_groups = int(parts[3][1:])  # Remove 'g' prefix
-
-                    # Store in cache with our key format: (m, k, n, num_groups)
-                    key = (m, k, n, num_groups)
-                    self.gmm_tiling_cache[key] = tuple(data["optimal_tiling"])
-                    loaded_count += 1
-
-                except ValueError:
-                    # Skip malformed cache keys
-                    continue
-
-            except Exception:
-                # Skip corrupted cache files
-                continue
-
-        print(
-            f"[EPMoE] Preloaded {loaded_count} GMM tiling configurations from auto-tune cache"
-        )
-
-    def _get_preloaded_tiling(self, m: int, k: int, n: int, num_groups: int):
-        """Get tiling from preloaded cache, fallback to runtime lookup if not found."""
+    def _get_tiling_from_configs(
+        self, gmm_tiling_configs, m: int, k: int, n: int, num_groups: int
+    ):
         key = (m, k, n, num_groups)
-        if key in self.gmm_tiling_cache:
-            # Cache hit - return preloaded tiling
-            return self.gmm_tiling_cache[key]
-
-        # Cache miss - use runtime lookup (should be rare)
-        jax.debug.print(
-            "[EPMoE] Cache miss for tiling key: m={m}, k={k}, n={n}, num_groups={num_groups}",
-            m=m,
-            k=k,
-            n=n,
-            num_groups=num_groups,
-        )
-        from sgl_jax.srt.layers.gmm.tiling_manager import get_optimal_tiling_for_gmm
-
-        tiling = get_optimal_tiling_for_gmm(m, k, n, num_groups)
-
-        # Cache the result for future use
-        self.gmm_tiling_cache[key] = tiling
-        return tiling
+        return gmm_tiling_configs.get(key, (8, 1024, 1024))  # Default fallback
 
     def _detect_device_capabilities(self):
         try:
@@ -260,7 +179,7 @@ class EPMoE(nnx.Module):
         except Exception as e:
             return False, "cpu"
 
-    def __call__(self, inputs, router_logits=None):
+    def __call__(self, inputs, router_logits=None, gmm_tiling_configs=None):
         if router_logits is None:
             raise ValueError("router_logits is required for EPMoE")
 
@@ -273,15 +192,26 @@ class EPMoE(nnx.Module):
             )
 
         if self.expert_parallel_size == 1:
-            output = self._single_device_forward(inputs, router_logits)
+            output = self._single_device_forward(
+                inputs, router_logits, gmm_tiling_configs
+            )
         else:
-            output = self._expert_parallel_forward_with_shard_map(inputs, router_logits)
+            output = self._expert_parallel_forward_with_shard_map(
+                inputs, router_logits, gmm_tiling_configs
+            )
 
         return output
 
-    def _expert_parallel_forward_with_shard_map(self, inputs, router_logits):
+    def _expert_parallel_forward_with_shard_map(
+        self, inputs, router_logits, gmm_tiling_configs
+    ):
         def _internal_moe_computation(
-            hidden_states, router_logits, w0_weights, w1_weights, wo_weights
+            hidden_states,
+            router_logits,
+            w0_weights,
+            w1_weights,
+            wo_weights,
+            gmm_tiling_configs,
         ):
             data_index = jax.lax.axis_index("data")
             tensor_index = jax.lax.axis_index("tensor")
@@ -330,6 +260,7 @@ class EPMoE(nnx.Module):
                 w0_weights,
                 w1_weights,
                 wo_weights,
+                gmm_tiling_configs,
             )
 
             # EP Combine
@@ -358,13 +289,28 @@ class EPMoE(nnx.Module):
                 P(("data", "tensor"), None, None),  # w0_weights
                 P(("data", "tensor"), None, None),  # w1_weights
                 P(("data", "tensor"), None, None),  # wo_weights
+                P(None),  # gmm_tiling_configs
             ),
             out_specs=P(None),
             check_rep=False,
-        )(inputs, router_logits, self.wi_0.value, self.wi_1.value, self.wo.value)
+        )(
+            inputs,
+            router_logits,
+            self.wi_0.value,
+            self.wi_1.value,
+            self.wo.value,
+            gmm_tiling_configs,
+        )
 
     def _gmm_compute_with_sharded_weights(
-        self, x, local_group_sizes, selected_experts, w0_kernel, w1_kernel, wo_kernel
+        self,
+        x,
+        local_group_sizes,
+        selected_experts,
+        w0_kernel,
+        w1_kernel,
+        wo_kernel,
+        gmm_tiling_configs,
     ):
         if x.shape[0] == 0:
             empty_output = jnp.zeros(
@@ -376,10 +322,11 @@ class EPMoE(nnx.Module):
         n_gate = w0_kernel.shape[2]
         n_down = wo_kernel.shape[2]
 
-        # Use preloaded tiling cache for better performance and reliability
-        optimal_tiling_gate = self._get_preloaded_tiling(m, k, n_gate, self.num_experts)
-        optimal_tiling_down = self._get_preloaded_tiling(
-            m, n_gate, n_down, self.num_experts
+        optimal_tiling_gate = self._get_tiling_from_configs(
+            gmm_tiling_configs, m, k, n_gate, self.num_experts
+        )
+        optimal_tiling_down = self._get_tiling_from_configs(
+            gmm_tiling_configs, m, n_gate, n_down, self.num_experts
         )
 
         # Convert to Python integers for static tiling parameters
@@ -425,7 +372,7 @@ class EPMoE(nnx.Module):
 
         return intermediate_output
 
-    def _single_device_forward(self, inputs, router_logits):
+    def _single_device_forward(self, inputs, router_logits, gmm_tiling_configs):
         top_k_logits, top_k_indices = jax.lax.top_k(
             router_logits, self.num_experts_per_tok
         )
@@ -435,9 +382,13 @@ class EPMoE(nnx.Module):
 
         top_k_weights = top_k_weights / jnp.sum(top_k_weights, axis=-1, keepdims=True)
 
-        return self._single_device_forward(inputs, top_k_indices, top_k_weights)
+        return self._single_device_forward_impl(
+            inputs, top_k_indices, top_k_weights, gmm_tiling_configs
+        )
 
-    def _single_device_forward(self, inputs, top_k_indices, top_k_weights):
+    def _single_device_forward_impl(
+        self, inputs, top_k_indices, top_k_weights, gmm_tiling_configs
+    ):
         num_tokens = inputs.shape[0] * (inputs.shape[1] if inputs.ndim > 1 else 1)
         inputs_flat = inputs.reshape(num_tokens, -1)
 

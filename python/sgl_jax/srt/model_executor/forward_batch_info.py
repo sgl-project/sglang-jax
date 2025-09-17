@@ -20,7 +20,7 @@ import logging
 from dataclasses import dataclass
 from enum import IntEnum, auto
 from functools import total_ordering
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 import jax
 
@@ -163,6 +163,11 @@ class ForwardBatch:
     trace_request_ids: Optional[List[str]] = None
     trace_request_objects: Optional[List] = None
 
+    # GMM tiling configurations: (m, k, n, num_groups) -> (tile_m, tile_k, tile_n)
+    gmm_tiling_configs: Optional[
+        Dict[Tuple[int, int, int, int], Tuple[int, int, int]]
+    ] = None
+
     def tree_flatten(self):
         children = (
             self.input_ids,
@@ -181,6 +186,7 @@ class ForwardBatch:
         aux_data = {
             "forward_mode": self.forward_mode,
             "batch_size": self.batch_size,
+            "gmm_tiling_configs": self.gmm_tiling_configs,
         }
         return (children, aux_data)
 
@@ -190,6 +196,7 @@ class ForwardBatch:
 
         obj.forward_mode = aux_data["forward_mode"]
         obj.batch_size = aux_data["batch_size"]
+        obj.gmm_tiling_configs = aux_data.get("gmm_tiling_configs", None)
         obj.trace_request_ids = None
         obj.trace_request_objects = None
 
@@ -258,6 +265,13 @@ class ForwardBatch:
                 batch.extend_seq_lens,
             ),
         )
+        gmm_tiling_configs_cpu = model_runner.get_gmm_tiling_configs_for_batch()
+        gmm_tiling_configs = (
+            device_array(model_runner.mesh, gmm_tiling_configs_cpu)
+            if gmm_tiling_configs_cpu
+            else None
+        )
+
         obj = cls(
             bid=batch.bid,
             forward_mode=batch.forward_mode,
@@ -273,6 +287,7 @@ class ForwardBatch:
             extend_seq_lens=extend_seq_lens,
             token_to_kv_pool=model_runner.token_to_kv_pool,
             attn_backend=model_runner.attn_backend,
+            gmm_tiling_configs=gmm_tiling_configs,
         )
 
         return obj

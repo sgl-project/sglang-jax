@@ -248,5 +248,8 @@ class ModelWorkerClient:
     def run_gmm_auto_tune(self):
         self.worker.run_gmm_auto_tune()
 
+    def load_all_gmm_tiling_configs(self):
+        self.worker.model_runner.load_all_gmm_tiling_configs()
+
     def __delete__(self):
         self.input_queue.put((None, None, None, None))

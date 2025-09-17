@@ -323,6 +323,10 @@ class ModelWorker:
                 f"[GMM AUTO-TUNE] Successfully tuned {len(results)}/{total_shapes} configurations"
             )
 
+            # Load all GMM tiling configurations into memory for fast access
+            logger.info("[GMM AUTO-TUNE] Loading tiling configurations into memory")
+            self.model_runner.load_all_gmm_tiling_configs()
+
         except Exception as e:
             logger.error(f"[GMM AUTO-TUNE] Auto-tuning failed: {e}")
             logger.info(
