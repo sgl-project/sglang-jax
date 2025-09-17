@@ -243,8 +243,31 @@ class ModelWorker:
 
             shapes = []
             skipped_count = 0
-            total_combinations = len(self.precompile_bs_paddings) * len(
-                self.precompile_token_paddings
+
+            # First, add decode-specific shapes (seq_length = 1)
+            logger.info(f"[GMM AUTO-TUNE] Adding decode-specific shapes (seq_length=1)")
+            for batch_size in self.precompile_bs_paddings:
+                seq_length = 1  # Decode always has seq_length = 1
+                actual_tokens = batch_size * seq_length  # = batch_size
+
+                if actual_tokens > self.max_padded_num_tokens:
+                    continue
+
+                # Decode: m = batch_size * num_experts_per_tok
+                m = actual_tokens * num_experts_per_tok
+
+                if m < 64 or hidden_size < 64 or target_intermediate_size < 64:
+                    continue
+
+                # Add shapes for decode gate/up projections (hidden -> intermediate)
+                shapes.append((m, hidden_size, target_intermediate_size, num_experts))
+                # Add shapes for decode down projections (intermediate -> hidden)
+                shapes.append((m, target_intermediate_size, hidden_size, num_experts))
+
+            # Then, add prefill shapes (variable seq_length)
+            logger.info(f"[GMM AUTO-TUNE] Adding prefill shapes (variable seq_length)")
+            total_combinations = len(self.precompile_bs_paddings) + (
+                len(self.precompile_bs_paddings) * len(self.precompile_token_paddings)
             )
             for batch_size in self.precompile_bs_paddings:
                 for seq_length in self.precompile_token_paddings:

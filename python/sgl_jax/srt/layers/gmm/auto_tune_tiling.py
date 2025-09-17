@@ -111,10 +111,36 @@ class TilingAutoTuner:
                 for tn in tile_sizes:
                     if tn > n:
                         continue
+
+                    # TPU constraints: check effective dimensions (min of tile_size and actual dimension)
+                    effective_tk = min(tk, k)
+                    effective_tn = min(tn, n)
+
+                    # TPU requires: k dimension divisible by 8, n dimension divisible by 128
+                    if effective_tk % 8 != 0 or effective_tn % 128 != 0:
+                        continue
+
                     candidates.append((tm, tk, tn))
 
-        default_tiling = (min(512, m), min(1024, k), min(1024, n))
-        if default_tiling not in candidates:
+        # Generate TPU-compliant default tiling
+        default_tm = min(512, m)
+        default_tk = min(1024, k)
+        default_tn = min(1024, n)
+
+        # Ensure default tiling meets TPU constraints
+        if default_tk % 8 != 0:
+            default_tk = (default_tk // 8) * 8  # Round down to nearest multiple of 8
+            if default_tk < 8:
+                default_tk = 8
+        if default_tn % 128 != 0:
+            default_tn = (
+                default_tn // 128
+            ) * 128  # Round down to nearest multiple of 128
+            if default_tn < 128:
+                default_tn = 128
+
+        default_tiling = (default_tm, default_tk, default_tn)
+        if default_tiling not in candidates and all(d > 0 for d in default_tiling):
             candidates.append(default_tiling)
 
         candidates.sort(key=lambda x: (x[0] * x[1] * x[2], x[0], x[1], x[2]))
@@ -195,7 +221,26 @@ class TilingAutoTuner:
                 continue
 
         if best_tiling is None:
-            best_tiling = (min(512, m), min(1024, k), min(1024, n))
+            # Generate TPU-compliant fallback tiling
+            fallback_tm = min(512, m)
+            fallback_tk = min(1024, k)
+            fallback_tn = min(1024, n)
+
+            # Ensure fallback meets TPU constraints
+            if fallback_tk % 8 != 0:
+                fallback_tk = (
+                    fallback_tk // 8
+                ) * 8  # Round down to nearest multiple of 8
+                if fallback_tk < 8:
+                    fallback_tk = 8
+            if fallback_tn % 128 != 0:
+                fallback_tn = (
+                    fallback_tn // 128
+                ) * 128  # Round down to nearest multiple of 128
+                if fallback_tn < 128:
+                    fallback_tn = 128
+
+            best_tiling = (fallback_tm, fallback_tk, fallback_tn)
             failure_summary = self._format_failure_summary(failure_reasons)
             logger.warning(
                 f"[GMM AUTO-TUNE] All {len(candidates)} tiling candidates failed for problem (m={m}, k={k}, n={n}, groups={num_groups}), using default {best_tiling}. "
