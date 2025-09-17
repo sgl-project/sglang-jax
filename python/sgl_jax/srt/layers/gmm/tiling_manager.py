@@ -88,8 +88,11 @@ class TilingManager:
                         cached_k == k
                         and cached_n == n
                         and cached_groups == num_groups
-                        and abs(cached_m - m) / max(cached_m, m) < 0.5
-                    ):  # Within 50% of cached m
+                        and (
+                            abs(cached_m - m) / max(cached_m, m) < 0.5
+                            or min(cached_m, m) <= 256
+                        )
+                    ):  # Within 50% of cached m, or for small sizes use any available
                         jax.debug.print(
                             "[TilingManager] Found close match {cached_key}: {tiling}",
                             cached_key=cached_key,

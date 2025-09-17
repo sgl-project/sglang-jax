@@ -252,7 +252,9 @@ class QWen3MoeDecoderLayer(nnx.Module):
         hidden_states += residual
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
-
+        jax.debug.print(
+            "hidden_states_shape: {hidden_states}", hidden_states=hidden_states.shape
+        )
         if self.is_moe_layer:
             router_logits = self.moe_gate(hidden_states)
             mlp_output = self.mlp(hidden_states, router_logits=router_logits)
