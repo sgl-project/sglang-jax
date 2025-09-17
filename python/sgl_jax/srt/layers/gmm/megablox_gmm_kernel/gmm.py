@@ -297,7 +297,6 @@ def gmm(
     existing_out: jnp.ndarray | None = None,
     transpose_rhs: bool = False,
     interpret: bool = False,
-    vmem_limit_bytes: int = 64 * (1 << 20),
 ) -> jnp.ndarray:
     """Compute lhs[sizes[i-1]:sizes[i], :] @ rhs for each group 'i'.
 
@@ -514,7 +513,7 @@ def gmm(
         input_output_aliases=input_output_aliases,
         compiler_params=pltpu.CompilerParams(
             dimension_semantics=("parallel", "arbitrary", "arbitrary"),
-            vmem_limit_bytes=vmem_limit_bytes,
+            vmem_limit_bytes=int(64 * (1 << 20)),
             disable_bounds_checks=True,
         ),
         interpret=interpret,

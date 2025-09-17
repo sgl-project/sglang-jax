@@ -16,7 +16,6 @@ def _gmm_fwd(
     existing_out: jnp.ndarray | None = None,
     transpose_rhs: bool = False,
     interpret: bool = False,
-    vmem_limit_bytes: int = 64 * (1 << 20),
 ) -> tuple[
     jnp.ndarray,
     tuple[
@@ -37,7 +36,6 @@ def _gmm_fwd(
         existing_out,
         transpose_rhs=transpose_rhs,
         interpret=interpret,
-        vmem_limit_bytes=vmem_limit_bytes,
     )
     return out, (lhs, rhs, group_sizes, group_offset, rhs.shape[0])
 
