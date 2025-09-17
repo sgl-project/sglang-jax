@@ -237,24 +237,36 @@ class ModelWorker:
                 f"[GMM AUTO-TUNE] Sequence length paddings: {self.precompile_token_paddings}"
             )
             logger.info(f"[GMM AUTO-TUNE] Experts per token: {num_experts_per_tok}")
+            logger.info(
+                f"[GMM AUTO-TUNE] Max padded num tokens: {self.max_padded_num_tokens}"
+            )
 
             shapes = []
+            skipped_count = 0
+            total_combinations = len(self.precompile_bs_paddings) * len(
+                self.precompile_token_paddings
+            )
             for batch_size in self.precompile_bs_paddings:
                 for seq_length in self.precompile_token_paddings:
-                    # MoE expands tokens: each token processes num_experts_per_tok experts
-                    m = batch_size * seq_length * num_experts_per_tok
+                    # Calculate actual token count first (before MoE expansion)
+                    actual_tokens = batch_size * seq_length
 
-                    # Filter out invalid shapes at the source
-                    if m > self.max_padded_num_tokens:
+                    # Filter out invalid shapes based on actual token count
+                    if actual_tokens > self.max_padded_num_tokens:
+                        skipped_count += 1
                         logger.debug(
-                            f"[GMM AUTO-TUNE] Skipping shape with m={m} (exceeds max_padded_num_tokens={self.max_padded_num_tokens})"
+                            f"[GMM AUTO-TUNE] Skipping shape bs={batch_size}, seq={seq_length} -> actual_tokens={actual_tokens} (exceeds max_padded_num_tokens={self.max_padded_num_tokens})"
                         )
                         continue
 
+                    # Now calculate m for MoE (after filtering)
+                    m = actual_tokens * num_experts_per_tok
+
                     # Skip very small problems that are not worth tuning
                     if m < 64 or hidden_size < 64 or target_intermediate_size < 64:
+                        skipped_count += 1
                         logger.debug(
-                            f"[GMM AUTO-TUNE] Skipping tiny shape m={m}, k={hidden_size}, n={target_intermediate_size}"
+                            f"[GMM AUTO-TUNE] Skipping tiny shape bs={batch_size}, seq={seq_length} -> m={m}, k={hidden_size}, n={target_intermediate_size}"
                         )
                         continue
 
@@ -268,6 +280,10 @@ class ModelWorker:
                         (m, target_intermediate_size, hidden_size, num_experts)
                     )
 
+            logger.info(
+                f"[GMM AUTO-TUNE] Generated {len(shapes)} shape configurations from {total_combinations} combinations "
+                f"(skipped {skipped_count} due to size constraints)"
+            )
             if not shapes:
                 logger.warning("[GMM AUTO-TUNE] No valid shapes to tune, skipping")
                 return
@@ -279,6 +295,12 @@ class ModelWorker:
             results = {}
             total_shapes = len(shapes)
             logger.info(f"[GMM AUTO-TUNE] Tuning {total_shapes} shape configurations")
+
+            # Show sample of shapes that will be tuned
+            if shapes:
+                logger.debug(
+                    f"[GMM AUTO-TUNE] Sample shapes to tune: {shapes[:3]}{'...' if len(shapes) > 3 else ''}"
+                )
 
             with tqdm(shapes, desc="[GMM AUTO-TUNE] Progress", leave=False) as pbar:
                 for i, (m, k, n, num_groups) in enumerate(pbar):
