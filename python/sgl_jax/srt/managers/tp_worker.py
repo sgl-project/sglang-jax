@@ -259,9 +259,8 @@ class ModelWorker:
                 if m < 64 or hidden_size < 64 or target_intermediate_size < 64:
                     continue
 
-                # GMM requires m to be divisible by num_experts
-                if m % num_experts != 0:
-                    continue
+                # Note: GMM only requires m to be divisible by tile_m, not num_experts
+                # This check will be done during tiling candidate generation
 
                 # Add shapes for decode gate/up projections (hidden -> intermediate)
                 shapes.append((m, hidden_size, target_intermediate_size, num_experts))
@@ -297,13 +296,8 @@ class ModelWorker:
                         )
                         continue
 
-                    # GMM requires m to be divisible by num_experts
-                    if m % num_experts != 0:
-                        skipped_count += 1
-                        logger.debug(
-                            f"[GMM AUTO-TUNE] Skipping prefill shape bs={batch_size}, seq={seq_length} -> m={m} not divisible by num_experts={num_experts}"
-                        )
-                        continue
+                    # Note: GMM only requires m to be divisible by tile_m, not num_experts
+                    # This check will be done during tiling candidate generation
 
                     # Add shapes for gate/up projections (hidden -> intermediate)
                     shapes.append(

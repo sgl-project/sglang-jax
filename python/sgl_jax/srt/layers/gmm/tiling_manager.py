@@ -28,7 +28,8 @@ class TilingManager:
 
         self.cache_dir = cache_dir or get_default_cache_dir()
         self.tiling_cache: Dict[str, Tuple[int, int, int]] = {}
-        self.default_tiling = (512, 1024, 1024)
+        # TPU-compliant default tiling that works for small decode cases
+        self.default_tiling = (8, 1024, 1024)  # Small tm for decode compatibility
         self._load_all_cached_tilings()
         self._initialized = True
 

@@ -98,18 +98,35 @@ class TilingAutoTuner:
     def _generate_tiling_candidates(
         self, m: int, k: int, n: int
     ) -> List[Tuple[int, int, int]]:
-        tile_sizes = [64, 128, 256, 512, 1024, 2048]
+        # Use conservative tile sizes that work well with TPU constraints
+        tile_sizes_m = [
+            8,
+            16,
+            32,
+            64,
+            128,
+            256,
+            512,
+            1024,
+            2048,
+        ]  # m can be small for decode
+        tile_sizes_k = [128, 256, 512, 1024, 2048]  # k should be >= 128 for TPU
+        tile_sizes_n = [128, 256, 512, 1024, 2048]  # n should be >= 128 for TPU
 
         candidates = []
 
-        for tm in tile_sizes:
+        for tm in tile_sizes_m:
             if tm > m:
                 continue
-            for tk in tile_sizes:
+            for tk in tile_sizes_k:
                 if tk > k:
                     continue
-                for tn in tile_sizes:
+                for tn in tile_sizes_n:
                     if tn > n:
+                        continue
+
+                    # GMM constraint: dimensions must be divisible by tile sizes
+                    if m % tm != 0 or k % tk != 0 or n % tn != 0:
                         continue
 
                     # TPU constraints: check effective dimensions (min of tile_size and actual dimension)
@@ -122,22 +139,27 @@ class TilingAutoTuner:
 
                     candidates.append((tm, tk, tn))
 
-        # Generate TPU-compliant default tiling
-        default_tm = min(512, m)
-        default_tk = min(1024, k)
-        default_tn = min(1024, n)
+        # Generate valid default tiling that satisfies both GMM and TPU constraints
+        default_tm = 8  # Start with small value for decode compatibility
+        default_tk = 128  # Start with TPU-safe minimum
+        default_tn = 128  # Start with TPU-safe minimum
 
-        # Ensure default tiling meets TPU constraints
-        if default_tk % 8 != 0:
-            default_tk = (default_tk // 8) * 8  # Round down to nearest multiple of 8
-            if default_tk < 8:
-                default_tk = 8
-        if default_tn % 128 != 0:
-            default_tn = (
-                default_tn // 128
-            ) * 128  # Round down to nearest multiple of 128
-            if default_tn < 128:
-                default_tn = 128
+        # Find the largest tm that divides m (including smaller values for decode)
+        for tm in tile_sizes_m:
+            if tm <= m and m % tm == 0:
+                default_tm = tm
+
+        # Find the largest tk that divides k and meets TPU constraints
+        for tk in reversed(tile_sizes_k):  # Try larger values first
+            if tk <= k and k % tk == 0:
+                default_tk = tk
+                break
+
+        # Find the largest tn that divides n and meets TPU constraints
+        for tn in reversed(tile_sizes_n):  # Try larger values first
+            if tn <= n and n % tn == 0:
+                default_tn = tn
+                break
 
         default_tiling = (default_tm, default_tk, default_tn)
         if default_tiling not in candidates and all(d > 0 for d in default_tiling):
@@ -172,27 +194,8 @@ class TilingAutoTuner:
         num_groups: int,
         use_cache: bool = True,
     ) -> Tuple[int, int, int]:
-        # GMM constraint: m must be divisible by num_groups (num_experts)
-        if m % num_groups != 0:
-            logger.warning(
-                f"[GMM AUTO-TUNE] Skipping shape m={m}, k={k}, n={n}, num_groups={num_groups}: m not divisible by num_groups"
-            )
-            # Return TPU-compliant default instead of raising error
-            default_tm = min(512, m)
-            default_tk = min(1024, k)
-            default_tn = min(1024, n)
-
-            # Ensure default meets TPU constraints
-            if default_tk % 8 != 0:
-                default_tk = (default_tk // 8) * 8
-                if default_tk < 8:
-                    default_tk = 8
-            if default_tn % 128 != 0:
-                default_tn = (default_tn // 128) * 128
-                if default_tn < 128:
-                    default_tn = 128
-
-            return (default_tm, default_tk, default_tn)
+        # Note: GMM requires m % tile_m == 0, k % tile_k == 0, n % tile_n == 0
+        # These constraints will be checked during candidate generation
 
         cache_key = self._get_cache_key(m, k, n, num_groups)
 
@@ -240,24 +243,32 @@ class TilingAutoTuner:
                 continue
 
         if best_tiling is None:
-            # Generate TPU-compliant fallback tiling
-            fallback_tm = min(512, m)
-            fallback_tk = min(1024, k)
-            fallback_tn = min(1024, n)
+            # Generate valid fallback tiling that satisfies both GMM and TPU constraints
+            fallback_tm = 8  # Start with small value for decode compatibility
+            fallback_tk = 128  # Start with TPU-safe minimum
+            fallback_tn = 128  # Start with TPU-safe minimum
 
-            # Ensure fallback meets TPU constraints
-            if fallback_tk % 8 != 0:
-                fallback_tk = (
-                    fallback_tk // 8
-                ) * 8  # Round down to nearest multiple of 8
-                if fallback_tk < 8:
-                    fallback_tk = 8
-            if fallback_tn % 128 != 0:
-                fallback_tn = (
-                    fallback_tn // 128
-                ) * 128  # Round down to nearest multiple of 128
-                if fallback_tn < 128:
-                    fallback_tn = 128
+            # Define tile sizes (same as in _generate_tiling_candidates)
+            tile_sizes_m = [8, 16, 32, 64, 128, 256, 512, 1024, 2048]
+            tile_sizes_k = [128, 256, 512, 1024, 2048]
+            tile_sizes_n = [128, 256, 512, 1024, 2048]
+
+            # Find the largest tm that divides m (including smaller values for decode)
+            for tm in tile_sizes_m:
+                if tm <= m and m % tm == 0:
+                    fallback_tm = tm
+
+            # Find the largest tk that divides k and meets TPU constraints
+            for tk in reversed(tile_sizes_k):  # Try larger values first
+                if tk <= k and k % tk == 0:
+                    fallback_tk = tk
+                    break
+
+            # Find the largest tn that divides n and meets TPU constraints
+            for tn in reversed(tile_sizes_n):  # Try larger values first
+                if tn <= n and n % tn == 0:
+                    fallback_tn = tn
+                    break
 
             best_tiling = (fallback_tm, fallback_tk, fallback_tn)
             failure_summary = self._format_failure_summary(failure_reasons)
