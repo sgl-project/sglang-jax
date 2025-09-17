@@ -172,8 +172,27 @@ class TilingAutoTuner:
         num_groups: int,
         use_cache: bool = True,
     ) -> Tuple[int, int, int]:
+        # GMM constraint: m must be divisible by num_groups (num_experts)
         if m % num_groups != 0:
-            raise ValueError(f"m ({m}) must be divisible by num_groups ({num_groups})")
+            logger.warning(
+                f"[GMM AUTO-TUNE] Skipping shape m={m}, k={k}, n={n}, num_groups={num_groups}: m not divisible by num_groups"
+            )
+            # Return TPU-compliant default instead of raising error
+            default_tm = min(512, m)
+            default_tk = min(1024, k)
+            default_tn = min(1024, n)
+
+            # Ensure default meets TPU constraints
+            if default_tk % 8 != 0:
+                default_tk = (default_tk // 8) * 8
+                if default_tk < 8:
+                    default_tk = 8
+            if default_tn % 128 != 0:
+                default_tn = (default_tn // 128) * 128
+                if default_tn < 128:
+                    default_tn = 128
+
+            return (default_tm, default_tk, default_tn)
 
         cache_key = self._get_cache_key(m, k, n, num_groups)
 
