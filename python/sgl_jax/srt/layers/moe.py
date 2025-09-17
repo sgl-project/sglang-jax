@@ -328,24 +328,24 @@ class EPMoE(nnx.Module):
             gmm_tiling_configs, m, n_gate, n_down, self.num_experts
         )
 
-        # Convert to Python integers for static tiling parameters
-        tiling_gate = (
-            int(min(optimal_tiling_gate[0], m)),
-            int(min(optimal_tiling_gate[1], k)),
-            int(min(optimal_tiling_gate[2], n_gate)),
-        )
-        tiling_down = (
-            int(min(optimal_tiling_down[0], m)),
-            int(min(optimal_tiling_down[1], n_gate)),
-            int(min(optimal_tiling_down[2], n_down)),
-        )
+        # Use JAX operations for tiling parameters (cannot use int() on tracers)
+        # tiling_gate = (
+        #     jnp.minimum(optimal_tiling_gate[0], m),
+        #     jnp.minimum(optimal_tiling_gate[1], k),
+        #     jnp.minimum(optimal_tiling_gate[2], n_gate),
+        # )
+        # tiling_down = (
+        #     jnp.minimum(optimal_tiling_down[0], m),
+        #     jnp.minimum(optimal_tiling_down[1], n_gate),
+        #     jnp.minimum(optimal_tiling_down[2], n_down),
+        # )
         # gate
         layer_w0 = gmm(
             lhs=x,
             rhs=w0_kernel,
             group_sizes=local_group_sizes,
             preferred_element_type=self.dtype,
-            tiling=tiling_gate,
+            tiling=optimal_tiling_gate,
         )
         # up
         layer_w1 = gmm(
@@ -353,7 +353,7 @@ class EPMoE(nnx.Module):
             rhs=w1_kernel,
             group_sizes=local_group_sizes,
             preferred_element_type=self.dtype,
-            tiling=tiling_gate,
+            tiling=optimal_tiling_gate,
         )
 
         # activation
@@ -366,7 +366,7 @@ class EPMoE(nnx.Module):
             rhs=wo_kernel,
             group_sizes=local_group_sizes,
             preferred_element_type=self.dtype,
-            tiling=tiling_down,
+            tiling=optimal_tiling_down,
         )
 
         return intermediate_output
