@@ -208,7 +208,7 @@ class ModelWorker:
             if num_experts is None:
                 self.disable_gmm_auto_tune = True
                 return
-
+            self.disable_gmm_auto_tune = False
             logger.info(
                 f"[GMM AUTO-TUNE] MoE model detected with {num_experts} experts"
             )
