@@ -256,9 +256,6 @@ class ModelWorker:
                 seq_length = 1
                 actual_tokens = batch_size * seq_length  # = batch_size
 
-                if actual_tokens > self.max_padded_num_tokens:
-                    continue
-
                 # Decode: m = batch_size * num_experts_per_tok
                 m = actual_tokens * self.num_experts_per_tok
 
@@ -281,13 +278,6 @@ class ModelWorker:
             for batch_size in self.precompile_bs_paddings:
                 for seq_length in self.precompile_token_paddings:
                     actual_tokens = batch_size * seq_length
-
-                    if actual_tokens > self.max_padded_num_tokens:
-                        skipped_count += 1
-                        logger.debug(
-                            f"[GMM AUTO-TUNE] Skipping shape bs={batch_size}, seq={seq_length} -> actual_tokens={actual_tokens} (exceeds max_padded_num_tokens={self.max_padded_num_tokens})"
-                        )
-                        continue
 
                     m = actual_tokens * self.num_experts_per_tok
 
@@ -482,7 +472,7 @@ class ModelWorker:
             # )
             gmm_tiling_config_array[0] = self.gmm_tiling_configs.get(
                 tiling_key,
-                None,
+                [512, 1024, 1024],
             )
             jax.debug.print("tiling_key: {tiling_key}", tiling_key=tiling_key)
             jax.debug.print(
