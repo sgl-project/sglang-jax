@@ -331,6 +331,15 @@ class ModelConfig:
                 f"padding_strategy={padding_strategy}"
             )
 
+    def validate_tensor_parallel_config(self, tensor_parallel_size: int):
+        """Validate tensor parallel configuration constraints."""
+        # Query heads must be divisible by tensor parallel size
+        assert self.num_attention_heads % tensor_parallel_size == 0, (
+            f"Number of attention heads ({self.num_attention_heads}) must be divisible by "
+            f"tensor parallel size ({tensor_parallel_size}). "
+            f"Got remainder: {self.num_attention_heads % tensor_parallel_size}"
+        )
+
     # adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/config.py
     def _parse_quant_hf_config(self):
         quant_cfg = getattr(self.hf_config, "quantization_config", None)

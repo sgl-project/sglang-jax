@@ -182,8 +182,8 @@ class ModelRunner:
         return min_available_device_memory
 
     def load_model(self):
+        self.model_config.validate_tensor_parallel_config(self.tp_size)
         self.model_config.configure_for_tensor_parallel(self.tp_size)
-
         self.model_config.log_kv_heads_info(self.tp_size)
 
         self.model = self.model_loader.load_model(
@@ -475,6 +475,10 @@ class MockModelRunner(ModelRunner):
         self.kv_cache_dtype = jnp.bfloat16
         self.page_size = 1
         self.mesh = mesh
+
+        # Validate tensor parallel configuration for MockModelRunner too
+        if not isinstance(model_config, MockModelConfig):
+            self.model_config.validate_tensor_parallel_config(self.tp_size)
 
         # If it is a draft model, tp_group can be different
         max_num_reqs = min(
