@@ -474,7 +474,7 @@ class PrefillAdder:
             # self.rem_total_tokens may decrease after the lock acquisition
             if total_tokens >= self.rem_total_tokens:
                 return AddReqResult.NO_TOKEN
-
+            req.last_matched_prefix_len = prefix_len
             input_tokens = self.ceil_paged_tokens(req.extend_input_len)
 
             if input_tokens >= self.rem_input_tokens and len(self.can_run_list) != 0:

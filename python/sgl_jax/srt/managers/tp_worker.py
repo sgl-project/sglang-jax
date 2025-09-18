@@ -46,14 +46,30 @@ class ModelWorker:
         server_args: ServerArgs,
         mesh: jax.sharding.Mesh,
         req_to_token_pool: ReqToTokenPool | None = None,
+        is_draft_worker: bool = False,
     ):
         # Parse args
         self.tp_size = server_args.tp_size
+        from sgl_jax.srt.speculative.spec_info import SpeculativeAlgorithm
 
+        self.speculative_algorithm = SpeculativeAlgorithm.from_string(
+            server_args.speculative_algorithm
+        )
+        self.server_args = server_args
         # Init model and tokenizer
         self.model_config = ModelConfig.from_server_args(
             server_args,
-            model_path=server_args.model_path,
+            model_path=(
+                server_args.model_path
+                if not is_draft_worker
+                else server_args.speculative_draft_model_path
+            ),
+            model_revision=(
+                server_args.revision
+                if not is_draft_worker
+                else server_args.speculative_draft_model_revision
+            ),
+            is_draft_model=is_draft_worker,
         )
 
         self.mesh = mesh
@@ -75,6 +91,7 @@ class ModelWorker:
             tp_size=server_args.tp_size,
             server_args=server_args,
             mesh=self.mesh,
+            is_draft_worker=is_draft_worker,
             req_to_token_pool=req_to_token_pool,
             rngs=nnx.Rngs(self.random_seed),
         )
@@ -309,6 +326,8 @@ class ModelWorker:
         num_tokens: int,
         mode: ForwardMode,
         max_cache_loc_size: int,
+        do_penalties: bool = False,
+        speculative_algotithm=None,
     ) -> ModelWorkerBatch:
         valid_input_ids = np.array([1] * bs, dtype=jnp.int32)
         invalid_input_ids = np.array([0] * (num_tokens - bs), dtype=jnp.int32)
@@ -333,9 +352,12 @@ class ModelWorker:
             seq_lens=np.array([1] * bs, dtype=np.int32),
             out_cache_loc=np.concat([valid_out_cache_loc, invalid_out_cache_loc], axis=0),
             return_logprob=False,
-            sampling_info=SamplingBatchInfo.generate_for_precompile(
-                bs,
-                self.model_config.vocab_size,
+            sampling_info=(
+                SamplingBatchInfo.generate_for_precompile(bs, self.model_config.vocab_size)
+                if speculative_algotithm is None
+                else SamplingBatchInfo.generate_for_precompile_all_greedy(
+                    bs, self.model_config.vocab_size
+                )
             ),
             extend_input_logprob_token_ids=None,
             positions=np.concat([valid_positions, invalid_positions], axis=0),
@@ -347,6 +369,7 @@ class ModelWorker:
             token_ids_logprobs=None,
             extend_logprob_start_lens=None,
             capture_hidden_mode=CaptureHiddenMode.NULL,
+            spec_algorithm=speculative_algotithm,
         )
 
     def get_model_runner(self):
@@ -437,7 +460,6 @@ class ModelWorker:
             forward_batch,
             logits_metadata=LogitsMetadata.from_model_worker_batch(model_worker_batch, self.mesh),
         )
-
         if launch_done is not None:
             launch_done.set()
 
