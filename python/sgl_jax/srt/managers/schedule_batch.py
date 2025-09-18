@@ -20,7 +20,7 @@ import dataclasses
 import logging
 import threading
 from http import HTTPStatus
-from typing import Any, List, Optional, Set, Tuple, Union
+from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
 import numpy as np
 from jax import numpy as jnp
@@ -1025,9 +1025,7 @@ class ScheduleBatch:
         bs_paddings: list,
         cache_loc_paddings: List,
         page_size: int,
-        gmm_tiling_configs: Optional[
-            Dict[Tuple[int, int, int, int], Tuple[int, int, int]]
-        ] = None,
+        gmm_tiling_configs: Optional[Dict[str, List[int]]] = None,
     ) -> ModelWorkerBatch:
         if self.forward_mode.is_decode_or_idle():
             extend_seq_lens = extend_prefix_lens = extend_logprob_start_lens = None

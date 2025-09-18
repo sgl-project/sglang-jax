@@ -1,7 +1,7 @@
 import json
 import os
 import threading
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 
 def get_default_cache_dir() -> str:
@@ -102,7 +102,7 @@ def get_optimal_tiling_for_gmm(
     return manager.get_optimal_tiling(m, k, n, num_groups)
 
 
-def load_all_gmm_tiling_configs():
+def load_all_gmm_tiling_configs() -> Dict[str, List[int]]:
     """Load all auto-tune GMM tiling configurations into memory after auto-tune completes."""
     import json
     import os
@@ -136,14 +136,8 @@ def load_all_gmm_tiling_configs():
                 continue
 
             try:
-                m = int(parts[0][1:])  # Remove 'm' prefix
-                k = int(parts[1][1:])  # Remove 'k' prefix
-                n = int(parts[2][1:])  # Remove 'n' prefix
-                num_groups = int(parts[3][1:])  # Remove 'g' prefix
-
-                # Store in memory cache
-                key = (m, k, n, num_groups)
-                configs[key] = tuple(data["optimal_tiling"])
+                # Store in memory cache using string key format
+                configs[cache_key] = list(data["optimal_tiling"])
                 loaded_count += 1
 
             except ValueError:

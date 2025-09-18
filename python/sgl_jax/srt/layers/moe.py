@@ -163,10 +163,7 @@ class EPMoE(nnx.Module):
     def _get_tiling_from_configs(
         self, gmm_tiling_configs, m: int, k: int, n: int, num_groups: int
     ):
-        key = (m, k, n, num_groups)
-        if gmm_tiling_configs is None:
-            return (8, 1024, 1024)  # Default fallback when configs not loaded
-        return gmm_tiling_configs.get(key, (8, 1024, 1024))  # Default fallback
+        return gmm_tiling_configs.get(f"m{m}_k{k}_n{n}_g{num_groups}", (8, 1024, 1024))
 
     def _detect_device_capabilities(self):
         try:

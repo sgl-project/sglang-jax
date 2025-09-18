@@ -164,9 +164,7 @@ class ForwardBatch:
     trace_request_objects: Optional[List] = None
 
     # GMM tiling configurations: (m, k, n, num_groups) -> (tile_m, tile_k, tile_n)
-    gmm_tiling_configs: Optional[
-        Dict[Tuple[int, int, int, int], Tuple[int, int, int]]
-    ] = None
+    gmm_tiling_configs: Optional[Dict[str, List[int]]] = None
 
     def tree_flatten(self):
         children = (
@@ -251,6 +249,7 @@ class ForwardBatch:
             cache_loc,
             extend_prefix_lens,
             extend_seq_lens,
+            gmm_tiling_configs,
         ) = device_array(
             model_runner.mesh,
             (
@@ -263,14 +262,8 @@ class ForwardBatch:
                 batch.cache_loc,
                 batch.extend_prefix_lens,
                 batch.extend_seq_lens,
+                batch.gmm_tiling_configs,
             ),
-        )
-        # Get GMM tiling configurations from batch (loaded into memory after auto-tune)
-        gmm_tiling_configs_cpu = batch.gmm_tiling_configs
-        gmm_tiling_configs = (
-            device_array(model_runner.mesh, gmm_tiling_configs_cpu)
-            if gmm_tiling_configs_cpu
-            else None
         )
 
         obj = cls(
