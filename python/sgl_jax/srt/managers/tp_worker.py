@@ -204,29 +204,33 @@ class ModelWorker:
             hf_config = self.model_config.hf_config
 
             # check if this is a MoE model
-            num_experts = getattr(hf_config, "num_experts", None)
-            if num_experts is None:
+            self.num_experts = getattr(hf_config, "num_experts", None)
+            if self.num_experts is None:
                 self.disable_gmm_auto_tune = True
                 return
             self.disable_gmm_auto_tune = False
             logger.info(
-                f"[GMM AUTO-TUNE] MoE model detected with {num_experts} experts"
+                f"[GMM AUTO-TUNE] MoE model detected with {self.num_experts} experts"
             )
 
-            hidden_size = getattr(hf_config, "hidden_size", 4096)
-            intermediate_size = getattr(hf_config, "intermediate_size", None)
-            moe_intermediate_size = getattr(hf_config, "moe_intermediate_size", None)
+            self.hidden_size = getattr(hf_config, "hidden_size", 4096)
+            self.intermediate_size = getattr(hf_config, "intermediate_size", None)
+            self.moe_intermediate_size = getattr(
+                hf_config, "moe_intermediate_size", None
+            )
 
             target_intermediate_size = (
-                moe_intermediate_size or intermediate_size or hidden_size * 4
+                self.moe_intermediate_size
+                or self.intermediate_size
+                or self.hidden_size * 4
             )
 
             logger.info(
-                f"[GMM AUTO-TUNE] Model config: hidden_size={hidden_size}, "
-                f"intermediate_size={target_intermediate_size}, num_experts={num_experts}"
+                f"[GMM AUTO-TUNE] Model config: hidden_size={self.hidden_size}, "
+                f"intermediate_size={target_intermediate_size}, num_experts={self.num_experts}"
             )
 
-            num_experts_per_tok = getattr(hf_config, "num_experts_per_tok", 8)
+            self.num_experts_per_tok = getattr(hf_config, "num_experts_per_tok", 8)
             # Generate all combinations: m = batch_size * seq_length * num_experts_per_tok
             logger.info(
                 f"[GMM AUTO-TUNE] Using precompile parameters for shape generation"
@@ -237,7 +241,9 @@ class ModelWorker:
             logger.info(
                 f"[GMM AUTO-TUNE] Sequence length paddings: {self.precompile_token_paddings}"
             )
-            logger.info(f"[GMM AUTO-TUNE] Experts per token: {num_experts_per_tok}")
+            logger.info(
+                f"[GMM AUTO-TUNE] Experts per token: {self.num_experts_per_tok}"
+            )
             logger.info(
                 f"[GMM AUTO-TUNE] Max padded num tokens: {self.max_padded_num_tokens}"
             )
@@ -254,15 +260,19 @@ class ModelWorker:
                     continue
 
                 # Decode: m = batch_size * num_experts_per_tok
-                m = actual_tokens * num_experts_per_tok
+                m = actual_tokens * self.num_experts_per_tok
 
-                if m < 8 or hidden_size < 64 or target_intermediate_size < 64:
+                if m < 8 or self.hidden_size < 64 or target_intermediate_size < 64:
                     continue
 
                 # Add shapes for decode gate/up projections (hidden -> intermediate)
-                shapes.append((m, hidden_size, target_intermediate_size, num_experts))
+                shapes.append(
+                    (m, self.hidden_size, target_intermediate_size, self.num_experts)
+                )
                 # Add shapes for decode down projections (intermediate -> hidden)
-                shapes.append((m, target_intermediate_size, hidden_size, num_experts))
+                shapes.append(
+                    (m, target_intermediate_size, self.hidden_size, self.num_experts)
+                )
 
             logger.info(f"[GMM AUTO-TUNE] Adding prefill shapes (variable seq_length)")
             total_combinations = len(self.precompile_bs_paddings) + (
@@ -279,21 +289,31 @@ class ModelWorker:
                         )
                         continue
 
-                    m = actual_tokens * num_experts_per_tok
+                    m = actual_tokens * self.num_experts_per_tok
 
-                    if m < 64 or hidden_size < 64 or target_intermediate_size < 64:
+                    if m < 64 or self.hidden_size < 64 or target_intermediate_size < 64:
                         skipped_count += 1
                         logger.debug(
-                            f"[GMM AUTO-TUNE] Skipping tiny shape bs={batch_size}, seq={seq_length} -> m={m}, k={hidden_size}, n={target_intermediate_size}"
+                            f"[GMM AUTO-TUNE] Skipping tiny shape bs={batch_size}, seq={seq_length} -> m={m}, k={self.hidden_size}, n={target_intermediate_size}"
                         )
                         continue
 
                     shapes.append(
-                        (m, hidden_size, target_intermediate_size, num_experts)
+                        (
+                            m,
+                            self.hidden_size,
+                            target_intermediate_size,
+                            self.num_experts,
+                        )
                     )
 
                     shapes.append(
-                        (m, target_intermediate_size, hidden_size, num_experts)
+                        (
+                            m,
+                            target_intermediate_size,
+                            self.hidden_size,
+                            self.num_experts,
+                        )
                     )
 
             logger.info(
@@ -454,9 +474,15 @@ class ModelWorker:
         invalid_cache_loc = np.array([0] * (invalid_cache_loc_size), dtype=jnp.int32)
 
         if not self.disable_gmm_auto_tune:
+            tiling_key = f"m{bs * num_tokens* self.num_experts_per_tok}_k{self.hidden_size}_n{self.moe_intermediate_size}_g{self.num_experts}"
             gmm_tiling_config_array = self.gmm_tiling_configs.get(
-                f"m{bs * num_tokens* self.model_config.num_experts_per_tok}_k{self.model_config.hidden_size}_n{self.model_config.moe_intermediate_size}_g{self.model_config.num_experts}",
+                tiling_key,
                 None,
+            )
+            jax.debug.print("tiling_key: {tiling_key}", tiling_key=tiling_key)
+            jax.debug.print(
+                "gmm_tiling_config_array: {gmm_tiling_config_array}",
+                gmm_tiling_config_array=gmm_tiling_config_array,
             )
         else:
             gmm_tiling_config_array = None
