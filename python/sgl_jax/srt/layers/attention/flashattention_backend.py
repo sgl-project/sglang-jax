@@ -82,7 +82,6 @@ class FlashAttention(AttentionBackend):
             self.num_kv_heads = num_kv_heads
         else:
             self.num_kv_heads = num_attn_heads
-        self.num_kv_heads = 8
         self.head_dim = head_dim
         self.page_size = page_size
         self.kv_partition_axis = kv_partition_axis

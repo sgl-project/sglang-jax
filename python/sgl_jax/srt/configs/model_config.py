@@ -168,7 +168,10 @@ class ModelConfig:
 
     # adapted from https://github.com/vllm-project/vllm/blob/main/vllm/config.py#L289
     def get_total_num_kv_heads(self) -> int:
-        """Returns the total number of KV heads."""
+        """Returns the total number of KV heads (original, not replicated)."""
+        # Use original value if it was stored during replication configuration
+        if hasattr(self, "_original_hf_num_key_value_heads"):
+            return self._original_hf_num_key_value_heads
         # For GPTBigCode & Falcon:
         # NOTE: for falcon, when new_decoder_architecture is True, the
         # multi_query flag is ignored and we use n_head_kv for the number of
@@ -217,12 +220,116 @@ class ModelConfig:
 
     def get_num_kv_heads(self, tensor_parallel_size) -> int:
         """Returns the number of KV heads per GPU."""
+        from sgl_jax.srt.utils.jax_utils import get_num_kv_heads_by_tp
+
         total_num_kv_heads = self.get_total_num_kv_heads()
-        # If tensor parallelism is used, we divide the number of KV heads by
-        # the tensor parallel size. We will replicate the KV heads in the
-        # case where the number of KV heads is smaller than the tensor
-        # parallel size so each GPU has at least one KV head.
-        return max(1, total_num_kv_heads // tensor_parallel_size)
+        return get_num_kv_heads_by_tp(total_num_kv_heads, tensor_parallel_size)
+
+    def needs_kv_head_replication(self, tensor_parallel_size: int) -> bool:
+        """Returns True if KV heads need to be replicated across devices."""
+        total_num_kv_heads = self.get_total_num_kv_heads()
+        return tensor_parallel_size > total_num_kv_heads
+
+    def get_num_kv_head_replicas(self, tensor_parallel_size: int) -> int:
+        """Returns the number of replicas for each original KV head."""
+        total_num_kv_heads = self.get_total_num_kv_heads()
+        if tensor_parallel_size > total_num_kv_heads:
+            return (tensor_parallel_size + total_num_kv_heads - 1) // total_num_kv_heads
+        else:
+            return 1
+
+    def get_total_num_kv_heads_with_replication(self, tensor_parallel_size: int) -> int:
+        """Returns the total number of KV heads after replication."""
+        total_num_kv_heads = self.get_total_num_kv_heads()
+        if tensor_parallel_size > total_num_kv_heads:
+            # When replication is needed, total becomes tensor_parallel_size
+            # because each device gets 1 head and there are tp_size devices
+            return tensor_parallel_size
+        else:
+            # No replication needed, return original
+            return total_num_kv_heads
+
+    def configure_for_tensor_parallel(self, tensor_parallel_size: int):
+        """Configure model config for tensor parallel execution with KV head replication."""
+        # Get per-device KV head count
+        kv_heads_per_device = self.get_num_kv_heads(tensor_parallel_size)
+
+        # Store original values for reference (only once)
+        if not hasattr(self, "_original_num_key_value_heads"):
+            self._original_num_key_value_heads = self.num_key_value_heads
+
+        # Handle cases where HF config doesn't have num_key_value_heads (MHA models)
+        if hasattr(self.hf_text_config, "num_key_value_heads"):
+            if not hasattr(self, "_original_hf_num_key_value_heads"):
+                self._original_hf_num_key_value_heads = (
+                    self.hf_text_config.num_key_value_heads
+                )
+        else:
+            # For MHA models without this attribute, it equals num_attention_heads
+            if not hasattr(self, "_original_hf_num_key_value_heads"):
+                self._original_hf_num_key_value_heads = (
+                    self.hf_text_config.num_attention_heads
+                )
+
+        # CRITICAL: Set to TOTAL count for global sharding
+        # JAX tensor parallel will automatically shard this across devices
+        total_kv_heads = kv_heads_per_device * tensor_parallel_size
+        self.num_key_value_heads = total_kv_heads
+
+        # Only set HF config if the attribute exists, otherwise create it
+        if hasattr(self.hf_text_config, "num_key_value_heads"):
+            self.hf_text_config.num_key_value_heads = total_kv_heads
+        else:
+            # For MHA models, dynamically add the attribute
+            setattr(self.hf_text_config, "num_key_value_heads", total_kv_heads)
+
+    def get_original_kv_head_id(self, tp_rank: int, tensor_parallel_size: int) -> int:
+        """Determine which original KV head this device should use."""
+        from sgl_jax.srt.utils.jax_utils import get_original_kv_head_id
+
+        total_num_kv_heads = self.get_total_num_kv_heads()
+        return get_original_kv_head_id(
+            tp_rank, total_num_kv_heads, tensor_parallel_size
+        )
+
+    def is_gqa_model(self) -> bool:
+        """Returns True if this is a Grouped Query Attention model."""
+        return self.get_total_num_kv_heads() < self.num_attention_heads
+
+    def get_kv_padding_strategy(self) -> str:
+        """Returns the padding strategy for KV heads."""
+        if self.is_gqa_model():
+            # GQA models should replicate existing kv heads to maintain attention semantics
+            return "replicate"
+        else:
+            # MHA models can use zero padding since all heads are equivalent
+            return "zero"
+
+    def log_kv_heads_info(self, tensor_parallel_size: int):
+        """Log KV heads configuration information during initialization."""
+        original_kv_heads = self.get_total_num_kv_heads()
+        kv_heads_per_device = self.get_num_kv_heads(tensor_parallel_size)
+        needs_replication = self.needs_kv_head_replication(tensor_parallel_size)
+        padding_strategy = self.get_kv_padding_strategy()
+
+        model_type = "GQA" if self.is_gqa_model() else "MHA"
+
+        if needs_replication:
+            num_replicas = self.get_num_kv_head_replicas(tensor_parallel_size)
+            logger.info(
+                f"KV heads replication enabled for {model_type} model: "
+                f"original_kv_heads={original_kv_heads}, tp_size={tensor_parallel_size}, "
+                f"each device gets {kv_heads_per_device} head(s), "
+                f"each original head replicated {num_replicas} times, "
+                f"padding_strategy={padding_strategy}"
+            )
+        else:
+            logger.info(
+                f"KV heads distribution for {model_type} model: "
+                f"original_kv_heads={original_kv_heads}, tp_size={tensor_parallel_size}, "
+                f"each device gets {kv_heads_per_device} head(s), no replication needed, "
+                f"padding_strategy={padding_strategy}"
+            )
 
     # adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/config.py
     def _parse_quant_hf_config(self):
