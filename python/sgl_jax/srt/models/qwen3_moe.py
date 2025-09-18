@@ -180,8 +180,6 @@ class QWen3MoeDecoderLayer(nnx.Module):
             self.is_moe_layer = False
             self.moe_gate = None
         else:
-            if mesh is None:
-                mesh = jax.sharding.get_abstract_mesh()
             num_experts = getattr(config, "num_experts", 128)
             num_experts_per_tok = getattr(config, "num_experts_per_tok", 8)
             moe_intermediate_size = getattr(config, "moe_intermediate_size", 768)

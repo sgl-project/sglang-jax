@@ -19,6 +19,7 @@ from sgl_jax.srt.managers.schedule_batch import (
     ModelWorkerBatch,
     global_server_args_dict,
 )
+from sgl_jax.srt.managers.utils import resolve_future_token_ids, set_future_token_ids
 from sgl_jax.srt.mem_cache.memory_pool import ReqToTokenPool
 from sgl_jax.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
@@ -184,11 +185,11 @@ class ModelWorker:
 
         self.precompile_token_paddings = normalized_token_paddings
 
-    def run_precompile(self):
-        self.precompile_extend()
-        self.precompile_decode()
+    def run_precompile(self, future_token_ids_map=None):
+        self.precompile_extend(future_token_ids_map)
+        self.precompile_decode(future_token_ids_map)
 
-    def precompile_extend(self):
+    def precompile_extend(self, future_token_ids_map=None):
         start_time = time.perf_counter()
         logger.info(
             f"[EXTEND] Begin to precompile bs_paddings={self.precompile_bs_paddings[-1:]} token_paddings={self.precompile_token_paddings}"
@@ -211,12 +212,22 @@ class ModelWorker:
                     ForwardMode.EXTEND,
                     self.precompile_cache_loc_paddings[-1],
                 )
+                model_worker_batch.forward_batch = ForwardBatch.init_new(
+                    model_worker_batch, self.model_runner
+                )
+                if future_token_ids_map is not None:
+                    model_worker_batch.forward_batch.input_ids = (
+                        resolve_future_token_ids(
+                            model_worker_batch.forward_batch.input_ids,
+                            future_token_ids_map,
+                        )
+                    )
                 self.forward_batch_generation(model_worker_batch, None, True)
 
         end_time = time.perf_counter()
         logger.info("[EXTEND] Precompile finished in %.0f secs", end_time - start_time)
 
-    def precompile_decode(self):
+    def precompile_decode(self, future_token_ids_map=None):
         start_time = time.perf_counter()
         logger.info(
             f"[DECODE] Begin to precompile bs_paddings={self.precompile_bs_paddings}"
@@ -236,9 +247,21 @@ class ModelWorker:
                 sampling_metadata = SamplingMetadata.from_model_worker_batch(
                     model_worker_batch, 0, self.mesh
                 )
-                self.forward_batch_generation(
+                model_worker_batch.forward_batch = ForwardBatch.init_new(
+                    model_worker_batch, self.model_runner
+                )
+                if future_token_ids_map is not None:
+                    model_worker_batch.forward_batch.input_ids = (
+                        resolve_future_token_ids(
+                            model_worker_batch.forward_batch.input_ids,
+                            future_token_ids_map,
+                        )
+                    )
+                _, next_token_ids, _ = self.forward_batch_generation(
                     model_worker_batch, None, False, sampling_metadata
                 )
+                if future_token_ids_map is not None:
+                    set_future_token_ids(future_token_ids_map, 0, next_token_ids)
 
         end_time = time.perf_counter()
         logger.info("[DECODE] Precompile finished in %.0f secs", end_time - start_time)
@@ -365,7 +388,7 @@ class ModelWorker:
         if forward_metadata is None:
             forward_metadata = (
                 self.worker.model_runner.attn_backend.get_forward_metadata(
-                    model_worker_batch, self.mesh
+                    model_worker_batch
                 )
             )
 

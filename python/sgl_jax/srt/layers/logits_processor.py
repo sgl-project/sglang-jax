@@ -7,7 +7,8 @@ import jax.nn as nn
 import jax.numpy as jnp
 import numpy as np
 from flax import nnx
-from jax.sharding import Mesh
+from jax.sharding import Mesh, NamedSharding
+from jax.sharding import PartitionSpec as P
 from jax.tree_util import register_pytree_node_class
 
 from sgl_jax.srt.layers.embeddings import Embed
@@ -194,7 +195,7 @@ class LogitsMetadata:
             ) = False
             extend_logprob_pruned_lens_cpu = extend_seq_lens_cpu = None
 
-        mesh = mesh if mesh is not None else jax.sharding.get_abstract_mesh()
+        sharding = NamedSharding(mesh, P()) if jax.process_count() == 1 else None
 
         return cls(
             forward_mode=batch.forward_mode,
@@ -202,7 +203,7 @@ class LogitsMetadata:
             extend_return_logprob=extend_return_logprob,
             extend_return_top_logprob=extend_return_top_logprob,
             extend_token_ids_logprob=extend_token_ids_logprob,
-            extend_seq_lens=device_array(mesh, batch.extend_seq_lens),
+            extend_seq_lens=device_array(batch.extend_seq_lens, sharding=sharding),
             extend_seq_lens_cpu=extend_seq_lens_cpu,
             extend_logprob_start_lens_cpu=(
                 batch.extend_logprob_start_lens if batch.return_logprob else None
@@ -211,8 +212,7 @@ class LogitsMetadata:
             top_logprobs_nums=batch.top_logprobs_nums,
             token_ids_logprobs=batch.token_ids_logprobs,
             extend_input_logprob_token_ids_device=device_array(
-                mesh,
-                batch.extend_input_logprob_token_ids,
+                batch.extend_input_logprob_token_ids, sharding=sharding
             ),
         )
 
@@ -279,14 +279,12 @@ class LogitsProcessor(nnx.Module):
 
             pruned_states = jnp.concat(pruned_states)
             sample_indices = device_array(
-                self.mesh,
                 np.array(
                     sample_indices,
                     dtype=jnp.int64,
                 ),
             )
             input_logprob_indices = device_array(
-                self.mesh,
                 np.array(input_logprob_indices, dtype=jnp.int64),
             )
 
@@ -324,7 +322,6 @@ class LogitsProcessor(nnx.Module):
 
             # Normalize the logprob w/o temperature, top-p
             pruned_lens = device_array(
-                self.mesh,
                 np.array(
                     logits_metadata.extend_logprob_pruned_lens_cpu,
                 ),
@@ -362,7 +359,7 @@ class LogitsProcessor(nnx.Module):
                 input_token_ids_logprobs_val = input_token_ids_logprobs_idx = None
 
             input_token_logprobs = input_logprobs[
-                device_array(self.mesh, np.arange(input_logprobs.shape[0])),
+                device_array(np.arange(input_logprobs.shape[0])),
                 logits_metadata.extend_input_logprob_token_ids_device,
             ]
 
