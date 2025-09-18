@@ -311,7 +311,7 @@ class EPMoE(nnx.Module):
                 (0, wo_kernel.shape[-1]), dtype=x.dtype
             )  # (0, hidden_dim)
             return empty_output
-
+        jax.debug.print("x_shape: {x_shape}", x_shape=x.shape)
         # static_tiling_gate = (
         #     int(optimal_tiling_gate[0]),
         #     int(optimal_tiling_gate[1]),
@@ -353,12 +353,12 @@ class EPMoE(nnx.Module):
             rhs=wo_kernel,
             group_sizes=local_group_sizes,
             preferred_element_type=self.dtype,
-            tiling=gmm_tiling_config_array[1],
+            tiling=gmm_tiling_config_array[0],
         )
 
         return intermediate_output
 
-    def _single_device_forward(self, inputs, router_logits, gmm_tiling_configs):
+    def _single_device_forward(self, inputs, router_logits, gmm_tiling_config_array):
         top_k_logits, top_k_indices = jax.lax.top_k(
             router_logits, self.num_experts_per_tok
         )
@@ -369,11 +369,11 @@ class EPMoE(nnx.Module):
         top_k_weights = top_k_weights / jnp.sum(top_k_weights, axis=-1, keepdims=True)
 
         return self._single_device_forward_impl(
-            inputs, top_k_indices, top_k_weights, gmm_tiling_configs
+            inputs, top_k_indices, top_k_weights, gmm_tiling_config_array
         )
 
     def _single_device_forward_impl(
-        self, inputs, top_k_indices, top_k_weights, gmm_tiling_configs
+        self, inputs, top_k_indices, top_k_weights, gmm_tiling_config_array
     ):
         num_tokens = inputs.shape[0] * (inputs.shape[1] if inputs.ndim > 1 else 1)
         inputs_flat = inputs.reshape(num_tokens, -1)

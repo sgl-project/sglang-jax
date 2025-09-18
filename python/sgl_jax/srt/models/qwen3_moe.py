@@ -257,7 +257,7 @@ class QWen3MoeDecoderLayer(nnx.Module):
             mlp_output = self.mlp(
                 hidden_states,
                 router_logits=router_logits,
-                gmm_tiling_configs=forward_batch.gmm_tiling_config_array,
+                gmm_tiling_config_array=forward_batch.gmm_tiling_config_array,
             )
             hidden_states = mlp_output
         else:

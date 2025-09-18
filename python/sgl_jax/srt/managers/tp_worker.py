@@ -472,10 +472,15 @@ class ModelWorker:
 
         valid_cache_loc = np.arange(bs)
         invalid_cache_loc = np.array([0] * (invalid_cache_loc_size), dtype=jnp.int32)
+        gmm_tiling_config_array = np.zeros((1, 3), dtype=np.int32)
 
         if not self.disable_gmm_auto_tune:
             tiling_key = f"m{bs * num_tokens* self.num_experts_per_tok}_k{self.hidden_size}_n{self.moe_intermediate_size}_g{self.num_experts}"
-            gmm_tiling_config_array = self.gmm_tiling_configs.get(
+            # gmm_tiling_config_array = self.gmm_tiling_configs.get(
+            #     tiling_key,
+            #     None,
+            # )
+            gmm_tiling_config_array[0] = self.gmm_tiling_configs.get(
                 tiling_key,
                 None,
             )
