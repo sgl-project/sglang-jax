@@ -40,6 +40,7 @@ def ref_ragged_paged_attention_fused(
     mask_value: float | None = DEFAULT_MASK_VALUE,
     k_scale: float | None = None,
     v_scale: float | None = None,
+    xai_temperature_len: float = -1.0,
 ):
     if mask_value is None:
         mask_value = DEFAULT_MASK_VALUE
@@ -84,6 +85,16 @@ def ref_ragged_paged_attention_fused(
             mask = jnp.logical_or(mask, q_span - sliding_window >= kv_span)
         if soft_cap is not None:
             attn = soft_cap * jnp.tanh(attn / soft_cap)
+
+        # xai_temperature_scale: ref implementation from sgl-project/sglang
+        # python/sglang/srt/layers/attention/triton_ops/decode_attention.py
+        if xai_temperature_len > 0:
+            xai_temperature_scale = 1.0 / jnp.log2(float(xai_temperature_len))
+            qidx = jnp.arange(q_start, q_end) - 1
+            _qtemp = jnp.log2(qidx.astype(jnp.float32)) * xai_temperature_scale
+            xai_temperature_reg = jnp.where(qidx > xai_temperature_len, _qtemp, 1.0)
+            attn = attn * xai_temperature_reg[:, None]
+
         attn += jnp.where(mask, mask_value, 0.0)
         attn = jax.nn.softmax(attn, axis=-1).astype(v.dtype)
         out = jnp.einsum("hqk,khd->qhd", attn, v).astype(queries.dtype)
@@ -107,6 +118,7 @@ def ref_ragged_paged_attention(
     mask_value: float | None = DEFAULT_MASK_VALUE,
     k_scale: float | None = None,
     v_scale: float | None = None,
+    xai_temperature_len: float = -1.0,
 ):
     if mask_value is None:
         mask_value = DEFAULT_MASK_VALUE
@@ -141,6 +153,16 @@ def ref_ragged_paged_attention(
             mask = jnp.logical_or(mask, q_span - sliding_window >= kv_span)
         if soft_cap is not None:
             attn = soft_cap * jnp.tanh(attn / soft_cap)
+
+        # xai_temperature_scale: ref implementation from sgl-project/sglang
+        # python/sglang/srt/layers/attention/triton_ops/decode_attention.py
+        if xai_temperature_len > 0:
+            xai_temperature_scale = 1.0 / jnp.log2(float(xai_temperature_len))
+            qidx = jnp.arange(q_start, q_end) - 1
+            _qtemp = jnp.log2(qidx.astype(jnp.float32)) * xai_temperature_scale
+            xai_temperature_reg = jnp.where(qidx > xai_temperature_len, _qtemp, 1.0)
+            attn = attn * xai_temperature_reg[:, None]
+
         attn += jnp.where(mask, mask_value, 0.0)
         attn = jax.nn.softmax(attn, axis=-1).astype(v.dtype)
         out = jnp.einsum("hqk,khd->qhd", attn, v).astype(queries.dtype)
