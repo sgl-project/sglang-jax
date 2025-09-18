@@ -60,6 +60,7 @@ class ModelRunner:
         tp_size: int,
         server_args: ServerArgs,
         mesh: jax.sharding.Mesh,
+        is_draft_worker: bool,
         req_to_token_pool: ReqToTokenPool | None = None,
         token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator | None = None,
         rngs: nnx.Rngs = None,
@@ -249,6 +250,13 @@ class ModelRunner:
 
         return max_tokens
 
+    @property
+    def is_hybrid_gdn(self):
+        return self.model_config.hf_config.architectures[0] in [
+            "Qwen3NextForCausalLM",
+            "Qwen3NextForCausalLMMTP",
+        ]
+
     def init_memory_pool(
         self,
         max_num_reqs: int | None = None,
@@ -356,10 +364,10 @@ class ModelRunner:
             return NativeAttention(self.num_attn_heads, self.num_kv_heads)
         elif backend == "fa":
             from sgl_jax.srt.layers.attention.flashattention_backend import (
-                FlashAttention,
+                FlashAttentionBackend,
             )
 
-            return FlashAttention(
+            return FlashAttentionBackend(
                 self.num_attn_heads,
                 self.num_kv_heads,
                 self.model_config.head_dim,

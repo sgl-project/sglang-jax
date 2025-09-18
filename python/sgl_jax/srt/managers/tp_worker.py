@@ -46,14 +46,19 @@ class ModelWorker:
         server_args: ServerArgs,
         mesh: jax.sharding.Mesh,
         req_to_token_pool: ReqToTokenPool | None = None,
+        is_draft_worker: bool = False,
     ):
         # Parse args
         self.tp_size = server_args.tp_size
 
         # Init model and tokenizer
+        if is_draft_worker:
+            model_path = server_args.speculative_draft_model_path
+        else:
+            model_path = server_args.model_path
         self.model_config = ModelConfig.from_server_args(
             server_args,
-            model_path=server_args.model_path,
+            model_path=model_path,
         )
 
         self.mesh = mesh
@@ -75,6 +80,7 @@ class ModelWorker:
             tp_size=server_args.tp_size,
             server_args=server_args,
             mesh=self.mesh,
+            is_draft_worker=is_draft_worker,
             req_to_token_pool=req_to_token_pool,
             rngs=nnx.Rngs(self.random_seed),
         )
@@ -131,7 +137,7 @@ class ModelWorker:
         # Each process may have different random_seed. After broadcast, all processes will have the same random_seed.
         # self.random_seed = broadcast_one_to_all(server_args.random_seed).item()
 
-        # A reference make this class has the same member as TpModelWorkerClient
+        # A reference make this class has the same member as ModelWorkerClient
         self.worker = self
 
         self.max_padded_batch_size, self.max_padded_num_tokens = self.get_max_padded_size()
@@ -435,6 +441,7 @@ class ModelWorker:
         forward_metadata=None,
     ) -> tuple[LogitsProcessorOutput | jax.Array | int, jax.Array | None]:
         # Use pre-initialized ForwardBatch if available (for overlap scheduling optimization)
+
         if model_worker_batch.forward_batch is not None:
             forward_batch = model_worker_batch.forward_batch
         else:
@@ -472,7 +479,6 @@ class ModelWorker:
             forward_batch,
             logits_metadata=LogitsMetadata.from_model_worker_batch(model_worker_batch, self.mesh),
         )
-
         if launch_done is not None:
             launch_done.set()
 
@@ -492,7 +498,6 @@ class ModelWorker:
                     positions_device,
                 )
                 sample_cache_miss_count = count()
-
         return (
             logits_output,
             next_token_ids_device,
@@ -546,7 +551,7 @@ class MockModelWorker:
         self.max_req_input_len = self.max_req_len - 5
         assert self.max_req_len > 0 and self.max_req_input_len > 0, "Memory pool size is too small"
 
-        # A reference make this class has the same member as TpModelWorkerClient
+        # A reference make this class has the same member as ModelWorkerClient
         self.worker = self
 
     def get_worker_info(self):

@@ -18,21 +18,6 @@ def get_dtype_packing(dtype):
     return 32 // bits
 
 
-def next_power_of_2(x: int):
-    """Finds the smallest power of 2 >= x using bit manipulation.
-
-    Args:
-      x: The input number (should be an integer).
-
-    Returns:
-      The smallest integer power of 2 that is >= x.
-    """
-    assert x > 0
-    if x == 1:
-        return 1
-    return 1 << (x - 1).bit_length()
-
-
 def get_tpu_version() -> int:
     """Returns the numeric version of the TPU, or -1 if not on TPU."""
     kind = jax.devices()[0].device_kind

@@ -507,6 +507,29 @@ class Qwen3ForCausalLM(nnx.Module):
 
         return mappings
 
+    def get_embed_and_head(self):
+        return (
+            self.transformer.embed_tokens.embedding.value,
+            self.lm_head.embedding.value,
+        )
+
+    def set_embed_and_head(
+        self,
+        embed_weight: jax.Array | None = None,
+        head_weight: jax.Array | None = None,
+    ) -> None:
+        """Set word embedding and LM Head weights.
+
+        Args:
+            embed_weight: Embedding matrix with shape [vocab_size, hidden_size].
+            head_weight:  LM Head matrix with shape [vocab_size, hidden_size].
+        """
+        if embed_weight is not None:
+            self.transformer.embed_tokens.embedding.value = embed_weight
+
+        if head_weight is not None:
+            self.lm_head.embedding.value = head_weight
+
     def __call__(
         self,
         forward_batch: ForwardBatch,

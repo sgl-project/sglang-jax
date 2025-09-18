@@ -45,6 +45,7 @@ class ModelConfig:
         quantization: str | None = None,
         model_layer_nums: int | None = None,
     ) -> None:
+
         self.model_path = model_path
         self.revision = revision
         self.model_impl = model_impl
