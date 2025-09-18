@@ -163,8 +163,7 @@ class ForwardBatch:
     trace_request_ids: Optional[List[str]] = None
     trace_request_objects: Optional[List] = None
 
-    # GMM tiling configurations: (m, k, n, num_groups) -> (tile_m, tile_k, tile_n)
-    gmm_tiling_configs: Optional[Dict[str, List[int]]] = None
+    gmm_tiling_config_array: jax.Array = None
 
     def tree_flatten(self):
         children = (
@@ -179,12 +178,12 @@ class ForwardBatch:
             self.cache_loc,
             self.extend_prefix_lens,
             self.extend_seq_lens,
+            self.gmm_tiling_config_array,
         )
 
         aux_data = {
             "forward_mode": self.forward_mode,
             "batch_size": self.batch_size,
-            "gmm_tiling_configs": self.gmm_tiling_configs,
         }
         return (children, aux_data)
 
@@ -194,7 +193,6 @@ class ForwardBatch:
 
         obj.forward_mode = aux_data["forward_mode"]
         obj.batch_size = aux_data["batch_size"]
-        obj.gmm_tiling_configs = aux_data.get("gmm_tiling_configs", None)
         obj.trace_request_ids = None
         obj.trace_request_objects = None
 
@@ -209,6 +207,7 @@ class ForwardBatch:
         obj.cache_loc = children[8]
         obj.extend_prefix_lens = children[9]
         obj.extend_seq_lens = children[10]
+        obj.gmm_tiling_config_array = children[11]
 
         return obj
 
@@ -225,6 +224,7 @@ class ForwardBatch:
             "cache_loc",
             "extend_prefix_lens",
             "extend_seq_lens",
+            "gmm_tiling_config_array",
         ]:
             value = getattr(self, field_name, None)
             if value is not None and isinstance(value, jax.Array):
@@ -249,7 +249,7 @@ class ForwardBatch:
             cache_loc,
             extend_prefix_lens,
             extend_seq_lens,
-            gmm_tiling_configs,
+            gmm_tiling_config_array,
         ) = device_array(
             model_runner.mesh,
             (
@@ -262,7 +262,7 @@ class ForwardBatch:
                 batch.cache_loc,
                 batch.extend_prefix_lens,
                 batch.extend_seq_lens,
-                batch.gmm_tiling_configs,
+                batch.gmm_tiling_config_array,
             ),
         )
 
@@ -281,7 +281,7 @@ class ForwardBatch:
             extend_seq_lens=extend_seq_lens,
             token_to_kv_pool=model_runner.token_to_kv_pool,
             attn_backend=model_runner.attn_backend,
-            gmm_tiling_configs=gmm_tiling_configs,
+            gmm_tiling_config_array=gmm_tiling_config_array,
         )
 
         return obj

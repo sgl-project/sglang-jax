@@ -206,6 +206,7 @@ class ModelWorker:
             # check if this is a MoE model
             num_experts = getattr(hf_config, "num_experts", None)
             if num_experts is None:
+                self.disable_gmm_auto_tune = True
                 return
 
             logger.info(
@@ -452,6 +453,14 @@ class ModelWorker:
         valid_cache_loc = np.arange(bs)
         invalid_cache_loc = np.array([0] * (invalid_cache_loc_size), dtype=jnp.int32)
 
+        if not self.disable_gmm_auto_tune:
+            gmm_tiling_config_array = self.gmm_tiling_configs.get(
+                f"m{bs * num_tokens* self.model_config.num_experts_per_tok}_k{self.model_config.hidden_size}_n{self.model_config.moe_intermediate_size}_g{self.model_config.num_experts}",
+                None,
+            )
+        else:
+            gmm_tiling_config_array = None
+
         return ModelWorkerBatch(
             bid=1,
             forward_mode=mode,
@@ -479,7 +488,7 @@ class ModelWorker:
             token_ids_logprobs=None,
             extend_logprob_start_lens=None,
             capture_hidden_mode=CaptureHiddenMode.NULL,
-            gmm_tiling_configs=self.gmm_tiling_configs,
+            gmm_tiling_config_array=gmm_tiling_config_array,
         )
 
     def get_model_runner(self):

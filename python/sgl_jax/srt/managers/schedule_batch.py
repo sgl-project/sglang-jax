@@ -1352,10 +1352,7 @@ class ModelWorkerBatch:
 
     capture_hidden_mode: CaptureHiddenMode = None
 
-    # GMM tiling configurations: (m, k, n, num_groups) -> (tile_m, tile_k, tile_n)
-    gmm_tiling_configs: Optional[
-        Dict[Tuple[int, int, int, int], Tuple[int, int, int]]
-    ] = None
+    gmm_tiling_config_array: np.ndarray = None
 
     # For logits and logprobs post processing
     temp_scaled_logprobs: bool = False

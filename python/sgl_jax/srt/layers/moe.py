@@ -160,11 +160,6 @@ class EPMoE(nnx.Module):
         sharded_state = jax.lax.with_sharding_constraint(state, pspecs)
         nnx.update(self, sharded_state)
 
-    def _get_tiling_from_configs(
-        self, gmm_tiling_configs, m: int, k: int, n: int, num_groups: int
-    ):
-        return gmm_tiling_configs.get(f"m{m}_k{k}_n{n}_g{num_groups}", None)
-
     def _detect_device_capabilities(self):
         try:
             devices = jax.devices()
@@ -178,7 +173,7 @@ class EPMoE(nnx.Module):
         except Exception as e:
             return False, "cpu"
 
-    def __call__(self, inputs, router_logits=None, gmm_tiling_configs=None):
+    def __call__(self, inputs, router_logits=None, gmm_tiling_config_array=None):
         if router_logits is None:
             raise ValueError("router_logits is required for EPMoE")
 
@@ -192,21 +187,22 @@ class EPMoE(nnx.Module):
 
         if self.expert_parallel_size == 1:
             output = self._single_device_forward(
-                inputs, router_logits, gmm_tiling_configs
+                inputs, router_logits, gmm_tiling_config_array
             )
         else:
             output = self._expert_parallel_forward_with_shard_map(
-                inputs, router_logits, gmm_tiling_configs
+                inputs, router_logits, gmm_tiling_config_array
             )
 
         return output
 
     def _expert_parallel_forward_with_shard_map(
-        self, inputs, router_logits, gmm_tiling_configs
+        self, inputs, router_logits, gmm_tiling_config_array
     ):
         def _internal_moe_computation(
             hidden_states,
             router_logits,
+            gmm_tiling_config_array,
             w0_weights,
             w1_weights,
             wo_weights,
@@ -258,7 +254,7 @@ class EPMoE(nnx.Module):
                 w0_weights,
                 w1_weights,
                 wo_weights,
-                gmm_tiling_configs,
+                gmm_tiling_config_array,
             )
 
             # EP Combine
@@ -284,6 +280,7 @@ class EPMoE(nnx.Module):
             in_specs=(
                 P(None),  # hidden_states
                 P(None),  # router_logits
+                P(None),  # gmm_tiling_config_array
                 P(("data", "tensor"), None, None),  # w0_weights
                 P(("data", "tensor"), None, None),  # w1_weights
                 P(("data", "tensor"), None, None),  # wo_weights
@@ -293,6 +290,7 @@ class EPMoE(nnx.Module):
         )(
             inputs,
             router_logits,
+            gmm_tiling_config_array,
             self.wi_0.value,
             self.wi_1.value,
             self.wo.value,
@@ -306,7 +304,7 @@ class EPMoE(nnx.Module):
         w0_kernel,
         w1_kernel,
         wo_kernel,
-        gmm_tiling_configs,
+        gmm_tiling_config_array,
     ):
         if x.shape[0] == 0:
             empty_output = jnp.zeros(
@@ -314,26 +312,19 @@ class EPMoE(nnx.Module):
             )  # (0, hidden_dim)
             return empty_output
 
-        m, k = x.shape[0], x.shape[1]
-        n_gate = w0_kernel.shape[2]
-        n_down = wo_kernel.shape[2]
-
-        optimal_tiling_gate = self._get_tiling_from_configs(
-            gmm_tiling_configs, m, k, n_gate, self.num_experts
-        )
-        optimal_tiling_down = self._get_tiling_from_configs(
-            gmm_tiling_configs, m, n_gate, n_down, self.num_experts
-        )
-
-        static_tiling_gate = (
-            int(optimal_tiling_gate[0]),
-            int(optimal_tiling_gate[1]),
-            int(optimal_tiling_gate[2]),
-        )
-        static_tiling_down = (
-            int(optimal_tiling_down[0]),
-            int(optimal_tiling_down[1]),
-            int(optimal_tiling_down[2]),
+        # static_tiling_gate = (
+        #     int(optimal_tiling_gate[0]),
+        #     int(optimal_tiling_gate[1]),
+        #     int(optimal_tiling_gate[2]),
+        # )
+        # static_tiling_down = (
+        #     int(optimal_tiling_down[0]),
+        #     int(optimal_tiling_down[1]),
+        #     int(optimal_tiling_down[2]),
+        # )
+        jax.debug.print(
+            "gmm_tiling_array: {gmm_tiling_config_array}",
+            gmm_tiling_config_array=gmm_tiling_config_array,
         )
         # gate
         layer_w0 = gmm(
@@ -341,7 +332,7 @@ class EPMoE(nnx.Module):
             rhs=w0_kernel,
             group_sizes=local_group_sizes,
             preferred_element_type=self.dtype,
-            tiling=static_tiling_gate,
+            tiling=gmm_tiling_config_array[0],
         )
         # up
         layer_w1 = gmm(
@@ -349,7 +340,7 @@ class EPMoE(nnx.Module):
             rhs=w1_kernel,
             group_sizes=local_group_sizes,
             preferred_element_type=self.dtype,
-            tiling=static_tiling_gate,
+            tiling=gmm_tiling_config_array[0],
         )
 
         # activation
@@ -362,7 +353,7 @@ class EPMoE(nnx.Module):
             rhs=wo_kernel,
             group_sizes=local_group_sizes,
             preferred_element_type=self.dtype,
-            tiling=static_tiling_down,
+            tiling=gmm_tiling_config_array[1],
         )
 
         return intermediate_output
