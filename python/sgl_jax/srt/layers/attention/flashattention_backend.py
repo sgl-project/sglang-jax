@@ -1,3 +1,4 @@
+import logging
 from dataclasses import dataclass
 
 import jax
@@ -16,8 +17,11 @@ from sgl_jax.srt.layers.radix_attention import RadixAttention
 from sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch
 from sgl_jax.srt.mem_cache.memory_pool import KVCache
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sgl_jax.srt.speculative.eagle_util import EagleDraftInput
 from sgl_jax.srt.utils import cdiv
 from sgl_jax.srt.utils.jax_utils import device_array
+
+logger = logging.getLogger(__name__)
 
 
 @register_pytree_node_class
@@ -35,6 +39,7 @@ class FlashAttentionMetadata:
     page_indices: jax.Array = None
     seq_lens: jax.Array = None
     distribution: jax.Array = None
+    custom_mask: jax.Array = None
 
     def tree_flatten(self):
         children = (
@@ -44,6 +49,7 @@ class FlashAttentionMetadata:
             self.page_indices,
             self.seq_lens,
             self.distribution,
+            self.custom_mask,
         )
 
         aux_data = {}
@@ -59,6 +65,7 @@ class FlashAttentionMetadata:
         obj.page_indices = children[3]
         obj.seq_lens = children[4]
         obj.distribution = children[5]
+        obj.custom_mask = children[6]
 
         return obj
 
@@ -89,7 +96,18 @@ class FlashAttention(AttentionBackend):
         self.forward_metadata = nnx.data(FlashAttentionMetadata())
         self.mesh = mesh
 
-    def get_forward_metadata(self, batch: ModelWorkerBatch):
+    def get_forward_metadata(
+        self,
+        batch: ModelWorkerBatch,
+        is_eagle: bool = False,
+        speculative_step_id: int = 0,
+        topk: int = 0,
+    ):
+        if is_eagle:
+            return self.get_eagle_forward_metadata(
+                batch, speculative_step_id=speculative_step_id, topk=topk
+            )
+
         """Return the metadata for a forward pass."""
         metadata = FlashAttentionMetadata()
 
@@ -135,6 +153,132 @@ class FlashAttention(AttentionBackend):
             # All sequences are decode/mixed mode
             distribution = np.array([0, 0, num_seqs.item()], dtype=np.int32)
         elif batch.forward_mode == ForwardMode.EXTEND:
+            # All sequences are prefill mode
+            distribution = np.array([0, num_seqs.item(), num_seqs.item()], dtype=np.int32)
+        else:
+            raise ValueError(f"Invalid forward mode: {batch.forward_mode}")
+
+        (
+            metadata.num_seqs,
+            metadata.cu_q_lens,
+            metadata.cu_kv_lens,
+            metadata.page_indices,
+            metadata.seq_lens,
+            metadata.distribution,
+        ) = device_array(
+            (num_seqs, cu_q_lens, cu_kv_lens, page_indices, seq_lens, distribution),
+            sharding=(NamedSharding(self.mesh, P()) if jax.process_count() == 1 else None),
+        )
+        return metadata
+
+    def get_eagle_forward_metadata(
+        self, batch: ModelWorkerBatch, speculative_step_id: int = 0, topk: int = 1
+    ):
+        """Return the metadata for a forward pass."""
+        metadata = FlashAttentionMetadata()
+
+        indices = np.arange(0, len(batch.cache_loc), self.page_size)
+        selected_cache_locs = batch.cache_loc[indices]
+        selected_cache_locs_for_draft_decode = np.zeros_like(selected_cache_locs)
+        if batch.forward_mode == ForwardMode.DECODE:
+            # for draft decode
+            offset1 = 0
+            offset2 = 0
+            for i in range(batch.real_bs):
+                draft_alloc = batch.spec_info.allocate_lens[i] - batch.seq_lens[i]
+                assert (
+                    draft_alloc == EagleDraftInput.ALLOC_LEN_PER_DECODE
+                ), f"{draft_alloc=} but {EagleDraftInput.ALLOC_LEN_PER_DECODE=}, speculative prepare_for_decode may be error"
+                seq_len = int(batch.seq_lens[i])
+                spec_tokens = seq_len + (speculative_step_id + 1) * topk
+                alloc_tokens = seq_len + draft_alloc
+                spec_pages = cdiv(spec_tokens, self.page_size)
+                alloc_pages = cdiv(alloc_tokens, self.page_size)
+                selected_cache_locs_for_draft_decode[offset1 : offset1 + spec_pages] = (
+                    selected_cache_locs[offset2 : offset2 + spec_pages]
+                )
+                offset1 += spec_pages
+                offset2 += alloc_pages
+            selected_cache_locs = selected_cache_locs_for_draft_decode
+
+        page_indices = (selected_cache_locs // self.page_size).astype(np.int32)
+
+        if batch.forward_mode == ForwardMode.TARGET_VERIFY:
+            # convert custom_mask from bool to int32, because dma not support bool type
+            if batch.spec_info.custom_mask.dtype == jnp.bool:
+                metadata.custom_mask = batch.spec_info.custom_mask.astype(jnp.int32)
+            else:
+                metadata.custom_mask = batch.spec_info.custom_mask
+        else:
+            metadata.custom_mask = None
+
+        if batch.forward_mode.is_extend():
+            if batch.forward_mode.is_target_verify():
+                padded_batch_size = len(batch.seq_lens)
+                real_batch_size = batch.real_bs
+                q_lens = np.array(
+                    [batch.spec_info.draft_token_num] * real_batch_size, dtype=np.int32
+                )
+                extend_seq_lens = np.pad(q_lens, (0, padded_batch_size - real_batch_size))
+
+            else:
+                extend_seq_lens = batch.extend_seq_lens
+
+            cu_q_lens = np.concatenate(
+                [
+                    np.array([0], dtype=np.int32),
+                    np.cumsum(extend_seq_lens),
+                ]
+            )
+
+        elif batch.forward_mode == ForwardMode.DECODE:
+            if batch.spec_algorithm.is_none():
+                cu_q_lens = jnp.concatenate(
+                    [
+                        np.array([0], dtype=jnp.int32),
+                        np.cumsum(jnp.ones(len(batch.seq_lens), dtype=np.int32)),
+                    ]
+                )
+                raise RuntimeError("should not reach here")
+            else:
+                assert isinstance(batch.spec_info, EagleDraftInput)
+                cu_q_lens = np.arange(
+                    0,
+                    len(batch.seq_lens) * topk + 1,
+                    step=topk,
+                    dtype=np.int32,
+                )
+
+        else:
+            raise ValueError(f"Invalid forward mode: {batch.forward_mode}")
+
+        seq_lens = np.copy(batch.seq_lens)
+
+        if batch.forward_mode.is_target_verify():
+            seq_lens += extend_seq_lens
+            aligned_seq_lens = ((seq_lens + self.page_size - 1) // self.page_size) * self.page_size
+        elif batch.forward_mode.is_decode() and not batch.spec_algorithm.is_none():
+            seq_lens += topk * (speculative_step_id + 1)
+            aligned_seq_lens = ((seq_lens + self.page_size - 1) // self.page_size) * self.page_size
+        else:
+            aligned_seq_lens = (
+                (batch.seq_lens + self.page_size - 1) // self.page_size
+            ) * self.page_size
+        cu_kv_lens = np.concatenate(
+            [
+                np.array([0], dtype=np.int32),
+                np.cumsum(aligned_seq_lens),
+            ]
+        )
+
+        num_seqs = np.sum(batch.seq_lens > 0, dtype=np.int32).reshape(
+            1,
+        )
+        # Construct distribution for V2 kernel: [decode_end, prefill_end, mixed_end]
+        if batch.forward_mode == ForwardMode.DECODE:
+            # All sequences are decode/mixed mode
+            distribution = np.array([0, 0, num_seqs.item()], dtype=np.int32)
+        elif batch.forward_mode.is_extend():
             # All sequences are prefill mode
             distribution = np.array([0, num_seqs.item(), num_seqs.item()], dtype=np.int32)
         else:
@@ -205,8 +349,15 @@ class FlashAttention(AttentionBackend):
         # Prepare fused KV cache for paged format: [num_pages, page_size, num_kv_heads * 2, head_dim]
         total_tokens = kv_cache_fused.shape[0]
         num_pages = total_tokens // self.page_size
-        kv_cache_fused_paged = kv_cache_fused.reshape(num_pages, self.page_size, -1, self.head_dim)
+        kv_cache_fused_paged = kv_cache_fused.reshape(
+            num_pages, self.page_size, -1, (self.head_dim + 127) // 128 * 128
+        )
 
+        causal = 1
+
+        # custom_mask = self.forward_metadata.custom_mask
+        if forward_batch.forward_mode == ForwardMode.TARGET_VERIFY:
+            causal = 0
         # Select page indices and remap to SWA pool if KV cache supports it
         page_indices_arg = self.forward_metadata.page_indices
         if hasattr(token_to_kv_pool, "remap_cache_loc") and self.page_size == 1:
@@ -222,6 +373,7 @@ class FlashAttention(AttentionBackend):
             P(),  # cu_q_lens
             P(),  # cu_kv_lens
             P(),  # distribution
+            P(),  # custom_mask
         )
         out_specs = (
             P(None, self.kv_partition_axis),  # attention output
@@ -241,6 +393,7 @@ class FlashAttention(AttentionBackend):
                 values,
                 kv_cache_fused,
                 *other_args,
+                causal=causal,
                 sm_scale=scale,
                 sliding_window=layer.sliding_window_size,
                 soft_cap=layer.logit_cap,
@@ -270,7 +423,15 @@ class FlashAttention(AttentionBackend):
             self.forward_metadata.cu_q_lens,
             self.forward_metadata.cu_kv_lens,
             self.forward_metadata.distribution,
+            self.forward_metadata.custom_mask,
         )
+        pad_width = (self.head_dim + 127) // 128 * 128 - self.head_dim
+        if pad_width > 0:
+            updated_kv_cache_fused = jnp.pad(
+                updated_kv_cache_fused,
+                ((0, 0), (0, 0), (0, pad_width)),
+                mode="constant",
+            )
 
         return (
             attn_output.reshape(q.shape[0], -1),

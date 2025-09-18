@@ -25,6 +25,7 @@ class WeightMapping:
     head_dim_padding: bool = False
     kv_head_padding: bool = False
     concat_axis: int | None = None
+    is_eagle3: bool = False
 
     def __post_init__(self):
         if self.sharding is None:
@@ -78,9 +79,8 @@ class WeightLoader:
             model_config, "head_dim", self.hidden_size // self.num_heads
         )
 
-        self.head_dim = (self.head_dim_original + 127) // 128 * 128
-        self.head_dim_pad = self.head_dim - self.head_dim_original
-
+        self.head_dim_pad = (self.head_dim_original + 127) // 128 * 128 - self.head_dim_original
+        self.head_dim = self.head_dim_original
         if hasattr(self.mesh, "shape") and "tensor" in self.mesh.shape:
             self.sharding_size = self.mesh.shape["tensor"]
         else:
@@ -122,6 +122,11 @@ class WeightLoader:
 
         for hf_key, hf_weight in self._iterate_weights():
             if hf_key in regular_mappings:
+                if hf_key == "d2t":
+                    base = jnp.arange(hf_weight.shape[0], dtype=hf_weight.dtype)
+                    hot_ids = (hf_weight + base).astype(jnp.int32)
+                    params["hot_token_ids"].value = hot_ids
+                    continue
                 mapping = regular_mappings[hf_key]
                 if isinstance(mapping, (str, list)):
                     mapping = WeightMapping(target_path=mapping)
@@ -334,9 +339,6 @@ class WeightLoader:
         if mapping.reshape is not None:
             processed_weight = jnp.reshape(processed_weight, mapping.reshape)
 
-        if mapping.head_dim_padding and self.head_dim_pad > 0:
-            processed_weight = self._apply_head_dim_padding(processed_weight, hf_key, mapping)
-
         if mapping.kv_head_padding:
             processed_weight = self._apply_kv_head_padding(processed_weight, hf_key)
 
@@ -538,17 +540,25 @@ class WeightLoader:
                     if "q_proj" in hf_key:
                         reshaped = jnp.reshape(
                             weight,
-                            (self.hidden_size, self.num_heads, self.head_dim_original),
+                            (
+                                self.hidden_size if not mapping.is_eagle3 else 2 * self.hidden_size,
+                                self.num_heads,
+                                self.head_dim_original,
+                            ),
                         )
                         padded = jnp.pad(reshaped, ((0, 0), (0, 0), (0, self.head_dim_pad)))
                         return jnp.reshape(
-                            padded, (self.hidden_size, self.num_heads * self.head_dim)
+                            padded,
+                            (
+                                self.hidden_size if not mapping.is_eagle3 else 2 * self.hidden_size,
+                                self.num_heads * self.head_dim,
+                            ),
                         )
                     elif any(proj in hf_key for proj in ["k_proj", "v_proj"]):
                         reshaped = jnp.reshape(
                             weight,
                             (
-                                self.hidden_size,
+                                self.hidden_size if not mapping.is_eagle3 else 2 * self.hidden_size,
                                 self.num_kv_heads,
                                 self.head_dim_original,
                             ),
@@ -556,7 +566,10 @@ class WeightLoader:
                         padded = jnp.pad(reshaped, ((0, 0), (0, 0), (0, self.head_dim_pad)))
                         return jnp.reshape(
                             padded,
-                            (self.hidden_size, self.num_kv_heads * self.head_dim),
+                            (
+                                self.hidden_size if not mapping.is_eagle3 else 2 * self.hidden_size,
+                                self.num_kv_heads * self.head_dim,
+                            ),
                         )
                     elif "o_proj" in hf_key:
                         reshaped = jnp.reshape(

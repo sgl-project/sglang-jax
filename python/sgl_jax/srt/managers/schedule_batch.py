@@ -21,8 +21,9 @@ import dataclasses
 import logging
 import threading
 from http import HTTPStatus
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
+import jax
 import numpy as np
 from jax import numpy as jnp
 from jax._src import mesh as mesh_lib
@@ -35,6 +36,10 @@ from sgl_jax.srt.mem_cache.allocator import (
 )
 from sgl_jax.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sgl_jax.srt.mem_cache.chunk_cache import ChunkCache
+from sgl_jax.srt.mem_cache.common import (
+    alloc_paged_token_slots_extend,
+    alloc_token_slots,
+)
 from sgl_jax.srt.mem_cache.memory_pool import ReqToTokenPool
 from sgl_jax.srt.mem_cache.swa_radix_cache import SWARadixCache
 from sgl_jax.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
@@ -46,12 +51,18 @@ from sgl_jax.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sgl_jax.srt.sampling.sampling_params import DEFAULT_SAMPLING_SEED, SamplingParams
 from sgl_jax.srt.server_args import ServerArgs
 
+if TYPE_CHECKING:
+    from sgl_jax.srt.speculative.eagle_util import EagleDraftInput, EagleVerifyInput
+    from sgl_jax.srt.speculative.spec_info import SpeculativeAlgorithm
+
 INIT_INCREMENTAL_DETOKENIZATION_OFFSET = 5
 
 
 GLOBAL_SERVER_ARGS_KEYS = [
     "device",
     "disable_radix_cache",
+    "speculative_accept_threshold_single",
+    "speculative_accept_threshold_acc",
     "enable_deterministic_sampling",
 ]
 
@@ -84,6 +95,18 @@ class FINISH_MATCHED_TOKEN(BaseFinishReason):
 
 
 class FINISH_MATCHED_STR(BaseFinishReason):
+    def __init__(self, matched: str):
+        super().__init__()
+        self.matched = matched
+
+    def to_json(self):
+        return {
+            "type": "stop",  # to match OpenAI API's return value
+            "matched": self.matched,
+        }
+
+
+class FINISHED_MATCHED_REGEX(BaseFinishReason):
     def __init__(self, matched: str):
         super().__init__()
         self.matched = matched
@@ -139,6 +162,7 @@ class Req:
         origin_input_ids_unpadded: tuple[int] | None = None,
         eos_token_ids: set[int] | None = None,
         vocab_size: int | None = None,
+        return_hidden_states: bool = False,
     ):
         # Input and output info
         self.rid = rid
@@ -156,6 +180,7 @@ class Req:
 
         # Sampling info
         self.sampling_params = sampling_params
+        self.return_hidden_states = return_hidden_states
 
         # Memory pool info
         self.req_pool_idx: int | None = None
@@ -163,6 +188,7 @@ class Req:
         # Check finish
         self.tokenizer = None
         self.finished_reason = None
+        self.finished_len = None
         # Whether this request has finished output
         self.finished_output = None
         # If we want to abort the request in the middle of the event loop, set this to true
@@ -198,6 +224,8 @@ class Req:
         self.last_host_node: Any = None
         # The node to lock until for swa radix tree lock ref
         self.swa_uuid_for_lock: int | None = None
+        # The prefix length of the last prefix matching
+        self.last_matched_prefix_len: int = 0
 
         # Whether or not if it is chunked. It increments whenever
         # it is chunked, and decrement whenever chunked request is
@@ -258,6 +286,13 @@ class Req:
         # The number of cached tokens that were already cached in the KV cache
         self.cached_tokens = 0
         self.already_computed = 0
+        # The number of verification forward passes in the speculative decoding.
+        # This is used to compute the average acceptance length per request.
+        self.spec_verify_ct = 0
+
+        # The number of accepted tokens in speculative decoding for this request.
+        # This is used to compute the acceptance rate and average acceptance length per request.
+        self.spec_accepted_tokens = 0
 
         # For metrics
         self.has_log_time_stats: bool = False
@@ -307,6 +342,7 @@ class Req:
             ) = tree_cache.match_prefix(
                 key=self.adjust_max_prefix_ids(),
             )
+            self.last_matched_prefix_len = len(self.prefix_indices)
         self.extend_input_len = len(self.fill_ids) - len(self.prefix_indices)
 
     def adjust_max_prefix_ids(self):
@@ -338,7 +374,7 @@ class Req:
         all_ids = self.origin_input_ids_unpadded + self.output_ids
         return all_ids[self.surr_offset :], self.read_offset - self.surr_offset
 
-    def check_finished(self):
+    def check_finished(self, new_accepted_len: int = 1):
         if self.finished():
             return
 
@@ -357,39 +393,58 @@ class Req:
             self.finished_reason = FINISH_MATCHED_TOKEN(matched=self.output_ids[-1])
             return
 
-        last_token_id = self.output_ids[-1]
-        if hasattr(last_token_id, "item"):
-            last_token_id = last_token_id.item()
-        last_token_id = int(last_token_id)
-        if not self.sampling_params.ignore_eos:
-            matched_eos = False
+        new_accepted_tokens = self.output_ids[-new_accepted_len:]
+        # if hasattr(last_token_id, "item"):
+        #     last_token_id = last_token_id.item()
+        # last_token_id = int(last_token_id)
+        if self._check_token_based_finish(new_accepted_tokens=new_accepted_tokens):
+            return
 
-            # Check stop token ids
+        if self._check_vocab_boundary_finish(new_accepted_tokens):
+            return
+
+        if self._check_str_based_finish():
+            return
+
+    def _check_vocab_boundary_finish(self, new_accepted_tokens: list[int]) -> bool:
+        for i, token_id in enumerate(new_accepted_tokens):
+            if self.vocab_size is not None and (token_id > self.vocab_size or token_id < 0):
+                if self.sampling_params.stop_token_ids:
+                    self.output_ids[-1] = next(iter(self.sampling_params.stop_token_ids))
+                elif self.eos_token_ids:
+                    self.output_ids[-1] = next(iter(self.eos_token_ids))
+                self.finished_reason = FINISH_MATCHED_STR(matched="NaN happened")
+                return True
+        return False
+
+    def _check_token_based_finish(self, new_accepted_tokens: list[int]) -> bool:
+        if self.sampling_params.ignore_eos:
+            return False
+        matched_eos = False
+        # Check stop token ids
+        for i, token_id in enumerate(new_accepted_tokens):
             if self.sampling_params.stop_token_ids:
-                matched_eos = last_token_id in self.sampling_params.stop_token_ids
+                matched_eos |= token_id in self.sampling_params.stop_token_ids
             if self.eos_token_ids:
                 if any(hasattr(token_id, "item") for token_id in self.eos_token_ids):
                     self.eos_token_ids = {
                         (int(token_id.item()) if hasattr(token_id, "item") else int(token_id))
                         for token_id in self.eos_token_ids
                     }
-                matched_eos |= last_token_id in self.eos_token_ids
+                matched_eos |= token_id in self.eos_token_ids
             if self.tokenizer is not None:
-                matched_eos |= last_token_id == self.tokenizer.eos_token_id
+                matched_eos |= token_id == self.tokenizer.eos_token_id
                 if self.tokenizer.additional_stop_token_ids:
-                    matched_eos |= last_token_id in self.tokenizer.additional_stop_token_ids
+                    matched_eos |= token_id in self.tokenizer.additional_stop_token_ids
             if matched_eos:
-                self.finished_reason = FINISH_MATCHED_TOKEN(matched=last_token_id)
-                return
+                self.finished_reason = FINISH_MATCHED_TOKEN(matched=token_id)
+                matched_pos = len(self.output_ids) - len(new_accepted_tokens) + i
+                self.finished_len = matched_pos + 1
+                return True
 
-        if self.vocab_size is not None and (last_token_id > self.vocab_size or last_token_id < 0):
-            if self.sampling_params.stop_token_ids:
-                self.output_ids[-1] = next(iter(self.sampling_params.stop_token_ids))
-            elif self.eos_token_ids:
-                self.output_ids[-1] = next(iter(self.eos_token_ids))
-            self.finished_reason = FINISH_MATCHED_STR(matched="NaN happened")
-            return
+        return False
 
+    def _check_str_based_finish(self):
         # Check stop strings
         if len(self.sampling_params.stop_strs) > 0:
             tail_str = self.tokenizer.decode(
@@ -399,7 +454,8 @@ class Req:
             for stop_str in self.sampling_params.stop_strs:
                 if stop_str in tail_str or stop_str in self.decoded_text:
                     self.finished_reason = FINISH_MATCHED_STR(matched=stop_str)
-                    return
+                    return True
+        return False
 
     def reset_for_retract(self):
         self.prefix_indices = []
@@ -499,6 +555,9 @@ class ScheduleBatch:
 
     cache_miss_count: int = 0
 
+    spec_algorithm: SpeculativeAlgorithm = None
+    spec_info: EagleDraftInput | EagleVerifyInput | None = None
+
     # Whether to return hidden states
     return_hidden_states: bool = False
 
@@ -517,6 +576,7 @@ class ScheduleBatch:
         tree_cache: BasePrefixCache,
         model_config: ModelConfig,
         enable_overlap: bool,
+        spec_algorithm: SpeculativeAlgorithm = None,
         enable_custom_logit_processor: bool = False,
         chunked_req: Req | None = None,
         mesh: mesh_lib.Mesh = None,
@@ -543,6 +603,7 @@ class ScheduleBatch:
             has_grammar=any(req.grammar for req in reqs),
             chunked_req=chunked_req,
             mesh=mesh,
+            spec_algorithm=spec_algorithm,
             is_prefill_only=all(req.sampling_params.max_new_tokens == 0 for req in reqs),
         )
 
@@ -562,61 +623,6 @@ class ScheduleBatch:
                 f"{num_reqs=}, "
             )
         return req_pool_indices
-
-    def alloc_token_slots(self, num_tokens: int, backup_state: bool = False):
-        self._evict_tree_cache_if_needed(num_tokens)
-
-        if backup_state:
-            state = self.token_to_kv_pool_allocator.backup_state()
-
-        out_cache_loc = self.token_to_kv_pool_allocator.alloc(num_tokens)
-        if out_cache_loc is None:
-            phase_str = "Prefill" if self.forward_mode.is_extend() else "Decode"
-            error_msg = (
-                f"{phase_str} out of memory. Try to lower your batch size.\n"
-                f"Try to allocate {num_tokens} tokens.\n"
-                f"{self._available_and_evictable_str()}"
-            )
-            logger.error(error_msg)
-            if self.tree_cache is not None:
-                self.tree_cache.pretty_print()
-            raise RuntimeError(error_msg)
-
-        if backup_state:
-            return out_cache_loc, state
-        else:
-            return out_cache_loc
-
-    def alloc_paged_token_slots_extend(
-        self,
-        prefix_lens: list[int],
-        seq_lens: list[int],
-        last_loc: list[int],
-        extend_num_tokens: int,
-        backup_state: bool = False,
-    ):
-        num_tokens = extend_num_tokens + len(seq_lens) * self.token_to_kv_pool_allocator.page_size
-        self._evict_tree_cache_if_needed(num_tokens)
-
-        if backup_state:
-            state = self.token_to_kv_pool_allocator.backup_state()
-
-        out_cache_loc = self.token_to_kv_pool_allocator.alloc_extend(
-            prefix_lens, seq_lens, last_loc, extend_num_tokens
-        )
-        if out_cache_loc is None:
-            error_msg = (
-                f"Prefill out of memory. Try to lower your batch size.\n"
-                f"Try to allocate {extend_num_tokens} tokens.\n"
-                f"{self._available_and_evictable_str()}"
-            )
-            logger.error(error_msg)
-            raise RuntimeError(error_msg)
-
-        if backup_state:
-            return out_cache_loc, state
-        else:
-            return out_cache_loc
 
     def alloc_paged_token_slots_decode(
         self,
@@ -756,14 +762,15 @@ class ScheduleBatch:
 
         # Allocate memory
         if self.token_to_kv_pool_allocator.page_size == 1:
-            out_cache_loc = self.alloc_token_slots(extend_num_tokens)
+            out_cache_loc = alloc_token_slots(self.tree_cache, extend_num_tokens)
         else:
             last_loc_cpu = get_last_loc(
                 self.req_to_token_pool.req_to_token,
                 req_pool_indices_cpu,
                 prefix_lens_cpu,
             )
-            out_cache_loc = self.alloc_paged_token_slots_extend(
+            out_cache_loc = alloc_paged_token_slots_extend(
+                self.tree_cache,
                 prefix_lens,
                 seq_lens,
                 last_loc_cpu.tolist(),
@@ -929,6 +936,14 @@ class ScheduleBatch:
     def prepare_for_decode(self):
         self.forward_mode = ForwardMode.DECODE
         bs = len(self.reqs)
+        if self.spec_algorithm is not None and self.spec_algorithm.is_eagle():
+            # if spec decoding is used, the decode batch is prepared inside
+            # `forward_batch_speculative_generation` after running draft models.
+            draft_input: EagleDraftInput = self.spec_info
+            draft_input.prepare_for_decode(self)
+
+        if self.spec_algorithm is not None and not self.spec_algorithm.is_none():
+            return
 
         if self.sampling_info.penalizer_orchestrator.is_required:
             if self.enable_overlap:
@@ -959,7 +974,7 @@ class ScheduleBatch:
 
         # Allocate memory
         if self.token_to_kv_pool_allocator.page_size == 1:
-            self.out_cache_loc = self.alloc_token_slots(bs)
+            self.out_cache_loc = alloc_token_slots(self.tree_cache, bs)
         else:
             last_loc = self.req_to_token_pool.req_to_token[self.req_pool_indices, self.seq_lens - 2]
             self.out_cache_loc = self.alloc_paged_token_slots_decode(
@@ -997,9 +1012,23 @@ class ScheduleBatch:
 
         self.reqs = [self.reqs[i] for i in keep_indices]
         self.req_pool_indices = self.req_pool_indices[keep_indices]
+        # TODO: uniform data type in scheduler batch
+        if isinstance(self.seq_lens, jax.Array):
+            self.seq_lens = np.array(self.seq_lens)
+            self.output_ids = np.array(self.output_ids)
         self.seq_lens = self.seq_lens[keep_indices]
+        if self.spec_info is not None and self.spec_info.topk_p is not None:
+            keep_indices_jax = jnp.asarray(keep_indices, dtype=jnp.int32)
+            self.spec_info.topk_p = self.spec_info.topk_p[keep_indices_jax]
+            self.spec_info.topk_index = self.spec_info.topk_index[keep_indices_jax]
+            self.spec_info.hidden_states = self.spec_info.hidden_states[keep_indices_jax]
+            self.spec_info.verified_id = self.spec_info.verified_id[keep_indices_jax]
+            self.spec_info.allocate_lens = self.spec_info.allocate_lens[keep_indices_jax]
+
         self.out_cache_loc = None
         self.seq_lens_sum = self.seq_lens.sum().item()
+        if not isinstance(keep_indices, np.ndarray):
+            keep_indices = np.array(keep_indices)
         self.output_ids = self.output_ids[keep_indices] if self.output_ids is not None else None
         self.return_logprob = any(req.return_logprob for req in self.reqs)
         if self.return_logprob:
@@ -1013,6 +1042,14 @@ class ScheduleBatch:
         self.has_grammar = any(req.grammar for req in self.reqs)
 
         self.sampling_info.filter_batch(np.array(keep_indices))
+        if self.spec_info is not None:
+            if chunked_req_to_exclude is not None and len(chunked_req_to_exclude) > 0:
+                has_been_filtered = False
+            else:
+                has_been_filtered = True
+            self.spec_info.filter_batch(
+                new_indices=keep_indices, has_been_filtered=has_been_filtered
+            )
 
     def merge_batch(self, other: ScheduleBatch):
         # Penalizer orchestrator must be merged before Batch.reqs is merged. This is because
@@ -1047,13 +1084,28 @@ class ScheduleBatch:
         self.has_grammar |= other.has_grammar
         self.return_hidden_states |= other.return_hidden_states
 
+        if self.spec_info:
+            self.spec_info.merge_batch(other.spec_info)
+
     def get_model_worker_batch(
         self,
         token_paddings: list,
         bs_paddings: list,
         cache_loc_paddings: list,
         page_size: int,
+        skip_padding: bool = False,
     ) -> ModelWorkerBatch:
+        if skip_padding:
+            # FIXME(pc) spec decode model_worker_batch will be modified at decode stage, and padding laterly
+            # this may has some redundant code, we need clear future
+            return self.get_spec_model_worker_batch(
+                token_paddings=token_paddings,
+                bs_paddings=bs_paddings,
+                cache_loc_paddings=cache_loc_paddings,
+                page_size=page_size,
+                skip_padding=skip_padding,
+            )
+
         if self.forward_mode.is_decode_or_idle():
             extend_seq_lens = extend_prefix_lens = extend_logprob_start_lens = None
             token_paddings = bs_paddings
@@ -1305,6 +1357,164 @@ class ScheduleBatch:
             launch_done=self.launch_done,
         )
 
+    def get_spec_model_worker_batch(
+        self,
+        token_paddings: list,
+        bs_paddings: list,
+        cache_loc_paddings: list,
+        page_size: int,
+        skip_padding: bool = False,
+    ) -> ModelWorkerBatch:
+
+        if self.forward_mode.is_decode_or_idle():
+            extend_seq_lens = extend_prefix_lens = extend_logprob_start_lens = None
+        else:
+            extend_seq_lens = np.array(self.extend_lens, dtype=np.int32)
+            extend_prefix_lens = np.array(self.prefix_lens, dtype=np.int32)
+            extend_logprob_start_lens = self.extend_logprob_start_lens
+
+        global bid
+        bid += 1
+
+        if self.input_ids is None:
+            input_ids_cpu = np.empty(0, dtype=np.int32)
+        else:
+            input_ids_cpu = self.input_ids.flatten()
+
+        real_input_ids_len = len(input_ids_cpu)
+        out_cache_loc_cpu = self.out_cache_loc
+        seq_lens_cpu = self.seq_lens
+        real_bs = len(seq_lens_cpu)
+        req_pool_indices_cpu = self.req_pool_indices
+        token_indices_with_all_reqs = self.req_to_token_pool.req_to_token[self.req_pool_indices]
+
+        # FIXME @pc, move this to eagle_worker
+        # If enable spec inference, use positions in spec info firstly
+        if self.spec_info is not None and getattr(self.spec_info, "positions", None) is not None:
+            positions_cpu = self.spec_info.positions
+        else:
+            positions_cpu = None
+
+        # Calculate positions and extend_start_loc after padding
+        if self.forward_mode.is_extend():
+            # For prefill: create positions for each token in sequences
+            # Calculate total tokens without padding first
+            if positions_cpu is None:
+                positions_cpu = np.concatenate(
+                    [
+                        np.arange(prefix_len, seq_len, dtype=seq_lens_cpu.dtype)
+                        for seq_len, prefix_len in zip(seq_lens_cpu, self.prefix_lens)
+                    ]
+                )
+            # Start location of each sequence in the flattened array
+            extend_start_loc = np.cumsum(
+                np.concatenate([np.array([0]), extend_seq_lens[:-1]]),
+                dtype=seq_lens_cpu.dtype,
+            )
+        else:
+            if positions_cpu is None:
+                # For decode: each sequence contributes one token at the next position (seq_len)
+                # Create positions for actual tokens (one per sequence at seq_len)
+                batch_positions = np.maximum(0, seq_lens_cpu - 1)
+                # Create positions array matching the length of input_ids (including padding)
+                positions_cpu = np.zeros(len(batch_positions), dtype=batch_positions.dtype)
+                # Fill in the actual positions for the real tokens
+                # positions = positions.at[: len(batch_positions)].set(batch_positions)
+                positions_cpu[: len(batch_positions)] = batch_positions
+                # The padding tokens (if any) will have position 0, which is fine for padding
+                # For decode, extend_start_loc is typically not used but we'll set it anyway
+            extend_start_loc = np.arange(len(seq_lens_cpu), dtype=seq_lens_cpu.dtype)
+
+        cache_loc_flat = np.array([], dtype=np.int32)
+
+        if len(seq_lens_cpu) > 0:
+            seq_lens = seq_lens_cpu
+            if self.spec_algorithm is not None and not self.spec_algorithm.is_none():
+                if self.forward_mode == ForwardMode.TARGET_VERIFY:
+                    seq_lens = seq_lens_cpu + self.spec_info.draft_token_num
+                elif self.forward_mode == ForwardMode.DECODE:
+                    from sgl_jax.srt.speculative.eagle_util import EagleDraftInput
+
+                    seq_lens = seq_lens_cpu + EagleDraftInput.ALLOC_LEN_PER_DECODE
+            # Filter out empty sequences
+            valid_mask = seq_lens > 0
+            if np.any(valid_mask):
+                valid_indices = np.where(valid_mask)[0]
+                valid_seq_lens = seq_lens[valid_mask]
+                # Calculate aligned lengths for all valid sequences at once
+                if (
+                    self.forward_mode == ForwardMode.DECODE
+                    and not self.spec_algorithm.is_none()
+                    and self.spec_info.allocate_lens is not None
+                ):
+                    allocated_len = self.spec_info.allocate_lens[: len(self.reqs)]
+                    aligned_lengths = ((allocated_len + page_size - 1) // page_size) * page_size
+                    alread_allocated_lens = allocated_len
+                else:
+                    aligned_lengths = ((valid_seq_lens + page_size - 1) // page_size) * page_size
+                    alread_allocated_lens = valid_seq_lens
+                total_aligned_length = np.sum(aligned_lengths)
+
+                # Pre-allocate the result array
+                cache_loc_flat = np.zeros(total_aligned_length, dtype=np.int32)
+                # Fill the array efficiently
+                offset = 0
+                for i, (seq_idx, alread_allocated_len, aligned_len) in enumerate(
+                    zip(valid_indices, alread_allocated_lens, aligned_lengths)
+                ):
+
+                    # Copy the actual data
+                    cache_loc_flat[offset : offset + alread_allocated_len] = (
+                        token_indices_with_all_reqs[seq_idx, :alread_allocated_len]
+                    )
+                    # Padding is already zero from initialization
+                    offset += aligned_len
+
+        if precision_tracer.get_trace_active():
+            self._generate_trace_info(real_bs, bid)
+        res = ModelWorkerBatch(
+            bid=bid,
+            forward_mode=self.forward_mode,
+            input_ids=input_ids_cpu,
+            real_input_ids_len=real_input_ids_len,
+            req_pool_indices=req_pool_indices_cpu,
+            seq_lens=seq_lens_cpu,
+            out_cache_loc=out_cache_loc_cpu,
+            return_logprob=self.return_logprob,
+            top_logprobs_nums=self.top_logprobs_nums,
+            token_ids_logprobs=self.token_ids_logprobs,
+            sampling_info=self.sampling_info,
+            positions=positions_cpu,
+            extend_start_loc=extend_start_loc,
+            cache_loc=cache_loc_flat,
+            extend_prefix_lens=(extend_prefix_lens if self.forward_mode.is_extend() else None),
+            extend_seq_lens=(extend_seq_lens if self.forward_mode.is_extend() else None),
+            extend_logprob_start_lens=extend_logprob_start_lens,
+            extend_input_logprob_token_ids=self.extend_input_logprob_token_ids,
+            real_bs=real_bs,
+            capture_hidden_mode=(
+                CaptureHiddenMode.FULL
+                if self.return_hidden_states
+                else (
+                    getattr(self.spec_info, "capture_hidden_mode", CaptureHiddenMode.NULL)
+                    if self.spec_info
+                    else CaptureHiddenMode.NULL
+                )
+            ),
+            launch_done=self.launch_done,
+            spec_info=self.spec_info,
+            spec_algorithm=self.spec_algorithm,
+            tree_cache=self.tree_cache,
+        )
+        if skip_padding:
+            return res
+        res.padding_model_worker_batch(
+            token_paddings=token_paddings,
+            bs_paddings=bs_paddings,
+            cache_loc_paddings=cache_loc_paddings,
+        )
+        return res
+
     def _generate_trace_info(self, real_bs: int, bid: int) -> list[str]:
         for req in self.reqs[:real_bs]:
             if precision_tracer.get_trace_active():
@@ -1450,6 +1660,173 @@ class ModelWorkerBatch:
 
     # Pre-initialized ForwardBatch for overlap scheduling optimization
     forward_batch: Any | None = None
+
+    spec_info: EagleDraftInput | EagleVerifyInput | None = None
+    spec_algorithm: SpeculativeAlgorithm = None
+    # If set, the output of the batch contains the hidden states of the run.
+    capture_hidden_mode: CaptureHiddenMode = None
+
+    tree_cache: BasePrefixCache = None
+
+    def padding_model_worker_batch(
+        self,
+        token_paddings: list,
+        bs_paddings: list,
+        cache_loc_paddings: list,
+    ):
+        if self.forward_mode.is_decode_or_idle():
+            token_paddings = bs_paddings
+        else:
+            bs_paddings = bs_paddings[-1:]
+            cache_loc_paddings = cache_loc_paddings[-1:]
+        # padding seq
+        # extend & decode: input_ids, positions, out_cache_loc, cache_loc
+        padding_size = 0
+        token_paddings.sort()
+        for size in token_paddings:
+            if size >= len(self.input_ids):
+                padding_size = size - len(self.input_ids)
+                break
+        if padding_size >= 0:
+            input_ids_cpu = np.concat(
+                [
+                    self.input_ids,
+                    np.array([0] * padding_size, dtype=self.input_ids.dtype),
+                ],
+                axis=0,
+            )
+        padded_input_ids_len = len(input_ids_cpu)
+        out_cache_loc_num_to_padding = padded_input_ids_len - len(self.out_cache_loc)
+        if out_cache_loc_num_to_padding >= 0:
+            out_cache_loc_cpu = np.concatenate(
+                [
+                    self.out_cache_loc,
+                    np.array(
+                        [-1] * out_cache_loc_num_to_padding,
+                        dtype=self.out_cache_loc.dtype,
+                    ),
+                ],
+                axis=0,
+            )
+        else:
+            # this maybe more than input_ids when eagle, but it will always be fix shape, so we should'd padding this
+            out_cache_loc_cpu = self.out_cache_loc
+        # todo padding position
+        seq_lens_cpu = self.seq_lens
+        bs_padding_size = 0
+        bs_paddings.sort()
+        select_bs_index = -1
+        for i, size in enumerate(bs_paddings):
+            if size >= len(seq_lens_cpu):
+                bs_padding_size = size - len(seq_lens_cpu)
+                select_bs_index = i
+                break
+
+        # offset = np.sum(seq_lens_cpu[seq_lens_cpu > 0]) if len(seq_lens_cpu) > 0 else 0
+
+        total_cache_loc_size = cache_loc_paddings[select_bs_index]
+        assert total_cache_loc_size >= len(self.cache_loc)
+
+        cache_loc_cpu = np.empty(total_cache_loc_size, dtype=np.int32)
+        if len(self.cache_loc) > 0:
+            cache_loc_cpu[: len(self.cache_loc)] = self.cache_loc
+        # Initialize padding area to ensure multiprocess consistency
+        if len(self.cache_loc) < total_cache_loc_size:
+            cache_loc_cpu[len(self.cache_loc) :] = 0
+        extend_start_loc = self.extend_start_loc
+        extend_prefix_lens = self.extend_prefix_lens
+        extend_seq_lens = self.extend_seq_lens
+        req_pool_indices_cpu = self.req_pool_indices
+        if bs_padding_size > 0:
+            invalid_req_pool_indices = np.array(
+                [-1] * bs_padding_size, dtype=self.req_pool_indices.dtype
+            )
+            req_pool_indices_cpu = np.concat(
+                [
+                    self.req_pool_indices,
+                    invalid_req_pool_indices,
+                ],
+                axis=0,
+            )
+            invalid_seq_lens = np.array([0] * bs_padding_size, dtype=seq_lens_cpu.dtype)
+            seq_lens_cpu = np.concat([seq_lens_cpu, invalid_seq_lens], axis=0)
+            if self.forward_mode.is_extend():
+                invalid_extend_start_loc = np.array(
+                    [self.extend_start_loc[-1] + self.extend_seq_lens[-1]] * bs_padding_size,
+                    dtype=(
+                        self.extend_start_loc.dtype
+                        if self.extend_start_loc is not None
+                        else np.int32
+                    ),
+                )
+                extend_start_loc = np.concat(
+                    [self.extend_start_loc, invalid_extend_start_loc], axis=0
+                )
+                invalid_extend_prefix_lens = np.array(
+                    [0] * bs_padding_size,
+                    dtype=np.int32,
+                )
+                extend_prefix_lens = (
+                    np.concat([self.extend_prefix_lens, invalid_extend_prefix_lens], axis=0)
+                    if self.extend_prefix_lens is not None
+                    and invalid_extend_prefix_lens.shape[0] > 0
+                    and self.extend_prefix_lens.shape[0] > 0
+                    else self.extend_prefix_lens
+                )
+                invalid_extend_seq_lens = np.array(
+                    [0] * bs_padding_size,
+                    dtype=(
+                        self.extend_seq_lens.dtype if self.extend_seq_lens is not None else np.int32
+                    ),
+                )
+                extend_seq_lens = (
+                    np.concat([self.extend_seq_lens, invalid_extend_seq_lens], axis=0)
+                    if self.extend_seq_lens is not None
+                    and invalid_extend_seq_lens.shape[0] > 0
+                    and self.extend_seq_lens.shape[0] > 0
+                    else self.extend_seq_lens
+                )
+            else:
+                invalid_extend_start_loc = np.array(
+                    [len(seq_lens_cpu)] * bs_padding_size,
+                    dtype=(
+                        self.extend_start_loc.dtype
+                        if self.extend_start_loc is not None
+                        else np.int32
+                    ),
+                )
+                extend_start_loc = np.concat(
+                    [self.extend_start_loc, invalid_extend_start_loc], axis=0
+                )
+                # padding
+        padding_size = 0
+        if (
+            self.forward_mode == ForwardMode.DRAFT_EXTEND
+            or self.forward_mode == ForwardMode.TARGET_VERIFY
+        ):
+            padding_size = len(input_ids_cpu) - len(self.positions)
+        elif self.forward_mode == ForwardMode.EXTEND or self.forward_mode == ForwardMode.MIXED:
+            total_tokens_before_padding = sum([extend_len for extend_len in extend_seq_lens])
+            padding_size = len(input_ids_cpu) - total_tokens_before_padding
+        elif not self.spec_algorithm.is_none() and self.forward_mode == ForwardMode.DECODE:
+            padding_size = len(input_ids_cpu) - len(self.positions)
+        else:
+            pass
+        if padding_size >= 0:
+            zeros_pad = np.zeros(padding_size, dtype=np.int32)
+            positions_cpu = np.concatenate([self.positions, zeros_pad], axis=0)
+        if len(positions_cpu) > len(input_ids_cpu):
+            positions_cpu = self.positions[: len(input_ids_cpu)]
+
+        self.seq_lens = seq_lens_cpu
+        self.extend_start_loc = extend_start_loc
+        self.extend_prefix_lens = extend_prefix_lens
+        self.extend_seq_lens = extend_seq_lens if self.forward_mode.is_extend() else None
+        self.cache_loc = cache_loc_cpu
+        self.input_ids = input_ids_cpu
+        self.out_cache_loc = out_cache_loc_cpu
+        self.req_pool_indices = req_pool_indices_cpu
+        self.positions = positions_cpu
 
 
 def get_last_loc(

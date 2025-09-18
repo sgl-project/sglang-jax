@@ -5,8 +5,8 @@ import jax.numpy as jnp
 from sgl_jax.srt.kernels.ragged_paged_attention.util import (
     get_device_name,
     get_tpu_version,
-    next_power_of_2,
 )
+from sgl_jax.srt.utils.common_utils import next_power_of_2
 
 # key
 #   - device_name
