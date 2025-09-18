@@ -384,7 +384,7 @@ class TestAttention(CustomTestCase):
             return out
 
         # run
-        jax_output, _, _ = jit_attn(q_shard, extend_k, extend_v, forward_batch)
+        jax_output, _ = jit_attn(q_shard, extend_k, extend_v, forward_batch)
         jax.block_until_ready(jax_output)
 
         rtol = 2e-2  # Relative tolerance
