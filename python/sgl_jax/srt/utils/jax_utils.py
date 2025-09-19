@@ -72,13 +72,11 @@ def get_available_device_memory(device, distributed=False, empty_cache=True):
         # Use pmap to find the minimum available memory across all devices.
         mesh = jax.make_mesh((jax.process_count(), 4), ("node", "device"))
 
-        with jax.sharding.set_mesh(mesh=mesh):
-
-            @jax.shard_map(
-                mesh=mesh, in_specs=PartitionSpec(None), out_specs=PartitionSpec(None)
-            )
-            def _get_available_memory_distributed(a):
-                return jax.lax.pmin(a, axis_name="node")
+        @jax.shard_map(
+            mesh=mesh, in_specs=PartitionSpec(None), out_specs=PartitionSpec(None)
+        )
+        def _get_available_memory_distributed(a):
+            return jax.lax.pmin(a, axis_name="node")
 
         # We broadcast the local min memory to all devices and then find the global min.
         # i64 dtype cannot be all-reduce min
@@ -93,7 +91,5 @@ def get_available_device_memory(device, distributed=False, empty_cache=True):
     return int(free_gpu_memory * (1 << 10))
 
 
-def device_array(mesh, *data, sharding=None, **kwargs) -> jax.Array:
-    if sharding is None:
-        sharding = NamedSharding(mesh, PartitionSpec())
+def device_array(*data, sharding=None, **kwargs) -> jax.Array:
     return jax.device_put(*data, device=sharding, **kwargs)

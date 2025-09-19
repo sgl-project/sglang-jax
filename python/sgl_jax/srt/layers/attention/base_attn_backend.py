@@ -17,7 +17,7 @@ class AttentionBackend(nnx.Module):
     """The base class of attention backends"""
 
     @abstractmethod
-    def get_forward_metadata(self, batch: ModelWorkerBatch, mesh: Mesh):
+    def get_forward_metadata(self, batch: ModelWorkerBatch):
         """Init the metadata for a forward pass and return it"""
         raise NotImplementedError()
 

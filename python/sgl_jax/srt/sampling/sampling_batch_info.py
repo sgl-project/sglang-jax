@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import dataclasses
 import logging
-from typing import TYPE_CHECKING, Callable, List, Optional
+from typing import TYPE_CHECKING, List, Optional
 
-from jax.sharding import Mesh
+from jax.sharding import Mesh, NamedSharding, PartitionSpec
 from jax.tree_util import register_pytree_node_class
 
 from sgl_jax.srt.sampling.sampling_params import TOP_K_ALL
@@ -113,7 +113,12 @@ class SamplingMetadata:
 
         (temperatures_device, top_ps_device, top_ks_device, min_ps_device) = (
             device_array(
-                mesh, (padded_temperatures, padded_top_ps, padded_top_ks, padded_min_ps)
+                (padded_temperatures, padded_top_ps, padded_top_ks, padded_min_ps),
+                sharding=(
+                    NamedSharding(mesh, PartitionSpec())
+                    if jax.process_count() == 1
+                    else None
+                ),
             )
         )
 
@@ -270,12 +275,10 @@ def merge_bias_tensor(
 
         if lhs is None:
             lhs = device_array(
-                mesh,
                 jnp.full((bs1, *shape), fill_value=default, dtype=dtype),
             )
         if rhs is None:
             rhs = device_array(
-                mesh,
                 jnp.full((bs2, *shape), fill_value=default, dtype=dtype),
             )
         return jnp.concat([lhs, rhs])
