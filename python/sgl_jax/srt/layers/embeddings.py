@@ -14,8 +14,8 @@
 
 """Embedding Layers."""
 
-from functools import partial
-from typing import Optional, Tuple, Union
+import math
+from typing import Any, Dict, Optional, Tuple, Union
 
 import jax
 import jax.numpy as jnp
@@ -222,6 +222,53 @@ class RotaryEmbedding(nnx.Module):
         return cache
 
 
+class Llama3RotaryEmbedding(RotaryEmbedding):
+
+    def __init__(
+        self,
+        head_size: int,
+        rotary_dim: int,
+        max_position_embeddings: int,
+        base: int,
+        is_neox_style: bool,
+        dtype: jnp.dtype,
+        scaling_factor: float,
+        low_freq_factor: float,
+        high_freq_factor: float,
+        orig_max_position: int,
+    ) -> None:
+        self.scaling_factor = scaling_factor
+        self.low_freq_factor = low_freq_factor
+        self.high_freq_factor = high_freq_factor
+        self.orig_max_position = orig_max_position
+        super().__init__(
+            head_size, rotary_dim, max_position_embeddings, base, is_neox_style, dtype
+        )
+
+    def _compute_inv_freq(self, base: Union[int, float]) -> jax.Array:
+        inv_freqs = super()._compute_inv_freq(base)
+        low_freq_wavelen = self.orig_max_position / self.low_freq_factor
+        high_freq_wavelen = self.orig_max_position / self.high_freq_factor
+
+        wave_len = 2 * math.pi / inv_freqs
+        if self.low_freq_factor != self.high_freq_factor:
+            smooth = (self.orig_max_position / wave_len - self.low_freq_factor) / (
+                self.high_freq_factor - self.low_freq_factor
+            )
+        else:
+            smooth = 0
+        new_freqs = jnp.where(
+            wave_len < high_freq_wavelen,
+            inv_freqs,
+            jnp.where(
+                wave_len > low_freq_wavelen,
+                inv_freqs / self.scaling_factor,
+                (1 - smooth) * inv_freqs / self.scaling_factor + smooth * inv_freqs,
+            ),
+        )
+        return new_freqs
+
+
 # @partial(jax.jit, static_argnames=["rotary_dim", "head_size", "is_neox_style"])
 def rotary_embedding_forward(
     positions: jax.Array,
@@ -283,3 +330,86 @@ def _apply_rotary_emb(
     else:
         stacked = jnp.stack((o1, o2), axis=-1)
         return stacked.reshape(*stacked.shape[:-2], -1)
+
+
+_ROPE_DICT: Dict[Tuple, RotaryEmbedding] = {}
+
+
+def get_rope(
+    head_size: int,
+    rotary_dim: int,
+    max_position: int,
+    base: int,
+    is_neox_style: bool = True,
+    rope_scaling: Optional[Dict[str, Any]] = None,
+    dtype: Optional[jnp.dtype] = jnp.bfloat16,
+    partial_rotary_factor: float = 1.0,
+    dual_chunk_attention_config: Optional[Dict[str, Any]] = None,
+) -> RotaryEmbedding:
+    if rope_scaling is not None:
+        # Transforms every value that is a list into a tuple for caching calls
+        rope_scaling_tuple = {
+            k: tuple(v) if isinstance(v, list) else v for k, v in rope_scaling.items()
+        }
+        rope_scaling_args = tuple(rope_scaling_tuple.items())
+    else:
+        rope_scaling_args = None
+
+    if dual_chunk_attention_config is not None:
+        dual_chunk_attention_tuple = {
+            k: tuple(v) if isinstance(v, list) else v
+            for k, v in dual_chunk_attention_config.items()
+            if k != "sparse_attention_config"
+        }
+        dual_chunk_attention_args = tuple(dual_chunk_attention_tuple.items())
+    else:
+        dual_chunk_attention_args = None
+
+    if partial_rotary_factor < 1.0:
+        rotary_dim = int(rotary_dim * partial_rotary_factor)
+    key = (
+        head_size,
+        rotary_dim,
+        max_position,
+        base,
+        is_neox_style,
+        rope_scaling_args,
+        dual_chunk_attention_args,
+        dtype,
+    )
+    if key in _ROPE_DICT:
+        return _ROPE_DICT[key]
+
+    if rope_scaling is None:
+        rotary_emb = RotaryEmbedding(
+            head_size, rotary_dim, max_position, base, is_neox_style, dtype
+        )
+    else:
+        if "rope_type" in rope_scaling:
+            scaling_type = rope_scaling["rope_type"]
+        elif "type" in rope_scaling:
+            scaling_type = rope_scaling["type"]
+        else:
+            raise ValueError("Unknown RoPE scaling type")
+
+        if scaling_type == "llama3":
+            scaling_factor = rope_scaling["factor"]
+            low_freq_factor = rope_scaling["low_freq_factor"]
+            high_freq_factor = rope_scaling["high_freq_factor"]
+            original_max_position = rope_scaling["original_max_position_embeddings"]
+            rotary_emb = Llama3RotaryEmbedding(
+                head_size,
+                rotary_dim,
+                max_position,
+                base,
+                is_neox_style,
+                dtype,
+                scaling_factor,
+                low_freq_factor,
+                high_freq_factor,
+                original_max_position,
+            )
+        else:
+            raise ValueError(f"Unknown RoPE scaling type {scaling_type}")
+    _ROPE_DICT[key] = rotary_emb
+    return rotary_emb
