@@ -173,7 +173,7 @@ class EPMoE(nnx.Module):
         except Exception as e:
             return False, "cpu"
 
-    def __call__(self, inputs, router_logits=None):
+    def __call__(self, inputs, router_logits=None, gmm_tiling_config_array=None):
         if router_logits is None:
             raise ValueError("router_logits is required for EPMoE")
 
@@ -186,15 +186,26 @@ class EPMoE(nnx.Module):
             )
 
         if self.expert_parallel_size == 1:
-            output = self._single_device_forward(inputs, router_logits)
+            output = self._single_device_forward(
+                inputs, router_logits, gmm_tiling_config_array
+            )
         else:
-            output = self._expert_parallel_forward_with_shard_map(inputs, router_logits)
+            output = self._expert_parallel_forward_with_shard_map(
+                inputs, router_logits, gmm_tiling_config_array
+            )
 
         return output
 
-    def _expert_parallel_forward_with_shard_map(self, inputs, router_logits):
+    def _expert_parallel_forward_with_shard_map(
+        self, inputs, router_logits, gmm_tiling_config_array
+    ):
         def _internal_moe_computation(
-            hidden_states, router_logits, w0_weights, w1_weights, wo_weights
+            hidden_states,
+            router_logits,
+            gmm_tiling_config_array,
+            w0_weights,
+            w1_weights,
+            wo_weights,
         ):
             data_index = jax.lax.axis_index("data")
             tensor_index = jax.lax.axis_index("tensor")
@@ -243,6 +254,7 @@ class EPMoE(nnx.Module):
                 w0_weights,
                 w1_weights,
                 wo_weights,
+                gmm_tiling_config_array,
             )
 
             # EP Combine
@@ -268,37 +280,51 @@ class EPMoE(nnx.Module):
             in_specs=(
                 P(None),  # hidden_states
                 P(None),  # router_logits
+                P(None),  # gmm_tiling_config_array
                 P(("data", "tensor"), None, None),  # w0_weights
                 P(("data", "tensor"), None, None),  # w1_weights
                 P(("data", "tensor"), None, None),  # wo_weights
             ),
             out_specs=P(None),
             check_rep=False,
-        )(inputs, router_logits, self.wi_0.value, self.wi_1.value, self.wo.value)
+        )(
+            inputs,
+            router_logits,
+            gmm_tiling_config_array,
+            self.wi_0.value,
+            self.wi_1.value,
+            self.wo.value,
+        )
 
     def _gmm_compute_with_sharded_weights(
-        self, x, local_group_sizes, selected_experts, w0_kernel, w1_kernel, wo_kernel
+        self,
+        x,
+        local_group_sizes,
+        selected_experts,
+        w0_kernel,
+        w1_kernel,
+        wo_kernel,
+        gmm_tiling_config_array,
     ):
         if x.shape[0] == 0:
             empty_output = jnp.zeros(
                 (0, wo_kernel.shape[-1]), dtype=x.dtype
             )  # (0, hidden_dim)
             return empty_output
-
-        m, k = x.shape[0], x.shape[1]
-        n_gate = w0_kernel.shape[2]
-        n_down = wo_kernel.shape[2]
-
-        default_tile_size = (512, 1024, 1024)
-        tiling_gate = (
-            min(default_tile_size[0], m),
-            min(default_tile_size[1], k),
-            min(default_tile_size[2], n_gate),
-        )
-        tiling_down = (
-            min(default_tile_size[0], m),
-            min(default_tile_size[1], n_gate),
-            min(default_tile_size[2], n_down),
+        jax.debug.print("x_shape: {x_shape}", x_shape=x.shape)
+        # static_tiling_gate = (
+        #     int(optimal_tiling_gate[0]),
+        #     int(optimal_tiling_gate[1]),
+        #     int(optimal_tiling_gate[2]),
+        # )
+        # static_tiling_down = (
+        #     int(optimal_tiling_down[0]),
+        #     int(optimal_tiling_down[1]),
+        #     int(optimal_tiling_down[2]),
+        # )
+        jax.debug.print(
+            "gmm_tiling_array: {gmm_tiling_config_array}",
+            gmm_tiling_config_array=gmm_tiling_config_array,
         )
         # gate
         layer_w0 = gmm(
@@ -306,7 +332,7 @@ class EPMoE(nnx.Module):
             rhs=w0_kernel,
             group_sizes=local_group_sizes,
             preferred_element_type=self.dtype,
-            tiling=tiling_gate,
+            tiling=gmm_tiling_config_array[0],
         )
         # up
         layer_w1 = gmm(
@@ -314,7 +340,7 @@ class EPMoE(nnx.Module):
             rhs=w1_kernel,
             group_sizes=local_group_sizes,
             preferred_element_type=self.dtype,
-            tiling=tiling_gate,
+            tiling=gmm_tiling_config_array[0],
         )
 
         # activation
@@ -327,12 +353,12 @@ class EPMoE(nnx.Module):
             rhs=wo_kernel,
             group_sizes=local_group_sizes,
             preferred_element_type=self.dtype,
-            tiling=tiling_down,
+            tiling=gmm_tiling_config_array[0],
         )
 
         return intermediate_output
 
-    def _single_device_forward(self, inputs, router_logits):
+    def _single_device_forward(self, inputs, router_logits, gmm_tiling_config_array):
         top_k_logits, top_k_indices = jax.lax.top_k(
             router_logits, self.num_experts_per_tok
         )
@@ -342,9 +368,13 @@ class EPMoE(nnx.Module):
 
         top_k_weights = top_k_weights / jnp.sum(top_k_weights, axis=-1, keepdims=True)
 
-        return self._single_device_forward(inputs, top_k_indices, top_k_weights)
+        return self._single_device_forward_impl(
+            inputs, top_k_indices, top_k_weights, gmm_tiling_config_array
+        )
 
-    def _single_device_forward(self, inputs, top_k_indices, top_k_weights):
+    def _single_device_forward_impl(
+        self, inputs, top_k_indices, top_k_weights, gmm_tiling_config_array
+    ):
         num_tokens = inputs.shape[0] * (inputs.shape[1] if inputs.ndim > 1 else 1)
         inputs_flat = inputs.reshape(num_tokens, -1)
 

@@ -2,6 +2,10 @@
 
 import itertools
 import logging
+import os
+
+# Add import for GMM auto tune
+import sys
 import threading
 import time
 from typing import Optional, Tuple, Union
@@ -14,6 +18,11 @@ from jax.experimental.multihost_utils import broadcast_one_to_all
 from tqdm import tqdm
 
 from sgl_jax.srt.configs.model_config import ModelConfig
+from sgl_jax.srt.layers.gmm.auto_tune_tiling import TilingAutoTuner
+from sgl_jax.srt.layers.gmm.tiling_manager import (
+    get_default_cache_dir,
+    load_all_gmm_tiling_configs,
+)
 from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessorOutput
 from sgl_jax.srt.managers.schedule_batch import (
     ModelWorkerBatch,
@@ -81,6 +90,9 @@ class ModelWorker:
             req_to_token_pool=req_to_token_pool,
             rngs=nnx.Rngs(self.random_seed),
         )
+
+        # Initialize empty GMM tiling configs (will be populated after auto-tune)
+        self.gmm_tiling_configs = {}
 
         # set infer devices
         self.device = server_args.device
@@ -184,6 +196,162 @@ class ModelWorker:
 
         self.precompile_token_paddings = normalized_token_paddings
 
+    def run_gmm_auto_tune(self):
+        start_time = time.perf_counter()
+        logger.info("[GMM AUTO-TUNE] Starting GMM tiling parameter auto-tuning")
+
+        try:
+            hf_config = self.model_config.hf_config
+
+            # check if this is a MoE model
+            self.num_experts = getattr(hf_config, "num_experts", None)
+            if self.num_experts is None:
+                self.disable_gmm_auto_tune = True
+                return
+            self.disable_gmm_auto_tune = False
+            logger.info(
+                f"[GMM AUTO-TUNE] MoE model detected with {self.num_experts} experts"
+            )
+
+            self.hidden_size = getattr(hf_config, "hidden_size", 4096)
+            self.intermediate_size = getattr(hf_config, "intermediate_size", None)
+            self.moe_intermediate_size = getattr(
+                hf_config, "moe_intermediate_size", None
+            )
+
+            target_intermediate_size = (
+                self.moe_intermediate_size
+                or self.intermediate_size
+                or self.hidden_size * 4
+            )
+
+            logger.info(
+                f"[GMM AUTO-TUNE] Model config: hidden_size={self.hidden_size}, "
+                f"intermediate_size={target_intermediate_size}, num_experts={self.num_experts}"
+            )
+
+            self.num_experts_per_tok = getattr(hf_config, "num_experts_per_tok", 8)
+            # Generate all combinations: m = batch_size * seq_length * num_experts_per_tok
+            logger.info(
+                f"[GMM AUTO-TUNE] Using precompile parameters for shape generation"
+            )
+            logger.info(
+                f"[GMM AUTO-TUNE] Batch size paddings: {self.precompile_bs_paddings}"
+            )
+            logger.info(
+                f"[GMM AUTO-TUNE] Sequence length paddings: {self.precompile_token_paddings}"
+            )
+            logger.info(
+                f"[GMM AUTO-TUNE] Experts per token: {self.num_experts_per_tok}"
+            )
+            logger.info(
+                f"[GMM AUTO-TUNE] Max padded num tokens: {self.max_padded_num_tokens}"
+            )
+
+            shapes = []
+            skipped_count = 0
+
+            logger.info(f"[GMM AUTO-TUNE] Adding decode-specific shapes (seq_length=1)")
+            for batch_size in self.precompile_bs_paddings:
+                seq_length = 1
+                actual_tokens = batch_size * seq_length  # = batch_size
+
+                # Decode: m = batch_size * num_experts_per_tok
+                m = actual_tokens * self.num_experts_per_tok
+
+                if m < 8 or self.hidden_size < 64 or target_intermediate_size < 64:
+                    continue
+
+                # Add shapes for decode gate/up projections (hidden -> intermediate)
+                shapes.append(
+                    (m, self.hidden_size, target_intermediate_size, self.num_experts)
+                )
+                # Add shapes for decode down projections (intermediate -> hidden)
+                shapes.append(
+                    (m, target_intermediate_size, self.hidden_size, self.num_experts)
+                )
+
+            logger.info(f"[GMM AUTO-TUNE] Adding prefill shapes (variable seq_length)")
+            total_combinations = len(self.precompile_bs_paddings) + (
+                len(self.precompile_bs_paddings) * len(self.precompile_token_paddings)
+            )
+            for batch_size in self.precompile_bs_paddings:
+                for seq_length in self.precompile_token_paddings:
+                    actual_tokens = batch_size * seq_length
+
+                    m = actual_tokens * self.num_experts_per_tok
+
+                    if m < 64 or self.hidden_size < 64 or target_intermediate_size < 64:
+                        skipped_count += 1
+                        logger.debug(
+                            f"[GMM AUTO-TUNE] Skipping tiny shape bs={batch_size}, seq={seq_length} -> m={m}, k={self.hidden_size}, n={target_intermediate_size}"
+                        )
+                        continue
+
+                    shapes.append(
+                        (
+                            m,
+                            self.hidden_size,
+                            target_intermediate_size,
+                            self.num_experts,
+                        )
+                    )
+
+                    shapes.append(
+                        (
+                            m,
+                            target_intermediate_size,
+                            self.hidden_size,
+                            self.num_experts,
+                        )
+                    )
+
+            logger.info(
+                f"[GMM AUTO-TUNE] Generated {len(shapes)} shape configurations from {total_combinations} combinations "
+                f"(skipped {skipped_count} due to size constraints)"
+            )
+            if not shapes:
+                logger.warning("[GMM AUTO-TUNE] No valid shapes to tune, skipping")
+                return
+
+            cache_dir = get_default_cache_dir()
+            tuner = TilingAutoTuner(cache_dir=cache_dir)
+            logger.info(f"[GMM AUTO-TUNE] Using cache directory: {cache_dir}")
+
+            results = {}
+            total_shapes = len(shapes)
+            logger.info(f"[GMM AUTO-TUNE] Tuning {total_shapes} shape configurations")
+
+            with tqdm(shapes, desc="[GMM AUTO-TUNE] Progress", leave=False) as pbar:
+                for i, (m, k, n, num_groups) in enumerate(pbar):
+                    pbar.set_postfix(shape=f"m={m},k={k},n={n},g={num_groups}")
+
+                    optimal_tiling = tuner.tune_for_target_size(
+                        m, k, n, num_groups, use_cache=True
+                    )
+                    cache_key = tuner._get_cache_key(m, k, n, num_groups)
+                    results[cache_key] = optimal_tiling
+
+            end_time = time.perf_counter()
+            logger.info(
+                f"[GMM AUTO-TUNE] Completed in {end_time - start_time:.1f} seconds"
+            )
+            logger.info(
+                f"[GMM AUTO-TUNE] Successfully tuned {len(results)}/{total_shapes} configurations"
+            )
+
+            # Load all GMM tiling configurations into memory for fast access
+            logger.info("[GMM AUTO-TUNE] Loading tiling configurations into memory")
+            self.gmm_tiling_configs = load_all_gmm_tiling_configs()
+
+        except Exception as e:
+            logger.error(f"[GMM AUTO-TUNE] Auto-tuning failed: {e}")
+            logger.info(
+                "[GMM AUTO-TUNE] Continuing without auto-tuning, will use default tiling parameters"
+            )
+            # Initialize empty configs for fallback
+            self.gmm_tiling_configs = {}
+
     def run_precompile(self):
         self.precompile_extend()
         self.precompile_decode()
@@ -272,6 +440,9 @@ class ModelWorker:
             self.precompile_cache_loc_paddings,
         )
 
+    def get_gmm_tiling_configs(self):
+        return self.gmm_tiling_configs
+
     def generate_model_worker_batch(
         self,
         bs: int,
@@ -291,6 +462,25 @@ class ModelWorker:
 
         valid_cache_loc = np.arange(bs)
         invalid_cache_loc = np.array([0] * (invalid_cache_loc_size), dtype=jnp.int32)
+        gmm_tiling_config_array = np.zeros((1, 3), dtype=np.int32)
+
+        if not self.disable_gmm_auto_tune:
+            tiling_key = f"m{bs * num_tokens* self.num_experts_per_tok}_k{self.hidden_size}_n{self.moe_intermediate_size}_g{self.num_experts}"
+            # gmm_tiling_config_array = self.gmm_tiling_configs.get(
+            #     tiling_key,
+            #     None,
+            # )
+            gmm_tiling_config_array[0] = self.gmm_tiling_configs.get(
+                tiling_key,
+                [512, 1024, 1024],
+            )
+            jax.debug.print("tiling_key: {tiling_key}", tiling_key=tiling_key)
+            jax.debug.print(
+                "gmm_tiling_config_array: {gmm_tiling_config_array}",
+                gmm_tiling_config_array=gmm_tiling_config_array,
+            )
+        else:
+            gmm_tiling_config_array = None
 
         return ModelWorkerBatch(
             bid=1,
@@ -319,6 +509,7 @@ class ModelWorker:
             token_ids_logprobs=None,
             extend_logprob_start_lens=None,
             capture_hidden_mode=CaptureHiddenMode.NULL,
+            gmm_tiling_config_array=gmm_tiling_config_array,
         )
 
     def get_model_runner(self):

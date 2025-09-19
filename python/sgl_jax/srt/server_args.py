@@ -128,6 +128,7 @@ class ServerArgs:
     precompile_bs_paddings: Optional[List[int]] = None
 
     disable_jax_precompile: bool = False
+    disable_gmm_auto_tune: bool = False
 
     def __post_init__(self):
         # Set missing default values
@@ -737,6 +738,11 @@ class ServerArgs:
             "--disable-jax-precompile",
             action="store_true",
             help="whether disable jax precompile",
+        )
+        parser.add_argument(
+            "--disable-gmm-auto-tune",
+            action="store_true",
+            help="Disable automatic tuning of GMM (Grouped Matrix Multiplication) tiling parameters at startup",
         )
         # Kernel backend
         parser.add_argument(
