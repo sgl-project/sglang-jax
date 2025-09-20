@@ -2,6 +2,7 @@ import logging
 from typing import Optional, Tuple
 
 import jax
+import jax.lax
 from flax import nnx
 from jax import numpy as jnp
 from jax._src.mesh import get_abstract_mesh, use_abstract_mesh
@@ -84,9 +85,9 @@ class Grok1MLP(nnx.Module):
         self.layer_id = layer_id
 
     def __call__(self, x):
-        gate_up = self.gate_up_proj(x)
-        x = self.act_fn(gate_up)
-        x = self.down_proj(x)
+        gate_up, _ = self.gate_up_proj(x)
+        x, _ = self.act_fn(gate_up)
+        x, _ = self.down_proj(x)
         return x
 
 
@@ -139,10 +140,11 @@ class Grok1MoE(nnx.Module):
             )
 
     def __call__(self, hidden_states: jax.Array) -> jax.Array:
-        router_logits = self.gate(hidden_states)
+        router_logits, _ = self.gate(hidden_states)
         if self.router_logit_softcapping != 0:
             router_logits = router_logits / self.router_logit_softcapping
-            router_logits = jax.nn.tanh(router_logits)
+            router_logits = jax.nn.tanh(router_logits) * self.router_logit_softcapping
+        router_logits = jax.nn.softmax(router_logits, axis=-1)
         return self.experts(hidden_states, router_logits)
 
 
@@ -240,8 +242,8 @@ class Grok1Attention(nnx.Module):
             logit_cap=logit_cap,
             pos_encoding_mode=pos_encoding_mode,
             logit_capping_method=logit_capping_method,
+            xai_temperature_len=getattr(self.config, "attn_temperature_len", -1),
         )
-        self.attn.xai_temperature_len = getattr(self.config, "attn_temperature_len", -1)
 
     def forward(
         self,
@@ -314,7 +316,6 @@ class Grok1DecoderLayer(nnx.Module):
                     intermediate_size=config.intermediate_size,
                     # reduce_results=False,
                     layer_id=layer_id,
-                    # split_gate_up=split_gate_up,
                     rngs=rngs,
                 )
         else:

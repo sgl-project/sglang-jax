@@ -1,4 +1,4 @@
-from typing import Any, Callable, Iterable, Optional, Sequence, Tuple, Union
+from typing import Iterable, Optional, Sequence, Tuple
 
 import jax
 from flax import nnx

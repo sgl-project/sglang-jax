@@ -177,7 +177,7 @@ class EPMoE(nnx.Module):
         if router_logits is None:
             raise ValueError("router_logits is required for EPMoE")
 
-        inputs = inputs.astype(self.dtype)
+        # inputs = inputs.astype(self.dtype)
         total_tokens, hidden_dim = inputs.shape
 
         if router_logits.shape[0] != total_tokens:
@@ -320,19 +320,14 @@ class EPMoE(nnx.Module):
         return intermediate_output
 
     def _single_device_forward(self, inputs, router_logits):
-        top_k_logits, top_k_indices = jax.lax.top_k(
-            router_logits, self.num_experts_per_tok
+        top_k_weights, top_k_indices = jax.lax.top_k(
+            router_logits, k=self.num_experts_per_tok
         )
-        top_k_weights = jax.nn.softmax(
-            top_k_logits.astype(jnp.float32), axis=-1
-        ).astype(self.dtype)
+        # top_k_weights = jax.nn.softmax(top_k_logits.astype(jnp.float32), axis=-1)
+        # top_k_weights = top_k_weights.astype(self.dtype)
+        # top_k_weights = top_k_weights / jnp.sum(top_k_weights, axis=-1, keepdims=True)
 
-        top_k_weights = top_k_weights / jnp.sum(top_k_weights, axis=-1, keepdims=True)
-
-        return self._single_device_forward(inputs, top_k_indices, top_k_weights)
-
-    def _single_device_forward(self, inputs, top_k_indices, top_k_weights):
-        num_tokens = inputs.shape[0] * (inputs.shape[1] if inputs.ndim > 1 else 1)
+        num_tokens = inputs.shape[0] * (inputs.shape[1] if inputs.ndim > 2 else 1)
         inputs_flat = inputs.reshape(num_tokens, -1)
 
         expert_weights = jnp.zeros((num_tokens, self.num_experts), dtype=self.dtype)
@@ -345,12 +340,27 @@ class EPMoE(nnx.Module):
             top_k_weights_flat
         )
 
+        # all_wi_0 = self.wi_0.value[top_k_indices.reshape(-1)]
+        # all_wi_1 = self.wi_1.value[top_k_indices.reshape(-1)]
+        # all_wo = self.wo.value[top_k_indices.reshape(-1)]
+        # expert_weights = expert_weights[:, top_k_indices.reshape(-1)]
+
         all_wi_0 = self.wi_0.value
         all_wi_1 = self.wi_1.value
         all_wo = self.wo.value
 
-        layer_w0 = jnp.einsum("th,ehd->ted", inputs_flat, all_wi_0)
-        layer_w1 = jnp.einsum("th,ehd->ted", inputs_flat, all_wi_1)
+        layer_w01 = jnp.einsum(
+            "th,ehd->ted", inputs_flat, jnp.concat([all_wi_0, all_wi_1], axis=-1)
+        )
+        layer_w0, layer_w1 = jnp.split(layer_w01, 2, axis=-1)
+
+        # layer_w0 = jnp.einsum("th,ehd->ted", inputs_flat, all_wi_0)
+        # layer_w1 = jnp.einsum("th,ehd->ted", inputs_flat, all_wi_1)
+
+        # print(f"{layer_w0.shape=}")
+        # print(f"{layer_w0=}")
+        # print(f"{layer_w1.shape=}")
+        # print(f"{layer_w1=}")
 
         if self.activation == "silu":
             activated = jax.nn.silu(layer_w0) * layer_w1
@@ -358,6 +368,8 @@ class EPMoE(nnx.Module):
             activated = jax.nn.gelu(layer_w0) * layer_w1
         else:
             raise NotImplementedError(self.activation)
+
+        print(f"{activated=}")
 
         expert_outputs = jnp.einsum("ted,edh->teh", activated, all_wo)
         final_output = jnp.einsum("te,teh->th", expert_weights, expert_outputs)

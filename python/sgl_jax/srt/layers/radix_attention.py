@@ -38,6 +38,7 @@ class RadixAttention(nnx.Module):
         pos_encoding_mode: str = "NONE",
         logit_capping_method: str = "tanh",
         v_head_dim: int = -1,
+        xai_temperature_len: int = -1,
         attn_type: AttentionType = AttentionType.DECODER,
     ):
         super().__init__()
@@ -53,7 +54,7 @@ class RadixAttention(nnx.Module):
 
         self.pos_encoding_mode = pos_encoding_mode
         self.logit_capping_method = logit_capping_method
-        self.xai_temperature_len = -1
+        self.xai_temperature_len = xai_temperature_len
 
     def __call__(
         self,
