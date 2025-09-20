@@ -109,4 +109,3 @@ def is_tpu_runtime() -> bool:
         return len(devs) > 0 and all(d.platform == "tpu" for d in devs)
     except Exception:
         return jax.default_backend() == "tpu"
-

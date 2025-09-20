@@ -339,11 +339,18 @@ class ModelRunner:
         self.attn_backend = self._get_attention_backend()
 
     def _get_attention_backend(self):
-        if self.server_args.attention_backend == "native":
+        # Fallback on CPU: FlashAttention (Pallas/Triton) does not support CPU compilation and execution
+        backend = self.server_args.attention_backend
+        if self.server_args.device == "cpu" and backend == "fa":
+            logger.warning(
+                "FlashAttention backend is not supported on CPU; falling back to native."
+            )
+            backend = "native"
+        if backend == "native":
             from sgl_jax.srt.layers.attention.native_backend import NativeAttention
 
             return NativeAttention(self.num_attn_heads, self.num_kv_heads)
-        elif self.server_args.attention_backend == "fa":
+        elif backend == "fa":
             from sgl_jax.srt.layers.attention.flashattention_backend import (
                 FlashAttention,
             )
