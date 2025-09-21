@@ -20,7 +20,7 @@ import logging
 from dataclasses import dataclass
 from enum import IntEnum, auto
 from functools import total_ordering
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 import jax
 
@@ -163,6 +163,8 @@ class ForwardBatch:
     trace_request_ids: Optional[List[str]] = None
     trace_request_objects: Optional[List] = None
 
+    gmm_tiling_config_array: jax.Array = None
+
     def tree_flatten(self):
         children = (
             self.input_ids,
@@ -176,6 +178,7 @@ class ForwardBatch:
             self.cache_loc,
             self.extend_prefix_lens,
             self.extend_seq_lens,
+            self.gmm_tiling_config_array,
         )
 
         aux_data = {
@@ -204,6 +207,7 @@ class ForwardBatch:
         obj.cache_loc = children[8]
         obj.extend_prefix_lens = children[9]
         obj.extend_seq_lens = children[10]
+        obj.gmm_tiling_config_array = children[11]
 
         return obj
 
@@ -220,6 +224,7 @@ class ForwardBatch:
             "cache_loc",
             "extend_prefix_lens",
             "extend_seq_lens",
+            "gmm_tiling_config_array",
         ]:
             value = getattr(self, field_name, None)
             if value is not None and isinstance(value, jax.Array):
@@ -244,6 +249,7 @@ class ForwardBatch:
             cache_loc,
             extend_prefix_lens,
             extend_seq_lens,
+            gmm_tiling_config_array,
         ) = device_array(
             model_runner.mesh,
             (
@@ -256,8 +262,10 @@ class ForwardBatch:
                 batch.cache_loc,
                 batch.extend_prefix_lens,
                 batch.extend_seq_lens,
+                batch.gmm_tiling_config_array,
             ),
         )
+
         obj = cls(
             bid=batch.bid,
             forward_mode=batch.forward_mode,
@@ -273,6 +281,7 @@ class ForwardBatch:
             extend_seq_lens=extend_seq_lens,
             token_to_kv_pool=model_runner.token_to_kv_pool,
             attn_backend=model_runner.attn_backend,
+            gmm_tiling_config_array=gmm_tiling_config_array,
         )
 
         return obj

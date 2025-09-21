@@ -306,6 +306,11 @@ class Scheduler(
             ]
         )
 
+        if not server_args.disable_gmm_auto_tune:
+            logger.info(f"[Scheduler] Begins to run GMM auto-tuning.")
+            self.tp_worker.run_gmm_auto_tune()
+            logger.info(f"[Scheduler] Completes GMM auto-tuning.")
+
         if not server_args.disable_jax_precompile:
             logger.info(f"[Scheduler] Begins to run worker precompile.")
             self.tp_worker.run_precompile()
@@ -908,6 +913,7 @@ class Scheduler(
             precompile_bs_paddings,
             precompile_cache_loc_paddings,
             self.page_size,
+            self.tp_worker.get_gmm_tiling_configs(),
         )
 
         sampling_metadata = SamplingMetadata.from_model_worker_batch(
