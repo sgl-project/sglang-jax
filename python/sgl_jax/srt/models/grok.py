@@ -245,7 +245,7 @@ class Grok1Attention(nnx.Module):
             xai_temperature_len=getattr(self.config, "attn_temperature_len", -1),
         )
 
-    def forward(
+    def __call__(
         self,
         positions: jax.Array,
         hidden_states: jax.Array,
@@ -259,7 +259,13 @@ class Grok1Attention(nnx.Module):
 
         qkv, _ = self.qkv_proj(hidden_states)
 
-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        q, k, v = jnp.split(qkv, [self.q_size, self.q_size + self.kv_size], axis=-1)
+
+        num_tokens = q.shape[0]
+        q = q.reshape(num_tokens, self.num_heads, self.head_dim)
+        k = k.reshape(num_tokens, self.num_kv_heads, self.head_dim)
+        v = v.reshape(num_tokens, self.num_kv_heads, self.head_dim)
+        
         q, k = self.rotary_emb(positions, q, k)
 
         attn_output = self.attn(q, k, v, forward_batch)
@@ -349,7 +355,7 @@ class Grok1DecoderLayer(nnx.Module):
         else:
             raise NotImplementedError()
 
-    def forward(
+    def __call__(
         self,
         positions: jax.Array,
         hidden_states: jax.Array,
@@ -427,7 +433,7 @@ class Grok1Model(nnx.Module):
         ]
         self.norm = RMSNorm(config.hidden_size, epsilon=config.rms_norm_eps, rngs=rngs)
 
-    def forward(
+    def __call__(
         self,
         input_ids: jax.Array,
         positions: jax.Array,

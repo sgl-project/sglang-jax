@@ -369,7 +369,7 @@ class EPMoE(nnx.Module):
         else:
             raise NotImplementedError(self.activation)
 
-        print(f"{activated=}")
+        # print(f"{activated=}")
 
         expert_outputs = jnp.einsum("ted,edh->teh", activated, all_wo)
         final_output = jnp.einsum("te,teh->th", expert_weights, expert_outputs)
