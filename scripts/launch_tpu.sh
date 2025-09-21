@@ -45,17 +45,6 @@ sanitize_ref() {
     echo "$ref"
 }
 
-# Check environment variables
-if [ -z "$USERNAME" ]; then
-    echo "Error: USERNAME environment variable is not set"
-    exit 1
-fi
-
-if [ -z "$GIT_TOKEN" ]; then
-    echo "Error: GIT_TOKEN environment variable is not set"
-    exit 1
-fi
-
 # Sanitize ref name
 SANITIZED_REF=$(sanitize_ref "$REF")
 
@@ -93,9 +82,7 @@ sky launch "$TEMP_YAML" \
     --infra=gcp \
     -i 10 \
     --down \
-    -y \
-    --secret USERNAME=${USERNAME} \
-    --secret GIT_TOKEN=${GIT_TOKEN}
+    -y
 
 # Store the exit code
 EXIT_CODE=$?
