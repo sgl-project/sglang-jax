@@ -67,14 +67,22 @@ Note: ensure the output contains all information tunix need.
 ```python
 def generate(
     self,
+    ## The input prompt. It can be a single prompt or a batch of prompts.
     prompt: Optional[Union[List[str], str]] = None,
+    # The token ids for text; one can specify either text or input_ids
     sampling_params: Optional[Union[List[Dict], Dict]] = None,
     # The token ids for text; one can either specify text or input_ids.
     input_ids: Optional[Union[List[List[int]], List[int]]] = None,
+    # Whether to return logprobs.
     return_logprob: Optional[Union[List[bool], bool]] = False,
+    # If return logprobs, the start location in the prompt for returning logprobs.
+    # By default, this value is "-1", which means it will only return logprobs for output tokens.
     logprob_start_len: Optional[Union[List[int], int]] = None,
+    # If return logprobs, the number of top logprobs to return at each position.
     top_logprobs_num: Optional[Union[List[int], int]] = None,
+    # If return logprobs, the token ids to return logprob for.
     token_ids_logprob: Optional[Union[List[List[int]], List[int]]] = None,
+     # Whether to stream output
     stream: bool = False,
 ) -> Union[Dict, Iterator[Dict]]:
     pass
@@ -90,16 +98,6 @@ if __name__ == '__main__':
     print(len(list(output)), output)
 ```
 
-- add_default_sampling_params
-
-- fix add for sample
-
-  ```python
-  return_logprob: bool,
-  top_logprobs_nums: List[int],
-  token_ids_logprobs: List[List[int]],
-  ```
-
 TODO: add definition.
 
 #### `vllm Sample` vs `sglang_jax Sample`
@@ -110,6 +108,7 @@ TODO: add definition.
 - `presence_penalty` & `frequency_penalty`: Will they be used in the future?
 - `logit_bias`: Will it be used in the future?
 - `logprobs`: Does it mean logprobs of `top_number+1` for every output position? 1 means it include output_id's logprob.
+
   > From vLLM: Number of log probabilities to return per output token. When set to
     `None`, no probability is returned. If set to a non-`None` value, the
     result includes the log probabilities of the specified number of most
@@ -117,11 +116,13 @@ TODO: add definition.
     follows the OpenAI API: The API will always return the log probability of
     the sampled token, so there may be up to `logprobs+1` elements in the
     response. When set to -1, return all `vocab_size` log probabilities.
+
    - Question1: According to the usage of logprobs in the PPO codes, it looks like we need to get the logprob of every token_id in prompt position rather than the top_num logprob. Is it right? 
 - `prompt_logprobs`: Does it mean logprobs of `top_number` for every prompt position?
   > From vLLM: Number of log probabilities to return per prompt token.
     When set to -1, return all `vocab_size` log probabilities.
    - Question2: Based on the Question1, the first prompt token does not have tokens before it, does the logprob seem to be not existed?
+
      > Example: 
 ```bash
 # input_ids = [0,1,2], vocab_size = 5, output_ids = [1,4], sampling algorithm = greedy
