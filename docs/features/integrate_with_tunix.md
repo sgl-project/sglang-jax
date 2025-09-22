@@ -52,13 +52,8 @@ class BaseRollout(abc.ABC):
 
 ### Work in Sglang-jax
 
-1. Use jit to wrap `return_logprob` logic to improve performance and test accuracy.
-2. Support `generate()` interface for batch prompts in a request, like `LLM.generate()`.
-3. Ensure the outputs with `samplingParams` are exptected by tunix.
-
-#### Wrap `return_logprob` logic
-
-TODO: add code modification.
+1. Support `generate()` and `get_default_sampling_params()` in `Engine`.
+2. Support abilities listed in the following table, like jitted `return_logprob` logic, `repetition_penalty`, etc.
 
 #### `generate()` API
 
@@ -98,7 +93,6 @@ if __name__ == '__main__':
     print(len(list(output)), output)
 ```
 
-TODO: add definition.
 
 #### `vllm Sample` vs `sglang_jax Sample`
 
@@ -116,78 +110,62 @@ TODO: add definition.
     follows the OpenAI API: The API will always return the log probability of
     the sampled token, so there may be up to `logprobs+1` elements in the
     response. When set to -1, return all `vocab_size` log probabilities.
-
-   - Question1: According to the usage of logprobs in the PPO codes, it looks like we need to get the logprob of every token_id in prompt position rather than the top_num logprob. Is it right? 
+   - Confusion1: According to the usage of logprobs in the PPO codes, it looks like we need to get the logprob of every token_id in prompt position rather than the top_num logprob.
 - `prompt_logprobs`: Does it mean logprobs of `top_number` for every prompt position?
   > From vLLM: Number of log probabilities to return per prompt token.
     When set to -1, return all `vocab_size` log probabilities.
-   - Question2: Based on the Question1, the first prompt token does not have tokens before it, does the logprob seem to be not existed?
-
-     > Example: 
-```bash
-# input_ids = [0,1,2], vocab_size = 5, output_ids = [1,4], sampling algorithm = greedy
-
-# prefill logits, the first generated token is 1
-[
-  [0.1, 0.2, 0.3, 0.5, -0.1],
-  [0.1, 0.2, 0.3, 0.5, -0.1],
-  [0.1, *0.5*, 0.3, 0.1, -0.1],
-]
-
-# decode logits, token is 4
-[
-  [0.1, *0.4*, 0.1, 0.2, 0.6],
-]
-
-# expected output logprobs:
-[0.5, 0.4]
-```
+   - Confusion2: According to `get_old_per_token_logps()` implemented in `VanillaRollout` and `VllmRollout`, the logprobs of prompt_ids do not return.
 
 Note:
 
 - `repetition_penalty`, `temperature`, `top_p`, `top_k`, `min_p` and `max_tokens` will be set by `get_default_sampling_params()`.
+- `get_default_sampling_params()` will be supported in `Engine`.
 
 | Fields                        | vllm                          | tunix 设置 vllm               | sglang_jax                    |
 |------------------------------|-------------------------------|-------------------------------|-------------------------------|
-| n                            | 1                             | multi_sampling=1, to check              | n:int=1                       |
-| best_of                      | 1                             | lack, not to support because tunix does not use it |                               |
-| _real_n                      | None                          | lack, not to support because tunix does not use it |                               |
-| presence_penalty             | 0.0                           | lack, not to support because tunix does not use it |                               |
-| frequency_penalty            | 0.0                           | lack, not to support because tunix does not use it |                               |
-| repetition_penalty           | get_default_sampling_params() | to support                    |                               |
+| n                            | 1                             | multi_sampling=1             | n:int = 1, to check                        |
+| best_of                      | 1                             |                              |         lack, not to support because tunix does not use it|
+| _real_n                      | None                          |                              |lack, not to support because tunix does not use it|
+| presence_penalty             | 0.0                           |                              |lack, not to support because tunix does not use it|
+| frequency_penalty            | 0.0                           |                              |lack, not to support because tunix does not use it|
+| repetition_penalty           | get_default_sampling_params() |                              |to support|
 | temperature                  | get_default_sampling_params() | temperature                   | temperature:float=1.0         |
 | top_p                        | get_default_sampling_params() | top_p                         | top_p:float=1.0               |
 | top_k                        | get_default_sampling_params() | top_k                         | top_k:int=1.0                 |
 | min_p                        | get_default_sampling_params() |                               | min_p:float=0.0               |
-| seed                         | tunix sets but not used when sampling  | lack, not to support because tunix does not use it |                               |
-| stop                         | None                          | None, to check                |                               |
+| seed                         | tunix sets but not used when sampling  |                      |lack, not to support because tunix does not use it|
+| stop                         | None                          |                               |None, to check                |                               |
 | stop_token_ids               | None                          | [self.tokenizer.eos_id()]     | None: to check                |
-| ignore_eos                   | False                         | False, to check               |                               |
+| ignore_eos                   | False                         |                               |False, to check               |                               |
 | max_tokens                   | get_default_sampling_params() | max_generation_steps          | max_new_tokens                |
 | min_tokens                   | 0                             |                               | min_new_tokens:int=0, to check|
-| logprobs                     | None                          | 1                             | Support, set in payload body:<br>- return_logprob = true<br>- top_logprobs_num = 1 |
-| prompt_logprobs              | None                          | 1                             | support in payload body:<br>- return_logprob = true<br>- top_logprobs_num = 1<br>- logprob_start_len = 0 |
+| logprobs                     | None                          | 1                             | support, set in payload body:<br>- return_logprob = true<br>- top_logprobs_num = 1 |
+| prompt_logprobs              | None                          | 1                             | support, set in payload body:<br>- return_logprob = true<br>- top_logprobs_num = 1<br>- logprob_start_len = 0 |
 | detokenize                   | True                          | False                         | to support                    |
 | skip_special_tokens          | True                          | True                          | skip_special_tokens:bool=True, to check |
 | spaces_between_special_tokens| True                          |                               | spaces_between_special_tokens:bool=True, to check |
-| logits_processors            | None                          | lack, not to support because tunix does not use it |                               |
-| include_stop_str_in_output   | False                         | lack, not to support because tunix uses token_ids |                               |
-| truncate_prompt_tokens       | None                          | lack, not to support because tunix disables it with None |                               |
-| output_kind                  | RequestOutputKind.CUMULATIVE  | lack, but output is cumulative|                               |
-| output_text_buffer_length    | 0                             | lack, not to support because tunix does not use it |                               |
-| guided_decoding              | None                          | lack, not to support because tunix does not use it |                               |
-| logit_bias                   | None                          | None, not to support because tunix does not use it |                               |
-| allowed_token_ids            | None                          |                               | support in payload body:<br>- return_logprob = true<br>- token_ids_logprob = None |
-| extra_args                   | None                          | lack, not to support because tunix does not use it |                               |
-| bad_words                    | None                          | lack, not to support because tunix does not use it |                               |
-| _bad_words_token_ids         | None                          | lack, not to support because tunix does not use it |                               |
+| logits_processors            | None                          |                               |lack, not to support because tunix does not use it |                               |
+| include_stop_str_in_output   | False                         |                               |lack, not to support because tunix uses token_ids |                               |
+| truncate_prompt_tokens       | None                          |                               |lack, not to support because tunix disables it with None |                               |
+| output_kind                  | RequestOutputKind.CUMULATIVE  |                               |lack, but output is cumulative|                               |
+| output_text_buffer_length    | 0                             |                               |lack, not to support because tunix does not use it |                               |
+| guided_decoding              | None                          |                               |lack, not to support because tunix does not use it |                               |
+| logit_bias                   | None                          |                                |None, not to support because tunix does not use it |                               |
+| allowed_token_ids            | None                          |                               | support, set in payload body:<br>- return_logprob = true<br>- token_ids_logprob = None |
+| extra_args                   | None                          |                               |lack, not to support because tunix does not use it |                               |
+| bad_words                    | None                          |                               |lack, not to support because tunix does not use it |                               |
+| _bad_words_token_ids         | None                          |                               |lack, not to support because tunix does not use it |                               |
 
+
+#### `generate()` API
+
+Note: ensure the output contains all information tunix need.
+
+TODO: add definition.
 
 ## Discussion
 
-D1. Is multi-sampling is required in the future?
-
-D2. Is beam search is required in the future?
+D1. Is beam search is required in the future?
 Sglang has a MR[https://github.com/sgl-project/sglang/pull/3066] to support it, but it has no progress.
 
 D3: For `generate`, is it enough to only have the `logprob` corresponding to each output_id? Are prompt_ids logprobs necessary?
