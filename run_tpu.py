@@ -1,4 +1,5 @@
 import itertools
+import random
 
 import flax.nnx
 import jax.tree_util
@@ -53,8 +54,9 @@ config = PretrainedConfig(
 
 def main():
     np.random.seed(0)
+    random.seed(0)
 
-    text_ids = [[1, 4, 2, 3]]
+    text_ids = [[random.randint(0, 131071) for _ in range(20)]]
 
     input_ids = jnp.asarray(list(itertools.chain(*text_ids)), dtype=jnp.int32)
     seq_lens = jnp.asarray([len(e) for e in text_ids], dtype=jnp.int32)

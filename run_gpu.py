@@ -1,4 +1,5 @@
 import itertools
+import random
 
 import numpy as np
 import torch.cuda
@@ -13,8 +14,8 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMo
 # from sglang.srt.models.grok import Grok1ModelForCausalLM
 from transformers import PretrainedConfig
 
+from sgl_jax.sglang_grok.sglang_grok import Grok1ModelForCausalLM
 from sgl_jax.srt.mem_cache.memory_pool import ReqToTokenPool
-from sglang_grok import Grok1ModelForCausalLM
 
 config = PretrainedConfig(
     **{
@@ -61,11 +62,12 @@ class AttrDict(dict):
 
 def main():
     np.random.seed(0)
+    random.seed(0)
 
     init_distributed_environment(rank=0)
     initialize_model_parallel()
 
-    text_ids = [[1, 4, 2, 3]]
+    text_ids = [[random.randint(0, 131071) for _ in range(20)]]
 
     input_ids = torch.tensor(
         list(itertools.chain(*text_ids)), dtype=torch.int32, device="cuda"
