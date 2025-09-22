@@ -83,6 +83,26 @@ def generate(
     pass
 ```
 
+- generate output format
+
+  ```json
+  {
+      "text":"the output of generate", // output seq
+       "meta_info": {
+          "id": "d8e57938583e45eb979db5eb5e8959a0", 
+          "finish_reason": {
+              "type": "length",
+              "length": 128
+          },
+          "prompt_tokens": 1,
+          "completion_tokens": 128,
+          "cached_tokens": 0,
+          "cache_miss_count": 0,
+          "e2e_latency": 27.593196630477905 
+      }
+  }
+  ```
+
 - use example
 
 ```python
@@ -110,10 +130,12 @@ if __name__ == '__main__':
     follows the OpenAI API: The API will always return the log probability of
     the sampled token, so there may be up to `logprobs+1` elements in the
     response. When set to -1, return all `vocab_size` log probabilities.
+
    - Confusion1: According to the usage of logprobs in the PPO codes, it looks like we need to get the logprob of every token_id in prompt position rather than the top_num logprob.
 - `prompt_logprobs`: Does it mean logprobs of `top_number` for every prompt position?
   > From vLLM: Number of log probabilities to return per prompt token.
     When set to -1, return all `vocab_size` log probabilities.
+
    - Confusion2: According to `get_old_per_token_logps()` implemented in `VanillaRollout` and `VllmRollout`, the logprobs of prompt_ids do not return.
 
 Note:
