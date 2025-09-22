@@ -4,9 +4,84 @@ Integrate with tunix to make contribution to post-training.
 
 ## Solution
 
-Sglang-jax will implement a SglangJaxRollout in tunix to generate completions.
+Sgl-jax will implement a SglJaxRollout in tunix to generate completions.
 
-### Work in Sglang-jax
+### Work in `tunix`
+
+Implement a complete sgl-jax rollout adapter for Tunix integration. This enables using sgl-jax's high-performance inference capabilities within Tunix's GRPO/PPO training pipeline.
+
+#### Key Components
+
+1. **SglJaxSampler** (`tunix/generate/sgljax_sampler.py`)
+   - Wraps sgl-jax ModelRunner with Tunix-compatible sampling interface
+   - Supports parameter updates, batch generation, and logprobs computation
+
+2. **SglJaxRollout** (`tunix/rl/rollout/sgljax_rollout.py`)
+   - Implements BaseRollout interface for seamless GRPO/PPO integration
+   - Provides parameter synchronization and per-token logprobs calculation
+   - Includes factory function `create_sgljax_rollout` for easy setup
+
+
+##### `update_params` API
+For sgl-jax, we directly update the model runner's model state since both use the same NNX format.
+```python
+def update_params(
+    self,
+    updated_weights: jaxtyping.PyTree,
+    filter_types: Optional[Tuple[Any, ...]] = None,
+):
+    """Update model parameters.
+
+    For sgl-jax, we directly update the model runner's model state
+    since both use the same NNX format.
+    """
+    from flax import nnx
+
+    if filter_types is not None:
+        # Filter and update only specific parameter types (e.g., LoRA)
+        current_state = nnx.state(self._model, filter_types)
+        filtered_updates = nnx.state(updated_weights, filter_types) if hasattr(updated_weights, '__call__') else {}
+
+        # Merge filtered updates with current state
+        for key, value in filtered_updates.items():
+            if key in current_state:
+                current_state[key] = value
+
+        nnx.update(self._model, current_state)
+    else:
+        nnx.update(self._model, updated_weights)
+```
+
+#### Usage Example
+
+```python
+from tunix.rl.rollout.sgljax_rollout import create_sgljax_rollout
+from tunix.rl.grpo.grpo_learner import GrpoLearner
+
+# Create sgl-jax rollout worker
+rollout = create_sgljax_rollout(
+    model=model,
+    tokenizer=tokenizer,
+    model_config=model_config,
+    mesh=mesh,
+    max_model_len=2048,
+)
+
+# Integrate with GRPO training
+rl_cluster = rl_cluster_lib.RLCluster(
+    actor=actor_model,
+    reference=reference_model,
+    tokenizer=tokenizer,
+    cluster_config=cluster_config,
+    rollout_worker=rollout,  # Use sgl-jax rollout
+)
+
+grpo_trainer = GrpoLearner(rl_cluster, reward_fns, grpo_config)
+grpo_trainer.train(dataset)
+```
+
+
+### Work in Sgl-jax
 
 1. Support `generate()` and `get_default_sampling_params()` in `Engine`.
 2. Support abilities listed in the following table, like jitted `return_logprob` logic, `repetition_penalty`, etc.
@@ -78,7 +153,7 @@ if __name__ == '__main__':
     print(len(list(output)), output)
 ```
 
-#### `vllm Sample` vs `sglang_jax Sample`
+#### `vllm Sample` vs `sgl_jax Sample`
 
 ##### Fields Discussion
 
@@ -107,7 +182,7 @@ Note:
 - `repetition_penalty`, `temperature`, `top_p`, `top_k`, `min_p` and `max_tokens` will be set by `get_default_sampling_params()`.
 - `get_default_sampling_params()` will be supported in `Engine`.
 
-| Fields                        | vllm                          | tunix 设置 vllm               | sglang_jax                    |
+| Fields                        | vllm                          | tunix 设置 vllm               | sgl_jax                    |
 |------------------------------|-------------------------------|-------------------------------|-------------------------------|
 | n                            | 1                             | multi_sampling=1             | n:int = 1, to check                        |
 | best_of                      | 1                             |                              |         lack, not to support because tunix does not use it|
@@ -142,81 +217,6 @@ Note:
 | bad_words                    | None                          |                               |lack, not to support because tunix does not use it |                               |
 | _bad_words_token_ids         | None                          |                               |lack, not to support because tunix does not use it |                               |
 
-### Work in `tunix`
-
-Implement a complete sgl-jax rollout adapter for Tunix integration. This enables using sgl-jax's high-performance inference capabilities within Tunix's GRPO/PPO training pipeline.
-
-#### Key Components
-
-1. **SglJaxSampler** (`tunix/generate/sgljax_sampler.py`)
-   - Wraps sgl-jax ModelRunner with Tunix-compatible sampling interface
-   - Supports parameter updates, batch generation, and logprobs computation
-
-2. **SglJaxRollout** (`tunix/rl/rollout/sgljax_rollout.py`)
-   - Implements BaseRollout interface for seamless GRPO/PPO integration
-   - Provides parameter synchronization and per-token logprobs calculation
-   - Includes factory function `create_sgljax_rollout` for easy setup
-
-
-##### `update_params` API
-For sglang-jax, we directly update the model runner's model state since both use the same NNX format.
-```python
-def update_params(
-    self,
-    updated_weights: jaxtyping.PyTree,
-    filter_types: Optional[Tuple[Any, ...]] = None,
-):
-    """Update model parameters.
-
-    For sglang-jax, we directly update the model runner's model state
-    since both use the same NNX format.
-    """
-    from flax import nnx
-
-    if filter_types is not None:
-        # Filter and update only specific parameter types (e.g., LoRA)
-        current_state = nnx.state(self._model, filter_types)
-        filtered_updates = nnx.state(updated_weights, filter_types) if hasattr(updated_weights, '__call__') else {}
-
-        # Merge filtered updates with current state
-        for key, value in filtered_updates.items():
-            if key in current_state:
-                current_state[key] = value
-
-        nnx.update(self._model, current_state)
-    else:
-        nnx.update(self._model, updated_weights)
-```
-
-#### Usage Example
-
-```python
-from tunix.rl.rollout.sgljax_rollout import create_sgljax_rollout
-from tunix.rl.grpo.grpo_learner import GrpoLearner
-
-# Create sgl-jax rollout worker
-rollout = create_sgljax_rollout(
-    model=model,
-    tokenizer=tokenizer,
-    model_config=model_config,
-    mesh=mesh,
-    max_model_len=2048,
-)
-
-# Integrate with GRPO training
-rl_cluster = rl_cluster_lib.RLCluster(
-    actor=actor_model,
-    reference=reference_model,
-    tokenizer=tokenizer,
-    cluster_config=cluster_config,
-    rollout_worker=rollout,  # Use sgl-jax rollout
-)
-
-grpo_trainer = GrpoLearner(rl_cluster, reward_fns, grpo_config)
-grpo_trainer.train(dataset)
-```
-
-This implementation leverages sgl-jax's optimized attention kernels and KV cache management while maintaining full compatibility with Tunix's training workflows.
 
 
 ## Discussion
@@ -226,11 +226,11 @@ Sglang has a MR[https://github.com/sgl-project/sglang/pull/3066] to support it, 
 
 D2: For `generate`, is it enough to only have the `logprob` corresponding to each output_id? Are prompt_ids logprobs necessary?
 
-D3: Implement `update_params()` in tunix or sglang-jax
+D3: Implement `update_params()` in tunix or sgl-jax
 
 ## Test
 
 1. Test whether sampling result is expected
 2. Test `generate()` interface
-3. Add unit test for SglangJaxRollout
+3. Add unit test for SglJaxRollout
 3. Test e2e result compared with VllmRollout: PPO, GRPO
