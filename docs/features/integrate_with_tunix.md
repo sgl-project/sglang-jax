@@ -44,6 +44,15 @@ def generate(
   ```json
   {
       "text":"the output of generate", // output seq
+      "output_token_logprobs":[[ 
+                  -0.73046875, // logprobs
+                  12095, // token_id
+                  null
+              ],[
+                  -0.9765625,
+                  13,
+                  null
+              ]]
        "meta_info": {
           "id": "d8e57938583e45eb979db5eb5e8959a0", 
           "finish_reason": {
