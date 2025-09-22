@@ -13,6 +13,7 @@
 # limitations under the License.
 import jax
 from flax import nnx
+from jax import numpy as jnp
 
 
 class GeluAndMul(nnx.Module):
@@ -21,10 +22,11 @@ class GeluAndMul(nnx.Module):
         self.approximate = approximate
 
     def __call__(self, x: jax.Array) -> jax.Array:
+        a, b = jnp.split(x, 2, axis=-1)
         if self.approximate == "tanh":
-            out = jax.nn.gelu(x, approximate=True) * x
+            out = jax.nn.gelu(a, approximate=True) * b
         elif self.approximate == "none":
-            out = jax.nn.gelu(x, approximate=False) * x
+            out = jax.nn.gelu(a, approximate=False) * b
         else:
             raise RuntimeError("GeluAndMul only support tanh or none")
         return out
