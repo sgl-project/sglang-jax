@@ -113,6 +113,35 @@ if __name__ == '__main__':
     print(len(list(output)), output)
 ```
 
+#### `update_params` API
+For sglang-jax, we directly update the model runner's model state since both use the same NNX format.
+```python
+    def update_params(
+        self,
+        updated_weights: jaxtyping.PyTree,
+        filter_types: Optional[Tuple[Any, ...]] = None,
+    ):
+        """Update model parameters.
+
+        For sglang-jax, we directly update the model runner's model state
+        since both use the same NNX format.
+        """
+        from flax import nnx
+
+        if filter_types is not None:
+            # Filter and update only specific parameter types (e.g., LoRA)
+            current_state = nnx.state(self._model, filter_types)
+            filtered_updates = nnx.state(updated_weights, filter_types) if hasattr(updated_weights, '__call__') else {}
+
+            # Merge filtered updates with current state
+            for key, value in filtered_updates.items():
+                if key in current_state:
+                    current_state[key] = value
+
+            nnx.update(self._model, current_state)
+        else:
+            nnx.update(self._model, updated_weights)
+```
 
 #### `vllm Sample` vs `sglang_jax Sample`
 
@@ -177,6 +206,51 @@ Note:
 | extra_args                   | None                          |                               |lack, not to support because tunix does not use it |                               |
 | bad_words                    | None                          |                               |lack, not to support because tunix does not use it |                               |
 | _bad_words_token_ids         | None                          |                               |lack, not to support because tunix does not use it |                               |
+
+### Work in `tunix`
+
+Implement a complete sgl-jax rollout adapter for Tunix integration. This enables using sgl-jax's high-performance inference capabilities within Tunix's GRPO training pipeline.
+
+#### Key Components
+
+1. **SglJaxSampler** (`tunix/generate/sgljax_sampler.py`)
+   - Wraps sgl-jax ModelRunner with Tunix-compatible sampling interface
+   - Supports parameter updates, batch generation, and logprobs computation
+
+2. **SglJaxRollout** (`tunix/rl/rollout/sgljax_rollout.py`)
+   - Implements BaseRollout interface for seamless GRPO integration
+   - Provides parameter synchronization and per-token logprobs calculation
+   - Includes factory function `create_sgljax_rollout` for easy setup
+
+#### Usage Example
+
+```python
+from tunix.rl.rollout.sgljax_rollout import create_sgljax_rollout
+from tunix.rl.grpo.grpo_learner import GrpoLearner
+
+# Create sgl-jax rollout worker
+rollout = create_sgljax_rollout(
+    model=model,
+    tokenizer=tokenizer,
+    model_config=model_config,
+    mesh=mesh,
+    max_model_len=2048,
+)
+
+# Integrate with GRPO training
+rl_cluster = rl_cluster_lib.RLCluster(
+    actor=actor_model,
+    reference=reference_model,
+    tokenizer=tokenizer,
+    cluster_config=cluster_config,
+    rollout_worker=rollout,  # Use sgl-jax rollout
+)
+
+grpo_trainer = GrpoLearner(rl_cluster, reward_fns, grpo_config)
+grpo_trainer.train(dataset)
+```
+
+This implementation leverages sgl-jax's optimized attention kernels and KV cache management while maintaining full compatibility with Tunix's training workflows.
 
 
 ## Discussion
