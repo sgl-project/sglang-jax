@@ -157,12 +157,6 @@ Note:
 | _bad_words_token_ids         | None                          |                               |lack, not to support because tunix does not use it |                               |
 
 
-#### `generate()` API
-
-Note: ensure the output contains all information tunix need.
-
-TODO: add definition.
-
 ## Discussion
 
 D1. Is beam search is required in the future?
