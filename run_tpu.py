@@ -4,7 +4,7 @@ import flax.nnx
 import jax.tree_util
 import numpy as np
 from jax import numpy as jnp
-from jax._src.tree_util import GetAttrKey
+from jax._src.tree_util import DictKey, GetAttrKey
 from transformers import PretrainedConfig
 
 from sgl_jax.srt.layers.attention.native_backend import NativeAttention
@@ -28,14 +28,14 @@ config = PretrainedConfig(
         "residual_moe": True,
         "num_attention_heads": 64,
         "num_key_value_heads": 8,
-        "num_hidden_layers": 1,
+        "num_hidden_layers": 2,
         "head_dim": 128,
         "rms_norm_eps": 1e-05,
         "final_logit_softcapping": 50,
         "attn_logit_softcapping": 30.0,
         "router_logit_softcapping": 30.0,
         "rope_theta": 208533496,
-        "attn_temperature_len": 1024,
+        "attn_temperature_len": 2,
         "sliding_window_size": -1,
         "global_attn_every_n": 1,
         "model_type": "git",
@@ -78,6 +78,14 @@ def main():
     param_dict = dict()
     for name, param in jax.tree_util.tree_leaves_with_path(flax.nnx.state(model)):
         if param.dtype in (jnp.float32, jnp.float16, jnp.bfloat16):
+            param = model
+            for e in name:
+                if isinstance(e, DictKey):
+                    if isinstance(e.key, str):
+                        param = getattr(param, e.key)
+                    else:
+                        param = param[e.key]
+
             name = ".".join(
                 [str(e)[1:] if isinstance(e, GetAttrKey) else str(e.key) for e in name]
             )
@@ -89,8 +97,7 @@ def main():
         if "cos_sin_cache" in name:
             continue
         data = np.random.randn(*param.shape)
-        param.value = jnp.asarray(data, dtype=param.dtype)
-        print(name, data.sum())
+        param.value = jnp.asarray(data).astype(dtype=param.dtype)
 
     cache_pool = MHATokenToKVPool(
         size=128,
@@ -123,7 +130,7 @@ def main():
         extend_seq_lens=jnp.array([sum(seq_lens)]),
     )
     with jax.sharding.use_mesh(mesh):
-        outputs = model(batch.input_ids, batch.positions, batch)
+        outputs, _ = model(batch.input_ids, batch.positions, batch)
     print(outputs)
 
 

@@ -60,4 +60,4 @@ def dual_rmsnorm_forward(x, residual, weight1, weight2, epsilon):
     w2 = jnp.asarray(weight2, jnp.float32)
     z = jnp.asarray(y * y_rrms * w2, jnp.float32)
 
-    return z, y.astype(residual.dtype)
+    return z.astype(x.dtype), y.astype(x.dtype)
