@@ -6,50 +6,6 @@ Integrate with tunix to make contribution to post-training.
 
 Sglang-jax will implement a SglangJaxRollout in tunix to generate completions.
 
-### SglangJaxRollout
-
-```python3
-class BaseRollout(abc.ABC):
-  """Base RolloutWorker."""
-
-  @abc.abstractmethod
-  def generate(
-      self,
-      prompts: list[str],
-      rollout_config: RolloutConfig,
-      **kwargs,
-  ) -> RolloutOutput:
-    """Generates samples from the model."""
-
-  @abc.abstractmethod
-  def get_per_token_logps(
-      self,
-      prompt_tokens: jax.Array,
-      completion_tokens: jax.Array,
-  ) -> jax.Array:
-    """Returns per-token log probabilities from the model."""
-
-  @abc.abstractmethod
-  def update_params(
-      self,
-      params: jaxtyping.PyTree,
-      filter_types: Optional[Tuple[Any, ...]] = None,
-  ) -> None:
-    """Updates the rollout model parameters."""
-
-  @abc.abstractmethod
-  def pad_id(self) -> int:
-    """Returns the pad id."""
-
-  @abc.abstractmethod
-  def eos_id(self) -> int:
-    """Returns the eos id."""
-
-  @abc.abstractmethod
-  def model(self) -> Any:
-    """Returns the rollout model."""
-```
-
 ### Work in Sglang-jax
 
 1. Support `generate()` and `get_default_sampling_params()` in `Engine`.
@@ -111,36 +67,6 @@ if __name__ == '__main__':
     engine=Engine(model_path= 'Qwen/Qwen-7B-Chat', trust_remote_code=True, dist_init_addr='0.0.0.0:10011', nnodes=1 , tp_size=4, device='tpu' ,random_seed=3, node_rank=0, mem_fraction_static=0.4, chunked_prefill_size=8192, download_dir='/tmp', dtype='bfloat16', precompile_bs_paddings = [64], max_running_requests = 64, skip_server_warmup=True, attention_backend='fa',precompile_token_paddings=[8192], page_size=64 ,log_requests=True, log_requests_level=3)
     output=engine.generate(prompt=['您好', "hello"], sampling_params={"n",2, "temperature": 0.7}, return_logprob=True)
     print(len(list(output)), output)
-```
-
-#### `update_params` API
-For sglang-jax, we directly update the model runner's model state since both use the same NNX format.
-```python
-    def update_params(
-        self,
-        updated_weights: jaxtyping.PyTree,
-        filter_types: Optional[Tuple[Any, ...]] = None,
-    ):
-        """Update model parameters.
-
-        For sglang-jax, we directly update the model runner's model state
-        since both use the same NNX format.
-        """
-        from flax import nnx
-
-        if filter_types is not None:
-            # Filter and update only specific parameter types (e.g., LoRA)
-            current_state = nnx.state(self._model, filter_types)
-            filtered_updates = nnx.state(updated_weights, filter_types) if hasattr(updated_weights, '__call__') else {}
-
-            # Merge filtered updates with current state
-            for key, value in filtered_updates.items():
-                if key in current_state:
-                    current_state[key] = value
-
-            nnx.update(self._model, current_state)
-        else:
-            nnx.update(self._model, updated_weights)
 ```
 
 #### `vllm Sample` vs `sglang_jax Sample`
@@ -209,7 +135,7 @@ Note:
 
 ### Work in `tunix`
 
-Implement a complete sgl-jax rollout adapter for Tunix integration. This enables using sgl-jax's high-performance inference capabilities within Tunix's GRPO training pipeline.
+Implement a complete sgl-jax rollout adapter for Tunix integration. This enables using sgl-jax's high-performance inference capabilities within Tunix's GRPO/PPO training pipeline.
 
 #### Key Components
 
@@ -218,9 +144,40 @@ Implement a complete sgl-jax rollout adapter for Tunix integration. This enables
    - Supports parameter updates, batch generation, and logprobs computation
 
 2. **SglJaxRollout** (`tunix/rl/rollout/sgljax_rollout.py`)
-   - Implements BaseRollout interface for seamless GRPO integration
+   - Implements BaseRollout interface for seamless GRPO/PPO integration
    - Provides parameter synchronization and per-token logprobs calculation
    - Includes factory function `create_sgljax_rollout` for easy setup
+
+
+##### `update_params` API
+For sglang-jax, we directly update the model runner's model state since both use the same NNX format.
+```python
+def update_params(
+    self,
+    updated_weights: jaxtyping.PyTree,
+    filter_types: Optional[Tuple[Any, ...]] = None,
+):
+    """Update model parameters.
+
+    For sglang-jax, we directly update the model runner's model state
+    since both use the same NNX format.
+    """
+    from flax import nnx
+
+    if filter_types is not None:
+        # Filter and update only specific parameter types (e.g., LoRA)
+        current_state = nnx.state(self._model, filter_types)
+        filtered_updates = nnx.state(updated_weights, filter_types) if hasattr(updated_weights, '__call__') else {}
+
+        # Merge filtered updates with current state
+        for key, value in filtered_updates.items():
+            if key in current_state:
+                current_state[key] = value
+
+        nnx.update(self._model, current_state)
+    else:
+        nnx.update(self._model, updated_weights)
+```
 
 #### Usage Example
 
@@ -255,10 +212,12 @@ This implementation leverages sgl-jax's optimized attention kernels and KV cache
 
 ## Discussion
 
-D1. Is beam search is required in the future?
+D1. Will beam search be required in the future?
 Sglang has a MR[https://github.com/sgl-project/sglang/pull/3066] to support it, but it has no progress.
 
-D3: For `generate`, is it enough to only have the `logprob` corresponding to each output_id? Are prompt_ids logprobs necessary?
+D2: For `generate`, is it enough to only have the `logprob` corresponding to each output_id? Are prompt_ids logprobs necessary?
+
+D3: Implement `update_params()` in tunix or sglang-jax
 
 ## Test
 
