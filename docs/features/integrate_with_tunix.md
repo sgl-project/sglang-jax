@@ -64,6 +64,42 @@ TODO: add code modification.
 
 Note: ensure the output contains all information tunix need.
 
+```python
+def generate(
+    self,
+    prompt: Optional[Union[List[str], str]] = None,
+    sampling_params: Optional[Union[List[Dict], Dict]] = None,
+    # The token ids for text; one can either specify text or input_ids.
+    input_ids: Optional[Union[List[List[int]], List[int]]] = None,
+    return_logprob: Optional[Union[List[bool], bool]] = False,
+    logprob_start_len: Optional[Union[List[int], int]] = None,
+    top_logprobs_num: Optional[Union[List[int], int]] = None,
+    token_ids_logprob: Optional[Union[List[List[int]], List[int]]] = None,
+    stream: bool = False,
+) -> Union[Dict, Iterator[Dict]]:
+    pass
+```
+
+- use example
+
+```python
+from sgl_jax.srt.entrypoints.engine import Engine
+if __name__ == '__main__':
+    engine=Engine(model_path= 'Qwen/Qwen-7B-Chat', trust_remote_code=True, dist_init_addr='0.0.0.0:10011', nnodes=1 , tp_size=4, device='tpu' ,random_seed=3, node_rank=0, mem_fraction_static=0.4, chunked_prefill_size=8192, download_dir='/tmp', dtype='bfloat16', precompile_bs_paddings = [64], max_running_requests = 64, skip_server_warmup=True, attention_backend='fa',precompile_token_paddings=[8192], page_size=64 ,log_requests=True, log_requests_level=3)
+    output=engine.generate(prompt=['您好', "hello"], sampling_params={"n",2, "temperature": 0.7}, return_logprob=True)
+    print(len(list(output)), output)
+```
+
+- add_default_sampling_params
+
+- fix add for sample
+
+  ```python
+  return_logprob: bool,
+  top_logprobs_nums: List[int],
+  token_ids_logprobs: List[List[int]],
+  ```
+
 TODO: add definition.
 
 #### `vllm Sample` vs `sglang_jax Sample`
