@@ -31,9 +31,9 @@ graph LR
 #### Key Components
 
 1. **Ragged Paged Attention Algorithm**: Handles variable-length sequences efficiently through paged memory management
-2. **Double Buffering System**: Overlaps computation and memory transfer for optimal TPU utilization
-3. **Auto-Tuned Block Sizes**: Dynamic performance optimization based on model configuration and hardware capabilities
-4. **Fused KV Cache Management**: Interleaved key-value storage format optimized for TPU memory patterns
+2. **Auto-Tuned Block Sizes**: Dynamic performance optimization based on model configuration and hardware capabilities
+3. **Fused KV Cache Management**: Interleaved key-value storage format optimized for TPU memory patterns
+4. **Double Buffering System**: Overlaps computation and memory transfer for optimal TPU utilization
 5. **Flash Attention**: Implementation based on the IO-aware attention algorithm that uses tiling to reduce memory reads/writes
 
 ### Memory Management Design
@@ -75,28 +75,6 @@ The kernel leverages JAX Pallas for low-level TPU optimization:
 - **Custom Memory Management**: Direct VMEM (Vector Memory) control for optimal data placement
 - **Asynchronous Operations**: Overlapped computation and data transfer using TPU semaphores
 - **Vectorized Operations**: Hardware-accelerated attention computation with optimal data types
-
-### Advanced Features
-
-#### Attention Enhancements
-
-- **Sliding Window Attention**: Configurable local attention windows for long-range efficiency
-- **Soft Capping**: Logit soft capping for improved training stability  
-- **Quantization Support**: Native support for quantized KV caches with scaling factors
-
-### Algorithm Comparison
-
-The Flash Attention implementation provides significant advantages over standard attention:
-
-| Aspect | Flash Attention | Native Attention |
-|--------|-----------------|------------------|
-| Memory Complexity | **O(N)** | O(N²) |
-| Algorithm Approach | **Tiled computation with IO-awareness** | Full matrix computation |
-| Computation Strategy | **Incremental softmax with rescaling** | Standard softmax over full matrix |
-| TPU Optimization | **Hardware-specific tuning** | Generic operations |
-| Paged Attention | ✅ **Supported** | ❌ Not supported |
-| Mixed Prefill/Decode | ✅ **Optimized** | ❌ Separate processing |
-| Sliding Window | ✅ **Configurable** | ❌ Not supported |
 
 ## Implementation
 
