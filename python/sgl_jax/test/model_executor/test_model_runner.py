@@ -227,7 +227,8 @@ class TestModelRunner(unittest.TestCase):
         extend_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
         with self.mesh:
             extend_output = self.model_runner.forward(
-                extend_batch, LogitsMetadata.from_model_worker_batch(model_worker_batch)
+                extend_batch,
+                LogitsMetadata.from_model_worker_batch(model_worker_batch, self.mesh),
             )
 
         # Verify forward_pass_id incremented
@@ -265,7 +266,9 @@ class TestModelRunner(unittest.TestCase):
             with self.mesh:
                 decode_output = self.model_runner.forward(
                     current_batch,
-                    LogitsMetadata.from_model_worker_batch(model_worker_batch),
+                    LogitsMetadata.from_model_worker_batch(
+                        model_worker_batch, self.mesh
+                    ),
                 )
             decode_outputs.append(decode_output)
 

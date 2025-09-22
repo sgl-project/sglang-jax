@@ -4,7 +4,6 @@ import dataclasses
 import logging
 import signal
 import threading
-import time
 from queue import Queue
 from typing import Optional, Tuple
 
@@ -16,32 +15,12 @@ from jax.sharding import NamedSharding, PartitionSpec
 
 from sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch
 from sgl_jax.srt.managers.tp_worker import ModelWorker
+from sgl_jax.srt.managers.utils import resolve_future_token_ids, set_future_token_ids
 from sgl_jax.srt.sampling.sampling_batch_info import SamplingMetadata
 from sgl_jax.srt.server_args import ServerArgs
-from sgl_jax.srt.utils.jax_utils import device_array
 from sgl_jax.utils import get_exception_traceback
 
 logger = logging.getLogger(__name__)
-
-
-@jax.jit
-def resolve_future_token_ids(input_ids, future_token_ids_map):
-    return jnp.where(
-        input_ids < 0,
-        future_token_ids_map[jnp.clip(-input_ids, a_min=0)],
-        input_ids,
-    )
-
-
-@jax.jit
-def set_future_token_ids(future_token_ids_map, future_token_ids_ct, next_token_ids):
-    # The start index must be a tuple, one element per dimension of the array.
-    start_indices = (future_token_ids_ct + 1,)
-
-    # jax.lax.dynamic_update_slice is the correct tool for this job.
-    return jax.lax.dynamic_update_slice(
-        future_token_ids_map, next_token_ids, start_indices
-    )
 
 
 class ModelWorkerClient:
@@ -187,7 +166,7 @@ class ModelWorkerClient:
         )
 
         forward_metadata = self.worker.model_runner.attn_backend.get_forward_metadata(
-            model_worker_batch, self.mesh
+            model_worker_batch
         )
 
         # Push a new batch to the queue (JAX handles synchronization automatically)
@@ -215,35 +194,7 @@ class ModelWorkerClient:
         return None, future_next_token_ids, 0
 
     def run_precompile(self):
-        start_time = time.perf_counter()
-        logger.info(
-            f"[ModelWorkerClient] Begins to run resolve_future_token_ids precompile."
-        )
-        (
-            precompile_token_paddings,
-            precompile_bs_paddings,
-            _,
-        ) = self.get_precompile_paddings()
-        max_padding_bs, _ = self.get_max_padded_size()
-        bs_paddings = sorted(set(precompile_bs_paddings + [max_padding_bs]))
-        token_paddings = sorted(set(bs_paddings + precompile_token_paddings))
-        for token_padding in token_paddings:
-            input_ids = device_array(
-                self.worker.mesh, jnp.arange(0, token_padding, dtype=jnp.int32)
-            )
-            resolve_future_token_ids(input_ids, self.future_token_ids_map)
-        for bs_padding in bs_paddings:
-            input_ids = device_array(
-                self.worker.mesh, jnp.arange(0, bs_padding, dtype=jnp.int32)
-            )
-            set_future_token_ids(
-                self.future_token_ids_map, self.future_token_ids_ct, input_ids
-            )
-        end_time = time.perf_counter()
-        logger.info(
-            f"[ModelWorkerClient] Completes resolve_future_token_ids precompile. Time cost: {end_time - start_time} seconds"
-        )
-        self.worker.run_precompile()
+        self.worker.run_precompile(self.future_token_ids_map)
 
     def __delete__(self):
         self.input_queue.put((None, None, None, None))

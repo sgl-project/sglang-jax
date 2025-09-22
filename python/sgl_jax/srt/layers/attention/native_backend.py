@@ -39,7 +39,7 @@ class NativeAttention(AttentionBackend):
             num_attn_heads=aux_data["num_heads"], num_kv_heads=aux_data["num_kv_heads"]
         )
 
-    def get_forward_metadata(self, batch: ModelWorkerBatch, mesh: Mesh):
+    def get_forward_metadata(self, batch: ModelWorkerBatch):
         """Init the metadata for a forward pass and return it."""
         return None
 
