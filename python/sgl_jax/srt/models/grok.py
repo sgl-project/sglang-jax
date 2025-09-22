@@ -1,5 +1,5 @@
 import logging
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
 import jax
 import jax.lax
@@ -86,7 +86,7 @@ class Grok1MLP(nnx.Module):
 
     def __call__(self, x):
         gate_up, _ = self.gate_up_proj(x)
-        x, _ = self.act_fn(gate_up)
+        x = self.act_fn(gate_up)
         x, _ = self.down_proj(x)
         return x
 
@@ -110,8 +110,6 @@ class Grok1MoE(nnx.Module):
     ):
         super().__init__()
 
-        if mesh is None:
-            mesh = get_abstract_mesh()
         # Gate always runs at full precision for stability (see https://arxiv.org/pdf/2101.03961)
         self.gate = LinearBase(
             input_size=config.hidden_size,
@@ -125,7 +123,7 @@ class Grok1MoE(nnx.Module):
         self.router_logit_softcapping = getattr(config, "router_logit_softcapping", 30)
 
         expert_parallel_size = mesh.shape.get("data", 1) * mesh.shape.get("tensor", 1)
-        with use_abstract_mesh(mesh):
+        with mesh:
             self.experts = EPMoE(
                 config=config,
                 num_experts=config.num_local_experts,
@@ -176,7 +174,7 @@ class Grok1Attention(nnx.Module):
         self.rope_theta = rope_theta
         rope_scaling = get_rope_scaling(config)
 
-        num_heads = self.total_num_heads + self.total_num_kv_heads
+        num_heads = self.total_num_heads + 2 * self.total_num_kv_heads
         self.qkv_proj = LinearBase(
             input_size=hidden_size,
             output_size=num_heads * self.head_dim,
@@ -250,7 +248,7 @@ class Grok1Attention(nnx.Module):
         positions: jax.Array,
         hidden_states: jax.Array,
         forward_batch: ForwardBatch,
-    ) -> jax.Array:
+    ) -> Tuple[jax.Array, jax.Array]:
         if hidden_states.shape[0] == 0:
             assert (
                 not self.o_proj.reduce_results
@@ -265,13 +263,13 @@ class Grok1Attention(nnx.Module):
         q = q.reshape(num_tokens, self.num_heads, self.head_dim)
         k = k.reshape(num_tokens, self.num_kv_heads, self.head_dim)
         v = v.reshape(num_tokens, self.num_kv_heads, self.head_dim)
-        
+
         q, k = self.rotary_emb(positions, q, k)
 
-        attn_output = self.attn(q, k, v, forward_batch)
+        attn_output, kv_fused = self.attn(q, k, v, forward_batch)
 
         output, _ = self.o_proj(attn_output)
-        return output
+        return output, kv_fused
 
 
 class Grok1DecoderLayer(nnx.Module):
@@ -362,7 +360,7 @@ class Grok1DecoderLayer(nnx.Module):
         forward_batch: ForwardBatch,
         residual: Optional[jax.Array] = None,
         deferred_norm: Optional[RMSNorm] = None,
-    ) -> Tuple[jax.Array, jax.Array, RMSNorm]:
+    ) -> Tuple[jax.Array, jax.Array, jax.Array, RMSNorm]:
 
         hidden_states_original = hidden_states
         residual_original = residual
@@ -382,13 +380,13 @@ class Grok1DecoderLayer(nnx.Module):
             # here hidden_states is the residual
             hidden_states, residual = self.pre_attn_norm(hidden_states), hidden_states
 
-        hidden_states = self.self_attn(
+        hidden_states, kv_fused = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
             forward_batch=forward_batch,
         )
 
-        hidden_states = jax.lax.psum(hidden_states, axis_name="tensor")
+        # hidden_states = jax.lax.psum(hidden_states, axis_name="tensor")
 
         hidden_states, residual = dual_rmsnorm_forward(
             hidden_states,
@@ -400,7 +398,7 @@ class Grok1DecoderLayer(nnx.Module):
 
         # Fully Connected
         hidden_states = self.ffn(hidden_states)
-        return hidden_states, residual, self.post_moe_norm  # defer layernorm
+        return hidden_states, residual, kv_fused, self.post_moe_norm  # defer layernorm
 
     def moe_with_rmoe(self, x):
         mlp_result = self.mlp(x)
@@ -438,19 +436,21 @@ class Grok1Model(nnx.Module):
         input_ids: jax.Array,
         positions: jax.Array,
         forward_batch: ForwardBatch,
-        input_embeds: jax.Array = None,
-    ) -> jax.Array:
+        input_embeds: Optional[jax.Array] = None,
+    ) -> Tuple[jax.Array, List[jax.Array]]:
         if input_embeds is None:
             hidden_states = self.embed_tokens(input_ids)
-            hidden_states.mul_(self.config.embedding_multiplier_scale)
+            hidden_states *= self.config.embedding_multiplier_scale
         else:
             hidden_states = input_embeds
 
+        layer_kv_fused = []
         residual, deferred_norm = None, None
         for i in range(len(self.layers)):
-            hidden_states, residual, deferred_norm = self.layers[i](
+            hidden_states, residual, kv_fused, deferred_norm = self.layers[i](
                 positions, hidden_states, forward_batch, residual, deferred_norm
             )
+            layer_kv_fused.append(kv_fused)
 
         hidden_states, _ = dual_rmsnorm_forward(
             hidden_states,
@@ -460,10 +460,10 @@ class Grok1Model(nnx.Module):
             deferred_norm.variance_epsilon,
         )
 
-        return hidden_states
+        return hidden_states, layer_kv_fused
 
 
-class Grok1ForCausalLM(nnx.Module):
+class Grok1ModelForCausalLM(nnx.Module):
     def __init__(
         self,
         config: PretrainedConfig,
@@ -472,8 +472,7 @@ class Grok1ForCausalLM(nnx.Module):
     ) -> None:
         super().__init__()
         self.config = config
-        if mesh is None:
-            mesh = get_abstract_mesh()
+        self.mesh = mesh
 
         self.model = Grok1Model(config, rngs=rngs, mesh=mesh)
 
@@ -495,7 +494,9 @@ class Grok1ForCausalLM(nnx.Module):
         forward_batch: ForwardBatch,
         input_embeds: Optional[jax.Array] = None,
     ) -> jax.Array:
-        hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
+        hidden_states, layer_kv_fused = self.model(
+            input_ids, positions, forward_batch, input_embeds
+        )
         return self.logits_processor(
             input_ids, hidden_states, self.lm_head, forward_batch
         )

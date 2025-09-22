@@ -20,7 +20,7 @@ class GeluAndMul(nnx.Module):
         super().__init__()
         self.approximate = approximate
 
-    def forward(self, x: jax.Array) -> jax.Array:
+    def __call__(self, x: jax.Array) -> jax.Array:
         if self.approximate == "tanh":
             out = jax.nn.gelu(x, approximate=True) * x
         elif self.approximate == "none":
