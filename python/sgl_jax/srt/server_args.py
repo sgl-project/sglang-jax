@@ -35,6 +35,7 @@ class ServerArgs:
     is_embedding: bool = False
     revision: Optional[str] = None
     model_impl: str = "auto"
+    model_layer_nums: Optional[int] = None
 
     # HTTP server
     host: str = "127.0.0.1"
@@ -287,6 +288,12 @@ class ServerArgs:
             '* "sglang" will use the SGLang model implementation.\n'
             '* "transformers" will use the Transformers model '
             "implementation.\n",
+        )
+        parser.add_argument(
+            "--model-layer-nums",
+            type=int,
+            default=ServerArgs.model_layer_nums,
+            help="Number of model layers to load and use for inference. If not specified, uses the value from model config.",
         )
 
         # HTTP server

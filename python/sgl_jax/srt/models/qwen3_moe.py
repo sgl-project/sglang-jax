@@ -346,7 +346,10 @@ class Qwen3MoeForCausalLM(nnx.Module):
     def load_weights(self, rng_key: jax.Array):
         self.rng = nnx.Rngs(rng_key)
         loader = WeightLoader(
-            model=self, model_config=self.config, mesh=self.mesh, dtype=self.dtype
+            model=self,
+            model_config=self.config,
+            mesh=self.mesh,
+            dtype=self.dtype,
         )
         weight_mappings = self._create_qwen3_moe_weight_mappings()
         loader.load_weights_from_safetensors(weight_mappings)
