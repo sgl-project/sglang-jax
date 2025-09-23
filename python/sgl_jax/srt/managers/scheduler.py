@@ -558,6 +558,7 @@ class Scheduler(
             token_ids_logprob=recv_req.token_ids_logprob,
             stream=recv_req.stream,
             eos_token_ids=self.model_config.hf_eos_token_id,
+            vocab_size=self.model_config.vocab_size,
         )
         req.tokenizer = self.tokenizer
 

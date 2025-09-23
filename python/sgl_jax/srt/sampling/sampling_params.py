@@ -148,3 +148,27 @@ class SamplingParams:
                 else:
                     stop_str_max_len = max(stop_str_max_len, len(stop_str))
             self.stop_str_max_len = stop_str_max_len
+
+    def convert_to_dict(self) -> Dict:
+        # Start with a copy of all instance attributes
+        result = {}
+        for key, value in self.__dict__.items():
+            if key.startswith("_"):
+                continue
+
+            # Handle special conversions
+            if key == "stop_token_ids":
+                # Convert set back to list, or None
+                result[key] = list(value) if value is not None else None
+            #elif key == "top_k":
+            #    # Restore -1 if it was set to TOP_K_ALL
+            #    from sgl_jax.srt.sampling.sampling_params import TOP_K_ALL  # or wherever it's defined
+            #    result[key] = -1 if value == TOP_K_ALL else value
+            elif key == "stop_strs":
+                # The API expects "stop", not "stop_strs"
+                result["stop"] = value
+            else:
+                # Pass through all other fields as-is
+                result[key] = value
+
+        return result
