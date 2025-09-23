@@ -12,7 +12,7 @@ import multiprocessing as mp
 import os
 import signal
 import threading
-from typing import AsyncIterator, Dict, Iterator, List, Optional, Tuple, Union
+from typing import Any, AsyncIterator, Dict, Iterator, List, Optional, Tuple, Union
 
 import zmq
 import zmq.asyncio
@@ -20,9 +20,12 @@ import zmq.asyncio
 # Fix a bug of Python threading
 setattr(threading, "_register_atexit", lambda *args, **kwargs: None)
 
+import json
+
 import uvloop
 
 from sgl_jax.srt.entrypoints.EngineBase import EngineBase
+from sgl_jax.srt.hf_transformers_utils import get_generation_config
 from sgl_jax.srt.managers.detokenizer_manager import run_detokenizer_process
 from sgl_jax.srt.managers.io_struct import (
     EmbeddingReqInput,
@@ -33,6 +36,7 @@ from sgl_jax.srt.managers.io_struct import (
 from sgl_jax.srt.managers.scheduler import run_scheduler_process
 from sgl_jax.srt.managers.template_manager import TemplateManager
 from sgl_jax.srt.managers.tokenizer_manager import TokenizerManager
+from sgl_jax.srt.sampling.sampling_params import SamplingParams
 from sgl_jax.srt.server_args import PortArgs, ServerArgs
 from sgl_jax.srt.utils import (
     configure_logger,
@@ -93,7 +97,7 @@ class Engine(EngineBase):
         self.tokenizer_manager = tokenizer_manager
         self.template_manager = template_manager
         self.scheduler_info = scheduler_info
-
+        self.default_sampling_params: Union[dict[str, Any], None] = None
         context = zmq.Context(2)
         self.send_to_rpc = get_zmq_socket(
             context, zmq.DEALER, self.port_args.rpc_ipc_name, True
@@ -115,6 +119,9 @@ class Engine(EngineBase):
         The arguments of this function is the same as `sglang/srt/managers/io_struct.py::GenerateReqInput`.
         Please refer to `GenerateReqInput` for the documentation.
         """
+
+        if sampling_params is None:
+            sampling_params = self.get_default_sampling_params()
 
         obj = GenerateReqInput(
             text=prompt,
@@ -159,6 +166,10 @@ class Engine(EngineBase):
         The arguments of this function is the same as `sglang/srt/managers/io_struct.py::GenerateReqInput`.
         Please refer to `GenerateReqInput` for the documentation.
         """
+
+        if sampling_params is None:
+            sampling_params = self.get_default_sampling_params()
+
         obj = GenerateReqInput(
             input_ids=input_ids,
             sampling_params=sampling_params,
@@ -345,6 +356,43 @@ class Engine(EngineBase):
             item_first=item_first,
             request=None,
         )
+
+    def get_default_sampling_params(self) -> SamplingParams:
+        if self.default_sampling_params is None:
+            config = get_generation_config(
+                self.server_args.model_path,
+                self.server_args.trust_remote_code,
+                self.server_args.revision,
+            )
+            if config is not None:
+                self.default_sampling_params = config.to_diff_dict()
+            else:
+                self.default_sampling_params = {}
+
+            if self.server_args.preferred_sampling_params is not None:
+                self.default_sampling_params.update(
+                    json.loads(self.server_args.preferred_sampling_params)
+                )
+
+            available_params = [
+                "repetition_penalty",
+                "temperature",
+                "top_k",
+                "top_p",
+                "min_p",
+                "max_new_tokens",
+            ]
+            if any(p in self.default_sampling_params for p in available_params):
+                diff_sampling_param = {
+                    p: self.default_sampling_params.get(p)
+                    for p in available_params
+                    if self.default_sampling_params.get(p) is not None
+                }
+                self.default_sampling_params = diff_sampling_param
+
+        if self.default_sampling_params:
+            return SamplingParams(**self.default_sampling_params)
+        return SamplingParams()
 
 
 def _set_envs_and_config():
