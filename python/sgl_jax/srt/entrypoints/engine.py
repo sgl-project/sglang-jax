@@ -206,6 +206,9 @@ class Engine(EngineBase):
         )
         generator = self.tokenizer_manager.generate_request(obj, None)
         return await generator.__anext__()
+    
+    def get_default_sampling_params(self):
+        pass
 
     def rerank(
         self,
