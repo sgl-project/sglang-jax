@@ -161,7 +161,10 @@ class ModelWorker:
         # padding cache_loc_paddings
         # note: the length of following two cache_loc_paddings must keep the same to length of separate bs_paddings.
         self.precompile_cache_loc_paddings = [
-            item * self.max_req_len for item in self.precompile_bs_paddings
+            (item * self.max_req_len + self.page_size - 1)
+            // self.page_size
+            * self.page_size
+            for item in self.precompile_bs_paddings
         ]
 
     def normalize_token_paddings(self):
