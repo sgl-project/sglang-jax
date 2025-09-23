@@ -397,11 +397,9 @@ class Engine(EngineBase):
                     if self.default_sampling_params.get(p) is not None
                 }
                 self.default_sampling_params = diff_sampling_param
-<<<<<<< HEAD
+
             else:
                 self.default_sampling_params = {}
-=======
->>>>>>> b82afc0 (add get default_sampling_params)
 
         if self.default_sampling_params:
             return SamplingParams(**self.default_sampling_params)
