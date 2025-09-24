@@ -12,7 +12,7 @@ import multiprocessing as mp
 import os
 import signal
 import threading
-from typing import AsyncIterator, Dict, Iterator, List, Optional, Tuple, Union
+from typing import AsyncIterator, Dict, Iterator, List, Optional, Tuple, Union, Any
 
 import zmq
 import zmq.asyncio
@@ -43,6 +43,7 @@ from sgl_jax.srt.utils import (
     set_ulimit,
 )
 from sgl_jax.version import __version__
+from sgl_jax.srt.sampling import SamplingParams
 
 logger = logging.getLogger(__name__)
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
@@ -98,6 +99,8 @@ class Engine(EngineBase):
         self.send_to_rpc = get_zmq_socket(
             context, zmq.DEALER, self.port_args.rpc_ipc_name, True
         )
+
+        self.default_sampling_params: Union[dict[str, Any], None] = None
 
     def generate(
         self,
@@ -342,6 +345,15 @@ class Engine(EngineBase):
             item_first=item_first,
             request=None,
         )
+
+    def get_default_sampling_params(self) -> SamplingParams:
+        if self.default_sampling_params is None:
+            self.default_sampling_params = (
+                self.llm_engine.model_config.get_diff_sampling_param())
+        if self.default_sampling_params:
+            return SamplingParams.from_optional(**self.default_sampling_params)
+        return SamplingParams()
+
 
 
 def _set_envs_and_config():
