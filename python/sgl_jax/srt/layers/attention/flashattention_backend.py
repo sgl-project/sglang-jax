@@ -4,7 +4,7 @@ from typing import Tuple
 import jax
 import jax.numpy as jnp
 import numpy as np
-from jax.sharding import Mesh
+from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 from jax.tree_util import register_pytree_node_class
 
@@ -75,6 +75,7 @@ class FlashAttention(AttentionBackend):
         vmem_limit_bytes: int = 64 * (1 << 20),  # 64MB
         page_size: int = 1,
         kv_partition_axis: str = "tensor",
+        mesh: jax.sharding.Mesh = None,
     ):
         self.vmem_limit_bytes = vmem_limit_bytes
         self.num_heads = num_attn_heads
@@ -82,13 +83,13 @@ class FlashAttention(AttentionBackend):
             self.num_kv_heads = num_kv_heads
         else:
             self.num_kv_heads = num_attn_heads
-        self.num_kv_heads = 8
         self.head_dim = head_dim
         self.page_size = page_size
         self.kv_partition_axis = kv_partition_axis
         self.forward_metadata = FlashAttentionMetadata()
+        self.mesh = mesh
 
-    def get_forward_metadata(self, batch: ModelWorkerBatch, mesh: Mesh):
+    def get_forward_metadata(self, batch: ModelWorkerBatch):
         """Return the metadata for a forward pass."""
         metadata = FlashAttentionMetadata()
 
@@ -149,8 +150,10 @@ class FlashAttention(AttentionBackend):
             metadata.seq_lens,
             metadata.distribution,
         ) = device_array(
-            mesh,
             (num_seqs, cu_q_lens, cu_kv_lens, page_indices, seq_lens, distribution),
+            sharding=(
+                NamedSharding(self.mesh, P()) if jax.process_count() == 1 else None
+            ),
         )
         return metadata
 
@@ -259,7 +262,6 @@ class FlashAttention(AttentionBackend):
             updated_kv_cache_fused,
         ) = jax.shard_map(  # Fused KV kernel handles cache updates internally
             _ragged_paged_attention_with_fused_kv,
-            mesh=jax.sharding.get_abstract_mesh(),
             in_specs=in_specs,
             out_specs=out_specs,
             check_vma=False,

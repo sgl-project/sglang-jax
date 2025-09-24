@@ -299,7 +299,7 @@ def run_detokenizer_process(
     port_args: PortArgs,
 ):
     kill_itself_when_parent_died()
-    setproctitle.setproctitle("sglang::detokenizer")
+    setproctitle.setproctitle("sglang-jax::detokenizer")
     configure_logger(server_args)
     parent_process = psutil.Process().parent()
 

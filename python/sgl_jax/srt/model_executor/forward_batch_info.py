@@ -26,6 +26,8 @@ import jax
 
 logger = logging.getLogger(__name__)
 
+from jax.sharding import NamedSharding, PartitionSpec
+
 from sgl_jax.srt.utils.jax_utils import device_array
 
 if TYPE_CHECKING:
@@ -245,7 +247,6 @@ class ForwardBatch:
             extend_prefix_lens,
             extend_seq_lens,
         ) = device_array(
-            model_runner.mesh,
             (
                 batch.input_ids,
                 batch.seq_lens,
@@ -257,7 +258,13 @@ class ForwardBatch:
                 batch.extend_prefix_lens,
                 batch.extend_seq_lens,
             ),
+            sharding=(
+                NamedSharding(model_runner.mesh, PartitionSpec())
+                if jax.process_count() == 1
+                else None
+            ),
         )
+
         obj = cls(
             bid=batch.bid,
             forward_mode=batch.forward_mode,

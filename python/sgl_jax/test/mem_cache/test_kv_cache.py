@@ -3,11 +3,11 @@ import unittest
 
 import jax
 import jax.numpy as jnp
-import numpy as np
-from jax.sharding import AxisType, Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 
-from sgl_jax.srt.mem_cache.memory_pool import update_kv_cache
+from sgl_jax.srt.mem_cache.memory_pool import (
+    update_kv_cache_vectorized as update_kv_cache,
+)
 from sgl_jax.srt.utils.mesh_utils import create_device_mesh
 
 mesh = create_device_mesh(ici_parallelism=[1, -1, 1, 1], dcn_parallelism=[1, 1, 1, 1])

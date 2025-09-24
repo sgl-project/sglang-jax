@@ -69,7 +69,9 @@ class ModelRunner:
         self.mesh = mesh
         # model args
         self.num_attn_heads = model_config.num_attention_heads
-        self.num_kv_heads = model_config.num_key_value_heads
+        self.num_kv_heads = model_config.get_total_num_kv_heads_with_replication(
+            tp_size
+        )
         self.rngs = rngs
 
         self.tp_size = tp_size
@@ -180,6 +182,10 @@ class ModelRunner:
         return min_available_device_memory
 
     def load_model(self):
+        self.model_config.validate_tensor_parallel_config(self.tp_size)
+        self.model_config.configure_for_tensor_parallel(self.tp_size)
+        self.model_config.log_kv_heads_info(self.tp_size)
+
         self.model = self.model_loader.load_model(
             model_config=self.model_config,
         )
@@ -303,7 +309,9 @@ class ModelRunner:
             size=self.max_total_num_tokens,
             page_size=self.page_size,
             dtype=self.kv_cache_dtype,
-            head_num=self.model_config.get_total_num_kv_heads(),
+            head_num=self.model_config.get_total_num_kv_heads_with_replication(
+                self.tp_size
+            ),
             head_dim=self.model_config.head_dim,
             layer_num=self.model_config.num_hidden_layers,
             mesh=self.mesh,
@@ -345,6 +353,7 @@ class ModelRunner:
                 self.num_kv_heads,
                 self.model_config.head_dim,
                 page_size=self.page_size,
+                mesh=self.mesh,
             )
         else:
             raise ValueError(
@@ -397,7 +406,7 @@ class ModelRunner:
     ) -> Tuple[LogitsProcessorOutput, int]:
         # for compatibility, 0.6.3 need to use use_mesh. set_mesh is not have __entry__ attribute.
         # on jax 0.7.1, we need to use set_mesh.
-        # with self.mesh, jax.sharding.set_mesh(self.mesh):
+        # with jax.sharding.set_mesh(self.mesh):
         with jax.sharding.use_mesh(self.mesh):
             if (
                 forward_batch.forward_mode.is_decode()
@@ -446,24 +455,31 @@ class MockModelRunner(ModelRunner):
         mesh: mesh_lib.Mesh = None,
         server_args: ServerArgs = None,
     ):
+        self.server_args = server_args
+        self.tp_size = server_args.tp_size
+
         if isinstance(model_config, MockModelConfig):
             self.num_kv_heads = model_config.num_kv_heads
             self.num_attn_heads = model_config.num_heads
             self.rngs = rngs
         else:
-            self.num_kv_heads = model_config.num_key_value_heads
+            self.num_kv_heads = model_config.get_total_num_kv_heads_with_replication(
+                self.tp_size
+            )
             self.num_attn_heads = model_config.num_attention_heads
             self.rngs = rngs
 
-        self.server_args = server_args
         self.dtype = jnp.float32
         self.mem_fraction_static = 0.8
         self.model_config = model_config
         self.max_total_num_tokens = 1 << 15
         self.kv_cache_dtype = jnp.bfloat16
         self.page_size = 1
-        self.tp_size = server_args.tp_size
         self.mesh = mesh
+
+        # Validate tensor parallel configuration for MockModelRunner too
+        if not isinstance(model_config, MockModelConfig):
+            self.model_config.validate_tensor_parallel_config(self.tp_size)
 
         # If it is a draft model, tp_group can be different
         max_num_reqs = min(
@@ -483,7 +499,9 @@ class MockModelRunner(ModelRunner):
             size=self.max_total_num_tokens,
             page_size=self.page_size,
             dtype=self.kv_cache_dtype,
-            head_num=self.model_config.get_num_kv_heads(self.tp_size),
+            head_num=self.model_config.get_total_num_kv_heads_with_replication(
+                self.tp_size
+            ),
             head_dim=self.model_config.head_dim,
             layer_num=self.model_config.num_hidden_layers,
             mesh=mesh,

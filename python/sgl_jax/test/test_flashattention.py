@@ -274,9 +274,7 @@ def create_test_data(
         extend_prefix_lens=extend_prefix_lens,
         extend_seq_lens=extend_seq_lens,
     )
-    fb.attn_backend.forward_metadata = attention_backend.get_forward_metadata(
-        mwb, mesh=mesh
-    )
+    fb.attn_backend.forward_metadata = attention_backend.get_forward_metadata(mwb)
     return fb, q, k, v
 
 

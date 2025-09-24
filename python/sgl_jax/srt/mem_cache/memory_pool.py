@@ -481,35 +481,6 @@ def _set_fused_kv_buffer(
     )
 
 
-def _set_kv_buffer(
-    k: jax.Array,
-    v: jax.Array,
-    loc: jax.Array,
-    k_cache: jax.Array,
-    v_cache: jax.Array,
-    page_size: int,
-    kv_partition_axis: str = "tensor",
-):
-    """
-    k: jax.Array,          # [total_tokens, num_heads, head_dim]
-    v: jax.Array,          # [total_tokens, num_heads, head_dim]
-    loc: jax.Array,        # [total_tokens] total_tokens is the padding tokens, if the value is -1, it means the token is padding
-    k_cache: jax.Array,
-    v_cache: jax.Array,
-    """
-    k_cache, v_cache = update_kv_cache(
-        k,
-        v,
-        loc,
-        k_cache,
-        v_cache,
-        page_size=page_size,
-        kv_partition_axis=kv_partition_axis,
-    )
-
-    return k_cache, v_cache
-
-
 def update_fused_kv_cache(
     fused_kv: jax.Array,  # [total_tokens, num_kv_heads * 2, head_dim]
     loc: jax.Array,  # [total_tokens], -1 for padding
@@ -534,40 +505,6 @@ def update_fused_kv_cache(
         fused_kv,
         loc,
         kv_cache,
-        page_size=page_size,
-        kv_partition_axis=kv_partition_axis,
-    )
-
-
-def update_kv_cache(
-    k: jax.Array,  # [total_tokens, num_heads, head_dim]
-    v: jax.Array,  # [total_tokens, num_heads, head_dim]
-    loc: jax.Array,  # [total_tokens], -1 for padding
-    k_cache: jax.Array,
-    v_cache: jax.Array,
-    page_size: int = 1,
-    kv_partition_axis: str = "tensor",
-):
-    """
-    Main KV cache update function that chooses between vectorized and token-by-token approaches.
-
-    Args:
-        k: Key tensor [total_tokens, num_heads, head_dim]
-        v: Value tensor [total_tokens, num_heads, head_dim]
-        loc: Location indices [total_tokens], -1 for padding tokens
-        k_cache: Key cache buffer
-        v_cache: Value cache buffer
-        use_vectorized: Whether to use vectorized (True) or token-by-token (False) approach
-
-    Returns:
-        Updated k_cache and v_cache
-    """
-    return update_kv_cache_vectorized(
-        k,
-        v,
-        loc,
-        k_cache,
-        v_cache,
         page_size=page_size,
         kv_partition_axis=kv_partition_axis,
     )
@@ -672,10 +609,7 @@ def kv_cache_update(
     num_slices_per_block: int = 8,
     kv_partition_axis: str = "tensor",
 ):
-    mesh = jax.sharding.get_abstract_mesh()
-
     @jax.shard_map(
-        mesh=mesh,
         in_specs=(
             P(
                 None, kv_partition_axis, None
@@ -783,6 +717,7 @@ def update_kv_cache_vectorized(
     v_cache: jax.Array,
     page_size: int,
     kv_partition_axis: str = "tensor",
+    mesh: jax.sharding.Mesh = None,
 ):
     """
     Vectorized KV cache update that handles padding and supports page_size > 1
