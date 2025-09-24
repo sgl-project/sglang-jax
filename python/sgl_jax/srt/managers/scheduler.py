@@ -911,12 +911,6 @@ class Scheduler(
             self.page_size,
         )
 
-        sampling_metadata = SamplingMetadata.from_model_worker_batch(
-            model_worker_batch,
-            len(model_worker_batch.seq_lens) - model_worker_batch.real_bs,
-            self.mesh,
-        )
-
         if self.enable_overlap:
             # Pre-initialize ForwardBatch for overlap scheduling optimization
             from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
@@ -926,14 +920,14 @@ class Scheduler(
             )
             logits_output, next_token_ids, cache_miss_count = (
                 self.tp_worker.forward_batch_generation(
-                    model_worker_batch, sampling_metadata=sampling_metadata
+                    model_worker_batch, sampling_metadata=None
                 )
             )
             next_token_ids = next_token_ids[: model_worker_batch.real_bs]
         else:
             logits_output, next_token_ids_device, cache_miss_count = (
                 self.tp_worker.forward_batch_generation(
-                    model_worker_batch, sampling_metadata=sampling_metadata
+                    model_worker_batch, sampling_metadata=None
                 )
             )
             next_token_ids = np.array(jax.device_get(next_token_ids_device))[

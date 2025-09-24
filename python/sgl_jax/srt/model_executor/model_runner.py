@@ -462,13 +462,6 @@ class ModelRunner:
 
         return ret
 
-    def _preprocess_logits(
-        self, logits_output: LogitsProcessorOutput, sampling_info: SamplingBatchInfo
-    ):
-        logits_output.next_token_logits = sampling_info.apply_logits_bias(
-            logits_output.next_token_logits
-        )
-
     def sample(
         self,
         logits_output: LogitsProcessorOutput,
@@ -484,6 +477,7 @@ class ModelRunner:
         Returns:
             A list of next_token_ids
         """
+        # Penalty application has been moved to the Sampler for better JIT performance
         return self.jitted_sampler(
             logits_output,
             sampling_metadata,

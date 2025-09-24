@@ -148,6 +148,8 @@ class SchedulerOutputProcessorMixin:
                 f"Prefill batch. #bid: {result.bid}, #cache_miss: {cache_miss_count}"
             )
 
+        self.set_next_batch_sampling_info_done(batch)
+
         self.stream_output(
             batch.reqs, batch.return_logprob, skip_stream_req, cache_miss_count
         )

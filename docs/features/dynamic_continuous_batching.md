@@ -131,7 +131,7 @@ The system supports dynamic batch modification:
 ```python
 def merge_batch(self, other: "ScheduleBatch"):
     # Merge sampling information
-    self.sampling_info.merge_batch(other.sampling_info, other.mesh)
+    self.sampling_info.merge_batch(other.sampling_info)
 
     # Concatenate array
     self.req_pool_indices = jnp.concat([self.req_pool_indices, other.req_pool_indices])

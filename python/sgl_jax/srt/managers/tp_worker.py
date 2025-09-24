@@ -193,6 +193,7 @@ class ModelWorker:
     def run_precompile(self, future_token_ids_map=None):
         self.precompile_extend(future_token_ids_map)
         self.precompile_decode(future_token_ids_map)
+        self.precompile_penalties(future_token_ids_map)
 
     def precompile_extend(self, future_token_ids_map=None):
         start_time = time.perf_counter()
@@ -282,6 +283,67 @@ class ModelWorker:
         end_time = time.perf_counter()
         logger.info("[DECODE] Precompile finished in %.0f secs", end_time - start_time)
 
+    def precompile_penalties(self, future_token_ids_map=None):
+        """Precompile penalty application for different batch sizes and penalty combinations."""
+        start_time = time.perf_counter()
+        logger.info(
+            f"[PENALTIES] Begin to precompile penalty applications bs_paddings={self.precompile_bs_paddings}"
+        )
+
+        with tqdm(
+            self.precompile_bs_paddings, desc="[PENALTIES] PRECOMPILE", leave=False
+        ) as pbar:
+            for bs in pbar:
+                pbar.set_postfix(bs=bs)
+
+                # Create model worker batch
+                aligned_cache_loc_size = (
+                    (bs * self.max_req_len + self.page_size - 1)
+                    // self.page_size
+                    * self.page_size
+                )
+                model_worker_batch = self.generate_model_worker_batch(
+                    bs,
+                    bs,
+                    ForwardMode.DECODE,
+                    aligned_cache_loc_size,
+                    do_penalties=True,
+                )
+
+                # Create sampling metadata with all penalty shapes for comprehensive compilation
+                # This ensures JAX compiles all penalty application branches in lax.cond
+                sampling_metadata = (
+                    SamplingMetadata.from_model_worker_batch_for_precompile(
+                        model_worker_batch, 0, self.mesh
+                    )
+                )
+
+                # Initialize forward batch
+                model_worker_batch.forward_batch = ForwardBatch.init_new(
+                    model_worker_batch, self.model_runner
+                )
+
+                if future_token_ids_map is not None:
+                    model_worker_batch.forward_batch.input_ids = (
+                        resolve_future_token_ids(
+                            model_worker_batch.forward_batch.input_ids,
+                            future_token_ids_map,
+                        )
+                    )
+
+                # Run forward with penalty application
+                _, next_token_ids, _ = self.forward_batch_generation(
+                    model_worker_batch, None, False, sampling_metadata
+                )
+
+                if future_token_ids_map is not None:
+                    set_future_token_ids(future_token_ids_map, 0, next_token_ids)
+
+        end_time = time.perf_counter()
+        logger.info(
+            "[PENALTIES] Precompile finished in %.0f secs", end_time - start_time
+        )
+
     def set_forward_metadata(self, model_worker_batch: ModelWorkerBatch):
         self.model_runner.attn_backend.forward_metadata = (
             self.worker.model_runner.attn_backend.get_forward_metadata(
@@ -324,6 +386,7 @@ class ModelWorker:
         num_tokens: int,
         mode: ForwardMode,
         max_cache_loc_size: int,
+        do_penalties: bool = False,
     ) -> ModelWorkerBatch:
         valid_input_ids = np.array([1] * bs, dtype=jnp.int32)
         invalid_input_ids = np.array([0] * (num_tokens - bs), dtype=jnp.int32)
@@ -351,7 +414,7 @@ class ModelWorker:
             ),
             return_logprob=False,
             sampling_info=SamplingBatchInfo.generate_for_precompile(
-                bs,
+                bs, self.model_config.vocab_size, do_penalties=do_penalties
             ),
             extend_input_logprob_token_ids=None,
             positions=np.concat([valid_positions, invalid_positions], axis=0),
@@ -415,6 +478,13 @@ class ModelWorker:
                 )
             )
 
+        if sampling_metadata is None:
+            sampling_metadata = SamplingMetadata.from_model_worker_batch(
+                model_worker_batch,
+                len(model_worker_batch.seq_lens) - model_worker_batch.real_bs,
+                self.mesh,
+            )
+
         self.model_runner.attn_backend.forward_metadata = forward_metadata
         # note: put positions on devices again because the forward_batch has been donated
         if not skip_sample:
@@ -448,6 +518,9 @@ class ModelWorker:
             import jax._src.test_util as jtu
 
             with jtu.count_pjit_cpp_cache_miss() as count:
+                # wait for sampling info to be done
+                if model_worker_batch.sampling_info.sampling_info_done:
+                    model_worker_batch.sampling_info.sampling_info_done.wait()
                 next_token_ids_device = self.model_runner.sample(
                     logits_output,
                     sampling_metadata,
@@ -532,9 +605,10 @@ class MockModelWorker:
 
     def forward_batch_generation(
         self,
-        model_worker_batch: ModelWorkerBatch,
-        launch_done: Optional[threading.Event] = None,
-        skip_sample: bool = False,
+        _model_worker_batch: ModelWorkerBatch,
+        _launch_done: Optional[threading.Event] = None,
+        _skip_sample: bool = False,
+        _sampling_metadata: Optional[SamplingMetadata] = None,
     ) -> Tuple[Union[LogitsProcessorOutput, jax.Array], Optional[jax.Array]]:
         return (
             LogitsProcessorOutput(
