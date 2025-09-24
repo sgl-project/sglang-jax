@@ -345,12 +345,9 @@ def generate_server_args() -> ServerArgs:
         preferred_sampling_params=None,
         disable_radix_cache=False,
         allow_auto_truncate=False,
-        jax_proc_id=None,
-        jax_num_procs=None,
-        xla_backend="tpu",
         max_seq_len=4096,
         precompile_token_paddings=[1, 8],
-        disable_jax_precompile=False,
+        disable_precompile=False,
     )
 
 

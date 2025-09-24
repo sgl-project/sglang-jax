@@ -59,6 +59,7 @@ class ServerArgs:
     schedule_policy: str = "fcfs"
     schedule_conservativeness: float = 1.0
     page_size: int = 1
+    hybrid_kvcache_ratio: float | None = None
     swa_full_tokens_ratio: float = 0.8
     disable_hybrid_swa_memory: bool = False
 
@@ -115,11 +116,6 @@ class ServerArgs:
     disable_overlap_schedule: bool = False
     enable_precision_tracer: bool = False
 
-    # Jax distribution info
-    jax_proc_id: int = None
-    jax_num_procs: int = None
-
-    xla_backend: str = "tpu"
     # Kernel backend
     attention_backend: str | None = "fa"
 
@@ -128,7 +124,7 @@ class ServerArgs:
     precompile_token_paddings: list[int] | None = None
     precompile_bs_paddings: list[int] | None = None
 
-    disable_jax_precompile: bool = False
+    disable_precompile: bool = False
 
     # For deterministic sampling
     enable_deterministic_sampling: bool = False
@@ -451,6 +447,18 @@ class ServerArgs:
             help="The number of tokens in a page.",
         )
         parser.add_argument(
+            "--hybrid-kvcache-ratio",
+            nargs="?",
+            const=0.5,
+            type=float,
+            default=ServerArgs.hybrid_kvcache_ratio,
+            help=(
+                "Mix ratio in [0,1] between uniform and hybrid kv buffers "
+                "(0.0 = pure uniform: swa_size / full_size = 1)"
+                "(1.0 = pure hybrid: swa_size / full_size = local_attention_size / context_length)"
+            ),
+        )
+        parser.add_argument(
             "--swa-full-tokens-ratio",
             type=float,
             default=ServerArgs.swa_full_tokens_ratio,
@@ -710,24 +718,6 @@ class ServerArgs:
         )
 
         parser.add_argument(
-            "--jax-proc-id",
-            type=int,
-            default=ServerArgs.jax_proc_id,
-            help="Jax Process ID",
-        )
-        parser.add_argument(
-            "--jax-num-procs",
-            type=int,
-            default=ServerArgs.jax_num_procs,
-            help="The number of Jax Processes",
-        )
-        parser.add_argument(
-            "--xla-backend",
-            type=str,
-            default=ServerArgs.xla_backend,
-            help="XLA backend",
-        )
-        parser.add_argument(
             "--max-seq-len",
             type=int,
             default=ServerArgs.max_seq_len,
@@ -746,9 +736,9 @@ class ServerArgs:
             help="Set the list of batch sizes buckets for jax jit",
         )
         parser.add_argument(
-            "--disable-jax-precompile",
+            "--disable-precompile",
             action="store_true",
-            help="whether disable jax precompile",
+            help="whether disable precompile",
         )
         # Kernel backend
         parser.add_argument(

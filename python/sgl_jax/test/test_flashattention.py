@@ -58,7 +58,7 @@ def create_qkv_cache(
     # Fill in the actual data for each sequence with proper alignment
     aligned_pos = 0
     for actual_pos, _ in enumerate(range(len(lens))):
-        seq_len = lens[actual_pos]
+        seq_len = lens[actual_pos][1]
         aligned_len = ((seq_len + page_size - 1) // page_size) * page_size
 
         # Generate data for this sequence
@@ -281,7 +281,7 @@ class TestAttention(CustomTestCase):
         self.rng_key = jax.random.PRNGKey(42)
         np.random.seed(42)
 
-    def run_test(self, mode, lens, mode_args):
+    def run_test(self, mode, lens, mode_args, sliding_window=None, logit_cap=None):
         # Create mock forward_batch
         num_heads, head_dim, num_kv_heads, page_size, dtype = mode_args
 
@@ -329,6 +329,8 @@ class TestAttention(CustomTestCase):
             scaling=head_dim**-0.5,
             num_kv_heads=num_kv_heads,
             layer_id=0,
+            sliding_window_size=sliding_window or 0,
+            logit_cap=logit_cap or 0,
         )
 
         padding_size = 4096
@@ -362,6 +364,8 @@ class TestAttention(CustomTestCase):
             # forward_batch.attn_backend.forward_metadata.cu_kv_lens,
             forward_batch.attn_backend.forward_metadata.num_seqs,
             sm_scale=head_dim**-0.5,
+            sliding_window=sliding_window,
+            soft_cap=logit_cap,
         )
         jax.block_until_ready(expected)
 
@@ -434,7 +438,7 @@ class TestAttention(CustomTestCase):
         """Test JAX attention accuracy against PyTorch reference"""
         # Parameters
         num_heads = 32
-        num_kv_heads = 8
+        num_kv_heads = 32
         head_dim = 128
         lens = [
             (1, 128),
@@ -570,6 +574,55 @@ class TestAttention(CustomTestCase):
         ]
 
         self.run_test("decode", lens, (num_heads, head_dim, num_kv_heads, 64, jnp.bfloat16))
+
+    def test_sliding_window_and_soft_cap_prefill_accuracy(self):
+        """Test combined sliding window and soft cap attention accuracy in prefill mode"""
+        # Parameters
+        num_heads = 32
+        num_kv_heads = 32
+        head_dim = 256
+        sliding_window_size = 512
+        logit_cap = 20.0
+
+        lens = [
+            (1, 128),
+            (64, 64),
+            (128, 256),
+            (100, 300),
+            (1, 400),
+        ]
+
+        self.run_test(
+            "prefill",
+            lens,
+            (num_heads, head_dim, num_kv_heads, 64, jnp.bfloat16),
+            sliding_window=sliding_window_size,
+            logit_cap=logit_cap,
+        )
+
+    def test_sliding_window_and_soft_cap_decode_accuracy(self):
+        """Test combined sliding window and soft cap attention accuracy in decode mode"""
+        # Parameters
+        num_heads = 32
+        num_kv_heads = 32
+        head_dim = 128
+        sliding_window_size = 512
+        logit_cap = 20.0
+
+        lens = [
+            (1, 256),
+            (1, 400),
+            (1, 512),
+            (1, 1024),
+        ]
+
+        self.run_test(
+            "decode",
+            lens,
+            (num_heads, head_dim, num_kv_heads, 64, jnp.bfloat16),
+            sliding_window=sliding_window_size,
+            logit_cap=logit_cap,
+        )
 
 
 if __name__ == "__main__":

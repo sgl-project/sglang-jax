@@ -2,8 +2,9 @@ import abc
 import logging
 
 import numpy as np
+from jax import numpy as jnp
 
-from sgl_jax.srt.mem_cache.memory_pool import KVCache
+from sgl_jax.srt.mem_cache.memory_pool import KVCache, SWAKVPool
 
 logger = logging.getLogger(__name__)
 
@@ -335,3 +336,109 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
     def load_cpu_copy(self, kv_cache_cpu, indices):
         return self._kvcache.load_cpu_copy(kv_cache_cpu, indices)
+
+
+class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
+    """Allocator for SWA hybrid KV cache."""
+
+    def __init__(
+        self,
+        size: int,
+        size_swa: int,
+        kvcache: SWAKVPool,
+    ):
+        super().__init__(size, 1, kvcache)
+        assert isinstance(kvcache, SWAKVPool)
+        self._size_full = size
+        self._size_swa = size_swa
+        self.full_attn_allocator = TokenToKVPoolAllocator(
+            size,
+            kvcache.full_kv_pool,
+        )
+        self.swa_attn_allocator = TokenToKVPoolAllocator(
+            size_swa,
+            kvcache.swa_kv_pool,
+        )
+        self.full_to_swa_index_mapping = np.empty(
+            size + size_swa + 1,
+            dtype=np.int64,
+        )
+        self.clear()
+
+        self._kvcache.full_to_swa_index_mapping = self.full_to_swa_index_mapping
+
+    def available_size(self):
+        raise NotImplementedError()
+
+    def full_available_size(self):
+        return self.full_attn_allocator.available_size()
+
+    def swa_available_size(self):
+        # return self.swa_attn_allocator.available_size()
+        return self.full_attn_allocator.available_size()
+
+    @property
+    def size_full(self):
+        return self._size_full
+
+    @property
+    def size_swa(self):
+        return self._size_swa
+
+    def debug_print(self) -> str:
+        msg = ""
+        msg += f"#swa-available-size: {self.swa_attn_allocator.available_size()}, "
+        msg += (
+            f"#full-attn-available-size: {self.full_attn_allocator.available_size()}, "
+        )
+        return msg
+
+    def get_kvcache(self):
+        return self._kvcache
+
+    def translate_loc_from_full_to_swa(self, kv_indices: np.array):
+        assert self.full_to_swa_index_mapping is not None
+        return self.full_to_swa_index_mapping[kv_indices].to(np.int32)
+
+    def alloc(self, need_size: int):
+        if need_size > self.full_attn_allocator.available_size():
+            return None
+        if need_size > self.swa_attn_allocator.available_size():
+            return None
+
+        alloc_full_indices = self.full_attn_allocator.alloc(need_size)
+        alloc_swa_indices = self.swa_attn_allocator.alloc(need_size)
+        self.full_to_swa_index_mapping[alloc_full_indices] = alloc_swa_indices
+        return alloc_full_indices
+
+    def free(self, free_index: np.array):
+        if len(free_index) == 0:
+            return
+        if self.is_not_in_free_group:
+            self.full_attn_allocator.free(free_index)
+            self.free_swa(free_index)
+        else:
+            self.free_group.append(free_index)
+        assert (
+            self.full_attn_allocator.available_size() <= self.full_attn_allocator.size
+        )
+        assert self.swa_attn_allocator.available_size() <= self.swa_attn_allocator.size
+
+    def free_swa(self, free_index: np.array):
+        swa_indices = self.full_to_swa_index_mapping[free_index]
+        swa_indices = swa_indices[swa_indices > 0]
+        self.swa_attn_allocator.free(swa_indices)
+        self.full_to_swa_index_mapping[free_index] = 0
+
+    def backup_state(self):
+        raise NotImplementedError
+
+    def restore_state(self, state):
+        raise NotImplementedError
+
+    def clear(self):
+        self.swa_attn_allocator.clear()
+        self.full_attn_allocator.clear()
+        self.full_to_swa_index_mapping.fill(0)
+        self.is_not_in_free_group = True
+        self.free_group = []

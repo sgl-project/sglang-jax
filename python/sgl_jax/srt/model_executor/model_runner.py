@@ -23,9 +23,10 @@ from sgl_jax.srt.managers.schedule_batch import (
 from sgl_jax.srt.mem_cache.allocator import (
     BaseTokenToKVPoolAllocator,
     PagedTokenToKVPoolAllocator,
+    SWATokenToKVPoolAllocator,
     TokenToKVPoolAllocator,
 )
-from sgl_jax.srt.mem_cache.memory_pool import MHATokenToKVPool, ReqToTokenPool
+from sgl_jax.srt.mem_cache.memory_pool import MHATokenToKVPool, ReqToTokenPool, SWAKVPool
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
 from sgl_jax.srt.model_loader.loader import get_model_loader
 from sgl_jax.srt.precision_tracer import precision_tracer
@@ -80,7 +81,9 @@ class ModelRunner:
         self.page_size = server_args.page_size
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
+        self.is_hybrid = model_config.is_hybrid
         self.use_mla_backend = self.model_config.attention_arch == AttentionArch.MLA
+        self.attention_chunk_size = model_config.attention_chunk_size
 
         self.forward_pass_id = 0
 
@@ -121,6 +124,16 @@ class ModelRunner:
         self.sampler = Sampler(nnx.Rngs(server_args.random_seed))
         total_device_memory = self.get_available_device_memory()
         self.load_model()
+
+        # Check if the model is using hybrid SWA
+        if (
+            not self.server_args.disable_hybrid_swa_memory
+            and self.sliding_window_size is not None
+            and self.sliding_window_size > 0
+        ):
+            architectures = self.model_config.hf_config.architectures
+            if architectures and not any("Llama4" in arch for arch in architectures):
+                self.is_hybrid = self.model_config.is_hybrid = True
 
         self.initialize_jit()
 
@@ -207,6 +220,16 @@ class ModelRunner:
         self.model = self.model_loader.load_model(
             model_config=self.model_config,
         )
+
+        # Parse other args
+        self.sliding_window_size = None
+        if hasattr(self.model, "get_attention_sliding_window_size"):
+            self.sliding_window_size = self.model.get_attention_sliding_window_size()
+        elif self.model_config.attention_chunk_size is not None:
+            self.sliding_window_size = self.model_config.attention_chunk_size
+            logger.info(
+                f"Setting sliding_window_size to be attention_chunk_size: {self.sliding_window_size}"
+            )
 
         self.dtype = self.model_config.dtype
         self.start_layer = getattr(self.model, "start_layer", 0)
@@ -297,6 +320,10 @@ class ModelRunner:
             self.max_total_num_tokens // self.server_args.page_size * self.server_args.page_size
         )
 
+        # create token size for hybrid cache
+        if self.is_hybrid:
+            self.set_num_token_hybrid()
+
         if self.max_total_num_tokens <= 0:
             raise RuntimeError("Not enough memory. Please try to increase --mem-fraction-static.")
 
@@ -311,31 +338,53 @@ class ModelRunner:
             )
 
         # Create KV cache pool
-        self.token_to_kv_pool = MHATokenToKVPool(
-            size=self.max_total_num_tokens,
-            page_size=self.page_size,
-            dtype=self.kv_cache_dtype,
-            head_num=self.model_config.get_total_num_kv_heads_with_replication(self.tp_size),
-            head_dim=self.model_config.head_dim,
-            layer_num=self.model_config.num_hidden_layers,
-            mesh=self.mesh,
-        )
+        if self.is_hybrid:
+            self.token_to_kv_pool = SWAKVPool(
+                size=self.full_max_total_num_tokens,
+                size_swa=self.swa_max_total_num_tokens,
+                swa_attention_layer_ids=self.model_config.swa_attention_layer_ids,
+                full_attention_layer_ids=self.model_config.full_attention_layer_ids,
+                dtype=self.kv_cache_dtype,
+                head_num=self.model_config.get_total_num_kv_heads_with_replication(
+                    self.tp_size
+                ),
+                head_dim=self.model_config.head_dim,
+                mesh=self.mesh,
+            )
+        else:
+            self.token_to_kv_pool = MHATokenToKVPool(
+                size=self.max_total_num_tokens,
+                page_size=self.page_size,
+                dtype=self.kv_cache_dtype,
+                head_num=self.model_config.get_total_num_kv_heads_with_replication(
+                    self.tp_size
+                ),
+                head_dim=self.model_config.head_dim,
+                layer_num=self.model_config.num_hidden_layers,
+                mesh=self.mesh,
+            )
 
         # Create KV pool allocator
         if self.token_to_kv_pool_allocator is None:
             if self.page_size == 1:
-                self.token_to_kv_pool_allocator = TokenToKVPoolAllocator(
-                    size=self.max_total_num_tokens,
-                    # dtype=self.kv_cache_dtype,
-                    kvcache=self.token_to_kv_pool,
-                )
+                if self.is_hybrid:
+                    self.token_to_kv_pool_allocator = SWATokenToKVPoolAllocator(
+                        self.full_max_total_num_tokens,
+                        self.swa_max_total_num_tokens,
+                        kvcache=self.token_to_kv_pool,
+                    )
+                else:
+                    self.token_to_kv_pool_allocator = TokenToKVPoolAllocator(
+                        size=self.max_total_num_tokens,
+                        kvcache=self.token_to_kv_pool,
+                    )
             else:
+                assert not self.is_hybrid
                 self.token_to_kv_pool_allocator = PagedTokenToKVPoolAllocator(
                     size=self.max_total_num_tokens,
                     page_size=self.page_size,
-                    # dtype=self.kv_cache_dtype,
                     kvcache=self.token_to_kv_pool,
-                    debug_mode=True,
+                    debug_mode=False,
                 )
 
     def init_attention_backend(self):
@@ -380,11 +429,12 @@ class ModelRunner:
         with jtu.count_pjit_cpp_cache_miss() as count:
             output, layers_kv_fused, _ = self.jitted_run_model(forward_batch, logits_metadata)
             cache_miss_count = count()
-        self._set_kv_cache_after_forward(layers_kv_fused, forward_batch)
+
+        self._set_kv_cache_after_forward(layers_kv_fused)
 
         return output, cache_miss_count
 
-    def _set_kv_cache_after_forward(self, layers_kv_fused, forward_batch: ForwardBatch):
+    def _set_kv_cache_after_forward(self, layers_kv_fused):
         # Note: For tp_size == 1, we need to put the layers_kv_fused on the device with the target_sharding
         # because sharding P(None, 'tensor') constraint has lost and this results in cache_miss for first prefill phase.
         # Issue: https://github.com/sgl-project/sglang-jax/issues/233
@@ -399,9 +449,8 @@ class ModelRunner:
                 jax.device_put(layer_kv_fused, target_sharding)
                 for layer_kv_fused in layers_kv_fused
             ]
-        start_idx = self.token_to_kv_pool.start_layer
-        end_idx = start_idx + len(layers_kv_fused)
-        self.token_to_kv_pool.kv_buffer[start_idx:end_idx] = layers_kv_fused
+        
+        self.token_to_kv_pool.replace_kv_buffer(layers_kv_fused)
 
     def forward_idle(
         self,
@@ -465,6 +514,96 @@ class ModelRunner:
             sampling_metadata,
             positions,
         )
+
+    def set_num_token_hybrid(self):
+        if (
+            "Llama4ForConditionalGeneration"
+            in self.model_config.hf_config.architectures
+        ):
+            temp_ratio = (
+                (1 - self.is_hybrid)
+                + self.is_hybrid
+                * self.attention_chunk_size
+                / self.model_config.context_len
+            )
+            self.swa_max_total_num_tokens = (
+                4 * self.max_total_num_tokens * temp_ratio // (3 * temp_ratio + 1)
+            )
+            self.full_max_total_num_tokens = (
+                4 * self.max_total_num_tokens
+                - 12 * self.max_total_num_tokens * temp_ratio // (3 * temp_ratio + 1)
+            )
+            self.swa_max_total_num_tokens = int(
+                self.swa_max_total_num_tokens
+                // self.server_args.page_size
+                * self.server_args.page_size
+            )
+            self.full_max_total_num_tokens = int(
+                self.full_max_total_num_tokens
+                // self.server_args.page_size
+                * self.server_args.page_size
+            )
+            self.max_total_num_tokens = self.full_max_total_num_tokens
+        else:
+            assert self.sliding_window_size is not None and self.sliding_window_size > 0
+            full_attention_layer_ids = []
+            swa_attention_layer_ids = []
+
+            # Try different attribute paths to access model layers
+            layers = None
+            layer_access_attempts = [
+                lambda: self.model.model.layers,
+                lambda: self.model.language_model.model.layers,
+                lambda: self.model.language_model.layers,
+                lambda: self.model.transformer.layers,
+            ]
+            for get_layers in layer_access_attempts:
+                try:
+                    layers = get_layers()
+                    break
+                except AttributeError:
+                    continue
+
+            if layers is None:
+                self.is_hybrid = False
+                return
+
+            for layer in layers:
+                if (
+                    layer.self_attn.attn.sliding_window_size is None
+                    or layer.self_attn.attn.sliding_window_size == -1
+                ):
+                    full_attention_layer_ids.append(layer.layer_id)
+                else:
+                    swa_attention_layer_ids.append(layer.layer_id)
+
+            self.model_config.swa_attention_layer_ids = swa_attention_layer_ids
+            self.model_config.full_attention_layer_ids = full_attention_layer_ids
+
+            # Algorithm:
+            # Existing max_total_num_tokens is per layer and assume all layers have the same number of tokens.
+            # - Find total # of tokens available across layers.
+            # - Calculate full_max_total_num_tokens and swa_max_total_num_tokens based on the given swa_full_tokens_ratio.
+            total_tokens = (
+                self.max_total_num_tokens * self.model_config.num_hidden_layers
+            )
+            full_layers_num = len(full_attention_layer_ids)
+            swa_layers_num = len(swa_attention_layer_ids)
+            swa_full_tokens_ratio = self.server_args.swa_full_tokens_ratio
+
+            # Solve the equations:
+            # 1. swa_max_total_num_tokens * swa_layers_num + full_max_total_num_tokens * full_layers_num == total_tokens
+            # 2. full_max_total_num_tokens * swa_full_tokens_ratio == swa_max_total_num_tokens
+            denominator = swa_full_tokens_ratio * swa_layers_num + full_layers_num
+            self.full_max_total_num_tokens = int(total_tokens / denominator)
+            self.swa_max_total_num_tokens = int(
+                self.full_max_total_num_tokens * swa_full_tokens_ratio
+            )
+            self.max_total_num_tokens = self.full_max_total_num_tokens
+
+            logger.info(
+                f"Use Sliding window memory pool. full_layer_tokens={self.full_max_total_num_tokens}, swa_layer_tokens={self.swa_max_total_num_tokens}"
+            )
 
 
 class MockModelRunner(ModelRunner):

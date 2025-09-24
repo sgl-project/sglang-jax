@@ -98,6 +98,7 @@ def benchmark_backend(
             cu_kv_lens,
             distribution,
             sm_scale=sm_scale,
+            page_size=page_size,
             vmem_limit_bytes=64 * 1024 * 1024,
         )
 
@@ -139,29 +140,17 @@ def main():
     print()
 
     bench_modes = ["prefill", "decode"]
-    page_size_config = [64, 128, 256]
+    page_size_config = [1]
     max_num_batched_tokens_config_for_decode = [
-        1,
-        2,
         4,
-        8,
-        16,
-        32,
-        64,
-        128,
-        256,
     ]
     max_num_batched_tokens_config_for_prefill = [
-        512,
-        1024,
-        2048,
         4096,
-        8192,
     ]
-    q_head_num_config = [2, 4, 8, 16, 32, 64]
-    kv_head_num_config = [2, 4, 8, 16, 32, 64]
-    head_dim_config = [128]
-    max_kv_cache_tokens_config = [600000]
+    q_head_num_config = [4, 8]
+    kv_head_num_config = [4, 8]
+    head_dim_config = [128, 256]
+    max_kv_cache_tokens_config = [40000]
     all_combinations = []
     config_of_modes = {}
     max_context_len = 40960
@@ -209,6 +198,7 @@ def main():
             print(
                 f"Config: q_head_num={q_head_num}, kv_head_num={kv_head_num}, head_dim={head_dim=}, page_size={page_size}, max_num_batched_tokens={max_num_batched_tokens}"
             )
+            # jax.profiler.start_trace(log_dir="/tmp/profiling")
             try:
                 flash_time = benchmark_backend(
                     mode,

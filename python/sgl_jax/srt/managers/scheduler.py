@@ -49,8 +49,9 @@ from sgl_jax.srt.managers.scheduler_profiler_mixing import SchedulerProfilerMixi
 from sgl_jax.srt.managers.tp_worker import ModelWorker
 from sgl_jax.srt.managers.tp_worker_overlap_thread import ModelWorkerClient
 from sgl_jax.srt.managers.utils import validate_input_length
-from sgl_jax.srt.mem_cache.chunk_cache import ChunkCache
+from sgl_jax.srt.mem_cache.chunk_cache import ChunkCache, SWAChunkCache
 from sgl_jax.srt.mem_cache.radix_cache import RadixCache
+from sgl_jax.srt.mem_cache.swa_radix_cache import SWARadixCache
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
 from sgl_jax.srt.precision_tracer import precision_tracer
 from sgl_jax.srt.server_args import PortArgs, ServerArgs
@@ -218,6 +219,13 @@ class Scheduler(
         global_server_args_dict.update(worker_global_server_args_dict)
         set_random_seed(self.random_seed)
 
+        self.is_hybrid = self.tp_worker.is_hybrid
+        if self.is_hybrid:
+            self.sliding_window_size = self.tp_worker.sliding_window_size
+            self.full_tokens_per_layer, self.swa_tokens_per_layer = (
+                self.tp_worker.get_tokens_per_layer_info()
+            )
+
         # Init memory pool and cache
         self.init_memory_pool_and_cache()
 
@@ -289,8 +297,8 @@ class Scheduler(
             ]
         )
 
-        if not server_args.disable_jax_precompile:
-            logger.info("[Scheduler] Begins to run worker precompile.")
+        if not server_args.disable_precompile:
+            logger.info(f"[Scheduler] Begins to run worker precompile.")
             self.tp_worker.run_precompile()
             logger.info("[Scheduler] Completes worker precompile.")
 
@@ -365,10 +373,26 @@ class Scheduler(
         server_args = self.server_args
         self.req_to_token_pool, self.token_to_kv_pool_allocator = self.tp_worker.get_memory_pool()
 
-        if server_args.chunked_prefill_size is not None and server_args.disable_radix_cache:
-            self.tree_cache = ChunkCache(
+        if (
+            server_args.chunked_prefill_size is not None
+            and server_args.disable_radix_cache
+        ):
+            if self.is_hybrid:
+                ChunkCacheClass = SWAChunkCache
+            else:
+                ChunkCacheClass = ChunkCache
+            self.tree_cache = ChunkCacheClass(
                 req_to_token_pool=self.req_to_token_pool,
                 token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                page_size=self.page_size,
+            )
+        elif self.is_hybrid:
+            self.tree_cache = SWARadixCache(
+                req_to_token_pool=self.req_to_token_pool,
+                token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                sliding_window_size=self.sliding_window_size,
+                page_size=self.page_size,
+                disable=server_args.disable_radix_cache,
             )
         else:
             self.tree_cache = RadixCache(
@@ -648,10 +672,27 @@ class Scheduler(
         self.waiting_queue.extend(reqs)
 
     def check_memory(self):
-        _, _, available_size, evictable_size = self._get_token_info()
-        protected_size = self.tree_cache.protected_size()
-        memory_leak = (available_size + evictable_size) != self.max_total_num_tokens
-        token_msg = f"{self.max_total_num_tokens=}, {available_size=}, {evictable_size=}, {protected_size=}\n"
+        if self.is_hybrid:
+            (
+                full_num_used,
+                swa_num_used,
+                _,
+                _,
+                full_available_size,
+                full_evictable_size,
+                swa_available_size,
+                swa_evictable_size,
+            ) = self._get_swa_token_info()
+            memory_leak = full_num_used != 0 or swa_num_used != 0
+            token_msg = (
+                f"{self.full_tokens_per_layer=}, {full_available_size=}, {full_evictable_size=}, {self.tree_cache.full_protected_size()=}\n"
+                f"{self.swa_tokens_per_layer=}, {swa_available_size=}, {swa_evictable_size=}, {self.tree_cache.swa_protected_size()=}\n"
+            )
+        else:
+            _, _, available_size, evictable_size = self._get_token_info()
+            protected_size = self.tree_cache.protected_size()
+            memory_leak = (available_size + evictable_size) != self.max_total_num_tokens
+            token_msg = f"{self.max_total_num_tokens=}, {available_size=}, {evictable_size=}, {protected_size=}\n"
 
         if memory_leak:
             msg = f"token_to_kv_pool_allocator memory leak detected! {token_msg}"
@@ -668,7 +709,8 @@ class Scheduler(
             raise ValueError(msg)
 
     def check_tree_cache(self):
-        pass
+        if self.is_hybrid and isinstance(self.tree_cache, SWARadixCache):
+            self.tree_cache.sanity_check()
 
     def _get_token_info(self):
         available_size = self.token_to_kv_pool_allocator.available_size()
@@ -676,6 +718,30 @@ class Scheduler(
         num_used = self.max_total_num_tokens - (available_size + evictable_size)
         token_usage = num_used / self.max_total_num_tokens
         return num_used, token_usage, available_size, evictable_size
+
+    def _get_swa_token_info(self):
+        full_available_size = self.token_to_kv_pool_allocator.full_available_size()
+        full_evictable_size = self.tree_cache.full_evictable_size()
+        swa_available_size = self.token_to_kv_pool_allocator.swa_available_size()
+        swa_evictable_size = self.tree_cache.swa_evictable_size()
+        full_num_used = self.full_tokens_per_layer - (
+            full_available_size + full_evictable_size
+        )
+        # swa_num_used = self.swa_tokens_per_layer - (
+        #     swa_available_size + swa_evictable_size
+        # )
+        full_token_usage = full_num_used / self.full_tokens_per_layer
+        # swa_token_usage = swa_num_used / self.swa_tokens_per_layer
+        return (
+            full_num_used,
+            0,  # swa_num_used,
+            full_token_usage,
+            0,  # swa_token_usage,
+            full_available_size,
+            full_evictable_size,
+            swa_available_size,
+            swa_evictable_size,
+        )
 
     def get_next_batch_to_run(self) -> ScheduleBatch | None:
         chunked_req_to_exclude = set()

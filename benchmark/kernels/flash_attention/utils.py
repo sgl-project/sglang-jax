@@ -11,7 +11,7 @@ def create_kv_cache_data(
     keys = jax.random.split(key, 3)
     total_num_pages = cdiv(max_kv_cache_tokens, page_size)
     kv_cache = jax.random.normal(
-        keys[1], (total_num_pages, page_size, head_num * 2, head_dim), dtype=dtype
+        keys[1], (total_num_pages * page_size, head_num * 2, head_dim), dtype=dtype
     )
     return kv_cache
 
