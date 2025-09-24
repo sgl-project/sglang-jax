@@ -29,10 +29,14 @@ from jax._src import mesh as mesh_lib
 
 from sgl_jax.global_config import global_config
 from sgl_jax.srt.configs.model_config import ModelConfig
-from sgl_jax.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+from sgl_jax.srt.mem_cache.allocator import (
+    BaseTokenToKVPoolAllocator,
+    SWATokenToKVPoolAllocator,
+)
 from sgl_jax.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sgl_jax.srt.mem_cache.chunk_cache import ChunkCache
 from sgl_jax.srt.mem_cache.memory_pool import ReqToTokenPool
+from sgl_jax.srt.mem_cache.swa_radix_cache import SWARadixCache
 from sgl_jax.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
 from sgl_jax.srt.precision_tracer import (
     PrecisionTracerRequestMetadata,
@@ -192,6 +196,8 @@ class Req:
         self.extend_logprob_start_len = 0
         self.last_node: Any = None
         self.last_host_node: Any = None
+        # The node to lock until for swa radix tree lock ref
+        self.swa_uuid_for_lock: int | None = None
 
         # Whether or not if it is chunked. It increments whenever
         # it is chunked, and decrement whenever chunked request is
@@ -388,6 +394,7 @@ class Req:
     def reset_for_retract(self):
         self.prefix_indices = []
         self.last_node = None
+        self.swa_uuid_for_lock = None
         self.extend_input_len = 0
         self.is_retracted = True
         self.input_token_logprobs = None
@@ -425,6 +432,7 @@ class ScheduleBatch:
     req_to_token_pool: ReqToTokenPool = None
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator = None
     tree_cache: BasePrefixCache = None
+    is_hybrid: bool = False
 
     # Batch configs
     model_config: ModelConfig = None
@@ -502,11 +510,19 @@ class ScheduleBatch:
     ):
         return_logprob = any(req.return_logprob for req in reqs)
 
+        is_hybrid = False
+        if isinstance(token_to_kv_pool_allocator, SWATokenToKVPoolAllocator):
+            assert tree_cache is None or isinstance(
+                tree_cache, (SWARadixCache, ChunkCache)
+            ), "SWARadixCache or ChunkCache is required for SWATokenToKVPoolAllocator"
+            is_hybrid = True
+
         return cls(
             reqs=reqs,
             req_to_token_pool=req_to_token_pool,
             token_to_kv_pool_allocator=token_to_kv_pool_allocator,
             tree_cache=tree_cache,
+            is_hybrid=is_hybrid,
             model_config=model_config,
             return_logprob=return_logprob,
             enable_overlap=enable_overlap,
@@ -810,53 +826,28 @@ class ScheduleBatch:
             reverse=True,
         )
 
-        def get_required_tokens(num_reqs: int):
-            return num_reqs * global_config.retract_decode_steps
-
-        def _get_available_size():
-            return self.token_to_kv_pool_allocator.available_size()
-
         retracted_reqs = []
-        seq_lens_cpu = self.seq_lens
         first_iter = True
         while (not self.check_decode_mem(selected_indices=sorted_indices)) or first_iter:
             if len(sorted_indices) == 1:
                 # Corner case: only one request left
-                assert (
-                    self.token_to_kv_pool_allocator.available_size() > 0
-                ), f"No space left for only one request, {self.token_to_kv_pool_allocator.available_size()=}"
+                if self.is_hybrid:
+                    full_available_size = self.token_to_kv_pool_allocator.full_available_size()
+                    swa_available_size = self.token_to_kv_pool_allocator.swa_available_size()
+                    assert (
+                        full_available_size > 0 and swa_available_size > 0
+                    ), f"No space left for only one request in SWA mode {full_available_size=}, {swa_available_size=}"
+                else:
+                    assert (
+                        self.token_to_kv_pool_allocator.available_size() > 0
+                    ), f"No space left for only one request, {self.token_to_kv_pool_allocator.available_size()=}"
                 break
 
             first_iter = False
             idx = sorted_indices.pop()
             req = self.reqs[idx]
             retracted_reqs.append(req)
-
-            if isinstance(self.tree_cache, ChunkCache):
-                # ChunkCache does not have eviction
-                token_indices = self.req_to_token_pool.req_to_token[
-                    req.req_pool_idx, : seq_lens_cpu[idx]
-                ]
-                self.token_to_kv_pool_allocator.free(token_indices)
-                self.req_to_token_pool.free(req.req_pool_idx)
-            else:
-                last_uncached_pos = (
-                    len(req.prefix_indices) // server_args.page_size
-                ) * server_args.page_size
-                token_indices = self.req_to_token_pool.req_to_token[
-                    req.req_pool_idx, last_uncached_pos : seq_lens_cpu[idx]
-                ]
-                self.token_to_kv_pool_allocator.free(token_indices)
-                self.req_to_token_pool.free(req.req_pool_idx)
-
-                # release the last node
-                self.tree_cache.dec_lock_ref(req.last_node)
-
-                # NOTE: we should use the newly evictable memory instantly.
-                num_tokens = len(sorted_indices) * global_config.retract_decode_steps
-                self._evict_tree_cache_if_needed(num_tokens)
-
-            req.reset_for_retract()
+            self.release_req(idx, len(sorted_indices), server_args)
 
             if len(retracted_reqs) == 0:
                 # Corner case: only one request left
@@ -876,6 +867,38 @@ class ScheduleBatch:
         new_estimate_ratio = min(1.0, new_estimate_ratio)
 
         return retracted_reqs, new_estimate_ratio
+
+    def release_req(self, idx: int, remaing_req_count: int, server_args: ServerArgs):
+        req = self.reqs[idx]
+        seq_lens_cpu = self.seq_lens
+
+        if isinstance(self.tree_cache, ChunkCache):
+            # ChunkCache does not have eviction
+            token_indices = self.req_to_token_pool.req_to_token[
+                req.req_pool_idx, : seq_lens_cpu[idx]
+            ]
+            self.token_to_kv_pool_allocator.free(token_indices)
+            self.req_to_token_pool.free(req.req_pool_idx)
+        else:
+            last_uncached_pos = (
+                len(req.prefix_indices) // server_args.page_size
+            ) * server_args.page_size
+            token_indices = self.req_to_token_pool.req_to_token[
+                req.req_pool_idx, last_uncached_pos : seq_lens_cpu[idx]
+            ]
+            self.token_to_kv_pool_allocator.free(token_indices)
+            self.req_to_token_pool.free(req.req_pool_idx)
+
+            # release the last node
+            if self.is_hybrid:
+                self.tree_cache.dec_lock_ref(req.last_node, req.swa_uuid_for_lock)
+            else:
+                self.tree_cache.dec_lock_ref(req.last_node)
+
+            num_tokens = remaing_req_count * global_config.retract_decode_steps
+            self._evict_tree_cache_if_needed(num_tokens)
+
+        req.reset_for_retract()
 
     def prepare_for_idle(self):
         self.forward_mode = ForwardMode.IDLE
@@ -1266,19 +1289,48 @@ class ScheduleBatch:
         if isinstance(self.tree_cache, ChunkCache):
             return
 
-        if (
-            self.token_to_kv_pool_allocator.available_size() < num_tokens
-            and self.tree_cache is not None
-        ):
-            self.tree_cache.evict(num_tokens)
+        if self.is_hybrid:
+            full_available_size = self.token_to_kv_pool_allocator.full_available_size()
+            swa_available_size = self.token_to_kv_pool_allocator.swa_available_size()
+
+            if (
+                full_available_size < num_tokens or swa_available_size < num_tokens
+            ) and self.tree_cache is not None:
+                full_num_tokens = max(0, num_tokens - full_available_size)
+                swa_num_tokens = max(0, num_tokens - swa_available_size)
+                self.tree_cache.evict(full_num_tokens, swa_num_tokens)
+        else:
+            if (
+                self.token_to_kv_pool_allocator.available_size() < num_tokens
+                and self.tree_cache is not None
+            ):
+                self.tree_cache.evict(num_tokens)
 
     def _is_available_size_sufficient(self, num_tokens: int) -> bool:
-        return self.token_to_kv_pool_allocator.available_size() >= num_tokens
+        if self.is_hybrid:
+            return (
+                self.token_to_kv_pool_allocator.full_available_size() >= num_tokens
+                and self.token_to_kv_pool_allocator.swa_available_size() >= num_tokens
+            )
+        else:
+            return self.token_to_kv_pool_allocator.available_size() >= num_tokens
 
     def _available_and_evictable_str(self) -> str:
-        available_size = self.token_to_kv_pool_allocator.available_size()
-        evictable_size = self.tree_cache.evictable_size()
-        return f"Available tokens: {available_size + evictable_size} ({available_size=} + {evictable_size=})\n"
+        if self.is_hybrid:
+            full_available_size = self.token_to_kv_pool_allocator.full_available_size()
+            swa_available_size = self.token_to_kv_pool_allocator.swa_available_size()
+            full_evictable_size = self.tree_cache.full_evictable_size()
+            swa_evictable_size = self.tree_cache.swa_evictable_size()
+            return (
+                f"Available full tokens: {full_available_size + full_evictable_size} ({full_available_size=} + {full_evictable_size=})\n"
+                f"Available swa tokens: {swa_available_size + swa_evictable_size} ({swa_available_size=} + {swa_evictable_size=})\n"
+                f"Full LRU list evictable size: {self.tree_cache.full_lru_list_evictable_size()}\n"
+                f"SWA LRU list evictable size: {self.tree_cache.swa_lru_list_evictable_size()}\n"
+            )
+        else:
+            available_size = self.token_to_kv_pool_allocator.available_size()
+            evictable_size = self.tree_cache.evictable_size()
+            return f"Available tokens: {available_size + evictable_size} ({available_size=} + {evictable_size=})\n"
 
 
 def align_to_size(lst: list, size: int, value: int = 0) -> list:
