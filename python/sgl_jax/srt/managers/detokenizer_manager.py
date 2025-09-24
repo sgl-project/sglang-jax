@@ -4,6 +4,7 @@ import dataclasses
 import logging
 import os
 import signal
+import threading
 from collections import OrderedDict
 from typing import Dict, List, Optional, Union
 
@@ -330,3 +331,21 @@ def run_detokenizer_process(
         traceback = get_exception_traceback()
         logger.error(f"DetokenizerManager hit an exception: {traceback}")
         parent_process.send_signal(signal.SIGQUIT)
+
+
+def run_detokenizer_thread(
+    server_args: ServerArgs,
+    port_args: PortArgs,
+):
+    current_thread = threading.current_thread()
+    current_thread.name = "sglang-jax::detokenizer"
+    configure_logger(server_args)
+    current_process = psutil.Process()
+
+    try:
+        manager = DetokenizerManager(server_args, port_args)
+        manager.event_loop()
+    except Exception:
+        traceback = get_exception_traceback()
+        logger.error(f"DetokenizerManager hit an exception: {traceback}")
+        current_process.send_signal(signal.SIGQUIT)
