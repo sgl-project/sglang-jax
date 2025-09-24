@@ -87,6 +87,7 @@ class FlashAttention(AttentionBackend):
         self.page_size = page_size
         self.kv_partition_axis = kv_partition_axis
         self.forward_metadata = FlashAttentionMetadata()
+        self.xai_temperature_len = None
 
     def get_forward_metadata(self, batch: ModelWorkerBatch, mesh: Mesh):
         """Return the metadata for a forward pass."""
@@ -162,6 +163,7 @@ class FlashAttention(AttentionBackend):
             "vmem_limit_bytes": self.vmem_limit_bytes,
             "head_dim": self.head_dim,
             "page_size": self.page_size,
+            "xai_temperature_len": self.xai_temperature_len,
         }
         return (children, aux_data)
 
@@ -173,6 +175,7 @@ class FlashAttention(AttentionBackend):
             aux_data["head_dim"],
             aux_data["vmem_limit_bytes"],
             aux_data["page_size"],
+            aux_data["xai_temperature_len"],
         )
 
         obj.forward_metadata = children[0]
