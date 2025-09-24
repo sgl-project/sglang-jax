@@ -191,6 +191,7 @@ class FlashAttention(AttentionBackend):
         forward_batch: ForwardBatch,
         attention_mask: jax.Array = None,
         kv_partition_axis: str = "tensor",
+        # **kwargs
     ):
         """
         Args:
@@ -227,7 +228,9 @@ class FlashAttention(AttentionBackend):
             P(),  # cu_q_lens
             P(),  # cu_kv_lens
             P(),  # distribution
+            # P(),  # xai_temperature_len
         )
+        print("in_specs", in_specs)
         out_specs = (
             P(None, self.kv_partition_axis),  # attention output
             P(
@@ -238,6 +241,7 @@ class FlashAttention(AttentionBackend):
         def _ragged_paged_attention_with_fused_kv(*args):
             queries, keys, values, kv_cache_fused = args[:4]
             other_args = args[4:]
+            print('xai_temperature_len flash-attn cls', self.xai_temperature_len, self)
 
             # Call fused KV kernel with head interleaving
             result, updated_kv_cache_fused = ragged_paged_attention(
@@ -250,6 +254,7 @@ class FlashAttention(AttentionBackend):
                 sliding_window=None,
                 soft_cap=None,
                 vmem_limit_bytes=self.vmem_limit_bytes,
+                # xai_temperature_len=self.xai_temperature_len,
             )
 
             return result, updated_kv_cache_fused

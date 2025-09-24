@@ -134,6 +134,7 @@ def create_test_data(
 ):
     """Create a real ForwardBatch for testing."""
     assert mode in ["prefill", "decode"]
+    print("model_config", model_config)
     batch_size = len(lens)
     # Create sequence lengths array
     seq_lens = jnp.array([kv_len for _, kv_len in lens], dtype=jnp.int32)
@@ -233,7 +234,12 @@ def create_test_data(
     )
     if model_config.get("xai_temperature_len", None):
         attention_backend.xai_temperature_len = model_config["xai_temperature_len"]
-    print('mdl cfg.get', model_config.get("xai_temperature_len", None), attention_backend, type(attention_backend))
+    print(
+        "mdl cfg.get",
+        model_config.get("xai_temperature_len", None),
+        attention_backend,
+        type(attention_backend),
+    )
     forward_mode = ForwardMode.EXTEND if mode == "prefill" else ForwardMode.DECODE
 
     mwb = ModelWorkerBatch(
@@ -379,17 +385,19 @@ class TestAttention(CustomTestCase):
             # forward_batch.attn_backend.forward_metadata.cu_kv_lens,
             forward_batch.attn_backend.forward_metadata.num_seqs,
             sm_scale=head_dim**-0.5,
-            **mode_kwargs
+            **mode_kwargs,
         )
         jax.block_until_ready(expected)
 
         @jax.jit
         def jit_attn(q, k, v, forward_batch):
-            out = attn(q, k, v, forward_batch)
+            out = attn(q, k, v, forward_batch)#, **mode_kwargs)
             return out
 
         if mode_kwargs.get("xai_temperature_len", None):
-            forward_batch.attn_backend.xai_temperature_len = mode_kwargs.get("xai_temperature_len")
+            forward_batch.attn_backend.xai_temperature_len = mode_kwargs.get(
+                "xai_temperature_len"
+            )
 
         # run
         jax_output, _ = jit_attn(q_shard, extend_k, extend_v, forward_batch)
@@ -461,6 +469,7 @@ class TestAttention(CustomTestCase):
         head_dim = 128
         lens = [
             (1, 128),
+            # q len, kv len
             (125, 125),
             (1024, 1024),
             (123, 522),

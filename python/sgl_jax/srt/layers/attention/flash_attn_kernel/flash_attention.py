@@ -88,7 +88,8 @@ def ref_ragged_paged_attention_fused(
 
         # xai_temperature_scale: ref implementation from sgl-project/sglang
         # python/sglang/srt/layers/attention/triton_ops/decode_attention.py
-        if xai_temperature_len > 0:
+        if xai_temperature_len is not None:
+            # xai_temperature_scale = 1.0 / jnp.log2(jnp.array(xai_temperature_len, float))
             xai_temperature_scale = 1.0 / jnp.log2(float(xai_temperature_len))
             qidx = jnp.arange(q_start, q_end) - 1
             _qtemp = jnp.log2(qidx.astype(jnp.float32)) * xai_temperature_scale
@@ -118,7 +119,7 @@ def ref_ragged_paged_attention(
     mask_value: float | None = DEFAULT_MASK_VALUE,
     k_scale: float | None = None,
     v_scale: float | None = None,
-    xai_temperature_len: float = -1.0,
+    xai_temperature_len: float | None = 3,#None,
 ):
     if mask_value is None:
         mask_value = DEFAULT_MASK_VALUE
@@ -156,7 +157,8 @@ def ref_ragged_paged_attention(
 
         # xai_temperature_scale: ref implementation from sgl-project/sglang
         # python/sglang/srt/layers/attention/triton_ops/decode_attention.py
-        if xai_temperature_len > 0:
+        if xai_temperature_len is not None:
+            # xai_temperature_scale = 1.0 / jnp.log2(jnp.array(xai_temperature_len, float))
             xai_temperature_scale = 1.0 / jnp.log2(float(xai_temperature_len))
             qidx = jnp.arange(q_start, q_end) - 1
             _qtemp = jnp.log2(qidx.astype(jnp.float32)) * xai_temperature_scale
@@ -280,7 +282,7 @@ def _ragged_paged_attention_kernel(
     q_scale: float | None = None,
     k_scale: float | None = None,
     v_scale: float | None = None,
-    xai_temperature_len: float = -1,
+    xai_temperature_len: float | None = 3,#None,
     chunk_prefill_size: int | None = None,
     bkv_p,
     bq_sz,
@@ -686,11 +688,12 @@ def _ragged_paged_attention_kernel(
                         q_heads.append(bq)
                     q_batch = jnp.stack(q_heads, axis=0)
 
-                    if xai_temperature_len > 0:
+                    if xai_temperature_len is not None:
                         import numpy as np
 
                         q_len_start = cu_q_lens_ref[seq_idx] + bq_idx * bq_sz
                         q_batch_shape = q_batch.shape
+                        print('bq_sz', bq_sz, 'actual_bq_sz', actual_bq_sz)
                         base = (q_len_start - 1) + lax.iota(jnp.int32, q_batch_shape[1])
                         offs_qidx = jnp.tile(base, (q_batch_shape[0], 1))
                         return q_batch, offs_qidx
@@ -699,6 +702,8 @@ def _ragged_paged_attention_kernel(
                 # Load batched data
                 k_batch, v_batch = batch_load_all_heads_kv()
                 q_batch, offs_qidx_batch = batch_prepare_queries()
+                print('q_batch.shape', q_batch.shape, xai_temperature_len)
+                print('offs_qidx_batch.shape', offs_qidx_batch.shape)
 
                 def flash_attention(q_batch, k_batch, v_batch):
                     q_batch_f32 = q_batch.astype(jnp.float32)
@@ -743,17 +748,11 @@ def _ragged_paged_attention_kernel(
 
                     # xai_temperature_scale: ref implementation from sgl-project/sglang
                     # python/sglang/srt/layers/attention/triton_ops/decode_attention.py
-                    if xai_temperature_len > 0:
-                        xai_temperature_scale = 1.0 / jnp.log2(
-                            float(xai_temperature_len)
-                        )
-                        _qtemp = (
-                            jnp.log2(offs_qidx_batch.astype(jnp.float32))
-                            * xai_temperature_scale
-                        )
-                        xai_temperature_reg = jnp.where(
-                            offs_qidx_batch > xai_temperature_len, _qtemp, 1.0
-                        )
+                    if xai_temperature_len is not None:
+                        # xai_temperature_scale = 1.0 / jnp.log2(jnp.array(xai_temperature_len, float))
+                        xai_temperature_scale = 1.0 / jnp.log2(float(xai_temperature_len))
+                        _qtemp = jnp.log2(offs_qidx_batch.astype(jnp.float32)) * xai_temperature_scale
+                        xai_temperature_reg = jnp.where(offs_qidx_batch > xai_temperature_len, _qtemp, 1.0)
 
                         s = s * xai_temperature_reg[:, :, None]
 
@@ -1010,6 +1009,7 @@ def static_validate_inputs_fused(
     soft_cap: float | None = None,
     mask_value: float | None = DEFAULT_MASK_VALUE,
     q_scale: float | None = None,
+    # TODO: temp
     k_scale: float | None = None,
     v_scale: float | None = None,
     # Kernel optimization params.
@@ -1160,7 +1160,7 @@ def ragged_paged_attention(
     q_scale: float | None = None,
     k_scale: float | None = None,
     v_scale: float | None = None,
-    xai_temperature_len: float = -1,
+    xai_temperature_len: float | None = None,
     # Kernel optimization params.
     chunk_prefill_size: int | None = None,
     # Kernel tuning params.
