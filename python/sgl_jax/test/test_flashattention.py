@@ -458,7 +458,6 @@ class TestAttention(CustomTestCase):
         head_dim = 128
         lens = [
             (1, 128),
-            # q len, kv len
             (125, 125),
             (1024, 1024),
             (123, 522),

@@ -1194,6 +1194,8 @@ def ragged_paged_attention(
       mask_value: mask value for causal mask.
       k_scale: the scale for the key cache.
       v_scale: the scale for the value cache.
+      xai_temperature_len: the length-based temperature term used by xai grok.
+        reference: sgl-project/sglang: python/sglang/srt/layers/attention/triton_ops/decode_attention.py
       num_kv_pages_per_block: number of kv pages to be processed in one flash
         attention block in the pallas kernel.
       num_queries_per_block: number of kv pages to be processed in one flash

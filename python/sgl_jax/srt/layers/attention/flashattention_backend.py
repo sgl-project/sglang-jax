@@ -191,7 +191,6 @@ class FlashAttention(AttentionBackend):
         forward_batch: ForwardBatch,
         attention_mask: jax.Array = None,
         kv_partition_axis: str = "tensor",
-        # **kwargs
     ):
         """
         Args:
