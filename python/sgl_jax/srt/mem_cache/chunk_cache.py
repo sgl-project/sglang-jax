@@ -4,7 +4,10 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
-from sgl_jax.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+from sgl_jax.srt.mem_cache.allocator import (
+    BaseTokenToKVPoolAllocator,
+    SWATokenToKVPoolAllocator,
+)
 from sgl_jax.srt.mem_cache.base_prefix_cache import BasePrefixCache, MatchResult
 from sgl_jax.srt.mem_cache.memory_pool import ReqToTokenPool
 
@@ -17,9 +20,11 @@ class ChunkCache(BasePrefixCache):
         self,
         req_to_token_pool: ReqToTokenPool,
         token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
+        page_size: int,
     ):
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
+        self.page_size = page_size
 
     def reset(self):
         pass
@@ -56,3 +61,35 @@ class ChunkCache(BasePrefixCache):
 
     def pretty_print(self):
         return ""
+
+
+class SWAChunkCache(ChunkCache):
+    """ChunkCache with support for hybrid KV cache operations."""
+
+    def __init__(
+        self,
+        req_to_token_pool: ReqToTokenPool,
+        token_to_kv_pool_allocator: SWATokenToKVPoolAllocator,
+        page_size: int,
+    ):
+        super().__init__(req_to_token_pool, token_to_kv_pool_allocator, page_size)
+        assert isinstance(token_to_kv_pool_allocator, SWATokenToKVPoolAllocator)
+
+    def evict_swa(
+        self,
+        req: Req,
+        prelen: int,
+        attention_chunk_size: int,
+    ):
+        if prelen >= req.evicted_seqlen_local + attention_chunk_size:
+            new_evicted_seqlen_local = attention_chunk_size * (
+                prelen // attention_chunk_size
+            )
+            free_slots = self.req_to_token_pool.req_to_token[
+                req.req_pool_idx, req.evicted_seqlen_local : new_evicted_seqlen_local
+            ]
+            self.token_to_kv_pool_allocator.free_swa(free_slots)
+            req.evicted_seqlen_local = new_evicted_seqlen_local
+
+    def evict(self, num_tokens: int):
+        pass

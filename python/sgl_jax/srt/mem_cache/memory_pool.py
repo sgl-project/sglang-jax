@@ -186,6 +186,25 @@ class KVCache(abc.ABC):
     ) -> None:
         raise NotImplementedError()
 
+    @abc.abstractmethod
+    def replace_kv_buffer(self, kv_buffer: list[jnp.ndarray]) -> None:
+        """Replace the internal KV buffer with a new one.
+
+        This method is essential for JAX jit compatibility since JAX functions
+        are pure and cannot perform in-place mutations. After running forward
+        passes that update KV cache through functional operations (like .at[].set()),
+        we need to replace the original buffer references with the updated ones
+        returned from the jitted computation.
+
+        Args:
+            kv_buffer: The updated KV buffer returned from jitted forward pass
+
+        Note:
+            This enables the functional programming paradigm required by JAX
+            while maintaining the illusion of in-place updates for the user API.
+        """
+        raise NotImplementedError()
+
     def get_kv_size_bytes(self):
         """Calculate KV cache size in bytes"""
         raise NotImplementedError()
@@ -394,6 +413,9 @@ class MHATokenToKVPool(KVCache):
         v_data = fused_kv_data[:, 1::2, :]  # Head interleaving: V at odd indices
         return k_data, v_data
 
+    def replace_kv_buffer(self, fused_kv_buffer: list[jnp.ndarray]) -> None:
+        self.kv_buffer[self.start_layer : self.start_layer + len(fused_kv_buffer)] = fused_kv_buffer
+
     def get_cpu_copy(self, indices):
         """Get CPU copy of fused KV cache for specified indices"""
         kv_cache_host = []
@@ -446,6 +468,129 @@ class MHATokenToKVPool(KVCache):
         # for jax function
         updated_layer = self.kv_buffer[layer_idx].at[safe_loc].set(fused_kv, mode="drop")
         return updated_layer
+
+
+@register_pytree_node_class
+class SWAKVPool(KVCache):
+    """KV cache with separate pools for full and SWA attention layers."""
+
+    def __init__(
+        self,
+        size: int,
+        size_swa: int,
+        swa_attention_layer_ids: list[int],
+        full_attention_layer_ids: list[int],
+        token_to_kv_pool_class: KVCache = MHATokenToKVPool,
+        **kwargs,
+    ):
+        self.size = size
+        self.size_swa = size_swa
+        self.swa_layer_nums = len(swa_attention_layer_ids)
+        self.full_layer_nums = len(full_attention_layer_ids)
+        kwargs["page_size"] = 1
+
+        self.swa_kv_pool = token_to_kv_pool_class(
+            size=size_swa,
+            layer_num=self.swa_layer_nums,
+            **kwargs,
+        )
+        self.full_kv_pool = token_to_kv_pool_class(
+            size=size,
+            layer_num=self.full_layer_nums,
+            **kwargs,
+        )
+
+        self.layers_mapping: dict[int, tuple[int, bool]] = {}
+        for full_attn_layer_id, global_layer_id in enumerate(full_attention_layer_ids):
+            self.layers_mapping[global_layer_id] = (full_attn_layer_id, False)
+        for swa_layer_id, global_layer_id in enumerate(swa_attention_layer_ids):
+            self.layers_mapping[global_layer_id] = (swa_layer_id, True)
+
+        self.full_to_swa_index_mapping: np.array | None = None
+
+        k_size, v_size = self.get_kv_size_bytes()
+        self.mem_usage = (k_size + v_size) / GB
+
+    def tree_flatten(self):
+        children = (
+            self.swa_kv_pool,
+            self.full_kv_pool,
+            self.full_to_swa_index_mapping,
+        )
+        aux_data = {
+            "size": self.size,
+            "size_swa": self.size_swa,
+            "swa_layer_nums": self.swa_layer_nums,
+            "full_layer_nums": self.full_layer_nums,
+            "layers_mapping": self.layers_mapping,
+            "mem_usage": self.mem_usage,
+        }
+        return (children, aux_data)
+
+    @classmethod
+    def tree_unflatten(cls, aux_data, children):
+        obj = object.__new__(cls)
+
+        obj.size = aux_data["size"]
+        obj.size_swa = aux_data["size_swa"]
+        obj.swa_layer_nums = aux_data["swa_layer_nums"]
+        obj.full_layer_nums = aux_data["full_layer_nums"]
+        obj.layers_mapping = aux_data["layers_mapping"]
+        obj.mem_usage = aux_data["mem_usage"]
+
+        obj.swa_kv_pool = children[0]
+        obj.full_kv_pool = children[1]
+        obj.full_to_swa_index_mapping = children[2]
+
+        return obj
+
+    def get_kv_size_bytes(self):
+        k_size, v_size = self.full_kv_pool.get_kv_size_bytes()
+        k_size_swa, v_size_swa = self.swa_kv_pool.get_kv_size_bytes()
+        return k_size + k_size_swa, v_size + v_size_swa
+
+    def get_kv_buffer(self, layer_id: int):
+        layer_id_pool, is_swa = self.layers_mapping[layer_id]
+        if is_swa:
+            return self.swa_kv_pool.get_kv_buffer(layer_id_pool)
+        return self.full_kv_pool.get_kv_buffer(layer_id_pool)
+
+    def get_fused_kv_buffer(self, layer_id):
+        layer_id_pool, is_swa = self.layers_mapping[layer_id]
+        if is_swa:
+            return self.swa_kv_pool.get_fused_kv_buffer(layer_id_pool)
+        return self.full_kv_pool.get_fused_kv_buffer(layer_id_pool)
+
+    def set_kv_buffer(
+        self,
+        layer_id: int,
+        loc: jnp.ndarray,
+        cache_k: jnp.ndarray,
+        cache_v: jnp.ndarray,
+        is_decode: bool = False,
+    ):
+        layer_id_pool, is_swa = self.layers_mapping[layer_id]
+        if is_swa:
+            if self.full_to_swa_index_mapping is not None:
+                loc = self.full_to_swa_index_mapping[loc].to(np.int32)
+            self.full_kv_pool.set_kv_buffer(layer_id_pool, loc, cache_k, cache_v, is_decode)
+        else:
+            self.full_kv_pool.set_kv_buffer(layer_id_pool, loc, cache_k, cache_v, is_decode)
+
+    def replace_kv_buffer(self, kv_buffer: list[jnp.ndarray]):
+        assert len(kv_buffer) == len(self.layers_mapping)
+
+        full_kv_buffer = []
+        swa_kv_buffer = []
+        for layer_id, layer_kv_buffer in enumerate(kv_buffer):
+            _, is_swa = self.layers_mapping[layer_id]
+            if is_swa:
+                swa_kv_buffer.append(layer_kv_buffer)
+            else:
+                full_kv_buffer.append(layer_kv_buffer)
+
+        self.swa_kv_pool.replace_kv_buffer(swa_kv_buffer)
+        self.full_kv_pool.replace_kv_buffer(full_kv_buffer)
 
 
 def _set_fused_kv_buffer(
@@ -634,11 +779,11 @@ def kv_cache_update(
         # smaller or equal to page_size
 
         in_specs = [
-            pl.BlockSpec(memory_space=pltpu.TPUMemorySpace.ANY),
-            pl.BlockSpec(memory_space=pltpu.TPUMemorySpace.ANY),
+            pl.BlockSpec(memory_space=pltpu.MemorySpace.ANY),
+            pl.BlockSpec(memory_space=pltpu.MemorySpace.ANY),
         ]
 
-        out_specs = [pl.BlockSpec(memory_space=pltpu.TPUMemorySpace.ANY)]
+        out_specs = [pl.BlockSpec(memory_space=pltpu.MemorySpace.ANY)]
         out_shape = [jax.ShapeDtypeStruct(kv_cache.shape, dtype=kv_cache.dtype)]
 
         scalar_prefetches = [slices]
