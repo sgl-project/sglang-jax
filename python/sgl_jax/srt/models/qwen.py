@@ -303,7 +303,10 @@ class QWenLMHeadModel(nnx.Module):
         self.rng = nnx.Rngs(rng_key)
 
         loader = WeightLoader(
-            model=self, model_config=self.config, mesh=self.mesh, dtype=self.dtype
+            model=self,
+            model_config=self.config,
+            mesh=self.mesh,
+            dtype=self.dtype,
         )
 
         weight_mappings = self._create_qwen_weight_mappings()

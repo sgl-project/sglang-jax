@@ -1,9 +1,8 @@
 import abc
 import logging
-import os
 import time
 from functools import partial
-from typing import Dict, List, Optional, Tuple, Union
+from typing import List, Optional, Tuple, Union
 
 import jax
 import jax.numpy as jnp
@@ -281,27 +280,26 @@ class MHATokenToKVPool(KVCache):
             self.head_num * 2,  # [K0,V0,K1,V1,...]
             self.head_dim,
         )
+        total_memory_per_layer = (
+            fused_buffer_shape[0]
+            * fused_buffer_shape[1]
+            * fused_buffer_shape[2]
+            * jnp.dtype(self.dtype).itemsize
+        )
         logger.info(
-            f"Total fused KV cache memory per layer: {fused_buffer_shape[0] * fused_buffer_shape[1] * fused_buffer_shape[2] / 1024**3:.2f} GB, dtype: {self.dtype}"
+            f"Total fused KV cache memory per layer: {total_memory_per_layer / 1024**3:.2f} GB, dtype: {self.dtype}"
         )
         with self.mesh:
             self.kv_buffer = []
-
             for _ in range(self.layer_num):
-                tensor_size = self.mesh.shape.get(self.kv_partition_axis, 1)
+                kv_buf = jax.jit(
+                    lambda: jnp.zeros(
+                        shape=fused_buffer_shape,
+                        dtype=self.dtype,
+                    ),
+                    out_shardings=self.kv_sharding,
+                )()
 
-                def create_fused_kv_callback(index):
-                    local_shape = (
-                        fused_buffer_shape[0],
-                        fused_buffer_shape[1]
-                        // tensor_size,  # num_kv_heads * 2 sharded
-                        fused_buffer_shape[2],  # head_dim not sharded
-                    )
-                    return jnp.zeros(local_shape, dtype=self.dtype)
-
-                kv_buf = jax.make_array_from_callback(
-                    fused_buffer_shape, self.kv_sharding, create_fused_kv_callback
-                )
                 self.kv_buffer.append(kv_buf)
 
         end_time = time.time()

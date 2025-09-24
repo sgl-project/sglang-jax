@@ -107,6 +107,10 @@ class WeightLoader:
 
         expert_weights = {}
 
+        logger.info(
+            f"WeightLoader: Will load layers 0 to {self.model_config.num_hidden_layers - 1}"
+        )
+
         for hf_key, hf_weight in self._iterate_weights():
             if hf_key in regular_mappings:
                 mapping = regular_mappings[hf_key]
@@ -115,9 +119,15 @@ class WeightLoader:
 
                 self._process_and_assign_weight(params, hf_key, hf_weight, mapping)
             elif "mlp.experts." in hf_key and hf_key.endswith(".weight"):
-                expert_weights[hf_key] = hf_weight.astype(self.dtype)
+                if self._is_excluded_layer_weight(hf_key):
+                    logger.debug(f"Skipping excluded MoE expert weight: {hf_key}")
+                else:
+                    expert_weights[hf_key] = hf_weight.astype(self.dtype)
             else:
-                logger.warning(f"No mapping found for weight: {hf_key}")
+                if self._is_excluded_layer_weight(hf_key):
+                    logger.debug(f"Skipping excluded layer weight: {hf_key}")
+                else:
+                    logger.warning(f"No mapping found for weight: {hf_key}")
             nnx.update(self.model, params)
 
         if moe_mappings:
@@ -133,6 +143,7 @@ class WeightLoader:
 
         weights_files.sort()
 
+        skipped_files = 0
         with tqdm(weights_files, desc="[LOADING] MODEL WEIGHTS", unit="file") as pbar:
             for st_file in pbar:
                 filename = os.path.basename(st_file)
@@ -140,9 +151,33 @@ class WeightLoader:
 
                 with jax.default_device(jax.local_devices(backend="cpu")[0]):
                     with safe_open(st_file, framework="flax") as f:
+                        needed_keys = []
                         for name in f.keys():
+                            if not name.startswith("model.layers."):
+                                needed_keys.append(name)
+                                continue
+
+                            if not self._is_excluded_layer_weight(name):
+                                needed_keys.append(name)
+
+                        if not needed_keys:
+                            skipped_files += 1
+                            logger.debug(
+                                f"Skipping {filename}: 0/{len(f.keys())} weights needed"
+                            )
+                            continue
+
+                        logger.debug(
+                            f"Loading {filename}: {len(needed_keys)}/{len(f.keys())} weights needed"
+                        )
+                        for name in needed_keys:
                             weight_tensor = f.get_tensor(name)
                             yield name, weight_tensor
+
+        if skipped_files > 0:
+            logger.info(
+                f"Memory optimization: Skipped {skipped_files}/{len(weights_files)} files with no needed weights"
+            )
 
     def _process_and_assign_weight(
         self,
@@ -490,6 +525,26 @@ class WeightLoader:
                         weight = jnp.concatenate([weight, padding], axis=1)
 
         return weight
+
+    def _is_excluded_layer_weight(self, hf_key: str) -> bool:
+        if not hf_key.startswith("model.layers."):
+            return False
+
+        parts = hf_key.split(".")
+        if len(parts) < 3 or not parts[2].isdigit():
+            return False
+
+        layer_num = int(parts[2])
+
+        is_excluded = layer_num >= self.model_config.num_hidden_layers
+
+        if is_excluded and not hasattr(self, "_debug_count"):
+            logger.info(
+                f"DEBUG: Excluding layer {layer_num} >= {self.model_config.num_hidden_layers}"
+            )
+            self._debug_count = True
+
+        return is_excluded
 
     def _process_moe_expert_weights(
         self,

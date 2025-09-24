@@ -44,6 +44,7 @@ class ModelConfig:
         is_draft_model: bool = False,
         model_impl: Union[str, ModelImpl] = ModelImpl.AUTO,
         quantization: Optional[str] = None,
+        model_layer_nums: Optional[int] = None,
     ) -> None:
 
         self.model_path = model_path
@@ -141,6 +142,22 @@ class ModelConfig:
         self.num_hidden_layers = self.hf_text_config.num_hidden_layers
         self.vocab_size = self.hf_text_config.vocab_size
 
+        # Override num_hidden_layers if model_layer_nums is specified
+        if model_layer_nums is not None:
+            if model_layer_nums <= 0:
+                raise ValueError(
+                    f"model_layer_nums must be positive, got {model_layer_nums}"
+                )
+            if model_layer_nums > self.num_hidden_layers:
+                logger.warning(
+                    f"model_layer_nums ({model_layer_nums}) is greater than the original "
+                    f"num_hidden_layers ({self.num_hidden_layers}). Using original value."
+                )
+            elif model_layer_nums != self.num_hidden_layers:
+                self.num_hidden_layers = model_layer_nums
+                # Also update hf_config to ensure consistency across all components
+                self.hf_config.num_hidden_layers = model_layer_nums
+
         # Cache attributes
         self.hf_eos_token_id = self.get_hf_eos_token_id()
 
@@ -163,6 +180,7 @@ class ModelConfig:
             dtype=server_args.dtype,
             quantization=server_args.quantization,
             model_impl=server_args.model_impl,
+            model_layer_nums=server_args.model_layer_nums,
             **kwargs,
         )
 
