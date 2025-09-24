@@ -73,7 +73,7 @@ class ModelConfig:
         )
 
         self.hf_text_config = get_hf_text_config(self.hf_config)
-        self.attention_chunk_size = getattr(self.hf_text_config, "attention_chunk_size", None)
+        self.sliding_window = self.hf_text_config.sliding_window
 
         if is_draft_model and self.hf_config.architectures[0] == "DeepseekV3ForCausalLM":
             self.hf_config.architectures[0] = "DeepseekV3ForCausalLMNextN"
@@ -125,6 +125,7 @@ class ModelConfig:
         self.hidden_size = self.hf_text_config.hidden_size
         self.num_hidden_layers = self.hf_text_config.num_hidden_layers
         self.vocab_size = self.hf_text_config.vocab_size
+        self.final_logit_softcapping = getattr(self.hf_text_config, "final_logit_softcapping", None)
 
         # Override num_hidden_layers if model_layer_nums is specified
         if model_layer_nums is not None:
@@ -481,6 +482,16 @@ def is_generation_model(model_architectures: list[str], is_embedding: bool = Fal
         return False
     else:
         return not is_embedding
+
+
+def get_hybrid_layer_ids(model_architectures: list[str], num_hidden_layers: int):
+    if "Llama4ForConditionalGeneration" in model_architectures:
+        swa_attention_layer_ids = [i for i in range(num_hidden_layers) if (i + 1) % 4 != 0]
+        full_attention_layer_ids = [i for i in range(num_hidden_layers) if (i + 1) % 4 == 0]
+    else:
+        swa_attention_layer_ids = None
+        full_attention_layer_ids = None
+    return swa_attention_layer_ids, full_attention_layer_ids
 
 
 multimodal_model_archs = [

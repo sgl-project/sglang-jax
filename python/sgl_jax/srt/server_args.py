@@ -115,11 +115,6 @@ class ServerArgs:
     disable_overlap_schedule: bool = False
     enable_precision_tracer: bool = False
 
-    # Jax distribution info
-    jax_proc_id: int = None
-    jax_num_procs: int = None
-
-    xla_backend: str = "tpu"
     # Kernel backend
     attention_backend: str | None = "fa"
 
@@ -128,7 +123,7 @@ class ServerArgs:
     precompile_token_paddings: list[int] | None = None
     precompile_bs_paddings: list[int] | None = None
 
-    disable_jax_precompile: bool = False
+    disable_precompile: bool = False
 
     # For deterministic sampling
     enable_deterministic_sampling: bool = False
@@ -710,24 +705,6 @@ class ServerArgs:
         )
 
         parser.add_argument(
-            "--jax-proc-id",
-            type=int,
-            default=ServerArgs.jax_proc_id,
-            help="Jax Process ID",
-        )
-        parser.add_argument(
-            "--jax-num-procs",
-            type=int,
-            default=ServerArgs.jax_num_procs,
-            help="The number of Jax Processes",
-        )
-        parser.add_argument(
-            "--xla-backend",
-            type=str,
-            default=ServerArgs.xla_backend,
-            help="XLA backend",
-        )
-        parser.add_argument(
             "--max-seq-len",
             type=int,
             default=ServerArgs.max_seq_len,
@@ -746,9 +723,9 @@ class ServerArgs:
             help="Set the list of batch sizes buckets for jax jit",
         )
         parser.add_argument(
-            "--disable-jax-precompile",
+            "--disable-precompile",
             action="store_true",
-            help="whether disable jax precompile",
+            help="whether disable precompile",
         )
         # Kernel backend
         parser.add_argument(

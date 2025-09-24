@@ -120,7 +120,6 @@ class QWenAttention(nnx.Module):
             params_dtype=dtype,
         )
 
-        # Use torch version of RotaryEmbedding directly
         self.rotary_emb = RotaryEmbedding(
             head_size=head_size,
             rotary_dim=head_size,
@@ -129,7 +128,6 @@ class QWenAttention(nnx.Module):
             is_neox_style=True,
             dtype=dtype,
         )
-        self.scaling = head_size**-0.5
         self.attn = RadixAttention(
             num_heads=num_heads,
             head_dim=head_size,
@@ -213,7 +211,7 @@ class QWenBlock(nnx.Module):
         hidden_states: jax.Array,
         forward_batch: ForwardBatch,
         token_to_kv_pool: KVCache,
-    ) -> tuple[jax.Array, jax.Array, jax.Array]:
+    ):
         residual = hidden_states
 
         hidden_states = self.ln_1(hidden_states)
@@ -309,7 +307,7 @@ class QWenLMHeadModel(nnx.Module):
         vocab_size = ((config.vocab_size + 63) // 64) * 64
         if not getattr(self.config, "tie_word_embeddings", True):
             self.lm_head = ParallelLMHead(vocab_size, config.hidden_size, rngs=rngs)
-        self.logits_processor = LogitsProcessor(vocab_size, self.mesh)
+        self.logits_processor = LogitsProcessor(vocab_size, mesh=self.mesh)
 
     def load_weights(self, model_config: ModelConfig, rng_key: jax.Array):
         self.rng = nnx.Rngs(rng_key)
