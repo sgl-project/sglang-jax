@@ -744,9 +744,16 @@ def _ragged_paged_attention_kernel(
                     # xai_temperature_scale: ref implementation from sgl-project/sglang
                     # python/sglang/srt/layers/attention/triton_ops/decode_attention.py
                     if xai_temperature_len is not None:
-                        xai_temperature_scale = 1.0 / jnp.log2(float(xai_temperature_len))
-                        _qtemp = jnp.log2(offs_qidx_batch.astype(jnp.float32)) * xai_temperature_scale
-                        xai_temperature_reg = jnp.where(offs_qidx_batch > xai_temperature_len, _qtemp, 1.0)
+                        xai_temperature_scale = 1.0 / jnp.log2(
+                            float(xai_temperature_len)
+                        )
+                        _qtemp = (
+                            jnp.log2(offs_qidx_batch.astype(jnp.float32))
+                            * xai_temperature_scale
+                        )
+                        xai_temperature_reg = jnp.where(
+                            offs_qidx_batch > xai_temperature_len, _qtemp, 1.0
+                        )
 
                         s = s * xai_temperature_reg[:, :, None]
 

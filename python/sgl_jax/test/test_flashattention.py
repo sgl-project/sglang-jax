@@ -385,7 +385,7 @@ class TestAttention(CustomTestCase):
 
         @jax.jit
         def jit_attn(q, k, v, forward_batch):
-            out = attn(q, k, v, forward_batch)#, **mode_kwargs)
+            out = attn(q, k, v, forward_batch)
             return out
 
         attn.xai_temperature_len = mode_kwargs.get("xai_temperature_len", None)
