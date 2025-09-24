@@ -160,6 +160,7 @@ class ModelWorkerClient:
     ) -> Tuple[None, jax.Array, int]:
         # Create a new copy of sampling_info because it will be updated in-place by the scheduler for the next batch.
         sampling_info = model_worker_batch.sampling_info
+        sampling_info.update_penalties()
         model_worker_batch.sampling_info = self.cur_sampling_info = dataclasses.replace(
             sampling_info,
             sampling_info_done=threading.Event(),

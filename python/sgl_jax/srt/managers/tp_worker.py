@@ -191,6 +191,7 @@ class ModelWorker:
     def run_precompile(self, future_token_ids_map=None):
         self.precompile_extend(future_token_ids_map)
         self.precompile_decode(future_token_ids_map)
+        self.precompile_penalties(future_token_ids_map)
 
     def precompile_extend(self, future_token_ids_map=None):
         start_time = time.perf_counter()
@@ -275,6 +276,161 @@ class ModelWorker:
         end_time = time.perf_counter()
         logger.info("[DECODE] Precompile finished in %.0f secs", end_time - start_time)
 
+    def precompile_penalties(self, future_token_ids_map=None):
+        """Precompile penalty application for different batch sizes and penalty combinations."""
+        start_time = time.perf_counter()
+        logger.info(
+            f"[PENALTIES] Begin to precompile penalty applications bs_paddings={self.precompile_bs_paddings}"
+        )
+
+        with tqdm(
+            self.precompile_bs_paddings, desc="[PENALTIES] PRECOMPILE", leave=False
+        ) as pbar:
+            for bs in pbar:
+                pbar.set_postfix(bs=bs)
+
+                # Test both with and without penalties for comprehensive JIT coverage
+                penalty_scenarios = [
+                    ("no_penalties", False),
+                    ("with_penalties", True),
+                ]
+
+                for _, with_penalties in penalty_scenarios:
+                    # Create model worker batch
+                    aligned_cache_loc_size = (
+                        (bs * self.max_req_len + self.page_size - 1)
+                        // self.page_size
+                        * self.page_size
+                    )
+                    model_worker_batch = self.generate_model_worker_batch(
+                        bs,
+                        bs,
+                        ForwardMode.DECODE,
+                        aligned_cache_loc_size,
+                    )
+
+                    # Modify sampling_info to include penalty data if needed
+                    if with_penalties:
+                        # Create mock penalty data for precompile
+                        model_worker_batch.sampling_info = (
+                            self._create_penalty_sampling_info(bs)
+                        )
+
+                    # Create sampling metadata
+                    sampling_metadata = SamplingMetadata.from_model_worker_batch(
+                        model_worker_batch, 0, self.mesh
+                    )
+
+                    # Initialize forward batch
+                    model_worker_batch.forward_batch = ForwardBatch.init_new(
+                        model_worker_batch, self.model_runner
+                    )
+
+                    if future_token_ids_map is not None:
+                        model_worker_batch.forward_batch.input_ids = (
+                            resolve_future_token_ids(
+                                model_worker_batch.forward_batch.input_ids,
+                                future_token_ids_map,
+                            )
+                        )
+
+                    # Run forward with penalty application
+                    _, next_token_ids, _ = self.forward_batch_generation(
+                        model_worker_batch, None, False, sampling_metadata
+                    )
+
+                    if future_token_ids_map is not None:
+                        set_future_token_ids(future_token_ids_map, 0, next_token_ids)
+
+        end_time = time.perf_counter()
+        logger.info(
+            "[PENALTIES] Precompile finished in %.0f secs", end_time - start_time
+        )
+
+    def _create_penalty_sampling_info(self, bs: int):
+        """Create mock SamplingBatchInfo with penalty data for precompile."""
+        import numpy as np
+
+        from sgl_jax.srt.sampling import penaltylib
+        from sgl_jax.srt.sampling.sampling_batch_info import SamplingBatchInfo
+
+        # Create mock sampling info with penalty orchestrator
+        temperatures = np.array([1.0] * bs, dtype=np.float32)
+        top_ps = np.array([1.0] * bs, dtype=np.float32)
+        top_ks = np.array([-1] * bs, dtype=np.int32)
+        min_ps = np.array([0.0] * bs, dtype=np.float32)
+
+        sampling_info = SamplingBatchInfo(
+            temperatures=temperatures,
+            top_ps=top_ps,
+            top_ks=top_ks,
+            min_ps=min_ps,
+            vocab_size=self.model_config.vocab_size,
+            is_all_greedy=True,
+            need_top_p_sampling=False,
+            need_top_k_sampling=True,
+            need_min_p_sampling=False,
+            sampling_info_done=None,
+            penalizer_orchestrator=None,
+            linear_penalty=None,
+        )
+
+        # Create mock penalty orchestrator with sample penalty data
+        # This ensures the penalty application JIT functions are compiled
+        mock_reqs = self._create_mock_reqs_with_penalties(bs)
+
+        # Create a mock batch-like object for the orchestrator
+        class MockBatch:
+            def __init__(self, reqs):
+                self.reqs = reqs
+
+        mock_batch = MockBatch(mock_reqs)
+
+        penalizer_orchestrator = penaltylib.BatchedPenalizerOrchestrator(
+            vocab_size=self.model_config.vocab_size,
+            batch=mock_batch,
+            penalizers={
+                penaltylib.BatchedFrequencyPenalizer,
+                penaltylib.BatchedMinNewTokensPenalizer,
+                penaltylib.BatchedPresencePenalizer,
+            },
+        )
+
+        sampling_info.penalizer_orchestrator = penalizer_orchestrator
+
+        return sampling_info
+
+    def _create_mock_reqs_with_penalties(self, bs: int):
+        """Create mock requests with penalty parameters for precompile."""
+        from sgl_jax.srt.sampling.sampling_params import SamplingParams
+
+        mock_reqs = []
+        for i in range(bs):
+            # Create mock request with penalty parameters
+            class MockReq:
+                def __init__(self, idx):
+                    # Create sampling params with various penalty settings
+                    self.sampling_params = SamplingParams(
+                        temperature=1.0,
+                        top_p=1.0,
+                        top_k=-1,
+                        min_p=0.0,
+                        frequency_penalty=0.1 if idx % 2 == 0 else 0.0,
+                        presence_penalty=0.2 if idx % 3 == 0 else 0.0,
+                        min_new_tokens=5 if idx % 4 == 0 else 0,
+                    )
+
+                    # Mock tokenizer for stop tokens
+                    class MockTokenizer:
+                        eos_token_id = 0
+                        additional_stop_token_ids = [1, 2]
+
+                    self.tokenizer = MockTokenizer()
+
+            mock_reqs.append(MockReq(i))
+
+        return mock_reqs
+
     def get_max_padded_size(self):
         """Calculate the max padded batch size and token nums.
 
@@ -337,7 +493,7 @@ class ModelWorker:
             ),
             return_logprob=False,
             sampling_info=SamplingBatchInfo.generate_for_precompile(
-                bs,
+                bs, self.model_config.vocab_size
             ),
             extend_input_logprob_token_ids=None,
             positions=np.concat([valid_positions, invalid_positions], axis=0),
@@ -501,9 +657,10 @@ class MockModelWorker:
 
     def forward_batch_generation(
         self,
-        model_worker_batch: ModelWorkerBatch,
-        launch_done: Optional[threading.Event] = None,
-        skip_sample: bool = False,
+        _model_worker_batch: ModelWorkerBatch,
+        _launch_done: Optional[threading.Event] = None,
+        _skip_sample: bool = False,
+        _sampling_metadata: Optional[SamplingMetadata] = None,
     ) -> Tuple[Union[LogitsProcessorOutput, jax.Array], Optional[jax.Array]]:
         return (
             LogitsProcessorOutput(
