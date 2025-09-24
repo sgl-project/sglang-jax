@@ -34,6 +34,7 @@ QWEN3_8B = "Qwen/Qwen3-8B"
 QWEN3_MOE_30B = "Qwen/Qwen3-30B-A3B"
 QWEN2_5_7B_INSTRUCT = "Qwen/Qwen2.5-7B-Instruct"
 QWEN3_CODER_30B_A3B_INSTRUCT = "Qwen/Qwen3-Coder-30B-A3B-Instruct"
+GEMMA2_2B_IT = "google/gemma-2-2b-it"
 
 DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH = 600
 
@@ -345,12 +346,9 @@ def generate_server_args() -> ServerArgs:
         preferred_sampling_params=None,
         disable_radix_cache=False,
         allow_auto_truncate=False,
-        jax_proc_id=None,
-        jax_num_procs=None,
-        xla_backend="tpu",
         max_seq_len=4096,
         precompile_token_paddings=[1, 8],
-        disable_jax_precompile=False,
+        disable_precompile=False,
     )
 
 

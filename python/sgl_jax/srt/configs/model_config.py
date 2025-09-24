@@ -75,7 +75,7 @@ class ModelConfig:
         )
 
         self.hf_text_config = get_hf_text_config(self.hf_config)
-        self.attention_chunk_size = getattr(self.hf_text_config, "attention_chunk_size", None)
+        self.sliding_window = getattr(self.hf_text_config, "sliding_window", None)
 
         if is_draft_model and self.hf_config.architectures[0] == "DeepseekV3ForCausalLM":
             self.hf_config.architectures[0] = "DeepseekV3ForCausalLMNextN"
@@ -127,6 +127,7 @@ class ModelConfig:
         self.hidden_size = self.hf_text_config.hidden_size
         self.num_hidden_layers = self.hf_text_config.num_hidden_layers
         self.vocab_size = self.hf_text_config.vocab_size
+        self.final_logit_softcapping = getattr(self.hf_text_config, "final_logit_softcapping", None)
 
         # Override num_hidden_layers if model_layer_nums is specified
         if model_layer_nums is not None:
