@@ -237,7 +237,7 @@ class DetokenizerManager:
                     "For more details, see: https://github.com/sgl-project/sglang/issues/2812"
                 )
             new_text = read_texts[i][len(surr_texts[i]) :]
-            new_token_ids = read_ids[i][len(surr_ids[i]):]
+            new_token_ids = read_ids[i][len(surr_ids[i]) :]
             if recv_obj.finished_reasons[i] is None:
                 # Streaming chunk: update the decode status
                 if len(new_text) > 0 and not new_text.endswith("�"):
@@ -253,9 +253,9 @@ class DetokenizerManager:
                 recv_obj.finished_reasons[i],
                 recv_obj.no_stop_trim[i],
             )
-            
-            processed_new_token_ids=process_special_tokens_spaces(
-                new_token_ids, 
+
+            processed_new_token_ids = process_special_tokens_spaces(
+                new_token_ids,
                 recv_obj.skip_special_tokens[i],
                 self.tokenizer.all_special_ids,
             )
@@ -290,6 +290,7 @@ class DetokenizerManager:
             cache_miss_count=recv_obj.cache_miss_count,
         )
 
+
 def process_special_tokens_spaces(
     token_ids: Optional[List[int]] = None,
     skip_special_tokens: Optional[bool] = None,
@@ -298,7 +299,6 @@ def process_special_tokens_spaces(
     if all_special_ids is None or not skip_special_tokens or token_ids is None:
         return token_ids
     return [token for token in token_ids if token not in all_special_ids]
-    
 
 
 class LimitedCapacityDict(OrderedDict):

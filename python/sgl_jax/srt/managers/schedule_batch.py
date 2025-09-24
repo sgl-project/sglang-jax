@@ -374,7 +374,9 @@ class Req:
                 self.finished_reason = FINISH_MATCHED_TOKEN(matched=last_token_id)
                 return
 
-        if self.vocab_size is not None and (last_token_id > self.vocab_size or last_token_id < 0):
+        if self.vocab_size is not None and (
+            last_token_id > self.vocab_size or last_token_id < 0
+        ):
             if self.sampling_params.stop_token_ids:
                 self.output_ids[-1] = next(iter(self.sampling_params.stop_token_ids))
             elif self.eos_token_ids:

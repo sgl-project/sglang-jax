@@ -160,7 +160,7 @@ class SamplingParams:
             if key == "stop_token_ids":
                 # Convert set back to list, or None
                 result[key] = list(value) if value is not None else None
-            #elif key == "top_k":
+            # elif key == "top_k":
             #    # Restore -1 if it was set to TOP_K_ALL
             #    from sgl_jax.srt.sampling.sampling_params import TOP_K_ALL  # or wherever it's defined
             #    result[key] = -1 if value == TOP_K_ALL else value
