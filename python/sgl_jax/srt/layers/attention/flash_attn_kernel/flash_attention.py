@@ -40,7 +40,7 @@ def ref_ragged_paged_attention_fused(
     mask_value: float | None = DEFAULT_MASK_VALUE,
     k_scale: float | None = None,
     v_scale: float | None = None,
-    xai_temperature_len: float = -1.0,
+    xai_temperature_len: float | None = None,
 ):
     if mask_value is None:
         mask_value = DEFAULT_MASK_VALUE
@@ -89,7 +89,6 @@ def ref_ragged_paged_attention_fused(
         # xai_temperature_scale: ref implementation from sgl-project/sglang
         # python/sglang/srt/layers/attention/triton_ops/decode_attention.py
         if xai_temperature_len is not None:
-            # xai_temperature_scale = 1.0 / jnp.log2(jnp.array(xai_temperature_len, float))
             xai_temperature_scale = 1.0 / jnp.log2(float(xai_temperature_len))
             qidx = jnp.arange(q_start, q_end) - 1
             _qtemp = jnp.log2(qidx.astype(jnp.float32)) * xai_temperature_scale
@@ -158,7 +157,6 @@ def ref_ragged_paged_attention(
         # xai_temperature_scale: ref implementation from sgl-project/sglang
         # python/sglang/srt/layers/attention/triton_ops/decode_attention.py
         if xai_temperature_len is not None:
-            # xai_temperature_scale = 1.0 / jnp.log2(jnp.array(xai_temperature_len, float))
             xai_temperature_scale = 1.0 / jnp.log2(float(xai_temperature_len))
             qidx = jnp.arange(q_start, q_end) - 1
             _qtemp = jnp.log2(qidx.astype(jnp.float32)) * xai_temperature_scale
@@ -746,7 +744,6 @@ def _ragged_paged_attention_kernel(
                     # xai_temperature_scale: ref implementation from sgl-project/sglang
                     # python/sglang/srt/layers/attention/triton_ops/decode_attention.py
                     if xai_temperature_len is not None:
-                        # xai_temperature_scale = 1.0 / jnp.log2(jnp.array(xai_temperature_len, float))
                         xai_temperature_scale = 1.0 / jnp.log2(float(xai_temperature_len))
                         _qtemp = jnp.log2(offs_qidx_batch.astype(jnp.float32)) * xai_temperature_scale
                         xai_temperature_reg = jnp.where(offs_qidx_batch > xai_temperature_len, _qtemp, 1.0)
@@ -1006,9 +1003,9 @@ def static_validate_inputs_fused(
     soft_cap: float | None = None,
     mask_value: float | None = DEFAULT_MASK_VALUE,
     q_scale: float | None = None,
-    # TODO: temp
     k_scale: float | None = None,
     v_scale: float | None = None,
+    xai_temperature_len: float | None = None,
     # Kernel optimization params.
     chunk_prefill_size: int | None = None,
     # Kernel tuning params.
@@ -1103,6 +1100,8 @@ def static_validate_inputs_fused(
         raise ValueError(f"{sliding_window=} must be positive.")
     if soft_cap is not None and soft_cap == 0.0:
         raise ValueError(f"{soft_cap=} must not be 0.0.")
+    if xai_temperature_len is not None and xai_temperature_len <= 0:
+        raise ValueError(f"{xai_temperature_len=} must be positive.")
     if chunk_prefill_size is not None and chunk_prefill_size <= 0:
         raise ValueError(f"{chunk_prefill_size=} must be positive.")
     if num_kv_pages_per_block is not None:
@@ -1119,6 +1118,7 @@ def static_validate_inputs_fused(
     del q_scale
     del k_scale
     del v_scale
+    del xai_temperature_len
 
 
 @functools.partial(
