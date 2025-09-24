@@ -1,9 +1,8 @@
 import abc
 import logging
-import os
 import time
 from functools import partial
-from typing import Dict, List, Optional, Tuple, Union
+from typing import List, Optional, Tuple, Union
 
 import jax
 import jax.numpy as jnp
@@ -16,7 +15,6 @@ from jax.sharding import PartitionSpec as P
 from jax.tree_util import register_pytree_node_class
 
 from sgl_jax.srt.utils import cdiv
-from sgl_jax.srt.utils.jax_utils import get_available_device_memory
 
 
 def merge_kv(k: jax.Array, v: jax.Array) -> jax.Array:
