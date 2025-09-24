@@ -27,6 +27,11 @@ class TestFeatures(CustomTestCase):
     - Abort
     - CacheMiss
     - Logprobs
+    - Penalties
+      - FrequencyPenalty
+      - PresencePenalty
+      - MinNewTokens
+      - CombinedPenalties
 
     """
 
@@ -521,6 +526,221 @@ class TestFeatures(CustomTestCase):
                 self.assertEqual(
                     real_token, expected_output_token_ids_logprobs[i][j][1]
                 )
+
+    def test_frequency_penalty(self):
+        """Test frequency penalty functionality."""
+        # Test with frequency penalty enabled
+        args = SimpleNamespace(
+            base_url=self.base_url,
+            text="Say hello hello hello",
+            temperature=0.5,
+            max_new_tokens=10,
+        )
+
+        # Test frequency penalty = 1.0
+        response = requests.post(
+            self.base_url + "/generate",
+            json={
+                "text": args.text,
+                "sampling_params": {
+                    "temperature": args.temperature,
+                    "max_new_tokens": args.max_new_tokens,
+                    "frequency_penalty": 1.0,
+                },
+            },
+        )
+
+        resp_with_penalty = response.json()
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("text", resp_with_penalty)
+
+        # Test without frequency penalty for comparison
+        response_no_penalty = requests.post(
+            self.base_url + "/generate",
+            json={
+                "text": args.text,
+                "sampling_params": {
+                    "temperature": args.temperature,
+                    "max_new_tokens": args.max_new_tokens,
+                    "frequency_penalty": 0.0,
+                },
+            },
+        )
+
+        resp_no_penalty = response_no_penalty.json()
+        self.assertEqual(response_no_penalty.status_code, 200)
+        self.assertIn("text", resp_no_penalty)
+
+        # With frequency penalty, the output should be different (less repetitive)
+        # This is a behavioral test - the penalty should reduce repetition
+        output_with_penalty = resp_with_penalty["text"]
+        output_no_penalty = resp_no_penalty["text"]
+
+        # Basic validation that the responses are generated
+        self.assertIsInstance(output_with_penalty, str)
+        self.assertIsInstance(output_no_penalty, str)
+
+    def test_presence_penalty(self):
+        """Test presence penalty functionality."""
+        args = SimpleNamespace(
+            base_url=self.base_url,
+            text="The weather is nice today. The weather",
+            temperature=0.5,
+            max_new_tokens=8,
+        )
+
+        # Test with presence penalty
+        response = requests.post(
+            self.base_url + "/generate",
+            json={
+                "text": args.text,
+                "sampling_params": {
+                    "temperature": args.temperature,
+                    "max_new_tokens": args.max_new_tokens,
+                    "presence_penalty": 1.0,
+                },
+            },
+        )
+
+        resp_with_penalty = response.json()
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("text", resp_with_penalty)
+
+        # Test without presence penalty
+        response_no_penalty = requests.post(
+            self.base_url + "/generate",
+            json={
+                "text": args.text,
+                "sampling_params": {
+                    "temperature": args.temperature,
+                    "max_new_tokens": args.max_new_tokens,
+                    "presence_penalty": 0.0,
+                },
+            },
+        )
+
+        resp_no_penalty = response_no_penalty.json()
+        self.assertEqual(response_no_penalty.status_code, 200)
+        self.assertIn("text", resp_no_penalty)
+
+        # Basic validation that responses are generated
+        output_with_penalty = resp_with_penalty["text"]
+        output_no_penalty = resp_no_penalty["text"]
+
+        self.assertIsInstance(output_with_penalty, str)
+        self.assertIsInstance(output_no_penalty, str)
+
+    def test_min_new_tokens(self):
+        """Test min_new_tokens penalty functionality."""
+        args = SimpleNamespace(
+            base_url=self.base_url,
+            text="Hello",
+            temperature=0.0,
+            max_new_tokens=10,
+        )
+
+        # Test with min_new_tokens
+        response = requests.post(
+            self.base_url + "/generate",
+            json={
+                "text": args.text,
+                "sampling_params": {
+                    "temperature": args.temperature,
+                    "max_new_tokens": args.max_new_tokens,
+                    "min_new_tokens": 5,
+                },
+            },
+        )
+
+        resp_with_min_tokens = response.json()
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("text", resp_with_min_tokens)
+
+        # Test without min_new_tokens
+        response_no_min = requests.post(
+            self.base_url + "/generate",
+            json={
+                "text": args.text,
+                "sampling_params": {
+                    "temperature": args.temperature,
+                    "max_new_tokens": args.max_new_tokens,
+                    "min_new_tokens": 0,
+                },
+            },
+        )
+
+        resp_no_min = response_no_min.json()
+        self.assertEqual(response_no_min.status_code, 200)
+        self.assertIn("text", resp_no_min)
+
+        # The response with min_new_tokens should generate at least some output
+        output_with_min_tokens = resp_with_min_tokens["text"]
+        output_no_min = resp_no_min["text"]
+
+        self.assertIsInstance(output_with_min_tokens, str)
+        self.assertIsInstance(output_no_min, str)
+
+        # With min_new_tokens=5, we should get at least some additional tokens
+        # The length constraint ensures minimum generation
+        self.assertGreater(len(output_with_min_tokens), len(args.text))
+
+    def test_combined_penalties(self):
+        """Test multiple penalties applied together."""
+        args = SimpleNamespace(
+            base_url=self.base_url,
+            text="Tell me about cats. Cats are",
+            temperature=0.5,
+            max_new_tokens=15,
+        )
+
+        # Test with combined penalties
+        response = requests.post(
+            self.base_url + "/generate",
+            json={
+                "text": args.text,
+                "sampling_params": {
+                    "temperature": args.temperature,
+                    "max_new_tokens": args.max_new_tokens,
+                    "frequency_penalty": 0.5,
+                    "presence_penalty": 0.3,
+                    "min_new_tokens": 3,
+                },
+            },
+        )
+
+        resp_combined = response.json()
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("text", resp_combined)
+
+        # Test with no penalties for comparison
+        response_no_penalty = requests.post(
+            self.base_url + "/generate",
+            json={
+                "text": args.text,
+                "sampling_params": {
+                    "temperature": args.temperature,
+                    "max_new_tokens": args.max_new_tokens,
+                    "frequency_penalty": 0.0,
+                    "presence_penalty": 0.0,
+                    "min_new_tokens": 0,
+                },
+            },
+        )
+
+        resp_no_penalty = response_no_penalty.json()
+        self.assertEqual(response_no_penalty.status_code, 200)
+        self.assertIn("text", resp_no_penalty)
+
+        # Basic validation that responses are generated
+        output_combined = resp_combined["text"]
+        output_no_penalty = resp_no_penalty["text"]
+
+        self.assertIsInstance(output_combined, str)
+        self.assertIsInstance(output_no_penalty, str)
+
+        # Both should generate some output beyond the input
+        self.assertGreater(len(output_combined), len(args.text))
+        self.assertGreater(len(output_no_penalty), len(args.text))
 
 
 if __name__ == "__main__":
