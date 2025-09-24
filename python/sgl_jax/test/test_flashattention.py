@@ -234,12 +234,6 @@ def create_test_data(
     )
     if model_config.get("xai_temperature_len", None):
         attention_backend.xai_temperature_len = model_config["xai_temperature_len"]
-    print(
-        "mdl cfg.get",
-        model_config.get("xai_temperature_len", None),
-        attention_backend,
-        type(attention_backend),
-    )
     forward_mode = ForwardMode.EXTEND if mode == "prefill" else ForwardMode.DECODE
 
     mwb = ModelWorkerBatch(
@@ -394,10 +388,7 @@ class TestAttention(CustomTestCase):
             out = attn(q, k, v, forward_batch)#, **mode_kwargs)
             return out
 
-        if mode_kwargs.get("xai_temperature_len", None):
-            forward_batch.attn_backend.xai_temperature_len = mode_kwargs.get(
-                "xai_temperature_len"
-            )
+        attn.xai_temperature_len = mode_kwargs.get("xai_temperature_len", None)
 
         # run
         jax_output, _ = jit_attn(q_shard, extend_k, extend_v, forward_batch)
