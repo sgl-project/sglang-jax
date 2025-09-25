@@ -558,6 +558,7 @@ class Scheduler(
             token_ids_logprob=recv_req.token_ids_logprob,
             stream=recv_req.stream,
             eos_token_ids=self.model_config.hf_eos_token_id,
+            vocab_size=self.model_config.vocab_size,
         )
         req.tokenizer = self.tokenizer
 
@@ -1101,3 +1102,45 @@ def run_scheduler_process(
         traceback = get_exception_traceback()
         logger.error(f"Scheduler hit an exception: {traceback}")
         parent_process.send_signal(signal.SIGQUIT)
+
+
+def run_scheduler_thread(
+    server_args: ServerArgs,
+    port_args: PortArgs,
+    dp_rank: Optional[int],
+    pipe_writer,
+):
+    # Generate the prefix
+    prefix = ""
+    if server_args.nnodes > 1:
+        prefix += f" NP{server_args.node_rank}"
+
+    # Config the process
+    current_thread = threading.current_thread()
+    current_thread.name = f"sglang::scheduler{prefix.replace(' ', '_')}"
+    faulthandler.enable()
+    current_process = psutil.Process()
+
+    # Configure the logger
+    configure_logger(server_args, prefix=prefix)
+
+    # Create a scheduler and run the event loop
+    try:
+        scheduler = Scheduler(server_args, port_args)
+        pipe_writer.send(
+            {
+                "status": "ready",
+                "max_total_num_tokens": scheduler.max_total_num_tokens,
+                "max_req_input_len": scheduler.max_req_input_len,
+            }
+        )
+
+        if scheduler.enable_overlap:
+            scheduler.event_loop_overlap()
+        else:
+            scheduler.event_loop_normal()
+
+    except Exception:
+        traceback = get_exception_traceback()
+        logger.error(f"Scheduler hit an exception: {traceback}")
+        current_process.send_signal(signal.SIGQUIT)

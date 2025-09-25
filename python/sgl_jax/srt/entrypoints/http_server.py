@@ -30,7 +30,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import ORJSONResponse, Response, StreamingResponse
 
-from sgl_jax.srt.entrypoints.engine import _launch_subprocesses
+from sgl_jax.srt.entrypoints.engine import _launch_subprocesses_or_threads
 from sgl_jax.srt.entrypoints.openai.protocol import (
     ChatCompletionRequest,
     CompletionRequest,
@@ -809,8 +809,8 @@ def launch_server(
     # Initialize precision tracer enable state in HTTP server process
     precision_tracer.set_enable_precision_tracer(server_args.enable_precision_tracer)
 
-    tokenizer_manager, template_manager, scheduler_info = _launch_subprocesses(
-        server_args=server_args, port_args=None
+    tokenizer_manager, template_manager, scheduler_info = (
+        _launch_subprocesses_or_threads(server_args=server_args, port_args=None)
     )
     set_global_state(
         _GlobalState(
