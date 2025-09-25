@@ -241,11 +241,17 @@ class ModelWorker:
         ) as pbar:
             for bs in pbar:
                 pbar.set_postfix(bs=bs)
+                # use same page aligned with precompile cache_loc_paddings
+                aligned_cache_loc_size = (
+                    (bs * self.max_req_len + self.page_size - 1)
+                    // self.page_size
+                    * self.page_size
+                )
                 model_worker_batch = self.generate_model_worker_batch(
                     bs,
                     bs,
                     ForwardMode.DECODE,
-                    bs * self.max_req_len,
+                    aligned_cache_loc_size,
                 )
                 sampling_metadata = SamplingMetadata.from_model_worker_batch(
                     model_worker_batch, 0, self.mesh
