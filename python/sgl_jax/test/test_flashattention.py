@@ -134,7 +134,7 @@ def create_test_data(
 ):
     """Create a real ForwardBatch for testing."""
     assert mode in ["prefill", "decode"]
-    print("model_config", model_config)
+
     batch_size = len(lens)
     # Create sequence lengths array
     seq_lens = jnp.array([kv_len for _, kv_len in lens], dtype=jnp.int32)
