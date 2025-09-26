@@ -911,6 +911,27 @@ class ScheduleBatch:
         self.forward_mode = ForwardMode.DECODE
         bs = len(self.reqs)
 
+        if self.sampling_info.penalizer_orchestrator.is_required:
+            if self.enable_overlap:
+                delayed_output_ids = np.array(
+                    [
+                        (
+                            req.output_ids[-1]
+                            if len(req.output_ids)
+                            else req.origin_input_ids[-1]
+                        )
+                        for req in self.reqs
+                    ],
+                    dtype=np.int64,
+                )
+                self.sampling_info.penalizer_orchestrator.cumulate_output_tokens(
+                    delayed_output_ids
+                )
+            else:
+                self.sampling_info.penalizer_orchestrator.cumulate_output_tokens(
+                    np.array(self.output_ids, dtype=np.int64)
+                )
+
         # Update fields
         self.input_ids = self.output_ids
 

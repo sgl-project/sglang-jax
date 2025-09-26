@@ -76,6 +76,62 @@ class Sampler(nnx.Module):
 
         return None
 
+    def apply_penalties(
+        self, logits: jax.Array, sampling_metadata: SamplingMetadata
+    ) -> jax.Array:
+        """
+        Apply penalties to logits with JIT-optimized tensor operations.
+
+        This method handles penalty application efficiently for both overlap and
+        non-overlap modes by always operating on tensors (never None) for optimal JIT performance.
+
+        Args:
+            logits: The input logits tensor of shape [batch_size, vocab_size]
+            sampling_metadata: Metadata containing penalty information (never None)
+
+        Returns:
+            Modified logits with penalties applied
+        """
+
+        # Priority 1: Use linear_penalty from overlap mode if available
+        # This is pre-computed penalty matrix that combines all penalty types
+        if sampling_metadata.linear_penalty is not None:
+            return logits - sampling_metadata.linear_penalty
+
+        # Priority 2: Non-overlap mode - apply individual penalties separately
+
+        # Apply cumulated frequency penalties if available
+        if sampling_metadata.cumulated_frequency_penalties is not None:
+            logits = logits - sampling_metadata.cumulated_frequency_penalties
+
+        # Apply cumulated presence penalties if available
+        if sampling_metadata.cumulated_presence_penalties is not None:
+            logits = logits - sampling_metadata.cumulated_presence_penalties
+
+        # Apply min new tokens penalty to stop tokens if available
+        if (
+            sampling_metadata.min_new_tokens is not None
+            and sampling_metadata.len_output_tokens is not None
+            and sampling_metadata.stop_token_penalties is not None
+        ):
+            # Generate mask for sequences that haven't reached min_new_tokens
+            min_new_tokens_mask = (
+                sampling_metadata.len_output_tokens < sampling_metadata.min_new_tokens
+            )
+
+            # Apply stop token penalties only for sequences that need more tokens
+            # stop_penalty shape: [batch_size, vocab_size]
+            stop_penalty = jnp.where(
+                min_new_tokens_mask.reshape(
+                    -1, 1
+                ),  # [batch_size, 1] -> broadcast to [batch_size, vocab_size]
+                sampling_metadata.stop_token_penalties,  # [batch_size, vocab_size]
+                0.0,  # scalar -> broadcast to [batch_size, vocab_size]
+            )
+            logits = logits + stop_penalty
+
+        return logits
+
     def __call__(
         self,
         logits_output: LogitsProcessorOutput,
@@ -98,6 +154,9 @@ class Sampler(nnx.Module):
             logits_output.next_token_logits,
             (-1, logits_output.next_token_logits.shape[-1]),
         )
+
+        # Apply penalties before sampling - similar to VLLM approach
+        logits = self.apply_penalties(logits, sampling_metadata)
 
         _, rng = jax.random.split(self.rngs.params())
 
@@ -224,6 +283,6 @@ def top_p_normalize_probs_jax(
     probs_sort = probs_sort / probs_sort.sum(axis=-1, keepdim=True)
     # return jnp.zeros_like(probs_sort).scatter_(-1, probs_idx, probs_sort)
 
-    num_tokens, h = probs.shape
+    num_tokens, _ = probs.shape
     row_idx = jnp.arange(num_tokens)[:, None]  # [B, 1], broadcast over H
     return jnp.zeros_like(probs).at[row_idx, probs_idx].set(probs_sort)
