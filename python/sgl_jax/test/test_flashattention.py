@@ -659,8 +659,7 @@ class TestAttention(CustomTestCase):
         )
 
     def test_gqa_prefill_accuracy_page_size_1_temperature(self):
-        """Test JAX attention accuracy against PyTorch reference
-        """
+        """Test JAX attention accuracy against PyTorch reference"""
         # Parameters
         num_heads = 32
         num_kv_heads = 8
