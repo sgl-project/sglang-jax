@@ -134,7 +134,6 @@ def create_test_data(
 ):
     """Create a real ForwardBatch for testing."""
     assert mode in ["prefill", "decode"]
-    print("model_config", model_config)
     batch_size = len(lens)
     # Create sequence lengths array
     seq_lens = jnp.array([kv_len for _, kv_len in lens], dtype=jnp.int32)
@@ -655,6 +654,55 @@ class TestAttention(CustomTestCase):
             "decode",
             lens,
             (num_heads, head_dim, num_kv_heads, 64, jnp.bfloat16),
+            xai_temperature_len=512,
+        )
+
+    def test_gqa_prefill_accuracy_page_size_1_temperature(self):
+        """Test JAX attention accuracy against PyTorch reference
+        """
+        # Parameters
+        num_heads = 32
+        num_kv_heads = 8
+        head_dim = 128
+        lens = [
+            (1, 128),
+            (3, 20),
+            (64, 64),
+            (20, 20),
+            (125, 125),
+            # (1024, 1024),
+            (123, 522),
+            (1, 511),
+        ]
+        self.run_test(
+            "prefill",
+            lens,
+            (num_heads, head_dim, num_kv_heads, 1, jnp.bfloat16),
+            xai_temperature_len=512,
+        )
+
+    def test_gqa_decode_accuracy_page_size_1_temperature(self):
+        """Test JAX attention accuracy against native fa"""
+        # Parameters
+        num_heads = 32
+        num_kv_heads = 8
+        head_dim = 128
+        lens = [
+            (1, 119),
+            (1, 127),
+            (1, 128),
+            (1, 129),
+            (1, 133),
+            (1, 1001),
+            (1, 1023),
+            (1, 1024),
+            (1, 1025),
+        ]
+
+        self.run_test(
+            "decode",
+            lens,
+            (num_heads, head_dim, num_kv_heads, 1, jnp.bfloat16),
             xai_temperature_len=512,
         )
 
