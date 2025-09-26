@@ -207,6 +207,7 @@ class FlashAttention(AttentionBackend):
             scale = 1.0 / jnp.sqrt(layer.head_dim)
         else:
             scale = layer.scaling
+        xai_temperature_len = getattr(layer, "xai_temperature_len", None)
 
         # Prepare fused KV cache for paged format: [num_pages, page_size, num_kv_heads * 2, head_dim]
         total_tokens = kv_cache_fused.shape[0]
@@ -249,6 +250,7 @@ class FlashAttention(AttentionBackend):
                 sm_scale=scale,
                 sliding_window=None,
                 soft_cap=None,
+                xai_temperature_len=xai_temperature_len,
                 vmem_limit_bytes=self.vmem_limit_bytes,
             )
 
