@@ -229,7 +229,11 @@ def create_test_data(
 
     # init attention backend
     attention_backend = FlashAttention(
-        num_heads, num_kv_heads, head_dim, page_size=page_size
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        page_size=page_size,
+        mesh=mesh,
     )
     forward_mode = ForwardMode.EXTEND if mode == "prefill" else ForwardMode.DECODE
 
