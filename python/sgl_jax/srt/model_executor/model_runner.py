@@ -25,7 +25,7 @@ from sgl_jax.srt.mem_cache.allocator import (
 )
 from sgl_jax.srt.mem_cache.memory_pool import MHATokenToKVPool, ReqToTokenPool
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sgl_jax.srt.model_loader.loader import JAXModelLoader
+from sgl_jax.srt.model_loader.loader import get_model_loader
 from sgl_jax.srt.precision_tracer import precision_tracer
 from sgl_jax.srt.sampling.sampling_batch_info import SamplingBatchInfo, SamplingMetadata
 from sgl_jax.srt.server_args import ServerArgs
@@ -83,12 +83,13 @@ class ModelRunner:
         self.use_mla_backend = self.model_config.attention_arch == AttentionArch.MLA
 
         self.forward_pass_id = 0
-        self.model_loader = JAXModelLoader(
+        self.model_loader = get_model_loader(
             load_config=LoadConfig(
-                load_format=LoadFormat.JAX, download_dir=server_args.download_dir
+                load_format=server_args.load_format,
+                download_dir=server_args.download_dir,
             ),
             rngs=rngs,
-            mesh=self.mesh,
+            mesh=mesh,
         )
 
         # Initialize precision tracer enable state
@@ -404,10 +405,13 @@ class ModelRunner:
         forward_batch: ForwardBatch,
         logits_metadata: LogitsMetadata,
     ) -> Tuple[LogitsProcessorOutput, int]:
-        # for compatibility, 0.6.3 need to use use_mesh. set_mesh is not have __entry__ attribute.
-        # on jax 0.7.1, we need to use set_mesh.
-        # with jax.sharding.set_mesh(self.mesh):
-        with jax.sharding.use_mesh(self.mesh):
+        # Enter mesh context so shard_map can see a valid mesh
+        try:
+            ctx = jax.set_mesh(self.mesh)
+        except AttributeError:
+            # Fallback for older JAX where Mesh is a context manager
+            ctx = self.mesh
+        with ctx:
             if (
                 forward_batch.forward_mode.is_decode()
                 or forward_batch.forward_mode.is_extend()
