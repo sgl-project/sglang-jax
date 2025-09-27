@@ -61,6 +61,7 @@ class Embed(nnx.Module):
                           computations between query/embedding tensors.
             rngs: Random number generator state for parameter initialization.
         """
+        rngs = rngs or nnx.Rngs(0)
         self.embedding = nnx.Param(
             nnx.with_partitioning(default_embed_init, (None, None))(
                 rngs.params(), (num_embeddings, features), param_dtype
@@ -145,6 +146,7 @@ class ParallelLMHead(Embed):
             use_bias: Whether to include bias parameters. Note: bias is currently
                      not used in logits computation, reserved for future extension.
         """
+        rngs = rngs or nnx.Rngs(0)
         super().__init__(
             num_embeddings=num_embeddings,
             features=features,
@@ -441,3 +443,21 @@ def get_rope(
             raise ValueError(f"Unknown RoPE scaling type {scaling_type}")
     _ROPE_DICT[key] = rotary_emb
     return rotary_emb
+
+
+def _yarn_get_mscale(scaling_factor: float) -> float:
+    # Approximate magnitude scaling correction used by YaRN
+    return math.sqrt(scaling_factor)
+
+
+def _yarn_find_correction_range(
+    beta_fast: int,
+    beta_slow: int,
+    rotary_dim: int,
+    base: int,
+    max_position_embeddings: int,
+) -> tuple[float, float]:
+    # Heuristic correction band across rotary dimensions; can be refined
+    low = max(int(rotary_dim // max(beta_fast, 1)), 1)
+    high = max(int(rotary_dim // max(beta_slow, 1)), low + 1)
+    return float(low), float(high)

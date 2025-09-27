@@ -263,6 +263,7 @@ class FlashAttention(AttentionBackend):
             updated_kv_cache_fused,
         ) = jax.shard_map(  # Fused KV kernel handles cache updates internally
             _ragged_paged_attention_with_fused_kv,
+            mesh=self.mesh,
             in_specs=in_specs,
             out_specs=out_specs,
             check_vma=False,

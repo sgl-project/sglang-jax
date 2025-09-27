@@ -40,6 +40,7 @@ class LinearBase(nnx.Module):
         rngs: nnx.Rngs = None,
     ):
         """Initialize parameters and quantization method."""
+        rngs = rngs or nnx.Rngs(0)
         self.skip_bias_add = skip_bias_add
         self.weight = nnx.Param(
             nnx.with_partitioning(nnx.initializers.normal(), kernel_axes)(

@@ -17,6 +17,7 @@ class RMSNorm(nnx.Module):
         kernel_axes: Optional[Sequence[str]] = None,
         rngs: nnx.Rngs = None,
     ):
+        rngs = rngs or nnx.Rngs(0)
         self.variance_epsilon = epsilon
         self.weight = nnx.Param(
             nnx.with_partitioning(nnx.initializers.ones, kernel_axes)(
@@ -47,3 +48,20 @@ def rmsnorm_forward(
         return output
     else:
         return output, residual
+
+
+def dual_rmsnorm_forward(
+    x: jax.Array,
+    residual: jax.Array,
+    weight1: jax.Array,
+    weight2: jax.Array,
+    epsilon: float,
+) -> Tuple[jax.Array, jax.Array]:
+    """Apply two RMSNorms with shared residual path, returning (y2, residual).
+
+    Equivalent to fused_dual_residual_rmsnorm: first adds residual, applies
+    norm with weight1 to produce y1 (discarded), then norm with weight2 to produce y2.
+    """
+    y1, residual_out = rmsnorm_forward(x, residual, weight1, epsilon)
+    y2, _ = rmsnorm_forward(x, residual, weight2, epsilon)
+    return y2, residual_out
