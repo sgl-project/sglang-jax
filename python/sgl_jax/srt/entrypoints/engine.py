@@ -349,12 +349,23 @@ def _set_envs_and_config():
     set_ulimit()
 
     def sigchld_handler(signum, frame):
-        pid, exitcode = os.waitpid(0, os.WNOHANG)
-        if exitcode != 0:
-            logger.warning(
-                f"Child process unexpectedly failed with {exitcode=}. {pid=}"
-            )
-            logger.warning(f"Child process {pid=} frame={frame}")
+        try:
+            while True:
+                pid, exitcode = os.waitpid(0, os.WNOHANG)
+                if pid == 0:
+                    # No more dead children to reap
+                    break
+                if exitcode != 0:
+                    logger.warning(
+                        f"Child process unexpectedly failed with {exitcode=}. {pid=}"
+                    )
+                    logger.warning(f"Child process {pid=} frame={frame}")
+        except ChildProcessError:
+            # No child processes
+            pass
+        except OSError:
+            # ECHILD or other OS errors; ignore to avoid crashing main process
+            pass
 
     signal.signal(signal.SIGCHLD, sigchld_handler)
 

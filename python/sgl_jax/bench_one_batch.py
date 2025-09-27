@@ -53,8 +53,9 @@ import time
 from typing import Tuple
 
 import numpy as np
-import torch
-import torch.distributed as dist
+import jax
+from jax import profiler as jax_profiler
+from jax.experimental import multihost_utils as jax_mh
 
 from sgl_jax.srt.configs.model_config import ModelConfig
 
@@ -67,16 +68,18 @@ from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
 from sgl_jax.srt.model_executor.model_runner import ModelRunner
 from sgl_jax.srt.sampling.sampling_params import SamplingParams
 from sgl_jax.srt.server_args import PortArgs, ServerArgs
+from sgl_jax.srt.layers.logits_processor import LogitsMetadata
+from sgl_jax.srt.sampling.sampling_batch_info import SamplingMetadata
 
 # from sgl_jax.srt.speculative.spec_info import SpeculativeAlgorithm
 from sgl_jax.srt.utils import (
     configure_logger,
     get_bool_env_var,
     kill_process_tree,
-    require_mlp_sync,
-    require_mlp_tp_gather,
-    set_gpu_proc_affinity,
-    suppress_other_loggers,
+    # require_mlp_sync,
+    # require_mlp_tp_gather,
+    # set_gpu_proc_affinity,
+    # suppress_other_loggers,
 )
 
 
@@ -118,14 +121,14 @@ class BenchArgs:
             help="Log decode latency by step, default is set to zero to disable.",
         )
         parser.add_argument(
-            "--profile", action="store_true", help="Use Torch Profiler."
+            "--profile", action="store_true", help="Use JAX Profiler."
         )
         parser.add_argument(
             "--profile-filename-prefix",
             type=str,
             default=BenchArgs.profile_filename_prefix,
-            help="Prefix of the profiling file names. The full profiling result file(s) be "
-            '"[profile_filename_prefix]_batch[batch_size]_input[input_len]_output[output_len].trace.json.gz"',
+            help="Prefix of the profiling output path. The trace will be saved under a directory named "
+            '"[profile_filename_prefix]_batch[batch_size]_input[input_len]_output[output_len].tb"',
         )
 
     @classmethod
@@ -138,23 +141,21 @@ class BenchArgs:
 
 
 def load_model(server_args, port_args, tp_rank):
-    suppress_other_loggers()
+    # suppress_other_loggers()
     rank_print = print if tp_rank == 0 else lambda *args, **kwargs: None
     moe_ep_rank = tp_rank // (server_args.tp_size // server_args.ep_size)
 
     model_config = ModelConfig.from_server_args(server_args)
+    
+    # Create a mesh that includes the 'tensor' axis to satisfy KV cache sharding
+    mesh = jax.sharding.Mesh(jax.devices(), ("tensor",))
+
     model_runner = ModelRunner(
         model_config=model_config,
         mem_fraction_static=server_args.mem_fraction_static,
-        gpu_id=tp_rank,
-        tp_rank=tp_rank,
         tp_size=server_args.tp_size,
-        moe_ep_rank=moe_ep_rank,
-        moe_ep_size=server_args.ep_size,
-        pp_rank=0,
-        pp_size=1,
-        nccl_port=port_args.nccl_port,
         server_args=server_args,
+        mesh=mesh,
     )
     rank_print(f"max_total_num_tokens={model_runner.max_total_num_tokens}")
     tokenizer = get_tokenizer(
@@ -163,7 +164,10 @@ def load_model(server_args, port_args, tp_rank):
         trust_remote_code=server_args.trust_remote_code,
     )
     if server_args.tp_size > 1:
-        dist.barrier()
+        try:
+            jax_mh.sync_global_devices("load_model")
+        except Exception:
+            pass
     return model_runner, tokenizer
 
 
@@ -237,7 +241,6 @@ def prepare_synthetic_inputs_for_latency_test(batch_size, input_len):
     return reqs
 
 
-@torch.no_grad
 def extend(reqs, model_runner):
     batch = ScheduleBatch.init_new(
         reqs=reqs,
@@ -251,39 +254,86 @@ def extend(reqs, model_runner):
     )
     batch.prepare_for_extend()
     _maybe_prepare_mlp_sync_batch(batch, model_runner)
-    model_worker_batch = batch.get_model_worker_batch()
+    # Prepare paddings consistent with Scheduler usage
+    page_size = model_runner.page_size
+    bs_needed = len(batch.seq_lens)
+    # token paddings should cover total extend tokens
+    if hasattr(batch, "extend_lens") and batch.extend_lens is not None:
+        token_needed = int(np.sum(np.array(batch.extend_lens, dtype=np.int64)))
+    else:
+        # fallback: derive extend lengths as seq_len - prefix_len per req
+        token_needed = int(
+            np.sum(np.array(batch.seq_lens, dtype=np.int64))
+        )
+    # cache_loc size must be >= sum of per-seq aligned lengths
+    cache_loc_needed = int(
+        np.sum(
+            ((np.array(batch.seq_lens, dtype=np.int64) + page_size - 1) // page_size)
+            * page_size
+        )
+    )
+    model_worker_batch = batch.get_model_worker_batch(
+        [token_needed], [bs_needed], [cache_loc_needed], page_size
+    )
+    # Prepare attention forward metadata (required by FlashAttention backend)
+    forward_metadata = model_runner.attn_backend.get_forward_metadata(
+        model_worker_batch
+    )
+    model_runner.attn_backend.forward_metadata = forward_metadata
     forward_batch = ForwardBatch.init_new(model_worker_batch, model_runner)
-    logits_output, _ = model_runner.forward(forward_batch)
-    next_token_ids = model_runner.sample(logits_output, forward_batch)
+    logits_metadata = LogitsMetadata.from_model_worker_batch(
+        model_worker_batch, mesh=model_runner.mesh
+    )
+    logits_output, _ = model_runner.forward(
+        forward_batch, logits_metadata=logits_metadata
+    )
+    pad_size = len(model_worker_batch.seq_lens) - model_worker_batch.real_bs
+    sampling_metadata = SamplingMetadata.from_model_worker_batch(
+        model_worker_batch, pad_size=pad_size, mesh=model_runner.mesh
+    )
+    next_token_ids = model_runner.sample(logits_output, sampling_metadata)
     return next_token_ids, logits_output.next_token_logits, batch
 
 
-@torch.no_grad
 def decode(input_token_ids, batch, model_runner):
     batch.output_ids = input_token_ids
     batch.prepare_for_decode()
     _maybe_prepare_mlp_sync_batch(batch, model_runner)
-    model_worker_batch = batch.get_model_worker_batch()
+    # Prepare paddings consistent with Scheduler usage
+    page_size = model_runner.page_size
+    bs_needed = len(batch.seq_lens)
+    cache_loc_needed = int(
+        np.sum(
+            ((np.array(batch.seq_lens, dtype=np.int64) + page_size - 1) // page_size)
+            * page_size
+        )
+    )
+    model_worker_batch = batch.get_model_worker_batch(
+        [bs_needed], [bs_needed], [cache_loc_needed], page_size
+    )
+    # Prepare attention forward metadata (required by FlashAttention backend)
+    forward_metadata = model_runner.attn_backend.get_forward_metadata(
+        model_worker_batch
+    )
+    model_runner.attn_backend.forward_metadata = forward_metadata
     forward_batch = ForwardBatch.init_new(model_worker_batch, model_runner)
-    logits_output, _ = model_runner.forward(forward_batch)
-    next_token_ids = model_runner.sample(logits_output, forward_batch)
+    logits_metadata = LogitsMetadata.from_model_worker_batch(
+        model_worker_batch, mesh=model_runner.mesh
+    )
+    logits_output, _ = model_runner.forward(
+        forward_batch, logits_metadata=logits_metadata
+    )
+    pad_size = len(model_worker_batch.seq_lens) - model_worker_batch.real_bs
+    sampling_metadata = SamplingMetadata.from_model_worker_batch(
+        model_worker_batch, pad_size=pad_size, mesh=model_runner.mesh
+    )
+    next_token_ids = model_runner.sample(logits_output, sampling_metadata)
     return next_token_ids, logits_output.next_token_logits
 
 
 def _maybe_prepare_mlp_sync_batch(batch: ScheduleBatch, model_runner):
-    if require_mlp_sync(model_runner.server_args):
-        Scheduler.prepare_mlp_sync_batch_raw(
-            batch,
-            dp_size=model_runner.server_args.dp_size,
-            attn_tp_size=1,
-            tp_group=model_runner.tp_group,
-            get_idle_batch=None,
-            disable_cuda_graph=model_runner.server_args.disable_cuda_graph,
-            spec_algorithm=SpeculativeAlgorithm.NONE,
-            speculative_num_draft_tokens=None,
-            require_mlp_tp_gather=require_mlp_tp_gather(model_runner.server_args),
-            disable_overlap_schedule=model_runner.server_args.disable_overlap_schedule,
-        )
+    # No-op for JAX bench; MLP sync is not required here
+    return
 
 
 def correctness_test(
@@ -332,7 +382,8 @@ def correctness_test(
 
 
 def synchronize(device):
-    torch.get_device_module(device).synchronize()
+    # JAX: submit a tiny computation and wait for completion
+    jax.random.normal(jax.random.PRNGKey(0), ()).block_until_ready()
 
 
 def latency_test_run_once(
@@ -370,14 +421,9 @@ def latency_test_run_once(
 
     profiler = None
     if profile:
-        profiler = torch.profiler.profile(
-            activities=[
-                torch.profiler.ProfilerActivity.CPU,
-                torch.profiler.ProfilerActivity.CUDA,
-            ],
-            with_stack=True,
-        )
-        profiler.start()
+        profile_dir = f"{profile_filename_prefix}_batch{batch_size}_input{input_len}_output{output_len}.tb"
+        os.makedirs(profile_dir, exist_ok=True)
+        jax_profiler.start_trace(profile_dir)
 
     # Prefill
     synchronize(device)
@@ -410,12 +456,8 @@ def latency_test_run_once(
             )
 
     if profile:
-        profiler.stop()
-        profile_filename = f"{profile_filename_prefix}_batch{batch_size}_input{input_len}_output{output_len}.trace.json.gz"
-        parent_dir = os.path.dirname(os.path.abspath(profile_filename))
-        os.makedirs(parent_dir, exist_ok=True)
-        profiler.export_chrome_trace(profile_filename)
-        rank_print(f"torch profiler chrome trace saved to {profile_filename}")
+        jax_profiler.stop_trace()
+        rank_print(f"JAX profiler trace saved to {profile_dir}")
 
     # Record decode timing from 2nd output
     if output_len > 1:
@@ -504,14 +546,12 @@ def latency_test(
             for result in result_list:
                 fout.write(json.dumps(result) + "\n")
 
-    if server_args.tp_size > 1:
-        destroy_distributed_environment()
-
 
 def main(server_args, bench_args):
     server_args.cuda_graph_max_bs = max(bench_args.batch_size)
+    server_args.ep_size = 1
 
-    _set_envs_and_config(server_args)
+    _set_envs_and_config()
 
     if server_args.model_path:
         if bench_args.correctness_test:
@@ -525,6 +565,7 @@ def main(server_args, bench_args):
         )
 
     port_args = PortArgs.init_new(server_args)
+    port_args.nccl_port = 29500
 
     if server_args.tp_size == 1:
         work_func(server_args, port_args, bench_args, 0)
