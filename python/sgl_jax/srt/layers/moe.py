@@ -112,6 +112,7 @@ class EPMoE(nnx.Module):
         dtype: jnp.dtype = jnp.bfloat16,
         layer_id: int = 0,
         rngs: nnx.Rngs = None,
+        activation: str = "gelu",
     ):
 
         self.config = config
@@ -123,13 +124,17 @@ class EPMoE(nnx.Module):
         self.layer_id = layer_id
         self.expert_parallel_size = expert_parallel_size
         self.mesh = mesh
+        self.activation = activation
         if num_experts % self.expert_parallel_size != 0:
             raise ValueError(
                 f"num_experts({num_experts}) must be divisible by expert_parallel_size ({self.expert_parallel_size})"
             )
 
+        rngs = rngs or nnx.Rngs(0)
+
         self.experts_per_device = num_experts // self.expert_parallel_size
-        expert_kernel_axes = (("data", "tensor"), None, None)
+        has_tensor = "tensor" in self.mesh.axis_names
+        expert_kernel_axes = (("data", "tensor"), None, None) if (self.expert_parallel_size > 1 and has_tensor) else (("data",), None, None) if (self.expert_parallel_size > 1) else (None, None, None)
 
         self.wi_0 = nnx.Param(
             nnx.with_partitioning(nnx.initializers.normal(), expert_kernel_axes)(
@@ -155,10 +160,9 @@ class EPMoE(nnx.Module):
             )
         )
 
-        state = nnx.state(self)
-        pspecs = nnx.get_partition_spec(state)
-        sharded_state = jax.lax.with_sharding_constraint(state, pspecs)
-        nnx.update(self, sharded_state)
+        # Parameters have logical partitioning via with_partitioning; avoid
+        # applying with_sharding_constraint here to keep construction simple
+        # when using AbstractMesh in tests.
 
     def _detect_device_capabilities(self):
         try:
@@ -191,6 +195,16 @@ class EPMoE(nnx.Module):
             output = self._expert_parallel_forward_with_shard_map(inputs, router_logits)
 
         return output
+
+    def _apply_activation(self, x):
+        if self.activation == "gelu":
+            return jax.nn.gelu(x)
+        elif self.activation == "relu":
+            return jax.nn.relu(x)
+        elif self.activation == "silu":
+            return jax.nn.silu(x)
+        else:
+            return x
 
     def _expert_parallel_forward_with_shard_map(self, inputs, router_logits):
         def _internal_moe_computation(
@@ -268,9 +282,9 @@ class EPMoE(nnx.Module):
             in_specs=(
                 P(None),  # hidden_states
                 P(None),  # router_logits
-                P(("data", "tensor"), None, None),  # w0_weights
-                P(("data", "tensor"), None, None),  # w1_weights
-                P(("data", "tensor"), None, None),  # wo_weights
+                P(("data", "tensor"), None, None) if ("tensor" in self.mesh.axis_names) else P(("data",), None, None),  # w0_weights
+                P(("data", "tensor"), None, None) if ("tensor" in self.mesh.axis_names) else P(("data",), None, None),  # w1_weights
+                P(("data", "tensor"), None, None) if ("tensor" in self.mesh.axis_names) else P(("data",), None, None),  # wo_weights
             ),
             out_specs=P(None),
             check_rep=False,
@@ -333,20 +347,24 @@ class EPMoE(nnx.Module):
         return intermediate_output
 
     def _single_device_forward(self, inputs, router_logits):
+        # Compute top-k experts and delegate to indices variant
         top_k_logits, top_k_indices = jax.lax.top_k(
             router_logits, self.num_experts_per_tok
         )
         top_k_weights = jax.nn.softmax(
-            top_k_logits.astype(jnp.float32), axis=-1
+            top_k_logits.astype(jnp.bfloat16), axis=-1
         ).astype(self.dtype)
-
         top_k_weights = top_k_weights / jnp.sum(top_k_weights, axis=-1, keepdims=True)
 
-        return self._single_device_forward(inputs, top_k_indices, top_k_weights)
+        return self._single_device_forward_indices(inputs, top_k_indices, top_k_weights)
 
-    def _single_device_forward(self, inputs, top_k_indices, top_k_weights):
-        num_tokens = inputs.shape[0] * (inputs.shape[1] if inputs.ndim > 1 else 1)
-        inputs_flat = inputs.reshape(num_tokens, -1)
+    def _single_device_forward_indices(self, inputs, top_k_indices, top_k_weights):
+        if inputs.ndim == 2:
+            num_tokens = inputs.shape[0]
+            inputs_flat = inputs
+        else:
+            num_tokens = inputs.shape[0] * inputs.shape[1]
+            inputs_flat = inputs.reshape(num_tokens, -1)
 
         expert_weights = jnp.zeros((num_tokens, self.num_experts), dtype=self.dtype)
         token_indices = jnp.arange(num_tokens)[:, None]
@@ -438,7 +456,7 @@ class EPMoE(nnx.Module):
             send_sizes,
             output_offsets,
             recv_sizes,
-            axis_name=("data", "tensor"),
+            axis_name=("data", "tensor") if ("tensor" in self.mesh.axis_names) else ("data",),
         )
 
         return result
