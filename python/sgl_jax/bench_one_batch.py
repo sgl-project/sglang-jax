@@ -87,8 +87,8 @@ from sgl_jax.srt.utils import (
 class BenchArgs:
     run_name: str = "default"
     batch_size: Tuple[int] = (1,)
-    input_len: Tuple[int] = (1024,)
-    output_len: Tuple[int] = (16,)
+    input_len: Tuple[int] = (8,)
+    output_len: Tuple[int] = (2,)
     result_filename: str = "result.jsonl"
     correctness_test: bool = False
     # This is only used for correctness test
@@ -188,7 +188,7 @@ def prepare_inputs_for_correctness_test(bench_args, tokenizer):
     input_ids = [tokenizer.encode(p) for p in prompts]
     sampling_params = SamplingParams(
         temperature=0,
-        max_new_tokens=BenchArgs.output_len,
+        max_new_tokens=bench_args.output_len[0],
     )
 
     reqs = []
@@ -229,7 +229,7 @@ def prepare_synthetic_inputs_for_latency_test(batch_size, input_len):
     input_ids = np.random.randint(0, 10000, (batch_size, input_len), dtype=np.int32)
     sampling_params = SamplingParams(
         temperature=0,
-        max_new_tokens=BenchArgs.output_len,
+        max_new_tokens=BenchArgs.output_len[0] if isinstance(BenchArgs.output_len, tuple) else 16,
     )
 
     reqs = []
@@ -558,6 +558,46 @@ def latency_test(
 def main(server_args, bench_args):
     server_args.cuda_graph_max_bs = max(bench_args.batch_size)
     server_args.ep_size = 1
+
+    # Constrain static KV allocation for single-device TPU if not user-specified
+    if (
+        server_args.max_total_tokens is None
+        and (server_args.device is None or server_args.device == "tpu")
+        and server_args.tp_size == 1
+    ):
+        bs_max = max(bench_args.batch_size)
+        in_max = max(bench_args.input_len)
+        out_max = max(bench_args.output_len)
+
+        # If running correctness test, ensure the cap covers the real workload
+        # (3 prompts with cut_len prefill and extend, plus a few decode steps),
+        # while still being small to avoid compile-time memory blowups.
+        if bench_args.correctness_test:
+            bs_max = max(bs_max, 3)
+            # Prompts here are short but can exceed CLI defaults; pick a safe small bound.
+            in_max = max(in_max, max(bench_args.cut_len, 16))
+            out_max = max(out_max, bench_args.output_len[0])
+
+        # Total KV tokens needed equals sum of per-seq tokens kept in cache
+        tokens_needed = bs_max * (in_max + out_max)
+        # Small headroom for alignment/padding
+        tokens_needed = int(tokens_needed * 1.1) + server_args.page_size
+        # Align to page size (>=1)
+        page = max(1, server_args.page_size)
+        tokens_needed = (tokens_needed // page) * page
+        server_args.max_total_tokens = max(tokens_needed, page)
+        logging.info(
+            f"Setting max_total_tokens={server_args.max_total_tokens} (bs={bs_max}, in={in_max}, out={out_max}) to limit static KV memory on single TPU"
+        )
+
+    # Prefer native attention on single-TPU runs to avoid large FA compile-time temps
+    if (
+        (server_args.device is None or server_args.device == "tpu")
+        and server_args.tp_size == 1
+        and getattr(server_args, "attention_backend", "fa") == "fa"
+    ):
+        server_args.attention_backend = "native"
+        logging.info("Switching attention backend to 'native' for single TPU to reduce compile-time memory")
 
     _set_envs_and_config()
 

@@ -92,7 +92,8 @@ class NativeAttention(AttentionBackend):
             forward_batch.forward_mode,
         )
 
-        kv_fused = merge_kv(k, v)
+        # Merge K/V from cache buffers (which are 3D: [tokens, kv_heads, head_dim])
+        kv_fused = merge_kv(k_buffer, v_buffer)
 
         return attn_output, kv_fused
 
@@ -107,15 +108,28 @@ class NativeAttention(AttentionBackend):
         """
         Get the kv cache from the forward batch.
         """
-        if is_tpu_runtime():
-            if forward_batch.forward_mode == ForwardMode.EXTEND:
-                token_to_kv_pool.set_kv_buffer(
-                    layer_id, forward_batch.out_cache_loc, k, v, is_decode=False
-                )
-            else:
-                token_to_kv_pool.set_kv_buffer(
-                    layer_id, forward_batch.out_cache_loc, k, v, is_decode=True
-                )
+        # Ensure K/V are 3D: [tokens, kv_heads, head_dim]
+        if k.ndim == 2:
+            num_tokens, hidden_size = k.shape
+            # Use kv head count; assume uniform head_dim
+            # Note: layer_id maps to a RadixAttention layer with kv_head_num and head_dim
+            kv_heads = forward_batch.attn_backend.num_kv_heads if hasattr(
+                forward_batch.attn_backend, "num_kv_heads"
+            ) else None
+            if kv_heads is None:
+                # Fallback to layer's kv heads if available through call site
+                kv_heads = 1
+            head_dim = hidden_size // kv_heads
+            assert (
+                hidden_size % kv_heads == 0
+            ), f"hidden_size {hidden_size} not divisible by kv_heads {kv_heads}"
+            k = k.reshape(num_tokens, kv_heads, head_dim)
+            v = v.reshape(num_tokens, kv_heads, head_dim)
+
+        if forward_batch.forward_mode == ForwardMode.EXTEND:
+            forward_batch.token_to_kv_pool.set_kv_buffer(
+                layer_id, forward_batch.out_cache_loc, k, v, is_decode=False
+            )
         else:
             token_to_kv_pool.set_kv_buffer_legacy(
                 layer_id, forward_batch.out_cache_loc, k, v

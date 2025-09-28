@@ -138,6 +138,14 @@ class ModelRunner:
             sampler_state
         )
 
+        # Store state leaves so they can be passed as dynamic arguments (avoid constant capture)
+        self._model_def = model_def
+        self._model_state_def = model_state_def
+        self._model_state_leaves = model_state_leaves
+        self._sampler_def = sampler_def
+        self._sampler_state_def = sampler_state_def
+        self._sampler_state_leaves = sampler_state_leaves
+
         @partial(
             jax.jit,
             donate_argnames=["token_to_kv_pool"],  # just donate KV cache
@@ -146,10 +154,10 @@ class ModelRunner:
         def jitted_run_model(
             model_def,
             model_state_def,
-            model_state_leaves,
             forward_batch,
             token_to_kv_pool,
             logits_metadata,
+            model_state_leaves,
         ):
             model_state = jax.tree_util.tree_unflatten(
                 model_state_def, model_state_leaves
@@ -158,7 +166,12 @@ class ModelRunner:
             return model(forward_batch, token_to_kv_pool, logits_metadata)
 
         @partial(jax.jit, static_argnames=["sampler_state_def"])
-        def jitted_sampler(sampler_def, sampler_state_def, sampler_state_leaves, *args):
+        def jitted_sampler(
+            sampler_def,
+            sampler_state_def,
+            sampler_state_leaves,
+            *args,
+        ):
             model_state = jax.tree_util.tree_unflatten(
                 sampler_state_def, sampler_state_leaves
             )
@@ -179,7 +192,7 @@ class ModelRunner:
 
         self.jitted_run_model = run_model_wrapper
         self.jitted_sampler = partial(
-            jitted_sampler, sampler_def, sampler_state_def, sampler_state_leaves
+            jitted_sampler, self._sampler_def, self._sampler_state_def
         )
 
     def get_available_device_memory(self):
@@ -400,7 +413,7 @@ class ModelRunner:
 
         with jtu.count_pjit_cpp_cache_miss() as count:
             output, layers_kv_fused, _ = self.jitted_run_model(
-                forward_batch, logits_metadata
+                forward_batch, logits_metadata, self._model_state_leaves
             )
             cache_miss_count = count()
         self._set_kv_cache_after_forward(layers_kv_fused, forward_batch)
