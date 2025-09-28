@@ -1299,7 +1299,9 @@ class ScheduleBatch:
 
     def _available_and_evictable_str(self) -> str:
         available_size = self.token_to_kv_pool_allocator.available_size()
-        evictable_size = self.tree_cache.evictable_size()
+        evictable_size = (
+            self.tree_cache.evictable_size() if self.tree_cache is not None else 0
+        )
         return f"Available tokens: {available_size + evictable_size} ({available_size=} + {evictable_size=})\n"
 
 

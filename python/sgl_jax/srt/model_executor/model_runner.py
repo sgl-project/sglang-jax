@@ -128,6 +128,14 @@ class ModelRunner:
             sampler_state
         )
 
+        # Store state leaves so they can be passed as dynamic arguments (avoid constant capture)
+        self._model_def = model_def
+        self._model_state_def = model_state_def
+        self._model_state_leaves = model_state_leaves
+        self._sampler_def = sampler_def
+        self._sampler_state_def = sampler_state_def
+        self._sampler_state_leaves = sampler_state_leaves
+
         @partial(
             jax.jit,
             donate_argnames=["forward_batch"],
@@ -136,9 +144,9 @@ class ModelRunner:
         def jitted_run_model(
             model_def,
             model_state_def,
-            model_state_leaves,
             forward_batch,
             logits_metadata,
+            model_state_leaves,
         ):
             model_state = jax.tree_util.tree_unflatten(
                 model_state_def, model_state_leaves
@@ -147,18 +155,24 @@ class ModelRunner:
             return model(forward_batch, logits_metadata)
 
         @partial(jax.jit, static_argnames=["sampler_state_def"])
-        def jitted_sampler(sampler_def, sampler_state_def, sampler_state_leaves, *args):
+        def jitted_sampler(
+            sampler_def,
+            sampler_state_def,
+            sampler_state_leaves,
+            *args,
+        ):
             model_state = jax.tree_util.tree_unflatten(
                 sampler_state_def, sampler_state_leaves
             )
             sampler = nnx.merge(sampler_def, model_state)
             return sampler(*args)
 
+        # Bind only small/static structures; pass large leaves dynamically per call
         self.jitted_run_model = partial(
-            jitted_run_model, model_def, model_state_def, model_state_leaves
+            jitted_run_model, self._model_def, self._model_state_def
         )
         self.jitted_sampler = partial(
-            jitted_sampler, sampler_def, sampler_state_def, sampler_state_leaves
+            jitted_sampler, self._sampler_def, self._sampler_state_def
         )
 
     def get_available_device_memory(self):
@@ -372,7 +386,7 @@ class ModelRunner:
 
         with jtu.count_pjit_cpp_cache_miss() as count:
             output, layers_kv_fused, _ = self.jitted_run_model(
-                forward_batch, logits_metadata
+                forward_batch, logits_metadata, self._model_state_leaves
             )
             cache_miss_count = count()
         self._set_kv_cache_after_forward(layers_kv_fused, forward_batch)
@@ -449,8 +463,7 @@ class ModelRunner:
             A list of next_token_ids
         """
         return self.jitted_sampler(
-            logits_output,
-            sampling_metadata,
+            self._sampler_state_leaves, logits_output, sampling_metadata
         )
 
 
