@@ -610,6 +610,7 @@ class Grok1Model(nnx.Module):
     ) -> None:
         super().__init__()
         config.num_hidden_layers = 1
+        print(f"config: {config}")
         self.config = config
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
@@ -704,7 +705,7 @@ class Grok1ForCausalLM(nnx.Module):
                 rngs=rngs,
             )
             # Skip all-gather for replicated head
-            self.logits_processor = LogitsProcessor(config, lm_head=self.lm_head, mesh=mesh, skip_all_gather=True)
+            self.logits_processor = LogitsProcessor(config.vocab_size, lm_head=self.lm_head, mesh=mesh)
         else:
             self.lm_head = ParallelLMHead(
                 num_embeddings=config.vocab_size,
@@ -712,7 +713,7 @@ class Grok1ForCausalLM(nnx.Module):
                 param_dtype=None,
                 rngs=rngs,
             )
-            self.logits_processor = LogitsProcessor(config, lm_head=self.lm_head, mesh=mesh)
+            self.logits_processor = LogitsProcessor(config.vocab_size, lm_head=self.lm_head, mesh=mesh)
 
         self.loaded_param_names = set()
 

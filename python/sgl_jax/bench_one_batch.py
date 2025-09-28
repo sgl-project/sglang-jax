@@ -141,19 +141,27 @@ class BenchArgs:
 
 
 def load_model(server_args, port_args, tp_rank):
+    # TODO: pass in tp_size
+    server_args.tp_size = 1
     # suppress_other_loggers()
     rank_print = print if tp_rank == 0 else lambda *args, **kwargs: None
     moe_ep_rank = tp_rank // (server_args.tp_size // server_args.ep_size)
 
     model_config = ModelConfig.from_server_args(server_args)
-    
-    # Create a mesh that includes the 'tensor' axis to satisfy KV cache sharding
-    mesh = jax.sharding.Mesh(jax.devices(), ("tensor",))
+
+    # Create a mesh that includes both 'data' and 'tensor' axes.
+    # Use a size-1 'data' axis and shard across the 'tensor' axis per tp_size.
+    all_devices = jax.devices()
+    tp = min(server_args.tp_size, len(all_devices))
+    devices = all_devices[:tp]
+    print(f"devices: {devices}")
+    devices_array = np.array(devices, dtype=object).reshape((1, tp))
+    mesh = jax.sharding.Mesh(devices_array, ("data", "tensor"))
 
     model_runner = ModelRunner(
         model_config=model_config,
         mem_fraction_static=server_args.mem_fraction_static,
-        tp_size=server_args.tp_size,
+        tp_size=tp,
         server_args=server_args,
         mesh=mesh,
     )
@@ -163,7 +171,7 @@ def load_model(server_args, port_args, tp_rank):
         tokenizer_mode=server_args.tokenizer_mode,
         trust_remote_code=server_args.trust_remote_code,
     )
-    if server_args.tp_size > 1:
+    if tp > 1:
         try:
             jax_mh.sync_global_devices("load_model")
         except Exception:
@@ -587,7 +595,8 @@ def main(server_args, bench_args):
         for proc in workers:
             proc.join()
 
-        proc.terminate()
+        for proc in workers:
+            proc.terminate()
 
 
 if __name__ == "__main__":

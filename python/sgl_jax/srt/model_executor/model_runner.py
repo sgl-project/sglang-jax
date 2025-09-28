@@ -68,6 +68,7 @@ class ModelRunner:
     ):
         # Parse args
         self.model_config = model_config
+        self.model_config.num_hidden_layers = 1
         self.mem_fraction_static = mem_fraction_static
         self.device = server_args.device
         self.mesh = mesh
@@ -449,10 +450,12 @@ class ModelRunner:
     ) -> Tuple[LogitsProcessorOutput, int]:
         # Enter mesh context so shard_map can see a valid mesh
         try:
-            ctx = jax.set_mesh(self.mesh)
+            ctx = jax.sharding.use_mesh(self.mesh)
         except AttributeError:
-            # Fallback for older JAX where Mesh is a context manager
-            ctx = self.mesh
+            try:
+                ctx = jax.set_mesh(self.mesh)
+            except AttributeError:
+                ctx = self.mesh
         with ctx:
             if (
                 forward_batch.forward_mode.is_decode()
