@@ -437,6 +437,19 @@ _STR_DTYPE_TO_JAX_DTYPE = {
 }
 
 
+def _convert_torch_dtype_to_jax(config_dtype) -> Optional[jnp.dtype]:
+    # In order not to import pytorch package
+    # ugly way for convert pytorch dtype to jax dtype but works :)
+    if (
+        hasattr(config_dtype, "__module__")
+        and config_dtype.__module__
+        and "torch" in config_dtype.__module__
+        and hasattr(config_dtype, "__name__")
+    ):
+        return _STR_DTYPE_TO_JAX_DTYPE.get(config_dtype.__name__, None)
+    return None
+
+
 def _get_and_verify_dtype(
     config: PretrainedConfig,
     dtype: Union[str, jnp.dtype],
@@ -444,6 +457,9 @@ def _get_and_verify_dtype(
     config_dtype = getattr(config, "torch_dtype", None)
     if isinstance(config_dtype, str):
         config_dtype = _STR_DTYPE_TO_JAX_DTYPE.get(config_dtype, None)
+    elif config_dtype is not None:
+        config_dtype = _convert_torch_dtype_to_jax(config_dtype)
+
     if config_dtype is None:
         config_dtype = jnp.float32
 
