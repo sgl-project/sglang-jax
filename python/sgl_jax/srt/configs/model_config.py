@@ -429,11 +429,11 @@ class ModelConfig:
 
 
 _STR_DTYPE_TO_JAX_DTYPE = {
-    "torch.half": jnp.float16,
-    "torch.float16": jnp.float16,
-    "torch.float": jnp.float32,
-    "torch.float32": jnp.float32,
-    "torch.bfloat16": jnp.bfloat16,
+    "half": jnp.float16,
+    "float16": jnp.float16,
+    "float": jnp.float32,
+    "float32": jnp.float32,
+    "bfloat16": jnp.bfloat16,
 }
 
 
