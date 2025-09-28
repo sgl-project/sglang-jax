@@ -111,7 +111,6 @@ class TestSRTEngine(CustomTestCase):
                 True,
             )
             self.assertEqual(decoded_output, item["text"])
-<<<<<<< HEAD
 
     def test_3_engine_sampling_temperature_top_p_top_k_min_p(self):
         input_strings = ["the capital of France is"]
@@ -243,5 +242,3 @@ class TestSRTEngine(CustomTestCase):
         #         True,
         #     )
         #     self.assertEqual(decoded_output, item["text"])
-=======
->>>>>>> 904bc64 (Merge pull request #6 from primatrix/feat/align-sampling-for-tunix)

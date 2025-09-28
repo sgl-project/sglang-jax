@@ -250,7 +250,7 @@ class SamplingMetadata:
         padded_top_ks = np.concat(
             [
                 batch.sampling_info.top_ks,
-                np.array([-1] * pad_size, dtype=batch.sampling_info.top_ks.dtype),
+                np.array([1] * pad_size, dtype=batch.sampling_info.top_ks.dtype),
             ]
         )
         padded_min_ps = np.concat(
@@ -259,6 +259,21 @@ class SamplingMetadata:
                 np.array([0.0] * pad_size, dtype=batch.sampling_info.min_ps.dtype),
             ]
         )
+        if batch.sampling_info.sampling_seeds is not None:
+            padded_sampling_seeds = np.concat(
+                [
+                    batch.sampling_info.sampling_seeds,
+                    np.array(
+                        [DEFAULT_SAMPLING_SEED] * pad_size,
+                        dtype=batch.sampling_info.sampling_seeds.dtype,
+                    ),
+                ]
+            )
+            sampling_seeds_device = device_array(
+                padded_sampling_seeds, sharding=sharding
+            )
+        else:
+            sampling_seeds_device = None
 
         (temperatures_device, top_ps_device, top_ks_device, min_ps_device) = (
             device_array(
@@ -304,6 +319,7 @@ class SamplingMetadata:
             top_ps=top_ps_device,
             top_ks=top_ks_device,
             min_ps=min_ps_device,
+            sampling_seeds=sampling_seeds_device,
             is_all_greedy=batch.sampling_info.is_all_greedy,
             need_min_p_sampling=batch.sampling_info.need_min_p_sampling,
             linear_penalty=linear_penalty_device,
