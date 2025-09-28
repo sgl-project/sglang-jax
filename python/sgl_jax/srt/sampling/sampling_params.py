@@ -78,10 +78,6 @@ class SamplingParams:
             sampling_seed = DEFAULT_SAMPLING_SEED
         self.sampling_seed = sampling_seed
 
-        print(
-            f"[sampling_params__init__] {get_bool_env_var("SGLANG_ENABLE_DETERMINISTIC_SAMPLING")}"
-        )
-
         # Process some special cases
         if 0 <= self.temperature < _SAMPLING_EPS:
             # top_k = 1 means greedy sampling
