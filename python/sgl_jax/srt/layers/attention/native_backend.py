@@ -10,6 +10,7 @@ from sgl_jax.srt.layers.radix_attention import AttentionType, RadixAttention
 from sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch
 from sgl_jax.srt.mem_cache.memory_pool import merge_kv
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sgl_jax.srt.utils.jax_utils import is_tpu_runtime
 
 
 @register_pytree_node_class
@@ -104,13 +105,18 @@ class NativeAttention(AttentionBackend):
         """
         Get the kv cache from the forward batch.
         """
-        if forward_batch.forward_mode == ForwardMode.EXTEND:
-            forward_batch.token_to_kv_pool.set_kv_buffer(
-                layer_id, forward_batch.out_cache_loc, k, v, is_decode=False
-            )
+        if is_tpu_runtime():
+            if forward_batch.forward_mode == ForwardMode.EXTEND:
+                forward_batch.token_to_kv_pool.set_kv_buffer(
+                    layer_id, forward_batch.out_cache_loc, k, v, is_decode=False
+                )
+            else:
+                forward_batch.token_to_kv_pool.set_kv_buffer(
+                    layer_id, forward_batch.out_cache_loc, k, v, is_decode=True
+                )
         else:
-            forward_batch.token_to_kv_pool.set_kv_buffer(
-                layer_id, forward_batch.out_cache_loc, k, v, is_decode=True
+            forward_batch.token_to_kv_pool.set_kv_buffer_legacy(
+                layer_id, forward_batch.out_cache_loc, k, v
             )
 
         k, v = forward_batch.token_to_kv_pool.get_kv_buffer(layer_id)

@@ -93,3 +93,15 @@ def get_available_device_memory(device, distributed=False, empty_cache=True):
 
 def device_array(*data, sharding=None, **kwargs) -> jax.Array:
     return jax.device_put(*data, device=sharding, **kwargs)
+
+
+def is_tpu_runtime() -> bool:
+    """Return True if the current JAX runtime is on TPU devices.
+
+    Prefer checking actual devices; fall back to default backend if necessary.
+    """
+    try:
+        devs = jax.devices()
+        return len(devs) > 0 and all(d.platform == "tpu" for d in devs)
+    except Exception:
+        return jax.default_backend() == "tpu"
