@@ -47,6 +47,7 @@ INIT_INCREMENTAL_DETOKENIZATION_OFFSET = 5
 GLOBAL_SERVER_ARGS_KEYS = [
     "device",
     "disable_radix_cache",
+    "enable_deterministic_sampling",
 ]
 
 PADDING_BUCKETS = [1 << i for i in range(6, 21)]

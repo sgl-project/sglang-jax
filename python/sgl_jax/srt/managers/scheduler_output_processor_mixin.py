@@ -142,6 +142,12 @@ class SchedulerOutputProcessorMixin:
                         logprob_pt += num_input_logprobs
 
         batch.cache_miss_count = cache_miss_count
+
+        if batch.cache_miss_count > 0:
+            logger.info(
+                f"Prefill batch. #bid: {result.bid}, #cache_miss: {cache_miss_count}"
+            )
+
         self.stream_output(
             batch.reqs, batch.return_logprob, skip_stream_req, cache_miss_count
         )
