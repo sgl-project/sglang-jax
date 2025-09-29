@@ -36,7 +36,10 @@ from sgl_jax.srt.managers.io_struct import (
     ReleaseMemoryOccupationReqInput,
     ResumeMemoryOccupationReqInput,
 )
-from sgl_jax.srt.managers.scheduler import run_scheduler_process, run_scheduler_thread
+from sgl_jax.srt.managers.scheduler import (
+    run_scheduler_loop_thread_after_create,
+    run_scheduler_process,
+)
 from sgl_jax.srt.managers.template_manager import TemplateManager
 from sgl_jax.srt.managers.tokenizer_manager import TokenizerManager
 from sgl_jax.srt.sampling.sampling_params import SamplingParams
@@ -559,23 +562,11 @@ def _launch_threads(
     )
 
     scheduler_threads = []
+    scheduler_infos = []
     if server_args.dp_size == 1:
         scheduler_pipe_readers = []
-        reader, writer = mp.Pipe(duplex=False)
-        thread = threading.Thread(
-            target=run_scheduler_thread,
-            args=(
-                server_args,
-                port_args,
-                None,
-                writer,
-            ),
-            daemon=True,
-        )
-        # with memory_saver_adapter.configure_subprocess():
-        thread.start()
-        scheduler_threads.append(thread)
-        scheduler_pipe_readers.append(reader)
+        scheduler_info = run_scheduler_loop_thread_after_create(server_args, port_args)
+        scheduler_infos.append(scheduler_info)
     else:
         pass
 
@@ -621,25 +612,14 @@ def _launch_threads(
     )
 
     # Wait for the model to finish loading
-    scheduler_infos = []
-    for i in range(len(scheduler_pipe_readers)):
-        try:
-            data = scheduler_pipe_readers[i].recv()
-        except EOFError:
-            logger.error(
-                f"Node {i} jax_scheduler is dead. Please check if there are relevant logs."
-            )
-            scheduler_threads[i].join()
-            logger.error(f"{scheduler_threads[i].name} eof")
-            raise
-
-        if data["status"] != "ready":
+    for i in range(len(scheduler_infos)):
+        if scheduler_infos[i]["status"] != "ready":
             raise RuntimeError(
                 "Initialization failed. Please see the error messages above."
             )
-        scheduler_infos.append(data)
 
     # Assume all schedulers have the same scheduler_info
+    assert len(scheduler_infos) > 0, "scheduler_infos is empty"
     scheduler_info = scheduler_infos[0]
     tokenizer_manager.max_req_input_len = scheduler_info["max_req_input_len"]
     return tokenizer_manager, template_manager, scheduler_info
