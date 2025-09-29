@@ -78,6 +78,10 @@ class FlashAttention(AttentionBackend):
         kv_partition_axis: str = "tensor",
         mesh: jax.sharding.Mesh = None,
     ):
+        import flax
+
+        flax.config
+        # Static configuration (not included in PyTree)
         self.vmem_limit_bytes = vmem_limit_bytes
         self.num_heads = num_attn_heads
         if num_kv_heads is not None:
@@ -157,31 +161,6 @@ class FlashAttention(AttentionBackend):
             ),
         )
         return metadata
-
-    def tree_flatten(self):
-        children = (self.forward_metadata,)
-        aux_data = {
-            "num_heads": self.num_heads,
-            "num_kv_heads": self.num_kv_heads,
-            "vmem_limit_bytes": self.vmem_limit_bytes,
-            "head_dim": self.head_dim,
-            "page_size": self.page_size,
-        }
-        return (children, aux_data)
-
-    @classmethod
-    def tree_unflatten(cls, aux_data, children):
-        obj = cls(
-            aux_data["num_heads"],
-            aux_data["num_kv_heads"],
-            aux_data["head_dim"],
-            aux_data["vmem_limit_bytes"],
-            aux_data["page_size"],
-        )
-
-        obj.forward_metadata = children[0]
-
-        return obj
 
     def __call__(
         self,

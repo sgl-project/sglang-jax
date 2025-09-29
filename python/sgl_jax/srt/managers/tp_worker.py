@@ -345,7 +345,7 @@ class ModelWorker:
         )
 
     def set_forward_metadata(self, model_worker_batch: ModelWorkerBatch):
-        self.model_runner.attn_backend.forward_metadata = (
+        self.model_runner.attn_backend.forward_metadata = nnx.data(
             self.worker.model_runner.attn_backend.get_forward_metadata(
                 model_worker_batch
             )
@@ -485,7 +485,7 @@ class ModelWorker:
                 self.mesh,
             )
 
-        self.model_runner.attn_backend.forward_metadata = forward_metadata
+        self.model_runner.attn_backend.forward_metadata = nnx.data(forward_metadata)
         # note: put positions on devices again because the forward_batch has been donated
         if not skip_sample:
             positions = (
