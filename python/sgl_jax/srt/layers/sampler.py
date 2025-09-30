@@ -27,6 +27,15 @@ class Sampler(nnx.Module):
         """Regular sampling branch"""
         logits, sampling_metadata, positions, rng = operands
 
+        # Validate broadcast compatibility for temperature division
+        logits_batch_size = logits.shape[0]
+        temperatures_shape = sampling_metadata.temperatures.shape
+
+        # Temperatures should be (batch_size, 1) for proper broadcasting
+        assert (
+            temperatures_shape[0] == logits_batch_size
+        ), f"Temperature batch size {temperatures_shape[0]} doesn't match logits batch size {logits_batch_size}"
+
         # Post process logits
         processed_logits = jnp.divide(logits, sampling_metadata.temperatures).astype(
             logits.dtype
@@ -78,6 +87,144 @@ class Sampler(nnx.Module):
 
         return None
 
+    def _apply_linear_penalty(self, operands):
+        """Apply linear penalty branch (overlap mode)"""
+        logits, sampling_metadata = operands
+        penalty = sampling_metadata.linear_penalty
+
+        # Validate penalty shape matches logits when penalty exists
+        if penalty is not None:
+            assert (
+                penalty.shape == logits.shape
+            ), f"Linear penalty shape {penalty.shape} doesn't match logits shape {logits.shape}"
+
+        return logits + (
+            penalty.astype(logits.dtype)
+            if penalty is not None
+            else jnp.array(0.0, dtype=logits.dtype)
+        )
+
+    def _apply_individual_penalties(self, operands):
+        """Apply individual penalties branch (non-overlap mode)"""
+        logits, sampling_metadata = operands
+
+        # Validate penalty shapes match logits batch size when they exist
+        if sampling_metadata.cumulated_frequency_penalties is not None:
+            assert (
+                sampling_metadata.cumulated_frequency_penalties.shape == logits.shape
+            ), f"Frequency penalty shape {sampling_metadata.cumulated_frequency_penalties.shape} doesn't match logits shape {logits.shape}"
+
+        if sampling_metadata.cumulated_presence_penalties is not None:
+            assert (
+                sampling_metadata.cumulated_presence_penalties.shape == logits.shape
+            ), f"Presence penalty shape {sampling_metadata.cumulated_presence_penalties.shape} doesn't match logits shape {logits.shape}"
+
+        if sampling_metadata.stop_token_penalties is not None:
+            assert (
+                sampling_metadata.stop_token_penalties.shape == logits.shape
+            ), f"Stop token penalty shape {sampling_metadata.stop_token_penalties.shape} doesn't match logits shape {logits.shape}"
+
+        # Apply frequency penalties if available
+        freq_operands = (logits, sampling_metadata)
+        logits = lax.cond(
+            sampling_metadata.cumulated_frequency_penalties is not None,
+            lambda ops: ops[0]
+            - (
+                ops[1].cumulated_frequency_penalties.astype(ops[0].dtype)
+                if ops[1].cumulated_frequency_penalties is not None
+                else jnp.array(0.0, dtype=ops[0].dtype)
+            ),
+            lambda ops: ops[0],
+            freq_operands,
+        )
+
+        # Apply presence penalties if available
+        presence_operands = (logits, sampling_metadata)
+        logits = lax.cond(
+            sampling_metadata.cumulated_presence_penalties is not None,
+            lambda ops: ops[0]
+            - (
+                ops[1].cumulated_presence_penalties.astype(ops[0].dtype)
+                if ops[1].cumulated_presence_penalties is not None
+                else jnp.array(0.0, dtype=ops[0].dtype)
+            ),
+            lambda ops: ops[0],
+            presence_operands,
+        )
+
+        # Apply min new tokens penalty if available
+        min_tokens_condition = (
+            sampling_metadata.min_new_tokens is not None
+            and sampling_metadata.len_output_tokens is not None
+            and sampling_metadata.stop_token_penalties is not None
+        )
+
+        min_tokens_operands = (logits, sampling_metadata)
+        logits = lax.cond(
+            min_tokens_condition,
+            self._apply_min_tokens_penalty,
+            lambda ops: ops[0],
+            min_tokens_operands,
+        )
+
+        return logits
+
+    def _apply_min_tokens_penalty(self, operands):
+        """Apply min new tokens penalty to stop tokens"""
+        logits, sampling_metadata = operands
+
+        len_output = sampling_metadata.len_output_tokens
+        min_new = sampling_metadata.min_new_tokens
+        stop_penalties = sampling_metadata.stop_token_penalties
+
+        # The parent lax.cond checks for None, but this branch is still traced
+        # when the values are None. This guard prevents a TypeError during trace.
+        if len_output is None or min_new is None or stop_penalties is None:
+            return logits
+
+        # Generate mask for sequences that haven't reached min_new_tokens
+        min_new_tokens_mask = len_output < min_new
+
+        # Apply stop token penalties only for sequences that need more tokens
+        stop_penalty = jnp.where(
+            min_new_tokens_mask.reshape(-1, 1),
+            stop_penalties,
+            jnp.array(0.0, dtype=stop_penalties.dtype),
+        )
+
+        return logits + stop_penalty.astype(logits.dtype)
+
+    def apply_penalties(
+        self, logits: jax.Array, sampling_metadata: SamplingMetadata
+    ) -> jax.Array:
+        """
+        Apply penalties to logits with JIT-optimized tensor operations using lax.cond.
+
+        This method handles penalty application efficiently for both overlap and
+        non-overlap modes by using lax.cond to ensure compilation-time optimization
+        of different penalty application paths.
+
+        Args:
+            logits: The input logits tensor of shape [batch_size, vocab_size]
+            sampling_metadata: Metadata containing penalty information (never None)
+
+        Returns:
+            Modified logits with penalties applied
+        """
+
+        penalty_operands = (logits, sampling_metadata)
+
+        # Use lax.cond to choose between linear penalty (overlap mode)
+        # and individual penalties (non-overlap mode)
+        result_logits = lax.cond(
+            sampling_metadata.linear_penalty is not None,
+            self._apply_linear_penalty,
+            self._apply_individual_penalties,
+            penalty_operands,
+        )
+
+        return result_logits
+
     def __call__(
         self,
         logits_output: LogitsProcessorOutput,
@@ -96,6 +243,10 @@ class Sampler(nnx.Module):
             logits_output.next_token_logits,
             (-1, logits_output.next_token_logits.shape[-1]),
         )
+
+        # Apply penalties before sampling
+        if sampling_metadata.do_penalties:
+            logits = self.apply_penalties(logits, sampling_metadata)
 
         _, rng = jax.random.split(self.rngs.params())
 
@@ -278,6 +429,6 @@ def top_p_normalize_probs_jax(
     probs_sort = probs_sort / probs_sort.sum(axis=-1, keepdim=True)
     # return jnp.zeros_like(probs_sort).scatter_(-1, probs_idx, probs_sort)
 
-    num_tokens, h = probs.shape
+    num_tokens, _ = probs.shape
     row_idx = jnp.arange(num_tokens)[:, None]  # [B, 1], broadcast over H
     return jnp.zeros_like(probs).at[row_idx, probs_idx].set(probs_sort)
