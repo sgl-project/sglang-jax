@@ -124,18 +124,32 @@ class TestFeatures(CustomTestCase):
                     future.result()["meta_info"]["finish_reason"]["type"], "abort"
                 )
 
-    def test_cache_miss(self):
+    def test_cache_miss_prefill(self):
         args = SimpleNamespace(
             base_url=self.base_url,
             text="the capital of France is",
             temperature=0,
-            max_new_tokens=6,
+            max_new_tokens=1,
         )
 
         resp = run_curl(args)
 
         if "cache_miss_count" not in resp["meta_info"]:
-            raise "cache_miss_count is missed in response"
+            raise "[prefill] cache_miss_count is missed in response"
+        self.assertEqual(resp["meta_info"]["cache_miss_count"], 0)
+
+    def test_cache_miss_decode(self):
+        args = SimpleNamespace(
+            base_url=self.base_url,
+            text="the capital of France is",
+            temperature=0,
+            max_new_tokens=2,
+        )
+
+        resp = run_curl(args)
+
+        if "cache_miss_count" not in resp["meta_info"]:
+            raise "[prefill] cache_miss_count is missed in response"
         self.assertEqual(resp["meta_info"]["cache_miss_count"], 0)
 
     def test_logprobs(self):

@@ -11,6 +11,7 @@ import jax.numpy as jnp
 import numpy as np
 from flax import nnx
 from jax.experimental.multihost_utils import broadcast_one_to_all
+from jax.sharding import NamedSharding, PartitionSpec
 from tqdm import tqdm
 
 from sgl_jax.srt.configs.model_config import ModelConfig
@@ -33,6 +34,7 @@ from sgl_jax.srt.utils.common_utils import (
     PRECOMPILE_DEFAULT_BS_PADDINGS,
     PRECOMPILE_DEFAULT_TOKEN_PADDINGS,
 )
+from sgl_jax.srt.utils.jax_utils import device_array
 
 logger = logging.getLogger(__name__)
 
@@ -215,6 +217,9 @@ class ModelWorker:
                     ForwardMode.EXTEND,
                     self.precompile_cache_loc_paddings[-1],
                 )
+                sampling_metadata = SamplingMetadata.from_model_worker_batch(
+                    model_worker_batch, 0, self.mesh
+                )
                 model_worker_batch.forward_batch = ForwardBatch.init_new(
                     model_worker_batch, self.model_runner
                 )
@@ -225,8 +230,10 @@ class ModelWorker:
                             future_token_ids_map,
                         )
                     )
-                self.forward_batch_generation(model_worker_batch, None, True)
 
+                self.forward_batch_generation(
+                    model_worker_batch, None, False, sampling_metadata
+                )
         end_time = time.perf_counter()
         logger.info("[EXTEND] Precompile finished in %.0f secs", end_time - start_time)
 
@@ -274,6 +281,13 @@ class ModelWorker:
 
         end_time = time.perf_counter()
         logger.info("[DECODE] Precompile finished in %.0f secs", end_time - start_time)
+
+    def set_forward_metadata(self, model_worker_batch: ModelWorkerBatch):
+        self.model_runner.attn_backend.forward_metadata = (
+            self.worker.model_runner.attn_backend.get_forward_metadata(
+                model_worker_batch
+            )
+        )
 
     def get_max_padded_size(self):
         """Calculate the max padded batch size and token nums.
@@ -402,6 +416,21 @@ class ModelWorker:
             )
 
         self.model_runner.attn_backend.forward_metadata = forward_metadata
+        # note: put positions on devices again because the forward_batch has been donated
+        if not skip_sample:
+            positions = (
+                model_worker_batch.positions
+                if model_worker_batch.forward_mode.is_decode()
+                else model_worker_batch.seq_lens - 1
+            )
+            positions_device = device_array(
+                positions,
+                sharding=(
+                    NamedSharding(self.model_runner.mesh, PartitionSpec())
+                    if jax.process_count() == 1
+                    else None
+                ),
+            )
         logits_output, cache_miss_count = self.model_runner.forward(
             forward_batch,
             logits_metadata=LogitsMetadata.from_model_worker_batch(
@@ -420,7 +449,9 @@ class ModelWorker:
 
             with jtu.count_pjit_cpp_cache_miss() as count:
                 next_token_ids_device = self.model_runner.sample(
-                    logits_output, sampling_metadata
+                    logits_output,
+                    sampling_metadata,
+                    positions_device,
                 )
                 sample_cache_miss_count = count()
 

@@ -17,7 +17,11 @@ from sgl_jax.srt.configs.load_config import LoadConfig, LoadFormat
 from sgl_jax.srt.configs.model_config import AttentionArch, MockModelConfig, ModelConfig
 from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessorOutput
 from sgl_jax.srt.layers.sampler import Sampler
-from sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch
+from sgl_jax.srt.managers.schedule_batch import (
+    GLOBAL_SERVER_ARGS_KEYS,
+    ModelWorkerBatch,
+    global_server_args_dict,
+)
 from sgl_jax.srt.mem_cache.allocator import (
     BaseTokenToKVPoolAllocator,
     PagedTokenToKVPoolAllocator,
@@ -83,6 +87,12 @@ class ModelRunner:
         self.use_mla_backend = self.model_config.attention_arch == AttentionArch.MLA
 
         self.forward_pass_id = 0
+
+        # Global vars
+        global_server_args_dict.update(
+            {k: getattr(server_args, k) for k in GLOBAL_SERVER_ARGS_KEYS}
+        )
+
         self.model_loader = JAXModelLoader(
             load_config=LoadConfig(
                 load_format=LoadFormat.JAX, download_dir=server_args.download_dir
@@ -438,19 +448,21 @@ class ModelRunner:
         self,
         logits_output: LogitsProcessorOutput,
         sampling_metadata: SamplingMetadata,
+        positions: jax.Array,
     ) -> jax.Array:
         """Sample and compute logprobs and update logits_output.
 
         Args:
             logits_output: The logits output from the model forward
             forward_batch: The forward batch that generates logits_output
-
+            positions: The positions of the tokens in the sequence.
         Returns:
             A list of next_token_ids
         """
         return self.jitted_sampler(
             logits_output,
             sampling_metadata,
+            positions,
         )
 
 

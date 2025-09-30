@@ -2,8 +2,11 @@
 
 from typing import Dict, List, Optional, Union
 
+from sgl_jax.srt.utils import get_bool_env_var
+
 _SAMPLING_EPS = 1e-6
 TOP_K_ALL = 1 << 30
+DEFAULT_SAMPLING_SEED = 42
 
 
 class SamplingParams:
@@ -39,6 +42,7 @@ class SamplingParams:
         no_stop_trim: bool = False,
         stream_interval: Optional[int] = None,
         logit_bias: Optional[Dict[str, float]] = None,
+        sampling_seed: Optional[int] = None,
     ) -> None:
         self.max_new_tokens = max_new_tokens
         self.stop_strs = stop
@@ -65,6 +69,14 @@ class SamplingParams:
         self.no_stop_trim = no_stop_trim
         self.stream_interval = stream_interval
         self.logit_bias = logit_bias
+        # Used for deterministic sampling
+        if (
+            get_bool_env_var("SGLANG_ENABLE_DETERMINISTIC_SAMPLING")
+            and sampling_seed is None
+        ):
+            # If deterministic sampling is enabled and sampling_seed is not set, use the default seed
+            sampling_seed = DEFAULT_SAMPLING_SEED
+        self.sampling_seed = sampling_seed
 
         # Process some special cases
         if 0 <= self.temperature < _SAMPLING_EPS:
@@ -148,3 +160,27 @@ class SamplingParams:
                 else:
                     stop_str_max_len = max(stop_str_max_len, len(stop_str))
             self.stop_str_max_len = stop_str_max_len
+
+    def convert_to_dict(self) -> Dict:
+        # Start with a copy of all instance attributes
+        result = {}
+        for key, value in self.__dict__.items():
+            if key.startswith("_"):
+                continue
+
+            # Handle special conversions
+            if key == "stop_token_ids":
+                # Convert set back to list, or None
+                result[key] = list(value) if value is not None else None
+            # elif key == "top_k":
+            #    # Restore -1 if it was set to TOP_K_ALL
+            #    from sgl_jax.srt.sampling.sampling_params import TOP_K_ALL  # or wherever it's defined
+            #    result[key] = -1 if value == TOP_K_ALL else value
+            elif key == "stop_strs":
+                # The API expects "stop", not "stop_strs"
+                result["stop"] = value
+            else:
+                # Pass through all other fields as-is
+                result[key] = value
+
+        return result

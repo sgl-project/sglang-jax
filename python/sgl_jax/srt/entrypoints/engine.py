@@ -12,7 +12,7 @@ import multiprocessing as mp
 import os
 import signal
 import threading
-from typing import AsyncIterator, Dict, Iterator, List, Optional, Tuple, Union
+from typing import Any, AsyncIterator, Dict, Iterator, List, Optional, Tuple, Union
 
 import zmq
 import zmq.asyncio
@@ -20,25 +20,33 @@ import zmq.asyncio
 # Fix a bug of Python threading
 setattr(threading, "_register_atexit", lambda *args, **kwargs: None)
 
+import json
+
 import uvloop
 
 from sgl_jax.srt.entrypoints.EngineBase import EngineBase
-from sgl_jax.srt.managers.detokenizer_manager import run_detokenizer_process
+from sgl_jax.srt.hf_transformers_utils import get_generation_config
+from sgl_jax.srt.managers.detokenizer_manager import (
+    run_detokenizer_process,
+    run_detokenizer_thread,
+)
 from sgl_jax.srt.managers.io_struct import (
     EmbeddingReqInput,
     GenerateReqInput,
     ReleaseMemoryOccupationReqInput,
     ResumeMemoryOccupationReqInput,
 )
-from sgl_jax.srt.managers.scheduler import run_scheduler_process
+from sgl_jax.srt.managers.scheduler import run_scheduler_process, run_scheduler_thread
 from sgl_jax.srt.managers.template_manager import TemplateManager
 from sgl_jax.srt.managers.tokenizer_manager import TokenizerManager
+from sgl_jax.srt.sampling.sampling_params import SamplingParams
 from sgl_jax.srt.server_args import PortArgs, ServerArgs
 from sgl_jax.srt.utils import (
     configure_logger,
     get_zmq_socket,
     kill_process_tree,
     launch_dummy_health_check_server,
+    pathways_available,
     prepare_model_and_tokenizer,
     set_ulimit,
 )
@@ -84,16 +92,18 @@ class Engine(EngineBase):
         self.port_args = PortArgs.init_new(server_args)
         logger.info(f"{server_args=}")
 
-        # Launch subprocesses
-        tokenizer_manager, template_manager, scheduler_info = _launch_subprocesses(
-            server_args=server_args,
-            port_args=self.port_args,
+        # Launch subprocesses or threads
+        tokenizer_manager, template_manager, scheduler_info = (
+            _launch_subprocesses_or_threads(
+                server_args=server_args,
+                port_args=self.port_args,
+            )
         )
         self.server_args = server_args
         self.tokenizer_manager = tokenizer_manager
         self.template_manager = template_manager
         self.scheduler_info = scheduler_info
-
+        self.default_sampling_params: Union[dict[str, Any], None] = None
         context = zmq.Context(2)
         self.send_to_rpc = get_zmq_socket(
             context, zmq.DEALER, self.port_args.rpc_ipc_name, True
@@ -115,6 +125,9 @@ class Engine(EngineBase):
         The arguments of this function is the same as `sglang/srt/managers/io_struct.py::GenerateReqInput`.
         Please refer to `GenerateReqInput` for the documentation.
         """
+
+        if sampling_params is None:
+            sampling_params = self.get_default_sampling_params()
 
         obj = GenerateReqInput(
             text=prompt,
@@ -159,6 +172,10 @@ class Engine(EngineBase):
         The arguments of this function is the same as `sglang/srt/managers/io_struct.py::GenerateReqInput`.
         Please refer to `GenerateReqInput` for the documentation.
         """
+
+        if sampling_params is None:
+            sampling_params = self.get_default_sampling_params()
+
         obj = GenerateReqInput(
             input_ids=input_ids,
             sampling_params=sampling_params,
@@ -224,6 +241,8 @@ class Engine(EngineBase):
     def shutdown(self):
         """Shutdown the engine"""
         kill_process_tree(os.getpid(), include_parent=False)
+        if pathways_available():
+            self.send_to_rpc.close()
 
     def __enter__(self):
         return self
@@ -343,6 +362,45 @@ class Engine(EngineBase):
             request=None,
         )
 
+    def get_default_sampling_params(self) -> SamplingParams:
+        if self.default_sampling_params is None:
+            config = get_generation_config(
+                self.server_args.model_path,
+                self.server_args.trust_remote_code,
+                self.server_args.revision,
+            )
+            if config is not None:
+                self.default_sampling_params = config.to_diff_dict()
+            else:
+                self.default_sampling_params = {}
+
+            if self.server_args.preferred_sampling_params is not None:
+                self.default_sampling_params.update(
+                    json.loads(self.server_args.preferred_sampling_params)
+                )
+
+            available_params = [
+                "repetition_penalty",
+                "temperature",
+                "top_k",
+                "top_p",
+                "min_p",
+                "max_new_tokens",
+            ]
+            if any(p in self.default_sampling_params for p in available_params):
+                diff_sampling_param = {
+                    p: self.default_sampling_params.get(p)
+                    for p in available_params
+                    if self.default_sampling_params.get(p) is not None
+                }
+                self.default_sampling_params = diff_sampling_param
+            else:
+                self.default_sampling_params = {}
+
+        if self.default_sampling_params:
+            return SamplingParams(**self.default_sampling_params)
+        return SamplingParams()
+
 
 def _set_envs_and_config():
     # Set ulimit
@@ -368,9 +426,14 @@ def _set_envs_and_config():
         kill_process_tree(os.getpid())
 
     signal.signal(signal.SIGQUIT, sigquit_handler)
+    if not pathways_available():
+        # Set mp start method
+        mp.set_start_method("spawn", force=True)
+    else:
+        ## close resource tracker process
+        from multiprocessing import resource_tracker
 
-    # Set mp start method
-    mp.set_start_method("spawn", force=True)
+        resource_tracker._resource_tracker._fd = -1
 
 
 def _launch_subprocesses(
@@ -474,3 +537,117 @@ def _launch_subprocesses(
     scheduler_info = scheduler_infos[0]
     tokenizer_manager.max_req_input_len = scheduler_info["max_req_input_len"]
     return tokenizer_manager, template_manager, scheduler_info
+
+
+def _launch_threads(
+    server_args, port_args: Optional[PortArgs] = None
+) -> Tuple[TokenizerManager, TemplateManager, Dict]:
+    # Configure global environment
+    configure_logger(server_args)
+    server_args.check_server_args()
+    _set_envs_and_config()
+
+    # Allocate ports for inter-process communications
+    if port_args is None:
+        port_args = PortArgs.init_new(server_args)
+        logger.info(f"{server_args=}")
+
+    # If using model from www.modelscope.cn, first download the model.
+    server_args.model_path, server_args.tokenizer_path = prepare_model_and_tokenizer(
+        server_args.model_path, server_args.tokenizer_path
+    )
+
+    scheduler_threads = []
+    if server_args.dp_size == 1:
+        scheduler_pipe_readers = []
+        reader, writer = mp.Pipe(duplex=False)
+        thread = threading.Thread(
+            target=run_scheduler_thread,
+            args=(
+                server_args,
+                port_args,
+                None,
+                writer,
+            ),
+            daemon=True,
+        )
+        # with memory_saver_adapter.configure_subprocess():
+        thread.start()
+        scheduler_threads.append(thread)
+        scheduler_pipe_readers.append(reader)
+    else:
+        pass
+
+    if server_args.node_rank >= 1:
+        # In multi-node cases, non-zero rank nodes do not need to run tokenizer or detokenizer,
+        # so they can just wait here.
+
+        for reader in scheduler_pipe_readers:
+            data = reader.recv()
+            assert data["status"] == "ready"
+
+        if os.getenv("SGLANG_BLOCK_NONZERO_RANK_CHILDREN") == "0":
+            # When using `Engine` as a Python API, we don't want to block here.
+            return None, None, None
+
+        launch_dummy_health_check_server(server_args.host, server_args.port)
+
+        for thread in scheduler_threads:
+            thread.join()
+            logger.error(
+                f"Scheduler or DataParallelController {thread.name} terminated"
+            )
+        return None, None, None
+
+    # Launch detokenizer thread
+    detoken_thread = threading.Thread(
+        target=run_detokenizer_thread,
+        args=(
+            server_args,
+            port_args,
+        ),
+        daemon=True,
+    )
+    detoken_thread.start()
+
+    # Launch tokenizer process
+    tokenizer_manager = TokenizerManager(server_args, port_args)
+
+    # Initialize templates
+    template_manager = TemplateManager()
+    template_manager.initialize_templates(
+        model_path=server_args.model_path,
+    )
+
+    # Wait for the model to finish loading
+    scheduler_infos = []
+    for i in range(len(scheduler_pipe_readers)):
+        try:
+            data = scheduler_pipe_readers[i].recv()
+        except EOFError:
+            logger.error(
+                f"Node {i} jax_scheduler is dead. Please check if there are relevant logs."
+            )
+            scheduler_threads[i].join()
+            logger.error(f"{scheduler_threads[i].name} eof")
+            raise
+
+        if data["status"] != "ready":
+            raise RuntimeError(
+                "Initialization failed. Please see the error messages above."
+            )
+        scheduler_infos.append(data)
+
+    # Assume all schedulers have the same scheduler_info
+    scheduler_info = scheduler_infos[0]
+    tokenizer_manager.max_req_input_len = scheduler_info["max_req_input_len"]
+    return tokenizer_manager, template_manager, scheduler_info
+
+
+def _launch_subprocesses_or_threads(
+    server_args, port_args: Optional[PortArgs] = None
+) -> Tuple[TokenizerManager, TemplateManager, Dict]:
+    if pathways_available():
+        return _launch_threads(server_args, port_args)
+    else:
+        return _launch_subprocesses(server_args, port_args)

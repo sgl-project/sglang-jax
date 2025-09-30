@@ -18,14 +18,14 @@ class Sampler(nnx.Module):
 
     def _greedy_sampling(self, operands):
         """Greedy sampling branch"""
-        logits, _, _ = operands
+        logits, _, _, _ = operands
         batch_next_token_ids = jnp.argmax(logits, -1).flatten()
         logprobs = jax.nn.log_softmax(logits, axis=-1)
         return batch_next_token_ids, logprobs
 
     def _regular_sampling(self, operands):
         """Regular sampling branch"""
-        logits, sampling_metadata, rng = operands
+        logits, sampling_metadata, positions, rng = operands
 
         # Post process logits
         processed_logits = jnp.divide(logits, sampling_metadata.temperatures).astype(
@@ -39,6 +39,8 @@ class Sampler(nnx.Module):
             sampling_metadata.top_ks,
             sampling_metadata.top_ps,
             sampling_metadata.min_ps,
+            positions,
+            sampling_metadata.sampling_seeds,
             sampling_metadata.need_min_p_sampling,
             rng,
         )
@@ -80,18 +82,14 @@ class Sampler(nnx.Module):
         self,
         logits_output: LogitsProcessorOutput,
         sampling_metadata: SamplingMetadata,
+        positions: jax.Array,
     ):
         """Run a sampler & compute logprobs and update logits_output accordingly.
 
         Args:
             logits_output: The logits from the model forward
-            sampling_info: Metadata for sampling
-            return_logprob: If set, store the output logprob information to
-                logits_output
-            top_logprobs_nums: Number of top lobprobs per sequence in a batch
-            batch_next_token_ids: next token IDs. If set, skip sampling and only
-                compute output logprobs It is used for speculative decoding which
-                performs sampling in draft workers.
+            sampling_metadata: Metadata for sampling
+            positions: The positions of the tokens in the sequence.
         """
 
         logits = jnp.reshape(
@@ -101,7 +99,7 @@ class Sampler(nnx.Module):
 
         _, rng = jax.random.split(self.rngs.params())
 
-        operands = (logits, sampling_metadata, rng)
+        operands = (logits, sampling_metadata, positions, rng)
         batch_next_token_ids, logprobs = lax.cond(
             sampling_metadata.is_all_greedy,
             self._greedy_sampling,
@@ -158,17 +156,73 @@ def top_k_top_p_min_p_sampling_from_probs_jax(
     top_ks: jax.Array,
     top_ps: jax.Array,
     min_ps: jax.Array,
-    need_min_p_sampling: bool,
-    rng: nnx.Rngs,
+    positions: jax.Array,
+    sampling_seeds: jax.Array = None,
+    need_min_p_sampling: bool = False,
+    rng: nnx.Rngs = None,
 ):
     """A top-k, top-p and min-p sampling implementation with native jax operations."""
     probs_sort, probs_idx = _sample_part_a(
         probs, top_ks, top_ps, min_ps, need_min_p_sampling
     )
 
-    sampled_index = random.categorical(rng, jnp.log(probs_sort)).reshape(-1, 1)
+    multinomial_operands = (probs_sort, sampling_seeds, positions, rng)
+    sampled_index = lax.cond(
+        sampling_seeds is not None,
+        multinomial_with_seed,
+        multinomial,
+        multinomial_operands,
+    )
 
     return _sample_part_b(probs_idx, sampled_index)
+
+
+def multinomial(
+    operands,
+) -> jax.Array:
+    inputs, _, _, rng = operands
+    return random.categorical(rng, jnp.log(inputs)).reshape(-1, 1)
+
+
+def multinomial_with_seed(
+    operands,
+) -> jax.Array:
+    """
+    Note:
+    1. This implementation is copied from https://github.com/sgl-project/sglang/blob/e2ac7888b8cb1fd6c33a7ec58d27a5f5b5b24e0c/python/sglang/srt/layers/sampler.py#L268.
+    2. Based on last response in issue, the fixed four big prime numbers can be set freely. 8589934591 is out of uin32, so I replace it with 805306457.
+    - issue: https://github.com/sgl-project/sglang/issues/10938
+
+    Samples n elements from an input array `inputs` of shape (n, m) using
+    a unique random seed for each row.
+
+    Args:
+        inputs: A float array of shape (n, m) representing n categorical
+                distributions with m categories each. The values are treated
+                as weights and do not need to sum to 1.
+        seed:   An integer array of shape (n,) containing the random seed
+                for each corresponding row in `inputs`.
+        positions: The positions of the tokens in the sequence.
+
+    Returns:
+        A array of shape (n,) where the i-th element is an index sampled
+        from the distribution in `inputs[i]` using `seed[i]`.
+    """
+    inputs, seed, positions, _ = operands
+    if seed is None:
+        # note: this codes is used to keep compatible with lax.cond
+        return multinomial(operands)
+    n, m = inputs.shape
+    step_seed = seed * 19349663 ^ positions * 73856093
+    seed_expanded = step_seed[:, None]
+    col_indices = jnp.arange(m)[None, :]
+    hashed = seed_expanded * 805306457 ^ col_indices * 479001599
+    uniform_samples = (hashed % (2**24)).astype(jnp.float32) / (2**24)
+    epsilon = 1e-9
+    gumbel_noise = -jnp.log(-jnp.log(uniform_samples + epsilon) + epsilon)
+    log_probs = jnp.log(inputs + epsilon)
+    perturbed_log_probs = log_probs + gumbel_noise
+    return jnp.argmax(perturbed_log_probs, axis=1, keepdims=True)
 
 
 def _apply_min_p_filter(operands):

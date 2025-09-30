@@ -130,6 +130,9 @@ class ServerArgs:
 
     disable_jax_precompile: bool = False
 
+    # For deterministic sampling
+    enable_deterministic_sampling: bool = False
+
     def __post_init__(self):
         # Set missing default values
         if self.tokenizer_path is None:
@@ -182,6 +185,10 @@ class ServerArgs:
                     "Disabling chunked prefill."
                 )
                 self.chunked_prefill_size = -1
+
+        os.environ["SGLANG_ENABLE_DETERMINISTIC_SAMPLING"] = (
+            "1" if self.enable_deterministic_sampling else "0"
+        )
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
@@ -755,6 +762,13 @@ class ServerArgs:
             ],
             default=ServerArgs.attention_backend,
             help="Choose the kernels for attention layers.",
+        )
+
+        # For deterministic sampling
+        parser.add_argument(
+            "--enable-deterministic-sampling",
+            action="store_true",
+            help="Enable deterministic sampling",
         )
 
     @classmethod

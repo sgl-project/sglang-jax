@@ -4,8 +4,9 @@ import dataclasses
 import logging
 import os
 import signal
+import threading
 from collections import OrderedDict
-from typing import Dict, List, Union
+from typing import Dict, List, Optional, Union
 
 import psutil
 import setproctitle
@@ -223,6 +224,7 @@ class DetokenizerManager:
 
         # Incremental decoding
         output_strs = []
+        output_ids_list = []
         for i in range(bs):
             try:
                 s = self.decode_status[recv_obj.rids[i]]
@@ -236,6 +238,7 @@ class DetokenizerManager:
                     "For more details, see: https://github.com/sgl-project/sglang/issues/2812"
                 )
             new_text = read_texts[i][len(surr_texts[i]) :]
+            new_token_ids = read_ids[i][len(surr_ids[i]) :]
             if recv_obj.finished_reasons[i] is None:
                 # Streaming chunk: update the decode status
                 if len(new_text) > 0 and not new_text.endswith("�"):
@@ -251,16 +254,24 @@ class DetokenizerManager:
                 recv_obj.finished_reasons[i],
                 recv_obj.no_stop_trim[i],
             )
+
+            processed_new_token_ids = process_special_tokens_spaces(
+                new_token_ids,
+                recv_obj.skip_special_tokens[i],
+                self.tokenizer.all_special_ids,
+            )
+
             # Incrementally send text.
             incremental_output = output_str[s.sent_offset :]
             s.sent_offset = len(output_str)
             output_strs.append(incremental_output)
+            output_ids_list.append(processed_new_token_ids)
 
         return BatchStrOut(
             rids=recv_obj.rids,
             finished_reasons=recv_obj.finished_reasons,
             output_strs=output_strs,
-            output_ids=None,
+            output_ids=output_ids_list,
             prompt_tokens=recv_obj.prompt_tokens,
             completion_tokens=recv_obj.completion_tokens,
             cached_tokens=recv_obj.cached_tokens,
@@ -279,6 +290,16 @@ class DetokenizerManager:
             output_hidden_states=recv_obj.output_hidden_states,
             cache_miss_count=recv_obj.cache_miss_count,
         )
+
+
+def process_special_tokens_spaces(
+    token_ids: Optional[List[int]] = None,
+    skip_special_tokens: Optional[bool] = None,
+    all_special_ids: Optional[List[int]] = None,
+):
+    if all_special_ids is None or not skip_special_tokens or token_ids is None:
+        return token_ids
+    return [token for token in token_ids if token not in all_special_ids]
 
 
 class LimitedCapacityDict(OrderedDict):
@@ -310,3 +331,21 @@ def run_detokenizer_process(
         traceback = get_exception_traceback()
         logger.error(f"DetokenizerManager hit an exception: {traceback}")
         parent_process.send_signal(signal.SIGQUIT)
+
+
+def run_detokenizer_thread(
+    server_args: ServerArgs,
+    port_args: PortArgs,
+):
+    current_thread = threading.current_thread()
+    current_thread.name = "sglang-jax::detokenizer"
+    configure_logger(server_args)
+    current_process = psutil.Process()
+
+    try:
+        manager = DetokenizerManager(server_args, port_args)
+        manager.event_loop()
+    except Exception:
+        traceback = get_exception_traceback()
+        logger.error(f"DetokenizerManager hit an exception: {traceback}")
+        current_process.send_signal(signal.SIGQUIT)

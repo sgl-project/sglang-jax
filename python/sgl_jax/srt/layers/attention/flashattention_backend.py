@@ -101,14 +101,14 @@ class FlashAttention(AttentionBackend):
             cu_q_lens = np.concatenate(
                 [
                     np.array([0], dtype=np.int32),
-                    np.cumsum(batch.extend_seq_lens),
+                    np.cumsum(batch.extend_seq_lens, dtype=np.int32),
                 ]
             )
         elif batch.forward_mode == ForwardMode.DECODE:
-            cu_q_lens = jnp.concatenate(
+            cu_q_lens = np.concatenate(
                 [
-                    np.array([0], dtype=jnp.int32),
-                    np.cumsum(jnp.ones(len(batch.seq_lens), dtype=np.int32)),
+                    np.array([0], dtype=np.int32),
+                    np.cumsum(np.ones(len(batch.seq_lens), dtype=np.int32)),
                 ]
             )
         else:

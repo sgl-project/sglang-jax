@@ -150,6 +150,7 @@ suites = {
         TestFile("test/srt/openai_server/basic/test_serving_completions.py", 10),
         TestFile("test/srt/openai_server/basic/test_openai_server.py", 10),
         TestFile("test/srt/test_qwen2_5_models.py", 15),
+        TestFile("test/srt/test_srt_engine.py", 15),
     ],
     "per-commit-tpu-v6e-2": [],
     "per-commit-tpu-v6e-4": [
