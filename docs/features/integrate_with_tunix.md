@@ -51,6 +51,7 @@ def update_params(
     else:
         nnx.update(self._model, updated_weights)
 ```
+Note: Add key_mappings and transpose_keys which follows the example of `utils.transfer_state_with_mappings` to handle the mapping and transformation between states.
 
 #### Usage Example
 
@@ -84,7 +85,8 @@ grpo_trainer.train(dataset)
 ### Work in Sgl-jax
 
 1. Support `generate()` and `get_default_sampling_params()` in `Engine`.
-2. Support abilities listed in the following table, like jitted `return_logprob` logic, `repetition_penalty`, etc.
+2. Support abilities listed in the following table.
+3. Support single process in sgl-jax Engine for Pathways.
 
 #### `generate()` API
 
@@ -118,27 +120,19 @@ def generate(
 
   ```json
   {
-      "text":"the output of generate", ## output seq
-      "output_token_logprobs":[[ 
-                  -0.73046875, ## logprobs
-                  12095, ## token_id
-                  null
-              ],[
-                  -0.9765625,
-                  13,
-                  null
-              ]],
+      "text": " Paris. It is located in the", ## output seq
+      "output_ids": [12095, 13, 1084, 374, 7407, 304],
        "meta_info": {
-          "id": "d8e57938583e45eb979db5eb5e8959a0", 
+          "id": "d8e57938583e45eb979db5eb5e8959a0",
           "finish_reason": {
               "type": "length",
-              "length": 128
+              "length": 6
           },
-          "prompt_tokens": 1,
-          "completion_tokens": 128,
+          "prompt_tokens": 5,
+          "completion_tokens": 6,
           "cached_tokens": 0,
           "cache_miss_count": 0,
-          "e2e_latency": 27.593196630477905 
+          "e2e_latency": 0.8139922618865967
       }
   }
   ```
@@ -148,8 +142,8 @@ def generate(
 ```python
 from sgl_jax.srt.entrypoints.engine import Engine
 if __name__ == '__main__':
-    engine=Engine(model_path= 'Qwen/Qwen-7B-Chat', trust_remote_code=True, dist_init_addr='0.0.0.0:10011', nnodes=1 , tp_size=4, device='tpu' ,random_seed=3, node_rank=0, mem_fraction_static=0.4, chunked_prefill_size=8192, download_dir='/tmp', dtype='bfloat16', precompile_bs_paddings = [64], max_running_requests = 64, skip_server_warmup=True, attention_backend='fa',precompile_token_paddings=[8192], page_size=64 ,log_requests=True, log_requests_level=3)
-    output=engine.generate(prompt=['您好', "hello"], sampling_params={"n",2, "temperature": 0.7}, return_logprob=True)
+    engine = Engine(model_path = 'Qwen/Qwen-7B-Chat', trust_remote_code = True, dist_init_addr = '0.0.0.0:10011', nnodes = 1 , tp_size = 4, device = 'tpu' ,random_seed = 3, node_rank = 0, mem_fraction_static = 0.4, chunked_prefill_size = 8192, download_dir = '/tmp', dtype = 'bfloat16', precompile_bs_paddings = [64], max_running_requests = 64, skip_server_warmup = True, attention_backend = 'fa',precompile_token_paddings = [8192], page_size = 64 ,log_requests = True, log_requests_level = 3)
+    output = engine.generate(prompt = ['您好', "hello"], sampling_params = {"n",2, "temperature": 0.7})
     print(len(list(output)), output)
 ```
 
@@ -158,9 +152,11 @@ if __name__ == '__main__':
 ##### Fields Discussion
 
 - `seed`: It is set by tunix sampler but is not used when sampling. Will it be used in the future?
+   - Answer: It will be used in the future. But now it is used to test. It is not sure that whether the deterministic inference will be required or not by algorithm engineers. So here we decide to support deterministic sampling for every request.
 - `presence_penalty` & `frequency_penalty`: Will they be used in the future?
-- `logit_bias`: Will it be used in the future?
+   - Answer: Support them.
 - `logprobs`: Does it mean logprobs of `top_number+1` for every output position? 1 means it include output_id's logprob.
+   - Answer: No, only output_ids' logprobs are required. But the output_ids' logprobs will be recalculated due to accuracy problem between inference framework and training framework. So these logprobs are not required.
 
   > From vLLM: Number of log probabilities to return per output token. When set to
     `None`, no probability is returned. If set to a non-`None` value, the
@@ -170,12 +166,10 @@ if __name__ == '__main__':
     the sampled token, so there may be up to `logprobs+1` elements in the
     response. When set to -1, return all `vocab_size` log probabilities.
 
-   - Confusion1: According to the usage of logprobs in the PPO codes, it looks like we need to get the logprob of every token_id in prompt position rather than the top_num logprob.
 - `prompt_logprobs`: Does it mean logprobs of `top_number` for every prompt position?
+   - Answer: No, they are not required.
   > From vLLM: Number of log probabilities to return per prompt token.
     When set to -1, return all `vocab_size` log probabilities.
-
-   - Confusion2: According to `get_old_per_token_logps()` implemented in `VanillaRollout` and `VllmRollout`, the logprobs of prompt_ids do not return.
 
 Note:
 
@@ -200,8 +194,8 @@ Note:
 | ignore_eos                   | False                         |                               |False, to check               |                               |
 | max_tokens                   | get_default_sampling_params() | max_generation_steps          | max_new_tokens                |
 | min_tokens                   | 0                             |                               | min_new_tokens:int=0, to check|
-| logprobs                     | None                          | 1                             | support, set in payload body:<br>- return_logprob = true<br>- top_logprobs_num = 1 |
-| prompt_logprobs              | None                          | 1                             | support, set in payload body:<br>- return_logprob = true<br>- top_logprobs_num = 1<br>- logprob_start_len = 0 |
+| logprobs                     | None                          | 1                             | tunix does not need it, it will be recalculated.|
+| prompt_logprobs              | None                          | 1                             | tunix does not need them|
 | detokenize                   | True                          | False                         | to support                    |
 | skip_special_tokens          | True                          | True                          | skip_special_tokens:bool=True, to check |
 | spaces_between_special_tokens| True                          |                               | spaces_between_special_tokens:bool=True, to check |
@@ -212,21 +206,37 @@ Note:
 | output_text_buffer_length    | 0                             |                               |lack, not to support because tunix does not use it |                               |
 | guided_decoding              | None                          |                               |lack, not to support because tunix does not use it |                               |
 | logit_bias                   | None                          |                                |None, not to support because tunix does not use it |                               |
-| allowed_token_ids            | None                          |                               | support, set in payload body:<br>- return_logprob = true<br>- token_ids_logprob = None |
+| allowed_token_ids            | None                          |                               | tunix does not need it|
 | extra_args                   | None                          |                               |lack, not to support because tunix does not use it |                               |
 | bad_words                    | None                          |                               |lack, not to support because tunix does not use it |                               |
 | _bad_words_token_ids         | None                          |                               |lack, not to support because tunix does not use it |                               |
 
+#### Single Process for Pathways
+
+Pathways mode is prior to multi controller jax mode, and Pathways requires the sgl-jax Engine runs in a single process. But now the sgl-jax Engine runs in several processes. So we need to support single process. In order to minimum the code modifications, we choose use multi threads to replace multi processes.
+
+```python3
+def pathways_available() -> bool:
+    try:
+        import pathwaysutils
+
+        return True
+    except ImportError:
+        return False
+
+def _launch_subprocesses_or_threads(
+    if pathways_available():
+        return _launch_threads(server_args, port_args)
+    else:
+        return _launch_subprocesses(server_args, port_args)
+```
 
 
 ## Discussion
 
 D1. Will beam search be required in the future?
 Sglang has a MR[https://github.com/sgl-project/sglang/pull/3066] to support it, but it has no progress.
-
-D2: For `generate`, is it enough to only have the `logprob` corresponding to each output_id? Are prompt_ids logprobs necessary?
-
-D3: Implement `update_params()` in tunix or sgl-jax
+  - Answer: Currently it is not required.
 
 ## Test
 
