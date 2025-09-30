@@ -134,6 +134,7 @@ def create_test_data(
 ):
     """Create a real ForwardBatch for testing."""
     assert mode in ["prefill", "decode"]
+
     batch_size = len(lens)
     # Create sequence lengths array
     seq_lens = jnp.array([kv_len for _, kv_len in lens], dtype=jnp.int32)
@@ -235,6 +236,8 @@ def create_test_data(
         page_size=page_size,
         mesh=mesh,
     )
+    if model_config.get("xai_temperature_len", None):
+        attention_backend.xai_temperature_len = model_config["xai_temperature_len"]
     forward_mode = ForwardMode.EXTEND if mode == "prefill" else ForwardMode.DECODE
 
     mwb = ModelWorkerBatch(
@@ -290,7 +293,7 @@ class TestAttention(CustomTestCase):
         self.rng_key = jax.random.PRNGKey(42)
         np.random.seed(42)
 
-    def run_test(self, mode, lens, mode_args):
+    def run_test(self, mode, lens, mode_args, **mode_kwargs):
         # Create mock forward_batch
         num_heads, head_dim, num_kv_heads, page_size, dtype = mode_args
 
@@ -311,6 +314,7 @@ class TestAttention(CustomTestCase):
                 "head_dim": head_dim,
                 "num_hidden_layers": 1,
                 "bf16": is_bf16,
+                "xai_temperature_len": mode_kwargs.get("xai_temperature_len", None),
             },
         )
 
@@ -377,6 +381,7 @@ class TestAttention(CustomTestCase):
             # forward_batch.attn_backend.forward_metadata.cu_kv_lens,
             forward_batch.attn_backend.forward_metadata.num_seqs,
             sm_scale=head_dim**-0.5,
+            **mode_kwargs,
         )
         jax.block_until_ready(expected)
 
@@ -384,6 +389,8 @@ class TestAttention(CustomTestCase):
         def jit_attn(q, k, v, forward_batch):
             out = attn(q, k, v, forward_batch)
             return out
+
+        attn.xai_temperature_len = mode_kwargs.get("xai_temperature_len", None)
 
         # run
         jax_output, _ = jit_attn(q_shard, extend_k, extend_v, forward_batch)
@@ -602,6 +609,105 @@ class TestAttention(CustomTestCase):
 
         self.run_test(
             "decode", lens, (num_heads, head_dim, num_kv_heads, 64, jnp.bfloat16)
+        )
+
+    def test_gqa_prefill_accuracy_page_size_64_temperature(self):
+        """Test JAX attention accuracy against PyTorch reference
+        Testcase (1024, 1024) fails on token 607, possible precision issue?
+        Token 607: max_diff=0.023438, jax_mean=-0.011597, expected_mean=-0.011597, jax_std=0.048096, expected_std=0.047607
+        """
+        # Parameters
+        num_heads = 32
+        num_kv_heads = 8
+        head_dim = 128
+        lens = [
+            (1, 128),
+            (3, 20),
+            (64, 64),
+            (20, 20),
+            (125, 125),
+            # (1024, 1024),
+            (123, 522),
+            (1, 511),
+        ]
+        self.run_test(
+            "prefill",
+            lens,
+            (num_heads, head_dim, num_kv_heads, 64, jnp.bfloat16),
+            xai_temperature_len=512,
+        )
+
+    def test_gqa_decode_accuracy_page_size_64_temperature(self):
+        """Test JAX attention accuracy against native fa"""
+        # Parameters
+        num_heads = 32
+        num_kv_heads = 8
+        head_dim = 128
+        lens = [
+            (1, 119),
+            (1, 127),
+            (1, 128),
+            (1, 129),
+            (1, 133),
+            (1, 1001),
+            (1, 1023),
+            (1, 1024),
+            (1, 1025),
+        ]
+
+        self.run_test(
+            "decode",
+            lens,
+            (num_heads, head_dim, num_kv_heads, 64, jnp.bfloat16),
+            xai_temperature_len=512,
+        )
+
+    def test_gqa_prefill_accuracy_page_size_1_temperature(self):
+        """Test JAX attention accuracy against PyTorch reference"""
+        # Parameters
+        num_heads = 32
+        num_kv_heads = 8
+        head_dim = 128
+        lens = [
+            (1, 128),
+            (3, 20),
+            (64, 64),
+            (20, 20),
+            (125, 125),
+            # (1024, 1024),
+            (123, 522),
+            (1, 511),
+        ]
+        self.run_test(
+            "prefill",
+            lens,
+            (num_heads, head_dim, num_kv_heads, 1, jnp.bfloat16),
+            xai_temperature_len=512,
+        )
+
+    def test_gqa_decode_accuracy_page_size_1_temperature(self):
+        """Test JAX attention accuracy against native fa"""
+        # Parameters
+        num_heads = 32
+        num_kv_heads = 8
+        head_dim = 128
+        lens = [
+            (1, 119),
+            (1, 127),
+            (1, 128),
+            (1, 129),
+            (1, 133),
+            (1, 1001),
+            (1, 1023),
+            (1, 1024),
+            (1, 1025),
+        ]
+
+        self.run_test(
+            "decode",
+            lens,
+            (num_heads, head_dim, num_kv_heads, 1, jnp.bfloat16),
+            xai_temperature_len=512,
         )
 
 
