@@ -8,6 +8,7 @@ import huggingface_hub
 import jax
 import jax.numpy as jnp
 from flax import nnx
+import numpy as np
 
 from sgl_jax.srt.configs.load_config import LoadConfig, LoadFormat
 from sgl_jax.srt.configs.model_config import ModelConfig
@@ -179,6 +180,52 @@ class JAXDummyModelLoader(BaseModelLoader):
         model_class, _ = get_model_architecture(model_config)
         return model_class
 
+    # def initialize_dummy_weights_pytorch(
+    #     model: torch.nn.Module,
+    #     low: float = -1e-3,
+    #     high: float = 1e-3,
+    #     seed: int = 1234,
+    # ) -> None:
+    #     """
+    #     Fill all floating tensors in model.state_dict() from a NumPy RNG.
+    #     For each tensor, the RNG is re-seeded with `seed`, and a flat stream
+    #     of length `numel` is drawn in a generation dtype (fp16 if <16-bit,
+    #     else native; bfloat16 generates in fp32), then reshaped and cast to
+    #     the tensor's target dtype. Values depend only on (numel, dtype, seed).
+    #     """
+    #     def _np_gen_dtype(tdtype: torch.dtype) -> np.dtype:
+    #         # generation dtype (host-side)
+    #         bits = torch.finfo(tdtype).bits
+    #         if bits < 16:
+    #             return np.float16
+    #         if tdtype is torch.bfloat16:
+    #             return np.float32
+    #         return {torch.float16: np.float16,
+    #                 torch.float32: np.float32,
+    #                 torch.float64: np.float64}.get(tdtype, np.float32)
+
+    #     for tens in model.state_dict().values():
+    #         if not torch.is_floating_point(tens):
+    #             continue
+
+    #         print(f"Tensor name: {tens.__dict__.get('_name', 'unknown')}, dtype: {tens.dtype}")
+    #         tgt_dtype = tens.dtype
+    #         dev = tens.device
+    #         numel = tens.numel()
+    #         gen_dtype = _np_gen_dtype(tgt_dtype)
+
+    #         # Per-parameter reseed so results are independent of order/partitioning
+    #         rng = np.random.default_rng(seed)
+    #         flat = rng.uniform(low, high, size=(numel,)).astype(gen_dtype)
+    #         arr = flat.reshape(tuple(tens.shape))
+
+    #         t = torch.from_numpy(arr).to(device=dev)   # dtype = gen_dtype
+    #         t = t.to(dtype=tgt_dtype)                  # cast to target dtype
+
+    #         with torch.no_grad():
+    #             tens.copy_(t)
+    #     print(model.state_dict())
+
     def _initialize_dummy_weights(
         self,
         model: nnx.Module,
@@ -186,32 +233,48 @@ class JAXDummyModelLoader(BaseModelLoader):
         high: float = 1e-3,
         seed: int = 1234,
     ) -> None:
-        """Initialize floating-point weights with random values.
-
-        Values only depend on parameter size and dtype (and fixed seed),
-        matching the PyTorch dummy loader behavior.
+        """
+        Fill all floating arrays in nnx.state(model) from a NumPy RNG.
+        For each array, the RNG is re-seeded with `seed`, we draw a flat
+        stream of length `numel` in a generation dtype (fp16 if <16-bit,
+        else native; bfloat16 generates in fp32), reshape to array.shape,
+        cast to the target dtype, and (if present) re-apply the array's
+        sharding spec so partitioning doesn't affect values.
         """
         params = nnx.state(model)
         pspecs = nnx.get_partition_spec(params)
-        key = jax.random.PRNGKey(seed)
 
-        def init_value(x, pspec):
+        def _np_gen_dtype(jdtype) -> np.dtype:
+            bits = jnp.finfo(jdtype).bits
+            if bits < 16:
+                return np.float16
+            if jdtype == jnp.bfloat16:
+                return np.float32
+            return {jnp.float16: np.float16,
+                    jnp.float32: np.float32,
+                    jnp.float64: np.float64}.get(jdtype, np.float32)
+
+        def _init_leaf(x, pspec):
             if isinstance(x, jax.Array) and jnp.issubdtype(x.dtype, jnp.floating):
-                target_dtype = x.dtype
-                gen_dtype = jnp.float16 if jnp.finfo(target_dtype).bits < 16 else target_dtype
-                values = jax.random.uniform(
-                    key,
-                    shape=x.shape,
-                    minval=low,
-                    maxval=high,
-                    dtype=gen_dtype,
-                ).astype(target_dtype)
-                # Ensure arrays respect original sharding
-                return jax.lax.with_sharding_constraint(values, pspec)
+                tgt_dtype = x.dtype
+                gen_dtype = _np_gen_dtype(tgt_dtype)
+                numel = int(np.prod(x.shape))
+
+                # Per-parameter reseed (shape-agnostic stream)
+                rng = np.random.default_rng(seed)
+                flat = rng.uniform(low, high, size=(numel,)).astype(gen_dtype)
+                arr_np = flat.reshape(x.shape)
+
+                arr_jax = jnp.asarray(arr_np, dtype=tgt_dtype)
+                if pspec is not None:
+                    arr_jax = jax.lax.with_sharding_constraint(arr_jax, pspec)
+                return arr_jax
             return x
 
-        new_params = jax.tree_util.tree_map(init_value, params, pspecs)
+        new_params = jax.tree_util.tree_map(_init_leaf, params, pspecs)
         nnx.update(model, new_params)
+        print(f"new_params: {new_params}")
+
 
     def load_model(
         self,
