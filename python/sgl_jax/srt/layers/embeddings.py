@@ -202,7 +202,8 @@ class RotaryEmbedding(nnx.Module):
         self.is_neox_style = is_neox_style
         self.dtype = dtype
 
-        self.cos_sin_cache = self._compute_cos_sin_cache().astype(dtype=dtype)
+        # may need to keep the cache in float32
+        self._cos_sin_cache = self._compute_cos_sin_cache().astype(dtype=dtype)
 
     def __call__(
         self,
@@ -250,6 +251,14 @@ class RotaryEmbedding(nnx.Module):
         sin, cos = jnp.sin(freqs), jnp.cos(freqs)
         cache = jnp.concatenate((cos, sin), axis=-1)
         return cache
+
+    @property
+    def cos_sin_cache(self) -> jax.Array:
+        return self._cos_sin_cache
+
+    @cos_sin_cache.setter
+    def cos_sin_cache(self, _):
+        raise AttributeError("cos_sin_cache is read-only and cannot be modified")
 
 
 class Llama3RotaryEmbedding(RotaryEmbedding):
