@@ -13,6 +13,8 @@ from sgl_jax.srt.layers.embeddings import (
     Embed,
     ParallelLMHead,
     RotaryEmbedding,
+    _yarn_get_mscale,
+    _yarn_find_correction_range,
 )
 from sgl_jax.srt.layers.layernorm import RMSNorm, dual_rmsnorm_forward
 from sgl_jax.srt.layers.linear import LinearBase
@@ -95,7 +97,6 @@ class ScalingRotaryEmbedding(RotaryEmbedding):
         self.beta_fast = beta_fast
         self.beta_slow = beta_slow
         # Get n-d magnitude scaling corrected for interpolation
-        from sgl_jax.srt.layers.embeddings import _yarn_get_mscale
         self.mscale = float(_yarn_get_mscale(self.scaling_factor) * attn_factor)
         super().__init__(
             head_size, rotary_dim, max_position_embeddings, base, is_neox_style, dtype
@@ -108,7 +109,6 @@ class ScalingRotaryEmbedding(RotaryEmbedding):
         inv_freq_extrapolation = 1.0 / pos_freqs
         inv_freq_interpolation = 1.0 / (scaling_factor * pos_freqs)
 
-        from sgl_jax.srt.layers.embeddings import _yarn_find_correction_range
         low, high = _yarn_find_correction_range(
             self.beta_fast,
             self.beta_slow,
@@ -432,8 +432,12 @@ class Grok1Attention(nnx.Module):
         q, k = self.rotary_emb(positions, q, k)
 
         # Apply attention (backend may return tuple)
+        jax.debug.print("before attn q: {q}", q=q)
+        jax.debug.print("before attn k: {k}", k=k)
+        jax.debug.print("before attn v: {v}", v=v)
         attn_ret = self.attn(q, k, v, forward_batch)
         attn_output = attn_ret[0] if isinstance(attn_ret, tuple) else attn_ret
+        jax.debug.print("after attn attn_ret: {attn_ret}", attn_ret=attn_ret)
 
         # Project output
         output, _ = self.o_proj(attn_output)
@@ -569,14 +573,16 @@ class Grok1DecoderLayer(nnx.Module):
             )
         else:
             # First layer or no deferred norm - use fused_rmsnorm equivalent
-            normalized, residual = self.pre_attn_norm(hidden_states), hidden_states
+            hidden_states, residual = self.pre_attn_norm(hidden_states), hidden_states
 
         # Self-attention
+        jax.debug.print("before self_attn hidden_states: {hidden_states}", hidden_states=hidden_states)
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
             forward_batch=forward_batch,
         )
+        jax.debug.print("after self_attn hidden_states: {hidden_states}", hidden_states=hidden_states)
 
         # All-reduce across tensor parallel ranks (matching PyTorch)
         if self.tp_axis_size > 1 and ("tensor" in get_abstract_mesh().shape):
@@ -610,6 +616,7 @@ class Grok1Model(nnx.Module):
     ) -> None:
         super().__init__()
         config.num_hidden_layers = 1
+        config.attn_temperature_len = -1
         print(f"config: {config}")
         self.config = config
         self.padding_idx = config.pad_token_id
@@ -761,6 +768,8 @@ class Grok1ForCausalLM(nnx.Module):
         """Forward pass through the model using unified forward_batch API."""
         input_ids = forward_batch.input_ids
         positions = forward_batch.positions
+        jax.debug.print("input_ids: {input_ids}", input_ids=input_ids)
+        jax.debug.print("positions: {positions}", positions=positions)
         hidden_states = self.model(input_ids, positions, forward_batch, None)
         output = self.logits_processor(hidden_states, logits_metadata)
         # Return values consistent with other models: (output, layers_kv_fused, layers_callback_flag)
