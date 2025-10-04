@@ -427,6 +427,7 @@ class Grok1Attention(nnx.Module):
 
         # Split QKV (matching PyTorch split logic)
         q, k, v = jnp.split(qkv, [self.q_size, self.q_size + self.kv_size], axis=-1)
+        jax.debug.print("before attn qkv: {qkv}", qkv=qkv)
 
         # Apply rotary position embeddings
         q, k = self.rotary_emb(positions, q, k)
