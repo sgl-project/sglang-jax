@@ -438,7 +438,7 @@ class Grok1Attention(nnx.Module):
         jax.debug.print("before attn v: {v}", v=v)
         attn_ret = self.attn(q, k, v, forward_batch)
         attn_output = attn_ret[0] if isinstance(attn_ret, tuple) else attn_ret
-        jax.debug.print("after attn attn_ret: {attn_ret}", attn_ret=attn_ret)
+        jax.debug.print("after attn attn_output: {attn_output}, shape: {shape}", attn_output=attn_output, shape=attn_output.shape)
 
         # Project output
         output, _ = self.o_proj(attn_output)
@@ -702,13 +702,14 @@ class Grok1ForCausalLM(nnx.Module):
         )
 
         # Language modeling head (matching PyTorch logic for replicated vs parallel)
+        lm_head_params_dtype = None
         if self.replicate_lm_head:
             # ReplicatedLinear equivalent
             self.lm_head = LinearBase(
                 input_size=config.hidden_size,
                 output_size=config.vocab_size,
                 use_bias=False,
-                params_dtype=None,
+                params_dtype=jnp.bfloat16,
                 kernel_axes=None,
                 rngs=rngs,
             )
@@ -718,7 +719,7 @@ class Grok1ForCausalLM(nnx.Module):
             self.lm_head = ParallelLMHead(
                 num_embeddings=config.vocab_size,
                 features=config.hidden_size,
-                param_dtype=None,
+                param_dtype=jnp.bfloat16,
                 rngs=rngs,
             )
             self.logits_processor = LogitsProcessor(config.vocab_size, lm_head=self.lm_head, mesh=mesh)

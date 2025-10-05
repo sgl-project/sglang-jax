@@ -15,13 +15,14 @@ class RMSNorm(nnx.Module):
         hidden_size: int,
         epsilon: float = 1e-6,
         kernel_axes: Optional[Sequence[str]] = None,
+        params_dtype: Optional[jnp.dtype] = jnp.bfloat16,
         rngs: nnx.Rngs = None,
     ):
         rngs = rngs or nnx.Rngs(0)
         self.variance_epsilon = epsilon
         self.weight = nnx.Param(
             nnx.with_partitioning(nnx.initializers.ones, kernel_axes)(
-                rngs.params(), (hidden_size,)
+                rngs.params(), (hidden_size,), params_dtype
             )
         )
 
