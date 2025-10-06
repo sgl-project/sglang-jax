@@ -13,17 +13,15 @@ from sgl_jax.srt.layers.embeddings import (
     Embed,
     ParallelLMHead,
     RotaryEmbedding,
-    _yarn_get_mscale,
     _yarn_find_correction_range,
+    _yarn_get_mscale,
 )
 from sgl_jax.srt.layers.layernorm import RMSNorm, dual_rmsnorm_forward
 from sgl_jax.srt.layers.linear import LinearBase
-from sgl_jax.srt.layers.logits_processor import LogitsProcessor
-from sgl_jax.srt.layers.logits_processor import LogitsMetadata
+from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
 from sgl_jax.srt.layers.moe import EPMoE
 from sgl_jax.srt.layers.radix_attention import RadixAttention
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
-from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
 
 logger = logging.getLogger(__name__)
 
@@ -70,7 +68,7 @@ def get_rope_scaling(config):
 
 
 class ScalingRotaryEmbedding(RotaryEmbedding):
-    """Scale the RotaryEmbedding in a way similar to YaRN method. 
+    """Scale the RotaryEmbedding in a way similar to YaRN method.
     https://arxiv.org/pdf/2309.00071.
     """
 
@@ -121,7 +119,7 @@ class ScalingRotaryEmbedding(RotaryEmbedding):
             1
             - _yarn_linear_ramp_mask(low, high, self.rotary_dim // 2, dtype=jnp.float32)
         ) * self.extrapolation_factor
-        
+
         if self.extra_method in ["original"]:
             inv_freq = inv_freq_extrapolation
         elif self.extra_method in ["yarn", "yarn_linear"]:
@@ -136,6 +134,7 @@ class ScalingRotaryEmbedding(RotaryEmbedding):
             )
         elif self.extra_method == "theta_scale":
             import math
+
             exponents = jnp.arange(0, self.rotary_dim, 2, dtype=jnp.float32)
             theta_scale_exponent = self.base ** (
                 math.log(
@@ -165,7 +164,7 @@ class ScalingRotaryEmbedding(RotaryEmbedding):
 
 class Grok1MLP(nnx.Module):
     """Standard MLP layer for Grok-1 model."""
-    
+
     def __init__(
         self,
         hidden_size: int,
@@ -183,7 +182,7 @@ class Grok1MLP(nnx.Module):
             output_size=intermediate_size * 2,
             use_bias=False,
             params_dtype=dtype,
-            kernel_axes=(None, "tensor") if ("tensor" in get_abstract_mesh().shape) else (None, None),
+            kernel_axes=(None, "tensor"),
             rngs=rngs,
         )
         self.down_proj = LinearBase(
@@ -191,7 +190,7 @@ class Grok1MLP(nnx.Module):
             output_size=hidden_size,
             use_bias=False,
             params_dtype=dtype,
-            kernel_axes=("tensor", None) if ("tensor" in get_abstract_mesh().shape) else (None, None),
+            kernel_axes=("tensor", None),
             rngs=rngs,
         )
         self.act_fn = GeluAndMul(approximate="tanh")
@@ -232,7 +231,7 @@ class Grok1MoE(nnx.Module):
 
         if mesh is None:
             mesh = get_abstract_mesh()
-            
+
         # Gate always runs at full precision for stability
         # (see https://arxiv.org/pdf/2101.03961)
         self.gate = LinearBase(
@@ -244,7 +243,9 @@ class Grok1MoE(nnx.Module):
             rngs=rngs,
         )
 
-        self.router_logit_softcapping = getattr(config, "router_logit_softcapping", 30.0)
+        self.router_logit_softcapping = getattr(
+            config, "router_logit_softcapping", 30.0
+        )
 
         # Determine MoE implementation based on parallelism
         expert_parallel_size = mesh.shape.get("data", 1) * mesh.shape.get("tensor", 1)
@@ -287,12 +288,12 @@ class Grok1MoE(nnx.Module):
     def __call__(self, hidden_states: jax.Array) -> jax.Array:
         # Router computation with soft capping
         router_logits, _ = self.gate(hidden_states)
-        
+
         # Apply soft capping for stability (matching PyTorch implementation)
         if self.router_logit_softcapping != 0:
             router_logits = router_logits / self.router_logit_softcapping
             router_logits = jax.nn.tanh(router_logits) * self.router_logit_softcapping
-            
+
         # Note: The PyTorch version applies softmax in the routing function,
         # but here we pass the logits directly to the experts layer
         # which handles the routing internally
@@ -301,7 +302,7 @@ class Grok1MoE(nnx.Module):
 
 class Grok1Attention(nnx.Module):
     """Multi-head attention layer for Grok-1 with RoPE positional encoding."""
-    
+
     def __init__(
         self,
         config: PretrainedConfig,
@@ -319,33 +320,19 @@ class Grok1Attention(nnx.Module):
         self.config = config
         self.layer_id = layer_id
         self.hidden_size = hidden_size
-        
+
         if mesh is None:
             mesh = get_abstract_mesh()
-        
-        # Handle tensor parallelism for attention heads
-        attn_tp_size = mesh.shape.get("tensor", 1)
-        self.total_num_heads = num_heads
-        assert self.total_num_heads % attn_tp_size == 0
-        self.num_heads = self.total_num_heads // attn_tp_size
-        
-        self.total_num_kv_heads = num_kv_heads
-        if self.total_num_kv_heads >= attn_tp_size:
-            # Number of KV heads is greater than TP size, so we partition
-            # the KV heads across multiple tensor parallel GPUs.
-            assert self.total_num_kv_heads % attn_tp_size == 0
-        else:
-            # Number of KV heads is less than TP size, so we replicate
-            # the KV heads across multiple tensor parallel GPUs.
-            assert attn_tp_size % self.total_num_kv_heads == 0
-        self.num_kv_heads = max(1, self.total_num_kv_heads // attn_tp_size)
-        
+
+        self.num_heads = num_heads
+        self.num_kv_heads = num_kv_heads
+
         self.head_dim = getattr(config, "head_dim", 128)
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
         self.scaling = self.head_dim**-0.5
         self.rope_theta = rope_theta
-        
+
         rope_scaling = get_rope_scaling(config)
         self.rope_rotate_half_dims = getattr(config, "rope_rotate_half_dims", False)
 
@@ -358,7 +345,7 @@ class Grok1Attention(nnx.Module):
             kernel_axes=(None, "tensor") if ("tensor" in mesh.shape) else (None, None),
             rngs=rngs,
         )
-        
+
         self.o_proj = LinearBase(
             input_size=self.num_heads * self.head_dim,  # Use local num_heads
             output_size=hidden_size,
@@ -438,7 +425,11 @@ class Grok1Attention(nnx.Module):
         jax.debug.print("before attn v: {v}", v=v)
         attn_ret = self.attn(q, k, v, forward_batch)
         attn_output = attn_ret[0] if isinstance(attn_ret, tuple) else attn_ret
-        jax.debug.print("after attn attn_output: {attn_output}, shape: {shape}", attn_output=attn_output, shape=attn_output.shape)
+        jax.debug.print(
+            "after attn attn_output: {attn_output}, shape: {shape}",
+            attn_output=attn_output,
+            shape=attn_output.shape,
+        )
 
         # Project output
         output, _ = self.o_proj(attn_output)
@@ -447,7 +438,7 @@ class Grok1Attention(nnx.Module):
 
 class Grok1DecoderLayer(nnx.Module):
     """A single decoder layer of the Grok-1 model."""
-    
+
     def __init__(
         self,
         config: PretrainedConfig,
@@ -534,12 +525,12 @@ class Grok1DecoderLayer(nnx.Module):
         # Setup FFN function based on configuration (matching PyTorch logic)
         if self.num_experts > 0:
             if self.residual_moe:
-                if mesh.size > 1 and ("tensor" in get_abstract_mesh().shape):
-                    self.ffn = lambda x: jax.lax.psum(
-                        self.moe_with_rmoe(x), axis_name="tensor"
-                    )
-                else:
-                    self.ffn = self.moe_with_rmoe
+                # if mesh.size > 1 and ("tensor" in get_abstract_mesh().shape):
+                #     self.ffn = lambda x: jax.lax.psum(
+                #         self.moe_with_rmoe(x), axis_name="tensor"
+                #     )
+                # else:
+                self.ffn = self.moe_with_rmoe
             else:
                 self.ffn = self.block_sparse_moe
         else:
@@ -577,17 +568,23 @@ class Grok1DecoderLayer(nnx.Module):
             hidden_states, residual = self.pre_attn_norm(hidden_states), hidden_states
 
         # Self-attention
-        jax.debug.print("before self_attn hidden_states: {hidden_states}", hidden_states=hidden_states)
+        jax.debug.print(
+            "before self_attn hidden_states: {hidden_states}",
+            hidden_states=hidden_states,
+        )
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
             forward_batch=forward_batch,
         )
-        jax.debug.print("after self_attn hidden_states: {hidden_states}", hidden_states=hidden_states)
+        jax.debug.print(
+            "after self_attn hidden_states: {hidden_states}",
+            hidden_states=hidden_states,
+        )
 
         # All-reduce across tensor parallel ranks (matching PyTorch)
-        if self.tp_axis_size > 1 and ("tensor" in get_abstract_mesh().shape):
-            hidden_states = jax.lax.psum(hidden_states, axis_name="tensor")
+        # if self.tp_axis_size > 1 and ("tensor" in get_abstract_mesh().shape):
+        #     hidden_states = jax.lax.psum(hidden_states, axis_name="tensor")
 
         # Apply post-attention norm and pre-MoE norm (matching PyTorch fused_dual_residual_rmsnorm)
         hidden_states, residual = dual_rmsnorm_forward(
@@ -600,14 +597,14 @@ class Grok1DecoderLayer(nnx.Module):
 
         # Feed-forward network
         hidden_states = self.ffn(hidden_states)
-        
+
         # Return with deferred post-MoE norm (matching PyTorch)
         return hidden_states, residual, self.post_moe_norm
 
 
 class Grok1Model(nnx.Module):
     """The main Grok-1 transformer model."""
-    
+
     def __init__(
         self,
         config: PretrainedConfig,
@@ -635,7 +632,7 @@ class Grok1Model(nnx.Module):
             Grok1DecoderLayer(config=config, layer_id=i, mesh=mesh, rngs=rngs)
             for i in range(config.num_hidden_layers)
         ]
-        
+
         # Final layer norm (using eps to match PyTorch)
         self.norm = RMSNorm(config.hidden_size, epsilon=config.rms_norm_eps, rngs=rngs)
 
@@ -650,7 +647,7 @@ class Grok1Model(nnx.Module):
         if input_embeds is None:
             hidden_states = self.embed_tokens(input_ids)
             # Apply embedding scaling if specified (matching PyTorch)
-            if hasattr(self.config, 'embedding_multiplier_scale'):
+            if hasattr(self.config, "embedding_multiplier_scale"):
                 hidden_states = hidden_states * self.config.embedding_multiplier_scale
         else:
             hidden_states = input_embeds
@@ -676,7 +673,7 @@ class Grok1Model(nnx.Module):
 
 class Grok1ForCausalLM(nnx.Module):
     """Grok-1 model with a causal language modeling head."""
-    
+
     def __init__(
         self,
         config: PretrainedConfig,
@@ -695,10 +692,7 @@ class Grok1ForCausalLM(nnx.Module):
 
         # Main model
         self.model = Grok1Model(
-            config, 
-            rngs=rngs, 
-            mesh=mesh,
-            replicate_embedding=self.replicate_embedding
+            config, rngs=rngs, mesh=mesh, replicate_embedding=self.replicate_embedding
         )
 
         # Language modeling head (matching PyTorch logic for replicated vs parallel)
@@ -714,7 +708,9 @@ class Grok1ForCausalLM(nnx.Module):
                 rngs=rngs,
             )
             # Skip all-gather for replicated head
-            self.logits_processor = LogitsProcessor(config.vocab_size, lm_head=self.lm_head, mesh=mesh)
+            self.logits_processor = LogitsProcessor(
+                config.vocab_size, lm_head=self.lm_head, mesh=mesh
+            )
         else:
             self.lm_head = ParallelLMHead(
                 num_embeddings=config.vocab_size,
@@ -722,7 +718,9 @@ class Grok1ForCausalLM(nnx.Module):
                 param_dtype=jnp.bfloat16,
                 rngs=rngs,
             )
-            self.logits_processor = LogitsProcessor(config.vocab_size, lm_head=self.lm_head, mesh=mesh)
+            self.logits_processor = LogitsProcessor(
+                config.vocab_size, lm_head=self.lm_head, mesh=mesh
+            )
 
         self.loaded_param_names = set()
 
@@ -734,6 +732,7 @@ class Grok1ForCausalLM(nnx.Module):
 
         def _collect(obj, prefix: str):
             from flax import nnx as _nnx
+
             # nnx.Param
             if isinstance(obj, _nnx.Param):
                 params[prefix] = obj
@@ -803,19 +802,34 @@ class Grok1ForCausalLM(nnx.Module):
         num_experts = model_config.num_local_experts
         expert_params_mapping = []
         for expert_id in range(num_experts):
-            expert_params_mapping.extend([
-                ("block_sparse_moe.experts.wi_0", f"block_sparse_moe.experts.{expert_id}.w1", expert_id, 0),
-                ("block_sparse_moe.experts.wi_1", f"block_sparse_moe.experts.{expert_id}.w3", expert_id, 1),
-                ("block_sparse_moe.experts.wo", f"block_sparse_moe.experts.{expert_id}.w2", expert_id, 0),
-            ])
+            expert_params_mapping.extend(
+                [
+                    (
+                        "block_sparse_moe.experts.wi_0",
+                        f"block_sparse_moe.experts.{expert_id}.w1",
+                        expert_id,
+                        0,
+                    ),
+                    (
+                        "block_sparse_moe.experts.wi_1",
+                        f"block_sparse_moe.experts.{expert_id}.w3",
+                        expert_id,
+                        1,
+                    ),
+                    (
+                        "block_sparse_moe.experts.wo",
+                        f"block_sparse_moe.experts.{expert_id}.w2",
+                        expert_id,
+                        0,
+                    ),
+                ]
+            )
 
         params_dict = dict(self.named_parameters())
         all_names = set(params_dict.keys())
         hit_names = set()
 
-        def load_weight_wrapper(
-            name: str, loaded_weight: jax.Array, *args, **kwargs
-        ):
+        def load_weight_wrapper(name: str, loaded_weight: jax.Array, *args, **kwargs):
             # Fuse constant multipliers into the weights (matching PyTorch)
             if "lm_head" in name:
                 loaded_weight = (
@@ -838,7 +852,7 @@ class Grok1ForCausalLM(nnx.Module):
             else:
                 # Handle different parameter types
                 setattr(self, name.split(".")[-1], loaded_weight)
-            
+
             hit_names.add(name)
             self.loaded_param_names.add(original_name)
 
@@ -949,9 +963,10 @@ class Grok1ForCausalLM(nnx.Module):
 
     def get_num_params_torch(self):
         """Get actual number of parameters (JAX equivalent)."""
+
         def count_params(pytree):
-            return sum(x.size for x in jax.tree_leaves(pytree) if hasattr(x, 'size'))
-        
+            return sum(x.size for x in jax.tree_leaves(pytree) if hasattr(x, "size"))
+
         # Get mesh size for proper scaling
         mesh_size = self.mesh.size if self.mesh else 1
         return count_params(self) * mesh_size
@@ -959,6 +974,7 @@ class Grok1ForCausalLM(nnx.Module):
 
 class Grok1ModelForCausalLM(Grok1ForCausalLM):
     """An alias for backward-compatibility (matching PyTorch)."""
+
     pass
 
 
