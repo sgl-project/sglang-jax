@@ -134,12 +134,20 @@ class EPMoE(nnx.Module):
 
         self.experts_per_device = num_experts // self.expert_parallel_size
         has_tensor = "tensor" in self.mesh.axis_names
-        expert_kernel_axes = (("data", "tensor"), None, None) if (self.expert_parallel_size > 1 and has_tensor) else (("data",), None, None) if (self.expert_parallel_size > 1) else (None, None, None)
+        expert_kernel_axes = (
+            (("data", "tensor"), None, None)
+            if (self.expert_parallel_size > 1 and has_tensor)
+            else (
+                (("data",), None, None)
+                if (self.expert_parallel_size > 1)
+                else (None, None, None)
+            )
+        )
 
         self.wi_0 = nnx.Param(
             nnx.with_partitioning(nnx.initializers.normal(), expert_kernel_axes)(
                 rngs.params(),
-                (self.experts_per_device, config.hidden_size, intermediate_dim),
+                (num_experts, config.hidden_size, intermediate_dim),
                 weight_dtype,
             )
         )
@@ -147,7 +155,7 @@ class EPMoE(nnx.Module):
         self.wi_1 = nnx.Param(
             nnx.with_partitioning(nnx.initializers.normal(), expert_kernel_axes)(
                 rngs.params(),
-                (self.experts_per_device, config.hidden_size, intermediate_dim),
+                (num_experts, config.hidden_size, intermediate_dim),
                 weight_dtype,
             )
         )
@@ -155,7 +163,7 @@ class EPMoE(nnx.Module):
         self.wo = nnx.Param(
             nnx.with_partitioning(nnx.initializers.normal(), expert_kernel_axes)(
                 rngs.params(),
-                (self.experts_per_device, intermediate_dim, config.hidden_size),
+                (num_experts, intermediate_dim, config.hidden_size),
                 weight_dtype,
             )
         )
@@ -282,9 +290,21 @@ class EPMoE(nnx.Module):
             in_specs=(
                 P(None),  # hidden_states
                 P(None),  # router_logits
-                P(("data", "tensor"), None, None) if ("tensor" in self.mesh.axis_names) else P(("data",), None, None),  # w0_weights
-                P(("data", "tensor"), None, None) if ("tensor" in self.mesh.axis_names) else P(("data",), None, None),  # w1_weights
-                P(("data", "tensor"), None, None) if ("tensor" in self.mesh.axis_names) else P(("data",), None, None),  # wo_weights
+                (
+                    P(("data", "tensor"), None, None)
+                    if ("tensor" in self.mesh.axis_names)
+                    else P(("data",), None, None)
+                ),  # w0_weights
+                (
+                    P(("data", "tensor"), None, None)
+                    if ("tensor" in self.mesh.axis_names)
+                    else P(("data",), None, None)
+                ),  # w1_weights
+                (
+                    P(("data", "tensor"), None, None)
+                    if ("tensor" in self.mesh.axis_names)
+                    else P(("data",), None, None)
+                ),  # wo_weights
             ),
             out_specs=P(None),
             check_rep=False,
@@ -456,7 +476,9 @@ class EPMoE(nnx.Module):
             send_sizes,
             output_offsets,
             recv_sizes,
-            axis_name=("data", "tensor") if ("tensor" in self.mesh.axis_names) else ("data",),
+            axis_name=(
+                ("data", "tensor") if ("tensor" in self.mesh.axis_names) else ("data",)
+            ),
         )
 
         return result

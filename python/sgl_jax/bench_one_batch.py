@@ -52,8 +52,8 @@ import os
 import time
 from typing import Tuple
 
-import numpy as np
 import jax
+import numpy as np
 from jax import profiler as jax_profiler
 from jax.experimental import multihost_utils as jax_mh
 
@@ -62,24 +62,20 @@ from sgl_jax.srt.configs.model_config import ModelConfig
 # from sgl_jax.srt.distributed.parallel_state import destroy_distributed_environment
 from sgl_jax.srt.entrypoints.engine import _set_envs_and_config
 from sgl_jax.srt.hf_transformers_utils import get_tokenizer
+from sgl_jax.srt.layers.logits_processor import LogitsMetadata
 from sgl_jax.srt.managers.schedule_batch import Req, ScheduleBatch
 from sgl_jax.srt.managers.scheduler import Scheduler
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
 from sgl_jax.srt.model_executor.model_runner import ModelRunner
+from sgl_jax.srt.sampling.sampling_batch_info import SamplingMetadata
 from sgl_jax.srt.sampling.sampling_params import SamplingParams
 from sgl_jax.srt.server_args import PortArgs, ServerArgs
-from sgl_jax.srt.layers.logits_processor import LogitsMetadata
-from sgl_jax.srt.sampling.sampling_batch_info import SamplingMetadata
 
 # from sgl_jax.srt.speculative.spec_info import SpeculativeAlgorithm
-from sgl_jax.srt.utils import (
+from sgl_jax.srt.utils import (  # require_mlp_sync,; require_mlp_tp_gather,; set_gpu_proc_affinity,; suppress_other_loggers,
     configure_logger,
     get_bool_env_var,
     kill_process_tree,
-    # require_mlp_sync,
-    # require_mlp_tp_gather,
-    # set_gpu_proc_affinity,
-    # suppress_other_loggers,
 )
 
 
@@ -120,9 +116,7 @@ class BenchArgs:
             default=BenchArgs.log_decode_step,
             help="Log decode latency by step, default is set to zero to disable.",
         )
-        parser.add_argument(
-            "--profile", action="store_true", help="Use JAX Profiler."
-        )
+        parser.add_argument("--profile", action="store_true", help="Use JAX Profiler.")
         parser.add_argument(
             "--profile-filename-prefix",
             type=str,
@@ -142,7 +136,7 @@ class BenchArgs:
 
 def load_model(server_args, port_args, tp_rank):
     # TODO: pass in tp_size
-    server_args.tp_size = 1
+    # server_args.tp_size = 1
     # suppress_other_loggers()
     rank_print = print if tp_rank == 0 else lambda *args, **kwargs: None
     moe_ep_rank = tp_rank // (server_args.tp_size // server_args.ep_size)
@@ -229,7 +223,9 @@ def prepare_synthetic_inputs_for_latency_test(batch_size, input_len):
     input_ids = np.random.randint(0, 10000, (batch_size, input_len), dtype=np.int32)
     sampling_params = SamplingParams(
         temperature=0,
-        max_new_tokens=BenchArgs.output_len[0] if isinstance(BenchArgs.output_len, tuple) else 16,
+        max_new_tokens=(
+            BenchArgs.output_len[0] if isinstance(BenchArgs.output_len, tuple) else 16
+        ),
     )
 
     reqs = []
@@ -270,9 +266,7 @@ def extend(reqs, model_runner):
         token_needed = int(np.sum(np.array(batch.extend_lens, dtype=np.int64)))
     else:
         # fallback: derive extend lengths as seq_len - prefix_len per req
-        token_needed = int(
-            np.sum(np.array(batch.seq_lens, dtype=np.int64))
-        )
+        token_needed = int(np.sum(np.array(batch.seq_lens, dtype=np.int64)))
     # cache_loc size must be >= sum of per-seq aligned lengths
     cache_loc_needed = int(
         np.sum(
@@ -597,7 +591,9 @@ def main(server_args, bench_args):
         and getattr(server_args, "attention_backend", "fa") == "fa"
     ):
         server_args.attention_backend = "native"
-        logging.info("Switching attention backend to 'native' for single TPU to reduce compile-time memory")
+        logging.info(
+            "Switching attention backend to 'native' for single TPU to reduce compile-time memory"
+        )
 
     _set_envs_and_config()
 
@@ -615,28 +611,7 @@ def main(server_args, bench_args):
     port_args = PortArgs.init_new(server_args)
     port_args.nccl_port = 29500
 
-    if server_args.tp_size == 1:
-        work_func(server_args, port_args, bench_args, 0)
-    else:
-        workers = []
-        for tp_rank in range(server_args.tp_size):
-            proc = multiprocessing.Process(
-                target=work_func,
-                args=(
-                    server_args,
-                    port_args,
-                    bench_args,
-                    tp_rank,
-                ),
-            )
-            proc.start()
-            workers.append(proc)
-
-        for proc in workers:
-            proc.join()
-
-        for proc in workers:
-            proc.terminate()
+    work_func(server_args, port_args, bench_args, 0)
 
 
 if __name__ == "__main__":
