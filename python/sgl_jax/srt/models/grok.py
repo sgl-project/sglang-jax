@@ -593,8 +593,8 @@ class Grok1DecoderLayer(nnx.Module):
         )
 
         # All-reduce across tensor parallel ranks (matching PyTorch)
-        # if self.tp_axis_size > 1 and ("tensor" in get_abstract_mesh().shape):
-        #     hidden_states = jax.lax.psum(hidden_states, axis_name="tensor")
+        if self.tp_axis_size > 1 and ("tensor" in get_abstract_mesh().shape):
+            hidden_states = jax.lax.psum(hidden_states, axis_name="tensor")
 
         # Apply post-attention norm and pre-MoE norm (matching PyTorch fused_dual_residual_rmsnorm)
         hidden_states, residual = dual_rmsnorm_forward(
