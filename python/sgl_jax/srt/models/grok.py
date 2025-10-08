@@ -623,8 +623,8 @@ class Grok1Model(nnx.Module):
         replicate_embedding: bool = False,
     ) -> None:
         super().__init__()
+        # TODO (chhzh123): remove this
         config.num_hidden_layers = 1
-        config.attn_temperature_len = -1
         print(f"config: {config}")
         self.config = config
         self.padding_idx = config.pad_token_id

@@ -64,6 +64,7 @@ class ModelRunner:
     ):
         # Parse args
         self.model_config = model_config
+        # TODO (chhzh123): remove this
         self.model_config.num_hidden_layers = 1
         self.mem_fraction_static = mem_fraction_static
         self.device = server_args.device
