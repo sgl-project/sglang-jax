@@ -64,7 +64,6 @@ class ModelRunner:
     ):
         # Parse args
         self.model_config = model_config
-        # TODO (chhzh123): remove this
         self.model_config.num_hidden_layers = 1
         self.mem_fraction_static = mem_fraction_static
         self.device = server_args.device
@@ -121,59 +120,97 @@ class ModelRunner:
 
         self.init_attention_backend()
 
+    def extract_tree_pspec(self, state):
+        print(state)
+
+        def extract_pspec(node):
+            print(node, isinstance(node, nnx.Variable), isinstance(node, jax.Array))
+            if isinstance(node, nnx.Variable):
+                if (
+                    hasattr(node.sharding, "sharding")
+                    and node.sharding.sharding is not None
+                ):
+                    return P(*node.sharding.sharding)
+                return P()
+            if isinstance(node, jax.Array):
+                # For jax.Array, access sharding directly
+                print(node.sharding, node.ndim, P(*[None for _ in range(node.ndim)]))
+                return P(*[None for _ in range(node.ndim)])
+            return P()
+
+        return jax.tree.map(
+            extract_pspec,
+            state,
+            is_leaf=lambda x: isinstance(x, (nnx.Variable, jax.Array)),
+        )
+
     def initialize_jit(self):
         model_def, model_state = nnx.split(self.model)
-        model_state_leaves, model_state_def = jax.tree_util.tree_flatten(model_state)
+        model_state_pspec = self.extract_tree_pspec(model_state)
         sampler_def, sampler_state = nnx.split(self.sampler)
-        sampler_state_leaves, sampler_state_def = jax.tree_util.tree_flatten(
-            sampler_state
-        )
+        sampler_state_pspec = self.extract_tree_pspec(sampler_state)
 
         # Store state leaves so they can be passed as dynamic arguments (avoid constant capture)
         self._model_def = model_def
-        self._model_state_def = model_state_def
-        self._model_state_leaves = model_state_leaves
+        self._model_state = model_state
         self._sampler_def = sampler_def
-        self._sampler_state_def = sampler_state_def
-        self._sampler_state_leaves = sampler_state_leaves
+        self._sampler_state = sampler_state
 
-        @partial(
-            jax.jit,
-            donate_argnames=["forward_batch"],
-            static_argnames=["model_state_def"],
-        )
         def jitted_run_model(
             model_def,
-            model_state_def,
+            model_state,
             forward_batch,
             logits_metadata,
-            model_state_leaves,
         ):
-            model_state = jax.tree_util.tree_unflatten(
-                model_state_def, model_state_leaves
-            )
-            model = nnx.merge(model_def, model_state)
-            return model(forward_batch, logits_metadata)
+            forward_batch_spec = self.extract_tree_pspec(forward_batch)
+            logits_metadata_spec = self.extract_tree_pspec(logits_metadata)
 
-        @partial(jax.jit, static_argnames=["sampler_state_def"])
-        def jitted_sampler(
-            sampler_def,
-            sampler_state_def,
-            sampler_state_leaves,
-            *args,
-        ):
-            model_state = jax.tree_util.tree_unflatten(
-                sampler_state_def, sampler_state_leaves
+            print(forward_batch)
+            print(forward_batch_spec)
+            print(logits_metadata_spec)
+
+            in_specs = (
+                None,
+                model_state_pspec,
+                forward_batch_spec,
+                logits_metadata_spec,
             )
-            sampler = nnx.merge(sampler_def, model_state)
-            return sampler(*args)
+
+            @partial(
+                jax.shard_map,
+                mesh=self.mesh,
+                in_specs=in_specs,
+                out_specs=(P(), None, None),
+            )
+            def wrapped(model_def, model_state, forward_batch, logits_metadata):
+                jax.debug.print("input_ids: {input_ids}", input_ids=forward_batch.input_ids)
+                return 0
+                # model = nnx.merge(model_def, model_state)
+                # return model(forward_batch, logits_metadata)
+
+            return wrapped(model_def, model_state, forward_batch, logits_metadata)
+
+        def jitted_sampler(sampler_def, sampler_state, *args):
+            arg_pspecs = [self.extract_tree_pspec(e) for e in args]
+            in_specs = (None, sampler_state_pspec, *arg_pspecs)
+
+            @partial(
+                jax.shard_map,
+                in_specs=in_specs,
+                out_specs=(P(), None, None),
+            )
+            def wrapped(sampler_def, sampler_state, *args):
+                sampler = nnx.merge(sampler_def, sampler_state)
+                return sampler(*args)
+
+            return wrapped(sampler_def, sampler_state, *args)
 
         # Bind only small/static structures; pass large leaves dynamically per call
         self.jitted_run_model = partial(
-            jitted_run_model, self._model_def, self._model_state_def
+            jitted_run_model, self._model_def, self._model_state
         )
         self.jitted_sampler = partial(
-            jitted_sampler, self._sampler_def, self._sampler_state_def
+            jitted_sampler, self._sampler_def, self._sampler_state
         )
 
     def get_available_device_memory(self):
@@ -250,7 +287,7 @@ class ModelRunner:
             f"cell_size={cell_size}bytes"
         )
 
-        return max_tokens
+        return 100
 
     def init_memory_pool(
         self,
@@ -387,7 +424,7 @@ class ModelRunner:
 
         with jtu.count_pjit_cpp_cache_miss() as count:
             output, layers_kv_fused, _ = self.jitted_run_model(
-                forward_batch, logits_metadata, self._model_state_leaves
+                forward_batch, logits_metadata
             )
             cache_miss_count = count()
         self._set_kv_cache_after_forward(layers_kv_fused, forward_batch)
@@ -463,9 +500,7 @@ class ModelRunner:
         Returns:
             A list of next_token_ids
         """
-        return self.jitted_sampler(
-            self._sampler_state_leaves, logits_output, sampling_metadata
-        )
+        return self.jitted_sampler(logits_output, sampling_metadata)
 
 
 class MockModelRunner(ModelRunner):
@@ -527,3 +562,4 @@ class MockModelRunner(ModelRunner):
             layer_num=self.model_config.num_hidden_layers,
             mesh=mesh,
         )
+
