@@ -13,15 +13,17 @@ from sgl_jax.srt.layers.embeddings import (
     Embed,
     ParallelLMHead,
     RotaryEmbedding,
-    _yarn_find_correction_range,
     _yarn_get_mscale,
+    _yarn_find_correction_range,
 )
 from sgl_jax.srt.layers.layernorm import RMSNorm, dual_rmsnorm_forward
 from sgl_jax.srt.layers.linear import LinearBase
-from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
+from sgl_jax.srt.layers.logits_processor import LogitsProcessor
+from sgl_jax.srt.layers.logits_processor import LogitsMetadata
 from sgl_jax.srt.layers.moe import EPMoE
 from sgl_jax.srt.layers.radix_attention import RadixAttention
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
+from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
 
 logger = logging.getLogger(__name__)
 
@@ -182,7 +184,11 @@ class Grok1MLP(nnx.Module):
             output_size=intermediate_size * 2,
             use_bias=False,
             params_dtype=dtype,
-            kernel_axes=(None, "tensor"),
+            kernel_axes=(
+                (None, "tensor")
+                if ("tensor" in get_abstract_mesh().shape)
+                else (None, None)
+            ),
             rngs=rngs,
         )
         self.down_proj = LinearBase(
@@ -190,7 +196,11 @@ class Grok1MLP(nnx.Module):
             output_size=hidden_size,
             use_bias=False,
             params_dtype=dtype,
-            kernel_axes=("tensor", None),
+            kernel_axes=(
+                ("tensor", None)
+                if ("tensor" in get_abstract_mesh().shape)
+                else (None, None)
+            ),
             rngs=rngs,
         )
         self.act_fn = GeluAndMul(approximate="tanh")
@@ -396,8 +406,8 @@ class Grok1Attention(nnx.Module):
             # logit_cap=logit_cap,
             # pos_encoding_mode=pos_encoding_mode,
             # logit_capping_method=logit_capping_method,
-            # xai_temperature_len=getattr(self.config, "attn_temperature_len", -1),
         )
+        self.attn.xai_temperature_len = getattr(config, "attn_temperature_len", -1)
 
     def __call__(
         self,

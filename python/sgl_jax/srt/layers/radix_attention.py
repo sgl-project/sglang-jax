@@ -46,6 +46,7 @@ class RadixAttention(nnx.Module):
         self.scaling = scaling
         self.layer_id = layer_id
         self.attn_type = attn_type
+        self.xai_temperature_len = -1
 
     def __call__(
         self,

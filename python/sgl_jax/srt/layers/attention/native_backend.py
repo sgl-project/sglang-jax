@@ -75,6 +75,9 @@ class NativeAttention(AttentionBackend):
         ):
             is_causal = False
 
+        # Get xai_temperature_len from the layer if it exists and pass it down.
+        xai_temp_len = getattr(layer, "xai_temperature_len", None)
+
         attn_output = forward_attention(
             q,
             k_buffer,
@@ -88,6 +91,7 @@ class NativeAttention(AttentionBackend):
             scale,
             is_causal,
             forward_batch.forward_mode,
+            xai_temperature_len=xai_temp_len,
         )
 
         # Merge K/V from cache buffers (which are 3D: [tokens, kv_heads, head_dim])
@@ -110,9 +114,11 @@ class NativeAttention(AttentionBackend):
             num_tokens, hidden_size = k.shape
             # Use kv head count; assume uniform head_dim
             # Note: layer_id maps to a RadixAttention layer with kv_head_num and head_dim
-            kv_heads = forward_batch.attn_backend.num_kv_heads if hasattr(
-                forward_batch.attn_backend, "num_kv_heads"
-            ) else None
+            kv_heads = (
+                forward_batch.attn_backend.num_kv_heads
+                if hasattr(forward_batch.attn_backend, "num_kv_heads")
+                else None
+            )
             if kv_heads is None:
                 # Fallback to layer's kv heads if available through call site
                 kv_heads = 1
@@ -155,6 +161,7 @@ def forward_attention(
     scale=None,
     is_causal=True,
     mode=ForwardMode.DECODE,
+    xai_temperature_len: float | None = None,
 ):
     """
     Forward pass using native JAX implementation with block-diagonal attention.
@@ -172,6 +179,7 @@ def forward_attention(
         num_kv_heads: number of key/value heads
         scale: scale for the attention weights
         seq_mask: boolean mask of shape [batch_size, total_prefix_len]
+        xai_temperature_len: length of the xai temperature
 
     Returns:
         Output tensor of shape[batch_size, hidden_size]
@@ -209,6 +217,7 @@ def forward_attention(
     k_heads = jnp.repeat(k_heads, num_copies, axis=1)
     v_heads = jnp.repeat(v_heads, num_copies, axis=1)
 
+    # Transpose for matmul: [num_heads, num_tokens, head_dim]
     q_t = jnp.transpose(q_heads, (1, 0, 2))
     k_t = jnp.transpose(k_heads, (1, 0, 2))
     v_t = jnp.transpose(v_heads, (1, 0, 2))
@@ -216,6 +225,34 @@ def forward_attention(
     # Compute full attention weights in one operation: [num_heads, num_tokens, head_dim]
     attn_weights = jnp.einsum("hqd,hkd->hqk", q_t, k_t) * scale
 
+    # ** NEW: Apply XAI temperature scaling if specified **
+    if xai_temperature_len is not None and xai_temperature_len > 0:
+        query_len = q_heads.shape[0]
+
+        # Determine the sequence position of each query token
+        if mode == ForwardMode.EXTEND:
+            q_starts = jnp.cumsum(extend_seq_lens) - extend_seq_lens
+            q_batch_indicators = (
+                jnp.zeros(query_len, dtype=jnp.int32).at[q_starts].set(1)
+            )
+            q_batch_ids = jnp.cumsum(q_batch_indicators) - 1
+            q_relative_pos = (
+                jnp.arange(query_len, dtype=jnp.int32) - q_starts[q_batch_ids]
+            )
+            q_positions = extend_prefix_lens[q_batch_ids] + q_relative_pos
+        else:  # mode == ForwardMode.DECODE
+            q_positions = seq_lengths
+
+        # Calculate and apply the scaling factor
+        xai_scale = 1.0 / jnp.log2(float(xai_temperature_len))
+        log_pos = jnp.log2(jnp.maximum(q_positions.astype(jnp.float32), 1.0))
+        temp_factor = log_pos * xai_scale
+        regulator = jnp.where(q_positions > xai_temperature_len, temp_factor, 1.0)
+
+        # Broadcast regulator from [num_tokens] to [1, num_tokens, 1] to scale weights
+        attn_weights = attn_weights * regulator[None, :, None]
+
+    # Apply appropriate masking
     if mode == ForwardMode.EXTEND:
         attn_weights = _apply_extend_mask(
             attn_weights, seq_lengths, extend_prefix_lens, extend_seq_lens, is_causal
