@@ -126,6 +126,7 @@ class ParallelLMHead(Embed):
         features: int,
         dtype: Optional[jnp.dtype] = None,
         param_dtype: jnp.dtype = jnp.bfloat16,
+        promote_dtype: PromoteDtypeFn = dtypes.promote_dtype,
         rngs: nnx.Rngs = None,
         use_bias: bool = False,
     ):
@@ -138,6 +139,8 @@ class ParallelLMHead(Embed):
             dtype: Data type for computations. If None, uses param_dtype.
                    Enables mixed precision when different from param_dtype.
             param_dtype: Data type for parameter storage (weights and bias).
+            promote_dtype: Function to handle dtype promotion during logits computation.
+                          Controls how hidden_states and embedding tensors are promoted.
             rngs: Random number generator for parameter initialization.
             use_bias: Whether to include bias parameters. Note: bias is currently
                      not used in logits computation, reserved for future extension.
@@ -147,6 +150,7 @@ class ParallelLMHead(Embed):
             features=features,
             dtype=dtype,
             param_dtype=param_dtype,
+            promote_dtype=promote_dtype,
             rngs=rngs,
         )
         if use_bias:
