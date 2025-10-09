@@ -11,7 +11,7 @@ from sgl_jax.srt.layers.attention.flash_attn_kernel.flash_attention import (
 from sgl_jax.srt.layers.attention.flashattention_backend import FlashAttention
 from sgl_jax.srt.layers.radix_attention import RadixAttention
 from sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch
-from sgl_jax.srt.mem_cache.memory_pool import MHATokenToKVPool
+from sgl_jax.srt.mem_cache.memory_pool import KVCache, MHATokenToKVPool
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sgl_jax.srt.model_executor.model_runner import ModelRunner
 from sgl_jax.srt.utils.mesh_utils import create_device_mesh
@@ -84,7 +84,7 @@ def create_qkv_cache(
     return q, k, v
 
 
-def write_prefix_tokens_for_kv(forward_batch, lens, k, v):
+def write_prefix_tokens_for_kv(forward_batch, token_to_kv_pool: KVCache, lens, k, v):
     page_size = forward_batch.attn_backend.page_size
     # Use aligned positions for k/v indexing since k/v arrays are created with alignment gaps
     aligned_seq_lens = (
@@ -111,9 +111,7 @@ def write_prefix_tokens_for_kv(forward_batch, lens, k, v):
             prefix_cache_loc = forward_batch.cache_loc[start:prefix_end]
             prefix_k = k[start:prefix_end]
             prefix_v = v[start:prefix_end]
-            forward_batch.token_to_kv_pool.set_kv_buffer(
-                0, prefix_cache_loc, prefix_k, prefix_v
-            )
+            token_to_kv_pool.set_kv_buffer(0, prefix_cache_loc, prefix_k, prefix_v)
 
         extend_k.append(k[extend_start:extend_end])
         extend_v.append(v[extend_start:extend_end])
@@ -269,14 +267,13 @@ def create_test_data(
         out_cache_loc=out_cache_loc,
         positions=positions,
         extend_start_loc=extend_start_loc,
-        token_to_kv_pool=current_kv_cache,
         attn_backend=attention_backend,
         cache_loc=cache_loc,
         extend_prefix_lens=extend_prefix_lens,
         extend_seq_lens=extend_seq_lens,
     )
     fb.attn_backend.forward_metadata = attention_backend.get_forward_metadata(mwb)
-    return fb, q, k, v
+    return fb, current_kv_cache, q, k, v
 
 
 class TestAttention(CustomTestCase):
@@ -299,7 +296,7 @@ class TestAttention(CustomTestCase):
         else:
             is_bf16 = False
 
-        forward_batch, q, k, v = create_test_data(
+        forward_batch, token_to_kv_pool, q, k, v = create_test_data(
             mode,
             lens,
             num_heads,
@@ -332,7 +329,7 @@ class TestAttention(CustomTestCase):
 
         # write prefix tokens
         extend_k, extend_v = write_prefix_tokens_for_kv(
-            forward_batch, lens, k_cache_shard, v_cache_shard
+            forward_batch, token_to_kv_pool, lens, k_cache_shard, v_cache_shard
         )
 
         # JAX attention
@@ -381,12 +378,14 @@ class TestAttention(CustomTestCase):
         jax.block_until_ready(expected)
 
         @jax.jit
-        def jit_attn(q, k, v, forward_batch):
-            out = attn(q, k, v, forward_batch)
+        def jit_attn(q, k, v, forward_batch, token_to_kv_pool: KVCache):
+            out = attn(q, k, v, forward_batch, token_to_kv_pool)
             return out
 
         # run
-        jax_output, _ = jit_attn(q_shard, extend_k, extend_v, forward_batch)
+        jax_output, _ = jit_attn(
+            q_shard, extend_k, extend_v, forward_batch, token_to_kv_pool
+        )
         jax.block_until_ready(jax_output)
 
         rtol = 2e-2  # Relative tolerance

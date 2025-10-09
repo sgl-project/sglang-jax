@@ -14,6 +14,7 @@ from sgl_jax.srt.layers.attention.flash_attn_kernel.flash_attention import (
 )
 from sgl_jax.srt.layers.radix_attention import RadixAttention
 from sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch
+from sgl_jax.srt.mem_cache.memory_pool import KVCache
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sgl_jax.srt.utils import cdiv
 from sgl_jax.srt.utils.jax_utils import device_array
@@ -189,6 +190,7 @@ class FlashAttention(AttentionBackend):
         v: jax.Array,  # [total_tokens, num_heads, head_dim]
         layer: RadixAttention,
         forward_batch: ForwardBatch,
+        token_to_kv_pool: KVCache,
         attention_mask: jax.Array = None,
         kv_partition_axis: str = "tensor",
     ):
@@ -201,7 +203,9 @@ class FlashAttention(AttentionBackend):
         Returns:
             Output tensor of shape [total_tokens, hidden_size]
         """
-        kv_cache_fused = self._get_fused_kv_cache(forward_batch, layer.layer_id)
+        kv_cache_fused = self._get_fused_kv_cache(
+            forward_batch, token_to_kv_pool, layer.layer_id
+        )
 
         if layer.scaling is None:
             scale = 1.0 / jnp.sqrt(layer.head_dim)
@@ -282,9 +286,10 @@ class FlashAttention(AttentionBackend):
     def _get_fused_kv_cache(
         self,
         forward_batch: ForwardBatch,
+        token_to_kv_pool: KVCache,
         layer_id: int,
     ) -> jax.Array:
-        return forward_batch.token_to_kv_pool.get_fused_kv_buffer(layer_id)
+        return token_to_kv_pool.get_fused_kv_buffer(layer_id)
 
     @staticmethod
     def get_max_running_reqests(max_context_len: int, page_size: int) -> int:

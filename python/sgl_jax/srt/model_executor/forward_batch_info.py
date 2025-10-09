@@ -33,7 +33,6 @@ from sgl_jax.srt.utils.jax_utils import device_array
 if TYPE_CHECKING:
     from sgl_jax.srt.layers.attention.base_attn_backend import AttentionBackend
     from sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch
-    from sgl_jax.srt.mem_cache.memory_pool import KVCache
     from sgl_jax.srt.model_executor.model_runner import ModelRunner
 
 from jax.tree_util import register_pytree_node_class
@@ -152,8 +151,6 @@ class ForwardBatch:
     # Start position for each sequence in extend mode [batch_size]
     extend_start_loc: jax.Array = None
 
-    # kv cache
-    token_to_kv_pool: KVCache = None
     attn_backend: AttentionBackend = None
 
     cache_loc: jax.Array = None
@@ -173,7 +170,6 @@ class ForwardBatch:
             self.out_cache_loc,
             self.positions,
             self.extend_start_loc,
-            self.token_to_kv_pool,
             self.attn_backend,
             self.cache_loc,
             self.extend_prefix_lens,
@@ -201,11 +197,10 @@ class ForwardBatch:
         obj.out_cache_loc = children[3]
         obj.positions = children[4]
         obj.extend_start_loc = children[5]
-        obj.token_to_kv_pool = children[6]
-        obj.attn_backend = children[7]
-        obj.cache_loc = children[8]
-        obj.extend_prefix_lens = children[9]
-        obj.extend_seq_lens = children[10]
+        obj.attn_backend = children[6]
+        obj.cache_loc = children[7]
+        obj.extend_prefix_lens = children[8]
+        obj.extend_seq_lens = children[9]
 
         return obj
 
@@ -278,7 +273,6 @@ class ForwardBatch:
             cache_loc=cache_loc,
             extend_prefix_lens=extend_prefix_lens,
             extend_seq_lens=extend_seq_lens,
-            token_to_kv_pool=model_runner.token_to_kv_pool,
             attn_backend=model_runner.attn_backend,
         )
 

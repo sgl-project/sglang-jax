@@ -8,6 +8,7 @@ from flax import nnx
 from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 
+from sgl_jax.srt.mem_cache.memory_pool import KVCache
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
 
 
@@ -53,6 +54,7 @@ class RadixAttention(nnx.Module):
         k: jax.Array,
         v: jax.Array,
         forward_batch: ForwardBatch,
+        token_to_kv_pool: KVCache,
         **kwargs,
     ):
         assert k is not None
@@ -64,6 +66,7 @@ class RadixAttention(nnx.Module):
             v,
             self,
             forward_batch,
+            token_to_kv_pool,
             **kwargs,
         )
         return attn_output, kv_fused
