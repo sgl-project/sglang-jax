@@ -156,14 +156,23 @@ class ModelWorkerClient:
     def forward_batch_generation(
         self,
         model_worker_batch: ModelWorkerBatch,
-        sampling_metadata: SamplingMetadata,
+        sampling_metadata: SamplingMetadata = None,
     ) -> Tuple[None, jax.Array, int]:
         # Create a new copy of sampling_info because it will be updated in-place by the scheduler for the next batch.
         sampling_info = model_worker_batch.sampling_info
+        sampling_info.update_penalties()
         model_worker_batch.sampling_info = self.cur_sampling_info = dataclasses.replace(
             sampling_info,
             sampling_info_done=threading.Event(),
+            penalizer_orchestrator=None,
         )
+
+        if sampling_metadata is None:
+            sampling_metadata = SamplingMetadata.from_model_worker_batch(
+                model_worker_batch,
+                len(model_worker_batch.seq_lens) - model_worker_batch.real_bs,
+                self.mesh,
+            )
 
         forward_metadata = self.worker.model_runner.attn_backend.get_forward_metadata(
             model_worker_batch

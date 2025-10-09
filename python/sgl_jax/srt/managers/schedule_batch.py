@@ -1002,7 +1002,7 @@ class ScheduleBatch:
         # Penalizer orchestrator must be merged before Batch.reqs is merged. This is because
         # orchestrator.merge() depends on Batch.reqs during preparation of each penalizers, so it
         # needs to be called with pre-merged Batch.reqs.
-        self.sampling_info.merge_batch(other.sampling_info, other.mesh)
+        self.sampling_info.merge_batch(other.sampling_info)
 
         self.req_pool_indices = np.concat(
             [self.req_pool_indices, other.req_pool_indices]
