@@ -50,12 +50,16 @@ class Embed(nnx.Module):
         This method initializes the embedding parameters with logical partitioning.
         The embedding is represented as a parameter with the specified shape and data type.
 
-        Parameters:
-        - embedding: The embedding parameter initialized using the specified method,
-                     partitioned logically along the 'vocab' and 'embed' dimensions.
-
-        Returns:
-        None
+        Args:
+            num_embeddings: Number of embeddings in the vocabulary.
+            features: Number of feature dimensions for each embedding.
+            dtype: Data type for computations (forward pass, attend operations).
+                   If None, uses the same dtype as the embedding parameter.
+            param_dtype: Data type for storing the embedding parameters in memory.
+                        Controls memory usage and precision of stored weights.
+            promote_dtype: Function to handle dtype promotion during mixed-precision
+                          computations between query/embedding tensors.
+            rngs: Random number generator state for parameter initialization.
         """
         self.embedding = nnx.Param(
             nnx.with_partitioning(default_embed_init, (None, None))(
@@ -109,15 +113,35 @@ class Embed(nnx.Module):
 
 
 class ParallelLMHead(Embed):
+    """Language model head layer for vocabulary prediction.
+
+    Inherits from Embed to enable weight tying with input embeddings.
+    Note: This layer's __call__ method is disabled - weights should be used
+    directly in the sampling/prediction phase.
+    """
+
     def __init__(
         self,
         num_embeddings: int,
         features: int,
-        dtype: jnp.dtype = jnp.bfloat16,
+        dtype: Optional[jnp.dtype] = None,
         param_dtype: jnp.dtype = jnp.bfloat16,
         rngs: nnx.Rngs = None,
         use_bias: bool = False,
     ):
+        """
+        Initialize the language model head.
+
+        Args:
+            num_embeddings: Size of vocabulary.
+            features: Hidden dimension size.
+            dtype: Data type for computations. If None, uses param_dtype.
+                   Enables mixed precision when different from param_dtype.
+            param_dtype: Data type for parameter storage (weights and bias).
+            rngs: Random number generator for parameter initialization.
+            use_bias: Whether to include bias parameters. Note: bias is currently
+                     not used in logits computation, reserved for future extension.
+        """
         super().__init__(
             num_embeddings=num_embeddings,
             features=features,
@@ -128,7 +152,7 @@ class ParallelLMHead(Embed):
         if use_bias:
             self.bias = nnx.Param(
                 nnx.with_partitioning(nnx.initializers.constant(0.0), (None, "tensor"))(
-                    rngs.params(), (self.num_embeddings, self.features), dtype
+                    rngs.params(), (self.num_embeddings, self.features), param_dtype
                 )
             )
         else:
