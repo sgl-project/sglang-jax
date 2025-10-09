@@ -7,8 +7,8 @@ from typing import Any, List, Optional, Tuple
 import huggingface_hub
 import jax
 import jax.numpy as jnp
-from flax import nnx
 import numpy as np
+from flax import nnx
 
 from sgl_jax.srt.configs.load_config import LoadConfig, LoadFormat
 from sgl_jax.srt.configs.model_config import ModelConfig
