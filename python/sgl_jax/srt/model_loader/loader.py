@@ -6,7 +6,9 @@ from typing import Any, List, Optional, Tuple
 
 import huggingface_hub
 import jax
+import jax.numpy as jnp
 from flax import nnx
+import numpy as np
 
 from sgl_jax.srt.configs.load_config import LoadConfig, LoadFormat
 from sgl_jax.srt.configs.model_config import ModelConfig
@@ -54,12 +56,6 @@ class JAXModelLoader(BaseModelLoader):
         self, load_config: LoadConfig, rngs: jax.Array, mesh: jax.sharding.Mesh
     ):
         super().__init__(load_config)
-        if load_config.load_format != LoadFormat.JAX:
-            raise ValueError(
-                f"JAXModelLoader only supports JAX load format, "
-                f"got {load_config.load_format}"
-            )
-
         self.rng = rngs
         self.mesh = mesh
 
@@ -160,6 +156,116 @@ class JAXModelLoader(BaseModelLoader):
         return hf_folder
 
 
+class JAXDummyModelLoader(BaseModelLoader):
+    """Model loader that will set model weights to random values for JAX models."""
+
+    def __init__(
+        self, load_config: LoadConfig, rngs: jax.Array, mesh: jax.sharding.Mesh
+    ):
+        super().__init__(load_config)
+        if load_config.model_loader_extra_config:
+            raise ValueError(
+                f"Model loader extra config is not supported for "
+                f"load format {load_config.load_format}"
+            )
+        self.rng = rngs
+        self.mesh = mesh
+
+    def download_model(self, model_config: ModelConfig) -> None:
+        # Nothing to download for dummy loader
+        return None
+
+    def _initialize_model(self, model_config: ModelConfig) -> Any:
+        # Do not require a load_weights method for dummy loader
+        model_class, _ = get_model_architecture(model_config)
+        return model_class
+
+    def _initialize_dummy_weights(
+        self,
+        model: nnx.Module,
+        low: float = -1e-3,
+        high: float = 1e-3,
+        seed: int = 1234,
+    ) -> None:
+        """
+        Fill all floating arrays in nnx.state(model) from a NumPy RNG.
+        For each array, the RNG is re-seeded with `seed`, we draw a flat
+        stream of length `numel` in a generation dtype (fp16 if <16-bit,
+        else native; bfloat16 generates in fp32), reshape to array.shape,
+        cast to the target dtype, and (if present) re-apply the array's
+        sharding spec so partitioning doesn't affect values.
+        """
+        params = nnx.state(model)
+        pspecs = nnx.get_partition_spec(params)
+
+        def _np_gen_dtype(jdtype) -> np.dtype:
+            bits = jnp.finfo(jdtype).bits
+            if bits < 16:
+                return np.float16
+            if jdtype == jnp.bfloat16:
+                return np.float32
+            return {
+                jnp.float16: np.float16,
+                jnp.float32: np.float32,
+                jnp.float64: np.float64,
+            }.get(jdtype, np.float32)
+
+        def _init_leaf(x, pspec):
+            if isinstance(x, jax.Array) and jnp.issubdtype(x.dtype, jnp.floating):
+                tgt_dtype = x.dtype
+                gen_dtype = _np_gen_dtype(tgt_dtype)
+                numel = int(np.prod(x.shape))
+
+                # Per-parameter reseed (shape-agnostic stream)
+                rng = np.random.default_rng(seed)
+                flat = rng.uniform(low, high, size=(numel,)).astype(gen_dtype)
+                arr_np = flat.reshape(x.shape)
+
+                arr_jax = jnp.asarray(arr_np, dtype=tgt_dtype)
+                if pspec is not None:
+                    arr_jax = jax.lax.with_sharding_constraint(arr_jax, pspec)
+                return arr_jax
+            return x
+
+        new_params = jax.tree_util.tree_map(_init_leaf, params, pspecs)
+
+        # Do not alter rotary embedding caches
+        def _preserve_rope_caches(path, old, new):
+            # path is a tuple of keys; stringify for robust matching
+            path_str = ".".join(str(k) for k in path)
+            if ("cos_sin_cache" in path_str) or ("_cos_sin_cache" in path_str):
+                return old
+            return new
+
+        new_params = jax.tree_util.tree_map_with_path(
+            _preserve_rope_caches, params, new_params
+        )
+        nnx.update(model, new_params)
+
+    def load_model(
+        self,
+        *,
+        model_config: ModelConfig,
+    ) -> Any:
+        # Initialize JAX model definition on mesh
+        model_class = self._initialize_model(model_config)
+
+        def create_model(rng: nnx.Rngs):
+            model = model_class(model_config.hf_config, rng, self.mesh)
+            state = nnx.state(model)
+            pspecs = nnx.get_partition_spec(state)
+            sharded_state = jax.lax.with_sharding_constraint(state, pspecs)
+            nnx.update(model, sharded_state)
+            return model
+
+        with self.mesh:
+            model = create_model(self.rng)
+            # Assign random weights deterministically
+            self._initialize_dummy_weights(model)
+
+        return model
+
+
 def get_model_loader(
     load_config: LoadConfig, rngs: jax.Array, mesh: jax.sharding.Mesh
 ) -> BaseModelLoader:
@@ -167,6 +273,9 @@ def get_model_loader(
 
     if isinstance(load_config.load_format, type):
         return load_config.load_format(load_config)
+
+    if load_config.load_format == LoadFormat.DUMMY:
+        return JAXDummyModelLoader(load_config, rngs, mesh)
 
     if load_config.load_format == LoadFormat.JAX:
         return JAXModelLoader(load_config, rngs, mesh)
