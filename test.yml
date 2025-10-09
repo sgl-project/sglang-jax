@@ -1,0 +1,12 @@
+resources:
+  accelerators: tpu-v6e-4
+  use_spot: True
+  disk_size: 512  # Ensure model checkpoints can fit.
+  disk_tier: best
+
+setup: |
+  if [ -d "sglang-jax" ]; then pip uninstall -y sgl-jax || true && rm -rf sglang-jax; fi
+  git clone https://github.com/sgl-project/sglang-jax.git
+  cd sglang-jax && git checkout "feat/grok-tpu"
+  pip install -e python/ tpu-info
+

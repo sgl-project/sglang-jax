@@ -10,21 +10,18 @@ import jax.numpy as jnp
 import numpy as np
 from flax import nnx
 from jax._src import mesh as mesh_lib
-from jax.sharding import NamedSharding
-from jax.sharding import PartitionSpec as P
 
-from sgl_jax.srt.configs.load_config import LoadConfig, LoadFormat
+from sgl_jax.srt.configs.load_config import LoadConfig
 from sgl_jax.srt.configs.model_config import AttentionArch, MockModelConfig, ModelConfig
 from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessorOutput
 from sgl_jax.srt.layers.sampler import Sampler
-from sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch
 from sgl_jax.srt.mem_cache.allocator import (
     BaseTokenToKVPoolAllocator,
     PagedTokenToKVPoolAllocator,
     TokenToKVPoolAllocator,
 )
 from sgl_jax.srt.mem_cache.memory_pool import MHATokenToKVPool, ReqToTokenPool
-from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
 from sgl_jax.srt.model_loader.loader import get_model_loader
 from sgl_jax.srt.precision_tracer import precision_tracer
 from sgl_jax.srt.sampling.sampling_batch_info import SamplingBatchInfo, SamplingMetadata
@@ -64,6 +61,7 @@ class ModelRunner:
     ):
         # Parse args
         self.model_config = model_config
+        # TODO (chhzh123): remove this
         self.model_config.num_hidden_layers = 1
         self.mem_fraction_static = mem_fraction_static
         self.device = server_args.device
@@ -120,97 +118,58 @@ class ModelRunner:
 
         self.init_attention_backend()
 
-    def extract_tree_pspec(self, state):
-        print(state)
-
-        def extract_pspec(node):
-            print(node, isinstance(node, nnx.Variable), isinstance(node, jax.Array))
-            if isinstance(node, nnx.Variable):
-                if (
-                    hasattr(node.sharding, "sharding")
-                    and node.sharding.sharding is not None
-                ):
-                    return P(*node.sharding.sharding)
-                return P()
-            if isinstance(node, jax.Array):
-                # For jax.Array, access sharding directly
-                print(node.sharding, node.ndim, P(*[None for _ in range(node.ndim)]))
-                return P(*[None for _ in range(node.ndim)])
-            return P()
-
-        return jax.tree.map(
-            extract_pspec,
-            state,
-            is_leaf=lambda x: isinstance(x, (nnx.Variable, jax.Array)),
-        )
-
     def initialize_jit(self):
         model_def, model_state = nnx.split(self.model)
-        model_state_pspec = self.extract_tree_pspec(model_state)
+        model_state_leaves, model_state_def = jax.tree.flatten(model_state)
         sampler_def, sampler_state = nnx.split(self.sampler)
-        sampler_state_pspec = self.extract_tree_pspec(sampler_state)
+        sampler_state_leaves, sampler_state_def = jax.tree.flatten(sampler_state)
 
         # Store state leaves so they can be passed as dynamic arguments (avoid constant capture)
         self._model_def = model_def
-        self._model_state = model_state
+        self._model_state_def = model_state_def
+        self._model_state_leaves = model_state_leaves
         self._sampler_def = sampler_def
-        self._sampler_state = sampler_state
+        self._sampler_state_def = sampler_state_def
+        self._sampler_state_leaves = sampler_state_leaves
 
+        @partial(
+            nnx.jit,
+            donate_argnames=["forward_batch"],
+            static_argnames=["model_state_def"],
+        )
         def jitted_run_model(
             model_def,
-            model_state,
+            model_state_def,
             forward_batch,
             logits_metadata,
+            model_state_leaves,
         ):
-            forward_batch_spec = self.extract_tree_pspec(forward_batch)
-            logits_metadata_spec = self.extract_tree_pspec(logits_metadata)
-
-            print(forward_batch)
-            print(forward_batch_spec)
-            print(logits_metadata_spec)
-
-            in_specs = (
-                None,
-                model_state_pspec,
-                forward_batch_spec,
-                logits_metadata_spec,
+            model_state = jax.tree_util.tree_unflatten(
+                model_state_def, model_state_leaves
             )
+            model = nnx.merge(model_def, model_state)
+            output = model(forward_batch, logits_metadata)
+            return output
 
-            @partial(
-                jax.shard_map,
-                mesh=self.mesh,
-                in_specs=in_specs,
-                out_specs=(P(), None, None),
+        @partial(nnx.jit, static_argnames=["sampler_state_def"])
+        def jitted_sampler(
+            sampler_def,
+            sampler_state_def,
+            sampler_state_leaves,
+            *args,
+        ):
+            model_state = jax.tree_util.tree_unflatten(
+                sampler_state_def, sampler_state_leaves
             )
-            def wrapped(model_def, model_state, forward_batch, logits_metadata):
-                jax.debug.print("input_ids: {input_ids}", input_ids=forward_batch.input_ids)
-                return 0
-                # model = nnx.merge(model_def, model_state)
-                # return model(forward_batch, logits_metadata)
-
-            return wrapped(model_def, model_state, forward_batch, logits_metadata)
-
-        def jitted_sampler(sampler_def, sampler_state, *args):
-            arg_pspecs = [self.extract_tree_pspec(e) for e in args]
-            in_specs = (None, sampler_state_pspec, *arg_pspecs)
-
-            @partial(
-                jax.shard_map,
-                in_specs=in_specs,
-                out_specs=(P(), None, None),
-            )
-            def wrapped(sampler_def, sampler_state, *args):
-                sampler = nnx.merge(sampler_def, sampler_state)
-                return sampler(*args)
-
-            return wrapped(sampler_def, sampler_state, *args)
+            sampler = nnx.merge(sampler_def, model_state)
+            return sampler(*args)
 
         # Bind only small/static structures; pass large leaves dynamically per call
         self.jitted_run_model = partial(
-            jitted_run_model, self._model_def, self._model_state
+            jitted_run_model, self._model_def, self._model_state_def
         )
         self.jitted_sampler = partial(
-            jitted_sampler, self._sampler_def, self._sampler_state
+            jitted_sampler, self._sampler_def, self._sampler_state_def
         )
 
     def get_available_device_memory(self):
@@ -424,8 +383,11 @@ class ModelRunner:
 
         with jtu.count_pjit_cpp_cache_miss() as count:
             output, layers_kv_fused, _ = self.jitted_run_model(
-                forward_batch, logits_metadata
+                forward_batch, logits_metadata, self._model_state_leaves
             )
+            output: LogitsProcessorOutput
+            print(">>>", output.hidden_states.sharding)
+            print(">>>", output.next_token_logits.sharding)
             cache_miss_count = count()
         self._set_kv_cache_after_forward(layers_kv_fused, forward_batch)
 
@@ -500,7 +462,10 @@ class ModelRunner:
         Returns:
             A list of next_token_ids
         """
-        return self.jitted_sampler(logits_output, sampling_metadata)
+        print(logits_output.next_token_logits.sharding)
+        return self.jitted_sampler(
+            self._sampler_state_leaves, logits_output, sampling_metadata
+        )
 
 
 class MockModelRunner(ModelRunner):
@@ -562,4 +527,3 @@ class MockModelRunner(ModelRunner):
             layer_num=self.model_config.num_hidden_layers,
             mesh=mesh,
         )
-

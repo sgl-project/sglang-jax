@@ -268,6 +268,19 @@ class MHATokenToKVPool(KVCache):
 
         return obj
 
+    def __repr__(self):
+        return (f"{self.__class__.__name__}(head_num={self.head_num}, "
+                f"head_dim={self.head_dim}, "
+                f"kv_partition_axis={self.kv_partition_axis}, "
+                f"kv_sharding={self.kv_sharding}, "
+                f"size={self.size}, "
+                f"page_size={self.page_size}, "
+                f"dtype={self.dtype}, "
+                f"layer_num={self.layer_num}, "
+                f"mesh={self.mesh}, "
+                f"start_layer={self.start_layer}, "
+                f"end_layer={self.end_layer})")
+
     def _create_buffers(self):
         """Create sharded fused KV cache buffers with proper distributed allocation"""
         self.kv_sharding = NamedSharding(self.mesh, P(None, self.kv_partition_axis))

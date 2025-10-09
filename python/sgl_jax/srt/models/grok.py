@@ -1,3 +1,4 @@
+import functools
 import logging
 from typing import Iterable, Optional, Tuple
 
@@ -6,6 +7,7 @@ import jax.lax
 from flax import nnx
 from jax import numpy as jnp
 from jax._src.mesh import get_abstract_mesh, use_abstract_mesh
+from jax._src.partition_spec import PartitionSpec as P
 from transformers import PretrainedConfig
 
 from sgl_jax.srt.layers.activation import GeluAndMul
@@ -18,12 +20,11 @@ from sgl_jax.srt.layers.embeddings import (
 )
 from sgl_jax.srt.layers.layernorm import RMSNorm, dual_rmsnorm_forward
 from sgl_jax.srt.layers.linear import LinearBase
-from sgl_jax.srt.layers.logits_processor import LogitsProcessor
 from sgl_jax.srt.layers.logits_processor import LogitsMetadata
+from sgl_jax.srt.layers.logits_processor import LogitsProcessor
 from sgl_jax.srt.layers.moe import EPMoE
 from sgl_jax.srt.layers.radix_attention import RadixAttention
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
-from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +68,14 @@ def get_rope_scaling(config):
         return rope_scaling
     else:
         return None
+
+
+def all_reduce(x, x_spec, mesh: jax.sharding.Mesh, axis_name: str):
+    @functools.partial(jax.shard_map, mesh=mesh, in_specs=x_spec, out_specs=P())
+    def wrapped(x):
+        return jax.lax.psum(x, axis_name=axis_name)
+
+    return wrapped(x)
 
 
 class ScalingRotaryEmbedding(RotaryEmbedding):
@@ -518,6 +527,8 @@ class Grok1DecoderLayer(nnx.Module):
         else:
             raise NotImplementedError()
 
+        self.mesh = mesh
+
         # Layer normalization (using eps instead of epsilon to match PyTorch)
         self.pre_attn_norm = RMSNorm(
             config.hidden_size, epsilon=config.rms_norm_eps, rngs=rngs
@@ -535,12 +546,15 @@ class Grok1DecoderLayer(nnx.Module):
         # Setup FFN function based on configuration (matching PyTorch logic)
         if self.num_experts > 0:
             if self.residual_moe:
-                # if mesh.size > 1 and ("tensor" in get_abstract_mesh().shape):
-                #     self.ffn = lambda x: jax.lax.psum(
-                #         self.moe_with_rmoe(x), axis_name="tensor"
-                #     )
-                # else:
-                self.ffn = self.moe_with_rmoe
+                if mesh.size > 1 and ("tensor" in get_abstract_mesh().shape):
+                    self.ffn = lambda x: all_reduce(
+                        self.moe_with_rmoe(x),
+                        x_spec=P("tensor", None),
+                        mesh=mesh,
+                        axis_name="tensor",
+                    )
+                else:
+                    self.ffn = self.moe_with_rmoe
             else:
                 self.ffn = self.block_sparse_moe
         else:
@@ -594,7 +608,12 @@ class Grok1DecoderLayer(nnx.Module):
 
         # All-reduce across tensor parallel ranks (matching PyTorch)
         if self.tp_axis_size > 1 and ("tensor" in get_abstract_mesh().shape):
-            hidden_states = jax.lax.psum(hidden_states, axis_name="tensor")
+            hidden_states = all_reduce(
+                hidden_states,
+                x_spec=P("tensor", None),
+                mesh=self.mesh,
+                axis_name="tensor",
+            )
 
         # Apply post-attention norm and pre-MoE norm (matching PyTorch fused_dual_residual_rmsnorm)
         hidden_states, residual = dual_rmsnorm_forward(
