@@ -12,6 +12,7 @@ from sgl_jax.srt.layers.embeddings import Embed, ParallelLMHead, RotaryEmbedding
 from sgl_jax.srt.layers.linear import LinearBase
 from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
 from sgl_jax.srt.layers.radix_attention import RadixAttention
+from sgl_jax.srt.mem_cache.memory_pool import KVCache
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
 from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
 
@@ -142,6 +143,7 @@ class QWenAttention(nnx.Module):
         positions: jax.Array,
         hidden_states: jax.Array,
         forward_batch: ForwardBatch,
+        token_to_kv_pool: KVCache,
         layer_id: int,
     ) -> tuple[jax.Array, jax.Array, jax.Array]:
         q, _ = self.q_proj(hidden_states)
@@ -153,7 +155,7 @@ class QWenAttention(nnx.Module):
         v = v.reshape(-1, self.num_heads, self.head_size)
 
         q, k = self.rotary_emb(positions, q, k)
-        attn_output, kv_fused = self.attn(q, k, v, forward_batch=forward_batch)
+        attn_output, kv_fused = self.attn(q, k, v, forward_batch, token_to_kv_pool)
         output, _ = self.c_proj(attn_output)
         return output, kv_fused
 
@@ -210,6 +212,7 @@ class QWenBlock(nnx.Module):
         positions: jax.Array,
         hidden_states: jax.Array,
         forward_batch: ForwardBatch,
+        token_to_kv_pool: KVCache,
     ) -> tuple[jax.Array, jax.Array, jax.Array]:
         residual = hidden_states
 
@@ -218,6 +221,7 @@ class QWenBlock(nnx.Module):
             positions=positions,
             hidden_states=hidden_states,
             forward_batch=forward_batch,
+            token_to_kv_pool=token_to_kv_pool,
             layer_id=self.layer_id,
         )
         hidden_states = residual + attn_output
@@ -268,6 +272,7 @@ class QWenModel(nnx.Module):
     def __call__(
         self,
         forward_batch: ForwardBatch,
+        token_to_kv_pool: KVCache,
     ):
         hidden_states = self.embed_tokens(forward_batch.input_ids)
 
@@ -275,7 +280,7 @@ class QWenModel(nnx.Module):
 
         for layer in self.h:
             hidden_states, kv_fused = layer(
-                forward_batch.positions, hidden_states, forward_batch
+                forward_batch.positions, hidden_states, forward_batch, token_to_kv_pool
             )
             layers_kv_fused.append(kv_fused)
 
@@ -395,9 +400,12 @@ class QWenLMHeadModel(nnx.Module):
     def __call__(
         self,
         forward_batch: ForwardBatch,
+        token_to_kv_pool: KVCache,
         logits_metadata: LogitsMetadata,
     ):
-        hidden_states, layers_kv_fused = self.transformer(forward_batch)
+        hidden_states, layers_kv_fused = self.transformer(
+            forward_batch, token_to_kv_pool
+        )
         output = self.logits_processor(hidden_states, logits_metadata)
         return output, layers_kv_fused, True
 

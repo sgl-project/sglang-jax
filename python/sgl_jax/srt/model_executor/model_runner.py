@@ -138,7 +138,7 @@ class ModelRunner:
 
         @partial(
             jax.jit,
-            donate_argnames=["forward_batch"],
+            donate_argnames=["token_to_kv_pool"],  # just donate KV cache
             static_argnames=["model_state_def"],
         )
         def jitted_run_model(
@@ -146,13 +146,14 @@ class ModelRunner:
             model_state_def,
             model_state_leaves,
             forward_batch,
+            token_to_kv_pool,
             logits_metadata,
         ):
             model_state = jax.tree_util.tree_unflatten(
                 model_state_def, model_state_leaves
             )
             model = nnx.merge(model_def, model_state)
-            return model(forward_batch, logits_metadata)
+            return model(forward_batch, token_to_kv_pool, logits_metadata)
 
         @partial(jax.jit, static_argnames=["sampler_state_def"])
         def jitted_sampler(sampler_def, sampler_state_def, sampler_state_leaves, *args):
@@ -162,9 +163,19 @@ class ModelRunner:
             sampler = nnx.merge(sampler_def, model_state)
             return sampler(*args)
 
-        self.jitted_run_model = partial(
-            jitted_run_model, model_def, model_state_def, model_state_leaves
-        )
+        def run_model_wrapper(forward_batch, logits_metadata):
+            token_to_kv_pool = self.token_to_kv_pool
+
+            return jitted_run_model(
+                model_def,
+                model_state_def,
+                model_state_leaves,
+                forward_batch,
+                token_to_kv_pool,
+                logits_metadata,
+            )
+
+        self.jitted_run_model = run_model_wrapper
         self.jitted_sampler = partial(
             jitted_sampler, sampler_def, sampler_state_def, sampler_state_leaves
         )
@@ -395,9 +406,9 @@ class ModelRunner:
         return output, cache_miss_count
 
     def _set_kv_cache_after_forward(self, layers_kv_fused, forward_batch: ForwardBatch):
-        start_idx = forward_batch.token_to_kv_pool.start_layer
+        start_idx = self.token_to_kv_pool.start_layer
         end_idx = start_idx + len(layers_kv_fused)
-        forward_batch.token_to_kv_pool.kv_buffer[start_idx:end_idx] = layers_kv_fused
+        self.token_to_kv_pool.kv_buffer[start_idx:end_idx] = layers_kv_fused
 
     def forward_idle(
         self,
