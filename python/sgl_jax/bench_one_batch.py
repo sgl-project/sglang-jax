@@ -164,8 +164,8 @@ def load_model(server_args, port_args, tp_rank):
 def prepare_inputs_for_correctness_test(bench_args, tokenizer):
     prompts = [
         "The capital of France is",
-        # "The capital of the United Kindom is",
-        # "Today is a sunny day and I like",
+        "The capital of the United Kindom is",
+        "Today is a sunny day and I like",
     ]
     input_ids = [tokenizer.encode(p) for p in prompts]
     sampling_params = SamplingParams(
@@ -539,7 +539,7 @@ def latency_test(
 
 def main(server_args, bench_args):
     server_args.cuda_graph_max_bs = max(bench_args.batch_size)
-    server_args.ep_size = 1
+    # server_args.ep_size = 1
 
     # Constrain static KV allocation for single-device TPU if not user-specified
     if (
@@ -597,7 +597,6 @@ def main(server_args, bench_args):
         )
 
     port_args = PortArgs.init_new(server_args)
-    port_args.nccl_port = 29500
 
     work_func(server_args, port_args, bench_args, 0)
 
