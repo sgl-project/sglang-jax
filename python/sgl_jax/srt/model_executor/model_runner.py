@@ -10,10 +10,8 @@ import jax.numpy as jnp
 import numpy as np
 from flax import nnx
 from jax._src import mesh as mesh_lib
-from jax.sharding import NamedSharding
-from jax.sharding import PartitionSpec as P
 
-from sgl_jax.srt.configs.load_config import LoadConfig, LoadFormat
+from sgl_jax.srt.configs.load_config import LoadConfig
 from sgl_jax.srt.configs.model_config import AttentionArch, MockModelConfig, ModelConfig
 from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessorOutput
 from sgl_jax.srt.layers.sampler import Sampler
@@ -28,7 +26,7 @@ from sgl_jax.srt.mem_cache.allocator import (
     TokenToKVPoolAllocator,
 )
 from sgl_jax.srt.mem_cache.memory_pool import MHATokenToKVPool, ReqToTokenPool
-from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
 from sgl_jax.srt.model_loader.loader import get_model_loader
 from sgl_jax.srt.precision_tracer import precision_tracer
 from sgl_jax.srt.sampling.sampling_batch_info import SamplingBatchInfo, SamplingMetadata
@@ -61,14 +59,14 @@ class ModelRunner:
         mem_fraction_static: float,
         tp_size: int,
         server_args: ServerArgs,
-        mesh: jax.sharding.Mesh,
         req_to_token_pool: Optional[ReqToTokenPool] = None,
         token_to_kv_pool_allocator: Optional[BaseTokenToKVPoolAllocator] = None,
-        rngs: nnx.Rngs = None,
+        *,
+        mesh: jax.sharding.Mesh,
+        rngs: Optional[nnx.Rngs] = None,
     ):
         # Parse args
         self.model_config = model_config
-        # TODO (chhzh123): remove this
         self.model_config.num_hidden_layers = 1
         self.mem_fraction_static = mem_fraction_static
         self.device = server_args.device
@@ -78,7 +76,7 @@ class ModelRunner:
         self.num_kv_heads = model_config.get_total_num_kv_heads_with_replication(
             tp_size
         )
-        self.rngs = rngs
+        self.rngs = rngs or nnx.Rngs(default=server_args.random_seed)
 
         self.tp_size = tp_size
         self.server_args = server_args
@@ -100,8 +98,8 @@ class ModelRunner:
                 load_format=server_args.load_format,
                 download_dir=server_args.download_dir,
             ),
-            rngs=rngs,
-            mesh=mesh,
+            rngs=self.rngs,
+            mesh=self.mesh,
         )
 
         # Initialize precision tracer enable state
@@ -133,11 +131,9 @@ class ModelRunner:
 
     def initialize_jit(self):
         model_def, model_state = nnx.split(self.model)
-        model_state_leaves, model_state_def = jax.tree_util.tree_flatten(model_state)
+        model_state_leaves, model_state_def = jax.tree.flatten(model_state)
         sampler_def, sampler_state = nnx.split(self.sampler)
-        sampler_state_leaves, sampler_state_def = jax.tree_util.tree_flatten(
-            sampler_state
-        )
+        sampler_state_leaves, sampler_state_def = jax.tree.flatten(sampler_state)
 
         # Store state leaves so they can be passed as dynamic arguments (avoid constant capture)
         self._model_def = model_def

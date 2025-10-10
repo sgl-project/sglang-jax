@@ -5,7 +5,6 @@ import jax
 import jax.lax
 from flax import nnx
 from jax import numpy as jnp
-from jax._src.mesh import get_abstract_mesh, use_abstract_mesh
 from transformers import PretrainedConfig
 
 from sgl_jax.srt.layers.activation import GeluAndMul
@@ -13,17 +12,15 @@ from sgl_jax.srt.layers.embeddings import (
     Embed,
     ParallelLMHead,
     RotaryEmbedding,
-    _yarn_get_mscale,
     _yarn_find_correction_range,
+    _yarn_get_mscale,
 )
 from sgl_jax.srt.layers.layernorm import RMSNorm, dual_rmsnorm_forward
 from sgl_jax.srt.layers.linear import LinearBase
-from sgl_jax.srt.layers.logits_processor import LogitsProcessor
-from sgl_jax.srt.layers.logits_processor import LogitsMetadata
+from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
 from sgl_jax.srt.layers.moe import EPMoE
 from sgl_jax.srt.layers.radix_attention import RadixAttention
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
-from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
 
 logger = logging.getLogger(__name__)
 
@@ -184,11 +181,7 @@ class Grok1MLP(nnx.Module):
             output_size=intermediate_size * 2,
             use_bias=False,
             params_dtype=dtype,
-            kernel_axes=(
-                (None, "tensor")
-                if ("tensor" in get_abstract_mesh().shape)
-                else (None, None)
-            ),
+            kernel_axes=(None, "tensor"),
             rngs=rngs,
         )
         self.down_proj = LinearBase(
@@ -196,11 +189,7 @@ class Grok1MLP(nnx.Module):
             output_size=hidden_size,
             use_bias=False,
             params_dtype=dtype,
-            kernel_axes=(
-                ("tensor", None)
-                if ("tensor" in get_abstract_mesh().shape)
-                else (None, None)
-            ),
+            kernel_axes=("tensor", None),
             rngs=rngs,
         )
         self.act_fn = GeluAndMul(approximate="tanh")
@@ -229,18 +218,15 @@ class Grok1MoE(nnx.Module):
         top_k: int,
         hidden_size: int,
         intermediate_size: int,
-        rngs: Optional[nnx.Rngs] = None,
+        rngs: nnx.Rngs,
+        mesh: jax.sharding.Mesh,
         dtype: jnp.dtype = jnp.bfloat16,
-        mesh: Optional[jax.sharding.Mesh] = None,
         reduce_results: bool = True,
         inplace: bool = True,
         no_combine: bool = False,
     ):
         super().__init__()
         self.hidden_size = hidden_size
-
-        if mesh is None:
-            mesh = get_abstract_mesh()
 
         # Gate always runs at full precision for stability
         # (see https://arxiv.org/pdf/2101.03961)
@@ -249,7 +235,7 @@ class Grok1MoE(nnx.Module):
             output_size=num_experts,
             use_bias=False,
             params_dtype=jnp.float32,
-            kernel_axes=None,
+            kernel_axes=(None, None),
             rngs=rngs,
         )
 
@@ -266,34 +252,18 @@ class Grok1MoE(nnx.Module):
                 expert_parallel_size,
             )
             expert_parallel_size = 1
-        if isinstance(mesh, jax.sharding.Mesh):
-            with mesh:
-                self.experts = EPMoE(
-                    config=config,
-                    num_experts=num_experts,
-                    num_experts_per_tok=top_k,
-                    expert_parallel_size=expert_parallel_size,
-                    mesh=mesh,
-                    intermediate_dim=intermediate_size,
-                    dtype=dtype,
-                    activation="gelu",
-                    layer_id=layer_id,
-                    rngs=rngs,
-                )
-        else:
-            with use_abstract_mesh(mesh):
-                self.experts = EPMoE(
-                    config=config,
-                    num_experts=num_experts,
-                    num_experts_per_tok=top_k,
-                    expert_parallel_size=expert_parallel_size,
-                    mesh=mesh,
-                    intermediate_dim=intermediate_size,
-                    dtype=dtype,
-                    activation="gelu",
-                    layer_id=layer_id,
-                    rngs=rngs,
-                )
+        self.experts = EPMoE(
+            config=config,
+            num_experts=num_experts,
+            num_experts_per_tok=top_k,
+            expert_parallel_size=expert_parallel_size,
+            mesh=mesh,
+            intermediate_dim=intermediate_size,
+            dtype=dtype,
+            activation="gelu",
+            layer_id=layer_id,
+            rngs=rngs,
+        )
 
     def __call__(self, hidden_states: jax.Array) -> jax.Array:
         # Router computation with soft capping
@@ -322,17 +292,15 @@ class Grok1Attention(nnx.Module):
         layer_id: int = 0,
         max_position: int = 4096 * 32,
         rope_theta: float = 10000,
-        rngs: Optional[nnx.Rngs] = None,
         reduce_results: bool = True,
-        mesh: Optional[jax.sharding.Mesh] = None,
+        *,
+        mesh: jax.sharding.Mesh,
+        rngs: nnx.Rngs,
     ) -> None:
         super().__init__()
         self.config = config
         self.layer_id = layer_id
         self.hidden_size = hidden_size
-
-        if mesh is None:
-            mesh = get_abstract_mesh()
 
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
@@ -452,18 +420,15 @@ class Grok1DecoderLayer(nnx.Module):
     def __init__(
         self,
         config: PretrainedConfig,
-        layer_id: int = 0,
-        rngs: Optional[nnx.Rngs] = None,
-        mesh: Optional[jax.sharding.Mesh] = None,
+        layer_id: int,
+        rngs: nnx.Rngs,
+        mesh: jax.sharding.Mesh,
     ) -> None:
         super().__init__()
         self.num_experts = config.num_local_experts
         self.hidden_size = config.hidden_size
         self.residual_moe = getattr(config, "residual_moe", False)
         self.layer_id = layer_id
-
-        if mesh is None:
-            mesh = get_abstract_mesh()
 
         # Self-attention
         rope_theta = getattr(config, "rope_theta", 10000)
@@ -535,11 +500,6 @@ class Grok1DecoderLayer(nnx.Module):
         # Setup FFN function based on configuration (matching PyTorch logic)
         if self.num_experts > 0:
             if self.residual_moe:
-                # if mesh.size > 1 and ("tensor" in get_abstract_mesh().shape):
-                #     self.ffn = lambda x: jax.lax.psum(
-                #         self.moe_with_rmoe(x), axis_name="tensor"
-                #     )
-                # else:
                 self.ffn = self.moe_with_rmoe
             else:
                 self.ffn = self.block_sparse_moe
@@ -592,10 +552,6 @@ class Grok1DecoderLayer(nnx.Module):
             hidden_states=hidden_states,
         )
 
-        # All-reduce across tensor parallel ranks (matching PyTorch)
-        if self.tp_axis_size > 1 and ("tensor" in get_abstract_mesh().shape):
-            hidden_states = jax.lax.psum(hidden_states, axis_name="tensor")
-
         # Apply post-attention norm and pre-MoE norm (matching PyTorch fused_dual_residual_rmsnorm)
         hidden_states, residual = dual_rmsnorm_forward(
             hidden_states,
@@ -606,7 +562,10 @@ class Grok1DecoderLayer(nnx.Module):
         )
 
         # Feed-forward network
-        hidden_states = self.ffn(hidden_states)
+        if self.residual_moe:
+            hidden_states = self.moe_with_rmoe(hidden_states)
+        else:
+            hidden_states = self.block_sparse_moe(hidden_states)
 
         # Return with deferred post-MoE norm (matching PyTorch)
         return hidden_states, residual, self.post_moe_norm
@@ -618,9 +577,9 @@ class Grok1Model(nnx.Module):
     def __init__(
         self,
         config: PretrainedConfig,
-        rngs: Optional[nnx.Rngs] = None,
-        mesh: Optional[jax.sharding.Mesh] = None,
-        replicate_embedding: bool = False,
+        *,
+        rngs: nnx.Rngs,
+        mesh: jax.sharding.Mesh,
     ) -> None:
         super().__init__()
         # TODO (chhzh123): remove this
@@ -687,26 +646,21 @@ class Grok1ForCausalLM(nnx.Module):
     def __init__(
         self,
         config: PretrainedConfig,
+        # TODO(jcyang): should make the following two args keyword-only
         rngs: Optional[nnx.Rngs] = None,
         mesh: Optional[jax.sharding.Mesh] = None,
     ) -> None:
         super().__init__()
         self.config = config
-        if mesh is None:
-            mesh = get_abstract_mesh()
         self.mesh = mesh
 
         # Configuration flags (matching PyTorch implementation)
-        self.replicate_embedding = getattr(config, "replicate_embedding", False)
         self.replicate_lm_head = getattr(config, "replicate_lm_head", False)
 
         # Main model
-        self.model = Grok1Model(
-            config, rngs=rngs, mesh=mesh, replicate_embedding=self.replicate_embedding
-        )
+        self.model = Grok1Model(config, rngs=rngs, mesh=mesh)
 
         # Language modeling head (matching PyTorch logic for replicated vs parallel)
-        lm_head_params_dtype = None
         if self.replicate_lm_head:
             # ReplicatedLinear equivalent
             self.lm_head = LinearBase(
