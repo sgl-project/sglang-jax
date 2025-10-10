@@ -1,3 +1,4 @@
+import functools
 from typing import Iterable, Optional, Sequence, Tuple, Union
 
 import jax
@@ -106,15 +107,15 @@ class EPMoE(nnx.Module):
         num_experts: int,
         num_experts_per_tok: int,
         expert_parallel_size: int,
-        mesh: Mesh,
         intermediate_dim: int = 2048,
         weight_dtype: jnp.dtype = jnp.bfloat16,
         dtype: jnp.dtype = jnp.bfloat16,
         layer_id: int = 0,
-        rngs: nnx.Rngs = None,
         activation: str = "gelu",
+        *,
+        mesh: Mesh,
+        rngs: nnx.Rngs,
     ):
-
         self.config = config
         self.num_experts = num_experts
         self.num_experts_per_tok = num_experts_per_tok
@@ -129,8 +130,6 @@ class EPMoE(nnx.Module):
             raise ValueError(
                 f"num_experts({num_experts}) must be divisible by expert_parallel_size ({self.expert_parallel_size})"
             )
-
-        rngs = rngs or nnx.Rngs(0)
 
         self.experts_per_device = num_experts // self.expert_parallel_size
         has_tensor = "tensor" in self.mesh.axis_names
@@ -284,7 +283,7 @@ class EPMoE(nnx.Module):
             )
             return output
 
-        return shard_map(
+        return jax.shard_map(
             _internal_moe_computation,
             mesh=self.mesh,
             in_specs=(
@@ -307,7 +306,7 @@ class EPMoE(nnx.Module):
                 ),  # wo_weights
             ),
             out_specs=P(None),
-            check_rep=False,
+            check_vma=False,
         )(inputs, router_logits, self.wi_0.value, self.wi_1.value, self.wo.value)
 
     def _gmm_compute_with_sharded_weights(
