@@ -191,7 +191,7 @@ class WeightLoader:
         hf_weight: jax.Array,
         mapping: WeightMapping,
     ):
-        processed_weight = hf_weight.astype(self.dtype)
+        processed_weight = hf_weight
 
         if mapping.transpose and not hf_key.endswith(".bias"):
             processed_weight = jnp.transpose(processed_weight, (1, 0))
@@ -235,10 +235,7 @@ class WeightLoader:
     def _handle_split_weight(
         self, params: nnx.State, hf_key: str, weight: jax.Array, mapping: WeightMapping
     ):
-        if "c_attn" in hf_key:
-            self._split_qkv_weight(params, hf_key, weight, mapping)
-        else:
-            raise ValueError(f"Unknown split weight pattern for {hf_key}")
+        self._split_qkv_weight(params, hf_key, weight, mapping)
 
     def _split_qkv_weight(
         self, params: nnx.State, hf_key: str, weight: jax.Array, mapping: WeightMapping
