@@ -10,6 +10,7 @@ from jax import random
 
 from sgl_jax.srt.layers.logits_processor import LogitsProcessorOutput
 from sgl_jax.srt.sampling.sampling_batch_info import SamplingMetadata
+from sgl_jax.srt.utils.jax_utils import is_tpu_runtime
 
 
 class Sampler(nnx.Module):
@@ -233,11 +234,38 @@ def _apply_min_p_filter(operands):
     return jnp.where(min_p_mask, 0.0, probs_sort)
 
 
+def _get_sorted_indices_np(probs_np: np.ndarray) -> np.ndarray:
+    """
+    CPU-side NumPy sorting index that is robust to NaNs/Infs.
+    Always returns descending order indices with int32 dtype.
+    """
+    # 1) Map NaN -> -inf, +inf -> +inf, -inf -> -inf for stable descending order
+    scores_np = np.nan_to_num(probs_np, nan=-np.inf, posinf=np.inf, neginf=-np.inf)
+    # 2) argsort ascending then flip for descending
+    return np.argsort(scores_np, axis=-1)[:, ::-1].astype(np.int32)
+
+
 def _sample_part_a(probs, top_ks, top_ps, min_ps, need_min_p_sampling: bool):
-    probs_sort = jnp.sort(probs, axis=-1)[
-        :, ::-1
-    ]  # Sort and reverse for descending order
-    probs_idx = jnp.argsort(probs, axis=-1)[:, ::-1]
+    # Branch by backend: TPU can use native jnp.argsort/jnp.sort; others offload indices to CPU
+    if is_tpu_runtime():
+        probs_sort = jnp.sort(probs, axis=-1)[
+            :, ::-1
+        ]  # Sort and reverse for descending order
+        probs_idx = jnp.argsort(probs, axis=-1)[:, ::-1]
+    else:
+        # 1) Use jax.pure_callback to compute robust descending indices on CPU
+        out_spec = jnp.empty(probs.shape, dtype=jnp.int32)
+        probs_idx = jax.pure_callback(
+            _get_sorted_indices_np,
+            out_spec,
+            probs,
+            vmap_method="legacy_vectorized",
+        )
+        # 2) Gather with sanitized probabilities (map NaNs/Infs to 0)
+        sanitized_probs = jnp.nan_to_num(probs, nan=0.0, posinf=0.0, neginf=0.0)
+        assert probs_idx.shape == sanitized_probs.shape and probs_idx.dtype == jnp.int32
+        probs_sort = jnp.take_along_axis(sanitized_probs, probs_idx, axis=-1)
+
     probs_sum = jnp.cumsum(probs_sort, axis=-1)
 
     top_k_mask = jnp.arange(0, probs.shape[-1]).reshape(1, -1) >= top_ks.reshape(-1, 1)
