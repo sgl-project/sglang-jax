@@ -61,7 +61,7 @@ class NativeAttention(AttentionBackend):
         Returns:
             Tuple of (output tensor of shape [total_tokens, hidden_size], k, v)
         """
-        k_buffer, v_buffer = self._get_and_update_kv_cache(
+        k_buffer, v_buffer, kv_fused = self._get_and_update_kv_cache(
             k, v, forward_batch, token_to_kv_pool, layer.layer_id
         )
 
@@ -92,8 +92,7 @@ class NativeAttention(AttentionBackend):
             forward_batch.forward_mode,
         )
 
-        kv_fused = merge_kv(k, v)
-
+        # Return full fused KV buffer for this layer so that caller can persist it outside JIT
         return attn_output, kv_fused
 
     def _get_and_update_kv_cache(
@@ -103,7 +102,7 @@ class NativeAttention(AttentionBackend):
         forward_batch: ForwardBatch,
         token_to_kv_pool: KVCache,
         layer_id: int,
-    ) -> Tuple[jax.Array, jax.Array]:
+    ) -> Tuple[jax.Array, jax.Array, jax.Array]:
         """
         Get the kv cache from the forward batch.
         """
@@ -116,13 +115,21 @@ class NativeAttention(AttentionBackend):
                 token_to_kv_pool.set_kv_buffer(
                     layer_id, forward_batch.out_cache_loc, k, v, is_decode=True
                 )
+            # Use fused layer directly from pool; derive K/V views without extra merge
+            fused_layer = token_to_kv_pool.get_fused_kv_buffer(layer_id)
+            k, v = fused_layer[:, ::2, :], fused_layer[:, 1::2, :]
+            fused_return = fused_layer
         else:
-            token_to_kv_pool.set_kv_buffer_legacy(
+            updated_layer = token_to_kv_pool.set_kv_buffer_legacy(
                 layer_id, forward_batch.out_cache_loc, k, v
             )
-
-        k, v = token_to_kv_pool.get_kv_buffer(layer_id)
-        return k, v
+            # Functional style: treat updated_layer as authoritative fused buffer for this layer in this step
+            # Derive K/V views for attention computation from fused buffer directly
+            k = updated_layer[:, ::2, :]
+            v = updated_layer[:, 1::2, :]
+            # Return fused buffer directly for persistence outside JIT
+            fused_return = updated_layer
+        return k, v, fused_return
 
     @staticmethod
     def get_max_running_reqests(max_context_len: int, page_size: int) -> int:
@@ -165,8 +172,11 @@ def forward_attention(
     Returns:
         Output tensor of shape[batch_size, hidden_size]
     """
-    k_cache = jnp.take(k_cache, loc, axis=0)
-    v_cache = jnp.take(v_cache, loc, axis=0)
+
+    cache_size = k_cache.shape[0]
+    safe_loc = jnp.where(loc > 0, loc, cache_size)
+    k_cache = jnp.take(k_cache, safe_loc, axis=0, mode="fill", fill_value=0)
+    v_cache = jnp.take(v_cache, safe_loc, axis=0, mode="fill", fill_value=0)
 
     # Handle both 2D and 3D input formats for q
     if len(q.shape) == 2:
@@ -190,30 +200,34 @@ def forward_attention(
     # Transpose for efficient matrix operations
     # q: shape of (num_heads, num_tokens, head_dim)
     # k, v: shape of (total_prefix_len, num_heads, head_dim)
-
-    # For GQA attention, we need to copy k and v heads to match the number of query heads
-    num_copies = num_heads // num_kv_heads
-    # Use repeat to copy k and v heads
-    # [total_prefix_len, num_kv_heads, head_dim] -> [total_prefix_len, num_heads, head_dim]
-    k_heads = jnp.repeat(k_heads, num_copies, axis=1)
-    v_heads = jnp.repeat(v_heads, num_copies, axis=1)
+    if num_kv_heads != num_heads:
+        # For GQA attention, we need to copy k and v heads to match the number of query heads
+        num_copies = num_heads // num_kv_heads
+        # Use repeat to copy k and v heads
+        # [total_prefix_len, num_kv_heads, head_dim] -> [total_prefix_len, num_heads, head_dim]
+        k_heads = jnp.repeat(k_heads, num_copies, axis=1)
+        v_heads = jnp.repeat(v_heads, num_copies, axis=1)
 
     q_t = jnp.transpose(q_heads, (1, 0, 2))
     k_t = jnp.transpose(k_heads, (1, 0, 2))
     v_t = jnp.transpose(v_heads, (1, 0, 2))
 
-    # Compute full attention weights in one operation: [num_heads, num_tokens, head_dim]
-    attn_weights = jnp.einsum("hqd,hkd->hqk", q_t, k_t) * scale
+    if scale is None:
+        scale = 1.0 / jnp.sqrt(head_dim)
+    attn_logits = jnp.einsum("hqd,hkd->hqk", q_t, k_t) * scale
+    neg_inf = jnp.asarray(jnp.finfo(attn_logits.dtype).min, attn_logits.dtype)
+    is_valid = loc > 0
+    attn_logits = jnp.where(is_valid[jnp.newaxis, jnp.newaxis, :], attn_logits, neg_inf)
 
     if mode == ForwardMode.EXTEND:
-        attn_weights = _apply_extend_mask(
-            attn_weights, seq_lengths, extend_prefix_lens, extend_seq_lens, is_causal
+        attn_logits = _apply_extend_mask(
+            attn_logits, seq_lengths, extend_prefix_lens, extend_seq_lens, is_causal
         )
     else:
-        attn_weights = _apply_decode_mask(attn_weights, seq_lengths)
+        attn_logits = _apply_decode_mask(attn_logits, seq_lengths)
 
     # Softmax
-    attn_weights = jax.nn.softmax(attn_weights, axis=-1)
+    attn_weights = jax.nn.softmax(attn_logits, axis=-1)
 
     attn_output = jnp.matmul(attn_weights, v_t)
     attn_output = jnp.transpose(attn_output, (1, 0, 2))

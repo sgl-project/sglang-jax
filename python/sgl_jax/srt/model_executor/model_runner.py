@@ -112,6 +112,16 @@ class ModelRunner:
     def initialize(self):
         server_args = self.server_args
 
+        # Set highest matmul precision only for GPU/CUDA to improve numerical stability.
+        # Do this at runtime (not import time) to avoid initializing busy backends.
+        try:
+            if str(getattr(server_args, "device", "")).lower() in ("gpu", "cuda"):
+                from jax import config as _jax_config
+
+                _jax_config.update("jax_default_matmul_precision", "highest")
+        except Exception:
+            pass
+
         # Load the model
         self.sampler = Sampler(nnx.Rngs(server_args.random_seed))
         total_device_memory = self.get_available_device_memory()
