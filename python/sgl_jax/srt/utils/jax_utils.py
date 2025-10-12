@@ -58,6 +58,19 @@ def get_available_device_memory(device, distributed=False, empty_cache=True):
             stats = dev.memory_stats()
             avail_mem.append(stats["bytes_limit"] - stats["bytes_in_use"])
         avail_mem = jnp.array([min(avail_mem) / (1 << 10)], dtype=jnp.float32)
+    elif device in ("gpu", "cuda"):
+        if empty_cache:
+            jax.clear_caches()
+        devices = [
+            d for d in jax.local_devices() if getattr(d, "platform", None) == "gpu"
+        ]
+        if not devices:
+            raise RuntimeError("No GPU devices found by JAX")
+        avail = []
+        for dev in devices:
+            stats = dev.memory_stats()
+            avail.append(stats["bytes_limit"] - stats["bytes_in_use"])
+        avail_mem = jnp.array([min(avail) / (1 << 10)], dtype=jnp.float32)
     elif device == "cpu":
         import psutil
 
