@@ -219,14 +219,15 @@ class ServerArgs:
             default=ServerArgs.load_format,
             choices=[
                 "auto",
-                "pt",
+                "jax",
                 "safetensors",
                 "npcache",
                 "dummy",
-                "sharded_state",
                 "gguf",
                 "bitsandbytes",
                 "layered",
+                "pt",
+                "sharded_state",
                 "remote",
             ],
             help="The format of the model weights to load. "
