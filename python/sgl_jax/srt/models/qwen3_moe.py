@@ -13,6 +13,7 @@ from sgl_jax.srt.layers.linear import LinearBase
 from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
 from sgl_jax.srt.layers.moe import EPMoE, GateLogit
 from sgl_jax.srt.layers.radix_attention import RadixAttention
+from sgl_jax.srt.mem_cache.memory_pool import KVCache
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
 from sgl_jax.srt.models.qwen3 import Qwen3MLP
 from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
@@ -117,6 +118,7 @@ class QWen3MoeAttention(nnx.Module):
         positions: jax.Array,
         hidden_states: jax.Array,
         forward_batch: ForwardBatch,
+        token_to_kv_pool: KVCache,
     ) -> jax.Array:
         q, _ = self.q_proj(hidden_states)
         k, _ = self.k_proj(hidden_states)
@@ -130,7 +132,7 @@ class QWen3MoeAttention(nnx.Module):
         k = self.k_norm(k)
 
         q, k = self.rotary_emb(positions, q, k)
-        attn_output, kv_fused = self.attn(q, k, v, forward_batch=forward_batch)
+        attn_output, kv_fused = self.attn(q, k, v, forward_batch, token_to_kv_pool)
 
         output, _ = self.c_proj(attn_output)
         return output, kv_fused
@@ -231,6 +233,7 @@ class QWen3MoeDecoderLayer(nnx.Module):
         positions: jax.Array,
         hidden_states: jax.Array,
         forward_batch: ForwardBatch,
+        token_to_kv_pool: KVCache,
         residual: Optional[jax.Array] = None,
     ) -> Tuple[jax.Array, jax.Array]:
         if residual is None:
@@ -245,6 +248,7 @@ class QWen3MoeDecoderLayer(nnx.Module):
             positions=positions,
             hidden_states=hidden_states,
             forward_batch=forward_batch,
+            token_to_kv_pool=token_to_kv_pool,
         )
 
         hidden_states += residual
@@ -303,13 +307,18 @@ class QWen3MoeModel(nnx.Module):
     def __call__(
         self,
         forward_batch: ForwardBatch,
+        token_to_kv_pool: KVCache,
     ) -> jax.Array:
         hidden_states = self.embed_tokens(forward_batch.input_ids)
         residual = None
         layers_kv_fused = []
         for layer in self.layers:
             hidden_states, residual, kv_fused = layer(
-                forward_batch.positions, hidden_states, forward_batch, residual
+                forward_batch.positions,
+                hidden_states,
+                forward_batch,
+                token_to_kv_pool,
+                residual,
             )
             layers_kv_fused.append(kv_fused)
 
@@ -508,9 +517,12 @@ class Qwen3MoeForCausalLM(nnx.Module):
     def __call__(
         self,
         forward_batch: ForwardBatch,
+        token_to_kv_pool: KVCache,
         logits_metadata: LogitsMetadata,
     ):
-        hidden_states, layers_kv_fused = self.transformer(forward_batch)
+        hidden_states, layers_kv_fused = self.transformer(
+            forward_batch, token_to_kv_pool
+        )
         output = self.logits_processor(hidden_states, logits_metadata)
         return output, layers_kv_fused, True
 
