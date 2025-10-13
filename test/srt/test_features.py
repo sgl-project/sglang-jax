@@ -520,6 +520,8 @@ cache_misses_common_args = [
     "--chunked-prefill-size",
     "8192",
 ]
+
+
 class TestCacheMissesTP1(CustomTestCase):
     @classmethod
     def setUpClass(cls):
@@ -539,7 +541,6 @@ class TestCacheMissesTP1(CustomTestCase):
     @classmethod
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
-    
 
     def test_cache_miss_prefill(self):
         args = SimpleNamespace(
@@ -567,7 +568,8 @@ class TestCacheMissesTP1(CustomTestCase):
 
         if "cache_miss_count" not in resp["meta_info"]:
             raise "[prefill] cache_miss_count is missed in response"
-        self.assertEqual(resp["meta_info"]["cache_miss_count"], 0) 
+        self.assertEqual(resp["meta_info"]["cache_miss_count"], 0)
+
 
 class TestCacheMissesTP4(CustomTestCase):
     @classmethod
@@ -588,7 +590,6 @@ class TestCacheMissesTP4(CustomTestCase):
     @classmethod
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
-    
 
     def test_cache_miss_prefill(self):
         args = SimpleNamespace(
@@ -616,8 +617,7 @@ class TestCacheMissesTP4(CustomTestCase):
 
         if "cache_miss_count" not in resp["meta_info"]:
             raise "[prefill] cache_miss_count is missed in response"
-        self.assertEqual(resp["meta_info"]["cache_miss_count"], 0) 
-
+        self.assertEqual(resp["meta_info"]["cache_miss_count"], 0)
 
 
 if __name__ == "__main__":
