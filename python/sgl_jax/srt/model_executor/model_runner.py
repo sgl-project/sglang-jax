@@ -420,7 +420,7 @@ class ModelRunner:
                 jax.device_put(layer_kv_fused, target_sharding)
                 for layer_kv_fused in layers_kv_fused
             ]
-        start_idx = forward_batch.token_to_kv_pool.start_layer
+        start_idx = self.token_to_kv_pool.start_layer
         end_idx = start_idx + len(layers_kv_fused)
         self.token_to_kv_pool.kv_buffer[start_idx:end_idx] = layers_kv_fused
 
