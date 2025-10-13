@@ -25,7 +25,6 @@ class TestFeatures(CustomTestCase):
       - ChunkPrefillSize
       - PageSizeGreaterThanOne
     - Abort
-    - CacheMiss
     - Logprobs
 
     """
@@ -123,34 +122,6 @@ class TestFeatures(CustomTestCase):
                 self.assertEqual(
                     future.result()["meta_info"]["finish_reason"]["type"], "abort"
                 )
-
-    def test_cache_miss_prefill(self):
-        args = SimpleNamespace(
-            base_url=self.base_url,
-            text="the capital of France is",
-            temperature=0,
-            max_new_tokens=1,
-        )
-
-        resp = run_curl(args)
-
-        if "cache_miss_count" not in resp["meta_info"]:
-            raise "[prefill] cache_miss_count is missed in response"
-        self.assertEqual(resp["meta_info"]["cache_miss_count"], 0)
-
-    def test_cache_miss_decode(self):
-        args = SimpleNamespace(
-            base_url=self.base_url,
-            text="the capital of France is",
-            temperature=0,
-            max_new_tokens=2,
-        )
-
-        resp = run_curl(args)
-
-        if "cache_miss_count" not in resp["meta_info"]:
-            raise "[prefill] cache_miss_count is missed in response"
-        self.assertEqual(resp["meta_info"]["cache_miss_count"], 0)
 
     def test_logprobs(self):
         # Note: add test_logprobs until accuracy score is relatively high, we will update the following expected logits.
@@ -521,6 +492,132 @@ class TestFeatures(CustomTestCase):
                 self.assertEqual(
                     real_token, expected_output_token_ids_logprobs[i][j][1]
                 )
+
+
+cache_misses_common_args = [
+    "--trust-remote-code",
+    "--skip-server-warmup",
+    "--random-seed",
+    "3",
+    "--mem-fraction-static",
+    "0.65",
+    "--max-prefill-tokens",
+    "8192",
+    "--download-dir",
+    "/dev/shm/",
+    "--dtype",
+    "bfloat16",
+    "--attention-backend",
+    "fa",
+    "--precompile-token-paddings",
+    "16384",
+    "--precompile-bs-paddings",
+    "64",
+    "--page-size",
+    "64",
+    "--max-running-requests",
+    "64",
+    "--chunked-prefill-size",
+    "8192",
+]
+class TestCacheMissesTP1(CustomTestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.model = DEFAULT_MODEL_NAME_FOR_TEST
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            device="tpu",
+            other_args=cache_misses_common_args + ["--tp-size", "1"],
+            env={
+                "JAX_COMPILATION_CACHE_DIR": "/tmp/jax_compilation_cache",
+            },
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        kill_process_tree(cls.process.pid)
+    
+
+    def test_cache_miss_prefill(self):
+        args = SimpleNamespace(
+            base_url=self.base_url,
+            text="the capital of France is",
+            temperature=0,
+            max_new_tokens=1,
+        )
+
+        resp = run_curl(args)
+
+        if "cache_miss_count" not in resp["meta_info"]:
+            raise "[prefill] cache_miss_count is missed in response"
+        self.assertEqual(resp["meta_info"]["cache_miss_count"], 0)
+
+    def test_cache_miss_decode(self):
+        args = SimpleNamespace(
+            base_url=self.base_url,
+            text="the capital of France is",
+            temperature=0,
+            max_new_tokens=2,
+        )
+
+        resp = run_curl(args)
+
+        if "cache_miss_count" not in resp["meta_info"]:
+            raise "[prefill] cache_miss_count is missed in response"
+        self.assertEqual(resp["meta_info"]["cache_miss_count"], 0) 
+
+class TestCacheMissesTP4(CustomTestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.model = DEFAULT_MODEL_NAME_FOR_TEST
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            device="tpu",
+            other_args=cache_misses_common_args + ["--tp-size", "4"],
+            env={
+                "JAX_COMPILATION_CACHE_DIR": "/tmp/jax_compilation_cache",
+            },
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        kill_process_tree(cls.process.pid)
+    
+
+    def test_cache_miss_prefill(self):
+        args = SimpleNamespace(
+            base_url=self.base_url,
+            text="the capital of France is",
+            temperature=0,
+            max_new_tokens=1,
+        )
+
+        resp = run_curl(args)
+
+        if "cache_miss_count" not in resp["meta_info"]:
+            raise "[prefill] cache_miss_count is missed in response"
+        self.assertEqual(resp["meta_info"]["cache_miss_count"], 0)
+
+    def test_cache_miss_decode(self):
+        args = SimpleNamespace(
+            base_url=self.base_url,
+            text="the capital of France is",
+            temperature=0,
+            max_new_tokens=2,
+        )
+
+        resp = run_curl(args)
+
+        if "cache_miss_count" not in resp["meta_info"]:
+            raise "[prefill] cache_miss_count is missed in response"
+        self.assertEqual(resp["meta_info"]["cache_miss_count"], 0) 
+
 
 
 if __name__ == "__main__":
