@@ -240,7 +240,6 @@ Sglang has a MR[https://github.com/sgl-project/sglang/pull/3066] to support it, 
 
 ## Test
 
-1. Test whether sampling result is expected
-2. Test `generate()` interface
-3. Add unit test for SglJaxRollout
-3. Test e2e result compared with VllmRollout: PPO, GRPO
+1. Add unittest for `generate()` and `update_params()` API
+2. Replace VanillaRollout with SglJaxRollout to run GRPO
+3. Keep the result with RL baseline
