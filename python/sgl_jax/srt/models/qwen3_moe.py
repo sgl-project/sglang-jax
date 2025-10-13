@@ -118,6 +118,7 @@ class QWen3MoeAttention(nnx.Module):
         positions: jax.Array,
         hidden_states: jax.Array,
         forward_batch: ForwardBatch,
+        token_to_kv_pool: KVCache,
     ) -> jax.Array:
         q, _ = self.q_proj(hidden_states)
         k, _ = self.k_proj(hidden_states)
@@ -247,6 +248,7 @@ class QWen3MoeDecoderLayer(nnx.Module):
             positions=positions,
             hidden_states=hidden_states,
             forward_batch=forward_batch,
+            token_to_kv_pool=token_to_kv_pool,
         )
 
         hidden_states += residual
