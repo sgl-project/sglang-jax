@@ -156,8 +156,8 @@ def load_model(server_args, port_args, tp_rank):
     if tp > 1:
         try:
             jax_mh.sync_global_devices("load_model")
-        except Exception:
-            pass
+        except Exception as e:
+            logging.info(f"Could not sync global devices (expected in single-host): {e}")
     return model_runner, tokenizer
 
 
@@ -246,49 +246,41 @@ def extend(reqs, model_runner):
     )
     batch.prepare_for_extend()
     _maybe_prepare_mlp_sync_batch(batch, model_runner)
-    # Prepare paddings consistent with Scheduler usage
-    page_size = model_runner.page_size
-    bs_needed = len(batch.seq_lens)
-    # token paddings should cover total extend tokens
+    # Compute how many tokens we need for extend and run forward+sample
     if hasattr(batch, "extend_lens") and batch.extend_lens is not None:
         token_needed = int(np.sum(np.array(batch.extend_lens, dtype=np.int64)))
     else:
-        # fallback: derive extend lengths as seq_len - prefix_len per req
         token_needed = int(np.sum(np.array(batch.seq_lens, dtype=np.int64)))
-    # cache_loc size must be >= sum of per-seq aligned lengths
-    cache_loc_needed = int(
-        np.sum(
-            ((np.array(batch.seq_lens, dtype=np.int64) + page_size - 1) // page_size)
-            * page_size
-        )
+    next_token_ids, next_token_logits = _run_forward_and_sample(
+        model_runner, batch, token_needed
     )
-    model_worker_batch = batch.get_model_worker_batch(
-        [token_needed], [bs_needed], [cache_loc_needed], page_size
-    )
-    # Prepare attention forward metadata (required by FlashAttention backend)
-    forward_metadata = model_runner.attn_backend.get_forward_metadata(
-        model_worker_batch
-    )
-    model_runner.attn_backend.forward_metadata = forward_metadata
-    forward_batch = ForwardBatch.init_new(model_worker_batch, model_runner)
-    logits_metadata = LogitsMetadata.from_model_worker_batch(
-        model_worker_batch, mesh=model_runner.mesh
-    )
-    logits_output, _ = model_runner.forward(
-        forward_batch, logits_metadata=logits_metadata
-    )
-    pad_size = len(model_worker_batch.seq_lens) - model_worker_batch.real_bs
-    sampling_metadata = SamplingMetadata.from_model_worker_batch(
-        model_worker_batch, pad_size=pad_size, mesh=model_runner.mesh
-    )
-    next_token_ids = model_runner.sample(logits_output, sampling_metadata)
-    return next_token_ids, logits_output.next_token_logits, batch
+    return next_token_ids, next_token_logits, batch
 
 
 def decode(input_token_ids, batch, model_runner):
     batch.output_ids = input_token_ids
     batch.prepare_for_decode()
     _maybe_prepare_mlp_sync_batch(batch, model_runner)
+    # For decode, the token dimension equals current batch size
+    bs_needed = len(batch.seq_lens)
+    next_token_ids, next_token_logits = _run_forward_and_sample(
+        model_runner, batch, bs_needed
+    )
+    return next_token_ids, next_token_logits
+
+
+def _maybe_prepare_mlp_sync_batch(batch: ScheduleBatch, model_runner):
+    # No-op for JAX bench; MLP sync is not required here
+    return
+
+
+def _run_forward_and_sample(model_runner, batch: ScheduleBatch, token_first_arg: int):
+    """Shared helper to build model worker batch, run forward, and sample.
+
+    The first argument to `get_model_worker_batch` differs between extend and decode:
+    - extend: number of tokens to extend across the batch
+    - decode: equals the batch size (one token per sequence)
+    """
     # Prepare paddings consistent with Scheduler usage
     page_size = model_runner.page_size
     bs_needed = len(batch.seq_lens)
@@ -298,32 +290,33 @@ def decode(input_token_ids, batch, model_runner):
             * page_size
         )
     )
+
     model_worker_batch = batch.get_model_worker_batch(
-        [bs_needed], [bs_needed], [cache_loc_needed], page_size
+        [token_first_arg], [bs_needed], [cache_loc_needed], page_size
     )
+
     # Prepare attention forward metadata (required by FlashAttention backend)
     forward_metadata = model_runner.attn_backend.get_forward_metadata(
         model_worker_batch
     )
     model_runner.attn_backend.forward_metadata = forward_metadata
+
     forward_batch = ForwardBatch.init_new(model_worker_batch, model_runner)
     logits_metadata = LogitsMetadata.from_model_worker_batch(
         model_worker_batch, mesh=model_runner.mesh
     )
+
     logits_output, _ = model_runner.forward(
         forward_batch, logits_metadata=logits_metadata
     )
+
     pad_size = len(model_worker_batch.seq_lens) - model_worker_batch.real_bs
     sampling_metadata = SamplingMetadata.from_model_worker_batch(
         model_worker_batch, pad_size=pad_size, mesh=model_runner.mesh
     )
     next_token_ids = model_runner.sample(logits_output, sampling_metadata)
+
     return next_token_ids, logits_output.next_token_logits
-
-
-def _maybe_prepare_mlp_sync_batch(batch: ScheduleBatch, model_runner):
-    # No-op for JAX bench; MLP sync is not required here
-    return
 
 
 def correctness_test(
