@@ -24,7 +24,6 @@ import jax.numpy as jnp
 from flax import nnx
 from transformers import LlamaConfig
 
-from sgl_jax.srt.configs.model_config import ModelConfig
 from sgl_jax.srt.layers.embeddings import (
     Embed,
     ParallelLMHead,
@@ -371,18 +370,18 @@ class LlamaModel(nnx.Module):
 
 class LlamaForCausalLM(nnx.Module):
     def __init__(
-        self, config: ModelConfig, rngs: nnx.Rngs = None, mesh: jax.sharding.Mesh = None
+        self, config: PretrainedConfig, rngs: nnx.Rngs = None, mesh: jax.sharding.Mesh = None
     ):
         self.mesh = mesh
         self.config = config
         self.dtype = config.dtype
         logger.info(f"LlamaForCausalLM config dtype: {self.dtype}")
-        self.transformer = LlamaModel(config.hf_config, dtype=self.dtype, rngs=rngs)
+        self.transformer = LlamaModel(config, dtype=self.dtype, rngs=rngs)
         self.lm_head = ParallelLMHead(
-            config.hf_config.vocab_size, config.hidden_size, rngs=rngs
+            config.vocab_size, config.hidden_size, rngs=rngs
         )
         self.logits_processor = LogitsProcessor(
-            config.hf_config.vocab_size, self.lm_head, self.mesh
+            config.vocab_size, self.lm_head, self.mesh
         )
 
     def load_weights(self, rng_key: jax.Array):
@@ -412,12 +411,12 @@ class LlamaForCausalLM(nnx.Module):
             ),
         }
 
-        if not getattr(self.config.hf_config, "tie_word_embeddings", True):
+        if not getattr(self.config, "tie_word_embeddings", True):
             mappings["lm_head.weight"] = WeightMapping(
                 target_path="lm_head.embedding", sharding=(None, None), transpose=False
             )
 
-        num_layers = self.config.hf_config.num_hidden_layers
+        num_layers = self.config.num_hidden_layers
         for layer_idx in range(num_layers):
             layer_mappings = self._create_layer_mappings(layer_idx)
             mappings.update(layer_mappings)
@@ -484,7 +483,7 @@ class LlamaForCausalLM(nnx.Module):
             ),
         }
 
-        if getattr(self.config.hf_config, "attention_bias", False):
+        if getattr(self.config, "attention_bias", False):
             bias_mappings = {
                 f"{prefix}.self_attn.q_proj.bias": WeightMapping(
                     target_path=f"{target_prefix}.self_attn.q_proj.bias",
