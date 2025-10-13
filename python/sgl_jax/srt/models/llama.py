@@ -370,16 +370,17 @@ class LlamaModel(nnx.Module):
 
 class LlamaForCausalLM(nnx.Module):
     def __init__(
-        self, config: PretrainedConfig, rngs: nnx.Rngs = None, mesh: jax.sharding.Mesh = None
+        self,
+        config: PretrainedConfig,
+        rngs: nnx.Rngs = None,
+        mesh: jax.sharding.Mesh = None,
     ):
         self.mesh = mesh
         self.config = config
         self.dtype = config.dtype
         logger.info(f"LlamaForCausalLM config dtype: {self.dtype}")
         self.transformer = LlamaModel(config, dtype=self.dtype, rngs=rngs)
-        self.lm_head = ParallelLMHead(
-            config.vocab_size, config.hidden_size, rngs=rngs
-        )
+        self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size, rngs=rngs)
         self.logits_processor = LogitsProcessor(
             config.vocab_size, self.lm_head, self.mesh
         )

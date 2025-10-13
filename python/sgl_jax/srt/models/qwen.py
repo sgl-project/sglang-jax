@@ -288,7 +288,10 @@ class QWenLMHeadModel(nnx.Module):
     """QWen language head model"""
 
     def __init__(
-        self, config: PretrainedConfig, rngs: nnx.Rngs = None, mesh: jax.sharding.Mesh = None
+        self,
+        config: PretrainedConfig,
+        rngs: nnx.Rngs = None,
+        mesh: jax.sharding.Mesh = None,
     ):
         self.mesh = mesh
         self.config = config
