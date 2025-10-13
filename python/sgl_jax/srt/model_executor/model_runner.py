@@ -406,7 +406,21 @@ class ModelRunner:
         return output, cache_miss_count
 
     def _set_kv_cache_after_forward(self, layers_kv_fused, forward_batch: ForwardBatch):
-        start_idx = self.token_to_kv_pool.start_layer
+        # Note: For tp_size == 1, we need to put the layers_kv_fused on the device with the target_sharding
+        # because sharding P(None, 'tensor') constraint has lost and this results in cache_miss for first prefill phase.
+        # Issue: https://github.com/sgl-project/sglang-jax/issues/233
+        # Q: Why does not call device_put in every layer?
+        # A: Because it does not work and cache_miss still happens. According to benchmark(https://github.com/sgl-project/sglang-jax/pull/234), the performance is not influenced.
+        if self.tp_size == 1:
+            target_sharding = NamedSharding(
+                self.token_to_kv_pool.mesh,
+                P(None, self.token_to_kv_pool.kv_partition_axis),
+            )
+            layers_kv_fused = [
+                jax.device_put(layer_kv_fused, target_sharding)
+                for layer_kv_fused in layers_kv_fused
+            ]
+        start_idx = forward_batch.token_to_kv_pool.start_layer
         end_idx = start_idx + len(layers_kv_fused)
         self.token_to_kv_pool.kv_buffer[start_idx:end_idx] = layers_kv_fused
 
