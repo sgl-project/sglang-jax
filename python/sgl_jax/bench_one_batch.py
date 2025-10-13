@@ -157,7 +157,9 @@ def load_model(server_args, port_args, tp_rank):
         try:
             jax_mh.sync_global_devices("load_model")
         except Exception as e:
-            logging.info(f"Could not sync global devices (expected in single-host): {e}")
+            logging.info(
+                f"Could not sync global devices (expected in single-host): {e}"
+            )
     return model_runner, tokenizer
 
 
