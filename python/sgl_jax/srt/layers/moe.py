@@ -79,8 +79,8 @@ class GateLogit(nnx.Module):
             self.bias = None
 
     def __call__(self, inputs: jax.Array) -> Tuple[jax.Array, Optional[jax.Array]]:
+        jax.debug.print("bias dtype: {bias_dtype}", bias_dtype=self.bias.value.dtype)
         inputs = jnp.asarray(inputs, self.dtype)
-
         kernel = jnp.asarray(self.kernel.value, self.dtype)
         output = jnp.dot(inputs, kernel)
 
