@@ -133,7 +133,7 @@ class NativeAttention(AttentionBackend):
             v = v.reshape(num_tokens, kv_heads, head_dim)
 
         if forward_batch.forward_mode == ForwardMode.EXTEND:
-            forward_batch.token_to_kv_pool.set_kv_buffer(
+            token_to_kv_pool.set_kv_buffer(
                 layer_id, forward_batch.out_cache_loc, k, v, is_decode=False
             )
         else:
