@@ -20,6 +20,7 @@ from sgl_jax.srt.layers.linear import LinearBase
 from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
 from sgl_jax.srt.layers.moe import EPMoE
 from sgl_jax.srt.layers.radix_attention import RadixAttention
+from sgl_jax.srt.mem_cache.memory_pool import KVCache
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
 
 logger = logging.getLogger(__name__)
@@ -382,6 +383,7 @@ class Grok1Attention(nnx.Module):
         positions: jax.Array,
         hidden_states: jax.Array,
         forward_batch: ForwardBatch,
+        token_to_kv_pool: KVCache,
     ) -> jax.Array:
         # Short circuit for empty sequences
         if hidden_states.shape[0] == 0:
@@ -401,7 +403,7 @@ class Grok1Attention(nnx.Module):
         jax.debug.print("before attn q: {q}", q=q)
         jax.debug.print("before attn k: {k}", k=k)
         jax.debug.print("before attn v: {v}", v=v)
-        attn_ret = self.attn(q, k, v, forward_batch)
+        attn_ret = self.attn(q, k, v, forward_batch, token_to_kv_pool)
         attn_output = attn_ret[0] if isinstance(attn_ret, tuple) else attn_ret
         jax.debug.print(
             "after attn attn_output: {attn_output}, shape: {shape}",
@@ -518,6 +520,7 @@ class Grok1DecoderLayer(nnx.Module):
         positions: jax.Array,
         hidden_states: jax.Array,
         forward_batch: ForwardBatch,
+        token_to_kv_pool: KVCache,
         residual: Optional[jax.Array] = None,
         deferred_norm: Optional[RMSNorm] = None,
     ) -> Tuple[jax.Array, jax.Array, RMSNorm]:
@@ -546,6 +549,7 @@ class Grok1DecoderLayer(nnx.Module):
             positions=positions,
             hidden_states=hidden_states,
             forward_batch=forward_batch,
+            token_to_kv_pool=token_to_kv_pool,
         )
         jax.debug.print(
             "after self_attn hidden_states: {hidden_states}",
@@ -610,6 +614,7 @@ class Grok1Model(nnx.Module):
         input_ids: jax.Array,
         positions: jax.Array,
         forward_batch: ForwardBatch,
+        token_to_kv_pool: KVCache,
         input_embeds: jax.Array = None,
     ) -> jax.Array:
         # Get embeddings
@@ -625,7 +630,12 @@ class Grok1Model(nnx.Module):
         residual, deferred_norm = None, None
         for layer in self.layers:
             hidden_states, residual, deferred_norm = layer(
-                positions, hidden_states, forward_batch, residual, deferred_norm
+                positions,
+                hidden_states,
+                forward_batch,
+                token_to_kv_pool,
+                residual,
+                deferred_norm,
             )
 
         # Apply final normalization (matching PyTorch fused_dual_residual_rmsnorm)
@@ -728,6 +738,7 @@ class Grok1ForCausalLM(nnx.Module):
     def __call__(
         self,
         forward_batch: ForwardBatch,
+        token_to_kv_pool: KVCache,
         logits_metadata: LogitsMetadata,
     ) -> tuple[jax.Array, list, bool]:
         """Forward pass through the model using unified forward_batch API."""
@@ -735,7 +746,9 @@ class Grok1ForCausalLM(nnx.Module):
         positions = forward_batch.positions
         jax.debug.print("input_ids: {input_ids}", input_ids=input_ids)
         jax.debug.print("positions: {positions}", positions=positions)
-        hidden_states = self.model(input_ids, positions, forward_batch, None)
+        hidden_states = self.model(
+            input_ids, positions, forward_batch, token_to_kv_pool, None
+        )
         output = self.logits_processor(hidden_states, logits_metadata)
         # Return values consistent with other models: (output, layers_kv_fused, layers_callback_flag)
         # Grok model does not expose per-layer KV tensors here, so return an empty list and True flag.
