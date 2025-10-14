@@ -152,14 +152,12 @@ class ModelRunner:
         def jitted_run_model(
             model_def,
             model_state_def,
+            model_state_leaves,
             forward_batch,
             token_to_kv_pool,
             logits_metadata,
-            model_state_leaves,
         ):
-            model_state = jax.tree_util.tree_unflatten(
-                model_state_def, model_state_leaves
-            )
+            model_state = jax.tree.unflatten(model_state_def, model_state_leaves)
             model = nnx.merge(model_def, model_state)
             return model(forward_batch, token_to_kv_pool, logits_metadata)
 
