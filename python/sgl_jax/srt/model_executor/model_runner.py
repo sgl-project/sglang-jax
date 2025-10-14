@@ -186,10 +186,16 @@ class ModelRunner:
                 logits_metadata,
             )
 
+        def run_sampler_wrapper(*args):
+            return jitted_sampler(
+                sampler_def,
+                sampler_state_def,
+                sampler_state_leaves,
+                *args,
+            )
+
         self.jitted_run_model = run_model_wrapper
-        self.jitted_sampler = partial(
-            jitted_sampler, self._sampler_def, self._sampler_state_def
-        )
+        self.jitted_sampler = run_sampler_wrapper
 
     def get_available_device_memory(self):
         min_available_device_memory = get_available_device_memory(
