@@ -253,11 +253,7 @@ class ForwardBatch:
                 batch.extend_prefix_lens,
                 batch.extend_seq_lens,
             ),
-            sharding=(
-                NamedSharding(model_runner.mesh, PartitionSpec())
-                if jax.process_count() == 1
-                else None
-            ),
+            sharding=NamedSharding(model_runner.mesh, PartitionSpec()),
         )
 
         obj = cls(

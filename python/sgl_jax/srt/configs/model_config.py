@@ -441,6 +441,8 @@ def _get_and_verify_dtype(
     config: PretrainedConfig,
     dtype: Union[str, jnp.dtype],
 ) -> jnp.dtype:
+    # If torch is available, it will by default return a torch dtype object.
+    # https://github.com/huggingface/transformers/blob/v4.56.2/src/transformers/configuration_utils.py#L269
     config_dtype = getattr(config, "torch_dtype", None)
     if isinstance(config_dtype, str):
         config_dtype = _STR_DTYPE_TO_JAX_DTYPE.get(config_dtype, None)

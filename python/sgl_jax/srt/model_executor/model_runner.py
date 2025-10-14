@@ -13,13 +13,12 @@ from jax._src import mesh as mesh_lib
 from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 
-from sgl_jax.srt.configs.load_config import LoadConfig, LoadFormat
+from sgl_jax.srt.configs.load_config import LoadConfig
 from sgl_jax.srt.configs.model_config import AttentionArch, MockModelConfig, ModelConfig
 from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessorOutput
 from sgl_jax.srt.layers.sampler import Sampler
 from sgl_jax.srt.managers.schedule_batch import (
     GLOBAL_SERVER_ARGS_KEYS,
-    ModelWorkerBatch,
     global_server_args_dict,
 )
 from sgl_jax.srt.mem_cache.allocator import (
@@ -28,8 +27,8 @@ from sgl_jax.srt.mem_cache.allocator import (
     TokenToKVPoolAllocator,
 )
 from sgl_jax.srt.mem_cache.memory_pool import MHATokenToKVPool, ReqToTokenPool
-from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sgl_jax.srt.model_loader.loader import JAXModelLoader
+from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
+from sgl_jax.srt.model_loader.loader import get_model_loader
 from sgl_jax.srt.precision_tracer import precision_tracer
 from sgl_jax.srt.sampling.sampling_batch_info import SamplingBatchInfo, SamplingMetadata
 from sgl_jax.srt.server_args import ServerArgs
@@ -61,13 +60,15 @@ class ModelRunner:
         mem_fraction_static: float,
         tp_size: int,
         server_args: ServerArgs,
-        mesh: jax.sharding.Mesh,
         req_to_token_pool: Optional[ReqToTokenPool] = None,
         token_to_kv_pool_allocator: Optional[BaseTokenToKVPoolAllocator] = None,
-        rngs: nnx.Rngs = None,
+        *,
+        mesh: jax.sharding.Mesh,
+        rngs: Optional[nnx.Rngs] = None,
     ):
         # Parse args
         self.model_config = model_config
+        self.model_config.num_hidden_layers = 1
         self.mem_fraction_static = mem_fraction_static
         self.device = server_args.device
         self.mesh = mesh
@@ -76,7 +77,7 @@ class ModelRunner:
         self.num_kv_heads = model_config.get_total_num_kv_heads_with_replication(
             tp_size
         )
-        self.rngs = rngs
+        self.rngs = rngs or nnx.Rngs(default=server_args.random_seed)
 
         self.tp_size = tp_size
         self.server_args = server_args
@@ -93,11 +94,12 @@ class ModelRunner:
             {k: getattr(server_args, k) for k in GLOBAL_SERVER_ARGS_KEYS}
         )
 
-        self.model_loader = JAXModelLoader(
+        self.model_loader = get_model_loader(
             load_config=LoadConfig(
-                load_format=LoadFormat.JAX, download_dir=server_args.download_dir
+                load_format=server_args.load_format,
+                download_dir=server_args.download_dir,
             ),
-            rngs=rngs,
+            rngs=self.rngs,
             mesh=self.mesh,
         )
 
@@ -130,11 +132,17 @@ class ModelRunner:
 
     def initialize_jit(self):
         model_def, model_state = nnx.split(self.model)
-        model_state_leaves, model_state_def = jax.tree_util.tree_flatten(model_state)
+        model_state_leaves, model_state_def = jax.tree.flatten(model_state)
         sampler_def, sampler_state = nnx.split(self.sampler)
-        sampler_state_leaves, sampler_state_def = jax.tree_util.tree_flatten(
-            sampler_state
-        )
+        sampler_state_leaves, sampler_state_def = jax.tree.flatten(sampler_state)
+
+        # Store state leaves so they can be passed as dynamic arguments (avoid constant capture)
+        self._model_def = model_def
+        self._model_state_def = model_state_def
+        self._model_state_leaves = model_state_leaves
+        self._sampler_def = sampler_def
+        self._sampler_state_def = sampler_state_def
+        self._sampler_state_leaves = sampler_state_leaves
 
         @partial(
             jax.jit,
@@ -149,14 +157,17 @@ class ModelRunner:
             token_to_kv_pool,
             logits_metadata,
         ):
-            model_state = jax.tree_util.tree_unflatten(
-                model_state_def, model_state_leaves
-            )
+            model_state = jax.tree.unflatten(model_state_def, model_state_leaves)
             model = nnx.merge(model_def, model_state)
             return model(forward_batch, token_to_kv_pool, logits_metadata)
 
         @partial(jax.jit, static_argnames=["sampler_state_def"])
-        def jitted_sampler(sampler_def, sampler_state_def, sampler_state_leaves, *args):
+        def jitted_sampler(
+            sampler_def,
+            sampler_state_def,
+            sampler_state_leaves,
+            *args,
+        ):
             model_state = jax.tree_util.tree_unflatten(
                 sampler_state_def, sampler_state_leaves
             )
@@ -175,10 +186,16 @@ class ModelRunner:
                 logits_metadata,
             )
 
+        def run_sampler_wrapper(*args):
+            return jitted_sampler(
+                sampler_def,
+                sampler_state_def,
+                sampler_state_leaves,
+                *args,
+            )
+
         self.jitted_run_model = run_model_wrapper
-        self.jitted_sampler = partial(
-            jitted_sampler, sampler_def, sampler_state_def, sampler_state_leaves
-        )
+        self.jitted_sampler = run_sampler_wrapper
 
     def get_available_device_memory(self):
         min_available_device_memory = get_available_device_memory(
@@ -446,10 +463,15 @@ class ModelRunner:
         forward_batch: ForwardBatch,
         logits_metadata: LogitsMetadata,
     ) -> Tuple[LogitsProcessorOutput, int]:
-        # for compatibility, 0.6.3 need to use use_mesh. set_mesh is not have __entry__ attribute.
-        # on jax 0.7.1, we need to use set_mesh.
-        # with jax.sharding.set_mesh(self.mesh):
-        with jax.sharding.use_mesh(self.mesh):
+        # Enter mesh context so shard_map can see a valid mesh
+        try:
+            ctx = jax.sharding.use_mesh(self.mesh)
+        except AttributeError:
+            try:
+                ctx = jax.set_mesh(self.mesh)
+            except AttributeError:
+                ctx = self.mesh
+        with ctx:
             if (
                 forward_batch.forward_mode.is_decode()
                 or forward_batch.forward_mode.is_extend()

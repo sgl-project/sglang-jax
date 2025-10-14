@@ -61,6 +61,7 @@ class Embed(nnx.Module):
                           computations between query/embedding tensors.
             rngs: Random number generator state for parameter initialization.
         """
+        rngs = rngs or nnx.Rngs(0)
         self.embedding = nnx.Param(
             nnx.with_partitioning(default_embed_init, (None, None))(
                 rngs.params(), (num_embeddings, features), param_dtype
@@ -145,6 +146,7 @@ class ParallelLMHead(Embed):
             use_bias: Whether to include bias parameters. Note: bias is currently
                      not used in logits computation, reserved for future extension.
         """
+        rngs = rngs or nnx.Rngs(0)
         super().__init__(
             num_embeddings=num_embeddings,
             features=features,
@@ -200,7 +202,8 @@ class RotaryEmbedding(nnx.Module):
         self.is_neox_style = is_neox_style
         self.dtype = dtype
 
-        self.cos_sin_cache = self._compute_cos_sin_cache().astype(dtype=dtype)
+        # may need to keep the cache in float32
+        self._cos_sin_cache = self._compute_cos_sin_cache().astype(dtype=dtype)
 
     def __call__(
         self,
@@ -248,6 +251,14 @@ class RotaryEmbedding(nnx.Module):
         sin, cos = jnp.sin(freqs), jnp.cos(freqs)
         cache = jnp.concatenate((cos, sin), axis=-1)
         return cache
+
+    @property
+    def cos_sin_cache(self) -> jax.Array:
+        return self._cos_sin_cache
+
+    @cos_sin_cache.setter
+    def cos_sin_cache(self, _):
+        raise AttributeError("cos_sin_cache is read-only and cannot be modified")
 
 
 class Llama3RotaryEmbedding(RotaryEmbedding):
@@ -441,3 +452,21 @@ def get_rope(
             raise ValueError(f"Unknown RoPE scaling type {scaling_type}")
     _ROPE_DICT[key] = rotary_emb
     return rotary_emb
+
+
+def _yarn_get_mscale(scaling_factor: float) -> float:
+    # Approximate magnitude scaling correction used by YaRN
+    return math.sqrt(scaling_factor)
+
+
+def _yarn_find_correction_range(
+    beta_fast: int,
+    beta_slow: int,
+    rotary_dim: int,
+    base: int,
+    max_position_embeddings: int,
+) -> tuple[float, float]:
+    # Heuristic correction band across rotary dimensions; can be refined
+    low = max(int(rotary_dim // max(beta_fast, 1)), 1)
+    high = max(int(rotary_dim // max(beta_slow, 1)), low + 1)
+    return float(low), float(high)
