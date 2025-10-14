@@ -77,7 +77,6 @@ class GateLogit(nnx.Module):
 
     def __call__(self, inputs: jax.Array) -> tuple[jax.Array, jax.Array | None]:
         inputs = jnp.asarray(inputs, self.dtype)
-
         kernel = jnp.asarray(self.kernel.value, self.dtype)
         output = jnp.dot(inputs, kernel)
 

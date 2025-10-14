@@ -118,7 +118,7 @@ class WeightLoader:
                 if self._is_excluded_layer_weight(hf_key):
                     logger.debug("Skipping excluded MoE expert weight: %s", hf_key)
                 else:
-                    expert_weights[hf_key] = hf_weight.astype(self.dtype)
+                    expert_weights[hf_key] = hf_weight
             else:
                 if self._is_excluded_layer_weight(hf_key):
                     logger.debug("Skipping excluded layer weight: %s", hf_key)
@@ -227,7 +227,7 @@ class WeightLoader:
                 processed_weight.shape,
                 mapping.transpose,
             )
-            model_param.value = sharded_weight
+            model_param.value = sharded_weight.astype(model_param.value.dtype)
         except Exception as e:
             logger.error("Failed to load %s -> %s: %s", hf_key, jax_path, str(e))
             raise
@@ -344,8 +344,10 @@ class WeightLoader:
             sharded_weight = self._shard_weight(processed_weight, mapping.sharding)
 
             model_param = self._get_param(params, jax_path)
-            model_param.value = sharded_weight
-            logger.debug("Split %s -> %s, shape: %s", hf_key, jax_path, processed_weight.shape)
+            model_param.value = sharded_weight.astype(model_param.value.dtype)
+            logger.debug(
+                f"Split {hf_key} -> {jax_path}, shape: {processed_weight.shape}"
+            )
 
     def _shard_weight(self, weight: jax.Array, sharding: tuple) -> jax.Array:
         if math.prod(self.mesh.axis_sizes) == 1:
@@ -552,6 +554,6 @@ class WeightLoader:
 
                     sharded_weight = self._shard_weight(device_experts, mapping.sharding)
                     model_param = self._get_param(params, target_path)
-                    model_param.value = sharded_weight
+                    model_param.value = sharded_weight.astype(model_param.value.dtype)
                 else:
                     logger.error("Could not collect all expert weights for %s", target_path)
