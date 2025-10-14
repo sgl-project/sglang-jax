@@ -10,6 +10,8 @@ import jax.numpy as jnp
 import numpy as np
 from flax import nnx
 from jax._src import mesh as mesh_lib
+from jax.sharding import NamedSharding
+from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.configs.load_config import LoadConfig
 from sgl_jax.srt.configs.model_config import AttentionArch, MockModelConfig, ModelConfig
@@ -17,7 +19,6 @@ from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessorO
 from sgl_jax.srt.layers.sampler import Sampler
 from sgl_jax.srt.managers.schedule_batch import (
     GLOBAL_SERVER_ARGS_KEYS,
-    ModelWorkerBatch,
     global_server_args_dict,
 )
 from sgl_jax.srt.mem_cache.allocator import (
@@ -410,7 +411,7 @@ class ModelRunner:
 
         with jtu.count_pjit_cpp_cache_miss() as count:
             output, layers_kv_fused, _ = self.jitted_run_model(
-                forward_batch, logits_metadata, self._model_state_leaves
+                forward_batch, logits_metadata
             )
             cache_miss_count = count()
         self._set_kv_cache_after_forward(layers_kv_fused, forward_batch)
