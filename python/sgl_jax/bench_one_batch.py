@@ -47,7 +47,6 @@ import dataclasses
 import itertools
 import json
 import logging
-import multiprocessing
 import os
 import time
 from typing import Tuple
@@ -64,7 +63,6 @@ from sgl_jax.srt.entrypoints.engine import _set_envs_and_config
 from sgl_jax.srt.hf_transformers_utils import get_tokenizer
 from sgl_jax.srt.layers.logits_processor import LogitsMetadata
 from sgl_jax.srt.managers.schedule_batch import Req, ScheduleBatch
-from sgl_jax.srt.managers.scheduler import Scheduler
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
 from sgl_jax.srt.model_executor.model_runner import ModelRunner
 from sgl_jax.srt.sampling.sampling_batch_info import SamplingMetadata
@@ -550,6 +548,8 @@ def latency_test(
 
 
 def main(server_args, bench_args):
+    jax.distributed.initialize()
+
     server_args.cuda_graph_max_bs = max(bench_args.batch_size)
     server_args.ep_size = 1
 
