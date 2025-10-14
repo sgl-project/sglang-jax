@@ -291,7 +291,9 @@ def extend(reqs, model_runner):
     sampling_metadata = SamplingMetadata.from_model_worker_batch(
         model_worker_batch, pad_size=pad_size, mesh=model_runner.mesh
     )
-    next_token_ids = model_runner.sample(logits_output, sampling_metadata)
+    next_token_ids = model_runner.sample(
+        logits_output, sampling_metadata, batch.positions
+    )
     return next_token_ids, logits_output.next_token_logits, batch
 
 
@@ -327,7 +329,9 @@ def decode(input_token_ids, batch, model_runner):
     sampling_metadata = SamplingMetadata.from_model_worker_batch(
         model_worker_batch, pad_size=pad_size, mesh=model_runner.mesh
     )
-    next_token_ids = model_runner.sample(logits_output, sampling_metadata)
+    next_token_ids = model_runner.sample(
+        logits_output, sampling_metadata, batch.positions
+    )
     return next_token_ids, logits_output.next_token_logits
 
 
