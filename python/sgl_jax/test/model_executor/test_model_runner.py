@@ -17,7 +17,7 @@ from sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch
 from sgl_jax.srt.mem_cache.memory_pool import ReqToTokenPool
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sgl_jax.srt.model_executor.model_runner import ModelRunner
-from sgl_jax.srt.model_loader.loader import JAXModelLoader
+from sgl_jax.srt.model_loader.loader import get_model_loader
 from sgl_jax.srt.precision_tracer import precision_tracer
 from sgl_jax.srt.sampling.sampling_batch_info import SamplingBatchInfo, SamplingMetadata
 from sgl_jax.srt.server_args import ServerArgs
@@ -69,9 +69,9 @@ class TestModelRunner(unittest.TestCase):
             model_path=self.model_path, model_override_args="{}", dtype="bfloat16"
         )
 
-        # Create load config and JAX loader
+        # Create load config and get_model_loader
         self.load_config = LoadConfig(load_format=LoadFormat.JAX, download_dir="/tmp/")
-        self.jax_loader = JAXModelLoader(self.load_config, self.rng, self.mesh)
+        self.jax_loader = get_model_loader(self.load_config, self.rng, self.mesh)
 
         # Setup ModelRunner
         self._setup_model_runner()

@@ -13,7 +13,7 @@ from sgl_jax.srt.layers.attention.native_backend import NativeAttention
 from sgl_jax.srt.layers.sampler import Sampler
 from sgl_jax.srt.mem_cache.memory_pool import MHATokenToKVPool
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sgl_jax.srt.model_loader.loader import JAXModelLoader
+from sgl_jax.srt.model_loader.loader import get_model_loader
 from sgl_jax.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sgl_jax.test.test_utils import create_device_mesh, jax_trace_context
 
@@ -34,7 +34,7 @@ class TestQwenModel(unittest.TestCase):
 
         # JAX loader configuration
         self.load_config = LoadConfig(load_format=LoadFormat.JAX)
-        self.jax_loader = JAXModelLoader(self.load_config, self.rngs, self.mesh)
+        self.jax_loader = get_model_loader(self.load_config, self.rngs, self.mesh)
         # initialise_tracking()
 
     def _get_tokenizer(self):
@@ -70,7 +70,7 @@ class TestQwenModel(unittest.TestCase):
             )
 
     def _setup_model(self):
-        """Setup model using JAXModelLoader"""
+        """Setup model using get_model_loader"""
         model_path = self.test_model_path
 
         # Check if it's a local path

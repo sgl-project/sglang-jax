@@ -284,4 +284,4 @@ def get_model_loader(
     if load_config.load_format == LoadFormat.JAX:
         return JAXModelLoader(load_config, rngs, mesh)
 
-    return JAXModelLoader(load_config, rngs, mesh)
+    raise ValueError(f"Invalid load format: {load_config.load_format}")
