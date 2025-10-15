@@ -7,6 +7,7 @@ from flax import nnx
 from jax import numpy as jnp
 from transformers import PretrainedConfig
 
+from sgl_jax.srt.configs.model_config import ModelConfig
 from sgl_jax.srt.layers.embeddings import Embed, ParallelLMHead, RotaryEmbedding
 from sgl_jax.srt.layers.linear import LinearBase
 from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
@@ -316,12 +317,12 @@ class Qwen2ForCausalLM(nnx.Module):
             config.vocab_size, self.lm_head, self.mesh
         )
 
-    def load_weights(self, rng_key: jax.Array):
+    def load_weights(self, model_config: ModelConfig, rng_key: jax.Array):
         self.rng = nnx.Rngs(rng_key)
 
         loader = WeightLoader(
             model=self,
-            model_config=self.config,
+            model_config=model_config,
             mesh=self.mesh,
             dtype=self.dtype,
         )

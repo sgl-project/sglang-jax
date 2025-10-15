@@ -107,7 +107,8 @@ class JAXModelLoader(BaseModelLoader):
             model = create_model(self.rng)
 
         rng_key = self.rng.default.key.value
-        model.load_weights(rng_key)
+        # FIXME: Better interface not to pass in model_config again
+        model.load_weights(model_config, rng_key)
 
         return model
 
