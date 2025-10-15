@@ -290,12 +290,13 @@ class QWenLMHeadModel(nnx.Module):
     def __init__(
         self,
         config: PretrainedConfig,
+        dtype: jnp.dtype = jnp.bfloat16,
         rngs: nnx.Rngs = None,
         mesh: jax.sharding.Mesh = None,
     ):
         self.mesh = mesh
         self.config = config
-        self.dtype = config.dtype
+        self.dtype = dtype
         logger.info(f"QWenLMHeadModel config dtype: {self.dtype}")
         self.transformer = QWenModel(config, dtype=self.dtype, rngs=rngs)
         vocab_size = ((config.vocab_size + 63) // 64) * 64

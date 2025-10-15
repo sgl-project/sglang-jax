@@ -302,12 +302,13 @@ class Qwen2ForCausalLM(nnx.Module):
     def __init__(
         self,
         config: PretrainedConfig,
+        dtype: jnp.dtype = jnp.bfloat16,
         rngs: nnx.Rngs = None,
         mesh: jax.sharding.Mesh = None,
     ):
         self.mesh = mesh
         self.config = config
-        self.dtype = config.dtype
+        self.dtype = dtype
         logger.info(f"Qwen2ForCausalLM config dtype: {self.dtype}")
         self.transformer = Qwen2Model(config, dtype=self.dtype, rngs=rngs)
         self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size, rngs=rngs)

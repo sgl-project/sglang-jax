@@ -94,7 +94,9 @@ class JAXModelLoader(BaseModelLoader):
     def _get_model(self, model_class: Any, model_config: ModelConfig) -> nnx.Module:
         @nnx.jit
         def create_model(rng: nnx.Rngs):
-            model = model_class(model_config.hf_config, rng, self.mesh)
+            model = model_class(
+                model_config.hf_config, model_config.dtype, rng, self.mesh
+            )
             state = nnx.state(model)
             pspecs = nnx.get_partition_spec(state)
             sharded_state = jax.lax.with_sharding_constraint(state, pspecs)
@@ -251,7 +253,9 @@ class JAXDummyModelLoader(BaseModelLoader):
         model_class = self._initialize_model(model_config)
 
         def create_model(rng: nnx.Rngs):
-            model = model_class(model_config.hf_config, rng, self.mesh)
+            model = model_class(
+                model_config.hf_config, model_config.dtype, rng, self.mesh
+            )
             state = nnx.state(model)
             pspecs = nnx.get_partition_spec(state)
             sharded_state = jax.lax.with_sharding_constraint(state, pspecs)

@@ -279,7 +279,9 @@ class TestModelLoaderWithRealModel(unittest.TestCase):
             )
 
             # Create QWen model instance
-            model = QWenLMHeadModel(model_config, self.rng, self.mesh)
+            model = QWenLMHeadModel(
+                model_config, model_config.dtype, self.rng, self.mesh
+            )
 
             self.assertIsInstance(model, QWenLMHeadModel)
             self.assertEqual(model.config, model_config)
@@ -314,7 +316,9 @@ class TestModelLoaderWithRealModel(unittest.TestCase):
             )
 
             # Create QWen model instance
-            model = QWenLMHeadModel(model_config, self.rng, self.mesh)
+            model = QWenLMHeadModel(
+                model_config, model_config.dtype, self.rng, self.mesh
+            )
 
             # Print the actual parameter structure of the model
             try:
@@ -393,7 +397,9 @@ class TestModelLoaderWithRealModel(unittest.TestCase):
             print(f"  Attention heads: {model_config.num_attention_heads}")
 
             # Create QWen model instance
-            model = QWenLMHeadModel(model_config, self.rng, self.mesh)
+            model = QWenLMHeadModel(
+                model_config, model_config.dtype, self.rng, self.mesh
+            )
 
             # Check what attributes the model actually has
             print(f" Model Attributes:")
@@ -492,7 +498,9 @@ class TestModelLoaderWithRealModel(unittest.TestCase):
             )
 
             # Create QWen model instance
-            model = QWenLMHeadModel(model_config, self.rng, self.mesh)
+            model = QWenLMHeadModel(
+                model_config, model_config.dtype, self.rng, self.mesh
+            )
 
             print(f" Validating Model Parameter Structure:")
             print(f"  Model type: {type(model).__name__}")
