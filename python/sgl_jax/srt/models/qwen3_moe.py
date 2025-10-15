@@ -334,29 +334,26 @@ class QWen3MoeModel(nnx.Module):
 class Qwen3MoeForCausalLM(nnx.Module):
     def __init__(
         self,
-        config: ModelConfig,
+        config: PretrainedConfig,
+        dtype: jnp.dtype = jnp.bfloat16,
         rngs: nnx.Rngs = None,
         mesh: jax.sharding.Mesh = None,
     ):
         self.mesh = mesh
         self.config = config
-        self.dtype = config.dtype
+        self.dtype = dtype
         logger.info(f"QWen3MoeForCausalLMModel config dtype: {self.dtype}")
-        self.transformer = QWen3MoeModel(
-            config.hf_config, dtype=self.dtype, rngs=rngs, mesh=mesh
-        )
-        self.lm_head = ParallelLMHead(
-            config.hf_config.vocab_size, config.hidden_size, rngs=rngs
-        )
+        self.transformer = QWen3MoeModel(config, dtype=self.dtype, rngs=rngs, mesh=mesh)
+        self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size, rngs=rngs)
         self.logits_processor = LogitsProcessor(
-            config.hf_config.vocab_size, self.lm_head, self.mesh
+            config.vocab_size, self.lm_head, self.mesh
         )
 
-    def load_weights(self, rng_key: jax.Array):
+    def load_weights(self, model_config: ModelConfig, rng_key: jax.Array):
         self.rng = nnx.Rngs(rng_key)
         loader = WeightLoader(
             model=self,
-            model_config=self.config,
+            model_config=model_config,
             mesh=self.mesh,
             dtype=self.dtype,
         )
@@ -376,13 +373,13 @@ class Qwen3MoeForCausalLM(nnx.Module):
             ),
         }
 
-        if not getattr(self.config.hf_config, "tie_word_embeddings", True):
+        if not getattr(self.config, "tie_word_embeddings", True):
             mappings["lm_head.weight"] = WeightMapping(
                 target_path="lm_head.embedding", sharding=(None, None), transpose=False
             )
 
-        num_layers = self.config.hf_config.num_hidden_layers
-        mlp_only_layers = getattr(self.config.hf_config, "mlp_only_layers", [])
+        num_layers = self.config.num_hidden_layers
+        mlp_only_layers = getattr(self.config, "mlp_only_layers", [])
 
         for layer_idx in range(num_layers):
             layer_mappings = self._create_moe_layer_mappings(
@@ -441,7 +438,7 @@ class Qwen3MoeForCausalLM(nnx.Module):
             ),
         }
 
-        if getattr(self.config.hf_config, "attention_bias", False):
+        if getattr(self.config, "attention_bias", False):
             bias_mappings = {
                 f"{prefix}.self_attn.q_proj.bias": WeightMapping(
                     target_path=f"{target_prefix}.self_attn.q_proj.bias",
@@ -494,7 +491,7 @@ class Qwen3MoeForCausalLM(nnx.Module):
                 transpose=True,
             )
 
-            num_experts = getattr(self.config.hf_config, "num_experts", 128)
+            num_experts = getattr(self.config, "num_experts", 128)
             for expert_type in ["gate_proj", "up_proj", "down_proj"]:
                 target_name = {
                     "gate_proj": "wi_0",

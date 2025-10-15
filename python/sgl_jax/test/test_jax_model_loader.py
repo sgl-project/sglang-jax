@@ -181,15 +181,6 @@ class TestJAXModelLoader(CustomTestCase):
         loader = JAXModelLoader(self.load_config)
         self.assertEqual(loader.load_config.load_format, LoadFormat.JAX)
 
-    def test_jax_loader_invalid_format(self):
-        """Test JAXModelLoader with invalid load format"""
-        invalid_config = LoadConfig(load_format=LoadFormat.AUTO)
-        with self.assertRaises(ValueError) as context:
-            JAXModelLoader(invalid_config)
-        self.assertIn(
-            "JAXModelLoader only supports JAX load format", str(context.exception)
-        )
-
     def test_prepare_jax_weights_local_path(self):
         """Test preparing JAX weights from local path"""
         loader = JAXModelLoader(self.load_config)

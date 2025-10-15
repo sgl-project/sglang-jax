@@ -72,15 +72,13 @@ class TestModelLoader(unittest.TestCase):
         self.assertIsInstance(loader, JAXModelLoader)
 
     def test_load_config_validation(self):
-        """Test that JAXModelLoader validates load format."""
+        """Test that get_model_loader validates load format."""
         invalid_config = LoadConfig(load_format=LoadFormat.PT)
 
         with self.assertRaises(ValueError) as context:
-            JAXModelLoader(invalid_config, self.rng, self.mesh)
+            get_model_loader(invalid_config, self.rng, self.mesh)
 
-        self.assertIn(
-            "JAXModelLoader only supports JAX load format", str(context.exception)
-        )
+        self.assertIn("Invalid load format", str(context.exception))
 
     def test_multi_device_environment_setup(self):
         """Test that multi-device environment is properly configured."""
@@ -279,7 +277,9 @@ class TestModelLoaderWithRealModel(unittest.TestCase):
             )
 
             # Create QWen model instance
-            model = QWenLMHeadModel(model_config, self.rng, self.mesh)
+            model = QWenLMHeadModel(
+                model_config, model_config.dtype, self.rng, self.mesh
+            )
 
             self.assertIsInstance(model, QWenLMHeadModel)
             self.assertEqual(model.config, model_config)
@@ -314,7 +314,9 @@ class TestModelLoaderWithRealModel(unittest.TestCase):
             )
 
             # Create QWen model instance
-            model = QWenLMHeadModel(model_config, self.rng, self.mesh)
+            model = QWenLMHeadModel(
+                model_config, model_config.dtype, self.rng, self.mesh
+            )
 
             # Print the actual parameter structure of the model
             try:
@@ -393,7 +395,9 @@ class TestModelLoaderWithRealModel(unittest.TestCase):
             print(f"  Attention heads: {model_config.num_attention_heads}")
 
             # Create QWen model instance
-            model = QWenLMHeadModel(model_config, self.rng, self.mesh)
+            model = QWenLMHeadModel(
+                model_config, model_config.dtype, self.rng, self.mesh
+            )
 
             # Check what attributes the model actually has
             print(f" Model Attributes:")
@@ -413,7 +417,7 @@ class TestModelLoaderWithRealModel(unittest.TestCase):
             traceback.print_exc()
 
     def test_full_model_loading_pipeline(self):
-        """Test the complete model loading pipeline using JAXModelLoader."""
+        """Test the complete model loading pipeline using get_model_loader."""
         try:
             # Create model config
             model_config = ModelConfig(
@@ -492,7 +496,9 @@ class TestModelLoaderWithRealModel(unittest.TestCase):
             )
 
             # Create QWen model instance
-            model = QWenLMHeadModel(model_config, self.rng, self.mesh)
+            model = QWenLMHeadModel(
+                model_config, model_config.dtype, self.rng, self.mesh
+            )
 
             print(f" Validating Model Parameter Structure:")
             print(f"  Model type: {type(model).__name__}")

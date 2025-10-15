@@ -293,23 +293,27 @@ class QWenLMHeadModel(nnx.Module):
     """QWen language head model"""
 
     def __init__(
-        self, config: ModelConfig, rngs: nnx.Rngs = None, mesh: jax.sharding.Mesh = None
+        self,
+        config: PretrainedConfig,
+        dtype: jnp.dtype = jnp.bfloat16,
+        rngs: nnx.Rngs = None,
+        mesh: jax.sharding.Mesh = None,
     ):
         self.mesh = mesh
         self.config = config
-        self.dtype = config.dtype
+        self.dtype = dtype
         logger.info(f"QWenLMHeadModel config dtype: {self.dtype}")
-        self.transformer = QWenModel(config.hf_config, dtype=self.dtype, rngs=rngs)
-        vocab_size = ((config.hf_config.vocab_size + 63) // 64) * 64
+        self.transformer = QWenModel(config, dtype=self.dtype, rngs=rngs)
+        vocab_size = ((config.vocab_size + 63) // 64) * 64
         self.lm_head = ParallelLMHead(vocab_size, config.hidden_size, rngs=rngs)
         self.logits_processor = LogitsProcessor(vocab_size, self.lm_head, self.mesh)
 
-    def load_weights(self, rng_key: jax.Array):
+    def load_weights(self, model_config: ModelConfig, rng_key: jax.Array):
         self.rng = nnx.Rngs(rng_key)
 
         loader = WeightLoader(
             model=self,
-            model_config=self.config,
+            model_config=model_config,
             mesh=self.mesh,
             dtype=self.dtype,
         )
@@ -331,12 +335,12 @@ class QWenLMHeadModel(nnx.Module):
             ),
         }
 
-        if not getattr(self.config.hf_config, "tie_word_embeddings", True):
+        if not getattr(self.config, "tie_word_embeddings", True):
             mappings["lm_head.weight"] = WeightMapping(
                 target_path="lm_head.embedding", sharding=(None, None), transpose=False
             )
 
-        num_layers = self.config.hf_config.num_hidden_layers
+        num_layers = self.config.num_hidden_layers
         for layer_idx in range(num_layers):
             layer_mappings = self._create_layer_mappings(layer_idx)
             mappings.update(layer_mappings)

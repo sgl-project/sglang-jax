@@ -310,26 +310,28 @@ class Qwen2Model(nnx.Module):
 
 class Qwen2ForCausalLM(nnx.Module):
     def __init__(
-        self, config: ModelConfig, rngs: nnx.Rngs = None, mesh: jax.sharding.Mesh = None
+        self,
+        config: PretrainedConfig,
+        dtype: jnp.dtype = jnp.bfloat16,
+        rngs: nnx.Rngs = None,
+        mesh: jax.sharding.Mesh = None,
     ):
         self.mesh = mesh
         self.config = config
-        self.dtype = config.dtype
+        self.dtype = dtype
         logger.info(f"Qwen2ForCausalLM config dtype: {self.dtype}")
-        self.transformer = Qwen2Model(config.hf_config, dtype=self.dtype, rngs=rngs)
-        self.lm_head = ParallelLMHead(
-            config.hf_config.vocab_size, config.hidden_size, rngs=rngs
-        )
+        self.transformer = Qwen2Model(config, dtype=self.dtype, rngs=rngs)
+        self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size, rngs=rngs)
         self.logits_processor = LogitsProcessor(
-            config.hf_config.vocab_size, self.lm_head, self.mesh
+            config.vocab_size, self.lm_head, self.mesh
         )
 
-    def load_weights(self, rng_key: jax.Array):
+    def load_weights(self, model_config: ModelConfig, rng_key: jax.Array):
         self.rng = nnx.Rngs(rng_key)
 
         loader = WeightLoader(
             model=self,
-            model_config=self.config,
+            model_config=model_config,
             mesh=self.mesh,
             dtype=self.dtype,
         )
@@ -351,12 +353,12 @@ class Qwen2ForCausalLM(nnx.Module):
             ),
         }
 
-        if not getattr(self.config.hf_config, "tie_word_embeddings", True):
+        if not getattr(self.config, "tie_word_embeddings", True):
             mappings["lm_head.weight"] = WeightMapping(
                 target_path="lm_head.embedding", sharding=(None, None), transpose=False
             )
 
-        num_layers = self.config.hf_config.num_hidden_layers
+        num_layers = self.config.num_hidden_layers
         for layer_idx in range(num_layers):
             layer_mappings = self._create_layer_mappings(layer_idx)
             mappings.update(layer_mappings)
@@ -423,7 +425,7 @@ class Qwen2ForCausalLM(nnx.Module):
             ),
         }
 
-        if getattr(self.config.hf_config, "attention_bias", True):
+        if getattr(self.config, "attention_bias", True):
             bias_mappings = {
                 f"{prefix}.self_attn.q_proj.bias": WeightMapping(
                     target_path=f"{target_prefix}.self_attn.q_proj.bias",
