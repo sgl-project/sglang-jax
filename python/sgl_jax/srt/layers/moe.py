@@ -10,6 +10,8 @@ from jax.sharding import PartitionSpec as P
 from sgl_jax.srt.layers import linear
 from sgl_jax.srt.layers.gmm.megablox_gmm_backend import gmm
 
+from ..utils.weight_utils import lazy_init
+
 
 class GateLogit(nnx.Module):
     """A layer used to compute gate logits, allowing to return the pre bias values for DeepSeek routing.
@@ -60,7 +62,7 @@ class GateLogit(nnx.Module):
         kernel_shape = (input_size,) + self.features
 
         self.kernel = nnx.Param(
-            nnx.with_partitioning(nnx.initializers.normal(), self.kernel_axes)(
+            nnx.with_partitioning(lazy_init, self.kernel_axes)(
                 rngs.params(), kernel_shape, self.weight_dtype
             )
         )
@@ -98,6 +100,31 @@ class GateLogit(nnx.Module):
 
         return output
 
+    def materialize(self, mesh: Mesh, rngs: nnx.Rngs):
+        """Materializes and shards GateLogit parameters in-place."""
+        pspecs = nnx.get_partition_spec(nnx.state(self))
+
+        real_kernel_val = nnx.initializers.normal()(
+            rngs.params(), self.kernel.value.shape, self.weight_dtype
+        )
+
+        with mesh:
+            sharded_kernel = jax.lax.with_sharding_constraint(
+                real_kernel_val, pspecs["kernel"]
+            )
+            updates = {"kernel": sharded_kernel}
+
+            if self.use_bias and self.bias is not None:
+                real_bias_val = nnx.initializers.zeros_init()(
+                    rngs.params(), self.bias.value.shape, self.weight_dtype
+                )
+                sharded_bias = jax.lax.with_sharding_constraint(
+                    real_bias_val, pspecs["bias"]
+                )
+                updates["bias"] = sharded_bias
+
+        nnx.update(self, updates)
+
 
 class EPMoE(nnx.Module):
     def __init__(
@@ -132,7 +159,7 @@ class EPMoE(nnx.Module):
         expert_kernel_axes = (("data", "tensor"), None, None)
 
         self.wi_0 = nnx.Param(
-            nnx.with_partitioning(nnx.initializers.normal(), expert_kernel_axes)(
+            nnx.with_partitioning(lazy_init, expert_kernel_axes)(
                 rngs.params(),
                 (self.experts_per_device, config.hidden_size, intermediate_dim),
                 weight_dtype,
@@ -140,7 +167,7 @@ class EPMoE(nnx.Module):
         )
 
         self.wi_1 = nnx.Param(
-            nnx.with_partitioning(nnx.initializers.normal(), expert_kernel_axes)(
+            nnx.with_partitioning(lazy_init, expert_kernel_axes)(
                 rngs.params(),
                 (self.experts_per_device, config.hidden_size, intermediate_dim),
                 weight_dtype,
@@ -148,17 +175,36 @@ class EPMoE(nnx.Module):
         )
 
         self.wo = nnx.Param(
-            nnx.with_partitioning(nnx.initializers.normal(), expert_kernel_axes)(
+            nnx.with_partitioning(lazy_init, expert_kernel_axes)(
                 rngs.params(),
                 (self.experts_per_device, intermediate_dim, config.hidden_size),
                 weight_dtype,
             )
         )
 
-        state = nnx.state(self)
-        pspecs = nnx.get_partition_spec(state)
-        sharded_state = jax.lax.with_sharding_constraint(state, pspecs)
-        nnx.update(self, sharded_state)
+        # Defer materialization; no eager sharding at construction time
+
+    def materialize(self, mesh: Mesh, rngs: nnx.Rngs):
+        """Materialize and shard MoE expert weights in-place."""
+        pspecs = nnx.get_partition_spec(nnx.state(self))
+
+        real_wi_0 = nnx.initializers.normal()(
+            rngs.params(), self.wi_0.value.shape, self.weight_dtype
+        )
+        real_wi_1 = nnx.initializers.normal()(
+            rngs.params(), self.wi_1.value.shape, self.weight_dtype
+        )
+        real_wo = nnx.initializers.normal()(
+            rngs.params(), self.wo.value.shape, self.weight_dtype
+        )
+
+        with mesh:
+            sharded_wi_0 = jax.lax.with_sharding_constraint(real_wi_0, pspecs["wi_0"])
+            sharded_wi_1 = jax.lax.with_sharding_constraint(real_wi_1, pspecs["wi_1"])
+            sharded_wo = jax.lax.with_sharding_constraint(real_wo, pspecs["wo"])
+            nnx.update(
+                self, {"wi_0": sharded_wi_0, "wi_1": sharded_wi_1, "wo": sharded_wo}
+            )
 
     def _detect_device_capabilities(self):
         try:

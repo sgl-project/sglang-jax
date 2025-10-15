@@ -19,6 +19,10 @@ from sgl_jax.srt.configs.model_config import ModelConfig
 logger = logging.getLogger(__name__)
 
 
+def lazy_init(rng, shape, dtype):
+    return jax.ShapeDtypeStruct(shape, dtype)
+
+
 @dataclass
 class WeightMapping:
     target_path: Union[str, List[str]]

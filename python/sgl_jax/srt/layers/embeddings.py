@@ -23,6 +23,9 @@ from flax import nnx
 from flax.nnx.nn import dtypes
 from flax.nnx.nn.linear import default_embed_init
 from flax.typing import PromoteDtypeFn
+from jax.sharding import Mesh
+
+from ..utils.weight_utils import lazy_init
 
 
 class Embed(nnx.Module):
@@ -62,7 +65,7 @@ class Embed(nnx.Module):
             rngs: Random number generator state for parameter initialization.
         """
         self.embedding = nnx.Param(
-            nnx.with_partitioning(default_embed_init, (None, None))(
+            nnx.with_partitioning(lazy_init, (None, None))(
                 rngs.params(), (num_embeddings, features), param_dtype
             )
         )
@@ -92,6 +95,26 @@ class Embed(nnx.Module):
         if self.num_embeddings == 1:
             return jnp.broadcast_to(embedding, inputs.shape + (self.features,))
         return jnp.take(embedding, inputs, axis=0)
+
+    def materialize(self, mesh: Mesh, rngs: nnx.Rngs):
+        """
+        Materializes and shards the embedding parameters in-place.
+        """
+        pspecs = nnx.get_partition_spec(nnx.state(self))
+
+        real_embedding_val = default_embed_init()(  # type: ignore[arg-type]
+            rngs.params(),
+            (self.num_embeddings, self.features),
+            self.embedding.value.dtype,
+        )
+
+        with mesh:
+            sharded_embedding = jax.lax.with_sharding_constraint(
+                real_embedding_val, pspecs["embedding"]
+            )
+            updates = {"embedding": sharded_embedding}
+
+        nnx.update(self, updates)
 
     def attend(self, query: jax.Array) -> jax.Array:
         """Attend over the embedding using a query array.
@@ -155,7 +178,7 @@ class ParallelLMHead(Embed):
         )
         if use_bias:
             self.bias = nnx.Param(
-                nnx.with_partitioning(nnx.initializers.constant(0.0), (None, "tensor"))(
+                nnx.with_partitioning(lazy_init, (None, "tensor"))(
                     rngs.params(), (self.num_embeddings, self.features), param_dtype
                 )
             )
@@ -166,6 +189,43 @@ class ParallelLMHead(Embed):
         """Tie the weights with word embeddings."""
         self.embedding = embed_tokens.embedding
         return self
+
+    def materialize(self, mesh: Mesh, rngs: nnx.Rngs):
+        """
+        Materializes and shards LM head parameters in-place.
+        - If embedding is already materialized (e.g., tied to input embeddings), it is left untouched.
+        - Bias, when present and lazy, is materialized and sharded.
+        """
+        pspecs = nnx.get_partition_spec(nnx.state(self))
+
+        updates = {}
+
+        # Only materialize embedding if still lazy (ShapeDtypeStruct)
+        if isinstance(self.embedding.value, jax.ShapeDtypeStruct):
+            shape = self.embedding.value.shape
+            dtype = self.embedding.value.dtype
+            real_embedding_val = default_embed_init()(rngs.params(), shape, dtype)
+            with mesh:
+                sharded_embedding = jax.lax.with_sharding_constraint(
+                    real_embedding_val, pspecs["embedding"]
+                )
+            updates["embedding"] = sharded_embedding
+
+        # Materialize bias if present and lazy
+        if getattr(self, "bias", None) is not None and isinstance(
+            self.bias.value, jax.ShapeDtypeStruct
+        ):
+            shape = self.bias.value.shape
+            dtype = self.bias.value.dtype
+            real_bias_val = nnx.initializers.zeros_init()(rngs.params(), shape, dtype)
+            with mesh:
+                sharded_bias = jax.lax.with_sharding_constraint(
+                    real_bias_val, pspecs["bias"]
+                )
+            updates["bias"] = sharded_bias
+
+        if updates:
+            nnx.update(self, updates)
 
     def __call__(self, input_):
         del input_
