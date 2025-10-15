@@ -4,7 +4,7 @@ import jax
 from flax import nnx
 from jax import numpy as jnp
 from jax.experimental.shard_map import shard_map
-from jax.sharding import Mesh
+from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.layers import linear
@@ -102,15 +102,14 @@ class GateLogit(nnx.Module):
 
     def materialize(self, mesh: Mesh, rngs: nnx.Rngs):
         """Materializes and shards GateLogit parameters in-place."""
-        pspecs = nnx.get_partition_spec(nnx.state(self))
-
         real_kernel_val = nnx.initializers.normal()(
             rngs.params(), self.kernel.value.shape, self.weight_dtype
         )
 
         with mesh:
+            kernel_pspec = P(*self.kernel_axes) if self.kernel_axes else P()
             sharded_kernel = jax.lax.with_sharding_constraint(
-                real_kernel_val, pspecs["kernel"]
+                real_kernel_val, NamedSharding(mesh, kernel_pspec)
             )
             updates = {"kernel": sharded_kernel}
 
@@ -118,8 +117,12 @@ class GateLogit(nnx.Module):
                 real_bias_val = nnx.initializers.zeros_init()(
                     rngs.params(), self.bias.value.shape, self.weight_dtype
                 )
+                bias_axes = (
+                    self.kernel_axes[-len(self.features) :] if self.kernel_axes else ()
+                )
+                bias_pspec = P(*bias_axes) if bias_axes else P()
                 sharded_bias = jax.lax.with_sharding_constraint(
-                    real_bias_val, pspecs["bias"]
+                    real_bias_val, NamedSharding(mesh, bias_pspec)
                 )
                 updates["bias"] = sharded_bias
 
@@ -186,8 +189,6 @@ class EPMoE(nnx.Module):
 
     def materialize(self, mesh: Mesh, rngs: nnx.Rngs):
         """Materialize and shard MoE expert weights in-place."""
-        pspecs = nnx.get_partition_spec(nnx.state(self))
-
         real_wi_0 = nnx.initializers.normal()(
             rngs.params(), self.wi_0.value.shape, self.weight_dtype
         )
@@ -199,9 +200,16 @@ class EPMoE(nnx.Module):
         )
 
         with mesh:
-            sharded_wi_0 = jax.lax.with_sharding_constraint(real_wi_0, pspecs["wi_0"])
-            sharded_wi_1 = jax.lax.with_sharding_constraint(real_wi_1, pspecs["wi_1"])
-            sharded_wo = jax.lax.with_sharding_constraint(real_wo, pspecs["wo"])
+            expert_pspec = P(("data", "tensor"), None, None)
+            sharded_wi_0 = jax.lax.with_sharding_constraint(
+                real_wi_0, NamedSharding(mesh, expert_pspec)
+            )
+            sharded_wi_1 = jax.lax.with_sharding_constraint(
+                real_wi_1, NamedSharding(mesh, expert_pspec)
+            )
+            sharded_wo = jax.lax.with_sharding_constraint(
+                real_wo, NamedSharding(mesh, expert_pspec)
+            )
             nnx.update(
                 self, {"wi_0": sharded_wi_0, "wi_1": sharded_wi_1, "wo": sharded_wo}
             )

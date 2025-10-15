@@ -19,7 +19,6 @@ class TestLinear(LinearBase):
         kernel_axes=None,
         rngs: nnx.Rngs | None = None,
     ):
-        # Set attributes referenced by LinearBase.__init__
         self.input_size = input_size
         self.output_size = output_size
         self.use_bias = use_bias

@@ -23,7 +23,8 @@ from flax import nnx
 from flax.nnx.nn import dtypes
 from flax.nnx.nn.linear import default_embed_init
 from flax.typing import PromoteDtypeFn
-from jax.sharding import Mesh
+from jax.sharding import Mesh, NamedSharding
+from jax.sharding import PartitionSpec as P
 
 from ..utils.weight_utils import lazy_init
 
@@ -100,8 +101,6 @@ class Embed(nnx.Module):
         """
         Materializes and shards the embedding parameters in-place.
         """
-        pspecs = nnx.get_partition_spec(nnx.state(self))
-
         real_embedding_val = default_embed_init()(  # type: ignore[arg-type]
             rngs.params(),
             (self.num_embeddings, self.features),
@@ -109,10 +108,11 @@ class Embed(nnx.Module):
         )
 
         with mesh:
+            embed_pspec = P(None, None)
             sharded_embedding = jax.lax.with_sharding_constraint(
-                real_embedding_val, pspecs["embedding"]
+                real_embedding_val, NamedSharding(mesh, embed_pspec)
             )
-            updates = {"embedding": sharded_embedding}
+        updates = {"embedding": sharded_embedding}
 
         nnx.update(self, updates)
 
@@ -196,8 +196,6 @@ class ParallelLMHead(Embed):
         - If embedding is already materialized (e.g., tied to input embeddings), it is left untouched.
         - Bias, when present and lazy, is materialized and sharded.
         """
-        pspecs = nnx.get_partition_spec(nnx.state(self))
-
         updates = {}
 
         # Only materialize embedding if still lazy (ShapeDtypeStruct)
@@ -206,8 +204,9 @@ class ParallelLMHead(Embed):
             dtype = self.embedding.value.dtype
             real_embedding_val = default_embed_init()(rngs.params(), shape, dtype)
             with mesh:
+                embed_pspec = P(None, None)
                 sharded_embedding = jax.lax.with_sharding_constraint(
-                    real_embedding_val, pspecs["embedding"]
+                    real_embedding_val, NamedSharding(mesh, embed_pspec)
                 )
             updates["embedding"] = sharded_embedding
 
@@ -219,8 +218,9 @@ class ParallelLMHead(Embed):
             dtype = self.bias.value.dtype
             real_bias_val = nnx.initializers.zeros_init()(rngs.params(), shape, dtype)
             with mesh:
+                bias_pspec = P(None, None)
                 sharded_bias = jax.lax.with_sharding_constraint(
-                    real_bias_val, pspecs["bias"]
+                    real_bias_val, NamedSharding(mesh, bias_pspec)
                 )
             updates["bias"] = sharded_bias
 

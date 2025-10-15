@@ -4,6 +4,7 @@ import jax
 from flax import nnx
 from jax import numpy as jnp
 from jax.sharding import Mesh, NamedSharding
+from jax.sharding import PartitionSpec as P
 
 from ..utils.weight_utils import lazy_init
 
@@ -64,9 +65,6 @@ class LinearBase(nnx.Module):
         Materializes and shards the model's parameters in-place.
         This method contains the full logic and is designed to be JIT-compiled.
         """
-        # Get the sharding plan from the existing (lazy) state
-        pspecs = nnx.get_partition_spec(nnx.state(self))
-
         # Create the real parameter values on a single device first
         real_weight_val = nnx.initializers.normal()(
             rngs.params(), (self.input_size, self.output_size), self.params_dtype
@@ -74,8 +72,9 @@ class LinearBase(nnx.Module):
 
         # Apply sharding constraints within the mesh context
         with mesh:
+            weight_pspec = P(*self.kernel_axes) if self.kernel_axes else P()
             sharded_weight = jax.lax.with_sharding_constraint(
-                real_weight_val, pspecs["weight"]
+                real_weight_val, NamedSharding(mesh, weight_pspec)
             )
             updates = {"weight": sharded_weight}
 
@@ -83,8 +82,10 @@ class LinearBase(nnx.Module):
                 real_bias_val = nnx.initializers.zeros_init()(
                     rngs.params(), (self.output_size,), self.params_dtype
                 )
+                bias_axes = (self.kernel_axes[-1],) if self.kernel_axes else ()
+                bias_pspec = P(*bias_axes) if bias_axes else P()
                 sharded_bias = jax.lax.with_sharding_constraint(
-                    real_bias_val, pspecs["bias"]
+                    real_bias_val, NamedSharding(mesh, bias_pspec)
                 )
                 updates["bias"] = sharded_bias
 

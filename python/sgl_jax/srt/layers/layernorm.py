@@ -5,7 +5,8 @@ import jax
 import jax.numpy as jnp
 from flax import nnx
 from jax import lax
-from jax.sharding import Mesh
+from jax.sharding import Mesh, NamedSharding
+from jax.sharding import PartitionSpec as P
 
 from ..utils.weight_utils import lazy_init
 
@@ -35,15 +36,13 @@ class RMSNorm(nnx.Module):
 
     def materialize(self, mesh: Mesh, rngs: nnx.Rngs):
         """Materialize and shard RMSNorm parameters in-place."""
-        pspecs = nnx.get_partition_spec(nnx.state(self))
-
         real_weight_val = nnx.initializers.ones()(
             rngs.params(), (self.weight.value.shape[0],), self.weight.value.dtype
         )
 
         with mesh:
             sharded_weight = jax.lax.with_sharding_constraint(
-                real_weight_val, pspecs["weight"]
+                real_weight_val, NamedSharding(mesh, P())
             )
             nnx.update(self, {"weight": sharded_weight})
 
