@@ -11,6 +11,8 @@ from jax import random
 from sgl_jax.srt.layers.logits_processor import LogitsProcessorOutput
 from sgl_jax.srt.sampling.sampling_batch_info import SamplingMetadata
 
+_SAMPLING_EPS = 1e-5
+
 
 class Sampler(nnx.Module):
     def __init__(self, rngs: nnx.Rngs = None):
@@ -26,6 +28,15 @@ class Sampler(nnx.Module):
     def _regular_sampling(self, operands):
         """Regular sampling branch"""
         logits, sampling_metadata, positions, rng = operands
+
+        # Validate broadcast compatibility for temperature division
+        logits_batch_size = logits.shape[0]
+        temperatures_shape = sampling_metadata.temperatures.shape
+
+        # Temperatures should be (batch_size, 1) for proper broadcasting
+        assert (
+            temperatures_shape[0] == logits_batch_size
+        ), f"Temperature batch size {temperatures_shape[0]} doesn't match logits batch size {logits_batch_size}"
 
         # Post process logits
         processed_logits = jnp.divide(logits, sampling_metadata.temperatures).astype(
@@ -78,6 +89,74 @@ class Sampler(nnx.Module):
 
         return None
 
+    def _apply_linear_penalty(self, operands):
+        """Apply linear penalty branch (overlap mode)"""
+        logits, sampling_metadata = operands
+        penalty = sampling_metadata.linear_penalty
+
+        # Validate penalty shape matches logits when penalty exists
+        if penalty is not None:
+            assert (
+                penalty.shape == logits.shape
+            ), f"Linear penalty shape {penalty.shape} doesn't match logits shape {logits.shape}"
+            penalty = penalty.astype(logits.dtype)
+        else:
+            penalty = jnp.array(0.0, dtype=logits.dtype)
+
+        return logits + penalty
+
+    def _apply_min_tokens_penalty(self, operands):
+        """Apply min new tokens penalty to stop tokens"""
+        logits, sampling_metadata = operands
+
+        len_output = sampling_metadata.len_output_tokens
+        min_new = sampling_metadata.min_new_tokens
+        stop_penalties = sampling_metadata.stop_token_penalties
+
+        # The parent lax.cond checks for None, but this branch is still traced
+        # when the values are None. This guard prevents a TypeError during trace.
+        if len_output is None or min_new is None or stop_penalties is None:
+            return logits
+
+        # Generate mask for sequences that haven't reached min_new_tokens
+        min_new_tokens_mask = len_output < min_new
+
+        # Apply stop token penalties only for sequences that need more tokens
+        stop_penalty = jnp.where(
+            min_new_tokens_mask.reshape(-1, 1),
+            stop_penalties,
+            jnp.array(0.0, dtype=stop_penalties.dtype),
+        )
+
+        return logits + stop_penalty.astype(logits.dtype)
+
+    def apply_penalties(
+        self, logits: jax.Array, sampling_metadata: SamplingMetadata
+    ) -> jax.Array:
+        """
+        Apply penalties to logits with JIT-optimized tensor operations using lax.cond.
+
+        This method handles penalty application efficiently for both overlap and
+        non-overlap modes by using lax.cond to ensure compilation-time optimization
+        of different penalty application paths.
+
+        Args:
+            logits: The input logits tensor of shape [batch_size, vocab_size]
+            sampling_metadata: Metadata containing penalty information (never None)
+
+        Returns:
+            Modified logits with penalties applied
+        """
+
+        result_logits = lax.cond(
+            sampling_metadata.do_penalties,
+            self._apply_linear_penalty,
+            lambda operands: operands[0],  # Return logits
+            (logits, sampling_metadata),
+        )
+
+        return result_logits
+
     def __call__(
         self,
         logits_output: LogitsProcessorOutput,
@@ -96,6 +175,9 @@ class Sampler(nnx.Module):
             logits_output.next_token_logits,
             (-1, logits_output.next_token_logits.shape[-1]),
         )
+
+        # Apply penalties before sampling
+        logits = self.apply_penalties(logits, sampling_metadata)
 
         _, rng = jax.random.split(self.rngs.params())
 
@@ -278,6 +360,6 @@ def top_p_normalize_probs_jax(
     probs_sort = probs_sort / probs_sort.sum(axis=-1, keepdim=True)
     # return jnp.zeros_like(probs_sort).scatter_(-1, probs_idx, probs_sort)
 
-    num_tokens, h = probs.shape
+    num_tokens, _ = probs.shape
     row_idx = jnp.arange(num_tokens)[:, None]  # [B, 1], broadcast over H
     return jnp.zeros_like(probs).at[row_idx, probs_idx].set(probs_sort)

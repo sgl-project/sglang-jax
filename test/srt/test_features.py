@@ -26,6 +26,11 @@ class TestFeatures(CustomTestCase):
       - PageSizeGreaterThanOne
     - Abort
     - Logprobs
+    - Penalties
+      - FrequencyPenalty
+      - PresencePenalty
+      - MinNewTokens
+      - CombinedPenalties
 
     """
 
@@ -493,6 +498,300 @@ class TestFeatures(CustomTestCase):
                     real_token, expected_output_token_ids_logprobs[i][j][1]
                 )
 
+    def test_frequency_penalty(self):
+        """Test frequency penalty functionality."""
+        # Test with frequency penalty enabled
+        args = SimpleNamespace(
+            base_url=self.base_url,
+            text="Say hello hello hello",
+            temperature=0.5,
+            max_new_tokens=1,
+        )
+
+        # Test frequency penalty = 1.0
+        resp_with_penalty = run_curl(args)
+
+        if "cache_miss_count" not in resp_with_penalty["meta_info"]:
+            raise "[frequency_penalty] cache_miss_count is missed in response"
+        self.assertEqual(resp_with_penalty["meta_info"]["cache_miss_count"], 0)
+        self.assertIn("text", resp_with_penalty)
+
+        # decode
+        args = SimpleNamespace(
+            base_url=self.base_url,
+            text="The weather is nice today. The weather",
+            temperature=0.5,
+            max_new_tokens=2,
+        )
+        resp_with_penalty = run_curl(args)
+        if "cache_miss_count" not in resp_with_penalty["meta_info"]:
+            raise "[frequency_penalty] cache_miss_count is missed in response"
+        self.assertEqual(resp_with_penalty["meta_info"]["cache_miss_count"], 0)
+        self.assertIn("text", resp_with_penalty)
+
+    def test_presence_penalty(self):
+        """Test presence penalty functionality."""
+        args = SimpleNamespace(
+            base_url=self.base_url,
+            text="The weather is nice today. The weather",
+            temperature=0.5,
+            max_new_tokens=1,
+        )
+
+        resp_with_penalty = run_curl(args)
+        if "cache_miss_count" not in resp_with_penalty["meta_info"]:
+            raise "[presence_penalty] cache_miss_count is missed in response"
+        self.assertEqual(resp_with_penalty["meta_info"]["cache_miss_count"], 0)
+        self.assertIn("text", resp_with_penalty)
+
+        # decode
+        args = SimpleNamespace(
+            base_url=self.base_url,
+            text="The weather is nice today. The weather",
+            temperature=0.5,
+            max_new_tokens=2,
+        )
+
+        resp_with_penalty = run_curl(args)
+
+        if "cache_miss_count" not in resp_with_penalty["meta_info"]:
+            raise "[presence_penalty] cache_miss_count is missed in response"
+        self.assertEqual(resp_with_penalty["meta_info"]["cache_miss_count"], 0)
+        self.assertIn("text", resp_with_penalty)
+
+    def test_min_new_tokens_penalty(self):
+        """Test min_new_tokens penalty functionality."""
+        args = SimpleNamespace(
+            base_url=self.base_url,
+            text="Hello",
+            temperature=0.0,
+            max_new_tokens=1,
+        )
+
+        resp_with_min_tokens = run_curl(args)
+        if "cache_miss_count" not in resp_with_min_tokens["meta_info"]:
+            raise "[min_new_tokens] cache_miss_count is missed in response"
+        self.assertEqual(resp_with_min_tokens["meta_info"]["cache_miss_count"], 0)
+        self.assertIn("text", resp_with_min_tokens)
+
+        # decode
+        args = SimpleNamespace(
+            base_url=self.base_url,
+            text="Hello",
+            temperature=0.0,
+            max_new_tokens=2,
+        )
+
+        resp_with_min_tokens = run_curl(args)
+        if "cache_miss_count" not in resp_with_min_tokens["meta_info"]:
+            raise "[min_new_tokens] cache_miss_count is missed in response"
+        self.assertEqual(resp_with_min_tokens["meta_info"]["cache_miss_count"], 0)
+        self.assertIn("text", resp_with_min_tokens)
+
+    def test_combined_penalties(self):
+        """Test multiple penalties applied together."""
+        penalty_params = [
+            {},
+            {},
+            {},
+            {"frequency_penalty": 2},
+            {"presence_penalty": 1},
+            {"min_new_tokens": 16},
+            {"frequency_penalty": 0.2},
+            {"presence_penalty": 0.4},
+            {"min_new_tokens": 8},
+            {"frequency_penalty": 0.4, "presence_penalty": 0.8},
+            {"frequency_penalty": 0.4, "min_new_tokens": 12},
+            {"presence_penalty": 0.8, "min_new_tokens": 12},
+            {"presence_penalty": -0.3, "frequency_penalty": 1.3, "min_new_tokens": 32},
+            {"presence_penalty": 0.3, "frequency_penalty": -1.3, "min_new_tokens": 32},
+        ]
+
+        for penalty_param in penalty_params:
+            args = SimpleNamespace(
+                base_url=self.base_url,
+                text="Tell me about cats. Cats are",
+                temperature=0.5,
+                max_new_tokens=32,
+                **penalty_param,
+            )
+            resp_combined = run_curl(args)
+            if "cache_miss_count" not in resp_combined["meta_info"]:
+                raise "[combined_penalties] cache_miss_count is missed in response"
+            self.assertIn("text", resp_combined)
+
+
+class TestNoOverlapSchedule(CustomTestCase):
+
+    @classmethod
+    def setUpClass(cls):
+        cls.model = DEFAULT_MODEL_NAME_FOR_TEST
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            device="tpu",
+            other_args=[
+                "--trust-remote-code",
+                "--skip-server-warmup",
+                "--random-seed",
+                "3",
+                "--tp-size",
+                "4",
+                "--mem-fraction-static",
+                "0.65",
+                "--max-prefill-tokens",
+                "8192",
+                "--download-dir",
+                "/dev/shm/",
+                "--dtype",
+                "bfloat16",
+                "--attention-backend",
+                "fa",
+                "--precompile-token-paddings",
+                "16384",
+                "--precompile-bs-paddings",
+                "64",
+                "--page-size",
+                "64",
+                "--max-running-requests",
+                "64",
+                "--chunked-prefill-size",
+                "8192",
+                "--disable-overlap-schedule",
+            ],
+            env={
+                "JAX_COMPILATION_CACHE_DIR": "/tmp/jax_compilation_cache",
+            },
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        kill_process_tree(cls.process.pid)
+
+    def test_frequency_penalty(self):
+        """Test frequency penalty functionality."""
+        # Test with frequency penalty enabled
+        args = SimpleNamespace(
+            base_url=self.base_url,
+            text="Say hello hello hello",
+            temperature=0.5,
+            max_new_tokens=1,
+        )
+
+        # Test frequency penalty = 1.0
+        resp_with_penalty = run_curl(args)
+
+        if "cache_miss_count" not in resp_with_penalty["meta_info"]:
+            raise "[frequency_penalty] cache_miss_count is missed in response"
+        self.assertEqual(resp_with_penalty["meta_info"]["cache_miss_count"], 0)
+        self.assertIn("text", resp_with_penalty)
+
+        # decode
+        args = SimpleNamespace(
+            base_url=self.base_url,
+            text="The weather is nice today. The weather",
+            temperature=0.5,
+            max_new_tokens=2,
+        )
+        resp_with_penalty = run_curl(args)
+        if "cache_miss_count" not in resp_with_penalty["meta_info"]:
+            raise "[frequency_penalty] cache_miss_count is missed in response"
+        self.assertEqual(resp_with_penalty["meta_info"]["cache_miss_count"], 0)
+        self.assertIn("text", resp_with_penalty)
+
+    def test_presence_penalty(self):
+        """Test presence penalty functionality."""
+        args = SimpleNamespace(
+            base_url=self.base_url,
+            text="The weather is nice today. The weather",
+            temperature=0.5,
+            max_new_tokens=1,
+        )
+
+        resp_with_penalty = run_curl(args)
+        if "cache_miss_count" not in resp_with_penalty["meta_info"]:
+            raise "[presence_penalty] cache_miss_count is missed in response"
+        self.assertEqual(resp_with_penalty["meta_info"]["cache_miss_count"], 0)
+        self.assertIn("text", resp_with_penalty)
+
+        args = SimpleNamespace(
+            base_url=self.base_url,
+            text="The weather is nice today. The weather",
+            temperature=0.5,
+            max_new_tokens=2,
+        )
+
+        resp_with_penalty = run_curl(args)
+
+        if "cache_miss_count" not in resp_with_penalty["meta_info"]:
+            raise "[presence_penalty] cache_miss_count is missed in response"
+        self.assertEqual(resp_with_penalty["meta_info"]["cache_miss_count"], 0)
+        self.assertIn("text", resp_with_penalty)
+
+    def test_min_new_tokens_penalty(self):
+        """Test min_new_tokens penalty functionality."""
+        args = SimpleNamespace(
+            base_url=self.base_url,
+            text="Hello",
+            temperature=0.0,
+            max_new_tokens=1,
+        )
+
+        resp_with_min_tokens = run_curl(args)
+        if "cache_miss_count" not in resp_with_min_tokens["meta_info"]:
+            raise "[min_new_tokens] cache_miss_count is missed in response"
+        self.assertEqual(resp_with_min_tokens["meta_info"]["cache_miss_count"], 0)
+        self.assertIn("text", resp_with_min_tokens)
+
+        args = SimpleNamespace(
+            base_url=self.base_url,
+            text="Hello",
+            temperature=0.0,
+            max_new_tokens=2,
+        )
+
+        # decode
+        # Test with min_new_tokens
+        resp_with_min_tokens = run_curl(args)
+        if "cache_miss_count" not in resp_with_min_tokens["meta_info"]:
+            raise "[min_new_tokens] cache_miss_count is missed in response"
+        self.assertEqual(resp_with_min_tokens["meta_info"]["cache_miss_count"], 0)
+        self.assertIn("text", resp_with_min_tokens)
+
+    def test_combined_penalties(self):
+        """Test multiple penalties applied together."""
+        penalty_params = [
+            {},
+            {},
+            {},
+            {"frequency_penalty": 2},
+            {"presence_penalty": 1},
+            {"min_new_tokens": 16},
+            {"frequency_penalty": 0.2},
+            {"presence_penalty": 0.4},
+            {"min_new_tokens": 8},
+            {"frequency_penalty": 0.4, "presence_penalty": 0.8},
+            {"frequency_penalty": 0.4, "min_new_tokens": 12},
+            {"presence_penalty": 0.8, "min_new_tokens": 12},
+            {"presence_penalty": -0.3, "frequency_penalty": 1.3, "min_new_tokens": 32},
+            {"presence_penalty": 0.3, "frequency_penalty": -1.3, "min_new_tokens": 32},
+        ]
+
+        for penalty_param in penalty_params:
+            args = SimpleNamespace(
+                base_url=self.base_url,
+                text="Tell me about cats. Cats are",
+                temperature=0.5,
+                max_new_tokens=32,
+                **penalty_param,
+            )
+            resp_combined = run_curl(args)
+            if "cache_miss_count" not in resp_combined["meta_info"]:
+                raise "[combined_penalties] cache_miss_count is missed in response"
+            self.assertIn("text", resp_combined)
+
 
 cache_misses_common_args = [
     "--trust-remote-code",
@@ -615,6 +914,36 @@ class TestCacheMissesTP4(CustomTestCase):
 
         resp = run_curl(args)
 
+        if "cache_miss_count" not in resp["meta_info"]:
+            raise "[prefill] cache_miss_count is missed in response"
+        self.assertEqual(resp["meta_info"]["cache_miss_count"], 0)
+
+    def test_cache_miss_with_sampling_params(self):
+        # prefill
+        args = SimpleNamespace(
+            base_url=self.base_url,
+            text="the capital of France is",
+            temperature=0,
+            top_k=5,
+            top_p=0.5,
+            min_p=0.2,
+            max_new_tokens=1,
+        )
+        resp = run_curl(args)
+        if "cache_miss_count" not in resp["meta_info"]:
+            raise "[prefill] cache_miss_count is missed in response"
+        self.assertEqual(resp["meta_info"]["cache_miss_count"], 0)
+        # decode
+        args = SimpleNamespace(
+            base_url=self.base_url,
+            text="the capital of France is",
+            temperature=0,
+            top_k=5,
+            top_p=0.5,
+            min_p=0.2,
+            max_new_tokens=2,
+        )
+        resp = run_curl(args)
         if "cache_miss_count" not in resp["meta_info"]:
             raise "[prefill] cache_miss_count is missed in response"
         self.assertEqual(resp["meta_info"]["cache_miss_count"], 0)

@@ -924,6 +924,28 @@ class ScheduleBatch:
         self.forward_mode = ForwardMode.DECODE
         bs = len(self.reqs)
 
+        if self.sampling_info.penalizer_orchestrator.is_required:
+            if self.enable_overlap:
+                # TODO: this can be slow, optimize this.
+                delayed_output_ids = np.array(
+                    [
+                        (
+                            req.output_ids[-1]
+                            if len(req.output_ids)
+                            else req.origin_input_ids[-1]
+                        )
+                        for req in self.reqs
+                    ],
+                    dtype=np.int64,
+                )
+                self.sampling_info.penalizer_orchestrator.cumulate_output_tokens(
+                    delayed_output_ids
+                )
+            else:
+                self.sampling_info.penalizer_orchestrator.cumulate_output_tokens(
+                    self.output_ids
+                )
+
         # Update fields
         self.input_ids = self.output_ids
 
@@ -1002,7 +1024,7 @@ class ScheduleBatch:
         # Penalizer orchestrator must be merged before Batch.reqs is merged. This is because
         # orchestrator.merge() depends on Batch.reqs during preparation of each penalizers, so it
         # needs to be called with pre-merged Batch.reqs.
-        self.sampling_info.merge_batch(other.sampling_info, other.mesh)
+        self.sampling_info.merge_batch(other.sampling_info)
 
         self.req_pool_indices = np.concat(
             [self.req_pool_indices, other.req_pool_indices]
