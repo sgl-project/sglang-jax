@@ -45,6 +45,12 @@ class LinearBase(nnx.Module):
     ):
         """Initialize parameters and quantization method."""
         self.skip_bias_add = skip_bias_add
+        self.kernel_axes = kernel_axes
+        self.input_size = input_size
+        self.output_size = output_size
+        self.params_dtype = params_dtype
+        self.use_bias = use_bias
+
         self.weight = nnx.Param(
             nnx.with_partitioning(lazy_init, self.kernel_axes)(
                 rngs.params(), (self.input_size, self.output_size), self.params_dtype

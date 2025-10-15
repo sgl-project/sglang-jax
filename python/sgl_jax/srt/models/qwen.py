@@ -4,7 +4,7 @@ from typing import Any, Dict, Optional
 import jax
 import jax.numpy as jnp
 from flax import nnx
-from jax.sharding import PartitionSpec
+from jax.sharding import Mesh, PartitionSpec
 from transformers import PretrainedConfig
 
 from sgl_jax.srt.configs.model_config import ModelConfig
@@ -412,6 +412,24 @@ class QWenLMHeadModel(nnx.Module):
         )
         output = self.logits_processor(hidden_states, logits_metadata)
         return output, layers_kv_fused, True
+
+    def materialize(self, mesh: Mesh, rngs: nnx.Rngs):
+        if hasattr(self.transformer.embed_tokens, "materialize"):
+            self.transformer.embed_tokens.materialize(mesh, rngs)
+        if hasattr(self.lm_head, "materialize"):
+            self.lm_head.materialize(mesh, rngs)
+
+        for layer in self.transformer.h:
+            attn = layer.attn
+            attn.q_proj.materialize(mesh, rngs)
+            attn.k_proj.materialize(mesh, rngs)
+            attn.v_proj.materialize(mesh, rngs)
+            attn.c_proj.materialize(mesh, rngs)
+
+            mlp = layer.mlp
+            mlp.w1.materialize(mesh, rngs)
+            mlp.w2.materialize(mesh, rngs)
+            mlp.c_proj.materialize(mesh, rngs)
 
 
 EntryClass = QWenLMHeadModel

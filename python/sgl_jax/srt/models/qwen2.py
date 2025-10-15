@@ -5,6 +5,7 @@ import jax
 import jax.numpy as jnp
 from flax import nnx
 from jax import numpy as jnp
+from jax.sharding import Mesh
 from transformers import PretrainedConfig
 
 from sgl_jax.srt.configs.model_config import ModelConfig
@@ -469,6 +470,24 @@ class Qwen2ForCausalLM(nnx.Module):
         )
         output = self.logits_processor(hidden_states, logits_metadata)
         return output, layers_kv_fused, layers_callback_flag
+
+    def materialize(self, mesh: Mesh, rngs: nnx.Rngs):
+        if hasattr(self.transformer.embed_tokens, "materialize"):
+            self.transformer.embed_tokens.materialize(mesh, rngs)
+        if hasattr(self.lm_head, "materialize"):
+            self.lm_head.materialize(mesh, rngs)
+
+        for layer in self.transformer.layers:
+            attn = layer.self_attn
+            attn.q_proj.materialize(mesh, rngs)
+            attn.k_proj.materialize(mesh, rngs)
+            attn.v_proj.materialize(mesh, rngs)
+            attn.o_proj.materialize(mesh, rngs)
+
+            mlp = layer.mlp
+            mlp.gate_proj.materialize(mesh, rngs)
+            mlp.up_proj.materialize(mesh, rngs)
+            mlp.down_proj.materialize(mesh, rngs)
 
 
 EntryClass = Qwen2ForCausalLM

@@ -361,6 +361,30 @@ class Qwen3MoeForCausalLM(nnx.Module):
         loader.load_weights_from_safetensors(weight_mappings)
         logger.info("Qwen3Moe weights loaded successfully!")
 
+    def materialize(self, mesh: jax.sharding.Mesh, rngs: nnx.Rngs):
+        if hasattr(self.transformer.embed_tokens, "materialize"):
+            self.transformer.embed_tokens.materialize(mesh, rngs)
+        if hasattr(self.lm_head, "materialize"):
+            self.lm_head.materialize(mesh, rngs)
+
+        for layer in self.transformer.layers:
+            attn = layer.self_attn
+            attn.q_proj.materialize(mesh, rngs)
+            attn.k_proj.materialize(mesh, rngs)
+            attn.v_proj.materialize(mesh, rngs)
+            attn.c_proj.materialize(mesh, rngs)
+
+            if layer.is_moe_layer:
+                if hasattr(layer.moe_gate, "materialize"):
+                    layer.moe_gate.materialize(mesh, rngs)
+                if hasattr(layer.mlp, "materialize"):
+                    layer.mlp.materialize(mesh, rngs)
+            else:
+                mlp = layer.mlp
+                mlp.gate_proj.materialize(mesh, rngs)
+                mlp.up_proj.materialize(mesh, rngs)
+                mlp.down_proj.materialize(mesh, rngs)
+
     def _create_qwen3_moe_weight_mappings(self) -> dict:
         mappings = {
             "model.embed_tokens.weight": WeightMapping(

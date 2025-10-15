@@ -101,7 +101,7 @@ class Embed(nnx.Module):
         """
         Materializes and shards the embedding parameters in-place.
         """
-        real_embedding_val = default_embed_init()(  # type: ignore[arg-type]
+        real_embedding_val = default_embed_init(  # type: ignore[arg-type]
             rngs.params(),
             (self.num_embeddings, self.features),
             self.embedding.value.dtype,
@@ -202,7 +202,7 @@ class ParallelLMHead(Embed):
         if isinstance(self.embedding.value, jax.ShapeDtypeStruct):
             shape = self.embedding.value.shape
             dtype = self.embedding.value.dtype
-            real_embedding_val = default_embed_init()(rngs.params(), shape, dtype)
+            real_embedding_val = default_embed_init(rngs.params(), shape, dtype)
             with mesh:
                 embed_pspec = P(None, None)
                 sharded_embedding = jax.lax.with_sharding_constraint(
