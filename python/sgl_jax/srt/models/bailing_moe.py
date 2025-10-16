@@ -10,7 +10,7 @@ from sgl_jax.srt.configs.model_config import ModelConfig
 from sgl_jax.srt.layers.embeddings import Embed, ParallelLMHead, RotaryEmbedding
 from sgl_jax.srt.layers.linear import LinearBase
 from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
-from sgl_jax.srt.layers.moe import EPMoE, TopK
+from sgl_jax.srt.layers.moe import EPMoE, GateLogit, TopK
 from sgl_jax.srt.layers.radix_attention import RadixAttention
 from sgl_jax.srt.mem_cache.memory_pool import KVCache
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
@@ -195,41 +195,6 @@ class BailingMoEMLP(nnx.Module):
         return output
 
 
-class BailingMoEGate(nnx.Module):
-    def __init__(
-        self,
-        input_size: int,
-        weight_dtype: jnp.dtype = jnp.float32,
-        enable_expert_bias: bool = False,
-        num_experts: int = 0,
-        score_func: str = "",
-        rngs: nnx.Rngs = None,
-    ):
-        self.weight_dtype = weight_dtype
-        self.enable_expert_bias = enable_expert_bias
-        self.score_func = score_func
-
-        self.kernel = nnx.Param(
-            nnx.with_partitioning(nnx.initializers.normal(), (None, None))(
-                rngs.params(), (input_size, num_experts), self.weight_dtype
-            )
-        )
-        if enable_expert_bias:
-            self.bias = nnx.Param(
-                nnx.with_partitioning(nnx.initializers.zeros_init(), (None,))(
-                    rngs.params(), (num_experts,), self.weight_dtype
-                )
-            )
-        else:
-            self.bias = None
-
-    def __call__(
-        self, hidden_states: jax.Array
-    ) -> Tuple[jax.Array, Optional[jax.Array]]:
-        logits = jnp.dot(hidden_states.astype(self.weight_dtype), self.kernel.value)
-        return logits
-
-
 class BailingMoEDecoderLayer(nnx.Module):
     def __init__(
         self,
@@ -294,7 +259,7 @@ class BailingMoEDecoderLayer(nnx.Module):
                 router_dtype = jnp.float32
             else:
                 router_dtype = jnp.bfloat16
-            self.moe_gate = BailingMoEGate(
+            self.moe_gate = GateLogit(
                 input_size=config.hidden_size,
                 num_experts=config.num_experts,
                 enable_expert_bias=getattr(
@@ -391,8 +356,8 @@ class BailingMoEDecoderLayer(nnx.Module):
             correction_bias = (
                 self.moe_gate.bias.value if self.moe_gate.bias is not None else None
             )
-            topk_ids, topk_weights = self.topk(router_logits, correction_bias)
-            hidden_states = self.mlp(hidden_states, topk_ids, topk_weights)
+            topk_weights, topk_ids = self.topk(router_logits, correction_bias)
+            hidden_states = self.mlp(hidden_states, topk_weights, topk_ids)
             if shared_output is not None:
                 hidden_states = hidden_states + shared_output
         else:
@@ -460,10 +425,8 @@ class BailingMoEModel(nnx.Module):
 
         if residual is not None:
             hidden_states += residual
-            hidden_states = self.norm(hidden_states)
-        else:
-            hidden_states = self.norm(hidden_states)
 
+        hidden_states = self.norm(hidden_states)
         return hidden_states, layers_kv_fused
 
 

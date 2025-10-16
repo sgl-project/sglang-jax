@@ -193,12 +193,7 @@ class QWen3MoeDecoderLayer(nnx.Module):
             )
             self.moe_gate = GateLogit(
                 input_size=config.hidden_size,
-                features=num_experts,
-                model_name=getattr(config, "model_name", "qwen3_moe"),
-                use_bias=False,
-                kernel_axes=(None, ("data", "tensor")),
-                dtype=dtype,
-                layer_id=layer_id,
+                num_experts=num_experts,
                 rngs=rngs,
             )
             with mesh:
@@ -260,8 +255,8 @@ class QWen3MoeDecoderLayer(nnx.Module):
 
         if self.is_moe_layer:
             router_logits = self.moe_gate(hidden_states)
-            topk_ids, topk_weights = self.topk(router_logits)
-            mlp_output = self.mlp(hidden_states, topk_ids, topk_weights)
+            topk_weights, topk_ids = self.topk(router_logits)
+            mlp_output = self.mlp(hidden_states, topk_weights, topk_ids)
             hidden_states = mlp_output
         else:
             hidden_states = self.mlp(hidden_states)

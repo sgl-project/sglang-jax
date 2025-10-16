@@ -20,7 +20,7 @@ import logging
 from dataclasses import dataclass
 from enum import IntEnum, auto
 from functools import total_ordering
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, Optional
 
 import jax
 
@@ -159,9 +159,6 @@ class ForwardBatch:
     extend_prefix_lens: Optional[jax.Array] = None
     extend_seq_lens: Optional[jax.Array] = None
 
-    trace_request_ids: Optional[List[str]] = None
-    trace_request_objects: Optional[List] = None
-
     def tree_flatten(self):
         children = (
             self.input_ids,
@@ -188,8 +185,6 @@ class ForwardBatch:
 
         obj.forward_mode = aux_data["forward_mode"]
         obj.batch_size = aux_data["batch_size"]
-        obj.trace_request_ids = None
-        obj.trace_request_objects = None
 
         obj.input_ids = children[0]
         obj.req_pool_indices = children[1]
