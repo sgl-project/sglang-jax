@@ -17,7 +17,7 @@
 """Inference-only LLaMA model compatible with HuggingFace weights."""
 
 import logging
-from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
+from typing import Any, Dict, Optional, Tuple
 
 import jax
 import jax.numpy as jnp
@@ -28,7 +28,6 @@ from sgl_jax.srt.configs.model_config import ModelConfig
 from sgl_jax.srt.layers.embeddings import (
     Embed,
     ParallelLMHead,
-    RotaryEmbedding,
     get_rope,
 )
 from sgl_jax.srt.layers.layernorm import RMSNorm
@@ -36,7 +35,6 @@ from sgl_jax.srt.layers.linear import LinearBase
 from sgl_jax.srt.layers.logits_processor import (
     LogitsMetadata,
     LogitsProcessor,
-    LogitsProcessorOutput,
 )
 from sgl_jax.srt.layers.radix_attention import RadixAttention
 from sgl_jax.srt.mem_cache.memory_pool import KVCache

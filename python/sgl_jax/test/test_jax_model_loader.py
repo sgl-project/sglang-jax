@@ -87,7 +87,7 @@ class MockJAXModel:
                     memory_str = f"{memory_bytes / 1024:.2f} KB"
                 else:
                     memory_str = f"{memory_bytes} bytes"
-            except:
+            except Exception:
                 memory_str = "unknown"
 
             stats_str = ""
@@ -100,7 +100,7 @@ class MockJAXModel:
                         stats_str = f", range=[{min_val:.6f}, {max_val:.6f}], mean={mean_val:.6f}"
                     else:
                         stats_str = f", range=[{min_val:.6f}, {max_val:.6f}]"
-            except:
+            except Exception:
                 pass
 
             # Print tensor data preview

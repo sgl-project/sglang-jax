@@ -3,10 +3,7 @@
 from enum import Enum
 
 import jax
-import jax.numpy as jnp
 from flax import nnx
-from jax.sharding import NamedSharding
-from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.mem_cache.memory_pool import KVCache
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch

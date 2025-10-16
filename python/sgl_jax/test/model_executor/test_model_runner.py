@@ -1,5 +1,6 @@
 import os
 
+# ruff: noqa: E402
 TP_SIZE = int(os.environ.get("TP_SIZE", 1))
 os.environ["XLA_FLAGS"] = f"--xla_force_host_platform_device_count={TP_SIZE}"
 import unittest

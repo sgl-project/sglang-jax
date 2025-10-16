@@ -5,7 +5,6 @@ from typing import TYPE_CHECKING
 
 import jax
 from flax import nnx
-from jax.sharding import Mesh
 
 if TYPE_CHECKING:
     from sgl_jax.srt.layers.radix_attention import RadixAttention

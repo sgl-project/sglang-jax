@@ -106,7 +106,7 @@ class ModelWorker:
         constraints = [server_limit, pool_limit, attn_backend_limit]
         self.max_running_requests = min(constraints)
         # Log each constraint for debugging
-        logger.info(f"Max running requests constraints:")
+        logger.info("Max running requests constraints:")
         logger.info(
             f"  - Server limit: {server_limit} {'(max_total_tokens//2)' if server_args.max_running_requests is None else '(configured)'}"
         )

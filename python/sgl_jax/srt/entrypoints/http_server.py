@@ -16,6 +16,7 @@ import time
 from http import HTTPStatus
 from typing import Any, AsyncIterator, Callable, Dict, List, Optional
 
+# ruff: noqa: E402
 # Fix a bug of Python threading
 setattr(threading, "_register_atexit", lambda *args, **kwargs: None)
 
@@ -430,7 +431,7 @@ async def start_trace_async(obj: Optional[StartTraceReqInput] = None):
             )
 
         precision_tracer.start_trace(req_num=obj.req_num, output_file=output_file)
-        logger.info(f"[HTTP] Sending trace state to scheduler...")
+        logger.info("[HTTP] Sending trace state to scheduler...")
         trace_state = {
             "precision_tracer": {
                 "trace_active": True,
@@ -479,7 +480,7 @@ async def stop_trace_async(obj: Optional[StopTraceReqInput] = None):
     """Stop precision tracing."""
     try:
         output_file = precision_tracer.stop_trace()
-        print(f"[HTTP] Sending stop trace state to scheduler...")
+        print("[HTTP] Sending stop trace state to scheduler...")
         trace_state = {
             "precision_tracer": {
                 "trace_active": False,

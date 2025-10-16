@@ -170,7 +170,7 @@ class EPMoE(nnx.Module):
             primary_device = device_types[0] if device_types else "unknown"
 
             return can_use_ragged, primary_device
-        except Exception as e:
+        except Exception as _:
             return False, "cpu"
 
     def __call__(self, inputs, router_logits=None):

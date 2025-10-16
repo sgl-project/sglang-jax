@@ -1,3 +1,4 @@
+# ruff: noqa: E402
 from __future__ import annotations
 
 """
@@ -1338,9 +1339,9 @@ class ScheduleBatch:
         return f"Available tokens: {available_size + evictable_size} ({available_size=} + {evictable_size=})\n"
 
 
-def align_to_size(l: list, size: int, value: int = 0) -> list:
-    align_len = (len(l) + size - 1) // size * size
-    return l[:] + [value] * (align_len - len(l))
+def align_to_size(lst: list, size: int, value: int = 0) -> list:
+    align_len = (len(lst) + size - 1) // size * size
+    return lst[:] + [value] * (align_len - len(lst))
 
 
 @dataclasses.dataclass

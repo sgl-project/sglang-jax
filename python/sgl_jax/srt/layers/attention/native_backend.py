@@ -2,7 +2,6 @@ from typing import Tuple
 
 import jax
 import jax.numpy as jnp
-from jax.sharding import Mesh
 from jax.tree_util import register_pytree_node_class
 
 from sgl_jax.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -245,7 +244,6 @@ def _apply_extend_mask(
     Applies a block-diagonal and optionally a causal mask in a unified,
     efficient way, correctly handling padding.
     """
-    batch_size = seq_lengths.shape[0]
     _, query_len, key_len = attn_weights.shape
 
     # --- Create validity masks to handle padding ---

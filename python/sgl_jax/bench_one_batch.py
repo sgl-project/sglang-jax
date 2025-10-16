@@ -66,7 +66,7 @@ from sgl_jax.srt.model_executor.model_runner import ModelRunner
 from sgl_jax.srt.sampling.sampling_batch_info import SamplingMetadata
 from sgl_jax.srt.sampling.sampling_params import SamplingParams
 from sgl_jax.srt.server_args import PortArgs, ServerArgs
-from sgl_jax.srt.utils import configure_logger, get_bool_env_var, kill_process_tree
+from sgl_jax.srt.utils import configure_logger, kill_process_tree
 
 
 @dataclasses.dataclass
@@ -128,7 +128,7 @@ def load_model(server_args, port_args, tp_rank):
     # TODO: pass in tp_size
     # server_args.tp_size = 1
     rank_print = print if tp_rank == 0 else lambda *args, **kwargs: None
-    moe_ep_rank = tp_rank // (server_args.tp_size // server_args.ep_size)
+    # moe_ep_rank = tp_rank // (server_args.tp_size // server_args.ep_size)
 
     model_config = ModelConfig.from_server_args(server_args)
 
@@ -404,7 +404,6 @@ def latency_test_run_once(
 
     tot_latency = 0
 
-    profiler = None
     if profile:
         profile_dir = f"{profile_filename_prefix}_batch{batch_size}_input{input_len}_output{output_len}.tb"
         os.makedirs(profile_dir, exist_ok=True)
@@ -469,10 +468,7 @@ def latency_test(
     bench_args,
     tp_rank,
 ):
-    # Set CPU affinity
-    if get_bool_env_var("SGLANG_SET_CPU_AFFINITY"):
-        set_gpu_proc_affinity(server_args.tp_size, server_args.nnodes, tp_rank)
-
+    # TODO: Fix this function
     # Configure the logger
     configure_logger(server_args, prefix=f" TP{tp_rank}")
     rank_print = print if tp_rank == 0 else lambda *args, **kwargs: None

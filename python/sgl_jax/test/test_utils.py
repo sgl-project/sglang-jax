@@ -3,7 +3,6 @@ import copy
 import logging
 import os
 import re
-import shutil
 import signal
 import subprocess
 import sys
@@ -15,7 +14,6 @@ from types import SimpleNamespace
 from typing import Awaitable, Callable, Optional, Sequence
 
 import jax
-import jax.numpy as jnp
 import numpy as np
 import psutil
 import requests

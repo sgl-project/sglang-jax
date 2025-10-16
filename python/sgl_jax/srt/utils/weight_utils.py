@@ -1,10 +1,9 @@
-import functools
 import glob
 import logging
 import math
 import os
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 import jax
 import jax.numpy as jnp

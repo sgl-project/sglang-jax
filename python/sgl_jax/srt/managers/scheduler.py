@@ -54,7 +54,6 @@ from sgl_jax.srt.mem_cache.chunk_cache import ChunkCache
 from sgl_jax.srt.mem_cache.radix_cache import RadixCache
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
 from sgl_jax.srt.precision_tracer import precision_tracer
-from sgl_jax.srt.sampling.sampling_batch_info import SamplingMetadata
 from sgl_jax.srt.server_args import PortArgs, ServerArgs
 from sgl_jax.srt.utils.common_utils import (
     configure_logger,
@@ -307,9 +306,9 @@ class Scheduler(
         )
 
         if not server_args.disable_jax_precompile:
-            logger.info(f"[Scheduler] Begins to run worker precompile.")
+            logger.info("[Scheduler] Begins to run worker precompile.")
             self.tp_worker.run_precompile()
-            logger.info(f"[Scheduler] Completes worker precompile.")
+            logger.info("[Scheduler] Completes worker precompile.")
 
     def sync_pub(self):
         logger.info(
@@ -635,7 +634,7 @@ class Scheduler(
                         precision_tracer._completed_requests_count = 0
                         precision_tracer._request_traces = {}
                         logger.info(
-                            f"[SCHEDULER] Reset request_counter, completed_count and traces"
+                            "[SCHEDULER] Reset request_counter, completed_count and traces"
                         )
 
                 if "max_requests" in tracer_config:

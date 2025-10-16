@@ -2,7 +2,6 @@
 import os
 import tempfile
 import unittest
-from pathlib import Path
 
 # Set up multi-device simulation for tensor parallelism
 if os.environ.get("USE_DEVICE_TYPE") == "cpu":
@@ -84,7 +83,7 @@ class TestModelLoader(unittest.TestCase):
         """Test that multi-device environment is properly configured."""
         devices = jax.devices()
 
-        print(f" Environment validation:")
+        print(" Environment validation:")
         print(f"  XLA_FLAGS: {os.environ.get('XLA_FLAGS', 'Not set')}")
         print(f"  JAX_PLATFORMS: {os.environ.get('JAX_PLATFORMS', 'Not set')}")
         print(f"  Detected devices: {len(devices)}")
@@ -94,12 +93,12 @@ class TestModelLoader(unittest.TestCase):
         if "--xla_force_host_platform_device_count=8" in os.environ.get(
             "XLA_FLAGS", ""
         ):
-            print(f"PASS: Multi-device simulation properly configured")
+            print("PASS: Multi-device simulation properly configured")
             self.assertGreaterEqual(
                 len(devices), 2, "Should have at least 2 simulated devices"
             )
         else:
-            print(f"WARNING:  Multi-device simulation not configured")
+            print("WARNING:  Multi-device simulation not configured")
 
         # Test mesh creation with available devices
         if len(devices) >= 4:
@@ -121,7 +120,7 @@ class TestModelLoader(unittest.TestCase):
                 device.platform, "cpu", f"Expected CPU device, got {device.platform}"
             )
 
-        print(f"PASS: Multi-device environment validation completed!")
+        print("PASS: Multi-device environment validation completed!")
 
     def test_sharding_configuration(self):
         """Test that sharding configuration works correctly."""
@@ -160,7 +159,7 @@ class TestModelLoader(unittest.TestCase):
             "Array should be distributed across multiple devices",
         )
 
-        print(f"PASS: Sharding configuration test completed!")
+        print("PASS: Sharding configuration test completed!")
 
     def tearDown(self):
         """Clean up test fixtures."""
@@ -259,7 +258,7 @@ class TestModelLoaderWithRealModel(unittest.TestCase):
             self.assertGreater(model_config.hidden_size, 0)
             self.assertGreater(model_config.num_attention_heads, 0)
 
-            print(f"PASS: Model config created successfully:")
+            print("PASS: Model config created successfully:")
             print(f"  Model path: {model_config.model_path}")
             print(f"  Architecture: {model_config.hf_config.architectures}")
             print(f"  Hidden size: {model_config.hidden_size}")
@@ -286,7 +285,7 @@ class TestModelLoaderWithRealModel(unittest.TestCase):
             self.assertEqual(model.mesh, self.mesh)
             self.assertTrue(hasattr(model, "load_weights"))
 
-            print(f"PASS: QWen model instantiated successfully")
+            print("PASS: QWen model instantiated successfully")
 
         except Exception as e:
             self.fail(f"Failed to instantiate QWen model: {e}")
@@ -321,7 +320,7 @@ class TestModelLoaderWithRealModel(unittest.TestCase):
             # Print the actual parameter structure of the model
             try:
                 params = nnx.state(model)
-                print(f" Model parameter structure:")
+                print(" Model parameter structure:")
                 self._print_param_structure(params, "", max_depth=3)
             except Exception as e:
                 print(f"WARNING:  Could not extract model parameters: {e}")
@@ -332,7 +331,7 @@ class TestModelLoaderWithRealModel(unittest.TestCase):
             # Attempt to load weights
             model.load_weights(jax.random.PRNGKey(42))
 
-            print(f"PASS: Weight loading completed successfully!")
+            print("PASS: Weight loading completed successfully!")
 
         except Exception as e:
             # Print detailed error for debugging
@@ -388,7 +387,7 @@ class TestModelLoaderWithRealModel(unittest.TestCase):
                 model_path=self.model_path, trust_remote_code=True, dtype="bfloat16"
             )
 
-            print(f" Model Config Details:")
+            print(" Model Config Details:")
             print(f"  Architecture: {model_config.hf_config.architectures}")
             print(f"  Hidden size: {model_config.hidden_size}")
             print(f"  Num layers: {model_config.hf_config.num_hidden_layers}")
@@ -400,14 +399,14 @@ class TestModelLoaderWithRealModel(unittest.TestCase):
             )
 
             # Check what attributes the model actually has
-            print(f" Model Attributes:")
+            print(" Model Attributes:")
             for attr in dir(model):
                 if not attr.startswith("_"):
                     try:
                         value = getattr(model, attr)
                         if not callable(value):
                             print(f"  {attr}: {type(value)}")
-                    except:
+                    except Exception:
                         pass
 
         except Exception as e:
@@ -427,7 +426,7 @@ class TestModelLoaderWithRealModel(unittest.TestCase):
             # Create loader
             loader = get_model_loader(self.load_config, self.rng, self.mesh)
 
-            print(f"🔄 Testing full loading pipeline...")
+            print("🔄 Testing full loading pipeline...")
 
             # Test download_model (should be no-op for local path)
             loader.download_model(model_config)
@@ -436,7 +435,7 @@ class TestModelLoaderWithRealModel(unittest.TestCase):
             model = loader.load_model(model_config=model_config)
 
             self.assertIsNotNone(model)
-            print(f"PASS: Full model loading pipeline completed!")
+            print("PASS: Full model loading pipeline completed!")
             state = nnx.state(model)
 
             def print_sharding(params, prefix=""):
@@ -500,13 +499,13 @@ class TestModelLoaderWithRealModel(unittest.TestCase):
                 model_config, model_config.dtype, self.rng, self.mesh
             )
 
-            print(f" Validating Model Parameter Structure:")
+            print(" Validating Model Parameter Structure:")
             print(f"  Model type: {type(model).__name__}")
 
             # Get model state
             try:
                 params = nnx.state(model)
-                print(f" Full Model Parameter Structure:")
+                print(" Full Model Parameter Structure:")
                 self._print_param_structure_detailed(params, "", max_depth=5)
 
                 # Check key mappings we're expecting
@@ -524,7 +523,7 @@ class TestModelLoaderWithRealModel(unittest.TestCase):
                     "transformer.h.0.mlp.c_proj.weight",
                 ]
 
-                print(f"\n Checking Expected Parameter Paths:")
+                print("\n Checking Expected Parameter Paths:")
                 for path in expected_paths:
                     try:
                         param = self._get_param_by_path(params, path)
@@ -625,7 +624,7 @@ class TestModelLoaderWithRealModel(unittest.TestCase):
 
             # Check if weights are properly sharded
             state = nnx.state(model)
-            print(f" Checking weight sharding across devices:")
+            print(" Checking weight sharding across devices:")
 
             # Check a few key parameters for sharding
             key_params = [
@@ -664,7 +663,7 @@ class TestModelLoaderWithRealModel(unittest.TestCase):
                 except Exception as e:
                     print(f"    ERROR: Could not check {param_path}: {e}")
 
-            print(f"PASS: Multi-device tensor parallelism test completed!")
+            print("PASS: Multi-device tensor parallelism test completed!")
 
         except Exception as e:
             print(f"ERROR: Multi-device tensor parallelism test failed: {e}")
@@ -696,13 +695,13 @@ class TestModelLoaderWithRealModel(unittest.TestCase):
                 model_path=self.model_path, trust_remote_code=True, dtype="bfloat16"
             )
 
-            print(f"🔄 Testing tensor parallel computation...")
+            print("🔄 Testing tensor parallel computation...")
 
             # Create loader and load model
             loader = get_model_loader(self.load_config, self.rng, self.mesh)
             model = loader.load_model(model_config=model_config)
 
-            print(f"PASS: Model loaded for computation test")
+            print("PASS: Model loaded for computation test")
 
             # Create a simple test input
             # Note: We're not actually running forward pass here since we'd need
@@ -727,7 +726,7 @@ class TestModelLoaderWithRealModel(unittest.TestCase):
                 )
                 print(f"  📊 Sum result sharding: {weight_sum.sharding}")
 
-            print(f"PASS: Tensor parallel computation test completed!")
+            print("PASS: Tensor parallel computation test completed!")
 
         except Exception as e:
             print(f"ERROR: Tensor parallel computation test failed: {e}")
@@ -775,20 +774,20 @@ class TestModelLoaderEdgeCases(unittest.TestCase):
 
     def test_nonexistent_model_path(self):
         """Test handling of nonexistent model path."""
-        load_config = LoadConfig(load_format=LoadFormat.JAX)
+        LoadConfig(load_format=LoadFormat.JAX)
 
         with self.assertRaises(Exception):
-            model_config = ModelConfig(
+            ModelConfig(
                 model_path="/nonexistent/path", trust_remote_code=True
             )
 
     def test_empty_directory(self):
         """Test handling of empty model directory."""
-        load_config = LoadConfig(load_format=LoadFormat.JAX)
+        LoadConfig(load_format=LoadFormat.JAX)
 
         # This should fail when trying to create ModelConfig
         with self.assertRaises(Exception):
-            model_config = ModelConfig(
+            ModelConfig(
                 model_path=self.temp_dir, trust_remote_code=True  # Empty directory
             )
 

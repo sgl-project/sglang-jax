@@ -1,3 +1,4 @@
+# ruff: noqa: F401
 from .common_utils import (
     add_api_key_middleware,
     cdiv,

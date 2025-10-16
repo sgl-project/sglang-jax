@@ -2,7 +2,7 @@ import argparse
 import os
 import subprocess
 import sys
-import unittest
+import importlib
 from pathlib import Path
 
 
@@ -11,11 +11,11 @@ def check_jax_dependencies():
     try:
         import jax
         import jax.numpy as jnp
-        from flax import nnx
+        importlib.util.find_spec("flax.nnx")
 
         print(f"✓ JAX version: {jax.__version__}")
         print(f"✓ JAX backend: {jax.default_backend()}")
-        print(f"✓ Flax NNX available")
+        print("✓ Flax NNX available")
 
         # Test basic JAX operations
         x = jnp.array([1, 2, 3])
@@ -35,9 +35,9 @@ def check_jax_dependencies():
 def check_sglang_dependencies():
     """Check if SGLang dependencies are available"""
     try:
-        from sgl_jax.srt.configs.load_config import LoadFormat
-        from sgl_jax.srt.model_loader.loader import JAXModelLoader
-        from sgl_jax.srt.models.qwen import QWenLMHeadJaxModel
+        importlib.util.find_spec("sgl_jax.srt.configs.load_config.LoadFormat")
+        importlib.util.find_spec("sgl_jax.srt.model_loader.loader.JAXModelLoader")
+        importlib.util.find_spec("sgl_jax.srt.models.qwen.QWenLMHeadJaxModel")
 
         print("✓ SGLang JAXModelLoader available")
         print("✓ QWenLMHeadJaxModel available")
@@ -52,7 +52,6 @@ def check_transformers_dependencies():
     """Check if Transformers dependencies are available"""
     try:
         import transformers
-        from transformers import PretrainedConfig
 
         print(f"✓ Transformers version: {transformers.__version__}")
         return True
@@ -188,7 +187,7 @@ def create_sample_qwen_model(output_dir):
             msgpack.pack(mock_weights, f)
 
         print(f"Created sample QWen JAX model at: {model_dir}")
-        print(f"  - config.json: Model configuration")
+        print("  - config.json: Model configuration")
         print(f"  - model.msgpack: Mock weights ({msgpack_file.stat().st_size} bytes)")
 
     except ImportError:
@@ -290,7 +289,7 @@ def main():
     if args.create_sample:
         try:
             model_path = create_sample_qwen_model(args.create_sample)
-            print(f"\nYou can now run tests with:")
+            print("\nYou can now run tests with:")
             print(f"python {__file__} --model-path {model_path}")
             return 0
         except Exception as e:

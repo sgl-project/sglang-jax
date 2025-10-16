@@ -7,7 +7,6 @@ from contextlib import contextmanager
 from typing import Callable, Dict, List, Optional, Union
 
 import jax
-import jax.numpy as jnp
 import jax.profiler
 
 logger = logging.getLogger(__name__)

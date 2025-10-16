@@ -1,5 +1,5 @@
 from abc import ABC, abstractmethod
-from typing import Any, Dict, Iterator, List, Optional, Union
+from typing import Dict, Iterator, List, Optional, Union
 
 
 class EngineBase(ABC):

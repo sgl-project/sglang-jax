@@ -23,19 +23,16 @@ from functools import total_ordering
 from typing import TYPE_CHECKING, List, Optional
 
 import jax
+from jax.sharding import NamedSharding, PartitionSpec
+from jax.tree_util import register_pytree_node_class
+from sgl_jax.srt.utils.jax_utils import device_array
 
 logger = logging.getLogger(__name__)
-
-from jax.sharding import NamedSharding, PartitionSpec
-
-from sgl_jax.srt.utils.jax_utils import device_array
 
 if TYPE_CHECKING:
     from sgl_jax.srt.layers.attention.base_attn_backend import AttentionBackend
     from sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch
     from sgl_jax.srt.model_executor.model_runner import ModelRunner
-
-from jax.tree_util import register_pytree_node_class
 
 
 class ForwardMode(IntEnum):
