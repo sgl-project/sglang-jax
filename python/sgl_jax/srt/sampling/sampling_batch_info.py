@@ -323,7 +323,6 @@ class SamplingMetadata:
             is_all_greedy=batch.sampling_info.is_all_greedy,
             need_min_p_sampling=batch.sampling_info.need_min_p_sampling,
             linear_penalty=linear_penalty_device,
-            sampling_seeds=sampling_seeds_device,
             do_penalties=True,
         )
 
