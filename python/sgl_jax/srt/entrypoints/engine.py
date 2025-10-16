@@ -4,6 +4,8 @@ The entry point of inference server. (SRT = SGLang Runtime)
 This file implements python APIs for the inference engine.
 """
 
+import json
+import uvloop
 import asyncio
 import atexit
 import dataclasses
@@ -17,12 +19,9 @@ from typing import Any, AsyncIterator, Dict, Iterator, List, Optional, Tuple, Un
 import zmq
 import zmq.asyncio
 
+# ruff: noqa: E402
 # Fix a bug of Python threading
 setattr(threading, "_register_atexit", lambda *args, **kwargs: None)
-
-import json
-
-import uvloop
 
 from sgl_jax.srt.entrypoints.EngineBase import EngineBase
 from sgl_jax.srt.hf_transformers_utils import get_generation_config

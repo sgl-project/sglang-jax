@@ -15,7 +15,7 @@ from sgl_jax.srt.mem_cache.base_prefix_cache import BasePrefixCache, MatchResult
 from sgl_jax.srt.mem_cache.memory_pool import ReqToTokenPool
 
 if TYPE_CHECKING:
-    from sgl_jax.srt.managers.schedule_batch import Req
+    pass
 
 
 class TreeNode:
@@ -278,7 +278,6 @@ class RadixCache(BasePrefixCache):
 
         match_result = self.match_prefix(token_ids)
         matched_tokens = match_result.device_indices
-        last_node = match_result.last_device_node
         matched_len = len(matched_tokens)
 
         if matched_len == 0:
@@ -325,9 +324,9 @@ class RadixCache(BasePrefixCache):
                 k_data = jnp.stack(
                     k_data_list, axis=0
                 )  # (layer_num, matched_len, head_num, head_dim)
-                v_data = jnp.stack(
-                    v_data_list, axis=0
-                )  # (layer_num, matched_len, head_num, head_dim)
+                # v_data = jnp.stack(
+                #     v_data_list, axis=0
+                # )  # (layer_num, matched_len, head_num, head_dim)
 
                 # For this implementation, we return K data (could also return concatenated K,V)
                 kv_data = k_data

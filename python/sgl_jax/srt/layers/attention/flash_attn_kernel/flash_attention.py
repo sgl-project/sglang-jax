@@ -280,9 +280,6 @@ def _ragged_paged_attention_kernel(
         kv_packing,
         _,
     ) = kv_cache_fused_hbm_ref.shape
-    max_num_seqs = kv_lens_ref.shape[0]
-    num_page_indices = page_indices_ref.shape[0]
-    pages_per_seq = num_page_indices // max_num_seqs
     num_q_heads_per_kv_head = num_q_heads_per_kv_head_per_packing * q_packing
     q_dtype = q_hbm_ref.dtype
     kv_dtype = kv_cache_fused_hbm_ref.dtype

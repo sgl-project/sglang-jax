@@ -143,10 +143,6 @@ class PrecisionTracer:
         with self.lock:
             return self._max_requests
 
-    def get_completed_requests_count(self):
-        with self.lock:
-            return self._completed_requests_count
-
     def get_request_counter(self):
         with self.lock:
             return self._request_counter
@@ -222,7 +218,7 @@ class PrecisionTracer:
 
         os.makedirs(os.path.dirname(self._trace_output_file), exist_ok=True)
 
-        with open(self._trace_output_file, "w") as f:
+        with open(self._trace_output_file, "w") as _:
             pass
 
         logger.info(f"Request tracing started. Output: {self._trace_output_file}")

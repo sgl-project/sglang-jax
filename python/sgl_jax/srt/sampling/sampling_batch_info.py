@@ -20,7 +20,6 @@ import threading
 import jax
 import jax.numpy as jnp
 import numpy as np
-from jax._src import mesh as mesh_lib
 
 logger = logging.getLogger(__name__)
 

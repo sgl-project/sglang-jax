@@ -2,9 +2,8 @@
 
 import importlib.metadata
 import resource
-import subprocess
 import sys
-from collections import OrderedDict, defaultdict
+from collections import OrderedDict
 
 import jax
 

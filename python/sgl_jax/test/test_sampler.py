@@ -12,8 +12,8 @@ class TestMultinomialWithSeed(unittest.TestCase):
     def test_deterministic_sampling_with_same_seed(self):
         """Test that same (inputs, seed) pair always yields the same sample."""
         # Setup test data
-        batch_size = 4
-        vocab_size = 10
+        # batch_size = 4
+        # vocab_size = 10
 
         # Create logits that simulate different temperature scenarios
         flatter_distribution = jnp.array(

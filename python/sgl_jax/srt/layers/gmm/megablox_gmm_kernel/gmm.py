@@ -425,6 +425,7 @@ def gmm(
                 mask_k_rem_lhs = partial(mask_k_rem, dim=1)
                 mask_k_rem_rhs = partial(mask_k_rem, dim=int(transpose_rhs))
             else:
+                # ruff: noqa: E731
                 mask_k_rem_lhs = lambda x: x
                 mask_k_rem_rhs = lambda x: x
 

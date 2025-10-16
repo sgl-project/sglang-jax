@@ -1,7 +1,7 @@
 import argparse
 import json
 import sys
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, List, Optional, Tuple
 
 
 class Colors:
@@ -640,7 +640,6 @@ def compare_trace_files(
         for content_hash in sorted(only_in_1):
             traces = groups1[content_hash]
             trace = traces[0]
-            records = trace.get("precision_records", [])
             print(
                 f"  {Colors.YELLOW}-{Colors.RESET} {content_hash} (Request ID: {trace.get('request_id', 'N/A')})"
             )
@@ -650,7 +649,6 @@ def compare_trace_files(
         for content_hash in sorted(only_in_2):
             traces = groups2[content_hash]
             trace = traces[0]
-            records = trace.get("precision_records", [])
             print(
                 f"  {Colors.YELLOW}+{Colors.RESET} {content_hash} (Request ID: {trace.get('request_id', 'N/A')})"
             )

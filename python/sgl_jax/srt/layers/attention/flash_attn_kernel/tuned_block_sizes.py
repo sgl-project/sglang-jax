@@ -3,9 +3,7 @@
 import jax.numpy as jnp
 
 from sgl_jax.srt.layers.attention.flash_attn_kernel.util import (
-    align_to,
     get_device_name,
-    get_dtype_packing,
     get_tpu_version,
     next_power_of_2,
 )

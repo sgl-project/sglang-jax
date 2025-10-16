@@ -205,7 +205,6 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         page_idx = 0
 
         for seq_idx in range(batch_size):
-            seq_len = seq_lens_np[seq_idx]
             pre_len = prefix_lens_np[seq_idx]
             last_loc = last_loc_np[seq_idx]
             extend_len = extend_lens[seq_idx]

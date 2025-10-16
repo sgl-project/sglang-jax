@@ -5,7 +5,6 @@ python3 run_curl.py --base-url=http://127.0.0.1:8100 --return-logprob=true --top
 
 import argparse
 import json
-import time
 
 import requests
 

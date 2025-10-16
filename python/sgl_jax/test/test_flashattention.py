@@ -13,7 +13,6 @@ from sgl_jax.srt.layers.radix_attention import RadixAttention
 from sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch
 from sgl_jax.srt.mem_cache.memory_pool import KVCache, MHATokenToKVPool
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sgl_jax.srt.model_executor.model_runner import ModelRunner
 from sgl_jax.srt.utils.mesh_utils import create_device_mesh
 from sgl_jax.test.test_utils import CustomTestCase
 
@@ -42,7 +41,7 @@ def create_qkv_cache(
     page_size=1,
 ):
     batched_q_len = sum([q_len for q_len, _ in lens])
-    batched_kv_len = sum([kv_len for _, kv_len in lens])
+    # batched_kv_len = sum([kv_len for _, kv_len in lens])
 
     # Calculate aligned batched_kv_len
     seq_lens = jnp.array([kv_len for _, kv_len in lens], dtype=jnp.int32)
@@ -165,9 +164,9 @@ def create_test_data(
     q, k, v = create_qkv_cache(lens, num_heads, head_dim, num_kv_heads, page_size)
 
     # cache loc - match schedule_batch.py logic with align_to_size
-    def align_to_size(l, size, value=0):
-        align_len = (len(l) + size - 1) // size * size
-        return l + [value] * (align_len - len(l))
+    def align_to_size(lst, size, value=0):
+        align_len = (len(lst) + size - 1) // size * size
+        return lst + [value] * (align_len - len(lst))
 
     cache_loc_flat = []
     current_aligned_pos = 0  # Track aligned position in k/v cache
@@ -312,7 +311,7 @@ class TestAttention(CustomTestCase):
         )
 
         # Debug cache mapping
-        print(f"=== Cache Mapping Debug ===")
+        print("=== Cache Mapping Debug ===")
         print(f"lens: {lens}")
         print(f"seq_lens: {forward_batch.seq_lens}")
         print(f"cu_q_lens: {forward_batch.attn_backend.forward_metadata.cu_q_lens}")
@@ -395,13 +394,13 @@ class TestAttention(CustomTestCase):
         diff = np.abs(jax_flat - expected_flat)
         max_diff = np.max(diff)
 
-        print(f"=== Detailed Analysis ===")
+        print("=== Detailed Analysis ===")
         print(f"JAX output shape: {jax_flat.shape}")
         print(f"Expected shape: {expected_flat.shape}")
         print(f"Max difference: {max_diff}")
 
         # Analyze by token dimension (rows) - show only first 5 tokens
-        print(f"\n=== Token-wise Analysis (first 20 tokens) ===")
+        print("\n=== Token-wise Analysis (first 20 tokens) ===")
         num_tokens = jax_flat.shape[0]
         for i in range(min(num_tokens, 20)):
             jax_row = np.asarray(jax_flat[i])
@@ -418,7 +417,7 @@ class TestAttention(CustomTestCase):
             print()
 
         # Overall statistics
-        print(f"=== Overall Statistics ===")
+        print("=== Overall Statistics ===")
         print(
             f"JAX output:      mean={float(np.mean(jax_flat)):.6f}, std={float(np.std(jax_flat)):.6f}"
         )

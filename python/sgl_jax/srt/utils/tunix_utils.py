@@ -1,7 +1,8 @@
 # refer to tunix
 def pathways_available() -> bool:
     try:
-        import pathwaysutils  # pylint: disable=g-import-not-at-top, unused-import
+        # ruff: noqa: F401
+        import pathwaysutils
 
         return True
     except ImportError:

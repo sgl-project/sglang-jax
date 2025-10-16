@@ -28,8 +28,8 @@ repos:
     rev: v0.11.7
     hooks:
       - id: ruff
-        args: [--select=F401, --fixable=F401]
-        files: ^(benchmark/|docs/|examples/)
+        args: ["--select=F401,F821", "--fixable=F401,F821"]
+        files: ^(python/|benchmark/|docs/|examples/)
         exclude: \.ipynb$
   - repo: https://github.com/psf/black
     rev: 24.10.0

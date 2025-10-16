@@ -28,7 +28,7 @@ import argparse
 import os
 import subprocess
 import sys
-import unittest
+import importlib
 from pathlib import Path
 
 os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=8"
@@ -39,13 +39,13 @@ def check_jax_dependencies():
     try:
         import jax
         import jax.numpy as jnp
-        from flax import nnx
+        importlib.util.find_spec("flax.nnx")
 
         print(f"✓ JAX version: {jax.__version__}")
         print(f"✓ JAX backend: {jax.default_backend()}")
         print(f"✓ Available devices: {len(jax.devices())} devices")
         print(f"✓ Device types: {[d.platform for d in jax.devices()]}")
-        print(f"✓ Flax NNX available")
+        print("✓ Flax NNX available")
 
         # Test basic JAX operations
         x = jnp.array([1, 2, 3])
@@ -65,9 +65,9 @@ def check_jax_dependencies():
 def check_sglang_dependencies():
     """Check if SGLang dependencies are available"""
     try:
-        from sgl_jax.srt.configs.load_config import LoadFormat
-        from sgl_jax.srt.model_loader.loader import JAXModelLoader
-        from sgl_jax.srt.models.qwen3_moe import Qwen3MoeForCausalLMJaxModel
+        importlib.util.find_spec("sgl_jax.srt.configs.load_config.LoadFormat")
+        importlib.util.find_spec("sgl_jax.srt.model_loader.loader.JAXModelLoader")
+        importlib.util.find_spec("sgl_jax.srt.models.qwen3_moe.Qwen3MoeForCausalLMJaxModel")
 
         print("✓ SGLang JAXModelLoader available")
         print("✓ Qwen3MoeForCausalLMJaxModel available")
@@ -82,7 +82,6 @@ def check_transformers_dependencies():
     """Check if Transformers dependencies are available"""
     try:
         import transformers
-        from transformers import PretrainedConfig
 
         print(f"✓ Transformers version: {transformers.__version__}")
         return True
@@ -271,7 +270,7 @@ def create_sample_qwen3_moe_model(output_dir):
             msgpack.pack(mock_weights, f)
 
         print(f"Created sample Qwen3 MoE JAX model at: {model_dir}")
-        print(f"  - config.json: Model configuration with MoE settings")
+        print("  - config.json: Model configuration with MoE settings")
         print(f"  - model.msgpack: Mock weights ({msgpack_file.stat().st_size} bytes)")
         print(
             f"  - MoE config: {config['num_experts']} experts, {config['num_experts_per_tok']} experts per token"
@@ -369,7 +368,7 @@ def main():
     if args.create_sample:
         try:
             model_path = create_sample_qwen3_moe_model(args.create_sample)
-            print(f"\nYou can now run tests with:")
+            print("\nYou can now run tests with:")
             print(f"python {__file__} --model-path {model_path}")
             return 0
         except Exception as e:

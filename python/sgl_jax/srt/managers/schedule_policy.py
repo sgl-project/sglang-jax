@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-"""Request scheduler policy"""
-
 import os
 import random
 from collections import defaultdict

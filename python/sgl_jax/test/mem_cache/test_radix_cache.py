@@ -10,7 +10,6 @@ if os.environ.get("USE_DEVICE_TYPE") == "cpu":
     os.environ["JAX_PLATFORMS"] = "cpu"
 
 import unittest
-from unittest.mock import Mock
 
 import jax
 import jax.numpy as jnp
@@ -740,7 +739,6 @@ class TestRadixCacheWithRequests(unittest.TestCase):
     def test_cache_finished_req_disabled(self):
         """test cache finished request disabled"""
         # create disabled cache
-        mesh = Mesh([self.devices[0]], axis_names=("tensor",))
         disabled_cache = RadixCache(
             req_to_token_pool=self.req_pool,
             token_to_kv_pool_allocator=self.allocator,

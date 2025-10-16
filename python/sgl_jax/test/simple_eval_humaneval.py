@@ -11,7 +11,6 @@ import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, List, Optional
 
-import tqdm
 
 try:
     from human_eval.data import read_problems
@@ -41,7 +40,6 @@ def evaluate_functional_correctness(
     Evaluates the functional correctness of generated samples, and writes
     results to f"{sample_file}_results.jsonl.gz"
     """
-    import copy
 
     # Check the generated samples against test suites.
     with ThreadPoolExecutor(max_workers=n_workers) as executor:

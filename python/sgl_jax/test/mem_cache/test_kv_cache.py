@@ -1,4 +1,3 @@
-import random
 import unittest
 
 import jax
@@ -142,10 +141,6 @@ class TestKVCache(unittest.TestCase):
         # Verify that padding tokens didn't affect the cache
         padding_mask = loc == -1
         if jnp.any(padding_mask):
-            # Check that original cache values at padding positions are unchanged
-            original_k_cache = jnp.zeros_like(k_cache)  # Original was all zeros
-            original_v_cache = jnp.zeros_like(v_cache)
-
             # For positions that should be ignored (padding), cache should remain unchanged
             for i in range(total_tokens):
                 if loc[i] == -1:

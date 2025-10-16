@@ -1,7 +1,6 @@
 import os
 import unittest
 from pathlib import Path
-from unittest.mock import patch
 
 import jax.numpy as jnp
 from flax import nnx
@@ -395,11 +394,11 @@ class TestQwenModel(unittest.TestCase):
             input_texts = self._generate_random_questions(batch_size)
             print(f"\nGenerated {batch_size} random questions for batch testing")
 
-            print(f"\nBatch Configuration:")
+            print("\nBatch Configuration:")
             print(f"   Total requests: {len(input_texts)}")
             print(f"   Batch size: {len(input_texts)}")
 
-            print(f"\nSample questions:")
+            print("\nSample questions:")
             for i, text in enumerate(input_texts[: min(5, len(input_texts))]):
                 print(f"   {i+1}: '{text}'")
             if len(input_texts) > 5:
@@ -414,7 +413,7 @@ class TestQwenModel(unittest.TestCase):
                 self._create_batch_from_texts(model.config, input_texts, tokenizer)
             )
 
-            print(f"\n  Batch Processing Info:")
+            print("\n  Batch Processing Info:")
             print(f"   Input tokens shape: {input_ids_array.shape}")
             print(
                 f"   Actual sequence lengths: {actual_seq_lens[:10]}{'...' if len(actual_seq_lens) > 10 else ''}"
@@ -517,8 +516,8 @@ class TestQwenModel(unittest.TestCase):
                 len(r["output"]) for r in final_results.values()
             ) / len(final_results)
 
-            print(f"\n === Generation Results Summary ===")
-            print(f"Performance Metrics:")
+            print("\n === Generation Results Summary ===")
+            print("Performance Metrics:")
             print(f"   Total time: {total_time:.2f} seconds")
             print(f"   Requests processed: {len(input_texts)}")
             print(f"   Requests finished: {finished_count}/{len(input_texts)}")
@@ -528,7 +527,7 @@ class TestQwenModel(unittest.TestCase):
 
             # Print detailed results for small batches
             if len(input_texts) <= 10:
-                print(f"\nDetailed Results:")
+                print("\nDetailed Results:")
                 for i in range(len(input_texts)):
                     result = final_results[i]
                     status = (
@@ -541,7 +540,7 @@ class TestQwenModel(unittest.TestCase):
                     print(f"  Output: '{result['output']}'")
             else:
                 # Show only a few examples
-                print(f"\n Sample Results (first 3):")
+                print("\n Sample Results (first 3):")
                 for i in range(min(3, len(input_texts))):
                     result = final_results[i]
                     status = " Finished" if result["finished"] else "Max iterations"
@@ -559,7 +558,7 @@ class TestQwenModel(unittest.TestCase):
                 self.assertIsNotNone(result["output"])
                 self.assertTrue(len(result["output"]) >= len(result["input"]))
 
-            print(f"\n Batch test completed successfully!")
+            print("\n Batch test completed successfully!")
             return {
                 "total_time": total_time,
                 "throughput": len(input_texts) / total_time,

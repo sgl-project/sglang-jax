@@ -123,7 +123,7 @@ def get_generation_config(
         return GenerationConfig.from_pretrained(
             model, trust_remote_code=trust_remote_code, revision=revision, **kwargs
         )
-    except OSError as e:
+    except OSError:
         return None
 
 

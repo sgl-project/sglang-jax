@@ -18,7 +18,6 @@ from sgl_jax.test.simple_eval_common import (
     HTML_JINJA,
     Eval,
     EvalResult,
-    MessageList,
     SamplerBase,
     SingleEvalResult,
     format_multichoice_question,

@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 import jax
 import jax.numpy as jnp
-from jax.sharding import NamedSharding, PartitionSpec
+from jax.sharding import PartitionSpec
 
 
 def get_num_kv_heads_by_tp(total_num_kv_heads: int, tp_size: int) -> int:

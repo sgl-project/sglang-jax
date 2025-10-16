@@ -4,7 +4,6 @@ from typing import Any, Dict, Optional, Tuple
 import jax
 import jax.numpy as jnp
 from flax import nnx
-from jax import numpy as jnp
 from transformers import PretrainedConfig
 
 from sgl_jax.srt.configs.model_config import ModelConfig

@@ -1,5 +1,4 @@
-from functools import partial
-from typing import List, Optional
+from typing import List
 
 import jax
 import numpy as np

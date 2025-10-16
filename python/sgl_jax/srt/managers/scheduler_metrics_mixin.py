@@ -1,7 +1,7 @@
 import logging
 import time
 from collections import defaultdict
-from typing import List, Optional
+from typing import List
 
 from sgl_jax.srt.managers.schedule_policy import PrefillAdder
 from sgl_jax.srt.managers.scheduler import Req, ScheduleBatch
