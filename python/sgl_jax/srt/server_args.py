@@ -178,7 +178,7 @@ class ServerArgs:
             self.load_format = "remote"
 
         if self.enable_precision_tracer:
-            if self.chunked_prefill_size is not None or self.chunked_prefill_size > 0:
+            if self.chunked_prefill_size is not None and self.chunked_prefill_size > 0:
                 logger.warning(
                     "Chunked prefill is enabled, but precision tracer is also enabled. "
                     "This may cause incorrect precision tracer results."
