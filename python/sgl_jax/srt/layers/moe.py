@@ -1,5 +1,3 @@
-from collections.abc import Iterable, Sequence
-
 import jax
 from flax import nnx
 from jax import numpy as jnp
@@ -7,92 +5,50 @@ from jax.experimental.shard_map import shard_map
 from jax.sharding import Mesh
 from jax.sharding import PartitionSpec as P
 
-from sgl_jax.srt.layers import linear
 from sgl_jax.srt.layers.gmm.megablox_gmm_backend import gmm
 
 
 class GateLogit(nnx.Module):
-    """A layer used to compute gate logits, allowing to return the pre bias values for DeepSeek routing.
-
-    Attributes:
-        input_size: input dimension of the layer.
-        features: tuple with numbers of output features.
-        model_name: which model to run.
-        axis: tuple with axes to apply the transformation on.
-        weight_dtype: the dtype of the weights (default: float32).
-        dtype: the dtype of the computation (default: float32).
-        kernel_axes: tuple with axes to apply kernel function.
-        use_bias: whether to add learnable bias in gate logit scores.
-          When enabled, this bias aids expert load balancing (like in DeepSeek V3),
-          and is not part of the loss calculation.
-        score_func: scoring function for output normalization before applying bias.
-        matmul_precision: precision for JAX functions.
-    """
-
     def __init__(
         self,
         input_size: int,
-        features: Iterable[int] | int,
-        model_name: str,
-        axis: Iterable[int] | int = -1,
-        weight_dtype: jnp.dtype = jnp.float32,
-        dtype: jnp.dtype = jnp.float32,
-        kernel_axes: Sequence[str] | None = None,
-        use_bias: bool = False,
-        score_func: str = "",
-        matmul_precision: str = "default",
-        layer_id: int = 0,
-        rngs: nnx.Rngs = None,
+        num_experts: int = 0,
+        weight_dtype: jnp.dtype = jnp.bfloat16,
+        enable_expert_bias: bool | None = False,
+        score_func: str | None = "softmax",
     ):
-        self.features = linear._canonicalize_tuple(features)
-        self.axis = linear._canonicalize_tuple(axis)
-        self.model_name = model_name
         self.weight_dtype = weight_dtype
-        self.dtype = dtype
-        self.use_bias = use_bias
+        self.enable_expert_bias = enable_expert_bias
         self.score_func = score_func
-        self.matmul_precision = matmul_precision
-        self.layer_id = layer_id
-
-        self.kernel_axes = kernel_axes or ()
-
-        kernel_shape = (input_size,) + self.features
 
         self.kernel = nnx.Param(
-            nnx.with_partitioning(nnx.initializers.normal(), self.kernel_axes)(
-                jax.random.PRNGKey(0), kernel_shape, self.weight_dtype
+            nnx.with_partitioning(nnx.initializers.normal(), (None, None))(
+                jax.random.PRNGKey(0), (input_size, num_experts), self.weight_dtype
             )
         )
-
-        if self.use_bias:
-            bias_shape = self.features
-            bias_axes = self.kernel_axes[-len(self.features) :] if self.kernel_axes else ()
+        if enable_expert_bias:
             self.bias = nnx.Param(
-                nnx.with_partitioning(nnx.initializers.zeros_init(), bias_axes)(
-                    jax.random.PRNGKey(0), bias_shape, self.weight_dtype
+                nnx.with_partitioning(nnx.initializers.zeros_init(), (None,))(
+                    jax.random.PRNGKey(0), (num_experts,), self.weight_dtype
                 )
             )
         else:
             self.bias = None
 
-    def __call__(self, inputs: jax.Array) -> tuple[jax.Array, jax.Array | None]:
-        inputs = jnp.asarray(inputs, self.dtype)
-        kernel = jnp.asarray(self.kernel.value, self.dtype)
-        output = jnp.dot(inputs, kernel)
+    def __call__(self, hidden_states: jax.Array) -> tuple[jax.Array, jax.Array | None]:
+        logits = hidden_states.astype(self.weight_dtype) @ self.kernel
 
         if self.score_func:
             if self.score_func == "softmax":
-                output = jax.nn.softmax(output)
+                logits = jax.nn.softmax(logits, axis=-1)
             elif self.score_func == "sigmoid":
-                output = jax.nn.sigmoid(output)
+                logits = jax.nn.sigmoid(logits)
             elif self.score_func == "tanh":
-                output = jax.nn.tanh(output)
+                logits = jax.nn.tanh(logits)
+            else:
+                raise ValueError("unknown score func")
 
-        if self.use_bias and self.bias is not None:
-            bias = jnp.asarray(self.bias.value, self.dtype)
-            output += bias
-
-        return output
+        return logits
 
 
 class TopK(nnx.Module):
@@ -102,7 +58,7 @@ class TopK(nnx.Module):
         renormalize: bool,
         num_expert_group: int = 0,
         topk_group: int = 0,
-        routed_scaling_factor: Optional[float] = None,
+        routed_scaling_factor: float | None = None,
     ):
         self.topk = topk
         self.renormalize = renormalize
@@ -113,55 +69,45 @@ class TopK(nnx.Module):
     def __call__(self, router_logits: jax.Array, correction_bias: jax.Array = None):
         if self.num_expert_group > 0 or self.topk_group > 0:
             if correction_bias is not None:
-                topk_ids, topk_weights = self._biased_grouped_topk(
-                    router_logits, correction_bias
-                )
+                topk_weights, topk_ids = self._biased_grouped_topk(router_logits, correction_bias)
             else:
-                topk_ids, topk_weights = self._grouped_topk(router_logits)
+                topk_weights, topk_ids = self._grouped_topk(router_logits)
         else:
             if correction_bias is not None:
-                topk_ids, topk_weights = self._biased_topk(
-                    router_logits, correction_bias
-                )
+                topk_weights, topk_ids = self._biased_topk(router_logits, correction_bias)
             else:
-                topk_ids, topk_weights = self._topk(router_logits)
+                topk_weights, topk_ids = self._topk(router_logits)
 
         if self.renormalize:
-            topk_weights = topk_weights / (
-                jnp.sum(topk_weights, axis=-1, keepdims=True) + 1e-20
-            )
+            topk_weights = topk_weights / (jnp.sum(topk_weights, axis=-1, keepdims=True))
             if self.routed_scaling_factor is not None:
                 topk_weights *= self.routed_scaling_factor
 
         topk_weights = topk_weights.astype(router_logits.dtype)
 
-        return topk_ids, topk_weights
+        return topk_weights, topk_ids
 
     def _topk(self, router_logits):
-        topk_weights = jax.nn.softmax(router_logits.astype(jnp.float32), axis=-1)
-        topk_weights, topk_ids = jax.lax.top_k(topk_weights, self.topk)
-        return topk_ids, topk_weights
+        return jax.lax.top_k(router_logits, self.topk)
 
     def _biased_topk(self, router_logits, correction_bias):
         n_routed_experts = router_logits.shape[-1]
-        scores = jax.nn.softmax(router_logits, axis=-1)
-        scores_for_choice = scores.reshape(-1, n_routed_experts) + jnp.expand_dims(
+        scores_for_choice = router_logits.reshape(-1, n_routed_experts) + jnp.expand_dims(
             correction_bias, axis=0
         )
         topk_ids = jax.lax.top_k(scores_for_choice, self.topk)[1]
-        topk_weights = jnp.take_along_axis(scores, topk_ids, axis=1)
-        return topk_ids, topk_weights
+        topk_weights = jnp.take_along_axis(router_logits, topk_ids, axis=1)
+        return topk_weights, topk_ids
 
     def _grouped_topk(
         self,
         router_logits: jax.Array,
     ):
-        scores = jax.nn.softmax(router_logits, axis=-1)
-        num_token = scores.shape[0]
+        num_token = router_logits.shape[0]
 
         # Group scores calculation
         group_shape = (num_token, self.num_expert_group, -1)
-        scores_grouped = scores.reshape(group_shape)
+        scores_grouped = router_logits.reshape(group_shape)
         group_scores = jnp.max(scores_grouped, axis=-1)  # [n, n_group]
 
         # Get top group indices # [n, top_k_group]
@@ -173,7 +119,7 @@ class TopK(nnx.Module):
         group_mask = group_mask.at[token_indices, group_idx].set(1)  # [n, n_group]
 
         # Create score mask
-        experts_per_group = scores.shape[-1] // self.num_expert_group
+        experts_per_group = router_logits.shape[-1] // self.num_expert_group
         score_mask = jnp.expand_dims(group_mask, axis=-1)  # [n, n_group, 1]
         score_mask = jnp.broadcast_to(
             score_mask, (num_token, self.num_expert_group, experts_per_group)
@@ -181,27 +127,24 @@ class TopK(nnx.Module):
         score_mask = score_mask.reshape(num_token, -1)  # [n, e]
 
         # Apply mask and get topk
-        tmp_scores = jnp.where(score_mask, scores, 0.0)  # [n, e]
+        tmp_scores = jnp.where(score_mask, router_logits, 0.0)  # [n, e]
         topk_weights, topk_ids = jax.lax.top_k(tmp_scores, k=self.topk)
 
-        return topk_ids, topk_weights
+        return topk_weights, topk_ids
 
     def _biased_grouped_topk(
         self,
         router_logits: jax.Array,
         correction_bias: jax.Array = None,
     ):
-        scores = jax.nn.sigmoid(router_logits)
-        num_token = scores.shape[0]
-        scores_for_choice = scores.reshape(num_token, -1) + jnp.expand_dims(
+        num_token = router_logits.shape[0]
+        scores_for_choice = router_logits.reshape(num_token, -1) + jnp.expand_dims(
             correction_bias, axis=0
         )
 
         # Group scores calculation
         scores_grouped = scores_for_choice.reshape(num_token, self.num_expert_group, -1)
-        group_scores = jnp.sum(
-            jax.lax.top_k(scores_grouped, k=2)[0], axis=-1
-        )  # [n, n_group]
+        group_scores = jnp.sum(jax.lax.top_k(scores_grouped, k=2)[0], axis=-1)  # [n, n_group]
 
         # Get top group indices [n, top_k_group]
         group_idx = jax.lax.top_k(group_scores, k=self.topk_group)[1]
@@ -212,7 +155,7 @@ class TopK(nnx.Module):
         group_mask = group_mask.at[token_indices, group_idx].set(1)  # [n, n_group]
 
         # Create score mask
-        experts_per_group = scores.shape[-1] // self.num_expert_group
+        experts_per_group = router_logits.shape[-1] // self.num_expert_group
         score_mask = jnp.expand_dims(group_mask, axis=-1)  # [n, n_group, 1]
         score_mask = jnp.broadcast_to(
             score_mask, (num_token, self.num_expert_group, experts_per_group)
@@ -221,10 +164,11 @@ class TopK(nnx.Module):
 
         # Apply mask and get topk
         tmp_scores = jnp.where(score_mask, scores_for_choice, float("-inf"))  # [n, e]
-        topk_ids = jax.lax.top_k(tmp_scores, k=self.topk)[1]
-        topk_weights = jnp.take_along_axis(scores, topk_ids, axis=1)
 
-        return topk_ids, topk_weights
+        topk_ids = jax.lax.top_k(tmp_scores, k=self.topk)[1]
+        topk_weights = jnp.take_along_axis(router_logits, topk_ids, axis=1)
+
+        return topk_weights, topk_ids
 
 
 class EPMoE(nnx.Module):
@@ -239,7 +183,6 @@ class EPMoE(nnx.Module):
         weight_dtype: jnp.dtype = jnp.bfloat16,
         dtype: jnp.dtype = jnp.bfloat16,
         layer_id: int = 0,
-        rngs: nnx.Rngs = None,
     ):
         self.config = config
         self.num_experts = num_experts
@@ -300,14 +243,14 @@ class EPMoE(nnx.Module):
         except Exception as _:
             return False, "cpu"
 
-    def __call__(self, hidden_states, topk_ids, topk_weights):
+    def __call__(self, hidden_states, topk_weights, topk_ids):
         return shard_map(
             self._forward,
             mesh=self.mesh,
             in_specs=(
                 P(None),  # hidden_states
-                P(None),  # topk_ids
                 P(None),  # topk_weights
+                P(None),  # topk_ids
                 P(("data", "tensor"), None, None),  # w0_weights
                 P(("data", "tensor"), None, None),  # w1_weights
                 P(("data", "tensor"), None, None),  # wo_weights
@@ -316,16 +259,14 @@ class EPMoE(nnx.Module):
             check_rep=False,
         )(
             hidden_states,
-            topk_ids,
             topk_weights,
+            topk_ids,
             self.wi_0.value,
             self.wi_1.value,
             self.wo.value,
         )
 
-    def _forward(
-        self, hidden_states, topk_ids, topk_weights, w0_weights, w1_weights, wo_weights
-    ):
+    def _forward(self, hidden_states, topk_weights, topk_ids, w0_weights, w1_weights, wo_weights):
         data_index = jax.lax.axis_index("data")
         tensor_index = jax.lax.axis_index("tensor")
         tensor_size = jax.lax.axis_size("tensor")
@@ -338,8 +279,8 @@ class EPMoE(nnx.Module):
             batch_size, seq_len = hidden_states.shape[0], hidden_states.shape[1]
             total_tokens = batch_size * seq_len
         # Permute
-        x, sorted_selected_experts, weights, group_sizes, selected_experts = (
-            self._permute(hidden_states, topk_ids, topk_weights)
+        x, sorted_selected_experts, weights, group_sizes, selected_experts = self._permute(
+            hidden_states, topk_ids, topk_weights
         )
 
         # EP Dispatch
@@ -508,7 +449,7 @@ class EPMoE(nnx.Module):
             inputs_2d = jnp.reshape(inputs, (bsz_times_seq_len, inputs_shape[-1]))
 
         flatten_selected_experts = jnp.ravel(top_k_indices)
-        sorted_selected_experts = jnp.argsort(flatten_selected_experts)
+        sorted_selected_experts = jnp.argsort(flatten_selected_experts, stable=True)
         sorted_indices = sorted_selected_experts // self.num_experts_per_tok
 
         sorted_inputs = jnp.take(inputs_2d, indices=sorted_indices, axis=0).astype(self.dtype)
@@ -542,7 +483,7 @@ class EPMoE(nnx.Module):
                 padding = jnp.zeros((padding_size, intermediate.shape[1]), dtype=intermediate.dtype)
                 intermediate = jnp.concatenate([intermediate, padding], axis=0)
 
-        argsort_indices = jnp.argsort(sorted_selected_experts)
+        argsort_indices = jnp.argsort(sorted_selected_experts, stable=True)
         unsort_intermediate = jnp.take(intermediate, indices=argsort_indices, axis=0)
 
         total_tokens = weights.shape[0] * weights.shape[1] // self.num_experts_per_tok

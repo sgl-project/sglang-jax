@@ -185,22 +185,14 @@ class QWen3MoeDecoderLayer(nnx.Module):
             num_experts = getattr(config, "num_experts", 128)
             num_experts_per_tok = getattr(config, "num_experts_per_tok", 8)
             moe_intermediate_size = getattr(config, "moe_intermediate_size", 768)
-            expert_parallel_size = mesh.shape.get("data", 1) * mesh.shape.get(
-                "tensor", 1
-            )
+            expert_parallel_size = mesh.shape.get("data", 1) * mesh.shape.get("tensor", 1)
             self.topk = TopK(
                 topk=num_experts_per_tok,
                 renormalize=config.norm_topk_prob,
             )
             self.moe_gate = GateLogit(
                 input_size=config.hidden_size,
-                features=num_experts,
-                model_name=getattr(config, "model_name", "qwen3_moe"),
-                use_bias=False,
-                kernel_axes=(None, ("data", "tensor")),
-                dtype=dtype,
-                layer_id=layer_id,
-                rngs=rngs,
+                num_experts=num_experts,
             )
             with mesh:
                 self.mlp = EPMoE(
@@ -213,7 +205,6 @@ class QWen3MoeDecoderLayer(nnx.Module):
                     weight_dtype=dtype,
                     dtype=dtype,
                     layer_id=layer_id,
-                    rngs=rngs,
                 )
             self.is_moe_layer = True
 
@@ -261,8 +252,8 @@ class QWen3MoeDecoderLayer(nnx.Module):
 
         if self.is_moe_layer:
             router_logits = self.moe_gate(hidden_states)
-            topk_ids, topk_weights = self.topk(router_logits)
-            mlp_output = self.mlp(hidden_states, topk_ids, topk_weights)
+            topk_weights, topk_ids = self.topk(router_logits)
+            mlp_output = self.mlp(hidden_states, topk_weights, topk_ids)
             hidden_states = mlp_output
         else:
             hidden_states = self.mlp(hidden_states)

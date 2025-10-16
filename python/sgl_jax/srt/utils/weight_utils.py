@@ -345,9 +345,7 @@ class WeightLoader:
 
             model_param = self._get_param(params, jax_path)
             model_param.value = sharded_weight.astype(model_param.value.dtype)
-            logger.debug(
-                f"Split {hf_key} -> {jax_path}, shape: {processed_weight.shape}"
-            )
+            logger.debug("Split %s -> %s, shape: %s", hf_key, jax_path, processed_weight.shape)
 
     def _shard_weight(self, weight: jax.Array, sharding: tuple) -> jax.Array:
         if math.prod(self.mesh.axis_sizes) == 1:

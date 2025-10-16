@@ -86,9 +86,6 @@ class ModelWorkerClient:
             self.parent_process.send_signal(signal.SIGQUIT)
 
     def forward_thread_func_(self):
-        batch_pt = 0
-        batch_lists = [None] * 2
-
         while True:
             (
                 model_worker_batch,
@@ -98,10 +95,6 @@ class ModelWorkerClient:
             ) = self.input_queue.get()
             if not model_worker_batch:
                 break
-
-            # Keep a reference of model_worker_batch by storing it into a list.
-            batch_lists[batch_pt % 2] = model_worker_batch
-            batch_pt += 1
 
             # Resolve future tokens in the input
             input_ids = model_worker_batch.forward_batch.input_ids
@@ -183,8 +176,8 @@ class ModelWorkerClient:
         )
 
         # Allocate output future objects
-        # Only count non-padded sequences (seq_lens > 0)
-        bs = len(model_worker_batch.seq_lens)
+        bs = len([seq_len for seq_len in model_worker_batch.seq_lens if seq_len > 0])
+
         future_next_token_ids = np.arange(
             -(self.future_token_ids_ct + 1),
             -(self.future_token_ids_ct + 1 + bs),

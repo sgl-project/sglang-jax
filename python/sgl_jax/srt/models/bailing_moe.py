@@ -1,16 +1,17 @@
 import logging
-from typing import Any, Dict, Optional, Tuple
+from typing import Any
 
+import jax
 from flax import nnx
-from jax import jax
 from jax import numpy as jnp
 from transformers import PretrainedConfig
 
 from sgl_jax.srt.configs.model_config import ModelConfig
 from sgl_jax.srt.layers.embeddings import Embed, ParallelLMHead, RotaryEmbedding
+from sgl_jax.srt.layers.layernorm import RMSNorm
 from sgl_jax.srt.layers.linear import LinearBase
 from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
-from sgl_jax.srt.layers.moe import EPMoE, TopK
+from sgl_jax.srt.layers.moe import EPMoE, GateLogit, TopK
 from sgl_jax.srt.layers.radix_attention import RadixAttention
 from sgl_jax.srt.mem_cache.memory_pool import KVCache
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
@@ -29,8 +30,8 @@ class BailingMoEAttention(nnx.Module):
         num_kv_heads: int,
         max_position_embeddings: int,
         rope_theta: float = 10000,
-        rope_scaling: Optional[Dict[str, Any]] = None,
-        head_dim: Optional[int] = None,
+        rope_scaling: dict[str, Any] | None = None,
+        head_dim: int | None = None,
         rms_norm_eps: float = None,
         use_qk_norm: bool = True,
         rotary_dim: int = 0,
@@ -53,14 +54,14 @@ class BailingMoEAttention(nnx.Module):
         self.use_qk_norm = use_qk_norm
 
         if use_qk_norm:
-            self.q_norm = nnx.RMSNorm(
+            self.q_norm = RMSNorm(
                 self.head_dim,
                 epsilon=rms_norm_eps,
                 param_dtype=dtype,
                 scale_init=nnx.with_partitioning(init_fn, (None,)),
                 rngs=rngs,
             )
-            self.k_norm = nnx.RMSNorm(
+            self.k_norm = RMSNorm(
                 self.head_dim,
                 epsilon=rms_norm_eps,
                 param_dtype=dtype,
@@ -195,41 +196,6 @@ class BailingMoEMLP(nnx.Module):
         return output
 
 
-class BailingMoEGate(nnx.Module):
-    def __init__(
-        self,
-        input_size: int,
-        weight_dtype: jnp.dtype = jnp.float32,
-        enable_expert_bias: bool = False,
-        num_experts: int = 0,
-        score_func: str = "",
-        rngs: nnx.Rngs = None,
-    ):
-        self.weight_dtype = weight_dtype
-        self.enable_expert_bias = enable_expert_bias
-        self.score_func = score_func
-
-        self.kernel = nnx.Param(
-            nnx.with_partitioning(nnx.initializers.normal(), (None, None))(
-                rngs.params(), (input_size, num_experts), self.weight_dtype
-            )
-        )
-        if enable_expert_bias:
-            self.bias = nnx.Param(
-                nnx.with_partitioning(nnx.initializers.zeros_init(), (None,))(
-                    rngs.params(), (num_experts,), self.weight_dtype
-                )
-            )
-        else:
-            self.bias = None
-
-    def __call__(
-        self, hidden_states: jax.Array
-    ) -> Tuple[jax.Array, Optional[jax.Array]]:
-        logits = jnp.dot(hidden_states.astype(self.weight_dtype), self.kernel.value)
-        return logits
-
-
 class BailingMoEDecoderLayer(nnx.Module):
     def __init__(
         self,
@@ -244,14 +210,14 @@ class BailingMoEDecoderLayer(nnx.Module):
         rope_theta = getattr(config, "rope_theta", 1000000)
         rope_scaling = getattr(config, "rope_scaling", None)
         max_position_embeddings = getattr(config, "max_position_embeddings", 40960)
-        head_dim = getattr(config, "head_dim", None)
+        self.head_dim = getattr(config, "head_dim", None)
         use_qk_norm = getattr(config, "use_qk_norm", False)
         if hasattr(config, "partial_rotary_factor"):
-            rotary_dim = int(head_dim * config.partial_rotary_factor)
+            rotary_dim = int(self.head_dim * config.partial_rotary_factor)
         elif hasattr(config, "rotary_dim"):
             rotary_dim = config.rotary_dim
         else:
-            rotary_dim = head_dim
+            rotary_dim = self.head_dim
 
         self.self_attn = BailingMoEAttention(
             hidden_size=config.hidden_size,
@@ -260,7 +226,7 @@ class BailingMoEDecoderLayer(nnx.Module):
             max_position_embeddings=max_position_embeddings,
             rope_theta=rope_theta,
             rope_scaling=rope_scaling,
-            head_dim=head_dim,
+            head_dim=self.head_dim,
             rms_norm_eps=config.rms_norm_eps,
             use_qk_norm=use_qk_norm,
             rotary_dim=rotary_dim,
@@ -284,9 +250,7 @@ class BailingMoEDecoderLayer(nnx.Module):
             self.moe_gate = None
         else:
             num_shared_experts = getattr(config, "num_shared_experts", 0)
-            expert_parallel_size = mesh.shape.get("data", 1) * mesh.shape.get(
-                "tensor", 1
-            )
+            expert_parallel_size = mesh.shape.get("data", 1) * mesh.shape.get("tensor", 1)
             router_dtype = getattr(config, "router_dtype", None)
             if router_dtype is None:
                 router_dtype = None
@@ -294,15 +258,12 @@ class BailingMoEDecoderLayer(nnx.Module):
                 router_dtype = jnp.float32
             else:
                 router_dtype = jnp.bfloat16
-            self.moe_gate = BailingMoEGate(
+            self.moe_gate = GateLogit(
                 input_size=config.hidden_size,
                 num_experts=config.num_experts,
-                enable_expert_bias=getattr(
-                    config, "moe_router_enable_expert_bias", False
-                ),
+                enable_expert_bias=getattr(config, "moe_router_enable_expert_bias", False),
                 weight_dtype=router_dtype,
                 score_func=getattr(config, "score_function", "sigmoid"),
-                rngs=rngs,
             )
             self.topk = TopK(
                 topk=config.num_experts_per_tok,
@@ -321,7 +282,6 @@ class BailingMoEDecoderLayer(nnx.Module):
                 weight_dtype=dtype,
                 dtype=dtype,
                 layer_id=layer_id,
-                rngs=rngs,
             )
             if num_shared_experts > 0:
                 self.shared_experts = BailingMoEMLP(
@@ -340,14 +300,14 @@ class BailingMoEDecoderLayer(nnx.Module):
                 self.shared_experts = None
             self.is_moe_layer = True
 
-        self.input_layernorm = nnx.RMSNorm(
+        self.input_layernorm = RMSNorm(
             config.hidden_size,
             epsilon=config.rms_norm_eps,
             param_dtype=dtype,
             scale_init=nnx.with_partitioning(init_fn, (None,)),
             rngs=rngs,
         )
-        self.post_attention_layernorm = nnx.RMSNorm(
+        self.post_attention_layernorm = RMSNorm(
             config.hidden_size,
             epsilon=config.rms_norm_eps,
             param_dtype=dtype,
@@ -361,8 +321,8 @@ class BailingMoEDecoderLayer(nnx.Module):
         hidden_states: jax.Array,
         forward_batch: ForwardBatch,
         token_to_kv_pool: KVCache,
-        residual: Optional[jax.Array] = None,
-    ) -> Tuple[jax.Array, jax.Array]:
+        residual: jax.Array | None = None,
+    ) -> tuple[jax.Array, jax.Array]:
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
@@ -377,7 +337,6 @@ class BailingMoEDecoderLayer(nnx.Module):
             forward_batch=forward_batch,
             token_to_kv_pool=token_to_kv_pool,
         )
-
         hidden_states += residual
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
@@ -388,11 +347,10 @@ class BailingMoEDecoderLayer(nnx.Module):
             else:
                 shared_output = None
             router_logits = self.moe_gate(hidden_states)
-            correction_bias = (
-                self.moe_gate.bias.value if self.moe_gate.bias is not None else None
-            )
-            topk_ids, topk_weights = self.topk(router_logits, correction_bias)
-            hidden_states = self.mlp(hidden_states, topk_ids, topk_weights)
+
+            correction_bias = self.moe_gate.bias.value if self.moe_gate.bias is not None else None
+            topk_weights, topk_ids = self.topk(router_logits, correction_bias)
+            hidden_states = self.mlp(hidden_states, topk_weights, topk_ids)
             if shared_output is not None:
                 hidden_states = hidden_states + shared_output
         else:
@@ -421,18 +379,20 @@ class BailingMoEModel(nnx.Module):
             param_dtype=dtype,
         )
 
-        self.layers = [
-            BailingMoEDecoderLayer(
-                config=config,
-                layer_id=i,
-                dtype=dtype,
-                rngs=rngs,
-                mesh=mesh,
-            )
-            for i in range(config.num_hidden_layers)
-        ]
+        self.layers = nnx.data(
+            [
+                BailingMoEDecoderLayer(
+                    config=config,
+                    layer_id=i,
+                    dtype=dtype,
+                    rngs=rngs,
+                    mesh=mesh,
+                )
+                for i in range(config.num_hidden_layers)
+            ]
+        )
 
-        self.norm = nnx.RMSNorm(
+        self.norm = RMSNorm(
             config.hidden_size,
             epsilon=config.rms_norm_eps,
             param_dtype=dtype,
@@ -460,38 +420,31 @@ class BailingMoEModel(nnx.Module):
 
         if residual is not None:
             hidden_states += residual
-            hidden_states = self.norm(hidden_states)
-        else:
-            hidden_states = self.norm(hidden_states)
 
+        hidden_states = self.norm(hidden_states)
         return hidden_states, layers_kv_fused
 
 
 class BailingMoEForCausalLM(nnx.Module):
     def __init__(
         self,
-        config: ModelConfig,
+        config: PretrainedConfig,
+        dtype: jnp.dtype = jnp.bfloat16,
         rngs: nnx.Rngs = None,
         mesh: jax.sharding.Mesh = None,
     ):
         self.mesh = mesh
         self.config = config
-        self.dtype = config.dtype
-        self.model = BailingMoEModel(
-            config.hf_config, dtype=self.dtype, rngs=rngs, mesh=mesh
-        )
-        self.lm_head = ParallelLMHead(
-            config.hf_config.vocab_size, config.hidden_size, rngs=rngs
-        )
-        self.logits_processor = LogitsProcessor(
-            config.hf_config.vocab_size, self.lm_head, self.mesh
-        )
+        self.dtype = dtype
+        self.model = BailingMoEModel(config, dtype=self.dtype, rngs=rngs, mesh=mesh)
+        self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size, rngs=rngs)
+        self.logits_processor = LogitsProcessor(config.vocab_size, self.mesh)
 
-    def load_weights(self, rng_key: jax.Array):
+    def load_weights(self, model_config: ModelConfig, rng_key: jax.Array):
         self.rng = nnx.Rngs(rng_key)
         loader = WeightLoader(
             model=self,
-            model_config=self.config,
+            model_config=model_config,
             mesh=self.mesh,
             dtype=self.dtype,
         )
@@ -511,13 +464,13 @@ class BailingMoEForCausalLM(nnx.Module):
             ),
         }
 
-        if not getattr(self.config.hf_config, "tie_word_embeddings", True):
+        if not getattr(self.config, "tie_word_embeddings", True):
             mappings["lm_head.weight"] = WeightMapping(
                 target_path="lm_head.embedding", sharding=(None, None), transpose=False
             )
 
-        num_layers = self.config.hf_config.num_hidden_layers
-        first_k_dense_replace = self.config.hf_config.first_k_dense_replace
+        num_layers = self.config.num_hidden_layers
+        first_k_dense_replace = self.config.first_k_dense_replace
 
         for layer_idx in range(num_layers):
             layer_mappings = self._create_moe_layer_mappings(
@@ -560,7 +513,7 @@ class BailingMoEForCausalLM(nnx.Module):
             ),
         }
 
-        if getattr(self.config.hf_config, "use_qk_norm", True):
+        if getattr(self.config, "use_qk_norm", True):
             mappings[f"{prefix}.attention.query_layernorm.weight"] = WeightMapping(
                 target_path=f"{target_prefix}.self_attn.q_norm.scale",
                 sharding=(None,),
@@ -597,14 +550,14 @@ class BailingMoEForCausalLM(nnx.Module):
                 sharding=(None, None),
                 transpose=True,
             )
-            if getattr(self.config.hf_config, "moe_router_enable_expert_bias", False):
+            if getattr(self.config, "moe_router_enable_expert_bias", False):
                 mappings[f"{prefix}.mlp.gate.expert_bias"] = WeightMapping(
                     target_path=f"{target_prefix}.moe_gate.bias",
                     sharding=(None,),
                     transpose=False,
                 )
 
-            if getattr(self.config.hf_config, "num_shared_experts", 0) > 0:
+            if getattr(self.config, "num_shared_experts", 0) > 0:
                 shared_experts_mappings = {
                     f"{prefix}.mlp.shared_experts.gate_proj.weight": WeightMapping(
                         target_path=f"{target_prefix}.shared_experts.gate_proj.weight",
@@ -624,7 +577,7 @@ class BailingMoEForCausalLM(nnx.Module):
                 }
                 mappings.update(shared_experts_mappings)
 
-            num_experts = getattr(self.config.hf_config, "num_experts", 256)
+            num_experts = getattr(self.config, "num_experts", 256)
             for expert_type in ["gate_proj", "up_proj", "down_proj"]:
                 target_name = {
                     "gate_proj": "wi_0",
@@ -632,8 +585,7 @@ class BailingMoEForCausalLM(nnx.Module):
                     "down_proj": "wo",
                 }[expert_type]
                 expert_keys = [
-                    f"{prefix}.mlp.experts.{i}.{expert_type}.weight"
-                    for i in range(num_experts)
+                    f"{prefix}.mlp.experts.{i}.{expert_type}.weight" for i in range(num_experts)
                 ]
 
                 mappings[f"__MOE_EXPERTS__{prefix}.mlp.{target_name}"] = WeightMapping(
@@ -651,7 +603,7 @@ class BailingMoEForCausalLM(nnx.Module):
         logits_metadata: LogitsMetadata,
     ):
         hidden_states, layers_kv_fused = self.model(forward_batch, token_to_kv_pool)
-        output = self.logits_processor(hidden_states, logits_metadata)
+        output = self.logits_processor(hidden_states, self.lm_head, logits_metadata)
         return output, layers_kv_fused, True
 
 
