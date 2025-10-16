@@ -777,9 +777,7 @@ class TestModelLoaderEdgeCases(unittest.TestCase):
         LoadConfig(load_format=LoadFormat.JAX)
 
         with self.assertRaises(Exception):
-            ModelConfig(
-                model_path="/nonexistent/path", trust_remote_code=True
-            )
+            ModelConfig(model_path="/nonexistent/path", trust_remote_code=True)
 
     def test_empty_directory(self):
         """Test handling of empty model directory."""
@@ -788,7 +786,8 @@ class TestModelLoaderEdgeCases(unittest.TestCase):
         # This should fail when trying to create ModelConfig
         with self.assertRaises(Exception):
             ModelConfig(
-                model_path=self.temp_dir, trust_remote_code=True  # Empty directory
+                model_path=self.temp_dir,
+                trust_remote_code=True,  # Empty directory
             )
 
 
