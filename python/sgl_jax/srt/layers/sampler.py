@@ -8,6 +8,7 @@ from jax import lax
 from jax import numpy as jnp
 from jax import random
 
+from sgl_jax.srt.layers.binary_search import topk_mask, topp_mask
 from sgl_jax.srt.layers.logits_processor import LogitsProcessorOutput
 from sgl_jax.srt.sampling.sampling_batch_info import SamplingMetadata
 from sgl_jax.srt.utils.jax_utils import is_tpu_runtime
@@ -46,19 +47,22 @@ class Sampler(nnx.Module):
 
         probs = jax.nn.softmax(processed_logits, axis=-1)
 
-        batch_next_token_ids = top_k_top_p_min_p_sampling_from_probs_jax(
+        args = (
+            logits,
             probs,
             sampling_metadata.top_ks,
             sampling_metadata.top_ps,
             sampling_metadata.min_ps,
             positions,
+            sampling_metadata.temperatures,
             sampling_metadata.sampling_seeds,
             sampling_metadata.need_min_p_sampling,
             rng,
         )
+        batch_next_token_ids = top_k_top_p_min_p_sampling_from_probs_jax(args)
 
-        logprobs = jnp.log(probs).clip(min=jnp.finfo(probs.dtype).min)
-        return batch_next_token_ids, logprobs
+        log_probs = jnp.log(probs).clip(min=jnp.finfo(probs.dtype).min)
+        return batch_next_token_ids, log_probs
 
     def _process_logprob_results(self, operands):
         """Process logprob results when return_logprob=True"""
@@ -233,37 +237,12 @@ def get_token_ids_logprobs(logprobs: jax.Array, token_ids_logprobs: List[List[in
 
     return output_token_ids_logprobs_val, output_token_ids_logprobs_idx
 
-
-def top_k_top_p_min_p_sampling_from_probs_jax(
-    probs: jax.Array,
-    top_ks: jax.Array,
-    top_ps: jax.Array,
-    min_ps: jax.Array,
-    positions: jax.Array,
-    sampling_seeds: jax.Array = None,
-    need_min_p_sampling: bool = False,
-    rng: nnx.Rngs = None,
-):
-    """A top-k, top-p and min-p sampling implementation with native jax operations."""
-    probs_sort, probs_idx = _sample_part_a(
-        probs, top_ks, top_ps, min_ps, need_min_p_sampling
-    )
-
-    multinomial_operands = (probs_sort, sampling_seeds, positions, rng)
-    sampled_index = lax.cond(
-        sampling_seeds is not None,
-        multinomial_with_seed,
-        multinomial,
-        multinomial_operands,
-    )
-
-    return _sample_part_b(probs_idx, sampled_index)
-
-
 def multinomial(
     operands,
 ) -> jax.Array:
     inputs, _, _, rng = operands
+    if is_tpu_runtime():
+        return random.categorical(rng, inputs).reshape(-1, 1)
     return random.categorical(rng, jnp.log(inputs)).reshape(-1, 1)
 
 
@@ -291,7 +270,8 @@ def multinomial_with_seed(
         A array of shape (n,) where the i-th element is an index sampled
         from the distribution in `inputs[i]` using `seed[i]`.
     """
-    inputs, seed, positions, _ = operands
+    logits, seed, positions, _ = operands
+    inputs = jax.nn.softmax(logits, axis=-1)
     if seed is None:
         # note: this codes is used to keep compatible with lax.cond
         return multinomial(operands)
@@ -307,15 +287,6 @@ def multinomial_with_seed(
     perturbed_log_probs = log_probs + gumbel_noise
     return jnp.argmax(perturbed_log_probs, axis=1, keepdims=True)
 
-
-def _apply_min_p_filter(operands):
-    """Apply min_p filtering when need_min_p_sampling=True"""
-    probs_sort, min_ps = operands
-    min_p_thresholds = probs_sort[:, 0] * min_ps
-    min_p_mask = probs_sort < min_p_thresholds.reshape(-1, 1)
-    return jnp.where(min_p_mask, 0.0, probs_sort)
-
-
 def _get_sorted_indices_np(probs_np: np.ndarray) -> np.ndarray:
     """
     CPU-side NumPy sorting index that is robust to NaNs/Infs.
@@ -325,52 +296,6 @@ def _get_sorted_indices_np(probs_np: np.ndarray) -> np.ndarray:
     scores_np = np.nan_to_num(probs_np, nan=-np.inf, posinf=np.inf, neginf=-np.inf)
     # 2) argsort ascending then flip for descending
     return np.argsort(scores_np, axis=-1)[:, ::-1].astype(np.int32)
-
-
-def _sample_part_a(probs, top_ks, top_ps, min_ps, need_min_p_sampling: bool):
-    # Branch by backend: TPU can use native jnp.argsort/jnp.sort; others offload indices to CPU
-    if is_tpu_runtime():
-        probs_sort = jnp.sort(probs, axis=-1)[
-            :, ::-1
-        ]  # Sort and reverse for descending order
-        probs_idx = jnp.argsort(probs, axis=-1)[:, ::-1]
-    else:
-        # 1) Use jax.pure_callback to compute robust descending indices on CPU
-        out_spec = jnp.empty(probs.shape, dtype=jnp.int32)
-        probs_idx = jax.pure_callback(
-            _get_sorted_indices_np,
-            out_spec,
-            probs,
-            vmap_method="legacy_vectorized",
-        )
-        # 2) Gather with sanitized probabilities (map NaNs/Infs to 0)
-        sanitized_probs = jnp.nan_to_num(probs, nan=0.0, posinf=0.0, neginf=0.0)
-        assert probs_idx.shape == sanitized_probs.shape and probs_idx.dtype == jnp.int32
-        probs_sort = jnp.take_along_axis(sanitized_probs, probs_idx, axis=-1)
-
-    probs_sum = jnp.cumsum(probs_sort, axis=-1)
-
-    top_k_mask = jnp.arange(0, probs.shape[-1]).reshape(1, -1) >= top_ks.reshape(-1, 1)
-    probs_sort = jnp.where(top_k_mask, 0.0, probs_sort)
-
-    top_p_mask = (probs_sum - probs_sort) > top_ps.reshape(-1, 1)
-    probs_sort = jnp.where(top_p_mask, 0.0, probs_sort)
-
-    # Use lax.cond to avoid recompilation due to need_min_p_sampling changes
-    min_p_operands = (probs_sort, min_ps)
-    probs_sort = lax.cond(
-        need_min_p_sampling,
-        _apply_min_p_filter,
-        lambda operands: operands[0],  # No min_p filtering, just return probs_sort
-        min_p_operands,
-    )
-
-    return probs_sort, probs_idx
-
-
-def _sample_part_b(probs_idx, sampled_index):
-    probs_idx = probs_idx.astype(jnp.int32)
-    return jnp.take_along_axis(probs_idx, axis=1, indices=sampled_index).flatten()
 
 
 def top_p_normalize_probs_jax(
@@ -391,3 +316,93 @@ def top_p_normalize_probs_jax(
     num_tokens, _ = probs.shape
     row_idx = jnp.arange(num_tokens)[:, None]  # [B, 1], broadcast over H
     return jnp.zeros_like(probs).at[row_idx, probs_idx].set(probs_sort)
+
+
+def _apply_min_p_filter(operands):
+    """Apply min_p filtering when need_min_p_sampling=True"""
+    inputs, min_ps= operands
+    if is_tpu_runtime():
+        max_per_bs = jnp.max(inputs, axis=1)
+        min_p_thresholds = max_per_bs * min_ps
+    else:
+        min_p_thresholds = inputs[:, 0] * min_ps
+    min_p_mask = inputs < min_p_thresholds.reshape(-1, 1)
+    return jnp.where(min_p_mask, 0.0, inputs)
+
+
+def top_k_top_p_min_p_sampling_from_probs_jax(args):
+    if is_tpu_runtime():
+        return top_k_top_p_min_p_sampling_from_probs_jax_tpu_runtime(args)
+    return top_k_top_p_min_p_sampling_from_probs_jax_not_tpu_runtime(args)
+
+def top_k_top_p_min_p_sampling_from_probs_jax_tpu_runtime(args):
+    logits,_,top_ks,top_ps,min_ps,positions,temperatures,sampling_seeds,need_min_p_sampling, rng = args 
+    logits = logits.astype(jnp.float32)
+    logits = topk_mask(logits, top_ks, replace_val=-1e12)
+    logits = topp_mask(logits, top_ps, replace_val=-1e12)
+
+    temperatures = temperatures.astype(logits.dtype)
+    logits = jnp.divide(logits, temperatures)
+
+    min_p_operands = (logits, min_ps)
+    logits = lax.cond(
+        need_min_p_sampling,
+        _apply_min_p_filter,
+        lambda operands: operands[0],
+        min_p_operands,
+    )
+
+    multinomial_operands = (logits, sampling_seeds, positions, rng)
+    sampled_index = lax.cond(
+        sampling_seeds is not None,
+        multinomial_with_seed,
+        multinomial,
+        multinomial_operands,
+    )
+
+    return sampled_index.flatten()
+
+def top_k_top_p_min_p_sampling_from_probs_jax_not_tpu_runtime(args):
+    _,probs,top_ks,top_ps,min_ps,positions,temperatures,sampling_seeds,need_min_p_sampling, rng = args 
+    # 1) Use jax.pure_callback to compute robust descending indices on CPU
+    out_spec = jnp.empty(probs.shape, dtype=jnp.int32)
+    probs_idx = jax.pure_callback(
+        _get_sorted_indices_np,
+        out_spec,
+        probs,
+        vmap_method="legacy_vectorized",
+    )
+    # 2) Gather with sanitized probabilities (map NaNs/Infs to 0)
+    sanitized_probs = jnp.nan_to_num(probs, nan=0.0, posinf=0.0, neginf=0.0)
+    assert probs_idx.shape == sanitized_probs.shape and probs_idx.dtype == jnp.int32
+    probs_sort = jnp.take_along_axis(sanitized_probs, probs_idx, axis=-1)
+    probs_sum = jnp.cumsum(probs_sort, axis=-1)
+
+    top_k_mask = jnp.arange(0, probs.shape[-1]).reshape(1, -1) >= top_ks.reshape(-1, 1)
+    probs_sort = jnp.where(top_k_mask, 0.0, probs_sort)
+
+    top_p_mask = (probs_sum - probs_sort) > top_ps.reshape(-1, 1)
+    probs_sort = jnp.where(top_p_mask, 0.0, probs_sort)
+
+    # Use lax.cond to avoid recompilation due to need_min_p_sampling changes
+    min_p_operands = (probs_sort, min_ps, False)
+    probs_sort = lax.cond(
+        need_min_p_sampling,
+        _apply_min_p_filter,
+        lambda operands: operands[0],  # No min_p filtering, just return probs_sort
+        min_p_operands,
+    )
+
+    multinomial_operands = (probs_sort, sampling_seeds, positions, rng)
+    sampled_index = lax.cond(
+        sampling_seeds is not None,
+        multinomial_with_seed,
+        multinomial,
+        multinomial_operands,
+    )
+
+    probs_idx = probs_idx.astype(jnp.int32)
+    return jnp.take_along_axis(probs_idx, axis=1, indices=sampled_index).flatten()
+
+    
+     
