@@ -71,25 +71,27 @@ class LinearBase(nnx.Module):
         Materializes and shards the model's parameters in-place.
         This method contains the full logic and is designed to be JIT-compiled.
         """
-        # Create the real parameter values on a single device first
-        real_weight_val = nnx.initializers.normal()(
-            rngs.params(), (self.input_size, self.output_size), self.params_dtype
-        )
+        rng_key = rngs.params()
 
-        # Apply sharding constraints within the mesh context
+        # Create sharded parameters directly inside mesh without inner jit/pjit
         with mesh:
+            # Weight
             weight_pspec = P(*self.kernel_axes) if self.kernel_axes else P()
+            real_weight_val = nnx.initializers.normal()(
+                rng_key, (self.input_size, self.output_size), self.params_dtype
+            )
             sharded_weight = jax.lax.with_sharding_constraint(
                 real_weight_val, NamedSharding(mesh, weight_pspec)
             )
             updates = {"weight": sharded_weight}
 
+            # Bias (if enabled)
             if self.use_bias:
-                real_bias_val = nnx.initializers.zeros_init()(
-                    rngs.params(), (self.output_size,), self.params_dtype
-                )
                 bias_axes = (self.kernel_axes[-1],) if self.kernel_axes else ()
                 bias_pspec = P(*bias_axes) if bias_axes else P()
+                real_bias_val = nnx.initializers.zeros_init()(
+                    rng_key, (self.output_size,), self.params_dtype
+                )
                 sharded_bias = jax.lax.with_sharding_constraint(
                     real_bias_val, NamedSharding(mesh, bias_pspec)
                 )
