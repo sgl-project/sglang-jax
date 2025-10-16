@@ -61,7 +61,7 @@ class GateLogit(nnx.Module):
 
         self.kernel = nnx.Param(
             nnx.with_partitioning(nnx.initializers.normal(), self.kernel_axes)(
-                rngs.params(), kernel_shape, self.weight_dtype
+                jax.random.PRNGKey(0), kernel_shape, self.weight_dtype
             )
         )
 
@@ -72,7 +72,7 @@ class GateLogit(nnx.Module):
             )
             self.bias = nnx.Param(
                 nnx.with_partitioning(nnx.initializers.zeros_init(), bias_axes)(
-                    rngs.params(), bias_shape, self.weight_dtype
+                    jax.random.PRNGKey(0), bias_shape, self.weight_dtype
                 )
             )
         else:
@@ -133,7 +133,7 @@ class EPMoE(nnx.Module):
 
         self.wi_0 = nnx.Param(
             nnx.with_partitioning(nnx.initializers.normal(), expert_kernel_axes)(
-                rngs.params(),
+                jax.random.PRNGKey(0),
                 (self.experts_per_device, config.hidden_size, intermediate_dim),
                 weight_dtype,
             )
@@ -141,7 +141,7 @@ class EPMoE(nnx.Module):
 
         self.wi_1 = nnx.Param(
             nnx.with_partitioning(nnx.initializers.normal(), expert_kernel_axes)(
-                rngs.params(),
+                jax.random.PRNGKey(0),
                 (self.experts_per_device, config.hidden_size, intermediate_dim),
                 weight_dtype,
             )
@@ -149,7 +149,7 @@ class EPMoE(nnx.Module):
 
         self.wo = nnx.Param(
             nnx.with_partitioning(nnx.initializers.normal(), expert_kernel_axes)(
-                rngs.params(),
+                jax.random.PRNGKey(0),
                 (self.experts_per_device, intermediate_dim, config.hidden_size),
                 weight_dtype,
             )
