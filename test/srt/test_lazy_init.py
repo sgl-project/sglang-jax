@@ -194,6 +194,32 @@ def run_lazy_demo(mesh: Mesh):
     print(f"Final Sharding Status: {lazy_model.weight.value.sharding}")
 
 
+def run_only_lazy_init(mesh: Mesh):
+    rngs = nnx.Rngs(3)
+    print("--- Lazy Init Only (no materialize) ---")
+    print_all_devices_memory("Before LazyOnly (current)")
+    mem_before = print_memory_usage("Before LazyOnly (peak)")
+
+    def create_lazy_only(r: nnx.Rngs):
+        # Create the model lazily; do NOT call materialize
+        return LinearBase(
+            input_size=GIGANTIC_SIZE,
+            output_size=GIGANTIC_SIZE,
+            use_bias=False,
+            params_dtype=jnp.bfloat16,
+            kernel_axes=("data", "model"),
+            rngs=r,
+        )
+
+    start = time.perf_counter()
+    _ = create_lazy_only(rngs)
+    secs = time.perf_counter() - start
+    print(f"create_lazy_only (jit) time: {secs * 1000:.2f} ms")
+    print_all_devices_memory("After create_lazy_only (current)")
+    mem_after = print_memory_usage("After create_lazy_only (peak)")
+    print(f"Memory increased by: {(mem_after - mem_before) / 1e6:.2f} MB")
+
+
 if __name__ == "__main__":
     # Run unittests by default. To run interactive demos, use: --eager or --lazy
     import argparse
@@ -202,9 +228,12 @@ if __name__ == "__main__":
     group = parser.add_mutually_exclusive_group()
     group.add_argument("--eager", action="store_true", help="Run eager init demo")
     group.add_argument("--lazy", action="store_true", help="Run lazy init demo")
+    group.add_argument(
+        "--lazy-only", action="store_true", help="Run lazy init only (no materialize)"
+    )
     args = parser.parse_args()
 
-    if args.eager or args.lazy:
+    if args.eager or args.lazy or args.lazy_only:
         devices = jax.devices()
         if len(devices) < 4:
             raise ValueError("This example requires at least 4 devices for a 2x2 mesh.")
@@ -213,7 +242,9 @@ if __name__ == "__main__":
 
         if args.eager:
             run_eager_demo(mesh)
-        else:
+        elif args.lazy:
             run_lazy_demo(mesh)
+        else:
+            run_only_lazy_init(mesh)
     else:
         unittest.main(argv=[sys.argv[0]])
