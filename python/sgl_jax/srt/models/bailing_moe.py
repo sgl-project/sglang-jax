@@ -10,10 +10,11 @@ from sgl_jax.srt.configs.model_config import ModelConfig
 from sgl_jax.srt.layers.embeddings import Embed, ParallelLMHead, RotaryEmbedding
 from sgl_jax.srt.layers.linear import LinearBase
 from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
-from sgl_jax.srt.layers.moe import EPMoE, TopK
+from sgl_jax.srt.layers.moe import EPMoE, GateLogit, TopK
 from sgl_jax.srt.layers.radix_attention import RadixAttention
 from sgl_jax.srt.mem_cache.memory_pool import KVCache
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
+from sgl_jax.srt.precision_tracer import precision_tracer
 from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
 
 logger = logging.getLogger(__name__)
@@ -195,41 +196,6 @@ class BailingMoEMLP(nnx.Module):
         return output
 
 
-class BailingMoEGate(nnx.Module):
-    def __init__(
-        self,
-        input_size: int,
-        weight_dtype: jnp.dtype = jnp.float32,
-        enable_expert_bias: bool = False,
-        num_experts: int = 0,
-        score_func: str = "",
-        rngs: nnx.Rngs = None,
-    ):
-        self.weight_dtype = weight_dtype
-        self.enable_expert_bias = enable_expert_bias
-        self.score_func = score_func
-
-        self.kernel = nnx.Param(
-            nnx.with_partitioning(nnx.initializers.normal(), (None, None))(
-                rngs.params(), (input_size, num_experts), self.weight_dtype
-            )
-        )
-        if enable_expert_bias:
-            self.bias = nnx.Param(
-                nnx.with_partitioning(nnx.initializers.zeros_init(), (None,))(
-                    rngs.params(), (num_experts,), self.weight_dtype
-                )
-            )
-        else:
-            self.bias = None
-
-    def __call__(
-        self, hidden_states: jax.Array
-    ) -> Tuple[jax.Array, Optional[jax.Array]]:
-        logits = jnp.dot(hidden_states.astype(self.weight_dtype), self.kernel.value)
-        return logits
-
-
 class BailingMoEDecoderLayer(nnx.Module):
     def __init__(
         self,
@@ -294,7 +260,7 @@ class BailingMoEDecoderLayer(nnx.Module):
                 router_dtype = jnp.float32
             else:
                 router_dtype = jnp.bfloat16
-            self.moe_gate = BailingMoEGate(
+            self.moe_gate = GateLogit(
                 input_size=config.hidden_size,
                 num_experts=config.num_experts,
                 enable_expert_bias=getattr(
@@ -363,6 +329,7 @@ class BailingMoEDecoderLayer(nnx.Module):
         token_to_kv_pool: KVCache,
         residual: Optional[jax.Array] = None,
     ) -> Tuple[jax.Array, jax.Array]:
+        layer_callback_flag = []
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
@@ -371,12 +338,21 @@ class BailingMoEDecoderLayer(nnx.Module):
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
 
+        layer_norm_callback_flag = precision_tracer.jit_pure_callback_record(
+            hidden_states, "input_layernorm_output", "INPUT_LAYERNORM", self.layer_id
+        )
+        layer_callback_flag.append(layer_norm_callback_flag)
+
         hidden_states, kv_fused = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
             forward_batch=forward_batch,
             token_to_kv_pool=token_to_kv_pool,
         )
+        attn_callback_flag = precision_tracer.jit_pure_callback_record(
+            hidden_states, "self_attn_output", "SELF_ATTN", self.layer_id
+        )
+        layer_callback_flag.append(attn_callback_flag)
 
         hidden_states += residual
         residual = hidden_states
@@ -391,14 +367,19 @@ class BailingMoEDecoderLayer(nnx.Module):
             correction_bias = (
                 self.moe_gate.bias.value if self.moe_gate.bias is not None else None
             )
-            topk_ids, topk_weights = self.topk(router_logits, correction_bias)
-            hidden_states = self.mlp(hidden_states, topk_ids, topk_weights)
+            topk_weights, topk_ids = self.topk(router_logits, correction_bias)
+            hidden_states = self.mlp(hidden_states, topk_weights, topk_ids)
             if shared_output is not None:
                 hidden_states = hidden_states + shared_output
         else:
             hidden_states = self.mlp(hidden_states)
 
-        return hidden_states, residual, kv_fused
+        mlp_callback_flag = precision_tracer.jit_pure_callback_record(
+            hidden_states, "mlp_output", "MLP", self.layer_id
+        )
+        layer_callback_flag.append(mlp_callback_flag)
+
+        return hidden_states, residual, kv_fused, layer_callback_flag
 
 
 class BailingMoEModel(nnx.Module):
@@ -421,16 +402,18 @@ class BailingMoEModel(nnx.Module):
             param_dtype=dtype,
         )
 
-        self.layers = [
-            BailingMoEDecoderLayer(
-                config=config,
-                layer_id=i,
-                dtype=dtype,
-                rngs=rngs,
-                mesh=mesh,
-            )
-            for i in range(config.num_hidden_layers)
-        ]
+        self.layers = nnx.data(
+            [
+                BailingMoEDecoderLayer(
+                    config=config,
+                    layer_id=i,
+                    dtype=dtype,
+                    rngs=rngs,
+                    mesh=mesh,
+                )
+                for i in range(config.num_hidden_layers)
+            ]
+        )
 
         self.norm = nnx.RMSNorm(
             config.hidden_size,
@@ -448,8 +431,9 @@ class BailingMoEModel(nnx.Module):
         hidden_states = self.embed_tokens(forward_batch.input_ids)
         residual = None
         layers_kv_fused = []
+        layers_callback_flag = []
         for layer in self.layers:
-            hidden_states, residual, kv_fused = layer(
+            hidden_states, residual, kv_fused, callback_flag = layer(
                 forward_batch.positions,
                 hidden_states,
                 forward_batch,
@@ -457,14 +441,18 @@ class BailingMoEModel(nnx.Module):
                 residual,
             )
             layers_kv_fused.append(kv_fused)
+            layers_callback_flag.extend(callback_flag)
 
         if residual is not None:
             hidden_states += residual
-            hidden_states = self.norm(hidden_states)
-        else:
-            hidden_states = self.norm(hidden_states)
 
-        return hidden_states, layers_kv_fused
+        hidden_states = self.norm(hidden_states)
+
+        callback_flag = precision_tracer.jit_pure_callback_record(
+            hidden_states, "transformer_output", "TRANSFORMER"
+        )
+        layers_callback_flag.append(callback_flag)
+        return hidden_states, layers_kv_fused, layers_callback_flag
 
 
 class BailingMoEForCausalLM(nnx.Module):
@@ -650,9 +638,11 @@ class BailingMoEForCausalLM(nnx.Module):
         token_to_kv_pool: KVCache,
         logits_metadata: LogitsMetadata,
     ):
-        hidden_states, layers_kv_fused = self.model(forward_batch, token_to_kv_pool)
+        hidden_states, layers_kv_fused, layers_callback_flag = self.model(
+            forward_batch, token_to_kv_pool
+        )
         output = self.logits_processor(hidden_states, logits_metadata)
-        return output, layers_kv_fused, True
+        return output, layers_kv_fused, layers_callback_flag
 
 
 class BailingMoeForCausalLM(BailingMoEForCausalLM):

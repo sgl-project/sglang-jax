@@ -63,7 +63,6 @@ class FlashAttentionMetadata:
         return obj
 
 
-@register_pytree_node_class
 @dataclass
 class FlashAttention(AttentionBackend):
     """Native Attention layer for variable-length sequences using ForwardBatch."""

@@ -311,11 +311,11 @@ def print_diff_header(content_hash: str, trace1: Dict, trace2: Dict):
     print(f"\n{Colors.BOLD}{Colors.CYAN}Content Hash: {content_hash}{Colors.RESET}")
     print(
         f"{Colors.BOLD}Request 1:{Colors.RESET} ID={trace1.get('request_id', 'N/A')}, "
-        f"Duration={trace1.get('duration', 'N/A'):.3f}s"
+        f"Duration={trace1.get('duration', 'N/A')}s"
     )
     print(
         f"{Colors.BOLD}Request 2:{Colors.RESET} ID={trace2.get('request_id', 'N/A')}, "
-        f"Duration={trace2.get('duration', 'N/A'):.3f}s"
+        f"Duration={trace2.get('duration', 'N/A')}s"
     )
     print("=" * 80)
 
