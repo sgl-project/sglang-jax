@@ -9,6 +9,7 @@ from transformers import PretrainedConfig
 
 from sgl_jax.srt.configs.model_config import ModelConfig
 from sgl_jax.srt.layers.embeddings import Embed, ParallelLMHead, RotaryEmbedding
+from sgl_jax.srt.layers.layernorm import RMSNorm
 from sgl_jax.srt.layers.linear import LinearBase
 from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
 from sgl_jax.srt.layers.radix_attention import RadixAttention
@@ -170,7 +171,7 @@ class QWenBlock(nnx.Module):
     ):
         self.layer_id = layer_id
 
-        self.ln_1 = nnx.RMSNorm(
+        self.ln_1 = RMSNorm(
             config.hidden_size,
             epsilon=config.layer_norm_epsilon,
             param_dtype=dtype,
@@ -191,7 +192,7 @@ class QWenBlock(nnx.Module):
             rngs=rngs,
         )
 
-        self.ln_2 = nnx.RMSNorm(
+        self.ln_2 = RMSNorm(
             config.hidden_size,
             epsilon=config.layer_norm_epsilon,
             param_dtype=dtype,
@@ -261,7 +262,7 @@ class QWenModel(nnx.Module):
             for i in range(config.num_hidden_layers)
         ]
 
-        self.ln_f = nnx.RMSNorm(
+        self.ln_f = RMSNorm(
             config.hidden_size,
             epsilon=config.layer_norm_epsilon,
             param_dtype=dtype,

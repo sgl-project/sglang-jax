@@ -9,6 +9,7 @@ from transformers import PretrainedConfig
 
 from sgl_jax.srt.configs.model_config import ModelConfig
 from sgl_jax.srt.layers.embeddings import Embed, ParallelLMHead, RotaryEmbedding
+from sgl_jax.srt.layers.layernorm import RMSNorm
 from sgl_jax.srt.layers.linear import LinearBase
 from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
 from sgl_jax.srt.layers.radix_attention import RadixAttention
@@ -200,14 +201,14 @@ class Qwen2DecoderLayer(nnx.Module):
             dtype=dtype,
             rngs=rngs,
         )
-        self.input_layernorm = nnx.RMSNorm(
+        self.input_layernorm = RMSNorm(
             config.hidden_size,
             epsilon=config.rms_norm_eps,
             param_dtype=dtype,
             scale_init=nnx.with_partitioning(init_fn, (None,)),
             rngs=rngs,
         )
-        self.post_attention_layernorm = nnx.RMSNorm(
+        self.post_attention_layernorm = RMSNorm(
             config.hidden_size,
             epsilon=config.rms_norm_eps,
             param_dtype=dtype,
@@ -273,7 +274,7 @@ class Qwen2Model(nnx.Module):
             for i in range(config.num_hidden_layers)
         ]
 
-        self.norm = nnx.RMSNorm(
+        self.norm = RMSNorm(
             config.hidden_size,
             epsilon=config.rms_norm_eps,
             param_dtype=dtype,

@@ -1,19 +1,24 @@
 import dataclasses
 import logging
 import os
+import time
 from abc import ABC, abstractmethod
+from functools import partial
 from typing import Any, List, Optional, Tuple
 
+import flax.linen as nn
 import huggingface_hub
 import jax
 import jax.numpy as jnp
 import numpy as np
 from flax import nnx
+from jax.sharding import NamedSharding
 
 from sgl_jax.srt.configs.load_config import LoadConfig, LoadFormat
 from sgl_jax.srt.configs.model_config import ModelConfig
 from sgl_jax.srt.model_loader.arch import get_model_architecture
 from sgl_jax.srt.utils.common_utils import get_bool_env_var
+from sgl_jax.srt.utils.jax_utils import print_memory
 
 logger = logging.getLogger(__name__)
 
@@ -92,24 +97,13 @@ class JAXModelLoader(BaseModelLoader):
         return model_class
 
     def _get_model(self, model_class: Any, model_config: ModelConfig) -> nnx.Module:
-        @nnx.jit
-        def create_model(rng: nnx.Rngs):
-            model = model_class(
-                model_config.hf_config, model_config.dtype, rng, self.mesh
+        model = nnx.eval_shape(
+            lambda: model_class(
+                model_config.hf_config, model_config.dtype, self.rng, self.mesh
             )
-            state = nnx.state(model)
-            pspecs = nnx.get_partition_spec(state)
-            sharded_state = jax.lax.with_sharding_constraint(state, pspecs)
-            nnx.update(model, sharded_state)
-            return model
+        )
 
-        with self.mesh:
-            model = create_model(self.rng)
-
-        rng_key = self.rng.default.key.value
-        # FIXME: Better interface not to pass in model_config again
-        model.load_weights(model_config, rng_key)
-
+        model.load_weights(model_config, self.rng.default.key.value)
         return model
 
     def _maybe_download_from_modelscope(

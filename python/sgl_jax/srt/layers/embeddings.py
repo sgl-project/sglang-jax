@@ -19,6 +19,7 @@ from typing import Any, Dict, Optional, Tuple, Union
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from flax import nnx
 from flax.nnx.nn import dtypes
 from flax.nnx.nn.linear import default_embed_init
@@ -63,7 +64,7 @@ class Embed(nnx.Module):
         """
         self.embedding = nnx.Param(
             nnx.with_partitioning(default_embed_init, (None, None))(
-                rngs.params(), (num_embeddings, features), param_dtype
+                jax.random.PRNGKey(0), (num_embeddings, features), param_dtype
             )
         )
 
@@ -156,7 +157,9 @@ class ParallelLMHead(Embed):
         if use_bias:
             self.bias = nnx.Param(
                 nnx.with_partitioning(nnx.initializers.constant(0.0), (None, "tensor"))(
-                    rngs.params(), (self.num_embeddings, self.features), param_dtype
+                    jax.random.PRNGKey(0),
+                    (self.num_embeddings, self.features),
+                    param_dtype,
                 )
             )
         else:
@@ -172,16 +175,8 @@ class ParallelLMHead(Embed):
         raise RuntimeError("LMHead's weights should be used in the sampler.")
 
 
-class RotaryEmbedding(nnx.Module):
-    """Rotary Position Embedding.
-
-    Attributes:
-      min_timescale: Start of the geometric index. Determines the periodicity of
-        the added signal.
-      max_timescale: End of the geometric index. Determines the frequency of the
-        added signal.
-      embedding_dims: Dimension of the embedding to be generated.
-    """
+class RotaryEmbedding:
+    """Rotary Position Embedding (safe to initialize inside JIT if needed)."""
 
     def __init__(
         self,
@@ -192,7 +187,6 @@ class RotaryEmbedding(nnx.Module):
         is_neox_style: bool,
         dtype: jnp.dtype,
     ):
-        super().__init__()
         self.head_size = head_size
         self.rotary_dim = rotary_dim
         self.max_position_embeddings = max_position_embeddings
@@ -200,7 +194,10 @@ class RotaryEmbedding(nnx.Module):
         self.is_neox_style = is_neox_style
         self.dtype = dtype
 
-        self.cos_sin_cache = self._compute_cos_sin_cache().astype(dtype=dtype)
+        inv_freq_np = 1.0 / (
+            base ** (np.arange(0, rotary_dim, 2, dtype=np.float32) / rotary_dim)
+        )
+        self._inv_freq_np = inv_freq_np  # shape: (rotary_dim // 2,)
 
     def __call__(
         self,
@@ -208,29 +205,32 @@ class RotaryEmbedding(nnx.Module):
         query: jax.Array,
         key: jax.Array,
     ) -> Tuple[jax.Array, jax.Array]:
-        """Generates a jax.Array of sinusoids with different frequencies.
+        positions = positions.flatten()  # [num_tokens]
 
-        Args:
-          query, key: The input sequence on which to apply the Rotary position
-            embedding. Since rotary position embeddings are applied to query and
-            keys after projection, it is assumed of shape [B*S, H].
-          position: Optional position jax.Array which denotes the position of each
-            token in the sequence. This only needs to be supplied when the sequence
-            is packed. It is of shape [B, S].
+        inv_freq = jnp.asarray(self._inv_freq_np, dtype=self.dtype)
 
-        Returns:
-          a Tuple of jax.Array of shape [B*S, H] which includes the inputs together with
-          the rotary position embedding incorporated in it.
-        """
-        return rotary_embedding_forward(
-            positions,
-            query,
-            key,
-            self.cos_sin_cache,
-            self.rotary_dim,
-            self.head_size,
-            self.is_neox_style,
-        )
+        # Compute freqs = positions * inv_freq
+        freqs = jnp.einsum("n,d->nd", positions.astype(jnp.float32), inv_freq)
+
+        cos = jnp.cos(freqs).astype(self.dtype)
+        sin = jnp.sin(freqs).astype(self.dtype)
+
+        query_shape = query.shape
+        num_tokens = positions.shape[0]
+        query = query.reshape(num_tokens, -1, self.head_size)
+        query_rot = query[..., : self.rotary_dim]
+        query_pass = query[..., self.rotary_dim :]
+        query_rot = _apply_rotary_emb(query_rot, cos, sin, self.is_neox_style)
+        query = jnp.concatenate((query_rot, query_pass), axis=-1).reshape(query_shape)
+
+        key_shape = key.shape
+        key = key.reshape(num_tokens, -1, self.head_size)
+        key_rot = key[..., : self.rotary_dim]
+        key_pass = key[..., self.rotary_dim :]
+        key_rot = _apply_rotary_emb(key_rot, cos, sin, self.is_neox_style)
+        key = jnp.concatenate((key_rot, key_pass), axis=-1).reshape(key_shape)
+
+        return query, key
 
     def _compute_inv_freq(self, base: Union[int, float]) -> jax.Array:
         """Compute the inverse frequency."""

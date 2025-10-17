@@ -43,14 +43,14 @@ class LinearBase(nnx.Module):
         self.skip_bias_add = skip_bias_add
         self.weight = nnx.Param(
             nnx.with_partitioning(nnx.initializers.normal(), kernel_axes)(
-                rngs.params(), (input_size, output_size), params_dtype
+                jax.random.PRNGKey(0), (input_size, output_size), params_dtype
             )
         )
         if use_bias:
             self.bias = nnx.Param(
                 nnx.with_partitioning(
                     nnx.initializers.zeros_init(), (kernel_axes[-1],)
-                )(rngs.params(), (output_size,), params_dtype)
+                )(jax.random.PRNGKey(0), (output_size,), params_dtype)
             )
         else:
             self.bias = None
