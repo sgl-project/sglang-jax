@@ -812,6 +812,9 @@ def launch_server(
     tokenizer_manager, template_manager, scheduler_info = (
         _launch_subprocesses_or_threads(server_args=server_args, port_args=None)
     )
+    ## don't expose scheduler in server mode
+    if "scheduler" in scheduler_info:
+        del scheduler_info["scheduler"]
     set_global_state(
         _GlobalState(
             tokenizer_manager=tokenizer_manager,
