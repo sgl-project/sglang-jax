@@ -91,10 +91,10 @@ select = [
     "G",
 ]
 ignore = [
+    # line too long handled by Black
+    "E501",
     # star imports
     "F405", "F403",
-    # line too long
-    "E501",
     # lambda expression assignment
     "E731",
     # zip without `strict=`
