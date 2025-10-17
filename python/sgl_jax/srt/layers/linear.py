@@ -3,6 +3,10 @@ from typing import Any, Callable, Iterable, Optional, Sequence, Tuple, Union
 import jax
 from flax import nnx
 from jax import numpy as jnp
+from jax.sharding import Mesh, NamedSharding
+from jax.sharding import PartitionSpec as P
+
+from ..utils.weight_utils import lazy_init
 
 
 def _canonicalize_tuple(x):
@@ -41,19 +45,60 @@ class LinearBase(nnx.Module):
     ):
         """Initialize parameters and quantization method."""
         self.skip_bias_add = skip_bias_add
+        self.kernel_axes = kernel_axes
+        self.input_size = input_size
+        self.output_size = output_size
+        self.params_dtype = params_dtype
+        self.use_bias = use_bias
+
         self.weight = nnx.Param(
-            nnx.with_partitioning(nnx.initializers.normal(), kernel_axes)(
-                rngs.params(), (input_size, output_size), params_dtype
+            nnx.with_partitioning(lazy_init, self.kernel_axes)(
+                rngs.params(), (self.input_size, self.output_size), self.params_dtype
             )
         )
-        if use_bias:
+        if self.use_bias:
+            bias_axes = (self.kernel_axes[-1],) if self.kernel_axes else ()
             self.bias = nnx.Param(
-                nnx.with_partitioning(
-                    nnx.initializers.zeros_init(), (kernel_axes[-1],)
-                )(rngs.params(), (output_size,), params_dtype)
+                nnx.with_partitioning(lazy_init, bias_axes)(
+                    rngs.params(), (self.output_size,), self.params_dtype
+                )
             )
         else:
             self.bias = None
+
+    def materialize(self, mesh: Mesh, rngs: nnx.Rngs):
+        """
+        Materializes and shards the model's parameters in-place.
+        This method contains the full logic and is designed to be JIT-compiled.
+        """
+        rng_key = rngs.params()
+
+        # Create sharded parameters directly inside mesh without inner jit/pjit
+        with mesh:
+            # Weight
+            weight_pspec = P(*self.kernel_axes) if self.kernel_axes else P()
+            real_weight_val = nnx.initializers.normal()(
+                rng_key, (self.input_size, self.output_size), self.params_dtype
+            )
+            sharded_weight = jax.lax.with_sharding_constraint(
+                real_weight_val, NamedSharding(mesh, weight_pspec)
+            )
+            updates = {"weight": sharded_weight}
+
+            # Bias (if enabled)
+            if self.use_bias:
+                bias_axes = (self.kernel_axes[-1],) if self.kernel_axes else ()
+                bias_pspec = P(*bias_axes) if bias_axes else P()
+                real_bias_val = nnx.initializers.zeros_init()(
+                    rng_key, (self.output_size,), self.params_dtype
+                )
+                sharded_bias = jax.lax.with_sharding_constraint(
+                    real_bias_val, NamedSharding(mesh, bias_pspec)
+                )
+                updates["bias"] = sharded_bias
+
+        # Update the model's state with the new sharded parameters
+        nnx.update(self, updates)
 
     def __call__(self, x: jax.Array) -> Tuple[jax.Array, Optional[jax.Array]]:
         """Forward pass of the linear layer."""

@@ -94,17 +94,15 @@ class JAXModelLoader(BaseModelLoader):
     def _get_model(self, model_class: Any, model_config: ModelConfig) -> nnx.Module:
         @nnx.jit
         def create_model(rng: nnx.Rngs):
-            model = model_class(
-                model_config.hf_config, model_config.dtype, rng, self.mesh
-            )
-            state = nnx.state(model)
-            pspecs = nnx.get_partition_spec(state)
-            sharded_state = jax.lax.with_sharding_constraint(state, pspecs)
-            nnx.update(model, sharded_state)
+            with self.mesh:
+                model = model_class(model_config, self.rng, self.mesh)
+                # Materialize lazily initialized parameters before any further compilation/JIT steps
+                if hasattr(model, "materialize"):
+                    model.materialize(self.mesh, self.rng)
             return model
 
-        with self.mesh:
-            model = create_model(self.rng)
+        # Instantiate model outside of JIT to avoid passing ShapeDtypeStruct through JIT
+        model = create_model(self.rng)
 
         rng_key = self.rng.default.key.value
         # FIXME: Better interface not to pass in model_config again
