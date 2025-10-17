@@ -523,7 +523,9 @@ def print_tree_differences(differences: list[str]):
                         )
                         if total_items > shown_items:
                             print(
-                                f"      {Colors.YELLOW}... and {total_items - shown_items} more{Colors.RESET}"
+                                "      "
+                                f"{Colors.YELLOW}... and {total_items - shown_items} more"
+                                f"{Colors.RESET}"
                             )
 
     # Print root-level differences
@@ -628,7 +630,8 @@ def compare_trace_files(
             traces = groups1[content_hash]
             trace = traces[0]
             print(
-                f"  {Colors.YELLOW}-{Colors.RESET} {content_hash} (Request ID: {trace.get('request_id', 'N/A')})"
+                f"  {Colors.YELLOW}-{Colors.RESET} {content_hash} "
+                f"(Request ID: {trace.get('request_id', 'N/A')})"
             )
 
     if only_in_2:
@@ -637,7 +640,8 @@ def compare_trace_files(
             traces = groups2[content_hash]
             trace = traces[0]
             print(
-                f"  {Colors.YELLOW}+{Colors.RESET} {content_hash} (Request ID: {trace.get('request_id', 'N/A')})"
+                f"  {Colors.YELLOW}+{Colors.RESET} {content_hash} "
+                f"(Request ID: {trace.get('request_id', 'N/A')})"
             )
 
     # Summary
