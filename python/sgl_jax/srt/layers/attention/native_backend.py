@@ -5,7 +5,7 @@ from jax.tree_util import register_pytree_node_class
 from sgl_jax.srt.layers.attention.base_attn_backend import AttentionBackend
 from sgl_jax.srt.layers.radix_attention import AttentionType, RadixAttention
 from sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch
-from sgl_jax.srt.mem_cache.memory_pool import KVCache, merge_kv
+from sgl_jax.srt.mem_cache.memory_pool import KVCache
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sgl_jax.srt.utils.jax_utils import is_tpu_runtime
 
@@ -33,9 +33,7 @@ class NativeAttention(AttentionBackend):
 
     @classmethod
     def tree_unflatten(cls, aux_data, children):
-        return cls(
-            num_attn_heads=aux_data["num_heads"], num_kv_heads=aux_data["num_kv_heads"]
-        )
+        return cls(num_attn_heads=aux_data["num_heads"], num_kv_heads=aux_data["num_kv_heads"])
 
     def get_forward_metadata(self, batch: ModelWorkerBatch):
         """Init the metadata for a forward pass and return it."""
@@ -62,9 +60,7 @@ class NativeAttention(AttentionBackend):
             k, v, forward_batch, token_to_kv_pool, layer.layer_id
         )
 
-        scale = (
-            1.0 / jnp.sqrt(layer.head_dim) if layer.scaling is None else layer.scaling
-        )
+        scale = 1.0 / jnp.sqrt(layer.head_dim) if layer.scaling is None else layer.scaling
 
         is_causal = not (
             forward_batch.forward_mode == ForwardMode.DECODE
@@ -181,9 +177,7 @@ def forward_attention(
     else:
         # Already in multi-head format: [num_tokens, num_heads, head_dim]
         num_tokens, num_heads_input, head_dim = q.shape
-        assert (
-            num_heads_input == num_heads
-        ), f"Expected {num_heads} heads, got {num_heads_input}"
+        assert num_heads_input == num_heads, f"Expected {num_heads} heads, got {num_heads_input}"
         hidden_size = num_heads * head_dim  # Calculate hidden_size for proper reshaping
         q_heads = q
 
