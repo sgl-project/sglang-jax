@@ -332,15 +332,17 @@ class LlamaModel(nnx.Module):
             param_dtype=dtype,
         )
 
-        self.layers = [
-            LlamaDecoderLayer(
-                config=config,
-                layer_id=i,
-                dtype=dtype,
-                rngs=rngs,
-            )
-            for i in range(config.num_hidden_layers)
-        ]
+        self.layers = nnx.data(
+            [
+                LlamaDecoderLayer(
+                    config=config,
+                    layer_id=i,
+                    dtype=dtype,
+                    rngs=rngs,
+                )
+                for i in range(config.num_hidden_layers)
+            ]
+        )
 
         self.norm = RMSNorm(
             config.hidden_size,

@@ -286,16 +286,18 @@ class QWen3MoeModel(nnx.Module):
             param_dtype=dtype,
         )
 
-        self.layers = [
-            QWen3MoeDecoderLayer(
-                config=config,
-                layer_id=i,
-                dtype=dtype,
-                rngs=rngs,
-                mesh=mesh,
-            )
-            for i in range(config.num_hidden_layers)
-        ]
+        self.layers = nnx.data(
+            [
+                QWen3MoeDecoderLayer(
+                    config=config,
+                    layer_id=i,
+                    dtype=dtype,
+                    rngs=rngs,
+                    mesh=mesh,
+                )
+                for i in range(config.num_hidden_layers)
+            ]
+        )
 
         self.norm = RMSNorm(
             config.hidden_size,
