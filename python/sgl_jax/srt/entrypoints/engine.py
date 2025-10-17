@@ -49,7 +49,6 @@ from sgl_jax.srt.utils import (
     get_zmq_socket,
     kill_process_tree,
     launch_dummy_health_check_server,
-    pathways_available,
     prepare_model_and_tokenizer,
     set_ulimit,
 )
@@ -248,7 +247,7 @@ class Engine(EngineBase):
     def shutdown(self):
         """Shutdown the engine"""
         kill_process_tree(os.getpid(), include_parent=False)
-        if pathways_available():
+        if self.server_args.enable_single_process:
             self.send_to_rpc.close()
 
     def __enter__(self):
@@ -410,7 +409,7 @@ class Engine(EngineBase):
         return SamplingParams()
 
 
-def _set_envs_and_config():
+def _set_envs_and_config(server_args):
     # Set ulimit
     set_ulimit()
 
@@ -434,7 +433,7 @@ def _set_envs_and_config():
         kill_process_tree(os.getpid())
 
     signal.signal(signal.SIGQUIT, sigquit_handler)
-    if not pathways_available():
+    if not server_args.enable_single_process:
         # Set mp start method
         mp.set_start_method("spawn", force=True)
     else:
@@ -450,7 +449,7 @@ def _launch_subprocesses(
     # Configure global environment
     configure_logger(server_args)
     server_args.check_server_args()
-    _set_envs_and_config()
+    _set_envs_and_config(server_args)
 
     # Allocate ports for inter-process communications
     if port_args is None:
@@ -553,7 +552,7 @@ def _launch_threads(
     # Configure global environment
     configure_logger(server_args)
     server_args.check_server_args()
-    _set_envs_and_config()
+    _set_envs_and_config(server_args)
 
     # Allocate ports for inter-process communications
     if port_args is None:
@@ -632,7 +631,7 @@ def _launch_threads(
 def _launch_subprocesses_or_threads(
     server_args, port_args: Optional[PortArgs] = None
 ) -> Tuple[TokenizerManager, TemplateManager, Dict]:
-    if pathways_available():
+    if server_args.enable_single_process:
         return _launch_threads(server_args, port_args)
     else:
         return _launch_subprocesses(server_args, port_args)

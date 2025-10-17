@@ -78,10 +78,6 @@ class FlashAttention(AttentionBackend):
         kv_partition_axis: str = "tensor",
         mesh: jax.sharding.Mesh = None,
     ):
-        import flax
-
-        flax.config
-        # Static configuration (not included in PyTree)
         self.vmem_limit_bytes = vmem_limit_bytes
         self.num_heads = num_attn_heads
         if num_kv_heads is not None:
