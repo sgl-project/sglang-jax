@@ -51,9 +51,7 @@ class TestModelLoader(unittest.TestCase):
         self.temp_dir = tempfile.mkdtemp()
 
         # Load config
-        self.load_config = LoadConfig(
-            load_format=LoadFormat.JAX, download_dir=self.temp_dir
-        )
+        self.load_config = LoadConfig(load_format=LoadFormat.JAX, download_dir=self.temp_dir)
 
     def test_jax_model_loader_init(self):
         """Test JAXModelLoader initialization."""
@@ -90,13 +88,9 @@ class TestModelLoader(unittest.TestCase):
         print(f"  Device details: {[str(d) for d in devices[:8]]}")
 
         # Verify we have simulated multiple devices
-        if "--xla_force_host_platform_device_count=8" in os.environ.get(
-            "XLA_FLAGS", ""
-        ):
+        if "--xla_force_host_platform_device_count=8" in os.environ.get("XLA_FLAGS", ""):
             print("PASS: Multi-device simulation properly configured")
-            self.assertGreaterEqual(
-                len(devices), 2, "Should have at least 2 simulated devices"
-            )
+            self.assertGreaterEqual(len(devices), 2, "Should have at least 2 simulated devices")
         else:
             print("WARNING:  Multi-device simulation not configured")
 
@@ -116,9 +110,7 @@ class TestModelLoader(unittest.TestCase):
 
         # Verify all devices are CPU (as expected in test environment)
         for device in devices:
-            self.assertEqual(
-                device.platform, "cpu", f"Expected CPU device, got {device.platform}"
-            )
+            self.assertEqual(device.platform, "cpu", f"Expected CPU device, got {device.platform}")
 
         print("PASS: Multi-device environment validation completed!")
 
@@ -233,9 +225,7 @@ class TestModelLoaderWithRealModel(unittest.TestCase):
             # Single device fallback
             self.mesh = Mesh(devices, ("tensor",))
             print(f" Using single-device mesh: {self.mesh}")
-        print(
-            f"[MESH CHECK] mesh shape: {self.mesh.shape}, mesh devices: {self.mesh.devices}"
-        )
+        print(f"[MESH CHECK] mesh shape: {self.mesh.shape}, mesh devices: {self.mesh.devices}")
 
         # Initialize RNG
         self.rng = nnx.Rngs(42)
@@ -274,9 +264,7 @@ class TestModelLoaderWithRealModel(unittest.TestCase):
             )
 
             # Create QWen model instance
-            model = QWenLMHeadModel(
-                model_config, model_config.dtype, self.rng, self.mesh
-            )
+            model = QWenLMHeadModel(model_config, model_config.dtype, self.rng, self.mesh)
 
             self.assertIsInstance(model, QWenLMHeadModel)
             self.assertEqual(model.config, model_config)
@@ -295,9 +283,7 @@ class TestModelLoaderWithRealModel(unittest.TestCase):
             if file.endswith(".safetensors"):
                 safetensor_files.append(file)
 
-        self.assertGreater(
-            len(safetensor_files), 0, "No safetensor files found in model directory"
-        )
+        self.assertGreater(len(safetensor_files), 0, "No safetensor files found in model directory")
 
         print(f"PASS: Found {len(safetensor_files)} safetensor files:")
         for f in safetensor_files[:5]:  # Show first 5 files
@@ -311,9 +297,7 @@ class TestModelLoaderWithRealModel(unittest.TestCase):
             )
 
             # Create QWen model instance
-            model = QWenLMHeadModel(
-                model_config, model_config.dtype, self.rng, self.mesh
-            )
+            model = QWenLMHeadModel(model_config, model_config.dtype, self.rng, self.mesh)
 
             # Print the actual parameter structure of the model
             try:
@@ -372,9 +356,7 @@ class TestModelLoaderWithRealModel(unittest.TestCase):
                     print(f"  {current_prefix}: {value.value.shape}")
                 elif isinstance(value, dict):
                     print(f"  {current_prefix}/ (dict)")
-                    self._print_param_structure(
-                        value, current_prefix, max_depth, current_depth + 1
-                    )
+                    self._print_param_structure(value, current_prefix, max_depth, current_depth + 1)
                 else:
                     print(f"  {current_prefix}: {type(value)}")
 
@@ -392,9 +374,7 @@ class TestModelLoaderWithRealModel(unittest.TestCase):
             print(f"  Attention heads: {model_config.num_attention_heads}")
 
             # Create QWen model instance
-            model = QWenLMHeadModel(
-                model_config, model_config.dtype, self.rng, self.mesh
-            )
+            model = QWenLMHeadModel(model_config, model_config.dtype, self.rng, self.mesh)
 
             # Check what attributes the model actually has
             print(" Model Attributes:")
@@ -450,9 +430,7 @@ class TestModelLoaderWithRealModel(unittest.TestCase):
                     else:
                         if hasattr(v, "sharding"):
                             print(f"[SHARDING] {prefix}: sharding={v.sharding}")
-                            for i, shard in enumerate(
-                                getattr(v, "addressable_shards", [])
-                            ):
+                            for i, shard in enumerate(getattr(v, "addressable_shards", [])):
                                 print(
                                     f"    [SHARD] idx={i}, device={shard.device}, index={getattr(shard, 'index', None)}, shape={getattr(shard.data, 'shape', None)}"
                                 )
@@ -493,9 +471,7 @@ class TestModelLoaderWithRealModel(unittest.TestCase):
             )
 
             # Create QWen model instance
-            model = QWenLMHeadModel(
-                model_config, model_config.dtype, self.rng, self.mesh
-            )
+            model = QWenLMHeadModel(model_config, model_config.dtype, self.rng, self.mesh)
 
             print(" Validating Model Parameter Structure:")
             print(f"  Model type: {type(model).__name__}")
@@ -543,9 +519,7 @@ class TestModelLoaderWithRealModel(unittest.TestCase):
 
             traceback.print_exc()
 
-    def _print_param_structure_detailed(
-        self, params, prefix="", max_depth=3, current_depth=0
-    ):
+    def _print_param_structure_detailed(self, params, prefix="", max_depth=3, current_depth=0):
         """Helper function to print detailed parameter structure."""
         if current_depth >= max_depth:
             return
@@ -555,14 +529,10 @@ class TestModelLoaderWithRealModel(unittest.TestCase):
                 current_prefix = f"{prefix}.{key}" if prefix else key
                 if hasattr(value, "value") and hasattr(value.value, "shape"):
                     # This is a parameter with shape
-                    print(
-                        f"  {current_prefix}: {value.value.shape} ({type(value).__name__})"
-                    )
+                    print(f"  {current_prefix}: {value.value.shape} ({type(value).__name__})")
                 elif isinstance(value, dict):
                     print(f"  {current_prefix}/ (dict with {len(value)} keys)")
-                    if (
-                        current_depth < max_depth - 1
-                    ):  # Only recurse if not at max depth
+                    if current_depth < max_depth - 1:  # Only recurse if not at max depth
                         self._print_param_structure_detailed(
                             value, current_prefix, max_depth, current_depth + 1
                         )
@@ -572,9 +542,7 @@ class TestModelLoaderWithRealModel(unittest.TestCase):
                     for i, item in enumerate(value[:3]):  # Show first 3 items
                         item_prefix = f"{current_prefix}.{i}"
                         if hasattr(item, "value") and hasattr(item.value, "shape"):
-                            print(
-                                f"    {item_prefix}: {item.value.shape} ({type(item).__name__})"
-                            )
+                            print(f"    {item_prefix}: {item.value.shape} ({type(item).__name__})")
                         elif isinstance(item, dict):
                             print(f"    {item_prefix}/ (dict)")
                             if current_depth < max_depth - 1:
@@ -603,9 +571,7 @@ class TestModelLoaderWithRealModel(unittest.TestCase):
                 model_path=self.model_path, trust_remote_code=True, dtype="bfloat16"
             )
 
-            print(
-                f"🔄 Testing multi-device tensor parallelism with {len(devices[:4])} devices..."
-            )
+            print(f"🔄 Testing multi-device tensor parallelism with {len(devices[:4])} devices...")
 
             # Create loader with multi-device mesh
             loader = get_model_loader(self.load_config, self.rng, self.mesh)
@@ -613,9 +579,7 @@ class TestModelLoaderWithRealModel(unittest.TestCase):
             # Load model
             model = loader.load_model(model_config=model_config)
 
-            print(
-                f"PASS: Model loaded successfully on {len(self.mesh.devices)} devices"
-            )
+            print(f"PASS: Model loaded successfully on {len(self.mesh.devices)} devices")
 
             # Check if weights are properly sharded
             state = nnx.state(model)
@@ -643,17 +607,13 @@ class TestModelLoaderWithRealModel(unittest.TestCase):
                         )
 
                         # Verify sharding is actually distributed
-                        unique_devices = set(
-                            shard.device for shard in weight.addressable_shards
-                        )
+                        unique_devices = set(shard.device for shard in weight.addressable_shards)
                         if len(unique_devices) > 1:
                             print(
                                 f"    PASS: Weight is distributed across {len(unique_devices)} devices"
                             )
                         else:
-                            print(
-                                f"    WARNING:  Weight is on single device: {unique_devices}"
-                            )
+                            print(f"    WARNING:  Weight is on single device: {unique_devices}")
 
                 except Exception as e:
                     print(f"    ERROR: Could not check {param_path}: {e}")
@@ -671,9 +631,7 @@ class TestModelLoaderWithRealModel(unittest.TestCase):
                 keyword in str(e).lower()
                 for keyword in ["weight", "tensor", "shape", "mapping", "jit"]
             ):
-                print(
-                    "PASS: Test passed: Multi-device setup reached weight loading stage"
-                )
+                print("PASS: Test passed: Multi-device setup reached weight loading stage")
             else:
                 self.fail(f"Unexpected error in multi-device test: {e}")
 
@@ -681,9 +639,7 @@ class TestModelLoaderWithRealModel(unittest.TestCase):
         """Test that computation works correctly with tensor parallelism."""
         devices = jax.devices()
         if len(devices) < 2:
-            self.skipTest(
-                "Tensor parallel computation test requires at least 2 devices"
-            )
+            self.skipTest("Tensor parallel computation test requires at least 2 devices")
 
         try:
             model_config = ModelConfig(
@@ -704,9 +660,7 @@ class TestModelLoaderWithRealModel(unittest.TestCase):
 
             # Test that we can access parameters and they're properly sharded
             state = nnx.state(model)
-            embed_param = self._get_param_by_path(
-                state, "transformer.embed_tokens.embedding"
-            )
+            embed_param = self._get_param_by_path(state, "transformer.embed_tokens.embedding")
 
             if hasattr(embed_param, "value"):
                 embed_weight = embed_param.value
@@ -716,9 +670,7 @@ class TestModelLoaderWithRealModel(unittest.TestCase):
                 # Verify we can perform operations on sharded weights
                 # Simple operation to test sharding works
                 weight_sum = jnp.sum(embed_weight, axis=0)
-                print(
-                    f"  PASS: Successfully computed sum over sharded weight: {weight_sum.shape}"
-                )
+                print(f"  PASS: Successfully computed sum over sharded weight: {weight_sum.shape}")
                 print(f"  📊 Sum result sharding: {weight_sum.sharding}")
 
             print("PASS: Tensor parallel computation test completed!")
@@ -729,10 +681,7 @@ class TestModelLoaderWithRealModel(unittest.TestCase):
 
             traceback.print_exc()
 
-            if any(
-                keyword in str(e).lower()
-                for keyword in ["weight", "tensor", "shape", "jit"]
-            ):
+            if any(keyword in str(e).lower() for keyword in ["weight", "tensor", "shape", "jit"]):
                 print("PASS: Test passed: Computation test reached expected stage")
             else:
                 self.fail(f"Unexpected error in computation test: {e}")

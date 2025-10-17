@@ -214,9 +214,7 @@ async def async_request_openai_completions(
         st = time.perf_counter()
         most_recent_timestamp = st
         try:
-            async with session.post(
-                url=api_url, json=payload, headers=headers
-            ) as response:
+            async with session.post(url=api_url, json=payload, headers=headers) as response:
                 if response.status == 200:
                     async for chunk_bytes in response.content:
                         chunk_bytes = chunk_bytes.strip()
@@ -295,9 +293,7 @@ async def async_request_truss(
         st = time.perf_counter()
         most_recent_timestamp = st
         try:
-            async with session.post(
-                url=api_url, json=payload, headers=headers
-            ) as response:
+            async with session.post(url=api_url, json=payload, headers=headers) as response:
                 if response.status == 200:
                     async for chunk_bytes in response.content:
                         chunk_bytes = chunk_bytes.strip()
@@ -382,9 +378,7 @@ async def async_request_sglang_generate(
         most_recent_timestamp = st
         last_output_len = 0
         try:
-            async with session.post(
-                url=api_url, json=payload, headers=headers
-            ) as response:
+            async with session.post(url=api_url, json=payload, headers=headers) as response:
                 if response.status == 200:
                     async for chunk_bytes in response.content:
                         chunk_bytes = chunk_bytes.strip()
@@ -487,13 +481,10 @@ def get_model(pretrained_model_name_or_path: str) -> str:
 def get_tokenizer(
     pretrained_model_name_or_path: str,
 ) -> PreTrainedTokenizer | PreTrainedTokenizerFast:
-    assert (
-        pretrained_model_name_or_path is not None
-        and pretrained_model_name_or_path != ""
-    )
-    if pretrained_model_name_or_path.endswith(
-        ".json"
-    ) or pretrained_model_name_or_path.endswith(".model"):
+    assert pretrained_model_name_or_path is not None and pretrained_model_name_or_path != ""
+    if pretrained_model_name_or_path.endswith(".json") or pretrained_model_name_or_path.endswith(
+        ".model"
+    ):
         from sglang.srt.hf_transformers_utils import get_tokenizer
 
         return get_tokenizer(pretrained_model_name_or_path)
@@ -502,9 +493,7 @@ def get_tokenizer(
         pretrained_model_name_or_path
     ):
         pretrained_model_name_or_path = get_model(pretrained_model_name_or_path)
-    return AutoTokenizer.from_pretrained(
-        pretrained_model_name_or_path, trust_remote_code=True
-    )
+    return AutoTokenizer.from_pretrained(pretrained_model_name_or_path, trust_remote_code=True)
 
 
 def get_dataset(args, tokenizer):
@@ -650,9 +639,7 @@ def is_file_valid_json(path):
             json.load(f)
         return True
     except JSONDecodeError as e:
-        print(
-            f"{path} exists but json loading fails ({e=}), thus treat as invalid file"
-        )
+        print(f"{path} exists but json loading fails ({e=}), thus treat as invalid file")
         return False
 
 
@@ -710,9 +697,7 @@ def sample_mmmu_requests(
             sample_dataset = mmmu_dataset.select(indices)
         else:
             # Take first N
-            sample_dataset = mmmu_dataset.select(
-                range(min(num_requests, len(mmmu_dataset)))
-            )
+            sample_dataset = mmmu_dataset.select(range(min(num_requests, len(mmmu_dataset))))
     else:
         print(f"Dataset has less than {num_requests} examples, using all examples")
         sample_dataset = mmmu_dataset
@@ -838,11 +823,7 @@ def sample_sharegpt_requests(
         # Tokenize the prompts and completions.
         prompt = dataset[i][0]
         if prompt_suffix:
-            prompt = (
-                remove_suffix(prompt, ASSISTANT_SUFFIX)
-                + prompt_suffix
-                + ASSISTANT_SUFFIX
-            )
+            prompt = remove_suffix(prompt, ASSISTANT_SUFFIX) + prompt_suffix + ASSISTANT_SUFFIX
 
         if apply_chat_template:
             prompt = tokenizer.apply_chat_template(
@@ -856,9 +837,7 @@ def sample_sharegpt_requests(
         completion = dataset[i][1]
         completion_token_ids = tokenizer.encode(completion)
         prompt_len = len(prompt_token_ids)
-        output_len = (
-            len(completion_token_ids) if fixed_output_len is None else fixed_output_len
-        )
+        output_len = len(completion_token_ids) if fixed_output_len is None else fixed_output_len
 
         if prompt_len < 2 or output_len < 2:
             # Prune too short sequences.
@@ -962,8 +941,7 @@ def sample_random_requests(
         input_requests = []
         for i in range(num_prompts):
             input_content = [
-                (offsets[i] + i + j) % tokenizer.vocab_size
-                for j in range(input_lens[i])
+                (offsets[i] + i + j) % tokenizer.vocab_size for j in range(input_lens[i])
             ]
             if return_text:
                 input_content = tokenizer.decode(input_content)
@@ -1039,17 +1017,13 @@ def sample_generated_shared_prefix_requests(
 
     for group_idx in tqdm(range(num_groups), desc="Generating system prompt"):
         system_prompt = system_prompts[group_idx]
-        for prompt_idx in tqdm(
-            range(prompts_per_group), desc="Generating questions", leave=False
-        ):
+        for prompt_idx in tqdm(range(prompts_per_group), desc="Generating questions", leave=False):
             question = questions[group_idx * prompts_per_group + prompt_idx]
             full_prompt = f"{system_prompt}\n\n{question}"
             prompt_len = len(tokenizer.encode(full_prompt))
 
             input_requests.append(
-                DatasetRow(
-                    prompt=full_prompt, prompt_len=prompt_len, output_len=output_len
-                )
+                DatasetRow(prompt=full_prompt, prompt_len=prompt_len, output_len=output_len)
             )
             total_input_tokens += prompt_len
             total_output_tokens += output_len
@@ -1150,8 +1124,7 @@ def calculate_metrics(
         output_throughput=sum(output_lens) / dur_s,
         output_throughput_retokenized=sum(retokenized_output_lens) / dur_s,
         total_throughput=(total_input + sum(output_lens)) / dur_s,
-        total_throughput_retokenized=(total_input + sum(retokenized_output_lens))
-        / dur_s,
+        total_throughput_retokenized=(total_input + sum(retokenized_output_lens)) / dur_s,
         mean_ttft_ms=np.mean(ttfts or 0)
         * 1000,  # ttfts is empty if streaming is not supported by backend
         median_ttft_ms=np.median(ttfts or 0) * 1000,
@@ -1215,9 +1188,7 @@ async def benchmark(
     # Use the first request for all warmup iterations
     test_request = input_requests[0]
 
-    lora_name = (
-        lora_names[0] if lora_names is not None and len(lora_names) != 0 else None
-    )
+    lora_name = lora_names[0] if lora_names is not None and len(lora_names) != 0 else None
 
     # Create the test input once
     test_input = RequestFuncInput(
@@ -1234,9 +1205,7 @@ async def benchmark(
     # Run warmup requests
     warmup_tasks = []
     for _ in range(warmup_requests):
-        warmup_tasks.append(
-            asyncio.create_task(request_func(request_func_input=test_input))
-        )
+        warmup_tasks.append(asyncio.create_task(request_func(request_func_input=test_input)))
 
     warmup_outputs = await asyncio.gather(*warmup_tasks)
 
@@ -1260,9 +1229,7 @@ async def benchmark(
     # Start profiler
     if profile:
         print("Starting profiler...")
-        profile_output = await async_request_profile(
-            api_url=base_url + "/start_profile"
-        )
+        profile_output = await async_request_profile(api_url=base_url + "/start_profile")
         if profile_output.success:
             print("Profiler started")
 
@@ -1348,38 +1315,16 @@ async def benchmark(
             "Total generated tokens (retokenized):", metrics.total_output_retokenized
         )
     )
-    print(
-        "{:<40} {:<10.2f}".format(
-            "Request throughput (req/s):", metrics.request_throughput
-        )
-    )
-    print(
-        "{:<40} {:<10.2f}".format(
-            "Input token throughput (tok/s):", metrics.input_throughput
-        )
-    )
-    print(
-        "{:<40} {:<10.2f}".format(
-            "Output token throughput (tok/s):", metrics.output_throughput
-        )
-    )
-    print(
-        "{:<40} {:<10.2f}".format(
-            "Total token throughput (tok/s):", metrics.total_throughput
-        )
-    )
+    print("{:<40} {:<10.2f}".format("Request throughput (req/s):", metrics.request_throughput))
+    print("{:<40} {:<10.2f}".format("Input token throughput (tok/s):", metrics.input_throughput))
+    print("{:<40} {:<10.2f}".format("Output token throughput (tok/s):", metrics.output_throughput))
+    print("{:<40} {:<10.2f}".format("Total token throughput (tok/s):", metrics.total_throughput))
     print("{:<40} {:<10.2f}".format("Concurrency:", metrics.concurrency))
     if accept_length:
         print("{:<40} {:<10.2f}".format("Accept length:", accept_length))
     print("{s:{c}^{n}}".format(s="End-to-End Latency", n=50, c="-"))
-    print(
-        "{:<40} {:<10.2f}".format("Mean E2E Latency (ms):", metrics.mean_e2e_latency_ms)
-    )
-    print(
-        "{:<40} {:<10.2f}".format(
-            "Median E2E Latency (ms):", metrics.median_e2e_latency_ms
-        )
-    )
+    print("{:<40} {:<10.2f}".format("Mean E2E Latency (ms):", metrics.mean_e2e_latency_ms))
+    print("{:<40} {:<10.2f}".format("Median E2E Latency (ms):", metrics.median_e2e_latency_ms))
     print("{s:{c}^{n}}".format(s="Time to First Token", n=50, c="-"))
     print("{:<40} {:<10.2f}".format("Mean TTFT (ms):", metrics.mean_ttft_ms))
     print("{:<40} {:<10.2f}".format("Median TTFT (ms):", metrics.median_ttft_ms))
@@ -1565,9 +1510,7 @@ def run_benchmark(args_: argparse.Namespace):
             if args.base_url
             else f"http://{args.host}:{args.port}/v1/models/model:predict"
         )
-    base_url = (
-        f"http://{args.host}:{args.port}" if args.base_url is None else args.base_url
-    )
+    base_url = f"http://{args.host}:{args.port}" if args.base_url is None else args.base_url
 
     # Get model name
     if args.model is None:
@@ -1582,9 +1525,7 @@ def run_benchmark(args_: argparse.Namespace):
             args.model = model_list[0]["id"] if model_list else None
         except Exception as e:
             print(f"Failed to fetch model from {model_url}. Error: {e}")
-            print(
-                "Please specify the correct host and port using `--host` and `--port`."
-            )
+            print("Please specify the correct host and port using `--host` and `--port`.")
             sys.exit(1)
 
     if args.model is None:
@@ -1664,9 +1605,7 @@ if __name__ == "__main__":
         default=None,
         help="Server or API base url if not using http host and port.",
     )
-    parser.add_argument(
-        "--host", type=str, default="0.0.0.0", help="Default host is 0.0.0.0."
-    )
+    parser.add_argument("--host", type=str, default="0.0.0.0", help="Default host is 0.0.0.0.")
     parser.add_argument(
         "--port",
         type=int,
@@ -1679,9 +1618,7 @@ if __name__ == "__main__":
         choices=["sharegpt", "random", "random-ids", "generated-shared-prefix", "mmmu"],
         help="Name of the dataset to benchmark on.",
     )
-    parser.add_argument(
-        "--dataset-path", type=str, default="", help="Path to the dataset."
-    )
+    parser.add_argument("--dataset-path", type=str, default="", help="Path to the dataset.")
     parser.add_argument(
         "--model",
         type=str,

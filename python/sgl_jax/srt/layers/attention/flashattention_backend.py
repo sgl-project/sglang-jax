@@ -136,9 +136,7 @@ class FlashAttention(AttentionBackend):
             distribution = np.array([0, 0, num_seqs.item()], dtype=np.int32)
         elif batch.forward_mode == ForwardMode.EXTEND:
             # All sequences are prefill mode
-            distribution = np.array(
-                [0, num_seqs.item(), num_seqs.item()], dtype=np.int32
-            )
+            distribution = np.array([0, num_seqs.item(), num_seqs.item()], dtype=np.int32)
         else:
             raise ValueError(f"Invalid forward mode: {batch.forward_mode}")
 
@@ -151,9 +149,7 @@ class FlashAttention(AttentionBackend):
             metadata.distribution,
         ) = device_array(
             (num_seqs, cu_q_lens, cu_kv_lens, page_indices, seq_lens, distribution),
-            sharding=(
-                NamedSharding(self.mesh, P()) if jax.process_count() == 1 else None
-            ),
+            sharding=(NamedSharding(self.mesh, P()) if jax.process_count() == 1 else None),
         )
         return metadata
 
@@ -202,28 +198,20 @@ class FlashAttention(AttentionBackend):
         Returns:
             Output tensor of shape [total_tokens, hidden_size]
         """
-        kv_cache_fused = self._get_fused_kv_cache(
-            forward_batch, token_to_kv_pool, layer.layer_id
-        )
+        kv_cache_fused = self._get_fused_kv_cache(forward_batch, token_to_kv_pool, layer.layer_id)
 
-        scale = (
-            1.0 / jnp.sqrt(layer.head_dim) if layer.scaling is None else layer.scaling
-        )
+        scale = 1.0 / jnp.sqrt(layer.head_dim) if layer.scaling is None else layer.scaling
 
         # Prepare fused KV cache for paged format: [num_pages, page_size, num_kv_heads * 2, head_dim]
         total_tokens = kv_cache_fused.shape[0]
         num_pages = total_tokens // self.page_size
-        kv_cache_fused_paged = kv_cache_fused.reshape(
-            num_pages, self.page_size, -1, self.head_dim
-        )
+        kv_cache_fused_paged = kv_cache_fused.reshape(num_pages, self.page_size, -1, self.head_dim)
 
         in_specs = (
             P(None, self.kv_partition_axis),  # queries
             P(None, self.kv_partition_axis),  # keys (new tokens)
             P(None, self.kv_partition_axis),  # values (new tokens)
-            P(
-                None, None, self.kv_partition_axis, None
-            ),  # kv_cache_fused (head interleaved)
+            P(None, None, self.kv_partition_axis, None),  # kv_cache_fused (head interleaved)
             P(),  # kv_lens
             P(),  # page_indices
             P(),  # cu_q_lens

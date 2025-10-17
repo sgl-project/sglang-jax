@@ -68,9 +68,7 @@ def check_sglang_dependencies():
     try:
         importlib.util.find_spec("sgl_jax.srt.configs.load_config.LoadFormat")
         importlib.util.find_spec("sgl_jax.srt.model_loader.loader.JAXModelLoader")
-        importlib.util.find_spec(
-            "sgl_jax.srt.models.qwen3_moe.Qwen3MoeForCausalLMJaxModel"
-        )
+        importlib.util.find_spec("sgl_jax.srt.models.qwen3_moe.Qwen3MoeForCausalLMJaxModel")
 
         print("✓ SGLang JAXModelLoader available")
         print("✓ Qwen3MoeForCausalLMJaxModel available")
@@ -165,26 +163,24 @@ def create_sample_qwen3_moe_model(output_dir):
         mock_weights = {
             "model": {
                 "embed_tokens": {
-                    "kernel": np.random.randn(
-                        config["vocab_size"], config["hidden_size"]
-                    ).astype(np.float32)
+                    "kernel": np.random.randn(config["vocab_size"], config["hidden_size"]).astype(
+                        np.float32
+                    )
                 },
                 "layers": {},
                 "norm": {"scale": np.ones(config["hidden_size"], dtype=np.float32)},
             },
             "lm_head": {
-                "kernel": np.random.randn(
-                    config["hidden_size"], config["vocab_size"]
-                ).astype(np.float32)
+                "kernel": np.random.randn(config["hidden_size"], config["vocab_size"]).astype(
+                    np.float32
+                )
             },
         }
 
         # Add layer weights with MoE structure
         for i in range(config["num_hidden_layers"]):
             layer_weights = {
-                "input_layernorm": {
-                    "scale": np.ones(config["hidden_size"], dtype=np.float32)
-                },
+                "input_layernorm": {"scale": np.ones(config["hidden_size"], dtype=np.float32)},
                 "self_attn": {
                     "q_proj": {
                         "kernel": np.random.randn(
@@ -321,26 +317,18 @@ def main():
         help="Specific test method to run (use --list-tests to see available tests)",
     )
 
-    parser.add_argument(
-        "--verbose", "-v", action="store_true", help="Verbose test output"
-    )
+    parser.add_argument("--verbose", "-v", action="store_true", help="Verbose test output")
 
-    parser.add_argument(
-        "--check-jax", action="store_true", help="Check JAX dependencies and exit"
-    )
+    parser.add_argument("--check-jax", action="store_true", help="Check JAX dependencies and exit")
 
-    parser.add_argument(
-        "--check-deps", action="store_true", help="Check all dependencies and exit"
-    )
+    parser.add_argument("--check-deps", action="store_true", help="Check all dependencies and exit")
 
     parser.add_argument(
         "--create-sample",
         help="Create a sample Qwen3 MoE JAX model directory at the specified path",
     )
 
-    parser.add_argument(
-        "--list-tests", action="store_true", help="List all available test methods"
-    )
+    parser.add_argument("--list-tests", action="store_true", help="List all available test methods")
 
     args = parser.parse_args()
 
@@ -397,9 +385,7 @@ def main():
 
     print("\nRunning Qwen3 MoE JAXModelLoader tests...")
 
-    success = run_tests(
-        test_name=args.test, model_path=args.model_path, verbose=args.verbose
-    )
+    success = run_tests(test_name=args.test, model_path=args.model_path, verbose=args.verbose)
 
     if success:
         print("\n✓ All Qwen3 MoE tests passed!")

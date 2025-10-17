@@ -409,9 +409,7 @@ class QWenLMHeadModel(nnx.Module):
         token_to_kv_pool: KVCache,
         logits_metadata: LogitsMetadata,
     ):
-        hidden_states, layers_kv_fused = self.transformer(
-            forward_batch, token_to_kv_pool
-        )
+        hidden_states, layers_kv_fused = self.transformer(forward_batch, token_to_kv_pool)
         output = self.logits_processor(hidden_states, logits_metadata)
         return output, layers_kv_fused, True
 

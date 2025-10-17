@@ -81,9 +81,7 @@ class JsonSchemaResponseFormat(BaseModel):
 class FileRequest(BaseModel):
     # https://platform.openai.com/docs/api-reference/files/create
     file: bytes  # The File object (not file name) to be uploaded
-    purpose: str = (
-        "batch"  # The intended purpose of the uploaded file, default is "batch"
-    )
+    purpose: str = "batch"  # The intended purpose of the uploaded file, default is "batch"
 
 
 class FileResponse(BaseModel):
@@ -102,9 +100,7 @@ class FileDeleteResponse(BaseModel):
 
 
 class BatchRequest(BaseModel):
-    input_file_id: (
-        str  # The ID of an uploaded file that contains requests for the new batch
-    )
+    input_file_id: str  # The ID of an uploaded file that contains requests for the new batch
     endpoint: str  # The endpoint to be used for all requests in the batch
     completion_window: str  # The time frame within which the batch should be processed
     metadata: dict | None = None  # Optional custom metadata for the batch
@@ -321,9 +317,7 @@ class ChatCompletionMessageUserParam(BaseModel):
     content: str | list[ChatCompletionMessageContentPart]
 
 
-ChatCompletionMessageParam = (
-    ChatCompletionMessageGenericParam | ChatCompletionMessageUserParam
-)
+ChatCompletionMessageParam = ChatCompletionMessageGenericParam | ChatCompletionMessageUserParam
 
 
 class ResponseFormat(BaseModel):
@@ -456,10 +450,7 @@ class ChatCompletionResponseChoice(BaseModel):
     message: ChatMessage
     logprobs: LogProbs | ChoiceLogprobs | None = None
     finish_reason: (
-        Literal[
-            "stop", "length", "tool_calls", "content_filter", "function_call", "abort"
-        ]
-        | None
+        Literal["stop", "length", "tool_calls", "content_filter", "function_call", "abort"] | None
     ) = None
     matched_stop: None | int | str = None
     hidden_states: object | None = None
@@ -501,10 +492,7 @@ class ChatCompletionResponseStreamChoice(BaseModel):
     delta: DeltaMessage
     logprobs: LogProbs | ChoiceLogprobs | None = None
     finish_reason: (
-        Literal[
-            "stop", "length", "tool_calls", "content_filter", "function_call", "abort"
-        ]
-        | None
+        Literal["stop", "length", "tool_calls", "content_filter", "function_call", "abort"] | None
     ) = None
     matched_stop: None | int | str = None
 
@@ -523,9 +511,7 @@ class MultimodalEmbeddingInput(BaseModel):
     image: str | None = None
 
 
-EmbeddingInput = (
-    list[int] | list[list[int]] | str | list[str] | list[MultimodalEmbeddingInput]
-)
+EmbeddingInput = list[int] | list[list[int]] | str | list[str] | list[MultimodalEmbeddingInput]
 
 
 class EmbeddingRequest(BaseModel):
@@ -587,11 +573,7 @@ class RerankResponse(BaseModel):
 
 
 OpenAIServingRequest = (
-    ChatCompletionRequest
-    | CompletionRequest
-    | EmbeddingRequest
-    | ScoringRequest
-    | V1RerankReqInput
+    ChatCompletionRequest | CompletionRequest | EmbeddingRequest | ScoringRequest | V1RerankReqInput
 )
 
 

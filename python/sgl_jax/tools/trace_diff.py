@@ -106,9 +106,7 @@ def compare_token_groups(
             )
 
     if len(tokens1) != len(tokens2):
-        differences.append(
-            f"  {category}: Token count mismatch: {len(tokens1)} vs {len(tokens2)}"
-        )
+        differences.append(f"  {category}: Token count mismatch: {len(tokens1)} vs {len(tokens2)}")
         all_match = False
         # Continue comparing up to the shorter length
         min_length = min(len(tokens1), len(tokens2))
@@ -268,9 +266,7 @@ def compare_token_records(
                     all_match = False
                 else:
                     # Compare token-level stats
-                    for ts_idx, (ts1, ts2) in enumerate(
-                        zip(token_stats1, token_stats2)
-                    ):
+                    for ts_idx, (ts1, ts2) in enumerate(zip(token_stats1, token_stats2)):
                         for ts_field in ["min", "max", "mean", "std", "value"]:
                             ts_val1, ts_val2 = ts1.get(ts_field), ts2.get(ts_field)
                             if ts_val1 is not None and ts_val2 is not None:
@@ -381,9 +377,7 @@ def print_tree_differences(differences: list[str]):
                 category_part = path.split("[")[0].strip()
                 rest = path.split("]", 1)[1].strip() if "]" in path else ""
                 token_part = (
-                    path.split("[")[1].split("]")[0]
-                    if "[" in path and "]" in path
-                    else "0"
+                    path.split("[")[1].split("]")[0] if "[" in path and "]" in path else "0"
                 )
 
                 if category_part not in tree:
@@ -418,9 +412,7 @@ def print_tree_differences(differences: list[str]):
         print(f"\n{Colors.BOLD}{category.upper()}:{Colors.RESET}")
 
         tokens = tree[category]
-        for token_idx in sorted(
-            tokens.keys(), key=lambda x: int(x) if x.isdigit() else 999
-        ):
+        for token_idx in sorted(tokens.keys(), key=lambda x: int(x) if x.isdigit() else 999):
             token_diffs = tokens[token_idx]
             if len(token_diffs) > 0:
                 print(f"  Token[{token_idx}]:")
@@ -527,9 +519,7 @@ def print_tree_differences(differences: list[str]):
 
                         total_items = len(mismatches) + len(matches) + len(others)
                         shown_items = (
-                            min(3, len(mismatches))
-                            + min(3, len(matches))
-                            + min(2, len(others))
+                            min(3, len(mismatches)) + min(3, len(matches)) + min(2, len(others))
                         )
                         if total_items > shown_items:
                             print(

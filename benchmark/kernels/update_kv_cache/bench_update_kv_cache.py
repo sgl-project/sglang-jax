@@ -131,11 +131,9 @@ def main():
             head_num,
             head_dim,
         )
-        max_num_slices_per_block_config = get_num_slices_per_block(
-            new_value, cache, page_size
-        )
-        random_cache_loc, slice_lens, new_value_start_loc, update_slices_num = (
-            create_input_params(max_cache_len, new_value_len, page_size=page_size)
+        max_num_slices_per_block_config = get_num_slices_per_block(new_value, cache, page_size)
+        random_cache_loc, slice_lens, new_value_start_loc, update_slices_num = create_input_params(
+            max_cache_len, new_value_len, page_size=page_size
         )
 
         print(
@@ -160,9 +158,7 @@ def main():
             if cost < min_cost:
                 min_cost = cost
                 fastest_num_slices_per_block = num_slices_per_block
-            print(
-                f"[num_slices_per_block={num_slices_per_block}] avg cost: {cost * 1000} ms"
-            )
+            print(f"[num_slices_per_block={num_slices_per_block}] avg cost: {cost * 1000} ms")
 
         print(
             f"Fastest [num_slices_per_block={fastest_num_slices_per_block}] costs: {min_cost * 1000} ms"

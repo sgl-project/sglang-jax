@@ -17,9 +17,7 @@ from sgl_jax.srt.utils import cdiv
 
 
 def merge_kv(k: jax.Array, v: jax.Array) -> jax.Array:
-    assert (
-        k.shape == v.shape
-    ), f"k and v must have same shape, got {k.shape} vs {v.shape}"
+    assert k.shape == v.shape, f"k and v must have same shape, got {k.shape} vs {v.shape}"
 
     num_tokens, num_kv_heads, head_dim = k.shape
 
@@ -215,9 +213,7 @@ class MHATokenToKVPool(KVCache):
         start_layer: int | None = None,
         end_layer: int | None = None,
     ):
-        super().__init__(
-            size, page_size, dtype, layer_num, mesh, start_layer, end_layer
-        )
+        super().__init__(size, page_size, dtype, layer_num, mesh, start_layer, end_layer)
         self.head_num = head_num
         self.head_dim = head_dim
         self.kv_partition_axis = "tensor"
@@ -390,9 +386,7 @@ class MHATokenToKVPool(KVCache):
             kv_partition_axis=self.kv_partition_axis,
         )
 
-    def get_kv_data(
-        self, layer_id: int, indices: jnp.ndarray
-    ) -> tuple[jnp.ndarray, jnp.ndarray]:
+    def get_kv_data(self, layer_id: int, indices: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray]:
         """Get KV data at specified positions"""
         layer_idx = layer_id - self.start_layer
         fused_kv_data = self.kv_buffer[layer_idx][indices]
@@ -418,9 +412,7 @@ class MHATokenToKVPool(KVCache):
             # Merge k and v into fused format
             fused_kv_host = merge_kv(k_host, v_host)
             fused_kv_device = jax.device_put(fused_kv_host, self.kv_sharding)
-            self.kv_buffer[layer_id] = (
-                self.kv_buffer[layer_id].at[indices].set(fused_kv_device)
-            )
+            self.kv_buffer[layer_id] = self.kv_buffer[layer_id].at[indices].set(fused_kv_device)
 
     def move_kv_cache(self, tgt_loc: jnp.ndarray, src_loc: jnp.ndarray):
         """Move fused KV cache from source locations to target locations"""
@@ -428,9 +420,7 @@ class MHATokenToKVPool(KVCache):
             # Get fused KV data from source locations
             fused_kv_data = self.kv_buffer[layer_id][src_loc]
             # Set data to target locations
-            self.kv_buffer[layer_id] = (
-                self.kv_buffer[layer_id].at[tgt_loc].set(fused_kv_data)
-            )
+            self.kv_buffer[layer_id] = self.kv_buffer[layer_id].at[tgt_loc].set(fused_kv_data)
 
     def clear_cache(self, indices: jnp.ndarray):
         """Clear fused KV cache at specified indices"""
@@ -454,9 +444,7 @@ class MHATokenToKVPool(KVCache):
         N = self.kv_buffer[layer_idx].shape[0]
         safe_loc = jnp.where(loc >= 0, loc, jnp.int32(N))
         # for jax function
-        updated_layer = (
-            self.kv_buffer[layer_idx].at[safe_loc].set(fused_kv, mode="drop")
-        )
+        updated_layer = self.kv_buffer[layer_idx].at[safe_loc].set(fused_kv, mode="drop")
         return updated_layer
 
 
@@ -587,17 +575,13 @@ def get_num_slices_per_block(new_kv: jax.Array, kv_cache: jax.Array, page_size=1
     kv_head_num = new_kv.shape[1]
     head_dim = new_kv.shape[2]
 
-    max_num_slices_per_block = VMEM_SIZE // (
-        bytes_per_element * page_size * kv_head_num * head_dim
-    )
+    max_num_slices_per_block = VMEM_SIZE // (bytes_per_element * page_size * kv_head_num * head_dim)
     assert (
         max_num_slices_per_block > 0
     ), f"max_num_slices_per_block={max_num_slices_per_block} is not greater than 0"
 
     return (
-        total_num_token
-        if total_num_token < max_num_slices_per_block
-        else max_num_slices_per_block
+        total_num_token if total_num_token < max_num_slices_per_block else max_num_slices_per_block
     )
 
 
@@ -619,13 +603,9 @@ def kv_cache_update(
 ):
     @jax.shard_map(
         in_specs=(
-            P(
-                None, kv_partition_axis, None
-            ),  # new_kv - consistent with KV cache sharding
+            P(None, kv_partition_axis, None),  # new_kv - consistent with KV cache sharding
             P(None, None),  # slices
-            P(
-                None, kv_partition_axis, None
-            ),  # kv_cache - consistent with KV cache sharding
+            P(None, kv_partition_axis, None),  # kv_cache - consistent with KV cache sharding
             P(None),  # num_kv_update_slices
         ),
         out_specs=P(
@@ -879,13 +859,7 @@ def get_best_num_slices_per_block(head_num, cache_len, new_kv_len, head_dim, pag
     hd_val = find_value(head_dim_config, head_dim)
     ps_val = find_value(page_size_config, page_size)
 
-    if (
-        hn_val != -1
-        and mcl_val != -1
-        and nkl_val != -1
-        and hd_val != -1
-        and ps_val != -1
-    ):
+    if hn_val != -1 and mcl_val != -1 and nkl_val != -1 and hd_val != -1 and ps_val != -1:
         return best_num_slices_per_block_config[
             f"hn_{hn_val}_mcl_{mcl_val}_nvl_{nkl_val}_hd_{hd_val}_ps_{ps_val}"
         ]
@@ -912,9 +886,7 @@ class MLATokenToKVPool(KVCache):
         start_layer: int | None = None,
         end_layer: int | None = None,
     ):
-        super().__init__(
-            size, page_size, dtype, layer_num, mesh, start_layer, end_layer
-        )
+        super().__init__(size, page_size, dtype, layer_num, mesh, start_layer, end_layer)
         self.kv_lora_rank = kv_lora_rank
         self.qk_rope_head_dim = qk_rope_head_dim
         self.kv_partition_axis = kv_partition_axis
@@ -988,15 +960,11 @@ class MLATokenToKVPool(KVCache):
             - v_buffer contains the qk_rope_head_dim portion
         """
         layer_idx = layer_id - self.start_layer
-        mla_kv = self.kv_buffer[
-            layer_idx
-        ]  # [cache_size, 1, kv_lora_rank + qk_rope_head_dim]
+        mla_kv = self.kv_buffer[layer_idx]  # [cache_size, 1, kv_lora_rank + qk_rope_head_dim]
 
         # Split MLA KV buffer into K and V components for native attention
         k_buffer = mla_kv[:, :, : self.kv_lora_rank]  # [cache_size, 1, kv_lora_rank]
-        v_buffer = mla_kv[
-            :, :, self.kv_lora_rank :
-        ]  # [cache_size, 1, qk_rope_head_dim]
+        v_buffer = mla_kv[:, :, self.kv_lora_rank :]  # [cache_size, 1, qk_rope_head_dim]
 
         return k_buffer, v_buffer
 
@@ -1023,9 +991,7 @@ class MLATokenToKVPool(KVCache):
         layer_idx = layer_id - self.start_layer
         # Concatenate nope and rope components
         cache_k_combined = jnp.concatenate([cache_k_nope, cache_k_rope], axis=-1)
-        self.kv_buffer[layer_idx] = (
-            self.kv_buffer[layer_idx].at[loc].set(cache_k_combined)
-        )
+        self.kv_buffer[layer_idx] = self.kv_buffer[layer_idx].at[loc].set(cache_k_combined)
 
     def get_cpu_copy(self, indices):
         """Get CPU copy of KV cache for specified indices"""
@@ -1040,9 +1006,7 @@ class MLATokenToKVPool(KVCache):
         for layer_id in range(self.layer_num):
             kv_host = kv_cache_host[layer_id]
             kv_device = jax.device_put(kv_host, self.kv_sharding)
-            self.kv_buffer[layer_id] = (
-                self.kv_buffer[layer_id].at[indices].set(kv_device)
-            )
+            self.kv_buffer[layer_id] = self.kv_buffer[layer_id].at[indices].set(kv_device)
 
 
 best_num_slices_per_block_config = {

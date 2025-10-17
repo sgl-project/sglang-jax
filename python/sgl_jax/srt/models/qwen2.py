@@ -323,9 +323,7 @@ class Qwen2ForCausalLM(nnx.Module):
         logger.info("Qwen2ForCausalLM config dtype: %s", self.dtype)
         self.transformer = Qwen2Model(config, dtype=self.dtype, rngs=rngs)
         self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size, rngs=rngs)
-        self.logits_processor = LogitsProcessor(
-            config.vocab_size, self.lm_head, self.mesh
-        )
+        self.logits_processor = LogitsProcessor(config.vocab_size, self.lm_head, self.mesh)
 
     def load_weights(self, model_config: ModelConfig, rng_key: jax.Array):
         self.rng = nnx.Rngs(rng_key)

@@ -62,9 +62,7 @@ class BenchArgs:
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
         parser.add_argument("--backend", type=str, default=BenchArgs.backend)
-        parser.add_argument(
-            "--result-filename", type=str, default=BenchArgs.result_filename
-        )
+        parser.add_argument("--result-filename", type=str, default=BenchArgs.result_filename)
         parser.add_argument(
             "--dataset-name",
             type=str,
@@ -72,9 +70,7 @@ class BenchArgs:
             choices=["sharegpt", "random", "generated-shared-prefix"],
             help="Name of the dataset to benchmark on.",
         )
-        parser.add_argument(
-            "--dataset-path", type=str, default="", help="Path to the dataset."
-        )
+        parser.add_argument("--dataset-path", type=str, default="", help="Path to the dataset.")
         parser.add_argument(
             "--num-prompts",
             type=int,
@@ -222,9 +218,7 @@ def throughput_test_once(
     ]
 
     if profile:
-        assert (
-            "SGLANG_TORCH_PROFILER_DIR" in os.environ
-        ), "Please set SGLANG_TORCH_PROFILER_DIR."
+        assert "SGLANG_TORCH_PROFILER_DIR" in os.environ, "Please set SGLANG_TORCH_PROFILER_DIR."
         os.makedirs(os.environ["SGLANG_TORCH_PROFILER_DIR"], exist_ok=True)
         backend.start_profile()
 
@@ -247,18 +241,11 @@ def throughput_test_once(
     measurement_results["total_output_tokens"] = sum(
         o["meta_info"]["completion_tokens"] for o in gen_out
     )
-    measurement_results["request_throughput"] = (
-        measurement_results["successful_requests"] / latency
-    )
-    measurement_results["input_throughput"] = (
-        measurement_results["total_input_tokens"] / latency
-    )
-    measurement_results["output_throughput"] = (
-        measurement_results["total_output_tokens"] / latency
-    )
+    measurement_results["request_throughput"] = measurement_results["successful_requests"] / latency
+    measurement_results["input_throughput"] = measurement_results["total_input_tokens"] / latency
+    measurement_results["output_throughput"] = measurement_results["total_output_tokens"] / latency
     measurement_results["total_throughput"] = (
-        measurement_results["total_input_tokens"]
-        + measurement_results["total_output_tokens"]
+        measurement_results["total_input_tokens"] + measurement_results["total_output_tokens"]
     ) / latency
 
     if inspect.isawaitable(server_info):
@@ -370,41 +357,23 @@ def throughput_test(
         with open(bench_args.result_filename, "a") as fout:
             fout.write(json.dumps(result) + "\n")
 
-    print(
-        "\n{s:{c}^{n}}".format(s=" Offline Throughput Benchmark Result ", n=50, c="=")
-    )
+    print("\n{s:{c}^{n}}".format(s=" Offline Throughput Benchmark Result ", n=50, c="="))
     print("{:<40} {:<10}".format("Backend:", result["backend"]))
     print("{:<40} {:<10}".format("Successful requests:", result["successful_requests"]))
     print("{:<40} {:<10.2f}".format("Benchmark duration (s):", result["total_latency"]))
     print("{:<40} {:<10}".format("Total input tokens:", result["total_input_tokens"]))
-    print(
-        "{:<40} {:<10}".format("Total generated tokens:", result["total_output_tokens"])
-    )
+    print("{:<40} {:<10}".format("Total generated tokens:", result["total_output_tokens"]))
     print(
         "{:<40} {:<10.2f}".format(
             "Last generation throughput (tok/s):", result["last_gen_throughput"]
         )
     )
+    print("{:<40} {:<10.2f}".format("Request throughput (req/s):", result["request_throughput"]))
+    print("{:<40} {:<10.2f}".format("Input token throughput (tok/s):", result["input_throughput"]))
     print(
-        "{:<40} {:<10.2f}".format(
-            "Request throughput (req/s):", result["request_throughput"]
-        )
+        "{:<40} {:<10.2f}".format("Output token throughput (tok/s):", result["output_throughput"])
     )
-    print(
-        "{:<40} {:<10.2f}".format(
-            "Input token throughput (tok/s):", result["input_throughput"]
-        )
-    )
-    print(
-        "{:<40} {:<10.2f}".format(
-            "Output token throughput (tok/s):", result["output_throughput"]
-        )
-    )
-    print(
-        "{:<40} {:<10.2f}".format(
-            "Total token throughput (tok/s):", result["total_throughput"]
-        )
-    )
+    print("{:<40} {:<10.2f}".format("Total token throughput (tok/s):", result["total_throughput"]))
     print("=" * 50)
 
     return result

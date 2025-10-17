@@ -39,9 +39,7 @@ def _run_profile(
     output_dir.mkdir(exist_ok=True, parents=True)
 
     print(f"Dump profiling traces to {output_dir}")
-    print(
-        f"Waiting for {num_steps} steps and the trace to be flushed.... ({profile_by_stage=})"
-    )
+    print(f"Waiting for {num_steps} steps and the trace to be flushed.... ({profile_by_stage=})")
 
     # Dump server args.
     file_path = Path(output_dir) / "server_args.json"
@@ -77,9 +75,7 @@ def run_profile(
     profile_by_stage: bool = False,
 ):
     # step based profile will self terminate on num_steps constraints
-    link = _run_profile(
-        url, num_steps, activities, output_dir, profile_name, profile_by_stage
-    )
+    link = _run_profile(url, num_steps, activities, output_dir, profile_name, profile_by_stage)
     return link
 
 

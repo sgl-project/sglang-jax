@@ -55,9 +55,7 @@ class MathEval(Eval):
             response_text = sampler(prompt_messages)
             match = re.search(ANSWER_PATTERN, response_text)
             extracted_answer = match.group(1) if match else None
-            score = float(
-                check_equality(self.equality_checker, row["Answer"], extracted_answer)
-            )
+            score = float(check_equality(self.equality_checker, row["Answer"], extracted_answer))
             html = common.jinja_env.from_string(HTML_JINJA).render(
                 prompt_messages=prompt_messages,
                 next_message=dict(content=response_text, role="assistant"),

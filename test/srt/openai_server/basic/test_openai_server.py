@@ -63,17 +63,13 @@ class TestOpenAIServer(CustomTestCase):
             },
         )
         cls.base_url += "/v1"
-        cls.tokenizer = get_tokenizer(
-            DEFAULT_SMALL_MODEL_NAME_FOR_TEST, trust_remote_code=True
-        )
+        cls.tokenizer = get_tokenizer(DEFAULT_SMALL_MODEL_NAME_FOR_TEST, trust_remote_code=True)
 
     @classmethod
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
 
-    def run_completion(
-        self, echo, logprobs, use_list_input, parallel_sample_num, token_input
-    ):
+    def run_completion(self, echo, logprobs, use_list_input, parallel_sample_num, token_input):
         client = openai.Client(api_key=self.api_key, base_url=self.base_url)
         prompt = "The capital of France is"
         if token_input:
@@ -182,9 +178,7 @@ class TestOpenAIServer(CustomTestCase):
                     assert isinstance(
                         response.choices[0].logprobs.top_logprobs[0], dict
                     ), f"top_logprobs was not a dictionary"
-                    ret_num_top_logprobs = len(
-                        response.choices[0].logprobs.top_logprobs[0]
-                    )
+                    ret_num_top_logprobs = len(response.choices[0].logprobs.top_logprobs[0])
                     # FIXME: Sometimes, some top_logprobs are missing in the return value. The reason is that some output id maps to the same output token and duplicate in the map
                     # assert ret_num_top_logprobs == logprobs, f"{ret_num_top_logprobs} vs {logprobs}"
                     assert ret_num_top_logprobs > 0, f"ret_num_top_logprobs was 0"
@@ -199,9 +193,7 @@ class TestOpenAIServer(CustomTestCase):
             assert response.created, f"no created in response"
 
         for index in [i for i in range(parallel_sample_num * num_choices)]:
-            assert not is_firsts.get(
-                index, True
-            ), f"index {index} is not found in the response"
+            assert not is_firsts.get(index, True), f"index {index} is not found in the response"
 
     def run_chat_completion(self, logprobs, parallel_sample_num):
         client = openai.Client(api_key=self.api_key, base_url=self.base_url)
@@ -221,16 +213,10 @@ class TestOpenAIServer(CustomTestCase):
         )
 
         if logprobs:
-            assert isinstance(
-                response.choices[0].logprobs.content[0].top_logprobs[0].token, str
-            )
+            assert isinstance(response.choices[0].logprobs.content[0].top_logprobs[0].token, str)
 
-            ret_num_top_logprobs = len(
-                response.choices[0].logprobs.content[0].top_logprobs
-            )
-            assert (
-                ret_num_top_logprobs == logprobs
-            ), f"{ret_num_top_logprobs} vs {logprobs}"
+            ret_num_top_logprobs = len(response.choices[0].logprobs.content[0].top_logprobs)
+            assert ret_num_top_logprobs == logprobs, f"{ret_num_top_logprobs} vs {logprobs}"
 
         assert len(response.choices) == parallel_sample_num
         assert response.choices[0].message.role == "assistant"
@@ -277,9 +263,7 @@ class TestOpenAIServer(CustomTestCase):
             data = response.choices[0].delta
 
             if is_firsts.get(index, True):
-                assert (
-                    data.role == "assistant"
-                ), f"data.role was not 'assistant' for first chunk"
+                assert data.role == "assistant", f"data.role was not 'assistant' for first chunk"
                 is_firsts[index] = False
                 continue
 
@@ -291,12 +275,8 @@ class TestOpenAIServer(CustomTestCase):
                 assert isinstance(
                     response.choices[0].logprobs.content[0].top_logprobs, list
                 ), f"top_logprobs was not a list"
-                ret_num_top_logprobs = len(
-                    response.choices[0].logprobs.content[0].top_logprobs
-                )
-                assert (
-                    ret_num_top_logprobs == logprobs
-                ), f"{ret_num_top_logprobs} vs {logprobs}"
+                ret_num_top_logprobs = len(response.choices[0].logprobs.content[0].top_logprobs)
+                assert ret_num_top_logprobs == logprobs, f"{ret_num_top_logprobs} vs {logprobs}"
 
             assert (
                 isinstance(data.content, str)
@@ -308,15 +288,11 @@ class TestOpenAIServer(CustomTestCase):
             assert response.created
 
         for index in [i for i in range(parallel_sample_num)]:
-            assert not is_firsts.get(
-                index, True
-            ), f"index {index} is not found in the response"
+            assert not is_firsts.get(index, True), f"index {index} is not found in the response"
 
         # Verify that each choice gets exactly one finish_reason chunk
         for index in range(parallel_sample_num):
-            assert (
-                index in finish_reason_counts
-            ), f"No finish_reason found for index {index}"
+            assert index in finish_reason_counts, f"No finish_reason found for index {index}"
             assert (
                 finish_reason_counts[index] == 1
             ), f"Expected 1 finish_reason chunk for index {index}, got {finish_reason_counts[index]}"

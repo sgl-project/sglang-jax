@@ -185,9 +185,7 @@ class QWen3MoeDecoderLayer(nnx.Module):
             num_experts = getattr(config, "num_experts", 128)
             num_experts_per_tok = getattr(config, "num_experts_per_tok", 8)
             moe_intermediate_size = getattr(config, "moe_intermediate_size", 768)
-            expert_parallel_size = mesh.shape.get("data", 1) * mesh.shape.get(
-                "tensor", 1
-            )
+            expert_parallel_size = mesh.shape.get("data", 1) * mesh.shape.get("tensor", 1)
             self.moe_gate = GateLogit(
                 input_size=config.hidden_size,
                 features=num_experts,
@@ -347,9 +345,7 @@ class Qwen3MoeForCausalLM(nnx.Module):
         logger.info("QWen3MoeForCausalLMModel config dtype: %s", self.dtype)
         self.transformer = QWen3MoeModel(config, dtype=self.dtype, rngs=rngs, mesh=mesh)
         self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size, rngs=rngs)
-        self.logits_processor = LogitsProcessor(
-            config.vocab_size, self.lm_head, self.mesh
-        )
+        self.logits_processor = LogitsProcessor(config.vocab_size, self.lm_head, self.mesh)
 
     def load_weights(self, model_config: ModelConfig, rng_key: jax.Array):
         self.rng = nnx.Rngs(rng_key)
@@ -501,8 +497,7 @@ class Qwen3MoeForCausalLM(nnx.Module):
                     "down_proj": "wo",
                 }[expert_type]
                 expert_keys = [
-                    f"{prefix}.mlp.experts.{i}.{expert_type}.weight"
-                    for i in range(num_experts)
+                    f"{prefix}.mlp.experts.{i}.{expert_type}.weight" for i in range(num_experts)
                 ]
 
                 mappings[f"__MOE_EXPERTS__{prefix}.mlp.{target_name}"] = WeightMapping(
@@ -519,9 +514,7 @@ class Qwen3MoeForCausalLM(nnx.Module):
         token_to_kv_pool: KVCache,
         logits_metadata: LogitsMetadata,
     ):
-        hidden_states, layers_kv_fused = self.transformer(
-            forward_batch, token_to_kv_pool
-        )
+        hidden_states, layers_kv_fused = self.transformer(forward_batch, token_to_kv_pool)
         output = self.logits_processor(hidden_states, logits_metadata)
         return output, layers_kv_fused, True
 

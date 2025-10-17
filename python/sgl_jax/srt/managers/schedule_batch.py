@@ -322,9 +322,7 @@ class Req:
 
         if first_iter:
             self.read_offset = len(self.origin_input_ids_unpadded)
-            self.surr_offset = max(
-                self.read_offset - INIT_INCREMENTAL_DETOKENIZATION_OFFSET, 0
-            )
+            self.surr_offset = max(self.read_offset - INIT_INCREMENTAL_DETOKENIZATION_OFFSET, 0)
 
         all_ids = self.origin_input_ids_unpadded + self.output_ids
         return all_ids[self.surr_offset :], self.read_offset - self.surr_offset
@@ -340,9 +338,7 @@ class Req:
             return
 
         if len(self.output_ids) >= self.sampling_params.max_new_tokens:
-            self.finished_reason = FINISH_LENGTH(
-                length=self.sampling_params.max_new_tokens
-            )
+            self.finished_reason = FINISH_LENGTH(length=self.sampling_params.max_new_tokens)
             return
 
         last_token_id = self.output_ids[-1]
@@ -358,27 +354,19 @@ class Req:
             if self.eos_token_ids:
                 if any(hasattr(token_id, "item") for token_id in self.eos_token_ids):
                     self.eos_token_ids = {
-                        (
-                            int(token_id.item())
-                            if hasattr(token_id, "item")
-                            else int(token_id)
-                        )
+                        (int(token_id.item()) if hasattr(token_id, "item") else int(token_id))
                         for token_id in self.eos_token_ids
                     }
                 matched_eos |= last_token_id in self.eos_token_ids
             if self.tokenizer is not None:
                 matched_eos |= last_token_id == self.tokenizer.eos_token_id
                 if self.tokenizer.additional_stop_token_ids:
-                    matched_eos |= (
-                        last_token_id in self.tokenizer.additional_stop_token_ids
-                    )
+                    matched_eos |= last_token_id in self.tokenizer.additional_stop_token_ids
             if matched_eos:
                 self.finished_reason = FINISH_MATCHED_TOKEN(matched=last_token_id)
                 return
 
-        if self.vocab_size is not None and (
-            last_token_id > self.vocab_size or last_token_id < 0
-        ):
+        if self.vocab_size is not None and (last_token_id > self.vocab_size or last_token_id < 0):
             if self.sampling_params.stop_token_ids:
                 self.output_ids[-1] = next(iter(self.sampling_params.stop_token_ids))
             elif self.eos_token_ids:
@@ -414,9 +402,7 @@ class Req:
         # set it to one token to skip the long prefill
         self.origin_input_ids = [0]
         self.return_logprob = False
-        self.finished_reason = FINISH_ABORT(
-            error_msg, HTTPStatus.BAD_REQUEST, "BadRequestError"
-        )
+        self.finished_reason = FINISH_ABORT(error_msg, HTTPStatus.BAD_REQUEST, "BadRequestError")
 
     def __repr__(self):
         return (
@@ -527,9 +513,7 @@ class ScheduleBatch:
             has_stream=any(req.stream for req in reqs),
             chunked_req=chunked_req,
             mesh=mesh,
-            is_prefill_only=all(
-                req.sampling_params.max_new_tokens == 0 for req in reqs
-            ),
+            is_prefill_only=all(req.sampling_params.max_new_tokens == 0 for req in reqs),
         )
 
     def batch_size(self):
@@ -581,10 +565,7 @@ class ScheduleBatch:
         extend_num_tokens: int,
         backup_state: bool = False,
     ):
-        num_tokens = (
-            extend_num_tokens
-            + len(seq_lens) * self.token_to_kv_pool_allocator.page_size
-        )
+        num_tokens = extend_num_tokens + len(seq_lens) * self.token_to_kv_pool_allocator.page_size
         self._evict_tree_cache_if_needed(num_tokens)
 
         if backup_state:
@@ -645,9 +626,7 @@ class ScheduleBatch:
             req.extend_input_len = 1
 
         input_ids = jnp.concatenate([self.input_ids, running_batch.input_ids])
-        out_cache_loc = jnp.concatenate(
-            [self.out_cache_loc, running_batch.out_cache_loc]
-        )
+        out_cache_loc = jnp.concatenate([self.out_cache_loc, running_batch.out_cache_loc])
 
         self.merge_batch(running_batch)
         self.input_ids = input_ids
@@ -656,10 +635,7 @@ class ScheduleBatch:
         delta = 0 if self.enable_overlap else -1
         # NOTE: prefix_indices is what has been cached, but we don't cache each decode step
         self.prefix_lens.extend(
-            [
-                len(r.origin_input_ids) + len(r.output_ids) + delta
-                for r in running_batch.reqs
-            ]
+            [len(r.origin_input_ids) + len(r.output_ids) + delta for r in running_batch.reqs]
         )
         self.extend_lens.extend([1] * running_bs)
         self.extend_num_tokens += running_bs
@@ -695,9 +671,7 @@ class ScheduleBatch:
             prefix_indices = req.prefix_indices
             if pre_len > 0:
                 # note: prefix_indices has to locate on device, or will meet Received incompatible devices for jitted computation
-                self.req_to_token_pool.write(
-                    (req.req_pool_idx, slice(0, pre_len)), prefix_indices
-                )
+                self.req_to_token_pool.write((req.req_pool_idx, slice(0, pre_len)), prefix_indices)
 
             req.cached_tokens += pre_len - req.already_computed
             req.already_computed = seq_len
@@ -735,20 +709,14 @@ class ScheduleBatch:
                 if global_start_idx < req.logprob_start_len:
                     global_start_idx = req.logprob_start_len
 
-                logprob_token_ids = req.origin_input_ids[
-                    global_start_idx + 1 : global_end_idx + 1
-                ]
+                logprob_token_ids = req.origin_input_ids[global_start_idx + 1 : global_end_idx + 1]
                 extend_input_logprob_token_ids.extend(logprob_token_ids)
 
                 # We will need req.extend_input_len - req.extend_logprob_start_len number of
                 # tokens, and logprob_token_ids is for input logprob, so pad the rest of them by 0.
                 extend_input_logprob_token_ids.extend(
                     [0]
-                    * (
-                        req.extend_input_len
-                        - req.extend_logprob_start_len
-                        - len(logprob_token_ids)
-                    )
+                    * (req.extend_input_len - req.extend_logprob_start_len - len(logprob_token_ids))
                 )
 
         if self.return_logprob:
@@ -847,10 +815,7 @@ class ScheduleBatch:
         retracted_reqs = []
         seq_lens_cpu = self.seq_lens
         first_iter = True
-        while (
-            _get_available_size() < get_required_tokens(len(sorted_indices))
-            or first_iter
-        ):
+        while _get_available_size() < get_required_tokens(len(sorted_indices)) or first_iter:
             if len(sorted_indices) == 1:
                 # Corner case: only one request left
                 assert (
@@ -930,22 +895,14 @@ class ScheduleBatch:
                 # TODO: this can be slow, optimize this.
                 delayed_output_ids = np.array(
                     [
-                        (
-                            req.output_ids[-1]
-                            if len(req.output_ids)
-                            else req.origin_input_ids[-1]
-                        )
+                        (req.output_ids[-1] if len(req.output_ids) else req.origin_input_ids[-1])
                         for req in self.reqs
                     ],
                     dtype=np.int64,
                 )
-                self.sampling_info.penalizer_orchestrator.cumulate_output_tokens(
-                    delayed_output_ids
-                )
+                self.sampling_info.penalizer_orchestrator.cumulate_output_tokens(delayed_output_ids)
             else:
-                self.sampling_info.penalizer_orchestrator.cumulate_output_tokens(
-                    self.output_ids
-                )
+                self.sampling_info.penalizer_orchestrator.cumulate_output_tokens(self.output_ids)
 
         # Update fields
         self.input_ids = self.output_ids
@@ -964,9 +921,7 @@ class ScheduleBatch:
         if self.token_to_kv_pool_allocator.page_size == 1:
             self.out_cache_loc = self.alloc_token_slots(bs)
         else:
-            last_loc = self.req_to_token_pool.req_to_token[
-                self.req_pool_indices, self.seq_lens - 2
-            ]
+            last_loc = self.req_to_token_pool.req_to_token[self.req_pool_indices, self.seq_lens - 2]
             self.out_cache_loc = self.alloc_paged_token_slots_decode(
                 self.seq_lens.tolist(),
                 last_loc.tolist(),
@@ -988,8 +943,7 @@ class ScheduleBatch:
             keep_indices = [
                 i
                 for i in range(len(self.reqs))
-                if not self.reqs[i].finished()
-                and self.reqs[i] not in chunked_req_to_exclude
+                if not self.reqs[i].finished() and self.reqs[i] not in chunked_req_to_exclude
             ]
 
         if keep_indices is None or len(keep_indices) == 0:
@@ -1006,9 +960,7 @@ class ScheduleBatch:
         self.seq_lens = self.seq_lens[keep_indices]
         self.out_cache_loc = None
         self.seq_lens_sum = self.seq_lens.sum().item()
-        self.output_ids = (
-            self.output_ids[keep_indices] if self.output_ids is not None else None
-        )
+        self.output_ids = self.output_ids[keep_indices] if self.output_ids is not None else None
         self.return_logprob = any(req.return_logprob for req in self.reqs)
         if self.return_logprob:
             self.top_logprobs_nums = [self.top_logprobs_nums[i] for i in keep_indices]
@@ -1027,9 +979,7 @@ class ScheduleBatch:
         # needs to be called with pre-merged Batch.reqs.
         self.sampling_info.merge_batch(other.sampling_info)
 
-        self.req_pool_indices = np.concat(
-            [self.req_pool_indices, other.req_pool_indices]
-        )
+        self.req_pool_indices = np.concat([self.req_pool_indices, other.req_pool_indices])
         self.seq_lens = np.concat([self.seq_lens, other.seq_lens])
         self.out_cache_loc = None
         self.seq_lens_sum += other.seq_lens_sum
@@ -1085,9 +1035,7 @@ class ScheduleBatch:
         seq_lens_cpu = self.seq_lens
         real_bs = len(seq_lens_cpu)
         req_pool_indices_cpu = self.req_pool_indices
-        token_indices_with_all_reqs = self.req_to_token_pool.req_to_token[
-            self.req_pool_indices
-        ]
+        token_indices_with_all_reqs = self.req_to_token_pool.req_to_token[self.req_pool_indices]
 
         # padding seq
         # extend & decode: input_ids, positions, out_cache_loc, cache_loc
@@ -1125,9 +1073,7 @@ class ScheduleBatch:
         if self.forward_mode.is_extend():
             # For prefill: create positions for each token in sequences
             # Calculate total tokens without padding first
-            total_tokens_before_padding = sum(
-                [extend_len for extend_len in self.extend_lens]
-            )
+            total_tokens_before_padding = sum([extend_len for extend_len in self.extend_lens])
             positions_cpu = np.concatenate(
                 [
                     np.arange(prefix_len, seq_len, dtype=seq_lens_cpu.dtype)
@@ -1178,9 +1124,7 @@ class ScheduleBatch:
                 valid_seq_lens = seq_lens_cpu[valid_mask]
 
                 # Calculate aligned lengths for all valid sequences at once
-                aligned_lengths = (
-                    (valid_seq_lens + page_size - 1) // page_size
-                ) * page_size
+                aligned_lengths = ((valid_seq_lens + page_size - 1) // page_size) * page_size
                 total_aligned_length = np.sum(aligned_lengths)
 
                 # Pre-allocate the result array
@@ -1192,9 +1136,9 @@ class ScheduleBatch:
                     zip(valid_indices, valid_seq_lens, aligned_lengths)
                 ):
                     # Copy the actual data
-                    cache_loc_flat[offset : offset + seq_len] = (
-                        token_indices_with_all_reqs[seq_idx, :seq_len]
-                    )
+                    cache_loc_flat[offset : offset + seq_len] = token_indices_with_all_reqs[
+                        seq_idx, :seq_len
+                    ]
                     # Padding is already zero from initialization
                     offset += aligned_len
 
@@ -1228,9 +1172,7 @@ class ScheduleBatch:
                     [extend_start_loc[-1] + extend_seq_lens[-1]] * bs_padding_size,
                     dtype=extend_start_loc.dtype,
                 )
-                extend_start_loc = np.concat(
-                    [extend_start_loc, invalid_extend_start_loc], axis=0
-                )
+                extend_start_loc = np.concat([extend_start_loc, invalid_extend_start_loc], axis=0)
                 invalid_extend_prefix_lens = np.array(
                     [0] * bs_padding_size, dtype=extend_prefix_lens.dtype
                 )
@@ -1240,16 +1182,12 @@ class ScheduleBatch:
                 invalid_extend_seq_lens = np.array(
                     [0] * bs_padding_size, dtype=extend_seq_lens.dtype
                 )
-                extend_seq_lens = np.concat(
-                    [extend_seq_lens, invalid_extend_seq_lens], axis=0
-                )
+                extend_seq_lens = np.concat([extend_seq_lens, invalid_extend_seq_lens], axis=0)
             else:
                 invalid_extend_start_loc = np.array(
                     [len(seq_lens_cpu)] * bs_padding_size, dtype=extend_start_loc.dtype
                 )
-                extend_start_loc = np.concat(
-                    [extend_start_loc, invalid_extend_start_loc], axis=0
-                )
+                extend_start_loc = np.concat([extend_start_loc, invalid_extend_start_loc], axis=0)
 
         if precision_tracer.get_trace_active():
             self._generate_trace_info(real_bs, bid)
@@ -1272,9 +1210,7 @@ class ScheduleBatch:
             extend_prefix_lens=(
                 extend_prefix_lens if self.forward_mode == ForwardMode.EXTEND else None
             ),
-            extend_seq_lens=(
-                extend_seq_lens if self.forward_mode == ForwardMode.EXTEND else None
-            ),
+            extend_seq_lens=(extend_seq_lens if self.forward_mode == ForwardMode.EXTEND else None),
             extend_logprob_start_lens=extend_logprob_start_lens,
             extend_input_logprob_token_ids=self.extend_input_logprob_token_ids,
             real_bs=real_bs,
@@ -1296,9 +1232,7 @@ class ScheduleBatch:
 
                 precision_tracer.add_request_to_batch_requests_mapping(
                     bid,
-                    PrecisionTracerRequestMetadata(
-                        req.rid, input_ids_to_trace, self.forward_mode
-                    ),
+                    PrecisionTracerRequestMetadata(req.rid, input_ids_to_trace, self.forward_mode),
                 )
                 if self.forward_mode == ForwardMode.EXTEND:
                     precision_tracer.add_request_counter()

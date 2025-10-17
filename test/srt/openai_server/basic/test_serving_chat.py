@@ -98,9 +98,7 @@ class ServingChatTestCase(unittest.TestCase):
     # ------------- conversion tests -------------
     def test_convert_to_internal_request_single(self):
         with (
-            patch(
-                "sgl_jax.srt.entrypoints.openai.serving_chat.generate_chat_conv"
-            ) as conv_mock,
+            patch("sgl_jax.srt.entrypoints.openai.serving_chat.generate_chat_conv") as conv_mock,
             patch.object(self.chat, "_process_messages") as proc_mock,
         ):
             conv_ins = Mock()
@@ -134,18 +132,14 @@ class ServingChatTestCase(unittest.TestCase):
         # Mock conversation template with initial stop_str
         initial_stop_str = ["\n"]
 
-        with patch(
-            "sgl_jax.srt.entrypoints.openai.serving_chat.generate_chat_conv"
-        ) as conv_mock:
+        with patch("sgl_jax.srt.entrypoints.openai.serving_chat.generate_chat_conv") as conv_mock:
             # Create a mock conversation object that will be returned by generate_chat_conv
             conv_ins = Mock()
             conv_ins.get_prompt.return_value = "Test prompt"
             conv_ins.image_data = None
             conv_ins.audio_data = None
             conv_ins.modalities = []
-            conv_ins.stop_str = (
-                initial_stop_str.copy()
-            )  # Template's default stop strings
+            conv_ins.stop_str = initial_stop_str.copy()  # Template's default stop strings
             conv_mock.return_value = conv_ins
 
             # First request with additional stop string
@@ -243,9 +237,7 @@ class ServingChatTestCase(unittest.TestCase):
         # Should return a chunk with remaining arguments
         self.assertIsNotNone(result, "Should return chunk with remaining arguments")
         self.assertIn('"arguments":', result, "Should contain arguments field")
-        self.assertIn(
-            ', "unit": "celsius"}', result, "Should contain remaining arguments"
-        )
+        self.assertIn(', "unit": "celsius"}', result, "Should contain remaining arguments")
         self.assertIn(
             '"finish_reason":null',
             result,
@@ -324,9 +316,7 @@ class ServingChatTestCase(unittest.TestCase):
         )
 
         # Should return None since there's no parser data
-        self.assertIsNone(
-            result, "Should return None when parser has no tool call data"
-        )
+        self.assertIsNone(result, "Should return None when parser has no tool call data")
 
 
 if __name__ == "__main__":

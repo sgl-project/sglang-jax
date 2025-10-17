@@ -73,22 +73,15 @@ class ModelConfig:
         )
 
         self.hf_text_config = get_hf_text_config(self.hf_config)
-        self.attention_chunk_size = getattr(
-            self.hf_text_config, "attention_chunk_size", None
-        )
+        self.attention_chunk_size = getattr(self.hf_text_config, "attention_chunk_size", None)
 
-        if (
-            is_draft_model
-            and self.hf_config.architectures[0] == "DeepseekV3ForCausalLM"
-        ):
+        if is_draft_model and self.hf_config.architectures[0] == "DeepseekV3ForCausalLM":
             self.hf_config.architectures[0] = "DeepseekV3ForCausalLMNextN"
 
         if is_draft_model and self.hf_config.architectures[0] == "MiMoForCausalLM":
             self.hf_config.architectures[0] = "MiMoMTP"
         # Check model type
-        self.is_generation = is_generation_model(
-            self.hf_config.architectures, is_embedding
-        )
+        self.is_generation = is_generation_model(self.hf_config.architectures, is_embedding)
         self.is_multimodal = False
         self.dtype = _get_and_verify_dtype(self.hf_text_config, dtype)
 
@@ -96,9 +89,7 @@ class ModelConfig:
         derived_context_len = get_context_length(self.hf_text_config)
         if context_length is not None:
             if context_length > derived_context_len:
-                if get_bool_env_var(
-                    "SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN", default="True"
-                ):
+                if get_bool_env_var("SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN", default="True"):
                     logger.warning(
                         "Warning: User-specified context_length (%s) is greater than the derived context_length (%s). This may lead to incorrect model outputs or CUDA errors.",
                         context_length,
@@ -123,15 +114,11 @@ class ModelConfig:
 
         self.attention_arch = AttentionArch.MHA
         self.num_attention_heads = self.hf_text_config.num_attention_heads
-        self.num_key_value_heads = getattr(
-            self.hf_text_config, "num_key_value_heads", None
-        )
+        self.num_key_value_heads = getattr(self.hf_text_config, "num_key_value_heads", None)
 
         # for Dbrx and MPT models
         if self.hf_config.model_type in ["dbrx", "mpt"]:
-            self.num_key_value_heads = getattr(
-                self.hf_config.attn_config, "kv_n_heads", None
-            )
+            self.num_key_value_heads = getattr(self.hf_config.attn_config, "kv_n_heads", None)
 
         if self.num_key_value_heads is None:
             self.num_key_value_heads = self.num_attention_heads
@@ -142,9 +129,7 @@ class ModelConfig:
         # Override num_hidden_layers if model_layer_nums is specified
         if model_layer_nums is not None:
             if model_layer_nums <= 0:
-                raise ValueError(
-                    f"model_layer_nums must be positive, got {model_layer_nums}"
-                )
+                raise ValueError(f"model_layer_nums must be positive, got {model_layer_nums}")
             if model_layer_nums > self.num_hidden_layers:
                 logger.warning(
                     "model_layer_nums (%s) is greater than the original num_hidden_layers (%s). Using original value.",
@@ -193,13 +178,10 @@ class ModelConfig:
         # multi_query flag is ignored and we use n_head_kv for the number of
         # KV heads.
         falcon_model_types = ["falcon", "RefinedWeb", "RefinedWebModel"]
-        new_decoder_arch_falcon = (
-            self.hf_config.model_type in falcon_model_types
-            and getattr(self.hf_config, "new_decoder_architecture", False)
+        new_decoder_arch_falcon = self.hf_config.model_type in falcon_model_types and getattr(
+            self.hf_config, "new_decoder_architecture", False
         )
-        if not new_decoder_arch_falcon and getattr(
-            self.hf_text_config, "multi_query", False
-        ):
+        if not new_decoder_arch_falcon and getattr(self.hf_text_config, "multi_query", False):
             # Multi-query attention, only one KV head.
             # Currently, tensor parallelism is not supported in this case.
             return 1
@@ -277,15 +259,11 @@ class ModelConfig:
         # Handle cases where HF config doesn't have num_key_value_heads (MHA models)
         if hasattr(self.hf_text_config, "num_key_value_heads"):
             if not hasattr(self, "_original_hf_num_key_value_heads"):
-                self._original_hf_num_key_value_heads = (
-                    self.hf_text_config.num_key_value_heads
-                )
+                self._original_hf_num_key_value_heads = self.hf_text_config.num_key_value_heads
         else:
             # For MHA models without this attribute, it equals num_attention_heads
             if not hasattr(self, "_original_hf_num_key_value_heads"):
-                self._original_hf_num_key_value_heads = (
-                    self.hf_text_config.num_attention_heads
-                )
+                self._original_hf_num_key_value_heads = self.hf_text_config.num_attention_heads
 
         # CRITICAL: Set to TOTAL count for global sharding
         # JAX tensor parallel will automatically shard this across devices
@@ -304,9 +282,7 @@ class ModelConfig:
         from sgl_jax.srt.utils.jax_utils import get_original_kv_head_id
 
         total_num_kv_heads = self.get_total_num_kv_heads()
-        return get_original_kv_head_id(
-            tp_rank, total_num_kv_heads, tensor_parallel_size
-        )
+        return get_original_kv_head_id(tp_rank, total_num_kv_heads, tensor_parallel_size)
 
     def is_gqa_model(self) -> bool:
         """Returns True if this is a Grouped Query Attention model."""
@@ -379,9 +355,7 @@ class ModelConfig:
                 if hf_api.file_exists(self.model_path, "hf_quant_config.json"):
                     quant_cfg = modelopt_quant_config
             elif os.path.exists(os.path.join(self.model_path, "hf_quant_config.json")):
-                quant_config_file = os.path.join(
-                    self.model_path, "hf_quant_config.json"
-                )
+                quant_config_file = os.path.join(self.model_path, "hf_quant_config.json")
                 with open(quant_config_file) as f:
                     quant_config_dict = json.load(f)
                 json_quant_configs = quant_config_dict["quantization"]
@@ -400,9 +374,7 @@ class ModelConfig:
         if eos_ids is None:
             eos_ids = set()
         if self.hf_generation_config:
-            generation_eos_ids = getattr(
-                self.hf_generation_config, "eos_token_id", None
-            )
+            generation_eos_ids = getattr(self.hf_generation_config, "eos_token_id", None)
             if generation_eos_ids:
                 generation_eos_ids = (
                     {generation_eos_ids}
@@ -447,9 +419,7 @@ def _get_and_verify_dtype(
     if isinstance(config_dtype, str):
         config_dtype = _STR_DTYPE_TO_JAX_DTYPE.get(config_dtype)
     elif config_dtype is not None:
-        config_dtype = _STR_DTYPE_TO_JAX_DTYPE.get(
-            str(config_dtype).replace("torch.", ""), None
-        )
+        config_dtype = _STR_DTYPE_TO_JAX_DTYPE.get(str(config_dtype).replace("torch.", ""), None)
 
     if config_dtype is None:
         config_dtype = jnp.float32

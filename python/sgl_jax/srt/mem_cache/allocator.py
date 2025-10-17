@@ -144,9 +144,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
     def alloc(self, need_size: int) -> np.ndarray | None:
         # page-aligned allocation, returning contiguous indices of pages
-        assert (
-            need_size % self.page_size == 0
-        ), "The allocation size should be page-aligned"
+        assert need_size % self.page_size == 0, "The allocation size should be page-aligned"
 
         num_pages = need_size // self.page_size
         if num_pages > len(self.free_pages):
@@ -218,12 +216,8 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             part1_size = min(extend_len, current_page_capacity - pre_len)
 
             if part1_size > 0:
-                part1_indices = np.arange(
-                    last_loc + 1, last_loc + 1 + part1_size, dtype=np.int32
-                )
-                out_indices[current_output_idx : current_output_idx + part1_size] = (
-                    part1_indices
-                )
+                part1_indices = np.arange(last_loc + 1, last_loc + 1 + part1_size, dtype=np.int32)
+                out_indices[current_output_idx : current_output_idx + part1_size] = part1_indices
                 current_output_idx += part1_size
 
             remaining_tokens = extend_len - part1_size
@@ -240,9 +234,9 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
                     part2_indices = np.arange(
                         page_start, page_start + self.page_size, dtype=np.int32
                     )
-                    out_indices[
-                        current_output_idx : current_output_idx + self.page_size
-                    ] = part2_indices
+                    out_indices[current_output_idx : current_output_idx + self.page_size] = (
+                        part2_indices
+                    )
                     current_output_idx += self.page_size
                     page_idx += 1
 
@@ -250,12 +244,10 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             remaining_tokens -= part2_size
             if remaining_tokens > 0:
                 page_start = allocated_pages[page_idx] * self.page_size
-                part3_indices = np.arange(
-                    page_start, page_start + remaining_tokens, dtype=np.int32
+                part3_indices = np.arange(page_start, page_start + remaining_tokens, dtype=np.int32)
+                out_indices[current_output_idx : current_output_idx + remaining_tokens] = (
+                    part3_indices
                 )
-                out_indices[
-                    current_output_idx : current_output_idx + remaining_tokens
-                ] = part3_indices
                 current_output_idx += remaining_tokens
                 page_idx += 1
         # page_idx is the number of new pages allocated

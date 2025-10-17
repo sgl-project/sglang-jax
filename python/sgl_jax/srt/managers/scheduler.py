@@ -156,13 +156,9 @@ class Scheduler(
                     context, zmq.PUSH, port_args.detokenizer_ipc_name, False
                 )
 
-            self.recv_from_rpc = get_zmq_socket(
-                context, zmq.DEALER, port_args.rpc_ipc_name, False
-            )
+            self.recv_from_rpc = get_zmq_socket(context, zmq.DEALER, port_args.rpc_ipc_name, False)
             if self.nnodes > 1:
-                self.publisher = get_zmq_socket(
-                    context, zmq.PUB, self.pub_sub_addr, bind=True
-                )
+                self.publisher = get_zmq_socket(context, zmq.PUB, self.pub_sub_addr, bind=True)
                 self.publisher_sync = get_zmq_socket(
                     context, zmq.REP, self.pub_sub_sync_addr, bind=True
                 )
@@ -173,9 +169,7 @@ class Scheduler(
             self.send_to_tokenizer = SimpleNamespace(send_pyobj=lambda x: None)
             self.send_to_detokenizer = SimpleNamespace(send_pyobj=lambda x: None)
             if self.nnodes > 1:
-                self.subscriber = get_zmq_socket(
-                    context, zmq.SUB, self.pub_sub_addr, bind=False
-                )
+                self.subscriber = get_zmq_socket(context, zmq.SUB, self.pub_sub_addr, bind=False)
                 self.subscriber.setsockopt(zmq.SUBSCRIBE, b"")
                 self.subscriber.setsockopt(zmq.RCVTIMEO, 5000)
                 self.subscriber_sync = get_zmq_socket(
@@ -194,9 +188,7 @@ class Scheduler(
 
         # init distribution
         if self.nnodes > 1:
-            jax.distributed.initialize(
-                server_args.dist_init_addr, self.nnodes, self.node_rank
-            )
+            jax.distributed.initialize(server_args.dist_init_addr, self.nnodes, self.node_rank)
         self.mesh = create_device_mesh(
             ici_parallelism=[-1, self.tp_size, 1], dcn_parallelism=[1, 1, 1]
         )
@@ -262,17 +254,13 @@ class Scheduler(
             self.schedule_policy,
             self.tree_cache,
         )
-        assert (
-            server_args.schedule_conservativeness >= 0
-        ), "Invalid schedule_conservativeness"
+        assert server_args.schedule_conservativeness >= 0, "Invalid schedule_conservativeness"
         self.init_new_token_ratio = min(
-            global_config.default_init_new_token_ratio
-            * server_args.schedule_conservativeness,
+            global_config.default_init_new_token_ratio * server_args.schedule_conservativeness,
             1.0,
         )
         self.min_new_token_ratio = min(
-            self.init_new_token_ratio
-            * global_config.default_min_new_token_ratio_factor,
+            self.init_new_token_ratio * global_config.default_min_new_token_ratio_factor,
             1.0,
         )
         self.new_token_ratio_decay = (
@@ -327,9 +315,7 @@ class Scheduler(
                 else:
                     self.publisher_sync.send_string("NACK")
         except zmq.Again:
-            logger.error(
-                "[Publisher %s] Fails to synchronize due to timeout", self.node_rank
-            )
+            logger.error("[Publisher %s] Fails to synchronize due to timeout", self.node_rank)
             return False
         except Exception as e:
             logger.error("[Publisher %s] Encounters error: %s", self.node_rank, e)
@@ -353,9 +339,7 @@ class Scheduler(
                 )
                 return False
         except Exception as e:
-            logger.error(
-                "[Subscriber %s] Fails to synchronize with error: %s", self.node_rank, e
-            )
+            logger.error("[Subscriber %s] Fails to synchronize with error: %s", self.node_rank, e)
             return False
 
     def sync_pub_sub(self):
@@ -379,14 +363,9 @@ class Scheduler(
 
     def init_memory_pool_and_cache(self):
         server_args = self.server_args
-        self.req_to_token_pool, self.token_to_kv_pool_allocator = (
-            self.tp_worker.get_memory_pool()
-        )
+        self.req_to_token_pool, self.token_to_kv_pool_allocator = self.tp_worker.get_memory_pool()
 
-        if (
-            server_args.chunked_prefill_size is not None
-            and server_args.disable_radix_cache
-        ):
+        if server_args.chunked_prefill_size is not None and server_args.disable_radix_cache:
             self.tree_cache = ChunkCache(
                 req_to_token_pool=self.req_to_token_pool,
                 token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
@@ -509,9 +488,7 @@ class Scheduler(
         else:
             recv_reqs = self.run_subscriber()
             if recv_reqs is None:
-                raise ReceiveDataError(
-                    f"[Subscriber {self.node_rank}] Fails to receive data"
-                )
+                raise ReceiveDataError(f"[Subscriber {self.node_rank}] Fails to receive data")
         return recv_reqs
 
     def recv_requests(self) -> list[Req]:
@@ -604,9 +581,7 @@ class Scheduler(
         ret = dict(global_server_args_dict)
         ret["last_gen_throughput"] = self.last_gen_throughput
         ret["memory_usage"] = {
-            "kvcache": round(
-                self.token_to_kv_pool_allocator.get_kvcache().mem_usage, 2
-            ),
+            "kvcache": round(self.token_to_kv_pool_allocator.get_kvcache().mem_usage, 2),
             "token_capacity": int(self.max_total_num_tokens),
         }
 
@@ -638,9 +613,7 @@ class Scheduler(
                         precision_tracer._request_counter = 0
                         precision_tracer._completed_requests_count = 0
                         precision_tracer._request_traces = {}
-                        logger.info(
-                            "[SCHEDULER] Reset request_counter, completed_count and traces"
-                        )
+                        logger.info("[SCHEDULER] Reset request_counter, completed_count and traces")
 
                 if "max_requests" in tracer_config:
                     precision_tracer._max_requests = tracer_config["max_requests"]
@@ -656,9 +629,7 @@ class Scheduler(
                         precision_tracer._trace_output_file,
                     )
 
-                logger.info(
-                    "[SCHEDULER] Precision tracer state updated: %s", tracer_config
-                )
+                logger.info("[SCHEDULER] Precision tracer state updated: %s", tracer_config)
 
         except Exception as e:
             success = False
@@ -723,9 +694,7 @@ class Scheduler(
 
             # Filter batch
             last_bs = self.last_batch.batch_size()
-            self.last_batch.filter_batch(
-                chunked_req_to_exclude=list(chunked_req_to_exclude)
-            )
+            self.last_batch.filter_batch(chunked_req_to_exclude=list(chunked_req_to_exclude))
             if self.last_batch.batch_size() < last_bs:
                 self.running_batch.batch_is_full = False
 
@@ -807,9 +776,7 @@ class Scheduler(
         if len(can_run_list) == 0:
             return None
 
-        self.waiting_queue = [
-            x for x in self.waiting_queue if x not in set(can_run_list)
-        ]
+        self.waiting_queue = [x for x in self.waiting_queue if x not in set(can_run_list)]
 
         if adder.new_chunked_req is not None:
             assert self.chunked_req is None
@@ -926,16 +893,12 @@ class Scheduler(
                 model_worker_batch, self.tp_worker.get_model_runner()
             )
             logits_output, next_token_ids, cache_miss_count = (
-                self.tp_worker.forward_batch_generation(
-                    model_worker_batch, sampling_metadata=None
-                )
+                self.tp_worker.forward_batch_generation(model_worker_batch, sampling_metadata=None)
             )
             next_token_ids = next_token_ids[: model_worker_batch.real_bs]
         else:
             logits_output, next_token_ids_device, cache_miss_count = (
-                self.tp_worker.forward_batch_generation(
-                    model_worker_batch, sampling_metadata=None
-                )
+                self.tp_worker.forward_batch_generation(model_worker_batch, sampling_metadata=None)
             )
             next_token_ids = np.array(jax.device_get(next_token_ids_device))[
                 : model_worker_batch.real_bs
@@ -952,9 +915,7 @@ class Scheduler(
         else:
             extend_input_len_per_req = None
         if batch.return_logprob:
-            extend_logprob_start_len_per_req = [
-                req.extend_logprob_start_len for req in batch.reqs
-            ]
+            extend_logprob_start_len_per_req = [req.extend_logprob_start_len for req in batch.reqs]
         else:
             extend_logprob_start_len_per_req = None
 
@@ -1052,9 +1013,7 @@ class Scheduler(
             reqs = self.running_batch.reqs + self.cur_batch.reqs
 
         for req in reqs:
-            if not req.finished() and (
-                recv_req.abort_all or req.rid.startswith(recv_req.rid)
-            ):
+            if not req.finished() and (recv_req.abort_all or req.rid.startswith(recv_req.rid)):
                 # Abort method 3: set `to_abort=True`
                 # The request will still run one decode forward pass.
                 # Then we reuse all existing code to clean up the KV cache allocation.

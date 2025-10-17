@@ -34,9 +34,7 @@ def _validate_args(
 
     # Validate 'group_sizes'.
     if group_sizes.dtype != jnp.int32:
-        raise ValueError(
-            f"Expected 32-bit integer 'group_sizes' but got {group_sizes.dtype}."
-        )
+        raise ValueError(f"Expected 32-bit integer 'group_sizes' but got {group_sizes.dtype}.")
 
     return lhs, group_sizes, common.select_input_dtype(lhs, rhs)
 
@@ -198,9 +196,7 @@ def make_group_metadata(
 
     partial_tile_ids = jnp.where(partial_tile_mask, tiles_m, group_offsets[:-1] // tm)
 
-    tile_visits = (
-        jnp.histogram(partial_tile_ids, bins=tiles_m, range=(0, tiles_m - 1))[0] + 1
-    )
+    tile_visits = jnp.histogram(partial_tile_ids, bins=tiles_m, range=(0, tiles_m - 1))[0] + 1
 
     # Create the m-dimension tile ids for each grid index based on the visit
     # counts for each tile.
@@ -230,9 +226,7 @@ def make_group_metadata(
     return (group_offsets, group_ids, m_tile_ids), num_tiles
 
 
-def _get_group_size(
-    *, grid_id: jnp.ndarray, group_metadata: GroupMetadata
-) -> jnp.ndarray:
+def _get_group_size(*, grid_id: jnp.ndarray, group_metadata: GroupMetadata) -> jnp.ndarray:
     """Calculate the number of rows in the current group."""
     group_offsets, group_ids = group_metadata[:2]
     group_id = group_ids[grid_id]
@@ -324,15 +318,11 @@ def gmm(
         group_offset = jnp.array([0], dtype=jnp.int32)
     else:
         if group_offset.shape:
-            raise ValueError(
-                f"group_offset must be a ()-shaped array. Got: {group_offset.shape}."
-            )
+            raise ValueError(f"group_offset must be a ()-shaped array. Got: {group_offset.shape}.")
         group_offset = group_offset[None]
     num_current_groups = rhs.shape[0]
     num_total_groups = group_sizes.shape[0]
-    lhs, group_sizes, input_dtype = _validate_args(
-        lhs=lhs, rhs=rhs, group_sizes=group_sizes
-    )
+    lhs, group_sizes, input_dtype = _validate_args(lhs=lhs, rhs=rhs, group_sizes=group_sizes)
 
     # Gather shape information.
     m, k, n = (lhs.shape[0], lhs.shape[1], rhs.shape[2])
@@ -362,9 +352,7 @@ def gmm(
         visit_empty_groups=False,
     )
 
-    dot_general_dims = (
-        (((1,), (1,)), ((), ())) if transpose_rhs else (((1,), (0,)), ((), ()))
-    )
+    dot_general_dims = (((1,), (1,)), ((), ())) if transpose_rhs else (((1,), (0,)), ((), ()))
 
     def kernel(
         group_metadata,
@@ -389,9 +377,7 @@ def gmm(
                 prev_grid_id = jnp.where(grid_id > 0, grid_id - 1, 0)
                 is_first_processed_group = grid_id == 0
                 m_tile_changed = m_tile_ids[grid_id] != m_tile_ids[prev_grid_id]
-                first_time_seeing_out = jnp.logical_or(
-                    is_first_processed_group, m_tile_changed
-                )
+                first_time_seeing_out = jnp.logical_or(is_first_processed_group, m_tile_changed)
 
                 @pl.when(first_time_seeing_out)
                 def _init_out():
@@ -414,9 +400,9 @@ def gmm(
                 tn=tn,
             )
             to_store = acc_scratch[...]
-            out[...] = jax.lax.select(
-                mask[...], to_store, out[...].astype(jnp.float32)
-            ).astype(preferred_element_type)
+            out[...] = jax.lax.select(mask[...], to_store, out[...].astype(jnp.float32)).astype(
+                preferred_element_type
+            )
 
         def _accum(is_last_k_tile):
             if is_last_k_tile:
@@ -491,9 +477,7 @@ def gmm(
     max_active_tiles = group_metadata[1].size
     bytes_accessed = (lhs_bytes * tiles_n) + (rhs_bytes * max_active_tiles) + out_bytes
     flops = 2 * m * k * n
-    cost_estimate = pl.CostEstimate(
-        flops=flops, bytes_accessed=bytes_accessed, transcendentals=0
-    )
+    cost_estimate = pl.CostEstimate(flops=flops, bytes_accessed=bytes_accessed, transcendentals=0)
 
     call_gmm = pl.pallas_call(
         kernel,

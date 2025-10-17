@@ -127,9 +127,7 @@ class ChatCompletionSampler(SamplerBase):
 
     def __call__(self, message_list: MessageList) -> str:
         if self.system_message:
-            message_list = [
-                self._pack_message("system", self.system_message)
-            ] + message_list
+            message_list = [self._pack_message("system", self.system_message)] + message_list
         trial = 0
         while True:
             try:
@@ -425,9 +423,7 @@ def make_report_from_example_htmls(htmls: list[str]):
     """
     Create a standalone HTML report from a list of example htmls
     """
-    return jinja_env.from_string(_report_template).render(
-        score=None, metrics={}, htmls=htmls
-    )
+    return jinja_env.from_string(_report_template).render(score=None, metrics={}, htmls=htmls)
 
 
 def download_dataset(path, url):

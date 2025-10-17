@@ -53,9 +53,7 @@ def main():
     )
 
     model_path = os.environ.get("TEST_MODEL_PATH", "./test_models/your_model_dir")
-    model_config = ModelConfig(
-        model_path=model_path, trust_remote_code=True, dtype="bfloat16"
-    )
+    model_config = ModelConfig(model_path=model_path, trust_remote_code=True, dtype="bfloat16")
     load_config = LoadConfig(load_format=LoadFormat.JAX)
     rng = nnx.Rngs(42)
 

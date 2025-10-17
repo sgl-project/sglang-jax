@@ -177,10 +177,7 @@ def main():
                 for page_size in page_size_config:
                     for max_kv_cache_tokens in max_kv_cache_tokens_config:
                         for max_num_batched_tokens in max_num_batched_tokens_config:
-                            if (
-                                q_head_num < kv_head_num
-                                or q_head_num % kv_head_num != 0
-                            ):
+                            if q_head_num < kv_head_num or q_head_num % kv_head_num != 0:
                                 continue
                             all_combinations.append(
                                 (
@@ -215,9 +212,7 @@ def main():
     ) in enumerate(all_combinations):
         best_output = inf
         best_config = None
-        for i, (num_kv_pages_per_blk, num_queries_per_block) in enumerate(
-            block_spec_configs
-        ):
+        for i, (num_kv_pages_per_blk, num_queries_per_block) in enumerate(block_spec_configs):
             try:
                 (
                     flash_time,

@@ -13,12 +13,8 @@ def create_bench_data(
 ):
     key = jax.random.PRNGKey(42)
     keys = jax.random.split(key, 3)
-    new_value = jax.random.normal(
-        keys[1], (new_kv_len, kv_head_num, head_dim), dtype=dtype
-    )
-    cache = jax.random.normal(
-        keys[2], (cache_max_tokens, kv_head_num, head_dim), dtype=dtype
-    )
+    new_value = jax.random.normal(keys[1], (new_kv_len, kv_head_num, head_dim), dtype=dtype)
+    cache = jax.random.normal(keys[2], (cache_max_tokens, kv_head_num, head_dim), dtype=dtype)
     return new_value, cache
 
 
@@ -37,8 +33,7 @@ def create_random_cache_start_loc(cache_max_tokens, new_kv_len, page_size=128):
     new_value_page_num = cdiv(new_kv_len, page_size)
     max_cache_page_num = cdiv(cache_max_tokens, page_size)
     cache_start_loc = (
-        jax.random.randint(key, (new_value_page_num,), 0, max_cache_page_num - 1)
-        * page_size
+        jax.random.randint(key, (new_value_page_num,), 0, max_cache_page_num - 1) * page_size
     )
     return cache_start_loc
 

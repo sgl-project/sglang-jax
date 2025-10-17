@@ -181,10 +181,7 @@ def main():
                                 )
 
                             for max_num_batched_tokens in max_num_batched_tokens_config:
-                                if (
-                                    q_head_num < kv_head_num
-                                    or q_head_num % kv_head_num != 0
-                                ):
+                                if q_head_num < kv_head_num or q_head_num % kv_head_num != 0:
                                     continue
                                 all_combinations.append(
                                     (

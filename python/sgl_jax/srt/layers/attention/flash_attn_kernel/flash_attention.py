@@ -59,9 +59,9 @@ def ref_ragged_paged_attention_fused(
         indices = page_indices[i]
         q = queries[q_start:q_end]
 
-        kv_fused = kv_pages_fused[indices, :, :, :].reshape(
-            -1, num_kv_heads_interleaved, head_dim
-        )[:kv_len]
+        kv_fused = kv_pages_fused[indices, :, :, :].reshape(-1, num_kv_heads_interleaved, head_dim)[
+            :kv_len
+        ]
 
         # Head format: [K1, V1, K2, V2, ...]
         k = kv_fused[:, 0::2, :]  # indices 0, 2, 4, ...
@@ -263,9 +263,7 @@ def _ragged_paged_attention_kernel(
     bq_sz,
 ):
     assert q_hbm_ref.shape == o_hbm_ref.shape
-    assert (
-        q_hbm_ref.shape[-1] == kv_cache_fused_hbm_ref.shape[-1]
-    )  # head_dim should match
+    assert q_hbm_ref.shape[-1] == kv_cache_fused_hbm_ref.shape[-1]  # head_dim should match
     (
         actual_num_kv_heads,
         max_num_tokens,
@@ -326,9 +324,7 @@ def _ragged_paged_attention_kernel(
         kv_left_frm_cache = jnp.maximum(kv_left - q_len, 0)
         kv_left_frm_new = kv_left - kv_left_frm_cache
         bkv_p_frm_cache = jnp.minimum(cdiv(kv_left_frm_cache, page_size), bkv_p)
-        bkv_sz_frm_new = jnp.minimum(
-            jnp.maximum(bkv_sz - kv_left_frm_cache, 0), kv_left_frm_new
-        )
+        bkv_sz_frm_new = jnp.minimum(jnp.maximum(bkv_sz - kv_left_frm_cache, 0), kv_left_frm_new)
 
         start_kv_page_idx = cdiv(cu_kv_lens_ref[seq_idx], page_size)
         page_indices_offset = start_kv_page_idx + kv_p_start
@@ -486,9 +482,7 @@ def _ragged_paged_attention_kernel(
             .at[bq_sem_idx, kv_head_idx]
             .reshape(bq_sz * num_q_heads_per_kv_head_per_packing, head_dim)
         )
-        return pltpu.bitcast(
-            q_ref[: actual_bq_sz * num_q_heads_per_kv_head_per_packing], q_dtype
-        )
+        return pltpu.bitcast(q_ref[: actual_bq_sz * num_q_heads_per_kv_head_per_packing], q_dtype)
 
     def strided_load(ref, start, step, *, dtype=None):
         assert get_dtype_packing(ref.dtype) == 1
@@ -511,9 +505,7 @@ def _ragged_paged_attention_kernel(
         step //= kv_packing
 
         kv_ref = (
-            bkv_fused_x2_ref.bitcast(jnp.uint32)
-            .at[bkv_sem_idx]
-            .reshape(bkv_sz * step, head_dim)
+            bkv_fused_x2_ref.bitcast(jnp.uint32).at[bkv_sem_idx].reshape(bkv_sz * step, head_dim)
         )
 
         def _mask_kv(k, v):
@@ -547,9 +539,9 @@ def _ragged_paged_attention_kernel(
         assert src.shape[-1] % 128 == 0
         target_minor = align_to(shape[-1], src.shape[-1])
         # no-op concatenation.
-        return jnp.concatenate(
-            [src for _ in range(target_minor // src.shape[-1])], axis=-1
-        )[..., : shape[-1]]
+        return jnp.concatenate([src for _ in range(target_minor // src.shape[-1])], axis=-1)[
+            ..., : shape[-1]
+        ]
 
     def process(static_q_len=None):
         num_bkv = cdiv(kv_len, bkv_sz)
@@ -692,12 +684,9 @@ def _ragged_paged_attention_kernel(
                         kv_len
                         - q_len
                         + bq_idx * bq_sz
-                        + lax.broadcasted_iota(jnp.int32, s.shape, 1)
-                        // num_q_heads_per_kv_head
+                        + lax.broadcasted_iota(jnp.int32, s.shape, 1) // num_q_heads_per_kv_head
                     )
-                    k_span = bkv_idx * bkv_sz + lax.broadcasted_iota(
-                        jnp.int32, s.shape, 2
-                    )
+                    k_span = bkv_idx * bkv_sz + lax.broadcasted_iota(jnp.int32, s.shape, 2)
                     mask = q_span < k_span
 
                     if sliding_window is not None:
@@ -714,9 +703,7 @@ def _ragged_paged_attention_kernel(
                         head_acc_ref = acc_ref.at[head_idx, : q_batch.shape[1]]
 
                         def load_with_init(ref, init_val):
-                            return jnp.where(
-                                bkv_idx == 0, jnp.full_like(ref, init_val), ref[...]
-                            )
+                            return jnp.where(bkv_idx == 0, jnp.full_like(ref, init_val), ref[...])
 
                         s_head = s[head_idx]
                         s_head_rowmax = jnp.max(s_head, axis=1, keepdims=True)
@@ -975,13 +962,9 @@ def static_validate_inputs_fused(
     if k.shape != v.shape:
         raise ValueError(f"Expected {k.shape=} to be equal to {v.shape=}")
     if not (q.shape[0] == k.shape[0] == v.shape[0]):
-        raise ValueError(
-            f"Expected {q.shape[0]=} to be equal to {k.shape[0]=} and {v.shape[0]=}"
-        )
+        raise ValueError(f"Expected {q.shape[0]=} to be equal to {k.shape[0]=} and {v.shape[0]=}")
     if not (q.shape[2] == k.shape[2] == v.shape[2]):
-        raise ValueError(
-            f"Expected {q.shape[2]=} to be equal to {k.shape[2]=} and {v.shape[2]=}"
-        )
+        raise ValueError(f"Expected {q.shape[2]=} to be equal to {k.shape[2]=} and {v.shape[2]=}")
 
     actual_head_dim = q.shape[2]
     actual_num_q_heads = q.shape[1]
@@ -994,9 +977,7 @@ def static_validate_inputs_fused(
 
     # Validate fused KV cache
     if len(kv_cache_fused.shape) != 4:
-        raise ValueError(
-            f"Expected 4D kv_cache_fused, got shape {kv_cache_fused.shape}"
-        )
+        raise ValueError(f"Expected 4D kv_cache_fused, got shape {kv_cache_fused.shape}")
 
     _, page_size, cache_num_kv_heads_interleaved, head_dim = kv_cache_fused.shape
 
@@ -1012,9 +993,7 @@ def static_validate_inputs_fused(
         )
 
     if head_dim != align_to(actual_head_dim, 128):
-        raise ValueError(
-            f"Expected {head_dim=} is equal to {align_to(actual_head_dim, 128)=}"
-        )
+        raise ValueError(f"Expected {head_dim=} is equal to {align_to(actual_head_dim, 128)=}")
 
     if not (kv_cache_fused.dtype == k.dtype == v.dtype):
         raise ValueError(
@@ -1025,11 +1004,7 @@ def static_validate_inputs_fused(
         raise ValueError(f"Expected {kv_cache_fused.dtype=} to be a floating point.")
 
     if not (
-        jnp.int32
-        == kv_lens.dtype
-        == page_indices.dtype
-        == cu_q_lens.dtype
-        == distribution.dtype
+        jnp.int32 == kv_lens.dtype == page_indices.dtype == cu_q_lens.dtype == distribution.dtype
     ):
         raise ValueError(
             f"Expected int32 dtype for {kv_lens.dtype=}, {page_indices.dtype=},"
@@ -1325,9 +1300,7 @@ def ragged_paged_attention(
         )
     )
 
-    output, updated_kv_cache_fused = kernel(
-        *scalar_prefetches, q, kv, kv_cache_fused_processed
-    )
+    output, updated_kv_cache_fused = kernel(*scalar_prefetches, q, kv, kv_cache_fused_processed)
     return (
         prepare_outputs(output, actual_num_q_heads_per_kv_head, actual_head_dim),
         prepare_updated_kv_cache_fused(
@@ -1403,9 +1376,7 @@ def prepare_updated_kv_cache_fused(
         head_dim,
     ) = kv_cache_fused.shape
 
-    actual_num_kv_heads_interleaved = (
-        actual_num_kv_heads * 2
-    )  # Head interleaving: K1,V1,K2,V2,...
+    actual_num_kv_heads_interleaved = actual_num_kv_heads * 2  # Head interleaving: K1,V1,K2,V2,...
     return kv_cache_fused.reshape(
         -1,
         num_kv_heads_interleaved_packed * kv_packing,

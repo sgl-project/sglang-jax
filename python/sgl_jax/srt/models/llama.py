@@ -210,9 +210,7 @@ class LlamaDecoderLayer(nnx.Module):
         self.layer_id = layer_id
         rope_theta = getattr(config, "rope_theta", 10000)
         rope_scaling = getattr(config, "rope_scaling", None)
-        if rope_scaling is not None and getattr(
-            config, "original_max_position_embeddings", None
-        ):
+        if rope_scaling is not None and getattr(config, "original_max_position_embeddings", None):
             rope_scaling["original_max_position_embeddings"] = (
                 config.original_max_position_embeddings
             )
@@ -220,9 +218,7 @@ class LlamaDecoderLayer(nnx.Module):
         max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
         # Support llamafy/Qwen-Qwen2.5-7B-Instruct-llamafied with attention_bias
         # Support internlm/internlm-7b with bias
-        attention_bias = getattr(config, "attention_bias", False) or getattr(
-            config, "bias", False
-        )
+        attention_bias = getattr(config, "attention_bias", False) or getattr(config, "bias", False)
 
         head_dim = getattr(config, "head_dim", None)
         self.self_attn = LlamaAttention(
@@ -392,9 +388,7 @@ class LlamaForCausalLM(nnx.Module):
         logger.info("LlamaForCausalLM config dtype: %s", self.dtype)
         self.transformer = LlamaModel(config, dtype=self.dtype, rngs=rngs)
         self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size, rngs=rngs)
-        self.logits_processor = LogitsProcessor(
-            config.vocab_size, self.lm_head, self.mesh
-        )
+        self.logits_processor = LogitsProcessor(config.vocab_size, self.lm_head, self.mesh)
 
     def load_weights(self, model_config: ModelConfig, rng_key: jax.Array):
         self.rng = nnx.Rngs(rng_key)

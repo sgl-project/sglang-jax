@@ -91,9 +91,7 @@ class DetokenizerManager:
             # if recv_obj is not None:
             self.send_to_tokenizer.send_pyobj(output)
 
-    def trim_matched_stop(
-        self, output: str | list[int], finished_reason: dict, no_stop_trim: bool
-    ):
+    def trim_matched_stop(self, output: str | list[int], finished_reason: dict, no_stop_trim: bool):
         if no_stop_trim or not finished_reason:
             return output
 
@@ -158,10 +156,7 @@ class DetokenizerManager:
                             if hasattr(lst, "__len__") and len(lst) == 1:
                                 return [int(lst.item())]
                             elif hasattr(lst, "__iter__"):
-                                return [
-                                    int(x.item() if hasattr(x, "item") else x)
-                                    for x in lst
-                                ]
+                                return [int(x.item() if hasattr(x, "item") else x) for x in lst]
                             else:
                                 return [int(lst.item())]
                         else:
@@ -178,9 +173,7 @@ class DetokenizerManager:
                                 result.append(int(item.item()))
                             elif hasattr(item, "__iter__"):
                                 for x in item:
-                                    result.append(
-                                        int(x.item() if hasattr(x, "item") else x)
-                                    )
+                                    result.append(int(x.item() if hasattr(x, "item") else x))
                             else:
                                 result.append(int(item.item()))
                         else:

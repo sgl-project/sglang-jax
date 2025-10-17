@@ -16,10 +16,7 @@ class BatchedPresencePenalizer(_BatchedPenalizer):
         self._is_prepared = False
 
     def _is_required(self) -> bool:
-        return any(
-            req.sampling_params.presence_penalty != 0.0
-            for req in self.orchestrator.reqs()
-        )
+        return any(req.sampling_params.presence_penalty != 0.0 for req in self.orchestrator.reqs())
 
     def _prepare(self):
         # Only keep the presence penalty values, not the large penalty array
@@ -56,6 +53,4 @@ class BatchedPresencePenalizer(_BatchedPenalizer):
         self.presence_penalties = np.concatenate(
             [self.presence_penalties, their.presence_penalties], axis=0
         )
-        self.token_presence = np.concatenate(
-            [self.token_presence, their.token_presence], axis=0
-        )
+        self.token_presence = np.concatenate([self.token_presence, their.token_presence], axis=0)

@@ -103,9 +103,7 @@ class TestParamsValidation(CustomTestCase):
                 timeout=10,
             )
             # return 400 rather than failed
-            self.assertEqual(
-                response.status_code, 400, f"Expected 400, got {response.status_code}"
-            )
+            self.assertEqual(response.status_code, 400, f"Expected 400, got {response.status_code}")
         except Exception as e:
             self.fail(f"Server should handle malformed JSON gracefully, but got: {e}")
 

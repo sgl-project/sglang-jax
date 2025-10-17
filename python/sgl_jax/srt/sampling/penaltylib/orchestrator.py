@@ -74,9 +74,7 @@ class BatchedPenalizerOrchestrator:
         )
 
         # Get active penalizers
-        active_penalizers = [
-            (type(p), p) for p in self.penalizers.values() if p.is_prepared()
-        ]
+        active_penalizers = [(type(p), p) for p in self.penalizers.values() if p.is_prepared()]
 
         if len(active_penalizers) == 0:
             return None
@@ -94,10 +92,7 @@ class BatchedPenalizerOrchestrator:
             result = None
 
             for penalty_type in penalty_order:
-                if (
-                    penalty_type in self.penalizers
-                    and self.penalizers[penalty_type].is_prepared()
-                ):
+                if penalty_type in self.penalizers and self.penalizers[penalty_type].is_prepared():
                     penalty_values = self.penalizers[penalty_type].compute_penalty()
                     if result is None:
                         result = penalty_values.copy()

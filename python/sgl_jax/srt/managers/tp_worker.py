@@ -63,9 +63,7 @@ class ModelWorker:
         # Each process may have different random_seed. After broadcast, all processes will have the same random_seed.
         if server_args.random_seed is None:
             with jax.default_device(jax.local_devices()[0]):
-                seed_to_broadcast = (
-                    server_args.random_seed if jax.process_index() == 0 else 0
-                )
+                seed_to_broadcast = server_args.random_seed if jax.process_index() == 0 else 0
                 self.random_seed = broadcast_one_to_all(seed_to_broadcast).item()
         else:
             self.random_seed = server_args.random_seed
@@ -127,9 +125,7 @@ class ModelWorker:
             self.max_total_num_tokens - 1,
         )
         self.max_req_input_len = self.max_req_len - 5
-        assert (
-            self.max_req_len > 0 and self.max_req_input_len > 0
-        ), "Memory pool size is too small"
+        assert self.max_req_len > 0 and self.max_req_input_len > 0, "Memory pool size is too small"
 
         # Sync random seed across TP workers
         # Each process may have different random_seed. After broadcast, all processes will have the same random_seed.
@@ -138,9 +134,7 @@ class ModelWorker:
         # A reference make this class has the same member as TpModelWorkerClient
         self.worker = self
 
-        self.max_padded_batch_size, self.max_padded_num_tokens = (
-            self.get_max_padded_size()
-        )
+        self.max_padded_batch_size, self.max_padded_num_tokens = self.get_max_padded_size()
 
         # precompile
         self.precompile_token_paddings = server_args.precompile_token_paddings
@@ -168,9 +162,7 @@ class ModelWorker:
         # padding cache_loc_paddings
         # note: the length of following two cache_loc_paddings must keep the same to length of separate bs_paddings.
         self.precompile_cache_loc_paddings = [
-            (item * self.max_req_len + self.page_size - 1)
-            // self.page_size
-            * self.page_size
+            (item * self.max_req_len + self.page_size - 1) // self.page_size * self.page_size
             for item in self.precompile_bs_paddings
         ]
 
@@ -180,10 +172,7 @@ class ModelWorker:
         if self.precompile_token_paddings is None:
             self.precompile_token_paddings = PRECOMPILE_DEFAULT_TOKEN_PADDINGS
         for item in self.precompile_token_paddings:
-            if (
-                item >= self.max_padded_batch_size
-                and item <= self.max_padded_num_tokens
-            ):
+            if item >= self.max_padded_batch_size and item <= self.max_padded_num_tokens:
                 normalized_token_paddings.append(item)
 
         normalized_token_paddings.sort()
@@ -217,9 +206,7 @@ class ModelWorker:
                 bs, num_tokens = pair[0], pair[1]
                 pbar.set_postfix(bs=bs, tokens=num_tokens)
                 if bs > num_tokens:
-                    logger.warning(
-                        "bs=%s > num_tokens=%s, skip this pair", bs, num_tokens
-                    )
+                    logger.warning("bs=%s > num_tokens=%s, skip this pair", bs, num_tokens)
                     continue
                 model_worker_batch = self.generate_model_worker_batch(
                     bs,
@@ -234,16 +221,12 @@ class ModelWorker:
                     model_worker_batch, self.model_runner
                 )
                 if future_token_ids_map is not None:
-                    model_worker_batch.forward_batch.input_ids = (
-                        resolve_future_token_ids(
-                            model_worker_batch.forward_batch.input_ids,
-                            future_token_ids_map,
-                        )
+                    model_worker_batch.forward_batch.input_ids = resolve_future_token_ids(
+                        model_worker_batch.forward_batch.input_ids,
+                        future_token_ids_map,
                     )
 
-                self.forward_batch_generation(
-                    model_worker_batch, None, False, sampling_metadata
-                )
+                self.forward_batch_generation(model_worker_batch, None, False, sampling_metadata)
         end_time = time.perf_counter()
         logger.info("[EXTEND] Precompile finished in %.0f secs", end_time - start_time)
 
@@ -254,16 +237,12 @@ class ModelWorker:
             self.precompile_bs_paddings,
         )
 
-        with tqdm(
-            self.precompile_bs_paddings, desc="[DECODE] PRECOMPILE", leave=False
-        ) as pbar:
+        with tqdm(self.precompile_bs_paddings, desc="[DECODE] PRECOMPILE", leave=False) as pbar:
             for bs in pbar:
                 pbar.set_postfix(bs=bs)
                 # use same page aligned with precompile cache_loc_paddings
                 aligned_cache_loc_size = (
-                    (bs * self.max_req_len + self.page_size - 1)
-                    // self.page_size
-                    * self.page_size
+                    (bs * self.max_req_len + self.page_size - 1) // self.page_size * self.page_size
                 )
                 model_worker_batch = self.generate_model_worker_batch(
                     bs,
@@ -278,11 +257,9 @@ class ModelWorker:
                     model_worker_batch, self.model_runner
                 )
                 if future_token_ids_map is not None:
-                    model_worker_batch.forward_batch.input_ids = (
-                        resolve_future_token_ids(
-                            model_worker_batch.forward_batch.input_ids,
-                            future_token_ids_map,
-                        )
+                    model_worker_batch.forward_batch.input_ids = resolve_future_token_ids(
+                        model_worker_batch.forward_batch.input_ids,
+                        future_token_ids_map,
                     )
                 _, next_token_ids, _ = self.forward_batch_generation(
                     model_worker_batch, None, False, sampling_metadata
@@ -301,17 +278,13 @@ class ModelWorker:
             self.precompile_bs_paddings,
         )
 
-        with tqdm(
-            self.precompile_bs_paddings, desc="[PENALTIES] PRECOMPILE", leave=False
-        ) as pbar:
+        with tqdm(self.precompile_bs_paddings, desc="[PENALTIES] PRECOMPILE", leave=False) as pbar:
             for bs in pbar:
                 pbar.set_postfix(bs=bs)
 
                 # Create model worker batch
                 aligned_cache_loc_size = (
-                    (bs * self.max_req_len + self.page_size - 1)
-                    // self.page_size
-                    * self.page_size
+                    (bs * self.max_req_len + self.page_size - 1) // self.page_size * self.page_size
                 )
                 model_worker_batch = self.generate_model_worker_batch(
                     bs,
@@ -323,10 +296,8 @@ class ModelWorker:
 
                 # Create sampling metadata with all penalty shapes for comprehensive compilation
                 # This ensures JAX compiles all penalty application branches in lax.cond
-                sampling_metadata = (
-                    SamplingMetadata.from_model_worker_batch_for_precompile(
-                        model_worker_batch, 0, self.mesh
-                    )
+                sampling_metadata = SamplingMetadata.from_model_worker_batch_for_precompile(
+                    model_worker_batch, 0, self.mesh
                 )
 
                 # Initialize forward batch
@@ -335,11 +306,9 @@ class ModelWorker:
                 )
 
                 if future_token_ids_map is not None:
-                    model_worker_batch.forward_batch.input_ids = (
-                        resolve_future_token_ids(
-                            model_worker_batch.forward_batch.input_ids,
-                            future_token_ids_map,
-                        )
+                    model_worker_batch.forward_batch.input_ids = resolve_future_token_ids(
+                        model_worker_batch.forward_batch.input_ids,
+                        future_token_ids_map,
                     )
 
                 # Run forward with penalty application
@@ -351,15 +320,11 @@ class ModelWorker:
                     set_future_token_ids(future_token_ids_map, 0, next_token_ids)
 
         end_time = time.perf_counter()
-        logger.info(
-            "[PENALTIES] Precompile finished in %.0f secs", end_time - start_time
-        )
+        logger.info("[PENALTIES] Precompile finished in %.0f secs", end_time - start_time)
 
     def set_forward_metadata(self, model_worker_batch: ModelWorkerBatch):
         self.model_runner.attn_backend.forward_metadata = (
-            self.worker.model_runner.attn_backend.get_forward_metadata(
-                model_worker_batch
-            )
+            self.worker.model_runner.attn_backend.get_forward_metadata(model_worker_batch)
         )
 
     def get_max_padded_size(self):
@@ -373,10 +338,7 @@ class ModelWorker:
         # Use chunked prefill size if enabled (> 0), otherwise use max prefill tokens
         # Take minimum with max_prefill_tokens as upper bound
         max_padded_num_tokens = self.max_prefill_tokens
-        if (
-            self.chunked_prefill_size > 0
-            and max_padded_num_tokens > self.chunked_prefill_size
-        ):
+        if self.chunked_prefill_size > 0 and max_padded_num_tokens > self.chunked_prefill_size:
             max_padded_num_tokens = self.chunked_prefill_size
 
         # Batch size is constrained by both max_running_requests and available tokens divide by page_size
@@ -420,9 +382,7 @@ class ModelWorker:
             real_bs=bs,
             req_pool_indices=np.arange(bs, dtype=np.int32),
             seq_lens=np.array([1] * bs, dtype=np.int32),
-            out_cache_loc=np.concat(
-                [valid_out_cache_loc, invalid_out_cache_loc], axis=0
-            ),
+            out_cache_loc=np.concat([valid_out_cache_loc, invalid_out_cache_loc], axis=0),
             return_logprob=False,
             sampling_info=SamplingBatchInfo.generate_for_precompile(
                 bs, self.model_config.vocab_size, do_penalties=do_penalties
@@ -431,9 +391,7 @@ class ModelWorker:
             positions=np.concat([valid_positions, invalid_positions], axis=0),
             extend_start_loc=np.arange(bs, dtype=np.int64),
             cache_loc=np.concat([valid_cache_loc, invalid_cache_loc], axis=0),
-            extend_prefix_lens=(
-                np.array([0] * bs) if mode == ForwardMode.EXTEND else None
-            ),
+            extend_prefix_lens=(np.array([0] * bs) if mode == ForwardMode.EXTEND else None),
             extend_seq_lens=np.array([1] * bs) if mode == ForwardMode.EXTEND else None,
             top_logprobs_nums=None,
             token_ids_logprobs=None,
@@ -483,10 +441,8 @@ class ModelWorker:
             forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
 
         if forward_metadata is None:
-            forward_metadata = (
-                self.worker.model_runner.attn_backend.get_forward_metadata(
-                    model_worker_batch
-                )
+            forward_metadata = self.worker.model_runner.attn_backend.get_forward_metadata(
+                model_worker_batch
             )
 
         if sampling_metadata is None:
@@ -514,9 +470,7 @@ class ModelWorker:
             )
         logits_output, cache_miss_count = self.model_runner.forward(
             forward_batch,
-            logits_metadata=LogitsMetadata.from_model_worker_batch(
-                model_worker_batch, self.mesh
-            ),
+            logits_metadata=LogitsMetadata.from_model_worker_batch(model_worker_batch, self.mesh),
         )
 
         if launch_done is not None:
@@ -590,9 +544,7 @@ class MockModelWorker:
             self.max_total_num_tokens - 1,
         )
         self.max_req_input_len = self.max_req_len - 5
-        assert (
-            self.max_req_len > 0 and self.max_req_input_len > 0
-        ), "Memory pool size is too small"
+        assert self.max_req_len > 0 and self.max_req_input_len > 0, "Memory pool size is too small"
 
         # A reference make this class has the same member as TpModelWorkerClient
         self.worker = self

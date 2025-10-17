@@ -31,9 +31,7 @@ def run_curl(args):
     print(f"Payload: {json.dumps(payload, indent=2)}")
 
     try:
-        response = requests.post(
-            f"{base_url}/generate", json=payload, headers=headers, timeout=30
-        )
+        response = requests.post(f"{base_url}/generate", json=payload, headers=headers, timeout=30)
 
         print(f"Status Code: {response.status_code}")
 
