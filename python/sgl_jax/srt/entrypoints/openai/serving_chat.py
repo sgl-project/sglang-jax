@@ -167,6 +167,7 @@ class OpenAIServingChat(OpenAIServingBase):
             openai_compatible_messages.append(processed_msg)
 
         # Handle assistant prefix for continue_final_message
+        assistant_prefix = None
         if (
             openai_compatible_messages
             and openai_compatible_messages[-1]["role"] == "assistant"
