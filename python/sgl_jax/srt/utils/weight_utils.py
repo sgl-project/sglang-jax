@@ -31,11 +31,7 @@ class WeightMapping:
             self.sharding = self._infer_default_sharding()
 
     def _infer_default_sharding(self) -> tuple:
-        path = (
-            self.target_path[0]
-            if isinstance(self.target_path, list)
-            else self.target_path
-        )
+        path = self.target_path[0] if isinstance(self.target_path, list) else self.target_path
 
         if any(pattern in path for pattern in ["embedding", "lm_head"]):
             return (None, None)
@@ -154,7 +150,7 @@ class WeightLoader:
                     safe_open(st_file, framework="flax") as f,
                 ):
                     needed_keys = []
-                    for name in f:
+                    for name in f.keys():  # noqa: SIM118
                         if not name.startswith("model.layers."):
                             needed_keys.append(name)
                             continue
@@ -215,9 +211,7 @@ class WeightLoader:
             processed_weight = jnp.reshape(processed_weight, mapping.reshape)
 
         if mapping.head_dim_padding and self.head_dim_pad > 0:
-            processed_weight = self._apply_head_dim_padding(
-                processed_weight, hf_key, mapping
-            )
+            processed_weight = self._apply_head_dim_padding(processed_weight, hf_key, mapping)
 
         if mapping.kv_head_padding:
             processed_weight = self._apply_kv_head_padding(processed_weight, hf_key)
@@ -264,15 +258,11 @@ class WeightLoader:
                 q_bias = jnp.pad(q_bias, ((0, 0), (0, self.head_dim_pad)))
                 q_bias = jnp.reshape(q_bias, (self.num_heads * self.head_dim,))
 
-                k_bias = jnp.reshape(
-                    k_bias, (self.num_kv_heads, self.head_dim_original)
-                )
+                k_bias = jnp.reshape(k_bias, (self.num_kv_heads, self.head_dim_original))
                 k_bias = jnp.pad(k_bias, ((0, 0), (0, self.head_dim_pad)))
                 k_bias = jnp.reshape(k_bias, (self.num_kv_heads * self.head_dim,))
 
-                v_bias = jnp.reshape(
-                    v_bias, (self.num_kv_heads, self.head_dim_original)
-                )
+                v_bias = jnp.reshape(v_bias, (self.num_kv_heads, self.head_dim_original))
                 v_bias = jnp.pad(v_bias, ((0, 0), (0, self.head_dim_pad)))
                 v_bias = jnp.reshape(v_bias, (self.num_kv_heads * self.head_dim,))
 
@@ -296,9 +286,7 @@ class WeightLoader:
                         q_weight,
                         (self.hidden_size, self.num_heads, self.head_dim_original),
                     )
-                    q_weight = jnp.pad(
-                        q_weight, ((0, 0), (0, 0), (0, self.head_dim_pad))
-                    )
+                    q_weight = jnp.pad(q_weight, ((0, 0), (0, 0), (0, self.head_dim_pad)))
                     q_weight = jnp.reshape(
                         q_weight, (self.hidden_size, self.num_heads * self.head_dim)
                     )
@@ -307,9 +295,7 @@ class WeightLoader:
                         k_weight,
                         (self.hidden_size, self.num_kv_heads, self.head_dim_original),
                     )
-                    k_weight = jnp.pad(
-                        k_weight, ((0, 0), (0, 0), (0, self.head_dim_pad))
-                    )
+                    k_weight = jnp.pad(k_weight, ((0, 0), (0, 0), (0, self.head_dim_pad)))
                     k_weight = jnp.reshape(
                         k_weight, (self.hidden_size, self.num_kv_heads * self.head_dim)
                     )
@@ -318,9 +304,7 @@ class WeightLoader:
                         v_weight,
                         (self.hidden_size, self.num_kv_heads, self.head_dim_original),
                     )
-                    v_weight = jnp.pad(
-                        v_weight, ((0, 0), (0, 0), (0, self.head_dim_pad))
-                    )
+                    v_weight = jnp.pad(v_weight, ((0, 0), (0, 0), (0, self.head_dim_pad)))
                     v_weight = jnp.reshape(
                         v_weight, (self.hidden_size, self.num_kv_heads * self.head_dim)
                     )
@@ -329,9 +313,7 @@ class WeightLoader:
                         q_weight,
                         (self.num_heads, self.head_dim_original, self.hidden_size),
                     )
-                    q_weight = jnp.pad(
-                        q_weight, ((0, 0), (0, self.head_dim_pad), (0, 0))
-                    )
+                    q_weight = jnp.pad(q_weight, ((0, 0), (0, self.head_dim_pad), (0, 0)))
                     q_weight = jnp.reshape(
                         q_weight, (self.num_heads * self.head_dim, self.hidden_size)
                     )
@@ -340,9 +322,7 @@ class WeightLoader:
                         k_weight,
                         (self.num_kv_heads, self.head_dim_original, self.hidden_size),
                     )
-                    k_weight = jnp.pad(
-                        k_weight, ((0, 0), (0, self.head_dim_pad), (0, 0))
-                    )
+                    k_weight = jnp.pad(k_weight, ((0, 0), (0, self.head_dim_pad), (0, 0)))
                     k_weight = jnp.reshape(
                         k_weight, (self.num_kv_heads * self.head_dim, self.hidden_size)
                     )
@@ -351,9 +331,7 @@ class WeightLoader:
                         v_weight,
                         (self.num_kv_heads, self.head_dim_original, self.hidden_size),
                     )
-                    v_weight = jnp.pad(
-                        v_weight, ((0, 0), (0, self.head_dim_pad), (0, 0))
-                    )
+                    v_weight = jnp.pad(v_weight, ((0, 0), (0, self.head_dim_pad), (0, 0)))
                     v_weight = jnp.reshape(
                         v_weight, (self.num_kv_heads * self.head_dim, self.hidden_size)
                     )
@@ -363,18 +341,14 @@ class WeightLoader:
         for split_weight, jax_path in zip(splits, jax_paths):
             processed_weight = split_weight
 
-            if mapping.kv_head_padding and (
-                "k_proj" in jax_path or "v_proj" in jax_path
-            ):
+            if mapping.kv_head_padding and ("k_proj" in jax_path or "v_proj" in jax_path):
                 processed_weight = self._apply_kv_head_padding(processed_weight, hf_key)
 
             sharded_weight = self._shard_weight(processed_weight, mapping.sharding)
 
             model_param = self._get_param(params, jax_path)
             model_param.value = sharded_weight
-            logger.debug(
-                "Split %s -> %s, shape: %s", hf_key, jax_path, processed_weight.shape
-            )
+            logger.debug("Split %s -> %s, shape: %s", hf_key, jax_path, processed_weight.shape)
 
     def _shard_weight(self, weight: jax.Array, sharding: tuple) -> jax.Array:
         if math.prod(self.mesh.axis_sizes) == 1:
@@ -404,15 +378,11 @@ class WeightLoader:
         if hf_key.endswith(".bias"):
             if any(proj in hf_key for proj in ["q_proj", "k_proj", "v_proj"]):
                 if "q_proj" in hf_key:
-                    reshaped = jnp.reshape(
-                        weight, (self.num_heads, self.head_dim_original)
-                    )
+                    reshaped = jnp.reshape(weight, (self.num_heads, self.head_dim_original))
                     padded = jnp.pad(reshaped, ((0, 0), (0, self.head_dim_pad)))
                     return jnp.reshape(padded, (self.num_heads * self.head_dim,))
                 else:  # k_proj or v_proj
-                    reshaped = jnp.reshape(
-                        weight, (self.num_kv_heads, self.head_dim_original)
-                    )
+                    reshaped = jnp.reshape(weight, (self.num_kv_heads, self.head_dim_original))
                     padded = jnp.pad(reshaped, ((0, 0), (0, self.head_dim_pad)))
                     return jnp.reshape(padded, (self.num_kv_heads * self.head_dim,))
         else:
@@ -429,9 +399,7 @@ class WeightLoader:
                             weight,
                             (self.hidden_size, self.num_heads, self.head_dim_original),
                         )
-                        padded = jnp.pad(
-                            reshaped, ((0, 0), (0, 0), (0, self.head_dim_pad))
-                        )
+                        padded = jnp.pad(reshaped, ((0, 0), (0, 0), (0, self.head_dim_pad)))
                         return jnp.reshape(
                             padded, (self.hidden_size, self.num_heads * self.head_dim)
                         )
@@ -444,9 +412,7 @@ class WeightLoader:
                                 self.head_dim_original,
                             ),
                         )
-                        padded = jnp.pad(
-                            reshaped, ((0, 0), (0, 0), (0, self.head_dim_pad))
-                        )
+                        padded = jnp.pad(reshaped, ((0, 0), (0, 0), (0, self.head_dim_pad)))
                         return jnp.reshape(
                             padded,
                             (self.hidden_size, self.num_kv_heads * self.head_dim),
@@ -460,9 +426,7 @@ class WeightLoader:
                             reshaped,
                             (self.num_heads, self.head_dim_original, self.hidden_size),
                         )
-                        padded = jnp.pad(
-                            padded_reshaped, ((0, 0), (0, self.head_dim_pad), (0, 0))
-                        )
+                        padded = jnp.pad(padded_reshaped, ((0, 0), (0, self.head_dim_pad), (0, 0)))
                         return jnp.reshape(
                             padded, (self.num_heads * self.head_dim, self.hidden_size)
                         )
@@ -476,9 +440,7 @@ class WeightLoader:
             proj in hf_key for proj in ["k_proj", "v_proj"]
         ) and self.model_config.needs_kv_head_replication(self.sharding_size):
             total_kv_heads = self.model_config.get_total_num_kv_heads()
-            num_replicas = self.model_config.get_num_kv_head_replicas(
-                self.sharding_size
-            )
+            num_replicas = self.model_config.get_num_kv_head_replicas(self.sharding_size)
             padding_strategy = self.model_config.get_kv_padding_strategy()
 
             if padding_strategy == "replicate":
@@ -531,9 +493,7 @@ class WeightLoader:
                     padding_size = target_size - current_size
 
                     if padding_size > 0:
-                        padding = jnp.zeros(
-                            (weight.shape[0], padding_size), dtype=weight.dtype
-                        )
+                        padding = jnp.zeros((weight.shape[0], padding_size), dtype=weight.dtype)
                         weight = jnp.concatenate([weight, padding], axis=1)
 
         return weight
@@ -566,17 +526,12 @@ class WeightLoader:
         moe_mappings: dict[str, WeightMapping],
         expert_weights: dict[str, jax.Array],
     ):
-        with tqdm(
-            moe_mappings.items(), desc="[STACKING] MOE EXPERTS", unit="layer"
-        ) as pbar:
+        with tqdm(moe_mappings.items(), desc="[STACKING] MOE EXPERTS", unit="layer") as pbar:
             for moe_key, mapping in pbar:
                 layer_name = moe_key.replace("__MOE_EXPERTS__", "")
                 pbar.set_postfix({"layer": layer_name})
 
-                if (
-                    not isinstance(mapping.target_path, list)
-                    or len(mapping.target_path) < 2
-                ):
+                if not isinstance(mapping.target_path, list) or len(mapping.target_path) < 2:
                     logger.warning("Invalid MoE mapping for %s", moe_key)
                     continue
 
@@ -598,12 +553,8 @@ class WeightLoader:
 
                     device_experts = stacked_weight
 
-                    sharded_weight = self._shard_weight(
-                        device_experts, mapping.sharding
-                    )
+                    sharded_weight = self._shard_weight(device_experts, mapping.sharding)
                     model_param = self._get_param(params, target_path)
                     model_param.value = sharded_weight
                 else:
-                    logger.error(
-                        "Could not collect all expert weights for %s", target_path
-                    )
+                    logger.error("Could not collect all expert weights for %s", target_path)
