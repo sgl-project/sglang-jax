@@ -202,7 +202,7 @@ def main():
             block_spec_configs.append((num_kv_pages_per_blk, num_queries_per_block))
 
     print(
-        f"(q_dtype, kv_dtype, num_q_heads_per_blk, num_kv_heads_per_blk, head_dim, page_size, max_num_batched_tokens): (num_kv_pages_per_block, num_queries_per_block)"
+        "(q_dtype, kv_dtype, num_q_heads_per_blk, num_kv_heads_per_blk, head_dim, page_size, max_num_batched_tokens): (num_kv_pages_per_block, num_queries_per_block)"
     )
 
     for i, (
@@ -237,7 +237,7 @@ def main():
                 if flash_time < best_output:
                     best_output = flash_time
                     best_config = (num_kv_pages_per_blk, num_queries_per_block)
-            except Exception as e:
+            except Exception:
                 pass
 
         print(

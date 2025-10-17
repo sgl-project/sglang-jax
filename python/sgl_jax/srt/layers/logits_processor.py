@@ -1,5 +1,4 @@
 import dataclasses
-from typing import List, Optional
 
 import jax
 import jax.nn as nn
@@ -24,27 +23,27 @@ class LogitsProcessorOutput:
     next_token_logits: jax.Array
     # Used by speculative decoding (EAGLE)
     # The last hidden layers
-    hidden_states: Optional[jax.Array] = None
+    hidden_states: jax.Array | None = None
 
     ## Part 2: This part will be assigned in python/sglang/srt/layers/sampler.py::Sampler
     # The logprobs of the next tokens.                              shape: [#seq]
-    next_token_logprobs: Optional[jax.Array] = None
+    next_token_logprobs: jax.Array | None = None
     # The logprobs and ids of the top-k tokens in output positions. shape: [#seq, k]
-    next_token_top_logprobs_val: Optional[List] = None
-    next_token_top_logprobs_idx: Optional[List] = None
+    next_token_top_logprobs_val: list | None = None
+    next_token_top_logprobs_idx: list | None = None
     # The logprobs and ids of the requested token ids in output positions. shape: [#seq, n] (n is the number of requested token ids)
-    next_token_token_ids_logprobs_val: Optional[List] = None
-    next_token_token_ids_logprobs_idx: Optional[List] = None
+    next_token_token_ids_logprobs_val: list | None = None
+    next_token_token_ids_logprobs_idx: list | None = None
 
     ## Part 3: Prefill-only. This part will be assigned in python/sglang/srt/layers/logits_processor.py::LogitsProcessor
     # The logprobs of input tokens.        shape: [#token]
-    input_token_logprobs: Optional[jax.Array] = None
+    input_token_logprobs: jax.Array | None = None
     # The logprobs and ids of the top-k tokens in input positions.  shape: [#seq, #token, k]
-    input_top_logprobs_val: List = None
-    input_top_logprobs_idx: List = None
+    input_top_logprobs_val: list = None
+    input_top_logprobs_idx: list = None
     # The logprobs and ids of the requested token ids in input positions. shape: [#seq, n] (n is the number of requested token ids)
-    input_token_ids_logprobs_val: Optional[List] = None
-    input_token_ids_logprobs_idx: Optional[List] = None
+    input_token_ids_logprobs_val: list | None = None
+    input_token_ids_logprobs_idx: list | None = None
 
     def tree_flatten(self):
         children = (
@@ -107,13 +106,13 @@ class LogitsMetadata:
     extend_return_logprob: bool = False
     extend_return_top_logprob: bool = False
     extend_token_ids_logprob: bool = False
-    extend_seq_lens: Optional[jax.Array] = None
-    extend_seq_lens_cpu: Optional[List[int]] = None
-    extend_logprob_start_lens_cpu: Optional[List[int]] = None
-    extend_logprob_pruned_lens_cpu: Optional[List[int]] = None
-    top_logprobs_nums: Optional[List[int]] = None
-    extend_input_logprob_token_ids_device: Optional[jax.Array] = None
-    token_ids_logprobs: Optional[List[List[int]]] = None
+    extend_seq_lens: jax.Array | None = None
+    extend_seq_lens_cpu: list[int] | None = None
+    extend_logprob_start_lens_cpu: list[int] | None = None
+    extend_logprob_pruned_lens_cpu: list[int] | None = None
+    top_logprobs_nums: list[int] | None = None
+    extend_input_logprob_token_ids_device: jax.Array | None = None
+    token_ids_logprobs: list[list[int]] | None = None
 
     # logits and logprobs post processing
     temp_scaled_logprobs: bool = False
@@ -293,7 +292,7 @@ class LogitsProcessor(nnx.Module):
             logits[sample_indices] if sample_indices is not None else logits
         )
 
-        hidden_states_to_store: Optional[jax.Array] = None
+        hidden_states_to_store: jax.Array | None = None
         if logits_metadata.capture_hidden_mode.need_capture():
             if logits_metadata.capture_hidden_mode.is_full():
                 hidden_states_to_store = hidden_states
@@ -306,7 +305,7 @@ class LogitsProcessor(nnx.Module):
                     else pruned_states
                 )
             else:
-                assert False, "Should never reach"
+                raise AssertionError()
 
         if not logits_metadata.extend_return_logprob:
             # Decode mode or extend mode without return_logprob.

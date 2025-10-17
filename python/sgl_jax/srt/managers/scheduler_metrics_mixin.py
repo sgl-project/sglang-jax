@@ -1,7 +1,6 @@
 import logging
 import time
 from collections import defaultdict
-from typing import List
 
 from sgl_jax.srt.managers.schedule_policy import PrefillAdder
 from sgl_jax.srt.managers.scheduler import Req, ScheduleBatch
@@ -26,7 +25,7 @@ class SchedulerMetricsMixin:
     def log_prefill_stats(
         self,
         adder: PrefillAdder,
-        can_run_list: List[Req],
+        can_run_list: list[Req],
         running_bs: int,
     ):
         gap_latency = time.perf_counter() - self.last_prefill_stats_tic
@@ -60,7 +59,7 @@ class SchedulerMetricsMixin:
         self.num_generated_tokens = 0
         num_running_reqs = len(batch.reqs)
         num_used, token_usage, _, _ = self._get_token_info()
-        token_msg = f"#token: {num_used}, " f"token usage: {token_usage:.2f}, "
+        token_msg = f"#token: {num_used}, token usage: {token_usage:.2f}, "
 
         if RECORD_STEP_TIME:
             self.step_time_dict[num_running_reqs].append(

@@ -127,7 +127,6 @@ class TestParamsValidation(CustomTestCase):
             self.assertTrue(cm.exception.code, 400)
 
     def test_input_length_longer_than_context_length(self):
-
         client = openai.Client(api_key=self.api_key, base_url=f"{self.base_url}/v1")
         # Will tokenize to more than context length
         long_text = "hello" * 1200

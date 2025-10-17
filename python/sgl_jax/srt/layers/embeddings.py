@@ -15,7 +15,7 @@
 """Embedding Layers."""
 
 import math
-from typing import Any, Dict, Optional, Tuple, Union
+from typing import Any
 
 import jax
 import jax.numpy as jnp
@@ -40,7 +40,7 @@ class Embed(nnx.Module):
         self,
         num_embeddings: int,
         features: int,
-        dtype: Optional[jnp.dtype] = None,
+        dtype: jnp.dtype | None = None,
         param_dtype: jnp.dtype = jnp.bfloat16,
         promote_dtype: PromoteDtypeFn = dtypes.promote_dtype,
         rngs: nnx.Rngs = None,
@@ -125,7 +125,7 @@ class ParallelLMHead(Embed):
         self,
         num_embeddings: int,
         features: int,
-        dtype: Optional[jnp.dtype] = None,
+        dtype: jnp.dtype | None = None,
         param_dtype: jnp.dtype = jnp.bfloat16,
         promote_dtype: PromoteDtypeFn = dtypes.promote_dtype,
         rngs: nnx.Rngs = None,
@@ -204,7 +204,7 @@ class RotaryEmbedding:
         positions: jax.Array,
         query: jax.Array,
         key: jax.Array,
-    ) -> Tuple[jax.Array, jax.Array]:
+    ) -> tuple[jax.Array, jax.Array]:
         positions = positions.flatten()  # [num_tokens]
 
         inv_freq = jnp.asarray(self._inv_freq_np, dtype=self.dtype)
@@ -232,7 +232,7 @@ class RotaryEmbedding:
 
         return query, key
 
-    def _compute_inv_freq(self, base: Union[int, float]) -> jax.Array:
+    def _compute_inv_freq(self, base: int | float) -> jax.Array:
         """Compute the inverse frequency."""
         inv_freq = 1.0 / (
             base
@@ -251,7 +251,6 @@ class RotaryEmbedding:
 
 
 class Llama3RotaryEmbedding(RotaryEmbedding):
-
     def __init__(
         self,
         head_size: int,
@@ -273,7 +272,7 @@ class Llama3RotaryEmbedding(RotaryEmbedding):
             head_size, rotary_dim, max_position_embeddings, base, is_neox_style, dtype
         )
 
-    def _compute_inv_freq(self, base: Union[int, float]) -> jax.Array:
+    def _compute_inv_freq(self, base: int | float) -> jax.Array:
         inv_freqs = super()._compute_inv_freq(base)
         low_freq_wavelen = self.orig_max_position / self.low_freq_factor
         high_freq_wavelen = self.orig_max_position / self.high_freq_factor
@@ -306,7 +305,7 @@ def rotary_embedding_forward(
     rotary_dim: int,
     head_size: int,
     is_neox_style: bool,
-) -> Tuple[jax.Array, jax.Array]:
+) -> tuple[jax.Array, jax.Array]:
     """Rotary Position Embedding."""
     positions = positions.flatten()
     num_tokens = positions.shape[0]
@@ -360,7 +359,7 @@ def _apply_rotary_emb(
         return stacked.reshape(*stacked.shape[:-2], -1)
 
 
-_ROPE_DICT: Dict[Tuple, RotaryEmbedding] = {}
+_ROPE_DICT: dict[tuple, RotaryEmbedding] = {}
 
 
 def get_rope(
@@ -369,10 +368,10 @@ def get_rope(
     max_position: int,
     base: int,
     is_neox_style: bool = True,
-    rope_scaling: Optional[Dict[str, Any]] = None,
-    dtype: Optional[jnp.dtype] = jnp.bfloat16,
+    rope_scaling: dict[str, Any] | None = None,
+    dtype: jnp.dtype | None = jnp.bfloat16,
     partial_rotary_factor: float = 1.0,
-    dual_chunk_attention_config: Optional[Dict[str, Any]] = None,
+    dual_chunk_attention_config: dict[str, Any] | None = None,
 ) -> RotaryEmbedding:
     if rope_scaling is not None:
         # Transforms every value that is a list into a tuple for caching calls

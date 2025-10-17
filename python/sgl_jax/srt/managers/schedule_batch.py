@@ -21,7 +21,7 @@ import dataclasses
 import logging
 import threading
 from http import HTTPStatus
-from typing import Any, List, Optional, Set, Tuple, Union
+from typing import Any
 
 import numpy as np
 from jax import numpy as jnp
@@ -68,7 +68,7 @@ class BaseFinishReason:
 
 
 class FINISH_MATCHED_TOKEN(BaseFinishReason):
-    def __init__(self, matched: Union[int, List[int]]):
+    def __init__(self, matched: int | list[int]):
         super().__init__()
         self.matched = matched
 
@@ -126,15 +126,15 @@ class Req:
         self,
         rid: str,
         origin_input_text: str,
-        origin_input_ids: List[int],
+        origin_input_ids: list[int],
         sampling_params: SamplingParams,
         return_logprob: bool = False,
         top_logprobs_num: int = 0,
-        token_ids_logprob: List[int] = None,
+        token_ids_logprob: list[int] = None,
         stream: bool = False,
-        origin_input_ids_unpadded: Optional[Tuple[int]] = None,
-        eos_token_ids: Optional[Set[int]] = None,
-        vocab_size: Optional[int] = None,
+        origin_input_ids_unpadded: tuple[int] | None = None,
+        eos_token_ids: set[int] | None = None,
+        vocab_size: int | None = None,
     ):
         # Input and output info
         self.rid = rid
@@ -154,7 +154,7 @@ class Req:
         self.sampling_params = sampling_params
 
         # Memory pool info
-        self.req_pool_idx: Optional[int] = None
+        self.req_pool_idx: int | None = None
 
         # Check finish
         self.tokenizer = None
@@ -219,18 +219,18 @@ class Req:
         # Logprobs (return values)
         # True means the input logprob has been already sent to detokenizer.
         self.input_logprob_sent: bool = False
-        self.input_token_logprobs_val: Optional[List[float]] = None
-        self.input_token_logprobs_idx: Optional[List[int]] = None
-        self.input_top_logprobs_val: Optional[List[float]] = None
-        self.input_top_logprobs_idx: Optional[List[int]] = None
-        self.input_token_ids_logprobs_val: Optional[List[float]] = None
-        self.input_token_ids_logprobs_idx: Optional[List[int]] = None
+        self.input_token_logprobs_val: list[float] | None = None
+        self.input_token_logprobs_idx: list[int] | None = None
+        self.input_top_logprobs_val: list[float] | None = None
+        self.input_top_logprobs_idx: list[int] | None = None
+        self.input_token_ids_logprobs_val: list[float] | None = None
+        self.input_token_ids_logprobs_idx: list[int] | None = None
         # Temporary holder to store input_token_logprobs.
-        self.input_token_logprobs: Optional[List[Tuple[int]]] = None
-        self.temp_input_top_logprobs_val: Optional[List[np.ndarray]] = None
-        self.temp_input_top_logprobs_idx: Optional[List[int]] = None
-        self.temp_input_token_ids_logprobs_val: Optional[List[float]] = None
-        self.temp_input_token_ids_logprobs_idx: Optional[List[int]] = None
+        self.input_token_logprobs: list[tuple[int]] | None = None
+        self.temp_input_top_logprobs_val: list[np.ndarray] | None = None
+        self.temp_input_top_logprobs_idx: list[int] | None = None
+        self.temp_input_token_ids_logprobs_val: list[float] | None = None
+        self.temp_input_token_ids_logprobs_idx: list[int] | None = None
 
         if return_logprob:
             # shape: (bs, 1)
@@ -247,7 +247,7 @@ class Req:
             ) = self.output_top_logprobs_idx = self.output_token_ids_logprobs_val = (
                 self.output_token_ids_logprobs_idx
             ) = None
-        self.hidden_states: List[List[float]] = []
+        self.hidden_states: list[list[float]] = []
 
         # The number of cached tokens that were already cached in the KV cache
         self.cached_tokens = 0
@@ -284,7 +284,7 @@ class Req:
 
     def init_next_round_input(
         self,
-        tree_cache: Optional[BasePrefixCache] = None,
+        tree_cache: BasePrefixCache | None = None,
     ):
         self.fill_ids = self.origin_input_ids + self.output_ids
         if tree_cache is not None:
@@ -435,7 +435,7 @@ class ScheduleBatch:
     """Store all information of a batch on the scheduler."""
 
     # Request, memory pool, and cache
-    reqs: List[Req]
+    reqs: list[Req]
     req_to_token_pool: ReqToTokenPool = None
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator = None
     tree_cache: BasePrefixCache = None
@@ -449,7 +449,7 @@ class ScheduleBatch:
     # This is an optimization to reduce the overhead of the prefill check.
     batch_is_full: bool = False
 
-    chunked_req: Optional[Req] = None
+    chunked_req: Req | None = None
 
     # Sampling info
     sampling_info: SamplingBatchInfo = None
@@ -468,21 +468,21 @@ class ScheduleBatch:
 
     # For processing logprobs
     return_logprob: bool = False
-    top_logprobs_nums: Optional[List[int]] = None
-    token_ids_logprobs: Optional[List[List[int]]] = None
+    top_logprobs_nums: list[int] | None = None
+    token_ids_logprobs: list[list[int]] | None = None
 
     # For logits and logprob post processing
     temp_scaled_logprobs: bool = False
     top_p_normalized_logprobs: bool = False
 
     # For extend and mixed chunekd prefill
-    prefix_lens: List[int] = None
-    extend_lens: List[int] = None
-    extend_num_tokens: Optional[int] = None
-    decoding_reqs: List[Req] = None
-    extend_logprob_start_lens: List[int] = None
+    prefix_lens: list[int] = None
+    extend_lens: list[int] = None
+    extend_num_tokens: int | None = None
+    decoding_reqs: list[Req] = None
+    extend_logprob_start_lens: list[int] = None
     # It comes empty list if logprob is not required.
-    extend_input_logprob_token_ids: Optional[np.ndarray] = None
+    extend_input_logprob_token_ids: np.ndarray | None = None
 
     # Stream
     has_stream: bool = False
@@ -499,19 +499,19 @@ class ScheduleBatch:
     is_prefill_only: bool = False
 
     # Events
-    launch_done: Optional[threading.Event] = None
+    launch_done: threading.Event | None = None
 
     @classmethod
     def init_new(
         cls,
-        reqs: List[Req],
+        reqs: list[Req],
         req_to_token_pool: ReqToTokenPool,
         token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
         tree_cache: BasePrefixCache,
         model_config: ModelConfig,
         enable_overlap: bool,
         enable_custom_logit_processor: bool = False,
-        chunked_req: Optional[Req] = None,
+        chunked_req: Req | None = None,
         mesh: mesh_lib.Mesh = None,
     ):
         return_logprob = any(req.return_logprob for req in reqs)
@@ -575,9 +575,9 @@ class ScheduleBatch:
 
     def alloc_paged_token_slots_extend(
         self,
-        prefix_lens: List[int],
-        seq_lens: List[int],
-        last_loc: List[int],
+        prefix_lens: list[int],
+        seq_lens: list[int],
+        last_loc: list[int],
         extend_num_tokens: int,
         backup_state: bool = False,
     ):
@@ -609,8 +609,8 @@ class ScheduleBatch:
 
     def alloc_paged_token_slots_decode(
         self,
-        seq_lens: List[int],
-        last_loc: List[int],
+        seq_lens: list[int],
+        last_loc: list[int],
         backup_state: bool = False,
     ):
         num_tokens = len(seq_lens) * self.token_to_kv_pool_allocator.page_size
@@ -635,7 +635,7 @@ class ScheduleBatch:
         else:
             return out_cache_loc
 
-    def mix_with_running(self, running_batch: "ScheduleBatch"):
+    def mix_with_running(self, running_batch: ScheduleBatch):
         # Use EXTEND instead of MIXED for precompile cache hit
         self.forward_mode = ForwardMode.EXTEND
         running_bs = running_batch.batch_size()
@@ -977,8 +977,8 @@ class ScheduleBatch:
 
     def filter_batch(
         self,
-        chunked_req_to_exclude: Optional[Union[Req, List[Req]]] = None,
-        keep_indices: Optional[List[int]] = None,
+        chunked_req_to_exclude: Req | list[Req] | None = None,
+        keep_indices: list[int] | None = None,
     ):
         if keep_indices is None:
             if isinstance(chunked_req_to_exclude, Req):
@@ -1021,7 +1021,7 @@ class ScheduleBatch:
 
         self.sampling_info.filter_batch(np.array(keep_indices))
 
-    def merge_batch(self, other: "ScheduleBatch"):
+    def merge_batch(self, other: ScheduleBatch):
         # Penalizer orchestrator must be merged before Batch.reqs is merged. This is because
         # orchestrator.merge() depends on Batch.reqs during preparation of each penalizers, so it
         # needs to be called with pre-merged Batch.reqs.
@@ -1059,7 +1059,7 @@ class ScheduleBatch:
         self,
         token_paddings: list,
         bs_paddings: list,
-        cache_loc_paddings: List,
+        cache_loc_paddings: list,
         page_size: int,
     ) -> ModelWorkerBatch:
         if self.forward_mode.is_decode_or_idle():
@@ -1282,9 +1282,8 @@ class ScheduleBatch:
             launch_done=self.launch_done,
         )
 
-    def _generate_trace_info(self, real_bs: int, bid: int) -> List[str]:
+    def _generate_trace_info(self, real_bs: int, bid: int) -> list[str]:
         for req in self.reqs[:real_bs]:
-
             if precision_tracer.get_trace_active():
                 # for chunked prefill trace
                 if req.fill_ids:
@@ -1304,7 +1303,9 @@ class ScheduleBatch:
                 if self.forward_mode == ForwardMode.EXTEND:
                     precision_tracer.add_request_counter()
                     logger.info(
-                        f"Starting trace for request {precision_tracer.get_request_counter()}: {req.rid}"
+                        "Starting trace for request %d: %s",
+                        precision_tracer.get_request_counter(),
+                        req.rid,
                     )
 
     def copy(self):
@@ -1326,9 +1327,11 @@ class ScheduleBatch:
         if isinstance(self.tree_cache, ChunkCache):
             return
 
-        if self.token_to_kv_pool_allocator.available_size() < num_tokens:
-            if self.tree_cache is not None:
-                self.tree_cache.evict(num_tokens)
+        if (
+            self.token_to_kv_pool_allocator.available_size() < num_tokens
+            and self.tree_cache is not None
+        ):
+            self.tree_cache.evict(num_tokens)
 
     def _is_available_size_sufficient(self, num_tokens: int) -> bool:
         return self.token_to_kv_pool_allocator.available_size() >= num_tokens
@@ -1371,15 +1374,15 @@ class ModelWorkerBatch:
 
     # For logprob
     return_logprob: bool
-    top_logprobs_nums: Optional[List[int]]
-    token_ids_logprobs: Optional[List[List[int]]]
+    top_logprobs_nums: list[int] | None
+    token_ids_logprobs: list[list[int]] | None
 
     # For extend
     # extend_num_tokens: Optional[int]
-    extend_seq_lens: Optional[np.ndarray]
-    extend_prefix_lens: Optional[np.ndarray]
-    extend_logprob_start_lens: Optional[List[int]]
-    extend_input_logprob_token_ids: Optional[np.ndarray]
+    extend_seq_lens: np.ndarray | None
+    extend_prefix_lens: np.ndarray | None
+    extend_logprob_start_lens: list[int] | None
+    extend_input_logprob_token_ids: np.ndarray | None
 
     # For padding
     real_bs: int
@@ -1393,10 +1396,10 @@ class ModelWorkerBatch:
     top_p: np.ndarray = None
 
     # Events
-    launch_done: Optional[threading.Event] = None
+    launch_done: threading.Event | None = None
 
     # Pre-initialized ForwardBatch for overlap scheduling optimization
-    forward_batch: Optional[Any] = None
+    forward_batch: Any | None = None
 
 
 def get_last_loc(

@@ -3,7 +3,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Dict, List, Optional, Union
+from typing import Any
 
 from sgl_jax.srt.managers.schedule_batch import BaseFinishReason
 
@@ -11,35 +11,35 @@ from sgl_jax.srt.managers.schedule_batch import BaseFinishReason
 @dataclass
 class BatchStrOut:
     # The request id
-    rids: List[str]
+    rids: list[str]
     # The finish reason
-    finished_reasons: List[dict]
+    finished_reasons: list[dict]
     # The output decoded strings
-    output_strs: List[str]
+    output_strs: list[str]
     # The token ids
-    output_ids: Optional[List[int]]
+    output_ids: list[int] | None
 
     # Token counts
-    prompt_tokens: List[int]
-    completion_tokens: List[int]
-    cached_tokens: List[int]
+    prompt_tokens: list[int]
+    completion_tokens: list[int]
+    cached_tokens: list[int]
 
     # Logprobs
-    input_token_logprobs_val: List[float]
-    input_token_logprobs_idx: List[int]
-    output_token_logprobs_val: List[float]
-    output_token_logprobs_idx: List[int]
-    input_top_logprobs_val: List[List]
-    input_top_logprobs_idx: List[List]
-    output_top_logprobs_val: List[List]
-    output_top_logprobs_idx: List[List]
-    input_token_ids_logprobs_val: List[List]
-    input_token_ids_logprobs_idx: List[List]
-    output_token_ids_logprobs_val: List[List]
-    output_token_ids_logprobs_idx: List[List]
+    input_token_logprobs_val: list[float]
+    input_token_logprobs_idx: list[int]
+    output_token_logprobs_val: list[float]
+    output_token_logprobs_idx: list[int]
+    input_top_logprobs_val: list[list]
+    input_top_logprobs_idx: list[list]
+    output_top_logprobs_val: list[list]
+    output_top_logprobs_idx: list[list]
+    input_token_ids_logprobs_val: list[list]
+    input_token_ids_logprobs_idx: list[list]
+    output_token_ids_logprobs_val: list[list]
+    output_token_ids_logprobs_idx: list[list]
 
     # Hidden states
-    output_hidden_states: List[List[float]]
+    output_hidden_states: list[list[float]]
 
     # Cache miss count
     cache_miss_count: int = None
@@ -48,41 +48,41 @@ class BatchStrOut:
 @dataclass
 class BatchTokenIDOut:
     # The request id
-    rids: List[str]
+    rids: list[str]
     # The finish reason
-    finished_reasons: List[BaseFinishReason]
+    finished_reasons: list[BaseFinishReason]
     # For incremental decoding
-    decoded_texts: List[str]
-    decode_ids: List[List[int]]
-    read_offsets: List[int]
+    decoded_texts: list[str]
+    decode_ids: list[list[int]]
+    read_offsets: list[int]
     # Only used when `--skip-tokenizer-init` is on
-    output_ids: Optional[List[int]]
+    output_ids: list[int] | None
     # Detokenization configs
-    skip_special_tokens: List[bool]
-    spaces_between_special_tokens: List[bool]
-    no_stop_trim: List[bool]
+    skip_special_tokens: list[bool]
+    spaces_between_special_tokens: list[bool]
+    no_stop_trim: list[bool]
 
     # Token counts
-    prompt_tokens: List[int]
-    completion_tokens: List[int]
-    cached_tokens: List[int]
+    prompt_tokens: list[int]
+    completion_tokens: list[int]
+    cached_tokens: list[int]
 
     # Logprobs
-    input_token_logprobs_val: List[float]
-    input_token_logprobs_idx: List[int]
-    output_token_logprobs_val: List[float]
-    output_token_logprobs_idx: List[int]
-    input_top_logprobs_val: List[List]
-    input_top_logprobs_idx: List[List]
-    output_top_logprobs_val: List[List]
-    output_top_logprobs_idx: List[List]
-    input_token_ids_logprobs_val: List[List]
-    input_token_ids_logprobs_idx: List[List]
-    output_token_ids_logprobs_val: List[List]
-    output_token_ids_logprobs_idx: List[List]
+    input_token_logprobs_val: list[float]
+    input_token_logprobs_idx: list[int]
+    output_token_logprobs_val: list[float]
+    output_token_logprobs_idx: list[int]
+    input_top_logprobs_val: list[list]
+    input_top_logprobs_idx: list[list]
+    output_top_logprobs_val: list[list]
+    output_top_logprobs_idx: list[list]
+    input_token_ids_logprobs_val: list[list]
+    input_token_ids_logprobs_idx: list[list]
+    output_token_ids_logprobs_val: list[list]
+    output_token_ids_logprobs_idx: list[list]
 
     # Hidden states
-    output_hidden_states: List[List[float]]
+    output_hidden_states: list[list[float]]
 
     # Cache miss count
     cache_miss_count: int = None
@@ -91,22 +91,22 @@ class BatchTokenIDOut:
 @dataclass
 class TokenizedGenerateReqInput:
     # The request id.
-    rid: Optional[Union[List[str], str]] = None
+    rid: list[str] | str | None = None
     # The input prompt. It can be a single prompt or a batch of prompts.
-    text: Optional[Union[List[str], str]] = None
+    text: list[str] | str | None = None
     # The token ids for text; one can specify either text or input_ids
-    input_ids: Optional[Union[List[List[int]], List[int]]] = None
+    input_ids: list[list[int]] | list[int] | None = None
     # The sampling_params. See descriptions below.
-    sampling_params: Optional[Union[List[Dict], Dict]] = None
+    sampling_params: list[dict] | dict | None = None
     # Whether to return logprobs.
-    return_logprob: Optional[Union[List[bool], bool]] = None
+    return_logprob: list[bool] | bool | None = None
     # If return logprobs, the start location in the prompt for returning logprobs.
     # By default, this value is "-1", which means it will only return logprobs for output tokens.
-    logprob_start_len: Optional[Union[List[int], int]] = -1
+    logprob_start_len: list[int] | int | None = -1
     # If return logprobs, the number of top logprobs to return at each position.
-    top_logprobs_num: Optional[Union[List[int], int]] = None
+    top_logprobs_num: list[int] | int | None = None
     # If return logprobs, the token ids to return logprob for.
-    token_ids_logprob: Optional[Union[List[List[int]], List[int]]] = None
+    token_ids_logprob: list[list[int]] | list[int] | None = None
     # Whether to stream output
     stream: bool = False
 
@@ -126,7 +126,7 @@ class EmbeddingReqInput:
 
     rid: str = None
     text: str = ""
-    input_ids: List[int] = None
+    input_ids: list[int] = None
     normalize: bool = True
 
 
@@ -135,23 +135,23 @@ class GenerateReqInput:
     """Request input for text generation."""
 
     batch_size: int = 1
-    rid: Optional[Union[List[str], str]] = None
-    text: Optional[Union[List[str], str]] = None
-    input_ids: List[int] = None
+    rid: list[str] | str | None = None
+    text: list[str] | str | None = None
+    input_ids: list[int] = None
     # The embeddings for input_ids; one can specify either text or input_ids or input_embeds.
-    input_embeds: Optional[Union[List[List[List[float]]], List[List[float]]]] = None
-    sampling_params: Optional[Any] = (
+    input_embeds: list[list[list[float]]] | list[list[float]] | None = None
+    sampling_params: Any | None = (
         None  # Using Any for now to avoid SamplingParams serialization issues
     )
     stream: bool = False
     is_single: bool = True
-    return_logprob: Optional[Union[List[bool], bool]] = None
+    return_logprob: list[bool] | bool | None = None
     # If return logprobs, the start location in the prompt for returning logprobs.
-    logprob_start_len: Optional[Union[List[int], int]] = None
+    logprob_start_len: list[int] | int | None = None
     # If return logprobs, the number of top logprobs to return at each position.
-    top_logprobs_num: Optional[Union[List[int], int]] = None
+    top_logprobs_num: list[int] | int | None = None
     # If return logprobs, the token ids to return logprob for.
-    token_ids_logprob: Optional[Union[List[List[int]], List[int]]] = None
+    token_ids_logprob: list[list[int]] | list[int] | None = None
     # Whether to detokenize tokens in text in the returned logprobs.
     return_text_in_logprobs: bool = False
 
@@ -387,9 +387,9 @@ class ResumeMemoryOccupationReqInput(RpcReqInput):
 class BatchEmbeddingOut:
     """Batch embedding output."""
 
-    rids: List[str]
-    embeddings: List[List[float]]
-    prompt_tokens: List[int]
+    rids: list[str]
+    embeddings: list[list[float]]
+    prompt_tokens: list[int]
 
 
 # Request input classes for sessions
@@ -413,7 +413,7 @@ class TokenizedEmbeddingReqInput:
 
     rid: str
     text: str
-    input_ids: List[int]
+    input_ids: list[int]
     normalize: bool = True
 
 
@@ -423,7 +423,7 @@ class ConfigureLoggingReq(RpcReqInput):
     """Request to configure logging."""
 
     log_level: str
-    log_file: Optional[str] = None
+    log_file: str | None = None
 
 
 @dataclass
@@ -441,14 +441,14 @@ class GetInternalStateReq:
 
 @dataclass
 class GetInternalStateReqOutput:
-    internal_state: Dict[Any, Any]
+    internal_state: dict[Any, Any]
 
 
 @dataclass
 class SetInternalStateReq(RpcReqInput):
     """Request to set internal state."""
 
-    state_data: Dict[str, Any]
+    state_data: dict[str, Any]
 
 
 # Profile classes
@@ -456,19 +456,19 @@ class SetInternalStateReq(RpcReqInput):
 
 @dataclass
 class ProfileReqInput:
-    output_dir: Optional[str] = None
-    start_step: Optional[int] = None
-    num_steps: Optional[int] = None
+    output_dir: str | None = None
+    start_step: int | None = None
+    num_steps: int | None = None
     # Sets the trace level for host-side activities.
     # 0: Disables host (CPU) tracing entirely.
     # 1: Enables tracing of only user-instrumented TraceMe events (this is the default).
     # 2: Includes level 1 traces plus high-level program execution details like expensive XLA operations.
     # 3: Includes level 2 traces plus more verbose, low-level program execution details such as cheap XLA operations.
-    host_tracer_level: Optional[int] = None
+    host_tracer_level: int | None = None
     # Controls whether Python tracing is enabled.
     # 0: Disables Python function call tracing.
     # 1: Enables Python tracing (this is the default).
-    python_tracer_level: Optional[int] = None
+    python_tracer_level: int | None = None
 
 
 class ProfileReqType(Enum):
@@ -479,12 +479,12 @@ class ProfileReqType(Enum):
 @dataclass
 class ProfileReq:
     type: ProfileReqType
-    output_dir: Optional[str] = None
-    start_step: Optional[int] = None
-    num_steps: Optional[int] = None
-    host_tracer_level: Optional[int] = None
-    python_tracer_level: Optional[int] = None
-    profile_id: Optional[str] = None
+    output_dir: str | None = None
+    start_step: int | None = None
+    num_steps: int | None = None
+    host_tracer_level: int | None = None
+    python_tracer_level: int | None = None
+    profile_id: str | None = None
 
 
 @dataclass
@@ -579,8 +579,8 @@ class VertexGenerateReqInput(GenerateReqInput):
 class StartTraceReqInput(RpcReqInput):
     """Request to start precision tracing."""
 
-    req_num: Optional[int] = None  # Maximum number of requests to trace
-    output_file: Optional[str] = None  # Output file path
+    req_num: int | None = None  # Maximum number of requests to trace
+    output_file: str | None = None  # Output file path
     request_id: str = ""  # Override base class field with default
 
     def __post_init__(self):

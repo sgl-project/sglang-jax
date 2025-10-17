@@ -1,6 +1,5 @@
 import abc
 import logging
-from typing import List, Optional
 
 import numpy as np
 
@@ -77,7 +76,7 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         raise NotImplementedError()
 
     @abc.abstractmethod
-    def alloc(self, need_size: int) -> Optional[np.ndarray]:
+    def alloc(self, need_size: int) -> np.ndarray | None:
         raise NotImplementedError()
 
     @abc.abstractmethod
@@ -105,7 +104,7 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         # To avoid minor "len(free_slots) * 1" overhead
         return len(self.free_slots)
 
-    def alloc(self, need_size: int) -> Optional[np.ndarray]:
+    def alloc(self, need_size: int) -> np.ndarray | None:
         if need_size > self.available_size():
             return None
 
@@ -143,7 +142,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.debug_mode = debug_mode
         self.clear()
 
-    def alloc(self, need_size: int) -> Optional[np.ndarray]:
+    def alloc(self, need_size: int) -> np.ndarray | None:
         # page-aligned allocation, returning contiguous indices of pages
         assert (
             need_size % self.page_size == 0
@@ -166,11 +165,11 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
     def alloc_extend(
         self,
-        prefix_lens: List[int],
-        seq_lens: List[int],
-        last_loc: List[int],
+        prefix_lens: list[int],
+        seq_lens: list[int],
+        last_loc: list[int],
         extend_num_tokens: int,
-    ) -> Optional[np.ndarray]:
+    ) -> np.ndarray | None:
         # Convert to numpy for internal operations
         seq_lens_np = np.array(seq_lens)
         prefix_lens_np = np.array(prefix_lens)
@@ -266,9 +265,9 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
     def alloc_decode(
         self,
-        seq_lens: List[int],
-        last_loc: List[int],
-    ) -> Optional[np.ndarray]:
+        seq_lens: list[int],
+        last_loc: list[int],
+    ) -> np.ndarray | None:
         # Convert inputs to numpy for calculations
         seq_lens_np = np.array(seq_lens)
         last_loc_np = np.array(last_loc)

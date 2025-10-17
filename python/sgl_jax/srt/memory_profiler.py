@@ -3,8 +3,8 @@ import glob
 import json
 import logging
 import os
+from collections.abc import Callable
 from contextlib import contextmanager
-from typing import Callable, Dict, List, Optional, Union
 
 import jax
 import jax.profiler
@@ -49,7 +49,7 @@ _config = MemoryProfilerConfig().from_env()
 def configure_memory_profiler(
     enabled: bool = None,
     output_dir: str = None,
-    layer_filter: Union[List[int], Callable, None] = None,
+    layer_filter: list[int] | Callable | None = None,
     generate_prof: bool = None,
     generate_reports: bool = None,
     log_to_console: bool = None,
@@ -71,7 +71,7 @@ def configure_memory_profiler(
         _config.log_to_console = log_to_console
 
 
-def _should_profile_layer(layer_id: Optional[int]) -> bool:
+def _should_profile_layer(layer_id: int | None) -> bool:
     if not _config.enabled or layer_id is None:
         return False
 
@@ -111,10 +111,10 @@ def _save_memory_snapshot(filename: str, condition: bool = True):
         )
         jax.profiler.save_device_memory_profile(output_path)
     except Exception as e:
-        logger.warning(f"Failed to save memory snapshot {filename}: {e}")
+        logger.warning("Failed to save memory snapshot %s: %s", filename, e)
 
 
-def _log_tensor_memory(stage: str, layer_id: Optional[int] = None, **tensors):
+def _log_tensor_memory(stage: str, layer_id: int | None = None, **tensors):
     if not _config.enabled or not _config.log_to_console:
         return
 
@@ -122,7 +122,7 @@ def _log_tensor_memory(stage: str, layer_id: Optional[int] = None, **tensors):
         return
 
     layer_info = f"Layer {layer_id}" if layer_id is not None else "Global"
-    logger.info(f"  [Memory] {layer_info} - {stage}:")
+    logger.info("  [Memory] %s - %s:", layer_info, stage)
 
     total_memory = 0
     tensor_info = []
@@ -133,10 +133,14 @@ def _log_tensor_memory(stage: str, layer_id: Optional[int] = None, **tensors):
             total_memory += memory_mb
             tensor_info.append((name, memory_mb, tensor.shape, tensor.dtype))
             logger.info(
-                f"    {name:<20}: {memory_mb:>8.2f} MB - {tensor.shape} {tensor.dtype}"
+                "    %-20s: %8.2f MB - %s %s",
+                name,
+                memory_mb,
+                tensor.shape,
+                tensor.dtype,
             )
 
-    logger.info(f"    Total Memory: {total_memory:.2f} MB")
+    logger.info("    Total Memory: %.2f MB", total_memory)
     logger.info("-" * 80)
 
     return tensor_info, total_memory
@@ -144,8 +148,8 @@ def _log_tensor_memory(stage: str, layer_id: Optional[int] = None, **tensors):
 
 def _create_memory_report(
     stage: str,
-    tensor_dict: Dict[str, jax.Array],
-    layer_id: Optional[int] = None,
+    tensor_dict: dict[str, jax.Array],
+    layer_id: int | None = None,
     report_type: str = "general",
 ):
     if not _config.enabled or not _config.generate_reports:
@@ -227,17 +231,19 @@ def _create_memory_report(
         with open(json_report_path, "w") as f:
             json.dump(json_report, f, indent=2)
 
-        logger.debug(f"  Generated memory reports: {report_path}, {json_report_path}")
+        logger.debug(
+            "  Generated memory reports: %s, %s", report_path, json_report_path
+        )
 
     except Exception as e:
-        logger.warning(f"Failed to create memory report for {stage}: {e}")
+        logger.warning("Failed to create memory report for %s: %s", stage, e)
 
 
 class MemoryProfiler:
     def __init__(
         self,
         stage: str,
-        layer_id: Optional[int] = None,
+        layer_id: int | None = None,
         report_type: str = "general",
         auto_snapshot: bool = True,
     ):
@@ -279,12 +285,11 @@ class MemoryProfiler:
 
 def memory_profile(
     stage: str,
-    layer_id: Optional[int] = None,
+    layer_id: int | None = None,
     report_type: str = "general",
     include_args: bool = False,
     include_result: bool = True,
 ):
-
     def decorator(func):
         @functools.wraps(func)
         def wrapper(*args, **kwargs):
@@ -331,7 +336,6 @@ def memory_profile(
 
 @contextmanager
 def profile_memory_scope(stage: str, **tensors):
-
     if not _config.enabled:
         yield
         return
@@ -366,7 +370,7 @@ def move_reports_to_output_dir():
     return moved_files
 
 
-def generate_summary_report(output_dir: Optional[str] = None):
+def generate_summary_report(output_dir: str | None = None):
     if output_dir is None:
         output_dir = _config.output_dir
 
@@ -385,7 +389,7 @@ def generate_summary_report(output_dir: Optional[str] = None):
 
     for json_file in json_files:
         try:
-            with open(json_file, "r") as f:
+            with open(json_file) as f:
                 report = json.load(f)
 
             stage = report.get("stage", "unknown")
@@ -411,21 +415,21 @@ def generate_summary_report(output_dir: Optional[str] = None):
                 summary["layer_analysis"][layer_id][stage] = total_memory
 
         except Exception as e:
-            logger.warning(f"Failed to process {json_file}: {e}")
+            logger.warning("Failed to process %s: %s", json_file, e)
 
     summary_path = os.path.join(output_dir, "memory_summary.json")
     with open(summary_path, "w") as f:
         json.dump(summary, f, indent=2)
 
-    logger.info(f"Generated memory summary report: {summary_path}")
+    logger.info("Generated memory summary report: %s", summary_path)
     return summary
 
 
-def profile_attention(stage: str, layer_id: Optional[int] = None):
+def profile_attention(stage: str, layer_id: int | None = None):
     return memory_profile(stage, layer_id, report_type="attention", include_result=True)
 
 
-def profile_mlp(stage: str, layer_id: Optional[int] = None):
+def profile_mlp(stage: str, layer_id: int | None = None):
     return memory_profile(stage, layer_id, report_type="mlp", include_result=True)
 
 

@@ -5,7 +5,7 @@ import random
 from collections import defaultdict
 from contextlib import contextmanager
 from enum import Enum, auto
-from typing import TYPE_CHECKING, Dict, List, Optional, Set, Union
+from typing import TYPE_CHECKING
 
 from jax import numpy as jnp
 
@@ -59,7 +59,7 @@ class CacheAgnosticPolicy(Enum):
 
 
 class SchedulePolicy:
-    Policy = Union[CacheAwarePolicy, CacheAgnosticPolicy]
+    Policy = CacheAwarePolicy | CacheAgnosticPolicy
 
     def __init__(
         self,
@@ -77,7 +77,7 @@ class SchedulePolicy:
             disable=False,
         )
 
-    def calc_priority(self, waiting_queue: List[Req]) -> bool:
+    def calc_priority(self, waiting_queue: list[Req]) -> bool:
         if self.policy == CacheAgnosticPolicy.FCFS:
             # A shortcut for FCFS
             return False
@@ -110,7 +110,7 @@ class SchedulePolicy:
 
         return prefix_computed
 
-    def _determine_active_policy(self, waiting_queue: List[Req]) -> Policy:
+    def _determine_active_policy(self, waiting_queue: list[Req]) -> Policy:
         if self.policy == CacheAwarePolicy.LPM and len(waiting_queue) > 128:
             # Turn off the expensive prefix matching and sorting when the #queue is large.
             return CacheAgnosticPolicy.FCFS
@@ -131,17 +131,17 @@ class SchedulePolicy:
         except ValueError:
             try:
                 return CacheAgnosticPolicy(policy)
-            except ValueError:
-                raise ValueError(f"Unknown schedule_policy: {policy=}")
+            except ValueError as inner_err:
+                raise ValueError(f"Unknown schedule_policy: {policy=}") from inner_err
 
     def _compute_prefix_matches(
-        self, waiting_queue: List[Req], policy: CacheAwarePolicy
-    ) -> Set[int]:
+        self, waiting_queue: list[Req], policy: CacheAwarePolicy
+    ) -> set[int]:
         """
         Computes and caches the matching prefixes for requests in the waiting queue,
             and handles in-batch prefix caching logic.
         """
-        temporary_deprioritized: Set[int] = set()
+        temporary_deprioritized: set[int] = set()
         self.waiting_queue_radix_tree.reset()
 
         for r in waiting_queue:
@@ -179,7 +179,7 @@ class SchedulePolicy:
 
     @staticmethod
     def _sort_by_longest_prefix(
-        waiting_queue: List[Req], temporary_deprioritized: Set[int]
+        waiting_queue: list[Req], temporary_deprioritized: set[int]
     ) -> None:
         """Sorts the waiting queue based on the longest prefix match."""
         waiting_queue.sort(
@@ -192,7 +192,7 @@ class SchedulePolicy:
 
     @staticmethod
     def _sort_by_dfs_weight(
-        waiting_queue: List[Req], tree_cache: BasePrefixCache
+        waiting_queue: list[Req], tree_cache: BasePrefixCache
     ) -> None:
         """Sorts the waiting queue based on a depth-first search weighting."""
         last_node_to_reqs = defaultdict(list)
@@ -213,17 +213,17 @@ class SchedulePolicy:
         )
 
     @staticmethod
-    def _sort_by_longest_output(waiting_queue: List[Req]) -> None:
+    def _sort_by_longest_output(waiting_queue: list[Req]) -> None:
         """Sorts the waiting queue based on the longest output (max_new_tokens)."""
         waiting_queue.sort(key=lambda x: -x.sampling_params.max_new_tokens)
 
     @staticmethod
-    def _sort_randomly(waiting_queue: List[Req]) -> None:
+    def _sort_randomly(waiting_queue: list[Req]) -> None:
         """Shuffles the waiting queue randomly."""
         random.shuffle(waiting_queue)
 
     @staticmethod
-    def _calc_weight(cur_node: TreeNode, node_to_weight: Dict[TreeNode, int]) -> None:
+    def _calc_weight(cur_node: TreeNode, node_to_weight: dict[TreeNode, int]) -> None:
         for child in cur_node.children.values():
             SchedulePolicy._calc_weight(child, node_to_weight)
             node_to_weight[cur_node] += node_to_weight[child]
@@ -231,9 +231,9 @@ class SchedulePolicy:
     @staticmethod
     def _get_dfs_priority(
         cur_node: TreeNode,
-        node_to_priority: Dict[TreeNode, int],
-        last_node_to_reqs: Dict[TreeNode, List[Req]],
-        q: List,
+        node_to_priority: dict[TreeNode, int],
+        last_node_to_reqs: dict[TreeNode, list[Req]],
+        q: list,
     ) -> None:
         childs = [child for child in cur_node.children.values()]
         childs.sort(key=lambda x: -node_to_priority[x])
@@ -259,7 +259,7 @@ class PrefillAdder:
         running_batch: ScheduleBatch,
         new_token_ratio: float,
         rem_input_tokens: int,
-        rem_chunk_tokens: Optional[int],
+        rem_chunk_tokens: int | None,
         mixed_with_decode_tokens: int = 0,
     ):
         self.page_size = page_size

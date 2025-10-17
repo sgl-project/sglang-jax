@@ -6,7 +6,6 @@ and code completion templates, eliminating global state and improving modularity
 """
 
 import logging
-from typing import Optional
 
 from sgl_jax.srt.conversation import get_conv_template_by_model_path
 
@@ -24,22 +23,22 @@ class TemplateManager:
 
     def __init__(self):
         pass
-        self._chat_template_name: Optional[str] = None
-        self._completion_template_name: Optional[str] = None
-        self._jinja_template_content_format: Optional[str] = None
+        self._chat_template_name: str | None = None
+        self._completion_template_name: str | None = None
+        self._jinja_template_content_format: str | None = None
 
     @property
-    def chat_template_name(self) -> Optional[str]:
+    def chat_template_name(self) -> str | None:
         """Get the current chat template name."""
         return self._chat_template_name
 
     @property
-    def completion_template_name(self) -> Optional[str]:
+    def completion_template_name(self) -> str | None:
         """Get the current completion template name."""
         return self._completion_template_name
 
     @property
-    def jinja_template_content_format(self) -> Optional[str]:
+    def jinja_template_content_format(self) -> str | None:
         """Get the detected template content format ('string' or 'openai' or None)."""
         return self._jinja_template_content_format
 
@@ -52,7 +51,7 @@ class TemplateManager:
         """
         template_name = get_conv_template_by_model_path(model_path)
         if template_name is not None:
-            logger.info(f"Inferred chat template from model path: {template_name}")
+            logger.info("Inferred chat template from model path: %s", template_name)
             self._chat_template_name = template_name
 
     def initialize_templates(

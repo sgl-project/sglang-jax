@@ -13,7 +13,6 @@ from sgl_jax.test.test_utils import (
 
 
 class TestBenchOneBatch(CustomTestCase):
-
     def test_bs1_default(self):
         output_throughput = run_bench_offline_throughput(
             DEFAULT_MODEL_NAME_FOR_TEST,

@@ -20,11 +20,12 @@ import logging
 from dataclasses import dataclass
 from enum import IntEnum, auto
 from functools import total_ordering
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING
 
 import jax
 from jax.sharding import NamedSharding, PartitionSpec
 from jax.tree_util import register_pytree_node_class
+
 from sgl_jax.srt.utils.jax_utils import device_array
 
 logger = logging.getLogger(__name__)
@@ -153,11 +154,11 @@ class ForwardBatch:
     cache_loc: jax.Array = None
 
     # For extend
-    extend_prefix_lens: Optional[jax.Array] = None
-    extend_seq_lens: Optional[jax.Array] = None
+    extend_prefix_lens: jax.Array | None = None
+    extend_seq_lens: jax.Array | None = None
 
-    trace_request_ids: Optional[List[str]] = None
-    trace_request_objects: Optional[List] = None
+    trace_request_ids: list[str] | None = None
+    trace_request_objects: list | None = None
 
     def tree_flatten(self):
         children = (

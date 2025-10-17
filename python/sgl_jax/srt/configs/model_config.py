@@ -2,7 +2,6 @@ import json
 import logging
 import os
 from enum import Enum, IntEnum, auto
-from typing import List, Optional, Set, Union
 
 import jax.numpy as jnp
 from transformers import PretrainedConfig
@@ -35,18 +34,17 @@ class ModelConfig:
         self,
         model_path: str,
         trust_remote_code: bool = True,
-        revision: Optional[str] = None,
-        context_length: Optional[int] = None,
+        revision: str | None = None,
+        context_length: int | None = None,
         model_override_args: str = "{}",
-        is_embedding: Optional[bool] = None,
+        is_embedding: bool | None = None,
         dtype: str = "auto",
-        override_config_file: Optional[str] = None,
+        override_config_file: str | None = None,
         is_draft_model: bool = False,
-        model_impl: Union[str, ModelImpl] = ModelImpl.AUTO,
-        quantization: Optional[str] = None,
-        model_layer_nums: Optional[int] = None,
+        model_impl: str | ModelImpl = ModelImpl.AUTO,
+        quantization: str | None = None,
+        model_layer_nums: int | None = None,
     ) -> None:
-
         self.model_path = model_path
         self.revision = revision
         self.model_impl = model_impl
@@ -102,15 +100,14 @@ class ModelConfig:
                     "SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN", default="True"
                 ):
                     logger.warning(
-                        f"Warning: User-specified context_length ({context_length}) is greater than the derived context_length ({derived_context_len}). "
-                        f"This may lead to incorrect model outputs or CUDA errors."
+                        "Warning: User-specified context_length (%s) is greater than the derived context_length (%s). This may lead to incorrect model outputs or CUDA errors.",
+                        context_length,
+                        derived_context_len,
                     )
                     self.context_len = context_length
                 else:
                     raise ValueError(
-                        f"User-specified context_length ({context_length}) is greater than the derived context_length ({derived_context_len}). "
-                        f"This may lead to incorrect model outputs or CUDA errors. Note that the derived context_length may differ from max_position_embeddings in the model's config. "
-                        f"To allow overriding this maximum, set the env var SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1"
+                        f"User-specified context_length ({context_length}) is greater than the derived context_length ({derived_context_len}). This may lead to incorrect model outputs or CUDA errors. Note that the derived context_length may differ from max_position_embeddings in the model's config. To allow overriding this maximum, set the env var SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1"
                     )
             else:
                 self.context_len = context_length
@@ -150,8 +147,9 @@ class ModelConfig:
                 )
             if model_layer_nums > self.num_hidden_layers:
                 logger.warning(
-                    f"model_layer_nums ({model_layer_nums}) is greater than the original "
-                    f"num_hidden_layers ({self.num_hidden_layers}). Using original value."
+                    "model_layer_nums (%s) is greater than the original num_hidden_layers (%s). Using original value.",
+                    model_layer_nums,
+                    self.num_hidden_layers,
                 )
             elif model_layer_nums != self.num_hidden_layers:
                 self.num_hidden_layers = model_layer_nums
@@ -299,7 +297,7 @@ class ModelConfig:
             self.hf_text_config.num_key_value_heads = total_kv_heads
         else:
             # For MHA models, dynamically add the attribute
-            setattr(self.hf_text_config, "num_key_value_heads", total_kv_heads)
+            self.hf_text_config.num_key_value_heads = total_kv_heads
 
     def get_original_kv_head_id(self, tp_rank: int, tensor_parallel_size: int) -> int:
         """Determine which original KV head this device should use."""
@@ -335,18 +333,22 @@ class ModelConfig:
         if needs_replication:
             num_replicas = self.get_num_kv_head_replicas(tensor_parallel_size)
             logger.info(
-                f"KV heads replication enabled for {model_type} model: "
-                f"original_kv_heads={original_kv_heads}, tp_size={tensor_parallel_size}, "
-                f"each device gets {kv_heads_per_device} head(s), "
-                f"each original head replicated {num_replicas} times, "
-                f"padding_strategy={padding_strategy}"
+                "KV heads replication enabled for %s model: original_kv_heads=%s, tp_size=%s, each device gets %s head(s), each original head replicated %s times, padding_strategy=%s",
+                model_type,
+                original_kv_heads,
+                tensor_parallel_size,
+                kv_heads_per_device,
+                num_replicas,
+                padding_strategy,
             )
         else:
             logger.info(
-                f"KV heads distribution for {model_type} model: "
-                f"original_kv_heads={original_kv_heads}, tp_size={tensor_parallel_size}, "
-                f"each device gets {kv_heads_per_device} head(s), no replication needed, "
-                f"padding_strategy={padding_strategy}"
+                "KV heads distribution for %s model: original_kv_heads=%s, tp_size=%s, each device gets %s head(s), no replication needed, padding_strategy=%s",
+                model_type,
+                original_kv_heads,
+                tensor_parallel_size,
+                kv_heads_per_device,
+                padding_strategy,
             )
 
     def validate_tensor_parallel_config(self, tensor_parallel_size: int):
@@ -390,7 +392,7 @@ class ModelConfig:
                     quant_cfg = modelopt_quant_config
         return quant_cfg
 
-    def get_hf_eos_token_id(self) -> Optional[Set[int]]:
+    def get_hf_eos_token_id(self) -> set[int] | None:
         eos_ids = getattr(self.hf_config, "eos_token_id", None)
         if eos_ids:
             # it can be either int or list of int
@@ -439,11 +441,11 @@ _STR_DTYPE_TO_JAX_DTYPE = {
 
 def _get_and_verify_dtype(
     config: PretrainedConfig,
-    dtype: Union[str, jnp.dtype],
+    dtype: str | jnp.dtype,
 ) -> jnp.dtype:
     config_dtype = getattr(config, "torch_dtype", None)
     if isinstance(config_dtype, str):
-        config_dtype = _STR_DTYPE_TO_JAX_DTYPE.get(config_dtype, None)
+        config_dtype = _STR_DTYPE_TO_JAX_DTYPE.get(config_dtype)
     elif config_dtype is not None:
         config_dtype = _STR_DTYPE_TO_JAX_DTYPE.get(
             str(config_dtype).replace("torch.", ""), None
@@ -458,8 +460,8 @@ def _get_and_verify_dtype(
             jax_dtype = config_dtype
             if config_dtype != jnp.bfloat16:
                 logger.warning(
-                    f"Model dtype is {config_dtype}. "
-                    "On TPU, using non-bfloat16 models may reduce performance."
+                    "Model dtype is %s. On TPU, using non-bfloat16 models may reduce performance.",
+                    config_dtype,
                 )
         else:
             if dtype not in _STR_DTYPE_TO_JAX_DTYPE:
@@ -483,10 +485,10 @@ def _get_and_verify_dtype(
         else:
             # Casting between float16 and bfloat16 is allowed with a warning.
             logger.warning("Casting %s to %s.", config_dtype, jax_dtype)
-    return jax_dtype
+        return jax_dtype
 
 
-def is_generation_model(model_architectures: List[str], is_embedding: bool = False):
+def is_generation_model(model_architectures: list[str], is_embedding: bool = False):
     # We have two ways to determine whether a model is a generative model.
     # 1. Check the model architecture
     # 2. check the `is_embedding` server args

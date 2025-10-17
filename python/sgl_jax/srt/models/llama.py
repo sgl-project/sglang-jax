@@ -17,7 +17,7 @@
 """Inference-only LLaMA model compatible with HuggingFace weights."""
 
 import logging
-from typing import Any, Dict, Optional, Tuple
+from typing import Any
 
 import jax
 import jax.numpy as jnp
@@ -32,10 +32,7 @@ from sgl_jax.srt.layers.embeddings import (
 )
 from sgl_jax.srt.layers.layernorm import RMSNorm
 from sgl_jax.srt.layers.linear import LinearBase
-from sgl_jax.srt.layers.logits_processor import (
-    LogitsMetadata,
-    LogitsProcessor,
-)
+from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
 from sgl_jax.srt.layers.radix_attention import RadixAttention
 from sgl_jax.srt.mem_cache.memory_pool import KVCache
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
@@ -102,9 +99,9 @@ class LlamaAttention(nnx.Module):
         num_kv_heads: int,
         layer_id: int = 0,
         rope_theta: float = 10000,
-        rope_scaling: Optional[Dict[str, Any]] = None,
-        head_dim: Optional[int] = None,
-        partial_rotary_factor: Optional[int] = None,
+        rope_scaling: dict[str, Any] | None = None,
+        head_dim: int | None = None,
+        partial_rotary_factor: int | None = None,
         rope_is_neox_style: bool = True,
         max_position_embeddings: int = 8192,
         dtype: jnp.dtype = jnp.bfloat16,
@@ -271,8 +268,8 @@ class LlamaDecoderLayer(nnx.Module):
         hidden_states: jax.Array,
         forward_batch: ForwardBatch,
         token_to_kv_pool: KVCache,
-        residual: Optional[jax.Array],
-    ) -> Tuple[jax.Array, jax.Array]:
+        residual: jax.Array | None,
+    ) -> tuple[jax.Array, jax.Array]:
         layer_callback_flag = []
         if residual is None:
             residual = hidden_states
@@ -392,7 +389,7 @@ class LlamaForCausalLM(nnx.Module):
         self.mesh = mesh
         self.config = config
         self.dtype = dtype
-        logger.info(f"LlamaForCausalLM config dtype: {self.dtype}")
+        logger.info("LlamaForCausalLM config dtype: %s", self.dtype)
         self.transformer = LlamaModel(config, dtype=self.dtype, rngs=rngs)
         self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size, rngs=rngs)
         self.logits_processor = LogitsProcessor(

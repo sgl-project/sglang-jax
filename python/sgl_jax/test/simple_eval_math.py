@@ -8,7 +8,6 @@ https://arxiv.org/abs/2103.03874
 
 import random
 import re
-from typing import Optional
 
 import pandas
 
@@ -37,7 +36,7 @@ class MathEval(Eval):
         self,
         filename: str,
         equality_checker: SamplerBase,
-        num_examples: Optional[int],
+        num_examples: int | None,
         num_threads: int,
     ):
         df = pandas.read_csv(filename)

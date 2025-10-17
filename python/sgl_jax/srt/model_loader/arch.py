@@ -1,7 +1,7 @@
 """Utilities for selecting and loading models."""
 
 import logging
-from typing import Any, Tuple
+from typing import Any
 
 import transformers
 from transformers.dynamic_module_utils import get_class_from_dynamic_module
@@ -46,8 +46,7 @@ def resolve_transformers_arch(model_config: ModelConfig, architectures: list[str
         if model_config.model_impl == ModelImpl.TRANSFORMERS:
             if not model_module.is_backend_compatible():
                 raise ValueError(
-                    f"The Transformers implementation of {arch} is not "
-                    "compatible with SGLang."
+                    f"The Transformers implementation of {arch} is not compatible with SGLang."
                 )
             architectures[i] = "TransformersForCausalLM"
         if model_config.model_impl == ModelImpl.AUTO:
@@ -66,7 +65,7 @@ def resolve_transformers_arch(model_config: ModelConfig, architectures: list[str
     return architectures
 
 
-def get_model_architecture(model_config: ModelConfig) -> Tuple[Any, str]:
+def get_model_architecture(model_config: ModelConfig) -> tuple[Any, str]:
     from sgl_jax.srt.models.registry import ModelRegistry
 
     architectures = getattr(model_config.hf_config, "architectures", [])

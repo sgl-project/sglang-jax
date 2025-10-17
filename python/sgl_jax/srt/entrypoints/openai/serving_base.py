@@ -2,7 +2,7 @@ import json
 import logging
 import uuid
 from abc import ABC, abstractmethod
-from typing import Any, Optional, Union
+from typing import Any
 
 from fastapi import Request
 from fastapi.responses import ORJSONResponse, StreamingResponse
@@ -23,7 +23,7 @@ class OpenAIServingBase(ABC):
 
     async def handle_request(
         self, request: OpenAIServingRequest, raw_request: Request
-    ) -> Union[Any, StreamingResponse, ErrorResponse]:
+    ) -> Any | StreamingResponse | ErrorResponse:
         """Handle the specific request type with common pattern"""
         try:
             # Validate request
@@ -47,7 +47,7 @@ class OpenAIServingBase(ABC):
                 )
 
         except Exception as e:
-            logger.exception(f"Error in request: {e}")
+            logger.exception("Error in request: %s", e)
             return self.create_error_response(
                 message=f"Internal server error: {str(e)}",
                 err_type="InternalServerError",
@@ -59,7 +59,7 @@ class OpenAIServingBase(ABC):
         """Generate request ID based on request type"""
         pass
 
-    def _generate_request_id_base(self, request: OpenAIServingRequest) -> Optional[str]:
+    def _generate_request_id_base(self, request: OpenAIServingRequest) -> str | None:
         """Generate request ID based on request type"""
         return None
 
@@ -82,7 +82,7 @@ class OpenAIServingBase(ABC):
         adapted_request: GenerateReqInput,
         request: OpenAIServingRequest,
         raw_request: Request,
-    ) -> Union[StreamingResponse, ErrorResponse, ORJSONResponse]:
+    ) -> StreamingResponse | ErrorResponse | ORJSONResponse:
         """Handle streaming request
 
         Override this method in child classes that support streaming requests.
@@ -98,7 +98,7 @@ class OpenAIServingBase(ABC):
         adapted_request: GenerateReqInput,
         request: OpenAIServingRequest,
         raw_request: Request,
-    ) -> Union[Any, ErrorResponse, ORJSONResponse]:
+    ) -> Any | ErrorResponse | ORJSONResponse:
         """Handle non-streaming request
 
         Override this method in child classes that support non-streaming requests.
@@ -109,16 +109,16 @@ class OpenAIServingBase(ABC):
             status_code=501,
         )
 
-    def _validate_request(self, _: OpenAIServingRequest) -> Optional[str]:
+    def _validate_request(self, _: OpenAIServingRequest) -> str | None:
         """Validate request"""
-        pass
+        return None
 
     def create_error_response(
         self,
         message: str,
         err_type: str = "BadRequestError",
         status_code: int = 400,
-        param: Optional[str] = None,
+        param: str | None = None,
     ) -> ORJSONResponse:
         """Create an error response"""
         error = ErrorResponse(

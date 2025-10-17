@@ -6,7 +6,6 @@ import os
 import signal
 import threading
 from collections import OrderedDict
-from typing import Dict, List, Optional, Union
 
 import psutil
 import setproctitle
@@ -40,7 +39,7 @@ class DecodeStatus:
     """Store the status of incremental decoding."""
 
     decoded_text: str
-    decode_ids: List[int]
+    decode_ids: list[int]
     surr_offset: int
     read_offset: int
     # Offset that's sent to tokenizer for incremental update.
@@ -93,12 +92,12 @@ class DetokenizerManager:
             self.send_to_tokenizer.send_pyobj(output)
 
     def trim_matched_stop(
-        self, output: Union[str, List[int]], finished_reason: Dict, no_stop_trim: bool
+        self, output: str | list[int], finished_reason: dict, no_stop_trim: bool
     ):
         if no_stop_trim or not finished_reason:
             return output
 
-        matched = finished_reason.get("matched", None)
+        matched = finished_reason.get("matched")
         if not matched:
             return output
 
@@ -228,7 +227,7 @@ class DetokenizerManager:
         for i in range(bs):
             try:
                 s = self.decode_status[recv_obj.rids[i]]
-            except KeyError:
+            except KeyError as e:
                 raise RuntimeError(
                     f"Decode status not found for request {recv_obj.rids[i]}. "
                     "It may be due to the request being evicted from the decode status due to memory pressure. "
@@ -236,7 +235,7 @@ class DetokenizerManager:
                     "the SGLANG_DETOKENIZER_MAX_STATES environment variable to a bigger value than the default value. "
                     f"The current value is {DETOKENIZER_MAX_STATES}. "
                     "For more details, see: https://github.com/sgl-project/sglang/issues/2812"
-                )
+                ) from e
             new_text = read_texts[i][len(surr_texts[i]) :]
             new_token_ids = read_ids[i][len(surr_ids[i]) :]
             if recv_obj.finished_reasons[i] is None:
@@ -293,9 +292,9 @@ class DetokenizerManager:
 
 
 def process_special_tokens_spaces(
-    token_ids: Optional[List[int]] = None,
-    skip_special_tokens: Optional[bool] = None,
-    all_special_ids: Optional[List[int]] = None,
+    token_ids: list[int] | None = None,
+    skip_special_tokens: bool | None = None,
+    all_special_ids: list[int] | None = None,
 ):
     if all_special_ids is None or not skip_special_tokens or token_ids is None:
         return token_ids
@@ -329,7 +328,7 @@ def run_detokenizer_process(
         manager.event_loop()
     except Exception:
         traceback = get_exception_traceback()
-        logger.error(f"DetokenizerManager hit an exception: {traceback}")
+        logger.error("DetokenizerManager hit an exception: %s", traceback)
         parent_process.send_signal(signal.SIGQUIT)
 
 
@@ -347,5 +346,5 @@ def run_detokenizer_thread(
         manager.event_loop()
     except Exception:
         traceback = get_exception_traceback()
-        logger.error(f"DetokenizerManager hit an exception: {traceback}")
+        logger.error("DetokenizerManager hit an exception: %s", traceback)
         current_process.send_signal(signal.SIGQUIT)

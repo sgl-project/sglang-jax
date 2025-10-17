@@ -1,8 +1,8 @@
 import argparse
+import importlib
 import os
 import subprocess
 import sys
-import importlib
 from pathlib import Path
 
 
@@ -11,6 +11,7 @@ def check_jax_dependencies():
     try:
         import jax
         import jax.numpy as jnp
+
         importlib.util.find_spec("flax.nnx")
 
         print(f"✓ JAX version: {jax.__version__}")

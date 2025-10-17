@@ -66,7 +66,7 @@ class TestQwenModel(unittest.TestCase):
             print(f"Failed to load tokenizer from HuggingFace: {e}")
             raise RuntimeError(
                 f"Could not load tokenizer from local path or HuggingFace: {e}"
-            )
+            ) from e
 
     def _setup_model(self):
         """Setup model using get_model_loader"""
@@ -281,7 +281,7 @@ class TestQwenModel(unittest.TestCase):
                     question = template.format(*fill_params)
                 except (IndexError, ValueError):
                     question = (
-                        f"Question {i+1}: Tell me about {random.choice(fill_words)}"
+                        f"Question {i + 1}: Tell me about {random.choice(fill_words)}"
                     )
             else:
                 question = template
@@ -400,7 +400,7 @@ class TestQwenModel(unittest.TestCase):
 
             print("\nSample questions:")
             for i, text in enumerate(input_texts[: min(5, len(input_texts))]):
-                print(f"   {i+1}: '{text}'")
+                print(f"   {i + 1}: '{text}'")
             if len(input_texts) > 5:
                 print(f"   ... and {len(input_texts) - 5} more questions")
 
@@ -522,8 +522,8 @@ class TestQwenModel(unittest.TestCase):
             print(f"   Requests processed: {len(input_texts)}")
             print(f"   Requests finished: {finished_count}/{len(input_texts)}")
             print(f"   Average output length: {avg_output_length:.1f} characters")
-            print(f"   Throughput: {len(input_texts)/total_time:.2f} requests/second")
-            print(f"   Time per request: {total_time/len(input_texts)*1000:.2f} ms")
+            print(f"   Throughput: {len(input_texts) / total_time:.2f} requests/second")
+            print(f"   Time per request: {total_time / len(input_texts) * 1000:.2f} ms")
 
             # Print detailed results for small batches
             if len(input_texts) <= 10:

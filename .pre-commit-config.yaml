@@ -31,7 +31,6 @@ repos:
         args: [--output-format, github, --fix]
         files: ^(python/|benchmark/|docs/|examples/)
         exclude: \.ipynb$
-      - id: ruff-format
   - repo: https://github.com/psf/black
     rev: 24.10.0
     hooks:

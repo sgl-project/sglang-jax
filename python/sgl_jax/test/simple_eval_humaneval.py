@@ -9,8 +9,6 @@ https://arxiv.org/abs/2107.03374 https://github.com/openai/human-eval/
 import random
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Dict, List, Optional
-
 
 try:
     from human_eval.data import read_problems
@@ -31,8 +29,8 @@ from sgl_jax.test.simple_eval_common import (
 
 
 def evaluate_functional_correctness(
-    sample: Dict[str, str],
-    completions: List[str],
+    sample: dict[str, str],
+    completions: list[str],
     n_workers: int = 4,
     timeout: float = 3.0,
 ):
@@ -59,10 +57,10 @@ def evaluate_functional_correctness(
 class HumanEval(Eval):
     def __init__(
         self,
-        num_examples: Optional[int],
+        num_examples: int | None,
         num_threads: int,
         num_samples_per_task: int = 5,
-        ks_passes: List[int] = [1, 2, 5],
+        ks_passes: tuple[int, ...] = (1, 2, 5),
         timeout: int = 120,
     ):
         self.seed = 0
@@ -89,7 +87,7 @@ class HumanEval(Eval):
             ]  # remove signature
             return extracted_answer
 
-        def fn(sample: Dict[str, str]):
+        def fn(sample: dict[str, str]):
             prompt_messages = [
                 sampler._pack_message(
                     role="user", content=instruction + sample["prompt"]

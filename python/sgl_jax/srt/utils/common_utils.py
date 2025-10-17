@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import ctypes
 import dataclasses
 import functools
@@ -21,8 +22,9 @@ import threading
 import time
 import traceback
 from collections import OrderedDict
+from collections.abc import Callable, Sequence
 from pathlib import Path
-from typing import Any, Callable, Optional, Set, Union, Sequence
+from typing import Any
 
 import numpy as np
 import psutil
@@ -47,7 +49,9 @@ def get_bool_env_var(name: str, default: str = "false") -> bool:
     if (value not in truthy_values) and (value not in falsy_values):
         if value not in _warned_bool_env_var_keys:
             logger.warning(
-                f"get_bool_env_var({name}) see non-understandable value={value} and treat as false"
+                "get_bool_env_var(%s) see non-understandable value=%s and treat as false",
+                name,
+                value,
             )
         _warned_bool_env_var_keys.add(value)
 
@@ -79,13 +83,11 @@ def kill_process_tree(parent_pid, include_parent: bool = True, skip_pid: int = N
     for child in children:
         if child.pid == skip_pid:
             continue
-        try:
+        with contextlib.suppress(psutil.NoSuchProcess):
             child.kill()
-        except psutil.NoSuchProcess:
-            pass
 
     if include_parent:
-        try:
+        with contextlib.suppress(psutil.NoSuchProcess):
             if parent_pid == os.getpid():
                 itself.kill()
                 sys.exit(0)
@@ -95,8 +97,6 @@ def kill_process_tree(parent_pid, include_parent: bool = True, skip_pid: int = N
             # Sometime processes cannot be killed with SIGKILL (e.g, PID=1 launched by kubernetes),
             # so we send an additional signal to kill them.
             itself.send_signal(signal.SIGQUIT)
-        except psutil.NoSuchProcess:
-            pass
 
 
 def set_ulimit(target_soft_limit=65535):
@@ -108,7 +108,7 @@ def set_ulimit(target_soft_limit=65535):
         try:
             resource.setrlimit(resource_type, (target_soft_limit, current_hard))
         except ValueError as e:
-            logger.warning(f"Fail to set RLIMIT_NOFILE: {e}")
+            logger.warning("Fail to set RLIMIT_NOFILE: %s", e)
 
     # stack size
     resource_type = resource.RLIMIT_STACK
@@ -120,7 +120,7 @@ def set_ulimit(target_soft_limit=65535):
                 resource_type, (target_soft_limit_stack_size, current_hard)
             )
         except ValueError as e:
-            logger.warning(f"Fail to set RLIMIT_STACK: {e}")
+            logger.warning("Fail to set RLIMIT_STACK: %s", e)
 
 
 def add_api_key_middleware(app, api_key: str):
@@ -138,14 +138,13 @@ def add_api_key_middleware(app, api_key: str):
 
 
 def prepare_model_and_tokenizer(model_path: str, tokenizer_path: str):
-    if get_bool_env_var("SGLANG_USE_MODELSCOPE"):
-        if not os.path.exists(model_path):
-            from modelscope import snapshot_download
+    if get_bool_env_var("SGLANG_USE_MODELSCOPE") and not os.path.exists(model_path):
+        from modelscope import snapshot_download
 
-            model_path = snapshot_download(model_path)
-            tokenizer_path = snapshot_download(
-                tokenizer_path, ignore_patterns=["*.bin", "*.safetensors"]
-            )
+        model_path = snapshot_download(model_path)
+        tokenizer_path = snapshot_download(
+            tokenizer_path, ignore_patterns=["*.bin", "*.safetensors"]
+        )
     return model_path, tokenizer_path
 
 
@@ -153,8 +152,7 @@ def configure_logger(server_args, prefix: str = ""):
     if SGLANG_LOGGING_CONFIG_PATH := os.getenv("SGLANG_LOGGING_CONFIG_PATH"):
         if not os.path.exists(SGLANG_LOGGING_CONFIG_PATH):
             raise Exception(
-                "Setting SGLANG_LOGGING_CONFIG_PATH from env with "
-                f"{SGLANG_LOGGING_CONFIG_PATH} but it does not exist!"
+                f"Setting SGLANG_LOGGING_CONFIG_PATH from env with {SGLANG_LOGGING_CONFIG_PATH} does not exists"
             )
         with open(SGLANG_LOGGING_CONFIG_PATH, encoding="utf-8") as file:
             custom_config = json.loads(file.read())
@@ -176,10 +174,7 @@ def get_zmq_socket(
     mem = psutil.virtual_memory()
     total_mem = mem.total / 1024**3
     available_mem = mem.available / 1024**3
-    if total_mem > 32 and available_mem > 16:
-        buf_size = int(0.5 * 1024**3)
-    else:
-        buf_size = -1
+    buf_size = int(0.5 * 1024**3) if total_mem > 32 and available_mem > 16 else -1
 
     socket = context.socket(socket_type)
     if endpoint.find("[") != -1:
@@ -220,7 +215,7 @@ def delete_directory(dirpath):
 
 
 def dataclass_to_string_truncated(
-    data, max_length=2048, skip_names: Optional[Set[str]] = None
+    data, max_length=2048, skip_names: set[str] | None = None
 ):
     if skip_names is None:
         skip_names = set()
@@ -276,9 +271,9 @@ def pyspy_dump_schedulers():
         result = subprocess.run(
             cmd, shell=True, capture_output=True, text=True, check=True
         )
-        logger.error(f"Pyspy dump for PID {pid}:\n{result.stdout}")
+        logger.error("Pyspy dump for PID %s:\n%s", pid, result.stdout)
     except subprocess.CalledProcessError as e:
-        logger.error(f"Pyspy failed to dump PID {pid}. Error: {e.stderr}")
+        logger.error("Pyspy failed to dump PID %s. Error: %s", pid, e.stderr)
 
 
 def kill_itself_when_parent_died():
@@ -344,16 +339,16 @@ def launch_dummy_health_check_server(host, port):
     try:
         loop = asyncio.get_running_loop()
         logger.info(
-            f"Dummy health check server scheduled on existing loop at {host}:{port}"
+            "Dummy health check server scheduled on existing loop at %s:%s", host, port
         )
         loop.create_task(server.serve())
 
     except RuntimeError:
-        logger.info(f"Starting dummy health check server at {host}:{port}")
+        logger.info("Starting dummy health check server at %s:%s", host, port)
         server.run()
 
 
-def is_remote_url(url: Union[str, Path]) -> bool:
+def is_remote_url(url: str | Path) -> bool:
     """
     Check if the URL is a remote URL of the format:
     <connector_type>://<host>:<port>/<model_name>
@@ -378,17 +373,23 @@ def retry(
             return fn()
         except Exception as e:
             if try_index >= max_retry:
-                raise Exception("retry() exceed maximum number of retries.")
+                raise Exception("retry() exceed maximum number of retries.") from e
 
             if not should_retry(e):
-                raise Exception("retry() observe errors that should not be retried.")
+                raise Exception(
+                    "retry() observe errors that should not be retried."
+                ) from e
 
             delay = min(initial_delay * (2**try_index), max_delay) * (
                 0.75 + 0.25 * random.random()
             )
 
             logger.warning(
-                f"retry() failed once ({try_index}th try, maximum {max_retry} retries). Will delay {delay:.2f}s and retry. Error: {e}"
+                "retry() failed once (%sth try, maximum %s retries). Will delay %.2fs and retry. Error: %s",
+                try_index,
+                max_retry,
+                delay,
+                e,
             )
             traceback.print_exc()
 
@@ -413,7 +414,7 @@ def lru_cache_frozenset(maxsize=128):
             ):
                 return tuple(_to_hashable(v) for v in o)
             else:
-                raise TypeError(f"Cannot make hashable: {type(o)}")
+                raise TypeError(f"Cannot make hashable: {type(o)}") from None
 
     def decorator(func):
         cache = OrderedDict()
@@ -441,5 +442,5 @@ def lru_cache_frozenset(maxsize=128):
 
 
 def cdiv(a, b):
-    assert b != 0, f"b is equal to 0, {b=}"
+    assert b != 0, f"b is equal to 0, b={b}"
     return (a + b - 1) // b

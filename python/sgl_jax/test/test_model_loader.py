@@ -203,12 +203,10 @@ class TestModelLoaderWithRealModel(unittest.TestCase):
                 # Look for directories that contain safetensors files
                 for item in os.listdir(path):
                     item_path = os.path.join(path, item)
-                    if os.path.isdir(item_path):
-                        # Check if this directory has safetensors files
-                        if any(
-                            f.endswith(".safetensors") for f in os.listdir(item_path)
-                        ):
-                            return item_path
+                    if os.path.isdir(item_path) and any(
+                        f.endswith(".safetensors") for f in os.listdir(item_path)
+                    ):
+                        return item_path
 
         return None
 
@@ -591,10 +589,7 @@ class TestModelLoaderWithRealModel(unittest.TestCase):
         keys = path.split(".")
         current = params
         for key in keys:
-            if key.isdigit():
-                current = current[int(key)]
-            else:
-                current = current[key]
+            current = current[int(key)] if key.isdigit() else current[key]
         return current
 
     def test_multi_device_tensor_parallelism(self):
@@ -776,7 +771,7 @@ class TestModelLoaderEdgeCases(unittest.TestCase):
         """Test handling of nonexistent model path."""
         LoadConfig(load_format=LoadFormat.JAX)
 
-        with self.assertRaises(Exception):
+        with self.assertRaises((OSError, FileNotFoundError)):
             ModelConfig(model_path="/nonexistent/path", trust_remote_code=True)
 
     def test_empty_directory(self):
@@ -784,7 +779,7 @@ class TestModelLoaderEdgeCases(unittest.TestCase):
         LoadConfig(load_format=LoadFormat.JAX)
 
         # This should fail when trying to create ModelConfig
-        with self.assertRaises(Exception):
+        with self.assertRaises(OSError):
             ModelConfig(
                 model_path=self.temp_dir,
                 trust_remote_code=True,  # Empty directory

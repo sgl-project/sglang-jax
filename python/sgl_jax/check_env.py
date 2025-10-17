@@ -56,9 +56,7 @@ def get_device_info():
     if len(device_list) == 0:
         return {"Device": "no device found"}
     for i, device in enumerate(device_list):
-        if "TPU" in device.device_kind:
-            device_info[f"[{device.device_kind}-{i}]"] = f"{device}"
-        elif "cpu" in device.device_kind:
+        if "TPU" in device.device_kind or "cpu" in device.device_kind:
             device_info[f"[{device.device_kind}-{i}]"] = f"{device}"
         else:
             raise ValueError(f"invalid device kind: {device.device_kind}")

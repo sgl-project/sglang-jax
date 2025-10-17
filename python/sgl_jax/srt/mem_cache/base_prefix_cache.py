@@ -1,5 +1,5 @@
 import abc
-from typing import TYPE_CHECKING, Any, List, NamedTuple, Optional, Tuple
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 import jax.numpy as jnp
 
@@ -23,8 +23,8 @@ class MatchResult(NamedTuple):
     """
 
     device_indices: jnp.ndarray
-    last_device_node: Optional[TreeNode]
-    last_host_node: Optional[TreeNode]
+    last_device_node: TreeNode | None
+    last_host_node: TreeNode | None
     host_hit_length: int = 0
 
 
@@ -36,7 +36,7 @@ class BasePrefixCache(abc.ABC):
         pass
 
     @abc.abstractmethod
-    def match_prefix(self, key: List[int], **kwargs) -> MatchResult:
+    def match_prefix(self, key: list[int], **kwargs) -> MatchResult:
         pass
 
     @abc.abstractmethod
@@ -56,7 +56,7 @@ class BasePrefixCache(abc.ABC):
         pass
 
     @abc.abstractmethod
-    def dec_lock_ref(self, node: Any, swa_uuid_for_lock: Optional[str] = None):
+    def dec_lock_ref(self, node: Any, swa_uuid_for_lock: str | None = None):
         pass
 
     def evictable_size(self):
@@ -87,7 +87,7 @@ class BasePrefixCache(abc.ABC):
         self,
         last_host_node: Any,
         host_hit_length: int,
-    ) -> Tuple[jnp.ndarray, Any]:
+    ) -> tuple[jnp.ndarray, Any]:
         """
         Preparing KV cache loading from host to device.
         """

@@ -206,10 +206,9 @@ class FlashAttention(AttentionBackend):
             forward_batch, token_to_kv_pool, layer.layer_id
         )
 
-        if layer.scaling is None:
-            scale = 1.0 / jnp.sqrt(layer.head_dim)
-        else:
-            scale = layer.scaling
+        scale = (
+            1.0 / jnp.sqrt(layer.head_dim) if layer.scaling is None else layer.scaling
+        )
 
         # Prepare fused KV cache for paged format: [num_pages, page_size, num_kv_heads * 2, head_dim]
         total_tokens = kv_cache_fused.shape[0]

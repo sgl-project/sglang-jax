@@ -1,10 +1,11 @@
+import contextlib
 import hashlib
 import json
 import logging
 import os
 import threading
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 import jax
 import jax.numpy as jnp
@@ -13,9 +14,7 @@ logger = logging.getLogger(__name__)
 
 
 def _is_jax_array(obj):
-    if not hasattr(obj, "shape") or not hasattr(obj, "dtype"):
-        return False
-    return True
+    return hasattr(obj, "shape") and hasattr(obj, "dtype")
 
 
 class TensorJSONEncoder(json.JSONEncoder):
@@ -122,18 +121,20 @@ class PrecisionTracer:
 
         # metadata
         self._current_batch_id = None
-        self._records: Dict[str, PrecisionTracerRecord] = {}
-        self._batch_requests_mapping: Dict[
-            int, List[PrecisionTracerRequestMetadata]
+        self._records: dict[str, PrecisionTracerRecord] = {}
+        self._batch_requests_mapping: dict[
+            int, list[PrecisionTracerRequestMetadata]
         ] = {}
 
-        self._token_counters: Dict[str, int] = {}
-        self._last_forward_pass_id: Dict[str, int] = {}
+        self._token_counters: dict[str, int] = {}
+        self._last_forward_pass_id: dict[str, int] = {}
         self._current_forward_pass_id: int = -1
 
     def set_enable_precision_tracer(self, enabled: bool):
         self._enable_precision_tracer = enabled
-        logger.info(f"Precision tracer globally {'enabled' if enabled else 'disabled'}")
+        logger.info(
+            "Precision tracer globally %s", "enabled" if enabled else "disabled"
+        )
 
     def get_trace_active(self):
         with self.lock:
@@ -181,8 +182,8 @@ class PrecisionTracer:
 
     def start_trace(
         self,
-        req_num: Optional[int] = None,
-        output_file: Optional[str] = None,
+        req_num: int | None = None,
+        output_file: str | None = None,
         verbose_logging: bool = False,
     ):
         if not self._enable_precision_tracer:
@@ -214,16 +215,16 @@ class PrecisionTracer:
             raise ValueError("output_file is required")
 
         self._trace_output_file = output_file
-        logger.info(f"Trace output file: {self._trace_output_file}")
+        logger.info("Trace output file: %s", self._trace_output_file)
 
         os.makedirs(os.path.dirname(self._trace_output_file), exist_ok=True)
 
         with open(self._trace_output_file, "w") as _:
             pass
 
-        logger.info(f"Request tracing started. Output: {self._trace_output_file}")
+        logger.info("Request tracing started. Output: %s", self._trace_output_file)
         if req_num:
-            logger.info(f"Will trace up to {req_num} requests")
+            logger.info("Will trace up to %s requests", req_num)
         if not verbose_logging:
             logger.info("Verbose console logging disabled during tracing")
 
@@ -243,16 +244,18 @@ class PrecisionTracer:
                     json.dump(record_dict, f, cls=TensorJSONEncoder, ensure_ascii=False)
                     f.write("\n")
 
-            logger.info(f"Saved {len(self._records)} request traces to: {output_file}")
+            logger.info(
+                "Saved %s request traces to: %s", len(self._records), output_file
+            )
 
         except Exception as e:
-            logger.error(f"Error saving traces to {output_file}: {e}")
+            logger.error("Error saving traces to %s: %s", output_file, e)
 
         self._records.clear()
         self._batch_requests_mapping.clear()
         self._token_counters.clear()
         self._last_forward_pass_id.clear()
-        logger.info(f"Request tracing stopped. Traces saved to: {output_file}")
+        logger.info("Request tracing stopped. Traces saved to: %s", output_file)
         return output_file
 
     def start_batch_trace(self, batch_id: int):
@@ -263,7 +266,7 @@ class PrecisionTracer:
             requests_in_batch = self._batch_requests_mapping.get(batch_id, [])
 
             if len(requests_in_batch) == 0:
-                logger.warning(f"Batch {batch_id} has no requests to trace")
+                logger.warning("Batch %s has no requests to trace", batch_id)
                 return
 
             self._current_batch_id = batch_id
@@ -293,7 +296,7 @@ class PrecisionTracer:
         self._current_forward_pass_id = forward_pass_id
 
     def jit_pure_callback_record(
-        self, tensor: Any, name: str, stage: str, layer_id: Optional[int] = None
+        self, tensor: Any, name: str, stage: str, layer_id: int | None = None
     ) -> bool:
         if self._enable_precision_tracer:
             full_stage = (
@@ -304,7 +307,10 @@ class PrecisionTracer:
                 # Debug logging to check what stage is being passed
                 if self._trace_active:
                     logger.debug(
-                        f"Recording tensor {name} with stage: {full_stage}, layer_id: {layer_id}"
+                        "Recording tensor %s with stage: %s, layer_id: %s",
+                        name,
+                        full_stage,
+                        layer_id,
                     )
                 precision_tracer.record(tensor, name, full_stage)
                 return True
@@ -326,7 +332,7 @@ class PrecisionTracer:
             return
 
         if tensor is None:
-            logger.info(f"[{stage}] {name}: None")
+            logger.info("[%s] %s: None", stage, name)
             return
 
         with self.lock:
@@ -336,7 +342,7 @@ class PrecisionTracer:
             current_batch_id = self._current_batch_id
 
         if len(request_in_batch) == 0:
-            logger.warning(f"Batch {current_batch_id} has no requests to trace")
+            logger.warning("Batch %s has no requests to trace", current_batch_id)
             return
 
         prisicion_infos = self._calculate_tensor_pricision_info(
@@ -422,7 +428,7 @@ class PrecisionTracer:
                         current_token_group["records"].append(record_with_metadata)
 
                 else:
-                    logger.warning(f"Request {req_id} not found in records")
+                    logger.warning("Request %s not found in records", req_id)
                     continue
 
         for req_id, data in prisicion_infos.items():
@@ -436,8 +442,8 @@ class PrecisionTracer:
         tensor: Any,
         name: str,
         stage: str,
-        request_in_batch: List[PrecisionTracerRequestMetadata],
-    ) -> Dict[str, Any]:
+        request_in_batch: list[PrecisionTracerRequestMetadata],
+    ) -> dict[str, Any]:
         try:
             try:
                 test_scalar = jnp.array(1.0)
@@ -456,16 +462,16 @@ class PrecisionTracer:
 
             for idx, req_meta in enumerate(request_in_batch):
                 req_id = req_meta.request_id
-                if req_meta.forward_mode == 1:
-                    seq_len = req_meta.input_len
-                else:
-                    seq_len = 1
+                seq_len = req_meta.input_len if req_meta.forward_mode == 1 else 1
 
                 if current_idx + seq_len > total_batch_size:
                     logger.error(
-                        f"[TENSOR_DEBUG] ERROR: Request {req_id} requires {seq_len} tokens, "
-                        f"but only {total_batch_size - current_idx} left in tensor of shape {tensor.shape}. "
-                        f"Current position: {current_idx}"
+                        "[TENSOR_DEBUG] ERROR: Request %s requires %s tokens, but only %s left in tensor of shape %s. Current position: %s",
+                        req_id,
+                        seq_len,
+                        total_batch_size - current_idx,
+                        tensor.shape,
+                        current_idx,
                     )
                     continue
 
@@ -518,7 +524,7 @@ class PrecisionTracer:
         module_type = "unknown"
 
         if self._trace_active:
-            logger.debug(f"Parsing stage: '{stage}'")
+            logger.debug("Parsing stage: '%s'", stage)
 
         if "_layer_id_" in stage:
             parts = stage.split("_layer_id_")
@@ -528,12 +534,14 @@ class PrecisionTracer:
                     module_type = parts[0]
                     if self._trace_active:
                         logger.debug(
-                            f"Parsed from _layer_id_ format: layer_id={layer_id}, module_type={module_type}"
+                            "Parsed from _layer_id_ format: layer_id=%s, module_type=%s",
+                            layer_id,
+                            module_type,
                         )
                     return layer_id, module_type
                 except (ValueError, IndexError) as e:
                     if self._trace_active:
-                        logger.debug(f"Failed to parse _layer_id_ format: {e}")
+                        logger.debug("Failed to parse _layer_id_ format: %s", e)
                     pass
 
         if stage:
@@ -560,10 +568,8 @@ class PrecisionTracer:
                 layer_match = re.search(r"L(\d+)", stage, re.IGNORECASE)
 
             if layer_match:
-                try:
+                with contextlib.suppress(ValueError):
                     layer_id = int(layer_match.group(1))
-                except ValueError:
-                    pass
 
         return layer_id, module_type
 
@@ -580,10 +586,7 @@ class PrecisionTracer:
             shape = tensor.shape
             dtype = str(tensor.dtype)
 
-            if tensor.size > 1:
-                std_val = float(jnp.std(tensor, ddof=0).item())
-            else:
-                std_val = 0.0
+            std_val = float(jnp.std(tensor, ddof=0).item()) if tensor.size > 1 else 0.0
 
             stats = {
                 "framework": "jax",
@@ -669,7 +672,7 @@ class PrecisionTracer:
             "tracing_context": True,
         }
 
-    def _verbose_logging_console(self, stats: Dict[str, Any]):
+    def _verbose_logging_console(self, stats: dict[str, Any]):
         if self._trace_active and not self._verbose_logging:
             return
 

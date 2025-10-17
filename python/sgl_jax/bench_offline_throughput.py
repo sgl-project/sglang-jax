@@ -19,7 +19,6 @@ import logging
 import os
 import random
 import time
-from typing import Dict, List, Optional
 
 import numpy as np
 
@@ -41,8 +40,8 @@ class BenchArgs:
     dataset_name: str = "sharegpt"
     dataset_path: str = ""
     num_prompts: int = 1000
-    sharegpt_output_len: Optional[int] = None
-    sharegpt_context_len: Optional[int] = None
+    sharegpt_output_len: int | None = None
+    sharegpt_context_len: int | None = None
     random_input_len: int = 1024
     random_output_len: int = 1024
     random_range_ratio: float = 0.0
@@ -53,7 +52,7 @@ class BenchArgs:
     gsp_output_len: int = 256
     seed: int = 1
     disable_ignore_eos: bool = False
-    extra_request_body: Optional[str] = None
+    extra_request_body: str | None = None
     apply_chat_template: bool = False
     profile: bool = False
     skip_warmup: bool = False
@@ -110,15 +109,13 @@ class BenchArgs:
             "--random-range-ratio",
             type=float,
             default=BenchArgs.random_range_ratio,
-            help="Range of sampled ratio of input/output length, "
-            "used only for random dataset.",
+            help="Range of sampled ratio of input/output length, used only for random dataset.",
         )
         parser.add_argument(
             "--gsp-num-groups",
             type=int,
             default=BenchArgs.gsp_num_groups,
-            help="Number of groups with shared prefix, used"
-            "only for generate-shared-prefix",
+            help="Number of groups with shared prefix, usedonly for generate-shared-prefix",
         )
         parser.add_argument(
             "--gsp-prompts-per-group",
@@ -131,13 +128,13 @@ class BenchArgs:
             "--gsp-system-prompt-len",
             type=int,
             default=BenchArgs.gsp_system_prompt_len,
-            help="System prompt length, used" "only for generate-shared-prefix",
+            help="System prompt length, usedonly for generate-shared-prefix",
         )
         parser.add_argument(
             "--gsp-question-len",
             type=int,
             default=BenchArgs.gsp_question_len,
-            help="Question length, used" "only for generate-shared-prefix",
+            help="Question length, usedonly for generate-shared-prefix",
         )
         parser.add_argument(
             "--gsp-output-len",
@@ -196,9 +193,9 @@ class BenchArgs:
 def throughput_test_once(
     backend_name: str,
     backend,
-    reqs: List[DatasetRow],
+    reqs: list[DatasetRow],
     ignore_eos: bool,
-    extra_request_body: Dict,
+    extra_request_body: dict,
     profile: bool,
 ):
     measurement_results = {

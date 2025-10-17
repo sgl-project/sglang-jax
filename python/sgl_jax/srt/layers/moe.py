@@ -1,4 +1,4 @@
-from typing import Iterable, Optional, Sequence, Tuple, Union
+from collections.abc import Iterable, Sequence
 
 import jax
 from flax import nnx
@@ -32,19 +32,18 @@ class GateLogit(nnx.Module):
     def __init__(
         self,
         input_size: int,
-        features: Union[Iterable[int], int],
+        features: Iterable[int] | int,
         model_name: str,
-        axis: Union[Iterable[int], int] = -1,
+        axis: Iterable[int] | int = -1,
         weight_dtype: jnp.dtype = jnp.float32,
         dtype: jnp.dtype = jnp.float32,
-        kernel_axes: Optional[Sequence[str]] = None,
+        kernel_axes: Sequence[str] | None = None,
         use_bias: bool = False,
         score_func: str = "",
         matmul_precision: str = "default",
         layer_id: int = 0,
         rngs: nnx.Rngs = None,
     ):
-
         self.features = linear._canonicalize_tuple(features)
         self.axis = linear._canonicalize_tuple(axis)
         self.model_name = model_name
@@ -78,7 +77,7 @@ class GateLogit(nnx.Module):
         else:
             self.bias = None
 
-    def __call__(self, inputs: jax.Array) -> Tuple[jax.Array, Optional[jax.Array]]:
+    def __call__(self, inputs: jax.Array) -> tuple[jax.Array, jax.Array | None]:
         inputs = jnp.asarray(inputs, self.dtype)
 
         kernel = jnp.asarray(self.kernel.value, self.dtype)
@@ -113,7 +112,6 @@ class EPMoE(nnx.Module):
         layer_id: int = 0,
         rngs: nnx.Rngs = None,
     ):
-
         self.config = config
         self.num_experts = num_experts
         self.num_experts_per_tok = num_experts_per_tok

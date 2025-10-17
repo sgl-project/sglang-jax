@@ -2,7 +2,6 @@ import abc
 import logging
 import time
 from functools import partial
-from typing import List, Optional, Tuple, Union
 
 import jax
 import jax.numpy as jnp
@@ -95,7 +94,7 @@ class ReqToTokenPool:
         """Return number of available request slots"""
         return len(self.free_slots)
 
-    def alloc(self, need_size: int = 1) -> List[int]:
+    def alloc(self, need_size: int = 1) -> list[int]:
         """Allocate request slots"""
         if need_size > len(self.free_slots):
             return None
@@ -104,7 +103,7 @@ class ReqToTokenPool:
         self.free_slots = self.free_slots[need_size:]
         return select_indices
 
-    def free(self, free_index: Union[int, List[int]]):
+    def free(self, free_index: int | list[int]):
         """Free request slots"""
         if isinstance(free_index, int):
             self.free_slots.append(free_index)
@@ -126,8 +125,8 @@ class KVCache(abc.ABC):
         dtype: jnp.dtype,
         layer_num: int,
         mesh: Mesh,
-        start_layer: Optional[int] = None,
-        end_layer: Optional[int] = None,
+        start_layer: int | None = None,
+        end_layer: int | None = None,
     ):
         self.size = size
         self.page_size = page_size
@@ -170,7 +169,7 @@ class KVCache(abc.ABC):
         raise NotImplementedError()
 
     @abc.abstractmethod
-    def get_kv_buffer(self, layer_id: int) -> Tuple[jnp.ndarray, jnp.ndarray]:
+    def get_kv_buffer(self, layer_id: int) -> tuple[jnp.ndarray, jnp.ndarray]:
         """Get separate K and V buffers for native attention.
 
         Returns:
@@ -213,8 +212,8 @@ class MHATokenToKVPool(KVCache):
         head_dim: int,
         layer_num: int,
         mesh: Mesh,
-        start_layer: Optional[int] = None,
-        end_layer: Optional[int] = None,
+        start_layer: int | None = None,
+        end_layer: int | None = None,
     ):
         super().__init__(
             size, page_size, dtype, layer_num, mesh, start_layer, end_layer
@@ -272,7 +271,7 @@ class MHATokenToKVPool(KVCache):
         """Create sharded fused KV cache buffers with proper distributed allocation"""
         self.kv_sharding = NamedSharding(self.mesh, P(None, self.kv_partition_axis))
 
-        logger.info(f"Creating fused KV buffers for {self.layer_num} layers")
+        logger.info("Creating fused KV buffers for %s layers", self.layer_num)
         start_time = time.time()
 
         fused_buffer_shape = (
@@ -287,7 +286,9 @@ class MHATokenToKVPool(KVCache):
             * jnp.dtype(self.dtype).itemsize
         )
         logger.info(
-            f"Total fused KV cache memory per layer: {total_memory_per_layer / 1024**3:.2f} GB, dtype: {self.dtype}"
+            "Total fused KV cache memory per layer: %.2f GB, dtype: %s",
+            total_memory_per_layer / 1024**3,
+            self.dtype,
         )
         with self.mesh:
             self.kv_buffer = []
@@ -304,7 +305,9 @@ class MHATokenToKVPool(KVCache):
 
         end_time = time.time()
         logger.info(
-            f"Total time to create {self.layer_num} buffers: {end_time - start_time:.2f} seconds"
+            "Total time to create %s buffers: %.2f seconds",
+            self.layer_num,
+            end_time - start_time,
         )
 
     def _calculate_memory_usage(self):
@@ -320,8 +323,9 @@ class MHATokenToKVPool(KVCache):
         self.mem_usage = fused_kv_size / GB
 
         logger.info(
-            f"JAX Fused KV Cache allocated. #tokens: {self.size}, "
-            f"Fused KV size: {fused_kv_size / GB:.2f} GB"
+            "JAX Fused KV Cache allocated. #tokens: %s, Fused KV size: %.2f GB",
+            self.size,
+            fused_kv_size / GB,
         )
 
     def get_kv_size_bytes(self):
@@ -342,7 +346,7 @@ class MHATokenToKVPool(KVCache):
     def get_fused_kv_buffer(self, layer_id: int) -> jnp.ndarray:
         return self.kv_buffer[layer_id - self.start_layer]
 
-    def get_kv_buffer(self, layer_id: int) -> Tuple[jnp.ndarray, jnp.ndarray]:
+    def get_kv_buffer(self, layer_id: int) -> tuple[jnp.ndarray, jnp.ndarray]:
         layer_idx = layer_id - self.start_layer
         fused_kv = self.kv_buffer[layer_idx]  # [cache_size, num_kv_heads * 2, head_dim]
 
@@ -388,7 +392,7 @@ class MHATokenToKVPool(KVCache):
 
     def get_kv_data(
         self, layer_id: int, indices: jnp.ndarray
-    ) -> Tuple[jnp.ndarray, jnp.ndarray]:
+    ) -> tuple[jnp.ndarray, jnp.ndarray]:
         """Get KV data at specified positions"""
         layer_idx = layer_id - self.start_layer
         fused_kv_data = self.kv_buffer[layer_idx][indices]
@@ -837,10 +841,7 @@ def update_fused_kv_cache_vectorized(
 
 def get_best_num_slices_per_block(head_num, cache_len, new_kv_len, head_dim, page_size):
     # keep same to original implementation
-    if page_size == 1:
-        num_slices_per_block = 4
-    else:
-        num_slices_per_block = page_size
+    num_slices_per_block = 4 if page_size == 1 else page_size
 
     return num_slices_per_block
 
@@ -893,7 +894,7 @@ def get_best_num_slices_per_block(head_num, cache_len, new_kv_len, head_dim, pag
 # @partial(jax.jit, static_argnames=["layer_id"])
 def _get_kv_buffer(
     layer_id: int, k_cache: jax.Array, v_cache: jax.Array
-) -> Tuple[jax.Array, jax.Array]:
+) -> tuple[jax.Array, jax.Array]:
     return k_cache[layer_id], v_cache[layer_id]
 
 
@@ -908,8 +909,8 @@ class MLATokenToKVPool(KVCache):
         layer_num: int,
         mesh: Mesh,
         kv_partition_axis: str = "data",  # Note: ignored in MLA, no sharding applied
-        start_layer: Optional[int] = None,
-        end_layer: Optional[int] = None,
+        start_layer: int | None = None,
+        end_layer: int | None = None,
     ):
         super().__init__(
             size, page_size, dtype, layer_num, mesh, start_layer, end_layer
@@ -952,8 +953,9 @@ class MLATokenToKVPool(KVCache):
         self.mem_usage = kv_size / GB
 
         logger.info(
-            f"JAX MLA KV Cache allocated. #tokens: {self.size}, "
-            f"KV size: {kv_size / GB:.2f} GB"
+            "JAX MLA KV Cache allocated. #tokens: %s, KV size: %.2f GB",
+            self.size,
+            kv_size / GB,
         )
 
     def get_kv_size_bytes(self):
@@ -974,7 +976,7 @@ class MLATokenToKVPool(KVCache):
         """
         return self.kv_buffer[layer_id - self.start_layer]
 
-    def get_kv_buffer(self, layer_id: int) -> Tuple[jnp.ndarray, jnp.ndarray]:
+    def get_kv_buffer(self, layer_id: int) -> tuple[jnp.ndarray, jnp.ndarray]:
         """Get separate K and V buffers for native attention from MLA KV cache.
 
         Note: MLA architecture differs from standard MHA. For native attention compatibility,
@@ -1186,87 +1188,12 @@ best_num_slices_per_block_config = {
     "hn_32_mcl_320000_nvl_16384_hd_128_ps_128": 4,
     "hn_32_mcl_640000_nvl_1024_hd_128_ps_128": 512,
     "hn_32_mcl_640000_nvl_2048_hd_128_ps_128": 4096,
-    "hn_32_mcl_640000_nvl_4096_hd_128_ps_128": 4,
-    "hn_32_mcl_640000_nvl_9182_hd_128_ps_128": 2,
-    "hn_32_mcl_640000_nvl_16384_hd_128_ps_128": 1024,
+    "hn_32_mcl_640000_nvl_4096_hd_128_ps_128": 4096,
+    "hn_32_mcl_640000_nvl_9182_hd_128_ps_128": 256,
+    "hn_32_mcl_640000_nvl_16384_hd_128_ps_128": 128,
     "hn_32_mcl_1280000_nvl_1024_hd_128_ps_128": 32,
     "hn_32_mcl_1280000_nvl_2048_hd_128_ps_128": 2048,
-    "hn_32_mcl_1280000_nvl_4096_hd_128_ps_128": 128,
-    "hn_32_mcl_1280000_nvl_9182_hd_128_ps_128": 1024,
-    "hn_32_mcl_1280000_nvl_16384_hd_128_ps_128": 1024,
-    "hn_8_mcl_80000_nvl_1024_hd_128_ps_256": 2,
-    "hn_8_mcl_80000_nvl_2048_hd_128_ps_256": 4,
-    "hn_8_mcl_80000_nvl_4096_hd_128_ps_256": 2,
-    "hn_8_mcl_80000_nvl_9182_hd_128_ps_256": 512,
-    "hn_8_mcl_80000_nvl_16384_hd_128_ps_256": 2048,
-    "hn_8_mcl_160000_nvl_1024_hd_128_ps_256": 4,
-    "hn_8_mcl_160000_nvl_2048_hd_128_ps_256": 256,
-    "hn_8_mcl_160000_nvl_4096_hd_128_ps_256": 128,
-    "hn_8_mcl_160000_nvl_9182_hd_128_ps_256": 2048,
-    "hn_8_mcl_160000_nvl_16384_hd_128_ps_256": 2048,
-    "hn_8_mcl_320000_nvl_1024_hd_128_ps_256": 4,
-    "hn_8_mcl_320000_nvl_2048_hd_128_ps_256": 1024,
-    "hn_8_mcl_320000_nvl_4096_hd_128_ps_256": 64,
-    "hn_8_mcl_320000_nvl_9182_hd_128_ps_256": 16,
-    "hn_8_mcl_320000_nvl_16384_hd_128_ps_256": 512,
-    "hn_8_mcl_640000_nvl_1024_hd_128_ps_256": 1024,
-    "hn_8_mcl_640000_nvl_2048_hd_128_ps_256": 8,
-    "hn_8_mcl_640000_nvl_4096_hd_128_ps_256": 16,
-    "hn_8_mcl_640000_nvl_9182_hd_128_ps_256": 16,
-    "hn_8_mcl_640000_nvl_16384_hd_128_ps_256": 4096,
-    "hn_8_mcl_1280000_nvl_1024_hd_128_ps_256": 64,
-    "hn_8_mcl_1280000_nvl_2048_hd_128_ps_256": 2,
-    "hn_8_mcl_1280000_nvl_4096_hd_128_ps_256": 2048,
-    "hn_8_mcl_1280000_nvl_9182_hd_128_ps_256": 1024,
-    "hn_8_mcl_1280000_nvl_16384_hd_128_ps_256": 128,
-    "hn_16_mcl_80000_nvl_1024_hd_128_ps_256": 2,
-    "hn_16_mcl_80000_nvl_2048_hd_128_ps_256": 16,
-    "hn_16_mcl_80000_nvl_4096_hd_128_ps_256": 64,
-    "hn_16_mcl_80000_nvl_9182_hd_128_ps_256": 256,
-    "hn_16_mcl_80000_nvl_16384_hd_128_ps_256": 16,
-    "hn_16_mcl_160000_nvl_1024_hd_128_ps_256": 4,
-    "hn_16_mcl_160000_nvl_2048_hd_128_ps_256": 2,
-    "hn_16_mcl_160000_nvl_4096_hd_128_ps_256": 128,
-    "hn_16_mcl_160000_nvl_9182_hd_128_ps_256": 16,
-    "hn_16_mcl_160000_nvl_16384_hd_128_ps_256": 8,
-    "hn_16_mcl_320000_nvl_1024_hd_128_ps_256": 16,
-    "hn_16_mcl_320000_nvl_2048_hd_128_ps_256": 8,
-    "hn_16_mcl_320000_nvl_4096_hd_128_ps_256": 4,
-    "hn_16_mcl_320000_nvl_9182_hd_128_ps_256": 8,
-    "hn_16_mcl_320000_nvl_16384_hd_128_ps_256": 8,
-    "hn_16_mcl_640000_nvl_1024_hd_128_ps_256": 512,
-    "hn_16_mcl_640000_nvl_2048_hd_128_ps_256": 1024,
-    "hn_16_mcl_640000_nvl_4096_hd_128_ps_256": 2048,
-    "hn_16_mcl_640000_nvl_9182_hd_128_ps_256": 4096,
-    "hn_16_mcl_640000_nvl_16384_hd_128_ps_256": 32,
-    "hn_16_mcl_1280000_nvl_1024_hd_128_ps_256": 4,
-    "hn_16_mcl_1280000_nvl_2048_hd_128_ps_256": 2,
-    "hn_16_mcl_1280000_nvl_4096_hd_128_ps_256": 1024,
-    "hn_16_mcl_1280000_nvl_9182_hd_128_ps_256": 2048,
-    "hn_16_mcl_1280000_nvl_16384_hd_128_ps_256": 16,
-    "hn_32_mcl_80000_nvl_1024_hd_128_ps_256": 4,
-    "hn_32_mcl_80000_nvl_2048_hd_128_ps_256": 256,
-    "hn_32_mcl_80000_nvl_4096_hd_128_ps_256": 4096,
-    "hn_32_mcl_80000_nvl_9182_hd_128_ps_256": 128,
-    "hn_32_mcl_80000_nvl_16384_hd_128_ps_256": 512,
-    "hn_32_mcl_160000_nvl_1024_hd_128_ps_256": 64,
-    "hn_32_mcl_160000_nvl_2048_hd_128_ps_256": 4096,
-    "hn_32_mcl_160000_nvl_4096_hd_128_ps_256": 4096,
-    "hn_32_mcl_160000_nvl_9182_hd_128_ps_256": 256,
-    "hn_32_mcl_160000_nvl_16384_hd_128_ps_256": 128,
-    "hn_32_mcl_320000_nvl_1024_hd_128_ps_256": 4,
-    "hn_32_mcl_320000_nvl_2048_hd_128_ps_256": 64,
-    "hn_32_mcl_320000_nvl_4096_hd_128_ps_256": 1024,
-    "hn_32_mcl_320000_nvl_9182_hd_128_ps_256": 256,
-    "hn_32_mcl_320000_nvl_16384_hd_128_ps_256": 32,
-    "hn_32_mcl_640000_nvl_1024_hd_128_ps_256": 256,
-    "hn_32_mcl_640000_nvl_2048_hd_128_ps_256": 8,
-    "hn_32_mcl_640000_nvl_4096_hd_128_ps_256": 64,
-    "hn_32_mcl_640000_nvl_9182_hd_128_ps_256": 32,
-    "hn_32_mcl_640000_nvl_16384_hd_128_ps_256": 32,
-    "hn_32_mcl_1280000_nvl_1024_hd_128_ps_256": 256,
-    "hn_32_mcl_1280000_nvl_2048_hd_128_ps_256": 2048,
-    "hn_32_mcl_1280000_nvl_4096_hd_128_ps_256": 8,
-    "hn_32_mcl_1280000_nvl_9182_hd_128_ps_256": 4,
-    "hn_32_mcl_1280000_nvl_16384_hd_128_ps_256": 2,
+    "hn_32_mcl_1280000_nvl_4096_hd_128_ps_128": 8,
+    "hn_32_mcl_1280000_nvl_9182_hd_128_ps_128": 4,
+    "hn_32_mcl_1280000_nvl_16384_hd_128_ps_128": 2,
 }

@@ -3,7 +3,6 @@
 import logging
 import os
 from functools import partial
-from typing import Optional, Tuple, Union
 
 import jax
 import jax.numpy as jnp
@@ -61,8 +60,8 @@ class ModelRunner:
         tp_size: int,
         server_args: ServerArgs,
         mesh: jax.sharding.Mesh,
-        req_to_token_pool: Optional[ReqToTokenPool] = None,
-        token_to_kv_pool_allocator: Optional[BaseTokenToKVPoolAllocator] = None,
+        req_to_token_pool: ReqToTokenPool | None = None,
+        token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator | None = None,
         rngs: nnx.Rngs = None,
     ):
         # Parse args
@@ -197,18 +196,18 @@ class ModelRunner:
 
         # Check memory for tensor parallelism
         local_device_memory = get_available_device_memory(self.device)
-        if self.tp_size > 1:
-            if min_available_device_memory < local_device_memory * 0.9:
-                if get_bool_env_var("SGL_DISABLE_TP_MEMORY_INBALANCE_CHECK"):
-                    logger.warning(
-                        "The memory capacity is unbalanced. "
-                        f"{min_available_device_memory=}, {local_device_memory=}, {local_device_memory * 0.9=}"
-                    )
-                else:
-                    raise ValueError(
-                        "The memory capacity is unbalanced. "
-                        f"{min_available_device_memory=}, {local_device_memory=}, {local_device_memory * 0.9=}"
-                    )
+        if self.tp_size > 1 and min_available_device_memory < local_device_memory * 0.9:
+            if get_bool_env_var("SGL_DISABLE_TP_MEMORY_INBALANCE_CHECK"):
+                logger.warning(
+                    "The memory capacity is unbalanced. min_available_device_memory=%s, local_device_memory=%s, local_device_memory*0.9=%s",
+                    min_available_device_memory,
+                    local_device_memory,
+                    local_device_memory * 0.9,
+                )
+            else:
+                raise ValueError(
+                    f"The memory capacity is unbalanced. min_available_device_memory={min_available_device_memory}, local_device_memory={local_device_memory}, local_device_memory*0.9={local_device_memory * 0.9}"
+                )
 
         return min_available_device_memory
 
@@ -257,20 +256,20 @@ class ModelRunner:
         max_tokens = max(1, int(available_kv_cache_bytes // cell_size))
 
         logger.info(
-            f"TPU Memory profiling: "
-            f"available_device_memory={available_device_memory / (1024**3):.1f}GB, "
-            f"available_kv_cache={available_kv_cache_bytes / (1024**3):.1f}GB, "
-            f"max_tokens={max_tokens}, "
-            f"cell_size={cell_size}bytes"
+            "TPU Memory profiling: available_device_memory=%.1fGB, available_kv_cache=%.1fGB, max_tokens=%d, cell_size=%dbytes",
+            available_device_memory / (1024**3),
+            available_kv_cache_bytes / (1024**3),
+            max_tokens,
+            cell_size,
         )
 
         return max_tokens
 
     def init_memory_pool(
         self,
-        max_num_reqs: Optional[int] = None,
-        max_total_tokens: Optional[int] = None,
-        total_device_memory: Optional[int] = None,
+        max_num_reqs: int | None = None,
+        max_total_tokens: int | None = None,
+        total_device_memory: int | None = None,
     ):
         """Initialize memory pool for KV cache."""
         # Set KV cache data type
@@ -282,7 +281,7 @@ class ModelRunner:
             raise ValueError(
                 f"Unsupported kv_cache_dtype: {self.server_args.kv_cache_dtype}."
             )
-        logger.info(f"ModelRunner kv_cache_dtype: {self.kv_cache_dtype}")
+        logger.info("ModelRunner kv_cache_dtype: %s", self.kv_cache_dtype)
         # Profile maximum number of tokens
         self.max_total_num_tokens = self.profile_max_num_token(total_device_memory)
 
@@ -307,9 +306,9 @@ class ModelRunner:
         if max_total_tokens is not None:
             if max_total_tokens > self.max_total_num_tokens:
                 logger.warning(
-                    f"max_total_tokens={max_total_tokens} is larger than the profiled value "
-                    f"{self.max_total_num_tokens}. "
-                    f"Use the profiled value instead."
+                    "max_total_tokens=%s is larger than the profiled value %s. Use the profiled value instead.",
+                    max_total_tokens,
+                    self.max_total_num_tokens,
                 )
             self.max_total_num_tokens = min(self.max_total_num_tokens, max_total_tokens)
 
@@ -325,7 +324,7 @@ class ModelRunner:
                 "Not enough memory. Please try to increase --mem-fraction-static."
             )
 
-        logger.info(f"ModelRunner max_total_num_tokens: {self.max_total_num_tokens}")
+        logger.info("ModelRunner max_total_num_tokens: %s", self.max_total_num_tokens)
 
         # Create request to token pool if not already created
         if self.req_to_token_pool is None:
@@ -438,14 +437,14 @@ class ModelRunner:
         self,
         forward_batch: ForwardBatch,
         logits_metadata: LogitsMetadata,
-    ) -> Tuple[LogitsProcessorOutput, int]:
+    ) -> tuple[LogitsProcessorOutput, int]:
         raise NotImplementedError("forward_idle is not implemented")
 
     def forward(
         self,
         forward_batch: ForwardBatch,
         logits_metadata: LogitsMetadata,
-    ) -> Tuple[LogitsProcessorOutput, int]:
+    ) -> tuple[LogitsProcessorOutput, int]:
         self.forward_pass_id += 1
         precision_tracer.start_batch_trace(forward_batch.bid)
         precision_tracer.set_current_forward_pass_id(self.forward_pass_id)
@@ -455,7 +454,7 @@ class ModelRunner:
         self,
         forward_batch: ForwardBatch,
         logits_metadata: LogitsMetadata,
-    ) -> Tuple[LogitsProcessorOutput, int]:
+    ) -> tuple[LogitsProcessorOutput, int]:
         # for compatibility, 0.6.3 need to use use_mesh. set_mesh is not have __entry__ attribute.
         # on jax >=0.7.1, we need to use set_mesh.
         try:
@@ -504,7 +503,7 @@ class ModelRunner:
 class MockModelRunner(ModelRunner):
     def __init__(
         self,
-        model_config: Union[ModelConfig, MockModelConfig],
+        model_config: ModelConfig | MockModelConfig,
         rngs: nnx.Rngs = None,
         mesh: mesh_lib.Mesh = None,
         server_args: ServerArgs = None,

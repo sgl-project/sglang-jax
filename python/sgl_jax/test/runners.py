@@ -14,8 +14,6 @@
 
 import os
 
-
-
 DEFAULT_PROMPTS = [
     "Apple is red. Banana is Yellow. " * 800 + "Apple is",
     "The capital of the United Kingdom is",
@@ -41,7 +39,7 @@ TEST_RERANK_QUERY_DOCS = [
 ]
 
 dirpath = os.path.dirname(__file__)
-with open(os.path.join(dirpath, "long_prompt.txt"), "r") as f:
+with open(os.path.join(dirpath, "long_prompt.txt")) as f:
     long_prompt = f.read()
 DEFAULT_PROMPTS.append(long_prompt)
 

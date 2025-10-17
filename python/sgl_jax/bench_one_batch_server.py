@@ -18,7 +18,6 @@ import json
 import multiprocessing
 import os
 import time
-from typing import Tuple
 
 import requests
 
@@ -33,9 +32,9 @@ from sgl_jax.test.test_utils import is_in_ci, write_github_step_summary
 @dataclasses.dataclass
 class BenchArgs:
     run_name: str = "default"
-    batch_size: Tuple[int] = (1,)
-    input_len: Tuple[int] = (1024,)
-    output_len: Tuple[int] = (16,)
+    batch_size: tuple[int] = (1,)
+    input_len: tuple[int] = (1024,)
+    output_len: tuple[int] = (16,)
     temperature: float = 0.0
     return_logprob: bool = False
     client_stream_interval: int = 1
@@ -372,7 +371,7 @@ def run_benchmark(server_args: ServerArgs, bench_args: BenchArgs):
             f"{input_throughput:.2f} | "
             f"{output_throughput:.2f} | "
             f"{accept_length} | "
-            f"{1 / (output_throughput/batch_size) * 1000:.2f} | "
+            f"{1 / (output_throughput / batch_size) * 1000:.2f} | "
             f"{1e6 / (input_throughput * input_util) / 3600 * hourly_cost:.2f} | "
             f"{1e6 / output_throughput / 3600 * hourly_cost:.2f} |"
         )

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 import threading
-from typing import TYPE_CHECKING, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING
 
 import jax
 
@@ -32,8 +32,8 @@ class SchedulerOutputProcessorMixin:
     def process_batch_result_prefill(
         self: Scheduler,
         batch: ScheduleBatch,
-        result: Union[GenerationBatchResult],
-        launch_done: Optional[threading.Event] = None,
+        result: GenerationBatchResult,
+        launch_done: threading.Event | None = None,
     ):
         skip_stream_req = None
 
@@ -89,7 +89,10 @@ class SchedulerOutputProcessorMixin:
                         precision_tracer.add_completed_requests_count()
                         precision_tracer.set_end_time_and_duration(req.rid)
                         logger.info(
-                            f"Request trace completed ({precision_tracer.get_completed_requests_count()}/{precision_tracer.get_max_requests()}): {req.rid}"
+                            "Request trace completed (%d/%d): %s",
+                            precision_tracer.get_completed_requests_count(),
+                            precision_tracer.get_max_requests(),
+                            req.rid,
                         )
                         if (
                             precision_tracer.get_completed_requests_count()
@@ -145,7 +148,7 @@ class SchedulerOutputProcessorMixin:
 
         if batch.cache_miss_count > 0:
             logger.info(
-                f"Prefill batch. #bid: {result.bid}, #cache_miss: {cache_miss_count}"
+                "Prefill batch. #bid: %s, #cache_miss: %s", result.bid, cache_miss_count
             )
 
         self.set_next_batch_sampling_info_done(batch)
@@ -158,7 +161,7 @@ class SchedulerOutputProcessorMixin:
         self: Scheduler,
         batch: ScheduleBatch,
         result: GenerationBatchResult,
-        launch_done: Optional[threading.Event] = None,
+        launch_done: threading.Event | None = None,
     ):
         logits_output, next_token_ids, cache_miss_count = (
             result.logits_output,
@@ -212,7 +215,10 @@ class SchedulerOutputProcessorMixin:
                     precision_tracer.add_completed_requests_count()
                     precision_tracer.set_end_time_and_duration(req.rid)
                     logger.info(
-                        f"Request trace completed ({precision_tracer.get_completed_requests_count()}/{precision_tracer.get_max_requests()}): {req.rid}"
+                        "Request trace completed (%d/%d): %s",
+                        precision_tracer.get_completed_requests_count(),
+                        precision_tracer.get_max_requests(),
+                        req.rid,
                     )
                     if (
                         precision_tracer.get_completed_requests_count()
@@ -297,7 +303,7 @@ class SchedulerOutputProcessorMixin:
 
         # Important for the performance.
         assert isinstance(output.input_token_logprobs, tuple)
-        input_token_logprobs: Tuple[int] = output.input_token_logprobs
+        input_token_logprobs: tuple[int] = output.input_token_logprobs
         input_token_logprobs = input_token_logprobs[
             logprob_pt : logprob_pt + num_input_logprobs
         ]
@@ -394,7 +400,7 @@ class SchedulerOutputProcessorMixin:
         i: int,
         req: Req,
         pt: int,
-        next_token_ids: List[int],
+        next_token_ids: list[int],
         num_input_logprobs: int,
         output: LogitsProcessorOutput,
     ):
@@ -422,9 +428,9 @@ class SchedulerOutputProcessorMixin:
 
     def stream_output(
         self: Scheduler,
-        reqs: List[Req],
+        reqs: list[Req],
         return_logprob: bool,
-        skip_req: Optional[Req] = None,
+        skip_req: Req | None = None,
         cache_miss_count: int = None,
     ):
         """Stream the output to detokenizer."""
@@ -433,13 +439,13 @@ class SchedulerOutputProcessorMixin:
 
     def stream_output_generation(
         self: Scheduler,
-        reqs: List[Req],
+        reqs: list[Req],
         return_logprob: bool,
-        skip_req: Optional[Req] = None,
+        skip_req: Req | None = None,
         cache_miss_count: int = None,
     ):
         rids = []
-        finished_reasons: List[BaseFinishReason] = []
+        finished_reasons: list[BaseFinishReason] = []
 
         decoded_texts = []
         decode_ids_list = []

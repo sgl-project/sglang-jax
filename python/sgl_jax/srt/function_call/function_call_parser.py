@@ -5,7 +5,7 @@ This is a stub implementation for the migration from sglang.
 
 import json
 import logging
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -13,11 +13,11 @@ logger = logging.getLogger(__name__)
 class FunctionCallParser:
     """Parser for handling function calls and tool calls."""
 
-    def __init__(self, parser_type: Optional[str] = None):
+    def __init__(self, parser_type: str | None = None):
         self.parser_type = parser_type or "default"
-        logger.info(f"Initialized FunctionCallParser with type: {self.parser_type}")
+        logger.info("Initialized FunctionCallParser with type: %s", self.parser_type)
 
-    def parse_function_call(self, text: str) -> Optional[Dict[str, Any]]:
+    def parse_function_call(self, text: str) -> dict[str, Any] | None:
         """
         Parse function call from text.
 
@@ -38,10 +38,10 @@ class FunctionCallParser:
                     return json.loads(json_str)
             return None
         except (json.JSONDecodeError, ValueError) as e:
-            logger.debug(f"Failed to parse function call: {e}")
+            logger.debug("Failed to parse function call: %s", e)
             return None
 
-    def extract_tool_calls(self, text: str) -> List[Dict[str, Any]]:
+    def extract_tool_calls(self, text: str) -> list[dict[str, Any]]:
         """
         Extract tool calls from text.
 

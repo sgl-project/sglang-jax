@@ -25,10 +25,10 @@ Usage:
 """
 
 import argparse
+import importlib
 import os
 import subprocess
 import sys
-import importlib
 from pathlib import Path
 
 os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=8"
@@ -39,6 +39,7 @@ def check_jax_dependencies():
     try:
         import jax
         import jax.numpy as jnp
+
         importlib.util.find_spec("flax.nnx")
 
         print(f"✓ JAX version: {jax.__version__}")
@@ -67,7 +68,9 @@ def check_sglang_dependencies():
     try:
         importlib.util.find_spec("sgl_jax.srt.configs.load_config.LoadFormat")
         importlib.util.find_spec("sgl_jax.srt.model_loader.loader.JAXModelLoader")
-        importlib.util.find_spec("sgl_jax.srt.models.qwen3_moe.Qwen3MoeForCausalLMJaxModel")
+        importlib.util.find_spec(
+            "sgl_jax.srt.models.qwen3_moe.Qwen3MoeForCausalLMJaxModel"
+        )
 
         print("✓ SGLang JAXModelLoader available")
         print("✓ Qwen3MoeForCausalLMJaxModel available")

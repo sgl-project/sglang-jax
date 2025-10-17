@@ -4,7 +4,6 @@ import contextlib
 import os
 import warnings
 from pathlib import Path
-from typing import Dict, Optional, Type, Union
 
 from huggingface_hub import snapshot_download
 from transformers import (
@@ -21,7 +20,7 @@ from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING_N
 
 from sgl_jax.srt.utils.common_utils import is_remote_url, lru_cache_frozenset
 
-_CONFIG_REGISTRY: Dict[str, Type[PretrainedConfig]] = {}
+_CONFIG_REGISTRY: dict[str, type[PretrainedConfig]] = {}
 
 for name, cls in _CONFIG_REGISTRY.items():
     with contextlib.suppress(ValueError):
@@ -51,10 +50,8 @@ def get_hf_text_config(config: PretrainedConfig):
         # qwen2.5 omni
         thinker_config = config.thinker_config
         if hasattr(thinker_config, "text_config"):
-            setattr(
-                thinker_config.text_config,
-                "torch_dtype",
-                getattr(thinker_config, "torch_dtype", None),
+            thinker_config.text_config.torch_dtype = getattr(
+                thinker_config, "torch_dtype", None
             )
             return thinker_config.text_config
         return thinker_config
@@ -66,8 +63,8 @@ def get_hf_text_config(config: PretrainedConfig):
 def get_config(
     model: str,
     trust_remote_code: bool,
-    revision: Optional[str] = None,
-    model_override_args: Optional[dict] = None,
+    revision: str | None = None,
+    model_override_args: dict | None = None,
     **kwargs,
 ):
     is_gguf = check_gguf_file(model)
@@ -89,7 +86,7 @@ def get_config(
         config_class = _CONFIG_REGISTRY[config.model_type]
         config = config_class.from_pretrained(model, revision=revision)
         # NOTE(HandH1998): Qwen2VL requires `_name_or_path` attribute in `config`.
-        setattr(config, "_name_or_path", model)
+        config._name_or_path = model
 
     if isinstance(model, str) and config.model_type == "internvl_chat":
         for key, val in config.llm_config.__dict__.items():
@@ -116,7 +113,7 @@ def get_config(
 def get_generation_config(
     model: str,
     trust_remote_code: bool,
-    revision: Optional[str] = None,
+    revision: str | None = None,
     **kwargs,
 ):
     try:
@@ -169,9 +166,9 @@ def get_tokenizer(
     *args,
     tokenizer_mode: str = "auto",
     trust_remote_code: bool = False,
-    tokenizer_revision: Optional[str] = None,
+    tokenizer_revision: str | None = None,
     **kwargs,
-) -> Union[PreTrainedTokenizer, PreTrainedTokenizerFast]:
+) -> PreTrainedTokenizer | PreTrainedTokenizerFast:
     """Gets a tokenizer for the given model name via Huggingface."""
     if tokenizer_mode == "slow":
         if kwargs.get("use_fast", False):
@@ -228,8 +225,8 @@ def get_tokenizer(
 
     if not isinstance(tokenizer, PreTrainedTokenizerFast):
         warnings.warn(
-            "Using a slow tokenizer. This might cause a significant "
-            "slowdown. Consider using a fast tokenizer instead."
+            "Using a slow tokenizer. This might cause a significant slowdown. Consider using a fast tokenizer instead.",
+            stacklevel=2,
         )
 
     attach_additional_stop_token_ids(tokenizer)
@@ -248,8 +245,8 @@ def get_processor(
     *args,
     tokenizer_mode: str = "auto",
     trust_remote_code: bool = False,
-    tokenizer_revision: Optional[str] = None,
-    use_fast: Optional[bool] = True,
+    tokenizer_revision: str | None = None,
+    use_fast: bool | None = True,
     **kwargs,
 ):
     # pop 'revision' from kwargs if present.
@@ -263,9 +260,8 @@ def get_processor(
     )
 
     # fix: for Qwen2-VL model, inject default 'size' if not provided.
-    if config.model_type in {"qwen2_vl"}:
-        if "size" not in kwargs:
-            kwargs["size"] = {"shortest_edge": 3136, "longest_edge": 1003520}
+    if config.model_type in {"qwen2_vl"} and "size" not in kwargs:
+        kwargs["size"] = {"shortest_edge": 3136, "longest_edge": 1003520}
 
     if config.model_type not in {"llava", "clip"}:
         kwargs["use_fast"] = use_fast
@@ -294,7 +290,7 @@ def attach_additional_stop_token_ids(tokenizer):
         tokenizer.additional_stop_token_ids = None
 
 
-def check_gguf_file(model: Union[str, os.PathLike]) -> bool:
+def check_gguf_file(model: str | os.PathLike) -> bool:
     """Check if the file is a GGUF model."""
     model = Path(model)
     if not model.is_file():
