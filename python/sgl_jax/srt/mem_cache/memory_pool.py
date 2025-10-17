@@ -439,7 +439,7 @@ class MHATokenToKVPool(KVCache):
         loc: jnp.ndarray,
         cache_k: jnp.ndarray,
         cache_v: jnp.ndarray,
-    ) -> None:
+    ) -> jax.Array:
         """
         Legacy interface for backward compatibility.
         This assumes contiguous cache locations and uses simple JAX operations.
@@ -447,7 +447,13 @@ class MHATokenToKVPool(KVCache):
         layer_idx = layer_id - self.start_layer
         # Merge k and v into fused format
         fused_kv = merge_kv(cache_k, cache_v)
-        self.kv_buffer[layer_idx] = self.kv_buffer[layer_idx].at[loc].set(fused_kv)
+        N = self.kv_buffer[layer_idx].shape[0]
+        safe_loc = jnp.where(loc >= 0, loc, jnp.int32(N))
+        # for jax function
+        updated_layer = (
+            self.kv_buffer[layer_idx].at[safe_loc].set(fused_kv, mode="drop")
+        )
+        return updated_layer
 
 
 def _set_fused_kv_buffer(
