@@ -237,6 +237,7 @@ def get_token_ids_logprobs(logprobs: jax.Array, token_ids_logprobs: List[List[in
 
     return output_token_ids_logprobs_val, output_token_ids_logprobs_idx
 
+
 def multinomial(
     operands,
 ) -> jax.Array:
@@ -287,6 +288,7 @@ def multinomial_with_seed(
     perturbed_log_probs = log_probs + gumbel_noise
     return jnp.argmax(perturbed_log_probs, axis=1, keepdims=True)
 
+
 def _get_sorted_indices_np(probs_np: np.ndarray) -> np.ndarray:
     """
     CPU-side NumPy sorting index that is robust to NaNs/Infs.
@@ -320,7 +322,7 @@ def top_p_normalize_probs_jax(
 
 def _apply_min_p_filter(operands):
     """Apply min_p filtering when need_min_p_sampling=True"""
-    inputs, min_ps= operands
+    inputs, min_ps = operands
     if is_tpu_runtime():
         max_per_bs = jnp.max(inputs, axis=1)
         min_p_thresholds = max_per_bs * min_ps
@@ -335,8 +337,20 @@ def top_k_top_p_min_p_sampling_from_probs_jax(args):
         return top_k_top_p_min_p_sampling_from_probs_jax_tpu_runtime(args)
     return top_k_top_p_min_p_sampling_from_probs_jax_not_tpu_runtime(args)
 
+
 def top_k_top_p_min_p_sampling_from_probs_jax_tpu_runtime(args):
-    logits,_,top_ks,top_ps,min_ps,positions,temperatures,sampling_seeds,need_min_p_sampling, rng = args 
+    (
+        logits,
+        _,
+        top_ks,
+        top_ps,
+        min_ps,
+        positions,
+        temperatures,
+        sampling_seeds,
+        need_min_p_sampling,
+        rng,
+    ) = args
     logits = logits.astype(jnp.float32)
     logits = topk_mask(logits, top_ks, replace_val=-1e12)
     logits = topp_mask(logits, top_ps, replace_val=-1e12)
@@ -362,8 +376,20 @@ def top_k_top_p_min_p_sampling_from_probs_jax_tpu_runtime(args):
 
     return sampled_index.flatten()
 
+
 def top_k_top_p_min_p_sampling_from_probs_jax_not_tpu_runtime(args):
-    _,probs,top_ks,top_ps,min_ps,positions,temperatures,sampling_seeds,need_min_p_sampling, rng = args 
+    (
+        _,
+        probs,
+        top_ks,
+        top_ps,
+        min_ps,
+        positions,
+        temperatures,
+        sampling_seeds,
+        need_min_p_sampling,
+        rng,
+    ) = args
     # 1) Use jax.pure_callback to compute robust descending indices on CPU
     out_spec = jnp.empty(probs.shape, dtype=jnp.int32)
     probs_idx = jax.pure_callback(
@@ -403,6 +429,3 @@ def top_k_top_p_min_p_sampling_from_probs_jax_not_tpu_runtime(args):
 
     probs_idx = probs_idx.astype(jnp.int32)
     return jnp.take_along_axis(probs_idx, axis=1, indices=sampled_index).flatten()
-
-    
-     
