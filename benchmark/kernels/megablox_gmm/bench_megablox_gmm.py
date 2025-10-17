@@ -138,7 +138,7 @@ def main():
                         )
 
                         print(
-                            f"Config {valid_config_count}: m={adjusted_m}, k={k}, n={n}, groups={num_groups}, group_size={adjusted_m//num_groups}"
+                            f"Config {valid_config_count}: m={adjusted_m}, k={k}, n={n}, groups={num_groups}, group_size={adjusted_m // num_groups}"
                         )
 
                         try:

@@ -11,7 +11,6 @@ import time
 from collections import deque
 from dataclasses import dataclass
 from types import SimpleNamespace
-from typing import Dict, List, Optional, Union
 
 import jax
 import numpy as np
@@ -88,10 +87,10 @@ class ReceiveDataError(Exception):
 
 @dataclass
 class GenerationBatchResult:
-    logits_output: Optional[LogitsProcessorOutput]
-    next_token_ids: Optional[List[int]]  # on device
-    extend_input_len_per_req: List[int]
-    extend_logprob_start_len_per_req: List[int]
+    logits_output: LogitsProcessorOutput | None
+    next_token_ids: list[int] | None  # on device
+    extend_input_len_per_req: list[int]
+    extend_logprob_start_len_per_req: list[int]
     bid: int
     cache_miss_count: int
 
@@ -202,10 +201,7 @@ class Scheduler(
             ici_parallelism=[-1, self.tp_size, 1], dcn_parallelism=[1, 1, 1]
         )
 
-        if self.enable_overlap:
-            TpWorkerClass = ModelWorkerClient
-        else:
-            TpWorkerClass = ModelWorker
+        TpWorkerClass = ModelWorkerClient if self.enable_overlap else ModelWorker
 
         self.tp_worker = TpWorkerClass(
             server_args=server_args,
@@ -234,15 +230,15 @@ class Scheduler(
         self.init_memory_pool_and_cache()
 
         # Init running status
-        self.waiting_queue: List[Req] = []
+        self.waiting_queue: list[Req] = []
         # The aborted requests
-        self.aborted_reqs: Dict[str, Req] = {}
+        self.aborted_reqs: dict[str, Req] = {}
         # The running decoding batch for continuous batching
         self.running_batch: ScheduleBatch = ScheduleBatch(reqs=[], batch_is_full=False)
         # The current forward batch
-        self.cur_batch: Optional[ScheduleBatch] = None
+        self.cur_batch: ScheduleBatch | None = None
         # The last forward batch
-        self.last_batch: Optional[ScheduleBatch] = None
+        self.last_batch: ScheduleBatch | None = None
         self.forward_ct = 0
         self.forward_ct_decode = 0
         self.num_generated_tokens = 0
@@ -312,7 +308,9 @@ class Scheduler(
 
     def sync_pub(self):
         logger.info(
-            f"[Publisher {self.node_rank}] Begins to synchronize, wait {self.nnodes-1} Subscribers"
+            "[Publisher %s] Begins to synchronize, wait %s Subscribers",
+            self.node_rank,
+            self.nnodes - 1,
         )
         ready_count = 0
         try:
@@ -321,47 +319,47 @@ class Scheduler(
                 if message == "READY":
                     ready_count += 1
                     logger.info(
-                        f"[Publisher {self.node_rank}] receives {ready_count} READY signal"
+                        "[Publisher %s] receives %s READY signal",
+                        self.node_rank,
+                        ready_count,
                     )
                     self.publisher_sync.send_string("ACK")
                 else:
                     self.publisher_sync.send_string("NACK")
         except zmq.Again:
             logger.error(
-                f"[Publisher {self.node_rank}] Fails to synchronize due to timeout"
+                "[Publisher %s] Fails to synchronize due to timeout", self.node_rank
             )
             return False
         except Exception as e:
-            logger.error(f"[Publisher {self.node_rank}] Encounters error: {e}")
+            logger.error("[Publisher %s] Encounters error: %s", self.node_rank, e)
             return False
-        logger.info(f"[Publisher {self.node_rank}] Succeeds to synchronize!")
+        logger.info("[Publisher %s] Succeeds to synchronize!", self.node_rank)
         return True
 
     def sync_sub(self):
-        logger.info(f"[Subscriber {self.node_rank}] Begins to synchronize")
+        logger.info("[Subscriber %s] Begins to synchronize", self.node_rank)
         try:
             self.subscriber_sync.send_string("READY")
             ack = self.subscriber_sync.recv_string()
             if ack == "ACK":
-                logger.info(f"[Subscriber {self.node_rank}] Succeeds to synchronizes!")
+                logger.info("[Subscriber %s] Succeeds to synchronizes!", self.node_rank)
                 return True
             else:
                 logger.error(
-                    f"[Subscriber {self.node_rank}] Fails to synchroinze with ack: {ack}"
+                    "[Subscriber %s] Fails to synchroinze with ack: %s",
+                    self.node_rank,
+                    ack,
                 )
                 return False
         except Exception as e:
             logger.error(
-                f"[Subscriber {self.node_rank}] Fails to synchronize with error: {e}"
+                "[Subscriber %s] Fails to synchronize with error: %s", self.node_rank, e
             )
             return False
 
     def sync_pub_sub(self):
-        success = False
-        if self.node_rank == 0:
-            success = self.sync_pub()
-        else:
-            success = self.sync_sub()
+        success = self.sync_pub() if self.node_rank == 0 else self.sync_sub()
         if not success:
             raise SyncError("Fail to synchronize between publisher and subscribers")
 
@@ -479,7 +477,9 @@ class Scheduler(
                 return True
             except Exception as e:
                 logger.error(
-                    f"[Publisher {self.node_rank}] Fails to send data with error: {e}"
+                    "[Publisher %s] Fails to send data with error: %s",
+                    self.node_rank,
+                    e,
                 )
         return False
 
@@ -491,11 +491,14 @@ class Scheduler(
                 return pickle.loads(serialized_data)
             except zmq.Again:
                 logger.error(
-                    f"[Subscriber {self.node_rank}] Fails to receive data with timeout, and try again"
+                    "[Subscriber %s] Fails to receive data with timeout, and try again",
+                    self.node_rank,
                 )
             except Exception as e:
                 logger.error(
-                    f"[Subscriber {self.node_rank}] Fails to receive or deserialize with error: {e}, and try again"
+                    "[Subscriber %s] Fails to receive or deserialize with error: %s, and try again",
+                    self.node_rank,
+                    e,
                 )
         return None
 
@@ -511,7 +514,7 @@ class Scheduler(
                 )
         return recv_reqs
 
-    def recv_requests(self) -> List[Req]:
+    def recv_requests(self) -> list[Req]:
         """Receive results at node_rank = 0 and broadcast it to all other Node ranks."""
         if self.node_rank == 0:
             recv_reqs = []
@@ -536,7 +539,7 @@ class Scheduler(
             recv_reqs = self.broadcast_pyobj(recv_reqs)
         return recv_reqs
 
-    def process_input_requests(self, recv_reqs: List):
+    def process_input_requests(self, recv_reqs: list):
         for recv_req in recv_reqs:
             output = self._request_dispatcher(recv_req)
             if output is not None:
@@ -621,11 +624,13 @@ class Scheduler(
                 # Update precision_tracer state in this process
                 if "trace_active" in tracer_config:
                     logger.info(
-                        f"[SCHEDULER] check trace_active: {precision_tracer.get_trace_active()}"
+                        "[SCHEDULER] check trace_active: %s",
+                        precision_tracer.get_trace_active(),
                     )
                     precision_tracer._trace_active = tracer_config["trace_active"]
                     logger.info(
-                        f"[SCHEDULER] Updated trace_active to: {precision_tracer._trace_active}"
+                        "[SCHEDULER] Updated trace_active to: %s",
+                        precision_tracer._trace_active,
                     )
 
                     # Reset counters when starting trace
@@ -640,23 +645,25 @@ class Scheduler(
                 if "max_requests" in tracer_config:
                     precision_tracer._max_requests = tracer_config["max_requests"]
                     logger.info(
-                        f"[SCHEDULER] Updated max_requests to: {precision_tracer._max_requests}"
+                        "[SCHEDULER] Updated max_requests to: %s",
+                        precision_tracer._max_requests,
                     )
 
                 if "output_file" in tracer_config:
                     precision_tracer._trace_output_file = tracer_config["output_file"]
                     logger.info(
-                        f"[SCHEDULER] Updated output_file to: {precision_tracer._trace_output_file}"
+                        "[SCHEDULER] Updated output_file to: %s",
+                        precision_tracer._trace_output_file,
                     )
 
                 logger.info(
-                    f"[SCHEDULER] Precision tracer state updated: {tracer_config}"
+                    "[SCHEDULER] Precision tracer state updated: %s", tracer_config
                 )
 
         except Exception as e:
             success = False
             error_msg = str(e)
-            logger.info(f"[SCHEDULER] Error updating internal state: {error_msg}")
+            logger.info("[SCHEDULER] Error updating internal state: %s", error_msg)
 
         return SetInternalStateReqOutput(
             request_id=recv_req.request_id, success=success, error_msg=error_msg
@@ -666,7 +673,7 @@ class Scheduler(
         req.queue_time_start = time.perf_counter()
         self.waiting_queue.append(req)
 
-    def _extend_requests_to_queue(self, reqs: List[Req], is_retracted: bool = False):
+    def _extend_requests_to_queue(self, reqs: list[Req], is_retracted: bool = False):
         self.waiting_queue.extend(reqs)
 
     def check_memory(self):
@@ -676,7 +683,7 @@ class Scheduler(
         token_msg = f"{self.max_total_num_tokens=}, {available_size=}, {evictable_size=}, {protected_size=}\n"
 
         if memory_leak:
-            msg = "token_to_kv_pool_allocator memory leak detected! " f"{token_msg}"
+            msg = f"token_to_kv_pool_allocator memory leak detected! {token_msg}"
             raise ValueError(msg)
 
         req_total_size = self.req_to_token_pool.size
@@ -699,7 +706,7 @@ class Scheduler(
         token_usage = num_used / self.max_total_num_tokens
         return num_used, token_usage, available_size, evictable_size
 
-    def get_next_batch_to_run(self) -> Optional[ScheduleBatch]:
+    def get_next_batch_to_run(self) -> ScheduleBatch | None:
         chunked_req_to_exclude = set()
         if self.chunked_req:
             # Move the chunked request out of the batch so that we can merge
@@ -746,7 +753,7 @@ class Scheduler(
 
         return ret
 
-    def get_new_batch_prefill(self) -> Optional[ScheduleBatch]:
+    def get_new_batch_prefill(self) -> ScheduleBatch | None:
         # Handle the cases where prefill is not allowed
         if (
             self.running_batch.batch_is_full or len(self.waiting_queue) == 0
@@ -796,7 +803,7 @@ class Scheduler(
                 break
 
         # Update waiting queue
-        can_run_list: List[Req] = adder.can_run_list
+        can_run_list: list[Req] = adder.can_run_list
         if len(can_run_list) == 0:
             return None
 
@@ -848,7 +855,7 @@ class Scheduler(
 
         return new_batch
 
-    def update_running_batch(self, batch: ScheduleBatch) -> Optional[ScheduleBatch]:
+    def update_running_batch(self, batch: ScheduleBatch) -> ScheduleBatch | None:
         """Update the current running decoding batch."""
         initial_bs = batch.batch_size()
 
@@ -868,9 +875,10 @@ class Scheduler(
             self.new_token_ratio = new_token_ratio
 
             logger.info(
-                "KV cache pool is full. Retract requests. "
-                f"#retracted_reqs: {num_retracted_reqs}, "
-                f"#new_token_ratio: {old_ratio:.4f} -> {self.new_token_ratio:.4f}"
+                "KV cache pool is full. Retract requests. #retracted_reqs: %d, #new_token_ratio: %.4f -> %.4f",
+                num_retracted_reqs,
+                old_ratio,
+                self.new_token_ratio,
             )
 
             self._extend_requests_to_queue(retracted_reqs, is_retracted=True)
@@ -887,7 +895,7 @@ class Scheduler(
         batch.prepare_for_decode()
         return batch
 
-    def run_batch(self, batch: ScheduleBatch) -> Union[GenerationBatchResult]:
+    def run_batch(self, batch: ScheduleBatch) -> GenerationBatchResult:
         """Run a batch."""
         self.forward_ct += 1
 
@@ -964,10 +972,9 @@ class Scheduler(
     def process_batch_result(
         self,
         batch: ScheduleBatch,
-        result: Union[GenerationBatchResult],
-        launch_done: Optional[threading.Event] = None,
+        result: GenerationBatchResult,
+        launch_done: threading.Event | None = None,
     ):
-
         if batch.forward_mode.is_decode():
             self.process_batch_result_decode(batch, result)
         elif batch.forward_mode.is_extend():
@@ -1014,7 +1021,7 @@ class Scheduler(
             time.sleep(self.watchdog_timeout // 2)
 
         pyspy_dump_schedulers()
-        logger.error(f"Watchdog timeout ({self.watchdog_timeout=})")
+        logger.error("Watchdog timeout (watchdog_timeout=%s)", self.watchdog_timeout)
         print(file=sys.stderr, flush=True)
         print(file=sys.stdout, flush=True)
 
@@ -1036,7 +1043,7 @@ class Scheduler(
             # We still need to send something back to TokenizerManager to clean up the state.
             req = self.waiting_queue.pop(i)
             self.send_to_tokenizer.send_pyobj(AbortReq(req.rid))
-            logger.debug(f"Abort queued request. {req.rid=}")
+            logger.debug("Abort queued request. rid=%s", req.rid)
 
         # Delete requests in the running batch
         if self.cur_batch is self.running_batch or self.cur_batch is None:
@@ -1051,14 +1058,14 @@ class Scheduler(
                 # Abort method 3: set `to_abort=True`
                 # The request will still run one decode forward pass.
                 # Then we reuse all existing code to clean up the KV cache allocation.
-                logger.debug(f"Abort running request. {req.rid=}")
+                logger.debug("Abort running request. rid=%s", req.rid)
                 req.to_abort = True
 
 
 def run_scheduler_process(
     server_args: ServerArgs,
     port_args: PortArgs,
-    dp_rank: Optional[int],
+    dp_rank: int | None,
     pipe_writer,
 ):
     # Generate the prefix
@@ -1093,7 +1100,7 @@ def run_scheduler_process(
 
     except Exception:
         traceback = get_exception_traceback()
-        logger.error(f"Scheduler hit an exception: {traceback}")
+        logger.error("Scheduler hit an exception: %s", traceback)
         parent_process.send_signal(signal.SIGQUIT)
 
 
@@ -1144,5 +1151,5 @@ def scheduler_loop_after_create(server_args, scheduler):
             scheduler.event_loop_normal()
     except Exception:
         traceback = get_exception_traceback()
-        logger.error(f"Scheduler hit an exception: {traceback}")
+        logger.error("Scheduler hit an exception: %s", traceback)
         current_process.send_signal(signal.SIGQUIT)

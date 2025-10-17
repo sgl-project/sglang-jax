@@ -226,7 +226,7 @@ def main():
             except Exception as e:
                 raise ValueError(f"run failed: {e=}")
 
-            print(f"cost: {flash_time*1000}ms")
+            print(f"cost: {flash_time * 1000}ms")
 
 
 if __name__ == "__main__":

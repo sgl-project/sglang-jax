@@ -49,7 +49,6 @@ import json
 import logging
 import os
 import time
-from typing import Tuple
 
 import jax
 import numpy as np
@@ -72,9 +71,9 @@ from sgl_jax.srt.utils import configure_logger, kill_process_tree
 @dataclasses.dataclass
 class BenchArgs:
     run_name: str = "default"
-    batch_size: Tuple[int] = (1,)
-    input_len: Tuple[int] = (1024,)
-    output_len: Tuple[int] = (16,)
+    batch_size: tuple[int] = (1,)
+    input_len: tuple[int] = (1024,)
+    output_len: tuple[int] = (16,)
     result_filename: str = "result.jsonl"
     correctness_test: bool = False
     # This is only used for correctness test
@@ -156,9 +155,9 @@ def load_model(server_args, port_args, tp_rank):
     if tp > 1:
         try:
             jax_mh.sync_global_devices("load_model")
-        except Exception as e:
+        except Exception as err:
             logging.info(
-                f"Could not sync global devices (expected in single-host): {e}"
+                "Could not sync global devices (expected in single-host): %s", err
             )
     return model_runner, tokenizer
 
@@ -560,7 +559,11 @@ def main(server_args, bench_args):
         tokens_needed = (tokens_needed // page) * page
         server_args.max_total_tokens = max(tokens_needed, page)
         logging.info(
-            f"Setting max_total_tokens={server_args.max_total_tokens} (bs={bs_max}, in={in_max}, out={out_max}) to limit static KV memory on single TPU"
+            "Setting max_total_tokens=%s (bs=%s, in=%s, out=%s) to limit static KV memory on single TPU",
+            server_args.max_total_tokens,
+            bs_max,
+            in_max,
+            out_max,
         )
 
     # Prefer native attention on single-TPU runs to avoid large FA compile-time temps
@@ -577,10 +580,7 @@ def main(server_args, bench_args):
     _set_envs_and_config()
 
     if server_args.model_path:
-        if bench_args.correctness_test:
-            work_func = correctness_test
-        else:
-            work_func = latency_test
+        work_func = correctness_test if bench_args.correctness_test else latency_test
     else:
         raise ValueError(
             "Provide --model-path for running the tests or "

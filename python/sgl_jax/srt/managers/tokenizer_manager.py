@@ -16,7 +16,7 @@ import uuid
 from collections import deque
 from datetime import datetime
 from http import HTTPStatus
-from typing import Any, Deque, Dict, Generic, List, Optional, Tuple, TypeVar, Union
+from typing import Any, Generic, TypeVar
 
 import fastapi
 import jax
@@ -75,10 +75,10 @@ logger = logging.getLogger(__name__)
 class ReqState:
     """Store the state a request."""
 
-    out_list: List[Dict[Any, Any]]
+    out_list: list[dict[Any, Any]]
     finished: bool
     event: asyncio.Event
-    obj: Union[GenerateReqInput, EmbeddingReqInput]
+    obj: GenerateReqInput | EmbeddingReqInput
 
     # For metrics
     created_time: float
@@ -91,19 +91,19 @@ class ReqState:
     last_output_offset: int = 0
 
     text: str = ""
-    output_ids: List[int] = dataclasses.field(default_factory=list)
-    input_token_logprobs_val: List[float] = dataclasses.field(default_factory=list)
-    input_token_logprobs_idx: List[int] = dataclasses.field(default_factory=list)
-    output_token_logprobs_val: List[float] = dataclasses.field(default_factory=list)
-    output_token_logprobs_idx: List[int] = dataclasses.field(default_factory=list)
-    input_top_logprobs_val: List[List[float]] = dataclasses.field(default_factory=list)
-    input_top_logprobs_idx: List[List[int]] = dataclasses.field(default_factory=list)
-    output_top_logprobs_val: List[List[float]] = dataclasses.field(default_factory=list)
-    output_top_logprobs_idx: List[List[int]] = dataclasses.field(default_factory=list)
-    input_token_ids_logprobs_val: List = dataclasses.field(default_factory=list)
-    input_token_ids_logprobs_idx: List = dataclasses.field(default_factory=list)
-    output_token_ids_logprobs_val: List = dataclasses.field(default_factory=list)
-    output_token_ids_logprobs_idx: List = dataclasses.field(default_factory=list)
+    output_ids: list[int] = dataclasses.field(default_factory=list)
+    input_token_logprobs_val: list[float] = dataclasses.field(default_factory=list)
+    input_token_logprobs_idx: list[int] = dataclasses.field(default_factory=list)
+    output_token_logprobs_val: list[float] = dataclasses.field(default_factory=list)
+    output_token_logprobs_idx: list[int] = dataclasses.field(default_factory=list)
+    input_top_logprobs_val: list[list[float]] = dataclasses.field(default_factory=list)
+    input_top_logprobs_idx: list[list[int]] = dataclasses.field(default_factory=list)
+    output_top_logprobs_val: list[list[float]] = dataclasses.field(default_factory=list)
+    output_top_logprobs_idx: list[list[int]] = dataclasses.field(default_factory=list)
+    input_token_ids_logprobs_val: list = dataclasses.field(default_factory=list)
+    input_token_ids_logprobs_idx: list = dataclasses.field(default_factory=list)
+    output_token_ids_logprobs_val: list = dataclasses.field(default_factory=list)
+    output_token_ids_logprobs_idx: list = dataclasses.field(default_factory=list)
 
 
 class TokenizerManager:
@@ -159,14 +159,14 @@ class TokenizerManager:
 
         # Store states
         self.no_create_loop = False
-        self.rid_to_state: Dict[str, ReqState] = {}
+        self.rid_to_state: dict[str, ReqState] = {}
         self.health_check_failed = False
         self.gracefully_exit = False
         self.last_receive_tstamp = 0
         self.dump_requests_folder = ""  # By default do not dump
         self.dump_requests_threshold = 1000
-        self.dump_request_list: List[Tuple] = []
-        self.crash_dump_request_list: deque[Tuple] = deque()
+        self.dump_request_list: list[tuple] = []
+        self.crash_dump_request_list: deque[tuple] = deque()
         self.log_request_metadata = self.get_log_request_metadata()
         self.session_futures = {}  # session_id -> asyncio event
         self.max_req_input_len = None
@@ -239,8 +239,8 @@ class TokenizerManager:
 
     async def generate_request(
         self,
-        obj: Union[GenerateReqInput, EmbeddingReqInput],
-        request: Optional[fastapi.Request] = None,
+        obj: GenerateReqInput | EmbeddingReqInput,
+        request: fastapi.Request | None = None,
     ):
         created_time = time.time()
         async with self._cond:
@@ -258,7 +258,8 @@ class TokenizerManager:
         if self.log_requests:
             max_length, skip_names, _ = self.log_request_metadata
             logger.info(
-                f"Receive: obj={dataclass_to_string_truncated(obj, max_length, skip_names=skip_names)}"
+                "Receive: obj=%s",
+                dataclass_to_string_truncated(obj, max_length, skip_names=skip_names),
             )
 
         if obj.is_single:
@@ -274,7 +275,7 @@ class TokenizerManager:
 
     async def _tokenize_one_request(
         self,
-        obj: Union[GenerateReqInput, EmbeddingReqInput],
+        obj: GenerateReqInput | EmbeddingReqInput,
     ):
         """Tokenize one request."""
 
@@ -292,7 +293,7 @@ class TokenizerManager:
         return self._create_tokenized_object(obj, input_text, input_ids)
 
     def _validate_one_request(
-        self, obj: Union[GenerateReqInput, EmbeddingReqInput], input_ids: List[int]
+        self, obj: GenerateReqInput | EmbeddingReqInput, input_ids: list[int]
     ) -> None:
         """Validates that the input token count and the requested token count doesn't exceed the model's context length."""
 
@@ -321,7 +322,7 @@ class TokenizerManager:
             raise ValueError(error_msg)
 
     def _validate_input_ids_in_vocab(
-        self, input_ids: List[int], vocab_size: int
+        self, input_ids: list[int], vocab_size: int
     ) -> None:
         if any(id >= vocab_size for id in input_ids):
             raise ValueError(
@@ -332,7 +333,7 @@ class TokenizerManager:
         self,
         obj: GenerateReqInput,
         input_text: str,
-        input_ids: List[int],
+        input_ids: list[int],
     ) -> TokenizedGenerateReqInput:
         """Create a tokenized request object from common parameters."""
         # Parse sampling parameters
@@ -364,9 +365,9 @@ class TokenizerManager:
 
     async def _batch_tokenize_and_process(
         self, batch_size: int, obj: GenerateReqInput
-    ) -> List[Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput]]:
+    ) -> list[TokenizedGenerateReqInput | TokenizedEmbeddingReqInput]:
         """Handle batch tokenization for text inputs only."""
-        logger.debug(f"Starting batch tokenization for {batch_size} text requests")
+        logger.debug("Starting batch tokenization for %s text requests", batch_size)
 
         # Collect requests and texts
         requests = [obj[i] for i in range(batch_size)]
@@ -385,11 +386,11 @@ class TokenizerManager:
                     req, req.text, input_ids_list[i], None, None
                 )
             )
-        logger.debug(f"Completed batch processing for {batch_size} requests")
+        logger.debug("Completed batch processing for %s requests", batch_size)
         return tokenized_objs
 
     def _validate_batch_tokenization_constraints(
-        self, batch_size: int, obj: Union[GenerateReqInput, EmbeddingReqInput]
+        self, batch_size: int, obj: GenerateReqInput | EmbeddingReqInput
     ) -> None:
         """Validate constraints for batch tokenization processing."""
         for i in range(batch_size):
@@ -408,9 +409,9 @@ class TokenizerManager:
 
     def _send_one_request(
         self,
-        obj: Union[GenerateReqInput, EmbeddingReqInput],
-        tokenized_obj: Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput],
-        created_time: Optional[float] = None,
+        obj: GenerateReqInput | EmbeddingReqInput,
+        tokenized_obj: TokenizedGenerateReqInput | TokenizedEmbeddingReqInput,
+        created_time: float | None = None,
     ):
         self.send_to_scheduler.send_pyobj(tokenized_obj)
         state = ReqState([], False, asyncio.Event(), obj, created_time=created_time)
@@ -421,9 +422,9 @@ class TokenizerManager:
 
     async def _wait_one_response(
         self,
-        obj: Union[GenerateReqInput, EmbeddingReqInput],
+        obj: GenerateReqInput | EmbeddingReqInput,
         state: ReqState,
-        request: Optional[fastapi.Request] = None,
+        request: fastapi.Request | None = None,
     ):
         """Wait for the response of one request."""
         while True:
@@ -434,9 +435,14 @@ class TokenizerManager:
                     # Abort the request for disconnected requests (non-streaming, waiting queue)
                     self.abort_request(obj.rid)
                     # Use exception to kill the whole call stack and asyncio task
-                    raise ValueError(
-                        f"Request is disconnected from the client side (type 1). Abort request {obj.rid=}"
-                    )
+                    try:
+                        raise ValueError(
+                            f"Request is disconnected from the client side (type 1). Abort request rid={obj.rid}"
+                        )
+                    except ValueError as e:
+                        raise ValueError(
+                            f"Request is disconnected from the client side (type 1). Abort request rid={obj.rid}"
+                        ) from e
                 continue
 
             out = state.out_list[-1]
@@ -475,9 +481,9 @@ class TokenizerManager:
 
     async def _handle_batch_request(
         self,
-        obj: Union[GenerateReqInput, EmbeddingReqInput],
-        request: Optional[fastapi.Request] = None,
-        created_time: Optional[float] = None,
+        obj: GenerateReqInput | EmbeddingReqInput,
+        request: fastapi.Request | None = None,
+        created_time: float | None = None,
     ):
         batch_size = obj.batch_size
 
@@ -574,11 +580,11 @@ class TokenizerManager:
 
     async def start_profile(
         self,
-        output_dir: Optional[str] = None,
-        start_step: Optional[int] = None,
-        num_steps: Optional[int] = None,
-        host_tracer_level: Optional[int] = None,
-        python_tracer_level: Optional[int] = None,
+        output_dir: str | None = None,
+        start_step: int | None = None,
+        num_steps: int | None = None,
+        host_tracer_level: int | None = None,
+        python_tracer_level: int | None = None,
     ):
         self.auto_create_handle_loop()
         req = ProfileReq(
@@ -616,7 +622,7 @@ class TokenizerManager:
     async def release_memory_occupation(
         self,
         obj: ReleaseMemoryOccupationReqInput,
-        request: Optional[fastapi.Request] = None,
+        request: fastapi.Request | None = None,
     ):
         self.auto_create_handle_loop()
         await self.release_memory_occupation_communicator(obj)
@@ -624,13 +630,13 @@ class TokenizerManager:
     async def resume_memory_occupation(
         self,
         obj: ResumeMemoryOccupationReqInput,
-        request: Optional[fastapi.Request] = None,
+        request: fastapi.Request | None = None,
     ):
         self.auto_create_handle_loop()
         await self.resume_memory_occupation_communicator(obj)
 
     async def open_session(
-        self, obj: OpenSessionReqInput, request: Optional[fastapi.Request] = None
+        self, obj: OpenSessionReqInput, request: fastapi.Request | None = None
     ):
         self.auto_create_handle_loop()
 
@@ -647,13 +653,13 @@ class TokenizerManager:
         return session_id
 
     async def close_session(
-        self, obj: CloseSessionReqInput, request: Optional[fastapi.Request] = None
+        self, obj: CloseSessionReqInput, request: fastapi.Request | None = None
     ):
         await self.send_to_scheduler.send_pyobj(obj)
 
-    async def get_internal_state(self) -> List[Dict[Any, Any]]:
+    async def get_internal_state(self) -> list[dict[Any, Any]]:
         req = GetInternalStateReq()
-        responses: List[GetInternalStateReqOutput] = (
+        responses: list[GetInternalStateReqOutput] = (
             await self.get_internal_state_communicator(req)
         )
         # Many DP ranks
@@ -670,7 +676,7 @@ class TokenizerManager:
         self, obj: SetInternalStateReq
     ) -> SetInternalStateReqOutput:
         self.auto_create_handle_loop()
-        responses: List[SetInternalStateReqOutput] = (
+        responses: list[SetInternalStateReqOutput] = (
             await self.set_internal_state_communicator(obj)
         )
         return (
@@ -748,7 +754,7 @@ class TokenizerManager:
             self.dump_requests_threshold = obj.dump_requests_threshold
         if obj.crash_dump_folder is not None:
             self.crash_dump_folder = obj.crash_dump_folder
-        logging.info(f"Config logging: {obj=}")
+        logging.info("Config logging: %s", obj)
         self.log_request_metadata = self.get_log_request_metadata()
 
     def create_abort_task(self, obj: GenerateReqInput):
@@ -802,7 +808,10 @@ class TokenizerManager:
                 "SIGTERM/SIGQUIT/Exception triggered, but crash dump already performed, skipping."
             )
             return
-        logger.error(f"Dumping requests before crash. {self.crash_dump_folder=}")
+        logger.error(
+            "Dumping requests before crash. crash_dump_folder=%s",
+            self.crash_dump_folder,
+        )
         self.crash_dump_performed = True
         if not self.crash_dump_folder:
             return
@@ -827,7 +836,7 @@ class TokenizerManager:
         filename = os.path.join(
             self.crash_dump_folder,
             os.getenv("HOSTNAME", None),
-            f'crash_dump_{datetime.now().strftime("%Y-%m-%d_%H-%M-%S")}.pkl',
+            f"crash_dump_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.pkl",
         )
 
         os.makedirs(os.path.dirname(filename), exist_ok=True)
@@ -839,7 +848,10 @@ class TokenizerManager:
         with open(filename, "wb") as f:
             pickle.dump(data_to_dump_with_server_args, f)
         logger.error(
-            f"Dumped {len(self.crash_dump_request_list)} finished and {len(unfinished_requests)} unfinished requests before crash to {filename}"
+            "Dumped %d finished and %d unfinished requests before crash to %s",
+            len(self.crash_dump_request_list),
+            len(unfinished_requests),
+            filename,
         )
 
     async def sigterm_watchdog(self):
@@ -868,7 +880,8 @@ class TokenizerManager:
                 break
 
             logger.info(
-                f"Gracefully exiting... remaining number of requests {remain_num_req}"
+                "Gracefully exiting... remaining number of requests %d",
+                remain_num_req,
             )
             if remain_num_req > 0:
                 await asyncio.sleep(5)
@@ -889,13 +902,14 @@ class TokenizerManager:
 
     def _handle_batch_output(
         self,
-        recv_obj: Union[BatchStrOut, BatchEmbeddingOut, BatchTokenIDOut],
+        recv_obj: BatchStrOut | BatchEmbeddingOut | BatchTokenIDOut,
     ):
         for i, rid in enumerate(recv_obj.rids):
             state = self.rid_to_state.get(rid, None)
             if state is None:
                 logger.error(
-                    f"Received output for {rid=} but the state was deleted in TokenizerManager."
+                    "Received output for rid=%s but the state was deleted in TokenizerManager.",
+                    rid,
                 )
                 continue
 
@@ -980,7 +994,7 @@ class TokenizerManager:
         meta_info: dict,
         state: ReqState,
         top_logprobs_num: int,
-        token_ids_logprob: List[int],
+        token_ids_logprob: list[int],
         return_text_in_logprobs: bool,
         recv_obj: BatchStrOut,
         recv_obj_index: int,
@@ -1065,8 +1079,8 @@ class TokenizerManager:
 
     def detokenize_logprob_tokens(
         self,
-        token_logprobs_val: List[float],
-        token_logprobs_idx: List[int],
+        token_logprobs_val: list[float],
+        token_logprobs_idx: list[int],
         decode_to_text: bool,
     ):
         if not decode_to_text:
@@ -1081,8 +1095,8 @@ class TokenizerManager:
 
     def detokenize_top_logprobs_tokens(
         self,
-        token_logprobs_val: List[float],
-        token_logprobs_idx: List[int],
+        token_logprobs_val: list[float],
+        token_logprobs_idx: list[int],
         decode_to_text: bool,
     ):
         # We should batch all top-k tokens in all positions.
@@ -1108,7 +1122,7 @@ class TokenizerManager:
                 self.dump_requests_folder,
                 datetime.now().strftime("%Y-%m-%d_%H-%M-%S") + ".pkl",
             )
-            logger.info(f"Dump {len(self.dump_request_list)} requests to {filename}")
+            logger.info("Dump %s requests to %s", len(self.dump_request_list), filename)
 
             to_dump = self.dump_request_list
             self.dump_request_list = []
@@ -1164,13 +1178,13 @@ class TokenizerManager:
 
     async def score_request(
         self,
-        query: Optional[Union[str, List[int]]] = None,
-        items: Optional[Union[str, List[str], List[List[int]]]] = None,
-        label_token_ids: Optional[List[int]] = None,
+        query: str | list[int] | None = None,
+        items: str | list[str] | list[list[int]] | None = None,
+        label_token_ids: list[int] | None = None,
         apply_softmax: bool = False,
         item_first: bool = False,
-        request: Optional[Any] = None,
-    ) -> List[List[float]]:
+        request: Any | None = None,
+    ) -> list[list[float]]:
         """
         See Engine.score() for more details.
         """
@@ -1266,7 +1280,7 @@ async def print_exception_wrapper(func):
         await func()
     except Exception:
         traceback = get_exception_traceback()
-        logger.error(f"TokenizerManager hit an exception: {traceback}")
+        logger.error("TokenizerManager hit an exception: %s", traceback)
         if hasattr(func, "__self__") and isinstance(func.__self__, TokenizerManager):
             func.__self__.dump_requests_before_crash()
         kill_process_tree(os.getpid(), include_parent=True)
@@ -1279,7 +1293,9 @@ class SignalHandler:
 
     def sigterm_handler(self, signum=None, frame=None):
         logger.warning(
-            f"SIGTERM received. {signum=} {frame=}. Draining requests and shutting down..."
+            "SIGTERM received. signum=%s frame=%s. Draining requests and shutting down...",
+            signum,
+            frame,
         )
         self.tokenizer_manager.gracefully_exit = True
 
@@ -1300,9 +1316,9 @@ class _Communicator(Generic[T]):
     def __init__(self, sender, fan_out: int):
         self._sender = sender
         self._fan_out = fan_out
-        self._result_event: Optional[asyncio.Event] = None
-        self._result_values: Optional[List[T]] = None
-        self._ready_queue: Deque[asyncio.Future] = deque()
+        self._result_event: asyncio.Event | None = None
+        self._result_values: list[T] | None = None
+        self._ready_queue: deque[asyncio.Future] = deque()
 
     async def __call__(self, obj):
         ready_event = asyncio.Event()

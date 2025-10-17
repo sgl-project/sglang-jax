@@ -1,9 +1,10 @@
 import importlib
 import logging
 import pkgutil
+from collections.abc import Set as AbstractSet
 from dataclasses import dataclass, field
 from functools import lru_cache
-from typing import AbstractSet, Any, Dict, List, Optional, Tuple, Type, Union
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -11,12 +12,12 @@ logger = logging.getLogger(__name__)
 @dataclass
 class _ModelRegistry:
     # Keyed by model_arch
-    models: Dict[str, Union[Type[Any], str]] = field(default_factory=dict)
+    models: dict[str, type[Any] | str] = field(default_factory=dict)
 
     def get_supported_archs(self) -> AbstractSet[str]:
         return self.models.keys()
 
-    def _raise_for_unsupported(self, architectures: List[str]):
+    def _raise_for_unsupported(self, architectures: list[str]):
         all_supported_archs = self.get_supported_archs()
 
         if any(arch in all_supported_archs for arch in architectures):
@@ -30,7 +31,7 @@ class _ModelRegistry:
             f"Supported architectures: {all_supported_archs}"
         )
 
-    def _try_load_model_cls(self, model_arch: str) -> Optional[Type[Any]]:
+    def _try_load_model_cls(self, model_arch: str) -> type[Any] | None:
         if model_arch not in self.models:
             return None
 
@@ -38,8 +39,8 @@ class _ModelRegistry:
 
     def _normalize_archs(
         self,
-        architectures: Union[str, List[str]],
-    ) -> List[str]:
+        architectures: str | list[str],
+    ) -> list[str]:
         if isinstance(architectures, str):
             architectures = [architectures]
         if not architectures:
@@ -57,8 +58,8 @@ class _ModelRegistry:
 
     def resolve_model_cls(
         self,
-        architectures: Union[str, List[str]],
-    ) -> Tuple[Type[Any], str]:
+        architectures: str | list[str],
+    ) -> tuple[type[Any], str]:
         architectures = self._normalize_archs(architectures)
 
         for arch in architectures:
@@ -69,7 +70,7 @@ class _ModelRegistry:
         return self._raise_for_unsupported(architectures)
 
 
-@lru_cache()
+@lru_cache
 def import_model_classes():
     model_arch_name_to_cls = {}
     package_name = "sgl_jax.srt.models"
@@ -79,7 +80,7 @@ def import_model_classes():
             try:
                 module = importlib.import_module(name)
             except Exception as e:
-                logger.warning(f"Ignore import error when loading {name}. " f"{e}")
+                logger.warning("Ignore import error when loading %s. %s", name, e)
                 continue
             if hasattr(module, "EntryClass"):
                 entry = module.EntryClass

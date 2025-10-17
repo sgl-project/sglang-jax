@@ -1,5 +1,3 @@
-from typing import Tuple
-
 import jax
 import jax.numpy as jnp
 from jax.tree_util import register_pytree_node_class
@@ -64,17 +62,14 @@ class NativeAttention(AttentionBackend):
             k, v, forward_batch, token_to_kv_pool, layer.layer_id
         )
 
-        if layer.scaling is None:
-            scale = 1.0 / jnp.sqrt(layer.head_dim)
-        else:
-            scale = layer.scaling
+        scale = (
+            1.0 / jnp.sqrt(layer.head_dim) if layer.scaling is None else layer.scaling
+        )
 
-        is_causal = True
-        if (
+        is_causal = not (
             forward_batch.forward_mode == ForwardMode.DECODE
             or layer.attn_type == AttentionType.ENCODER_ONLY
-        ):
-            is_causal = False
+        )
 
         attn_output = forward_attention(
             q,
@@ -101,7 +96,7 @@ class NativeAttention(AttentionBackend):
         forward_batch: ForwardBatch,
         token_to_kv_pool: KVCache,
         layer_id: int,
-    ) -> Tuple[jax.Array, jax.Array, jax.Array]:
+    ) -> tuple[jax.Array, jax.Array, jax.Array]:
         """
         Get the kv cache from the forward batch.
         """

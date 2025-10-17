@@ -161,11 +161,11 @@ def main():
                 min_cost = cost
                 fastest_num_slices_per_block = num_slices_per_block
             print(
-                f"[num_slices_per_block={num_slices_per_block}] avg cost: {cost*1000} ms"
+                f"[num_slices_per_block={num_slices_per_block}] avg cost: {cost * 1000} ms"
             )
 
         print(
-            f"Fastest [num_slices_per_block={fastest_num_slices_per_block}] costs: {min_cost*1000} ms"
+            f"Fastest [num_slices_per_block={fastest_num_slices_per_block}] costs: {min_cost * 1000} ms"
         )
 
 

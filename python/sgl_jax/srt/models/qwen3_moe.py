@@ -1,5 +1,5 @@
 import logging
-from typing import Any, Dict, Optional, Tuple
+from typing import Any
 
 from flax import nnx
 from jax import jax
@@ -31,8 +31,8 @@ class QWen3MoeAttention(nnx.Module):
         num_kv_heads: int,
         max_position_embeddings: int,
         rope_theta: float = 10000,
-        rope_scaling: Optional[Dict[str, Any]] = None,
-        head_dim: Optional[int] = None,
+        rope_scaling: dict[str, Any] | None = None,
+        head_dim: int | None = None,
         rms_norm_eps: float = None,
         layer_id: int = 0,
         attention_bias: bool = False,
@@ -234,8 +234,8 @@ class QWen3MoeDecoderLayer(nnx.Module):
         hidden_states: jax.Array,
         forward_batch: ForwardBatch,
         token_to_kv_pool: KVCache,
-        residual: Optional[jax.Array] = None,
-    ) -> Tuple[jax.Array, jax.Array]:
+        residual: jax.Array | None = None,
+    ) -> tuple[jax.Array, jax.Array]:
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
@@ -344,7 +344,7 @@ class Qwen3MoeForCausalLM(nnx.Module):
         self.mesh = mesh
         self.config = config
         self.dtype = dtype
-        logger.info(f"QWen3MoeForCausalLMModel config dtype: {self.dtype}")
+        logger.info("QWen3MoeForCausalLMModel config dtype: %s", self.dtype)
         self.transformer = QWen3MoeModel(config, dtype=self.dtype, rngs=rngs, mesh=mesh)
         self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size, rngs=rngs)
         self.logits_processor = LogitsProcessor(

@@ -1,13 +1,13 @@
 import logging
 import traceback
-from typing import Any, Callable, List, Tuple, Type
-
+from collections.abc import Callable
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
 
 class TypeBasedDispatcher:
-    def __init__(self, mapping: List[Tuple[Type, Callable]]):
+    def __init__(self, mapping: list[tuple[type, Callable]]):
         self._mapping = mapping
 
     def __call__(self, obj: Any):

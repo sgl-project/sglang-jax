@@ -131,7 +131,7 @@ class TestModelRunner(unittest.TestCase):
             print(f"Failed to load tokenizer from HuggingFace: {e}")
             raise RuntimeError(
                 f"Could not load tokenizer from local path or HuggingFace: {e}"
-            )
+            ) from e
 
     def _new_forward_batch(self, input_ids, positions):
         """Create a ForwardBatch for testing."""

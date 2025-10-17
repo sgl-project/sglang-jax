@@ -1,5 +1,5 @@
 import logging
-from typing import Any, Dict, List, Optional, Union
+from typing import Any
 
 from sgl_jax.srt.entrypoints.openai.protocol import (
     ChatCompletionRequest,
@@ -48,12 +48,9 @@ def to_openai_style_logprobs(
 
 
 def process_hidden_states_from_ret(
-    ret_item: Dict[str, Any],
-    request: Union[
-        ChatCompletionRequest,
-        CompletionRequest,
-    ],
-) -> Optional[List]:
+    ret_item: dict[str, Any],
+    request: ChatCompletionRequest | CompletionRequest,
+) -> list | None:
     """Process hidden states from a ret item in non-streaming response.
 
     Args:

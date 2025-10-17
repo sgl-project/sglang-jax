@@ -13,12 +13,13 @@ import os
 import random
 import threading
 import time
+from collections.abc import AsyncIterator, Callable
 from http import HTTPStatus
-from typing import Any, AsyncIterator, Callable, Dict, List, Optional
+from typing import Any
 
 # ruff: noqa: E402
 # Fix a bug of Python threading
-setattr(threading, "_register_atexit", lambda *args, **kwargs: None)
+threading._register_atexit = lambda *args, **kwargs: None
 
 from contextlib import asynccontextmanager
 
@@ -88,10 +89,10 @@ asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 class _GlobalState:
     tokenizer_manager: TokenizerManager
     template_manager: TemplateManager
-    scheduler_info: Dict
+    scheduler_info: dict
 
 
-_global_state: Optional[_GlobalState] = None
+_global_state: _GlobalState | None = None
 
 
 def set_global_state(global_state: _GlobalState):
@@ -150,10 +151,9 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
     exc_str = str(exc)
     errors_str = str(exc.errors())
 
-    if errors_str and errors_str != exc_str:
-        message = f"{exc_str} {errors_str}"
-    else:
-        message = exc_str
+    message = (
+        f"{exc_str} {errors_str}" if errors_str and errors_str != exc_str else exc_str
+    )
 
     err = ErrorResponse(
         message=message,
@@ -231,9 +231,10 @@ async def health_generate(request: Request) -> Response:
         "%H:%M:%S", time.localtime(_global_state.tokenizer_manager.last_receive_tstamp)
     )
     logger.error(
-        f"Health check failed. Server couldn't get a response from detokenizer for last "
-        f"{HEALTH_CHECK_TIMEOUT} seconds. tic start time: {tic_time}. "
-        f"last_heartbeat time: {last_receive_time}"
+        "Health check failed. Server couldn't get a response from detokenizer for last %s seconds. tic start time: %s. last_heartbeat time: %s",
+        HEALTH_CHECK_TIMEOUT,
+        tic_time,
+        last_receive_time,
     )
     _global_state.tokenizer_manager.rid_to_state.pop(rid, None)
     _global_state.tokenizer_manager.health_check_failed = True
@@ -255,7 +256,7 @@ async def get_model_info():
 @app.get("/get_server_info")
 async def get_server_info():
     # Returns interna states per DP.
-    internal_states: List[Dict[Any, Any]] = (
+    internal_states: list[dict[Any, Any]] = (
         await _global_state.tokenizer_manager.get_internal_state()
     )
     return {
@@ -290,15 +291,19 @@ async def generate_request(obj: GenerateReqInput, request: Request):
                 async for out in _global_state.tokenizer_manager.generate_request(
                     obj, request
                 ):
-                    yield b"data: " + orjson.dumps(
-                        out, option=orjson.OPT_NON_STR_KEYS
-                    ) + b"\n\n"
+                    yield (
+                        b"data: "
+                        + orjson.dumps(out, option=orjson.OPT_NON_STR_KEYS)
+                        + b"\n\n"
+                    )
             except ValueError as e:
                 out = {"error": {"message": str(e)}}
-                logger.error(f"[http_server] Error: {e}")
-                yield b"data: " + orjson.dumps(
-                    out, option=orjson.OPT_NON_STR_KEYS
-                ) + b"\n\n"
+                logger.error("[http_server] Error: %s", e)
+                yield (
+                    b"data: "
+                    + orjson.dumps(out, option=orjson.OPT_NON_STR_KEYS)
+                    + b"\n\n"
+                )
             yield b"data: [DONE]\n\n"
 
         return StreamingResponse(
@@ -313,7 +318,7 @@ async def generate_request(obj: GenerateReqInput, request: Request):
             ).__anext__()
             return ret
         except ValueError as e:
-            logger.error(f"[http_server] Error: {e}")
+            logger.error("[http_server] Error: %s", e)
             return _create_error_response(e)
 
 
@@ -337,7 +342,7 @@ async def generate_from_file_request(file: UploadFile, request: Request):
         ).__anext__()
         return ret
     except ValueError as e:
-        logger.error(f"Error: {e}")
+        logger.error("Error: %s", e)
         return _create_error_response(e)
 
 
@@ -377,7 +382,7 @@ async def flush_cache():
 
 
 @app.api_route("/start_profile", methods=["GET", "POST"])
-async def start_profile_async(obj: Optional[ProfileReqInput] = None):
+async def start_profile_async(obj: ProfileReqInput | None = None):
     """Start profiling."""
     if obj is None:
         obj = ProfileReqInput()
@@ -406,7 +411,7 @@ async def stop_profile_async():
 
 
 @app.api_route("/start_trace", methods=["GET", "POST"])
-async def start_trace_async(obj: Optional[StartTraceReqInput] = None):
+async def start_trace_async(obj: StartTraceReqInput | None = None):
     """Start precision tracing."""
     if obj is None:
         obj = StartTraceReqInput()
@@ -444,9 +449,9 @@ async def start_trace_async(obj: Optional[StartTraceReqInput] = None):
             result = await _global_state.tokenizer_manager.set_internal_state(
                 SetInternalStateReq(request_id="trace_state", state_data=trace_state)
             )
-            logger.info(f"[HTTP] Set internal state result: {result}")
+            logger.info("[HTTP] Set internal state result: %s", result)
         except Exception as e:
-            logger.info(f"[HTTP] Error setting internal state: {e}")
+            logger.info("[HTTP] Error setting internal state: %s", e)
             precision_tracer.stop_trace()
             return ORJSONResponse(
                 content={
@@ -476,7 +481,7 @@ async def start_trace_async(obj: Optional[StartTraceReqInput] = None):
 
 
 @app.api_route("/stop_trace", methods=["GET", "POST"])
-async def stop_trace_async(obj: Optional[StopTraceReqInput] = None):
+async def stop_trace_async(obj: StopTraceReqInput | None = None):
     """Stop precision tracing."""
     try:
         output_file = precision_tracer.stop_trace()
@@ -521,7 +526,7 @@ async def stop_trace_async(obj: Optional[StopTraceReqInput] = None):
 
 
 @app.api_route("/trace_status", methods=["GET", "POST"])
-async def trace_status_async(obj: Optional[TraceStatusReqInput] = None):
+async def trace_status_async(obj: TraceStatusReqInput | None = None):
     """Get precision tracing status."""
     try:
         return ORJSONResponse(
@@ -789,8 +794,8 @@ def _create_error_response(e):
 
 def launch_server(
     server_args: ServerArgs,
-    pipe_finish_writer: Optional[multiprocessing.connection.Connection] = None,
-    launch_callback: Optional[Callable[[], None]] = None,
+    pipe_finish_writer: multiprocessing.connection.Connection | None = None,
+    launch_callback: Callable[[], None] | None = None,
 ):
     """
     Launch SRT (SGLang Runtime) Server.
@@ -859,7 +864,7 @@ def launch_server(
 
 def _execute_server_warmup(
     server_args: ServerArgs,
-    pipe_finish_writer: Optional[multiprocessing.connection.Connection],
+    pipe_finish_writer: multiprocessing.connection.Connection | None,
 ):
     headers = {}
     url = server_args.url()
@@ -882,7 +887,7 @@ def _execute_server_warmup(
     if not success:
         if pipe_finish_writer is not None:
             pipe_finish_writer.send(last_traceback)
-        logger.error(f"Initialization failed. warmup error: {last_traceback}")
+        logger.error("Initialization failed. warmup error: %s", last_traceback)
         kill_process_tree(os.getpid())
         return success
 
@@ -919,7 +924,7 @@ def _execute_server_warmup(
         last_traceback = get_exception_traceback()
         if pipe_finish_writer is not None:
             pipe_finish_writer.send(last_traceback)
-        logger.error(f"Initialization failed. warmup error: {last_traceback}")
+        logger.error("Initialization failed. warmup error: %s", last_traceback)
         kill_process_tree(os.getpid())
         return False
 
@@ -930,15 +935,14 @@ def _execute_server_warmup(
 
 def _wait_and_warmup(
     server_args: ServerArgs,
-    pipe_finish_writer: Optional[multiprocessing.connection.Connection],
-    launch_callback: Optional[Callable[[], None]] = None,
+    pipe_finish_writer: multiprocessing.connection.Connection | None,
+    launch_callback: Callable[[], None] | None = None,
 ):
-    if not server_args.skip_server_warmup:
-        if not _execute_server_warmup(
-            server_args,
-            pipe_finish_writer,
-        ):
-            return
+    if not server_args.skip_server_warmup and not _execute_server_warmup(
+        server_args,
+        pipe_finish_writer,
+    ):
+        return
 
     logger.info("The server is fired up and ready to roll!")
 

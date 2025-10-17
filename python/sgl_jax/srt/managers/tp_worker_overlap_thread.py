@@ -5,7 +5,6 @@ import logging
 import signal
 import threading
 from queue import Queue
-from typing import Optional, Tuple
 
 import jax
 import jax.numpy as jnp
@@ -85,7 +84,7 @@ class ModelWorkerClient:
             self.forward_thread_func_()
         except Exception:
             traceback = get_exception_traceback()
-            logger.error(f"ModelWorkerClient hit an exception: {traceback}")
+            logger.error("ModelWorkerClient hit an exception: %s", traceback)
             self.parent_process.send_signal(signal.SIGQUIT)
 
     def forward_thread_func_(self):
@@ -131,7 +130,7 @@ class ModelWorkerClient:
                 (None, logits_output, next_token_ids, cache_miss_count)
             )
 
-    def resolve_last_batch_result(self, launch_done: Optional[threading.Event] = None):
+    def resolve_last_batch_result(self, launch_done: threading.Event | None = None):
         """
         This function is called to resolve the last batch result and
         wait for the current batch to be launched. Used in overlap mode.
@@ -158,7 +157,7 @@ class ModelWorkerClient:
         self,
         model_worker_batch: ModelWorkerBatch,
         sampling_metadata: SamplingMetadata = None,
-    ) -> Tuple[None, jax.Array, int]:
+    ) -> tuple[None, jax.Array, int]:
         # Create a new copy of sampling_info because it will be updated in-place by the scheduler for the next batch.
         sampling_info = model_worker_batch.sampling_info
         sampling_info.update_penalties()

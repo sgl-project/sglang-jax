@@ -56,9 +56,9 @@ def create_qkv_cache(
     v = jnp.zeros((batched_aligned_kv_len, num_kv_heads, head_dim), dtype=jnp.bfloat16)
 
     # Fill in the actual data for each sequence with proper alignment
-    actual_pos = 0
     aligned_pos = 0
-    for seq_len in [kv_len for _, kv_len in lens]:
+    for actual_pos, _ in enumerate(range(len(lens))):
+        seq_len = lens[actual_pos]
         aligned_len = ((seq_len + page_size - 1) // page_size) * page_size
 
         # Generate data for this sequence
@@ -77,7 +77,6 @@ def create_qkv_cache(
         k = k.at[aligned_pos : aligned_pos + seq_len].set(seq_k)
         v = v.at[aligned_pos : aligned_pos + seq_len].set(seq_v)
 
-        actual_pos += 1
         aligned_pos += aligned_len
 
     return q, k, v
@@ -290,11 +289,7 @@ class TestAttention(CustomTestCase):
         # Create mock forward_batch
         num_heads, head_dim, num_kv_heads, page_size, dtype = mode_args
 
-        if dtype == jnp.bfloat16:
-            is_bf16 = True
-        else:
-            is_bf16 = False
-
+        is_bf16 = dtype == jnp.bfloat16
         forward_batch, token_to_kv_pool, q, k, v = create_test_data(
             mode,
             lens,

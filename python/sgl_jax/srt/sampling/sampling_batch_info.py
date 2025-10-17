@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import dataclasses
 import logging
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING
 
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
 from jax.tree_util import register_pytree_node_class
@@ -13,7 +13,7 @@ from sgl_jax.srt.utils import get_bool_env_var
 from sgl_jax.srt.utils.jax_utils import device_array
 
 if TYPE_CHECKING:
-    from sgl_jax.srt.managers.schedule_batch import ScheduleBatch, ModelWorkerBatch
+    from sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch, ScheduleBatch
 
 import threading
 
@@ -33,8 +33,8 @@ class SamplingMetadata:
 
     # logprob
     return_logprob: bool
-    top_logprobs_nums: Optional[List[int]]
-    token_ids_logprobs: Optional[List[List[int]]]
+    top_logprobs_nums: list[int] | None
+    token_ids_logprobs: list[list[int]] | None
 
     # sample
     temperatures: jax.Array
@@ -47,7 +47,7 @@ class SamplingMetadata:
 
     # penalty
     do_penalties: bool = False
-    linear_penalty: Optional[jax.Array] = None
+    linear_penalty: jax.Array | None = None
 
     def tree_flatten(self):
         children = (
@@ -353,12 +353,12 @@ class SamplingBatchInfo:
     need_min_p_sampling: bool = False
 
     # An event used for overlap schedule
-    sampling_info_done: Optional[threading.Event] = None
+    sampling_info_done: threading.Event | None = None
 
-    sampling_seeds: Optional[np.ndarray] = None
+    sampling_seeds: np.ndarray | None = None
 
     # Penalizer
-    penalizer_orchestrator: Optional[penaltylib.BatchedPenalizerOrchestrator] = None
+    penalizer_orchestrator: penaltylib.BatchedPenalizerOrchestrator | None = None
     linear_penalty: np.ndarray = None
 
     @classmethod
@@ -524,7 +524,7 @@ class SamplingBatchInfo:
             if value is not None:
                 setattr(self, item, value[keep_indices])
 
-    def merge_batch(self, other: "SamplingBatchInfo"):
+    def merge_batch(self, other: SamplingBatchInfo):
         self.penalizer_orchestrator.merge(other.penalizer_orchestrator)
         # Note: because the __len()__ operator is defined on the temperatures tensor,
         # please make sure any merge operation with len(self) or len(other) is done before

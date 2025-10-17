@@ -1,7 +1,6 @@
 import logging
 import os
 from pathlib import Path
-from typing import Optional
 
 import jax
 
@@ -12,20 +11,20 @@ logger = logging.getLogger(__name__)
 
 class SchedulerProfilerMixin:
     def init_profier(self):
-        self.profiler_output_dir: Optional[str] = None
-        self.profile_id: Optional[str] = None
-        self.profiler_start_forward_ct: Optional[int] = None
-        self.profiler_target_forward_ct: Optional[int] = None
-        self.profile_steps: Optional[int] = None
+        self.profiler_output_dir: str | None = None
+        self.profile_id: str | None = None
+        self.profiler_start_forward_ct: int | None = None
+        self.profiler_target_forward_ct: int | None = None
+        self.profile_steps: int | None = None
         self.profile_in_progress: bool = False
 
     def start_profile(
         self,
-        output_dir: Optional[str],
-        start_step: Optional[int],
-        num_steps: Optional[int],
-        host_tracer_level: Optional[int],
-        python_tracer_level: Optional[int],
+        output_dir: str | None,
+        start_step: int | None,
+        num_steps: int | None,
+        host_tracer_level: int | None,
+        python_tracer_level: int | None,
         profile_id: str,
     ) -> ProfileReqOutput:
         if self.profile_in_progress:
@@ -68,7 +67,9 @@ class SchedulerProfilerMixin:
             return ProfileReqOutput(success=True, message="Succeeded")
 
         logger.info(
-            f"Profiling starts. Traces will be saved to: {self.profiler_output_dir} (with profile id: {self.profile_id})",
+            "Profiling starts. Traces will be saved to: %s (with profile id: %s)",
+            self.profiler_output_dir,
+            self.profile_id,
         )
 
         profiler_options = jax.profiler.ProfileOptions()

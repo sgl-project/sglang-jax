@@ -1,5 +1,5 @@
 import logging
-from typing import Any, Dict, Optional, Tuple
+from typing import Any
 
 import jax
 import jax.numpy as jnp
@@ -30,8 +30,8 @@ class QWen3Attention(nnx.Module):
         num_kv_heads: int,
         max_position_embeddings: int,
         rope_theta: float = 10000,
-        rope_scaling: Optional[Dict[str, Any]] = None,
-        head_dim: Optional[int] = None,
+        rope_scaling: dict[str, Any] | None = None,
+        head_dim: int | None = None,
         rms_norm_eps: float = None,
         layer_id: int = 0,
         attention_bias: bool = False,
@@ -242,8 +242,8 @@ class QWen3DecoderLayer(nnx.Module):
         hidden_states: jax.Array,
         forward_batch: ForwardBatch,
         token_to_kv_pool: KVCache,
-        residual: Optional[jax.Array] = None,
-    ) -> Tuple[jax.Array, jax.Array]:
+        residual: jax.Array | None = None,
+    ) -> tuple[jax.Array, jax.Array]:
         layer_callback_flag = []
         if residual is None:
             residual = hidden_states
@@ -289,7 +289,6 @@ class QWen3Model(nnx.Module):
         dtype: jnp.dtype = jnp.bfloat16,
         rngs: nnx.Rngs = None,
     ):
-
         self.embed_tokens = Embed(
             num_embeddings=config.vocab_size,
             features=config.hidden_size,
@@ -360,7 +359,7 @@ class Qwen3ForCausalLM(nnx.Module):
         self.mesh = mesh
         self.config = config
         self.dtype = dtype
-        logger.info(f"QWen3ForCausalLMModel config dtype: {self.dtype}")
+        logger.info("QWen3ForCausalLMModel config dtype: %s", self.dtype)
         self.transformer = QWen3Model(config, dtype=self.dtype, rngs=rngs)
         self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size, rngs=rngs)
         self.logits_processor = LogitsProcessor(

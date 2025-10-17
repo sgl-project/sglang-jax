@@ -9,9 +9,9 @@ import sys
 import threading
 import time
 import unittest
-from contextlib import nullcontext
+from collections.abc import Awaitable, Callable, Sequence
+from contextlib import nullcontext, suppress
 from types import SimpleNamespace
-from typing import Awaitable, Callable, Optional, Sequence
 
 import jax
 import numpy as np
@@ -42,10 +42,7 @@ def is_in_ci():
     return get_bool_env_var("SGLANG_IS_IN_CI")
 
 
-if is_in_ci():
-    DEFAULT_PORT_FOR_SRT_TEST_RUNNER = 5000 + 100
-else:
-    DEFAULT_PORT_FOR_SRT_TEST_RUNNER = 7000 + 100
+DEFAULT_PORT_FOR_SRT_TEST_RUNNER = 5000 + 100 if is_in_ci() else 7000 + 100
 DEFAULT_URL_FOR_TEST = f"http://127.0.0.1:{DEFAULT_PORT_FOR_SRT_TEST_RUNNER + 1000}"
 
 mesh_axes = [
@@ -142,10 +139,10 @@ def popen_launch_server(
     model: str,
     base_url: str,
     timeout: float,
-    api_key: Optional[str] = None,
-    other_args: list[str] = [],
-    env: Optional[dict] = None,
-    return_stdout_stderr: Optional[tuple] = None,
+    api_key: str | None = None,
+    other_args: list[str] | None = None,
+    env: dict | None = None,
+    return_stdout_stderr: tuple | None = None,
     device: str = "tpu",
     pd_separated: bool = False,
 ):
@@ -155,7 +152,7 @@ def popen_launch_server(
         device: Device type ("auto", "cuda", "rocm" or "cpu").
                 If "auto", will detect available platforms automatically.
     """
-    other_args = list(other_args)
+    other_args = list(other_args) if other_args is not None else []
     other_args += ["--device", str(device)]
 
     _, host, port = base_url.split(":")
@@ -217,13 +214,11 @@ def popen_launch_server(
     start_time = time.perf_counter()
     with requests.Session() as session:
         while time.perf_counter() - start_time < timeout:
-
             return_code = process.poll()
             if return_code is not None:
                 # Server failed to start (non-zero exit code) or crashed
                 raise Exception(
-                    f"Server process exited with code {return_code}. "
-                    "Check server logs for errors."
+                    f"Server process exited with code {return_code}. Check server logs for errors."
                 )
 
             try:
@@ -271,13 +266,11 @@ def kill_process_tree(parent_pid, include_parent: bool = True, skip_pid: int = N
     for child in children:
         if child.pid == skip_pid:
             continue
-        try:
+        with suppress(psutil.NoSuchProcess):
             child.kill()
-        except psutil.NoSuchProcess:
-            pass
 
     if include_parent:
-        try:
+        with suppress(psutil.NoSuchProcess):
             if parent_pid == os.getpid():
                 itself.kill()
                 sys.exit(0)
@@ -287,8 +280,6 @@ def kill_process_tree(parent_pid, include_parent: bool = True, skip_pid: int = N
             # Sometime processes cannot be killed with SIGKILL (e.g, PID=1 launched by kubernetes),
             # so we send an additional signal to kill them.
             itself.send_signal(signal.SIGQUIT)
-        except psutil.NoSuchProcess:
-            pass
 
 
 def generate_server_args() -> ServerArgs:
@@ -467,8 +458,8 @@ def run_bench_serving(
     need_warmup=False,
     seed: int = 0,
     device="auto",
-    background_task: Optional[Callable[[str, asyncio.Event], Awaitable[None]]] = None,
-    lora_name: Optional[str] = None,
+    background_task: Callable[[str, asyncio.Event], Awaitable[None]] | None = None,
+    lora_name: str | None = None,
 ):
     if device == "auto":
         device = "tpu"
@@ -722,10 +713,11 @@ def calculate_rouge_l(output_strs_list1, output_strs_list2):
         lcs_len = lcs(s1, s2)
         precision = lcs_len / len(s1) if len(s1) > 0 else 0
         recall = lcs_len / len(s2) if len(s2) > 0 else 0
-        if precision + recall > 0:
-            fmeasure = (2 * precision * recall) / (precision + recall)
-        else:
-            fmeasure = 0.0
+        fmeasure = (
+            (2 * precision * recall) / (precision + recall)
+            if precision + recall > 0
+            else 0.0
+        )
         rouge_l_scores.append(fmeasure)
 
     return rouge_l_scores

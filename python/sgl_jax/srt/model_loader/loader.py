@@ -48,7 +48,7 @@ class JAXModelLoader(BaseModelLoader):
     @dataclasses.dataclass
     class JAXSource:
         model_or_path: str
-        revision: Optional[str]
+        revision: str | None
 
         @classmethod
         def init_new(cls, model_config: ModelConfig):
@@ -108,8 +108,8 @@ class JAXModelLoader(BaseModelLoader):
         return model
 
     def _maybe_download_from_modelscope(
-        self, model: str, revision: Optional[str]
-    ) -> Optional[str]:
+        self, model: str, revision: str | None
+    ) -> str | None:
         if get_bool_env_var("SGLANG_USE_MODELSCOPE"):
             # download model from ModelScope hub,
             # lazy import so that modelscope is not required for normal use.
@@ -129,8 +129,8 @@ class JAXModelLoader(BaseModelLoader):
         return None
 
     def _prepare_weights(
-        self, model_name_or_path: str, revision: Optional[str]
-    ) -> Tuple[str, List[str]]:
+        self, model_name_or_path: str, revision: str | None
+    ) -> tuple[str, list[str]]:
         model_path = self._maybe_download_from_modelscope(model_name_or_path, revision)
         if model_path is not None:
             model_name_or_path = model_path

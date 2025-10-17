@@ -1,7 +1,5 @@
 """Sampling parameters for text generation."""
 
-from typing import Dict, List, Optional, Union
-
 from sgl_jax.srt.utils import get_bool_env_var
 
 _SAMPLING_EPS = 1e-6
@@ -21,8 +19,8 @@ class SamplingParams:
     def __init__(
         self,
         max_new_tokens: int = 128,
-        stop: Optional[Union[str, List[str]]] = None,
-        stop_token_ids: Optional[List[int]] = None,
+        stop: str | list[str] | None = None,
+        stop_token_ids: list[int] | None = None,
         temperature: float = 1.0,
         top_p: float = 1.0,
         top_k: int = -1,
@@ -32,17 +30,17 @@ class SamplingParams:
         repetition_penalty: float = 1.0,
         min_new_tokens: int = 0,
         n: int = 1,
-        json_schema: Optional[str] = None,
-        regex: Optional[str] = None,
-        ebnf: Optional[str] = None,
-        structural_tag: Optional[str] = None,
+        json_schema: str | None = None,
+        regex: str | None = None,
+        ebnf: str | None = None,
+        structural_tag: str | None = None,
         ignore_eos: bool = False,
         skip_special_tokens: bool = True,
         spaces_between_special_tokens: bool = True,
         no_stop_trim: bool = False,
-        stream_interval: Optional[int] = None,
-        logit_bias: Optional[Dict[str, float]] = None,
-        sampling_seed: Optional[int] = None,
+        stream_interval: int | None = None,
+        logit_bias: dict[str, float] | None = None,
+        sampling_seed: int | None = None,
     ) -> None:
         self.max_new_tokens = max_new_tokens
         self.stop_strs = stop
@@ -101,22 +99,19 @@ class SamplingParams:
             )
         if not -2.0 <= self.frequency_penalty <= 2.0:
             raise ValueError(
-                "frequency_penalty must be in [-2, 2], got "
-                f"{self.frequency_penalty}."
+                f"frequency_penalty must be in [-2, 2], got {self.frequency_penalty}."
             )
         if not -2.0 <= self.presence_penalty <= 2.0:
             raise ValueError(
-                "presence_penalty must be in [-2, 2], got " f"{self.presence_penalty}."
+                f"presence_penalty must be in [-2, 2], got {self.presence_penalty}."
             )
         if not 0.0 <= self.repetition_penalty <= 2.0:
             raise ValueError(
-                "repetition_penalty must be in [0, 2], got "
-                f"{self.repetition_penalty}."
+                f"repetition_penalty must be in [0, 2], got {self.repetition_penalty}."
             )
-        if not 0 <= self.min_new_tokens:
+        if not self.min_new_tokens >= 0:
             raise ValueError(
-                f"min_new_tokens must be in [0, max_new_tokens], got "
-                f"{self.min_new_tokens}."
+                f"min_new_tokens must be in [0, max_new_tokens], got {self.min_new_tokens}."
             )
         if self.max_new_tokens is not None:
             if self.max_new_tokens < 0:
@@ -132,8 +127,7 @@ class SamplingParams:
             for token_id in self.logit_bias:
                 if not 0 <= int(token_id) < vocab_size:
                     raise ValueError(
-                        f"logit_bias must has keys in [0, {vocab_size - 1}], got "
-                        f"{token_id}."
+                        f"logit_bias must has keys in [0, {vocab_size - 1}], got {token_id}."
                     )
         grammars = [
             self.json_schema,
@@ -161,7 +155,7 @@ class SamplingParams:
                     stop_str_max_len = max(stop_str_max_len, len(stop_str))
             self.stop_str_max_len = stop_str_max_len
 
-    def convert_to_dict(self) -> Dict:
+    def convert_to_dict(self) -> dict:
         # Start with a copy of all instance attributes
         result = {}
         for key, value in self.__dict__.items():

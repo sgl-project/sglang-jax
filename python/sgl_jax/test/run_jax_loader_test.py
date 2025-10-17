@@ -22,10 +22,10 @@ Usage:
 """
 
 import argparse
+import importlib
 import os
 import subprocess
 import sys
-import importlib
 from pathlib import Path
 
 

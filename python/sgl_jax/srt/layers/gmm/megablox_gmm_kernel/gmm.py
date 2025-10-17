@@ -1,7 +1,7 @@
 import functools
 from collections.abc import Callable
 from functools import partial
-from typing import Any, Optional
+from typing import Any
 
 import jax
 import jax.numpy as jnp
@@ -28,8 +28,7 @@ def _validate_args(
     # Validate 'rhs'.
     if rhs.ndim != expected_rhs_dims:
         raise ValueError(
-            f"Expected {expected_rhs_dims}-tensor for 'rhs' but got"
-            f" {rhs.ndim}-tensor."
+            f"Expected {expected_rhs_dims}-tensor for 'rhs' but got {rhs.ndim}-tensor."
         )
     common.assert_is_supported_dtype(rhs.dtype)
 
@@ -275,7 +274,7 @@ def _zero_uninitialized_memory(
     return jnp.where(valid_mask[:, None], out, 0)
 
 
-LutFn = Callable[[int, int, int], Optional[tuple[int, int, int]]]
+LutFn = Callable[[int, int, int], tuple[int, int, int] | None]
 
 
 @functools.partial(
@@ -363,10 +362,9 @@ def gmm(
         visit_empty_groups=False,
     )
 
-    if transpose_rhs:
-        dot_general_dims = (((1,), (1,)), ((), ()))
-    else:
-        dot_general_dims = (((1,), (0,)), ((), ()))
+    dot_general_dims = (
+        (((1,), (1,)), ((), ())) if transpose_rhs else (((1,), (0,)), ((), ()))
+    )
 
     def kernel(
         group_metadata,

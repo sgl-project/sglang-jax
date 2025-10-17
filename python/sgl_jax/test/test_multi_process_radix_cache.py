@@ -19,7 +19,7 @@ from sgl_jax.srt.mem_cache.radix_cache import RadixCache
 
 def print_cache_sharding_info(cache, mesh, req_pool, allocator, process_id):
     """Print cache-related sharding information"""
-    print(f"\n{'='*80}")
+    print(f"\n{'=' * 80}")
     print(f"[PROCESS {process_id}] RadixCache multiprocesssharding info")
     print(f"[PROCESS {process_id}] Local device count: {len(jax.local_devices())}")
     print(f"[PROCESS {process_id}] Global device count: {len(jax.devices())}")
@@ -75,7 +75,7 @@ def print_cache_sharding_info(cache, mesh, req_pool, allocator, process_id):
     if hasattr(kv_cache, "kv_buffer") and kv_cache.kv_buffer:
         print_sharding(kv_cache.kv_buffer[0], "kv_cache.kv_buffer[0]", "allocator")
 
-    print(f"{'='*80}")
+    print(f"{'=' * 80}")
 
 
 def create_multi_process_radix_cache(process_id, tp_size=8):
@@ -175,7 +175,7 @@ def test_basic_radix_cache_operations(cache, process_id):
     test_keys = [[1, 2, 3, 4, 5], [1, 2, 3, 6, 7], [10, 11, 12, 13, 14]]
 
     for i, key in enumerate(test_keys):
-        print(f"[PROCESS {process_id}] Inserting key {i+1}: {key}")
+        print(f"[PROCESS {process_id}] Inserting key {i + 1}: {key}")
         prefix_len = cache.insert(key)
         print(f"[PROCESS {process_id}] Prefix match length: {prefix_len}")
 
@@ -253,11 +253,11 @@ def test_cross_process_isolation(cache, process_id):
 
     print(f"[PROCESS {process_id}] Inserting process-specific data:")
     for i, key in enumerate(process_specific_keys):
-        print(f"[PROCESS {process_id}] Inserting key{i+1}: {key}")
+        print(f"[PROCESS {process_id}] Inserting key{i + 1}: {key}")
         cache.insert(key)
         match_result = cache.match_prefix(key)
         print(
-            f"[PROCESS {process_id}] Key{i+1} match result: {len(match_result.device_indices)}"
+            f"[PROCESS {process_id}] Key{i + 1} match result: {len(match_result.device_indices)}"
         )
 
     # Test cache status

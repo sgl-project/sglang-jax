@@ -1,6 +1,3 @@
-from typing import Dict, Optional, Tuple, Type
-
-
 class StreamingParseResult:
     """Result of streaming incremental parsing."""
 
@@ -186,13 +183,13 @@ class ReasoningParser:
             If True, streams reasoning content as it arrives.
     """
 
-    DetectorMap: Dict[str, Type[BaseReasoningFormatDetector]] = {
+    DetectorMap: dict[str, type[BaseReasoningFormatDetector]] = {
         "deepseek-r1": DeepSeekR1Detector,
         "qwen3": Qwen3Detector,
         "kimi": KimiDetector,
     }
 
-    def __init__(self, model_type: Optional[str] = None, stream_reasoning: bool = True):
+    def __init__(self, model_type: str | None = None, stream_reasoning: bool = True):
         if not model_type:
             raise ValueError("Model type must be specified")
 
@@ -202,12 +199,12 @@ class ReasoningParser:
 
         self.detector = detector_class(stream_reasoning=stream_reasoning)
 
-    def parse_non_stream(self, full_text: str) -> Tuple[str, str]:
+    def parse_non_stream(self, full_text: str) -> tuple[str, str]:
         """Non-streaming call: one-time parsing"""
         ret = self.detector.detect_and_parse(full_text)
         return ret.reasoning_text, ret.normal_text
 
-    def parse_stream_chunk(self, chunk_text: str) -> Tuple[str, str]:
+    def parse_stream_chunk(self, chunk_text: str) -> tuple[str, str]:
         """Streaming call: incremental parsing"""
         ret = self.detector.parse_streaming_increment(chunk_text)
         return ret.reasoning_text, ret.normal_text

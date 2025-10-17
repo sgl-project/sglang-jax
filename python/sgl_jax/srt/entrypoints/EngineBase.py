@@ -1,5 +1,5 @@
 from abc import ABC, abstractmethod
-from typing import Dict, Iterator, List, Optional, Union
+from collections.abc import Iterator
 
 
 class EngineBase(ABC):
@@ -11,23 +11,23 @@ class EngineBase(ABC):
     @abstractmethod
     def generate(
         self,
-        prompt: Optional[Union[List[str], str]] = None,
-        sampling_params: Optional[Union[List[Dict], Dict]] = None,
-        input_ids: Optional[Union[List[List[int]], List[int]]] = None,
-        image_data: Optional[Union[List[str], str]] = None,
-        return_logprob: Optional[Union[List[bool], bool]] = False,
-        logprob_start_len: Optional[Union[List[int], int]] = None,
-        top_logprobs_num: Optional[Union[List[int], int]] = None,
-        token_ids_logprob: Optional[Union[List[List[int]], List[int]]] = None,
-        lora_path: Optional[Union[List[Optional[str]], Optional[str]]] = None,
-        custom_logit_processor: Optional[Union[List[str], str]] = None,
-        return_hidden_states: Optional[bool] = None,
-        stream: Optional[bool] = None,
-        bootstrap_host: Optional[Union[List[str], str]] = None,
-        bootstrap_port: Optional[Union[List[int], int]] = None,
-        bootstrap_room: Optional[Union[List[int], int]] = None,
-        data_parallel_rank: Optional[int] = None,
-    ) -> Union[Dict, Iterator[Dict]]:
+        prompt: list[str] | str | None = None,
+        sampling_params: list[dict] | dict | None = None,
+        input_ids: list[list[int]] | list[int] | None = None,
+        image_data: list[str] | str | None = None,
+        return_logprob: list[bool] | bool | None = False,
+        logprob_start_len: list[int] | int | None = None,
+        top_logprobs_num: list[int] | int | None = None,
+        token_ids_logprob: list[list[int]] | list[int] | None = None,
+        lora_path: list[str | None] | str | None | None = None,
+        custom_logit_processor: list[str] | str | None = None,
+        return_hidden_states: bool | None = None,
+        stream: bool | None = None,
+        bootstrap_host: list[str] | str | None = None,
+        bootstrap_port: list[int] | int | None = None,
+        bootstrap_room: list[int] | int | None = None,
+        data_parallel_rank: int | None = None,
+    ) -> dict | Iterator[dict]:
         """Generate outputs based on given inputs."""
         pass
 

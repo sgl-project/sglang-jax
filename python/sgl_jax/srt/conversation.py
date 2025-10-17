@@ -4,15 +4,16 @@ This is a stub implementation for the migration from sglang.
 """
 
 import logging
-from typing import Any, Callable, Dict, List, Optional
+from collections.abc import Callable
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
 
 def generate_chat_conv(
-    messages: List[Dict[str, Any]],
+    messages: list[dict[str, Any]],
     tokenizer: Any = None,
-    chat_template: Optional[str] = None,
+    chat_template: str | None = None,
 ) -> str:
     """
     Generate a conversation from chat messages.
@@ -25,7 +26,7 @@ def generate_chat_conv(
     Returns:
         Formatted conversation string
     """
-    logger.info(f"Generating chat conversation from {len(messages)} messages")
+    logger.info("Generating chat conversation from %s messages", len(messages))
 
     # Basic implementation - just concatenate messages
     conversation_parts = []
@@ -35,7 +36,7 @@ def generate_chat_conv(
         conversation_parts.append(f"{role}: {content}")
 
     conversation = "\n".join(conversation_parts)
-    logger.debug(f"Generated conversation: {conversation[:100]}...")
+    logger.debug("Generated conversation: %s...", conversation[:100])
 
     return conversation
 
@@ -43,7 +44,7 @@ def generate_chat_conv(
 class Conversation:
     """Basic conversation class for handling chat interactions."""
 
-    def __init__(self, messages: List[Dict[str, Any]]):
+    def __init__(self, messages: list[dict[str, Any]]):
         self.messages = messages
         self.history = []
 
@@ -63,8 +64,8 @@ class Conversation:
 
 
 # A global registry for all conversation templates
-chat_templates: Dict[str, Conversation] = {}
-matching_function_registry: List[Callable] = []
+chat_templates: dict[str, Conversation] = {}
+matching_function_registry: list[Callable] = []
 
 
 def register_conv_template(template: Conversation, override: bool = False):

@@ -81,7 +81,6 @@ def get_available_device_memory(device, distributed=False, empty_cache=True):
         raise ValueError(f"Invalid device: {device}")
 
     if distributed:
-
         # Use pmap to find the minimum available memory across all devices.
         mesh = jax.make_mesh((jax.process_count(), 4), ("node", "device"))
 

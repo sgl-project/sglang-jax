@@ -554,7 +554,7 @@ class TestKVCache(unittest.TestCase):
                 )
                 for idx, cache_start, new_start, length in slices:
                     print(
-                        f"    Slice at pos {idx}: cache[{cache_start}:{cache_start+length}] <- input[{new_start}:{new_start+length}]"
+                        f"    Slice at pos {idx}: cache[{cache_start}:{cache_start + length}] <- input[{new_start}:{new_start + length}]"
                     )
 
                     # Verify slice doesn't exceed page_size

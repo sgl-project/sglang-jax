@@ -3,7 +3,6 @@ import logging
 import math
 import os
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple, Union
 
 import jax
 import jax.numpy as jnp
@@ -20,10 +19,10 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class WeightMapping:
-    target_path: Union[str, List[str]]
-    sharding: Optional[Tuple] = None
+    target_path: str | list[str]
+    sharding: tuple | None = None
     transpose: bool = False
-    reshape: Optional[Tuple] = None
+    reshape: tuple | None = None
     head_dim_padding: bool = False
     kv_head_padding: bool = False
 
@@ -31,11 +30,12 @@ class WeightMapping:
         if self.sharding is None:
             self.sharding = self._infer_default_sharding()
 
-    def _infer_default_sharding(self) -> Tuple:
-        if isinstance(self.target_path, list):
-            path = self.target_path[0]
-        else:
-            path = self.target_path
+    def _infer_default_sharding(self) -> tuple:
+        path = (
+            self.target_path[0]
+            if isinstance(self.target_path, list)
+            else self.target_path
+        )
 
         if any(pattern in path for pattern in ["embedding", "lm_head"]):
             return (None, None)
@@ -91,7 +91,7 @@ class WeightLoader:
             self.sharding_size = 1
 
     def load_weights_from_safetensors(
-        self, weight_mappings: Dict[str, Union[str, List[str], WeightMapping]]
+        self, weight_mappings: dict[str, str | list[str] | WeightMapping]
     ):
         params = nnx.state(self.model)
 
@@ -107,7 +107,8 @@ class WeightLoader:
         expert_weights = {}
 
         logger.info(
-            f"WeightLoader: Will load layers 0 to {self.model_config.num_hidden_layers - 1}"
+            "WeightLoader: Will load layers 0 to %s",
+            self.model_config.num_hidden_layers - 1,
         )
 
         for hf_key, hf_weight in self._iterate_weights():
@@ -119,12 +120,12 @@ class WeightLoader:
                 self._process_and_assign_weight(params, hf_key, hf_weight, mapping)
             elif "mlp.experts." in hf_key and hf_key.endswith(".weight"):
                 if self._is_excluded_layer_weight(hf_key):
-                    logger.debug(f"Skipping excluded MoE expert weight: {hf_key}")
+                    logger.debug("Skipping excluded MoE expert weight: %s", hf_key)
                 else:
                     expert_weights[hf_key] = hf_weight.astype(self.dtype)
             else:
                 if self._is_excluded_layer_weight(hf_key):
-                    logger.debug(f"Skipping excluded layer weight: {hf_key}")
+                    logger.debug("Skipping excluded layer weight: %s", hf_key)
                 else:
                     logger.warning(f"No mapping found for weight: {hf_key}")
         nnx.update(self.model, params)
@@ -148,34 +149,43 @@ class WeightLoader:
                 filename = os.path.basename(st_file)
                 pbar.set_postfix({"file": filename})
 
-                with jax.default_device(jax.local_devices(backend="cpu")[0]):
-                    with safe_open(st_file, framework="flax") as f:
-                        needed_keys = []
-                        for name in f.keys():
-                            if not name.startswith("model.layers."):
-                                needed_keys.append(name)
-                                continue
-
-                            if not self._is_excluded_layer_weight(name):
-                                needed_keys.append(name)
-
-                        if not needed_keys:
-                            skipped_files += 1
-                            logger.debug(
-                                f"Skipping {filename}: 0/{len(f.keys())} weights needed"
-                            )
+                with (
+                    jax.default_device(jax.local_devices(backend="cpu")[0]),
+                    safe_open(st_file, framework="flax") as f,
+                ):
+                    needed_keys = []
+                    for name in f:
+                        if not name.startswith("model.layers."):
+                            needed_keys.append(name)
                             continue
 
+                        if not self._is_excluded_layer_weight(name):
+                            needed_keys.append(name)
+
+                    if not needed_keys:
+                        skipped_files += 1
                         logger.debug(
-                            f"Loading {filename}: {len(needed_keys)}/{len(f.keys())} weights needed"
+                            "Skipping %s: 0/%s weights needed",
+                            filename,
+                            len(f.keys()),
                         )
-                        for name in needed_keys:
-                            weight_tensor = f.get_tensor(name)
-                            yield name, weight_tensor
+                        continue
+
+                    logger.debug(
+                        "Loading %s: %s/%s weights needed",
+                        filename,
+                        len(needed_keys),
+                        len(f.keys()),
+                    )
+                    for name in needed_keys:
+                        weight_tensor = f.get_tensor(name)
+                        yield name, weight_tensor
 
         if skipped_files > 0:
             logger.info(
-                f"Memory optimization: Skipped {skipped_files}/{len(weights_files)} files with no needed weights"
+                "Memory optimization: Skipped %s/%s files with no needed weights",
+                skipped_files,
+                len(weights_files),
             )
 
     def _process_and_assign_weight(
@@ -217,11 +227,15 @@ class WeightLoader:
         try:
             model_param = self._get_param(params, jax_path)
             logger.debug(
-                f"Loading {hf_key} -> {jax_path}, shape: {processed_weight.shape}, transpose: {mapping.transpose}"
+                "Loading %s -> %s, shape: %s, transpose: %s",
+                hf_key,
+                jax_path,
+                processed_weight.shape,
+                mapping.transpose,
             )
             model_param.value = sharded_weight
         except Exception as e:
-            logger.error(f"Failed to load {hf_key} -> {jax_path}: {str(e)}")
+            logger.error("Failed to load %s -> %s: %s", hf_key, jax_path, str(e))
             raise
 
     def _handle_split_weight(
@@ -264,7 +278,6 @@ class WeightLoader:
 
             splits = [q_bias, k_bias, v_bias]
         else:
-
             q_dim = self.num_heads * self.head_dim_original
             kv_dim = self.num_kv_heads * self.head_dim_original
 
@@ -360,7 +373,7 @@ class WeightLoader:
             model_param = self._get_param(params, jax_path)
             model_param.value = sharded_weight
             logger.debug(
-                f"Split {hf_key} -> {jax_path}, shape: {processed_weight.shape}"
+                "Split %s -> %s, shape: %s", hf_key, jax_path, processed_weight.shape
             )
 
     def _shard_weight(self, weight: jax.Array, sharding: tuple) -> jax.Array:
@@ -539,7 +552,9 @@ class WeightLoader:
 
         if is_excluded and not hasattr(self, "_debug_count"):
             logger.info(
-                f"DEBUG: Excluding layer {layer_num} >= {self.model_config.num_hidden_layers}"
+                "DEBUG: Excluding layer %s >= %s",
+                layer_num,
+                self.model_config.num_hidden_layers,
             )
             self._debug_count = True
 
@@ -548,8 +563,8 @@ class WeightLoader:
     def _process_moe_expert_weights(
         self,
         params: nnx.State,
-        moe_mappings: Dict[str, WeightMapping],
-        expert_weights: Dict[str, jax.Array],
+        moe_mappings: dict[str, WeightMapping],
+        expert_weights: dict[str, jax.Array],
     ):
         with tqdm(
             moe_mappings.items(), desc="[STACKING] MOE EXPERTS", unit="layer"
@@ -562,7 +577,7 @@ class WeightLoader:
                     not isinstance(mapping.target_path, list)
                     or len(mapping.target_path) < 2
                 ):
-                    logger.warning(f"Invalid MoE mapping for {moe_key}")
+                    logger.warning("Invalid MoE mapping for %s", moe_key)
                     continue
 
                 target_path = mapping.target_path[0]
@@ -576,7 +591,7 @@ class WeightLoader:
                             weight = jnp.transpose(weight, (1, 0))
                         collected_weights.append(weight)
                     else:
-                        logger.warning(f"Missing expert weight: {expert_key}")
+                        logger.warning("Missing expert weight: %s", expert_key)
 
                 if len(collected_weights) == len(expert_keys):
                     stacked_weight = jnp.stack(collected_weights, axis=0)
@@ -590,5 +605,5 @@ class WeightLoader:
                     model_param.value = sharded_weight
                 else:
                     logger.error(
-                        f"Could not collect all expert weights for {target_path}"
+                        "Could not collect all expert weights for %s", target_path
                     )

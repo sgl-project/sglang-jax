@@ -2,10 +2,9 @@
 
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field, root_validator, validator
-from typing_extensions import Literal
 
 
 class ModelCard(BaseModel):
@@ -15,68 +14,68 @@ class ModelCard(BaseModel):
     object: str = "model"
     created: int = Field(default_factory=lambda: int(time.time()))
     owned_by: str = "sglang"
-    root: Optional[str] = None
-    max_model_len: Optional[int] = None
+    root: str | None = None
+    max_model_len: int | None = None
 
 
 class ModelList(BaseModel):
     """Model list consists of model cards."""
 
     object: str = "list"
-    data: List[ModelCard] = Field(default_factory=list)
+    data: list[ModelCard] = Field(default_factory=list)
 
 
 class ErrorResponse(BaseModel):
     object: str = "error"
     message: str
     type: str
-    param: Optional[str] = None
+    param: str | None = None
     code: int
 
 
 class LogProbs(BaseModel):
-    text_offset: List[int] = Field(default_factory=list)
-    token_logprobs: List[Optional[float]] = Field(default_factory=list)
-    tokens: List[str] = Field(default_factory=list)
-    top_logprobs: List[Optional[Dict[str, float]]] = Field(default_factory=list)
+    text_offset: list[int] = Field(default_factory=list)
+    token_logprobs: list[float | None] = Field(default_factory=list)
+    tokens: list[str] = Field(default_factory=list)
+    top_logprobs: list[dict[str, float] | None] = Field(default_factory=list)
 
 
 class TopLogprob(BaseModel):
     token: str
-    bytes: List[int]
+    bytes: list[int]
     logprob: float
 
 
 class ChatCompletionTokenLogprob(BaseModel):
     token: str
-    bytes: List[int]
+    bytes: list[int]
     logprob: float
-    top_logprobs: List[TopLogprob]
+    top_logprobs: list[TopLogprob]
 
 
 class ChoiceLogprobs(BaseModel):
     # build for v1/chat/completions response
-    content: List[ChatCompletionTokenLogprob]
+    content: list[ChatCompletionTokenLogprob]
 
 
 class UsageInfo(BaseModel):
     prompt_tokens: int = 0
     total_tokens: int = 0
-    completion_tokens: Optional[int] = 0
+    completion_tokens: int | None = 0
     # only used to return cached tokens when --enable-cache-report is set
-    prompt_tokens_details: Optional[Dict[str, int]] = None
+    prompt_tokens_details: dict[str, int] | None = None
 
 
 class StreamOptions(BaseModel):
-    include_usage: Optional[bool] = False
+    include_usage: bool | None = False
 
 
 class JsonSchemaResponseFormat(BaseModel):
     name: str
-    description: Optional[str] = None
+    description: str | None = None
     # use alias to workaround pydantic conflict
-    schema_: Optional[Dict[str, object]] = Field(alias="schema", default=None)
-    strict: Optional[bool] = False
+    schema_: dict[str, object] | None = Field(alias="schema", default=None)
+    strict: bool | None = False
 
 
 class FileRequest(BaseModel):
@@ -108,77 +107,77 @@ class BatchRequest(BaseModel):
     )
     endpoint: str  # The endpoint to be used for all requests in the batch
     completion_window: str  # The time frame within which the batch should be processed
-    metadata: Optional[dict] = None  # Optional custom metadata for the batch
+    metadata: dict | None = None  # Optional custom metadata for the batch
 
 
 class BatchResponse(BaseModel):
     id: str
     object: str = "batch"
     endpoint: str
-    errors: Optional[dict] = None
+    errors: dict | None = None
     input_file_id: str
     completion_window: str
     status: str = "validating"
-    output_file_id: Optional[str] = None
-    error_file_id: Optional[str] = None
+    output_file_id: str | None = None
+    error_file_id: str | None = None
     created_at: int
-    in_progress_at: Optional[int] = None
-    expires_at: Optional[int] = None
-    finalizing_at: Optional[int] = None
-    completed_at: Optional[int] = None
-    failed_at: Optional[int] = None
-    expired_at: Optional[int] = None
-    cancelling_at: Optional[int] = None
-    cancelled_at: Optional[int] = None
-    request_counts: Optional[dict] = None
-    metadata: Optional[dict] = None
+    in_progress_at: int | None = None
+    expires_at: int | None = None
+    finalizing_at: int | None = None
+    completed_at: int | None = None
+    failed_at: int | None = None
+    expired_at: int | None = None
+    cancelling_at: int | None = None
+    cancelled_at: int | None = None
+    request_counts: dict | None = None
+    metadata: dict | None = None
 
 
 class CompletionRequest(BaseModel):
     # Ordered by official OpenAI API documentation
     # https://platform.openai.com/docs/api-reference/completions/create
     model: str
-    prompt: Union[List[int], List[List[int]], str, List[str]]
-    best_of: Optional[int] = None
+    prompt: list[int] | list[list[int]] | str | list[str]
+    best_of: int | None = None
     echo: bool = False
     frequency_penalty: float = 0.0
-    logit_bias: Optional[Dict[str, float]] = None
-    logprobs: Optional[int] = None
+    logit_bias: dict[str, float] | None = None
+    logprobs: int | None = None
     max_tokens: int = 16
     n: int = 1
     presence_penalty: float = 0.0
-    seed: Optional[int] = None
-    stop: Optional[Union[str, List[str]]] = None
+    seed: int | None = None
+    stop: str | list[str] | None = None
     stream: bool = False
-    stream_options: Optional[StreamOptions] = None
-    suffix: Optional[str] = None
+    stream_options: StreamOptions | None = None
+    suffix: str | None = None
     temperature: float = 1.0
     top_p: float = 1.0
-    user: Optional[str] = None
+    user: str | None = None
     return_hidden_states: bool = False
 
     # Extra parameters for SRT backend only and will be ignored by OpenAI models.
     top_k: int = -1
     min_p: float = 0.0
     min_tokens: int = 0
-    json_schema: Optional[str] = None
-    regex: Optional[str] = None
-    ebnf: Optional[str] = None
+    json_schema: str | None = None
+    regex: str | None = None
+    ebnf: str | None = None
     repetition_penalty: float = 1.0
-    stop_token_ids: Optional[List[int]] = None
+    stop_token_ids: list[int] | None = None
     no_stop_trim: bool = False
     ignore_eos: bool = False
     skip_special_tokens: bool = True
-    lora_path: Optional[Union[List[Optional[str]], Optional[str]]] = None
-    session_params: Optional[Dict] = None
+    lora_path: list[str | None] | str | None | None = None
+    session_params: dict | None = None
 
     # For PD disaggregation
-    bootstrap_host: Optional[str] = None
-    bootstrap_port: Optional[int] = None
-    bootstrap_room: Optional[int] = None
+    bootstrap_host: str | None = None
+    bootstrap_port: int | None = None
+    bootstrap_room: int | None = None
 
     # For request id
-    rid: Optional[Union[List[str], str]] = None
+    rid: list[str] | str | None = None
 
     @validator("max_tokens")
     @classmethod
@@ -191,10 +190,10 @@ class CompletionRequest(BaseModel):
 class CompletionResponseChoice(BaseModel):
     index: int
     text: str
-    logprobs: Optional[LogProbs] = None
-    finish_reason: Optional[Literal["stop", "length", "content_filter", "abort"]] = None
-    matched_stop: Union[None, int, str] = None
-    hidden_states: Optional[object] = None
+    logprobs: LogProbs | None = None
+    finish_reason: Literal["stop", "length", "content_filter", "abort"] | None = None
+    matched_stop: None | int | str = None
+    hidden_states: object | None = None
 
     # @model_serializer(mode="wrap")  # Not available in pydantic v1
     # def _serialize(self, handler):
@@ -209,17 +208,17 @@ class CompletionResponse(BaseModel):
     object: str = "text_completion"
     created: int = Field(default_factory=lambda: int(time.time()))
     model: str
-    choices: List[CompletionResponseChoice]
+    choices: list[CompletionResponseChoice]
     usage: UsageInfo
 
 
 class CompletionResponseStreamChoice(BaseModel):
     index: int
     text: str
-    logprobs: Optional[LogProbs] = None
-    finish_reason: Optional[Literal["stop", "length", "content_filter", "abort"]] = None
-    matched_stop: Union[None, int, str] = None
-    hidden_states: Optional[object] = None
+    logprobs: LogProbs | None = None
+    finish_reason: Literal["stop", "length", "content_filter", "abort"] | None = None
+    matched_stop: None | int | str = None
+    hidden_states: object | None = None
 
     # @model_serializer(mode="wrap")  # Not available in pydantic v1
     # def _serialize(self, handler):
@@ -234,8 +233,8 @@ class CompletionStreamResponse(BaseModel):
     object: str = "text_completion"
     created: int = Field(default_factory=lambda: int(time.time()))
     model: str
-    choices: List[CompletionResponseStreamChoice]
-    usage: Optional[UsageInfo] = None
+    choices: list[CompletionResponseStreamChoice]
+    usage: UsageInfo | None = None
 
 
 class ChatCompletionMessageContentTextPart(BaseModel):
@@ -245,7 +244,7 @@ class ChatCompletionMessageContentTextPart(BaseModel):
 
 class ChatCompletionMessageContentImageURL(BaseModel):
     url: str
-    detail: Optional[Literal["auto", "low", "high"]] = "auto"
+    detail: Literal["auto", "low", "high"] | None = "auto"
 
 
 class ChatCompletionMessageContentVideoURL(BaseModel):
@@ -259,7 +258,7 @@ class ChatCompletionMessageContentAudioURL(BaseModel):
 class ChatCompletionMessageContentImagePart(BaseModel):
     type: Literal["image_url"]
     image_url: ChatCompletionMessageContentImageURL
-    modalities: Optional[Literal["image", "multi-images", "video"]] = "image"
+    modalities: Literal["image", "multi-images", "video"] | None = "image"
 
 
 class ChatCompletionMessageContentVideoPart(BaseModel):
@@ -272,37 +271,37 @@ class ChatCompletionMessageContentAudioPart(BaseModel):
     audio_url: ChatCompletionMessageContentAudioURL
 
 
-ChatCompletionMessageContentPart = Union[
-    ChatCompletionMessageContentTextPart,
-    ChatCompletionMessageContentImagePart,
-    ChatCompletionMessageContentVideoPart,
-    ChatCompletionMessageContentAudioPart,
-]
+ChatCompletionMessageContentPart = (
+    ChatCompletionMessageContentTextPart
+    | ChatCompletionMessageContentImagePart
+    | ChatCompletionMessageContentVideoPart
+    | ChatCompletionMessageContentAudioPart
+)
 
 
 class FunctionResponse(BaseModel):
     """Function response."""
 
-    name: Optional[str] = None
-    arguments: Optional[str] = None
+    name: str | None = None
+    arguments: str | None = None
 
 
 class ToolCall(BaseModel):
     """Tool call response."""
 
-    id: Optional[str] = None
-    index: Optional[int] = None
+    id: str | None = None
+    index: int | None = None
     type: Literal["function"] = "function"
     function: FunctionResponse
 
 
 class ChatCompletionMessageGenericParam(BaseModel):
     role: Literal["system", "assistant", "tool"]
-    content: Union[str, List[ChatCompletionMessageContentTextPart], None]
-    tool_call_id: Optional[str] = None
-    name: Optional[str] = None
-    reasoning_content: Optional[str] = None
-    tool_calls: Optional[List[ToolCall]] = Field(default=None, examples=[None])
+    content: str | list[ChatCompletionMessageContentTextPart] | None
+    tool_call_id: str | None = None
+    name: str | None = None
+    reasoning_content: str | None = None
+    tool_calls: list[ToolCall] | None = Field(default=None, examples=[None])
 
     @validator("role", pre=True)
     @classmethod
@@ -319,37 +318,37 @@ class ChatCompletionMessageGenericParam(BaseModel):
 
 class ChatCompletionMessageUserParam(BaseModel):
     role: Literal["user"]
-    content: Union[str, List[ChatCompletionMessageContentPart]]
+    content: str | list[ChatCompletionMessageContentPart]
 
 
-ChatCompletionMessageParam = Union[
-    ChatCompletionMessageGenericParam, ChatCompletionMessageUserParam
-]
+ChatCompletionMessageParam = (
+    ChatCompletionMessageGenericParam | ChatCompletionMessageUserParam
+)
 
 
 class ResponseFormat(BaseModel):
     type: Literal["text", "json_object", "json_schema"]
-    json_schema: Optional[JsonSchemaResponseFormat] = None
+    json_schema: JsonSchemaResponseFormat | None = None
 
 
 class StructuresResponseFormat(BaseModel):
     begin: str
-    schema_: Optional[Dict[str, object]] = Field(alias="schema", default=None)
+    schema_: dict[str, object] | None = Field(alias="schema", default=None)
     end: str
 
 
 class StructuralTagResponseFormat(BaseModel):
     type: Literal["structural_tag"]
-    structures: List[StructuresResponseFormat]
-    triggers: List[str]
+    structures: list[StructuresResponseFormat]
+    triggers: list[str]
 
 
 class Function(BaseModel):
     """Function descriptions."""
 
-    description: Optional[str] = Field(default=None, examples=[None])
-    name: Optional[str] = None
-    parameters: Optional[object] = None
+    description: str | None = Field(default=None, examples=[None])
+    name: str | None = None
+    parameters: object | None = None
     strict: bool = False
 
 
@@ -363,7 +362,7 @@ class Tool(BaseModel):
 class ToolChoiceFuncName(BaseModel):
     """The name of tool choice function."""
 
-    name: Optional[str] = None
+    name: str | None = None
 
 
 class ToolChoice(BaseModel):
@@ -376,34 +375,34 @@ class ToolChoice(BaseModel):
 class ChatCompletionRequest(BaseModel):
     # Ordered by official OpenAI API documentation
     # https://platform.openai.com/docs/api-reference/chat/create
-    messages: List[ChatCompletionMessageParam]
+    messages: list[ChatCompletionMessageParam]
     model: str
     frequency_penalty: float = 0.0
-    logit_bias: Optional[Dict[str, float]] = None
+    logit_bias: dict[str, float] | None = None
     logprobs: bool = False
-    top_logprobs: Optional[int] = None
-    max_tokens: Optional[int] = Field(
+    top_logprobs: int | None = None
+    max_tokens: int | None = Field(
         default=None,
         deprecated="max_tokens is deprecated in favor of the max_completion_tokens field",
         description="The maximum number of tokens that can be generated in the chat completion. ",
     )
-    max_completion_tokens: Optional[int] = Field(
+    max_completion_tokens: int | None = Field(
         default=None,
         description="The maximum number of completion tokens for a chat completion request, "
         "including visible output tokens and reasoning tokens. Input tokens are not included. ",
     )
     n: int = 1
     presence_penalty: float = 0.0
-    response_format: Optional[Union[ResponseFormat, StructuralTagResponseFormat]] = None
-    seed: Optional[int] = None
-    stop: Optional[Union[str, List[str]]] = None
+    response_format: ResponseFormat | StructuralTagResponseFormat | None = None
+    seed: int | None = None
+    stop: str | list[str] | None = None
     stream: bool = False
-    stream_options: Optional[StreamOptions] = None
+    stream_options: StreamOptions | None = None
     temperature: float = 0.7
     top_p: float = 1.0
-    user: Optional[str] = None
-    tools: Optional[List[Tool]] = Field(default=None, examples=[None])
-    tool_choice: Union[ToolChoice, Literal["auto", "required", "none"]] = Field(
+    user: str | None = None
+    tools: list[Tool] | None = Field(default=None, examples=[None])
+    tool_choice: ToolChoice | Literal["auto", "required", "none"] = Field(
         default="auto", examples=["none"]
     )  # noqa
     return_hidden_states: bool = False
@@ -422,47 +421,48 @@ class ChatCompletionRequest(BaseModel):
     top_k: int = -1
     min_p: float = 0.0
     min_tokens: int = 0
-    regex: Optional[str] = None
-    ebnf: Optional[str] = None
+    regex: str | None = None
+    ebnf: str | None = None
     repetition_penalty: float = 1.0
-    stop_token_ids: Optional[List[int]] = None
+    stop_token_ids: list[int] | None = None
     no_stop_trim: bool = False
     ignore_eos: bool = False
     continue_final_message: bool = False
     skip_special_tokens: bool = True
-    lora_path: Optional[Union[List[Optional[str]], Optional[str]]] = None
-    session_params: Optional[Dict] = None
+    lora_path: list[str | None] | str | None | None = None
+    session_params: dict | None = None
     separate_reasoning: bool = True
     stream_reasoning: bool = True
-    chat_template_kwargs: Optional[Dict] = None
+    chat_template_kwargs: dict | None = None
 
     # For request id
-    rid: Optional[Union[List[str], str]] = None
+    rid: list[str] | str | None = None
 
     # For PD disaggregation
-    bootstrap_host: Optional[str] = None
-    bootstrap_port: Optional[int] = None
-    bootstrap_room: Optional[int] = None
+    bootstrap_host: str | None = None
+    bootstrap_port: int | None = None
+    bootstrap_room: int | None = None
 
 
 class ChatMessage(BaseModel):
-    role: Optional[str] = None
-    content: Optional[str] = None
-    reasoning_content: Optional[str] = None
-    tool_calls: Optional[List[ToolCall]] = Field(default=None, examples=[None])
+    role: str | None = None
+    content: str | None = None
+    reasoning_content: str | None = None
+    tool_calls: list[ToolCall] | None = Field(default=None, examples=[None])
 
 
 class ChatCompletionResponseChoice(BaseModel):
     index: int
     message: ChatMessage
-    logprobs: Optional[Union[LogProbs, ChoiceLogprobs]] = None
-    finish_reason: Optional[
+    logprobs: LogProbs | ChoiceLogprobs | None = None
+    finish_reason: (
         Literal[
             "stop", "length", "tool_calls", "content_filter", "function_call", "abort"
         ]
-    ] = None
-    matched_stop: Union[None, int, str] = None
-    hidden_states: Optional[object] = None
+        | None
+    ) = None
+    matched_stop: None | int | str = None
+    hidden_states: object | None = None
 
     # @model_serializer(mode="wrap")  # Not available in pydantic v1
     # def _serialize(self, handler):
@@ -477,16 +477,16 @@ class ChatCompletionResponse(BaseModel):
     object: str = "chat.completion"
     created: int = Field(default_factory=lambda: int(time.time()))
     model: str
-    choices: List[ChatCompletionResponseChoice]
+    choices: list[ChatCompletionResponseChoice]
     usage: UsageInfo
 
 
 class DeltaMessage(BaseModel):
-    role: Optional[str] = None
-    content: Optional[str] = None
-    reasoning_content: Optional[str] = None
-    tool_calls: Optional[List[ToolCall]] = Field(default=None, examples=[None])
-    hidden_states: Optional[object] = None
+    role: str | None = None
+    content: str | None = None
+    reasoning_content: str | None = None
+    tool_calls: list[ToolCall] | None = Field(default=None, examples=[None])
+    hidden_states: object | None = None
 
     # @model_serializer(mode="wrap")  # Not available in pydantic v1
     # def _serialize(self, handler):
@@ -499,13 +499,14 @@ class DeltaMessage(BaseModel):
 class ChatCompletionResponseStreamChoice(BaseModel):
     index: int
     delta: DeltaMessage
-    logprobs: Optional[Union[LogProbs, ChoiceLogprobs]] = None
-    finish_reason: Optional[
+    logprobs: LogProbs | ChoiceLogprobs | None = None
+    finish_reason: (
         Literal[
             "stop", "length", "tool_calls", "content_filter", "function_call", "abort"
         ]
-    ] = None
-    matched_stop: Union[None, int, str] = None
+        | None
+    ) = None
+    matched_stop: None | int | str = None
 
 
 class ChatCompletionStreamResponse(BaseModel):
@@ -513,18 +514,18 @@ class ChatCompletionStreamResponse(BaseModel):
     object: str = "chat.completion.chunk"
     created: int = Field(default_factory=lambda: int(time.time()))
     model: str
-    choices: List[ChatCompletionResponseStreamChoice]
-    usage: Optional[UsageInfo] = None
+    choices: list[ChatCompletionResponseStreamChoice]
+    usage: UsageInfo | None = None
 
 
 class MultimodalEmbeddingInput(BaseModel):
-    text: Optional[str] = None
-    image: Optional[str] = None
+    text: str | None = None
+    image: str | None = None
 
 
-EmbeddingInput = Union[
-    List[int], List[List[int]], str, List[str], List[MultimodalEmbeddingInput]
-]
+EmbeddingInput = (
+    list[int] | list[list[int]] | str | list[str] | list[MultimodalEmbeddingInput]
+)
 
 
 class EmbeddingRequest(BaseModel):
@@ -533,69 +534,65 @@ class EmbeddingRequest(BaseModel):
     input: EmbeddingInput
     model: str
     encoding_format: str = "float"
-    dimensions: Optional[int] = None
-    user: Optional[str] = None
+    dimensions: int | None = None
+    user: str | None = None
 
     # The request id.
-    rid: Optional[Union[List[str], str]] = None
+    rid: list[str] | str | None = None
 
 
 class EmbeddingObject(BaseModel):
-    embedding: List[float]
+    embedding: list[float]
     index: int
     object: str = "embedding"
 
 
 class EmbeddingResponse(BaseModel):
-    data: List[EmbeddingObject]
+    data: list[EmbeddingObject]
     model: str
     object: str = "list"
-    usage: Optional[UsageInfo] = None
+    usage: UsageInfo | None = None
 
 
 class ScoringRequest(BaseModel):
-    query: Optional[Union[str, List[int]]] = (
-        None  # Query text or pre-tokenized token IDs
-    )
-    items: Optional[Union[str, List[str], List[List[int]]]] = (
+    query: str | list[int] | None = None  # Query text or pre-tokenized token IDs
+    items: str | list[str] | list[list[int]] | None = (
         None  # Item text(s) or pre-tokenized token IDs
     )
-    label_token_ids: Optional[List[int]] = (
-        None  # Token IDs to compute probabilities for
-    )
+    label_token_ids: list[int] | None = None  # Token IDs to compute probabilities for
     apply_softmax: bool = False
     item_first: bool = False
     model: str
 
 
 class ScoringResponse(BaseModel):
-    scores: List[
-        List[float]
+    scores: list[
+        list[float]
     ]  # List of lists of probabilities, each in the order of label_token_ids
     model: str
-    usage: Optional[UsageInfo] = None
+    usage: UsageInfo | None = None
     object: str = "scoring"
 
 
 class V1RerankReqInput(BaseModel):
     query: str
-    documents: List[str]
+    documents: list[str]
 
 
 class RerankResponse(BaseModel):
     score: float
     document: str
     index: int
-    meta_info: Optional[dict] = None
+    meta_info: dict | None = None
 
 
-OpenAIServingRequest = Union[
-    ChatCompletionRequest,
-    CompletionRequest,
-    EmbeddingRequest,
-    ScoringRequest,
-    V1RerankReqInput,
-]
+OpenAIServingRequest = (
+    ChatCompletionRequest
+    | CompletionRequest
+    | EmbeddingRequest
+    | ScoringRequest
+    | V1RerankReqInput
+)
 
 
 @dataclass
@@ -617,10 +614,10 @@ class MessageProcessingResult:
     """
 
     prompt: str
-    prompt_ids: Union[str, List[int]]
-    image_data: Optional[Any]
-    audio_data: Optional[Any]
-    video_data: Optional[Any]
-    modalities: List[str]
-    stop: List[str]
-    tool_call_constraint: Optional[Any] = None
+    prompt_ids: str | list[int]
+    image_data: Any | None
+    audio_data: Any | None
+    video_data: Any | None
+    modalities: list[str]
+    stop: list[str]
+    tool_call_constraint: Any | None = None

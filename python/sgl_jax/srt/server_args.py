@@ -6,7 +6,6 @@ import json
 import logging
 import os
 import tempfile
-from typing import List, Optional
 
 import jax
 
@@ -25,36 +24,36 @@ logger = logging.getLogger(__name__)
 class ServerArgs:
     # Model and tokenizer
     model_path: str
-    tokenizer_path: Optional[str] = None
+    tokenizer_path: str | None = None
     tokenizer_mode: str = "auto"
     skip_tokenizer_init: bool = False
     load_format: str = "auto"
     model_loader_extra_config: str = "{}"
     trust_remote_code: bool = False
-    context_length: Optional[int] = None
+    context_length: int | None = None
     is_embedding: bool = False
-    revision: Optional[str] = None
+    revision: str | None = None
     model_impl: str = "auto"
-    model_layer_nums: Optional[int] = None
+    model_layer_nums: int | None = None
 
     # HTTP server
     host: str = "127.0.0.1"
     port: int = 30000
     skip_server_warmup: bool = False
-    warmups: Optional[str] = None
+    warmups: str | None = None
 
     # Quantization and data type
     dtype: str = "auto"
-    quantization: Optional[str] = None
-    quantization_param_path: Optional[str] = None
+    quantization: str | None = None
+    quantization_param_path: str | None = None
     kv_cache_dtype: str = "auto"
 
     # Memory and scheduling
-    mem_fraction_static: Optional[float] = None
-    max_running_requests: Optional[int] = None
-    max_total_tokens: Optional[int] = None
+    mem_fraction_static: float | None = None
+    max_running_requests: int | None = None
+    max_total_tokens: int | None = None
     max_prefill_tokens: int = 16384
-    chunked_prefill_size: Optional[int] = None
+    chunked_prefill_size: int | None = None
     enable_mixed_chunk: bool = False
     schedule_policy: str = "fcfs"
     schedule_conservativeness: float = 1.0
@@ -63,15 +62,15 @@ class ServerArgs:
     disable_hybrid_swa_memory: bool = False
 
     # Runtime options
-    device: Optional[str] = None
+    device: str | None = None
     tp_size: int = 1
     stream_interval: int = 1
     stream_output: bool = False
-    random_seed: Optional[int] = None
-    constrained_json_whitespace_pattern: Optional[str] = None
+    random_seed: int | None = None
+    constrained_json_whitespace_pattern: str | None = None
     watchdog_timeout: float = 300
-    dist_timeout: Optional[int] = None  # timeout for distributed initialization
-    download_dir: Optional[str] = None
+    dist_timeout: int | None = None  # timeout for distributed initialization
+    download_dir: str | None = None
     sleep_on_idle: bool = False
 
     # Data parallel
@@ -79,34 +78,34 @@ class ServerArgs:
 
     # Logging
     log_level: str = "info"
-    log_level_http: Optional[str] = None
+    log_level_http: str | None = None
     log_requests: bool = False
     log_requests_level: int = 0
-    crash_dump_folder: Optional[str] = None
+    crash_dump_folder: str | None = None
     show_time_cost: bool = False
-    bucket_time_to_first_token: Optional[List[float]] = None
-    bucket_inter_token_latency: Optional[List[float]] = None
-    bucket_e2e_request_latency: Optional[List[float]] = None
+    bucket_time_to_first_token: list[float] | None = None
+    bucket_inter_token_latency: list[float] | None = None
+    bucket_e2e_request_latency: list[float] | None = None
     decode_log_interval: int = 40
     enable_request_time_stats_logging: bool = False
-    kv_events_config: Optional[str] = None
+    kv_events_config: str | None = None
 
     # API related
-    api_key: Optional[str] = None
-    served_model_name: Optional[str] = None
+    api_key: str | None = None
+    served_model_name: str | None = None
     file_storage_path: str = "sglang_storage"
     enable_cache_report: bool = False
-    reasoning_parser: Optional[str] = None
-    tool_call_parser: Optional[str] = None
+    reasoning_parser: str | None = None
+    tool_call_parser: str | None = None
 
     # Multi-node distributed serving
-    dist_init_addr: Optional[str] = None
+    dist_init_addr: str | None = None
     nnodes: int = 1
     node_rank: int = 0
 
     # Model override args in JSON
     json_model_override_args: str = "{}"
-    preferred_sampling_params: Optional[str] = None
+    preferred_sampling_params: str | None = None
 
     # Optimization/debug options
     disable_radix_cache: bool = False
@@ -121,12 +120,12 @@ class ServerArgs:
 
     xla_backend: str = "tpu"
     # Kernel backend
-    attention_backend: Optional[str] = "fa"
+    attention_backend: str | None = "fa"
 
     max_seq_len: int = 4096
 
-    precompile_token_paddings: Optional[List[int]] = None
-    precompile_bs_paddings: Optional[List[int]] = None
+    precompile_token_paddings: list[int] | None = None
+    precompile_bs_paddings: list[int] | None = None
 
     disable_jax_precompile: bool = False
 
@@ -178,14 +177,13 @@ class ServerArgs:
         if is_remote_url(self.model_path):
             self.load_format = "remote"
 
-        if self.enable_precision_tracer:
-            if self.chunked_prefill_size is not None or self.chunked_prefill_size > 0:
-                logger.warning(
-                    "Chunked prefill is enabled, but precision tracer is also enabled. "
-                    "This may cause incorrect precision tracer results."
-                    "Disabling chunked prefill."
-                )
-                self.chunked_prefill_size = -1
+        if self.enable_precision_tracer and (
+            self.chunked_prefill_size is not None or self.chunked_prefill_size > 0
+        ):
+            logger.warning(
+                "Chunked prefill is enabled, but precision tracer is also enabled. This may cause incorrect precision tracer results. Disabling chunked prefill."
+            )
+            self.chunked_prefill_size = -1
 
         os.environ["SGLANG_ENABLE_DETERMINISTIC_SAMPLING"] = (
             "1" if self.enable_deterministic_sampling else "0"
@@ -815,7 +813,7 @@ class ServerArgs:
             ), "chunked_prefill_size must be divisible by page_size"
 
 
-def prepare_server_args(argv: List[str]) -> ServerArgs:
+def prepare_server_args(argv: list[str]) -> ServerArgs:
     """
     Prepare the server arguments from the command line arguments.
 
@@ -857,7 +855,7 @@ class PortArgs:
     metrics_ipc_name: str
 
     @staticmethod
-    def init_new(server_args, dp_rank: Optional[int] = None) -> "PortArgs":
+    def init_new(server_args, dp_rank: int | None = None) -> "PortArgs":
         if server_args.nnodes > 1:
             dist_init_addr = server_args.dist_init_addr.split(":")
             dist_init_host, dist_init_port = dist_init_addr

@@ -9,7 +9,6 @@ https://arxiv.org/abs/2210.03057 reference: https://github.com/google-research/u
 
 import re
 import urllib
-from typing import Optional
 
 from sgl_jax.test import simple_eval_common as common
 from sgl_jax.test.simple_eval_common import (
@@ -139,7 +138,7 @@ class MGSMEval(Eval):
         self,
         num_examples_per_lang: int = 250,  # restrict to a subset of the data for debugging
         num_threads: int = 64,
-        languages: Optional[list[str]] = ALL_LANGUAGES,
+        languages: list[str] | None = ALL_LANGUAGES,
     ):
         if languages is None:
             languages = ALL_LANGUAGES

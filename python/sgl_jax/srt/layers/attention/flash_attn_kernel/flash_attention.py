@@ -460,7 +460,7 @@ def _ragged_paged_attention_kernel(
         old_seq_idx = bo_ids_ref[bo_sem_idx]
         old_bo_idx = bo_ids_ref[bo_sem_idx + 2]
 
-        @pl.when(jnp.logical_and(0 <= old_seq_idx, old_seq_idx <= seq_idx))
+        @pl.when(jnp.logical_and(old_seq_idx >= 0, old_seq_idx <= seq_idx))
         def _():
             _send_bo(old_seq_idx, old_bo_idx, bo_sem_idx, wait=True)
 
@@ -989,8 +989,7 @@ def static_validate_inputs_fused(
 
     if actual_num_q_heads % actual_num_kv_heads != 0:
         raise ValueError(
-            f"Expected {actual_num_q_heads=} to be divisible by"
-            f" {actual_num_kv_heads=}."
+            f"Expected {actual_num_q_heads=} to be divisible by {actual_num_kv_heads=}."
         )
 
     # Validate fused KV cache
@@ -1039,8 +1038,7 @@ def static_validate_inputs_fused(
 
     if not (len(kv_lens.shape) == len(page_indices.shape) == len(cu_q_lens.shape) == 1):
         raise ValueError(
-            f"Expected 1D array for {kv_lens.shape=}, {page_indices.shape=},"
-            f" {cu_q_lens.shape=}"
+            f"Expected 1D array for {kv_lens.shape=}, {page_indices.shape=}, {cu_q_lens.shape=}"
         )
 
     max_num_seqs = kv_lens.shape[0]
@@ -1057,12 +1055,10 @@ def static_validate_inputs_fused(
         raise ValueError(f"{soft_cap=} must not be 0.0.")
     if chunk_prefill_size is not None and chunk_prefill_size <= 0:
         raise ValueError(f"{chunk_prefill_size=} must be positive.")
-    if num_kv_pages_per_block is not None:
-        if num_kv_pages_per_block <= 0:
-            raise ValueError(f"{num_kv_pages_per_block=} must be positive.")
-    if num_queries_per_block is not None:
-        if num_queries_per_block <= 0:
-            raise ValueError(f"{num_queries_per_block=} must be positive.")
+    if num_kv_pages_per_block is not None and num_kv_pages_per_block <= 0:
+        raise ValueError(f"{num_kv_pages_per_block=} must be positive.")
+    if num_queries_per_block is not None and num_queries_per_block <= 0:
+        raise ValueError(f"{num_queries_per_block=} must be positive.")
     if vmem_limit_bytes is not None and vmem_limit_bytes <= 0:
         raise ValueError(f"{vmem_limit_bytes=} must be positive.")
 

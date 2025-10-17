@@ -11,7 +11,6 @@ import os
 import time
 from argparse import ArgumentParser
 from pathlib import Path
-from typing import List, Optional
 
 import requests
 
@@ -19,11 +18,11 @@ PARENT_FOLDER = "/tmp/sglang-profile"
 
 
 def _run_profile(
-    url: Optional[str],
+    url: str | None,
     num_steps: int,
-    activities: List[str],
-    output_dir: Optional[str] = None,
-    profile_name: Optional[str] = None,
+    activities: list[str],
+    output_dir: str | None = None,
+    profile_name: str | None = None,
     profile_by_stage: bool = False,
 ) -> str:
     if output_dir is None:
@@ -70,11 +69,11 @@ def _run_profile(
 
 
 def run_profile(
-    url: Optional[str],
+    url: str | None,
     num_steps: int,
-    activities: List[str],
-    output_dir: Optional[str] = None,
-    profile_name: Optional[str] = None,
+    activities: list[str],
+    output_dir: str | None = None,
+    profile_name: str | None = None,
     profile_by_stage: bool = False,
 ):
     # step based profile will self terminate on num_steps constraints

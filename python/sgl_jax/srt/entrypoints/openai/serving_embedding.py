@@ -1,4 +1,4 @@
-from typing import Any, Dict, List, Optional, Union
+from typing import Any
 
 from fastapi import Request
 from fastapi.responses import ORJSONResponse
@@ -31,7 +31,7 @@ class OpenAIServingEmbedding(OpenAIServingBase):
     def _request_id_prefix(self) -> str:
         return "embd-"
 
-    def _validate_request(self, request: EmbeddingRequest) -> Optional[str]:
+    def _validate_request(self, request: EmbeddingRequest) -> str | None:
         """Validate that the input is not empty or whitespace only."""
         if not (input := request.input):
             return "Input cannot be empty"
@@ -130,7 +130,7 @@ class OpenAIServingEmbedding(OpenAIServingBase):
         adapted_request: EmbeddingReqInput,
         request: EmbeddingRequest,
         raw_request: Request,
-    ) -> Union[EmbeddingResponse, ErrorResponse, ORJSONResponse]:
+    ) -> EmbeddingResponse | ErrorResponse | ORJSONResponse:
         """Handle the embedding request"""
         try:
             ret = await self.tokenizer_manager.generate_request(
@@ -145,7 +145,7 @@ class OpenAIServingEmbedding(OpenAIServingBase):
         response = self._build_embedding_response(ret)
         return response
 
-    def _build_embedding_response(self, ret: List[Dict[str, Any]]) -> EmbeddingResponse:
+    def _build_embedding_response(self, ret: list[dict[str, Any]]) -> EmbeddingResponse:
         """Build the embedding response"""
         embedding_objects = []
         prompt_tokens = 0

@@ -85,7 +85,7 @@ class TestEvalAccuracyLarge(CustomTestCase):
         metrics = run_eval(args)
 
         if is_in_ci():
-            write_github_step_summary(f"### test_mmlu\n" f'{metrics["score"]=:.4f}\n')
+            write_github_step_summary(f'### test_mmlu\n{metrics["score"]=:.4f}\n')
         print("mmlu metrics", metrics)
 
         self.assertGreater(metrics["score"], 0.43)
@@ -120,9 +120,7 @@ class TestEvalAccuracyLarge(CustomTestCase):
         metrics = run_eval(args)
 
         if is_in_ci():
-            write_github_step_summary(
-                f"### test_mgsm_en\n" f'{metrics["score"]=:.4f}\n'
-            )
+            write_github_step_summary(f'### test_mgsm_en\n{metrics["score"]=:.4f}\n')
         print("mgsm en metrics", metrics)
         self.assertGreater(metrics["score"], 0.4)
 

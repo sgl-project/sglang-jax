@@ -6,7 +6,7 @@ import time
 from collections import defaultdict
 from dataclasses import dataclass, field
 from multiprocessing.pool import ThreadPool
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any
 
 import httpx
 import jinja2
@@ -23,8 +23,8 @@ OPENAI_SYSTEM_MESSAGE_CHATGPT = (
 )
 
 
-Message = Dict[str, Any]  # keys role, content
-MessageList = List[Message]
+Message = dict[str, Any]  # keys role, content
+MessageList = list[Message]
 
 
 class SamplerBase:
@@ -43,10 +43,10 @@ class EvalResult:
     Result of running an evaluation (usually consisting of many samples)
     """
 
-    score: Optional[float]  # top-line metric
-    metrics: Optional[Dict[str, float]]  # other metrics
-    htmls: List[str]  # strings of valid HTML
-    convos: List[MessageList]  # sampled conversations
+    score: float | None  # top-line metric
+    metrics: dict[str, float] | None  # other metrics
+    htmls: list[str]  # strings of valid HTML
+    convos: list[MessageList]  # sampled conversations
 
 
 @dataclass
@@ -55,10 +55,10 @@ class SingleEvalResult:
     Result of evaluating a single sample
     """
 
-    score: Optional[float]
-    metrics: Dict[str, float] = field(default_factory=dict)
-    html: Optional[str] = None
-    convo: Optional[MessageList] = None  # sampled conversation
+    score: float | None
+    metrics: dict[str, float] = field(default_factory=dict)
+    html: str | None = None
+    convo: MessageList | None = None  # sampled conversation
 
 
 class Eval:
@@ -88,8 +88,8 @@ class ChatCompletionSampler(SamplerBase):
     def __init__(
         self,
         base_url: str = None,
-        model: Optional[str] = None,
-        system_message: Optional[str] = None,
+        model: str | None = None,
+        system_message: str | None = None,
         temperature: float = 0.0,
         max_tokens: int = 2048,
     ):
@@ -269,9 +269,9 @@ def _compute_stat(values: list, stat: str):
 
 
 def aggregate_results(
-    single_eval_results: List[SingleEvalResult],
-    default_stats: Tuple[str] = ("mean", "std"),
-    name2stats: Optional[Dict[str, Tuple[str]]] = None,
+    single_eval_results: list[SingleEvalResult],
+    default_stats: tuple[str] = ("mean", "std"),
+    name2stats: dict[str, tuple[str]] | None = None,
 ) -> EvalResult:
     """
     Aggregate results from multiple evaluations into a single EvalResult.
@@ -301,11 +301,11 @@ def aggregate_results(
     )
 
 
-def map_with_progress(f: callable, xs: List[Any], num_threads: int):
+def map_with_progress(f: callable, xs: list[Any], num_threads: int):
     """
     Apply f to each element of xs, using a ThreadPool, and show progress.
     """
-    if os.getenv("debug"):
+    if os.getenv("DEBUG"):
         return list(map(f, tqdm(xs, total=len(xs))))
     else:
         with ThreadPool(min(num_threads, len(xs))) as pool:
@@ -421,7 +421,7 @@ def make_report(eval_result: EvalResult) -> str:
     )
 
 
-def make_report_from_example_htmls(htmls: List[str]):
+def make_report_from_example_htmls(htmls: list[str]):
     """
     Create a standalone HTML report from a list of example htmls
     """
@@ -439,20 +439,23 @@ def download_dataset(path, url):
         total_size = int(response.headers.get("content-length", 0))
         block_size = 8192
 
-        with open(path, "wb") as f, tqdm(
-            desc="Downloading",
-            total=total_size,
-            unit="iB",
-            unit_scale=True,
-            unit_divisor=1024,
-        ) as progress_bar:
+        with (
+            open(path, "wb") as f,
+            tqdm(
+                desc="Downloading",
+                total=total_size,
+                unit="iB",
+                unit_scale=True,
+                unit_divisor=1024,
+            ) as progress_bar,
+        ):
             for data in response.iter_content(block_size):
                 size = f.write(data)
                 progress_bar.update(size)
 
         print(f"Dataset downloaded and saved to {path}")
     except requests.RequestException as e:
-        raise Exception(f"Failed to download dataset: {e}")
+        raise Exception(f"Failed to download dataset: {e}") from e
 
 
 def set_ulimit(target_soft_limit=65535):

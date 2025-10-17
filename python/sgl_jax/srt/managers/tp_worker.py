@@ -4,7 +4,6 @@ import itertools
 import logging
 import threading
 import time
-from typing import Optional, Tuple, Union
 
 import jax
 import jax.numpy as jnp
@@ -46,7 +45,7 @@ class ModelWorker:
         self,
         server_args: ServerArgs,
         mesh: jax.sharding.Mesh,
-        req_to_token_pool: Optional[ReqToTokenPool] = None,
+        req_to_token_pool: ReqToTokenPool | None = None,
     ):
         # Parse args
         self.tp_size = server_args.tp_size
@@ -62,14 +61,11 @@ class ModelWorker:
 
         # Sync random seed across TP workers
         # Each process may have different random_seed. After broadcast, all processes will have the same random_seed.
-        # self.random_seed = broadcast_one_to_all(server_args.random_seed).item()
         if server_args.random_seed is None:
             with jax.default_device(jax.local_devices()[0]):
-                if jax.process_index() == 0:
-                    seed_to_broadcast = server_args.random_seed
-                else:
-                    seed_to_broadcast = 0
-
+                seed_to_broadcast = (
+                    server_args.random_seed if jax.process_index() == 0 else 0
+                )
                 self.random_seed = broadcast_one_to_all(seed_to_broadcast).item()
         else:
             self.random_seed = server_args.random_seed
@@ -108,13 +104,22 @@ class ModelWorker:
         # Log each constraint for debugging
         logger.info("Max running requests constraints:")
         logger.info(
-            f"  - Server limit: {server_limit} {'(max_total_tokens//2)' if server_args.max_running_requests is None else '(configured)'}"
+            "  - Server limit: %s %s",
+            server_limit,
+            (
+                "(max_total_tokens//2)"
+                if server_args.max_running_requests is None
+                else "(configured)"
+            ),
         )
-        logger.info(f"  - Token pool size: {pool_limit}")
+        logger.info("  - Token pool size: %s", pool_limit)
         logger.info(
-            f"  - Attention backend: {attn_backend_limit} (context_len={self.model_config.context_len}, page_size={self.page_size})"
+            "  - Attention backend: %s (context_len=%s, page_size=%s)",
+            attn_backend_limit,
+            self.model_config.context_len,
+            self.page_size,
         )
-        logger.info(f"  → Final max_running_requests: {self.max_running_requests}")
+        logger.info("  → Final max_running_requests: %s", self.max_running_requests)
         assert self.max_running_requests > 0, "max_running_request is zero"
 
         self.max_req_len = min(
@@ -198,7 +203,9 @@ class ModelWorker:
     def precompile_extend(self, future_token_ids_map=None):
         start_time = time.perf_counter()
         logger.info(
-            f"[EXTEND] Begin to precompile bs_paddings={self.precompile_bs_paddings[-1:]} token_paddings={self.precompile_token_paddings}"
+            "[EXTEND] Begin to precompile bs_paddings=%s token_paddings=%s",
+            self.precompile_bs_paddings[-1:],
+            self.precompile_token_paddings,
         )
 
         bs, _ = self.get_max_padded_size()
@@ -210,7 +217,9 @@ class ModelWorker:
                 bs, num_tokens = pair[0], pair[1]
                 pbar.set_postfix(bs=bs, tokens=num_tokens)
                 if bs > num_tokens:
-                    logger.warning(f"{bs=} > {num_tokens=}, skip this pair")
+                    logger.warning(
+                        "bs=%s > num_tokens=%s, skip this pair", bs, num_tokens
+                    )
                     continue
                 model_worker_batch = self.generate_model_worker_batch(
                     bs,
@@ -241,7 +250,8 @@ class ModelWorker:
     def precompile_decode(self, future_token_ids_map=None):
         start_time = time.perf_counter()
         logger.info(
-            f"[DECODE] Begin to precompile bs_paddings={self.precompile_bs_paddings}"
+            "[DECODE] Begin to precompile bs_paddings=%s",
+            self.precompile_bs_paddings,
         )
 
         with tqdm(
@@ -287,7 +297,8 @@ class ModelWorker:
         """Precompile penalty application for different batch sizes and penalty combinations."""
         start_time = time.perf_counter()
         logger.info(
-            f"[PENALTIES] Begin to precompile penalty applications bs_paddings={self.precompile_bs_paddings}"
+            "[PENALTIES] Begin to precompile penalty applications bs_paddings=%s",
+            self.precompile_bs_paddings,
         )
 
         with tqdm(
@@ -460,11 +471,11 @@ class ModelWorker:
     def forward_batch_generation(
         self,
         model_worker_batch: ModelWorkerBatch,
-        launch_done: Optional[threading.Event] = None,
+        launch_done: threading.Event | None = None,
         skip_sample: bool = False,
         sampling_metadata: SamplingMetadata = None,
         forward_metadata=None,
-    ) -> Tuple[Union[LogitsProcessorOutput, jax.Array, int], Optional[jax.Array]]:
+    ) -> tuple[LogitsProcessorOutput | jax.Array | int, jax.Array | None]:
         # Use pre-initialized ForwardBatch if available (for overlap scheduling optimization)
         if model_worker_batch.forward_batch is not None:
             forward_batch = model_worker_batch.forward_batch
@@ -606,10 +617,10 @@ class MockModelWorker:
     def forward_batch_generation(
         self,
         _model_worker_batch: ModelWorkerBatch,
-        _launch_done: Optional[threading.Event] = None,
+        _launch_done: threading.Event | None = None,
         _skip_sample: bool = False,
-        _sampling_metadata: Optional[SamplingMetadata] = None,
-    ) -> Tuple[Union[LogitsProcessorOutput, jax.Array], Optional[jax.Array]]:
+        _sampling_metadata: SamplingMetadata | None = None,
+    ) -> tuple[LogitsProcessorOutput | jax.Array, jax.Array | None]:
         return (
             LogitsProcessorOutput(
                 next_token_logits=jnp.array([0, 1]),
