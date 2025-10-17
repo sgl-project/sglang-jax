@@ -37,7 +37,7 @@ jobs:
       - name: Run test
         timeout-minutes: 120
         run: |
-          uv venv && uv pip install -e python/
+          uv venv --python 3.12 && source .venv/bin/activate && uv pip install -e python/
           bash scripts/killall_sglang.sh
           uv run python test/srt/run_suite.py --suite per-commit-tpu-v6e-1
 
@@ -52,7 +52,7 @@ jobs:
       - name: Run test
         timeout-minutes: 120
         run: |
-          uv venv && uv pip install -e python/
+          uv venv --python 3.12 && source .venv/bin/activate && uv pip install -e python/
           bash scripts/killall_sglang.sh
           uv run python test/srt/run_suite.py --suite per-commit-tpu-v6e-4
 

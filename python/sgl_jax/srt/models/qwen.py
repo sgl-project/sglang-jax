@@ -251,15 +251,17 @@ class QWenModel(nnx.Module):
             param_dtype=dtype,
         )
 
-        self.h = [
-            QWenBlock(
-                config,
-                layer_id=i,
-                dtype=dtype,
-                rngs=rngs,
-            )
-            for i in range(config.num_hidden_layers)
-        ]
+        self.h = nnx.data(
+            [
+                QWenBlock(
+                    config,
+                    layer_id=i,
+                    dtype=dtype,
+                    rngs=rngs,
+                )
+                for i in range(config.num_hidden_layers)
+            ]
+        )
 
         self.ln_f = nnx.RMSNorm(
             config.hidden_size,

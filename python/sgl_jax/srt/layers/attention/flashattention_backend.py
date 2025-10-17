@@ -4,6 +4,7 @@ from typing import Tuple
 import jax
 import jax.numpy as jnp
 import numpy as np
+from flax import nnx
 from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 from jax.tree_util import register_pytree_node_class
@@ -63,7 +64,6 @@ class FlashAttentionMetadata:
         return obj
 
 
-@register_pytree_node_class
 @dataclass
 class FlashAttention(AttentionBackend):
     """Native Attention layer for variable-length sequences using ForwardBatch."""
@@ -87,7 +87,7 @@ class FlashAttention(AttentionBackend):
         self.head_dim = head_dim
         self.page_size = page_size
         self.kv_partition_axis = kv_partition_axis
-        self.forward_metadata = FlashAttentionMetadata()
+        self.forward_metadata = nnx.data(FlashAttentionMetadata())
         self.mesh = mesh
 
     def get_forward_metadata(self, batch: ModelWorkerBatch):
