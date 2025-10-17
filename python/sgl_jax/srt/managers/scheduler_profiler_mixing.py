@@ -55,9 +55,7 @@ class SchedulerProfilerMixin:
         if num_steps:
             self.profile_steps = num_steps
             if start_step:
-                self.profiler_target_forward_ct = (
-                    self.profiler_start_forward_ct + num_steps
-                )
+                self.profiler_target_forward_ct = self.profiler_start_forward_ct + num_steps
             else:
                 self.profiler_target_forward_ct = self.forward_ct + num_steps
         else:
@@ -111,18 +109,10 @@ class SchedulerProfilerMixin:
         return ProfileReqOutput(success=True, message="Succeeded.")
 
     def _profile_batch_predicate(self, batch):
-        if (
-            self.profiler_target_forward_ct
-            and self.profiler_target_forward_ct <= self.forward_ct
-        ):
+        if self.profiler_target_forward_ct and self.profiler_target_forward_ct <= self.forward_ct:
             self.stop_profile()
-        if (
-            self.profiler_start_forward_ct
-            and self.profiler_start_forward_ct == self.forward_ct
-        ):
-            self.start_profile(
-                self.profiler_output_dir, None, self.profile_steps, self.profile_id
-            )
+        if self.profiler_start_forward_ct and self.profiler_start_forward_ct == self.forward_ct:
+            self.start_profile(self.profiler_output_dir, None, self.profile_steps, self.profile_id)
 
     def profile(self, recv_req: ProfileReq):
         if recv_req.type == ProfileReqType.START_PROFILE:

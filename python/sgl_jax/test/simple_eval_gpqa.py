@@ -38,9 +38,7 @@ class GPQAEval(Eval):
             assert n_repeats == 1, "n_repeats only supported for num_examples"
             examples = rng.sample(examples, num_examples)
         examples = examples * n_repeats
-        examples = [
-            example | {"permutation": rng.sample(range(4), 4)} for example in examples
-        ]
+        examples = [example | {"permutation": rng.sample(range(4), 4)} for example in examples]
         self.examples = examples
         self.n_repeats = n_repeats
         self.num_threads = num_threads

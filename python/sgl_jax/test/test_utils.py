@@ -83,9 +83,7 @@ def create_device_mesh(
     return mesh
 
 
-def fill_unspecified_parallelism(
-    parallelism: Sequence[int], num_devices: int
-) -> Sequence[int]:
+def fill_unspecified_parallelism(parallelism: Sequence[int], num_devices: int) -> Sequence[int]:
     if -1 not in parallelism:
         return parallelism
 
@@ -126,9 +124,7 @@ def jax_trace_context(log_dir: str):
 
 class CustomTestCase(unittest.TestCase):
     def _callTestMethod(self, method):
-        max_retry = int(
-            os.environ.get("SGLANG_TEST_MAX_RETRY", "1" if is_in_ci() else "0")
-        )
+        max_retry = int(os.environ.get("SGLANG_TEST_MAX_RETRY", "1" if is_in_ci() else "0"))
         retry(
             lambda: super(CustomTestCase, self)._callTestMethod(method),
             max_retry=max_retry,
@@ -562,9 +558,7 @@ def run_bench_one_batch(model, other_args):
         # Return prefill_latency, decode_throughput, decode_latency
         prefill_line = output.split("\n")[-9]
         decode_line = output.split("\n")[-3]
-        pattern = (
-            r"latency: (?P<latency>\d+\.\d+).*?throughput:\s*(?P<throughput>\d+\.\d+)"
-        )
+        pattern = r"latency: (?P<latency>\d+\.\d+).*?throughput:\s*(?P<throughput>\d+\.\d+)"
         match = re.search(pattern, prefill_line)
         if match:
             prefill_latency = float(match.group("latency"))
@@ -714,9 +708,7 @@ def calculate_rouge_l(output_strs_list1, output_strs_list2):
         precision = lcs_len / len(s1) if len(s1) > 0 else 0
         recall = lcs_len / len(s2) if len(s2) > 0 else 0
         fmeasure = (
-            (2 * precision * recall) / (precision + recall)
-            if precision + recall > 0
-            else 0.0
+            (2 * precision * recall) / (precision + recall) if precision + recall > 0 else 0.0
         )
         rouge_l_scores.append(fmeasure)
 

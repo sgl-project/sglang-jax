@@ -85,9 +85,7 @@ def create_qkv_cache(
 def write_prefix_tokens_for_kv(forward_batch, token_to_kv_pool: KVCache, lens, k, v):
     page_size = forward_batch.attn_backend.page_size
     # Use aligned positions for k/v indexing since k/v arrays are created with alignment gaps
-    aligned_seq_lens = (
-        (forward_batch.seq_lens + page_size - 1) // page_size
-    ) * page_size
+    aligned_seq_lens = ((forward_batch.seq_lens + page_size - 1) // page_size) * page_size
     aligned_cache_loc_idx = jnp.concatenate(
         [jnp.array([0], dtype=jnp.int32), jnp.cumsum(aligned_seq_lens)]
     )
@@ -172,9 +170,7 @@ def create_test_data(
 
     for i, (_, kv_len) in enumerate(lens):
         # Create token indices for this sequence based on actual k/v storage position
-        seq_token_indices = list(
-            range(current_aligned_pos, current_aligned_pos + kv_len)
-        )
+        seq_token_indices = list(range(current_aligned_pos, current_aligned_pos + kv_len))
         # Apply alignment padding to this sequence
         aligned_seq_indices = align_to_size(seq_token_indices, page_size, 0)
         cache_loc_flat.extend(aligned_seq_indices)
@@ -338,9 +334,7 @@ class TestAttention(CustomTestCase):
         padding_size = 4096
         cache_loc_list = []
 
-        aligned_seq_lens = (
-            (forward_batch.seq_lens + page_size - 1) // page_size
-        ) * page_size
+        aligned_seq_lens = ((forward_batch.seq_lens + page_size - 1) // page_size) * page_size
         cache_start_loc = jnp.concatenate(
             [jnp.zeros(1, dtype=jnp.int32), jnp.cumsum(aligned_seq_lens)]
         )
@@ -377,9 +371,7 @@ class TestAttention(CustomTestCase):
             return out
 
         # run
-        jax_output, _ = jit_attn(
-            q_shard, extend_k, extend_v, forward_batch, token_to_kv_pool
-        )
+        jax_output, _ = jit_attn(q_shard, extend_k, extend_v, forward_batch, token_to_kv_pool)
         jax.block_until_ready(jax_output)
 
         rtol = 2e-2  # Relative tolerance
@@ -424,9 +416,7 @@ class TestAttention(CustomTestCase):
         )
 
         # Check how many tokens have large differences
-        large_diff_tokens = int(
-            np.sum(np.max(diff.reshape(num_tokens, -1), axis=1) > 0.1)
-        )
+        large_diff_tokens = int(np.sum(np.max(diff.reshape(num_tokens, -1), axis=1) > 0.1))
         print(f"Tokens with max diff > 0.1: {large_diff_tokens}/{num_tokens}")
 
         are_close = np.allclose(
@@ -455,9 +445,7 @@ class TestAttention(CustomTestCase):
             (512, 1024),
         ]
 
-        self.run_test(
-            "prefill", lens, (num_heads, head_dim, num_kv_heads, 1, jnp.bfloat16)
-        )
+        self.run_test("prefill", lens, (num_heads, head_dim, num_kv_heads, 1, jnp.bfloat16))
 
     def test_mha_decode_accuracy_page_size_1(self):
         """Test JAX attention accuracy against native fa"""
@@ -477,9 +465,7 @@ class TestAttention(CustomTestCase):
             (1, 1025),
         ]
 
-        self.run_test(
-            "decode", lens, (num_heads, head_dim, num_kv_heads, 1, jnp.bfloat16)
-        )
+        self.run_test("decode", lens, (num_heads, head_dim, num_kv_heads, 1, jnp.bfloat16))
 
     def test_mha_prefill_accuracy_page_size_8(self):
         """
@@ -495,9 +481,7 @@ class TestAttention(CustomTestCase):
             (5, 33),
             (5, 5),
         ]
-        self.run_test(
-            "prefill", lens, (num_heads, head_dim, num_kv_heads, 8, jnp.bfloat16)
-        )
+        self.run_test("prefill", lens, (num_heads, head_dim, num_kv_heads, 8, jnp.bfloat16))
 
     def test_mha_decode_accuracy_page_size_8(self):
         """Test JAX attention accuracy against native fa"""
@@ -510,9 +494,7 @@ class TestAttention(CustomTestCase):
             (1, 6),
             (1, 5),
         ]
-        self.run_test(
-            "decode", lens, (num_heads, head_dim, num_kv_heads, 8, jnp.bfloat16)
-        )
+        self.run_test("decode", lens, (num_heads, head_dim, num_kv_heads, 8, jnp.bfloat16))
 
     def test_mha_prefill_accuracy_page_size_64(self):
         """Test JAX attention accuracy against PyTorch reference"""
@@ -530,9 +512,7 @@ class TestAttention(CustomTestCase):
             (123, 522),
             (1, 511),
         ]
-        self.run_test(
-            "prefill", lens, (num_heads, head_dim, num_kv_heads, 64, jnp.bfloat16)
-        )
+        self.run_test("prefill", lens, (num_heads, head_dim, num_kv_heads, 64, jnp.bfloat16))
 
     def test_mha_decode_accuracy_page_size_64(self):
         """Test JAX attention accuracy against native fa"""
@@ -551,9 +531,7 @@ class TestAttention(CustomTestCase):
             (1, 1024),
             (1, 1025),
         ]
-        self.run_test(
-            "decode", lens, (num_heads, head_dim, num_kv_heads, 64, jnp.bfloat16)
-        )
+        self.run_test("decode", lens, (num_heads, head_dim, num_kv_heads, 64, jnp.bfloat16))
 
     def test_gqa_prefill_accuracy_page_size_64(self):
         """Test JAX attention accuracy against PyTorch reference"""
@@ -571,9 +549,7 @@ class TestAttention(CustomTestCase):
             (123, 522),
             (1, 511),
         ]
-        self.run_test(
-            "prefill", lens, (num_heads, head_dim, num_kv_heads, 64, jnp.bfloat16)
-        )
+        self.run_test("prefill", lens, (num_heads, head_dim, num_kv_heads, 64, jnp.bfloat16))
 
     def test_gqa_decode_accuracy_page_size_64(self):
         """Test JAX attention accuracy against native fa"""
@@ -593,9 +569,7 @@ class TestAttention(CustomTestCase):
             (1, 1025),
         ]
 
-        self.run_test(
-            "decode", lens, (num_heads, head_dim, num_kv_heads, 64, jnp.bfloat16)
-        )
+        self.run_test("decode", lens, (num_heads, head_dim, num_kv_heads, 64, jnp.bfloat16))
 
 
 if __name__ == "__main__":

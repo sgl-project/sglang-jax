@@ -162,9 +162,7 @@ class MGSMEval(Eval):
     def __call__(self, sampler: SamplerBase) -> EvalResult:
         def fn(example: dict[str, str]):
             language = example["lang"]
-            latin_language = (
-                "group_latin" if language in LATIN_LANGUAGES else "group_non_latin"
-            )
+            latin_language = "group_latin" if language in LATIN_LANGUAGES else "group_non_latin"
             correct_answer = example["targets"]
             instructoin = LANG_TO_INSTRUCTIONS[language]
             prompt_messages = [
@@ -196,7 +194,5 @@ class MGSMEval(Eval):
                 metrics={language: score, latin_language: score},
             )
 
-        results = common.map_with_progress(
-            fn, self.examples, num_threads=self._num_threads
-        )
+        results = common.map_with_progress(fn, self.examples, num_threads=self._num_threads)
         return common.aggregate_results(results, default_stats=("mean", "std"))

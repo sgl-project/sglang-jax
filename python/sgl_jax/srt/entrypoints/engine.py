@@ -95,11 +95,9 @@ class Engine(EngineBase):
         logger.info("server_args=%s", server_args)
 
         # Launch subprocesses or threads
-        tokenizer_manager, template_manager, scheduler_info = (
-            _launch_subprocesses_or_threads(
-                server_args=server_args,
-                port_args=self.port_args,
-            )
+        tokenizer_manager, template_manager, scheduler_info = _launch_subprocesses_or_threads(
+            server_args=server_args,
+            port_args=self.port_args,
         )
         self.server_args = server_args
         self.tokenizer_manager = tokenizer_manager
@@ -107,9 +105,7 @@ class Engine(EngineBase):
         self.scheduler_info = scheduler_info
         self.default_sampling_params: dict[str, Any] | None = None
         context = zmq.Context(2)
-        self.send_to_rpc = get_zmq_socket(
-            context, zmq.DEALER, self.port_args.rpc_ipc_name, True
-        )
+        self.send_to_rpc = get_zmq_socket(context, zmq.DEALER, self.port_args.rpc_ipc_name, True)
 
     def generate(
         self,
@@ -271,9 +267,7 @@ class Engine(EngineBase):
 
     def get_server_info(self):
         loop = asyncio.get_event_loop()
-        internal_states = loop.run_until_complete(
-            self.tokenizer_manager.get_internal_state()
-        )
+        internal_states = loop.run_until_complete(self.tokenizer_manager.get_internal_state())
         return {
             **dataclasses.asdict(self.tokenizer_manager.server_args),
             **self.scheduler_info,
@@ -284,16 +278,12 @@ class Engine(EngineBase):
     def release_memory_occupation(self, tags: list[str] | None = None):
         obj = ReleaseMemoryOccupationReqInput(tags=tags)
         loop = asyncio.get_event_loop()
-        return loop.run_until_complete(
-            self.tokenizer_manager.release_memory_occupation(obj, None)
-        )
+        return loop.run_until_complete(self.tokenizer_manager.release_memory_occupation(obj, None))
 
     def resume_memory_occupation(self, tags: list[str] | None = None):
         obj = ResumeMemoryOccupationReqInput(tags=tags)
         loop = asyncio.get_event_loop()
-        return loop.run_until_complete(
-            self.tokenizer_manager.resume_memory_occupation(obj, None)
-        )
+        return loop.run_until_complete(self.tokenizer_manager.resume_memory_occupation(obj, None))
 
     def score(
         self,
@@ -429,9 +419,7 @@ def _set_envs_and_config(server_args):
     # The child processes will send SIGQUIT to this process when any error happens
     # This process then clean up the whole process tree
     def sigquit_handler(signum, frame):
-        logger.error(
-            "Received sigquit from a child process. It usually means the child failed."
-        )
+        logger.error("Received sigquit from a child process. It usually means the child failed.")
         kill_process_tree(os.getpid())
 
     signal.signal(signal.SIGQUIT, sigquit_handler)
@@ -540,9 +528,7 @@ def _launch_subprocesses(
             raise
 
         if data["status"] != "ready":
-            raise RuntimeError(
-                "Initialization failed. Please see the error messages above."
-            )
+            raise RuntimeError("Initialization failed. Please see the error messages above.")
         scheduler_infos.append(data)
 
     # Assume all schedulers have the same scheduler_info
@@ -594,9 +580,7 @@ def _launch_threads(
 
         for thread in scheduler_threads:
             thread.join()
-            logger.error(
-                "Scheduler or DataParallelController %s terminated", thread.name
-            )
+            logger.error("Scheduler or DataParallelController %s terminated", thread.name)
         return None, None, None
 
     # Launch detokenizer thread

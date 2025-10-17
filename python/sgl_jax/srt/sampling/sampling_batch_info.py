@@ -96,15 +96,11 @@ class SamplingMetadata:
         pad_size: int = 0,
         mesh: Mesh = None,
     ) -> SamplingMetadata:
-        sharding = (
-            NamedSharding(mesh, PartitionSpec()) if jax.process_count() == 1 else None
-        )
+        sharding = NamedSharding(mesh, PartitionSpec()) if jax.process_count() == 1 else None
         padded_temperatures = np.concat(
             [
                 batch.sampling_info.temperatures,
-                np.array(
-                    [1.0] * pad_size, dtype=batch.sampling_info.temperatures.dtype
-                ),
+                np.array([1.0] * pad_size, dtype=batch.sampling_info.temperatures.dtype),
             ]
         ).reshape(-1, 1)
         padded_top_ps = np.concat(
@@ -135,17 +131,13 @@ class SamplingMetadata:
                     ),
                 ]
             )
-            sampling_seeds_device = device_array(
-                padded_sampling_seeds, sharding=sharding
-            )
+            sampling_seeds_device = device_array(padded_sampling_seeds, sharding=sharding)
         else:
             sampling_seeds_device = None
 
-        (temperatures_device, top_ps_device, top_ks_device, min_ps_device) = (
-            device_array(
-                (padded_temperatures, padded_top_ps, padded_top_ks, padded_min_ps),
-                sharding=sharding,
-            )
+        (temperatures_device, top_ps_device, top_ks_device, min_ps_device) = device_array(
+            (padded_temperatures, padded_top_ps, padded_top_ks, padded_min_ps),
+            sharding=sharding,
         )
 
         # Extract penalty information from penalizer orchestrator
@@ -165,9 +157,7 @@ class SamplingMetadata:
                     (pad_size, original_linear_penalty.shape[1]),
                     dtype=original_linear_penalty.dtype,
                 )
-                padded_linear_penalty = np.concat(
-                    [original_linear_penalty, pad_rows], axis=0
-                )
+                padded_linear_penalty = np.concat([original_linear_penalty, pad_rows], axis=0)
             else:
                 padded_linear_penalty = original_linear_penalty
 
@@ -190,9 +180,7 @@ class SamplingMetadata:
                     (pad_size, original_linear_penalty.shape[1]),
                     dtype=original_linear_penalty.dtype,
                 )
-                padded_linear_penalty = np.concat(
-                    [original_linear_penalty, pad_rows], axis=0
-                )
+                padded_linear_penalty = np.concat([original_linear_penalty, pad_rows], axis=0)
             else:
                 padded_linear_penalty = original_linear_penalty
 
@@ -229,15 +217,11 @@ class SamplingMetadata:
         shapes for all penalty types to ensure comprehensive compilation coverage.
         """
         # Basic sampling parameters (same as original method)
-        sharding = (
-            NamedSharding(mesh, PartitionSpec()) if jax.process_count() == 1 else None
-        )
+        sharding = NamedSharding(mesh, PartitionSpec()) if jax.process_count() == 1 else None
         padded_temperatures = np.concat(
             [
                 batch.sampling_info.temperatures,
-                np.array(
-                    [1.0] * pad_size, dtype=batch.sampling_info.temperatures.dtype
-                ),
+                np.array([1.0] * pad_size, dtype=batch.sampling_info.temperatures.dtype),
             ]
         ).reshape(-1, 1)
         padded_top_ps = np.concat(
@@ -274,11 +258,9 @@ class SamplingMetadata:
         else:
             sampling_seeds_device = None
 
-        (temperatures_device, top_ps_device, top_ks_device, min_ps_device) = (
-            device_array(
-                (padded_temperatures, padded_top_ps, padded_top_ks, padded_min_ps),
-                sharding=sharding,
-            )
+        (temperatures_device, top_ps_device, top_ks_device, min_ps_device) = device_array(
+            (padded_temperatures, padded_top_ps, padded_top_ks, padded_min_ps),
+            sharding=sharding,
         )
 
         if batch.sampling_info.sampling_seeds is not None:
@@ -301,9 +283,7 @@ class SamplingMetadata:
         # Calculate batch size and vocab size
         batch_size = len(batch.sampling_info.temperatures) + pad_size
         vocab_size = batch.sampling_info.vocab_size
-        padded_linear_penalty = (
-            jnp.ones((batch_size, vocab_size), dtype=jnp.float32) * 0.2
-        )
+        padded_linear_penalty = jnp.ones((batch_size, vocab_size), dtype=jnp.float32) * 0.2
 
         (linear_penalty_device,) = device_array(
             (padded_linear_penalty,),
@@ -368,17 +348,13 @@ class SamplingBatchInfo:
         return global_server_args_dict
 
     @classmethod
-    def generate_for_precompile(
-        cls, bs: int, vocab_size: int = 32000, do_penalties: bool = False
-    ):
+    def generate_for_precompile(cls, bs: int, vocab_size: int = 32000, do_penalties: bool = False):
         temperatures = np.array([0.6 for _ in range(bs)], dtype=np.float32)
         top_ps = np.array([0.9 for _ in range(bs)], dtype=np.float32)
         top_ks = np.array([30 for _ in range(bs)], dtype=np.int32)
         min_ps = np.array([0.6 for _ in range(bs)], dtype=np.float32)
         if get_bool_env_var("SGLANG_ENABLE_DETERMINISTIC_SAMPLING"):
-            sampling_seeds = np.array(
-                [DEFAULT_SAMPLING_SEED for _ in range(bs)], dtype=np.int32
-            )
+            sampling_seeds = np.array([DEFAULT_SAMPLING_SEED for _ in range(bs)], dtype=np.int32)
         else:
             sampling_seeds = None
 

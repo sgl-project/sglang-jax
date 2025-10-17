@@ -62,9 +62,7 @@ def check_transformers_dependencies():
         return False
 
 
-def run_tests(
-    test_name=None, model_path=None, verbose=False, enable_precision_tracer=False
-):
+def run_tests(test_name=None, model_path=None, verbose=False, enable_precision_tracer=False):
     """Run the QWen JAXModelLoader tests"""
     env = os.environ.copy()
     if model_path:
@@ -127,22 +125,22 @@ def create_sample_qwen_model(output_dir):
         mock_weights = {
             "transformer": {
                 "embed_tokens": {
-                    "kernel": np.random.randn(
-                        config["vocab_size"], config["hidden_size"]
-                    ).astype(np.float32)
+                    "kernel": np.random.randn(config["vocab_size"], config["hidden_size"]).astype(
+                        np.float32
+                    )
                 },
                 "h": {},
                 "ln_f": {"scale": np.ones(config["hidden_size"], dtype=np.float32)},
             },
             "lm_head": {
-                "kernel": np.random.randn(
-                    config["hidden_size"], config["vocab_size"]
-                ).astype(np.float32)
+                "kernel": np.random.randn(config["hidden_size"], config["vocab_size"]).astype(
+                    np.float32
+                )
             },
             "logits_processor": {
-                "kernel": np.random.randn(
-                    config["hidden_size"], config["vocab_size"]
-                ).astype(np.float32)
+                "kernel": np.random.randn(config["hidden_size"], config["vocab_size"]).astype(
+                    np.float32
+                )
             },
         }
 
@@ -233,26 +231,18 @@ def main():
         help="Specific test method to run (use --list-tests to see available tests)",
     )
 
-    parser.add_argument(
-        "--verbose", "-v", action="store_true", help="Verbose test output"
-    )
+    parser.add_argument("--verbose", "-v", action="store_true", help="Verbose test output")
 
-    parser.add_argument(
-        "--check-jax", action="store_true", help="Check JAX dependencies and exit"
-    )
+    parser.add_argument("--check-jax", action="store_true", help="Check JAX dependencies and exit")
 
-    parser.add_argument(
-        "--check-deps", action="store_true", help="Check all dependencies and exit"
-    )
+    parser.add_argument("--check-deps", action="store_true", help="Check all dependencies and exit")
 
     parser.add_argument(
         "--create-sample",
         help="Create a sample QWen JAX model directory at the specified path",
     )
 
-    parser.add_argument(
-        "--list-tests", action="store_true", help="List all available test methods"
-    )
+    parser.add_argument("--list-tests", action="store_true", help="List all available test methods")
     parser.add_argument(
         "--enable-precision-tracer",
         action="store_true",

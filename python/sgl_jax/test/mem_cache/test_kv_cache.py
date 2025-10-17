@@ -71,10 +71,7 @@ class TestKVCache(unittest.TestCase):
             loc = jnp.zeros(total_tokens, dtype=jnp.int32)
             loc = loc.at[::2].set(all_locs[: total_tokens // 2])
             loc = loc.at[1::2].set(
-                all_locs[
-                    total_tokens // 2 : total_tokens // 2
-                    + (total_tokens - total_tokens // 2)
-                ]
+                all_locs[total_tokens // 2 : total_tokens // 2 + (total_tokens - total_tokens // 2)]
             )
         else:
             # All valid tokens
@@ -104,13 +101,9 @@ class TestKVCache(unittest.TestCase):
     def test_kv_cache_update_page_size_1(self):
         """Test KV cache update with page_size=1."""
         total_tokens = 16
-        k, v, loc, k_cache, v_cache = self.generate_test_data(
-            total_tokens, add_padding=False
-        )
+        k, v, loc, k_cache, v_cache = self.generate_test_data(total_tokens, add_padding=False)
 
-        updated_k_cache, updated_v_cache = update_kv_cache(
-            k, v, loc, k_cache, v_cache, page_size=1
-        )
+        updated_k_cache, updated_v_cache = update_kv_cache(k, v, loc, k_cache, v_cache, page_size=1)
 
         # Expected result
         expected_k_cache, expected_v_cache = self.expected_update_kv_cache(
@@ -123,13 +116,9 @@ class TestKVCache(unittest.TestCase):
     def test_kv_cache_update_page_size_1_with_padding(self):
         """Test KV cache update with page_size=1 and padding tokens."""
         total_tokens = 12
-        k, v, loc, k_cache, v_cache = self.generate_test_data(
-            total_tokens, add_padding=True
-        )
+        k, v, loc, k_cache, v_cache = self.generate_test_data(total_tokens, add_padding=True)
 
-        updated_k_cache, updated_v_cache = update_kv_cache(
-            k, v, loc, k_cache, v_cache, page_size=1
-        )
+        updated_k_cache, updated_v_cache = update_kv_cache(k, v, loc, k_cache, v_cache, page_size=1)
 
         # Expected result (should ignore padding tokens where loc == -1)
         expected_k_cache, expected_v_cache = self.expected_update_kv_cache(
@@ -150,14 +139,10 @@ class TestKVCache(unittest.TestCase):
     def test_kv_cache_update_page_size_4(self):
         """Test KV cache update with page_size=4."""
         total_tokens = 16
-        k, v, loc, k_cache, v_cache = self.generate_test_data(
-            total_tokens, add_padding=False
-        )
+        k, v, loc, k_cache, v_cache = self.generate_test_data(total_tokens, add_padding=False)
 
         # Test with page_size=4
-        updated_k_cache, updated_v_cache = update_kv_cache(
-            k, v, loc, k_cache, v_cache, page_size=4
-        )
+        updated_k_cache, updated_v_cache = update_kv_cache(k, v, loc, k_cache, v_cache, page_size=4)
 
         # Expected result
         expected_k_cache, expected_v_cache = self.expected_update_kv_cache(
@@ -171,14 +156,10 @@ class TestKVCache(unittest.TestCase):
     def test_kv_cache_update_page_size_4_with_padding(self):
         """Test KV cache update with page_size=4 and padding tokens."""
         total_tokens = 12
-        k, v, loc, k_cache, v_cache = self.generate_test_data(
-            total_tokens, add_padding=True
-        )
+        k, v, loc, k_cache, v_cache = self.generate_test_data(total_tokens, add_padding=True)
 
         # Test with page_size=4
-        updated_k_cache, updated_v_cache = update_kv_cache(
-            k, v, loc, k_cache, v_cache, page_size=4
-        )
+        updated_k_cache, updated_v_cache = update_kv_cache(k, v, loc, k_cache, v_cache, page_size=4)
 
         # Expected result (should ignore padding tokens where loc == -1)
         expected_k_cache, expected_v_cache = self.expected_update_kv_cache(
@@ -191,14 +172,10 @@ class TestKVCache(unittest.TestCase):
     def test_kv_cache_update_page_size_8_contiguous(self):
         """Test KV cache update with page_size=8 and contiguous locations."""
         total_tokens = 16
-        k, v, loc, k_cache, v_cache = self.generate_test_data(
-            total_tokens, add_padding=False
-        )
+        k, v, loc, k_cache, v_cache = self.generate_test_data(total_tokens, add_padding=False)
 
         # Test with page_size=8
-        updated_k_cache, updated_v_cache = update_kv_cache(
-            k, v, loc, k_cache, v_cache, page_size=8
-        )
+        updated_k_cache, updated_v_cache = update_kv_cache(k, v, loc, k_cache, v_cache, page_size=8)
 
         # Expected result
         expected_k_cache, expected_v_cache = self.expected_update_kv_cache(
@@ -211,9 +188,7 @@ class TestKVCache(unittest.TestCase):
     def test_all_padding_tokens(self):
         """Test case where all tokens are padding tokens."""
         total_tokens = 4
-        k, v, _, k_cache, v_cache = self.generate_test_data(
-            total_tokens, add_padding=False
-        )
+        k, v, _, k_cache, v_cache = self.generate_test_data(total_tokens, add_padding=False)
 
         # Make all tokens padding
         loc = jnp.full((total_tokens,), -1, dtype=jnp.int32)
@@ -234,15 +209,13 @@ class TestKVCache(unittest.TestCase):
         from sgl_jax.srt.mem_cache.memory_pool import _optimize_contiguous_updates
 
         total_tokens = 8
-        k, v, loc, k_cache, v_cache = self.generate_test_data(
-            total_tokens, add_padding=False
-        )
+        k, v, loc, k_cache, v_cache = self.generate_test_data(total_tokens, add_padding=False)
 
         # Test the optimization logic for page_size=1
         page_size = 1
         if page_size > 1:
-            kv_cache_locs, new_kv_locs, slice_lens, num_slices = (
-                _optimize_contiguous_updates(loc, page_size)
+            kv_cache_locs, new_kv_locs, slice_lens, num_slices = _optimize_contiguous_updates(
+                loc, page_size
             )
         else:
             # Use original logic for page_size = 1: one slice per token
@@ -270,12 +243,8 @@ class TestKVCache(unittest.TestCase):
 
                 # Update cache
                 for j in range(length):
-                    updated_k_cache = updated_k_cache.at[cache_start + j].set(
-                        k[new_start + j]
-                    )
-                    updated_v_cache = updated_v_cache.at[cache_start + j].set(
-                        v[new_start + j]
-                    )
+                    updated_k_cache = updated_k_cache.at[cache_start + j].set(k[new_start + j])
+                    updated_v_cache = updated_v_cache.at[cache_start + j].set(v[new_start + j])
 
         # Expected result
         expected_k_cache, expected_v_cache = self.expected_update_kv_cache(
@@ -290,14 +259,12 @@ class TestKVCache(unittest.TestCase):
         from sgl_jax.srt.mem_cache.memory_pool import _optimize_contiguous_updates
 
         total_tokens = 16
-        k, v, loc, k_cache, v_cache = self.generate_test_data(
-            total_tokens, add_padding=False
-        )
+        k, v, loc, k_cache, v_cache = self.generate_test_data(total_tokens, add_padding=False)
 
         # Test the optimization logic for page_size=4
         page_size = 4
-        kv_cache_locs, new_kv_locs, slice_lens, num_slices = (
-            _optimize_contiguous_updates(loc, page_size)
+        kv_cache_locs, new_kv_locs, slice_lens, num_slices = _optimize_contiguous_updates(
+            loc, page_size
         )
 
         # Verify the slice logic makes sense
@@ -312,9 +279,7 @@ class TestKVCache(unittest.TestCase):
         self.assertEqual(total_processed, non_padding_count)
 
         # For contiguous tokens with page_size=4, expect 4 slices of length 4 each
-        actual_slices = [
-            (i, slice_lens[i]) for i in range(num_slices) if slice_lens[i] > 0
-        ]
+        actual_slices = [(i, slice_lens[i]) for i in range(num_slices) if slice_lens[i] > 0]
         expected_slices = [(0, 4), (4, 4), (8, 4), (12, 4)]
         self.assertEqual(len(actual_slices), len(expected_slices))
         for (actual_i, actual_len), (expected_i, expected_len) in zip(
@@ -335,12 +300,8 @@ class TestKVCache(unittest.TestCase):
 
                 # Update cache
                 for j in range(length):
-                    updated_k_cache = updated_k_cache.at[cache_start + j].set(
-                        k[new_start + j]
-                    )
-                    updated_v_cache = updated_v_cache.at[cache_start + j].set(
-                        v[new_start + j]
-                    )
+                    updated_k_cache = updated_k_cache.at[cache_start + j].set(k[new_start + j])
+                    updated_v_cache = updated_v_cache.at[cache_start + j].set(v[new_start + j])
 
         # For this test, we'll verify that the processed tokens are correctly updated
         # rather than expecting all tokens to be processed due to the optimization bug
@@ -357,26 +318,20 @@ class TestKVCache(unittest.TestCase):
                     actual_k_val = updated_k_cache[cache_start + j]
                     actual_v_val = updated_v_cache[cache_start + j]
 
-                    self.assertTrue(
-                        jnp.allclose(actual_k_val, expected_k_val, rtol=1e-5)
-                    )
-                    self.assertTrue(
-                        jnp.allclose(actual_v_val, expected_v_val, rtol=1e-5)
-                    )
+                    self.assertTrue(jnp.allclose(actual_k_val, expected_k_val, rtol=1e-5))
+                    self.assertTrue(jnp.allclose(actual_v_val, expected_v_val, rtol=1e-5))
 
     def test_update_kv_cache_logic_page_size_8_with_padding(self):
         """Test KV cache update logic with page_size=8 and padding using optimization functions."""
         from sgl_jax.srt.mem_cache.memory_pool import _optimize_contiguous_updates
 
         total_tokens = 20
-        k, v, loc, k_cache, v_cache = self.generate_test_data(
-            total_tokens, add_padding=True
-        )
+        k, v, loc, k_cache, v_cache = self.generate_test_data(total_tokens, add_padding=True)
 
         # Test the optimization logic for page_size=8 with padding
         page_size = 8
-        kv_cache_locs, new_kv_locs, slice_lens, num_slices = (
-            _optimize_contiguous_updates(loc, page_size)
+        kv_cache_locs, new_kv_locs, slice_lens, num_slices = _optimize_contiguous_updates(
+            loc, page_size
         )
 
         # Verify the slice logic handles padding correctly
@@ -399,12 +354,8 @@ class TestKVCache(unittest.TestCase):
 
                 # Update cache
                 for j in range(length):
-                    updated_k_cache = updated_k_cache.at[cache_start + j].set(
-                        k[new_start + j]
-                    )
-                    updated_v_cache = updated_v_cache.at[cache_start + j].set(
-                        v[new_start + j]
-                    )
+                    updated_k_cache = updated_k_cache.at[cache_start + j].set(k[new_start + j])
+                    updated_v_cache = updated_v_cache.at[cache_start + j].set(v[new_start + j])
 
         # Expected result (should ignore padding tokens where loc == -1)
         expected_k_cache, expected_v_cache = self.expected_update_kv_cache(
@@ -481,9 +432,7 @@ class TestKVCache(unittest.TestCase):
                     cache_pos = 11 + i
                     input_pos = i
                     self.assertTrue(
-                        jnp.allclose(
-                            updated_k_cache[cache_pos], k[input_pos], rtol=1e-5
-                        )
+                        jnp.allclose(updated_k_cache[cache_pos], k[input_pos], rtol=1e-5)
                     )
 
                 # Segment 2: cache locations 22-25
@@ -491,9 +440,7 @@ class TestKVCache(unittest.TestCase):
                     cache_pos = 22 + i
                     input_pos = 7 + i
                     self.assertTrue(
-                        jnp.allclose(
-                            updated_k_cache[cache_pos], k[input_pos], rtol=1e-5
-                        )
+                        jnp.allclose(updated_k_cache[cache_pos], k[input_pos], rtol=1e-5)
                     )
 
                 # Segment 3: cache locations 30-39
@@ -501,9 +448,7 @@ class TestKVCache(unittest.TestCase):
                     cache_pos = 30 + i
                     input_pos = 11 + i
                     self.assertTrue(
-                        jnp.allclose(
-                            updated_k_cache[cache_pos], k[input_pos], rtol=1e-5
-                        )
+                        jnp.allclose(updated_k_cache[cache_pos], k[input_pos], rtol=1e-5)
                     )
 
                 print(f"  ✓ page_size={page_size} passed")
@@ -529,8 +474,8 @@ class TestKVCache(unittest.TestCase):
 
         for page_size in [1, 2, 4, 8]:
             with self.subTest(case=1, page_size=page_size):
-                kv_cache_locs, new_kv_locs, slice_lens, num_slices = (
-                    _optimize_contiguous_updates(loc, page_size)
+                kv_cache_locs, new_kv_locs, slice_lens, num_slices = _optimize_contiguous_updates(
+                    loc, page_size
                 )
 
                 # Verify all valid tokens are processed
@@ -571,8 +516,8 @@ class TestKVCache(unittest.TestCase):
 
         for page_size in [1, 2, 4]:
             with self.subTest(case=2, page_size=page_size):
-                kv_cache_locs, new_kv_locs, slice_lens, num_slices = (
-                    _optimize_contiguous_updates(loc2, page_size)
+                kv_cache_locs, new_kv_locs, slice_lens, num_slices = _optimize_contiguous_updates(
+                    loc2, page_size
                 )
 
                 total_processed = jnp.sum(slice_lens)
@@ -594,14 +539,12 @@ class TestKVCache(unittest.TestCase):
 
         for page_size in [1, 4]:
             with self.subTest(case=3, page_size=page_size):
-                kv_cache_locs, new_kv_locs, slice_lens, num_slices = (
-                    _optimize_contiguous_updates(loc3, page_size)
+                kv_cache_locs, new_kv_locs, slice_lens, num_slices = _optimize_contiguous_updates(
+                    loc3, page_size
                 )
 
                 total_processed = jnp.sum(slice_lens)
-                self.assertEqual(
-                    total_processed, 0, "Should process 0 tokens when all are padding"
-                )
+                self.assertEqual(total_processed, 0, "Should process 0 tokens when all are padding")
 
                 # No slices should be created
                 slices = [i for i in range(num_slices) if slice_lens[i] > 0]

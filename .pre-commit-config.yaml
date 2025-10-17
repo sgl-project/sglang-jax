@@ -27,6 +27,8 @@ repos:
   - repo: https://github.com/astral-sh/ruff-pre-commit
     rev: v0.13.3
     hooks:
+      # Ruff is lint-only; formatting is handled by Black.
+      # Do not add ruff-format to avoid conflicts with Black.
       - id: ruff-check
         args: [--output-format, github, --fix]
         files: ^(python/|benchmark/|docs/|examples/)
@@ -35,6 +37,8 @@ repos:
     rev: 24.10.0
     hooks:
       - id: black-jupyter
+        args: ["--config", "python/pyproject.toml"]
+        # Black is the only formatter; keep Ruff formatting disabled.
         # exclude: >
         #   (?x)^(
         #     python/sgl_jax/srt/entrypoints/openai/serving_rerank\.py|

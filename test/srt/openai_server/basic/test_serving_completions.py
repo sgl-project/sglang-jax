@@ -63,9 +63,7 @@ class ServingCompletionTestCase(unittest.TestCase):
         self.assertEqual(self.sc._get_echo_text(req, 0), "Hello")
 
     def test_echo_with_list_of_strings_streaming(self):
-        req = CompletionRequest(
-            model="x", prompt=["A", "B"], max_tokens=1, echo=True, n=1
-        )
+        req = CompletionRequest(model="x", prompt=["A", "B"], max_tokens=1, echo=True, n=1)
         self.assertEqual(self.sc._get_echo_text(req, 0), "A")
         self.assertEqual(self.sc._get_echo_text(req, 1), "B")
 
@@ -75,9 +73,7 @@ class ServingCompletionTestCase(unittest.TestCase):
         self.assertEqual(self.sc._get_echo_text(req, 0), "decoded_prompt")
 
     def test_echo_with_multiple_token_ids_streaming(self):
-        req = CompletionRequest(
-            model="x", prompt=[[1, 2], [3, 4]], max_tokens=1, echo=True, n=1
-        )
+        req = CompletionRequest(model="x", prompt=[[1, 2], [3, 4]], max_tokens=1, echo=True, n=1)
         self.sc.tokenizer_manager.tokenizer.decode.return_value = "decoded"
         self.assertEqual(self.sc._get_echo_text(req, 0), "decoded")
 

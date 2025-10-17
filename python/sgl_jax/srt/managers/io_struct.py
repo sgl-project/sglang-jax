@@ -235,12 +235,8 @@ class GenerateReqInput:
                 raise ValueError("Text should be a list for batch processing.")
             self.text = self.text * self.parallel_sample_num
         elif self.input_ids is not None:
-            if not isinstance(self.input_ids, list) or not isinstance(
-                self.input_ids[0], list
-            ):
-                raise ValueError(
-                    "input_ids should be a list of lists for batch processing."
-                )
+            if not isinstance(self.input_ids, list) or not isinstance(self.input_ids[0], list):
+                raise ValueError("input_ids should be a list of lists for batch processing.")
             self.input_ids = self.input_ids * self.parallel_sample_num
         elif self.input_embeds is not None:
             if not isinstance(self.input_embeds, list):
@@ -302,21 +298,13 @@ class GenerateReqInput:
                 return [param] * num
             else:
                 if self.parallel_sample_num > 1:
-                    raise ValueError(
-                        f"Cannot use list {param_name} with parallel_sample_num > 1"
-                    )
+                    raise ValueError(f"Cannot use list {param_name} with parallel_sample_num > 1")
                 return param
 
         # Normalize each logprob parameter
-        self.return_logprob = normalize_param(
-            self.return_logprob, False, "return_logprob"
-        )
-        self.logprob_start_len = normalize_param(
-            self.logprob_start_len, -1, "logprob_start_len"
-        )
-        self.top_logprobs_num = normalize_param(
-            self.top_logprobs_num, 0, "top_logprobs_num"
-        )
+        self.return_logprob = normalize_param(self.return_logprob, False, "return_logprob")
+        self.logprob_start_len = normalize_param(self.logprob_start_len, -1, "logprob_start_len")
+        self.top_logprobs_num = normalize_param(self.top_logprobs_num, 0, "top_logprobs_num")
 
         # Handle token_ids_logprob specially due to its nested structure
         if not self.token_ids_logprob:  # covers both None and []
@@ -324,13 +312,9 @@ class GenerateReqInput:
         elif not isinstance(self.token_ids_logprob, list):
             self.token_ids_logprob = [[self.token_ids_logprob] for _ in range(num)]
         elif not isinstance(self.token_ids_logprob[0], list):
-            self.token_ids_logprob = [
-                copy.deepcopy(self.token_ids_logprob) for _ in range(num)
-            ]
+            self.token_ids_logprob = [copy.deepcopy(self.token_ids_logprob) for _ in range(num)]
         elif self.parallel_sample_num > 1:
-            raise ValueError(
-                "Cannot use list token_ids_logprob with parallel_sample_num > 1"
-            )
+            raise ValueError("Cannot use list token_ids_logprob with parallel_sample_num > 1")
 
     def regenerate_rid(self):
         """Generate a new request ID and return it."""

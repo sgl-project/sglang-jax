@@ -76,12 +76,8 @@ class LogitsProcessorOutput:
 
         obj.next_token_top_logprobs_val = aux_data["next_token_top_logprobs_val"]
         obj.next_token_top_logprobs_idx = aux_data["next_token_top_logprobs_idx"]
-        obj.next_token_token_ids_logprobs_val = aux_data[
-            "next_token_token_ids_logprobs_val"
-        ]
-        obj.next_token_token_ids_logprobs_idx = aux_data[
-            "next_token_token_ids_logprobs_idx"
-        ]
+        obj.next_token_token_ids_logprobs_val = aux_data["next_token_token_ids_logprobs_val"]
+        obj.next_token_token_ids_logprobs_idx = aux_data["next_token_token_ids_logprobs_idx"]
         obj.input_top_logprobs_val = aux_data["input_top_logprobs_val"]
         obj.input_top_logprobs_idx = aux_data["input_top_logprobs_idx"]
         obj.input_token_ids_logprobs_val = aux_data["input_token_ids_logprobs_val"]
@@ -175,9 +171,7 @@ class LogitsMetadata:
             extend_seq_lens_cpu = batch.extend_seq_lens.tolist()
 
             extend_return_top_logprob = any(x > 0 for x in batch.top_logprobs_nums)
-            extend_token_ids_logprob = any(
-                x is not None for x in batch.token_ids_logprobs
-            )
+            extend_token_ids_logprob = any(x is not None for x in batch.token_ids_logprobs)
             extend_return_logprob = False
             extend_logprob_pruned_lens_cpu = []
             for extend_len, start_len in zip(
@@ -188,9 +182,7 @@ class LogitsMetadata:
                     extend_return_logprob = True
                 extend_logprob_pruned_lens_cpu.append(extend_len - start_len)
         else:
-            extend_return_logprob = extend_return_top_logprob = (
-                extend_token_ids_logprob
-            ) = False
+            extend_return_logprob = extend_return_top_logprob = extend_token_ids_logprob = False
             extend_logprob_pruned_lens_cpu = extend_seq_lens_cpu = None
 
         sharding = NamedSharding(mesh, P()) if jax.process_count() == 1 else None
@@ -232,10 +224,7 @@ class LogitsProcessor(nnx.Module):
             pruned_states = hidden_states
             sample_indices = None
             input_logprob_indices = None
-        elif (
-            logits_metadata.forward_mode.is_extend()
-            and not logits_metadata.extend_return_logprob
-        ):
+        elif logits_metadata.forward_mode.is_extend() and not logits_metadata.extend_return_logprob:
             last_index = jnp.cumsum(logits_metadata.extend_seq_lens, axis=0) - 1
             pruned_states = hidden_states[last_index]
             sample_indices = None
@@ -288,9 +277,7 @@ class LogitsProcessor(nnx.Module):
 
         # Compute logits for both input and sampled tokens.
         logits = self._get_logits(pruned_states, self.lm_head)
-        sampled_logits = (
-            logits[sample_indices] if sample_indices is not None else logits
-        )
+        sampled_logits = logits[sample_indices] if sample_indices is not None else logits
 
         hidden_states_to_store: jax.Array | None = None
         if logits_metadata.capture_hidden_mode.need_capture():
@@ -300,9 +287,7 @@ class LogitsProcessor(nnx.Module):
                 # Get the last token hidden states. If sample_indices is None,
                 # pruned states only contain the last tokens already.
                 hidden_states_to_store = (
-                    pruned_states[sample_indices]
-                    if sample_indices is not None
-                    else pruned_states
+                    pruned_states[sample_indices] if sample_indices is not None else pruned_states
                 )
             else:
                 raise AssertionError()
@@ -372,9 +357,7 @@ class LogitsProcessor(nnx.Module):
             )
 
     @staticmethod
-    def get_token_ids_logprobs(
-        all_logprobs: jax.Array, logits_metadata: LogitsMetadata
-    ):
+    def get_token_ids_logprobs(all_logprobs: jax.Array, logits_metadata: LogitsMetadata):
         input_token_ids_logprobs_val, input_token_ids_logprobs_idx = [], []
         pt = 0
         for token_ids, pruned_len in zip(
@@ -413,12 +396,8 @@ class LogitsProcessor(nnx.Module):
                 input_top_logprobs_idx.append([])
                 continue
 
-            input_top_logprobs_val.append(
-                [values[pt + j][:k] for j in range(pruned_len)]
-            )
-            input_top_logprobs_idx.append(
-                [indices[pt + j][:k] for j in range(pruned_len)]
-            )
+            input_top_logprobs_val.append([values[pt + j][:k] for j in range(pruned_len)])
+            input_top_logprobs_idx.append([indices[pt + j][:k] for j in range(pruned_len)])
             pt += pruned_len
 
         return input_top_logprobs_val, input_top_logprobs_idx
@@ -439,10 +418,7 @@ class LogitsProcessor(nnx.Module):
 
         # Normalize logprobs if top_p normalization is enabled
         # NOTE: only normalize logprobs when top_p is set and not equal to 1.0
-        if (
-            logits_metadata.top_p_normalized_logprobs
-            and (logits_metadata.top_p != 1.0).any()
-        ):
+        if logits_metadata.top_p_normalized_logprobs and (logits_metadata.top_p != 1.0).any():
             from sgl_jax.srt.layers.sampler import top_p_normalize_probs_jax
 
             probs = jnp.softmax(last_logits, axis=-1)
@@ -471,10 +447,6 @@ class LogitsProcessor(nnx.Module):
 
         logits = jnp.dot(hidden_states, embedding.T)
 
-        logits = (
-            logits[:, : self.vocab_size]
-            if logits.ndim > 1
-            else logits[: self.vocab_size]
-        )
+        logits = logits[:, : self.vocab_size] if logits.ndim > 1 else logits[: self.vocab_size]
 
         return logits

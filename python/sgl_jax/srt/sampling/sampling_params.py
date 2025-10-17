@@ -68,10 +68,7 @@ class SamplingParams:
         self.stream_interval = stream_interval
         self.logit_bias = logit_bias
         # Used for deterministic sampling
-        if (
-            get_bool_env_var("SGLANG_ENABLE_DETERMINISTIC_SAMPLING")
-            and sampling_seed is None
-        ):
+        if get_bool_env_var("SGLANG_ENABLE_DETERMINISTIC_SAMPLING") and sampling_seed is None:
             # If deterministic sampling is enabled and sampling_seed is not set, use the default seed
             sampling_seed = DEFAULT_SAMPLING_SEED
         self.sampling_seed = sampling_seed
@@ -86,25 +83,17 @@ class SamplingParams:
 
     def verify(self, vocab_size):
         if self.temperature < 0.0:
-            raise ValueError(
-                f"temperature must be non-negative, got {self.temperature}."
-            )
+            raise ValueError(f"temperature must be non-negative, got {self.temperature}.")
         if not 0.0 < self.top_p <= 1.0:
             raise ValueError(f"top_p must be in (0, 1], got {self.top_p}.")
         if not 0.0 <= self.min_p <= 1.0:
             raise ValueError(f"min_p must be in [0, 1], got {self.min_p}.")
         if self.top_k < 1 or self.top_k == -1:
-            raise ValueError(
-                f"top_k must be -1 (disable) or at least 1, got {self.top_k}."
-            )
+            raise ValueError(f"top_k must be -1 (disable) or at least 1, got {self.top_k}.")
         if not -2.0 <= self.frequency_penalty <= 2.0:
-            raise ValueError(
-                f"frequency_penalty must be in [-2, 2], got {self.frequency_penalty}."
-            )
+            raise ValueError(f"frequency_penalty must be in [-2, 2], got {self.frequency_penalty}.")
         if not -2.0 <= self.presence_penalty <= 2.0:
-            raise ValueError(
-                f"presence_penalty must be in [-2, 2], got {self.presence_penalty}."
-            )
+            raise ValueError(f"presence_penalty must be in [-2, 2], got {self.presence_penalty}.")
         if not 0.0 <= self.repetition_penalty <= 2.0:
             raise ValueError(
                 f"repetition_penalty must be in [0, 2], got {self.repetition_penalty}."
@@ -115,9 +104,7 @@ class SamplingParams:
             )
         if self.max_new_tokens is not None:
             if self.max_new_tokens < 0:
-                raise ValueError(
-                    f"max_new_tokens must be at least 0, got {self.max_new_tokens}."
-                )
+                raise ValueError(f"max_new_tokens must be at least 0, got {self.max_new_tokens}.")
             if not self.min_new_tokens <= self.max_new_tokens:
                 raise ValueError(
                     f"min_new_tokens must be in [0, max_new_tokens({self.max_new_tokens})], got "

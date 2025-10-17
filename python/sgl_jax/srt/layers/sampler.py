@@ -38,9 +38,7 @@ class Sampler(nnx.Module):
         ), f"Temperature batch size {temperatures_shape[0]} doesn't match logits batch size {logits_batch_size}"
 
         # Post process logits
-        processed_logits = jnp.divide(logits, sampling_metadata.temperatures).astype(
-            logits.dtype
-        )
+        processed_logits = jnp.divide(logits, sampling_metadata.temperatures).astype(logits.dtype)
 
         probs = jax.nn.softmax(processed_logits, axis=-1)
 
@@ -132,9 +130,7 @@ class Sampler(nnx.Module):
 
         return logits + stop_penalty.astype(logits.dtype)
 
-    def apply_penalties(
-        self, logits: jax.Array, sampling_metadata: SamplingMetadata
-    ) -> jax.Array:
+    def apply_penalties(self, logits: jax.Array, sampling_metadata: SamplingMetadata) -> jax.Array:
         """
         Apply penalties to logits with JIT-optimized tensor operations using lax.cond.
 

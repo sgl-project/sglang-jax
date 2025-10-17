@@ -36,9 +36,7 @@ def create_device_mesh(
     return mesh
 
 
-def fill_unspecified_parallelism(
-    parallelism: Sequence[int], num_devices: int
-) -> Sequence[int]:
+def fill_unspecified_parallelism(parallelism: Sequence[int], num_devices: int) -> Sequence[int]:
     if -1 not in parallelism:
         return parallelism
 

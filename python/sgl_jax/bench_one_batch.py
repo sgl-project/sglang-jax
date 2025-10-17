@@ -85,18 +85,10 @@ class BenchArgs:
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
         parser.add_argument("--run-name", type=str, default=BenchArgs.run_name)
-        parser.add_argument(
-            "--batch-size", type=int, nargs="+", default=BenchArgs.batch_size
-        )
-        parser.add_argument(
-            "--input-len", type=int, nargs="+", default=BenchArgs.input_len
-        )
-        parser.add_argument(
-            "--output-len", type=int, nargs="+", default=BenchArgs.output_len
-        )
-        parser.add_argument(
-            "--result-filename", type=str, default=BenchArgs.result_filename
-        )
+        parser.add_argument("--batch-size", type=int, nargs="+", default=BenchArgs.batch_size)
+        parser.add_argument("--input-len", type=int, nargs="+", default=BenchArgs.input_len)
+        parser.add_argument("--output-len", type=int, nargs="+", default=BenchArgs.output_len)
+        parser.add_argument("--result-filename", type=str, default=BenchArgs.result_filename)
         parser.add_argument("--correctness-test", action="store_true")
         parser.add_argument("--cut-len", type=int, default=BenchArgs.cut_len)
         parser.add_argument(
@@ -118,9 +110,7 @@ class BenchArgs:
     def from_cli_args(cls, args: argparse.Namespace):
         # use the default value's type to cast the args into correct types.
         attrs = [(attr.name, type(attr.default)) for attr in dataclasses.fields(cls)]
-        return cls(
-            **{attr: attr_type(getattr(args, attr)) for attr, attr_type in attrs}
-        )
+        return cls(**{attr: attr_type(getattr(args, attr)) for attr, attr_type in attrs})
 
 
 def load_model(server_args, port_args, tp_rank):
@@ -156,9 +146,7 @@ def load_model(server_args, port_args, tp_rank):
         try:
             jax_mh.sync_global_devices("load_model")
         except Exception as err:
-            logging.info(
-                "Could not sync global devices (expected in single-host): %s", err
-            )
+            logging.info("Could not sync global devices (expected in single-host): %s", err)
     return model_runner, tokenizer
 
 
@@ -194,15 +182,11 @@ def prepare_inputs_for_correctness_test(bench_args, tokenizer):
     return input_ids, reqs
 
 
-def prepare_extend_inputs_for_correctness_test(
-    bench_args, input_ids, reqs, model_runner
-):
+def prepare_extend_inputs_for_correctness_test(bench_args, input_ids, reqs, model_runner):
     for i in range(len(reqs)):
         req = reqs[i]
         req.fill_ids += input_ids[i][bench_args.cut_len :]
-        req.prefix_indices = model_runner.req_to_token_pool.req_to_token[
-            i, : bench_args.cut_len
-        ]
+        req.prefix_indices = model_runner.req_to_token_pool.req_to_token[i, : bench_args.cut_len]
         req.extend_input_len = len(req.fill_ids) - len(req.prefix_indices)
         req.logprob_start_len = len(req.origin_input_ids) - 1
     return reqs
@@ -212,9 +196,7 @@ def prepare_synthetic_inputs_for_latency_test(batch_size, input_len):
     input_ids = np.random.randint(0, 10000, (batch_size, input_len), dtype=np.int32)
     sampling_params = SamplingParams(
         temperature=0,
-        max_new_tokens=(
-            BenchArgs.output_len[0] if isinstance(BenchArgs.output_len, tuple) else 16
-        ),
+        max_new_tokens=(BenchArgs.output_len[0] if isinstance(BenchArgs.output_len, tuple) else 16),
     )
 
     reqs = []
@@ -252,9 +234,7 @@ def extend(reqs, model_runner):
         token_needed = int(np.sum(np.array(batch.extend_lens, dtype=np.int64)))
     else:
         token_needed = int(np.sum(np.array(batch.seq_lens, dtype=np.int64)))
-    next_token_ids, next_token_logits = _run_forward_and_sample(
-        model_runner, batch, token_needed
-    )
+    next_token_ids, next_token_logits = _run_forward_and_sample(model_runner, batch, token_needed)
     return next_token_ids, next_token_logits, batch
 
 
@@ -264,9 +244,7 @@ def decode(input_token_ids, batch, model_runner):
     _maybe_prepare_mlp_sync_batch(batch, model_runner)
     # For decode, the token dimension equals current batch size
     bs_needed = len(batch.seq_lens)
-    next_token_ids, next_token_logits = _run_forward_and_sample(
-        model_runner, batch, bs_needed
-    )
+    next_token_ids, next_token_logits = _run_forward_and_sample(model_runner, batch, bs_needed)
     return next_token_ids, next_token_logits
 
 
@@ -287,8 +265,7 @@ def _run_forward_and_sample(model_runner, batch: ScheduleBatch, token_first_arg:
     bs_needed = len(batch.seq_lens)
     cache_loc_needed = int(
         np.sum(
-            ((np.array(batch.seq_lens, dtype=np.int64) + page_size - 1) // page_size)
-            * page_size
+            ((np.array(batch.seq_lens, dtype=np.int64) + page_size - 1) // page_size) * page_size
         )
     )
 
@@ -297,9 +274,7 @@ def _run_forward_and_sample(model_runner, batch: ScheduleBatch, token_first_arg:
     )
 
     # Prepare attention forward metadata (required by FlashAttention backend)
-    forward_metadata = model_runner.attn_backend.get_forward_metadata(
-        model_worker_batch
-    )
+    forward_metadata = model_runner.attn_backend.get_forward_metadata(model_worker_batch)
     model_runner.attn_backend.forward_metadata = forward_metadata
 
     forward_batch = ForwardBatch.init_new(model_worker_batch, model_runner)
@@ -307,9 +282,7 @@ def _run_forward_and_sample(model_runner, batch: ScheduleBatch, token_first_arg:
         model_worker_batch, mesh=model_runner.mesh
     )
 
-    logits_output, _ = model_runner.forward(
-        forward_batch, logits_metadata=logits_metadata
-    )
+    logits_output, _ = model_runner.forward(forward_batch, logits_metadata=logits_metadata)
 
     pad_size = len(model_worker_batch.seq_lens) - model_worker_batch.real_bs
     sampling_metadata = SamplingMetadata.from_model_worker_batch(
@@ -343,9 +316,7 @@ def correctness_test(
         rank_print(f"prefill logits (first half): {next_token_logits} \n")
 
     # Prepare extend inputs
-    reqs = prepare_extend_inputs_for_correctness_test(
-        bench_args, input_ids, reqs, model_runner
-    )
+    reqs = prepare_extend_inputs_for_correctness_test(bench_args, input_ids, reqs, model_runner)
 
     # Extend (prefill w/ KV cache)
     next_token_ids, next_token_logits, batch = extend(reqs, model_runner)
@@ -404,7 +375,9 @@ def latency_test_run_once(
     tot_latency = 0
 
     if profile:
-        profile_dir = f"{profile_filename_prefix}_batch{batch_size}_input{input_len}_output{output_len}.tb"
+        profile_dir = (
+            f"{profile_filename_prefix}_batch{batch_size}_input{input_len}_output{output_len}.tb"
+        )
         os.makedirs(profile_dir, exist_ok=True)
         jax_profiler.start_trace(profile_dir)
 
@@ -416,9 +389,7 @@ def latency_test_run_once(
     prefill_latency = time.perf_counter() - tic
     tot_latency += prefill_latency
     throughput = input_len * batch_size / prefill_latency
-    rank_print(
-        f"Prefill. latency: {prefill_latency:6.5f} s, throughput: {throughput:9.2f} token/s"
-    )
+    rank_print(f"Prefill. latency: {prefill_latency:6.5f} s, throughput: {throughput:9.2f} token/s")
     measurement_results["prefill_latency"] = prefill_latency
     measurement_results["prefill_throughput"] = throughput
 
@@ -453,9 +424,7 @@ def latency_test_run_once(
         measurement_results["median_decode_throughput"] = med_decode_throughput
 
     throughput = (input_len + output_len) * batch_size / tot_latency
-    rank_print(
-        f"Total. latency: {tot_latency:6.3f} s, throughput: {throughput:9.2f} token/s"
-    )
+    rank_print(f"Total. latency: {tot_latency:6.3f} s, throughput: {throughput:9.2f} token/s")
     measurement_results["total_latency"] = tot_latency
     measurement_results["overall_throughput"] = throughput
     return measurement_results

@@ -21,9 +21,7 @@ def run_eval(args):
     if "OPENAI_API_KEY" not in os.environ:
         os.environ["OPENAI_API_KEY"] = "EMPTY"
 
-    base_url = (
-        f"{args.base_url}/v1" if args.base_url else f"http://{args.host}:{args.port}/v1"
-    )
+    base_url = f"{args.base_url}/v1" if args.base_url else f"http://{args.host}:{args.port}/v1"
 
     if args.eval_name == "mmlu":
         from sgl_jax.test.simple_eval_mmlu import MMLUEval
@@ -35,12 +33,8 @@ def run_eval(args):
 
         equality_checker = ChatCompletionSampler(model="gpt-4-turbo")
 
-        filename = (
-            "https://openaipublic.blob.core.windows.net/simple-evals/math_test.csv"
-        )
-        eval_obj = MathEval(
-            filename, equality_checker, args.num_examples, args.num_threads
-        )
+        filename = "https://openaipublic.blob.core.windows.net/simple-evals/math_test.csv"
+        eval_obj = MathEval(filename, equality_checker, args.num_examples, args.num_threads)
     elif args.eval_name == "mgsm":
         from sgl_jax.test.simple_eval_mgsm import MGSMEval
 
@@ -52,9 +46,7 @@ def run_eval(args):
     elif args.eval_name == "gpqa":
         from sgl_jax.test.simple_eval_gpqa import GPQAEval
 
-        filename = (
-            "https://openaipublic.blob.core.windows.net/simple-evals/gpqa_diamond.csv"
-        )
+        filename = "https://openaipublic.blob.core.windows.net/simple-evals/gpqa_diamond.csv"
         eval_obj = GPQAEval(filename, args.num_examples, args.num_threads)
     elif args.eval_name == "humaneval":
         from sgl_jax.test.simple_eval_humaneval import HumanEval
@@ -109,9 +101,7 @@ if __name__ == "__main__":
         default=None,
         help="Server or API base url if not using http host and port.",
     )
-    parser.add_argument(
-        "--host", type=str, default="0.0.0.0", help="Default host is 0.0.0.0."
-    )
+    parser.add_argument("--host", type=str, default="0.0.0.0", help="Default host is 0.0.0.0.")
     parser.add_argument(
         "--port",
         type=int,

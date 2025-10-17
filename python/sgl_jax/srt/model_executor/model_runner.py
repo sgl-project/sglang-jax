@@ -71,9 +71,7 @@ class ModelRunner:
         self.mesh = mesh
         # model args
         self.num_attn_heads = model_config.num_attention_heads
-        self.num_kv_heads = model_config.get_total_num_kv_heads_with_replication(
-            tp_size
-        )
+        self.num_kv_heads = model_config.get_total_num_kv_heads_with_replication(tp_size)
         self.rngs = rngs
 
         self.tp_size = tp_size
@@ -101,9 +99,7 @@ class ModelRunner:
         )
 
         # Initialize precision tracer enable state
-        precision_tracer.set_enable_precision_tracer(
-            server_args.enable_precision_tracer
-        )
+        precision_tracer.set_enable_precision_tracer(server_args.enable_precision_tracer)
 
         # If it is a draft model, tp_group can be different
         self.initialize()
@@ -141,9 +137,7 @@ class ModelRunner:
         model_def, model_state = nnx.split(self.model)
         model_state_leaves, model_state_def = jax.tree_util.tree_flatten(model_state)
         sampler_def, sampler_state = nnx.split(self.sampler)
-        sampler_state_leaves, sampler_state_def = jax.tree_util.tree_flatten(
-            sampler_state
-        )
+        sampler_state_leaves, sampler_state_def = jax.tree_util.tree_flatten(sampler_state)
 
         @partial(
             jax.jit,
@@ -158,17 +152,13 @@ class ModelRunner:
             token_to_kv_pool,
             logits_metadata,
         ):
-            model_state = jax.tree_util.tree_unflatten(
-                model_state_def, model_state_leaves
-            )
+            model_state = jax.tree_util.tree_unflatten(model_state_def, model_state_leaves)
             model = nnx.merge(model_def, model_state)
             return model(forward_batch, token_to_kv_pool, logits_metadata)
 
         @partial(jax.jit, static_argnames=["sampler_state_def"])
         def jitted_sampler(sampler_def, sampler_state_def, sampler_state_leaves, *args):
-            model_state = jax.tree_util.tree_unflatten(
-                sampler_state_def, sampler_state_leaves
-            )
+            model_state = jax.tree_util.tree_unflatten(sampler_state_def, sampler_state_leaves)
             sampler = nnx.merge(sampler_def, model_state)
             return sampler(*args)
 
@@ -190,9 +180,7 @@ class ModelRunner:
         )
 
     def get_available_device_memory(self):
-        min_available_device_memory = get_available_device_memory(
-            self.device, distributed=False
-        )
+        min_available_device_memory = get_available_device_memory(self.device, distributed=False)
 
         # Check memory for tensor parallelism
         local_device_memory = get_available_device_memory(self.device)
@@ -222,9 +210,7 @@ class ModelRunner:
 
         self.dtype = self.model_config.dtype
         self.start_layer = getattr(self.model, "start_layer", 0)
-        self.end_layer = getattr(
-            self.model, "end_layer", self.model_config.num_hidden_layers
-        )
+        self.end_layer = getattr(self.model, "end_layer", self.model_config.num_hidden_layers)
         self.num_effective_layers = self.end_layer - self.start_layer
 
     def profile_max_num_token(self, total_device_memory: int):
@@ -240,9 +226,7 @@ class ModelRunner:
         )
 
         if available_kv_cache_bytes <= 0:
-            raise RuntimeError(
-                "Not enough memory. Please try to increase --mem-fraction-static."
-            )
+            raise RuntimeError("Not enough memory. Please try to increase --mem-fraction-static.")
 
         cell_size = (
             self.model_config.get_num_kv_heads(self.tp_size)
@@ -278,9 +262,7 @@ class ModelRunner:
         elif self.server_args.kv_cache_dtype == "bf16":
             self.kv_cache_dtype = jnp.bfloat16
         else:
-            raise ValueError(
-                f"Unsupported kv_cache_dtype: {self.server_args.kv_cache_dtype}."
-            )
+            raise ValueError(f"Unsupported kv_cache_dtype: {self.server_args.kv_cache_dtype}.")
         logger.info("ModelRunner kv_cache_dtype: %s", self.kv_cache_dtype)
         # Profile maximum number of tokens
         self.max_total_num_tokens = self.profile_max_num_token(total_device_memory)
@@ -289,9 +271,7 @@ class ModelRunner:
         if max_num_reqs is None:
             max_num_reqs = min(
                 max(
-                    int(
-                        self.max_total_num_tokens / self.model_config.context_len * 512
-                    ),
+                    int(self.max_total_num_tokens / self.model_config.context_len * 512),
                     2048,
                 ),
                 4096,
@@ -314,15 +294,11 @@ class ModelRunner:
 
         # Align to page size
         self.max_total_num_tokens = (
-            self.max_total_num_tokens
-            // self.server_args.page_size
-            * self.server_args.page_size
+            self.max_total_num_tokens // self.server_args.page_size * self.server_args.page_size
         )
 
         if self.max_total_num_tokens <= 0:
-            raise RuntimeError(
-                "Not enough memory. Please try to increase --mem-fraction-static."
-            )
+            raise RuntimeError("Not enough memory. Please try to increase --mem-fraction-static.")
 
         logger.info("ModelRunner max_total_num_tokens: %s", self.max_total_num_tokens)
 
@@ -339,9 +315,7 @@ class ModelRunner:
             size=self.max_total_num_tokens,
             page_size=self.page_size,
             dtype=self.kv_cache_dtype,
-            head_num=self.model_config.get_total_num_kv_heads_with_replication(
-                self.tp_size
-            ),
+            head_num=self.model_config.get_total_num_kv_heads_with_replication(self.tp_size),
             head_dim=self.model_config.head_dim,
             layer_num=self.model_config.num_hidden_layers,
             mesh=self.mesh,
@@ -393,9 +367,7 @@ class ModelRunner:
                 mesh=self.mesh,
             )
         else:
-            raise ValueError(
-                f"Unsupported attention backend: {self.server_args.attention_backend}"
-            )
+            raise ValueError(f"Unsupported attention backend: {self.server_args.attention_backend}")
 
     def _forward(
         self,
@@ -406,9 +378,7 @@ class ModelRunner:
         import jax._src.test_util as jtu
 
         with jtu.count_pjit_cpp_cache_miss() as count:
-            output, layers_kv_fused, _ = self.jitted_run_model(
-                forward_batch, logits_metadata
-            )
+            output, layers_kv_fused, _ = self.jitted_run_model(forward_batch, logits_metadata)
             cache_miss_count = count()
         self._set_kv_cache_after_forward(layers_kv_fused, forward_batch)
 
@@ -465,10 +435,7 @@ class ModelRunner:
             except AttributeError:
                 ctx = self.mesh
         with ctx:
-            if (
-                forward_batch.forward_mode.is_decode()
-                or forward_batch.forward_mode.is_extend()
-            ):
+            if forward_batch.forward_mode.is_decode() or forward_batch.forward_mode.is_extend():
                 ret = self._forward(forward_batch, logits_metadata)
             elif forward_batch.forward_mode.is_idle():
                 ret = self.forward_idle(forward_batch, logits_metadata)
@@ -516,9 +483,7 @@ class MockModelRunner(ModelRunner):
             self.num_attn_heads = model_config.num_heads
             self.rngs = rngs
         else:
-            self.num_kv_heads = model_config.get_total_num_kv_heads_with_replication(
-                self.tp_size
-            )
+            self.num_kv_heads = model_config.get_total_num_kv_heads_with_replication(self.tp_size)
             self.num_attn_heads = model_config.num_attention_heads
             self.rngs = rngs
 
@@ -552,9 +517,7 @@ class MockModelRunner(ModelRunner):
             size=self.max_total_num_tokens,
             page_size=self.page_size,
             dtype=self.kv_cache_dtype,
-            head_num=self.model_config.get_total_num_kv_heads_with_replication(
-                self.tp_size
-            ),
+            head_num=self.model_config.get_total_num_kv_heads_with_replication(self.tp_size),
             head_dim=self.model_config.head_dim,
             layer_num=self.model_config.num_hidden_layers,
             mesh=mesh,

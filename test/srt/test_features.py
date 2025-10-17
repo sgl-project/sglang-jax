@@ -124,9 +124,7 @@ class TestFeatures(CustomTestCase):
             )
 
             for future in as_completed(futures):
-                self.assertEqual(
-                    future.result()["meta_info"]["finish_reason"]["type"], "abort"
-                )
+                self.assertEqual(future.result()["meta_info"]["finish_reason"]["type"], "abort")
 
     def test_cache_miss_prefill(self):
         args = SimpleNamespace(
@@ -424,12 +422,8 @@ class TestFeatures(CustomTestCase):
                 continue
             for j, pair in enumerate(subitem):
                 real_prob, real_token = pair[0], pair[1]
-                self.assertEqual(
-                    real_prob, expected_input_token_ids_logprobs[i - 1][j][0]
-                )
-                self.assertEqual(
-                    real_token, expected_input_token_ids_logprobs[i - 1][j][1]
-                )
+                self.assertEqual(real_prob, expected_input_token_ids_logprobs[i - 1][j][0])
+                self.assertEqual(real_token, expected_input_token_ids_logprobs[i - 1][j][1])
 
         expected_output_token_ids_logprobs = [
             [
@@ -522,9 +516,7 @@ class TestFeatures(CustomTestCase):
             for j, pair in enumerate(subitem):
                 real_prob, real_token = pair[0], pair[1]
                 self.assertEqual(real_prob, expected_output_token_ids_logprobs[i][j][0])
-                self.assertEqual(
-                    real_token, expected_output_token_ids_logprobs[i][j][1]
-                )
+                self.assertEqual(real_token, expected_output_token_ids_logprobs[i][j][1])
 
     def test_frequency_penalty(self):
         """Test frequency penalty functionality."""

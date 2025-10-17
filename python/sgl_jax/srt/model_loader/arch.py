@@ -15,9 +15,7 @@ def resolve_transformers_arch(model_config: ModelConfig, architectures: list[str
     for i, arch in enumerate(architectures):
         if arch == "TransformersForCausalLM":
             continue
-        auto_map: dict[str, str] = (
-            getattr(model_config.hf_config, "auto_map", None) or dict()
-        )
+        auto_map: dict[str, str] = getattr(model_config.hf_config, "auto_map", None) or dict()
         # Make sure that config class is always initialized before model class,
         # otherwise the model class won't be able to access the config class,
         # the expected auto_map should have correct order like:

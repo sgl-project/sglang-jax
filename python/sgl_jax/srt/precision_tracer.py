@@ -25,11 +25,7 @@ class TensorJSONEncoder(json.JSONEncoder):
                     "__tensor_type__": "jax",
                     "shape": list(obj.shape),
                     "dtype": str(obj.dtype),
-                    "data": (
-                        obj.tolist()
-                        if obj.size < 100
-                        else f"<array too large: {obj.shape}>"
-                    ),
+                    "data": (obj.tolist() if obj.size < 100 else f"<array too large: {obj.shape}>"),
                 }
             except Exception:
                 return {
@@ -47,9 +43,7 @@ class TensorJSONEncoder(json.JSONEncoder):
 class PrecisionTracerRequestMetadata:
     def __init__(self, request_id, request_input_ids, forward_mode):
         self.request_id = request_id
-        self.input_hash = hashlib.md5(
-            str(request_input_ids).encode("utf-8")
-        ).hexdigest()[:16]
+        self.input_hash = hashlib.md5(str(request_input_ids).encode("utf-8")).hexdigest()[:16]
         self.request_input_ids = request_input_ids
         self.input_len = len(request_input_ids)
         self.forward_mode = forward_mode
@@ -122,9 +116,7 @@ class PrecisionTracer:
         # metadata
         self._current_batch_id = None
         self._records: dict[str, PrecisionTracerRecord] = {}
-        self._batch_requests_mapping: dict[
-            int, list[PrecisionTracerRequestMetadata]
-        ] = {}
+        self._batch_requests_mapping: dict[int, list[PrecisionTracerRequestMetadata]] = {}
 
         self._token_counters: dict[str, int] = {}
         self._last_forward_pass_id: dict[str, int] = {}
@@ -132,9 +124,7 @@ class PrecisionTracer:
 
     def set_enable_precision_tracer(self, enabled: bool):
         self._enable_precision_tracer = enabled
-        logger.info(
-            "Precision tracer globally %s", "enabled" if enabled else "disabled"
-        )
+        logger.info("Precision tracer globally %s", "enabled" if enabled else "disabled")
 
     def get_trace_active(self):
         with self.lock:
@@ -168,8 +158,7 @@ class PrecisionTracer:
         with self.lock:
             self._records[request_id].end_time = time.time()
             self._records[request_id].duration = (
-                self._records[request_id].end_time
-                - self._records[request_id].start_time
+                self._records[request_id].end_time - self._records[request_id].start_time
             )
 
     def add_request_to_batch_requests_mapping(
@@ -187,9 +176,7 @@ class PrecisionTracer:
         verbose_logging: bool = False,
     ):
         if not self._enable_precision_tracer:
-            logger.warning(
-                "Precision tracer is disabled. Enable with --enable-precision-tracer"
-            )
+            logger.warning("Precision tracer is disabled. Enable with --enable-precision-tracer")
             return
 
         if self._trace_active:
@@ -205,9 +192,7 @@ class PrecisionTracer:
 
         self._current_batch_id = None
         self._records: dict[str, PrecisionTracerRecord] = {}
-        self._batch_requests_mapping: dict[
-            int, list[PrecisionTracerRequestMetadata]
-        ] = {}
+        self._batch_requests_mapping: dict[int, list[PrecisionTracerRequestMetadata]] = {}
         self._token_counters: dict[str, int] = {}
         self._last_forward_pass_id: dict[str, int] = {}
 
@@ -244,9 +229,7 @@ class PrecisionTracer:
                     json.dump(record_dict, f, cls=TensorJSONEncoder, ensure_ascii=False)
                     f.write("\n")
 
-            logger.info(
-                "Saved %s request traces to: %s", len(self._records), output_file
-            )
+            logger.info("Saved %s request traces to: %s", len(self._records), output_file)
 
         except Exception as e:
             logger.error("Error saving traces to %s: %s", output_file, e)
@@ -299,9 +282,7 @@ class PrecisionTracer:
         self, tensor: Any, name: str, stage: str, layer_id: int | None = None
     ) -> bool:
         if self._enable_precision_tracer:
-            full_stage = (
-                f"{stage}_layer_id_{layer_id}" if layer_id is not None else stage
-            )
+            full_stage = f"{stage}_layer_id_{layer_id}" if layer_id is not None else stage
 
             def trace_callback(tensor):
                 # Debug logging to check what stage is being passed
@@ -336,9 +317,7 @@ class PrecisionTracer:
             return
 
         with self.lock:
-            request_in_batch = self._batch_requests_mapping.get(
-                self._current_batch_id, []
-            )
+            request_in_batch = self._batch_requests_mapping.get(self._current_batch_id, [])
             current_batch_id = self._current_batch_id
 
         if len(request_in_batch) == 0:
@@ -384,9 +363,7 @@ class PrecisionTracer:
                     else:
                         # For decode, use forward_pass_id to determine when to start new token group
                         current_token_idx = self._token_counters.get(req_id, 0)
-                        last_forward_pass_id = self._last_forward_pass_id.get(
-                            req_id, -1
-                        )
+                        last_forward_pass_id = self._last_forward_pass_id.get(req_id, -1)
 
                         # Check if this is a new forward pass (new inference step)
                         is_new_forward_pass = (
@@ -398,9 +375,7 @@ class PrecisionTracer:
                         if is_new_forward_pass and last_forward_pass_id != -1:
                             current_token_idx = self._token_counters.get(req_id, 0) + 1
                             self._token_counters[req_id] = current_token_idx
-                            self._last_forward_pass_id[req_id] = (
-                                self._current_forward_pass_id
-                            )
+                            self._last_forward_pass_id[req_id] = self._current_forward_pass_id
 
                         # Look for existing token group at current position
                         current_token_group = None
@@ -419,9 +394,7 @@ class PrecisionTracer:
                             precision_records[category].append(current_token_group)
                             # Update forward pass id for first record of this token
                             if hasattr(self, "_current_forward_pass_id"):
-                                self._last_forward_pass_id[req_id] = (
-                                    self._current_forward_pass_id
-                                )
+                                self._last_forward_pass_id[req_id] = self._current_forward_pass_id
 
                         # Add record to the token group
                         record_with_metadata = data.copy()
@@ -507,12 +480,8 @@ class PrecisionTracer:
                     "framework": "jax",
                     "name": name,
                     "stage": stage,
-                    "shape": (
-                        tuple(tensor.shape) if hasattr(tensor, "shape") else "unknown"
-                    ),
-                    "dtype": (
-                        str(tensor.dtype) if hasattr(tensor, "dtype") else "unknown"
-                    ),
+                    "shape": (tuple(tensor.shape) if hasattr(tensor, "shape") else "unknown"),
+                    "dtype": (str(tensor.dtype) if hasattr(tensor, "dtype") else "unknown"),
                     "error": str(e),
                     "layer_id": "unknown",
                     "module_type": "unknown",
@@ -679,9 +648,7 @@ class PrecisionTracer:
         req_info = ""
         if "request_id" in stats:
             req_id_short = (
-                stats["request_id"][:8]
-                if len(stats["request_id"]) > 8
-                else stats["request_id"]
+                stats["request_id"][:8] if len(stats["request_id"]) > 8 else stats["request_id"]
             )
             req_info = f"[Req:{req_id_short}]"
 

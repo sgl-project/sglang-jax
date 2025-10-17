@@ -104,11 +104,7 @@ def _save_memory_snapshot(filename: str, condition: bool = True):
         return
 
     try:
-        output_path = (
-            os.path.join(_config.output_dir, filename)
-            if _config.output_dir
-            else filename
-        )
+        output_path = os.path.join(_config.output_dir, filename) if _config.output_dir else filename
         jax.profiler.save_device_memory_profile(output_path)
     except Exception as e:
         logger.warning("Failed to save memory snapshot %s: %s", filename, e)
@@ -201,9 +197,7 @@ def _create_memory_report(
             )
 
             for name, info in sorted_tensors:
-                percentage = (
-                    (info["memory_mb"] / total_memory) * 100 if total_memory > 0 else 0
-                )
+                percentage = (info["memory_mb"] / total_memory) * 100 if total_memory > 0 else 0
                 shape_str = "x".join(map(str, info["shape"]))
                 f.write(
                     f"{name:<25}: {info['memory_mb']:>8.2f} MB ({percentage:>5.1f}%) "
@@ -231,9 +225,7 @@ def _create_memory_report(
         with open(json_report_path, "w") as f:
             json.dump(json_report, f, indent=2)
 
-        logger.debug(
-            "  Generated memory reports: %s, %s", report_path, json_report_path
-        )
+        logger.debug("  Generated memory reports: %s, %s", report_path, json_report_path)
 
     except Exception as e:
         logger.warning("Failed to create memory report for %s: %s", stage, e)
@@ -359,9 +351,7 @@ def move_reports_to_output_dir():
             os.rename(prof_file, dest_path)
             moved_files.append(dest_path)
 
-    for report_file in glob.glob("memory_report_*.txt") + glob.glob(
-        "memory_report_*.json"
-    ):
+    for report_file in glob.glob("memory_report_*.txt") + glob.glob("memory_report_*.json"):
         if not report_file.startswith(_config.output_dir):
             dest_path = os.path.join(_config.output_dir, report_file)
             os.rename(report_file, dest_path)

@@ -61,9 +61,7 @@ def process_content_for_template_format(
                     # Keep other content as-is (text, etc.)
                     processed_content_parts.append(chunk)
 
-        new_msg = {
-            k: v for k, v in msg_dict.items() if v is not None and k != "content"
-        }
+        new_msg = {k: v for k, v in msg_dict.items() if v is not None and k != "content"}
         new_msg["content"] = processed_content_parts
         return new_msg
 

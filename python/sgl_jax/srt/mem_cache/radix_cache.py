@@ -105,9 +105,7 @@ class RadixCache(BasePrefixCache):
 
         if self.page_size == 1:
             self.key_match_fn = _key_match_page_size1
-            self.get_child_key_fn = lambda key: (
-                int(key[0]) if hasattr(key[0], "item") else key[0]
-            )
+            self.get_child_key_fn = lambda key: (int(key[0]) if hasattr(key[0], "item") else key[0])
         else:
             self.key_match_fn = partial(_key_match_paged, page_size=page_size)
             # Ensure returning hashable types, convert numpy arrays to Python native types
@@ -204,12 +202,8 @@ class RadixCache(BasePrefixCache):
             page_aligned_kv_indices = kv_indices
 
         # Radix Cache takes over one reference from memory pool
-        new_prefix_len = self.insert(
-            token_ids[:page_aligned_len], page_aligned_kv_indices
-        )
-        self.token_to_kv_pool_allocator.free(
-            kv_indices[len(req.prefix_indices) : new_prefix_len]
-        )
+        new_prefix_len = self.insert(token_ids[:page_aligned_len], page_aligned_kv_indices)
+        self.token_to_kv_pool_allocator.free(kv_indices[len(req.prefix_indices) : new_prefix_len])
 
         # Remove request slot and release cache lock
         self.req_to_token_pool.free(req.req_pool_idx)
@@ -233,9 +227,7 @@ class RadixCache(BasePrefixCache):
 
         # Radix Cache takes over one reference from memory pool
         new_prefix_len = self.insert(page_aligned_token_ids, page_aligned_kv_indices)
-        self.token_to_kv_pool_allocator.free(
-            kv_indices[len(req.prefix_indices) : new_prefix_len]
-        )
+        self.token_to_kv_pool_allocator.free(kv_indices[len(req.prefix_indices) : new_prefix_len])
 
         # Prefix indices may have been updated, reuse them
         new_match_result = self.match_prefix(page_aligned_token_ids)
@@ -253,9 +245,7 @@ class RadixCache(BasePrefixCache):
         # `req.prefix_indices` will be used later in `PrefillAdder::add_chunked_req`
         if self.page_size != 1:
             # create array on CPU
-            req.prefix_indices = np.concat(
-                [new_indices, kv_indices[len(new_indices) :]]
-            )
+            req.prefix_indices = np.concat([new_indices, kv_indices[len(new_indices) :]])
             # with jax.default_device(self.cpu_device):
             #     kv_indices_cpu = jax.device_put(kv_indices, self.cpu_device)
             #     req.prefix_indices = jnp.concatenate(

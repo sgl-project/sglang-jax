@@ -61,9 +61,7 @@ def get_available_device_memory(device, distributed=False, empty_cache=True):
     elif device in ("gpu", "cuda"):
         if empty_cache:
             jax.clear_caches()
-        devices = [
-            d for d in jax.local_devices() if getattr(d, "platform", None) == "gpu"
-        ]
+        devices = [d for d in jax.local_devices() if getattr(d, "platform", None) == "gpu"]
         if not devices:
             raise RuntimeError("No GPU devices found by JAX")
         avail = []
@@ -84,9 +82,7 @@ def get_available_device_memory(device, distributed=False, empty_cache=True):
         # Use pmap to find the minimum available memory across all devices.
         mesh = jax.make_mesh((jax.process_count(), 4), ("node", "device"))
 
-        @jax.shard_map(
-            mesh=mesh, in_specs=PartitionSpec(None), out_specs=PartitionSpec(None)
-        )
+        @jax.shard_map(mesh=mesh, in_specs=PartitionSpec(None), out_specs=PartitionSpec(None))
         def _get_available_memory_distributed(a):
             return jax.lax.pmin(a, axis_name="node")
 

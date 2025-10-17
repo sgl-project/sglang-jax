@@ -49,15 +49,9 @@ class BenchArgs:
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
         parser.add_argument("--run-name", type=str, default=BenchArgs.run_name)
-        parser.add_argument(
-            "--batch-size", type=int, nargs="+", default=BenchArgs.batch_size
-        )
-        parser.add_argument(
-            "--input-len", type=int, nargs="+", default=BenchArgs.input_len
-        )
-        parser.add_argument(
-            "--output-len", type=int, nargs="+", default=BenchArgs.output_len
-        )
+        parser.add_argument("--batch-size", type=int, nargs="+", default=BenchArgs.batch_size)
+        parser.add_argument("--input-len", type=int, nargs="+", default=BenchArgs.input_len)
+        parser.add_argument("--output-len", type=int, nargs="+", default=BenchArgs.output_len)
         parser.add_argument("--temperature", type=float, default=BenchArgs.temperature)
         parser.add_argument("--return-logprob", action="store_true")
         parser.add_argument(
@@ -70,9 +64,7 @@ class BenchArgs:
             type=float,
             default=BenchArgs.input_len_step_percentage,
         )
-        parser.add_argument(
-            "--result-filename", type=str, default=BenchArgs.result_filename
-        )
+        parser.add_argument("--result-filename", type=str, default=BenchArgs.result_filename)
         parser.add_argument("--base-url", type=str, default=BenchArgs.base_url)
         parser.add_argument("--skip-warmup", action="store_true")
         parser.add_argument("--show-report", action="store_true")
@@ -83,9 +75,7 @@ class BenchArgs:
     def from_cli_args(cls, args: argparse.Namespace):
         # use the default value's type to cast the args into correct types.
         attrs = [(attr.name, type(attr.default)) for attr in dataclasses.fields(cls)]
-        return cls(
-            **{attr: attr_type(getattr(args, attr)) for attr, attr_type in attrs}
-        )
+        return cls(**{attr: attr_type(getattr(args, attr)) for attr, attr_type in attrs})
 
 
 def launch_server_internal(server_args):
@@ -160,9 +150,7 @@ def run_one_case(
 
     profile_link = None
     if profile:
-        profile_link: str = run_profile(
-            url, 3, ["CPU", "GPU"], None, None, profile_by_stage
-        )
+        profile_link: str = run_profile(url, 3, ["CPU", "GPU"], None, None, profile_by_stage)
 
     tic = time.perf_counter()
     response = requests.post(
@@ -336,9 +324,7 @@ def run_benchmark(server_args: ServerArgs, bench_args: BenchArgs):
     if not bench_args.show_report:
         return
 
-    summary = (
-        f"\nInput lens: {bench_args.input_len}. Output lens: {bench_args.output_len}.\n"
-    )
+    summary = f"\nInput lens: {bench_args.input_len}. Output lens: {bench_args.output_len}.\n"
     summary += "| batch size | latency (s) | input throughput (tok/s)  | output throughput (tok/s) | acc length | ITL (ms) | input cost ($/1M) | output cost ($/1M) |"
 
     if bench_args.profile:

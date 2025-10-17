@@ -169,9 +169,9 @@ class ServerArgs:
             self.chunked_prefill_size = 4096
 
         # GGUF
-        if (
-            self.load_format == "auto" or self.load_format == "gguf"
-        ) and check_gguf_file(self.model_path):
+        if (self.load_format == "auto" or self.load_format == "gguf") and check_gguf_file(
+            self.model_path
+        ):
             self.quantization = self.load_format = "gguf"
 
         if is_remote_url(self.model_path):
@@ -801,9 +801,7 @@ class ServerArgs:
         return hf_config
 
     def check_server_args(self):
-        assert (
-            self.tp_size
-        ) % self.nnodes == 0, "tp_size must be divisible by number of nodes"
+        assert (self.tp_size) % self.nnodes == 0, "tp_size must be divisible by number of nodes"
 
         # Check chunked prefill
         # Skip validation if chunked prefill is disabled (i.e., size <= 0).
@@ -868,13 +866,9 @@ class PortArgs:
             rpc_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
             metrics_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
             pub_sub_addr=(
-                f"tcp://{dist_init_host}:{port_base + 4}"
-                if server_args.nnodes > 1
-                else None
+                f"tcp://{dist_init_host}:{port_base + 4}" if server_args.nnodes > 1 else None
             ),
             pub_sub_sync_addr=(
-                f"tcp://{dist_init_host}:{port_base + 5}"
-                if server_args.nnodes > 1
-                else None
+                f"tcp://{dist_init_host}:{port_base + 5}" if server_args.nnodes > 1 else None
             ),
         )

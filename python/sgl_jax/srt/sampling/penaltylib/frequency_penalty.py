@@ -16,10 +16,7 @@ class BatchedFrequencyPenalizer(_BatchedPenalizer):
         self._is_prepared = False
 
     def _is_required(self) -> bool:
-        return any(
-            req.sampling_params.frequency_penalty != 0.0
-            for req in self.orchestrator.reqs()
-        )
+        return any(req.sampling_params.frequency_penalty != 0.0 for req in self.orchestrator.reqs())
 
     def _prepare(self):
         # Only keep the frequency penalty values, not the large penalty array

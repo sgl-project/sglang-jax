@@ -38,9 +38,7 @@ class ModelWorkerClient:
         # Init future mappings
         self.future_token_ids_ct = 0
         self.future_token_ids_limit = self.max_running_requests * 3
-        self.future_token_ids_map = jnp.zeros(
-            (self.max_running_requests * 5,), dtype=jnp.int32
-        )
+        self.future_token_ids_map = jnp.zeros((self.max_running_requests * 5,), dtype=jnp.int32)
         self.mesh = mesh
         sharding = NamedSharding(mesh, PartitionSpec(None))
         self.future_token_ids_map = jax.device_put(self.future_token_ids_map, sharding)
@@ -112,13 +110,11 @@ class ModelWorkerClient:
             )
 
             # Run forward
-            logits_output, next_token_ids, cache_miss_count = (
-                self.worker.forward_batch_generation(
-                    model_worker_batch,
-                    model_worker_batch.launch_done,
-                    sampling_metadata=sampling_metadata,
-                    forward_metadata=forward_metadata,
-                )
+            logits_output, next_token_ids, cache_miss_count = self.worker.forward_batch_generation(
+                model_worker_batch,
+                model_worker_batch.launch_done,
+                sampling_metadata=sampling_metadata,
+                forward_metadata=forward_metadata,
             )
 
             # Update the future token ids map
@@ -126,9 +122,7 @@ class ModelWorkerClient:
                 self.future_token_ids_map, future_token_ids_ct, next_token_ids
             )
 
-            self.output_queue.put(
-                (None, logits_output, next_token_ids, cache_miss_count)
-            )
+            self.output_queue.put((None, logits_output, next_token_ids, cache_miss_count))
 
     def resolve_last_batch_result(self, launch_done: threading.Event | None = None):
         """
@@ -197,9 +191,7 @@ class ModelWorkerClient:
             -1,
             dtype=np.int32,
         )
-        self.future_token_ids_ct = (
-            self.future_token_ids_ct + bs
-        ) % self.future_token_ids_limit
+        self.future_token_ids_ct = (self.future_token_ids_ct + bs) % self.future_token_ids_limit
         return None, future_next_token_ids, 0
 
     def run_precompile(self):
