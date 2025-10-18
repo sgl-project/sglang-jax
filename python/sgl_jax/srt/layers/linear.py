@@ -1,9 +1,10 @@
-from typing import Any, Callable, Iterable, Optional, Sequence, Tuple, Union
+from typing import Iterable, Optional, Sequence, Tuple
 
 import jax
 from flax import nnx
 from jax import numpy as jnp
 
+from sgl_jax.srt.utils.jax_utils import jit_with_partitioning
 
 def _canonicalize_tuple(x):
     if isinstance(x, Iterable):
@@ -43,13 +44,13 @@ class LinearBase(nnx.Module):
         rngs = rngs or nnx.Rngs(0)
         self.skip_bias_add = skip_bias_add
         self.weight = nnx.Param(
-            nnx.with_partitioning(nnx.initializers.normal(), kernel_axes)(
+            jit_with_partitioning(nnx.initializers.normal(), kernel_axes)(
                 rngs.params(), (input_size, output_size), params_dtype
             )
         )
         if use_bias:
             self.bias = nnx.Param(
-                nnx.with_partitioning(
+                jit_with_partitioning(
                     nnx.initializers.zeros_init(), (kernel_axes[-1],)
                 )(rngs.params(), (output_size,), params_dtype)
             )

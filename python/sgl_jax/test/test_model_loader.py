@@ -63,7 +63,7 @@ class TestModelLoader(unittest.TestCase):
         self.assertIsInstance(loader, JAXModelLoader)
         self.assertEqual(loader.load_config, self.load_config)
         self.assertEqual(loader.mesh, self.mesh)
-        self.assertEqual(loader.rng, self.rng)
+        self.assertEqual(loader.rngs, self.rng)
 
     def test_get_model_loader(self):
         """Test get_model_loader function."""

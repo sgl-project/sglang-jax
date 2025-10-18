@@ -2,7 +2,7 @@ import abc
 import logging
 import time
 from functools import partial
-from typing import List, Optional, Tuple, Union
+from typing import List, Optional, Tuple, Union, Sequence
 
 import jax
 import jax.numpy as jnp
@@ -455,7 +455,7 @@ def _set_fused_kv_buffer(
     loc: jax.Array,
     kv_cache: jax.Array,
     page_size: int,
-    kv_partition_axis: str = "tensor",
+    kv_partition_axis: Union[str, Sequence[str]] = "tensor",
 ) -> jax.Array:
     """
     Update fused KV cache with new fused KV data.
@@ -484,7 +484,7 @@ def update_fused_kv_cache(
     loc: jax.Array,  # [total_tokens], -1 for padding
     kv_cache: jax.Array,  # [cache_size, num_kv_heads * 2, head_dim]
     page_size: int = 1,
-    kv_partition_axis: str = "tensor",
+    kv_partition_axis: Union[str, Sequence[str]] = "tensor",
 ) -> jax.Array:
     """
     Main fused KV cache update function.
@@ -605,7 +605,7 @@ def kv_cache_update(
     *,
     page_size: int = 1,  # because we treat each token as an independent query
     num_slices_per_block: int = 8,
-    kv_partition_axis: str = "tensor",
+    kv_partition_axis: Union[str, Sequence[str]] = "tensor",
 ):
     @jax.shard_map(
         in_specs=(
@@ -714,7 +714,7 @@ def update_kv_cache_vectorized(
     k_cache: jax.Array,
     v_cache: jax.Array,
     page_size: int,
-    kv_partition_axis: str = "tensor",
+    kv_partition_axis: Union[str, Sequence[str]] = "tensor",
     mesh: jax.sharding.Mesh = None,
 ):
     """
@@ -783,7 +783,7 @@ def update_fused_kv_cache_vectorized(
     loc: jax.Array,  # [total_tokens], -1 for padding
     kv_cache: jax.Array,  # [cache_size, num_kv_heads * 2, head_dim]
     page_size: int,
-    kv_partition_axis: str = "tensor",
+    kv_partition_axis: Union[str, Sequence[str]] = "tensor",
 ) -> jax.Array:
     """
     Vectorized fused KV cache update that handles padding and supports page_size > 1

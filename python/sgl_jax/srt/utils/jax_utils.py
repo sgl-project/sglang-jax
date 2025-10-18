@@ -1,7 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
+import functools
+
 import jax
 import jax.numpy as jnp
 from jax.sharding import NamedSharding, PartitionSpec
+from flax import nnx
 
 
 def get_num_kv_heads_by_tp(total_num_kv_heads: int, tp_size: int) -> int:
@@ -105,3 +108,19 @@ def is_tpu_runtime() -> bool:
         return len(devs) > 0 and all(d.platform == "tpu" for d in devs)
     except Exception:
         return jax.default_backend() == "tpu"
+
+
+def jit_with_partitioning(initializer: nnx.Initializer, sharding):
+    in_shardings = (PartitionSpec(),)
+    out_shardings = PartitionSpec(*sharding) if sharding is not None else PartitionSpec()
+
+    @functools.partial(
+        jax.jit,
+        static_argnames=("shape", "dtype"),
+        in_shardings=in_shardings,
+        out_shardings=out_shardings,
+    )
+    def wrapped(key, shape, dtype):
+        return initializer(key, shape, dtype)
+
+    return wrapped

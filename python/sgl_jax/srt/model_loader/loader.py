@@ -56,7 +56,7 @@ class JAXModelLoader(BaseModelLoader):
         self, load_config: LoadConfig, rngs: nnx.Rngs, mesh: jax.sharding.Mesh
     ):
         super().__init__(load_config)
-        self.rng = rngs
+        self.rngs = rngs
         self.mesh = mesh
 
     def download_model(self, model_config: ModelConfig) -> str:
@@ -92,19 +92,10 @@ class JAXModelLoader(BaseModelLoader):
         return model_class
 
     def _get_model(self, model_class: Any, model_config: ModelConfig) -> nnx.Module:
-        @nnx.jit
-        def create_model(rng: nnx.Rngs):
-            model = model_class(model_config, rng, self.mesh)
-            state = nnx.state(model)
-            pspecs = nnx.get_partition_spec(state)
-            sharded_state = jax.lax.with_sharding_constraint(state, pspecs)
-            nnx.update(model, sharded_state)
-            return model
-
         with jax.sharding.use_mesh(self.mesh):
-            model = create_model(self.rng)
+            model = model_class(model_config, rngs=self.rngs, mesh=self.mesh)
 
-        rng_key = self.rng.default.key.value
+        rng_key = self.rngs.default.key.value
         model.load_weights(rng_key)
 
         return model
@@ -254,12 +245,8 @@ class JAXDummyModelLoader(BaseModelLoader):
         model_class = self._initialize_model(model_config)
 
         with jax.sharding.use_mesh(self.mesh):
-            model = model_class(model_config.hf_config, self.rngs, self.mesh)
-            # self._initialize_dummy_weights(model)
-            state = nnx.state(model)
-            pspecs = nnx.get_partition_spec(state)
-            sharded_state = jax.lax.with_sharding_constraint(state, pspecs)
-            nnx.update(model, sharded_state)
+            model = model_class(model_config, rngs=self.rngs, mesh=self.mesh)
+            self._initialize_dummy_weights(model)
 
         for dev in jax.local_devices():
             print(dev, dev.memory_stats())

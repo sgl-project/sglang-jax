@@ -68,7 +68,6 @@ class ModelRunner:
     ):
         # Parse args
         self.model_config = model_config
-        self.model_config.num_hidden_layers = 1
         self.mem_fraction_static = mem_fraction_static
         self.device = server_args.device
         self.mesh = mesh
@@ -199,7 +198,7 @@ class ModelRunner:
 
     def get_available_device_memory(self):
         min_available_device_memory = get_available_device_memory(
-            self.device, distributed=False
+            self.device, distributed=True
         )
 
         # Check memory for tensor parallelism
@@ -271,7 +270,7 @@ class ModelRunner:
             f"cell_size={cell_size}bytes"
         )
 
-        return max_tokens
+        return 100
 
     def init_memory_pool(
         self,

@@ -24,6 +24,7 @@ from flax.nnx.nn import dtypes
 from flax.nnx.nn.linear import default_embed_init
 from flax.typing import PromoteDtypeFn
 
+from sgl_jax.srt.utils.jax_utils import jit_with_partitioning
 
 class Embed(nnx.Module):
     """A parameterized function from integers [0, n) to d-dimensional vectors.
@@ -63,7 +64,7 @@ class Embed(nnx.Module):
         """
         rngs = rngs or nnx.Rngs(0)
         self.embedding = nnx.Param(
-            nnx.with_partitioning(default_embed_init, (None, None))(
+            jit_with_partitioning(default_embed_init, (None, None))(
                 rngs.params(), (num_embeddings, features), param_dtype
             )
         )
@@ -157,9 +158,9 @@ class ParallelLMHead(Embed):
         )
         if use_bias:
             self.bias = nnx.Param(
-                nnx.with_partitioning(nnx.initializers.constant(0.0), (None, "tensor"))(
-                    rngs.params(), (self.num_embeddings, self.features), param_dtype
-                )
+                jit_with_partitioning(
+                    nnx.initializers.constant(0.0), (None, "tensor")
+                )(rngs.params(), (self.num_embeddings, self.features), param_dtype)
             )
         else:
             self.bias = None

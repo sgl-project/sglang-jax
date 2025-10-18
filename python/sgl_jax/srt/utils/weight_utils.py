@@ -1,3 +1,4 @@
+import collections
 import functools
 import glob
 import logging
@@ -105,7 +106,7 @@ class WeightLoader:
             else:
                 regular_mappings[key] = mapping
 
-        expert_weights = {}
+        expert_weights = collections.defaultdict(list)
 
         logger.info(
             f"WeightLoader: Will load layers 0 to {self.model_config.num_hidden_layers - 1}"
@@ -118,11 +119,13 @@ class WeightLoader:
                     mapping = WeightMapping(target_path=mapping)
 
                 self._process_and_assign_weight(params, hf_key, hf_weight, mapping)
-            elif "mlp.experts." in hf_key and hf_key.endswith(".weight"):
+            elif (
+                "mlp.experts." in hf_key or "block_sparse_moe.experts" in hf_key
+            ) and hf_key.endswith(".weight"):
                 if self._is_excluded_layer_weight(hf_key):
                     logger.debug(f"Skipping excluded MoE expert weight: {hf_key}")
                 else:
-                    expert_weights[hf_key] = hf_weight.astype(self.dtype)
+                    expert_weights[hf_key].append(hf_weight.astype(self.dtype))
             else:
                 if self._is_excluded_layer_weight(hf_key):
                     logger.debug(f"Skipping excluded layer weight: {hf_key}")
@@ -550,7 +553,7 @@ class WeightLoader:
         self,
         params: nnx.State,
         moe_mappings: Dict[str, WeightMapping],
-        expert_weights: Dict[str, jax.Array],
+        expert_weights: Dict[str, List[jax.Array]],
     ):
         with tqdm(
             moe_mappings.items(), desc="[STACKING] MOE EXPERTS", unit="layer"
@@ -572,9 +575,15 @@ class WeightLoader:
                 collected_weights = []
                 for expert_key in expert_keys:
                     if expert_key in expert_weights:
-                        weight = expert_weights[expert_key]
+                        weights = expert_weights[expert_key]
                         if mapping.transpose and not expert_key.endswith(".bias"):
-                            weight = jnp.transpose(weight, (1, 0))
+                            weights = [jnp.transpose(w, (1, 0)) for w in weights]
+                        if len(weights) > 1:
+                            # We can have multiple weights per expert key
+                            # This is because the weights might use TP for MoE layers
+                            weight = jnp.concatenate(weights, axis=-1)
+                        else:
+                            weight = weights[0]
                         collected_weights.append(weight)
                     else:
                         logger.warning(f"Missing expert weight: {expert_key}")
@@ -588,6 +597,9 @@ class WeightLoader:
                         device_experts, mapping.sharding
                     )
                     model_param = self._get_param(params, target_path)
+                    assert (
+                        model_param.value.shape == sharded_weight.shape
+                    ), f"{model_param.value.shape} != {sharded_weight.shape}, ({stacked_weight.shape})"
                     model_param.value = sharded_weight
                 else:
                     logger.error(

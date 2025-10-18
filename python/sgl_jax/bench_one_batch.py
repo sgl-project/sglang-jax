@@ -137,17 +137,19 @@ def load_model(server_args, port_args, tp_rank):
     # server_args.tp_size = 1
     # suppress_other_loggers()
     rank_print = print if tp_rank == 0 else lambda *args, **kwargs: None
-    moe_ep_rank = tp_rank // (server_args.tp_size // server_args.ep_size)
 
     model_config = ModelConfig.from_server_args(server_args)
 
     # Create a mesh that includes both 'data' and 'tensor' axes.
     # Use a size-1 'data' axis and shard across the 'tensor' axis per tp_size.
     all_devices = jax.devices()
-    tp = min(server_args.tp_size, len(all_devices))
-    devices = all_devices[:tp]
+    dp = server_args.dp_size
+    tp = server_args.tp_size
+    devices = all_devices[:dp * tp]
     print(f"devices: {devices}")
-    devices_array = np.array(devices, dtype=object).reshape((1, tp))
+    print(f"dp: {dp}")
+    print(f"tp: {tp}")
+    devices_array = np.array(devices, dtype=object).reshape((dp, tp))
     mesh = jax.sharding.Mesh(devices_array, ("data", "tensor"))
 
     model_runner = ModelRunner(
@@ -555,7 +557,6 @@ def main(server_args, bench_args):
     jax.distributed.initialize()
 
     server_args.cuda_graph_max_bs = max(bench_args.batch_size)
-    server_args.ep_size = 1
 
     # Constrain static KV allocation for single-device TPU if not user-specified
     if (

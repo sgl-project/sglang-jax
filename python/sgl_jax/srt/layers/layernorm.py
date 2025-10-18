@@ -1,10 +1,11 @@
-from functools import partial
 from typing import Optional, Sequence, Tuple, Union
 
 import jax
 import jax.numpy as jnp
 from flax import nnx
 from jax import lax
+
+from sgl_jax.srt.utils.jax_utils import jit_with_partitioning
 
 
 class RMSNorm(nnx.Module):
@@ -21,7 +22,7 @@ class RMSNorm(nnx.Module):
         rngs = rngs or nnx.Rngs(0)
         self.variance_epsilon = epsilon
         self.weight = nnx.Param(
-            nnx.with_partitioning(nnx.initializers.ones, kernel_axes)(
+            jit_with_partitioning(nnx.initializers.ones, kernel_axes)(
                 rngs.params(), (hidden_size,), params_dtype
             )
         )
