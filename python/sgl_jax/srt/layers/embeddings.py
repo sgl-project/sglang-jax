@@ -190,9 +190,7 @@ class RotaryEmbedding:
         self.is_neox_style = is_neox_style
         self.dtype = dtype
 
-        inv_freq_np = 1.0 / (
-            base ** (np.arange(0, rotary_dim, 2, dtype=np.float32) / rotary_dim)
-        )
+        inv_freq_np = 1.0 / (base ** (np.arange(0, rotary_dim, 2, dtype=np.float32) / rotary_dim))
         self._inv_freq_np = inv_freq_np  # shape: (rotary_dim // 2,)
 
     def __call__(

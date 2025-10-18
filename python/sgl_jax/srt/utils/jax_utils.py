@@ -120,11 +120,7 @@ def print_memory(stage_name):
     memory = get_memory_usage()
     print(f"\n[{stage_name}] Memory usage:")
     for device, usage in memory.items():
-        print(
-            f"  {device}: {usage}GB"
-            if isinstance(usage, float)
-            else f"  {device}: {usage}"
-        )
+        print(f"  {device}: {usage}GB" if isinstance(usage, float) else f"  {device}: {usage}")
     return memory
 
 
@@ -136,8 +132,8 @@ def get_memory_usage():
             try:
                 device_stats = device.memory_stats()
                 stats[f"device_{i}"] = device_stats.get("bytes_in_use", 0) / (1024**3)
-            except:
+            except Exception:
                 stats[f"device_{i}"] = "N/A"
         return stats
-    except:
+    except Exception:
         return {f"device_{i}": "N/A" for i in range(len(jax.devices()))}

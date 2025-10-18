@@ -20,16 +20,14 @@ Includes fast algorithms top-k masking and top-p masking on probability
 distributions.
 """
 
-from typing import Callable, Sequence
+from collections.abc import Callable, Sequence
 
 import jax
 from jax import lax
 from jax import numpy as jnp
 
 
-def int32_bsearch(
-    batch_shape: Sequence[int], predicate: Callable[[jnp.ndarray], jnp.ndarray]
-):
+def int32_bsearch(batch_shape: Sequence[int], predicate: Callable[[jnp.ndarray], jnp.ndarray]):
     """Batched binary search over int32 values.
 
     For each element of the batch, search for the largest int32 (closest to
@@ -54,9 +52,7 @@ def int32_bsearch(
     # bits. we use uint32 due to numpy promotion/casting rules.
     midpoint = current_bits
     predicate_satisfied = predicate(midpoint)
-    current_bits = current_bits | jnp.where(
-        predicate_satisfied, jnp.uint32(1 << 31), jnp.uint32(0)
-    )
+    current_bits = current_bits | jnp.where(predicate_satisfied, jnp.uint32(1 << 31), jnp.uint32(0))
     del midpoint, predicate_satisfied
 
     def loop_body(i, current_bits):
