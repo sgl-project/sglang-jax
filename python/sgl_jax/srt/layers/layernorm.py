@@ -1,4 +1,5 @@
-from typing import Any, Iterable, Optional, Tuple
+from collections.abc import Iterable
+from typing import Any
 
 import jax
 import jax.numpy as jnp
@@ -9,7 +10,7 @@ from flax.typing import Array, Axes, Dtype, Initializer
 from jax import lax
 
 
-def _canonicalize_axes(rank: int, axes: Axes) -> Tuple[int, ...]:
+def _canonicalize_axes(rank: int, axes: Axes) -> tuple[int, ...]:
     """Returns a tuple of deduplicated, sorted, and positive axes."""
     if not isinstance(axes, Iterable):
         axes = (axes,)
@@ -30,13 +31,13 @@ class RMSNorm(nnx.Module):
         num_features: int,
         *,
         epsilon: float = 1e-6,
-        dtype: Optional[Dtype] = None,
+        dtype: Dtype | None = None,
         param_dtype: Dtype = jnp.float32,
         use_scale: bool = True,
         scale_init: Initializer = initializers.ones,
         reduction_axes: Axes = -1,
         feature_axes: Axes = -1,
-        axis_name: Optional[str] = None,
+        axis_name: str | None = None,
         axis_index_groups: Any = None,
         use_fast_variance: bool = True,
         rngs: rnglib.Rngs,
@@ -45,9 +46,7 @@ class RMSNorm(nnx.Module):
 
         self.scale: nnx.Param[jax.Array] | None
         if use_scale:
-            self.scale = nnx.Param(
-                scale_init(jax.random.PRNGKey(0), feature_shape, param_dtype)
-            )
+            self.scale = nnx.Param(scale_init(jax.random.PRNGKey(0), feature_shape, param_dtype))
         else:
             self.scale = None
 
@@ -63,7 +62,7 @@ class RMSNorm(nnx.Module):
         self.axis_index_groups = axis_index_groups
         self.use_fast_variance = use_fast_variance
 
-    def __call__(self, x, mask: Optional[jax.Array] = None):
+    def __call__(self, x, mask: jax.Array | None = None):
         mean, var = _compute_stats(
             x,
             self.reduction_axes,
@@ -91,12 +90,12 @@ class RMSNorm(nnx.Module):
 def _compute_stats(
     x: Array,
     axes: Axes,
-    dtype: Optional[Dtype],
-    axis_name: Optional[str] = None,
+    dtype: Dtype | None,
+    axis_name: str | None = None,
     axis_index_groups: Any = None,
     use_mean: bool = True,
     use_fast_variance: bool = True,
-    mask: Optional[Array] = None,
+    mask: Array | None = None,
 ):
     if dtype is None:
         dtype = jnp.result_type(x)
@@ -130,9 +129,7 @@ def _compute_stats(
             var = jnp.maximum(0.0, mu2 - _abs_sq(mu))
         else:
             mu = maybe_distributed_mean(x, mask=mask)
-            var = maybe_distributed_mean(
-                _abs_sq(x - jnp.expand_dims(mu, axes)), mask=mask
-            )
+            var = maybe_distributed_mean(_abs_sq(x - jnp.expand_dims(mu, axes)), mask=mask)
     else:
         var = maybe_distributed_mean(_abs_sq(x), mask=mask)
         mu = jnp.zeros_like(var)
@@ -143,11 +140,11 @@ def _normalize(
     x: Array,
     mean: Array,
     var: Array,
-    scale: Optional[Array],
-    bias: Optional[Array],
+    scale: Array | None,
+    bias: Array | None,
     reduction_axes: Axes,
     feature_axes: Axes,
-    dtype: Optional[Dtype],
+    dtype: Dtype | None,
     epsilon: float,
 ):
     reduction_axes = _canonicalize_axes(x.ndim, reduction_axes)

@@ -123,7 +123,7 @@ class WeightLoader:
                 if self._is_excluded_layer_weight(hf_key):
                     logger.debug("Skipping excluded layer weight: %s", hf_key)
                 else:
-                    logger.warning(f"No mapping found for weight: {hf_key}")
+                    logger.warning("No mapping found for weight: %s", hf_key)
         nnx.update(self.model, params)
 
         if moe_mappings:

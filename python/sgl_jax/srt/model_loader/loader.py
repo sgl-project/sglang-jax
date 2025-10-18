@@ -1,24 +1,19 @@
 import dataclasses
 import logging
 import os
-import time
 from abc import ABC, abstractmethod
-from functools import partial
-from typing import Any, List, Optional, Tuple
+from typing import Any
 
-import flax.linen as nn
 import huggingface_hub
 import jax
 import jax.numpy as jnp
 import numpy as np
 from flax import nnx
-from jax.sharding import NamedSharding
 
 from sgl_jax.srt.configs.load_config import LoadConfig, LoadFormat
 from sgl_jax.srt.configs.model_config import ModelConfig
 from sgl_jax.srt.model_loader.arch import get_model_architecture
 from sgl_jax.srt.utils.common_utils import get_bool_env_var
-from sgl_jax.srt.utils.jax_utils import print_memory
 
 logger = logging.getLogger(__name__)
 

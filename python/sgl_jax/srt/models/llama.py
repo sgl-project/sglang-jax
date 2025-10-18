@@ -25,11 +25,7 @@ from flax import nnx
 from transformers import LlamaConfig, PretrainedConfig
 
 from sgl_jax.srt.configs.model_config import ModelConfig
-from sgl_jax.srt.layers.embeddings import (
-    Embed,
-    ParallelLMHead,
-    get_rope,
-)
+from sgl_jax.srt.layers.embeddings import Embed, ParallelLMHead, get_rope
 from sgl_jax.srt.layers.layernorm import RMSNorm
 from sgl_jax.srt.layers.linear import LinearBase
 from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor

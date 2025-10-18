@@ -16,7 +16,7 @@ import uuid
 from collections import deque
 from datetime import datetime
 from http import HTTPStatus
-from typing import Any, Generic, TypeVar
+from typing import Any
 
 import fastapi
 import jax
@@ -417,7 +417,7 @@ class TokenizerManager:
         while True:
             try:
                 await asyncio.wait_for(state.event.wait(), timeout=self.wait_timeout)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 if request is not None and await request.is_disconnected():
                     # Abort the request for disconnected requests (non-streaming, waiting queue)
                     self.abort_request(obj.rid)
@@ -1241,10 +1241,7 @@ class SignalHandler:
         kill_process_tree(os.getpid())
 
 
-T = TypeVar("T")
-
-
-class _Communicator(Generic[T]):
+class _Communicator[T]:
     """Note: The communicator now only run up to 1 in-flight request at any time."""
 
     def __init__(self, sender, fan_out: int):
