@@ -9,7 +9,6 @@ https://arxiv.org/abs/2210.03057 reference: https://github.com/google-research/u
 
 import re
 import urllib
-from typing import Optional
 
 from sgl_jax.test import simple_eval_common as common
 from sgl_jax.test.simple_eval_common import (
@@ -139,7 +138,7 @@ class MGSMEval(Eval):
         self,
         num_examples_per_lang: int = 250,  # restrict to a subset of the data for debugging
         num_threads: int = 64,
-        languages: Optional[list[str]] = ALL_LANGUAGES,
+        languages: list[str] | None = ALL_LANGUAGES,
     ):
         if languages is None:
             languages = ALL_LANGUAGES
@@ -163,9 +162,7 @@ class MGSMEval(Eval):
     def __call__(self, sampler: SamplerBase) -> EvalResult:
         def fn(example: dict[str, str]):
             language = example["lang"]
-            latin_language = (
-                "group_latin" if language in LATIN_LANGUAGES else "group_non_latin"
-            )
+            latin_language = "group_latin" if language in LATIN_LANGUAGES else "group_non_latin"
             correct_answer = example["targets"]
             instructoin = LANG_TO_INSTRUCTIONS[language]
             prompt_messages = [
@@ -175,7 +172,7 @@ class MGSMEval(Eval):
             ]
             try:
                 response_text = sampler(prompt_messages)
-            except Exception as e:
+            except Exception:
                 response_text = ""
 
             answer_prefix = LANG_TO_ANSWER_PREFIX[language]
@@ -197,7 +194,5 @@ class MGSMEval(Eval):
                 metrics={language: score, latin_language: score},
             )
 
-        results = common.map_with_progress(
-            fn, self.examples, num_threads=self._num_threads
-        )
+        results = common.map_with_progress(fn, self.examples, num_threads=self._num_threads)
         return common.aggregate_results(results, default_stats=("mean", "std"))

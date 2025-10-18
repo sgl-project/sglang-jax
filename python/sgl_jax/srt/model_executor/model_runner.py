@@ -3,7 +3,6 @@
 import logging
 import os
 from functools import partial
-from typing import Optional, Tuple, Union
 
 import jax
 import jax.numpy as jnp
@@ -13,13 +12,12 @@ from jax._src import mesh as mesh_lib
 from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 
-from sgl_jax.srt.configs.load_config import LoadConfig, LoadFormat
+from sgl_jax.srt.configs.load_config import LoadConfig
 from sgl_jax.srt.configs.model_config import AttentionArch, MockModelConfig, ModelConfig
 from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessorOutput
 from sgl_jax.srt.layers.sampler import Sampler
 from sgl_jax.srt.managers.schedule_batch import (
     GLOBAL_SERVER_ARGS_KEYS,
-    ModelWorkerBatch,
     global_server_args_dict,
 )
 from sgl_jax.srt.mem_cache.allocator import (
@@ -28,10 +26,10 @@ from sgl_jax.srt.mem_cache.allocator import (
     TokenToKVPoolAllocator,
 )
 from sgl_jax.srt.mem_cache.memory_pool import MHATokenToKVPool, ReqToTokenPool
-from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
 from sgl_jax.srt.model_loader.loader import get_model_loader
 from sgl_jax.srt.precision_tracer import precision_tracer
-from sgl_jax.srt.sampling.sampling_batch_info import SamplingBatchInfo, SamplingMetadata
+from sgl_jax.srt.sampling.sampling_batch_info import SamplingMetadata
 from sgl_jax.srt.server_args import ServerArgs
 from sgl_jax.srt.utils.common_utils import get_bool_env_var
 from sgl_jax.srt.utils.jax_utils import get_available_device_memory
@@ -62,8 +60,8 @@ class ModelRunner:
         tp_size: int,
         server_args: ServerArgs,
         mesh: jax.sharding.Mesh,
-        req_to_token_pool: Optional[ReqToTokenPool] = None,
-        token_to_kv_pool_allocator: Optional[BaseTokenToKVPoolAllocator] = None,
+        req_to_token_pool: ReqToTokenPool | None = None,
+        token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator | None = None,
         rngs: nnx.Rngs = None,
     ):
         # Parse args
@@ -73,9 +71,7 @@ class ModelRunner:
         self.mesh = mesh
         # model args
         self.num_attn_heads = model_config.num_attention_heads
-        self.num_kv_heads = model_config.get_total_num_kv_heads_with_replication(
-            tp_size
-        )
+        self.num_kv_heads = model_config.get_total_num_kv_heads_with_replication(tp_size)
         self.rngs = rngs
 
         self.tp_size = tp_size
@@ -103,9 +99,7 @@ class ModelRunner:
         )
 
         # Initialize precision tracer enable state
-        precision_tracer.set_enable_precision_tracer(
-            server_args.enable_precision_tracer
-        )
+        precision_tracer.set_enable_precision_tracer(server_args.enable_precision_tracer)
 
         # If it is a draft model, tp_group can be different
         self.initialize()
@@ -143,9 +137,7 @@ class ModelRunner:
         model_def, model_state = nnx.split(self.model)
         model_state_leaves, model_state_def = jax.tree_util.tree_flatten(model_state)
         sampler_def, sampler_state = nnx.split(self.sampler)
-        sampler_state_leaves, sampler_state_def = jax.tree_util.tree_flatten(
-            sampler_state
-        )
+        sampler_state_leaves, sampler_state_def = jax.tree_util.tree_flatten(sampler_state)
 
         @partial(
             jax.jit,
@@ -160,17 +152,13 @@ class ModelRunner:
             token_to_kv_pool,
             logits_metadata,
         ):
-            model_state = jax.tree_util.tree_unflatten(
-                model_state_def, model_state_leaves
-            )
+            model_state = jax.tree_util.tree_unflatten(model_state_def, model_state_leaves)
             model = nnx.merge(model_def, model_state)
             return model(forward_batch, token_to_kv_pool, logits_metadata)
 
         @partial(jax.jit, static_argnames=["sampler_state_def"])
         def jitted_sampler(sampler_def, sampler_state_def, sampler_state_leaves, *args):
-            model_state = jax.tree_util.tree_unflatten(
-                sampler_state_def, sampler_state_leaves
-            )
+            model_state = jax.tree_util.tree_unflatten(sampler_state_def, sampler_state_leaves)
             sampler = nnx.merge(sampler_def, model_state)
             return sampler(*args)
 
@@ -192,24 +180,22 @@ class ModelRunner:
         )
 
     def get_available_device_memory(self):
-        min_available_device_memory = get_available_device_memory(
-            self.device, distributed=False
-        )
+        min_available_device_memory = get_available_device_memory(self.device, distributed=False)
 
         # Check memory for tensor parallelism
         local_device_memory = get_available_device_memory(self.device)
-        if self.tp_size > 1:
-            if min_available_device_memory < local_device_memory * 0.9:
-                if get_bool_env_var("SGL_DISABLE_TP_MEMORY_INBALANCE_CHECK"):
-                    logger.warning(
-                        "The memory capacity is unbalanced. "
-                        f"{min_available_device_memory=}, {local_device_memory=}, {local_device_memory * 0.9=}"
-                    )
-                else:
-                    raise ValueError(
-                        "The memory capacity is unbalanced. "
-                        f"{min_available_device_memory=}, {local_device_memory=}, {local_device_memory * 0.9=}"
-                    )
+        if self.tp_size > 1 and min_available_device_memory < local_device_memory * 0.9:
+            if get_bool_env_var("SGL_DISABLE_TP_MEMORY_INBALANCE_CHECK"):
+                logger.warning(
+                    "The memory capacity is unbalanced. min_available_device_memory=%s, local_device_memory=%s, local_device_memory*0.9=%s",
+                    min_available_device_memory,
+                    local_device_memory,
+                    local_device_memory * 0.9,
+                )
+            else:
+                raise ValueError(
+                    f"The memory capacity is unbalanced. min_available_device_memory={min_available_device_memory}, local_device_memory={local_device_memory}, local_device_memory*0.9={local_device_memory * 0.9}"
+                )
 
         return min_available_device_memory
 
@@ -224,9 +210,7 @@ class ModelRunner:
 
         self.dtype = self.model_config.dtype
         self.start_layer = getattr(self.model, "start_layer", 0)
-        self.end_layer = getattr(
-            self.model, "end_layer", self.model_config.num_hidden_layers
-        )
+        self.end_layer = getattr(self.model, "end_layer", self.model_config.num_hidden_layers)
         self.num_effective_layers = self.end_layer - self.start_layer
 
     def profile_max_num_token(self, total_device_memory: int):
@@ -242,9 +226,7 @@ class ModelRunner:
         )
 
         if available_kv_cache_bytes <= 0:
-            raise RuntimeError(
-                "Not enough memory. Please try to increase --mem-fraction-static."
-            )
+            raise RuntimeError("Not enough memory. Please try to increase --mem-fraction-static.")
 
         cell_size = (
             self.model_config.get_num_kv_heads(self.tp_size)
@@ -258,20 +240,20 @@ class ModelRunner:
         max_tokens = max(1, int(available_kv_cache_bytes // cell_size))
 
         logger.info(
-            f"TPU Memory profiling: "
-            f"available_device_memory={available_device_memory / (1024**3):.1f}GB, "
-            f"available_kv_cache={available_kv_cache_bytes / (1024**3):.1f}GB, "
-            f"max_tokens={max_tokens}, "
-            f"cell_size={cell_size}bytes"
+            "TPU Memory profiling: available_device_memory=%.1fGB, available_kv_cache=%.1fGB, max_tokens=%d, cell_size=%dbytes",
+            available_device_memory / (1024**3),
+            available_kv_cache_bytes / (1024**3),
+            max_tokens,
+            cell_size,
         )
 
         return max_tokens
 
     def init_memory_pool(
         self,
-        max_num_reqs: Optional[int] = None,
-        max_total_tokens: Optional[int] = None,
-        total_device_memory: Optional[int] = None,
+        max_num_reqs: int | None = None,
+        max_total_tokens: int | None = None,
+        total_device_memory: int | None = None,
     ):
         """Initialize memory pool for KV cache."""
         # Set KV cache data type
@@ -280,10 +262,8 @@ class ModelRunner:
         elif self.server_args.kv_cache_dtype == "bf16":
             self.kv_cache_dtype = jnp.bfloat16
         else:
-            raise ValueError(
-                f"Unsupported kv_cache_dtype: {self.server_args.kv_cache_dtype}."
-            )
-        logger.info(f"ModelRunner kv_cache_dtype: {self.kv_cache_dtype}")
+            raise ValueError(f"Unsupported kv_cache_dtype: {self.server_args.kv_cache_dtype}.")
+        logger.info("ModelRunner kv_cache_dtype: %s", self.kv_cache_dtype)
         # Profile maximum number of tokens
         self.max_total_num_tokens = self.profile_max_num_token(total_device_memory)
 
@@ -291,9 +271,7 @@ class ModelRunner:
         if max_num_reqs is None:
             max_num_reqs = min(
                 max(
-                    int(
-                        self.max_total_num_tokens / self.model_config.context_len * 512
-                    ),
+                    int(self.max_total_num_tokens / self.model_config.context_len * 512),
                     2048,
                 ),
                 4096,
@@ -308,25 +286,21 @@ class ModelRunner:
         if max_total_tokens is not None:
             if max_total_tokens > self.max_total_num_tokens:
                 logger.warning(
-                    f"max_total_tokens={max_total_tokens} is larger than the profiled value "
-                    f"{self.max_total_num_tokens}. "
-                    f"Use the profiled value instead."
+                    "max_total_tokens=%s is larger than the profiled value %s. Use the profiled value instead.",
+                    max_total_tokens,
+                    self.max_total_num_tokens,
                 )
             self.max_total_num_tokens = min(self.max_total_num_tokens, max_total_tokens)
 
         # Align to page size
         self.max_total_num_tokens = (
-            self.max_total_num_tokens
-            // self.server_args.page_size
-            * self.server_args.page_size
+            self.max_total_num_tokens // self.server_args.page_size * self.server_args.page_size
         )
 
         if self.max_total_num_tokens <= 0:
-            raise RuntimeError(
-                "Not enough memory. Please try to increase --mem-fraction-static."
-            )
+            raise RuntimeError("Not enough memory. Please try to increase --mem-fraction-static.")
 
-        logger.info(f"ModelRunner max_total_num_tokens: {self.max_total_num_tokens}")
+        logger.info("ModelRunner max_total_num_tokens: %s", self.max_total_num_tokens)
 
         # Create request to token pool if not already created
         if self.req_to_token_pool is None:
@@ -341,9 +315,7 @@ class ModelRunner:
             size=self.max_total_num_tokens,
             page_size=self.page_size,
             dtype=self.kv_cache_dtype,
-            head_num=self.model_config.get_total_num_kv_heads_with_replication(
-                self.tp_size
-            ),
+            head_num=self.model_config.get_total_num_kv_heads_with_replication(self.tp_size),
             head_dim=self.model_config.head_dim,
             layer_num=self.model_config.num_hidden_layers,
             mesh=self.mesh,
@@ -395,9 +367,7 @@ class ModelRunner:
                 mesh=self.mesh,
             )
         else:
-            raise ValueError(
-                f"Unsupported attention backend: {self.server_args.attention_backend}"
-            )
+            raise ValueError(f"Unsupported attention backend: {self.server_args.attention_backend}")
 
     def _forward(
         self,
@@ -408,9 +378,7 @@ class ModelRunner:
         import jax._src.test_util as jtu
 
         with jtu.count_pjit_cpp_cache_miss() as count:
-            output, layers_kv_fused, _ = self.jitted_run_model(
-                forward_batch, logits_metadata
-            )
+            output, layers_kv_fused, _ = self.jitted_run_model(forward_batch, logits_metadata)
             cache_miss_count = count()
         self._set_kv_cache_after_forward(layers_kv_fused, forward_batch)
 
@@ -439,14 +407,14 @@ class ModelRunner:
         self,
         forward_batch: ForwardBatch,
         logits_metadata: LogitsMetadata,
-    ) -> Tuple[LogitsProcessorOutput, int]:
+    ) -> tuple[LogitsProcessorOutput, int]:
         raise NotImplementedError("forward_idle is not implemented")
 
     def forward(
         self,
         forward_batch: ForwardBatch,
         logits_metadata: LogitsMetadata,
-    ) -> Tuple[LogitsProcessorOutput, int]:
+    ) -> tuple[LogitsProcessorOutput, int]:
         self.forward_pass_id += 1
         precision_tracer.start_batch_trace(forward_batch.bid)
         precision_tracer.set_current_forward_pass_id(self.forward_pass_id)
@@ -456,7 +424,7 @@ class ModelRunner:
         self,
         forward_batch: ForwardBatch,
         logits_metadata: LogitsMetadata,
-    ) -> Tuple[LogitsProcessorOutput, int]:
+    ) -> tuple[LogitsProcessorOutput, int]:
         # for compatibility, 0.6.3 need to use use_mesh. set_mesh is not have __entry__ attribute.
         # on jax >=0.7.1, we need to use set_mesh.
         try:
@@ -467,10 +435,7 @@ class ModelRunner:
             except AttributeError:
                 ctx = self.mesh
         with ctx:
-            if (
-                forward_batch.forward_mode.is_decode()
-                or forward_batch.forward_mode.is_extend()
-            ):
+            if forward_batch.forward_mode.is_decode() or forward_batch.forward_mode.is_extend():
                 ret = self._forward(forward_batch, logits_metadata)
             elif forward_batch.forward_mode.is_idle():
                 ret = self.forward_idle(forward_batch, logits_metadata)
@@ -505,7 +470,7 @@ class ModelRunner:
 class MockModelRunner(ModelRunner):
     def __init__(
         self,
-        model_config: Union[ModelConfig, MockModelConfig],
+        model_config: ModelConfig | MockModelConfig,
         rngs: nnx.Rngs = None,
         mesh: mesh_lib.Mesh = None,
         server_args: ServerArgs = None,
@@ -518,9 +483,7 @@ class MockModelRunner(ModelRunner):
             self.num_attn_heads = model_config.num_heads
             self.rngs = rngs
         else:
-            self.num_kv_heads = model_config.get_total_num_kv_heads_with_replication(
-                self.tp_size
-            )
+            self.num_kv_heads = model_config.get_total_num_kv_heads_with_replication(self.tp_size)
             self.num_attn_heads = model_config.num_attention_heads
             self.rngs = rngs
 
@@ -554,9 +517,7 @@ class MockModelRunner(ModelRunner):
             size=self.max_total_num_tokens,
             page_size=self.page_size,
             dtype=self.kv_cache_dtype,
-            head_num=self.model_config.get_total_num_kv_heads_with_replication(
-                self.tp_size
-            ),
+            head_num=self.model_config.get_total_num_kv_heads_with_replication(self.tp_size),
             head_dim=self.model_config.head_dim,
             layer_num=self.model_config.num_hidden_layers,
             mesh=mesh,

@@ -4,7 +4,7 @@ import heapq
 import time
 from collections import defaultdict
 from functools import partial
-from typing import TYPE_CHECKING, List, Optional, Tuple
+from typing import TYPE_CHECKING
 
 import jax
 import jax.numpy as jnp
@@ -15,13 +15,13 @@ from sgl_jax.srt.mem_cache.base_prefix_cache import BasePrefixCache, MatchResult
 from sgl_jax.srt.mem_cache.memory_pool import ReqToTokenPool
 
 if TYPE_CHECKING:
-    from sgl_jax.srt.managers.schedule_batch import Req
+    pass
 
 
 class TreeNode:
     counter = 0
 
-    def __init__(self, id: Optional[int] = None):
+    def __init__(self, id: int | None = None):
         self.children = defaultdict(TreeNode)
         self.parent = None
         self.key = None
@@ -46,11 +46,11 @@ class TreeNode:
     def backuped(self):
         return self.host_value is not None
 
-    def __lt__(self, other: "TreeNode"):
+    def __lt__(self, other: TreeNode):
         return self.last_access_time < other.last_access_time
 
 
-def _key_match_page_size1(key0: List, key1: List):
+def _key_match_page_size1(key0: list, key1: list):
     i = 0
     for k0, k1 in zip(key0, key1):
         if k0 != k1:
@@ -59,7 +59,7 @@ def _key_match_page_size1(key0: List, key1: List):
     return i
 
 
-def _key_match_paged(key0: List, key1: List, page_size: int):
+def _key_match_paged(key0: list, key1: list, page_size: int):
     min_len = min(len(key0), len(key1))
 
     i = 0
@@ -105,9 +105,7 @@ class RadixCache(BasePrefixCache):
 
         if self.page_size == 1:
             self.key_match_fn = _key_match_page_size1
-            self.get_child_key_fn = lambda key: (
-                int(key[0]) if hasattr(key[0], "item") else key[0]
-            )
+            self.get_child_key_fn = lambda key: (int(key[0]) if hasattr(key[0], "item") else key[0])
         else:
             self.key_match_fn = partial(_key_match_paged, page_size=page_size)
             # Ensure returning hashable types, convert numpy arrays to Python native types
@@ -116,7 +114,7 @@ class RadixCache(BasePrefixCache):
             )
         self.reset()
 
-    def _create_tokens_data(self, tokens: List[int]) -> np.ndarray:
+    def _create_tokens_data(self, tokens: list[int]) -> np.ndarray:
         if self.disable:
             return np.array(tokens, dtype=np.int32)
 
@@ -130,7 +128,7 @@ class RadixCache(BasePrefixCache):
         self.evictable_size_ = 0
         self.protected_size_ = 0
 
-    def match_prefix(self, key: List[int], **kwargs) -> MatchResult:
+    def match_prefix(self, key: list[int], **kwargs) -> MatchResult:
         if self.disable or len(key) == 0:
             empty_array = np.empty((0,), dtype=np.int32)
 
@@ -170,7 +168,7 @@ class RadixCache(BasePrefixCache):
             host_hit_length=0,
         )
 
-    def insert(self, key: List, value=None):
+    def insert(self, key: list, value=None):
         if self.disable:
             return 0
 
@@ -204,12 +202,8 @@ class RadixCache(BasePrefixCache):
             page_aligned_kv_indices = kv_indices
 
         # Radix Cache takes over one reference from memory pool
-        new_prefix_len = self.insert(
-            token_ids[:page_aligned_len], page_aligned_kv_indices
-        )
-        self.token_to_kv_pool_allocator.free(
-            kv_indices[len(req.prefix_indices) : new_prefix_len]
-        )
+        new_prefix_len = self.insert(token_ids[:page_aligned_len], page_aligned_kv_indices)
+        self.token_to_kv_pool_allocator.free(kv_indices[len(req.prefix_indices) : new_prefix_len])
 
         # Remove request slot and release cache lock
         self.req_to_token_pool.free(req.req_pool_idx)
@@ -233,9 +227,7 @@ class RadixCache(BasePrefixCache):
 
         # Radix Cache takes over one reference from memory pool
         new_prefix_len = self.insert(page_aligned_token_ids, page_aligned_kv_indices)
-        self.token_to_kv_pool_allocator.free(
-            kv_indices[len(req.prefix_indices) : new_prefix_len]
-        )
+        self.token_to_kv_pool_allocator.free(kv_indices[len(req.prefix_indices) : new_prefix_len])
 
         # Prefix indices may have been updated, reuse them
         new_match_result = self.match_prefix(page_aligned_token_ids)
@@ -253,9 +245,7 @@ class RadixCache(BasePrefixCache):
         # `req.prefix_indices` will be used later in `PrefillAdder::add_chunked_req`
         if self.page_size != 1:
             # create array on CPU
-            req.prefix_indices = np.concat(
-                [new_indices, kv_indices[len(new_indices) :]]
-            )
+            req.prefix_indices = np.concat([new_indices, kv_indices[len(new_indices) :]])
             # with jax.default_device(self.cpu_device):
             #     kv_indices_cpu = jax.device_put(kv_indices, self.cpu_device)
             #     req.prefix_indices = jnp.concatenate(
@@ -266,7 +256,7 @@ class RadixCache(BasePrefixCache):
         req.last_node = new_last_node
 
     # note: get_cached_kv is only used by test, skip to replace jnp with np
-    def get_cached_kv(self, token_ids: List[int]) -> Tuple[jnp.ndarray, int]:
+    def get_cached_kv(self, token_ids: list[int]) -> tuple[jnp.ndarray, int]:
         if self.disable:
             with jax.default_device(self.cpu_device):
                 empty_kv = jnp.zeros(
@@ -278,7 +268,6 @@ class RadixCache(BasePrefixCache):
 
         match_result = self.match_prefix(token_ids)
         matched_tokens = match_result.device_indices
-        last_node = match_result.last_device_node
         matched_len = len(matched_tokens)
 
         if matched_len == 0:
@@ -325,9 +314,9 @@ class RadixCache(BasePrefixCache):
                 k_data = jnp.stack(
                     k_data_list, axis=0
                 )  # (layer_num, matched_len, head_num, head_dim)
-                v_data = jnp.stack(
-                    v_data_list, axis=0
-                )  # (layer_num, matched_len, head_num, head_dim)
+                # v_data = jnp.stack(
+                #     v_data_list, axis=0
+                # )  # (layer_num, matched_len, head_num, head_dim)
 
                 # For this implementation, we return K data (could also return concatenated K,V)
                 kv_data = k_data
@@ -382,7 +371,7 @@ class RadixCache(BasePrefixCache):
             node = node.parent
         return delta
 
-    def dec_lock_ref(self, node: TreeNode, swa_uuid_for_lock: Optional[str] = None):
+    def dec_lock_ref(self, node: TreeNode, swa_uuid_for_lock: str | None = None):
         if self.disable:
             return 0
 
@@ -412,13 +401,13 @@ class RadixCache(BasePrefixCache):
 
     ##### Internal Helper Functions #####
 
-    def _match_prefix_helper(self, node: TreeNode, key: List):
+    def _match_prefix_helper(self, node: TreeNode, key: list):
         node.last_access_time = time.monotonic()
 
         child_key = self.get_child_key_fn(key)
 
         token_sequences = []
-        while len(key) > 0 and child_key in node.children.keys():
+        while len(key) > 0 and child_key in node.children:
             child = node.children[child_key]
             child.last_access_time = time.monotonic()
             prefix_len = self.key_match_fn(child.key, key)
@@ -452,7 +441,7 @@ class RadixCache(BasePrefixCache):
 
         return new_node
 
-    def _insert_helper(self, node: TreeNode, key: List, value):
+    def _insert_helper(self, node: TreeNode, key: list, value):
         if isinstance(value, jnp.ndarray):
             assert value.ndim == 1, "value must be a 1D array"
 
@@ -463,7 +452,7 @@ class RadixCache(BasePrefixCache):
         child_key = self.get_child_key_fn(key)
 
         total_prefix_length = 0
-        while len(key) > 0 and child_key in node.children.keys():
+        while len(key) > 0 and child_key in node.children:
             node = node.children[child_key]
             node.last_access_time = time.monotonic()
             prefix_len = self.key_match_fn(node.key, key)

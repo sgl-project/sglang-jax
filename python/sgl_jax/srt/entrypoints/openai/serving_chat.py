@@ -3,7 +3,8 @@ import json
 import logging
 import time
 import uuid
-from typing import Any, AsyncGenerator, Dict, List, Optional, Union
+from collections.abc import AsyncGenerator
+from typing import Any
 
 from fastapi import Request
 from fastapi.responses import ORJSONResponse, StreamingResponse
@@ -45,9 +46,7 @@ logger = logging.getLogger(__name__)
 class OpenAIServingChat(OpenAIServingBase):
     """Handler for /v1/chat/completions requests"""
 
-    def __init__(
-        self, tokenizer_manager: TokenizerManager, template_manager: TemplateManager
-    ):
+    def __init__(self, tokenizer_manager: TokenizerManager, template_manager: TemplateManager):
         super().__init__(tokenizer_manager)
         self.template_manager = template_manager
 
@@ -122,7 +121,7 @@ class OpenAIServingChat(OpenAIServingBase):
     def _apply_jinja_template(
         self,
         request: ChatCompletionRequest,
-        tools: Optional[List[Dict]],
+        tools: list[dict] | None,
         is_multimodal: bool,
     ) -> MessageProcessingResult:
         """Apply Jinja chat template"""
@@ -151,9 +150,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 modalities,
             )
 
-            if "tool_calls" in processed_msg and isinstance(
-                processed_msg.get("tool_calls"), list
-            ):
+            if "tool_calls" in processed_msg and isinstance(processed_msg.get("tool_calls"), list):
                 for call in processed_msg["tool_calls"]:
                     try:
                         if "arguments" in call["function"] and isinstance(
@@ -164,9 +161,7 @@ class OpenAIServingChat(OpenAIServingBase):
                             )
                     except json.JSONDecodeError as e:
                         # Log a warning or error if JSON parsing fails for arguments
-                        logger.warning(
-                            f"Failed to parse tool call arguments as JSON: {e}"
-                        )
+                        logger.warning("Failed to parse tool call arguments as JSON: %s", e)
                         # Decide whether to continue or raise the exception based on desired behavior
                         continue  # Or raise e if strict parsing is required
             openai_compatible_messages.append(processed_msg)
@@ -176,10 +171,10 @@ class OpenAIServingChat(OpenAIServingBase):
         if (
             openai_compatible_messages
             and openai_compatible_messages[-1]["role"] == "assistant"
+            and request.continue_final_message
         ):
-            if request.continue_final_message:
-                assistant_prefix = openai_compatible_messages[-1]["content"]
-                openai_compatible_messages = openai_compatible_messages[:-1]
+            assistant_prefix = openai_compatible_messages[-1]["content"]
+            openai_compatible_messages = openai_compatible_messages[:-1]
 
         try:
             # Check if tokenizer has a chat template, if not, provide a default one
@@ -210,11 +205,7 @@ Assistant: {% endif %}"""
             #  This except branch will be triggered when the chosen model
             #  has a different tools input format that is not compatible
             #  with openAI's apply_chat_template tool_call format, like Mistral.
-            tools = (
-                [t if "function" in t else {"function": t} for t in tools]
-                if tools
-                else None
-            )
+            tools = [t if "function" in t else {"function": t} for t in tools] if tools else None
             prompt_ids = self.tokenizer_manager.tokenizer.apply_chat_template(
                 openai_compatible_messages,
                 tokenize=True,
@@ -310,9 +301,9 @@ Assistant: {% endif %}"""
     def _build_sampling_params(
         self,
         request: ChatCompletionRequest,
-        stop: List[str],
-        tool_call_constraint: Optional[Any],
-    ) -> Dict[str, Any]:
+        stop: list[str],
+        tool_call_constraint: Any | None,
+    ) -> dict[str, Any]:
         """Build sampling parameters for the request"""
 
         sampling_params = {
@@ -343,9 +334,7 @@ Assistant: {% endif %}"""
             pass
         elif request.response_format and request.response_format.type == "json_object":
             sampling_params["json_schema"] = '{"type": "object"}'
-        elif (
-            request.response_format and request.response_format.type == "structural_tag"
-        ):
+        elif request.response_format and request.response_format.type == "structural_tag":
             # sampling_params["structural_tag"] = convert_json_schema_to_str(
             #     request.response_format.model_dump(by_alias=True)
             # )
@@ -424,9 +413,7 @@ Assistant: {% endif %}"""
                     choice_logprobs = self._process_streaming_logprobs(
                         content, n_prev_tokens.get(index, 0)
                     )
-                    n_prev_tokens[index] = len(
-                        content["meta_info"]["output_token_logprobs"]
-                    )
+                    n_prev_tokens[index] = len(content["meta_info"]["output_token_logprobs"])
 
                 finish_reason = content["meta_info"]["finish_reason"]
                 finish_reason_type = finish_reason["type"] if finish_reason else None
@@ -505,8 +492,7 @@ Assistant: {% endif %}"""
                             delta=DeltaMessage(content=delta if delta else None),
                             finish_reason=(
                                 None
-                                if request.stream_options
-                                and request.stream_options.include_usage
+                                if request.stream_options and request.stream_options.include_usage
                                 else finish_reason_type
                             ),
                             matched_stop=(
@@ -550,9 +536,7 @@ Assistant: {% endif %}"""
                 for index, choice_hidden_states in hidden_states.items():
                     if choice_hidden_states:
                         last_token_hidden_states = (
-                            choice_hidden_states[-1]
-                            if len(choice_hidden_states) > 1
-                            else []
+                            choice_hidden_states[-1] if len(choice_hidden_states) > 1 else []
                         )
                         hidden_states_chunk = ChatCompletionStreamResponse(
                             id=content["meta_info"]["id"],
@@ -560,9 +544,7 @@ Assistant: {% endif %}"""
                             choices=[
                                 ChatCompletionResponseStreamChoice(
                                     index=index,
-                                    delta=DeltaMessage(
-                                        hidden_states=last_token_hidden_states
-                                    ),
+                                    delta=DeltaMessage(hidden_states=last_token_hidden_states),
                                     finish_reason=finish_reason_type,
                                 )
                             ],
@@ -599,7 +581,7 @@ Assistant: {% endif %}"""
         adapted_request: GenerateReqInput,
         request: ChatCompletionRequest,
         raw_request: Request,
-    ) -> Union[ChatCompletionResponse, ErrorResponse, ORJSONResponse]:
+    ) -> ChatCompletionResponse | ErrorResponse | ORJSONResponse:
         """Handle non-streaming chat completion request"""
         try:
             ret = await self.tokenizer_manager.generate_request(
@@ -622,9 +604,9 @@ Assistant: {% endif %}"""
     def _build_chat_response(
         self,
         request: ChatCompletionRequest,
-        ret: List[Dict[str, Any]],
+        ret: list[dict[str, Any]],
         created: int,
-    ) -> Union[ChatCompletionResponse, ORJSONResponse]:
+    ) -> ChatCompletionResponse | ORJSONResponse:
         """Build chat completion response from generation results"""
         choices = []
 
@@ -645,12 +627,10 @@ Assistant: {% endif %}"""
             reasoning_parser = self.tokenizer_manager.server_args.reasoning_parser
             if reasoning_parser and request.separate_reasoning:
                 try:
-                    parser = ReasoningParser(
-                        model_type=reasoning_parser, stream_reasoning=False
-                    )
+                    parser = ReasoningParser(model_type=reasoning_parser, stream_reasoning=False)
                     reasoning_text, text = parser.parse_non_stream(text)
                 except Exception as e:
-                    logger.error(f"Reasoning parsing error: {e}")
+                    logger.error("Reasoning parsing error: %s", e)
                     return self.create_error_response(
                         "Failed to parse reasoning content",
                         err_type="InternalServerError",
@@ -701,7 +681,7 @@ Assistant: {% endif %}"""
 
     def _process_logprobs_tokens(
         self, logprobs: LogProbs, use_token_index: bool = False
-    ) -> List[ChatCompletionTokenLogprob]:
+    ) -> list[ChatCompletionTokenLogprob]:
         """Common helper to process logprobs tokens for both streaming and non-streaming
 
         Args:
@@ -710,18 +690,14 @@ Assistant: {% endif %}"""
         """
         token_logprobs = []
 
-        for token_idx, (token, logprob) in enumerate(
-            zip(logprobs.tokens, logprobs.token_logprobs)
-        ):
+        for token_idx, (token, logprob) in enumerate(zip(logprobs.tokens, logprobs.token_logprobs)):
             token_bytes = list(token.encode("utf-8"))
             top_logprobs = []
             if logprobs.top_logprobs:
                 # - Non-streaming (use_token_index=True): uses token_idx for full data
                 # - Streaming (use_token_index=False): uses index 0 for pre-sliced data
                 top_logprobs_idx = token_idx if use_token_index else 0
-                for top_token, top_logprob in logprobs.top_logprobs[
-                    top_logprobs_idx
-                ].items():
+                for top_token, top_logprob in logprobs.top_logprobs[top_logprobs_idx].items():
                     top_token_bytes = list(top_token.encode("utf-8"))
                     top_logprobs.append(
                         TopLogprob(
@@ -741,7 +717,7 @@ Assistant: {% endif %}"""
 
         return token_logprobs
 
-    def _process_response_logprobs(self, ret_item: Dict[str, Any]) -> ChoiceLogprobs:
+    def _process_response_logprobs(self, ret_item: dict[str, Any]) -> ChoiceLogprobs:
         """Process logprobs for non-streaming response"""
         logprobs = to_openai_style_logprobs(
             output_token_logprobs=ret_item["meta_info"]["output_token_logprobs"],
@@ -754,10 +730,10 @@ Assistant: {% endif %}"""
     def _process_tool_calls(
         self,
         text: str,
-        tools: List[Any],
-        tool_call_parser: Optional[str],
-        finish_reason: Dict[str, Any],
-    ) -> tuple[Optional[List[ToolCall]], str, Dict[str, Any]]:
+        tools: list[Any],
+        tool_call_parser: str | None,
+        finish_reason: dict[str, Any],
+    ) -> tuple[list[ToolCall] | None, str, dict[str, Any]]:
         """Process tool calls in the response"""
         parser = FunctionCallParser(tools, tool_call_parser)
         if parser.has_tool_call(text):
@@ -777,23 +753,19 @@ Assistant: {% endif %}"""
                 ]
                 return tool_calls, text, finish_reason
             except Exception as e:
-                logger.error(f"Tool call parsing error: {e}")
+                logger.error("Tool call parsing error: %s", e)
                 # Return error but don't fail the whole request
                 return None, text, finish_reason
 
         return None, text, finish_reason
 
     def _process_streaming_logprobs(
-        self, content: Dict[str, Any], n_prev_token: int
+        self, content: dict[str, Any], n_prev_token: int
     ) -> ChoiceLogprobs:
         """Process logprobs for streaming response"""
         logprobs = to_openai_style_logprobs(
-            output_token_logprobs=content["meta_info"]["output_token_logprobs"][
-                n_prev_token:
-            ],
-            output_top_logprobs=content["meta_info"].get("output_top_logprobs", [])[
-                n_prev_token:
-            ],
+            output_token_logprobs=content["meta_info"]["output_token_logprobs"][n_prev_token:],
+            output_top_logprobs=content["meta_info"].get("output_top_logprobs", [])[n_prev_token:],
         )
 
         token_logprobs = self._process_logprobs_tokens(logprobs, use_token_index=False)
@@ -803,10 +775,10 @@ Assistant: {% endif %}"""
         self,
         index: int,
         delta: str,
-        reasoning_parser_dict: Dict[int, ReasoningParser],
-        content: Dict[str, Any],
+        reasoning_parser_dict: dict[int, ReasoningParser],
+        content: dict[str, Any],
         request: ChatCompletionRequest,
-    ) -> tuple[Optional[str], str]:
+    ) -> tuple[str | None, str]:
         """Process reasoning content in streaming response"""
         if index not in reasoning_parser_dict:
             reasoning_parser_dict[index] = ReasoningParser(
@@ -839,10 +811,10 @@ Assistant: {% endif %}"""
         self,
         index: int,
         delta: str,
-        parser_dict: Dict[int, FunctionCallParser],
-        content: Dict[str, Any],
+        parser_dict: dict[int, FunctionCallParser],
+        content: dict[str, Any],
         request: ChatCompletionRequest,
-        finish_reason_type: Optional[str],
+        finish_reason_type: str | None,
     ):
         """Process tool calls in streaming response"""
         if index not in parser_dict:

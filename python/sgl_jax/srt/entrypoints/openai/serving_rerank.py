@@ -1,5 +1,5 @@
 import logging
-from typing import Any, Dict, List, Optional, Union
+from typing import Any
 
 from fastapi import Request
 from fastapi.responses import ORJSONResponse
@@ -24,14 +24,13 @@ class OpenAIServingRerank(OpenAIServingBase):
     def _request_id_prefix(self) -> str:
         return "rerank-"
 
-    def _validate_request(self, request: V1RerankReqInput) -> Optional[str]:
+    def _validate_request(self, request: V1RerankReqInput) -> str | None:
         """Validate rerank request format and content"""
         if not request.query:
             return "Query cannot be empty"
 
-        if isinstance(request.query, str):
-            if not request.query.strip():
-                return "Query cannot be empty or whitespace only"
+        if isinstance(request.query, str) and not request.query.strip():
+            return "Query cannot be empty or whitespace only"
 
         if not request.documents:
             return "Documents cannot be empty"
@@ -65,7 +64,7 @@ class OpenAIServingRerank(OpenAIServingBase):
         adapted_request: EmbeddingReqInput,
         request: V1RerankReqInput,
         raw_request: Request,
-    ) -> Union[List[RerankResponse], ErrorResponse, ORJSONResponse]:
+    ) -> list[RerankResponse] | ErrorResponse | ORJSONResponse:
         """Handle the rerank request"""
         try:
             ret = await self.tokenizer_manager.generate_request(
@@ -82,8 +81,8 @@ class OpenAIServingRerank(OpenAIServingBase):
         return responses
 
     def _build_rerank_response(
-        self, ret: List[Dict[str, Any]], request: V1RerankReqInput
-    ) -> List[RerankResponse]:
+        self, ret: list[dict[str, Any]], request: V1RerankReqInput
+    ) -> list[RerankResponse]:
         """Build the rerank response from generation results"""
         responses = []
         for idx, ret_item in enumerate(ret):

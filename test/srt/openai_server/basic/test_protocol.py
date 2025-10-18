@@ -169,9 +169,7 @@ class TestChatCompletionRequest(unittest.TestCase):
                 "function": {"name": "test_func", "description": "Test function"},
             }
         ]
-        request2 = ChatCompletionRequest(
-            model="test-model", messages=messages, tools=tools
-        )
+        request2 = ChatCompletionRequest(model="test-model", messages=messages, tools=tools)
         self.assertEqual(request2.tool_choice, "auto")
 
     def test_chat_completion_sglang_extensions(self):
@@ -245,9 +243,7 @@ class TestValidationEdgeCases(unittest.TestCase):
         """Test invalid tool choice type"""
         messages = [{"role": "user", "content": "Hello"}]
         with self.assertRaises(ValidationError):
-            ChatCompletionRequest(
-                model="test-model", messages=messages, tool_choice=123
-            )
+            ChatCompletionRequest(model="test-model", messages=messages, tool_choice=123)
 
     def test_negative_token_limits(self):
         """Test negative token limits"""

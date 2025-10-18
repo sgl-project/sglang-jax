@@ -1,7 +1,6 @@
 import argparse
 import json
 import sys
-from typing import Dict, List, Optional, Set, Tuple
 
 
 class Colors:
@@ -20,16 +19,16 @@ class Colors:
     BG_YELLOW = "\033[48;5;178m"
 
 
-def load_jsonl(file_path: str) -> List[Dict]:
+def load_jsonl(file_path: str) -> list[dict]:
     try:
-        with open(file_path, "r", encoding="utf-8") as f:
+        with open(file_path, encoding="utf-8") as f:
             return [json.loads(line.strip()) for line in f if line.strip()]
     except Exception as e:
         print(f"Error loading {file_path}: {e}")
         return []
 
 
-def group_by_content_hash(traces: List[Dict]) -> Dict[str, List[Dict]]:
+def group_by_content_hash(traces: list[dict]) -> dict[str, list[dict]]:
     groups = {}
     for trace in traces:
         content_hash = trace.get("content_hash")
@@ -41,11 +40,11 @@ def group_by_content_hash(traces: List[Dict]) -> Dict[str, List[Dict]]:
 
 
 def compare_precision_records(
-    records1: Dict,
-    records2: Dict,
+    records1: dict,
+    records2: dict,
     tolerance: float = 1e-6,
-    max_decode_tokens: Optional[int] = None,
-) -> Tuple[bool, List[str]]:
+    max_decode_tokens: int | None = None,
+) -> tuple[bool, list[str]]:
     differences = []
     all_match = True
 
@@ -87,11 +86,11 @@ def compare_precision_records(
 
 def compare_token_groups(
     category: str,
-    tokens1: List[Dict],
-    tokens2: List[Dict],
+    tokens1: list[dict],
+    tokens2: list[dict],
     tolerance: float = 1e-6,
-    max_decode_tokens: Optional[int] = None,
-) -> Tuple[bool, List[str]]:
+    max_decode_tokens: int | None = None,
+) -> tuple[bool, list[str]]:
     """Compare token groups within a category (prefill/decode)"""
     differences = []
     all_match = True
@@ -107,9 +106,7 @@ def compare_token_groups(
             )
 
     if len(tokens1) != len(tokens2):
-        differences.append(
-            f"  {category}: Token count mismatch: {len(tokens1)} vs {len(tokens2)}"
-        )
+        differences.append(f"  {category}: Token count mismatch: {len(tokens1)} vs {len(tokens2)}")
         all_match = False
         # Continue comparing up to the shorter length
         min_length = min(len(tokens1), len(tokens2))
@@ -156,10 +153,10 @@ def compare_token_groups(
 def compare_token_records(
     category: str,
     token_idx: int,
-    records1: List[Dict],
-    records2: List[Dict],
+    records1: list[dict],
+    records2: list[dict],
     tolerance: float = 1e-6,
-) -> Tuple[bool, List[str]]:
+) -> tuple[bool, list[str]]:
     """Compare records within a single token group"""
     differences = []
     all_match = True
@@ -269,9 +266,7 @@ def compare_token_records(
                     all_match = False
                 else:
                     # Compare token-level stats
-                    for ts_idx, (ts1, ts2) in enumerate(
-                        zip(token_stats1, token_stats2)
-                    ):
+                    for ts_idx, (ts1, ts2) in enumerate(zip(token_stats1, token_stats2)):
                         for ts_field in ["min", "max", "mean", "std", "value"]:
                             ts_val1, ts_val2 = ts1.get(ts_field), ts2.get(ts_field)
                             if ts_val1 is not None and ts_val2 is not None:
@@ -306,7 +301,7 @@ def compare_token_records(
     return all_match, differences
 
 
-def print_diff_header(content_hash: str, trace1: Dict, trace2: Dict):
+def print_diff_header(content_hash: str, trace1: dict, trace2: dict):
     """Print a header for the diff section"""
     print(f"\n{Colors.BOLD}{Colors.CYAN}Content Hash: {content_hash}{Colors.RESET}")
     print(
@@ -352,7 +347,7 @@ def format_comparison_result(message: str) -> str:
     return message
 
 
-def print_tree_differences(differences: List[str]):
+def print_tree_differences(differences: list[str]):
     """Print differences in a tree-like structure with color coding"""
     if not differences:
         print(f"{Colors.BG_GREEN}{Colors.WHITE} ALL MATCH {Colors.RESET}")
@@ -382,9 +377,7 @@ def print_tree_differences(differences: List[str]):
                 category_part = path.split("[")[0].strip()
                 rest = path.split("]", 1)[1].strip() if "]" in path else ""
                 token_part = (
-                    path.split("[")[1].split("]")[0]
-                    if "[" in path and "]" in path
-                    else "0"
+                    path.split("[")[1].split("]")[0] if "[" in path and "]" in path else "0"
                 )
 
                 if category_part not in tree:
@@ -406,14 +399,12 @@ def print_tree_differences(differences: List[str]):
 
     # Print tree structure - ensure prefill comes first
     def display_category_sort_key(category):
-        if category == "prefill":
-            return 0
-        elif category == "decode":
-            return 1
-        elif category == "root":
-            return 999  # root always last
-        else:
-            return 2
+        order = {
+            "prefill": 0,
+            "decode": 1,
+            "root": 999,  # root always last
+        }
+        return order.get(category, 2)
 
     for category in sorted(tree.keys(), key=display_category_sort_key):
         if category == "root":
@@ -421,9 +412,7 @@ def print_tree_differences(differences: List[str]):
         print(f"\n{Colors.BOLD}{category.upper()}:{Colors.RESET}")
 
         tokens = tree[category]
-        for token_idx in sorted(
-            tokens.keys(), key=lambda x: int(x) if x.isdigit() else 999
-        ):
+        for token_idx in sorted(tokens.keys(), key=lambda x: int(x) if x.isdigit() else 999):
             token_diffs = tokens[token_idx]
             if len(token_diffs) > 0:
                 print(f"  Token[{token_idx}]:")
@@ -471,7 +460,7 @@ def print_tree_differences(differences: List[str]):
 
                 # Group by layer number first
                 layers_by_num = {}
-                for layer_key in layer_groups.keys():
+                for layer_key in layer_groups:
                     layer_num, module_type = parse_layer_module(layer_key)
                     if layer_num not in layers_by_num:
                         layers_by_num[layer_num] = {}
@@ -530,13 +519,13 @@ def print_tree_differences(differences: List[str]):
 
                         total_items = len(mismatches) + len(matches) + len(others)
                         shown_items = (
-                            min(3, len(mismatches))
-                            + min(3, len(matches))
-                            + min(2, len(others))
+                            min(3, len(mismatches)) + min(3, len(matches)) + min(2, len(others))
                         )
                         if total_items > shown_items:
                             print(
-                                f"      {Colors.YELLOW}... and {total_items - shown_items} more{Colors.RESET}"
+                                "      "
+                                f"{Colors.YELLOW}... and {total_items - shown_items} more"
+                                f"{Colors.RESET}"
                             )
 
     # Print root-level differences
@@ -547,7 +536,7 @@ def print_tree_differences(differences: List[str]):
             print(f"  {formatted}")
 
 
-def print_match_status(is_match: bool, differences: List[str]):
+def print_match_status(is_match: bool, differences: list[str]):
     """Print match status with tree-like hierarchy"""
     print_tree_differences(differences)
 
@@ -557,7 +546,7 @@ def compare_trace_files(
     file2: str,
     tolerance: float = 1e-6,
     show_matches: bool = False,
-    max_decode_tokens: Optional[int] = None,
+    max_decode_tokens: int | None = None,
 ) -> bool:
     """
     Compare two JSONL trace files by content_hash with tree-structured output
@@ -640,9 +629,9 @@ def compare_trace_files(
         for content_hash in sorted(only_in_1):
             traces = groups1[content_hash]
             trace = traces[0]
-            records = trace.get("precision_records", [])
             print(
-                f"  {Colors.YELLOW}-{Colors.RESET} {content_hash} (Request ID: {trace.get('request_id', 'N/A')})"
+                f"  {Colors.YELLOW}-{Colors.RESET} {content_hash} "
+                f"(Request ID: {trace.get('request_id', 'N/A')})"
             )
 
     if only_in_2:
@@ -650,9 +639,9 @@ def compare_trace_files(
         for content_hash in sorted(only_in_2):
             traces = groups2[content_hash]
             trace = traces[0]
-            records = trace.get("precision_records", [])
             print(
-                f"  {Colors.YELLOW}+{Colors.RESET} {content_hash} (Request ID: {trace.get('request_id', 'N/A')})"
+                f"  {Colors.YELLOW}+{Colors.RESET} {content_hash} "
+                f"(Request ID: {trace.get('request_id', 'N/A')})"
             )
 
     # Summary

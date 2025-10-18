@@ -1,7 +1,6 @@
 import os
 import unittest
 from pathlib import Path
-from unittest.mock import patch
 
 import jax.numpy as jnp
 from flax import nnx
@@ -22,9 +21,7 @@ class TestQwenModel(unittest.TestCase):
     """Test cases for the Qwen model."""
 
     def setUp(self):
-        self.mesh = create_device_mesh(
-            ici_parallelism=[-1, 1, 1], dcn_parallelism=[1, 1, 1]
-        )
+        self.mesh = create_device_mesh(ici_parallelism=[-1, 1, 1], dcn_parallelism=[1, 1, 1])
         # Model path for local model and tokenizer
         self.test_model_path = os.environ.get(
             "MODEL_PATH", "Qwen/Qwen-7B"
@@ -44,30 +41,24 @@ class TestQwenModel(unittest.TestCase):
         # Check if it's a local path and has tokenizer files
         if model_path.exists():
             tokenizer_files = ["tokenizer_config.json"]
-            has_tokenizer = any(
-                (model_path / file).exists() for file in tokenizer_files
-            )
+            has_tokenizer = any((model_path / file).exists() for file in tokenizer_files)
 
             if has_tokenizer:
                 print(f"Using local tokenizer from: {model_path}")
                 try:
-                    return AutoTokenizer.from_pretrained(
-                        str(model_path), trust_remote_code=True
-                    )
+                    return AutoTokenizer.from_pretrained(str(model_path), trust_remote_code=True)
                 except Exception as e:
                     print(f"  Failed to load local tokenizer: {e}")
 
         # Use HuggingFace model with network error handling
         try:
             print(f"Loading tokenizer from HuggingFace: {self.test_model_path}")
-            return AutoTokenizer.from_pretrained(
-                self.test_model_path, trust_remote_code=True
-            )
+            return AutoTokenizer.from_pretrained(self.test_model_path, trust_remote_code=True)
         except Exception as e:
             print(f"Failed to load tokenizer from HuggingFace: {e}")
             raise RuntimeError(
                 f"Could not load tokenizer from local path or HuggingFace: {e}"
-            )
+            ) from e
 
     def _setup_model(self):
         """Setup model using get_model_loader"""
@@ -274,16 +265,12 @@ class TestQwenModel(unittest.TestCase):
 
             if "{}" in template:
                 param_count = template.count("{}")
-                fill_params = random.sample(
-                    fill_words, min(param_count, len(fill_words))
-                )
+                fill_params = random.sample(fill_words, min(param_count, len(fill_words)))
 
                 try:
                     question = template.format(*fill_params)
                 except (IndexError, ValueError):
-                    question = (
-                        f"Question {i+1}: Tell me about {random.choice(fill_words)}"
-                    )
+                    question = f"Question {i + 1}: Tell me about {random.choice(fill_words)}"
             else:
                 question = template
 
@@ -316,9 +303,7 @@ class TestQwenModel(unittest.TestCase):
 
             # Check if this request should finish BEFORE updating sequences
             if self._is_finished(current_token_id, tokenizer):
-                print(
-                    f" Request {orig_idx} will be removed from batch (token: {current_token_id})"
-                )
+                print(f" Request {orig_idx} will be removed from batch (token: {current_token_id})")
                 finished_requests.add(orig_idx)
                 continue
 
@@ -337,9 +322,7 @@ class TestQwenModel(unittest.TestCase):
         forward_batch.seq_lens = jnp.array(new_seq_lens, dtype=jnp.int32)
 
         # update cache loc
-        out_cache_start_loc = (
-            max(item for sublist in new_cache_loc for item in sublist) + 1
-        )
+        out_cache_start_loc = max(item for sublist in new_cache_loc for item in sublist) + 1
         forward_batch.out_cache_loc = jnp.arange(
             out_cache_start_loc,
             out_cache_start_loc + forward_batch.batch_size,
@@ -383,9 +366,7 @@ class TestQwenModel(unittest.TestCase):
         """
         print("Testing Qwen model generation...")
         model = self._setup_model()
-        jax_profiling_dir = os.environ.get(
-            "JAX_TRACE_PROFILING_DIR", "/tmp/jax_profiling"
-        )
+        jax_profiling_dir = os.environ.get("JAX_TRACE_PROFILING_DIR", "/tmp/jax_profiling")
         batch_size = int(os.environ.get("BATCH_SIZE", 10))
         with self.mesh, jax_trace_context(jax_profiling_dir):
             sampler = Sampler(rngs=nnx.Rngs(0))
@@ -395,13 +376,13 @@ class TestQwenModel(unittest.TestCase):
             input_texts = self._generate_random_questions(batch_size)
             print(f"\nGenerated {batch_size} random questions for batch testing")
 
-            print(f"\nBatch Configuration:")
+            print("\nBatch Configuration:")
             print(f"   Total requests: {len(input_texts)}")
             print(f"   Batch size: {len(input_texts)}")
 
-            print(f"\nSample questions:")
+            print("\nSample questions:")
             for i, text in enumerate(input_texts[: min(5, len(input_texts))]):
-                print(f"   {i+1}: '{text}'")
+                print(f"   {i + 1}: '{text}'")
             if len(input_texts) > 5:
                 print(f"   ... and {len(input_texts) - 5} more questions")
 
@@ -410,11 +391,11 @@ class TestQwenModel(unittest.TestCase):
 
             start_time = time.time()
 
-            input_ids_array, actual_seq_lens, forward_batch = (
-                self._create_batch_from_texts(model.config, input_texts, tokenizer)
+            input_ids_array, actual_seq_lens, forward_batch = self._create_batch_from_texts(
+                model.config, input_texts, tokenizer
             )
 
-            print(f"\n  Batch Processing Info:")
+            print("\n  Batch Processing Info:")
             print(f"   Input tokens shape: {input_ids_array.shape}")
             print(
                 f"   Actual sequence lengths: {actual_seq_lens[:10]}{'...' if len(actual_seq_lens) > 10 else ''}"
@@ -449,9 +430,7 @@ class TestQwenModel(unittest.TestCase):
                     print(f"Active requests: {forward_batch.batch_size}")
 
                 # Forward pass
-                y = model(
-                    forward_batch.input_ids, forward_batch.positions, forward_batch
-                )
+                y = model(forward_batch.input_ids, forward_batch.positions, forward_batch)
 
                 # Sample next token for each active sequence
                 next_token_ids = sampler(
@@ -469,12 +448,8 @@ class TestQwenModel(unittest.TestCase):
                     print(f"Generated tokens: {next_token_ids.tolist()}")
 
                 for batch_idx, token_id in enumerate(next_token_ids):
-                    decoded_token = tokenizer.decode(
-                        int(token_id[0]), skip_special_tokens=False
-                    )
-                    final_results[original_indices[batch_idx]][
-                        "output"
-                    ] += decoded_token
+                    decoded_token = tokenizer.decode(int(token_id[0]), skip_special_tokens=False)
+                    final_results[original_indices[batch_idx]]["output"] += decoded_token
 
                     if len(input_texts) <= 10 and (iteration % 5 == 0):
                         print(
@@ -513,35 +488,31 @@ class TestQwenModel(unittest.TestCase):
             total_time = end_time - start_time
 
             finished_count = sum(1 for r in final_results.values() if r["finished"])
-            avg_output_length = sum(
-                len(r["output"]) for r in final_results.values()
-            ) / len(final_results)
+            avg_output_length = sum(len(r["output"]) for r in final_results.values()) / len(
+                final_results
+            )
 
-            print(f"\n === Generation Results Summary ===")
-            print(f"Performance Metrics:")
+            print("\n === Generation Results Summary ===")
+            print("Performance Metrics:")
             print(f"   Total time: {total_time:.2f} seconds")
             print(f"   Requests processed: {len(input_texts)}")
             print(f"   Requests finished: {finished_count}/{len(input_texts)}")
             print(f"   Average output length: {avg_output_length:.1f} characters")
-            print(f"   Throughput: {len(input_texts)/total_time:.2f} requests/second")
-            print(f"   Time per request: {total_time/len(input_texts)*1000:.2f} ms")
+            print(f"   Throughput: {len(input_texts) / total_time:.2f} requests/second")
+            print(f"   Time per request: {total_time / len(input_texts) * 1000:.2f} ms")
 
             # Print detailed results for small batches
             if len(input_texts) <= 10:
-                print(f"\nDetailed Results:")
+                print("\nDetailed Results:")
                 for i in range(len(input_texts)):
                     result = final_results[i]
-                    status = (
-                        " Finished"
-                        if result["finished"]
-                        else "⏰ Max iterations reached"
-                    )
+                    status = " Finished" if result["finished"] else "⏰ Max iterations reached"
                     print(f"\nRequest {i} ({status}):")
                     print(f"  Input:  '{result['input']}'")
                     print(f"  Output: '{result['output']}'")
             else:
                 # Show only a few examples
-                print(f"\n Sample Results (first 3):")
+                print("\n Sample Results (first 3):")
                 for i in range(min(3, len(input_texts))):
                     result = final_results[i]
                     status = " Finished" if result["finished"] else "Max iterations"
@@ -559,7 +530,7 @@ class TestQwenModel(unittest.TestCase):
                 self.assertIsNotNone(result["output"])
                 self.assertTrue(len(result["output"]) >= len(result["input"]))
 
-            print(f"\n Batch test completed successfully!")
+            print("\n Batch test completed successfully!")
             return {
                 "total_time": total_time,
                 "throughput": len(input_texts) / total_time,

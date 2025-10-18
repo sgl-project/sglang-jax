@@ -138,7 +138,7 @@ def main():
                         )
 
                         print(
-                            f"Config {valid_config_count}: m={adjusted_m}, k={k}, n={n}, groups={num_groups}, group_size={adjusted_m//num_groups}"
+                            f"Config {valid_config_count}: m={adjusted_m}, k={k}, n={n}, groups={num_groups}, group_size={adjusted_m // num_groups}"
                         )
 
                         try:
@@ -186,15 +186,9 @@ def main():
         worst_config = max(results, key=lambda x: x["megablox_ms"])
 
         print("-" * 80)
-        print(
-            f"Best performance:  {best_config['config']} - {best_config['megablox_ms']:.2f} ms"
-        )
-        print(
-            f"Worst performance: {worst_config['config']} - {worst_config['megablox_ms']:.2f} ms"
-        )
-        print(
-            f"Speedup ratio: {worst_config['megablox_ms'] / best_config['megablox_ms']:.2f}x"
-        )
+        print(f"Best performance:  {best_config['config']} - {best_config['megablox_ms']:.2f} ms")
+        print(f"Worst performance: {worst_config['config']} - {worst_config['megablox_ms']:.2f} ms")
+        print(f"Speedup ratio: {worst_config['megablox_ms'] / best_config['megablox_ms']:.2f}x")
 
 
 if __name__ == "__main__":

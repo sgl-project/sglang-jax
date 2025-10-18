@@ -1,8 +1,8 @@
 import argparse
+import importlib
 import os
 import subprocess
 import sys
-import unittest
 from pathlib import Path
 
 
@@ -11,11 +11,12 @@ def check_jax_dependencies():
     try:
         import jax
         import jax.numpy as jnp
-        from flax import nnx
+
+        importlib.util.find_spec("flax.nnx")
 
         print(f"✓ JAX version: {jax.__version__}")
         print(f"✓ JAX backend: {jax.default_backend()}")
-        print(f"✓ Flax NNX available")
+        print("✓ Flax NNX available")
 
         # Test basic JAX operations
         x = jnp.array([1, 2, 3])
@@ -35,9 +36,9 @@ def check_jax_dependencies():
 def check_sglang_dependencies():
     """Check if SGLang dependencies are available"""
     try:
-        from sgl_jax.srt.configs.load_config import LoadFormat
-        from sgl_jax.srt.model_loader.loader import JAXModelLoader
-        from sgl_jax.srt.models.qwen import QWenLMHeadJaxModel
+        importlib.util.find_spec("sgl_jax.srt.configs.load_config.LoadFormat")
+        importlib.util.find_spec("sgl_jax.srt.model_loader.loader.JAXModelLoader")
+        importlib.util.find_spec("sgl_jax.srt.models.qwen.QWenLMHeadJaxModel")
 
         print("✓ SGLang JAXModelLoader available")
         print("✓ QWenLMHeadJaxModel available")
@@ -52,7 +53,6 @@ def check_transformers_dependencies():
     """Check if Transformers dependencies are available"""
     try:
         import transformers
-        from transformers import PretrainedConfig
 
         print(f"✓ Transformers version: {transformers.__version__}")
         return True
@@ -62,9 +62,7 @@ def check_transformers_dependencies():
         return False
 
 
-def run_tests(
-    test_name=None, model_path=None, verbose=False, enable_precision_tracer=False
-):
+def run_tests(test_name=None, model_path=None, verbose=False, enable_precision_tracer=False):
     """Run the QWen JAXModelLoader tests"""
     env = os.environ.copy()
     if model_path:
@@ -127,22 +125,22 @@ def create_sample_qwen_model(output_dir):
         mock_weights = {
             "transformer": {
                 "embed_tokens": {
-                    "kernel": np.random.randn(
-                        config["vocab_size"], config["hidden_size"]
-                    ).astype(np.float32)
+                    "kernel": np.random.randn(config["vocab_size"], config["hidden_size"]).astype(
+                        np.float32
+                    )
                 },
                 "h": {},
                 "ln_f": {"scale": np.ones(config["hidden_size"], dtype=np.float32)},
             },
             "lm_head": {
-                "kernel": np.random.randn(
-                    config["hidden_size"], config["vocab_size"]
-                ).astype(np.float32)
+                "kernel": np.random.randn(config["hidden_size"], config["vocab_size"]).astype(
+                    np.float32
+                )
             },
             "logits_processor": {
-                "kernel": np.random.randn(
-                    config["hidden_size"], config["vocab_size"]
-                ).astype(np.float32)
+                "kernel": np.random.randn(config["hidden_size"], config["vocab_size"]).astype(
+                    np.float32
+                )
             },
         }
 
@@ -188,7 +186,7 @@ def create_sample_qwen_model(output_dir):
             msgpack.pack(mock_weights, f)
 
         print(f"Created sample QWen JAX model at: {model_dir}")
-        print(f"  - config.json: Model configuration")
+        print("  - config.json: Model configuration")
         print(f"  - model.msgpack: Mock weights ({msgpack_file.stat().st_size} bytes)")
 
     except ImportError:
@@ -233,26 +231,18 @@ def main():
         help="Specific test method to run (use --list-tests to see available tests)",
     )
 
-    parser.add_argument(
-        "--verbose", "-v", action="store_true", help="Verbose test output"
-    )
+    parser.add_argument("--verbose", "-v", action="store_true", help="Verbose test output")
 
-    parser.add_argument(
-        "--check-jax", action="store_true", help="Check JAX dependencies and exit"
-    )
+    parser.add_argument("--check-jax", action="store_true", help="Check JAX dependencies and exit")
 
-    parser.add_argument(
-        "--check-deps", action="store_true", help="Check all dependencies and exit"
-    )
+    parser.add_argument("--check-deps", action="store_true", help="Check all dependencies and exit")
 
     parser.add_argument(
         "--create-sample",
         help="Create a sample QWen JAX model directory at the specified path",
     )
 
-    parser.add_argument(
-        "--list-tests", action="store_true", help="List all available test methods"
-    )
+    parser.add_argument("--list-tests", action="store_true", help="List all available test methods")
     parser.add_argument(
         "--enable-precision-tracer",
         action="store_true",
@@ -290,7 +280,7 @@ def main():
     if args.create_sample:
         try:
             model_path = create_sample_qwen_model(args.create_sample)
-            print(f"\nYou can now run tests with:")
+            print("\nYou can now run tests with:")
             print(f"python {__file__} --model-path {model_path}")
             return 0
         except Exception as e:

@@ -2,7 +2,6 @@ import enum
 import json
 import logging
 from dataclasses import dataclass, field
-from typing import List, Optional, Union
 
 logger = logging.getLogger(__name__)
 
@@ -45,11 +44,11 @@ class LoadConfig:
         from this file (after PBKDF2).
     """
 
-    load_format: Union[str, LoadFormat] = LoadFormat.AUTO
-    download_dir: Optional[str] = None
-    model_loader_extra_config: Optional[Union[str, dict]] = field(default_factory=dict)
-    ignore_patterns: Optional[Union[List[str], str]] = None
-    decryption_key_file: Optional[str] = None
+    load_format: str | LoadFormat = LoadFormat.AUTO
+    download_dir: str | None = None
+    model_loader_extra_config: str | dict | None = field(default_factory=dict)
+    ignore_patterns: list[str] | str | None = None
+    decryption_key_file: str | None = None
 
     def __post_init__(self):
         model_loader_extra_config = self.model_loader_extra_config or {}

@@ -1,6 +1,7 @@
 import logging
 import time
-from typing import Any, AsyncGenerator, Dict, List, Union
+from collections.abc import AsyncGenerator
+from typing import Any
 
 from fastapi import Request
 from fastapi.responses import ORJSONResponse, StreamingResponse
@@ -58,18 +59,13 @@ class OpenAIServingCompletion(OpenAIServingBase):
             pass
 
         # Set logprob start length based on echo and logprobs
-        if request.echo and request.logprobs:
-            logprob_start_len = 0
-        else:
-            logprob_start_len = -1
+        logprob_start_len = 0 if request.echo and request.logprobs else -1
 
         # Build sampling parameters
         sampling_params = self._build_sampling_params(request)
 
         # Determine prompt format
-        if isinstance(prompt, str) or (
-            isinstance(prompt, list) and isinstance(prompt[0], str)
-        ):
+        if isinstance(prompt, str) or (isinstance(prompt, list) and isinstance(prompt[0], str)):
             prompt_kwargs = {"text": prompt}
         else:
             prompt_kwargs = {"input_ids": prompt}
@@ -92,7 +88,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
 
         return adapted_request, request
 
-    def _build_sampling_params(self, request: CompletionRequest) -> Dict[str, Any]:
+    def _build_sampling_params(self, request: CompletionRequest) -> dict[str, Any]:
         """Build sampling parameters for the request"""
         # Start with common parameters
         sampling_params = {
@@ -164,20 +160,16 @@ class OpenAIServingCompletion(OpenAIServingBase):
                 hidden_states[index] = content["meta_info"].get("hidden_states", None)
 
                 stream_buffer = stream_buffers.get(index, "")
-                # Handle echo for first chunk
-                if not stream_buffer:  # The first chunk
-                    if request.echo:
-                        echo_text = self._get_echo_text(request, index)
-                        text = echo_text + text
+                if not stream_buffer and request.echo:  # The first chunk
+                    echo_text = self._get_echo_text(request, index)
+                    text = echo_text + text
 
                 # Handle logprobs
                 logprobs = None
                 if request.logprobs is not None:
                     # The first chunk and echo is enabled.
                     if not stream_buffer and request.echo:
-                        input_token_logprobs = content["meta_info"][
-                            "input_token_logprobs"
-                        ]
+                        input_token_logprobs = content["meta_info"]["input_token_logprobs"]
                         input_top_logprobs = content["meta_info"]["input_top_logprobs"]
                     else:
                         input_token_logprobs = None
@@ -187,16 +179,14 @@ class OpenAIServingCompletion(OpenAIServingBase):
                     logprobs = to_openai_style_logprobs(
                         input_token_logprobs=input_token_logprobs,
                         input_top_logprobs=input_top_logprobs,
-                        output_token_logprobs=content["meta_info"][
-                            "output_token_logprobs"
-                        ][n_prev_token:],
+                        output_token_logprobs=content["meta_info"]["output_token_logprobs"][
+                            n_prev_token:
+                        ],
                         output_top_logprobs=content["meta_info"]["output_top_logprobs"][
                             n_prev_token:
                         ],
                     )
-                    n_prev_tokens[index] = len(
-                        content["meta_info"]["output_token_logprobs"]
-                    )
+                    n_prev_tokens[index] = len(content["meta_info"]["output_token_logprobs"])
 
                 # Generate delta
                 delta = text[len(stream_buffer) :]
@@ -228,9 +218,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
                 for index, choice_hidden_states in hidden_states.items():
                     if choice_hidden_states:
                         last_token_hidden_states = (
-                            choice_hidden_states[-1]
-                            if len(choice_hidden_states) > 1
-                            else []
+                            choice_hidden_states[-1] if len(choice_hidden_states) > 1 else []
                         )
                         hidden_states_chunk = CompletionStreamResponse(
                             id=content["meta_info"]["id"],
@@ -278,12 +266,10 @@ class OpenAIServingCompletion(OpenAIServingBase):
         adapted_request: GenerateReqInput,
         request: CompletionRequest,
         raw_request: Request,
-    ) -> Union[CompletionResponse, ErrorResponse, ORJSONResponse]:
+    ) -> CompletionResponse | ErrorResponse | ORJSONResponse:
         """Handle non-streaming completion request"""
         try:
-            generator = self.tokenizer_manager.generate_request(
-                adapted_request, raw_request
-            )
+            generator = self.tokenizer_manager.generate_request(adapted_request, raw_request)
             ret = await generator.__anext__()
         except ValueError as e:
             return self.create_error_response(str(e))
@@ -302,7 +288,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
     def _build_completion_response(
         self,
         request: CompletionRequest,
-        ret: List[Dict[str, Any]],
+        ret: list[dict[str, Any]],
         created: int,
     ) -> CompletionResponse:
         """Build completion response from generation results"""
@@ -336,9 +322,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
                 logprobs = to_openai_style_logprobs(
                     input_token_logprobs=input_token_logprobs,
                     input_top_logprobs=input_top_logprobs,
-                    output_token_logprobs=ret_item["meta_info"][
-                        "output_token_logprobs"
-                    ],
+                    output_token_logprobs=ret_item["meta_info"]["output_token_logprobs"],
                     output_top_logprobs=ret_item["meta_info"]["output_top_logprobs"],
                 )
 
@@ -389,9 +373,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
                 return self.tokenizer_manager.tokenizer.decode(
                     request.prompt, skip_special_tokens=True
                 )
-            elif isinstance(request.prompt[0], list) and isinstance(
-                request.prompt[0][0], int
-            ):
+            elif isinstance(request.prompt[0], list) and isinstance(request.prompt[0][0], int):
                 # for the case of multiple token ids prompts
                 return self.tokenizer_manager.tokenizer.decode(
                     request.prompt[index // request.n],
@@ -399,7 +381,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
                 )
         return ""
 
-    def _prepare_echo_prompts(self, request: CompletionRequest) -> List[str]:
+    def _prepare_echo_prompts(self, request: CompletionRequest) -> list[str]:
         """Prepare echo prompts for non-streaming response"""
         if isinstance(request.prompt, list) and isinstance(request.prompt[0], str):
             # for the case of multiple str prompts
@@ -407,17 +389,13 @@ class OpenAIServingCompletion(OpenAIServingBase):
         elif isinstance(request.prompt, list) and isinstance(request.prompt[0], list):
             # for the case of multiple token ids prompts
             return [
-                self.tokenizer_manager.tokenizer.decode(
-                    prompt, skip_special_tokens=True
-                )
+                self.tokenizer_manager.tokenizer.decode(prompt, skip_special_tokens=True)
                 for prompt in request.prompt
             ]
         elif isinstance(request.prompt, list) and isinstance(request.prompt[0], int):
             # for the case of single token ids prompt
             return [
-                self.tokenizer_manager.tokenizer.decode(
-                    request.prompt, skip_special_tokens=True
-                )
+                self.tokenizer_manager.tokenizer.decode(request.prompt, skip_special_tokens=True)
             ]
         else:
             # for the case of single str prompt

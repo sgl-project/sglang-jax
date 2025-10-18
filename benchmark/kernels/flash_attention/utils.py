@@ -16,9 +16,7 @@ def create_kv_cache_data(
     return kv_cache
 
 
-def create_qkv_data(
-    total_tokens, q_head_num, kv_head_num, head_dim, dtype=jnp.bfloat16, seed=42
-):
+def create_qkv_data(total_tokens, q_head_num, kv_head_num, head_dim, dtype=jnp.bfloat16, seed=42):
     key = jax.random.PRNGKey(seed)
     keys = jax.random.split(key, 3)
     q = jax.random.normal(keys[0], (total_tokens, q_head_num, head_dim), dtype=dtype)
@@ -27,14 +25,10 @@ def create_qkv_data(
     return q, k, v
 
 
-def create_page_indices_data(
-    num_seqs, total_kv_tokens, seq_lens, max_context_len, page_size=128
-):
+def create_page_indices_data(num_seqs, total_kv_tokens, seq_lens, max_context_len, page_size=128):
     cache_loc = jnp.arange(0, total_kv_tokens, dtype=jnp.int32)
 
-    cache_start_idx = jnp.concatenate(
-        [jnp.array([0], dtype=jnp.int32), jnp.cumsum(seq_lens)]
-    )
+    cache_start_idx = jnp.concatenate([jnp.array([0], dtype=jnp.int32), jnp.cumsum(seq_lens)])
 
     cache_loc_list = []
     for i in range(num_seqs):
@@ -130,9 +124,7 @@ def create_decode_uniform_data(
 ):
     batch_size = max_num_batched_tokens
     # hackly set prefix len to 2048-4096 for decode one seq in random
-    random_prefix_lens = jax.random.randint(
-        jax.random.PRNGKey(42), (batch_size,), 1024, 2048
-    )
+    random_prefix_lens = jax.random.randint(jax.random.PRNGKey(42), (batch_size,), 1024, 2048)
     seq_lens = random_prefix_lens + 1
     cu_q_lens = jnp.concatenate(
         [
@@ -146,9 +138,7 @@ def create_decode_uniform_data(
             jnp.cumsum(seq_lens),
         ]
     )
-    q, k, v = create_qkv_data(
-        batch_size, q_head_num, kv_head_num, head_dim, dtype, seed
-    )
+    q, k, v = create_qkv_data(batch_size, q_head_num, kv_head_num, head_dim, dtype, seed)
     kv_cache = create_kv_cache_data(
         max_kv_cache_tokens,
         kv_head_num,

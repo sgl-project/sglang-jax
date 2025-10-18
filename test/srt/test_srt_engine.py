@@ -54,8 +54,7 @@ class TestSRTEngine(CustomTestCase):
         )
         eos_tok = (
             [tokenizer.eos_token_id]
-            if tokenizer.eos_token_id is not None
-            and input_ids[-1] != tokenizer.eos_token_id
+            if tokenizer.eos_token_id is not None and input_ids[-1] != tokenizer.eos_token_id
             else []
         )
         return bos_tok + input_ids + eos_tok

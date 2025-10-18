@@ -1,4 +1,4 @@
-from typing import Any, Callable, Iterable, Optional, Sequence, Tuple, Union
+from collections.abc import Iterable, Sequence
 
 import jax
 from flax import nnx
@@ -12,7 +12,7 @@ def _canonicalize_tuple(x):
         return (x,)
 
 
-def _normalize_axes(axes: Iterable[int], ndim: int) -> Tuple[int, ...]:
+def _normalize_axes(axes: Iterable[int], ndim: int) -> tuple[int, ...]:
     return tuple(ax if ax >= 0 else ndim + ax for ax in axes)
 
 
@@ -35,8 +35,8 @@ class LinearBase(nnx.Module):
         output_size: int,
         use_bias: bool = True,
         skip_bias_add: bool = False,
-        params_dtype: Optional[jnp.dtype] = jnp.bfloat16,
-        kernel_axes: Optional[Sequence[str]] = None,
+        params_dtype: jnp.dtype | None = jnp.bfloat16,
+        kernel_axes: Sequence[str] | None = None,
         rngs: nnx.Rngs = None,
     ):
         """Initialize parameters and quantization method."""
@@ -48,14 +48,14 @@ class LinearBase(nnx.Module):
         )
         if use_bias:
             self.bias = nnx.Param(
-                nnx.with_partitioning(
-                    nnx.initializers.zeros_init(), (kernel_axes[-1],)
-                )(jax.random.PRNGKey(0), (output_size,), params_dtype)
+                nnx.with_partitioning(nnx.initializers.zeros_init(), (kernel_axes[-1],))(
+                    jax.random.PRNGKey(0), (output_size,), params_dtype
+                )
             )
         else:
             self.bias = None
 
-    def __call__(self, x: jax.Array) -> Tuple[jax.Array, Optional[jax.Array]]:
+    def __call__(self, x: jax.Array) -> tuple[jax.Array, jax.Array | None]:
         """Forward pass of the linear layer."""
         bias = self.bias if not self.skip_bias_add else None
         # Access the underlying JAX array using .value property

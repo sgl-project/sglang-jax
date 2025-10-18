@@ -8,7 +8,6 @@ https://arxiv.org/abs/2311.12022
 
 import random
 import re
-from typing import Optional
 
 import pandas
 
@@ -18,7 +17,6 @@ from sgl_jax.test.simple_eval_common import (
     HTML_JINJA,
     Eval,
     EvalResult,
-    MessageList,
     SamplerBase,
     SingleEvalResult,
     format_multichoice_question,
@@ -29,7 +27,7 @@ class GPQAEval(Eval):
     def __init__(
         self,
         filename: str,
-        num_examples: Optional[int],
+        num_examples: int | None,
         num_threads: int,
         n_repeats: int = 1,
     ):
@@ -40,9 +38,7 @@ class GPQAEval(Eval):
             assert n_repeats == 1, "n_repeats only supported for num_examples"
             examples = rng.sample(examples, num_examples)
         examples = examples * n_repeats
-        examples = [
-            example | {"permutation": rng.sample(range(4), 4)} for example in examples
-        ]
+        examples = [example | {"permutation": rng.sample(range(4), 4)} for example in examples]
         self.examples = examples
         self.n_repeats = n_repeats
         self.num_threads = num_threads

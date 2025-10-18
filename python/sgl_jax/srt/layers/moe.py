@@ -1,4 +1,4 @@
-from typing import Iterable, Optional, Sequence, Tuple, Union
+from collections.abc import Iterable, Sequence
 
 import jax
 from flax import nnx
@@ -32,19 +32,18 @@ class GateLogit(nnx.Module):
     def __init__(
         self,
         input_size: int,
-        features: Union[Iterable[int], int],
+        features: Iterable[int] | int,
         model_name: str,
-        axis: Union[Iterable[int], int] = -1,
+        axis: Iterable[int] | int = -1,
         weight_dtype: jnp.dtype = jnp.float32,
         dtype: jnp.dtype = jnp.float32,
-        kernel_axes: Optional[Sequence[str]] = None,
+        kernel_axes: Sequence[str] | None = None,
         use_bias: bool = False,
         score_func: str = "",
         matmul_precision: str = "default",
         layer_id: int = 0,
         rngs: nnx.Rngs = None,
     ):
-
         self.features = linear._canonicalize_tuple(features)
         self.axis = linear._canonicalize_tuple(axis)
         self.model_name = model_name
@@ -67,9 +66,7 @@ class GateLogit(nnx.Module):
 
         if self.use_bias:
             bias_shape = self.features
-            bias_axes = (
-                self.kernel_axes[-len(self.features) :] if self.kernel_axes else ()
-            )
+            bias_axes = self.kernel_axes[-len(self.features) :] if self.kernel_axes else ()
             self.bias = nnx.Param(
                 nnx.with_partitioning(nnx.initializers.zeros_init(), bias_axes)(
                     jax.random.PRNGKey(0), bias_shape, self.weight_dtype
@@ -78,7 +75,7 @@ class GateLogit(nnx.Module):
         else:
             self.bias = None
 
-    def __call__(self, inputs: jax.Array) -> Tuple[jax.Array, Optional[jax.Array]]:
+    def __call__(self, inputs: jax.Array) -> tuple[jax.Array, jax.Array | None]:
         inputs = jnp.asarray(inputs, self.dtype)
 
         kernel = jnp.asarray(self.kernel.value, self.dtype)
@@ -113,7 +110,6 @@ class EPMoE(nnx.Module):
         layer_id: int = 0,
         rngs: nnx.Rngs = None,
     ):
-
         self.config = config
         self.num_experts = num_experts
         self.num_experts_per_tok = num_experts_per_tok
@@ -170,7 +166,7 @@ class EPMoE(nnx.Module):
             primary_device = device_types[0] if device_types else "unknown"
 
             return can_use_ragged, primary_device
-        except Exception as e:
+        except Exception as _:
             return False, "cpu"
 
     def __call__(self, inputs, router_logits=None):
@@ -202,17 +198,13 @@ class EPMoE(nnx.Module):
             expert_shard_id = data_index * tensor_size + tensor_index
 
             # topk
-            top_k_logits, top_k_indices = jax.lax.top_k(
-                router_logits, self.num_experts_per_tok
+            top_k_logits, top_k_indices = jax.lax.top_k(router_logits, self.num_experts_per_tok)
+            top_k_weights = jax.nn.softmax(top_k_logits.astype(jnp.bfloat16), axis=-1).astype(
+                self.dtype
             )
-            top_k_weights = jax.nn.softmax(
-                top_k_logits.astype(jnp.bfloat16), axis=-1
-            ).astype(self.dtype)
 
             # ep moe norm_topk_prob=true
-            top_k_weights = top_k_weights / jnp.sum(
-                top_k_weights, axis=-1, keepdims=True
-            )
+            top_k_weights = top_k_weights / jnp.sum(top_k_weights, axis=-1, keepdims=True)
 
             if hidden_states.ndim == 2:
                 total_tokens = hidden_states.shape[0]
@@ -221,16 +213,14 @@ class EPMoE(nnx.Module):
                 batch_size, seq_len = hidden_states.shape[0], hidden_states.shape[1]
                 total_tokens = batch_size * seq_len
             # Permute
-            x, sorted_selected_experts, weights, group_sizes, selected_experts = (
-                self._permute(hidden_states, top_k_indices, top_k_weights)
+            x, sorted_selected_experts, weights, group_sizes, selected_experts = self._permute(
+                hidden_states, top_k_indices, top_k_weights
             )
 
             # EP Dispatch
             if self.expert_parallel_size > 1:
-                x, local_group_sizes, selected_experts = (
-                    self._expert_all_to_all_dispatch(
-                        x, selected_experts, expert_shard_id
-                    )
+                x, local_group_sizes, selected_experts = self._expert_all_to_all_dispatch(
+                    x, selected_experts, expert_shard_id
                 )
             else:
                 local_group_sizes = group_sizes
@@ -280,9 +270,7 @@ class EPMoE(nnx.Module):
         self, x, local_group_sizes, selected_experts, w0_kernel, w1_kernel, wo_kernel
     ):
         if x.shape[0] == 0:
-            empty_output = jnp.zeros(
-                (0, wo_kernel.shape[-1]), dtype=x.dtype
-            )  # (0, hidden_dim)
+            empty_output = jnp.zeros((0, wo_kernel.shape[-1]), dtype=x.dtype)  # (0, hidden_dim)
             return empty_output
 
         m, k = x.shape[0], x.shape[1]
@@ -333,12 +321,8 @@ class EPMoE(nnx.Module):
         return intermediate_output
 
     def _single_device_forward(self, inputs, router_logits):
-        top_k_logits, top_k_indices = jax.lax.top_k(
-            router_logits, self.num_experts_per_tok
-        )
-        top_k_weights = jax.nn.softmax(
-            top_k_logits.astype(jnp.float32), axis=-1
-        ).astype(self.dtype)
+        top_k_logits, top_k_indices = jax.lax.top_k(router_logits, self.num_experts_per_tok)
+        top_k_weights = jax.nn.softmax(top_k_logits.astype(jnp.float32), axis=-1).astype(self.dtype)
 
         top_k_weights = top_k_weights / jnp.sum(top_k_weights, axis=-1, keepdims=True)
 
@@ -396,26 +380,20 @@ class EPMoE(nnx.Module):
         valid_experts_for_bincount = jnp.where(
             valid_expert_mask, local_experts_extracted, local_expert_size
         )
-        local_group_sizes = jnp.bincount(
-            valid_experts_for_bincount, length=local_expert_size
-        )
+        local_group_sizes = jnp.bincount(valid_experts_for_bincount, length=local_expert_size)
 
         return local_data, local_group_sizes, local_experts_extracted
 
     def _get_all_to_all_params(self, group_sizes, shard_id):
         input_offsets = jnp.zeros(self.expert_parallel_size, dtype=group_sizes.dtype)
         send_sizes = jnp.repeat(group_sizes[shard_id], self.expert_parallel_size)
-        output_offset = jnp.concatenate((jnp.array([0]), jnp.cumsum(group_sizes[:-1])))[
-            shard_id
-        ]
+        output_offset = jnp.concatenate((jnp.array([0]), jnp.cumsum(group_sizes[:-1])))[shard_id]
         output_offsets = jnp.repeat(output_offset, self.expert_parallel_size)
         recv_sizes = group_sizes
 
         return input_offsets, send_sizes, output_offsets, recv_sizes
 
-    def _expert_all_to_all_collect(
-        self, data, global_group_sizes, expert_shard_id, target_size
-    ):
+    def _expert_all_to_all_collect(self, data, global_group_sizes, expert_shard_id, target_size):
         # Calculate the number of tokens to be handled by each device.
         reshaped_group_sizes = global_group_sizes.reshape(
             self.expert_parallel_size, self.experts_per_device
@@ -423,8 +401,8 @@ class EPMoE(nnx.Module):
         tokens_per_device = jnp.sum(reshaped_group_sizes, axis=1)
 
         # Get parameters for ragged_all_to_all
-        input_offsets, send_sizes, output_offsets, recv_sizes = (
-            self._get_all_to_all_params(tokens_per_device, expert_shard_id)
+        input_offsets, send_sizes, output_offsets, recv_sizes = self._get_all_to_all_params(
+            tokens_per_device, expert_shard_id
         )
 
         # Create output shape buffer
@@ -457,9 +435,7 @@ class EPMoE(nnx.Module):
         sorted_selected_experts = jnp.argsort(flatten_selected_experts)
         sorted_indices = sorted_selected_experts // self.num_experts_per_tok
 
-        sorted_inputs = jnp.take(inputs_2d, indices=sorted_indices, axis=0).astype(
-            self.dtype
-        )
+        sorted_inputs = jnp.take(inputs_2d, indices=sorted_indices, axis=0).astype(self.dtype)
 
         group_sizes = jnp.bincount(flatten_selected_experts, length=self.num_experts)
 
@@ -478,9 +454,7 @@ class EPMoE(nnx.Module):
             sorted_experts,
         )
 
-    def _unpermute(
-        self, intermediate, sorted_selected_experts, weights, batch_size, seq_len
-    ):
+    def _unpermute(self, intermediate, sorted_selected_experts, weights, batch_size, seq_len):
         expected_tokens = sorted_selected_experts.shape[0]
         actual_tokens = intermediate.shape[0]
 
@@ -489,9 +463,7 @@ class EPMoE(nnx.Module):
                 intermediate = intermediate[:expected_tokens]
             else:
                 padding_size = expected_tokens - actual_tokens
-                padding = jnp.zeros(
-                    (padding_size, intermediate.shape[1]), dtype=intermediate.dtype
-                )
+                padding = jnp.zeros((padding_size, intermediate.shape[1]), dtype=intermediate.dtype)
                 intermediate = jnp.concatenate([intermediate, padding], axis=0)
 
         argsort_indices = jnp.argsort(sorted_selected_experts)
@@ -499,9 +471,7 @@ class EPMoE(nnx.Module):
 
         total_tokens = weights.shape[0] * weights.shape[1] // self.num_experts_per_tok
 
-        reshaped_weights = jnp.reshape(
-            weights, (total_tokens, self.num_experts_per_tok)
-        )
+        reshaped_weights = jnp.reshape(weights, (total_tokens, self.num_experts_per_tok))
         reshaped_intermediate = jnp.reshape(
             unsort_intermediate,
             (total_tokens, self.num_experts_per_tok, -1),
