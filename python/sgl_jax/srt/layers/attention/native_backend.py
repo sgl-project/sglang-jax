@@ -62,10 +62,12 @@ class NativeAttention(AttentionBackend):
 
         scale = 1.0 / jnp.sqrt(layer.head_dim) if layer.scaling is None else layer.scaling
 
-        is_causal = not (
+        is_causal = True
+        if (
             forward_batch.forward_mode == ForwardMode.DECODE
             or layer.attn_type == AttentionType.ENCODER_ONLY
-        )
+        ):
+            is_causal = False
 
         attn_output = forward_attention(
             q,
