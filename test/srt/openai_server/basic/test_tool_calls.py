@@ -42,7 +42,7 @@ class TestToolCalls(CustomTestCase):
                 "--chunked-prefill-size",
                 "2048",
                 "--download-dir",
-                "/tmp/",
+                "/dev/shm",
                 "--dtype",
                 "bfloat16",
                 "--precompile-bs-paddings",
