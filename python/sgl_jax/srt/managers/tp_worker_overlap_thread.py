@@ -48,7 +48,7 @@ class ModelWorkerClient:
         # JAX handles device execution automatically, no need for explicit streams
         self.forward_thread = threading.Thread(
             target=self.forward_thread_func,
-            daemon=True if server_args.enable_single_process else False,
+            daemon=bool(server_args.enable_single_process),
         )
         self.forward_thread.start()
         self.parent_process = psutil.Process().parent()

@@ -1085,7 +1085,7 @@ def run_scheduler_loop_thread_after_create(
         }
     except Exception:
         traceback = get_exception_traceback()
-        logger.error(f"Scheduler hit an exception: {traceback}")
+        logger.error("Scheduler hit an exception: %s", traceback)
         current_process.send_signal(signal.SIGQUIT)
 
 

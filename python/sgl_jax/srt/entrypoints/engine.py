@@ -606,9 +606,7 @@ def _launch_threads(
     # Wait for the model to finish loading
     for i in range(len(scheduler_infos)):
         if scheduler_infos[i]["status"] != "ready":
-            raise RuntimeError(
-                "Initialization failed. Please see the error messages above."
-            )
+            raise RuntimeError("Initialization failed. Please see the error messages above.")
 
     # Assume all schedulers have the same scheduler_info
     assert len(scheduler_infos) > 0, "scheduler_infos is empty"

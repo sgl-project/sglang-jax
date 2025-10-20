@@ -252,9 +252,7 @@ class SamplingMetadata:
                     ),
                 ]
             )
-            sampling_seeds_device = device_array(
-                padded_sampling_seeds, sharding=sharding
-            )
+            sampling_seeds_device = device_array(padded_sampling_seeds, sharding=sharding)
         else:
             sampling_seeds_device = None
 
