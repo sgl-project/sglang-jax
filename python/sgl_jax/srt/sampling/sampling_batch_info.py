@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import dataclasses
 import logging
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING
 
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
 from jax.tree_util import register_pytree_node_class
@@ -13,14 +13,13 @@ from sgl_jax.srt.utils import get_bool_env_var
 from sgl_jax.srt.utils.jax_utils import device_array
 
 if TYPE_CHECKING:
-    from sgl_jax.srt.managers.schedule_batch import ScheduleBatch, ModelWorkerBatch
+    from sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch, ScheduleBatch
 
 import threading
 
 import jax
 import jax.numpy as jnp
 import numpy as np
-from jax._src import mesh as mesh_lib
 
 logger = logging.getLogger(__name__)
 
@@ -34,8 +33,8 @@ class SamplingMetadata:
 
     # logprob
     return_logprob: bool
-    top_logprobs_nums: Optional[List[int]]
-    token_ids_logprobs: Optional[List[List[int]]]
+    top_logprobs_nums: list[int] | None
+    token_ids_logprobs: list[list[int]] | None
 
     # sample
     temperatures: jax.Array
@@ -48,7 +47,7 @@ class SamplingMetadata:
 
     # penalty
     do_penalties: bool = False
-    linear_penalty: Optional[jax.Array] = None
+    linear_penalty: jax.Array | None = None
 
     def tree_flatten(self):
         children = (
@@ -97,15 +96,11 @@ class SamplingMetadata:
         pad_size: int = 0,
         mesh: Mesh = None,
     ) -> SamplingMetadata:
-        sharding = (
-            NamedSharding(mesh, PartitionSpec()) if jax.process_count() == 1 else None
-        )
+        sharding = NamedSharding(mesh, PartitionSpec()) if jax.process_count() == 1 else None
         padded_temperatures = np.concat(
             [
                 batch.sampling_info.temperatures,
-                np.array(
-                    [1.0] * pad_size, dtype=batch.sampling_info.temperatures.dtype
-                ),
+                np.array([1.0] * pad_size, dtype=batch.sampling_info.temperatures.dtype),
             ]
         ).reshape(-1, 1)
         padded_top_ps = np.concat(
@@ -136,17 +131,13 @@ class SamplingMetadata:
                     ),
                 ]
             )
-            sampling_seeds_device = device_array(
-                padded_sampling_seeds, sharding=sharding
-            )
+            sampling_seeds_device = device_array(padded_sampling_seeds, sharding=sharding)
         else:
             sampling_seeds_device = None
 
-        (temperatures_device, top_ps_device, top_ks_device, min_ps_device) = (
-            device_array(
-                (padded_temperatures, padded_top_ps, padded_top_ks, padded_min_ps),
-                sharding=sharding,
-            )
+        (temperatures_device, top_ps_device, top_ks_device, min_ps_device) = device_array(
+            (padded_temperatures, padded_top_ps, padded_top_ks, padded_min_ps),
+            sharding=sharding,
         )
 
         # Extract penalty information from penalizer orchestrator
@@ -166,9 +157,7 @@ class SamplingMetadata:
                     (pad_size, original_linear_penalty.shape[1]),
                     dtype=original_linear_penalty.dtype,
                 )
-                padded_linear_penalty = np.concat(
-                    [original_linear_penalty, pad_rows], axis=0
-                )
+                padded_linear_penalty = np.concat([original_linear_penalty, pad_rows], axis=0)
             else:
                 padded_linear_penalty = original_linear_penalty
 
@@ -191,9 +180,7 @@ class SamplingMetadata:
                     (pad_size, original_linear_penalty.shape[1]),
                     dtype=original_linear_penalty.dtype,
                 )
-                padded_linear_penalty = np.concat(
-                    [original_linear_penalty, pad_rows], axis=0
-                )
+                padded_linear_penalty = np.concat([original_linear_penalty, pad_rows], axis=0)
             else:
                 padded_linear_penalty = original_linear_penalty
 
@@ -230,15 +217,11 @@ class SamplingMetadata:
         shapes for all penalty types to ensure comprehensive compilation coverage.
         """
         # Basic sampling parameters (same as original method)
-        sharding = (
-            NamedSharding(mesh, PartitionSpec()) if jax.process_count() == 1 else None
-        )
+        sharding = NamedSharding(mesh, PartitionSpec()) if jax.process_count() == 1 else None
         padded_temperatures = np.concat(
             [
                 batch.sampling_info.temperatures,
-                np.array(
-                    [1.0] * pad_size, dtype=batch.sampling_info.temperatures.dtype
-                ),
+                np.array([1.0] * pad_size, dtype=batch.sampling_info.temperatures.dtype),
             ]
         ).reshape(-1, 1)
         padded_top_ps = np.concat(
@@ -269,17 +252,13 @@ class SamplingMetadata:
                     ),
                 ]
             )
-            sampling_seeds_device = device_array(
-                padded_sampling_seeds, sharding=sharding
-            )
+            sampling_seeds_device = device_array(padded_sampling_seeds, sharding=sharding)
         else:
             sampling_seeds_device = None
 
-        (temperatures_device, top_ps_device, top_ks_device, min_ps_device) = (
-            device_array(
-                (padded_temperatures, padded_top_ps, padded_top_ks, padded_min_ps),
-                sharding=sharding,
-            )
+        (temperatures_device, top_ps_device, top_ks_device, min_ps_device) = device_array(
+            (padded_temperatures, padded_top_ps, padded_top_ks, padded_min_ps),
+            sharding=sharding,
         )
 
         if batch.sampling_info.sampling_seeds is not None:
@@ -302,9 +281,7 @@ class SamplingMetadata:
         # Calculate batch size and vocab size
         batch_size = len(batch.sampling_info.temperatures) + pad_size
         vocab_size = batch.sampling_info.vocab_size
-        padded_linear_penalty = (
-            jnp.ones((batch_size, vocab_size), dtype=jnp.float32) * 0.2
-        )
+        padded_linear_penalty = jnp.ones((batch_size, vocab_size), dtype=jnp.float32) * 0.2
 
         (linear_penalty_device,) = device_array(
             (padded_linear_penalty,),
@@ -354,12 +331,12 @@ class SamplingBatchInfo:
     need_min_p_sampling: bool = False
 
     # An event used for overlap schedule
-    sampling_info_done: Optional[threading.Event] = None
+    sampling_info_done: threading.Event | None = None
 
-    sampling_seeds: Optional[np.ndarray] = None
+    sampling_seeds: np.ndarray | None = None
 
     # Penalizer
-    penalizer_orchestrator: Optional[penaltylib.BatchedPenalizerOrchestrator] = None
+    penalizer_orchestrator: penaltylib.BatchedPenalizerOrchestrator | None = None
     linear_penalty: np.ndarray = None
 
     @classmethod
@@ -369,17 +346,13 @@ class SamplingBatchInfo:
         return global_server_args_dict
 
     @classmethod
-    def generate_for_precompile(
-        cls, bs: int, vocab_size: int = 32000, do_penalties: bool = False
-    ):
+    def generate_for_precompile(cls, bs: int, vocab_size: int = 32000, do_penalties: bool = False):
         temperatures = np.array([0.6 for _ in range(bs)], dtype=np.float32)
         top_ps = np.array([0.9 for _ in range(bs)], dtype=np.float32)
         top_ks = np.array([30 for _ in range(bs)], dtype=np.int32)
         min_ps = np.array([0.6 for _ in range(bs)], dtype=np.float32)
         if get_bool_env_var("SGLANG_ENABLE_DETERMINISTIC_SAMPLING"):
-            sampling_seeds = np.array(
-                [DEFAULT_SAMPLING_SEED for _ in range(bs)], dtype=np.int32
-            )
+            sampling_seeds = np.array([DEFAULT_SAMPLING_SEED for _ in range(bs)], dtype=np.int32)
         else:
             sampling_seeds = None
 
@@ -525,7 +498,7 @@ class SamplingBatchInfo:
             if value is not None:
                 setattr(self, item, value[keep_indices])
 
-    def merge_batch(self, other: "SamplingBatchInfo"):
+    def merge_batch(self, other: SamplingBatchInfo):
         self.penalizer_orchestrator.merge(other.penalizer_orchestrator)
         # Note: because the __len()__ operator is defined on the temperatures tensor,
         # please make sure any merge operation with len(self) or len(other) is done before

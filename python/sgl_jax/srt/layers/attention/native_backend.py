@@ -1,14 +1,11 @@
-from typing import Tuple
-
 import jax
 import jax.numpy as jnp
-from jax.sharding import Mesh
 from jax.tree_util import register_pytree_node_class
 
 from sgl_jax.srt.layers.attention.base_attn_backend import AttentionBackend
 from sgl_jax.srt.layers.radix_attention import AttentionType, RadixAttention
 from sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch
-from sgl_jax.srt.mem_cache.memory_pool import KVCache, merge_kv
+from sgl_jax.srt.mem_cache.memory_pool import KVCache
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sgl_jax.srt.utils.jax_utils import is_tpu_runtime
 
@@ -36,9 +33,7 @@ class NativeAttention(AttentionBackend):
 
     @classmethod
     def tree_unflatten(cls, aux_data, children):
-        return cls(
-            num_attn_heads=aux_data["num_heads"], num_kv_heads=aux_data["num_kv_heads"]
-        )
+        return cls(num_attn_heads=aux_data["num_heads"], num_kv_heads=aux_data["num_kv_heads"])
 
     def get_forward_metadata(self, batch: ModelWorkerBatch):
         """Init the metadata for a forward pass and return it."""
@@ -65,10 +60,7 @@ class NativeAttention(AttentionBackend):
             k, v, forward_batch, token_to_kv_pool, layer.layer_id
         )
 
-        if layer.scaling is None:
-            scale = 1.0 / jnp.sqrt(layer.head_dim)
-        else:
-            scale = layer.scaling
+        scale = 1.0 / jnp.sqrt(layer.head_dim) if layer.scaling is None else layer.scaling
 
         is_causal = True
         if (
@@ -102,7 +94,7 @@ class NativeAttention(AttentionBackend):
         forward_batch: ForwardBatch,
         token_to_kv_pool: KVCache,
         layer_id: int,
-    ) -> Tuple[jax.Array, jax.Array, jax.Array]:
+    ) -> tuple[jax.Array, jax.Array, jax.Array]:
         """
         Get the kv cache from the forward batch.
         """
@@ -187,9 +179,7 @@ def forward_attention(
     else:
         # Already in multi-head format: [num_tokens, num_heads, head_dim]
         num_tokens, num_heads_input, head_dim = q.shape
-        assert (
-            num_heads_input == num_heads
-        ), f"Expected {num_heads} heads, got {num_heads_input}"
+        assert num_heads_input == num_heads, f"Expected {num_heads} heads, got {num_heads_input}"
         hidden_size = num_heads * head_dim  # Calculate hidden_size for proper reshaping
         q_heads = q
 
@@ -245,7 +235,6 @@ def _apply_extend_mask(
     Applies a block-diagonal and optionally a causal mask in a unified,
     efficient way, correctly handling padding.
     """
-    batch_size = seq_lengths.shape[0]
     _, query_len, key_len = attn_weights.shape
 
     # --- Create validity masks to handle padding ---

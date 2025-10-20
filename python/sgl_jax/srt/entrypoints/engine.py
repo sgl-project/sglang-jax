@@ -7,22 +7,22 @@ This file implements python APIs for the inference engine.
 import asyncio
 import atexit
 import dataclasses
+import json
 import logging
 import multiprocessing as mp
 import os
 import signal
 import threading
-from typing import Any, AsyncIterator, Dict, Iterator, List, Optional, Tuple, Union
+from collections.abc import AsyncIterator, Iterator
+from typing import Any
 
+import uvloop
 import zmq
 import zmq.asyncio
 
+# ruff: noqa: E402
 # Fix a bug of Python threading
-setattr(threading, "_register_atexit", lambda *args, **kwargs: None)
-
-import json
-
-import uvloop
+threading._register_atexit = lambda *args, **kwargs: None
 
 from sgl_jax.srt.entrypoints.EngineBase import EngineBase
 from sgl_jax.srt.hf_transformers_utils import get_generation_config
@@ -92,37 +92,33 @@ class Engine(EngineBase):
 
         # Allocate ports for inter-process communications
         self.port_args = PortArgs.init_new(server_args)
-        logger.info(f"{server_args=}")
+        logger.info("server_args=%s", server_args)
 
         # Launch subprocesses or threads
-        tokenizer_manager, template_manager, scheduler_info = (
-            _launch_subprocesses_or_threads(
-                server_args=server_args,
-                port_args=self.port_args,
-            )
+        tokenizer_manager, template_manager, scheduler_info = _launch_subprocesses_or_threads(
+            server_args=server_args,
+            port_args=self.port_args,
         )
         self.server_args = server_args
         self.tokenizer_manager = tokenizer_manager
         self.template_manager = template_manager
         self.scheduler_info = scheduler_info
-        self.default_sampling_params: Union[dict[str, Any], None] = None
+        self.default_sampling_params: dict[str, Any] | None = None
         context = zmq.Context(2)
-        self.send_to_rpc = get_zmq_socket(
-            context, zmq.DEALER, self.port_args.rpc_ipc_name, True
-        )
+        self.send_to_rpc = get_zmq_socket(context, zmq.DEALER, self.port_args.rpc_ipc_name, True)
 
     def generate(
         self,
-        prompt: Optional[Union[List[str], str]] = None,
-        sampling_params: Optional[Union[List[Dict], Dict]] = None,
+        prompt: list[str] | str | None = None,
+        sampling_params: list[dict] | dict | None = None,
         # The token ids for text; one can either specify text or input_ids.
-        input_ids: Optional[Union[List[List[int]], List[int]]] = None,
-        return_logprob: Optional[Union[List[bool], bool]] = False,
-        logprob_start_len: Optional[Union[List[int], int]] = None,
-        top_logprobs_num: Optional[Union[List[int], int]] = None,
-        token_ids_logprob: Optional[Union[List[List[int]], List[int]]] = None,
+        input_ids: list[list[int]] | list[int] | None = None,
+        return_logprob: list[bool] | bool | None = False,
+        logprob_start_len: list[int] | int | None = None,
+        top_logprobs_num: list[int] | int | None = None,
+        token_ids_logprob: list[list[int]] | list[int] | None = None,
         stream: bool = False,
-    ) -> Union[Dict, Iterator[Dict]]:
+    ) -> dict | Iterator[dict]:
         """
         The arguments of this function is the same as `sglang/srt/managers/io_struct.py::GenerateReqInput`.
         Please refer to `GenerateReqInput` for the documentation.
@@ -165,15 +161,15 @@ class Engine(EngineBase):
 
     async def async_generate(
         self,
-        sampling_params: Optional[Union[List[Dict], Dict]] = None,
+        sampling_params: list[dict] | dict | None = None,
         # The token ids for text; one can either specify text or input_ids.
-        input_ids: Optional[Union[List[List[int]], List[int]]] = None,
-        return_logprob: Optional[Union[List[bool], bool]] = False,
-        logprob_start_len: Optional[Union[List[int], int]] = None,
-        top_logprobs_num: Optional[Union[List[int], int]] = None,
-        token_ids_logprob: Optional[Union[List[List[int]], List[int]]] = None,
+        input_ids: list[list[int]] | list[int] | None = None,
+        return_logprob: list[bool] | bool | None = False,
+        logprob_start_len: list[int] | int | None = None,
+        top_logprobs_num: list[int] | int | None = None,
+        token_ids_logprob: list[list[int]] | list[int] | None = None,
         stream: bool = False,
-    ) -> Union[Dict, AsyncIterator[Dict]]:
+    ) -> dict | AsyncIterator[dict]:
         """
         The arguments of this function is the same as `sglang/srt/managers/io_struct.py::GenerateReqInput`.
         Please refer to `GenerateReqInput` for the documentation.
@@ -200,8 +196,8 @@ class Engine(EngineBase):
 
     def encode(
         self,
-        prompt: Union[str, List[str], List[Dict], List[List[Dict]]],
-    ) -> Dict:
+        prompt: str | list[str] | list[dict] | list[list[dict]],
+    ) -> dict:
         """
         The arguments of this function is the same as `sglang/srt/managers/io_struct.py::EmbeddingReqInput`.
         Please refer to `EmbeddingReqInput` for the documentation.
@@ -216,8 +212,8 @@ class Engine(EngineBase):
 
     async def async_encode(
         self,
-        prompt: Union[str, List[str], List[Dict], List[List[Dict]]],
-    ) -> Dict:
+        prompt: str | list[str] | list[dict] | list[list[dict]],
+    ) -> dict:
         """
         Asynchronous version of encode method.
 
@@ -232,8 +228,8 @@ class Engine(EngineBase):
 
     def rerank(
         self,
-        prompt: Union[List[List[str]]],
-    ) -> Dict:
+        prompt: list[list[str]],
+    ) -> dict:
         """
         The arguments of this function is the same as `sglang/srt/managers/io_struct.py::EmbeddingReqInput`.
         Please refer to `EmbeddingReqInput` for the documentation.
@@ -271,9 +267,7 @@ class Engine(EngineBase):
 
     def get_server_info(self):
         loop = asyncio.get_event_loop()
-        internal_states = loop.run_until_complete(
-            self.tokenizer_manager.get_internal_state()
-        )
+        internal_states = loop.run_until_complete(self.tokenizer_manager.get_internal_state())
         return {
             **dataclasses.asdict(self.tokenizer_manager.server_args),
             **self.scheduler_info,
@@ -281,28 +275,24 @@ class Engine(EngineBase):
             "version": __version__,
         }
 
-    def release_memory_occupation(self, tags: Optional[List[str]] = None):
+    def release_memory_occupation(self, tags: list[str] | None = None):
         obj = ReleaseMemoryOccupationReqInput(tags=tags)
         loop = asyncio.get_event_loop()
-        return loop.run_until_complete(
-            self.tokenizer_manager.release_memory_occupation(obj, None)
-        )
+        return loop.run_until_complete(self.tokenizer_manager.release_memory_occupation(obj, None))
 
-    def resume_memory_occupation(self, tags: Optional[List[str]] = None):
+    def resume_memory_occupation(self, tags: list[str] | None = None):
         obj = ResumeMemoryOccupationReqInput(tags=tags)
         loop = asyncio.get_event_loop()
-        return loop.run_until_complete(
-            self.tokenizer_manager.resume_memory_occupation(obj, None)
-        )
+        return loop.run_until_complete(self.tokenizer_manager.resume_memory_occupation(obj, None))
 
     def score(
         self,
-        query: Optional[Union[str, List[int]]] = None,
-        items: Optional[Union[str, List[str], List[List[int]]]] = None,
-        label_token_ids: Optional[List[int]] = None,
+        query: str | list[int] | None = None,
+        items: str | list[str] | list[list[int]] | None = None,
+        label_token_ids: list[int] | None = None,
         apply_softmax: bool = False,
         item_first: bool = False,
-    ) -> List[List[float]]:
+    ) -> list[list[float]]:
         """
         Score the probability of specified token IDs appearing after the given (query + item) pair. For example:
         query = "<|user|>Is the following city the capital of France? "
@@ -348,12 +338,12 @@ class Engine(EngineBase):
 
     async def async_score(
         self,
-        query: Optional[Union[str, List[int]]] = None,
-        items: Optional[Union[str, List[str], List[List[int]]]] = None,
-        label_token_ids: Optional[List[int]] = None,
+        query: str | list[int] | None = None,
+        items: str | list[str] | list[list[int]] | None = None,
+        label_token_ids: list[int] | None = None,
         apply_softmax: bool = False,
         item_first: bool = False,
-    ) -> List[List[float]]:
+    ) -> list[list[float]]:
         """
         Asynchronous version of score method.
 
@@ -417,9 +407,11 @@ def _set_envs_and_config(server_args):
         pid, exitcode = os.waitpid(0, os.WNOHANG)
         if exitcode != 0:
             logger.warning(
-                f"Child process unexpectedly failed with {exitcode=}. {pid=}"
+                "Child process unexpectedly failed with exitcode=%s. pid=%s",
+                exitcode,
+                pid,
             )
-            logger.warning(f"Child process {pid=} frame={frame}")
+            logger.warning("Child process pid=%s frame=%s", pid, frame)
 
     signal.signal(signal.SIGCHLD, sigchld_handler)
 
@@ -427,9 +419,7 @@ def _set_envs_and_config(server_args):
     # The child processes will send SIGQUIT to this process when any error happens
     # This process then clean up the whole process tree
     def sigquit_handler(signum, frame):
-        logger.error(
-            "Received sigquit from a child process. It usually means the child failed."
-        )
+        logger.error("Received sigquit from a child process. It usually means the child failed.")
         kill_process_tree(os.getpid())
 
     signal.signal(signal.SIGQUIT, sigquit_handler)
@@ -444,8 +434,8 @@ def _set_envs_and_config(server_args):
 
 
 def _launch_subprocesses(
-    server_args, port_args: Optional[PortArgs] = None
-) -> Tuple[TokenizerManager, TemplateManager, Dict]:
+    server_args, port_args: PortArgs | None = None
+) -> tuple[TokenizerManager, TemplateManager, dict]:
     # Configure global environment
     configure_logger(server_args)
     server_args.check_server_args()
@@ -454,7 +444,7 @@ def _launch_subprocesses(
     # Allocate ports for inter-process communications
     if port_args is None:
         port_args = PortArgs.init_new(server_args)
-        logger.info(f"{server_args=}")
+        logger.info("server_args=%s", server_args)
 
     # If using model from www.modelscope.cn, first download the model.
     server_args.model_path, server_args.tokenizer_path = prepare_model_and_tokenizer(
@@ -498,7 +488,9 @@ def _launch_subprocesses(
         for proc in scheduler_procs:
             proc.join()
             logger.error(
-                f"Scheduler or DataParallelController {proc.pid} terminated with {proc.exitcode}"
+                "Scheduler or DataParallelController %s terminated with %s",
+                proc.pid,
+                proc.exitcode,
             )
         return None, None, None
 
@@ -528,16 +520,15 @@ def _launch_subprocesses(
             data = scheduler_pipe_readers[i].recv()
         except EOFError:
             logger.error(
-                f"Node {i} jax_scheduler is dead. Please check if there are relevant logs."
+                "Node %s jax_scheduler is dead. Please check if there are relevant logs.",
+                i,
             )
             scheduler_procs[i].join()
-            logger.error(f"Exit code: {scheduler_procs[i].exitcode}")
+            logger.error("Exit code: %s", scheduler_procs[i].exitcode)
             raise
 
         if data["status"] != "ready":
-            raise RuntimeError(
-                "Initialization failed. Please see the error messages above."
-            )
+            raise RuntimeError("Initialization failed. Please see the error messages above.")
         scheduler_infos.append(data)
 
     # Assume all schedulers have the same scheduler_info
@@ -547,8 +538,8 @@ def _launch_subprocesses(
 
 
 def _launch_threads(
-    server_args, port_args: Optional[PortArgs] = None
-) -> Tuple[TokenizerManager, TemplateManager, Dict]:
+    server_args, port_args: PortArgs | None = None
+) -> tuple[TokenizerManager, TemplateManager, dict]:
     # Configure global environment
     configure_logger(server_args)
     server_args.check_server_args()
@@ -557,7 +548,7 @@ def _launch_threads(
     # Allocate ports for inter-process communications
     if port_args is None:
         port_args = PortArgs.init_new(server_args)
-        logger.info(f"{server_args=}")
+        logger.info("server_args=%s", server_args)
 
     # If using model from www.modelscope.cn, first download the model.
     server_args.model_path, server_args.tokenizer_path = prepare_model_and_tokenizer(
@@ -589,9 +580,7 @@ def _launch_threads(
 
         for thread in scheduler_threads:
             thread.join()
-            logger.error(
-                f"Scheduler or DataParallelController {thread.name} terminated"
-            )
+            logger.error("Scheduler or DataParallelController %s terminated", thread.name)
         return None, None, None
 
     # Launch detokenizer thread
@@ -617,9 +606,7 @@ def _launch_threads(
     # Wait for the model to finish loading
     for i in range(len(scheduler_infos)):
         if scheduler_infos[i]["status"] != "ready":
-            raise RuntimeError(
-                "Initialization failed. Please see the error messages above."
-            )
+            raise RuntimeError("Initialization failed. Please see the error messages above.")
 
     # Assume all schedulers have the same scheduler_info
     assert len(scheduler_infos) > 0, "scheduler_infos is empty"
@@ -629,8 +616,8 @@ def _launch_threads(
 
 
 def _launch_subprocesses_or_threads(
-    server_args, port_args: Optional[PortArgs] = None
-) -> Tuple[TokenizerManager, TemplateManager, Dict]:
+    server_args, port_args: PortArgs | None = None
+) -> tuple[TokenizerManager, TemplateManager, dict]:
     if server_args.enable_single_process:
         return _launch_threads(server_args, port_args)
     else:

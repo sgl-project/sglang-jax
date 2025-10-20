@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import abc
 import weakref
-from typing import TYPE_CHECKING, Optional, Set, Type
+from typing import TYPE_CHECKING
 
 import numpy as np
 
@@ -15,7 +15,7 @@ class BatchedPenalizerOrchestrator:
         self,
         vocab_size: int,
         batch: ScheduleBatch,
-        penalizers: Set[Type["_BatchedPenalizer"]],
+        penalizers: set[type[_BatchedPenalizer]],
     ):
         self.vocab_size = vocab_size
         self._batch_ref = weakref.ref(batch)
@@ -35,7 +35,7 @@ class BatchedPenalizerOrchestrator:
         return self._batch_ref()
 
     @batch.setter
-    def batch(self, value: Optional[ScheduleBatch]):
+    def batch(self, value: ScheduleBatch | None):
         if value is None:
             self._batch_ref = lambda: None
         else:
@@ -74,9 +74,7 @@ class BatchedPenalizerOrchestrator:
         )
 
         # Get active penalizers
-        active_penalizers = [
-            (type(p), p) for p in self.penalizers.values() if p.is_prepared()
-        ]
+        active_penalizers = [(type(p), p) for p in self.penalizers.values() if p.is_prepared()]
 
         if len(active_penalizers) == 0:
             return None
@@ -94,10 +92,7 @@ class BatchedPenalizerOrchestrator:
             result = None
 
             for penalty_type in penalty_order:
-                if (
-                    penalty_type in self.penalizers
-                    and self.penalizers[penalty_type].is_prepared()
-                ):
+                if penalty_type in self.penalizers and self.penalizers[penalty_type].is_prepared():
                     penalty_values = self.penalizers[penalty_type].compute_penalty()
                     if result is None:
                         result = penalty_values.copy()
@@ -132,7 +127,7 @@ class BatchedPenalizerOrchestrator:
                 penalizer.teardown()
         self.is_required = is_required
 
-    def merge(self, their: "BatchedPenalizerOrchestrator"):
+    def merge(self, their: BatchedPenalizerOrchestrator):
         """
         Merge the penalizers of another orchestrator into this one.
 
@@ -189,7 +184,7 @@ class _BatchedPenalizer(abc.ABC):
 
         self._filter(keep_indices=keep_indices)
 
-    def merge(self, their: "_BatchedPenalizer"):
+    def merge(self, their: _BatchedPenalizer):
         if not self._is_prepared and not their._is_prepared:
             return
 
@@ -228,7 +223,7 @@ class _BatchedPenalizer(abc.ABC):
         pass
 
     @abc.abstractmethod
-    def _merge(self, their: "_BatchedPenalizer"):
+    def _merge(self, their: _BatchedPenalizer):
         """
         Merge the penalizer with another penalizer.
         """

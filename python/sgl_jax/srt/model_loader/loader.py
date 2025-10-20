@@ -1,24 +1,19 @@
 import dataclasses
 import logging
 import os
-import time
 from abc import ABC, abstractmethod
-from functools import partial
-from typing import Any, List, Optional, Tuple
+from typing import Any
 
-import flax.linen as nn
 import huggingface_hub
 import jax
 import jax.numpy as jnp
 import numpy as np
 from flax import nnx
-from jax.sharding import NamedSharding
 
 from sgl_jax.srt.configs.load_config import LoadConfig, LoadFormat
 from sgl_jax.srt.configs.model_config import ModelConfig
 from sgl_jax.srt.model_loader.arch import get_model_architecture
 from sgl_jax.srt.utils.common_utils import get_bool_env_var
-from sgl_jax.srt.utils.jax_utils import print_memory
 
 logger = logging.getLogger(__name__)
 
@@ -48,7 +43,7 @@ class JAXModelLoader(BaseModelLoader):
     @dataclasses.dataclass
     class JAXSource:
         model_or_path: str
-        revision: Optional[str]
+        revision: str | None
 
         @classmethod
         def init_new(cls, model_config: ModelConfig):
@@ -57,9 +52,7 @@ class JAXModelLoader(BaseModelLoader):
                 model_config.revision,
             )
 
-    def __init__(
-        self, load_config: LoadConfig, rngs: jax.Array, mesh: jax.sharding.Mesh
-    ):
+    def __init__(self, load_config: LoadConfig, rngs: jax.Array, mesh: jax.sharding.Mesh):
         super().__init__(load_config)
         self.rng = rngs
         self.mesh = mesh
@@ -99,17 +92,13 @@ class JAXModelLoader(BaseModelLoader):
     def _get_model(self, model_class: Any, model_config: ModelConfig) -> nnx.Module:
         with self.mesh:
             model = nnx.eval_shape(
-                lambda: model_class(
-                    model_config.hf_config, model_config.dtype, self.rng, self.mesh
-                )
+                lambda: model_class(model_config.hf_config, model_config.dtype, self.rng, self.mesh)
             )
 
         model.load_weights(model_config, self.rng.default.key.value)
         return model
 
-    def _maybe_download_from_modelscope(
-        self, model: str, revision: Optional[str]
-    ) -> Optional[str]:
+    def _maybe_download_from_modelscope(self, model: str, revision: str | None) -> str | None:
         if get_bool_env_var("SGLANG_USE_MODELSCOPE"):
             # download model from ModelScope hub,
             # lazy import so that modelscope is not required for normal use.
@@ -129,8 +118,8 @@ class JAXModelLoader(BaseModelLoader):
         return None
 
     def _prepare_weights(
-        self, model_name_or_path: str, revision: Optional[str]
-    ) -> Tuple[str, List[str]]:
+        self, model_name_or_path: str, revision: str | None
+    ) -> tuple[str, list[str]]:
         model_path = self._maybe_download_from_modelscope(model_name_or_path, revision)
         if model_path is not None:
             model_name_or_path = model_path
@@ -157,9 +146,7 @@ class JAXModelLoader(BaseModelLoader):
 class JAXDummyModelLoader(BaseModelLoader):
     """Model loader that will set model weights to random values for JAX models."""
 
-    def __init__(
-        self, load_config: LoadConfig, rngs: jax.Array, mesh: jax.sharding.Mesh
-    ):
+    def __init__(self, load_config: LoadConfig, rngs: jax.Array, mesh: jax.sharding.Mesh):
         super().__init__(load_config)
         if load_config.model_loader_extra_config:
             raise ValueError(
@@ -235,9 +222,7 @@ class JAXDummyModelLoader(BaseModelLoader):
                 return old
             return new
 
-        new_params = jax.tree_util.tree_map_with_path(
-            _preserve_rope_caches, params, new_params
-        )
+        new_params = jax.tree_util.tree_map_with_path(_preserve_rope_caches, params, new_params)
         nnx.update(model, new_params)
 
     def load_model(
@@ -249,9 +234,7 @@ class JAXDummyModelLoader(BaseModelLoader):
         model_class = self._initialize_model(model_config)
 
         def create_model(rng: nnx.Rngs):
-            model = model_class(
-                model_config.hf_config, model_config.dtype, rng, self.mesh
-            )
+            model = model_class(model_config.hf_config, model_config.dtype, rng, self.mesh)
             state = nnx.state(model)
             pspecs = nnx.get_partition_spec(state)
             sharded_state = jax.lax.with_sharding_constraint(state, pspecs)

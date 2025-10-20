@@ -13,11 +13,13 @@ import os
 import random
 import threading
 import time
+from collections.abc import AsyncIterator, Callable
 from http import HTTPStatus
-from typing import Any, AsyncIterator, Callable, Dict, List, Optional
+from typing import Any
 
+# ruff: noqa: E402
 # Fix a bug of Python threading
-setattr(threading, "_register_atexit", lambda *args, **kwargs: None)
+threading._register_atexit = lambda *args, **kwargs: None
 
 from contextlib import asynccontextmanager
 
@@ -87,10 +89,10 @@ asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 class _GlobalState:
     tokenizer_manager: TokenizerManager
     template_manager: TemplateManager
-    scheduler_info: Dict
+    scheduler_info: dict
 
 
-_global_state: Optional[_GlobalState] = None
+_global_state: _GlobalState | None = None
 
 
 def set_global_state(global_state: _GlobalState):
@@ -110,12 +112,8 @@ async def lifespan(fast_api_app: FastAPI):
     fast_api_app.state.openai_serving_embedding = OpenAIServingEmbedding(
         _global_state.tokenizer_manager, _global_state.template_manager
     )
-    fast_api_app.state.openai_serving_score = OpenAIServingScore(
-        _global_state.tokenizer_manager
-    )
-    fast_api_app.state.openai_serving_rerank = OpenAIServingRerank(
-        _global_state.tokenizer_manager
-    )
+    fast_api_app.state.openai_serving_score = OpenAIServingScore(_global_state.tokenizer_manager)
+    fast_api_app.state.openai_serving_rerank = OpenAIServingRerank(_global_state.tokenizer_manager)
 
     server_args: ServerArgs = fast_api_app.server_args
     if server_args.warmups is not None:
@@ -149,10 +147,7 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
     exc_str = str(exc)
     errors_str = str(exc.errors())
 
-    if errors_str and errors_str != exc_str:
-        message = f"{exc_str} {errors_str}"
-    else:
-        message = exc_str
+    message = f"{exc_str} {errors_str}" if errors_str and errors_str != exc_str else exc_str
 
     err = ErrorResponse(
         message=message,
@@ -230,9 +225,10 @@ async def health_generate(request: Request) -> Response:
         "%H:%M:%S", time.localtime(_global_state.tokenizer_manager.last_receive_tstamp)
     )
     logger.error(
-        f"Health check failed. Server couldn't get a response from detokenizer for last "
-        f"{HEALTH_CHECK_TIMEOUT} seconds. tic start time: {tic_time}. "
-        f"last_heartbeat time: {last_receive_time}"
+        "Health check failed. Server couldn't get a response from detokenizer for last %s seconds. tic start time: %s. last_heartbeat time: %s",
+        HEALTH_CHECK_TIMEOUT,
+        tic_time,
+        last_receive_time,
     )
     _global_state.tokenizer_manager.rid_to_state.pop(rid, None)
     _global_state.tokenizer_manager.health_check_failed = True
@@ -254,7 +250,7 @@ async def get_model_info():
 @app.get("/get_server_info")
 async def get_server_info():
     # Returns interna states per DP.
-    internal_states: List[Dict[Any, Any]] = (
+    internal_states: list[dict[Any, Any]] = (
         await _global_state.tokenizer_manager.get_internal_state()
     )
     return {
@@ -286,18 +282,12 @@ async def generate_request(obj: GenerateReqInput, request: Request):
 
         async def stream_results() -> AsyncIterator[bytes]:
             try:
-                async for out in _global_state.tokenizer_manager.generate_request(
-                    obj, request
-                ):
-                    yield b"data: " + orjson.dumps(
-                        out, option=orjson.OPT_NON_STR_KEYS
-                    ) + b"\n\n"
+                async for out in _global_state.tokenizer_manager.generate_request(obj, request):
+                    yield (b"data: " + orjson.dumps(out, option=orjson.OPT_NON_STR_KEYS) + b"\n\n")
             except ValueError as e:
                 out = {"error": {"message": str(e)}}
-                logger.error(f"[http_server] Error: {e}")
-                yield b"data: " + orjson.dumps(
-                    out, option=orjson.OPT_NON_STR_KEYS
-                ) + b"\n\n"
+                logger.error("[http_server] Error: %s", e)
+                yield (b"data: " + orjson.dumps(out, option=orjson.OPT_NON_STR_KEYS) + b"\n\n")
             yield b"data: [DONE]\n\n"
 
         return StreamingResponse(
@@ -307,12 +297,10 @@ async def generate_request(obj: GenerateReqInput, request: Request):
         )
     else:
         try:
-            ret = await _global_state.tokenizer_manager.generate_request(
-                obj, request
-            ).__anext__()
+            ret = await _global_state.tokenizer_manager.generate_request(obj, request).__anext__()
             return ret
         except ValueError as e:
-            logger.error(f"[http_server] Error: {e}")
+            logger.error("[http_server] Error: %s", e)
             return _create_error_response(e)
 
 
@@ -331,12 +319,10 @@ async def generate_from_file_request(file: UploadFile, request: Request):
     )
 
     try:
-        ret = await _global_state.tokenizer_manager.generate_request(
-            obj, request
-        ).__anext__()
+        ret = await _global_state.tokenizer_manager.generate_request(obj, request).__anext__()
         return ret
     except ValueError as e:
-        logger.error(f"Error: {e}")
+        logger.error("Error: %s", e)
         return _create_error_response(e)
 
 
@@ -344,9 +330,7 @@ async def generate_from_file_request(file: UploadFile, request: Request):
 async def encode_request(obj: EmbeddingReqInput, request: Request):
     """Handle an embedding request."""
     try:
-        ret = await _global_state.tokenizer_manager.generate_request(
-            obj, request
-        ).__anext__()
+        ret = await _global_state.tokenizer_manager.generate_request(obj, request).__anext__()
         return ret
     except ValueError as e:
         return _create_error_response(e)
@@ -356,9 +340,7 @@ async def encode_request(obj: EmbeddingReqInput, request: Request):
 async def classify_request(obj: EmbeddingReqInput, request: Request):
     """Handle a reward model request. Now the arguments and return values are the same as embedding models."""
     try:
-        ret = await _global_state.tokenizer_manager.generate_request(
-            obj, request
-        ).__anext__()
+        ret = await _global_state.tokenizer_manager.generate_request(obj, request).__anext__()
         return ret
     except ValueError as e:
         return _create_error_response(e)
@@ -376,7 +358,7 @@ async def flush_cache():
 
 
 @app.api_route("/start_profile", methods=["GET", "POST"])
-async def start_profile_async(obj: Optional[ProfileReqInput] = None):
+async def start_profile_async(obj: ProfileReqInput | None = None):
     """Start profiling."""
     if obj is None:
         obj = ProfileReqInput()
@@ -405,7 +387,7 @@ async def stop_profile_async():
 
 
 @app.api_route("/start_trace", methods=["GET", "POST"])
-async def start_trace_async(obj: Optional[StartTraceReqInput] = None):
+async def start_trace_async(obj: StartTraceReqInput | None = None):
     """Start precision tracing."""
     if obj is None:
         obj = StartTraceReqInput()
@@ -425,12 +407,10 @@ async def start_trace_async(obj: Optional[StartTraceReqInput] = None):
         else:
             timestamp = int(time.time())
             unique_suffix = random.randint(1000, 9999)
-            output_file = (
-                f"debug_outputs/request_traces_{timestamp}_{unique_suffix}.jsonl"
-            )
+            output_file = f"debug_outputs/request_traces_{timestamp}_{unique_suffix}.jsonl"
 
         precision_tracer.start_trace(req_num=obj.req_num, output_file=output_file)
-        logger.info(f"[HTTP] Sending trace state to scheduler...")
+        logger.info("[HTTP] Sending trace state to scheduler...")
         trace_state = {
             "precision_tracer": {
                 "trace_active": True,
@@ -443,9 +423,9 @@ async def start_trace_async(obj: Optional[StartTraceReqInput] = None):
             result = await _global_state.tokenizer_manager.set_internal_state(
                 SetInternalStateReq(request_id="trace_state", state_data=trace_state)
             )
-            logger.info(f"[HTTP] Set internal state result: {result}")
+            logger.info("[HTTP] Set internal state result: %s", result)
         except Exception as e:
-            logger.info(f"[HTTP] Error setting internal state: {e}")
+            logger.info("[HTTP] Error setting internal state: %s", e)
             precision_tracer.stop_trace()
             return ORJSONResponse(
                 content={
@@ -475,11 +455,11 @@ async def start_trace_async(obj: Optional[StartTraceReqInput] = None):
 
 
 @app.api_route("/stop_trace", methods=["GET", "POST"])
-async def stop_trace_async(obj: Optional[StopTraceReqInput] = None):
+async def stop_trace_async(obj: StopTraceReqInput | None = None):
     """Stop precision tracing."""
     try:
         output_file = precision_tracer.stop_trace()
-        print(f"[HTTP] Sending stop trace state to scheduler...")
+        print("[HTTP] Sending stop trace state to scheduler...")
         trace_state = {
             "precision_tracer": {
                 "trace_active": False,
@@ -520,7 +500,7 @@ async def stop_trace_async(obj: Optional[StopTraceReqInput] = None):
 
 
 @app.api_route("/trace_status", methods=["GET", "POST"])
-async def trace_status_async(obj: Optional[TraceStatusReqInput] = None):
+async def trace_status_async(obj: TraceStatusReqInput | None = None):
     """Get precision tracing status."""
     try:
         return ORJSONResponse(
@@ -545,9 +525,7 @@ async def trace_status_async(obj: Optional[TraceStatusReqInput] = None):
 
 
 @app.api_route("/release_memory_occupation", methods=["GET", "POST"])
-async def release_memory_occupation(
-    obj: ReleaseMemoryOccupationReqInput, request: Request
-):
+async def release_memory_occupation(obj: ReleaseMemoryOccupationReqInput, request: Request):
     """Release GPU memory occupation temporarily."""
     try:
         await _global_state.tokenizer_manager.release_memory_occupation(obj, request)
@@ -556,9 +534,7 @@ async def release_memory_occupation(
 
 
 @app.api_route("/resume_memory_occupation", methods=["GET", "POST"])
-async def resume_memory_occupation(
-    obj: ResumeMemoryOccupationReqInput, request: Request
-):
+async def resume_memory_occupation(obj: ResumeMemoryOccupationReqInput, request: Request):
     """Resume GPU memory occupation."""
     try:
         await _global_state.tokenizer_manager.resume_memory_occupation(obj, request)
@@ -601,9 +577,7 @@ async def configure_logging(obj: ConfigureLoggingReq, request: Request):
 async def abort_request(obj: AbortReq, request: Request):
     """Abort a request."""
     try:
-        _global_state.tokenizer_manager.abort_request(
-            rid=obj.rid, abort_all=obj.abort_all
-        )
+        _global_state.tokenizer_manager.abort_request(rid=obj.rid, abort_all=obj.abort_all)
         return Response(status_code=200)
     except Exception as e:
         return _create_error_response(e)
@@ -623,9 +597,7 @@ async def parse_function_call_request(obj: ParseFunctionCallReq, request: Reques
     # 3) Organize the response content
     response_data = {
         "normal_text": normal_text,
-        "calls": [
-            call.model_dump() for call in calls
-        ],  # Convert pydantic objects to dictionaries
+        "calls": [call.model_dump() for call in calls],  # Convert pydantic objects to dictionaries
     }
 
     return ORJSONResponse(content=response_data, status_code=200)
@@ -683,13 +655,9 @@ async def openai_v1_completions(request: CompletionRequest, raw_request: Request
 
 
 @app.post("/v1/chat/completions", dependencies=[Depends(validate_json_request)])
-async def openai_v1_chat_completions(
-    request: ChatCompletionRequest, raw_request: Request
-):
+async def openai_v1_chat_completions(request: ChatCompletionRequest, raw_request: Request):
     """OpenAI-compatible chat completion endpoint."""
-    return await raw_request.app.state.openai_serving_chat.handle_request(
-        request, raw_request
-    )
+    return await raw_request.app.state.openai_serving_chat.handle_request(request, raw_request)
 
 
 @app.post(
@@ -699,9 +667,7 @@ async def openai_v1_chat_completions(
 )
 async def openai_v1_embeddings(request: EmbeddingRequest, raw_request: Request):
     """OpenAI-compatible embeddings endpoint."""
-    return await raw_request.app.state.openai_serving_embedding.handle_request(
-        request, raw_request
-    )
+    return await raw_request.app.state.openai_serving_embedding.handle_request(request, raw_request)
 
 
 @app.get("/v1/models", response_class=ORJSONResponse)
@@ -753,43 +719,31 @@ async def sagemaker_health() -> Response:
 
 
 @app.post("/invocations")
-async def sagemaker_chat_completions(
-    request: ChatCompletionRequest, raw_request: Request
-):
+async def sagemaker_chat_completions(request: ChatCompletionRequest, raw_request: Request):
     """OpenAI-compatible chat completion endpoint."""
-    return await raw_request.app.state.openai_serving_chat.handle_request(
-        request, raw_request
-    )
+    return await raw_request.app.state.openai_serving_chat.handle_request(request, raw_request)
 
 
 @app.post("/v1/score", dependencies=[Depends(validate_json_request)])
 async def v1_score_request(request: ScoringRequest, raw_request: Request):
     """Endpoint for the decoder-only scoring API. See Engine.score() for detailed documentation."""
-    return await raw_request.app.state.openai_serving_score.handle_request(
-        request, raw_request
-    )
+    return await raw_request.app.state.openai_serving_score.handle_request(request, raw_request)
 
 
-@app.api_route(
-    "/v1/rerank", methods=["POST", "PUT"], dependencies=[Depends(validate_json_request)]
-)
+@app.api_route("/v1/rerank", methods=["POST", "PUT"], dependencies=[Depends(validate_json_request)])
 async def v1_rerank_request(request: V1RerankReqInput, raw_request: Request):
     """Endpoint for reranking documents based on query relevance."""
-    return await raw_request.app.state.openai_serving_rerank.handle_request(
-        request, raw_request
-    )
+    return await raw_request.app.state.openai_serving_rerank.handle_request(request, raw_request)
 
 
 def _create_error_response(e):
-    return ORJSONResponse(
-        {"error": {"message": str(e)}}, status_code=HTTPStatus.BAD_REQUEST
-    )
+    return ORJSONResponse({"error": {"message": str(e)}}, status_code=HTTPStatus.BAD_REQUEST)
 
 
 def launch_server(
     server_args: ServerArgs,
-    pipe_finish_writer: Optional[multiprocessing.connection.Connection] = None,
-    launch_callback: Optional[Callable[[], None]] = None,
+    pipe_finish_writer: multiprocessing.connection.Connection | None = None,
+    launch_callback: Callable[[], None] | None = None,
 ):
     """
     Launch SRT (SGLang Runtime) Server.
@@ -809,8 +763,8 @@ def launch_server(
     # Initialize precision tracer enable state in HTTP server process
     precision_tracer.set_enable_precision_tracer(server_args.enable_precision_tracer)
 
-    tokenizer_manager, template_manager, scheduler_info = (
-        _launch_subprocesses_or_threads(server_args=server_args, port_args=None)
+    tokenizer_manager, template_manager, scheduler_info = _launch_subprocesses_or_threads(
+        server_args=server_args, port_args=None
     )
     ## don't expose scheduler in server mode
     if "scheduler" in scheduler_info:
@@ -858,7 +812,7 @@ def launch_server(
 
 def _execute_server_warmup(
     server_args: ServerArgs,
-    pipe_finish_writer: Optional[multiprocessing.connection.Connection],
+    pipe_finish_writer: multiprocessing.connection.Connection | None,
 ):
     headers = {}
     url = server_args.url()
@@ -881,7 +835,7 @@ def _execute_server_warmup(
     if not success:
         if pipe_finish_writer is not None:
             pipe_finish_writer.send(last_traceback)
-        logger.error(f"Initialization failed. warmup error: {last_traceback}")
+        logger.error("Initialization failed. warmup error: %s", last_traceback)
         kill_process_tree(os.getpid())
         return success
 
@@ -918,7 +872,7 @@ def _execute_server_warmup(
         last_traceback = get_exception_traceback()
         if pipe_finish_writer is not None:
             pipe_finish_writer.send(last_traceback)
-        logger.error(f"Initialization failed. warmup error: {last_traceback}")
+        logger.error("Initialization failed. warmup error: %s", last_traceback)
         kill_process_tree(os.getpid())
         return False
 
@@ -929,15 +883,14 @@ def _execute_server_warmup(
 
 def _wait_and_warmup(
     server_args: ServerArgs,
-    pipe_finish_writer: Optional[multiprocessing.connection.Connection],
-    launch_callback: Optional[Callable[[], None]] = None,
+    pipe_finish_writer: multiprocessing.connection.Connection | None,
+    launch_callback: Callable[[], None] | None = None,
 ):
-    if not server_args.skip_server_warmup:
-        if not _execute_server_warmup(
-            server_args,
-            pipe_finish_writer,
-        ):
-            return
+    if not server_args.skip_server_warmup and not _execute_server_warmup(
+        server_args,
+        pipe_finish_writer,
+    ):
+        return
 
     logger.info("The server is fired up and ready to roll!")
 

@@ -12,24 +12,7 @@
 # limitations under the License.
 # ==============================================================================
 
-import multiprocessing as mp
 import os
-from dataclasses import dataclass
-from typing import List, Optional, Tuple, Union
-
-import transformers
-from transformers import (
-    AutoConfig,
-    AutoModel,
-    AutoModelForCausalLM,
-    AutoModelForVision2Seq,
-    AutoProcessor,
-    GenerationConfig,
-)
-
-from sgl_jax.srt.entrypoints.engine import Engine
-from sgl_jax.srt.hf_transformers_utils import get_tokenizer
-from sgl_jax.test.test_utils import DEFAULT_PORT_FOR_SRT_TEST_RUNNER, calculate_rouge_l
 
 DEFAULT_PROMPTS = [
     "Apple is red. Banana is Yellow. " * 800 + "Apple is",
@@ -56,7 +39,7 @@ TEST_RERANK_QUERY_DOCS = [
 ]
 
 dirpath = os.path.dirname(__file__)
-with open(os.path.join(dirpath, "long_prompt.txt"), "r") as f:
+with open(os.path.join(dirpath, "long_prompt.txt")) as f:
     long_prompt = f.read()
 DEFAULT_PROMPTS.append(long_prompt)
 

@@ -5,7 +5,6 @@ python3 run_curl.py --base-url=http://127.0.0.1:8100 --return-logprob=true --top
 
 import argparse
 import json
-import time
 
 import requests
 
@@ -32,9 +31,7 @@ def run_curl(args):
     print(f"Payload: {json.dumps(payload, indent=2)}")
 
     try:
-        response = requests.post(
-            f"{base_url}/generate", json=payload, headers=headers, timeout=30
-        )
+        response = requests.post(f"{base_url}/generate", json=payload, headers=headers, timeout=30)
 
         print(f"Status Code: {response.status_code}")
 

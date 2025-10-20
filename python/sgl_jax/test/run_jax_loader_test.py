@@ -22,10 +22,10 @@ Usage:
 """
 
 import argparse
+import importlib
 import os
 import subprocess
 import sys
-import unittest
 from pathlib import Path
 
 
@@ -55,8 +55,8 @@ def check_jax_dependencies():
 def check_sglang_dependencies():
     """Check if SGLang dependencies are available"""
     try:
-        from sgl_jax.srt.configs.load_config import LoadFormat
-        from sgl_jax.srt.model_loader.loader import JAXModelLoader
+        importlib.util.find_spec("sgl_jax.srt.configs.load_config.LoadFormat")
+        importlib.util.find_spec("sgl_jax.srt.model_loader.loader.JAXModelLoader")
 
         print("✓ SGLang JAXModelLoader available")
         return True
@@ -96,7 +96,6 @@ def run_tests(test_name=None, model_path=None, verbose=False):
 def create_sample_jax_model(output_dir):
     """Create a sample JAX model directory for testing"""
     import json
-    import tempfile
 
     model_dir = Path(output_dir) / "sample_jax_model"
     model_dir.mkdir(parents=True, exist_ok=True)
@@ -136,17 +135,11 @@ def main():
         help="Specific test method to run (e.g., test_load_model_with_custom_path)",
     )
 
-    parser.add_argument(
-        "--verbose", "-v", action="store_true", help="Verbose test output"
-    )
+    parser.add_argument("--verbose", "-v", action="store_true", help="Verbose test output")
 
-    parser.add_argument(
-        "--check-jax", action="store_true", help="Check JAX dependencies and exit"
-    )
+    parser.add_argument("--check-jax", action="store_true", help="Check JAX dependencies and exit")
 
-    parser.add_argument(
-        "--check-deps", action="store_true", help="Check all dependencies and exit"
-    )
+    parser.add_argument("--check-deps", action="store_true", help="Check all dependencies and exit")
 
     parser.add_argument(
         "--create-sample",
@@ -175,7 +168,7 @@ def main():
     if args.create_sample:
         try:
             model_path = create_sample_jax_model(args.create_sample)
-            print(f"\nYou can now run tests with:")
+            print("\nYou can now run tests with:")
             print(f"python {__file__} --model-path {model_path}")
             return 0
         except Exception as e:
@@ -193,9 +186,7 @@ def main():
 
     print("\nRunning JAXModelLoader tests...")
 
-    success = run_tests(
-        test_name=args.test, model_path=args.model_path, verbose=args.verbose
-    )
+    success = run_tests(test_name=args.test, model_path=args.model_path, verbose=args.verbose)
 
     if success:
         print("\n✓ All tests passed!")

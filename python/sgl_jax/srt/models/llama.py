@@ -17,7 +17,7 @@
 """Inference-only LLaMA model compatible with HuggingFace weights."""
 
 import logging
-from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
+from typing import Any
 
 import jax
 import jax.numpy as jnp
@@ -25,19 +25,10 @@ from flax import nnx
 from transformers import LlamaConfig, PretrainedConfig
 
 from sgl_jax.srt.configs.model_config import ModelConfig
-from sgl_jax.srt.layers.embeddings import (
-    Embed,
-    ParallelLMHead,
-    RotaryEmbedding,
-    get_rope,
-)
+from sgl_jax.srt.layers.embeddings import Embed, ParallelLMHead, get_rope
 from sgl_jax.srt.layers.layernorm import RMSNorm
 from sgl_jax.srt.layers.linear import LinearBase
-from sgl_jax.srt.layers.logits_processor import (
-    LogitsMetadata,
-    LogitsProcessor,
-    LogitsProcessorOutput,
-)
+from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
 from sgl_jax.srt.layers.radix_attention import RadixAttention
 from sgl_jax.srt.mem_cache.memory_pool import KVCache
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
@@ -104,9 +95,9 @@ class LlamaAttention(nnx.Module):
         num_kv_heads: int,
         layer_id: int = 0,
         rope_theta: float = 10000,
-        rope_scaling: Optional[Dict[str, Any]] = None,
-        head_dim: Optional[int] = None,
-        partial_rotary_factor: Optional[int] = None,
+        rope_scaling: dict[str, Any] | None = None,
+        head_dim: int | None = None,
+        partial_rotary_factor: int | None = None,
         rope_is_neox_style: bool = True,
         max_position_embeddings: int = 8192,
         dtype: jnp.dtype = jnp.bfloat16,
@@ -215,9 +206,7 @@ class LlamaDecoderLayer(nnx.Module):
         self.layer_id = layer_id
         rope_theta = getattr(config, "rope_theta", 10000)
         rope_scaling = getattr(config, "rope_scaling", None)
-        if rope_scaling is not None and getattr(
-            config, "original_max_position_embeddings", None
-        ):
+        if rope_scaling is not None and getattr(config, "original_max_position_embeddings", None):
             rope_scaling["original_max_position_embeddings"] = (
                 config.original_max_position_embeddings
             )
@@ -225,9 +214,7 @@ class LlamaDecoderLayer(nnx.Module):
         max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
         # Support llamafy/Qwen-Qwen2.5-7B-Instruct-llamafied with attention_bias
         # Support internlm/internlm-7b with bias
-        attention_bias = getattr(config, "attention_bias", False) or getattr(
-            config, "bias", False
-        )
+        attention_bias = getattr(config, "attention_bias", False) or getattr(config, "bias", False)
 
         head_dim = getattr(config, "head_dim", None)
         self.self_attn = LlamaAttention(
@@ -273,8 +260,8 @@ class LlamaDecoderLayer(nnx.Module):
         hidden_states: jax.Array,
         forward_batch: ForwardBatch,
         token_to_kv_pool: KVCache,
-        residual: Optional[jax.Array],
-    ) -> Tuple[jax.Array, jax.Array]:
+        residual: jax.Array | None,
+    ) -> tuple[jax.Array, jax.Array]:
         layer_callback_flag = []
         if residual is None:
             residual = hidden_states
@@ -394,12 +381,10 @@ class LlamaForCausalLM(nnx.Module):
         self.mesh = mesh
         self.config = config
         self.dtype = dtype
-        logger.info(f"LlamaForCausalLM config dtype: {self.dtype}")
+        logger.info("LlamaForCausalLM config dtype: %s", self.dtype)
         self.transformer = LlamaModel(config, dtype=self.dtype, rngs=rngs)
         self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size, rngs=rngs)
-        self.logits_processor = LogitsProcessor(
-            config.vocab_size, self.lm_head, self.mesh
-        )
+        self.logits_processor = LogitsProcessor(config.vocab_size, self.lm_head, self.mesh)
 
     def load_weights(self, model_config: ModelConfig, rng_key: jax.Array):
         self.rng = nnx.Rngs(rng_key)

@@ -103,9 +103,7 @@ class TestParamsValidation(CustomTestCase):
                 timeout=10,
             )
             # return 400 rather than failed
-            self.assertEqual(
-                response.status_code, 400, f"Expected 400, got {response.status_code}"
-            )
+            self.assertEqual(response.status_code, 400, f"Expected 400, got {response.status_code}")
         except Exception as e:
             self.fail(f"Server should handle malformed JSON gracefully, but got: {e}")
 
@@ -127,7 +125,6 @@ class TestParamsValidation(CustomTestCase):
             self.assertTrue(cm.exception.code, 400)
 
     def test_input_length_longer_than_context_length(self):
-
         client = openai.Client(api_key=self.api_key, base_url=f"{self.base_url}/v1")
         # Will tokenize to more than context length
         long_text = "hello" * 1200

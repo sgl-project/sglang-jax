@@ -1,7 +1,7 @@
 """Utilities for selecting and loading models."""
 
 import logging
-from typing import Any, Tuple
+from typing import Any
 
 import transformers
 from transformers.dynamic_module_utils import get_class_from_dynamic_module
@@ -15,9 +15,7 @@ def resolve_transformers_arch(model_config: ModelConfig, architectures: list[str
     for i, arch in enumerate(architectures):
         if arch == "TransformersForCausalLM":
             continue
-        auto_map: dict[str, str] = (
-            getattr(model_config.hf_config, "auto_map", None) or dict()
-        )
+        auto_map: dict[str, str] = getattr(model_config.hf_config, "auto_map", None) or dict()
         # Make sure that config class is always initialized before model class,
         # otherwise the model class won't be able to access the config class,
         # the expected auto_map should have correct order like:
@@ -46,8 +44,7 @@ def resolve_transformers_arch(model_config: ModelConfig, architectures: list[str
         if model_config.model_impl == ModelImpl.TRANSFORMERS:
             if not model_module.is_backend_compatible():
                 raise ValueError(
-                    f"The Transformers implementation of {arch} is not "
-                    "compatible with SGLang."
+                    f"The Transformers implementation of {arch} is not compatible with SGLang."
                 )
             architectures[i] = "TransformersForCausalLM"
         if model_config.model_impl == ModelImpl.AUTO:
@@ -66,7 +63,7 @@ def resolve_transformers_arch(model_config: ModelConfig, architectures: list[str
     return architectures
 
 
-def get_model_architecture(model_config: ModelConfig) -> Tuple[Any, str]:
+def get_model_architecture(model_config: ModelConfig) -> tuple[Any, str]:
     from sgl_jax.srt.models.registry import ModelRegistry
 
     architectures = getattr(model_config.hf_config, "architectures", [])

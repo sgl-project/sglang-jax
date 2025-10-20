@@ -1,5 +1,4 @@
 import logging
-from typing import Optional
 
 import jax
 from jax import numpy as jnp
@@ -11,7 +10,7 @@ logger = logging.getLogger(__name__)
 
 def validate_input_length(
     req: Req, max_req_input_len: int, allow_auto_truncate: bool
-) -> Optional[str]:
+) -> str | None:
     """Validate and potentially truncate input length.
 
     Args:
@@ -25,9 +24,9 @@ def validate_input_length(
     if len(req.origin_input_ids) >= max_req_input_len:
         if allow_auto_truncate:
             logger.warning(
-                "Request length is longer than the KV cache pool size or "
-                "the max context length. Truncated. "
-                f"{len(req.origin_input_ids)=}, {max_req_input_len=}."
+                "Request length is longer than the KV cache pool size or the max context length. Truncated. len(origin_input_ids)=%s, max_req_input_len=%s",
+                len(req.origin_input_ids),
+                max_req_input_len,
             )
             req.origin_input_ids = req.origin_input_ids[:max_req_input_len]
             return None
@@ -54,6 +53,4 @@ def resolve_future_token_ids(input_ids, future_token_ids_map):
 @jax.jit
 def set_future_token_ids(future_token_ids_map, future_token_ids_ct, next_token_ids):
     start_indices = (future_token_ids_ct + 1,)
-    return jax.lax.dynamic_update_slice(
-        future_token_ids_map, next_token_ids, start_indices
-    )
+    return jax.lax.dynamic_update_slice(future_token_ids_map, next_token_ids, start_indices)

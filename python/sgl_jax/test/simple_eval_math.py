@@ -8,7 +8,6 @@ https://arxiv.org/abs/2103.03874
 
 import random
 import re
-from typing import Optional
 
 import pandas
 
@@ -37,7 +36,7 @@ class MathEval(Eval):
         self,
         filename: str,
         equality_checker: SamplerBase,
-        num_examples: Optional[int],
+        num_examples: int | None,
         num_threads: int,
     ):
         df = pandas.read_csv(filename)
@@ -56,9 +55,7 @@ class MathEval(Eval):
             response_text = sampler(prompt_messages)
             match = re.search(ANSWER_PATTERN, response_text)
             extracted_answer = match.group(1) if match else None
-            score = float(
-                check_equality(self.equality_checker, row["Answer"], extracted_answer)
-            )
+            score = float(check_equality(self.equality_checker, row["Answer"], extracted_answer))
             html = common.jinja_env.from_string(HTML_JINJA).render(
                 prompt_messages=prompt_messages,
                 next_message=dict(content=response_text, role="assistant"),

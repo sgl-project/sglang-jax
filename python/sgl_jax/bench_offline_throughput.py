@@ -19,7 +19,6 @@ import logging
 import os
 import random
 import time
-from typing import Dict, List, Optional
 
 import numpy as np
 
@@ -41,8 +40,8 @@ class BenchArgs:
     dataset_name: str = "sharegpt"
     dataset_path: str = ""
     num_prompts: int = 1000
-    sharegpt_output_len: Optional[int] = None
-    sharegpt_context_len: Optional[int] = None
+    sharegpt_output_len: int | None = None
+    sharegpt_context_len: int | None = None
     random_input_len: int = 1024
     random_output_len: int = 1024
     random_range_ratio: float = 0.0
@@ -53,7 +52,7 @@ class BenchArgs:
     gsp_output_len: int = 256
     seed: int = 1
     disable_ignore_eos: bool = False
-    extra_request_body: Optional[str] = None
+    extra_request_body: str | None = None
     apply_chat_template: bool = False
     profile: bool = False
     skip_warmup: bool = False
@@ -63,9 +62,7 @@ class BenchArgs:
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
         parser.add_argument("--backend", type=str, default=BenchArgs.backend)
-        parser.add_argument(
-            "--result-filename", type=str, default=BenchArgs.result_filename
-        )
+        parser.add_argument("--result-filename", type=str, default=BenchArgs.result_filename)
         parser.add_argument(
             "--dataset-name",
             type=str,
@@ -73,9 +70,7 @@ class BenchArgs:
             choices=["sharegpt", "random", "generated-shared-prefix"],
             help="Name of the dataset to benchmark on.",
         )
-        parser.add_argument(
-            "--dataset-path", type=str, default="", help="Path to the dataset."
-        )
+        parser.add_argument("--dataset-path", type=str, default="", help="Path to the dataset.")
         parser.add_argument(
             "--num-prompts",
             type=int,
@@ -110,15 +105,13 @@ class BenchArgs:
             "--random-range-ratio",
             type=float,
             default=BenchArgs.random_range_ratio,
-            help="Range of sampled ratio of input/output length, "
-            "used only for random dataset.",
+            help="Range of sampled ratio of input/output length, used only for random dataset.",
         )
         parser.add_argument(
             "--gsp-num-groups",
             type=int,
             default=BenchArgs.gsp_num_groups,
-            help="Number of groups with shared prefix, used"
-            "only for generate-shared-prefix",
+            help="Number of groups with shared prefix, usedonly for generate-shared-prefix",
         )
         parser.add_argument(
             "--gsp-prompts-per-group",
@@ -131,13 +124,13 @@ class BenchArgs:
             "--gsp-system-prompt-len",
             type=int,
             default=BenchArgs.gsp_system_prompt_len,
-            help="System prompt length, used" "only for generate-shared-prefix",
+            help="System prompt length, usedonly for generate-shared-prefix",
         )
         parser.add_argument(
             "--gsp-question-len",
             type=int,
             default=BenchArgs.gsp_question_len,
-            help="Question length, used" "only for generate-shared-prefix",
+            help="Question length, usedonly for generate-shared-prefix",
         )
         parser.add_argument(
             "--gsp-output-len",
@@ -196,9 +189,9 @@ class BenchArgs:
 def throughput_test_once(
     backend_name: str,
     backend,
-    reqs: List[DatasetRow],
+    reqs: list[DatasetRow],
     ignore_eos: bool,
-    extra_request_body: Dict,
+    extra_request_body: dict,
     profile: bool,
 ):
     measurement_results = {
@@ -225,9 +218,7 @@ def throughput_test_once(
     ]
 
     if profile:
-        assert (
-            "SGLANG_TORCH_PROFILER_DIR" in os.environ
-        ), "Please set SGLANG_TORCH_PROFILER_DIR."
+        assert "SGLANG_TORCH_PROFILER_DIR" in os.environ, "Please set SGLANG_TORCH_PROFILER_DIR."
         os.makedirs(os.environ["SGLANG_TORCH_PROFILER_DIR"], exist_ok=True)
         backend.start_profile()
 
@@ -250,18 +241,11 @@ def throughput_test_once(
     measurement_results["total_output_tokens"] = sum(
         o["meta_info"]["completion_tokens"] for o in gen_out
     )
-    measurement_results["request_throughput"] = (
-        measurement_results["successful_requests"] / latency
-    )
-    measurement_results["input_throughput"] = (
-        measurement_results["total_input_tokens"] / latency
-    )
-    measurement_results["output_throughput"] = (
-        measurement_results["total_output_tokens"] / latency
-    )
+    measurement_results["request_throughput"] = measurement_results["successful_requests"] / latency
+    measurement_results["input_throughput"] = measurement_results["total_input_tokens"] / latency
+    measurement_results["output_throughput"] = measurement_results["total_output_tokens"] / latency
     measurement_results["total_throughput"] = (
-        measurement_results["total_input_tokens"]
-        + measurement_results["total_output_tokens"]
+        measurement_results["total_input_tokens"] + measurement_results["total_output_tokens"]
     ) / latency
 
     if inspect.isawaitable(server_info):
@@ -373,41 +357,23 @@ def throughput_test(
         with open(bench_args.result_filename, "a") as fout:
             fout.write(json.dumps(result) + "\n")
 
-    print(
-        "\n{s:{c}^{n}}".format(s=" Offline Throughput Benchmark Result ", n=50, c="=")
-    )
+    print("\n{s:{c}^{n}}".format(s=" Offline Throughput Benchmark Result ", n=50, c="="))
     print("{:<40} {:<10}".format("Backend:", result["backend"]))
     print("{:<40} {:<10}".format("Successful requests:", result["successful_requests"]))
     print("{:<40} {:<10.2f}".format("Benchmark duration (s):", result["total_latency"]))
     print("{:<40} {:<10}".format("Total input tokens:", result["total_input_tokens"]))
-    print(
-        "{:<40} {:<10}".format("Total generated tokens:", result["total_output_tokens"])
-    )
+    print("{:<40} {:<10}".format("Total generated tokens:", result["total_output_tokens"]))
     print(
         "{:<40} {:<10.2f}".format(
             "Last generation throughput (tok/s):", result["last_gen_throughput"]
         )
     )
+    print("{:<40} {:<10.2f}".format("Request throughput (req/s):", result["request_throughput"]))
+    print("{:<40} {:<10.2f}".format("Input token throughput (tok/s):", result["input_throughput"]))
     print(
-        "{:<40} {:<10.2f}".format(
-            "Request throughput (req/s):", result["request_throughput"]
-        )
+        "{:<40} {:<10.2f}".format("Output token throughput (tok/s):", result["output_throughput"])
     )
-    print(
-        "{:<40} {:<10.2f}".format(
-            "Input token throughput (tok/s):", result["input_throughput"]
-        )
-    )
-    print(
-        "{:<40} {:<10.2f}".format(
-            "Output token throughput (tok/s):", result["output_throughput"]
-        )
-    )
-    print(
-        "{:<40} {:<10.2f}".format(
-            "Total token throughput (tok/s):", result["total_throughput"]
-        )
-    )
+    print("{:<40} {:<10.2f}".format("Total token throughput (tok/s):", result["total_throughput"]))
     print("=" * 50)
 
     return result

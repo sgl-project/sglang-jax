@@ -1,6 +1,3 @@
-from functools import partial
-from typing import List, Optional
-
 import jax
 import numpy as np
 from flax import nnx
@@ -41,9 +38,7 @@ class Sampler(nnx.Module):
         ), f"Temperature batch size {temperatures_shape[0]} doesn't match logits batch size {logits_batch_size}"
 
         # Post process logits
-        processed_logits = jnp.divide(logits, sampling_metadata.temperatures).astype(
-            logits.dtype
-        )
+        processed_logits = jnp.divide(logits, sampling_metadata.temperatures).astype(logits.dtype)
 
         probs = jax.nn.softmax(processed_logits, axis=-1)
 
@@ -135,9 +130,7 @@ class Sampler(nnx.Module):
 
         return logits + stop_penalty.astype(logits.dtype)
 
-    def apply_penalties(
-        self, logits: jax.Array, sampling_metadata: SamplingMetadata
-    ) -> jax.Array:
+    def apply_penalties(self, logits: jax.Array, sampling_metadata: SamplingMetadata) -> jax.Array:
         """
         Apply penalties to logits with JIT-optimized tensor operations using lax.cond.
 
@@ -210,7 +203,7 @@ class Sampler(nnx.Module):
         return batch_next_token_ids
 
 
-def get_top_logprobs(logprobs: jax.Array, top_logprobs_nums: List[int]):
+def get_top_logprobs(logprobs: jax.Array, top_logprobs_nums: list[int]):
     max_k = max(top_logprobs_nums)
     values, indices = jax.lax.top_k(logprobs, max_k)
     values = values.tolist()
@@ -224,7 +217,7 @@ def get_top_logprobs(logprobs: jax.Array, top_logprobs_nums: List[int]):
     return output_top_logprobs_val, output_top_logprobs_idx
 
 
-def get_token_ids_logprobs(logprobs: jax.Array, token_ids_logprobs: List[List[int]]):
+def get_token_ids_logprobs(logprobs: jax.Array, token_ids_logprobs: list[list[int]]):
     output_token_ids_logprobs_val = []
     output_token_ids_logprobs_idx = []
     for i, token_ids in enumerate(token_ids_logprobs):

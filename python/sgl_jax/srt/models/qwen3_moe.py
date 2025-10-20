@@ -1,10 +1,9 @@
 import logging
-from typing import Any, Dict, Optional, Tuple
+from typing import Any
 
 from flax import nnx
 from jax import jax
 from jax import numpy as jnp
-from jax.sharding import get_abstract_mesh
 from transformers import PretrainedConfig
 
 from sgl_jax.srt.configs.model_config import ModelConfig
@@ -32,8 +31,8 @@ class QWen3MoeAttention(nnx.Module):
         num_kv_heads: int,
         max_position_embeddings: int,
         rope_theta: float = 10000,
-        rope_scaling: Optional[Dict[str, Any]] = None,
-        head_dim: Optional[int] = None,
+        rope_scaling: dict[str, Any] | None = None,
+        head_dim: int | None = None,
         rms_norm_eps: float = None,
         layer_id: int = 0,
         attention_bias: bool = False,
@@ -186,9 +185,7 @@ class QWen3MoeDecoderLayer(nnx.Module):
             num_experts = getattr(config, "num_experts", 128)
             num_experts_per_tok = getattr(config, "num_experts_per_tok", 8)
             moe_intermediate_size = getattr(config, "moe_intermediate_size", 768)
-            expert_parallel_size = mesh.shape.get("data", 1) * mesh.shape.get(
-                "tensor", 1
-            )
+            expert_parallel_size = mesh.shape.get("data", 1) * mesh.shape.get("tensor", 1)
             self.moe_gate = GateLogit(
                 input_size=config.hidden_size,
                 features=num_experts,
@@ -235,8 +232,8 @@ class QWen3MoeDecoderLayer(nnx.Module):
         hidden_states: jax.Array,
         forward_batch: ForwardBatch,
         token_to_kv_pool: KVCache,
-        residual: Optional[jax.Array] = None,
-    ) -> Tuple[jax.Array, jax.Array]:
+        residual: jax.Array | None = None,
+    ) -> tuple[jax.Array, jax.Array]:
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
@@ -345,12 +342,10 @@ class Qwen3MoeForCausalLM(nnx.Module):
         self.mesh = mesh
         self.config = config
         self.dtype = dtype
-        logger.info(f"QWen3MoeForCausalLMModel config dtype: {self.dtype}")
+        logger.info("QWen3MoeForCausalLMModel config dtype: %s", self.dtype)
         self.transformer = QWen3MoeModel(config, dtype=self.dtype, rngs=rngs, mesh=mesh)
         self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size, rngs=rngs)
-        self.logits_processor = LogitsProcessor(
-            config.vocab_size, self.lm_head, self.mesh
-        )
+        self.logits_processor = LogitsProcessor(config.vocab_size, self.lm_head, self.mesh)
 
     def load_weights(self, model_config: ModelConfig, rng_key: jax.Array):
         self.rng = nnx.Rngs(rng_key)
@@ -502,8 +497,7 @@ class Qwen3MoeForCausalLM(nnx.Module):
                     "down_proj": "wo",
                 }[expert_type]
                 expert_keys = [
-                    f"{prefix}.mlp.experts.{i}.{expert_type}.weight"
-                    for i in range(num_experts)
+                    f"{prefix}.mlp.experts.{i}.{expert_type}.weight" for i in range(num_experts)
                 ]
 
                 mappings[f"__MOE_EXPERTS__{prefix}.mlp.{target_name}"] = WeightMapping(
@@ -520,9 +514,7 @@ class Qwen3MoeForCausalLM(nnx.Module):
         token_to_kv_pool: KVCache,
         logits_metadata: LogitsMetadata,
     ):
-        hidden_states, layers_kv_fused = self.transformer(
-            forward_batch, token_to_kv_pool
-        )
+        hidden_states, layers_kv_fused = self.transformer(forward_batch, token_to_kv_pool)
         output = self.logits_processor(hidden_states, logits_metadata)
         return output, layers_kv_fused, True
 

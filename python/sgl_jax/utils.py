@@ -1,21 +1,13 @@
 import logging
-import os
-import subprocess
 import traceback
-from io import BytesIO
-from typing import Any, Callable, List, Tuple, Type, Union
-
-import psutil
-import pybase64
-import requests
-import zmq
-from PIL import Image
+from collections.abc import Callable
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
 
 class TypeBasedDispatcher:
-    def __init__(self, mapping: List[Tuple[Type, Callable]]):
+    def __init__(self, mapping: list[tuple[type, Callable]]):
         self._mapping = mapping
 
     def __call__(self, obj: Any):

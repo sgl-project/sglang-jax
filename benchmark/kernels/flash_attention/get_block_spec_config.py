@@ -177,10 +177,7 @@ def main():
                 for page_size in page_size_config:
                     for max_kv_cache_tokens in max_kv_cache_tokens_config:
                         for max_num_batched_tokens in max_num_batched_tokens_config:
-                            if (
-                                q_head_num < kv_head_num
-                                or q_head_num % kv_head_num != 0
-                            ):
+                            if q_head_num < kv_head_num or q_head_num % kv_head_num != 0:
                                 continue
                             all_combinations.append(
                                 (
@@ -202,7 +199,7 @@ def main():
             block_spec_configs.append((num_kv_pages_per_blk, num_queries_per_block))
 
     print(
-        f"(q_dtype, kv_dtype, num_q_heads_per_blk, num_kv_heads_per_blk, head_dim, page_size, max_num_batched_tokens): (num_kv_pages_per_block, num_queries_per_block)"
+        "(q_dtype, kv_dtype, num_q_heads_per_blk, num_kv_heads_per_blk, head_dim, page_size, max_num_batched_tokens): (num_kv_pages_per_block, num_queries_per_block)"
     )
 
     for i, (
@@ -215,9 +212,7 @@ def main():
     ) in enumerate(all_combinations):
         best_output = inf
         best_config = None
-        for i, (num_kv_pages_per_blk, num_queries_per_block) in enumerate(
-            block_spec_configs
-        ):
+        for i, (num_kv_pages_per_blk, num_queries_per_block) in enumerate(block_spec_configs):
             try:
                 (
                     flash_time,
@@ -237,7 +232,7 @@ def main():
                 if flash_time < best_output:
                     best_output = flash_time
                     best_config = (num_kv_pages_per_blk, num_queries_per_block)
-            except Exception as e:
+            except Exception:
                 pass
 
         print(

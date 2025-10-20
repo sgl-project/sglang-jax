@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 import jax
 import jax.numpy as jnp
-from jax.sharding import NamedSharding, PartitionSpec
+from jax.sharding import PartitionSpec
 
 
 def get_num_kv_heads_by_tp(total_num_kv_heads: int, tp_size: int) -> int:
@@ -61,9 +61,7 @@ def get_available_device_memory(device, distributed=False, empty_cache=True):
     elif device in ("gpu", "cuda"):
         if empty_cache:
             jax.clear_caches()
-        devices = [
-            d for d in jax.local_devices() if getattr(d, "platform", None) == "gpu"
-        ]
+        devices = [d for d in jax.local_devices() if getattr(d, "platform", None) == "gpu"]
         if not devices:
             raise RuntimeError("No GPU devices found by JAX")
         avail = []
@@ -81,13 +79,10 @@ def get_available_device_memory(device, distributed=False, empty_cache=True):
         raise ValueError(f"Invalid device: {device}")
 
     if distributed:
-
         # Use pmap to find the minimum available memory across all devices.
         mesh = jax.make_mesh((jax.process_count(), 4), ("node", "device"))
 
-        @jax.shard_map(
-            mesh=mesh, in_specs=PartitionSpec(None), out_specs=PartitionSpec(None)
-        )
+        @jax.shard_map(mesh=mesh, in_specs=PartitionSpec(None), out_specs=PartitionSpec(None))
         def _get_available_memory_distributed(a):
             return jax.lax.pmin(a, axis_name="node")
 
@@ -125,11 +120,7 @@ def print_memory(stage_name):
     memory = get_memory_usage()
     print(f"\n[{stage_name}] Memory usage:")
     for device, usage in memory.items():
-        print(
-            f"  {device}: {usage}GB"
-            if isinstance(usage, float)
-            else f"  {device}: {usage}"
-        )
+        print(f"  {device}: {usage}GB" if isinstance(usage, float) else f"  {device}: {usage}")
     return memory
 
 
@@ -141,8 +132,8 @@ def get_memory_usage():
             try:
                 device_stats = device.memory_stats()
                 stats[f"device_{i}"] = device_stats.get("bytes_in_use", 0) / (1024**3)
-            except:
+            except Exception:
                 stats[f"device_{i}"] = "N/A"
         return stats
-    except:
+    except Exception:
         return {f"device_{i}": "N/A" for i in range(len(jax.devices()))}

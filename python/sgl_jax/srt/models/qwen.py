@@ -1,10 +1,9 @@
 import logging
-from typing import Any, Dict, Optional
+from typing import Any
 
 import jax
 import jax.numpy as jnp
 from flax import nnx
-from jax.sharding import PartitionSpec
 from transformers import PretrainedConfig
 
 from sgl_jax.srt.configs.model_config import ModelConfig
@@ -77,7 +76,7 @@ class QWenAttention(nnx.Module):
         num_heads: int,
         max_position_embeddings: int,
         rope_theta: float = 10000,
-        rope_scaling: Optional[Dict[str, Any]] = None,
+        rope_scaling: dict[str, Any] | None = None,
         layer_id: int = 0,
         dtype: jnp.dtype = jnp.float16,
         rngs: nnx.Rngs = None,
@@ -305,7 +304,7 @@ class QWenLMHeadModel(nnx.Module):
         self.mesh = mesh
         self.config = config
         self.dtype = dtype
-        logger.info(f"QWenLMHeadModel config dtype: {self.dtype}")
+        logger.info("QWenLMHeadModel config dtype: %s", self.dtype)
         self.transformer = QWenModel(config, dtype=self.dtype, rngs=rngs)
         vocab_size = ((config.vocab_size + 63) // 64) * 64
         self.lm_head = ParallelLMHead(vocab_size, config.hidden_size, rngs=rngs)
@@ -410,9 +409,7 @@ class QWenLMHeadModel(nnx.Module):
         token_to_kv_pool: KVCache,
         logits_metadata: LogitsMetadata,
     ):
-        hidden_states, layers_kv_fused = self.transformer(
-            forward_batch, token_to_kv_pool
-        )
+        hidden_states, layers_kv_fused = self.transformer(forward_batch, token_to_kv_pool)
         output = self.logits_processor(hidden_states, logits_metadata)
         return output, layers_kv_fused, True
 

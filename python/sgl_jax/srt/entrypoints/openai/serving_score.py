@@ -1,5 +1,4 @@
 import logging
-from typing import Union
 
 from fastapi import Request
 
@@ -37,7 +36,7 @@ class OpenAIServingScore(OpenAIServingBase):
         adapted_request: ScoringRequest,
         request: ScoringRequest,
         raw_request: Request,
-    ) -> Union[ScoringResponse, ErrorResponse]:
+    ) -> ScoringResponse | ErrorResponse:
         """Handle the scoring request"""
         try:
             # Use tokenizer_manager's score_request method directly

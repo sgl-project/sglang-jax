@@ -8,7 +8,6 @@ https://arxiv.org/abs/2009.03300
 
 import random
 import re
-from typing import Optional
 
 import pandas
 
@@ -85,7 +84,7 @@ subject2category = {
 
 
 class MMLUEval(Eval):
-    def __init__(self, filename: str, num_examples: Optional[int], num_threads: int):
+    def __init__(self, filename: str, num_examples: int | None, num_threads: int):
         df = pandas.read_csv(filename)
         examples = [row.to_dict() for _, row in df.iterrows()]
         if num_examples:
@@ -96,9 +95,7 @@ class MMLUEval(Eval):
     def __call__(self, sampler: SamplerBase) -> EvalResult:
         def fn(row: dict):
             prompt_messages = [
-                sampler._pack_message(
-                    content=format_multichoice_question(row), role="user"
-                )
+                sampler._pack_message(content=format_multichoice_question(row), role="user")
             ]
             response_text = sampler(prompt_messages)
             match = re.search(ANSWER_PATTERN_MULTICHOICE, response_text)
@@ -113,9 +110,7 @@ class MMLUEval(Eval):
             )
             convo = prompt_messages + [dict(content=response_text, role="assistant")]
             category = subject2category.get(row["Subject"], "other")
-            return SingleEvalResult(
-                html=html, score=score, metrics={category: score}, convo=convo
-            )
+            return SingleEvalResult(html=html, score=score, metrics={category: score}, convo=convo)
 
         results = common.map_with_progress(fn, self.examples, self.num_threads)
         return common.aggregate_results(results)
