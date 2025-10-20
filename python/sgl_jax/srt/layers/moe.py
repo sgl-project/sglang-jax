@@ -524,7 +524,6 @@ class FusedMoE(nnx.Module):
         activation: str = "gelu",
         *,
         mesh: Mesh,
-        rngs: nnx.Rngs,
     ):
         self.config = config
         self.num_experts = num_experts
@@ -546,7 +545,7 @@ class FusedMoE(nnx.Module):
 
         self.wi_0 = nnx.Param(
             nnx.with_partitioning(nnx.initializers.normal(), self.wi_sharding)(
-                rngs.params(),
+                jax.random.PRNGKey(0),
                 (num_experts, config.hidden_size, intermediate_dim),
                 weight_dtype,
             )
@@ -554,7 +553,7 @@ class FusedMoE(nnx.Module):
 
         self.wi_1 = nnx.Param(
             nnx.with_partitioning(nnx.initializers.normal(), self.wi_sharding)(
-                rngs.params(),
+                jax.random.PRNGKey(0),
                 (num_experts, config.hidden_size, intermediate_dim),
                 weight_dtype,
             )
@@ -562,32 +561,14 @@ class FusedMoE(nnx.Module):
 
         self.wo = nnx.Param(
             nnx.with_partitioning(nnx.initializers.normal(), self.wo_sharding)(
-                rngs.params(),
+                jax.random.PRNGKey(0),
                 (num_experts, intermediate_dim, config.hidden_size),
                 weight_dtype,
             )
         )
 
-    def __call__(self, inputs, router_logits=None):
-        if router_logits is None:
-            raise ValueError("router_logits is required for EPMoE")
-
-        inputs = inputs.astype(self.dtype)
-        total_tokens, hidden_dim = inputs.shape
-
-        if router_logits.shape[0] != total_tokens:
-            raise ValueError(
-                f"router_logits shape {router_logits.shape} doesn't match inputs shape {inputs.shape}"
-            )
-
-        # Compute top-k experts and delegate to indices variant
-        top_k_logits, top_k_indices = jax.lax.top_k(
-            router_logits, self.num_experts_per_tok
-        )
-        top_k_weights = jax.nn.softmax(
-            top_k_logits.astype(jnp.bfloat16), axis=-1
-        ).astype(self.dtype)
-        top_k_weights = top_k_weights / jnp.sum(top_k_weights, axis=-1, keepdims=True)
+    def __call__(self, hidden_states, topk_weights, topk_ids):
+        inputs = hidden_states.astype(self.dtype)
 
         if inputs.ndim == 2:
             num_tokens = inputs.shape[0]
@@ -599,8 +580,8 @@ class FusedMoE(nnx.Module):
         expert_weights = jnp.zeros((num_tokens, self.num_experts), dtype=self.dtype)
         token_indices = jnp.arange(num_tokens)[:, None]
 
-        top_k_indices_flat = top_k_indices.reshape(num_tokens, -1)
-        top_k_weights_flat = top_k_weights.reshape(num_tokens, -1)
+        top_k_indices_flat = topk_ids.reshape(num_tokens, -1)
+        top_k_weights_flat = topk_weights.reshape(num_tokens, -1)
 
         expert_weights = expert_weights.at[token_indices, top_k_indices_flat].set(
             top_k_weights_flat

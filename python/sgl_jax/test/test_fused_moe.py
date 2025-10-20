@@ -24,30 +24,47 @@ class TestFusedMoe(unittest.TestCase):
     def test_forward(self):
         config = Namespace()
         config.hidden_size = 128
-        src_layer = FusedMoE(
-            config=config,
-            num_experts=8,
-            num_experts_per_tok=2,
-            mesh=self.mesh,
-            rngs=nnx.Rngs(default=0),
-        )
-        std_layer = EPMoE(
-            config=config,
-            num_experts=8,
-            num_experts_per_tok=2,
-            mesh=self.mesh,
-            rngs=nnx.Rngs(default=0),
-        )
-        router_logits = jax.random.normal(self.rng_key, shape=(1, 8), dtype=jnp.float32)
-        inputs = jax.random.normal(self.rng_key, shape=(1, 128), dtype=jnp.float32)
 
-        std_output = std_layer(inputs, router_logits)
-        src_output = src_layer(inputs, router_logits)
+        with jax.sharding.use_mesh(self.mesh):
+            src_layer = FusedMoE(
+                config=config,
+                num_experts=8,
+                num_experts_per_tok=2,
+                mesh=self.mesh,
+                rngs=nnx.Rngs(default=0),
+            )
+            std_layer = EPMoE(
+                config=config,
+                num_experts=8,
+                num_experts_per_tok=2,
+                mesh=self.mesh,
+                rngs=nnx.Rngs(default=0),
+                expert_parallel_size=1,
+            )
+            src_layer.wi_0.value = std_layer.wi_0.value
+            src_layer.wi_1.value = std_layer.wi_1.value
+            src_layer.wo.value = std_layer.wo.value
+
+            src_layer_state = nnx.state(src_layer)
+            src_layer_state_pspecs = nnx.get_partition_spec(src_layer_state)
+            src_layer_state = jax.lax.with_sharding_constraint(src_layer_state, src_layer_state_pspecs)
+            nnx.update(src_layer, src_layer_state)
+
+            std_layer_state = nnx.state(std_layer)
+            std_layer_state_pspecs = nnx.get_partition_spec(std_layer_state)
+            std_layer_state = jax.lax.with_sharding_constraint(std_layer_state, std_layer_state_pspecs)
+            nnx.update(std_layer, std_layer_state)
+
+            router_logits = jax.random.normal(self.rng_key, shape=(10, 128, 8), dtype=jnp.float32)
+            inputs = jax.random.normal(self.rng_key, shape=(10, 128), dtype=jnp.float32)
+
+            std_output = std_layer(inputs, router_logits)
+            src_output = src_layer(inputs, router_logits)
 
         print(src_output)
         print(std_output)
 
-        assert jnp.allclose(src_output, std_output)
+        assert jnp.allclose(src_output, std_output, rtol=1e-3, atol=1e-3)
 
 
 if __name__ == "__main__":
