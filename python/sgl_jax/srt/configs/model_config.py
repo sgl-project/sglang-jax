@@ -455,7 +455,7 @@ def _get_and_verify_dtype(
         else:
             # Casting between float16 and bfloat16 is allowed with a warning.
             logger.warning("Casting %s to %s.", config_dtype, jax_dtype)
-        return jax_dtype
+    return jax_dtype
 
 
 def is_generation_model(model_architectures: list[str], is_embedding: bool = False):
