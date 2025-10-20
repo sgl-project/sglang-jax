@@ -232,7 +232,7 @@ class QWen3DecoderLayer(nnx.Module):
             config.hidden_size,
             epsilon=config.rms_norm_eps,
             param_dtype=dtype,
-            scale_init=nnx.with_partitioning(init_fn, (None,)),
+            scale_init=nnx.with_partitioning(int_fn, (None,)),
             rngs=rngs,
         )
 
