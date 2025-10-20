@@ -361,8 +361,9 @@ class Qwen3ForCausalLM(nnx.Module):
         self.dtype = dtype
         logger.info("QWen3ForCausalLMModel config dtype: %s", self.dtype)
         self.transformer = QWen3Model(config, dtype=self.dtype, rngs=rngs)
-        self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size, rngs=rngs)
-        self.logits_processor = LogitsProcessor(config.vocab_size, self.lm_head, self.mesh)
+        if not getattr(self.config, "tie_word_embeddings", True):
+            self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size, rngs=rngs)
+        self.logits_processor = LogitsProcessor(config.vocab_size, self.mesh)
 
     def load_weights(self, model_config: ModelConfig, rng_key: jax.Array):
         self.rng = nnx.Rngs(rng_key)
@@ -515,7 +516,12 @@ class Qwen3ForCausalLM(nnx.Module):
         hidden_states, layers_kv_fused, layers_callback_flag = self.transformer(
             forward_batch, token_to_kv_pool
         )
-        output = self.logits_processor(hidden_states, logits_metadata)
+        if not getattr(self.config, "tie_word_embeddings", True):
+            output = self.logits_processor(hidden_states, self.lm_head, logits_metadata)
+        else:
+            output = self.logits_processor(
+                hidden_states, self.transformer.embed_tokens, logits_metadata
+            )
         return output, layers_kv_fused, layers_callback_flag
 
 

@@ -210,14 +210,14 @@ class LogitsMetadata:
 class LogitsProcessor(nnx.Module):
     """Logits processor for the model."""
 
-    def __init__(self, vocab_size: int, lm_head: Embed, mesh: Mesh):
+    def __init__(self, vocab_size: int, mesh: Mesh):
         self.vocab_size = vocab_size
-        self.lm_head = lm_head
         self.mesh = mesh
 
     def __call__(
         self,
         hidden_states: jax.Array,
+        lm_head: Embed,
         logits_metadata: LogitsMetadata,
     ) -> LogitsProcessorOutput:
         if logits_metadata.forward_mode.is_decode_or_idle():
@@ -276,7 +276,7 @@ class LogitsProcessor(nnx.Module):
             )
 
         # Compute logits for both input and sampled tokens.
-        logits = self._get_logits(pruned_states, self.lm_head)
+        logits = self._get_logits(pruned_states, lm_head)
         sampled_logits = logits[sample_indices] if sample_indices is not None else logits
 
         hidden_states_to_store: jax.Array | None = None
