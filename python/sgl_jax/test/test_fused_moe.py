@@ -6,7 +6,7 @@ import jax.numpy as jnp
 import numpy as np
 from flax import nnx
 
-from sgl_jax.srt.layers.moe import FusedMoE, EPMoE
+from sgl_jax.srt.layers.moe import EPMoE, FusedMoE
 
 
 class TestFusedMoe(unittest.TestCase):
@@ -47,12 +47,16 @@ class TestFusedMoe(unittest.TestCase):
 
             src_layer_state = nnx.state(src_layer)
             src_layer_state_pspecs = nnx.get_partition_spec(src_layer_state)
-            src_layer_state = jax.lax.with_sharding_constraint(src_layer_state, src_layer_state_pspecs)
+            src_layer_state = jax.lax.with_sharding_constraint(
+                src_layer_state, src_layer_state_pspecs
+            )
             nnx.update(src_layer, src_layer_state)
 
             std_layer_state = nnx.state(std_layer)
             std_layer_state_pspecs = nnx.get_partition_spec(std_layer_state)
-            std_layer_state = jax.lax.with_sharding_constraint(std_layer_state, std_layer_state_pspecs)
+            std_layer_state = jax.lax.with_sharding_constraint(
+                std_layer_state, std_layer_state_pspecs
+            )
             nnx.update(std_layer, std_layer_state)
 
             router_logits = jax.random.normal(self.rng_key, shape=(10, 128, 8), dtype=jnp.float32)
