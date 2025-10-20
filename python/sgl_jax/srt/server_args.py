@@ -132,6 +132,7 @@ class ServerArgs:
 
     # For deterministic sampling
     enable_deterministic_sampling: bool = False
+    enable_single_process: bool = False
 
     def __post_init__(self):
         # Set missing default values
@@ -769,6 +770,12 @@ class ServerArgs:
             "--enable-deterministic-sampling",
             action="store_true",
             help="Enable deterministic sampling",
+        )
+
+        parser.add_argument(
+            "--enable-single-process",
+            action="store_true",
+            help="Enable run the engine with single process.",
         )
 
     @classmethod

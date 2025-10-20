@@ -13,4 +13,3 @@ from .common_utils import (
     set_ulimit,
     set_uvicorn_logging_configs,
 )
-from .tunix_utils import pathways_available
