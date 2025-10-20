@@ -1,6 +1,6 @@
 from json import JSONDecodeError, JSONDecoder
 from json.decoder import WHITESPACE
-from typing import Any, List, Literal, Optional, Tuple, Union
+from typing import Any, Literal
 
 import orjson
 import partial_json_parser
@@ -20,7 +20,7 @@ def _find_common_prefix(s1: str, s2: str) -> str:
     return prefix
 
 
-def _partial_json_loads(input_str: str, flags: Allow) -> Tuple[Any, int]:
+def _partial_json_loads(input_str: str, flags: Allow) -> tuple[Any, int]:
     """
     Parse incomplete or partial JSON strings commonly encountered during streaming.
 
@@ -57,7 +57,7 @@ def _is_complete_json(input_str: str) -> bool:
         return False
 
 
-def _get_tool_schema_defs(tools: List[Tool]) -> dict:
+def _get_tool_schema_defs(tools: list[Tool]) -> dict:
     """
     Get consolidated $defs from all tools, validating for conflicts.
 
@@ -102,8 +102,8 @@ def _get_tool_schema(tool: Tool) -> dict:
 
 
 def get_json_schema_constraint(
-    tools: List[Tool], tool_choice: Union[ToolChoice, Literal["required"]]
-) -> Optional[dict]:
+    tools: list[Tool], tool_choice: ToolChoice | Literal["required"]
+) -> dict | None:
     """
     Get the JSON schema constraint for the specified tool choice.
 

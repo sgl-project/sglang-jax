@@ -1,5 +1,5 @@
 import logging
-from typing import Any, Dict, List, Literal, Optional, Set, Tuple, Type, Union
+from typing import Any, Literal
 
 from sgl_jax.srt.entrypoints.openai.protocol import (
     StructuralTagResponseFormat,
@@ -24,12 +24,12 @@ class FunctionCallParser:
     and returns the resulting normal_text and calls to the upper layer (or SSE).
     """
 
-    ToolCallParserEnum: Dict[str, Type[BaseFormatDetector]] = {
+    ToolCallParserEnum: dict[str, type[BaseFormatDetector]] = {
         "qwen3_coder": Qwen3CoderDetector,
     }
 
-    def __init__(self, tools: List[Tool], tool_call_parser: str):
-        detector: Type[BaseFormatDetector] = None
+    def __init__(self, tools: list[Tool], tool_call_parser: str):
+        detector: type[BaseFormatDetector] = None
         detector_class = self.ToolCallParserEnum.get(tool_call_parser)
         if detector_class:
             detector = detector_class()
@@ -54,7 +54,7 @@ class FunctionCallParser:
             return False
         return self.detector.has_tool_call(text)
 
-    def parse_non_stream(self, full_text: str) -> Tuple[str, list[ToolCallItem]]:
+    def parse_non_stream(self, full_text: str) -> tuple[str, list[ToolCallItem]]:
         """
         One-time parsing of the full text to extract tool calls.
 
@@ -75,7 +75,7 @@ class FunctionCallParser:
         else:
             return full_text, []
 
-    def parse_stream_chunk(self, chunk_text: str) -> Tuple[str, list[ToolCallItem]]:
+    def parse_stream_chunk(self, chunk_text: str) -> tuple[str, list[ToolCallItem]]:
         """
         Streaming incremental parsing of chunks of text as they arrive.
 
@@ -107,8 +107,8 @@ class FunctionCallParser:
 
         This creates the necessary structural tags that guide the model's output format.
         """
-        tool_structures: List[StructuresResponseFormat] = list()
-        tool_trigger_set: Set[str] = set()
+        tool_structures: list[StructuresResponseFormat] = list()
+        tool_trigger_set: set[str] = set()
 
         get_structure_info = self.detector.structure_info()
         for tool in self.tools:
@@ -136,8 +136,8 @@ class FunctionCallParser:
         )
 
     def get_structure_constraint(
-        self, tool_choice: Union[ToolChoice, Literal["auto", "required"]]
-    ) -> Optional[Tuple[str, Any]]:
+        self, tool_choice: ToolChoice | Literal["auto", "required"]
+    ) -> tuple[str, Any] | None:
         """
         Returns the appropriate structure constraint for tool calls based on the tool_choice.
         The constraint is used to guide the model's output format.
@@ -162,9 +162,7 @@ class FunctionCallParser:
             json_schema = get_json_schema_constraint(self.tools, tool_choice)
             return ("json_schema", json_schema)
 
-    def get_ebnf(
-        self, tool_choice: Union[ToolChoice, Literal["required"]]
-    ) -> Optional[str]:
+    def get_ebnf(self, tool_choice: ToolChoice | Literal["required"]) -> str | None:
         """
         Get the EBNF grammar for the specified tool choice.
 
@@ -187,9 +185,11 @@ class FunctionCallParser:
             if not filtered_tools:
                 available_functions = [t.function.name for t in self.tools]
                 logger.warning(
-                    f"Function '{fn_name}' not found in available tools. "
-                    f"Available functions: {available_functions}. "
-                    f"Skipping tool choice."
+                    "Function '%s' not found in available tools. "
+                    "Available functions: %s. "
+                    "Skipping tool choice.",
+                    fn_name,
+                    available_functions,
                 )
 
                 # TODO: Return a 400 error instead of warning when adapter supports proper error handling

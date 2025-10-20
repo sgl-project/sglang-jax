@@ -1,7 +1,7 @@
 import json
 import logging
 from abc import ABC, abstractmethod
-from typing import Any, Dict, List
+from typing import Any
 
 import orjson
 from partial_json_parser.core.exceptions import MalformedJSON
@@ -32,7 +32,7 @@ class BaseFormatDetector(ABC):
         # Stores complete tool call info (name and arguments) for each tool being parsed.
         # Used by serving layer for completion handling when streaming ends.
         # Format: [{"name": str, "arguments": dict}, ...]
-        self.prev_tool_call_arr: List[Dict] = []
+        self.prev_tool_call_arr: list[dict] = []
         # Index of currently streaming tool call. Starts at -1 (no active tool),
         # increments as each tool completes. Tracks which tool's arguments are streaming.
         self.current_tool_id: int = -1
@@ -42,14 +42,14 @@ class BaseFormatDetector(ABC):
         # Tracks raw JSON string content streamed to client for each tool's arguments.
         # Critical for serving layer to calculate remaining content when streaming ends.
         # Each index corresponds to a tool_id. Example: ['{"location": "San Francisco"', '{"temp": 72']
-        self.streamed_args_for_tool: List[str] = []
+        self.streamed_args_for_tool: list[str] = []
 
         # Token configuration (override in subclasses)
         self.bot_token = ""
         self.eot_token = ""
         self.tool_call_separator = ", "
 
-    def _get_tool_indices(self, tools: List[Tool]) -> Dict[str, int]:
+    def _get_tool_indices(self, tools: list[Tool]) -> dict[str, int]:
         """
         Get a mapping of tool names to their indices in the tools list.
 
@@ -63,11 +63,9 @@ class BaseFormatDetector(ABC):
         Returns:
             Dictionary mapping tool names to their indices
         """
-        return {
-            tool.function.name: i for i, tool in enumerate(tools) if tool.function.name
-        }
+        return {tool.function.name: i for i, tool in enumerate(tools) if tool.function.name}
 
-    def parse_base_json(self, action: Any, tools: List[Tool]) -> List[ToolCallItem]:
+    def parse_base_json(self, action: Any, tools: list[Tool]) -> list[ToolCallItem]:
         tool_indices = self._get_tool_indices(tools)
         if not isinstance(action, list):
             action = [action]
@@ -87,12 +85,12 @@ class BaseFormatDetector(ABC):
                     )
                 )
             else:
-                logger.warning(f"Model attempted to call undefined function: {name}")
+                logger.warning("Model attempted to call undefined function: %s", name)
 
         return results
 
     @abstractmethod
-    def detect_and_parse(self, text: str, tools: List[Tool]) -> StreamingParseResult:
+    def detect_and_parse(self, text: str, tools: list[Tool]) -> StreamingParseResult:
         """
         Parses the text in one go. Returns success=True if the format matches, otherwise False.
         Note that leftover_text here represents "content that this parser will not consume further".
@@ -113,9 +111,7 @@ class BaseFormatDetector(ABC):
                 return i
         return 0
 
-    def parse_streaming_increment(
-        self, new_text: str, tools: List[Tool]
-    ) -> StreamingParseResult:
+    def parse_streaming_increment(self, new_text: str, tools: list[Tool]) -> StreamingParseResult:
         """
         Streaming incremental parsing with tool validation.
 
@@ -139,10 +135,7 @@ class BaseFormatDetector(ABC):
         # or it is the start of a new tool call after a tool call separator, when there is a previous tool call
         if not (
             self.has_tool_call(current_text)
-            or (
-                self.current_tool_id > 0
-                and current_text.startswith(self.tool_call_separator)
-            )
+            or (self.current_tool_id > 0 and current_text.startswith(self.tool_call_separator))
         ):
             # Only clear buffer if we're sure no tool call is starting
             if not self._ends_with_partial_token(self._buffer, self.bot_token):
@@ -166,9 +159,7 @@ class BaseFormatDetector(ABC):
                 tool_call_pos = current_text.find(self.bot_token)
                 if tool_call_pos != -1:
                     start_idx = tool_call_pos + len(self.bot_token)
-                elif self.current_tool_id > 0 and current_text.startswith(
-                    self.tool_call_separator
-                ):
+                elif self.current_tool_id > 0 and current_text.startswith(self.tool_call_separator):
                     start_idx = len(self.tool_call_separator)
                 else:
                     start_idx = 0
@@ -195,9 +186,7 @@ class BaseFormatDetector(ABC):
                 # Handle parameters/arguments consistency
                 # NOTE: we assume here that the obj is always partial of a single tool call
                 if "parameters" in obj:
-                    assert (
-                        "arguments" not in obj
-                    ), "model generated both parameters and arguments"
+                    assert "arguments" not in obj, "model generated both parameters and arguments"
                     obj["arguments"] = obj["parameters"]
 
                 current_tool_call = obj
@@ -249,9 +238,9 @@ class BaseFormatDetector(ABC):
                     cur_args_json = json.dumps(cur_arguments)
                     prev_arguments = None
                     if self.current_tool_id < len(self.prev_tool_call_arr):
-                        prev_arguments = self.prev_tool_call_arr[
-                            self.current_tool_id
-                        ].get("arguments")
+                        prev_arguments = self.prev_tool_call_arr[self.current_tool_id].get(
+                            "arguments"
+                        )
 
                     argument_diff = None
 
@@ -277,9 +266,7 @@ class BaseFormatDetector(ABC):
                         # Ensure prev_tool_call_arr is large enough
                         while len(self.prev_tool_call_arr) <= self.current_tool_id:
                             self.prev_tool_call_arr.append({})
-                        self.prev_tool_call_arr[self.current_tool_id] = (
-                            current_tool_call
-                        )
+                        self.prev_tool_call_arr[self.current_tool_id] = current_tool_call
 
                     # Advance to next tool if complete
                     if is_current_complete:
@@ -290,9 +277,7 @@ class BaseFormatDetector(ABC):
                     if argument_diff is not None:
                         # Use the correct tool_index: completing_tool_id for completed tools, current_tool_id for ongoing
                         tool_index_to_use = (
-                            completing_tool_id
-                            if is_current_complete
-                            else self.current_tool_id
+                            completing_tool_id if is_current_complete else self.current_tool_id
                         )
                         res = StreamingParseResult(
                             calls=[
@@ -307,7 +292,7 @@ class BaseFormatDetector(ABC):
             return res
 
         except Exception as e:
-            logger.error(f"Error in parse_streaming_increment: {e}")
+            logger.error("Error in parse_streaming_increment: %v", e)
             return StreamingParseResult()
 
     @abstractmethod
@@ -336,7 +321,7 @@ class BaseFormatDetector(ABC):
         raise NotImplementedError()
 
     @abstractmethod
-    def build_ebnf(self, tools: List[Tool]) -> str:
+    def build_ebnf(self, tools: list[Tool]) -> str:
         """
         Build an EBNF grammar for constrained generation of function calls.
 

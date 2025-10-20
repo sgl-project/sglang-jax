@@ -3,7 +3,7 @@ import html
 import json
 import logging
 import re
-from typing import Any, Dict, List, Tuple
+from typing import Any
 
 from sgl_jax.srt.entrypoints.openai.protocol import Tool
 from sgl_jax.srt.function_call.base_format_detector import BaseFormatDetector
@@ -59,8 +59,8 @@ class Qwen3CoderDetector(BaseFormatDetector):
 
         # Streaming state variables
         self._current_function_name: str = ""
-        self._current_parameters: Dict[str, Any] = {}
-        self._streamed_parameters: Dict[str, str] = (
+        self._current_parameters: dict[str, Any] = {}
+        self._streamed_parameters: dict[str, str] = (
             {}
         )  # Track what parameter content we've streamed
         self._in_tool_call: bool = False
@@ -69,16 +69,14 @@ class Qwen3CoderDetector(BaseFormatDetector):
     def has_tool_call(self, text: str) -> bool:
         return self.tool_call_start_token in text
 
-    def detect_and_parse(self, text: str, tools: List[Tool]) -> StreamingParseResult:
+    def detect_and_parse(self, text: str, tools: list[Tool]) -> StreamingParseResult:
         normal, calls = self._extract(text, tools)
         return StreamingParseResult(normal_text=normal, calls=calls)
 
-    def parse_streaming_increment(
-        self, new_text: str, tools: List[Tool]
-    ) -> StreamingParseResult:
+    def parse_streaming_increment(self, new_text: str, tools: list[Tool]) -> StreamingParseResult:
         self._buf += new_text
         normal = ""
-        calls: List[ToolCallItem] = []
+        calls: list[ToolCallItem] = []
 
         # Build tool indices for validation
         if not hasattr(self, "_tool_indices"):
@@ -154,7 +152,7 @@ class Qwen3CoderDetector(BaseFormatDetector):
                         continue
                     else:
                         # Invalid function name, reset state
-                        logger.warning(f"Invalid function name: {function_name}")
+                        logger.warning("Invalid function name: %s", function_name)
                         self._reset_streaming_state()
                         normal += self._buf
                         self._buf = ""
@@ -202,7 +200,7 @@ class Qwen3CoderDetector(BaseFormatDetector):
 
         return StreamingParseResult(normal_text=normal, calls=calls)
 
-    def _parse_and_stream_parameters(self, text_to_parse: str) -> List[ToolCallItem]:
+    def _parse_and_stream_parameters(self, text_to_parse: str) -> list[ToolCallItem]:
         """
         Parse complete parameter blocks from text and return any tool call items to emit.
 
@@ -218,13 +216,11 @@ class Qwen3CoderDetector(BaseFormatDetector):
         Returns:
             List of ToolCallItem objects to emit (may be empty)
         """
-        calls: List[ToolCallItem] = []
+        calls: list[ToolCallItem] = []
 
         # Find all complete parameter patterns
         param_matches = list(
-            re.finditer(
-                r"<parameter=([^>]+)>(.*?)</parameter>", text_to_parse, re.DOTALL
-            )
+            re.finditer(r"<parameter=([^>]+)>(.*?)</parameter>", text_to_parse, re.DOTALL)
         )
 
         # Build new parameters dictionary
@@ -297,9 +293,9 @@ class Qwen3CoderDetector(BaseFormatDetector):
         self._streamed_parameters = {}
         self.current_tool_name_sent = False
 
-    def _extract(self, text: str, tools: List[Tool]) -> Tuple[str, List[ToolCallItem]]:
-        normal_parts: List[str] = []
-        calls: List[ToolCallItem] = []
+    def _extract(self, text: str, tools: list[Tool]) -> tuple[str, list[ToolCallItem]]:
+        normal_parts: list[str] = []
+        calls: list[ToolCallItem] = []
         cursor = 0
         while True:
             s = text.find(self.tool_call_start_token, cursor)
@@ -316,8 +312,8 @@ class Qwen3CoderDetector(BaseFormatDetector):
             calls.extend(self._parse_block(block, tools))
         return "".join(normal_parts), calls
 
-    def _parse_block(self, block: str, tools: List[Tool]) -> List[ToolCallItem]:
-        res: List[ToolCallItem] = []
+    def _parse_block(self, block: str, tools: list[Tool]) -> list[ToolCallItem]:
+        res: list[ToolCallItem] = []
         for m in self.tool_call_function_regex.findall(block):
             txt = m[0] if m[0] else m[1]
             if ">" not in txt:
@@ -325,7 +321,7 @@ class Qwen3CoderDetector(BaseFormatDetector):
             idx = txt.index(">")
             fname = txt[:idx].strip()
             body = txt[idx + 1 :]
-            params: Dict[str, Any] = {}
+            params: dict[str, Any] = {}
             for pm in self.tool_call_parameter_regex.findall(body):
                 ptxt = pm[0] if pm[0] else pm[1]
                 if ">" not in ptxt:
@@ -349,7 +345,7 @@ class Qwen3CoderDetector(BaseFormatDetector):
     def structure_info(self) -> _GetInfoFunc:
         raise NotImplementedError
 
-    def build_ebnf(self, tools: List[Tool]):
+    def build_ebnf(self, tools: list[Tool]):
         return EBNFComposer.build_ebnf(
             tools,
             individual_call_start_token=self.tool_call_start_token.replace("\n", "\\n"),

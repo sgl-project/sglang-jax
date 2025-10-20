@@ -1,4 +1,4 @@
-from typing import Any, Dict, Literal, Optional
+from typing import Any, Literal
 
 
 class EBNFComposer:
@@ -129,7 +129,7 @@ class EBNFComposer:
         return f"({enum_rule})" if len(formatted_values) > 1 else enum_rule
 
     @staticmethod
-    def get_type_mapping(function_format: str) -> Dict[str, str]:
+    def get_type_mapping(function_format: str) -> dict[str, str]:
         """Get the complete type mapping for a given format."""
         mapping = EBNFComposer.BASE_TYPE_MAPPING.copy()
         overrides = EBNFComposer.FORMAT_TYPE_OVERRIDES.get(function_format, {})
@@ -144,8 +144,7 @@ class EBNFComposer:
 
         if isinstance(prop_type, list):
             type_rules = [
-                type_mapping.get(single_type, function_format)
-                for single_type in prop_type
+                type_mapping.get(single_type, function_format) for single_type in prop_type
             ]
             return " | ".join(type_rules) if type_rules else function_format
 
@@ -156,15 +155,15 @@ class EBNFComposer:
         tools,
         function_format: Literal["pythonic", "json", "xml"] = "json",
         # Parameters for wrapping the entire sequence of tool calls
-        sequence_start_token: Optional[str] = None,
-        sequence_end_token: Optional[str] = None,
+        sequence_start_token: str | None = None,
+        sequence_end_token: str | None = None,
         # Parameters for wrapping individual tool calls
-        individual_call_start_token: Optional[str] = None,
-        individual_call_end_token: Optional[str] = None,
+        individual_call_start_token: str | None = None,
+        individual_call_end_token: str | None = None,
         # Parameter for separating multiple tool calls
-        tool_call_separator: Optional[str] = None,
-        call_rule_fmt: Optional[str] = None,
-        key_value_rule_fmt: Optional[str] = None,
+        tool_call_separator: str | None = None,
+        call_rule_fmt: str | None = None,
+        key_value_rule_fmt: str | None = None,
         key_value_separator: str = 'ws "," ws',
     ):
         """
@@ -193,7 +192,9 @@ class EBNFComposer:
         # =================================================================
         # Handle a single function call
         if individual_call_start_token and individual_call_end_token:
-            function_call_unit = f'"{individual_call_start_token}" function_call "{individual_call_end_token}"'
+            function_call_unit = (
+                f'"{individual_call_start_token}" function_call "{individual_call_end_token}"'
+            )
         else:
             function_call_unit = "function_call"
 
@@ -206,9 +207,7 @@ class EBNFComposer:
 
         # Apply sequence-level wrapping if needed
         if sequence_start_token and sequence_end_token:
-            root_rule = (
-                f'"{sequence_start_token}" {base_pattern} "{sequence_end_token}"'
-            )
+            root_rule = f'"{sequence_start_token}" {base_pattern} "{sequence_end_token}"'
         else:
             root_rule = base_pattern
 
@@ -217,8 +216,7 @@ class EBNFComposer:
         # =================================================================
         ebnf_lines = [
             f"root ::= {root_rule}",
-            "function_call ::= "
-            + " | ".join([f"call_{tool.function.name}" for tool in tools]),
+            "function_call ::= " + " | ".join([f"call_{tool.function.name}" for tool in tools]),
         ]
 
         # =================================================================
@@ -322,9 +320,7 @@ class EBNFComposer:
 
             # Add the function call rule and its arguments rule
             ebnf_lines.append(
-                call_template.format(
-                    name=tool_name, arguments_rule=f"arguments_{tool_name}"
-                )
+                call_template.format(name=tool_name, arguments_rule=f"arguments_{tool_name}")
             )
             ebnf_lines.append(f"arguments_{tool_name} ::= {arguments_rule}")
 
@@ -336,9 +332,7 @@ class EBNFComposer:
             "json": EBNFComposer.json_grammar_ebnf_str,
             "xml": EBNFComposer.xml_grammar_ebnf_str,
         }
-        base_grammar = grammar_dict.get(
-            function_format, EBNFComposer.json_grammar_ebnf_str
-        )
+        base_grammar = grammar_dict.get(function_format, EBNFComposer.json_grammar_ebnf_str)
         ebnf_lines.append(base_grammar)
 
         return "\n".join(ebnf_lines)

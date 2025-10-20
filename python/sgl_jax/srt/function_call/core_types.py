@@ -1,5 +1,5 @@
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Callable, List, Optional
 
 from pydantic import BaseModel
 
@@ -8,7 +8,7 @@ class ToolCallItem(BaseModel):
     """Simple encapsulation of the parsed ToolCall result for easier usage in streaming contexts."""
 
     tool_index: int
-    name: Optional[str] = None
+    name: str | None = None
     parameters: str  # JSON string
 
 
@@ -16,7 +16,7 @@ class StreamingParseResult(BaseModel):
     """Result of streaming incremental parsing."""
 
     normal_text: str = ""
-    calls: List[ToolCallItem] = []
+    calls: list[ToolCallItem] = []
 
 
 @dataclass
