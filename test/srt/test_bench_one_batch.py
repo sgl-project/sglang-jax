@@ -16,7 +16,7 @@ class TestBenchOneBatch(CustomTestCase):
     def test_bs1_default(self):
         output_throughput = run_bench_offline_throughput(
             DEFAULT_MODEL_NAME_FOR_TEST,
-            ["--tp-size", "1", "--mem-fraction-static", "0.1"],
+            ["--tp-size", "1", "--mem-fraction-static", "0.8"],
         )
 
         if is_in_ci():
