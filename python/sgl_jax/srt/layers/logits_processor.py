@@ -290,7 +290,7 @@ class LogitsProcessor(nnx.Module):
                     pruned_states[sample_indices] if sample_indices is not None else pruned_states
                 )
             else:
-                raise AssertionError()
+                raise AssertionError("This branch should not be reached")
 
         if not logits_metadata.extend_return_logprob:
             # Decode mode or extend mode without return_logprob.
