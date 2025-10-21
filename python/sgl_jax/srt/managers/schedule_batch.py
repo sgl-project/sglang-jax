@@ -770,6 +770,7 @@ class ScheduleBatch:
         self.sampling_info = SamplingBatchInfo.from_schedule_batch(
             self,
             self.model_config.vocab_size,
+            getattr(self.model_config, "tie_word_embeddings", False),
         )
 
     def new_page_count_next_decode(self):
@@ -884,6 +885,7 @@ class ScheduleBatch:
         self.sampling_info = SamplingBatchInfo.from_schedule_batch(
             self,
             self.model_config.vocab_size,
+            getattr(self.model_config, "tie_word_embeddings", False),
         )
 
     def prepare_for_decode(self):

@@ -184,9 +184,13 @@ class SamplingMetadata:
             else:
                 padded_linear_penalty = original_linear_penalty
 
+            if not batch.sampling_info.tie_word_embeddings:
+                linear_penalty_sharding = NamedSharding(mesh, PartitionSpec(None, "tensor"))
+            else:
+                linear_penalty_sharding = sharding
             linear_penalty_device = device_array(
                 padded_linear_penalty,
-                sharding=sharding,
+                sharding=linear_penalty_sharding,
             )
 
         return cls(
@@ -283,9 +287,13 @@ class SamplingMetadata:
         vocab_size = batch.sampling_info.vocab_size
         padded_linear_penalty = jnp.ones((batch_size, vocab_size), dtype=jnp.float32) * 0.2
 
+        if not batch.sampling_info.tie_word_embeddings:
+            linear_penalty_sharding = NamedSharding(mesh, PartitionSpec(None, "tensor"))
+        else:
+            linear_penalty_sharding = sharding
         (linear_penalty_device,) = device_array(
             (padded_linear_penalty,),
-            sharding=sharding,
+            sharding=linear_penalty_sharding,
         )
 
         return cls(
@@ -338,6 +346,7 @@ class SamplingBatchInfo:
     # Penalizer
     penalizer_orchestrator: penaltylib.BatchedPenalizerOrchestrator | None = None
     linear_penalty: np.ndarray = None
+    tie_word_embeddings: bool = False
 
     @classmethod
     def _get_global_server_args_dict(cls):
@@ -346,7 +355,13 @@ class SamplingBatchInfo:
         return global_server_args_dict
 
     @classmethod
-    def generate_for_precompile(cls, bs: int, vocab_size: int = 32000, do_penalties: bool = False):
+    def generate_for_precompile(
+        cls,
+        bs: int,
+        vocab_size: int = 32000,
+        do_penalties: bool = False,
+        tie_word_embeddings: bool = False,
+    ):
         temperatures = np.array([0.6 for _ in range(bs)], dtype=np.float32)
         top_ps = np.array([0.9 for _ in range(bs)], dtype=np.float32)
         top_ks = np.array([30 for _ in range(bs)], dtype=np.int32)
@@ -383,6 +398,7 @@ class SamplingBatchInfo:
             sampling_seeds=sampling_seeds,
             penalizer_orchestrator=penalizer_orchestrator,
             linear_penalty=None,
+            tie_word_embeddings=tie_word_embeddings,
         )
         return ret
 
@@ -427,7 +443,9 @@ class SamplingBatchInfo:
         return MockBatch(bs)
 
     @classmethod
-    def from_schedule_batch(cls, batch: ScheduleBatch, vocab_size: int):
+    def from_schedule_batch(
+        cls, batch: ScheduleBatch, vocab_size: int, tie_word_embeddings: bool = False
+    ):
         global_server_args_dict = cls._get_global_server_args_dict()
         enable_deterministic = global_server_args_dict["enable_deterministic_sampling"]
         reqs = batch.reqs
@@ -471,6 +489,7 @@ class SamplingBatchInfo:
             sampling_seeds=sampling_seeds,
             vocab_size=vocab_size,
             penalizer_orchestrator=penalizer_orchestrator,
+            tie_word_embeddings=tie_word_embeddings,
         )
         return ret
 

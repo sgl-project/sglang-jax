@@ -322,8 +322,13 @@ class Qwen2ForCausalLM(nnx.Module):
         self.dtype = dtype
         logger.info("Qwen2ForCausalLM config dtype: %s", self.dtype)
         self.transformer = Qwen2Model(config, dtype=self.dtype, rngs=rngs)
-        if not getattr(self.config, "tie_word_embeddings", True):
-            self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size, rngs=rngs)
+        if not getattr(self.config, "tie_word_embeddings", False):
+            self.lm_head = ParallelLMHead(
+                config.vocab_size,
+                config.hidden_size,
+                embedding_init=nnx.with_partitioning(init_fn, ("tensor", None)),
+                rngs=rngs,
+            )
         self.logits_processor = LogitsProcessor(config.vocab_size, self.mesh)
 
     def load_weights(self, model_config: ModelConfig, rng_key: jax.Array):
@@ -353,9 +358,9 @@ class Qwen2ForCausalLM(nnx.Module):
             ),
         }
 
-        if not getattr(self.config, "tie_word_embeddings", True):
+        if not getattr(self.config, "tie_word_embeddings", False):
             mappings["lm_head.weight"] = WeightMapping(
-                target_path="lm_head.embedding", sharding=(None, None), transpose=False
+                target_path="lm_head.embedding", sharding=("tensor", None), transpose=False
             )
 
         num_layers = self.config.num_hidden_layers
@@ -467,7 +472,7 @@ class Qwen2ForCausalLM(nnx.Module):
         hidden_states, layers_kv_fused, layers_callback_flag = self.transformer(
             forward_batch, token_to_kv_pool
         )
-        if not getattr(self.config, "tie_word_embeddings", True):
+        if not getattr(self.config, "tie_word_embeddings", False):
             output = self.logits_processor(hidden_states, self.lm_head, logits_metadata)
         else:
             output = self.logits_processor(

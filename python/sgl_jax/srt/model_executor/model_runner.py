@@ -156,11 +156,11 @@ class ModelRunner:
             model = nnx.merge(model_def, model_state)
             return model(forward_batch, token_to_kv_pool, logits_metadata)
 
-        @partial(jax.jit, static_argnames=["sampler_state_def"])
-        def jitted_sampler(sampler_def, sampler_state_def, sampler_state_leaves, *args):
+        @partial(jax.jit, static_argnames=["sampler_state_def", "mesh"])
+        def jitted_sampler(sampler_def, sampler_state_def, sampler_state_leaves, mesh, *args):
             model_state = jax.tree_util.tree_unflatten(sampler_state_def, sampler_state_leaves)
             sampler = nnx.merge(sampler_def, model_state)
-            return sampler(*args)
+            return sampler(*args, mesh=mesh)
 
         def run_model_wrapper(forward_batch, logits_metadata):
             token_to_kv_pool = self.token_to_kv_pool
@@ -176,7 +176,7 @@ class ModelRunner:
 
         self.jitted_run_model = run_model_wrapper
         self.jitted_sampler = partial(
-            jitted_sampler, sampler_def, sampler_state_def, sampler_state_leaves
+            jitted_sampler, sampler_def, sampler_state_def, sampler_state_leaves, self.mesh
         )
 
     def get_available_device_memory(self):
