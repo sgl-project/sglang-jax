@@ -39,6 +39,7 @@ dependencies = [
     "pandas",
     "aiohttp",
     "pybase64",
+    "partial_json_parser",
 ]
 
 [project.optional-dependencies]

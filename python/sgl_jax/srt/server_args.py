@@ -9,6 +9,7 @@ import tempfile
 
 import jax
 
+from sgl_jax.srt.function_call.function_call_parser import FunctionCallParser
 from sgl_jax.srt.hf_transformers_utils import check_gguf_file, get_config
 from sgl_jax.srt.reasoning_parser import ReasoningParser
 from sgl_jax.srt.utils.common_utils import (
@@ -638,19 +639,13 @@ class ServerArgs:
             default=ServerArgs.reasoning_parser,
             help=f"Specify the parser for reasoning models, supported parsers are: {list(ReasoningParser.DetectorMap.keys())}.",
         )
+        tool_call_parser_choices = list(FunctionCallParser.ToolCallParserEnum.keys())
         parser.add_argument(
             "--tool-call-parser",
             type=str,
-            choices=[
-                "qwen25",
-                "mistral",
-                "llama3",
-                "deepseekv3",
-                "pythonic",
-                "kimi_k2",
-            ],
+            choices=tool_call_parser_choices,
             default=ServerArgs.tool_call_parser,
-            help="Specify the parser for handling tool-call interactions. Options include: 'qwen25', 'mistral', 'llama3', 'deepseekv3', 'pythonic', and 'kimi_k2'.",
+            help=f"Specify the parser for handling tool-call interactions. Options include: {tool_call_parser_choices}.",
         )
 
         # Data parallelism

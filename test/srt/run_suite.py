@@ -155,6 +155,7 @@ suites = {
         TestFile("test/srt/test_chunked_prefill_size.py", 25),
         TestFile("test/srt/test_bench_one_batch.py", 15),
         TestFile("test/srt/test_eval_accuracy_large.py", 25),
+        TestFile("test/srt/openai_server/basic/test_tool_calls.py", 45),
     ],
     "per-commit-tpu-v6e-8": [],
     "per-commit-tpu-v6e-16": [],

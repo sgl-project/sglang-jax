@@ -42,7 +42,7 @@ class TestEvalAccuracyLarge(CustomTestCase):
                 "--random-seed",
                 "3",
                 "--mem-fraction-static",
-                "0.4",
+                "0.8",
                 "--max-prefill-tokens",
                 "8192",
                 "--download-dir",
