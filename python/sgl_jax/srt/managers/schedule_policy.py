@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import logging
 import os
 import random
 from collections import defaultdict
@@ -16,6 +15,8 @@ from sgl_jax.srt.mem_cache.radix_cache import RadixCache, TreeNode
 
 if TYPE_CHECKING:
     from sgl_jax.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+
+import logging
 
 logger = logging.getLogger(__name__)
 
@@ -271,7 +272,7 @@ class PrefillAdder:
         self.log_input_tokens = 0
 
         if running_batch is not None:
-            running_batch_tokens = sum(
+            self.rem_total_token_offset += sum(
                 [
                     min(
                         (r.sampling_params.max_new_tokens - len(r.output_ids)),
@@ -281,7 +282,6 @@ class PrefillAdder:
                     for r in running_batch.reqs
                 ]
             )
-            self.rem_total_token_offset += running_batch_tokens
 
     @property
     def rem_total_tokens(self):
@@ -316,7 +316,6 @@ class PrefillAdder:
     def add_chunked_req(self, req: Req):
         _rem_tokens = min(self.rem_chunk_tokens, int(self.rem_total_tokens))
         truncated = req.extend_input_len > _rem_tokens
-
         req.extend_input_len = min(req.extend_input_len, _rem_tokens)
         req.fill_ids = req.fill_ids[: len(req.prefix_indices) + req.extend_input_len]
         self.can_run_list.append(req)
