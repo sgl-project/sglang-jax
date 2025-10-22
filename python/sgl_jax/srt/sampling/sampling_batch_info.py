@@ -184,10 +184,8 @@ class SamplingMetadata:
             else:
                 padded_linear_penalty = original_linear_penalty
 
-            if not batch.sampling_info.tie_word_embeddings:
-                linear_penalty_sharding = NamedSharding(mesh, PartitionSpec(None, "tensor"))
-            else:
-                linear_penalty_sharding = sharding
+            linear_penalty_sharding = NamedSharding(mesh, PartitionSpec(None, "tensor"))
+
             linear_penalty_device = device_array(
                 padded_linear_penalty,
                 sharding=linear_penalty_sharding,
@@ -287,10 +285,8 @@ class SamplingMetadata:
         vocab_size = batch.sampling_info.vocab_size
         padded_linear_penalty = jnp.ones((batch_size, vocab_size), dtype=jnp.float32) * 0.2
 
-        if not batch.sampling_info.tie_word_embeddings:
-            linear_penalty_sharding = NamedSharding(mesh, PartitionSpec(None, "tensor"))
-        else:
-            linear_penalty_sharding = sharding
+        linear_penalty_sharding = NamedSharding(mesh, PartitionSpec(None, "tensor"))
+
         (linear_penalty_device,) = device_array(
             (padded_linear_penalty,),
             sharding=linear_penalty_sharding,

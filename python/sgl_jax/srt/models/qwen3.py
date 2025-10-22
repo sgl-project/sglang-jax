@@ -294,6 +294,7 @@ class QWen3Model(nnx.Module):
             features=config.hidden_size,
             rngs=rngs,
             dtype=dtype,
+            embedding_init=nnx.with_partitioning(init_fn, ("tensor", None)),
             param_dtype=dtype,
         )
 
@@ -389,7 +390,7 @@ class Qwen3ForCausalLM(nnx.Module):
         mappings = {
             "model.embed_tokens.weight": WeightMapping(
                 target_path="transformer.embed_tokens.embedding",
-                sharding=(None, None),
+                sharding=("tensor", None),
                 transpose=False,
             ),
             "model.norm.weight": WeightMapping(
