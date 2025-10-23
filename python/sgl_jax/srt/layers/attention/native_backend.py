@@ -1,6 +1,5 @@
 import jax
 import jax.numpy as jnp
-from jax.tree_util import register_pytree_node_class
 
 from sgl_jax.srt.layers.attention.base_attn_backend import AttentionBackend
 from sgl_jax.srt.layers.radix_attention import AttentionType, RadixAttention
@@ -10,7 +9,6 @@ from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch, ForwardM
 from sgl_jax.srt.utils.jax_utils import is_tpu_runtime
 
 
-@register_pytree_node_class
 class NativeAttention(AttentionBackend):
     """Native Attention layer for variable-length sequences using ForwardBatch."""
 

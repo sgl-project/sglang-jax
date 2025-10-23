@@ -937,9 +937,9 @@ class Scheduler(
         launch_done: threading.Event | None = None,
     ):
         if batch.forward_mode.is_decode():
-            self.process_batch_result_decode(batch, result)
+            self.process_batch_result_decode(batch, result, launch_done)
         elif batch.forward_mode.is_extend():
-            self.process_batch_result_prefill(batch, result)
+            self.process_batch_result_prefill(batch, result, launch_done)
         elif batch.forward_mode.is_idle():
             if self.enable_overlap:
                 self.tp_worker.resolve_last_batch_result(launch_done)

@@ -178,8 +178,6 @@ class SchedulerOutputProcessorMixin:
                     float
                 )
 
-        # batch.output_ids = np.array(next_token_ids, dtype=np.int32)
-
         self.token_to_kv_pool_allocator.free_group_begin()
 
         # Check finish condition

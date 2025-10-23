@@ -118,7 +118,7 @@ class WeightLoader:
                 if self._is_excluded_layer_weight(hf_key):
                     logger.debug("Skipping excluded MoE expert weight: %s", hf_key)
                 else:
-                    expert_weights[hf_key] = hf_weight.astype(self.dtype)
+                    expert_weights[hf_key] = hf_weight
             else:
                 if self._is_excluded_layer_weight(hf_key):
                     logger.debug("Skipping excluded layer weight: %s", hf_key)
@@ -191,7 +191,7 @@ class WeightLoader:
         hf_weight: jax.Array,
         mapping: WeightMapping,
     ):
-        processed_weight = hf_weight.astype(self.dtype)
+        processed_weight = hf_weight
 
         if mapping.transpose and not hf_key.endswith(".bias"):
             processed_weight = jnp.transpose(processed_weight, (1, 0))
@@ -227,7 +227,7 @@ class WeightLoader:
                 processed_weight.shape,
                 mapping.transpose,
             )
-            model_param.value = sharded_weight
+            model_param.value = sharded_weight.astype(model_param.value.dtype)
         except Exception as e:
             logger.error("Failed to load %s -> %s: %s", hf_key, jax_path, str(e))
             raise
@@ -235,10 +235,7 @@ class WeightLoader:
     def _handle_split_weight(
         self, params: nnx.State, hf_key: str, weight: jax.Array, mapping: WeightMapping
     ):
-        if "c_attn" in hf_key:
-            self._split_qkv_weight(params, hf_key, weight, mapping)
-        else:
-            raise ValueError(f"Unknown split weight pattern for {hf_key}")
+        self._split_qkv_weight(params, hf_key, weight, mapping)
 
     def _split_qkv_weight(
         self, params: nnx.State, hf_key: str, weight: jax.Array, mapping: WeightMapping
@@ -347,7 +344,7 @@ class WeightLoader:
             sharded_weight = self._shard_weight(processed_weight, mapping.sharding)
 
             model_param = self._get_param(params, jax_path)
-            model_param.value = sharded_weight
+            model_param.value = sharded_weight.astype(model_param.value.dtype)
             logger.debug("Split %s -> %s, shape: %s", hf_key, jax_path, processed_weight.shape)
 
     def _shard_weight(self, weight: jax.Array, sharding: tuple) -> jax.Array:
@@ -555,6 +552,6 @@ class WeightLoader:
 
                     sharded_weight = self._shard_weight(device_experts, mapping.sharding)
                     model_param = self._get_param(params, target_path)
-                    model_param.value = sharded_weight
+                    model_param.value = sharded_weight.astype(model_param.value.dtype)
                 else:
                     logger.error("Could not collect all expert weights for %s", target_path)
