@@ -248,6 +248,7 @@ class QWenModel(nnx.Module):
             features=config.hidden_size,
             rngs=rngs,
             dtype=dtype,
+            embedding_init=nnx.with_partitioning(init_fn, ("tensor", None)),
             param_dtype=dtype,
         )
 
@@ -307,8 +308,13 @@ class QWenLMHeadModel(nnx.Module):
         logger.info("QWenLMHeadModel config dtype: %s", self.dtype)
         self.transformer = QWenModel(config, dtype=self.dtype, rngs=rngs)
         vocab_size = ((config.vocab_size + 63) // 64) * 64
-        if not getattr(self.config, "tie_word_embeddings", True):
-            self.lm_head = ParallelLMHead(vocab_size, config.hidden_size, rngs=rngs)
+        if not getattr(self.config, "tie_word_embeddings", False):
+            self.lm_head = ParallelLMHead(
+                vocab_size,
+                config.hidden_size,
+                embedding_init=nnx.with_partitioning(init_fn, ("tensor", None)),
+                rngs=rngs,
+            )
         self.logits_processor = LogitsProcessor(vocab_size, self.mesh)
 
     def load_weights(self, model_config: ModelConfig, rng_key: jax.Array):
@@ -330,7 +336,7 @@ class QWenLMHeadModel(nnx.Module):
         mappings = {
             "transformer.wte.weight": WeightMapping(
                 target_path="transformer.embed_tokens.embedding",
-                sharding=(None, None),
+                sharding=("tensor", None),
                 transpose=False,
             ),
             "transformer.ln_f.weight": WeightMapping(
@@ -338,9 +344,9 @@ class QWenLMHeadModel(nnx.Module):
             ),
         }
 
-        if not getattr(self.config, "tie_word_embeddings", True):
+        if not getattr(self.config, "tie_word_embeddings", False):
             mappings["lm_head.weight"] = WeightMapping(
-                target_path="lm_head.embedding", sharding=(None, None), transpose=False
+                target_path="lm_head.embedding", sharding=("tensor", None), transpose=False
             )
 
         num_layers = self.config.num_hidden_layers
@@ -411,7 +417,7 @@ class QWenLMHeadModel(nnx.Module):
         logits_metadata: LogitsMetadata,
     ):
         hidden_states, layers_kv_fused = self.transformer(forward_batch, token_to_kv_pool)
-        if not getattr(self.config, "tie_word_embeddings", True):
+        if not getattr(self.config, "tie_word_embeddings", False):
             output = self.logits_processor(hidden_states, self.lm_head, logits_metadata)
         else:
             output = self.logits_processor(
