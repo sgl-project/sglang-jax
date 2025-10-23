@@ -1,3 +1,6 @@
+# Adapted from https://github.com/jax-ml/jax/releases/tag/jax-v0.8.0
+# Copyright 2025 The JAX Authors. All rights reserved.
+
 import re
 
 import jax

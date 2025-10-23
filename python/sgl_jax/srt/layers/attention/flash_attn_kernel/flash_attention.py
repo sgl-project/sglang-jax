@@ -1,3 +1,5 @@
+# Adapted from https://github.com/vllm-project/tpu-inference/releases/tag/v0.11.1
+# Copyright 2025 The tpu-inference Authors. All rights reserved.
 """TPU-Friendly Ragged Paged Attention kernel.
 
 This kernel offers a highly optimized implementation of ragged paged attention,
