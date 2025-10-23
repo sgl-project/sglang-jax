@@ -17,7 +17,7 @@ from sgl_jax.srt.layers.radix_attention import RadixAttention
 from sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch
 from sgl_jax.srt.mem_cache.memory_pool import KVCache
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sgl_jax.srt.speculative.eagle_util import EagleDraftInput, EagleVerifyInput
+from sgl_jax.srt.speculative.eagle_util import EagleDraftInput
 from sgl_jax.srt.utils import cdiv
 from sgl_jax.srt.utils.jax_utils import device_array
 
@@ -115,18 +115,21 @@ class FlashAttentionBackend(AttentionBackend):
 
         if batch.forward_mode.is_extend():
             if batch.forward_mode.is_target_verify():
-                cu_q_lens = np.arange(
-                    0,
-                    batch.seq_lens.shape[0] * batch.spec_info.draft_token_num + 1,
-                    batch.spec_info.draft_token_num,
+                padded_batch_size = len(batch.seq_lens)
+                real_batch_size = batch.real_bs
+                q_lens = np.array(
+                    [batch.spec_info.draft_token_num] * real_batch_size, dtype=np.int32
                 )
+                extend_seq_lens = np.pad(q_lens, (0, padded_batch_size - real_batch_size))
             else:
-                cu_q_lens = np.concatenate(
-                    [
-                        np.array([0], dtype=np.int32),
-                        np.cumsum(batch.extend_seq_lens),
-                    ]
-                )
+                extend_seq_lens = batch.extend_seq_lens
+
+            cu_q_lens = np.concatenate(
+                [
+                    np.array([0], dtype=np.int32),
+                    np.cumsum(extend_seq_lens),
+                ]
+            )
             # if batch.forward_mode == ForwardMode.TARGET_VERIFY:
             # logger.info(f"***********{batch.forward_mode}******cu_q_lens****{batch.extend_seq_lens}*******{batch.extend_prefix_lens}******{cu_q_lens}")
         elif batch.forward_mode == ForwardMode.DECODE:
@@ -150,21 +153,10 @@ class FlashAttentionBackend(AttentionBackend):
 
         seq_lens = np.copy(batch.seq_lens)
 
-        if not batch.spec_algorithm.is_none() and batch.spec_info is not None:
-            if isinstance(batch.spec_info, EagleVerifyInput):
-                assert batch.spec_info is not None, f"batch {batch}"
-                logger.info("batch.spec_info.draft_token_num")
-                aligned_seq_lens = (
-                    (batch.seq_lens + batch.spec_info.draft_token_num + self.page_size - 1)
-                    // self.page_size
-                ) * self.page_size
-            elif isinstance(batch.spec_info, EagleDraftInput):
-                aligned_seq_lens = (
-                    (batch.seq_lens + speculative_step_id + 1 + self.page_size - 1)
-                    // self.page_size
-                ) * self.page_size
-            else:
-                raise RuntimeError(f"Should not reach {batch.spec_info}")
+        if batch.forward_mode.is_target_verify():
+            aligned_seq_lens = (
+                (batch.seq_lens + extend_seq_lens + self.page_size - 1) // self.page_size
+            ) * self.page_size
         else:
             aligned_seq_lens = (
                 (batch.seq_lens + self.page_size - 1) // self.page_size
