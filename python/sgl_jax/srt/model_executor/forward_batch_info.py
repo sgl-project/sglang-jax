@@ -157,9 +157,6 @@ class ForwardBatch:
     extend_prefix_lens: jax.Array | None = None
     extend_seq_lens: jax.Array | None = None
 
-    trace_request_ids: list[str] | None = None
-    trace_request_objects: list | None = None
-
     def tree_flatten(self):
         children = (
             self.input_ids,
@@ -186,8 +183,6 @@ class ForwardBatch:
 
         obj.forward_mode = aux_data["forward_mode"]
         obj.batch_size = aux_data["batch_size"]
-        obj.trace_request_ids = None
-        obj.trace_request_objects = None
 
         obj.input_ids = children[0]
         obj.req_pool_indices = children[1]
