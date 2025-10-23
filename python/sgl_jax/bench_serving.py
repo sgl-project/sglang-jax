@@ -925,9 +925,12 @@ def sample_random_requests(
             else:
                 ratio = (input_lens[i] + prompt_len - 1) // prompt_len
                 input_ids = (prompt_token_ids * ratio)[: input_lens[i]]
-            input_content = input_ids
-            if return_text:
-                input_content = tokenizer.decode(input_content)
+            token_text, token_ids, token_mismatch = adjust_prompt_decode_to_target_len(
+                tokenizer, input_ids, input_lens[i]
+            )
+            if token_mismatch > 0:
+                continue  # skip this request
+            input_content = token_text if return_text else token_ids
             input_requests.append(
                 DatasetRow(
                     prompt=input_content,
@@ -943,8 +946,12 @@ def sample_random_requests(
             input_content = [
                 (offsets[i] + i + j) % tokenizer.vocab_size for j in range(input_lens[i])
             ]
-            if return_text:
-                input_content = tokenizer.decode(input_content)
+            token_text, token_ids, token_mismatch = adjust_prompt_decode_to_target_len(
+                tokenizer, input_content, input_lens[i]
+            )
+            if token_mismatch > 0:
+                continue  # skip this request
+            input_content = token_text if return_text else token_ids
             input_requests.append(
                 DatasetRow(
                     prompt=input_content,
@@ -956,6 +963,51 @@ def sample_random_requests(
     print(f"#Input tokens: {np.sum(input_lens)}")
     print(f"#Output tokens: {np.sum(output_lens)}")
     return input_requests
+
+
+def adjust_prompt_decode_to_target_len(
+    tokenizer: PreTrainedTokenizerBase,
+    token_sequence: int,
+    target_token_len: int,
+    max_retry: int = 10,
+) -> tuple[str, list[int]]:
+    """
+    Refer https://github.com/vllm-project/vllm/pull/24937
+    Ensure decoded-then-encoded prompt length matches the target token length.
+
+    This function decodes an initial token sequence to text and re-encodes it
+    , iteratively adjusting the token sequence length to match a target.
+    This is necessary because some tokenizers do not guarantee a 1:1 mapping
+    between consecutive tokens and the decoded-then-encoded sequence length.
+    For example, for GPT2Tokenizer:
+    [6880, 6881] -> ['Ġcalls', 'here'] ->
+    [1650, 939, 486] -> ['Ġcall', 'sh', 'ere']
+    """
+    remain_num_try = max_retry
+    token_mismatch = 0
+    while True:
+        prompt = tokenizer.decode(token_sequence)
+        token_sequence = tokenizer.encode(prompt)
+        if remain_num_try <= 0:
+            if len(token_sequence) != target_token_len:
+                token_mismatch = len(token_sequence) - target_token_len
+            break
+
+        if len(token_sequence) == target_token_len:
+            break
+        elif len(token_sequence) < target_token_len:
+            extra_tokens = np.random.randint(
+                0,
+                tokenizer.vocab_size,
+                size=target_token_len - len(token_sequence),
+            ).tolist()
+            token_sequence.extend(extra_tokens)
+        elif len(token_sequence) > target_token_len:
+            token_sequence = token_sequence[:target_token_len]
+
+        remain_num_try -= 1
+
+    return prompt, token_sequence, token_mismatch
 
 
 def gen_prompt(tokenizer, token_num):
