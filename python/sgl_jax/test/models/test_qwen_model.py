@@ -442,6 +442,7 @@ class TestQwenModel(unittest.TestCase):
                         min_ps=jnp.full((forward_batch.batch_size, 1), 0.0),
                         vocab_size=model.config.vocab_size,
                     ),
+                    mesh=self.mesh,
                 )
 
                 if len(input_texts) <= 10 and (iteration % 5 == 0):

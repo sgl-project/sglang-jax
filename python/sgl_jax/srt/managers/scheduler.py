@@ -737,7 +737,6 @@ class Scheduler(
         # Get priority queue
         self.policy.calc_priority(self.waiting_queue)
 
-        # Prefill policy
         adder = PrefillAdder(
             self.page_size,
             self.tree_cache,

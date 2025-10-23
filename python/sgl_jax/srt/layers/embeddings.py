@@ -33,7 +33,10 @@ class Embed(nnx.Module):
       num_embeddings: number of embeddings.
       features: number of feature dimensions for each embedding.
       dtype: the dtype of the embedding vectors (default: float32).
+      param_dtype: the dtype of the embedding parameters.
+      promote_dtype: the dtype promotion function.
       embedding_init: embedding initializer.
+      rngs: rng keys.
     """
 
     def __init__(
@@ -43,6 +46,7 @@ class Embed(nnx.Module):
         dtype: jnp.dtype | None = None,
         param_dtype: jnp.dtype = jnp.bfloat16,
         promote_dtype: PromoteDtypeFn = dtypes.promote_dtype,
+        embedding_init: nnx.Initializer = default_embed_init,
         rngs: nnx.Rngs = None,
     ):
         """
@@ -63,9 +67,7 @@ class Embed(nnx.Module):
             rngs: Random number generator state for parameter initialization.
         """
         self.embedding = nnx.Param(
-            nnx.with_partitioning(default_embed_init, (None, None))(
-                jax.random.PRNGKey(0), (num_embeddings, features), param_dtype
-            )
+            embedding_init(jax.random.PRNGKey(0), (num_embeddings, features), param_dtype)
         )
 
         self.num_embeddings = num_embeddings
@@ -124,6 +126,7 @@ class ParallelLMHead(Embed):
         dtype: jnp.dtype | None = None,
         param_dtype: jnp.dtype = jnp.bfloat16,
         promote_dtype: PromoteDtypeFn = dtypes.promote_dtype,
+        embedding_init: nnx.Initializer = default_embed_init,
         rngs: nnx.Rngs = None,
         use_bias: bool = False,
     ):
@@ -148,6 +151,7 @@ class ParallelLMHead(Embed):
             dtype=dtype,
             param_dtype=param_dtype,
             promote_dtype=promote_dtype,
+            embedding_init=embedding_init,
             rngs=rngs,
         )
         if use_bias:

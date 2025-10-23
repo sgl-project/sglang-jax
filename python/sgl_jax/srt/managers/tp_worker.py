@@ -385,7 +385,10 @@ class ModelWorker:
             out_cache_loc=np.concat([valid_out_cache_loc, invalid_out_cache_loc], axis=0),
             return_logprob=False,
             sampling_info=SamplingBatchInfo.generate_for_precompile(
-                bs, self.model_config.vocab_size, do_penalties=do_penalties
+                bs,
+                self.model_config.vocab_size,
+                do_penalties=do_penalties,
+                tie_word_embeddings=getattr(self.model_config, "tie_word_embeddings", False),
             ),
             extend_input_logprob_token_ids=None,
             positions=np.concat([valid_positions, invalid_positions], axis=0),

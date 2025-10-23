@@ -4,6 +4,8 @@ from flax import nnx
 from jax import lax
 from jax import numpy as jnp
 from jax import random
+from jax.sharding import Mesh, NamedSharding
+from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.layers.binary_search import topk_mask, topp_mask
 from sgl_jax.srt.layers.logits_processor import LogitsProcessorOutput
@@ -26,7 +28,9 @@ class Sampler(nnx.Module):
 
     def _regular_sampling(self, operands):
         """Regular sampling branch"""
-        logits, sampling_metadata, positions, rng = operands
+        logits, sampling_metadata, positions, rng, mesh = operands
+
+        logits = lax.with_sharding_constraint(logits, NamedSharding(mesh, P(None, None)))
 
         # Validate broadcast compatibility for temperature division
         logits_batch_size = logits.shape[0]
@@ -160,6 +164,7 @@ class Sampler(nnx.Module):
         logits_output: LogitsProcessorOutput,
         sampling_metadata: SamplingMetadata,
         positions: jax.Array,
+        mesh: Mesh,
     ):
         """Run a sampler & compute logprobs and update logits_output accordingly.
 
@@ -168,22 +173,16 @@ class Sampler(nnx.Module):
             sampling_metadata: Metadata for sampling
             positions: The positions of the tokens in the sequence.
         """
-
-        logits = jnp.reshape(
-            logits_output.next_token_logits,
-            (-1, logits_output.next_token_logits.shape[-1]),
-        )
-
         # Apply penalties before sampling
-        logits = self.apply_penalties(logits, sampling_metadata)
+        logits = self.apply_penalties(logits_output.next_token_logits, sampling_metadata)
 
         _, rng = jax.random.split(self.rngs.params())
-
         operands = (logits, sampling_metadata, positions, rng)
+        regular_fn = lambda op: self._regular_sampling((*op, mesh))
         batch_next_token_ids, logprobs = lax.cond(
             sampling_metadata.is_all_greedy,
             self._greedy_sampling,
-            self._regular_sampling,
+            regular_fn,
             operands,
         )
 

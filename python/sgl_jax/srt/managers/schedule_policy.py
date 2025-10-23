@@ -16,6 +16,10 @@ from sgl_jax.srt.mem_cache.radix_cache import RadixCache, TreeNode
 if TYPE_CHECKING:
     from sgl_jax.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 # Clip the estimation of max_new_tokens for the request whose max_new_tokens is very large.
 # This can prevent the server from being too conservative.
 # Note that this only clips the estimation in the scheduler but does not change the stop
