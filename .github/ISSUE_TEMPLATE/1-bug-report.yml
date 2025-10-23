@@ -32,7 +32,7 @@ body:
   attributes:
     label: Environment
     description: |
-      Please provide necessary environment information here with `python3 -m sglang.check_env`. Otherwise the issue will be closed.
+      Please provide necessary environment information here with `python3 -m sgl_jax.check_env`. Otherwise the issue will be closed.
     placeholder: Environment here.
   validations:
     required: true
