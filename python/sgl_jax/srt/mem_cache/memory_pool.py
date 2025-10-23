@@ -585,6 +585,8 @@ def get_num_slices_per_block(new_kv: jax.Array, kv_cache: jax.Array, page_size=1
     )
 
 
+# Adapted from https://github.com/vllm-project/tpu-inference/releases/tag/v0.11.1
+# Copyright 2025 The tpu-inference Authors. All rights reserved.
 @partial(
     jax.jit,
     static_argnames=["page_size", "num_slices_per_block", "kv_partition_axis"],
