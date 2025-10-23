@@ -651,7 +651,7 @@ class EagleVerifyInput:
 
         if is_all_greedy:
             target_predict = jnp.argmax(logits_output.next_token_logits, axis=-1).flatten()
-            target_predict = target_predict.reshape(bs, self.draft_token_num)
+            # target_predict = target_predict.reshape(bs, self.draft_token_num)
             accept_index, accept_length, predict = verify_tree_greedy(
                 predicts=predict,  # mutable
                 accept_index=accept_index,  # mutable

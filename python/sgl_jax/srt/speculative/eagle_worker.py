@@ -538,6 +538,14 @@ class EAGLEWorker(ModelWorker):
 
             if i == self.speculative_num_steps - 1:
                 break
+            if i > 0:
+                model_worker_batch = schedule_batch.get_model_worker_batch(
+                    precompile_token_paddings,
+                    precompile_bs_paddings,
+                    precompile_cache_loc_paddings,
+                    self.page_size,
+                    speculative_step_id=i,
+                )
             model_worker_batch.input_ids = input_ids
             model_worker_batch.out_cache_loc = out_cache_loc[i]
             model_worker_batch.positions = original_positions + 1 + i

@@ -157,7 +157,7 @@ class FlashAttentionBackend(AttentionBackend):
             seq_lens += extend_seq_lens
             aligned_seq_lens = ((seq_lens + self.page_size - 1) // self.page_size) * self.page_size
         elif batch.forward_mode.is_decode() and not batch.spec_algorithm.is_none():
-            seq_lens += speculative_step_id
+            seq_lens += speculative_step_id + 1
             aligned_seq_lens = ((seq_lens + self.page_size - 1) // self.page_size) * self.page_size
         else:
             aligned_seq_lens = (

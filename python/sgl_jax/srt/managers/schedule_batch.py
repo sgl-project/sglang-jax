@@ -1039,6 +1039,7 @@ class ScheduleBatch:
         bs_paddings: list,
         cache_loc_paddings: list,
         page_size: int,
+        speculative_step_id: int = 0,
     ) -> ModelWorkerBatch:
         if self.forward_mode.is_decode_or_idle():
             extend_seq_lens = extend_prefix_lens = extend_logprob_start_lens = None
@@ -1173,7 +1174,9 @@ class ScheduleBatch:
                 if self.forward_mode == ForwardMode.TARGET_VERIFY:
                     seq_lens = seq_lens_cpu + self.spec_info.draft_token_num
                 elif self.forward_mode == ForwardMode.DECODE:
-                    seq_lens = seq_lens_cpu + self.spec_info.topk_p.shape[1]
+                    seq_lens = seq_lens_cpu + self.spec_info.topk_p.shape[1] * (
+                        speculative_step_id + 1
+                    )
             # Filter out empty sequences
             valid_mask = seq_lens > 0
             if np.any(valid_mask):
