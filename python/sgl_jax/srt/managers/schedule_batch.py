@@ -1166,18 +1166,19 @@ class ScheduleBatch:
                 select_bs_index = i
                 break
         cache_loc_flat = np.array([], dtype=np.int32)
-        if not self.spec_algorithm.is_none():
-            if self.forward_mode == ForwardMode.TARGET_VERIFY:
-                seq_lens_cpu = seq_lens_cpu + self.spec_info.draft_token_num
-            elif self.forward_mode == ForwardMode.DECODE:
-                seq_lens_cpu = seq_lens_cpu + self.spec_info.topk_p.shape[1]
 
         if len(seq_lens_cpu) > 0:
+            seq_lens = seq_lens_cpu
+            if not self.spec_algorithm.is_none():
+                if self.forward_mode == ForwardMode.TARGET_VERIFY:
+                    seq_lens = seq_lens_cpu + self.spec_info.draft_token_num
+                elif self.forward_mode == ForwardMode.DECODE:
+                    seq_lens = seq_lens_cpu + self.spec_info.topk_p.shape[1]
             # Filter out empty sequences
-            valid_mask = seq_lens_cpu > 0
+            valid_mask = seq_lens > 0
             if np.any(valid_mask):
                 valid_indices = np.where(valid_mask)[0]
-                valid_seq_lens = seq_lens_cpu[valid_mask]
+                valid_seq_lens = seq_lens[valid_mask]
 
                 # Calculate aligned lengths for all valid sequences at once
                 aligned_lengths = ((valid_seq_lens + page_size - 1) // page_size) * page_size

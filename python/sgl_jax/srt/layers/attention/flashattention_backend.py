@@ -154,9 +154,11 @@ class FlashAttentionBackend(AttentionBackend):
         seq_lens = np.copy(batch.seq_lens)
 
         if batch.forward_mode.is_target_verify():
-            aligned_seq_lens = (
-                (batch.seq_lens + extend_seq_lens + self.page_size - 1) // self.page_size
-            ) * self.page_size
+            seq_lens += extend_seq_lens
+            aligned_seq_lens = ((seq_lens + self.page_size - 1) // self.page_size) * self.page_size
+        elif batch.forward_mode.is_decode() and not batch.spec_algorithm.is_none():
+            seq_lens += speculative_step_id
+            aligned_seq_lens = ((seq_lens + self.page_size - 1) // self.page_size) * self.page_size
         else:
             aligned_seq_lens = (
                 (batch.seq_lens + self.page_size - 1) // self.page_size
