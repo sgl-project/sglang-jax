@@ -210,8 +210,11 @@ class LogitsMetadata:
 class LogitsProcessor(nnx.Module):
     """Logits processor for the model."""
 
-    def __init__(self, vocab_size: int, mesh: Mesh):
+    def __init__(
+        self, vocab_size: int, soft_cap: float | None = None, mesh: Mesh = None
+    ):
         self.vocab_size = vocab_size
+        self.soft_cap = soft_cap
         self.mesh = mesh
 
     def __call__(
@@ -277,7 +280,9 @@ class LogitsProcessor(nnx.Module):
 
         # Compute logits for both input and sampled tokens.
         logits = self._get_logits(pruned_states, lm_head)
-        sampled_logits = logits[sample_indices] if sample_indices is not None else logits
+        sampled_logits = (
+            logits[sample_indices] if sample_indices is not None else logits
+        )
 
         hidden_states_to_store: jax.Array | None = None
         if logits_metadata.capture_hidden_mode.need_capture():
@@ -426,7 +431,6 @@ class LogitsProcessor(nnx.Module):
             probs = top_p_normalize_probs_jax(probs, logits_metadata.top_p)
             return jnp.log(probs)
         else:
-            # return torch.nn.functional.log_softmax(last_logits, dim=-1)
             return nn.log_softmax(last_logits, axis=-1)
 
     def _get_logits(
@@ -449,4 +453,6 @@ class LogitsProcessor(nnx.Module):
 
         logits = logits[:, : self.vocab_size] if logits.ndim > 1 else logits[: self.vocab_size]
 
+        if self.soft_cap:
+            logits = self.soft_cap * jnp.tanh(logits / self.soft_cap)
         return logits

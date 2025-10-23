@@ -261,7 +261,7 @@ class LlamaDecoderLayer(nnx.Module):
         forward_batch: ForwardBatch,
         token_to_kv_pool: KVCache,
         residual: jax.Array | None,
-    ) -> tuple[jax.Array, jax.Array]:
+    ):
         layer_callback_flag = []
         if residual is None:
             residual = hidden_states
@@ -382,7 +382,7 @@ class LlamaForCausalLM(nnx.Module):
         self.config = config
         self.dtype = dtype
         logger.info("LlamaForCausalLM config dtype: %s", self.dtype)
-        self.transformer = LlamaModel(config, dtype=self.dtype, rngs=rngs)
+        self.model = LlamaModel(config, dtype=self.dtype, rngs=rngs)
         if not getattr(self.config, "tie_word_embeddings", True):
             self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size, rngs=rngs)
         self.logits_processor = LogitsProcessor(config.vocab_size, self.mesh)
@@ -405,12 +405,12 @@ class LlamaForCausalLM(nnx.Module):
     def _create_llama_weight_mappings(self) -> dict:
         mappings = {
             "model.embed_tokens.weight": WeightMapping(
-                target_path="transformer.embed_tokens.embedding",
+                target_path="model.embed_tokens.embedding",
                 sharding=(None, None),
                 transpose=False,
             ),
             "model.norm.weight": WeightMapping(
-                target_path="transformer.norm.scale", sharding=(None,), transpose=False
+                target_path="model.norm.scale", sharding=(None,), transpose=False
             ),
         }
 
@@ -428,7 +428,7 @@ class LlamaForCausalLM(nnx.Module):
 
     def _create_layer_mappings(self, layer_idx: int) -> dict:
         prefix = f"model.layers.{layer_idx}"
-        target_prefix = f"transformer.layers.{layer_idx}"
+        target_prefix = f"model.layers.{layer_idx}"
 
         mappings = {
             f"{prefix}.input_layernorm.weight": WeightMapping(
@@ -525,14 +525,14 @@ class LlamaForCausalLM(nnx.Module):
         token_to_kv_pool: KVCache,
         logits_metadata: LogitsMetadata,
     ):
-        hidden_states, layers_kv_fused, layers_callback_flag = self.transformer(
+        hidden_states, layers_kv_fused, layers_callback_flag = self.model(
             forward_batch, token_to_kv_pool
         )
         if not getattr(self.config, "tie_word_embeddings", True):
             output = self.logits_processor(hidden_states, self.lm_head, logits_metadata)
         else:
             output = self.logits_processor(
-                hidden_states, self.transformer.embed_tokens, logits_metadata
+                hidden_states, self.model.embed_tokens, logits_metadata
             )
         return output, layers_kv_fused, layers_callback_flag
 

@@ -190,5 +190,16 @@ class ModelWorkerClient:
     def run_precompile(self):
         self.worker.run_precompile(self.future_token_ids_map)
 
+    @property
+    def sliding_window_size(self) -> int | None:
+        return self.worker.sliding_window_size
+
+    @property
+    def is_hybrid(self) -> bool:
+        return self.worker.is_hybrid
+
+    def get_tokens_per_layer_info(self):
+        return self.worker.get_tokens_per_layer_info()
+
     def __delete__(self):
         self.input_queue.put((None, None, None, None))
