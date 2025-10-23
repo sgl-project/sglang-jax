@@ -1063,7 +1063,6 @@ class ScheduleBatch:
         real_bs = len(seq_lens_cpu)
         req_pool_indices_cpu = self.req_pool_indices
         token_indices_with_all_reqs = self.req_to_token_pool.req_to_token[self.req_pool_indices]
-
         # padding seq
         # extend & decode: input_ids, positions, out_cache_loc, cache_loc
         padding_size = 0
@@ -1165,8 +1164,13 @@ class ScheduleBatch:
                 bs_padding_size = size - len(seq_lens_cpu)
                 select_bs_index = i
                 break
-
         cache_loc_flat = np.array([], dtype=np.int32)
+        if not self.spec_algorithm.is_none():
+            if self.forward_mode == ForwardMode.TARGET_VERIFY:
+                seq_lens_cpu = seq_lens_cpu + self.spec_info.draft_token_num
+            elif self.forward_mode == ForwardMode.DECODE:
+                seq_lens_cpu = seq_lens_cpu + self.spec_info.topk_p.shape[1]
+
         if len(seq_lens_cpu) > 0:
             # Filter out empty sequences
             valid_mask = seq_lens_cpu > 0
@@ -1186,6 +1190,7 @@ class ScheduleBatch:
                 for i, (seq_idx, seq_len, aligned_len) in enumerate(
                     zip(valid_indices, valid_seq_lens, aligned_lengths)
                 ):
+
                     # Copy the actual data
                     cache_loc_flat[offset : offset + seq_len] = token_indices_with_all_reqs[
                         seq_idx, :seq_len

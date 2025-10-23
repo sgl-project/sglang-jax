@@ -1,5 +1,3 @@
-from typing import Tuple
-
 import jax
 import jax.numpy as jnp
 
@@ -15,18 +13,14 @@ def create_extend_after_decode_spec_info(
 
     def compute_position_updates():
         bs = seq_lens.shape[0]
-        total_positions = jnp.sum(accept_lens)
+        # total_positions = jnp.sum(accept_lens)
 
         batch_ids = jnp.repeat(jnp.arange(bs), accept_lens)
-        within_batch_offsets = jnp.concatenate(
-            [jnp.arange(accept_lens[i]) for i in range(bs)]
-        )
+        within_batch_offsets = jnp.concatenate([jnp.arange(accept_lens[i]) for i in range(bs)])
 
         position_indices = accept_lens_cumsum[batch_ids] + within_batch_offsets
 
-        position_values = (
-            seq_lens[batch_ids] - accept_lens[batch_ids] + within_batch_offsets
-        )
+        position_values = seq_lens[batch_ids] - accept_lens[batch_ids] + within_batch_offsets
 
         return position_indices, position_values
 
@@ -57,9 +51,7 @@ def assign_req_to_token_pool(
         out_cache_loc_start = out_cache_loc_start_positions[i]
         req_to_token_pool.write(
             (req_pool_indices[i], slice(start_offsets[i], end_offsets[i])),
-            out_cache_loc[
-                out_cache_loc_start : out_cache_loc_start + out_cache_lens[i]
-            ],
+            out_cache_loc[out_cache_loc_start : out_cache_loc_start + out_cache_lens[i]],
         )
 
 
@@ -101,15 +93,11 @@ def verify_tree_greedy(
             while cur_index != -1:
                 draft_index = retrive_index[bid, cur_index]
                 draft_token_id = candidates[bid, cur_index]
-                target_token_id = target_predict[last_accepted_retrive_idx]
-                if False:
-                    predicts = predicts.at[last_accepted_retrive_idx].set(
-                        target_token_id
-                    )
+                target_token_id = target_predict[bid, last_accepted_retrive_idx]
+                if draft_token_id == target_token_id:
+                    predicts = predicts.at[last_accepted_retrive_idx].set(target_token_id)
                     num_accepted_tokens += 1
-                    accept_index = accept_index.at[bid, num_accepted_tokens].set(
-                        draft_index
-                    )
+                    accept_index = accept_index.at[bid, num_accepted_tokens].set(draft_index)
                     last_accepted_retrive_idx = draft_index
                     break
                 else:
@@ -255,22 +243,15 @@ def tree_speculative_sampling_target_only(
                 draft_token_id = candidates[bid, cur_index]
                 target_prob_single = target_probs[cur_prob_offset, draft_token_id]
                 prob_acc += target_prob_single
-                if (
-                    coin <= prob_acc / threshold_acc
-                    or target_prob_single >= threshold_single
-                ):
+                if coin <= prob_acc / threshold_acc or target_prob_single >= threshold_single:
                     # accept token
                     # reset prob_acc
                     prob_acc = jnp.array(0, dtype=dtype)
                     cur_prob_offset = bid * num_draft_tokens + cur_index
                     coin = uniform_samples[bid, cur_index]
-                    predicts = predicts.at[last_accepted_retrive_idx].set(
-                        draft_token_id
-                    )
+                    predicts = predicts.at[last_accepted_retrive_idx].set(draft_token_id)
                     num_accepted_tokens += 1
-                    accept_index = accept_index.at[bid, num_accepted_tokens].set(
-                        draft_index
-                    )
+                    accept_index = accept_index.at[bid, num_accepted_tokens].set(draft_index)
                     last_accepted_retrive_idx = draft_index
                     break
                 else:
@@ -308,9 +289,7 @@ def align_evict_mask_to_page_size(
     num_draft_tokens,
 ) -> jax.Array:
     for i, seq_len in enumerate(seq_lens):
-        evict_draft_token_mask = evict_mask[
-            i * num_draft_tokens : (i + 1) * num_draft_tokens
-        ]
+        evict_draft_token_mask = evict_mask[i * num_draft_tokens : (i + 1) * num_draft_tokens]
         evict_num = jnp.sum(evict_draft_token_mask)
         accept_num = num_draft_tokens - evict_num
         start = (seq_len + accept_num - 1) // page_size * page_size - seq_len
@@ -325,8 +304,8 @@ def get_target_cache_loc(
     to_free_num_slots: jnp.array,
     out_cache_loc: jnp.array,
     num_verify_tokens: int,
-) -> Tuple[jnp.array, jnp.array]:
-    batch_size = accept_length.shape[0]
+) -> tuple[jnp.array, jnp.array]:
+    # batch_size = accept_length.shape[0]
 
     # process accepted token
     copy_lens_accepted = accept_length + 1
@@ -338,9 +317,7 @@ def get_target_cache_loc(
     accepted_mask = token_indices < copy_lens_accepted[:, None]
 
     # select accepted position with mask matrix
-    accepted_positions = jnp.where(
-        accepted_mask, out_cache_loc[:, :max_accepted_len], -1  # 填充值
-    )
+    accepted_positions = jnp.where(accepted_mask, out_cache_loc[:, :max_accepted_len], -1)  # 填充值
 
     # remove padding
     tgt_cache_loc = accepted_positions.flatten()
@@ -374,39 +351,26 @@ def filter_finished_cache_loc_kernel(
     max_length = jnp.max(accept_length_filter)
 
     if max_length == 0:
-        # 如果所有batch都已完成，返回空数组
         return jnp.array([], dtype=tgt_cache_loc.dtype)
 
-    # 计算源和目标的起始位置
-    accept_length_cumsum = jnp.cumsum(
-        jnp.concatenate([jnp.array([0]), accept_length[:-1]])
-    )
+    accept_length_cumsum = jnp.cumsum(jnp.concatenate([jnp.array([0]), accept_length[:-1]]))
     old_starts = accept_length_cumsum + jnp.arange(batch_size)
-    new_starts = jnp.cumsum(
-        jnp.concatenate([jnp.array([0]), accept_length_filter[:-1]])
-    )
+    # new_starts = jnp.cumsum(jnp.concatenate([jnp.array([0]), accept_length_filter[:-1]]))
 
-    # 创建索引矩阵
-    batch_indices = jnp.arange(batch_size)[:, None]  # [batch_size, 1]
+    # batch_indices = jnp.arange(batch_size)[:, None]  # [batch_size, 1]
     token_indices = jnp.arange(max_length)[None, :]  # [1, max_length]
 
-    # 计算源索引
     source_indices = old_starts[:, None] + token_indices  # [batch_size, max_length]
 
-    # 创建有效性掩码
     # [batch_size, max_length]
     valid_mask = token_indices < accept_length_filter[:, None]
 
-    # 安全的索引访问（确保不超出边界）
     source_indices = jnp.clip(source_indices, 0, tgt_cache_loc.shape[0] - 1)
 
-    # 从源数组获取数据
     gathered_data = tgt_cache_loc[source_indices]  # [batch_size, max_length]
 
-    # 应用掩码，无效位置设为特殊值
     masked_data = jnp.where(valid_mask, gathered_data, -1)
 
-    # 展平并移除无效元素
     flattened = masked_data.flatten()
     output_data = flattened[flattened != -1]
 

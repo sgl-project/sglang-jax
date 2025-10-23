@@ -134,9 +134,7 @@ class Scheduler(
         self.max_seq_len = server_args.max_seq_len
         self.page_size = server_args.page_size
         self.enable_overlap = not server_args.disable_overlap_schedule
-        self.spec_algorithm = SpeculativeAlgorithm.from_string(
-            server_args.speculative_algorithm
-        )
+        self.spec_algorithm = SpeculativeAlgorithm.from_string(server_args.speculative_algorithm)
         # Init inter-process communication
         context = zmq.Context(2)
 
@@ -409,7 +407,7 @@ class Scheduler(
                 self.process_batch_result(batch, result)
             else:
                 # When the server is idle, do self-check and re-init some states
-                self.check_memory()
+                # self.check_memory()
                 self.check_tree_cache()
                 self.new_token_ratio = self.init_new_token_ratio
 
@@ -908,12 +906,16 @@ class Scheduler(
                     model_worker_batch, self.tp_worker.get_model_runner()
                 )
                 logits_output, next_token_ids, cache_miss_count = (
-                    self.tp_worker.forward_batch_generation(model_worker_batch, sampling_metadata=None)
+                    self.tp_worker.forward_batch_generation(
+                        model_worker_batch, sampling_metadata=None
+                    )
                 )
                 next_token_ids = next_token_ids[: model_worker_batch.real_bs]
             else:
                 logits_output, next_token_ids_device, cache_miss_count = (
-                    self.tp_worker.forward_batch_generation(model_worker_batch, sampling_metadata=None)
+                    self.tp_worker.forward_batch_generation(
+                        model_worker_batch, sampling_metadata=None
+                    )
                 )
                 next_token_ids = np.array(jax.device_get(next_token_ids_device))[
                     : model_worker_batch.real_bs

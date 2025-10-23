@@ -1,6 +1,5 @@
 import logging
 from dataclasses import dataclass
-from typing import Tuple
 
 import jax
 import jax.numpy as jnp
@@ -97,9 +96,7 @@ class FlashAttentionBackend(AttentionBackend):
         self.forward_metadata = nnx.data(FlashAttentionMetadata())
         self.mesh = mesh
 
-    def get_forward_metadata(
-        self, batch: ModelWorkerBatch, speculative_step_id: int = 0
-    ):
+    def get_forward_metadata(self, batch: ModelWorkerBatch, speculative_step_id: int = 0):
         """Return the metadata for a forward pass."""
         metadata = FlashAttentionMetadata()
 
@@ -158,12 +155,7 @@ class FlashAttentionBackend(AttentionBackend):
                 assert batch.spec_info is not None, f"batch {batch}"
                 logger.info("batch.spec_info.draft_token_num")
                 aligned_seq_lens = (
-                    (
-                        batch.seq_lens
-                        + batch.spec_info.draft_token_num
-                        + self.page_size
-                        - 1
-                    )
+                    (batch.seq_lens + batch.spec_info.draft_token_num + self.page_size - 1)
                     // self.page_size
                 ) * self.page_size
             elif isinstance(batch.spec_info, EagleDraftInput):
@@ -265,7 +257,7 @@ class FlashAttentionBackend(AttentionBackend):
         kv_cache_fused_paged = kv_cache_fused.reshape(num_pages, self.page_size, -1, self.head_dim)
 
         causal = 1
-        custom_mask = self.forward_metadata.custom_mask
+        # custom_mask = self.forward_metadata.custom_mask
         if forward_batch.forward_mode == ForwardMode.TARGET_VERIFY:
             causal = 0
         in_specs = (
