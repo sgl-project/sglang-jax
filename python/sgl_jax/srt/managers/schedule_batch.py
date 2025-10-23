@@ -981,6 +981,7 @@ class ScheduleBatch:
         # TODO: uniform data type in scheduler batch
         if isinstance(self.seq_lens, jax.Array):
             self.seq_lens = np.array(self.seq_lens)
+            self.output_ids = np.array(self.output_ids)
         self.seq_lens = self.seq_lens[keep_indices]
         self.out_cache_loc = None
         self.seq_lens_sum = self.seq_lens.sum().item()

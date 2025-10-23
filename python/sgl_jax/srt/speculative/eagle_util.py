@@ -842,13 +842,12 @@ class EagleVerifyInput:
             )
         else:
             if page_size == 1 or self.topk == 1:
-                batch.out_cache_loc = batch.out_cache_loc[accept_index]
                 assign_req_to_token_pool(
                     batch.req_pool_indices,
                     batch.req_to_token_pool,
                     batch.seq_lens,
                     batch.seq_lens + accept_length + 1,
-                    batch.out_cache_loc,
+                    batch.out_cache_loc[accept_index],
                 )
                 batch.seq_lens = batch.seq_lens + (accept_length + 1)
 
