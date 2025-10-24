@@ -188,7 +188,9 @@ class Scheduler(
 
         # init distribution
         if self.nnodes > 1:
-            jax.distributed.initialize(server_args.dist_init_addr, self.nnodes, self.node_rank)
+            jax.distributed.initialize(
+                server_args.dist_init_addr, self.nnodes, self.node_rank, [0, 1, 2]
+            )
         self.mesh = create_device_mesh(
             ici_parallelism=[-1, self.tp_size, 1], dcn_parallelism=[1, 1, 1]
         )
