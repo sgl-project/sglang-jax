@@ -482,7 +482,7 @@ class Qwen3MoeForCausalLM(nnx.Module):
         else:
             mappings[f"{prefix}.mlp.gate.weight"] = WeightMapping(
                 target_path=f"{target_prefix}.moe_gate.kernel",
-                sharding=(None, ("data", "tensor")),
+                sharding=(None, None),
                 transpose=True,
             )
 
