@@ -215,7 +215,7 @@ class WeightLoader:
 
         if mapping.kv_head_padding:
             processed_weight = self._apply_kv_head_padding(processed_weight, hf_key)
-
+        print(f"hf key: {hf_key}")
         sharded_weight = self._shard_weight(processed_weight, mapping.sharding)
 
         try:
