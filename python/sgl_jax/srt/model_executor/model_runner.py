@@ -75,6 +75,7 @@ class ModelRunner:
         self.rngs = rngs
 
         self.tp_size = tp_size
+        self.ep_size = server_args.ep_size
         self.server_args = server_args
         self.is_generation = model_config.is_generation
         self.page_size = server_args.page_size
@@ -203,6 +204,7 @@ class ModelRunner:
         self.model_config.validate_tensor_parallel_config(self.tp_size)
         self.model_config.configure_for_tensor_parallel(self.tp_size)
         self.model_config.log_kv_heads_info(self.tp_size)
+        self.model_config.hf_config.ep_size = self.ep_size
 
         self.model = self.model_loader.load_model(
             model_config=self.model_config,
