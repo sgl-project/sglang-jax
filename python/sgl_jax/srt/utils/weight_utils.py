@@ -100,7 +100,7 @@ class WeightLoader:
             else:
                 regular_mappings[key] = mapping
 
-        expert_weights = {}
+        moe_buffer = {}
 
         logger.info(
             "WeightLoader: Will load layers 0 to %s",
@@ -112,23 +112,70 @@ class WeightLoader:
                 mapping = regular_mappings[hf_key]
                 if isinstance(mapping, (str, list)):
                     mapping = WeightMapping(target_path=mapping)
-
                 self._process_and_assign_weight(params, hf_key, hf_weight, mapping)
             elif "mlp.experts." in hf_key and hf_key.endswith(".weight"):
                 if self._is_excluded_layer_weight(hf_key):
                     logger.debug("Skipping excluded MoE expert weight: %s", hf_key)
-                else:
-                    expert_weights[hf_key] = hf_weight
+                    continue
+
+                assigned = False
+                for moe_key, mapping in moe_mappings.items():
+                    expected_hf_keys = mapping.target_path[1:]  # list of expected HF keys
+                    if hf_key in expected_hf_keys:
+                        if moe_key not in moe_buffer:
+                            moe_buffer[moe_key] = {}
+                        moe_buffer[moe_key][hf_key] = hf_weight
+                        assigned = True
+
+                        if len(moe_buffer[moe_key]) == len(expected_hf_keys):
+                            self._process_single_moe_group(
+                                params, moe_key, mapping, moe_buffer[moe_key]
+                            )
+                            del moe_buffer[moe_key]  # free memory
+                        break
+
+                if not assigned:
+                    logger.warning("MoE expert weight not assigned to any mapping: %s", hf_key)
             else:
                 if self._is_excluded_layer_weight(hf_key):
                     logger.debug("Skipping excluded layer weight: %s", hf_key)
                 else:
                     logger.warning("No mapping found for weight: %s", hf_key)
+
+        if moe_buffer:
+            for moe_key in moe_buffer:
+                expected = len(moe_mappings[moe_key].target_path[1:])
+                got = len(moe_buffer[moe_key])
+                logger.error(
+                    "MoE group %s incomplete: %s/%s weights loaded", moe_key, got, expected
+                )
+            raise RuntimeError("Incomplete MoE expert weights detected.")
+
         nnx.update(self.model, params)
 
-        if moe_mappings:
-            self._process_moe_expert_weights(params, moe_mappings, expert_weights)
-            nnx.update(self.model, params)
+    def _process_single_moe_group(
+        self,
+        params: nnx.State,
+        moe_key: str,
+        mapping: WeightMapping,
+        expert_weights_dict: dict[str, jax.Array],
+    ):
+        target_path = mapping.target_path[0]
+        expected_hf_keys = mapping.target_path[1:]
+
+        collected_weights = []
+        for hf_key in expected_hf_keys:
+            weight = expert_weights_dict[hf_key]
+            if mapping.transpose and not hf_key.endswith(".bias"):
+                weight = jnp.transpose(weight, (1, 0))
+            collected_weights.append(weight)
+
+        stacked_weight = jnp.stack(collected_weights, axis=0)  # (num_experts, ...)
+        sharded_weight = self._shard_weight(stacked_weight, mapping.sharding)
+        model_param = self._get_param(params, target_path)
+        model_param.value = sharded_weight.astype(model_param.value.dtype)
+
+        logger.debug("Assigned MoE group %s, shape: %s", moe_key, stacked_weight.shape)
 
     def _iterate_weights(self):
         model_path = self.model_config.model_path
@@ -432,7 +479,6 @@ class WeightLoader:
 
     def _apply_kv_head_padding(self, weight: jax.Array, hf_key: str) -> jax.Array:
         """Apply KV head padding/replication when tp_size > total_kv_heads."""
-        # Only apply when dealing with KV projections and replication is needed
         if any(
             proj in hf_key for proj in ["k_proj", "v_proj"]
         ) and self.model_config.needs_kv_head_replication(self.sharding_size):
@@ -441,58 +487,39 @@ class WeightLoader:
             padding_strategy = self.model_config.get_kv_padding_strategy()
 
             if padding_strategy == "replicate":
-                # GQA models: replicate existing KV heads to maintain attention semantics
                 if hf_key.endswith(".bias"):
-                    # For bias: replicate each original head
                     replicated_bias_parts = []
-
                     for original_head_id in range(total_kv_heads):
                         start_idx = original_head_id * self.head_dim
                         end_idx = (original_head_id + 1) * self.head_dim
                         original_head_bias = weight[start_idx:end_idx]
-
-                        # Replicate this head for all its assigned devices
                         for _ in range(num_replicas):
                             replicated_bias_parts.append(original_head_bias)
-
-                    # Concatenate all replicated parts
                     weight = jnp.concatenate(replicated_bias_parts, axis=0)
                 else:
-                    # For weight matrix: replicate each original head
                     replicated_weight_parts = []
-
                     for original_head_id in range(total_kv_heads):
                         start_idx = original_head_id * self.head_dim
                         end_idx = (original_head_id + 1) * self.head_dim
                         original_head_weight = weight[:, start_idx:end_idx]
-
-                        # Replicate this head for all its assigned devices
                         for _ in range(num_replicas):
                             replicated_weight_parts.append(original_head_weight)
-
-                    # Concatenate all replicated parts along head dimension
                     weight = jnp.concatenate(replicated_weight_parts, axis=1)
-
             elif padding_strategy == "zero":
-                # MHA models: zero padding since all heads are equivalent
                 target_heads = total_kv_heads * num_replicas
                 target_size = target_heads * self.head_dim
-
                 if hf_key.endswith(".bias"):
                     current_size = weight.shape[0]
                     padding_size = target_size - current_size
-
                     if padding_size > 0:
                         padding = jnp.zeros((padding_size,), dtype=weight.dtype)
                         weight = jnp.concatenate([weight, padding], axis=0)
                 else:
                     current_size = weight.shape[1]
                     padding_size = target_size - current_size
-
                     if padding_size > 0:
                         padding = jnp.zeros((weight.shape[0], padding_size), dtype=weight.dtype)
                         weight = jnp.concatenate([weight, padding], axis=1)
-
         return weight
 
     def _is_excluded_layer_weight(self, hf_key: str) -> bool:
@@ -504,54 +531,4 @@ class WeightLoader:
             return False
 
         layer_num = int(parts[2])
-
-        is_excluded = layer_num >= self.model_config.num_hidden_layers
-
-        if is_excluded and not hasattr(self, "_debug_count"):
-            logger.info(
-                "DEBUG: Excluding layer %s >= %s",
-                layer_num,
-                self.model_config.num_hidden_layers,
-            )
-            self._debug_count = True
-
-        return is_excluded
-
-    def _process_moe_expert_weights(
-        self,
-        params: nnx.State,
-        moe_mappings: dict[str, WeightMapping],
-        expert_weights: dict[str, jax.Array],
-    ):
-        with tqdm(moe_mappings.items(), desc="[STACKING] MOE EXPERTS", unit="layer") as pbar:
-            for moe_key, mapping in pbar:
-                layer_name = moe_key.replace("__MOE_EXPERTS__", "")
-                pbar.set_postfix({"layer": layer_name})
-
-                if not isinstance(mapping.target_path, list) or len(mapping.target_path) < 2:
-                    logger.warning("Invalid MoE mapping for %s", moe_key)
-                    continue
-
-                target_path = mapping.target_path[0]
-                expert_keys = mapping.target_path[1:]
-
-                collected_weights = []
-                for expert_key in expert_keys:
-                    if expert_key in expert_weights:
-                        weight = expert_weights[expert_key]
-                        if mapping.transpose and not expert_key.endswith(".bias"):
-                            weight = jnp.transpose(weight, (1, 0))
-                        collected_weights.append(weight)
-                    else:
-                        logger.warning("Missing expert weight: %s", expert_key)
-
-                if len(collected_weights) == len(expert_keys):
-                    stacked_weight = jnp.stack(collected_weights, axis=0)
-
-                    device_experts = stacked_weight
-
-                    sharded_weight = self._shard_weight(device_experts, mapping.sharding)
-                    model_param = self._get_param(params, target_path)
-                    model_param.value = sharded_weight.astype(model_param.value.dtype)
-                else:
-                    logger.error("Could not collect all expert weights for %s", target_path)
+        return layer_num >= self.model_config.num_hidden_layers
