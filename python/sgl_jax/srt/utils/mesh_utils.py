@@ -15,7 +15,7 @@ def create_device_mesh(
     """Create a device mesh"""
     if devices is None:
         devices = jax.devices()
-
+    devices = devices[:48]
     ici_parallelism = fill_unspecified_parallelism(ici_parallelism, len(devices))
     if num_slices > 1:
         dcn_parallelism = fill_unspecified_parallelism(dcn_parallelism, num_slices)
