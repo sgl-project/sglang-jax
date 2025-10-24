@@ -291,14 +291,14 @@ TUNED_BLOCK_SIZES = {
         ("bfloat16", "bfloat16", 16, 2, 128, 128, 2): (32, 16),
         ("bfloat16", "bfloat16", 16, 2, 128, 128, 4): (4, 1),
         ("bfloat16", "bfloat16", 16, 2, 128, 128, 8): (16, 8),
-        ("bfloat16", "bfloat16", 16, 2, 128, 128, 16): (32, 1),
+        ("bfloat16", "bfloat16", 16, 2, 128, 128, 16): (32, 16),
         ("bfloat16", "bfloat16", 16, 2, 128, 128, 32): (16, 4),
-        ("bfloat16", "bfloat16", 16, 2, 128, 128, 64): (16, 1),
-        ("bfloat16", "bfloat16", 16, 2, 128, 128, 128): (16, 1),
-        ("bfloat16", "bfloat16", 16, 2, 128, 128, 256): (16, 1),
+        ("bfloat16", "bfloat16", 16, 2, 128, 128, 64): (16, 16),
+        ("bfloat16", "bfloat16", 16, 2, 128, 128, 128): (16, 16),
+        ("bfloat16", "bfloat16", 16, 2, 128, 128, 256): (16, 16),
         ("bfloat16", "bfloat16", 16, 2, 128, 128, 512): (4, 128),
         ("bfloat16", "bfloat16", 16, 2, 128, 128, 1024): (8, 64),
-        ("bfloat16", "bfloat16", 16, 2, 128, 128, 2048): (16, 128),
+        ("bfloat16", "bfloat16", 16, 2, 128, 128, 2048): (8, 128),
         ("bfloat16", "bfloat16", 16, 2, 128, 128, 4096): (16, 128),
         ("bfloat16", "bfloat16", 16, 2, 128, 128, 8192): (16, 128),
         ("bfloat16", "bfloat16", 16, 2, 128, 256, 1): (2, 8),
@@ -651,6 +651,34 @@ TUNED_BLOCK_SIZES = {
         ("bfloat16", "bfloat16", 32, 32, 128, 256, 2048): (1, 64),
         ("bfloat16", "bfloat16", 32, 32, 128, 256, 4096): (2, 64),
         ("bfloat16", "bfloat16", 32, 32, 128, 256, 8192): (2, 64),
+        ("bfloat16", "bfloat16", 64, 8, 128, 64, 1): (16, 16),
+        ("bfloat16", "bfloat16", 64, 8, 128, 64, 2): (16, 16),
+        ("bfloat16", "bfloat16", 64, 8, 128, 64, 4): (16, 16),
+        ("bfloat16", "bfloat16", 64, 8, 128, 64, 8): (16, 16),
+        ("bfloat16", "bfloat16", 64, 8, 128, 64, 16): (16, 16),
+        ("bfloat16", "bfloat16", 64, 8, 128, 64, 32): (16, 16),
+        ("bfloat16", "bfloat16", 64, 8, 128, 64, 64): (16, 16),
+        ("bfloat16", "bfloat16", 64, 8, 128, 64, 128): (16, 16),
+        ("bfloat16", "bfloat16", 64, 8, 128, 64, 256): (16, 16),
+        ("bfloat16", "bfloat16", 64, 8, 128, 64, 512): (16, 16),
+        ("bfloat16", "bfloat16", 64, 8, 128, 64, 1024): (16, 16),
+        ("bfloat16", "bfloat16", 64, 8, 128, 64, 2048): (16, 16),
+        ("bfloat16", "bfloat16", 64, 8, 128, 64, 4096): (16, 8),
+        ("bfloat16", "bfloat16", 64, 8, 128, 64, 8192): (16, 8),
+        ("bfloat16", "bfloat16", 64, 8, 128, 128, 1): (16, 16),
+        ("bfloat16", "bfloat16", 64, 8, 128, 128, 2): (16, 16),
+        ("bfloat16", "bfloat16", 64, 8, 128, 128, 4): (16, 16),
+        ("bfloat16", "bfloat16", 64, 8, 128, 128, 8): (16, 16),
+        ("bfloat16", "bfloat16", 64, 8, 128, 128, 16): (16, 16),
+        ("bfloat16", "bfloat16", 64, 8, 128, 128, 32): (16, 16),
+        ("bfloat16", "bfloat16", 64, 8, 128, 128, 64): (16, 16),
+        ("bfloat16", "bfloat16", 64, 8, 128, 128, 128): (16, 16),
+        ("bfloat16", "bfloat16", 64, 8, 128, 128, 256): (16, 16),
+        ("bfloat16", "bfloat16", 64, 8, 128, 128, 512): (16, 16),
+        ("bfloat16", "bfloat16", 64, 8, 128, 128, 1024): (16, 16),
+        ("bfloat16", "bfloat16", 64, 8, 128, 128, 2048): (16, 16),
+        ("bfloat16", "bfloat16", 64, 8, 128, 128, 4096): (16, 8),
+        ("bfloat16", "bfloat16", 64, 8, 128, 128, 8192): (16, 8),
     },
 }
 
@@ -688,8 +716,13 @@ def get_tuned_block_sizes(
         # TPUv4 has much smaller VMEM size so we pick fixed block sizes.
         bkv_p, bq = (512 // page_size, 32)
     else:
-        if device_name in TUNED_BLOCK_SIZES and keys in TUNED_BLOCK_SIZES[device_name]:
-            bkv_p, bq = TUNED_BLOCK_SIZES[device_name][keys]
+        if device_name in TUNED_BLOCK_SIZES and keys[1:] in TUNED_BLOCK_SIZES[device_name]:
+            bkv_p, bq = TUNED_BLOCK_SIZES[device_name][keys[1:]]
+
+    # if bkv_p != 16 or bq != 16:
+    #     raise ValueError(
+    #         f"Invalid block sizes: {keys=}, {bkv_p=}, {bq=}. Please check {page_size=}, {actual_num_q_heads=}, {actual_num_kv_heads=}, {head_dim=}, {max_num_tokens=}, {pages_per_seq=}"
+    #     )
 
     return (min(pages_per_seq, bkv_p), min(max_num_tokens, bq))
 
