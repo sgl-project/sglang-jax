@@ -6,7 +6,7 @@ import jax.numpy as jnp
 import numpy as np
 from flax import nnx
 
-from sgl_jax.srt.layers.moe import EPMoE, FusedMoE
+from sgl_jax.srt.layers.moe import EPMoE, FusedMoE, TopK
 
 
 class TestFusedMoe(unittest.TestCase):
@@ -26,19 +26,19 @@ class TestFusedMoe(unittest.TestCase):
         config.hidden_size = 128
 
         with jax.sharding.use_mesh(self.mesh):
+            num_experts_per_topk = 2
+            std_topk = TopK(topk=num_experts_per_topk, renormalize=True)
             src_layer = FusedMoE(
                 config=config,
                 num_experts=8,
-                num_experts_per_tok=2,
+                num_experts_per_tok=num_experts_per_topk,
                 mesh=self.mesh,
-                rngs=nnx.Rngs(default=0),
             )
             std_layer = EPMoE(
                 config=config,
                 num_experts=8,
-                num_experts_per_tok=2,
+                num_experts_per_tok=num_experts_per_topk,
                 mesh=self.mesh,
-                rngs=nnx.Rngs(default=0),
                 expert_parallel_size=1,
             )
             src_layer.wi_0.value = std_layer.wi_0.value
@@ -60,10 +60,12 @@ class TestFusedMoe(unittest.TestCase):
             nnx.update(std_layer, std_layer_state)
 
             router_logits = jax.random.normal(self.rng_key, shape=(10, 128, 8), dtype=jnp.float32)
+            topk_weights, topk_ids = std_topk(router_logits)
+
             inputs = jax.random.normal(self.rng_key, shape=(10, 128), dtype=jnp.float32)
 
-            std_output = std_layer(inputs, router_logits)
-            src_output = src_layer(inputs, router_logits)
+            std_output = std_layer(inputs, topk_weights, topk_ids)
+            src_output = src_layer(inputs, topk_weights, topk_ids)
 
         print(src_output)
         print(std_output)
