@@ -2,6 +2,7 @@ from collections.abc import Iterable, Sequence
 
 import jax
 from flax import nnx
+from jax import lax
 from jax import numpy as jnp
 
 
@@ -41,6 +42,7 @@ class LinearBase(nnx.Module):
     ):
         """Initialize parameters and quantization method."""
         self.skip_bias_add = skip_bias_add
+        self.params_dtype = params_dtype
         self.weight = nnx.Param(
             nnx.with_partitioning(nnx.initializers.normal(), kernel_axes)(
                 jax.random.PRNGKey(0), (input_size, output_size), params_dtype
@@ -59,7 +61,12 @@ class LinearBase(nnx.Module):
         """Forward pass of the linear layer."""
         bias = self.bias if not self.skip_bias_add else None
         # Access the underlying JAX array using .value property
-        output = jnp.dot(x, self.weight.value)
+        output = lax.dot_general(
+            x,
+            self.weight.value,
+            (((x.ndim - 1,), (0,)), ((), ())),
+            preferred_element_type=self.params_dtype,
+        )
         if bias is not None:
             output = output + bias.value
         output_bias = self.bias if self.skip_bias_add else None
