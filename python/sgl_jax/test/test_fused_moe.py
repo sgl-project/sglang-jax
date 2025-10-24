@@ -31,7 +31,6 @@ class TestFusedMoe(unittest.TestCase):
             src_layer = FusedMoE(
                 config=config,
                 num_experts=8,
-                num_experts_per_tok=num_experts_per_topk,
                 mesh=self.mesh,
             )
             std_layer = EPMoE(

@@ -212,7 +212,6 @@ class QWen3MoeDecoderLayer(nnx.Module):
                     self.mlp = FusedMoE(
                         config=config,
                         num_experts=num_experts,
-                        num_experts_per_tok=num_experts_per_tok,
                         intermediate_dim=moe_intermediate_size,
                         weight_dtype=dtype,
                         dtype=dtype,

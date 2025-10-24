@@ -516,18 +516,15 @@ class FusedMoE(nnx.Module):
         self,
         config,
         num_experts: int,
-        num_experts_per_tok: int,
         intermediate_dim: int = 2048,
         weight_dtype: jnp.dtype = jnp.bfloat16,
         dtype: jnp.dtype = jnp.bfloat16,
         layer_id: int = 0,
-        activation: str = "gelu",
         *,
         mesh: Mesh,
     ):
         self.config = config
         self.num_experts = num_experts
-        self.num_experts_per_tok = num_experts_per_tok
         self.intermediate_dim = intermediate_dim
         self.weight_dtype = weight_dtype
         self.dtype = dtype
@@ -536,7 +533,6 @@ class FusedMoE(nnx.Module):
         self.tp_size = mesh.shape.get("data") * mesh.shape.get("tensor")
 
         self.mesh = mesh
-        self.activation = activation
 
         self.experts_per_device = num_experts
 
