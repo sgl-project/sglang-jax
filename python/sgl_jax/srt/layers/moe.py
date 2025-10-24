@@ -509,3 +509,93 @@ class EPMoE(nnx.Module):
             final_output = output.reshape(batch_size, seq_len, -1).astype(self.dtype)
 
         return final_output
+
+
+class FusedMoE(nnx.Module):
+    def __init__(
+        self,
+        config,
+        num_experts: int,
+        num_experts_per_tok: int,
+        intermediate_dim: int = 2048,
+        weight_dtype: jnp.dtype = jnp.bfloat16,
+        dtype: jnp.dtype = jnp.bfloat16,
+        layer_id: int = 0,
+        activation: str = "gelu",
+        *,
+        mesh: Mesh,
+    ):
+        self.config = config
+        self.num_experts = num_experts
+        self.num_experts_per_tok = num_experts_per_tok
+        self.intermediate_dim = intermediate_dim
+        self.weight_dtype = weight_dtype
+        self.dtype = dtype
+        self.layer_id = layer_id
+
+        self.tp_size = mesh.shape.get("data") * mesh.shape.get("tensor")
+
+        self.mesh = mesh
+        self.activation = activation
+
+        self.experts_per_device = num_experts
+
+        self.wi_sharding = (None, None, ("data", "tensor"))
+        self.wo_sharding = (None, ("data", "tensor"), None)
+
+        self.wi_0 = nnx.Param(
+            nnx.with_partitioning(nnx.initializers.normal(), self.wi_sharding)(
+                jax.random.PRNGKey(0),
+                (num_experts, config.hidden_size, intermediate_dim),
+                weight_dtype,
+            )
+        )
+
+        self.wi_1 = nnx.Param(
+            nnx.with_partitioning(nnx.initializers.normal(), self.wi_sharding)(
+                jax.random.PRNGKey(0),
+                (num_experts, config.hidden_size, intermediate_dim),
+                weight_dtype,
+            )
+        )
+
+        self.wo = nnx.Param(
+            nnx.with_partitioning(nnx.initializers.normal(), self.wo_sharding)(
+                jax.random.PRNGKey(0),
+                (num_experts, intermediate_dim, config.hidden_size),
+                weight_dtype,
+            )
+        )
+
+    def __call__(self, hidden_states, topk_weights, topk_ids):
+        inputs = hidden_states.astype(self.dtype)
+
+        if inputs.ndim == 2:
+            num_tokens = inputs.shape[0]
+            inputs_flat = inputs
+        else:
+            num_tokens = inputs.shape[0] * inputs.shape[1]
+            inputs_flat = inputs.reshape(num_tokens, -1)
+
+        expert_weights = jnp.zeros((num_tokens, self.num_experts), dtype=self.dtype)
+        token_indices = jnp.arange(num_tokens)[:, None]
+
+        top_k_indices_flat = topk_ids.reshape(num_tokens, -1)
+        top_k_weights_flat = topk_weights.reshape(num_tokens, -1)
+
+        expert_weights = expert_weights.at[token_indices, top_k_indices_flat].set(
+            top_k_weights_flat
+        )
+
+        all_wi_0 = self.wi_0.value
+        all_wi_1 = self.wi_1.value
+        all_wo = self.wo.value
+
+        layer_w0 = jnp.einsum("th,ehd->ted", inputs_flat, all_wi_0)
+        layer_w1 = jnp.einsum("th,ehd->ted", inputs_flat, all_wi_1)
+
+        activated = jax.nn.silu(layer_w0) * layer_w1
+        expert_outputs = jnp.einsum("ted,edh->teh", activated, all_wo)
+        final_output = jnp.einsum("te,teh->th", expert_weights, expert_outputs)
+
+        return final_output.reshape(inputs.shape).astype(self.dtype)

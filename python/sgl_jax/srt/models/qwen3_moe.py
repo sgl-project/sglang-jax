@@ -11,7 +11,7 @@ from sgl_jax.srt.layers.embeddings import Embed, ParallelLMHead, RotaryEmbedding
 from sgl_jax.srt.layers.layernorm import RMSNorm
 from sgl_jax.srt.layers.linear import LinearBase
 from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
-from sgl_jax.srt.layers.moe import EPMoE, GateLogit, TopK
+from sgl_jax.srt.layers.moe import FusedMoE, GateLogit, TopK
 from sgl_jax.srt.layers.radix_attention import RadixAttention
 from sgl_jax.srt.mem_cache.memory_pool import KVCache
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
@@ -185,7 +185,7 @@ class QWen3MoeDecoderLayer(nnx.Module):
             num_experts = getattr(config, "num_experts", 128)
             num_experts_per_tok = getattr(config, "num_experts_per_tok", 8)
             moe_intermediate_size = getattr(config, "moe_intermediate_size", 768)
-            expert_parallel_size = mesh.shape.get("data", 1) * mesh.shape.get("tensor", 1)
+            # expert_parallel_size = mesh.shape.get("data", 1) * mesh.shape.get("tensor", 1)
             self.topk = TopK(
                 topk=num_experts_per_tok,
                 renormalize=config.norm_topk_prob,
@@ -195,16 +195,14 @@ class QWen3MoeDecoderLayer(nnx.Module):
                 num_experts=num_experts,
             )
             with mesh:
-                self.mlp = EPMoE(
+                self.mlp = FusedMoE(
                     config=config,
                     num_experts=num_experts,
                     num_experts_per_tok=num_experts_per_tok,
                     intermediate_dim=moe_intermediate_size,
-                    mesh=mesh,
-                    expert_parallel_size=expert_parallel_size,
                     weight_dtype=dtype,
                     dtype=dtype,
-                    layer_id=layer_id,
+                    mesh=mesh,
                 )
             self.is_moe_layer = True
 
