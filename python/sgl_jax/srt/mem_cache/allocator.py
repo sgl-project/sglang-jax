@@ -127,6 +127,13 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def load_cpu_copy(self, kv_cache_cpu, indices):
         return self._kvcache.load_cpu_copy(kv_cache_cpu, indices)
 
+    def backup_state(self):
+        return (self.free_slots, self.release_pages)
+
+    def restore_state(self, state):
+        assert len(state) == 2
+        self.free_slots, self.release_pages = state
+
 
 class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def __init__(
