@@ -185,7 +185,6 @@ class QWen3MoeDecoderLayer(nnx.Module):
             num_experts = getattr(config, "num_experts", 128)
             num_experts_per_tok = getattr(config, "num_experts_per_tok", 8)
             moe_intermediate_size = getattr(config, "moe_intermediate_size", 768)
-            expert_parallel_size = mesh.shape.get("data", 1) * mesh.shape.get("tensor", 1)
             self.topk = TopK(
                 topk=num_experts_per_tok,
                 renormalize=config.norm_topk_prob,
@@ -501,7 +500,7 @@ class Qwen3MoeForCausalLM(nnx.Module):
         else:
             mappings[f"{prefix}.mlp.gate.weight"] = WeightMapping(
                 target_path=f"{target_prefix}.moe_gate.kernel",
-                sharding=(None, ("data", "tensor")),
+                sharding=(None, None),
                 transpose=True,
             )
 
@@ -512,13 +511,21 @@ class Qwen3MoeForCausalLM(nnx.Module):
                     "up_proj": "wi_1",
                     "down_proj": "wo",
                 }[expert_type]
+
                 expert_keys = [
                     f"{prefix}.mlp.experts.{i}.{expert_type}.weight" for i in range(num_experts)
                 ]
 
+                if self.config.ep_size > 1:
+                    sharding = (("data", "tensor"), None, None)
+                else:
+                    if expert_type == "down_proj":
+                        sharding = (None, ("data", "tensor"), None)
+                    else:
+                        sharding = (None, None, ("data", "tensor"))
                 mappings[f"__MOE_EXPERTS__{prefix}.mlp.{target_name}"] = WeightMapping(
                     target_path=[f"{target_prefix}.mlp.{target_name}"] + expert_keys,
-                    sharding=(("data", "tensor"), None, None),
+                    sharding=sharding,
                     transpose=True,
                 )
 
