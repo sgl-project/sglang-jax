@@ -75,9 +75,7 @@ class TestVerifyTree(CustomTestCase):
         )
 
         # Check the expected output.
-        self.assertEqual(
-            predicts.flatten().tolist(), [3, -1, -1, 4, 5, 18, 11, -1, -1, -1, 12, 18]
-        )
+        self.assertEqual(predicts.flatten().tolist(), [3, -1, -1, 4, 5, 18, 11, -1, -1, -1, 12, 18])
         self.assertEqual(accept_index.tolist(), [[0, 3, 4, 5], [6, 10, 11, -1]])
         self.assertEqual(accept_token_num.tolist(), [3, 2])
 
@@ -161,12 +159,10 @@ class TestVerifyTree(CustomTestCase):
             dtype=jnp.int32,
         )
 
-        expanded_temperature = jnp.expand_dims(
-            jnp.expand_dims(temperatures, axis=1), axis=1
+        expanded_temperature = jnp.expand_dims(jnp.expand_dims(temperatures, axis=1), axis=1)
+        target_probs = jax.nn.softmax(target_logits / expanded_temperature, axis=-1).reshape(
+            bs * num_draft_tokens, -1
         )
-        target_probs = jax.nn.softmax(
-            target_logits / expanded_temperature, axis=-1
-        ).reshape(bs * num_draft_tokens, -1)
         draft_probs = jnp.full_like(
             target_probs,
             0,
@@ -178,24 +174,21 @@ class TestVerifyTree(CustomTestCase):
         coins_for_final_sampling = jax.random.uniform(
             jax.random.PRNGKey(42), (bs,), dtype=jnp.float32
         )
-
-        accept_index, accept_token_num, predicts = (
-            tree_speculative_sampling_target_only(
-                predicts=predicts,
-                accept_index=accept_index,
-                accept_token_num=accept_token_num,
-                candidates=candidates,
-                retrive_index=retrive_index,
-                retrive_next_token=retrive_next_token,
-                retrive_next_sibling=retrive_next_sibling,
-                uniform_samples=coins,
-                uniform_samples_for_final_sampling=coins_for_final_sampling,
-                target_probs=target_probs,
-                draft_probs=draft_probs,
-                threshold_single=threshold_single,
-                threshold_acc=threshold_acc,
-                deterministic=True,
-            )
+        accept_index, accept_token_num, predicts = tree_speculative_sampling_target_only(
+            predicts=predicts,
+            accept_index=accept_index,
+            accept_token_num=accept_token_num,
+            candidates=candidates,
+            retrive_index=retrive_index,
+            retrive_next_token=retrive_next_token,
+            retrive_next_sibling=retrive_next_sibling,
+            uniform_samples=coins,
+            uniform_samples_for_final_sampling=coins_for_final_sampling,
+            target_probs=target_probs,
+            draft_probs=draft_probs,
+            threshold_single=threshold_single,
+            threshold_acc=threshold_acc,
+            deterministic=True,
         )
 
         self.assertEqual(

@@ -13,7 +13,6 @@ from flax import nnx
 from jax.tree_util import register_pytree_node_class
 
 from sgl_jax.srt.layers.logits_processor import LogitsProcessorOutput
-from sgl_jax.srt.layers.sampler import top_k_top_p_min_p_sampling_from_probs_jax
 from sgl_jax.srt.managers.schedule_batch import (
     ScheduleBatch,
     get_last_loc,
@@ -27,6 +26,8 @@ from sgl_jax.srt.speculative.pallas.kernel import (
     create_extend_after_decode_spec_info,
     filter_finished_cache_loc_kernel,
     get_target_cache_loc,
+    top_k_renorm_prob,
+    top_p_renorm_prob,
     tree_speculative_sampling_target_only,
     verify_tree_greedy,
 )
@@ -651,7 +652,6 @@ class EagleVerifyInput:
 
         if is_all_greedy:
             target_predict = jnp.argmax(logits_output.next_token_logits, axis=-1).flatten()
-            # target_predict = target_predict.reshape(bs, self.draft_token_num)
             accept_index, accept_length, predict = verify_tree_greedy(
                 predicts=predict,  # mutable
                 accept_index=accept_index,  # mutable
@@ -672,18 +672,17 @@ class EagleVerifyInput:
             target_probs = jax.nn.softmax(
                 logits_output.next_token_logits / expanded_temperature, axis=-1
             )  # (bs * draft_token_num, vocab_size)
-            # TODO: optimize top_k and top_p by avoiding sort
-            rngs = jax.random.split(rng.params(), 3)
-            target_probs = top_k_top_p_min_p_sampling_from_probs_jax(
-                target_probs,
-                jnp.repeat(sampling_info.top_ks, self.draft_token_num),
-                jnp.repeat(sampling_info.top_ps, self.draft_token_num),
-                jnp.repeat(sampling_info.min_ps, self.draft_token_num),
-                sampling_info.need_min_p_sampling,
-                rngs[0],
+            target_probs = top_k_renorm_prob(
+                target_probs, jnp.repeat(sampling_info.top_ks, self.draft_token_num)
             )
 
-            target_probs = target_probs.reshape(bs, self.draft_token_num, -1)
+            if not jnp.all(sampling_info.top_ps == 1.0):
+                target_probs = top_p_renorm_prob(
+                    target_probs, jnp.repeat(sampling_info.top_ps, self.draft_token_num)
+                )
+
+            # TODO: optimize top_k and top_p by avoiding sort
+            rngs = jax.random.split(rng.params(), 3)
 
             draft_probs = jnp.zeros(target_probs.shape, dtype=jnp.float32)
 

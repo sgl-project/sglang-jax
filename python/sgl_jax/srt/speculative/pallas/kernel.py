@@ -124,9 +124,7 @@ def top_k_renorm_prob(probs, top_k_values):
     Returns:
       Renormalized probabilities, shape ``(batch_size, num_classes)``.
     """
-    assert (
-        len(probs.shape == 2) and len(top_k_values.shape) == 2
-    ), f"length of probs.shape(): {len(probs.shape)} should equal to length of top_k_values.shape: {len(top_k_values.shape)}"
+    assert len(probs.shape) == 2, f"length of probs.shape(): {len(probs.shape)} should equal to 2"
     assert (
         probs.shape[0] == top_k_values.shape[0]
     ), f"probs.shape[0]: {probs.shape[0]} should equal to top_k_values.shape[0]: {top_k_values.shape}"
@@ -151,9 +149,7 @@ def top_p_renorm_prob(probs, top_p_values):
     Returns:
       Renormalized probabilities, shape ``(batch_size, num_classes)``.
     """
-    assert (
-        len(probs.shape == 2) and len(top_p_values.shape) == 2
-    ), f"length of probs.shape(): {len(probs.shape)} should equal to length of top_k_values.shape: {len(top_p_values.shape)}"
+    assert len(probs.shape) == 2, f"length of probs.shape(): {len(probs.shape)} should equal to 2"
     assert (
         probs.shape[0] == top_p_values.shape[0]
     ), f"probs.shape[0]: {probs.shape[0]} should equal to top_k_values.shape[0]: {top_p_values.shape}"
