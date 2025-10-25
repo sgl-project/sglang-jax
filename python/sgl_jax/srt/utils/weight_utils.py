@@ -174,7 +174,7 @@ class WeightLoader:
                 collected_weights.append(weight)
 
             stacked_weight = jnp.stack(collected_weights, axis=0)  # (num_experts, ...)
-
+        print(f"moe sharding: {mapping.sharding}")
         sharded_weight = self._shard_weight(stacked_weight, mapping.sharding)
 
         model_param = self._get_param(params, target_path)
