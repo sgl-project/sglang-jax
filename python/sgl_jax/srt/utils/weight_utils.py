@@ -108,6 +108,7 @@ class WeightLoader:
         )
 
         for hf_key, hf_weight in self._iterate_weights():
+            print(f"hf key is :{hf_key}")
             if hf_key in regular_mappings:
                 mapping = regular_mappings[hf_key]
                 if isinstance(mapping, (str, list)):
