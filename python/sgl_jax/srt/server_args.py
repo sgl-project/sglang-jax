@@ -65,6 +65,7 @@ class ServerArgs:
     # Runtime options
     device: str | None = None
     tp_size: int = 1
+    ep_size: int = 1
     stream_interval: int = 1
     stream_output: bool = False
     random_seed: int | None = None
@@ -476,6 +477,12 @@ class ServerArgs:
             type=int,
             default=ServerArgs.tp_size,
             help="The tensor parallelism size.",
+        )
+        parser.add_argument(
+            "--ep-size",
+            type=int,
+            default=ServerArgs.ep_size,
+            help="The expert parallelism size",
         )
         parser.add_argument(
             "--stream-interval",

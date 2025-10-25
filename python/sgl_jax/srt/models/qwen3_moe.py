@@ -11,7 +11,7 @@ from sgl_jax.srt.layers.embeddings import Embed, ParallelLMHead, RotaryEmbedding
 from sgl_jax.srt.layers.layernorm import RMSNorm
 from sgl_jax.srt.layers.linear import LinearBase
 from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
-from sgl_jax.srt.layers.moe import EPMoE, GateLogit, TopK
+from sgl_jax.srt.layers.moe import EPMoE, FusedMoE, GateLogit, TopK
 from sgl_jax.srt.layers.radix_attention import RadixAttention
 from sgl_jax.srt.mem_cache.memory_pool import KVCache
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
@@ -195,17 +195,28 @@ class QWen3MoeDecoderLayer(nnx.Module):
                 num_experts=num_experts,
             )
             with mesh:
-                self.mlp = EPMoE(
-                    config=config,
-                    num_experts=num_experts,
-                    num_experts_per_tok=num_experts_per_tok,
-                    intermediate_dim=moe_intermediate_size,
-                    mesh=mesh,
-                    expert_parallel_size=expert_parallel_size,
-                    weight_dtype=dtype,
-                    dtype=dtype,
-                    layer_id=layer_id,
-                )
+                if config.ep_size > 1:
+                    expert_parallel_size = mesh.shape.get("data", 1) * mesh.shape.get("tensor", 1)
+                    self.mlp = EPMoE(
+                        config=config,
+                        num_experts=num_experts,
+                        num_experts_per_tok=num_experts_per_tok,
+                        intermediate_dim=moe_intermediate_size,
+                        mesh=mesh,
+                        expert_parallel_size=expert_parallel_size,
+                        weight_dtype=dtype,
+                        dtype=dtype,
+                        layer_id=layer_id,
+                    )
+                else:
+                    self.mlp = FusedMoE(
+                        config=config,
+                        num_experts=num_experts,
+                        intermediate_dim=moe_intermediate_size,
+                        weight_dtype=dtype,
+                        dtype=dtype,
+                        mesh=mesh,
+                    )
             self.is_moe_layer = True
 
         self.input_layernorm = RMSNorm(

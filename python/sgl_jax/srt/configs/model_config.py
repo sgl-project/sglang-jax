@@ -49,7 +49,9 @@ class ModelConfig:
         self.revision = revision
         self.model_impl = model_impl
         self.quantization = quantization
-
+        # if ep_size > 1, use ep moe, else use fused moe
+        # TODO: support ep moe with ETP
+        self.ep_size = 1
         # Parse args
         self.maybe_pull_model_tokenizer_from_remote()
         self.model_override_args = json.loads(model_override_args)
