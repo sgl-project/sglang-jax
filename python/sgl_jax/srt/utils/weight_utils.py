@@ -153,34 +153,33 @@ class WeightLoader:
 
         nnx.update(self.model, params)
 
+    def _process_single_moe_group(
+        self,
+        params: nnx.State,
+        moe_key: str,
+        mapping: WeightMapping,
+        expert_weights_dict: dict[str, jax.Array],
+    ):
+        target_path = mapping.target_path[0]
+        expected_hf_keys = mapping.target_path[1:]
 
-def _process_single_moe_group(
-    self,
-    params: nnx.State,
-    moe_key: str,
-    mapping: WeightMapping,
-    expert_weights_dict: dict[str, jax.Array],
-):
-    target_path = mapping.target_path[0]
-    expected_hf_keys = mapping.target_path[1:]
+        cpu_device = jax.local_devices(backend="cpu")[0]
+        with jax.default_device(cpu_device):
+            collected_weights = []
+            for hf_key in expected_hf_keys:
+                weight = expert_weights_dict[hf_key]
+                if mapping.transpose and not hf_key.endswith(".bias"):
+                    weight = jnp.transpose(weight, (1, 0))
+                collected_weights.append(weight)
 
-    cpu_device = jax.local_devices(backend="cpu")[0]
-    with jax.default_device(cpu_device):
-        collected_weights = []
-        for hf_key in expected_hf_keys:
-            weight = expert_weights_dict[hf_key]
-            if mapping.transpose and not hf_key.endswith(".bias"):
-                weight = jnp.transpose(weight, (1, 0))
-            collected_weights.append(weight)
+            stacked_weight = jnp.stack(collected_weights, axis=0)  # (num_experts, ...)
 
-        stacked_weight = jnp.stack(collected_weights, axis=0)  # (num_experts, ...)
+        sharded_weight = self._shard_weight(stacked_weight, mapping.sharding)
 
-    sharded_weight = self._shard_weight(stacked_weight, mapping.sharding)
+        model_param = self._get_param(params, target_path)
+        model_param.value = sharded_weight.astype(model_param.value.dtype)
 
-    model_param = self._get_param(params, target_path)
-    model_param.value = sharded_weight.astype(model_param.value.dtype)
-
-    logger.debug("Assigned MoE group %s, shape: %s", moe_key, stacked_weight.shape)
+        logger.debug("Assigned MoE group %s, shape: %s", moe_key, stacked_weight.shape)
 
     def _iterate_weights(self):
         model_path = self.model_config.model_path
