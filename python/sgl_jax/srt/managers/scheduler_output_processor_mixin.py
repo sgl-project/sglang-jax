@@ -194,8 +194,8 @@ class SchedulerOutputProcessorMixin:
                     if (len(req.origin_input_ids) + len(req.output_ids) - 1) % self.page_size == 0:
                         self.token_to_kv_pool_allocator.free(batch.out_cache_loc[i : i + 1])
                 continue
-
-            req.output_ids.append(next_token_id)
+            if batch.spec_algorithm.is_none():
+                req.output_ids.append(next_token_id)
 
             req.check_finished()
             if req.finished():
@@ -217,7 +217,7 @@ class SchedulerOutputProcessorMixin:
                         precision_tracer.stop_trace()
                 self.tree_cache.cache_finished_req(req)
 
-            if req.return_logprob:
+            if req.return_logprob and batch.spec_algorithm.is_none():
                 # speculative worker handles logprob in speculative decoding
                 req.output_token_logprobs_val.append(next_token_logprobs[i])
                 req.output_token_logprobs_idx.append(next_token_id)

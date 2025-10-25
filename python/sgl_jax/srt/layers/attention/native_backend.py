@@ -97,7 +97,7 @@ class NativeAttention(AttentionBackend):
         Get the kv cache from the forward batch.
         """
         if is_tpu_runtime():
-            if forward_batch.forward_mode == ForwardMode.EXTEND:
+            if forward_batch.forward_mode.is_extend():
                 token_to_kv_pool.set_kv_buffer(
                     layer_id, forward_batch.out_cache_loc, k, v, is_decode=False
                 )

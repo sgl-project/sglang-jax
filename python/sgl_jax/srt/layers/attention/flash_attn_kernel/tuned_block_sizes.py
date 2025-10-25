@@ -5,8 +5,8 @@ import jax.numpy as jnp
 from sgl_jax.srt.layers.attention.flash_attn_kernel.util import (
     get_device_name,
     get_tpu_version,
-    next_power_of_2,
 )
+from sgl_jax.srt.utils.common_utils import next_power_of_2
 
 # key
 #   - device_name
