@@ -36,25 +36,14 @@ sanitize_ref() {
     ref=$(echo "$ref" | sed 's/^[^a-zA-Z]*//')
     # Ensure it doesn't end with dash, dot or underscore
     ref=$(echo "$ref" | sed 's/[-._]*$//')
-    # Truncate to reasonable length (max 40 chars to leave room for prefix/suffix)
-    ref=$(echo "$ref" | cut -c1-40)
+    # Truncate to reasonable length (max 20 chars to leave room for prefix/suffix)
+    ref=$(echo "$ref" | cut -c1-20)
     # If empty after sanitization, use "default"
     if [ -z "$ref" ]; then
         ref="default"
     fi
     echo "$ref"
 }
-
-# Check environment variables
-if [ -z "$USERNAME" ]; then
-    echo "Error: USERNAME environment variable is not set"
-    exit 1
-fi
-
-if [ -z "$GIT_TOKEN" ]; then
-    echo "Error: GIT_TOKEN environment variable is not set"
-    exit 1
-fi
 
 # Sanitize ref name
 SANITIZED_REF=$(sanitize_ref "$REF")
@@ -73,9 +62,9 @@ sed -e "s|\$ACCELERATOR|${ACCELERATOR}|g" \
 
 # Create cluster name with ref
 if [ -n "$TEST_TYPE" ]; then
-    CLUSTER_NAME="sgl-jax-ci-$ACCELERATOR-$SANITIZED_REF-$TEST_TYPE"
+    CLUSTER_NAME="sgl-jax-$ACCELERATOR-$SANITIZED_REF-$TEST_TYPE-$RANDOM"
 else
-    CLUSTER_NAME="sgl-jax-ci-$ACCELERATOR-$SANITIZED_REF"
+    CLUSTER_NAME="sgl-jax-$ACCELERATOR-$SANITIZED_REF-$RANDOM"
 fi
 
 # Execute sky launch command
@@ -93,9 +82,7 @@ sky launch "$TEMP_YAML" \
     --infra=gcp \
     -i 10 \
     --down \
-    -y \
-    --secret USERNAME=${USERNAME} \
-    --secret GIT_TOKEN=${GIT_TOKEN}
+    -y
 
 # Store the exit code
 EXIT_CODE=$?
