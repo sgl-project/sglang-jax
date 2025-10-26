@@ -498,6 +498,7 @@ def get_tokenizer(
 
 def get_dataset(args, tokenizer):
     tokenize_prompt = getattr(args, "tokenize_prompt", False)
+    adjust_prompt_max_retry = getattr(args, "adjust_prompt_max_retry", 10)
     if args.dataset_name == "sharegpt":
         assert not tokenize_prompt
         input_requests = sample_sharegpt_requests(
@@ -519,6 +520,7 @@ def get_dataset(args, tokenizer):
             dataset_path=args.dataset_path,
             random_sample=args.dataset_name == "random",
             return_text=not tokenize_prompt,
+            max_retry=adjust_prompt_max_retry,
         )
     elif args.dataset_name == "generated-shared-prefix":
         assert not tokenize_prompt
@@ -865,6 +867,7 @@ def sample_random_requests(
     dataset_path: str,
     random_sample: bool = True,
     return_text: bool = True,
+    max_retry: int = 10,
 ) -> list[DatasetRow]:
     input_lens = np.random.randint(
         max(int(input_len * range_ratio), 1),
@@ -926,7 +929,7 @@ def sample_random_requests(
                 ratio = (input_lens[i] + prompt_len - 1) // prompt_len
                 input_ids = (prompt_token_ids * ratio)[: input_lens[i]]
             token_text, token_ids, token_mismatch = adjust_prompt_decode_to_target_len(
-                tokenizer, input_ids, input_lens[i]
+                tokenizer, input_ids, input_lens[i], max_retry=max_retry
             )
             if token_mismatch > 0:
                 continue  # skip this request
@@ -947,7 +950,7 @@ def sample_random_requests(
                 (offsets[i] + i + j) % tokenizer.vocab_size for j in range(input_lens[i])
             ]
             token_text, token_ids, token_mismatch = adjust_prompt_decode_to_target_len(
-                tokenizer, input_content, input_lens[i]
+                tokenizer, input_content, input_lens[i], max_retry=max_retry
             )
             if token_mismatch > 0:
                 continue  # skip this request
@@ -959,6 +962,8 @@ def sample_random_requests(
                     output_len=int(output_lens[i]),
                 )
             )
+    if len(input_lens) < num_prompts:
+        raise ValueError("Not enough prompts, expected %d, actual %d", num_prompts, len(input_lens))
 
     print(f"#Input tokens: {np.sum(input_lens)}")
     print(f"#Output tokens: {np.sum(output_lens)}")
@@ -967,7 +972,7 @@ def sample_random_requests(
 
 def adjust_prompt_decode_to_target_len(
     tokenizer: PreTrainedTokenizerBase,
-    token_sequence: int,
+    token_sequence: list[int],
     target_token_len: int,
     max_retry: int = 10,
 ) -> tuple[str, list[int]]:
@@ -987,7 +992,7 @@ def adjust_prompt_decode_to_target_len(
     token_mismatch = 0
     while True:
         prompt = tokenizer.decode(token_sequence)
-        token_sequence = tokenizer.encode(prompt)
+        token_sequence = tokenizer.encode(prompt, add_special_tokens=False)
         if remain_num_try <= 0:
             if len(token_sequence) != target_token_len:
                 token_mismatch = len(token_sequence) - target_token_len
@@ -1497,6 +1502,9 @@ def run_benchmark(args_: argparse.Namespace):
     if not hasattr(args, "tokenize_prompt"):
         args.tokenize_prompt = False
 
+    if not hasattr(args, "adjust_prompt_max_retry"):
+        args.adjust_prompt_max_retry = 10
+
     print(f"benchmark_args={args}")
 
     # Set global environments
@@ -1814,6 +1822,12 @@ if __name__ == "__main__":
         "--tokenize-prompt",
         action="store_true",
         help="Use integer ids instead of string for inputs. Useful to control prompt lengths accurately",
+    )
+    parser.add_argument(
+        "--adjust-prompt-max-retry",
+        type=int,
+        default=10,
+        help="Number of adjust_prompt_decode_to_target_len max retry count",
     )
 
     group = parser.add_argument_group("generated-shared-prefix dataset arguments")
