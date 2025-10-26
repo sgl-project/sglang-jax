@@ -129,6 +129,7 @@ class EAGLEWorker(ModelWorker):
             logits_output, next_token_ids, cache_miss_count, bid, seq_lens = (
                 self.forward_target_extend(model_worker_batch, sampling_metadata)
             )
+
             # draft extend for Update Draft State
             self.forward_draft_extend(
                 batch, model_worker_batch, logits_output.hidden_states, next_token_ids
@@ -141,9 +142,11 @@ class EAGLEWorker(ModelWorker):
                 0,
             )
         else:
+
             # draft
             spec_info = self.draft(batch)
             # verify
+
             logits_output, verify_output, model_worker_batch, _ = self.verify(batch, spec_info)
 
             # TODO: if enable_dp_attention, add condition here

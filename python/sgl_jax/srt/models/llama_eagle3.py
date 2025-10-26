@@ -105,12 +105,12 @@ class LlamaDecoderLayer(LlamaDecoderLayer):
         token_to_kv_pool: KVCache,
         residual: jax.Array | None,
     ) -> tuple[jax.Array, jax.Array]:
+
         residual = hidden_states
         embeds = self.input_layernorm(embeds)
         hidden_states = self.hidden_norm(hidden_states)
 
         hidden_states = jnp.concatenate([embeds, hidden_states], axis=-1, dtype=jnp.bfloat16)
-        print(f"-----{hidden_states.shape}------")
         # Self Attention
         hidden_states, kv_fused = self.self_attn(
             positions=positions,
@@ -194,6 +194,7 @@ class LlamaEagleModel(LlamaModel):
         if forward_batch.spec_info is None or forward_batch.spec_info.hidden_states is None:
             raise ValueError("EAGLE3 draft model expects speculative hidden states.")
         hidden_states = forward_batch.spec_info.hidden_states
+
         if hidden_states.shape[-1] != embeds.shape[-1]:
             hidden_states = self.fc(hidden_states)[0]
 

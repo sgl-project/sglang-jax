@@ -102,6 +102,9 @@ class LogitsProcessorOutput:
             self.next_token_logits = jax.lax.dynamic_slice_in_dim(
                 self.next_token_logits, 0, batch.real_bs, axis=0
             )
+            self.hidden_states = jax.lax.dynamic_slice_in_dim(
+                self.hidden_states, 0, batch.real_bs, axis=0
+            )
         # assert not batch.capture_hidden_mode.need_capture()
 
 
