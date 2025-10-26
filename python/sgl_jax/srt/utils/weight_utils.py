@@ -1,13 +1,12 @@
 import glob
 import logging
-import math
 import os
 from dataclasses import dataclass
 
 import jax
 import jax.numpy as jnp
 from flax import nnx
-from jax.sharding import Mesh, NamedSharding
+from jax.sharding import Mesh
 from jax.sharding import PartitionSpec as P
 from safetensors import safe_open
 from tqdm import tqdm
@@ -394,10 +393,26 @@ class WeightLoader:
             model_param.value = sharded_weight.astype(model_param.value.dtype)
             logger.debug("Split %s -> %s, shape: %s", hf_key, jax_path, processed_weight.shape)
 
-    def _shard_weight(self, weight: jax.Array, sharding: tuple) -> jax.Array:
-        if math.prod(self.mesh.axis_sizes) == 1:
-            return jax.device_put(weight, self.mesh.devices.flatten()[0])
-        return jax.device_put(weight, NamedSharding(self.mesh, P(*sharding)))
+    def _shard_weight(self, weight: jax.Array, sharding_spec: tuple) -> jax.Array:
+        target_sharding = jax.sharding.NamedSharding(self.mesh, P(*sharding_spec))
+
+        if (
+            getattr(weight, "_committed", False)
+            and getattr(weight, "sharding", None) == target_sharding
+        ):
+            return weight
+
+        if jax.process_count() > 1:
+
+            def make_shard(indices):
+                shard = weight[indices]
+                return shard
+
+            return jax.make_array_from_callback(
+                shape=weight.shape, sharding=target_sharding, data_callback=make_shard
+            )
+        else:
+            return jax.device_put(weight, target_sharding)
 
     def _get_param(self, params: nnx.State, path: str) -> nnx.State:
         keys = path.split(".")
