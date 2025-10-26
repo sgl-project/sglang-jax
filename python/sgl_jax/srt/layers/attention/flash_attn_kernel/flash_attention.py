@@ -13,7 +13,6 @@ import jax.numpy as jnp
 from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
-from numpy import int32
 
 from sgl_jax.srt.layers.attention.flash_attn_kernel.tuned_block_sizes import (
     get_tuned_block_sizes,
@@ -112,13 +111,11 @@ def ref_ragged_paged_attention(
     v_scale: float | None = None,
 ):
     if causal:
-        if custom_mask != None:
-            raise ValueError(f"use causal mask, custom_mask is not None")
+        assert custom_mask is not None, "use causal mask, custom_mask is not None"
     else:
-        if custom_mask == None or custom_mask.size < jnp.cumsum(kv_lens)[-1]:
-            raise ValueError(
-                f"use custom_mask, custom_mask length must larger than total kv length"
-            )
+        assert (
+            custom_mask is None or custom_mask.size < jnp.cumsum(kv_lens)[-1]
+        ), "use custom_mask, custom_mask length must larger than total kv length"
     if mask_value is None:
         mask_value = DEFAULT_MASK_VALUE
     _, _, num_kv_heads, head_dim = k_pages.shape
@@ -126,16 +123,14 @@ def ref_ragged_paged_attention(
     assert num_q_heads % num_kv_heads == 0
     num_query_per_kv = num_q_heads // num_kv_heads
     outputs = []
-    cu_kv_lens = jnp.concatenate([jnp.array([0], dtype=jnp.int32), jnp.cumsum(kv_lens)])
+    # cu_kv_lens = jnp.concatenate([jnp.array([0], dtype=jnp.int32), jnp.cumsum(kv_lens)])
     mask_len_list = []
     for i in range(num_seqs[0]):
         kv_len = kv_lens[i]
         q_len = cu_q_lens[i + 1] - cu_q_lens[i]
         mask_len_list.append(q_len * kv_len)
     mask_lens = jnp.array(mask_len_list, dtype=jnp.int32)
-    cu_mask_lens = jnp.concatenate(
-        [jnp.array([0], dtype=jnp.int32), jnp.cumsum(mask_lens)]
-    )
+    cu_mask_lens = jnp.concatenate([jnp.array([0], dtype=jnp.int32), jnp.cumsum(mask_lens)])
 
     for i in range(num_seqs[0]):
         q_start = cu_q_lens[i]
@@ -157,9 +152,7 @@ def ref_ragged_paged_attention(
         attn = jnp.einsum("qhd,khd->hqk", q, k, preferred_element_type=jnp.float32)
         attn *= sm_scale
         if causal:
-            q_span = (kv_len - q_len) + jax.lax.broadcasted_iota(
-                jnp.int32, attn.shape, 1
-            )
+            q_span = (kv_len - q_len) + jax.lax.broadcasted_iota(jnp.int32, attn.shape, 1)
             kv_span = jax.lax.broadcasted_iota(jnp.int32, attn.shape, 2)
             mask = q_span < kv_span
         else:
@@ -573,9 +566,7 @@ def _ragged_paged_attention_kernel(
             .at[bq_sem_idx, kv_head_idx]
             .reshape(bq_sz * num_q_heads_per_kv_head_per_packing, head_dim)
         )
-        res = pltpu.bitcast(
-            q_ref[: actual_bq_sz * num_q_heads_per_kv_head_per_packing], q_dtype
-        )
+        res = pltpu.bitcast(q_ref[: actual_bq_sz * num_q_heads_per_kv_head_per_packing], q_dtype)
         return res
 
     def strided_load(ref, start, step, *, dtype=None):
@@ -694,8 +685,8 @@ def _ragged_paged_attention_kernel(
 
                 # Get next bkv ids.
                 bkv_sem_idx = sem_ids_ref[1]
-                next_seq_idx, next_bq_idx, next_bkv_idx, next_bkv_sem_idx = (
-                    get_next_bkv_ids(seq_idx, bq_idx, bkv_idx, bkv_sem_idx)
+                next_seq_idx, next_bq_idx, next_bkv_idx, next_bkv_sem_idx = get_next_bkv_ids(
+                    seq_idx, bq_idx, bkv_idx, bkv_sem_idx
                 )
 
                 # Prefetch next bkv
@@ -706,9 +697,7 @@ def _ragged_paged_attention_kernel(
 
                     @pl.when(causal == 0)
                     def _():
-                        start_fetch_mask(
-                            next_seq_idx, next_bq_idx, next_bkv_idx, next_bkv_sem_idx
-                        )
+                        start_fetch_mask(next_seq_idx, next_bq_idx, next_bkv_idx, next_bkv_sem_idx)
 
                 # Wait for cur bq if not ready yet
                 @pl.when(bkv_idx == 0)
@@ -760,9 +749,7 @@ def _ragged_paged_attention_kernel(
 
                 def load_mask():
                     mask = bkvmask_ref[bkv_sem_idx, :actual_bq_sz, :, 0]
-                    num_q_heads_per_kv_head_mask = jnp.repeat(
-                        mask, num_q_heads_per_kv_head, axis=0
-                    )
+                    num_q_heads_per_kv_head_mask = jnp.repeat(mask, num_q_heads_per_kv_head, axis=0)
                     num_kv_heads_mask = jnp.concat(
                         [
                             num_q_heads_per_kv_head_mask.reshape(
@@ -930,7 +917,6 @@ def merge_kv(
     actual_num_kv_heads_x2 = actual_num_kv_heads * 2
     num_kv_heads_x2 = align_to(actual_num_kv_heads_x2, kv_packing)
     head_dim = align_to(actual_head_dim, 128)
-
     # Interleave k and v: [k1, v1, k2, v2, ...]
     kv = jnp.pad(
         jnp.concat([k, v], axis=-1).reshape(
@@ -1332,9 +1318,7 @@ def ragged_paged_attention(
 
     q_lens = cu_q_lens[1:] - cu_q_lens[:-1]
     seq_mask_lens = kv_lens * q_lens
-    cu_seq_mask_lens = jnp.concatenate(
-        [jnp.array([0], dtype=jnp.int32), jnp.cumsum(seq_mask_lens)]
-    )
+    cu_seq_mask_lens = jnp.concatenate([jnp.array([0], dtype=jnp.int32), jnp.cumsum(seq_mask_lens)])
     if custom_mask is None:
         # fix bug: XLA layout ({0}) does not match Mosaic layout ({0:T(128)}) for an operand of shape s32[0]
         custom_mask = jnp.empty((1, 128), dtype=jnp.int32)
@@ -1342,11 +1326,9 @@ def ragged_paged_attention(
     else:
         assert (
             custom_mask.dtype != jnp.bool
-        ), f"custom_mask bool dtype is not supported, use int32 instead. 0: False, 1: True"
+        ), "custom_mask bool dtype is not supported, use int32 instead. 0: False, 1: True"
 
-        custom_mask = jnp.repeat(
-            jnp.expand_dims(custom_mask, axis=1), repeats=head_dim, axis=1
-        )
+        custom_mask = jnp.repeat(jnp.expand_dims(custom_mask, axis=1), repeats=head_dim, axis=1)
 
     grid = (distribution[2],)
 

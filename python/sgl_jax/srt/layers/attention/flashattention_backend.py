@@ -90,7 +90,7 @@ class FlashAttentionBackend(AttentionBackend):
             self.num_kv_heads = num_kv_heads
         else:
             self.num_kv_heads = num_attn_heads
-        self.head_dim = head_dim
+        self.head_dim = (head_dim + 127) // 128 * 128
         self.page_size = page_size
         self.kv_partition_axis = kv_partition_axis
         self.forward_metadata = nnx.data(FlashAttentionMetadata())
@@ -242,14 +242,12 @@ class FlashAttentionBackend(AttentionBackend):
             Output tensor of shape [total_tokens, hidden_size]
         """
         kv_cache_fused = self._get_fused_kv_cache(forward_batch, token_to_kv_pool, layer.layer_id)
-
         scale = 1.0 / jnp.sqrt(layer.head_dim) if layer.scaling is None else layer.scaling
 
         # Prepare fused KV cache for paged format: [num_pages, page_size, num_kv_heads * 2, head_dim]
         total_tokens = kv_cache_fused.shape[0]
         num_pages = total_tokens // self.page_size
         kv_cache_fused_paged = kv_cache_fused.reshape(num_pages, self.page_size, -1, self.head_dim)
-
         causal = 1
         # custom_mask = self.forward_metadata.custom_mask
         if forward_batch.forward_mode == ForwardMode.TARGET_VERIFY:

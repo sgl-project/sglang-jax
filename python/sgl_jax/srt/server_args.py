@@ -133,6 +133,7 @@ class ServerArgs:
     # Speculative decoding
     speculative_algorithm: str | None = None
     speculative_draft_model_path: str | None = None
+    speculative_draft_model_revision: str | None = None
     speculative_num_steps: int = 4
     speculative_eagle_topk: int = 5
     speculative_num_draft_tokens: int = 4
@@ -789,6 +790,14 @@ class ServerArgs:
             type=str,
             help="The path of the draft model weights. This can be a local folder or a Hugging Face repo ID.",
             default=ServerArgs.speculative_draft_model_path,
+        )
+        parser.add_argument(
+            "--speculative-draft-model-revision",
+            type=str,
+            default=None,
+            help="The specific draft model version to use. It can be a branch "
+            "name, a tag name, or a commit id. If unspecified, will use "
+            "the default version.",
         )
         parser.add_argument(
             "--speculative-num-steps",

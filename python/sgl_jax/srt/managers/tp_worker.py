@@ -52,13 +52,19 @@ class ModelWorker:
         self.tp_size = server_args.tp_size
 
         # Init model and tokenizer
-        if is_draft_worker:
-            model_path = server_args.speculative_draft_model_path
-        else:
-            model_path = server_args.model_path
         self.model_config = ModelConfig.from_server_args(
             server_args,
-            model_path=model_path,
+            model_path=(
+                server_args.model_path
+                if not is_draft_worker
+                else server_args.speculative_draft_model_path
+            ),
+            model_revision=(
+                server_args.revision
+                if not is_draft_worker
+                else server_args.speculative_draft_model_revision
+            ),
+            is_draft_model=is_draft_worker,
         )
 
         self.mesh = mesh

@@ -56,7 +56,6 @@ class RadixAttention(nnx.Module):
     ):
         assert k is not None
         assert v is not None
-
         attn_output, kv_fused = forward_batch.attn_backend(
             q,
             k,

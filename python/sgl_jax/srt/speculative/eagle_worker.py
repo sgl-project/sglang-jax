@@ -3,6 +3,8 @@ import logging
 import jax
 import jax.numpy as jnp
 import numpy as np
+from jax.sharding import NamedSharding
+from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessorOutput
 from sgl_jax.srt.layers.sampler import get_token_ids_logprobs, get_top_logprobs
@@ -24,6 +26,7 @@ from sgl_jax.srt.speculative.eagle_util import (
 )
 from sgl_jax.srt.speculative.spec_info import SpeculativeAlgorithm
 from sgl_jax.srt.utils.common_utils import get_bool_env_var
+from sgl_jax.srt.utils.jax_utils import device_array
 
 logger = logging.getLogger(__name__)
 RETURN_ORIGINAL_LOGPROB = get_bool_env_var("RETURN_ORIGINAL_LOGPROB")
@@ -42,25 +45,59 @@ class EAGLEWorker(ModelWorker):
             server_args.speculative_algorithm
         )
         self.req_to_token_pool, self.token_to_kv_pool_allocator = target_worker.get_memory_pool()
-        self.hot_token_id = None
+        self.hot_token_ids = None
 
         # Initialize dummy tensors for EAGLE operations
         self.num_new_pages_per_topk = None
         self.extend_lens = None
 
+        # this must be put at last to make sure model state is correct
         super().__init__(
             server_args,
             target_worker.mesh,
             req_to_token_pool=self.req_to_token_pool,
             is_draft_worker=True,
         )
-
         embed, head = self.target_worker.model_runner.model.get_embed_and_head()
 
         if self.speculative_algorithm.is_eagle3():
-            pass
+            # most cases EAGLE3 models don't share lm_head
+            # but some models (e.g. nvidia/gpt-oss-120b-Eagle3) shares
+            if (
+                hasattr(self.draft_model_runner.model, "load_lm_head_from_target")
+                and self.draft_model_runner.model.load_lm_head_from_target
+            ):
+                self.draft_model_runner.model.set_embed_and_head(embed, head)
+            else:
+                self.draft_model_runner.model.set_embed(embed)
+
+            # grab hot token ids
+            if self.draft_model_runner.model.hot_token_ids is not None:
+                self.hot_token_ids = device_array(
+                    self.draft_model_runner.model.hot_token_ids,
+                    sharding=(
+                        NamedSharding(self.model_runner.mesh, P())
+                        if jax.process_count() == 1
+                        else None
+                    ),
+                )
         else:
-            self.target_worker.model_runner.model.set_embed_and_head(embed, head)
+            if self.hot_token_ids is not None:
+                head = head.clone()
+                self.hot_token_ids = device_array(
+                    self.draft_model_runner.model.hot_token_ids,
+                    sharding=(
+                        NamedSharding(self.model_runner.mesh, P())
+                        if jax.process_count() == 1
+                        else None
+                    ),
+                )
+                head.data = head.data[self.hot_token_ids]
+
+            # Share the embedding and lm_head
+            self.draft_model_runner.model.set_embed_and_head(embed, head)
+
+        self.model_runner.initialize_jit()
 
     def forward_batch_speculative_generation(
         self,
@@ -460,6 +497,18 @@ class EAGLEWorker(ModelWorker):
             precompile_cache_loc_paddings,
             self.page_size,
         )
+        # Pad hidden_states to match input_ids length
+        if model_worker_batch.spec_info.hidden_states is not None:
+            current_len = model_worker_batch.spec_info.hidden_states.shape[0]
+            padding_size = len(model_worker_batch.input_ids) - current_len
+            if padding_size >= 0:
+                model_worker_batch.spec_info.hidden_states = jnp.pad(
+                    model_worker_batch.spec_info.hidden_states,
+                    ((0, padding_size), (0, 0)),
+                    mode="constant",
+                    constant_values=0,
+                )
+
         assert model_worker_batch.capture_hidden_mode == CaptureHiddenMode.LAST
         forward_batch = ForwardBatch.init_new(model_worker_batch, self.draft_model_runner)
         if forward_batch.seq_lens is not None:
@@ -511,8 +560,8 @@ class EAGLEWorker(ModelWorker):
             spec_info.topk_index,
             spec_info.hidden_states,
         )
-        if self.hot_token_id is not None:
-            topk_index = self.hot_token_id[topk_index]
+        if self.hot_token_ids is not None:
+            topk_index = self.hot_token_ids[topk_index]
         out_cache_loc = out_cache_loc[
             : (schedule_batch.batch_size() * self.topk * self.speculative_num_steps)
         ].reshape(schedule_batch.batch_size(), self.topk, self.speculative_num_steps)
@@ -546,13 +595,24 @@ class EAGLEWorker(ModelWorker):
                     self.page_size,
                     speculative_step_id=i,
                 )
+
             model_worker_batch.input_ids = input_ids
+            if hidden_states is not None:
+                current_len = hidden_states.shape[0]
+                padding_size = len(input_ids) - current_len
+                if padding_size >= 0:
+                    model_worker_batch.spec_info.hidden_states = jnp.pad(
+                        hidden_states,
+                        ((0, padding_size), (0, 0)),
+                        mode="constant",
+                        constant_values=0,
+                    )
             model_worker_batch.out_cache_loc = out_cache_loc[i]
             model_worker_batch.positions = original_positions + 1 + i
             self.draft_model_runner.attn_backend.forward_metadata = (
                 self.draft_model_runner.attn_backend.get_forward_metadata(model_worker_batch, i)
             )
-            spec_info.hidden_states = hidden_states
+            # spec_info.hidden_states = hidden_states
             forward_batch = ForwardBatch.init_new(model_worker_batch, self.draft_model_runner)
             # Run forward
             logits_output, _ = self.draft_model_runner.forward(
@@ -563,8 +623,8 @@ class EAGLEWorker(ModelWorker):
             )
             # self._detect_nan_if_needed(logits_output)
             topk_p, topk_index = topk_probs_from_logits(logits_output.next_token_logits, self.topk)
-            if self.hot_token_id is not None:
-                topk_index = self.hot_token_id[topk_index]
+            if self.hot_token_ids is not None:
+                topk_index = self.hot_token_ids[topk_index]
             hidden_states = logits_output.hidden_states
 
         return score_list, token_list, parents_list

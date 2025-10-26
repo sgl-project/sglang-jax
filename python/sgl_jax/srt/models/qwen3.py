@@ -316,6 +316,8 @@ class QWen3Model(nnx.Module):
             scale_init=nnx.with_partitioning(init_fn, (None,)),
             rngs=rngs,
         )
+        # For EAGLE3 support
+        self.layers_to_capture = []
 
     def __call__(
         self,
@@ -326,7 +328,12 @@ class QWen3Model(nnx.Module):
         hidden_states = self.embed_tokens(forward_batch.input_ids)
         layers_kv_fused = []
         layers_callback_flag = []
-        for layer in self.layers:
+        aux_hidden_states = []
+        for layer_id, layer in enumerate(self.layers):
+            if layer_id in self.layers_to_capture:
+                aux_hidden_states.append(
+                    hidden_states + residual if residual is not None else hidden_states
+                )
             hidden_states, residual, kv_fused, callback_flag = layer(
                 forward_batch.positions,
                 hidden_states,
@@ -345,7 +352,7 @@ class QWen3Model(nnx.Module):
             hidden_states, "transformer_output", "TRANSFORMER"
         )
         layers_callback_flag.append(callback_flag)
-        return hidden_states, layers_kv_fused, layers_callback_flag
+        return hidden_states, aux_hidden_states, layers_kv_fused, layers_callback_flag
 
 
 class Qwen3ForCausalLM(nnx.Module):
@@ -364,6 +371,9 @@ class Qwen3ForCausalLM(nnx.Module):
         if not getattr(self.config, "tie_word_embeddings", True):
             self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size, rngs=rngs)
         self.logits_processor = LogitsProcessor(config.vocab_size, self.mesh)
+
+        # For EAGLE3 support
+        self.capture_aux_hidden_states = False
 
     def load_weights(self, model_config: ModelConfig, rng_key: jax.Array):
         self.rng = nnx.Rngs(rng_key)
@@ -530,20 +540,38 @@ class Qwen3ForCausalLM(nnx.Module):
         if head_weight is not None:
             self.lm_head.embedding.value = head_weight
 
+    def set_eagle3_layers_to_capture(self, layer_ids: list[int] | None = None):
+
+        self.capture_aux_hidden_states = True
+        if layer_ids is None:
+            num_layers = self.config.num_hidden_layers
+            self.transformer.layers_to_capture = [
+                2,
+                num_layers // 2,
+                num_layers - 3,
+            ]  # Specific layers for EAGLE3 support
+        else:
+            self.transformer.layers_to_capture = [val + 1 for val in layer_ids]
+
     def __call__(
         self,
         forward_batch: ForwardBatch,
         token_to_kv_pool: KVCache,
         logits_metadata: LogitsMetadata,
     ):
-        hidden_states, layers_kv_fused, layers_callback_flag = self.transformer(
+        hidden_states, aux_hidden_states, layers_kv_fused, layers_callback_flag = self.transformer(
             forward_batch, token_to_kv_pool
         )
         if not getattr(self.config, "tie_word_embeddings", True):
-            output = self.logits_processor(hidden_states, self.lm_head, logits_metadata)
+            output = self.logits_processor(
+                hidden_states, self.lm_head, logits_metadata, aux_hidden_states=aux_hidden_states
+            )
         else:
             output = self.logits_processor(
-                hidden_states, self.transformer.embed_tokens, logits_metadata
+                hidden_states,
+                self.transformer.embed_tokens,
+                logits_metadata,
+                aux_hidden_states=aux_hidden_states,
             )
         return output, layers_kv_fused, layers_callback_flag
 

@@ -23,7 +23,6 @@ def merge_kv(k: jax.Array, v: jax.Array) -> jax.Array:
 
     kv_concat = jnp.concatenate([k, v], axis=-1)  # [tokens, heads, head_dim*2]
     kv_fused = kv_concat.reshape(num_tokens, num_kv_heads * 2, head_dim)
-
     return kv_fused
 
 
@@ -375,6 +374,7 @@ class MHATokenToKVPool(KVCache):
         page_size = 1 if is_decode else self.page_size
 
         # Merge k and v into fused format
+
         fused_kv = merge_kv(k, v)  # [total_tokens, num_heads * 2, head_dim]
 
         # Update the fused KV cache

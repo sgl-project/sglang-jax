@@ -282,6 +282,9 @@ class Qwen2Model(nnx.Module):
             rngs=rngs,
         )
 
+        # For EAGLE3 support
+        self.layers_to_capture = []
+
     def __call__(
         self,
         forward_batch: ForwardBatch,
@@ -291,7 +294,13 @@ class Qwen2Model(nnx.Module):
         hidden_states = self.embed_tokens(forward_batch.input_ids)
         layers_kv_fused = []
         layers_callback_flag = []
-        for layer in self.layers:
+        # For EAGLE3 support
+        aux_hidden_states = []
+        for layer_id, layer in enumerate(self.layers):
+            if layer_id in self.layers_to_capture:
+                aux_hidden_states.append(
+                    hidden_states + residual if residual is not None else hidden_states
+                )
             hidden_states, residual, kv_fused, callback_flag = layer(
                 forward_batch.positions,
                 hidden_states,
@@ -306,7 +315,7 @@ class Qwen2Model(nnx.Module):
             hidden_states += residual
         hidden_states = self.norm(hidden_states)
 
-        return hidden_states, layers_kv_fused, layers_callback_flag
+        return hidden_states, aux_hidden_states, layers_kv_fused, layers_callback_flag
 
 
 class Qwen2ForCausalLM(nnx.Module):
@@ -464,14 +473,17 @@ class Qwen2ForCausalLM(nnx.Module):
         token_to_kv_pool: KVCache,
         logits_metadata: LogitsMetadata,
     ):
-        hidden_states, layers_kv_fused, layers_callback_flag = self.transformer(
+        hidden_states, aux_hidden_states, layers_kv_fused, layers_callback_flag = self.transformer(
             forward_batch, token_to_kv_pool
         )
         if not getattr(self.config, "tie_word_embeddings", True):
             output = self.logits_processor(hidden_states, self.lm_head, logits_metadata)
         else:
             output = self.logits_processor(
-                hidden_states, self.transformer.embed_tokens, logits_metadata
+                hidden_states,
+                self.transformer.embed_tokens,
+                logits_metadata,
+                aux_hidden_states=aux_hidden_states,
             )
         return output, layers_kv_fused, layers_callback_flag
 

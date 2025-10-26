@@ -303,14 +303,14 @@ class LogitsProcessor(nnx.Module):
         if logits_metadata.capture_hidden_mode.need_capture():
             if logits_metadata.capture_hidden_mode.is_full():
                 if aux_hidden_states is not None:
-                    hidden_states_to_store = jnp.concat(aux_hidden_states, dim=-1)
+                    hidden_states_to_store = jnp.concat(aux_hidden_states, axis=-1)
                 else:
                     hidden_states_to_store = hidden_states
             elif logits_metadata.capture_hidden_mode.is_last():
                 # Get the last token hidden states. If sample_indices is None,
                 # pruned states only contain the last tokens already.
                 if aux_hidden_states is not None:
-                    aux_pruned_states = jnp.concat(aux_pruned_states, dim=-1)
+                    aux_pruned_states = jnp.concat(aux_pruned_states, axis=-1)
                     hidden_states_to_store = (
                         aux_pruned_states[sample_indices]
                         if sample_indices is not None

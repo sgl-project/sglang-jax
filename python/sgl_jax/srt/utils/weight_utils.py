@@ -25,6 +25,7 @@ class WeightMapping:
     reshape: tuple | None = None
     head_dim_padding: bool = False
     kv_head_padding: bool = False
+    is_eagle3: bool = False
 
     def __post_init__(self):
         if self.sharding is None:
@@ -109,6 +110,11 @@ class WeightLoader:
 
         for hf_key, hf_weight in self._iterate_weights():
             if hf_key in regular_mappings:
+                if hf_key == "d2t":
+                    base = jnp.arange(hf_weight.shape[0], dtype=hf_weight.dtype)
+                    hot_ids = (hf_weight + base).astype(jnp.int32)
+                    params["hot_token_ids"].value = hot_ids
+                    continue
                 mapping = regular_mappings[hf_key]
                 if isinstance(mapping, (str, list)):
                     mapping = WeightMapping(target_path=mapping)
@@ -209,8 +215,8 @@ class WeightLoader:
 
         if mapping.reshape is not None:
             processed_weight = jnp.reshape(processed_weight, mapping.reshape)
-
         if mapping.head_dim_padding and self.head_dim_pad > 0:
+
             processed_weight = self._apply_head_dim_padding(processed_weight, hf_key, mapping)
 
         if mapping.kv_head_padding:
@@ -355,7 +361,6 @@ class WeightLoader:
     def _get_param(self, params: nnx.State, path: str) -> nnx.State:
         keys = path.split(".")
         current_level = params
-
         for key in keys:
             if key.isdigit():
                 current_level = current_level[int(key)]
@@ -372,6 +377,7 @@ class WeightLoader:
     def _apply_head_dim_padding(
         self, weight: jax.Array, hf_key: str, mapping: WeightMapping
     ) -> jax.Array:
+
         if hf_key.endswith(".bias"):
             if any(proj in hf_key for proj in ["q_proj", "k_proj", "v_proj"]):
                 if "q_proj" in hf_key:
@@ -383,6 +389,7 @@ class WeightLoader:
                     padded = jnp.pad(reshaped, ((0, 0), (0, self.head_dim_pad)))
                     return jnp.reshape(padded, (self.num_kv_heads * self.head_dim,))
         else:
+
             if mapping.reshape is not None:
                 if "o_proj" in hf_key:
                     padded = jnp.pad(weight, ((0, 0), (0, 0), (0, self.head_dim_pad)))
@@ -394,17 +401,26 @@ class WeightLoader:
                     if "q_proj" in hf_key:
                         reshaped = jnp.reshape(
                             weight,
-                            (self.hidden_size, self.num_heads, self.head_dim_original),
+                            (
+                                self.hidden_size if not mapping.is_eagle3 else 2 * self.hidden_size,
+                                self.num_heads,
+                                self.head_dim_original,
+                            ),
                         )
                         padded = jnp.pad(reshaped, ((0, 0), (0, 0), (0, self.head_dim_pad)))
                         return jnp.reshape(
-                            padded, (self.hidden_size, self.num_heads * self.head_dim)
+                            padded,
+                            (
+                                self.hidden_size if not mapping.is_eagle3 else 2 * self.hidden_size,
+                                self.num_heads * self.head_dim,
+                            ),
                         )
                     elif any(proj in hf_key for proj in ["k_proj", "v_proj"]):
+
                         reshaped = jnp.reshape(
                             weight,
                             (
-                                self.hidden_size,
+                                self.hidden_size if not mapping.is_eagle3 else 2 * self.hidden_size,
                                 self.num_kv_heads,
                                 self.head_dim_original,
                             ),
@@ -412,7 +428,10 @@ class WeightLoader:
                         padded = jnp.pad(reshaped, ((0, 0), (0, 0), (0, self.head_dim_pad)))
                         return jnp.reshape(
                             padded,
-                            (self.hidden_size, self.num_kv_heads * self.head_dim),
+                            (
+                                self.hidden_size if not mapping.is_eagle3 else 2 * self.hidden_size,
+                                self.num_kv_heads * self.head_dim,
+                            ),
                         )
                     elif "o_proj" in hf_key:
                         reshaped = jnp.reshape(
