@@ -7,7 +7,7 @@ Qwen is Alibaba's family of large language models optimized for diverse applicat
 Launch a Qwen-7B-Chat server on TPU:
 
 ```bash
-JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache python3 -u -m sgl_jax.launch_server \
+JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache uv run python -u -m sgl_jax.launch_server \
     --model-path Qwen/Qwen-7B-Chat \
     --trust-remote-code \
     --dist-init-addr=0.0.0.0:10011 \
@@ -56,7 +56,7 @@ Set `--mem-fraction-static 0.8` for optimal TPU memory utilization. For larger m
 
 ### Throughput Testing
 ```bash
-python3 -m sgl_jax.bench_serving \
+uv run python -m sgl_jax.bench_serving \
     --backend sgl-jax \
     --dataset-name random \
     --num-prompts 100 \

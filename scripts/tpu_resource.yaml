@@ -1,19 +1,16 @@
 resources:
   accelerators: $ACCELERATOR
-  use_spot: True
-  disk_size: 512  # Ensure model checkpoints can fit.
-  disk_tier: best
-
-secrets:
-  USERNAME: null
-  GIT_TOKEN: null
-
+  accelerator_args:
+      tpu_vm: True
+      runtime_version: v2-alpha-tpuv6e
+  use_spot: True # The default instance is spot.
 
 setup: |
   if [ -d "sglang-jax" ]; then pip uninstall -y sgl-jax || true && rm -rf sglang-jax; fi
-  git clone https://${USERNAME}:${GIT_TOKEN}@github.com/sgl-project/sglang-jax.git
+  git clone https://github.com/sgl-project/sglang-jax.git
   cd sglang-jax && git fetch origin $REF:$REF && git checkout $REF
   uv venv --python 3.12
   source .venv/bin/activate
   uv pip install -e python/
   bash scripts/killall_sglang.sh
+  uv tool install evalscope
