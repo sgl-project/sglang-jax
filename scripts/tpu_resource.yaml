@@ -15,5 +15,5 @@ setup: |
   cd sglang-jax && git fetch origin $REF:$REF && git checkout $REF
   uv venv --python 3.12
   source .venv/bin/activate
-  uv pip install -e python/
+  uv pip install -e "python[all]"
   bash scripts/killall_sglang.sh
