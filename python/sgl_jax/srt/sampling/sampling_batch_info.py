@@ -18,7 +18,6 @@ if TYPE_CHECKING:
 import threading
 
 import jax
-import jax.numpy as jnp
 import numpy as np
 
 logger = logging.getLogger(__name__)
@@ -47,7 +46,7 @@ class SamplingMetadata:
 
     # penalty
     do_penalties: bool = False
-    linear_penalty: jax.Array | None = None
+    linear_penalty: jax.Array = None
 
     def tree_flatten(self):
         children = (
@@ -59,13 +58,13 @@ class SamplingMetadata:
             self.is_all_greedy,
             self.need_min_p_sampling,
             self.linear_penalty,
+            self.do_penalties,
         )
 
         aux_data = {
             "return_logprob": self.return_logprob,
             "top_logprobs_nums": self.top_logprobs_nums,
             "token_ids_logprobs": self.token_ids_logprobs,
-            "do_penalties": self.do_penalties,
         }
         return (children, aux_data)
 
@@ -81,11 +80,11 @@ class SamplingMetadata:
         obj.is_all_greedy = children[5]
         obj.need_min_p_sampling = children[6]
         obj.linear_penalty = children[7]
+        obj.do_penalties = children[8]
 
         obj.return_logprob = aux_data["return_logprob"]
         obj.top_logprobs_nums = aux_data["top_logprobs_nums"]
         obj.token_ids_logprobs = aux_data["token_ids_logprobs"]
-        obj.do_penalties = aux_data["do_penalties"]
 
         return obj
 
@@ -95,6 +94,7 @@ class SamplingMetadata:
         batch: ModelWorkerBatch,
         pad_size: int = 0,
         mesh: Mesh = None,
+        vocab_size: int = 32000,
     ) -> SamplingMetadata:
         sharding = NamedSharding(mesh, PartitionSpec()) if jax.process_count() == 1 else None
         padded_temperatures = np.concat(
@@ -143,6 +143,7 @@ class SamplingMetadata:
         # Extract penalty information from penalizer orchestrator
         linear_penalty_device = None
         do_penalties = False
+        linear_penalty_sharding = NamedSharding(mesh, PartitionSpec(None, "tensor"))
 
         # Handle linear penalty independently (created by update_penalties)
         if (
@@ -163,12 +164,13 @@ class SamplingMetadata:
 
             linear_penalty_device = device_array(
                 padded_linear_penalty,
-                sharding=sharding,
+                sharding=linear_penalty_sharding,
             )
 
         # Handle individual penalties from orchestrator
         if (
-            batch.sampling_info.penalizer_orchestrator
+            linear_penalty_device is None
+            and batch.sampling_info.penalizer_orchestrator
             and batch.sampling_info.penalizer_orchestrator.is_required
         ):
             do_penalties = True
@@ -184,8 +186,14 @@ class SamplingMetadata:
             else:
                 padded_linear_penalty = original_linear_penalty
 
-            linear_penalty_sharding = NamedSharding(mesh, PartitionSpec(None, "tensor"))
-
+            linear_penalty_device = device_array(
+                padded_linear_penalty,
+                sharding=linear_penalty_sharding,
+            )
+        if linear_penalty_device is None:
+            padded_linear_penalty = np.zeros(
+                (padded_temperatures.shape[0], vocab_size), dtype=np.float32
+            )
             linear_penalty_device = device_array(
                 padded_linear_penalty,
                 sharding=linear_penalty_sharding,
@@ -204,107 +212,6 @@ class SamplingMetadata:
             need_min_p_sampling=batch.sampling_info.need_min_p_sampling,
             linear_penalty=linear_penalty_device,
             do_penalties=do_penalties,
-        )
-
-    @classmethod
-    def from_model_worker_batch_for_precompile(
-        cls,
-        batch: ModelWorkerBatch,
-        pad_size: int = 0,
-        mesh: Mesh = None,
-    ) -> SamplingMetadata:
-        """
-        Create SamplingMetadata for precompile with all possible penalty shapes.
-        Since JAX compilation only cares about shapes, we create tensors with appropriate
-        shapes for all penalty types to ensure comprehensive compilation coverage.
-        """
-        # Basic sampling parameters (same as original method)
-        sharding = NamedSharding(mesh, PartitionSpec()) if jax.process_count() == 1 else None
-        padded_temperatures = np.concat(
-            [
-                batch.sampling_info.temperatures,
-                np.array([1.0] * pad_size, dtype=batch.sampling_info.temperatures.dtype),
-            ]
-        ).reshape(-1, 1)
-        padded_top_ps = np.concat(
-            [
-                batch.sampling_info.top_ps,
-                np.array([1.0] * pad_size, dtype=batch.sampling_info.top_ps.dtype),
-            ]
-        )
-        padded_top_ks = np.concat(
-            [
-                batch.sampling_info.top_ks,
-                np.array([1] * pad_size, dtype=batch.sampling_info.top_ks.dtype),
-            ]
-        )
-        padded_min_ps = np.concat(
-            [
-                batch.sampling_info.min_ps,
-                np.array([0.0] * pad_size, dtype=batch.sampling_info.min_ps.dtype),
-            ]
-        )
-        if batch.sampling_info.sampling_seeds is not None:
-            padded_sampling_seeds = np.concat(
-                [
-                    batch.sampling_info.sampling_seeds,
-                    np.array(
-                        [DEFAULT_SAMPLING_SEED] * pad_size,
-                        dtype=batch.sampling_info.sampling_seeds.dtype,
-                    ),
-                ]
-            )
-            sampling_seeds_device = device_array(padded_sampling_seeds, sharding=sharding)
-        else:
-            sampling_seeds_device = None
-
-        (temperatures_device, top_ps_device, top_ks_device, min_ps_device) = device_array(
-            (padded_temperatures, padded_top_ps, padded_top_ks, padded_min_ps),
-            sharding=sharding,
-        )
-
-        if batch.sampling_info.sampling_seeds is not None:
-            padded_sampling_seeds = np.concat(
-                [
-                    batch.sampling_info.sampling_seeds,
-                    np.array(
-                        [DEFAULT_SAMPLING_SEED] * pad_size,
-                        dtype=batch.sampling_info.sampling_seeds.dtype,
-                    ),
-                ]
-            )
-            sampling_seeds_device = device_array(
-                padded_sampling_seeds,
-                sharding=sharding,
-            )
-        else:
-            sampling_seeds_device = None
-
-        # Calculate batch size and vocab size
-        batch_size = len(batch.sampling_info.temperatures) + pad_size
-        vocab_size = batch.sampling_info.vocab_size
-        padded_linear_penalty = jnp.ones((batch_size, vocab_size), dtype=jnp.float32) * 0.2
-
-        linear_penalty_sharding = NamedSharding(mesh, PartitionSpec(None, "tensor"))
-
-        (linear_penalty_device,) = device_array(
-            (padded_linear_penalty,),
-            sharding=linear_penalty_sharding,
-        )
-
-        return cls(
-            return_logprob=batch.return_logprob,
-            top_logprobs_nums=batch.top_logprobs_nums,
-            token_ids_logprobs=batch.token_ids_logprobs,
-            temperatures=temperatures_device,
-            top_ps=top_ps_device,
-            top_ks=top_ks_device,
-            min_ps=min_ps_device,
-            sampling_seeds=sampling_seeds_device,
-            is_all_greedy=batch.sampling_info.is_all_greedy,
-            need_min_p_sampling=batch.sampling_info.need_min_p_sampling,
-            linear_penalty=linear_penalty_device,
-            do_penalties=True,
         )
 
 
@@ -342,7 +249,6 @@ class SamplingBatchInfo:
     # Penalizer
     penalizer_orchestrator: penaltylib.BatchedPenalizerOrchestrator | None = None
     linear_penalty: np.ndarray = None
-    tie_word_embeddings: bool = False
 
     @classmethod
     def _get_global_server_args_dict(cls):
@@ -355,8 +261,6 @@ class SamplingBatchInfo:
         cls,
         bs: int,
         vocab_size: int = 32000,
-        do_penalties: bool = False,
-        tie_word_embeddings: bool = False,
     ):
         temperatures = np.array([0.6 for _ in range(bs)], dtype=np.float32)
         top_ps = np.array([0.9 for _ in range(bs)], dtype=np.float32)
@@ -366,19 +270,7 @@ class SamplingBatchInfo:
             sampling_seeds = np.array([DEFAULT_SAMPLING_SEED for _ in range(bs)], dtype=np.int32)
         else:
             sampling_seeds = None
-
-        # Create mock batch for precompile with penalty-enabled requests
-        mock_batch = cls._create_mock_batch_for_precompile(bs, do_penalties)
-
-        penalizer_orchestrator = penaltylib.BatchedPenalizerOrchestrator(
-            vocab_size=vocab_size,
-            batch=mock_batch,
-            penalizers={
-                penaltylib.BatchedFrequencyPenalizer,
-                penaltylib.BatchedMinNewTokensPenalizer,
-                penaltylib.BatchedPresencePenalizer,
-            },
-        )
+        linear_penalty = np.zeros((bs, vocab_size), dtype=np.float32)
 
         ret = cls(
             temperatures=temperatures,
@@ -392,55 +284,16 @@ class SamplingBatchInfo:
             need_min_p_sampling=True,
             sampling_info_done=None,
             sampling_seeds=sampling_seeds,
-            penalizer_orchestrator=penalizer_orchestrator,
-            linear_penalty=None,
-            tie_word_embeddings=tie_word_embeddings,
+            penalizer_orchestrator=None,
+            linear_penalty=linear_penalty,
         )
         return ret
 
     @classmethod
-    def _create_mock_batch_for_precompile(cls, bs: int, do_penalties: bool = False):
-        """Create a mock batch with penalty-enabled requests for precompile."""
-        from sgl_jax.srt.sampling.sampling_params import SamplingParams
-
-        class MockReq:
-            def __init__(self, idx):
-                # Create sampling params with various penalty settings to ensure
-                # orchestrator recognizes penalties as required
-                if do_penalties:
-                    self.sampling_params = SamplingParams(
-                        temperature=0.6,
-                        top_p=0.9,
-                        top_k=30,
-                        min_p=0.6,
-                        frequency_penalty=0.1,  # Non-zero to trigger orchestrator
-                        presence_penalty=0.1,  # Non-zero to trigger orchestrator
-                        min_new_tokens=5,  # Non-zero to trigger orchestrator
-                    )
-                else:
-                    self.sampling_params = SamplingParams(
-                        temperature=0.6,
-                        top_p=0.9,
-                        top_k=30,
-                        min_p=0.6,
-                    )
-
-                # Create mock tokenizer for min_new_tokens penalizer
-                class MockTokenizer:
-                    eos_token_id = 0
-                    additional_stop_token_ids = [1, 2]
-
-                self.tokenizer = MockTokenizer()
-
-        class MockBatch:
-            def __init__(self, bs):
-                self.reqs = [MockReq(i) for i in range(bs)]
-
-        return MockBatch(bs)
-
-    @classmethod
     def from_schedule_batch(
-        cls, batch: ScheduleBatch, vocab_size: int, tie_word_embeddings: bool = False
+        cls,
+        batch: ScheduleBatch,
+        vocab_size: int,
     ):
         global_server_args_dict = cls._get_global_server_args_dict()
         enable_deterministic = global_server_args_dict["enable_deterministic_sampling"]
@@ -485,7 +338,6 @@ class SamplingBatchInfo:
             sampling_seeds=sampling_seeds,
             vocab_size=vocab_size,
             penalizer_orchestrator=penalizer_orchestrator,
-            tie_word_embeddings=tie_word_embeddings,
         )
         return ret
 
