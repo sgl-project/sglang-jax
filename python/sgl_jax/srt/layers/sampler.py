@@ -314,11 +314,8 @@ def top_p_normalize_probs_jax(
 
 def _apply_min_p_filter(operands):
     """Apply min_p filtering when need_min_p_sampling=True"""
-    # Handle both 2-tuple and 3-tuple cases for backward compatibility
-    if len(operands) == 3:
-        inputs, min_ps, _ = operands  # Ignore the third parameter
-    else:
-        inputs, min_ps = operands
+    inputs, min_ps = operands
+
     if is_tpu_runtime():
         max_per_bs = jnp.max(inputs, axis=1)
         min_p_thresholds = max_per_bs * min_ps
@@ -407,7 +404,7 @@ def top_k_top_p_min_p_sampling_from_probs_jax_not_tpu_runtime(args):
     probs_sort = jnp.where(top_p_mask, 0.0, probs_sort)
 
     # Use lax.cond to avoid recompilation due to need_min_p_sampling changes
-    min_p_operands = (probs_sort, min_ps, False)
+    min_p_operands = (probs_sort, min_ps)
     probs_sort = lax.cond(
         need_min_p_sampling,
         _apply_min_p_filter,
