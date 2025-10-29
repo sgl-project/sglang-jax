@@ -85,6 +85,9 @@ class ModelRunner:
 
         self.forward_pass_id = 0
 
+        # For sampling
+        self.use_sort_for_toppk_minp = server_args.use_sort_for_toppk_minp
+
         # Global vars
         global_server_args_dict.update(
             {k: getattr(server_args, k) for k in GLOBAL_SERVER_ARGS_KEYS}
@@ -157,11 +160,18 @@ class ModelRunner:
             model = nnx.merge(model_def, model_state)
             return model(forward_batch, token_to_kv_pool, logits_metadata)
 
-        @partial(jax.jit, static_argnames=["sampler_state_def", "mesh"])
-        def jitted_sampler(sampler_def, sampler_state_def, sampler_state_leaves, mesh, *args):
+        @partial(jax.jit, static_argnames=["sampler_state_def", "mesh", "use_sort_for_toppk_minp"])
+        def jitted_sampler(
+            sampler_def,
+            sampler_state_def,
+            sampler_state_leaves,
+            mesh,
+            use_sort_for_toppk_minp,
+            *args,
+        ):
             model_state = jax.tree_util.tree_unflatten(sampler_state_def, sampler_state_leaves)
             sampler = nnx.merge(sampler_def, model_state)
-            return sampler(*args, mesh=mesh)
+            return sampler(*args, mesh=mesh, use_sort_for_toppk_minp=use_sort_for_toppk_minp)
 
         def run_model_wrapper(forward_batch, logits_metadata):
             token_to_kv_pool = self.token_to_kv_pool
@@ -177,7 +187,12 @@ class ModelRunner:
 
         self.jitted_run_model = run_model_wrapper
         self.jitted_sampler = partial(
-            jitted_sampler, sampler_def, sampler_state_def, sampler_state_leaves, self.mesh
+            jitted_sampler,
+            sampler_def,
+            sampler_state_def,
+            sampler_state_leaves,
+            self.mesh,
+            self.use_sort_for_toppk_minp,
         )
 
     def get_available_device_memory(self):
