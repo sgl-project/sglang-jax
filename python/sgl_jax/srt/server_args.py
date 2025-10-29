@@ -144,6 +144,8 @@ class ServerArgs:
     enable_deterministic_sampling: bool = False
     enable_single_process: bool = False
 
+    enable_nan_detection: bool = False
+
     def __post_init__(self):
         # Set missing default values
         if self.tokenizer_path is None:
@@ -774,6 +776,12 @@ class ServerArgs:
             ],
             default=ServerArgs.attention_backend,
             help="Choose the kernels for attention layers.",
+        )
+
+        parser.add_argument(
+            "--enable-nan-detection",
+            action="store_true",
+            help="Enable the NaN detection for debugging purposes.",
         )
 
         # Speculative decoding

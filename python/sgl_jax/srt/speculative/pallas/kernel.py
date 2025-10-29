@@ -34,25 +34,7 @@ def create_extend_after_decode_spec_info(
     return positions_updated, new_verified_id_updated
 
 
-def assign_req_to_token_pool(
-    req_pool_indices,
-    req_to_token_pool,
-    start_offsets,
-    end_offsets,
-    out_cache_loc,
-):
-    bs = start_offsets.shape[0]
-    out_cache_lens = end_offsets - start_offsets
-    out_cache_loc_start_positions = jnp.concatenate(
-        [jnp.array([0], dtype=jnp.int32), jnp.cumsum(out_cache_lens)]
-    )[0:-1]
 
-    for i in range(bs):
-        out_cache_loc_start = out_cache_loc_start_positions[i]
-        req_to_token_pool.write(
-            (req_pool_indices[i], slice(start_offsets[i], end_offsets[i])),
-            out_cache_loc[out_cache_loc_start : out_cache_loc_start + out_cache_lens[i]],
-        )
 
 
 def verify_tree_greedy(

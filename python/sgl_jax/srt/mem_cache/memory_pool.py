@@ -13,17 +13,17 @@ from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 from jax.tree_util import register_pytree_node_class
 
+from sgl_jax.srt.layers.attention.flash_attn_kernel.flash_attention import merge_kv
 from sgl_jax.srt.utils import cdiv
 
+# def merge_kv(k: jax.Array, v: jax.Array) -> jax.Array:
+#     assert k.shape == v.shape, f"k and v must have same shape, got {k.shape} vs {v.shape}"
 
-def merge_kv(k: jax.Array, v: jax.Array) -> jax.Array:
-    assert k.shape == v.shape, f"k and v must have same shape, got {k.shape} vs {v.shape}"
+#     num_tokens, num_kv_heads, head_dim = k.shape
 
-    num_tokens, num_kv_heads, head_dim = k.shape
-
-    kv_concat = jnp.concatenate([k, v], axis=-1)  # [tokens, heads, head_dim*2]
-    kv_fused = kv_concat.reshape(num_tokens, num_kv_heads * 2, head_dim)
-    return kv_fused
+#     kv_concat = jnp.concatenate([k, v], axis=-1)  # [tokens, heads, head_dim*2]
+#     kv_fused = kv_concat.reshape(num_tokens, num_kv_heads * 2, head_dim)
+#     return kv_fused
 
 
 logger = logging.getLogger(__name__)
@@ -376,7 +376,6 @@ class MHATokenToKVPool(KVCache):
         # Merge k and v into fused format
 
         fused_kv = merge_kv(k, v)  # [total_tokens, num_heads * 2, head_dim]
-
         # Update the fused KV cache
         self.kv_buffer[layer_idx] = _set_fused_kv_buffer(
             fused_kv=fused_kv,

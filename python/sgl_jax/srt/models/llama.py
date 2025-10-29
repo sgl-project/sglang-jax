@@ -217,13 +217,12 @@ class LlamaDecoderLayer(nnx.Module):
         attention_bias = getattr(config, "attention_bias", False) or getattr(config, "bias", False)
 
         head_dim = getattr(config, "head_dim", None)
-        self.head_dim = (head_dim + 127) // 128 * 128
 
         self.self_attn = LlamaAttention(
             hidden_size=self.hidden_size,
             num_heads=config.num_attention_heads,
             num_kv_heads=config.num_key_value_heads,
-            head_dim=self.head_dim,
+            head_dim=head_dim,
             layer_id=layer_id,
             rope_theta=rope_theta,
             rope_scaling=rope_scaling,

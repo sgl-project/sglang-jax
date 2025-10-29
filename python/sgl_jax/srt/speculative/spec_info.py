@@ -1,6 +1,11 @@
-from dataclasses import dataclass
+import logging
 from enum import IntEnum, auto
-from typing import TYPE_CHECKING, Any, List
+
+import jax
+
+from sgl_jax.srt.layers.logits_processor import LogitsProcessorOutput
+
+logger = logging.getLogger(__name__)
 
 
 class SpeculativeAlgorithm(IntEnum):
@@ -32,3 +37,10 @@ class SpeculativeAlgorithm(IntEnum):
         if name is not None:
             name = name.upper()
         return name_map[name]
+
+
+def detect_nan(logits_output: LogitsProcessorOutput):
+    logits = logits_output.next_token_logits
+    if jax.numpy.any(jax.numpy.isnan(logits)):
+        logger.error("Detected errors during sampling! NaN in the logits.")
+        raise ValueError("Detected errors during sampling! NaN in the logits.")

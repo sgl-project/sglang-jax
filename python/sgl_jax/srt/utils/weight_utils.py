@@ -79,9 +79,9 @@ class WeightLoader:
             model_config, "head_dim", self.hidden_size // self.num_heads
         )
 
-        self.head_dim = (self.head_dim_original + 127) // 128 * 128
-        self.head_dim_pad = self.head_dim - self.head_dim_original
-
+        # self.head_dim = (self.head_dim_original + 127) // 128 * 128
+        self.head_dim_pad = (self.head_dim_original + 127) // 128 * 128 - self.head_dim_original
+        self.head_dim = self.head_dim_original
         if hasattr(self.mesh, "shape") and "tensor" in self.mesh.shape:
             self.sharding_size = self.mesh.shape["tensor"]
         else:
@@ -216,8 +216,9 @@ class WeightLoader:
         if mapping.reshape is not None:
             processed_weight = jnp.reshape(processed_weight, mapping.reshape)
         if mapping.head_dim_padding and self.head_dim_pad > 0:
-
-            processed_weight = self._apply_head_dim_padding(processed_weight, hf_key, mapping)
+            pass
+            # this is deprecated, we should not padding weight at head_dim axis here
+            # processed_weight = self._apply_head_dim_padding(processed_weight, hf_key, mapping)
 
         if mapping.kv_head_padding:
             processed_weight = self._apply_kv_head_padding(processed_weight, hf_key)

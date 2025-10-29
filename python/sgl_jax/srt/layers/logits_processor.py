@@ -11,11 +11,14 @@ from jax.sharding import PartitionSpec as P
 from jax.tree_util import register_pytree_node_class
 
 from sgl_jax.srt.layers.embeddings import Embed
-from sgl_jax.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
 from sgl_jax.srt.utils.jax_utils import device_array
 
 if TYPE_CHECKING:
     from sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch
+    from sgl_jax.srt.model_executor.forward_batch_info import (
+        CaptureHiddenMode,
+        ForwardMode,
+    )
 
 
 @register_pytree_node_class
@@ -89,30 +92,29 @@ class LogitsProcessorOutput:
         return obj
 
     def truncate_logits_processor_output(self, batch: "ModelWorkerBatch"):
+        from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
+
         # note: here only need to truncate next_token_logits and hidden_states
         if batch.forward_mode == ForwardMode.TARGET_VERIFY:
             # For ForwardMode.TARGET_VERIFY mode, we should take draft_token_num token for tree verify later
-            self.next_token_logits = jax.lax.dynamic_slice_in_dim(
-                self.next_token_logits,
-                0,
-                batch.real_bs * batch.spec_info.draft_token_num,
-                axis=0,
-            )
+            self.next_token_logits = self.next_token_logits[
+                0 : batch.real_bs * batch.spec_info.draft_token_num
+            ]
+        
         else:
-            self.next_token_logits = jax.lax.dynamic_slice_in_dim(
-                self.next_token_logits, 0, batch.real_bs, axis=0
-            )
-            self.hidden_states = jax.lax.dynamic_slice_in_dim(
-                self.hidden_states, 0, batch.real_bs, axis=0
-            )
+            self.next_token_logits = self.next_token_logits[0 : batch.real_bs]
+            if len(self.hidden_states.shape) == 1:
+                self.hidden_states = jnp.expand_dims(self.hidden_states, axis=0)
+            self.hidden_states = self.hidden_states[0 : batch.real_bs]
+
         # assert not batch.capture_hidden_mode.need_capture()
 
 
 @register_pytree_node_class
 @dataclasses.dataclass
 class LogitsMetadata:
-    forward_mode: ForwardMode
-    capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.NULL
+    forward_mode: "ForwardMode"
+    capture_hidden_mode: "CaptureHiddenMode" = None
 
     extend_return_logprob: bool = False
     extend_return_top_logprob: bool = False
@@ -250,6 +252,7 @@ class LogitsProcessor(nnx.Module):
             pruned_states = hidden_states[last_index]
             if aux_hidden_states is not None:
                 aux_pruned_states = [hidden[last_index] for hidden in aux_hidden_states]
+
             sample_indices = None
             input_logprob_indices = None
         else:
@@ -314,11 +317,13 @@ class LogitsProcessor(nnx.Module):
                 # pruned states only contain the last tokens already.
                 if aux_hidden_states is not None:
                     aux_pruned_states = jnp.concat(aux_pruned_states, axis=-1)
+
                     hidden_states_to_store = (
                         aux_pruned_states[sample_indices]
                         if sample_indices is not None
                         else aux_pruned_states
                     )
+
                 else:
                     hidden_states_to_store = (
                         pruned_states[sample_indices]

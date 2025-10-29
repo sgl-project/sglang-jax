@@ -10,6 +10,7 @@ from sgl_jax.srt.layers.logits_processor import LogitsProcessorOutput
 from sgl_jax.srt.managers.io_struct import BatchTokenIDOut
 from sgl_jax.srt.managers.schedule_batch import BaseFinishReason, Req, ScheduleBatch
 from sgl_jax.srt.precision_tracer import precision_tracer
+from sgl_jax.srt.utils.common_utils import cdiv
 
 if TYPE_CHECKING:
     from sgl_jax.srt.managers.scheduler import (
@@ -100,6 +101,7 @@ class SchedulerOutputProcessorMixin:
                         ):
                             precision_tracer.stop_trace()
                     self.tree_cache.cache_finished_req(req)
+
                 elif not batch.decoding_reqs or req not in batch.decoding_reqs:
                     # This updates radix so others can match
                     self.tree_cache.cache_unfinished_req(req)
@@ -153,6 +155,25 @@ class SchedulerOutputProcessorMixin:
 
         self.stream_output(batch.reqs, batch.return_logprob, skip_stream_req, cache_miss_count)
 
+        batch.spec_info = result.next_draft_input
+
+    def _resolve_spec_decode_token_ids(
+        self: Scheduler, result: GenerationBatchResult, batch: ScheduleBatch
+    ) -> list[list[int]]:
+        """Resolve the padding next token ids for speculative decoding with overlap."""
+
+        next_token_ids = result.next_token_ids
+        accept_lens = result.accept_lens.tolist()
+        result.num_accepted_tokens = sum(accept_lens) - len(batch.reqs)
+        predict_tokens = []
+        stride = self.draft_worker.speculative_num_draft_tokens
+        for i, req in enumerate(batch.reqs):
+            predict_tokens.append([token for token in next_token_ids[i * stride : i * stride + stride] if token != 0])
+            req.spec_verify_ct += 1
+            req.spec_accepted_tokens += accept_lens[i]
+
+        return predict_tokens
+
     def process_batch_result_decode(
         self: Scheduler,
         batch: ScheduleBatch,
@@ -164,7 +185,13 @@ class SchedulerOutputProcessorMixin:
             result.next_token_ids,
             result.cache_miss_count,
         )
+        if not self.spec_algorithm.is_none():
+            next_token_ids = self._resolve_spec_decode_token_ids(result=result, batch=batch)
+            allocate_lens_list = result.allocate_lens.tolist()
+            accept_lens_list = result.accept_lens.tolist()
         self.num_generated_tokens += len(batch.reqs)
+
+        # FIXME(pc) add spec decode metrics
 
         if self.enable_overlap:
             logits_output, next_token_ids, cache_miss_count = (
@@ -184,21 +211,50 @@ class SchedulerOutputProcessorMixin:
         # NOTE: the length of reqs and next_token_ids don't match if it is spec decoding.
         # We should ignore using next_token_ids for spec decoding cases.
         for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
+            req: Req
+
+            indices_to_free = None
+            if self.enable_overlap and req.finished():
+                if self.page_size == 1:
+                    indices_to_free = batch.out_cache_loc[i : i + 1]
+                else:
+                    if (len(req.origin_input_ids) + len(req.output_ids) - 1) % self.page_size == 0:
+                        indices_to_free = batch.out_cache_loc[i : i + 1]
+                if indices_to_free is not None:
+                    self.token_to_kv_pool_allocator.free(indices_to_free)
+                continue
+
             if req.is_retracted:
                 continue
 
-            if self.enable_overlap and req.finished():
-                if self.page_size == 1:
-                    self.token_to_kv_pool_allocator.free(batch.out_cache_loc[i : i + 1])
-                else:
-                    if (len(req.origin_input_ids) + len(req.output_ids) - 1) % self.page_size == 0:
-                        self.token_to_kv_pool_allocator.free(batch.out_cache_loc[i : i + 1])
-                continue
+            new_accepted_len = 1
             if batch.spec_algorithm.is_none():
                 req.output_ids.append(next_token_id)
+            elif self.spec_algorithm.is_eagle():
+                req.output_ids.extend(next_token_id) 
+                new_accepted_len = len(next_token_id)
 
-            req.check_finished()
+            req.check_finished(new_accepted_len)
             if req.finished():
+                if batch.spec_algorithm.is_eagle():
+                    all_token_len = len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0)
+                    if self.page_size > 1:
+                        all_token_len = cdiv(all_token_len, self.page_size) * self.page_size
+                    kv_indices = self.req_to_token_pool.req_to_token[
+                        req.req_pool_idx,
+                        all_token_len : -1,
+                    ]
+                    kv_indices = kv_indices[kv_indices != 0]
+                    # start_p = batch.seq_lens[i] + accept_lens_list[i] - (len(req.output_ids) - 1)
+                    # end_p = allocate_lens_list[i]
+                    # print(f"============{start_p=}======================={end_p=}======={ batch.seq_lens[i]=}====={accept_lens_list[i]}=")
+                    # if self.page_size > 1:
+                    #     start_p = cdiv(start_p, self.page_size) * self.page_size
+                    # print(f"============{ self.req_to_token_pool.req_to_token[req.req_pool_idx][:30]=}====================================")
+                    # indices_to_free = self.req_to_token_pool.req_to_token[req.req_pool_idx][
+                    #     start_p:end_p
+                    # ]
+                    self.token_to_kv_pool_allocator.free(kv_indices)
                 # End trace for finished request
                 if precision_tracer.get_trace_active():
                     precision_tracer.set_request_status_to_completed(req.rid)
@@ -232,13 +288,15 @@ class SchedulerOutputProcessorMixin:
                         logits_output.next_token_token_ids_logprobs_idx[i]
                     )
 
+            if req.return_hidden_states and logits_output.hidden_states is not None:
+                req.hidden_states.append(logits_output.hidden_states[i])
+
         self.set_next_batch_sampling_info_done(batch)
         self.stream_output(batch.reqs, batch.return_logprob, cache_miss_count=cache_miss_count)
         self.token_to_kv_pool_allocator.free_group_end()
 
         self.forward_ct_decode = (self.forward_ct_decode + 1) % (1 << 30)
         batch.cache_miss_count = cache_miss_count
-
         if (
             self.forward_ct_decode % self.server_args.decode_log_interval == 0
             or batch.cache_miss_count > 0
@@ -431,6 +489,8 @@ class SchedulerOutputProcessorMixin:
         prompt_tokens = []
         completion_tokens = []
         cached_tokens = []
+        spec_verify_ct = []
+        spec_accepted_tokens = []
         output_hidden_states = None
 
         if return_logprob:
@@ -506,6 +566,10 @@ class SchedulerOutputProcessorMixin:
                 prompt_tokens.append(len(req.origin_input_ids))
                 completion_tokens.append(len(req.output_ids))
                 cached_tokens.append(req.cached_tokens)
+
+                if not self.spec_algorithm.is_none():
+                    spec_verify_ct.append(req.spec_verify_ct)
+                    spec_accepted_tokens.append(req.spec_accepted_tokens)
 
                 if return_logprob:
                     if req.return_logprob and not req.input_logprob_sent:

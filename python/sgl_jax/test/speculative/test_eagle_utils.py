@@ -2,18 +2,21 @@ import unittest
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 
-from sgl_jax.srt.speculative.eagle_util import create_extend_after_decode_spec_info
+from sgl_jax.srt.speculative.eagle_util import (
+    build_tree_mask_for_draft_decode,
+    create_extend_after_decode_spec_info,
+    tree_speculative_sampling_target_only,
+    verify_tree_greedy,
+)
 from sgl_jax.srt.speculative.pallas.tree_speculative_sampling_target_only_kernel import (
     tree_speculative_sampling_target_only_pallas_call,
 )
-from sgl_jax.srt.speculative.pallas.verify_tree_greedy_kernel import verify_tree_greedy
-from sgl_jax.srt.utils.mesh_utils import create_device_mesh
 from sgl_jax.test.test_utils import CustomTestCase
 
-mesh = create_device_mesh(ici_parallelism=[1, -1, 1], dcn_parallelism=[1, 1, 1])
-
-
+from sgl_jax.srt.speculative.pallas.verify_tree_greedy_kernel import verify_tree_greedy
+from sgl_jax.srt.utils.mesh_utils import create_device_mesh
 class TestVerifyTree(CustomTestCase):
     def test_verify_tree_greedy(self):
         candidates = jnp.array(
@@ -277,6 +280,105 @@ class TestVerifyTree(CustomTestCase):
             expected_verified_id,
             f"verified_id not equal, result: {new_verified_id.tolist()}, expected: {expected_verified_id}",
         )
+
+
+class TestDraftDecodeMask(CustomTestCase):
+    def _expected(
+        self,
+        seq_len: int,
+        speculative_step_id: int,
+        topk: int,
+        parents_rows: list[np.ndarray] | None = None,
+    ) -> np.ndarray:
+        kv_len = seq_len + (speculative_step_id + 1) * topk
+        mask = np.zeros((topk, kv_len), dtype=bool)
+        mask[:, :seq_len] = True
+
+        ancestry = np.zeros((speculative_step_id + 1, topk), dtype=np.int32)
+        ancestry[speculative_step_id] = np.arange(topk, dtype=np.int32)
+
+        parent_rows = parents_rows or [None] * (speculative_step_id + 1)
+        if len(parent_rows) < speculative_step_id + 1:
+            parent_rows = list(parent_rows) + [None] * (speculative_step_id + 1 - len(parent_rows))
+
+        for step in range(speculative_step_id, 0, -1):
+            row = parent_rows[step]
+            if row is None:
+                ancestry[step - 1] = ancestry[step]
+                continue
+            row_np = np.asarray(row, dtype=np.int64)
+            offset = topk if step == 1 else topk**2 * (step - 1) + topk
+            parent_indices = np.clip((row_np - offset) // topk, 0, topk - 1).astype(np.int32)
+            ancestry[step - 1] = parent_indices[ancestry[step]]
+
+        for branch in range(topk):
+            for step in range(speculative_step_id + 1):
+                branch_idx = ancestry[step, branch]
+                position = seq_len + step * topk + branch_idx
+                mask[branch, position] = True
+
+        return mask.reshape(-1)
+
+    def test_single_step(self):
+        mask = build_tree_mask_for_draft_decode(
+            seq_lens=jnp.array([6]),
+            topk=3,
+            speculative_step_id=0,
+            parents_list=[jnp.arange(-1, 3, dtype=jnp.int32)[None, :]],
+        )
+        expected = self._expected(6, speculative_step_id=0, topk=3)
+        print(f"======test_single_step======{mask=}================")
+
+        self.assertEqual(mask.tolist(), expected.tolist())
+
+    def test_multi_step(self):
+        parents_rows = [None, np.array([4, 3]), np.array([6, 9])]
+        parents = [
+            jnp.array([[-1, 0]], dtype=jnp.int32),
+            jnp.array([[4, 3]], dtype=jnp.int32),
+            jnp.array([[6, 9]], dtype=jnp.int32),
+        ]
+        mask = build_tree_mask_for_draft_decode(
+            seq_lens=jnp.array([4]),
+            topk=2,
+            speculative_step_id=2,
+            parents_list=parents,
+        )
+        expected = self._expected(4, speculative_step_id=2, topk=2, parents_rows=parents_rows)
+        print(f"=====test_multi_step======={mask=}================")
+
+        self.assertEqual(mask.tolist(), expected.tolist())
+
+    def test_batch_concatenation(self):
+        parents = [
+            jnp.tile(jnp.arange(-1, 2, dtype=jnp.int32), (2, 1)),
+            jnp.array([[4, 3], [2, 5]], dtype=jnp.int32),  # offset 2 -> batch-specific parents
+        ]
+        mask = build_tree_mask_for_draft_decode(
+            seq_lens=jnp.array([3, 5]),
+            topk=2,
+            speculative_step_id=1,
+            parents_list=parents,
+        )
+        expected = np.concatenate(
+            [
+                self._expected(
+                    3,
+                    speculative_step_id=1,
+                    topk=2,
+                    parents_rows=[None, np.array([4, 3])],
+                ),
+                self._expected(
+                    5,
+                    speculative_step_id=1,
+                    topk=2,
+                    parents_rows=[None, np.array([2, 5])],
+                ),
+            ]
+        )
+        print(f"====test_batch_concatenation========{mask=}================")
+
+        self.assertEqual(mask.tolist(), expected.tolist())
 
 
 if __name__ == "__main__":

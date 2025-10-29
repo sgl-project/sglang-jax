@@ -412,7 +412,7 @@ class ModelRunner:
             return FlashAttentionBackend(
                 self.num_attn_heads,
                 self.num_kv_heads,
-                (self.model_config.head_dim + 127) // 128 * 128,
+                self.model_config.head_dim,
                 page_size=self.page_size,
                 mesh=self.mesh,
             )

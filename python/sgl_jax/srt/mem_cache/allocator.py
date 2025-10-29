@@ -97,6 +97,7 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def clear(self):
         # The padded slot 0 is used for writing dummy outputs from padded tokens.
         self.free_slots = np.arange(1, self.size + 1, dtype=np.int32)
+        self.origin_size = len(self.free_slots)
         self.is_not_in_free_group = True
         self.free_group = []
 

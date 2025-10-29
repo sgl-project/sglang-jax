@@ -209,7 +209,7 @@ class LlamaEagleModel(LlamaModel):
         )
         if residual is not None:
             hidden_states = hidden_states + residual
-            residual = hidden_states
+            residual = hidden_states.copy()
         hidden_states_to_logits = self.norm(hidden_states)
 
         layers_kv_fused = [kv_fused] if kv_fused is not None else []
@@ -325,7 +325,7 @@ class LlamaForCausalLMEagle3(LlamaForCausalLM):
             target_path="transformer.midlayer.self_attn.q_proj.weight",
             sharding=(None, "tensor"),
             transpose=True,
-            head_dim_padding=True,
+            head_dim_padding=False,
             kv_head_padding=False,
             is_eagle3=True,
         )
@@ -333,7 +333,7 @@ class LlamaForCausalLMEagle3(LlamaForCausalLM):
             target_path="transformer.midlayer.self_attn.k_proj.weight",
             sharding=(None, "tensor"),
             transpose=True,
-            head_dim_padding=True,
+            head_dim_padding=False,
             kv_head_padding=True,
             is_eagle3=True,
         )
@@ -341,7 +341,7 @@ class LlamaForCausalLMEagle3(LlamaForCausalLM):
             target_path="transformer.midlayer.self_attn.v_proj.weight",
             sharding=(None, "tensor"),
             transpose=True,
-            head_dim_padding=True,
+            head_dim_padding=False,
             kv_head_padding=True,
             is_eagle3=True,
         )
