@@ -238,7 +238,7 @@ class TestModelRunner(unittest.TestCase):
         current_token = self.model_runner.sampler(
             extend_output,
             sampling_metadata=SamplingMetadata.from_model_worker_batch(
-                model_worker_batch.sampling_info
+                model_worker_batch.sampling_info, vocab_size=self.model_config.vocab_size
             ),
         )
 
@@ -267,7 +267,7 @@ class TestModelRunner(unittest.TestCase):
             current_token = self.model_runner.sampler(
                 decode_output,
                 sampling_metadata=SamplingMetadata.from_model_worker_batch(
-                    model_worker_batch.sampling_info
+                    model_worker_batch.sampling_info, vocab_size=self.model_config.vocab_size
                 ),
             )
             all_generated_tokens.append(current_token)

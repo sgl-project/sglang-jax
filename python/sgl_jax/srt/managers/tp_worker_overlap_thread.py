@@ -159,6 +159,7 @@ class ModelWorkerClient:
                 model_worker_batch,
                 len(model_worker_batch.seq_lens) - model_worker_batch.real_bs,
                 self.mesh,
+                self.worker.model_config.vocab_size,
             )
 
         forward_metadata = self.worker.model_runner.attn_backend.get_forward_metadata(

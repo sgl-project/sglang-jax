@@ -94,18 +94,19 @@ class Sampler(nnx.Module):
         return None
 
     def _apply_linear_penalty(self, operands):
-        """Apply linear penalty branch (overlap mode)"""
+        """
+        Args:
+            logits: The input logits tensor of shape [batch_size, vocab_size]
+            sampling_metadata: Metadata containing penalty information (never None)
+
+        Returns:
+            Modified logits with penalties applied
+        """
         logits, sampling_metadata = operands
         penalty = sampling_metadata.linear_penalty
 
         # Validate penalty shape matches logits when penalty exists
-        if penalty is not None:
-            assert (
-                penalty.shape == logits.shape
-            ), f"Linear penalty shape {penalty.shape} doesn't match logits shape {logits.shape}"
-            penalty = penalty.astype(logits.dtype)
-        else:
-            penalty = jnp.array(0.0, dtype=logits.dtype)
+        penalty = penalty.astype(logits.dtype)
 
         return logits + penalty
 
@@ -134,31 +135,6 @@ class Sampler(nnx.Module):
 
         return logits + stop_penalty.astype(logits.dtype)
 
-    def apply_penalties(self, logits: jax.Array, sampling_metadata: SamplingMetadata) -> jax.Array:
-        """
-        Apply penalties to logits with JIT-optimized tensor operations using lax.cond.
-
-        This method handles penalty application efficiently for both overlap and
-        non-overlap modes by using lax.cond to ensure compilation-time optimization
-        of different penalty application paths.
-
-        Args:
-            logits: The input logits tensor of shape [batch_size, vocab_size]
-            sampling_metadata: Metadata containing penalty information (never None)
-
-        Returns:
-            Modified logits with penalties applied
-        """
-
-        result_logits = lax.cond(
-            sampling_metadata.do_penalties,
-            self._apply_linear_penalty,
-            lambda operands: operands[0],  # Return logits
-            (logits, sampling_metadata),
-        )
-
-        return result_logits
-
     def __call__(
         self,
         logits_output: LogitsProcessorOutput,
@@ -174,7 +150,12 @@ class Sampler(nnx.Module):
             positions: The positions of the tokens in the sequence.
         """
         # Apply penalties before sampling
-        logits = self.apply_penalties(logits_output.next_token_logits, sampling_metadata)
+        logits = lax.cond(
+            sampling_metadata.do_penalties,
+            self._apply_linear_penalty,
+            lambda operands: operands[0],
+            (logits_output.next_token_logits, sampling_metadata),
+        )
 
         _, rng = jax.random.split(self.rngs.params())
         operands = (logits, sampling_metadata, positions, rng)

@@ -526,6 +526,7 @@ class TestFeatures(CustomTestCase):
             text="Say hello hello hello",
             temperature=0.5,
             max_new_tokens=1,
+            frequency_penalty=0.2,
         )
 
         # Test frequency penalty = 1.0
@@ -542,6 +543,7 @@ class TestFeatures(CustomTestCase):
             text="The weather is nice today. The weather",
             temperature=0.5,
             max_new_tokens=2,
+            frequency_penalty=0.2,
         )
         resp_with_penalty = run_curl(args)
         if "cache_miss_count" not in resp_with_penalty["meta_info"]:
@@ -556,6 +558,7 @@ class TestFeatures(CustomTestCase):
             text="The weather is nice today. The weather",
             temperature=0.5,
             max_new_tokens=1,
+            presence_penalty=0.2,
         )
 
         resp_with_penalty = run_curl(args)
@@ -570,6 +573,7 @@ class TestFeatures(CustomTestCase):
             text="The weather is nice today. The weather",
             temperature=0.5,
             max_new_tokens=2,
+            presence_penalty=0.2,
         )
 
         resp_with_penalty = run_curl(args)
@@ -586,9 +590,11 @@ class TestFeatures(CustomTestCase):
             text="Hello",
             temperature=0.0,
             max_new_tokens=1,
+            min_new_tokens=1,
         )
 
         resp_with_min_tokens = run_curl(args)
+
         if "cache_miss_count" not in resp_with_min_tokens["meta_info"]:
             raise "[min_new_tokens] cache_miss_count is missed in response"
         self.assertEqual(resp_with_min_tokens["meta_info"]["cache_miss_count"], 0)
@@ -600,6 +606,7 @@ class TestFeatures(CustomTestCase):
             text="Hello",
             temperature=0.0,
             max_new_tokens=2,
+            min_new_tokens=2,
         )
 
         resp_with_min_tokens = run_curl(args)
@@ -697,6 +704,7 @@ class TestNoOverlapSchedule(CustomTestCase):
             text="Say hello hello hello",
             temperature=0.5,
             max_new_tokens=1,
+            frequency_penalty=0.2,
         )
 
         # Test frequency penalty = 1.0
@@ -713,6 +721,7 @@ class TestNoOverlapSchedule(CustomTestCase):
             text="The weather is nice today. The weather",
             temperature=0.5,
             max_new_tokens=2,
+            frequency_penalty=0.2,
         )
         resp_with_penalty = run_curl(args)
         if "cache_miss_count" not in resp_with_penalty["meta_info"]:
@@ -727,6 +736,7 @@ class TestNoOverlapSchedule(CustomTestCase):
             text="The weather is nice today. The weather",
             temperature=0.5,
             max_new_tokens=1,
+            presence_penalty=0.2,
         )
 
         resp_with_penalty = run_curl(args)
@@ -740,6 +750,7 @@ class TestNoOverlapSchedule(CustomTestCase):
             text="The weather is nice today. The weather",
             temperature=0.5,
             max_new_tokens=2,
+            presence_penalty=0.2,
         )
 
         resp_with_penalty = run_curl(args)
@@ -756,6 +767,7 @@ class TestNoOverlapSchedule(CustomTestCase):
             text="Hello",
             temperature=0.0,
             max_new_tokens=1,
+            min_new_tokens=1,
         )
 
         resp_with_min_tokens = run_curl(args)
@@ -769,6 +781,7 @@ class TestNoOverlapSchedule(CustomTestCase):
             text="Hello",
             temperature=0.0,
             max_new_tokens=2,
+            min_new_tokens=2,
         )
 
         # decode

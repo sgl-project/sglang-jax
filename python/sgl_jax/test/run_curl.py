@@ -17,6 +17,9 @@ def run_curl(args):
         "sampling_params": {
             "temperature": args.temperature,
             "max_new_tokens": getattr(args, "max_new_tokens", 10),
+            "frequency_penalty": getattr(args, "frequency_penalty", 0.0),
+            "presence_penalty": getattr(args, "presence_penalty", 0.0),
+            "min_new_tokens": getattr(args, "min_new_tokens", 0),
         },
         "text": args.text,
         "return_logprob": getattr(args, "return_logprob", False),
@@ -80,6 +83,12 @@ if __name__ == "__main__":
         "--logprob-start-len",
         type=int,
     )
+    parser.add_argument(
+        "--frequency-penalty",
+        type=float,
+    )
+    parser.add_argument("--presence-penalty", type=float)
+    parser.add_argument("--min-new-tokens", type=int)
     args = parser.parse_args()
 
     run_curl(args)
