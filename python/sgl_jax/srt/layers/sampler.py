@@ -21,14 +21,14 @@ class Sampler(nnx.Module):
 
     def _greedy_sampling(self, operands):
         """Greedy sampling branch"""
-        logits, _, _, _, _ = operands
+        logits, _, _, _ = operands
         batch_next_token_ids = jnp.argmax(logits, -1).flatten()
         logprobs = jax.nn.log_softmax(logits, axis=-1)
         return batch_next_token_ids, logprobs
 
     def _regular_sampling(self, operands):
         """Regular sampling branch"""
-        logits, sampling_metadata, positions, rng, use_sort_for_toppk_minp, mesh = operands
+        logits, sampling_metadata, positions, rng, mesh, use_sort_for_toppk_minp = operands
 
         logits = lax.with_sharding_constraint(logits, NamedSharding(mesh, P(None, None)))
 
@@ -57,9 +57,13 @@ class Sampler(nnx.Module):
             sampling_metadata.sampling_seeds,
             sampling_metadata.need_min_p_sampling,
             rng,
+            # use_sort_for_toppk_minp,
+        )
+        # batch_next_token_ids = top_k_top_p_min_p_sampling_from_probs_jax(args)
+        batch_next_token_ids = top_k_top_p_min_p_sampling_from_probs_jax(
+            args,
             use_sort_for_toppk_minp,
         )
-        batch_next_token_ids = top_k_top_p_min_p_sampling_from_probs_jax(args)
 
         log_probs = jnp.log(probs).clip(min=jnp.finfo(probs.dtype).min)
         return batch_next_token_ids, log_probs
@@ -161,8 +165,8 @@ class Sampler(nnx.Module):
         )
 
         _, rng = jax.random.split(self.rngs.params())
-        operands = (logits, sampling_metadata, positions, rng, use_sort_for_toppk_minp)
-        regular_fn = lambda op: self._regular_sampling((*op, mesh))
+        operands = (logits, sampling_metadata, positions, rng)
+        regular_fn = lambda op: self._regular_sampling((*op, mesh, use_sort_for_toppk_minp))
         batch_next_token_ids, logprobs = lax.cond(
             sampling_metadata.is_all_greedy,
             self._greedy_sampling,
@@ -217,8 +221,8 @@ def get_token_ids_logprobs(logprobs: jax.Array, token_ids_logprobs: list[list[in
 def multinomial(
     operands,
 ) -> jax.Array:
-    inputs, _, _, rng, use_sort_for_toppk_minp = operands
-    if is_tpu_runtime() and not use_sort_for_toppk_minp:
+    inputs, _, _, rng, use_probs = operands
+    if not use_probs:
         return random.categorical(rng, inputs).reshape(-1, 1)
     return random.categorical(rng, jnp.log(inputs)).reshape(-1, 1)
 
@@ -247,13 +251,14 @@ def multinomial_with_seed(
         A array of shape (n,) where the i-th element is an index sampled
         from the distribution in `inputs[i]` using `seed[i]`.
     """
-    inputs, seed, positions, _, use_sort_for_toppk_minp = operands
-    if not use_sort_for_toppk_minp:
-        inputs = jax.nn.softmax(inputs, axis=-1)
-    # inputs = jax.nn.softmax(logits, axis=-1)
+    inputs, seed, positions, _, use_probs = operands
     if seed is None:
         # note: this codes is used to keep compatible with lax.cond
         return multinomial(operands)
+    if not use_probs:
+        inputs = jax.nn.softmax(inputs, axis=-1)
+    # inputs = jax.nn.softmax(logits, axis=-1)
+
     n, m = inputs.shape
     step_seed = seed * 19349663 ^ positions * 73856093
     seed_expanded = step_seed[:, None]
@@ -300,9 +305,8 @@ def top_p_normalize_probs_jax(
 
 def _apply_min_p_filter(operands):
     """Apply min_p filtering when need_min_p_sampling=True"""
-    inputs, min_ps, use_sort_for_toppk_minp = operands
-
-    if is_tpu_runtime() and not use_sort_for_toppk_minp:
+    inputs, min_ps, use_probs = operands
+    if not use_probs:
         max_per_bs = jnp.max(inputs, axis=1)
         min_p_thresholds = max_per_bs * min_ps
     else:
@@ -311,13 +315,16 @@ def _apply_min_p_filter(operands):
     return jnp.where(min_p_mask, 0.0, inputs)
 
 
-def top_k_top_p_min_p_sampling_from_probs_jax(args):
-    if is_tpu_runtime():
-        return top_k_top_p_min_p_sampling_from_probs_jax_tpu_runtime(args)
-    return top_k_top_p_min_p_sampling_from_probs_jax_not_tpu_runtime(args)
+def top_k_top_p_min_p_sampling_from_probs_jax(
+    args,
+    use_sort_for_toppk_minp,
+):
+    if use_sort_for_toppk_minp:
+        return top_k_top_p_min_p_sampling_from_probs_jax_with_sort(args)
+    return top_k_top_p_min_p_sampling_from_probs_jax_with_mask(args)
 
 
-def top_k_top_p_min_p_sampling_from_probs_jax_tpu_runtime(args):
+def top_k_top_p_min_p_sampling_from_probs_jax_with_sort(args):
     (
         logits,
         probs,
@@ -329,33 +336,25 @@ def top_k_top_p_min_p_sampling_from_probs_jax_tpu_runtime(args):
         sampling_seeds,
         need_min_p_sampling,
         rng,
-        use_sort_for_toppk_minp,
     ) = args
 
-    # Note: jax.lax.cond is not used here due to only one condition will be triggered when launching server
-    if use_sort_for_toppk_minp:
-        return sort_version(
-            probs, top_ks, top_ps, min_ps, positions, sampling_seeds, need_min_p_sampling, rng
-        )
+    if is_tpu_runtime():
+        probs_sort = jnp.sort(probs, axis=-1)[:, ::-1]  # Sort and reverse for descending order
+        probs_idx = jnp.argsort(probs, axis=-1)[:, ::-1]
     else:
-        return mask_version(
-            logits,
-            top_ks,
-            top_ps,
-            min_ps,
-            positions,
-            temperatures,
-            sampling_seeds,
-            need_min_p_sampling,
-            rng,
+        # 1) Use jax.pure_callback to compute robust descending indices on CPU
+        out_spec = jnp.empty(probs.shape, dtype=jnp.int32)
+        probs_idx = jax.pure_callback(
+            _get_sorted_indices_np,
+            out_spec,
+            probs,
+            vmap_method="legacy_vectorized",
         )
+        # 2) Gather with sanitized probabilities (map NaNs/Infs to 0)
+        sanitized_probs = jnp.nan_to_num(probs, nan=0.0, posinf=0.0, neginf=0.0)
+        assert probs_idx.shape == sanitized_probs.shape and probs_idx.dtype == jnp.int32
 
-
-def sort_version(
-    probs, top_ks, top_ps, min_ps, positions, sampling_seeds, need_min_p_sampling, rng
-):
-    probs_sort = jnp.sort(probs, axis=-1)[:, ::-1]  # Sort and reverse for descending order
-    probs_idx = jnp.argsort(probs, axis=-1)[:, ::-1]
+        probs_sort = jnp.take_along_axis(sanitized_probs, probs_idx, axis=-1)
 
     probs_sum = jnp.cumsum(probs_sort, axis=-1)
 
@@ -366,19 +365,22 @@ def sort_version(
     probs_sort = jnp.where(top_p_mask, 0.0, probs_sort)
 
     # Use lax.cond to avoid recompilation due to need_min_p_sampling changes
-    min_p_operands = (probs_sort, min_ps, True)
+    min_p_operands = (probs_sort, min_ps)
+    apply_min_p_filter_fn = lambda op: _apply_min_p_filter((*op, True))
     probs_sort = lax.cond(
         need_min_p_sampling,
-        _apply_min_p_filter,
+        apply_min_p_filter_fn,
         lambda operands: operands[0],  # No min_p filtering, just return probs_sort
         min_p_operands,
     )
 
-    multinomial_operands = (probs_sort, sampling_seeds, positions, rng, True)
+    multinomial_operands = (probs_sort, sampling_seeds, positions, rng)
+    multinomial_with_seed_fn = lambda op: multinomial_with_seed((*op, True))
+    multinomial_fn = lambda op: multinomial((*op, True))
     sampled_index = lax.cond(
         sampling_seeds is not None,
-        multinomial_with_seed,
-        multinomial,
+        multinomial_with_seed_fn,
+        multinomial_fn,
         multinomial_operands,
     )
 
@@ -386,46 +388,9 @@ def sort_version(
     return jnp.take_along_axis(probs_idx, axis=1, indices=sampled_index).flatten()
 
 
-def mask_version(
-    logits,
-    top_ks,
-    top_ps,
-    min_ps,
-    positions,
-    temperatures,
-    sampling_seeds,
-    need_min_p_sampling,
-    rng,
-):
-    logits = logits.astype(jnp.float32)
-    logits = topk_mask(logits, top_ks, replace_val=-1e12)
-    logits = topp_mask(logits, top_ps, replace_val=-1e12)
-
-    temperatures = temperatures.astype(logits.dtype)
-    logits = jnp.divide(logits, temperatures)
-
-    min_p_operands = (logits, min_ps, False)
-    logits = lax.cond(
-        need_min_p_sampling,
-        _apply_min_p_filter,
-        lambda operands: operands[0],
-        min_p_operands,
-    )
-
-    multinomial_operands = (logits, sampling_seeds, positions, rng, False)
-    sampled_index = lax.cond(
-        sampling_seeds is not None,
-        multinomial_with_seed,
-        multinomial,
-        multinomial_operands,
-    )
-
-    return sampled_index.flatten()
-
-
-def top_k_top_p_min_p_sampling_from_probs_jax_not_tpu_runtime(args):
+def top_k_top_p_min_p_sampling_from_probs_jax_with_mask(args):
     (
-        _,
+        logits,
         probs,
         top_ks,
         top_ps,
@@ -435,44 +400,31 @@ def top_k_top_p_min_p_sampling_from_probs_jax_not_tpu_runtime(args):
         sampling_seeds,
         need_min_p_sampling,
         rng,
-        _,
     ) = args
-    # 1) Use jax.pure_callback to compute robust descending indices on CPU
-    out_spec = jnp.empty(probs.shape, dtype=jnp.int32)
-    probs_idx = jax.pure_callback(
-        _get_sorted_indices_np,
-        out_spec,
-        probs,
-        vmap_method="legacy_vectorized",
-    )
-    # 2) Gather with sanitized probabilities (map NaNs/Infs to 0)
-    sanitized_probs = jnp.nan_to_num(probs, nan=0.0, posinf=0.0, neginf=0.0)
-    assert probs_idx.shape == sanitized_probs.shape and probs_idx.dtype == jnp.int32
-    probs_sort = jnp.take_along_axis(sanitized_probs, probs_idx, axis=-1)
-    probs_sum = jnp.cumsum(probs_sort, axis=-1)
+    logits = logits.astype(jnp.float32)
+    logits = topk_mask(logits, top_ks, replace_val=-1e12)
+    logits = topp_mask(logits, top_ps, replace_val=-1e12)
 
-    top_k_mask = jnp.arange(0, probs.shape[-1]).reshape(1, -1) >= top_ks.reshape(-1, 1)
-    probs_sort = jnp.where(top_k_mask, 0.0, probs_sort)
+    temperatures = temperatures.astype(logits.dtype)
+    logits = jnp.divide(logits, temperatures)
 
-    top_p_mask = (probs_sum - probs_sort) > top_ps.reshape(-1, 1)
-    probs_sort = jnp.where(top_p_mask, 0.0, probs_sort)
-
-    # Use lax.cond to avoid recompilation due to need_min_p_sampling changes
-    min_p_operands = (probs_sort, min_ps, True)
-    probs_sort = lax.cond(
+    min_p_operands = (logits, min_ps)
+    apply_min_p_filter_fn = lambda op: _apply_min_p_filter((*op, False))
+    logits = lax.cond(
         need_min_p_sampling,
-        _apply_min_p_filter,
-        lambda operands: operands[0],  # No min_p filtering, just return probs_sort
+        apply_min_p_filter_fn,
+        lambda operands: operands[0],
         min_p_operands,
     )
 
-    multinomial_operands = (probs_sort, sampling_seeds, positions, rng, True)
+    multinomial_operands = (logits, sampling_seeds, positions, rng)
+    multinomial_with_seed_fn = lambda op: multinomial_with_seed((*op, False))
+    multinomial_fn = lambda op: multinomial((*op, False))
     sampled_index = lax.cond(
         sampling_seeds is not None,
-        multinomial_with_seed,
-        multinomial,
+        multinomial_with_seed_fn,
+        multinomial_fn,
         multinomial_operands,
     )
 
-    probs_idx = probs_idx.astype(jnp.int32)
-    return jnp.take_along_axis(probs_idx, axis=1, indices=sampled_index).flatten()
+    return sampled_index.flatten()
