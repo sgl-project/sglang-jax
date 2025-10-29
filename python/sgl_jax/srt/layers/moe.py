@@ -206,12 +206,12 @@ class EPMoE(nnx.Module):
         self.experts_per_device = num_experts // self.ep_size
         print("tp_size: %d, ep_size: %d", self.tp_size, self.ep_size)
 
-        if self.tp_size > 1:
-            wi_kernel_axes = ("tensor", None, "data")
-            wo_kernel_axes = ("tensor", "data", None)
-        else:
-            wi_kernel_axes = (("data", "expert"), None, None)
-            wo_kernel_axes = ("data", "expert", None, None)
+        # if self.tp_size > 1:
+        wi_kernel_axes = ("tensor", None, "data")
+        wo_kernel_axes = ("tensor", "data", None)
+        # else:
+        #     wi_kernel_axes = (("data", "tensor"), None, None)
+        #     wo_kernel_axes = (("data", "tensor"), None, None)
 
         self.wi_0 = nnx.Param(
             nnx.with_partitioning(nnx.initializers.normal(), wi_kernel_axes)(

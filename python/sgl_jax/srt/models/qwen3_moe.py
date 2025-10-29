@@ -505,28 +505,29 @@ class Qwen3MoeForCausalLM(nnx.Module):
                     f"{prefix}.mlp.experts.{i}.{expert_type}.weight" for i in range(num_experts)
                 ]
 
-                world_size = (
-                    self.mesh.shape.get("data", 1)
-                    * self.mesh.shape.get("tensor", 1)
-                    * self.mesh.shape.get("expert", 1)
-                )
-                tp_size = world_size // self.config.ep_size
-
-                if self.config.ep_size == 1:
-                    # TP
-                    if expert_type == "down_proj":
-                        sharding = (None, ("data", "tensor"), None)
-                    else:
-                        sharding = (None, None, ("data", "tensor"))
-                elif tp_size > 1:
-                    # ETP
-                    if expert_type == "down_proj":
-                        sharding = ("tensor", "data", None)
-                    else:
-                        sharding = ("tensor", None, "data")
+                if expert_type == "down_proj":
+                    sharding = ("tensor", "data", None)
                 else:
-                    # EP
-                    sharding = (("data", "tensor"), None, None)
+                    sharding = ("tensor", None, "data")
+                # world_size = (
+                #     self.mesh.shape.get("data", 1)
+                #     * self.mesh.shape.get("tensor", 1)
+                #     * self.mesh.shape.get("expert", 1)
+                # )
+                # tp_size = world_size // self.config.ep_size
+
+                # if self.config.ep_size == 1:
+                #     # TP
+                #     if expert_type == "down_proj":
+                #         sharding = (None, ("data", "tensor"), None)
+                #     else:
+                #         sharding = (None, None, ("data", "tensor"))
+                # elif tp_size > 1:
+                #     # ETP
+
+                # else:
+                #     # EP
+                #     sharding = (("data", "tensor"), None, None)
 
                 mappings[f"__MOE_EXPERTS__{prefix}.mlp.{target_name}"] = WeightMapping(
                     target_path=[f"{target_prefix}.mlp.{target_name}"] + expert_keys,
