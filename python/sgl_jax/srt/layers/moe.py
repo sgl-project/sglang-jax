@@ -263,9 +263,9 @@ class EPMoE(nnx.Module):
                 P(None),  # hidden_states
                 P(None),  # topk_weights
                 P(None),  # topk_ids
-                P(("data", "tensor"), None, None),  # w0_weights
-                P(("data", "tensor"), None, None),  # w1_weights
-                P(("data", "tensor"), None, None),  # wo_weights
+                P("expert", None, "data"),  # w0_weights
+                P("expert", None, "data"),  # w1_weights
+                P("expert", "data", None),  # wo_weights
             ),
             out_specs=P(None),
             check_rep=False,
