@@ -152,7 +152,7 @@ class QWen3MoeDecoderLayer(nnx.Module):
         rope_theta = getattr(config, "rope_theta", 1000000)
         rope_scaling = getattr(config, "rope_scaling", None)
         max_position_embeddings = getattr(config, "max_position_embeddings", 40960)
-        head_dim = getattr(config, "head_dim", None)
+        head_dim = getattr(config, "head_dim_padded", None)
 
         self.self_attn = QWen3MoeAttention(
             hidden_size=config.hidden_size,
