@@ -90,7 +90,7 @@ class JAXModelLoader(BaseModelLoader):
         return model_class
 
     def _get_model(self, model_class: Any, model_config: ModelConfig) -> nnx.Module:
-        with self.mesh:
+        with jax.set_mesh(self.mesh):
             model = nnx.eval_shape(
                 lambda: model_class(model_config.hf_config, model_config.dtype, self.rng, self.mesh)
             )

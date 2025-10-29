@@ -29,6 +29,7 @@ class QWenMLP(nnx.Module):
         layer_id: int = 0,
         rngs: nnx.Rngs = None,
         dtype: jnp.dtype = jnp.float16,
+        mesh: jax.sharding.Mesh = None,
     ):
         self.layer_id = layer_id
 
@@ -39,6 +40,7 @@ class QWenMLP(nnx.Module):
             kernel_axes=(None, "tensor"),
             params_dtype=dtype,
             rngs=rngs,
+            mesh=mesh,
         )
 
         self.w2 = LinearBase(
@@ -48,6 +50,7 @@ class QWenMLP(nnx.Module):
             kernel_axes=(None, "tensor"),
             params_dtype=dtype,
             rngs=rngs,
+            mesh=mesh,
         )
 
         self.c_proj = LinearBase(
@@ -57,6 +60,7 @@ class QWenMLP(nnx.Module):
             kernel_axes=("tensor", None),
             params_dtype=dtype,
             rngs=rngs,
+            mesh=mesh,
         )
 
         self.act_func = jax.nn.silu
@@ -80,6 +84,7 @@ class QWenAttention(nnx.Module):
         layer_id: int = 0,
         dtype: jnp.dtype = jnp.float16,
         rngs: nnx.Rngs = None,
+        mesh: jax.sharding.Mesh = None,
     ):
         self.hidden_size = hidden_size
         self.num_heads = num_heads
@@ -94,6 +99,7 @@ class QWenAttention(nnx.Module):
             kernel_axes=(None, "tensor"),
             rngs=rngs,
             params_dtype=dtype,
+            mesh=mesh,
         )
         self.k_proj = LinearBase(
             input_size=hidden_size,
@@ -102,6 +108,7 @@ class QWenAttention(nnx.Module):
             kernel_axes=(None, "tensor"),
             rngs=rngs,
             params_dtype=dtype,
+            mesh=mesh,
         )
         self.v_proj = LinearBase(
             input_size=hidden_size,
@@ -110,6 +117,7 @@ class QWenAttention(nnx.Module):
             kernel_axes=(None, "tensor"),
             rngs=rngs,
             params_dtype=dtype,
+            mesh=mesh,
         )
         self.c_proj = LinearBase(
             input_size=num_heads * head_size,
@@ -118,6 +126,7 @@ class QWenAttention(nnx.Module):
             kernel_axes=("tensor", None),
             rngs=rngs,
             params_dtype=dtype,
+            mesh=mesh,
         )
 
         self.rotary_emb = RotaryEmbedding(
@@ -165,6 +174,7 @@ class QWenBlock(nnx.Module):
         layer_id: int = 0,
         dtype: jnp.dtype = jnp.float16,
         rngs: nnx.Rngs = None,
+        mesh: jax.sharding.Mesh = None,
     ):
         self.layer_id = layer_id
 
@@ -172,7 +182,6 @@ class QWenBlock(nnx.Module):
             config.hidden_size,
             epsilon=config.layer_norm_epsilon,
             param_dtype=dtype,
-            scale_init=nnx.with_partitioning(init_fn, (None,)),
             rngs=rngs,
         )
 
@@ -187,13 +196,13 @@ class QWenBlock(nnx.Module):
             layer_id=layer_id,
             dtype=dtype,
             rngs=rngs,
+            mesh=mesh,
         )
 
         self.ln_2 = RMSNorm(
             config.hidden_size,
             epsilon=config.layer_norm_epsilon,
             param_dtype=dtype,
-            scale_init=nnx.with_partitioning(init_fn, (None,)),
             rngs=rngs,
         )
 
@@ -203,6 +212,7 @@ class QWenBlock(nnx.Module):
             layer_id=layer_id,
             dtype=dtype,
             rngs=rngs,
+            mesh=mesh,
         )
 
     def __call__(
@@ -238,6 +248,7 @@ class QWenModel(nnx.Module):
         config: PretrainedConfig,
         dtype: jnp.dtype = jnp.float16,
         rngs: nnx.Rngs = None,
+        mesh: jax.sharding.Mesh = None,
     ):
         vocab_size = ((config.vocab_size + 63) // 64) * 64
 
@@ -246,17 +257,19 @@ class QWenModel(nnx.Module):
             features=config.hidden_size,
             rngs=rngs,
             dtype=dtype,
-            embedding_init=nnx.with_partitioning(init_fn, ("tensor", None)),
+            kernel_axes=("tensor", None),
             param_dtype=dtype,
+            mesh=mesh,
         )
 
-        self.h = nnx.data(
+        self.layers = nnx.data(
             [
                 QWenBlock(
                     config,
                     layer_id=i,
                     dtype=dtype,
                     rngs=rngs,
+                    mesh=mesh,
                 )
                 for i in range(config.num_hidden_layers)
             ]
@@ -266,7 +279,6 @@ class QWenModel(nnx.Module):
             config.hidden_size,
             epsilon=config.layer_norm_epsilon,
             param_dtype=dtype,
-            scale_init=nnx.with_partitioning(init_fn, (None,)),
             rngs=rngs,
         )
 
@@ -279,7 +291,7 @@ class QWenModel(nnx.Module):
 
         layers_kv_fused = []
 
-        for layer in self.h:
+        for layer in self.layers:
             hidden_states, kv_fused = layer(
                 forward_batch.positions, hidden_states, forward_batch, token_to_kv_pool
             )
@@ -304,13 +316,13 @@ class QWenLMHeadModel(nnx.Module):
         self.config = config
         self.dtype = dtype
         logger.info("QWenLMHeadModel config dtype: %s", self.dtype)
-        self.transformer = QWenModel(config, dtype=self.dtype, rngs=rngs)
+        self.model = QWenModel(config, dtype=self.dtype, rngs=rngs, mesh=mesh)
         vocab_size = ((config.vocab_size + 63) // 64) * 64
         if not getattr(self.config, "tie_word_embeddings", False):
             self.lm_head = ParallelLMHead(
                 vocab_size,
                 config.hidden_size,
-                embedding_init=nnx.with_partitioning(init_fn, ("tensor", None)),
+                kernel_axes=("tensor", None),
                 rngs=rngs,
             )
         self.logits_processor = LogitsProcessor(vocab_size, mesh=self.mesh)
@@ -333,12 +345,12 @@ class QWenLMHeadModel(nnx.Module):
     def _create_qwen_weight_mappings(self) -> dict:
         mappings = {
             "transformer.wte.weight": WeightMapping(
-                target_path="transformer.embed_tokens.embedding",
+                target_path="model.embed_tokens.embedding",
                 sharding=("tensor", None),
                 transpose=False,
             ),
             "transformer.ln_f.weight": WeightMapping(
-                target_path="transformer.ln_f.scale", sharding=(None,), transpose=False
+                target_path="model.ln_f.scale", sharding=(None,), transpose=False
             ),
         }
 
@@ -356,19 +368,20 @@ class QWenLMHeadModel(nnx.Module):
 
     def _create_layer_mappings(self, layer_idx: int) -> dict:
         prefix = f"transformer.h.{layer_idx}"
+        target_prefix = f"model.layers.{layer_idx}"
 
         return {
             f"{prefix}.ln_1.weight": WeightMapping(
-                target_path=f"{prefix}.ln_1.scale", sharding=(None,), transpose=False
+                target_path=f"{target_prefix}.ln_1.scale", sharding=(None,), transpose=False
             ),
             f"{prefix}.ln_2.weight": WeightMapping(
-                target_path=f"{prefix}.ln_2.scale", sharding=(None,), transpose=False
+                target_path=f"{target_prefix}.ln_2.scale", sharding=(None,), transpose=False
             ),
             f"{prefix}.attn.c_attn.weight": WeightMapping(
                 target_path=[
-                    f"{prefix}.attn.q_proj.weight",
-                    f"{prefix}.attn.k_proj.weight",
-                    f"{prefix}.attn.v_proj.weight",
+                    f"{target_prefix}.attn.q_proj.weight",
+                    f"{target_prefix}.attn.k_proj.weight",
+                    f"{target_prefix}.attn.v_proj.weight",
                 ],
                 sharding=(None, "tensor"),
                 transpose=True,
@@ -377,9 +390,9 @@ class QWenLMHeadModel(nnx.Module):
             ),
             f"{prefix}.attn.c_attn.bias": WeightMapping(
                 target_path=[
-                    f"{prefix}.attn.q_proj.bias",
-                    f"{prefix}.attn.k_proj.bias",
-                    f"{prefix}.attn.v_proj.bias",
+                    f"{target_prefix}.attn.q_proj.bias",
+                    f"{target_prefix}.attn.k_proj.bias",
+                    f"{target_prefix}.attn.v_proj.bias",
                 ],
                 sharding=(None,),
                 transpose=False,
@@ -387,22 +400,22 @@ class QWenLMHeadModel(nnx.Module):
                 kv_head_padding=True,
             ),
             f"{prefix}.attn.c_proj.weight": WeightMapping(
-                target_path=f"{prefix}.attn.c_proj.weight",
+                target_path=f"{target_prefix}.attn.c_proj.weight",
                 sharding=("tensor", None),
                 transpose=True,
             ),
             f"{prefix}.mlp.w1.weight": WeightMapping(
-                target_path=f"{prefix}.mlp.w1.weight",
+                target_path=f"{target_prefix}.mlp.w1.weight",
                 sharding=(None, "tensor"),
                 transpose=True,
             ),
             f"{prefix}.mlp.w2.weight": WeightMapping(
-                target_path=f"{prefix}.mlp.w2.weight",
+                target_path=f"{target_prefix}.mlp.w2.weight",
                 sharding=(None, "tensor"),
                 transpose=True,
             ),
             f"{prefix}.mlp.c_proj.weight": WeightMapping(
-                target_path=f"{prefix}.mlp.c_proj.weight",
+                target_path=f"{target_prefix}.mlp.c_proj.weight",
                 sharding=("tensor", None),
                 transpose=True,
             ),
@@ -414,13 +427,11 @@ class QWenLMHeadModel(nnx.Module):
         token_to_kv_pool: KVCache,
         logits_metadata: LogitsMetadata,
     ):
-        hidden_states, layers_kv_fused = self.transformer(forward_batch, token_to_kv_pool)
+        hidden_states, layers_kv_fused = self.model(forward_batch, token_to_kv_pool)
         if not getattr(self.config, "tie_word_embeddings", False):
             output = self.logits_processor(hidden_states, self.lm_head, logits_metadata)
         else:
-            output = self.logits_processor(
-                hidden_states, self.transformer.embed_tokens, logits_metadata
-            )
+            output = self.logits_processor(hidden_states, self.model.embed_tokens, logits_metadata)
         return output, layers_kv_fused, True
 
 
