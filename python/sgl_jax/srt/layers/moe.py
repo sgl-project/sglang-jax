@@ -204,6 +204,7 @@ class EPMoE(nnx.Module):
         )
         self.tp_size = world_size // self.ep_size
         self.experts_per_device = num_experts // self.ep_size
+        print("tp_size: %d, ep_size: %d", self.tp_size, self.ep_size)
 
         if self.tp_size > 1:
             wi_kernel_axes = ("tensor", None, "data")
