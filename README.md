@@ -45,6 +45,8 @@ SGL-JAX is designed for easy extension to new model architectures. It currently 
 -   **Qwen**
 -   **Qwen 3**
 -   **Qwen 3 MoE**
+-   **Llama**
+-   **Bailing MoE**
 
 ## Performance and Benchmarking
 
