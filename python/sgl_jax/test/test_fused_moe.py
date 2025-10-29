@@ -38,7 +38,7 @@ class TestFusedMoe(unittest.TestCase):
                 num_experts=8,
                 num_experts_per_tok=num_experts_per_topk,
                 mesh=self.mesh,
-                expert_parallel_size=1,
+                ep_size=1,
             )
             src_layer.wi_0.value = std_layer.wi_0.value
             src_layer.wi_1.value = std_layer.wi_1.value

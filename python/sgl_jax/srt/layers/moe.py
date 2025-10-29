@@ -177,7 +177,7 @@ class EPMoE(nnx.Module):
         config,
         num_experts: int,
         num_experts_per_tok: int,
-        expert_parallel_size: int,
+        ep_size: int,
         mesh: Mesh,
         intermediate_dim: int = 2048,
         weight_dtype: jnp.dtype = jnp.bfloat16,
@@ -191,18 +191,29 @@ class EPMoE(nnx.Module):
         self.weight_dtype = weight_dtype
         self.dtype = dtype
         self.layer_id = layer_id
-        self.expert_parallel_size = expert_parallel_size
+        self.ep_size = ep_size
         self.mesh = mesh
-        if num_experts % self.expert_parallel_size != 0:
+        if num_experts % self.ep_size != 0:
             raise ValueError(
-                f"num_experts({num_experts}) must be divisible by expert_parallel_size ({self.expert_parallel_size})"
+                f"num_experts({num_experts}) must be divisible by ep_size ({self.ep_size})"
             )
+        world_size = (
+            self.mesh.shape.get("data", 1)
+            * mesh.shape.get("tensor", 1)
+            * mesh.shape.get("expert", 1)
+        )
+        self.tp_size = world_size // self.ep_size
+        self.experts_per_device = num_experts // self.ep_size
 
-        self.experts_per_device = num_experts // self.expert_parallel_size
-        expert_kernel_axes = (("data", "tensor"), None, None)
+        if self.tp_size > 1:
+            wi_kernel_axes = ("tensor", None, "data")
+            wo_kernel_axes = ("tensor", "data", None)
+        else:
+            wi_kernel_axes = (("data", "expert"), None, None)
+            wo_kernel_axes = ("data", "expert", None, None)
 
         self.wi_0 = nnx.Param(
-            nnx.with_partitioning(nnx.initializers.normal(), expert_kernel_axes)(
+            nnx.with_partitioning(nnx.initializers.normal(), wi_kernel_axes)(
                 jax.random.PRNGKey(0),
                 (self.experts_per_device, config.hidden_size, intermediate_dim),
                 weight_dtype,
@@ -210,7 +221,7 @@ class EPMoE(nnx.Module):
         )
 
         self.wi_1 = nnx.Param(
-            nnx.with_partitioning(nnx.initializers.normal(), expert_kernel_axes)(
+            nnx.with_partitioning(nnx.initializers.normal(), wi_kernel_axes)(
                 jax.random.PRNGKey(0),
                 (self.experts_per_device, config.hidden_size, intermediate_dim),
                 weight_dtype,
@@ -218,7 +229,7 @@ class EPMoE(nnx.Module):
         )
 
         self.wo = nnx.Param(
-            nnx.with_partitioning(nnx.initializers.normal(), expert_kernel_axes)(
+            nnx.with_partitioning(nnx.initializers.normal(), wo_kernel_axes)(
                 jax.random.PRNGKey(0),
                 (self.experts_per_device, intermediate_dim, config.hidden_size),
                 weight_dtype,
@@ -284,7 +295,7 @@ class EPMoE(nnx.Module):
         )
 
         # EP Dispatch
-        if self.expert_parallel_size > 1:
+        if self.ep_size > 1:
             x, local_group_sizes, selected_experts = self._expert_all_to_all_dispatch(
                 x, selected_experts, expert_shard_id
             )
@@ -302,7 +313,7 @@ class EPMoE(nnx.Module):
         )
 
         # EP Combine
-        if self.expert_parallel_size > 1:
+        if self.ep_size > 1:
             original_size = total_tokens * self.num_experts_per_tok
             intermediate_output = self._expert_all_to_all_collect(
                 intermediate_output, group_sizes, expert_shard_id, original_size
@@ -402,19 +413,17 @@ class EPMoE(nnx.Module):
         return local_data, local_group_sizes, local_experts_extracted
 
     def _get_all_to_all_params(self, group_sizes, shard_id):
-        input_offsets = jnp.zeros(self.expert_parallel_size, dtype=group_sizes.dtype)
-        send_sizes = jnp.repeat(group_sizes[shard_id], self.expert_parallel_size)
+        input_offsets = jnp.zeros(self.ep_size, dtype=group_sizes.dtype)
+        send_sizes = jnp.repeat(group_sizes[shard_id], self.ep_size)
         output_offset = jnp.concatenate((jnp.array([0]), jnp.cumsum(group_sizes[:-1])))[shard_id]
-        output_offsets = jnp.repeat(output_offset, self.expert_parallel_size)
+        output_offsets = jnp.repeat(output_offset, self.ep_size)
         recv_sizes = group_sizes
 
         return input_offsets, send_sizes, output_offsets, recv_sizes
 
     def _expert_all_to_all_collect(self, data, global_group_sizes, expert_shard_id, target_size):
         # Calculate the number of tokens to be handled by each device.
-        reshaped_group_sizes = global_group_sizes.reshape(
-            self.expert_parallel_size, self.experts_per_device
-        )
+        reshaped_group_sizes = global_group_sizes.reshape(self.ep_size, self.experts_per_device)
         tokens_per_device = jnp.sum(reshaped_group_sizes, axis=1)
 
         # Get parameters for ragged_all_to_all
