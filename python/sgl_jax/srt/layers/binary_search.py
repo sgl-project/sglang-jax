@@ -1,5 +1,5 @@
-#########################################################################################
-# Note: The following codes are copied from tpu_commons.
+# Adapted from https://github.com/vllm-project/tpu-inference/releases/tag/v0.11.1
+# Copyright 2025 The tpu-inference Authors. All rights reserved.
 
 # Copyright 2024 The T5X Authors.
 #

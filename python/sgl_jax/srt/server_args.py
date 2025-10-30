@@ -135,6 +135,9 @@ class ServerArgs:
     enable_deterministic_sampling: bool = False
     enable_single_process: bool = False
 
+    # For sampling
+    use_sort_for_toppk_minp: bool = False
+
     def __post_init__(self):
         # Set missing default values
         if self.tokenizer_path is None:
@@ -780,6 +783,13 @@ class ServerArgs:
             "--enable-single-process",
             action="store_true",
             help="Enable run the engine with single process.",
+        )
+
+        # For sampling
+        parser.add_argument(
+            "--use-sort-for-toppk-minp",
+            action="store_true",
+            help="Use jnp.sort to deal with top_k, top_p and min_p, which improves the grades for math-500 but increase precompile time a lot",
         )
 
     @classmethod
