@@ -52,13 +52,13 @@ SANITIZED_REF=$(sanitize_ref "$REF")
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 
 # Create a temporary rendered yaml file
-TEMP_YAML="${SCRIPT_DIR}/tpu_resource_rendered.yaml"
+TEMP_YAML="${SCRIPT_DIR}/tpu_resource_rendered.sky.yaml"
 
 # Read the template and replace variables
 # Use | as delimiter to handle slashes in branch names
 sed -e "s|\$ACCELERATOR|${ACCELERATOR}|g" \
     -e "s|\$REF|${REF}|g" \
-    "${SCRIPT_DIR}/tpu_resource.yaml" > "$TEMP_YAML"
+    "${SCRIPT_DIR}/tpu_resource.sky.yaml" > "$TEMP_YAML"
 
 # Create cluster name with ref
 if [ -n "$TEST_TYPE" ]; then
