@@ -57,9 +57,7 @@ class Sampler(nnx.Module):
             sampling_metadata.sampling_seeds,
             sampling_metadata.need_min_p_sampling,
             rng,
-            # use_sort_for_toppk_minp,
         )
-        # batch_next_token_ids = top_k_top_p_min_p_sampling_from_probs_jax(args)
         batch_next_token_ids = top_k_top_p_min_p_sampling_from_probs_jax(
             args,
             use_sort_for_toppk_minp,
