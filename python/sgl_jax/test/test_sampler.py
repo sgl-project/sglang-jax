@@ -52,7 +52,7 @@ class TestMultinomialWithSeed(unittest.TestCase):
                 # Sample multiple times with the same inputs and seeds
                 samples = []
                 for _ in range(10):  # Run 10 times
-                    sample = multinomial_with_seed((inputs, seeds, positions, None))
+                    sample = multinomial_with_seed((inputs, seeds, positions, None, True))
                     samples.append(sample)
 
                 # All samples should be identical
@@ -77,7 +77,7 @@ class TestMultinomialWithSeed(unittest.TestCase):
 
         samples = []
         for seed in seeds:
-            sample = multinomial_with_seed((inputs, seed, positions, None))
+            sample = multinomial_with_seed((inputs, seed, positions, None, True))
             samples.append(sample)
 
         original_len = len(samples)
@@ -94,7 +94,7 @@ class TestMultinomialWithSeed(unittest.TestCase):
         seeds = jnp.array([1, 2, 3])
         positions = jnp.array([0, 1, 2])
 
-        sample = multinomial_with_seed((inputs, seeds, positions, None))
+        sample = multinomial_with_seed((inputs, seeds, positions, None, True))
 
         expected_shape = (batch_size, 1)  # Function returns keepdims=True
         self.assertEqual(sample.shape, expected_shape)
