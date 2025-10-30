@@ -443,7 +443,7 @@ class EPMoE(nnx.Module):
             send_sizes,
             output_offsets,
             recv_sizes,
-            axis_name=("data", "tensor"),
+            axis_name=("tensor"),
         )
 
         return result
