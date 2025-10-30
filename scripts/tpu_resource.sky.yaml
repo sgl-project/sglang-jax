@@ -1,3 +1,5 @@
+# Launch TPU resources for development with SkyPilot command:
+#   sky launch tpu_resource.sky.yaml
 resources:
   accelerators: $ACCELERATOR
   accelerator_args:
