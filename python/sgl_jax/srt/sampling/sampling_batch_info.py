@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+from functools import partial
 from typing import TYPE_CHECKING
 
+from jax import numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
 from jax.tree_util import register_pytree_node_class
 
@@ -191,12 +193,8 @@ class SamplingMetadata:
                 sharding=linear_penalty_sharding,
             )
         if linear_penalty_device is None:
-            padded_linear_penalty = np.zeros(
-                (padded_temperatures.shape[0], vocab_size), dtype=np.float32
-            )
-            linear_penalty_device = device_array(
-                padded_linear_penalty,
-                sharding=linear_penalty_sharding,
+            linear_penalty_device = _create_zero_penalty(
+                (padded_temperatures.shape[0], vocab_size), linear_penalty_sharding
             )
 
         return cls(
@@ -213,6 +211,11 @@ class SamplingMetadata:
             linear_penalty=linear_penalty_device,
             do_penalties=do_penalties,
         )
+
+
+@partial(jax.jit, static_argnames=["shape", "sharding"])
+def _create_zero_penalty(shape, sharding):
+    return jnp.zeros(shape=shape, dtype=jnp.bfloat16, device=sharding)
 
 
 @dataclasses.dataclass
@@ -270,7 +273,6 @@ class SamplingBatchInfo:
             sampling_seeds = np.array([DEFAULT_SAMPLING_SEED for _ in range(bs)], dtype=np.int32)
         else:
             sampling_seeds = None
-        linear_penalty = np.zeros((bs, vocab_size), dtype=np.float32)
 
         ret = cls(
             temperatures=temperatures,
@@ -285,7 +287,7 @@ class SamplingBatchInfo:
             sampling_info_done=None,
             sampling_seeds=sampling_seeds,
             penalizer_orchestrator=None,
-            linear_penalty=linear_penalty,
+            linear_penalty=None,
         )
         return ret
 
