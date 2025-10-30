@@ -47,7 +47,7 @@ To deploy on Google’s Cloud TPU, you can use [SkyPilot](https://github.com/sky
 <summary>SkyPilot YAML: <code>sglang-jax.yaml</code></summary>
 
 ```yaml
-# sglang-jax.yaml
+# sglang-jax.sky.yaml
 resources:
    accelerators: tpu-v6e-4
    accelerator_args:
@@ -64,12 +64,12 @@ run: |
 </details>
 
 ```bash
-sky launch -c sglang-jax sglang.yaml --infra=gcp
+sky launch -c sglang-jax sglang.sky.yaml --infra=gcp
 
 ```
 - For debugging and testing purposes, you can use spot instances to reduce costs by adding the `--use-spot` flag to your SkyPilot commands:
   ```bash
-  sky launch -c sglang-jax sglang.yaml --infra=gcp --use-spot
+  sky launch -c sglang-jax sglang.sky.yaml --infra=gcp --use-spot
   ```
 
 </details>
