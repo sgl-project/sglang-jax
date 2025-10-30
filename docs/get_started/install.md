@@ -44,7 +44,7 @@ To deploy on Google’s Cloud TPU, you can use [SkyPilot](https://github.com/sky
 1. Install SkyPilot and set up cloud access: see [SkyPilot's documentation](https://skypilot.readthedocs.io/en/latest/getting-started/installation.html) and [Cloud TPU — SkyPilot documentation](https://docs.skypilot.co/en/latest/reference/tpu.html)
 2. Deploy on your own infra with a single command and get the HTTP API endpoint:
 <details>
-<summary>SkyPilot YAML: <code>sglang-jax.yaml</code></summary>
+<summary>SkyPilot YAML: <code>sglang-jax.sky.yaml</code></summary>
 
 ```yaml
 # sglang-jax.sky.yaml
