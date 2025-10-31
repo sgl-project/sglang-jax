@@ -152,6 +152,7 @@ suites = {
     "per-commit-tpu-v6e-4": [
         TestFile("test/srt/test_qwen3_moe_models.py", 45),
         TestFile("test/srt/test_features.py", 30),
+        # TestFile("test/srt/test_sliding_window_attention.py", 30), # add after gpt-oss supported
         TestFile("test/srt/test_chunked_prefill_size.py", 25),
         TestFile("test/srt/test_bench_one_batch.py", 15),
         TestFile("test/srt/test_eval_accuracy_large.py", 25),
