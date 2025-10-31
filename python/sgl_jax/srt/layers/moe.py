@@ -279,10 +279,8 @@ class EPMoE(nnx.Module):
         )
 
     def _forward(self, hidden_states, topk_weights, topk_ids, w0_weights, w1_weights, wo_weights):
-        data_index = jax.lax.axis_index("data")
         tensor_index = jax.lax.axis_index("tensor")
-        tensor_size = jax.lax.axis_size("tensor")
-        expert_shard_id = data_index * tensor_size + tensor_index
+        expert_shard_id = tensor_index
 
         if hidden_states.ndim == 2:
             total_tokens = hidden_states.shape[0]
