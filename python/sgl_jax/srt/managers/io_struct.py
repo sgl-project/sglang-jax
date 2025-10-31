@@ -213,6 +213,16 @@ class GenerateReqInput:
                         "The parallel_sample_num should be the same for all samples in sample params."
                     )
 
+        # If using parallel sampling with a single example, convert to batch
+        if self.parallel_sample_num > 1 and self.is_single:
+            self.is_single = False
+            if self.text is not None:
+                self.text = [self.text]
+            if self.input_ids is not None:
+                self.input_ids = [self.input_ids]
+            if self.input_embeds is not None:
+                self.input_embeds = [self.input_embeds]
+
     def _normalize_batch_inputs(self):
         """Normalize inputs for a batch of examples, including parallel sampling expansion."""
         # Calculate expanded batch size

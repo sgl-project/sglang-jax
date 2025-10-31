@@ -3,6 +3,7 @@ Usage:
 python3 -m unittest test_srt_engine.TestSRTEngine.test_1_engine_prompt_ids_output_ids
 """
 
+import unittest
 from typing import List
 
 from sgl_jax.srt.entrypoints.engine import Engine
@@ -215,29 +216,6 @@ class TestSRTEngine(CustomTestCase):
             )
             self.assertEqual(int(outputs[0]["meta_info"]["cache_miss_count"]), 0)
 
-    def test_4_engine_prompt_ids_with_sample_n_output_ids(self):
-        input_strings = ["the capital of China is"]
 
-        sampling_params = TestSRTEngine.engine.get_default_sampling_params()
-        sampling_params.max_new_tokens = 10
-        sampling_params.n = 20
-        sampling_params.temperature = 0
-        sampling_params.stop_token_ids = [TestSRTEngine.tokenizer.eos_token_id]
-        sampling_params.skip_special_tokens = True
-        # sampling_params.sampling_seed= 30
-
-        sampling_params_dict = sampling_params.convert_to_dict()
-
-        prompt_ids_list = [self.tokenize(x) for x in input_strings]
-        outputs = TestSRTEngine.engine.generate(
-            input_ids=prompt_ids_list,
-            sampling_params=[sampling_params_dict] * 2,
-        )
-
-        # self.assertEqual(len(outputs), 4)
-        # for item in outputs:
-        #     decoded_output = TestSRTEngine.tokenizer.decode(
-        #         item["output_ids"],
-        #         True,
-        #     )
-        #     self.assertEqual(decoded_output, item["text"])
+if __name__ == "__main__":
+    unittest.main()

@@ -328,7 +328,7 @@ class TestOpenAIServer(CustomTestCase):
 
     def test_chat_completion(self):
         for logprobs in [None]:
-            for parallel_sample_num in [1]:
+            for parallel_sample_num in [1, 2]:
                 self.run_chat_completion(logprobs, parallel_sample_num)
 
     def test_chat_completion_stream(self):
