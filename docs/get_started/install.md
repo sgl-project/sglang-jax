@@ -20,7 +20,7 @@ cd sglang-jax
 
 # Install the python packages
 uv venv --python 3.12 && source .venv/bin/activate
-uv pip install -e python/
+uv pip install -e "python[all]"
 
 # Run Qwen-7B Model
 JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache uv run python -u -m sgl_jax.launch_server --model-path Qwen/Qwen-7B-Chat --trust-remote-code  --dist-init-addr=0.0.0.0:10011 --nnodes=1  --tp-size=4 --device=tpu --random-seed=3 --node-rank=0 --mem-fraction-static=0.8 --max-prefill-tokens=8192 --download-dir=/tmp --dtype=bfloat16  --skip-server-warmup --host 0.0.0.0 --port 30000
@@ -58,7 +58,7 @@ run: |
   cd sglang-jax && git fetch origin $REF:$REF && git checkout $REF
   uv venv --python 3.12
   source .venv/bin/activate
-  uv pip install -e python/
+  uv pip install -e "python[all]"
 ```
 
 </details>
