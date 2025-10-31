@@ -10,6 +10,7 @@ import jax
 import jax.numpy as jnp
 import numpy
 from flax import nnx
+from jax.sharding import Mesh
 from jax.tree_util import register_pytree_node_class
 
 from sgl_jax.srt.layers.logits_processor import LogitsProcessorOutput
@@ -29,8 +30,8 @@ from sgl_jax.srt.speculative.pallas.kernel import (
     top_k_renorm_prob,
     top_p_renorm_prob,
     tree_speculative_sampling_target_only,
-    verify_tree_greedy,
 )
+from sgl_jax.srt.speculative.pallas.verify_tree_greedy_kernel import verify_tree_greedy
 
 logger = logging.getLogger(__name__)
 
@@ -591,6 +592,7 @@ class EagleVerifyInput:
         token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
         page_size: int,
         rng: nnx.Rngs,
+        mesh: Mesh,
         vocab_mask: jax.Array | None = None,  # For grammar
     ) -> jax.Array:
         """
@@ -653,17 +655,17 @@ class EagleVerifyInput:
         if is_all_greedy:
             target_predict = jnp.argmax(logits_output.next_token_logits, axis=-1).flatten()
             accept_index, accept_length, predict = verify_tree_greedy(
-                predicts=predict,  # mutable
-                accept_index=accept_index,  # mutable
-                accept_token_num=accept_length,  # mutable
+                predicts=predict,
+                accept_index=accept_index,
+                accept_token_num=accept_length,
                 candidates=candidates,
                 retrive_index=self.retrive_index,
                 retrive_next_token=self.retrive_next_token,
                 retrive_next_sibling=self.retrive_next_sibling,
                 target_predict=target_predict,
+                mesh=mesh,
             )
         else:
-
             # apply temperature and get target probs
             expanded_temperature = jnp.repeat(
                 sampling_info.temperatures, self.draft_token_num
@@ -706,7 +708,6 @@ class EagleVerifyInput:
                 threshold_acc=global_server_args_dict["speculative_accept_threshold_acc"],
                 deterministic=True,
             )
-
         if SIMULATE_ACC_LEN:
             # Do simulation
             _, rng = jax.random.split(rng.params())

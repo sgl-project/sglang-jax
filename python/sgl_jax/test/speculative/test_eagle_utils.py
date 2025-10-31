@@ -3,12 +3,15 @@ import unittest
 import jax
 import jax.numpy as jnp
 
-from sgl_jax.srt.speculative.eagle_util import (
-    create_extend_after_decode_spec_info,
-    tree_speculative_sampling_target_only,
-    verify_tree_greedy,
+from sgl_jax.srt.speculative.eagle_util import create_extend_after_decode_spec_info
+from sgl_jax.srt.speculative.pallas.tree_speculative_sampling_target_only_kernel import (
+    tree_speculative_sampling_target_only_pallas_call,
 )
+from sgl_jax.srt.speculative.pallas.verify_tree_greedy_kernel import verify_tree_greedy
+from sgl_jax.srt.utils.mesh_utils import create_device_mesh
 from sgl_jax.test.test_utils import CustomTestCase
+
+mesh = create_device_mesh(ici_parallelism=[1, -1, 1], dcn_parallelism=[1, 1, 1])
 
 
 class TestVerifyTree(CustomTestCase):
@@ -59,7 +62,7 @@ class TestVerifyTree(CustomTestCase):
         bs = candidates.shape[0]
         num_spec_step = 4
 
-        predicts = jnp.full(predict_shape, -1, dtype=jnp.int32)  # mutable
+        predicts = jnp.empty(predict_shape, dtype=jnp.int32)  # mutable
         accept_index = jnp.full((bs, num_spec_step), -1, dtype=jnp.int32)  # mutable
         accept_token_num = jnp.full((bs,), 0, dtype=jnp.int32)  # mutable
 
@@ -72,10 +75,11 @@ class TestVerifyTree(CustomTestCase):
             retrive_next_token=retrive_next_token,
             retrive_next_sibling=retrive_next_sibling,
             target_predict=target_predict,
+            mesh=mesh,
         )
 
         # Check the expected output.
-        self.assertEqual(predicts.flatten().tolist(), [3, -1, -1, 4, 5, 18, 11, -1, -1, -1, 12, 18])
+        self.assertEqual(predicts.flatten().tolist(), [3, 0, 0, 4, 5, 18, 11, 0, 0, 0, 12, 18])
         self.assertEqual(accept_index.tolist(), [[0, 3, 4, 5], [6, 10, 11, -1]])
         self.assertEqual(accept_token_num.tolist(), [3, 2])
 
@@ -174,21 +178,23 @@ class TestVerifyTree(CustomTestCase):
         coins_for_final_sampling = jax.random.uniform(
             jax.random.PRNGKey(42), (bs,), dtype=jnp.float32
         )
-        accept_index, accept_token_num, predicts = tree_speculative_sampling_target_only(
-            predicts=predicts,
-            accept_index=accept_index,
-            accept_token_num=accept_token_num,
-            candidates=candidates,
-            retrive_index=retrive_index,
-            retrive_next_token=retrive_next_token,
-            retrive_next_sibling=retrive_next_sibling,
-            uniform_samples=coins,
-            uniform_samples_for_final_sampling=coins_for_final_sampling,
-            target_probs=target_probs,
-            draft_probs=draft_probs,
-            threshold_single=threshold_single,
-            threshold_acc=threshold_acc,
-            deterministic=True,
+        accept_index, accept_token_num, predicts = (
+            tree_speculative_sampling_target_only_pallas_call(
+                predicts=predicts,
+                accept_index=accept_index,
+                accept_token_num=accept_token_num,
+                candidates=candidates,
+                retrive_index=retrive_index,
+                retrive_next_token=retrive_next_token,
+                retrive_next_sibling=retrive_next_sibling,
+                uniform_samples=coins,
+                uniform_samples_for_final_sampling=coins_for_final_sampling,
+                target_probs=target_probs,
+                draft_probs=draft_probs,
+                threshold_single=threshold_single,
+                threshold_acc=threshold_acc,
+                deterministic=True,
+            )
         )
 
         self.assertEqual(

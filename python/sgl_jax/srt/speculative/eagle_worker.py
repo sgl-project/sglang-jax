@@ -356,6 +356,7 @@ class EAGLEWorker(ModelWorker):
             self.token_to_kv_pool_allocator,
             self.page_size,
             self.model_runner.rngs,
+            self.mesh,
         )
 
         # Post process based on verified outputs.
