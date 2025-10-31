@@ -2,10 +2,8 @@ from __future__ import annotations
 
 import dataclasses
 import logging
-from functools import partial
 from typing import TYPE_CHECKING
 
-from jax import numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
 from jax.tree_util import register_pytree_node_class
 
@@ -23,6 +21,9 @@ import jax
 import numpy as np
 
 logger = logging.getLogger(__name__)
+
+_zero_linear_penalty_cache: dict[tuple[int, int], jax.Array] = {}
+_zero_linear_penalty_lock = threading.Lock()
 
 
 @register_pytree_node_class
@@ -193,8 +194,9 @@ class SamplingMetadata:
                 sharding=linear_penalty_sharding,
             )
         if linear_penalty_device is None:
-            linear_penalty_device = _create_zero_penalty(
-                (padded_temperatures.shape[0], vocab_size), linear_penalty_sharding
+            target_shape = (padded_temperatures.shape[0], vocab_size)
+            linear_penalty_device = _get_or_create_zero_penalty_device(
+                target_shape, linear_penalty_sharding
             )
 
         return cls(
@@ -213,9 +215,32 @@ class SamplingMetadata:
         )
 
 
-@partial(jax.jit, static_argnames=["shape", "sharding"])
-def _create_zero_penalty(shape, sharding):
-    return jnp.zeros(shape=shape, dtype=jnp.bfloat16, device=sharding)
+def _get_or_create_zero_penalty_device(
+    shape: tuple[int, int],
+    sharding: NamedSharding | None,
+) -> jax.Array:
+    """
+    Reuse cached zero penalties per shape to avoid reallocation.
+    """
+
+    key_shape = (int(shape[0]), int(shape[1]))
+
+    with _zero_linear_penalty_lock:
+        cached = _zero_linear_penalty_cache.get(key_shape)
+    if cached is not None:
+        return cached
+
+    zero_penalty = device_array(
+        np.zeros(key_shape, dtype=np.float32),
+        sharding=sharding,
+    )
+
+    with _zero_linear_penalty_lock:
+        existing = _zero_linear_penalty_cache.get(key_shape)
+        if existing is None:
+            _zero_linear_penalty_cache[key_shape] = zero_penalty
+            return zero_penalty
+        return existing
 
 
 @dataclasses.dataclass
