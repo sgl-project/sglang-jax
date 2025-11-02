@@ -169,6 +169,9 @@ class ModelConfig:
             **kwargs,
         )
 
+    def get_padded_head_dim(self) -> int:
+        return (self.head_dim + 127) // 128 * 128
+
     # adapted from https://github.com/vllm-project/vllm/blob/main/vllm/config.py#L289
     def get_total_num_kv_heads(self) -> int:
         """Returns the total number of KV heads (original, not replicated)."""

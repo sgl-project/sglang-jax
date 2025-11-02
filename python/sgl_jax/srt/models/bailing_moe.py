@@ -210,7 +210,7 @@ class BailingMoEDecoderLayer(nnx.Module):
         rope_theta = getattr(config, "rope_theta", 1000000)
         rope_scaling = getattr(config, "rope_scaling", None)
         max_position_embeddings = getattr(config, "max_position_embeddings", 40960)
-        self.head_dim = getattr(config, "head_dim", None)
+        self.head_dim = getattr(config, "head_dim_padded", None)
         use_qk_norm = getattr(config, "use_qk_norm", False)
         if hasattr(config, "partial_rotary_factor"):
             rotary_dim = int(self.head_dim * config.partial_rotary_factor)

@@ -77,15 +77,15 @@ class QWenAttention(nnx.Module):
         max_position_embeddings: int,
         rope_theta: float = 10000,
         rope_scaling: dict[str, Any] | None = None,
+        head_dim: int | None = None,
         layer_id: int = 0,
         dtype: jnp.dtype = jnp.float16,
         rngs: nnx.Rngs = None,
     ):
         self.hidden_size = hidden_size
         self.num_heads = num_heads
-        head_size = hidden_size // num_heads
-        self.head_size = head_size
-        self.scaling = head_size**-0.5
+        self.head_dim = head_dim or hidden_size // num_heads
+        self.scaling = head_dim**-0.5
 
         self.q_proj = LinearBase(
             input_size=hidden_size,
@@ -112,7 +112,7 @@ class QWenAttention(nnx.Module):
             params_dtype=dtype,
         )
         self.c_proj = LinearBase(
-            input_size=num_heads * head_size,
+            input_size=num_heads * head_dim,
             output_size=hidden_size,
             use_bias=False,
             kernel_axes=("tensor", None),
@@ -122,17 +122,17 @@ class QWenAttention(nnx.Module):
 
         # Use torch version of RotaryEmbedding directly
         self.rotary_emb = RotaryEmbedding(
-            head_size=head_size,
-            rotary_dim=head_size,
+            head_size=head_dim,
+            rotary_dim=head_dim,
             max_position_embeddings=max_position_embeddings,
             base=rope_theta,
             is_neox_style=True,
             dtype=dtype,
         )
-        self.scaling = head_size**-0.5
+        self.scaling = head_dim**-0.5
         self.attn = RadixAttention(
             num_heads=num_heads,
-            head_dim=head_size,
+            head_dim=head_dim,
             scaling=self.scaling,
             num_kv_heads=num_heads,
             layer_id=layer_id,
@@ -150,9 +150,9 @@ class QWenAttention(nnx.Module):
         k, _ = self.k_proj(hidden_states)
         v, _ = self.v_proj(hidden_states)
 
-        q = q.reshape(-1, self.num_heads, self.head_size)
-        k = k.reshape(-1, self.num_heads, self.head_size)
-        v = v.reshape(-1, self.num_heads, self.head_size)
+        q = q.reshape(-1, self.num_heads, self.head_dim)
+        k = k.reshape(-1, self.num_heads, self.head_dim)
+        v = v.reshape(-1, self.num_heads, self.head_dim)
 
         q, k = self.rotary_emb(positions, q, k)
         attn_output, kv_fused = self.attn(q, k, v, forward_batch, token_to_kv_pool)
@@ -169,7 +169,7 @@ class QWenBlock(nnx.Module):
         rngs: nnx.Rngs = None,
     ):
         self.layer_id = layer_id
-
+        head_dim = getattr(config, "head_dim_padded", None)
         self.ln_1 = RMSNorm(
             config.hidden_size,
             epsilon=config.layer_norm_epsilon,
@@ -186,6 +186,7 @@ class QWenBlock(nnx.Module):
             config.max_position_embeddings,
             rope_theta=rope_theta,
             rope_scaling=rope_scaling,
+            head_dim=head_dim,
             layer_id=layer_id,
             dtype=dtype,
             rngs=rngs,
