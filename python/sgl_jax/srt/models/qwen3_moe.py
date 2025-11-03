@@ -119,7 +119,7 @@ class QWen3MoeAttention(nnx.Module):
         hidden_states: jax.Array,
         forward_batch: ForwardBatch,
         token_to_kv_pool: KVCache,
-    ) -> jax.Array:
+    ) -> tuple[jax.Array, jax.Array]:
         q, _ = self.q_proj(hidden_states)
         k, _ = self.k_proj(hidden_states)
         v, _ = self.v_proj(hidden_states)
@@ -240,7 +240,7 @@ class QWen3MoeDecoderLayer(nnx.Module):
         forward_batch: ForwardBatch,
         token_to_kv_pool: KVCache,
         residual: jax.Array | None = None,
-    ) -> tuple[jax.Array, jax.Array]:
+    ) -> tuple[jax.Array, jax.Array, jax.Array]:
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
@@ -317,7 +317,7 @@ class QWen3MoeModel(nnx.Module):
         self,
         forward_batch: ForwardBatch,
         token_to_kv_pool: KVCache,
-    ) -> jax.Array:
+    ) -> tuple[jax.Array, list[jax.Array]]:
         hidden_states = self.embed_tokens(forward_batch.input_ids)
         residual = None
         layers_kv_fused = []

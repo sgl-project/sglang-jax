@@ -155,7 +155,7 @@ class Qwen2MoeAttention(nnx.Module):
         hidden_states: jax.Array,
         forward_batch: ForwardBatch,
         token_to_kv_pool: KVCache,
-    ) -> jax.Array:
+    ) -> tuple[jax.Array, jax.Array]:
         q, _ = self.q_proj(hidden_states)
         k, _ = self.k_proj(hidden_states)
         v, _ = self.v_proj(hidden_states)
@@ -284,8 +284,8 @@ class Qwen2MoeDecoderLayer(nnx.Module):
         forward_batch: ForwardBatch,
         token_to_kv_pool: KVCache,
         residual: jax.Array | None = None,
-    ) -> tuple[jax.Array, jax.Array]:
-        layer_callback_flag = []
+    ) -> tuple[jax.Array, jax.Array, jax.Array]:
+
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
@@ -319,7 +319,7 @@ class Qwen2MoeDecoderLayer(nnx.Module):
         mlp_output = self.mlp(hidden_states, topk_weights, topk_ids)
         hidden_states = mlp_output if shared_output is None else (mlp_output + shared_output)
 
-        return hidden_states, residual, kv_fused, layer_callback_flag
+        return hidden_states, residual, kv_fused
 
 
 class Qwen2MoeModel(nnx.Module):
@@ -341,6 +341,7 @@ class Qwen2MoeModel(nnx.Module):
             features=config.hidden_size,
             rngs=rngs,
             dtype=dtype,
+            embedding_init=nnx.with_partitioning(init_fn, ("tensor", None)),
             param_dtype=dtype,
         )
 
@@ -373,10 +374,9 @@ class Qwen2MoeModel(nnx.Module):
         residual = None
         hidden_states = self.embed_tokens(forward_batch.input_ids)
         layers_kv_fused = []
-        layers_callback_flag = []
 
         for layer in self.layers:
-            hidden_states, residual, kv_fused, callback_flag = layer(
+            hidden_states, residual, kv_fused = layer(
                 forward_batch.positions,
                 hidden_states,
                 forward_batch,
@@ -384,13 +384,12 @@ class Qwen2MoeModel(nnx.Module):
                 residual,
             )
             layers_kv_fused.append(kv_fused)
-            layers_callback_flag.extend(callback_flag)
 
         if residual is not None:
             hidden_states += residual
         hidden_states = self.norm(hidden_states)
 
-        return hidden_states, layers_kv_fused, layers_callback_flag
+        return hidden_states, layers_kv_fused
 
 
 class Qwen2MoeForCausalLM(nnx.Module):
@@ -409,7 +408,12 @@ class Qwen2MoeForCausalLM(nnx.Module):
         logger.info("Qwen2MoeForCausalLM config dtype: %s", self.dtype)
         self.transformer = Qwen2MoeModel(config, dtype=self.dtype, rngs=rngs, mesh=mesh)
         if not getattr(self.config, "tie_word_embeddings", True):
-            self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size, rngs=rngs)
+            self.lm_head = ParallelLMHead(
+                config.vocab_size,
+                config.hidden_size,
+                embedding_init=nnx.with_partitioning(init_fn, ("tensor", None)),
+                rngs=rngs,
+            )
         self.logits_processor = LogitsProcessor(config.vocab_size, self.mesh)
 
     def load_weights(self, model_config: ModelConfig, rng_key: jax.Array):
@@ -575,10 +579,16 @@ class Qwen2MoeForCausalLM(nnx.Module):
             expert_keys = [
                 f"{prefix}.mlp.experts.{i}.{expert_type}.weight" for i in range(num_experts)
             ]
-
+            if self.config.ep_size > 1:
+                sharding = (("data", "tensor"), None, None)
+            else:
+                if expert_type == "down_proj":
+                    sharding = (None, ("data", "tensor"), None)
+                else:
+                    sharding = (None, None, ("data", "tensor"))
             mappings[f"__MOE_EXPERTS__{prefix}.mlp.{target_name}"] = WeightMapping(
                 target_path=[f"{target_prefix}.mlp.{target_name}"] + expert_keys,
-                sharding=(("data", "tensor"), None, None),
+                sharding=sharding,
                 transpose=True,
             )
 
@@ -590,16 +600,14 @@ class Qwen2MoeForCausalLM(nnx.Module):
         token_to_kv_pool: KVCache,
         logits_metadata: LogitsMetadata,
     ):
-        hidden_states, layers_kv_fused, layers_callback_flag = self.transformer(
-            forward_batch, token_to_kv_pool
-        )
+        hidden_states, layers_kv_fused = self.transformer(forward_batch, token_to_kv_pool)
         if not getattr(self.config, "tie_word_embeddings", True):
             output = self.logits_processor(hidden_states, self.lm_head, logits_metadata)
         else:
             output = self.logits_processor(
                 hidden_states, self.transformer.embed_tokens, logits_metadata
             )
-        return output, layers_kv_fused, layers_callback_flag
+        return output, layers_kv_fused, True
 
 
 EntryClass = Qwen2MoeForCausalLM
