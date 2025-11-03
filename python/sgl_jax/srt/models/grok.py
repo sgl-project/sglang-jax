@@ -225,6 +225,8 @@ class Grok1MoE(nnx.Module):
     ):
         super().__init__()
         self.hidden_size = hidden_size
+        self.dtype = dtype
+        self.top_k = top_k
 
         # Gate always runs at full precision for stability
         # (see https://arxiv.org/pdf/2101.03961)
@@ -239,18 +241,18 @@ class Grok1MoE(nnx.Module):
 
         self.router_logit_softcapping = getattr(config, "router_logit_softcapping", 30.0)
 
-        # Determine MoE implementation based on parallelism
         self.experts = EPMoE(
-            config=config,
-            num_experts=num_experts,
-            num_experts_per_tok=top_k,
-            mesh=mesh,
-            intermediate_dim=intermediate_size,
-            dtype=dtype,
-            activation="gelu",
-            layer_id=layer_id,
-            rngs=rngs,
-        )
+                config=config,
+                num_experts=num_experts,
+                num_experts_per_tok=self.top_k,
+                intermediate_dim=intermediate_size,
+                mesh=mesh,
+                activation="gelu",
+                ep_size=config.ep_size,
+                weight_dtype=dtype,
+                dtype=dtype,
+                layer_id=layer_id,
+            )
 
     def __call__(self, hidden_states: jax.Array) -> jax.Array:
         # Router computation with soft capping
@@ -261,10 +263,12 @@ class Grok1MoE(nnx.Module):
             router_logits = router_logits / self.router_logit_softcapping
             router_logits = jax.nn.tanh(router_logits) * self.router_logit_softcapping
 
-        # Note: The PyTorch version applies softmax in the routing function,
-        # but here we pass the logits directly to the experts layer
-        # which handles the routing internally
-        return self.experts(hidden_states, router_logits)
+        top_k_logits, top_k_indices = jax.lax.top_k(router_logits, self.top_k)
+        top_k_weights = jax.nn.softmax(top_k_logits.astype(self.dtype), axis=-1)
+        top_k_weights = top_k_weights.astype(self.dtype)
+        top_k_weights = top_k_weights / jnp.sum(top_k_weights, axis=-1, keepdims=True)
+
+        return self.experts(hidden_states, top_k_weights, top_k_indices)
 
 
 class Grok1Attention(nnx.Module):
@@ -305,7 +309,7 @@ class Grok1Attention(nnx.Module):
             output_size=self.q_size + 2 * self.kv_size,  # Q + K + V
             use_bias=False,
             params_dtype=jnp.bfloat16,
-            kernel_axes=(None, ("tensor", "expert")),
+            kernel_axes=(None, "tensor"),
             rngs=rngs,
         )
 
@@ -314,7 +318,7 @@ class Grok1Attention(nnx.Module):
             output_size=hidden_size,
             use_bias=False,
             params_dtype=jnp.bfloat16,
-            kernel_axes=(("tensor", "expert"), None),
+            kernel_axes=("tensor", None),
             rngs=rngs,
         )
 
@@ -595,14 +599,13 @@ class Grok1ForCausalLM(nnx.Module):
 
     def __init__(
         self,
-        config: ModelConfig,
-        *,
+        config: PretrainedConfig,
+        dtype: jnp.dtype,
         rngs: nnx.Rngs | None = None,
         mesh: jax.sharding.Mesh | None = None,
     ) -> None:
         super().__init__()
-        self.model_config = config
-        config = config.hf_config
+        assert dtype == jnp.bfloat16
         config.num_hidden_layers = 1
         self.config = config
         self.mesh = mesh
@@ -693,12 +696,12 @@ class Grok1ForCausalLM(nnx.Module):
         # Grok model does not expose per-layer KV tensors here, so return an empty list and True flag.
         return output, [], True
 
-    def load_weights(self, rng_key: jax.Array):
+    def load_weights(self, model_config: ModelConfig, rng_key: jax.Array):
         self.rngs = nnx.Rngs(rng_key)
 
         loader = WeightLoader(
             model=self,
-            model_config=self.model_config,
+            model_config=model_config,
             mesh=self.mesh,
             dtype=jnp.bfloat16,
         )
@@ -738,14 +741,14 @@ class Grok1ForCausalLM(nnx.Module):
             # self_attn
             f"{prefix}.self_attn.qkv_proj.weight": WeightMapping(
                 target_path=f"{target_prefix}.self_attn.qkv_proj.weight",
-                sharding=(None, ("tensor", "expert")),
+                sharding=(None, "tensor"),
                 transpose=True,
                 head_dim_padding=True,
                 kv_head_padding=False,
             ),
             f"{prefix}.self_attn.o_proj.weight": WeightMapping(
                 target_path=f"{target_prefix}.self_attn.o_proj.weight",
-                sharding=(("tensor", "expert"), None),
+                sharding=("tensor", None),
                 transpose=True,
                 head_dim_padding=True,
                 kv_head_padding=False,
@@ -772,17 +775,17 @@ class Grok1ForCausalLM(nnx.Module):
             ),
             f"{prefix}.mlp.gate_proj.weight": WeightMapping(
                 target_path=f"{target_prefix}.mlp.gate_proj.weight",
-                sharding=(None, ("tensor", "expert")),
+                sharding=(None, "tensor"),
                 transpose=True,
             ),
             f"{prefix}.mlp.up_proj.weight": WeightMapping(
                 target_path=f"{target_prefix}.mlp.up_proj.weight",
-                sharding=(None, ("tensor", "expert")),
+                sharding=(None, "tensor"),
                 transpose=True,
             ),
             f"{prefix}.mlp.down_proj.weight": WeightMapping(
                 target_path=f"{target_prefix}.mlp.down_proj.weight",
-                sharding=(("tensor", "expert"), None),
+                sharding=("tensor", None),
                 transpose=True,
             ),
             f"{prefix}.block_sparse_moe.gate.weight": WeightMapping(
@@ -802,9 +805,9 @@ class Grok1ForCausalLM(nnx.Module):
             )
 
             if target_name == "wo":
-                sharding = ("expert", ("data", "tensor"), None)
+                sharding = (None, ("data", "tensor"), None)
             else:
-                sharding = ("expert", None, ("data", "tensor"))
+                sharding = (None, None, ("data", "tensor"))
             mappings[f"__MOE_EXPERTS__{prefix}.block_sparse_moe.experts.{target_name}"] = (
                 WeightMapping(target_path=target_path, sharding=sharding, transpose=True)
             )
@@ -812,10 +815,4 @@ class Grok1ForCausalLM(nnx.Module):
         return mappings
 
 
-class Grok1ModelForCausalLM(Grok1ForCausalLM):
-    """An alias for backward-compatibility (matching PyTorch)."""
-
-    pass
-
-
-# Entry classes for model registration (matching PyTorch)
+EntryClass = Grok1ForCausalLM
