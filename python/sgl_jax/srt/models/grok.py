@@ -172,7 +172,7 @@ class Grok1MLP(nnx.Module):
             output_size=intermediate_size,
             use_bias=False,
             params_dtype=dtype,
-            kernel_axes=(None, ("tensor", "expert")),
+            kernel_axes=(None, "tensor"),
             rngs=rngs,
         )
         self.up_proj = LinearBase(
@@ -180,7 +180,7 @@ class Grok1MLP(nnx.Module):
             output_size=intermediate_size,
             use_bias=False,
             params_dtype=dtype,
-            kernel_axes=(None, ("tensor", "expert")),
+            kernel_axes=(None, "tensor"),
             rngs=rngs,
         )
         self.down_proj = LinearBase(
@@ -188,7 +188,7 @@ class Grok1MLP(nnx.Module):
             output_size=hidden_size,
             use_bias=False,
             params_dtype=dtype,
-            kernel_axes=(("tensor", "expert"), None),
+            kernel_axes=("tensor", None),
             rngs=rngs,
         )
         self.act_fn = GeluAndMul(approximate="tanh")
