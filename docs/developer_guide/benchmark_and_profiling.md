@@ -14,6 +14,46 @@
   ```bash
   python3 -m sgl_jax.bench_serving --backend sgl-jax --num-prompt 10
   ```
+- A recommended benchmark before merging into main. Please save the following codes as script.sh and execute `./script.sh sglang-oai`.
+  ```bash
+  #!/bin/bash
+
+  set -e
+
+  if [ -z "$1" ]; then
+      echo "Usage: $0 <engine>"
+      echo "engine: sgl-jax, sglang-oai or vllm"
+      exit 1
+  fi
+
+  backend=${1}
+  num_prompts_per_concurrency=3
+  input_seq_lens=(1024 4096 8192)
+  output_seq_lens=(1 1024) # 1 for TTFT
+  max_concurrencies=(8 16 32 64 128 256)
+
+  for input_seq_len in "${input_seq_lens[@]}"; do
+      for output_seq_len in "${output_seq_lens[@]}"; do
+          echo "======================================="
+          echo "Testing with ISL/OSL: $input_seq_len/$output_seq_len"
+          echo "======================================="
+          for max_concurrency in "${max_concurrencies[@]}"; do
+              echo "benchmark on max_concurrency=$max_concurrency"
+              num_prompts=$((num_prompts_per_concurrency * max_concurrency))
+              uv run python -m sgl_jax.bench_serving \
+                --backend ${backend} \
+                --dataset-name random \
+                --num-prompts ${num_prompts} \
+                --random-input-len ${input_seq_len} \
+                --random-output-len ${output_seq_len} \
+                --max-concurrency ${max_concurrency} \
+                --random-range-ratio 1 \
+                --disable-ignore-eos \
+                --warmup-requests 0
+          done
+      done
+  done
+  ```
 
 ## Profile with Jax Profiler
 
