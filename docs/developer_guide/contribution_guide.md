@@ -65,9 +65,7 @@ python3 -m sgl_jax.launch_server \
 --page-size 128
 
 # Evaluate By EvalScope
-## Note:
-## 1. evalscope==0.17.1 is recommended.
-## 3. Please set proper sampling parameters for your model. We recommend to use configurations on Hugging Face.
+## Note: evalscope==0.17.1 is recommended.
 evalscope eval  \
 --model Qwen/Qwen3-8B \
 --api-url http://127.0.0.1:30000/v1/chat/completions \
@@ -82,6 +80,7 @@ Some details about evaluations:
 - Evalscope Usage: You can set more arguments for evaluation, please refer to [official documents](https://evalscope.readthedocs.io/en/latest/get_started/parameters.html).
 - Accuracy Deviation: This test can have significant variance (1%–5%) in accuracy due to batching and the non-deterministic nature of the inference engine. Please run multi times to get the average result.
 - Dataset Selection: GSM8K is too easy for state-of-the-art models nowadays. Please try your own more challenging accuracy tests. You can find additional accuracy eval examples in [test_eval_accuracy_large.py](https://github.com/sgl-project/sglang-jax/blob/main/test/srt/test_eval_accuracy_large.py).
+- Sampling Parameters: Please set proper sampling parameters for your model. We recommend to use configurations on Hugging Face.
 
 ## Benchmark the speed
 Refer to [Benchmark and Profiling](./benchmark_and_profiling.md)
