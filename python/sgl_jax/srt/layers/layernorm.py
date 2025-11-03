@@ -1,4 +1,4 @@
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from typing import Any
 
 import jax
@@ -171,3 +171,36 @@ def _normalize(
         args.append(bias)
     dtype = dtypes.canonicalize_dtype(*args, dtype=dtype)
     return jnp.asarray(y, dtype)
+
+
+class GemmaRMSNorm(nnx.Module):
+    """Gemma RMS normalization."""
+
+    def __init__(
+        self,
+        hidden_size: int,
+        epsilon: float = 1e-6,
+        kernel_axes: Sequence[str] | None = None,
+        rngs: nnx.Rngs = None,
+    ):
+        self.epsilon = epsilon
+        self.weight = nnx.Param(
+            nnx.with_partitioning(nnx.initializers.zeros, kernel_axes)(
+                jax.random.PRNGKey(0), (hidden_size,)
+            )
+        )
+
+    def __call__(
+        self, x: jax.Array, residual: jax.Array | None = None
+    ) -> jax.Array | tuple[jax.Array, jax.Array]:
+        orig_dtype = x.dtype
+        if residual is not None:
+            x = x + jnp.astype(residual, jnp.float16) if orig_dtype == jnp.float16 else x + residual
+            residual = x
+
+        x = x.astype(jnp.float32)
+        variance = jnp.mean(lax.square(x), axis=-1, keepdims=True)
+        x = x * lax.rsqrt(variance + self.epsilon)
+        x = x * (1.0 + jnp.asarray(self.weight, jnp.float32))
+        x = x.astype(orig_dtype)
+        return x if residual is None else (x, residual)

@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING
 from jax import numpy as jnp
 
 from sgl_jax.srt.managers.schedule_batch import Req, ScheduleBatch
+from sgl_jax.srt.mem_cache.allocator import SWATokenToKVPoolAllocator
 from sgl_jax.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sgl_jax.srt.mem_cache.radix_cache import RadixCache, TreeNode
 
@@ -283,19 +284,37 @@ class PrefillAdder:
                 ]
             )
 
+        self.is_hybrid = isinstance(self.token_to_kv_pool_allocator, SWATokenToKVPoolAllocator)
+
     @property
     def rem_total_tokens(self):
-        available_and_evictable = (
-            self.token_to_kv_pool_allocator.available_size() + self.tree_cache.evictable_size()
-        )
+        if self.is_hybrid:
+            available_and_evictable = min(
+                self.token_to_kv_pool_allocator.full_available_size()
+                + self.tree_cache.full_evictable_size(),
+                self.token_to_kv_pool_allocator.swa_available_size()
+                + self.tree_cache.swa_evictable_size(),
+            )
+        else:
+            available_and_evictable = (
+                self.token_to_kv_pool_allocator.available_size() + self.tree_cache.evictable_size()
+            )
 
         return available_and_evictable - self.rem_total_token_offset
 
     @property
     def cur_rem_tokens(self):
-        available_and_evictable = (
-            self.token_to_kv_pool_allocator.available_size() + self.tree_cache.evictable_size()
-        )
+        if self.is_hybrid:
+            available_and_evictable = min(
+                self.token_to_kv_pool_allocator.full_available_size()
+                + self.tree_cache.full_evictable_size(),
+                self.token_to_kv_pool_allocator.swa_available_size()
+                + self.tree_cache.swa_evictable_size(),
+            )
+        else:
+            available_and_evictable = (
+                self.token_to_kv_pool_allocator.available_size() + self.tree_cache.evictable_size()
+            )
 
         return available_and_evictable - self.cur_rem_token_offset
 
@@ -346,11 +365,18 @@ class PrefillAdder:
 
     @contextmanager
     def _lock_node(self, last_node: TreeNode):
-        try:
-            self.tree_cache.inc_lock_ref(last_node)
-            yield None
-        finally:
-            self.tree_cache.dec_lock_ref(last_node)
+        if self.is_hybrid:
+            try:
+                swa_uuid_for_lock = self.tree_cache.inc_lock_ref(last_node)
+                yield None
+            finally:
+                self.tree_cache.dec_lock_ref(last_node, swa_uuid_for_lock)
+        else:
+            try:
+                self.tree_cache.inc_lock_ref(last_node)
+                yield None
+            finally:
+                self.tree_cache.dec_lock_ref(last_node)
 
     def add_one_req_ignore_eos(self, req: Req):
         if self.ceil_paged_tokens(req.extend_input_len) > min(
@@ -387,16 +413,17 @@ class PrefillAdder:
         else:
             add_req_state(req, insert_sort=True)
 
-        cur_rem_tokens = self.cur_rem_tokens - self.ceil_paged_tokens(req.extend_input_len)
-        tokens_freed = 0
-        for i, (tokens_left, tokens_occupied) in enumerate(self.req_states):
-            # tokens_left gives a reservative calculation as the last token is not stored
-            bs = len(self.req_states) - i
-            min_free_tokens = cur_rem_tokens + tokens_freed - tokens_left * bs
-            # reserve tokens for corner cases
-            if min_free_tokens <= IGNORE_EOS_RESERVE_TOKENS * bs:
-                return AddReqResult.NO_TOKEN
-            tokens_freed += tokens_occupied
+        if not self.is_hybrid:
+            cur_rem_tokens = self.cur_rem_tokens - self.ceil_paged_tokens(req.extend_input_len)
+            tokens_freed = 0
+            for i, (tokens_left, tokens_occupied) in enumerate(self.req_states):
+                # tokens_left gives a reservative calculation as the last token is not stored
+                bs = len(self.req_states) - i
+                min_free_tokens = cur_rem_tokens + tokens_freed - tokens_left * bs
+                # reserve tokens for corner cases
+                if min_free_tokens <= IGNORE_EOS_RESERVE_TOKENS * bs:
+                    return AddReqResult.NO_TOKEN
+                tokens_freed += tokens_occupied
 
         if (
             self.rem_chunk_tokens is None  # chunked prefill is disabled
@@ -456,7 +483,11 @@ class PrefillAdder:
             if self.rem_chunk_tokens is None or input_tokens <= self.rem_chunk_tokens:
                 # Non-chunked prefill
                 self.can_run_list.append(req)
-                self.tree_cache.inc_lock_ref(req.last_node)
+                if self.is_hybrid:
+                    swa_uuid_for_lock = self.tree_cache.inc_lock_ref(req.last_node)
+                    req.swa_uuid_for_lock = swa_uuid_for_lock
+                else:
+                    self.tree_cache.inc_lock_ref(req.last_node)
                 self._update_prefill_budget(
                     prefix_len,
                     input_tokens,
@@ -477,7 +508,11 @@ class PrefillAdder:
 
                 self.can_run_list.append(req)
                 self.new_chunked_req = req
-                self.tree_cache.inc_lock_ref(req.last_node)
+                if self.is_hybrid:
+                    swa_uuid_for_lock = self.tree_cache.inc_lock_ref(req.last_node)
+                    req.swa_uuid_for_lock = swa_uuid_for_lock
+                else:
+                    self.tree_cache.inc_lock_ref(req.last_node)
                 self._update_prefill_budget(prefix_len, trunc_len, 0)
 
         return self.budget_state()
