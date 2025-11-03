@@ -210,8 +210,9 @@ class LogitsMetadata:
 class LogitsProcessor(nnx.Module):
     """Logits processor for the model."""
 
-    def __init__(self, vocab_size: int, mesh: Mesh):
+    def __init__(self, vocab_size: int, soft_cap: float | None = None, mesh: Mesh = None):
         self.vocab_size = vocab_size
+        self.soft_cap = soft_cap
         self.mesh = mesh
 
     def __call__(
@@ -426,7 +427,6 @@ class LogitsProcessor(nnx.Module):
             probs = top_p_normalize_probs_jax(probs, logits_metadata.top_p)
             return jnp.log(probs)
         else:
-            # return torch.nn.functional.log_softmax(last_logits, dim=-1)
             return nn.log_softmax(last_logits, axis=-1)
 
     def _get_logits(
@@ -449,4 +449,6 @@ class LogitsProcessor(nnx.Module):
 
         logits = logits[:, : self.vocab_size] if logits.ndim > 1 else logits[: self.vocab_size]
 
+        if self.soft_cap:
+            logits = self.soft_cap * jnp.tanh(logits / self.soft_cap)
         return logits
