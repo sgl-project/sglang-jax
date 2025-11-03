@@ -520,6 +520,7 @@ class FusedMoE(nnx.Module):
         weight_dtype: jnp.dtype = jnp.bfloat16,
         dtype: jnp.dtype = jnp.bfloat16,
         layer_id: int = 0,
+        activation: str = "silu",
         *,
         mesh: Mesh,
     ):
@@ -529,6 +530,7 @@ class FusedMoE(nnx.Module):
         self.weight_dtype = weight_dtype
         self.dtype = dtype
         self.layer_id = layer_id
+        self.activation = activation
 
         self.tp_size = mesh.shape.get("data") * mesh.shape.get("tensor")
 
@@ -590,7 +592,12 @@ class FusedMoE(nnx.Module):
         layer_w0 = jnp.einsum("th,ehd->ted", inputs_flat, all_wi_0)
         layer_w1 = jnp.einsum("th,ehd->ted", inputs_flat, all_wi_1)
 
-        activated = jax.nn.silu(layer_w0) * layer_w1
+        if self.activation == "silu":
+            activated = jax.nn.silu(layer_w0) * layer_w1
+        elif self.activation == "gelu":
+            activated = jax.nn.gelu(layer_w0) * layer_w1
+        else:
+            raise ValueError(f"Unsupported activation function {self.activation}")
         expert_outputs = jnp.einsum("ted,edh->teh", activated, all_wo)
         final_output = jnp.einsum("te,teh->th", expert_weights, expert_outputs)
 

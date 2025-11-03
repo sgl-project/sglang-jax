@@ -281,6 +281,7 @@ def _run_forward_and_sample(model_runner, batch: ScheduleBatch, token_first_arg:
     logits_metadata = LogitsMetadata.from_model_worker_batch(
         model_worker_batch, mesh=model_runner.mesh
     )
+    positions = model_worker_batch.positions
 
     logits_output, _ = model_runner.forward(forward_batch, logits_metadata=logits_metadata)
 
@@ -291,7 +292,7 @@ def _run_forward_and_sample(model_runner, batch: ScheduleBatch, token_first_arg:
         mesh=model_runner.mesh,
         vocab_size=model_runner.model_config.vocab_size,
     )
-    next_token_ids = model_runner.sample(logits_output, sampling_metadata)
+    next_token_ids = model_runner.sample(logits_output, sampling_metadata, positions)
 
     return next_token_ids, logits_output.next_token_logits
 
@@ -549,7 +550,7 @@ def main(server_args, bench_args):
             "Switching attention backend to 'native' for single TPU to reduce compile-time memory"
         )
 
-    _set_envs_and_config()
+    _set_envs_and_config(server_args)
 
     if server_args.model_path:
         work_func = correctness_test if bench_args.correctness_test else latency_test

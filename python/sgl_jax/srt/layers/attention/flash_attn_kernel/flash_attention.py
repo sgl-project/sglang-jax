@@ -42,6 +42,7 @@ def ref_ragged_paged_attention_fused(
     mask_value: float | None = DEFAULT_MASK_VALUE,
     k_scale: float | None = None,
     v_scale: float | None = None,
+    xai_temperature_len: float | None = None,
 ):
     if mask_value is None:
         mask_value = DEFAULT_MASK_VALUE
@@ -86,6 +87,19 @@ def ref_ragged_paged_attention_fused(
             mask = jnp.logical_or(mask, q_span - sliding_window >= kv_span)
         if soft_cap is not None:
             attn = soft_cap * jnp.tanh(attn / soft_cap)
+
+        # xai_temperature_scale: ref implementation from sgl-project/sglang
+        # python/sglang/srt/layers/attention/triton_ops/decode_attention.py
+        if xai_temperature_len is not None:
+            # FIXED: Calculate `qidx` based on the sequence's own length, not global batch indices.
+            prefix_len = kv_len - q_len
+            qidx = jnp.arange(prefix_len, kv_len)
+
+            xai_temperature_scale = 1.0 / jnp.log2(float(xai_temperature_len))
+            _qtemp = jnp.log2(qidx.astype(jnp.float32)) * xai_temperature_scale
+            xai_temperature_reg = jnp.where(qidx > xai_temperature_len, _qtemp, 1.0)
+            attn = attn * xai_temperature_reg[:, None]
+
         attn += jnp.where(mask, mask_value, 0.0)
         attn = jax.nn.softmax(attn, axis=-1).astype(v.dtype)
         out = jnp.einsum("hqk,khd->qhd", attn, v).astype(queries.dtype)
@@ -109,6 +123,7 @@ def ref_ragged_paged_attention(
     mask_value: float | None = DEFAULT_MASK_VALUE,
     k_scale: float | None = None,
     v_scale: float | None = None,
+    xai_temperature_len: float | None = None,
 ):
     if mask_value is None:
         mask_value = DEFAULT_MASK_VALUE
@@ -143,6 +158,16 @@ def ref_ragged_paged_attention(
             mask = jnp.logical_or(mask, q_span - sliding_window >= kv_span)
         if soft_cap is not None:
             attn = soft_cap * jnp.tanh(attn / soft_cap)
+
+        # xai_temperature_scale: ref implementation from sgl-project/sglang
+        # python/sglang/srt/layers/attention/triton_ops/decode_attention.py
+        if xai_temperature_len is not None:
+            xai_temperature_scale = 1.0 / jnp.log2(float(xai_temperature_len))
+            qidx = jnp.arange(q_start, q_end) - 1
+            _qtemp = jnp.log2(qidx.astype(jnp.float32)) * xai_temperature_scale
+            xai_temperature_reg = jnp.where(qidx > xai_temperature_len, _qtemp, 1.0)
+            attn = attn * xai_temperature_reg[:, None]
+
         attn += jnp.where(mask, mask_value, 0.0)
         attn = jax.nn.softmax(attn, axis=-1).astype(v.dtype)
         out = jnp.einsum("hqk,khd->qhd", attn, v).astype(queries.dtype)
@@ -260,6 +285,7 @@ def _ragged_paged_attention_kernel(
     q_scale: float | None = None,
     k_scale: float | None = None,
     v_scale: float | None = None,
+    xai_temperature_len: float | None = None,
     chunk_prefill_size: int | None = None,
     bkv_p,
     bq_sz,
@@ -652,12 +678,24 @@ def _ragged_paged_attention_kernel(
                     for head_idx in range(actual_num_kv_heads):
                         bq = load_bq(bq_sem_idx, head_idx, actual_bq_sz=actual_bq_sz)
                         q_heads.append(bq)
+                    q_batch = jnp.stack(q_heads, axis=0)
 
-                    return jnp.stack(q_heads, axis=0)
+                    if xai_temperature_len is not None:
+                        # Correctly calculate sequence-relative position
+                        prefix_len = kv_len - q_len
+                        # `bq_idx * bq_sz` is the offset within the new queries for this sequence
+                        local_q_offset = bq_idx * bq_sz + lax.iota(jnp.int32, q_batch.shape[1])
+                        # `base_qidx` is the absolute sequence position
+                        base_qidx = prefix_len + local_q_offset
+                        # Tile for all KV heads, as the position is the same for each head group.
+                        offs_qidx_batch = jnp.tile(base_qidx, (q_batch.shape[0], 1))
+                        return q_batch, offs_qidx_batch
+
+                    return q_batch, None
 
                 # Load batched data
                 k_batch, v_batch = batch_load_all_heads_kv()
-                q_batch = batch_prepare_queries()
+                q_batch, offs_qidx_batch = batch_prepare_queries()
 
                 def flash_attention(q_batch, k_batch, v_batch):
                     q_batch_f32 = q_batch.astype(jnp.float32)
@@ -696,6 +734,19 @@ def _ragged_paged_attention_kernel(
 
                     if soft_cap is not None:
                         s = soft_cap * jnp.tanh(s / soft_cap)
+
+                    # xai_temperature_scale: ref implementation from sgl-project/sglang
+                    # python/sglang/srt/layers/attention/triton_ops/decode_attention.py
+                    if xai_temperature_len is not None:
+                        xai_temperature_scale = 1.0 / jnp.log2(float(xai_temperature_len))
+                        _qtemp = (
+                            jnp.log2(offs_qidx_batch.astype(jnp.float32)) * xai_temperature_scale
+                        )
+                        xai_temperature_reg = jnp.where(
+                            offs_qidx_batch > xai_temperature_len, _qtemp, 1.0
+                        )
+
+                        s = s * xai_temperature_reg[:, :, None]
 
                     s += jnp.where(mask, mask_value, 0.0)
 
@@ -950,6 +1001,7 @@ def static_validate_inputs_fused(
     q_scale: float | None = None,
     k_scale: float | None = None,
     v_scale: float | None = None,
+    xai_temperature_len: float | None = None,
     # Kernel optimization params.
     chunk_prefill_size: int | None = None,
     # Kernel tuning params.
@@ -1030,6 +1082,8 @@ def static_validate_inputs_fused(
         raise ValueError(f"{sliding_window=} must be positive.")
     if soft_cap is not None and soft_cap == 0.0:
         raise ValueError(f"{soft_cap=} must not be 0.0.")
+    if xai_temperature_len is not None and xai_temperature_len <= 0:
+        raise ValueError(f"{xai_temperature_len=} must be positive.")
     if chunk_prefill_size is not None and chunk_prefill_size <= 0:
         raise ValueError(f"{chunk_prefill_size=} must be positive.")
     if num_kv_pages_per_block is not None and num_kv_pages_per_block <= 0:
@@ -1044,6 +1098,7 @@ def static_validate_inputs_fused(
     del q_scale
     del k_scale
     del v_scale
+    del xai_temperature_len
 
 
 @functools.partial(
@@ -1056,6 +1111,7 @@ def static_validate_inputs_fused(
         "q_scale",
         "k_scale",
         "v_scale",
+        "xai_temperature_len",
         "chunk_prefill_size",
         "num_kv_pages_per_block",
         "num_queries_per_block",
@@ -1081,6 +1137,7 @@ def ragged_paged_attention(
     q_scale: float | None = None,
     k_scale: float | None = None,
     v_scale: float | None = None,
+    xai_temperature_len: float | None = None,
     # Kernel optimization params.
     chunk_prefill_size: int | None = None,
     # Kernel tuning params.
@@ -1110,6 +1167,8 @@ def ragged_paged_attention(
       mask_value: mask value for causal mask.
       k_scale: the scale for the key cache.
       v_scale: the scale for the value cache.
+      xai_temperature_len: the length-based temperature term used by xai grok.
+        reference: sgl-project/sglang: python/sglang/srt/layers/attention/triton_ops/decode_attention.py
       num_kv_pages_per_block: number of kv pages to be processed in one flash
         attention block in the pallas kernel.
       num_queries_per_block: number of kv pages to be processed in one flash
@@ -1270,6 +1329,7 @@ def ragged_paged_attention(
                 q_scale=q_scale,
                 k_scale=k_scale,
                 v_scale=v_scale,
+                xai_temperature_len=xai_temperature_len,
                 chunk_prefill_size=chunk_prefill_size,
                 bq_sz=bq_sz,
                 bkv_p=bkv_p,
