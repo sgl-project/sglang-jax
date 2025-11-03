@@ -182,6 +182,7 @@ class EPMoE(nnx.Module):
         intermediate_dim: int = 2048,
         weight_dtype: jnp.dtype = jnp.bfloat16,
         dtype: jnp.dtype = jnp.bfloat16,
+        activation: str = "silu",
         layer_id: int = 0,
     ):
         self.config = config
@@ -193,6 +194,7 @@ class EPMoE(nnx.Module):
         self.layer_id = layer_id
         self.ep_size = ep_size
         self.mesh = mesh
+        self.activation = activation
         if num_experts % self.ep_size != 0:
             raise ValueError(
                 f"num_experts({num_experts}) must be divisible by ep_size ({self.ep_size})"
@@ -372,7 +374,12 @@ class EPMoE(nnx.Module):
         )
 
         # activation
-        layer_act = jax.nn.silu(layer_w0)
+        if self.activation == "silu":
+            layer_act = jax.nn.silu(layer_w0) 
+        elif self.activation == "gelu":
+            layer_act = jax.nn.gelu(layer_w0)
+        else:
+            raise ValueError(f"Unsupported activation function {self.activation}")
         intermediate_layer = jnp.multiply(layer_act, layer_w1)
 
         # down
