@@ -45,34 +45,67 @@ If your code changes the model output, please run the accuracy tests. A quick sa
 
 ```
 # Launch a server
-python3 -m sgl_jax.launch_server --model-path Qwen/Qwen-7B-Chat --trust-remote-code  --dist-init-addr=0.0.0.0:10011 --nnodes=1  --tp-size=4 --device=tpu --random-seed=3 --node-rank=0 --mem-fraction-static=0.8 --max-prefill-tokens=8192 --download-dir=/tmp --dtype=bfloat16  --skip-server-warmup --port 30000
+JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache \
+python3 -m sgl_jax.launch_server \
+--model-path Qwen/Qwen-7B-Chat \
+--trust-remote-code  \
+--dist-init-addr=0.0.0.0:10011 \
+--nnodes=1  \
+--tp-size=4 \
+--device=tpu \
+--random-seed=3 \
+--node-rank=0 \
+--mem-fraction-static=0.8 \
+--max-prefill-tokens=8192 \
+--download-dir=/tmp \
+--dtype=bfloat16  \
+--skip-server-warmup \
+--port 30000 \
+--max-running-requests 256 \
+--page-size 128
 
-# Evaluate By EvolScope
-evalscope eval  --model Qwen-7B-Chat --api-url http://127.0.0.1:30000/v1/chat/completions --api-key EMPTY --eval-type service --datasets gsm8k --eval-batch-size 8 --limit 500
+# Evaluate By EvalScope
+## Note:
+## 1. evalscope==0.17.1 is recommended.
+## 3. Please set proper sampling parameters for your model. We recommend to use configurations on Hugging Face.
+evalscope eval  \
+--model Qwen/Qwen3-8B \
+--api-url http://127.0.0.1:30000/v1/chat/completions \
+--api-key EMPTY \
+--eval-type service \
+--datasets gsm8k \
+--eval-batch-size 64 \
+--generation-config '{"temperature": 0.7,"top_p":0.8,"top_k":20,"min_p":0.0,"presence_penalty":0.5}'
 ```
 
-Please note that the above script is primarily a sanity check, not a rigorous accuracy or speed test.
-This test can have significant variance (1%–5%) in accuracy due to batching and the non-deterministic nature of the inference engine.
-Also, do not rely on the "Latency/Output throughput" from this script, as it is not a proper speed test.
-
-GSM8K is too easy for state-of-the-art models nowadays. Please try your own more challenging accuracy tests.
-You can find additional accuracy eval examples in:
-- [test_eval_accuracy_large.py](https://github.com/sgl-project/sglang-jax/blob/main/test/srt/test_eval_accuracy_large.py)
+Some details about evaluations:
+- Evalscope Usage: You can set more arguments for evaluation, please refer to [official documents](https://evalscope.readthedocs.io/en/latest/get_started/parameters.html).
+- Accuracy Deviation: This test can have significant variance (1%–5%) in accuracy due to batching and the non-deterministic nature of the inference engine. Please run multi times to get the average result.
+- Dataset Selection: GSM8K is too easy for state-of-the-art models nowadays. Please try your own more challenging accuracy tests. You can find additional accuracy eval examples in [test_eval_accuracy_large.py](https://github.com/sgl-project/sglang-jax/blob/main/test/srt/test_eval_accuracy_large.py).
 
 ## Benchmark the speed
 Refer to [Benchmark and Profiling](./benchmark_and_profiling.md)
 
 
 ## Request a review
-Waiting for completion
+Waiting for completion.
 
 ## General code style
 - Avoid code duplication. If the same code snippet (more than five lines) appears multiple times, extract it into a shared function.
 - Keep files concise. If a file exceeds 2,000 lines of code, split it into multiple smaller files.
 - Strive to make functions as pure as possible. Avoid in-place modification of arguments.
 
+
 ## Tips for newcomers
 
-Waiting for completion
+Waiting for completion.
+
+## Q & A
+
+### Q1: When I add a new model for SGLang-Jax, what do I need to do before merge into main?
+
+
+1. Please add accuracy and benchmark baselines for new model in PR.
+2. Please add accuracy baseline in CI and refer to `Adding baselines in CI` in [test/README.md](https://github.com/sgl-project/sglang-jax/tree/main/test/README.md).
 
 Thank you for your interest in SGLang-Jax. Happy coding!
