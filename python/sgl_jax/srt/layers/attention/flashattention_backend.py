@@ -207,6 +207,11 @@ class FlashAttention(AttentionBackend):
         num_pages = total_tokens // self.page_size
         kv_cache_fused_paged = kv_cache_fused.reshape(num_pages, self.page_size, -1, self.head_dim)
 
+        # Select page indices and remap to SWA pool if KV cache supports it
+        page_indices_arg = self.forward_metadata.page_indices
+        if hasattr(token_to_kv_pool, "remap_cache_loc") and self.page_size == 1:
+            page_indices_arg = token_to_kv_pool.remap_cache_loc(page_indices_arg, layer.layer_id)
+
         in_specs = (
             P(None, self.kv_partition_axis),  # queries
             P(None, self.kv_partition_axis),  # keys (new tokens)
@@ -237,8 +242,8 @@ class FlashAttention(AttentionBackend):
                 kv_cache_fused,
                 *other_args,
                 sm_scale=scale,
-                sliding_window=None,
-                soft_cap=None,
+                sliding_window=layer.sliding_window_size,
+                soft_cap=layer.logit_cap,
                 vmem_limit_bytes=self.vmem_limit_bytes,
             )
 
@@ -258,7 +263,7 @@ class FlashAttention(AttentionBackend):
             v.reshape(v.shape[0], -1, self.head_dim),
             kv_cache_fused_paged,
             self.forward_metadata.seq_lens,
-            self.forward_metadata.page_indices,
+            page_indices_arg,
             self.forward_metadata.cu_q_lens,
             self.forward_metadata.cu_kv_lens,
             self.forward_metadata.distribution,

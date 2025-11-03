@@ -59,6 +59,6 @@ JIT Forward is default to use.
 
 - `--precompile-token-paddings`: default values is recommended, but you still can set like 8192 16384
 - `--precompile-bs-paddings`: default values is recommended, but you still can set like 1 10 32
-- `--disable-jax-precompile`: default to False
+- `--disable-precompile`: default to False
 - `--max-running-requests`
 - `--chunked-prefill-size`
