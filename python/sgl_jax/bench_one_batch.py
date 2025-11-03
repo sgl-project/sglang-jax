@@ -549,7 +549,7 @@ def main(server_args, bench_args):
             "Switching attention backend to 'native' for single TPU to reduce compile-time memory"
         )
 
-    _set_envs_and_config()
+    _set_envs_and_config(server_args)
 
     if server_args.model_path:
         work_func = correctness_test if bench_args.correctness_test else latency_test
