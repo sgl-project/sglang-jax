@@ -163,7 +163,6 @@ class Grok1MLP(nnx.Module):
         rngs: nnx.Rngs = None,
         dtype: jnp.dtype = jnp.bfloat16,
         reduce_results: bool = True,
-        split_gate_up: bool = False,
     ) -> None:
         super().__init__()
 
@@ -351,9 +350,6 @@ class Grok1Attention(nnx.Module):
             scaling=self.scaling,
             num_kv_heads=self.num_kv_heads,
             layer_id=layer_id,
-            # logit_cap=logit_cap,
-            # pos_encoding_mode=pos_encoding_mode,
-            # logit_capping_method=logit_capping_method,
         )
         self.attn.xai_temperature_len = getattr(config, "attn_temperature_len", -1)
 
@@ -376,6 +372,10 @@ class Grok1Attention(nnx.Module):
 
         # Apply rotary position embeddings
         q, k = self.rotary_emb(positions, q, k)
+
+        q = q.reshape(-1, self.num_heads, self.head_dim)
+        k = k.reshape(-1, self.num_kv_heads, self.head_dim)
+        v = v.reshape(-1, self.num_kv_heads, self.head_dim)
 
         # Apply attention (backend may return tuple)
         attn_ret = self.attn(q, k, v, forward_batch, token_to_kv_pool)
@@ -420,7 +420,6 @@ class Grok1DecoderLayer(nnx.Module):
         )
 
         # Feed-forward networks
-        split_gate_up = not getattr(config, "merge_gate_up", True)
         if self.num_experts > 0:
             self.block_sparse_moe = Grok1MoE(
                 config=config,
@@ -443,7 +442,6 @@ class Grok1DecoderLayer(nnx.Module):
                     layer_id=layer_id,
                     rngs=rngs,
                     reduce_results=False,
-                    split_gate_up=split_gate_up,
                 )
         else:
             raise NotImplementedError()
@@ -545,10 +543,12 @@ class Grok1Model(nnx.Module):
         )
 
         # Transformer layers
-        self.layers = [
-            Grok1DecoderLayer(config=config, layer_id=i, mesh=mesh, rngs=rngs)
-            for i in range(config.num_hidden_layers)
-        ]
+        self.layers = nnx.List(
+            [
+                Grok1DecoderLayer(config=config, layer_id=i, mesh=mesh, rngs=rngs)
+                for i in range(config.num_hidden_layers)
+            ]
+        )
 
         # Final layer norm (using eps to match PyTorch)
         self.norm = RMSNorm(config.hidden_size, epsilon=config.rms_norm_eps, rngs=rngs)
@@ -627,10 +627,6 @@ class Grok1ForCausalLM(nnx.Module):
                 kernel_axes=None,
                 rngs=rngs,
             )
-            # Skip all-gather for replicated head
-            self.logits_processor = LogitsProcessor(
-                config.vocab_size, lm_head=self.lm_head, mesh=mesh
-            )
         else:
             self.lm_head = ParallelLMHead(
                 num_embeddings=config.vocab_size,
@@ -638,9 +634,7 @@ class Grok1ForCausalLM(nnx.Module):
                 param_dtype=jnp.bfloat16,
                 rngs=rngs,
             )
-            self.logits_processor = LogitsProcessor(
-                config.vocab_size, lm_head=self.lm_head, mesh=mesh
-            )
+        self.logits_processor = LogitsProcessor(config.vocab_size, mesh=mesh)
 
         self.loaded_param_names = set()
 
@@ -691,7 +685,7 @@ class Grok1ForCausalLM(nnx.Module):
         input_ids = forward_batch.input_ids
         positions = forward_batch.positions
         hidden_states = self.model(input_ids, positions, forward_batch, token_to_kv_pool, None)
-        output = self.logits_processor(hidden_states, logits_metadata)
+        output = self.logits_processor(hidden_states, self.lm_head, logits_metadata)
         # Return values consistent with other models: (output, layers_kv_fused, layers_callback_flag)
         # Grok model does not expose per-layer KV tensors here, so return an empty list and True flag.
         return output, [], True
