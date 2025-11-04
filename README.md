@@ -43,6 +43,8 @@ For more features and usage details, please read the documents in the [`docs`](h
 SGL-JAX is designed for easy extension to new model architectures. It currently provides first-class, optimized support for:
 
 -   **Qwen**
+-   **Qwen 2**
+-   **Qwen 2 MOE**
 -   **Qwen 3**
 -   **Qwen 3 MoE**
 -   **Llama**
