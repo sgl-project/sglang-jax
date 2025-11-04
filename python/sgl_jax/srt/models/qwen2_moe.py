@@ -32,6 +32,7 @@ class Qwen2MoeMLP(nnx.Module):
         layer_id: int = 0,
         rngs: nnx.Rngs = None,
         dtype: jnp.dtype = jnp.bfloat16,
+        gate_up_down_bias: bool | None = False,
     ) -> None:
         self.layer_id = layer_id
 
@@ -39,7 +40,7 @@ class Qwen2MoeMLP(nnx.Module):
             input_size=hidden_size,
             output_size=intermediate_size,
             kernel_axes=(None, "tensor"),
-            use_bias=False,
+            use_bias=gate_up_down_bias,
             params_dtype=dtype,
             rngs=rngs,
         )
@@ -48,7 +49,7 @@ class Qwen2MoeMLP(nnx.Module):
             input_size=hidden_size,
             output_size=intermediate_size,
             kernel_axes=(None, "tensor"),
-            use_bias=False,
+            use_bias=gate_up_down_bias,
             params_dtype=dtype,
             rngs=rngs,
         )
@@ -57,7 +58,7 @@ class Qwen2MoeMLP(nnx.Module):
             input_size=intermediate_size,
             output_size=hidden_size,
             kernel_axes=("tensor", None),
-            use_bias=False,
+            use_bias=gate_up_down_bias,
             params_dtype=dtype,
             rngs=rngs,
         )
@@ -87,6 +88,8 @@ class Qwen2MoeAttention(nnx.Module):
         layer_id: int = 0,
         dtype: jnp.dtype = jnp.bfloat16,
         rngs: nnx.Rngs = None,
+        qkv_bias: bool | None = True,
+        o_bias: bool | None = False,
     ):
         self.layer_id = layer_id
         assert (
@@ -103,7 +106,7 @@ class Qwen2MoeAttention(nnx.Module):
         self.q_proj = LinearBase(
             input_size=hidden_size,
             output_size=num_heads * self.head_dim,
-            use_bias=True,
+            use_bias=qkv_bias,
             kernel_axes=(None, "tensor"),
             rngs=rngs,
             params_dtype=dtype,
@@ -111,7 +114,7 @@ class Qwen2MoeAttention(nnx.Module):
         self.k_proj = LinearBase(
             input_size=hidden_size,
             output_size=num_kv_heads * self.head_dim,
-            use_bias=True,
+            use_bias=qkv_bias,
             kernel_axes=(None, "tensor"),
             rngs=rngs,
             params_dtype=dtype,
@@ -119,7 +122,7 @@ class Qwen2MoeAttention(nnx.Module):
         self.v_proj = LinearBase(
             input_size=hidden_size,
             output_size=num_kv_heads * self.head_dim,
-            use_bias=True,
+            use_bias=qkv_bias,
             kernel_axes=(None, "tensor"),
             rngs=rngs,
             params_dtype=dtype,
@@ -127,7 +130,7 @@ class Qwen2MoeAttention(nnx.Module):
         self.o_proj = LinearBase(
             input_size=num_heads * self.head_dim,
             output_size=hidden_size,
-            use_bias=False,
+            use_bias=o_bias,
             kernel_axes=("tensor", None),
             rngs=rngs,
             params_dtype=dtype,
@@ -200,6 +203,8 @@ class Qwen2MoeDecoderLayer(nnx.Module):
             layer_id=layer_id,
             dtype=dtype,
             rngs=rngs,
+            qkv_bias=getattr(config, "qkv_bias", True),
+            o_bias=getattr(config, "o_bias", False),
         )
 
         # Use MoE for all layers
@@ -226,6 +231,7 @@ class Qwen2MoeDecoderLayer(nnx.Module):
                 layer_id=layer_id,
                 dtype=dtype,
                 rngs=rngs,
+                gate_up_down_bias=False,
             )
             self.shared_expert_gate = LinearBase(
                 input_size=config.hidden_size,
