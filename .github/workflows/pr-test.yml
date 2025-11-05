@@ -48,7 +48,7 @@ jobs:
         env:
           COMMIT_SHA: ${{ github.sha }}
           GITHUB_RUN_ID: ${{ github.run_id }}
-          SKYPILOT_ENDPOINT: ${{ secrets.SKYPILOT_ENDPOINT }}
+          SKYPILOT_ENDPOINT: ${{ secrets.CI_SKYPILOT_ENDPOINT }}
         run: |
           JOB_NAME="tpu-test-v6e-1-${GITHUB_RUN_ID}"
           echo "Submitting Job: $JOB_NAME"
