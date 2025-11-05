@@ -55,7 +55,7 @@ jobs:
           apiVersion: batch/v1
           kind: Job
           metadata:
-            name: \$JOB_NAME
+            name: $JOB_NAME
           spec:
             ttlSecondsAfterFinished: 1800
             backoffLimit: 1
