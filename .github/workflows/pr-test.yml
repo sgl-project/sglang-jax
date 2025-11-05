@@ -38,8 +38,8 @@ jobs:
 
       - name: Get GKE credentials
         run: |
+          sudo apt-get update && sudo apt-get install -y google-cloud-cli-gke-gcloud-auth-plugin
           gcloud container clusters get-credentials tpu-service --zone=us-east5 --project=tpu-service-473302
-          gcloud components install gke-gcloud-auth-plugin
 
       - name: Submit TPU v6e-1 Job
         env:
