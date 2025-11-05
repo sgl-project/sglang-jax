@@ -25,36 +25,160 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-
   e2e-test-1-tpu:
     if: github.event.pull_request.draft == false
-    runs-on: tpuv6e-1
-    strategy:
-      fail-fast: false
+    runs-on: ubuntu-latest
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-      - name: Run test
-        timeout-minutes: 120
+      - name: Setup gcloud
+        uses: google-github-actions/setup-gcloud@v1
+        with:
+          project_id: tpu-service-473302
+          service_account_key: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Get GKE credentials
         run: |
-          uv venv --python 3.12 && source .venv/bin/activate && uv pip install -e "python[all]"
-          bash scripts/killall_sglang.sh
-          uv run python test/srt/run_suite.py --suite per-commit-tpu-v6e-1
+          gcloud container clusters get-credentials tpu-service --zone=us-east5 --project=tpu-service-473302
+
+      - name: Submit TPU v6e-1 Job
+        env:
+          COMMIT_SHA: ${{ github.sha }}
+        run: |
+          JOB_NAME="tpu-test-v6e-1-${GITHUB_RUN_ID}"
+          cat > job.yaml <<EOF
+          apiVersion: batch/v1
+          kind: Job
+          meta
+            name: \$JOB_NAME
+          spec:
+            ttlSecondsAfterFinished: 1800
+            backoffLimit: 1
+            template:
+              spec:
+                containers:
+                - name: sky-launcher
+                  image: python:3.12-slim
+                  command: ["/bin/bash", "-c"]
+                  args:
+                    - |
+                      set -e
+                      apt update && apt install -y git curl openssh-client
+                      pip install skypilot-nightly
+                      mkdir -p ~/.ssh
+                      cp /secret/id_rsa ~/.ssh/id_rsa
+                      chmod 600 ~/.ssh/id_rsa
+                      cp /config/sky-task.yaml ./task.yaml
+                      sed -i "s|TPU_VARIANT_PLACEHOLDER|tpu-v6e-1|g" ./task.yaml
+                      sed -i "s|COMMIT_SHA_PLACEHOLDER|${COMMIT_SHA}|g" ./task.yaml
+                      sky launch ./task.yaml -y \
+                        --use-spot \
+                        --idle-minutes-to-autostop 120 \
+                        --down \
+                        -- "uv venv --python 3.12 && source .venv/bin/activate && cd sglang-jax && uv pip install -e "python[all]" && bash scripts/killall_sglang.sh && uv run python test/srt/run_suite.py --suite per-commit-tpu-v6e-1"
+                  volumeMounts:
+                    - name: config-volume
+                      mountPath: /config
+                    - name: ssh-secret
+                      mountPath: /secret
+                volumes:
+                  - name: config-volume
+                    configMap:
+                      name: sky-task-base
+                  - name: ssh-secret
+                    secret:
+                      secretName: ssh-key-secret
+                restartPolicy: Never
+          EOF
+          kubectl apply -f job.yaml
+          echo "job_name=$JOB_NAME" >> $GITHUB_ENV
+
+      - name: Wait and collect logs
+        run: |
+          timeout 7200 kubectl wait --for=condition=complete job/${{ env.job_name }} --timeout=7200s
+          kubectl logs job/${{ env.job_name }}
+          if kubectl get job ${{ env.job_name }} -o jsonpath='{.status.failed}' | grep -q '[1-9]'; then
+            exit 1
+          fi
 
   e2e-test-4-tpu:
     if: github.event.pull_request.draft == false
-    runs-on: tpuv6e-4
-    strategy:
-      fail-fast: false
+    runs-on: ubuntu-latest
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-      - name: Run test
-        timeout-minutes: 120
+      - name: Setup gcloud
+        uses: google-github-actions/setup-gcloud@v1
+        with:
+          project_id: tpu-service-473302
+          service_account_key: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Get GKE credentials
         run: |
-          uv venv --python 3.12 && source .venv/bin/activate && uv pip install -e "python[all]"
-          bash scripts/killall_sglang.sh
-          uv run python test/srt/run_suite.py --suite per-commit-tpu-v6e-4
+          gcloud container clusters get-credentials tpu-service --zone=us-east5 --project=tpu-service-473302
+
+      - name: Submit TPU v6e-4 Job
+        env:
+          COMMIT_SHA: ${{ github.sha }}
+        run: |
+          JOB_NAME="tpu-test-v6e-4-${GITHUB_RUN_ID}"
+          cat > job.yaml <<EOF
+          apiVersion: batch/v1
+          kind: Job
+          meta
+            name: \$JOB_NAME
+          spec:
+            ttlSecondsAfterFinished: 1800
+            backoffLimit: 1
+            template:
+              spec:
+                containers:
+                - name: sky-launcher
+                  image: python:3.12-slim
+                  command: ["/bin/bash", "-c"]
+                  args:
+                    - |
+                      set -e
+                      apt update && apt install -y git curl openssh-client
+                      pip install skypilot-nightly
+                      mkdir -p ~/.ssh
+                      cp /secret/id_rsa ~/.ssh/id_rsa
+                      chmod 600 ~/.ssh/id_rsa
+                      cp /config/sky-task.yaml ./task.yaml
+                      sed -i "s|TPU_VARIANT_PLACEHOLDER|tpu-v6e-4|g" ./task.yaml
+                      sed -i "s|COMMIT_SHA_PLACEHOLDER|${COMMIT_SHA}|g" ./task.yaml
+                      sky launch ./task.yaml -y \
+                        --use-spot \
+                        --idle-minutes-to-autostop 120 \
+                        --down \
+                        -- "uv venv --python 3.12 && source .venv/bin/activate && cd sglang-jax && uv pip install -e "python[all]" && bash scripts/killall_sglang.sh && uv run python test/srt/run_suite.py --suite per-commit-tpu-v6e-4"
+                  volumeMounts:
+                    - name: config-volume
+                      mountPath: /config
+                    - name: ssh-secret
+                      mountPath: /secret
+                volumes:
+                  - name: config-volume
+                    configMap:
+                      name: sky-task-base
+                  - name: ssh-secret
+                    secret:
+                      secretName: ssh-key-secret
+                restartPolicy: Never
+          EOF
+          kubectl apply -f job.yaml
+          echo "job_name=$JOB_NAME" >> $GITHUB_ENV
+
+      - name: Wait and collect logs
+        run: |
+          timeout 7200 kubectl wait --for=condition=complete job/${{ env.job_name }} --timeout=7200s
+          kubectl logs job/${{ env.job_name }}
+          if kubectl get job ${{ env.job_name }} -o jsonpath='{.status.failed}' | grep -q '[1-9]'; then
+            exit 1
+          fi
+
+  pr-test-finish:
+    needs: [e2e-test-1-tpu, e2e-test-4-tpu]
+    runs-on: ubuntu-latest
+    steps:
+      - name: All tests passed
+        run: echo "✅ All TPU tests completed successfully"
 
   # performance-test-1-tpu:
   #   if: github.event.pull_request.draft == false
@@ -145,22 +269,3 @@ jobs:
   #         source ~/sky/bin/activate
   #         CLUSTER_NAME=$(bash scripts/get_cluster_name.sh tpu-v6e-1 ${{ github.ref }} accuracy)
   #         sky exec "$CLUSTER_NAME" -- 'set -e; cd sglang-jax/test/srt; python3 test_eval_accuracy_large.py'
-
-  pr-test-finish:
-    needs: [
-      e2e-test-1-tpu,
-      e2e-test-4-tpu,
-    ]
-    runs-on: self-hosted
-    steps:
-      - name: Check all dependent job statuses
-        run: |
-          results=(${{ join(needs.*.result, ' ') }})
-          for result in "${results[@]}"; do
-            if [ "$result" = "failure" ] || [ "$result" = "cancelled" ]; then
-              echo "Job failed with result: $result"
-              exit 1
-            fi
-          done
-          echo "All jobs completed successfully"
-          exit 0
