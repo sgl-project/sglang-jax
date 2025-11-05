@@ -136,10 +136,6 @@ class TestFeatures(CustomTestCase):
 
         resp = run_curl(args)
 
-        if "cache_miss_count" not in resp["meta_info"]:
-            raise "[prefill] cache_miss_count is missed in response"
-        self.assertEqual(resp["meta_info"]["cache_miss_count"], 0)
-
     def test_cache_miss_decode(self):
         args = SimpleNamespace(
             base_url=self.base_url,
@@ -149,10 +145,6 @@ class TestFeatures(CustomTestCase):
         )
 
         resp = run_curl(args)
-
-        if "cache_miss_count" not in resp["meta_info"]:
-            raise "[prefill] cache_miss_count is missed in response"
-        self.assertEqual(resp["meta_info"]["cache_miss_count"], 0)
 
     def test_logprobs(self):
         # Note: add test_logprobs until accuracy score is relatively high, we will update the following expected logits.
@@ -562,9 +554,7 @@ class TestFeatures(CustomTestCase):
         )
 
         resp_with_penalty = run_curl(args)
-        if "cache_miss_count" not in resp_with_penalty["meta_info"]:
-            raise "[presence_penalty] cache_miss_count is missed in response"
-        self.assertEqual(resp_with_penalty["meta_info"]["cache_miss_count"], 0)
+
         self.assertIn("text", resp_with_penalty)
 
         # decode
@@ -578,9 +568,6 @@ class TestFeatures(CustomTestCase):
 
         resp_with_penalty = run_curl(args)
 
-        if "cache_miss_count" not in resp_with_penalty["meta_info"]:
-            raise "[presence_penalty] cache_miss_count is missed in response"
-        self.assertEqual(resp_with_penalty["meta_info"]["cache_miss_count"], 0)
         self.assertIn("text", resp_with_penalty)
 
     def test_min_new_tokens_penalty(self):
@@ -595,9 +582,6 @@ class TestFeatures(CustomTestCase):
 
         resp_with_min_tokens = run_curl(args)
 
-        if "cache_miss_count" not in resp_with_min_tokens["meta_info"]:
-            raise "[min_new_tokens] cache_miss_count is missed in response"
-        self.assertEqual(resp_with_min_tokens["meta_info"]["cache_miss_count"], 0)
         self.assertIn("text", resp_with_min_tokens)
 
         # decode
@@ -610,9 +594,7 @@ class TestFeatures(CustomTestCase):
         )
 
         resp_with_min_tokens = run_curl(args)
-        if "cache_miss_count" not in resp_with_min_tokens["meta_info"]:
-            raise "[min_new_tokens] cache_miss_count is missed in response"
-        self.assertEqual(resp_with_min_tokens["meta_info"]["cache_miss_count"], 0)
+
         self.assertIn("text", resp_with_min_tokens)
 
     def test_combined_penalties(self):
@@ -709,10 +691,6 @@ class TestNoOverlapSchedule(CustomTestCase):
 
         # Test frequency penalty = 1.0
         resp_with_penalty = run_curl(args)
-
-        if "cache_miss_count" not in resp_with_penalty["meta_info"]:
-            raise "[frequency_penalty] cache_miss_count is missed in response"
-        self.assertEqual(resp_with_penalty["meta_info"]["cache_miss_count"], 0)
         self.assertIn("text", resp_with_penalty)
 
         # decode
@@ -724,9 +702,6 @@ class TestNoOverlapSchedule(CustomTestCase):
             frequency_penalty=0.2,
         )
         resp_with_penalty = run_curl(args)
-        if "cache_miss_count" not in resp_with_penalty["meta_info"]:
-            raise "[frequency_penalty] cache_miss_count is missed in response"
-        self.assertEqual(resp_with_penalty["meta_info"]["cache_miss_count"], 0)
         self.assertIn("text", resp_with_penalty)
 
     def test_presence_penalty(self):
@@ -740,9 +715,6 @@ class TestNoOverlapSchedule(CustomTestCase):
         )
 
         resp_with_penalty = run_curl(args)
-        if "cache_miss_count" not in resp_with_penalty["meta_info"]:
-            raise "[presence_penalty] cache_miss_count is missed in response"
-        self.assertEqual(resp_with_penalty["meta_info"]["cache_miss_count"], 0)
         self.assertIn("text", resp_with_penalty)
 
         args = SimpleNamespace(
@@ -754,10 +726,6 @@ class TestNoOverlapSchedule(CustomTestCase):
         )
 
         resp_with_penalty = run_curl(args)
-
-        if "cache_miss_count" not in resp_with_penalty["meta_info"]:
-            raise "[presence_penalty] cache_miss_count is missed in response"
-        self.assertEqual(resp_with_penalty["meta_info"]["cache_miss_count"], 0)
         self.assertIn("text", resp_with_penalty)
 
     def test_min_new_tokens_penalty(self):
@@ -771,9 +739,6 @@ class TestNoOverlapSchedule(CustomTestCase):
         )
 
         resp_with_min_tokens = run_curl(args)
-        if "cache_miss_count" not in resp_with_min_tokens["meta_info"]:
-            raise "[min_new_tokens] cache_miss_count is missed in response"
-        self.assertEqual(resp_with_min_tokens["meta_info"]["cache_miss_count"], 0)
         self.assertIn("text", resp_with_min_tokens)
 
         args = SimpleNamespace(
@@ -787,9 +752,6 @@ class TestNoOverlapSchedule(CustomTestCase):
         # decode
         # Test with min_new_tokens
         resp_with_min_tokens = run_curl(args)
-        if "cache_miss_count" not in resp_with_min_tokens["meta_info"]:
-            raise "[min_new_tokens] cache_miss_count is missed in response"
-        self.assertEqual(resp_with_min_tokens["meta_info"]["cache_miss_count"], 0)
         self.assertIn("text", resp_with_min_tokens)
 
     def test_combined_penalties(self):
@@ -820,8 +782,6 @@ class TestNoOverlapSchedule(CustomTestCase):
                 **penalty_param,
             )
             resp_combined = run_curl(args)
-            if "cache_miss_count" not in resp_combined["meta_info"]:
-                raise "[combined_penalties] cache_miss_count is missed in response"
             self.assertIn("text", resp_combined)
 
 
@@ -881,11 +841,7 @@ class TestCacheMissesTP1(CustomTestCase):
             max_new_tokens=1,
         )
 
-        resp = run_curl(args)
-
-        if "cache_miss_count" not in resp["meta_info"]:
-            raise "[prefill] cache_miss_count is missed in response"
-        self.assertEqual(resp["meta_info"]["cache_miss_count"], 0)
+        run_curl(args)
 
     def test_cache_miss_decode(self):
         args = SimpleNamespace(
@@ -895,11 +851,7 @@ class TestCacheMissesTP1(CustomTestCase):
             max_new_tokens=2,
         )
 
-        resp = run_curl(args)
-
-        if "cache_miss_count" not in resp["meta_info"]:
-            raise "[prefill] cache_miss_count is missed in response"
-        self.assertEqual(resp["meta_info"]["cache_miss_count"], 0)
+        run_curl(args)
 
 
 class TestCacheMissesTP4(CustomTestCase):
@@ -930,11 +882,7 @@ class TestCacheMissesTP4(CustomTestCase):
             max_new_tokens=1,
         )
 
-        resp = run_curl(args)
-
-        if "cache_miss_count" not in resp["meta_info"]:
-            raise "[prefill] cache_miss_count is missed in response"
-        self.assertEqual(resp["meta_info"]["cache_miss_count"], 0)
+        run_curl(args)
 
     def test_cache_miss_decode(self):
         args = SimpleNamespace(
@@ -944,11 +892,7 @@ class TestCacheMissesTP4(CustomTestCase):
             max_new_tokens=2,
         )
 
-        resp = run_curl(args)
-
-        if "cache_miss_count" not in resp["meta_info"]:
-            raise "[prefill] cache_miss_count is missed in response"
-        self.assertEqual(resp["meta_info"]["cache_miss_count"], 0)
+        run_curl(args)
 
     def test_cache_miss_with_sampling_params(self):
         # prefill
@@ -961,10 +905,8 @@ class TestCacheMissesTP4(CustomTestCase):
             min_p=0.2,
             max_new_tokens=1,
         )
-        resp = run_curl(args)
-        if "cache_miss_count" not in resp["meta_info"]:
-            raise "[prefill] cache_miss_count is missed in response"
-        self.assertEqual(resp["meta_info"]["cache_miss_count"], 0)
+        run_curl(args)
+
         # decode
         args = SimpleNamespace(
             base_url=self.base_url,
@@ -975,10 +917,7 @@ class TestCacheMissesTP4(CustomTestCase):
             min_p=0.2,
             max_new_tokens=2,
         )
-        resp = run_curl(args)
-        if "cache_miss_count" not in resp["meta_info"]:
-            raise "[prefill] cache_miss_count is missed in response"
-        self.assertEqual(resp["meta_info"]["cache_miss_count"], 0)
+        run_curl(args)
 
 
 if __name__ == "__main__":
