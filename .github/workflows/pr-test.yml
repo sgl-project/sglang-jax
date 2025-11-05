@@ -111,7 +111,6 @@ jobs:
 
       - name: Get GKE credentials
         run: |
-          gcloud
           gcloud container clusters get-credentials tpu-service --zone=us-east5 --project=tpu-service-473302
 
       - name: Submit TPU v6e-4 Job
