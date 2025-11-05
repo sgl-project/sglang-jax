@@ -29,16 +29,6 @@ jobs:
     if: github.event.pull_request.draft == false
     runs-on: ubuntu-latest
     steps:
-      - name: Check if GCP_SA_KEY secret is injected
-        env:
-          GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
-        run: |
-          if [ -z "${{ secrets.GCP_SA_KEY }}" ]; then
-            echo "❌ GCP_SA_KEY is NOT set"
-            exit 1
-          else
-            echo "✅ GCP_SA_KEY is set (value length: ${#GCP_SA_KEY})"
-          fi
       - name: Setup gcloud
         env:
           GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
@@ -58,7 +48,7 @@ jobs:
           cat > job.yaml <<EOF
           apiVersion: batch/v1
           kind: Job
-          meta
+          metadata:
             name: \$JOB_NAME
           spec:
             ttlSecondsAfterFinished: 1800
