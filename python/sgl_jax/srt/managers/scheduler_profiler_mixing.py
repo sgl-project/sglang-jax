@@ -17,6 +17,8 @@ class SchedulerProfilerMixin:
         self.profiler_target_forward_ct: int | None = None
         self.profile_steps: int | None = None
         self.profile_in_progress: bool = False
+        self.host_tracer_level: int | None = None
+        self.python_tracer_level: int | None = None
 
     def start_profile(
         self,
@@ -48,6 +50,8 @@ class SchedulerProfilerMixin:
 
         self.profiler_output_dir = output_dir
         self.profile_id = profile_id
+        self.host_tracer_level = host_tracer_level
+        self.python_tracer_level = python_tracer_level
 
         if start_step:
             self.profiler_start_forward_ct = max(start_step, self.forward_ct + 1)
@@ -112,7 +116,14 @@ class SchedulerProfilerMixin:
         if self.profiler_target_forward_ct and self.profiler_target_forward_ct <= self.forward_ct:
             self.stop_profile()
         if self.profiler_start_forward_ct and self.profiler_start_forward_ct == self.forward_ct:
-            self.start_profile(self.profiler_output_dir, None, self.profile_steps, self.profile_id)
+            self.start_profile(
+                self.profiler_output_dir,
+                None,
+                self.profile_steps,
+                self.host_tracer_level,
+                self.python_tracer_level,
+                self.profile_id,
+            )
 
     def profile(self, recv_req: ProfileReq):
         if recv_req.type == ProfileReqType.START_PROFILE:
