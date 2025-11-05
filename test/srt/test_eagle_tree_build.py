@@ -7,6 +7,9 @@ from sgl_jax.srt.speculative.eagle_util import (
     build_tree_kernel_efficient,
     build_tree_kernel_efficient_preprocess,
 )
+from sgl_jax.srt.utils.mesh_utils import create_device_mesh
+
+mesh = create_device_mesh(ici_parallelism=[1, -1, 1], dcn_parallelism=[1, 1, 1])
 
 
 def test_build_tree_kernel_efficient():
@@ -231,9 +234,9 @@ def test_build_tree_kernel_efficient():
         seq_lens=seq_lens,
         seq_lens_sum=jnp.sum(seq_lens).item(),
         topk=topk,
-        spec_steps=depth,
         num_verify_tokens=num_draft_token,
         max_seq_len_per_req=int(seq_lens.max()),
+        mesh=mesh,
     )
 
     print("=========== build tree kernel efficient ==========")
@@ -249,6 +252,31 @@ def test_build_tree_kernel_efficient():
 
     # Test exact values to match PyTorch implementation
     # Note: These are the expected results from the PyTorch version
+
+    expected_tree_mask = [
+        # first seq
+        True, True, True, True, True, True, False, False, False, False, False, False, False,
+        True, True, True, True, True, True, True, False, False, False, False, False, False,
+        True, True, True, True, True, True, False, True, False, False, False, False, False,
+        True, True, True, True, True, True, True, False, True, False, False, False, False,
+        True, True, True, True, True, True, False, True, False, True, False, False, False,
+        True, True, True, True, True, True, True, False, True, False, True, False, False,
+        True, True, True, True, True, True, False, True, False, True, False, True, False,
+        True, True, True, True, True, True, True, False, True, False, True, False, True,
+
+        # second seq
+        True, True, True, True, True, True, True, True, True, True, True, False, False, False, False, False, False, False,
+        True, True, True, True, True, True, True, True, True, True, True, True, False, False, False, False, False, False,
+        True, True, True, True, True, True, True, True, True, True, True, True, True, False, False, False, False, False,
+        True, True, True, True, True, True, True, True, True, True, True, True, False, True, False, False, False, False,
+        True, True, True, True, True, True, True, True, True, True, True, True, False, False, True, False, False, False,
+        True, True, True, True, True, True, True, True, True, True, True, True, False, False, False, True, False, False,
+        True, True, True, True, True, True, True, True, True, True, True, True, False, True, False, False, True, False,
+        True, True, True, True, True, True, True, True, True, True, True, True, False, True, False, False, True, True,
+
+        # invalid
+        False, False, False, False, False, False, False, False, False, False, False, False, False, False, False, False, False, False, False, False, False, False, False, False, False, False, False, False, False, False, False, False, False, False, False, False, False, False, False, False]
+
     expected_position = [5, 6, 6, 7, 7, 8, 8, 9, 10, 11, 12, 12, 12, 12, 13, 14]
     expected_retrive_index = [
         [0, 1, 2, 3, 4, 5, 6, 7],
@@ -282,6 +310,16 @@ def test_build_tree_kernel_efficient():
     ]
 
     print("\n=== Comparing with PyTorch expected results ===")
+
+    # Test tree mask
+    tree_mask_list = tree_mask.tolist()
+    try:
+        assert tree_mask_list == expected_tree_mask
+        print("✓ Tree Mask matches!")
+    except AssertionError:
+        print(f"✗ Tree Mask assertion failed!")
+        print(f"   Expected: {expected_tree_mask}")
+        print(f"   Actual:   {tree_mask_list}")
 
     # Test position
     actual_position = position.tolist()
@@ -342,9 +380,7 @@ def test_build_tree_kernel_efficient():
         print(f"✗ Draft_tokens assertion failed!")
         print(f"   Expected: {expected_draft_tokens}")
         print(f"   Actual:   {actual_draft_tokens}")
-        print(
-            "This indicates the preprocessing logic needs further alignment with PyTorch."
-        )
+        print("This indicates the preprocessing logic needs further alignment with PyTorch.")
 
     print("\n=== Test Summary ===")
     print("✅ PREPROCESSING COMPLETE: draft_tokens matches PyTorch implementation!")
@@ -362,9 +398,7 @@ def test_build_tree_kernel_efficient():
         print("✅ Retrive_next_sibling matches")
         print("✅ Draft_tokens matches")
         print("")
-        print(
-            "🚀 EAGLE tree construction is now fully compatible with PyTorch version!"
-        )
+        print("🚀 EAGLE tree construction is now fully compatible with PyTorch version!")
     else:
         raise ValueError("Test failed")
 
@@ -457,10 +491,8 @@ def test_build_tree_preprocess():
     num_verify_tokens = 8
 
     # Test the preprocessing function
-    parent_list, top_scores_index, draft_tokens = (
-        build_tree_kernel_efficient_preprocess(
-            verified_id, score_list, token_list, parents_list, num_verify_tokens
-        )
+    parent_list, top_scores_index, draft_tokens = build_tree_kernel_efficient_preprocess(
+        verified_id, score_list, token_list, parents_list, num_verify_tokens
     )
 
     print("========== Preprocessing Test Results ==========")
@@ -470,12 +502,8 @@ def test_build_tree_preprocess():
     print(f"draft_tokens: {draft_tokens.tolist()}")
 
     # Verify shapes
-    assert (
-        parent_list.shape[0] == 2
-    ), f"Expected batch size 2, got {parent_list.shape[0]}"
-    assert (
-        top_scores_index.shape[0] == 2
-    ), f"Expected batch size 2, got {top_scores_index.shape[0]}"
+    assert parent_list.shape[0] == 2, f"Expected batch size 2, got {parent_list.shape[0]}"
+    assert top_scores_index.shape[0] == 2, f"Expected batch size 2, got {top_scores_index.shape[0]}"
     assert (
         top_scores_index.shape[1] == num_verify_tokens - 1
     ), f"Expected {num_verify_tokens - 1} tokens, got {top_scores_index.shape[1]}"
@@ -507,9 +535,9 @@ def test_build_tree_simple_case():
         seq_lens=seq_lens,
         seq_lens_sum=3,
         topk=2,
-        spec_steps=1,
         num_verify_tokens=2,
         max_seq_len_per_req=int(seq_lens.max()),
+        mesh=mesh,
     )
 
     (

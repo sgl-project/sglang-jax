@@ -66,17 +66,26 @@ class TestVerifyTree(CustomTestCase):
         accept_index = jnp.full((bs, num_spec_step), -1, dtype=jnp.int32)  # mutable
         accept_token_num = jnp.full((bs,), 0, dtype=jnp.int32)  # mutable
 
-        accept_index, accept_token_num, predicts = verify_tree_greedy(
-            predicts=predicts,
-            accept_index=accept_index,
-            accept_token_num=accept_token_num,
-            candidates=candidates,
-            retrive_index=retrive_index,
-            retrive_next_token=retrive_next_token,
-            retrive_next_sibling=retrive_next_sibling,
-            target_predict=target_predict,
-            mesh=mesh,
-        )
+        # # for compatibility, 0.6.3 need to use use_mesh. set_mesh is not have __entry__ attribute.
+        # # on jax >=0.7.1, we need to use set_mesh.
+        try:
+            ctx = jax.sharding.use_mesh(mesh)
+        except AttributeError:
+            try:
+                ctx = jax.set_mesh(mesh)
+            except AttributeError:
+                ctx = mesh
+        with ctx:
+            accept_index, accept_token_num, predicts = verify_tree_greedy(
+                predicts=predicts,
+                accept_index=accept_index,
+                accept_token_num=accept_token_num,
+                candidates=candidates,
+                retrive_index=retrive_index,
+                retrive_next_token=retrive_next_token,
+                retrive_next_sibling=retrive_next_sibling,
+                target_predict=target_predict,
+            )
 
         # Check the expected output.
         self.assertEqual(predicts.flatten().tolist(), [3, 0, 0, 4, 5, 18, 11, 0, 0, 0, 12, 18])

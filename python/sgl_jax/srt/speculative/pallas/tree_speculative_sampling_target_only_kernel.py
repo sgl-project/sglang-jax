@@ -51,7 +51,7 @@ def _tree_speculative_sampling_target_only_kernel(
     o_accept_index_ref.at[bid, 0].set(last_accepted_retrive_idx)
 
     def init_accept_index():
-        def body(i, state):
+        def body(i, _):
             o_accept_index_ref.at[bid, i].set(-1)
             return ()
 
@@ -59,7 +59,7 @@ def _tree_speculative_sampling_target_only_kernel(
             0,
             num_spec_tokens,
             body,
-            (),
+            None,
             unroll=num_spec_tokens,
         )
 

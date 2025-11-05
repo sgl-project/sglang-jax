@@ -50,6 +50,7 @@ repos:
         #     python/sgl_jax/srt/managers/scheduler\.py|
         #     python/sgl_jax/srt/server_args\.py
         #   )$
+        exclude: test/srt/test_eagle_tree_build.py
   - repo: https://github.com/codespell-project/codespell
     rev: v2.4.1
     hooks:

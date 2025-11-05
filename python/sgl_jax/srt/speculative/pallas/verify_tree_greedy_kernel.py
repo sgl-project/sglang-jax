@@ -4,7 +4,6 @@ import jax
 import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
-from jax.sharding import Mesh
 from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.utils.common_utils import cdiv
@@ -28,15 +27,14 @@ def _verify_tree_greedy_kernel(
     bid = pl.program_id(0)
 
     def init_accept_index():
-        def body(i, state):
+        def body(i, _):
             o_accept_index_ref.at[bid, i].set(-1)
-            return ()
 
         jax.lax.fori_loop(
             0,
             num_spec_tokens,
             body,
-            (),
+            None,
             unroll=num_spec_tokens,
         )
 
@@ -195,63 +193,11 @@ def prepare_for_verify(candidates, retrive_index, retrive_next_token, retrive_ne
     return candidates, retrive_index, retrive_next_token, retrive_next_sibling
 
 
-def verify_tree_greedy(
-    predicts: jax.Array,  # shape: (bs*num_draft_tokens,)
-    accept_index: jax.Array,  # shape: (bs*num_spec_step,)
-    accept_token_num: jax.Array,  # shape: (bs,)
-    candidates: jax.Array,  # shape: (bs, num_draft_tokens)
-    retrive_index: jax.Array,  # shape: (bs, num_draft_tokens)
-    retrive_next_token: jax.Array,  # shape: (bs, num_draft_tokens)
-    retrive_next_sibling: jax.Array,  # shape: (bs, num_draft_tokens)
-    target_predict: jax.Array,  # shape: (bs*num_draft_tokens,)
-    mesh: Mesh,
-):
-    in_specs = (
-        P(),  # predicts
-        P(),  # accept_index
-        P(),  # accept_token_num
-        P(),  # candidates
-        P(),  # retrive_index
-        P(),  # retrive_next_token
-        P(),  # retrive_next_sibling
-        P(),  # target_predict
-    )
-    out_specs = (
-        P(),  # accept_index
-        P(),  # accept_token_num
-        P(),  # predicts
-    )
-    # # for compatibility, 0.6.3 need to use use_mesh. set_mesh is not have __entry__ attribute.
-    # # on jax >=0.7.1, we need to use set_mesh.
-    try:
-        ctx = jax.sharding.use_mesh(mesh)
-    except AttributeError:
-        try:
-            ctx = jax.set_mesh(mesh)
-        except AttributeError:
-            ctx = mesh
-    with ctx:
-        (accept_index, accept_token_num, predicts) = jax.shard_map(
-            verify_tree_greedy_pallas_call,
-            in_specs=in_specs,
-            out_specs=out_specs,
-            check_vma=False,
-        )(
-            predicts,
-            accept_index,
-            accept_token_num,
-            candidates,
-            retrive_index,
-            retrive_next_token,
-            retrive_next_sibling,
-            target_predict,
-        )
-    return accept_index, accept_token_num, predicts
-
-
-functools.partial(jax.jit, donate_argnames=("predicts", "accept_index", "accept_token_num"))
-
-
+@functools.partial(
+    jax.jit,
+    static_argnames=("draft_token_num", "num_spec_tokens"),
+    donate_argnames=("predicts", "accept_index", "accept_token_num"),
+)
 def verify_tree_greedy_pallas_call(
     predicts: jax.Array,  # shape: (bs*num_draft_tokens,)
     accept_index: jax.Array,  # shape: (bs,num_spec_tokens)
@@ -261,11 +207,11 @@ def verify_tree_greedy_pallas_call(
     retrive_next_token: jax.Array,
     retrive_next_sibling: jax.Array,
     target_predict: jax.Array,  # shape: (bs*num_draft_tokens,)
+    draft_token_num: int,
+    num_spec_tokens: int,
 ):
     """Verify the tree greedy using a Pallas kernel"""
     bs = candidates.shape[0]
-    draft_token_num = retrive_index.shape[1]
-    num_spec_tokens = accept_index.shape[1]
 
     (candidates, retrive_index, retrive_next_token, retrive_next_sibling) = prepare_for_verify(
         candidates, retrive_index, retrive_next_token, retrive_next_sibling
@@ -315,4 +261,53 @@ def verify_tree_greedy_pallas_call(
         predicts,
     ) = kernel(*scalar_prefetches)
 
+    return accept_index, accept_token_num, predicts
+
+
+@jax.jit
+def verify_tree_greedy(
+    predicts: jax.Array,  # shape: (bs*num_draft_tokens,)
+    accept_index: jax.Array,  # shape: (bs*num_spec_step,)
+    accept_token_num: jax.Array,  # shape: (bs,)
+    candidates: jax.Array,  # shape: (bs, num_draft_tokens)
+    retrive_index: jax.Array,  # shape: (bs, num_draft_tokens)
+    retrive_next_token: jax.Array,  # shape: (bs, num_draft_tokens)
+    retrive_next_sibling: jax.Array,  # shape: (bs, num_draft_tokens)
+    target_predict: jax.Array,  # shape: (bs*num_draft_tokens,)
+):
+    in_specs = (
+        P(),  # predicts
+        P(),  # accept_index
+        P(),  # accept_token_num
+        P(),  # candidates
+        P(),  # retrive_index
+        P(),  # retrive_next_token
+        P(),  # retrive_next_sibling
+        P(),  # target_predict
+        None,
+        None,
+    )
+    out_specs = (
+        P(),  # accept_index
+        P(),  # accept_token_num
+        P(),  # predicts
+    )
+
+    (accept_index, accept_token_num, predicts) = jax.shard_map(
+        verify_tree_greedy_pallas_call,
+        in_specs=in_specs,
+        out_specs=out_specs,
+        check_vma=False,
+    )(
+        predicts,
+        accept_index,
+        accept_token_num,
+        candidates,
+        retrive_index,
+        retrive_next_token,
+        retrive_next_sibling,
+        target_predict,
+        retrive_index.shape[1],
+        accept_index.shape[1],
+    )
     return accept_index, accept_token_num, predicts

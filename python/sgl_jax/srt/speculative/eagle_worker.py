@@ -290,9 +290,9 @@ class EAGLEWorker(ModelWorker):
             batch.seq_lens,
             batch.seq_lens_sum,
             self.topk,
-            self.speculative_num_steps,
             self.speculative_num_draft_tokens,
             int(batch.req_to_token_pool.req_to_token.shape[1]),
+            self.mesh,
         )
         # build tree
         return EagleVerifyInput(

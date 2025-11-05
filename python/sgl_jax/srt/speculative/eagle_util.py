@@ -21,6 +21,9 @@ from sgl_jax.srt.managers.schedule_batch import (
 )
 from sgl_jax.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sgl_jax.srt.model_executor.forward_batch_info import CaptureHiddenMode
+from sgl_jax.srt.speculative.pallas.build_eagle_tree_structure_kernel import (
+    build_eagle_tree_structure,
+)
 from sgl_jax.srt.speculative.pallas.kernel import (
     align_evict_mask_to_page_size,
     assign_req_to_token_pool,
@@ -198,7 +201,8 @@ def build_tree_kernel_efficient_preprocess(
         parent_list = jnp.concatenate(parents_list[:-1], axis=1)
     else:
         batch_size = parents_list[0].shape[0]
-        parent_list = jnp.empty((batch_size, 0), dtype=jnp.int32)
+        # parent_list = jnp.empty((batch_size, 0), dtype=jnp.int32)
+        parent_list = jnp.full((batch_size, 1), -1, dtype=jnp.int32)
 
     return parent_list, top_scores_index, draft_tokens
 
@@ -211,9 +215,9 @@ def build_tree_kernel_efficient(
     seq_lens: jax.Array,
     seq_lens_sum: int,
     topk: int,
-    spec_steps: int,
     num_verify_tokens: int,
     max_seq_len_per_req: int,
+    mesh: Mesh,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
     """JAX implementation of build_tree_kernel_efficient.
 
@@ -225,7 +229,6 @@ def build_tree_kernel_efficient(
         seq_lens: Sequence lengths
         seq_lens_sum: Sum of sequence lengths
         topk: Number of top-k candidates
-        spec_steps: Number of speculative steps
         num_verify_tokens: Number of tokens to verify
         max_seq_len_per_req: Maximum allowed sequence length per request (static bound)
 
@@ -238,30 +241,28 @@ def build_tree_kernel_efficient(
     )
 
     # Get batch size
-    bs = seq_lens.shape[0]
-    actual_tree_mask_size = (
-        seq_lens_sum * num_verify_tokens + num_verify_tokens * num_verify_tokens * bs
-    )
-    max_tree_mask_size = (
-        max_seq_len_per_req * num_verify_tokens * bs + num_verify_tokens * num_verify_tokens * bs
-    )
-
-    tree_mask, positions, retrive_index, retrive_next_token, retrive_next_sibling = (
-        build_eagle_tree_structure(
-            parent_list=parent_list,
-            selected_index=top_scores_index,
-            verified_seq_len=seq_lens,
-            bs=bs,
-            draft_token_num=num_verify_tokens,
-            topk=topk,
-            depth=spec_steps,
-            seq_lens_sum=seq_lens_sum,
-            tree_mask_mode=0,  # FULL_MASK
-            max_seq_len_per_req=max_seq_len_per_req,
-            max_tree_mask_size=max_tree_mask_size,
-            actual_tree_mask_size=actual_tree_mask_size,
+    # for compatibility, 0.6.3 need to use use_mesh. set_mesh is not have __entry__ attribute.
+    # on jax >=0.7.1, we need to use set_mesh.
+    try:
+        ctx = jax.sharding.use_mesh(mesh)
+    except AttributeError:
+        try:
+            ctx = jax.set_mesh(mesh)
+        except AttributeError:
+            ctx = mesh
+    with ctx:
+        tree_mask, positions, retrive_index, retrive_next_token, retrive_next_sibling = (
+            build_eagle_tree_structure(
+                parent_list=parent_list,
+                selected_index=top_scores_index,
+                verified_seq_len=seq_lens,
+                draft_token_num=num_verify_tokens,
+                topk=topk,
+                seq_lens_sum=seq_lens_sum,
+                max_context_len=max_seq_len_per_req,
+                tree_mask_mode=0,  # FULL_MASK
+            )
         )
-    )
 
     return (
         tree_mask,
@@ -654,17 +655,26 @@ class EagleVerifyInput:
 
         if is_all_greedy:
             target_predict = jnp.argmax(logits_output.next_token_logits, axis=-1).flatten()
-            accept_index, accept_length, predict = verify_tree_greedy(
-                predicts=predict,
-                accept_index=accept_index,
-                accept_token_num=accept_length,
-                candidates=candidates,
-                retrive_index=self.retrive_index,
-                retrive_next_token=self.retrive_next_token,
-                retrive_next_sibling=self.retrive_next_sibling,
-                target_predict=target_predict,
-                mesh=mesh,
-            )
+            # # for compatibility, 0.6.3 need to use use_mesh. set_mesh is not have __entry__ attribute.
+            # # on jax >=0.7.1, we need to use set_mesh.
+            try:
+                ctx = jax.sharding.use_mesh(mesh)
+            except AttributeError:
+                try:
+                    ctx = jax.set_mesh(mesh)
+                except AttributeError:
+                    ctx = mesh
+            with ctx:
+                accept_index, accept_length, predict = verify_tree_greedy(
+                    predicts=predict,
+                    accept_index=accept_index,
+                    accept_token_num=accept_length,
+                    candidates=candidates,
+                    retrive_index=self.retrive_index,
+                    retrive_next_token=self.retrive_next_token,
+                    retrive_next_sibling=self.retrive_next_sibling,
+                    target_predict=target_predict,
+                )
         else:
             # apply temperature and get target probs
             expanded_temperature = jnp.repeat(
@@ -951,193 +961,6 @@ def _generate_simulated_accept_index(
     accept_length = accept_length.at[:].set(simulate_acc_len - 1)
     predict = predict.at[:].set(100)  # some legit token id
     return sim_accept_index, accept_length, predict
-
-
-def build_eagle_tree_structure(
-    parent_list: jax.Array,
-    selected_index: jax.Array,
-    verified_seq_len: jax.Array,
-    bs: int,
-    draft_token_num: int,
-    topk: int,
-    depth: int,
-    seq_lens_sum: int,
-    tree_mask_mode: int = 0,  # FULL_MASK = 0
-    max_seq_len_per_req: int | None = None,
-    max_tree_mask_size: int | None = None,
-    actual_tree_mask_size: int | None = None,
-) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
-    """
-    Args:
-        parent_list: Parent indices array [bs, topk * (depth-1) + 1]
-        selected_index: Selected token indices [bs, draft_token_num - 1]
-        verified_seq_len: Sequence lengths [bs]
-        bs: Batch size
-        draft_token_num: Number of draft tokens (num_verify_tokens)
-        topk: Top-k value
-        depth: Tree depth
-        seq_lens_sum: Sum of sequence lengths
-        tree_mask_mode: Tree mask mode (0=FULL_MASK)
-        max_seq_len_per_req: Static upper bound for sequence length per request
-        max_tree_mask_size: Optional explicit capacity for the tree mask buffer
-        actual_tree_mask_size: Optional override for the exact number of valid mask entries
-
-    Returns:
-        tuple of (tree_mask, positions, retrive_index, retrive_next_token, retrive_next_sibling)
-    """
-
-    if tree_mask_mode == 0:  # FULL_MASK
-        inferred_actual_size = (
-            seq_lens_sum * draft_token_num + draft_token_num * draft_token_num * bs
-        )
-        tree_mask_size = (
-            inferred_actual_size if actual_tree_mask_size is None else actual_tree_mask_size
-        )
-        inferred_capacity = (
-            max_seq_len_per_req * draft_token_num * bs + draft_token_num * draft_token_num * bs
-            if max_seq_len_per_req is not None
-            else inferred_actual_size
-        )
-        tree_mask_capacity = inferred_capacity if max_tree_mask_size is None else max_tree_mask_size
-    else:
-        inferred_actual_size = bs * draft_token_num * draft_token_num
-        tree_mask_size = (
-            inferred_actual_size if actual_tree_mask_size is None else actual_tree_mask_size
-        )
-        tree_mask_capacity = (
-            inferred_actual_size if max_tree_mask_size is None else max_tree_mask_size
-        )
-
-    tree_mask = jnp.zeros((tree_mask_capacity,), dtype=jnp.bool_)
-    if tree_mask_size > 0:
-        tree_mask = tree_mask.at[:tree_mask_size].set(True)
-    positions = jnp.zeros((bs * draft_token_num,), dtype=jnp.int32)
-    retrive_index = jnp.full((bs, draft_token_num), -1, dtype=jnp.int32)
-    retrive_next_token = jnp.full((bs, draft_token_num), -1, dtype=jnp.int32)
-    retrive_next_sibling = jnp.full((bs, draft_token_num), -1, dtype=jnp.int32)
-
-    for bid in range(bs):
-        seq_len = verified_seq_len[bid]
-
-        # Calculate seq_tree_idx for this batch (exactly like CUDA kernel)
-        seq_tree_idx = draft_token_num * draft_token_num * bid
-        if tree_mask_mode == 0:  # FULL_MASK
-            for i in range(bid):
-                seq_tree_idx += verified_seq_len[i] * draft_token_num
-        for tid in range(draft_token_num):
-            global_token_idx = bid * draft_token_num + tid
-
-            # Calculate token_tree_idx for tree_mask
-            if tree_mask_mode == 0:  # FULL_MASK
-                token_tree_idx = seq_tree_idx + (seq_len + draft_token_num) * tid + seq_len + 1
-            else:
-                token_tree_idx = draft_token_num * draft_token_num * bid + draft_token_num * tid + 1
-
-            # Set tree_mask for this token
-            if token_tree_idx > 0 and token_tree_idx <= tree_mask_size:
-                tree_mask = tree_mask.at[token_tree_idx - 1].set(True)
-
-            # Clear next draft_token_num - 1 positions
-            for i in range(draft_token_num - 1):
-                mask_idx = token_tree_idx + i
-                if mask_idx < tree_mask_size:
-                    tree_mask = tree_mask.at[mask_idx].set(False)
-
-            if tid == 0:
-                # Verified token (tid == 0)
-                positions = positions.at[global_token_idx].set(seq_len)
-                retrive_index = retrive_index.at[bid, tid].set(global_token_idx)
-
-                # Build retrive_next_token and retrive_next_sibling (backwards iteration)
-                retrive_index_offset = bid * draft_token_num
-                for i in range(draft_token_num - 1, 0, -1):  # i from draft_token_num-1 to 1
-                    current_token_idx = retrive_index_offset + i
-                    retrive_index = retrive_index.at[bid, i].set(current_token_idx)
-
-                    selected_idx = bid * (draft_token_num - 1) + i - 1
-                    parent_tb_idx = selected_index.flatten()[selected_idx] // topk
-                    parent_position = 0
-
-                    if parent_tb_idx > 0:
-                        parent_list_idx = bid * (topk * (depth - 1) + 1) + parent_tb_idx
-                        if parent_list_idx < parent_list.size:
-                            parent_token_idx = parent_list.flatten()[parent_list_idx]
-
-                            for parent_pos in range(draft_token_num - 1):
-                                check_idx = bid * (draft_token_num - 1) + parent_pos
-                                if (
-                                    check_idx < selected_index.size
-                                    and selected_index.flatten()[check_idx] == parent_token_idx
-                                ):
-                                    parent_position = parent_pos + 1  # +1 to convert to 1-indexed
-                                    break
-                            else:
-                                parent_position = draft_token_num  # Not found
-                        else:
-                            parent_position = draft_token_num  # Invalid parent_list_idx
-                    else:
-                        parent_position = 0  # Root node
-
-                    if parent_position >= draft_token_num:
-                        # Invalid parent, skip
-                        continue
-
-                    next_token_idx = bid * draft_token_num + parent_position
-                    if retrive_next_token.flatten()[next_token_idx] == -1:
-                        retrive_next_token = retrive_next_token.at[bid, parent_position].set(i)
-                    else:
-                        # There's already a next_token, so set sibling
-                        origin_next_token = retrive_next_token.flatten()[next_token_idx]
-                        retrive_next_token = retrive_next_token.at[bid, parent_position].set(i)
-                        retrive_next_sibling = retrive_next_sibling.at[bid, i].set(
-                            origin_next_token
-                        )
-
-                retrive_index = retrive_index.at[bid, 0].set(bid * draft_token_num)
-
-            else:
-                # Draft token (tid > 0)
-                # Calculate position by tracing back to root
-                position = 0
-                cur_position = tid - 1  # Convert to 0-indexed for selected_index
-
-                while True:
-                    position += 1
-                    mask_idx = token_tree_idx + cur_position
-                    if mask_idx < tree_mask_size:
-                        tree_mask = tree_mask.at[mask_idx].set(True)
-
-                    selected_idx = bid * (draft_token_num - 1) + cur_position
-                    parent_tb_idx = selected_index.flatten()[selected_idx] // topk
-
-                    if parent_tb_idx == 0:
-                        # Reached root
-                        break
-
-                    parent_list_idx = bid * (topk * (depth - 1) + 1) + parent_tb_idx
-                    if parent_list_idx < parent_list.size:
-                        token_idx = parent_list.flatten()[parent_list_idx]
-
-                        found = False
-                        for cur_pos in range(draft_token_num - 1):
-                            check_idx = bid * (draft_token_num - 1) + cur_pos
-                            if (
-                                check_idx < selected_index.size
-                                and selected_index.flatten()[check_idx] == token_idx
-                            ):
-                                cur_position = cur_pos
-                                found = True
-                                break
-
-                        if not found:
-                            break  # Invalid tree structure
-                    else:
-                        break  # Invalid parent_list_idx
-
-                positions = positions.at[global_token_idx].set(position + seq_len)
-                retrive_index = retrive_index.at[bid, tid].set(global_token_idx)
-
-    return tree_mask, positions, retrive_index, retrive_next_token, retrive_next_sibling
 
 
 def get_src_tgt_cache_loc(
