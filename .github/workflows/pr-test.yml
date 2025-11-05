@@ -79,6 +79,7 @@ jobs:
                       sed -i "s|COMMIT_SHA_PLACEHOLDER|${COMMIT_SHA}|g" ./task.yaml
                       sky api login --endpoint ${SKYPILOT_ENDPOINT}
                       sky check
+                      cat ./task.yaml
                       sky launch ./task.yaml -y \
                         --use-spot \
                         --idle-minutes-to-autostop 120 \
