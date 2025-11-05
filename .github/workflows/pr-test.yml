@@ -48,6 +48,7 @@ jobs:
         env:
           COMMIT_SHA: ${{ github.sha }}
           GITHUB_RUN_ID: ${{ github.run_id }}
+          SKYPILOT_ENDPOINT: ${{ secrets.SKYPILOT_ENDPOINT }}
         run: |
           JOB_NAME="tpu-test-v6e-1-${GITHUB_RUN_ID}"
           echo "Submitting Job: $JOB_NAME"
@@ -76,6 +77,8 @@ jobs:
                       cp /config/sky-task.yaml ./task.yaml
                       sed -i "s|TPU_VARIANT_PLACEHOLDER|tpu-v6e-1|g" ./task.yaml
                       sed -i "s|COMMIT_SHA_PLACEHOLDER|${COMMIT_SHA}|g" ./task.yaml
+                      sky api login --endpoint ${SKYPILOT_ENDPOINT}
+                      sky check
                       sky launch ./task.yaml -y \
                         --use-spot \
                         --idle-minutes-to-autostop 120 \
