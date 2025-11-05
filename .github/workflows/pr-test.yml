@@ -30,6 +30,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Check if GCP_SA_KEY secret is injected
+        env:
+          GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
         run: |
           if [ -z "${{ secrets.GCP_SA_KEY }}" ]; then
             echo "❌ GCP_SA_KEY is NOT set"
@@ -37,8 +39,6 @@ jobs:
           else
             echo "✅ GCP_SA_KEY is set (value length: ${#GCP_SA_KEY})"
           fi
-        env:
-          GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
       - name: Setup gcloud
         env:
           GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
