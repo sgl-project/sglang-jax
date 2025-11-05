@@ -441,7 +441,6 @@ class ModelWorker:
         if launch_done is not None:
             launch_done.set()
 
-        sample_cache_miss_count = 0
         if skip_sample:
             next_token_ids_device = None
         else:
@@ -456,12 +455,12 @@ class ModelWorker:
                     sampling_metadata,
                     positions_device,
                 )
-                sample_cache_miss_count = count()
+                cache_miss_count += count()
 
         return (
             logits_output,
             next_token_ids_device,
-            cache_miss_count + sample_cache_miss_count,
+            cache_miss_count,
         )
 
 

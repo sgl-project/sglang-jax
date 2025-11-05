@@ -142,7 +142,7 @@ def popen_launch_server(
     env: dict | None = None,
     return_stdout_stderr: tuple | None = None,
     device: str = "tpu",
-    pd_separated: bool = False,
+    check_cache_miss: bool = True,
 ):
     """Launch a server process with automatic device detection.
 
@@ -156,7 +156,7 @@ def popen_launch_server(
     _, host, port = base_url.split(":")
     host = host[2:]
 
-    module = "sgl_jax.launch_pd_server" if pd_separated else "sgl_jax.launch_server"
+    module = "sgl_jax.launch_server"
 
     module_argv = [
         "-m",
@@ -164,27 +164,12 @@ def popen_launch_server(
         "--trust-remote-code",
         "--model-path",
         model,
+        "--host",
+        host,
+        "--port",
+        port,
         *[str(x) for x in other_args],
     ]
-
-    if pd_separated:
-        module_argv.extend(
-            [
-                "--lb-host",
-                host,
-                "--lb-port",
-                port,
-            ]
-        )
-    else:
-        module_argv.extend(
-            [
-                "--host",
-                host,
-                "--port",
-                port,
-            ]
-        )
 
     if api_key:
         module_argv += ["--api-key", api_key]
@@ -197,6 +182,9 @@ def popen_launch_server(
     env_final = os.environ.copy()
     if env:
         env_final.update(env)
+
+    if check_cache_miss:
+        env_final.update({"SGLANG_JAX_ENABLE_CACHE_MISS_CHECK": "1"})
 
     if return_stdout_stderr:
         process = subprocess.Popen(
