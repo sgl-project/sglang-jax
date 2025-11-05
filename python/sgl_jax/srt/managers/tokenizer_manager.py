@@ -910,6 +910,13 @@ class TokenizerManager:
                 meta_info["hidden_states"] = recv_obj.output_hidden_states[i]
 
             if getattr(recv_obj, "cache_miss_count", None) is not None:
+                if (
+                    get_bool_env_var("SGLANG_JAX_ENABLE_CACHE_MISS_CHECK")
+                    and recv_obj.cache_miss_count > 0
+                ):
+                    raise RuntimeError(
+                        f"Cache miss occurred {recv_obj.cache_miss_count} times, please check if the precompile logic covers the current scenario"
+                    )
                 meta_info["cache_miss_count"] = recv_obj.cache_miss_count
 
             if isinstance(recv_obj, BatchStrOut):
