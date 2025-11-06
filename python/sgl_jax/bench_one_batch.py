@@ -356,9 +356,6 @@ def correctness_test(
     next_token_ids, next_token_logits, batch = extend(reqs, model_runner)
     next_token_ids_cpu = np.array(next_token_ids)
     rank_print(f"prefill logits (final): {next_token_logits} \n")
-    
-    # if not isinstance(next_token_ids, np.ndarray):
-    #     raise ValueError(f"next_token_ids is not a numpy array: {type(next_token_ids)}")
 
     # Decode
     output_ids = [input_ids[i] + [next_token_ids[i]] for i in range(len(input_ids))]
@@ -589,8 +586,6 @@ def main(server_args, bench_args):
 
     if server_args.model_path:
         work_func = correctness_test if bench_args.correctness_test else latency_test
-        logging.info("entering main work function")
-        logging.info("work function is correctness_test" if bench_args.correctness_test else "work function is latency_test")
     else:
         raise ValueError(
             "Provide --model-path for running the tests or "
@@ -599,7 +594,6 @@ def main(server_args, bench_args):
 
     port_args = PortArgs.init_new(server_args)
 
-    logging.info("entering work function")
     work_func(server_args, port_args, bench_args, 0)
 
 
