@@ -171,7 +171,7 @@ class ModelRunner:
             logits_metadata,
         ):
             model_state = jax.tree_util.tree_unflatten(model_state_def, model_state_leaves)
-            model = nnx.merge(model_def, model_state)
+            model = nnx.merge(model_def, model_state, copy=True)
             return model(forward_batch, token_to_kv_pool, logits_metadata)
 
         @partial(jax.jit, static_argnames=["sampler_state_def", "mesh", "use_sort_for_toppk_minp"])
@@ -184,7 +184,7 @@ class ModelRunner:
             *args,
         ):
             model_state = jax.tree_util.tree_unflatten(sampler_state_def, sampler_state_leaves)
-            sampler = nnx.merge(sampler_def, model_state)
+            sampler = nnx.merge(sampler_def, model_state, copy=True)
             return sampler(*args, mesh=mesh, use_sort_for_toppk_minp=use_sort_for_toppk_minp)
 
         def run_model_wrapper(forward_batch, logits_metadata):
