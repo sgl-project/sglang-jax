@@ -62,38 +62,37 @@ jobs:
             backoffLimit: 1
             template:
               spec:
+                restartPolicy: Never
+                nodeSelector:
+                  cloud.google.com/compute-class: tpu-class-v6e-1
                 containers:
-                - name: sky-launcher
+                - name: job-launcher
                   image: python:3.12-slim
                   command: ["/bin/bash", "-c"]
                   args:
                     - |
                       set -e
                       apt update && apt install -y git curl openssh-client
-                      pip install skypilot-nightly
                       mkdir -p ~/.ssh
+                      rm -f ~/.ssh/config
                       cp /secret/id_rsa ~/.ssh/id_rsa
                       chmod 600 ~/.ssh/id_rsa
-                      cp /config/sky-task.yaml ./task.yaml
-                      sed -i "s|TPU_VARIANT_PLACEHOLDER|tpu-v6e-1|g" ./task.yaml
-                      sed -i "s|COMMIT_SHA_PLACEHOLDER|${COMMIT_SHA}|g" ./task.yaml
-                      sky api login --endpoint ${SKYPILOT_ENDPOINT}
-                      sky check
-                      cat ./task.yaml
-                      sky launch ./task.yaml -y \
-                        --use-spot \
-                        --idle-minutes-to-autostop 120 \
-                        --down \
-                        -- "uv venv --python 3.12 && source .venv/bin/activate && cd sglang-jax && uv pip install -e "python[all]" && bash scripts/killall_sglang.sh && uv run python test/srt/run_suite.py --suite per-commit-tpu-v6e-1"
+                      GIT_SSH_COMMAND="ssh -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no" git clone git@github.com:sgl-project/sglang-jax.git
+                      cd sglang-jax &&git checkout ${COMMIT_SHA}
+                      uv venv --python 3.12
+                      source .venv/bin/activate
+                      uv pip install -e "python[all]"
+                      bash scripts/killall_sglang.sh
+                      uv run python test/srt/run_suite.py --suite per-commit-tpu-v6e-1
                   volumeMounts:
-                    - name: config-volume
-                      mountPath: /config
                     - name: ssh-secret
                       mountPath: /secret
+                  resources:
+                    requests:
+                      google.com/tpu: 1
+                    limits:
+                      google.com/tpu: 1
                 volumes:
-                  - name: config-volume
-                    configMap:
-                      name: sky-task-base
                   - name: ssh-secret
                     secret:
                       secretName: ssh-key-secret
