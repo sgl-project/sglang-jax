@@ -12,6 +12,8 @@ from sgl_jax.srt.layers.logits_processor import LogitsProcessorOutput
 from sgl_jax.srt.sampling.sampling_batch_info import SamplingMetadata
 from sgl_jax.srt.utils.jax_utils import is_tpu_runtime
 
+import logging
+
 _SAMPLING_EPS = 1e-5
 
 
@@ -171,6 +173,11 @@ class Sampler(nnx.Module):
             operands,
         )
 
+        # if not isinstance(batch_next_token_ids, np.ndarray):
+        #     raise ValueError(f"batch_next_token_ids is not a numpy array at the end of __call__: {type(batch_next_token_ids)}")
+        # else:
+        #     logging.info("batch_next_token_ids is a numpy array at the end of __call__")
+
         logprob_operands = (
             logits_output,
             sampling_metadata,
@@ -183,6 +190,8 @@ class Sampler(nnx.Module):
             lambda operands: None,
             logprob_operands,
         )
+        
+        logging.info("batch_next_token_ids type is %s", type(batch_next_token_ids))
 
         return batch_next_token_ids
 
@@ -392,7 +401,13 @@ def top_k_top_p_min_p_sampling_from_probs_jax_with_sort(args):
     )
 
     probs_idx = probs_idx.astype(jnp.int32)
-    return jnp.take_along_axis(probs_idx, axis=1, indices=sampled_index).flatten()
+    
+    result = jnp.take_along_axis(probs_idx, axis=1, indices=sampled_index).flatten()
+    if not isinstance(result, np.ndarray):
+        raise ValueError(f"result is not a numpy array at the end of top_k_top_p_min_p_sampling_from_probs_jax_with_sort: {type(result)}")
+    else:
+        jax.debug.print("result is a numpy array at the end of top_k_top_p_min_p_sampling_from_probs_jax_with_sort")
+    return result
 
 
 def top_k_top_p_min_p_sampling_from_probs_jax_with_mask(args):
@@ -414,6 +429,8 @@ def top_k_top_p_min_p_sampling_from_probs_jax_with_mask(args):
 
     temperatures = temperatures.astype(logits.dtype)
     logits = jnp.divide(logits, temperatures)
+    logging.info("logits type is %s", type(logits))
+    assert isinstance(logits, jax.numpy.ndarray)
 
     min_p_operands = (logits, min_ps)
     apply_min_p_filter_fn = lambda op: _apply_min_p_filter((*op, False))
@@ -423,10 +440,13 @@ def top_k_top_p_min_p_sampling_from_probs_jax_with_mask(args):
         lambda operands: operands[0],
         min_p_operands,
     )
+    
+    assert isinstance(logits, jax.numpy.ndarray)
 
     multinomial_operands = (logits, sampling_seeds, positions, rng)
     multinomial_with_seed_fn = lambda op: multinomial_with_seed((*op, False))
     multinomial_fn = lambda op: multinomial((*op, False))
+    jax.debug.visualize_array_sharding(logits)
     sampled_index = lax.cond(
         sampling_seeds is not None,
         multinomial_with_seed_fn,

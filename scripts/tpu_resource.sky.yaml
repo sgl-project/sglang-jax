@@ -7,12 +7,27 @@ resources:
       runtime_version: v2-alpha-tpuv6e
   use_spot: True # The default instance is spot.
 
+file_mounts:
+  ~/.ssh/id_rsa: ~/.ssh/id_rsa
+
 setup: |
+  chmod 600 ~/.ssh/id_rsa
+  rm ~/.ssh/config
   if [ -d "sglang-jax" ]; then pip uninstall -y sgl-jax || true && rm -rf sglang-jax; fi
-  git clone https://github.com/sgl-project/sglang-jax.git
+  git clone https://github.com/Bob-Chen222/sglang-jax
   cd sglang-jax && git fetch origin $REF:$REF && git checkout $REF
   uv venv --python 3.12
   source .venv/bin/activate
   uv pip install -e "python[all]"
   bash scripts/killall_sglang.sh
   uv tool install evalscope
+
+# run: |
+#   cd sglang-jax && source .venv/bin/activate && \
+#   JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache uv run python -u -m sgl_jax.launch_server \
+#   --model-path Qwen/Qwen-7B-Chat --trust-remote-code \
+#   --dist-init-addr=0.0.0.0:10011 --nnodes=1  \
+#   --tp-size=1 --device=tpu --random-seed=3 \
+#   --node-rank=0 --mem-fraction-static=0.8  \
+#   --max-prefill-tokens=8192 --download-dir=/tmp --dtype=bfloat16  \
+#   --skip-server-warmup --host 0.0.0.0 --port 30000

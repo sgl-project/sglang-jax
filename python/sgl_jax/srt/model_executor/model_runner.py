@@ -107,12 +107,15 @@ class ModelRunner:
             rngs=rngs,
             mesh=self.mesh,
         )
+        logging.info("after get model loader")
 
         # Initialize precision tracer enable state
         precision_tracer.set_enable_precision_tracer(server_args.enable_precision_tracer)
 
         # If it is a draft model, tp_group can be different
+        logging.info("before initialize")
         self.initialize()
+        logging.info("after initialize")
 
     def initialize(self):
         server_args = self.server_args
@@ -131,6 +134,8 @@ class ModelRunner:
         self.sampler = Sampler(nnx.Rngs(server_args.random_seed), mesh=self.mesh)
         total_device_memory = self.get_available_device_memory()
         self.load_model()
+        
+        logging.info("before initialize jit")
 
         # Check if the model is using hybrid SWA
         if (
@@ -141,13 +146,15 @@ class ModelRunner:
             self.is_hybrid = True
 
         self.initialize_jit()
-
+        
+        logging.info("before init memory pool")
         # Init memory pool and attention backends
         self.init_memory_pool(
             server_args.max_running_requests,
             server_args.max_total_tokens,
             total_device_memory,
         )
+        logging.info("after init memory pool")
 
         self.init_attention_backend()
 
@@ -156,6 +163,8 @@ class ModelRunner:
         model_state_leaves, model_state_def = jax.tree_util.tree_flatten(model_state)
         sampler_def, sampler_state = nnx.split(self.sampler)
         sampler_state_leaves, sampler_state_def = jax.tree_util.tree_flatten(sampler_state)
+        
+        logging.info("before jitted run model")
 
         @partial(
             jax.jit,
@@ -199,6 +208,8 @@ class ModelRunner:
             )
 
         self.jitted_run_model = run_model_wrapper
+        
+        logging.info("before jitted sampler")
         self.jitted_sampler = partial(
             jitted_sampler,
             sampler_def,
@@ -278,7 +289,8 @@ class ModelRunner:
             cell_size,
         )
 
-        return max_tokens
+        # return max_tokens
+        return 100
 
     def init_memory_pool(
         self,

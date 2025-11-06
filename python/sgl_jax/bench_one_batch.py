@@ -114,12 +114,16 @@ class BenchArgs:
 
 
 def load_model(server_args, port_args, tp_rank):
+    logging.info("entering load model")
     # TODO: pass in tp_size
     # server_args.tp_size = 1
     rank_print = print if tp_rank == 0 else lambda *args, **kwargs: None
     # moe_ep_rank = tp_rank // (server_args.tp_size // server_args.ep_size)
+    logging.info("before model config")
 
     model_config = ModelConfig.from_server_args(server_args)
+
+    logging.info("after model config")
 
     # Create a mesh that includes both 'data' and 'tensor' axes.
     # Use a size-1 'data' axis and shard across the 'tensor' axis per tp_size.
@@ -129,6 +133,8 @@ def load_model(server_args, port_args, tp_rank):
     devices_array = np.array(devices, dtype=object).reshape((1, tp))
     mesh = jax.sharding.Mesh(devices_array, ("data", "tensor"))
 
+    logging.info("before model runner")
+
     model_runner = ModelRunner(
         model_config=model_config,
         mem_fraction_static=server_args.mem_fraction_static,
@@ -137,6 +143,8 @@ def load_model(server_args, port_args, tp_rank):
         mesh=mesh,
     )
     rank_print(f"max_total_num_tokens={model_runner.max_total_num_tokens}")
+    logging.info("after model runner")
+
     tokenizer = get_tokenizer(
         server_args.tokenizer_path,
         tokenizer_mode=server_args.tokenizer_mode,
@@ -144,9 +152,12 @@ def load_model(server_args, port_args, tp_rank):
     )
     if tp > 1:
         try:
+            logging.info("before sync global devices")  
             jax_mh.sync_global_devices("load_model")
+            logging.info("after sync global devices")
         except Exception as err:
             logging.info("Could not sync global devices (expected in single-host): %s", err)
+    logging.info("finished load model")
     return model_runner, tokenizer
 
 
@@ -235,10 +246,14 @@ def extend(reqs, model_runner):
     else:
         token_needed = int(np.sum(np.array(batch.seq_lens, dtype=np.int64)))
     next_token_ids, next_token_logits = _run_forward_and_sample(model_runner, batch, token_needed)
+    # if not isinstance(next_token_ids, np.ndarray):
+    #     raise ValueError(f"next_token_ids is not a numpy array: {type(next_token_ids)}")
+    # else:
+    #     print("extend done")
     return next_token_ids, next_token_logits, batch
 
 
-def decode(input_token_ids, batch, model_runner):
+def decode(input_token_ids, batch: ScheduleBatch, model_runner):
     batch.output_ids = input_token_ids
     batch.prepare_for_decode()
     _maybe_prepare_mlp_sync_batch(batch, model_runner)
@@ -269,7 +284,7 @@ def _run_forward_and_sample(model_runner, batch: ScheduleBatch, token_first_arg:
         )
     )
 
-    model_worker_batch = batch.get_model_worker_batch(
+    model_worker_batch : ModelWorkerBatch = batch.get_model_worker_batch(
         [token_first_arg], [bs_needed], [cache_loc_needed], page_size
     )
 
@@ -284,6 +299,8 @@ def _run_forward_and_sample(model_runner, batch: ScheduleBatch, token_first_arg:
     positions = model_worker_batch.positions
 
     logits_output, _ = model_runner.forward(forward_batch, logits_metadata=logits_metadata)
+    
+    logging.info("logits output type: %s", type(logits_output))
 
     pad_size = len(model_worker_batch.seq_lens) - model_worker_batch.real_bs
     sampling_metadata = SamplingMetadata.from_model_worker_batch(
@@ -293,6 +310,15 @@ def _run_forward_and_sample(model_runner, batch: ScheduleBatch, token_first_arg:
         vocab_size=model_runner.model_config.vocab_size,
     )
     next_token_ids = model_runner.sample(logits_output, sampling_metadata, positions)
+    # NOTE(Bob): seems that now next_token_ids is a jax array, not a numpy array
+    
+    # if not isinstance(next_token_ids, np.ndarray):
+    #     logging.info("current forward mode is %s", model_worker_batch.forward_mode)
+    #     raise ValueError(f"next_token_ids is not a numpy array: {type(next_token_ids)}")
+    # else:
+    #     print("finished forward and sample")
+    #     print("next token ids type: ", type(next_token_ids))
+    #     print("logits output type: ", type(logits_output.next_token_logits))
 
     return next_token_ids, logits_output.next_token_logits
 
@@ -303,12 +329,16 @@ def correctness_test(
     bench_args,
     tp_rank,
 ):
+    logging.info("entering correctness_test")
     # Configure the logger
     configure_logger(server_args, prefix=f" TP{tp_rank}")
     rank_print = print if tp_rank == 0 else lambda *args, **kwargs: None
 
     # Load the model
+    logging.info("before load model")
     model_runner, tokenizer = load_model(server_args, port_args, tp_rank)
+    
+    logging.info("after load model")
 
     # Prepare inputs
     input_ids, reqs = prepare_inputs_for_correctness_test(bench_args, tokenizer)
@@ -324,15 +354,20 @@ def correctness_test(
 
     # Extend (prefill w/ KV cache)
     next_token_ids, next_token_logits, batch = extend(reqs, model_runner)
+    next_token_ids_cpu = np.array(next_token_ids)
     rank_print(f"prefill logits (final): {next_token_logits} \n")
+    
+    # if not isinstance(next_token_ids, np.ndarray):
+    #     raise ValueError(f"next_token_ids is not a numpy array: {type(next_token_ids)}")
 
     # Decode
     output_ids = [input_ids[i] + [next_token_ids[i]] for i in range(len(input_ids))]
-    for _ in range(bench_args.output_len[0] - 1):
-        next_token_ids, _ = decode(next_token_ids, batch, model_runner)
-        next_token_ids_list = next_token_ids.tolist()
+    for step in range(bench_args.output_len[0] - 1):
+        logging.info(f"decode step {step}")
+        next_token_ids, _ = decode(next_token_ids_cpu, batch, model_runner)
+        next_token_ids_cpu = np.array(next_token_ids)
         for i in range(len(reqs)):
-            output_ids[i].append(next_token_ids_list[i])
+            output_ids[i].append(next_token_ids_cpu[i])
 
     # Print output texts
     for i in range(len(reqs)):
@@ -554,6 +589,8 @@ def main(server_args, bench_args):
 
     if server_args.model_path:
         work_func = correctness_test if bench_args.correctness_test else latency_test
+        logging.info("entering main work function")
+        logging.info("work function is correctness_test" if bench_args.correctness_test else "work function is latency_test")
     else:
         raise ValueError(
             "Provide --model-path for running the tests or "
@@ -562,10 +599,12 @@ def main(server_args, bench_args):
 
     port_args = PortArgs.init_new(server_args)
 
+    logging.info("entering work function")
     work_func(server_args, port_args, bench_args, 0)
 
 
 if __name__ == "__main__":
+    jax.distributed.initialize()
     parser = argparse.ArgumentParser()
     ServerArgs.add_cli_args(parser)
     BenchArgs.add_cli_args(parser)
