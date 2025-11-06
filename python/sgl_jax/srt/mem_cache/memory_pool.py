@@ -239,7 +239,9 @@ class MHATokenToKVPool(KVCache):
         self.head_dim = head_dim
         self.kv_partition_axis = "tensor"
 
+        logging.info("before create buffers")
         self._create_buffers()
+        logging.info("after create buffers")
         self._calculate_memory_usage()
 
     def tree_flatten(self):
