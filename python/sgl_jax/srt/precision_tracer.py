@@ -107,6 +107,7 @@ class PrecisionTracer:
         self._trace_output_file = None
         self._verbose_logging = False
         self._enable_precision_tracer = False
+        self._save_tensor = False
 
         # counter
         self._max_requests = 0
@@ -174,6 +175,7 @@ class PrecisionTracer:
         req_num: int | None = None,
         output_file: str | None = None,
         verbose_logging: bool = False,
+        save_tensor: bool = False,
     ):
         if not self._enable_precision_tracer:
             logger.warning("Precision tracer is disabled. Enable with --enable-precision-tracer")
@@ -189,6 +191,7 @@ class PrecisionTracer:
         self._max_requests = req_num
         self._completed_requests_count = 0
         self._request_counter = 0
+        self._save_tensor = save_tensor
 
         self._current_batch_id = None
         self._records: dict[str, PrecisionTracerRecord] = {}
@@ -572,6 +575,8 @@ class PrecisionTracer:
                 "layer_id": layer_id,
                 "module_type": module_type,
             }
+            if self._save_tensor:
+                stats |= {"tensor": tensor.tolist()}
 
             if len(shape) >= 2 and shape[0] > 1 and not is_prefill:
                 seq_len = shape[0]
