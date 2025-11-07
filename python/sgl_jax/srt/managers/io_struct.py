@@ -576,6 +576,7 @@ class StartTraceReqInput(RpcReqInput):
     req_num: int | None = None  # Maximum number of requests to trace
     output_file: str | None = None  # Output file path
     request_id: str = ""  # Override base class field with default
+    save_tensor: bool = False  # Save the specific tensor content
 
     def __post_init__(self):
         if not self.request_id:
