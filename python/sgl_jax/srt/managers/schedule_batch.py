@@ -932,7 +932,6 @@ class ScheduleBatch:
 
         # Update fields
         self.input_ids = self.output_ids
-        logging.info("input ids type is %s", type(self.input_ids))
 
         self.output_ids = None
 
