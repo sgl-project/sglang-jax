@@ -196,20 +196,42 @@ class JAXDummyModelLoader(BaseModelLoader):
             }.get(jdtype, np.float32)
 
         def _init_leaf(x, pspec):
-            if isinstance(x, jax.Array) and jnp.issubdtype(x.dtype, jnp.floating):
+            is_array = isinstance(x, jax.Array)
+            is_abstract = isinstance(x, jax.ShapeDtypeStruct)
+            
+            if (is_array or is_abstract) and jnp.issubdtype(x.dtype, jnp.floating):
                 tgt_dtype = x.dtype
-                gen_dtype = _np_gen_dtype(tgt_dtype)
-                numel = int(np.prod(x.shape))
+                shape = x.shape
 
-                # Per-parameter reseed (shape-agnostic stream)
-                rng = np.random.default_rng(seed)
-                flat = rng.uniform(low, high, size=(numel,)).astype(gen_dtype)
-                arr_np = flat.reshape(x.shape)
-
-                arr_jax = jnp.asarray(arr_np, dtype=tgt_dtype)
+                # Safely construct sharding
                 if pspec is not None:
-                    arr_jax = jax.lax.with_sharding_constraint(arr_jax, pspec)
-                return arr_jax
+                    sharding = jax.sharding.NamedSharding(self.mesh, pspec)
+                else:
+                    # If no pspec, try to preserve original sharding; fallback to replicated
+                    sharding = getattr(x, 'sharding', jax.sharding.NamedSharding(self.mesh, jax.sharding.PartitionSpec()))
+
+                def _make_shard(indices):
+                    # Compute local shard shape from global shape and slice indices
+                    shard_shape = []
+                    for dim_size, idx in zip(shape, indices):
+                        if isinstance(idx, slice):
+                            start, stop, step = idx.indices(dim_size)
+                            assert step == 1, f"Non-unit step in slice not supported: {idx}"
+                            shard_shape.append(stop - start)
+                        else:
+                            # Integer index (e.g., from advanced indexing); size 1
+                            shard_shape.append(1)
+                    shard_shape = tuple(shard_shape)
+
+                    # Generate random data
+                    rng = np.random.default_rng(seed)
+                    gen_dtype = _np_gen_dtype(tgt_dtype)
+                    numel = int(np.prod(shard_shape))
+                    flat = rng.uniform(low, high, size=numel)
+                    arr_np = flat.reshape(shard_shape).astype(gen_dtype)
+                    return jnp.asarray(arr_np, dtype=tgt_dtype)
+
+                return jax.make_array_from_callback(shape, sharding, _make_shard)
             return x
 
         new_params = jax.tree_util.tree_map(_init_leaf, params, pspecs)
@@ -230,22 +252,13 @@ class JAXDummyModelLoader(BaseModelLoader):
         *,
         model_config: ModelConfig,
     ) -> Any:
-        # Initialize JAX model definition on mesh
         model_class = self._initialize_model(model_config)
 
-        def create_model(rng: nnx.Rngs):
-            model = model_class(model_config.hf_config, model_config.dtype, rng, self.mesh)
-            state = nnx.state(model)
-            pspecs = nnx.get_partition_spec(state)
-            sharded_state = jax.lax.with_sharding_constraint(state, pspecs)
-            nnx.update(model, sharded_state)
-            return model
-
         with self.mesh:
-            model = create_model(self.rng)
-            # Assign random weights deterministically
+            model = nnx.eval_shape(
+                lambda: model_class(model_config.hf_config, model_config.dtype, self.rng, self.mesh)
+            )
             self._initialize_dummy_weights(model)
-
         return model
 
 
