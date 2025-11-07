@@ -107,15 +107,12 @@ class ModelRunner:
             rngs=rngs,
             mesh=self.mesh,
         )
-        logging.info("after get model loader")
 
         # Initialize precision tracer enable state
         precision_tracer.set_enable_precision_tracer(server_args.enable_precision_tracer)
 
         # If it is a draft model, tp_group can be different
-        logging.info("before initialize")
         self.initialize()
-        logging.info("after initialize")
 
     def initialize(self):
         server_args = self.server_args
@@ -135,7 +132,6 @@ class ModelRunner:
         total_device_memory = self.get_available_device_memory()
         self.load_model()
         
-        logging.info("before initialize jit")
 
         # Check if the model is using hybrid SWA
         if (
@@ -147,14 +143,12 @@ class ModelRunner:
 
         self.initialize_jit()
         
-        logging.info("before init memory pool")
         # Init memory pool and attention backends
         self.init_memory_pool(
             server_args.max_running_requests,
             server_args.max_total_tokens,
             total_device_memory,
         )
-        logging.info("after init memory pool")
 
         self.init_attention_backend()
 
@@ -164,7 +158,6 @@ class ModelRunner:
         sampler_def, sampler_state = nnx.split(self.sampler)
         sampler_state_leaves, sampler_state_def = jax.tree_util.tree_flatten(sampler_state)
         
-        logging.info("before jitted run model")
 
         @partial(
             jax.jit,
@@ -209,7 +202,6 @@ class ModelRunner:
 
         self.jitted_run_model = run_model_wrapper
         
-        logging.info("before jitted sampler")
         self.jitted_sampler = partial(
             jitted_sampler,
             sampler_def,
@@ -232,9 +224,12 @@ class ModelRunner:
                     local_device_memory * 0.9,
                 )
             else:
-                raise ValueError(
+                logging.warning(
                     f"The memory capacity is unbalanced. min_available_device_memory={min_available_device_memory}, local_device_memory={local_device_memory}, local_device_memory*0.9={local_device_memory * 0.9}"
                 )
+                # raise ValueError(
+                #     f"The memory capacity is unbalanced. min_available_device_memory={min_available_device_memory}, local_device_memory={local_device_memory}, local_device_memory*0.9={local_device_memory * 0.9}"
+                # )
 
         return min_available_device_memory
 

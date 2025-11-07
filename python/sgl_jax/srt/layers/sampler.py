@@ -429,7 +429,6 @@ def top_k_top_p_min_p_sampling_from_probs_jax_with_mask(args):
     multinomial_operands = (logits, sampling_seeds, positions, rng)
     multinomial_with_seed_fn = lambda op: multinomial_with_seed((*op, False))
     multinomial_fn = lambda op: multinomial((*op, False))
-    jax.debug.visualize_array_sharding(logits)
     sampled_index = lax.cond(
         sampling_seeds is not None,
         multinomial_with_seed_fn,
