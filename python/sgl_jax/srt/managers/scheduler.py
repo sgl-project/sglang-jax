@@ -646,6 +646,13 @@ class Scheduler(
                         precision_tracer._trace_output_file,
                     )
 
+                if "save_tensor" in tracer_config:
+                    precision_tracer._save_tensor = tracer_config["save_tensor"]
+                    logger.info(
+                        "[SCHEDULER] Updated save_tensor to: %s",
+                        precision_tracer._save_tensor,
+                    )
+
                 logger.info("[SCHEDULER] Precision tracer state updated: %s", tracer_config)
 
         except Exception as e:

@@ -409,13 +409,16 @@ async def start_trace_async(obj: StartTraceReqInput | None = None):
             unique_suffix = random.randint(1000, 9999)
             output_file = f"debug_outputs/request_traces_{timestamp}_{unique_suffix}.jsonl"
 
-        precision_tracer.start_trace(req_num=obj.req_num, output_file=output_file)
+        precision_tracer.start_trace(
+            req_num=obj.req_num, output_file=output_file, save_tensor=obj.save_tensor
+        )
         logger.info("[HTTP] Sending trace state to scheduler...")
         trace_state = {
             "precision_tracer": {
                 "trace_active": True,
                 "max_requests": obj.req_num,
                 "output_file": output_file,
+                "save_tensor": obj.save_tensor,
             }
         }
 
@@ -441,6 +444,7 @@ async def start_trace_async(obj: StartTraceReqInput | None = None):
                 "status": "ok",
                 "req_num": obj.req_num,
                 "output_file": output_file,
+                "save_tensor": obj.save_tensor,
             },
             status_code=200,
         )
