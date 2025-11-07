@@ -605,7 +605,6 @@ class Grok1ForCausalLM(nnx.Module):
     ) -> None:
         super().__init__()
         assert dtype == jnp.bfloat16
-        config.num_hidden_layers = 64
         self.config = config
         self.mesh = mesh
 
