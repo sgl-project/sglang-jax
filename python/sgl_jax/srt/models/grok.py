@@ -539,6 +539,9 @@ class Grok1Model(nnx.Module):
             num_embeddings=config.vocab_size,
             features=config.hidden_size,
             rngs=rngs,
+            dtype=jnp.bfloat16,
+            embedding_init=nnx.with_partitioning(init_fn, ("tensor", None)),
+            param_dtype=jnp.bfloat16,
         )
 
         # Transformer layers
@@ -622,7 +625,7 @@ class Grok1ForCausalLM(nnx.Module):
                 output_size=config.vocab_size,
                 use_bias=False,
                 params_dtype=jnp.bfloat16,
-                kernel_axes=None,
+                kernel_axes=("tensor", None),
                 rngs=rngs,
             )
         else:
@@ -630,6 +633,7 @@ class Grok1ForCausalLM(nnx.Module):
                 num_embeddings=config.vocab_size,
                 features=config.hidden_size,
                 param_dtype=jnp.bfloat16,
+                embedding_init=nnx.with_partitioning(init_fn, ("tensor", None)),
                 rngs=rngs,
             )
         self.logits_processor = LogitsProcessor(config.vocab_size, mesh=mesh)
@@ -707,14 +711,14 @@ class Grok1ForCausalLM(nnx.Module):
         mappings = {
             "model.embed_tokens.weight": WeightMapping(
                 target_path="model.embed_tokens.embedding",
-                sharding=(None, None),
+                sharding=("tensor", None),
                 transpose=False,
             ),
             "model.norm.weight": WeightMapping(
                 target_path="model.norm.scale", sharding=(None,), transpose=False
             ),
             "lm_head.weight": WeightMapping(
-                target_path="lm_head.embedding", sharding=(None, None), transpose=False
+                target_path="lm_head.embedding", sharding=("tensor", None), transpose=False
             ),
         }
 

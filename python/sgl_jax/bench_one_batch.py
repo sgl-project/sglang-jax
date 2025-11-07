@@ -324,21 +324,27 @@ def correctness_test(
     if bench_args.cut_len > 0:
         # Prefill
         next_token_ids, next_token_logits, batch = extend(reqs, model_runner)
-        rank_print(f"prefill logits (first half): {next_token_logits} \n")
+        if tp_rank == 0:
+            gathered_logits = jax_mh.process_allgather(next_token_logits, tiled=True)
+            rank_print(f"prefill logits (first half): {gathered_logits} \n")
 
     # Prepare extend inputs
     reqs = prepare_extend_inputs_for_correctness_test(bench_args, input_ids, reqs, model_runner)
 
     # Extend (prefill w/ KV cache)
     next_token_ids, next_token_logits, batch = extend(reqs, model_runner)
-    next_token_ids_cpu = np.array(next_token_ids)
-    rank_print(f"prefill logits (final): {next_token_logits} \n")
+    gathered_token_ids = jax_mh.process_allgather(next_token_ids, tiled=True)
+    next_token_ids_cpu = np.array(gathered_token_ids)
+    if tp_rank == 0:
+        gathered_logits = jax_mh.process_allgather(next_token_logits, tiled=True)
+        rank_print(f"prefill logits (final): {gathered_logits} \n")
 
     # Decode
-    output_ids = [input_ids[i] + [next_token_ids[i]] for i in range(len(input_ids))]
+    output_ids = [input_ids[i] + [next_token_ids_cpu[i]] for i in range(len(input_ids))]
     for step in range(bench_args.output_len[0] - 1):
         next_token_ids, _ = decode(next_token_ids_cpu, batch, model_runner)
-        next_token_ids_cpu = np.array(next_token_ids)
+        gathered_token_ids = jax_mh.process_allgather(next_token_ids, tiled=True)
+        next_token_ids_cpu = np.array(gathered_token_ids)
         for i in range(len(reqs)):
             output_ids[i].append(next_token_ids_cpu[i])
 
