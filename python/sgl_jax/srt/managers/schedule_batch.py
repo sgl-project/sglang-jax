@@ -43,7 +43,7 @@ from sgl_jax.srt.precision_tracer import (
     precision_tracer,
 )
 from sgl_jax.srt.sampling.sampling_batch_info import SamplingBatchInfo
-from sgl_jax.srt.sampling.sampling_params import SamplingParams
+from sgl_jax.srt.sampling.sampling_params import DEFAULT_SAMPLING_SEED, SamplingParams
 from sgl_jax.srt.server_args import ServerArgs
 
 INIT_INCREMENTAL_DETOKENIZATION_OFFSET = 5
@@ -277,6 +277,11 @@ class Req:
         self.tmp_end_idx: int = -1
         self.metadata_buffer_index: int = -1
 
+        # Grammar for constrained decoding
+        self.grammar = None  # BaseGrammarObject | Future | None
+        self.grammar_key: tuple[str, str] | None = None  # Cache key for grammar
+        self.grammar_wait_ct = 0  # Counter for grammar compilation wait time
+
     @property
     def seqlen(self):
         return len(self.origin_input_ids) + len(self.output_ids)
@@ -345,6 +350,11 @@ class Req:
 
         if len(self.output_ids) >= self.sampling_params.max_new_tokens:
             self.finished_reason = FINISH_LENGTH(length=self.sampling_params.max_new_tokens)
+            return
+
+        # Check grammar termination
+        if self.grammar is not None and self.grammar.is_terminated():
+            self.finished_reason = FINISH_MATCHED_TOKEN(matched=self.output_ids[-1])
             return
 
         last_token_id = self.output_ids[-1]
@@ -481,6 +491,9 @@ class ScheduleBatch:
     # Stream
     has_stream: bool = False
 
+    # Grammar-constrained decoding
+    has_grammar: bool = False
+
     # device mesh
     mesh: mesh_lib.Mesh = None
 
@@ -527,6 +540,7 @@ class ScheduleBatch:
             return_logprob=return_logprob,
             enable_overlap=enable_overlap,
             has_stream=any(req.stream for req in reqs),
+            has_grammar=any(req.grammar for req in reqs),
             chunked_req=chunked_req,
             mesh=mesh,
             is_prefill_only=all(req.sampling_params.max_new_tokens == 0 for req in reqs),
@@ -996,6 +1010,7 @@ class ScheduleBatch:
             self.token_ids_logprobs = None
 
         self.has_stream = any(req.stream for req in self.reqs)
+        self.has_grammar = any(req.grammar for req in self.reqs)
 
         self.sampling_info.filter_batch(np.array(keep_indices))
 
@@ -1029,6 +1044,7 @@ class ScheduleBatch:
 
         self.return_logprob |= other.return_logprob
         self.has_stream |= other.has_stream
+        self.has_grammar |= other.has_grammar
         self.return_hidden_states |= other.return_hidden_states
 
     def get_model_worker_batch(
@@ -1215,6 +1231,51 @@ class ScheduleBatch:
                 )
                 extend_start_loc = np.concat([extend_start_loc, invalid_extend_start_loc], axis=0)
 
+        sampling_info = self.sampling_info
+        if self.sampling_info:
+            new_temperatures = np.concatenate(
+                [
+                    sampling_info.temperatures,
+                    np.array([1.0] * bs_padding_size, dtype=sampling_info.temperatures.dtype),
+                ]
+            ).reshape(-1, 1)
+            new_top_ps = np.concatenate(
+                [
+                    sampling_info.top_ps,
+                    np.array([1.0] * bs_padding_size, dtype=sampling_info.top_ps.dtype),
+                ]
+            )
+            new_top_ks = np.concatenate(
+                [
+                    sampling_info.top_ks,
+                    np.array([1] * bs_padding_size, dtype=sampling_info.top_ks.dtype),
+                ]
+            )
+            new_min_ps = np.concatenate(
+                [
+                    sampling_info.min_ps,
+                    np.array([0.0] * bs_padding_size, dtype=sampling_info.min_ps.dtype),
+                ]
+            )
+            updates = {
+                "temperatures": new_temperatures,
+                "top_ps": new_top_ps,
+                "top_ks": new_top_ks,
+                "min_ps": new_min_ps,
+                "grammars": ([req.grammar for req in self.reqs] if self.has_grammar else None),
+            }
+            if sampling_info.sampling_seeds is not None:
+                updates["sampling_seeds"] = np.concatenate(
+                    [
+                        sampling_info.sampling_seeds,
+                        np.array(
+                            [DEFAULT_SAMPLING_SEED] * bs_padding_size,
+                            dtype=sampling_info.sampling_seeds.dtype,
+                        ),
+                    ]
+                )
+            sampling_info = dataclasses.replace(sampling_info, **updates)
+
         if precision_tracer.get_trace_active():
             self._generate_trace_info(real_bs, bid)
 
@@ -1229,7 +1290,7 @@ class ScheduleBatch:
             return_logprob=self.return_logprob,
             top_logprobs_nums=self.top_logprobs_nums,
             token_ids_logprobs=self.token_ids_logprobs,
-            sampling_info=self.sampling_info,
+            sampling_info=sampling_info,
             positions=positions_cpu,
             extend_start_loc=extend_start_loc,
             cache_loc=cache_loc_cpu,

@@ -501,7 +501,6 @@ class ModelRunner:
         self,
         logits_output: LogitsProcessorOutput,
         sampling_metadata: SamplingMetadata,
-        positions: jax.Array,
     ) -> jax.Array:
         """Sample and compute logprobs and update logits_output.
 
@@ -516,7 +515,6 @@ class ModelRunner:
         return self.jitted_sampler(
             logits_output,
             sampling_metadata,
-            positions,
         )
 
     def set_num_token_hybrid(self):
