@@ -7,7 +7,7 @@ SGLang-Jax uses the built-in library [unittest](https://docs.python.org/3/librar
 cd sglang-jax/test/srt
 
 # Run single file
-python3 test_abort.py
+python3 test_srt_engine.py
 
 # Run a suite with multiple files on tpu
 ## Note: You can change the value of `--suite` according to your demand.
