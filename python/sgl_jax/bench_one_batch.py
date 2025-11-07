@@ -114,16 +114,13 @@ class BenchArgs:
 
 
 def load_model(server_args, port_args, tp_rank):
-    logging.info("entering load model")
     # TODO: pass in tp_size
-    # server_args.tp_size = 1
+    # server_args.tp_size = 16
     rank_print = print if tp_rank == 0 else lambda *args, **kwargs: None
     # moe_ep_rank = tp_rank // (server_args.tp_size // server_args.ep_size)
-    logging.info("before model config")
 
     model_config = ModelConfig.from_server_args(server_args)
 
-    logging.info("after model config")
 
     # Create a mesh that includes both 'data' and 'tensor' axes.
     # Use a size-1 'data' axis and shard across the 'tensor' axis per tp_size.
@@ -133,8 +130,6 @@ def load_model(server_args, port_args, tp_rank):
     devices_array = np.array(devices, dtype=object).reshape((1, tp))
     mesh = jax.sharding.Mesh(devices_array, ("data", "tensor"))
 
-    logging.info("before model runner")
-
     model_runner = ModelRunner(
         model_config=model_config,
         mem_fraction_static=server_args.mem_fraction_static,
@@ -143,7 +138,6 @@ def load_model(server_args, port_args, tp_rank):
         mesh=mesh,
     )
     rank_print(f"max_total_num_tokens={model_runner.max_total_num_tokens}")
-    logging.info("after model runner")
 
     tokenizer = get_tokenizer(
         server_args.tokenizer_path,
@@ -152,12 +146,9 @@ def load_model(server_args, port_args, tp_rank):
     )
     if tp > 1:
         try:
-            logging.info("before sync global devices")  
             jax_mh.sync_global_devices("load_model")
-            logging.info("after sync global devices")
         except Exception as err:
-            logging.info("Could not sync global devices (expected in single-host): %s", err)
-    logging.info("finished load model")
+            logging.info("Could not sync global devices (expected in single-host): %s", err)  
     return model_runner, tokenizer
 
 
@@ -300,8 +291,6 @@ def _run_forward_and_sample(model_runner, batch: ScheduleBatch, token_first_arg:
 
     logits_output, _ = model_runner.forward(forward_batch, logits_metadata=logits_metadata)
     
-    logging.info("logits output type: %s", type(logits_output))
-
     pad_size = len(model_worker_batch.seq_lens) - model_worker_batch.real_bs
     sampling_metadata = SamplingMetadata.from_model_worker_batch(
         model_worker_batch,
@@ -311,14 +300,6 @@ def _run_forward_and_sample(model_runner, batch: ScheduleBatch, token_first_arg:
     )
     next_token_ids = model_runner.sample(logits_output, sampling_metadata, positions)
     # NOTE(Bob): seems that now next_token_ids is a jax array, not a numpy array
-    
-    # if not isinstance(next_token_ids, np.ndarray):
-    #     logging.info("current forward mode is %s", model_worker_batch.forward_mode)
-    #     raise ValueError(f"next_token_ids is not a numpy array: {type(next_token_ids)}")
-    # else:
-    #     print("finished forward and sample")
-    #     print("next token ids type: ", type(next_token_ids))
-    #     print("logits output type: ", type(logits_output.next_token_logits))
 
     return next_token_ids, logits_output.next_token_logits
 
@@ -329,16 +310,12 @@ def correctness_test(
     bench_args,
     tp_rank,
 ):
-    logging.info("entering correctness_test")
     # Configure the logger
     configure_logger(server_args, prefix=f" TP{tp_rank}")
     rank_print = print if tp_rank == 0 else lambda *args, **kwargs: None
 
     # Load the model
-    logging.info("before load model")
     model_runner, tokenizer = load_model(server_args, port_args, tp_rank)
-    
-    logging.info("after load model")
 
     # Prepare inputs
     input_ids, reqs = prepare_inputs_for_correctness_test(bench_args, tokenizer)
@@ -360,7 +337,6 @@ def correctness_test(
     # Decode
     output_ids = [input_ids[i] + [next_token_ids[i]] for i in range(len(input_ids))]
     for step in range(bench_args.output_len[0] - 1):
-        logging.info(f"decode step {step}")
         next_token_ids, _ = decode(next_token_ids_cpu, batch, model_runner)
         next_token_ids_cpu = np.array(next_token_ids)
         for i in range(len(reqs)):
