@@ -49,7 +49,7 @@ Key components:
    - Uses min-heap to select leaf nodes by `last_access_time`
    - Only evicts nodes with `lock_ref == 0`
 
-The radix tree is stored on CPU while KV data uses GPU memory pools.
+The radix tree is stored on CPU while KV data uses TPU memory pools.
 
 ## Usage
 

@@ -44,12 +44,17 @@ class SamplingMetadata:
     top_ks: jax.Array
     min_ps: jax.Array
     sampling_seeds: jax.Array
+    positions: jax.Array
     is_all_greedy: bool = False
     need_min_p_sampling: bool = False
 
     # penalty
     do_penalties: bool = False
     linear_penalty: jax.Array = None
+
+    # Grammar vocab mask
+    vocab_mask: jax.Array | None = None
+    apply_vocab_mask: bool = False
 
     def tree_flatten(self):
         children = (
@@ -58,10 +63,13 @@ class SamplingMetadata:
             self.top_ks,
             self.min_ps,
             self.sampling_seeds,
+            self.positions,
             self.is_all_greedy,
             self.need_min_p_sampling,
             self.linear_penalty,
             self.do_penalties,
+            self.vocab_mask,
+            self.apply_vocab_mask,
         )
 
         aux_data = {
@@ -80,10 +88,13 @@ class SamplingMetadata:
         obj.top_ks = children[2]
         obj.min_ps = children[3]
         obj.sampling_seeds = children[4]
-        obj.is_all_greedy = children[5]
-        obj.need_min_p_sampling = children[6]
-        obj.linear_penalty = children[7]
-        obj.do_penalties = children[8]
+        obj.positions = children[5]
+        obj.is_all_greedy = children[6]
+        obj.need_min_p_sampling = children[7]
+        obj.linear_penalty = children[8]
+        obj.do_penalties = children[9]
+        obj.vocab_mask = children[10]
+        obj.apply_vocab_mask = children[11]
 
         obj.return_logprob = aux_data["return_logprob"]
         obj.top_logprobs_nums = aux_data["top_logprobs_nums"]
@@ -100,47 +111,26 @@ class SamplingMetadata:
         vocab_size: int = 32000,
     ) -> SamplingMetadata:
         sharding = NamedSharding(mesh, PartitionSpec()) if jax.process_count() == 1 else None
-        padded_temperatures = np.concat(
-            [
-                batch.sampling_info.temperatures,
-                np.array([1.0] * pad_size, dtype=batch.sampling_info.temperatures.dtype),
-            ]
-        ).reshape(-1, 1)
-        padded_top_ps = np.concat(
-            [
-                batch.sampling_info.top_ps,
-                np.array([1.0] * pad_size, dtype=batch.sampling_info.top_ps.dtype),
-            ]
-        )
-        padded_top_ks = np.concat(
-            [
-                batch.sampling_info.top_ks,
-                np.array([1] * pad_size, dtype=batch.sampling_info.top_ks.dtype),
-            ]
-        )
-        padded_min_ps = np.concat(
-            [
-                batch.sampling_info.min_ps,
-                np.array([0.0] * pad_size, dtype=batch.sampling_info.min_ps.dtype),
-            ]
-        )
         if batch.sampling_info.sampling_seeds is not None:
-            padded_sampling_seeds = np.concat(
-                [
-                    batch.sampling_info.sampling_seeds,
-                    np.array(
-                        [DEFAULT_SAMPLING_SEED] * pad_size,
-                        dtype=batch.sampling_info.sampling_seeds.dtype,
-                    ),
-                ]
+            sampling_seeds_device = device_array(
+                batch.sampling_info.sampling_seeds, sharding=sharding
             )
-            sampling_seeds_device = device_array(padded_sampling_seeds, sharding=sharding)
         else:
             sampling_seeds_device = None
 
-        (temperatures_device, top_ps_device, top_ks_device, min_ps_device) = device_array(
-            (padded_temperatures, padded_top_ps, padded_top_ks, padded_min_ps),
-            sharding=sharding,
+        positions = batch.positions if batch.forward_mode.is_decode() else batch.seq_lens - 1
+
+        (temperatures_device, top_ps_device, top_ks_device, min_ps_device, positions_device) = (
+            device_array(
+                (
+                    batch.sampling_info.temperatures,
+                    batch.sampling_info.top_ps,
+                    batch.sampling_info.top_ks,
+                    batch.sampling_info.min_ps,
+                    positions,
+                ),
+                sharding=sharding,
+            )
         )
 
         # Extract penalty information from penalizer orchestrator
@@ -196,7 +186,7 @@ class SamplingMetadata:
                 sharding=linear_penalty_sharding,
             )
         if linear_penalty_device is None:
-            target_shape = (padded_temperatures.shape[0], vocab_size)
+            target_shape = (batch.sampling_info.temperatures.shape[0], vocab_size)
             linear_penalty_device = _get_or_create_zero_penalty_device(
                 target_shape, linear_penalty_sharding
             )
@@ -211,9 +201,11 @@ class SamplingMetadata:
             min_ps=min_ps_device,
             sampling_seeds=sampling_seeds_device,
             is_all_greedy=batch.sampling_info.is_all_greedy,
+            positions=positions_device,
             need_min_p_sampling=batch.sampling_info.need_min_p_sampling,
             linear_penalty=linear_penalty_device,
             do_penalties=do_penalties,
+            vocab_mask=batch.sampling_info.vocab_mask,
         )
 
 
@@ -247,9 +239,7 @@ def _get_or_create_zero_penalty_device(
 
 @dataclasses.dataclass
 class SamplingBatchInfo:
-    """
-    keep the array on device same to sglang
-    """
+    """Batched sampling information for a generation batch."""
 
     # Basic batched sampling params
     temperatures: np.ndarray
@@ -280,6 +270,10 @@ class SamplingBatchInfo:
     penalizer_orchestrator: penaltylib.BatchedPenalizerOrchestrator | None = None
     linear_penalty: np.ndarray = None
 
+    # Grammar-constrained decoding
+    grammars: list | None = None  # list[BaseGrammarObject | None]
+    vocab_mask: np.ndarray | None = None  # Shape: [batch_size, vocab_size // 32]
+
     @classmethod
     def _get_global_server_args_dict(cls):
         from sgl_jax.srt.managers.schedule_batch import global_server_args_dict
@@ -301,8 +295,11 @@ class SamplingBatchInfo:
         else:
             sampling_seeds = None
 
+        num_int32_per_vocab = (vocab_size + 31) // 32
+        vocab_mask = np.zeros((bs, num_int32_per_vocab), dtype=np.int32)
+
         ret = cls(
-            temperatures=temperatures,
+            temperatures=temperatures.reshape(-1, 1),
             top_ps=top_ps,
             top_ks=top_ks,
             min_ps=min_ps,
@@ -315,6 +312,7 @@ class SamplingBatchInfo:
             sampling_seeds=sampling_seeds,
             penalizer_orchestrator=None,
             linear_penalty=None,
+            vocab_mask=vocab_mask,
         )
         return ret
 
@@ -394,6 +392,12 @@ class SamplingBatchInfo:
             if value is not None:
                 setattr(self, item, value[keep_indices])
 
+        # Filter grammars and vocab_mask
+        if self.grammars is not None:
+            self.grammars = [self.grammars[i] for i in keep_indices]
+        if self.vocab_mask is not None:
+            self.vocab_mask = self.vocab_mask[keep_indices]
+
     def merge_batch(self, other: SamplingBatchInfo):
         self.penalizer_orchestrator.merge(other.penalizer_orchestrator)
         # Note: because the __len()__ operator is defined on the temperatures tensor,
@@ -416,6 +420,17 @@ class SamplingBatchInfo:
         self.need_top_k_sampling |= other.need_top_k_sampling
         self.need_min_p_sampling |= other.need_min_p_sampling
 
+        # Merge grammars and vocab_mask
+        if self.grammars is not None and other.grammars is not None:
+            self.grammars.extend(other.grammars)
+        elif other.grammars is not None:
+            self.grammars = other.grammars
+
+        if self.vocab_mask is not None and other.vocab_mask is not None:
+            self.vocab_mask = np.concat([self.vocab_mask, other.vocab_mask])
+        elif other.vocab_mask is not None:
+            self.vocab_mask = other.vocab_mask
+
     def cumulate_output_tokens(self, output_ids: jax.Array):
         """
         Feed the output tokens to the penalty orchestrator.
@@ -425,3 +440,26 @@ class SamplingBatchInfo:
         """
         if self.penalizer_orchestrator and self.penalizer_orchestrator.is_required:
             self.penalizer_orchestrator.cumulate_output_tokens(output_ids)
+
+    def update_grammar_vocab_mask(self):
+        """Update vocabulary masks from grammars before sampling."""
+        if not self.grammars:
+            self.vocab_mask = None
+            return
+
+        # Find first non-None grammar from the list
+        first_grammar = next((g for g in self.grammars if g), None)
+        if first_grammar is None:
+            self.vocab_mask = None
+            return
+
+        # Allocate bitmask using the grammar object's method
+        self.vocab_mask = first_grammar.allocate_vocab_mask(
+            vocab_size=self.vocab_size,
+            batch_size=len(self.temperatures),
+        )
+
+        # Fill mask for each request with active grammar
+        for i, grammar in enumerate(self.grammars):
+            if grammar and not grammar.finished and not grammar.is_terminated():
+                grammar.fill_vocab_mask(self.vocab_mask, i)

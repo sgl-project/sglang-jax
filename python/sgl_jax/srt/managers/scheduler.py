@@ -1,5 +1,6 @@
 """A scheduler that manages a tensor parallel TPU worker."""
 
+import concurrent.futures as futures
 import faulthandler
 import logging
 import os
@@ -20,6 +21,10 @@ import zmq
 
 from sgl_jax.global_config import global_config
 from sgl_jax.srt.configs.model_config import ModelConfig
+from sgl_jax.srt.constrained.base_grammar_backend import (
+    INVALID_GRAMMAR_OBJ,
+    create_grammar_backend,
+)
 from sgl_jax.srt.hf_transformers_utils import get_tokenizer
 from sgl_jax.srt.layers.logits_processor import LogitsProcessorOutput
 from sgl_jax.srt.managers.io_struct import (
@@ -182,6 +187,19 @@ class Scheduler(
 
         # Init tokenizer
         self.init_tokenizer()
+
+        # Init grammar backend for structured output
+        self.grammar_backend = None
+        self.grammar_queue: list[Req] = []  # Requests waiting for grammar compilation
+        if not server_args.skip_tokenizer_init:
+            self.grammar_backend = create_grammar_backend(
+                server_args,
+                self.tokenizer,
+                self.model_config.vocab_size,
+                self.model_config.hf_eos_token_id,
+            )
+        else:
+            self.grammar_backend = None
 
         if not self.is_generation:
             self.enable_overlap = False
@@ -590,7 +608,87 @@ class Scheduler(
             self.max_req_len - len(req.origin_input_ids) - 1,
         )
 
-        self._add_request_to_queue(req)
+        # Init grammar cache for this request
+        add_to_grammar_queue = False
+        if (
+            req.sampling_params.json_schema is not None
+            or req.sampling_params.regex is not None
+            or req.sampling_params.ebnf is not None
+            or req.sampling_params.structural_tag is not None
+        ):
+            assert self.grammar_backend is not None
+            if req.sampling_params.json_schema is not None:
+                key = ("json", req.sampling_params.json_schema)
+            elif req.sampling_params.regex is not None:
+                key = ("regex", req.sampling_params.regex)
+            elif req.sampling_params.ebnf is not None:
+                key = ("ebnf", req.sampling_params.ebnf)
+            elif req.sampling_params.structural_tag:
+                key = ("structural_tag", req.sampling_params.structural_tag)
+
+            value, cache_hit = self.grammar_backend.get_cached_or_future_value(key)
+            req.grammar = value
+
+            if not cache_hit:
+                req.grammar_key = key
+                add_to_grammar_queue = True
+            else:
+                if value is INVALID_GRAMMAR_OBJ:  # We hit a cached invalid grammar.
+                    error_msg = f"Invalid grammar request with cache hit: {key=}"
+                    req.set_finish_with_abort(error_msg)
+
+        if add_to_grammar_queue:
+            req.queue_time_start = time.perf_counter()
+            self.grammar_queue.append(req)
+        else:
+            self._add_request_to_queue(req)
+
+    def move_ready_grammar_requests(self):
+        """Poll grammar futures and move ready requests to waiting queue."""
+        if not self.grammar_queue:
+            return
+
+        num_ready_reqs = 0
+        num_timeout_reqs = 0
+
+        for req in self.grammar_queue:
+            try:
+                if req.finished():  # Aborted by AbortReq
+                    num_ready_reqs += 1
+                    continue
+
+                # Poll with short timeout
+                req.grammar = req.grammar.result(timeout=0.03)
+                # Cache the compiled grammar
+                if self.grammar_backend and req.grammar_key:
+                    self.grammar_backend.set_cache(req.grammar_key, req.grammar.copy())
+
+                # Check if compilation resulted in invalid grammar
+                if req.grammar is INVALID_GRAMMAR_OBJ:
+                    req.set_finish_with_abort(f"Invalid grammar request: key={req.grammar_key}")
+
+                num_ready_reqs += 1
+            except futures._base.TimeoutError:
+                req.grammar_wait_ct += 1
+                # Check if we've exceeded the timeout
+                if req.grammar_wait_ct > GRAMMAR_TIMEOUT / 0.03:
+                    num_timeout_reqs = 1
+                break
+
+        # Handle timeout requests: cancel and mark as failed
+        for i in range(num_ready_reqs, num_ready_reqs + num_timeout_reqs):
+            req = self.grammar_queue[i]
+            req.grammar.cancel()
+            error_msg = f"Grammar preprocessing timed out for {req.grammar_key=}"
+            req.set_finish_with_abort(error_msg)
+            # Cache as invalid to avoid retrying
+            if self.grammar_backend and req.grammar_key:
+                self.grammar_backend.set_cache(req.grammar_key, INVALID_GRAMMAR_OBJ)
+        num_ready_reqs += num_timeout_reqs
+
+        # Move ready requests to waiting queue
+        self._extend_requests_to_queue(self.grammar_queue[:num_ready_reqs])
+        self.grammar_queue = self.grammar_queue[num_ready_reqs:]
 
     def get_internal_state(self, recv_req: GetInternalStateReq):
         ret = dict(global_server_args_dict)
@@ -786,6 +884,9 @@ class Scheduler(
         return ret
 
     def get_new_batch_prefill(self) -> ScheduleBatch | None:
+        if self.grammar_queue:
+            self.move_ready_grammar_requests()
+
         # Handle the cases where prefill is not allowed
         if (
             self.running_batch.batch_is_full or len(self.waiting_queue) == 0
@@ -1025,6 +1126,9 @@ class Scheduler(
 
     def set_next_batch_sampling_info_done(self, batch: ScheduleBatch):
         if batch.next_batch_sampling_info:
+            # Update grammar vocab masks for next batch in overlap mode
+            if batch.next_batch_sampling_info.grammars is not None:
+                batch.next_batch_sampling_info.update_grammar_vocab_mask()
             batch.next_batch_sampling_info.sampling_info_done.set()
 
     def watchdog_thread(self):
@@ -1067,6 +1171,14 @@ class Scheduler(
             req = self.waiting_queue.pop(i)
             self.send_to_tokenizer.send_pyobj(AbortReq(req.rid))
             logger.debug("Abort queued request. rid=%s", req.rid)
+
+        # Delete the requests in the grammar queue
+        for req in self.grammar_queue:
+            if recv_req.abort_all or req.rid.startswith(recv_req.rid):
+                logger.debug("Abort grammar queue request. rid=%s", req.rid)
+                if req.grammar:
+                    req.grammar.cancel()
+                req.set_finish_with_abort("Aborted by AbortReq.")
 
         # Delete requests in the running batch
         if self.cur_batch is self.running_batch or self.cur_batch is None:

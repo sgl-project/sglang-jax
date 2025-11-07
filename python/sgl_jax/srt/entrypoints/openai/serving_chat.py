@@ -39,6 +39,7 @@ from sgl_jax.srt.managers.io_struct import GenerateReqInput
 from sgl_jax.srt.managers.template_manager import TemplateManager
 from sgl_jax.srt.managers.tokenizer_manager import TokenizerManager
 from sgl_jax.srt.reasoning_parser import ReasoningParser
+from sgl_jax.utils import convert_json_schema_to_str
 
 logger = logging.getLogger(__name__)
 
@@ -328,17 +329,15 @@ Assistant: {% endif %}"""
         }
 
         if request.response_format and request.response_format.type == "json_schema":
-            # sampling_params["json_schema"] = convert_json_schema_to_str(
-            #     request.response_format.json_schema.schema_
-            # )
-            pass
+            sampling_params["json_schema"] = convert_json_schema_to_str(
+                request.response_format.json_schema.schema_
+            )
         elif request.response_format and request.response_format.type == "json_object":
             sampling_params["json_schema"] = '{"type": "object"}'
         elif request.response_format and request.response_format.type == "structural_tag":
-            # sampling_params["structural_tag"] = convert_json_schema_to_str(
-            #     request.response_format.model_dump(by_alias=True)
-            # )
-            pass
+            sampling_params["structural_tag"] = convert_json_schema_to_str(
+                request.response_format.model_dump(by_alias=True)
+            )
 
         # Check if there are already existing output constraints
         has_existing_constraints = (
@@ -353,10 +352,9 @@ Assistant: {% endif %}"""
         elif tool_call_constraint:
             constraint_type, constraint_value = tool_call_constraint
             if constraint_type == "structural_tag":
-                # sampling_params[constraint_type] = convert_json_schema_to_str(
-                #     constraint_value.model_dump(by_alias=True)
-                # )
-                pass
+                sampling_params[constraint_type] = convert_json_schema_to_str(
+                    constraint_value.model_dump(by_alias=True)
+                )
             else:
                 sampling_params[constraint_type] = constraint_value
         return sampling_params

@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING
 import jax
 
 from sgl_jax.srt.layers.logits_processor import LogitsProcessorOutput
-from sgl_jax.srt.managers.io_struct import BatchTokenIDOut
+from sgl_jax.srt.managers.io_struct import AbortReq, BatchTokenIDOut
 from sgl_jax.srt.managers.schedule_batch import BaseFinishReason, Req, ScheduleBatch
 from sgl_jax.srt.precision_tracer import precision_tracer
 
@@ -119,6 +119,23 @@ class SchedulerOutputProcessorMixin:
                         logits_output,
                     )
                     logprob_pt += num_input_logprobs
+
+                # Update grammar state after token sampling
+                if req.grammar is not None:
+                    try:
+                        req.grammar.accept_token(int(next_token_id))
+                    except ValueError as e:
+                        # Grammar accept_token can raise ValueError if the token is not in the grammar.
+                        # This can happen if the grammar is not set correctly or the token is invalid.
+                        logger.error(
+                            "Grammar accept_token failed for req %s with token %s: %s",
+                            req.rid,
+                            next_token_id,
+                            e,
+                        )
+
+                        self.abort_request(AbortReq(rid=req.rid))
+                    req.grammar.finished = req.finished()
             else:
                 # being chunked reqs' prefill is not finished
                 req.is_chunked -= 1
@@ -181,8 +198,6 @@ class SchedulerOutputProcessorMixin:
         self.token_to_kv_pool_allocator.free_group_begin()
 
         # Check finish condition
-        # NOTE: the length of reqs and next_token_ids don't match if it is spec decoding.
-        # We should ignore using next_token_ids for spec decoding cases.
         for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
             if req.is_retracted:
                 continue
@@ -231,6 +246,23 @@ class SchedulerOutputProcessorMixin:
                     req.output_token_ids_logprobs_idx.append(
                         logits_output.next_token_token_ids_logprobs_idx[i]
                     )
+
+            # Update grammar state after token sampling
+            if req.grammar is not None:
+                try:
+                    req.grammar.accept_token(int(next_token_id))
+                except ValueError as e:
+                    # Grammar accept_token can raise ValueError if the token is not in the grammar.
+                    # This can happen if the grammar is not set correctly or the token is invalid.
+                    logger.error(
+                        "Grammar accept_token failed for req %s with token %s: %s",
+                        req.rid,
+                        next_token_id,
+                        e,
+                    )
+
+                    self.abort_request(AbortReq(rid=req.rid))
+                req.grammar.finished = req.finished()
 
         self.set_next_batch_sampling_info_done(batch)
         self.stream_output(batch.reqs, batch.return_logprob, cache_miss_count=cache_miss_count)

@@ -10,10 +10,10 @@ import jax.numpy as jnp
 import numpy as np
 from flax import nnx
 from jax.experimental.multihost_utils import broadcast_one_to_all
-from jax.sharding import NamedSharding, PartitionSpec
 from tqdm import tqdm
 
 from sgl_jax.srt.configs.model_config import ModelConfig
+from sgl_jax.srt.constrained.bitmask_ops import allocate_token_bitmask
 from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessorOutput
 from sgl_jax.srt.managers.schedule_batch import (
     ModelWorkerBatch,
@@ -33,7 +33,6 @@ from sgl_jax.srt.utils.common_utils import (
     PRECOMPILE_DEFAULT_BS_PADDINGS,
     PRECOMPILE_DEFAULT_TOKEN_PADDINGS,
 )
-from sgl_jax.srt.utils.jax_utils import device_array
 
 logger = logging.getLogger(__name__)
 
@@ -390,6 +389,24 @@ class ModelWorker:
             self.model_runner.token_to_kv_pool_allocator,
         )
 
+    def _update_grammar_vocab_mask(
+        self, batch: ModelWorkerBatch, sampling_metadata: SamplingMetadata
+    ):
+        if batch.sampling_info.grammars:
+            # Overlap mode: wait for the mask prepared in set_next_batch_sampling_info_done
+            if batch.sampling_info.sampling_info_done:
+                batch.sampling_info.sampling_info_done.wait()
+            else:
+                batch.sampling_info.update_grammar_vocab_mask()
+        if batch.sampling_info.vocab_mask is None:
+            sampling_metadata.apply_vocab_mask = False
+            sampling_metadata.vocab_mask = allocate_token_bitmask(
+                len(batch.sampling_info.temperatures), batch.sampling_info.vocab_size
+            )
+        else:
+            sampling_metadata.apply_vocab_mask = True
+            sampling_metadata.vocab_mask = batch.sampling_info.vocab_mask
+
     def forward_batch_generation(
         self,
         model_worker_batch: ModelWorkerBatch,
@@ -418,21 +435,6 @@ class ModelWorker:
             )
 
         self.model_runner.attn_backend.forward_metadata = forward_metadata
-        # note: put positions on devices again because the forward_batch has been donated
-        if not skip_sample:
-            positions = (
-                model_worker_batch.positions
-                if model_worker_batch.forward_mode.is_decode()
-                else model_worker_batch.seq_lens - 1
-            )
-            positions_device = device_array(
-                positions,
-                sharding=(
-                    NamedSharding(self.model_runner.mesh, PartitionSpec())
-                    if jax.process_count() == 1
-                    else None
-                ),
-            )
         logits_output, cache_miss_count = self.model_runner.forward(
             forward_batch,
             logits_metadata=LogitsMetadata.from_model_worker_batch(model_worker_batch, self.mesh),
@@ -446,14 +448,14 @@ class ModelWorker:
         else:
             import jax._src.test_util as jtu
 
+            # Preprocess logits: update grammar vocab masks if needed
+            if model_worker_batch.sampling_info:
+                self._update_grammar_vocab_mask(model_worker_batch, sampling_metadata)
+
             with jtu.count_pjit_cpp_cache_miss() as count:
-                # wait for sampling info to be done
-                if model_worker_batch.sampling_info.sampling_info_done:
-                    model_worker_batch.sampling_info.sampling_info_done.wait()
                 next_token_ids_device = self.model_runner.sample(
                     logits_output,
                     sampling_metadata,
-                    positions_device,
                 )
                 cache_miss_count += count()
 

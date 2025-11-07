@@ -20,6 +20,8 @@ from sgl_jax.srt.utils.common_utils import (
 
 logger = logging.getLogger(__name__)
 
+GRAMMAR_BACKEND_CHOICES = ["llguidance", "none"]
+
 
 @dataclasses.dataclass
 class ServerArgs:
@@ -70,6 +72,7 @@ class ServerArgs:
     stream_output: bool = False
     random_seed: int | None = None
     constrained_json_whitespace_pattern: str | None = None
+    constrained_json_disable_any_whitespace: bool = False
     watchdog_timeout: float = 300
     dist_timeout: int | None = None  # timeout for distributed initialization
     download_dir: str | None = None
@@ -118,6 +121,8 @@ class ServerArgs:
 
     # Kernel backend
     attention_backend: str | None = "fa"
+
+    grammar_backend: str | None = None
 
     max_seq_len: int = 4096
 
@@ -188,6 +193,9 @@ class ServerArgs:
                 "Disabling chunked prefill."
             )
             self.chunked_prefill_size = -1
+
+        if self.grammar_backend is None:
+            self.grammar_backend = "llguidance"
 
         os.environ["SGLANG_ENABLE_DETERMINISTIC_SAMPLING"] = (
             "1" if self.enable_deterministic_sampling else "0"
@@ -304,6 +312,13 @@ class ServerArgs:
             type=int,
             default=ServerArgs.model_layer_nums,
             help="Number of model layers to load and use for inference. If not specified, uses the value from model config.",
+        )
+        parser.add_argument(
+            "--grammar-backend",
+            type=str,
+            choices=GRAMMAR_BACKEND_CHOICES,
+            default=ServerArgs.grammar_backend,
+            help="Choose the backend for grammar-guided decoding.",
         )
 
         # HTTP server
@@ -503,7 +518,12 @@ class ServerArgs:
             "--constrained-json-whitespace-pattern",
             type=str,
             default=ServerArgs.constrained_json_whitespace_pattern,
-            help="(outlines backend only) Regex pattern for syntactic whitespaces allowed in JSON constrained output. For example, to allow the model generate consecutive whitespaces, set the pattern to [\n\t ]*",
+            help="(llguidance backends only) Regex pattern for syntactic whitespaces allowed in JSON constrained output. For example, to allow the model generate consecutive whitespaces, set the pattern to [\n\t ]*",
+        )
+        parser.add_argument(
+            "--constrained-json-disable-any-whitespace",
+            action="store_true",
+            help="(llguidance backends only) Enforce compact representation in JSON constrained output.",
         )
         parser.add_argument(
             "--watchdog-timeout",

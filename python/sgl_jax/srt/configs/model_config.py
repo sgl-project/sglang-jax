@@ -220,7 +220,7 @@ class ModelConfig:
         return self.hf_text_config.num_attention_heads
 
     def get_num_kv_heads(self, tensor_parallel_size) -> int:
-        """Returns the number of KV heads per GPU."""
+        """Returns the number of KV heads per TP size."""
         from sgl_jax.srt.utils.jax_utils import get_num_kv_heads_by_tp
 
         total_num_kv_heads = self.get_total_num_kv_heads()

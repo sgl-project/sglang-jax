@@ -16,7 +16,7 @@ The primary objectives of chunked prefill are:
 
 Traditional LLM inference processes entire prefill requests as single units, which can cause issues with very long sequences:
 - **Prefill phase**: Processes entire input prompt in parallel, but long sequences can exceed memory limits
-- **Memory constraints**: Large prefill requests may not fit in available GPU memory or batch size limits
+- **Memory constraints**: Large prefill requests may not fit in available TPU memory or batch size limits
 
 Chunked prefill addresses this by breaking large prefill requests into smaller chunks that can be processed sequentially, allowing the system to handle much longer input sequences without running out of memory.
 

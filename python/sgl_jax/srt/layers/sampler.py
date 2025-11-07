@@ -7,12 +7,11 @@ from jax import random
 from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 
+from sgl_jax.srt.constrained.bitmask_ops import apply_token_bitmask
 from sgl_jax.srt.layers.binary_search import topk_mask, topp_mask
 from sgl_jax.srt.layers.logits_processor import LogitsProcessorOutput
 from sgl_jax.srt.sampling.sampling_batch_info import SamplingMetadata
 from sgl_jax.srt.utils.jax_utils import is_tpu_runtime
-
-_SAMPLING_EPS = 1e-5
 
 
 class Sampler(nnx.Module):
@@ -22,14 +21,14 @@ class Sampler(nnx.Module):
 
     def _greedy_sampling(self, operands):
         """Greedy sampling branch"""
-        logits, _, _, _ = operands
+        logits, _, _ = operands
         batch_next_token_ids = jnp.argmax(logits, -1).flatten()
         logprobs = jax.nn.log_softmax(logits, axis=-1)
         return batch_next_token_ids, logprobs
 
     def _regular_sampling(self, operands):
         """Regular sampling branch"""
-        logits, sampling_metadata, positions, rng, use_sort_for_toppk_minp = operands
+        logits, sampling_metadata, rng, use_sort_for_toppk_minp = operands
 
         logits = lax.with_sharding_constraint(logits, NamedSharding(self.mesh, P(None, None)))
 
@@ -53,7 +52,7 @@ class Sampler(nnx.Module):
             sampling_metadata.top_ks,
             sampling_metadata.top_ps,
             sampling_metadata.min_ps,
-            positions,
+            sampling_metadata.positions,
             sampling_metadata.temperatures,
             sampling_metadata.sampling_seeds,
             sampling_metadata.need_min_p_sampling,
@@ -142,7 +141,6 @@ class Sampler(nnx.Module):
         self,
         logits_output: LogitsProcessorOutput,
         sampling_metadata: SamplingMetadata,
-        positions: jax.Array,
         use_sort_for_toppk_minp: bool,
     ):
         """Run a sampler & compute logprobs and update logits_output accordingly.
@@ -150,7 +148,6 @@ class Sampler(nnx.Module):
         Args:
             logits_output: The logits from the model forward
             sampling_metadata: Metadata for sampling
-            positions: The positions of the tokens in the sequence.
             use_sort_for_toppk_minp: whether use sort when dealing with top_k, top_k and min_p.
         """
         # Apply penalties before sampling
@@ -161,8 +158,16 @@ class Sampler(nnx.Module):
             (logits_output.next_token_logits, sampling_metadata),
         )
 
+        # Apply grammar-constrained vocab mask
+        logits = lax.cond(
+            sampling_metadata.apply_vocab_mask,
+            lambda operands: apply_token_bitmask(operands[0], operands[1]),
+            lambda operands: operands[0],
+            (logits, sampling_metadata.vocab_mask),
+        )
+
         _, rng = jax.random.split(self.rngs.params())
-        operands = (logits, sampling_metadata, positions, rng)
+        operands = (logits, sampling_metadata, rng)
         regular_fn = lambda op: self._regular_sampling((*op, use_sort_for_toppk_minp))
         batch_next_token_ids, logprobs = lax.cond(
             sampling_metadata.is_all_greedy,
@@ -259,7 +264,7 @@ def multinomial_with_seed(
         inputs = jax.nn.softmax(inputs, axis=-1)
     # inputs = jax.nn.softmax(logits, axis=-1)
 
-    n, m = inputs.shape
+    _, m = inputs.shape
     step_seed = seed * 19349663 ^ positions * 73856093
     seed_expanded = step_seed[:, None]
     col_indices = jnp.arange(m)[None, :]
@@ -330,13 +335,13 @@ def top_k_top_p_min_p_sampling_from_probs_jax(
 
 def top_k_top_p_min_p_sampling_from_probs_jax_with_sort(args):
     (
-        logits,
+        _,
         probs,
         top_ks,
         top_ps,
         min_ps,
         positions,
-        temperatures,
+        _,
         sampling_seeds,
         need_min_p_sampling,
         rng,
@@ -395,7 +400,7 @@ def top_k_top_p_min_p_sampling_from_probs_jax_with_sort(args):
 def top_k_top_p_min_p_sampling_from_probs_jax_with_mask(args):
     (
         logits,
-        probs,
+        _,
         top_ks,
         top_ps,
         min_ps,
