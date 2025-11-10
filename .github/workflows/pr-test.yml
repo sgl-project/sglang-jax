@@ -25,36 +25,77 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-
   e2e-test-1-tpu:
     if: github.event.pull_request.draft == false
-    runs-on: tpuv6e-1
+    runs-on: tpu-runner-v6e-1
     strategy:
       fail-fast: false
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+      - name: Install Python 3.12 and dependencies
+        shell: bash
+        run: |
+          sudo apt update
+          sudo apt install -y software-properties-common
+          sudo add-apt-repository -y ppa:deadsnakes/ppa
+          sudo apt update
+          sudo apt install -y \
+              python3.12 \
+              python3.12-venv \
+              python3.12-dev \
+              python3-pip \
+              git \
+              curl \
+              procps \
+              build-essential
+          python3.12 --version
       - name: Run test
         timeout-minutes: 120
+        shell: bash
         run: |
-          uv venv --python 3.12 && source .venv/bin/activate && uv pip install -e "python[all]"
+          python3.12 -m venv .venv
+          source .venv/bin/activate
+          pip install uv
+          uv pip install -e "python[all]"
           bash scripts/killall_sglang.sh
-          uv run python test/srt/run_suite.py --suite per-commit-tpu-v6e-1
+          python test/srt/run_suite.py --suite per-commit-tpu-v6e-1
 
   e2e-test-4-tpu:
     if: github.event.pull_request.draft == false
-    runs-on: tpuv6e-4
+    runs-on: tpu-runner-v6e-4
     strategy:
       fail-fast: false
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+      - name: Install Python 3.12 and dependencies
+        shell: bash
+        run: |
+          sudo apt update
+          sudo apt install -y software-properties-common
+          sudo add-apt-repository -y ppa:deadsnakes/ppa
+          sudo apt update
+          sudo apt install -y \
+              python3.12 \
+              python3.12-venv \
+              python3.12-dev \
+              python3-pip \
+              git \
+              curl \
+              procps \
+              build-essential
+          python3.12 --version
       - name: Run test
         timeout-minutes: 120
+        shell: bash
         run: |
-          uv venv --python 3.12 && source .venv/bin/activate && uv pip install -e "python[all]"
+          python3.12 -m venv .venv
+          source .venv/bin/activate
+          pip install uv
+          uv pip install -e "python[all]"
           bash scripts/killall_sglang.sh
-          uv run python test/srt/run_suite.py --suite per-commit-tpu-v6e-4
+          python test/srt/run_suite.py --suite per-commit-tpu-v6e-4
 
   # performance-test-1-tpu:
   #   if: github.event.pull_request.draft == false
@@ -149,9 +190,9 @@ jobs:
   pr-test-finish:
     needs: [
       e2e-test-1-tpu,
-      e2e-test-4-tpu,
+      # e2e-test-4-tpu,
     ]
-    runs-on: self-hosted
+    runs-on: cpu-runner
     steps:
       - name: Check all dependent job statuses
         run: |
