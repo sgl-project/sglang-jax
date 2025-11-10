@@ -150,7 +150,7 @@ class WeightLoader:
                         break
 
                 if not assigned:
-                    # logger.warning("MoE expert weight not assigned to any mapping: %s", hf_key)
+                    logger.warning("MoE expert weight not assigned to any mapping: %s", hf_key)
                     pass  # TODO: add warning, right now just for debugging
             else:
                 if self._is_excluded_layer_weight(hf_key):
@@ -302,6 +302,18 @@ class WeightLoader:
     ):
         jax_path = mapping.target_path
         processed_weight = weight
+
+        # Apply output_multiplier_scale to lm_head weights (matching PyTorch implementation)
+        if "lm_head" in hf_key and hasattr(self.model_config.hf_config, "output_multiplier_scale"):
+            logger.info(
+                "Applying output_multiplier_scale (%.2f) to %s",
+                self.model_config.hf_config.output_multiplier_scale,
+                hf_key,
+            )
+            processed_weight = processed_weight.astype(jnp.float32)
+            processed_weight = (
+                processed_weight * self.model_config.hf_config.output_multiplier_scale
+            )
 
         if mapping.reshape is not None:
             processed_weight = jnp.reshape(processed_weight, mapping.reshape)
