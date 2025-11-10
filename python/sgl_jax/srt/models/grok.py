@@ -310,7 +310,7 @@ class Grok1Attention(nnx.Module):
             kernel_axes=(None, "tensor"),
             rngs=rngs,
         )
-        
+
         self.k_proj = LinearBase(
             input_size=hidden_size,
             output_size=self.kv_size,
@@ -319,7 +319,7 @@ class Grok1Attention(nnx.Module):
             kernel_axes=(None, "tensor"),
             rngs=rngs,
         )
-        
+
         self.v_proj = LinearBase(
             input_size=hidden_size,
             output_size=self.kv_size,
@@ -340,8 +340,7 @@ class Grok1Attention(nnx.Module):
 
         # Initialize rotary embeddings based on scaling configuration
         if rope_scaling is not None:
-            self.rotary_emb = ScalingRotaryEmbedd
-            ing(
+            self.rotary_emb = ScalingRotaryEmbedding(
                 self.head_dim,
                 rotary_dim=(
                     self.head_dim if not self.rope_rotate_half_dims else self.head_dim // 2
@@ -517,8 +516,8 @@ class Grok1DecoderLayer(nnx.Module):
             forward_batch=forward_batch,
             token_to_kv_pool=token_to_kv_pool,
         )
-        
-        logging.info(f"hidden_states after attention: {hidden_states}")
+
+        # logging.info(f"hidden_states after attention: {hidden_states}")
 
         # Apply post-attention norm and pre-MoE norm (matching PyTorch fused_dual_residual_rmsnorm)
         hidden_states, residual = dual_rmsnorm_forward(
@@ -534,8 +533,8 @@ class Grok1DecoderLayer(nnx.Module):
             hidden_states = self.moe_with_rmoe(hidden_states)
         else:
             hidden_states = self.block_sparse_moe(hidden_states)
-            
-        logging.info(f"hidden_states after moe: {hidden_states}")
+
+        # logging.info(f"hidden_states after moe: {hidden_states}")
 
         # Return with deferred post-MoE norm (matching PyTorch)
         return hidden_states, residual, self.post_moe_norm
@@ -630,7 +629,6 @@ class Grok1ForCausalLM(nnx.Module):
     ) -> None:
         super().__init__()
         assert dtype == jnp.bfloat16
-        config.num_hidden_layers = 4 #for debugging
         self.config = config
         self.mesh = mesh
 
@@ -659,7 +657,7 @@ class Grok1ForCausalLM(nnx.Module):
                 embedding_init=nnx.with_partitioning(init_fn, ("tensor", None)),
                 rngs=rngs,
             )
-        self.logits_processor = LogitsProcessor(config.vocab_size, mesh=mesh)
+        self.logits_processor = LogitsProcessor(config.vocab_size, mesh=mesh, config=config)
 
         self.loaded_param_names = set()
 
@@ -828,7 +826,9 @@ class Grok1ForCausalLM(nnx.Module):
             ),
         }
 
-        for name, target_name in [("w1", "wi_0"), ("w2", "wi_1"), ("w3", "wo")]:
+        # CRITICAL: Correct MoE weight mapping
+        # w1 (gate_proj) -> wi_0, w3 (up_proj) -> wi_1, w2 (down_proj) -> wo
+        for name, target_name in [("w1", "wi_0"), ("w3", "wi_1"), ("w2", "wo")]:
             target_path = [f"{target_prefix}.block_sparse_moe.experts.{target_name}"]
             target_path.extend(
                 [
@@ -841,18 +841,20 @@ class Grok1ForCausalLM(nnx.Module):
                 sharding = (None, ("data", "tensor"), None)
             else:
                 sharding = (None, None, ("data", "tensor"))
-                
+
             if name == "w2":
+                # w2 (down_proj) -> wo: HF shape (8192, 2048), concat -> (8192, 16384), transpose -> (16384, 8192)
                 mappings[f"__MOE_EXPERTS__{prefix}.block_sparse_moe.experts.{target_name}"] = (
-                    WeightMapping(target_path=target_path, sharding=sharding, transpose=False, concat_axis=-1)
-                )
-            elif name == "w3":
-                mappings[f"__MOE_EXPERTS__{prefix}.block_sparse_moe.experts.{target_name}"] = (
-                    WeightMapping(target_path=target_path, sharding=sharding, transpose=False, concat_axis=0)
+                    WeightMapping(
+                        target_path=target_path, sharding=sharding, transpose=True, concat_axis=-1
+                    )
                 )
             else:
+                # w1/w3 (gate/up) -> wi_0/wi_1: HF shape (2048, 8192), concat -> (16384, 8192), transpose -> (8192, 16384)
                 mappings[f"__MOE_EXPERTS__{prefix}.block_sparse_moe.experts.{target_name}"] = (
-                    WeightMapping(target_path=target_path, sharding=sharding, transpose=True, concat_axis=0)
+                    WeightMapping(
+                        target_path=target_path, sharding=sharding, transpose=True, concat_axis=0
+                    )
                 )
 
         return mappings

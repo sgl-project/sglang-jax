@@ -125,10 +125,9 @@ class ModelRunner:
         self.sampler = Sampler(nnx.Rngs(server_args.random_seed))
         total_device_memory = self.get_available_device_memory()
         self.load_model()
-        
 
         self.initialize_jit()
-        
+
         # Init memory pool and attention backends
         self.init_memory_pool(
             server_args.max_running_requests,
@@ -143,7 +142,6 @@ class ModelRunner:
         model_state_leaves, model_state_def = jax.tree_util.tree_flatten(model_state)
         sampler_def, sampler_state = nnx.split(self.sampler)
         sampler_state_leaves, sampler_state_def = jax.tree_util.tree_flatten(sampler_state)
-        
 
         @partial(
             jax.jit,
@@ -188,7 +186,7 @@ class ModelRunner:
             )
 
         self.jitted_run_model = run_model_wrapper
-        
+
         self.jitted_sampler = partial(
             jitted_sampler,
             sampler_def,
@@ -213,7 +211,10 @@ class ModelRunner:
                 )
             else:
                 logging.warning(
-                    f"The memory capacity is unbalanced. min_available_device_memory={min_available_device_memory}, local_device_memory={local_device_memory}, local_device_memory*0.9={local_device_memory * 0.9}"
+                    "The memory capacity is unbalanced. min_available_device_memory=%s, local_device_memory=%s, local_device_memory*0.9=%s",
+                    min_available_device_memory,
+                    local_device_memory,
+                    local_device_memory * 0.9,
                 )
                 # raise ValueError(
                 #     f"The memory capacity is unbalanced. min_available_device_memory={min_available_device_memory}, local_device_memory={local_device_memory}, local_device_memory*0.9={local_device_memory * 0.9}"
@@ -269,8 +270,7 @@ class ModelRunner:
             cell_size,
         )
 
-        # return max_tokens
-        return 100
+        return max_tokens
 
     def init_memory_pool(
         self,
