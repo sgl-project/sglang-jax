@@ -2,7 +2,6 @@ import glob
 import logging
 import os
 from dataclasses import dataclass
-from re import M
 
 import jax
 import jax.numpy as jnp
@@ -122,7 +121,9 @@ class WeightLoader:
                 if isinstance(mapping, (str, list)):
                     mapping = WeightMapping(target_path=mapping)
                 self._process_and_assign_weight(params, hf_key, hf_weight, mapping)
-            elif ("mlp.experts." in hf_key or "block_sparse_moe.experts") and hf_key.endswith(".weight"):
+            elif (
+                "mlp.experts." in hf_key or "block_sparse_moe.experts" in hf_key
+            ) and hf_key.endswith(".weight"):
                 if self._is_excluded_layer_weight(hf_key):
                     logger.debug("Skipping excluded MoE expert weight: %s", hf_key)
                     continue
@@ -150,7 +151,7 @@ class WeightLoader:
 
                 if not assigned:
                     # logger.warning("MoE expert weight not assigned to any mapping: %s", hf_key)
-                    pass # TODO: add warning, right now just for debugging
+                    pass  # TODO: add warning, right now just for debugging
             else:
                 if self._is_excluded_layer_weight(hf_key):
                     logger.debug("Skipping excluded layer weight: %s", hf_key)
@@ -185,28 +186,42 @@ class WeightLoader:
         for hf_key in expected_hf_keys:
             weights = expert_weights_dict[hf_key]
             # concat weights along axis 0
-            if hf_key.split(".")[-2] == "w2":
-                logging.info("hf_key: %s", hf_key)
-                logging.info("weight shape: %s", weights[0].shape)
-                logging.info("mapping.concat_axis: %s", mapping.concat_axis)
-                logging.info("transpose: %s", mapping.transpose)
-                
+            # Log ALL expert weights, not just w2
+            logging.info("=== Processing expert weight ===")
+            logging.info("hf_key: %s", hf_key)
+            logging.info("num_shards: %s", len(weights))
+            logging.info("shard[0] shape: %s", weights[0].shape)
+            logging.info("mapping.concat_axis: %s", mapping.concat_axis)
+            logging.info("mapping.transpose: %s", mapping.transpose)
+
             if mapping.concat_axis is not None:
                 weights = jnp.concatenate(weights, axis=mapping.concat_axis)
+                logging.info("after concat shape: %s", weights.shape)
             if mapping.transpose and not hf_key.endswith(".bias"):
                 weights = jnp.transpose(weights, (1, 0))
-            # logging.info("weights.shape: %s", weights.shape)
-            # logging.info("first 100 weights: %s", weights[:10, :100])
+                logging.info("after transpose shape: %s", weights.shape)
             collected_weights.append(weights)
 
         stacked_weight = jnp.stack(collected_weights, axis=0)  # (num_experts, ...)
+        logging.info("=== Final stacked weight ===")
         logging.info("stacked_weight.shape: %s", stacked_weight.shape)
         sharded_weight = self._shard_weight(stacked_weight, mapping.sharding)
-        # logging.info("sharded_weight.shape: %s", sharded_weight.shape)
+        logging.info("sharded_weight.shape: %s", sharded_weight.shape)
         model_param = self._get_param(params, target_path)
         logging.info("param name: %s", target_path)
-        # logging.info("model_param.value.shape: %s", model_param.value.shape)
-        # logging.info("target_path: %s", target_path)
+        logging.info("model_param.value.shape: %s", model_param.value.shape)
+
+        # CRITICAL: Validate shape match before assignment
+        expected_shape = model_param.value.shape
+        actual_shape = sharded_weight.shape
+        if expected_shape != actual_shape:
+            raise ValueError(
+                f"Shape mismatch for {target_path}!\n"
+                f"  Expected: {expected_shape}\n"
+                f"  Got:      {actual_shape}\n"
+                f"  This indicates incorrect weight loading configuration (concat_axis or transpose)."
+            )
+
         model_param.value = sharded_weight.astype(model_param.value.dtype)
 
         logger.debug("Assigned MoE group %s, shape: %s", moe_key, stacked_weight.shape)
