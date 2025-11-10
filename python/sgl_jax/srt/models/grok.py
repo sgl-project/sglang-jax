@@ -658,7 +658,10 @@ class Grok1ForCausalLM(nnx.Module):
                 embedding_init=nnx.with_partitioning(init_fn, ("tensor", None)),
                 rngs=rngs,
             )
-        self.logits_processor = LogitsProcessor(config.vocab_size, mesh=mesh)
+        soft_cap = (
+             getattr(config, "final_logit_softcapping", 0.0) if config else 0.0
+         )
+        self.logits_processor = LogitsProcessor(config.vocab_size, mesh=mesh, soft_cap=soft_cap)
 
         self.loaded_param_names = set()
 
@@ -827,7 +830,9 @@ class Grok1ForCausalLM(nnx.Module):
             ),
         }
 
-        for name, target_name in [("w1", "wi_0"), ("w2", "wi_1"), ("w3", "wo")]:
+        # CRITICAL: Correct MoE weight mapping
+        # w1 (gate_proj) -> wi_0, w3 (up_proj) -> wi_1, w2 (down_proj) -> wo
+        for name, target_name in [("w1", "wi_0"), ("w3", "wi_1"), ("w2", "wo")]:
             target_path = [f"{target_prefix}.block_sparse_moe.experts.{target_name}"]
             target_path.extend(
                 [
@@ -842,18 +847,14 @@ class Grok1ForCausalLM(nnx.Module):
                 sharding = (None, None, ("data", "tensor"))
 
             if name == "w2":
+                # w2 (down_proj) -> wo: HF shape (8192, 2048), concat -> (8192, 16384), transpose -> (16384, 8192)
                 mappings[f"__MOE_EXPERTS__{prefix}.block_sparse_moe.experts.{target_name}"] = (
                     WeightMapping(
-                        target_path=target_path, sharding=sharding, transpose=False, concat_axis=-1
-                    )
-                )
-            elif name == "w3":
-                mappings[f"__MOE_EXPERTS__{prefix}.block_sparse_moe.experts.{target_name}"] = (
-                    WeightMapping(
-                        target_path=target_path, sharding=sharding, transpose=False, concat_axis=0
+                        target_path=target_path, sharding=sharding, transpose=True, concat_axis=-1
                     )
                 )
             else:
+                # w1/w3 (gate/up) -> wi_0/wi_1: HF shape (2048, 8192), concat -> (16384, 8192), transpose -> (8192, 16384)
                 mappings[f"__MOE_EXPERTS__{prefix}.block_sparse_moe.experts.{target_name}"] = (
                     WeightMapping(
                         target_path=target_path, sharding=sharding, transpose=True, concat_axis=0
