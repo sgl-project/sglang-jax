@@ -215,6 +215,7 @@ class LogitsProcessor(nnx.Module):
         self.soft_cap = soft_cap
         self.mesh = mesh
 
+
     def __call__(
         self,
         hidden_states: jax.Array,
@@ -448,6 +449,7 @@ class LogitsProcessor(nnx.Module):
 
         logits = logits[:, : self.vocab_size] if logits.ndim > 1 else logits[: self.vocab_size]
 
-        if self.soft_cap:
+        if self.soft_cap and self.soft_cap > 0:
             logits = self.soft_cap * jnp.tanh(logits / self.soft_cap)
+
         return logits
