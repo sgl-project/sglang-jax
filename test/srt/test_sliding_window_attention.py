@@ -30,7 +30,7 @@ class TestSlidingWindowAttention(CustomTestCase):
                 "--mem-fraction-static",
                 "0.8",
                 "--download-dir",
-                "/tmp/",
+                "/dev/shm",
                 "--max-running-requests",
                 "256",
                 "--precompile-bs-paddings",

@@ -30,7 +30,7 @@ class TestChunkedPrefillSize(CustomTestCase):
                 "--mem-fraction-static",
                 "0.8",
                 "--download-dir",
-                "/tmp/",
+                "/dev/shm",
                 "--dtype",
                 "bfloat16",
                 "--max-running-requests",

@@ -1,6 +1,7 @@
 import argparse
 import glob
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -81,6 +82,21 @@ def kill_process_tree(parent_pid, include_parent: bool = True, skip_pid: int = N
             pass
 
 
+def cleanup_model_cache():
+    shm_dir = "/dev/shm"
+    if os.path.exists(shm_dir):
+        for item in os.listdir(shm_dir):
+            if item.startswith("model"):
+                model_path = os.path.join(shm_dir, item)
+                if os.path.isdir(model_path):
+                    try:
+                        print(f"\nCleaning up model cache at {model_path}...", flush=True)
+                        shutil.rmtree(model_path)
+                        print(f"Model cache cleaned successfully.\n", flush=True)
+                    except Exception as e:
+                        print(f"Failed to clean model cache: {e}\n", flush=True)
+
+
 def run_unittest_files(files: List[TestFile], timeout_per_file: float):
     tic = time.perf_counter()
     success = True
@@ -112,6 +128,9 @@ def run_unittest_files(files: List[TestFile], timeout_per_file: float):
                 f".\n.\nEnd ({i}/{len(files) - 1}):\n{filename=}, {elapsed=:.0f}, {estimated_time=}\n.\n.\n",
                 flush=True,
             )
+
+            cleanup_model_cache()
+
             return process.returncode
 
         try:
