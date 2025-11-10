@@ -20,6 +20,6 @@ run: |
   #  --load-format auto --tokenizer-path Xenova/grok-1-tokenizer --correct --tp-size 8 --download-dir /models/
 
   # rm -rf ~/.cache/ && \
-  cd python/sgl_jax && python3 bench_one_batch.py --model-path xai-org/grok-2 --load-format dummy --tokenizer-path Xenova/grok-1-tokenizer --correctness-test --tp-size 32 \
-  --mem-fraction-static 0.5 --download-dir /models/grok/
+  cd python/sgl_jax && python3 -u bench_one_batch.py --model-path /models/xai-org-backup/ --load-format auto --tokenizer-path Xenova/grok-1-tokenizer --correctness-test --tp-size 4 \
+  --mem-fraction-static 0.9
   # --nnodes 8 --dist-init-addr=0.0.0.0:10011

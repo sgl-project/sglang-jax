@@ -301,10 +301,28 @@ class Grok1Attention(nnx.Module):
         rope_scaling = get_rope_scaling(config)
         self.rope_rotate_half_dims = getattr(config, "rope_rotate_half_dims", False)
 
-        # QKV projection (matches PyTorch QKVParallelLinear structure)
-        self.qkv_proj = LinearBase(
+        # Separate Q, K, V projections (to match checkpoint format)
+        self.q_proj = LinearBase(
             input_size=hidden_size,
-            output_size=self.q_size + 2 * self.kv_size,  # Q + K + V
+            output_size=self.q_size,
+            use_bias=False,
+            params_dtype=jnp.bfloat16,
+            kernel_axes=(None, "tensor"),
+            rngs=rngs,
+        )
+        
+        self.k_proj = LinearBase(
+            input_size=hidden_size,
+            output_size=self.kv_size,
+            use_bias=False,
+            params_dtype=jnp.bfloat16,
+            kernel_axes=(None, "tensor"),
+            rngs=rngs,
+        )
+        
+        self.v_proj = LinearBase(
+            input_size=hidden_size,
+            output_size=self.kv_size,
             use_bias=False,
             params_dtype=jnp.bfloat16,
             kernel_axes=(None, "tensor"),
@@ -322,7 +340,8 @@ class Grok1Attention(nnx.Module):
 
         # Initialize rotary embeddings based on scaling configuration
         if rope_scaling is not None:
-            self.rotary_emb = ScalingRotaryEmbedding(
+            self.rotary_emb = ScalingRotaryEmbedd
+            ing(
                 self.head_dim,
                 rotary_dim=(
                     self.head_dim if not self.rope_rotate_half_dims else self.head_dim // 2
@@ -363,11 +382,10 @@ class Grok1Attention(nnx.Module):
         if hidden_states.shape[0] == 0:
             return hidden_states
 
-        # Project to QKV
-        qkv, _ = self.qkv_proj(hidden_states)
-
-        # Split QKV (matching PyTorch split logic)
-        q, k, v = jnp.split(qkv, [self.q_size, self.q_size + self.kv_size], axis=-1)
+        # Project Q, K, V separately
+        q, _ = self.q_proj(hidden_states)
+        k, _ = self.k_proj(hidden_states)
+        v, _ = self.v_proj(hidden_states)
 
         # Apply rotary position embeddings
         q, k = self.rotary_emb(positions, q, k)
@@ -499,6 +517,8 @@ class Grok1DecoderLayer(nnx.Module):
             forward_batch=forward_batch,
             token_to_kv_pool=token_to_kv_pool,
         )
+        
+        logging.info(f"hidden_states after attention: {hidden_states}")
 
         # Apply post-attention norm and pre-MoE norm (matching PyTorch fused_dual_residual_rmsnorm)
         hidden_states, residual = dual_rmsnorm_forward(
@@ -514,6 +534,8 @@ class Grok1DecoderLayer(nnx.Module):
             hidden_states = self.moe_with_rmoe(hidden_states)
         else:
             hidden_states = self.block_sparse_moe(hidden_states)
+            
+        logging.info(f"hidden_states after moe: {hidden_states}")
 
         # Return with deferred post-MoE norm (matching PyTorch)
         return hidden_states, residual, self.post_moe_norm
@@ -608,6 +630,7 @@ class Grok1ForCausalLM(nnx.Module):
     ) -> None:
         super().__init__()
         assert dtype == jnp.bfloat16
+        config.num_hidden_layers = 4 #for debugging
         self.config = config
         self.mesh = mesh
 
@@ -734,13 +757,27 @@ class Grok1ForCausalLM(nnx.Module):
         target_prefix = f"model.layers.{layer_idx}"
 
         mappings = {
-            # self_attn
-            f"{prefix}.self_attn.qkv_proj.weight": WeightMapping(
-                target_path=f"{target_prefix}.self_attn.qkv_proj.weight",
+            # self_attn - separate q, k, v projections
+            f"{prefix}.self_attn.q_proj.weight": WeightMapping(
+                target_path=f"{target_prefix}.self_attn.q_proj.weight",
                 sharding=(None, "tensor"),
                 transpose=True,
                 head_dim_padding=True,
                 kv_head_padding=False,
+            ),
+            f"{prefix}.self_attn.k_proj.weight": WeightMapping(
+                target_path=f"{target_prefix}.self_attn.k_proj.weight",
+                sharding=(None, "tensor"),
+                transpose=True,
+                head_dim_padding=True,
+                kv_head_padding=True,
+            ),
+            f"{prefix}.self_attn.v_proj.weight": WeightMapping(
+                target_path=f"{target_prefix}.self_attn.v_proj.weight",
+                sharding=(None, "tensor"),
+                transpose=True,
+                head_dim_padding=True,
+                kv_head_padding=True,
             ),
             f"{prefix}.self_attn.o_proj.weight": WeightMapping(
                 target_path=f"{target_prefix}.self_attn.o_proj.weight",
@@ -804,9 +841,19 @@ class Grok1ForCausalLM(nnx.Module):
                 sharding = (None, ("data", "tensor"), None)
             else:
                 sharding = (None, None, ("data", "tensor"))
-            mappings[f"__MOE_EXPERTS__{prefix}.block_sparse_moe.experts.{target_name}"] = (
-                WeightMapping(target_path=target_path, sharding=sharding, transpose=True)
-            )
+                
+            if name == "w2":
+                mappings[f"__MOE_EXPERTS__{prefix}.block_sparse_moe.experts.{target_name}"] = (
+                    WeightMapping(target_path=target_path, sharding=sharding, transpose=False, concat_axis=-1)
+                )
+            elif name == "w3":
+                mappings[f"__MOE_EXPERTS__{prefix}.block_sparse_moe.experts.{target_name}"] = (
+                    WeightMapping(target_path=target_path, sharding=sharding, transpose=False, concat_axis=0)
+                )
+            else:
+                mappings[f"__MOE_EXPERTS__{prefix}.block_sparse_moe.experts.{target_name}"] = (
+                    WeightMapping(target_path=target_path, sharding=sharding, transpose=True, concat_axis=0)
+                )
 
         return mappings
 
