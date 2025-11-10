@@ -33,7 +33,7 @@ class GateLogit(nnx.Module):
                 )
             )
         else:
-            self.bias = None
+            self.bias = nnx.data(None)
 
     def __call__(self, hidden_states: jax.Array) -> tuple[jax.Array, jax.Array | None]:
         logits = hidden_states.astype(self.weight_dtype) @ self.kernel

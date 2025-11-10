@@ -55,7 +55,7 @@ class LinearBase(nnx.Module):
                 )
             )
         else:
-            self.bias = None
+            self.bias = nnx.data(None)
 
     def __call__(self, x: jax.Array) -> tuple[jax.Array, jax.Array | None]:
         """Forward pass of the linear layer."""

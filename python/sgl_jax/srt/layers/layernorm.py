@@ -48,7 +48,7 @@ class RMSNorm(nnx.Module):
         if use_scale:
             self.scale = nnx.Param(scale_init(jax.random.PRNGKey(0), feature_shape, param_dtype))
         else:
-            self.scale = None
+            self.scale = nnx.data(None)
 
         self.num_features = num_features
         self.epsilon = epsilon

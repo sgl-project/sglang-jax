@@ -163,7 +163,7 @@ class ParallelLMHead(Embed):
                 )
             )
         else:
-            self.bias = None
+            self.bias = nnx.data(None)
 
     def tie_weights(self, embed_tokens: Embed):
         """Tie the weights with word embeddings."""
