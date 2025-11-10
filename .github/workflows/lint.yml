@@ -19,16 +19,16 @@ jobs:
               python3.12 \
               python3.12-venv \
               python3.12-dev \
-              python3-pip \
               git \
               curl \
               procps \
               build-essential
           python3.12 --version
+          curl -sS https://bootstrap.pypa.io/get-pip.py | python3.12
       - name: Install pre-commit hook
         run: |
-          python3.12 -m pip install pre-commit
-          pre-commit install
+          python3.12 -m pip install --user pre-commit
+          python3.12 -m pre-commit install
 
       - name: Linting
         run: pre-commit run --all-files --show-diff-on-failure
