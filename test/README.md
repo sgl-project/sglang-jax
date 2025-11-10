@@ -3,15 +3,16 @@
 SGLang-Jax uses the built-in library [unittest](https://docs.python.org/3/library/unittest.html) as the testing framework.
 
 ## Test Backend Runtime
+Run single file
 ```bash
 cd sglang-jax/test/srt
-
-# Run single file
 python3 test_srt_engine.py
+```
 
-# Run a suite with multiple files on tpu
+Run a suite with multiple files on tpu
+```bash
 ## Note: You can change the value of `--suite` according to your demand.
-python3 run_suite.py --suite per-commit-tpu-v6e-1
+python3 test/srt/run_suite.py --suite per-commit-tpu-v6e-1
 ```
 
 ## Adding or Updating Tests in CI

@@ -56,7 +56,11 @@ For detailed performance evaluation and to run the benchmarks yourself, please s
 
 ## Testing
 
-[How to Run test](https://github.com/sgl-project/sglang-jax/blob/main/test/README.md)
+The project includes a comprehensive test suite to ensure correctness and stability. To run the full suite of tests:
+
+```bash
+python test/srt/run_suite.py
+```
 
 ## Contributing
 
