@@ -63,7 +63,7 @@ jobs:
 
   e2e-test-4-tpu:
     if: github.event.pull_request.draft == false
-    runs-on: arc-runner-v6e-1
+    runs-on: arc-runner-v6e-4
     strategy:
       fail-fast: false
     steps:
