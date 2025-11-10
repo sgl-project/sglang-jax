@@ -66,3 +66,9 @@ python run_suite.py
 ## Contributing
 
 Contributions are welcome! If you would like to contribute, please feel free to open an issue to discuss your ideas or submit a pull request.
+
+Before contributing, please read our [Contribution Guide](https://github.com/sgl-project/sglang-jax/blob/main/docs/developer_guide/contribution_guide.md)
+ for setup instructions, coding standards, and contribution workflow.
+
+You can also join our community on Slack to discuss ideas, get help, or collaborate with other contributors:
+👉 Join the [SGL-JAX Slack](https://sgl-fru7574.slack.com/archives/C09EBE5HT5X)
