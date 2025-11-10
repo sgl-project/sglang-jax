@@ -120,6 +120,8 @@ def load_model(server_args, port_args, tp_rank):
     # moe_ep_rank = tp_rank // (server_args.tp_size // server_args.ep_size)
 
     model_config = ModelConfig.from_server_args(server_args)
+    # logging.info("load_model num_hidden_layers: %s", model_config.num_hidden_layers)
+    # model_config.num_hidden_layers = 1 #for debugging
 
 
     # Create a mesh that includes both 'data' and 'tensor' axes.
@@ -237,10 +239,6 @@ def extend(reqs, model_runner):
     else:
         token_needed = int(np.sum(np.array(batch.seq_lens, dtype=np.int64)))
     next_token_ids, next_token_logits = _run_forward_and_sample(model_runner, batch, token_needed)
-    # if not isinstance(next_token_ids, np.ndarray):
-    #     raise ValueError(f"next_token_ids is not a numpy array: {type(next_token_ids)}")
-    # else:
-    #     print("extend done")
     return next_token_ids, next_token_logits, batch
 
 
@@ -251,6 +249,7 @@ def decode(input_token_ids, batch: ScheduleBatch, model_runner):
     # For decode, the token dimension equals current batch size
     bs_needed = len(batch.seq_lens)
     next_token_ids, next_token_logits = _run_forward_and_sample(model_runner, batch, bs_needed)
+    logging.info("next token logits: %s", next_token_logits)
     return next_token_ids, next_token_logits
 
 
@@ -581,6 +580,7 @@ def main(server_args, bench_args):
 
 if __name__ == "__main__":
     jax.distributed.initialize()
+    logging.info("JAX distributed initialized")
     parser = argparse.ArgumentParser()
     ServerArgs.add_cli_args(parser)
     BenchArgs.add_cli_args(parser)
