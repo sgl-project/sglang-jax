@@ -4,18 +4,30 @@ on: [ pull_request ]
 
 jobs:
   lint:
-    runs-on: cpu-runner
+    runs-on: arc-runner-cpu
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v4
-        with:
-          python-version: '3.12'
-
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - name: Install Python 3.12 and dependencies
+        shell: bash
+        run: |
+          sudo apt update
+          sudo apt install -y software-properties-common
+          sudo add-apt-repository -y ppa:deadsnakes/ppa
+          sudo apt update
+          sudo apt install -y \
+              python3.12 \
+              python3.12-venv \
+              python3.12-dev \
+              python3-pip \
+              git \
+              curl \
+              procps \
+              build-essential
+          python3.12 --version
       - name: Install pre-commit hook
         run: |
-          python -m pip install pre-commit
+          python3.12 -m pip install pre-commit
           pre-commit install
 
       - name: Linting
