@@ -2,6 +2,7 @@ import glob
 import logging
 import os
 from dataclasses import dataclass
+from re import M
 
 import jax
 import jax.numpy as jnp
@@ -24,6 +25,7 @@ class WeightMapping:
     reshape: tuple | None = None
     head_dim_padding: bool = False
     kv_head_padding: bool = False
+    concat_axis: int | None = None
 
     def __post_init__(self):
         if self.sharding is None:
@@ -117,13 +119,21 @@ class WeightLoader:
             self.model_config.num_hidden_layers - 1,
         )
 
+        rank = jax.process_index()
+        idx = 0
         for hf_key, hf_weight in self._iterate_weights():
+            idx += 1
+            if rank == 0:
+                with open("/tmp/debug.txt", "a") as f:
+                    f.write(f"idx: {idx}\n")
+                    f.write(f"hf_key: {hf_key}\n")
+                    f.write(f"hf_weight.shape: {hf_weight.shape}\n")
             if hf_key in regular_mappings:
                 mapping = regular_mappings[hf_key]
                 if isinstance(mapping, (str, list)):
                     mapping = WeightMapping(target_path=mapping)
                 self._process_and_assign_weight(params, hf_key, hf_weight, mapping)
-            elif "mlp.experts." in hf_key and hf_key.endswith(".weight"):
+            elif ("mlp.experts." in hf_key or "block_sparse_moe.experts") and hf_key.endswith(".weight"):
                 if self._is_excluded_layer_weight(hf_key):
                     logger.debug("Skipping excluded MoE expert weight: %s", hf_key)
                     continue
@@ -134,10 +144,15 @@ class WeightLoader:
                     if hf_key in expected_hf_keys:
                         if moe_key not in moe_buffer:
                             moe_buffer[moe_key] = {}
-                        moe_buffer[moe_key][hf_key] = hf_weight
+                        if hf_key not in moe_buffer[moe_key]:
+                            moe_buffer[moe_key][hf_key] = []
+                        moe_buffer[moe_key][hf_key].append(hf_weight)
                         assigned = True
 
                         if len(moe_buffer[moe_key]) == len(expected_hf_keys):
+                            shard_counts = [len(v) for v in moe_buffer[moe_key].values()]
+                            if len(set(shard_counts)) != 1 or shard_counts[0] != 8:
+                                continue
                             self._process_single_moe_group(
                                 params, moe_key, mapping, moe_buffer[moe_key]
                             )
@@ -145,7 +160,8 @@ class WeightLoader:
                         break
 
                 if not assigned:
-                    logger.warning("MoE expert weight not assigned to any mapping: %s", hf_key)
+                    # logger.warning("MoE expert weight not assigned to any mapping: %s", hf_key)
+                    pass # TODO: add warning, right now just for debugging
             else:
                 if self._is_excluded_layer_weight(hf_key):
                     logger.debug("Skipping excluded layer weight: %s", hf_key)
@@ -162,23 +178,37 @@ class WeightLoader:
             raise RuntimeError("Incomplete MoE expert weights detected.")
 
         nnx.update(self.model, params)
+        with open("/tmp/debug.txt", "a") as f:
+            f.write("updated params\n")
+            f.write(f"params: {params}\n")
 
     def _process_single_moe_group(
         self,
         params: nnx.State,
         moe_key: str,
         mapping: WeightMapping,
-        expert_weights_dict: dict[str, jax.Array],
+        expert_weights_dict: dict[str, list[jax.Array]],
     ):
         target_path = mapping.target_path[0]
         expected_hf_keys = mapping.target_path[1:]
 
         collected_weights = []
         for hf_key in expected_hf_keys:
-            weight = expert_weights_dict[hf_key]
+            weights = expert_weights_dict[hf_key]
+            # concat weights along axis 0
+            if hf_key.split(".")[-2] == "w2":
+                logging.info("hf_key: %s", hf_key)
+                logging.info("weight shape: %s", weights[0].shape)
+                logging.info("mapping.concat_axis: %s", mapping.concat_axis)
+                logging.info("transpose: %s", mapping.transpose)
+                
+            if mapping.concat_axis is not None:
+                weights = jnp.concatenate(weights, axis=mapping.concat_axis)
             if mapping.transpose and not hf_key.endswith(".bias"):
-                weight = jnp.transpose(weight, (1, 0))
-            collected_weights.append(weight)
+                weights = jnp.transpose(weights, (1, 0))
+            # logging.info("weights.shape: %s", weights.shape)
+            # logging.info("first 100 weights: %s", weights[:10, :100])
+            collected_weights.append(weights)
 
         stacked_weight = jnp.stack(collected_weights, axis=0)  # (num_experts, ...)
 
@@ -197,6 +227,9 @@ class WeightLoader:
             sharded_weight = self._shard_weight(stacked_weight, mapping.sharding)
 
         model_param = self._get_param(params, target_path)
+        logging.info("param name: %s", target_path)
+        # logging.info("model_param.value.shape: %s", model_param.value.shape)
+        # logging.info("target_path: %s", target_path)
         model_param.value = sharded_weight.astype(model_param.value.dtype)
 
         logger.debug("Assigned MoE group %s, shape: %s", moe_key, stacked_weight.shape)
