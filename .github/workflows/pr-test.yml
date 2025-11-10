@@ -27,7 +27,7 @@ concurrency:
 jobs:
   e2e-test-1-tpu:
     if: github.event.pull_request.draft == false
-    runs-on: tpu-runner-v6e-1
+    runs-on: arc-runner-v6e-1
     strategy:
       fail-fast: false
     steps:
@@ -63,7 +63,7 @@ jobs:
 
   e2e-test-4-tpu:
     if: github.event.pull_request.draft == false
-    runs-on: tpu-runner-v6e-4
+    runs-on: arc-runner-v6e-1
     strategy:
       fail-fast: false
     steps:
@@ -190,9 +190,9 @@ jobs:
   pr-test-finish:
     needs: [
       e2e-test-1-tpu,
-      # e2e-test-4-tpu,
+      e2e-test-4-tpu,
     ]
-    runs-on: cpu-runner
+    runs-on: arc-runner-v6e-1
     steps:
       - name: Check all dependent job statuses
         run: |
