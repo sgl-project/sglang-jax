@@ -2,6 +2,7 @@ import logging
 
 import jax
 import jax.lax
+import numpy as np
 from flax import nnx
 from jax import numpy as jnp
 from transformers import PretrainedConfig
@@ -27,6 +28,27 @@ from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
 logger = logging.getLogger(__name__)
 
 init_fn = nnx.initializers.uniform()
+
+
+# Debug helper function for io_callback
+def _save_array_to_file(arr: np.ndarray, filename: str):
+    """Save numpy array to file using io_callback."""
+    import os
+
+    os.makedirs("debug_dumps", exist_ok=True)
+    filepath = os.path.join("debug_dumps", filename)
+    np.save(filepath, arr)
+    logger.info("Saved array shape {x} to {y}", x=arr.shape, y=filepath)
+
+
+def save_jax_array(jax_arr: jax.Array, filename: str):
+    """Use io_callback to save JAX array to file during execution."""
+    jax.experimental.io_callback(
+        _save_array_to_file,
+        None,  # No return value
+        jax_arr,
+        filename,
+    )
 
 
 def _yarn_linear_ramp_mask(low: float, high: float, dim: int, dtype: jnp.dtype) -> jax.Array:
@@ -266,16 +288,22 @@ class Grok1MoE(nnx.Module):
             x=self.gate.weight,
         )
 
-        # Manually compute router logits like sglang's router kernel
-        # This ensures we match sglang's exact computation path:
-        # 1. Convert to float32
-        # 2. Compute logits = hidden @ weight.T
-        # 3. Apply softcapping
-        hidden_fp32 = hidden_states.astype(jnp.float32)
-        weight_fp32 = self.gate.weight.value.astype(jnp.float32)  # (num_experts, hidden_size)
+        # 🔍 DEBUG: Dump hidden_states and gate weight for manual verification
+        # Only dump for layer 0 to avoid too many files
+        if self.layer_id == 0:
+            # Convert to float32 for accurate verification
+            hidden_fp32 = hidden_states.astype(jnp.float32)
+            weight_fp32 = self.gate.weight.value.astype(jnp.float32)
 
-        # Compute router_logits: (batch, num_experts)
-        router_logits = hidden_fp32 @ weight_fp32
+            # Save inputs
+            save_jax_array(hidden_fp32, "layer_0_hidden_states_fp32.npy")
+            save_jax_array(weight_fp32, "layer_0_gate_weight_fp32.npy")
+
+        router_logits = self.gate(hidden_states)
+
+        # 🔍 DEBUG: Dump router_logits result
+        if self.layer_id == 0:
+            save_jax_array(router_logits, "layer_0_router_logits_output.npy")
 
         jax.debug.print(
             "Layer {layer_id}: router_logits AFTER gate {x}",
