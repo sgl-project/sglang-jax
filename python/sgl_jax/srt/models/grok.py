@@ -226,6 +226,7 @@ class Grok1MoE(nnx.Module):
         self.hidden_size = hidden_size
         self.dtype = dtype
         self.top_k = top_k
+        self.layer_id = layer_id
 
         # Gate always runs at full precision for stability
         # (see https://arxiv.org/pdf/2101.03961)
