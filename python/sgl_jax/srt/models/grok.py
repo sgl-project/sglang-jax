@@ -510,6 +510,13 @@ class Grok1DecoderLayer(nnx.Module):
             # First layer or no deferred norm - use fused_rmsnorm equivalent
             hidden_states, residual = self.pre_attn_norm(hidden_states), hidden_states
 
+        # === ADDED DEBUG PRINT (Before Attention) ===
+        jax.debug.print(
+            "Layer {layer_id}: hidden_states BEFORE attention {x}",
+            layer_id=self.layer_id,
+            x=hidden_states,
+        )
+
         # Self-attention
         hidden_states = self.self_attn(
             positions=positions,
@@ -518,6 +525,12 @@ class Grok1DecoderLayer(nnx.Module):
             token_to_kv_pool=token_to_kv_pool,
         )
 
+        # === ADDED DEBUG PRINT (After Attention) ===
+        jax.debug.print(
+            "Layer {layer_id}: hidden_states AFTER attention {x}",
+            layer_id=self.layer_id,
+            x=hidden_states,
+        )
         # logging.info(f"hidden_states after attention: {hidden_states}")
 
         # Apply post-attention norm and pre-MoE norm (matching PyTorch fused_dual_residual_rmsnorm)
@@ -535,6 +548,12 @@ class Grok1DecoderLayer(nnx.Module):
         else:
             hidden_states = self.block_sparse_moe(hidden_states)
 
+        # === ADDED DEBUG PRINT (After MLP/MoE) ===
+        jax.debug.print(
+            "Layer {layer_id}: hidden_states AFTER moe/mlp {x}",
+            layer_id=self.layer_id,
+            x=hidden_states,
+        )
         # logging.info(f"hidden_states after moe: {hidden_states}")
 
         # Return with deferred post-MoE norm (matching PyTorch)
@@ -713,6 +732,10 @@ class Grok1ForCausalLM(nnx.Module):
         positions = forward_batch.positions
         hidden_states = self.model(input_ids, positions, forward_batch, token_to_kv_pool, None)
         output = self.logits_processor(hidden_states, self.lm_head, logits_metadata)
+
+        # === ADDED DEBUG PRINT (Final Logits) ===
+        jax.debug.print("Final next_token_logits {x}", x=output)
+
         # Return values consistent with other models: (output, layers_kv_fused, layers_callback_flag)
         # Grok model does not expose per-layer KV tensors here, so return an empty list and True flag.
         return output, [], True
