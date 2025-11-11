@@ -387,8 +387,29 @@ class Grok1Attention(nnx.Module):
         k, _ = self.k_proj(hidden_states)
         v, _ = self.v_proj(hidden_states)
 
+        jax.debug.print(
+            "Layer {layer_id}: q BEFORE rotary {x}",
+            layer_id=self.layer_id,
+            x=q,
+        )
+        jax.debug.print(
+            "Layer {layer_id}: k BEFORE rotary {x}",
+            layer_id=self.layer_id,
+            x=k,
+        )
+
         # Apply rotary position embeddings
         q, k = self.rotary_emb(positions, q, k)
+        jax.debug.print(
+            "Layer {layer_id}: q AFTER rotary {x}",
+            layer_id=self.layer_id,
+            x=q,
+        )
+        jax.debug.print(
+            "Layer {layer_id}: k AFTER rotary {x}",
+            layer_id=self.layer_id,
+            x=k,
+        )
 
         q = q.reshape(-1, self.num_heads, self.head_dim)
         k = k.reshape(-1, self.num_kv_heads, self.head_dim)
@@ -397,6 +418,12 @@ class Grok1Attention(nnx.Module):
         # Apply attention (backend may return tuple)
         attn_ret = self.attn(q, k, v, forward_batch, token_to_kv_pool)
         attn_output = attn_ret[0] if isinstance(attn_ret, tuple) else attn_ret
+
+        jax.debug.print(
+            "Layer {layer_id}: attn_output BEFORE o_proj {x}",
+            layer_id=self.layer_id,
+            x=attn_output,
+        )
 
         # Project output
         output, _ = self.o_proj(attn_output)
