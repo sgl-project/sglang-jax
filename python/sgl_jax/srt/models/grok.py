@@ -261,6 +261,11 @@ class Grok1MoE(nnx.Module):
             layer_id=self.layer_id,
             x=hidden_states,
         )
+        jax.debug.print(
+            "Layer {layer_id}: gate weight {x}",
+            layer_id=self.layer_id,
+            x=self.gate.weight,
+        )
         router_logits, _ = self.gate(hidden_states)
         jax.debug.print(
             "Layer {layer_id}: router_logits AFTER gate {x}",
@@ -277,6 +282,32 @@ class Grok1MoE(nnx.Module):
         top_k_weights = jax.nn.softmax(top_k_logits.astype(self.dtype), axis=-1)
         top_k_weights = top_k_weights.astype(self.dtype)
         top_k_weights = top_k_weights / jnp.sum(top_k_weights, axis=-1, keepdims=True)
+
+        jax.debug.print(
+            "Layer {layer_id}: top_k_weights {x}",
+            layer_id=self.layer_id,
+            x=top_k_weights,
+        )
+        jax.debug.print(
+            "Layer {layer_id}: top_k_indices {x}",
+            layer_id=self.layer_id,
+            x=top_k_indices,
+        )
+        jax.debug.print(
+            "Layer {layer_id}: first expert weight wi_0 {x}",
+            layer_id=self.layer_id,
+            x=self.experts.wi_0.value[0],
+        )
+        jax.debug.print(
+            "Layer {layer_id}: first expert weight wi_1 {x}",
+            layer_id=self.layer_id,
+            x=self.experts.wi_1.value[0],
+        )
+        jax.debug.print(
+            "Layer {layer_id}: first expert weight wo {x}",
+            layer_id=self.layer_id,
+            x=self.experts.wo.value[0],
+        )
 
         result = self.experts(hidden_states, top_k_weights, top_k_indices)
         jax.debug.print(
