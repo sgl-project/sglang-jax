@@ -426,6 +426,11 @@ class Grok1Attention(nnx.Module):
 
         # Project output
         output, _ = self.o_proj(attn_output)
+        jax.debug.print(
+            "Layer {layer_id}: output AFTER o_proj {x}",
+            layer_id=self.layer_id,
+            x=output,
+        )
         return output
 
 
