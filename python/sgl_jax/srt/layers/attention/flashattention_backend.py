@@ -8,10 +8,10 @@ from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 from jax.tree_util import register_pytree_node_class
 
-from sgl_jax.srt.layers.attention.base_attn_backend import AttentionBackend
-from sgl_jax.srt.layers.attention.flash_attn_kernel.flash_attention import (
+from sgl_jax.srt.kernels.ragged_paged_attention.ragged_paged_attention import (
     ragged_paged_attention,
 )
+from sgl_jax.srt.layers.attention.base_attn_backend import AttentionBackend
 from sgl_jax.srt.layers.radix_attention import RadixAttention
 from sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch
 from sgl_jax.srt.mem_cache.memory_pool import KVCache
