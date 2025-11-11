@@ -297,7 +297,7 @@ def build_tree_kernel_efficient(
     token_list: list[jax.Array],
     parents_list: list[jax.Array],
     seq_lens: jax.Array,
-    seq_lens_sum: int,
+    seq_lens_sum: jax.Array,
     topk: int,
     num_verify_tokens: int,
     max_seq_len_per_req: int,
@@ -335,6 +335,7 @@ def build_tree_kernel_efficient(
         except AttributeError:
             ctx = mesh
     with ctx:
+
         tree_mask, positions, retrive_index, retrive_next_token, retrive_next_sibling = (
             build_eagle_tree_structure(
                 parent_list=parent_list,
@@ -479,7 +480,7 @@ class EagleDraftInput:
         batch_output: GenerationBatchResult,
         precompile_token_paddings,
         precompile_bs_paddings,
-        precompile_cache_loc_paddings
+        precompile_cache_loc_paddings,
     ):
         seq_lens_cpu_ = model_worker_batch.seq_lens
 
@@ -487,7 +488,9 @@ class EagleDraftInput:
         verified_id = batch_output.next_draft_input.verified_id
         verified_id = verified_id[verified_id != 0].flatten()
         model_worker_batch.input_ids = verified_id
-        model_worker_batch.seq_lens = model_worker_batch.seq_lens[:model_worker_batch.real_bs] + batch_output.accept_lens
+        model_worker_batch.seq_lens = (
+            model_worker_batch.seq_lens[: model_worker_batch.real_bs] + batch_output.accept_lens
+        )
         model_worker_batch.extend_seq_lens = np.asarray(
             [batch_output.accept_lens[i] for i in range(batch_output.accept_lens.shape[0])]
         )
@@ -503,12 +506,18 @@ class EagleDraftInput:
         )
         draft_model_runner.attn_backend.forward_metadata = forward_metadata
         from sgl_jax.srt.layers.logits_processor import LogitsMetadata
-        logits_metadata = LogitsMetadata.from_model_worker_batch(model_worker_batch, draft_model_runner.mesh)
+
+        logits_metadata = LogitsMetadata.from_model_worker_batch(
+            model_worker_batch, draft_model_runner.mesh
+        )
         model_worker_batch.padding_model_worker_batch(
             precompile_token_paddings, precompile_bs_paddings, precompile_cache_loc_paddings
         )
         hidden_states = model_worker_batch.spec_info.hidden_states
-        if hidden_states is not None and hidden_states.shape[0] < model_worker_batch.input_ids.shape[0]:
+        if (
+            hidden_states is not None
+            and hidden_states.shape[0] < model_worker_batch.input_ids.shape[0]
+        ):
             pad_len = model_worker_batch.input_ids.shape[0] - hidden_states.shape[0]
             pad_shape = (pad_len,) + hidden_states.shape[1:]
             pad_values = jnp.zeros(pad_shape, dtype=hidden_states.dtype)
@@ -580,7 +589,7 @@ class EagleDraftInput:
         # we don't need process outcache_loc because we don't need this in attention backend
         # out_cache_loc = np.empty((bs * topk * num_steps), dtype=np.int32)
         # model_worker_batch.out_cache_loc = out_cache_loc
-        model_worker_batch.seq_lens_sum = int(jnp.sum(model_worker_batch.seq_lens))
+        model_worker_batch.seq_lens_sum = jnp.sum(model_worker_batch.seq_lens)
         model_worker_batch.return_hidden_states = False
         model_worker_batch.spec_info.positions = jnp.repeat(model_worker_batch.seq_lens, topk)
 
@@ -837,7 +846,6 @@ class EagleVerifyInput:
         candidates = self.draft_token.reshape(bs, self.draft_token_num)
         sampling_info = model_worker_batch.sampling_info
 
-
         predict_shape = list(logits_output.next_token_logits.shape)[:-1]
         predict_shape[-1] += 1
         predict = jnp.empty(predict_shape, dtype=jnp.int32)
@@ -890,9 +898,7 @@ class EagleVerifyInput:
                         f"\033[32m accept rate is {np.sum(accept_length) / (accept_length.shape[0] * (self.draft_token_num - 1))}\033[0m"
                     )
                 else:
-                    print(
-                        f"\033[31m accept rate is 0\033[0m"
-                    )
+                    print("\033[31m accept rate is 0\033[0m")
         else:
             # apply temperature and get target probs
             expanded_temperature = jnp.repeat(

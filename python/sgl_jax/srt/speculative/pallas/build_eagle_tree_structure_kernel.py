@@ -14,6 +14,7 @@ def _build_eagle_tree_structure_kernel(
     selected_index_ref,  # shape: (bs, draft_token_num - 1)
     verified_seq_len_ref,  # shape: (bs,)
     cu_full_mask_len_ref,  # shape: (bs+1,)
+    tree_mask_size_ref,  # shape: (1,)
     # Input
     zeros_ref,  # used for init tree mask output, shape: (batched_tree_mask_capacity, 128)
     ones_ref,  # used for init tree mask output, shape: (batched_tree_mask_capacity, 128)
@@ -25,7 +26,6 @@ def _build_eagle_tree_structure_kernel(
     o_retrive_next_token_ref,  # on SMEM, shape: (bs, draft_token_num)
     o_retrive_next_sibling_ref,  # on SMEM, shape: (bs, draft_token_num)
     *,
-    actual_batched_tree_mask_size: int,
     draft_token_num: int,
     topk: int,
     tree_mask_mode: int = 0,  # FULL_MASK = 0
@@ -34,6 +34,7 @@ def _build_eagle_tree_structure_kernel(
     retrive_output_batch_offset = bid * draft_token_num
     batched_tree_mask_capacity = o_tree_mask_ref.shape[0]
     seq_len = verified_seq_len_ref[bid]
+    actual_batched_tree_mask_size = tree_mask_size_ref[0]
 
     def set_tree_mask(start, offset, val):
         def set_true():
@@ -311,7 +312,6 @@ def _build_eagle_tree_structure_kernel(
     static_argnames=[
         "draft_token_num",
         "topk",
-        "seq_lens_sum",
         "max_context_len",
         "tree_mask_mode",
     ],
@@ -320,10 +320,10 @@ def build_eagle_tree_structure_pallas_call(
     parent_list: jax.Array,
     selected_index: jax.Array,
     verified_seq_len: jax.Array,
+    seq_lens_sum: jax.Array,
     *,
     draft_token_num: int,
     topk: int,
-    seq_lens_sum: int,
     max_context_len: int,
     tree_mask_mode: int = 0,  # FULL_MASK = 0
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
@@ -342,11 +342,13 @@ def build_eagle_tree_structure_pallas_call(
         [jnp.array([0], dtype=jnp.int32), jnp.cumsum(verified_seq_len + draft_token_num)]
     )
 
+    tree_mask_size = jnp.asarray(tree_mask_size, dtype=jnp.int32).reshape(1)
     scalar_prefetches = (
         parent_list,
         selected_index,
         verified_seq_len,
         cu_full_mask_len,
+        tree_mask_size,
     )
 
     in_specs = [
@@ -388,7 +390,6 @@ def build_eagle_tree_structure_pallas_call(
     kernel = pl.pallas_call(
         partial(
             _build_eagle_tree_structure_kernel,
-            actual_batched_tree_mask_size=tree_mask_size,
             draft_token_num=draft_token_num,
             topk=topk,
             tree_mask_mode=tree_mask_mode,
@@ -425,7 +426,6 @@ def build_eagle_tree_structure_pallas_call(
     static_argnames=(
         "draft_token_num",
         "topk",
-        "seq_lens_sum",
         "max_context_len",
         "tree_mask_mode",
     ),
@@ -434,9 +434,9 @@ def build_eagle_tree_structure(
     parent_list: jax.Array,
     selected_index: jax.Array,
     verified_seq_len: jax.Array,
+    seq_lens_sum: jax.Array,
     draft_token_num: int,
     topk: int,
-    seq_lens_sum: int,
     max_context_len: int,
     tree_mask_mode: int = 0,  # FULL_MASK = 0
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
@@ -460,6 +460,7 @@ def build_eagle_tree_structure(
         P(),  # parent_list
         P(),  # selected_index
         P(),  # verified_seq_len
+        P(),  # seq_lens_sum
     )
     out_specs = (
         P(),  # tree_mask
@@ -472,7 +473,6 @@ def build_eagle_tree_structure(
         build_eagle_tree_structure_pallas_call,
         draft_token_num=draft_token_num,
         topk=topk,
-        seq_lens_sum=seq_lens_sum,
         max_context_len=max_context_len,
         tree_mask_mode=tree_mask_mode,
     )
@@ -491,5 +491,6 @@ def build_eagle_tree_structure(
         parent_list,
         selected_index,
         verified_seq_len,
+        seq_lens_sum,
     )
     return tree_mask, positions, retrive_index, retrive_next_token, retrive_next_sibling
