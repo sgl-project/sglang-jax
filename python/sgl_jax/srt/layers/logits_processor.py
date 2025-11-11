@@ -210,9 +210,12 @@ class LogitsMetadata:
 class LogitsProcessor(nnx.Module):
     """Logits processor for the model."""
 
-    def __init__(self, vocab_size: int, mesh: Mesh):
+    def __init__(self, vocab_size: int, mesh: Mesh, config=None):
         self.vocab_size = vocab_size
         self.mesh = mesh
+        self.final_logit_softcapping = (
+            getattr(config, "final_logit_softcapping", 0.0) if config else 0.0
+        )
 
     def __call__(
         self,
@@ -448,5 +451,10 @@ class LogitsProcessor(nnx.Module):
         logits = jnp.dot(hidden_states, embedding.T)
 
         logits = logits[:, : self.vocab_size] if logits.ndim > 1 else logits[: self.vocab_size]
+
+        # Apply final logit soft capping (for Grok models)
+        if self.final_logit_softcapping > 0:
+            logits = logits / self.final_logit_softcapping
+            logits = jnp.tanh(logits) * self.final_logit_softcapping
 
         return logits

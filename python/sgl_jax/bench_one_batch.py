@@ -115,11 +115,14 @@ class BenchArgs:
 
 def load_model(server_args, port_args, tp_rank):
     # TODO: pass in tp_size
-    # server_args.tp_size = 1
+    # server_args.tp_size = 16
     rank_print = print if tp_rank == 0 else lambda *args, **kwargs: None
     # moe_ep_rank = tp_rank // (server_args.tp_size // server_args.ep_size)
 
     model_config = ModelConfig.from_server_args(server_args)
+    # logging.info("load_model num_hidden_layers: %s", model_config.num_hidden_layers)
+    # model_config.num_hidden_layers = 1 #for debugging
+
 
     # Create a mesh that includes both 'data' and 'tensor' axes.
     # Use a size-1 'data' axis and shard across the 'tensor' axis per tp_size.
@@ -137,6 +140,7 @@ def load_model(server_args, port_args, tp_rank):
         mesh=mesh,
     )
     rank_print(f"max_total_num_tokens={model_runner.max_total_num_tokens}")
+
     tokenizer = get_tokenizer(
         server_args.tokenizer_path,
         tokenizer_mode=server_args.tokenizer_mode,
@@ -146,7 +150,7 @@ def load_model(server_args, port_args, tp_rank):
         try:
             jax_mh.sync_global_devices("load_model")
         except Exception as err:
-            logging.info("Could not sync global devices (expected in single-host): %s", err)
+            logging.info("Could not sync global devices (expected in single-host): %s", err)  
     return model_runner, tokenizer
 
 
@@ -238,13 +242,14 @@ def extend(reqs, model_runner):
     return next_token_ids, next_token_logits, batch
 
 
-def decode(input_token_ids, batch, model_runner):
+def decode(input_token_ids, batch: ScheduleBatch, model_runner):
     batch.output_ids = input_token_ids
     batch.prepare_for_decode()
     _maybe_prepare_mlp_sync_batch(batch, model_runner)
     # For decode, the token dimension equals current batch size
     bs_needed = len(batch.seq_lens)
     next_token_ids, next_token_logits = _run_forward_and_sample(model_runner, batch, bs_needed)
+    logging.info("next token logits: %s", next_token_logits)
     return next_token_ids, next_token_logits
 
 
@@ -269,7 +274,7 @@ def _run_forward_and_sample(model_runner, batch: ScheduleBatch, token_first_arg:
         )
     )
 
-    model_worker_batch = batch.get_model_worker_batch(
+    model_worker_batch : ModelWorkerBatch = batch.get_model_worker_batch(
         [token_first_arg], [bs_needed], [cache_loc_needed], page_size
     )
 
@@ -284,7 +289,7 @@ def _run_forward_and_sample(model_runner, batch: ScheduleBatch, token_first_arg:
     positions = model_worker_batch.positions
 
     logits_output, _ = model_runner.forward(forward_batch, logits_metadata=logits_metadata)
-
+    
     pad_size = len(model_worker_batch.seq_lens) - model_worker_batch.real_bs
     sampling_metadata = SamplingMetadata.from_model_worker_batch(
         model_worker_batch,
@@ -293,6 +298,7 @@ def _run_forward_and_sample(model_runner, batch: ScheduleBatch, token_first_arg:
         vocab_size=model_runner.model_config.vocab_size,
     )
     next_token_ids = model_runner.sample(logits_output, sampling_metadata, positions)
+    # NOTE(Bob): seems that now next_token_ids is a jax array, not a numpy array
 
     return next_token_ids, logits_output.next_token_logits
 
@@ -317,22 +323,29 @@ def correctness_test(
     if bench_args.cut_len > 0:
         # Prefill
         next_token_ids, next_token_logits, batch = extend(reqs, model_runner)
-        rank_print(f"prefill logits (first half): {next_token_logits} \n")
+        if tp_rank == 0:
+            gathered_logits = jax_mh.process_allgather(next_token_logits, tiled=True)
+            rank_print(f"prefill logits (first half): {gathered_logits} \n")
 
     # Prepare extend inputs
     reqs = prepare_extend_inputs_for_correctness_test(bench_args, input_ids, reqs, model_runner)
 
     # Extend (prefill w/ KV cache)
     next_token_ids, next_token_logits, batch = extend(reqs, model_runner)
-    rank_print(f"prefill logits (final): {next_token_logits} \n")
+    gathered_token_ids = jax_mh.process_allgather(next_token_ids, tiled=True)
+    next_token_ids_cpu = np.array(gathered_token_ids)
+    if tp_rank == 0:
+        gathered_logits = jax_mh.process_allgather(next_token_logits, tiled=True)
+        rank_print(f"prefill logits (final): {gathered_logits} \n")
 
     # Decode
-    output_ids = [input_ids[i] + [next_token_ids[i]] for i in range(len(input_ids))]
-    for _ in range(bench_args.output_len[0] - 1):
-        next_token_ids, _ = decode(next_token_ids, batch, model_runner)
-        next_token_ids_list = next_token_ids.tolist()
+    output_ids = [input_ids[i] + [next_token_ids_cpu[i]] for i in range(len(input_ids))]
+    for step in range(bench_args.output_len[0] - 1):
+        next_token_ids, _ = decode(next_token_ids_cpu, batch, model_runner)
+        gathered_token_ids = jax_mh.process_allgather(next_token_ids, tiled=True)
+        next_token_ids_cpu = np.array(gathered_token_ids)
         for i in range(len(reqs)):
-            output_ids[i].append(next_token_ids_list[i])
+            output_ids[i].append(next_token_ids_cpu[i])
 
     # Print output texts
     for i in range(len(reqs)):
@@ -566,6 +579,8 @@ def main(server_args, bench_args):
 
 
 if __name__ == "__main__":
+    jax.distributed.initialize()
+    logging.info("JAX distributed initialized")
     parser = argparse.ArgumentParser()
     ServerArgs.add_cli_args(parser)
     BenchArgs.add_cli_args(parser)

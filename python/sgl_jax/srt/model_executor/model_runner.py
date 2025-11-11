@@ -186,6 +186,7 @@ class ModelRunner:
             )
 
         self.jitted_run_model = run_model_wrapper
+
         self.jitted_sampler = partial(
             jitted_sampler,
             sampler_def,
@@ -209,9 +210,15 @@ class ModelRunner:
                     local_device_memory * 0.9,
                 )
             else:
-                raise ValueError(
-                    f"The memory capacity is unbalanced. min_available_device_memory={min_available_device_memory}, local_device_memory={local_device_memory}, local_device_memory*0.9={local_device_memory * 0.9}"
+                logging.warning(
+                    "The memory capacity is unbalanced. min_available_device_memory=%s, local_device_memory=%s, local_device_memory*0.9=%s",
+                    min_available_device_memory,
+                    local_device_memory,
+                    local_device_memory * 0.9,
                 )
+                # raise ValueError(
+                #     f"The memory capacity is unbalanced. min_available_device_memory={min_available_device_memory}, local_device_memory={local_device_memory}, local_device_memory*0.9={local_device_memory * 0.9}"
+                # )
 
         return min_available_device_memory
 
@@ -224,7 +231,6 @@ class ModelRunner:
         self.model = self.model_loader.load_model(
             model_config=self.model_config,
         )
-
         self.dtype = self.model_config.dtype
         self.start_layer = getattr(self.model, "start_layer", 0)
         self.end_layer = getattr(self.model, "end_layer", self.model_config.num_hidden_layers)
