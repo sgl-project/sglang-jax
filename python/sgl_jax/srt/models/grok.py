@@ -254,7 +254,17 @@ class Grok1MoE(nnx.Module):
 
     def __call__(self, hidden_states: jax.Array) -> jax.Array:
         # Router computation with soft capping
+        jax.debug.print(
+            "Layer {layer_id}: hidden_states BEFORE gate {x}",
+            layer_id=self.layer_id,
+            x=hidden_states,
+        )
         router_logits, _ = self.gate(hidden_states)
+        jax.debug.print(
+            "Layer {layer_id}: router_logits AFTER gate {x}",
+            layer_id=self.layer_id,
+            x=router_logits,
+        )
 
         # Apply soft capping for stability (matching PyTorch implementation)
         if self.router_logit_softcapping != 0:
@@ -266,7 +276,13 @@ class Grok1MoE(nnx.Module):
         top_k_weights = top_k_weights.astype(self.dtype)
         top_k_weights = top_k_weights / jnp.sum(top_k_weights, axis=-1, keepdims=True)
 
-        return self.experts(hidden_states, top_k_weights, top_k_indices)
+        result = self.experts(hidden_states, top_k_weights, top_k_indices)
+        jax.debug.print(
+            "Layer {layer_id}: result AFTER experts {x}",
+            layer_id=self.layer_id,
+            x=result,
+        )
+        return result
 
 
 class Grok1Attention(nnx.Module):
