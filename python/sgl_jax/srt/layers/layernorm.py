@@ -201,5 +201,5 @@ def dual_rmsnorm_forward(
     norm with weight1 to produce y1 (discarded), then norm with weight2 to produce y2.
     """
     y1, residual_out = rmsnorm_forward(x, residual, weight1, epsilon)
-    y2, _ = rmsnorm_forward(x, residual, weight2, epsilon)
+    y2, _ = rmsnorm_forward(y1, residual, weight2, epsilon)
     return y2, residual_out
