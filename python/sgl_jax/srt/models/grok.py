@@ -729,6 +729,7 @@ class Grok1ForCausalLM(nnx.Module):
         """Forward pass through the model using unified forward_batch API."""
         input_ids = forward_batch.input_ids
         positions = forward_batch.positions
+        jax.debug.print("input_ids {input_ids}", input_ids=input_ids)
         hidden_states = self.model(input_ids, positions, forward_batch, token_to_kv_pool, None)
         output = self.logits_processor(hidden_states, self.lm_head, logits_metadata)
 
