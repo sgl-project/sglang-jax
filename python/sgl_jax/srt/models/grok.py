@@ -266,22 +266,41 @@ class Grok1MoE(nnx.Module):
             layer_id=self.layer_id,
             x=self.gate.weight,
         )
-        router_logits, _ = self.gate(hidden_states)
+
+        # Manually compute router logits like sglang's router kernel
+        # This ensures we match sglang's exact computation path:
+        # 1. Convert to float32
+        # 2. Compute logits = hidden @ weight.T
+        # 3. Apply softcapping
+        hidden_fp32 = hidden_states.astype(jnp.float32)
+        weight_fp32 = self.gate.weight.value.astype(jnp.float32)  # (num_experts, hidden_size)
+
+        # Compute router_logits: (batch, num_experts)
+        router_logits = hidden_fp32 @ weight_fp32
+
         jax.debug.print(
             "Layer {layer_id}: router_logits AFTER gate {x}",
             layer_id=self.layer_id,
             x=router_logits,
         )
 
-        # Apply soft capping for stability (matching PyTorch implementation)
+        # Apply soft capping for stability (matching sglang implementation)
         if self.router_logit_softcapping != 0:
             router_logits = router_logits / self.router_logit_softcapping
             router_logits = jax.nn.tanh(router_logits) * self.router_logit_softcapping
 
-        top_k_logits, top_k_indices = jax.lax.top_k(router_logits, self.top_k)
-        top_k_weights = jax.nn.softmax(top_k_logits.astype(self.dtype), axis=-1)
-        top_k_weights = top_k_weights.astype(self.dtype)
-        top_k_weights = top_k_weights / jnp.sum(top_k_weights, axis=-1, keepdims=True)
+        jax.debug.print(
+            "router_logits: {x}",
+            x=router_logits,
+        )
+
+        # Compute top-k routing weights using sglang-style approach:
+        # 1. Compute global softmax over ALL experts (not just top-k)
+        # 2. Select top-k experts based on logits
+        # 3. Extract corresponding weights (no renormalization)
+        top_k_weights, top_k_indices = self._custom_topk(
+            router_logits, self.top_k, renormalize=False
+        )
 
         jax.debug.print(
             "Layer {layer_id}: top_k_weights {x}",
@@ -316,6 +335,53 @@ class Grok1MoE(nnx.Module):
             x=result,
         )
         return result
+
+    def _custom_topk(
+        self, router_logits: jax.Array, top_k: int, renormalize: bool = False
+    ) -> tuple[jax.Array, jax.Array]:
+        """
+        Compute top-k routing weights using sglang's approach.
+
+        This matches sglang's fused_moe_router implementation:
+        1. Compute softmax over ALL experts (global normalization)
+        2. Select top-k experts based on original logits
+        3. Extract weights for selected experts
+
+        Key difference from naive approach:
+        - Naive: top_k on logits, then softmax on selected → weights sum to 1
+        - sglang: softmax on all, then select top_k → weights sum to <1
+
+        This preserves the "confidence" of selected experts relative to all experts.
+
+        Args:
+            router_logits: [batch_size, num_experts] logits from gate
+            top_k: number of experts to select
+            renormalize: if True, renormalize selected weights to sum to 1
+
+        Returns:
+            top_k_weights: [batch_size, top_k] weights for selected experts
+            top_k_indices: [batch_size, top_k] indices of selected experts
+        """
+        # Compute global softmax over ALL experts (numerically stable)
+        # This matches sglang's implementation in router.py lines 71-76, 244-246
+        max_logit = jnp.max(router_logits, axis=-1, keepdims=True)
+        exp_logits = jnp.exp(router_logits - max_logit)
+        sum_exp_logits = jnp.sum(exp_logits, axis=-1, keepdims=True)
+        all_weights = exp_logits / sum_exp_logits  # Global softmax weights
+
+        # Select top-k experts based on logits (not weights)
+        # jax.lax.top_k returns values and indices in descending order
+        _, top_k_indices = jax.lax.top_k(router_logits, top_k)
+
+        # Extract weights for the selected top-k experts
+        # Use take_along_axis to gather weights corresponding to top_k_indices
+        top_k_weights = jnp.take_along_axis(all_weights, top_k_indices, axis=-1)
+
+        # Optional: renormalize weights to sum to 1 (sglang uses renormalize=False)
+        if renormalize:
+            top_k_weights = top_k_weights / jnp.sum(top_k_weights, axis=-1, keepdims=True)
+
+        return top_k_weights, top_k_indices
 
 
 class Grok1Attention(nnx.Module):
