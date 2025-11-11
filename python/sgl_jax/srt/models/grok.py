@@ -845,7 +845,7 @@ class Grok1ForCausalLM(nnx.Module):
             f"{prefix}.self_attn.o_proj.weight": WeightMapping(
                 target_path=f"{target_prefix}.self_attn.o_proj.weight",
                 sharding=("tensor", None),
-                transpose=True,
+                transpose=False,
                 head_dim_padding=True,
                 kv_head_padding=False,
             ),
