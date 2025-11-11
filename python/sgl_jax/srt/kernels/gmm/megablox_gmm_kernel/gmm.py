@@ -12,7 +12,7 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from sgl_jax.srt.layers.gmm.megablox_gmm_kernel import common
+from sgl_jax.srt.kernels.gmm.megablox_gmm_kernel import common
 
 
 def _validate_args(

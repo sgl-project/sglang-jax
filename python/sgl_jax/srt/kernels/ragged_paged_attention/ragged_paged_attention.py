@@ -16,10 +16,10 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from sgl_jax.srt.layers.attention.flash_attn_kernel.tuned_block_sizes import (
+from sgl_jax.srt.kernels.ragged_paged_attention.tuned_block_sizes import (
     get_tuned_block_sizes,
 )
-from sgl_jax.srt.layers.attention.flash_attn_kernel.util import (
+from sgl_jax.srt.kernels.ragged_paged_attention.util import (
     align_to,
     cdiv,
     get_dtype_packing,
