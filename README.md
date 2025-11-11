@@ -59,8 +59,7 @@ For detailed performance evaluation and to run the benchmarks yourself, please s
 The project includes a comprehensive test suite to ensure correctness and stability. To run the full suite of tests:
 
 ```bash
-cd test/srt
-python run_suite.py
+python test/srt/run_suite.py
 ```
 
 ## Contributing

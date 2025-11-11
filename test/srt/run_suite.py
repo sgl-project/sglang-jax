@@ -155,9 +155,6 @@ def run_unittest_files(files: List[TestFile], timeout_per_file: float):
 
 
 suites = {
-    "per-commit": [
-        # TestFile("test/srt/test_tpu_availability.py", 3),
-    ],
     "per-commit-tpu-v6e-1": [
         TestFile("test/srt/test_tpu_availability.py", 3),
         TestFile("test/srt/openai_server/basic/test_protocol.py", 10),
@@ -166,6 +163,9 @@ suites = {
         TestFile("test/srt/openai_server/basic/test_openai_server.py", 10),
         TestFile("test/srt/test_qwen2_5_models.py", 15),
         TestFile("test/srt/test_srt_engine.py", 15),
+    ],
+    "per-commit": [
+        # TestFile("test/srt/test_tpu_availability.py", 3),
     ],
     "per-commit-tpu-v6e-2": [],
     "per-commit-tpu-v6e-4": [
