@@ -5,7 +5,7 @@ from jax.experimental.shard_map import shard_map
 from jax.sharding import Mesh
 from jax.sharding import PartitionSpec as P
 
-from sgl_jax.srt.layers.gmm.megablox_gmm_backend import gmm
+from sgl_jax.srt.kernels.gmm.megablox_gmm_backend import gmm
 
 
 class GateLogit(nnx.Module):

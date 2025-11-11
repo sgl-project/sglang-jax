@@ -6,7 +6,7 @@ import jax
 import numpy as np
 from utils import create_decode_uniform_data, create_prefill_uniform_data
 
-from sgl_jax.srt.layers.attention.flash_attn_kernel.flash_attention import (
+from sgl_jax.srt.kernels.ragged_paged_attention.ragged_paged_attention import (
     ragged_paged_attention,
 )
 

@@ -5,7 +5,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from sgl_jax.srt.layers.gmm.megablox_gmm_backend import gmm
+from sgl_jax.srt.kernels.gmm.megablox_gmm_backend import gmm
 
 
 def create_gmm_test_data(
