@@ -226,6 +226,7 @@ class Grok1MoE(nnx.Module):
         self.hidden_size = hidden_size
         self.dtype = dtype
         self.top_k = top_k
+        self.layer_id = layer_id
 
         # Gate always runs at full precision for stability
         # (see https://arxiv.org/pdf/2101.03961)
@@ -254,19 +255,123 @@ class Grok1MoE(nnx.Module):
 
     def __call__(self, hidden_states: jax.Array) -> jax.Array:
         # Router computation with soft capping
+        # jax.debug.print(
+        #     "Layer {layer_id}: hidden_states BEFORE gate {x}",
+        #     layer_id=self.layer_id,
+        #     x=hidden_states,
+        # )
+        # jax.debug.print(
+        #     "Layer {layer_id}: gate weight {x}",
+        #     layer_id=self.layer_id,
+        #     x=self.gate.weight,
+        # )
+
         router_logits, _ = self.gate(hidden_states)
 
-        # Apply soft capping for stability (matching PyTorch implementation)
+        # jax.debug.print(
+        #     "Layer {layer_id}: router_logits AFTER gate {x}",
+        #     layer_id=self.layer_id,
+        #     x=router_logits,
+        # )
+
+        # Apply soft capping for stability (matching sglang implementation)
         if self.router_logit_softcapping != 0:
             router_logits = router_logits / self.router_logit_softcapping
             router_logits = jax.nn.tanh(router_logits) * self.router_logit_softcapping
 
-        top_k_logits, top_k_indices = jax.lax.top_k(router_logits, self.top_k)
-        top_k_weights = jax.nn.softmax(top_k_logits.astype(self.dtype), axis=-1)
-        top_k_weights = top_k_weights.astype(self.dtype)
-        top_k_weights = top_k_weights / jnp.sum(top_k_weights, axis=-1, keepdims=True)
+        # jax.debug.print(
+        #     "router_logits: {x}",
+        #     x=router_logits,
+        # )
 
-        return self.experts(hidden_states, top_k_weights, top_k_indices)
+        # Compute top-k routing weights using sglang-style approach:
+        # 1. Compute global softmax over ALL experts (not just top-k)
+        # 2. Select top-k experts based on logits
+        # 3. Extract corresponding weights (no renormalization)
+        top_k_weights, top_k_indices = self._custom_topk(
+            router_logits, self.top_k, renormalize=False
+        )
+
+        # jax.debug.print(
+        #     "Layer {layer_id}: top_k_weights {x}",
+        #     layer_id=self.layer_id,
+        #     x=top_k_weights,
+        # )
+        # jax.debug.print(
+        #     "Layer {layer_id}: top_k_indices {x}",
+        #     layer_id=self.layer_id,
+        #     x=top_k_indices,
+        # )
+        # jax.debug.print(
+        #     "Layer {layer_id}: first expert weight wi_0 {x}",
+        #     layer_id=self.layer_id,
+        #     x=self.experts.wi_0.value[0],
+        # )
+        # jax.debug.print(
+        #     "Layer {layer_id}: first expert weight wi_1 {x}",
+        #     layer_id=self.layer_id,
+        #     x=self.experts.wi_1.value[0],
+        # )
+        # jax.debug.print(
+        #     "Layer {layer_id}: first expert weight wo {x}",
+        #     layer_id=self.layer_id,
+        #     x=self.experts.wo.value[0],
+        # )
+
+        result = self.experts(hidden_states, top_k_weights, top_k_indices)
+        # jax.debug.print(
+        #     "Layer {layer_id}: result AFTER experts {x}",
+        #     layer_id=self.layer_id,
+        #     x=result,
+        # )
+        return result
+
+    def _custom_topk(
+        self, router_logits: jax.Array, top_k: int, renormalize: bool = False
+    ) -> tuple[jax.Array, jax.Array]:
+        """
+        Compute top-k routing weights using sglang's approach.
+
+        This matches sglang's fused_moe_router implementation:
+        1. Compute softmax over ALL experts (global normalization)
+        2. Select top-k experts based on original logits
+        3. Extract weights for selected experts
+
+        Key difference from naive approach:
+        - Naive: top_k on logits, then softmax on selected → weights sum to 1
+        - sglang: softmax on all, then select top_k → weights sum to <1
+
+        This preserves the "confidence" of selected experts relative to all experts.
+
+        Args:
+            router_logits: [batch_size, num_experts] logits from gate
+            top_k: number of experts to select
+            renormalize: if True, renormalize selected weights to sum to 1
+
+        Returns:
+            top_k_weights: [batch_size, top_k] weights for selected experts
+            top_k_indices: [batch_size, top_k] indices of selected experts
+        """
+        # Compute global softmax over ALL experts (numerically stable)
+        # This matches sglang's implementation in router.py lines 71-76, 244-246
+        max_logit = jnp.max(router_logits, axis=-1, keepdims=True)
+        exp_logits = jnp.exp(router_logits - max_logit)
+        sum_exp_logits = jnp.sum(exp_logits, axis=-1, keepdims=True)
+        all_weights = exp_logits / sum_exp_logits  # Global softmax weights
+
+        # Select top-k experts based on logits (not weights)
+        # jax.lax.top_k returns values and indices in descending order
+        _, top_k_indices = jax.lax.top_k(router_logits, top_k)
+
+        # Extract weights for the selected top-k experts
+        # Use take_along_axis to gather weights corresponding to top_k_indices
+        top_k_weights = jnp.take_along_axis(all_weights, top_k_indices, axis=-1)
+
+        # Optional: renormalize weights to sum to 1 (sglang uses renormalize=False)
+        if renormalize:
+            top_k_weights = top_k_weights / jnp.sum(top_k_weights, axis=-1, keepdims=True)
+
+        return top_k_weights, top_k_indices
 
 
 class Grok1Attention(nnx.Module):
@@ -386,8 +491,29 @@ class Grok1Attention(nnx.Module):
         k, _ = self.k_proj(hidden_states)
         v, _ = self.v_proj(hidden_states)
 
+        # jax.debug.print(
+        #     "Layer {layer_id}: q BEFORE rotary {x}",
+        #     layer_id=self.layer_id,
+        #     x=q,
+        # )
+        # jax.debug.print(
+        #     "Layer {layer_id}: k BEFORE rotary {x}",
+        #     layer_id=self.layer_id,
+        #     x=k,
+        # )
+
         # Apply rotary position embeddings
         q, k = self.rotary_emb(positions, q, k)
+        # jax.debug.print(
+        #     "Layer {layer_id}: q AFTER rotary {x}",
+        #     layer_id=self.layer_id,
+        #     x=q,
+        # )
+        # jax.debug.print(
+        #     "Layer {layer_id}: k AFTER rotary {x}",
+        #     layer_id=self.layer_id,
+        #     x=k,
+        # )
 
         q = q.reshape(-1, self.num_heads, self.head_dim)
         k = k.reshape(-1, self.num_kv_heads, self.head_dim)
@@ -397,8 +523,24 @@ class Grok1Attention(nnx.Module):
         attn_ret = self.attn(q, k, v, forward_batch, token_to_kv_pool)
         attn_output = attn_ret[0] if isinstance(attn_ret, tuple) else attn_ret
 
+        # jax.debug.print(
+        #     "Layer {layer_id}: attn_output BEFORE o_proj {x}",
+        #     layer_id=self.layer_id,
+        #     x=attn_output,
+        # )
+
         # Project output
         output, _ = self.o_proj(attn_output)
+        # jax.debug.print(
+        #     "Layer {layer_id}: o_proj weight {x}",
+        #     layer_id=self.layer_id,
+        #     x=self.o_proj.weight,
+        # )
+        # jax.debug.print(
+        #     "Layer {layer_id}: output AFTER o_proj {x}",
+        #     layer_id=self.layer_id,
+        #     x=output,
+        # )
         return output
 
 
@@ -509,6 +651,13 @@ class Grok1DecoderLayer(nnx.Module):
             # First layer or no deferred norm - use fused_rmsnorm equivalent
             hidden_states, residual = self.pre_attn_norm(hidden_states), hidden_states
 
+        # === ADDED DEBUG PRINT (Before Attention) ===
+        # jax.debug.print(
+        #     "Layer {layer_id}: hidden_states BEFORE attention {x}",
+        #     layer_id=self.layer_id,
+        #     x=hidden_states,
+        # )
+
         # Self-attention
         hidden_states = self.self_attn(
             positions=positions,
@@ -517,9 +666,35 @@ class Grok1DecoderLayer(nnx.Module):
             token_to_kv_pool=token_to_kv_pool,
         )
 
+        # === ADDED DEBUG PRINT (After Attention) ===
+        # jax.debug.print(
+        #     "Layer {layer_id}: hidden_states AFTER attention {x}",
+        #     layer_id=self.layer_id,
+        #     x=hidden_states,
+        # )
         # logging.info(f"hidden_states after attention: {hidden_states}")
 
         # Apply post-attention norm and pre-MoE norm (matching PyTorch fused_dual_residual_rmsnorm)
+        # jax.debug.print(
+        #     "Layer {layer_id}: residual BEFORE dual_rmsnorm {x}",
+        #     layer_id=self.layer_id,
+        #     x=residual,
+        # )
+        # jax.debug.print(
+        #     "Layer {layer_id}: post_attn_norm scale {x}",
+        #     layer_id=self.layer_id,
+        #     x=self.post_attn_norm.scale,
+        # )
+        # jax.debug.print(
+        #     "Layer {layer_id}: pre_moe_norm scale {x}",
+        #     layer_id=self.layer_id,
+        #     x=self.pre_moe_norm.scale,
+        # )
+        # jax.debug.print(
+        #     "Layer {layer_id}: post_attn_norm epsilon {x}",
+        #     layer_id=self.layer_id,
+        #     x=self.post_attn_norm.epsilon,
+        # )
         hidden_states, residual = dual_rmsnorm_forward(
             hidden_states,
             residual,
@@ -528,12 +703,29 @@ class Grok1DecoderLayer(nnx.Module):
             self.post_attn_norm.epsilon,
         )
 
+        # jax.debug.print(
+        #     "Layer {layer_id}: hidden_states AFTER dual_rmsnorm {x}",
+        #     layer_id=self.layer_id,
+        #     x=hidden_states,
+        # )
+        # jax.debug.print(
+        #     "Layer {layer_id}: residual AFTER dual_rmsnorm {x}",
+        #     layer_id=self.layer_id,
+        #     x=residual,
+        # )
+
         # Feed-forward network
         if self.residual_moe:
             hidden_states = self.moe_with_rmoe(hidden_states)
         else:
             hidden_states = self.block_sparse_moe(hidden_states)
 
+        # === ADDED DEBUG PRINT (After MLP/MoE) ===
+        # jax.debug.print(
+        #     "Layer {layer_id}: hidden_states AFTER moe/mlp {x}",
+        #     layer_id=self.layer_id,
+        #     x=hidden_states,
+        # )
         # logging.info(f"hidden_states after moe: {hidden_states}")
 
         # Return with deferred post-MoE norm (matching PyTorch)
@@ -707,8 +899,13 @@ class Grok1ForCausalLM(nnx.Module):
         """Forward pass through the model using unified forward_batch API."""
         input_ids = forward_batch.input_ids
         positions = forward_batch.positions
+        # jax.debug.print("input_ids {input_ids}", input_ids=input_ids)
         hidden_states = self.model(input_ids, positions, forward_batch, token_to_kv_pool, None)
         output = self.logits_processor(hidden_states, self.lm_head, logits_metadata)
+
+        # === ADDED DEBUG PRINT (Final Logits) ===
+        # jax.debug.print("Final next_token_logits {x}", x=output)
+
         # Return values consistent with other models: (output, layers_kv_fused, layers_callback_flag)
         # Grok model does not expose per-layer KV tensors here, so return an empty list and True flag.
         return output, [], True
