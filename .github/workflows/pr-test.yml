@@ -25,8 +25,76 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # =============================================== check changes ====================================================
+  check-changes:
+    runs-on: ubuntu-latest
+    outputs:
+      main_package: ${{ steps.filter.outputs.main_package }}
+      pallas_kernel: ${{ steps.filter.outputs.pallas_kernel }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+      # TODO: use run-ci label when sglang-jax-bot exists
+      # - name: Fail if the PR does not have the 'run-ci' label
+      #   if: github.event_name == 'pull_request' && !contains(github.event.pull_request.labels.*.name, 'run-ci')
+      #   run: |
+      #     echo "This pull request does not have the 'run-ci' label. Failing the workflow."
+      #     exit 1
+
+      - name: Fail if the PR is a draft
+        if: github.event_name == 'pull_request' && github.event.pull_request.draft == true
+        run: |
+          echo "This pull request is a draft. Failing the workflow."
+          exit 1
+
+      - name: Detect file changes
+        id: filter
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            main_package:
+              - "python/sgl-jax/**"
+              - "python/*.toml"
+              - "scripts/ci/**"
+              - "test/**"
+              - ".github/workflows/pr-test.yml"
+            pallas_kernel:
+              - "python/sgl_jax/kernels/**"
+  # =============================================== unit-test ====================================================
+  unit-test-1-tpu:
+    needs: [check-changes]
+    if: github.event.pull_request.draft == false && needs.check-changes.outputs.main_package == 'true'
+    #runs-on: arc-runner-v6e-1
+    runs-on: ubuntu-slim
+    strategy:
+      fail-fast: false
+      matrix:
+        part: [0, 1]
+    steps:
+      # TODO: please rename when implement unit test
+      - name: Mock
+        timeout-minutes: 30
+        run: echo ${{ matrix.part }}
+
+  unit-test-4-tpu:
+    needs: [check-changes]
+    if: github.event.pull_request.draft == false && needs.check-changes.outputs.main_package == 'true'
+    #runs-on: arc-runner-v6e-1
+    runs-on: ubuntu-slim
+    strategy:
+      fail-fast: false
+      matrix:
+        part: [0, 1]
+    steps:
+    # TODO: please rename when implement unit test
+      - name: Mock
+        timeout-minutes: 30
+        run: echo ${{ matrix.part }}
+
+  # =============================================== e2e-test ===============================================
   e2e-test-1-tpu:
-    if: github.event.pull_request.draft == false
+    needs: [check-changes]
+    if: github.event.pull_request.draft == false && needs.check-changes.outputs.main_package == 'true'
     runs-on: arc-runner-v6e-1
     strategy:
       fail-fast: false
@@ -62,7 +130,8 @@ jobs:
           python test/srt/run_suite.py --suite per-commit-tpu-v6e-1
 
   e2e-test-4-tpu:
-    if: github.event.pull_request.draft == false
+    needs: [check-changes]
+    if: github.event.pull_request.draft == false && needs.check-changes.outputs.main_package == 'true'
     runs-on: arc-runner-v6e-4
     strategy:
       fail-fast: false
@@ -97,28 +166,66 @@ jobs:
           bash scripts/killall_sglang.sh
           python test/srt/run_suite.py --suite per-commit-tpu-v6e-4
 
-  # performance-test-1-tpu:
-  #   if: github.event.pull_request.draft == false
-  #   runs-on: self-hosted
-  #   strategy:
-  #     fail-fast: false
-  #   steps:
-  #     - name: Checkout code
-  #       uses: actions/checkout@v4
-  #     - name: Setup environment
-  #       uses: ./.github/actions/setup_environment
-  #       with:
-  #         accelerator: tpu-v6e-1
-  #         test_type: performance
-  #         skypilot_endpoint: ${{ secrets.SKYPILOT_ENDPOINT }}
-  #         username: ${{ secrets.USERNAME }}
-  #         git_token: ${{ secrets.GIT_TOKEN }}
-  #     - name: Benchmark single latency
-  #       timeout-minutes: 30
-  #       run: |
-  #         source ~/sky/bin/activate
-  #         CLUSTER_NAME=$(bash scripts/get_cluster_name.sh tpu-v6e-1 ${{ github.ref }} performance)
-  #         sky exec "$CLUSTER_NAME" -- 'set -e; cd sglang-jax/test/srt; uv run python -m unittest test_bench_one_batch.TestBenchOneBatch.test_bs1_default'
+  # =============================================== accurancy-test ===============================================
+  accurancy-test-1-tpu:
+    needs: [check-changes]
+    if: github.event.pull_request.draft == false && needs.check-changes.outputs.main_package == 'true'
+    #runs-on: arc-runner-v6e-1
+    runs-on: ubuntu-slim
+    strategy:
+      fail-fast: false
+      matrix:
+        part: [0, 1]
+    steps:
+      # TODO: please rename when implement acc test
+      - name: Mock
+        run: echo ${{ matrix.part }}
+
+  accurancy-test-4-tpu:
+    needs: [check-changes]
+    if: github.event.pull_request.draft == false && needs.check-changes.outputs.main_package == 'true'
+    #runs-on: arc-runner-v6e-1
+    runs-on: ubuntu-slim
+    strategy:
+      fail-fast: false
+      matrix:
+        part: [0, 1]
+    steps:
+      # TODO: please rename when implement acc test
+      - name: Mock
+        run: echo ${{ matrix.part }}
+
+  # =============================================== performance-test ===============================================
+  performance-test-1-tpu:
+    needs: [check-changes]
+    if: github.event.pull_request.draft == false && needs.check-changes.outputs.main_package == 'true'
+    #runs-on: arc-runner-v6e-1
+    runs-on: ubuntu-slim
+    strategy:
+      fail-fast: false
+      matrix:
+        part: [0, 1]
+    steps:
+        # TODO: please rename when implement performance test
+        - name: Mock
+          timeout-minutes: 10
+          run: echo ${{ matrix.part }}
+      # - name: Checkout code
+      #   uses: actions/checkout@v4
+      # - name: Setup environment
+      #   uses: ./.github/actions/setup_environment
+      #   with:
+      #     accelerator: tpu-v6e-1
+      #     test_type: performance
+      #     skypilot_endpoint: ${{ secrets.SKYPILOT_ENDPOINT }}
+      #     username: ${{ secrets.USERNAME }}
+      #     git_token: ${{ secrets.GIT_TOKEN }}
+      # - name: Benchmark single latency
+      #   timeout-minutes: 30
+      #   run: |
+      #     source ~/sky/bin/activate
+      #     CLUSTER_NAME=$(bash scripts/get_cluster_name.sh tpu-v6e-1 ${{ github.ref }} performance)
+      #     sky exec "$CLUSTER_NAME" -- 'set -e; cd sglang-jax/test/srt; uv run python -m unittest test_bench_one_batch.TestBenchOneBatch.test_bs1_default'
 
       # - name: Benchmark online latency
       #   timeout-minutes: 10
@@ -149,14 +256,20 @@ jobs:
       #     sky exec "$CLUSTER_NAME" -- 'set -e; cd sglang-jax/test/srt; python3 -m unittest test_bench_serving.TestBenchServing.test_offline_throughput_default'
 
 
-  # performance-test-4-tpu:
-  #   if: github.event.pull_request.draft == false
-  #   runs-on: self-hosted
-  #   strategy:
-  #     fail-fast: false
-  #   steps:
-  #     - name: Checkout code
-  #       uses: actions/checkout@v4
+  performance-test-4-tpu:
+    needs: [check-changes]
+    if: github.event.pull_request.draft == false && needs.check-changes.outputs.main_package == 'true'
+    #runs-on: arc-runner-v6e-1
+    runs-on: ubuntu-slim
+    strategy:
+      fail-fast: false
+      matrix:
+        part: [0, 1]
+    steps:
+      # TODO: please rename when implement performance test
+      - name: Mock
+        timeout-minutes: 10
+        run: echo ${{ matrix.part }}
 
   # accuracy-test-1-tpu:
   #   if: github.event.pull_request.draft == false
@@ -187,10 +300,32 @@ jobs:
   #         CLUSTER_NAME=$(bash scripts/get_cluster_name.sh tpu-v6e-1 ${{ github.ref }} accuracy)
   #         sky exec "$CLUSTER_NAME" -- 'set -e; cd sglang-jax/test/srt; python3 test_eval_accuracy_large.py'
 
+  # =============================================== kernel-benchmark ===============================================
+  pallas-kernel-benchmark:
+    needs: [check-changes]
+    if: github.event.pull_request.draft == false && needs.check-changes.outputs.pallas_kernel == 'true'
+    #runs-on: arc-runner-v6e-1
+    runs-on: ubuntu-slim
+    strategy:
+      fail-fast: false
+      matrix:
+        part: [0, 1]
+    steps:
+      # TODO: please rename when this implement kernel benchmark
+      - name: Mock
+        run: echo ${{ matrix.part }}
+
   pr-test-finish:
     needs: [
+      performance-test-1-tpu,
+      performance-test-4-tpu,
+      accurancy-test-1-tpu,
+      accurancy-test-4-tpu,
+      unit-test-1-tpu,
+      unit-test-4-tpu,
       e2e-test-1-tpu,
       e2e-test-4-tpu,
+      pallas-kernel-benchmark,
     ]
     runs-on: arc-runner-v6e-1
     steps:
