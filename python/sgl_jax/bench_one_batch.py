@@ -248,7 +248,7 @@ def decode(input_token_ids, batch: ScheduleBatch, model_runner):
     # For decode, the token dimension equals current batch size
     bs_needed = len(batch.seq_lens)
     next_token_ids, next_token_logits = _run_forward_and_sample(model_runner, batch, bs_needed)
-    logging.info("next token logits: %s", next_token_logits)
+    # logging.info("next token logits: %s", next_token_logits)
     return next_token_ids, next_token_logits
 
 

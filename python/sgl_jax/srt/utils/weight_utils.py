@@ -187,29 +187,29 @@ class WeightLoader:
             weights = expert_weights_dict[hf_key]
             # concat weights along axis 0
             # Log ALL expert weights, not just w2
-            logging.info("=== Processing expert weight ===")
-            logging.info("hf_key: %s", hf_key)
-            logging.info("num_shards: %s", len(weights))
-            logging.info("shard[0] shape: %s", weights[0].shape)
-            logging.info("mapping.concat_axis: %s", mapping.concat_axis)
-            logging.info("mapping.transpose: %s", mapping.transpose)
+            # logging.info("=== Processing expert weight ===")
+            # logging.info("hf_key: %s", hf_key)
+            # logging.info("num_shards: %s", len(weights))
+            # logging.info("shard[0] shape: %s", weights[0].shape)
+            # logging.info("mapping.concat_axis: %s", mapping.concat_axis)
+            # logging.info("mapping.transpose: %s", mapping.transpose)
 
             if mapping.concat_axis is not None:
                 weights = jnp.concatenate(weights, axis=mapping.concat_axis)
-                logging.info("after concat shape: %s", weights.shape)
+                # logging.info("after concat shape: %s", weights.shape)
             if mapping.transpose and not hf_key.endswith(".bias"):
                 weights = jnp.transpose(weights, (1, 0))
-                logging.info("after transpose shape: %s", weights.shape)
+                # logging.info("after transpose shape: %s", weights.shape)
             collected_weights.append(weights)
 
         stacked_weight = jnp.stack(collected_weights, axis=0)  # (num_experts, ...)
-        logging.info("=== Final stacked weight ===")
-        logging.info("stacked_weight.shape: %s", stacked_weight.shape)
+        # logging.info("=== Final stacked weight ===")
+        # logging.info("stacked_weight.shape: %s", stacked_weight.shape)
         sharded_weight = self._shard_weight(stacked_weight, mapping.sharding)
-        logging.info("sharded_weight.shape: %s", sharded_weight.shape)
+        # logging.info("sharded_weight.shape: %s", sharded_weight.shape)
         model_param = self._get_param(params, target_path)
-        logging.info("param name: %s", target_path)
-        logging.info("model_param.value.shape: %s", model_param.value.shape)
+        # logging.info("param name: %s", target_path)
+        # logging.info("model_param.value.shape: %s", model_param.value.shape)
 
         # CRITICAL: Validate shape match before assignment
         expected_shape = model_param.value.shape
