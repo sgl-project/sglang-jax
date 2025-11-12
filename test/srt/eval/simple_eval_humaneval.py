@@ -18,8 +18,8 @@ except (ImportError, ModuleNotFoundError):
     print("\nPlease install human-eval at https://github.com/openai/human-eval.\n")
     raise
 
-from sgl_jax.test import simple_eval_common as common
-from sgl_jax.test.simple_eval_common import (
+import eval.simple_eval_common as common
+from eval.simple_eval_common import (
     HTML_JINJA,
     Eval,
     EvalResult,
