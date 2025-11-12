@@ -168,9 +168,9 @@ class WeightLoader:
             raise RuntimeError("Incomplete MoE expert weights detected.")
 
         nnx.update(self.model, params)
-        with open("/tmp/debug.txt", "a") as f:
-            f.write("updated params\n")
-            f.write(f"params: {params}\n")
+        # with open("/tmp/debug.txt", "a") as f:
+        #     f.write("updated params\n")
+        #     f.write(f"params: {params}\n")
 
     def _process_single_moe_group(
         self,

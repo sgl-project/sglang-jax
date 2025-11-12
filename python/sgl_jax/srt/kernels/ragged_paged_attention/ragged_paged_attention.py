@@ -683,6 +683,8 @@ def _ragged_paged_attention_kernel(
                     if xai_temperature_len is not None:
                         # Correctly calculate sequence-relative position
                         prefix_len = kv_len - q_len
+                        # if q_len == 1:
+                        #     return q_batch, jnp.tile(prefix_len, (q_batch.shape[0], 1))
                         # `bq_idx * bq_sz` is the offset within the new queries for this sequence
                         local_q_offset = bq_idx * bq_sz + lax.iota(jnp.int32, q_batch.shape[1])
                         # `base_qidx` is the absolute sequence position

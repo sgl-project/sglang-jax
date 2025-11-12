@@ -198,7 +198,7 @@ class JAXDummyModelLoader(BaseModelLoader):
         def _init_leaf(x, pspec):
             is_array = isinstance(x, jax.Array)
             is_abstract = isinstance(x, jax.ShapeDtypeStruct)
-            
+
             if (is_array or is_abstract) and jnp.issubdtype(x.dtype, jnp.floating):
                 tgt_dtype = x.dtype
                 shape = x.shape
@@ -208,7 +208,11 @@ class JAXDummyModelLoader(BaseModelLoader):
                     sharding = jax.sharding.NamedSharding(self.mesh, pspec)
                 else:
                     # If no pspec, try to preserve original sharding; fallback to replicated
-                    sharding = getattr(x, 'sharding', jax.sharding.NamedSharding(self.mesh, jax.sharding.PartitionSpec()))
+                    sharding = getattr(
+                        x,
+                        "sharding",
+                        jax.sharding.NamedSharding(self.mesh, jax.sharding.PartitionSpec()),
+                    )
 
                 def _make_shard(indices):
                     # Compute local shard shape from global shape and slice indices
@@ -266,9 +270,6 @@ def get_model_loader(
     load_config: LoadConfig, rngs: jax.Array, mesh: jax.sharding.Mesh
 ) -> BaseModelLoader:
     """Get a model loader based on the load format."""
-    
-    logging.info(f"load_config load format: {load_config.load_format}")
-
     if isinstance(load_config.load_format, type):
         return load_config.load_format(load_config)
 
@@ -277,7 +278,7 @@ def get_model_loader(
 
     if load_config.load_format == LoadFormat.JAX:
         return JAXModelLoader(load_config, rngs, mesh)
-    
-    logging.info("loader falled back to JAXModelLoader")
+
+    logging.info("loader failed back to JAXModelLoader")
 
     return JAXModelLoader(load_config, rngs, mesh)

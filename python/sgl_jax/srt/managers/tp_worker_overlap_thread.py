@@ -40,8 +40,10 @@ class ModelWorkerClient:
         self.future_token_ids_limit = self.max_running_requests * 3
         self.future_token_ids_map = jnp.zeros((self.max_running_requests * 5,), dtype=jnp.int32)
         self.mesh = mesh
-        sharding = NamedSharding(mesh, PartitionSpec(None))
-        self.future_token_ids_map = jax.device_put(self.future_token_ids_map, sharding)
+        self.future_token_ids_map = jax.device_put(
+            self.future_token_ids_map,
+            NamedSharding(self.worker.mesh, PartitionSpec()) if jax.process_count() == 1 else None,
+        )
         # Launch threads
         self.input_queue = Queue()
         self.output_queue = Queue()

@@ -146,7 +146,9 @@ class SamplingMetadata:
         # Extract penalty information from penalizer orchestrator
         linear_penalty_device = None
         do_penalties = False
-        linear_penalty_sharding = NamedSharding(mesh, PartitionSpec(None, "tensor"))
+        linear_penalty_sharding = (
+            NamedSharding(mesh, PartitionSpec(None, "tensor")) if jax.process_count() == 1 else None
+        )
 
         # Handle linear penalty independently (created by update_penalties)
         if (
