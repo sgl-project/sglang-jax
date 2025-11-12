@@ -251,26 +251,13 @@ class SchedulerOutputProcessorMixin:
                         req.req_pool_idx,
                         all_token_len:cur_allocate_len,
                     ]
-                    print(f"{kv_indices[:10]=}")
-                    print(
-                        f"{len(kv_indices)=} {all_token_len} {cur_allocate_len}  {len(kv_indices[kv_indices != 0])=}"
-                    )
                     kv_indices = kv_indices[kv_indices != 0]
                     from sgl_jax.srt.speculative.eagle_util import EagleDraftInput
 
                     assert (
                         len(kv_indices) <= EagleDraftInput.ALLOC_LEN_PER_DECODE
                     ), f"redundant kv indices {len(kv_indices)=} should less than {EagleDraftInput.ALLOC_LEN_PER_DECODE=}"
-                    print(f"{kv_indices[:10]=}")
-                    # start_p = batch.seq_lens[i] + accept_lens_list[i] - (len(req.output_ids) - 1)
-                    # end_p = allocate_lens_list[i]
-                    # print(f"============{start_p=}======================={end_p=}======={ batch.seq_lens[i]=}====={accept_lens_list[i]}=")
-                    # if self.page_size > 1:
-                    #     start_p = cdiv(start_p, self.page_size) * self.page_size
-                    # print(f"============{ self.req_to_token_pool.req_to_token[req.req_pool_idx][:30]=}====================================")
-                    # indices_to_free = self.req_to_token_pool.req_to_token[req.req_pool_idx][
-                    #     start_p:end_p
-                    # ]
+
                     self.token_to_kv_pool_allocator.free(kv_indices)
                 # End trace for finished request
                 if precision_tracer.get_trace_active():

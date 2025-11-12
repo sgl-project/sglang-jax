@@ -77,7 +77,7 @@ class SchedulerMetricsMixin:
             accept_ratio = (self.accept_token / self.draft_token) * 100
             self.accept_token = 0
             self.draft_token = 0
-            msg += f"accept_ratio {accept_ratio:.2f}%"
+            msg += f"accept_ratio {accept_ratio:.2f}%, "
 
         msg += f"#cache_miss: {batch.cache_miss_count}"
 

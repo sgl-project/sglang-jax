@@ -494,13 +494,10 @@ class EagleDraftInput:
         model_worker_batch.extend_seq_lens = np.asarray(
             [batch_output.accept_lens[i] for i in range(batch_output.accept_lens.shape[0])]
         )
-        # model_worker_batch.extend_prefix_lens = model_worker_batch.extend_prefix_lens
         model_worker_batch.capture_hidden_mode = CaptureHiddenMode.LAST
         model_worker_batch.spec_info.capture_hidden_mode = CaptureHiddenMode.LAST
         model_worker_batch.forward_mode = ForwardMode.DRAFT_EXTEND
         model_worker_batch.spec_info.hidden_states = batch_output.next_draft_input.hidden_states
-        # print(f"=======before padding==========={model_worker_batch.spec_info.hidden_states=}==========================")
-        # model_worker_batch.positions = model_worker_batch.spec_info.positions
         forward_metadata = draft_model_runner.attn_backend.get_forward_metadata(
             model_worker_batch, is_eagle=True
         )
@@ -524,8 +521,6 @@ class EagleDraftInput:
             model_worker_batch.spec_info.hidden_states = jnp.concatenate(
                 [model_worker_batch.spec_info.hidden_states, pad_values], axis=0
             )
-
-        # # print(f"=======after padding==========={model_worker_batch.spec_info.hidden_states=}==========================")
 
         forward_batch = ForwardBatch.init_new(model_worker_batch, draft_model_runner)
 
@@ -556,8 +551,6 @@ class EagleDraftInput:
                 last_loc,
                 extend_num_tokens,
             )
-        print(f"{self.allocate_lens=}")
-        print(f"{new_allocate_lens=}")
 
         assign_req_to_token_pool(
             schedule_batch.req_pool_indices,
@@ -566,7 +559,7 @@ class EagleDraftInput:
             new_allocate_lens,
             out_cache_loc,
         )
-        print()
+
         self.allocate_lens = new_allocate_lens
 
         schedule_batch.seq_lens_sum = np.sum(schedule_batch.seq_lens).item()
@@ -654,13 +647,7 @@ class EagleDraftInput:
         pass
 
     def filter_batch(self, new_indices: np.ndarray, has_been_filtered: bool = True):
-        # FIXME(pc) need support overlap here
-        # if new_indices.shape[0] > self.allocate_lens.shape[0]:
-        #     logger.warning(f"{new_indices.shape[0]=} > {self.allocate_lens.shape[0]=}  {new_indices=} {self.allocate_lens=}")
-        # print(f"============={new_indices=}===============")
-        # print(f"============={self.allocate_lens=}==========================")
-        # new_indices = new_indices[new_indices < self.allocate_lens.shape[0]]
-        # self.allocate_lens = self.allocate_lens[new_indices]
+
         if has_been_filtered:
             # in eagle_utils.py:verify, we have already filtered the batch by `unfinished_index`
             # therefore, we don't need to filter the batch again in scheduler
@@ -888,12 +875,6 @@ class EagleVerifyInput:
                     retrive_next_sibling=self.retrive_next_sibling,
                     target_predict=target_predict,
                 )
-                if np.sum(accept_length) > 0:
-                    print(
-                        f"\033[32m accept rate is {np.sum(accept_length) / (accept_length.shape[0] * (self.draft_token_num - 1))}\033[0m"
-                    )
-                else:
-                    print("\033[31m accept rate is 0\033[0m")
         else:
             # apply temperature and get target probs
             expanded_temperature = jnp.repeat(
