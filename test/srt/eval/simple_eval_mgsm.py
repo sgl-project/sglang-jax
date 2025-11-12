@@ -10,8 +10,8 @@ https://arxiv.org/abs/2210.03057 reference: https://github.com/google-research/u
 import re
 import urllib
 
-from sgl_jax.test import simple_eval_common as common
-from sgl_jax.test.simple_eval_common import (
+import eval.simple_eval_common as common
+from eval.simple_eval_common import (
     HTML_JINJA,
     Eval,
     EvalResult,

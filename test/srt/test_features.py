@@ -5,10 +5,10 @@ from types import SimpleNamespace
 
 import openai
 import requests
+from run_curl import run_curl
+from run_eval import run_eval
 
 from sgl_jax.srt.utils import kill_process_tree
-from sgl_jax.test.run_curl import run_curl
-from sgl_jax.test.run_eval import run_eval
 from sgl_jax.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,

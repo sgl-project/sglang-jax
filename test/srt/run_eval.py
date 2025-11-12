@@ -1,6 +1,6 @@
 """
 Usage:
-python3 -m sgl_jax.test.run_eval --port 30000 --eval-name mmlu --num-examples 10
+python3 test/srt/run_eval.py --port 30000 --eval-name mmlu --num-examples 10
 """
 
 import argparse
@@ -8,11 +8,7 @@ import json
 import os
 import time
 
-from sgl_jax.test.simple_eval_common import (
-    ChatCompletionSampler,
-    make_report,
-    set_ulimit,
-)
+from eval.simple_eval_common import ChatCompletionSampler, make_report, set_ulimit
 
 
 def run_eval(args):
@@ -24,32 +20,32 @@ def run_eval(args):
     base_url = f"{args.base_url}/v1" if args.base_url else f"http://{args.host}:{args.port}/v1"
 
     if args.eval_name == "mmlu":
-        from sgl_jax.test.simple_eval_mmlu import MMLUEval
+        from eval.simple_eval_mmlu import MMLUEval
 
         filename = "https://openaipublic.blob.core.windows.net/simple-evals/mmlu.csv"
         eval_obj = MMLUEval(filename, args.num_examples, args.num_threads)
     elif args.eval_name == "math":
-        from sgl_jax.test.simple_eval_math import MathEval
+        from eval.simple_eval_math import MathEval
 
         equality_checker = ChatCompletionSampler(model="gpt-4-turbo")
 
         filename = "https://openaipublic.blob.core.windows.net/simple-evals/math_test.csv"
         eval_obj = MathEval(filename, equality_checker, args.num_examples, args.num_threads)
     elif args.eval_name == "mgsm":
-        from sgl_jax.test.simple_eval_mgsm import MGSMEval
+        from eval.simple_eval_mgsm import MGSMEval
 
         eval_obj = MGSMEval(args.num_examples, args.num_threads)
     elif args.eval_name == "mgsm_en":
-        from sgl_jax.test.simple_eval_mgsm import MGSMEval
+        from eval.simple_eval_mgsm import MGSMEval
 
         eval_obj = MGSMEval(args.num_examples, args.num_threads, languages=["en"])
     elif args.eval_name == "gpqa":
-        from sgl_jax.test.simple_eval_gpqa import GPQAEval
+        from eval.simple_eval_gpqa import GPQAEval
 
         filename = "https://openaipublic.blob.core.windows.net/simple-evals/gpqa_diamond.csv"
         eval_obj = GPQAEval(filename, args.num_examples, args.num_threads)
     elif args.eval_name == "humaneval":
-        from sgl_jax.test.simple_eval_humaneval import HumanEval
+        from eval.simple_eval_humaneval import HumanEval
 
         eval_obj = HumanEval(args.num_examples, args.num_threads)
     else:

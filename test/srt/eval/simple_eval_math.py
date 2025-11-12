@@ -9,10 +9,9 @@ https://arxiv.org/abs/2103.03874
 import random
 import re
 
+import eval.simple_eval_common as common
 import pandas
-
-from sgl_jax.test import simple_eval_common as common
-from sgl_jax.test.simple_eval_common import (
+from eval.simple_eval_common import (
     ANSWER_PATTERN,
     HTML_JINJA,
     Eval,
