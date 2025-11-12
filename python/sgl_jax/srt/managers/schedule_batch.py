@@ -968,7 +968,6 @@ class ScheduleBatch:
         if len(keep_indices) == len(self.reqs):
             # No need to filter
             return
-
         self.reqs = [self.reqs[i] for i in keep_indices]
         self.req_pool_indices = self.req_pool_indices[keep_indices]
         # TODO: uniform data type in scheduler batch
@@ -983,6 +982,7 @@ class ScheduleBatch:
             self.spec_info.hidden_states = self.spec_info.hidden_states[keep_indices_jax]
             self.spec_info.verified_id = self.spec_info.verified_id[keep_indices_jax]
             self.spec_info.allocate_lens = self.spec_info.allocate_lens[keep_indices_jax]
+
         self.out_cache_loc = None
         self.seq_lens_sum = self.seq_lens.sum().item()
         if not isinstance(keep_indices, np.ndarray):
@@ -1120,6 +1120,7 @@ class ScheduleBatch:
                     seq_lens = seq_lens_cpu + self.spec_info.draft_token_num
                 elif self.forward_mode == ForwardMode.DECODE:
                     from sgl_jax.srt.speculative.eagle_util import EagleDraftInput
+
                     seq_lens = seq_lens_cpu + EagleDraftInput.ALLOC_LEN_PER_DECODE
             # Filter out empty sequences
             valid_mask = seq_lens > 0
@@ -1401,24 +1402,47 @@ class ModelWorkerBatch:
             if self.forward_mode.is_extend():
                 invalid_extend_start_loc = np.array(
                     [self.extend_start_loc[-1] + self.extend_seq_lens[-1]] * bs_padding_size,
-                    dtype=self.extend_start_loc.dtype if self.extend_start_loc is not None else np.int32,
+                    dtype=(
+                        self.extend_start_loc.dtype
+                        if self.extend_start_loc is not None
+                        else np.int32
+                    ),
                 )
                 extend_start_loc = np.concat(
                     [self.extend_start_loc, invalid_extend_start_loc], axis=0
                 )
                 invalid_extend_prefix_lens = np.array(
-                    [0] * bs_padding_size, dtype=np.int32,
+                    [0] * bs_padding_size,
+                    dtype=np.int32,
                 )
-                extend_prefix_lens = np.concat(
-                    [self.extend_prefix_lens, invalid_extend_prefix_lens], axis=0
-                ) if self.extend_prefix_lens is not None and invalid_extend_prefix_lens.shape[0] > 0 and self.extend_prefix_lens.shape[0] > 0  else self.extend_prefix_lens
+                extend_prefix_lens = (
+                    np.concat([self.extend_prefix_lens, invalid_extend_prefix_lens], axis=0)
+                    if self.extend_prefix_lens is not None
+                    and invalid_extend_prefix_lens.shape[0] > 0
+                    and self.extend_prefix_lens.shape[0] > 0
+                    else self.extend_prefix_lens
+                )
                 invalid_extend_seq_lens = np.array(
-                    [0] * bs_padding_size, dtype=self.extend_seq_lens.dtype if self.extend_seq_lens is not None else np.int32,
+                    [0] * bs_padding_size,
+                    dtype=(
+                        self.extend_seq_lens.dtype if self.extend_seq_lens is not None else np.int32
+                    ),
                 )
-                extend_seq_lens = np.concat([self.extend_seq_lens, invalid_extend_seq_lens], axis=0) if self.extend_seq_lens is not None and invalid_extend_seq_lens.shape[0] > 0 and self.extend_seq_lens.shape[0] > 0 else self.extend_seq_lens
+                extend_seq_lens = (
+                    np.concat([self.extend_seq_lens, invalid_extend_seq_lens], axis=0)
+                    if self.extend_seq_lens is not None
+                    and invalid_extend_seq_lens.shape[0] > 0
+                    and self.extend_seq_lens.shape[0] > 0
+                    else self.extend_seq_lens
+                )
             else:
                 invalid_extend_start_loc = np.array(
-                    [len(seq_lens_cpu)] * bs_padding_size, dtype=self.extend_start_loc.dtype if self.extend_start_loc is not None else np.int32,
+                    [len(seq_lens_cpu)] * bs_padding_size,
+                    dtype=(
+                        self.extend_start_loc.dtype
+                        if self.extend_start_loc is not None
+                        else np.int32
+                    ),
                 )
                 extend_start_loc = np.concat(
                     [self.extend_start_loc, invalid_extend_start_loc], axis=0
@@ -1452,7 +1476,7 @@ class ModelWorkerBatch:
         self.out_cache_loc = out_cache_loc_cpu
         self.req_pool_indices = req_pool_indices_cpu
         self.positions = positions_cpu
-        
+
 
 def get_last_loc(
     req_to_token: np.ndarray,

@@ -168,7 +168,7 @@ class SchedulerOutputProcessorMixin:
         predict_tokens = []
         stride = self.draft_worker.speculative_num_draft_tokens
         for i, req in enumerate(batch.reqs):
-            predict_tokens.append([token for token in next_token_ids[i * stride : i * stride + stride] if token != 0])
+            predict_tokens.append(next_token_ids[i * stride : i * stride + accept_lens[i]])
             req.spec_verify_ct += 1
             req.spec_accepted_tokens += accept_lens[i]
 
@@ -187,10 +187,17 @@ class SchedulerOutputProcessorMixin:
         )
         if not self.spec_algorithm.is_none():
             next_token_ids = self._resolve_spec_decode_token_ids(result=result, batch=batch)
+
             allocate_lens_list = result.allocate_lens.tolist()
             accept_lens_list = result.accept_lens.tolist()
-        self.num_generated_tokens += len(batch.reqs)
 
+        if self.spec_algorithm.is_none():
+            self.num_generated_tokens += len(batch.reqs)
+        else:
+            for next_token_id in next_token_ids:
+                self.num_generated_tokens += len(next_token_id)
+                self.accept_token += len(next_token_id)
+            self.draft_token += len(batch.reqs) * self.draft_worker.speculative_num_draft_tokens
         # FIXME(pc) add spec decode metrics
 
         if self.enable_overlap:
@@ -206,7 +213,6 @@ class SchedulerOutputProcessorMixin:
                 )
 
         self.token_to_kv_pool_allocator.free_group_begin()
-
         # Check finish condition
         # NOTE: the length of reqs and next_token_ids don't match if it is spec decoding.
         # We should ignore using next_token_ids for spec decoding cases.
@@ -231,20 +237,31 @@ class SchedulerOutputProcessorMixin:
             if batch.spec_algorithm.is_none():
                 req.output_ids.append(next_token_id)
             elif self.spec_algorithm.is_eagle():
-                req.output_ids.extend(next_token_id) 
+                req.output_ids.extend(next_token_id)
                 new_accepted_len = len(next_token_id)
 
             req.check_finished(new_accepted_len)
             if req.finished():
                 if batch.spec_algorithm.is_eagle():
+                    cur_allocate_len = batch.spec_info.allocate_lens[i]
                     all_token_len = len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0)
                     if self.page_size > 1:
                         all_token_len = cdiv(all_token_len, self.page_size) * self.page_size
                     kv_indices = self.req_to_token_pool.req_to_token[
                         req.req_pool_idx,
-                        all_token_len : -1,
+                        all_token_len:cur_allocate_len,
                     ]
+                    print(f"{kv_indices[:10]=}")
+                    print(
+                        f"{len(kv_indices)=} {all_token_len} {cur_allocate_len}  {len(kv_indices[kv_indices != 0])=}"
+                    )
                     kv_indices = kv_indices[kv_indices != 0]
+                    from sgl_jax.srt.speculative.eagle_util import EagleDraftInput
+
+                    assert (
+                        len(kv_indices) <= EagleDraftInput.ALLOC_LEN_PER_DECODE
+                    ), f"redundant kv indices {len(kv_indices)=} should less than {EagleDraftInput.ALLOC_LEN_PER_DECODE=}"
+                    print(f"{kv_indices[:10]=}")
                     # start_p = batch.seq_lens[i] + accept_lens_list[i] - (len(req.output_ids) - 1)
                     # end_p = allocate_lens_list[i]
                     # print(f"============{start_p=}======================={end_p=}======={ batch.seq_lens[i]=}====={accept_lens_list[i]}=")

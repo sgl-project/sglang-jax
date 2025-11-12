@@ -146,7 +146,7 @@ class EAGLEWorker(ModelWorker):
                 logits_output=logits_output,
                 next_token_ids=next_token_ids,
                 next_draft_input=model_worker_batch.spec_info,
-                allocate_lens=model_worker_batch.seq_lens,
+                allocate_lens=model_worker_batch.seq_lens[: model_worker_batch.real_bs],
                 bid=bid,
                 cache_miss_count=cache_miss_count,
             )
@@ -215,7 +215,9 @@ class EAGLEWorker(ModelWorker):
         )
         logits_output.truncate_logits_processor_output(model_worker_batch)
         assert isinstance(forward_batch.spec_info, EagleDraftInput)
-        forward_batch.spec_info.allocate_lens = model_worker_batch.seq_lens
+        forward_batch.spec_info.allocate_lens = model_worker_batch.seq_lens[
+            : model_worker_batch.real_bs
+        ]
         # assert forward_batch.spec_info is batch.spec_info
 
         self.capture_for_decode(logits_output, forward_batch.spec_info)
@@ -328,7 +330,6 @@ class EAGLEWorker(ModelWorker):
         next_draft_input = EagleDraftInput(
             verified_id=verified_id,
             new_seq_lens=new_seq_lens,
-            # FIXME(pc) make allocate_lens to true value
             allocate_lens=cur_allocate_lens,
             hidden_states=logits_output.hidden_states,
         )
@@ -512,6 +513,12 @@ class EAGLEWorker(ModelWorker):
             #     self.precompile_bs_paddings,
             #     self.precompile_cache_loc_paddings,
             # )
+
+            model_worker_batch.padding_model_worker_batch(
+                self.precompile_token_paddings,
+                self.precompile_bs_paddings,
+                self.precompile_cache_loc_paddings,
+            )
             self.draft_model_runner.attn_backend.forward_metadata = (
                 self.draft_model_runner.attn_backend.get_forward_metadata(
                     model_worker_batch,
@@ -529,11 +536,6 @@ class EAGLEWorker(ModelWorker):
                         parents_list=parents_list,
                     )
                 )
-            model_worker_batch.padding_model_worker_batch(
-                self.precompile_token_paddings,
-                self.precompile_bs_paddings,
-                self.precompile_cache_loc_paddings,
-            )
             forward_batch = ForwardBatch.init_new(model_worker_batch, self.draft_model_runner)
             # Run forward
             logits_output, _ = self.draft_model_runner.forward(

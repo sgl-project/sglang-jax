@@ -533,16 +533,10 @@ class EagleDraftInput:
 
     def prepare_for_decode(self, schedule_batch: ScheduleBatch):
         new_allocate_lens = schedule_batch.seq_lens + self.ALLOC_LEN_PER_DECODE
-        if new_allocate_lens.shape[0] != self.allocate_lens.shape[0] or np.any(
-            self.allocate_lens < schedule_batch.seq_lens
-        ):
-            logger.warning(f"{new_allocate_lens=} {self.allocate_lens=}, this should happen")
-            # TODO hack this , this should happen
-            self.allocate_lens = schedule_batch.seq_lens
-        # TODO(pc) implement overlap here
-        # schedule_batch.maybe_wait_verify_done()
         bs = schedule_batch.batch_size()
-
+        assert (
+            self.allocate_lens.shape[0] == bs
+        ), f" {self.allocate_lens.shape[0]=} but batch_size is {bs} "
         page_size = schedule_batch.token_to_kv_pool_allocator.page_size
 
         if page_size == 1:
@@ -562,6 +556,8 @@ class EagleDraftInput:
                 last_loc,
                 extend_num_tokens,
             )
+        print(f"{self.allocate_lens=}")
+        print(f"{new_allocate_lens=}")
 
         assign_req_to_token_pool(
             schedule_batch.req_pool_indices,
@@ -570,11 +566,9 @@ class EagleDraftInput:
             new_allocate_lens,
             out_cache_loc,
         )
-
+        print()
         self.allocate_lens = new_allocate_lens
 
-        # FIXME(lsyin): make this sync optional
-        # schedule_batch.seq_lens_cpu = schedule_batch.seq_lens
         schedule_batch.seq_lens_sum = np.sum(schedule_batch.seq_lens).item()
         schedule_batch.out_cache_loc = out_cache_loc
 
@@ -702,6 +696,7 @@ class EagleDraftInput:
         self.verified_id = jnp.concatenate([self.verified_id, spec_info.verified_id], axis=0)
         self.topk_p = jnp.concatenate([self.topk_p, spec_info.topk_p])
         self.topk_index = jnp.concatenate([self.topk_index, spec_info.topk_index])
+        self.allocate_lens = jnp.concatenate([self.allocate_lens, spec_info.allocate_lens])
 
 
 @dataclass
@@ -848,10 +843,10 @@ class EagleVerifyInput:
 
         predict_shape = list(logits_output.next_token_logits.shape)[:-1]
         predict_shape[-1] += 1
-        predict = jnp.empty(predict_shape, dtype=jnp.int32)
+        predict = jnp.zeros(predict_shape, dtype=jnp.int32)
 
         accept_index = jnp.full((bs, self.spec_steps + 1), -1, dtype=jnp.int32)
-        accept_length = jnp.empty((bs,), dtype=jnp.int32)
+        accept_length = jnp.zeros((bs,), dtype=jnp.int32)
 
         if bs != len(sampling_info):
             sampling_info = copy.deepcopy(sampling_info)
@@ -1054,9 +1049,15 @@ def assign_req_to_token_pool(
     out_cache_loc_start_positions = np.concatenate(
         [np.array([0], dtype=np.int32), np.cumsum(out_cache_lens)]
     )[0:-1]
+    all_cache_loc_len = out_cache_loc.shape[0]
+    allocate_len = 0
     for i in range(bs):
         out_cache_loc_start = out_cache_loc_start_positions[i]
         req_to_token_pool.write(
             (req_pool_indices[i], slice(start_offsets[i], end_offsets[i])),
             out_cache_loc[out_cache_loc_start : out_cache_loc_start + out_cache_lens[i]],
         )
+        allocate_len += out_cache_lens[i]
+    assert (
+        allocate_len == all_cache_loc_len
+    ), f"not all allocate cache loc is assigned to req_token_pool, it's may lead to mem leak, assigned {allocate_len}, allocate {all_cache_loc_len}"

@@ -256,7 +256,8 @@ class Scheduler(
         self.last_prefill_stats_tic = time.perf_counter()
         self.num_retracted_reqs: int = 0
         self.num_paused_reqs: int = 0
-
+        self.accept_token = 0
+        self.draft_token = 0
         # Init chunked prefill
         self.chunked_prefill_size = server_args.chunked_prefill_size
         if self.chunked_prefill_size <= 0:  # -1 means disable
@@ -735,7 +736,6 @@ class Scheduler(
         else:
             # Run decode
             if not self.running_batch.is_empty():
-
 
                 self.running_batch = self.update_running_batch(self.running_batch)
                 ret = self.running_batch if not self.running_batch.is_empty() else None

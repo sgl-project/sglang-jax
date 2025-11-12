@@ -37,6 +37,9 @@ class ChunkCache(BasePrefixCache):
             # For decode server: if req.output_ids is empty, we want to free all req.origin_input_ids
             : len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0),
         ]
+        print(
+            f"trunked cache cache_finished_req {max(len(req.output_ids) - 1, 0)=} {len(req.origin_input_ids)=} {len(kv_indices)=} {len(kv_indices[kv_indices != 0])=}"
+        )
         self.req_to_token_pool.free(req.req_pool_idx)
         self.token_to_kv_pool_allocator.free(kv_indices)
 

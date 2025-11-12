@@ -73,6 +73,12 @@ class SchedulerMetricsMixin:
             f"#queue-req: {len(self.waiting_queue)}, "
         )
 
+        if not running_batch.spec_algorithm.is_none():
+            accept_ratio = (self.accept_token / self.draft_token) * 100
+            self.accept_token = 0
+            self.draft_token = 0
+            msg += f"accept_ratio {accept_ratio:.2f}%"
+
         msg += f"#cache_miss: {batch.cache_miss_count}"
 
         logger.info(msg)

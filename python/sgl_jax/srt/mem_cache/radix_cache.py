@@ -211,6 +211,7 @@ class RadixCache(BasePrefixCache):
                 all_token_len,
             )
             kv_indices = kv_indices[kv_indices != 0]
+            print(f"cache_finished_req {kv_indices=}")
             self.token_to_kv_pool_allocator.free(kv_indices)
             self.req_to_token_pool.free(req.req_pool_idx)
             return
