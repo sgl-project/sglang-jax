@@ -385,8 +385,7 @@ class EPMoE(nnx.Module):
         )
 
         # Need to reduce over the intermediate dimension which is sharded on "tensor" axis
-        mesh_shape_tensor = jax.lax.psum(1, "tensor")
-        if mesh_shape_tensor > 1:
+        if self.tp_size > 1:
             intermediate_output = jax.lax.psum(intermediate_output, "tensor")
 
         return intermediate_output
