@@ -222,23 +222,13 @@ class ModelWorker:
                 if bs > num_tokens:
                     logger.warning("bs=%s > num_tokens=%s, skip this pair", bs, num_tokens)
                     continue
-                if not self.speculative_algorithm.is_none():
-                    model_worker_batch = self.generate_model_worker_batch(
-                        bs,
-                        num_tokens,
-                        ForwardMode.EXTEND,
-                        self.precompile_cache_loc_paddings[-1],
-                        self.speculative_algorithm,
-                        self.server_args.speculative_num_draft_tokens,
-                        self.server_args.speculative_eagle_topk
-                    )
-                else:
-                    model_worker_batch = self.generate_model_worker_batch(
-                        bs,
-                        num_tokens,
-                        ForwardMode.EXTEND,
-                        self.precompile_cache_loc_paddings[-1],
-                    )
+
+                model_worker_batch = self.generate_model_worker_batch(
+                    bs,
+                    num_tokens,
+                    ForwardMode.EXTEND,
+                    self.precompile_cache_loc_paddings[-1],
+                )
                 sampling_metadata = SamplingMetadata.from_model_worker_batch(
                     model_worker_batch, 0, self.mesh
                 )
@@ -386,8 +376,6 @@ class ModelWorker:
         max_cache_loc_size: int,
         do_penalties: bool = False,
         speculative_algotithm = None,
-        speculative_num_draft_tokens = 0,
-        speculative_eagle_topk = 0
     ) -> ModelWorkerBatch:
         valid_input_ids = np.array([1] * bs, dtype=jnp.int32)
         invalid_input_ids = np.array([0] * (num_tokens - bs), dtype=jnp.int32)
@@ -425,7 +413,7 @@ class ModelWorker:
             token_ids_logprobs=None,
             extend_logprob_start_lens=None,
             capture_hidden_mode=CaptureHiddenMode.NULL,
-            spec_algorithm=speculative_algotithm,
+            speculative_algorithm=speculative_algotithm,
         )
 
     def get_model_runner(self):

@@ -308,9 +308,14 @@ class Scheduler(
         )
 
         if not server_args.disable_jax_precompile:
-            logger.info("[Scheduler] Begins to run worker precompile.")
-            self.tp_worker.run_precompile()
-            logger.info("[Scheduler] Completes worker precompile.")
+            if self.spec_algorithm.is_none():
+                logger.info("[Scheduler] Begins to run worker precompile.")
+                self.tp_worker.run_precompile()
+                logger.info("[Scheduler] Completes worker precompile.")
+            else:
+                logger.info("[Scheduler] Begins to run spec_decode worker precompile.")
+                self.draft_worker.run_spec_decode_precompile()
+                logger.info("[Scheduler] Completes spec_decode worker precompile.")
 
     def sync_pub(self):
         logger.info(

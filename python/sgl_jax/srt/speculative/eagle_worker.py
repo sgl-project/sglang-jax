@@ -1,6 +1,9 @@
 import functools
 import logging
 
+import tqdm
+import itertools
+import time
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -676,6 +679,64 @@ class EAGLEWorker(ModelWorker):
         spec_info.positions = jnp.repeat(model_worker_batch.seq_lens, self.topk)
         self.token_to_kv_pool_allocator.restore_state(token_to_kv_pool_state_backup)
 
+    def run_spec_decode_precompile(self):
+        self.precompile_spec_extend()
+        self.precompile_spec_decode()
+        
+    def precompile_spec_extend(self):
+        start_time = time.perf_counter()
+        logger.info(
+            "[SPEC_EXTEND] Begin to precompile bs_paddings=%s token_paddings=%s",
+            self.precompile_bs_paddings[-1:],
+            self.precompile_token_paddings,
+        )
+
+        bs, _ = self.get_max_padded_size()
+        pairs = list(itertools.product([bs], self.precompile_token_paddings))
+
+        with tqdm(pairs, desc="[SPEC_EXTEND] PRECOMPILE", leave=False) as pbar:
+            for pair in pbar:
+                pair = list(pair)
+                bs, num_tokens = pair[0], pair[1]
+                pbar.set_postfix(bs=bs, tokens=num_tokens)
+                if bs > num_tokens:
+                    logger.warning("bs=%s > num_tokens=%s, skip this pair", bs, num_tokens)
+                    continue
+                model_worker_batch = self.generate_model_worker_batch(
+                    bs,
+                    num_tokens,
+                    ForwardMode.EXTEND,
+                    self.precompile_cache_loc_paddings[-1],
+                )
+                self.forward_batch_speculative_generation(model_worker_batch)
+        end_time = time.perf_counter()
+        logger.info("[SPEC_EXTEND] Precompile finished in %.0f secs", end_time - start_time)
+
+    def precompile_spec_decode(self):
+        start_time = time.perf_counter()
+        logger.info(
+            "[SPEC_DECODE] Begin to precompile bs_paddings=%s",
+            self.precompile_bs_paddings,
+        )
+
+        with tqdm(self.precompile_bs_paddings, desc="[SPEC_DECODE] PRECOMPILE", leave=False) as pbar:
+            for bs in pbar:
+                pbar.set_postfix(bs=bs)
+                # use same page aligned with precompile cache_loc_paddings
+                aligned_cache_loc_size = (
+                    (bs * self.max_req_len + self.page_size - 1) // self.page_size * self.page_size
+                )
+                model_worker_batch = self.generate_model_worker_batch(
+                    bs,
+                    bs,
+                    ForwardMode.DECODE,
+                    aligned_cache_loc_size,
+                    self.speculative_algorithm
+                )
+                _, next_token_ids, _ = self.forward_batch_speculative_generation(model_worker_batch)
+
+        end_time = time.perf_counter()
+        logger.info("[SPEC_DECODE] Precompile finished in %.0f secs", end_time - start_time)
 
 @functools.partial(jax.jit, static_argnames=["topk"])
 def topk_probs_from_logits(
