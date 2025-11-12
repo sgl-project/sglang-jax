@@ -286,7 +286,7 @@ class MHATokenToKVPool(KVCache):
 
     def _create_buffers(self):
         """Create sharded fused KV cache buffers with proper distributed allocation"""
-        self.kv_sharding = NamedSharding(self.mesh, P(None, self.kv_partition_axis))
+        self.kv_sharding = NamedSharding(self.mesh, P(None, self.kv_partition_axis, None))
 
         logger.info("Creating fused KV buffers for %s layers", self.layer_num)
         start_time = time.time()

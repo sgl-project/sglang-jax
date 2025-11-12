@@ -37,6 +37,7 @@ class QWen3Attention(nnx.Module):
         attention_bias: bool = False,
         dtype: jnp.dtype = jnp.bfloat16,
         rngs: nnx.Rngs = None,
+        mesh: jax.sharding.Mesh = None,
     ):
         self.layer_id = layer_id
         assert num_heads % num_kv_heads == 0
@@ -52,14 +53,12 @@ class QWen3Attention(nnx.Module):
             self.head_dim,
             epsilon=rms_norm_eps,
             param_dtype=dtype,
-            scale_init=nnx.with_partitioning(init_fn, (None,)),
             rngs=rngs,
         )
         self.k_norm = RMSNorm(
             self.head_dim,
             epsilon=rms_norm_eps,
             param_dtype=dtype,
-            scale_init=nnx.with_partitioning(init_fn, (None,)),
             rngs=rngs,
         )
 
@@ -70,6 +69,7 @@ class QWen3Attention(nnx.Module):
             kernel_axes=(None, "tensor"),
             rngs=rngs,
             params_dtype=dtype,
+            mesh=mesh,
         )
         self.k_proj = LinearBase(
             input_size=hidden_size,
@@ -78,6 +78,7 @@ class QWen3Attention(nnx.Module):
             kernel_axes=(None, "tensor"),
             rngs=rngs,
             params_dtype=dtype,
+            mesh=mesh,
         )
         self.v_proj = LinearBase(
             input_size=hidden_size,
@@ -86,6 +87,7 @@ class QWen3Attention(nnx.Module):
             kernel_axes=(None, "tensor"),
             rngs=rngs,
             params_dtype=dtype,
+            mesh=mesh,
         )
         self.o_proj = LinearBase(
             input_size=num_heads * self.head_dim,
@@ -94,6 +96,7 @@ class QWen3Attention(nnx.Module):
             kernel_axes=("tensor", None),
             rngs=rngs,
             params_dtype=dtype,
+            mesh=mesh,
         )
         self.rotary_emb = RotaryEmbedding(
             head_size=self.head_dim,
@@ -145,6 +148,7 @@ class Qwen3MLP(nnx.Module):
         layer_id: int = 0,
         rngs: nnx.Rngs = None,
         dtype: jnp.dtype = jnp.bfloat16,
+        mesh: jax.sharding.Mesh = None,
     ) -> None:
         self.layer_id = layer_id
 
@@ -155,6 +159,7 @@ class Qwen3MLP(nnx.Module):
             use_bias=False,
             params_dtype=dtype,
             rngs=rngs,
+            mesh=mesh,
         )
 
         self.up_proj = LinearBase(
@@ -164,6 +169,7 @@ class Qwen3MLP(nnx.Module):
             use_bias=False,
             params_dtype=dtype,
             rngs=rngs,
+            mesh=mesh,
         )
 
         self.down_proj = LinearBase(
@@ -173,6 +179,7 @@ class Qwen3MLP(nnx.Module):
             use_bias=False,
             params_dtype=dtype,
             rngs=rngs,
+            mesh=mesh,
         )
 
         self.act_fn = jax.nn.silu
@@ -192,6 +199,7 @@ class QWen3DecoderLayer(nnx.Module):
         layer_id: int = 0,
         dtype: jnp.dtype = jnp.bfloat16,
         rngs: nnx.Rngs = None,
+        mesh: jax.sharding.Mesh = None,
     ):
         self.layer_id = layer_id
         self.hidden_size = config.hidden_size
@@ -212,6 +220,7 @@ class QWen3DecoderLayer(nnx.Module):
             attention_bias=config.attention_bias,
             dtype=dtype,
             rngs=rngs,
+            mesh=mesh,
         )
 
         self.mlp = Qwen3MLP(
@@ -220,19 +229,18 @@ class QWen3DecoderLayer(nnx.Module):
             layer_id=layer_id,
             dtype=dtype,
             rngs=rngs,
+            mesh=mesh,
         )
         self.input_layernorm = RMSNorm(
             config.hidden_size,
             epsilon=config.rms_norm_eps,
             param_dtype=dtype,
-            scale_init=nnx.with_partitioning(init_fn, (None,)),
             rngs=rngs,
         )
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size,
             epsilon=config.rms_norm_eps,
             param_dtype=dtype,
-            scale_init=nnx.with_partitioning(init_fn, (None,)),
             rngs=rngs,
         )
 
@@ -288,14 +296,16 @@ class QWen3Model(nnx.Module):
         config: PretrainedConfig,
         dtype: jnp.dtype = jnp.bfloat16,
         rngs: nnx.Rngs = None,
+        mesh: jax.sharding.Mesh = None,
     ):
         self.embed_tokens = Embed(
             num_embeddings=config.vocab_size,
             features=config.hidden_size,
             rngs=rngs,
             dtype=dtype,
-            embedding_init=nnx.with_partitioning(init_fn, ("tensor", None)),
+            kernel_axes=("tensor", None),
             param_dtype=dtype,
+            mesh=mesh,
         )
 
         self.layers = nnx.data(
@@ -305,6 +315,7 @@ class QWen3Model(nnx.Module):
                     layer_id=i,
                     dtype=dtype,
                     rngs=rngs,
+                    mesh=mesh,
                 )
                 for i in range(config.num_hidden_layers)
             ]
@@ -314,7 +325,6 @@ class QWen3Model(nnx.Module):
             config.hidden_size,
             epsilon=config.rms_norm_eps,
             param_dtype=dtype,
-            scale_init=nnx.with_partitioning(init_fn, (None,)),
             rngs=rngs,
         )
 
@@ -361,12 +371,12 @@ class Qwen3ForCausalLM(nnx.Module):
         self.config = config
         self.dtype = dtype
         logger.info("QWen3ForCausalLMModel config dtype: %s", self.dtype)
-        self.model = QWen3Model(config, dtype=self.dtype, rngs=rngs)
+        self.model = QWen3Model(config, dtype=self.dtype, rngs=rngs, mesh=mesh)
         if not getattr(self.config, "tie_word_embeddings", False):
             self.lm_head = ParallelLMHead(
                 config.vocab_size,
                 config.hidden_size,
-                embedding_init=nnx.with_partitioning(init_fn, ("tensor", None)),
+                kernel_axes=("tensor", None),
                 rngs=rngs,
             )
         self.logits_processor = LogitsProcessor(config.vocab_size, mesh=self.mesh)
@@ -429,28 +439,24 @@ class Qwen3ForCausalLM(nnx.Module):
                 target_path=f"{target_prefix}.self_attn.q_proj.weight",
                 sharding=(None, "tensor"),
                 transpose=True,
-                head_dim_padding=True,
                 kv_head_padding=False,
             ),
             f"{prefix}.self_attn.k_proj.weight": WeightMapping(
                 target_path=f"{target_prefix}.self_attn.k_proj.weight",
                 sharding=(None, "tensor"),
                 transpose=True,
-                head_dim_padding=True,
                 kv_head_padding=True,
             ),
             f"{prefix}.self_attn.v_proj.weight": WeightMapping(
                 target_path=f"{target_prefix}.self_attn.v_proj.weight",
                 sharding=(None, "tensor"),
                 transpose=True,
-                head_dim_padding=True,
                 kv_head_padding=True,
             ),
             f"{prefix}.self_attn.o_proj.weight": WeightMapping(
                 target_path=f"{target_prefix}.self_attn.o_proj.weight",
                 sharding=("tensor", None),
                 transpose=True,
-                head_dim_padding=True,
                 kv_head_padding=False,
             ),
             f"{prefix}.self_attn.q_norm.weight": WeightMapping(
@@ -486,21 +492,18 @@ class Qwen3ForCausalLM(nnx.Module):
                     target_path=f"{target_prefix}.self_attn.q_proj.bias",
                     sharding=(None,),
                     transpose=False,
-                    head_dim_padding=True,
                     kv_head_padding=False,
                 ),
                 f"{prefix}.self_attn.k_proj.bias": WeightMapping(
                     target_path=f"{target_prefix}.self_attn.k_proj.bias",
                     sharding=(None,),
                     transpose=False,
-                    head_dim_padding=True,
                     kv_head_padding=True,
                 ),
                 f"{prefix}.self_attn.v_proj.bias": WeightMapping(
                     target_path=f"{target_prefix}.self_attn.v_proj.bias",
                     sharding=(None,),
                     transpose=False,
-                    head_dim_padding=True,
                     kv_head_padding=True,
                 ),
                 f"{prefix}.self_attn.o_proj.bias": WeightMapping(

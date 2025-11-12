@@ -4,6 +4,7 @@ from typing import Any
 from flax import nnx
 from jax import jax
 from jax import numpy as jnp
+from jax.sharding import PartitionSpec as P
 from transformers import PretrainedConfig
 
 from sgl_jax.srt.configs.model_config import ModelConfig
@@ -11,7 +12,7 @@ from sgl_jax.srt.layers.embeddings import Embed, ParallelLMHead, RotaryEmbedding
 from sgl_jax.srt.layers.layernorm import RMSNorm
 from sgl_jax.srt.layers.linear import LinearBase
 from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
-from sgl_jax.srt.layers.moe import EPMoE, FusedMoE, GateLogit, TopK
+from sgl_jax.srt.layers.moe import EPMoE, GateLogit, TopK
 from sgl_jax.srt.layers.radix_attention import RadixAttention
 from sgl_jax.srt.mem_cache.memory_pool import KVCache
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
@@ -38,6 +39,7 @@ class QWen3MoeAttention(nnx.Module):
         attention_bias: bool = False,
         dtype: jnp.dtype = jnp.bfloat16,
         rngs: nnx.Rngs = None,
+        mesh: jax.sharding.Mesh = None,
     ):
         self.layer_id = layer_id
         assert num_heads % num_kv_heads == 0
@@ -54,14 +56,12 @@ class QWen3MoeAttention(nnx.Module):
             self.head_dim,
             epsilon=rms_norm_eps,
             param_dtype=dtype,
-            scale_init=nnx.with_partitioning(init_fn, (None,)),
             rngs=rngs,
         )
         self.k_norm = RMSNorm(
             self.head_dim,
             epsilon=rms_norm_eps,
             param_dtype=dtype,
-            scale_init=nnx.with_partitioning(init_fn, (None,)),
             rngs=rngs,
         )
 
@@ -72,6 +72,7 @@ class QWen3MoeAttention(nnx.Module):
             kernel_axes=(None, "tensor"),
             rngs=rngs,
             params_dtype=dtype,
+            mesh=mesh,
         )
         self.k_proj = LinearBase(
             input_size=hidden_size,
@@ -80,6 +81,7 @@ class QWen3MoeAttention(nnx.Module):
             kernel_axes=(None, "tensor"),
             rngs=rngs,
             params_dtype=dtype,
+            mesh=mesh,
         )
         self.v_proj = LinearBase(
             input_size=hidden_size,
@@ -88,6 +90,7 @@ class QWen3MoeAttention(nnx.Module):
             kernel_axes=(None, "tensor"),
             rngs=rngs,
             params_dtype=dtype,
+            mesh=mesh,
         )
         self.c_proj = LinearBase(
             input_size=num_heads * self.head_dim,
@@ -96,6 +99,7 @@ class QWen3MoeAttention(nnx.Module):
             kernel_axes=("tensor", None),
             rngs=rngs,
             params_dtype=dtype,
+            mesh=mesh,
         )
         self.rotary_emb = RotaryEmbedding(
             head_size=self.head_dim,
@@ -149,6 +153,7 @@ class QWen3MoeDecoderLayer(nnx.Module):
     ):
         self.layer_id = layer_id
         self.hidden_size = config.hidden_size
+        self.mesh = mesh
         rope_theta = getattr(config, "rope_theta", 1000000)
         rope_scaling = getattr(config, "rope_scaling", None)
         max_position_embeddings = getattr(config, "max_position_embeddings", 40960)
@@ -167,6 +172,7 @@ class QWen3MoeDecoderLayer(nnx.Module):
             attention_bias=getattr(config, "attention_bias", False),
             dtype=dtype,
             rngs=rngs,
+            mesh=mesh,
         )
 
         mlp_only_layers = getattr(config, "mlp_only_layers", [])
@@ -178,6 +184,7 @@ class QWen3MoeDecoderLayer(nnx.Module):
                 layer_id=layer_id,
                 dtype=dtype,
                 rngs=rngs,
+                mesh=mesh,
             )
             self.is_moe_layer = False
             self.moe_gate = None
@@ -193,43 +200,29 @@ class QWen3MoeDecoderLayer(nnx.Module):
                 input_size=config.hidden_size,
                 num_experts=num_experts,
             )
-            with mesh:
-                if config.ep_size > 1:
-                    expert_parallel_size = mesh.shape.get("data", 1) * mesh.shape.get("tensor", 1)
-                    self.mlp = EPMoE(
-                        config=config,
-                        num_experts=num_experts,
-                        num_experts_per_tok=num_experts_per_tok,
-                        intermediate_dim=moe_intermediate_size,
-                        mesh=mesh,
-                        expert_parallel_size=expert_parallel_size,
-                        weight_dtype=dtype,
-                        dtype=dtype,
-                        layer_id=layer_id,
-                    )
-                else:
-                    self.mlp = FusedMoE(
-                        config=config,
-                        num_experts=num_experts,
-                        intermediate_dim=moe_intermediate_size,
-                        weight_dtype=dtype,
-                        dtype=dtype,
-                        mesh=mesh,
-                    )
+            self.mlp = EPMoE(
+                config=config,
+                num_experts=num_experts,
+                num_experts_per_tok=num_experts_per_tok,
+                intermediate_dim=moe_intermediate_size,
+                mesh=mesh,
+                ep_size=config.ep_size,
+                weight_dtype=dtype,
+                dtype=dtype,
+                layer_id=layer_id,
+            )
             self.is_moe_layer = True
 
         self.input_layernorm = RMSNorm(
             config.hidden_size,
             epsilon=config.rms_norm_eps,
             param_dtype=dtype,
-            scale_init=nnx.with_partitioning(init_fn, (None,)),
             rngs=rngs,
         )
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size,
             epsilon=config.rms_norm_eps,
             param_dtype=dtype,
-            scale_init=nnx.with_partitioning(init_fn, (None,)),
             rngs=rngs,
         )
 
@@ -264,7 +257,10 @@ class QWen3MoeDecoderLayer(nnx.Module):
             router_logits = self.moe_gate(hidden_states)
             topk_weights, topk_ids = self.topk(router_logits)
             mlp_output = self.mlp(hidden_states, topk_weights, topk_ids)
-            hidden_states = mlp_output
+            output_pspec = P(*([None] * (mlp_output.ndim - 1)), "tensor")
+            hidden_states = jax.sharding.reshard(
+                mlp_output, jax.sharding.NamedSharding(self.mesh, output_pspec)
+            )
         else:
             hidden_states = self.mlp(hidden_states)
 
@@ -288,8 +284,9 @@ class QWen3MoeModel(nnx.Module):
             features=config.hidden_size,
             rngs=rngs,
             dtype=dtype,
-            embedding_init=nnx.with_partitioning(init_fn, ("tensor", None)),
+            kernel_axes=("tensor", None),
             param_dtype=dtype,
+            mesh=mesh,
         )
 
         self.layers = nnx.data(
@@ -309,7 +306,6 @@ class QWen3MoeModel(nnx.Module):
             config.hidden_size,
             epsilon=config.rms_norm_eps,
             param_dtype=dtype,
-            scale_init=nnx.with_partitioning(init_fn, (None,)),
             rngs=rngs,
         )
 
@@ -357,7 +353,7 @@ class Qwen3MoeForCausalLM(nnx.Module):
             self.lm_head = ParallelLMHead(
                 config.vocab_size,
                 config.hidden_size,
-                embedding_init=nnx.with_partitioning(init_fn, ("tensor", None)),
+                kernel_axes=("tensor", None),
                 rngs=rngs,
             )
         self.logits_processor = LogitsProcessor(config.vocab_size, mesh=self.mesh)
@@ -516,13 +512,30 @@ class Qwen3MoeForCausalLM(nnx.Module):
                     f"{prefix}.mlp.experts.{i}.{expert_type}.weight" for i in range(num_experts)
                 ]
 
-                if self.config.ep_size > 1:
-                    sharding = (("data", "tensor"), None, None)
+                if expert_type == "down_proj":
+                    sharding = ("expert", "tensor", None)
                 else:
-                    if expert_type == "down_proj":
-                        sharding = (None, ("data", "tensor"), None)
-                    else:
-                        sharding = (None, None, ("data", "tensor"))
+                    sharding = ("expert", None, "tensor")
+                # world_size = (
+                #     self.mesh.shape.get("data", 1)
+                #     * self.mesh.shape.get("tensor", 1)
+                #     * self.mesh.shape.get("expert", 1)
+                # )
+                # tp_size = world_size // self.config.ep_size
+
+                # if self.config.ep_size == 1:
+                #     # TP
+                #     if expert_type == "down_proj":
+                #         sharding = (None, ("data", "tensor"), None)
+                #     else:
+                #         sharding = (None, None, ("data", "tensor"))
+                # elif tp_size > 1:
+                #     # ETP
+
+                # else:
+                #     # EP
+                #     sharding = (("data", "tensor"), None, None)
+
                 mappings[f"__MOE_EXPERTS__{prefix}.mlp.{target_name}"] = WeightMapping(
                     target_path=[f"{target_prefix}.mlp.{target_name}"] + expert_keys,
                     sharding=sharding,

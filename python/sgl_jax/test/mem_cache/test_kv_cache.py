@@ -9,7 +9,7 @@ from sgl_jax.srt.mem_cache.memory_pool import (
 )
 from sgl_jax.srt.utils.mesh_utils import create_device_mesh
 
-mesh = create_device_mesh(ici_parallelism=[1, -1, 1, 1], dcn_parallelism=[1, 1, 1, 1])
+mesh = create_device_mesh(ici_parallelism=[1, -1], dcn_parallelism=[1, 1])
 jax.sharding.set_mesh(mesh)
 
 

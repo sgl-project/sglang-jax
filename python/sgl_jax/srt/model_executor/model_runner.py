@@ -128,7 +128,7 @@ class ModelRunner:
             pass
 
         # Load the model
-        self.sampler = Sampler(nnx.Rngs(server_args.random_seed))
+        self.sampler = Sampler(nnx.Rngs(server_args.random_seed), mesh=self.mesh)
         total_device_memory = self.get_available_device_memory()
         self.load_model()
 
@@ -174,18 +174,17 @@ class ModelRunner:
             model = nnx.merge(model_def, model_state)
             return model(forward_batch, token_to_kv_pool, logits_metadata)
 
-        @partial(jax.jit, static_argnames=["sampler_state_def", "mesh", "use_sort_for_toppk_minp"])
+        @partial(jax.jit, static_argnames=["sampler_state_def", "use_sort_for_toppk_minp"])
         def jitted_sampler(
             sampler_def,
             sampler_state_def,
             sampler_state_leaves,
-            mesh,
             use_sort_for_toppk_minp,
             *args,
         ):
             model_state = jax.tree_util.tree_unflatten(sampler_state_def, sampler_state_leaves)
             sampler = nnx.merge(sampler_def, model_state)
-            return sampler(*args, mesh=mesh, use_sort_for_toppk_minp=use_sort_for_toppk_minp)
+            return sampler(*args, use_sort_for_toppk_minp=use_sort_for_toppk_minp)
 
         def run_model_wrapper(forward_batch, logits_metadata):
             token_to_kv_pool = self.token_to_kv_pool
@@ -205,7 +204,6 @@ class ModelRunner:
             sampler_def,
             sampler_state_def,
             sampler_state_leaves,
-            self.mesh,
             self.use_sort_for_toppk_minp,
         )
 
@@ -449,7 +447,7 @@ class ModelRunner:
         if self.tp_size == 1:
             target_sharding = NamedSharding(
                 self.token_to_kv_pool.mesh,
-                P(None, self.token_to_kv_pool.kv_partition_axis),
+                P(None, self.token_to_kv_pool.kv_partition_axis, None),
             )
             layers_kv_fused = [
                 jax.device_put(layer_kv_fused, target_sharding)

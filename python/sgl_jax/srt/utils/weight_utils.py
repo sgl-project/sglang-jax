@@ -85,6 +85,17 @@ class WeightLoader:
         else:
             self.sharding_size = 1
 
+        if hasattr(model_config, "ep_size") and model_config.ep_size > 1:
+            world_size = self.mesh.shape.get("data", 1) * self.mesh.shape.get("tensor", 1)
+            tp_size = world_size // model_config.ep_size
+            ep_size = model_config.ep_size
+            abstract_mesh = self.mesh.abstract_mesh
+            self.moe_abstract_mesh = abstract_mesh.update(
+                axis_sizes=(ep_size, tp_size), axis_names=("expert", "tensor")
+            )
+        else:
+            self.moe_abstract_mesh = None
+
     def load_weights_from_safetensors(
         self, weight_mappings: dict[str, str | list[str] | WeightMapping]
     ):
@@ -170,7 +181,21 @@ class WeightLoader:
             collected_weights.append(weight)
 
         stacked_weight = jnp.stack(collected_weights, axis=0)  # (num_experts, ...)
-        sharded_weight = self._shard_weight(stacked_weight, mapping.sharding)
+
+        if "expert" in mapping.sharding:
+            ep_size = getattr(self.model_config.hf_config, "ep_size", 1)
+            world_size = self.mesh.shape.get("data", 1) * self.mesh.shape.get("tensor", 1)
+            tp_size = world_size // ep_size
+
+            devices = self.mesh.devices.flatten()
+            moe_mesh = jax.sharding.Mesh(
+                devices.reshape(ep_size, tp_size), axis_names=("expert", "tensor")
+            )
+
+            sharded_weight = self._shard_weight(stacked_weight, mapping.sharding, mesh=moe_mesh)
+        else:
+            sharded_weight = self._shard_weight(stacked_weight, mapping.sharding)
+
         model_param = self._get_param(params, target_path)
         model_param.value = sharded_weight.astype(model_param.value.dtype)
 
@@ -393,8 +418,12 @@ class WeightLoader:
             model_param.value = sharded_weight.astype(model_param.value.dtype)
             logger.debug("Split %s -> %s, shape: %s", hf_key, jax_path, processed_weight.shape)
 
-    def _shard_weight(self, weight: jax.Array, sharding_spec: tuple) -> jax.Array:
-        target_sharding = jax.sharding.NamedSharding(self.mesh, P(*sharding_spec))
+    def _shard_weight(
+        self, weight: jax.Array, sharding_spec: tuple, mesh: jax.sharding.Mesh = None
+    ) -> jax.Array:
+        if mesh is None:
+            mesh = self.mesh
+        target_sharding = jax.sharding.NamedSharding(mesh, P(*sharding_spec))
 
         if (
             getattr(weight, "_committed", False)

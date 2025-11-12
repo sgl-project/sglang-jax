@@ -190,9 +190,7 @@ class Scheduler(
         # init distribution
         if self.nnodes > 1:
             jax.distributed.initialize(server_args.dist_init_addr, self.nnodes, self.node_rank)
-        self.mesh = create_device_mesh(
-            ici_parallelism=[-1, self.tp_size, 1], dcn_parallelism=[1, 1, 1]
-        )
+        self.mesh = create_device_mesh(ici_parallelism=[-1, self.tp_size], dcn_parallelism=[1, 1])
 
         TpWorkerClass = ModelWorkerClient if self.enable_overlap else ModelWorker
 

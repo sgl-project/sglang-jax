@@ -4,6 +4,8 @@ import jax
 from flax import nnx
 from jax import lax
 from jax import numpy as jnp
+from jax.sharding import NamedSharding
+from jax.sharding import PartitionSpec as P
 
 
 def _canonicalize_tuple(x):
@@ -39,20 +41,31 @@ class LinearBase(nnx.Module):
         params_dtype: jnp.dtype | None = jnp.bfloat16,
         kernel_axes: Sequence[str] | None = None,
         rngs: nnx.Rngs = None,
+        mesh: jax.sharding.Mesh = None,
     ):
         """Initialize parameters and quantization method."""
         self.skip_bias_add = skip_bias_add
         self.params_dtype = params_dtype
+        self.kernel_axes = kernel_axes
+        self.mesh = mesh
         self.weight = nnx.Param(
-            nnx.with_partitioning(nnx.initializers.normal(), kernel_axes)(
-                jax.random.PRNGKey(0), (input_size, output_size), params_dtype
-            )
+            jax.random.normal(
+                jax.random.PRNGKey(0),
+                (input_size, output_size),
+                dtype=params_dtype,
+                out_sharding=P(*kernel_axes),
+            ),
         )
         if use_bias:
             self.bias = nnx.Param(
-                nnx.with_partitioning(nnx.initializers.zeros_init(), (kernel_axes[-1],))(
-                    jax.random.PRNGKey(0), (output_size,), params_dtype
-                )
+                jax.random.normal(
+                    jax.random.PRNGKey(0),
+                    (output_size,),
+                    dtype=params_dtype,
+                    out_sharding=P(
+                        kernel_axes[-1],
+                    ),
+                ),
             )
         else:
             self.bias = None
@@ -60,12 +73,14 @@ class LinearBase(nnx.Module):
     def __call__(self, x: jax.Array) -> tuple[jax.Array, jax.Array | None]:
         """Forward pass of the linear layer."""
         bias = self.bias if not self.skip_bias_add else None
-        # Access the underlying JAX array using .value property
+        output_pspec = P(*([None] * (x.ndim - 1)), self.kernel_axes[-1])
+        output_sharding = NamedSharding(self.mesh, output_pspec)
         output = lax.dot_general(
             x,
             self.weight.value,
             (((x.ndim - 1,), (0,)), ((), ())),
             preferred_element_type=self.params_dtype,
+            out_sharding=output_sharding,
         )
         if bias is not None:
             output = output + bias.value

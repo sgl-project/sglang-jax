@@ -22,8 +22,9 @@ import jax.numpy as jnp
 import numpy as np
 from flax import nnx
 from flax.nnx.nn import dtypes
-from flax.nnx.nn.linear import default_embed_init
 from flax.typing import PromoteDtypeFn
+from jax.sharding import NamedSharding
+from jax.sharding import PartitionSpec as P
 
 
 class Embed(nnx.Module):
@@ -35,7 +36,7 @@ class Embed(nnx.Module):
       dtype: the dtype of the embedding vectors (default: float32).
       param_dtype: the dtype of the embedding parameters.
       promote_dtype: the dtype promotion function.
-      embedding_init: embedding initializer.
+      kernel_axes: the axes of kernel weights.
       rngs: rng keys.
     """
 
@@ -46,8 +47,9 @@ class Embed(nnx.Module):
         dtype: jnp.dtype | None = None,
         param_dtype: jnp.dtype = jnp.bfloat16,
         promote_dtype: PromoteDtypeFn = dtypes.promote_dtype,
-        embedding_init: nnx.Initializer = default_embed_init,
+        kernel_axes: tuple[str, ...] = (None, "tensor"),
         rngs: nnx.Rngs = None,
+        mesh: jax.sharding.Mesh = None,
     ):
         """
         Sets up the embedding parameters for the model.
@@ -67,13 +69,19 @@ class Embed(nnx.Module):
             rngs: Random number generator state for parameter initialization.
         """
         self.embedding = nnx.Param(
-            embedding_init(jax.random.PRNGKey(0), (num_embeddings, features), param_dtype)
+            jax.random.normal(
+                jax.random.PRNGKey(0),
+                (num_embeddings, features),
+                dtype=param_dtype,
+                out_sharding=P(*kernel_axes),
+            ),
         )
-
+        self.kernel_axes = kernel_axes
         self.num_embeddings = num_embeddings
         self.features = features
         self.dtype = dtype or self.embedding.value.dtype
         self.promote_dtype = promote_dtype
+        self.mesh = mesh
 
     def __call__(self, inputs: jax.Array) -> jax.Array:
         """Embeds the inputs along the last dimension.
@@ -92,7 +100,11 @@ class Embed(nnx.Module):
         (embedding,) = self.promote_dtype((self.embedding.value,), dtype=self.dtype, inexact=False)
         if self.num_embeddings == 1:
             return jnp.broadcast_to(embedding, inputs.shape + (self.features,))
-        return jnp.take(embedding, inputs, axis=0)
+
+        output_pspec = P(*([None] * inputs.ndim), self.kernel_axes[-1])
+        output_sharding = NamedSharding(self.mesh, output_pspec)
+        output = embedding.at[inputs].get(out_sharding=output_sharding)
+        return output
 
     def attend(self, query: jax.Array) -> jax.Array:
         """Attend over the embedding using a query array.
@@ -126,7 +138,7 @@ class ParallelLMHead(Embed):
         dtype: jnp.dtype | None = None,
         param_dtype: jnp.dtype = jnp.bfloat16,
         promote_dtype: PromoteDtypeFn = dtypes.promote_dtype,
-        embedding_init: nnx.Initializer = default_embed_init,
+        kernel_axes: tuple[str, ...] = ("tensor", None),
         rngs: nnx.Rngs = None,
         use_bias: bool = False,
     ):
@@ -151,16 +163,17 @@ class ParallelLMHead(Embed):
             dtype=dtype,
             param_dtype=param_dtype,
             promote_dtype=promote_dtype,
-            embedding_init=embedding_init,
+            kernel_axes=kernel_axes,
             rngs=rngs,
         )
         if use_bias:
             self.bias = nnx.Param(
-                nnx.with_partitioning(nnx.initializers.constant(0.0), (None, "tensor"))(
+                jax.random.normal(
                     jax.random.PRNGKey(0),
                     (self.num_embeddings, self.features),
-                    param_dtype,
-                )
+                    dtype=param_dtype,
+                    out_sharding=P(None, "tensor"),
+                ),
             )
         else:
             self.bias = None

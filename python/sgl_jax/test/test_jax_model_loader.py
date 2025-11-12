@@ -148,7 +148,7 @@ class TestJAXModelLoader(CustomTestCase):
     """Test cases for JAXModelLoader"""
 
     def setUp(self):
-        self.mesh = create_device_mesh(ici_parallelism=[-1, 1, 1], dcn_parallelism=[1, 1, 1])
+        self.mesh = create_device_mesh(ici_parallelism=[-1, 1], dcn_parallelism=[1, 1])
 
         self.test_model_path = os.environ.get("MODEL_PATH", "/tmp/test_jax_model")
         self.load_config = LoadConfig(load_format=LoadFormat.JAX)

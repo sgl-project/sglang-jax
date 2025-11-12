@@ -5,9 +5,10 @@ import jax
 import jax.numpy as jnp
 from flax import nnx
 from flax.nnx import rnglib
-from flax.nnx.nn import dtypes, initializers
-from flax.typing import Array, Axes, Dtype, Initializer
+from flax.nnx.nn import dtypes
+from flax.typing import Array, Axes, Dtype
 from jax import lax
+from jax.sharding import PartitionSpec as P
 
 
 def _canonicalize_axes(rank: int, axes: Axes) -> tuple[int, ...]:
@@ -34,7 +35,6 @@ class RMSNorm(nnx.Module):
         dtype: Dtype | None = None,
         param_dtype: Dtype = jnp.float32,
         use_scale: bool = True,
-        scale_init: Initializer = initializers.ones,
         reduction_axes: Axes = -1,
         feature_axes: Axes = -1,
         axis_name: str | None = None,
@@ -46,7 +46,16 @@ class RMSNorm(nnx.Module):
 
         self.scale: nnx.Param[jax.Array] | None
         if use_scale:
-            self.scale = nnx.Param(scale_init(jax.random.PRNGKey(0), feature_shape, param_dtype))
+            self.scale = nnx.Param(
+                jax.random.normal(
+                    jax.random.PRNGKey(0),
+                    feature_shape,
+                    dtype=param_dtype,
+                    out_sharding=P(
+                        None,
+                    ),
+                ),
+            )
         else:
             self.scale = None
 
@@ -55,7 +64,6 @@ class RMSNorm(nnx.Module):
         self.dtype = dtype
         self.param_dtype = param_dtype
         self.use_scale = use_scale
-        self.scale_init = scale_init
         self.reduction_axes = reduction_axes
         self.feature_axes = feature_axes
         self.axis_name = axis_name

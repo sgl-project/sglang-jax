@@ -177,7 +177,7 @@ class EPMoE(nnx.Module):
         config,
         num_experts: int,
         num_experts_per_tok: int,
-        expert_parallel_size: int,
+        ep_size: int,
         mesh: Mesh,
         intermediate_dim: int = 2048,
         weight_dtype: jnp.dtype = jnp.bfloat16,
@@ -191,44 +191,55 @@ class EPMoE(nnx.Module):
         self.weight_dtype = weight_dtype
         self.dtype = dtype
         self.layer_id = layer_id
-        self.expert_parallel_size = expert_parallel_size
+        self.ep_size = ep_size
         self.mesh = mesh
-        if num_experts % self.expert_parallel_size != 0:
+        if num_experts % self.ep_size != 0:
             raise ValueError(
-                f"num_experts({num_experts}) must be divisible by expert_parallel_size ({self.expert_parallel_size})"
+                f"num_experts({num_experts}) must be divisible by ep_size ({self.ep_size})"
             )
+        world_size = self.mesh.shape.get("data", 1) * mesh.shape.get("tensor", 1)
+        self.tp_size = world_size // self.ep_size
+        self.experts_per_device = num_experts // self.ep_size
 
-        self.experts_per_device = num_experts // self.expert_parallel_size
-        expert_kernel_axes = (("data", "tensor"), None, None)
-
-        self.wi_0 = nnx.Param(
-            nnx.with_partitioning(nnx.initializers.normal(), expert_kernel_axes)(
-                jax.random.PRNGKey(0),
-                (self.experts_per_device, config.hidden_size, intermediate_dim),
-                weight_dtype,
-            )
+        devices = self.mesh.devices.flatten()
+        self.moe_mesh = jax.sharding.Mesh(
+            devices.reshape(self.ep_size, self.tp_size),
+            axis_names=("expert", "tensor"),
+            axis_types=(jax.sharding.AxisType.Explicit, jax.sharding.AxisType.Explicit),
         )
 
-        self.wi_1 = nnx.Param(
-            nnx.with_partitioning(nnx.initializers.normal(), expert_kernel_axes)(
-                jax.random.PRNGKey(0),
-                (self.experts_per_device, config.hidden_size, intermediate_dim),
-                weight_dtype,
-            )
+        abstract_mesh = self.mesh.abstract_mesh
+        self.updated_mesh = abstract_mesh.update(
+            axis_sizes=(self.ep_size, self.tp_size), axis_names=("expert", "tensor")
         )
 
-        self.wo = nnx.Param(
-            nnx.with_partitioning(nnx.initializers.normal(), expert_kernel_axes)(
-                jax.random.PRNGKey(0),
-                (self.experts_per_device, intermediate_dim, config.hidden_size),
-                weight_dtype,
+        with jax.sharding.use_abstract_mesh(self.updated_mesh):
+            self.wi_0 = nnx.Param(
+                jax.random.normal(
+                    jax.random.PRNGKey(0),
+                    (self.experts_per_device, config.hidden_size, intermediate_dim),
+                    dtype=weight_dtype,
+                    out_sharding=P("expert", None, "tensor"),
+                )
             )
-        )
 
-        state = nnx.state(self)
-        pspecs = nnx.get_partition_spec(state)
-        sharded_state = jax.lax.with_sharding_constraint(state, pspecs)
-        nnx.update(self, sharded_state)
+            self.wi_1 = nnx.Param(
+                jax.random.normal(
+                    jax.random.PRNGKey(0),
+                    (self.experts_per_device, config.hidden_size, intermediate_dim),
+                    dtype=weight_dtype,
+                    out_sharding=P("expert", None, "tensor"),
+                )
+            )
+
+            self.wo = nnx.Param(
+                jax.random.normal(
+                    jax.random.PRNGKey(0),
+                    (self.experts_per_device, intermediate_dim, config.hidden_size),
+                    dtype=weight_dtype,
+                    out_sharding=P("expert", "tensor", None),
+                )
+            )
 
     def _detect_device_capabilities(self):
         try:
@@ -244,33 +255,35 @@ class EPMoE(nnx.Module):
             return False, "cpu"
 
     def __call__(self, hidden_states, topk_weights, topk_ids):
-        return shard_map(
-            self._forward,
-            mesh=self.mesh,
-            in_specs=(
-                P(None),  # hidden_states
-                P(None),  # topk_weights
-                P(None),  # topk_ids
-                P(("data", "tensor"), None, None),  # w0_weights
-                P(("data", "tensor"), None, None),  # w1_weights
-                P(("data", "tensor"), None, None),  # wo_weights
-            ),
-            out_specs=P(None),
-            check_rep=False,
-        )(
-            hidden_states,
-            topk_weights,
-            topk_ids,
-            self.wi_0.value,
-            self.wi_1.value,
-            self.wo.value,
-        )
+        with jax.sharding.use_abstract_mesh(self.updated_mesh):
+            hidden_states_reshard = jax.sharding.reshard(hidden_states, P(None))
+            topk_weights_reshard = jax.sharding.reshard(topk_weights, P(None))
+            topk_ids_reshard = jax.sharding.reshard(topk_ids, P(None))
+
+            return shard_map(
+                self._forward,
+                mesh=self.moe_mesh,
+                in_specs=(
+                    P(None),
+                    P(None),
+                    P(None),
+                    P("expert", None, "tensor"),
+                    P("expert", None, "tensor"),
+                    P("expert", "tensor", None),
+                ),
+                out_specs=P(None),
+                check_rep=False,
+            )(
+                hidden_states_reshard,
+                topk_weights_reshard,
+                topk_ids_reshard,
+                self.wi_0.value,
+                self.wi_1.value,
+                self.wo.value,
+            )
 
     def _forward(self, hidden_states, topk_weights, topk_ids, w0_weights, w1_weights, wo_weights):
-        data_index = jax.lax.axis_index("data")
-        tensor_index = jax.lax.axis_index("tensor")
-        tensor_size = jax.lax.axis_size("tensor")
-        expert_shard_id = data_index * tensor_size + tensor_index
+        expert_shard_id = jax.lax.axis_index("expert")
 
         if hidden_states.ndim == 2:
             total_tokens = hidden_states.shape[0]
@@ -284,7 +297,7 @@ class EPMoE(nnx.Module):
         )
 
         # EP Dispatch
-        if self.expert_parallel_size > 1:
+        if self.ep_size > 1:
             x, local_group_sizes, selected_experts = self._expert_all_to_all_dispatch(
                 x, selected_experts, expert_shard_id
             )
@@ -302,7 +315,7 @@ class EPMoE(nnx.Module):
         )
 
         # EP Combine
-        if self.expert_parallel_size > 1:
+        if self.ep_size > 1:
             original_size = total_tokens * self.num_experts_per_tok
             intermediate_output = self._expert_all_to_all_collect(
                 intermediate_output, group_sizes, expert_shard_id, original_size
@@ -348,6 +361,7 @@ class EPMoE(nnx.Module):
             preferred_element_type=self.dtype,
             tiling=tiling_gate,
         )
+
         # up
         layer_w1 = gmm(
             lhs=x,
@@ -369,6 +383,10 @@ class EPMoE(nnx.Module):
             preferred_element_type=self.dtype,
             tiling=tiling_down,
         )
+
+        # Need to reduce over the intermediate dimension which is sharded on "tensor" axis
+        if self.tp_size > 1:
+            intermediate_output = jax.lax.psum(intermediate_output, "tensor")
 
         return intermediate_output
 
@@ -402,19 +420,17 @@ class EPMoE(nnx.Module):
         return local_data, local_group_sizes, local_experts_extracted
 
     def _get_all_to_all_params(self, group_sizes, shard_id):
-        input_offsets = jnp.zeros(self.expert_parallel_size, dtype=group_sizes.dtype)
-        send_sizes = jnp.repeat(group_sizes[shard_id], self.expert_parallel_size)
+        input_offsets = jnp.zeros(self.ep_size, dtype=group_sizes.dtype)
+        send_sizes = jnp.repeat(group_sizes[shard_id], self.ep_size)
         output_offset = jnp.concatenate((jnp.array([0]), jnp.cumsum(group_sizes[:-1])))[shard_id]
-        output_offsets = jnp.repeat(output_offset, self.expert_parallel_size)
+        output_offsets = jnp.repeat(output_offset, self.ep_size)
         recv_sizes = group_sizes
 
         return input_offsets, send_sizes, output_offsets, recv_sizes
 
     def _expert_all_to_all_collect(self, data, global_group_sizes, expert_shard_id, target_size):
         # Calculate the number of tokens to be handled by each device.
-        reshaped_group_sizes = global_group_sizes.reshape(
-            self.expert_parallel_size, self.experts_per_device
-        )
+        reshaped_group_sizes = global_group_sizes.reshape(self.ep_size, self.experts_per_device)
         tokens_per_device = jnp.sum(reshaped_group_sizes, axis=1)
 
         # Get parameters for ragged_all_to_all
@@ -433,7 +449,7 @@ class EPMoE(nnx.Module):
             send_sizes,
             output_offsets,
             recv_sizes,
-            axis_name=("data", "tensor"),
+            axis_name=("expert",),
         )
 
         return result
@@ -509,89 +525,3 @@ class EPMoE(nnx.Module):
             final_output = output.reshape(batch_size, seq_len, -1).astype(self.dtype)
 
         return final_output
-
-
-class FusedMoE(nnx.Module):
-    def __init__(
-        self,
-        config,
-        num_experts: int,
-        intermediate_dim: int = 2048,
-        weight_dtype: jnp.dtype = jnp.bfloat16,
-        dtype: jnp.dtype = jnp.bfloat16,
-        layer_id: int = 0,
-        *,
-        mesh: Mesh,
-    ):
-        self.config = config
-        self.num_experts = num_experts
-        self.intermediate_dim = intermediate_dim
-        self.weight_dtype = weight_dtype
-        self.dtype = dtype
-        self.layer_id = layer_id
-
-        self.tp_size = mesh.shape.get("data") * mesh.shape.get("tensor")
-
-        self.mesh = mesh
-
-        self.experts_per_device = num_experts
-
-        self.wi_sharding = (None, None, ("data", "tensor"))
-        self.wo_sharding = (None, ("data", "tensor"), None)
-
-        self.wi_0 = nnx.Param(
-            nnx.with_partitioning(nnx.initializers.normal(), self.wi_sharding)(
-                jax.random.PRNGKey(0),
-                (num_experts, config.hidden_size, intermediate_dim),
-                weight_dtype,
-            )
-        )
-
-        self.wi_1 = nnx.Param(
-            nnx.with_partitioning(nnx.initializers.normal(), self.wi_sharding)(
-                jax.random.PRNGKey(0),
-                (num_experts, config.hidden_size, intermediate_dim),
-                weight_dtype,
-            )
-        )
-
-        self.wo = nnx.Param(
-            nnx.with_partitioning(nnx.initializers.normal(), self.wo_sharding)(
-                jax.random.PRNGKey(0),
-                (num_experts, intermediate_dim, config.hidden_size),
-                weight_dtype,
-            )
-        )
-
-    def __call__(self, hidden_states, topk_weights, topk_ids):
-        inputs = hidden_states.astype(self.dtype)
-
-        if inputs.ndim == 2:
-            num_tokens = inputs.shape[0]
-            inputs_flat = inputs
-        else:
-            num_tokens = inputs.shape[0] * inputs.shape[1]
-            inputs_flat = inputs.reshape(num_tokens, -1)
-
-        expert_weights = jnp.zeros((num_tokens, self.num_experts), dtype=self.dtype)
-        token_indices = jnp.arange(num_tokens)[:, None]
-
-        top_k_indices_flat = topk_ids.reshape(num_tokens, -1)
-        top_k_weights_flat = topk_weights.reshape(num_tokens, -1)
-
-        expert_weights = expert_weights.at[token_indices, top_k_indices_flat].set(
-            top_k_weights_flat
-        )
-
-        all_wi_0 = self.wi_0.value
-        all_wi_1 = self.wi_1.value
-        all_wo = self.wo.value
-
-        layer_w0 = jnp.einsum("th,ehd->ted", inputs_flat, all_wi_0)
-        layer_w1 = jnp.einsum("th,ehd->ted", inputs_flat, all_wi_1)
-
-        activated = jax.nn.silu(layer_w0) * layer_w1
-        expert_outputs = jnp.einsum("ted,edh->teh", activated, all_wo)
-        final_output = jnp.einsum("te,teh->th", expert_weights, expert_outputs)
-
-        return final_output.reshape(inputs.shape).astype(self.dtype)

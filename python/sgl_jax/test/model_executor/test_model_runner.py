@@ -53,8 +53,8 @@ class TestModelRunner(unittest.TestCase):
             jax_devices = jax_devices[: self.tp_size]
         self.mesh = create_device_mesh(
             devices=jax_devices,
-            ici_parallelism=[1, self.tp_size, 1, 1],
-            dcn_parallelism=[1, 1, 1, 1],
+            ici_parallelism=[1, self.tp_size],
+            dcn_parallelism=[1, 1],
         )
 
         # Create RNG
