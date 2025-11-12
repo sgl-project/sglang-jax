@@ -1,7 +1,7 @@
 import functools
 import logging
 
-import tqdm
+from tqdm import tqdm
 import itertools
 import time
 import jax
@@ -707,6 +707,8 @@ class EAGLEWorker(ModelWorker):
                     num_tokens,
                     ForwardMode.EXTEND,
                     self.precompile_cache_loc_paddings[-1],
+                    do_penalties=False,
+                    speculative_algotithm=self.speculative_algorithm,
                 )
                 self.forward_batch_speculative_generation(model_worker_batch)
         end_time = time.perf_counter()
@@ -731,9 +733,21 @@ class EAGLEWorker(ModelWorker):
                     bs,
                     ForwardMode.DECODE,
                     aligned_cache_loc_size,
-                    self.speculative_algorithm
+                    do_penalties=False,
+                    speculative_algotithm=self.speculative_algorithm,
                 )
-                _, next_token_ids, _ = self.forward_batch_speculative_generation(model_worker_batch)
+                spec_info = EagleDraftInput(
+                    # FIXME(pc) dtype should according to serverargs
+                    topk_p=jnp.ones((bs, self.topk), dtype=jnp.bfloat16 if self.server_args.dtype == "bfloat16" else jnp.float32),
+                    topk_index=jnp.ones((bs, self.topk),dtype=jnp.int32),
+                    hidden_states=jnp.ones((bs, self.model_config.hidden_size), dtype=jnp.bfloat16 if self.server_args.dtype == "bfloat16" else jnp.float32),
+                    verified_id=jnp.ones((bs,), dtype=jnp.int32),
+                    accept_length=jnp.ones((bs,), dtype=jnp.int32),
+                    capture_hidden_mode=CaptureHiddenMode.LAST,                  
+                )
+                model_worker_batch.capture_hidden_mode=CaptureHiddenMode.LAST
+                model_worker_batch.spec_info = spec_info
+                self.forward_batch_speculative_generation(model_worker_batch)
 
         end_time = time.perf_counter()
         logger.info("[SPEC_DECODE] Precompile finished in %.0f secs", end_time - start_time)

@@ -402,6 +402,8 @@ class ModelWorker:
             return_logprob=False,
             sampling_info=SamplingBatchInfo.generate_for_precompile(
                 bs, self.model_config.vocab_size, do_penalties=do_penalties
+            ) if speculative_algotithm is None else SamplingBatchInfo.generate_for_precompile_all_greedy(
+                bs, self.model_config.vocab_size, do_penalties=do_penalties
             ),
             extend_input_logprob_token_ids=None,
             positions=np.concat([valid_positions, invalid_positions], axis=0),
@@ -413,7 +415,7 @@ class ModelWorker:
             token_ids_logprobs=None,
             extend_logprob_start_lens=None,
             capture_hidden_mode=CaptureHiddenMode.NULL,
-            speculative_algorithm=speculative_algotithm,
+            spec_algorithm=speculative_algotithm,
         )
 
     def get_model_runner(self):

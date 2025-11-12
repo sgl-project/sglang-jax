@@ -1462,12 +1462,10 @@ class ModelWorkerBatch:
         else:
             pass
         if padding_size >= 0:
-            positions_cpu = np.concatenate(
-                [
-                    self.positions,
-                    jnp.zeros(padding_size, dtype=self.positions.dtype),
-                ]
-            )
+            zeros_pad = np.zeros(padding_size, dtype=np.int32)
+            positions_cpu = np.concatenate([self.positions, zeros_pad], axis=0)
+        if len(positions_cpu) > len(input_ids_cpu):
+            positions_cpu = self.positions[:len(input_ids_cpu)]
 
         self.seq_lens = seq_lens_cpu
         self.extend_start_loc = extend_start_loc

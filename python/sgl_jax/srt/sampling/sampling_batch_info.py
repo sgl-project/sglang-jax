@@ -387,6 +387,47 @@ class SamplingBatchInfo:
         return ret
 
     @classmethod
+    def generate_for_precompile_all_greedy(cls, bs: int, vocab_size: int = 32000, do_penalties: bool = False):
+        temperatures = np.array([0.0 for _ in range(bs)], dtype=np.float32)
+        top_ps = np.array([1.0 for _ in range(bs)], dtype=np.float32)
+        top_ks = np.array([1 for _ in range(bs)], dtype=np.int32)
+        min_ps = np.array([1.0 for _ in range(bs)], dtype=np.float32)
+        if get_bool_env_var("SGLANG_ENABLE_DETERMINISTIC_SAMPLING"):
+            sampling_seeds = np.array([DEFAULT_SAMPLING_SEED for _ in range(bs)], dtype=np.int32)
+        else:
+            sampling_seeds = None
+
+        # Create mock batch for precompile with penalty-enabled requests
+        mock_batch = cls._create_mock_batch_for_precompile(bs, do_penalties)
+
+        penalizer_orchestrator = penaltylib.BatchedPenalizerOrchestrator(
+            vocab_size=vocab_size,
+            batch=mock_batch,
+            penalizers={
+                penaltylib.BatchedFrequencyPenalizer,
+                penaltylib.BatchedMinNewTokensPenalizer,
+                penaltylib.BatchedPresencePenalizer,
+            },
+        )
+
+        ret = cls(
+            temperatures=temperatures,
+            top_ps=top_ps,
+            top_ks=top_ks,
+            min_ps=min_ps,
+            vocab_size=vocab_size,
+            is_all_greedy=True,
+            need_top_p_sampling=False,
+            need_top_k_sampling=True,
+            need_min_p_sampling=True,
+            sampling_info_done=None,
+            sampling_seeds=sampling_seeds,
+            penalizer_orchestrator=penalizer_orchestrator,
+            linear_penalty=None,
+        )
+        return ret
+    
+    @classmethod
     def _create_mock_batch_for_precompile(cls, bs: int, do_penalties: bool = False):
         """Create a mock batch with penalty-enabled requests for precompile."""
         from sgl_jax.srt.sampling.sampling_params import SamplingParams
