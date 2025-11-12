@@ -444,8 +444,6 @@ class EAGLEWorker(ModelWorker):
             forward_batch,
             logits_metadata=logits_meatadata,
         )
-        # print(f"==============={draft_logits_output.hidden_states=}=====================")
-        # print(f"==============={draft_logits_output.next_token_logits=}=====================")
 
         draft_logits_output.truncate_logits_processor_output(model_worker_batch)
         self.capture_for_decode(draft_logits_output, forward_batch.spec_info)
@@ -519,6 +517,17 @@ class EAGLEWorker(ModelWorker):
                 self.precompile_bs_paddings,
                 self.precompile_cache_loc_paddings,
             )
+            hidden_states = model_worker_batch.spec_info.hidden_states
+            if (
+                hidden_states is not None
+                and hidden_states.shape[0] < model_worker_batch.input_ids.shape[0]
+            ):
+                pad_len = model_worker_batch.input_ids.shape[0] - hidden_states.shape[0]
+                pad_shape = (pad_len,) + hidden_states.shape[1:]
+                pad_values = jnp.zeros(pad_shape, dtype=hidden_states.dtype)
+                model_worker_batch.spec_info.hidden_states = jnp.concatenate(
+                    [model_worker_batch.spec_info.hidden_states, pad_values], axis=0
+                )
             self.draft_model_runner.attn_backend.forward_metadata = (
                 self.draft_model_runner.attn_backend.get_forward_metadata(
                     model_worker_batch,
@@ -544,10 +553,10 @@ class EAGLEWorker(ModelWorker):
                     model_worker_batch, self.draft_model_runner.mesh
                 ),
             )
-            topk_p, topk_index = topk_probs_from_logits(logits_output.next_token_logits, self.topk)
+            topk_p, topk_index = topk_probs_from_logits(logits_output.next_token_logits[:model_worker_batch.real_bs*self.topk], self.topk)
             if self.hot_token_ids is not None:
                 topk_index = self.hot_token_ids[topk_index]
-            hidden_states = logits_output.hidden_states
+            hidden_states = logits_output.hidden_states[:model_worker_batch.real_bs*self.topk*self.topk,:]
         for i in range(len(score_list)):
             # topk = 1
             score_list[i] = score_list[i][: model_worker_batch.real_bs]

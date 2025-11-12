@@ -1103,7 +1103,7 @@ class ScheduleBatch:
                 # Create positions for actual tokens (one per sequence at seq_len)
                 batch_positions = np.maximum(0, seq_lens_cpu - 1)
                 # Create positions array matching the length of input_ids (including padding)
-                positions_cpu = np.zeros(len(input_ids_cpu), dtype=batch_positions.dtype)
+                positions_cpu = np.zeros(len(batch_positions), dtype=batch_positions.dtype)
                 # Fill in the actual positions for the real tokens
                 # positions = positions.at[: len(batch_positions)].set(batch_positions)
                 positions_cpu[: len(batch_positions)] = batch_positions
@@ -1457,6 +1457,8 @@ class ModelWorkerBatch:
         elif self.forward_mode == ForwardMode.EXTEND or self.forward_mode == ForwardMode.MIXED:
             total_tokens_before_padding = sum([extend_len for extend_len in extend_seq_lens])
             padding_size = len(input_ids_cpu) - total_tokens_before_padding
+        elif not self.spec_algorithm.is_none() and self.forward_mode == ForwardMode.DECODE:
+            padding_size = len(input_ids_cpu) - len(self.positions)
         else:
             pass
         if padding_size >= 0:
