@@ -547,7 +547,7 @@ class EagleDraftInput:
             out_cache_loc = alloc_paged_token_slots_extend(
                 schedule_batch.tree_cache,
                 self.allocate_lens,
-                self.allocate_lens,
+                new_allocate_lens,
                 last_loc,
                 extend_num_tokens,
             )
