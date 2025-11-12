@@ -39,6 +39,7 @@ class BailingMoEAttention(nnx.Module):
         attention_bias: bool = False,
         dtype: jnp.dtype = jnp.bfloat16,
         rngs: nnx.Rngs = None,
+        mesh: jax.sharding.Mesh = None,
     ):
         self.layer_id = layer_id
         assert num_heads % num_kv_heads == 0
@@ -58,14 +59,12 @@ class BailingMoEAttention(nnx.Module):
                 self.head_dim,
                 epsilon=rms_norm_eps,
                 param_dtype=dtype,
-                scale_init=nnx.with_partitioning(init_fn, (None,)),
                 rngs=rngs,
             )
             self.k_norm = RMSNorm(
                 self.head_dim,
                 epsilon=rms_norm_eps,
                 param_dtype=dtype,
-                scale_init=nnx.with_partitioning(init_fn, (None,)),
                 rngs=rngs,
             )
         else:
@@ -79,6 +78,7 @@ class BailingMoEAttention(nnx.Module):
             kernel_axes=(None, "tensor"),
             rngs=rngs,
             params_dtype=dtype,
+            mesh=mesh,
         )
         self.k_proj = LinearBase(
             input_size=hidden_size,
@@ -87,6 +87,7 @@ class BailingMoEAttention(nnx.Module):
             kernel_axes=(None, "tensor"),
             rngs=rngs,
             params_dtype=dtype,
+            mesh=mesh,
         )
         self.v_proj = LinearBase(
             input_size=hidden_size,
@@ -95,6 +96,7 @@ class BailingMoEAttention(nnx.Module):
             kernel_axes=(None, "tensor"),
             rngs=rngs,
             params_dtype=dtype,
+            mesh=mesh,
         )
         self.c_proj = LinearBase(
             input_size=num_heads * self.head_dim,
@@ -103,6 +105,7 @@ class BailingMoEAttention(nnx.Module):
             kernel_axes=("tensor", None),
             rngs=rngs,
             params_dtype=dtype,
+            mesh=mesh,
         )
         self.rotary_emb = RotaryEmbedding(
             head_size=self.head_dim,
@@ -156,6 +159,7 @@ class BailingMoEMLP(nnx.Module):
         layer_id: int = 0,
         rngs: nnx.Rngs = None,
         dtype: jnp.dtype = jnp.bfloat16,
+        mesh: jax.sharding.Mesh = None,
     ) -> None:
         self.layer_id = layer_id
 
@@ -166,6 +170,7 @@ class BailingMoEMLP(nnx.Module):
             use_bias=False,
             params_dtype=dtype,
             rngs=rngs,
+            mesh=mesh,
         )
 
         self.up_proj = LinearBase(
@@ -175,6 +180,7 @@ class BailingMoEMLP(nnx.Module):
             use_bias=False,
             params_dtype=dtype,
             rngs=rngs,
+            mesh=mesh,
         )
 
         self.down_proj = LinearBase(
@@ -184,6 +190,7 @@ class BailingMoEMLP(nnx.Module):
             use_bias=False,
             params_dtype=dtype,
             rngs=rngs,
+            mesh=mesh,
         )
 
         self.act_fn = jax.nn.silu
@@ -234,6 +241,7 @@ class BailingMoEDecoderLayer(nnx.Module):
             attention_bias=getattr(config, "attention_bias", False),
             dtype=dtype,
             rngs=rngs,
+            mesh=mesh,
         )
 
         first_k_dense_replace = getattr(config, "first_k_dense_replace", 0)
@@ -245,6 +253,7 @@ class BailingMoEDecoderLayer(nnx.Module):
                 layer_id=layer_id,
                 dtype=dtype,
                 rngs=rngs,
+                mesh=mesh,
             )
             self.is_moe_layer = False
             self.moe_gate = None
@@ -278,7 +287,7 @@ class BailingMoEDecoderLayer(nnx.Module):
                 num_experts_per_tok=config.num_experts_per_tok,
                 intermediate_dim=config.moe_intermediate_size,
                 mesh=mesh,
-                expert_parallel_size=expert_parallel_size,
+                ep_size=expert_parallel_size,
                 weight_dtype=dtype,
                 dtype=dtype,
                 layer_id=layer_id,
@@ -295,6 +304,7 @@ class BailingMoEDecoderLayer(nnx.Module):
                     layer_id=layer_id,
                     dtype=dtype,
                     rngs=rngs,
+                    mesh=mesh,
                 )
             else:
                 self.shared_experts = None
@@ -304,14 +314,12 @@ class BailingMoEDecoderLayer(nnx.Module):
             config.hidden_size,
             epsilon=config.rms_norm_eps,
             param_dtype=dtype,
-            scale_init=nnx.with_partitioning(init_fn, (None,)),
             rngs=rngs,
         )
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size,
             epsilon=config.rms_norm_eps,
             param_dtype=dtype,
-            scale_init=nnx.with_partitioning(init_fn, (None,)),
             rngs=rngs,
         )
 
@@ -377,7 +385,8 @@ class BailingMoEModel(nnx.Module):
             rngs=rngs,
             dtype=dtype,
             param_dtype=dtype,
-            embedding_init=nnx.with_partitioning(init_fn, ("tensor", None)),
+            kernel_axes=("tensor", None),
+            mesh=mesh,
         )
 
         self.layers = nnx.data(
@@ -397,7 +406,6 @@ class BailingMoEModel(nnx.Module):
             config.hidden_size,
             epsilon=config.rms_norm_eps,
             param_dtype=dtype,
-            scale_init=nnx.with_partitioning(init_fn, (None,)),
             rngs=rngs,
         )
 
@@ -442,7 +450,7 @@ class BailingMoEForCausalLM(nnx.Module):
             self.lm_head = ParallelLMHead(
                 config.vocab_size,
                 config.hidden_size,
-                embedding_init=nnx.with_partitioning(init_fn, ("tensor", None)),
+                kernel_axes=("tensor", None),
                 rngs=rngs,
             )
         self.logits_processor = LogitsProcessor(config.vocab_size, self.mesh)
@@ -595,9 +603,14 @@ class BailingMoEForCausalLM(nnx.Module):
                     f"{prefix}.mlp.experts.{i}.{expert_type}.weight" for i in range(num_experts)
                 ]
 
+                if expert_type == "down_proj":
+                    sharding = ("expert", "tensor", None)
+                else:
+                    sharding = ("expert", None, "tensor")
+
                 mappings[f"__MOE_EXPERTS__{prefix}.mlp.{target_name}"] = WeightMapping(
                     target_path=[f"{target_prefix}.mlp.{target_name}"] + expert_keys,
-                    sharding=(("data", "tensor"), None, None),
+                    sharding=sharding,
                     transpose=True,
                 )
 

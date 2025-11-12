@@ -403,9 +403,8 @@ class LogitsProcessor(nnx.Module):
 
         return input_top_logprobs_val, input_top_logprobs_idx
 
-    @staticmethod
     def compute_temp_top_p_normalized_logprobs(
-        last_logits: jax.Array, logits_metadata: LogitsMetadata
+        self, last_logits: jax.Array, logits_metadata: LogitsMetadata
     ) -> jax.Array:
         """
         compute logprobs for the output token from the given logits.
@@ -424,7 +423,7 @@ class LogitsProcessor(nnx.Module):
 
             probs = jnp.softmax(last_logits, axis=-1)
             del last_logits
-            probs = top_p_normalize_probs_jax(probs, logits_metadata.top_p)
+            probs = top_p_normalize_probs_jax(probs, logits_metadata.top_p, self.mesh)
             return jnp.log(probs)
         else:
             return nn.log_softmax(last_logits, axis=-1)

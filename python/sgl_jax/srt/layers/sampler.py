@@ -4,7 +4,8 @@ from flax import nnx
 from jax import lax
 from jax import numpy as jnp
 from jax import random
-from jax.sharding import Mesh
+from jax.sharding import Mesh, NamedSharding
+from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.layers.binary_search import topk_mask, topp_mask
 from sgl_jax.srt.layers.logits_processor import LogitsProcessorOutput
@@ -15,8 +16,9 @@ _SAMPLING_EPS = 1e-5
 
 
 class Sampler(nnx.Module):
-    def __init__(self, rngs: nnx.Rngs = None):
+    def __init__(self, rngs: nnx.Rngs = None, mesh: Mesh = None):
         self.rngs = rngs
+        self.mesh = mesh
 
     def _greedy_sampling(self, operands):
         """Greedy sampling branch"""
@@ -27,7 +29,9 @@ class Sampler(nnx.Module):
 
     def _regular_sampling(self, operands):
         """Regular sampling branch"""
-        logits, sampling_metadata, positions, rng, mesh, use_sort_for_toppk_minp = operands
+        logits, sampling_metadata, positions, rng, use_sort_for_toppk_minp = operands
+
+        logits = lax.with_sharding_constraint(logits, NamedSharding(self.mesh, P(None, None)))
 
         # Validate broadcast compatibility for temperature division
         logits_batch_size = logits.shape[0]
@@ -68,10 +72,9 @@ class Sampler(nnx.Module):
         logits_output, sampling_metadata, batch_next_token_ids, logprobs = operands
 
         # Set next_token_logprobs
-        logits_output.next_token_logprobs = logprobs[
-            np.arange(len(batch_next_token_ids)),
-            batch_next_token_ids,
-        ]
+        out_sharding = NamedSharding(self.mesh, P(None))
+        indices = (np.arange(len(batch_next_token_ids)), batch_next_token_ids)
+        logits_output.next_token_logprobs = logprobs.at[indices].get(out_sharding=out_sharding)
 
         # Set top_logprobs if needed
         if sampling_metadata.top_logprobs_nums is not None and any(
@@ -89,7 +92,7 @@ class Sampler(nnx.Module):
             (
                 logits_output.next_token_token_ids_logprobs_val,
                 logits_output.next_token_token_ids_logprobs_idx,
-            ) = get_token_ids_logprobs(logprobs, sampling_metadata.token_ids_logprobs)
+            ) = get_token_ids_logprobs(logprobs, sampling_metadata.token_ids_logprobs, self.mesh)
 
         return None
 
@@ -140,7 +143,6 @@ class Sampler(nnx.Module):
         logits_output: LogitsProcessorOutput,
         sampling_metadata: SamplingMetadata,
         positions: jax.Array,
-        mesh: Mesh,
         use_sort_for_toppk_minp: bool,
     ):
         """Run a sampler & compute logprobs and update logits_output accordingly.
@@ -161,7 +163,7 @@ class Sampler(nnx.Module):
 
         _, rng = jax.random.split(self.rngs.params())
         operands = (logits, sampling_metadata, positions, rng)
-        regular_fn = lambda op: self._regular_sampling((*op, mesh, use_sort_for_toppk_minp))
+        regular_fn = lambda op: self._regular_sampling((*op, use_sort_for_toppk_minp))
         batch_next_token_ids, logprobs = lax.cond(
             sampling_metadata.is_all_greedy,
             self._greedy_sampling,
@@ -199,12 +201,15 @@ def get_top_logprobs(logprobs: jax.Array, top_logprobs_nums: list[int]):
     return output_top_logprobs_val, output_top_logprobs_idx
 
 
-def get_token_ids_logprobs(logprobs: jax.Array, token_ids_logprobs: list[list[int]]):
+def get_token_ids_logprobs(logprobs: jax.Array, token_ids_logprobs: list[list[int]], mesh: Mesh):
     output_token_ids_logprobs_val = []
     output_token_ids_logprobs_idx = []
+    out_sharding = NamedSharding(mesh, P(None))
     for i, token_ids in enumerate(token_ids_logprobs):
         if token_ids is not None:
-            output_token_ids_logprobs_val.append(logprobs[i, token_ids].tolist())
+            output_token_ids_logprobs_val.append(
+                logprobs.at[i, token_ids].get(out_sharding=out_sharding).tolist()
+            )
             output_token_ids_logprobs_idx.append(token_ids)
         else:
             output_token_ids_logprobs_val.append([])
@@ -281,6 +286,7 @@ def _get_sorted_indices_np(probs_np: np.ndarray) -> np.ndarray:
 def top_p_normalize_probs_jax(
     probs: jax.Array,
     top_ps: jax.Array,
+    mesh: Mesh = None,
 ):
     # See also top_k_top_p_min_p_sampling_from_probs_torch
     probs_sort = jnp.sort(probs, axis=-1, descending=True)
@@ -295,7 +301,13 @@ def top_p_normalize_probs_jax(
 
     num_tokens, _ = probs.shape
     row_idx = jnp.arange(num_tokens)[:, None]  # [B, 1], broadcast over H
-    return jnp.zeros_like(probs).at[row_idx, probs_idx].set(probs_sort)
+    if mesh is not None:
+        out_sharding = NamedSharding(mesh, P(None, None))
+        return (
+            jnp.zeros_like(probs).at[row_idx, probs_idx].set(probs_sort, out_sharding=out_sharding)
+        )
+    else:
+        return jnp.zeros_like(probs).at[row_idx, probs_idx].set(probs_sort)
 
 
 def _apply_min_p_filter(operands):

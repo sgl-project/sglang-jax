@@ -11,7 +11,7 @@ from sgl_jax.srt.layers.embeddings import Embed, ParallelLMHead, RotaryEmbedding
 from sgl_jax.srt.layers.layernorm import RMSNorm
 from sgl_jax.srt.layers.linear import LinearBase
 from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
-from sgl_jax.srt.layers.moe import EPMoE, FusedMoE, GateLogit, TopK
+from sgl_jax.srt.layers.moe import EPMoE, GateLogit, TopK
 from sgl_jax.srt.layers.radix_attention import RadixAttention
 from sgl_jax.srt.mem_cache.memory_pool import KVCache
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
@@ -33,6 +33,7 @@ class Qwen2MoeMLP(nnx.Module):
         rngs: nnx.Rngs = None,
         dtype: jnp.dtype = jnp.bfloat16,
         gate_up_down_bias: bool | None = False,
+        mesh: jax.sharding.Mesh = None,
     ) -> None:
         self.layer_id = layer_id
 
@@ -43,6 +44,7 @@ class Qwen2MoeMLP(nnx.Module):
             use_bias=gate_up_down_bias,
             params_dtype=dtype,
             rngs=rngs,
+            mesh=mesh,
         )
 
         self.up_proj = LinearBase(
@@ -52,6 +54,7 @@ class Qwen2MoeMLP(nnx.Module):
             use_bias=gate_up_down_bias,
             params_dtype=dtype,
             rngs=rngs,
+            mesh=mesh,
         )
 
         self.down_proj = LinearBase(
@@ -61,6 +64,7 @@ class Qwen2MoeMLP(nnx.Module):
             use_bias=gate_up_down_bias,
             params_dtype=dtype,
             rngs=rngs,
+            mesh=mesh,
         )
 
         self.act_fn = jax.nn.silu
@@ -90,6 +94,7 @@ class Qwen2MoeAttention(nnx.Module):
         rngs: nnx.Rngs = None,
         qkv_bias: bool | None = True,
         o_bias: bool | None = False,
+        mesh: jax.sharding.Mesh = None,
     ):
         self.layer_id = layer_id
         assert (
@@ -110,6 +115,7 @@ class Qwen2MoeAttention(nnx.Module):
             kernel_axes=(None, "tensor"),
             rngs=rngs,
             params_dtype=dtype,
+            mesh=mesh,
         )
         self.k_proj = LinearBase(
             input_size=hidden_size,
@@ -118,6 +124,7 @@ class Qwen2MoeAttention(nnx.Module):
             kernel_axes=(None, "tensor"),
             rngs=rngs,
             params_dtype=dtype,
+            mesh=mesh,
         )
         self.v_proj = LinearBase(
             input_size=hidden_size,
@@ -126,6 +133,7 @@ class Qwen2MoeAttention(nnx.Module):
             kernel_axes=(None, "tensor"),
             rngs=rngs,
             params_dtype=dtype,
+            mesh=mesh,
         )
         self.o_proj = LinearBase(
             input_size=num_heads * self.head_dim,
@@ -134,6 +142,7 @@ class Qwen2MoeAttention(nnx.Module):
             kernel_axes=("tensor", None),
             rngs=rngs,
             params_dtype=dtype,
+            mesh=mesh,
         )
         self.rotary_emb = RotaryEmbedding(
             head_size=self.head_dim,
@@ -205,13 +214,13 @@ class Qwen2MoeDecoderLayer(nnx.Module):
             rngs=rngs,
             qkv_bias=getattr(config, "qkv_bias", True),
             o_bias=getattr(config, "o_bias", False),
+            mesh=mesh,
         )
 
         # Use MoE for all layers
         num_experts = getattr(config, "num_experts", 8)
         num_experts_per_tok = getattr(config, "num_experts_per_tok", 2)
         moe_intermediate_size = getattr(config, "moe_intermediate_size", config.intermediate_size)
-        expert_parallel_size = mesh.shape.get("data", 1) * mesh.shape.get("tensor", 1)
 
         self.moe_gate = GateLogit(
             input_size=config.hidden_size,
@@ -232,6 +241,7 @@ class Qwen2MoeDecoderLayer(nnx.Module):
                 dtype=dtype,
                 rngs=rngs,
                 gate_up_down_bias=False,
+                mesh=mesh,
             )
             self.shared_expert_gate = LinearBase(
                 input_size=config.hidden_size,
@@ -240,46 +250,34 @@ class Qwen2MoeDecoderLayer(nnx.Module):
                 kernel_axes=(None, None),
                 rngs=rngs,
                 params_dtype=dtype,
+                mesh=mesh,
             )
         else:
             self.shared_experts = None
             self.shared_expert_gate = None
 
-        with mesh:
-            if getattr(config, "ep_size", 1) > 1:
-                self.mlp = EPMoE(
-                    config=config,
-                    num_experts=num_experts,
-                    num_experts_per_tok=num_experts_per_tok,
-                    intermediate_dim=moe_intermediate_size,
-                    mesh=mesh,
-                    expert_parallel_size=expert_parallel_size,
-                    weight_dtype=dtype,
-                    dtype=dtype,
-                    layer_id=layer_id,
-                )
-            else:
-                self.mlp = FusedMoE(
-                    config=config,
-                    num_experts=num_experts,
-                    intermediate_dim=moe_intermediate_size,
-                    weight_dtype=dtype,
-                    dtype=dtype,
-                    mesh=mesh,
-                )
+        self.mlp = EPMoE(
+            config=config,
+            num_experts=num_experts,
+            num_experts_per_tok=num_experts_per_tok,
+            intermediate_dim=moe_intermediate_size,
+            mesh=mesh,
+            ep_size=config.ep_size,
+            weight_dtype=dtype,
+            dtype=dtype,
+            layer_id=layer_id,
+        )
 
         self.input_layernorm = RMSNorm(
             config.hidden_size,
             epsilon=config.rms_norm_eps,
             param_dtype=dtype,
-            scale_init=nnx.with_partitioning(init_fn, (None,)),
             rngs=rngs,
         )
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size,
             epsilon=config.rms_norm_eps,
             param_dtype=dtype,
-            scale_init=nnx.with_partitioning(init_fn, (None,)),
             rngs=rngs,
         )
 
@@ -347,8 +345,9 @@ class Qwen2MoeModel(nnx.Module):
             features=config.hidden_size,
             rngs=rngs,
             dtype=dtype,
-            embedding_init=nnx.with_partitioning(init_fn, ("tensor", None)),
+            kernel_axes=("tensor", None),
             param_dtype=dtype,
+            mesh=mesh,
         )
 
         self.layers = nnx.data(
@@ -368,7 +367,6 @@ class Qwen2MoeModel(nnx.Module):
             config.hidden_size,
             epsilon=config.rms_norm_eps,
             param_dtype=dtype,
-            scale_init=nnx.with_partitioning(init_fn, (None,)),
             rngs=rngs,
         )
 
@@ -412,12 +410,12 @@ class Qwen2MoeForCausalLM(nnx.Module):
         self.config = config
         self.dtype = dtype
         logger.info("Qwen2MoeForCausalLM config dtype: %s", self.dtype)
-        self.transformer = Qwen2MoeModel(config, dtype=self.dtype, rngs=rngs, mesh=mesh)
+        self.model = Qwen2MoeModel(config, dtype=self.dtype, rngs=rngs, mesh=mesh)
         if not getattr(self.config, "tie_word_embeddings", True):
             self.lm_head = ParallelLMHead(
                 config.vocab_size,
                 config.hidden_size,
-                embedding_init=nnx.with_partitioning(init_fn, ("tensor", None)),
+                kernel_axes=("tensor", None),
                 rngs=rngs,
             )
         self.logits_processor = LogitsProcessor(config.vocab_size, self.mesh)
@@ -440,12 +438,12 @@ class Qwen2MoeForCausalLM(nnx.Module):
     def _create_qwen2_moe_weight_mappings(self) -> dict:
         mappings = {
             "model.embed_tokens.weight": WeightMapping(
-                target_path="transformer.embed_tokens.embedding",
+                target_path="model.embed_tokens.embedding",
                 sharding=(None, None),
                 transpose=False,
             ),
             "model.norm.weight": WeightMapping(
-                target_path="transformer.norm.scale", sharding=(None,), transpose=False
+                target_path="model.norm.scale", sharding=(None,), transpose=False
             ),
         }
 
@@ -464,7 +462,7 @@ class Qwen2MoeForCausalLM(nnx.Module):
 
     def _create_moe_layer_mappings(self, layer_idx: int) -> dict:
         prefix = f"model.layers.{layer_idx}"
-        target_prefix = f"transformer.layers.{layer_idx}"
+        target_prefix = f"model.layers.{layer_idx}"
 
         mappings = {
             f"{prefix}.input_layernorm.weight": WeightMapping(
@@ -585,13 +583,12 @@ class Qwen2MoeForCausalLM(nnx.Module):
             expert_keys = [
                 f"{prefix}.mlp.experts.{i}.{expert_type}.weight" for i in range(num_experts)
             ]
-            if self.config.ep_size > 1:
-                sharding = (("data", "tensor"), None, None)
+
+            if expert_type == "down_proj":
+                sharding = ("expert", "tensor", None)
             else:
-                if expert_type == "down_proj":
-                    sharding = (None, ("data", "tensor"), None)
-                else:
-                    sharding = (None, None, ("data", "tensor"))
+                sharding = ("expert", None, "tensor")
+
             mappings[f"__MOE_EXPERTS__{prefix}.mlp.{target_name}"] = WeightMapping(
                 target_path=[f"{target_prefix}.mlp.{target_name}"] + expert_keys,
                 sharding=sharding,
@@ -606,13 +603,11 @@ class Qwen2MoeForCausalLM(nnx.Module):
         token_to_kv_pool: KVCache,
         logits_metadata: LogitsMetadata,
     ):
-        hidden_states, layers_kv_fused = self.transformer(forward_batch, token_to_kv_pool)
+        hidden_states, layers_kv_fused = self.model(forward_batch, token_to_kv_pool)
         if not getattr(self.config, "tie_word_embeddings", True):
             output = self.logits_processor(hidden_states, self.lm_head, logits_metadata)
         else:
-            output = self.logits_processor(
-                hidden_states, self.transformer.embed_tokens, logits_metadata
-            )
+            output = self.logits_processor(hidden_states, self.model.embed_tokens, logits_metadata)
         return output, layers_kv_fused, True
 
 

@@ -11,6 +11,7 @@ def create_device_mesh(
     devices=None,
     num_slices: int = 1,
     allow_split_physical_axes: bool = True,
+    use_explicit_sharding: bool = True,
 ) -> jax.sharding.Mesh:
     """Create a device mesh"""
     if devices is None:
@@ -32,7 +33,12 @@ def create_device_mesh(
             contiguous_submeshes=False,
             allow_split_physical_axes=allow_split_physical_axes,
         )
-    mesh = jax.sharding.Mesh(devices_array, mesh_axes)
+
+    if use_explicit_sharding:
+        axis_types = (jax.sharding.AxisType.Explicit,) * len(mesh_axes)
+        mesh = jax.sharding.Mesh(devices_array, mesh_axes, axis_types=axis_types)
+    else:
+        mesh = jax.sharding.Mesh(devices_array, mesh_axes)
     return mesh
 
 
@@ -53,5 +59,4 @@ def fill_unspecified_parallelism(parallelism: Sequence[int], num_devices: int) -
 mesh_axes = [
     "data",  # data parallelism
     "tensor",  # tensor parallelism
-    "expert",  # expert parallelism
 ]
