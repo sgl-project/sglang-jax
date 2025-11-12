@@ -179,9 +179,9 @@ class WeightLoader:
             raise RuntimeError("Incomplete MoE expert weights detected.")
 
         nnx.update(self.model, params)
-        with open("/tmp/debug.txt", "a") as f:
-            f.write("updated params\n")
-            f.write(f"params: {params}\n")
+        # with open("/tmp/debug.txt", "a") as f:
+        #     f.write("updated params\n")
+        #     f.write(f"params: {params}\n")
 
     def _process_single_moe_group(
         self,
@@ -214,7 +214,7 @@ class WeightLoader:
             collected_weights.append(weights)
 
         stacked_weight = jnp.stack(collected_weights, axis=0)  # (num_experts, ...)
-        
+
         if "expert" in mapping.sharding:
             ep_size = getattr(self.model_config.hf_config, "ep_size", 1)
             world_size = self.mesh.shape.get("data", 1) * self.mesh.shape.get("tensor", 1)

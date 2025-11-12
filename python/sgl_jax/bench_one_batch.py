@@ -123,7 +123,6 @@ def load_model(server_args, port_args, tp_rank):
     # logging.info("load_model num_hidden_layers: %s", model_config.num_hidden_layers)
     # model_config.num_hidden_layers = 1 #for debugging
 
-
     # Create a mesh that includes both 'data' and 'tensor' axes.
     # Use a size-1 'data' axis and shard across the 'tensor' axis per tp_size.
     all_devices = jax.devices()
@@ -150,7 +149,7 @@ def load_model(server_args, port_args, tp_rank):
         try:
             jax_mh.sync_global_devices("load_model")
         except Exception as err:
-            logging.info("Could not sync global devices (expected in single-host): %s", err)  
+            logging.info("Could not sync global devices (expected in single-host): %s", err)
     return model_runner, tokenizer
 
 
@@ -274,7 +273,7 @@ def _run_forward_and_sample(model_runner, batch: ScheduleBatch, token_first_arg:
         )
     )
 
-    model_worker_batch : ModelWorkerBatch = batch.get_model_worker_batch(
+    model_worker_batch = batch.get_model_worker_batch(
         [token_first_arg], [bs_needed], [cache_loc_needed], page_size
     )
 
@@ -289,7 +288,7 @@ def _run_forward_and_sample(model_runner, batch: ScheduleBatch, token_first_arg:
     positions = model_worker_batch.positions
 
     logits_output, _ = model_runner.forward(forward_batch, logits_metadata=logits_metadata)
-    
+
     pad_size = len(model_worker_batch.seq_lens) - model_worker_batch.real_bs
     sampling_metadata = SamplingMetadata.from_model_worker_batch(
         model_worker_batch,

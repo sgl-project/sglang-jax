@@ -244,6 +244,9 @@ class FlashAttention(AttentionBackend):
                 sm_scale=scale,
                 sliding_window=layer.sliding_window_size,
                 soft_cap=layer.logit_cap,
+                # xai_temperature_len=(
+                #     layer.xai_temperature_len if layer.xai_temperature_len > 0 else None
+                # ),
                 vmem_limit_bytes=self.vmem_limit_bytes,
             )
 

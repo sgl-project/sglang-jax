@@ -209,7 +209,10 @@ class ModelRunner:
         )
 
     def get_available_device_memory(self):
-        min_available_device_memory = get_available_device_memory(self.device, distributed=False)
+        distributed = jax.process_count() != 1
+        min_available_device_memory = get_available_device_memory(
+            self.device, distributed=distributed
+        )
 
         # Check memory for tensor parallelism
         local_device_memory = get_available_device_memory(self.device)
