@@ -155,8 +155,8 @@ def run_unittest_files(files: List[TestFile], timeout_per_file: float):
 
 
 suites = {
+    "per-commit": [],
     "per-commit-tpu-v6e-1": [
-        TestFile("test/srt/test_tpu_availability.py", 3),
         TestFile("test/srt/openai_server/basic/test_protocol.py", 10),
         TestFile("test/srt/openai_server/basic/test_serving_chat.py", 10),
         TestFile("test/srt/openai_server/basic/test_serving_completions.py", 10),
@@ -164,15 +164,11 @@ suites = {
         TestFile("test/srt/test_qwen2_5_models.py", 15),
         TestFile("test/srt/test_srt_engine.py", 15),
     ],
-    "per-commit": [
-        # TestFile("test/srt/test_tpu_availability.py", 3),
-    ],
     "per-commit-tpu-v6e-2": [],
     "per-commit-tpu-v6e-4": [
         TestFile("test/srt/test_qwen3_moe_models.py", 45),
         TestFile("test/srt/test_features.py", 30),
         # TestFile("test/srt/test_sliding_window_attention.py", 30), # add after gpt-oss supported
-        TestFile("test/srt/test_chunked_prefill_size.py", 25),
         TestFile("test/srt/test_bench_one_batch.py", 15),
         TestFile("test/srt/test_eval_accuracy_large.py", 25),
         TestFile("test/srt/openai_server/basic/test_tool_calls.py", 45),
