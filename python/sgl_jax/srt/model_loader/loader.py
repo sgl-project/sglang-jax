@@ -267,9 +267,6 @@ def get_model_loader(
     load_config: LoadConfig, rngs: jax.Array, mesh: jax.sharding.Mesh
 ) -> BaseModelLoader:
     """Get a model loader based on the load format."""
-    
-    logging.info(f"load_config load format: {load_config.load_format}")
-
     if isinstance(load_config.load_format, type):
         return load_config.load_format(load_config)
 
@@ -278,7 +275,7 @@ def get_model_loader(
 
     if load_config.load_format == LoadFormat.JAX:
         return JAXModelLoader(load_config, rngs, mesh)
-    
-    logging.info("loader falled back to JAXModelLoader")
+
+    logging.info("loader failed back to JAXModelLoader")
 
     return JAXModelLoader(load_config, rngs, mesh)
