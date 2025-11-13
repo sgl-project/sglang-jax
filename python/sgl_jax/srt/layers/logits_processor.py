@@ -215,7 +215,6 @@ class LogitsProcessor(nnx.Module):
         self.soft_cap = soft_cap
         self.mesh = mesh
 
-
     def __call__(
         self,
         hidden_states: jax.Array,

@@ -761,7 +761,9 @@ class Grok1ForCausalLM(nnx.Module):
         """Forward pass through the model using unified forward_batch API."""
         input_ids = forward_batch.input_ids
         positions = forward_batch.positions
-        hidden_states, layers_kv_fused = self.model(input_ids, positions, forward_batch, token_to_kv_pool, None)
+        hidden_states, layers_kv_fused = self.model(
+            input_ids, positions, forward_batch, token_to_kv_pool, None
+        )
         output = self.logits_processor(hidden_states, self.lm_head, logits_metadata)
 
         # Return values consistent with other models: (output, layers_kv_fused, layers_callback_flag)
