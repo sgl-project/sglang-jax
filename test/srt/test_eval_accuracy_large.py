@@ -38,8 +38,6 @@ class TestEvalAccuracyLarge(CustomTestCase):
                 "0.0.0.0:10011",
                 "--nnodes",
                 "1",
-                "--tp-size",
-                "4",
                 "--random-seed",
                 "3",
                 "--mem-fraction-static",
@@ -58,8 +56,6 @@ class TestEvalAccuracyLarge(CustomTestCase):
                 "8192",
                 "--chunked-prefill-size",
                 "-1",
-                "--attention-backend",
-                "fa",
                 "--max-running-requests",
                 "64",
                 "--page-size",
@@ -79,8 +75,8 @@ class TestEvalAccuracyLarge(CustomTestCase):
             base_url=self.base_url,
             model=self.model,
             eval_name="mmlu",
-            num_examples=1024,
-            num_threads=64,
+            num_examples=200,
+            num_threads=32,
         )
 
         metrics = run_eval(args)

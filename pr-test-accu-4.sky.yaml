@@ -1,0 +1,16 @@
+# sglang-jax.sky.yaml
+resources:
+  accelerators: tpu-v6e-4
+  accelerator_args:
+    tpu_vm: True
+    runtime_version: v2-alpha-tpuv6e
+file_mounts:
+  /home/gcpuser/sky_workdir/sglang-jax: .
+run: |
+  # git clone https://github.com/sgl-project/sglang-jax.git
+  cd sglang-jax && git fetch origin $REF:$REF && git checkout $REF
+  uv venv --python 3.12
+  source .venv/bin/activate
+  uv pip install -e "python[all]"
+  cd test/srt
+  uv run python -m unittest test_moe_eval_accuracy_large.TestMoEEvalAccuracyLarge.test_mmlu

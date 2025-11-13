@@ -30,6 +30,7 @@ from sgl_jax.srt.utils.common_utils import get_bool_env_var, retry
 
 DEFAULT_MODEL_NAME_FOR_TEST = "Qwen/Qwen3-8B"
 DEFAULT_SMALL_MODEL_NAME_FOR_TEST = "Qwen/Qwen-1_8B-Chat"
+QWEN_7B_CHAT = "Qwen/Qwen-7B-Chat"
 QWEN3_8B = "Qwen/Qwen3-8B"
 QWEN3_MOE_30B = "Qwen/Qwen3-30B-A3B"
 QWEN2_5_7B_INSTRUCT = "Qwen/Qwen2.5-7B-Instruct"
@@ -388,6 +389,8 @@ def get_benchmark_args(
     sharegpt_output_len=None,
     random_input_len=4096,
     random_output_len=2048,
+    max_concurrency=256,
+    random_range_ratio=1,
     sharegpt_context_len=None,
     request_rate=float("inf"),
     disable_stream=False,
@@ -398,7 +401,7 @@ def get_benchmark_args(
     lora_name=None,
 ):
     return SimpleNamespace(
-        backend="sglang",
+        backend="sgl-jax",
         base_url=base_url,
         host=None,
         port=None,
@@ -411,7 +414,8 @@ def get_benchmark_args(
         sharegpt_context_len=sharegpt_context_len,
         random_input_len=random_input_len,
         random_output_len=random_output_len,
-        random_range_ratio=0.0,
+        max_concurrency=max_concurrency,
+        random_range_ratio=random_range_ratio,
         request_rate=request_rate,
         multi=None,
         output_file=None,
@@ -440,6 +444,8 @@ def run_bench_serving(
     tokenizer=None,
     random_input_len=4096,
     random_output_len=2048,
+    max_concurrency=256,
+    random_range_ratio=1,
     sharegpt_context_len=None,
     disable_stream=False,
     disable_ignore_eos=False,
@@ -469,6 +475,8 @@ def run_bench_serving(
         num_prompts=num_prompts,
         random_input_len=random_input_len,
         random_output_len=random_output_len,
+        max_concurrency=max_concurrency,
+        random_range_ratio=random_range_ratio,
         sharegpt_context_len=sharegpt_context_len,
         request_rate=request_rate,
         disable_stream=disable_stream,
