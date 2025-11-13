@@ -197,6 +197,7 @@ class SchedulerOutputProcessorMixin:
             for next_token_id in next_token_ids:
                 self.num_generated_tokens += len(next_token_id)
                 self.accept_token += len(next_token_id)
+            self.spec_num_forward_ct += len(batch.reqs)
             self.draft_token += len(batch.reqs) * self.draft_worker.speculative_num_draft_tokens
         # FIXME(pc) add spec decode metrics
 

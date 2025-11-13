@@ -221,22 +221,8 @@ class EAGLEWorker(ModelWorker):
         forward_batch.spec_info.allocate_lens = model_worker_batch.seq_lens[
             : model_worker_batch.real_bs
         ]
-        # assert forward_batch.spec_info is batch.spec_info
 
         self.capture_for_decode(logits_output, forward_batch.spec_info)
-
-        # has_finished, unfinished_req_index = False, []
-        # for i, req in enumerate(batch.reqs):
-        #     if req.finished():
-        #         has_finished = True
-        #     else:
-        #         unfinished_req_index.append(i)
-        # if has_finished:
-        #     unfinished_index_device = jnp.array(
-        #         unfinished_req_index,
-        #         dtype=jnp.int64,
-        #     )
-        #     batch.spec_info.filter_batch(unfinished_index_device, has_been_filtered=False)
 
     @property
     def draft_model_runner(self):
@@ -321,8 +307,8 @@ class EAGLEWorker(ModelWorker):
         ) = spec_info.sample(
             model_worker_batch,
             logits_output,
-            self.token_to_kv_pool_allocator,
-            self.page_size,
+            # self.token_to_kv_pool_allocator,
+            # self.page_size,
             self.model_runner.rngs,
             self.mesh,
         )
@@ -527,8 +513,8 @@ class EAGLEWorker(ModelWorker):
             ):
                 pad_len = model_worker_batch.input_ids.shape[0] - hidden_states.shape[0]
                 pad_shape = (pad_len,) + hidden_states.shape[1:]
-                pad_values = jnp.zeros(pad_shape, dtype=hidden_states.dtype)
-                model_worker_batch.spec_info.hidden_states = jnp.concatenate(
+                pad_values = np.zeros(pad_shape, dtype=hidden_states.dtype)
+                model_worker_batch.spec_info.hidden_states = np.concatenate(
                     [model_worker_batch.spec_info.hidden_states, pad_values], axis=0
                 )
             self.draft_model_runner.attn_backend.forward_metadata = (
@@ -607,7 +593,7 @@ class EAGLEWorker(ModelWorker):
                 #  "x" means speculative draft tokens
                 #  "." means padded tokens
 
-                # TODO(lmzheng): The current implementation is still a fake support
+                # TODO: The current implementation is still a fake support
                 # for page size > 1. In the `assign_draft_cache_locs` below,
                 # we directly move the indices instead of the real kv cache.
                 # This only works when the kernel backend runs with page size = 1.
@@ -631,7 +617,7 @@ class EAGLEWorker(ModelWorker):
                     self.page_size,
                 )
 
-                # TODO(lmzheng): remove this device sync
+                # TODO: remove this device sync
                 extend_num_tokens = int(jnp.sum(extend_lens))
 
                 # Store in instance variables for later use
@@ -678,9 +664,9 @@ class EAGLEWorker(ModelWorker):
             out_cache_loc = out_cache_loc[: num_seqs * self.topk * self.speculative_num_steps]
 
         model_worker_batch.out_cache_loc = out_cache_loc
-        model_worker_batch.seq_lens_sum = int(jnp.sum(model_worker_batch.seq_lens))
+        model_worker_batch.seq_lens_sum = int(np.sum(model_worker_batch.seq_lens))
         model_worker_batch.return_hidden_states = False
-        spec_info.positions = jnp.repeat(model_worker_batch.seq_lens, self.topk)
+        spec_info.positions = np.repeat(model_worker_batch.seq_lens, self.topk)
         self.token_to_kv_pool_allocator.restore_state(token_to_kv_pool_state_backup)
 
     def run_spec_decode_precompile(self):
@@ -805,42 +791,63 @@ def select_top_k_tokens(
     topk: int,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
     if i == 0:
-        # The first step after extend
-        input_ids = topk_index.flatten()
-        hidden_states = jnp.repeat(hidden_states, topk, axis=0)
-        scores = topk_p  # shape: (b, topk)
-
-        tree_info = (
-            jnp.expand_dims(topk_p, axis=1),  # shape: (b, 1, topk)
-            topk_index,  # shape: (b, topk)
-            jnp.tile(
-                jnp.expand_dims(jnp.arange(-1, topk, dtype=jnp.float32), axis=0),
-                (topk_p.shape[0], 1),
-            ),  # shape: (b, topk + 1)
-        )
+        return select_top_k_tokens_step_0(topk_p, topk_index, hidden_states, scores, topk)
     else:
-        # The later decode steps
-        expand_scores = jax.lax.mul(
-            jnp.expand_dims(scores, axis=2), topk_p.reshape(-1, topk, topk)
-        )  # (b, topk, 1) x (b, topk ,topk) -> (b, topk, topk)
-        topk_cs_p, topk_cs_index = fast_topk(
-            expand_scores.reshape(expand_scores.shape[0], -1), topk, axis=-1
-        )  # (b, topk)
-        scores = topk_cs_p  # shape: (b, topk)
-
-        topk_index = topk_index.reshape(-1, topk**2)
-        input_ids = jnp.take_along_axis(topk_index, topk_cs_index, axis=1).flatten()
-
-        if hidden_states.shape[0] > 0:
-            selected_input_index = topk_cs_index.flatten() // topk + jnp.repeat(
-                jnp.arange(0, hidden_states.shape[0], topk), topk
-            )
-            hidden_states = hidden_states[selected_input_index, :]
-
-        tree_info = (
-            expand_scores,  # shape: (b, topk, topk)
-            topk_index,  # shape: (b, topk * topk)
-            topk_cs_index + (topk**2 * (i - 1) + topk),  # shape: (b, topk)
+        return select_top_k_tokens_step_greater_0(
+            jnp.asarray(i), topk_p, topk_index, hidden_states, scores, topk
         )
 
+
+@functools.partial(jax.jit, static_argnames=["topk"])
+def select_top_k_tokens_step_0(
+    topk_p: jax.Array,
+    topk_index: jax.Array,
+    hidden_states: jax.Array,
+    scores: jax.Array,
+    topk: int,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+    # The first step after extend
+    input_ids = topk_index.flatten()
+    hidden_states = jnp.repeat(hidden_states, topk, axis=0)
+    scores = topk_p  # shape: (b, topk)
+    tree_info = (
+        jnp.expand_dims(topk_p, axis=1),  # shape: (b, 1, topk)
+        topk_index,  # shape: (b, topk)
+        jnp.tile(
+            jnp.expand_dims(jnp.arange(-1, topk, dtype=jnp.float32), axis=0),
+            (topk_p.shape[0], 1),
+        ),  # shape: (b, topk + 1)
+    )
+    return input_ids, hidden_states, scores, tree_info
+
+
+@functools.partial(jax.jit, static_argnames=["topk"])
+def select_top_k_tokens_step_greater_0(
+    i: jax.Array,
+    topk_p: jax.Array,
+    topk_index: jax.Array,
+    hidden_states: jax.Array,
+    scores: jax.Array,
+    topk: int,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+    # The later decode steps
+    expand_scores = jax.lax.mul(
+        jnp.expand_dims(scores, axis=2), topk_p.reshape(-1, topk, topk)
+    )  # (b, topk, 1) x (b, topk ,topk) -> (b, topk, topk)
+    topk_cs_p, topk_cs_index = fast_topk(
+        expand_scores.reshape(expand_scores.shape[0], -1), topk, axis=-1
+    )  # (b, topk)
+    scores = topk_cs_p  # shape: (b, topk)
+    topk_index = topk_index.reshape(-1, topk**2)
+    input_ids = jnp.take_along_axis(topk_index, topk_cs_index, axis=1).flatten()
+    if hidden_states.shape[0] > 0:
+        selected_input_index = topk_cs_index.flatten() // topk + jnp.repeat(
+            jnp.arange(0, hidden_states.shape[0], topk), topk
+        )
+        hidden_states = hidden_states[selected_input_index, :]
+    tree_info = (
+        expand_scores,  # shape: (b, topk, topk)
+        topk_index,  # shape: (b, topk * topk)
+        topk_cs_index + (topk**2 * (i - 1) + topk),  # shape: (b, topk)
+    )
     return input_ids, hidden_states, scores, tree_info

@@ -27,7 +27,6 @@ from sgl_jax.srt.managers.schedule_batch import (
     global_server_args_dict,
 )
 from sgl_jax.srt.managers.tp_worker import ModelWorker
-from sgl_jax.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sgl_jax.srt.mem_cache.common import (
     alloc_paged_token_slots_extend,
     alloc_token_slots,
@@ -367,22 +366,22 @@ class EagleDraftInput:
 
     # The inputs for decode
     # shape: (b, topk)
-    topk_p: jax.Array = None
-    topk_index: jax.Array = None
+    topk_p: np.ndarray = None
+    topk_index: np.ndarray = None
     # shape: (b, hidden_size)
-    hidden_states: jax.Array = None
+    hidden_states: np.ndarray = None
     capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.FULL
 
     # Inputs for extend
     # shape: (b,)
-    verified_id: jax.Array = None
-    accept_length: jax.Array = None
-    accept_length_cpu: jax.Array | None = None
+    verified_id: np.ndarray = None
+    accept_length: np.ndarray = None
+    accept_length_cpu: np.ndarray | None = None
 
     # Inputs for the attention backends
     # shape: (b + 1,)
-    kv_indptr: jax.Array = None
-    kv_indices: jax.Array = None
+    kv_indptr: np.ndarray = None
+    kv_indices: np.ndarray = None
 
     # Shape info for padding
     num_tokens_per_batch: int = -1
@@ -390,14 +389,14 @@ class EagleDraftInput:
 
     # Inputs for draft extend
     # shape: (b,)
-    seq_lens_for_draft_extend: jax.Array = None
-    req_pool_indices_for_draft_extend: jax.Array = None
+    seq_lens_for_draft_extend: np.ndarray = None
+    req_pool_indices_for_draft_extend: np.ndarray = None
     # todo some fields is unuseful
 
     # Inputs for V2 overlap worker
     # future_indices: Optional[FutureIndices] = None
     allocate_lens: np.ndarray | None = None
-    new_seq_lens: jax.Array | None = None
+    new_seq_lens: np.ndarray | None = None
     # verify_done: Optional[torch.cuda.Event] = None
 
     def tree_flatten(self):
@@ -474,7 +473,7 @@ class EagleDraftInput:
     def prepare_for_extend_after_verify(
         self,
         model_worker_batch: ModelWorkerBatch,
-        predict: jax.Array,
+        predict: np.ndarray,
         num_draft_tokens: int,
         draft_model_runner: Any,
         batch_output: GenerationBatchResult,
@@ -517,7 +516,7 @@ class EagleDraftInput:
         ):
             pad_len = model_worker_batch.input_ids.shape[0] - hidden_states.shape[0]
             pad_shape = (pad_len,) + hidden_states.shape[1:]
-            pad_values = jnp.zeros(pad_shape, dtype=hidden_states.dtype)
+            pad_values = np.zeros(pad_shape, dtype=hidden_states.dtype)
             model_worker_batch.spec_info.hidden_states = jnp.concatenate(
                 [model_worker_batch.spec_info.hidden_states, pad_values], axis=0
             )
@@ -576,26 +575,26 @@ class EagleDraftInput:
         # we don't need process outcache_loc because we don't need this in attention backend
         # out_cache_loc = np.empty((bs * topk * num_steps), dtype=np.int32)
         # model_worker_batch.out_cache_loc = out_cache_loc
-        model_worker_batch.seq_lens_sum = jnp.sum(model_worker_batch.seq_lens)
+        model_worker_batch.seq_lens_sum = np.sum(model_worker_batch.seq_lens)
         model_worker_batch.return_hidden_states = False
-        model_worker_batch.spec_info.positions = jnp.repeat(model_worker_batch.seq_lens, topk)
+        model_worker_batch.spec_info.positions = np.repeat(model_worker_batch.seq_lens, topk)
 
     @classmethod
     def create_idle_input(
         cls,
         hidden_size: int,
-        dtype: jnp.dtype,
+        dtype: np.dtype,
         topk: int,
         capture_hidden_mode: CaptureHiddenMode,
     ):
         return cls(
-            verified_id=jnp.empty((0,), dtype=jnp.int32),
-            hidden_states=jnp.empty((0, hidden_size), dtype=dtype),
-            topk_p=jnp.empty((0, topk), dtype=jnp.float32),
-            topk_index=jnp.empty((0, topk), dtype=jnp.int32),
+            verified_id=np.empty((0,), dtype=np.int32),
+            hidden_states=np.empty((0, hidden_size), dtype=dtype),
+            topk_p=np.empty((0, topk), dtype=np.float32),
+            topk_index=np.empty((0, topk), dtype=np.int32),
             capture_hidden_mode=capture_hidden_mode,
-            accept_length=jnp.empty((0,), dtype=jnp.int32),
-            accept_length_cpu=jnp.empty((0,), dtype=jnp.int32),
+            accept_length=np.empty((0,), dtype=np.int32),
+            accept_length_cpu=np.empty((0,), dtype=np.int32),
         )
 
     @DeprecationWarning
@@ -609,11 +608,9 @@ class EagleDraftInput:
         batch.input_ids = self.verified_id
         accept_length_cpu_arr = batch.spec_info.accept_length_cpu
         if accept_length_cpu_arr is None:
-            accept_length_cpu_host = numpy.asarray([], dtype=numpy.int32)
+            accept_length_cpu_host = np.asarray([], dtype=np.int32)
         else:
-            accept_length_cpu_host = numpy.asarray(
-                jax.device_get(accept_length_cpu_arr), dtype=numpy.int32
-            )
+            accept_length_cpu_host = accept_length_cpu_arr
         batch.extend_lens = (accept_length_cpu_host + 1).tolist()
         batch.extend_num_tokens = sum(batch.extend_lens)
         batch.seq_lens = batch.spec_info.seq_lens_for_draft_extend
@@ -624,8 +621,8 @@ class EagleDraftInput:
 
         self.capture_hidden_mode = CaptureHiddenMode.LAST
         self.accept_length = self.accept_length + 1
-        self.positions = jnp.empty_like(batch.input_ids, dtype=jnp.int32)
-        self.verified_id = jnp.empty_like(self.accept_length, dtype=jnp.int32)
+        self.positions = np.empty_like(batch.input_ids, dtype=np.int32)
+        self.verified_id = np.empty_like(self.accept_length, dtype=np.int32)
 
         self.positions, self.verified_id = create_extend_after_decode_spec_info(
             batch.input_ids,
@@ -635,16 +632,7 @@ class EagleDraftInput:
             self.verified_id,
         )
 
-        self.accept_length_cpu = jnp.asarray(accept_length_cpu_host, dtype=jnp.int32)
-
-    def generate_attn_arg_prefill(
-        self,
-        req_pool_indices: jax.Array,
-        paged_kernel_lens: jax.Array,
-        paged_kernel_lens_sum: int,
-        req_to_token: jax.Array,
-    ):
-        pass
+        self.accept_length_cpu = np.asarray(accept_length_cpu_host, dtype=np.int32)
 
     def filter_batch(self, new_indices: np.ndarray, has_been_filtered: bool = True):
 
@@ -679,11 +667,11 @@ class EagleDraftInput:
         if spec_info.hidden_states is None:
             return
         # FIXME(pc) this operate should be put on cpu
-        self.hidden_states = jnp.concatenate([self.hidden_states, spec_info.hidden_states], axis=0)
-        self.verified_id = jnp.concatenate([self.verified_id, spec_info.verified_id], axis=0)
-        self.topk_p = jnp.concatenate([self.topk_p, spec_info.topk_p])
-        self.topk_index = jnp.concatenate([self.topk_index, spec_info.topk_index])
-        self.allocate_lens = jnp.concatenate([self.allocate_lens, spec_info.allocate_lens])
+        self.hidden_states = np.concatenate([self.hidden_states, spec_info.hidden_states], axis=0)
+        self.verified_id = np.concatenate([self.verified_id, spec_info.verified_id], axis=0)
+        self.topk_p = np.concatenate([self.topk_p, spec_info.topk_p])
+        self.topk_index = np.concatenate([self.topk_index, spec_info.topk_index])
+        self.allocate_lens = np.concatenate([self.allocate_lens, spec_info.allocate_lens])
 
 
 @dataclass
@@ -693,11 +681,11 @@ class EagleVerifyOutput:
     # Logit outputs from target worker
     logits_output: LogitsProcessorOutput
     # Accepted token ids including the bonus token
-    verified_id: jax.Array
+    verified_id: np.ndarray
     # Accepted token length per sequence in a batch in CPU.
     accept_length_per_req_cpu: list[int]
     # Accepted indices from logits_output.next_token_logits
-    accepted_indices: jax.Array
+    accepted_indices: np.ndarray
 
 
 @register_pytree_node_class
@@ -711,7 +699,7 @@ class EagleVerifyInput:
     retrive_next_token: jax.Array
     retrive_next_sibling: jax.Array
     retrive_cum_len: jax.Array
-    seq_lens_cpu: jax.Array
+    seq_lens_cpu: np.ndarray
     # common type for pytree
     spec_steps: int
     topk: int
@@ -790,11 +778,11 @@ class EagleVerifyInput:
         self,
         model_worker_batch: ModelWorkerBatch,
         logits_output: LogitsProcessorOutput,
-        token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
-        page_size: int,
+        # token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
+        # page_size: int,
         rng: nnx.Rngs,
         mesh: Mesh,
-        vocab_mask: jax.Array | None = None,  # For grammar
+        # vocab_mask: jax.Array | None = None,  # For grammar
     ) -> jax.Array:
         """
         Verify and find accepted tokens based on logits output and batch
@@ -990,16 +978,16 @@ def _generate_simulated_accept_index(
 
 
 def get_src_tgt_cache_loc(
-    seq_lens: jax.Array,
-    out_cache_loc: jax.Array,
-    accept_index: jax.Array,
-    accept_length: jax.Array,
+    seq_lens: np.ndarray,
+    out_cache_loc: np.ndarray,
+    accept_index: np.ndarray,
+    accept_length: np.ndarray,
     draft_token_num: int,
     page_size: int,
 ):
     src_cache_loc = out_cache_loc[accept_index]
     extended_len = seq_lens + draft_token_num
-    keep_len = jnp.minimum(
+    keep_len = np.minimum(
         (seq_lens + accept_length + 1 + page_size - 1) // page_size * page_size,
         extended_len,
     )
@@ -1008,9 +996,9 @@ def get_src_tgt_cache_loc(
 
 
 def create_accept_length_filter(
-    accept_length: jax.Array,
-    unfinished_index_device: jax.Array,
-    seq_lens: jax.Array,
+    accept_length: np.ndarray,
+    unfinished_index_device: np.ndarray,
+    seq_lens: np.ndarray,
 ):
     accept_length_filter = jnp.zeros_like(accept_length)
     accept_length_filter[unfinished_index_device] = accept_length[unfinished_index_device] + 1

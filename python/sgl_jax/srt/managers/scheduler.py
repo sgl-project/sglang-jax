@@ -257,6 +257,7 @@ class Scheduler(
         self.num_retracted_reqs: int = 0
         self.num_paused_reqs: int = 0
         self.accept_token = 0
+        self.spec_num_forward_ct = 0
         self.draft_token = 0
         # Init chunked prefill
         self.chunked_prefill_size = server_args.chunked_prefill_size
