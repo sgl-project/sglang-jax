@@ -1,3 +1,11 @@
+"""
+  Usage:
+  1. For test benchmark in ci
+  SGLANG_JAX_IS_IN_CI=true python benchmark/kernels/flash_attention/bench_flashattention.py
+  2. For generic benchmark results
+  python benchmark/kernels/flash_attention/bench_flashattention.py
+"""
+
 import functools
 import time
 
@@ -8,6 +16,7 @@ from utils import create_decode_uniform_data, create_prefill_uniform_data
 from sgl_jax.srt.kernels.ragged_paged_attention.ragged_paged_attention import (
     ragged_paged_attention,
 )
+from sgl_jax.test.test_utils import CustomTestCase, is_in_ci
 
 
 def benchmark_backend(
@@ -133,11 +142,7 @@ def benchmark_backend(
     return avg_time
 
 
-def main():
-    print("JAX devices:", jax.devices())
-    print("Device count:", jax.device_count())
-    print()
-
+def full_benchmark():
     bench_modes = ["prefill", "decode"]
     page_size_config = [64, 128, 256]
     max_num_batched_tokens_config_for_decode = [
@@ -226,5 +231,69 @@ def main():
             print(f"cost: {flash_time * 1000}ms")
 
 
+class TestPerformance(CustomTestCase):
+    def test_ragged_paged_attention_performance(self, floating_threshold: int = 0.1):
+        """
+        Args:
+            floating_threshold: the ratio of expected results
+        """
+        # Key: (mode, page_size, max_num_batched_tokens, q_head_num, kv_head_num, head_dim, max_kv_cache_tokens)
+        # Value: expected cost-time (baseline) in ms
+        test_cases = {
+            ("prefill", 64, 1024, 16, 8, 128, 600000): 4.008749666657725,
+            ("prefill", 64, 1024, 16, 16, 128, 600000): 8.193466667459385,
+            ("prefill", 64, 4096, 16, 8, 128, 600000): 4.2207833333426,
+            ("prefill", 64, 4096, 16, 16, 128, 600000): 8.552263333816276,
+            ("prefill", 128, 1024, 16, 8, 128, 600000): 4.0092333329084795,
+            ("prefill", 128, 1024, 16, 16, 128, 600000): 8.165363332712635,
+            ("prefill", 128, 4096, 16, 8, 128, 600000): 4.24394333397989,
+            ("prefill", 128, 4096, 16, 16, 128, 600000): 8.460050000091238,
+            ("decode", 64, 32, 16, 8, 128, 600000): 4.261216666539743,
+            ("decode", 64, 32, 16, 16, 128, 600000): 8.48227999995288,
+            ("decode", 64, 128, 16, 8, 128, 600000): 4.822640000080962,
+            ("decode", 64, 128, 16, 16, 128, 600000): 9.865053332759999,
+            ("decode", 128, 32, 16, 8, 128, 600000): 4.196350000105061,
+            ("decode", 128, 32, 16, 16, 128, 600000): 8.480740000474421,
+            ("decode", 128, 128, 16, 8, 128, 600000): 4.756273332532146,
+            ("decode", 128, 128, 16, 16, 128, 600000): 9.756909999850905,
+        }
+        max_context_len = 40960
+        for case, baseline in test_cases.items():
+            (
+                mode,
+                page_size,
+                max_num_batched_tokens,
+                q_head_num,
+                kv_head_num,
+                head_dim,
+                max_kv_cache_tokens,
+            ) = case
+            res = benchmark_backend(
+                mode,
+                max_context_len,
+                max_kv_cache_tokens,
+                max_num_batched_tokens,
+                q_head_num,
+                kv_head_num,
+                head_dim,
+                page_size,
+            )
+            if baseline < 2:
+                expected_result = baseline * (1 + floating_threshold)
+            else:
+                expected_result = baseline * (1 + floating_threshold / 2)
+            print(f"{case}, res={res*1000}ms, {expected_result=}ms")
+            self.assertLess(
+                res * 1000,
+                expected_result,
+                f"Run ragged_paged_attention performance test failed, {case=}",
+            )
+
+
 if __name__ == "__main__":
-    main()
+    if is_in_ci():
+        print("Run Ragged Paged Attention Performance Test...")
+        TestPerformance().test_ragged_paged_attention_performance()
+    else:
+        print("Run Ragged Paged Attention Full Benchmark...")
+        full_benchmark()

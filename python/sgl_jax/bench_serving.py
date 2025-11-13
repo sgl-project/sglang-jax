@@ -1278,7 +1278,7 @@ async def benchmark(
         )
 
     # Flush cache
-    if ("sgl-jax" in backend and _get_bool_env_var("SGLANG_IS_IN_CI")) or flush_cache:
+    if ("sgl-jax" in backend and _get_bool_env_var("SGLANG_JAX_IS_IN_CI")) or flush_cache:
         requests.post(base_url + "/flush_cache", headers=get_auth_headers())
 
     time.sleep(1.0)

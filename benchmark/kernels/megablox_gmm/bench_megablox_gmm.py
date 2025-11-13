@@ -6,6 +6,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from sgl_jax.srt.kernels.gmm.megablox_gmm_backend import gmm
+from sgl_jax.test.test_utils import CustomTestCase, is_in_ci
 
 
 def create_gmm_test_data(
@@ -98,7 +99,7 @@ def create_uniform_group_sizes(num_groups: int, group_size: int) -> jnp.ndarray:
     return jnp.array([group_size] * num_groups, dtype=jnp.int32)
 
 
-def main():
+def full_benchmark():
     """Main benchmark function."""
     # Configuration ranges
     m_config = [512, 1024, 2048, 4096]
@@ -191,5 +192,51 @@ def main():
         print(f"Speedup ratio: {worst_config['megablox_ms'] / best_config['megablox_ms']:.2f}x")
 
 
+class TestPerformance(CustomTestCase):
+    def test_megablox_gmm_performance(self, floating_threshold: int = 0.1):
+        """
+        Args:
+            floating_threshold: the ratio of expected results
+        """
+        # Key: (m, k, n, num_groups)
+        # Value: expected cost-time (baseline) in ms
+        test_cases = {
+            (1024, 1024, 4096, 16): 1.9645499999872604,
+            (1024, 4096, 1024, 8): 1.0311300000770036,
+            (1024, 4096, 4096, 16): 7.200843333369751,
+            (4096, 1024, 1024, 8): 1.0643133333208727,
+            (4096, 1024, 4096, 16): 3.762219999998706,
+            (4096, 4096, 1024, 8): 3.689633333351594,
+            (4096, 4096, 4096, 16): 14.21690999995917,
+        }
+
+        for case, baseline in test_cases.items():
+            m, k, n, num_groups = case
+            group_sizes = create_uniform_group_sizes(num_groups, m // num_groups)
+            megablox_time = benchmark_backend(
+                m,
+                k,
+                n,
+                num_groups,
+                group_sizes,
+                backend_type="megablox",
+            )
+            if baseline < 2:
+                expected_result = baseline * (1 + floating_threshold)
+            else:
+                expected_result = baseline * (1 + floating_threshold / 2)
+            print(f"{case}, res={megablox_time*1000}ms, {expected_result=}ms")
+            self.assertLess(
+                megablox_time * 1000,
+                expected_result,
+                f"Run ragged_paged_attention performance test failed, {case=}",
+            )
+
+
 if __name__ == "__main__":
-    main()
+    if is_in_ci():
+        print("Run megablox gmm performance test...")
+        TestPerformance().test_megablox_gmm_performance()
+    else:
+        print("Run megablox gmm full benchmark...")
+        full_benchmark
