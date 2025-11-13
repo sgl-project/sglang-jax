@@ -8,22 +8,6 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-      - name: Install Python 3.12 and dependencies
-        shell: bash
-        run: |
-          sudo apt update
-          sudo apt install -y software-properties-common
-          sudo add-apt-repository -y ppa:deadsnakes/ppa
-          sudo apt update
-          sudo apt install -y \
-              python3.12 \
-              python3.12-venv \
-              python3.12-dev \
-              git \
-              curl \
-              procps \
-              build-essential
-          python3.12 --version
       - name: Install pre-commit hook
         run: |
           python3.12 -m venv .venv
