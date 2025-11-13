@@ -276,6 +276,4 @@ def get_model_loader(
     if load_config.load_format == LoadFormat.JAX:
         return JAXModelLoader(load_config, rngs, mesh)
 
-    logging.info("loader failed back to JAXModelLoader")
-
     return JAXModelLoader(load_config, rngs, mesh)

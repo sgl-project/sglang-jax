@@ -225,15 +225,9 @@ class ModelRunner:
                     local_device_memory * 0.9,
                 )
             else:
-                logging.warning(
-                    "The memory capacity is unbalanced. min_available_device_memory=%s, local_device_memory=%s, local_device_memory*0.9=%s",
-                    min_available_device_memory,
-                    local_device_memory,
-                    local_device_memory * 0.9,
+                raise ValueError(
+                    f"The memory capacity is unbalanced. min_available_device_memory={min_available_device_memory}, local_device_memory={local_device_memory}, local_device_memory*0.9={local_device_memory * 0.9}"
                 )
-                # raise ValueError(
-                #     f"The memory capacity is unbalanced. min_available_device_memory={min_available_device_memory}, local_device_memory={local_device_memory}, local_device_memory*0.9={local_device_memory * 0.9}"
-                # )
 
         return min_available_device_memory
 
