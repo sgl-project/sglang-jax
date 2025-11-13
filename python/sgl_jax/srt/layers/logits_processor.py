@@ -353,7 +353,8 @@ class LogitsProcessor(nnx.Module):
             )
 
     @staticmethod
-    def get_token_ids_logprobs(all_logprobs: jax.Array, logits_metadata: LogitsMetadata):
+    def get_token_ids_logprobs(all_logprobs: jax.Array, logits_metadata: LogitsMetadata, mesh: Mesh):
+        out_sharding = NamedSharding(mesh, P(None))
         input_token_ids_logprobs_val, input_token_ids_logprobs_idx = [], []
         pt = 0
         for token_ids, pruned_len in zip(
@@ -366,7 +367,7 @@ class LogitsProcessor(nnx.Module):
                 continue
 
             input_token_ids_logprobs_val.append(
-                [all_logprobs[pt + j, token_ids] for j in range(pruned_len)]
+                [all_logprobs.at[pt + j, token_ids].get(out_sharding = out_sharding) for j in range(pruned_len)]
             )
             input_token_ids_logprobs_idx.append([token_ids for _ in range(pruned_len)])
             pt += pruned_len
