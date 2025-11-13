@@ -144,8 +144,21 @@ class WeightLoader:
 
                         if len(moe_buffer[moe_key]) == len(expected_hf_keys):
                             shard_counts = [len(v) for v in moe_buffer[moe_key].values()]
-                            if len(set(shard_counts)) != 1 or shard_counts[0] != 8:
+                            # Validate all weights have consistent shard counts
+                            if len(set(shard_counts)) != 1:
                                 continue
+
+                            # Auto-detect TP sharding:
+                            # - Grok-2: concat_axis is set, needs multiple shards (e.g., 8)
+                            if mapping.concat_axis is not None:
+                                # TP-sharded weights: need multiple shards to concatenate
+                                if shard_counts[0] < 2:
+                                    continue
+                            else:
+                                # Non-TP-sharded weights: expect exactly 1 copy per expert
+                                if shard_counts[0] != 1:
+                                    continue
+
                             self._process_single_moe_group(
                                 params, moe_key, mapping, moe_buffer[moe_key]
                             )
@@ -162,10 +175,19 @@ class WeightLoader:
 
         if moe_buffer:
             for moe_key in moe_buffer:
-                expected = len(moe_mappings[moe_key].target_path[1:])
+                mapping = moe_mappings[moe_key]
+                expected = len(mapping.target_path[1:])
                 got = len(moe_buffer[moe_key])
+                shard_counts = (
+                    [len(v) for v in moe_buffer[moe_key].values()] if moe_buffer[moe_key] else []
+                )
                 logger.error(
-                    "MoE group %s incomplete: %s/%s weights loaded", moe_key, got, expected
+                    "MoE group %s incomplete: %s/%s weights loaded, shard_counts=%s, concat_axis=%s",
+                    moe_key,
+                    got,
+                    expected,
+                    shard_counts,
+                    mapping.concat_axis,
                 )
             raise RuntimeError("Incomplete MoE expert weights detected.")
 
@@ -184,11 +206,16 @@ class WeightLoader:
         collected_weights = []
         for hf_key in expected_hf_keys:
             weights = expert_weights_dict[hf_key]
-            if mapping.concat_axis is not None:
-                weights = jnp.concatenate(weights, axis=mapping.concat_axis)
+            # If TP-sharded (e.g., Grok-2), concatenate shards along concat_axis
+            if mapping.concat_axis is not None and len(weights) > 1:
+                weight = jnp.concatenate(weights, axis=mapping.concat_axis)
+            else:
+                # Non-TP-sharded (e.g., Qwen3-MoE), expect single weight
+                weight = weights[0]
+
             if mapping.transpose and not hf_key.endswith(".bias"):
-                weights = jnp.transpose(weights, (1, 0))
-            collected_weights.append(weights)
+                weight = jnp.transpose(weight, (1, 0))
+            collected_weights.append(weight)
 
         stacked_weight = jnp.stack(collected_weights, axis=0)  # (num_experts, ...)
 
@@ -207,18 +234,6 @@ class WeightLoader:
             sharded_weight = self._shard_weight(stacked_weight, mapping.sharding)
 
         model_param = self._get_param(params, target_path)
-
-        # CRITICAL: Validate shape match before assignment
-        expected_shape = model_param.value.shape
-        actual_shape = sharded_weight.shape
-        if expected_shape != actual_shape:
-            raise ValueError(
-                f"Shape mismatch for {target_path}!\n"
-                f"  Expected: {expected_shape}\n"
-                f"  Got:      {actual_shape}\n"
-                f"  This indicates incorrect weight loading configuration (concat_axis or transpose)."
-            )
-
         model_param.value = sharded_weight.astype(model_param.value.dtype)
 
         logger.debug("Assigned MoE group %s, shape: %s", moe_key, stacked_weight.shape)

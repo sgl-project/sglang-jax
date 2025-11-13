@@ -114,7 +114,9 @@ class ModelWorkerClient:
 
             # Update the future token ids map
             self.future_token_ids_map = set_future_token_ids(
-                self.future_token_ids_map, future_token_ids_ct, next_token_ids
+                self.future_token_ids_map,
+                future_token_ids_ct,
+                next_token_ids,
             )
 
             self.output_queue.put((None, logits_output, next_token_ids, cache_miss_count))

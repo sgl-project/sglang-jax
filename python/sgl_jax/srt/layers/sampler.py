@@ -392,9 +392,7 @@ def top_k_top_p_min_p_sampling_from_probs_jax_with_sort(args):
     )
 
     probs_idx = probs_idx.astype(jnp.int32)
-
-    result = jnp.take_along_axis(probs_idx, axis=1, indices=sampled_index).flatten()
-    return result
+    return jnp.take_along_axis(probs_idx, axis=1, indices=sampled_index).flatten()
 
 
 def top_k_top_p_min_p_sampling_from_probs_jax_with_mask(args):

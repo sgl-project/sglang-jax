@@ -193,6 +193,7 @@ class EPMoE(nnx.Module):
         self.dtype = dtype
         self.layer_id = layer_id
         self.ep_size = ep_size
+        self.original_mesh = mesh
         self.mesh = mesh
         self.activation = activation
         if num_experts % self.ep_size != 0:
@@ -262,7 +263,7 @@ class EPMoE(nnx.Module):
             topk_weights_reshard = jax.sharding.reshard(topk_weights, P(None))
             topk_ids_reshard = jax.sharding.reshard(topk_ids, P(None))
 
-            return shard_map(
+            result = shard_map(
                 self._forward,
                 mesh=self.moe_mesh,
                 in_specs=(
@@ -283,6 +284,11 @@ class EPMoE(nnx.Module):
                 self.wi_1.value,
                 self.wo.value,
             )
+
+        output_pspec = P(*([None] * (result.ndim)))
+        return jax.sharding.reshard(
+            result, jax.sharding.NamedSharding(self.original_mesh, output_pspec)
+        )
 
     def _forward(self, hidden_states, topk_weights, topk_ids, w0_weights, w1_weights, wo_weights):
         expert_shard_id = jax.lax.axis_index("expert")
@@ -375,7 +381,7 @@ class EPMoE(nnx.Module):
 
         # activation
         if self.activation == "silu":
-            layer_act = jax.nn.silu(layer_w0) 
+            layer_act = jax.nn.silu(layer_w0)
         elif self.activation == "gelu":
             layer_act = jax.nn.gelu(layer_w0)
         else:

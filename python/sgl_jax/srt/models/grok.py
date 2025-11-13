@@ -163,6 +163,7 @@ class Grok1MLP(nnx.Module):
         rngs: nnx.Rngs = None,
         dtype: jnp.dtype = jnp.bfloat16,
         reduce_results: bool = True,
+        mesh: jax.sharding.Mesh = None,
     ) -> None:
         super().__init__()
 
@@ -173,6 +174,7 @@ class Grok1MLP(nnx.Module):
             params_dtype=dtype,
             kernel_axes=(None, "tensor"),
             rngs=rngs,
+            mesh=mesh,
         )
         self.up_proj = LinearBase(
             input_size=hidden_size,
@@ -181,6 +183,7 @@ class Grok1MLP(nnx.Module):
             params_dtype=dtype,
             kernel_axes=(None, "tensor"),
             rngs=rngs,
+            mesh=mesh,
         )
         self.down_proj = LinearBase(
             input_size=intermediate_size,
@@ -189,6 +192,7 @@ class Grok1MLP(nnx.Module):
             params_dtype=dtype,
             kernel_axes=("tensor", None),
             rngs=rngs,
+            mesh=mesh,
         )
         self.act_fn = GeluAndMul(approximate="tanh")
         self.layer_id = layer_id
@@ -197,8 +201,7 @@ class Grok1MLP(nnx.Module):
     def __call__(self, x):
         gate, _ = self.gate_proj(x)
         up, _ = self.up_proj(x)
-        gate_up = jnp.concat([gate, up], axis=-1)
-        x, _ = self.act_fn(gate_up)
+        x, _ = self.act_fn(gate, up)
         x, _ = self.down_proj(x)
         return x
 
@@ -227,6 +230,7 @@ class Grok1MoE(nnx.Module):
         self.dtype = dtype
         self.top_k = top_k
         self.layer_id = layer_id
+        self.mesh = mesh
 
         # Gate always runs at full precision for stability
         # (see https://arxiv.org/pdf/2101.03961)
@@ -237,6 +241,7 @@ class Grok1MoE(nnx.Module):
             params_dtype=jnp.float32,
             kernel_axes=(None, None),
             rngs=rngs,
+            mesh=mesh,
         )
 
         self.router_logit_softcapping = getattr(config, "router_logit_softcapping", 30.0)
@@ -271,8 +276,7 @@ class Grok1MoE(nnx.Module):
             router_logits, self.top_k, renormalize=False
         )
 
-        result = self.experts(hidden_states, top_k_weights, top_k_indices)
-        return result
+        return self.experts(hidden_states, top_k_weights, top_k_indices)
 
     def _custom_topk(
         self, router_logits: jax.Array, top_k: int, renormalize: bool = False
@@ -336,6 +340,7 @@ class Grok1Attention(nnx.Module):
         rope_theta: float = 10000,
         *,
         rngs: nnx.Rngs,
+        mesh: jax.sharding.Mesh = None,
     ) -> None:
         super().__init__()
         self.config = config
@@ -350,6 +355,7 @@ class Grok1Attention(nnx.Module):
         self.kv_size = self.num_kv_heads * self.head_dim
         self.scaling = self.head_dim**-0.5
         self.rope_theta = rope_theta
+        self.mesh = mesh
 
         rope_scaling = get_rope_scaling(config)
         self.rope_rotate_half_dims = getattr(config, "rope_rotate_half_dims", False)
@@ -362,6 +368,7 @@ class Grok1Attention(nnx.Module):
             params_dtype=jnp.bfloat16,
             kernel_axes=(None, "tensor"),
             rngs=rngs,
+            mesh=mesh,
         )
 
         self.k_proj = LinearBase(
@@ -371,6 +378,7 @@ class Grok1Attention(nnx.Module):
             params_dtype=jnp.bfloat16,
             kernel_axes=(None, "tensor"),
             rngs=rngs,
+            mesh=mesh,
         )
 
         self.v_proj = LinearBase(
@@ -380,6 +388,7 @@ class Grok1Attention(nnx.Module):
             params_dtype=jnp.bfloat16,
             kernel_axes=(None, "tensor"),
             rngs=rngs,
+            mesh=mesh,
         )
 
         self.o_proj = LinearBase(
@@ -389,6 +398,7 @@ class Grok1Attention(nnx.Module):
             params_dtype=jnp.bfloat16,
             kernel_axes=("tensor", None),
             rngs=rngs,
+            mesh=mesh,
         )
 
         # Initialize rotary embeddings based on scaling configuration
@@ -474,6 +484,7 @@ class Grok1DecoderLayer(nnx.Module):
         self.hidden_size = config.hidden_size
         self.residual_moe = getattr(config, "residual_moe", False)
         self.layer_id = layer_id
+        self.mesh = mesh
 
         # Self-attention
         rope_theta = getattr(config, "rope_theta", 10000)
@@ -490,6 +501,7 @@ class Grok1DecoderLayer(nnx.Module):
             layer_id=layer_id,
             rope_theta=rope_theta,
             rngs=rngs,
+            mesh=mesh,
         )
 
         # Feed-forward networks
@@ -515,6 +527,7 @@ class Grok1DecoderLayer(nnx.Module):
                     layer_id=layer_id,
                     rngs=rngs,
                     reduce_results=False,
+                    mesh=mesh,
                 )
         else:
             raise NotImplementedError()
@@ -607,6 +620,7 @@ class Grok1Model(nnx.Module):
         self.config = config
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
+        self.mesh = mesh
 
         # Token embeddings (matching PyTorch VocabParallelEmbedding behavior)
         self.embed_tokens = Embed(
@@ -614,8 +628,9 @@ class Grok1Model(nnx.Module):
             features=config.hidden_size,
             rngs=rngs,
             dtype=jnp.bfloat16,
-            embedding_init=nnx.with_partitioning(init_fn, ("tensor", None)),
+            kernel_axes=("tensor", None),
             param_dtype=jnp.bfloat16,
+            mesh=self.mesh,
         )
 
         # Transformer layers
@@ -708,7 +723,7 @@ class Grok1ForCausalLM(nnx.Module):
                 num_embeddings=config.vocab_size,
                 features=config.hidden_size,
                 param_dtype=jnp.bfloat16,
-                embedding_init=nnx.with_partitioning(init_fn, ("tensor", None)),
+                kernel_axes=("tensor", None),
                 rngs=rngs,
             )
         soft_cap = getattr(config, "final_logit_softcapping", 0.0) if config else 0.0
@@ -896,9 +911,9 @@ class Grok1ForCausalLM(nnx.Module):
             )
 
             if target_name == "wo":
-                sharding = (None, ("data", "tensor"), None)
+                sharding = ("expert", "tensor", None)
             else:
-                sharding = (None, None, ("data", "tensor"))
+                sharding = ("expert", None, "tensor")
 
             if name == "w2":
                 # w2 (down_proj) -> wo: HF shape (8192, 2048), concat -> (8192, 16384), transpose -> (16384, 8192)
