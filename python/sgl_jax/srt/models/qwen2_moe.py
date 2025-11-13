@@ -415,6 +415,8 @@ class Qwen2MoeForCausalLM(nnx.Module):
             self.lm_head = ParallelLMHead(
                 config.vocab_size,
                 config.hidden_size,
+                dtype=self.dtype,
+                param_dtype=self.dtype,
                 kernel_axes=("tensor", None),
                 rngs=rngs,
             )

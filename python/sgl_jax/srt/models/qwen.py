@@ -322,6 +322,8 @@ class QWenLMHeadModel(nnx.Module):
             self.lm_head = ParallelLMHead(
                 vocab_size,
                 config.hidden_size,
+                dtype=self.dtype,
+                param_dtype=self.dtype,
                 kernel_axes=("tensor", None),
                 rngs=rngs,
             )
