@@ -333,7 +333,7 @@ class LogitsProcessor(nnx.Module):
                 (
                     input_token_ids_logprobs_val,
                     input_token_ids_logprobs_idx,
-                ) = self.get_token_ids_logprobs(input_logprobs, logits_metadata)
+                ) = self.get_token_ids_logprobs(input_logprobs, logits_metadata, self.mesh)
             else:
                 input_token_ids_logprobs_val = input_token_ids_logprobs_idx = None
 
