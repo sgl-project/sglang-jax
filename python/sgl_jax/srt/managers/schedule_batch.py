@@ -1127,24 +1127,32 @@ class ScheduleBatch:
             if np.any(valid_mask):
                 valid_indices = np.where(valid_mask)[0]
                 valid_seq_lens = seq_lens[valid_mask]
-
                 # Calculate aligned lengths for all valid sequences at once
-                aligned_lengths = ((valid_seq_lens + page_size - 1) // page_size) * page_size
+                if (
+                    self.forward_mode == ForwardMode.DECODE
+                    and not self.spec_algorithm.is_none()
+                    and self.spec_info.allocate_lens is not None
+                ):
+                    allocated_len = self.spec_info.allocate_lens[: len(self.reqs)]
+                    aligned_lengths = ((allocated_len + page_size - 1) // page_size) * page_size
+                    alread_allocated_lens = allocated_len
+                else:
+                    aligned_lengths = ((valid_seq_lens + page_size - 1) // page_size) * page_size
+                    alread_allocated_lens = valid_seq_lens
                 total_aligned_length = np.sum(aligned_lengths)
 
                 # Pre-allocate the result array
                 cache_loc_flat = np.zeros(total_aligned_length, dtype=np.int32)
-
                 # Fill the array efficiently
                 offset = 0
-                for i, (seq_idx, seq_len, aligned_len) in enumerate(
-                    zip(valid_indices, valid_seq_lens, aligned_lengths)
+                for i, (seq_idx, alread_allocated_len, aligned_len) in enumerate(
+                    zip(valid_indices, alread_allocated_lens, aligned_lengths)
                 ):
 
                     # Copy the actual data
-                    cache_loc_flat[offset : offset + seq_len] = token_indices_with_all_reqs[
-                        seq_idx, :seq_len
-                    ]
+                    cache_loc_flat[offset : offset + alread_allocated_len] = (
+                        token_indices_with_all_reqs[seq_idx, :alread_allocated_len]
+                    )
                     # Padding is already zero from initialization
                     offset += aligned_len
 
@@ -1465,7 +1473,7 @@ class ModelWorkerBatch:
             zeros_pad = np.zeros(padding_size, dtype=np.int32)
             positions_cpu = np.concatenate([self.positions, zeros_pad], axis=0)
         if len(positions_cpu) > len(input_ids_cpu):
-            positions_cpu = self.positions[:len(input_ids_cpu)]
+            positions_cpu = self.positions[: len(input_ids_cpu)]
 
         self.seq_lens = seq_lens_cpu
         self.extend_start_loc = extend_start_loc

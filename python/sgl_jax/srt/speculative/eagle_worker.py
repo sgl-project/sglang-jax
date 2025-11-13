@@ -1,14 +1,14 @@
 import functools
-import logging
-
-from tqdm import tqdm
 import itertools
+import logging
 import time
+
 import jax
 import jax.numpy as jnp
 import numpy as np
 from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
+from tqdm import tqdm
 
 from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessorOutput
 from sgl_jax.srt.layers.sampler import get_token_ids_logprobs, get_top_logprobs
@@ -270,8 +270,8 @@ class EAGLEWorker(ModelWorker):
             score_list,
             token_list,
             parents_list,
-            model_worker_batch.seq_lens,
-            jnp.sum(model_worker_batch.seq_lens),
+            model_worker_batch.seq_lens[: model_worker_batch.real_bs],
+            np.sum(model_worker_batch.seq_lens),
             self.topk,
             self.speculative_num_draft_tokens,
             int(self.req_to_token_pool.req_to_token.shape[1]),
@@ -556,10 +556,14 @@ class EAGLEWorker(ModelWorker):
                     model_worker_batch, self.draft_model_runner.mesh
                 ),
             )
-            topk_p, topk_index = topk_probs_from_logits(logits_output.next_token_logits[:model_worker_batch.real_bs*self.topk], self.topk)
+            topk_p, topk_index = topk_probs_from_logits(
+                logits_output.next_token_logits[: model_worker_batch.real_bs * self.topk], self.topk
+            )
             if self.hot_token_ids is not None:
                 topk_index = self.hot_token_ids[topk_index]
-            hidden_states = logits_output.hidden_states[:model_worker_batch.real_bs*self.topk*self.topk,:]
+            hidden_states = logits_output.hidden_states[
+                : model_worker_batch.real_bs * self.topk * self.topk, :
+            ]
         for i in range(len(score_list)):
             # topk = 1
             score_list[i] = score_list[i][: model_worker_batch.real_bs]
@@ -682,7 +686,7 @@ class EAGLEWorker(ModelWorker):
     def run_spec_decode_precompile(self):
         self.precompile_spec_extend()
         self.precompile_spec_decode()
-        
+
     def precompile_spec_extend(self):
         start_time = time.perf_counter()
         logger.info(
@@ -721,7 +725,9 @@ class EAGLEWorker(ModelWorker):
             self.precompile_bs_paddings,
         )
 
-        with tqdm(self.precompile_bs_paddings, desc="[SPEC_DECODE] PRECOMPILE", leave=False) as pbar:
+        with tqdm(
+            self.precompile_bs_paddings, desc="[SPEC_DECODE] PRECOMPILE", leave=False
+        ) as pbar:
             for bs in pbar:
                 pbar.set_postfix(bs=bs)
                 # use same page aligned with precompile cache_loc_paddings
@@ -738,19 +744,28 @@ class EAGLEWorker(ModelWorker):
                 )
                 spec_info = EagleDraftInput(
                     # FIXME(pc) dtype should according to serverargs
-                    topk_p=jnp.ones((bs, self.topk), dtype=jnp.bfloat16 if self.server_args.dtype == "bfloat16" else jnp.float32),
-                    topk_index=jnp.ones((bs, self.topk),dtype=jnp.int32),
-                    hidden_states=jnp.ones((bs, self.model_config.hidden_size), dtype=jnp.bfloat16 if self.server_args.dtype == "bfloat16" else jnp.float32),
+                    topk_p=jnp.ones(
+                        (bs, self.topk),
+                        dtype=jnp.bfloat16 if self.server_args.dtype == "bfloat16" else jnp.float32,
+                    ),
+                    topk_index=jnp.ones((bs, self.topk), dtype=jnp.int32),
+                    hidden_states=jnp.ones(
+                        (bs, self.model_config.hidden_size),
+                        dtype=jnp.bfloat16 if self.server_args.dtype == "bfloat16" else jnp.float32,
+                    ),
                     verified_id=jnp.ones((bs,), dtype=jnp.int32),
                     accept_length=jnp.ones((bs,), dtype=jnp.int32),
-                    capture_hidden_mode=CaptureHiddenMode.LAST,                  
+                    capture_hidden_mode=CaptureHiddenMode.LAST,
+                    allocate_lens=model_worker_batch.seq_lens
+                    + EagleDraftInput.ALLOC_LEN_PER_DECODE,
                 )
-                model_worker_batch.capture_hidden_mode=CaptureHiddenMode.LAST
+                model_worker_batch.capture_hidden_mode = CaptureHiddenMode.LAST
                 model_worker_batch.spec_info = spec_info
                 self.forward_batch_speculative_generation(model_worker_batch)
 
         end_time = time.perf_counter()
         logger.info("[SPEC_DECODE] Precompile finished in %.0f secs", end_time - start_time)
+
 
 @functools.partial(jax.jit, static_argnames=["topk"])
 def topk_probs_from_logits(

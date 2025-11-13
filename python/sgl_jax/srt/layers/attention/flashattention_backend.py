@@ -184,14 +184,24 @@ class FlashAttentionBackend(AttentionBackend):
             # for draft decode
             offset1 = 0
             offset2 = 0
-            for i in range(batch.seq_lens.shape[0]):
-                selected_cache_locs_for_draft_decode[
-                    offset1 : offset1 + batch.seq_lens[i] + (speculative_step_id + 1) * topk
-                ] = selected_cache_locs[
-                    offset2 : offset2 + batch.seq_lens[i] + (speculative_step_id + 1) * topk
-                ]
-                offset1 += batch.seq_lens[i] + (speculative_step_id + 1) * topk
-                offset2 += batch.seq_lens[i] + EagleDraftInput.ALLOC_LEN_PER_DECODE
+            for i in range(batch.real_bs):
+                # print(
+                #     f"=={i=}====={offset1=}===={batch.real_bs=}={np.sum(batch.seq_lens)=}==={offset2=}=={batch.cache_loc.shape=}==={selected_cache_locs_for_draft_decode.shape=}=={selected_cache_locs.shape=}"
+                # )
+                draft_alloc = batch.spec_info.allocate_lens[i] - batch.seq_lens[i]
+                assert (
+                    draft_alloc == EagleDraftInput.ALLOC_LEN_PER_DECODE
+                ), f"{draft_alloc=} but {EagleDraftInput.ALLOC_LEN_PER_DECODE=}, speculative prepare_for_decode may be error"
+                seq_len = int(batch.seq_lens[i])
+                spec_tokens = seq_len + (speculative_step_id + 1) * topk
+                alloc_tokens = seq_len + draft_alloc
+                spec_pages = cdiv(spec_tokens, self.page_size)
+                alloc_pages = cdiv(alloc_tokens, self.page_size)
+                selected_cache_locs_for_draft_decode[offset1 : offset1 + spec_pages] = (
+                    selected_cache_locs[offset2 : offset2 + spec_pages]
+                )
+                offset1 += spec_pages
+                offset2 += alloc_pages
             selected_cache_locs = selected_cache_locs_for_draft_decode
 
         page_indices = (selected_cache_locs // self.page_size).astype(np.int32)
