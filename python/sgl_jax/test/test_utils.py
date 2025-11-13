@@ -41,7 +41,7 @@ DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH = 600
 
 def is_in_ci():
     """Return whether it is in CI runner."""
-    return get_bool_env_var("SGLANG_IS_IN_CI")
+    return get_bool_env_var("SGLANG_JAX_IS_IN_CI")
 
 
 DEFAULT_PORT_FOR_SRT_TEST_RUNNER = 5000 + 100 if is_in_ci() else 7000 + 100

@@ -88,15 +88,18 @@ def kill_process_tree(parent_pid, include_parent: bool = True, skip_pid: int = N
 
     if include_parent:
         with contextlib.suppress(psutil.NoSuchProcess):
-            if parent_pid == os.getpid():
+            try:
+                if parent_pid == os.getpid():
+                    itself.kill()
+                    sys.exit(0)
+
                 itself.kill()
-                sys.exit(0)
 
-            itself.kill()
-
-            # Sometime processes cannot be killed with SIGKILL (e.g, PID=1 launched by kubernetes),
-            # so we send an additional signal to kill them.
-            itself.send_signal(signal.SIGQUIT)
+                # Sometime processes cannot be killed with SIGKILL (e.g, PID=1 launched by kubernetes),
+                # so we send an additional signal to kill them.
+                itself.send_signal(signal.SIGQUIT)
+            except psutil.NoSuchProcess:
+                pass
 
 
 def set_ulimit(target_soft_limit=65535):
