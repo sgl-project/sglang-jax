@@ -4,7 +4,7 @@ on:
   push:
     branches:
       - main
-      - 'epic/*'
+      - "epic/*"
     paths:
       - "python/**"
       - "scripts/**"
@@ -13,7 +13,7 @@ on:
   pull_request:
     branches:
       - main
-      - 'epic/*'
+      - "epic/*"
     paths:
       - "python/**"
       - "scripts/**"
@@ -89,7 +89,7 @@ jobs:
       matrix:
         part: [0, 1]
     steps:
-    # TODO: please rename when implement unit test
+      # TODO: please rename when implement unit test
       - name: Mock
         timeout-minutes: 30
         env:
@@ -147,32 +147,62 @@ jobs:
     if: github.event.pull_request.draft == false && needs.check-changes.outputs.main_package == 'true'
     #runs-on: arc-runner-v6e-1
     runs-on: ubuntu-slim
-    strategy:
-      fail-fast: false
-      matrix:
-        part: [0, 1]
+    # strategy:
+    #   fail-fast: false
+    #   matrix:
+    #     part: [0, 1]
     steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup environment
+        run: |
+          uv venv --python 3.12
+          source .venv/bin/activate
+          uv pip install -e "python[all]"
+          bash scripts/killall_sglang.sh
+
+      - name: Evaluate accuracy
+        timeout-minutes: 20
+        run: |
+          cd test/srt
+          uv run python -m unittest test_eval_accuracy_large.TestEvalAccuracyLarge.test_mmlu
       # TODO: please rename when implement acc test
-      - name: Mock
-        env:
-          SGLANG_JAX_IS_IN_CI: true
-        run: echo ${{ matrix.part }}
+      # - name: Mock
+      #   env:
+      #     SGLANG_JAX_IS_IN_CI: true
+      #   run: echo ${{ matrix.part }}
 
   accurancy-test-4-tpu:
     needs: [check-changes]
     if: github.event.pull_request.draft == false && needs.check-changes.outputs.main_package == 'true'
     #runs-on: arc-runner-v6e-1
     runs-on: ubuntu-slim
-    strategy:
-      fail-fast: false
-      matrix:
-        part: [0, 1]
+    # strategy:
+    #   fail-fast: false
+    #   matrix:
+    #     part: [0, 1]
     steps:
       # TODO: please rename when implement acc test
-      - name: Mock
-        env:
-          SGLANG_JAX_IS_IN_CI: true
-        run: echo ${{ matrix.part }}
+      # - name: Mock
+      #   env:
+      #     SGLANG_JAX_IS_IN_CI: true
+      #   run: echo ${{ matrix.part }}
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup environment
+        run: |
+          uv venv --python 3.12
+          source .venv/bin/activate
+          uv pip install -e "python[all]"
+          bash scripts/killall_sglang.sh
+
+      - name: Evaluate accuracy (TP=2)
+        timeout-minutes: 20
+        run: |
+          cd test/srt
+          uv run python -m unittest test_moe_eval_accuracy_large.TestMoEEvalAccuracyLarge.test_mmlu
 
   # =============================================== performance-test ===============================================
   performance-test-1-tpu:
@@ -180,17 +210,59 @@ jobs:
     if: github.event.pull_request.draft == false && needs.check-changes.outputs.main_package == 'true'
     #runs-on: arc-runner-v6e-1
     runs-on: ubuntu-slim
-    strategy:
-      fail-fast: false
-      matrix:
-        part: [0, 1]
+    # strategy:
+    #   fail-fast: false
+    #   matrix:
+    #     part: [0, 1]
     steps:
-        # TODO: please rename when implement performance test
-      - name: Mock
+      # TODO: please rename when implement performance test
+      # - name: Mock
+      #   timeout-minutes: 10
+      #   env:
+      #     SGLANG_JAX_IS_IN_CI: true
+      #   run: echo ${{ matrix.part }}
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup environment
+        run: |
+          uv venv --python 3.12
+          source .venv/bin/activate
+          uv pip install -e "python[all]"
+          bash scripts/killall_sglang.sh
+
+      - name: Benchmark single req ttft on server
         timeout-minutes: 10
         env:
           SGLANG_JAX_IS_IN_CI: true
-        run: echo ${{ matrix.part }}
+        run: |
+          cd test/srt
+          python3 -m unittest test_bench_serving.TestBenchServing.test_ttft_default
+
+      - name: Benchmark single itl on server
+        timeout-minutes: 10
+        env:
+          SGLANG_JAX_IS_IN_CI: true
+        run: |
+          cd test/srt
+          python3 -m unittest test_bench_serving.TestBenchServing.test_itl_default
+
+      - name: Benchmark 500 reqs input throughput
+        timeout-minutes: 10
+        env:
+          SGLANG_JAX_IS_IN_CI: true
+        run: |
+          cd test/srt
+          python3 -m unittest test_bench_serving.TestBenchServing.test_input_throughput_default
+
+      - name: Benchmark 500 reqs output throughput
+        timeout-minutes: 10
+        env:
+          SGLANG_JAX_IS_IN_CI: true
+        run: |
+          cd test/srt
+          python3 -m unittest test_bench_serving.TestBenchServing.test_output_throughput_default
       # - name: Checkout code
       #   uses: actions/checkout@v4
       # - name: Setup environment
@@ -236,23 +308,68 @@ jobs:
       #     CLUSTER_NAME=$(bash scripts/get_cluster_name.sh tpu-v6e-1 ${{ github.ref }} performance)
       #     sky exec "$CLUSTER_NAME" -- 'set -e; cd sglang-jax/test/srt; python3 -m unittest test_bench_serving.TestBenchServing.test_offline_throughput_default'
 
-
   performance-test-4-tpu:
     needs: [check-changes]
     if: github.event.pull_request.draft == false && needs.check-changes.outputs.main_package == 'true'
     #runs-on: arc-runner-v6e-1
     runs-on: ubuntu-slim
-    strategy:
-      fail-fast: false
-      matrix:
-        part: [0, 1]
+    # strategy:
+    #   fail-fast: false
+    #   matrix:
+    #     part: [0, 1]
     steps:
-      # TODO: please rename when implement performance test
-      - name: Mock
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup environment
+        run: |
+          uv venv --python 3.12
+          source .venv/bin/activate
+          uv pip install -e "python[all]"
+          bash scripts/killall_sglang.sh
+
+      - name: Benchmark single req ttft on server (tp=4)
         timeout-minutes: 10
+
         env:
           SGLANG_JAX_IS_IN_CI: true
-        run: echo ${{ matrix.part }}
+        run: |
+          cd test/srt
+          python3 -m unittest test_bench_serving.TestBenchServing.test_moe_ttft_default
+
+      - name: Benchmark single itl on server (tp=4)
+        timeout-minutes: 10
+
+        env:
+          SGLANG_JAX_IS_IN_CI: true
+        run: |
+          cd test/srt
+          python3 -m unittest test_bench_serving.TestBenchServing.test_moe_itl_default
+
+      - name: Benchmark 500 reqs input throughput (tp=4)
+        timeout-minutes: 10
+
+        env:
+          SGLANG_JAX_IS_IN_CI: true
+        run: |
+          cd test/srt
+          python3 -m unittest test_bench_serving.TestBenchServing.test_moe_input_throughput_default
+
+      - name: Benchmark 500 reqs output throughput (tp=4)
+        timeout-minutes: 10
+
+        env:
+          SGLANG_JAX_IS_IN_CI: true
+        run: |
+          cd test/srt
+          python3 -m unittest test_bench_serving.TestBenchServing.test_moe_output_throughput_default
+
+      # TODO: please rename when implement performance test
+      # - name: Mock
+      #   timeout-minutes: 10
+      #   env:
+      #     SGLANG_JAX_IS_IN_CI: true
+      #   run: echo ${{ matrix.part }}
 
   # accuracy-test-1-tpu:
   #   if: github.event.pull_request.draft == false
@@ -308,17 +425,18 @@ jobs:
           python test/srt/run_suite.py --suite kernel-performance-test-tpu-v6e-1 --auto-partition-id ${{ matrix.part }} --auto-partition-size 2
 
   pr-test-finish:
-    needs: [
-      performance-test-1-tpu,
-      performance-test-4-tpu,
-      accurancy-test-1-tpu,
-      accurancy-test-4-tpu,
-      unit-test-1-tpu,
-      unit-test-4-tpu,
-      e2e-test-1-tpu,
-      e2e-test-4-tpu,
-      pallas-kernel-benchmark,
-    ]
+    needs:
+      [
+        performance-test-1-tpu,
+        performance-test-4-tpu,
+        accurancy-test-1-tpu,
+        accurancy-test-4-tpu,
+        unit-test-1-tpu,
+        unit-test-4-tpu,
+        e2e-test-1-tpu,
+        e2e-test-4-tpu,
+        pallas-kernel-benchmark,
+      ]
     runs-on: arc-runner-v6e-1
     steps:
       - name: Check all dependent job statuses
