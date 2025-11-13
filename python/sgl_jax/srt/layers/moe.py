@@ -217,7 +217,7 @@ class EPMoE(nnx.Module):
             self.wi_0 = nnx.Param(
                 jax.random.normal(
                     jax.random.PRNGKey(0),
-                    (self.experts_per_device, config.hidden_size, intermediate_dim),
+                    (num_experts, config.hidden_size, intermediate_dim),
                     dtype=weight_dtype,
                     out_sharding=P("expert", None, "tensor"),
                 )
@@ -226,7 +226,7 @@ class EPMoE(nnx.Module):
             self.wi_1 = nnx.Param(
                 jax.random.normal(
                     jax.random.PRNGKey(0),
-                    (self.experts_per_device, config.hidden_size, intermediate_dim),
+                    (num_experts, config.hidden_size, intermediate_dim),
                     dtype=weight_dtype,
                     out_sharding=P("expert", None, "tensor"),
                 )
@@ -235,7 +235,7 @@ class EPMoE(nnx.Module):
             self.wo = nnx.Param(
                 jax.random.normal(
                     jax.random.PRNGKey(0),
-                    (self.experts_per_device, intermediate_dim, config.hidden_size),
+                    (num_experts, intermediate_dim, config.hidden_size),
                     dtype=weight_dtype,
                     out_sharding=P("expert", "tensor", None),
                 )
