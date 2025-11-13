@@ -2,7 +2,6 @@ import logging
 
 import jax
 from jax import numpy as jnp
-from jax.sharding import NamedSharding, PartitionSpec
 
 from sgl_jax.srt.managers.schedule_batch import Req
 
@@ -53,8 +52,8 @@ def resolve_future_token_ids(input_ids, future_token_ids_map):
 
 @jax.jit
 def set_future_token_ids(future_token_ids_map, future_token_ids_ct, next_token_ids):
-    next_token_ids = jax.lax.with_sharding_constraint(
-        next_token_ids, NamedSharding(next_token_ids.sharding.mesh, PartitionSpec(None))
-    )
+    # next_token_ids = jax.lax.with_sharding_constraint(
+    #     next_token_ids, NamedSharding(next_token_ids.sharding.mesh, PartitionSpec(None))
+    # )
     start_indices = (future_token_ids_ct + 1,)
     return jax.lax.dynamic_update_slice(future_token_ids_map, next_token_ids, start_indices)
