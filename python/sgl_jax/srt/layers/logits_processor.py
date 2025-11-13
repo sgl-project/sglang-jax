@@ -337,10 +337,9 @@ class LogitsProcessor(nnx.Module):
             else:
                 input_token_ids_logprobs_val = input_token_ids_logprobs_idx = None
 
-            input_token_logprobs = input_logprobs[
-                device_array(np.arange(input_logprobs.shape[0])),
-                logits_metadata.extend_input_logprob_token_ids_device,
-            ]
+            out_sharding = NamedSharding(self.mesh, P(None))
+            indices = (np.arange(np.arange(input_logprobs.shape[0])), logits_metadata.extend_input_logprob_token_ids_device)
+            input_token_logprobs = input_logprobs.at[indices].get(out_sharding = out_sharding)
 
             return LogitsProcessorOutput(
                 next_token_logits=sampled_logits,
