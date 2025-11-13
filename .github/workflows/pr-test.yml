@@ -60,6 +60,7 @@ jobs:
               - ".github/workflows/pr-test.yml"
             pallas_kernel:
               - "python/sgl_jax/kernels/**"
+              - ".github/workflows/pr-test.yml"
   # =============================================== unit-test ====================================================
   unit-test-1-tpu:
     needs: [check-changes]
@@ -74,6 +75,8 @@ jobs:
       # TODO: please rename when implement unit test
       - name: Mock
         timeout-minutes: 30
+        env:
+          SGLANG_JAX_IS_IN_CI: true
         run: echo ${{ matrix.part }}
 
   unit-test-4-tpu:
@@ -89,6 +92,8 @@ jobs:
     # TODO: please rename when implement unit test
       - name: Mock
         timeout-minutes: 30
+        env:
+          SGLANG_JAX_IS_IN_CI: true
         run: echo ${{ matrix.part }}
 
   # =============================================== e2e-test ===============================================
@@ -104,6 +109,8 @@ jobs:
       - name: Run test
         timeout-minutes: 120
         shell: bash
+        env:
+          SGLANG_JAX_IS_IN_CI: true
         run: |
           python3.12 -m venv .venv
           source .venv/bin/activate
@@ -124,6 +131,8 @@ jobs:
       - name: Run test
         timeout-minutes: 120
         shell: bash
+        env:
+          SGLANG_JAX_IS_IN_CI: true
         run: |
           python3.12 -m venv .venv
           source .venv/bin/activate
@@ -145,6 +154,8 @@ jobs:
     steps:
       # TODO: please rename when implement acc test
       - name: Mock
+        env:
+          SGLANG_JAX_IS_IN_CI: true
         run: echo ${{ matrix.part }}
 
   accurancy-test-4-tpu:
@@ -159,6 +170,8 @@ jobs:
     steps:
       # TODO: please rename when implement acc test
       - name: Mock
+        env:
+          SGLANG_JAX_IS_IN_CI: true
         run: echo ${{ matrix.part }}
 
   # =============================================== performance-test ===============================================
@@ -173,9 +186,11 @@ jobs:
         part: [0, 1]
     steps:
         # TODO: please rename when implement performance test
-        - name: Mock
-          timeout-minutes: 10
-          run: echo ${{ matrix.part }}
+      - name: Mock
+        timeout-minutes: 10
+        env:
+          SGLANG_JAX_IS_IN_CI: true
+        run: echo ${{ matrix.part }}
       # - name: Checkout code
       #   uses: actions/checkout@v4
       # - name: Setup environment
@@ -235,6 +250,8 @@ jobs:
       # TODO: please rename when implement performance test
       - name: Mock
         timeout-minutes: 10
+        env:
+          SGLANG_JAX_IS_IN_CI: true
         run: echo ${{ matrix.part }}
 
   # accuracy-test-1-tpu:
@@ -270,16 +287,25 @@ jobs:
   pallas-kernel-benchmark:
     needs: [check-changes]
     if: github.event.pull_request.draft == false && needs.check-changes.outputs.pallas_kernel == 'true'
-    #runs-on: arc-runner-v6e-1
-    runs-on: ubuntu-slim
+    runs-on: arc-runner-v6e-1
     strategy:
       fail-fast: false
       matrix:
         part: [0, 1]
     steps:
-      # TODO: please rename when this implement kernel benchmark
-      - name: Mock
-        run: echo ${{ matrix.part }}
+      - name: Checkout code
+        uses: actions/checkout@v5
+      - name: Run test
+        timeout-minutes: 120
+        shell: bash
+        env:
+          SGLANG_JAX_IS_IN_CI: true
+        run: |
+          python3.12 -m venv .venv
+          source .venv/bin/activate
+          pip install uv
+          uv pip install -e "python[all]"
+          python test/srt/run_suite.py --suite kernel-performance-test-tpu-v6e-1 --auto-partition-id ${{ matrix.part }} --auto-partition-size 2
 
   pr-test-finish:
     needs: [

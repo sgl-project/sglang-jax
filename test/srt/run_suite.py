@@ -10,13 +10,13 @@ import time
 from dataclasses import dataclass
 from typing import Callable, List, Optional
 
-import psutil
+from sgl_jax.srt.utils import kill_process_tree
 
 
 @dataclass
 class TestFile:
     name: str
-    estimated_time: float = 60
+    estimated_time: float = 60  # in minitues
 
 
 def run_with_timeout(
@@ -41,45 +41,6 @@ def run_with_timeout(
         raise RuntimeError()
 
     return ret_value[0]
-
-
-def kill_process_tree(parent_pid, include_parent: bool = True, skip_pid: int = None):
-    """Kill the process and all its child processes."""
-    # Remove sigchld handler to avoid spammy logs.
-    if threading.current_thread() is threading.main_thread():
-        signal.signal(signal.SIGCHLD, signal.SIG_DFL)
-
-    if parent_pid is None:
-        parent_pid = os.getpid()
-        include_parent = False
-
-    try:
-        itself = psutil.Process(parent_pid)
-    except psutil.NoSuchProcess:
-        return
-
-    children = itself.children(recursive=True)
-    for child in children:
-        if child.pid == skip_pid:
-            continue
-        try:
-            child.kill()
-        except psutil.NoSuchProcess:
-            pass
-
-    if include_parent:
-        try:
-            if parent_pid == os.getpid():
-                itself.kill()
-                sys.exit(0)
-
-            itself.kill()
-
-            # Sometime processes cannot be killed with SIGKILL (e.g, PID=1 launched by kubernetes),
-            # so we send an additional signal to kill them.
-            itself.send_signal(signal.SIGQUIT)
-        except psutil.NoSuchProcess:
-            pass
 
 
 def cleanup_model_cache():
@@ -180,6 +141,11 @@ suites = {
     "per-commit-cpu": [],
     "nightly": [],
     "sglang_dependency_test": [],
+    "kernel-performance-test-tpu-v6e-1": [
+        TestFile("benchmark/kernels/flash_attention/bench_flashattention.py", 5),
+        TestFile("benchmark/kernels/megablox_gmm/bench_megablox_gmm.py", 2),
+        TestFile("benchmark/kernels/update_kv_cache/bench_update_kv_cache.py", 3),
+    ],
 }
 
 

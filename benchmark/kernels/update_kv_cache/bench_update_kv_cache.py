@@ -7,12 +7,15 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 from utils import create_bench_data, create_input_params
 
-from sgl_jax.srt.mem_cache.memory_pool import (
-    get_num_slices_per_block,
+from sgl_jax.srt.kernels.update_kv_cache.tuned_block_sizes import (
+    get_best_num_slices_per_block,
+)
+from sgl_jax.srt.kernels.update_kv_cache.update_kv_cache import (
     get_slot_mapping,
     kv_cache_update_kernel,
 )
 from sgl_jax.srt.utils import cdiv
+from sgl_jax.test.test_utils import CustomTestCase, is_in_ci
 
 
 def benchmark_backend(
@@ -81,24 +84,23 @@ def benchmark_backend(
 
     # run
     times = []
-    with jax.profiler.trace("/home/gcpuser/aolemila/profile_update/"):
-        for i in range(3):
-            start = time.perf_counter()
-            out = wrap_kv_cache_update(
-                new_value,
-                cache,
-                slices,
-                page_size,
-                update_slices_num,
-                num_slices_per_block,
-            )
-            jax.block_until_ready(out)
-            times.append(time.perf_counter() - start)
+    for i in range(3):
+        start = time.perf_counter()
+        out = wrap_kv_cache_update(
+            new_value,
+            cache,
+            slices,
+            page_size,
+            update_slices_num,
+            num_slices_per_block,
+        )
+        jax.block_until_ready(out)
+        times.append(time.perf_counter() - start)
 
     return np.mean(times)
 
 
-def main():
+def full_benchmark():
     head_num_config = [8, 16, 32]
     max_cache_len_config = [80000, 160000, 320000, 640000, 1280000]
     new_kv_len_config = [1024, 2048, 4096, 9182, 16384]
@@ -131,7 +133,9 @@ def main():
             head_num,
             head_dim,
         )
-        max_num_slices_per_block_config = get_num_slices_per_block(new_value, cache, page_size)
+        max_num_slices_per_block_config = get_best_num_slices_per_block(
+            head_num, max_cache_len, new_value_len, head_dim, page_size
+        )
         random_cache_loc, slice_lens, new_value_start_loc, update_slices_num = create_input_params(
             max_cache_len, new_value_len, page_size=page_size
         )
@@ -165,5 +169,76 @@ def main():
         )
 
 
+class TestPerformance(CustomTestCase):
+    def test_update_kv_cache_performance(self, floating_threshold: int = 0.1):
+        """
+        Args:
+            floating_threshold: the ratio of expected results
+        """
+        # Key: (head_num, max_cache_len, new_value_len, page_size, num_slices_per_block)
+        # Value: expected cost-time (baseline) in ms
+        test_cases = {
+            (8, 640000, 1024, 64, 16): 2.1278466665535234,
+            (8, 640000, 1024, 64, 64): 2.143913333687427,
+            (8, 640000, 1024, 128, 16): 2.140323333151173,
+            (8, 640000, 1024, 128, 64): 2.1591999999751956,
+            (8, 640000, 9182, 64, 16): 2.190333333601302,
+            (8, 640000, 9182, 64, 64): 2.2030303334759083,
+            (8, 640000, 9182, 128, 16): 2.180196666813572,
+            (8, 640000, 9182, 128, 64): 2.179193333783284,
+            (16, 160000, 1024, 64, 16): 1.1757366664824076,
+            (16, 160000, 1024, 64, 64): 1.1733099997096967,
+            (16, 160000, 1024, 128, 16): 1.174376666616202,
+            (16, 160000, 1024, 128, 64): 1.193989999895469,
+            (16, 160000, 9182, 64, 16): 1.234659999984918,
+            (16, 160000, 9182, 64, 64): 1.2280563338814925,
+            (16, 160000, 9182, 128, 16): 1.22331000026558,
+            (16, 160000, 9182, 128, 64): 1.2295200000759603,
+            (16, 640000, 1024, 64, 16): 4.42100333354271,
+            (16, 640000, 1024, 64, 64): 4.387726666512511,
+            (16, 640000, 1024, 128, 16): 4.395476666710844,
+            (16, 640000, 1024, 128, 64): 4.4098866665081005,
+            (16, 640000, 9182, 64, 16): 4.446526666773328,
+            (16, 640000, 9182, 64, 64): 4.459499999938998,
+            (16, 640000, 9182, 128, 16): 4.431259999970886,
+            (16, 640000, 9182, 128, 64): 4.429160000048189,
+        }
+        head_dim = 128
+        for case, roofline in test_cases.items():
+            head_num, max_cache_len, new_value_len, page_size, num_slices_per_block = case
+            new_value, cache = create_bench_data(
+                max_cache_len,
+                new_value_len,
+                head_num,
+                head_dim,
+            )
+            random_cache_loc, slice_lens, new_value_start_loc, update_slices_num = (
+                create_input_params(max_cache_len, new_value_len, page_size=page_size)
+            )
+            cost = benchmark_backend(
+                new_value,
+                cache,
+                random_cache_loc,
+                new_value_start_loc,
+                slice_lens,
+                update_slices_num,
+                num_slices_per_block,
+                page_size=page_size,
+            )
+            if roofline < 2:
+                expect_result = roofline * (1 + floating_threshold)
+            else:
+                expect_result = roofline * (1 + floating_threshold / 2)
+            print(f"{case}, res={cost*1000}ms, {expect_result=}ms")
+            self.assertLess(
+                cost * 1000, expect_result, f"Run update_kv_cache performance test failed, {case=}"
+            )
+
+
 if __name__ == "__main__":
-    main()
+    if is_in_ci():
+        print("Run update kv cache performance test...")
+        TestPerformance().test_update_kv_cache_performance()
+    else:
+        print("Run update kv cache full benchmark...")
+        full_benchmark()
