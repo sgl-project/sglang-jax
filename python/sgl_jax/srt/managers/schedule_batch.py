@@ -1049,9 +1049,228 @@ class ScheduleBatch:
         bs_paddings: list,
         cache_loc_paddings: list,
         page_size: int,
-        speculative_step_id: int = 0,
         skip_padding: bool = False,
     ) -> ModelWorkerBatch:
+        if skip_padding:
+            # FIXME(pc) spec decode model_worker_batch will be modified at decode stage, and padding laterly
+            # this may has some redundant code, we need clear future
+            return self.get_spec_model_worker_batch(token_paddings=token_paddings, bs_paddings=bs_paddings, cache_loc_paddings=cache_loc_paddings, page_size=page_size, skip_padding=skip_padding)
+        
+        if self.forward_mode.is_decode_or_idle():
+            extend_seq_lens = extend_prefix_lens = extend_logprob_start_lens = None
+            token_paddings = bs_paddings
+        else:
+            extend_seq_lens = np.array(self.extend_lens, dtype=np.int32)
+            extend_prefix_lens = np.array(self.prefix_lens, dtype=np.int32)
+            bs_paddings = bs_paddings[-1:]
+            cache_loc_paddings = cache_loc_paddings[-1:]
+            extend_logprob_start_lens = self.extend_logprob_start_lens
+
+        global bid
+        bid += 1
+
+        if self.input_ids is None:
+            input_ids_cpu = np.empty(0, dtype=np.int32)
+        else:
+            input_ids_cpu = self.input_ids.flatten()
+
+        real_input_ids_len = len(input_ids_cpu)
+        out_cache_loc_cpu = self.out_cache_loc
+        seq_lens_cpu = self.seq_lens
+        real_bs = len(seq_lens_cpu)
+        req_pool_indices_cpu = self.req_pool_indices
+        token_indices_with_all_reqs = self.req_to_token_pool.req_to_token[self.req_pool_indices]
+
+        # padding seq
+        # extend & decode: input_ids, positions, out_cache_loc, cache_loc
+        padding_size = 0
+        token_paddings.sort()
+        for size in token_paddings:
+            if size >= len(input_ids_cpu):
+                padding_size = size - len(input_ids_cpu)
+                break
+
+        if padding_size > 0:
+            input_ids_cpu = np.concat(
+                [
+                    input_ids_cpu,
+                    np.array([0] * padding_size, dtype=input_ids_cpu.dtype),
+                ],
+                axis=0,
+            )
+
+        padded_input_ids_len = len(input_ids_cpu)
+        out_cache_loc_num_to_padding = padded_input_ids_len - len(out_cache_loc_cpu)
+        if out_cache_loc_num_to_padding > 0:
+            out_cache_loc_cpu = np.concatenate(
+                [
+                    out_cache_loc_cpu,
+                    np.array(
+                        [-1] * out_cache_loc_num_to_padding,
+                        dtype=out_cache_loc_cpu.dtype,
+                    ),
+                ],
+                axis=0,
+            )
+
+        # Calculate positions and extend_start_loc after padding
+        if self.forward_mode.is_extend():
+            # For prefill: create positions for each token in sequences
+            # Calculate total tokens without padding first
+            total_tokens_before_padding = sum([extend_len for extend_len in self.extend_lens])
+            positions_cpu = np.concatenate(
+                [
+                    np.arange(prefix_len, seq_len, dtype=seq_lens_cpu.dtype)
+                    for seq_len, prefix_len in zip(seq_lens_cpu, self.prefix_lens)
+                ]
+            )
+
+            # If input_ids was padded, pad positions too
+            padding_size = len(input_ids_cpu) - total_tokens_before_padding
+            if padding_size:
+                positions_cpu = np.concatenate(
+                    [positions_cpu, np.zeros(padding_size, dtype=positions_cpu.dtype)]
+                )
+
+            # Start location of each sequence in the flattened array
+            extend_start_loc = np.cumsum(
+                np.concatenate([np.array([0]), extend_seq_lens[:-1]]),
+                dtype=seq_lens_cpu.dtype,
+            )
+        else:
+            # For decode: each sequence contributes one token at the next position (seq_len)
+            # Create positions for actual tokens (one per sequence at seq_len)
+            batch_positions = seq_lens_cpu - 1
+            # Create positions array matching the length of input_ids (including padding)
+            positions_cpu = np.zeros(len(input_ids_cpu), dtype=batch_positions.dtype)
+            # Fill in the actual positions for the real tokens
+            # positions = positions.at[: len(batch_positions)].set(batch_positions)
+            positions_cpu[: len(batch_positions)] = batch_positions
+            # The padding tokens (if any) will have position 0, which is fine for padding
+            # For decode, extend_start_loc is typically not used but we'll set it anyway
+            extend_start_loc = np.arange(len(seq_lens_cpu), dtype=seq_lens_cpu.dtype)
+
+        bs_padding_size = 0
+        bs_paddings.sort()
+        select_bs_index = -1
+        for i, size in enumerate(bs_paddings):
+            if size >= len(seq_lens_cpu):
+                bs_padding_size = size - len(seq_lens_cpu)
+                select_bs_index = i
+                break
+
+        cache_loc_flat = np.array([], dtype=np.int32)
+        if len(seq_lens_cpu) > 0:
+            # Filter out empty sequences
+            valid_mask = seq_lens_cpu > 0
+            if np.any(valid_mask):
+                valid_indices = np.where(valid_mask)[0]
+                valid_seq_lens = seq_lens_cpu[valid_mask]
+
+                # Calculate aligned lengths for all valid sequences at once
+                aligned_lengths = ((valid_seq_lens + page_size - 1) // page_size) * page_size
+                total_aligned_length = np.sum(aligned_lengths)
+
+                # Pre-allocate the result array
+                cache_loc_flat = np.zeros(total_aligned_length, dtype=np.int32)
+
+                # Fill the array efficiently
+                offset = 0
+                for i, (seq_idx, seq_len, aligned_len) in enumerate(
+                    zip(valid_indices, valid_seq_lens, aligned_lengths)
+                ):
+                    # Copy the actual data
+                    cache_loc_flat[offset : offset + seq_len] = token_indices_with_all_reqs[
+                        seq_idx, :seq_len
+                    ]
+                    # Padding is already zero from initialization
+                    offset += aligned_len
+
+        offset = np.sum(seq_lens_cpu[seq_lens_cpu > 0]) if len(seq_lens_cpu) > 0 else 0
+
+        total_cache_loc_size = cache_loc_paddings[select_bs_index]
+        assert total_cache_loc_size >= len(cache_loc_flat)
+
+        cache_loc_cpu = np.empty(total_cache_loc_size, dtype=np.int32)
+        if len(cache_loc_flat) > 0:
+            cache_loc_cpu[: len(cache_loc_flat)] = cache_loc_flat
+        # Initialize padding area to ensure multiprocess consistency
+        if len(cache_loc_flat) < total_cache_loc_size:
+            cache_loc_cpu[len(cache_loc_flat) :] = 0
+
+        if bs_padding_size > 0:
+            invalid_req_pool_indices = np.array(
+                [-1] * bs_padding_size, dtype=req_pool_indices_cpu.dtype
+            )
+            req_pool_indices_cpu = np.concat(
+                [
+                    req_pool_indices_cpu,
+                    invalid_req_pool_indices,
+                ],
+                axis=0,
+            )
+            invalid_seq_lens = np.array([0] * bs_padding_size, dtype=seq_lens_cpu.dtype)
+            seq_lens_cpu = np.concat([seq_lens_cpu, invalid_seq_lens], axis=0)
+            if self.forward_mode.is_extend():
+                invalid_extend_start_loc = np.array(
+                    [extend_start_loc[-1] + extend_seq_lens[-1]] * bs_padding_size,
+                    dtype=extend_start_loc.dtype,
+                )
+                extend_start_loc = np.concat([extend_start_loc, invalid_extend_start_loc], axis=0)
+                invalid_extend_prefix_lens = np.array(
+                    [0] * bs_padding_size, dtype=extend_prefix_lens.dtype
+                )
+                extend_prefix_lens = np.concat(
+                    [extend_prefix_lens, invalid_extend_prefix_lens], axis=0
+                )
+                invalid_extend_seq_lens = np.array(
+                    [0] * bs_padding_size, dtype=extend_seq_lens.dtype
+                )
+                extend_seq_lens = np.concat([extend_seq_lens, invalid_extend_seq_lens], axis=0)
+            else:
+                invalid_extend_start_loc = np.array(
+                    [len(seq_lens_cpu)] * bs_padding_size, dtype=extend_start_loc.dtype
+                )
+                extend_start_loc = np.concat([extend_start_loc, invalid_extend_start_loc], axis=0)
+
+        if precision_tracer.get_trace_active():
+            self._generate_trace_info(real_bs, bid)
+
+        return ModelWorkerBatch(
+            bid=bid,
+            forward_mode=self.forward_mode,
+            input_ids=input_ids_cpu,
+            real_input_ids_len=real_input_ids_len,
+            req_pool_indices=req_pool_indices_cpu,
+            seq_lens=seq_lens_cpu,
+            out_cache_loc=out_cache_loc_cpu,
+            return_logprob=self.return_logprob,
+            top_logprobs_nums=self.top_logprobs_nums,
+            token_ids_logprobs=self.token_ids_logprobs,
+            sampling_info=self.sampling_info,
+            positions=positions_cpu,
+            extend_start_loc=extend_start_loc,
+            cache_loc=cache_loc_cpu,
+            extend_prefix_lens=(
+                extend_prefix_lens if self.forward_mode == ForwardMode.EXTEND else None
+            ),
+            extend_seq_lens=(extend_seq_lens if self.forward_mode == ForwardMode.EXTEND else None),
+            extend_logprob_start_lens=extend_logprob_start_lens,
+            extend_input_logprob_token_ids=self.extend_input_logprob_token_ids,
+            real_bs=real_bs,
+            capture_hidden_mode=CaptureHiddenMode.NULL,
+            launch_done=self.launch_done,
+        )
+
+    def get_spec_model_worker_batch(
+        self,
+        token_paddings: list,
+        bs_paddings: list,
+        cache_loc_paddings: list,
+        page_size: int,
+        skip_padding: bool = False,
+    ) -> ModelWorkerBatch:
+        
         if self.forward_mode.is_decode_or_idle():
             extend_seq_lens = extend_prefix_lens = extend_logprob_start_lens = None
         else:

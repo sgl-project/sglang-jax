@@ -960,37 +960,38 @@ class Scheduler(
             batch_output = self.draft_worker.forward_batch_speculative_generation(
                 model_worker_batch
             )
-            bid = batch_output.bid
-            batch.output_ids = batch_output.next_token_ids
             if batch_output.accept_lens is not None:
                 batch.seq_lens = batch.seq_lens + batch_output.accept_lens
             batch.spec_info = batch_output.next_draft_input
-            # These 2 values are needed for processing the output, but the values can be
-            # modified by overlap schedule. So we have to copy them here so that
-            # we can use the correct values in output processing.
-            if batch.return_logprob:
-                extend_input_len_per_req = [req.extend_input_len for req in batch.reqs]
-            else:
-                extend_input_len_per_req = None
-            if batch.return_logprob:
-                extend_logprob_start_len_per_req = [
-                    req.extend_logprob_start_len for req in batch.reqs
-                ]
-            else:
-                extend_logprob_start_len_per_req = None
-
-            ret = GenerationBatchResult(
-                logits_output=batch_output.logits_output,
-                next_token_ids=batch_output.next_token_ids.tolist(),
-                extend_input_len_per_req=extend_input_len_per_req,
-                extend_logprob_start_len_per_req=extend_logprob_start_len_per_req,
-                bid=bid,
-                cache_miss_count=batch_output.cache_miss_count,
-                next_draft_input=batch_output.next_draft_input,
-                accept_lens=batch_output.accept_lens,
-                allocate_lens=batch_output.allocate_lens,
-            )
-
+            next_token_ids = batch_output.next_token_ids
+            logits_output = batch_output.logits_output
+            cache_miss_count = batch_output.cache_miss_count
+        bid = model_worker_batch.bid
+        batch.output_ids = next_token_ids
+        # These 2 values are needed for processing the output, but the values can be
+        # modified by overlap schedule. So we have to copy them here so that
+        # we can use the correct values in output processing.
+        if batch.return_logprob:
+            extend_input_len_per_req = [req.extend_input_len for req in batch.reqs]
+        else:
+            extend_input_len_per_req = None
+        if batch.return_logprob:
+            extend_logprob_start_len_per_req = [req.extend_logprob_start_len for req in batch.reqs]
+        else:
+            extend_logprob_start_len_per_req = None
+        ret = GenerationBatchResult(
+            logits_output=logits_output,
+            next_token_ids=next_token_ids.tolist(),
+            extend_input_len_per_req=extend_input_len_per_req,
+            extend_logprob_start_len_per_req=extend_logprob_start_len_per_req,
+            bid=bid,
+            cache_miss_count=cache_miss_count,
+        )
+        if not self.spec_algorithm.is_none():
+            assert isinstance(batch_output.next_draft_input, EagleDraftInput)
+            ret.next_draft_input=batch_output.next_draft_input
+            ret.accept_lens=batch_output.accept_lens
+            ret.allocate_lens=batch_output.allocate_lens
         return ret
 
     def process_batch_result(
