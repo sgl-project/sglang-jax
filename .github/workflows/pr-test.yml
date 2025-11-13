@@ -53,9 +53,9 @@ jobs:
         with:
           filters: |
             main_package:
-              - "python/sgl-jax/**"
+              - "python/sgl_jax/**"
               - "python/*.toml"
-              - "scripts/ci/**"
+              - "scripts/**"
               - "test/**"
               - ".github/workflows/pr-test.yml"
             pallas_kernel:
