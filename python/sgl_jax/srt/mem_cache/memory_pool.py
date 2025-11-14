@@ -18,9 +18,6 @@ from sgl_jax.srt.kernels.update_kv_cache.update_kv_cache import (
     kv_cache_update,
 )
 
-
-
-
 logger = logging.getLogger(__name__)
 
 GB = 1024 * 1024 * 1024
