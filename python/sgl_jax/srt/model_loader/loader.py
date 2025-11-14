@@ -277,7 +277,4 @@ def get_model_loader(
     if load_config.load_format == LoadFormat.JAX:
         return JAXModelLoader(load_config, rngs, mesh)
 
-    if load_config.load_format == LoadFormat.PT:
-        raise ValueError("Invalid load format: PT format is not supported for JAX models")
-
     return JAXModelLoader(load_config, rngs, mesh)
