@@ -1,7 +1,7 @@
 import jax
 from flax import nnx
 from jax import numpy as jnp
-from jax.experimental.shard_map import shard_map
+from jax import shard_map
 from jax.sharding import Mesh
 from jax.sharding import PartitionSpec as P
 
@@ -272,7 +272,7 @@ class EPMoE(nnx.Module):
                     P("expert", "tensor", None),
                 ),
                 out_specs=P(None),
-                check_rep=False,
+                check_vma=False,
             )(
                 hidden_states_reshard,
                 topk_weights_reshard,

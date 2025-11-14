@@ -68,12 +68,13 @@ class Embed(nnx.Module):
                           computations between query/embedding tensors.
             rngs: Random number generator state for parameter initialization.
         """
+        out_sharding = NamedSharding(mesh, P(*kernel_axes)) if mesh is not None else None
         self.embedding = nnx.Param(
             jax.random.normal(
                 jax.random.PRNGKey(0),
                 (num_embeddings, features),
                 dtype=param_dtype,
-                out_sharding=P(*kernel_axes),
+                out_sharding=out_sharding,
             ),
         )
         self.kernel_axes = kernel_axes
@@ -140,6 +141,7 @@ class ParallelLMHead(Embed):
         promote_dtype: PromoteDtypeFn = dtypes.promote_dtype,
         kernel_axes: tuple[str, ...] = ("tensor", None),
         rngs: nnx.Rngs = None,
+        mesh: jax.sharding.Mesh = None,
         use_bias: bool = False,
     ):
         """
@@ -165,14 +167,16 @@ class ParallelLMHead(Embed):
             promote_dtype=promote_dtype,
             kernel_axes=kernel_axes,
             rngs=rngs,
+            mesh=mesh,
         )
         if use_bias:
+            bias_sharding = NamedSharding(mesh, P(None, "tensor")) if mesh is not None else None
             self.bias = nnx.Param(
                 jax.random.normal(
                     jax.random.PRNGKey(0),
                     (self.num_embeddings, self.features),
                     dtype=param_dtype,
-                    out_sharding=P(None, "tensor"),
+                    out_sharding=bias_sharding,
                 ),
             )
         else:

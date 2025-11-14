@@ -33,15 +33,15 @@ class TestModelLoader(unittest.TestCase):
         # Use tensor parallelism across available devices
         if len(devices) >= 4:
             # Use 4 devices for tensor parallelism
-            self.mesh = Mesh(devices[:4], ("tensor",))
+            self.mesh = Mesh(devices[:4], ("tensor",), axis_types=(jax.sharding.AxisType.Explicit,))
             print(f" Using 4-device tensor parallelism mesh: {self.mesh}")
         elif len(devices) >= 2:
             # Use 2 devices for tensor parallelism
-            self.mesh = Mesh(devices[:2], ("tensor",))
+            self.mesh = Mesh(devices[:2], ("tensor",), axis_types=(jax.sharding.AxisType.Explicit,))
             print(f" Using 2-device tensor parallelism mesh: {self.mesh}")
         else:
             # Single device fallback
-            self.mesh = Mesh(devices, ("tensor",))
+            self.mesh = Mesh(devices, ("tensor",), axis_types=(jax.sharding.AxisType.Explicit,))
             print(f" Using single-device mesh: {self.mesh}")
 
         # Initialize RNG
@@ -96,21 +96,25 @@ class TestModelLoader(unittest.TestCase):
 
         # Test mesh creation with available devices
         if len(devices) >= 4:
-            mesh = Mesh(devices[:4], ("tensor",))
+            mesh = Mesh(devices[:4], ("tensor",), axis_types=(jax.sharding.AxisType.Explicit,))
             print(f"PASS: 4-device tensor parallelism mesh created: {mesh}")
             self.assertEqual(mesh.shape, {"tensor": 4})
         elif len(devices) >= 2:
-            mesh = Mesh(devices[:2], ("tensor",))
+            mesh = Mesh(devices[:2], ("tensor",), axis_types=(jax.sharding.AxisType.Explicit,))
             print(f"PASS: 2-device tensor parallelism mesh created: {mesh}")
             self.assertEqual(mesh.shape, {"tensor": 2})
         else:
-            mesh = Mesh(devices, ("tensor",))
+            mesh = Mesh(devices, ("tensor",), axis_types=(jax.sharding.AxisType.Explicit,))
             print(f"PASS: Single-device mesh created: {mesh}")
             self.assertEqual(mesh.shape, {"tensor": 1})
 
-        # Verify all devices are CPU (as expected in test environment)
+        # Verify devices are available (could be CPU or TPU depending on environment)
         for device in devices:
-            self.assertEqual(device.platform, "cpu", f"Expected CPU device, got {device.platform}")
+            self.assertIn(
+                device.platform,
+                ["cpu", "tpu", "gpu"],
+                f"Unexpected device platform: {device.platform}",
+            )
 
         print("PASS: Multi-device environment validation completed!")
 
@@ -122,7 +126,11 @@ class TestModelLoader(unittest.TestCase):
             self.skipTest("Sharding test requires at least 2 devices")
 
         # Create test mesh
-        mesh = Mesh(devices[: min(4, len(devices))], ("tensor",))
+        mesh = Mesh(
+            devices[: min(4, len(devices))],
+            ("tensor",),
+            axis_types=(jax.sharding.AxisType.Explicit,),
+        )
 
         print(f" Testing sharding configuration with {len(mesh.devices)} devices")
 
@@ -211,19 +219,19 @@ class TestModelLoaderWithRealModel(unittest.TestCase):
         # Use tensor parallelism across available devices
         if len(devices) >= 8:
             # Use 8 devices for tensor parallelism (optimal for large models)
-            self.mesh = Mesh(devices[:8], ("tensor",))
+            self.mesh = Mesh(devices[:8], ("tensor",), axis_types=(jax.sharding.AxisType.Explicit,))
             print(f" Using 8-device tensor parallelism mesh: {self.mesh}")
         elif len(devices) >= 4:
             # Use 4 devices for tensor parallelism
-            self.mesh = Mesh(devices[:4], ("tensor",))
+            self.mesh = Mesh(devices[:4], ("tensor",), axis_types=(jax.sharding.AxisType.Explicit,))
             print(f" Using 4-device tensor parallelism mesh: {self.mesh}")
         elif len(devices) >= 2:
             # Use 2 devices for tensor parallelism
-            self.mesh = Mesh(devices[:2], ("tensor",))
+            self.mesh = Mesh(devices[:2], ("tensor",), axis_types=(jax.sharding.AxisType.Explicit,))
             print(f" Using 2-device tensor parallelism mesh: {self.mesh}")
         else:
             # Single device fallback
-            self.mesh = Mesh(devices, ("tensor",))
+            self.mesh = Mesh(devices, ("tensor",), axis_types=(jax.sharding.AxisType.Explicit,))
             print(f" Using single-device mesh: {self.mesh}")
         print(f"[MESH CHECK] mesh shape: {self.mesh.shape}, mesh devices: {self.mesh.devices}")
 
@@ -263,11 +271,14 @@ class TestModelLoaderWithRealModel(unittest.TestCase):
                 model_path=self.model_path, trust_remote_code=True, dtype="bfloat16"
             )
 
-            # Create QWen model instance
-            model = QWenLMHeadModel(model_config, model_config.dtype, self.rng, self.mesh)
+            # Create QWen model instance with mesh context
+            with jax.set_mesh(self.mesh):
+                model = QWenLMHeadModel(
+                    model_config.hf_config, model_config.dtype, self.rng, self.mesh
+                )
 
             self.assertIsInstance(model, QWenLMHeadModel)
-            self.assertEqual(model.config, model_config)
+            self.assertEqual(model.config, model_config.hf_config)
             self.assertEqual(model.mesh, self.mesh)
             self.assertTrue(hasattr(model, "load_weights"))
 
@@ -296,8 +307,11 @@ class TestModelLoaderWithRealModel(unittest.TestCase):
                 model_path=self.model_path, trust_remote_code=True, dtype="bfloat16"
             )
 
-            # Create QWen model instance
-            model = QWenLMHeadModel(model_config, model_config.dtype, self.rng, self.mesh)
+            # Create QWen model instance with mesh context
+            with jax.set_mesh(self.mesh):
+                model = QWenLMHeadModel(
+                    model_config.hf_config, model_config.dtype, self.rng, self.mesh
+                )
 
             # Print the actual parameter structure of the model
             try:
@@ -311,7 +325,7 @@ class TestModelLoaderWithRealModel(unittest.TestCase):
             print(f"🔄 Starting weight loading from: {self.model_path}")
 
             # Attempt to load weights
-            model.load_weights(jax.random.PRNGKey(42))
+            model.load_weights(model_config, jax.random.PRNGKey(42))
 
             print("PASS: Weight loading completed successfully!")
 
@@ -373,8 +387,11 @@ class TestModelLoaderWithRealModel(unittest.TestCase):
             print(f"  Num layers: {model_config.hf_config.num_hidden_layers}")
             print(f"  Attention heads: {model_config.num_attention_heads}")
 
-            # Create QWen model instance
-            model = QWenLMHeadModel(model_config, model_config.dtype, self.rng, self.mesh)
+            # Create QWen model instance with mesh context
+            with jax.set_mesh(self.mesh):
+                model = QWenLMHeadModel(
+                    model_config.hf_config, model_config.dtype, self.rng, self.mesh
+                )
 
             # Check what attributes the model actually has
             print(" Model Attributes:")
@@ -470,8 +487,11 @@ class TestModelLoaderWithRealModel(unittest.TestCase):
                 model_path=self.model_path, trust_remote_code=True, dtype="bfloat16"
             )
 
-            # Create QWen model instance
-            model = QWenLMHeadModel(model_config, model_config.dtype, self.rng, self.mesh)
+            # Create QWen model instance with mesh context
+            with jax.set_mesh(self.mesh):
+                model = QWenLMHeadModel(
+                    model_config.hf_config, model_config.dtype, self.rng, self.mesh
+                )
 
             print(" Validating Model Parameter Structure:")
             print(f"  Model type: {type(model).__name__}")
@@ -484,17 +504,21 @@ class TestModelLoaderWithRealModel(unittest.TestCase):
 
                 # Check key mappings we're expecting
                 expected_paths = [
-                    "transformer.embed_tokens.embedding",
-                    "transformer.ln_f.weight",
+                    "model.embed_tokens.embedding",
+                    "model.ln_f.scale",
                     "lm_head.embedding",
-                    "transformer.h.0.ln_1.weight",
-                    "transformer.h.0.ln_2.weight",
-                    "transformer.h.0.attn.c_attn.weight",
-                    "transformer.h.0.attn.c_attn.bias",
-                    "transformer.h.0.attn.c_proj.weight",
-                    "transformer.h.0.mlp.w1.weight",
-                    "transformer.h.0.mlp.w2.weight",
-                    "transformer.h.0.mlp.c_proj.weight",
+                    "model.layers.0.ln_1.scale",
+                    "model.layers.0.ln_2.scale",
+                    "model.layers.0.attn.q_proj.weight",
+                    "model.layers.0.attn.k_proj.weight",
+                    "model.layers.0.attn.v_proj.weight",
+                    "model.layers.0.attn.q_proj.bias",
+                    "model.layers.0.attn.k_proj.bias",
+                    "model.layers.0.attn.v_proj.bias",
+                    "model.layers.0.attn.c_proj.weight",
+                    "model.layers.0.mlp.w1.weight",
+                    "model.layers.0.mlp.w2.weight",
+                    "model.layers.0.mlp.c_proj.weight",
                 ]
 
                 print("\n Checking Expected Parameter Paths:")
@@ -660,7 +684,7 @@ class TestModelLoaderWithRealModel(unittest.TestCase):
 
             # Test that we can access parameters and they're properly sharded
             state = nnx.state(model)
-            embed_param = self._get_param_by_path(state, "transformer.embed_tokens.embedding")
+            embed_param = self._get_param_by_path(state, "model.embed_tokens.embedding")
 
             if hasattr(embed_param, "value"):
                 embed_weight = embed_param.value
@@ -698,13 +722,13 @@ class TestModelLoaderEdgeCases(unittest.TestCase):
 
         # Use tensor parallelism across available devices
         if len(devices) >= 4:
-            self.mesh = Mesh(devices[:4], ("tensor",))
+            self.mesh = Mesh(devices[:4], ("tensor",), axis_types=(jax.sharding.AxisType.Explicit,))
             print(f" Using 4-device tensor parallelism mesh: {self.mesh}")
         elif len(devices) >= 2:
-            self.mesh = Mesh(devices[:2], ("tensor",))
+            self.mesh = Mesh(devices[:2], ("tensor",), axis_types=(jax.sharding.AxisType.Explicit,))
             print(f" Using 2-device tensor parallelism mesh: {self.mesh}")
         else:
-            self.mesh = Mesh(devices, ("tensor",))
+            self.mesh = Mesh(devices, ("tensor",), axis_types=(jax.sharding.AxisType.Explicit,))
             print(f" Using single-device mesh: {self.mesh}")
 
         self.rng = nnx.Rngs(42)
@@ -728,7 +752,7 @@ class TestModelLoaderEdgeCases(unittest.TestCase):
         LoadConfig(load_format=LoadFormat.JAX)
 
         # This should fail when trying to create ModelConfig
-        with self.assertRaises(OSError):
+        with self.assertRaises(ValueError):
             ModelConfig(
                 model_path=self.temp_dir,
                 trust_remote_code=True,  # Empty directory
