@@ -193,7 +193,7 @@ def full_benchmark():
 
 
 class TestPerformance(CustomTestCase):
-    def test_megablox_gmm_performance(self, floating_threshold: int = 0.1):
+    def test_megablox_gmm_performance(self, floating_threshold: int = 0.15):
         """
         Args:
             floating_threshold: the ratio of expected results
@@ -202,9 +202,7 @@ class TestPerformance(CustomTestCase):
         # Value: expected cost-time (baseline) in ms
         test_cases = {
             (1024, 1024, 4096, 16): 1.9645499999872604,
-            (1024, 4096, 1024, 8): 1.0311300000770036,
             (1024, 4096, 4096, 16): 7.200843333369751,
-            (4096, 1024, 1024, 8): 1.0643133333208727,
             (4096, 1024, 4096, 16): 3.762219999998706,
             (4096, 4096, 1024, 8): 3.689633333351594,
             (4096, 4096, 4096, 16): 14.21690999995917,

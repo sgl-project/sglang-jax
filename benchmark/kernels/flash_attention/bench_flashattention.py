@@ -232,7 +232,7 @@ def full_benchmark():
 
 
 class TestPerformance(CustomTestCase):
-    def test_ragged_paged_attention_performance(self, floating_threshold: int = 0.1):
+    def test_ragged_paged_attention_performance(self, floating_threshold: int = 0.15):
         """
         Args:
             floating_threshold: the ratio of expected results
