@@ -34,6 +34,8 @@ class TestMoEEvalAccuracyLarge(CustomTestCase):
                 "warning",
                 "--tp",
                 "4",
+                "--page-size",
+                "64",
             ],
         )
 
