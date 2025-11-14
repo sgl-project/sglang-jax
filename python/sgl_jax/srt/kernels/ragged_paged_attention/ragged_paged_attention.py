@@ -1196,6 +1196,7 @@ def ragged_paged_attention(
         q_scale=q_scale,
         k_scale=k_scale,
         v_scale=v_scale,
+        xai_temperature_len=xai_temperature_len,
         chunk_prefill_size=chunk_prefill_size,
         num_kv_pages_per_block=num_kv_pages_per_block,
         num_queries_per_block=num_queries_per_block,
