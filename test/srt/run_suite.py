@@ -17,7 +17,9 @@ from sgl_jax.srt.utils import kill_process_tree
 class TestFile:
     name: str
     estimated_time: float = 60  # in minitues
-    test_methods: Optional[List[str]] = None  # Optional: specific test methods to run (e.g., ["TestClass.test_method"])
+    test_methods: Optional[List[str]] = (
+        None  # Optional: specific test methods to run (e.g., ["TestClass.test_method"])
+    )
 
 
 def run_with_timeout(
@@ -77,7 +79,9 @@ def run_unittest_files(files: List[TestFile], timeout_per_file: float):
             if file.test_methods:
                 # Run specific test methods using unittest module syntax
                 # Convert file path to module path (e.g., test/srt/test_file.py -> test.srt.test_file)
-                module_path = filename.replace(os.getcwd() + "/", "").replace(".py", "").replace("/", ".")
+                module_path = (
+                    filename.replace(os.getcwd() + "/", "").replace(".py", "").replace("/", ".")
+                )
 
                 print(
                     f".\n.\nBegin ({i}/{len(files) - 1}):\nRunning specific test methods from {filename}\n",
@@ -99,7 +103,10 @@ def run_unittest_files(files: List[TestFile], timeout_per_file: float):
 
                     # If any test fails, return immediately
                     if process.returncode != 0:
-                        print(f"Test {test_path} failed with return code {process.returncode}\n", flush=True)
+                        print(
+                            f"Test {test_path} failed with return code {process.returncode}\n",
+                            flush=True,
+                        )
                         cleanup_model_cache()
                         return process.returncode
             else:
@@ -183,12 +190,14 @@ suites = {
         TestFile("test/srt/test_eval_accuracy_large.py", 5, ["TestEvalAccuracyLarge.test_mmlu"]),
     ],
     "accuracy-test-tpu-v6e-4": [
-        TestFile("test/srt/test_moe_eval_accuracy_large.py", 10, ["TestMoEEvalAccuracyLarge.test_mmlu"]),
+        TestFile(
+            "test/srt/test_moe_eval_accuracy_large.py", 40, ["TestMoEEvalAccuracyLarge.test_mmlu"]
+        ),
     ],
     "performance-test-tpu-v6e-1": [
         TestFile(
             "test/srt/test_bench_serving.py",
-            20,
+            7,
             [
                 "TestBenchServing.test_ttft_default",
                 "TestBenchServing.test_itl_default",
@@ -200,7 +209,7 @@ suites = {
     "performance-test-tpu-v6e-4": [
         TestFile(
             "test/srt/test_bench_serving.py",
-            30,
+            13,
             [
                 "TestBenchServing.test_ttft_default_tp_4",
                 "TestBenchServing.test_itl_default_tp_4",
@@ -210,14 +219,14 @@ suites = {
         ),
         TestFile(
             "test/srt/test_bench_serving.py",
-            30,
+            35,
             [
                 "TestBenchServing.test_moe_ttft_default",
                 "TestBenchServing.test_moe_itl_default",
                 "TestBenchServing.test_moe_input_throughput_default",
                 "TestBenchServing.test_moe_output_throughput_default",
             ],
-        )
+        ),
     ],
 }
 

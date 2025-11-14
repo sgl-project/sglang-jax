@@ -9,9 +9,9 @@ from types import SimpleNamespace
 from sgl_jax.srt.utils import kill_process_tree
 from sgl_jax.test.run_eval import run_eval
 from sgl_jax.test.test_utils import (
-    QWEN3_MOE_30B,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
+    QWEN3_MOE_30B,
     CustomTestCase,
     is_in_ci,
     popen_launch_server,
@@ -68,9 +68,7 @@ class TestMoEEvalAccuracyLarge(CustomTestCase):
         self.assertGreater(metrics["score"], 0.40)
 
         if is_in_ci():
-            write_github_step_summary(
-                f"### test_human_eval\n" f'{metrics["score"]=:.4f}\n'
-            )
+            write_github_step_summary(f"### test_human_eval\n" f'{metrics["score"]=:.4f}\n')
 
     def test_mgsm_en(self):
         args = SimpleNamespace(
@@ -85,9 +83,7 @@ class TestMoEEvalAccuracyLarge(CustomTestCase):
         self.assertGreater(metrics["score"], 0.61)
 
         if is_in_ci():
-            write_github_step_summary(
-                f"### test_mgsm_en\n" f'{metrics["score"]=:.4f}\n'
-            )
+            write_github_step_summary(f"### test_mgsm_en\n" f'{metrics["score"]=:.4f}\n')
 
 
 if __name__ == "__main__":

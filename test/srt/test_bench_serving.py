@@ -40,12 +40,12 @@ class TestBenchServing(CustomTestCase):
                 "256",
                 "--page-size",
                 "128",
-                "--disable-radix-cache"
+                "--disable-radix-cache",
             ],
             random_input_len=1024,
             random_output_len=1,
             max_concurrency=256,
-            random_range_ratio=1
+            random_range_ratio=1,
         )
 
         if is_in_ci():
@@ -79,12 +79,12 @@ class TestBenchServing(CustomTestCase):
                 "256",
                 "--page-size",
                 "128",
-                "--disable-radix-cache"
+                "--disable-radix-cache",
             ],
             random_input_len=1,
             random_output_len=1024,
             max_concurrency=256,
-            random_range_ratio=1
+            random_range_ratio=1,
         )
 
         if is_in_ci():
@@ -120,12 +120,12 @@ class TestBenchServing(CustomTestCase):
                 "256",
                 "--page-size",
                 "128",
-                "--disable-radix-cache"
+                "--disable-radix-cache",
             ],
             random_input_len=1024,
             random_output_len=1,
             max_concurrency=256,
-            random_range_ratio=1
+            random_range_ratio=1,
         )
 
         if is_in_ci():
@@ -161,12 +161,12 @@ class TestBenchServing(CustomTestCase):
                 "256",
                 "--page-size",
                 "128",
-                "--disable-radix-cache"
+                "--disable-radix-cache",
             ],
             random_input_len=1,
             random_output_len=1024,
             max_concurrency=256,
-            random_range_ratio=1
+            random_range_ratio=1,
         )
 
         if is_in_ci():
@@ -202,12 +202,12 @@ class TestBenchServing(CustomTestCase):
                 "256",
                 "--page-size",
                 "128",
-                "--disable-radix-cache"
+                "--disable-radix-cache",
             ],
             random_input_len=1024,
             random_output_len=1,
             max_concurrency=256,
-            random_range_ratio=1
+            random_range_ratio=1,
         )
 
         if is_in_ci():
@@ -243,12 +243,12 @@ class TestBenchServing(CustomTestCase):
                 "256",
                 "--page-size",
                 "128",
-                "--disable-radix-cache"
+                "--disable-radix-cache",
             ],
             random_input_len=1,
             random_output_len=1024,
             max_concurrency=256,
-            random_range_ratio=1
+            random_range_ratio=1,
         )
 
         if is_in_ci():
@@ -378,12 +378,12 @@ class TestBenchServing(CustomTestCase):
                 "256",
                 "--page-size",
                 "128",
-                "--disable-radix-cache"
+                "--disable-radix-cache",
             ],
             random_input_len=1024,
             random_output_len=1,
             max_concurrency=256,
-            random_range_ratio=1
+            random_range_ratio=1,
         )
 
         if is_in_ci():
@@ -419,12 +419,12 @@ class TestBenchServing(CustomTestCase):
                 "256",
                 "--page-size",
                 "128",
-                "--disable-radix-cache"
+                "--disable-radix-cache",
             ],
             random_input_len=1024,
             random_output_len=1,
             max_concurrency=256,
-            random_range_ratio=1
+            random_range_ratio=1,
         )
 
         if is_in_ci():
@@ -458,18 +458,17 @@ class TestBenchServing(CustomTestCase):
                 "256",
                 "--page-size",
                 "128",
-                "--disable-radix-cache"
+                "--disable-radix-cache",
             ],
             random_input_len=1024,
             random_output_len=1024,
             max_concurrency=256,
-            random_range_ratio=1
+            random_range_ratio=1,
         )
 
         if is_in_ci():
             write_github_step_summary(
-                f"### test_online_itl_default\n"
-                f"median_itl_ms: {res['median_itl_ms']:.2f} ms\n"
+                f"### test_online_itl_default\n" f"median_itl_ms: {res['median_itl_ms']:.2f} ms\n"
             )
             self.assertLess(res["median_itl_ms"], 20)
 
@@ -499,12 +498,12 @@ class TestBenchServing(CustomTestCase):
                 "256",
                 "--page-size",
                 "128",
-                "--disable-radix-cache"
+                "--disable-radix-cache",
             ],
             random_input_len=1024,
             random_output_len=1,
             max_concurrency=256,
-            random_range_ratio=1
+            random_range_ratio=1,
         )
 
         if is_in_ci():
@@ -540,12 +539,12 @@ class TestBenchServing(CustomTestCase):
                 "256",
                 "--page-size",
                 "128",
-                "--disable-radix-cache"
+                "--disable-radix-cache",
             ],
             random_input_len=1024,
             random_output_len=1024,
             max_concurrency=256,
-            random_range_ratio=1
+            random_range_ratio=1,
         )
 
         if is_in_ci():
@@ -581,12 +580,12 @@ class TestBenchServing(CustomTestCase):
                 "256",
                 "--page-size",
                 "128",
-                "--disable-radix-cache"
+                "--disable-radix-cache",
             ],
             random_input_len=1024,
             random_output_len=1,
             max_concurrency=256,
-            random_range_ratio=1
+            random_range_ratio=1,
         )
 
         if is_in_ci():
@@ -622,12 +621,12 @@ class TestBenchServing(CustomTestCase):
                 "256",
                 "--page-size",
                 "128",
-                "--disable-radix-cache"
+                "--disable-radix-cache",
             ],
             random_input_len=1024,
             random_output_len=1024,
             max_concurrency=256,
-            random_range_ratio=1
+            random_range_ratio=1,
         )
 
         if is_in_ci():
@@ -636,7 +635,6 @@ class TestBenchServing(CustomTestCase):
                 f"median_itl_ms: {res['median_itl_ms']:.2f} ms\n"
             )
             self.assertLess(res["median_itl_ms"], 15)
-
 
 
 if __name__ == "__main__":

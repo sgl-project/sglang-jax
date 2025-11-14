@@ -302,12 +302,12 @@ jobs:
           bash scripts/killall_sglang.sh
 
       - name: Benchmark performance (tp=4)
-        timeout-minutes: 30
+        timeout-minutes: 50
 
         env:
           SGLANG_JAX_IS_IN_CI: true
         run: |
-          python test/srt/run_suite.py --suite performance-test-tpu-v6e-4 --auto-partition-id ${{ matrix.part }} --auto-partition-size 2
+          python test/srt/run_suite.py --suite performance-test-tpu-v6e-4 --auto-partition-id ${{ matrix.part }} --auto-partition-size 2 --timeout-per-file 3000
 
       # TODO: please rename when implement performance test
       # - name: Mock
