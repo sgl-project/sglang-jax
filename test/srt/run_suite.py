@@ -77,11 +77,9 @@ def run_unittest_files(files: List[TestFile], timeout_per_file: float):
 
             # Check if specific test methods are specified
             if file.test_methods:
-                # Run specific test methods using unittest module syntax
-                # Convert file path to module path (e.g., test/srt/test_file.py -> test.srt.test_file)
-                module_path = (
-                    filename.replace(os.getcwd() + "/", "").replace(".py", "").replace("/", ".")
-                )
+                # Run specific test methods using unittest module syntax from test/srt directory
+                # Just use the filename directly (e.g., test_eval_accuracy_large.TestEvalAccuracyLarge.test_mmlu)
+                module_name = os.path.basename(filename).replace(".py", "")
 
                 print(
                     f".\n.\nBegin ({i}/{len(files) - 1}):\nRunning specific test methods from {filename}\n",
@@ -90,7 +88,7 @@ def run_unittest_files(files: List[TestFile], timeout_per_file: float):
 
                 # Run each test method sequentially
                 for method in file.test_methods:
-                    test_path = f"{module_path}.{method}"
+                    test_path = f"{module_name}.{method}"
                     print(f"Running: python3 -m unittest {test_path}\n", flush=True)
 
                     process = subprocess.Popen(
@@ -98,6 +96,7 @@ def run_unittest_files(files: List[TestFile], timeout_per_file: float):
                         stdout=sys.stdout,
                         stderr=sys.stderr,
                         env=os.environ,
+                        cwd=os.path.dirname(filename),
                     )
                     process.wait()
 
