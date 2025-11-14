@@ -17,6 +17,9 @@ from sgl_jax.srt.utils import kill_process_tree
 class TestFile:
     name: str
     estimated_time: float = 60  # in minitues
+    test_methods: Optional[List[str]] = (
+        None  # Optional: specific test methods to run (e.g., ["TestClass.test_method"])
+    )
 
 
 def run_with_timeout(
@@ -70,21 +73,57 @@ def run_unittest_files(files: List[TestFile], timeout_per_file: float):
             nonlocal process
 
             filename = os.path.join(os.getcwd(), filename)
-            print(
-                f".\n.\nBegin ({i}/{len(files) - 1}):\npython3 {filename}\n.\n.\n",
-                flush=True,
-            )
             tic = time.perf_counter()
 
-            process = subprocess.Popen(
-                ["uv", "run", "python3", filename],
-                stdout=None,
-                stderr=None,
-                env=os.environ,
-            )
-            process.wait()
-            elapsed = time.perf_counter() - tic
+            # Check if specific test methods are specified
+            if file.test_methods:
+                # Run specific test methods using unittest module syntax from test/srt directory
+                # Just use the filename directly (e.g., test_eval_accuracy_large.TestEvalAccuracyLarge.test_mmlu)
+                module_name = os.path.basename(filename).replace(".py", "")
 
+                print(
+                    f".\n.\nBegin ({i}/{len(files) - 1}):\nRunning specific test methods from {filename}\n",
+                    flush=True,
+                )
+
+                # Run each test method sequentially
+                for method in file.test_methods:
+                    test_path = f"{module_name}.{method}"
+                    print(f"Running: python3 -m unittest {test_path}\n", flush=True)
+
+                    process = subprocess.Popen(
+                        ["uv", "run", "python3", "-m", "unittest", test_path],
+                        stdout=sys.stdout,
+                        stderr=sys.stderr,
+                        env=os.environ,
+                        cwd=os.path.dirname(filename),
+                    )
+                    process.wait()
+
+                    # If any test fails, return immediately
+                    if process.returncode != 0:
+                        print(
+                            f"Test {test_path} failed with return code {process.returncode}\n",
+                            flush=True,
+                        )
+                        cleanup_model_cache()
+                        return process.returncode
+            else:
+                # Run entire file (existing behavior)
+                print(
+                    f".\n.\nBegin ({i}/{len(files) - 1}):\npython3 {filename}\n.\n.\n",
+                    flush=True,
+                )
+
+                process = subprocess.Popen(
+                    ["uv", "run", "python3", filename],
+                    stdout=sys.stdout,
+                    stderr=sys.stderr,
+                    env=os.environ,
+                )
+                process.wait()
+
+            elapsed = time.perf_counter() - tic
             print(
                 f".\n.\nEnd ({i}/{len(files) - 1}):\n{filename=}, {elapsed=:.0f}, {estimated_time=}\n.\n.\n",
                 flush=True,
@@ -122,6 +161,48 @@ suites = {
         TestFile("benchmark/kernels/flash_attention/bench_flashattention.py", 5),
         TestFile("benchmark/kernels/megablox_gmm/bench_megablox_gmm.py", 2),
         TestFile("benchmark/kernels/update_kv_cache/bench_update_kv_cache.py", 3),
+    ],
+    "accuracy-test-tpu-v6e-1": [
+        TestFile("test/srt/test_eval_accuracy_large.py", 5, ["TestEvalAccuracyLarge.test_mmlu"]),
+    ],
+    "accuracy-test-tpu-v6e-4": [
+        TestFile(
+            "test/srt/test_moe_eval_accuracy_large.py", 40, ["TestMoEEvalAccuracyLarge.test_mmlu"]
+        ),
+    ],
+    "performance-test-tpu-v6e-1": [
+        TestFile(
+            "test/srt/test_bench_serving.py",
+            7,
+            [
+                "TestBenchServing.test_ttft_default",
+                "TestBenchServing.test_itl_default",
+                "TestBenchServing.test_input_throughput_default",
+                "TestBenchServing.test_output_throughput_default",
+            ],
+        )
+    ],
+    "performance-test-tpu-v6e-4": [
+        TestFile(
+            "test/srt/test_bench_serving.py",
+            13,
+            [
+                "TestBenchServing.test_ttft_default_tp_4",
+                "TestBenchServing.test_itl_default_tp_4",
+                "TestBenchServing.test_input_throughput_default_tp_4",
+                "TestBenchServing.test_output_throughput_default_tp_4",
+            ],
+        ),
+        TestFile(
+            "test/srt/test_bench_serving.py",
+            35,
+            [
+                "TestBenchServing.test_moe_ttft_default",
+                "TestBenchServing.test_moe_itl_default",
+                "TestBenchServing.test_moe_input_throughput_default",
+                "TestBenchServing.test_moe_output_throughput_default",
+            ],
+        ),
     ],
     "e2e-test-tpu-v6e-1": [
         # openai_server e2e test

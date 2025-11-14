@@ -4,7 +4,7 @@ on:
   push:
     branches:
       - main
-      - 'epic/*'
+      - "epic/*"
     paths:
       - "python/**"
       - "scripts/**"
@@ -13,7 +13,7 @@ on:
   pull_request:
     branches:
       - main
-      - 'epic/*'
+      - "epic/*"
     paths:
       - "python/**"
       - "scripts/**"
@@ -89,7 +89,7 @@ jobs:
       matrix:
         part: [0, 1]
     steps:
-    # TODO: please rename when implement unit test
+      # TODO: please rename when implement unit test
       - name: Mock
         timeout-minutes: 30
         env:
@@ -149,143 +149,103 @@ jobs:
   accurancy-test-1-tpu:
     needs: [check-changes]
     if: github.event.pull_request.draft == false && needs.check-changes.outputs.main_package == 'true'
-    #runs-on: arc-runner-v6e-1
-    runs-on: ubuntu-slim
+    runs-on: arc-runner-v6e-1
     strategy:
       fail-fast: false
       matrix:
-        part: [0, 1]
+        part: [0]
     steps:
-      # TODO: please rename when implement acc test
-      - name: Mock
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Evaluate accuracy
+        timeout-minutes: 20
         env:
           SGLANG_JAX_IS_IN_CI: true
-        run: echo ${{ matrix.part }}
+        run: |
+          python3.12 -m venv .venv
+          source .venv/bin/activate
+          pip install uv
+          uv pip install -e "python[all]"
+          bash scripts/killall_sglang.sh
+          python test/srt/run_suite.py --suite accuracy-test-tpu-v6e-1 --auto-partition-id ${{ matrix.part }} --auto-partition-size 1
 
   accurancy-test-4-tpu:
     needs: [check-changes]
     if: github.event.pull_request.draft == false && needs.check-changes.outputs.main_package == 'true'
-    #runs-on: arc-runner-v6e-1
-    runs-on: ubuntu-slim
+
+    runs-on: arc-runner-v6e-4
     strategy:
       fail-fast: false
       matrix:
-        part: [0, 1]
+        part: [0]
     steps:
-      # TODO: please rename when implement acc test
-      - name: Mock
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Evaluate MoE accuracy (TP=4)
+        timeout-minutes: 50
         env:
           SGLANG_JAX_IS_IN_CI: true
-        run: echo ${{ matrix.part }}
+        run: |
+          python3.12 -m venv .venv
+          source .venv/bin/activate
+          pip install uv
+          uv pip install -e "python[all]"
+          bash scripts/killall_sglang.sh
+          python test/srt/run_suite.py --suite accuracy-test-tpu-v6e-4 --timeout-per-file 3000 --auto-partition-id ${{ matrix.part }} --auto-partition-size 1
 
   # =============================================== performance-test ===============================================
   performance-test-1-tpu:
     needs: [check-changes]
     if: github.event.pull_request.draft == false && needs.check-changes.outputs.main_package == 'true'
-    #runs-on: arc-runner-v6e-1
-    runs-on: ubuntu-slim
+
+    runs-on: arc-runner-v6e-1
     strategy:
       fail-fast: false
       matrix:
-        part: [0, 1]
+        part: [0]
     steps:
-        # TODO: please rename when implement performance test
-      - name: Mock
-        timeout-minutes: 10
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Benchmark performance
+        timeout-minutes: 30
         env:
           SGLANG_JAX_IS_IN_CI: true
-        run: echo ${{ matrix.part }}
-      # - name: Checkout code
-      #   uses: actions/checkout@v4
-      # - name: Setup environment
-      #   uses: ./.github/actions/setup_environment
-      #   with:
-      #     accelerator: tpu-v6e-1
-      #     test_type: performance
-      #     skypilot_endpoint: ${{ secrets.SKYPILOT_ENDPOINT }}
-      #     username: ${{ secrets.USERNAME }}
-      #     git_token: ${{ secrets.GIT_TOKEN }}
-      # - name: Benchmark single latency
-      #   timeout-minutes: 30
-      #   run: |
-      #     source ~/sky/bin/activate
-      #     CLUSTER_NAME=$(bash scripts/get_cluster_name.sh tpu-v6e-1 ${{ github.ref }} performance)
-      #     sky exec "$CLUSTER_NAME" -- 'set -e; cd sglang-jax/test/srt; uv run python -m unittest test_bench_one_batch.TestBenchOneBatch.test_bs1_default'
-
-      # - name: Benchmark online latency
-      #   timeout-minutes: 10
-      #   run: |
-      #     source ~/sky/bin/activate
-      #     CLUSTER_NAME=$(bash scripts/get_cluster_name.sh tpu-v6e-1 ${{ github.ref }} performance)
-      #     sky exec "$CLUSTER_NAME" -- 'set -e; cd sglang-jax/test/srt; python3 -m unittest test_bench_serving.TestBenchServing.test_online_latency_default'
-
-      # - name: Benchmark offline throughput (w/o RadixAttention)
-      #   timeout-minutes: 10
-      #   run: |
-      #     source ~/sky/bin/activate
-      #     CLUSTER_NAME=$(bash scripts/get_cluster_name.sh tpu-v6e-1 ${{ github.ref }} performance)
-      #     sky exec "$CLUSTER_NAME" -- 'set -e; cd sglang-jax/test/srt; python3 -m unittest test_bench_serving.TestBenchServing.test_offline_throughput_without_radix_cache'
-
-      # - name: Benchmark offline throughput (Non-streaming, small batch size)
-      #   timeout-minutes: 10
-      #   run: |
-      #     source ~/sky/bin/activate
-      #     CLUSTER_NAME=$(bash scripts/get_cluster_name.sh tpu-v6e-1 ${{ github.ref }} performance)
-      #     sky exec "$CLUSTER_NAME" -- 'set -e; cd sglang-jax/test/srt; python3 -m unittest test_bench_serving.TestBenchServing.test_offline_throughput_non_stream_small_batch_size'
-
-      # - name: Benchmark offline throughput
-      #   timeout-minutes: 10
-      #   run: |
-      #     source ~/sky/bin/activate
-      #     CLUSTER_NAME=$(bash scripts/get_cluster_name.sh tpu-v6e-1 ${{ github.ref }} performance)
-      #     sky exec "$CLUSTER_NAME" -- 'set -e; cd sglang-jax/test/srt; python3 -m unittest test_bench_serving.TestBenchServing.test_offline_throughput_default'
-
+        run: |
+          python3.12 -m venv .venv
+          source .venv/bin/activate
+          pip install uv
+          uv pip install -e "python[all]"
+          bash scripts/killall_sglang.sh
+          python test/srt/run_suite.py --suite performance-test-tpu-v6e-1 --auto-partition-id ${{ matrix.part }} --auto-partition-size 1
 
   performance-test-4-tpu:
     needs: [check-changes]
     if: github.event.pull_request.draft == false && needs.check-changes.outputs.main_package == 'true'
-    #runs-on: arc-runner-v6e-1
-    runs-on: ubuntu-slim
+
+    runs-on: arc-runner-v6e-4
     strategy:
       fail-fast: false
       matrix:
         part: [0, 1]
     steps:
-      # TODO: please rename when implement performance test
-      - name: Mock
-        timeout-minutes: 10
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Benchmark performance (tp=4)
+        timeout-minutes: 50
+
         env:
           SGLANG_JAX_IS_IN_CI: true
-        run: echo ${{ matrix.part }}
-
-  # accuracy-test-1-tpu:
-  #   if: github.event.pull_request.draft == false
-  #   runs-on: self-hosted
-  #   strategy:
-  #     fail-fast: false
-  #   steps:
-  #     - name: Checkout code
-  #       uses: actions/checkout@v4
-  #     - name: Setup environment
-  #       uses: ./.github/actions/setup_environment
-  #       with:
-  #         accelerator: tpu-v6e-1
-  #         test_type: accuracy
-  #         skypilot_endpoint: ${{ secrets.SKYPILOT_ENDPOINT }}
-  #         username: ${{ secrets.USERNAME }}
-  #         git_token: ${{ secrets.GIT_TOKEN }}
-  #     - name: Install dependencies
-  #       run: |
-  #         source ~/sky/bin/activate
-  #         CLUSTER_NAME=$(bash scripts/get_cluster_name.sh tpu-v6e-1 ${{ github.ref }} accuracy)
-  #         sky exec "$CLUSTER_NAME" -- 'set -e; if [ ! -d "human-eval" ] || [ -z "$(ls -A human-eval)" ]; then git clone https://github.com/merrymercy/human-eval.git; fi; cd human-eval; uv pip install -e .'
-
-  #     - name: Evaluate accuracy
-  #       timeout-minutes: 60
-  #       run: |
-  #         source ~/sky/bin/activate
-  #         CLUSTER_NAME=$(bash scripts/get_cluster_name.sh tpu-v6e-1 ${{ github.ref }} accuracy)
-  #         sky exec "$CLUSTER_NAME" -- 'set -e; cd sglang-jax/test/srt; python3 test_eval_accuracy_large.py'
+        run: |
+          python3.12 -m venv .venv
+          source .venv/bin/activate
+          pip install uv
+          uv pip install -e "python[all]"
+          bash scripts/killall_sglang.sh
+          python test/srt/run_suite.py --suite performance-test-tpu-v6e-4 --auto-partition-id ${{ matrix.part }} --auto-partition-size 2 --timeout-per-file 3000
 
   # =============================================== kernel-benchmark ===============================================
   pallas-kernel-benchmark:
