@@ -53,9 +53,9 @@ jobs:
         with:
           filters: |
             main_package:
-              - "python/sgl-jax/**"
+              - "python/sgl_jax/**"
               - "python/*.toml"
-              - "scripts/ci/**"
+              - "scripts/**"
               - "test/**"
               - ".github/workflows/pr-test.yml"
             pallas_kernel:
@@ -272,18 +272,17 @@ jobs:
           python test/srt/run_suite.py --suite kernel-performance-test-tpu-v6e-1 --auto-partition-id ${{ matrix.part }} --auto-partition-size 2
 
   pr-test-finish:
-    needs:
-      [
-        performance-test-1-tpu,
-        performance-test-4-tpu,
-        accurancy-test-1-tpu,
-        accurancy-test-4-tpu,
-        unit-test-1-tpu,
-        unit-test-4-tpu,
-        e2e-test-1-tpu,
-        e2e-test-4-tpu,
-        pallas-kernel-benchmark,
-      ]
+    needs: [
+      performance-test-1-tpu,
+      performance-test-4-tpu,
+      accurancy-test-1-tpu,
+      accurancy-test-4-tpu,
+      unit-test-1-tpu,
+      unit-test-4-tpu,
+      e2e-test-1-tpu,
+      e2e-test-4-tpu,
+      pallas-kernel-benchmark,
+    ]
     runs-on: arc-runner-v6e-1
     steps:
       - name: Check all dependent job statuses
