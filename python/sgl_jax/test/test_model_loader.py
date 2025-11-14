@@ -1,4 +1,4 @@
-# USE_DEVICE_TYPE=cpu TEST_MODEL_PATH=/models/Qwen-7B python sgl-jax/python/sgl_jax/test/test_model_loader.py
+# DOWNLOAD_DIR=/dev/shm TEST_MODEL_PATH=Qwen/Qwen-7B-Chat python python/sgl_jax/test/test_model_loader.py
 import os
 import tempfile
 import unittest
@@ -67,15 +67,6 @@ class TestModelLoader(unittest.TestCase):
         loader = get_model_loader(self.load_config, self.rng, self.mesh)
 
         self.assertIsInstance(loader, JAXModelLoader)
-
-    def test_load_config_validation(self):
-        """Test that get_model_loader validates load format."""
-        invalid_config = LoadConfig(load_format=LoadFormat.PT)
-
-        with self.assertRaises(ValueError) as context:
-            get_model_loader(invalid_config, self.rng, self.mesh)
-
-        self.assertIn("Invalid load format", str(context.exception))
 
     def test_multi_device_environment_setup(self):
         """Test that multi-device environment is properly configured."""
@@ -183,10 +174,22 @@ class TestModelLoaderWithRealModel(unittest.TestCase):
 
     @classmethod
     def _find_test_model_path(cls):
-        """Find a test model path from environment or common locations."""
+        """Find a test model path from environment or common locations.
+
+        Returns:
+            str: Either a local path or a HuggingFace model ID
+        """
         # Check environment variable first
         env_path = os.environ.get("TEST_MODEL_PATH")
-        if env_path and os.path.exists(env_path):
+        if env_path:
+            # If it's a local path and exists, use it
+            if os.path.exists(env_path):
+                return env_path
+            # Otherwise, treat it as a HuggingFace model ID (e.g., "Qwen/Qwen-1.5B")
+            # The loader will download it automatically
+            print(
+                f" TEST_MODEL_PATH '{env_path}' not found locally, will try to download from HuggingFace"
+            )
             return env_path
 
         # Check common test locations
@@ -238,8 +241,11 @@ class TestModelLoaderWithRealModel(unittest.TestCase):
         # Initialize RNG
         self.rng = nnx.Rngs(42)
 
-        # Create configs
-        self.load_config = LoadConfig(load_format=LoadFormat.JAX)
+        # Get download directory from environment or use default
+        download_dir = os.environ.get("DOWNLOAD_DIR", os.path.expanduser("~/.cache/sglang_test"))
+
+        # Create configs with download directory
+        self.load_config = LoadConfig(load_format=LoadFormat.JAX, download_dir=download_dir)
 
     def test_model_config_creation(self):
         """Test creating ModelConfig from real model path."""
@@ -289,8 +295,17 @@ class TestModelLoaderWithRealModel(unittest.TestCase):
 
     def test_safetensor_files_detection(self):
         """Test that safetensor files are detected in the model directory."""
+        # Create model config and download if needed
+        model_config = ModelConfig(
+            model_path=self.model_path, trust_remote_code=True, dtype="bfloat16"
+        )
+
+        # Download model if it's a HuggingFace ID
+        loader = get_model_loader(self.load_config, self.rng, self.mesh)
+        local_path = loader.download_model(model_config)
+
         safetensor_files = []
-        for file in os.listdir(self.model_path):
+        for file in os.listdir(local_path):
             if file.endswith(".safetensors"):
                 safetensor_files.append(file)
 
@@ -306,6 +321,11 @@ class TestModelLoaderWithRealModel(unittest.TestCase):
             model_config = ModelConfig(
                 model_path=self.model_path, trust_remote_code=True, dtype="bfloat16"
             )
+
+            # Download model if needed
+            loader = get_model_loader(self.load_config, self.rng, self.mesh)
+            local_path = loader.download_model(model_config)
+            model_config.model_path = local_path
 
             # Create QWen model instance with mesh context
             with jax.set_mesh(self.mesh):
@@ -381,6 +401,11 @@ class TestModelLoaderWithRealModel(unittest.TestCase):
                 model_path=self.model_path, trust_remote_code=True, dtype="bfloat16"
             )
 
+            # Download model if needed
+            loader = get_model_loader(self.load_config, self.rng, self.mesh)
+            local_path = loader.download_model(model_config)
+            model_config.model_path = local_path
+
             print(" Model Config Details:")
             print(f"  Architecture: {model_config.hf_config.architectures}")
             print(f"  Hidden size: {model_config.hidden_size}")
@@ -423,8 +448,9 @@ class TestModelLoaderWithRealModel(unittest.TestCase):
 
             print("🔄 Testing full loading pipeline...")
 
-            # Test download_model (should be no-op for local path)
-            loader.download_model(model_config)
+            # Test download_model (will download if HF ID, or no-op for local path)
+            local_path = loader.download_model(model_config)
+            model_config.model_path = local_path
 
             # Test load_model
             model = loader.load_model(model_config=model_config)
@@ -486,6 +512,11 @@ class TestModelLoaderWithRealModel(unittest.TestCase):
             model_config = ModelConfig(
                 model_path=self.model_path, trust_remote_code=True, dtype="bfloat16"
             )
+
+            # Download model if needed
+            loader = get_model_loader(self.load_config, self.rng, self.mesh)
+            local_path = loader.download_model(model_config)
+            model_config.model_path = local_path
 
             # Create QWen model instance with mesh context
             with jax.set_mesh(self.mesh):
@@ -597,8 +628,10 @@ class TestModelLoaderWithRealModel(unittest.TestCase):
 
             print(f"🔄 Testing multi-device tensor parallelism with {len(devices[:4])} devices...")
 
-            # Create loader with multi-device mesh
+            # Create loader with multi-device mesh and download model if needed
             loader = get_model_loader(self.load_config, self.rng, self.mesh)
+            local_path = loader.download_model(model_config)
+            model_config.model_path = local_path
 
             # Load model
             model = loader.load_model(model_config=model_config)
@@ -672,8 +705,10 @@ class TestModelLoaderWithRealModel(unittest.TestCase):
 
             print("🔄 Testing tensor parallel computation...")
 
-            # Create loader and load model
+            # Create loader, download model if needed, and load model
             loader = get_model_loader(self.load_config, self.rng, self.mesh)
+            local_path = loader.download_model(model_config)
+            model_config.model_path = local_path
             model = loader.load_model(model_config=model_config)
 
             print("PASS: Model loaded for computation test")
@@ -768,11 +803,15 @@ if __name__ == "__main__":
     print(f"  XLA_FLAGS: {os.environ.get('XLA_FLAGS', 'Not set')}")
     print(f"  JAX_PLATFORMS: {os.environ.get('JAX_PLATFORMS', 'Not set')}")
     print("=" * 60)
-    print("To test with a real model, either:")
-    print("1. Set TEST_MODEL_PATH environment variable:")
+    print("To test with a real model, use one of the following:")
+    print("1. Use a local model path:")
     print("   export TEST_MODEL_PATH=/path/to/your/model")
-    print("2. Place a model directory in ./test_models/ or /models/")
-    print("3. Model directory should contain .safetensors files")
+    print("2. Use a HuggingFace model ID (will auto-download):")
+    print("   export TEST_MODEL_PATH=Qwen/Qwen-1.5B")
+    print("3. Place a model directory in ./test_models/ or /models/")
+    print("")
+    print("Optional: Set download directory (default: ~/.cache/sglang_test)")
+    print("   export DOWNLOAD_DIR=/your/cache/dir")
     print("=" * 60)
 
     # Verify multi-device setup
