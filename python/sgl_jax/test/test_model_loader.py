@@ -180,7 +180,7 @@ class TestModelLoaderWithRealModel(unittest.TestCase):
             str: Either a local path or a HuggingFace model ID
         """
         # Check environment variable first
-        env_path = os.environ.get("TEST_MODEL_PATH")
+        env_path = os.environ.get("TEST_MODEL_PATH", "Qwen/Qwen-7B-Chat")
         if env_path:
             # If it's a local path and exists, use it
             if os.path.exists(env_path):
@@ -242,7 +242,7 @@ class TestModelLoaderWithRealModel(unittest.TestCase):
         self.rng = nnx.Rngs(42)
 
         # Get download directory from environment or use default
-        download_dir = os.environ.get("DOWNLOAD_DIR", os.path.expanduser("~/.cache/sglang_test"))
+        download_dir = os.environ.get("DOWNLOAD_DIR", "/dev/shm")
 
         # Create configs with download directory
         self.load_config = LoadConfig(load_format=LoadFormat.JAX, download_dir=download_dir)
