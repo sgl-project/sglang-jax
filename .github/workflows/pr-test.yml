@@ -159,13 +159,13 @@ jobs:
         env:
           SGLANG_JAX_IS_IN_CI: true
         run: |
+          export PYTHONPATH="$(pwd)/test/srt"
           python3.12 -m venv .venv
           source .venv/bin/activate
           pip install uv
           uv pip install -e "python[all]"
           bash scripts/killall_sglang.sh
-          cd test/srt
-          python run_suite.py --suite accuracy-test-tpu-v6e-1 --auto-partition-id ${{ matrix.part }} --auto-partition-size 1
+          python test/srt/run_suite.py --suite accuracy-test-tpu-v6e-1 --auto-partition-id ${{ matrix.part }} --auto-partition-size 1
 
   accurancy-test-4-tpu:
     needs: [check-changes]
@@ -185,13 +185,13 @@ jobs:
         env:
           SGLANG_JAX_IS_IN_CI: true
         run: |
+          export PYTHONPATH="$(pwd)/test/srt"
           python3.12 -m venv .venv
           source .venv/bin/activate
           pip install uv
           uv pip install -e "python[all]"
           bash scripts/killall_sglang.sh
-          cd test/srt
-          python run_suite.py --suite accuracy-test-tpu-v6e-4 --timeout-per-file 3000 --auto-partition-id ${{ matrix.part }} --auto-partition-size 1
+          python test/srt/run_suite.py --suite accuracy-test-tpu-v6e-4 --timeout-per-file 3000 --auto-partition-id ${{ matrix.part }} --auto-partition-size 1
 
   # =============================================== performance-test ===============================================
   performance-test-1-tpu:
@@ -217,8 +217,7 @@ jobs:
           pip install uv
           uv pip install -e "python[all]"
           bash scripts/killall_sglang.sh
-          cd test/srt
-          python run_suite.py --suite performance-test-tpu-v6e-1 --auto-partition-id ${{ matrix.part }} --auto-partition-size 1
+          python test/srt/run_suite.py --suite performance-test-tpu-v6e-1 --auto-partition-id ${{ matrix.part }} --auto-partition-size 1
 
   performance-test-4-tpu:
     needs: [check-changes]
@@ -244,8 +243,7 @@ jobs:
           pip install uv
           uv pip install -e "python[all]"
           bash scripts/killall_sglang.sh
-          cd test/srt
-          python run_suite.py --suite performance-test-tpu-v6e-4 --auto-partition-id ${{ matrix.part }} --auto-partition-size 2 --timeout-per-file 3000
+          python test/srt/run_suite.py --suite performance-test-tpu-v6e-4 --auto-partition-id ${{ matrix.part }} --auto-partition-size 2 --timeout-per-file 3000
 
   # =============================================== kernel-benchmark ===============================================
   pallas-kernel-benchmark:
