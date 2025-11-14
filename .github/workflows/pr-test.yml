@@ -171,7 +171,7 @@ jobs:
     needs: [check-changes]
     if: github.event.pull_request.draft == false && needs.check-changes.outputs.main_package == 'true'
 
-    runs-on: arc-runner-v6e-1
+    runs-on: arc-runner-v6e-4
     strategy:
       fail-fast: false
       matrix:
@@ -226,7 +226,7 @@ jobs:
     needs: [check-changes]
     if: github.event.pull_request.draft == false && needs.check-changes.outputs.main_package == 'true'
 
-    runs-on: arc-runner-v6e-1
+    runs-on: arc-runner-v6e-4
     strategy:
       fail-fast: false
       matrix:
