@@ -7,7 +7,7 @@ and code completion templates, eliminating global state and improving modularity
 
 import logging
 
-from sgl_jax.srt.conversation import get_conv_template_by_model_path
+from sgl_jax.srt.conversation import get_conv_template_by_model_path, chat_template_exists
 
 logger = logging.getLogger(__name__)
 
@@ -56,13 +56,41 @@ class TemplateManager:
 
     def initialize_templates(
         self,
+        tokenizer_manager,
         model_path: str,
+        chat_template: Optional[str] = None,
     ) -> None:
-        pass
         """
         Initialize all templates based on provided configuration.
 
         Args:
+            tokenizer_manager: Tokenizer manager
+            model_path: Path to the model
+            chat_template: Chat template name
+        """
+        self.load_chat_template(tokenizer_manager, chat_template, model_path)
+
+    def load_chat_template(
+        self, tokenizer_manager, chat_template_arg: Optional[str], model_path: str
+    ) -> None:
+        """
+        Load a chat template from various sources.
+
+        Args:
+            tokenizer_manager: The tokenizer manager instance
+            chat_template_arg: Template name, file path, or None to auto-detect
             model_path: Path to the model
         """
-        self.guess_chat_template_from_model_path(model_path)
+        
+        if chat_template_arg:
+            self._load_explicit_chat_template(tokenizer_manager, chat_template_arg)
+
+    def _load_explicit_chat_template(
+        self, tokenizer_manager, chat_template_arg: str
+    ) -> None:
+        """Load explicitly specified chat template."""
+        logger.info(f"Loading chat template from argument: {chat_template_arg}")
+
+        if chat_template_exists(chat_template_arg):
+            self._chat_template_name = chat_template_arg
+            return

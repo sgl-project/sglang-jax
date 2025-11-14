@@ -1,5 +1,4 @@
 import sys
-import os
 
 from sgl_jax.srt.configs.model_config import ModelConfig, is_multimodal_model, multimodal_model_archs
 

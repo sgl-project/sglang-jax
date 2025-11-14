@@ -248,7 +248,7 @@ Assistant: {% endif %}"""
         """Apply conversation template"""
         prompt = ""
         prompt_ids = []
-        conv = generate_chat_conv(request, self.template_manager.chat_template_name)
+        conv = generate_chat_conv(request.messages, self.template_manager.chat_template_name)
 
         # If we should continue the final assistant message, adjust the conversation.
         if (

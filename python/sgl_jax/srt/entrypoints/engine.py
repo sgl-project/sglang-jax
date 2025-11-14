@@ -621,7 +621,9 @@ def _launch_subprocesses(
     # Initialize templates
     template_manager = TemplateManager()
     template_manager.initialize_templates(
+        tokenizer_manager=tokenizer_manager,
         model_path=server_args.model_path,
+        chat_template=server_args.chat_template,
     )
 
     # Wait for the model to finish loading
@@ -711,7 +713,9 @@ def _launch_threads(
     # Initialize templates
     template_manager = TemplateManager()
     template_manager.initialize_templates(
+        tokenizer_manager=tokenizer_manager,
         model_path=server_args.model_path,
+        chat_template=server_args.chat_template,
     )
 
     # Wait for the model to finish loading

@@ -106,6 +106,7 @@ class ServerArgs:
     # API related
     api_key: str | None = None
     served_model_name: str | None = None
+    chat_template: Optional[str] = None
     file_storage_path: str = "sglang_storage"
     enable_cache_report: bool = False
     reasoning_parser: str | None = None
