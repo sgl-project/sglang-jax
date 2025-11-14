@@ -163,7 +163,7 @@ jobs:
         env:
           SGLANG_JAX_IS_IN_CI: true
         run: |
-          export PYTHONPATH="$(pwd):$(pwd)/python:$(pwd)/test/srt"
+          export PYTHONPATH="$(pwd):$(pwd)/test:$(pwd)/test/srt"
           python3.12 -m venv .venv
           source .venv/bin/activate
           pip install uv
@@ -189,7 +189,7 @@ jobs:
         env:
           SGLANG_JAX_IS_IN_CI: true
         run: |
-          export PYTHONPATH="$(pwd):$(pwd)/python:$(pwd)/test/srt"
+          export PYTHONPATH="$(pwd):$(pwd)/test:$(pwd)/test/srt"
           python3.12 -m venv .venv
           source .venv/bin/activate
           pip install uv
@@ -216,7 +216,7 @@ jobs:
         env:
           SGLANG_JAX_IS_IN_CI: true
         run: |
-          export PYTHONPATH="$(pwd):$(pwd)/python:$(pwd)/test/srt"
+          export PYTHONPATH="$(pwd):$(pwd)/test:$(pwd)/test/srt"
           python3.12 -m venv .venv
           source .venv/bin/activate
           pip install uv
@@ -243,7 +243,7 @@ jobs:
         env:
           SGLANG_JAX_IS_IN_CI: true
         run: |
-          export PYTHONPATH="$(pwd):$(pwd)/python:$(pwd)/test/srt"
+          export PYTHONPATH="$(pwd):$(pwd)/test:$(pwd)/test/srt"
           python3.12 -m venv .venv
           source .venv/bin/activate
           pip install uv
