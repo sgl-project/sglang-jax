@@ -10,6 +10,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+from sgl_jax.srt.managers.schedule_batch import Req
 from sgl_jax.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sgl_jax.srt.mem_cache.base_prefix_cache import BasePrefixCache, MatchResult
 from sgl_jax.srt.mem_cache.memory_pool import ReqToTokenPool
@@ -71,6 +72,16 @@ def _key_match_paged(key0: list, key1: list, page_size: int):
     return i
 
 
+def _convert_to_bigram_key(tokens: list[int]) -> list[tuple[int, int]]:
+    # EAGLE uses bigram keys in the radix tree since draft sequence is the one-token-shifted version of target
+    # [1, 2, 3, 4] -> [(1,2), (2,3), (3,4)]
+    if len(tokens) < 2:
+        return []
+    if isinstance(tokens[0], tuple):
+        return tokens
+    return [(tokens[i], tokens[i + 1]) for i in range(len(tokens) - 1)]
+
+
 class RadixCache(BasePrefixCache):
     def __init__(
         self,
@@ -84,6 +95,7 @@ class RadixCache(BasePrefixCache):
         max_seq_len: int = 4096,
         dtype: jnp.dtype = jnp.bfloat16,
         enable_kv_cache_events: bool = False,
+        is_eagle: bool = False,
     ):
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
@@ -102,6 +114,12 @@ class RadixCache(BasePrefixCache):
         self.local_devices = jax.local_device_count()
 
         self.cpu_device = jax.local_devices(backend="cpu")[0]
+        self.is_eagle = is_eagle
+
+        if is_eagle:
+            self.key_convert_fn = _convert_to_bigram_key
+        else:
+            self.key_convert_fn = lambda key: key
 
         if self.page_size == 1:
             self.key_match_fn = _key_match_page_size1
@@ -129,6 +147,7 @@ class RadixCache(BasePrefixCache):
         self.protected_size_ = 0
 
     def match_prefix(self, key: list[int], **kwargs) -> MatchResult:
+        key = self.key_convert_fn(key)
         if self.disable or len(key) == 0:
             empty_array = np.empty((0,), dtype=np.int32)
 
@@ -171,63 +190,96 @@ class RadixCache(BasePrefixCache):
     def insert(self, key: list, value=None):
         if self.disable:
             return 0
-
+        key = self.key_convert_fn(key)
         if value is None:
             value = self._create_tokens_data(key)
         elif isinstance(value, list):
             value = self._create_tokens_data(value)
 
+        if self.is_eagle:
+            # Make sure the value len equal to the EAGLE bigram key len
+            value = value[: len(key)]
+
         return self._insert_helper(self.root_node, key, value)
 
-    def cache_finished_req(self, req):
+    def cache_finished_req(self, req: Req):
         """Cache completed requests"""
+        all_token_len = len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0)
         if self.disable:
             kv_indices = self.req_to_token_pool.read(
                 req.req_pool_idx,
-                len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0),
+                all_token_len,
             )
+            kv_indices = kv_indices[kv_indices != 0]
             self.token_to_kv_pool_allocator.free(kv_indices)
             self.req_to_token_pool.free(req.req_pool_idx)
             return
 
-        token_ids = (req.origin_input_ids + req.output_ids)[:-1]
-        kv_indices = self.req_to_token_pool.read(req.req_pool_idx, len(token_ids))
+        token_ids = (req.origin_input_ids + req.output_ids)[:all_token_len]
+        # For EAGLE radix cache, we will convert the key to bigram key, e.g. [1,2,3,4] -> [(1,2), (2,3), (3,4)], the length will -1. ((len([(1,2), (2,3), (3,4)]) = len([1,2,3,4]) - 1))
+        # So for the corresponding kv length should also -1. Then we get the actual_kv_len, and use it to do later calculation and slicing.
+        actual_kv_len = all_token_len - 1 if self.is_eagle else all_token_len
+        kv_indices = self.req_to_token_pool.read(req.req_pool_idx, all_token_len)
+        kv_indices = kv_indices[kv_indices != 0]
 
         if self.page_size != 1:
-            page_aligned_len = len(kv_indices) // self.page_size * self.page_size
+            page_aligned_len = actual_kv_len // self.page_size * self.page_size
             page_aligned_kv_indices = kv_indices[:page_aligned_len].copy()
             self.token_to_kv_pool_allocator.free(kv_indices[page_aligned_len:])
         else:
-            page_aligned_len = len(kv_indices)
-            page_aligned_kv_indices = kv_indices
+            page_aligned_len = actual_kv_len
+            page_aligned_kv_indices = kv_indices[:page_aligned_len].copy()
+
+        page_aligned_token_len = page_aligned_len + 1 if self.is_eagle else page_aligned_len
+        old_prefix_len = len(req.prefix_indices)
+        if self.is_eagle and old_prefix_len > req.last_matched_prefix_len:
+            # In EAGLE chunked prefill case, the prefix_indices included one unmatched token (kv_indices[actual_kv_len:])
+            # Here we -1 to make sure the kv of the unmatched token can be freed correctly to avoid memory leak
+            old_prefix_len -= 1
 
         # Radix Cache takes over one reference from memory pool
-        new_prefix_len = self.insert(token_ids[:page_aligned_len], page_aligned_kv_indices)
-        self.token_to_kv_pool_allocator.free(kv_indices[len(req.prefix_indices) : new_prefix_len])
+        new_prefix_len = self.insert(token_ids[:page_aligned_token_len], page_aligned_kv_indices)
+
+        self.token_to_kv_pool_allocator.free(kv_indices[old_prefix_len:new_prefix_len])
+        # free the unaligned tail
+        self.token_to_kv_pool_allocator.free(kv_indices[page_aligned_len:])
 
         # Remove request slot and release cache lock
         self.req_to_token_pool.free(req.req_pool_idx)
         self.dec_lock_ref(req.last_node)
 
-    def cache_unfinished_req(self, req):
+    def cache_unfinished_req(self, req: Req):
         """Cache incomplete requests"""
         if self.disable:
             return
 
         token_ids = req.fill_ids
-        kv_indices = self.req_to_token_pool.read(req.req_pool_idx, len(token_ids))
+        all_token_len = len(token_ids)
+        # For EAGLE radix cache, we will convert the key to bigram key, e.g. [1,2,3,4] -> [(1,2), (2,3), (3,4)], the length will -1. ((len([(1,2), (2,3), (3,4)]) = len([1,2,3,4]) - 1))
+        # So for the corresponding kv length should also -1. Then we get the actual_kv_len, and use it to do later calculation and slicing.
+        actual_kv_len = all_token_len - 1 if self.is_eagle else all_token_len
+        kv_indices = self.req_to_token_pool.read(req.req_pool_idx, all_token_len)
 
         if self.page_size != 1:
-            page_aligned_len = len(kv_indices) // self.page_size * self.page_size
+            page_aligned_len = actual_kv_len // self.page_size * self.page_size
             page_aligned_kv_indices = kv_indices[:page_aligned_len].copy()
         else:
-            page_aligned_len = len(kv_indices)
+            page_aligned_len = actual_kv_len
             page_aligned_kv_indices = kv_indices
-        page_aligned_token_ids = token_ids[:page_aligned_len]
+
+        # For EAGLE, the page_aligned_len is for the bigram key, the normal key len should +1
+        page_aligned_token_len = page_aligned_len + 1 if self.is_eagle else page_aligned_len
+        page_aligned_token_ids = token_ids[:page_aligned_token_len]
+
+        old_prefix_len = len(req.prefix_indices)
+        if self.is_eagle and old_prefix_len > req.last_matched_prefix_len:
+            # In EAGLE chunked prefill case, the prefix_indices included one unmatched token (kv_indices[actual_kv_len:])
+            # Here we -1 to make sure the kv of the unmatched token can be freed correctly to avoid memory leak
+            old_prefix_len -= 1
 
         # Radix Cache takes over one reference from memory pool
         new_prefix_len = self.insert(page_aligned_token_ids, page_aligned_kv_indices)
-        self.token_to_kv_pool_allocator.free(kv_indices[len(req.prefix_indices) : new_prefix_len])
+        self.token_to_kv_pool_allocator.free(kv_indices[old_prefix_len:new_prefix_len])
 
         # Prefix indices may have been updated, reuse them
         new_match_result = self.match_prefix(page_aligned_token_ids)
@@ -235,10 +287,10 @@ class RadixCache(BasePrefixCache):
         new_last_node = new_match_result.last_device_node
 
         self.req_to_token_pool.write(
-            (req.req_pool_idx, slice(len(req.prefix_indices), len(new_indices))),
-            new_indices[len(req.prefix_indices) :],
+            (req.req_pool_idx, slice(old_prefix_len, len(new_indices))),
+            new_indices[old_prefix_len:],
         )
-
+        req.last_matched_prefix_len = len(new_indices)
         self.dec_lock_ref(req.last_node)
         self.inc_lock_ref(new_last_node)
 
@@ -248,6 +300,11 @@ class RadixCache(BasePrefixCache):
             req.prefix_indices = np.concat([new_indices, kv_indices[len(new_indices) :]])
         else:
             req.prefix_indices = new_indices
+            if self.is_eagle:
+                # Attach the kv index of the last token for EAGLE, it can be used in chunked prefill
+                req.prefix_indices = np.concatenate([new_indices, kv_indices[actual_kv_len:]])
+            else:
+                req.prefix_indices = new_indices
         req.last_node = new_last_node
 
     def pretty_print(self):

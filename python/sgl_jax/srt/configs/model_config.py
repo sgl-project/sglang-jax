@@ -45,6 +45,7 @@ class ModelConfig:
         quantization: str | None = None,
         model_layer_nums: int | None = None,
     ) -> None:
+
         self.model_path = model_path
         self.revision = revision
         self.model_impl = model_impl
@@ -79,6 +80,9 @@ class ModelConfig:
 
         if is_draft_model and self.hf_config.architectures[0] == "DeepseekV3ForCausalLM":
             self.hf_config.architectures[0] = "DeepseekV3ForCausalLMNextN"
+
+        if is_draft_model and self.hf_config.architectures[0] == "LlamaForCausalLM":
+            self.hf_config.architectures[0] = "LlamaForCausalLMEagle3"
 
         if is_draft_model and self.hf_config.architectures[0] == "MiMoForCausalLM":
             self.hf_config.architectures[0] = "MiMoMTP"
@@ -155,11 +159,16 @@ class ModelConfig:
         )
 
     @staticmethod
-    def from_server_args(server_args: ServerArgs, model_path: str = None, **kwargs):
+    def from_server_args(
+        server_args: ServerArgs,
+        model_path: str = None,
+        model_revision: str = None,
+        **kwargs,
+    ):
         return ModelConfig(
             model_path=model_path or server_args.model_path,
             trust_remote_code=server_args.trust_remote_code,
-            revision=server_args.revision,
+            revision=model_revision or server_args.revision,
             context_length=server_args.context_length,
             model_override_args=server_args.json_model_override_args,
             is_embedding=server_args.is_embedding,
