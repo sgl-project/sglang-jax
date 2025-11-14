@@ -1,5 +1,7 @@
 import jax
 import jax.numpy as jnp
+from jax.sharding import NamedSharding
+from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.layers.attention.base_attn_backend import AttentionBackend
 from sgl_jax.srt.layers.radix_attention import AttentionType, RadixAttention
@@ -16,17 +18,23 @@ class NativeAttention(AttentionBackend):
         self,
         num_attn_heads,
         num_kv_heads,
+        mesh,
     ):
         self.num_heads = num_attn_heads
         if num_kv_heads is not None:
             self.num_kv_heads = num_kv_heads
         else:
             self.num_kv_heads = num_attn_heads
-        # self.rngs = rngs
+        self.mesh = mesh
+        self.kv_sharding = NamedSharding(self.mesh, P(None, "tensor", None))
 
     def tree_flatten(self):
         children = ()
-        aux_data = {"num_heads": self.num_heads, "num_kv_heads": self.num_kv_heads}
+        aux_data = {
+            "num_heads": self.num_heads,
+            "num_kv_heads": self.num_kv_heads,
+            "mesh": self.mesh,
+        }
         return (children, aux_data)
 
     @classmethod
@@ -55,7 +63,7 @@ class NativeAttention(AttentionBackend):
             Tuple of (output tensor of shape [total_tokens, hidden_size], k, v)
         """
         k_buffer, v_buffer, kv_fused = self._get_and_update_kv_cache(
-            k, v, forward_batch, token_to_kv_pool, layer.layer_id
+            k, v, forward_batch, token_to_kv_pool, self.kv_sharding, layer.layer_id
         )
 
         scale = 1.0 / jnp.sqrt(layer.head_dim) if layer.scaling is None else layer.scaling
@@ -83,6 +91,7 @@ class NativeAttention(AttentionBackend):
             scale,
             is_causal,
             forward_batch.forward_mode,
+            self.kv_sharding,
             xai_temperature_len=xai_temp_len,
         )
 
@@ -95,6 +104,7 @@ class NativeAttention(AttentionBackend):
         v: jax.Array,
         forward_batch: ForwardBatch,
         token_to_kv_pool: KVCache,
+        kv_sharding: jax.NamedSharding,
         layer_id: int,
     ) -> tuple[jax.Array, jax.Array, jax.Array]:
         """
@@ -111,7 +121,8 @@ class NativeAttention(AttentionBackend):
                 )
             # Use fused layer directly from pool; derive K/V views without extra merge
             fused_layer = token_to_kv_pool.get_fused_kv_buffer(layer_id)
-            k, v = fused_layer[:, ::2, :], fused_layer[:, 1::2, :]
+            k = fused_layer.at[:, ::2, :].get(out_sharding=kv_sharding)
+            v = fused_layer.at[:, 1::2, :].get(out_sharding=kv_sharding)
             fused_return = fused_layer
         else:
             updated_layer = token_to_kv_pool.set_kv_buffer_legacy(
@@ -119,8 +130,8 @@ class NativeAttention(AttentionBackend):
             )
             # Functional style: treat updated_layer as authoritative fused buffer for this layer in this step
             # Derive K/V views for attention computation from fused buffer directly
-            k = updated_layer[:, ::2, :]
-            v = updated_layer[:, 1::2, :]
+            k = updated_layer.at[:, ::2, :].get(out_sharding=kv_sharding)
+            v = updated_layer.at[:, 1::2, :].get(out_sharding=kv_sharding)
             # Return fused buffer directly for persistence outside JIT
             fused_return = updated_layer
         return k, v, fused_return
@@ -145,6 +156,7 @@ def forward_attention(
     scale=None,
     is_causal=True,
     mode=ForwardMode.DECODE,
+    kv_sharding=None,
     xai_temperature_len: float | None = None,
 ):
     """
@@ -170,9 +182,10 @@ def forward_attention(
     """
 
     cache_size = k_cache.shape[0]
-    safe_loc = jnp.where(loc > 0, loc, cache_size)
-    k_cache = jnp.take(k_cache, safe_loc, axis=0, mode="fill", fill_value=0)
-    v_cache = jnp.take(v_cache, safe_loc, axis=0, mode="fill", fill_value=0)
+    is_valid = (loc >= 0) & (loc < cache_size)
+    safe_loc = jnp.where(is_valid, loc, cache_size)
+    k_cache = k_cache.at[safe_loc].get(out_sharding=kv_sharding, mode="fill", fill_value=0)
+    v_cache = v_cache.at[safe_loc].get(out_sharding=kv_sharding, mode="fill", fill_value=0)
 
     # Handle both 2D and 3D input formats for q
     if len(q.shape) == 2:
@@ -199,8 +212,8 @@ def forward_attention(
         num_copies = num_heads // num_kv_heads
         # Use repeat to copy k and v heads
         # [total_prefix_len, num_kv_heads, head_dim] -> [total_prefix_len, num_heads, head_dim]
-        k_heads = jnp.repeat(k_heads, num_copies, axis=1)
-        v_heads = jnp.repeat(v_heads, num_copies, axis=1)
+        k_heads = jnp.repeat(k_heads, num_copies, axis=1, out_sharding=kv_sharding)
+        v_heads = jnp.repeat(v_heads, num_copies, axis=1, out_sharding=kv_sharding)
 
     # Transpose for matmul: [num_heads, num_tokens, head_dim]
     q_t = jnp.transpose(q_heads, (1, 0, 2))

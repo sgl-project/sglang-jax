@@ -410,7 +410,7 @@ class ModelRunner:
         if backend == "native":
             from sgl_jax.srt.layers.attention.native_backend import NativeAttention
 
-            return NativeAttention(self.num_attn_heads, self.num_kv_heads)
+            return NativeAttention(self.num_attn_heads, self.num_kv_heads, self.mesh)
         elif backend == "fa":
             from sgl_jax.srt.layers.attention.flashattention_backend import (
                 FlashAttention,
@@ -436,8 +436,8 @@ class ModelRunner:
 
         with jtu.count_pjit_cpp_cache_miss() as count:
             output, layers_kv_fused, _ = self.jitted_run_model(forward_batch, logits_metadata)
-            cache_miss_count = count()
 
+            cache_miss_count = count()
         self._set_kv_cache_after_forward(layers_kv_fused)
 
         return output, cache_miss_count
