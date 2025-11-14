@@ -1,7 +1,7 @@
 import jax
 from flax import nnx
 from jax import numpy as jnp
-from jax.experimental.shard_map import shard_map
+from jax import shard_map
 from jax.sharding import Mesh
 from jax.sharding import PartitionSpec as P
 
