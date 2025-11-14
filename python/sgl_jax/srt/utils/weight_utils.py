@@ -5,6 +5,7 @@ from dataclasses import dataclass
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from flax import nnx
 from jax.sharding import Mesh
 from jax.sharding import PartitionSpec as P
@@ -17,6 +18,16 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass
+class WeightMetadata:
+    """Metadata for a weight tensor without loading the actual data."""
+
+    file_path: str
+    shape: tuple
+    dtype: str
+    hf_key: str
+
+
+@dataclass
 class WeightMapping:
     target_path: str | list[str]
     sharding: tuple | None = None
@@ -24,6 +35,7 @@ class WeightMapping:
     reshape: tuple | None = None
     head_dim_padding: bool = False
     kv_head_padding: bool = False
+    concat_axis: int | None = None
 
     def __post_init__(self):
         if self.sharding is None:
@@ -96,8 +108,148 @@ class WeightLoader:
         else:
             self.moe_abstract_mesh = None
 
+    def _scan_weight_metadata(self) -> dict[str, WeightMetadata]:
+        """
+        Scan all safetensors files and build a metadata map.
+
+        This is a fast operation that only reads file headers, not actual weight data.
+        All processes scan all files to build a complete global view.
+
+        Returns:
+            A dictionary mapping weight keys to their metadata
+        """
+        model_path = self.model_config.model_path
+        weights_files = glob.glob(os.path.join(model_path, "*.safetensors"))
+
+        if len(weights_files) == 0:
+            raise RuntimeError(f"Cannot find any *.safetensors files in {model_path}")
+
+        weights_files.sort()
+
+        metadata_map = {}
+        process_index = jax.process_index()
+
+        logger.info(
+            "Process %d: Scanning %d files for weight metadata...",
+            process_index,
+            len(weights_files),
+        )
+
+        for st_file in weights_files:
+            with safe_open(st_file, framework="flax") as f:
+                # Get all keys and their metadata
+                for hf_key in f.keys():  # noqa: SIM118
+                    # Skip excluded layers
+                    if hf_key.startswith("model.layers.") and self._is_excluded_layer_weight(
+                        hf_key
+                    ):
+                        continue
+
+                    # Get tensor metadata from header (no I/O)
+                    tensor_slice = f.get_slice(hf_key)
+                    shape = tensor_slice.get_shape()
+                    dtype = str(tensor_slice.get_dtype())
+
+                    metadata_map[hf_key] = WeightMetadata(
+                        file_path=st_file,
+                        shape=shape,
+                        dtype=dtype,
+                        hf_key=hf_key,
+                    )
+
+        logger.info(
+            "Process %d: Found %d weights across all files", process_index, len(metadata_map)
+        )
+        return metadata_map
+
+    def _determine_responsible_process(self, file_path: str, weights_files: list[str]) -> int:
+        """
+        Determine which process is responsible for loading weights from a given file.
+
+        Uses round-robin distribution: file at index i is handled by process (i % process_count)
+        """
+        try:
+            file_index = weights_files.index(file_path)
+            return file_index % jax.process_count()
+        except ValueError:
+            # Fallback: hash the filename
+            return hash(file_path) % jax.process_count()
+
+    def _load_and_broadcast_weight(
+        self, metadata: WeightMetadata, responsible_process: int
+    ) -> jax.Array:
+        """
+        Load a weight from disk and broadcast it to all processes.
+
+        This uses a two-step approach:
+        1. Responsible process loads the weight
+        2. Use process_allgather to distribute the weight to all processes
+
+        Args:
+            metadata: Weight metadata including file path and shape
+            responsible_process: The process that should load from disk
+
+        Returns:
+            The weight tensor, available on all processes
+        """
+        from jax.experimental.multihost_utils import process_allgather
+
+        process_index = jax.process_index()
+
+        # Convert dtype string to numpy dtype
+        dtype_map = {
+            "BF16": np.float32,  # Will be converted later
+            "F16": np.float16,
+            "F32": np.float32,
+            "F64": np.float64,
+            "I32": np.int32,
+            "I64": np.int64,
+            "U8": np.uint8,
+        }
+        np_dtype = dtype_map.get(metadata.dtype, np.float32)
+
+        if process_index == responsible_process:
+            # This process is responsible: load the weight from disk
+            # Calculate weight size for I/O monitoring
+            num_elements = 1
+            for dim in metadata.shape:
+                num_elements *= dim
+
+            bytes_per_element = 2  # Assume bf16/fp16 (most common)
+            if "F32" in metadata.dtype or "I32" in metadata.dtype:
+                bytes_per_element = 4
+            elif "I64" in metadata.dtype:
+                bytes_per_element = 8
+
+            weight_size_mb = (num_elements * bytes_per_element) / (1024 * 1024)
+
+            logger.debug(
+                "Process %d: Loading %s (%.2f MB) from %s",
+                process_index,
+                metadata.hf_key,
+                weight_size_mb,
+                os.path.basename(metadata.file_path),
+            )
+
+            with (
+                jax.default_device(jax.local_devices(backend="cpu")[0]),
+                safe_open(metadata.file_path, framework="flax") as f,
+            ):
+                weight = f.get_tensor(metadata.hf_key)
+        else:
+            # Other processes create zero arrays
+            weight = np.zeros(metadata.shape, dtype=np_dtype)
+
+        # Gather weights from all processes, then select the one from responsible process
+        # This uses process_allgather which handles multi-process communication properly
+        all_weights = process_allgather(weight, tiled=True)
+
+        # Extract the weight from the responsible process
+        # allgather stacks weights along axis 0, indexed by process
+        return all_weights[responsible_process]
+
     def load_weights_from_safetensors(
-        self, weight_mappings: dict[str, str | list[str] | WeightMapping]
+        self, weight_mappings: dict[str, str | list[str] | WeightMapping], safetensors_partition=1
     ):
         params = nnx.state(self.model)
 
@@ -117,47 +269,175 @@ class WeightLoader:
             self.model_config.num_hidden_layers - 1,
         )
 
-        for hf_key, hf_weight in self._iterate_weights():
-            if hf_key in regular_mappings:
-                mapping = regular_mappings[hf_key]
-                if isinstance(mapping, (str, list)):
-                    mapping = WeightMapping(target_path=mapping)
-                self._process_and_assign_weight(params, hf_key, hf_weight, mapping)
-            elif "mlp.experts." in hf_key and hf_key.endswith(".weight"):
-                if self._is_excluded_layer_weight(hf_key):
-                    logger.debug("Skipping excluded MoE expert weight: %s", hf_key)
-                    continue
+        process_count = jax.process_count()
+        process_index = jax.process_index()
 
-                assigned = False
-                for moe_key, mapping in moe_mappings.items():
-                    expected_hf_keys = mapping.target_path[1:]  # list of expected HF keys
-                    if hf_key in expected_hf_keys:
-                        if moe_key not in moe_buffer:
-                            moe_buffer[moe_key] = {}
-                        moe_buffer[moe_key][hf_key] = hf_weight
-                        assigned = True
+        if process_count > 1:
+            # Multi-process mode: scan metadata first, then load with distribution
+            logger.info("Process %d: Multi-process loading mode enabled", process_index)
 
-                        if len(moe_buffer[moe_key]) == len(expected_hf_keys):
-                            self._process_single_moe_group(
-                                params, moe_key, mapping, moe_buffer[moe_key]
-                            )
-                            del moe_buffer[moe_key]  # free memory
-                        break
+            # Phase 1: All processes scan file metadata (fast, no weight I/O)
+            metadata_map = self._scan_weight_metadata()
 
-                if not assigned:
-                    logger.warning("MoE expert weight not assigned to any mapping: %s", hf_key)
-            else:
-                if self._is_excluded_layer_weight(hf_key):
-                    logger.debug("Skipping excluded layer weight: %s", hf_key)
+            # Phase 2: Build file list for determining responsible processes
+            model_path = self.model_config.model_path
+            weights_files = sorted(glob.glob(os.path.join(model_path, "*.safetensors")))
+
+            # I/O statistics tracking
+            total_weights_loaded_by_me = 0
+            total_weights = len(metadata_map)
+
+            # Phase 3: Load weights with broadcasting
+            # Process weights in deterministic order for consistency across processes
+            for hf_key in sorted(metadata_map.keys()):
+                metadata = metadata_map[hf_key]
+
+                # Determine which process should load this weight
+                responsible_process = self._determine_responsible_process(
+                    metadata.file_path, weights_files
+                )
+
+                # Track I/O statistics
+                if responsible_process == process_index:
+                    total_weights_loaded_by_me += 1
+
+                # Load and broadcast the weight
+                hf_weight = self._load_and_broadcast_weight(metadata, responsible_process)
+
+                # Now all processes have this weight, process it normally
+                if hf_key in regular_mappings:
+                    mapping = regular_mappings[hf_key]
+                    if isinstance(mapping, (str, list)):
+                        mapping = WeightMapping(target_path=mapping)
+                    self._process_and_assign_weight(params, hf_key, hf_weight, mapping)
+                elif (
+                    "mlp.experts." in hf_key or "block_sparse_moe.experts" in hf_key
+                ) and hf_key.endswith(".weight"):
+                    if self._is_excluded_layer_weight(hf_key):
+                        logger.debug("Skipping excluded MoE expert weight: %s", hf_key)
+                        continue
+
+                    assigned = False
+                    for moe_key, mapping in moe_mappings.items():
+                        expected_hf_keys = mapping.target_path[1:]
+                        if hf_key in expected_hf_keys:
+                            if moe_key not in moe_buffer:
+                                moe_buffer[moe_key] = {}
+                            if hf_key not in moe_buffer[moe_key]:
+                                moe_buffer[moe_key][hf_key] = []
+                            moe_buffer[moe_key][hf_key].append(hf_weight)
+                            assigned = True
+
+                            if len(moe_buffer[moe_key]) == len(expected_hf_keys):
+                                shard_counts = [len(v) for v in moe_buffer[moe_key].values()]
+                                if len(set(shard_counts)) != 1:
+                                    continue
+
+                                if mapping.concat_axis is not None:
+                                    if shard_counts[0] < safetensors_partition:
+                                        continue
+                                else:
+                                    if shard_counts[0] != 1:
+                                        continue
+
+                                self._process_single_moe_group(
+                                    params, moe_key, mapping, moe_buffer[moe_key]
+                                )
+                                del moe_buffer[moe_key]
+                            break
+
+                    if not assigned:
+                        logger.warning("MoE expert weight not assigned to any mapping: %s", hf_key)
                 else:
-                    logger.warning("No mapping found for weight: %s", hf_key)
+                    if self._is_excluded_layer_weight(hf_key):
+                        logger.debug("Skipping excluded layer weight: %s", hf_key)
+                    else:
+                        logger.warning("No mapping found for weight: %s", hf_key)
+
+            # Log I/O statistics
+            io_reduction_ratio = (
+                1.0 - (total_weights_loaded_by_me / total_weights) if total_weights > 0 else 0
+            )
+            logger.info(
+                "Process %d: I/O optimization complete - loaded %d/%d weights from disk (%.1f%% reduction)",
+                process_index,
+                total_weights_loaded_by_me,
+                total_weights,
+                io_reduction_ratio * 100,
+            )
+
+        else:
+            # Single process mode: use original fast path
+            for hf_key, hf_weight, _source_process in self._iterate_weights():
+                if hf_key in regular_mappings:
+                    mapping = regular_mappings[hf_key]
+                    if isinstance(mapping, (str, list)):
+                        mapping = WeightMapping(target_path=mapping)
+                    self._process_and_assign_weight(params, hf_key, hf_weight, mapping)
+                elif (
+                    "mlp.experts." in hf_key or "block_sparse_moe.experts" in hf_key
+                ) and hf_key.endswith(".weight"):
+                    if self._is_excluded_layer_weight(hf_key):
+                        logger.debug("Skipping excluded MoE expert weight: %s", hf_key)
+                        continue
+
+                    assigned = False
+                    for moe_key, mapping in moe_mappings.items():
+                        expected_hf_keys = mapping.target_path[1:]  # list of expected HF keys
+                        if hf_key in expected_hf_keys:
+                            if moe_key not in moe_buffer:
+                                moe_buffer[moe_key] = {}
+                            if hf_key not in moe_buffer[moe_key]:
+                                moe_buffer[moe_key][hf_key] = []
+                            moe_buffer[moe_key][hf_key].append(hf_weight)
+                            assigned = True
+
+                            if len(moe_buffer[moe_key]) == len(expected_hf_keys):
+                                shard_counts = [len(v) for v in moe_buffer[moe_key].values()]
+                                # Validate all weights have consistent shard counts
+                                if len(set(shard_counts)) != 1:
+                                    continue
+
+                                # Auto-detect TP sharding:
+                                # - Grok-2: concat_axis is set, needs multiple shards (e.g., 8)
+                                if mapping.concat_axis is not None:
+                                    # TP-sharded weights: need multiple shards to concatenate
+                                    if shard_counts[0] < safetensors_partition:
+                                        continue
+                                else:
+                                    # Non-TP-sharded weights: expect exactly 1 copy per expert
+                                    if shard_counts[0] != 1:
+                                        continue
+
+                                self._process_single_moe_group(
+                                    params, moe_key, mapping, moe_buffer[moe_key]
+                                )
+                                del moe_buffer[moe_key]  # free memory
+                            break
+
+                    if not assigned:
+                        logger.warning("MoE expert weight not assigned to any mapping: %s", hf_key)
+                else:
+                    if self._is_excluded_layer_weight(hf_key):
+                        logger.debug("Skipping excluded layer weight: %s", hf_key)
+                    else:
+                        logger.warning("No mapping found for weight: %s", hf_key)
 
         if moe_buffer:
             for moe_key in moe_buffer:
-                expected = len(moe_mappings[moe_key].target_path[1:])
+                mapping = moe_mappings[moe_key]
+                expected = len(mapping.target_path[1:])
                 got = len(moe_buffer[moe_key])
+                shard_counts = (
+                    [len(v) for v in moe_buffer[moe_key].values()] if moe_buffer[moe_key] else []
+                )
                 logger.error(
-                    "MoE group %s incomplete: %s/%s weights loaded", moe_key, got, expected
+                    "MoE group %s incomplete: %s/%s weights loaded, shard_counts=%s, concat_axis=%s",
+                    moe_key,
+                    got,
+                    expected,
+                    shard_counts,
+                    mapping.concat_axis,
                 )
             raise RuntimeError("Incomplete MoE expert weights detected.")
 
@@ -168,14 +448,21 @@ class WeightLoader:
         params: nnx.State,
         moe_key: str,
         mapping: WeightMapping,
-        expert_weights_dict: dict[str, jax.Array],
+        expert_weights_dict: dict[str, list[jax.Array]],
     ):
         target_path = mapping.target_path[0]
         expected_hf_keys = mapping.target_path[1:]
 
         collected_weights = []
         for hf_key in expected_hf_keys:
-            weight = expert_weights_dict[hf_key]
+            weights = expert_weights_dict[hf_key]
+            # If TP-sharded (e.g., Grok-2), concatenate shards along concat_axis
+            if mapping.concat_axis is not None and len(weights) > 1:
+                weight = jnp.concatenate(weights, axis=mapping.concat_axis)
+            else:
+                # Non-TP-sharded (e.g., Qwen3-MoE), expect single weight
+                weight = weights[0]
+
             if mapping.transpose and not hf_key.endswith(".bias"):
                 weight = jnp.transpose(weight, (1, 0))
             collected_weights.append(weight)
@@ -202,6 +489,17 @@ class WeightLoader:
         logger.debug("Assigned MoE group %s, shape: %s", moe_key, stacked_weight.shape)
 
     def _iterate_weights(self):
+        """
+        Iterate through weights with multi-process optimization.
+
+        In multi-process mode (process_count > 1):
+        - Each process reads only its assigned files (process_index::process_count)
+        - Weights are yielded with source_process info for later broadcasting
+        - This reduces I/O by ~N× where N is the number of processes
+
+        In single-process mode:
+        - Behaves the same as before for backward compatibility
+        """
         model_path = self.model_config.model_path
         weights_files = glob.glob(os.path.join(model_path, "*.safetensors"))
 
@@ -210,11 +508,33 @@ class WeightLoader:
 
         weights_files.sort()
 
+        process_count = jax.process_count()
+        process_index = jax.process_index()
+
+        # Multi-process optimization: partition files across processes
+        if process_count > 1:
+            my_files = weights_files[process_index::process_count]
+            logger.info(
+                "Multi-process I/O optimization enabled: Process %d/%d loading %d/%d files",
+                process_index,
+                process_count,
+                len(my_files),
+                len(weights_files),
+            )
+        else:
+            my_files = weights_files
+
         skipped_files = 0
-        with tqdm(weights_files, desc="[LOADING] MODEL WEIGHTS", unit="file") as pbar:
+        # Only show progress bar on process 0 in multi-process mode
+        show_progress = process_index == 0 or process_count == 1
+
+        with tqdm(
+            my_files, desc="[LOADING] MODEL WEIGHTS", unit="file", disable=not show_progress
+        ) as pbar:
             for st_file in pbar:
                 filename = os.path.basename(st_file)
-                pbar.set_postfix({"file": filename})
+                if show_progress:
+                    pbar.set_postfix({"file": filename})
 
                 with (
                     jax.default_device(jax.local_devices(backend="cpu")[0]),
@@ -232,27 +552,30 @@ class WeightLoader:
                     if not needed_keys:
                         skipped_files += 1
                         logger.debug(
-                            "Skipping %s: 0/%s weights needed",
+                            "Process %d: Skipping %s: 0/%s weights needed",
+                            process_index,
                             filename,
                             len(f.keys()),
                         )
                         continue
 
                     logger.debug(
-                        "Loading %s: %s/%s weights needed",
+                        "Process %d: Loading %s: %s/%s weights needed",
+                        process_index,
                         filename,
                         len(needed_keys),
                         len(f.keys()),
                     )
                     for name in needed_keys:
                         weight_tensor = f.get_tensor(name)
-                        yield name, weight_tensor
+                        yield name, weight_tensor, process_index  # Include source process
 
         if skipped_files > 0:
             logger.info(
-                "Memory optimization: Skipped %s/%s files with no needed weights",
+                "Process %d: Skipped %d/%d files with no needed weights",
+                process_index,
                 skipped_files,
-                len(weights_files),
+                len(my_files),
             )
 
     def _process_and_assign_weight(
@@ -277,6 +600,18 @@ class WeightLoader:
     ):
         jax_path = mapping.target_path
         processed_weight = weight
+
+        # Apply output_multiplier_scale to lm_head weights (matching PyTorch implementation)
+        if "lm_head" in hf_key and hasattr(self.model_config.hf_config, "output_multiplier_scale"):
+            logger.info(
+                "Applying output_multiplier_scale (%.2f) to %s",
+                self.model_config.hf_config.output_multiplier_scale,
+                hf_key,
+            )
+            processed_weight = processed_weight.astype(jnp.float32)
+            processed_weight = (
+                processed_weight * self.model_config.hf_config.output_multiplier_scale
+            )
 
         if mapping.reshape is not None:
             processed_weight = jnp.reshape(processed_weight, mapping.reshape)
