@@ -17,7 +17,7 @@ from sgl_jax.srt.hf_transformers_utils import get_tokenizer
 from sgl_jax.srt.utils import kill_process_tree
 from sgl_jax.test.runners import TEST_RERANK_QUERY_DOCS
 from sgl_jax.test.test_utils import (
-    DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
+    DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
@@ -28,7 +28,7 @@ from sgl_jax.test.test_utils import (
 class TestOpenAIServer(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
+        cls.model = DEFAULT_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.api_key = "sk-123456"
         cls.process = popen_launch_server(
@@ -42,7 +42,7 @@ class TestOpenAIServer(CustomTestCase):
                 "--random-seed",
                 "3",
                 "--mem-fraction-static",
-                "0.2",
+                "0.8",
                 "--chunked-prefill-size",
                 "2048",
                 "--download-dir",
@@ -63,7 +63,7 @@ class TestOpenAIServer(CustomTestCase):
             },
         )
         cls.base_url += "/v1"
-        cls.tokenizer = get_tokenizer(DEFAULT_SMALL_MODEL_NAME_FOR_TEST, trust_remote_code=True)
+        cls.tokenizer = get_tokenizer(DEFAULT_MODEL_NAME_FOR_TEST, trust_remote_code=True)
 
     @classmethod
     def tearDownClass(cls):
