@@ -283,7 +283,11 @@ class FlashAttention(AttentionBackend):
             distribution = np.array([0, num_seqs.item(), num_seqs.item()], dtype=np.int32)
         else:
             raise ValueError(f"Invalid forward mode: {batch.forward_mode}")
-
+        num_seqs = np.array(num_seqs)
+        cu_q_lens = np.array(cu_q_lens)
+        cu_kv_lens = np.array(cu_kv_lens)
+        page_indices = np.array(page_indices)
+        seq_lens = np.array(seq_lens)
         (
             metadata.num_seqs,
             metadata.cu_q_lens,

@@ -128,7 +128,7 @@ def ref_ragged_paged_attention(
     xai_temperature_len: float | None = None,
 ):
     if causal:
-        assert custom_mask is not None, "use causal mask, custom_mask is not None"
+        pass
     else:
         assert (
             custom_mask is None or custom_mask.size < jnp.cumsum(kv_lens)[-1]

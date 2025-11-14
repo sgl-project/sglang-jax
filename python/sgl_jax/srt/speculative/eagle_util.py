@@ -31,11 +31,7 @@ from sgl_jax.srt.mem_cache.common import (
     alloc_paged_token_slots_extend,
     alloc_token_slots,
 )
-from sgl_jax.srt.model_executor.forward_batch_info import (
-    CaptureHiddenMode,
-    ForwardBatch,
-    ForwardMode,
-)
+from sgl_jax.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
 from sgl_jax.srt.speculative.pallas.build_eagle_tree_structure_kernel import (
     build_eagle_tree_structure,
 )
@@ -520,9 +516,7 @@ class EagleDraftInput:
                 [model_worker_batch.spec_info.hidden_states, pad_values], axis=0
             )
 
-        forward_batch = ForwardBatch.init_new(model_worker_batch, draft_model_runner)
-
-        return forward_batch, logits_metadata
+        return model_worker_batch, logits_metadata
 
     def prepare_for_decode(self, schedule_batch: ScheduleBatch):
         new_allocate_lens = schedule_batch.seq_lens + self.ALLOC_LEN_PER_DECODE

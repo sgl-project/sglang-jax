@@ -227,6 +227,44 @@ class EAGLEWorker(ModelWorker):
 
         self.capture_for_decode(logits_output, forward_batch.spec_info)
 
+    def copy_model_worker_batch_to_cpu(self, model_worker_batch: ModelWorkerBatch):
+        model_worker_batch.input_ids = np.array(
+            model_worker_batch.input_ids, dtype=model_worker_batch.input_ids.dtype
+        )
+        model_worker_batch.seq_lens = np.array(
+            model_worker_batch.seq_lens, dtype=model_worker_batch.seq_lens.dtype
+        )
+        model_worker_batch.out_cache_loc = np.array(
+            model_worker_batch.out_cache_loc, dtype=model_worker_batch.out_cache_loc.dtype
+        )
+        model_worker_batch.positions = np.array(
+            model_worker_batch.positions, dtype=model_worker_batch.positions.dtype
+        )
+        model_worker_batch.extend_start_loc = np.array(
+            model_worker_batch.extend_start_loc, dtype=model_worker_batch.extend_start_loc.dtype
+        )
+        model_worker_batch.req_pool_indices = np.array(
+            model_worker_batch.req_pool_indices, dtype=model_worker_batch.req_pool_indices.dtype
+        )
+        model_worker_batch.cache_loc = np.array(
+            model_worker_batch.cache_loc, dtype=model_worker_batch.cache_loc.dtype
+        )
+        model_worker_batch.extend_prefix_lens = (
+            np.array(
+                model_worker_batch.extend_prefix_lens,
+                dtype=model_worker_batch.extend_prefix_lens.dtype,
+            )
+            if model_worker_batch.extend_prefix_lens is not None
+            else None
+        )
+        model_worker_batch.extend_seq_lens = (
+            np.array(
+                model_worker_batch.extend_seq_lens, dtype=model_worker_batch.extend_seq_lens.dtype
+            )
+            if model_worker_batch.extend_seq_lens is not None
+            else None
+        )
+
     @property
     def draft_model_runner(self):
         return self.get_model_runner()
@@ -297,6 +335,7 @@ class EAGLEWorker(ModelWorker):
             model_worker_batch, is_eagle=True
         )
         # custom_mask = forward_metadata.custom_mask
+        self.copy_model_worker_batch_to_cpu(model_worker_batch)
         logits_output, _, cache_miss_count = self.target_worker.forward_batch_generation(
             model_worker_batch, skip_sample=True, forward_metadata=forward_metadata
         )
@@ -432,6 +471,8 @@ class EAGLEWorker(ModelWorker):
             self.precompile_bs_paddings,
             self.precompile_cache_loc_paddings,
         )
+        self.copy_model_worker_batch_to_cpu(model_worker_batch)
+        forward_batch = ForwardBatch.init_new(model_worker_batch, self.draft_model_runner)
         if forward_batch.input_ids.shape[0] <= 0:
             return
         draft_logits_output, _ = self.draft_model_runner.forward(
@@ -539,6 +580,7 @@ class EAGLEWorker(ModelWorker):
                         parents_list=parents_list,
                     )
                 )
+            self.copy_model_worker_batch_to_cpu(model_worker_batch)
             forward_batch = ForwardBatch.init_new(model_worker_batch, self.draft_model_runner)
             # Run forward
             logits_output, _ = self.draft_model_runner.forward(

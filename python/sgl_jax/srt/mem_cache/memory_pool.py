@@ -8,7 +8,7 @@ import numpy as np
 from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 from jax.tree_util import register_pytree_node_class
-from sgl_jax.srt.kernels.ragged_paged_attention.ragged_paged_attention import merge_kv
+
 from sgl_jax.srt.kernels.update_kv_cache.update_kv_cache import (
     get_num_slices_per_block,
     get_slot_mapping,
@@ -16,6 +16,30 @@ from sgl_jax.srt.kernels.update_kv_cache.update_kv_cache import (
 )
 
 
+def merge_kv(k: jax.Array, v: jax.Array) -> jax.Array:
+    assert k.shape == v.shape, f"k and v must have same shape, got {k.shape} vs {v.shape}"
+
+    num_tokens, num_kv_heads, head_dim = k.shape
+
+    kv_stacked = jnp.stack([k, v], axis=2)  # [tokens, heads, 2, head_dim]
+    kv_fused = kv_stacked.reshape(num_tokens, num_kv_heads * 2, head_dim)
+    from sgl_jax.srt.kernels.ragged_paged_attention.util import align_to
+
+    head_dim_aligned = align_to(head_dim, 128)
+    kv_fused = jnp.pad(
+        kv_fused,
+        (
+            (0, 0),
+            (0, 0),
+            (0, head_dim_aligned - head_dim),
+        ),
+        constant_values=0,
+    ).reshape(
+        num_tokens,
+        num_kv_heads * 2,
+        head_dim_aligned,
+    )
+    return kv_fused
 
 
 logger = logging.getLogger(__name__)
