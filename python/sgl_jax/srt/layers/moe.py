@@ -272,7 +272,7 @@ class EPMoE(nnx.Module):
                     P("expert", "tensor", None),
                 ),
                 out_specs=P(None),
-                check_rep=False,
+                check_vma=False,
             )(
                 hidden_states_reshard,
                 topk_weights_reshard,
