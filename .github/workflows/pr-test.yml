@@ -103,10 +103,12 @@ jobs:
     runs-on: arc-runner-v6e-1
     strategy:
       fail-fast: false
+      matrix:
+        part: [0]
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
-      - name: Run test
+        uses: actions/checkout@v5
+      - name: Run e2e test
         timeout-minutes: 120
         shell: bash
         env:
@@ -117,7 +119,7 @@ jobs:
           pip install uv
           uv pip install -e "python[all]"
           bash scripts/killall_sglang.sh
-          python test/srt/run_suite.py --suite per-commit-tpu-v6e-1
+          python test/srt/run_suite.py --suite e2e-test-tpu-v6e-1 --auto-partition-id ${{ matrix.part }} --auto-partition-size 1
 
   e2e-test-4-tpu:
     needs: [check-changes]
@@ -125,10 +127,12 @@ jobs:
     runs-on: arc-runner-v6e-4
     strategy:
       fail-fast: false
+      matrix:
+        part: [0, 1]
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
-      - name: Run test
+        uses: actions/checkout@v5
+      - name: Run e2e test
         timeout-minutes: 120
         shell: bash
         env:
@@ -139,7 +143,7 @@ jobs:
           pip install uv
           uv pip install -e "python[all]"
           bash scripts/killall_sglang.sh
-          python test/srt/run_suite.py --suite per-commit-tpu-v6e-4
+          python test/srt/run_suite.py --suite e2e-test-tpu-v6e-4 --auto-partition-id ${{ matrix.part }} --auto-partition-size 2
 
   # =============================================== accurancy-test ===============================================
   accurancy-test-1-tpu:

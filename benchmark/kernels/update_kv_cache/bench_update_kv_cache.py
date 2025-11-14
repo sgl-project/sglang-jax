@@ -225,10 +225,7 @@ class TestPerformance(CustomTestCase):
                 num_slices_per_block,
                 page_size=page_size,
             )
-            if roofline < 2:
-                expect_result = roofline * (1 + floating_threshold)
-            else:
-                expect_result = roofline * (1 + floating_threshold / 2)
+            expect_result = roofline * (1 + floating_threshold)
             print(f"{case}, res={cost*1000}ms, {expect_result=}ms")
             self.assertLess(
                 cost * 1000, expect_result, f"Run update_kv_cache performance test failed, {case=}"

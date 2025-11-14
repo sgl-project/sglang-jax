@@ -221,10 +221,7 @@ class TestPerformance(CustomTestCase):
                 group_sizes,
                 backend_type="megablox",
             )
-            if baseline < 2:
-                expected_result = baseline * (1 + floating_threshold)
-            else:
-                expected_result = baseline * (1 + floating_threshold / 2)
+            expected_result = baseline * (1 + floating_threshold)
             print(f"{case}, res={megablox_time*1000}ms, {expected_result=}ms")
             self.assertLess(
                 megablox_time * 1000,

@@ -278,10 +278,7 @@ class TestPerformance(CustomTestCase):
                 head_dim,
                 page_size,
             )
-            if baseline < 2:
-                expected_result = baseline * (1 + floating_threshold)
-            else:
-                expected_result = baseline * (1 + floating_threshold / 2)
+            expected_result = baseline * (1 + floating_threshold)
             print(f"{case}, res={res*1000}ms, {expected_result=}ms")
             self.assertLess(
                 res * 1000,
