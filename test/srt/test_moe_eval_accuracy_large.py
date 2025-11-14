@@ -1,10 +1,8 @@
 """
 Usage:
-python -m unittest test_eval_accuracy_large.TestEvalAccuracyLarge.test_mmlu
+python -m unittest test_moe_eval_accuracy_large.TestMoEEvalAccuracyLarge.test_mmlu
 """
 
-import os
-import time
 import unittest
 from types import SimpleNamespace
 
@@ -12,9 +10,9 @@ from run_eval import run_eval
 
 from sgl_jax.srt.utils import kill_process_tree
 from sgl_jax.test.test_utils import (
-    DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
+    QWEN3_MOE_30B,
     CustomTestCase,
     is_in_ci,
     popen_launch_server,
@@ -22,22 +20,21 @@ from sgl_jax.test.test_utils import (
 )
 
 
-class TestEvalAccuracyLarge(CustomTestCase):
+class TestMoEEvalAccuracyLarge(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model = DEFAULT_MODEL_NAME_FOR_TEST
+        cls.model = QWEN3_MOE_30B
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=[
-                "--trust-remote-code",
                 "--skip-server-warmup",
                 "--dist-init-addr",
                 "0.0.0.0:10011",
-                "--nnodes",
-                "1",
+                "--tp-size",
+                "4",
                 "--random-seed",
                 "3",
                 "--mem-fraction-static",
@@ -59,11 +56,8 @@ class TestEvalAccuracyLarge(CustomTestCase):
                 "--max-running-requests",
                 "64",
                 "--page-size",
-                "64",
+                "128",
             ],
-            env={
-                "JAX_COMPILATION_CACHE_DIR": "/tmp/jax_compilation_cache",
-            },
         )
 
     @classmethod
@@ -80,28 +74,40 @@ class TestEvalAccuracyLarge(CustomTestCase):
         )
 
         metrics = run_eval(args)
+        self.assertGreater(metrics["score"], 0.764)
 
         if is_in_ci():
-            write_github_step_summary(f'### test_mmlu\n{metrics["score"]=:.4f}\n')
-        print("mmlu metrics", metrics)
+            write_github_step_summary(f"### test_mmlu\n" f'{metrics["score"]=:.4f}\n')
 
-        self.assertGreater(metrics["score"], 0.698)
+    def test_human_eval(self):
+        args = SimpleNamespace(
+            base_url=self.base_url,
+            model=self.model,
+            eval_name="humaneval",
+            num_examples=None,
+            num_threads=1024,
+        )
+
+        metrics = run_eval(args)
+        self.assertGreater(metrics["score"], 0.40)
+
+        if is_in_ci():
+            write_github_step_summary(f"### test_human_eval\n" f'{metrics["score"]=:.4f}\n')
 
     def test_mgsm_en(self):
         args = SimpleNamespace(
             base_url=self.base_url,
             model=self.model,
             eval_name="mgsm_en",
-            num_examples=1024,
-            num_threads=64,
+            num_examples=None,
+            num_threads=1024,
         )
 
         metrics = run_eval(args)
+        self.assertGreater(metrics["score"], 0.61)
 
         if is_in_ci():
-            write_github_step_summary(f'### test_mgsm_en\n{metrics["score"]=:.4f}\n')
-        print("mgsm en metrics", metrics)
-        self.assertGreater(metrics["score"], 0.4)
+            write_github_step_summary(f"### test_mgsm_en\n" f'{metrics["score"]=:.4f}\n')
 
 
 if __name__ == "__main__":
