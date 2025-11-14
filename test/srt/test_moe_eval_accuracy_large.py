@@ -35,7 +35,7 @@ class TestMoEEvalAccuracyLarge(CustomTestCase):
                 "--tp",
                 "4",
                 "--page-size",
-                "64",
+                "128",
             ],
         )
 
@@ -53,7 +53,7 @@ class TestMoEEvalAccuracyLarge(CustomTestCase):
         )
 
         metrics = run_eval(args)
-        self.assertGreater(metrics["score"], 0.62)
+        self.assertGreater(metrics["score"], 0.764)
 
         if is_in_ci():
             write_github_step_summary(f"### test_mmlu\n" f'{metrics["score"]=:.4f}\n')

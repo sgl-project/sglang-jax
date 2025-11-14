@@ -85,7 +85,7 @@ class TestEvalAccuracyLarge(CustomTestCase):
             write_github_step_summary(f'### test_mmlu\n{metrics["score"]=:.4f}\n')
         print("mmlu metrics", metrics)
 
-        self.assertGreater(metrics["score"], 0.43)
+        self.assertGreater(metrics["score"], 0.698)
 
     def test_mgsm_en(self):
         args = SimpleNamespace(

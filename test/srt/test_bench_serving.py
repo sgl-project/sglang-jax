@@ -53,7 +53,7 @@ class TestBenchServing(CustomTestCase):
                 f"### test_input_throughput_default\n"
                 f"Input throughput: {res['input_throughput']:.2f} token/s\n"
             )
-            # self.assertGreater(res["input_throughput"], 20000)
+            self.assertGreater(res["input_throughput"], 28299)
 
     def test_output_throughput_default(self):
         res = run_bench_serving(
@@ -92,7 +92,7 @@ class TestBenchServing(CustomTestCase):
                 f"### test_output_throughput_default\n"
                 f"Output throughput: {res['output_throughput']:.2f} token/s\n"
             )
-            # self.assertGreater(res["output_throughput"], 1000)
+            self.assertGreater(res["output_throughput"], 2345)
 
     def test_input_throughput_default_tp_4(self):
         res = run_bench_serving(
@@ -133,7 +133,7 @@ class TestBenchServing(CustomTestCase):
                 f"### test_input_throughput_default_tp_4\n"
                 f"Input throughput: {res['input_throughput']:.2f} token/s\n"
             )
-            # self.assertGreater(res["input_throughput"], 60000)
+            self.assertGreater(res["input_throughput"], 64960)
 
     def test_output_throughput_default_tp_4(self):
         res = run_bench_serving(
@@ -174,7 +174,7 @@ class TestBenchServing(CustomTestCase):
                 f"### test_output_throughput_default_tp_4\n"
                 f"Output throughput: {res['output_throughput']:.2f} token/s\n"
             )
-            # self.assertGreater(res["output_throughput"], 10000)
+            self.assertGreater(res["output_throughput"], 9866)
 
     def test_moe_input_throughput_default(self):
         res = run_bench_serving(
@@ -215,7 +215,7 @@ class TestBenchServing(CustomTestCase):
                 f"### test_moe_input_throughput_default\n"
                 f"Input throughput: {res['input_throughput']:.2f} token/s\n"
             )
-            # self.assertGreater(res["input_throughput"], 1400)
+            self.assertGreater(res["input_throughput"], 14168)
 
     def test_moe_output_throughput_default(self):
         res = run_bench_serving(
@@ -256,7 +256,7 @@ class TestBenchServing(CustomTestCase):
                 f"### test_moe_output_throughput_default\n"
                 f"Output throughput: {res['output_throughput']:.2f} token/s\n"
             )
-            # self.assertGreater(res["output_throughput"], 1000)
+            self.assertGreater(res["output_throughput"], 2835)
 
     def test_ttft_default(self):
         res = run_bench_serving(
@@ -295,7 +295,7 @@ class TestBenchServing(CustomTestCase):
                 f"### test_online_ttft_default\n"
                 f"median_ttft_ms: {res['median_ttft_ms']:.2f} ms\n"
             )
-            # self.assertLess(res["median_ttft_ms"], 110)
+            self.assertLess(res["median_ttft_ms"], 52)
 
     def test_itl_default(self):
         res = run_bench_serving(
@@ -333,7 +333,7 @@ class TestBenchServing(CustomTestCase):
             write_github_step_summary(
                 f"### test_online_itl_default\n" f"median_itl_ms: {res['median_itl_ms']:.2f} ms\n"
             )
-            # self.assertLess(res["median_itl_ms"], 20)
+            self.assertLess(res["median_itl_ms"], 16)
 
     def test_ttft_default_tp_4(self):
         res = run_bench_serving(
@@ -374,7 +374,7 @@ class TestBenchServing(CustomTestCase):
                 f"### test_online_ttft_default_tp_4\n"
                 f"median_ttft_ms: {res['median_ttft_ms']:.2f} ms\n"
             )
-            # self.assertLess(res["median_ttft_ms"], 35)
+            self.assertLess(res["median_ttft_ms"], 38)
 
     def test_itl_default_tp_4(self):
         res = run_bench_serving(
@@ -415,7 +415,7 @@ class TestBenchServing(CustomTestCase):
                 f"### test_online_itl_default_tp_4\n"
                 f"median_itl_ms: {res['median_itl_ms']:.2f} ms\n"
             )
-            # self.assertLess(res["median_itl_ms"], 10)
+            self.assertLess(res["median_itl_ms"], 8)
 
     def test_moe_ttft_default(self):
         res = run_bench_serving(
@@ -456,7 +456,7 @@ class TestBenchServing(CustomTestCase):
                 f"### test_moe_online_ttft_default\n"
                 f"median_ttft_ms: {res['median_ttft_ms']:.2f} ms\n"
             )
-            # self.assertLess(res["median_ttft_ms"], 400)
+            self.assertLess(res["median_ttft_ms"], 106)
 
     def test_moe_itl_default(self):
         res = run_bench_serving(
@@ -497,7 +497,7 @@ class TestBenchServing(CustomTestCase):
                 f"### test_moe_online_itl_default\n"
                 f"median_itl_ms: {res['median_itl_ms']:.2f} ms\n"
             )
-            # self.assertLess(res["median_itl_ms"], 20)
+            self.assertLess(res["median_itl_ms"], 27)
 
 
 if __name__ == "__main__":
