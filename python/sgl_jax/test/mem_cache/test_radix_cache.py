@@ -527,16 +527,9 @@ class TestRadixCache(unittest.TestCase):
         match_result = cache.match_prefix(key)
         device_indices = match_result.device_indices
 
-        # check if the returned array is on CPU
-        self.assertTrue(hasattr(device_indices, "device"))
-        print(f"device_indices device: {device_indices.device}")
-
-        # verify device type (should be CPU)
-        if hasattr(device_indices, "device"):
-            device_str = str(device_indices.device)
-            self.assertIn("cpu", device_str.lower(), f"Expected CPU device, got: {device_str}")
-
-        # check array content correctness
+        # match_prefix now returns numpy arrays, verify shape and dtype directly
+        self.assertIsInstance(device_indices, np.ndarray)
+        self.assertEqual(device_indices.dtype, np.int32)
         self.assertEqual(len(device_indices), len(key))
 
         # convert to Python list and verify content
@@ -558,13 +551,9 @@ class TestRadixCache(unittest.TestCase):
         prefix_key = [1, 2]
         match_result = cache.match_prefix(prefix_key)
 
-        # verify device consistency
         device_indices = match_result.device_indices
-        if hasattr(device_indices, "device"):
-            device_str = str(device_indices.device)
-            self.assertIn("cpu", device_str.lower(), f"Expected CPU device, got: {device_str}")
-
-        # verify content
+        self.assertIsInstance(device_indices, np.ndarray)
+        self.assertEqual(device_indices.dtype, np.int32)
         self.assertEqual(len(device_indices), len(prefix_key))
         self.assertEqual(device_indices.tolist(), prefix_key)
 
@@ -578,29 +567,18 @@ class TestRadixCache(unittest.TestCase):
         match_result = cache.match_prefix(empty_key)
         device_indices = match_result.device_indices
 
-        # verify empty array is on the correct device
-        if hasattr(device_indices, "device"):
-            device_str = str(device_indices.device)
-            self.assertIn(
-                "cpu",
-                device_str.lower(),
-                f"Expected CPU device for empty array, got: {device_str}",
-            )
+        # verify empty array metadata
+        self.assertIsInstance(device_indices, np.ndarray)
+        self.assertEqual(device_indices.dtype, np.int32)
+        self.assertEqual(len(device_indices), 0)
 
         # test no match
         no_match_key = [999, 888, 777]
         match_result = cache.match_prefix(no_match_key)
         device_indices = match_result.device_indices
 
-        # verify no match result is on the correct device
-        if hasattr(device_indices, "device"):
-            device_str = str(device_indices.device)
-            self.assertIn(
-                "cpu",
-                device_str.lower(),
-                f"Expected CPU device for no-match array, got: {device_str}",
-            )
-
+        self.assertIsInstance(device_indices, np.ndarray)
+        self.assertEqual(device_indices.dtype, np.int32)
         self.assertEqual(len(device_indices), 0)
 
 
