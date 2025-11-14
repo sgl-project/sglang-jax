@@ -129,26 +129,3 @@ class TiktokenTokenizer:
         return {
             "input_ids": [self.encode(x) for x in text],
         }
-
-    def init_xgrammar(self):
-        from xgrammar import TokenizerInfo
-
-        XGRAMMAR_SPECIAL_TOKEN_TEMPLATE = "<|xg_special_token_{}|>"
-
-        enc = self.tokenizer
-        encoded_vocab = {**enc._mergeable_ranks, **enc._special_tokens}
-        encoded_vocab = [token for token, _ in sorted(encoded_vocab.items(), key=lambda x: x[1])]
-        override_stop_tokens = [2]  # eos
-        # These are treated as special tokens in xgrammar; we want to avoid them
-        # For now, xgrammar treats anything starting with b'\x00' as a special token
-        xgrammar_special_token_ids = []
-        for i, token in enumerate(encoded_vocab):
-            if isinstance(token, bytes) and token.startswith(b"\x00"):
-                xgrammar_special_token_ids.append(i)
-
-        for i, id in enumerate(xgrammar_special_token_ids):
-            encoded_vocab[id] = XGRAMMAR_SPECIAL_TOKEN_TEMPLATE.format(i)
-        tokenizer_info = TokenizerInfo(encoded_vocab, stop_token_ids=override_stop_tokens)
-        assert len(tokenizer_info.special_token_ids) == 0
-
-        return tokenizer_info, override_stop_tokens
