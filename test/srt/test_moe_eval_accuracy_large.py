@@ -6,8 +6,9 @@ python -m unittest test_moe_eval_accuracy_large.TestMoEEvalAccuracyLarge.test_mm
 import unittest
 from types import SimpleNamespace
 
+from run_eval import run_eval
+
 from sgl_jax.srt.utils import kill_process_tree
-from sgl_jax.test.run_eval import run_eval
 from sgl_jax.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
