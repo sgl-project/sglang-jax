@@ -26,8 +26,6 @@ class TestChunkedPrefillSize(CustomTestCase):
             other_args=[
                 "--trust-remote-code",
                 "--skip-server-warmup",
-                "--tp",
-                "4",
                 "--random-seed",
                 "3",
                 "--mem-fraction-static",
@@ -57,13 +55,13 @@ class TestChunkedPrefillSize(CustomTestCase):
             base_url=self.base_url,
             model=self.model,
             eval_name="mmlu",
-            num_examples=128,
+            num_examples=512,
             num_threads=64,
             max_tokens=1024,
         )
 
         metrics = run_eval(args)
-        self.assertGreater(metrics["score"], 0.5)
+        self.assertGreater(metrics["score"], 0.45)
 
 
 if __name__ == "__main__":

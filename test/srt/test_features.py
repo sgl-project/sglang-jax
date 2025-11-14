@@ -22,6 +22,7 @@ class TestFeatures(CustomTestCase):
     """
     Including:
     - BasicFeatures
+      - ChunkPrefillSize
       - PageSizeGreaterThanOne
     - Abort
     - Logprobs
@@ -47,7 +48,7 @@ class TestFeatures(CustomTestCase):
                 "--skip-server-warmup",
                 "--random-seed",
                 "3",
-                "--tp",
+                "--tp-size",
                 "4",
                 "--mem-fraction-static",
                 "0.65",
@@ -67,6 +68,8 @@ class TestFeatures(CustomTestCase):
                 "64",
                 "--max-running-requests",
                 "64",
+                "--chunked-prefill-size",
+                "8192",
             ],
             env={
                 "JAX_COMPILATION_CACHE_DIR": "/tmp/jax_compilation_cache",
