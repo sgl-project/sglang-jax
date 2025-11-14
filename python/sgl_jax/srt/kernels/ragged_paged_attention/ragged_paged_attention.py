@@ -313,7 +313,6 @@ def _ragged_paged_attention_kernel(
     m_ref,  # [actual_num_kv_heads, bq_sz * num_q_heads_per_kv_head, 128],
     acc_ref,  # [actual_num_kv_heads, bq_sz * num_q_heads_per_kv_head, head_dim],
     *,
-    causal: int,  # shape: (1,) 0: False, 1: True,
     sm_scale: float,
     sliding_window: int | None = None,
     soft_cap: float | None = None,
@@ -369,6 +368,8 @@ def _ragged_paged_attention_kernel(
             cp.start()
 
     def _fetch_mask(seq_idx, bq_idx, bkvmask_idx, bkvmask_sem_idx, *, wait=False):
+        if custom_mask_ref is None:
+            return
         sem = sems.at[4, bkvmask_sem_idx]
         kvmask_vmem_ref = bkvmask_ref.at[bkvmask_sem_idx]
 
@@ -725,8 +726,7 @@ def _ragged_paged_attention_kernel(
                     sem_ids_ref[1] = next_bkv_sem_idx
                     start_fetch_bkv(next_seq_idx, next_bkv_idx, next_bkv_sem_idx)
 
-                    @pl.when(causal == 0)
-                    def _():
+                    if custom_mask_ref is not None:
                         start_fetch_mask(next_seq_idx, next_bq_idx, next_bkv_idx, next_bkv_sem_idx)
 
                 # Wait for cur bq if not ready yet
@@ -737,9 +737,8 @@ def _ragged_paged_attention_kernel(
                 # Wait for cur bkv
                 offset, update_sz = wait_fetch_bkv(seq_idx, bkv_idx, bkv_sem_idx)
 
-                # Wait for kv mask if not use causal mask
-                @pl.when(causal == 0)
-                def _():
+                # Wait for kv mask if use custom mask
+                if custom_mask_ref is not None:
                     wait_fetch_mask(seq_idx, bq_idx, bkv_idx, bkv_sem_idx)
 
                 # Start updating bkv to kv cache if applicable.
@@ -789,23 +788,27 @@ def _ragged_paged_attention_kernel(
 
                     return q_batch, None
 
-                def load_mask():
-                    mask = bkvmask_ref[bkv_sem_idx, :actual_bq_sz, :, 0]
-                    num_q_heads_per_kv_head_mask = jnp.repeat(mask, num_q_heads_per_kv_head, axis=0)
-                    num_kv_heads_mask = jnp.concat(
-                        [
-                            num_q_heads_per_kv_head_mask.reshape(
-                                1, *num_q_heads_per_kv_head_mask.shape
-                            )
-                        ]
-                        * actual_num_kv_heads
-                    )
-                    return num_kv_heads_mask != 1
+                def load_mask(q_span, k_span):
+                    if bkvmask_ref is None:
+                        return q_span < k_span
+                    else:
+                        mask = bkvmask_ref[bkv_sem_idx, :actual_bq_sz, :, 0]
+                        num_q_heads_per_kv_head_mask = jnp.repeat(
+                            mask, num_q_heads_per_kv_head, axis=0
+                        )
+                        num_kv_heads_mask = jnp.concat(
+                            [
+                                num_q_heads_per_kv_head_mask.reshape(
+                                    1, *num_q_heads_per_kv_head_mask.shape
+                                )
+                            ]
+                            * actual_num_kv_heads
+                        )
+                        return num_kv_heads_mask != 1
 
                 # Load batched data
                 k_batch, v_batch = batch_load_all_heads_kv()
                 q_batch, offs_qidx_batch = batch_prepare_queries()
-                custom_mask = load_mask()
 
                 def flash_attention(q_batch, k_batch, v_batch):
                     q_batch_f32 = q_batch.astype(jnp.float32)
@@ -838,11 +841,7 @@ def _ragged_paged_attention_kernel(
                     )
                     k_span = bkv_idx * bkv_sz + lax.broadcasted_iota(jnp.int32, s.shape, 2)
                     # convert custom_mask from int32 to bool
-                    mask = lax.select(
-                        causal == 0,
-                        custom_mask,
-                        q_span < k_span,
-                    )
+                    mask = load_mask(q_span, k_span)
 
                     if sliding_window is not None:
                         mask = jnp.logical_or(mask, q_span - sliding_window >= k_span)
@@ -936,8 +935,7 @@ def _ragged_paged_attention_kernel(
         start_fetch_bq(0, 0, 0)
         start_fetch_bkv(0, 0, 0)
 
-        @pl.when(causal == 0)
-        def _():
+        if custom_mask_ref is not None:
             start_fetch_mask(0, 0, 0, 0)
 
     @pl.when(seq_idx < decode_end)
@@ -1384,11 +1382,7 @@ def ragged_paged_attention(
     q_lens = cu_q_lens[1:] - cu_q_lens[:-1]
     seq_mask_lens = kv_lens * q_lens
     cu_seq_mask_lens = jnp.concatenate([jnp.array([0], dtype=jnp.int32), jnp.cumsum(seq_mask_lens)])
-    if custom_mask is None:
-        # fix bug: XLA layout ({0}) does not match Mosaic layout ({0:T(128)}) for an operand of shape s32[0]
-        custom_mask = jnp.empty((1, 128), dtype=jnp.int32)
-
-    else:
+    if custom_mask is not None:
         assert (
             custom_mask.dtype != jnp.bool
         ), "custom_mask bool dtype is not supported, use int32 instead. 0: False, 1: True"
@@ -1401,7 +1395,7 @@ def ragged_paged_attention(
         pl.BlockSpec(memory_space=pltpu.ANY),  # q
         pl.BlockSpec(memory_space=pltpu.ANY),  # kv_fused
         pl.BlockSpec(memory_space=pltpu.ANY),  # kv_cache_fused
-        pl.BlockSpec(memory_space=pltpu.ANY),  # custom_mask
+        pl.BlockSpec(memory_space=pltpu.ANY) if custom_mask is not None else None,  # custom_mask
         pl.BlockSpec(memory_space=pltpu.ANY),  # zero mask
     ]
 
@@ -1415,10 +1409,14 @@ def ragged_paged_attention(
         kv_cache_fused_processed.dtype,
     )
 
-    bkvmask_double_buf = pltpu.VMEM(
-        (2, bq_sz, bkv_sz, head_dim),
-        jnp.int32,
-    )
+    if causal == 1:
+        # we don't need bkvmask_double_buf
+        bkvmask_double_buf = None
+    else:
+        bkvmask_double_buf = pltpu.VMEM(
+            (2, bq_sz, bkv_sz, head_dim),
+            jnp.int32,
+        )
 
     bq_double_buf = pltpu.VMEM(
         (2, actual_num_kv_heads, bq_sz, *q.shape[2:]),
@@ -1471,7 +1469,6 @@ def ragged_paged_attention(
         pl.pallas_call(
             functools.partial(
                 _ragged_paged_attention_kernel,
-                causal=causal,
                 sm_scale=sm_scale,
                 sliding_window=sliding_window,
                 soft_cap=soft_cap,
