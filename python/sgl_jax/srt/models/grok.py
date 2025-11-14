@@ -142,15 +142,6 @@ class ScalingRotaryEmbedding(RotaryEmbedding):
             raise ValueError(f"Unknown extrapolation method: {self.extra_method}")
         return inv_freq
 
-    def _compute_cos_sin_cache(self) -> jax.Array:
-        inv_freq = self._compute_inv_freq(self.scaling_factor)
-        t = jnp.arange(self.max_position_embeddings * self.scaling_factor, dtype=jnp.float32)
-        freqs = jnp.einsum("i,j -> ij", t, inv_freq)
-        cos = jnp.cos(freqs)
-        sin = jnp.sin(freqs)
-        cache = jnp.concatenate((cos, sin), axis=-1)
-        return cache
-
 
 class Grok1MLP(nnx.Module):
     """Standard MLP layer for Grok-1 model."""
@@ -425,7 +416,6 @@ class Grok1Attention(nnx.Module):
             )
 
         logit_cap = max(getattr(config, "attn_logit_softcapping", 30.0), 0.0)
-        # logit_capping_method = getattr(config, "attn_logit_softcapping_method", "tanh")
 
         self.attn = RadixAttention(
             num_heads=self.num_heads,
