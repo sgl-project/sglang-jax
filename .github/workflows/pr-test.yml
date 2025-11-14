@@ -153,18 +153,17 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-      - name: Setup environment
-        run: |
-          uv venv --python 3.12
-          source .venv/bin/activate
-          uv pip install -e "python[all]"
-          bash scripts/killall_sglang.sh
 
       - name: Evaluate accuracy
         timeout-minutes: 20
         env:
           SGLANG_JAX_IS_IN_CI: true
         run: |
+          python3.12 -m venv .venv
+          source .venv/bin/activate
+          pip install uv
+          uv pip install -e "python[all]"
+          bash scripts/killall_sglang.sh
           python test/srt/run_suite.py --suite accuracy-test-tpu-v6e-1 --auto-partition-id ${{ matrix.part }} --auto-partition-size 1
 
   accurancy-test-4-tpu:
@@ -180,18 +179,16 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Setup environment
-        run: |
-          uv venv --python 3.12
-          source .venv/bin/activate
-          uv pip install -e "python[all]"
-          bash scripts/killall_sglang.sh
-
       - name: Evaluate MoE accuracy (TP=4)
         timeout-minutes: 50
         env:
           SGLANG_JAX_IS_IN_CI: true
         run: |
+          python3.12 -m venv .venv
+          source .venv/bin/activate
+          pip install uv
+          uv pip install -e "python[all]"
+          bash scripts/killall_sglang.sh
           python test/srt/run_suite.py --suite accuracy-test-tpu-v6e-4 --timeout-per-file 3000 --auto-partition-id ${{ matrix.part }} --auto-partition-size 1
 
   # =============================================== performance-test ===============================================
@@ -208,18 +205,16 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Setup environment
-        run: |
-          uv venv --python 3.12
-          source .venv/bin/activate
-          uv pip install -e "python[all]"
-          bash scripts/killall_sglang.sh
-
       - name: Benchmark performance
         timeout-minutes: 30
         env:
           SGLANG_JAX_IS_IN_CI: true
         run: |
+          python3.12 -m venv .venv
+          source .venv/bin/activate
+          pip install uv
+          uv pip install -e "python[all]"
+          bash scripts/killall_sglang.sh
           python test/srt/run_suite.py --suite performance-test-tpu-v6e-1 --auto-partition-id ${{ matrix.part }} --auto-partition-size 1
 
   performance-test-4-tpu:
@@ -235,19 +230,17 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Setup environment
-        run: |
-          uv venv --python 3.12
-          source .venv/bin/activate
-          uv pip install -e "python[all]"
-          bash scripts/killall_sglang.sh
-
       - name: Benchmark performance (tp=4)
         timeout-minutes: 50
 
         env:
           SGLANG_JAX_IS_IN_CI: true
         run: |
+          python3.12 -m venv .venv
+          source .venv/bin/activate
+          pip install uv
+          uv pip install -e "python[all]"
+          bash scripts/killall_sglang.sh
           python test/srt/run_suite.py --suite performance-test-tpu-v6e-4 --auto-partition-id ${{ matrix.part }} --auto-partition-size 2 --timeout-per-file 3000
 
   # =============================================== kernel-benchmark ===============================================
