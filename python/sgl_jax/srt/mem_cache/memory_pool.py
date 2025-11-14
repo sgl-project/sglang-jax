@@ -23,8 +23,8 @@ def merge_kv(k: jax.Array, v: jax.Array) -> jax.Array:
 
     num_tokens, num_kv_heads, head_dim = k.shape
 
-    kv_concat = jnp.concatenate([k, v], axis=-1)  # [tokens, heads, head_dim*2]
-    kv_fused = kv_concat.reshape(num_tokens, num_kv_heads * 2, head_dim)
+    kv_stacked = jnp.stack([k, v], axis=2)  # [tokens, heads, 2, head_dim]
+    kv_fused = kv_stacked.reshape(num_tokens, num_kv_heads * 2, head_dim)
 
     return kv_fused
 
