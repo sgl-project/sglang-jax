@@ -772,8 +772,6 @@ class Grok1ForCausalLM(nnx.Module):
         )
         output = self.logits_processor(hidden_states, self.lm_head, logits_metadata)
 
-        # Return values consistent with other models: (output, layers_kv_fused, layers_callback_flag)
-        # Grok model does not expose per-layer KV tensors here, so return an empty list and True flag.
         return output, layers_kv_fused, True
 
     def load_weights(self, model_config: ModelConfig, rng_key: jax.Array):
@@ -788,7 +786,7 @@ class Grok1ForCausalLM(nnx.Module):
 
         weight_mappings = self._create_grok_weight_mappings()
 
-        loader.load_weights_from_safetensors(weight_mappings)
+        loader.load_weights_from_safetensors(weight_mappings, safetensors_partition=8)
         logger.info("Grok weights loaded successfully!")
 
     def _create_grok_weight_mappings(self):

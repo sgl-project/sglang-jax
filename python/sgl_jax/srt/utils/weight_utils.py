@@ -98,7 +98,9 @@ class WeightLoader:
             self.moe_abstract_mesh = None
 
     def load_weights_from_safetensors(
-        self, weight_mappings: dict[str, str | list[str] | WeightMapping]
+        self,
+        weight_mappings: dict[str, str | list[str] | WeightMapping],
+        safetensors_partition=1,
     ):
         params = nnx.state(self.model)
 
@@ -151,8 +153,10 @@ class WeightLoader:
                             # Auto-detect TP sharding:
                             # - Grok-2: concat_axis is set, needs multiple shards (e.g., 8)
                             if mapping.concat_axis is not None:
-                                # TP-sharded weights: need multiple shards to concatenate
-                                if shard_counts[0] < 2:
+                                # TP-sharded weights: need to collect all TP shards
+                                # Expected number of shards = total model files / experts per file
+                                if shard_counts[0] < safetensors_partition:
+                                    # Still collecting shards, wait for more
                                     continue
                             else:
                                 # Non-TP-sharded weights: expect exactly 1 copy per expert

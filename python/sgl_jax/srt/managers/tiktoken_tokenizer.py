@@ -129,3 +129,31 @@ class TiktokenTokenizer:
         return {
             "input_ids": [self.encode(x) for x in text],
         }
+
+    @property
+    def all_special_tokens(self) -> list[str]:
+        """
+        `list[str]`: List all special tokens in the tokenizer.
+        """
+        return list(self.tokenizer._special_tokens.keys())
+
+    def convert_tokens_to_ids(self, tokens: list[str]) -> list[int]:
+        """
+        Convert a list of tokens to token IDs.
+
+        Args:
+            tokens: List of tokens to convert
+
+        Returns:
+            List of token IDs
+        """
+        return [self.tokenizer._special_tokens.get(token, -1) for token in tokens]
+
+    @property
+    def all_special_ids(self) -> list[int]:
+        """
+        `list[int]`: List the ids of the special tokens(`'<unk>'`, `'<cls>'`, etc.) mapped to class attributes.
+        """
+        all_toks = self.all_special_tokens
+        all_ids = self.convert_tokens_to_ids(all_toks)
+        return all_ids
