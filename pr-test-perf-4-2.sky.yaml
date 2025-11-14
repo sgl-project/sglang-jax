@@ -1,6 +1,6 @@
 # sglang-jax.sky.yaml
 resources:
-  accelerators: tpu-v6e-1
+  accelerators: tpu-v6e-4
   accelerator_args:
     tpu_vm: True
     runtime_version: v2-alpha-tpuv6e
@@ -12,4 +12,4 @@ run: |
   uv venv --python 3.12
   source .venv/bin/activate
   uv pip install -e "python[all]"
-  python test/srt/run_suite.py --suite accuracy-test-tpu-v6e-1
+  python test/srt/run_suite.py --suite performance-test-tpu-v6e-4 --auto-partition-id 0 --auto-partition-size 2

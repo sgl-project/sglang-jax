@@ -12,5 +12,4 @@ run: |
   uv venv --python 3.12
   source .venv/bin/activate
   uv pip install -e "python[all]"
-  cd test/srt
-  uv run python -m unittest test_moe_eval_accuracy_large.TestMoEEvalAccuracyLarge.test_mmlu
+  python test/srt/run_suite.py --suite accuracy-test-tpu-v6e-4 --timeout-per-file 3600

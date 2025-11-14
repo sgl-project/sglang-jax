@@ -8,8 +8,7 @@ import time
 import unittest
 from types import SimpleNamespace
 
-from run_eval import run_eval
-
+from sgl_jax.test.run_eval import run_eval
 from sgl_jax.srt.utils import kill_process_tree
 from sgl_jax.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,

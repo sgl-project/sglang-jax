@@ -12,8 +12,4 @@ run: |
   uv venv --python 3.12
   source .venv/bin/activate
   uv pip install -e "python[all]"
-  cd test/srt
-  python3 -m unittest test_bench_serving.TestBenchServing.test_moe_ttft_default
-  python3 -m unittest test_bench_serving.TestBenchServing.test_moe_itl_default
-  python3 -m unittest test_bench_serving.TestBenchServing.test_moe_input_throughput_default
-  python3 -m unittest test_bench_serving.TestBenchServing.test_moe_output_throughput_default
+  python test/srt/run_suite.py --suite performance-test-tpu-v6e-4 --auto-partition-id 1 --auto-partition-size 2

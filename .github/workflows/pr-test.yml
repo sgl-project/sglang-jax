@@ -165,8 +165,7 @@ jobs:
       - name: Evaluate accuracy
         timeout-minutes: 20
         run: |
-          cd test/srt
-          uv run python -m unittest test_eval_accuracy_large.TestEvalAccuracyLarge.test_mmlu
+          python test/srt/run_suite.py --suite accuracy-test-tpu-v6e-1
       # TODO: please rename when implement acc test
       # - name: Mock
       #   env:
@@ -198,11 +197,10 @@ jobs:
           uv pip install -e "python[all]"
           bash scripts/killall_sglang.sh
 
-      - name: Evaluate accuracy (TP=2)
-        timeout-minutes: 20
+      - name: Evaluate MoE accuracy (TP=4)
+        timeout-minutes: 50
         run: |
-          cd test/srt
-          uv run python -m unittest test_moe_eval_accuracy_large.TestMoEEvalAccuracyLarge.test_mmlu
+          python test/srt/run_suite.py --suite accuracy-test-tpu-v6e-4 --timeout-per-file 3000
 
   # =============================================== performance-test ===============================================
   performance-test-1-tpu:
@@ -232,37 +230,12 @@ jobs:
           uv pip install -e "python[all]"
           bash scripts/killall_sglang.sh
 
-      - name: Benchmark single req ttft on server
-        timeout-minutes: 10
+      - name: Benchmark performance
+        timeout-minutes: 30
         env:
           SGLANG_JAX_IS_IN_CI: true
         run: |
-          cd test/srt
-          python3 -m unittest test_bench_serving.TestBenchServing.test_ttft_default
-
-      - name: Benchmark single itl on server
-        timeout-minutes: 10
-        env:
-          SGLANG_JAX_IS_IN_CI: true
-        run: |
-          cd test/srt
-          python3 -m unittest test_bench_serving.TestBenchServing.test_itl_default
-
-      - name: Benchmark 500 reqs input throughput
-        timeout-minutes: 10
-        env:
-          SGLANG_JAX_IS_IN_CI: true
-        run: |
-          cd test/srt
-          python3 -m unittest test_bench_serving.TestBenchServing.test_input_throughput_default
-
-      - name: Benchmark 500 reqs output throughput
-        timeout-minutes: 10
-        env:
-          SGLANG_JAX_IS_IN_CI: true
-        run: |
-          cd test/srt
-          python3 -m unittest test_bench_serving.TestBenchServing.test_output_throughput_default
+          python test/srt/run_suite.py --suite performance-test-tpu-v6e-1
       # - name: Checkout code
       #   uses: actions/checkout@v4
       # - name: Setup environment
@@ -313,10 +286,10 @@ jobs:
     if: github.event.pull_request.draft == false && needs.check-changes.outputs.main_package == 'true'
     #runs-on: arc-runner-v6e-1
     runs-on: ubuntu-slim
-    # strategy:
-    #   fail-fast: false
-    #   matrix:
-    #     part: [0, 1]
+    strategy:
+      fail-fast: false
+      matrix:
+        part: [0, 1]
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -328,41 +301,13 @@ jobs:
           uv pip install -e "python[all]"
           bash scripts/killall_sglang.sh
 
-      - name: Benchmark single req ttft on server (tp=4)
-        timeout-minutes: 10
+      - name: Benchmark performance (tp=4)
+        timeout-minutes: 30
 
         env:
           SGLANG_JAX_IS_IN_CI: true
         run: |
-          cd test/srt
-          python3 -m unittest test_bench_serving.TestBenchServing.test_moe_ttft_default
-
-      - name: Benchmark single itl on server (tp=4)
-        timeout-minutes: 10
-
-        env:
-          SGLANG_JAX_IS_IN_CI: true
-        run: |
-          cd test/srt
-          python3 -m unittest test_bench_serving.TestBenchServing.test_moe_itl_default
-
-      - name: Benchmark 500 reqs input throughput (tp=4)
-        timeout-minutes: 10
-
-        env:
-          SGLANG_JAX_IS_IN_CI: true
-        run: |
-          cd test/srt
-          python3 -m unittest test_bench_serving.TestBenchServing.test_moe_input_throughput_default
-
-      - name: Benchmark 500 reqs output throughput (tp=4)
-        timeout-minutes: 10
-
-        env:
-          SGLANG_JAX_IS_IN_CI: true
-        run: |
-          cd test/srt
-          python3 -m unittest test_bench_serving.TestBenchServing.test_moe_output_throughput_default
+          python test/srt/run_suite.py --suite performance-test-tpu-v6e-4 --auto-partition-id ${{ matrix.part }} --auto-partition-size 2
 
       # TODO: please rename when implement performance test
       # - name: Mock
