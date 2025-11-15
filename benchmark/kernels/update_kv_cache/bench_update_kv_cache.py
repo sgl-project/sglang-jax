@@ -7,10 +7,8 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 from utils import create_bench_data, create_input_params
 
-from sgl_jax.srt.kernels.update_kv_cache.tuned_block_sizes import (
-    get_best_num_slices_per_block,
-)
 from sgl_jax.srt.kernels.update_kv_cache.update_kv_cache import (
+    get_num_slices_per_block,
     get_slot_mapping,
     kv_cache_update_kernel,
 )
@@ -133,9 +131,7 @@ def full_benchmark():
             head_num,
             head_dim,
         )
-        max_num_slices_per_block_config = get_best_num_slices_per_block(
-            head_num, max_cache_len, new_value_len, head_dim, page_size
-        )
+        max_num_slices_per_block_config = get_num_slices_per_block(new_value, cache, page_size)
         random_cache_loc, slice_lens, new_value_start_loc, update_slices_num = create_input_params(
             max_cache_len, new_value_len, page_size=page_size
         )

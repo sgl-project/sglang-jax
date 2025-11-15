@@ -194,6 +194,9 @@ def kv_cache_update(
                 grid=(cdiv(num_kv_update_slices[0], num_slices_per_block),),
                 scratch_shapes=scratch_shapes,
             ),
+            compiler_params=pltpu.CompilerParams(
+                vmem_limit_bytes=VMEM_SIZE,
+            ),
             out_shape=out_shape,
             input_output_aliases={len(scalar_prefetches) + 1: 0},
         )
