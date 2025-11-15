@@ -40,6 +40,8 @@ class TestChunkedPrefillSize(CustomTestCase):
                 "256",
                 "--chunked-prefill-size",
                 "2048",
+                "--page-size",
+                "128",
                 "--disable-radix-cache",
                 "--enable-mixed-chunk",
             ],
