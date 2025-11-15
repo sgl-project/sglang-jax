@@ -67,6 +67,9 @@ else
     CLUSTER_NAME="sgl-jax-$ACCELERATOR-$SANITIZED_REF-$RANDOM"
 fi
 
+# Save cluster name to file for other scripts to use
+echo "$CLUSTER_NAME" > "${SCRIPT_DIR}/../.cluster_name"
+
 # Execute sky launch command
 echo ""
 echo "Executing command with:"
