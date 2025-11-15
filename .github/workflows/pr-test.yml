@@ -60,6 +60,7 @@ jobs:
               - ".github/workflows/pr-test.yml"
             pallas_kernel:
               - "python/sgl_jax/kernels/**"
+              - "benchmark/kernels/**"
               - ".github/workflows/pr-test.yml"
   # =============================================== unit-test ====================================================
   unit-test-1-tpu:
