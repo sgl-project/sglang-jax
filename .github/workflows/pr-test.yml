@@ -66,19 +66,26 @@ jobs:
   unit-test-1-tpu:
     needs: [check-changes]
     if: github.event.pull_request.draft == false && needs.check-changes.outputs.main_package == 'true'
-    #runs-on: arc-runner-v6e-1
-    runs-on: ubuntu-slim
+    runs-on: arc-runner-v6e-1
+    #runs-on: ubuntu-slim
     strategy:
       fail-fast: false
       matrix:
         part: [0, 1]
     steps:
-      # TODO: please rename when implement unit test
-      - name: Mock
+      - name: Checkout code
+        uses: actions/checkout@v5
+      - name: Run unit test
         timeout-minutes: 30
+        shell: bash
         env:
           SGLANG_JAX_IS_IN_CI: true
-        run: echo ${{ matrix.part }}
+        run: |
+          python3.12 -m venv .venv
+          source .venv/bin/activate
+          pip install uv
+          uv pip install -e "python[all]"
+          python test/srt/run_suite.py --suite unit-test-tpu-v6e-1 --auto-partition-id ${{ matrix.part }} --auto-partition-size 2
 
   unit-test-4-tpu:
     needs: [check-changes]

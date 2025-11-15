@@ -157,6 +157,15 @@ def run_unittest_files(files: List[TestFile], timeout_per_file: float):
 suites = {
     "nightly": [],
     "sglang_dependency_test": [],
+    "unit-test-tpu-v6e-1": [
+        TestFile("python/sgl_jax/test/test_flashattention.py", 20),
+        TestFile("python/sgl_jax/test/test_moe_topk.py", 1),
+        TestFile("python/sgl_jax/test/test_sampler.py", 0.2),
+        TestFile("python/sgl_jax/test/test_utils.py", 0.2),
+        TestFile("python/sgl_jax/test/mem_cache/test_kv_cache.py", 20),
+        TestFile("python/sgl_jax/test/mem_cache/test_radix_cache.py", 0.2),
+        TestFile("python/sgl_jax/test/mem_cache/test_swa_radix_cache.py", 0.2),
+    ],
     "kernel-performance-test-tpu-v6e-1": [
         TestFile("benchmark/kernels/flash_attention/bench_flashattention.py", 5),
         TestFile("benchmark/kernels/megablox_gmm/bench_megablox_gmm.py", 2),
