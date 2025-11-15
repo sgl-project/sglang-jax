@@ -9,10 +9,8 @@ from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 from jax.tree_util import register_pytree_node_class
 
-from sgl_jax.srt.kernels.update_kv_cache.tuned_block_sizes import (
-    get_best_num_slices_per_block,
-)
 from sgl_jax.srt.kernels.update_kv_cache.update_kv_cache import (
+    get_num_slices_per_block,
     get_slot_mapping,
     kv_cache_update,
 )
@@ -696,11 +694,9 @@ def update_kv_cache_vectorized(
     num_slices = total_tokens
 
     # head_num, cache_len, new_kv_len, head_dim, page_size
-    num_slices_per_block = get_best_num_slices_per_block(
-        k.shape[1],
-        k_cache.shape[0],
-        k.shape[0],
-        k.shape[2],
+    num_slices_per_block = get_num_slices_per_block(
+        k,
+        k_cache,
         page_size,
     )
 
@@ -757,11 +753,9 @@ def update_fused_kv_cache_vectorized(
     num_slices = total_tokens
 
     # head_num, cache_len, new_kv_len, head_dim (fused), page_size
-    num_slices_per_block = get_best_num_slices_per_block(
-        fused_kv.shape[1],  # num_kv_heads
-        kv_cache.shape[0],
-        fused_kv.shape[0],
-        fused_kv.shape[2],  # head_dim (after interleaving)
+    num_slices_per_block = get_num_slices_per_block(
+        fused_kv,  # num_kv_heads
+        kv_cache,
         page_size,
     )
 
