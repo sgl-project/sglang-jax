@@ -281,7 +281,15 @@ class TestAttention(CustomTestCase):
         self.rng_key = jax.random.PRNGKey(42)
         np.random.seed(42)
 
-    def run_test(self, mode, lens, mode_args, sliding_window=None, logit_cap=None):
+    def run_test(
+        self,
+        mode,
+        lens,
+        mode_args,
+        max_total_token_size=710016,
+        sliding_window=None,
+        logit_cap=None,
+    ):
         # Create mock forward_batch
         num_heads, head_dim, num_kv_heads, page_size, dtype = mode_args
 
@@ -299,6 +307,7 @@ class TestAttention(CustomTestCase):
                 "num_hidden_layers": 1,
                 "bf16": is_bf16,
             },
+            max_total_token_size=max_total_token_size,
         )
 
         # Debug cache mapping
@@ -595,9 +604,10 @@ class TestAttention(CustomTestCase):
         self.run_test(
             "prefill",
             lens,
-            (num_heads, head_dim, num_kv_heads, 64, jnp.bfloat16),
+            (num_heads, head_dim, num_kv_heads, 1, jnp.bfloat16),
             sliding_window=sliding_window_size,
             logit_cap=logit_cap,
+            max_total_token_size=200000,
         )
 
     def test_sliding_window_and_soft_cap_decode_accuracy(self):
@@ -619,9 +629,10 @@ class TestAttention(CustomTestCase):
         self.run_test(
             "decode",
             lens,
-            (num_heads, head_dim, num_kv_heads, 64, jnp.bfloat16),
+            (num_heads, head_dim, num_kv_heads, 1, jnp.bfloat16),
             sliding_window=sliding_window_size,
             logit_cap=logit_cap,
+            max_total_token_size=200000,
         )
 
 
