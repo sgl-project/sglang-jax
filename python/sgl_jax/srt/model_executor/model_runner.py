@@ -436,7 +436,6 @@ class ModelRunner:
 
         with jtu.count_pjit_cpp_cache_miss() as count:
             output, layers_kv_fused, _ = self.jitted_run_model(forward_batch, logits_metadata)
-
             cache_miss_count = count()
         self._set_kv_cache_after_forward(layers_kv_fused)
 

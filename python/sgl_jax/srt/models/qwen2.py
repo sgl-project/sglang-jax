@@ -170,6 +170,7 @@ class Qwen2Attention(nnx.Module):
 
         q, k = self.rotary_emb(positions, q, k)
         attn_output, kv_fused = self.attn(q, k, v, forward_batch, token_to_kv_pool)
+
         output, _ = self.o_proj(attn_output)
         return output, kv_fused
 
