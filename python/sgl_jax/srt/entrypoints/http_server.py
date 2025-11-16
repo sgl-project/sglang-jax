@@ -350,9 +350,16 @@ async def classify_request(obj: EmbeddingReqInput, request: Request):
 async def flush_cache():
     """Flush the radix cache."""
     ret = await _global_state.tokenizer_manager.flush_cache()
+    content = (
+        "Cache flushed.\nPlease check backend logs for more details. "
+        "(When there are running or waiting requests, the operation will not be performed.)\n"
+    )
+    if ret.success and ret.flushed_items:
+        content += f"Flushed items: {ret.flushed_items}\n"
+    elif not ret.success and ret.error_msg:
+        content += f"Reason: {ret.error_msg}\n"
     return Response(
-        content="Cache flushed.\nPlease check backend logs for more details. "
-        "(When there are running or waiting requests, the operation will not be performed.)\n",
+        content=content,
         status_code=200 if ret.success else HTTPStatus.BAD_REQUEST,
     )
 
