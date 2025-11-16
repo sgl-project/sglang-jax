@@ -182,8 +182,7 @@ def forward_attention(
     """
 
     cache_size = k_cache.shape[0]
-    is_valid = (loc >= 0) & (loc < cache_size)
-    safe_loc = jnp.where(is_valid, loc, cache_size)
+    safe_loc = jnp.where(loc > 0, loc, cache_size)
     k_cache = k_cache.at[safe_loc].get(out_sharding=kv_sharding, mode="fill", fill_value=0)
     v_cache = v_cache.at[safe_loc].get(out_sharding=kv_sharding, mode="fill", fill_value=0)
 
