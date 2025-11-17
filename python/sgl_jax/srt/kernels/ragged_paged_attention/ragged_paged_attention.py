@@ -162,11 +162,14 @@ def ref_ragged_paged_attention(
         # xai_temperature_scale: ref implementation from sgl-project/sglang
         # python/sglang/srt/layers/attention/triton_ops/decode_attention.py
         if xai_temperature_len is not None:
+            # FIXED: Calculate `qidx` based on the sequence's own length, not global batch indices.
+            prefix_len = kv_len - q_len
+            qidx = jnp.arange(prefix_len, kv_len)
+
             xai_temperature_scale = 1.0 / jnp.log2(float(xai_temperature_len))
-            qidx = jnp.arange(q_start, q_end) - 1
             _qtemp = jnp.log2(qidx.astype(jnp.float32)) * xai_temperature_scale
             xai_temperature_reg = jnp.where(qidx > xai_temperature_len, _qtemp, 1.0)
-            attn = attn * xai_temperature_reg[:, None]
+            attn = attn * xai_temperature_reg[None, :, None]
 
         attn += jnp.where(mask, mask_value, 0.0)
         attn = jax.nn.softmax(attn, axis=-1).astype(v.dtype)
