@@ -63,6 +63,8 @@ class TestBenchServing(CustomTestCase):
     def test_input_throughput_default(self):
         args = get_benchmark_args(
             base_url=self.base_url,
+            dataset_name="random",
+            device="tpu",
             num_prompts=500,
             request_rate=float("inf"),
             random_input_len=1024,
@@ -86,6 +88,8 @@ class TestBenchServing(CustomTestCase):
     def test_output_throughput_default(self):
         args = get_benchmark_args(
             base_url=self.base_url,
+            dataset_name="random",
+            device="tpu",
             num_prompts=500,
             request_rate=float("inf"),
             random_input_len=1,
@@ -106,6 +110,8 @@ class TestBenchServing(CustomTestCase):
     def test_ttft_default(self):
         args = get_benchmark_args(
             base_url=self.base_url,
+            dataset_name="random",
+            device="tpu",
             num_prompts=1,
             request_rate=float("inf"),
             random_input_len=1024,
@@ -126,6 +132,8 @@ class TestBenchServing(CustomTestCase):
     def test_itl_default(self):
         args = get_benchmark_args(
             base_url=self.base_url,
+            dataset_name="random",
+            device="tpu",
             num_prompts=1,
             request_rate=float("inf"),
             random_input_len=1024,
