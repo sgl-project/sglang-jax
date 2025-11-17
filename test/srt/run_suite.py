@@ -183,11 +183,11 @@ suites = {
     "performance-test-tpu-v6e-4": [
         TestFile(
             "test/srt/test_bench_serving_dense_tp_4.py",
-            13,
+            4,
         ),
         TestFile(
             "test/srt/test_bench_serving_moe.py",
-            35,
+            13,
         ),
     ],
     "e2e-test-tpu-v6e-1": [
