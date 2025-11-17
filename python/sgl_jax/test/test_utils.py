@@ -383,7 +383,7 @@ def get_benchmark_args(
     base_url="",
     dataset_name="",
     dataset_path="",
-    tokenizer="",
+    tokenizer=None,
     num_prompts=500,
     sharegpt_output_len=None,
     random_input_len=4096,
