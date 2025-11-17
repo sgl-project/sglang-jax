@@ -95,7 +95,7 @@ class JAXModelLoader(BaseModelLoader):
                 lambda: model_class(model_config.hf_config, model_config.dtype, self.rng, self.mesh)
             )
 
-        model.load_weights(model_config, self.rng.default.key.value)
+        model.load_weights(model_config, None if self.rng is None else self.rng.default.key.value)
         return model
 
     def _maybe_download_from_modelscope(self, model: str, revision: str | None) -> str | None:
@@ -267,7 +267,6 @@ def get_model_loader(
     load_config: LoadConfig, rngs: jax.Array, mesh: jax.sharding.Mesh
 ) -> BaseModelLoader:
     """Get a model loader based on the load format."""
-
     if isinstance(load_config.load_format, type):
         return load_config.load_format(load_config)
 

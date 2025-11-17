@@ -48,6 +48,7 @@ class RadixAttention(nnx.Module):
         self.sliding_window_size = sliding_window_size or None
         self.logit_cap = logit_cap or None
         self.attn_type = attn_type
+        self.xai_temperature_len = -1
 
     def __call__(
         self,
