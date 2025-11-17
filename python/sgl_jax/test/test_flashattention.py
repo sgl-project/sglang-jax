@@ -17,7 +17,8 @@ from sgl_jax.srt.utils.mesh_utils import create_device_mesh
 from sgl_jax.test.test_utils import CustomTestCase
 
 mesh = create_device_mesh(
-    ici_parallelism=[1, -1], dcn_parallelism=[1, 1], use_explicit_sharding=False
+    ici_parallelism=[1, -1],
+    dcn_parallelism=[1, 1],
 )
 jax.sharding.set_mesh(mesh)
 
