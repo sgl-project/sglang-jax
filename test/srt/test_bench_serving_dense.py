@@ -71,6 +71,9 @@ class TestBenchServing(CustomTestCase):
             random_range_ratio=1,
         )
         res = run_benchmark(args)
+        print(f"DEBUG: completed={res.get('completed')}, errors={res.get('errors', [])[:5]}")
+
+        assert res["completed"] == 500, f"Only {res['completed']}/500 completed"
         assert res["completed"] == 500
 
         if is_in_ci():
