@@ -424,7 +424,12 @@ class ConfigureLoggingReq(RpcReqInput):
 class FlushCacheReqInput(RpcReqInput):
     """Request to flush cache."""
 
+    request_id: str = ""
     cache_type: str = "all"
+
+    def __post_init__(self):
+        if not self.request_id:
+            self.request_id = f"flush_cache_{int(time.time())}"
 
 
 # Internal state classes
