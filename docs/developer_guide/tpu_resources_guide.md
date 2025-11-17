@@ -30,17 +30,17 @@ setup: |
 
 ## Scenarios
 
-### Start the developer computer 
+### Start the developer computer
 - `--use-spot` Use preemptible instances
 - `-i 15`: Automatically stops after 15 minutes of inactivity, can be modified by yourself, but is required to be filled in
 - `--down`: Directly destroy the server when stopped
 
-If an error occurs during the creation process, you can directly check the status by viewing the developer computer below. Usually, it has already been created. If you encounter the issue of duplicate creation, you need to manage it manually. 
+If an error occurs during the creation process, you can directly check the status by viewing the developer computer below. Usually, it has already been created. If you encounter the issue of duplicate creation, you need to manage it manually.
 
-If you log in to the developer computer via ssh, then the developer computer will not be idle, nor will it automatically shut down 
+If you log in to the developer computer via ssh, then the developer computer will not be idle, nor will it automatically shut down
 
 ```bash
-sky launch test.yaml -y --use-spot --infra=gcp -i 5 --down 
+sky launch test.yaml -y --use-spot --infra=gcp -i 5 --down
 
 YAML to run: test.yaml
 Running on cluster: sky-6f63-xl
@@ -49,9 +49,9 @@ Running on cluster: sky-6f63-xl
 Launching a spot job that does not automatically recover from preemptions. To get automatic recovery, use managed job instead: sky jobs launch or sky.jobs.launch().
 Considered resources (1 node):
 ------------------------------------------------------------------------------------------
- INFRA                 INSTANCE       vCPUs   Mem(GB)   GPUS          COST ($)   CHOSEN   
+ INFRA                 INSTANCE       vCPUs   Mem(GB)   GPUS          COST ($)   CHOSEN
 ------------------------------------------------------------------------------------------
- GCP (us-central1-b)   TPU-VM[Spot]   -       -         tpu-v6e-4:1   2.26          ✔     
+ GCP (us-central1-b)   TPU-VM[Spot]   -       -         tpu-v6e-4:1   2.26          ✔
 ------------------------------------------------------------------------------------------
 ⚙︎ Launching on GCP us-central1 (us-central1-b).
 ⠏ Launching  View logs: sky api logs -l sky-2025-08-05-10-09-55-434972/provision.log
@@ -59,16 +59,16 @@ Considered resources (1 node):
 
 ### View Developer Computer
 ```bash
-# View the current status of the developer computer 
+# View the current status of the developer computer
 sky queue
 
 Fetching and parsing job queue...
 Fetching job queue for: sky-6f63-xl
 
 Job queue of current user on cluster sky-6f63-xl
-ID  NAME  USER  SUBMITTED  STARTED    DURATION  RESOURCES   STATUS     LOG                                        GIT COMMIT  
-1   -     xl    1 min ago  1 min ago  < 1s      1x[CPU:1+]  SUCCEEDED  ~/sky_logs/sky-2025-08-05-10-09-55-434972  -          
-``` 
+ID  NAME  USER  SUBMITTED  STARTED    DURATION  RESOURCES   STATUS     LOG                                        GIT COMMIT
+1   -     xl    1 min ago  1 min ago  < 1s      1x[CPU:1+]  SUCCEEDED  ~/sky_logs/sky-2025-08-05-10-09-55-434972  -
+```
 
 ### Log in to the developer computer
 
@@ -76,7 +76,7 @@ ID  NAME  USER  SUBMITTED  STARTED    DURATION  RESOURCES   STATUS     LOG      
 ssh ${your_cluster_name}
 ```
 
-### Synchronize local code 
+### Synchronize local code
 
 ```bash
 rsync -Pavz python ${your_cluster_name}:/home/gcpuser/sky_workdir/sglang-jax/python

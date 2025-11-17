@@ -7,12 +7,12 @@ Welcome to **SGLang-Jax**! We appreciate your interest in contributing. This gui
 
 We divide the issues into three types:
 - Features, such as support [structured output](https://github.com/sgl-project/sglang-jax/issues/314)
-  - Note: Sometimes you just want to add a small feature like an api, please still link a google document. 
+  - Note: Sometimes you just want to add a small feature like an api, please still link a google document.
     - This is encouraged to discuss. We want to make a tradeoff between convenience and feature iterations.
 - Bugs
 - Add unit tests, E2E tests, accuracy tests, performance tests, etc.
 
-Note: 
+Note:
 - You can select the existing or create a new issue for yourself. Please fill the template according to issue type.
 - Before dive deep into different issues contribution requirements, please let me introduce you about CI which is necessary before merging into main. CI consists of pull requests tests and nightly tests. The former is design to ensure fundamental features and bugfixes work and pass few performance and accuracy tests. It includes unit tests, E2E tests, accuracy and performance tests for Qwen3-8B and Qwen3-30B-A3B. The latter is design to check tests as much as possible, such as more models, more datasets, more performance scenarios and so on. See more details in [CI Architecture](./ci_architecture.md).
 
@@ -31,9 +31,9 @@ Here we give the feature which is to support structure output as an example. Not
   - TPU resources: Please refer to [TPU Resources Guide](./tpu_resources_guide.md).
   - Setup environment: Please refer to [install SGLang-Jax from source](#install-sglang-jax-from-source).
   - Code style: Please refer to [format codes](#format-code-with-pre-commit) before you push.
-  - Testing: 
+  - Testing:
     - Please add unit tests under `python/srt/test/*` and E2E tests under `test/srt/*` to ensure the feature works. File names are required to start with `test_`.
-    - If the feature were to add new accuracy or performance baselines or influence the existing accuracy or performance, please add them in nightly tests. Nightly tests are under construction. 
+    - If the feature were to add new accuracy or performance baselines or influence the existing accuracy or performance, please add them in nightly tests. Nightly tests are under construction.
       - Example: Add a new model implementation.
   - Description in PR: Please add accuracy or benchmark baselines in pull requests if the feature meeted the above scenarios.
   - Review: Assign at least one reviewer.
@@ -48,7 +48,7 @@ Here we give the feature which is to support structure output as an example. Not
 2. You can fix it by your self or assign it to others. If you select the former, please continue.
 
 3. Code development: Keep the same to **Features**.
-  
+
 4. If you resolved all comments from code reviews, the pull request would be merged into main. Congrantulations to you!
 
 
