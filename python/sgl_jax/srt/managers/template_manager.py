@@ -82,9 +82,23 @@ class TemplateManager:
             chat_template_arg: Template name, file path, or None to auto-detect
             model_path: Path to the model
         """
-        
         if chat_template_arg:
             self._load_explicit_chat_template(tokenizer_manager, chat_template_arg)
+        else:
+            # Guess chat template from model path
+            self.guess_chat_template_from_model_path(model_path)
+
+            # If no pre-defined template was found, fallback to HuggingFace template
+            if self._chat_template_name is None:
+                # Try HuggingFace template first
+                hf_template = self._resolve_hf_chat_template(tokenizer_manager)
+                if hf_template:
+                    # override the chat template
+                    if tokenizer_manager.tokenizer:
+                        tokenizer_manager.tokenizer.chat_template = hf_template
+                    logger.info("Using default HuggingFace chat template")
+                else:
+                    logger.info("No chat template found")
 
     def _load_explicit_chat_template(
         self, tokenizer_manager, chat_template_arg: str
@@ -95,3 +109,22 @@ class TemplateManager:
         if chat_template_exists(chat_template_arg):
             self._chat_template_name = chat_template_arg
             return
+
+    def _resolve_hf_chat_template(self, tokenizer_manager) -> Optional[str]:
+        """
+        Resolve HuggingFace chat template.
+
+        Returns the chat template string if found, None otherwise.
+        """
+        try:
+            # if processor := tokenizer_manager.processor:
+            #     if hasattr(processor, "chat_template") and processor.chat_template:
+            #         return processor.chat_template
+            if tokenizer := tokenizer_manager.tokenizer:
+                if hasattr(tokenizer, "chat_template") and tokenizer.chat_template:
+                    return tokenizer.chat_template
+        except Exception as e:
+            logger.debug(f"Error getting chat template: {e}")
+
+        logger.debug("No HuggingFace chat template found")
+        return None

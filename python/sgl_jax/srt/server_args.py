@@ -375,7 +375,13 @@ class ServerArgs:
             default=ServerArgs.grammar_backend,
             help="Choose the backend for grammar-guided decoding.",
         )
-
+        parser.add_argument(
+            "--chat-template",
+            type=str,
+            default=ServerArgs.chat_template,
+            help="The buliltin chat template name or the path of the chat template file. This is only used for OpenAI-compatible API server.",
+        )
+        
         # HTTP server
         parser.add_argument(
             "--host",
