@@ -106,7 +106,7 @@ def get_available_device_memory(device, distributed=False, empty_cache=True):
     Get available memory for device:device_id.
     When distributed is True, the available memory is the minimum available memory of all devices.
     """
-    if device == "tpu":
+    if device in ("tpu", "proxy"):
         devices = jax.local_devices()
         if empty_cache:
             jax.clear_caches()
