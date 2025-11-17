@@ -153,7 +153,7 @@ class GenerateReqInput:
     # If return logprobs, the token ids to return logprob for.
     token_ids_logprob: list[list[int]] | list[int] | None = None
     # Whether to detokenize tokens in text in the returned logprobs.
-    return_text_in_logprobs: bool = False
+    return_text_in_logprobs: bool = True
 
     def _normalize_rid(self, num):
         """Normalize request IDs for batch processing."""
