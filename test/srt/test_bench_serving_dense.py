@@ -21,7 +21,7 @@ from sgl_jax.test.test_utils import (
 )
 
 
-class TestBenchServing(CustomTestCase):
+class TestBenchServingDense(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_MODEL_NAME_FOR_TEST

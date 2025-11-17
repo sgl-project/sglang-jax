@@ -182,18 +182,12 @@ suites = {
     "performance-test-tpu-v6e-1": [TestFile("test/srt/test_bench_serving_dense.py", 7)],
     "performance-test-tpu-v6e-4": [
         TestFile(
-            "test/srt/test_bench_serving.py",
+            "test/srt/test_bench_serving_dense_tp_4.py",
             13,
         ),
         TestFile(
-            "test/srt/test_bench_serving.py",
+            "test/srt/test_bench_serving_moe.py",
             35,
-            [
-                "TestBenchServing.test_moe_ttft_default",
-                "TestBenchServing.test_moe_itl_default",
-                "TestBenchServing.test_moe_input_throughput_default",
-                "TestBenchServing.test_moe_output_throughput_default",
-            ],
         ),
     ],
     "e2e-test-tpu-v6e-1": [
