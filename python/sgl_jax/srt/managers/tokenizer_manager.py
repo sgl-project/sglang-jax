@@ -729,7 +729,6 @@ class TokenizerManager:
             self.dump_requests_threshold = obj.dump_requests_threshold
         if obj.crash_dump_folder is not None:
             self.crash_dump_folder = obj.crash_dump_folder
-        logging.info("Config logging: %s", obj)
         self.log_request_metadata = self.get_log_request_metadata()
 
     def create_abort_task(self, obj: GenerateReqInput):

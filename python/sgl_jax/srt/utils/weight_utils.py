@@ -24,6 +24,7 @@ class WeightMapping:
     reshape: tuple | None = None
     head_dim_padding: bool = False
     kv_head_padding: bool = False
+    concat_axis: int | None = None
 
     def __post_init__(self):
         if self.sharding is None:
@@ -97,7 +98,9 @@ class WeightLoader:
             self.moe_abstract_mesh = None
 
     def load_weights_from_safetensors(
-        self, weight_mappings: dict[str, str | list[str] | WeightMapping]
+        self,
+        weight_mappings: dict[str, str | list[str] | WeightMapping],
+        safetensors_partition=1,
     ):
         params = nnx.state(self.model)
 
@@ -123,7 +126,9 @@ class WeightLoader:
                 if isinstance(mapping, (str, list)):
                     mapping = WeightMapping(target_path=mapping)
                 self._process_and_assign_weight(params, hf_key, hf_weight, mapping)
-            elif "mlp.experts." in hf_key and hf_key.endswith(".weight"):
+            elif (
+                "mlp.experts." in hf_key or "block_sparse_moe.experts" in hf_key
+            ) and hf_key.endswith(".weight"):
                 if self._is_excluded_layer_weight(hf_key):
                     logger.debug("Skipping excluded MoE expert weight: %s", hf_key)
                     continue
@@ -134,10 +139,30 @@ class WeightLoader:
                     if hf_key in expected_hf_keys:
                         if moe_key not in moe_buffer:
                             moe_buffer[moe_key] = {}
-                        moe_buffer[moe_key][hf_key] = hf_weight
+                        if hf_key not in moe_buffer[moe_key]:
+                            moe_buffer[moe_key][hf_key] = []
+                        moe_buffer[moe_key][hf_key].append(hf_weight)
                         assigned = True
 
                         if len(moe_buffer[moe_key]) == len(expected_hf_keys):
+                            shard_counts = [len(v) for v in moe_buffer[moe_key].values()]
+                            # Validate all weights have consistent shard counts
+                            if len(set(shard_counts)) != 1:
+                                continue
+
+                            # Auto-detect TP sharding:
+                            # - Grok-2: concat_axis is set, needs multiple shards (e.g., 8)
+                            if mapping.concat_axis is not None:
+                                # TP-sharded weights: need to collect all TP shards
+                                # Expected number of shards = total model files / experts per file
+                                if shard_counts[0] < safetensors_partition:
+                                    # Still collecting shards, wait for more
+                                    continue
+                            else:
+                                # Non-TP-sharded weights: expect exactly 1 copy per expert
+                                if shard_counts[0] != 1:
+                                    continue
+
                             self._process_single_moe_group(
                                 params, moe_key, mapping, moe_buffer[moe_key]
                             )
@@ -154,10 +179,19 @@ class WeightLoader:
 
         if moe_buffer:
             for moe_key in moe_buffer:
-                expected = len(moe_mappings[moe_key].target_path[1:])
+                mapping = moe_mappings[moe_key]
+                expected = len(mapping.target_path[1:])
                 got = len(moe_buffer[moe_key])
+                shard_counts = (
+                    [len(v) for v in moe_buffer[moe_key].values()] if moe_buffer[moe_key] else []
+                )
                 logger.error(
-                    "MoE group %s incomplete: %s/%s weights loaded", moe_key, got, expected
+                    "MoE group %s incomplete: %s/%s weights loaded, shard_counts=%s, concat_axis=%s",
+                    moe_key,
+                    got,
+                    expected,
+                    shard_counts,
+                    mapping.concat_axis,
                 )
             raise RuntimeError("Incomplete MoE expert weights detected.")
 
@@ -168,14 +202,21 @@ class WeightLoader:
         params: nnx.State,
         moe_key: str,
         mapping: WeightMapping,
-        expert_weights_dict: dict[str, jax.Array],
+        expert_weights_dict: dict[str, list[jax.Array]],
     ):
         target_path = mapping.target_path[0]
         expected_hf_keys = mapping.target_path[1:]
 
         collected_weights = []
         for hf_key in expected_hf_keys:
-            weight = expert_weights_dict[hf_key]
+            weights = expert_weights_dict[hf_key]
+            # If TP-sharded (e.g., Grok-2), concatenate shards along concat_axis
+            if mapping.concat_axis is not None and len(weights) > 1:
+                weight = jnp.concatenate(weights, axis=mapping.concat_axis)
+            else:
+                # Non-TP-sharded (e.g., Qwen3-MoE), expect single weight
+                weight = weights[0]
+
             if mapping.transpose and not hf_key.endswith(".bias"):
                 weight = jnp.transpose(weight, (1, 0))
             collected_weights.append(weight)
@@ -277,6 +318,18 @@ class WeightLoader:
     ):
         jax_path = mapping.target_path
         processed_weight = weight
+
+        # Apply output_multiplier_scale to lm_head weights (matching PyTorch implementation)
+        if "lm_head" in hf_key and hasattr(self.model_config.hf_config, "output_multiplier_scale"):
+            logger.info(
+                "Applying output_multiplier_scale (%.2f) to %s",
+                self.model_config.hf_config.output_multiplier_scale,
+                hf_key,
+            )
+            processed_weight = processed_weight.astype(jnp.float32)
+            processed_weight = (
+                processed_weight * self.model_config.hf_config.output_multiplier_scale
+            )
 
         if mapping.reshape is not None:
             processed_weight = jnp.reshape(processed_weight, mapping.reshape)

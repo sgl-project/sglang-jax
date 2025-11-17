@@ -168,6 +168,11 @@ def get_tokenizer(
     **kwargs,
 ) -> PreTrainedTokenizer | PreTrainedTokenizerFast:
     """Gets a tokenizer for the given model name via Huggingface."""
+    if tokenizer_name.endswith(".json"):
+        from sgl_jax.srt.managers.tiktoken_tokenizer import TiktokenTokenizer
+
+        return TiktokenTokenizer(tokenizer_name)
+
     if tokenizer_mode == "slow":
         if kwargs.get("use_fast", False):
             raise ValueError("Cannot use the fast tokenizer in slow tokenizer mode.")

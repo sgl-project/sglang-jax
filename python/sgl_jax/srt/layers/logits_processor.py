@@ -450,4 +450,5 @@ class LogitsProcessor(nnx.Module):
 
         if self.soft_cap:
             logits = self.soft_cap * jnp.tanh(logits / self.soft_cap)
+
         return logits

@@ -4,7 +4,6 @@ from typing import Any
 from flax import nnx
 from jax import jax
 from jax import numpy as jnp
-from jax.sharding import PartitionSpec as P
 from transformers import PretrainedConfig
 
 from sgl_jax.srt.configs.model_config import ModelConfig
@@ -256,11 +255,7 @@ class QWen3MoeDecoderLayer(nnx.Module):
         if self.is_moe_layer:
             router_logits = self.moe_gate(hidden_states)
             topk_weights, topk_ids = self.topk(router_logits)
-            mlp_output = self.mlp(hidden_states, topk_weights, topk_ids)
-            output_pspec = P(*([None] * (mlp_output.ndim - 1)), "tensor")
-            hidden_states = jax.sharding.reshard(
-                mlp_output, jax.sharding.NamedSharding(self.mesh, output_pspec)
-            )
+            hidden_states = self.mlp(hidden_states, topk_weights, topk_ids)
         else:
             hidden_states = self.mlp(hidden_states)
 

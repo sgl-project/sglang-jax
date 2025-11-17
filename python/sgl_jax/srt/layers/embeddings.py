@@ -452,3 +452,34 @@ def get_rope(
             raise ValueError(f"Unknown RoPE scaling type {scaling_type}")
     _ROPE_DICT[key] = rotary_emb
     return rotary_emb
+
+
+def _yarn_get_mscale(scaling_factor: float) -> float:
+    # Approximate magnitude scaling correction used by YaRN
+    if scaling_factor <= 1:
+        return 1.0
+    return math.sqrt(scaling_factor)
+
+
+# Inverse dim formula to find dim based on number of rotations
+def _yarn_find_correction_dim(
+    num_rotations: int,
+    dim: int,
+    base: float = 10000,
+    max_position_embeddings: int = 2048,
+) -> float:
+    return (dim * math.log(max_position_embeddings / (num_rotations * 2 * math.pi))) / (
+        2 * math.log(base)
+    )
+
+
+def _yarn_find_correction_range(
+    low_rot: int,
+    high_rot: int,
+    dim: int,
+    base: int,
+    max_position_embeddings: int,
+) -> tuple[float, float]:
+    low = math.floor(_yarn_find_correction_dim(low_rot, dim, base, max_position_embeddings))
+    high = math.ceil(_yarn_find_correction_dim(high_rot, dim, base, max_position_embeddings))
+    return max(low, 0), min(high, dim - 1)  # Clamp values just in case
