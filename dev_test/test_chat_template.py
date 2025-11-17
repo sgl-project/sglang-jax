@@ -67,8 +67,7 @@ def test_qwen2_vl_template():
     print("-" * 80)
     
     if "qwen2-vl" not in chat_templates:
-        print("✗ 失败: qwen2-vl 模板未注册")
-        return 1
+        raise Exception("✗ 失败: qwen2-vl 模板未注册")
     
     print("✓ qwen2-vl 模板已注册")
     template = chat_templates["qwen2-vl"]
@@ -240,11 +239,7 @@ def test_different_chat_templates():
     return 0
 
 
-if __name__ == "__main__":
-    print("\n" + "=" * 80)
-    print("Chat Template 功能测试")
-    print("=" * 80)
-    
+if __name__ == "__main__":    
     exit_code_1 = test_qwen2_vl_template()
     exit_code_2 = test_different_chat_templates()
     

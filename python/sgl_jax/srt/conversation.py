@@ -5,9 +5,37 @@ This is a stub implementation for the migration from sglang.
 
 import logging
 from collections.abc import Callable
+from dataclasses import dataclass, field
+from enum import IntEnum, auto
 from typing import Any
 
 logger = logging.getLogger(__name__)
+
+
+class SeparatorStyle(IntEnum):
+    """Separator styles for different models."""
+    ADD_COLON_SINGLE = auto()
+    ADD_COLON_TWO = auto()
+    ADD_COLON_SPACE_SINGLE = auto()
+    NO_COLON_SINGLE = auto()
+    NO_COLON_TWO = auto()
+    ADD_NEW_LINE_SINGLE = auto()
+    LLAMA2 = auto()
+    CHATGLM = auto()
+    CHATML = auto()
+    CHATINTERN = auto()
+    DOLLY = auto()
+    RWKV = auto()
+    PHOENIX = auto()
+    ROBIN = auto()
+    FALCON_CHAT = auto()
+    LLAMA3 = auto()
+    DEEPSEEK_CHAT = auto()
+    METAMATH = auto()
+    YUAN2 = auto()
+    GEMMA = auto()
+    CLLM = auto()
+    DEFAULT = auto()
 
 
 # Models in which system adds modality tokens at prompt start automatically
@@ -51,30 +79,10 @@ def generate_chat_conv(
     logger.info("Generating chat conversation from %s messages", len(messages))
     
     conv = chat_templates[template_name].copy()
-    conv = Conversation(
-        name=conv.name,
-        system_template=conv.system_template,
-        system_message=conv.system_message,
-        roles=conv.roles,
-        messages=list(conv.messages),  # prevent in-place modification
-        offset=conv.offset,
-        sep_style=SeparatorStyle(conv.sep_style),
-        sep=conv.sep,
-        sep2=conv.sep2,
-        stop_str=conv.stop_str,
-        image_data=[],
-        video_data=[],
-        audio_data=[],
-        modalities=[],
-        image_token=conv.image_token,
-        audio_token=conv.audio_token,
-        video_token=conv.video_token,
-        image_token_at_prefix=conv.image_token_at_prefix,
-    )
 
-    if isinstance(request.messages, str):
+    if isinstance(messages, str):
         raise ValueError("The messages should be a list of dict.")
-    for message in request.messages:
+    for message in messages:
         msg_role = message.role
         if msg_role == "system":
             if isinstance(message.content, str):
@@ -157,31 +165,115 @@ def generate_chat_conv(
 
     # Add a blank message for the assistant.
     conv.append_message(conv.roles[1], None)
-    logger.debug("Generated conversation: %s...", conversation[:100])
+    prompt = conv.get_prompt()
+    logger.debug("Generated conversation: %s...", prompt[:100] if len(prompt) > 100 else prompt)
 
     return conv
 
 
+@dataclass
 class Conversation:
-    """Basic conversation class for handling chat interactions."""
+    """A class that manages a conversation with a specific format."""
+    
+    name: str
+    system_template: str = "{system_message}"
+    system_message: str = ""
+    roles: tuple[str, str] = ("USER", "ASSISTANT")
+    messages: list[tuple[str, str]] = field(default_factory=list)
+    offset: int = 0
+    sep_style: SeparatorStyle = SeparatorStyle.ADD_COLON_SINGLE
+    sep: str = "\n"
+    sep2: str | None = None
+    stop_str: str | list[str] | None = None
+    
+    # Multimodal related
+    image_data: list = field(default_factory=list)
+    video_data: list = field(default_factory=list)
+    audio_data: list = field(default_factory=list)
+    modalities: list = field(default_factory=list)
+    image_token: str = "<image>"
+    audio_token: str = "<audio>"
+    video_token: str = "<video>"
+    image_token_at_prefix: bool = False
 
-    def __init__(self, messages: list[dict[str, Any]]):
-        self.messages = messages
-        self.history = []
+    def copy(self):
+        """Create a copy of the conversation."""
+        return Conversation(
+            name=self.name,
+            system_template=self.system_template,
+            system_message=self.system_message,
+            roles=self.roles,
+            messages=list(self.messages),
+            offset=self.offset,
+            sep_style=self.sep_style,
+            sep=self.sep,
+            sep2=self.sep2,
+            stop_str=self.stop_str,
+            image_data=list(self.image_data),
+            video_data=list(self.video_data),
+            audio_data=list(self.audio_data),
+            modalities=list(self.modalities),
+            image_token=self.image_token,
+            audio_token=self.audio_token,
+            video_token=self.video_token,
+            image_token_at_prefix=self.image_token_at_prefix,
+        )
 
-    def add_message(self, role: str, content: str):
-        """Add a message to the conversation."""
-        self.messages.append({"role": role, "content": content})
-        self.history.append({"role": role, "content": content})
+    def append_message(self, role: str, message: str | None):
+        """Append a new message."""
+        self.messages.append((role, message))
+
+    def append_image(self, image_url: str, detail: str = "auto"):
+        """Append image data."""
+        self.image_data.append({"url": image_url, "detail": detail})
+
+    def append_video(self, video_url: str):
+        """Append video data."""
+        self.video_data.append({"url": video_url})
+
+    def append_audio(self, audio_url: str):
+        """Append audio data."""
+        self.audio_data.append({"url": audio_url})
 
     def get_prompt(self) -> str:
-        """Get the conversation as a prompt string."""
-        return generate_chat_conv(self.messages)
+        """Get the conversation prompt."""
+        system_prompt = self.system_template.format(system_message=self.system_message)
+        
+        if self.sep_style == SeparatorStyle.ADD_NEW_LINE_SINGLE:
+            ret = system_prompt + self.sep
+            for role, message in self.messages:
+                if message:
+                    ret += role + "\n" + message + self.sep
+                else:
+                    ret += role + "\n"
+            return ret
+        elif self.sep_style == SeparatorStyle.ADD_COLON_SINGLE:
+            ret = system_prompt + self.sep
+            for role, message in self.messages:
+                if message:
+                    ret += role + ": " + message + self.sep
+                else:
+                    ret += role + ":"
+            return ret
+        elif self.sep_style == SeparatorStyle.ADD_COLON_TWO:
+            seps = [self.sep, self.sep2]
+            ret = system_prompt + seps[0]
+            for i, (role, message) in enumerate(self.messages):
+                if message:
+                    ret += role + ": " + message + seps[i % 2]
+                else:
+                    ret += role + ":"
+            return ret
+        else:
+            raise ValueError(f"Invalid separator style: {self.sep_style}")
 
     def clear(self):
         """Clear the conversation history."""
         self.messages.clear()
-        self.history.clear()
+        self.image_data.clear()
+        self.video_data.clear()
+        self.audio_data.clear()
+        self.modalities.clear()
 
 
 # A global registry for all conversation templates
