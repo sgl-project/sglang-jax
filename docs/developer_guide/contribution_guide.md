@@ -6,55 +6,51 @@ Welcome to **SGLang-Jax**! We appreciate your interest in contributing. This gui
 ## How to contribute your first PR?
 
 We divide the issues into three types:
-- Features, such as support structured output
+- Features, such as support [structured output](https://github.com/sgl-project/sglang-jax/issues/314)
+  - Note: Sometimes you just want to add a small feature like an api, please still link a google document. 
+    - This is encouraged to discuss. We want to make a tradeoff between convenience and feature iterations.
 - Bugs
-- Add unit tests or CI tests
+- Add unit tests, E2E tests, accuracy tests, performance tests, etc.
+
+Note: 
+- You can select the existing or create a new issue for yourself. Please fill the template according to issue type.
+- Before dive deep into different issues contribution requirements, please let me introduce you about CI which is necessary before merging into main. CI consists of pull requests tests and nightly tests. The former is design to ensure fundamental features and bugfixes work and pass few performance and accuracy tests. It includes unit tests, E2E tests, accuracy and performance tests for Qwen3-8B and Qwen3-30B-A3B. The latter is design to check tests as much as possible, such as more models, more datasets, more performance scenarios and so on. See more details in [CI Architecture](./ci_architecture.md).
 
 **Features**
 
-Here we give the feature which is to support structure output as an example.
+Here we give the feature which is to support structure output as an example. Note: If this is a small feature, only one issue is required.
 
 1. Create a root issue to trace your job in this feature, like [314](https://github.com/sgl-project/sglang-jax/issues/314)
 
 2. Split your job to at least two subissues, like:
-   - Design document subissue, such as [315](https://github.com/sgl-project/sglang-jax/issues/315)
-     - Note: A google document is required to elaborate your design, such as [structure output](https://docs.google.com/document/d/1lZ09hEB00KZjJW_W1Bht1euGwgl3jxu8bVnStJihHXg/edit?tab=t.0). This document is required to be reviewed.
-   - Code development subissue, such as [331](https://github.com/sgl-project/sglang-jax/issues/331)
+  - Design document subissue, such as [315](https://github.com/sgl-project/sglang-jax/issues/315)
+    - Note: A google document is required to elaborate your design, such as [structure output](https://docs.google.com/document/d/1lZ09hEB00KZjJW_W1Bht1euGwgl3jxu8bVnStJihHXg/edit?tab=t.0). This document is required to be reviewed. You have to include motivation, goals, design and tests.
+  - Code development subissue, such as [331](https://github.com/sgl-project/sglang-jax/issues/331)
 
 3. Codes development:
-   - TPU resources: Please refer to [how to get TPU resources to develop](#how-to-get-tpu-resources-to-develop).
-   - Please refer to [install SGLang-Jax from source](#install-sglang-jax-from-source) to setup the development environment.
-   - Please refer to [format codes](#format-code-with-pre-commit) before you push.
-   - Please add unit tests and e2e tests in CI to ensure the feature works. You can refer to [how to add tests in CI](#how-to-add-tests-in-ci).
-   - Codes are required to review.
-   - Please add accuracy and benchmark results when meeting the following cases:
-     - Add a new model: please give both of them in **PR** and **CI tests**.
-     - Feature may require new dataset accuracy: please add accuracy tests in **PR** and **CI tests**.
-     - Feature may require better performance baseline, such as overlapping scheduler: please add or update benchmark result in **PR** and **CI tests**.
-     - **Note**:
-       - Accuracy: please refer to [how to evaluate the accuracy](#how-to-evaluate-the-accuracy).
-       - Benchmark: please refer to [how to do benchmark](#how-to-do-benchmark).
-       - Add accuracy check in CI tests: please refer to the corresponding section in [how to add tests in CI](#how-to-add-tests-in-ci).
-       - Add benchmark check in CI tests: please refer to the corresponding section in [how to add tests in CI](#how-to-add-tests-in-ci)
+  - TPU resources: Please refer to [TPU Resources Guide](./tpu_resources_guide.md).
+  - Setup environment: Please refer to [install SGLang-Jax from source](#install-sglang-jax-from-source).
+  - Code style: Please refer to [format codes](#format-code-with-pre-commit) before you push.
+  - Testing: 
+    - Please add unit tests under `python/srt/test/*` and E2E tests under `test/srt/*` to ensure the feature works. File names are required to start with `test_`.
+    - If the feature were to add new accuracy or performance baselines or influence the existing accuracy or performance, please add them in nightly tests. Nightly tests are under construction. 
+      - Example: Add a new model implementation.
+  - Description in PR: Please add accuracy or benchmark baselines in pull requests if the feature meeted the above scenarios.
+  - Review: Assign at least one reviewer.
 
 4. If you resolved all comments from code reviews, the pull request would be merged into main. Congrantulations to you!
 
 
-**Bugs**
+**Bugs && Add tests**
 
-1. Create an bug issue and fill the content, such as reproduce steps, environment, solution and so on.
+1. Create an issue and fill the content according to template.
+
 2. You can fix it by your self or assign it to others. If you select the former, please continue.
-3. Code reviews are required.
-4. Fix bugs and add unit tests or e2e tests in CI to ensure the bug has been fixed. You can refer to [how to get TPU resources to develop](#how-to-get-tpu-resources-to-develop) and [how to add tests in CI](#how-to-add-tests-in-ci).
-5. Optional: Check the accuracy and benchmark if you think the modification will influence them.
-6. If you resolved all comments from code reviews, the pull request would be merged into main. Congrantulations to you!
 
-**Add tests**
+3. Code development: Keep the same to **Features**.
+  
+4. If you resolved all comments from code reviews, the pull request would be merged into main. Congrantulations to you!
 
-1. Create the issue or find an existing test issue to solve.
-2. Add unit test or [CI tests](#how-to-add-tests-in-ci). Run tests with [resource](#how-to-get-tpu-resources-to-develop).
-3. Code reviews are required.
-4. Merge branch.
 
 ## Install SGLang-Jax from Source
 
@@ -89,30 +85,12 @@ pre-commit run --all-files
 - Keep files concise. If a file exceeds 2,000 lines of code, split it into multiple smaller files.
 - Strive to make functions as pure as possible. Avoid in-place modification of arguments.
 
-## Q & A
-
-### Q1: When I add a new model for SGLang-Jax, what do I need to do before merge into main?
-
-
-1. Please add accuracy and benchmark baselines for new model in PR.
-2. Please add accuracy baseline in CI and refer to `Adding baselines in CI` in [test/README.md](https://github.com/sgl-project/sglang-jax/tree/main/test/README.md).
-
-Thank you for your interest in SGLang-Jax. Happy coding!
 
 ## Q & A
 
-### How to add tests in CI?
+### How to do benchmark?
 
-TODO.
-We will provide a document to introduce the following parts about CI:
-1. CI workflow.
-2. Principles and steps.
-3. How to add accuracy tests?
-4. How to add benchmark tests?
-
-### How to get TPU resources to develop?
-
-TODO.
+Please refer to [Benchmark and Profiling](./benchmark_and_profiling.md).
 
 ### How to evaluate the accuracy?
 
@@ -156,12 +134,3 @@ Some details about evaluations:
 - Accuracy Deviation: This test can have significant variance (1%–5%) in accuracy due to batching and the non-deterministic nature of the inference engine. Please run multi times to get the average result.
 - Dataset Selection: GSM8K is too easy for state-of-the-art models nowadays. Please try your own more challenging accuracy tests. You can find additional accuracy eval examples in [test_eval_accuracy_large.py](https://github.com/sgl-project/sglang-jax/blob/main/test/srt/test_eval_accuracy_large.py).
 - Sampling Parameters: Please set proper sampling parameters for your model. We recommend to use configurations on Hugging Face.
-
-### How to do benchmark?
-
-Please refer to [Benchmark and Profiling](./benchmark_and_profiling.md).
-
-
-## Contact us
-
-TODO.
