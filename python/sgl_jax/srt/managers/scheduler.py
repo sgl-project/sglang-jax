@@ -29,6 +29,8 @@ from sgl_jax.srt.hf_transformers_utils import get_tokenizer
 from sgl_jax.srt.layers.logits_processor import LogitsProcessorOutput
 from sgl_jax.srt.managers.io_struct import (
     AbortReq,
+    FlushCacheReqInput,
+    FlushCacheReqOutput,
     GetInternalStateReq,
     GetInternalStateReqOutput,
     ProfileReq,
@@ -308,6 +310,7 @@ class Scheduler(
                 (TokenizedGenerateReqInput, self.handle_generate_request),
                 (AbortReq, self.abort_request),
                 (ProfileReq, self.profile),
+                (FlushCacheReqInput, self.flush_cache_wrapped),
                 (GetInternalStateReq, self.get_internal_state),
                 (SetInternalStateReq, self.set_internal_state),
             ]
@@ -759,6 +762,85 @@ class Scheduler(
         return SetInternalStateReqOutput(
             request_id=recv_req.request_id, success=success, error_msg=error_msg
         )
+
+    def flush_cache_wrapped(self, recv_req: FlushCacheReqInput):
+        success, error_msg, flushed_items = self.flush_cache()
+        return FlushCacheReqOutput(
+            request_id=recv_req.request_id,
+            success=success,
+            error_msg=error_msg,
+            flushed_items=flushed_items,
+        )
+
+    def _can_flush_cache(self) -> tuple[bool, str]:
+        """Return whether cache flush can proceed and an optional error message."""
+
+        def _batch_size(batch: ScheduleBatch | None) -> int:
+            if batch is None:
+                return 0
+            return 0 if batch.is_empty() else batch.batch_size()
+
+        waiting_reqs = len(self.waiting_queue)
+        running_reqs = _batch_size(self.running_batch)
+        current_batch_reqs = _batch_size(self.cur_batch)
+        last_batch_reqs = _batch_size(self.last_batch)
+        chunked_pending = self.chunked_req is not None
+        pending_results = len(getattr(self, "result_queue", ())) if self.enable_overlap else 0
+
+        has_pending = (
+            waiting_reqs > 0
+            or running_reqs > 0
+            or current_batch_reqs > 0
+            or last_batch_reqs > 0
+            or chunked_pending
+            or pending_results > 0
+        )
+
+        if has_pending:
+            msg = (
+                "Cache not flushed because there are pending requests. "
+                f"waiting={waiting_reqs}, running={running_reqs}, "
+                f"cur_batch={current_batch_reqs}, last_batch={last_batch_reqs}, "
+                f"chunked={chunked_pending}, pending_results={pending_results}"
+            )
+            return False, msg
+
+        return True, ""
+
+    def flush_cache(self) -> tuple[bool, str, int]:
+        can_flush, message = self._can_flush_cache()
+        if not can_flush:
+            logger.warning(message)
+            return False, message, 0
+
+        # Reset scheduling state
+        self.cur_batch = None
+        self.last_batch = None
+        self.running_batch = ScheduleBatch(reqs=[], batch_is_full=False)
+        self.chunked_req = None
+        if self.enable_overlap:
+            self.result_queue = deque()
+
+        # Clear cache-related state
+        if self.tree_cache is not None:
+            self.tree_cache.reset()
+        if self.req_to_token_pool is not None:
+            self.req_to_token_pool.clear()
+        if self.token_to_kv_pool_allocator is not None:
+            self.token_to_kv_pool_allocator.clear()
+
+        self.num_generated_tokens = 0
+        self.forward_ct_decode = 0
+        self.new_token_ratio = self.init_new_token_ratio
+
+        flushed_items = (
+            self.token_to_kv_pool_allocator.available_size()
+            if self.token_to_kv_pool_allocator is not None
+            else 0
+        )
+
+        logger.info("Cache flushed successfully!")
+        return True, "", flushed_items
 
     def _add_request_to_queue(self, req: Req):
         req.queue_time_start = time.perf_counter()
