@@ -196,6 +196,9 @@ suites = {
         TestFile("test/srt/openai_server/basic/test_serving_chat.py", 0.1),
         TestFile("test/srt/openai_server/basic/test_serving_completions.py", 0.1),
         TestFile("test/srt/openai_server/basic/test_openai_server.py", 1),
+        TestFile("test/srt/openai_server/features/test_ebnf.py", 2),
+        TestFile("test/srt/openai_server/features/test_json_mode.py", 2),
+        TestFile("test/srt/openai_server/features/test_structural_tag.py", 2),
         TestFile("test/srt/test_srt_engine.py", 1),
     ],
     "e2e-test-tpu-v6e-4": [
