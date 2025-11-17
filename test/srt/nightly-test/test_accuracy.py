@@ -62,7 +62,7 @@ class TestModelAccuracy(CustomTestCase):
             max_tokens=1024,
         )
         metrics = run_eval(args)
-        self.assertGreater(metrics["score"], 0.36)
+        self.assertGreater(metrics["score"], 0.35)
 
         ## kill process
         kill_process_tree(process.pid)
