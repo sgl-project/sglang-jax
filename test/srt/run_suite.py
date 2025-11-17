@@ -179,28 +179,11 @@ suites = {
             "test/srt/test_moe_eval_accuracy_large.py", 40, ["TestMoEEvalAccuracyLarge.test_mmlu"]
         ),
     ],
-    "performance-test-tpu-v6e-1": [
-        TestFile(
-            "test/srt/test_bench_serving.py",
-            7,
-            [
-                "TestBenchServing.test_ttft_default",
-                "TestBenchServing.test_itl_default",
-                "TestBenchServing.test_input_throughput_default",
-                "TestBenchServing.test_output_throughput_default",
-            ],
-        )
-    ],
+    "performance-test-tpu-v6e-1": [TestFile("test/srt/test_bench_serving_dense.py", 7)],
     "performance-test-tpu-v6e-4": [
         TestFile(
             "test/srt/test_bench_serving.py",
             13,
-            [
-                "TestBenchServing.test_ttft_default_tp_4",
-                "TestBenchServing.test_itl_default_tp_4",
-                "TestBenchServing.test_input_throughput_default_tp_4",
-                "TestBenchServing.test_output_throughput_default_tp_4",
-            ],
         ),
         TestFile(
             "test/srt/test_bench_serving.py",
