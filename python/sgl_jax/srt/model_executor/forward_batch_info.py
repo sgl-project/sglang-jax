@@ -8,10 +8,10 @@ ScheduleBatch -> ModelWorkerBatch -> ForwardBatch
 - ScheduleBatch is managed by `scheduler.py::Scheduler`.
   It contains high-level scheduling data. Most of the data is on the CPU.
 - ModelWorkerBatch is managed by `tp_worker.py::TpModelWorker`.
-  It is a subset of `ScheduleBatch` that only contains data related to the model forward on GPU.
-  It will be transformed from CPU scheduler to GPU model runner.
+  It is a subset of `ScheduleBatch` that only contains data related to the model forward on TPU.
+  It will be transformed from CPU scheduler to TPU model runner.
 - ForwardBatch is managed by `model_runner.py::ModelRunner`.
-  It contains low-level tensor data. Most of the data consists of GPU tensors.
+  It contains low-level tensor data. Most of the data consists of TPU tensors.
 """
 
 from __future__ import annotations
