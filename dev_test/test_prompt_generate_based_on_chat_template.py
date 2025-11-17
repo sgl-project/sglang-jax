@@ -1,4 +1,8 @@
-
+"""
+- _apply_conversation_template()
+    -> generate_chat_conv()
+    -> conv.get_prompt()
+"""
 import sys
 from typing import List, Optional, Any
 from dataclasses import dataclass

@@ -6,6 +6,7 @@ and code completion templates, eliminating global state and improving modularity
 """
 
 import logging
+from typing import Optional
 
 from sgl_jax.srt.conversation import get_conv_template_by_model_path, chat_template_exists
 
