@@ -828,6 +828,8 @@ class Scheduler(
             self.req_to_token_pool.clear()
         if self.token_to_kv_pool_allocator is not None:
             self.token_to_kv_pool_allocator.clear()
+        if self.grammar_backend is not None:
+            self.grammar_backend.reset()
 
         self.num_generated_tokens = 0
         self.forward_ct_decode = 0
