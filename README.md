@@ -17,13 +17,18 @@ The engine incorporates state-of-the-art techniques to maximize hardware utiliza
 
 ## Architecture Overview
 
+![SGLang-JAX Architecture](docs/_static/image/architecture.svg)
+
 SGL-JAX operates on a distributed architecture designed for scalability and performance:
 
 1.  **HTTP Server**: The entry point for all requests, compatible with the OpenAI API standard.
-2.  **Scheduler**: The core of the engine. It receives requests, manages prompts, and schedules token generation in batches. It intelligently groups requests to form optimal batches for the model executor.
-3.  **TP Worker (Tensor Parallel Worker)**: A set of distributed workers that host the model weights, distributed via tensor parallelism. They execute the forward pass for the model.
-4.  **Model Runner**: Manages the actual JAX-based model execution, including the forward pass, attention computation, and KV cache operations.
-5.  **Radix Cache**: A global, memory-efficient KV cache that is shared across all requests, enabling prefix reuse and reducing the memory footprint.
+2. **TokenizerManager**: Runs in the main process, handles text tokenization
+3.  **Scheduler**: The core of the engine. It receives requests, manages prompts, and schedules token generation in batches. It intelligently groups requests to form optimal batches for the model executor.
+4.  **TP Worker (Tensor Parallel Worker)**: A set of distributed workers that host the model weights, distributed via tensor parallelism. They execute the forward pass for the model.
+5.  **Model Runner(Included in TP Worker)**: Manages the actual JAX-based model execution, including the forward pass, attention computation, and KV cache operations.
+6. **DetokenizerManager**: Runs in a subprocess, handles output token decoding
+
+More details in [architecture](https://github.com/sgl-project/sglang-jax/blob/main/docs/architecture/project-core-structure.md).
 
 ---
 
