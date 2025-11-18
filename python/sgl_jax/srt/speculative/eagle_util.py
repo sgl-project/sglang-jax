@@ -821,7 +821,8 @@ class EagleVerifyInput:
         if bs != len(sampling_info):
             sampling_info = copy.deepcopy(sampling_info)
             # NOTE: retrive_index are the indices of the requests that are kept.
-            sampling_info.filter_batch(self.retrive_index.tolist(), self.retrive_index)
+            # FIXME(pc)
+            sampling_info.filter_batch(np.arange(len(sampling_info)))
 
         # TODO: support custom sampler, apply the custom logit processors if registered in the sampling info.
         # if sampling_info.has_custom_logit_processor:

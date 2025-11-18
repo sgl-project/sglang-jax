@@ -130,7 +130,6 @@ class EAGLEWorker(ModelWorker):
                 self.precompile_bs_paddings,
                 self.precompile_cache_loc_paddings,
             )
-
             sampling_metadata = SamplingMetadata.from_model_worker_batch(
                 model_worker_batch,
                 len(model_worker_batch.seq_lens) - model_worker_batch.real_bs,

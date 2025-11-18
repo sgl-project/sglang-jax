@@ -1721,7 +1721,6 @@ class ModelWorkerBatch:
                 bs_padding_size = size - len(seq_lens_cpu)
                 select_bs_index = i
                 break
-
         # offset = np.sum(seq_lens_cpu[seq_lens_cpu > 0]) if len(seq_lens_cpu) > 0 else 0
 
         total_cache_loc_size = cache_loc_paddings[select_bs_index]
@@ -1799,6 +1798,50 @@ class ModelWorkerBatch:
                     [self.extend_start_loc, invalid_extend_start_loc], axis=0
                 )
                 # padding
+        sampling_info = self.sampling_info
+        if self.sampling_info:
+            new_temperatures = np.concatenate(
+                [
+                    sampling_info.temperatures.reshape(sampling_info.temperatures.shape[0]),
+                    np.array([1.0] * bs_padding_size, dtype=sampling_info.temperatures.dtype),
+                ]
+            ).reshape(-1, 1)
+            new_top_ps = np.concatenate(
+                [
+                    sampling_info.top_ps,
+                    np.array([1.0] * bs_padding_size, dtype=sampling_info.top_ps.dtype),
+                ]
+            )
+            new_top_ks = np.concatenate(
+                [
+                    sampling_info.top_ks,
+                    np.array([1] * bs_padding_size, dtype=sampling_info.top_ks.dtype),
+                ]
+            )
+            new_min_ps = np.concatenate(
+                [
+                    sampling_info.min_ps,
+                    np.array([0.0] * bs_padding_size, dtype=sampling_info.min_ps.dtype),
+                ]
+            )
+            updates = {
+                "temperatures": new_temperatures,
+                "top_ps": new_top_ps,
+                "top_ks": new_top_ks,
+                "min_ps": new_min_ps,
+                # "grammars": ([req.grammar for req in self.reqs] if self.has_grammar else None),
+            }
+            if sampling_info.sampling_seeds is not None:
+                updates["sampling_seeds"] = np.concatenate(
+                    [
+                        sampling_info.sampling_seeds,
+                        np.array(
+                            [DEFAULT_SAMPLING_SEED] * bs_padding_size,
+                            dtype=sampling_info.sampling_seeds.dtype,
+                        ),
+                    ]
+                )
+            sampling_info = dataclasses.replace(sampling_info, **updates)
         padding_size = 0
         if (
             self.forward_mode == ForwardMode.DRAFT_EXTEND
@@ -1827,6 +1870,7 @@ class ModelWorkerBatch:
         self.out_cache_loc = out_cache_loc_cpu
         self.req_pool_indices = req_pool_indices_cpu
         self.positions = positions_cpu
+        self.sampling_info = sampling_info
 
 
 def get_last_loc(

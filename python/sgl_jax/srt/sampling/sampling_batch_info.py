@@ -330,7 +330,7 @@ class SamplingBatchInfo:
             sampling_seeds = None
 
         ret = cls(
-            temperatures=temperatures,
+            temperatures=temperatures.reshape(-1, 1),
             top_ps=top_ps,
             top_ks=top_ks,
             min_ps=min_ps,
@@ -409,7 +409,8 @@ class SamplingBatchInfo:
             self.linear_penalty = None
 
     def filter_batch(self, keep_indices: np.ndarray):
-        self.penalizer_orchestrator.filter(keep_indices)
+        if self.penalizer_orchestrator is not None:
+            self.penalizer_orchestrator.filter(keep_indices)
 
         for item in [
             "temperatures",
@@ -429,7 +430,8 @@ class SamplingBatchInfo:
             self.vocab_mask = self.vocab_mask[keep_indices]
 
     def merge_batch(self, other: SamplingBatchInfo):
-        self.penalizer_orchestrator.merge(other.penalizer_orchestrator)
+        if self.penalizer_orchestrator is not None:
+            self.penalizer_orchestrator.merge(other.penalizer_orchestrator)
         # Note: because the __len()__ operator is defined on the temperatures tensor,
         # please make sure any merge operation with len(self) or len(other) is done before
         # the merge operation of the temperatures tensor below.
