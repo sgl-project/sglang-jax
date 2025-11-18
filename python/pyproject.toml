@@ -49,7 +49,7 @@ tpu = [
     "jax[tpu]~=0.8.0",
 ]
 gpu = [
-    "jax[cuda12]~=0.7.1",
+    "jax[cuda12]~=0.8.0",
 ]
 all = [
     "jax[tpu]~=0.8.0",
