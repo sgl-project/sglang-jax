@@ -161,6 +161,7 @@ class Req:
         top_logprobs_num: int = 0,
         token_ids_logprob: list[int] = None,
         stream: bool = False,
+        lora_id: str | None = None,
         extra_key: str | None = None,
         origin_input_ids_unpadded: tuple[int] | None = None,
         eos_token_ids: set[int] | None = None,
@@ -185,7 +186,12 @@ class Req:
         self.sampling_params = sampling_params
         self.return_hidden_states = return_hidden_states
 
+        # Extra key for cache namespace isolation (e.g., cache_salt, lora_id)
+        if lora_id is not None:
+            extra_key = (extra_key or "") + lora_id  # lora_id is concatenated to the extra key
+
         self.extra_key = extra_key
+        self.lora_id = lora_id if lora_id is not None else "0"
 
         # Memory pool info
         self.req_pool_idx: int | None = None
