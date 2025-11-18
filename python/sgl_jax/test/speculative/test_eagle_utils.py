@@ -4,14 +4,14 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+from sgl_jax.srt.kernels.speculative.tree_speculative_sampling_target_only_kernel import (
+    tree_speculative_sampling_target_only_pallas_call,
+)
+from sgl_jax.srt.kernels.speculative.verify_tree_greedy_kernel import verify_tree_greedy
 from sgl_jax.srt.speculative.eagle_util import (
     build_tree_mask_for_draft_decode,
     create_extend_after_decode_spec_info,
 )
-from sgl_jax.srt.speculative.pallas.tree_speculative_sampling_target_only_kernel import (
-    tree_speculative_sampling_target_only_pallas_call,
-)
-from sgl_jax.srt.speculative.pallas.verify_tree_greedy_kernel import verify_tree_greedy
 from sgl_jax.test.test_utils import CustomTestCase
 
 

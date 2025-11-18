@@ -20,6 +20,16 @@ from sgl_jax.srt.layers.logits_processor import LogitsProcessorOutput
 if TYPE_CHECKING:
     from sgl_jax.srt.managers.scheduler import GenerationBatchResult
 
+from sgl_jax.srt.kernels.speculative.build_eagle_tree_structure_kernel import (
+    build_eagle_tree_structure,
+)
+from sgl_jax.srt.kernels.speculative.kernel import (
+    create_extend_after_decode_spec_info,
+    top_k_renorm_prob,
+    top_p_renorm_prob,
+    tree_speculative_sampling_target_only,
+)
+from sgl_jax.srt.kernels.speculative.verify_tree_greedy_kernel import verify_tree_greedy
 from sgl_jax.srt.managers.schedule_batch import (
     ModelWorkerBatch,
     ScheduleBatch,
@@ -32,16 +42,6 @@ from sgl_jax.srt.mem_cache.common import (
     alloc_token_slots,
 )
 from sgl_jax.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
-from sgl_jax.srt.speculative.pallas.build_eagle_tree_structure_kernel import (
-    build_eagle_tree_structure,
-)
-from sgl_jax.srt.speculative.pallas.kernel import (
-    create_extend_after_decode_spec_info,
-    top_k_renorm_prob,
-    top_p_renorm_prob,
-    tree_speculative_sampling_target_only,
-)
-from sgl_jax.srt.speculative.pallas.verify_tree_greedy_kernel import verify_tree_greedy
 
 logger = logging.getLogger(__name__)
 
