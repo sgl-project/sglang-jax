@@ -79,6 +79,9 @@ class BaseGrammarBackend:
         """
         self.cache[key] = value
 
+    def reset(self):
+        self.cache.clear()
+
     def _dispatch(self, key_type: str, key_string: str) -> BaseGrammarObject:
         """Dispatch grammar creation based on type.
 
