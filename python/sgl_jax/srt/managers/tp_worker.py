@@ -453,11 +453,39 @@ class ModelWorker:
                 self._update_grammar_vocab_mask(model_worker_batch, sampling_metadata)
 
             with jtu.count_pjit_cpp_cache_miss() as count:
-                next_token_ids_device = self.model_runner.sample(
+                next_token_ids_device, new_logits_output = self.model_runner.sample(
                     logits_output,
                     sampling_metadata,
                 )
                 cache_miss_count += count()
+        if new_logits_output is not None:
+            logits_output = new_logits_output
+            if logits_output.next_token_top_logprobs_val is not None:
+                logits_output.next_token_top_logprobs_val = (
+                    logits_output.next_token_top_logprobs_val.astype(jnp.float32).tolist()
+                )
+                logits_output.next_token_top_logprobs_idx = (
+                    logits_output.next_token_top_logprobs_idx.tolist()
+                )
+            if logits_output.next_token_token_ids_logprobs_val is not None:
+                logits_output.next_token_token_ids_logprobs_val = (
+                    logits_output.next_token_token_ids_logprobs_val.astype(jnp.float32).tolist()
+                )
+                logits_output.next_token_token_ids_logprobs_idx = (
+                    logits_output.next_token_token_ids_logprobs_idx.tolist()
+                )
+            if logits_output.input_token_ids_logprobs_val is not None:
+                logits_output.input_token_ids_logprobs_val = (
+                    logits_output.input_token_ids_logprobs_val.astype(jnp.float32).tolist()
+                )
+                logits_output.input_token_ids_logprobs_idx = (
+                    logits_output.input_token_ids_logprobs_idx.tolist()
+                )
+            if logits_output.input_top_logprobs_val is not None:
+                logits_output.input_top_logprobs_val = logits_output.input_top_logprobs_val.astype(
+                    jnp.float32
+                ).tolist()
+                logits_output.input_top_logprobs_idx = logits_output.input_top_logprobs_idx.tolist()
 
         return (
             logits_output,
