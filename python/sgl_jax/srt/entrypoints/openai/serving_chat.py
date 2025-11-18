@@ -77,6 +77,8 @@ class OpenAIServingChat(OpenAIServingBase):
 
         adapted_request = GenerateReqInput(
             **prompt_kwargs,
+            image_data=processed_messages.image_data,
+            modalities=processed_messages.modalities,
             sampling_params=sampling_params,
             return_logprob=request.logprobs,
             logprob_start_len=-1,

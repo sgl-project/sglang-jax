@@ -117,9 +117,9 @@ class TemplateManager:
         Returns the chat template string if found, None otherwise.
         """
         try:
-            # if processor := tokenizer_manager.processor:
-            #     if hasattr(processor, "chat_template") and processor.chat_template:
-            #         return processor.chat_template
+            if processor := tokenizer_manager.processor:
+                if hasattr(processor, "chat_template") and processor.chat_template:
+                    return processor.chat_template
             if tokenizer := tokenizer_manager.tokenizer:
                 if hasattr(tokenizer, "chat_template") and tokenizer.chat_template:
                     return tokenizer.chat_template

@@ -8,7 +8,13 @@ from typing import Any, Literal
 import numpy as np
 
 from sgl_jax.srt.managers.schedule_batch import BaseFinishReason
+from sgl_jax.srt.utils import ImageData
 
+# Handle serialization of Image for pydantic
+if TYPE_CHECKING:
+    from PIL.Image import Image
+else:
+    Image = Any
 
 @dataclass
 class BaseReq:
@@ -118,6 +124,8 @@ class TokenizedGenerateReqInput:
     text: list[str] | str | None = None
     # The token ids for text; one can specify either text or input_ids
     input_ids: list[list[int]] | list[int] | None = None
+    # The multimodal inputs
+    mm_inputs: dict | None = None
     # The sampling_params. See descriptions below.
     sampling_params: list[dict] | dict | None = None
     # Whether to return logprobs.
@@ -209,6 +217,21 @@ class EmbeddingReqInput:
     # Extra key for cache namespace isolation
     extra_key: str | None = None
 
+# Type definitions for multimodal input data
+# Individual data item types for each modality
+ImageDataInputItem = Union[Image, str, ImageData, Dict]
+AudioDataInputItem = Union[str, Dict]
+VideoDataInputItem = Union[str, Dict]
+# Union type for any multimodal data item
+MultimodalDataInputItem = Union[
+    ImageDataInputItem, VideoDataInputItem, AudioDataInputItem
+]
+# Format types supporting single items, lists, or nested lists for batch processing
+MultimodalDataInputFormat = Union[
+    List[List[MultimodalDataInputItem]],
+    List[MultimodalDataInputItem],
+    MultimodalDataInputItem,
+]
 
 @dataclass
 class GenerateReqInput:
@@ -220,6 +243,11 @@ class GenerateReqInput:
     input_ids: list[list[int]] | list[int] | None = None
     # The embeddings for input_ids; one can specify either text or input_ids or input_embeds.
     input_embeds: list[list[list[float]]] | list[list[float]] | None = None
+    image_data: Optional[MultimodalDataInputFormat] = None
+    # The video input. Like image data, it can be a file name, a url, or base64 encoded string.
+    video_data: Optional[MultimodalDataInputFormat] = None
+    # The audio input. Like image data, it can be a file name, a url, or base64 encoded string.
+    audio_data: Optional[MultimodalDataInputFormat] = None
     sampling_params: Any | None = (
         None  # Using Any for now to avoid SamplingParams serialization issues
     )
@@ -242,6 +270,15 @@ class GenerateReqInput:
     lora_id: list[str] | str | None = None
     # Extra key for cache namespace isolation (e.g., cache_salt)
     extra_key: list[str] | str | None = None
+    # The modalities of the image data [image, multi-images, video]
+    modalities: Optional[List[str]] = None
+
+    def contains_mm_input(self) -> bool:
+        return (
+            has_valid_data(self.image_data)
+            or has_valid_data(self.video_data)
+            or has_valid_data(self.audio_data)
+        )
 
     return_routed_experts: list[bool] | bool | None = None
 
@@ -332,6 +369,7 @@ class GenerateReqInput:
         # Expand input based on type
         self._expand_inputs(num)
         self._normalize_rid(num)
+        self._normalize_image_data(num)
         self._normalize_sampling_params(num)
         self._normalize_logprob_params(num)
         self._normalize_lora_paths(num)
@@ -351,6 +389,48 @@ class GenerateReqInput:
             if not isinstance(self.input_embeds, list):
                 raise ValueError("input_embeds should be a list for batch processing.")
             self.input_embeds = self.input_embeds * self.parallel_sample_num
+
+    def _normalize_image_data(self, num):
+            """Normalize image data for batch processing."""
+            if self.image_data is None:
+                self.image_data = [None] * num
+            elif not isinstance(self.image_data, list):
+                # Single image, convert to list of single-image lists
+                self.image_data = [[self.image_data]] * num
+                self.modalities = ["image"] * num
+            elif isinstance(self.image_data, list):
+                # Handle empty list case - treat as no images
+                if len(self.image_data) == 0:
+                    self.image_data = [None] * num
+                    return
+
+                if len(self.image_data) != self.batch_size:
+                    raise ValueError(
+                        "The length of image_data should be equal to the batch size."
+                    )
+
+                self.modalities = []
+                if len(self.image_data) > 0 and isinstance(self.image_data[0], list):
+                    # Already a list of lists, keep as is
+                    for i in range(len(self.image_data)):
+                        if self.image_data[i] is None or self.image_data[i] == [None]:
+                            self.modalities.append(None)
+                        elif len(self.image_data[i]) == 1:
+                            self.modalities.append("image")
+                        elif len(self.image_data[i]) > 1:
+                            self.modalities.append("multi-images")
+                        else:
+                            # Ensure len(self.modalities) == len(self.image_data)
+                            self.modalities.append(None)
+                    # Expand parallel_sample_num
+                    self.image_data = self.image_data * self.parallel_sample_num
+                    self.modalities = self.modalities * self.parallel_sample_num
+                else:
+                    # List of images for a batch, wrap each in a list
+                    wrapped_images = [[img] for img in self.image_data]
+                    # Expand for parallel sampling
+                    self.image_data = wrapped_images * self.parallel_sample_num
+                    self.modalities = ["image"] * num
 
     def _validate_inputs(self):
         """Validate that the input configuration is valid."""
