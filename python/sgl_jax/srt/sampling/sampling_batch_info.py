@@ -136,7 +136,6 @@ class SamplingMetadata:
         # Extract penalty information from penalizer orchestrator
         linear_penalty_device = None
         do_penalties = False
-        # Use P(None, None) to match logits sharding in sampler, avoiding resharding overhead
         linear_penalty_sharding = (
             NamedSharding(mesh, PartitionSpec(None, "tensor")) if jax.process_count() == 1 else None
         )

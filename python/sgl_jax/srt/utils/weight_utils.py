@@ -69,7 +69,6 @@ class WeightLoader:
         self.model_config = model_config
         self.mesh = mesh
         self.dtype = dtype
-        # Check if in dummy mode (set by JAXDummyModelLoader)
         self.dummy_mode = getattr(model_config, "_dummy_mode", False)
 
         self.num_heads = model_config.num_attention_heads
