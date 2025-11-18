@@ -1,4 +1,4 @@
-## Grok-2 Model Server Launch Guide (sglang-jax)
+## Grok-2 Model Server Launch on SkyPilot
 ### Hardware Requirements
 #### Minimum TPU Setup (v6e-32) topology:
 - Total nodes: 8
