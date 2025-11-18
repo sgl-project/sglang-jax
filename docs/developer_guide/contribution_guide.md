@@ -1,4 +1,4 @@
-# [Draft]Contribution Guide
+# Contribution Guide
 
 Welcome to **SGLang-Jax**! We appreciate your interest in contributing. This guide provides a concise overview of how to set up your environment, run tests, build documentation, and open a Pull Request (PR).
 
