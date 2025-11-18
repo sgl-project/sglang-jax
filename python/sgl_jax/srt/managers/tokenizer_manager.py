@@ -28,6 +28,7 @@ from fastapi import BackgroundTasks
 
 from sgl_jax.srt.configs.model_config import ModelConfig
 from sgl_jax.srt.hf_transformers_utils import get_tokenizer
+from sgl_jax.srt.lora import LoRARegistry
 from sgl_jax.srt.managers.io_struct import (
     AbortReq,
     BatchEmbeddingOut,
@@ -192,6 +193,9 @@ class TokenizerManager:
             self.send_to_scheduler, server_args.dp_size
         )
 
+        # LoRA
+        self.lora_registry = LoRARegistry(self.server_args.lora_paths)
+
         self._result_dispatcher = TypeBasedDispatcher(
             [
                 (
@@ -244,6 +248,10 @@ class TokenizerManager:
 
         self.auto_create_handle_loop()
         obj.normalize_batch_and_arguments()
+
+        # Acquire LoRA ID if lora_path is provided
+        if isinstance(obj, GenerateReqInput) and self.server_args.enable_lora and obj.lora_path:
+            obj.lora_id = await self.lora_registry.acquire(obj.lora_path)
 
         if isinstance(obj, EmbeddingReqInput) and self.is_generation:
             raise ValueError(
@@ -349,6 +357,7 @@ class TokenizerManager:
             obj.top_logprobs_num,
             obj.token_ids_logprob,
             obj.stream,
+            obj.lora_id,
         )
         # note: When only `return_logprob` is specified, we assume that only the output probability is required.
         if (
@@ -964,6 +973,14 @@ class TokenizerManager:
             if state.finished:
                 state.finished_time = time.time()
                 meta_info["e2e_latency"] = state.finished_time - state.created_time
+                # Release LoRA ID if it was acquired
+                # Note: Only GenerateReqInput supports LoRA, not EmbeddingReqInput
+                if (
+                    isinstance(state.obj, GenerateReqInput)
+                    and self.server_args.enable_lora
+                    and state.obj.lora_id
+                ):
+                    asyncio.create_task(self.lora_registry.release(state.obj.lora_id))
                 del self.rid_to_state[rid]
 
             state.out_list.append(out_dict)
