@@ -70,18 +70,25 @@ class Sampler(nnx.Module):
         """Process logprob results when return_logprob=True"""
         logits_output, sampling_metadata, batch_next_token_ids, logprobs = operands
 
+        (
+            next_token_logprobs,
+            next_token_top_logprobs_val,
+            next_token_top_logprobs_idx,
+            next_token_token_ids_logprobs_val,
+            next_token_token_ids_logprobs_idx,
+        ) = (None, None, None, None, None)
         # Set next_token_logprobs
         out_sharding = NamedSharding(self.mesh, P(None))
         indices = (np.arange(len(batch_next_token_ids)), batch_next_token_ids)
-        logits_output.next_token_logprobs = logprobs.at[indices].get(out_sharding=out_sharding)
+        next_token_logprobs = logprobs.at[indices].get(out_sharding=out_sharding)
 
         # Set top_logprobs if needed
         if sampling_metadata.top_logprobs_nums is not None and any(
             x > 0 for x in sampling_metadata.top_logprobs_nums
         ):
             (
-                logits_output.next_token_top_logprobs_val,
-                logits_output.next_token_top_logprobs_idx,
+                next_token_top_logprobs_val,
+                next_token_top_logprobs_idx,
             ) = get_top_logprobs(logprobs, sampling_metadata.top_logprobs_nums)
 
         # Set token_ids_logprobs if needed
@@ -89,11 +96,23 @@ class Sampler(nnx.Module):
             x is not None for x in sampling_metadata.token_ids_logprobs
         ):
             (
-                logits_output.next_token_token_ids_logprobs_val,
-                logits_output.next_token_token_ids_logprobs_idx,
+                next_token_token_ids_logprobs_val,
+                next_token_token_ids_logprobs_idx,
             ) = get_token_ids_logprobs(logprobs, sampling_metadata.token_ids_logprobs, self.mesh)
 
-        return None
+        return LogitsProcessorOutput(
+            next_token_logits=logits_output.next_token_logits,
+            next_token_logprobs=next_token_logprobs,
+            next_token_top_logprobs_val=next_token_top_logprobs_val,
+            next_token_top_logprobs_idx=next_token_top_logprobs_idx,
+            next_token_token_ids_logprobs_val=next_token_token_ids_logprobs_val,
+            next_token_token_ids_logprobs_idx=next_token_token_ids_logprobs_idx,
+            input_token_logprobs=logits_output.input_token_logprobs,
+            input_top_logprobs_val=logits_output.input_top_logprobs_val,
+            input_top_logprobs_idx=logits_output.input_top_logprobs_idx,
+            input_token_ids_logprobs_val=logits_output.input_token_ids_logprobs_val,
+            input_token_ids_logprobs_idx=logits_output.input_token_ids_logprobs_idx,
+        )
 
     def _apply_linear_penalty(self, operands):
         """
@@ -150,6 +169,7 @@ class Sampler(nnx.Module):
             sampling_metadata: Metadata for sampling
             use_sort_for_toppk_minp: whether use sort when dealing with top_k, top_k and min_p.
         """
+
         # Apply penalties before sampling
         logits = lax.cond(
             sampling_metadata.do_penalties,
@@ -182,28 +202,23 @@ class Sampler(nnx.Module):
             batch_next_token_ids,
             logprobs,
         )
-        lax.cond(
-            sampling_metadata.return_logprob,
-            self._process_logprob_results,
-            lambda operands: None,
-            logprob_operands,
-        )
+        new_logits_output = None
+        if sampling_metadata.return_logprob:
+            new_logits_output = self._process_logprob_results(logprob_operands)
 
-        return batch_next_token_ids
+        return batch_next_token_ids, new_logits_output
 
 
 def get_top_logprobs(logprobs: jax.Array, top_logprobs_nums: list[int]):
     max_k = max(top_logprobs_nums)
     values, indices = jax.lax.top_k(logprobs, max_k)
-    values = values.tolist()
-    indices = indices.tolist()
 
     output_top_logprobs_val = []
     output_top_logprobs_idx = []
     for i, k in enumerate(top_logprobs_nums):
         output_top_logprobs_val.append(values[i][:k])
         output_top_logprobs_idx.append(indices[i][:k])
-    return output_top_logprobs_val, output_top_logprobs_idx
+    return jnp.array(output_top_logprobs_val), jnp.array(output_top_logprobs_idx)
 
 
 def get_token_ids_logprobs(logprobs: jax.Array, token_ids_logprobs: list[list[int]], mesh: Mesh):
@@ -213,14 +228,14 @@ def get_token_ids_logprobs(logprobs: jax.Array, token_ids_logprobs: list[list[in
     for i, token_ids in enumerate(token_ids_logprobs):
         if token_ids is not None:
             output_token_ids_logprobs_val.append(
-                logprobs.at[i, token_ids].get(out_sharding=out_sharding).tolist()
+                logprobs.at[i, token_ids].get(out_sharding=out_sharding)
             )
             output_token_ids_logprobs_idx.append(token_ids)
         else:
             output_token_ids_logprobs_val.append([])
             output_token_ids_logprobs_idx.append([])
 
-    return output_token_ids_logprobs_val, output_token_ids_logprobs_idx
+    return jnp.array(output_token_ids_logprobs_val), jnp.array(output_token_ids_logprobs_idx)
 
 
 def multinomial(

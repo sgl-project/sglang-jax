@@ -66,7 +66,6 @@ class SchedulerOutputProcessorMixin:
                     logits_output.input_token_logprobs = tuple(
                         jax.device_get(logits_output.input_token_logprobs).astype(float)
                     )
-
         # Check finish conditions
         logprob_pt = 0
         for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
@@ -317,8 +316,6 @@ class SchedulerOutputProcessorMixin:
                 assert req.input_token_logprobs_val is not None
             return
 
-        # Important for the performance.
-        assert isinstance(output.input_token_logprobs, tuple)
         input_token_logprobs: tuple[int] = output.input_token_logprobs
         input_token_logprobs = input_token_logprobs[logprob_pt : logprob_pt + num_input_logprobs]
         req.input_token_logprobs.extend(input_token_logprobs)
