@@ -26,7 +26,10 @@ setup: |
   chmod 600 ~/.ssh/id_rsa
   rm ~/.ssh/config
   GIT_SSH_COMMAND="ssh -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no" git clone git@github.com:sgl-project/sglang-jax.git
+  sudo mount -t tmpfs -o size=200G tmpfs /tmp # Suggestion: This configuration is suitable to model whose parameters are less than 100B. And this directory will be used to store model which downloads from HuggingFace.
 ```
+
+Note: If you want to test model whose parameters are bigger than 100B, we recommend you to use GCS. Please contact us with [Slack](https://sgl-fru7574.slack.com/archives/C09EBE5HT5X).
 
 ## Scenarios
 
