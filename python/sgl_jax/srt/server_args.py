@@ -967,7 +967,7 @@ class ServerArgs:
     def check_lora_server_args(self):
         """Validate and normalize LoRA-related server arguments."""
         # Import LoRARef here to avoid circular imports
-        from sgl_jax.srt.lora import LoRARef
+        from sgl_jax.srt.lora.lora_registry import LoRARef
 
         # Validate max_loras_per_batch
         assert self.max_loras_per_batch > 0, "max_loras_per_batch must be positive"
