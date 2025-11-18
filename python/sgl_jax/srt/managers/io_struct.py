@@ -163,12 +163,14 @@ class GenerateReqInput:
     token_ids_logprob: list[list[int]] | list[int] | None = None
     # Whether to detokenize tokens in text in the returned logprobs.
     return_text_in_logprobs: bool = True
+
     # The path to the LoRA adaptors
     lora_path: list[str] | str | None = None
     # The uid of LoRA adaptors, should be initialized by tokenizer manager
     lora_id: list[str] | str | None = None
     # Extra key for cache namespace isolation (e.g., cache_salt)
     extra_key: list[str] | str | None = None
+
 
     def _normalize_rid(self, num):
         """Normalize request IDs for batch processing."""
