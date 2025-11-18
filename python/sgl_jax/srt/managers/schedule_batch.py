@@ -136,6 +136,7 @@ class Req:
         top_logprobs_num: int = 0,
         token_ids_logprob: list[int] = None,
         stream: bool = False,
+        lora_id: str | None = None,
         origin_input_ids_unpadded: tuple[int] | None = None,
         eos_token_ids: set[int] | None = None,
         vocab_size: int | None = None,
@@ -156,6 +157,9 @@ class Req:
 
         # Sampling info
         self.sampling_params = sampling_params
+
+        # LoRA info
+        self.lora_id = lora_id
 
         # Memory pool info
         self.req_pool_idx: int | None = None
