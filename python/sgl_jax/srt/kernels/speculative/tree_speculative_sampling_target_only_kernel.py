@@ -53,7 +53,7 @@ def _tree_speculative_sampling_target_only_kernel(
     def init_accept_index():
         def body(i, _):
             o_accept_index_ref.at[bid, i].set(-1)
-            return ()
+            return None
 
         jax.lax.fori_loop(
             0,
