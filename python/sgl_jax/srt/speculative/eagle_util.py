@@ -57,6 +57,8 @@ def _is_jax_leaf(value: Any) -> bool:
 
 def _as_int32_array(value: Any, *, fallback: int = -1) -> jax.Array:
     """Convert scalar-like inputs into scalar int32 JAX arrays."""
+    if value is None:
+        return None
     if isinstance(value, jax.Array):
         return value
     if isinstance(value, numpy.ndarray):

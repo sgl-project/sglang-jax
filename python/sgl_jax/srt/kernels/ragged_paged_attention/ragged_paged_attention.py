@@ -9,6 +9,7 @@ during inference.
 """
 
 import functools
+import logging
 
 import jax
 import jax.numpy as jnp
@@ -26,6 +27,7 @@ from sgl_jax.srt.kernels.ragged_paged_attention.util import (
 )
 
 DEFAULT_MASK_VALUE = -0.7 * float(jnp.finfo(jnp.dtype("float32")).max)
+logger = logging.getLogger(__name__)
 
 
 def ref_ragged_paged_attention_fused(
@@ -127,12 +129,10 @@ def ref_ragged_paged_attention(
     v_scale: float | None = None,
     xai_temperature_len: float | None = None,
 ):
-    if causal:
-        pass
-    else:
+    if not causal:
         assert (
-            custom_mask is None or custom_mask.size < jnp.cumsum(kv_lens)[-1]
-        ), "use custom_mask, custom_mask length must larger than total kv length"
+            custom_mask is not None and custom_mask.size > jnp.cumsum(kv_lens)[-1]
+        ), f"use custom_mask, custom_mask length {custom_mask.size=} must larger than total kv length {jnp.cumsum(kv_lens)[-1]=}"
     if mask_value is None:
         mask_value = DEFAULT_MASK_VALUE
     _, _, num_kv_heads, head_dim = k_pages.shape
@@ -1383,9 +1383,15 @@ def ragged_paged_attention(
     seq_mask_lens = kv_lens * q_lens
     cu_seq_mask_lens = jnp.concatenate([jnp.array([0], dtype=jnp.int32), jnp.cumsum(seq_mask_lens)])
     if custom_mask is not None:
-        assert (
-            custom_mask.dtype != jnp.bool
-        ), "custom_mask bool dtype is not supported, use int32 instead. 0: False, 1: True"
+        if custom_mask.dtype == jnp.bool_:
+            logger.warning(
+                "custom_mask bool dtype detected in ragged_paged_attention; converting to int32 (0:False, 1:True)."
+            )
+            custom_mask = custom_mask.astype(jnp.int32)
+        else:
+            assert (
+                custom_mask.dtype == jnp.int32
+            ), "custom_mask bool dtype is not supported, use int32 instead. 0: False, 1: True"
 
         custom_mask = jnp.repeat(jnp.expand_dims(custom_mask, axis=1), repeats=head_dim, axis=1)
 

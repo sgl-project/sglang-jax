@@ -244,7 +244,7 @@ def create_test_data(
     )
 
     if not causal:
-        forward_mode = ForwardMode.TARGET_VERIFY
+        forward_mode = ForwardMode.EXTEND
         custom_mask = create_custom_mask(lens)
         spec_info = EagleVerifyInput(
             draft_token=None,
@@ -308,6 +308,18 @@ def create_test_data(
         spec_info=spec_info,
     )
     fb.attn_backend.forward_metadata = attention_backend.get_forward_metadata(mwb)
+    if fb.spec_info is not None:
+        from jax.sharding import NamedSharding
+        from jax.sharding import PartitionSpec as P
+
+        from sgl_jax.srt.utils.jax_utils import device_array
+
+        fb.attn_backend.forward_metadata.custom_mask = device_array(
+            (fb.spec_info.custom_mask),
+            sharding=(
+                NamedSharding(attention_backend.mesh, P()) if jax.process_count() == 1 else None
+            ),
+        )
     return fb, current_kv_cache, q, k, v
 
 
