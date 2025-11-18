@@ -830,3 +830,9 @@ class TestDraftDecodeMask(CustomTestCase):
         assert draft_tokens.shape[0] > 0, "draft_tokens should not be empty"
 
         print("Simple case test passed!")
+
+
+if __name__ == "__main__":
+    import unittest
+
+    unittest.main()
