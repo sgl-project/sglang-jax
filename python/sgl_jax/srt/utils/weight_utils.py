@@ -5,6 +5,7 @@ from dataclasses import dataclass
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from flax import nnx
 from jax.sharding import Mesh
 from jax.sharding import PartitionSpec as P
@@ -68,6 +69,8 @@ class WeightLoader:
         self.model_config = model_config
         self.mesh = mesh
         self.dtype = dtype
+        # Check if in dummy mode (set by JAXDummyModelLoader)
+        self.dummy_mode = getattr(model_config, "_dummy_mode", False)
 
         self.num_heads = model_config.num_attention_heads
         self.num_kv_heads = (
@@ -101,8 +104,22 @@ class WeightLoader:
         self,
         weight_mappings: dict[str, str | list[str] | WeightMapping],
         safetensors_partition=1,
+        dummy=False,
     ):
+        """Load weights from safetensors files or generate dummy weights.
+
+        Args:
+            weight_mappings: Mapping from HF keys to model paths with sharding info
+            safetensors_partition: Number of safetensors partitions
+            dummy: If True, generate random weights instead of loading from files
+        """
         params = nnx.state(self.model)
+
+        # Dummy mode: generate random weights using mapping's sharding info
+        # Can be explicitly passed or set via model_config._dummy_mode
+        if dummy or self.dummy_mode:
+            self._load_dummy_weights(params, weight_mappings)
+            return
 
         regular_mappings = {}
         moe_mappings = {}
@@ -241,6 +258,185 @@ class WeightLoader:
         model_param.value = sharded_weight.astype(model_param.value.dtype)
 
         logger.debug("Assigned MoE group %s, shape: %s", moe_key, stacked_weight.shape)
+
+    def _load_dummy_weights(
+        self,
+        params: nnx.State,
+        weight_mappings: dict[str, str | list[str] | WeightMapping],
+        seed: int = 1234,
+    ):
+        logger.info("Generating dummy weights with proper sharding from weight mappings")
+        # Separate regular and MOE weights
+        regular_mappings = {}
+        moe_mappings = {}
+
+        for hf_key, mapping in weight_mappings.items():
+            if hf_key.startswith("__MOE_EXPERTS__"):
+                moe_mappings[hf_key] = mapping
+            else:
+                regular_mappings[hf_key] = mapping
+
+        # Process regular weights
+        for hf_key, mapping in regular_mappings.items():
+
+            if isinstance(mapping, (str, list)):
+                mapping = WeightMapping(target_path=mapping)
+
+            target_path = (
+                mapping.target_path
+                if isinstance(mapping.target_path, str)
+                else mapping.target_path[0]
+            )
+
+            try:
+                model_param = self._get_param(params, target_path)
+            except (KeyError, AttributeError, ValueError):
+                logger.debug("Skip dummy weight for %s (parameter not found)", target_path)
+                continue
+
+            shape = model_param.value.shape
+            dtype = model_param.value.dtype
+
+            # Generate dummy weight with correct sharding
+            sharding_spec = P(*mapping.sharding) if mapping.sharding else P()
+            sharding = jax.sharding.NamedSharding(self.mesh, sharding_spec)
+
+            def make_shard(indices, shape=shape, dtype=dtype):
+                # Compute shard shape from global shape and indices
+                shard_shape = []
+                for dim_size, idx in zip(shape, indices):
+                    if isinstance(idx, slice):
+                        start, stop, step = idx.indices(dim_size)
+                        assert step == 1, f"Non-unit step not supported: {idx}"
+                        shard_shape.append(stop - start)
+                    else:
+                        shard_shape.append(1)
+                shard_shape = tuple(shard_shape)
+
+                # Generate random data
+                rng = np.random.default_rng(seed)
+                if jnp.issubdtype(dtype, jnp.floating):
+                    if dtype == jnp.bfloat16:
+                        gen_dtype = np.float32
+                    else:
+                        gen_dtype = {
+                            jnp.float16: np.float16,
+                            jnp.float32: np.float32,
+                            jnp.float64: np.float64,
+                        }.get(dtype, np.float32)
+                    arr_np = rng.uniform(-1e-3, 1e-3, size=shard_shape).astype(gen_dtype)
+                    return jnp.asarray(arr_np, dtype=dtype)
+                else:
+                    # Non-floating types, just zeros
+                    return jnp.zeros(shard_shape, dtype=dtype)
+
+            dummy_weight = jax.make_array_from_callback(shape, sharding, make_shard)
+            model_param.value = dummy_weight
+            logger.debug(
+                "Generated dummy weight for %s, shape=%s, sharding=%s",
+                target_path,
+                shape,
+                sharding_spec,
+            )
+
+        # Process MOE weights
+        for moe_key, mapping in moe_mappings.items():
+            if isinstance(mapping, (str, list)):
+                mapping = WeightMapping(target_path=mapping)
+
+            target_path = mapping.target_path[0]
+
+            try:
+                model_param = self._get_param(params, target_path)
+            except (KeyError, AttributeError, ValueError):
+                logger.debug("Skip dummy MOE weight for %s (parameter not found)", target_path)
+                continue
+
+            # Expected shape: (num_experts, ...)
+            full_shape = model_param.value.shape
+            num_experts = full_shape[0]
+            expert_weight_shape = full_shape[1:]
+            dtype = model_param.value.dtype
+
+            # Generate dummy weights for all experts
+            collected_weights = []
+            for expert_idx in range(num_experts):
+                # For each expert weight, generate with appropriate sharding
+                # Remove "expert" axis from sharding for individual expert weight generation
+                if mapping.sharding and "expert" in mapping.sharding:
+                    # Expert-parallel sharding: use tensor-only sharding for generation
+                    expert_sharding_tuple = tuple(s for s in mapping.sharding if s != "expert")
+                else:
+                    expert_sharding_tuple = mapping.sharding
+
+                expert_sharding_spec = P(*expert_sharding_tuple) if expert_sharding_tuple else P()
+                expert_sharding = jax.sharding.NamedSharding(self.mesh, expert_sharding_spec)
+
+                def make_expert_shard(
+                    indices, weight_shape=expert_weight_shape, weight_dtype=dtype, idx=expert_idx
+                ):
+                    shard_shape = []
+                    for dim_size, idx_val in zip(weight_shape, indices):
+                        if isinstance(idx_val, slice):
+                            start, stop, step = idx_val.indices(dim_size)
+                            assert step == 1, f"Non-unit step not supported: {idx_val}"
+                            shard_shape.append(stop - start)
+                        else:
+                            shard_shape.append(1)
+                    shard_shape = tuple(shard_shape)
+
+                    rng = np.random.default_rng(seed + idx)
+                    if jnp.issubdtype(weight_dtype, jnp.floating):
+                        gen_dtype = np.float32 if weight_dtype == jnp.bfloat16 else weight_dtype
+                        arr_np = rng.uniform(-1e-3, 1e-3, size=shard_shape).astype(gen_dtype)
+                        return jnp.asarray(arr_np, dtype=weight_dtype)
+                    else:
+                        return jnp.zeros(shard_shape, dtype=weight_dtype)
+
+                expert_weight = jax.make_array_from_callback(
+                    expert_weight_shape, expert_sharding, make_expert_shard
+                )
+                collected_weights.append(expert_weight)
+
+            # Stack all expert weights: (num_experts, ...)
+            stacked_weight = jnp.stack(collected_weights, axis=0)
+
+            # Apply final sharding with expert axis if needed
+            if mapping.sharding and "expert" in mapping.sharding:
+                # Use MOE mesh with expert parallelism
+                ep_size = getattr(self.model_config.hf_config, "ep_size", 1)
+                if ep_size > 1:
+                    world_size = self.mesh.shape.get("data", 1) * self.mesh.shape.get("tensor", 1)
+                    tp_size = world_size // ep_size
+
+                    devices = self.mesh.devices.flatten()
+                    moe_mesh = jax.sharding.Mesh(
+                        devices.reshape(ep_size, tp_size), axis_names=("expert", "tensor")
+                    )
+                    final_sharding_spec = P(*mapping.sharding)
+                    final_sharding = jax.sharding.NamedSharding(moe_mesh, final_sharding_spec)
+                else:
+                    # No expert parallelism, use regular mesh
+                    final_sharding_spec = P(*mapping.sharding)
+                    final_sharding = jax.sharding.NamedSharding(self.mesh, final_sharding_spec)
+            else:
+                final_sharding_spec = P(*mapping.sharding) if mapping.sharding else P()
+                final_sharding = jax.sharding.NamedSharding(self.mesh, final_sharding_spec)
+
+            # Reshard to final sharding
+            sharded_weight = jax.device_put(stacked_weight, final_sharding)
+            model_param.value = sharded_weight.astype(dtype)
+
+            logger.debug(
+                "Generated dummy MOE weight for %s, shape=%s, num_experts=%s, sharding=%s",
+                target_path,
+                full_shape,
+                num_experts,
+                mapping.sharding,
+            )
+
+        nnx.update(self.model, params)
+        logger.info("Dummy weights generated successfully!")
 
     def _iterate_weights(self):
         model_path = self.model_config.model_path
