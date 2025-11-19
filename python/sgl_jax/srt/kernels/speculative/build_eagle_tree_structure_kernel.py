@@ -57,26 +57,17 @@ def _build_eagle_tree_structure_kernel(
 
     def init_output():
         def init_tree_mask():
-            def body(i, _):
-                # set invalid tokens to false
-                @pl.when(actual_batched_tree_mask_size < batched_tree_mask_capacity)
-                def _():
-                    set_tree_mask(
-                        actual_batched_tree_mask_size,
-                        batched_tree_mask_capacity - actual_batched_tree_mask_size,
-                        0,
-                    )
+            # set invalid tokens to false
+            @pl.when(actual_batched_tree_mask_size < batched_tree_mask_capacity)
+            def _():
+                set_tree_mask(
+                    actual_batched_tree_mask_size,
+                    batched_tree_mask_capacity - actual_batched_tree_mask_size,
+                    0,
+                )
 
-                # set valid tokens to true
-                set_tree_mask(0, actual_batched_tree_mask_size, 1)
-
-            jax.lax.fori_loop(
-                0,
-                draft_token_num,
-                body,
-                None,
-                unroll=draft_token_num,
-            )
+            # set valid tokens to true
+            set_tree_mask(0, actual_batched_tree_mask_size, 1)
 
         def init_positions_and_retrive():
             def body(i, _):
