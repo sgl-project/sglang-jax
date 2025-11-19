@@ -126,6 +126,7 @@ class QWen3MoeAttention(nnx.Module):
         q, _ = self.q_proj(hidden_states)
         k, _ = self.k_proj(hidden_states)
         v, _ = self.v_proj(hidden_states)
+
         q = q.reshape(-1, self.q_head_num, self.head_dim)
         k = k.reshape(-1, self.kv_head_num, self.head_dim)
         v = v.reshape(-1, self.kv_head_num, self.head_dim)
