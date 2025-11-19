@@ -26,8 +26,8 @@ class BgmvLoRABackend(BaseLoRABackend):
 
     def run_lora_a_gemm(
         self,
-        x: jax.Array,  # (s, input_dim)
-        weights: jax.Array,  # (num_lora, r, input_dim)
+        x: jax.Array,
+        weights: jax.Array,
         *args,
         **kwargs,
     ) -> jax.Array:
@@ -70,13 +70,11 @@ class BgmvLoRABackend(BaseLoRABackend):
 
     def run_qkv_lora(
         self,
-        x: jax.Array,  # (s, input_dim)
-        qkv_lora_a: jax.Array,  # (num_lora, 3 * r, input_dim)
-        qkv_lora_b: (
-            jax.Array | tuple[jax.Array]
-        ),  # (num_lora, output_dim_q + 2 * output_dim_kv, r) or ((1, num_lora, output_dim_q, r), (2, num_lora, output_dim_kv, r))
-        output_slices: tuple,  # a tuple = (output_dim_q, output_dim_kv, output_dim_kv)
-        base_output: jax.Array,  # (s, output_dim_q + 2*output_dim_kv)
+        x: jax.Array,
+        qkv_lora_a: jax.Array,
+        qkv_lora_b: jax.Array | tuple[jax.Array],
+        output_slices: tuple,
+        base_output: jax.Array,
         *args,
         **kwargs,
     ) -> jax.Array:
@@ -122,12 +120,10 @@ class BgmvLoRABackend(BaseLoRABackend):
 
     def run_gate_up_lora(
         self,
-        x: jax.Array,  # (s, input_dim)
-        gate_up_lora_a: jax.Array,  # (num_lora, 2 * r, input_dim)
-        gate_up_lora_b: (
-            jax.Array | tuple[jax.Array]
-        ),  # (num_lora, 2 * output_dim, r) or ((num_lora, output_dim, r), (num_lora, output_dim, r))
-        base_output: jax.Array,  # (s, 2 * output_dim)
+        x: jax.Array,
+        gate_up_lora_a: jax.Array,
+        gate_up_lora_b: jax.Array | tuple[jax.Array],
+        base_output: jax.Array,
         *args,
         **kwargs,
     ) -> jax.Array:
@@ -164,9 +160,9 @@ class BgmvLoRABackend(BaseLoRABackend):
     def prepare_lora_batch(
         self,
         forward_batch: ForwardBatch,
-        weight_indices: list[int],  # (bs,), please pad with -1
-        lora_ranks: list[int],  # (max_loras_per_batch,)
-        scalings: list[float],  # (max_loras_per_batch,)
+        weight_indices: list[int],
+        lora_ranks: list[int],
+        scalings: list[float],
         batch_info: LoRABatchInfo | None = None,
     ):
         lora_ranks_bs = []
