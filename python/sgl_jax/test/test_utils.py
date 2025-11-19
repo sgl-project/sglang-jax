@@ -37,6 +37,7 @@ QWEN3_CODER_30B_A3B_INSTRUCT = "Qwen/Qwen3-Coder-30B-A3B-Instruct"
 GEMMA2_2B_IT = "google/gemma-2-2b-it"
 QWEN3_32B = "google/gemma-2-2b-it"
 QWEN3_32B_EAGLE3 = "AngelSlim/Qwen3-32B_eagle3"
+DEEPSEEK_R1_QWEN_1_5B = "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"
 
 DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH = 600
 
