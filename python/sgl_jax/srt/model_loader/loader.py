@@ -156,7 +156,7 @@ class DefaultModelLoader(BaseModelLoader):
                 jax.default_device(jax.local_devices(backend="cpu")[0]),
                 safe_open(st_file, framework="flax") as f,
             ):
-                for name in f:
+                for name in list(f.keys()):
                     yield source.prefix + name, f.get_tensor(name)
 
 
