@@ -106,6 +106,8 @@ def benchmark_backend(
             cu_q_lens,
             cu_kv_lens,
             distribution,
+            custom_mask=None,
+            causal=1,
             sm_scale=sm_scale,
             vmem_limit_bytes=64 * 1024 * 1024,
         )
