@@ -193,6 +193,9 @@ class Req:
         self.extra_key = extra_key
         self.lora_id = lora_id if lora_id is not None else "0"
 
+        # LoRA info
+        self.lora_id = lora_id
+
         # Memory pool info
         self.req_pool_idx: int | None = None
 
