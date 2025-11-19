@@ -36,6 +36,7 @@ from sgl_jax.srt.model_loader.loader import get_model_loader
 from sgl_jax.srt.precision_tracer import precision_tracer
 from sgl_jax.srt.sampling.sampling_batch_info import SamplingMetadata
 from sgl_jax.srt.server_args import ServerArgs
+from sgl_jax.srt.speculative.spec_info import SpeculativeAlgorithm
 from sgl_jax.srt.utils.common_utils import get_bool_env_var
 from sgl_jax.srt.utils.jax_utils import get_available_device_memory
 
@@ -65,11 +66,13 @@ class ModelRunner:
         tp_size: int,
         server_args: ServerArgs,
         mesh: jax.sharding.Mesh,
+        is_draft_worker: bool = False,
         req_to_token_pool: ReqToTokenPool | None = None,
         token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator | None = None,
         rngs: nnx.Rngs = None,
     ):
         # Parse args
+        self.is_draft_worker = is_draft_worker
         self.model_config = model_config
         self.mem_fraction_static = mem_fraction_static
         self.device = server_args.device
@@ -88,6 +91,8 @@ class ModelRunner:
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
         self.is_hybrid = False
         self.use_mla_backend = self.model_config.attention_arch == AttentionArch.MLA
+        self.is_draft_worker = is_draft_worker
+        self.spec_algorithm = SpeculativeAlgorithm.from_string(server_args.speculative_algorithm)
 
         self.forward_pass_id = 0
 
@@ -131,6 +136,8 @@ class ModelRunner:
         self.sampler = Sampler(nnx.Rngs(server_args.random_seed), mesh=self.mesh)
         total_device_memory = self.get_available_device_memory()
         self.load_model()
+        if not self.is_draft_worker:
+            self.initialize_jit()
 
         # Check if the model is using hybrid SWA
         if (
@@ -139,8 +146,6 @@ class ModelRunner:
             and self.sliding_window_size > 0
         ):
             self.is_hybrid = True
-
-        self.initialize_jit()
 
         # Init memory pool and attention backends
         self.init_memory_pool(
@@ -247,6 +252,16 @@ class ModelRunner:
         self.start_layer = getattr(self.model, "start_layer", 0)
         self.end_layer = getattr(self.model, "end_layer", self.model_config.num_hidden_layers)
         self.num_effective_layers = self.end_layer - self.start_layer
+        if self.server_args.speculative_algorithm == "EAGLE3" and not self.is_draft_worker:
+            try:
+                # get the aux layer from draft model config
+                eagle_config = getattr(self.model_config.hf_config, "eagle_config", None)
+                eagle_aux_hidden_state_layer_ids = eagle_config["eagle_aux_hidden_state_layer_ids"]
+            except Exception as e:
+                logger.warning("get the aux layer from draft model config %s", e)
+                # if there is no aux layer, set to None
+                eagle_aux_hidden_state_layer_ids = None
+            self.model.set_eagle3_layers_to_capture(eagle_aux_hidden_state_layer_ids)
 
     def profile_max_num_token(self, total_device_memory: int):
         """
@@ -262,10 +277,12 @@ class ModelRunner:
 
         if available_kv_cache_bytes <= 0:
             raise RuntimeError("Not enough memory. Please try to increase --mem-fraction-static.")
-
+        head_dim_aligned = self.model_config.head_dim
+        if head_dim_aligned % 128 != 0:
+            head_dim_aligned = (self.model_config.head_dim + 127) // 128 * 128
         cell_size = (
             self.model_config.get_num_kv_heads(self.tp_size)
-            * self.model_config.head_dim
+            * head_dim_aligned
             * self.model_config.num_hidden_layers
             * 2
             * jnp.dtype(self.kv_cache_dtype).itemsize
@@ -283,6 +300,13 @@ class ModelRunner:
         )
 
         return max_tokens
+
+    @property
+    def is_hybrid_gdn(self):
+        return self.model_config.hf_config.architectures[0] in [
+            "Qwen3NextForCausalLM",
+            "Qwen3NextForCausalLMMTP",
+        ]
 
     def init_memory_pool(
         self,
@@ -316,6 +340,29 @@ class ModelRunner:
         SGLANG_CI_SMALL_KV_SIZE = os.environ.get("SGLANG_CI_SMALL_KV_SIZE")
         if SGLANG_CI_SMALL_KV_SIZE:
             self.max_total_num_tokens = int(SGLANG_CI_SMALL_KV_SIZE)
+
+        if self.spec_algorithm is not None and not self.spec_algorithm.is_none():
+            if self.is_draft_worker:
+                self.max_total_num_tokens = self.server_args.draft_runner_cache_size
+                max_num_reqs = self.server_args.max_num_reqs
+            else:
+                # We are sharing the `token_to_kv_pool`, and both verify and draft tokens
+                # can be concurrently allocated, so we should give a headroom for it.
+                self.server_args.draft_runner_cache_size = (
+                    self.max_total_num_tokens
+                    # draft
+                    + max_num_reqs
+                    * self.server_args.speculative_num_steps
+                    * self.server_args.speculative_eagle_topk
+                    # verify
+                    + max_num_reqs * self.server_args.speculative_num_draft_tokens
+                    # buffer
+                    + 100
+                )
+                # Target worker and draft worker shares the same indices for the
+                # token_to_kv_pool, so we should make sure to match max_total_num_tokens.
+                self.max_total_num_tokens = self.server_args.draft_runner_cache_size
+                self.server_args.max_num_reqs = max_num_reqs
 
         # Handle max_total_tokens override
         if max_total_tokens is not None:
@@ -367,7 +414,7 @@ class ModelRunner:
                 page_size=self.page_size,
                 dtype=self.kv_cache_dtype,
                 head_num=self.model_config.get_total_num_kv_heads_with_replication(self.tp_size),
-                head_dim=self.model_config.head_dim,
+                head_dim=(self.model_config.head_dim + 127) // 128 * 128,
                 layer_num=self.model_config.num_hidden_layers,
                 mesh=self.mesh,
             )
@@ -631,7 +678,7 @@ class MockModelRunner(ModelRunner):
             page_size=self.page_size,
             dtype=self.kv_cache_dtype,
             head_num=self.model_config.get_total_num_kv_heads_with_replication(self.tp_size),
-            head_dim=self.model_config.head_dim,
+            head_dim=(self.model_config.head_dim + 127) // 128 * 128,
             layer_num=self.model_config.num_hidden_layers,
             mesh=mesh,
         )

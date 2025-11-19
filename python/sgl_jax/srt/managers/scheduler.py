@@ -62,6 +62,8 @@ from sgl_jax.srt.mem_cache.swa_radix_cache import SWARadixCache
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
 from sgl_jax.srt.precision_tracer import precision_tracer
 from sgl_jax.srt.server_args import PortArgs, ServerArgs
+from sgl_jax.srt.speculative.eagle_util import EagleDraftInput
+from sgl_jax.srt.speculative.spec_info import SpeculativeAlgorithm
 from sgl_jax.srt.utils.common_utils import (
     configure_logger,
     get_bool_env_var,
@@ -101,6 +103,12 @@ class GenerationBatchResult:
     extend_logprob_start_len_per_req: list[int]
     bid: int
     cache_miss_count: int
+    # relay path: forward stream -> next step forward
+    next_draft_input: EagleDraftInput | None = None
+
+    allocate_lens: np.ndarray | None = None
+    num_accepted_tokens: int | None = None
+    accept_lens: np.ndarray | None = None
 
 
 class Scheduler(
@@ -141,7 +149,7 @@ class Scheduler(
         self.max_seq_len = server_args.max_seq_len
         self.page_size = server_args.page_size
         self.enable_overlap = not server_args.disable_overlap_schedule
-
+        self.spec_algorithm = SpeculativeAlgorithm.from_string(server_args.speculative_algorithm)
         # Init inter-process communication
         context = zmq.Context(2)
 
@@ -219,6 +227,15 @@ class Scheduler(
             mesh=self.mesh,
         )
 
+        # launch draft worker
+        if self.spec_algorithm is not None and self.spec_algorithm.is_eagle():
+            from sgl_jax.srt.speculative.eagle_worker import EAGLEWorker
+
+            self.draft_worker = EAGLEWorker(
+                server_args=server_args,
+                target_worker=self.tp_worker,
+            )
+
         # Get token and memory info from the model worker
         (
             self.max_total_num_tokens,  # total requests
@@ -265,7 +282,9 @@ class Scheduler(
         self.last_prefill_stats_tic = time.perf_counter()
         self.num_retracted_reqs: int = 0
         self.num_paused_reqs: int = 0
-
+        self.accept_token = 0
+        self.spec_num_forward_ct = 0
+        self.draft_token = 0
         # Init chunked prefill
         self.chunked_prefill_size = server_args.chunked_prefill_size
         if self.chunked_prefill_size <= 0:  # -1 means disable
@@ -317,9 +336,14 @@ class Scheduler(
         )
 
         if not server_args.disable_precompile:
-            logger.info("[Scheduler] Begins to run worker precompile.")
-            self.tp_worker.run_precompile()
-            logger.info("[Scheduler] Completes worker precompile.")
+            if self.spec_algorithm is None or self.spec_algorithm.is_none():
+                logger.info("[Scheduler] Begins to run worker precompile.")
+                self.tp_worker.run_precompile()
+                logger.info("[Scheduler] Completes worker precompile.")
+            else:
+                logger.info("[Scheduler] Begins to run spec_decode worker precompile.")
+                self.draft_worker.run_spec_decode_precompile()
+                logger.info("[Scheduler] Completes spec_decode worker precompile.")
 
     def sync_pub(self):
         logger.info(
@@ -416,6 +440,7 @@ class Scheduler(
                 head_dim=self.model_config.head_dim,
                 layer_num=self.model_config.num_hidden_layers,
                 max_seq_len=server_args.max_seq_len,
+                is_eagle=self.spec_algorithm is not None and self.spec_algorithm.is_eagle(),
             )
 
         self.decode_mem_cache_buf_multiplier = 1
@@ -1042,9 +1067,10 @@ class Scheduler(
             self.tree_cache,
             self.model_config,
             self.enable_overlap,
-            False,
-            self.chunked_req,
-            self.mesh,
+            enable_custom_logit_processor=False,
+            chunked_req=self.chunked_req,
+            mesh=self.mesh,
+            spec_algorithm=self.spec_algorithm,
         )
 
         new_batch.prepare_for_extend()
@@ -1119,38 +1145,66 @@ class Scheduler(
         # Run forward
         assert self.is_generation
 
-        (
-            precompile_token_paddings,
-            precompile_bs_paddings,
-            precompile_cache_loc_paddings,
-        ) = self.tp_worker.get_precompile_paddings()
+        if self.spec_algorithm is None or self.spec_algorithm.is_none():
+            (
+                precompile_token_paddings,
+                precompile_bs_paddings,
+                precompile_cache_loc_paddings,
+            ) = self.tp_worker.get_precompile_paddings()
 
-        model_worker_batch = batch.get_model_worker_batch(
-            precompile_token_paddings,
-            precompile_bs_paddings,
-            precompile_cache_loc_paddings,
-            self.page_size,
-        )
-
-        if self.enable_overlap:
-            # Pre-initialize ForwardBatch for overlap scheduling optimization
-            from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
-
-            model_worker_batch.forward_batch = ForwardBatch.init_new(
-                model_worker_batch, self.tp_worker.get_model_runner()
+            model_worker_batch = batch.get_model_worker_batch(
+                precompile_token_paddings,
+                precompile_bs_paddings,
+                precompile_cache_loc_paddings,
+                self.page_size,
             )
-            logits_output, next_token_ids, cache_miss_count = (
-                self.tp_worker.forward_batch_generation(model_worker_batch, sampling_metadata=None)
-            )
-            next_token_ids = next_token_ids[: model_worker_batch.real_bs]
+
+            if self.enable_overlap:
+                # Pre-initialize ForwardBatch for overlap scheduling optimization
+                from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
+
+                model_worker_batch.forward_batch = ForwardBatch.init_new(
+                    model_worker_batch, self.tp_worker.get_model_runner()
+                )
+                logits_output, next_token_ids, cache_miss_count = (
+                    self.tp_worker.forward_batch_generation(
+                        model_worker_batch, sampling_metadata=None
+                    )
+                )
+                next_token_ids = next_token_ids[: model_worker_batch.real_bs]
+            else:
+                logits_output, next_token_ids_device, cache_miss_count = (
+                    self.tp_worker.forward_batch_generation(
+                        model_worker_batch, sampling_metadata=None
+                    )
+                )
+                next_token_ids = np.array(jax.device_get(next_token_ids_device))[
+                    : model_worker_batch.real_bs
+                ]
         else:
-            logits_output, next_token_ids_device, cache_miss_count = (
-                self.tp_worker.forward_batch_generation(model_worker_batch, sampling_metadata=None)
-            )
-            next_token_ids = np.array(jax.device_get(next_token_ids_device))[
-                : model_worker_batch.real_bs
-            ]
 
+            (
+                precompile_token_paddings,
+                precompile_bs_paddings,
+                precompile_cache_loc_paddings,
+            ) = self.draft_worker.get_precompile_paddings()
+            model_worker_batch = batch.get_model_worker_batch(
+                precompile_token_paddings,
+                precompile_bs_paddings,
+                precompile_cache_loc_paddings,
+                self.page_size,
+                # eagle's model_worker_batch will be modified and repadding within eagle_worker
+                skip_padding=True,
+            )
+            batch_output = self.draft_worker.forward_batch_speculative_generation(
+                model_worker_batch
+            )
+            if batch_output.accept_lens is not None:
+                batch.seq_lens = batch.seq_lens + batch_output.accept_lens
+            batch.spec_info = batch_output.next_draft_input
+            next_token_ids = batch_output.next_token_ids
+            logits_output = batch_output.logits_output
+            cache_miss_count = batch_output.cache_miss_count
         bid = model_worker_batch.bid
         batch.output_ids = next_token_ids
 
@@ -1174,7 +1228,11 @@ class Scheduler(
             bid=bid,
             cache_miss_count=cache_miss_count,
         )
-
+        if self.spec_algorithm is not None and self.spec_algorithm.is_eagle():
+            assert isinstance(batch_output.next_draft_input, EagleDraftInput)
+            ret.next_draft_input = batch_output.next_draft_input
+            ret.accept_lens = batch_output.accept_lens
+            ret.allocate_lens = batch_output.allocate_lens
         return ret
 
     def process_batch_result(
@@ -1204,6 +1262,7 @@ class Scheduler(
             self.enable_overlap,
             self.server_args.enable_custom_logit_processor,
             self.mesh,
+            spec_algorithm=self.spec_algorithm,
         )
         idle_batch.prepare_for_idle()
         return idle_batch
