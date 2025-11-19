@@ -203,6 +203,7 @@ suites = {
         TestFile("test/srt/openai_server/features/test_structural_tag.py", 2),
         TestFile("test/srt/test_srt_engine.py", 1),
         TestFile("test/srt/test_logprobs.py", 3),
+        TestFile("test/srt/test_qwen1_5_models_dummy.py", 3),
     ],
     "e2e-test-tpu-v6e-4": [
         TestFile("test/srt/openai_server/basic/test_tool_calls.py", 3),
