@@ -299,37 +299,27 @@ class EPMoE(nnx.Module):
         else:
             batch_size, seq_len = hidden_states.shape[0], hidden_states.shape[1]
             total_tokens = batch_size * seq_len
-        # Permute
-        x, sorted_selected_experts, weights, group_sizes, selected_experts = self._permute(
+
+        x, sorted_selected_experts, weights, group_sizes = self._permute(
             hidden_states, topk_ids, topk_weights
         )
 
-        # EP Dispatch
-        if self.ep_size > 1:
-            x, local_group_sizes, selected_experts = self._expert_all_to_all_dispatch(
-                x, selected_experts, expert_shard_id
-            )
-        else:
-            local_group_sizes = group_sizes
+        group_sizes = group_sizes.astype(jnp.int32)
 
-        # GMM
-        intermediate_output = self._gmm_compute_with_sharded_weights(
+        group_offset = self._dispatch(group_sizes, expert_shard_id)
+
+        intermediate_output = self._gmm_compute(
             x,
-            local_group_sizes,
-            selected_experts,
+            group_sizes,
             w0_weights,
             w1_weights,
             wo_weights,
+            group_offset,
         )
 
-        # EP Combine
         if self.ep_size > 1:
-            original_size = total_tokens * self.num_experts_per_tok
-            intermediate_output = self._expert_all_to_all_collect(
-                intermediate_output, group_sizes, expert_shard_id, original_size
-            )
+            intermediate_output = self._combine(intermediate_output)
 
-        # Unpermute
         output = self._unpermute(
             intermediate_output,
             sorted_selected_experts,
@@ -339,11 +329,9 @@ class EPMoE(nnx.Module):
         )
         return output
 
-    def _gmm_compute_with_sharded_weights(
-        self, x, local_group_sizes, selected_experts, w0_kernel, w1_kernel, wo_kernel
-    ):
+    def _gmm_compute(self, x, group_sizes, w0_kernel, w1_kernel, wo_kernel, group_offset):
         if x.shape[0] == 0:
-            empty_output = jnp.zeros((0, wo_kernel.shape[-1]), dtype=x.dtype)  # (0, hidden_dim)
+            empty_output = jnp.zeros((0, wo_kernel.shape[-1]), dtype=x.dtype)
             return empty_output
 
         m, k = x.shape[0], x.shape[1]
@@ -361,25 +349,27 @@ class EPMoE(nnx.Module):
             min(default_tile_size[1], n_gate),
             min(default_tile_size[2], n_down),
         )
-        # gate
+
+        group_sizes = group_sizes.astype(jnp.int32)
+
         layer_w0 = gmm(
             lhs=x,
             rhs=w0_kernel,
-            group_sizes=local_group_sizes,
+            group_sizes=group_sizes,
             preferred_element_type=self.dtype,
             tiling=tiling_gate,
+            group_offset=group_offset,
         )
 
-        # up
         layer_w1 = gmm(
             lhs=x,
             rhs=w1_kernel,
-            group_sizes=local_group_sizes,
+            group_sizes=group_sizes,
             preferred_element_type=self.dtype,
             tiling=tiling_gate,
+            group_offset=group_offset,
         )
 
-        # activation
         if self.activation == "silu":
             layer_act = jax.nn.silu(layer_w0)
         elif self.activation == "gelu":
@@ -388,84 +378,46 @@ class EPMoE(nnx.Module):
             raise ValueError(f"Unsupported activation function {self.activation}")
         intermediate_layer = jnp.multiply(layer_act, layer_w1)
 
-        # down
         intermediate_output = gmm(
             lhs=intermediate_layer,
             rhs=wo_kernel,
-            group_sizes=local_group_sizes,
+            group_sizes=group_sizes,
             preferred_element_type=self.dtype,
             tiling=tiling_down,
+            group_offset=group_offset,
         )
 
-        # Need to reduce over the intermediate dimension which is sharded on "tensor" axis
         if self.tp_size > 1:
             intermediate_output = jax.lax.psum(intermediate_output, "tensor")
 
         return intermediate_output
 
-    def _expert_all_to_all_dispatch(self, data, sorted_experts, expert_shard_id):
-        local_expert_size = self.experts_per_device
+    def _dispatch(self, group_sizes, expert_shard_id):
+        if self.ep_size <= 1:
+            return jnp.array(0, dtype=jnp.int32)
+        group_offset = jnp.array(expert_shard_id * self.experts_per_device, dtype=jnp.int32)
+        return group_offset
 
-        # compute each token's expert shard
-        divided_assignments = jnp.floor_divide(sorted_experts, local_expert_size)
-
-        # mask
-        belongs_to_this_shard = divided_assignments == expert_shard_id
-
-        local_experts = jnp.where(
-            belongs_to_this_shard,
-            jnp.mod(sorted_experts, local_expert_size),
-            local_expert_size,
-        )
-
-        valid_indices = jnp.nonzero(belongs_to_this_shard, size=data.shape[0])[0]
-        num_valid_tokens = jnp.sum(belongs_to_this_shard)
-
-        local_data = data[valid_indices]
-        local_experts_extracted = local_experts[valid_indices]
-
-        valid_expert_mask = jnp.arange(data.shape[0]) < num_valid_tokens
-        valid_experts_for_bincount = jnp.where(
-            valid_expert_mask, local_experts_extracted, local_expert_size
-        )
-        local_group_sizes = jnp.bincount(valid_experts_for_bincount, length=local_expert_size)
-
-        return local_data, local_group_sizes, local_experts_extracted
-
-    def _get_all_to_all_params(self, group_sizes, shard_id):
-        input_offsets = jnp.zeros(self.ep_size, dtype=group_sizes.dtype)
-        send_sizes = jnp.repeat(group_sizes[shard_id], self.ep_size)
-        output_offset = jnp.concatenate((jnp.array([0]), jnp.cumsum(group_sizes[:-1])))[shard_id]
-        output_offsets = jnp.repeat(output_offset, self.ep_size)
-        recv_sizes = group_sizes
+    def _get_all_to_all_params(
+        self,
+        tokens_group: jax.Array,
+        shard_id: jax.Array,
+        start_idx: jax.Array,
+        *,
+        ep_size: int,
+    ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+        input_offsets = jnp.full(ep_size, start_idx, dtype=tokens_group.dtype)
+        send_sizes = jnp.repeat(tokens_group[shard_id], ep_size)
+        output_offset = jnp.concatenate(
+            (jnp.array([0], dtype=tokens_group.dtype), jnp.cumsum(tokens_group[:-1]))
+        )[shard_id]
+        output_offsets = jnp.repeat(output_offset, ep_size)
+        recv_sizes = tokens_group
 
         return input_offsets, send_sizes, output_offsets, recv_sizes
 
-    def _expert_all_to_all_collect(self, data, global_group_sizes, expert_shard_id, target_size):
-        # Calculate the number of tokens to be handled by each device.
-        reshaped_group_sizes = global_group_sizes.reshape(self.ep_size, self.experts_per_device)
-        tokens_per_device = jnp.sum(reshaped_group_sizes, axis=1)
-
-        # Get parameters for ragged_all_to_all
-        input_offsets, send_sizes, output_offsets, recv_sizes = self._get_all_to_all_params(
-            tokens_per_device, expert_shard_id
-        )
-
-        # Create output shape buffer
-        output_shape = jnp.zeros((target_size, data.shape[1]), dtype=data.dtype)
-
-        # Use ragged_all_to_all to gather data from all devices
-        result = jax.lax.ragged_all_to_all(
-            data,
-            output_shape,
-            input_offsets,
-            send_sizes,
-            output_offsets,
-            recv_sizes,
-            axis_name=("expert",),
-        )
-
-        return result
+    def _combine(self, data):
+        return jax.lax.psum(data, "expert")
 
     def _permute(self, inputs, top_k_indices, top_k_weights):
         inputs_shape = inputs.shape
@@ -477,6 +429,8 @@ class EPMoE(nnx.Module):
             bsz_times_seq_len = inputs_shape[0] * inputs_shape[1]
             inputs_2d = jnp.reshape(inputs, (bsz_times_seq_len, inputs_shape[-1]))
 
+        del bsz_times_seq_len
+
         flatten_selected_experts = jnp.ravel(top_k_indices)
         sorted_selected_experts = jnp.argsort(flatten_selected_experts, stable=True)
         sorted_indices = sorted_selected_experts // self.num_experts_per_tok
@@ -485,19 +439,11 @@ class EPMoE(nnx.Module):
 
         group_sizes = jnp.bincount(flatten_selected_experts, length=self.num_experts)
 
-        expert_indices = jnp.arange(self.num_experts)
-        sorted_experts = jnp.repeat(
-            expert_indices,
-            repeats=group_sizes,
-            total_repeat_length=flatten_selected_experts.shape[0],
-        )
-
         return (
             sorted_inputs,
             sorted_selected_experts,
             top_k_weights,
             group_sizes,
-            sorted_experts,
         )
 
     def _unpermute(self, intermediate, sorted_selected_experts, weights, batch_size, seq_len):
