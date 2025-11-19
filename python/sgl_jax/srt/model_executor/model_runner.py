@@ -277,12 +277,12 @@ class ModelRunner:
 
         if available_kv_cache_bytes <= 0:
             raise RuntimeError("Not enough memory. Please try to increase --mem-fraction-static.")
-
+        head_dim_aligned = self.model_config.head_dim
+        if head_dim_aligned % 128 != 0:
+            head_dim_aligned = (self.model_config.head_dim + 127) // 128 * 128
         cell_size = (
             self.model_config.get_num_kv_heads(self.tp_size)
-            * (self.model_config.head_dim + 127)
-            // 128
-            * 128
+            * head_dim_aligned
             * self.model_config.num_hidden_layers
             * 2
             * jnp.dtype(self.kv_cache_dtype).itemsize
