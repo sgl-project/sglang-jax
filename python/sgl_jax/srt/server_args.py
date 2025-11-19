@@ -967,12 +967,12 @@ class ServerArgs:
                 self.chunked_prefill_size % self.page_size == 0
             ), "chunked_prefill_size must be divisible by page_size"
 
-
         # Disallow overlap scheduler when speculative decoding is enabled
         if self.speculative_algorithm is not None and not self.disable_overlap_schedule:
             raise ValueError(
                 "Speculative decoding does not support overlap scheduler. "
                 "Please pass --disable-overlap-schedule when using --speculative-algorithm."
+            )
 
         # Check LoRA configuration
         self.check_lora_server_args()
