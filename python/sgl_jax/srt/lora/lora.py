@@ -22,7 +22,6 @@ import logging
 import re
 
 import jax
-import jax.numpy as jnp
 from flax import nnx
 
 from sgl_jax.srt.configs.load_config import LoadConfig
@@ -93,83 +92,3 @@ class LoRAAdapter(nnx.Module):
                 self.layers[layer_id].weights[name] = loaded_weight
             else:
                 self.weights[name] = loaded_weight
-
-        # normalize kv_proj and gate_up_proj
-        for layer in self.layers:
-            weight_names = list(layer.weights.keys())
-            self.normalize_qkv_proj(weight_names, layer.weights)
-            self.normalize_gate_up_proj(weight_names, layer.weights)
-
-    def normalize_qkv_proj(self, weight_names: list[str], weights: dict[str, jax.Array]):
-        # Collect target q/k/v modules. This process is necessary since there might be no lora attached to k_proj
-        target_module = set()
-        for weight_name in weight_names:
-            if "k_proj" in weight_name:
-                target_module.add("k_proj")
-            if "q_proj" in weight_name:
-                target_module.add("q_proj")
-            if "v_proj" in weight_name:
-                target_module.add("v_proj")
-            if "qkv_proj" in weight_name:
-                target_module.add("qkv_proj")
-        if len(target_module) == 0:
-            return
-
-        for weight_name in weight_names:
-            # We assume every lora adaptor should contain lora modules for q_proj
-            if "q_proj" in weight_name:
-                q_name = weight_name
-                k_name = weight_name.replace("q_proj", "k_proj")
-                v_name = weight_name.replace("q_proj", "v_proj")
-                qkv_name = weight_name.replace("q_proj", "qkv_proj")
-
-                # If k_proj doesn't have lora, initialize it to zero
-                k_proj_weight = (
-                    weights[k_name]
-                    if "k_proj" in target_module
-                    else jnp.zeros_like(weights[v_name])
-                )
-                weights[qkv_name] = jnp.concatenate(
-                    (
-                        weights[q_name],
-                        k_proj_weight,
-                        weights[v_name],
-                    ),
-                    0,
-                )
-                weights.pop(q_name)
-                if "k_proj" in target_module:
-                    weights.pop(k_name)
-                weights.pop(v_name)
-            elif "qkv_proj" in weight_name:
-                # If qkv_proj is already stacked, we normalize it following the SGL convention.
-                qkv_name = weight_name
-                q_name = weight_name.replace("qkv_proj", "q_proj")
-                k_name = weight_name.replace("qkv_proj", "k_proj")
-                v_name = weight_name.replace("qkv_proj", "v_proj")
-                if "lora_A" in weight_name:
-                    weights[qkv_name] = weights[qkv_name].repeat(3, 1)
-                # else: no-op as LoRA B weight is already stacked.
-
-    def normalize_gate_up_proj(self, weight_names: list[str], weights: dict[str, jax.Array]):
-        for weight_name in weight_names:
-            if "gate_proj" in weight_name:
-                up_name = weight_name.replace("gate_proj", "up_proj")
-                gate_up_name = weight_name.replace("gate_proj", "gate_up_proj")
-                if up_name not in weights:
-                    weights[up_name] = jax.zeros_like(weights[weight_name])
-                    assert isinstance(self.lora_backend, SUPPORTED_BACKENDS), (
-                        f"LoRA weight initialization currently only supported for LoRA backends: {', '.join(b.name for b in SUPPORTED_BACKENDS)}"
-                        f"Received backend: {self.lora_backend.name}. Please verify your backend configuration "
-                        f"or consider implementing custom initialization logic for other backends."
-                    )
-                weights[gate_up_name] = jnp.concatenate((weights[weight_name], weights[up_name]), 0)
-                weights.pop(weight_name)
-                if up_name in weights:
-                    weights.pop(up_name)
-            elif "gate_up_proj" in weight_name:
-                # If gate_up_proj is already stacked, we normalize it following the SGL convention
-                gate_up_name = weight_name
-                if "lora_A" in weight_name:
-                    weights[gate_up_name] = weights[gate_up_name].repeat(2, 1)
-                # else: no-op as LoRA B weight is already stacked.
