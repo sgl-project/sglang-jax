@@ -80,11 +80,11 @@ def get_available_device_memory(device, distributed=False, empty_cache=True):
 
     if distributed:
         # Use pmap to find the minimum available memory across all devices.
-        mesh = jax.make_mesh((jax.process_count(), 4), ("node", "device"))
+        mesh = jax.make_mesh((jax.device_count(),), ("device"))
 
         @jax.shard_map(mesh=mesh, in_specs=PartitionSpec(None), out_specs=PartitionSpec(None))
         def _get_available_memory_distributed(a):
-            return jax.lax.pmin(a, axis_name="node")
+            return jax.lax.pmin(a, axis_name="device")
 
         # We broadcast the local min memory to all devices and then find the global min.
         # i64 dtype cannot be all-reduce min
