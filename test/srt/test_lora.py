@@ -26,9 +26,12 @@ class TestLora(CustomTestCase):
         self.assertEqual(lora_adapter.scaling, 1, "lora_alpha, r is not right")
         self.assertEqual(len(lora_adapter.layers), 36, "layers is not right")
         for i in range(36):
-            ## only base_model.model.model.layers.0.self_attn.qkv_proj.lora_A.weight and base_model.model.model.layers.0.self_attn.qkv_proj.lora_B.weight
+            ## dict_keys(['base_model.model.model.layers.22.self_attn.q_proj.lora_A.weight',
+            # 'base_model.model.model.layers.22.self_attn.q_proj.lora_B.weight',
+            # 'base_model.model.model.layers.22.self_attn.v_proj.lora_A.weight',
+            # 'base_model.model.model.layers.22.self_attn.v_proj.lora_B.weight'])
             self.assertEqual(
-                len(lora_adapter.layers[i].weights), 2, "weights per layer is not right"
+                len(lora_adapter.layers[i].weights), 4, "weights per layer is not right"
             )
 
 
