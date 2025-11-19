@@ -441,7 +441,7 @@ class Qwen2MoeForCausalLM(nnx.Module):
         mappings = {
             "model.embed_tokens.weight": WeightMapping(
                 target_path="model.embed_tokens.embedding",
-                sharding=(None, None),
+                sharding=("tensor", None),
                 transpose=False,
             ),
             "model.norm.weight": WeightMapping(
