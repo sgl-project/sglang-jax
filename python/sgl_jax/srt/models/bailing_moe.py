@@ -51,7 +51,7 @@ class BailingMoEAttention(nnx.Module):
         self.q_size = num_heads * self.head_dim
         self.kv_size = num_kv_heads * self.head_dim
         self.scaling = self.head_dim**-0.5
-        self.mesh = mesh
+
         self.use_qk_norm = use_qk_norm
 
         if use_qk_norm:
@@ -133,6 +133,7 @@ class BailingMoEAttention(nnx.Module):
         q, _ = self.q_proj(hidden_states)
         k, _ = self.k_proj(hidden_states)
         v, _ = self.v_proj(hidden_states)
+
         q = q.reshape(-1, self.q_head_num, self.head_dim)
         k = k.reshape(-1, self.kv_head_num, self.head_dim)
         v = v.reshape(-1, self.kv_head_num, self.head_dim)
@@ -224,7 +225,7 @@ class BailingMoEDecoderLayer(nnx.Module):
             rotary_dim = config.rotary_dim
         else:
             rotary_dim = self.head_dim
-        jax.debug.print("num key value heads: {heads_num}", heads_num=config.num_key_value_heads)
+
         self.self_attn = BailingMoEAttention(
             hidden_size=config.hidden_size,
             num_heads=config.num_attention_heads,
