@@ -40,6 +40,10 @@ class BgmvLoRABackend(BaseLoRABackend):
         Returns:
              result with shape (s, r)
         """
+        # print(f"{x=}")
+        # print(f"{weights=}")
+        # print(f"{self.batch_info.token_lora_indices=}")
+        # print(f"{self.batch_info.scalings=}")
         return shrink(x, weights, self.batch_info.token_lora_indices, self.batch_info.scalings)
 
     def run_lora_b_gemm(
@@ -64,7 +68,7 @@ class BgmvLoRABackend(BaseLoRABackend):
             x,
             weights,
             self.batch_info.token_lora_indices,
-            (weights.shape[1]),
+            (weights.shape[1],),
             self.max_lora_rank,
         )
 
@@ -114,7 +118,7 @@ class BgmvLoRABackend(BaseLoRABackend):
             lora_a_output,
             qkv_lora_b_concated,
             self.batch_info.token_lora_indices,
-            (qkv_lora_b_concated.shape[1]),
+            output_slices,
             self.max_lora_rank,
         )
 
@@ -153,7 +157,7 @@ class BgmvLoRABackend(BaseLoRABackend):
             lora_a_output,
             gate_up_lora_b_concated,
             self.batch_info.token_lora_indices,
-            (gate_up_lora_b_concated.shape[1]),
+            (gate_up_lora_b_concated.shape[1] // 2, gate_up_lora_b_concated.shape[1] // 2),
             self.max_lora_rank,
         )
 
@@ -194,6 +198,10 @@ class BgmvLoRABackend(BaseLoRABackend):
 
             num_to_pad = target_len - jnp.sum(forward_batch.seq_lens)
 
+            padded_scalings_cpu = scalings_cpu
+            padded_token_lora_indices_cpu = token_lora_indices_cpu
+            padded_lora_ranks_cpu = lora_ranks_cpu
+
             if num_to_pad > 0:
                 padded_scalings_cpu = np.pad(
                     scalings_cpu, [0, num_to_pad], mode="constant", constant_values=0.0
@@ -208,9 +216,6 @@ class BgmvLoRABackend(BaseLoRABackend):
             padded_scalings_cpu = np.array(scalings_bs, dtype=np.float32)
             padded_token_lora_indices_cpu = np.array(weight_indices, dtype=np.int32)
             padded_lora_ranks_cpu = np.array(lora_ranks_bs, dtype=np.int32)
-
-        if batch_info is None:
-            batch_info = LoRABatchInfo()
 
         batch_info = LoRABatchInfo(
             bs=forward_batch.batch_size,
@@ -290,6 +295,8 @@ def bgmv_shrink(
     """
     # if len(lora_weights.shape) == 4:
     #     lora_weights = jnp.squeeze(lora_weights, axis=1)
+    if isinstance(scaling, jax.Array) and scaling.ndim == 1:
+        scaling = scaling[:, jnp.newaxis]
     return scaling * bgmv_jax(inputs, lora_weights, lora_indices)
 
 
