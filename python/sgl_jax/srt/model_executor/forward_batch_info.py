@@ -173,6 +173,8 @@ class ForwardBatch:
     spec_info: EagleVerifyInput | EagleDraftInput | None = None
     spec_algorithm: SpeculativeAlgorithm = None
     capture_hidden_mode: CaptureHiddenMode = None
+    # For multimodal
+    mm_inputs: Optional[List[MultimodalInputs]] = None
 
     # Encoder-Decoder specific fields
     attention_mask: jax.Array | None = None
@@ -331,6 +333,7 @@ class ForwardBatch:
             input_ids=input_ids,
             seq_lens=seq_lens,
             out_cache_loc=out_cache_loc,
+            mm_inputs=batch.multimodal_inputs,
             positions=positions,
             extend_start_loc=extend_start_loc,
             req_pool_indices=req_pool_indices,
@@ -361,5 +364,95 @@ class ForwardBatch:
 
             # Generate mask: 1 for valid tokens, 0 for padding
             obj.attention_mask = (obj.input_ids != pad_token_id).astype(jnp.int32)
+        if model_runner.model_is_mrope:
+            obj._compute_mrope_positions(model_runner, batch)
 
         return obj
+
+
+    def contains_image_inputs(self) -> bool:
+        if self.mm_inputs is None:
+            return False
+        return any(
+            mm_input is not None and mm_input.contains_image_inputs()
+            for mm_input in self.mm_inputs
+        )
+
+    def contains_audio_inputs(self) -> bool:
+        if self.mm_inputs is None:
+            return False
+        return any(
+            mm_input is not None and mm_input.contains_audio_inputs()
+            for mm_input in self.mm_inputs
+        )
+
+    def contains_video_inputs(self) -> bool:
+        if self.mm_inputs is None:
+            return False
+        return any(
+            mm_input is not None and mm_input.contains_video_inputs()
+            for mm_input in self.mm_inputs
+        )
+
+    def contains_mm_inputs(self) -> bool:
+        return (
+            self.contains_audio_inputs()
+            or self.contains_video_inputs()
+            or self.contains_image_inputs()
+        )
+
+    def _compute_mrope_positions(
+        self, model_runner: ModelRunner, batch: ModelWorkerBatch
+    ):
+        # batch_size * [3 * seq_len]
+        batch_size = self.seq_lens.shape[0]
+        mrope_positions_list = [[]] * batch_size
+        for batch_idx in range(batch_size):
+            mm_input = batch.multimodal_inputs[batch_idx]
+            if self.forward_mode.is_decode():
+                # 3 * N
+                if mm_input is None:
+                    mrope_positions_list[batch_idx] = jnp.full(
+                        (3, 1),
+                        self.seq_lens[batch_idx] - 1,
+                        dtype=jnp.int64,
+                    )
+                else:
+                    mrope_positions = self._expand_mrope_from_input(
+                        mm_input, self.seq_lens[batch_idx], model_runner.device
+                    )
+                    mrope_positions_list[batch_idx] = mrope_positions
+            elif self.forward_mode.is_extend():
+                extend_seq_len, extend_prefix_len = (
+                    batch.extend_seq_lens[batch_idx],
+                    batch.extend_prefix_lens[batch_idx],
+                )
+                if mm_input is None:
+                    # text only
+                    mrope_positions = jnp.array(
+                        [
+                            [
+                                pos
+                                for pos in range(
+                                    extend_prefix_len,
+                                    extend_prefix_len + extend_seq_len,
+                                )
+                            ]
+                        ]
+                        * 3
+                    )
+                else:
+                    mrope_positions = mm_input.mrope_positions[
+                        :,
+                        extend_prefix_len : extend_prefix_len + extend_seq_len,
+                    ]
+                    if mrope_positions.size == 0:
+                        mrope_positions = self._expand_mrope_from_input(
+                            mm_input, self.seq_lens[batch_idx], model_runner.device
+                        )
+                mrope_positions_list[batch_idx] = mrope_positions
+
+        self.mrope_positions = jnp.concatenate(
+            mrope_positions_list,
+            axis=1,
+        ).astype(jnp.int64)

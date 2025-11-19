@@ -22,6 +22,7 @@ import logging
 import threading
 from http import HTTPStatus
 from typing import TYPE_CHECKING, Any
+from enum import Enum, auto
 
 import jax
 import numpy as np
@@ -455,6 +456,9 @@ class Req:
         self.read_offset = None
         self.decoded_text = ""
 
+        # For multimodal inputs
+        self.multimodal_inputs: Optional[MultimodalInputs] = None
+
         # Prefix info
         # The indices to kv cache for the shared prefix.
         self.prefix_indices: np.ndarray = []
@@ -571,7 +575,10 @@ class Req:
         return len(self.origin_input_ids) + len(self.output_ids)
 
     def extend_image_inputs(self, image_inputs):
-        raise NotImplementedError()
+        if self.multimodal_inputs is None:
+            self.multimodal_inputs = image_inputs
+        else:
+            self.multimodal_inputs.merge(image_inputs)
 
     def finished(self) -> bool:
         # Whether request reached finished condition
@@ -722,6 +729,7 @@ class Req:
         self.latest_bid = None
 
     def set_finish_with_abort(self, error_msg: str):
+        self.multimodal_inputs = None
         # set it to one token to skip the long prefill
         self.origin_input_ids = [0]
         self.grammar = None
@@ -969,6 +977,7 @@ class ScheduleBatch:
 
         # Copy prefix and do some basic check
         extend_input_logprob_token_ids = []
+        multimodal_inputs = []
 
         for i, (req, seq_len, pre_len) in enumerate(zip(reqs, seq_lens, prefix_lens)):
             req.req_pool_idx = req_pool_indices[i]
@@ -978,6 +987,8 @@ class ScheduleBatch:
             if pre_len > 0:
                 # note: prefix_indices has to locate on device, or will meet Received incompatible devices for jitted computation
                 self.req_to_token_pool.write((req.req_pool_idx, slice(0, pre_len)), prefix_indices)
+
+            multimodal_inputs.append(req.multimodal_inputs)
 
             req.cached_tokens += pre_len - req.already_computed
             req.already_computed = seq_len
@@ -1024,6 +1035,19 @@ class ScheduleBatch:
                     [0]
                     * (req.extend_input_len - req.extend_logprob_start_len - len(logprob_token_ids))
                 )
+
+        for mm_input in multimodal_inputs:
+            if mm_input is None:
+                continue
+            for mm_item in mm_input.mm_items:
+                pixel_values = getattr(mm_item, "feature", None)
+                if isinstance(pixel_values, torch.Tensor):
+                    mm_item.feature = pixel_values.to(self.device, non_blocking=True)
+                elif isinstance(pixel_values, CudaIpcTensorTransportProxy):
+                    mm_item.feature = pixel_values.reconstruct_on_target_device(
+                        torch.cuda.current_device()
+                    )
+        self.multimodal_inputs = multimodal_inputs
 
         if self.return_logprob:
             extend_input_logprob_token_ids = np.array(extend_input_logprob_token_ids)
@@ -1289,6 +1313,8 @@ class ScheduleBatch:
             return
 
         self.reqs = [self.reqs[i] for i in keep_indices]
+        if self.multimodal_inputs is not None:
+            self.multimodal_inputs = [self.multimodal_inputs[i] for i in keep_indices]
         self.req_pool_indices = self.req_pool_indices[keep_indices]
         # TODO: uniform data type in scheduler batch
         if isinstance(self.seq_lens, jax.Array):
@@ -1357,6 +1383,8 @@ class ScheduleBatch:
             self.top_logprobs_nums = [0] * len(self.reqs) + other.top_logprobs_nums
             self.token_ids_logprobs = [None] * len(self.reqs) + other.token_ids_logprobs
         self.reqs.extend(other.reqs)
+        if self.multimodal_inputs is not None:
+            self.multimodal_inputs.extend(other.multimodal_inputs)
 
         self.return_logprob |= other.return_logprob
         self.return_output_logprob_only |= other.return_output_logprob_only
@@ -1631,6 +1659,7 @@ class ScheduleBatch:
                 extend_prefix_lens if self.forward_mode == ForwardMode.EXTEND else None
             ),
             extend_seq_lens=(extend_seq_lens if self.forward_mode == ForwardMode.EXTEND else None),
+            multimodal_inputs=self.multimodal_inputs,
             extend_logprob_start_lens=extend_logprob_start_lens,
             extend_input_logprob_token_ids=self.extend_input_logprob_token_ids,
             lora_ids=(
@@ -1955,6 +1984,9 @@ class ModelWorkerBatch:
     extend_logprob_start_lens: list[int] | None
     extend_input_logprob_token_ids: np.ndarray | None
 
+    # For multimodal
+    multimodal_inputs: Optional[List[MultimodalInputs]]
+    
     # For padding
     real_bs: int
 

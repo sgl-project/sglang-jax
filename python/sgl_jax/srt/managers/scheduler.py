@@ -48,6 +48,7 @@ from sgl_jax.srt.managers.schedule_batch import (
     ScheduleBatch,
     acc_global_bid,
     global_server_args_dict,
+    MultimodalInputs,
 )
 from sgl_jax.srt.managers.schedule_policy import (
     AddReqResult,
@@ -652,6 +653,9 @@ class Scheduler(
             output = self._request_dispatcher(recv_req)
             if output is not None:
                 self.send_to_tokenizer.send_pyobj(output)
+
+    def _get_multimodal_inputs(self, mm_inputs_dict: dict):
+        return MultimodalInputs.from_dict(mm_inputs_dict)
 
     def handle_generate_request(
         self,
