@@ -51,7 +51,7 @@ class BailingMoEAttention(nnx.Module):
         self.q_size = num_heads * self.head_dim
         self.kv_size = num_kv_heads * self.head_dim
         self.scaling = self.head_dim**-0.5
-
+        self.mesh = mesh
         self.use_qk_norm = use_qk_norm
 
         if use_qk_norm:
@@ -133,7 +133,6 @@ class BailingMoEAttention(nnx.Module):
         q, _ = self.q_proj(hidden_states)
         k, _ = self.k_proj(hidden_states)
         v, _ = self.v_proj(hidden_states)
-
         q = q.reshape(-1, self.q_head_num, self.head_dim)
         k = k.reshape(-1, self.kv_head_num, self.head_dim)
         v = v.reshape(-1, self.kv_head_num, self.head_dim)
@@ -225,7 +224,7 @@ class BailingMoEDecoderLayer(nnx.Module):
             rotary_dim = config.rotary_dim
         else:
             rotary_dim = self.head_dim
-
+        jax.debug.print("num key value heads: {heads_num}", heads_num=config.num_key_value_heads)
         self.self_attn = BailingMoEAttention(
             hidden_size=config.hidden_size,
             num_heads=config.num_attention_heads,
@@ -259,7 +258,6 @@ class BailingMoEDecoderLayer(nnx.Module):
             self.moe_gate = None
         else:
             num_shared_experts = getattr(config, "num_shared_experts", 0)
-            expert_parallel_size = mesh.shape.get("data", 1) * mesh.shape.get("tensor", 1)
             router_dtype = getattr(config, "router_dtype", None)
             if router_dtype is None:
                 router_dtype = None
@@ -287,7 +285,7 @@ class BailingMoEDecoderLayer(nnx.Module):
                 num_experts_per_tok=config.num_experts_per_tok,
                 intermediate_dim=config.moe_intermediate_size,
                 mesh=mesh,
-                ep_size=expert_parallel_size,
+                ep_size=config.ep_size,
                 weight_dtype=dtype,
                 dtype=dtype,
                 layer_id=layer_id,
@@ -445,7 +443,7 @@ class BailingMoEForCausalLM(nnx.Module):
         self.mesh = mesh
         self.config = config
         self.dtype = dtype
-        self.transformer = BailingMoEModel(config, dtype=self.dtype, rngs=rngs, mesh=mesh)
+        self.model = BailingMoEModel(config, dtype=self.dtype, rngs=rngs, mesh=mesh)
         if not getattr(self.config, "tie_word_embeddings", False):
             self.lm_head = ParallelLMHead(
                 config.vocab_size,
@@ -455,7 +453,7 @@ class BailingMoEForCausalLM(nnx.Module):
                 kernel_axes=("tensor", None),
                 rngs=rngs,
             )
-        self.logits_processor = LogitsProcessor(config.vocab_size, self.mesh)
+        self.logits_processor = LogitsProcessor(config.vocab_size, mesh=self.mesh)
 
     def load_weights(self, model_config: ModelConfig, rng_key: jax.Array):
         self.rng = nnx.Rngs(rng_key)
@@ -520,7 +518,6 @@ class BailingMoEForCausalLM(nnx.Module):
                 ],
                 sharding=(None, "tensor"),
                 transpose=True,
-                head_dim_padding=True,
                 kv_head_padding=True,
             ),
             f"{prefix}.attention.dense.weight": WeightMapping(
@@ -624,13 +621,11 @@ class BailingMoEForCausalLM(nnx.Module):
         token_to_kv_pool: KVCache,
         logits_metadata: LogitsMetadata,
     ):
-        hidden_states, layers_kv_fused = self.transformer(forward_batch, token_to_kv_pool)
+        hidden_states, layers_kv_fused = self.model(forward_batch, token_to_kv_pool)
         if not getattr(self.config, "tie_word_embeddings", False):
             output = self.logits_processor(hidden_states, self.lm_head, logits_metadata)
         else:
-            output = self.logits_processor(
-                hidden_states, self.transformer.embed_tokens, logits_metadata
-            )
+            output = self.logits_processor(hidden_states, self.model.embed_tokens, logits_metadata)
         return output, layers_kv_fused, True
 
 

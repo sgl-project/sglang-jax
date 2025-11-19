@@ -420,7 +420,7 @@ class Qwen2MoeForCausalLM(nnx.Module):
                 kernel_axes=("tensor", None),
                 rngs=rngs,
             )
-        self.logits_processor = LogitsProcessor(config.vocab_size, self.mesh)
+        self.logits_processor = LogitsProcessor(config.vocab_size, mesh=self.mesh)
 
     def load_weights(self, model_config: ModelConfig, rng_key: jax.Array):
         self.rng = nnx.Rngs(rng_key)

@@ -34,7 +34,6 @@ class ModelWorkerClient:
         self.worker = ModelWorker(server_args, mesh=mesh)
         self.max_running_requests = self.worker.max_running_requests
         self.device = self.worker.device
-
         # Init future mappings
         self.future_token_ids_ct = 0
         self.future_token_ids_limit = self.max_running_requests * 3

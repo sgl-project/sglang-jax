@@ -660,7 +660,7 @@ class WeightLoader:
             processed_weight = split_weight
 
             if mapping.kv_head_padding and ("k_proj" in jax_path or "v_proj" in jax_path):
-                processed_weight = self._apply_kv_head_padding(processed_weight, hf_key)
+                processed_weight = self._apply_kv_head_padding(processed_weight, jax_path)
 
             sharded_weight = self._shard_weight(processed_weight, mapping.sharding)
 
