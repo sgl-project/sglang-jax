@@ -28,7 +28,7 @@ from fastapi import BackgroundTasks
 
 from sgl_jax.srt.configs.model_config import ModelConfig
 from sgl_jax.srt.hf_transformers_utils import get_tokenizer
-from sgl_jax.srt.lora import LoRARegistry
+from sgl_jax.srt.lora.lora_registry import LoRARegistry
 from sgl_jax.srt.managers.io_struct import (
     AbortReq,
     BatchEmbeddingOut,
