@@ -443,6 +443,8 @@ def next_power_of_2(x: int):
     if x == 1:
         return 1
     return 1 << (x - 1).bit_length()
+
+
 class RWLock:
     """An async reader-writer lock for LoRA adapter management."""
 
