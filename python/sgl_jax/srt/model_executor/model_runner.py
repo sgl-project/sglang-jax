@@ -146,6 +146,12 @@ class ModelRunner:
         ):
             self.is_hybrid = True
 
+        # Init lora
+        if server_args.enable_lora:
+            self.init_lora_manager()
+
+        self.initialize_jit()
+
         # Init memory pool and attention backends
         self.init_memory_pool(
             server_args.max_running_requests,
@@ -634,6 +640,23 @@ class ModelRunner:
             "Use Sliding window memory pool. full_layer_tokens=%s, swa_layer_tokens=%s",
             self.full_max_total_num_tokens,
             self.swa_max_total_num_tokens,
+        )
+
+    def init_lora_manager(self):
+        """Initialize LoRA manager for LoRA adapter support."""
+        from sgl_jax.srt.lora.lora_manager import LoRAManager
+
+        self.lora_manager = LoRAManager(
+            base_model=self.model,
+            base_hf_config=self.model_config.hf_config,
+            max_loras_per_batch=self.server_args.max_loras_per_batch,
+            dtype=self.dtype,
+            mesh=self.mesh,
+            tp_size=self.tp_size,
+            max_lora_rank=self.server_args.max_lora_rank,
+            target_modules=self.server_args.lora_target_modules,
+            lora_paths=self.server_args.lora_paths,
+            server_args=self.server_args,
         )
 
 
