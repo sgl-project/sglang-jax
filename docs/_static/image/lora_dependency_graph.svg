@@ -1,0 +1,228 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<svg width="1000" height="900" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink">
+  <defs>
+    <style>
+      .component-box {
+        fill: #e8f4f8;
+        stroke: #1a73e8;
+        stroke-width: 2;
+        rx: 5;
+      }
+      .config-box {
+        fill: #fff4e6;
+        stroke: #f57c00;
+        stroke-width: 2;
+        rx: 5;
+      }
+      .manager-box {
+        fill: #e8f5e9;
+        stroke: #388e3c;
+        stroke-width: 2;
+        rx: 5;
+      }
+      .layer-box {
+        fill: #f3e5f5;
+        stroke: #7b1fa2;
+        stroke-width: 2;
+        rx: 5;
+      }
+      .kernel-box {
+        fill: #fce4ec;
+        stroke: #c2185b;
+        stroke-width: 2;
+        rx: 5;
+      }
+      .request-box {
+        fill: #e0f2f1;
+        stroke: #00796b;
+        stroke-width: 2;
+        rx: 5;
+      }
+      .text {
+        font-family: Arial, sans-serif;
+        font-size: 14px;
+        fill: #333;
+      }
+      .text-bold {
+        font-family: Arial, sans-serif;
+        font-size: 14px;
+        font-weight: bold;
+        fill: #000;
+      }
+      .text-small {
+        font-family: Arial, sans-serif;
+        font-size: 12px;
+        fill: #666;
+      }
+      .title {
+        font-family: Arial, sans-serif;
+        font-size: 18px;
+        font-weight: bold;
+        fill: #1a73e8;
+      }
+      .arrow {
+        stroke: #1a73e8;
+        stroke-width: 2;
+        fill: none;
+        marker-end: url(#arrowhead);
+      }
+      .arrow-thick {
+        stroke: #00796b;
+        stroke-width: 3;
+        fill: none;
+        marker-end: url(#arrowhead-thick);
+      }
+      .dashed-arrow {
+        stroke: #7b1fa2;
+        stroke-width: 2;
+        stroke-dasharray: 5,5;
+        fill: none;
+        marker-end: url(#arrowhead-dashed);
+      }
+    </style>
+    <marker id="arrowhead" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto">
+      <polygon points="0 0, 10 3, 0 6" fill="#1a73e8" />
+    </marker>
+    <marker id="arrowhead-thick" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto">
+      <polygon points="0 0, 10 3, 0 6" fill="#00796b" />
+    </marker>
+    <marker id="arrowhead-dashed" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto">
+      <polygon points="0 0, 10 3, 0 6" fill="#7b1fa2" />
+    </marker>
+  </defs>
+
+  <!-- Title -->
+  <text x="500" y="30" class="title" text-anchor="middle">Component Dependency Graph</text>
+
+  <!-- Part 1: Component Dependencies -->
+  <text x="50" y="60" class="text-bold">Component Dependencies:</text>
+
+  <!-- ServerArgs -->
+  <rect x="400" y="80" width="200" height="50" class="config-box"/>
+  <text x="500" y="105" class="text-bold" text-anchor="middle">ServerArgs</text>
+  <text x="500" y="120" class="text-small" text-anchor="middle">(config)</text>
+
+  <!-- Arrow from ServerArgs to LoRAManager -->
+  <path d="M 500 130 L 500 170" class="arrow"/>
+
+  <!-- LoRAManager -->
+  <rect x="380" y="170" width="240" height="60" class="manager-box"/>
+  <text x="500" y="200" class="text-bold" text-anchor="middle">LoRAManager</text>
+  <text x="500" y="218" class="text-small" text-anchor="middle">Central orchestrator</text>
+
+  <!-- Arrow from LoRAManager to LoRAAdapter -->
+  <path d="M 380 205 L 280 205" class="arrow"/>
+  <text x="320" y="200" class="text-small">contains</text>
+
+  <!-- LoRAAdapter -->
+  <rect x="80" y="180" width="200" height="50" class="component-box"/>
+  <text x="180" y="200" class="text-bold" text-anchor="middle">LoRAAdapter</text>
+  <text x="180" y="215" class="text-small" text-anchor="middle">(N instances)</text>
+
+  <!-- Arrow from LoRAAdapter to LoRAConfig -->
+  <path d="M 180 230 L 180 280" class="arrow"/>
+
+  <!-- LoRAConfig -->
+  <rect x="80" y="280" width="200" height="50" class="config-box"/>
+  <text x="180" y="305" class="text-bold" text-anchor="middle">LoRAConfig</text>
+  <text x="180" y="320" class="text-small" text-anchor="middle">Adapter configuration</text>
+
+  <!-- Arrow from LoRAManager to Model layers (wraps) -->
+  <path d="M 500 230 L 500 280" class="dashed-arrow"/>
+  <text x="510" y="260" class="text-small">(wraps layers)</text>
+
+  <!-- Model layers -->
+  <rect x="380" y="280" width="240" height="50" class="layer-box"/>
+  <text x="500" y="305" class="text-bold" text-anchor="middle">Model layers</text>
+  <text x="500" y="320" class="text-small" text-anchor="middle">(base model)</text>
+
+  <!-- Arrow from Model layers to *WithLoRA layers -->
+  <path d="M 500 330 L 500 380" class="arrow"/>
+
+  <!-- *WithLoRA layers -->
+  <rect x="380" y="380" width="240" height="60" class="layer-box"/>
+  <text x="500" y="405" class="text-bold" text-anchor="middle">*WithLoRA layers</text>
+  <text x="500" y="423" class="text-small" text-anchor="middle">(LinearWithLoRA, etc.)</text>
+
+  <!-- Arrow from *WithLoRA to LoRAKernel -->
+  <path d="M 620 410 L 720 410" class="arrow"/>
+  <text x="660" y="405" class="text-small">uses</text>
+
+  <!-- LoRAKernel -->
+  <rect x="720" y="385" width="200" height="50" class="kernel-box"/>
+  <text x="820" y="405" class="text-bold" text-anchor="middle">LoRAKernel</text>
+  <text x="820" y="420" class="text-small" text-anchor="middle">(batched GEMM)</text>
+
+  <!-- Part 2: Request Flow -->
+  <text x="50" y="510" class="text-bold">Request Flow:</text>
+
+  <!-- GenerateReqInput -->
+  <rect x="50" y="540" width="180" height="50" class="request-box"/>
+  <text x="140" y="560" class="text-bold" text-anchor="middle">GenerateReqInput</text>
+  <text x="140" y="575" class="text-small" text-anchor="middle">(with lora_path)</text>
+
+  <!-- Arrow -->
+  <path d="M 230 565 L 290 565" class="arrow-thick"/>
+
+  <!-- TokenizedGenerateReqInput -->
+  <rect x="290" y="540" width="200" height="50" class="request-box"/>
+  <text x="390" y="560" class="text-bold" text-anchor="middle">TokenizedGenerate</text>
+  <text x="390" y="575" class="text-small" text-anchor="middle">ReqInput</text>
+
+  <!-- Arrow -->
+  <path d="M 490 565 L 550 565" class="arrow-thick"/>
+
+  <!-- Req -->
+  <rect x="550" y="540" width="100" height="50" class="request-box"/>
+  <text x="600" y="560" class="text-bold" text-anchor="middle">Req</text>
+  <text x="600" y="575" class="text-small" text-anchor="middle">(lora_path)</text>
+
+  <!-- Arrow -->
+  <path d="M 650 565 L 720 565" class="arrow-thick"/>
+
+  <!-- ScheduleBatch -->
+  <rect x="720" y="540" width="180" height="50" class="request-box"/>
+  <text x="810" y="560" class="text-bold" text-anchor="middle">ScheduleBatch</text>
+  <text x="810" y="575" class="text-small" text-anchor="middle">(collection of Reqs)</text>
+
+  <!-- Arrow down from ScheduleBatch -->
+  <path d="M 810 590 L 810 650" class="arrow-thick"/>
+
+  <!-- LoRAManager.prepare_lora_batch() -->
+  <rect x="660" y="650" width="300" height="60" class="manager-box"/>
+  <text x="810" y="673" class="text-bold" text-anchor="middle">LoRAManager</text>
+  <text x="810" y="691" class="text-bold" text-anchor="middle">.prepare_lora_batch()</text>
+
+  <!-- Arrow down -->
+  <path d="M 810 710 L 810 770" class="arrow-thick"/>
+
+  <!-- ModelRunner.forward() -->
+  <rect x="680" y="770" width="260" height="60" class="component-box"/>
+  <text x="810" y="793" class="text-bold" text-anchor="middle">ModelRunner.forward()</text>
+  <text x="810" y="811" class="text-small" text-anchor="middle">(JIT-compiled execution)</text>
+
+  <!-- Legend -->
+  <text x="50" y="870" class="text-bold">Legend:</text>
+
+  <rect x="200" y="855" width="80" height="25" class="config-box"/>
+  <text x="240" y="872" class="text-small" text-anchor="middle">Config</text>
+
+  <rect x="300" y="855" width="80" height="25" class="manager-box"/>
+  <text x="340" y="872" class="text-small" text-anchor="middle">Manager</text>
+
+  <rect x="400" y="855" width="80" height="25" class="layer-box"/>
+  <text x="440" y="872" class="text-small" text-anchor="middle">Layer</text>
+
+  <rect x="500" y="855" width="80" height="25" class="kernel-box"/>
+  <text x="540" y="872" class="text-small" text-anchor="middle">Kernel</text>
+
+  <rect x="600" y="855" width="80" height="25" class="request-box"/>
+  <text x="640" y="872" class="text-small" text-anchor="middle">Request</text>
+
+  <path d="M 700 867 L 750 867" class="arrow"/>
+  <text x="780" y="872" class="text-small">Dependency</text>
+
+  <path d="M 700 885 L 750 885" class="dashed-arrow"/>
+  <text x="780" y="890" class="text-small">Wraps/Contains</text>
+
+</svg>
