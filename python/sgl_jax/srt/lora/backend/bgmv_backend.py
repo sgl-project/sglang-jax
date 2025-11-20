@@ -40,10 +40,6 @@ class BgmvLoRABackend(BaseLoRABackend):
         Returns:
              result with shape (s, r)
         """
-        # print(f"{x=}")
-        # print(f"{weights=}")
-        # print(f"{self.batch_info.token_lora_indices=}")
-        # print(f"{self.batch_info.scalings=}")
         return shrink(
             x, weights, self.batch_info.token_lora_indices, self.batch_info.scalings
         ).astype(x.dtype)
