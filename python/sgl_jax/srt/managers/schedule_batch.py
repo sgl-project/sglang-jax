@@ -187,9 +187,6 @@ class Req:
         # LoRA info
         self.lora_id = lora_id
 
-        # LoRA info
-        self.lora_id = lora_id
-
         # Memory pool info
         self.req_pool_idx: int | None = None
 
