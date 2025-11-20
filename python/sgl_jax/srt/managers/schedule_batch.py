@@ -21,7 +21,7 @@ import dataclasses
 import logging
 import threading
 from http import HTTPStatus
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Union
 from enum import Enum, auto
 
 import jax
@@ -183,10 +183,10 @@ class MultimodalDataItem:
     offsets: Optional[list] = None
 
     # the raw features returned by processor, e.g. pixel_values or audio_features
-    feature: Union[torch.Tensor, np.ndarray] = None
+    feature: Union[jax.Array, np.ndarray] = None
     # the precomputed embeddings, passed as final encoder embeddings
     # One and only one of the feature and precomputed_embeddings will be empty
-    precomputed_embeddings: Optional[Union[torch.Tensor, np.ndarray]] = None
+    precomputed_embeddings: Optional[Union[jax.Array, np.ndarray]] = None
 
     # Model-specific data stored in a dictionary
     model_specific_data: dict[str, Any] = dataclasses.field(default_factory=dict)
@@ -221,7 +221,7 @@ class MultimodalDataItem:
         """
         Set the pad value after first hashing the data
         """
-        from sglang.srt.managers.mm_utils import hash_feature
+        from sgl_jax.srt.managers.mm_utils import hash_feature
 
         if self.hash is None:
             if self.feature is not None:
@@ -293,8 +293,8 @@ class MultimodalInputs:
     audio_end_id: Optional[int] = None
 
     # QWen2-VL related
-    mrope_positions: Optional[torch.Tensor] = None
-    mrope_position_delta: Optional[torch.Tensor] = None
+    mrope_positions: Optional[jax.Array] = None
+    mrope_position_delta: Optional[jax.Array] = None
 
     @staticmethod
     def from_dict(obj: dict):
@@ -358,8 +358,8 @@ class MultimodalInputs:
             if other.mrope_positions is None:
                 self.mrope_positions = mrope_positions
             else:
-                self.mrope_positions = torch.cat(
-                    [self.mrope_positions, other.mrope_positions], dim=1
+                self.mrope_positions = jnp.concatenate(
+                    [self.mrope_positions, other.mrope_positions], axis=1
                 )
 
         mrope_position_delta = self.mrope_position_delta
@@ -367,8 +367,8 @@ class MultimodalInputs:
             if other.mrope_position_delta is None:
                 self.mrope_position_delta = mrope_position_delta
             else:
-                self.mrope_position_delta = torch.cat(
-                    [self.mrope_position_delta, other.mrope_position_delta], dim=0
+                self.mrope_position_delta = jnp.concatenate(
+                    [self.mrope_position_delta, other.mrope_position_delta], axis=0
                 )
 
         for key, val in other.__dict__.items():
@@ -1041,12 +1041,18 @@ class ScheduleBatch:
                 continue
             for mm_item in mm_input.mm_items:
                 pixel_values = getattr(mm_item, "feature", None)
-                if isinstance(pixel_values, torch.Tensor):
-                    mm_item.feature = pixel_values.to(self.device, non_blocking=True)
+                # JAX arrays don't need explicit device transfer
+                # JAX automatically manages device placement
+                if isinstance(pixel_values, jax.Array):
+                    # Already a JAX array, no conversion needed
+                    mm_item.feature = pixel_values
+                elif isinstance(pixel_values, np.ndarray):
+                    # Convert numpy array to JAX array if needed
+                    mm_item.feature = jnp.asarray(pixel_values)
                 elif isinstance(pixel_values, CudaIpcTensorTransportProxy):
-                    mm_item.feature = pixel_values.reconstruct_on_target_device(
-                        torch.cuda.current_device()
-                    )
+                    # Handle IPC proxy - convert to JAX array
+                    # Note: This assumes the proxy can provide data as numpy or similar
+                    mm_item.feature = pixel_values.reconstruct_on_target_device()
         self.multimodal_inputs = multimodal_inputs
 
         if self.return_logprob:

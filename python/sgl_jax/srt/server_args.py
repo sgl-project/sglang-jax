@@ -1278,3 +1278,13 @@ class PortArgs:
                 f"tcp://{dist_init_host}:{port_base + 5}" if server_args.nnodes > 1 else None
             ),
         )
+
+
+def get_global_server_args() -> ServerArgs:
+    if _global_server_args is None:
+        # in ci, usually when we test custom ops/modules directly,
+        # we don't set the sgl_diffusion config. In that case, we set a default
+        # config.
+        # TODO(will): may need to handle this for CI.
+        raise ValueError("Global sgl_diffusion args is not set.")
+    return _global_server_args

@@ -8,7 +8,7 @@ import jax.numpy as jnp
 from PIL import Image
 
 from sgl_jax.srt.environ import envs
-from sgl_jax.srt.layers.embedding import MRotaryEmbedding
+from sgl_jax.srt.layers.embeddings import MRotaryEmbedding
 from sgl_jax.srt.models.qwen2_5_vl import Qwen2_5_VLForConditionalGeneration
 from sgl_jax.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
 from sgl_jax.srt.multimodal.processors.base_processor import MultimodalSpecialTokens

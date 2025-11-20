@@ -16,7 +16,7 @@ import uuid
 from collections import deque
 from datetime import datetime
 from http import HTTPStatus
-from typing import Any
+from typing import Any, Optional, Dict
 
 import fastapi
 import jax
@@ -215,7 +215,6 @@ class TokenizerManager:
                     trust_remote_code=server_args.trust_remote_code,
                     revision=server_args.revision,
                 )
-                self._initialize_multi_item_delimiter_text()
 
         # Store states
         self.no_create_loop = False

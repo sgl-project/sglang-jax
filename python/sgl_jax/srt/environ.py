@@ -1,6 +1,7 @@
 import os
 import warnings
 from typing import Any
+from contextlib import contextmanager
 
 class EnvField:
     def __init__(self, default: Any):
@@ -77,6 +78,11 @@ class EnvInt(EnvField):
             return int(value)
         except ValueError:
             raise ValueError(f'"{value}" is not a valid integer value')
+
+
+class EnvStr(EnvField):
+    def parse(self, value: str) -> str:
+        return value
 
 
 class Envs:

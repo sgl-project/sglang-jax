@@ -42,6 +42,7 @@ from sgl_jax.srt.managers.io_struct import (
     SetInternalStateReqOutput,
     TokenizedGenerateReqInput,
 )
+from sgl_jax.srt.managers.mm_utils import init_mm_embedding_cache
 from sgl_jax.srt.managers.schedule_batch import (
     FINISH_ABORT,
     Req,
@@ -289,6 +290,7 @@ class Scheduler(
         ) = self.tp_worker.get_worker_info()
 
         global_server_args_dict.update(worker_global_server_args_dict)
+        self.pad_input_ids_func = self.tp_worker.get_pad_input_ids_func()
         set_random_seed(self.random_seed)
 
         self.is_hybrid = self.tp_worker.is_hybrid
@@ -496,6 +498,8 @@ class Scheduler(
             )
 
         self.decode_mem_cache_buf_multiplier = 1
+        embedding_cache_size = int(os.environ.get("SGLANG_VLM_CACHE_SIZE_MB", "100"))
+        init_mm_embedding_cache(embedding_cache_size * 1024 * 1024)
 
     def event_loop_normal(self):
         """A normal scheduler loop."""

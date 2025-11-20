@@ -786,3 +786,15 @@ def get_or_create_loop():
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
     return loop
+def flatten_nested_list(nested_list):
+    if isinstance(nested_list, list):
+        return [
+            item for sublist in nested_list for item in flatten_nested_list(sublist)
+        ]
+    else:
+        return [nested_list]
+
+
+def print_warning_once(msg: str) -> None:
+    # Set the stacklevel to 2 to print the caller's line info
+    logger.warning(msg, stacklevel=2)

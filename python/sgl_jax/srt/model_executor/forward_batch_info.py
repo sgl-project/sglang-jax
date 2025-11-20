@@ -160,6 +160,8 @@ class ForwardBatch:
     # For extend
     extend_prefix_lens: jax.Array | None = None
     extend_seq_lens: jax.Array | None = None
+    extend_prefix_lens_cpu: Optional[List[int]] = None
+    extend_seq_lens_cpu: Optional[List[int]] = None
 
     # For LoRA
     lora_ids: list[str] | None = None
@@ -326,6 +328,9 @@ class ForwardBatch:
                 batch.lora_ranks,
             )
 
+        extend_prefix_lens_cpu = batch.extend_prefix_lens
+        extend_seq_lens_cpu = batch.extend_seq_lens
+        
         obj = cls(
             bid=batch.bid,
             forward_mode=batch.forward_mode,
@@ -344,6 +349,8 @@ class ForwardBatch:
             lora_scalings=lora_scalings,
             lora_token_indices=lora_token_indices,
             lora_ranks=lora_ranks,
+            extend_prefix_lens_cpu=extend_prefix_lens_cpu,
+            extend_seq_lens_cpu=extend_seq_lens_cpu,
             attn_backend=model_runner.attn_backend,
             spec_info=batch.spec_info,
             spec_algorithm=batch.spec_algorithm,
