@@ -36,13 +36,12 @@ logger = logging.getLogger(__name__)
 RETURN_ORIGINAL_LOGPROB = get_bool_env_var("RETURN_ORIGINAL_LOGPROB")
 
 
-@functools.partial(jax.jit, static_argnames=("draft_token_num",))
+@jax.jit
 def _verify_postprocess_fixed(
     logits_next_token: jax.Array,
     hidden_states: jax.Array,
     positions: jax.Array,
     accept_index: jax.Array,
-    draft_token_num: int,
 ):
     """Fixed-shape postprocess for verify outputs using mask instead of shrinking."""
     mask = accept_index != -1
@@ -52,6 +51,22 @@ def _verify_postprocess_fixed(
     gathered_hidden = jnp.take(hidden_states, gather_idx, axis=0)
     gathered_pos = jnp.take(positions, gather_idx, axis=0)
     return gathered_logits, gathered_hidden, gathered_pos, mask
+
+
+@functools.partial(jax.jit, static_argnames=("topk",))
+def _draft_extend_postprocess_fixed(
+    logits_next_token: jax.Array,
+    hidden_states: jax.Array,
+    accept_lens: jax.Array,
+    real_bs: int,
+    topk: int,
+):
+    """Fixed-shape helper for draft_extend_after_decode."""
+    select_index = jnp.arange(real_bs, dtype=jnp.int32) * topk + accept_lens[:real_bs] - 1
+    logits_next_token = jnp.take(logits_next_token, select_index, axis=0)
+    hidden_states = jnp.take(hidden_states, select_index, axis=0)
+    topk_p, topk_index = topk_probs_from_logits(logits_next_token, topk)
+    return logits_next_token, hidden_states, topk_p, topk_index
 
 
 class EAGLEWorker(ModelWorker):
@@ -412,7 +427,6 @@ class EAGLEWorker(ModelWorker):
             logits_output.hidden_states,
             model_worker_batch.positions,
             accept_index,
-            self.speculative_num_draft_tokens,
         )
         accept_index = accept_index[accept_mask]
         verified_id = predict[accept_index]
@@ -541,16 +555,17 @@ class EAGLEWorker(ModelWorker):
 
         draft_logits_output.truncate_logits_processor_output(model_worker_batch)
         self.capture_for_decode(draft_logits_output, forward_batch.spec_info)
-        select_index = (
-            np.arange(len(model_worker_batch.seq_lens[: model_worker_batch.real_bs]))
-            * self.speculative_num_draft_tokens
-            + batch_output.accept_lens
-            - 1
-        )
-        draft_logits_output.next_token_logits = draft_logits_output.next_token_logits[select_index]
-        draft_logits_output.hidden_states = draft_logits_output.hidden_states[select_index]
-        topk_p, topk_index = topk_probs_from_logits(
-            draft_logits_output.next_token_logits, self.topk
+        (
+            draft_logits_output.next_token_logits,
+            draft_logits_output.hidden_states,
+            topk_p,
+            topk_index,
+        ) = _draft_extend_postprocess_fixed(
+            draft_logits_output.next_token_logits,
+            draft_logits_output.hidden_states,
+            batch_output.accept_lens,
+            model_worker_batch.real_bs,
+            self.topk,
         )
 
         # prepare for next draft decode
