@@ -1,4 +1,7 @@
-"""End-to-end tests for BgmvLoRABackend with Cartesian product combinations."""
+"""
+Description: End-to-end tests for BgmvLoRABackend with Cartesian product combinations.
+Note: Refer to https://github.com/sgl-project/sglang/blob/main/test/srt/lora/test_chunked_sgmv_backend.py
+"""
 
 import itertools
 import random
