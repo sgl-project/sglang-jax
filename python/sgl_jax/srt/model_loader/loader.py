@@ -6,8 +6,6 @@ from typing import Any
 
 import huggingface_hub
 import jax
-import jax.numpy as jnp
-import numpy as np
 from flax import nnx
 
 from sgl_jax.srt.configs.load_config import LoadConfig, LoadFormat
@@ -165,88 +163,6 @@ class JAXDummyModelLoader(BaseModelLoader):
         model_class, _ = get_model_architecture(model_config)
         return model_class
 
-    def _initialize_dummy_weights(
-        self,
-        model: nnx.Module,
-        low: float = -1e-3,
-        high: float = 1e-3,
-        seed: int = 1234,
-    ) -> None:
-        """
-        Fill all floating arrays in nnx.state(model) from a NumPy RNG.
-        For each array, the RNG is re-seeded with `seed`, we draw a flat
-        stream of length `numel` in a generation dtype (fp16 if <16-bit,
-        else native; bfloat16 generates in fp32), reshape to array.shape,
-        cast to the target dtype, and (if present) re-apply the array's
-        sharding spec so partitioning doesn't affect values.
-        """
-        params = nnx.state(model)
-
-        def _np_gen_dtype(jdtype) -> np.dtype:
-            bits = jnp.finfo(jdtype).bits
-            if bits < 16:
-                return np.float16
-            if jdtype == jnp.bfloat16:
-                return np.float32
-            return {
-                jnp.float16: np.float16,
-                jnp.float32: np.float32,
-                jnp.float64: np.float64,
-            }.get(jdtype, np.float32)
-
-        def _init_leaf(x):
-            is_array = isinstance(x, jax.Array)
-            is_abstract = isinstance(x, jax.ShapeDtypeStruct)
-
-            if (is_array or is_abstract) and jnp.issubdtype(x.dtype, jnp.floating):
-                tgt_dtype = x.dtype
-                shape = x.shape
-
-                # Get sharding spec from the abstract shape and reconstruct with real mesh
-                abstract_sharding = getattr(x, "sharding", None)
-                if abstract_sharding is not None and hasattr(abstract_sharding, "spec"):
-                    # Use the spec from abstract sharding but with real mesh
-                    sharding = jax.sharding.NamedSharding(self.mesh, abstract_sharding.spec)
-                else:
-                    # Fallback to replicated if no sharding
-                    sharding = jax.sharding.NamedSharding(self.mesh, jax.sharding.PartitionSpec())
-
-                def _make_shard(indices):
-                    # Compute local shard shape from global shape and slice indices
-                    shard_shape = []
-                    for dim_size, idx in zip(shape, indices):
-                        if isinstance(idx, slice):
-                            start, stop, step = idx.indices(dim_size)
-                            assert step == 1, f"Non-unit step in slice not supported: {idx}"
-                            shard_shape.append(stop - start)
-                        else:
-                            shard_shape.append(1)
-                    shard_shape = tuple(shard_shape)
-
-                    # Generate random data
-                    rng = np.random.default_rng(seed)
-                    gen_dtype = _np_gen_dtype(tgt_dtype)
-                    numel = int(np.prod(shard_shape))
-                    flat = rng.uniform(low, high, size=numel)
-                    arr_np = flat.reshape(shard_shape).astype(gen_dtype)
-                    return jnp.asarray(arr_np, dtype=tgt_dtype)
-
-                return jax.make_array_from_callback(shape, sharding, _make_shard)
-            return x
-
-        new_params = jax.tree_util.tree_map(_init_leaf, params)
-
-        # Do not alter rotary embedding caches
-        def _preserve_rope_caches(path, old, new):
-            # path is a tuple of keys; stringify for robust matching
-            path_str = ".".join(str(k) for k in path)
-            if ("cos_sin_cache" in path_str) or ("_cos_sin_cache" in path_str):
-                return old
-            return new
-
-        new_params = jax.tree_util.tree_map_with_path(_preserve_rope_caches, params, new_params)
-        nnx.update(model, new_params)
-
     def load_model(
         self,
         *,
@@ -259,7 +175,11 @@ class JAXDummyModelLoader(BaseModelLoader):
                 lambda: model_class(model_config.hf_config, model_config.dtype, self.rng, self.mesh)
             )
 
-        self._initialize_dummy_weights(model)
+        # Use model's load_weights with dummy mode to ensure correct sharding
+        # Set a marker in model_config to indicate dummy mode
+        model_config._dummy_mode = True
+        model.load_weights(model_config, self.rng.default.key.value if self.rng else None)
+
         return model
 
 

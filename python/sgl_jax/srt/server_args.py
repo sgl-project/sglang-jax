@@ -131,9 +131,20 @@ class ServerArgs:
 
     disable_precompile: bool = False
 
+    # Speculative decoding
+    speculative_algorithm: str | None = None
+    speculative_draft_model_path: str | None = None
+    speculative_draft_model_revision: str | None = None
+    speculative_num_steps: int = 4
+    speculative_eagle_topk: int = 5
+    speculative_num_draft_tokens: int = 4
+    speculative_accept_threshold_single: float = 1.0
+    speculative_accept_threshold_acc: float = 1.0
+
     # For deterministic sampling
     enable_deterministic_sampling: bool = False
     enable_single_process: bool = False
+    enable_nan_detection: bool = False
 
     # For sampling
     use_sort_for_toppk_minp: bool = False
@@ -196,6 +207,10 @@ class ServerArgs:
 
         if self.grammar_backend is None:
             self.grammar_backend = "llguidance"
+
+        # Normalize speculative_algorithm: treat empty string as None
+        if isinstance(self.speculative_algorithm, str) and self.speculative_algorithm.strip() == "":
+            self.speculative_algorithm = None
 
         os.environ["SGLANG_ENABLE_DETERMINISTIC_SAMPLING"] = (
             "1" if self.enable_deterministic_sampling else "0"
@@ -769,6 +784,66 @@ class ServerArgs:
             help="Choose the kernels for attention layers.",
         )
 
+        parser.add_argument(
+            "--enable-nan-detection",
+            action="store_true",
+            help="Enable the NaN detection for debugging purposes.",
+        )
+
+        # Speculative decoding
+        parser.add_argument(
+            "--speculative-algorithm",
+            type=str,
+            choices=["EAGLE", "EAGLE3", "NEXTN", "STANDALONE"],
+            help="Speculative algorithm.",
+            default=ServerArgs.speculative_algorithm,
+        )
+        parser.add_argument(
+            "--speculative-draft-model-path",
+            "--speculative-draft-model",
+            type=str,
+            help="The path of the draft model weights. This can be a local folder or a Hugging Face repo ID.",
+            default=ServerArgs.speculative_draft_model_path,
+        )
+        parser.add_argument(
+            "--speculative-draft-model-revision",
+            type=str,
+            default=None,
+            help="The specific draft model version to use. It can be a branch "
+            "name, a tag name, or a commit id. If unspecified, will use "
+            "the default version.",
+        )
+        parser.add_argument(
+            "--speculative-num-steps",
+            type=int,
+            help="The number of steps sampled from draft model in Speculative Decoding.",
+            default=ServerArgs.speculative_num_steps,
+        )
+        parser.add_argument(
+            "--speculative-eagle-topk",
+            type=int,
+            help="The number of tokens sampled from the draft model in eagle2 each step.",
+            default=ServerArgs.speculative_eagle_topk,
+        )
+        parser.add_argument(
+            "--speculative-num-draft-tokens",
+            type=int,
+            help="The number of tokens sampled from the draft model in Speculative Decoding.",
+            default=ServerArgs.speculative_num_draft_tokens,
+        )
+        parser.add_argument(
+            "--speculative-accept-threshold-single",
+            type=float,
+            help="Accept a draft token if its probability in the target model is greater than this threshold.",
+            default=ServerArgs.speculative_accept_threshold_single,
+        )
+        parser.add_argument(
+            "--speculative-accept-threshold-acc",
+            type=float,
+            help="The accept probability of a draft token is raised from its target probability p to min(1, p / threshold_acc).",
+            default=ServerArgs.speculative_accept_threshold_acc,
+        )
+
         # For deterministic sampling
         parser.add_argument(
             "--enable-deterministic-sampling",
@@ -822,6 +897,13 @@ class ServerArgs:
             assert (
                 self.chunked_prefill_size % self.page_size == 0
             ), "chunked_prefill_size must be divisible by page_size"
+
+        # Disallow overlap scheduler when speculative decoding is enabled
+        if self.speculative_algorithm is not None and not self.disable_overlap_schedule:
+            raise ValueError(
+                "Speculative decoding does not support overlap scheduler. "
+                "Please pass --disable-overlap-schedule when using --speculative-algorithm."
+            )
 
 
 def prepare_server_args(argv: list[str]) -> ServerArgs:

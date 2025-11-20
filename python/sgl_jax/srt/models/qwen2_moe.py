@@ -420,7 +420,7 @@ class Qwen2MoeForCausalLM(nnx.Module):
                 kernel_axes=("tensor", None),
                 rngs=rngs,
             )
-        self.logits_processor = LogitsProcessor(config.vocab_size, self.mesh)
+        self.logits_processor = LogitsProcessor(config.vocab_size, mesh=self.mesh)
 
     def load_weights(self, model_config: ModelConfig, rng_key: jax.Array):
         self.rng = nnx.Rngs(rng_key)
@@ -441,7 +441,7 @@ class Qwen2MoeForCausalLM(nnx.Module):
         mappings = {
             "model.embed_tokens.weight": WeightMapping(
                 target_path="model.embed_tokens.embedding",
-                sharding=(None, None),
+                sharding=("tensor", None),
                 transpose=False,
             ),
             "model.norm.weight": WeightMapping(
@@ -451,7 +451,7 @@ class Qwen2MoeForCausalLM(nnx.Module):
 
         if not getattr(self.config, "tie_word_embeddings", True):
             mappings["lm_head.weight"] = WeightMapping(
-                target_path="lm_head.embedding", sharding=(None, None), transpose=False
+                target_path="lm_head.embedding", sharding=("tensor", None), transpose=False
             )
 
         num_layers = self.config.num_hidden_layers

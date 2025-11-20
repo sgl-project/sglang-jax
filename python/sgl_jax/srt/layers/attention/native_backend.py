@@ -62,6 +62,7 @@ class NativeAttention(AttentionBackend):
         Returns:
             Tuple of (output tensor of shape [total_tokens, hidden_size], k, v)
         """
+        # TODO(pc) support tree based native attention backend
         k_buffer, v_buffer, kv_fused = self._get_and_update_kv_cache(
             k, v, forward_batch, token_to_kv_pool, self.kv_sharding, layer.layer_id
         )
@@ -111,7 +112,7 @@ class NativeAttention(AttentionBackend):
         Get the kv cache from the forward batch.
         """
         if is_tpu_runtime():
-            if forward_batch.forward_mode == ForwardMode.EXTEND:
+            if forward_batch.forward_mode.is_extend():
                 token_to_kv_pool.set_kv_buffer(
                     layer_id, forward_batch.out_cache_loc, k, v, is_decode=False
                 )

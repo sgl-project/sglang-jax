@@ -112,11 +112,20 @@ class SchedulerMetricsMixin:
 
         msg = f"Decode batch. #running-req: {num_running_reqs}, {token_msg}"
 
+        if running_batch.spec_algorithm is not None and not running_batch.spec_algorithm.is_none():
+            accept_ratio = self.accept_token / self.draft_token
+            accept_len = self.accept_token / self.spec_num_forward_ct
+            self.accept_token = 0
+            self.draft_token = 0
+            self.spec_num_forward_ct = 0
+            msg += f"accept-len {accept_len:.2f}, accept-ratio {accept_ratio:.2f}, "
+
         msg += (
             f"gen throughput (token/s): {self.last_gen_throughput:.2f}, "
             f"#queue-req: {len(self.waiting_queue)}, "
         )
 
-        msg += f"#cache_miss: {batch.cache_miss_count}"
+        if batch.cache_miss_count > 0:
+            msg += f"#cache_miss: {batch.cache_miss_count}"
 
         logger.info(msg)

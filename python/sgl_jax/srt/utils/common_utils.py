@@ -427,3 +427,18 @@ def lru_cache_frozenset(maxsize=128):
 def cdiv(a, b):
     assert b != 0, f"b is equal to 0, b={b}"
     return (a + b - 1) // b
+
+
+def next_power_of_2(x: int):
+    """Finds the smallest power of 2 >= x using bit manipulation.
+
+    Args:
+      x: The input number (should be an integer).
+
+    Returns:
+      The smallest integer power of 2 that is >= x.
+    """
+    assert x > 0
+    if x == 1:
+        return 1
+    return 1 << (x - 1).bit_length()

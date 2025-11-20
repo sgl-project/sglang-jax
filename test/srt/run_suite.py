@@ -208,6 +208,8 @@ suites = {
         TestFile("python/sgl_jax/test/mem_cache/test_kv_cache.py", 20),
         TestFile("python/sgl_jax/test/mem_cache/test_radix_cache.py", 0.2),
         TestFile("python/sgl_jax/test/mem_cache/test_swa_radix_cache.py", 0.2),
+        TestFile("python/sgl_jax/test/speculative/test_eagle_tree_build.py", 1),
+        TestFile("python/sgl_jax/test/speculative/test_eagle_utils.py", 1),
     ],
     "kernel-performance-test-tpu-v6e-1": [
         TestFile("benchmark/kernels/flash_attention/bench_flashattention.py", 5),
@@ -244,6 +246,7 @@ suites = {
         TestFile("test/srt/openai_server/features/test_structural_tag.py", 2),
         TestFile("test/srt/test_srt_engine.py", 1),
         TestFile("test/srt/test_logprobs.py", 3),
+        TestFile("test/srt/test_qwen1_5_models_dummy.py", 3),
     ],
     "e2e-test-tpu-v6e-4": [
         TestFile("test/srt/openai_server/basic/test_tool_calls.py", 3),
