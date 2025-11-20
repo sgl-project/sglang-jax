@@ -150,6 +150,11 @@ class Scheduler(
         self.page_size = server_args.page_size
         self.enable_overlap = not server_args.disable_overlap_schedule
         self.spec_algorithm = SpeculativeAlgorithm.from_string(server_args.speculative_algorithm)
+
+        # LoRA configurations
+        self.lora_paths = server_args.lora_paths
+        self.max_loras_per_batch = server_args.max_loras_per_batch
+
         # Init inter-process communication
         context = zmq.Context(2)
 
@@ -1026,6 +1031,14 @@ class Scheduler(
             self.chunked_req.init_next_round_input()
             self.chunked_req = adder.add_chunked_req(self.chunked_req)
 
+        # Collect existing LoRA IDs in the running batch if LoRA is enabled
+        if self.lora_paths is not None:
+            lora_set = (
+                set([req.lora_id for req in self.running_batch.reqs])
+                if self.running_batch is not None
+                else set([])
+            )
+
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
             if req.finished():
@@ -1034,6 +1047,16 @@ class Scheduler(
 
             if running_bs + len(adder.can_run_list) >= self.max_running_requests:
                 self.running_batch.batch_is_full = True
+                break
+
+            # Check LoRA constraint: ensure we don't exceed max_loras_per_batch
+            if (
+                self.lora_paths is not None
+                and len(
+                    lora_set | set([req.lora_id for req in adder.can_run_list]) | set([req.lora_id])
+                )
+                > self.max_loras_per_batch
+            ):
                 break
 
             req.init_next_round_input(self.tree_cache)
@@ -1159,6 +1182,10 @@ class Scheduler(
                 precompile_cache_loc_paddings,
                 self.page_size,
             )
+
+            # Prepare LoRA batch if LoRA is enabled
+            if self.server_args.enable_lora:
+                self.tp_worker.get_model_runner().lora_manager.prepare_lora_batch(batch)
 
             if self.enable_overlap:
                 # Pre-initialize ForwardBatch for overlap scheduling optimization
