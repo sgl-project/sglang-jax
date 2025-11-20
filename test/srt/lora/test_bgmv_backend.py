@@ -266,7 +266,7 @@ class TestBgmvLoRABackend(CustomTestCase):
         rank, out_q, out_k, out_v = self.lora_configs[lora_name]
 
         if rank == 0:
-            lora_a = jnp.empty((0,self.input_dim), dtype = self.dtype)
+            lora_a = jnp.empty((0, self.input_dim), dtype=self.dtype)
 
         if num_slices == 3:  # QKV
             lora_a = jnp.array(
@@ -285,7 +285,7 @@ class TestBgmvLoRABackend(CustomTestCase):
                 lora_b = lora_b.at[out_q : out_q + out_k, :].set(0.0)
 
             if rank == 0:
-                lora_b = jnp.empty((out_q+out_k+out_v,0), dtype = self.dtype)
+                lora_b = jnp.empty((out_q + out_k + out_v, 0), dtype=self.dtype)
 
         elif num_slices == 2:  # gate-up
             lora_a = jnp.array(
@@ -297,7 +297,7 @@ class TestBgmvLoRABackend(CustomTestCase):
                 dtype=self.dtype,
             )
             if rank == 0:
-                lora_b = jnp.empty((2*self.gate_up_output_dim,0), dtype = self.dtype)
+                lora_b = jnp.empty((2 * self.gate_up_output_dim, 0), dtype=self.dtype)
         else:  # Standard linear
             lora_a = jnp.array(
                 np.random.randn(rank, self.input_dim) * 0.01,
@@ -308,7 +308,7 @@ class TestBgmvLoRABackend(CustomTestCase):
                 dtype=self.dtype,
             )
             if rank == 0:
-                lora_b = jnp.empty((self.input_dim,0), dtype = self.dtype)
+                lora_b = jnp.empty((self.input_dim, 0), dtype=self.dtype)
 
         return lora_a, lora_b
 
@@ -414,7 +414,7 @@ class TestBgmvLoRABackend(CustomTestCase):
 
     # === Test run_lora_a_gemm and run_lora_b_gemm ===
 
-    def test_lora_a_b_gemm_cartesian(self):
+    def test_lora_a_b_gemm(self):
         """Test run_lora_a_gemm and run_lora_b_gemm with Cartesian product."""
         batch_sizes = [1, 2, 16, 64]
         compositions = [BatchComposition.UNIFORM, BatchComposition.MIXED, BatchComposition.SKEWED]
@@ -503,7 +503,7 @@ class TestBgmvLoRABackend(CustomTestCase):
 
     # === Test run_qkv_lora ===
 
-    def test_qkv_lora_cartesian(self):
+    def test_qkv_lora(self):
         """Test run_qkv_lora with Cartesian product."""
         batch_sizes = [1, 2, 16, 64]
         compositions = [BatchComposition.UNIFORM, BatchComposition.MIXED, BatchComposition.SKEWED]
@@ -568,7 +568,7 @@ class TestBgmvLoRABackend(CustomTestCase):
 
     # === Test run_gate_up_lora ===
 
-    def test_gate_up_lora_cartesian(self):
+    def test_gate_up_lora(self):
         """Test run_gate_up_lora with Cartesian product."""
         batch_sizes = [1, 2, 16, 64]
         compositions = [BatchComposition.UNIFORM, BatchComposition.MIXED, BatchComposition.SKEWED]
@@ -633,7 +633,7 @@ class TestBgmvLoRABackend(CustomTestCase):
 
     # === Test QKV with missing k_proj ===
 
-    def test_qkv_missing_projections(self):
+    def test_qkv_missing(self):
         """Test QKV operations with missing k_proj (Qwen3 scenario)."""
         batch_sizes = [1, 2, 16, 64]
         compositions = [BatchComposition.UNIFORM, BatchComposition.MIXED, BatchComposition.SKEWED]
