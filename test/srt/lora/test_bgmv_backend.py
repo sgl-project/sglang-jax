@@ -25,6 +25,7 @@ class BatchComposition(Enum):
     UNIFORM = "uniform"
     MIXED = "mixed"
     SKEWED = "skewed"
+    NONE = "_NO_LORA_"
 
 
 class BatchMode(Enum):
@@ -220,7 +221,7 @@ def reference_gate_up_lora(
     return output
 
 
-class TestBgmvLoRABackendE2E(CustomTestCase):
+class TestBgmvLoRABackend(CustomTestCase):
     """End-to-end tests for BgmvLoRABackend with Cartesian product of conditions."""
 
     RTOL = 1e-3
@@ -241,6 +242,7 @@ class TestBgmvLoRABackendE2E(CustomTestCase):
             "lora_A": (8, 256, 128, 128),
             "lora_B": (16, 256, 128, 128),
             "lora_C": (32, 256, 128, 128),
+            "_NO_LORA_": (0, 4096, 1024, 1024),
         }
 
         self.qkv_output_slices = (256, 128, 128)
@@ -263,6 +265,9 @@ class TestBgmvLoRABackendE2E(CustomTestCase):
         """Create LoRA A and B weights."""
         rank, out_q, out_k, out_v = self.lora_configs[lora_name]
 
+        if rank == 0:
+            lora_a = jnp.empty((0,self.input_dim), dtype = self.dtype)
+
         if num_slices == 3:  # QKV
             lora_a = jnp.array(
                 np.random.randn(num_slices * rank, self.input_dim) * 0.01,
@@ -279,6 +284,9 @@ class TestBgmvLoRABackendE2E(CustomTestCase):
                 lora_a = lora_a.at[rank : 2 * rank, :].set(0.0)
                 lora_b = lora_b.at[out_q : out_q + out_k, :].set(0.0)
 
+            if rank == 0:
+                lora_b = jnp.empty((out_q+out_k+out_v,0), dtype = self.dtype)
+
         elif num_slices == 2:  # gate-up
             lora_a = jnp.array(
                 np.random.randn(num_slices * rank, self.input_dim) * 0.01,
@@ -288,6 +296,8 @@ class TestBgmvLoRABackendE2E(CustomTestCase):
                 np.random.randn(2 * self.gate_up_output_dim, rank) * 0.01,
                 dtype=self.dtype,
             )
+            if rank == 0:
+                lora_b = jnp.empty((2*self.gate_up_output_dim,0), dtype = self.dtype)
         else:  # Standard linear
             lora_a = jnp.array(
                 np.random.randn(rank, self.input_dim) * 0.01,
@@ -297,6 +307,8 @@ class TestBgmvLoRABackendE2E(CustomTestCase):
                 np.random.randn(self.input_dim, rank) * 0.01,
                 dtype=self.dtype,
             )
+            if rank == 0:
+                lora_b = jnp.empty((self.input_dim,0), dtype = self.dtype)
 
         return lora_a, lora_b
 
@@ -358,7 +370,7 @@ class TestBgmvLoRABackendE2E(CustomTestCase):
         if batch_composition == BatchComposition.UNIFORM:
             lora_assignments = ["lora_A"] * batch_size
         elif batch_composition == BatchComposition.MIXED:
-            lora_names = ["lora_A", "lora_B", "lora_C"]
+            lora_names = ["lora_A", "lora_B", "lora_C", None]
             lora_assignments = [lora_names[i % len(lora_names)] for i in range(batch_size)]
         elif batch_composition == BatchComposition.SKEWED:
             num_minority = max(1, batch_size // 8)
@@ -373,16 +385,19 @@ class TestBgmvLoRABackendE2E(CustomTestCase):
             dtype=self.dtype,
         )
 
-        unique_loras = sorted(set(lora_assignments))
+        normalized_assignments = [
+            name if name is not None else "_NO_LORA_" for name in lora_assignments
+        ]
+        unique_loras = sorted(set(normalized_assignments))
         lora_name_to_idx = {name: idx for idx, name in enumerate(unique_loras)}
 
         weights = {}
         for lora_name in unique_loras:
             weights[lora_name] = self.create_lora_weights(lora_name, num_slices, include_missing_k)
 
-        weight_indices = [lora_name_to_idx[name] for name in lora_assignments]
-        lora_ranks = [self.lora_configs[name][0] for name in lora_assignments]
-        scalings = [1.0 for _ in lora_assignments]
+        weight_indices = [lora_name_to_idx[name] for name in normalized_assignments]
+        lora_ranks = [self.lora_configs[name][0] for name in normalized_assignments]
+        scalings = [1.0 for _ in normalized_assignments]
 
         forward_batch = self.create_forward_batch(seq_lengths, batch_mode)
 
@@ -391,7 +406,7 @@ class TestBgmvLoRABackendE2E(CustomTestCase):
             weights,
             forward_batch,
             seq_lengths,
-            lora_assignments,
+            normalized_assignments,
             weight_indices,
             lora_ranks,
             scalings,
