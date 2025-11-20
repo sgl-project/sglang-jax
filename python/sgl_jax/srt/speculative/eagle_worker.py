@@ -36,6 +36,24 @@ logger = logging.getLogger(__name__)
 RETURN_ORIGINAL_LOGPROB = get_bool_env_var("RETURN_ORIGINAL_LOGPROB")
 
 
+@functools.partial(jax.jit, static_argnames=("draft_token_num",))
+def _verify_postprocess_fixed(
+    logits_next_token: jax.Array,
+    hidden_states: jax.Array,
+    positions: jax.Array,
+    accept_index: jax.Array,
+    draft_token_num: int,
+):
+    """Fixed-shape postprocess for verify outputs using mask instead of shrinking."""
+    mask = accept_index != -1
+    # gather with fill_value to avoid shape change
+    gather_idx = jnp.where(mask, accept_index, 0)
+    gathered_logits = jnp.take(logits_next_token, gather_idx, axis=0)
+    gathered_hidden = jnp.take(hidden_states, gather_idx, axis=0)
+    gathered_pos = jnp.take(positions, gather_idx, axis=0)
+    return gathered_logits, gathered_hidden, gathered_pos, mask
+
+
 class EAGLEWorker(ModelWorker):
     def __init__(self, server_args, target_worker: ModelWorker):
         self.server_args = server_args
@@ -374,7 +392,6 @@ class EAGLEWorker(ModelWorker):
         spec_info.hidden_states = logits_output.hidden_states
         (
             predict,
-            verified_id,
             accept_length,
             accept_index,
         ) = spec_info.sample(
@@ -385,9 +402,20 @@ class EAGLEWorker(ModelWorker):
             self.model_runner.rngs,
             self.mesh,
         )
-        logits_output.next_token_logits = logits_output.next_token_logits[accept_index]
-        logits_output.hidden_states = logits_output.hidden_states[accept_index]
-        model_worker_batch.positions = model_worker_batch.positions[accept_index]
+        (
+            logits_output.next_token_logits,
+            logits_output.hidden_states,
+            model_worker_batch.positions,
+            accept_mask,
+        ) = _verify_postprocess_fixed(
+            logits_output.next_token_logits,
+            logits_output.hidden_states,
+            model_worker_batch.positions,
+            accept_index,
+            self.speculative_num_draft_tokens,
+        )
+        accept_index = accept_index[accept_mask]
+        verified_id = predict[accept_index]
         new_seq_lens = model_worker_batch.seq_lens[: model_worker_batch.real_bs] + accept_length
         next_draft_input = EagleDraftInput(
             verified_id=verified_id,
@@ -492,7 +520,7 @@ class EAGLEWorker(ModelWorker):
         draft_input = EagleDraftInput(
             hidden_states=batch_output.logits_output.hidden_states,
         )
-        forward_batch, logits_meatadata = draft_input.prepare_for_extend_after_verify(
+        model_worker_batch, logits_meatadata = draft_input.prepare_for_extend_after_verify(
             model_worker_batch,
             batch_output.next_token_ids,
             self.speculative_num_draft_tokens,

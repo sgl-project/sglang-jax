@@ -970,9 +970,7 @@ class EagleVerifyInput:
 
         accept_length = accept_length + 1
         accept_index = accept_index.reshape(-1)
-        accept_index = accept_index[accept_index != -1]
-        verified_id = predict[accept_index]
-        return predict, verified_id, accept_length, accept_index
+        return predict, accept_length, accept_index
 
 
 def _generate_simulated_accept_index(
