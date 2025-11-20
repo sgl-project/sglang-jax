@@ -15,7 +15,7 @@ from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch, ForwardM
 from sgl_jax.test.test_utils import CustomTestCase
 
 
-def safe_matmul(a: jnp.ndarray, b: jnp.ndarray) -> jnp.ndarray:
+def safe_matmul(a: jax.Array, b: jax.Array) -> jax.Array:
     """Matrix multiplication with mixed precision handling for bfloat16."""
     result = jnp.matmul(a.astype(jnp.float32), b.astype(jnp.float32))
     return result.astype(a.dtype)
@@ -33,16 +33,16 @@ class BatchMode(Enum):
 
 
 def reference_lora_a_gemm(
-    x: jnp.ndarray,
-    weights: jnp.ndarray,
+    x: jax.Array,
+    weights: jax.Array,
     seq_lengths: List[int],
     lora_assignments: List[str],
     lora_configs: Dict[str, Tuple[int, int, int, int]],
     scalings: List[float],
-) -> jnp.ndarray:
+) -> jax.Array:
     """Reference implementation of LoRA A GEMM."""
-    if weights.size == 0:
-        return jnp.zeros((x.shape[0], 0), dtype=x.dtype)
+    # if weights.size == 0:
+    #     return jnp.zeros((x.shape[0], 0), dtype=x.dtype)
 
     total_seq_len, input_dim = x.shape
     num_loras, weight_out_dim, _ = weights.shape
@@ -75,13 +75,13 @@ def reference_lora_a_gemm(
 
 
 def reference_lora_b_gemm(
-    x: jnp.ndarray,
-    weights: jnp.ndarray,
+    x: jax.Array,
+    weights: jax.Array,
     seq_lengths: List[int],
     lora_assignments: List[str],
     lora_configs: Dict[str, Tuple[int, int, int, int]],
-    base_output: jnp.ndarray,
-) -> jnp.ndarray:
+    base_output: jax.Array,
+) -> jax.Array:
     """Reference implementation of LoRA B GEMM."""
     if weights.size == 0:
         return base_output
@@ -111,16 +111,16 @@ def reference_lora_b_gemm(
 
 
 def reference_qkv_lora(
-    x: jnp.ndarray,
-    qkv_lora_a: jnp.ndarray,
-    qkv_lora_b: jnp.ndarray,
+    x: jax.Array,
+    qkv_lora_a: jax.Array,
+    qkv_lora_b: jax.Array,
     seq_lengths: List[int],
     lora_assignments: List[str],
     lora_configs: Dict[str, Tuple[int, int, int, int]],
     scalings: List[float],
     output_slices: Tuple[int, int, int],
-    base_output: jnp.ndarray,
-) -> jnp.ndarray:
+    base_output: jax.Array,
+) -> jax.Array:
     """Reference implementation of QKV LoRA."""
     if qkv_lora_a.size == 0:
         return base_output
@@ -166,16 +166,16 @@ def reference_qkv_lora(
 
 
 def reference_gate_up_lora(
-    x: jnp.ndarray,
-    gate_up_lora_a: jnp.ndarray,
-    gate_up_lora_b: jnp.ndarray,
+    x: jax.Array,
+    gate_up_lora_a: jax.Array,
+    gate_up_lora_b: jax.Array,
     seq_lengths: List[int],
     lora_assignments: List[str],
     lora_configs: Dict[str, Tuple[int, int, int, int]],
     scalings: List[float],
     output_dim: int,
-    base_output: jnp.ndarray,
-) -> jnp.ndarray:
+    base_output: jax.Array,
+) -> jax.Array:
     """Reference implementation of gate-up LoRA."""
     if gate_up_lora_a.size == 0:
         return base_output
@@ -228,7 +228,7 @@ class TestBgmvLoRABackendE2E(CustomTestCase):
 
     def setUp(self):
         """Set up common test parameters."""
-        jax.config.update("jax_platform_name", "cpu")
+        # jax.config.update("jax_platform_name", "cpu")
         np.random.seed(42)
         random.seed(42)
 
@@ -259,7 +259,7 @@ class TestBgmvLoRABackendE2E(CustomTestCase):
 
     def create_lora_weights(
         self, lora_name: str, num_slices: int = 1, include_missing_k: bool = False
-    ) -> Tuple[jnp.ndarray, jnp.ndarray]:
+    ) -> Tuple[jax.Array, jax.Array]:
         """Create LoRA A and B weights."""
         rank, out_q, out_k, out_v = self.lora_configs[lora_name]
 
@@ -317,8 +317,8 @@ class TestBgmvLoRABackendE2E(CustomTestCase):
         )
 
     def stack_lora_weights(
-        self, weight_list: List[jnp.ndarray], is_lora_a: bool, max_rank: int, num_slices: int = 1
-    ) -> jnp.ndarray:
+        self, weight_list: List[jax.Array], is_lora_a: bool, max_rank: int, num_slices: int = 1
+    ) -> jax.Array:
         """Stack LoRA weights from different adapters."""
         if not weight_list or all(w.size == 0 for w in weight_list):
             return jnp.empty((len(weight_list), 0, 0), dtype=self.dtype)
@@ -459,6 +459,7 @@ class TestBgmvLoRABackendE2E(CustomTestCase):
                                 rtol=self.RTOL,
                                 atol=self.ATOL,
                                 err_msg=f"LoRA A failed for {composition.value}, {mode.value}, batch_size={batch_size}",
+                                strict=True,
                             )
                     token_offset += seq_len
 
@@ -482,6 +483,7 @@ class TestBgmvLoRABackendE2E(CustomTestCase):
                     rtol=self.RTOL,
                     atol=self.ATOL,
                     err_msg=f"LoRA B failed for {composition.value}, {mode.value}, batch_size={batch_size}",
+                    strict=True,
                 )
 
     # === Test run_qkv_lora ===
@@ -546,6 +548,7 @@ class TestBgmvLoRABackendE2E(CustomTestCase):
                     rtol=self.RTOL,
                     atol=self.ATOL,
                     err_msg=f"QKV LoRA failed for {composition.value}, {mode.value}, batch_size={batch_size}",
+                    strict=True,
                 )
 
     # === Test run_gate_up_lora ===
@@ -610,6 +613,7 @@ class TestBgmvLoRABackendE2E(CustomTestCase):
                     rtol=self.RTOL,
                     atol=self.ATOL,
                     err_msg=f"Gate-up LoRA failed for {composition.value}, {mode.value}, batch_size={batch_size}",
+                    strict=True,
                 )
 
     # === Test QKV with missing k_proj ===
@@ -676,6 +680,7 @@ class TestBgmvLoRABackendE2E(CustomTestCase):
                     rtol=self.RTOL,
                     atol=self.ATOL,
                     err_msg=f"QKV missing k_proj failed for {composition.value}, {mode.value}, batch_size={batch_size}",
+                    strict=True,
                 )
 
 

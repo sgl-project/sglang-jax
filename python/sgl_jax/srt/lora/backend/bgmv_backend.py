@@ -44,7 +44,9 @@ class BgmvLoRABackend(BaseLoRABackend):
         # print(f"{weights=}")
         # print(f"{self.batch_info.token_lora_indices=}")
         # print(f"{self.batch_info.scalings=}")
-        return shrink(x, weights, self.batch_info.token_lora_indices, self.batch_info.scalings)
+        return shrink(
+            x, weights, self.batch_info.token_lora_indices, self.batch_info.scalings
+        ).astype(x.dtype)
 
     def run_lora_b_gemm(
         self,
@@ -70,7 +72,7 @@ class BgmvLoRABackend(BaseLoRABackend):
             self.batch_info.token_lora_indices,
             (weights.shape[1],),
             self.max_lora_rank,
-        )
+        ).astype(x.dtype)
 
     def run_qkv_lora(
         self,
@@ -120,7 +122,7 @@ class BgmvLoRABackend(BaseLoRABackend):
             self.batch_info.token_lora_indices,
             output_slices,
             self.max_lora_rank,
-        )
+        ).astype(x.dtype)
 
     def run_gate_up_lora(
         self,
@@ -159,7 +161,7 @@ class BgmvLoRABackend(BaseLoRABackend):
             self.batch_info.token_lora_indices,
             (gate_up_lora_b_concated.shape[1] // 2, gate_up_lora_b_concated.shape[1] // 2),
             self.max_lora_rank,
-        )
+        ).astype(x.dtype)
 
     def prepare_lora_batch(
         self,
