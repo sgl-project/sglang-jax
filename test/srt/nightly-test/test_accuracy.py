@@ -53,8 +53,8 @@ class TestModelAccuracy(CustomTestCase):
                 "2048",
                 "--tp-size",
                 "1",
-                "--grammar-backend", 
-                "none", 
+                # "--grammar-backend", 
+                # "none", 
             ],
             env={
                 "JAX_COMPILATION_CACHE_DIR": "/tmp/jax_compilation_cache",
@@ -105,8 +105,8 @@ class TestModelAccuracy(CustomTestCase):
                 "2048",
                 "--tp-size",
                 "1",
-                "--grammar-backend", 
-                "none", 
+                # "--grammar-backend", 
+                # "none", 
             ],
             env={
                 "JAX_COMPILATION_CACHE_DIR": "/tmp/jax_compilation_cache",
@@ -209,8 +209,8 @@ class TestModelAccuracy(CustomTestCase):
                 "2048",
                 "--tp-size",
                 "1",
-                # "--grammar-backend", 
-                # "none", 
+                "--grammar-backend", 
+                "none", 
             ],
             env={
                 "JAX_COMPILATION_CACHE_DIR": "/tmp/jax_compilation_cache",
@@ -226,7 +226,7 @@ class TestModelAccuracy(CustomTestCase):
             max_tokens=1024,
         )
         metrics = run_eval(args)
-        self.assertGreater(metrics["score"], 0.2)
+        self.assertGreater(metrics["score"], 0.5)
 
         ## kill process
         kill_process_tree(process.pid)
@@ -371,6 +371,7 @@ class TestModelAccuracy(CustomTestCase):
                 "4", 
                 "--grammar-backend", 
                 "none", 
+                "--disable-hybrid-swa-memory",
             ],
             env={
                 "JAX_COMPILATION_CACHE_DIR": "/tmp/jax_compilation_cache",
@@ -552,7 +553,7 @@ class TestModelAccuracy(CustomTestCase):
             max_tokens=1024,
         )
         metrics = run_eval(args)
-        self.assertGreater(metrics["score"], 0.2)
+        self.assertGreater(metrics["score"], 0.7)
 
         ## kill process
         kill_process_tree(process.pid)
