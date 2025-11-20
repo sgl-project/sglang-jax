@@ -5,9 +5,9 @@
 Benchmark online serving with dynamic requests.
 
 Usage:
-python3 -m sglang.bench_serving --backend sgl-jax --num-prompt 10
+python3 -m sgl_jax.bench_serving --backend sgl-jax --num-prompt 10
 
-python3 -m sglang.bench_serving --backend sgl-jax --dataset-name random --num-prompts 3000 --random-input 1024 --random-output 1024 --random-range-ratio 0.5
+python3 -m sgl_jax.bench_serving --backend sgl-jax --dataset-name random --num-prompts 3000 --random-input 1024 --random-output 1024 --random-range-ratio 0.5
 """
 
 import argparse
@@ -45,7 +45,7 @@ ASSISTANT_SUFFIX = "Assistant:"
 global args
 
 
-# don't want to import sglang package here
+# don't want to import sgl_jax package here
 def _get_bool_env_var(name: str, default: str = "false") -> bool:
     value = os.getenv(name, default)
     return value.lower() in ("true", "1")
@@ -485,7 +485,7 @@ def get_tokenizer(
     if pretrained_model_name_or_path.endswith(".json") or pretrained_model_name_or_path.endswith(
         ".model"
     ):
-        from sglang.srt.hf_transformers_utils import get_tokenizer
+        from sgl_jax.srt.hf_transformers_utils import get_tokenizer
 
         return get_tokenizer(pretrained_model_name_or_path)
 

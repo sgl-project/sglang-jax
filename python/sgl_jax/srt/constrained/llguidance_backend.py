@@ -6,13 +6,14 @@ import os
 
 import numpy as np
 from llguidance import LLMatcher, LLTokenizer, StructTag, grammar_from
-from llguidance.hf import from_tokenizer
+from transformers import PreTrainedTokenizer, PreTrainedTokenizerFast
 
 from sgl_jax.srt.constrained.base_grammar_backend import (
     INVALID_GRAMMAR_OBJ,
     BaseGrammarBackend,
     BaseGrammarObject,
 )
+from sgl_jax.srt.managers.tiktoken_tokenizer import EOS, TiktokenTokenizer
 
 from .bitmask_ops import allocate_token_bitmask, fill_token_bitmask
 
@@ -109,7 +110,26 @@ class GuidanceBackend(BaseGrammarBackend):
 
         self.any_whitespace = any_whitespace
         self.whitespace_pattern = whitespace_pattern
-        self.llguidance_tokenizer = from_tokenizer(tokenizer, n_vocab=n_vocab)
+        if isinstance(tokenizer, (PreTrainedTokenizer, PreTrainedTokenizerFast)):
+            from llguidance.hf import from_tokenizer
+
+            self.llguidance_tokenizer = from_tokenizer(tokenizer, n_vocab=n_vocab)
+        elif isinstance(tokenizer, TiktokenTokenizer):
+            from llguidance.tiktoken import lltokenizer_from_encoding
+
+            # TiktokenTokenizer wraps the underlying tiktoken.Encoding on `.tokenizer`
+            encoding = tokenizer.tokenizer
+            eos_id = tokenizer.eos_token_id
+            if eos_id is None and hasattr(encoding, "_special_tokens"):
+                eos_id = encoding._special_tokens.get(EOS)
+
+            self.llguidance_tokenizer = lltokenizer_from_encoding(
+                encoding,
+                n_vocab=n_vocab,
+                eos_token=eos_id,
+            )
+        else:
+            raise TypeError(f"Unsupported tokenizer type: {type(tokenizer)}")
 
         logger.info("Initialized GuidanceBackend with whitespace_pattern=%s", whitespace_pattern)
 
