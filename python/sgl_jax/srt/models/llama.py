@@ -316,41 +316,44 @@ class LlamaModel(nnx.Module):
         config: LlamaConfig,
         dtype: jnp.dtype = jnp.bfloat16,
         rngs: nnx.Rngs = None,
+        is_draft_model: bool = False,
         mesh: jax.sharding.Mesh = None,
     ) -> None:
         super().__init__()
         self.config = config
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
-        self.embed_tokens = Embed(
-            config.vocab_size,
-            config.hidden_size,
-            rngs=rngs,
-            dtype=dtype,
-            kernel_axes=("tensor", None),
-            param_dtype=dtype,
-            mesh=mesh,
-        )
+        if not is_draft_model:
+            self.embed_tokens = Embed(
+                config.vocab_size,
+                config.hidden_size,
+                rngs=rngs,
+                dtype=dtype,
+                kernel_axes=("tensor", None),
+                param_dtype=dtype,
+                mesh=mesh,
+            )
 
-        self.layers = nnx.data(
-            [
-                LlamaDecoderLayer(
-                    config=config,
-                    layer_id=i,
-                    dtype=dtype,
-                    rngs=rngs,
-                    mesh=mesh,
-                )
-                for i in range(config.num_hidden_layers)
-            ]
-        )
+            self.layers = nnx.data(
+                [
+                    LlamaDecoderLayer(
+                        config=config,
+                        layer_id=i,
+                        dtype=dtype,
+                        rngs=rngs,
+                        mesh=mesh,
+                    )
+                    for i in range(config.num_hidden_layers)
+                ]
+            )
 
-        self.norm = RMSNorm(
-            config.hidden_size,
-            epsilon=config.rms_norm_eps,
-            param_dtype=dtype,
-            rngs=rngs,
-        )
+            self.norm = RMSNorm(
+                config.hidden_size,
+                epsilon=config.rms_norm_eps,
+                param_dtype=dtype,
+                rngs=rngs,
+            )
+        self.layers_to_capture = []
 
     def __call__(
         self,
@@ -361,7 +364,10 @@ class LlamaModel(nnx.Module):
         hidden_states = self.embed_tokens(forward_batch.input_ids)
         layers_kv_fused = []
         layers_callback_flag = []
-        for layer in self.layers:
+        aux_hidden_states = []
+        for layer_id, layer in enumerate(self.layers):
+            if layer_id in self.layers_to_capture:
+                aux_hidden_states.append(hidden_states + residual)
             hidden_states, residual, kv_fused, callback_flag = layer(
                 forward_batch.positions,
                 hidden_states,
@@ -380,7 +386,7 @@ class LlamaModel(nnx.Module):
             hidden_states, "transformer_output", "TRANSFORMER"
         )
         layers_callback_flag.append(callback_flag)
-        return hidden_states, layers_kv_fused, layers_callback_flag
+        return hidden_states, aux_hidden_states, layers_kv_fused, layers_callback_flag
 
 
 class LlamaForCausalLM(nnx.Module):
@@ -406,6 +412,7 @@ class LlamaForCausalLM(nnx.Module):
                 rngs=rngs,
             )
         self.logits_processor = LogitsProcessor(config.vocab_size, mesh=self.mesh)
+        self.capture_aux_hidden_states = False
 
     def load_weights(self, model_config: ModelConfig, rng_key: jax.Array):
         self.rng = nnx.Rngs(rng_key)
@@ -539,19 +546,79 @@ class LlamaForCausalLM(nnx.Module):
 
         return mappings
 
+    def set_eagle3_layers_to_capture(self, layer_ids: list[int] | None = None):
+
+        if layer_ids is None:
+            self.capture_aux_hidden_states = True
+            num_layers = self.config.num_hidden_layers
+            self.model.layers_to_capture = [2, num_layers // 2, num_layers - 3]
+        else:
+            self.capture_aux_hidden_states = True
+            # we plus 1 here because in sglang, for the ith layer, it takes the output
+            # of the (i-1)th layer as aux hidden state
+            self.model.layers_to_capture = [val + 1 for val in layer_ids]
+
+    def get_embed_and_head(self):
+        return (
+            self.model.embed_tokens.embedding.value,
+            self.lm_head.embedding.value,
+        )
+
+    def set_embed_and_head(
+        self,
+        embed_weight: jax.Array | None = None,
+        head_weight: jax.Array | None = None,
+    ) -> None:
+        """Set word embedding and LM Head weights.
+
+        Args:
+            embed_weight: Embedding matrix with shape [vocab_size, hidden_size].
+            head_weight:  LM Head matrix with shape [vocab_size, hidden_size].
+        """
+
+        # Set embedding weight
+        if embed_weight is not None:
+            self.model.embed_tokens.embedding.value = embed_weight
+
+        # Set LM Head weight
+        if head_weight is not None:
+            self.lm_head.embedding.value = head_weight
+
+    def get_embed(self):
+        return (
+            self.model.embed_tokens.embedding.value,
+            self.lm_head.embedding.value,
+        )
+
+    def set_embed(
+        self,
+        embed_weight: jax.Array | None = None,
+    ):
+        self.model.embed_tokens.embedding.value = embed_weight
+
     def __call__(
         self,
         forward_batch: ForwardBatch,
         token_to_kv_pool: KVCache,
         logits_metadata: LogitsMetadata,
     ):
-        hidden_states, layers_kv_fused, layers_callback_flag = self.model(
-            forward_batch, token_to_kv_pool
+        hidden_states, aux_hidden_states, layers_kv_fused, layers_callback_flag = self.model(
+            forward_batch=forward_batch, token_to_kv_pool=token_to_kv_pool
         )
-        if not getattr(self.config, "tie_word_embeddings", False):
-            output = self.logits_processor(hidden_states, self.lm_head, logits_metadata)
+        if not self.capture_aux_hidden_states:
+            aux_hidden_states = None
+        if getattr(self.config, "tie_word_embeddings", True):
+            output = self.logits_processor(
+                hidden_states,
+                self.model.embed_tokens,
+                logits_metadata,
+                aux_hidden_states=aux_hidden_states,
+            )
         else:
-            output = self.logits_processor(hidden_states, self.model.embed_tokens, logits_metadata)
+            output = self.logits_processor(
+                hidden_states, self.lm_head, logits_metadata, aux_hidden_states=aux_hidden_states
+            )
+
         return output, layers_kv_fused, layers_callback_flag
 
 

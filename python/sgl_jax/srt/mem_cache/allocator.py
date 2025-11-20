@@ -97,6 +97,7 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def clear(self):
         # The padded slot 0 is used for writing dummy outputs from padded tokens.
         self.free_slots = np.arange(1, self.size + 1, dtype=np.int32)
+        self.origin_size = len(self.free_slots)
         self.is_not_in_free_group = True
         self.free_group = []
 
@@ -126,6 +127,13 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
     def load_cpu_copy(self, kv_cache_cpu, indices):
         return self._kvcache.load_cpu_copy(kv_cache_cpu, indices)
+
+    def backup_state(self):
+        return (self.free_slots, self.release_pages)
+
+    def restore_state(self, state):
+        assert len(state) == 2
+        self.free_slots, self.release_pages = state
 
 
 class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):

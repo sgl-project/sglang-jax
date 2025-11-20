@@ -37,8 +37,14 @@ QWEN3_MOE_30B = "Qwen/Qwen3-30B-A3B"
 QWEN2_5_7B_INSTRUCT = "Qwen/Qwen2.5-7B-Instruct"
 QWEN3_CODER_30B_A3B_INSTRUCT = "Qwen/Qwen3-Coder-30B-A3B-Instruct"
 GEMMA2_2B_IT = "google/gemma-2-2b-it"
+
 bailing_moe="inclusionAI/Ling-flash-2.0"
 DEEPSEEK_R1_DISTILL_QWEN_1_5B = "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"
+
+QWEN3_32B = "google/gemma-2-2b-it"
+QWEN3_32B_EAGLE3 = "AngelSlim/Qwen3-32B_eagle3"
+DEEPSEEK_R1_QWEN_1_5B = "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"
+
 
 DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH = 600
 

@@ -1,4 +1,5 @@
 import dataclasses
+from typing import TYPE_CHECKING
 
 import jax
 import jax.nn as nn
@@ -10,9 +11,14 @@ from jax.sharding import PartitionSpec as P
 from jax.tree_util import register_pytree_node_class
 
 from sgl_jax.srt.layers.embeddings import Embed
-from sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch
-from sgl_jax.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
 from sgl_jax.srt.utils.jax_utils import device_array
+
+if TYPE_CHECKING:
+    from sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch
+    from sgl_jax.srt.model_executor.forward_batch_info import (
+        CaptureHiddenMode,
+        ForwardMode,
+    )
 
 
 @register_pytree_node_class
@@ -84,19 +90,30 @@ class LogitsProcessorOutput:
 
         return obj
 
-    def truncate_logits_processor_output(self, batch: ModelWorkerBatch):
+    def truncate_logits_processor_output(self, batch: "ModelWorkerBatch"):
+        from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
+
         # note: here only need to truncate next_token_logits and hidden_states
-        self.next_token_logits = jax.lax.dynamic_slice_in_dim(
-            self.next_token_logits, 0, batch.real_bs, axis=0
-        )
-        assert not batch.capture_hidden_mode.need_capture()
+        if batch.forward_mode == ForwardMode.TARGET_VERIFY:
+            # For ForwardMode.TARGET_VERIFY mode, we should take draft_token_num token for tree verify later
+            self.next_token_logits = self.next_token_logits[
+                0 : batch.real_bs * batch.spec_info.draft_token_num
+            ]
+
+        else:
+            self.next_token_logits = self.next_token_logits[0 : batch.real_bs]
+            if len(self.hidden_states.shape) == 1:
+                self.hidden_states = jnp.expand_dims(self.hidden_states, axis=0)
+            self.hidden_states = self.hidden_states[0 : batch.real_bs]
+
+        # assert not batch.capture_hidden_mode.need_capture()
 
 
 @register_pytree_node_class
 @dataclasses.dataclass
 class LogitsMetadata:
-    forward_mode: ForwardMode
-    capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.NULL
+    forward_mode: "ForwardMode"
+    capture_hidden_mode: "CaptureHiddenMode" = None
 
     extend_return_logprob: bool = False
     extend_return_top_logprob: bool = False
@@ -165,7 +182,7 @@ class LogitsMetadata:
         return obj
 
     @classmethod
-    def from_model_worker_batch(cls, batch: ModelWorkerBatch, mesh: Mesh = None):
+    def from_model_worker_batch(cls, batch: "ModelWorkerBatch", mesh: Mesh = None):
         if batch.forward_mode.is_extend() and batch.return_logprob:
             extend_seq_lens_cpu = batch.extend_seq_lens.tolist()
 
@@ -221,14 +238,23 @@ class LogitsProcessor(nnx.Module):
         hidden_states: jax.Array,
         lm_head: Embed,
         logits_metadata: LogitsMetadata,
+        aux_hidden_states: jax.Array | None = None,
     ) -> LogitsProcessorOutput:
-        if logits_metadata.forward_mode.is_decode_or_idle():
+        if (
+            logits_metadata.forward_mode.is_decode_or_idle()
+            or logits_metadata.forward_mode.is_target_verify()
+        ):
             pruned_states = hidden_states
+            if aux_hidden_states is not None:
+                aux_pruned_states = [hidden for hidden in aux_hidden_states]
             sample_indices = None
             input_logprob_indices = None
         elif logits_metadata.forward_mode.is_extend() and not logits_metadata.extend_return_logprob:
             last_index = jnp.cumsum(logits_metadata.extend_seq_lens, axis=0) - 1
             pruned_states = hidden_states[last_index]
+            if aux_hidden_states is not None:
+                aux_pruned_states = [hidden[last_index] for hidden in aux_hidden_states]
+
             sample_indices = None
             input_logprob_indices = None
         else:
@@ -264,11 +290,11 @@ class LogitsProcessor(nnx.Module):
             sample_indices = device_array(
                 np.array(
                     sample_indices,
-                    dtype=jnp.int64,
+                    dtype=np.int64,
                 ),
             )
             input_logprob_indices = device_array(
-                np.array(input_logprob_indices, dtype=jnp.int64),
+                np.array(input_logprob_indices, dtype=np.int64),
             )
 
         # Compute logits for both input and sampled tokens.
@@ -278,13 +304,29 @@ class LogitsProcessor(nnx.Module):
         hidden_states_to_store: jax.Array | None = None
         if logits_metadata.capture_hidden_mode.need_capture():
             if logits_metadata.capture_hidden_mode.is_full():
-                hidden_states_to_store = hidden_states
+                if aux_hidden_states is not None:
+                    hidden_states_to_store = jnp.concat(aux_hidden_states, axis=-1)
+                else:
+                    hidden_states_to_store = hidden_states
             elif logits_metadata.capture_hidden_mode.is_last():
                 # Get the last token hidden states. If sample_indices is None,
                 # pruned states only contain the last tokens already.
-                hidden_states_to_store = (
-                    pruned_states[sample_indices] if sample_indices is not None else pruned_states
-                )
+                if aux_hidden_states is not None:
+                    aux_pruned_states = jnp.concat(aux_pruned_states, axis=-1)
+
+                    hidden_states_to_store = (
+                        aux_pruned_states[sample_indices]
+                        if sample_indices is not None
+                        else aux_pruned_states
+                    )
+
+                else:
+                    hidden_states_to_store = (
+                        pruned_states[sample_indices]
+                        if sample_indices is not None
+                        else pruned_states
+                    )
+                    assert True, f"hidden_states_to_store {hidden_states_to_store[:100]}"
             else:
                 raise AssertionError("This branch should not be reached")
 

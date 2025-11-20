@@ -1,6 +1,56 @@
 # Contribution Guide
 
-Welcome to **SGLang-Jax**! We appreciate your interest in contributing. This guide provides a concise overview of how to set up your environment, run tests, build documentation, and open a Pull Request (PR). Whether you’re fixing a small bug or developing a major feature, we encourage following these steps for a smooth contribution process.
+Welcome to **SGLang-Jax**! We appreciate your interest in contributing. This guide provides a concise overview of how to set up your environment, run tests, build documentation, and open a Pull Request (PR).
+
+
+## How to contribute your first PR?
+
+We divide the issues into three types:
+- Features, such as support [structured output](https://github.com/sgl-project/sglang-jax/issues/314)
+  - Note: Sometimes you just want to add a small feature like an api, please still link a google document.
+    - This is encouraged to discuss. We want to make a tradeoff between convenience and feature iterations.
+- Bugs
+- Add unit tests, E2E tests, accuracy tests, performance tests, etc.
+
+Note:
+- You can select the existing or create a new issue for yourself. Please fill the template according to issue type.
+- Before dive deep into different issues contribution requirements, please let me introduce you about CI which is necessary before merging into main. CI consists of pull requests tests and nightly tests. The former is design to ensure fundamental features and bugfixes work and pass few performance and accuracy tests. It includes unit tests, E2E tests, accuracy and performance tests for Qwen3-8B and Qwen3-30B-A3B. The latter is design to check tests as much as possible, such as more models, more datasets, more performance scenarios and so on. See more details in [CI Architecture](./ci_architecture.md).
+
+**Features**
+
+Here we give the feature which is to support structure output as an example. Note: If this is a small feature, only one issue is required.
+
+1. Create a root issue to trace your job in this feature, like [314](https://github.com/sgl-project/sglang-jax/issues/314)
+
+2. Split your job to at least two subissues, like:
+  - Design document subissue, such as [315](https://github.com/sgl-project/sglang-jax/issues/315)
+    - Note: A google document is required to elaborate your design, such as [structure output](https://docs.google.com/document/d/1lZ09hEB00KZjJW_W1Bht1euGwgl3jxu8bVnStJihHXg/edit?tab=t.0). This document is required to be reviewed. You have to include motivation, goals, design and tests.
+  - Code development subissue, such as [331](https://github.com/sgl-project/sglang-jax/issues/331)
+
+3. Codes development:
+  - TPU resources: Please refer to [TPU Resources Guide](./tpu_resources_guide.md).
+  - Setup environment: Please refer to [install SGLang-Jax from source](#install-sglang-jax-from-source).
+  - Code style: Please refer to [format codes](#format-code-with-pre-commit) before you push.
+  - Testing:
+    - Please add unit tests under `python/srt/test/*` and E2E tests under `test/srt/*` to ensure the feature works. File names are required to start with `test_`.
+    - If the feature were to add new accuracy or performance baselines or influence the existing accuracy or performance, please add them in nightly tests. Nightly tests are under construction.
+      - Example: Add a new model implementation.
+  - Description in PR: Please add accuracy or benchmark baselines in pull requests if the feature meeted the above scenarios.
+  - Review: Assign at least one reviewer.
+
+4. If you resolved all comments from code reviews, the pull request would be merged into main. Congrantulations to you!
+
+
+**Bugs && Add tests**
+
+1. Create an issue and fill the content according to template.
+
+2. You can fix it by your self or assign it to others. If you select the former, please continue.
+
+3. Code development: Keep the same to **Features**.
+
+4. If you resolved all comments from code reviews, the pull request would be merged into main. Congrantulations to you!
+
 
 ## Install SGLang-Jax from Source
 
@@ -29,21 +79,24 @@ pre-commit run --all-files
 - **`pre-commit run --all-files`** manually runs all configured checks, applying fixes if possible. If it fails the first time, re-run it to ensure lint errors are fully resolved. Make sure your code passes all checks **before** creating a Pull Request.
 - **Do not commit** directly to the `main` branch. Always create a new branch (e.g., `feature/my-new-feature`), push your changes, and open a PR from that branch.
 
-## Run and add unit tests
 
-If you add a new feature or fix a bug, please add corresponding unit tests to ensure coverage and prevent regression.
-SGLang-Jax uses Python's built-in [unittest](https://docs.python.org/3/library/unittest.html) framework.
-For detailed instructions on running tests and integrating them into CI, refer to [test/README.md](https://github.com/sgl-project/sglang-jax/tree/main/test/README.md).
+## General code style
+- Avoid code duplication. If the same code snippet (more than five lines) appears multiple times, extract it into a shared function.
+- Keep files concise. If a file exceeds 2,000 lines of code, split it into multiple smaller files.
+- Strive to make functions as pure as possible. Avoid in-place modification of arguments.
 
 
-## Write documentations
+## Q & A
 
-We recommend new contributors start from writing documentation, which helps you quickly understand SGLang-Jax codebase.
+### How to do benchmark?
 
-## Test the accuracy
-If your code changes the model output, please run the accuracy tests. A quick sanity check is the few-shot GSM8K.
+Please refer to [Benchmark and Profiling](./benchmark_and_profiling.md).
 
-```
+### How to evaluate the accuracy?
+
+We recommend to refer to public configurations like sampling parameters and accuracy results on HuggingFace.
+
+```bash
 # Launch a server
 JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache \
 python3 -m sgl_jax.launch_server \
@@ -81,30 +134,3 @@ Some details about evaluations:
 - Accuracy Deviation: This test can have significant variance (1%–5%) in accuracy due to batching and the non-deterministic nature of the inference engine. Please run multi times to get the average result.
 - Dataset Selection: GSM8K is too easy for state-of-the-art models nowadays. Please try your own more challenging accuracy tests. You can find additional accuracy eval examples in [test_eval_accuracy_large.py](https://github.com/sgl-project/sglang-jax/blob/main/test/srt/test_eval_accuracy_large.py).
 - Sampling Parameters: Please set proper sampling parameters for your model. We recommend to use configurations on Hugging Face.
-
-## Benchmark the speed
-Refer to [Benchmark and Profiling](./benchmark_and_profiling.md)
-
-
-## Request a review
-Waiting for completion.
-
-## General code style
-- Avoid code duplication. If the same code snippet (more than five lines) appears multiple times, extract it into a shared function.
-- Keep files concise. If a file exceeds 2,000 lines of code, split it into multiple smaller files.
-- Strive to make functions as pure as possible. Avoid in-place modification of arguments.
-
-
-## Tips for newcomers
-
-Waiting for completion.
-
-## Q & A
-
-### Q1: When I add a new model for SGLang-Jax, what do I need to do before merge into main?
-
-
-1. Please add accuracy and benchmark baselines for new model in PR.
-2. Please add accuracy baseline in CI and refer to `Adding baselines in CI` in [test/README.md](https://github.com/sgl-project/sglang-jax/tree/main/test/README.md).
-
-Thank you for your interest in SGLang-Jax. Happy coding!

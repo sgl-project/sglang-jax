@@ -259,7 +259,6 @@ class BailingMoEDecoderLayer(nnx.Module):
             self.moe_gate = None
         else:
             num_shared_experts = getattr(config, "num_shared_experts", 0)
-            expert_parallel_size = mesh.shape.get("data", 1) * mesh.shape.get("tensor", 1)
             router_dtype = getattr(config, "router_dtype", None)
             if router_dtype is None:
                 router_dtype = None
@@ -287,7 +286,7 @@ class BailingMoEDecoderLayer(nnx.Module):
                 num_experts_per_tok=config.num_experts_per_tok,
                 intermediate_dim=config.moe_intermediate_size,
                 mesh=mesh,
-                ep_size=expert_parallel_size,
+                ep_size=config.ep_size,
                 weight_dtype=dtype,
                 dtype=dtype,
                 layer_id=layer_id,
@@ -445,7 +444,7 @@ class BailingMoEForCausalLM(nnx.Module):
         self.mesh = mesh
         self.config = config
         self.dtype = dtype
-        self.transformer = BailingMoEModel(config, dtype=self.dtype, rngs=rngs, mesh=mesh)
+        self.model = BailingMoEModel(config, dtype=self.dtype, rngs=rngs, mesh=mesh)
         if not getattr(self.config, "tie_word_embeddings", False):
             self.lm_head = ParallelLMHead(
                 config.vocab_size,
@@ -455,7 +454,7 @@ class BailingMoEForCausalLM(nnx.Module):
                 kernel_axes=("tensor", None),
                 rngs=rngs,
             )
-        self.logits_processor = LogitsProcessor(config.vocab_size, self.mesh)
+        self.logits_processor = LogitsProcessor(config.vocab_size, mesh=self.mesh)
 
     def load_weights(self, model_config: ModelConfig, rng_key: jax.Array):
         self.rng = nnx.Rngs(rng_key)
@@ -520,7 +519,6 @@ class BailingMoEForCausalLM(nnx.Module):
                 ],
                 sharding=(None, "tensor"),
                 transpose=True,
-                head_dim_padding=True,
                 kv_head_padding=True,
             ),
             f"{prefix}.attention.dense.weight": WeightMapping(
@@ -624,13 +622,11 @@ class BailingMoEForCausalLM(nnx.Module):
         token_to_kv_pool: KVCache,
         logits_metadata: LogitsMetadata,
     ):
-        hidden_states, layers_kv_fused = self.transformer(forward_batch, token_to_kv_pool)
+        hidden_states, layers_kv_fused = self.model(forward_batch, token_to_kv_pool)
         if not getattr(self.config, "tie_word_embeddings", False):
             output = self.logits_processor(hidden_states, self.lm_head, logits_metadata)
         else:
-            output = self.logits_processor(
-                hidden_states, self.transformer.embed_tokens, logits_metadata
-            )
+            output = self.logits_processor(hidden_states, self.model.embed_tokens, logits_metadata)
         return output, layers_kv_fused, True
 
 

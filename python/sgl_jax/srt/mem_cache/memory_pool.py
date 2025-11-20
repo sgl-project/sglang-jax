@@ -23,7 +23,22 @@ def merge_kv(k: jax.Array, v: jax.Array) -> jax.Array:
 
     kv_stacked = jnp.stack([k, v], axis=2)  # [tokens, heads, 2, head_dim]
     kv_fused = kv_stacked.reshape(num_tokens, num_kv_heads * 2, head_dim)
+    from sgl_jax.srt.kernels.ragged_paged_attention.util import align_to
 
+    head_dim_aligned = align_to(head_dim, 128)
+    kv_fused = jnp.pad(
+        kv_fused,
+        (
+            (0, 0),
+            (0, 0),
+            (0, head_dim_aligned - head_dim),
+        ),
+        constant_values=0,
+    ).reshape(
+        num_tokens,
+        num_kv_heads * 2,
+        head_dim_aligned,
+    )
     return kv_fused
 
 

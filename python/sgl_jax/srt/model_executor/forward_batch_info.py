@@ -26,6 +26,7 @@ import jax
 from jax.sharding import NamedSharding, PartitionSpec
 from jax.tree_util import register_pytree_node_class
 
+from sgl_jax.srt.speculative.spec_info import SpeculativeAlgorithm
 from sgl_jax.srt.utils.jax_utils import device_array
 
 logger = logging.getLogger(__name__)
@@ -34,6 +35,7 @@ if TYPE_CHECKING:
     from sgl_jax.srt.layers.attention.base_attn_backend import AttentionBackend
     from sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch
     from sgl_jax.srt.model_executor.model_runner import ModelRunner
+    from sgl_jax.srt.speculative.eagle_util import EagleDraftInput, EagleVerifyInput
 
 
 class ForwardMode(IntEnum):
@@ -157,6 +159,13 @@ class ForwardBatch:
     extend_prefix_lens: jax.Array | None = None
     extend_seq_lens: jax.Array | None = None
 
+    trace_request_ids: list[str] | None = None
+    trace_request_objects: list | None = None
+
+    spec_info: EagleVerifyInput | EagleDraftInput | None = None
+    spec_algorithm: SpeculativeAlgorithm = None
+    capture_hidden_mode: CaptureHiddenMode = None
+
     def tree_flatten(self):
         children = (
             self.input_ids,
@@ -169,11 +178,14 @@ class ForwardBatch:
             self.cache_loc,
             self.extend_prefix_lens,
             self.extend_seq_lens,
+            self.spec_info,
         )
 
         aux_data = {
             "forward_mode": self.forward_mode,
             "batch_size": self.batch_size,
+            "spec_algorithm": self.spec_algorithm,
+            "capture_hidden_mode": self.capture_hidden_mode,
         }
         return (children, aux_data)
 
@@ -183,6 +195,10 @@ class ForwardBatch:
 
         obj.forward_mode = aux_data["forward_mode"]
         obj.batch_size = aux_data["batch_size"]
+        obj.spec_algorithm = aux_data["spec_algorithm"]
+        obj.capture_hidden_mode = aux_data["capture_hidden_mode"]
+        obj.trace_request_ids = None
+        obj.trace_request_objects = None
 
         obj.input_ids = children[0]
         obj.req_pool_indices = children[1]
@@ -194,7 +210,7 @@ class ForwardBatch:
         obj.cache_loc = children[7]
         obj.extend_prefix_lens = children[8]
         obj.extend_seq_lens = children[9]
-
+        obj.spec_info = children[10]
         return obj
 
     def __repr__(self) -> str:
@@ -267,6 +283,9 @@ class ForwardBatch:
             extend_prefix_lens=extend_prefix_lens,
             extend_seq_lens=extend_seq_lens,
             attn_backend=model_runner.attn_backend,
+            spec_info=batch.spec_info,
+            spec_algorithm=batch.spec_algorithm,
+            capture_hidden_mode=batch.capture_hidden_mode,
         )
 
         return obj
