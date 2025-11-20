@@ -51,8 +51,7 @@ def get_device_hbm_limit() -> int:
         raise ValueError(f"Unknown device kind: {device_kind}")
 
 
-def pathways_hbm_usage_gb(devices: Any) -> list[tuple[float, float]]:
-    live_arrays = jax.live_arrays()
+def pathways_hbm_usage_gb(live_arrays, devices: Any) -> list[tuple[float, float]]:
     hbm_used = defaultdict(int)
     hbm_limit = get_device_hbm_limit()
     for array in live_arrays:
@@ -116,7 +115,8 @@ def get_available_device_memory(device, distributed=False, empty_cache=True):
             stats = dev.memory_stats()
             hbm_used_mem.append(stats["bytes_in_use"])
             avail_mem.append(stats["bytes_limit"] - stats["bytes_in_use"])
-        pathways_hbm_used_mem = pathways_hbm_usage_gb(devices)
+        live_arrays = jax.live_arrays()
+        pathways_hbm_used_mem = pathways_hbm_usage_gb(live_arrays, devices)
         print(f"hbm_used_mem{hbm_used_mem}", flush=True)
         print(
             f"pathways_hbm_used_mem{[hbm_used for hbm_used, _ in pathways_hbm_used_mem]}",
