@@ -15,10 +15,6 @@ from sgl_jax.srt.layers.sampler import get_token_ids_logprobs, get_top_logprobs
 from sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch, ScheduleBatch
 from sgl_jax.srt.managers.scheduler import GenerationBatchResult
 from sgl_jax.srt.managers.tp_worker import ModelWorker
-from sgl_jax.srt.mem_cache.common import (
-    alloc_paged_token_slots_extend,
-    alloc_token_slots,
-)
 from sgl_jax.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
@@ -31,8 +27,6 @@ from sgl_jax.srt.speculative.eagle_util import (
     EagleVerifyOutput,
     build_tree_kernel_efficient,
     build_tree_mask_for_draft_decode,
-    get_last_loc_large_page_size_large_top_k,
-    get_last_loc_large_page_size_top_k_1,
 )
 from sgl_jax.srt.speculative.spec_info import SpeculativeAlgorithm
 from sgl_jax.srt.utils.common_utils import get_bool_env_var
@@ -572,6 +566,11 @@ class EAGLEWorker(ModelWorker):
         )
         padded_token_len = None
         positions_view = None
+        logits_metadata = None
+        forward_metadata_per_step = [
+            self._get_cached_draft_forward_metadata(model_worker_batch, step)
+            for step in range(max(0, self.speculative_num_steps - 1))
+        ]
         for i in range(self.speculative_num_steps):
             input_ids, hidden_states, scores, tree_info = select_top_k_tokens(
                 i, topk_p, topk_index, hidden_states, scores, self.topk
@@ -595,6 +594,9 @@ class EAGLEWorker(ModelWorker):
                 )
                 padded_token_len = model_worker_batch.input_ids.shape[0]
                 positions_view = model_worker_batch.positions[:real_tokens]
+                logits_metadata = LogitsMetadata.from_model_worker_batch(
+                    model_worker_batch, self.draft_model_runner.mesh
+                )
             else:
                 model_worker_batch.input_ids[:real_tokens] = np.asarray(input_ids)
                 model_worker_batch.spec_info.hidden_states = hidden_states
@@ -612,25 +614,21 @@ class EAGLEWorker(ModelWorker):
                     [model_worker_batch.spec_info.hidden_states, pad_values], axis=0
                 )
 
-            self.draft_model_runner.attn_backend.forward_metadata = (
-                self._get_cached_draft_forward_metadata(model_worker_batch, i)
-            )
+            self.draft_model_runner.attn_backend.forward_metadata = forward_metadata_per_step[i]
             if self.topk > 1:
                 self.draft_model_runner.attn_backend.forward_metadata.custom_mask = (
                     build_tree_mask_for_draft_decode(
                         model_worker_batch.seq_lens,
                         topk=topk_index.shape[1],
                         speculative_step_id=i,
-                        parents_list=parents_list,
+                        parents_list=tuple(parents_list),
                     )
                 )
             forward_batch = ForwardBatch.init_new(model_worker_batch, self.draft_model_runner)
             # Run forward
             logits_output, _ = self.draft_model_runner.forward(
                 forward_batch,
-                logits_metadata=LogitsMetadata.from_model_worker_batch(
-                    model_worker_batch, self.draft_model_runner.mesh
-                ),
+                logits_metadata=logits_metadata,
             )
             topk_p, topk_index = topk_probs_from_logits(
                 logits_output.next_token_logits[: model_worker_batch.real_bs * self.topk], self.topk
@@ -648,118 +646,6 @@ class EAGLEWorker(ModelWorker):
         # Clear metadata cache to avoid stale reuse across batches
         self._draft_forward_metadata_cache.clear()
         return score_list, token_list, parents_list
-
-    def _draft_preprocess_idle(self, model_worker_batch: ModelWorkerBatch):
-        pass
-
-    def _draft_preprocess_decode(self, model_worker_batch: ModelWorkerBatch):
-        # Parse args
-        num_seqs = model_worker_batch.real_bs
-        spec_info = model_worker_batch.spec_info
-
-        # todo: add penalty
-
-        if self.page_size == 1:
-            out_cache_loc, token_to_kv_pool_state_backup = alloc_token_slots(
-                model_worker_batch.tree_cache,
-                num_seqs * self.speculative_num_steps * self.topk,
-                backup_state=True,
-            )
-        else:
-            if self.topk == 1:
-                prefix_lens, seq_lens, last_loc = get_last_loc_large_page_size_top_k_1(
-                    self.req_to_token_pool.req_to_token,
-                    model_worker_batch.req_pool_indices,
-                    model_worker_batch.seq_lens,
-                    self.speculative_num_steps,
-                )
-                extend_num_tokens = num_seqs * self.speculative_num_steps
-            else:
-                # In this case, the last partial page needs to be duplicated.
-                # KV cache layout in batch.req_to_token_pool.req_to_token:
-                #
-                # | -------- | -- xxxx .. | -- xxxx .. | -- xxxx .. |
-                #    prefix     top-k = 0    tok-k = 1    top-k = 2
-                #
-                #  "-" means prefix tokens
-                #  "x" means speculative draft tokens
-                #  "." means padded tokens
-
-                # TODO: The current implementation is still a fake support
-                # for page size > 1. In the `assign_draft_cache_locs` below,
-                # we directly move the indices instead of the real kv cache.
-                # This only works when the kernel backend runs with page size = 1.
-                # If the kernel backend runs with page size > 1, we need to
-                # duplicate the real KV cache. The overhead of duplicating KV
-                # cache seems okay because the draft KV cache only has one layer.
-                # see a related copy operation in MHATokenToKVPool::move_kv_cache.
-
-                (
-                    prefix_lens,
-                    seq_lens,
-                    last_loc,
-                    num_new_pages_per_topk,
-                    extend_lens,
-                ) = get_last_loc_large_page_size_large_top_k(
-                    self.req_to_token_pool.req_to_token,
-                    model_worker_batch.req_pool_indices,
-                    model_worker_batch.seq_lens,
-                    self.speculative_num_steps,
-                    self.topk,
-                    self.page_size,
-                )
-
-                # TODO: remove this device sync
-                extend_num_tokens = int(jnp.sum(extend_lens))
-
-                # Store in instance variables for later use
-                self.num_new_pages_per_topk = num_new_pages_per_topk
-                self.extend_lens = extend_lens
-
-            out_cache_loc, token_to_kv_pool_state_backup = alloc_paged_token_slots_extend(
-                model_worker_batch.tree_cache,
-                prefix_lens,
-                seq_lens,
-                last_loc,
-                extend_num_tokens,
-                backup_state=True,
-            )
-
-        # [       topk 0         ] [       topk 1         ]
-        # [iter=0, iter=1, iter=2] [iter=0, iter=1, iter=2]
-
-        # Update req_to_token_pool with cache locations (no reshape needed)
-        # Layout: [seq0_topk0_steps, seq0_topk1_steps, seq1_topk0_steps, ...]
-        for i in range(num_seqs):
-            req_idx = model_worker_batch.req_pool_indices[i].item()
-            start_pos = model_worker_batch.seq_lens[i].item()
-
-            # For each topk branch
-            for k in range(self.topk):
-                # For each speculative step
-                for step in range(self.speculative_num_steps):
-                    # Calculate flat index: i * (topk * steps) + k * steps + step
-                    flat_idx = (
-                        i * (self.topk * self.speculative_num_steps)
-                        + k * self.speculative_num_steps
-                        + step
-                    )
-                    token_pos = start_pos + step
-                    cache_loc = out_cache_loc[flat_idx].item()
-
-                    # Update req_to_token mapping
-                    if token_pos < self.req_to_token_pool.req_to_token.shape[1]:
-                        self.req_to_token_pool.write((req_idx, token_pos), cache_loc)
-
-        if self.page_size > 1 and self.topk > 1:
-            # Remove padded slots
-            out_cache_loc = out_cache_loc[: num_seqs * self.topk * self.speculative_num_steps]
-
-        model_worker_batch.out_cache_loc = out_cache_loc
-        model_worker_batch.seq_lens_sum = int(np.sum(model_worker_batch.seq_lens))
-        model_worker_batch.return_hidden_states = False
-        spec_info.positions = np.repeat(model_worker_batch.seq_lens, self.topk)
-        self.token_to_kv_pool_allocator.restore_state(token_to_kv_pool_state_backup)
 
     def run_spec_decode_precompile(self):
         self.precompile_spec_extend()
