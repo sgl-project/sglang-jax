@@ -566,7 +566,7 @@ class EagleDraftInput:
         ):
             pad_len = model_worker_batch.input_ids.shape[0] - hidden_states.shape[0]
             pad_shape = (pad_len,) + hidden_states.shape[1:]
-            pad_values = np.zeros(pad_shape, dtype=hidden_states.dtype)
+            pad_values = jnp.zeros(pad_shape, dtype=hidden_states.dtype)
             model_worker_batch.spec_info.hidden_states = jnp.concatenate(
                 [model_worker_batch.spec_info.hidden_states, pad_values], axis=0
             )
@@ -969,7 +969,7 @@ class EagleVerifyInput:
             )
 
         accept_length = accept_length + 1
-        accept_index = np.concatenate(accept_index, axis=-1)
+        accept_index = accept_index.reshape(-1)
         accept_index = accept_index[accept_index != -1]
         verified_id = predict[accept_index]
         return predict, verified_id, accept_length, accept_index

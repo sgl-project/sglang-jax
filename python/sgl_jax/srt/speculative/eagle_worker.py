@@ -558,8 +558,8 @@ class EAGLEWorker(ModelWorker):
             ):
                 pad_len = model_worker_batch.input_ids.shape[0] - hidden_states.shape[0]
                 pad_shape = (pad_len,) + hidden_states.shape[1:]
-                pad_values = np.zeros(pad_shape, dtype=hidden_states.dtype)
-                model_worker_batch.spec_info.hidden_states = np.concatenate(
+                pad_values = jnp.zeros(pad_shape, dtype=hidden_states.dtype)
+                model_worker_batch.spec_info.hidden_states = jnp.concatenate(
                     [model_worker_batch.spec_info.hidden_states, pad_values], axis=0
                 )
             self.draft_model_runner.attn_backend.forward_metadata = (
