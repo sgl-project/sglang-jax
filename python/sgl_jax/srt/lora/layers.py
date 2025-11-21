@@ -40,8 +40,8 @@ class BaseLayerWithLoRA(nnx.Module):
         if hasattr(self.base_layer, "weight"):
             self.weight = self.base_layer.weight
 
-    def forward(self, x: jax.Array):
-        return self.base_layer.forward(x)
+    def __call__(self, x: jax.Array):
+        return self.base_layer(x)
 
     def set_lora_info(self, *args):
         pass
