@@ -17,20 +17,18 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING
 
 import jax.numpy as jnp
 from jax.sharding import Mesh
 
+from python.sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
 from sgl_jax.srt.layers.linear import LinearBase
+from sgl_jax.srt.lora.layers import BaseLayerWithLoRA
 from sgl_jax.srt.lora.lora import ChunkedSgmvLoRABackend, LoRAAdapter
 from sgl_jax.srt.lora.lora_config import LoRAConfig
 from sgl_jax.srt.lora.lora_memory_pool import LoRAMemoryPool
 from sgl_jax.srt.lora.lora_registry import LoRARef
 from sgl_jax.srt.lora.utils import LoRAType, get_target_module_name
-
-if TYPE_CHECKING:
-    from sgl_jax.srt.managers.schedule_batch import ScheduleBatch
 
 logger = logging.getLogger(__name__)
 
@@ -357,7 +355,7 @@ class LoRAManager:
         """Check if memory pool can support the given LoRA config."""
         return self.memory_pool.can_support(config)
 
-    def prepare_lora_batch(self, schedule_batch: ScheduleBatch):
+    def prepare_lora_batch(self, forward_batch: ForwardBatch):
         """
         Prepare LoRA batch for inference.
 
@@ -365,30 +363,15 @@ class LoRAManager:
         All adapters are pre-loaded at initialization, no dynamic loading.
 
         Args:
-            schedule_batch: ScheduleBatch containing requests with lora_ids
+            forward_batch: ForwardBatch containing requests with lora_ids
 
         Raises:
             ValueError: If batch exceeds max_loras_per_batch or adapter not loaded
         """
-        # Collect unique lora_ids from batch
-        cur_uids = set()
-        for req in schedule_batch.reqs:
-            if hasattr(req, "lora_id") and req.lora_id is not None:
-                cur_uids.add(req.lora_id)
-            else:
-                # Base model (no LoRA)
-                cur_uids.add(None)
+        # Load active loras into lora memory pool
+        cur_uids = set(forward_batch.lora_ids)
 
-        # Validate batch size
-        if len(cur_uids) > self.max_loras_per_batch:
-            raise ValueError(
-                f"Batch has {len(cur_uids)} unique LoRA adapters, exceeds max {self.max_loras_per_batch}"
-            )
-
-        # Validate all adapters are loaded
-        for uid in cur_uids:
-            if uid is not None and uid not in self.loras:
-                raise ValueError(f"LoRA adapter {uid} not loaded")
+        assert len(cur_uids) <= self.max_loras_per_batch
 
         # Load adapters into device memory pool (CPU -> device transfer)
         self.memory_pool.prepare_lora_batch(
@@ -396,9 +379,24 @@ class LoRAManager:
             lora_adapters=self.loras,
         )
 
-        # Control LoRA layer enable/disable and set scaling
-        if hasattr(self, "lora_modules") and self.lora_modules:
-            self._update_lora_layers(cur_uids)
+        weight_indices = [0] * len(forward_batch.lora_ids)
+        lora_ranks = [0] * self.max_loras_per_batch
+        scalings = [0] * self.max_loras_per_batch
+        for i, uid in enumerate(forward_batch.lora_ids):
+            weight_indices[i] = self.memory_pool.get_buffer_id(uid)
+            if uid is not None:
+                lora = self.loras[uid]
+                lora_ranks[weight_indices[i]] = lora.config.r
+                scalings[weight_indices[i]] = lora.scaling
+
+        self.lora_backend.prepare_lora_batch(
+            forward_batch=forward_batch,
+            weight_indices=weight_indices,
+            lora_ranks=lora_ranks,
+            scalings=scalings,
+        )
+
+        self.verify_sharding_preserved()
 
         logger.debug("Prepared LoRA batch: %d unique adapters", len(cur_uids))
 
@@ -426,8 +424,6 @@ class LoRAManager:
         """
         from flax import nnx
 
-        from sgl_jax.srt.lora.layers import LoRALinear
-
         if self.base_model is None:
             logger.warning("No base_model provided, skipping LoRA surgery")
             return
@@ -438,7 +434,9 @@ class LoRAManager:
         original_state = nnx.state(self.base_model)
 
         # Step 2: Track replaced modules
-        self.lora_modules: list[tuple[str, LoRALinear]] = []
+        self.lora_modules: list[dict[str, BaseLayerWithLoRA]] = [
+            {} for _ in range(self.base_hf_config.num_hidden_layers)
+        ]
 
         # Step 3: Replace Linear layers with LoRALinear
         # We need to iterate through the model and find target modules
@@ -466,6 +464,7 @@ class LoRAManager:
                                 attn,
                                 module_name,
                                 f"layers.{layer_idx}.self_attn.{module_name}",
+                                layer_idx,
                             )
 
                 # Check for MLP layers
@@ -477,6 +476,7 @@ class LoRAManager:
                                 mlp,
                                 module_name,
                                 f"layers.{layer_idx}.mlp.{module_name}",
+                                layer_idx,
                             )
 
         except Exception as e:
@@ -500,6 +500,7 @@ class LoRAManager:
         parent_module,
         attr_name: str,
         full_path: str,
+        layer_idx: int,
     ):
         """
         Replace a Linear layer with LoRALinear wrapper.
@@ -508,6 +509,7 @@ class LoRAManager:
             parent_module: Parent module containing the layer
             attr_name: Attribute name of the layer (e.g., "q_proj")
             full_path: Full path for logging (e.g., "layers.0.self_attn.q_proj")
+            layer_idx: layer index
         """
 
         from sgl_jax.srt.lora.layers import LoRALinear
@@ -539,7 +541,7 @@ class LoRAManager:
         setattr(parent_module, attr_name, lora_layer)
 
         # Track the replacement
-        self.lora_modules.append((full_path, lora_layer))
+        self.lora_modules[layer_idx][attr_name] = lora_layer
 
         logger.debug("Replaced %s with LoRALinear", full_path)
 
@@ -584,77 +586,30 @@ class LoRAManager:
 
         logger.info("Verifying sharding preservation...")
 
-        for module_path, lora_layer in self.lora_modules:
-            try:
-                # Check if base layer kernel has sharding
-                if hasattr(lora_layer.base_layer, "kernel"):
-                    kernel = lora_layer.base_layer.kernel
-                    if hasattr(kernel, "value"):
-                        kernel_value = kernel.value
-                        if hasattr(kernel_value, "sharding"):
-                            sharding = kernel_value.sharding
-                            logger.info(
-                                "%s base_layer.kernel sharding: %s",
-                                module_path,
-                                sharding,
-                            )
-                        else:
-                            logger.warning(
-                                "%s base_layer.kernel has no sharding attribute",
-                                module_path,
-                            )
-
-                # Check LoRA parameters sharding
-                if hasattr(lora_layer.lora_A, "value"):
-                    lora_a_value = lora_layer.lora_A.value
-                    if hasattr(lora_a_value, "sharding"):
-                        logger.info(
-                            "%s lora_A sharding: %s",
-                            module_path,
-                            lora_a_value.sharding,
-                        )
-
-            except Exception as e:
-                logger.warning(
-                    "Error checking sharding for %s: %s",
-                    module_path,
-                    e,
-                )
-
-    def _update_lora_layers(self, cur_uids: set[str | None]):
-        """
-        Update LoRA layers based on current batch.
-
-        Enables/disables LoRA computation and sets scaling factors based on
-        whether the batch contains LoRA requests.
-
-        Args:
-            cur_uids: Set of lora_ids in the current batch
-        """
-        # Determine if batch has any LoRA requests
-        has_lora = any(uid is not None for uid in cur_uids)
-
-        # TODO: Currently simplified - enables all layers if any request has LoRA
-        # Phase 4 should implement per-request LoRA handling with batched computation
-
-        for module_path, lora_layer in self.lora_modules:
-            # Enable/disable LoRA
-            lora_layer.enabled.value = has_lora
-
-            if has_lora:
-                # Set scaling based on active adapter
-                # Simplified: use first non-None adapter's scaling
-                active_uid = next((uid for uid in cur_uids if uid is not None), None)
-                if active_uid and active_uid in self.loras:
-                    adapter = self.loras[active_uid]
-                    lora_layer.scaling.value = adapter.scaling
-                    logger.debug(
-                        "Enabled LoRA for %s with scaling=%.4f",
-                        module_path,
-                        adapter.scaling,
+        for layer_idx, layer_modules in enumerate(self.lora_modules):
+            for module_name, module in layer_modules:
+                try:
+                    # Check if base layer kernel has sharding
+                    if hasattr(module.base_layer, "kernel"):
+                        kernel = module.base_layer.kernel
+                        if hasattr(kernel, "value"):
+                            kernel_value = kernel.value
+                            if hasattr(kernel_value, "sharding"):
+                                sharding = kernel_value.sharding
+                                logger.info(
+                                    "%s base_layer.kernel sharding: %s",
+                                    f"layer{layer_idx}.{module_name}",
+                                    sharding,
+                                )
+                            else:
+                                logger.warning(
+                                    "%s base_layer.kernel has no sharding attribute",
+                                    f"layer{layer_idx}.{module_name}",
+                                )
+                # TODO: add the check of sharding for lora_a and lora_b
+                except Exception as e:
+                    logger.warning(
+                        "Error checking sharding for %s: %s",
+                        f"layer{layer_idx}.{module_name}",
+                        e,
                     )
-                else:
-                    # Fallback scaling
-                    lora_layer.scaling.value = 1.0
-            else:
-                logger.debug("Disabled LoRA for %s", module_path)
