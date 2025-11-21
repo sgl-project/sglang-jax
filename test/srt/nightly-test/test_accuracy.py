@@ -20,6 +20,8 @@ from sgl_jax.test.test_utils import (
     bailing_moe,
     DEEPSEEK_R1_DISTILL_QWEN_1_5B,
     QWEN2_5_7B_INSTRUCT,
+    CustomTestCase,
+    popen_launch_server,
 )
 
 
@@ -281,11 +283,11 @@ class TestModelAccuracy(CustomTestCase):
             max_tokens=1024,
         )
         metrics = run_eval(args)
-
         self.assertGreater(metrics["score"], 0.35)
 
         ## kill process
         kill_process_tree(process.pid)
+
     
     def test_qwen3_8b_tp_4(self):
         model = QWEN3_8B
