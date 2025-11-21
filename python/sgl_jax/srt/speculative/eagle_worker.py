@@ -53,16 +53,20 @@ def _verify_postprocess_fixed(
     return gathered_logits, gathered_hidden, gathered_pos, mask
 
 
-@functools.partial(jax.jit, static_argnames=("topk",))
+@functools.partial(jax.jit, static_argnames=("topk", "max_bs"))
 def _draft_extend_postprocess_fixed(
     logits_next_token: jax.Array,
     hidden_states: jax.Array,
     accept_lens: jax.Array,
-    real_bs: int,
+    real_bs: jax.Array,
+    max_bs: int,
     topk: int,
 ):
     """Fixed-shape helper for draft_extend_after_decode."""
-    select_index = jnp.arange(real_bs, dtype=jnp.int32) * topk + accept_lens[:real_bs] - 1
+    bs_indices = jnp.arange(max_bs, dtype=jnp.int32)
+    mask = bs_indices < real_bs
+    select_index = bs_indices * topk + accept_lens[:max_bs] - 1
+    select_index = jnp.where(mask, select_index, 0)
     logits_next_token = jnp.take(logits_next_token, select_index, axis=0)
     hidden_states = jnp.take(hidden_states, select_index, axis=0)
     topk_p, topk_index = topk_probs_from_logits(logits_next_token, topk)
@@ -564,7 +568,8 @@ class EAGLEWorker(ModelWorker):
             draft_logits_output.next_token_logits,
             draft_logits_output.hidden_states,
             batch_output.accept_lens,
-            model_worker_batch.real_bs,
+            jnp.asarray(model_worker_batch.real_bs, dtype=jnp.int32),
+            draft_logits_output.next_token_logits.shape[0],
             self.topk,
         )
 
