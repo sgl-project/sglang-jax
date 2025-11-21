@@ -5,8 +5,8 @@ WORKDIR /app
 # Copy the project files
 COPY . .
 
-# Install using pip (matching install.md Method 2)
-RUN pip install -e "python[all]"
+# Install the sglang-jax package with TPU support
+RUN cd python && pip install -e .[tpu]
 
 # Set environment variable for JAX compilation cache
 ENV JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache
