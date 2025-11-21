@@ -102,10 +102,17 @@ class LoRALinear(BaseLayerWithLoRA):
             Output tensor with LoRA delta added (if enabled) and bias from base_model
         """
         # Base layer computation (preserves original behavior)
-        output_bias = self.base_layer.bias if not self.base_layer.skip_bias_add else None
+        output_bias = jax.lax.cond(
+            not self.base_layer.skip_bias_add,
+            lambda operands: operands[0],
+            lambda operands: None,
+            (self.base_layer.bias),
+        )
         base_output = self.base_layer(x)
 
-        output = self.apply_lora(base_output, x) if self.set_lora else base_output
+        output = jax.lax.cond(
+            self.set_lora, self.apply_lora, lambda operands: operands[0], (base_output, x)
+        )
 
         return output, output_bias
 
