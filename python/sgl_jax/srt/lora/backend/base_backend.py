@@ -1,6 +1,5 @@
 import jax
 
-from sgl_jax.srt.lora.utils import LoRABatchInfo
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
 
 
@@ -94,7 +93,6 @@ class BaseLoRABackend:
         weight_indices: list[int],
         lora_ranks: list[int],
         scalings: list[float],
-        batch_info: LoRABatchInfo | None = None,
     ):
         """Prepare the lora weights and batch info for current forward batch.
 
