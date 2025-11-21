@@ -17,7 +17,7 @@ pip install --upgrade pip setuptools packaging
 pip install -e "python[gpu]"
 
 # Run Qwen-7B Model
-JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache python3 -u -m sgl_jax.launch_server --model-path Qwen/Qwen-7B-Chat --trust-remote-code  --dist-init-addr=0.0.0.0:10011 --nnodes=1  --tp-size=1 --xla-backend=native --attention-backend=native --device=cuda --random-seed=3 --node-rank=0 --mem-fraction-static=0.8 --max-prefill-tokens=64 --max-running-requests=1 --download-dir=/tmp --dtype=bfloat16  --skip-server-warmup --host 0.0.0.0 --port 30000
+JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache python3 -u -m sgl_jax.launch_server --model-path Qwen/Qwen-7B-Chat --trust-remote-code  --dist-init-addr=0.0.0.0:10011 --nnodes=1  --tp-size=1  --attention-backend=native --device=cuda --random-seed=3 --node-rank=0 --mem-fraction-static=0.8 --max-prefill-tokens=64 --max-running-requests=1 --download-dir=/tmp --dtype=bfloat16  --skip-server-warmup --host 0.0.0.0 --port 30000
 ```
 
 ## Bencmark
