@@ -4,17 +4,18 @@
 
 ### Introduction
 
-Environment: TPU v6e-4.
-Version: main-51e4987a7942ac936bc0e58d77b78174b71eefa5
+Environment: TPU v6e-1.
+Version: main-5fc4fa54a12ea0cbf05c4e304f0f69595e556aa7
 
 ### Instructions
 
 ```bash
+# sky-31d4-pseudonym
 # launch server, precision = bfloat16
 JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache python3 -u -m sgl_jax.launch_server \
 --model-path deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B \
 --trust-remote-code  \
---tp-size=4 \
+--tp-size=1 \
 --device=tpu \
 --mem-fraction-static=0.8 \
 --chunked-prefill-size=2048 \
@@ -26,11 +27,12 @@ JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache python3 -u -m sgl_jax.launch_server \
 --disable-radix-cache \
 --use-sort-for-toppk-minp
 
+# sky-495d-pseudonym
 # launch server, precision = float32
 JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache python3 -u -m sgl_jax.launch_server \
 --model-path deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B \
 --trust-remote-code  \
---tp-size=4 \
+--tp-size=1 \
 --device=tpu \
 --mem-fraction-static=0.8 \
 --chunked-prefill-size=2048 \
@@ -246,4 +248,5 @@ stream: false
 template_type: null
 timeout: 120000.0
 use_cache: null
+work_dir: ./outputs/20251121_043226
 ```
