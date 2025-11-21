@@ -5,7 +5,16 @@
 ### Introduction
 
 Environment: TPU v6e-1.
-Version: main-5fc4fa54a12ea0cbf05c4e304f0f69595e556aa7
+
+Version:
+```bash
+flax                0.12.1
+jax                 0.8.1
+jaxlib              0.8.1
+libtpu              0.0.30
+sglang-jax          main-5fc4fa54a12ea0cbf05c4e304f0f69595e556aa7
+```
+
 
 ### Instructions
 
