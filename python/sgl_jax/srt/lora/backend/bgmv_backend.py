@@ -165,7 +165,6 @@ class BgmvLoRABackend(BaseLoRABackend):
         weight_indices: list[int],
         lora_ranks: list[int],
         scalings: list[float],
-        batch_info: LoRABatchInfo | None = None,
     ):
         lora_ranks_bs = []
         scalings_bs = []
