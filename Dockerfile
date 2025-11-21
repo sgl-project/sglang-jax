@@ -23,11 +23,8 @@ RUN mkdir -p /tmp/jit_cache /tmp/models
 # IMPORTANT: To run on TPU VM, you MUST use:
 #   docker run --privileged --network=host sglang-jax --model-path <MODEL> --trust-remote-code
 #
-# TPU access requires:
-#   - --privileged: For necessary system permissions
-#   - --network=host: TPU is accessed via network (gRPC), not device files
-#   - No device mounting needed: TPU is network-based, not /dev-based
-#
-# Note: TPU devices cannot be mounted in Dockerfile (they're network-accessed),
-#       so runtime flags are required for TPU access.
-ENTRYPOINT ["python", "-u", "-m", "sgl_jax.launch_server", "--host", "0.0.0.0", "--port", "30000", "--device=tpu", "--dist-init-addr=0.0.0.0:10011", "--nnodes=1", "--tp-size=4", "--node-rank=0", "--mem-fraction-static=0.8", "--max-prefill-tokens=8192", "--download-dir=/tmp", "--dtype=bfloat16", "--skip-server-warmup", "--enable-single-process", "--grammar-backend=none"]
+# Required Docker flags:
+#   - --privileged: Grants access to all devices including VFIO (/dev/vfio/0,1,2,3)
+#                   and necessary system permissions for TPU operations
+#   - --network=host: Enables gRPC network communication between JAX and TPU Runtime
+ENTRYPOINT ["python", "-u", "-m", "sgl_jax.launch_server", "--host", "0.0.0.0", "--port", "30000", "--dist-init-addr=0.0.0.0:10011", "--nnodes=1", "--tp-size=4", "--node-rank=0", "--mem-fraction-static=0.8", "--max-prefill-tokens=8192", "--download-dir=/tmp", "--dtype=bfloat16", "--skip-server-warmup", "--enable-single-process", "--grammar-backend=none"]
