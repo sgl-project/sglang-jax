@@ -22,10 +22,12 @@ from typing import TYPE_CHECKING
 import jax.numpy as jnp
 from jax.sharding import Mesh
 
+from sgl_jax.srt.layers.linear import LinearBase
 from sgl_jax.srt.lora.lora import ChunkedSgmvLoRABackend, LoRAAdapter
 from sgl_jax.srt.lora.lora_config import LoRAConfig
 from sgl_jax.srt.lora.lora_memory_pool import LoRAMemoryPool
 from sgl_jax.srt.lora.lora_registry import LoRARef
+from sgl_jax.srt.lora.utils import LoRAType, get_target_module_name
 
 if TYPE_CHECKING:
     from sgl_jax.srt.managers.schedule_batch import ScheduleBatch
@@ -154,6 +156,8 @@ class LoRAManager:
         # Initialize memory pool
         self.init_memory_pool()
 
+        self.update_lora_info()
+
         logger.info(
             "LoRA manager initialized: max_rank=%d, target_modules=%s, max_loras=%d",
             self.max_lora_rank,
@@ -247,6 +251,26 @@ class LoRAManager:
             tp_size=self.tp_size,
         )
         self.memory_pool.init_buffers()
+
+    def update_lora_info(self):
+        """
+        Update all LoRA modules to associate them with the latest memory buffer.
+        """
+        for layer_id, layer_modules in enumerate(self.lora_modules):
+            for module_name, module in layer_modules.items():
+                target_module = get_target_module_name(module_name, self.memory_pool.target_modules)
+                module.set_lora_info(
+                    self.memory_pool.get_tensor(
+                        target_module=target_module,
+                        layer_id=layer_id,
+                        lora_type=LoRAType.LORA_A,
+                    ),
+                    self.memory_pool.get_tensor(
+                        target_module=target_module,
+                        layer_id=layer_id,
+                        lora_type=LoRAType.LORA_B,
+                    ),
+                )
 
     def load_lora_adapter(self, lora_ref: LoRARef):
         """
@@ -485,7 +509,6 @@ class LoRAManager:
             attr_name: Attribute name of the layer (e.g., "q_proj")
             full_path: Full path for logging (e.g., "layers.0.self_attn.q_proj")
         """
-        from flax import nnx
 
         from sgl_jax.srt.lora.layers import LoRALinear
 
@@ -494,7 +517,7 @@ class LoRAManager:
             return
 
         # Check if it's a Linear layer
-        if not isinstance(original_layer, nnx.Linear):
+        if not isinstance(original_layer, LinearBase):
             return
 
         # Get or create backend
@@ -508,12 +531,8 @@ class LoRAManager:
 
         # Create LoRALinear wrapper with backend
         lora_layer = LoRALinear(
-            in_features=original_layer.in_features,
-            out_features=original_layer.out_features,
-            lora_rank=self.max_lora_rank,
             base_layer=original_layer,
-            backend=self.lora_backend,
-            rngs=nnx.Rngs(42),  # Fixed seed for reproducibility
+            lora_backend=self.lora_backend,
         )
 
         # Replace the layer

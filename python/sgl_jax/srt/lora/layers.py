@@ -21,73 +21,77 @@ from typing import TYPE_CHECKING
 import jax
 from flax import nnx
 
+from python.sgl_jax.srt.layers.linear import LinearBase
+
 if TYPE_CHECKING:
     from sgl_jax.srt.lora.backend.base_backend import BaseLoRABackend
 
 
-class LoRALinear(nnx.Module):
+class BaseLayerWithLoRA(nnx.Module):
+    def __init__(
+        self,
+        base_layer: nnx.Module,
+        lora_backend: BaseLoRABackend,
+    ):
+        super().__init__()
+        self.base_layer: nnx.Module = base_layer
+        self.set_lora: bool = False
+        self.lora_backend: BaseLoRABackend = lora_backend
+        if hasattr(self.base_layer, "weight"):
+            self.weight = self.base_layer.weight
+
+    def forward(self, x: jax.Array):
+        return self.base_layer.forward(x)
+
+    def set_lora_info(self, *args):
+        pass
+
+
+class LoRALinear(BaseLayerWithLoRA):
     """
     LoRA wrapper for Linear layers using Flax NNX.
-
     This wraps an existing Linear layer and adds LoRA (Low-Rank Adaptation)
     computation. Uses Model Surgery to preserve the original weights and sharding.
 
-    V1 implementation uses backend to perform LoRA computation:
-        output = base_layer(x)
-        if enabled:
-            lora_output = backend.run_lora_a_gemm(x, lora_A_weights)
-            output = backend.run_lora_b_gemm(lora_output, lora_B_weights, output)
-
     Attributes:
         base_layer: Original Linear layer (preserves weights and sharding)
-        lora_rank: LoRA rank dimension
         backend: LoRA backend for efficient computation
-        enabled: Whether LoRA computation is active
     """
 
     def __init__(
         self,
-        in_features: int,
-        out_features: int,
-        lora_rank: int,
-        base_layer: nnx.Linear | None = None,
-        backend: BaseLoRABackend | None = None,
-        rngs: nnx.Rngs | None = None,
+        base_layer: LinearBase | None = None,
+        lora_backend: BaseLoRABackend | None = None,
     ):
         """
         Initialize LoRA Linear layer.
 
         Args:
-            in_features: Input dimension
-            out_features: Output dimension
-            lora_rank: Rank of LoRA matrices
-            base_layer: Existing Linear layer to wrap (optional)
-            backend: LoRA backend for computation (optional)
-            rngs: Random number generators for initialization
+            base_layer: Existing Linear layer to wrap
+            backend: LoRA backend for computation
         """
-        self.in_features = in_features
-        self.out_features = out_features
-        self.lora_rank = lora_rank
-        self.backend = backend
+        super().__init__(base_layer, lora_backend)
+        self.lora_backend = lora_backend
 
-        # Base layer - will be populated via nnx.update() during surgery
-        if base_layer is not None:
-            self.base_layer = base_layer
-        else:
-            # Create placeholder base layer
-            if rngs is None:
-                rngs = nnx.Rngs(0)
-            self.base_layer = nnx.Linear(
-                in_features,
-                out_features,
-                use_bias=True,
-                rngs=rngs,
-            )
+    def set_lora_info(
+        self,
+        A_buffer: jax.Array,
+        B_buffer: jax.Array,
+    ):
+        self.set_lora = True
+        self.A_buffer = A_buffer
+        self.B_buffer = B_buffer
 
-        # Control variable (not trainable)
-        self.enabled = nnx.Variable(False)  # Whether LoRA is active
+    def apply_lora(self, base_output: jax.Array, x: jax.Array) -> jax.Array:
+        lora_a_output = self.lora_backend.run_lora_a_gemm(x, self.A_buffer)
+        lora_output = self.lora_backend.run_lora_b_gemm(
+            x=lora_a_output,
+            weights=self.B_buffer,
+            base_output=base_output,
+        )
+        return lora_output
 
-    def __call__(self, x: jax.Array) -> jax.Array:
+    def __call__(self, x: jax.Array) -> tuple[jax.Array, jax.Array | None]:
         """
         Forward pass with optional LoRA computation using backend.
 
@@ -95,29 +99,18 @@ class LoRALinear(nnx.Module):
             x: Input tensor (shape: [seq_len, in_features])
 
         Returns:
-            Output tensor with LoRA delta added (if enabled)
+            Output tensor with LoRA delta added (if enabled) and bias from base_model
         """
         # Base layer computation (preserves original behavior)
-        output = self.base_layer(x)
+        output_bias = self.base_layer.bias if not self.base_layer.skip_bias_add else None
+        base_output = self.base_layer(x)
 
-        # Add LoRA delta if enabled and backend is available
-        if self.enabled.value and self.backend is not None:
-            # Get LoRA weights from memory pool via backend
-            # Backend handles batched LoRA computation for multiple adapters
+        output = self.apply_lora(base_output, x) if self.set_lora else base_output
 
-            # Step 1: Shrink - project to low-rank space
-            # lora_A_weights fetched from memory pool based on batch_info
-            lora_a_output = self.backend.run_lora_a_gemm(
-                x, None
-            )  # Backend manages weights internally
-
-            # Step 2: Expand - project back to output space and add to base output
-            output = self.backend.run_lora_b_gemm(lora_a_output, None, output)
-
-        return output
+        return output, output_bias
 
 
-class LoRAEmbedding(nnx.Module):
+class LoRAEmbedding(BaseLayerWithLoRA):
     """
     LoRA wrapper for Embedding layers.
 
@@ -127,61 +120,15 @@ class LoRAEmbedding(nnx.Module):
 
     def __init__(
         self,
-        num_embeddings: int,
-        features: int,
-        lora_rank: int,
-        base_layer: nnx.Embed | None = None,
-        backend: BaseLoRABackend | None = None,
-        rngs: nnx.Rngs | None = None,
+        base_layer: LinearBase | None = None,
+        lora_backend: BaseLoRABackend | None = None,
     ):
         """
         Initialize LoRA Embedding layer.
 
         Args:
-            num_embeddings: Size of vocabulary
-            features: Embedding dimension
-            lora_rank: Rank of LoRA matrices
-            base_layer: Existing Embed layer to wrap (optional)
-            backend: LoRA backend for computation (optional)
-            rngs: Random number generators
+            base_layer: Existing Embed layer to wrap
+            backend: LoRA backend for computation
         """
-        self.num_embeddings = num_embeddings
-        self.features = features
-        self.lora_rank = lora_rank
-        self.backend = backend
-
-        # Base layer
-        if base_layer is not None:
-            self.base_layer = base_layer
-        else:
-            if rngs is None:
-                rngs = nnx.Rngs(0)
-            self.base_layer = nnx.Embed(
-                num_embeddings,
-                features,
-                rngs=rngs,
-            )
-
-        # Control variable
-        self.enabled = nnx.Variable(False)
-
-    def __call__(self, x: jax.Array) -> jax.Array:
-        """
-        Forward pass for embedding with LoRA using backend.
-
-        Args:
-            x: Input token indices
-
-        Returns:
-            Embedded output with LoRA delta (if enabled)
-        """
-        output = self.base_layer(x)
-
-        # V1: Embedding LoRA computation via backend
-        # TODO: Implement embedding-specific backend methods if needed
-        # For now, embeddings use simple pass-through
-        if self.enabled.value and self.backend is not None:
-            # Backend handles embedding LoRA computation
-            pass
-
-        return output
+        super().__init__(base_layer, lora_backend)
+        self.weight = base_layer.weight
