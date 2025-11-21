@@ -158,11 +158,14 @@ suites = {
     "nightly-test-accuracy-text-models-tpu-v6e-1": [
         TestFile(
             "nightly-test/test_accuracy.py",
+
              test_methods=[#"TestModelAccuracy.test_qwen_7b",
                           #"TestModelAccuracy.test_qwen3_8b",
                           #"TestModelAccuracy.test_DEEPSEEK_R1_DISTILL_QWEN_1_5B",  
                           "TestModelAccuracy.test_GEMMA2_2B_IT", 
                           ],
+            test_methods=["TestModelAccuracy.test_qwen_7b", "TestModelAccuracy.test_qwen3_8b"],
+
         )
     ],
     "nightly-test-accuracy-text-models-tpu-v6e-4": [
@@ -175,6 +178,10 @@ suites = {
                 # "TestModelAccuracy.test_QWEN3_CODER_30B_A3B_INSTRUCT_tp_2_ep_2",  
                 "TestModelAccuracy.test_GEMMA2_2B_IT_tp_4", 
                 ],
+            test_methods=[
+                "TestModelAccuracy.test_qwen_7b_tp_4",
+                "TestModelAccuracy.test_qwen3_8b_tp_4",
+            ],
         )
     ],
     "nightly-test-perf-text-models-tpu-v6e-1": [
