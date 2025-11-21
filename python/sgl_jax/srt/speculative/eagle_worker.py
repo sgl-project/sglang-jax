@@ -353,6 +353,16 @@ class EAGLEWorker(ModelWorker):
         )
         # Run forward steps
         score_list, token_list, parents_list = self.draft_forward(model_worker_batch)
+
+        # padding seq_lens_sum
+        padded_seq_lens_sum = 0
+        seq_lens_sum = np.sum(model_worker_batch.seq_lens)
+        padding_size_buckets = [1024, 4096, 16384]
+        for bucket in padding_size_buckets:
+            if bucket >= seq_lens_sum:
+                padded_seq_lens_sum = bucket
+                break
+        assert padded_seq_lens_sum >= seq_lens_sum, "No padding size for seq_lens_sum available"
         (
             tree_mask,
             position,
@@ -366,7 +376,8 @@ class EAGLEWorker(ModelWorker):
             token_list,
             parents_list,
             model_worker_batch.seq_lens[: model_worker_batch.real_bs],
-            np.sum(model_worker_batch.seq_lens),
+            seq_lens_sum,
+            padded_seq_lens_sum,
             self.topk,
             self.speculative_num_draft_tokens,
             int(self.req_to_token_pool.req_to_token.shape[1]),
