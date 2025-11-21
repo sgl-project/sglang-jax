@@ -18,6 +18,7 @@ from transformers import (
 )
 from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING_NAMES
 
+from sgl_jax.srt.managers.tiktoken_tokenizer import TiktokenTokenizer
 from sgl_jax.srt.utils.common_utils import is_remote_url, lru_cache_frozenset
 
 _CONFIG_REGISTRY: dict[str, type[PretrainedConfig]] = {}
@@ -166,11 +167,9 @@ def get_tokenizer(
     trust_remote_code: bool = False,
     tokenizer_revision: str | None = None,
     **kwargs,
-) -> PreTrainedTokenizer | PreTrainedTokenizerFast:
+) -> PreTrainedTokenizer | PreTrainedTokenizerFast | TiktokenTokenizer:
     """Gets a tokenizer for the given model name via Huggingface."""
     if tokenizer_name.endswith(".json"):
-        from sgl_jax.srt.managers.tiktoken_tokenizer import TiktokenTokenizer
-
         return TiktokenTokenizer(tokenizer_name)
 
     if tokenizer_mode == "slow":
