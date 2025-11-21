@@ -55,6 +55,11 @@ class ModelWorker:
             server_args.speculative_algorithm
         )
         self.server_args = server_args
+
+        # LoRA configurations
+        self.lora_paths = server_args.lora_paths
+        self.max_loras_per_batch = server_args.max_loras_per_batch
+
         # Init model and tokenizer
         self.model_config = ModelConfig.from_server_args(
             server_args,
