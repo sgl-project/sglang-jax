@@ -178,7 +178,7 @@ class EPMoE(nnx.Module):
         num_experts: int,
         num_experts_per_tok: int,
         ep_size: int,
-        mesh: Mesh,
+        mesh: Mesh | None,
         intermediate_dim: int = 2048,
         weight_dtype: jnp.dtype = jnp.bfloat16,
         dtype: jnp.dtype = jnp.bfloat16,
@@ -257,7 +257,7 @@ class EPMoE(nnx.Module):
         except Exception as _:
             return False, "cpu"
 
-    def __call__(self, hidden_states, topk_weights, topk_ids):
+    def __call__(self, hidden_states, topk_weights, topk_ids) -> jax.Array:
         with jax.sharding.use_abstract_mesh(self.updated_mesh):
             hidden_states_reshard = jax.sharding.reshard(hidden_states, P(None))
             topk_weights_reshard = jax.sharding.reshard(topk_weights, P(None))
