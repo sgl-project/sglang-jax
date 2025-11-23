@@ -1,4 +1,3 @@
-import contextlib
 import json
 import logging
 import os
@@ -101,37 +100,18 @@ class MiMoModel(Qwen2Model):
         mesh: jax.sharding.Mesh | None = None,
     ):
         super().__init__(config=config, dtype=dtype, rngs=rngs, mesh=mesh)
-        self._mtp_layers_initialized = False
         self.mtp_layers = nnx.data([])
 
-    def ensure_mtp_layers(
-        self,
-        num_layers: int,
-        config: PretrainedConfig,
-        dtype: jnp.dtype,
-        rngs: nnx.Rngs | None,
-        mesh: jax.sharding.Mesh | None,
-    ):
-        if num_layers <= 0:
-            return
-        if self._mtp_layers_initialized and len(self.mtp_layers) == num_layers:
-            return
-
-        mesh_context = jax.set_mesh(mesh) if mesh is not None else contextlib.nullcontext()
-
-        with mesh_context:
-            mtp_layers = [
-                MiMoMTPLayer(
-                    config=config,
-                    layer_id=layer_id,
-                    dtype=dtype,
-                    rngs=rngs,
-                    mesh=mesh,
-                )
-                for layer_id in range(num_layers)
-            ]
-        self.mtp_layers = nnx.data(mtp_layers)
-        self._mtp_layers_initialized = True
+        self.mtp_layers = [
+            MiMoMTPLayer(
+                config=config,
+                layer_id=layer_id,
+                dtype=dtype,
+                rngs=rngs,
+                mesh=mesh,
+            )
+            for layer_id in range(config.num_nextn_predict_layers)
+        ]
 
 
 class MiMoForCausalLM(Qwen2ForCausalLM):
@@ -147,16 +127,6 @@ class MiMoForCausalLM(Qwen2ForCausalLM):
 
     def load_weights(self, model_config: ModelConfig, rng_key: jax.Array):
         self.rng = nnx.Rngs(rng_key)
-        self._weight_map = self._load_weight_map(model_config.model_path)
-        self._num_mtp_layers = self._infer_mtp_layer_count()
-        if self._num_mtp_layers:
-            self.model.ensure_mtp_layers(
-                num_layers=self._num_mtp_layers,
-                config=self.config,
-                dtype=self.dtype,
-                rngs=self.rng,
-                mesh=self.mesh,
-            )
 
         loader = WeightLoader(
             model=self,
@@ -287,32 +257,6 @@ class MiMoForCausalLM(Qwen2ForCausalLM):
             )
 
         return mappings
-
-    def _load_weight_map(self, model_path: str) -> dict:
-        index_path = os.path.join(model_path, "model.safetensors.index.json")
-        if not os.path.exists(index_path):
-            return {}
-        try:
-            with open(index_path, "r", encoding="utf-8") as index_file:
-                data = json.load(index_file)
-        except (OSError, json.JSONDecodeError) as exc:
-            logger.warning("Failed to read MiMo weight map from %s: %s", index_path, exc)
-            return {}
-        return data.get("weight_map", {})
-
-    def _infer_mtp_layer_count(self) -> int:
-        weight_map = getattr(self, "_weight_map", {}) or {}
-        layer_ids = set()
-        for key in weight_map.keys():
-            if not key.startswith("model.mtp_layers."):
-                continue
-            parts = key.split(".")
-            if len(parts) < 3:
-                continue
-            layer_index = parts[2]
-            if layer_index.isdigit():
-                layer_ids.add(int(layer_index))
-        return len(layer_ids)
 
 
 EntryClass = MiMoForCausalLM
