@@ -213,6 +213,9 @@ suites = {
         TestFile("python/sgl_jax/test/speculative/test_eagle_tree_build.py", 1),
         TestFile("python/sgl_jax/test/speculative/test_eagle_utils.py", 1),
     ],
+    "unit-test-tpu-v6e-4": [
+        TestFile("python/sgl_jax/test/test_mesh.py", 1),
+    ],
     "kernel-performance-test-tpu-v6e-1": [
         TestFile("benchmark/kernels/flash_attention/bench_flashattention.py", 5),
         TestFile("benchmark/kernels/megablox_gmm/bench_megablox_gmm.py", 2),

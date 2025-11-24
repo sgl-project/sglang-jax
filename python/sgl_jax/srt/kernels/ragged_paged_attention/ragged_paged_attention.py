@@ -779,7 +779,10 @@ def _ragged_paged_attention_kernel(
                         # Correctly calculate sequence-relative position
                         prefix_len = kv_len - q_len
                         # `bq_idx * bq_sz` is the offset within the new queries for this sequence
-                        local_q_offset = bq_idx * bq_sz + lax.iota(jnp.int32, q_batch.shape[1])
+                        local_q_offset = (
+                            bq_idx * bq_sz
+                            + lax.iota(jnp.int32, q_batch.shape[1]) // num_q_heads_per_kv_head
+                        )
                         # `base_qidx` is the absolute sequence position
                         base_qidx = prefix_len + local_q_offset
                         # Tile for all KV heads, as the position is the same for each head group.
