@@ -86,9 +86,7 @@ class ModelWorkerClient:
             self.parent_process.send_signal(signal.SIGQUIT)
 
     def forward_thread_func_(self):
-
         while True:
-
             (
                 model_worker_batch,
                 future_token_ids_ct,
