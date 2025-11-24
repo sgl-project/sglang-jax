@@ -477,7 +477,8 @@ class Scheduler(
 
             if batch:
                 batch.launch_done = threading.Event()
-                result = self.run_batch(batch)
+                with jax.profiler.TraceAnnotation("run_batch"):
+                    result = self.run_batch(batch)
                 self.result_queue.append((batch.copy(), result))
 
                 if self.last_batch is None:
@@ -488,7 +489,9 @@ class Scheduler(
                         forward_mode=ForwardMode.DUMMY_FIRST,
                         next_batch_sampling_info=self.tp_worker.cur_sampling_info,
                     )
-                    self.process_batch_result(tmp_batch, None, batch.launch_done)
+                    with jax.profiler.TraceAnnotation("process_batch_result"):
+
+                        self.process_batch_result(tmp_batch, None, batch.launch_done)
 
             if self.last_batch:
                 # Process the results of the last batch
@@ -1166,11 +1169,15 @@ class Scheduler(
                 model_worker_batch.forward_batch = ForwardBatch.init_new(
                     model_worker_batch, self.tp_worker.get_model_runner()
                 )
-                logits_output, next_token_ids, cache_miss_count = (
-                    self.tp_worker.forward_batch_generation(
-                        model_worker_batch, sampling_metadata=None
+                with jax.profiler.TraceAnnotation(
+                    f"forward_batch_generation_overlap {self.forward_ct}"
+                ):
+
+                    logits_output, next_token_ids, cache_miss_count = (
+                        self.tp_worker.forward_batch_generation(
+                            model_worker_batch, sampling_metadata=None
+                        )
                     )
-                )
                 next_token_ids = next_token_ids[: model_worker_batch.real_bs]
             else:
                 logits_output, next_token_ids_device, cache_miss_count = (

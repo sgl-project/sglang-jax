@@ -521,7 +521,9 @@ class ModelRunner:
         self.forward_pass_id += 1
         precision_tracer.start_batch_trace(forward_batch.bid)
         precision_tracer.set_current_forward_pass_id(self.forward_pass_id)
-        return self._forward_raw(forward_batch, logits_metadata)
+        with jax.profiler.TraceAnnotation("_forward_raw"):
+            ret = self._forward_raw(forward_batch, logits_metadata)
+        return ret
 
     def _forward_raw(
         self,
