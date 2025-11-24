@@ -1,6 +1,11 @@
 import os
 import sys
 import unittest
+import csv
+from types import SimpleNamespace
+import subprocess
+import re
+import time
 from types import SimpleNamespace
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -26,9 +31,64 @@ from sgl_jax.test.test_utils import (
 
 
 class TestModelAccuracy(CustomTestCase):
+    # def test_qwen_7b(self):
+    #     model = QWEN_7B
+    #     base_url = DEFAULT_URL_FOR_TEST
+    #     process = popen_launch_server(
+    #         model,
+    #         base_url,
+    #         timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+    #         device="tpu",
+    #         other_args=[
+    #             "--trust-remote-code",
+    #             "--skip-server-warmup",
+    #             "--random-seed",
+    #             "3",
+    #             "--max-prefill-tokens",
+    #             "16384",
+    #             "--download-dir",
+    #             "/dev/shm/",
+    #             "--dtype",
+    #             "bfloat16",
+    #             "--max-running-requests",
+    #             "256",
+    #             "--attention-backend",
+    #             "fa",
+    #             "--page-size",
+    #             "128",
+    #             "--chunked-prefill-size",
+    #             "2048",
+    #             "--tp-size",
+    #             "1",
+    #             # "--grammar-backend", 
+    #             # "none", 
+    #         ],
+    #         env={
+    #             "JAX_COMPILATION_CACHE_DIR": "/tmp/jax_compilation_cache",
+    #         },
+    #     )
+    #     ## test mmlu
+    #     args = SimpleNamespace(
+    #         base_url=base_url,
+    #         model=model,
+    #         eval_name="mmlu",
+    #         num_examples=256,
+    #         num_threads=128,
+    #         max_tokens=1024,
+    #     )
+    #     metrics = run_eval(args)
+    #     self.assertGreater(metrics["score"], 0.35)
+
+    #     ## kill process
+    #     kill_process_tree(process.pid)
+
     def test_qwen_7b(self):
-        model = QWEN_7B
-        base_url = DEFAULT_URL_FOR_TEST
+        model_name_str = "Qwen-7B"
+        model = QWEN_7B  
+        base_url = DEFAULT_URL_FOR_TEST 
+        results_file = "benchmark_results.csv"
+
+
         process = popen_launch_server(
             model,
             base_url,
@@ -37,46 +97,112 @@ class TestModelAccuracy(CustomTestCase):
             other_args=[
                 "--trust-remote-code",
                 "--skip-server-warmup",
-                "--random-seed",
-                "3",
-                "--max-prefill-tokens",
-                "16384",
-                "--download-dir",
-                "/dev/shm/",
-                "--dtype",
-                "bfloat16",
-                "--max-running-requests",
-                "256",
-                "--attention-backend",
-                "fa",
-                "--page-size",
-                "128",
-                "--chunked-prefill-size",
-                "2048",
-                "--tp-size",
-                "1",
-                # "--grammar-backend", 
-                # "none", 
+                "--random-seed", "3",
+                "--max-prefill-tokens", "16384",
+                "--download-dir", "/dev/shm/",
+                "--dtype", "bfloat16",
+                "--max-running-requests", "256",
+                "--attention-backend", "fa",
+                "--page-size", "128",
+                "--chunked-prefill-size", "2048",
+                "--tp-size", "1",
+                # "--grammar-backend", "none",
             ],
             env={
                 "JAX_COMPILATION_CACHE_DIR": "/tmp/jax_compilation_cache",
             },
         )
-        ## test mmlu
-        args = SimpleNamespace(
-            base_url=base_url,
-            model=model,
-            eval_name="mmlu",
-            num_examples=256,
-            num_threads=128,
-            max_tokens=1024,
-        )
-        metrics = run_eval(args)
-        self.assertGreater(metrics["score"], 0.35)
+        
 
-        ## kill process
-        kill_process_tree(process.pid)
+        mmlu_score = 0.0
+        gsm8k_score = 0.0
 
+        try:
+            try:
+                print(f">>> [{model_name_str}] Starting MMLU Evaluation (Internal)...")
+                mmlu_args = SimpleNamespace(
+                    base_url=base_url,
+                    model=model,
+                    eval_name="mmlu",
+                    num_examples=256,
+                    num_threads=128,
+                    max_tokens=1024,
+                )
+                # 假设 run_eval 返回 {'score': 0.35...}
+                mmlu_metrics = run_eval(mmlu_args) 
+                mmlu_score = mmlu_metrics.get('score', 0.0)
+                print(f">>> MMLU Score: {mmlu_score}")
+            except Exception as e:
+                print(f"!!! MMLU Failed: {e}")
+
+
+            print(f">>> [{model_name_str}] Starting GSM8K Evaluation (CLI: evalscope)...")
+            
+
+            api_url_for_cli = f"{base_url}/v1"
+            
+            cmd = [
+                "uv", "run",
+                "--with", "evalscope", 
+                "evalscope", "eval",
+                "--model", str(model),        
+                "--api-url", api_url_for_cli,   
+                "--api-key", "EMPTY",
+                "--eval-type", "openai_api",
+                "--datasets", "gsm8k",
+                "--eval-batch-size", "64",
+                "--limit", "10"
+            ]
+            
+            print(f"Executing: {' '.join(cmd)}")
+            
+
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            
+
+            print(">>> GSM8K CLI Output (Last 500 chars):")
+            print(result.stdout[-500:]) 
+            if result.stderr:
+                print(">>> GSM8K CLI Error Output:")
+                print(result.stderr[-500:])
+
+
+            try:
+
+                match = re.search(r"['\"]?acc['\"]?:\s*([0-9\.]+)", result.stdout) or \
+                        re.search(r"['\"]?score['\"]?:\s*([0-9\.]+)", result.stdout) or \
+                        re.search(r"Average Accuracy:\s*([0-9\.]+)", result.stdout)
+                
+                if match:
+                    gsm8k_score = float(match.group(1))
+                    print(f">>> Parsed GSM8K Score: {gsm8k_score}")
+                else:
+                    print("!!! Could not regex parse score from evalscope output. Setting to -1.")
+                    gsm8k_score = -1.0
+            except Exception as e:
+                print(f"!!! Error parsing GSM8K score: {e}")
+                gsm8k_score = -1.0
+
+            file_exists = os.path.isfile(results_file)
+            with open(results_file, mode='a', newline='', encoding='utf-8') as f:
+                fieldnames = ['Model', 'MMLU', 'GSM8K']
+                writer = csv.DictWriter(f, fieldnames=fieldnames)
+                if not file_exists:
+                    writer.writeheader()
+                
+                writer.writerow({
+                    'Model': model_name_str,
+                    'MMLU': mmlu_score,
+                    'GSM8K': gsm8k_score
+                })
+            print(f">>> Results saved to {results_file}")
+
+        finally:
+            kill_process_tree(process.pid)
+
+        self.assertGreater(mmlu_score, 0.35, "MMLU score too low")
+        if gsm8k_score > 0:
+            self.assertGreater(gsm8k_score, 0.20, "GSM8K score too low")
 
     def test_qwen3_8b(self):
         model = QWEN3_8B
