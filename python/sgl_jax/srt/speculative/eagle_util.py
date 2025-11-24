@@ -577,7 +577,8 @@ class EagleDraftInput:
         return model_worker_batch, logits_metadata
 
     def prepare_for_decode(self, schedule_batch: ScheduleBatch):
-        new_allocate_lens = schedule_batch.seq_lens + self.ALLOC_LEN_PER_DECODE
+        new_allocate_lens = np.array(schedule_batch.seq_lens + self.ALLOC_LEN_PER_DECODE)
+        self.allocate_lens = np.array(self.allocate_lens)
         bs = schedule_batch.batch_size()
         assert (
             self.allocate_lens.shape[0] == bs
@@ -601,7 +602,6 @@ class EagleDraftInput:
                 last_loc,
                 extend_num_tokens,
             )
-
         assign_req_to_token_pool(
             schedule_batch.req_pool_indices,
             schedule_batch.req_to_token_pool,
