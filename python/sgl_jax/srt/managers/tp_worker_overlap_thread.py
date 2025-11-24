@@ -86,7 +86,6 @@ class ModelWorkerClient:
             self.parent_process.send_signal(signal.SIGQUIT)
 
     def forward_thread_func_(self):
-        step_counter = 0
 
         while True:
 
@@ -106,7 +105,7 @@ class ModelWorkerClient:
             )
 
             # Run forward
-            with jax.profiler.TraceAnnotation(f"forward_batch_generation {step_counter}"):
+            with jax.profiler.TraceAnnotation(f"forward_batch_generation {model_worker_batch.bid}"):
                 logits_output, next_token_ids, cache_miss_count = (
                     self.worker.forward_batch_generation(
                         model_worker_batch,
@@ -123,7 +122,6 @@ class ModelWorkerClient:
                 next_token_ids,
             )
             self.output_queue.put((None, logits_output, next_token_ids, cache_miss_count))
-            step_counter += 1
 
     def resolve_last_batch_result(self, launch_done: threading.Event | None = None):
         """
