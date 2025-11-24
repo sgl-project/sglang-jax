@@ -1,7 +1,63 @@
 # SPDX-License-Identifier: Apache-2.0
+from collections import defaultdict
+from typing import Any
+
 import jax
 import jax.numpy as jnp
 from jax.sharding import PartitionSpec
+
+GBYTES = 1024 * 1024 * 1024
+TPU_HEAD_SIZE_ALIGNMENT = 128
+TPU_SECOND_LAST_MINOR = 8
+
+
+def get_device_name(num_devices: int | None = None):
+    kind = jax.devices()[0].device_kind
+    if "TPU" not in kind:
+        raise RuntimeError("Expected TPU devices")
+    suffix = ""
+    if kind.endswith(" lite"):
+        kind = kind[: -len(" lite")]
+        suffix = "e"
+    elif kind.endswith("e"):
+        kind = kind[:-1]
+        suffix = "e"
+    elif kind.endswith("p"):
+        kind = kind[:-1]
+        suffix = "p"
+    elif kind == "TPU7x":
+        kind = "TPU v7"
+    assert kind[:-1] == "TPU v", kind
+    kind += suffix
+    if num_devices is not None:
+        kind += f"-{num_devices}"
+    return kind
+
+
+def get_device_hbm_limit() -> int:
+
+    device_kind = get_device_name()
+    if device_kind == "TPU v5p" or device_kind == "TPU v5":
+        return 95 * GBYTES
+    elif device_kind == "TPU v5e":
+        return 16 * GBYTES
+    elif device_kind == "TPU v6e" or device_kind == "TPU v4":
+        return 32 * GBYTES
+    elif device_kind == "TPU v7":
+        # 192 * GBYTES / 2 because each JAX device (v7x core) has
+        # 1/2 of the total chip HBM
+        return 96 * GBYTES
+    else:
+        raise ValueError(f"Unknown device kind: {device_kind}")
+
+
+def pathways_hbm_usage_gb(live_arrays, devices: Any) -> list[tuple[float, float]]:
+    hbm_used = defaultdict(int)
+    hbm_limit = get_device_hbm_limit()
+    for array in live_arrays:
+        for buffer in array.addressable_shards:
+            hbm_used[buffer.data.device] += buffer.data.nbytes
+    return [(hbm_used[device], hbm_limit) for device in devices]
 
 
 def get_num_kv_heads_by_tp(total_num_kv_heads: int, tp_size: int) -> int:
@@ -58,6 +114,12 @@ def get_available_device_memory(device, distributed=False, empty_cache=True):
             stats = dev.memory_stats()
             avail_mem.append(stats["bytes_limit"] - stats["bytes_in_use"])
         avail_mem = jnp.array([min(avail_mem) / (1 << 10)], dtype=jnp.float32)
+    elif device == "proxy":
+        live_arrays = jax.live_arrays()
+        pathways_hbm_used_mem = pathways_hbm_usage_gb(live_arrays, devices)
+        avail_mem = jnp.array(
+            [(hbm_limit - hbm_used) for hbm_used, hbm_limit in pathways_hbm_used_mem]
+        )
     elif device in ("gpu", "cuda"):
         if empty_cache:
             jax.clear_caches()
