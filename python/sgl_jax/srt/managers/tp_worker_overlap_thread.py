@@ -86,7 +86,10 @@ class ModelWorkerClient:
             self.parent_process.send_signal(signal.SIGQUIT)
 
     def forward_thread_func_(self):
+        step_counter = 0
+
         while True:
+
             (
                 model_worker_batch,
                 future_token_ids_ct,
@@ -103,12 +106,15 @@ class ModelWorkerClient:
             )
 
             # Run forward
-            logits_output, next_token_ids, cache_miss_count = self.worker.forward_batch_generation(
-                model_worker_batch,
-                model_worker_batch.launch_done,
-                sampling_metadata=sampling_metadata,
-                forward_metadata=forward_metadata,
-            )
+            with jax.profiler.TraceAnnotation(f"forward_batch_generation {step_counter}"):
+                logits_output, next_token_ids, cache_miss_count = (
+                    self.worker.forward_batch_generation(
+                        model_worker_batch,
+                        model_worker_batch.launch_done,
+                        sampling_metadata=sampling_metadata,
+                        forward_metadata=forward_metadata,
+                    )
+                )
 
             # Update the future token ids map
             self.future_token_ids_map = set_future_token_ids(
@@ -116,8 +122,8 @@ class ModelWorkerClient:
                 future_token_ids_ct,
                 next_token_ids,
             )
-
             self.output_queue.put((None, logits_output, next_token_ids, cache_miss_count))
+            step_counter += 1
 
     def resolve_last_batch_result(self, launch_done: threading.Event | None = None):
         """
