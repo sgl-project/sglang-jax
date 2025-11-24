@@ -90,19 +90,25 @@ jobs:
   unit-test-4-tpu:
     needs: [check-changes]
     if: github.event.pull_request.draft == false && needs.check-changes.outputs.main_package == 'true'
-    #runs-on: arc-runner-v6e-1
-    runs-on: ubuntu-slim
+    runs-on: arc-runner-v6e-4
     strategy:
       fail-fast: false
       matrix:
         part: [0, 1]
     steps:
-      # TODO: please rename when implement unit test
-      - name: Mock
+      - name: Checkout code
+        uses: actions/checkout@v5
+      - name: Run unit test
         timeout-minutes: 30
         env:
           SGLANG_JAX_IS_IN_CI: true
-        run: echo ${{ matrix.part }}
+        run: |
+          python3.12 -m venv .venv
+          source .venv/bin/activate
+          pip install uv
+          uv pip install -e "python[all]"
+          bash scripts/killall_sglang.sh
+          python test/srt/run_suite.py --suite unit-test-tpu-v6e-4 --auto-partition-id ${{ matrix.part }} --auto-partition-size 2
 
   # =============================================== e2e-test ===============================================
   e2e-test-1-tpu:
