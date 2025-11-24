@@ -1,11 +1,6 @@
 name: Build Docker Images
 
 on:
-  push:
-    branches:
-      - feat/base-images
-    paths:
-      - '.github/workflows/build-docker-images.yml'
   workflow_dispatch:
     inputs:
       image_type:
@@ -27,8 +22,17 @@ on:
         default: 'latest'
 
 jobs:
+  check-branch:
+    runs-on: arc-runner-cpu
+    steps:
+      - name: Check if running on main branch
+        if: github.ref != 'refs/heads/main'
+        run: |
+          echo "This workflow can only be run on the main branch"
+          exit 1
 
   build-release-image:
+    needs: check-branch
     if: github.event.inputs.image_type == 'release' || github.event.inputs.image_type == 'both'
     runs-on: arc-runner-cpu
     permissions:
@@ -67,6 +71,7 @@ jobs:
           cache-to: type=gha,mode=max
 
   build-ci-base-image:
+    needs: check-branch
     if: github.event.inputs.image_type == 'ci-base' || github.event.inputs.image_type == 'both'
     runs-on: arc-runner-cpu
     permissions:
@@ -91,7 +96,7 @@ jobs:
         with:
           images: lmsysorg/sglang-jax
           tags: |
-            type=raw,value=actionrunner-dev
+            type=raw,value=actionrunner
 
       - name: Build and push ci-base image
         uses: docker/build-push-action@v5
