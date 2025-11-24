@@ -165,9 +165,9 @@ def create_grammar_backend(
     name = server_args.grammar_backend
 
     if name == "llguidance":
-        from sgl_jax.srt.constrained.llguidance_backend import GuidanceBackend
+        from sgl_jax.srt.constrained.llguidance_backend import get_guidance_backend
 
-        grammar_backend = GuidanceBackend(
+        grammar_backend = get_guidance_backend(
             tokenizer=tokenizer,
             num_threads=4,
             n_vocab=vocab_size,
