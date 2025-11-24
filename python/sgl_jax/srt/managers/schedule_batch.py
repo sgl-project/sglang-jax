@@ -191,11 +191,10 @@ class Req:
         self.finished_len = None
         # Whether this request has finished output
         self.finished_output = None
-        # If we want to abort the request in the middle of the event loop, set this to true
+        # If we want to abort the request in the middle of the event loop,
+        # set to_finish instead of directly setting finished_reason.
         # Note: We should never set finished_reason in the middle, the req will get filtered and never respond
-        self.to_abort = False
-        # This carries the error message for `.to_abort` and will be attached to the finished_reason at the end of the event loop
-        self.to_abort_message: str = None
+        self.to_finish: BaseFinishReason | None = None
         self.stream = stream
         self.eos_token_ids = eos_token_ids
         self.vocab_size = vocab_size
@@ -378,10 +377,9 @@ class Req:
         if self.finished():
             return
 
-        if self.to_abort:
-            self.finished_reason = FINISH_ABORT(
-                message=self.to_abort_message,
-            )
+        if self.to_finish:
+            self.finished_reason = self.to_finish
+            self.to_finish = None
             return
 
         if len(self.output_ids) >= self.sampling_params.max_new_tokens:
@@ -474,8 +472,9 @@ class Req:
     def set_finish_with_abort(self, error_msg: str):
         # set it to one token to skip the long prefill
         self.origin_input_ids = [0]
+        self.grammar = None
         self.return_logprob = False
-        self.finished_reason = FINISH_ABORT(error_msg, HTTPStatus.BAD_REQUEST, "BadRequestError")
+        self.to_finish = FINISH_ABORT(error_msg, HTTPStatus.BAD_REQUEST, "BadRequestError")
 
     def __repr__(self):
         return (
