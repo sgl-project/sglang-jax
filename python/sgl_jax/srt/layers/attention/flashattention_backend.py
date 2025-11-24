@@ -20,6 +20,7 @@ from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch, ForwardM
 from sgl_jax.srt.speculative.eagle_util import EagleDraftInput
 from sgl_jax.srt.utils import cdiv
 from sgl_jax.srt.utils.jax_utils import device_array
+from sgl_jax.srt.utils.profiling_utils import named_scope
 
 logger = logging.getLogger(__name__)
 
@@ -416,6 +417,7 @@ class FlashAttention(AttentionBackend):
 
         return obj
 
+    @named_scope
     def __call__(
         self,
         q: jax.Array,  # [total_tokens, num_heads, head_dim]

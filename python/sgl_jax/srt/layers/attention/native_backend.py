@@ -1,3 +1,5 @@
+from functools import partial
+
 import jax
 import jax.numpy as jnp
 from jax.sharding import NamedSharding
@@ -9,6 +11,7 @@ from sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch
 from sgl_jax.srt.mem_cache.memory_pool import KVCache
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sgl_jax.srt.utils.jax_utils import is_tpu_runtime
+from sgl_jax.srt.utils.profiling_utils import named_scope
 
 
 class NativeAttention(AttentionBackend):
@@ -45,6 +48,7 @@ class NativeAttention(AttentionBackend):
         """Init the metadata for a forward pass and return it."""
         return None
 
+    @named_scope
     def __call__(
         self,
         q: jax.Array,
@@ -143,7 +147,17 @@ class NativeAttention(AttentionBackend):
         return 4096
 
 
-# @partial(jax.jit, static_argnames=["num_heads", "num_kv_heads", "is_causal", "mode"])
+@partial(
+    jax.jit,
+    static_argnames=[
+        "num_heads",
+        "num_kv_heads",
+        "scale",
+        "is_causal",
+        "mode",
+        "xai_temperature_len",
+    ],
+)
 def forward_attention(
     q: jax.Array,
     k_cache: jax.Array,

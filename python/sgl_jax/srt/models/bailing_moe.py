@@ -55,14 +55,10 @@ class BailingMoEAttention(nnx.Module):
 
         if use_qk_norm:
             self.q_norm = RMSNorm(
-                self.head_dim,
-                epsilon=rms_norm_eps,
-                param_dtype=dtype,
+                self.head_dim, epsilon=rms_norm_eps, param_dtype=dtype, scope_name="q_norm"
             )
             self.k_norm = RMSNorm(
-                self.head_dim,
-                epsilon=rms_norm_eps,
-                param_dtype=dtype,
+                self.head_dim, epsilon=rms_norm_eps, param_dtype=dtype, scope_name="k_norm"
             )
         else:
             self.q_norm = None
@@ -75,6 +71,7 @@ class BailingMoEAttention(nnx.Module):
             kernel_axes=(None, "tensor"),
             params_dtype=dtype,
             mesh=mesh,
+            scope_name="q_proj",
         )
         self.k_proj = LinearBase(
             input_size=hidden_size,
@@ -83,6 +80,7 @@ class BailingMoEAttention(nnx.Module):
             kernel_axes=(None, "tensor"),
             params_dtype=dtype,
             mesh=mesh,
+            scope_name="k_proj",
         )
         self.v_proj = LinearBase(
             input_size=hidden_size,
@@ -91,6 +89,7 @@ class BailingMoEAttention(nnx.Module):
             kernel_axes=(None, "tensor"),
             params_dtype=dtype,
             mesh=mesh,
+            scope_name="v_proj",
         )
         self.c_proj = LinearBase(
             input_size=num_heads * self.head_dim,
@@ -99,6 +98,7 @@ class BailingMoEAttention(nnx.Module):
             kernel_axes=("tensor", None),
             params_dtype=dtype,
             mesh=mesh,
+            scope_name="c_proj",
         )
         self.rotary_emb = RotaryEmbedding(
             head_size=self.head_dim,
@@ -162,6 +162,7 @@ class BailingMoEMLP(nnx.Module):
             use_bias=False,
             params_dtype=dtype,
             mesh=mesh,
+            scope_name="gate_proj",
         )
 
         self.up_proj = LinearBase(
@@ -171,6 +172,7 @@ class BailingMoEMLP(nnx.Module):
             use_bias=False,
             params_dtype=dtype,
             mesh=mesh,
+            scope_name="up_proj",
         )
 
         self.down_proj = LinearBase(
@@ -180,6 +182,7 @@ class BailingMoEMLP(nnx.Module):
             use_bias=False,
             params_dtype=dtype,
             mesh=mesh,
+            scope_name="down_proj",
         )
 
         self.act_fn = jax.nn.silu
@@ -317,11 +320,13 @@ class BailingMoEDecoderLayer(nnx.Module):
             config.hidden_size,
             epsilon=config.rms_norm_eps,
             param_dtype=dtype,
+            scope_name="input_layernorm",
         )
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size,
             epsilon=config.rms_norm_eps,
             param_dtype=dtype,
+            scope_name="post_attention_layernorm",
         )
 
     def __call__(
@@ -407,9 +412,7 @@ class BailingMoEModel(nnx.Module):
         )
 
         self.norm = RMSNorm(
-            config.hidden_size,
-            epsilon=config.rms_norm_eps,
-            param_dtype=dtype,
+            config.hidden_size, epsilon=config.rms_norm_eps, param_dtype=dtype, scope_name="norm"
         )
 
     def __call__(
