@@ -86,7 +86,7 @@ jobs:
         with:
           images: lmsysorg/sglang-jax
           tags: |
-            type=raw,value=actionrunner
+            type=raw,value=actionrunner-dev
 
       - name: Build and push ci-base image
         uses: docker/build-push-action@v5
