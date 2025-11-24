@@ -1,6 +1,11 @@
 name: Build Docker Images
 
 on:
+  push:
+    branches:
+      - feat/base-images
+    paths:
+      - '.github/workflows/build-docker-images.yml'
   workflow_dispatch:
     inputs:
       image_type:
