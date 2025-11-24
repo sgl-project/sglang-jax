@@ -14,19 +14,18 @@ Enter your SkyPilot API server endpoint: Please join the [SGL-JAX Slack](https:/
 ## Generate a Yaml
 
 ```yaml
-Example Yaml
+#Example Yaml
 resources:
-   accelerators: tpu-v6e-4 #
+   accelerators: tpu-v6e-4
    accelerator_args:
       tpu_vm: True
-      runtime_version: v2-alpha-tpuv6e  # optional
-file_mounts:
-  ~/.ssh/id_rsa: ~/.ssh/id_rsa
-setup: |
-  chmod 600 ~/.ssh/id_rsa
-  rm ~/.ssh/config
-  GIT_SSH_COMMAND="ssh -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no" git clone git@github.com:sgl-project/sglang-jax.git
-  sudo mount -t tmpfs -o size=200G tmpfs /tmp # Suggestion: This configuration is suitable to model whose parameters are less than 100B. And this directory will be used to store model which downloads from HuggingFace.
+      runtime_version: v2-alpha-tpuv6e
+run: |
+  git clone https://github.com/sgl-project/sglang-jax.git
+  cd sglang-jax && git fetch origin $REF:$REF && git checkout $REF
+  uv venv --python 3.12
+  source .venv/bin/activate
+  uv pip install -e "python[all]"
 ```
 
 Note: If you want to test model whose parameters are bigger than 100B, we recommend you to use GCS. Please contact us with [Slack](https://sgl-fru7574.slack.com/archives/C09EBE5HT5X).
