@@ -269,7 +269,7 @@ class EAGLEWorker(ModelWorker):
 
     def capture_for_decode(
         self, logits_output: LogitsProcessorOutput, draft_input: EagleDraftInput
-    ):
+    ):          
         topk_p, topk_index = topk_probs_from_logits(logits_output.next_token_logits, self.topk)
         draft_input.topk_p = topk_p
         draft_input.topk_index = topk_index
@@ -674,10 +674,10 @@ class EAGLEWorker(ModelWorker):
                 )
                 spec_info = EagleDraftInput(
                     # FIXME(pc) dtype should according to serverargs
-                    topk_p=jnp.ones(
-                        (bs, self.topk),
+                    topk_p=jnp.arange(
+                        bs * self.topk,
                         dtype=jnp.bfloat16 if self.server_args.dtype == "bfloat16" else jnp.float32,
-                    ),
+                    ).reshape((bs, self.topk)),
                     topk_index=jnp.ones((bs, self.topk), dtype=jnp.int32),
                     hidden_states=jnp.ones(
                         (bs, self.model_config.hidden_size),

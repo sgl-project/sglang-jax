@@ -45,7 +45,7 @@ class MiMoMTPLayer(nnx.Module):
             input_size=config.hidden_size * 2,
             output_size=config.hidden_size,
             use_bias=False,
-            kernel_axes=(None, "tensor"),
+            kernel_axes=(None, None),
             rngs=rngs,
             params_dtype=dtype,
             mesh=mesh,
@@ -58,12 +58,9 @@ class MiMoMTPLayer(nnx.Module):
 
     def __call__(self, forward_batch: ForwardBatch, token_to_kv_pool: KVCache):
         hidden_states = self.embed_tokens(forward_batch.input_ids)
-        zero_indices = jnp.where(
-            forward_batch.positions == 0,
-            size=forward_batch.positions.shape[0],
-            fill_value=hidden_states.shape[0],
-        )[0]
-        hidden_states = hidden_states.at[zero_indices].set(0, mode="drop")
+        # Mask out padding tokens without scatter to avoid TPU custom-call issues.
+        token_mask = (forward_batch.positions != 0).astype(hidden_states.dtype)[:, None]
+        hidden_states = hidden_states * token_mask
         layers_kv_fused = []
 
         hidden_states, _ = self.input_proj(
@@ -122,6 +119,9 @@ class MiMoMTPForCausalLM(nnx.Module):
         target_prefix = "model.mtp_layers"
 
         mappings = {
+             "lm_head.weight": WeightMapping(
+                target_path="lm_head.embedding", sharding=(None, None), transpose=False
+            ),
             f"{prefix}.input_layernorm.weight": WeightMapping(
                 target_path=f"{target_prefix}.input_layernorm.scale",
                 sharding=(None,),
@@ -149,7 +149,7 @@ class MiMoMTPForCausalLM(nnx.Module):
             ),
             f"{prefix}.input_proj.weight": WeightMapping(
                 target_path="model.input_proj.weight",
-                sharding=(None, "tensor"),
+                sharding=(None, None),
                 transpose=True,
             ),
             f"{prefix}.self_attn.q_proj.weight": WeightMapping(
@@ -278,7 +278,8 @@ class MiMoMTPForCausalLM(nnx.Module):
 
         # Set LM Head weight
         if head_weight is not None:
-            self.lm_head.embedding.value = head_weight
+            pass
+            # self.lm_head.embedding.value = head_weight
 
 
 EntryClass = MiMoMTPForCausalLM

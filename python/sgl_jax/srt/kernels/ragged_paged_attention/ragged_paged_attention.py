@@ -1362,6 +1362,9 @@ def ragged_paged_attention(
             pages_per_seq,
             causal,
         )
+        if not causal:
+            bkv_p = 4
+            bq_sz = 4
     kv_packing = get_dtype_packing(kv_cache_fused_processed.dtype)
     if page_size == 1:
         bkv_p = bkv_p // 2
