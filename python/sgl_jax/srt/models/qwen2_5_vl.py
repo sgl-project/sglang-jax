@@ -1,5 +1,7 @@
 from typing import List
-from transformers import PretrainedConfig
+from transformers.models.qwen2_5_vl.configuration_qwen2_5_vl import (
+    Qwen2_5_VLConfig,
+)
 import jax
 import jax.numpy as jnp
 from flax import nnx
@@ -25,37 +27,39 @@ class Qwen2_5_VLForConditionalGeneration(nnx.Module):
 
     def __init__(
         self,
-        config: PretrainedConfig,
+        config: Qwen2_5_VLConfig,
         dtype: jnp.dtype = jnp.bfloat16,
         rngs: nnx.Rngs = None,
         mesh: jax.sharding.Mesh = None,
     ) -> None:
-        super().__init__()
 
-        self.config = config
-        self.dtype = dtype
-        self.mesh = mesh
         self.visual = Qwen2_5_VisionTransformer(
-            config.vision_config,
-            norm_eps=getattr(self.config, "rms_norm_eps", 1e-6),
+            vision_config=config.vision_config,
+            norm_eps=getattr(config, "rms_norm_eps", 1e-6),
+            dtype=dtype,
+            rngs=rngs,
+            mesh=mesh,
         )
 
         self.model = Qwen2Model(
-            self.config, dtype=self.dtype, rngs=rngs, mesh=mesh
+            config=config,
+            dtype=dtype,
+            rngs=rngs,
+            mesh=mesh,
         )
 
         self.lm_head = ParallelLMHead(
-            self.config.vocab_size,
-            self.config.hidden_size,
-            dtype=self.dtype,
-            param_dtype=self.dtype,
+            config.vocab_size,
+            config.hidden_size,
+            dtype=dtype,
+            param_dtype=dtype,
             kernel_axes=("tensor", None),
             rngs=rngs,
         )
 
-        self.is_mrope_enabled = "mrope_section" in self.config.rope_scaling
+        self.is_mrope_enabled = "mrope_section" in config.rope_scaling
 
-        self.logits_processor = LogitsProcessor(config.vocab_size, mesh=self.mesh)
+        self.logits_processor = LogitsProcessor(config.vocab_size, mesh=mesh)
 
     def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
         pattern = MultiModalityDataPaddingPatternMultimodalTokens()
@@ -112,9 +116,9 @@ class Qwen2_5_VLForConditionalGeneration(nnx.Module):
             or not forward_batch.contains_image_inputs()
         ):
             if self.is_mrope_enabled:
-                assert positions.ndim == 2 and positions.size(0) == 3, (
+                assert positions.ndim == 2 and positions.shape[0] == 3, (
                     "multimodal section rotary embedding requires "
-                    f"(3, seq_len) positions, but got {positions.size()}"
+                    f"(3, seq_len) positions, but got {positions.shape}"
                 )
 
         hidden_states, layers_kv_fused, layers_callback_flag = general_mm_embed_routine(
