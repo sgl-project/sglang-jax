@@ -7,7 +7,7 @@ name = "sglang-jax"
 version = "0.0.2"
 description = "JAX backend for SGL"
 readme = "README.md"
-requires-python = ">=3.12,<3.14"
+requires-python = "==3.12.*"
 license = { file = "LICENSE" }
 
 dependencies = [
@@ -29,7 +29,7 @@ dependencies = [
     "safetensors~=0.6.1",
     "setproctitle~=1.3.6",
     "tiktoken>=0.10.0",
-    "transformers~=4.57.1",
+    "transformers~=4.55.4",
     "typing-extensions~=4.14.1",
     "uvicorn~=0.35.0",
     "uvloop~=0.21.0",
