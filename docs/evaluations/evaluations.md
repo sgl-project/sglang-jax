@@ -19,7 +19,6 @@ sglang-jax          main-5fc4fa54a12ea0cbf05c4e304f0f69595e556aa7
 ### Instructions
 
 ```bash
-# sky-31d4-pseudonym
 # launch server, precision = bfloat16
 JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache python3 -u -m sgl_jax.launch_server \
 --model-path deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B \
@@ -36,7 +35,6 @@ JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache python3 -u -m sgl_jax.launch_server \
 --disable-radix-cache \
 --use-sort-for-toppk-minp
 
-# sky-495d-pseudonym
 # launch server, precision = float32
 JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache python3 -u -m sgl_jax.launch_server \
 --model-path deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B \
