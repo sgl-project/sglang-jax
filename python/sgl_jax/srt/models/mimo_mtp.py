@@ -39,27 +39,34 @@ class MiMoMTPLayer(nnx.Module):
             param_dtype=dtype,
             mesh=mesh,
         )
-        self.token_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.hidden_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.token_layernorm = RMSNorm(config.hidden_size, epsilon=config.rms_norm_eps, rngs=rngs)
+        self.hidden_layernorm = RMSNorm(config.hidden_size, epsilon=config.rms_norm_eps, rngs=rngs)
         self.input_proj = LinearBase(
             input_size=config.hidden_size * 2,
             output_size=config.hidden_size,
             use_bias=False,
-            kernel_axes=(None, None),
+            kernel_axes=(None, "tensor"),
             rngs=rngs,
             params_dtype=dtype,
             mesh=mesh,
         )
 
-        self.mtp_layers = Qwen2DecoderLayer(layer_id, dtype=dtype, rngs=rngs, mesh=mesh)
-        self.final_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.mtp_layers = Qwen2DecoderLayer(
+            config=config, layer_id=layer_id, dtype=dtype, rngs=rngs, mesh=mesh
+        )
+        self.final_layernorm = RMSNorm(config.hidden_size, epsilon=config.rms_norm_eps, rngs=rngs)
 
     def __call__(self, forward_batch: ForwardBatch, token_to_kv_pool: KVCache):
         hidden_states = self.embed_tokens(forward_batch.input_ids)
-        hidden_states.at[forward_batch.positions == 0].set(0)
+        zero_indices = jnp.where(
+            forward_batch.positions == 0,
+            size=forward_batch.positions.shape[0],
+            fill_value=hidden_states.shape[0],
+        )[0]
+        hidden_states = hidden_states.at[zero_indices].set(0, mode="drop")
         layers_kv_fused = []
 
-        hidden_states = self.input_proj(
+        hidden_states, _ = self.input_proj(
             jnp.concatenate(
                 (
                     self.hidden_layernorm(forward_batch.spec_info.hidden_states),
@@ -80,7 +87,7 @@ class MiMoMTPLayer(nnx.Module):
         return hidden_states, layers_kv_fused
 
 
-class MiMoMTPForCausalLM(nnx.module):
+class MiMoMTPForCausalLM(nnx.Module):
     def __init__(
         self,
         config: PretrainedConfig,
@@ -88,6 +95,10 @@ class MiMoMTPForCausalLM(nnx.module):
         rngs: nnx.Rngs | None = None,
         mesh: jax.sharding.Mesh | None = None,
     ):
+        self.dtype = dtype
+        self.rngs = rngs
+        self.config = config
+        self.mesh = mesh
         self.model = MiMoMTPLayer(config, dtype=self.dtype, rngs=rngs, mesh=mesh)
         self.lm_head = ParallelLMHead(
             config.vocab_size,
@@ -103,12 +114,7 @@ class MiMoMTPForCausalLM(nnx.module):
     def _create_mimo_weight_mappings(self) -> dict:
         mappings = {}
 
-        num_mtp_layers = getattr(self, "_num_mtp_layers", 0)
-        if not num_mtp_layers:
-            num_mtp_layers = len(getattr(self.model, "mtp_layers", []))
-
-        for layer_idx in range(num_mtp_layers):
-            mappings.update(self._create_mtp_layer_mappings(layer_idx))
+        mappings.update(self._create_mtp_layer_mappings(0))
 
         return mappings
 
@@ -128,22 +134,22 @@ class MiMoMTPForCausalLM(nnx.module):
                 transpose=False,
             ),
             f"{prefix}.hidden_layernorm.weight": WeightMapping(
-                target_path=f"{target_prefix}.hidden_layernorm.scale",
+                target_path="model.hidden_layernorm.scale",
                 sharding=(None,),
                 transpose=False,
             ),
             f"{prefix}.token_layernorm.weight": WeightMapping(
-                target_path=f"{target_prefix}.token_layernorm.scale",
+                target_path="model.token_layernorm.scale",
                 sharding=(None,),
                 transpose=False,
             ),
             f"{prefix}.final_layernorm.weight": WeightMapping(
-                target_path=f"{target_prefix}.final_layernorm.scale",
+                target_path="model.final_layernorm.scale",
                 sharding=(None,),
                 transpose=False,
             ),
             f"{prefix}.input_proj.weight": WeightMapping(
-                target_path=f"{target_prefix}.input_proj.weight",
+                target_path="model.input_proj.weight",
                 sharding=(None, "tensor"),
                 transpose=True,
             ),
@@ -220,13 +226,10 @@ class MiMoMTPForCausalLM(nnx.module):
         self.rng = nnx.Rngs(rng_key)
 
         loader = WeightLoader(
-            model=self,
-            model_config=model_config,
-            mesh=self.mesh,
-            dtype=self.dtype,
+            model=self, model_config=model_config, mesh=self.mesh, dtype=self.dtype, is_eagle=True
         )
 
-        weight_mappings = super()._create_qwen2_weight_mappings()
+        weight_mappings = self._create_mimo_weight_mappings()
 
         loader.load_weights_from_safetensors(weight_mappings)
         logger.info("MiMo MTP weights loaded successfully!")
