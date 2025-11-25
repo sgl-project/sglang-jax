@@ -1,28 +1,22 @@
+import logging
+
 import jax
 import jax.numpy as jnp
 from flax import nnx
 from transformers import PretrainedConfig
-from sgl_jax.srt.layers.embeddings import Embed, ParallelLMHead
-from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
-from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
-from sgl_jax.srt.mem_cache.memory_pool import KVCache
-from sgl_jax.srt.layers.layernorm import RMSNorm
+
 from sgl_jax.srt.configs.model_config import ModelConfig
+from sgl_jax.srt.layers.embeddings import Embed, ParallelLMHead
+from sgl_jax.srt.layers.layernorm import RMSNorm
 from sgl_jax.srt.layers.linear import LinearBase
-from sgl_jax.srt.models.qwen2 import (
-    Qwen2Attention,
-    Qwen2ForCausalLM,
-    Qwen2DecoderLayer,
-    Qwen2MLP,
-    Qwen2Model,
-)
-from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
+from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
 from sgl_jax.srt.mem_cache.memory_pool import KVCache
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
-from sgl_jax.srt.layers.embeddings import Embed, ParallelLMHead, RotaryEmbedding
-import logging
+from sgl_jax.srt.models.qwen2 import Qwen2DecoderLayer
+from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
 
 logger = logging.getLogger(__name__)
+
 
 class MiMoMTPLayer(nnx.Module):
     """Container for MiMo multi-token prediction (MTP) block weights."""
@@ -56,7 +50,7 @@ class MiMoMTPLayer(nnx.Module):
             params_dtype=dtype,
             mesh=mesh,
         )
-           
+
         self.mtp_layers = Qwen2DecoderLayer(layer_id, dtype=dtype, rngs=rngs, mesh=mesh)
         self.final_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
@@ -66,16 +60,25 @@ class MiMoMTPLayer(nnx.Module):
         layers_kv_fused = []
 
         hidden_states = self.input_proj(
-            jnp.concatenate((self.hidden_layernorm(forward_batch.spec_info.hidden_states), self.token_layernorm(hidden_states)), axis = -1)
+            jnp.concatenate(
+                (
+                    self.hidden_layernorm(forward_batch.spec_info.hidden_states),
+                    self.token_layernorm(hidden_states),
+                ),
+                axis=-1,
+            )
         )
-        hidden_states, residual, kv_fused, _ = self.mtp_layers(forward_batch.positions, hidden_states, forward_batch, token_to_kv_pool, None)
+        hidden_states, residual, kv_fused, _ = self.mtp_layers(
+            forward_batch.positions, hidden_states, forward_batch, token_to_kv_pool, None
+        )
 
         layers_kv_fused.append(kv_fused)
         hidden_states = hidden_states + residual
-        
+
         hidden_states = self.final_layernorm(hidden_states)
 
         return hidden_states, layers_kv_fused
+
 
 class MiMoMTPForCausalLM(nnx.module):
     def __init__(
@@ -96,7 +99,7 @@ class MiMoMTPForCausalLM(nnx.module):
         )
         self.load_lm_head_from_target = True
         self.logits_processor = LogitsProcessor(config.vocab_size, mesh=self.mesh)
-        
+
     def _create_mimo_weight_mappings(self) -> dict:
         mappings = {}
 
@@ -236,9 +239,7 @@ class MiMoMTPForCausalLM(nnx.module):
         token_to_kv_pool: KVCache,
         logits_metadata: LogitsMetadata,
     ):
-        hidden_states, layers_kv_fused = self.model(
-            forward_batch, token_to_kv_pool
-        )
+        hidden_states, layers_kv_fused = self.model(forward_batch, token_to_kv_pool)
         if not getattr(self.config, "tie_word_embeddings", False):
             output = self.logits_processor(
                 hidden_states, self.lm_head, logits_metadata, aux_hidden_states=None
@@ -252,7 +253,7 @@ class MiMoMTPForCausalLM(nnx.module):
             )
 
         return output, layers_kv_fused, []
-    
+
     def get_embed_and_head(self):
         return (
             self.model.embed_tokens.embedding.value,
