@@ -119,7 +119,7 @@ class MiMoMTPForCausalLM(nnx.Module):
         target_prefix = "model.mtp_layers"
 
         mappings = {
-             "lm_head.weight": WeightMapping(
+            "lm_head.weight": WeightMapping(
                 target_path="lm_head.embedding", sharding=(None, None), transpose=False
             ),
             f"{prefix}.input_layernorm.weight": WeightMapping(
