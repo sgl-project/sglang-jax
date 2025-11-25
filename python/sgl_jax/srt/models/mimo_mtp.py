@@ -105,7 +105,6 @@ class MiMoMTPForCausalLM(nnx.Module):
             config.hidden_size,
             dtype=dtype,
             param_dtype=dtype,
-            kernel_axes=("tensor", None),
             rngs=rngs,
         )
         self.load_lm_head_from_target = True
