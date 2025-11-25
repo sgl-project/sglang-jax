@@ -258,6 +258,9 @@ class ModelRunner:
         self.start_layer = getattr(self.model, "start_layer", 0)
         self.end_layer = getattr(self.model, "end_layer", self.model_config.num_hidden_layers)
         self.num_effective_layers = self.end_layer - self.start_layer
+        if self.is_draft_worker:
+            # if draft model and target model share same safetensor files, we should hack here to avoid create redundant layer kv cache
+            self.model_config.num_hidden_layers = getattr(self.model_config, "num_nextn_predict_layers", self.model_config.num_hidden_layers)
         if self.server_args.speculative_algorithm == "EAGLE3" and not self.is_draft_worker:
             try:
                 # get the aux layer from draft model config
