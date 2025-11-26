@@ -42,7 +42,7 @@ from sgl_jax.srt.managers.io_struct import (
     SetInternalStateReqOutput,
     TokenizedGenerateReqInput,
 )
-from sgl_jax.srt.managers.mm_utils import init_mm_embedding_cache
+from sgl_jax.srt.multimodal.mm_utils import init_mm_embedding_cache
 from sgl_jax.srt.managers.schedule_batch import (
     FINISH_ABORT,
     Req,

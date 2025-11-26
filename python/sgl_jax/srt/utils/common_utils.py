@@ -19,6 +19,10 @@ import shutil
 import signal
 import subprocess
 import sys
+import requests
+from io import BytesIO
+from PIL import Image
+from typing import Union, Optional, Literal
 import threading
 import time
 import traceback

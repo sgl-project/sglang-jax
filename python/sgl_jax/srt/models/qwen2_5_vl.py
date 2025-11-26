@@ -1,10 +1,7 @@
 import math
 from functools import partial
 from typing import List, Callable, NamedTuple, Optional, Any
-from transformers.models.qwen2_5_vl.configuration_qwen2_5_vl import (
-    Qwen2_5_VLConfig,
-    Qwen2_5_VLVisionConfig
-)
+from transformers.models.qwen2_5_vl.configuration_qwen2_5_vl import Qwen2_5_VLConfig
 import jax
 import jax.numpy as jnp
 from jax.sharding import Mesh
@@ -14,7 +11,7 @@ from sgl_jax.srt.managers.schedule_batch import (
     MultimodalDataItem,
     MultimodalInputs,
 )
-from sgl_jax.srt.managers.mm_utils import (
+from sgl_jax.srt.multimodal.mm_utils import (
     MultiModalityDataPaddingPatternMultimodalTokens,
     general_mm_embed_routine,
 )
@@ -309,7 +306,7 @@ class Qwen2_5_VisionBlock(nnx.Module):
 
     def __init__(
             self,
-            config: Qwen2_5_VLVisionConfig,
+            config: Qwen2_5_VLConfig,
             norm_eps: float = 1e-6,
             dtype: jnp.dtype = jnp.bfloat16,
             rngs: nnx.Rngs = None,
@@ -323,16 +320,16 @@ class Qwen2_5_VisionBlock(nnx.Module):
 
         self.norm1 = norm_layer(dim, dtype=dtype, rngs=rngs)
         self.norm2 = norm_layer(dim, dtype=dtype, rngs=rngs)
-        self.attn = Qwen2_5_VisionAttention(hidden_size=config.hidden_size,
-                                            num_heads=config.num_heads,
+        self.attn = Qwen2_5_VisionAttention(hidden_size=config.vision_config.hidden_size,
+                                            num_heads=config.vision_config.num_heads,
                                             rope_theta=config.rope_theta,
                                             rope_scaling=config.rope_scaling,
-                                            head_dim=config.head_dim,
+                                            head_dim=config.vision_config.hidden_size // config.vision_config.num_heads,
                                             dtype=dtype,
                                             rngs=rngs,
                                             mesh=mesh)
-        self.mlp = Qwen2_5_VisionMLP(hidden_size=config.hidden_size,
-                                     intermediate_size=config.intermediate_size,
+        self.mlp = Qwen2_5_VisionMLP(hidden_size=config.vision_config.hidden_size,
+                                     intermediate_size=config.vision_config.intermediate_size,
                                      dtype=dtype,
                                      rngs=rngs,
                                      mesh=mesh)
@@ -460,43 +457,43 @@ class Qwen2_5_VisionRotaryEmbedding(nnx.Module):
 class Qwen2_5_VisionTransformer(nnx.Module):
 
     def __init__(self,
-                 config: Qwen2_5_VLVisionConfig,
+                 config: Qwen2_5_VLConfig,
                  norm_eps: float = 1e-6,
                  dtype: jnp.dtype = jnp.bfloat16,
                  rngs: nnx.Rngs = None,
                  mesh: Mesh = None):
         # args for get_window_index_thw
-        self.window_size = config.window_size
-        self.patch_size = config.patch_size
-        self.spatial_merge_size = config.spatial_merge_size
-        self.fullatt_block_indexes = config.fullatt_block_indexes
-        self.spatial_merge_unit = config.spatial_merge_size**2
+        self.window_size = config.vision_config.window_size
+        self.patch_size = config.vision_config.patch_size
+        self.spatial_merge_size = config.vision_config.spatial_merge_size
+        self.fullatt_block_indexes = config.vision_config.fullatt_block_indexes
+        self.spatial_merge_unit = config.vision_config.spatial_merge_size**2
 
         self.patch_embed = Qwen2_5_VisionPatchEmbed(
-            patch_size=config.patch_size,
-            temporal_patch_size=config.temporal_patch_size,
-            in_channels=config.in_channels,
-            hidden_size=config.hidden_size,
+            patch_size=config.vision_config.patch_size,
+            temporal_patch_size=config.vision_config.temporal_patch_size,
+            in_channels=config.vision_config.in_channels,
+            hidden_size=config.vision_config.hidden_size,
             dtype=dtype,
             rngs=rngs)
 
-        head_dim = config.hidden_size // config.num_heads
+        head_dim = config.vision_config.hidden_size // config.vision_config.num_heads
         self.rotary_pos_emb = Qwen2_5_VisionRotaryEmbedding(head_dim // 2)
 
-        self.blocks = [
+        self.blocks = nnx.data([
             Qwen2_5_VisionBlock(
                 config=config,
                 norm_eps=norm_eps,
                 dtype=dtype,
                 rngs=rngs,
                 mesh=mesh,
-            ) for _ in range(config.depth)
-        ]
+            ) for _ in range(config.vision_config.depth)
+        ])
         self.merger = Qwen2_5_VisionPatchMerger(
-            d_model=config.out_hidden_size,
-            context_dim=config.hidden_size,
+            d_model=config.vision_config.out_hidden_size,
+            context_dim=config.vision_config.hidden_size,
             norm_layer=partial(nnx.RMSNorm, epsilon=norm_eps),
-            spatial_merge_size=config.spatial_merge_size,
+            spatial_merge_size=config.vision_config.spatial_merge_size,
             dtype=dtype,
             rngs=rngs,
             mesh=mesh,
@@ -675,14 +672,17 @@ class Qwen2_5_VLForConditionalGeneration(nnx.Module):
         self,
         config: Qwen2_5_VLConfig,
         dtype: jnp.dtype = jnp.bfloat16,
-        rngs: jax.Array | None = None,
+        rng_key: jax.Array | None = None,
         mesh: Mesh = None,
     ) -> None:
 
-        self.rng = nnx.Rngs(rngs)
+        self.config = config
+        self.rng = nnx.Rngs(rng_key)
+        self.dtype = dtype
+        self.mesh = mesh
 
         self.visual = Qwen2_5_VisionTransformer(
-            config=config.vision_config,
+            config=config,
             norm_eps=getattr(config, "rms_norm_eps", 1e-6),
             dtype=dtype,
             rngs=self.rng,
@@ -850,22 +850,44 @@ class Qwen2_5_VLForConditionalGeneration(nnx.Module):
         
         # Vision embeddings
         mappings["visual.patch_embed.proj.weight"] = WeightMapping(
-            target_path="visual.patch_embed.proj.weight",
-            sharding=(None, None, None, None),
+            target_path="visual.patch_embed.proj.kernel",
+            sharding=(None, None, None, None, "tensor"),
             transpose=False,
         )
         
-        if hasattr(self.visual, "patch_embed") and hasattr(self.visual.patch_embed, "proj"):
-            if hasattr(self.visual.patch_embed.proj, "bias"):
-                mappings["visual.patch_embed.proj.bias"] = WeightMapping(
-                    target_path="visual.patch_embed.proj.bias",
-                    sharding=(None,),
-                    transpose=False,
-                )
+        # Note: In the model definition, use_bias=False is set for the proj Conv layer
+        # So we don't need to map the bias parameter
+        
+        # Add merger mappings
+        mappings["visual.merger.ln_q.weight"] = WeightMapping(
+            target_path="visual.merger.ln_q.scale",
+            sharding=(None,),
+            transpose=False,
+        )
+        mappings["visual.merger.mlp.0.weight"] = WeightMapping(
+            target_path="visual.merger.mlp_fc1.weight",
+            sharding=(None, "tensor"),
+            transpose=True,
+        )
+        mappings["visual.merger.mlp.0.bias"] = WeightMapping(
+            target_path="visual.merger.mlp_fc1.bias",
+            sharding=("tensor",),
+            transpose=False,
+        )
+        mappings["visual.merger.mlp.2.weight"] = WeightMapping(
+            target_path="visual.merger.mlp_fc2.weight",
+            sharding=("tensor", None),
+            transpose=True,
+        )
+        mappings["visual.merger.mlp.2.bias"] = WeightMapping(
+            target_path="visual.merger.mlp_fc2.bias",
+            sharding=(None,),
+            transpose=False,
+        )
         
         # Vision transformer layers
         if hasattr(self.config, "vision_config"):
-            num_vision_layers = getattr(self.config.vision_config, "num_hidden_layers", 0)
+            num_vision_layers = getattr(self.config.vision_config, "depth", 0)
             for layer_idx in range(num_vision_layers):
                 vision_layer_mappings = self._create_vision_layer_mappings(layer_idx)
                 mappings.update(vision_layer_mappings)
@@ -895,23 +917,23 @@ class Qwen2_5_VLForConditionalGeneration(nnx.Module):
             ),
             # Attention QKV projection
             f"{prefix}.attn.qkv.weight": WeightMapping(
-                target_path=f"{target_prefix}.attn.qkv.weight",
+                target_path=f"{target_prefix}.attn.qkv_proj.weight",
                 sharding=(None, "tensor"),
                 transpose=True,
             ),
             f"{prefix}.attn.qkv.bias": WeightMapping(
-                target_path=f"{target_prefix}.attn.qkv.bias",
+                target_path=f"{target_prefix}.attn.qkv_proj.bias",
                 sharding=("tensor",),
                 transpose=False,
             ),
             # Attention output projection
             f"{prefix}.attn.proj.weight": WeightMapping(
-                target_path=f"{target_prefix}.attn.proj.weight",
+                target_path=f"{target_prefix}.attn.o_proj.weight",
                 sharding=("tensor", None),
                 transpose=True,
             ),
             f"{prefix}.attn.proj.bias": WeightMapping(
-                target_path=f"{target_prefix}.attn.proj.bias",
+                target_path=f"{target_prefix}.attn.o_proj.bias",
                 sharding=(None,),
                 transpose=False,
             ),
@@ -921,24 +943,36 @@ class Qwen2_5_VLForConditionalGeneration(nnx.Module):
                 sharding=(None,),
                 transpose=False,
             ),
-            # MLP layers
-            f"{prefix}.mlp.fc1.weight": WeightMapping(
-                target_path=f"{target_prefix}.mlp.fc1.weight",
+            # MLP gate projection
+            f"{prefix}.mlp.gate_proj.weight": WeightMapping(
+                target_path=f"{target_prefix}.mlp.gate_proj.weight",
                 sharding=(None, "tensor"),
                 transpose=True,
             ),
-            f"{prefix}.mlp.fc1.bias": WeightMapping(
-                target_path=f"{target_prefix}.mlp.fc1.bias",
+            f"{prefix}.mlp.gate_proj.bias": WeightMapping(
+                target_path=f"{target_prefix}.mlp.gate_proj.bias",
                 sharding=("tensor",),
                 transpose=False,
             ),
-            f"{prefix}.mlp.fc2.weight": WeightMapping(
-                target_path=f"{target_prefix}.mlp.fc2.weight",
+            # MLP up projection
+            f"{prefix}.mlp.up_proj.weight": WeightMapping(
+                target_path=f"{target_prefix}.mlp.up_proj.weight",
+                sharding=(None, "tensor"),
+                transpose=True,
+            ),
+            f"{prefix}.mlp.up_proj.bias": WeightMapping(
+                target_path=f"{target_prefix}.mlp.up_proj.bias",
+                sharding=("tensor",),
+                transpose=False,
+            ),
+            # MLP down projection
+            f"{prefix}.mlp.down_proj.weight": WeightMapping(
+                target_path=f"{target_prefix}.mlp.down_proj.weight",
                 sharding=("tensor", None),
                 transpose=True,
             ),
-            f"{prefix}.mlp.fc2.bias": WeightMapping(
-                target_path=f"{target_prefix}.mlp.fc2.bias",
+            f"{prefix}.mlp.down_proj.bias": WeightMapping(
+                target_path=f"{target_prefix}.mlp.down_proj.bias",
                 sharding=(None,),
                 transpose=False,
             ),

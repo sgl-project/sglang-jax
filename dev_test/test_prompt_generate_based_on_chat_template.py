@@ -88,7 +88,7 @@ def test_qwen2_vl_template():
             role="user",
             content=[
                 MockTextContent(text="描述这张图片"),
-                MockImageContent(url="https://github.com/sgl-project/sglang-jax/blob/main/test/srt/example_image.png?raw=true")
+                MockImageContent(url="https://github.com/IS-Model-Framework/sglang-jax/blob/dev/vl/test/srt/example_image.png?raw=true")
             ]
         )
     ]
@@ -97,7 +97,7 @@ def test_qwen2_vl_template():
     print("  - role: user")
     print("  - content:")
     print("    - type: text, text: '描述这张图片'")
-    print("    - type: image_url, url: 'https://github.com/sgl-project/sglang-jax/blob/main/test/srt/example_image.png?raw=true'")
+    print("    - type: image_url, url: 'https://github.com/IS-Model-Framework/sglang-jax/blob/dev/vl/test/srt/example_image.png?raw=true")
     
     print("\n【步骤 3】生成 conversation")
     print("-" * 80)
@@ -215,7 +215,7 @@ def test_different_chat_templates():
             role="user",
             content=[
                 MockTextContent(text="描述这张图片"),
-                MockImageContent(url="https://github.com/sgl-project/sglang-jax/blob/main/test/srt/example_image.png?raw=true")
+                MockImageContent(url="https://github.com/IS-Model-Framework/sglang-jax/blob/dev/vl/test/srt/example_image.png?raw=true")
             ]
         )
     ]

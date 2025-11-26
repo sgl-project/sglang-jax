@@ -221,7 +221,7 @@ class MultimodalDataItem:
         """
         Set the pad value after first hashing the data
         """
-        from sgl_jax.srt.managers.mm_utils import hash_feature
+        from sgl_jax.srt.multimodal.mm_utils import hash_feature
 
         if self.hash is None:
             if self.feature is not None:

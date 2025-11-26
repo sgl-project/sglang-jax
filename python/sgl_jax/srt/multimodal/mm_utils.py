@@ -29,6 +29,13 @@ from sgl_jax.utils import logger
 # propagation that can cause some log messages (like 'server is fired up') to not appear
 # in the console when multimodal support is enabled.
 
+def has_valid_data(data) -> bool:
+    if data is None:
+        return False
+    if isinstance(data, list):
+        return any(has_valid_data(item) for item in flatten_nested_list(data))
+    return True
+    
 
 class MultiModalityDataPaddingPattern:
     """
