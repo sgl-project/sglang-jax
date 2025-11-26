@@ -31,6 +31,8 @@ from sgl_jax.srt.utils.common_utils import get_bool_env_var, retry
 DEFAULT_MODEL_NAME_FOR_TEST = "Qwen/Qwen3-8B"
 DEFAULT_SMALL_MODEL_NAME_FOR_TEST = "Qwen/Qwen3-1.7B"
 QWEN3_8B = "Qwen/Qwen3-8B"
+QWEN_7B = "Qwen/Qwen-7B"
+
 QWEN3_MOE_30B = "Qwen/Qwen3-30B-A3B"
 QWEN2_5_7B_INSTRUCT = "Qwen/Qwen2.5-7B-Instruct"
 QWEN3_CODER_30B_A3B_INSTRUCT = "Qwen/Qwen3-Coder-30B-A3B-Instruct"
