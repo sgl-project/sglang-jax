@@ -170,6 +170,10 @@ class ModelWorkerClient:
             model_worker_batch
         )
 
+        # Prepare LoRA batch if LoRA is enabled
+        if self.server_args.enable_lora:
+            self.get_model_runner().lora_manager.prepare_lora_batch(model_worker_batch)
+
         # Push a new batch to the queue (JAX handles synchronization automatically)
         self.input_queue.put(
             (
