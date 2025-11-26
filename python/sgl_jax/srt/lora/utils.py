@@ -6,9 +6,6 @@ import jax
 
 @dataclass
 class LoRABatchInfo:
-    # Batch size
-    bs: int
-
     # scaling of each lora adapter, in shape (num_tokens,)
     scalings: jax.Array
 
