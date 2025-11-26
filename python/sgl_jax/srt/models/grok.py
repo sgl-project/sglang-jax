@@ -677,17 +677,15 @@ class Grok1Model(nnx.Module):
             )
             layers_kv_fused.append(kv_fused)
         # Apply final normalization (matching PyTorch fused_dual_residual_rmsnorm)
-        if deferred_norm is not None:
-            assert residual is not None
-            hidden_states, _ = dual_rmsnorm_forward(
-                hidden_states,
-                residual,
-                cast(jax.Array, deferred_norm.scale),
-                cast(jax.Array, self.norm.scale),
-                deferred_norm.epsilon,
-            )
-        else:
-            raise RuntimeError("Deferred RMSNorm state must be available after final layer.")
+        assert deferred_norm is not None
+        assert residual is not None
+        hidden_states, _ = dual_rmsnorm_forward(
+            hidden_states,
+            residual,
+            cast(jax.Array, deferred_norm.scale),
+            cast(jax.Array, self.norm.scale),
+            deferred_norm.epsilon,
+        )
 
         return hidden_states, layers_kv_fused
 
@@ -918,14 +916,9 @@ class Grok1ForCausalLM(nnx.Module):
                 ]
             )
 
-            if target_name == "wo":
-                sharding: tuple[str | None, ...] = (
-                    "expert",
-                    "tensor",
-                    None,
-                )
-            else:
-                sharding = ("expert", None, "tensor")
+            sharding = (
+                ("expert", "tensor", None) if target_name == "wo" else ("expert", None, "tensor")
+            )
 
             if name == "w2":
                 # w2 (down_proj) -> wo: HF shape (8192, 2048), concat -> (8192, 16384), transpose -> (16384, 8192)

@@ -115,3 +115,34 @@ ignore = [
 
 [tool.ruff.format]
 docstring-code-format = true
+
+[tool.mypy]
+files = [
+    "python/sgl_jax/srt/models/grok.py"
+]
+
+python_version = "3.12"
+
+show_error_codes = true
+
+warn_unused_configs = true
+warn_redundant_casts = true
+
+allow_redefinition = true
+
+# Gradual rollout settings
+check_untyped_defs = true
+no_implicit_optional = true
+
+# Don't be too strict with third-party dependencies
+# (JAX / transformers / tiktoken / numpy, etc.)
+ignore_missing_imports = true
+follow_imports = "silent"
+
+# Disable some noisy error codes for now
+# (we can enable them later as the codebase gets cleaner)
+disable_error_code = [
+    "attr-defined",
+    "name-defined",
+    "annotation-unchecked"
+]

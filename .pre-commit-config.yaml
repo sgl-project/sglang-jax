@@ -72,3 +72,34 @@ repos:
         args:
           - '--keep-output'
           - '--extra-keys=metadata.kernelspec metadata.language_info.version'
+
+  - repo: https://github.com/pre-commit/mirrors-mypy
+    rev: 9f70dc58c23dfcca1b97af99eaeee3140a807c7e
+    hooks:
+      - id: mypy
+        additional_dependencies: [
+          # package list reference: python/sgl_jax/check_env.py, python/pyproject.toml
+          # sglang-jax,
+          # jax,
+          # jaxlib,
+          # triton,
+          # transformers,
+          # numpy,
+          # aiohttp,
+          # fastapi,
+          # huggingface_hub,
+          # modelscope,
+          # orjson,
+          # packaging,
+          # psutil,
+          # pydantic,
+          # python-multipart,
+          # pyzmq,
+          # uvicorn,
+          # uvloop,
+          # openai,
+          # tiktoken,
+          flax
+        ]
+        args: ["--config", "python/pyproject.toml"]
+        pass_filenames: false
