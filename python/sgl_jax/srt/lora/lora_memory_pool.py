@@ -94,6 +94,7 @@ class LoRAMemoryPool:
         num_attention_heads: int = 32,
         num_kv_heads: int = 32,
         head_dim: int | None = None,
+        original_num_kv_heads: int | None = None,
         tp_size: int = 1,
     ):
         """
@@ -109,8 +110,10 @@ class LoRAMemoryPool:
             hidden_size: Model hidden dimension
             intermediate_size: FFN intermediate dimension
             num_attention_heads: Number of attention heads
-            num_kv_heads: Number of KV heads (for GQA)
-            tp_size: Tensor parallelism size
+            num_kv_heads: Number of KV heads AFTER replication (for GQA)
+            head_dim: Head dimension (optional)
+            original_num_kv_heads: Original number of KV heads BEFORE replication (optional)
+            tp_size: Tensor parallel size (for calculating replication)
         """
         self.max_loras_per_batch = max_loras_per_batch
         self.max_lora_rank = max_lora_rank
@@ -123,7 +126,22 @@ class LoRAMemoryPool:
         self.num_attention_heads = num_attention_heads
         self.num_kv_heads = num_kv_heads
         self.head_dim = head_dim if head_dim is not None else (hidden_size // num_attention_heads)
+
+        # Store original count and calculate replication info
+        self.original_num_kv_heads = (
+            original_num_kv_heads if original_num_kv_heads is not None else num_kv_heads
+        )
         self.tp_size = tp_size
+
+        # Calculate if replication is needed and how many replicas
+        if tp_size > self.original_num_kv_heads:
+            self.needs_kv_replication = True
+            self.num_kv_replicas = (
+                tp_size + self.original_num_kv_heads - 1
+            ) // self.original_num_kv_heads
+        else:
+            self.needs_kv_replication = False
+            self.num_kv_replicas = 1
 
         # CPU-side tracking (not in pytree)
         # These are mutable Python objects used for bookkeeping
@@ -158,7 +176,10 @@ class LoRAMemoryPool:
             "num_attention_heads": self.num_attention_heads,
             "num_kv_heads": self.num_kv_heads,
             "head_dim": self.head_dim,
+            "original_num_kv_heads": self.original_num_kv_heads,
             "tp_size": self.tp_size,
+            "needs_kv_replication": self.needs_kv_replication,
+            "num_kv_replicas": self.num_kv_replicas,
             "module_names": module_names,
             "uid_to_buffer_id": self.uid_to_buffer_id,
             "buffer_id_to_uid": self.buffer_id_to_uid,
@@ -182,7 +203,10 @@ class LoRAMemoryPool:
         obj.num_attention_heads = aux_data["num_attention_heads"]
         obj.num_kv_heads = aux_data["num_kv_heads"]
         obj.head_dim = aux_data.get("head_dim", obj.hidden_size // obj.num_attention_heads)
-        obj.tp_size = aux_data["tp_size"]
+        obj.original_num_kv_heads = aux_data.get("original_num_kv_heads", aux_data["num_kv_heads"])
+        obj.tp_size = aux_data.get("tp_size", 1)
+        obj.needs_kv_replication = aux_data.get("needs_kv_replication", False)
+        obj.num_kv_replicas = aux_data.get("num_kv_replicas", 1)
         obj.uid_to_buffer_id = aux_data["uid_to_buffer_id"]
         obj.buffer_id_to_uid = aux_data["buffer_id_to_uid"]
 
@@ -217,39 +241,21 @@ class LoRAMemoryPool:
 
         Returns: (max_loras_per_batch, max_lora_rank, input_dim)
 
-        Sharding strategy (for row-parallel layers like o_proj, down_proj):
-        - Shard input dimension across TP
+        Note: Shape is global in JAX. Sharding is controlled by sharding spec,
+        not by dividing dimensions in the shape.
         """
-        if module_name == "qkv_proj":
-            # Input: hidden_size
+        if module_name == "qkv_proj" or module_name in ["q_proj", "k_proj", "v_proj"]:
+            # Input: hidden_size (column-parallel, input not sharded)
             input_dim = self.hidden_size
-            if self.tp_size > 1:
-                # Column-parallel: input NOT sharded
-                pass
-        elif module_name in ["q_proj", "k_proj", "v_proj"]:
-            # Input: hidden_size (column-parallel)
-            input_dim = self.hidden_size
-            if self.tp_size > 1:
-                # Column-parallel: input NOT sharded
-                pass
         elif module_name == "o_proj":
-            # Input: num_attention_heads * head_dim (from concatenated heads)
+            # Input: num_attention_heads * head_dim (row-parallel, input sharded by TP)
             input_dim = self.num_attention_heads * self.head_dim
-            if self.tp_size > 1:
-                # Row-parallel: input sharded
-                input_dim = input_dim // self.tp_size
         elif module_name == "gate_up_proj":
-            # Input: hidden_size
+            # Input: hidden_size (column-parallel, input not sharded)
             input_dim = self.hidden_size
-            if self.tp_size > 1:
-                # Column-parallel: input NOT sharded
-                pass
         elif module_name == "down_proj":
-            # Input: intermediate_size
+            # Input: intermediate_size (row-parallel, input sharded by TP)
             input_dim = self.intermediate_size
-            if self.tp_size > 1:
-                # Row-parallel: input sharded
-                input_dim = input_dim // self.tp_size
         else:
             # Default: hidden_size
             input_dim = self.hidden_size
@@ -262,29 +268,30 @@ class LoRAMemoryPool:
 
         Returns: (max_loras_per_batch, output_dim, max_lora_rank)
 
-        Sharding strategy (for column-parallel layers like qkv_proj, gate_up_proj):
-        - Shard output dimension across TP
+        Note: Shape is global in JAX. Sharding is controlled by sharding spec,
+        not by dividing dimensions in the shape.
         """
         if module_name == "qkv_proj":
             # Output: (num_heads * head_dim) for Q, K, V combined
-            # Q heads + KV heads
+            # Q heads + KV heads (column-parallel, output sharded by TP)
             output_dim = (self.num_attention_heads + 2 * self.num_kv_heads) * self.head_dim
         elif module_name == "q_proj":
-            # Output: num_attention_heads * head_dim
+            # Output: num_attention_heads * head_dim (column-parallel, output sharded by TP)
             output_dim = self.num_attention_heads * self.head_dim
         elif module_name in ["k_proj", "v_proj"]:
-            # Output: num_kv_heads * head_dim (for GQA models)
+            # Output: num_kv_heads * head_dim (column-parallel, output sharded by TP)
             output_dim = self.num_kv_heads * self.head_dim
         elif module_name == "o_proj":
-            # Output: hidden_size
+            # Output: hidden_size (row-parallel, output not sharded)
             output_dim = self.hidden_size
         elif module_name == "gate_up_proj":
-            # Output: intermediate_size * 2 (gate and up combined)
+            # Output: intermediate_size * 2 (column-parallel, output sharded by TP)
             output_dim = self.intermediate_size * 2
         elif module_name == "down_proj":
-            # Output: hidden_size
+            # Output: hidden_size (row-parallel, output not sharded)
             output_dim = self.hidden_size
         elif module_name in ["gate_proj", "up_proj"]:
+            # Output: intermediate_size (column-parallel, output sharded by TP)
             output_dim = self.intermediate_size
         else:
             # Default: hidden_size
@@ -294,9 +301,6 @@ class LoRAMemoryPool:
 
     def _get_lora_a_sharding(self, module_name: str) -> NamedSharding:
         """Get sharding spec for LoRA A matrix."""
-        # Only shard if tp_size > 1
-        if self.tp_size == 1:
-            return NamedSharding(self.mesh, P(None, None, None))
         # Row-parallel layers: shard input dimension
         if module_name in {"o_proj", "down_proj"}:
             # Shape: (batch, rank, input_dim)
@@ -308,11 +312,16 @@ class LoRAMemoryPool:
 
     def _get_lora_b_sharding(self, module_name: str) -> NamedSharding:
         """Get sharding spec for LoRA B matrix."""
-        # Only shard if tp_size > 1
-        if self.tp_size == 1:
-            return NamedSharding(self.mesh, P(None, None, None))
         # Column-parallel layers: shard output dimension
-        if module_name in {"qkv_proj", "gate_up_proj", "q_proj", "k_proj", "v_proj", "gate_proj", "up_proj"}:
+        if module_name in {
+            "qkv_proj",
+            "gate_up_proj",
+            "q_proj",
+            "k_proj",
+            "v_proj",
+            "gate_proj",
+            "up_proj",
+        }:
             # Shape: (batch, output_dim, rank)
             # Shard output_dim across tensor axis
             return NamedSharding(self.mesh, P(None, "tensor", None))
@@ -482,6 +491,14 @@ class LoRAMemoryPool:
                         lora_a = self._handle_rank_mismatch(lora_a, is_lora_a=True)
                         lora_b = self._handle_rank_mismatch(lora_b, is_lora_a=False)
 
+                        # Handle KV head replication for k_proj/v_proj
+                        lora_a = self._replicate_kv_lora_weight(
+                            lora_a, is_lora_a=True, module_name=module_name
+                        )
+                        lora_b = self._replicate_kv_lora_weight(
+                            lora_b, is_lora_a=False, module_name=module_name
+                        )
+
                         # Load into buffer
                         self.A_buffer[module_name][layer_id] = (
                             self.A_buffer[module_name][layer_id].at[buffer_id].set(lora_a)
@@ -578,6 +595,9 @@ class LoRAMemoryPool:
         - lora_A: Concatenate along rank dimension (axis 0)
         - lora_B: Concatenate along output dimension (axis 0)
 
+        NOTE: When KV head replication is needed, k_proj and v_proj weights
+        are replicated BEFORE concatenation.
+
         Returns:
             Concatenated (lora_a_qkv, lora_b_qkv)
         """
@@ -588,12 +608,20 @@ class LoRAMemoryPool:
 
         # Check if all components are present
         if all(x is not None for x in [q_a, k_a, v_a, q_b, k_b, v_b]):
+            # Replicate k_proj and v_proj if needed (before concatenation)
+            k_a = self._replicate_kv_lora_weight(k_a, is_lora_a=True, module_name="k_proj")
+            k_b = self._replicate_kv_lora_weight(k_b, is_lora_a=False, module_name="k_proj")
+            v_a = self._replicate_kv_lora_weight(v_a, is_lora_a=True, module_name="v_proj")
+            v_b = self._replicate_kv_lora_weight(v_b, is_lora_a=False, module_name="v_proj")
+
             # Concatenate A matrices along rank dimension (axis 0)
             # Shape: (rank, hidden_size) -> (3*rank, hidden_size) or similar
+            # Note: k_a and v_a won't change with replication (input is hidden_size)
             lora_a_qkv = jnp.concatenate([q_a, k_a, v_a], axis=0)
 
             # Concatenate B matrices along output dimension (axis 0)
-            # Shape: (head_dim, rank) -> (3*head_dim, rank) or similar
+            # Shape: (head_dim, rank) -> (total_output_dim, rank)
+            # After replication, k_b and v_b have more output dims
             lora_b_qkv = jnp.concatenate([q_b, k_b, v_b], axis=0)
 
             return lora_a_qkv, lora_b_qkv
@@ -710,53 +738,94 @@ class LoRAMemoryPool:
 
         return weight
 
-    def _apply_tp_slice(
+    def _replicate_kv_lora_weight(
         self,
         weight: jax.Array,
-        module_name: str,
-        tp_rank: int,
         is_lora_a: bool,
+        module_name: str,
     ) -> jax.Array:
         """
-        Apply tensor parallel slicing to LoRA weights.
+        Replicate LoRA weights for k_proj/v_proj when KV head replication is needed.
 
-        Sharding strategy:
-        - Row-parallel (o_proj, down_proj): Shard input dimension of lora_A
-        - Column-parallel (qkv_proj, gate_up_proj): Shard output dimension of lora_B
+        This ensures LoRA weights match the base model's KV head replication pattern.
+        When tp_size > original_num_kv_heads, each original KV head is replicated
+        num_kv_replicas times.
 
         Args:
-            weight: LoRA weight tensor
-            module_name: Target module name
-            tp_rank: Tensor parallel rank
+            weight: LoRA weight tensor to replicate
             is_lora_a: True for A matrix, False for B matrix
+            module_name: Module name (should be k_proj or v_proj)
 
         Returns:
-            Sliced weight tensor for this TP rank
+            Replicated weight tensor
+
+        Example:
+            If original_num_kv_heads=4, tp_size=8, num_kv_replicas=2:
+            - Original lora_B shape: (output_dim, rank) where output_dim = 4 * head_dim
+            - After replication: (output_dim, rank) where output_dim = 8 * head_dim
+            - Each of the 4 original heads is replicated 2 times
         """
-        # Row-parallel modules: shard input dimension of lora_A
-        if module_name in {"o_proj", "down_proj"}:
-            if is_lora_a:
-                # lora_A shape: (rank, input_dim)
-                # Shard input_dim across TP ranks
-                input_dim = weight.shape[1]
-                chunk_size = input_dim // self.tp_size
-                start_idx = tp_rank * chunk_size
-                end_idx = start_idx + chunk_size
-                weight = weight[:, start_idx:end_idx]
-            # lora_B: no slicing for row-parallel
+        # Only replicate if needed and for k_proj/v_proj
+        if not self.needs_kv_replication:
+            return weight
 
-        # Column-parallel modules: shard output dimension of lora_B
-        elif module_name in {"qkv_proj", "gate_up_proj"} and not is_lora_a:
+        if module_name not in ["k_proj", "v_proj"]:
+            return weight
+
+        if is_lora_a:
+            # lora_A shape: (rank, input_dim)
+            # Input is hidden_size, doesn't need replication
+            return weight
+        else:
             # lora_B shape: (output_dim, rank)
-            # Shard output_dim across TP ranks
-            output_dim = weight.shape[0]
-            chunk_size = output_dim // self.tp_size
-            start_idx = tp_rank * chunk_size
-            end_idx = start_idx + chunk_size
-            weight = weight[start_idx:end_idx, :]
-            # lora_A: no slicing for column-parallel
+            # output_dim = original_num_kv_heads * head_dim
+            # Need to replicate to: tp_size * head_dim (or num_kv_heads * head_dim)
 
-        return weight
+            output_dim, rank = weight.shape
+
+            # Validate expected shape
+            expected_output_dim = self.original_num_kv_heads * self.head_dim
+            if output_dim != expected_output_dim:
+                logger.warning(
+                    "Unexpected lora_B output_dim for %s: got %d, expected %d (original_kv_heads=%d * head_dim=%d)",
+                    module_name,
+                    output_dim,
+                    expected_output_dim,
+                    self.original_num_kv_heads,
+                    self.head_dim,
+                )
+                # Continue anyway - weight might be from a different config
+
+            # Replicate each head: split by head, then repeat each head num_kv_replicas times
+            # Reshape to (original_num_kv_heads, head_dim, rank)
+            weight_per_head = jnp.reshape(weight, (self.original_num_kv_heads, self.head_dim, rank))
+
+            # Replicate each head
+            replicated_parts = []
+            for head_idx in range(self.original_num_kv_heads):
+                head_weight = weight_per_head[head_idx]  # (head_dim, rank)
+                # Repeat this head num_kv_replicas times
+                for _ in range(self.num_kv_replicas):
+                    replicated_parts.append(head_weight)
+
+            # Concatenate all replicated heads
+            # Shape: (original_num_kv_heads * num_kv_replicas, head_dim, rank)
+            replicated_weight = jnp.stack(replicated_parts, axis=0)
+
+            # Reshape back to (output_dim, rank)
+            final_output_dim = len(replicated_parts) * self.head_dim
+            replicated_weight = jnp.reshape(replicated_weight, (final_output_dim, rank))
+
+            logger.debug(
+                "Replicated %s lora_B: original shape=%s, replicated shape=%s (original_kv_heads=%d, replicas=%d)",
+                module_name,
+                weight.shape,
+                replicated_weight.shape,
+                self.original_num_kv_heads,
+                self.num_kv_replicas,
+            )
+
+            return replicated_weight
 
     def get_buffer_id(self, lora_uid: str | None) -> int:
         """Get buffer slot ID for a given LoRA adapter ID."""

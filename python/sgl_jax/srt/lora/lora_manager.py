@@ -75,11 +75,11 @@ class LoRAManager:
         max_loras_per_batch: int,
         dtype: jnp.dtype,
         mesh: Mesh,
-        tp_size: int = 1,
         max_lora_rank: int | None = None,
         target_modules: set[str] | None = None,
         lora_paths: list[LoRARef] | None = None,
         server_args=None,
+        model_config=None,
     ):
         """
         Initialize LoRA manager.
@@ -90,19 +90,19 @@ class LoRAManager:
             max_loras_per_batch: Maximum number of LoRA adapters in a batch
             dtype: Data type for LoRA weights
             mesh: JAX device mesh for sharding
-            tp_size: Tensor parallelism size
             max_lora_rank: Maximum LoRA rank to support (or None to infer)
             target_modules: Set of target module names (or None to infer)
             lora_paths: Optional list of LoRARef to preload
             server_args: Server arguments (for future use)
+            model_config: ModelConfig instance (for accessing original_num_kv_heads)
         """
         self.base_model = base_model
         self.base_hf_config = base_hf_config
         self.max_loras_per_batch = max_loras_per_batch
         self.dtype = dtype
         self.mesh = mesh
-        self.tp_size = tp_size
         self.server_args = server_args
+        self.model_config = model_config
 
         # Extract model architecture from hf_config
         self.num_layers = base_hf_config.num_hidden_layers
@@ -111,6 +111,17 @@ class LoRAManager:
         self.num_attention_heads = base_hf_config.num_attention_heads
         self.num_kv_heads = getattr(base_hf_config, "num_key_value_heads", self.num_attention_heads)
         self.head_dim = getattr(base_hf_config, "head_dim", None)
+
+        # Get original num_kv_heads and tp_size for replication
+        if model_config is not None:
+            self.original_num_kv_heads = getattr(
+                model_config, "_original_num_key_value_heads", self.num_kv_heads
+            )
+            self.tp_size = mesh.shape.get("tensor", 1) if hasattr(mesh, "shape") else 1
+        else:
+            # Fallback: assume no replication
+            self.original_num_kv_heads = self.num_kv_heads
+            self.tp_size = 1
 
         # Initialize mutable state
         self.init_state(
@@ -248,6 +259,7 @@ class LoRAManager:
             num_attention_heads=self.num_attention_heads,
             num_kv_heads=self.num_kv_heads,
             head_dim=self.head_dim,
+            original_num_kv_heads=self.original_num_kv_heads,
             tp_size=self.tp_size,
         )
         self.memory_pool.init_buffers()
