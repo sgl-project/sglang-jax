@@ -139,12 +139,12 @@ class QwenVLImageProcessor(BaseMultimodalProcessor):
         Qwen2_5_VLForConditionalGeneration,
     ]
 
-    def __init__(self, hf_config, server_args, _processor, _tokenizer, *args, **kwargs):
+    def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
         self.model_type = hf_config.model_type
         if hf_config.model_type == "qwen3_omni_moe":
             hf_config = hf_config.thinker_config
 
-        super().__init__(hf_config, server_args, _processor, _tokenizer, *args, **kwargs)
+        super().__init__(hf_config, server_args, _processor, *args, **kwargs)
 
         self.IM_START_TOKEN_ID = hf_config.vision_start_token_id
         self.IM_END_TOKEN_ID = hf_config.vision_end_token_id
@@ -163,7 +163,7 @@ class QwenVLImageProcessor(BaseMultimodalProcessor):
             ),
             video_token_id=hf_config.video_token_id,
             audio_token_id=self.audio_token_id,
-        ).build(_tokenizer)
+        ).build(_processor)
 
     async def process_mm_data_async(
         self,

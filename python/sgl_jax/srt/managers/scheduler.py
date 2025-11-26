@@ -449,12 +449,22 @@ class Scheduler(
         if server_args.skip_tokenizer_init:
             self.tokenizer = self.processor = None
         else:
-            self.tokenizer = get_tokenizer(
-                server_args.tokenizer_path,
-                tokenizer_mode=server_args.tokenizer_mode,
-                trust_remote_code=server_args.trust_remote_code,
-                revision=server_args.revision,
-            )
+            if self.model_config.is_multimodal:
+                self.processor = get_processor(
+                    server_args.tokenizer_path,
+                    tokenizer_mode=server_args.tokenizer_mode,
+                    trust_remote_code=server_args.trust_remote_code,
+                    revision=server_args.revision,
+                    use_fast=not server_args.disable_fast_image_processor,
+                )
+                self.tokenizer = get_tokenizer_from_processor(self.processor)
+            else:
+                self.tokenizer = get_tokenizer(
+                    server_args.tokenizer_path,
+                    tokenizer_mode=server_args.tokenizer_mode,
+                    trust_remote_code=server_args.trust_remote_code,
+                    revision=server_args.revision,
+                )
 
     def init_memory_pool_and_cache(self):
         server_args = self.server_args

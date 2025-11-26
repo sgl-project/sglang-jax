@@ -70,26 +70,26 @@ class MultimodalSpecialTokens:
 
     combined_regex: Optional[re.Pattern] = None
 
-    def build(self, tokenizer):
-        self.convert_to_strs(tokenizer)
+    def build(self, processor):
+        self.convert_to_strs(processor)
         self.parse_regex()
         self.get_combined_regex()
         return self
 
-    def convert_to_str(self, token: Union[str, int], tokenizer) -> str:
+    def convert_to_str(self, token: Union[str, int], processor) -> str:
         if token is None:
             return token
         if isinstance(token, str):
             return token
-        return tokenizer.convert_ids_to_tokens([token])[0]
+        return processor.tokenizer.convert_ids_to_tokens([token])[0]
 
-    def convert_to_strs(self, tokenizer):
+    def convert_to_strs(self, processor):
         if not self.image_token:
-            self.image_token = self.convert_to_str(self.image_token_id, tokenizer)
+            self.image_token = self.convert_to_str(self.image_token_id, processor)
         if not self.video_token:
-            self.video_token = self.convert_to_str(self.video_token_id, tokenizer)
+            self.video_token = self.convert_to_str(self.video_token_id, processor)
         if not self.audio_token:
-            self.audio_token = self.convert_to_str(self.audio_token_id, tokenizer)
+            self.audio_token = self.convert_to_str(self.audio_token_id, processor)
 
     def get_modality_of_token(self, token: str) -> Optional[Modality]:
         """
@@ -155,11 +155,10 @@ class BaseMultimodalProcessor(ABC):
     models = []
 
     def __init__(
-        self, hf_config, server_args, _processor, _tokenizer, transport_mode, *args, **kwargs
+        self, hf_config, server_args, _processor, transport_mode, *args, **kwargs
     ):
         self.hf_config = hf_config
         self._processor = _processor
-        self._tokenizer = _tokenizer
         self.server_args = server_args
         self.transport_mode = transport_mode
 
@@ -422,7 +421,7 @@ class BaseMultimodalProcessor(ABC):
 
         if isinstance(prompt, list) and return_text:
             assert len(prompt) and isinstance(prompt[0], int)
-            prompt = self._tokenizer.decode(prompt)
+            prompt = self._processor.tokenizer.decode(prompt)
         else:
             prompt = prompt
 
@@ -609,7 +608,7 @@ class BaseMultimodalProcessor(ABC):
         all_items = base_output.organize_results()
         # Handle text-only case
         if not all_items:
-            input_ids = self._tokenizer(
+            input_ids = self._processor.tokenizer(
                 base_output.input_text,
                 return_tensors="np",
                 add_special_tokens=True,
@@ -654,7 +653,7 @@ class BaseMultimodalProcessor(ABC):
 
         # Fallback tokenization if no raw items were processed
         if input_ids is None:
-            input_ids = self._tokenizer(
+            input_ids = self._processor.tokenizer(
                 base_output.input_text,
                 return_tensors="np",
                 add_special_tokens=True,

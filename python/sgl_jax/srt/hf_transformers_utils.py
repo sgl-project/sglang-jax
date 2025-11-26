@@ -8,7 +8,7 @@ from pathlib import Path
 from huggingface_hub import snapshot_download
 from transformers import (
     AutoConfig,
-    AutoImageProcessor,
+    AutoProcessor,
     AutoTokenizer,
     GenerationConfig,
     PretrainedConfig,
@@ -278,23 +278,18 @@ def get_processor(
     if config.model_type not in {"llava", "clip"}:
         kwargs["use_fast"] = use_fast
 
-    tokenizer = AutoTokenizer.from_pretrained(
+    processor = AutoProcessor.from_pretrained(
         tokenizer_name,
-        trust_remote_code=trust_remote_code,
-        revision=revision,
-        use_fast=kwargs.get("use_fast", use_fast),
-    )
-    
-    # Load image processor (without video processor to avoid PyTorch dependency)
-    image_processor = AutoImageProcessor.from_pretrained(
-        tokenizer_name,
+        *args,
         trust_remote_code=trust_remote_code,
         revision=revision,
         **kwargs,
     )
 
+    tokenizer = get_tokenizer_from_processor(processor)
+
     attach_additional_stop_token_ids(tokenizer)
-    return image_processor
+    return processor
 
 
 def attach_additional_stop_token_ids(tokenizer):
