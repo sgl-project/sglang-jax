@@ -314,6 +314,7 @@ class EAGLEWorker(ModelWorker):
         # padding seq_lens_sum
         padded_seq_lens_sum = 0
         seq_lens_sum = np.sum(model_worker_batch.seq_lens)
+        # FIXME move this to precompile when launch server and select properate size when serve
         padding_size_buckets = [1024, 4096, 16384]
         for bucket in padding_size_buckets:
             if bucket >= seq_lens_sum:

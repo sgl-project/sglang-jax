@@ -201,6 +201,7 @@ def build_tree_kernel_efficient_preprocess(
     # token_list   (bs, topk + (step - 1) * topk * topk)
     # parents_list (bs, topk + 1 + (step - 1) * topk)
     # score_tensor = jnp.concatenate(score_list, axis=1)
+    # FIXME this reshape operation should be optimized
     score_tensor = score_tensor.reshape(score_tensor.shape[0], -1)
 
     # ss_token_list = jnp.concatenate(token_list, axis=1)
@@ -211,6 +212,7 @@ def build_tree_kernel_efficient_preprocess(
     draft_tokens = jnp.take_along_axis(ss_token_list, top_scores_index, axis=1)
 
     verified_expanded = jnp.expand_dims(verified_id, axis=1)
+    # FIXME this as type operation should be optimized
     draft_tokens = (
         jnp.concatenate([verified_expanded, draft_tokens], axis=1).flatten().astype(jnp.int32)
     )
