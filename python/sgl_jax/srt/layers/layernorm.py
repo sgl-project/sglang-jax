@@ -40,7 +40,7 @@ class RMSNorm(nnx.Module):
         axis_name: str | None = None,
         axis_index_groups: Any = None,
         use_fast_variance: bool = True,
-        rngs: rnglib.Rngs,
+        rngs: rnglib.Rngs | None = None,
     ):
         feature_shape = (num_features,)
 

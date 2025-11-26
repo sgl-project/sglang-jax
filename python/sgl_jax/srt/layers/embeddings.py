@@ -47,9 +47,9 @@ class Embed(nnx.Module):
         dtype: jnp.dtype | None = None,
         param_dtype: jnp.dtype = jnp.bfloat16,
         promote_dtype: PromoteDtypeFn = dtypes.promote_dtype,
-        kernel_axes: tuple[str, ...] = (None, "tensor"),
-        rngs: nnx.Rngs = None,
-        mesh: jax.sharding.Mesh = None,
+        kernel_axes: tuple[str | None, ...] = (None, "tensor"),
+        rngs: nnx.Rngs | None = None,
+        mesh: jax.sharding.Mesh | None = None,
     ):
         """
         Sets up the embedding parameters for the model.
@@ -139,9 +139,9 @@ class ParallelLMHead(Embed):
         dtype: jnp.dtype | None = None,
         param_dtype: jnp.dtype = jnp.bfloat16,
         promote_dtype: PromoteDtypeFn = dtypes.promote_dtype,
-        kernel_axes: tuple[str, ...] = ("tensor", None),
-        rngs: nnx.Rngs = None,
-        mesh: jax.sharding.Mesh = None,
+        kernel_axes: tuple[str | None, ...] = ("tensor", None),
+        rngs: nnx.Rngs | None = None,
+        mesh: jax.sharding.Mesh | None = None,
         use_bias: bool = False,
     ):
         """
