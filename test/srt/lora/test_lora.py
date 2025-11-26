@@ -328,6 +328,113 @@ class TestLoRA(CustomTestCase):
         finally:
             kill_process_tree(process_with_lora.pid)
 
+    def test_lora_vs_base_difference(self, prompts, lora_set, tp_size, dtype, max_new_tokens):
+        """
+        Test that LoRA actually changes the model output.
+
+        This test verifies that:
+        1. Using the same prompt with LoRA produces different output than without LoRA
+        2. The outputs are deterministic (temperature=0.0)
+        """
+        print("=================== testing LoRA vs base difference =======================")
+        base_path = lora_set["base"]
+        all_lora_paths = lora_set["loras"]
+
+        # Use the first LoRA adapter
+        lora_path = all_lora_paths[0]
+
+        # Launch server with LoRA support
+        base_url = DEFAULT_URL_FOR_TEST
+        server_args = [
+            "--tp-size",
+            str(tp_size),
+            "--dtype",
+            dtype,
+            "--lora-paths",
+            lora_path,
+            "--max-loras-per-batch",
+            "2",
+            "--disable-radix-cache",
+        ]
+
+        process = popen_launch_server(
+            base_path,
+            base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=server_args,
+        )
+
+        try:
+            import requests
+
+            headers = {"Content-Type": "application/json"}
+
+            # Test with the first prompt
+            test_prompt = prompts[0]
+
+            # Get base model output (without LoRA)
+            payload_base = {
+                "text": test_prompt,
+                "sampling_params": {
+                    "max_new_tokens": max_new_tokens,
+                    "temperature": 0.0,
+                },
+            }
+
+            response_base = requests.post(
+                f"{base_url}/generate",
+                json=payload_base,
+                headers=headers,
+                timeout=60,
+            )
+            self.assertEqual(response_base.status_code, 200)
+            base_output = response_base.json()
+
+            # Get LoRA output (with LoRA)
+            payload_lora = {
+                "text": test_prompt,
+                "sampling_params": {
+                    "max_new_tokens": max_new_tokens,
+                    "temperature": 0.0,
+                },
+                "lora_name": lora_path,
+            }
+
+            response_lora = requests.post(
+                f"{base_url}/generate",
+                json=payload_lora,
+                headers=headers,
+                timeout=60,
+            )
+            self.assertEqual(response_lora.status_code, 200)
+            lora_output = response_lora.json()
+
+            # Verify both produced valid outputs
+            self.assertIn("text", base_output)
+            self.assertIn("text", lora_output)
+
+            base_text = base_output["text"]
+            lora_text = lora_output["text"]
+
+            # Print outputs for inspection
+            print(f"\nPrompt: {test_prompt[:80]}...")
+            print(f"\nBase model output:\n{base_text}")
+            print(f"\nLoRA model output:\n{lora_text}")
+
+            # Assert that outputs are different
+            # This is the key test: LoRA should change the model's behavior
+            self.assertNotEqual(
+                base_text,
+                lora_text,
+                "LoRA output should differ from base model output! "
+                "If they are the same, LoRA is not being applied correctly.",
+            )
+
+            print("\n✓ SUCCESS: LoRA produces different output than base model")
+
+        finally:
+            kill_process_tree(process.pid)
+
     def test_all(self):
         for lora_set in LORA_SETS:
             for dtype in DTYPES:
@@ -336,6 +443,7 @@ class TestLoRA(CustomTestCase):
                 self.inference(PROMPTS, lora_set, tp_size, dtype, max_new_tokens)
                 self.serving(PROMPTS, lora_set, tp_size, dtype, max_new_tokens)
                 self.base_inference(PROMPTS, lora_set, tp_size, dtype, max_new_tokens)
+                self.test_lora_vs_base_difference(PROMPTS, lora_set, tp_size, dtype, max_new_tokens)
 
 
 if __name__ == "__main__":
