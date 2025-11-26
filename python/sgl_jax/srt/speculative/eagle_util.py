@@ -211,10 +211,13 @@ def build_tree_kernel_efficient_preprocess(
     draft_tokens = jnp.take_along_axis(ss_token_list, top_scores_index, axis=1)
 
     verified_expanded = jnp.expand_dims(verified_id, axis=1)
-    draft_tokens = jnp.concatenate([verified_expanded, draft_tokens], axis=1).flatten()
-
+    draft_tokens = (
+        jnp.concatenate([verified_expanded, draft_tokens], axis=1).flatten().astype(jnp.int32)
+    )
+    print(f"{speculative_num_steps=}")
+    print(f"{(topk + 1 + (speculative_num_steps - 2) * topk)=}")
     if speculative_num_steps > 1:
-        parent_list = parents_list[:][topk + 1 + (speculative_num_steps - 2) * topk]
+        parent_list = parents_list[:, : (topk + 1 + (speculative_num_steps - 2) * topk)]
     else:
         batch_size = parents_list.shape[0]
         parent_list = jnp.full((batch_size, 1), -1, dtype=jnp.int32)
@@ -248,19 +251,11 @@ def _build_tree_kernel_efficient_core(
     tree_mask_mode: int,
     speculative_num_steps: int,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
-    parent_list, top_scores_index, draft_tokens = build_tree_kernel_efficient_preprocess(
-        verified_id,
-        score_list,
-        token_list,
-        parents_list,
-        num_verify_tokens,
-        topk,
-        speculative_num_steps,
-    )
+
     tree_mask, positions, retrive_index, retrive_next_token, retrive_next_sibling = (
         build_eagle_tree_structure(
-            parent_list=parent_list,
-            selected_index=top_scores_index,
+            parent_list=parents_list,
+            selected_index=score_list,
             verified_seq_len=seq_lens,
             draft_token_num=num_verify_tokens,
             topk=topk,
@@ -276,7 +271,7 @@ def _build_tree_kernel_efficient_core(
         retrive_index,
         retrive_next_token,
         retrive_next_sibling,
-        draft_tokens,
+        token_list,
     )
 
 
@@ -383,10 +378,19 @@ def build_tree_kernel_efficient(
         tuple of (tree_mask, positions, retrive_index, retrive_next_token,
                  retrive_next_sibling, draft_tokens)
     """
-
-    print(f"{score_list.shape=}")
-    print(f"{token_list.shape=}")
-    print(f"{parents_list.shape=}")
+    parent_list, top_scores_index, draft_tokens = build_tree_kernel_efficient_preprocess(
+        verified_id,
+        score_list,
+        token_list,
+        parents_list,
+        num_verify_tokens,
+        topk,
+        speculative_num_steps,
+    )
+    print("==========================")
+    print(f"{parent_list.shape=}")
+    print(f"{top_scores_index.shape=}")
+    print(f"{draft_tokens.shape=}")
 
     # Get batch size
     # for compatibility, 0.6.3 need to use use_mesh. set_mesh is not have __entry__ attribute.
@@ -408,9 +412,9 @@ def build_tree_kernel_efficient(
             draft_tokens,
         ) = _build_tree_kernel_efficient_core(
             verified_id,
-            score_list,
-            token_list,
-            parents_list,
+            top_scores_index,
+            draft_tokens,
+            parent_list,
             seq_lens,
             seq_lens_sum,
             padded_seq_lens_sum=padded_seq_lens_sum,
@@ -569,8 +573,8 @@ class EagleDraftInput:
         model_worker_batch.spec_info.capture_hidden_mode = CaptureHiddenMode.LAST
         model_worker_batch.forward_mode = ForwardMode.DRAFT_EXTEND
         model_worker_batch.spec_info.hidden_states = batch_output.next_draft_input.hidden_states
-        forward_metadata = draft_model_runner.attn_backend.get_forward_metadata(
-            model_worker_batch, is_eagle=True
+        forward_metadata = draft_model_runner.attn_backend.get_eagle_forward_metadata(
+            model_worker_batch
         )
         draft_model_runner.attn_backend.forward_metadata = forward_metadata
         from sgl_jax.srt.layers.logits_processor import LogitsMetadata

@@ -627,7 +627,7 @@ class EAGLEWorker(ModelWorker):
             # FIXME(pc) this should always be forward_batch ? because it has same shape
             if padded_token_len is None:
                 # First step: pad once to precompile shapes and reuse the buffers.
-                model_worker_batch.input_ids = np.asarray(input_ids)
+                model_worker_batch.input_ids = np.asarray(input_ids, dtype=np.int32)
                 model_worker_batch.spec_info.hidden_states = hidden_states
                 model_worker_batch.positions = positions_steps[i]
                 model_worker_batch.padding_model_worker_batch(
@@ -641,7 +641,7 @@ class EAGLEWorker(ModelWorker):
                     model_worker_batch, self.draft_model_runner.mesh
                 )
             else:
-                model_worker_batch.input_ids[:real_tokens] = np.asarray(input_ids)
+                model_worker_batch.input_ids[:real_tokens] = np.asarray(input_ids, dtype=np.int32)
                 model_worker_batch.spec_info.hidden_states = hidden_states
                 positions_view[:] = positions_steps[i]
 
