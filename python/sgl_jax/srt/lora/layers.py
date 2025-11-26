@@ -82,7 +82,8 @@ class LoRALinear(BaseLayerWithLoRA):
         self.A_buffer = A_buffer
         self.B_buffer = B_buffer
 
-    def apply_lora(self, base_output: jax.Array, x: jax.Array) -> jax.Array:
+    def apply_lora(self, operands) -> jax.Array:
+        base_output, x = operands
         lora_a_output = self.lora_backend.run_lora_a_gemm(x, self.A_buffer)
         lora_output = self.lora_backend.run_lora_b_gemm(
             x=lora_a_output,
@@ -101,14 +102,7 @@ class LoRALinear(BaseLayerWithLoRA):
         Returns:
             Output tensor with LoRA delta added (if enabled) and bias from base_model
         """
-        # Base layer computation (preserves original behavior)
-        output_bias = jax.lax.cond(
-            not self.base_layer.skip_bias_add,
-            lambda operands: operands[0],
-            lambda operands: None,
-            (self.base_layer.bias),
-        )
-        base_output = self.base_layer(x)
+        base_output, output_bias = self.base_layer(x)
 
         output = jax.lax.cond(
             self.set_lora, self.apply_lora, lambda operands: operands[0], (base_output, x)

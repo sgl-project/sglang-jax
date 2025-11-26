@@ -21,14 +21,14 @@ import logging
 import jax.numpy as jnp
 from jax.sharding import Mesh
 
-from python.sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
+from python.sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch
 from sgl_jax.srt.layers.linear import LinearBase
 from sgl_jax.srt.lora.layers import BaseLayerWithLoRA
 from sgl_jax.srt.lora.lora import ChunkedSgmvLoRABackend, LoRAAdapter
 from sgl_jax.srt.lora.lora_config import LoRAConfig
 from sgl_jax.srt.lora.lora_memory_pool import LoRAMemoryPool
 from sgl_jax.srt.lora.lora_registry import LoRARef
-from sgl_jax.srt.lora.utils import LoRAType, get_target_module_name
+from sgl_jax.srt.lora.utils import get_target_module_name
 
 logger = logging.getLogger(__name__)
 
@@ -259,14 +259,14 @@ class LoRAManager:
                 target_module = get_target_module_name(module_name, self.memory_pool.target_modules)
                 module.set_lora_info(
                     self.memory_pool.get_tensor(
-                        target_module=target_module,
+                        module_name=target_module,
                         layer_id=layer_id,
-                        lora_type=LoRAType.LORA_A,
+                        is_lora_a=True,
                     ),
                     self.memory_pool.get_tensor(
-                        target_module=target_module,
+                        module_name=target_module,
                         layer_id=layer_id,
-                        lora_type=LoRAType.LORA_B,
+                        is_lora_a=False,
                     ),
                 )
 
@@ -355,7 +355,7 @@ class LoRAManager:
         """Check if memory pool can support the given LoRA config."""
         return self.memory_pool.can_support(config)
 
-    def prepare_lora_batch(self, forward_batch: ForwardBatch):
+    def prepare_lora_batch(self, model_worker_batch: ModelWorkerBatch):
         """
         Prepare LoRA batch for inference.
 
@@ -369,7 +369,7 @@ class LoRAManager:
             ValueError: If batch exceeds max_loras_per_batch or adapter not loaded
         """
         # Load active loras into lora memory pool
-        cur_uids = set(forward_batch.lora_ids)
+        cur_uids = set(model_worker_batch.lora_ids)
 
         assert len(cur_uids) <= self.max_loras_per_batch
 
@@ -379,18 +379,20 @@ class LoRAManager:
             lora_adapters=self.loras,
         )
 
-        weight_indices = [0] * len(forward_batch.lora_ids)
+        weight_indices = [0] * len(model_worker_batch.lora_ids)
         lora_ranks = [0] * self.max_loras_per_batch
         scalings = [0] * self.max_loras_per_batch
-        for i, uid in enumerate(forward_batch.lora_ids):
+        # print(f"{self.loras=}")
+        for i, uid in enumerate(model_worker_batch.lora_ids):
             weight_indices[i] = self.memory_pool.get_buffer_id(uid)
-            if uid is not None:
+            if uid is not None and len(self.loras) > 0:
+                # print(f"{uid=}")
                 lora = self.loras[uid]
                 lora_ranks[weight_indices[i]] = lora.config.r
                 scalings[weight_indices[i]] = lora.scaling
 
         self.lora_backend.prepare_lora_batch(
-            forward_batch=forward_batch,
+            model_worker_batch=model_worker_batch,
             weight_indices=weight_indices,
             lora_ranks=lora_ranks,
             scalings=scalings,
@@ -584,10 +586,8 @@ class LoRAManager:
             logger.warning("No LoRA modules to verify")
             return
 
-        logger.info("Verifying sharding preservation...")
-
         for layer_idx, layer_modules in enumerate(self.lora_modules):
-            for module_name, module in layer_modules:
+            for module_name, module in layer_modules.items():
                 try:
                     # Check if base layer kernel has sharding
                     if hasattr(module.base_layer, "kernel"):
