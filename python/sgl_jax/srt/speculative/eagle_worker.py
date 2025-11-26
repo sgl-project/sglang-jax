@@ -79,7 +79,6 @@ class EAGLEWorker(ModelWorker):
         self.target_worker = target_worker
         self.topk = server_args.speculative_eagle_topk
         self.speculative_num_steps = server_args.speculative_num_steps
-        self.topk = server_args.speculative_eagle_topk
         self.speculative_num_draft_tokens = server_args.speculative_num_draft_tokens
         self.page_size = server_args.page_size
         self.speculative_algorithm = SpeculativeAlgorithm.from_string(
@@ -150,8 +149,6 @@ class EAGLEWorker(ModelWorker):
         self.precompile_bs_paddings = precompile_bs_paddings
         self.precompile_cache_loc_paddings = precompile_cache_loc_paddings
         self.precompile_token_paddings = precompile_token_paddings
-        # Cache forward metadata for speculative draft decode to avoid rebuilding per-step.
-        self._draft_forward_metadata_cache: dict[tuple, object] = {}
 
     def forward_batch_speculative_generation(
         self,
@@ -240,8 +237,8 @@ class EAGLEWorker(ModelWorker):
         forward_batch.return_logprob = False
 
         # Set forward_metadata for draft_model_runner's attention backend
-        forward_metadata = self.draft_model_runner.attn_backend.get_forward_metadata(
-            model_worker_batch, is_eagle=True
+        forward_metadata = self.draft_model_runner.attn_backend.get_eagle_forward_metadata(
+            model_worker_batch
         )
         self.draft_model_runner.attn_backend.forward_metadata = forward_metadata
         forward_batch.forward_mode = ForwardMode.EXTEND
@@ -297,46 +294,6 @@ class EAGLEWorker(ModelWorker):
             else None
         )
 
-    @property
-    def draft_model_runner(self):
-        return self.get_model_runner()
-
-    def _draft_forward_metadata_key(
-        self, model_worker_batch: ModelWorkerBatch, speculative_step_id: int
-    ) -> tuple:
-        seq_lens_key = tuple(np.asarray(model_worker_batch.seq_lens, dtype=np.int32).tolist())
-        allocate_lens = getattr(model_worker_batch.spec_info, "allocate_lens", None)
-        alloc_key = (
-            tuple(np.asarray(allocate_lens, dtype=np.int32).tolist())
-            if allocate_lens is not None
-            else ()
-        )
-        cache_loc_key = model_worker_batch.cache_loc.tobytes()
-        return (
-            seq_lens_key,
-            alloc_key,
-            cache_loc_key,
-            int(self.topk),
-            int(speculative_step_id),
-            int(self.page_size),
-        )
-
-    def _get_cached_draft_forward_metadata(
-        self, model_worker_batch: ModelWorkerBatch, speculative_step_id: int
-    ):
-        key = self._draft_forward_metadata_key(model_worker_batch, speculative_step_id)
-        cached = self._draft_forward_metadata_cache.get(key)
-        if cached is not None:
-            return cached
-        metadata = self.draft_model_runner.attn_backend.get_forward_metadata(
-            model_worker_batch,
-            is_eagle=True,
-            speculative_step_id=speculative_step_id,
-            topk=self.topk,
-        )
-        self._draft_forward_metadata_cache[key] = metadata
-        return metadata
-
     def capture_for_decode(
         self, logits_output: LogitsProcessorOutput, draft_input: EagleDraftInput
     ):
@@ -381,6 +338,7 @@ class EAGLEWorker(ModelWorker):
             self.topk,
             self.speculative_num_draft_tokens,
             int(self.req_to_token_pool.req_to_token.shape[1]),
+            model_worker_batch.speculative_num_steps,
             self.mesh,
         )
         # build tree
@@ -410,8 +368,8 @@ class EAGLEWorker(ModelWorker):
             self.precompile_bs_paddings,
             self.precompile_cache_loc_paddings,
         )
-        forward_metadata = self.target_worker.model_runner.attn_backend.get_forward_metadata(
-            model_worker_batch, is_eagle=True
+        forward_metadata = self.target_worker.model_runner.attn_backend.get_eagle_forward_metadata(
+            model_worker_batch
         )
         # custom_mask = forward_metadata.custom_mask
         self.copy_model_worker_batch_to_cpu(model_worker_batch)
@@ -465,6 +423,10 @@ class EAGLEWorker(ModelWorker):
             extend_input_len_per_req=None,
             extend_logprob_start_len_per_req=None,
         )
+
+    @property
+    def draft_model_runner(self):
+        return self.get_model_runner()
 
     def add_logprob_values(
         self,
@@ -609,9 +571,17 @@ class EAGLEWorker(ModelWorker):
         if self.hot_token_ids is not None:
             topk_index = self.hot_token_ids[topk_index]
         # Return values
-        score_list: list[jax.Array] = []
-        token_list: list[jax.Array] = []
-        parents_list: list[jax.Array] = []
+        # score_list   (bs, 1 + (step - 1) * topk  , eagle_topk)
+        # token_list   (bs, topk + (step - 1) * topk * topk)
+        # parents_list (bs, topk + 1 + (step - 1) * topk)
+        bs = model_worker_batch.real_bs
+        step_min_1 = self.speculative_num_steps - 1
+        score_list: jax.Array = jnp.empty((bs, 1 + step_min_1 * self.topk, self.topk))
+        token_list: jax.Array = jnp.empty((bs, self.topk + step_min_1 * self.topk * self.topk))
+        parents_list: jax.Array = jnp.empty((bs, self.topk + 1 + step_min_1 * self.topk))
+        print(f"{score_list.shape=}")
+        print(f"{token_list.shape=}")
+        print(f"{parents_list.shape=}")
         # Forward multiple steps
         scores = None
         # Save positions template once to avoid rebuilding per step
@@ -626,18 +596,32 @@ class EAGLEWorker(ModelWorker):
         padded_token_len = None
         positions_view = None
         logits_metadata = None
-        forward_metadata_per_step = [
-            self._get_cached_draft_forward_metadata(model_worker_batch, step)
-            for step in range(max(0, self.speculative_num_steps - 1))
-        ]
+        model_worker_batch.speculative_eagle_topk = self.topk
+        metadata_per_step = self.draft_model_runner.attn_backend.get_eagle_multi_step_metadata(
+            model_worker_batch,
+        )
+        assert isinstance(metadata_per_step, list)
         for i in range(self.speculative_num_steps):
             input_ids, hidden_states, scores, tree_info = select_top_k_tokens(
                 i, topk_p, topk_index, hidden_states, scores, self.topk
             )
-            score_list.append(tree_info[0])
-            token_list.append(tree_info[1])
-            parents_list.append(tree_info[2])
-
+            if i == 0:
+                score_list = score_list.at[:bs, :1, :].set(tree_info[0][:bs])
+                token_list = token_list.at[:bs, : self.topk].set(tree_info[1][:bs])
+                parents_list = parents_list.at[:bs, : self.topk + 1].set(tree_info[2][:bs])
+            else:
+                score_start = 1 + (i - 1) * self.topk
+                token_start = self.topk + (i - 1) * self.topk * self.topk
+                parent_start = self.topk + 1 + (i - 1) * self.topk
+                score_list = score_list.at[:bs, score_start : score_start + self.topk, :].set(
+                    tree_info[0][:bs]
+                )
+                token_list = token_list.at[
+                    :bs, token_start : token_start + self.topk * self.topk
+                ].set(tree_info[1][:bs])
+                parents_list = parents_list.at[:bs, parent_start : parent_start + self.topk].set(
+                    tree_info[2][:bs]
+                )
             if i == self.speculative_num_steps - 1:
                 break
             # FIXME(pc) this should always be forward_batch ? because it has same shape
@@ -672,8 +656,7 @@ class EAGLEWorker(ModelWorker):
                 model_worker_batch.spec_info.hidden_states = jnp.concatenate(
                     [model_worker_batch.spec_info.hidden_states, pad_values], axis=0
                 )
-
-            self.draft_model_runner.attn_backend.forward_metadata = forward_metadata_per_step[i]
+            self.draft_model_runner.attn_backend.forward_metadata = metadata_per_step[i]
             if self.topk > 1:
                 self.draft_model_runner.attn_backend.forward_metadata.custom_mask = (
                     build_tree_mask_for_draft_decode(
@@ -697,18 +680,15 @@ class EAGLEWorker(ModelWorker):
             hidden_states = logits_output.hidden_states[
                 : model_worker_batch.real_bs * self.topk * self.topk, :
             ]
-        for i in range(len(score_list)):
-            # topk = 1
-            score_list[i] = score_list[i][: model_worker_batch.real_bs]
-            token_list[i] = token_list[i][: model_worker_batch.real_bs]
-            parents_list[i] = parents_list[i][: model_worker_batch.real_bs]
-        # Clear metadata cache to avoid stale reuse across batches
-        self._draft_forward_metadata_cache.clear()
+        print(f"{score_list.shape=}")
+        print(f"{token_list.shape=}")
+        print(f"{parents_list.shape=}")
         return score_list, token_list, parents_list
 
     def run_spec_decode_precompile(self):
         self.precompile_spec_extend()
         self.precompile_spec_decode()
+        # FIXME precompile some kernel
 
     def precompile_spec_extend(self):
         start_time = time.perf_counter()
@@ -784,6 +764,9 @@ class EAGLEWorker(ModelWorker):
                 )
                 model_worker_batch.capture_hidden_mode = CaptureHiddenMode.LAST
                 model_worker_batch.spec_info = spec_info
+                model_worker_batch.speculative_eagle_topk = self.topk
+                model_worker_batch.speculative_num_draft_tokens = self.speculative_num_draft_tokens
+                model_worker_batch.speculative_num_steps = self.speculative_num_steps
                 self.forward_batch_speculative_generation(model_worker_batch)
 
         end_time = time.perf_counter()

@@ -180,18 +180,30 @@ def get_last_loc_large_page_size_large_top_k(
     return prefix_lens, new_seq_lens, last_loc, num_new_pages_per_topk, extend_lens
 
 
-@functools.partial(jax.jit, static_argnums=(4,))
+@functools.partial(
+    jax.jit,
+    static_argnums=(
+        4,
+        5,
+        6,
+    ),
+)
 def build_tree_kernel_efficient_preprocess(
     verified_id: jax.Array,
-    score_list: list[jax.Array] | tuple[jax.Array],
-    token_list: list[jax.Array] | tuple[jax.Array],
-    parents_list: list[jax.Array] | tuple[jax.Array],
+    score_tensor: jax.Array,
+    ss_token_list: jax.Array,
+    parents_list: jax.Array,
     num_verify_tokens: int,
+    topk: int,
+    speculative_num_steps: int,
 ):
-    score_tensor = jnp.concatenate(score_list, axis=1)
+    # score_list   (bs, 1 + (step - 1) * topk  , eagle_topk)
+    # token_list   (bs, topk + (step - 1) * topk * topk)
+    # parents_list (bs, topk + 1 + (step - 1) * topk)
+    # score_tensor = jnp.concatenate(score_list, axis=1)
     score_tensor = score_tensor.reshape(score_tensor.shape[0], -1)
 
-    ss_token_list = jnp.concatenate(token_list, axis=1)
+    # ss_token_list = jnp.concatenate(token_list, axis=1)
 
     _, top_scores_index = jax.lax.top_k(score_tensor, num_verify_tokens - 1)
     top_scores_index = jnp.sort(top_scores_index, axis=-1)
@@ -201,10 +213,10 @@ def build_tree_kernel_efficient_preprocess(
     verified_expanded = jnp.expand_dims(verified_id, axis=1)
     draft_tokens = jnp.concatenate([verified_expanded, draft_tokens], axis=1).flatten()
 
-    if len(parents_list) > 1:
-        parent_list = jnp.concatenate(parents_list[:-1], axis=1)
+    if speculative_num_steps > 1:
+        parent_list = parents_list[:][topk + 1 + (speculative_num_steps - 2) * topk]
     else:
-        batch_size = parents_list[0].shape[0]
+        batch_size = parents_list.shape[0]
         parent_list = jnp.full((batch_size, 1), -1, dtype=jnp.int32)
 
     return parent_list, top_scores_index, draft_tokens
@@ -218,13 +230,14 @@ def build_tree_kernel_efficient_preprocess(
         "topk",
         "max_seq_len_per_req",
         "tree_mask_mode",
+        "speculative_num_steps",
     ),
 )
 def _build_tree_kernel_efficient_core(
     verified_id: jax.Array,
-    score_list: tuple[jax.Array, ...],
-    token_list: tuple[jax.Array, ...],
-    parents_list: tuple[jax.Array, ...],
+    score_list: jax.Array,
+    token_list: jax.Array,
+    parents_list: jax.Array,
     seq_lens: jax.Array,
     seq_lens_sum: jax.Array,
     *,
@@ -233,6 +246,7 @@ def _build_tree_kernel_efficient_core(
     topk: int,
     max_seq_len_per_req: int,
     tree_mask_mode: int,
+    speculative_num_steps: int,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
     parent_list, top_scores_index, draft_tokens = build_tree_kernel_efficient_preprocess(
         verified_id,
@@ -240,6 +254,8 @@ def _build_tree_kernel_efficient_core(
         token_list,
         parents_list,
         num_verify_tokens,
+        topk,
+        speculative_num_steps,
     )
     tree_mask, positions, retrive_index, retrive_next_token, retrive_next_sibling = (
         build_eagle_tree_structure(
@@ -338,15 +354,16 @@ def build_tree_mask_for_draft_decode(
 
 def build_tree_kernel_efficient(
     verified_id: jax.Array,
-    score_list: list[jax.Array],
-    token_list: list[jax.Array],
-    parents_list: list[jax.Array],
+    score_list: jax.Array,
+    token_list: jax.Array,
+    parents_list: jax.Array,
     seq_lens: jax.Array,
     seq_lens_sum: jax.Array,
     padded_seq_lens_sum: int,
     topk: int,
     num_verify_tokens: int,
     max_seq_len_per_req: int,
+    speculative_num_steps: int,
     mesh: Mesh,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
     """JAX implementation of build_tree_kernel_efficient.
@@ -366,9 +383,10 @@ def build_tree_kernel_efficient(
         tuple of (tree_mask, positions, retrive_index, retrive_next_token,
                  retrive_next_sibling, draft_tokens)
     """
-    score_list = tuple(score_list)
-    token_list = tuple(token_list)
-    parents_list = tuple(parents_list)
+
+    print(f"{score_list.shape=}")
+    print(f"{token_list.shape=}")
+    print(f"{parents_list.shape=}")
 
     # Get batch size
     # for compatibility, 0.6.3 need to use use_mesh. set_mesh is not have __entry__ attribute.
@@ -400,6 +418,7 @@ def build_tree_kernel_efficient(
             topk=topk,
             max_seq_len_per_req=max_seq_len_per_req,
             tree_mask_mode=0,
+            speculative_num_steps=speculative_num_steps,
         )
 
     return (
