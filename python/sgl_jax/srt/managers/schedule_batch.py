@@ -1368,6 +1368,7 @@ class ScheduleBatch:
             extend_seq_lens=(extend_seq_lens if self.forward_mode == ForwardMode.EXTEND else None),
             extend_logprob_start_lens=extend_logprob_start_lens,
             extend_input_logprob_token_ids=self.extend_input_logprob_token_ids,
+            lora_ids=[req.lora_id for req in self.reqs] + [None] * bs_padding_size,
             real_bs=real_bs,
             capture_hidden_mode=CaptureHiddenMode.NULL,
             launch_done=self.launch_done,
@@ -1688,6 +1689,9 @@ class ModelWorkerBatch:
     extend_prefix_lens: np.ndarray | None
     extend_logprob_start_lens: list[int] | None
     extend_input_logprob_token_ids: np.ndarray | None
+
+    # For LoRA
+    lora_ids: list[str] | None
 
     # For padding
     real_bs: int
