@@ -62,13 +62,16 @@ class BgmvLoRABackend(BaseLoRABackend):
         Returns:
              result with shape (s, output_dim)
         """
-        return base_output + expand(
-            x,
-            weights,
-            self.batch_info.token_lora_indices,
-            (weights.shape[1],),
-            self.max_lora_rank,
-        ).astype(x.dtype)
+        return jnp.add(
+            base_output,
+            expand(
+                x,
+                weights,
+                self.batch_info.token_lora_indices,
+                (weights.shape[1],),
+                self.max_lora_rank,
+            ).astype(x.dtype),
+        )
 
     def run_qkv_lora(
         self,
@@ -112,13 +115,16 @@ class BgmvLoRABackend(BaseLoRABackend):
             x, qkv_lora_a, self.batch_info.token_lora_indices, self.batch_info.scalings
         )
 
-        return base_output + expand(
-            lora_a_output,
-            qkv_lora_b_concated,
-            self.batch_info.token_lora_indices,
-            output_slices,
-            self.max_lora_rank,
-        ).astype(x.dtype)
+        return jnp.add(
+            base_output,
+            expand(
+                lora_a_output,
+                qkv_lora_b_concated,
+                self.batch_info.token_lora_indices,
+                output_slices,
+                self.max_lora_rank,
+            ).astype(x.dtype),
+        )
 
     def run_gate_up_lora(
         self,
@@ -151,13 +157,16 @@ class BgmvLoRABackend(BaseLoRABackend):
             x, gate_up_lora_a, self.batch_info.token_lora_indices, self.batch_info.scalings
         )
 
-        return base_output + expand(
-            lora_a_output,
-            gate_up_lora_b_concated,
-            self.batch_info.token_lora_indices,
-            (gate_up_lora_b_concated.shape[1] // 2, gate_up_lora_b_concated.shape[1] // 2),
-            self.max_lora_rank,
-        ).astype(x.dtype)
+        return jnp.add(
+            base_output,
+            expand(
+                lora_a_output,
+                gate_up_lora_b_concated,
+                self.batch_info.token_lora_indices,
+                (gate_up_lora_b_concated.shape[1] // 2, gate_up_lora_b_concated.shape[1] // 2),
+                self.max_lora_rank,
+            ).astype(x.dtype),
+        )
 
     def prepare_lora_batch(
         self,

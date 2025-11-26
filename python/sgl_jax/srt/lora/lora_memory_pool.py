@@ -261,27 +261,29 @@ class LoRAMemoryPool:
             head_dim = self.hidden_size // self.num_attention_heads
             # Q heads + KV heads
             output_dim = (self.num_attention_heads + 2 * self.num_kv_heads) * head_dim
-            if self.tp_size > 1:
-                # Column-parallel: output sharded
-                output_dim = output_dim // self.tp_size
+            # if self.tp_size > 1:
+            #     # Column-parallel: output sharded
+            #     output_dim = output_dim // self.tp_size
         elif module_name == "o_proj":
             # Output: hidden_size
             output_dim = self.hidden_size
-            if self.tp_size > 1:
-                # Row-parallel: output NOT sharded
-                pass
+            # if self.tp_size > 1:
+            #     # Row-parallel: output NOT sharded
+            #     pass
         elif module_name == "gate_up_proj":
             # Output: intermediate_size * 2 (gate and up combined)
             output_dim = self.intermediate_size * 2
-            if self.tp_size > 1:
-                # Column-parallel: output sharded
-                output_dim = output_dim // self.tp_size
+            # if self.tp_size > 1:
+            #     # Column-parallel: output sharded
+            #     output_dim = output_dim // self.tp_size
         elif module_name == "down_proj":
             # Output: hidden_size
             output_dim = self.hidden_size
-            if self.tp_size > 1:
-                # Row-parallel: output NOT sharded
-                pass
+            # if self.tp_size > 1:
+            #     # Row-parallel: output NOT sharded
+            #     pass
+        elif module_name in ["gate_proj", "up_proj"]:
+            output_dim = self.intermediate_size
         else:
             # Default: hidden_size
             output_dim = self.hidden_size
@@ -405,78 +407,110 @@ class LoRAMemoryPool:
             buffer_id: Buffer slot index
             lora_adapter: LoRA adapter object (None for base model)
         """
-        if uid is None:
-            # Base model: zero out the buffer slot
-            logger.debug("Loading base model (zeros) into buffer slot %d", buffer_id)
-            for module_name in self.target_modules:
-                for layer_id in range(self.num_layers):
-                    # Zero out A buffer
-                    self.A_buffer[module_name][layer_id] = (
-                        self.A_buffer[module_name][layer_id].at[buffer_id].set(0)
-                    )
-                    # Zero out B buffer
-                    self.B_buffer[module_name][layer_id] = (
-                        self.B_buffer[module_name][layer_id].at[buffer_id].set(0)
-                    )
-            return
 
-        if lora_adapter is None:
-            logger.warning("LoRA adapter %s is None, loading zeros", uid)
-            # Treat as base model if adapter is None
-            for module_name in self.target_modules:
-                for layer_id in range(self.num_layers):
-                    self.A_buffer[module_name][layer_id] = (
-                        self.A_buffer[module_name][layer_id].at[buffer_id].set(0)
-                    )
-                    self.B_buffer[module_name][layer_id] = (
-                        self.B_buffer[module_name][layer_id].at[buffer_id].set(0)
-                    )
-            return
+        def get_ab_zero_matrix_shape(module_name: str):
+            _, max_lora_rank, input_dim = self._get_lora_a_shape(module_name)
+            a_zero_matrix_shape = (max_lora_rank, input_dim)
+            _, output_dim, max_lora_rank = self._get_lora_b_shape(module_name)
+            b_zero_matrix_shape = (output_dim, max_lora_rank)
+            # jax.device_put(jnp.zeros(a_zero_matrix_shape,dtype=self.dtype), self._get_lora_a_sharding)
+            return a_zero_matrix_shape, b_zero_matrix_shape
 
-        logger.debug("Loading LoRA adapter %s into buffer slot %d", uid, buffer_id)
+        with jax.set_mesh(self.mesh):
+            if uid is None:
+                # Base model: zero out the buffer slot
+                logger.debug("Loading base model (zeros) into buffer slot %d", buffer_id)
+                for module_name in self.target_modules:
+                    for layer_id in range(self.num_layers):
+                        a_shape, b_shape = get_ab_zero_matrix_shape(module_name)
+                        # Zero out A buffer
+                        self.A_buffer[module_name][layer_id] = (
+                            self.A_buffer[module_name][layer_id]
+                            .at[buffer_id]
+                            .set(jnp.zeros(a_shape, dtype=self.dtype))
+                        )
+                        # Zero out B buffer
+                        self.B_buffer[module_name][layer_id] = (
+                            self.B_buffer[module_name][layer_id]
+                            .at[buffer_id]
+                            .set(jnp.zeros(b_shape, dtype=self.dtype))
+                        )
+                return
 
-        # Get TP rank for distributed inference
-        tp_rank = jax.process_index() if self.tp_size > 1 else 0
+            if lora_adapter is None:
+                logger.warning("LoRA adapter %s is None, loading zeros", uid)
+                # Treat as base model if adapter is None
+                for module_name in self.target_modules:
+                    a_shape, b_shape = get_ab_zero_matrix_shape(module_name)
+                    for layer_id in range(self.num_layers):
+                        self.A_buffer[module_name][layer_id] = (
+                            self.A_buffer[module_name][layer_id]
+                            .at[buffer_id]
+                            .set(jnp.zeros(a_shape, dtype=self.dtype))
+                        )
+                        self.B_buffer[module_name][layer_id] = (
+                            self.B_buffer[module_name][layer_id]
+                            .at[buffer_id]
+                            .set(jnp.zeros(b_shape, dtype=self.dtype))
+                        )
+                return
 
-        # Process each layer
-        for layer_id in range(self.num_layers):
-            layer_weights = lora_adapter.layers[layer_id].weights
+            logger.debug("Loading LoRA adapter %s into buffer slot %d", uid, buffer_id)
 
-            # Process each target module
-            for module_name in self.target_modules:
-                # Extract and load weights for this module
-                lora_a, lora_b = self._extract_module_weights(layer_weights, layer_id, module_name)
+            # Process each layer
+            for layer_id in range(self.num_layers):
+                layer_weights = lora_adapter.layers[layer_id].weights
 
-                if lora_a is not None and lora_b is not None:
-                    # Handle rank padding/slicing
-                    lora_a = self._handle_rank_mismatch(lora_a, is_lora_a=True)
-                    lora_b = self._handle_rank_mismatch(lora_b, is_lora_a=False)
-
-                    # Apply TP slicing if needed
-                    if self.tp_size > 1:
-                        lora_a = self._apply_tp_slice(lora_a, module_name, tp_rank, is_lora_a=True)
-                        lora_b = self._apply_tp_slice(lora_b, module_name, tp_rank, is_lora_a=False)
-
-                    # Load into buffer
-                    self.A_buffer[module_name][layer_id] = (
-                        self.A_buffer[module_name][layer_id].at[buffer_id].set(lora_a)
+                # Process each target module
+                for module_name in self.target_modules:
+                    a_shape, b_shape = get_ab_zero_matrix_shape(module_name)
+                    # Extract and load weights for this module
+                    lora_a, lora_b = self._extract_module_weights(
+                        layer_weights, layer_id, module_name
                     )
-                    self.B_buffer[module_name][layer_id] = (
-                        self.B_buffer[module_name][layer_id].at[buffer_id].set(lora_b)
-                    )
-                else:
-                    # Module not found in adapter weights, zero out
-                    logger.debug(
-                        "Module %s not found in layer %d weights, zeroing buffer",
-                        module_name,
-                        layer_id,
-                    )
-                    self.A_buffer[module_name][layer_id] = (
-                        self.A_buffer[module_name][layer_id].at[buffer_id].set(0)
-                    )
-                    self.B_buffer[module_name][layer_id] = (
-                        self.B_buffer[module_name][layer_id].at[buffer_id].set(0)
-                    )
+
+                    if lora_a is not None and lora_b is not None:
+                        # Handle rank padding/slicing
+                        lora_a = self._handle_rank_mismatch(lora_a, is_lora_a=True)
+                        lora_b = self._handle_rank_mismatch(lora_b, is_lora_a=False)
+
+                        # Apply TP slicing if needed
+                        # if self.tp_size > 1:
+                        #     lora_a = self._apply_tp_slice(lora_a, module_name, tp_rank, is_lora_a=True)
+                        #     lora_b = self._apply_tp_slice(lora_b, module_name, tp_rank, is_lora_a=False)
+
+                        # # Get target sharding for the slice (remove first axis from buffer sharding)
+                        # a_buffer_sharding = self.A_buffer[module_name][layer_id].sharding
+                        # b_buffer_sharding = self.B_buffer[module_name][layer_id].sharding
+
+                        # # Place weights with appropriate sharding before set operation
+                        # lora_a = jax.device_put(lora_a, a_buffer_sharding)
+                        # lora_b = jax.device_put(lora_b, b_buffer_sharding)
+
+                        # Load into buffer
+                        self.A_buffer[module_name][layer_id] = (
+                            self.A_buffer[module_name][layer_id].at[buffer_id].set(lora_a)
+                        )
+                        self.B_buffer[module_name][layer_id] = (
+                            self.B_buffer[module_name][layer_id].at[buffer_id].set(lora_b)
+                        )
+                    else:
+                        # Module not found in adapter weights, zero out
+                        logger.debug(
+                            "Module %s not found in layer %d weights, zeroing buffer",
+                            module_name,
+                            layer_id,
+                        )
+                        self.A_buffer[module_name][layer_id] = (
+                            self.A_buffer[module_name][layer_id]
+                            .at[buffer_id]
+                            .set(jnp.zeros(a_shape, dtype=self.dtype))
+                        )
+                        self.B_buffer[module_name][layer_id] = (
+                            self.B_buffer[module_name][layer_id]
+                            .at[buffer_id]
+                            .set(jnp.zeros(b_shape, dtype=self.dtype))
+                        )
 
     def _extract_module_weights(
         self,

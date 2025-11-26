@@ -28,7 +28,7 @@ from sgl_jax.srt.lora.lora import ChunkedSgmvLoRABackend, LoRAAdapter
 from sgl_jax.srt.lora.lora_config import LoRAConfig
 from sgl_jax.srt.lora.lora_memory_pool import LoRAMemoryPool
 from sgl_jax.srt.lora.lora_registry import LoRARef
-from sgl_jax.srt.lora.utils import LoRAType, get_target_module_name
+from sgl_jax.srt.lora.utils import get_target_module_name
 
 logger = logging.getLogger(__name__)
 
@@ -259,14 +259,14 @@ class LoRAManager:
                 target_module = get_target_module_name(module_name, self.memory_pool.target_modules)
                 module.set_lora_info(
                     self.memory_pool.get_tensor(
-                        target_module=target_module,
+                        module_name=target_module,
                         layer_id=layer_id,
-                        lora_type=LoRAType.LORA_A,
+                        is_lora_a=True,
                     ),
                     self.memory_pool.get_tensor(
-                        target_module=target_module,
+                        module_name=target_module,
                         layer_id=layer_id,
-                        lora_type=LoRAType.LORA_B,
+                        is_lora_a=False,
                     ),
                 )
 
@@ -382,9 +382,11 @@ class LoRAManager:
         weight_indices = [0] * len(forward_batch.lora_ids)
         lora_ranks = [0] * self.max_loras_per_batch
         scalings = [0] * self.max_loras_per_batch
+        # print(f"{self.loras=}")
         for i, uid in enumerate(forward_batch.lora_ids):
             weight_indices[i] = self.memory_pool.get_buffer_id(uid)
-            if uid is not None:
+            if uid is not None and len(self.loras) > 0:
+                # print(f"{uid=}")
                 lora = self.loras[uid]
                 lora_ranks[weight_indices[i]] = lora.config.r
                 scalings[weight_indices[i]] = lora.scaling
@@ -584,10 +586,8 @@ class LoRAManager:
             logger.warning("No LoRA modules to verify")
             return
 
-        logger.info("Verifying sharding preservation...")
-
         for layer_idx, layer_modules in enumerate(self.lora_modules):
-            for module_name, module in layer_modules:
+            for module_name, module in layer_modules.items():
                 try:
                     # Check if base layer kernel has sharding
                     if hasattr(module.base_layer, "kernel"):
