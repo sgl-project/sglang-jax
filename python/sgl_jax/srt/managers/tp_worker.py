@@ -234,6 +234,9 @@ class ModelWorker:
                     ForwardMode.EXTEND,
                     self.precompile_cache_loc_paddings[-1],
                 )
+                # Prepare LoRA batch if LoRA is enabled
+                if self.server_args.enable_lora:
+                    self.get_model_runner().lora_manager.prepare_lora_batch(model_worker_batch)
                 sampling_metadata = SamplingMetadata.from_model_worker_batch(
                     model_worker_batch,
                     0,
@@ -273,6 +276,9 @@ class ModelWorker:
                     ForwardMode.DECODE,
                     aligned_cache_loc_size,
                 )
+                # Prepare LoRA batch if LoRA is enabled
+                if self.server_args.enable_lora:
+                    self.get_model_runner().lora_manager.prepare_lora_batch(model_worker_batch)
                 sampling_metadata = SamplingMetadata.from_model_worker_batch(
                     model_worker_batch, 0, self.mesh, self.model_config.vocab_size
                 )
@@ -345,6 +351,7 @@ class ModelWorker:
 
         valid_cache_loc = np.arange(bs)
         invalid_cache_loc = np.array([0] * (invalid_cache_loc_size), dtype=jnp.int32)
+        lora_ids = [0] if bs == 1 else [0] * (bs // 2) + [None] * (bs - bs // 2)
 
         return ModelWorkerBatch(
             bid=1,
@@ -374,6 +381,7 @@ class ModelWorker:
             extend_logprob_start_lens=None,
             capture_hidden_mode=CaptureHiddenMode.NULL,
             spec_algorithm=speculative_algotithm,
+            lora_ids=lora_ids,
         )
 
     def get_model_runner(self):
