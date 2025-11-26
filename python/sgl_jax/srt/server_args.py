@@ -985,13 +985,11 @@ class ServerArgs:
         # Validate max_loras_per_batch
         assert self.max_loras_per_batch > 0, "max_loras_per_batch must be positive"
 
-        # Auto-enable LoRA if lora_paths are provided
-        if self.lora_paths and self.enable_lora is None:
+        # If lora_paths are provided, auto-enable LoRA
+        if self.lora_paths:
             self.enable_lora = True
             logger.info("Auto-enabling LoRA because lora_paths are provided")
-
-        # Early return if LoRA is not enabled
-        if not self.enable_lora:
+        elif not self.enable_lora:
             return
 
         # Normalize lora_paths to List[LoRARef]
