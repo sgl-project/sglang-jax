@@ -93,6 +93,7 @@ class LoRAMemoryPool:
         intermediate_size: int = 11008,
         num_attention_heads: int = 32,
         num_kv_heads: int = 32,
+        head_dim: int | None = None,
         tp_size: int = 1,
     ):
         """
@@ -121,6 +122,7 @@ class LoRAMemoryPool:
         self.intermediate_size = intermediate_size
         self.num_attention_heads = num_attention_heads
         self.num_kv_heads = num_kv_heads
+        self.head_dim = head_dim if head_dim is not None else (hidden_size // num_attention_heads)
         self.tp_size = tp_size
 
         # CPU-side tracking (not in pytree)
@@ -155,6 +157,7 @@ class LoRAMemoryPool:
             "intermediate_size": self.intermediate_size,
             "num_attention_heads": self.num_attention_heads,
             "num_kv_heads": self.num_kv_heads,
+            "head_dim": self.head_dim,
             "tp_size": self.tp_size,
             "module_names": module_names,
             "uid_to_buffer_id": self.uid_to_buffer_id,
@@ -178,6 +181,7 @@ class LoRAMemoryPool:
         obj.intermediate_size = aux_data["intermediate_size"]
         obj.num_attention_heads = aux_data["num_attention_heads"]
         obj.num_kv_heads = aux_data["num_kv_heads"]
+        obj.head_dim = aux_data.get("head_dim", obj.hidden_size // obj.num_attention_heads)
         obj.tp_size = aux_data["tp_size"]
         obj.uid_to_buffer_id = aux_data["uid_to_buffer_id"]
         obj.buffer_id_to_uid = aux_data["buffer_id_to_uid"]
@@ -222,9 +226,15 @@ class LoRAMemoryPool:
             if self.tp_size > 1:
                 # Column-parallel: input NOT sharded
                 pass
-        elif module_name == "o_proj":
-            # Input: hidden_size (from concatenated heads)
+        elif module_name in ["q_proj", "k_proj", "v_proj"]:
+            # Input: hidden_size (column-parallel)
             input_dim = self.hidden_size
+            if self.tp_size > 1:
+                # Column-parallel: input NOT sharded
+                pass
+        elif module_name == "o_proj":
+            # Input: num_attention_heads * head_dim (from concatenated heads)
+            input_dim = self.num_attention_heads * self.head_dim
             if self.tp_size > 1:
                 # Row-parallel: input sharded
                 input_dim = input_dim // self.tp_size
@@ -257,10 +267,14 @@ class LoRAMemoryPool:
         """
         if module_name == "qkv_proj":
             # Output: (num_heads * head_dim) for Q, K, V combined
-            # head_dim = hidden_size // num_attention_heads
-            head_dim = self.hidden_size // self.num_attention_heads
             # Q heads + KV heads
-            output_dim = (self.num_attention_heads + 2 * self.num_kv_heads) * head_dim
+            output_dim = (self.num_attention_heads + 2 * self.num_kv_heads) * self.head_dim
+        elif module_name == "q_proj":
+            # Output: num_attention_heads * head_dim
+            output_dim = self.num_attention_heads * self.head_dim
+        elif module_name in ["k_proj", "v_proj"]:
+            # Output: num_kv_heads * head_dim (for GQA models)
+            output_dim = self.num_kv_heads * self.head_dim
         elif module_name == "o_proj":
             # Output: hidden_size
             output_dim = self.hidden_size
@@ -280,6 +294,9 @@ class LoRAMemoryPool:
 
     def _get_lora_a_sharding(self, module_name: str) -> NamedSharding:
         """Get sharding spec for LoRA A matrix."""
+        # Only shard if tp_size > 1
+        if self.tp_size == 1:
+            return NamedSharding(self.mesh, P(None, None, None))
         # Row-parallel layers: shard input dimension
         if module_name in {"o_proj", "down_proj"}:
             # Shape: (batch, rank, input_dim)
@@ -291,8 +308,11 @@ class LoRAMemoryPool:
 
     def _get_lora_b_sharding(self, module_name: str) -> NamedSharding:
         """Get sharding spec for LoRA B matrix."""
+        # Only shard if tp_size > 1
+        if self.tp_size == 1:
+            return NamedSharding(self.mesh, P(None, None, None))
         # Column-parallel layers: shard output dimension
-        if module_name in {"qkv_proj", "gate_up_proj"}:
+        if module_name in {"qkv_proj", "gate_up_proj", "q_proj", "k_proj", "v_proj", "gate_proj", "up_proj"}:
             # Shape: (batch, output_dim, rank)
             # Shard output_dim across tensor axis
             return NamedSharding(self.mesh, P(None, "tensor", None))

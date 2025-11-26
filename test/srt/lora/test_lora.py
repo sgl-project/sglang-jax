@@ -175,7 +175,6 @@ class TestLoRA(CustomTestCase):
             *all_lora_paths,
             "--max-loras-per-batch",
             "3",
-            "--disable-cuda-graph",
             "--disable-radix-cache",
         ]
 

@@ -110,6 +110,7 @@ class LoRAManager:
         self.intermediate_size = getattr(base_hf_config, "intermediate_size", self.hidden_size * 4)
         self.num_attention_heads = base_hf_config.num_attention_heads
         self.num_kv_heads = getattr(base_hf_config, "num_key_value_heads", self.num_attention_heads)
+        self.head_dim = getattr(base_hf_config, "head_dim", None)
 
         # Initialize mutable state
         self.init_state(
@@ -246,6 +247,7 @@ class LoRAManager:
             intermediate_size=self.intermediate_size,
             num_attention_heads=self.num_attention_heads,
             num_kv_heads=self.num_kv_heads,
+            head_dim=self.head_dim,
             tp_size=self.tp_size,
         )
         self.memory_pool.init_buffers()
@@ -385,7 +387,7 @@ class LoRAManager:
         # print(f"{self.loras=}")
         for i, uid in enumerate(model_worker_batch.lora_ids):
             weight_indices[i] = self.memory_pool.get_buffer_id(uid)
-            if uid is not None and len(self.loras) > 0:
+            if uid is not None and uid in self.loras:
                 # print(f"{uid=}")
                 lora = self.loras[uid]
                 lora_ranks[weight_indices[i]] = lora.config.r
