@@ -1195,10 +1195,6 @@ class Scheduler(
                 self.page_size,
             )
 
-            # Prepare LoRA batch if LoRA is enabled
-            if self.server_args.enable_lora:
-                self.tp_worker.get_model_runner().lora_manager.prepare_lora_batch(batch)
-
             if self.enable_overlap:
                 # Pre-initialize ForwardBatch for overlap scheduling optimization
                 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
