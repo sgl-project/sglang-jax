@@ -277,6 +277,9 @@ class Qwen2Model(nnx.Module):
             param_dtype=dtype,
         )
 
+    def get_input_embeddings(self):
+        return self.embed_tokens
+
     def __call__(
         self,
         forward_batch: ForwardBatch,

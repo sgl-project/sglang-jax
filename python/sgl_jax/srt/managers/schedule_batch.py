@@ -1049,10 +1049,9 @@ class ScheduleBatch:
                 elif isinstance(pixel_values, np.ndarray):
                     # Convert numpy array to JAX array if needed
                     mm_item.feature = jnp.asarray(pixel_values)
-                elif isinstance(pixel_values, CudaIpcTensorTransportProxy):
-                    # Handle IPC proxy - convert to JAX array
-                    # Note: This assumes the proxy can provide data as numpy or similar
-                    mm_item.feature = pixel_values.reconstruct_on_target_device()
+                else:
+                    # For other types, try to convert to JAX array
+                    mm_item.feature = jnp.asarray(pixel_values)
         self.multimodal_inputs = multimodal_inputs
 
         if self.return_logprob:

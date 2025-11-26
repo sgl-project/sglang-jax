@@ -555,7 +555,7 @@ def tensor_hash(tensor_list) -> int:
 
 def hash_feature(f):
     if isinstance(f, list):
-        if isinstance(f[0], jax.Array):
+        if len(f) > 0 and isinstance(f[0], jax.Array):
             return tensor_hash(f)
         return data_hash(tuple(flatten_nested_list(f)))
     elif isinstance(f, np.ndarray):
@@ -564,4 +564,8 @@ def hash_feature(f):
         return data_hash(arr_bytes)
     elif isinstance(f, jax.Array):
         return tensor_hash([f])
-    return data_hash(f)
+    elif isinstance(f, (bytes, bytearray)):
+        return data_hash(f)
+    else:
+        # For other types, try to convert to bytes
+        return data_hash(str(f).encode())

@@ -21,6 +21,7 @@ from dataclasses import dataclass
 from enum import IntEnum, auto
 from functools import total_ordering
 from typing import TYPE_CHECKING
+import numpy as np
 
 import jax
 import jax.numpy as jnp
@@ -177,6 +178,7 @@ class ForwardBatch:
     capture_hidden_mode: CaptureHiddenMode = None
     # For multimodal
     mm_inputs: Optional[List[MultimodalInputs]] = None
+    mrope_positions: jax.Array | None = None
 
     # Encoder-Decoder specific fields
     attention_mask: jax.Array | None = None
@@ -198,6 +200,7 @@ class ForwardBatch:
             self.lora_token_indices,
             self.lora_ranks,
             self.spec_info,
+            self.mrope_positions,
             self.attention_mask,
         )
 
@@ -236,10 +239,11 @@ class ForwardBatch:
         obj.lora_token_indices = children[11]
         obj.lora_ranks = children[12]
         obj.spec_info = children[13]
+        obj.mrope_positions = children[14]
 
         # Handle optional children for backward compatibility
-        if len(children) > 14:
-            obj.attention_mask = children[14]
+        if len(children) > 15:
+            obj.attention_mask = children[15]
         else:
             obj.attention_mask = None
 
@@ -408,6 +412,28 @@ class ForwardBatch:
             or self.contains_image_inputs()
         )
 
+    def _expand_mrope_from_input(
+        self,
+        mm_input: MultimodalInputs,
+        seq_len: int,
+    ) -> jax.Array:
+        """
+        Expand mrope positions from multimodal input for decode mode.
+        In JAX, device placement is handled automatically.
+        """
+        # Convert to JAX array if needed
+        if isinstance(mm_input.mrope_position_delta, np.ndarray):
+            mrope_position_delta = jnp.asarray(mm_input.mrope_position_delta)
+        else:
+            mrope_position_delta = mm_input.mrope_position_delta
+
+        mrope_position_deltas = mrope_position_delta.flatten()
+        # Add seq_len - 1 to deltas and repeat for 3 dimensions (T, H, W)
+        mrope_positions = jnp.tile(
+            (mrope_position_deltas + seq_len - 1)[jnp.newaxis, :], (3, 1)
+        )
+        return mrope_positions
+
     def _compute_mrope_positions(
         self, model_runner: ModelRunner, batch: ModelWorkerBatch
     ):
@@ -426,7 +452,7 @@ class ForwardBatch:
                     )
                 else:
                     mrope_positions = self._expand_mrope_from_input(
-                        mm_input, self.seq_lens[batch_idx], model_runner.device
+                        mm_input, self.seq_lens[batch_idx]
                     )
                     mrope_positions_list[batch_idx] = mrope_positions
             elif self.forward_mode.is_extend():

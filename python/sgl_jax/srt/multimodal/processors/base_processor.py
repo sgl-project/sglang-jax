@@ -8,9 +8,8 @@ from abc import ABC, abstractmethod
 from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
 
 import jax
-import jax.numpy as jnp
+import numpy as np
 from PIL import Image
-from transformers import BaseImageProcessorFast
 
 from sgl_jax.srt.managers.schedule_batch import Modality, MultimodalDataItem
 from sgl_jax.srt.utils import (
@@ -238,25 +237,17 @@ class BaseMultimodalProcessor(ABC):
                 kwargs["audios"] = audios
 
         processor = self._processor
-        if (
-            hasattr(processor, "image_processor")
-            and isinstance(processor.image_processor, BaseImageProcessorFast)
-            and not self.server_args.disable_fast_image_processor
-        ):
-            # https://github.com/huggingface/transformers/blob/main/src/transformers/utils/type_validators.py
-            kwargs["device"] = "xla"
         result = processor.__call__(
             text=[input_text],
             padding=True,
-            return_tensors="np",
+            return_tensors="pt",
             **kwargs,
         )
         if not self.server_args.keep_mm_feature_on_device:
             # move feature tensors to cpu
             for feature_name in self.FEATURE_NAMES:
-                if feature_name in result and isinstance(
-                    jnp.asarray(result[feature_name]), jnp.ndarray
-                ):
+                if feature_name in result and hasattr(result[feature_name], 'to'):
+                    # Check if it's a tensor-like object with a 'to' method (PyTorch tensor)
                     result[feature_name] = result[feature_name].to("cpu")
 
         return result
@@ -520,14 +511,16 @@ class BaseMultimodalProcessor(ABC):
             mm_token_id = 3
             return result = [(2,4),(6,7)]
         """
-        mask = input_ids == mm_token_id
+        # Use numpy to avoid JAX initialization in async context
+        input_ids_np = np.asarray(input_ids)
+        mask = input_ids_np == mm_token_id
         # Detect start positions of contiguous runs of the mm token
-        start_mask = jnp.logical_and(mask, jnp.logical_not(jnp.roll(mask, 1)))
+        start_mask = np.logical_and(mask, np.logical_not(np.roll(mask, 1)))
         # Detect end positions of contiguous runs of the mm token
-        end_mask = jnp.logical_and(mask, jnp.logical_not(jnp.roll(mask, -1)))
+        end_mask = np.logical_and(mask, np.logical_not(np.roll(mask, -1)))
 
-        start_positions = jnp.nonzero(start_mask, size=None)[0]
-        end_positions = jnp.nonzero(end_mask, size=None)[0]
+        start_positions = np.nonzero(start_mask)[0]
+        end_positions = np.nonzero(end_mask)[0]
 
         return list(zip(start_positions.tolist(), end_positions.tolist()))
 
@@ -535,8 +528,10 @@ class BaseMultimodalProcessor(ABC):
     def get_mm_items_offset_by_pair(
         input_ids: jax.Array, mm_start_id: int, mm_end_id: int
     ) -> List[Tuple[int, int]]:
-        indices_start = jnp.nonzero(input_ids == mm_start_id, size=None)[0] + 1
-        indices_end = jnp.nonzero(input_ids == mm_end_id, size=None)[0] - 1
+        # Use numpy to avoid JAX initialization in async context
+        input_ids_np = np.asarray(input_ids)
+        indices_start = np.nonzero(input_ids_np == mm_start_id)[0] + 1
+        indices_end = np.nonzero(input_ids_np == mm_end_id)[0] - 1
 
         return list(zip(indices_start.tolist(), indices_end.tolist()))
 
@@ -586,7 +581,9 @@ class BaseMultimodalProcessor(ABC):
             input_text=input_text, images=images, audios=audios, videos=videos, **kwargs
         )
 
-        input_ids = jnp.asarray(ret["input_ids"], dtype=jnp.int32).flatten()
+        # Keep as numpy to avoid JAX initialization in async context
+        # Will be converted to JAX array by the caller if needed
+        input_ids = np.asarray(ret["input_ids"], dtype=np.int32).flatten()
         collected_items = self.collect_mm_items_from_processor_output(ret)
 
         return collected_items, input_ids, ret
@@ -613,7 +610,8 @@ class BaseMultimodalProcessor(ABC):
                 return_tensors="np",
                 add_special_tokens=True,
             ).input_ids
-            input_ids = jnp.asarray(input_ids, dtype=jnp.int32).flatten()
+            # Keep as numpy to avoid JAX initialization in async context
+            input_ids = np.asarray(input_ids, dtype=np.int32).flatten()
             return [], input_ids, {}
 
         dict_items, raw_images, raw_audios, raw_videos = [], [], [], []
@@ -658,7 +656,8 @@ class BaseMultimodalProcessor(ABC):
                 return_tensors="np",
                 add_special_tokens=True,
             ).input_ids
-            input_ids = jnp.asarray(input_ids, dtype=jnp.int32).flatten()
+            # Keep as numpy to avoid JAX initialization in async context
+            input_ids = np.asarray(input_ids, dtype=np.int32).flatten()
 
         # Add offsets to all items
         for mm_item in all_collected_items:

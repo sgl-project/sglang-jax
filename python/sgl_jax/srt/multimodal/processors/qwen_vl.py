@@ -4,7 +4,7 @@ import re
 import time
 from typing import List, Union
 
-import jax.numpy as jnp
+import numpy as np
 from PIL import Image
 
 from sgl_jax.srt.environ import envs
@@ -211,9 +211,9 @@ class QwenVLImageProcessor(BaseMultimodalProcessor):
         if self.model_type == "qwen3_omni_moe":
             audio_item = next((mm for mm in mm_items if mm.is_audio()), None)
             if audio_item:
-                audio_feature_lengths = jnp.sum(
-                    jnp.asarray(audio_item.feature_attention_mask), axis=1
-                )
+                # Use numpy to avoid JAX initialization in async context
+                attention_mask_np = np.asarray(audio_item.feature_attention_mask)
+                audio_feature_lengths = np.sum(attention_mask_np, axis=1)
 
         second_per_grid_ts = getattr(ret, "second_per_grid_ts", None) or getattr(
             ret, "video_second_per_grid", None
@@ -221,7 +221,8 @@ class QwenVLImageProcessor(BaseMultimodalProcessor):
 
         process_time = time.perf_counter()
 
-        input_ids = input_ids.flatten()
+        # Ensure input_ids is a numpy array and flatten it
+        input_ids = np.asarray(input_ids).flatten()
 
         mrope_positions, mrope_position_delta = MRotaryEmbedding.get_rope_index(
             spatial_merge_size=self.hf_config.vision_config.spatial_merge_size,
@@ -232,7 +233,7 @@ class QwenVLImageProcessor(BaseMultimodalProcessor):
             tokens_per_second=getattr(
                 self.hf_config.vision_config, "tokens_per_second", None
             ),
-            input_ids=input_ids.unsqueeze(0),
+            input_ids=np.expand_dims(input_ids, axis=0),
             image_grid_thw=getattr(ret, "image_grid_thw", None),
             video_grid_thw=getattr(ret, "video_grid_thw", None),
             second_per_grid_ts=second_per_grid_ts,
