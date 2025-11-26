@@ -4,7 +4,8 @@ import numpy as np
 
 from sgl_jax.srt.lora.backend.base_backend import BaseLoRABackend
 from sgl_jax.srt.lora.utils import LoRABatchInfo
-from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch
+from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
 
 MIN_CHUNK_SIZE = 16
 
@@ -170,7 +171,7 @@ class BgmvLoRABackend(BaseLoRABackend):
 
     def prepare_lora_batch(
         self,
-        forward_batch: ForwardBatch,
+        model_worker_batch: ModelWorkerBatch,
         weight_indices: list[int],
         lora_ranks: list[int],
         scalings: list[float],
@@ -185,24 +186,24 @@ class BgmvLoRABackend(BaseLoRABackend):
                 lora_ranks_bs.append(0)
                 scalings_bs.append(0.0)
 
-        assert len(forward_batch.seq_lens) == len(weight_indices)
-        assert len(forward_batch.seq_lens) == len(lora_ranks_bs)
-        assert len(forward_batch.seq_lens) == len(scalings_bs)
+        assert len(model_worker_batch.seq_lens) == len(weight_indices)
+        assert len(model_worker_batch.seq_lens) == len(lora_ranks_bs)
+        assert len(model_worker_batch.seq_lens) == len(scalings_bs)
 
-        target_len = forward_batch.input_ids.shape[0]
+        target_len = model_worker_batch.input_ids.shape[0]
 
-        if forward_batch.forward_mode == ForwardMode.EXTEND:
+        if model_worker_batch.forward_mode == ForwardMode.EXTEND:
             scalings_cpu = np.repeat(
-                np.array(scalings_bs, dtype=np.float32), forward_batch.seq_lens
+                np.array(scalings_bs, dtype=np.float32), model_worker_batch.seq_lens
             )
             token_lora_indices_cpu = np.repeat(
-                np.array(weight_indices, dtype=np.int32), forward_batch.seq_lens
+                np.array(weight_indices, dtype=np.int32), model_worker_batch.seq_lens
             )
             lora_ranks_cpu = np.repeat(
-                np.array(lora_ranks_bs, dtype=np.int32), forward_batch.seq_lens
+                np.array(lora_ranks_bs, dtype=np.int32), model_worker_batch.seq_lens
             )
 
-            num_to_pad = target_len - jnp.sum(forward_batch.seq_lens)
+            num_to_pad = target_len - jnp.sum(model_worker_batch.seq_lens)
 
             padded_scalings_cpu = scalings_cpu
             padded_token_lora_indices_cpu = token_lora_indices_cpu
@@ -218,13 +219,12 @@ class BgmvLoRABackend(BaseLoRABackend):
                 padded_lora_ranks_cpu = np.pad(
                     lora_ranks_cpu, [0, num_to_pad], mode="constant", constant_values=0
                 )
-        elif forward_batch.forward_mode == ForwardMode.DECODE:
+        elif model_worker_batch.forward_mode == ForwardMode.DECODE:
             padded_scalings_cpu = np.array(scalings_bs, dtype=np.float32)
             padded_token_lora_indices_cpu = np.array(weight_indices, dtype=np.int32)
             padded_lora_ranks_cpu = np.array(lora_ranks_bs, dtype=np.int32)
 
         batch_info = LoRABatchInfo(
-            bs=forward_batch.batch_size,
             scalings=jnp.array(padded_scalings_cpu, dtype=jnp.float32),
             token_lora_indices=jnp.array(padded_token_lora_indices_cpu, dtype=jnp.int32),
             lora_ranks=jnp.array(padded_lora_ranks_cpu, dtype=jnp.int32),

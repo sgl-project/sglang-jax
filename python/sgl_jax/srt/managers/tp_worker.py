@@ -234,6 +234,9 @@ class ModelWorker:
                     ForwardMode.EXTEND,
                     self.precompile_cache_loc_paddings[-1],
                 )
+                # Prepare LoRA batch if LoRA is enabled
+                if self.server_args.enable_lora:
+                    self.get_model_runner().lora_manager.prepare_lora_batch(model_worker_batch)
                 sampling_metadata = SamplingMetadata.from_model_worker_batch(
                     model_worker_batch,
                     0,
@@ -273,6 +276,9 @@ class ModelWorker:
                     ForwardMode.DECODE,
                     aligned_cache_loc_size,
                 )
+                # Prepare LoRA batch if LoRA is enabled
+                if self.server_args.enable_lora:
+                    self.get_model_runner().lora_manager.prepare_lora_batch(model_worker_batch)
                 sampling_metadata = SamplingMetadata.from_model_worker_batch(
                     model_worker_batch, 0, self.mesh, self.model_config.vocab_size
                 )
@@ -455,10 +461,6 @@ class ModelWorker:
             forward_metadata = self.worker.model_runner.attn_backend.get_forward_metadata(
                 model_worker_batch
             )
-
-        # Prepare LoRA batch if LoRA is enabled
-        if self.server_args.enable_lora:
-            self.get_model_runner().lora_manager.prepare_lora_batch(forward_batch)
 
         if sampling_metadata is None:
             sampling_metadata = SamplingMetadata.from_model_worker_batch(

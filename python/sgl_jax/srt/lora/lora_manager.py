@@ -21,7 +21,7 @@ import logging
 import jax.numpy as jnp
 from jax.sharding import Mesh
 
-from python.sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
+from python.sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch
 from sgl_jax.srt.layers.linear import LinearBase
 from sgl_jax.srt.lora.layers import BaseLayerWithLoRA
 from sgl_jax.srt.lora.lora import ChunkedSgmvLoRABackend, LoRAAdapter
@@ -355,7 +355,7 @@ class LoRAManager:
         """Check if memory pool can support the given LoRA config."""
         return self.memory_pool.can_support(config)
 
-    def prepare_lora_batch(self, forward_batch: ForwardBatch):
+    def prepare_lora_batch(self, model_worker_batch: ModelWorkerBatch):
         """
         Prepare LoRA batch for inference.
 
@@ -369,7 +369,7 @@ class LoRAManager:
             ValueError: If batch exceeds max_loras_per_batch or adapter not loaded
         """
         # Load active loras into lora memory pool
-        cur_uids = set(forward_batch.lora_ids)
+        cur_uids = set(model_worker_batch.lora_ids)
 
         assert len(cur_uids) <= self.max_loras_per_batch
 
@@ -379,11 +379,11 @@ class LoRAManager:
             lora_adapters=self.loras,
         )
 
-        weight_indices = [0] * len(forward_batch.lora_ids)
+        weight_indices = [0] * len(model_worker_batch.lora_ids)
         lora_ranks = [0] * self.max_loras_per_batch
         scalings = [0] * self.max_loras_per_batch
         # print(f"{self.loras=}")
-        for i, uid in enumerate(forward_batch.lora_ids):
+        for i, uid in enumerate(model_worker_batch.lora_ids):
             weight_indices[i] = self.memory_pool.get_buffer_id(uid)
             if uid is not None and len(self.loras) > 0:
                 # print(f"{uid=}")
@@ -392,7 +392,7 @@ class LoRAManager:
                 scalings[weight_indices[i]] = lora.scaling
 
         self.lora_backend.prepare_lora_batch(
-            forward_batch=forward_batch,
+            model_worker_batch=model_worker_batch,
             weight_indices=weight_indices,
             lora_ranks=lora_ranks,
             scalings=scalings,
