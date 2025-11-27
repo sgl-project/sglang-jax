@@ -1,6 +1,7 @@
 import jax
 import jax.numpy as jnp
 import numpy as np
+from jax.sharding import NamedSharding
 
 from sgl_jax.srt.lora.backend.base_backend import BaseLoRABackend
 from sgl_jax.srt.lora.utils import LoRABatchInfo
@@ -29,6 +30,7 @@ class BgmvLoRABackend(BaseLoRABackend):
         self,
         x: jax.Array,
         weights: jax.Array,
+        sharding: NamedSharding,
         *args,
         **kwargs,
     ) -> jax.Array:
@@ -42,7 +44,7 @@ class BgmvLoRABackend(BaseLoRABackend):
              result with shape (s, r)
         """
         return shrink(
-            x, weights, self.batch_info.token_lora_indices, self.batch_info.scalings
+            x, weights, self.batch_info.token_lora_indices, self.batch_info.scalings, sharding
         ).astype(x.dtype)
 
     def run_lora_b_gemm(
@@ -50,6 +52,7 @@ class BgmvLoRABackend(BaseLoRABackend):
         x: jax.Array,
         weights: jax.Array,
         base_output: jax.Array,
+        sharding: NamedSharding,
         *args,
         **kwargs,
     ) -> jax.Array:
@@ -71,6 +74,7 @@ class BgmvLoRABackend(BaseLoRABackend):
                 self.batch_info.token_lora_indices,
                 (weights.shape[1],),
                 self.max_lora_rank,
+                sharding,
             ).astype(x.dtype),
         )
 
@@ -238,8 +242,9 @@ def shrink(
     lora_a_stacked: jax.Array,  # (max_loras, num_slices*max_lora_rank, in_features)
     token_lora_indices: jax.Array,  # (num_tokens,)
     scalings: jax.Array,  # (num_tokens,)
+    sharding: NamedSharding,
 ):
-    return bgmv_shrink(x, lora_a_stacked, token_lora_indices, scalings)
+    return bgmv_shrink(x, lora_a_stacked, token_lora_indices, sharding, scalings)
 
 
 def expand(
@@ -248,6 +253,7 @@ def expand(
     token_lora_indices: jax.Array,  # (num_tokens,)
     output_slices: tuple,
     max_lora_rank: int,
+    sharding: NamedSharding,
 ):
     """Optimized: Loop with slicing."""
     # y_shape = output_shape
@@ -275,6 +281,7 @@ def expand(
             token_lora_indices,
             offset_output,
             output_slices[slice_idx],
+            sharding,
         )
 
         offset_output += output_slices[slice_idx]
@@ -287,6 +294,7 @@ def bgmv_shrink(
     inputs,
     lora_weights,
     lora_indices,
+    sharding: NamedSharding,
     scaling: float = 1.0,
 ):
     """
@@ -299,11 +307,9 @@ def bgmv_shrink(
     Returns:
         [s, c * r]
     """
-    # if len(lora_weights.shape) == 4:
-    #     lora_weights = jnp.squeeze(lora_weights, axis=1)
     if isinstance(scaling, jax.Array) and scaling.ndim == 1:
         scaling = scaling[:, jnp.newaxis]
-    return scaling * bgmv_jax(inputs, lora_weights, lora_indices)
+    return scaling * bgmv_jax(inputs, lora_weights, lora_indices, sharding)
 
 
 def bgmv_expand_slice(
@@ -313,6 +319,7 @@ def bgmv_expand_slice(
     lora_indices,  # [num_tokens]
     slice_offset: int,
     slice_size: int,
+    sharding: NamedSharding,
 ):
     """
     Expand operation: maps from low-rank space to output space.
@@ -326,7 +333,7 @@ def bgmv_expand_slice(
     # if len(lora_weights.shape) == 4:
     #     lora_weights = jnp.squeeze(lora_weights, axis=1)
 
-    outputs = bgmv_jax(inputs, lora_weights, lora_indices)
+    outputs = bgmv_jax(inputs, lora_weights, lora_indices, sharding)
 
     # Pad the outputs
     pad_left = slice_offset
@@ -340,9 +347,10 @@ def bgmv_expand_slice(
 
 
 def bgmv_jax(
-    inputs,  # (s, input_dim)
+    inputs,  # (num_tokens, input_dim)
     loras,  # (num_lora, output_dim, input_dim)
     idxs,  # (num_tokens)
+    sharding,
 ):
     """
     Batched grouped matrix-vector multiplication.
@@ -353,4 +361,5 @@ def bgmv_jax(
         inputs,
         jax.nn.one_hot(idxs, loras.shape[0], dtype=inputs.dtype),
         loras,
+        out_sharding=sharding,
     )

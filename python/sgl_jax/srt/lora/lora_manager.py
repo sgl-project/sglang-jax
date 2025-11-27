@@ -282,6 +282,8 @@ class LoRAManager:
                         layer_id=layer_id,
                         is_lora_a=False,
                     ),
+                    target_module,
+                    self.mesh,
                 )
 
     def load_lora_adapter(self, lora_ref: LoRARef):

@@ -22,8 +22,9 @@ from typing import TYPE_CHECKING
 import jax
 import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding
-from jax.sharding import PartitionSpec as P
 from jax.tree_util import register_pytree_node_class
+
+from sgl_jax.srt.lora.utils import get_lora_a_sharding, get_lora_b_sharding
 
 if TYPE_CHECKING:
     from sgl_jax.srt.lora.lora import LoRAAdapter
@@ -300,34 +301,10 @@ class LoRAMemoryPool:
         return (self.max_loras_per_batch, output_dim, self.max_lora_rank)
 
     def _get_lora_a_sharding(self, module_name: str) -> NamedSharding:
-        """Get sharding spec for LoRA A matrix."""
-        # Row-parallel layers: shard input dimension
-        if module_name in {"o_proj", "down_proj"}:
-            # Shape: (batch, rank, input_dim)
-            # Shard input_dim across tensor axis
-            return NamedSharding(self.mesh, P(None, None, "tensor"))
-        else:
-            # Column-parallel: no sharding for A
-            return NamedSharding(self.mesh, P(None, None, None))
+        return get_lora_a_sharding(module_name, self.mesh)
 
     def _get_lora_b_sharding(self, module_name: str) -> NamedSharding:
-        """Get sharding spec for LoRA B matrix."""
-        # Column-parallel layers: shard output dimension
-        if module_name in {
-            "qkv_proj",
-            "gate_up_proj",
-            "q_proj",
-            "k_proj",
-            "v_proj",
-            "gate_proj",
-            "up_proj",
-        }:
-            # Shape: (batch, output_dim, rank)
-            # Shard output_dim across tensor axis
-            return NamedSharding(self.mesh, P(None, "tensor", None))
-        else:
-            # Row-parallel: no sharding for B
-            return NamedSharding(self.mesh, P(None, None, None))
+        return get_lora_b_sharding(module_name, self.mesh)
 
     def init_buffers(self):
         """

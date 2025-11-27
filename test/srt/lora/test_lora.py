@@ -328,7 +328,7 @@ class TestLoRA(CustomTestCase):
         finally:
             kill_process_tree(process_with_lora.pid)
 
-    def test_lora_vs_base_difference(self, prompts, lora_set, tp_size, dtype, max_new_tokens):
+    def lora_vs_base_difference(self, prompts, lora_set, tp_size, dtype, max_new_tokens):
         """
         Test that LoRA actually changes the model output.
 
@@ -443,7 +443,7 @@ class TestLoRA(CustomTestCase):
                 self.inference(PROMPTS, lora_set, tp_size, dtype, max_new_tokens)
                 self.serving(PROMPTS, lora_set, tp_size, dtype, max_new_tokens)
                 self.base_inference(PROMPTS, lora_set, tp_size, dtype, max_new_tokens)
-                self.test_lora_vs_base_difference(PROMPTS, lora_set, tp_size, dtype, max_new_tokens)
+                self.lora_vs_base_difference(PROMPTS, lora_set, tp_size, dtype, max_new_tokens)
 
 
 if __name__ == "__main__":

@@ -20,8 +20,13 @@ from typing import TYPE_CHECKING
 
 import jax
 from flax import nnx
+from jax.sharding import Mesh
 
 from python.sgl_jax.srt.layers.linear import LinearBase
+from sgl_jax.srt.lora.utils import (
+    get_lora_a_output_sharding,
+    get_lora_b_output_sharding,
+)
 
 if TYPE_CHECKING:
     from sgl_jax.srt.lora.backend.base_backend import BaseLoRABackend
@@ -77,18 +82,25 @@ class LoRALinear(BaseLayerWithLoRA):
         self,
         A_buffer: jax.Array,
         B_buffer: jax.Array,
+        module_name: str,
+        mesh: Mesh,
     ):
         self.set_lora = True
         self.A_buffer = A_buffer
         self.B_buffer = B_buffer
+        self.lora_a_output_sharding = get_lora_a_output_sharding(module_name, mesh)
+        self.lora_b_output_sharding = get_lora_b_output_sharding(module_name, mesh)
 
     def apply_lora(self, operands) -> jax.Array:
         base_output, x = operands
-        lora_a_output = self.lora_backend.run_lora_a_gemm(x, self.A_buffer)
+        lora_a_output = self.lora_backend.run_lora_a_gemm(
+            x=x, weights=self.A_buffer, sharding=self.lora_a_output_sharding
+        )
         lora_output = self.lora_backend.run_lora_b_gemm(
             x=lora_a_output,
             weights=self.B_buffer,
             base_output=base_output,
+            sharding=self.lora_b_output_sharding,
         )
         return lora_output
 
