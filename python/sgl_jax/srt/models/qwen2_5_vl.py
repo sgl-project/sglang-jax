@@ -277,14 +277,18 @@ class Qwen2_5_VisionAttention(nnx.Module):
         k = jnp.pad(k, pad_width, 'constant')
         v = jnp.pad(v, pad_width, 'constant')
 
-        if cu_window_seqlens is None:
-            mask = None
-        else:
+        mask_shape = (q.shape[-2], k.shape[-2])
+        row_ids = jax.lax.broadcasted_iota(jnp.int32, mask_shape, 0)
+        col_ids = jax.lax.broadcasted_iota(jnp.int32, mask_shape, 1)
+        mask = col_ids <= row_ids
+
+        if cu_window_seqlens is not None:
             segment_ids = generate_window_segment_ids(cu_window_seqlens, T_attn,
                                                       padded_T)
-            mask = jnp.equal(jnp.repeat(segment_ids.q, segment_ids.kv.shape[-1], 0),
-                             segment_ids.kv).astype(jnp.bool_)
-            mask = mask[None, None, :, :]
+            window_mask = jnp.equal(jnp.repeat(segment_ids.q, segment_ids.kv.shape[-1], 0),
+                             segment_ids.kv.transpose(1, 0)).astype(jnp.bool_)
+            mask = jnp.logical_and(mask, window_mask)
+        mask = mask[None, None, :, :]
 
         # TODO: add support for quantized KV cache?
         output = self.attention(q, k, v, mask)
@@ -500,27 +504,48 @@ class Qwen2_5_VisionTransformer(nnx.Module):
         )
 
     def rotary_pos_emb_thw(self, t, h, w):
+        # hpos_ids: [h, w], wpos_ids: [h, w]
         hpos_ids, wpos_ids = jnp.indices((h, w))
+        # hpos_ids: [h, w] -> [(h / spatial_merge_size) *
+        #                      (w / spatial_merge_size) *
+        #                      spatial_merge_size       *
+        #                      spatial_merge_size]
         hpos_ids = hpos_ids.reshape(
             h // self.spatial_merge_size,
             self.spatial_merge_size,
             w // self.spatial_merge_size,
             self.spatial_merge_size,
         ).transpose(0, 2, 1, 3).flatten()
+        # wpos_ids: [h, w] -> [(h / spatial_merge_size) *
+        #                      (w / spatial_merge_size) *
+        #                      spatial_merge_size       *
+        #                      spatial_merge_size]
         wpos_ids = wpos_ids.reshape(
             h // self.spatial_merge_size,
             self.spatial_merge_size,
             w // self.spatial_merge_size,
             self.spatial_merge_size,
         ).transpose(0, 2, 1, 3).flatten()
+        # pos_ids: [(h / spatial_merge_size) *
+        #           (w / spatial_merge_size) *
+        #           spatial_merge_size       *
+        #           spatial_merge_size, 2]
         pos_ids = jnp.stack([hpos_ids, wpos_ids], axis=-1)
+        # pos_ids: [t * (h / spatial_merge_size) *
+        #           (w / spatial_merge_size) *
+        #           spatial_merge_size       *
+        #           spatial_merge_size, 2]
         pos_ids = jnp.tile(pos_ids, (t, 1))
 
         max_size = max(h, w)
+        # rotary_pos_emb_full: [max_size, head_dim // 4]
         rotary_pos_emb_full = self.rotary_pos_emb(max_size)
-
+        # rotary_pos_emb: [t * h * w, head_dim // 2]
         rotary_pos_emb = rotary_pos_emb_full[pos_ids].reshape(
             pos_ids.shape[0], -1)
+        # rotary_pos_emb: [t * h * w / (spatial_merge_size*spatial_merge_size),
+        #                  spatial_merge_size*spatial_merge_size,
+        #                  head_dim // 2]
         rotary_pos_emb = rotary_pos_emb.reshape(
             rotary_pos_emb.shape[0] // self.spatial_merge_unit,
             self.spatial_merge_unit, -1)
