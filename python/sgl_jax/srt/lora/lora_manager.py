@@ -21,7 +21,6 @@ import logging
 import jax.numpy as jnp
 from jax.sharding import Mesh
 
-from python.sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch
 from sgl_jax.srt.layers.linear import LinearBase
 from sgl_jax.srt.lora.layers import BaseLayerWithLoRA
 from sgl_jax.srt.lora.lora import ChunkedSgmvLoRABackend, LoRAAdapter
@@ -29,6 +28,7 @@ from sgl_jax.srt.lora.lora_config import LoRAConfig
 from sgl_jax.srt.lora.lora_memory_pool import LoRAMemoryPool
 from sgl_jax.srt.lora.lora_registry import LoRARef
 from sgl_jax.srt.lora.utils import get_target_module_name
+from sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch
 
 logger = logging.getLogger(__name__)
 

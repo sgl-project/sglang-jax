@@ -207,6 +207,11 @@ class GenerateReqInput:
             self.top_logprobs_num = 0
         if not self.token_ids_logprob:  # covers both None and []
             self.token_ids_logprob = None
+        if self.lora_path is not None and isinstance(self.lora_path, list):
+            if len(self.lora_path) == 1:
+                self.lora_path = self.lora_path[0]
+            elif len(self.lora_path) > 1:
+                raise ValueError("Single request cannot have multiple lora_paths")
 
     def _handle_parallel_sampling(self):
         """Handle parallel sampling parameters and adjust batch size if needed."""

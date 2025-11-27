@@ -22,7 +22,7 @@ import jax
 from flax import nnx
 from jax.sharding import Mesh
 
-from python.sgl_jax.srt.layers.linear import LinearBase
+from sgl_jax.srt.layers.linear import LinearBase
 from sgl_jax.srt.lora.utils import (
     get_lora_a_output_sharding,
     get_lora_b_output_sharding,
