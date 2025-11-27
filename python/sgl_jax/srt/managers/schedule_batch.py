@@ -1664,11 +1664,11 @@ class ModelWorkerBatch:
     extend_logprob_start_lens: list[int] | None
     extend_input_logprob_token_ids: np.ndarray | None
 
-    # For LoRA
-    lora_ids: list[str] | None
-
     # For padding
     real_bs: int
+
+    # For LoRA
+    lora_ids: list[str] | None = None
 
     capture_hidden_mode: CaptureHiddenMode = None
 

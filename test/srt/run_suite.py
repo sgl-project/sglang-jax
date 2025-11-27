@@ -320,6 +320,7 @@ suites = {
         TestFile("test/srt/test_logprobs.py", 3),
         TestFile("test/srt/test_qwen1_5_models_dummy.py", 3),
         TestFile("test/srt/lora/test_bgmv_backend.py", 6),
+        TestFile("test/srt/lora/test_lora.py", 10),
     ],
     "e2e-test-tpu-v6e-4": [
         TestFile("test/srt/openai_server/basic/test_tool_calls.py", 3),
