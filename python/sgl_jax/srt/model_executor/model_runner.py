@@ -653,11 +653,11 @@ class ModelRunner:
             max_loras_per_batch=self.server_args.max_loras_per_batch,
             dtype=self.dtype,
             mesh=self.mesh,
-            tp_size=self.tp_size,
             max_lora_rank=self.server_args.max_lora_rank,
             target_modules=self.server_args.lora_target_modules,
             lora_paths=self.server_args.lora_paths,
             server_args=self.server_args,
+            model_config=self.model_config,
         )
 
 
