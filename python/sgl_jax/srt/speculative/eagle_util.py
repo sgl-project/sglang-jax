@@ -930,6 +930,21 @@ class EagleVerifyInput:
                 except AttributeError:
                     ctx = mesh
             with ctx:
+                print(f"{predict.shape=}")
+                print(f"{accept_index.shape=}")
+                print(f"{accept_length.shape=}")
+                print(f"{candidates.shape=}")
+                print(
+                    f"{self.retrive_next_token.shape=} {np.min(self.retrive_next_token)=} {np.max(self.retrive_next_token)=}"
+                )
+                print(
+                    f"{self.retrive_index.shape=} {np.min(self.retrive_index)=} {np.max(self.retrive_index)=}"
+                )
+                print(
+                    f"{self.retrive_next_sibling.shape=} {np.min(self.retrive_next_sibling)=} {np.max(self.retrive_next_sibling)=}"
+                )
+                print(f"{target_predict.shape=}")
+
                 accept_index, accept_length, predict = verify_tree_greedy(
                     predicts=predict,
                     accept_index=accept_index,
@@ -997,7 +1012,10 @@ class EagleVerifyInput:
             )
 
         accept_length = accept_length + 1
+        print(f"1     {accept_index.shape=}")
         accept_index = accept_index.reshape(-1)
+        print(f"2     {accept_index.shape=}")
+
         return predict, accept_length, accept_index
 
 

@@ -406,6 +406,13 @@ class EAGLEWorker(ModelWorker):
             model_worker_batch.positions,
             accept_index,
         )
+        accept_index = np.array(jax.device_get(accept_index))
+        accept_mask = np.array(jax.device_get(accept_mask))
+        predict = np.array(jax.device_get(predict))
+        accept_length = np.array(jax.device_get(accept_length))
+        model_worker_batch.seq_lens = np.array(jax.device_get(model_worker_batch.seq_lens))
+        logits_output.hidden_states = np.array(jax.device_get(logits_output.hidden_states))
+        cur_allocate_lens = np.array(jax.device_get(cur_allocate_lens))
         accept_index = accept_index[accept_mask]
         verified_id = predict[accept_index]
         new_seq_lens = model_worker_batch.seq_lens[: model_worker_batch.real_bs] + accept_length
@@ -422,7 +429,7 @@ class EAGLEWorker(ModelWorker):
             next_draft_input=next_draft_input,
             accept_lens=accept_length,
             # FIXME(pc) this field is for overlap
-            allocate_lens=cur_allocate_lens,
+            allocate_lens=next_draft_input.allocate_lens,
             bid=model_worker_batch.bid,
             cache_miss_count=cache_miss_count,
             extend_input_len_per_req=None,
