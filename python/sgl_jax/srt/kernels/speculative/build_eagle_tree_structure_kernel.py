@@ -301,9 +301,9 @@ def _build_eagle_tree_structure_kernel(
 @partial(
     jax.jit,
     static_argnames=[
+        "padded_seq_lens_sum",
         "draft_token_num",
         "topk",
-        "max_context_len",
         "tree_mask_mode",
     ],
 )
@@ -313,9 +313,9 @@ def build_eagle_tree_structure_pallas_call(
     verified_seq_len: jax.Array,
     seq_lens_sum: jax.Array,
     *,
+    padded_seq_lens_sum: int,
     draft_token_num: int,
     topk: int,
-    max_context_len: int,
     tree_mask_mode: int = 0,  # FULL_MASK = 0
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
     bs = parent_list.shape[0]
@@ -323,7 +323,7 @@ def build_eagle_tree_structure_pallas_call(
     if tree_mask_mode == 0:  # FULL_MASK
         tree_mask_size = seq_lens_sum * draft_token_num + draft_token_num * draft_token_num * bs
         tree_mask_capacity = (
-            max_context_len * draft_token_num * bs + draft_token_num * draft_token_num * bs
+            padded_seq_lens_sum * draft_token_num + draft_token_num * draft_token_num * bs
         )
     else:
         tree_mask_size = bs * draft_token_num * draft_token_num
@@ -404,7 +404,7 @@ def build_eagle_tree_structure_pallas_call(
     )
 
     return (
-        tree_mask[:, 0].astype(jnp.bool).reshape(-1),
+        tree_mask[:, 0].reshape(-1),
         positions,
         retrive_index,
         retrive_next_token,
@@ -415,9 +415,9 @@ def build_eagle_tree_structure_pallas_call(
 @partial(
     jax.jit,
     static_argnames=(
+        "padded_seq_lens_sum",
         "draft_token_num",
         "topk",
-        "max_context_len",
         "tree_mask_mode",
     ),
 )
@@ -426,9 +426,9 @@ def build_eagle_tree_structure(
     selected_index: jax.Array,
     verified_seq_len: jax.Array,
     seq_lens_sum: jax.Array,
+    padded_seq_lens_sum: int,
     draft_token_num: int,
     topk: int,
-    max_context_len: int,
     tree_mask_mode: int = 0,  # FULL_MASK = 0
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
     """
@@ -440,9 +440,9 @@ def build_eagle_tree_structure(
         draft_token_num: Number of draft tokens (num_verify_tokens)
         topk: Top-k value
         seq_lens_sum: Sum of sequence lengths
+        padded_seq_lens_sum: Padding for seq_lens_sum.
         tree_mask_mode: Tree mask mode (0=FULL_MASK)
         mesh: jax mesh used for distributed computation
-        max_context_len: The max context length per request.
 
     Returns:
         tuple of (tree_mask, positions, retrive_index, retrive_next_token, retrive_next_sibling)
@@ -462,9 +462,9 @@ def build_eagle_tree_structure(
     )
     _kernel = partial(
         build_eagle_tree_structure_pallas_call,
+        padded_seq_lens_sum=padded_seq_lens_sum,
         draft_token_num=draft_token_num,
         topk=topk,
-        max_context_len=max_context_len,
         tree_mask_mode=tree_mask_mode,
     )
     (

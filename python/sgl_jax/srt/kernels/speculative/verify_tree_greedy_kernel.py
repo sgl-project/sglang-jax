@@ -247,7 +247,7 @@ def verify_tree_greedy_pallas_call(
         ),
         compiler_params=pltpu.CompilerParams(
             dimension_semantics=("parallel",),
-            disable_bounds_checks=True,
+            disable_bounds_checks=False,
         ),
         out_shape=[
             jax.ShapeDtypeStruct(shape=accept_index.shape, dtype=accept_index.dtype),

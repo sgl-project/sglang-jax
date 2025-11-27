@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import functools
 import logging
 import os
 from collections.abc import Sequence
@@ -179,41 +180,99 @@ def get_last_loc_large_page_size_large_top_k(
     return prefix_lens, new_seq_lens, last_loc, num_new_pages_per_topk, extend_lens
 
 
+@functools.partial(
+    jax.jit,
+    static_argnums=(
+        4,
+        5,
+        6,
+    ),
+)
 def build_tree_kernel_efficient_preprocess(
     verified_id: jax.Array,
-    score_list: list[jax.Array],
-    token_list: list[jax.Array],
-    parents_list: list[jax.Array],
+    score_tensor: jax.Array,
+    ss_token_list: jax.Array,
+    parents_list: jax.Array,
     num_verify_tokens: int,
+    topk: int,
+    speculative_num_steps: int,
 ):
-    # Concatenate score_list along dim=1 and flatten from dim=1 onwards
-    # b, n, topk; n = 1 + (num_steps-1) * self.topk
-    score_tensor = jnp.concatenate(score_list, axis=1)
+    # score_list   (bs, 1 + (step - 1) * topk  , eagle_topk)
+    # token_list   (bs, topk + (step - 1) * topk * topk)
+    # parents_list (bs, topk + 1 + (step - 1) * topk)
+    # score_tensor = jnp.concatenate(score_list, axis=1)
+    # FIXME this reshape operation should be optimized
     score_tensor = score_tensor.reshape(score_tensor.shape[0], -1)
 
-    # Concatenate token lists: b, (self.topk + (num_steps-1) * self.topk)
-    ss_token_list = jnp.concatenate(token_list, axis=1)
+    # ss_token_list = jnp.concatenate(token_list, axis=1)
 
-    # Get top scores and indices
     _, top_scores_index = jax.lax.top_k(score_tensor, num_verify_tokens - 1)
     top_scores_index = jnp.sort(top_scores_index, axis=-1)
 
-    # Gather draft tokens using the top indices
     draft_tokens = jnp.take_along_axis(ss_token_list, top_scores_index, axis=1)
-    # assert draft_tokens.shape == (batch_size, verified_id.shape[0])
-    draft_tokens = jnp.concatenate(
-        [jnp.expand_dims(verified_id, axis=1), draft_tokens], axis=1
-    ).flatten()
 
-    # Build parent list
-    if len(parents_list) > 1:
-        parent_list = jnp.concatenate(parents_list[:-1], axis=1)
+    verified_expanded = jnp.expand_dims(verified_id, axis=1)
+    # FIXME this as type operation should be optimized
+    draft_tokens = (
+        jnp.concatenate([verified_expanded, draft_tokens], axis=1).flatten().astype(jnp.int32)
+    )
+    if speculative_num_steps > 1:
+        parent_list = parents_list[:, : (topk + 1 + (speculative_num_steps - 2) * topk)]
     else:
-        batch_size = parents_list[0].shape[0]
-        # parent_list = jnp.empty((batch_size, 0), dtype=jnp.int32)
+        batch_size = parents_list.shape[0]
         parent_list = jnp.full((batch_size, 1), -1, dtype=jnp.int32)
 
     return parent_list, top_scores_index, draft_tokens
+
+
+@functools.partial(
+    jax.jit,
+    static_argnames=(
+        "padded_seq_lens_sum",
+        "num_verify_tokens",
+        "topk",
+        "max_seq_len_per_req",
+        "tree_mask_mode",
+        "speculative_num_steps",
+    ),
+)
+def _build_tree_kernel_efficient_core(
+    verified_id: jax.Array,
+    score_list: jax.Array,
+    token_list: jax.Array,
+    parents_list: jax.Array,
+    seq_lens: jax.Array,
+    seq_lens_sum: jax.Array,
+    *,
+    padded_seq_lens_sum: int,
+    num_verify_tokens: int,
+    topk: int,
+    max_seq_len_per_req: int,
+    tree_mask_mode: int,
+    speculative_num_steps: int,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
+
+    tree_mask, positions, retrive_index, retrive_next_token, retrive_next_sibling = (
+        build_eagle_tree_structure(
+            parent_list=parents_list,
+            selected_index=score_list,
+            verified_seq_len=seq_lens,
+            draft_token_num=num_verify_tokens,
+            topk=topk,
+            seq_lens_sum=seq_lens_sum,
+            padded_seq_lens_sum=padded_seq_lens_sum,
+            tree_mask_mode=tree_mask_mode,
+        )
+    )
+
+    return (
+        tree_mask,
+        positions,
+        retrive_index,
+        retrive_next_token,
+        retrive_next_sibling,
+        token_list,
+    )
 
 
 def _extract_parent_branch_indices(
@@ -290,14 +349,16 @@ def build_tree_mask_for_draft_decode(
 
 def build_tree_kernel_efficient(
     verified_id: jax.Array,
-    score_list: list[jax.Array],
-    token_list: list[jax.Array],
-    parents_list: list[jax.Array],
+    score_list: jax.Array,
+    token_list: jax.Array,
+    parents_list: jax.Array,
     seq_lens: jax.Array,
     seq_lens_sum: jax.Array,
+    padded_seq_lens_sum: int,
     topk: int,
     num_verify_tokens: int,
     max_seq_len_per_req: int,
+    speculative_num_steps: int,
     mesh: Mesh,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
     """JAX implementation of build_tree_kernel_efficient.
@@ -318,7 +379,13 @@ def build_tree_kernel_efficient(
                  retrive_next_sibling, draft_tokens)
     """
     parent_list, top_scores_index, draft_tokens = build_tree_kernel_efficient_preprocess(
-        verified_id, score_list, token_list, parents_list, num_verify_tokens
+        verified_id,
+        score_list,
+        token_list,
+        parents_list,
+        num_verify_tokens,
+        topk,
+        speculative_num_steps,
     )
 
     # Get batch size
@@ -332,18 +399,26 @@ def build_tree_kernel_efficient(
         except AttributeError:
             ctx = mesh
     with ctx:
-
-        tree_mask, positions, retrive_index, retrive_next_token, retrive_next_sibling = (
-            build_eagle_tree_structure(
-                parent_list=parent_list,
-                selected_index=top_scores_index,
-                verified_seq_len=seq_lens,
-                draft_token_num=num_verify_tokens,
-                topk=topk,
-                seq_lens_sum=seq_lens_sum,
-                max_context_len=max_seq_len_per_req,
-                tree_mask_mode=0,  # FULL_MASK
-            )
+        (
+            tree_mask,
+            positions,
+            retrive_index,
+            retrive_next_token,
+            retrive_next_sibling,
+            draft_tokens,
+        ) = _build_tree_kernel_efficient_core(
+            verified_id,
+            top_scores_index,
+            draft_tokens,
+            parent_list,
+            seq_lens,
+            seq_lens_sum,
+            padded_seq_lens_sum=padded_seq_lens_sum,
+            num_verify_tokens=num_verify_tokens,
+            topk=topk,
+            max_seq_len_per_req=max_seq_len_per_req,
+            tree_mask_mode=0,
+            speculative_num_steps=speculative_num_steps,
         )
 
     return (
@@ -483,19 +558,25 @@ class EagleDraftInput:
         model_worker_batch.spec_info = self
         verified_id = batch_output.next_draft_input.verified_id
         verified_id = verified_id[verified_id != 0].flatten()
-        model_worker_batch.input_ids = verified_id
-        model_worker_batch.seq_lens = (
-            model_worker_batch.seq_lens[: model_worker_batch.real_bs] + batch_output.accept_lens
+        model_worker_batch.input_ids = np.array(jax.device_get(verified_id), dtype=np.int32)
+        model_worker_batch.seq_lens = np.array(
+            jax.device_get(
+                model_worker_batch.seq_lens[: model_worker_batch.real_bs] + batch_output.accept_lens
+            )
         )
         model_worker_batch.extend_seq_lens = np.asarray(
-            [batch_output.accept_lens[i] for i in range(batch_output.accept_lens.shape[0])]
+            jax.device_get(
+                [batch_output.accept_lens[i] for i in range(batch_output.accept_lens.shape[0])]
+            )
         )
         model_worker_batch.capture_hidden_mode = CaptureHiddenMode.LAST
         model_worker_batch.spec_info.capture_hidden_mode = CaptureHiddenMode.LAST
         model_worker_batch.forward_mode = ForwardMode.DRAFT_EXTEND
-        model_worker_batch.spec_info.hidden_states = batch_output.next_draft_input.hidden_states
-        forward_metadata = draft_model_runner.attn_backend.get_forward_metadata(
-            model_worker_batch, is_eagle=True
+        model_worker_batch.spec_info.hidden_states = np.array(
+            jax.device_get(batch_output.next_draft_input.hidden_states)
+        )
+        forward_metadata = draft_model_runner.attn_backend.get_eagle_forward_metadata(
+            model_worker_batch
         )
         draft_model_runner.attn_backend.forward_metadata = forward_metadata
         from sgl_jax.srt.layers.logits_processor import LogitsMetadata
@@ -513,7 +594,7 @@ class EagleDraftInput:
         ):
             pad_len = model_worker_batch.input_ids.shape[0] - hidden_states.shape[0]
             pad_shape = (pad_len,) + hidden_states.shape[1:]
-            pad_values = np.zeros(pad_shape, dtype=hidden_states.dtype)
+            pad_values = jnp.zeros(pad_shape, dtype=hidden_states.dtype)
             model_worker_batch.spec_info.hidden_states = jnp.concatenate(
                 [model_worker_batch.spec_info.hidden_states, pad_values], axis=0
             )
@@ -521,7 +602,8 @@ class EagleDraftInput:
         return model_worker_batch, logits_metadata
 
     def prepare_for_decode(self, schedule_batch: ScheduleBatch):
-        new_allocate_lens = schedule_batch.seq_lens + self.ALLOC_LEN_PER_DECODE
+        new_allocate_lens = np.array(schedule_batch.seq_lens + self.ALLOC_LEN_PER_DECODE)
+        self.allocate_lens = np.array(self.allocate_lens)
         bs = schedule_batch.batch_size()
         assert (
             self.allocate_lens.shape[0] == bs
@@ -545,7 +627,6 @@ class EagleDraftInput:
                 last_loc,
                 extend_num_tokens,
             )
-
         assign_req_to_token_pool(
             schedule_batch.req_pool_indices,
             schedule_batch.req_to_token_pool,
@@ -849,6 +930,21 @@ class EagleVerifyInput:
                 except AttributeError:
                     ctx = mesh
             with ctx:
+                print(f"{predict.shape=}")
+                print(f"{accept_index.shape=}")
+                print(f"{accept_length.shape=}")
+                print(f"{candidates.shape=}")
+                print(
+                    f"{self.retrive_next_token.shape=} {np.min(self.retrive_next_token)=} {np.max(self.retrive_next_token)=}"
+                )
+                print(
+                    f"{self.retrive_index.shape=} {np.min(self.retrive_index)=} {np.max(self.retrive_index)=}"
+                )
+                print(
+                    f"{self.retrive_next_sibling.shape=} {np.min(self.retrive_next_sibling)=} {np.max(self.retrive_next_sibling)=}"
+                )
+                print(f"{target_predict.shape=}")
+
                 accept_index, accept_length, predict = verify_tree_greedy(
                     predicts=predict,
                     accept_index=accept_index,
@@ -916,10 +1012,11 @@ class EagleVerifyInput:
             )
 
         accept_length = accept_length + 1
-        accept_index = np.concatenate(accept_index, axis=-1)
-        accept_index = accept_index[accept_index != -1]
-        verified_id = predict[accept_index]
-        return predict, verified_id, accept_length, accept_index
+        print(f"1     {accept_index.shape=}")
+        accept_index = accept_index.reshape(-1)
+        print(f"2     {accept_index.shape=}")
+
+        return predict, accept_length, accept_index
 
 
 def _generate_simulated_accept_index(

@@ -1668,6 +1668,9 @@ class ModelWorkerBatch:
 
     spec_info: EagleDraftInput | EagleVerifyInput | None = None
     spec_algorithm: SpeculativeAlgorithm = None
+    speculative_num_steps: int = 0
+    speculative_eagle_topk: int = 0
+    speculative_num_draft_tokens: int = 0
     # If set, the output of the batch contains the hidden states of the run.
     capture_hidden_mode: CaptureHiddenMode = None
 
@@ -1696,7 +1699,7 @@ class ModelWorkerBatch:
             input_ids_cpu = np.concat(
                 [
                     self.input_ids,
-                    np.array([0] * padding_size, dtype=self.input_ids.dtype),
+                    np.array([0] * padding_size, dtype=np.int32),
                 ],
                 axis=0,
             )
@@ -1876,6 +1879,11 @@ class ModelWorkerBatch:
         self.req_pool_indices = req_pool_indices_cpu
         self.positions = positions_cpu
         self.sampling_info = sampling_info
+
+
+@dataclasses.dataclass
+class EagleWorkerBatch:
+    pass
 
 
 def get_last_loc(

@@ -443,7 +443,6 @@ class ModelWorker:
             forward_batch = model_worker_batch.forward_batch
         else:
             forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
-
         if forward_metadata is None:
             forward_metadata = self.worker.model_runner.attn_backend.get_forward_metadata(
                 model_worker_batch
@@ -467,6 +466,7 @@ class ModelWorker:
 
         if skip_sample:
             next_token_ids_device = None
+            new_logits_output = None
         else:
             import jax._src.test_util as jtu
 
