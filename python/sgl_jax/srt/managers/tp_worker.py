@@ -443,7 +443,6 @@ class ModelWorker:
             forward_batch = model_worker_batch.forward_batch
         else:
             forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
-        print(f"{forward_batch.input_ids=}")
         if forward_metadata is None:
             forward_metadata = self.worker.model_runner.attn_backend.get_forward_metadata(
                 model_worker_batch

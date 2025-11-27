@@ -1700,7 +1700,7 @@ class ModelWorkerBatch:
             input_ids_cpu = np.concat(
                 [
                     self.input_ids,
-                    np.array([0] * padding_size, dtype=self.input_ids.dtype),
+                    np.array([0] * padding_size, dtype=np.int32),
                 ],
                 axis=0,
             )

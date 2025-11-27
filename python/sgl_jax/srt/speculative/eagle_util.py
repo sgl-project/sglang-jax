@@ -216,8 +216,6 @@ def build_tree_kernel_efficient_preprocess(
     draft_tokens = (
         jnp.concatenate([verified_expanded, draft_tokens], axis=1).flatten().astype(jnp.int32)
     )
-    print(f"{speculative_num_steps=}")
-    print(f"{(topk + 1 + (speculative_num_steps - 2) * topk)=}")
     if speculative_num_steps > 1:
         parent_list = parents_list[:, : (topk + 1 + (speculative_num_steps - 2) * topk)]
     else:
@@ -389,10 +387,6 @@ def build_tree_kernel_efficient(
         topk,
         speculative_num_steps,
     )
-    print("==========================")
-    print(f"{parent_list.shape=}")
-    print(f"{top_scores_index.shape=}")
-    print(f"{draft_tokens.shape=}")
 
     # Get batch size
     # for compatibility, 0.6.3 need to use use_mesh. set_mesh is not have __entry__ attribute.
@@ -564,17 +558,23 @@ class EagleDraftInput:
         model_worker_batch.spec_info = self
         verified_id = batch_output.next_draft_input.verified_id
         verified_id = verified_id[verified_id != 0].flatten()
-        model_worker_batch.input_ids = verified_id
-        model_worker_batch.seq_lens = (
-            model_worker_batch.seq_lens[: model_worker_batch.real_bs] + batch_output.accept_lens
+        model_worker_batch.input_ids = np.array(jax.device_get(verified_id), dtype=np.int32)
+        model_worker_batch.seq_lens = np.array(
+            jax.device_get(
+                model_worker_batch.seq_lens[: model_worker_batch.real_bs] + batch_output.accept_lens
+            )
         )
         model_worker_batch.extend_seq_lens = np.asarray(
-            [batch_output.accept_lens[i] for i in range(batch_output.accept_lens.shape[0])]
+            jax.device_get(
+                [batch_output.accept_lens[i] for i in range(batch_output.accept_lens.shape[0])]
+            )
         )
         model_worker_batch.capture_hidden_mode = CaptureHiddenMode.LAST
         model_worker_batch.spec_info.capture_hidden_mode = CaptureHiddenMode.LAST
         model_worker_batch.forward_mode = ForwardMode.DRAFT_EXTEND
-        model_worker_batch.spec_info.hidden_states = batch_output.next_draft_input.hidden_states
+        model_worker_batch.spec_info.hidden_states = np.array(
+            jax.device_get(batch_output.next_draft_input.hidden_states)
+        )
         forward_metadata = draft_model_runner.attn_backend.get_eagle_forward_metadata(
             model_worker_batch
         )
