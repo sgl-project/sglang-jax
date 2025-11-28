@@ -1,3 +1,4 @@
+from collections.abc import Iterable
 from dataclasses import dataclass
 from enum import Enum
 
@@ -88,3 +89,28 @@ def get_lora_b_output_sharding(module_name: str, mesh: Mesh) -> NamedSharding:
         return NamedSharding(mesh, P(None, "tensor"))
     else:
         return NamedSharding(mesh, P(None, None))
+
+
+def get_normalized_target_modules(
+    target_modules: Iterable[str],
+) -> set[str]:
+    """
+    Mapping a list of target module name to names of the normalized LoRA weights.
+    Handles both base module names (e.g., "gate_proj") and prefixed module names (e.g., "feed_forward.gate_proj").
+    """
+    params_mapping = {
+        "q_proj": "q_proj",
+        "k_proj": "k_proj",
+        "v_proj": "v_proj",
+        "o_proj": "o_proj",
+        "gate_proj": "gate_proj",
+        "up_proj": "up_proj",
+        "down_proj": "down_proj",
+    }
+
+    result = set()
+    for name in target_modules:
+        base_name = name.split(".")[-1]
+        normalized_name = params_mapping.get(base_name, base_name)
+        result.add(normalized_name)
+    return result

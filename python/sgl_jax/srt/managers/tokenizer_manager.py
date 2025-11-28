@@ -357,6 +357,7 @@ class TokenizerManager:
             obj.token_ids_logprob,
             obj.stream,
             obj.lora_id,
+            obj.extra_key,
         )
 
         return tokenized_obj

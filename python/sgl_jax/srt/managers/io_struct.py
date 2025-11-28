@@ -111,6 +111,8 @@ class TokenizedGenerateReqInput:
     stream: bool = False
     # LoRA related
     lora_id: str | None = None  # None means just use the base model
+    # Extra key for cache namespace isolation (e.g., cache_salt, lora_id)
+    extra_key: str | None = None
 
 
 @dataclass
@@ -130,6 +132,8 @@ class EmbeddingReqInput:
     text: str = ""
     input_ids: list[int] = None
     normalize: bool = True
+    # Extra key for cache namespace isolation
+    extra_key: str | None = None
 
 
 @dataclass
@@ -160,6 +164,8 @@ class GenerateReqInput:
     lora_path: list[str] | str | None = None
     # The uid of LoRA adaptors, should be initialized by tokenizer manager
     lora_id: list[str] | str | None = None
+    # Extra key for cache namespace isolation (e.g., cache_salt)
+    extra_key: list[str] | str | None = None
 
     def _normalize_rid(self, num):
         """Normalize request IDs for batch processing."""

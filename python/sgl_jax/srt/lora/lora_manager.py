@@ -27,7 +27,7 @@ from sgl_jax.srt.lora.lora import ChunkedSgmvLoRABackend, LoRAAdapter
 from sgl_jax.srt.lora.lora_config import LoRAConfig
 from sgl_jax.srt.lora.lora_memory_pool import LoRAMemoryPool
 from sgl_jax.srt.lora.lora_registry import LoRARef
-from sgl_jax.srt.lora.utils import get_target_module_name
+from sgl_jax.srt.lora.utils import get_normalized_target_modules, get_target_module_name
 from sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch
 
 logger = logging.getLogger(__name__)
@@ -218,8 +218,7 @@ class LoRAManager:
 
         # Infer from loaded adapters
         for lora_id, config in self.configs.items():
-            adapter_target_modules = set(config.target_modules)
-
+            adapter_target_modules = get_normalized_target_modules(config.target_modules)
             if target_modules is not None:
                 # Validate adapter is compatible
                 if not adapter_target_modules.issubset(self.target_modules):
@@ -245,8 +244,30 @@ class LoRAManager:
                 default=8,  # Default rank if no adapters loaded
             )
 
+        logger.info(
+            "LoRA shapes initialized: max_lora_rank=%d, target_modules=%s",
+            self.max_lora_rank,
+            sorted(self.target_modules),
+        )
+
     def init_memory_pool(self):
         """Initialize the LoRA memory pool with proper sharding."""
+        logger.info(
+            "Initializing LoRA memory pool: num_layers=%d, max_loras_per_batch=%d, max_lora_rank=%d",
+            self.num_layers,
+            self.max_loras_per_batch,
+            self.max_lora_rank,
+        )
+        logger.info(
+            "Model architecture: hidden_size=%d, intermediate_size=%d, num_attention_heads=%d, num_kv_heads=%d (original=%d), head_dim=%d, tp_size=%d",
+            self.hidden_size,
+            self.intermediate_size,
+            self.num_attention_heads,
+            self.num_kv_heads,
+            self.original_num_kv_heads,
+            self.head_dim,
+            self.tp_size,
+        )
         self.memory_pool = LoRAMemoryPool(
             max_loras_per_batch=self.max_loras_per_batch,
             max_lora_rank=self.max_lora_rank,
@@ -321,10 +342,12 @@ class LoRAManager:
             self.num_pinned_loras += 1
 
         logger.info(
-            "Loaded LoRA adapter: %s (id=%s, rank=%d, pinned=%s)",
+            "Loaded LoRA adapter: %s (id=%s, rank=%d, alpha=%d, target_modules=%s, pinned=%s)",
             lora_ref.lora_name,
             lora_ref.lora_id,
             config.r,
+            config.lora_alpha,
+            sorted(config.target_modules) if config.target_modules else "None",
             lora_ref.pinned,
         )
 
@@ -361,10 +384,18 @@ class LoRAManager:
         # Store adapter
         self.loras[lora_ref.lora_id] = adapter
 
+        # Count weights per layer for debugging
+        weights_summary = {}
+        for layer_idx, layer in enumerate(adapter.layers):
+            layer_weight_count = len(layer.weights)
+            if layer_weight_count > 0:
+                weights_summary[layer_idx] = layer_weight_count
+
         logger.info(
-            "Loaded weights for LoRA adapter: %s (%d layers)",
+            "Loaded weights for LoRA adapter: %s (%d layers, weights_per_layer=%s)",
             lora_ref.lora_name,
             len(adapter.layers),
+            weights_summary if weights_summary else "all_empty",
         )
 
     def can_support(self, config: LoRAConfig) -> bool:
@@ -446,7 +477,11 @@ class LoRAManager:
             logger.warning("No base_model provided, skipping LoRA surgery")
             return
 
-        logger.info("Applying LoRA surgery to base model...")
+        logger.info(
+            "Starting LoRA surgery on base model: num_layers=%d, target_modules=%s",
+            self.num_layers,
+            sorted(self.target_modules),
+        )
 
         # Step 1: Save original state (with sharding!)
         original_state = nnx.state(self.base_model)
@@ -498,16 +533,28 @@ class LoRAManager:
                             )
 
         except Exception as e:
-            logger.error("Error during LoRA surgery: %s", e)
-            logger.warning("LoRA surgery failed, continuing without LoRA layers")
-            return
+            raise ValueError(f"Error during LoRA surgery: {e}") from e
 
         # Step 4: Restore original weights (preserves sharding)
         try:
             nnx.update(self.base_model, original_state)
+
+            # Count total replaced modules
+            total_replaced = sum(len(layer_mods) for layer_mods in self.lora_modules)
+
+            # Log summary per layer
+            for layer_idx, layer_mods in enumerate(self.lora_modules):
+                if layer_mods:
+                    logger.info(
+                        "LoRA surgery layer %d: replaced %s",
+                        layer_idx,
+                        list(layer_mods.keys()),
+                    )
+
             logger.info(
-                "LoRA surgery completed: replaced %d modules",
-                len(self.lora_modules),
+                "LoRA surgery completed successfully: replaced %d modules across %d layers",
+                total_replaced,
+                len([lm for lm in self.lora_modules if lm]),
             )
         except Exception as e:
             logger.error("Error restoring original state: %s", e)
@@ -560,8 +607,6 @@ class LoRAManager:
 
         # Track the replacement
         self.lora_modules[layer_idx][attr_name] = lora_layer
-
-        logger.debug("Replaced %s with LoRALinear", full_path)
 
     def _get_nested_attr(self, obj, attr_path: str):
         """

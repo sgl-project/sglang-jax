@@ -312,7 +312,17 @@ class LoRAMemoryPool:
 
         Creates A_buffer and B_buffer with proper sharding.
         """
-        logger.info("Initializing LoRA memory pool buffers for %d layers", self.num_layers)
+        logger.info(
+            "Initializing LoRA memory pool buffers: num_layers=%d, max_loras_per_batch=%d, max_lora_rank=%d, dtype=%s",
+            self.num_layers,
+            self.max_loras_per_batch,
+            self.max_lora_rank,
+            self.dtype,
+        )
+        logger.info(
+            "Target modules to initialize: %s",
+            sorted(self.target_modules),
+        )
 
         with self.mesh:
             for module_name in self.target_modules:
@@ -340,10 +350,12 @@ class LoRAMemoryPool:
                     self.B_buffer[module_name].append(b_buf)
 
                 logger.info(
-                    "Created LoRA buffers for %s: A=%s, B=%s",
+                    "Created LoRA buffers for %s: A_shape=%s (sharding=%s), B_shape=%s (sharding=%s)",
                     module_name,
                     a_shape,
+                    a_sharding,
                     b_shape,
+                    b_sharding,
                 )
 
         logger.info("LoRA memory pool initialization complete")
@@ -385,7 +397,9 @@ class LoRAMemoryPool:
                 self.load_lora_weight_to_buffer(uid, buffer_id, lora_adapter)
                 self.uid_to_buffer_id[uid] = buffer_id
                 self.buffer_id_to_uid[buffer_id] = uid
-                logger.debug("Loaded LoRA %s into buffer slot %d", uid, buffer_id)
+                logger.info("Loaded LoRA %s into buffer slot %d", uid, buffer_id)
+            else:
+                logger.debug("LoRA %s already in buffer slot %d", uid, self.uid_to_buffer_id[uid])
 
     def load_lora_weight_to_buffer(
         self,
@@ -449,7 +463,16 @@ class LoRAMemoryPool:
                         )
                 return
 
-            logger.debug("Loading LoRA adapter %s into buffer slot %d", uid, buffer_id)
+            logger.info(
+                "Loading LoRA adapter %s into buffer slot %d (num_layers=%d, target_modules=%s)",
+                uid,
+                buffer_id,
+                self.num_layers,
+                sorted(self.target_modules),
+            )
+
+            # Track loaded weights for debugging
+            loaded_modules_count = {module: 0 for module in self.target_modules}
 
             # Process each layer
             for layer_id in range(self.num_layers):
@@ -464,6 +487,9 @@ class LoRAMemoryPool:
                     )
 
                     if lora_a is not None and lora_b is not None:
+                        # Track successful load
+                        loaded_modules_count[module_name] += 1
+
                         # Handle rank padding/slicing
                         lora_a = self._handle_rank_mismatch(lora_a, is_lora_a=True)
                         lora_b = self._handle_rank_mismatch(lora_b, is_lora_a=False)
@@ -483,6 +509,15 @@ class LoRAMemoryPool:
                         self.B_buffer[module_name][layer_id] = (
                             self.B_buffer[module_name][layer_id].at[buffer_id].set(lora_b)
                         )
+
+                        if layer_id == 0:  # Log details for first layer only
+                            logger.debug(
+                                "Loaded %s layer %d: lora_a.shape=%s, lora_b.shape=%s",
+                                module_name,
+                                layer_id,
+                                lora_a.shape,
+                                lora_b.shape,
+                            )
                     else:
                         # Module not found in adapter weights, zero out
                         logger.debug(
@@ -500,6 +535,13 @@ class LoRAMemoryPool:
                             .at[buffer_id]
                             .set(jnp.zeros(b_shape, dtype=self.dtype))
                         )
+
+            # Log summary of loaded weights
+            logger.info(
+                "Completed loading LoRA adapter %s: loaded_modules=%s (count per module across all layers)",
+                uid,
+                loaded_modules_count,
+            )
 
     def _extract_module_weights(
         self,
