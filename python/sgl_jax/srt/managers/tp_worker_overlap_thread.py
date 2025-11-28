@@ -32,6 +32,9 @@ class ModelWorkerClient:
     ):
         # Load the model
         self.worker = ModelWorker(server_args, mesh=mesh)
+        # overlap mode set worker need_prepare_lora_batch to False
+        self.worker.need_prepare_lora_batch = False
+
         self.max_running_requests = self.worker.max_running_requests
         self.device = self.worker.device
 

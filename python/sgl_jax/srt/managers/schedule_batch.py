@@ -41,6 +41,7 @@ from sgl_jax.srt.mem_cache.common import (
     alloc_token_slots,
 )
 from sgl_jax.srt.mem_cache.memory_pool import ReqToTokenPool
+from sgl_jax.srt.mem_cache.radix_cache import RadixKey
 from sgl_jax.srt.mem_cache.swa_radix_cache import SWARadixCache
 from sgl_jax.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
 from sgl_jax.srt.precision_tracer import (
@@ -160,6 +161,7 @@ class Req:
         token_ids_logprob: list[int] = None,
         stream: bool = False,
         lora_id: str | None = None,
+        extra_key: str | None = None,
         origin_input_ids_unpadded: tuple[int] | None = None,
         eos_token_ids: set[int] | None = None,
         vocab_size: int | None = None,
@@ -185,6 +187,8 @@ class Req:
 
         # LoRA info
         self.lora_id = lora_id
+        # Extra key for cache namespace isolation (e.g., cache_salt, lora_id)
+        self.extra_key = extra_key
 
         # Memory pool info
         self.req_pool_idx: int | None = None
@@ -343,7 +347,7 @@ class Req:
                 self.last_host_node,
                 self.host_hit_length,
             ) = tree_cache.match_prefix(
-                key=self.adjust_max_prefix_ids(),
+                key=RadixKey(self.adjust_max_prefix_ids(), self.extra_key),
             )
             self.last_matched_prefix_len = len(self.prefix_indices)
         self.extend_input_len = len(self.fill_ids) - len(self.prefix_indices)
@@ -1340,6 +1344,12 @@ class ScheduleBatch:
         if precision_tracer.get_trace_active():
             self._generate_trace_info(real_bs, bid)
 
+        # Extract lora_ids from requests
+        lora_ids = [req.lora_id for req in self.reqs]
+        # Pad lora_ids to match seq_lens_cpu length (after bs padding)
+        if bs_padding_size > 0:
+            lora_ids = lora_ids + [None] * bs_padding_size
+
         return ModelWorkerBatch(
             bid=bid,
             forward_mode=self.forward_mode,
@@ -1361,7 +1371,7 @@ class ScheduleBatch:
             extend_seq_lens=(extend_seq_lens if self.forward_mode == ForwardMode.EXTEND else None),
             extend_logprob_start_lens=extend_logprob_start_lens,
             extend_input_logprob_token_ids=self.extend_input_logprob_token_ids,
-            lora_ids=[req.lora_id for req in self.reqs] + [None] * bs_padding_size,
+            lora_ids=lora_ids,
             real_bs=real_bs,
             capture_hidden_mode=CaptureHiddenMode.NULL,
             launch_done=self.launch_done,
@@ -1482,6 +1492,10 @@ class ScheduleBatch:
 
         if precision_tracer.get_trace_active():
             self._generate_trace_info(real_bs, bid)
+
+        # Extract lora_ids from requests
+        lora_ids = [req.lora_id for req in self.reqs]
+
         res = ModelWorkerBatch(
             bid=bid,
             forward_mode=self.forward_mode,
@@ -1501,6 +1515,7 @@ class ScheduleBatch:
             extend_seq_lens=(extend_seq_lens if self.forward_mode.is_extend() else None),
             extend_logprob_start_lens=extend_logprob_start_lens,
             extend_input_logprob_token_ids=self.extend_input_logprob_token_ids,
+            lora_ids=lora_ids,
             real_bs=real_bs,
             capture_hidden_mode=(
                 CaptureHiddenMode.FULL
@@ -1762,6 +1777,11 @@ class ModelWorkerBatch:
             )
             invalid_seq_lens = np.array([0] * bs_padding_size, dtype=seq_lens_cpu.dtype)
             seq_lens_cpu = np.concat([seq_lens_cpu, invalid_seq_lens], axis=0)
+
+            # Pad lora_ids if present
+            if self.lora_ids is not None:
+                self.lora_ids = self.lora_ids + [None] * bs_padding_size
+
             if self.forward_mode.is_extend():
                 invalid_extend_start_loc = np.array(
                     [self.extend_start_loc[-1] + self.extend_seq_lens[-1]] * bs_padding_size,
