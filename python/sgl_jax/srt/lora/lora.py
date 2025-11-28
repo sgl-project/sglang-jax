@@ -83,6 +83,16 @@ class LoRAAdapter(nnx.Module):
         model_path = self.config.path
         loader = DefaultModelLoader(self.load_config)
         revision = getattr(self.config.hf_config, "revision", None)
+
+        logger.info(
+            "Loading LoRA weights from %s (revision=%s)",
+            model_path,
+            revision if revision else "default",
+        )
+
+        weight_count = 0
+        layer_weight_count = {}
+
         for name, loaded_weight in loader._get_weights_iterator(
             DefaultModelLoader.Source(model_path, revision=revision, fall_back_to_pt=True)
         ):
@@ -90,5 +100,23 @@ class LoRAAdapter(nnx.Module):
             if match is not None:
                 layer_id = int(match.group(1))
                 self.layers[layer_id].weights[name] = loaded_weight
+                layer_weight_count[layer_id] = layer_weight_count.get(layer_id, 0) + 1
+                weight_count += 1
+
+                # Log first few weights for debugging
+                if weight_count <= 5:
+                    logger.debug(
+                        "Loaded weight: %s, shape=%s, dtype=%s",
+                        name,
+                        loaded_weight.shape,
+                        loaded_weight.dtype,
+                    )
             else:
                 self.weights[name] = loaded_weight
+                weight_count += 1
+
+        logger.info(
+            "LoRA weights loaded: total=%d weights, layer_distribution=%s",
+            weight_count,
+            dict(sorted(layer_weight_count.items())),
+        )

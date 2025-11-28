@@ -546,6 +546,20 @@ class _WriterLock:
         await self._rwlock.release_writer()
 
 
+# LoRA-related constants and utilities
+SUPPORTED_LORA_TARGET_MODULES = [
+    "q_proj",
+    "k_proj",
+    "v_proj",
+    "o_proj",
+    "gate_proj",
+    "up_proj",
+    "down_proj",
+]
+
+LORA_TARGET_ALL_MODULES = "all"
+
+
 class ConcurrentCounter:
     """
     An asynchronous counter for managing concurrent tasks that need

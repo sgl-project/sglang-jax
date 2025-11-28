@@ -19,6 +19,7 @@ from sgl_jax.srt.mem_cache.memory_pool import (
     ReqToTokenPool,
     SWAKVPool,
 )
+from sgl_jax.srt.mem_cache.radix_cache import RadixKey
 from sgl_jax.srt.mem_cache.swa_radix_cache import SWARadixCache
 
 
@@ -229,6 +230,92 @@ class TestSWARadixCache(unittest.TestCase):
         # Match should always return empty
         match = disabled_cache.match_prefix(key)
         self.assertEqual(len(match.device_indices), 0)
+
+    def test_extra_key_namespace_isolation(self):
+        """Test that same tokens with different extra_keys don't share cache in SWA"""
+        key = [1, 2, 3, 4, 5]
+
+        # Insert with extra_key="adapter_a"
+        value_a = self._alloc_indices(len(key))
+        self.cache.insert(RadixKey(key, "adapter_a"), value=value_a, prev_prefix_len=0)
+
+        # Insert with extra_key="adapter_b"
+        value_b = self._alloc_indices(len(key))
+        self.cache.insert(RadixKey(key, "adapter_b"), value=value_b, prev_prefix_len=0)
+
+        # Match with "adapter_a" should return value_a
+        match_a = self.cache.match_prefix(RadixKey(key, "adapter_a"))
+        np.testing.assert_array_equal(np.asarray(match_a.device_indices), value_a)
+
+        # Match with "adapter_b" should return value_b
+        match_b = self.cache.match_prefix(RadixKey(key, "adapter_b"))
+        np.testing.assert_array_equal(np.asarray(match_b.device_indices), value_b)
+
+        # Verify they don't share cache (different values)
+        self.assertFalse(np.array_equal(value_a, value_b))
+
+    def test_extra_key_same_namespace_sharing(self):
+        """Test that same tokens with same extra_key share cache in SWA"""
+        # Insert short sequence with extra_key
+        key_short = [10, 20, 30]
+        value_short = self._alloc_indices(len(key_short))
+        self.cache.insert(RadixKey(key_short, "shared_key"), value=value_short, prev_prefix_len=0)
+
+        # Insert longer sequence with same extra_key should reuse prefix
+        key_long = [10, 20, 30, 40, 50]
+        value_long = self._alloc_indices(len(key_long))
+        prefix_len = self.cache.insert(
+            RadixKey(key_long, "shared_key"), value=value_long, prev_prefix_len=0
+        )
+
+        # Should have matched the first 3 tokens from cache
+        self.assertGreater(prefix_len, 0)
+
+        # Matching the short key should still work
+        match_short = self.cache.match_prefix(RadixKey(key_short, "shared_key"))
+        self.assertEqual(len(match_short.device_indices), len(key_short))
+
+    def test_extra_key_none_vs_string(self):
+        """Test that None extra_key is different from a string extra_key"""
+        key = [100, 200, 300]
+
+        # Insert with extra_key=None
+        value_none = self._alloc_indices(len(key))
+        self.cache.insert(RadixKey(key, None), value=value_none, prev_prefix_len=0)
+
+        # Insert with extra_key="test"
+        value_test = self._alloc_indices(len(key))
+        self.cache.insert(RadixKey(key, "test"), value=value_test, prev_prefix_len=0)
+
+        # Match with None should return value_none
+        match_none = self.cache.match_prefix(RadixKey(key, None))
+        np.testing.assert_array_equal(np.asarray(match_none.device_indices), value_none)
+
+        # Match with "test" should return value_test
+        match_test = self.cache.match_prefix(RadixKey(key, "test"))
+        np.testing.assert_array_equal(np.asarray(match_test.device_indices), value_test)
+
+        # They should be different
+        self.assertFalse(np.array_equal(value_none, value_test))
+
+    def test_backward_compatibility_plain_list(self):
+        """Test that plain list still works (defaults to extra_key=None)"""
+        key = [7, 8, 9]
+        value = self._alloc_indices(len(key))
+
+        # Insert with plain list
+        prefix_len = self.cache.insert(key, value=value, prev_prefix_len=0)
+        self.assertEqual(prefix_len, 0)
+
+        # Match with plain list
+        match_plain = self.cache.match_prefix(key)
+        np.testing.assert_array_equal(np.asarray(match_plain.device_indices), value)
+
+        # Match with RadixKey(key, None) should give same result
+        match_radix = self.cache.match_prefix(RadixKey(key, None))
+        np.testing.assert_array_equal(
+            np.asarray(match_plain.device_indices), np.asarray(match_radix.device_indices)
+        )
 
 
 if __name__ == "__main__":
