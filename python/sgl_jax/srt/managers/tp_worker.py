@@ -79,6 +79,9 @@ class ModelWorker:
         self.mesh = mesh
         self.page_size = server_args.page_size
 
+        # need_prepare_lora_batch is False in overlap mode, default is True
+        self.need_prepare_lora_batch = True
+
         # Sync random seed across TP workers
         # Each process may have different random_seed. After broadcast, all processes will have the same random_seed.
         if server_args.random_seed is None:
@@ -457,6 +460,10 @@ class ModelWorker:
             forward_batch = model_worker_batch.forward_batch
         else:
             forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
+
+        # Prepare LoRA batch if LoRA is enabled
+        if self.worker.server_args.enable_lora and self.need_prepare_lora_batch:
+            self.get_model_runner().lora_manager.prepare_lora_batch(model_worker_batch)
 
         if forward_metadata is None:
             forward_metadata = self.worker.model_runner.attn_backend.get_forward_metadata(
