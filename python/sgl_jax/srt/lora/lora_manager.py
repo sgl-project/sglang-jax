@@ -98,7 +98,7 @@ class LoRAManager:
         """
         self.base_model = base_model
         self.base_hf_config = base_hf_config
-        self.max_loras_per_batch = max_loras_per_batch
+        self.max_loras_per_batch = 1 if server_args.enable_single_lora else max_loras_per_batch
         self.dtype = dtype
         self.mesh = mesh
         self.server_args = server_args
@@ -384,6 +384,8 @@ class LoRAManager:
         Raises:
             ValueError: If batch exceeds max_loras_per_batch or adapter not loaded
         """
+        if self.server_args.enable_single_lora:
+            return
         # Load active loras into lora memory pool
         cur_uids = set(model_worker_batch.lora_ids)
 
@@ -409,9 +411,21 @@ class LoRAManager:
 
         self.lora_backend.prepare_lora_batch(
             model_worker_batch=model_worker_batch,
-            weight_indices=weight_indices,
-            lora_ranks=lora_ranks,
-            scalings=scalings,
+            weight_indices=(
+                weight_indices
+                if not self.server_args.enable_single_lora
+                else [0] * len(model_worker_batch.lora_ids)
+            ),
+            lora_ranks=(
+                lora_ranks
+                if not self.server_args.enable_single_lora
+                else [self.max_lora_rank] * self.max_loras_per_batch
+            ),
+            scalings=(
+                scalings
+                if not self.server_args.enable_single_lora
+                else [self.server_args.lora_scaling] * self.max_loras_per_batch
+            ),
         )
 
         self.verify_sharding_preserved()

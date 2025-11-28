@@ -148,7 +148,7 @@ class ModelRunner:
             self.is_hybrid = True
 
         # Init lora
-        if server_args.enable_lora:
+        if server_args.enable_lora or server_args.enable_single_lora:
             self.init_lora_manager()
 
         self.initialize_jit()

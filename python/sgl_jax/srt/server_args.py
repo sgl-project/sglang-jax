@@ -158,6 +158,8 @@ class ServerArgs:
     max_loaded_loras: int | None = None
     max_loras_per_batch: int = 8
     lora_eviction_policy: str = "lru"
+    enable_single_lora: bool | None = None
+    lora_scaling: float | None = 1.0
 
     def __post_init__(self):
         # Set missing default values
@@ -932,6 +934,17 @@ class ServerArgs:
             choices=["lru"],
             help="Policy for evicting LoRA adapters when max_loaded_loras is reached.",
         )
+        parser.add_argument(
+            "--enable-single-lora",
+            action="store_true",
+            help="Enable single LoRA support for RL, and it is different from the combination of enable-lora and max-loras-per-batch",
+        )
+        parser.add_argument(
+            "--lora-scaling",
+            type=float,
+            default=ServerArgs.lora_scaling,
+            help="For lora, scaling = alpha/rank",
+        )
 
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace):
@@ -981,6 +994,10 @@ class ServerArgs:
         """Validate and normalize LoRA-related server arguments."""
         # Import LoRARef here to avoid circular imports
         from sgl_jax.srt.lora.lora_registry import LoRARef
+
+        assert (
+            self.enable_lora and self.enable_single_lora
+        ), f"{self.enable_lora} and {self.enable_single_lora} can not be enable at the same time"
 
         # Validate max_loras_per_batch
         assert self.max_loras_per_batch > 0, "max_loras_per_batch must be positive"
