@@ -235,7 +235,7 @@ class ModelWorker:
                     self.precompile_cache_loc_paddings[-1],
                 )
                 # Prepare LoRA batch if LoRA is enabled
-                if self.server_args.enable_lora:
+                if self.server_args.enable_lora or self.server_args.enable_single_lora:
                     self.get_model_runner().lora_manager.prepare_lora_batch(model_worker_batch)
                 sampling_metadata = SamplingMetadata.from_model_worker_batch(
                     model_worker_batch,
@@ -277,7 +277,7 @@ class ModelWorker:
                     aligned_cache_loc_size,
                 )
                 # Prepare LoRA batch if LoRA is enabled
-                if self.server_args.enable_lora:
+                if self.server_args.enable_lora or self.server_args.enable_single_lora:
                     self.get_model_runner().lora_manager.prepare_lora_batch(model_worker_batch)
                 sampling_metadata = SamplingMetadata.from_model_worker_batch(
                     model_worker_batch, 0, self.mesh, self.model_config.vocab_size
