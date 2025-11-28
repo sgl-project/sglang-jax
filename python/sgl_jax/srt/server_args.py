@@ -1032,6 +1032,20 @@ class ServerArgs:
         if not self.enable_lora:
             return
 
+        # Expand target modules
+        if self.lora_target_modules:
+            self.lora_target_modules = set(self.lora_target_modules)
+            if "all" in self.lora_target_modules:
+                assert (
+                    len(self.lora_target_modules) == 1
+                ), "If 'all' is specified in --lora-target-modules, it should be the only module specified."
+                self.lora_target_modules = set(SUPPORTED_LORA_TARGET_MODULES)
+
+        # Ensure sufficient information is provided for LoRA initialization.
+        assert self.lora_paths or (
+            self.max_lora_rank and self.lora_target_modules
+        ), "When no initial --lora-paths is provided, you need to specify both --max-lora-rank and --lora-target-modules for LoRA initialization."
+
         # Normalize lora_paths to List[LoRARef]
         if self.lora_paths is not None:
             normalized_lora_refs = []

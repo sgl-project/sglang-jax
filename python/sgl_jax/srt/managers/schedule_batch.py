@@ -163,7 +163,6 @@ class Req:
         stream: bool = False,
         lora_id: str | None = None,
         extra_key: str | None = None,
-
         origin_input_ids_unpadded: tuple[int] | None = None,
         eos_token_ids: set[int] | None = None,
         vocab_size: int | None = None,
@@ -191,7 +190,6 @@ class Req:
         self.lora_id = lora_id
         # Extra key for cache namespace isolation (e.g., cache_salt, lora_id)
         self.extra_key = extra_key
-
 
         # Memory pool info
         self.req_pool_idx: int | None = None

@@ -94,7 +94,6 @@ class LoRAAdapter(nnx.Module):
         weight_count = 0
         layer_weight_count = {}
 
-
         for name, loaded_weight in loader._get_weights_iterator(
             DefaultModelLoader.Source(model_path, revision=revision, fall_back_to_pt=True)
         ):

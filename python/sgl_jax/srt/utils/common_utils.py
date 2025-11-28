@@ -443,11 +443,7 @@ def next_power_of_2(x: int):
     if x == 1:
         return 1
     return 1 << (x - 1).bit_length()
-<<<<<<< HEAD
 
-
-=======
->>>>>>> 603c4440 (feat: lora initial code (#432))
 class RWLock:
     """An async reader-writer lock for LoRA adapter management."""
 
@@ -550,6 +546,9 @@ class _WriterLock:
 
 
 <<<<<<< HEAD
+<<<<<<< HEAD
+=======
+>>>>>>> b2c7a610 (feat: infer lora target modules from adapters (#496))
 # LoRA-related constants and utilities
 SUPPORTED_LORA_TARGET_MODULES = [
     "q_proj",
@@ -564,8 +563,11 @@ SUPPORTED_LORA_TARGET_MODULES = [
 LORA_TARGET_ALL_MODULES = "all"
 
 
+<<<<<<< HEAD
 =======
 >>>>>>> 603c4440 (feat: lora initial code (#432))
+=======
+>>>>>>> b2c7a610 (feat: infer lora target modules from adapters (#496))
 class ConcurrentCounter:
     """
     An asynchronous counter for managing concurrent tasks that need

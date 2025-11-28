@@ -171,7 +171,6 @@ class GenerateReqInput:
     # Extra key for cache namespace isolation (e.g., cache_salt)
     extra_key: list[str] | str | None = None
 
-
     def _normalize_rid(self, num):
         """Normalize request IDs for batch processing."""
         if self.rid is None:
