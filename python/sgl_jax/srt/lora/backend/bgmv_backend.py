@@ -234,6 +234,26 @@ class BgmvLoRABackend(BaseLoRABackend):
             lora_ranks=jnp.array(padded_lora_ranks_cpu, dtype=jnp.int32),
         )
 
+        # Print batch info on CPU for debugging
+        print(f"\n[LoRA Batch Info - {model_worker_batch.forward_mode.name}]")
+        print(f"  Input shape: {model_worker_batch.input_ids.shape}")
+        print(f"  Batch size: {len(model_worker_batch.seq_lens)}")
+        print(f"  Seq lens: {model_worker_batch.seq_lens}")
+        print(f"  Weight indices (per seq): {weight_indices}")
+        print(f"  LoRA ranks (per seq): {lora_ranks_bs}")
+        print(f"  Scalings (per seq): {scalings_bs}")
+        print("\n  CPU Arrays (per token):")
+        print(f"    token_lora_indices shape: {padded_token_lora_indices_cpu.shape}")
+        print(f"    token_lora_indices: {padded_token_lora_indices_cpu}")
+        print(f"    lora_ranks shape: {padded_lora_ranks_cpu.shape}")
+        print(f"    lora_ranks: {padded_lora_ranks_cpu}")
+        print(f"    scalings shape: {padded_scalings_cpu.shape}")
+        print(f"    scalings: {padded_scalings_cpu}")
+        print(
+            f"  Num padding tokens: {num_to_pad if model_worker_batch.forward_mode == ForwardMode.EXTEND else 0}"
+        )
+        print()
+
         self.batch_info = batch_info
 
 
