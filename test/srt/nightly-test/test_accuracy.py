@@ -23,7 +23,6 @@ from sgl_jax.test.test_utils import (
     DEEPSEEK_R1_DISTILL_QWEN_1_5B,
     QWEN2_5_7B_INSTRUCT,
     CustomTestCase,
-    popen_launch_server,
 )
 
 
@@ -32,7 +31,7 @@ class TestModelAccuracy(CustomTestCase):
         model = QWEN_7B
         base_url = DEFAULT_URL_FOR_TEST
         api_url_for_eval = f"{base_url}/v1"
-        csv_file_path = "/home/gcpuser/sky_workdir/sglang-jax/eval_results.csv" 
+        csv_file_path = "../nightly_test_output/benchmark/benchmark_results.csv" 
 
         # launch server
         process = popen_launch_server(
@@ -72,8 +71,8 @@ class TestModelAccuracy(CustomTestCase):
                 threshold = task["threshold"]
                 
                 dataset_args = {}
-                if dataset_name == "mmlu" or dataset_name == "modelscope/mmlu":
-                    dataset_args = {"mmlu": {"subset_list": ["global_facts"]}}
+                # if dataset_name == "mmlu" or dataset_name == "modelscope/mmlu":
+                #     dataset_args = {"mmlu": {"subset_list": ["global_facts"]}}
                 
 
                 config = TaskConfig(
@@ -94,9 +93,9 @@ class TestModelAccuracy(CustomTestCase):
                     score = report.score
                     try:
                         rows = []
-                        fieldnames = ["Model"] # 默认第一列
-                        ##########################csv文件操作
-                        # 1. 读取现有文件（如果存在）
+                        fieldnames = ["Model"] 
+                        
+                        
                         if os.path.exists(csv_file_path):
                             with open(csv_file_path, 'r', newline='', encoding='utf-8') as f:
                                 reader = csv.DictReader(f)
@@ -104,24 +103,24 @@ class TestModelAccuracy(CustomTestCase):
                                     fieldnames = reader.fieldnames
                                 rows = list(reader)
                         
-                        # 2. 动态更新列头（如果当前数据集不在列头中，则添加）
+                        
                         if dataset_name not in fieldnames:
                             fieldnames.append(dataset_name)
 
-                        # 3. 更新或插入数据行
+                        
                         model_found = False
                         for row in rows:
                             if row.get("Model") == model:
-                                row[dataset_name] = score # 更新分数
+                                row[dataset_name] = score 
                                 model_found = True
                                 break
                         
                         if not model_found:
-                            # 如果没找到该模型的行，创建新行
+                            
                             new_row = {"Model": model, dataset_name: score}
                             rows.append(new_row)
 
-                        # 4. 写回 CSV 文件
+                        
                         with open(csv_file_path, 'w', newline='', encoding='utf-8') as f:
                             writer = csv.DictWriter(f, fieldnames=fieldnames)
                             writer.writeheader()
@@ -145,7 +144,7 @@ class TestModelAccuracy(CustomTestCase):
         model = QWEN3_8B
         base_url = DEFAULT_URL_FOR_TEST
         api_url_for_eval = f"{base_url}/v1"
-        csv_file_path = "/home/gcpuser/sky_workdir/sglang-jax/eval_results.csv" 
+        csv_file_path = "../nightly_test_output/benchmark/benchmark_results.csv" 
 
         # launch server
         process = popen_launch_server(
@@ -194,8 +193,8 @@ class TestModelAccuracy(CustomTestCase):
                 threshold = task["threshold"]
                 
                 dataset_args = {}
-                if dataset_name == "mmlu" or dataset_name == "modelscope/mmlu":
-                    dataset_args = {"mmlu": {"subset_list": ["global_facts"]}}
+                # if dataset_name == "mmlu" or dataset_name == "modelscope/mmlu":
+                #     dataset_args = {"mmlu": {"subset_list": ["global_facts"]}}
                 
 
                 config = TaskConfig(
@@ -216,9 +215,9 @@ class TestModelAccuracy(CustomTestCase):
                     score = report.score
                     try:
                         rows = []
-                        fieldnames = ["Model"] # 默认第一列
-                        ##########################csv文件操作
-                        # 1. 读取现有文件（如果存在）
+                        fieldnames = ["Model"] 
+                        
+                        
                         if os.path.exists(csv_file_path):
                             with open(csv_file_path, 'r', newline='', encoding='utf-8') as f:
                                 reader = csv.DictReader(f)
@@ -226,24 +225,24 @@ class TestModelAccuracy(CustomTestCase):
                                     fieldnames = reader.fieldnames
                                 rows = list(reader)
                         
-                        # 2. 动态更新列头（如果当前数据集不在列头中，则添加）
+                        
                         if dataset_name not in fieldnames:
                             fieldnames.append(dataset_name)
 
-                        # 3. 更新或插入数据行
+                        
                         model_found = False
                         for row in rows:
                             if row.get("Model") == model:
-                                row[dataset_name] = score # 更新分数
+                                row[dataset_name] = score 
                                 model_found = True
                                 break
                         
                         if not model_found:
-                            # 如果没找到该模型的行，创建新行
+                            
                             new_row = {"Model": model, dataset_name: score}
                             rows.append(new_row)
 
-                        # 4. 写回 CSV 文件
+                        
                         with open(csv_file_path, 'w', newline='', encoding='utf-8') as f:
                             writer = csv.DictWriter(f, fieldnames=fieldnames)
                             writer.writeheader()
@@ -267,7 +266,7 @@ class TestModelAccuracy(CustomTestCase):
         model = DEEPSEEK_R1_DISTILL_QWEN_1_5B
         base_url = DEFAULT_URL_FOR_TEST
         api_url_for_eval = f"{base_url}/v1"
-        csv_file_path = "/home/gcpuser/sky_workdir/sglang-jax/eval_results.csv" 
+        csv_file_path = "../nightly_test_output/benchmark/benchmark_results.csv" 
         process = popen_launch_server(
             model,
             base_url,
@@ -315,8 +314,8 @@ class TestModelAccuracy(CustomTestCase):
                 threshold = task["threshold"]
                 
                 dataset_args = {}
-                if dataset_name == "mmlu" or dataset_name == "modelscope/mmlu":
-                    dataset_args = {"mmlu": {"subset_list": ["global_facts"]}}
+                # if dataset_name == "mmlu" or dataset_name == "modelscope/mmlu":
+                #     dataset_args = {"mmlu": {"subset_list": ["global_facts"]}}
                 
 
                 config = TaskConfig(
@@ -337,9 +336,9 @@ class TestModelAccuracy(CustomTestCase):
                     score = report.score
                     try:
                         rows = []
-                        fieldnames = ["Model"] # 默认第一列
-                        ##########################csv文件操作
-                        # 1. 读取现有文件（如果存在）
+                        fieldnames = ["Model"] 
+                        
+                        
                         if os.path.exists(csv_file_path):
                             with open(csv_file_path, 'r', newline='', encoding='utf-8') as f:
                                 reader = csv.DictReader(f)
@@ -347,24 +346,24 @@ class TestModelAccuracy(CustomTestCase):
                                     fieldnames = reader.fieldnames
                                 rows = list(reader)
                         
-                        # 2. 动态更新列头（如果当前数据集不在列头中，则添加）
+                        
                         if dataset_name not in fieldnames:
                             fieldnames.append(dataset_name)
 
-                        # 3. 更新或插入数据行
+                        
                         model_found = False
                         for row in rows:
                             if row.get("Model") == model:
-                                row[dataset_name] = score # 更新分数
+                                row[dataset_name] = score 
                                 model_found = True
                                 break
                         
                         if not model_found:
-                            # 如果没找到该模型的行，创建新行
+                            
                             new_row = {"Model": model, dataset_name: score}
                             rows.append(new_row)
 
-                        # 4. 写回 CSV 文件
+                        
                         with open(csv_file_path, 'w', newline='', encoding='utf-8') as f:
                             writer = csv.DictWriter(f, fieldnames=fieldnames)
                             writer.writeheader()
@@ -388,7 +387,7 @@ class TestModelAccuracy(CustomTestCase):
         model = GEMMA2_2B_IT
         base_url = DEFAULT_URL_FOR_TEST
         api_url_for_eval = f"{base_url}/v1"
-        csv_file_path = "/home/gcpuser/sky_workdir/sglang-jax/eval_results.csv" 
+        csv_file_path = "../nightly_test_output/benchmark/benchmark_results.csv" 
         process = popen_launch_server(
             model,
             base_url,
@@ -435,8 +434,8 @@ class TestModelAccuracy(CustomTestCase):
                 threshold = task["threshold"]
                 
                 dataset_args = {}
-                if dataset_name == "mmlu" or dataset_name == "modelscope/mmlu":
-                    dataset_args = {"mmlu": {"subset_list": ["global_facts"]}}
+                # if dataset_name == "mmlu" or dataset_name == "modelscope/mmlu":
+                #     dataset_args = {"mmlu": {"subset_list": ["global_facts"]}}
                 
 
                 config = TaskConfig(
@@ -457,9 +456,9 @@ class TestModelAccuracy(CustomTestCase):
                     score = report.score
                     try:
                         rows = []
-                        fieldnames = ["Model"] # 默认第一列
-                        ##########################csv文件操作
-                        # 1. 读取现有文件（如果存在）
+                        fieldnames = ["Model"] 
+                        
+                        
                         if os.path.exists(csv_file_path):
                             with open(csv_file_path, 'r', newline='', encoding='utf-8') as f:
                                 reader = csv.DictReader(f)
@@ -467,24 +466,24 @@ class TestModelAccuracy(CustomTestCase):
                                     fieldnames = reader.fieldnames
                                 rows = list(reader)
                         
-                        # 2. 动态更新列头（如果当前数据集不在列头中，则添加）
+                        
                         if dataset_name not in fieldnames:
                             fieldnames.append(dataset_name)
 
-                        # 3. 更新或插入数据行
+                        
                         model_found = False
                         for row in rows:
                             if row.get("Model") == model:
-                                row[dataset_name] = score # 更新分数
+                                row[dataset_name] = score 
                                 model_found = True
                                 break
                         
                         if not model_found:
-                            # 如果没找到该模型的行，创建新行
+                            
                             new_row = {"Model": model, dataset_name: score}
                             rows.append(new_row)
 
-                        # 4. 写回 CSV 文件
+                        
                         with open(csv_file_path, 'w', newline='', encoding='utf-8') as f:
                             writer = csv.DictWriter(f, fieldnames=fieldnames)
                             writer.writeheader()
@@ -512,7 +511,7 @@ class TestModelAccuracy(CustomTestCase):
         model = QWEN_7B
         base_url = DEFAULT_URL_FOR_TEST
         api_url_for_eval = f"{base_url}/v1"
-        csv_file_path = "/home/gcpuser/sky_workdir/sglang-jax/eval_4_results.csv" 
+        csv_file_path = "../nightly_test_output/benchmark/benchmark_tp_4_results.csv" 
         process = popen_launch_server(
             model,
             DEFAULT_URL_FOR_TEST,
@@ -581,9 +580,9 @@ class TestModelAccuracy(CustomTestCase):
                     score = report.score
                     try:
                         rows = []
-                        fieldnames = ["Model"] # 默认第一列
-                        ##########################csv文件操作
-                        # 1. 读取现有文件（如果存在）
+                        fieldnames = ["Model"] 
+                        
+                        
                         if os.path.exists(csv_file_path):
                             with open(csv_file_path, 'r', newline='', encoding='utf-8') as f:
                                 reader = csv.DictReader(f)
@@ -591,24 +590,24 @@ class TestModelAccuracy(CustomTestCase):
                                     fieldnames = reader.fieldnames
                                 rows = list(reader)
                         
-                        # 2. 动态更新列头（如果当前数据集不在列头中，则添加）
+                        
                         if dataset_name not in fieldnames:
                             fieldnames.append(dataset_name)
 
-                        # 3. 更新或插入数据行
+                        
                         model_found = False
                         for row in rows:
                             if row.get("Model") == model:
-                                row[dataset_name] = score # 更新分数
+                                row[dataset_name] = score 
                                 model_found = True
                                 break
                         
                         if not model_found:
-                            # 如果没找到该模型的行，创建新行
+                            
                             new_row = {"Model": model, dataset_name: score}
                             rows.append(new_row)
 
-                        # 4. 写回 CSV 文件
+                        
                         with open(csv_file_path, 'w', newline='', encoding='utf-8') as f:
                             writer = csv.DictWriter(f, fieldnames=fieldnames)
                             writer.writeheader()
@@ -633,7 +632,7 @@ class TestModelAccuracy(CustomTestCase):
         model = QWEN3_8B
         base_url = DEFAULT_URL_FOR_TEST
         api_url_for_eval = f"{base_url}/v1"
-        csv_file_path = "/home/gcpuser/sky_workdir/sglang-jax/eval_4_results.csv" 
+        csv_file_path = "../nightly_test_output/benchmark/benchmark_tp_4_results.csv" 
         process = popen_launch_server(
             model,
             DEFAULT_URL_FOR_TEST,
@@ -702,9 +701,9 @@ class TestModelAccuracy(CustomTestCase):
                     score = report.score
                     try:
                         rows = []
-                        fieldnames = ["Model"] # 默认第一列
-                        ##########################csv文件操作
-                        # 1. 读取现有文件（如果存在）
+                        fieldnames = ["Model"] 
+                        
+                        
                         if os.path.exists(csv_file_path):
                             with open(csv_file_path, 'r', newline='', encoding='utf-8') as f:
                                 reader = csv.DictReader(f)
@@ -712,24 +711,24 @@ class TestModelAccuracy(CustomTestCase):
                                     fieldnames = reader.fieldnames
                                 rows = list(reader)
                         
-                        # 2. 动态更新列头（如果当前数据集不在列头中，则添加）
+                        
                         if dataset_name not in fieldnames:
                             fieldnames.append(dataset_name)
 
-                        # 3. 更新或插入数据行
+                        
                         model_found = False
                         for row in rows:
                             if row.get("Model") == model:
-                                row[dataset_name] = score # 更新分数
+                                row[dataset_name] = score 
                                 model_found = True
                                 break
                         
                         if not model_found:
-                            # 如果没找到该模型的行，创建新行
+                            
                             new_row = {"Model": model, dataset_name: score}
                             rows.append(new_row)
 
-                        # 4. 写回 CSV 文件
+                        
                         with open(csv_file_path, 'w', newline='', encoding='utf-8') as f:
                             writer = csv.DictWriter(f, fieldnames=fieldnames)
                             writer.writeheader()
@@ -753,7 +752,7 @@ class TestModelAccuracy(CustomTestCase):
         model = GEMMA2_2B_IT
         base_url = DEFAULT_URL_FOR_TEST
         api_url_for_eval = f"{base_url}/v1"
-        csv_file_path = "/home/gcpuser/sky_workdir/sglang-jax/eval_4_results.csv" 
+        csv_file_path = "../nightly_test_output/benchmark/benchmark_tp_4_results.csv" 
         process = popen_launch_server(
             model,
             DEFAULT_URL_FOR_TEST,
@@ -823,9 +822,9 @@ class TestModelAccuracy(CustomTestCase):
                     score = report.score
                     try:
                         rows = []
-                        fieldnames = ["Model"] # 默认第一列
-                        ##########################csv文件操作
-                        # 1. 读取现有文件（如果存在）
+                        fieldnames = ["Model"] 
+                        
+                        
                         if os.path.exists(csv_file_path):
                             with open(csv_file_path, 'r', newline='', encoding='utf-8') as f:
                                 reader = csv.DictReader(f)
@@ -833,24 +832,24 @@ class TestModelAccuracy(CustomTestCase):
                                     fieldnames = reader.fieldnames
                                 rows = list(reader)
                         
-                        # 2. 动态更新列头（如果当前数据集不在列头中，则添加）
+                        
                         if dataset_name not in fieldnames:
                             fieldnames.append(dataset_name)
 
-                        # 3. 更新或插入数据行
+                        
                         model_found = False
                         for row in rows:
                             if row.get("Model") == model:
-                                row[dataset_name] = score # 更新分数
+                                row[dataset_name] = score 
                                 model_found = True
                                 break
                         
                         if not model_found:
-                            # 如果没找到该模型的行，创建新行
+                            
                             new_row = {"Model": model, dataset_name: score}
                             rows.append(new_row)
 
-                        # 4. 写回 CSV 文件
+                        
                         with open(csv_file_path, 'w', newline='', encoding='utf-8') as f:
                             writer = csv.DictWriter(f, fieldnames=fieldnames)
                             writer.writeheader()
@@ -874,7 +873,7 @@ class TestModelAccuracy(CustomTestCase):
         model = QWEN3_CODER_30B_A3B_INSTRUCT
         base_url = DEFAULT_URL_FOR_TEST
         api_url_for_eval = f"{base_url}/v1"
-        csv_file_path = "/home/gcpuser/sky_workdir/sglang-jax/eval_4_results.csv" 
+        csv_file_path = "../nightly_test_output/benchmark/benchmark_tp_4_results.csv" 
         process = popen_launch_server(
             model,
             DEFAULT_URL_FOR_TEST,
@@ -946,9 +945,9 @@ class TestModelAccuracy(CustomTestCase):
                     score = report.score
                     try:
                         rows = []
-                        fieldnames = ["Model"] # 默认第一列
-                        ##########################csv文件操作
-                        # 1. 读取现有文件（如果存在）
+                        fieldnames = ["Model"] 
+                        
+                        
                         if os.path.exists(csv_file_path):
                             with open(csv_file_path, 'r', newline='', encoding='utf-8') as f:
                                 reader = csv.DictReader(f)
@@ -956,24 +955,24 @@ class TestModelAccuracy(CustomTestCase):
                                     fieldnames = reader.fieldnames
                                 rows = list(reader)
                         
-                        # 2. 动态更新列头（如果当前数据集不在列头中，则添加）
+                        
                         if dataset_name not in fieldnames:
                             fieldnames.append(dataset_name)
 
-                        # 3. 更新或插入数据行
+                        
                         model_found = False
                         for row in rows:
                             if row.get("Model") == model:
-                                row[dataset_name] = score # 更新分数
+                                row[dataset_name] = score 
                                 model_found = True
                                 break
                         
                         if not model_found:
-                            # 如果没找到该模型的行，创建新行
+                            
                             new_row = {"Model": model, dataset_name: score}
                             rows.append(new_row)
 
-                        # 4. 写回 CSV 文件
+                        
                         with open(csv_file_path, 'w', newline='', encoding='utf-8') as f:
                             writer = csv.DictWriter(f, fieldnames=fieldnames)
                             writer.writeheader()
@@ -997,7 +996,7 @@ class TestModelAccuracy(CustomTestCase):
         model = DEEPSEEK_R1_DISTILL_QWEN_1_5B
         base_url = DEFAULT_URL_FOR_TEST
         api_url_for_eval = f"{base_url}/v1"
-        csv_file_path = "/home/gcpuser/sky_workdir/sglang-jax/eval_4_results.csv"
+        csv_file_path = "../nightly_test_output/benchmark/benchmark_tp_4_results.csv"
         process = popen_launch_server(
             model,
             DEFAULT_URL_FOR_TEST,
@@ -1067,9 +1066,9 @@ class TestModelAccuracy(CustomTestCase):
                     score = report.score
                     try:
                         rows = []
-                        fieldnames = ["Model"] # 默认第一列
-                        ##########################csv文件操作
-                        # 1. 读取现有文件（如果存在）
+                        fieldnames = ["Model"] 
+                        
+                        
                         if os.path.exists(csv_file_path):
                             with open(csv_file_path, 'r', newline='', encoding='utf-8') as f:
                                 reader = csv.DictReader(f)
@@ -1077,24 +1076,24 @@ class TestModelAccuracy(CustomTestCase):
                                     fieldnames = reader.fieldnames
                                 rows = list(reader)
                         
-                        # 2. 动态更新列头（如果当前数据集不在列头中，则添加）
+                        
                         if dataset_name not in fieldnames:
                             fieldnames.append(dataset_name)
 
-                        # 3. 更新或插入数据行
+                        
                         model_found = False
                         for row in rows:
                             if row.get("Model") == model:
-                                row[dataset_name] = score # 更新分数
+                                row[dataset_name] = score 
                                 model_found = True
                                 break
                         
                         if not model_found:
-                            # 如果没找到该模型的行，创建新行
+                            
                             new_row = {"Model": model, dataset_name: score}
                             rows.append(new_row)
 
-                        # 4. 写回 CSV 文件
+                        
                         with open(csv_file_path, 'w', newline='', encoding='utf-8') as f:
                             writer = csv.DictWriter(f, fieldnames=fieldnames)
                             writer.writeheader()
@@ -1121,7 +1120,7 @@ class TestModelAccuracy(CustomTestCase):
         model = bailing_moe
         base_url = DEFAULT_URL_FOR_TEST
         api_url_for_eval = f"{base_url}/v1"
-        csv_file_path = "/home/gcpuser/sky_workdir/sglang-jax/eval_2_2_results.csv" 
+        csv_file_path = "../nightly_test_output/benchmark/benchmark_tp_2_ep_2results.csv" 
         process = popen_launch_server(
             model,
             DEFAULT_URL_FOR_TEST,
@@ -1193,9 +1192,9 @@ class TestModelAccuracy(CustomTestCase):
                     score = report.score
                     try:
                         rows = []
-                        fieldnames = ["Model"] # 默认第一列
-                        ##########################csv文件操作
-                        # 1. 读取现有文件（如果存在）
+                        fieldnames = ["Model"] 
+                        
+                        
                         if os.path.exists(csv_file_path):
                             with open(csv_file_path, 'r', newline='', encoding='utf-8') as f:
                                 reader = csv.DictReader(f)
@@ -1203,24 +1202,24 @@ class TestModelAccuracy(CustomTestCase):
                                     fieldnames = reader.fieldnames
                                 rows = list(reader)
                         
-                        # 2. 动态更新列头（如果当前数据集不在列头中，则添加）
+                        
                         if dataset_name not in fieldnames:
                             fieldnames.append(dataset_name)
 
-                        # 3. 更新或插入数据行
+                        
                         model_found = False
                         for row in rows:
                             if row.get("Model") == model:
-                                row[dataset_name] = score # 更新分数
+                                row[dataset_name] = score 
                                 model_found = True
                                 break
                         
                         if not model_found:
-                            # 如果没找到该模型的行，创建新行
+                            
                             new_row = {"Model": model, dataset_name: score}
                             rows.append(new_row)
 
-                        # 4. 写回 CSV 文件
+                        
                         with open(csv_file_path, 'w', newline='', encoding='utf-8') as f:
                             writer = csv.DictWriter(f, fieldnames=fieldnames)
                             writer.writeheader()
@@ -1244,7 +1243,7 @@ class TestModelAccuracy(CustomTestCase):
         model = QWEN3_CODER_30B_A3B_INSTRUCT
         base_url = DEFAULT_URL_FOR_TEST
         api_url_for_eval = f"{base_url}/v1"
-        csv_file_path = "/home/gcpuser/sky_workdir/sglang-jax/eval_2_2_results.csv" 
+        csv_file_path = "../nightly_test_output/benchmark/benchmark_tp_2_ep_2results.csv" 
         process = popen_launch_server(
             model,
             DEFAULT_URL_FOR_TEST,
@@ -1316,9 +1315,9 @@ class TestModelAccuracy(CustomTestCase):
                     score = report.score
                     try:
                         rows = []
-                        fieldnames = ["Model"] # 默认第一列
-                        ##########################csv文件操作
-                        # 1. 读取现有文件（如果存在）
+                        fieldnames = ["Model"] 
+                        
+                        
                         if os.path.exists(csv_file_path):
                             with open(csv_file_path, 'r', newline='', encoding='utf-8') as f:
                                 reader = csv.DictReader(f)
@@ -1326,24 +1325,24 @@ class TestModelAccuracy(CustomTestCase):
                                     fieldnames = reader.fieldnames
                                 rows = list(reader)
                         
-                        # 2. 动态更新列头（如果当前数据集不在列头中，则添加）
+                        
                         if dataset_name not in fieldnames:
                             fieldnames.append(dataset_name)
 
-                        # 3. 更新或插入数据行
+                        
                         model_found = False
                         for row in rows:
                             if row.get("Model") == model:
-                                row[dataset_name] = score # 更新分数
+                                row[dataset_name] = score 
                                 model_found = True
                                 break
                         
                         if not model_found:
-                            # 如果没找到该模型的行，创建新行
+                            
                             new_row = {"Model": model, dataset_name: score}
                             rows.append(new_row)
 
-                        # 4. 写回 CSV 文件
+                        
                         with open(csv_file_path, 'w', newline='', encoding='utf-8') as f:
                             writer = csv.DictWriter(f, fieldnames=fieldnames)
                             writer.writeheader()

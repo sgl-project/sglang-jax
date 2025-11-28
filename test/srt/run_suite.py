@@ -160,9 +160,9 @@ suites = {
             "nightly-test/test_accuracy.py",
 
              test_methods=["TestModelAccuracy.test_qwen_7b",
-                          #"TestModelAccuracy.test_qwen3_8b",
-                          #"TestModelAccuracy.test_DEEPSEEK_R1_DISTILL_QWEN_1_5B",  
-                          #"TestModelAccuracy.test_GEMMA2_2B_IT", 
+                          "TestModelAccuracy.test_qwen3_8b",
+                          "TestModelAccuracy.test_DEEPSEEK_R1_DISTILL_QWEN_1_5B",  
+                          "TestModelAccuracy.test_GEMMA2_2B_IT", 
                           ],
 
         )
@@ -170,11 +170,11 @@ suites = {
     "nightly-test-accuracy-text-models-tpu-v6e-4": [
         TestFile(
             "nightly-test/test_accuracy.py",
-            test_methods=[#"TestModelAccuracy.test_qwen_7b_tp_4",
-                #"TestModelAccuracy.test_qwen3_8b_tp_4",
+            test_methods=["TestModelAccuracy.test_qwen_7b_tp_4",
+                "TestModelAccuracy.test_qwen3_8b_tp_4",
                 "TestModelAccuracy.test_bailing_moe_tp_2_ep2", 
-                # "TestModelAccuracy.test_DEEPSEEK_R1_DISTILL_QWEN_1_5B_tp_4",
-                # "TestModelAccuracy.test_QWEN3_CODER_30B_A3B_INSTRUCT_tp_2_ep_2",  
+                "TestModelAccuracy.test_DEEPSEEK_R1_DISTILL_QWEN_1_5B_tp_4",
+                "TestModelAccuracy.test_QWEN3_CODER_30B_A3B_INSTRUCT_tp_2_ep_2",  
                 "TestModelAccuracy.test_GEMMA2_2B_IT_tp_4", 
                 ],
         )
@@ -183,10 +183,10 @@ suites = {
         TestFile(
             "nightly-test/test_pref.py",
             test_methods=[
-                "TestModePerf.test_input_throughput_qwen_7b_con_8_1k_1",
-                "TestModePerf.test_output_throughput_qwen_7b_con_8_1k_1",
-                "TestModePerf.test_ttft_qwen_7b_con_8_1k_1",
-                "TestModePerf.test_itl_qwen_7b_con_8_1k_1",
+                "TestModePerf.test_qwen_7b_performance_tp_1",
+                "TestModePerf.test_qwen3_8b_performance_tp_1",
+                "TestModePerf.test_GEMMA2_2B_IT_performance_tp_1",
+                "TestModePerf.test_QWEN2_5_7B_INSTRUCT_performance_tp_1",
             ],
         )
     ],
@@ -194,10 +194,12 @@ suites = {
         TestFile(
             "nightly-test/test_pref.py",
             test_methods=[
-                "TestModePerf.test_input_throughput_qwen_7b_tp_4_con_8_1k_1",
-                "TestModePerf.test_output_throughput_qwen_7b_tp_4_con_8_1k_1",
-                "TestModePerf.test_ttft_qwen_7b_tp_4_con_8_1k_1",
-                "TestModePerf.test_itl_qwen_7b_tp_4_con_8_1k_1",
+                "TestModePerf.test_qwen_7b_performance_tp_4",
+                "TestModePerf.test_qwen3_8b_performance_tp_4",
+                "TestModePerf.test_QWEN3_CODER_30B_A3B_INSTRUCT_performance_tp_2_ep_2",
+                "TestModePerf.test_GEMMA2_2B_IT_performance_tp_4",
+                "TestModePerf.test_bailing_moe_performance_tp_2_ep_2",
+                "TestModePerf.test_QWEN2_5_7B_INSTRUCT_performance_tp_4",
             ],
         )
     ],
@@ -312,7 +314,7 @@ if __name__ == "__main__":
     arg_parser.add_argument(
         "--timeout-per-file",
         type=int,
-        default=1800,
+        default=180000,
         help="The time limit for running one file in seconds.",
     )
     arg_parser.add_argument(

@@ -44,6 +44,8 @@ jobs:
           uv pip install -e "python[all]"
           bash scripts/killall_sglang.sh
           cd test/srt
+          mkdir -p ../nightly_test_output/benchmark
+          mkdir -p ../nightly_test_output/pref
           python3 run_suite.py --suite nightly-test-accuracy-text-models-tpu-v6e-1
 
   nightly-test-accuracy-text-models-4-tpu:
