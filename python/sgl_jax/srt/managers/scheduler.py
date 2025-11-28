@@ -617,6 +617,7 @@ class Scheduler(
             stream=recv_req.stream,
             extra_key=recv_req.extra_key,
             lora_id=recv_req.lora_id,
+            extra_key=recv_req.extra_key,
             eos_token_ids=self.model_config.hf_eos_token_id,
             vocab_size=self.model_config.vocab_size,
         )

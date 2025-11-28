@@ -13,6 +13,8 @@ from sgl_jax.srt.function_call.function_call_parser import FunctionCallParser
 from sgl_jax.srt.hf_transformers_utils import check_gguf_file, get_config
 from sgl_jax.srt.reasoning_parser import ReasoningParser
 from sgl_jax.srt.utils.common_utils import (
+    LORA_TARGET_ALL_MODULES,
+    SUPPORTED_LORA_TARGET_MODULES,
     is_remote_url,
     is_valid_ipv6_address,
     nullable_str,
@@ -921,9 +923,12 @@ class ServerArgs:
         parser.add_argument(
             "--lora-target-modules",
             type=str,
+            choices=SUPPORTED_LORA_TARGET_MODULES + [LORA_TARGET_ALL_MODULES],
             nargs="*",
             default=None,
-            help="List of module names to apply LoRA to. If not specified, will be determined from adapters.",
+            help="List of module names to apply LoRA to. If not specified, will be determined from adapters. If not specified, "
+            "it will be automatically inferred from the adapters provided in --lora-paths. If 'all' is specified, "
+            "all supported modules will be targeted.",
         )
         parser.add_argument(
             "--lora-eviction-policy",
@@ -1008,6 +1013,20 @@ class ServerArgs:
             logger.info("Auto-enabling LoRA because lora_paths are provided")
         elif not self.enable_lora:
             return
+
+        # Expand target modules
+        if self.lora_target_modules:
+            self.lora_target_modules = set(self.lora_target_modules)
+            if "all" in self.lora_target_modules:
+                assert (
+                    len(self.lora_target_modules) == 1
+                ), "If 'all' is specified in --lora-target-modules, it should be the only module specified."
+                self.lora_target_modules = set(SUPPORTED_LORA_TARGET_MODULES)
+
+        # Ensure sufficient information is provided for LoRA initialization.
+        assert self.lora_paths or (
+            self.max_lora_rank and self.lora_target_modules
+        ), "When no initial --lora-paths is provided, you need to specify both --max-lora-rank and --lora-target-modules for LoRA initialization."
 
         # Normalize lora_paths to List[LoRARef]
         if self.lora_paths is not None:
