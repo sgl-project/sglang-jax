@@ -159,6 +159,9 @@ class ForwardBatch:
     extend_prefix_lens: jax.Array | None = None
     extend_seq_lens: jax.Array | None = None
 
+    # For LoRA
+    lora_ids: list[str] | None = None
+
     trace_request_ids: list[str] | None = None
     trace_request_objects: list | None = None
 
@@ -282,6 +285,7 @@ class ForwardBatch:
             cache_loc=cache_loc,
             extend_prefix_lens=extend_prefix_lens,
             extend_seq_lens=extend_seq_lens,
+            lora_ids=batch.lora_ids,
             attn_backend=model_runner.attn_backend,
             spec_info=batch.spec_info,
             spec_algorithm=batch.spec_algorithm,

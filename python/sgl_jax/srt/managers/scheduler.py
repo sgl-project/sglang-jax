@@ -151,6 +151,11 @@ class Scheduler(
         self.page_size = server_args.page_size
         self.enable_overlap = not server_args.disable_overlap_schedule
         self.spec_algorithm = SpeculativeAlgorithm.from_string(server_args.speculative_algorithm)
+
+        # LoRA configurations
+        self.lora_paths = server_args.lora_paths
+        self.max_loras_per_batch = server_args.max_loras_per_batch
+
         # Init inter-process communication
         context = zmq.Context(2)
 
@@ -605,6 +610,8 @@ class Scheduler(
             top_logprobs_num=recv_req.top_logprobs_num,
             token_ids_logprob=recv_req.token_ids_logprob,
             stream=recv_req.stream,
+            lora_id=recv_req.lora_id,
+            extra_key=recv_req.extra_key,
             eos_token_ids=self.model_config.hf_eos_token_id,
             vocab_size=self.model_config.vocab_size,
         )
@@ -1036,10 +1043,28 @@ class Scheduler(
             self.chunked_req.init_next_round_input()
             self.chunked_req = adder.add_chunked_req(self.chunked_req)
 
+        # Collect existing LoRA IDs in the running batch if LoRA is enabled
+        if self.lora_paths is not None:
+            lora_set = (
+                set([req.lora_id for req in self.running_batch.reqs])
+                if self.running_batch is not None
+                else set([])
+            )
+
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
             if running_bs + len(adder.can_run_list) >= self.max_running_requests:
                 self.running_batch.batch_is_full = True
+                break
+
+            # Check LoRA constraint: ensure we don't exceed max_loras_per_batch
+            if (
+                self.lora_paths is not None
+                and len(
+                    lora_set | set([req.lora_id for req in adder.can_run_list]) | set([req.lora_id])
+                )
+                > self.max_loras_per_batch
+            ):
                 break
 
             req.init_next_round_input(self.tree_cache)

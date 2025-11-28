@@ -41,6 +41,7 @@ from sgl_jax.srt.mem_cache.common import (
     alloc_token_slots,
 )
 from sgl_jax.srt.mem_cache.memory_pool import ReqToTokenPool
+from sgl_jax.srt.mem_cache.radix_cache import RadixKey
 from sgl_jax.srt.mem_cache.swa_radix_cache import SWARadixCache
 from sgl_jax.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
 from sgl_jax.srt.precision_tracer import (
@@ -159,6 +160,8 @@ class Req:
         top_logprobs_num: int = 0,
         token_ids_logprob: list[int] = None,
         stream: bool = False,
+        lora_id: str | None = None,
+        extra_key: str | None = None,
         origin_input_ids_unpadded: tuple[int] | None = None,
         eos_token_ids: set[int] | None = None,
         vocab_size: int | None = None,
@@ -181,6 +184,11 @@ class Req:
         # Sampling info
         self.sampling_params = sampling_params
         self.return_hidden_states = return_hidden_states
+
+        # LoRA info
+        self.lora_id = lora_id
+        # Extra key for cache namespace isolation (e.g., cache_salt, lora_id)
+        self.extra_key = extra_key
 
         # Memory pool info
         self.req_pool_idx: int | None = None
@@ -339,7 +347,7 @@ class Req:
                 self.last_host_node,
                 self.host_hit_length,
             ) = tree_cache.match_prefix(
-                key=self.adjust_max_prefix_ids(),
+                key=RadixKey(self.adjust_max_prefix_ids(), self.extra_key),
             )
             self.last_matched_prefix_len = len(self.prefix_indices)
         self.extend_input_len = len(self.fill_ids) - len(self.prefix_indices)
@@ -1357,6 +1365,7 @@ class ScheduleBatch:
             extend_seq_lens=(extend_seq_lens if self.forward_mode == ForwardMode.EXTEND else None),
             extend_logprob_start_lens=extend_logprob_start_lens,
             extend_input_logprob_token_ids=self.extend_input_logprob_token_ids,
+            lora_ids=[req.lora_id for req in self.reqs] + [None] * bs_padding_size,
             real_bs=real_bs,
             capture_hidden_mode=CaptureHiddenMode.NULL,
             launch_done=self.launch_done,
@@ -1651,6 +1660,9 @@ class ModelWorkerBatch:
 
     # For padding
     real_bs: int
+
+    # For LoRA
+    lora_ids: list[str] | None = None
 
     capture_hidden_mode: CaptureHiddenMode = None
 

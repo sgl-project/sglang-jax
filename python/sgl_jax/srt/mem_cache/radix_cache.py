@@ -3,6 +3,7 @@ from __future__ import annotations
 import heapq
 import time
 from collections import defaultdict
+from collections.abc import Iterator
 from functools import partial
 from typing import TYPE_CHECKING
 
@@ -10,13 +11,38 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from sgl_jax.srt.managers.schedule_batch import Req
 from sgl_jax.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sgl_jax.srt.mem_cache.base_prefix_cache import BasePrefixCache, MatchResult
 from sgl_jax.srt.mem_cache.memory_pool import ReqToTokenPool
 
 if TYPE_CHECKING:
-    pass
+    from sgl_jax.srt.managers.schedule_batch import Req
+
+
+class RadixKey:
+    """
+    Composite key for radix cache that combines token IDs and an optional extra key.
+    The extra key enables cache namespace isolation (e.g., for different LoRA adapters).
+    """
+
+    def __init__(self, token_ids: list[int], extra_key: str | None = None):
+        self.token_ids = token_ids
+        self.extra_key = extra_key
+
+    def __len__(self) -> int:
+        return len(self.token_ids)
+
+    def __iter__(self) -> Iterator[int]:
+        return iter(self.token_ids)
+
+    def __getitem__(self, idx: int | slice) -> RadixKey:
+        if isinstance(idx, slice):
+            return RadixKey(self.token_ids[idx], self.extra_key)
+        return RadixKey([self.token_ids[idx]], self.extra_key)
+
+    def __repr__(self) -> str:
+        preview = self.token_ids[:10]
+        return f"RadixKey(extra_key={self.extra_key!r}, token_ids={preview}{'...' if len(self.token_ids) > 10 else ''})"
 
 
 class TreeNode:
@@ -25,7 +51,7 @@ class TreeNode:
     def __init__(self, id: int | None = None):
         self.children = defaultdict(TreeNode)
         self.parent = None
-        self.key = None
+        self.key: RadixKey = None
         self.value = None
         self.lock_ref = 0
         self.last_access_time = time.monotonic()
@@ -51,25 +77,41 @@ class TreeNode:
         return self.last_access_time < other.last_access_time
 
 
-def _key_match_page_size1(key0: list, key1: list):
+def _check_extra_key(key0: RadixKey, key1: RadixKey):
+    """Check that two RadixKeys have the same extra_key."""
+    if key0.extra_key != key1.extra_key:
+        raise ValueError(
+            f"_key_match should be run on the same extra key, but got key0.extra_key={key0.extra_key} != key1.extra_key={key1.extra_key}"
+        )
+
+
+def _key_match_page_size1(key0: RadixKey, key1: RadixKey):
+    _check_extra_key(key0, key1)
     i = 0
-    for k0, k1 in zip(key0, key1):
+    for k0, k1 in zip(key0.token_ids, key1.token_ids):
         if k0 != k1:
             break
         i += 1
     return i
 
 
-def _key_match_paged(key0: list, key1: list, page_size: int):
+def _key_match_paged(key0: RadixKey, key1: RadixKey, page_size: int):
+    _check_extra_key(key0, key1)
     min_len = min(len(key0), len(key1))
 
     i = 0
     while i < min_len:
-        if key0[i : i + page_size] != key1[i : i + page_size]:
+        if key0.token_ids[i : i + page_size] != key1.token_ids[i : i + page_size]:
             break
         i += page_size
 
     return i
+
+
+def get_child_key(key: RadixKey, page_size: int = 1):
+    """Get child key for tree traversal, incorporating extra_key for namespace isolation."""
+    plain_key = key.token_ids[0] if page_size == 1 else tuple(key.token_ids[:page_size])
+    return plain_key if key.extra_key is None else (key.extra_key, plain_key)
 
 
 def _convert_to_bigram_key(tokens: list[int]) -> list[tuple[int, int]]:
@@ -123,13 +165,10 @@ class RadixCache(BasePrefixCache):
 
         if self.page_size == 1:
             self.key_match_fn = _key_match_page_size1
-            self.get_child_key_fn = lambda key: (int(key[0]) if hasattr(key[0], "item") else key[0])
+            self.get_child_key_fn = get_child_key
         else:
             self.key_match_fn = partial(_key_match_paged, page_size=page_size)
-            # Ensure returning hashable types, convert numpy arrays to Python native types
-            self.get_child_key_fn = lambda key: tuple(
-                int(x) if hasattr(x, "item") else x for x in key[:page_size]
-            )
+            self.get_child_key_fn = partial(get_child_key, page_size=page_size)
         self.reset()
 
     def _create_tokens_data(self, tokens: list[int]) -> np.ndarray:
@@ -140,14 +179,18 @@ class RadixCache(BasePrefixCache):
 
     def reset(self):
         self.root_node = TreeNode()
-        self.root_node.key = []
+        self.root_node.key = RadixKey(token_ids=[], extra_key=None)
         self.root_node.value = []
         self.root_node.lock_ref = 1
         self.evictable_size_ = 0
         self.protected_size_ = 0
 
-    def match_prefix(self, key: list[int], **kwargs) -> MatchResult:
-        key = self.key_convert_fn(key)
+    def match_prefix(self, key: RadixKey | list[int], **kwargs) -> MatchResult:
+        # Support both RadixKey and plain list for backward compatibility
+        if not isinstance(key, RadixKey):
+            extra_key = kwargs.get("extra_key")
+            key = RadixKey(key, extra_key)
+
         if self.disable or len(key) == 0:
             empty_array = np.empty((0,), dtype=np.int32)
 
@@ -158,11 +201,14 @@ class RadixCache(BasePrefixCache):
                 host_hit_length=0,
             )
 
-        if self.page_size != 1:
-            page_aligned_len = len(key) // self.page_size * self.page_size
-            key = key[:page_aligned_len]
+        # Convert and align key
+        converted_key = RadixKey(self.key_convert_fn(key.token_ids), key.extra_key)
 
-        token_sequences, last_node = self._match_prefix_helper(self.root_node, key)
+        if self.page_size != 1:
+            page_aligned_len = len(converted_key) // self.page_size * self.page_size
+            converted_key = converted_key[:page_aligned_len]
+
+        token_sequences, last_node = self._match_prefix_helper(self.root_node, converted_key)
 
         if token_sequences:
             valid_tokens = []
@@ -187,20 +233,27 @@ class RadixCache(BasePrefixCache):
             host_hit_length=0,
         )
 
-    def insert(self, key: list, value=None):
+    def insert(self, key: RadixKey | list, value=None):
         if self.disable:
             return 0
-        key = self.key_convert_fn(key)
+
+        # Support both RadixKey and plain list for backward compatibility
+        if not isinstance(key, RadixKey):
+            key = RadixKey(key, None)
+
+        # Convert key
+        converted_key = RadixKey(self.key_convert_fn(key.token_ids), key.extra_key)
+
         if value is None:
-            value = self._create_tokens_data(key)
+            value = self._create_tokens_data(converted_key.token_ids)
         elif isinstance(value, list):
             value = self._create_tokens_data(value)
 
         if self.is_eagle:
             # Make sure the value len equal to the EAGLE bigram key len
-            value = value[: len(key)]
+            value = value[: len(converted_key)]
 
-        return self._insert_helper(self.root_node, key, value)
+        return self._insert_helper(self.root_node, converted_key, value)
 
     def cache_finished_req(self, req: Req):
         """Cache completed requests"""
@@ -238,7 +291,9 @@ class RadixCache(BasePrefixCache):
             old_prefix_len -= 1
 
         # Radix Cache takes over one reference from memory pool
-        new_prefix_len = self.insert(token_ids[:page_aligned_token_len], page_aligned_kv_indices)
+        new_prefix_len = self.insert(
+            RadixKey(token_ids[:page_aligned_token_len], req.extra_key), page_aligned_kv_indices
+        )
 
         self.token_to_kv_pool_allocator.free(kv_indices[old_prefix_len:new_prefix_len])
         # free the unaligned tail
@@ -278,11 +333,12 @@ class RadixCache(BasePrefixCache):
             old_prefix_len -= 1
 
         # Radix Cache takes over one reference from memory pool
-        new_prefix_len = self.insert(page_aligned_token_ids, page_aligned_kv_indices)
+        radix_key = RadixKey(page_aligned_token_ids, req.extra_key)
+        new_prefix_len = self.insert(radix_key, page_aligned_kv_indices)
         self.token_to_kv_pool_allocator.free(kv_indices[old_prefix_len:new_prefix_len])
 
         # Prefix indices may have been updated, reuse them
-        new_match_result = self.match_prefix(page_aligned_token_ids)
+        new_match_result = self.match_prefix(radix_key)
         new_indices = new_match_result.device_indices  # cpu
         new_last_node = new_match_result.last_device_node
 
@@ -384,7 +440,7 @@ class RadixCache(BasePrefixCache):
 
     ##### Internal Helper Functions #####
 
-    def _match_prefix_helper(self, node: TreeNode, key: list):
+    def _match_prefix_helper(self, node: TreeNode, key: RadixKey):
         node.last_access_time = time.monotonic()
 
         child_key = self.get_child_key_fn(key)
@@ -393,6 +449,7 @@ class RadixCache(BasePrefixCache):
         while len(key) > 0 and child_key in node.children:
             child = node.children[child_key]
             child.last_access_time = time.monotonic()
+
             prefix_len = self.key_match_fn(child.key, key)
             if prefix_len < len(child.key):
                 new_node = self._split_node(child.key, child, prefix_len)
@@ -402,29 +459,34 @@ class RadixCache(BasePrefixCache):
             else:
                 token_sequences.append(child.value)
                 node = child
-                key = key[prefix_len:]
+                key = key[prefix_len:]  # This creates a new RadixKey with sliced tokens
 
                 if len(key):
                     child_key = self.get_child_key_fn(key)
 
         return token_sequences, node
 
-    def _split_node(self, key, child: TreeNode, split_len: int):
+    def _split_node(self, key: RadixKey, child: TreeNode, split_len: int):
         new_node = TreeNode()
-        new_node.children = {self.get_child_key_fn(key[split_len:]): child}
         new_node.parent = child.parent
         new_node.lock_ref = child.lock_ref
         new_node.key = child.key[:split_len]
         new_node.value = child.value[:split_len].copy()
 
+        # Update child
         child.parent = new_node
         child.key = child.key[split_len:]
         child.value = child.value[split_len:].copy()
+
+        # Re-key old child in new_node's children
+        new_node.children = {self.get_child_key_fn(child.key): child}
+
+        # Update parent's reference to new_node
         new_node.parent.children[self.get_child_key_fn(key)] = new_node
 
         return new_node
 
-    def _insert_helper(self, node: TreeNode, key: list, value):
+    def _insert_helper(self, node: TreeNode, key: RadixKey, value):
         if isinstance(value, jnp.ndarray):
             assert value.ndim == 1, "value must be a 1D array"
 
@@ -438,9 +500,10 @@ class RadixCache(BasePrefixCache):
         while len(key) > 0 and child_key in node.children:
             node = node.children[child_key]
             node.last_access_time = time.monotonic()
+
             prefix_len = self.key_match_fn(node.key, key)
             total_prefix_length += prefix_len
-            key = key[prefix_len:]
+            key = key[prefix_len:]  # Slices RadixKey
             value = value[prefix_len:]
 
             if prefix_len < len(node.key):
@@ -470,11 +533,12 @@ class RadixCache(BasePrefixCache):
         print(
             " " * indent,
             len(node.key),
-            node.key[:10] if node.key else [],
+            node.key.token_ids[:10] if node.key else [],
             f"r={node.lock_ref}",
+            f"extra_key={node.key.extra_key if node.key else None}",
             value_info,
         )
-        for key, child in node.children.items():
+        for _, child in node.children.items():
             self._print_helper(child, indent + 2)
 
     def _delete_leaf_no_size_update(self, node):
