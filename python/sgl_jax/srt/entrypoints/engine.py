@@ -16,9 +16,14 @@ import threading
 from collections.abc import AsyncIterator, Iterator
 from typing import Any
 
+import jax
+import jax.numpy as jnp
 import uvloop
 import zmq
 import zmq.asyncio
+from flax import nnx
+
+from sgl_jax.srt.utils.common_utils import SUPPORTED_LORA_TARGET_MODULES
 
 # ruff: noqa: E402
 # Fix a bug of Python threading
@@ -193,6 +198,79 @@ class Engine(EngineBase):
             return generator
         else:
             return await generator.__anext__()
+
+    def apply_dummy_lora_ab_buffer(self, target_modules: list | None = None):
+        def _create_dummy_buffer(buffer):
+            """Create dummy buffer with sequential values, preserving type and sharding."""
+            if hasattr(buffer, "value"):
+                # It's a Param-wrapped value
+                arr = buffer.value
+                # Get sharding from the actual array, not the Param wrapper
+                sharding = arr.sharding if hasattr(arr, "sharding") else None
+                new_arr = jax.device_put(
+                    jnp.arange(arr.size, dtype=arr.dtype).reshape(arr.shape),
+                    device=sharding,
+                )
+                # Re-wrap in the same type (e.g., nnx.Param)
+                return type(buffer)(value=new_arr)
+            else:
+                # It's a raw Array
+                sharding = buffer.sharding if hasattr(buffer, "sharding") else None
+                new_arr = jax.device_put(
+                    jnp.arange(buffer.size, dtype=buffer.dtype).reshape(buffer.shape),
+                    device=sharding,
+                )
+                return new_arr
+
+        def traverse_and_update(state_obj):
+            """
+            Recursively traverse state structure and update A_buffer/B_buffer in target modules.
+
+            Args:
+                state_obj: Can be State/Params (dict-like), list, or leaf values (Param, Array, etc.)
+
+            Returns:
+                Updated state with same type as input
+            """
+            # Case 1: State or Params (dict-like with .items() method, but not a Param leaf node)
+            if hasattr(state_obj, "items") and not hasattr(state_obj, "value"):
+                updated = {}
+
+                for key, value in state_obj.items():
+                    if key in ("A_buffer", "B_buffer"):
+                        # Found a LoRA buffer to replace
+                        updated[key] = _create_dummy_buffer(value)
+                    elif key in target_modules:
+                        # This key is a target module name, recurse into it
+                        updated[key] = traverse_and_update(value)
+                    else:
+                        # Regular key, recurse normally
+                        updated[key] = traverse_and_update(value)
+
+                # Preserve type: return State if input was State, otherwise return same type
+                return type(state_obj)(updated)
+
+            # Case 2: List (e.g., layers list)
+            elif isinstance(state_obj, list):
+                return [traverse_and_update(item) for item in state_obj]
+
+            # Case 3: Leaf nodes (Param objects, raw arrays, or other values)
+            else:
+                return state_obj
+
+        if target_modules is None or len(target_modules) == 0:
+            logger.warning("No %v is specified, so skip to apply", target_modules)
+            return
+
+        if "all" in target_modules:
+            target_modules = SUPPORTED_LORA_TARGET_MODULES
+
+        logger.info("Applying dummy LoRA buffers to modules: %v", target_modules)
+
+        model_runner = self.scheduler_info["scheduler"].tp_worker.worker.model_runner
+        model_state = nnx.split(model_runner.model)[1]
+        new_state = traverse_and_update(model_state)
+        nnx.update(model_runner.model, new_state)
 
     def encode(
         self,

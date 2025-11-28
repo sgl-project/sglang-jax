@@ -236,9 +236,10 @@ class ModelWorker:
                     num_tokens,
                     ForwardMode.EXTEND,
                     self.precompile_cache_loc_paddings[-1],
+                    enable_static_lora=self.server_args.enable_static_lora,
                 )
                 # Prepare LoRA batch if LoRA is enabled
-                if self.server_args.enable_lora:
+                if self.server_args.enable_lora or self.server_args.enable_static_lora:
                     self.get_model_runner().lora_manager.prepare_lora_batch(model_worker_batch)
                 sampling_metadata = SamplingMetadata.from_model_worker_batch(
                     model_worker_batch,
@@ -278,9 +279,10 @@ class ModelWorker:
                     bs,
                     ForwardMode.DECODE,
                     aligned_cache_loc_size,
+                    enable_static_lora=self.server_args.enable_static_lora,
                 )
                 # Prepare LoRA batch if LoRA is enabled
-                if self.server_args.enable_lora:
+                if self.server_args.enable_lora or self.server_args.enable_static_lora:
                     self.get_model_runner().lora_manager.prepare_lora_batch(model_worker_batch)
                 sampling_metadata = SamplingMetadata.from_model_worker_batch(
                     model_worker_batch, 0, self.mesh, self.model_config.vocab_size
@@ -341,6 +343,7 @@ class ModelWorker:
         max_cache_loc_size: int,
         do_penalties: bool = False,
         speculative_algotithm=None,
+        enable_static_lora: bool = None,
     ) -> ModelWorkerBatch:
         valid_input_ids = np.array([1] * bs, dtype=jnp.int32)
         invalid_input_ids = np.array([0] * (num_tokens - bs), dtype=jnp.int32)
@@ -354,7 +357,7 @@ class ModelWorker:
 
         valid_cache_loc = np.arange(bs)
         invalid_cache_loc = np.array([0] * (invalid_cache_loc_size), dtype=jnp.int32)
-        lora_ids = [0] if bs == 1 else [0] * (bs // 2) + [None] * (bs - bs // 2)
+        lora_ids = ["0"] if bs == 1 else ["0"] * (bs // 2) + [None] * (bs - bs // 2)
 
         return ModelWorkerBatch(
             bid=1,
@@ -384,7 +387,7 @@ class ModelWorker:
             extend_logprob_start_lens=None,
             capture_hidden_mode=CaptureHiddenMode.NULL,
             spec_algorithm=speculative_algotithm,
-            lora_ids=lora_ids,
+            lora_ids=lora_ids if not enable_static_lora else ["0"] * bs,
         )
 
     def get_model_runner(self):
@@ -461,7 +464,9 @@ class ModelWorker:
             forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
 
         # Prepare LoRA batch if LoRA is enabled
-        if self.worker.server_args.enable_lora and self.need_prepare_lora_batch:
+        if (
+            self.worker.server_args.enable_lora or self.worker.server_args.enable_static_lora
+        ) and self.need_prepare_lora_batch:
             self.get_model_runner().lora_manager.prepare_lora_batch(model_worker_batch)
 
         if forward_metadata is None:

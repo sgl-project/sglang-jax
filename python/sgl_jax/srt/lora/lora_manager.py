@@ -98,7 +98,7 @@ class LoRAManager:
         """
         self.base_model = base_model
         self.base_hf_config = base_hf_config
-        self.max_loras_per_batch = max_loras_per_batch
+        self.max_loras_per_batch = 1 if server_args.enable_static_lora else max_loras_per_batch
         self.dtype = dtype
         self.mesh = mesh
         self.server_args = server_args
@@ -420,34 +420,49 @@ class LoRAManager:
 
         assert len(cur_uids) <= self.max_loras_per_batch
 
-        # Load adapters into device memory pool (CPU -> device transfer)
-        self.memory_pool.prepare_lora_batch(
-            cur_uids=cur_uids,
-            lora_adapters=self.loras,
-        )
-
         weight_indices = [0] * len(model_worker_batch.lora_ids)
         lora_ranks = [0] * self.max_loras_per_batch
         scalings = [0] * self.max_loras_per_batch
 
-        for i, uid in enumerate(model_worker_batch.lora_ids):
-            weight_indices[i] = self.memory_pool.get_buffer_id(uid)
-            if uid is not None and uid in self.loras:
-                lora = self.loras[uid]
-                lora_ranks[weight_indices[i]] = lora.config.r
-                scalings[weight_indices[i]] = lora.scaling
+        def prepare_static_lora_batch():
+            self.lora_backend.prepare_lora_batch(
+                model_worker_batch=model_worker_batch,
+                weight_indices=[0] * len(model_worker_batch.lora_ids),
+                lora_ranks=[self.max_lora_rank] * self.max_loras_per_batch,
+                scalings=[self.server_args.lora_scaling] * self.max_loras_per_batch,
+            )
 
-        self.lora_backend.prepare_lora_batch(
-            model_worker_batch=model_worker_batch,
-            weight_indices=weight_indices,
-            lora_ranks=lora_ranks,
-            scalings=scalings,
-        )
+        def prepare_dynamic_lora_batch():
+            # Load adapters into device memory pool (CPU -> device transfer)
+            self.memory_pool.prepare_lora_batch(
+                cur_uids=cur_uids,
+                lora_adapters=self.loras,
+            )
+
+            for i, uid in enumerate(model_worker_batch.lora_ids):
+                weight_indices[i] = self.memory_pool.get_buffer_id(uid)
+                if uid is not None and uid in self.loras:
+                    lora = self.loras[uid]
+                    lora_ranks[weight_indices[i]] = lora.config.r
+                    scalings[weight_indices[i]] = lora.scaling
+
+            self.lora_backend.prepare_lora_batch(
+                model_worker_batch=model_worker_batch,
+                weight_indices=weight_indices,
+                lora_ranks=lora_ranks,
+                scalings=scalings,
+            )
+
+        if self.server_args.enable_static_lora:
+            prepare_static_lora_batch()
+        else:
+            prepare_dynamic_lora_batch()
 
         # Update LoRA layer buffer references after loading new weights
         # This is necessary because JAX arrays are immutable, and load_lora_weight_to_buffer
         # creates new arrays. We need to update the references in LoRALinear layers.
-        self.update_lora_info()
+        if not self.server_args.enable_static_lora:
+            self.update_lora_info()
 
         logger.debug("Prepared LoRA batch: %d unique adapters", len(cur_uids))
 

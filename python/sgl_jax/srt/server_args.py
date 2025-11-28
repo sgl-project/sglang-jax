@@ -160,6 +160,8 @@ class ServerArgs:
     max_loaded_loras: int | None = None
     max_loras_per_batch: int = 8
     lora_eviction_policy: str = "lru"
+    enable_static_lora: bool | None = None
+    lora_scaling: float | None = None
 
     def __post_init__(self):
         # Set missing default values
@@ -937,6 +939,17 @@ class ServerArgs:
             choices=["lru"],
             help="Policy for evicting LoRA adapters when max_loaded_loras is reached.",
         )
+        parser.add_argument(
+            "--enable-static-lora",
+            action="store_true",
+            help="Enable static LoRA support for RL, and it is different from the combination of enable-lora and max-loras-per-batch = 1",
+        )
+        parser.add_argument(
+            "--lora-scaling",
+            type=float,
+            default=ServerArgs.lora_scaling,
+            help="Lora scaling is required for static LoRA, scaling = alpha/rank",
+        )
 
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace):
@@ -987,15 +1000,15 @@ class ServerArgs:
         # Import LoRARef here to avoid circular imports
         from sgl_jax.srt.lora.lora_registry import LoRARef
 
+        if not self.enable_lora and not self.enable_static_lora:
+            return
+
+        assert not (
+            self.enable_lora and self.enable_static_lora
+        ), f"{self.enable_lora} and {self.enable_static_lora} can not be enable at the same time"
+
         # Validate max_loras_per_batch
         assert self.max_loras_per_batch > 0, "max_loras_per_batch must be positive"
-
-        # If lora_paths are provided, auto-enable LoRA
-        if self.lora_paths:
-            self.enable_lora = True
-            logger.info("Auto-enabling LoRA because lora_paths are provided")
-        elif not self.enable_lora:
-            return
 
         # Expand target modules
         if self.lora_target_modules:
@@ -1011,60 +1024,86 @@ class ServerArgs:
             self.max_lora_rank and self.lora_target_modules
         ), "When no initial --lora-paths is provided, you need to specify both --max-lora-rank and --lora-target-modules for LoRA initialization."
 
-        # Normalize lora_paths to List[LoRARef]
-        if self.lora_paths is not None:
-            normalized_lora_refs = []
+        def check_static_lora_args():
+            assert (
+                self.lora_scaling is not None
+            ), "lora_scaling is required when enable-static-lora is enabled"
 
-            if isinstance(self.lora_paths, dict):
-                # Dict format: {"name": "path", ...}
-                for name, path in self.lora_paths.items():
-                    normalized_lora_refs.append(
-                        LoRARef(lora_name=name, lora_path=path, pinned=True)
+            assert (
+                self.lora_paths is None
+            ), "lora-paths is not required when enable-static-lora is enabled"
+            assert (
+                self.max_loras_per_batch == 1
+            ), "max-loras-per-batch is required to be 1 when enable-static-lora is enabled"
+
+        def check_dynamic_lora_args():
+            # Normalize lora_paths to List[LoRARef]
+            if self.lora_paths is not None:
+                normalized_lora_refs = []
+
+                # Normalize lora_paths to List[LoRARef]
+                if self.lora_paths is not None:
+                    normalized_lora_refs = []
+
+                    if isinstance(self.lora_paths, dict):
+                        # Dict format: {"name": "path", ...}
+                        for name, path in self.lora_paths.items():
+                            normalized_lora_refs.append(
+                                LoRARef(lora_name=name, lora_path=path, pinned=True)
+                            )
+                    elif isinstance(self.lora_paths, list):
+                        for item in self.lora_paths:
+                            if isinstance(item, str):
+                                # String format: "name=path" or just "path"
+                                if "=" in item:
+                                    name, path = item.split("=", 1)
+                                    normalized_lora_refs.append(
+                                        LoRARef(
+                                            lora_name=name.strip(),
+                                            lora_path=path.strip(),
+                                            pinned=True,
+                                        )
+                                    )
+                                else:
+                                    # Use basename as name
+                                    import os
+
+                                    name = os.path.basename(item.rstrip("/"))
+                                    normalized_lora_refs.append(
+                                        LoRARef(lora_name=name, lora_path=item, pinned=True)
+                                    )
+                            elif isinstance(item, dict):
+                                # Dict format in list: {"name": "adapter1", "path": "/path/to/adapter"}
+                                name = item.get("name") or item.get("lora_name")
+                                path = item.get("path") or item.get("lora_path")
+                                pinned = item.get("pinned", True)
+                                normalized_lora_refs.append(
+                                    LoRARef(lora_name=name, lora_path=path, pinned=pinned)
+                                )
+                            elif hasattr(item, "lora_name"):
+                                # Already a LoRARef object
+                                normalized_lora_refs.append(item)
+                            else:
+                                raise ValueError(f"Unsupported lora_paths item format: {item}")
+
+                    self.lora_paths = normalized_lora_refs
+
+                    # Validate max_loaded_loras
+                    if self.max_loaded_loras is not None:
+                        assert (
+                            self.max_loaded_loras >= self.max_loras_per_batch
+                        ), "max_loaded_loras must be >= max_loras_per_batch"
+
+                    logger.info(
+                        "Loaded %d LoRA adapters: %s",
+                        len(self.lora_paths),
+                        [ref.lora_name for ref in self.lora_paths],
                     )
-            elif isinstance(self.lora_paths, list):
-                for item in self.lora_paths:
-                    if isinstance(item, str):
-                        # String format: "name=path" or just "path"
-                        if "=" in item:
-                            name, path = item.split("=", 1)
-                            normalized_lora_refs.append(
-                                LoRARef(lora_name=name.strip(), lora_path=path.strip(), pinned=True)
-                            )
-                        else:
-                            # Use basename as name
-                            import os
 
-                            name = os.path.basename(item.rstrip("/"))
-                            normalized_lora_refs.append(
-                                LoRARef(lora_name=name, lora_path=item, pinned=True)
-                            )
-                    elif isinstance(item, dict):
-                        # Dict format in list: {"name": "adapter1", "path": "/path/to/adapter"}
-                        name = item.get("name") or item.get("lora_name")
-                        path = item.get("path") or item.get("lora_path")
-                        pinned = item.get("pinned", True)
-                        normalized_lora_refs.append(
-                            LoRARef(lora_name=name, lora_path=path, pinned=pinned)
-                        )
-                    elif hasattr(item, "lora_name"):
-                        # Already a LoRARef object
-                        normalized_lora_refs.append(item)
-                    else:
-                        raise ValueError(f"Unsupported lora_paths item format: {item}")
-
-            self.lora_paths = normalized_lora_refs
-
-            # Validate max_loaded_loras
-            if self.max_loaded_loras is not None:
-                assert (
-                    self.max_loaded_loras >= self.max_loras_per_batch
-                ), "max_loaded_loras must be >= max_loras_per_batch"
-
-            logger.info(
-                "Loaded %d LoRA adapters: %s",
-                len(self.lora_paths),
-                [ref.lora_name for ref in self.lora_paths],
-            )
+        if self.enable_static_lora:
+            check_static_lora_args()
+        else:
+            check_dynamic_lora_args()
 
 
 def prepare_server_args(argv: list[str]) -> ServerArgs:
