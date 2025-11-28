@@ -429,14 +429,30 @@ class LoRAManager:
         weight_indices = [0] * len(model_worker_batch.lora_ids)
         lora_ranks = [0] * self.max_loras_per_batch
         scalings = [0] * self.max_loras_per_batch
-        # print(f"{self.loras=}")
+
         for i, uid in enumerate(model_worker_batch.lora_ids):
             weight_indices[i] = self.memory_pool.get_buffer_id(uid)
+            print(
+                f"  [{i}] uid={uid}, buffer_id={weight_indices[i]}, uid_in_loras={uid in self.loras if uid is not None else False}"
+            )
             if uid is not None and uid in self.loras:
-                # print(f"{uid=}")
                 lora = self.loras[uid]
+                print(
+                    f"      -> Setting lora_ranks[{weight_indices[i]}]={lora.config.r}, scalings[{weight_indices[i]}]={lora.scaling}"
+                )
                 lora_ranks[weight_indices[i]] = lora.config.r
                 scalings[weight_indices[i]] = lora.scaling
+
+                # Check if weights are actually loaded in the buffer
+                import jax.numpy as jnp
+
+                sample_module = list(self.target_modules)[0] if self.target_modules else None
+                if sample_module and sample_module in self.memory_pool.A_buffer:
+                    layer_0_weights = self.memory_pool.A_buffer[sample_module][0][weight_indices[i]]
+                    weight_norm = jnp.linalg.norm(layer_0_weights)
+                    print(
+                        f"      -> Buffer slot {weight_indices[i]} weights norm (layer 0, {sample_module}): {weight_norm}"
+                    )
 
         self.lora_backend.prepare_lora_batch(
             model_worker_batch=model_worker_batch,
@@ -445,7 +461,10 @@ class LoRAManager:
             scalings=scalings,
         )
 
-        self.verify_sharding_preserved()
+        # Update LoRA layer buffer references after loading new weights
+        # This is necessary because JAX arrays are immutable, and load_lora_weight_to_buffer
+        # creates new arrays. We need to update the references in LoRALinear layers.
+        self.update_lora_info()
 
         logger.debug("Prepared LoRA batch: %d unique adapters", len(cur_uids))
 
@@ -636,41 +655,3 @@ class LoRAManager:
         for attr in parts[:-1]:
             obj = getattr(obj, attr)
         setattr(obj, parts[-1], value)
-
-    def verify_sharding_preserved(self):
-        """
-        Verify that model surgery preserved sharding information.
-
-        Checks that base layer weights still have their original sharding specs.
-        """
-        if not hasattr(self, "lora_modules") or not self.lora_modules:
-            logger.warning("No LoRA modules to verify")
-            return
-
-        for layer_idx, layer_modules in enumerate(self.lora_modules):
-            for module_name, module in layer_modules.items():
-                try:
-                    # Check if base layer kernel has sharding
-                    if hasattr(module.base_layer, "kernel"):
-                        kernel = module.base_layer.kernel
-                        if hasattr(kernel, "value"):
-                            kernel_value = kernel.value
-                            if hasattr(kernel_value, "sharding"):
-                                sharding = kernel_value.sharding
-                                logger.info(
-                                    "%s base_layer.kernel sharding: %s",
-                                    f"layer{layer_idx}.{module_name}",
-                                    sharding,
-                                )
-                            else:
-                                logger.warning(
-                                    "%s base_layer.kernel has no sharding attribute",
-                                    f"layer{layer_idx}.{module_name}",
-                                )
-                # TODO: add the check of sharding for lora_a and lora_b
-                except Exception as e:
-                    logger.warning(
-                        "Error checking sharding for %s: %s",
-                        f"layer{layer_idx}.{module_name}",
-                        e,
-                    )
