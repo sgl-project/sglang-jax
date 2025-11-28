@@ -19,6 +19,7 @@ from sgl_jax.srt.mem_cache.allocator import TokenToKVPoolAllocator
 from sgl_jax.srt.mem_cache.memory_pool import MHATokenToKVPool, ReqToTokenPool
 from sgl_jax.srt.mem_cache.radix_cache import (
     RadixCache,
+    RadixKey,
     TreeNode,
     _key_match_page_size1,
     _key_match_paged,
@@ -97,14 +98,14 @@ class TestRadixCache(unittest.TestCase):
     def test_key_match_functions(self):
         # test key matching function
         # test page_size=1 matching
-        key1 = [1, 2, 3, 4, 5]
-        key2 = [1, 2, 6, 7, 8]
+        key1 = RadixKey([1, 2, 3, 4, 5], None)
+        key2 = RadixKey([1, 2, 6, 7, 8], None)
         result = _key_match_page_size1(key1, key2)
         self.assertEqual(result, 2)  # first two elements match
 
         # test paged matching
-        key1 = [1, 2, 3, 4, 5, 6]
-        key2 = [1, 2, 3, 4, 7, 8]
+        key1 = RadixKey([1, 2, 3, 4, 5, 6], None)
+        key2 = RadixKey([1, 2, 3, 4, 7, 8], None)
         result = _key_match_paged(key1, key2, page_size=2)
         self.assertEqual(result, 4)  # first two pages match
 
@@ -315,6 +316,105 @@ class TestRadixCache(unittest.TestCase):
         self.assertEqual(device_indices.dtype, np.int32)
         self.assertEqual(len(device_indices), 0)
 
+    def test_extra_key_namespace_isolation(self):
+        """Test that same tokens with different extra_keys don't share cache"""
+        req_pool, allocator = self._create_auto_device_setup()
+        cache = self._create_radix_cache(req_pool, allocator)
+
+        # Insert same token sequence with extra_key="lora_a"
+        key = [1, 2, 3, 4, 5]
+        value_a = allocator.alloc(len(key))
+        cache.insert(RadixKey(key, "lora_a"), value_a)
+
+        # Insert same token sequence with extra_key="lora_b"
+        value_b = allocator.alloc(len(key))
+        cache.insert(RadixKey(key, "lora_b"), value_b)
+
+        # Match with extra_key="lora_a" should return value_a
+        match_a = cache.match_prefix(RadixKey(key, "lora_a"))
+        self.assertEqual(len(match_a.device_indices), len(key))
+        np.testing.assert_array_equal(match_a.device_indices, value_a)
+
+        # Match with extra_key="lora_b" should return value_b
+        match_b = cache.match_prefix(RadixKey(key, "lora_b"))
+        self.assertEqual(len(match_b.device_indices), len(key))
+        np.testing.assert_array_equal(match_b.device_indices, value_b)
+
+        # Verify values are different (different cache namespaces)
+        self.assertFalse(np.array_equal(value_a, value_b))
+
+    def test_extra_key_same_namespace_sharing(self):
+        """Test that same tokens with same extra_key do share cache"""
+        req_pool, allocator = self._create_auto_device_setup()
+        cache = self._create_radix_cache(req_pool, allocator)
+
+        # Insert with extra_key="lora_x"
+        key = [10, 20, 30]
+        cache.insert(RadixKey(key, "lora_x"))
+
+        # Match with same extra_key should hit cache
+        match = cache.match_prefix(RadixKey(key, "lora_x"))
+        self.assertEqual(len(match.device_indices), len(key))
+
+        # Insert longer sequence with same extra_key should reuse prefix
+        longer_key = [10, 20, 30, 40, 50]
+        prefix_len = cache.insert(RadixKey(longer_key, "lora_x"))
+        self.assertEqual(prefix_len, 3)  # Reused 3 tokens from cache
+
+    def test_extra_key_none_default_namespace(self):
+        """Test that None extra_key creates its own default namespace"""
+        req_pool, allocator = self._create_auto_device_setup()
+        cache = self._create_radix_cache(req_pool, allocator)
+
+        # Insert with extra_key=None
+        key = [100, 200, 300]
+        value_none = allocator.alloc(len(key))
+        cache.insert(RadixKey(key, None), value_none)
+
+        # Insert with extra_key="some_key"
+        value_some = allocator.alloc(len(key))
+        cache.insert(RadixKey(key, "some_key"), value_some)
+
+        # Match with None should return value_none
+        match_none = cache.match_prefix(RadixKey(key, None))
+        np.testing.assert_array_equal(match_none.device_indices, value_none)
+
+        # Match with "some_key" should return value_some
+        match_some = cache.match_prefix(RadixKey(key, "some_key"))
+        np.testing.assert_array_equal(match_some.device_indices, value_some)
+
+    def test_radix_key_backward_compatibility(self):
+        """Test that plain list still works for backward compatibility"""
+        req_pool, allocator = self._create_auto_device_setup()
+        cache = self._create_radix_cache(req_pool, allocator)
+
+        # Insert with plain list (should use extra_key=None)
+        key = [5, 10, 15]
+        prefix_len = cache.insert(key)
+        self.assertEqual(prefix_len, 0)
+
+        # Match with plain list
+        match = cache.match_prefix(key)
+        self.assertEqual(len(match.device_indices), len(key))
+
+        # Match with RadixKey(key, None) should return same result
+        match_radix = cache.match_prefix(RadixKey(key, None))
+        np.testing.assert_array_equal(match.device_indices, match_radix.device_indices)
+
+    def test_radix_key_slicing(self):
+        """Test that RadixKey slicing preserves extra_key"""
+        key = RadixKey([1, 2, 3, 4, 5], "test_key")
+
+        # Test slicing
+        sliced = key[2:]
+        self.assertEqual(sliced.token_ids, [3, 4, 5])
+        self.assertEqual(sliced.extra_key, "test_key")
+
+        # Test single index access returns RadixKey
+        single = key[0]
+        self.assertEqual(single.token_ids, [1])
+        self.assertEqual(single.extra_key, "test_key")
+
 
 class MockRequest:
     """mock request object for testing cache request functionality"""
@@ -327,6 +427,7 @@ class MockRequest:
         fill_ids,
         prefix_indices,
         last_node,
+        extra_key=None,
     ):
         self.req_pool_idx = req_pool_idx
         self.origin_input_ids = origin_input_ids
@@ -334,6 +435,7 @@ class MockRequest:
         self.fill_ids = fill_ids
         self.prefix_indices = prefix_indices
         self.last_node = last_node
+        self.extra_key = extra_key
 
 
 class TestRadixCacheWithRequests(unittest.TestCase):
