@@ -494,8 +494,8 @@ class EagleDraftInput:
         model_worker_batch.spec_info.capture_hidden_mode = CaptureHiddenMode.LAST
         model_worker_batch.forward_mode = ForwardMode.DRAFT_EXTEND
         model_worker_batch.spec_info.hidden_states = batch_output.next_draft_input.hidden_states
-        forward_metadata = draft_model_runner.attn_backend.get_forward_metadata(
-            model_worker_batch, is_eagle=True
+        forward_metadata = draft_model_runner.attn_backend.get_eagle_forward_metadata(
+            model_worker_batch
         )
         draft_model_runner.attn_backend.forward_metadata = forward_metadata
         from sgl_jax.srt.layers.logits_processor import LogitsMetadata

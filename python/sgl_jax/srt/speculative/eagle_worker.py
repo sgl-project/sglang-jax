@@ -207,8 +207,8 @@ class EAGLEWorker(ModelWorker):
         forward_batch.return_logprob = False
 
         # Set forward_metadata for draft_model_runner's attention backend
-        forward_metadata = self.draft_model_runner.attn_backend.get_forward_metadata(
-            model_worker_batch, is_eagle=True
+        forward_metadata = self.draft_model_runner.attn_backend.get_eagle_forward_metadata(
+            model_worker_batch
         )
         self.draft_model_runner.attn_backend.forward_metadata = forward_metadata
         forward_batch.forward_mode = ForwardMode.EXTEND
@@ -330,8 +330,8 @@ class EAGLEWorker(ModelWorker):
             self.precompile_bs_paddings,
             self.precompile_cache_loc_paddings,
         )
-        forward_metadata = self.target_worker.model_runner.attn_backend.get_forward_metadata(
-            model_worker_batch, is_eagle=True
+        forward_metadata = self.target_worker.model_runner.attn_backend.get_eagle_forward_metadata(
+            model_worker_batch
         )
         # custom_mask = forward_metadata.custom_mask
         self.copy_model_worker_batch_to_cpu(model_worker_batch)
@@ -524,6 +524,10 @@ class EAGLEWorker(ModelWorker):
         # Forward multiple steps
         scores = None
         # Save original positions to avoid buffer donation issues
+        meta_data = []
+        model_worker_batch.speculative_eagle_topk = self.topk
+        model_worker_batch.speculative_num_draft_tokens = self.speculative_num_draft_tokens
+        model_worker_batch.speculative_num_steps = self.speculative_num_steps
         original_positions = np.repeat(model_worker_batch.seq_lens, self.topk)
         for i in range(self.speculative_num_steps):
             input_ids, hidden_states, scores, tree_info = select_top_k_tokens(
@@ -562,14 +566,11 @@ class EAGLEWorker(ModelWorker):
                 model_worker_batch.spec_info.hidden_states = np.concatenate(
                     [model_worker_batch.spec_info.hidden_states, pad_values], axis=0
                 )
-            self.draft_model_runner.attn_backend.forward_metadata = (
-                self.draft_model_runner.attn_backend.get_forward_metadata(
-                    model_worker_batch,
-                    is_eagle=True,
-                    speculative_step_id=i,
-                    topk=topk_index.shape[1],
+            if i == 0:
+                meta_data = self.draft_model_runner.attn_backend.get_eagle_multi_step_metadata(
+                    model_worker_batch
                 )
-            )
+            self.draft_model_runner.attn_backend.forward_metadata = meta_data[i]
             if self.topk > 1:
                 self.draft_model_runner.attn_backend.forward_metadata.custom_mask = (
                     build_tree_mask_for_draft_decode(
