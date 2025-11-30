@@ -101,4 +101,3 @@ setup-conda:
 		echo "conda is not installed, skipping environment creation"; \
 		echo "Please install Miniconda or Anaconda first"; \
 	fi
-
