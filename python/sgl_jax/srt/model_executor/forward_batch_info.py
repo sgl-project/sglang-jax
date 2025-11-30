@@ -145,6 +145,7 @@ class ForwardBatch:
     # The sequence length for each request [batch_size]
     seq_lens: jax.Array
     # decode token position in kv cache
+    # this field will not be used
     out_cache_loc: jax.Array
     # Position information [total_tokens]
     positions: jax.Array = None
@@ -153,6 +154,7 @@ class ForwardBatch:
 
     attn_backend: AttentionBackend = None
 
+    # this field will not be used
     cache_loc: jax.Array = None
 
     # For extend

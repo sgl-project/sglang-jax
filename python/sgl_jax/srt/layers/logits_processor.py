@@ -96,15 +96,12 @@ class LogitsProcessorOutput:
         # note: here only need to truncate next_token_logits and hidden_states
         if batch.forward_mode == ForwardMode.TARGET_VERIFY:
             # For ForwardMode.TARGET_VERIFY mode, we should take draft_token_num token for tree verify later
-            self.next_token_logits = self.next_token_logits[
-                0 : batch.real_bs * batch.spec_info.draft_token_num
-            ]
-
+            self.next_token_logits = self.next_token_logits
         else:
-            self.next_token_logits = self.next_token_logits[0 : batch.real_bs]
+            self.next_token_logits = self.next_token_logits
             if len(self.hidden_states.shape) == 1:
                 self.hidden_states = jnp.expand_dims(self.hidden_states, axis=0)
-            self.hidden_states = self.hidden_states[0 : batch.real_bs]
+            self.hidden_states = self.hidden_states
 
         # assert not batch.capture_hidden_mode.need_capture()
 

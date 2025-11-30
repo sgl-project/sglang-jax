@@ -1109,19 +1109,7 @@ class ScheduleBatch:
         cache_loc_paddings: list,
         page_size: int,
         enable_static_lora: bool = False,
-        skip_padding: bool = False,
     ) -> ModelWorkerBatch:
-        if skip_padding:
-            # FIXME(pc) spec decode model_worker_batch will be modified at decode stage, and padding laterly
-            # this may has some redundant code, we need clear future
-            return self.get_spec_model_worker_batch(
-                token_paddings=token_paddings,
-                bs_paddings=bs_paddings,
-                cache_loc_paddings=cache_loc_paddings,
-                page_size=page_size,
-                skip_padding=skip_padding,
-            )
-
         if self.forward_mode.is_decode_or_idle():
             extend_seq_lens = extend_prefix_lens = extend_logprob_start_lens = None
             token_paddings = bs_paddings
@@ -1399,7 +1387,13 @@ class ScheduleBatch:
         page_size: int,
         skip_padding: bool = False,
     ) -> ModelWorkerBatch:
-
+        if not skip_padding:
+            return self.get_model_worker_batch(
+                token_paddings=token_paddings,
+                bs_paddings=bs_paddings,
+                cache_loc_paddings=cache_loc_paddings,
+                page_size=page_size,
+            )
         if self.forward_mode.is_decode_or_idle():
             extend_seq_lens = extend_prefix_lens = extend_logprob_start_lens = None
         else:
@@ -1532,11 +1526,10 @@ class ScheduleBatch:
 
         if precision_tracer.get_trace_active():
             self._generate_trace_info(real_bs, bid)
-
         # Extract lora_ids from requests
         lora_ids = [req.lora_id for req in self.reqs]
 
-        res = ModelWorkerBatch(
+        return ModelWorkerBatch(
             bid=bid,
             forward_mode=self.forward_mode,
             input_ids=input_ids_cpu,
@@ -1572,14 +1565,6 @@ class ScheduleBatch:
             spec_algorithm=self.spec_algorithm,
             tree_cache=self.tree_cache,
         )
-        if skip_padding:
-            return res
-        res.padding_model_worker_batch(
-            token_paddings=token_paddings,
-            bs_paddings=bs_paddings,
-            cache_loc_paddings=cache_loc_paddings,
-        )
-        return res
 
     def _generate_trace_info(self, real_bs: int, bid: int) -> list[str]:
         for req in self.reqs[:real_bs]:

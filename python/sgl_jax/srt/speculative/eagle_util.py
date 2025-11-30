@@ -482,16 +482,10 @@ class EagleDraftInput:
     def prepare_for_extend_after_verify(
         self,
         model_worker_batch: ModelWorkerBatch,
-        predict: np.ndarray,
-        num_draft_tokens: int,
         draft_model_runner: Any,
         batch_output: GenerationBatchResult,
         precompile_token_paddings,
-        precompile_bs_paddings,
-        precompile_cache_loc_paddings,
     ):
-        # seq_lens_cpu_ = model_worker_batch.seq_lens
-
         model_worker_batch.spec_info = self
         verified_id = batch_output.next_draft_input.verified_id
         verified_id = verified_id[verified_id != 0].flatten()
@@ -515,20 +509,6 @@ class EagleDraftInput:
         logits_metadata = LogitsMetadata.from_model_worker_batch(
             model_worker_batch, draft_model_runner.mesh
         )
-        model_worker_batch.padding_model_worker_batch(
-            precompile_token_paddings, precompile_bs_paddings, precompile_cache_loc_paddings
-        )
-        hidden_states = model_worker_batch.spec_info.hidden_states
-        if (
-            hidden_states is not None
-            and hidden_states.shape[0] < model_worker_batch.input_ids.shape[0]
-        ):
-            pad_len = model_worker_batch.input_ids.shape[0] - hidden_states.shape[0]
-            pad_shape = (pad_len,) + hidden_states.shape[1:]
-            pad_values = np.zeros(pad_shape, dtype=hidden_states.dtype)
-            model_worker_batch.spec_info.hidden_states = jnp.concatenate(
-                [model_worker_batch.spec_info.hidden_states, pad_values], axis=0
-            )
 
         return model_worker_batch, logits_metadata
 
@@ -584,7 +564,7 @@ class EagleDraftInput:
         # model_worker_batch.out_cache_loc = out_cache_loc
         model_worker_batch.seq_lens_sum = np.sum(model_worker_batch.seq_lens)
         model_worker_batch.return_hidden_states = False
-        model_worker_batch.spec_info.positions = np.repeat(model_worker_batch.seq_lens, topk)
+        # model_worker_batch.spec_info.positions = np.repeat(model_worker_batch.seq_lens, topk)
 
     @classmethod
     def create_idle_input(
@@ -785,8 +765,6 @@ class EagleVerifyInput:
         self,
         model_worker_batch: ModelWorkerBatch,
         logits_output: LogitsProcessorOutput,
-        # token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
-        # page_size: int,
         rng: nnx.Rngs,
         mesh: Mesh,
         # vocab_mask: jax.Array | None = None,  # For grammar
@@ -819,17 +797,8 @@ class EagleVerifyInput:
                 ),
             )
 
-        bs = self.retrive_index.shape[0]
-        candidates = self.draft_token.reshape(bs, self.draft_token_num)
         sampling_info = model_worker_batch.sampling_info
-
-        predict_shape = list(logits_output.next_token_logits.shape)[:-1]
-        predict_shape[-1] += 1
-        predict = jnp.zeros(predict_shape, dtype=jnp.int32)
-
-        accept_index = jnp.full((bs, self.spec_steps + 1), -1, dtype=jnp.int32)
-        accept_length = jnp.zeros((bs,), dtype=jnp.int32)
-
+        bs = self.retrive_index.shape[0]
         if bs != len(sampling_info):
             sampling_info = copy.deepcopy(sampling_info)
             # NOTE: retrive_index are the indices of the requests that are kept.
@@ -846,11 +815,9 @@ class EagleVerifyInput:
         # if vocab_mask is not None:
         #     pass
 
-        # Sample tokens. Force greedy sampling on AMD
         is_all_greedy = sampling_info.is_all_greedy
 
         if is_all_greedy:
-            target_predict = jnp.argmax(logits_output.next_token_logits, axis=-1).flatten()
             # # for compatibility, 0.6.3 need to use use_mesh. set_mesh is not have __entry__ attribute.
             # # on jax >=0.7.1, we need to use set_mesh.
             try:
@@ -862,16 +829,28 @@ class EagleVerifyInput:
                     ctx = mesh
             with ctx:
                 accept_index, accept_length, predict = verify_tree_greedy(
-                    predicts=predict,
-                    accept_index=accept_index,
-                    accept_token_num=accept_length,
-                    candidates=candidates,
+                    # predicts=predict,
+                    # accept_index=accept_index,
+                    # accept_token_num=accept_length,
+                    # candidates=candidates,
+                    bs=bs,
+                    speculative_num_steps=self.spec_steps,
+                    num_draft_tokens=self.draft_token_num,
+                    draft_tokens=self.draft_token,
                     retrive_index=self.retrive_index,
                     retrive_next_token=self.retrive_next_token,
                     retrive_next_sibling=self.retrive_next_sibling,
-                    target_predict=target_predict,
+                    next_token_logits=logits_output.next_token_logits,
                 )
         else:
+            bs = self.retrive_index.shape[0]
+            candidates = self.draft_token.reshape(bs, self.draft_token_num)
+            predict_shape = list(logits_output.next_token_logits.shape)[:-1]
+            predict_shape[-1] += 1
+            predict = jnp.zeros(predict_shape, dtype=jnp.int32)
+
+            accept_index = jnp.full((bs, self.spec_steps + 1), -1, dtype=jnp.int32)
+            accept_length = jnp.zeros((bs,), dtype=jnp.int32)
             # apply temperature and get target probs
             expanded_temperature = jnp.repeat(
                 sampling_info.temperatures, self.draft_token_num
@@ -926,6 +905,10 @@ class EagleVerifyInput:
                 spec_steps=self.spec_steps,
                 rng=rng,
             )
+
+        predict = np.asarray(jax.device_get(predict))
+        accept_index = np.asarray(jax.device_get(accept_index))
+        accept_length = np.asarray(jax.device_get(accept_length))
 
         accept_length = accept_length + 1
         accept_index = np.concatenate(accept_index, axis=-1)

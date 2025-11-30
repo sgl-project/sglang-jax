@@ -307,6 +307,7 @@ class FlashAttention(AttentionBackend):
         seq_lens_list = []
         for speculative_step_id in range(batch.speculative_num_steps):
             seq_lens = batch.seq_lens + (speculative_step_id + 1)
+            seq_lens[batch.real_bs :] = 0
             seq_lens_list.append(seq_lens)
             aligned_seq_lens = ((seq_lens + self.page_size - 1) // self.page_size) * self.page_size
             cu_kv_lens.append(
