@@ -285,7 +285,7 @@ class FlashAttention(AttentionBackend):
             page_indices_cur_step = (selected_cache_locs // self.page_size).astype(np.int32)
             if page_indices_cur_step.shape[0] < 16384:
                 padding_size = 16834 - page_indices_cur_step.shape[0]
-                page_indices_cur_step = jnp.pad(page_indices_cur_step, ((0, padding_size)))
+                page_indices_cur_step = np.pad(page_indices_cur_step, ((0, padding_size)))
             page_indices.append(page_indices_cur_step)
 
         if batch.spec_algorithm.is_none():

@@ -222,29 +222,32 @@ class EAGLEWorker(ModelWorker):
 
     def copy_model_worker_batch_to_cpu(self, model_worker_batch: ModelWorkerBatch):
         model_worker_batch.input_ids = np.array(
-            model_worker_batch.input_ids, dtype=model_worker_batch.input_ids.dtype
+            jax.device_get(model_worker_batch.input_ids), dtype=model_worker_batch.input_ids.dtype
         )
         model_worker_batch.seq_lens = np.array(
-            model_worker_batch.seq_lens, dtype=model_worker_batch.seq_lens.dtype
+            jax.device_get(model_worker_batch.seq_lens), dtype=model_worker_batch.seq_lens.dtype
         )
         model_worker_batch.out_cache_loc = np.array(
-            model_worker_batch.out_cache_loc, dtype=model_worker_batch.out_cache_loc.dtype
+            jax.device_get(model_worker_batch.out_cache_loc),
+            dtype=model_worker_batch.out_cache_loc.dtype,
         )
         model_worker_batch.positions = np.array(
-            model_worker_batch.positions, dtype=model_worker_batch.positions.dtype
+            jax.device_get(model_worker_batch.positions), dtype=model_worker_batch.positions.dtype
         )
         model_worker_batch.extend_start_loc = np.array(
-            model_worker_batch.extend_start_loc, dtype=model_worker_batch.extend_start_loc.dtype
+            jax.device_get(model_worker_batch.extend_start_loc),
+            dtype=model_worker_batch.extend_start_loc.dtype,
         )
         model_worker_batch.req_pool_indices = np.array(
-            model_worker_batch.req_pool_indices, dtype=model_worker_batch.req_pool_indices.dtype
+            jax.device_get(model_worker_batch.req_pool_indices),
+            dtype=model_worker_batch.req_pool_indices.dtype,
         )
         model_worker_batch.cache_loc = np.array(
-            model_worker_batch.cache_loc, dtype=model_worker_batch.cache_loc.dtype
+            jax.device_get(model_worker_batch.cache_loc), dtype=model_worker_batch.cache_loc.dtype
         )
         model_worker_batch.extend_prefix_lens = (
             np.array(
-                model_worker_batch.extend_prefix_lens,
+                jax.device_get(model_worker_batch.extend_prefix_lens),
                 dtype=model_worker_batch.extend_prefix_lens.dtype,
             )
             if model_worker_batch.extend_prefix_lens is not None
@@ -252,7 +255,8 @@ class EAGLEWorker(ModelWorker):
         )
         model_worker_batch.extend_seq_lens = (
             np.array(
-                model_worker_batch.extend_seq_lens, dtype=model_worker_batch.extend_seq_lens.dtype
+                jax.device_get(model_worker_batch.extend_seq_lens),
+                dtype=model_worker_batch.extend_seq_lens.dtype,
             )
             if model_worker_batch.extend_seq_lens is not None
             else None
