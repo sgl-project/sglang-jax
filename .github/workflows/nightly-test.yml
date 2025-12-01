@@ -31,38 +31,73 @@ jobs:
   nightly-test-accuracy-text-models-1-tpu:
     if: github.repository == 'sgl-project/sglang-jax'
     runs-on: arc-runner-v6e-1
+    strategy:
+      fail-fast: false
+      matrix:
+        part: [0, 1 , 2, 3]
     continue-on-error: true
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
       - name: Run eval test for text models
-        timeout-minutes: 120
+        timeout-minutes: 1200
         run: |
           python3.12 -m venv .venv
           source .venv/bin/activate
           pip install uv
           uv pip install -e "python[all]"
+          uv pip install evalscope==0.17.1
+
+          mkdir -p ./test/nightly_test_output/benchmark
+          mkdir -p ./test/nightly_test_output/pref
+
           bash scripts/killall_sglang.sh
           cd test/srt
-          python3 run_suite.py --suite nightly-test-accuracy-text-models-tpu-v6e-1
+          python3 run_suite.py --suite nightly-test-accuracy-text-models-tpu-v6e-1 --auto-partition-id ${{ matrix.part }} --auto-partition-size 4
+      - name: Publish traces to storage repo
+        env:
+          GITHUB_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+          GITHUB_RUN_NUMBER: ${{ github.run_number }}
+        run: |         
+          python3 scripts/ci/public_bench_and_pref.py --source-dir test/nightly_test_output
+
 
   nightly-test-accuracy-text-models-4-tpu:
     if: github.repository == 'sgl-project/sglang-jax'
     runs-on: arc-runner-v6e-4
+    strategy:
+      fail-fast: false
+      matrix:
+        part: [0, 1 , 2, 3 , 4, 5]
     continue-on-error: true
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
       - name: Run eval test for text models
-        timeout-minutes: 120
+        timeout-minutes: 1200
         run: |
           python3.12 -m venv .venv
           source .venv/bin/activate
           pip install uv
           uv pip install -e "python[all]"
+          uv pip install evalscope==0.17.1
+
+
+          mkdir -p ./test/nightly_test_output/benchmark
+          mkdir -p ./test/nightly_test_output/pref
+
+
           bash scripts/killall_sglang.sh
-          cd test/srt
-          python3 run_suite.py --suite nightly-test-accuracy-text-models-tpu-v6e-4
+          cd test/srt         
+          python3 run_suite.py --suite nightly-test-accuracy-text-models-tpu-v6e-4 --auto-partition-id ${{ matrix.part }} --auto-partition-size 6
+      - name: Publish traces to storage repo
+        env:
+          GITHUB_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+          GITHUB_RUN_NUMBER: ${{ github.run_number }}
+        run: |
+          python3 scripts/ci/public_bench_and_pref.py --source-dir test/nightly_test_output
 
   nightly-test-perf-text-models-1-tpu:
     if: github.repository == 'sgl-project/sglang-jax'
@@ -72,7 +107,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
       - name: Run performance test for text models
-        timeout-minutes: 180
+        timeout-minutes: 1800
         env:
           TRACE_BASE_URL: https://raw.githubusercontent.com/sglang-bot/sglang-ci-data/main/traces/${{ github.run_id }}
           PERFETTO_RELAY_URL: ${{ vars.PERFETTO_RELAY_URL }}
@@ -81,17 +116,24 @@ jobs:
           source .venv/bin/activate
           pip install uv
           uv pip install -e "python[all]"
+
+          mkdir -p ./test/nightly_test_output/benchmark
+          mkdir -p ./test/nightly_test_output/pref
+
+
           bash scripts/killall_sglang.sh
-          cd test/srt
+          cd test/srt         
           python3 run_suite.py --suite nightly-test-perf-text-models-tpu-v6e-1
 
-#      - name: Publish traces to storage repo
-#        env:
-#          GITHUB_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
-#          GITHUB_RUN_ID: ${{ github.run_id }}
-#          GITHUB_RUN_NUMBER: ${{ github.run_number }}
-#        run: |
-#          python3 scripts/ci/publish_traces.py --traces-dir test/srt/performance_profiles_text_models
+      - name: Publish traces to storage repo
+        env:
+          GITHUB_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+          GITHUB_RUN_NUMBER: ${{ github.run_number }}
+        run: |
+          
+          python3 scripts/ci/public_bench_and_pref.py --source-dir test/nightly_test_output
+
 
   nightly-test-perf-text-models-4-tpu:
     if: github.repository == 'sgl-project/sglang-jax'
@@ -102,7 +144,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Run performance test for text models
-        timeout-minutes: 180
+        timeout-minutes: 1800
         env:
           TRACE_BASE_URL: https://raw.githubusercontent.com/sglang-bot/sglang-ci-data/main/traces/${{ github.run_id }}
           PERFETTO_RELAY_URL: ${{ vars.PERFETTO_RELAY_URL }}
@@ -111,14 +153,19 @@ jobs:
           source .venv/bin/activate
           pip install uv
           uv pip install -e "python[all]"
+
+          mkdir -p ./test/nightly_test_output/benchmark
+          mkdir -p ./test/nightly_test_output/pref
+
+
           bash scripts/killall_sglang.sh
           cd test/srt
           python3 run_suite.py --suite  nightly-test-perf-text-models-tpu-v6e-4
 
-#      - name: Publish traces to storage repo
-#        env:
-#          GITHUB_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
-#          GITHUB_RUN_ID: ${{ github.run_id }}
-#          GITHUB_RUN_NUMBER: ${{ github.run_number }}
-#        run: |
-#          python3 scripts/ci/publish_traces.py --traces-dir test/srt/performance_profiles_text_models
+      - name: Publish traces to storage repo
+        env:
+          GITHUB_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+          GITHUB_RUN_NUMBER: ${{ github.run_number }}
+        run: |
+          python3 scripts/ci/public_bench_and_pref.py --source-dir test/nightly_test_output
