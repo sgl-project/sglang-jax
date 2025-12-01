@@ -178,7 +178,7 @@ class EPMoE(nnx.Module):
         num_experts: int,
         num_experts_per_tok: int,
         ep_size: int,
-        mesh: Mesh | None,
+        mesh: Mesh,
         intermediate_dim: int = 2048,
         weight_dtype: jnp.dtype = jnp.bfloat16,
         dtype: jnp.dtype = jnp.bfloat16,

@@ -19,7 +19,7 @@ def get_model(
     rng: jax.Array,
     mesh: Mesh,
 ) -> Any:
-    loader = get_model_loader(load_config, rng, mesh)
+    loader = get_model_loader(load_config, mesh)
     return loader.load_model(
         model_config=model_config,
     )
