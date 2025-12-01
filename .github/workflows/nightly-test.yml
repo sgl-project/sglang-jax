@@ -31,6 +31,10 @@ jobs:
   nightly-test-accuracy-text-models-1-tpu:
     if: github.repository == 'sgl-project/sglang-jax'
     runs-on: arc-runner-v6e-1
+    strategy:
+      fail-fast: false
+      matrix:
+        part: [0, 1 , 2, 3]
     continue-on-error: true
     steps:
       - name: Checkout code
@@ -42,15 +46,18 @@ jobs:
           source .venv/bin/activate
           pip install uv
           uv pip install -e "python[all]"
+          uv pip install evalscope==0.17.1
           bash scripts/killall_sglang.sh
           cd test/srt
-          mkdir -p ../nightly_test_output/benchmark
-          mkdir -p ../nightly_test_output/pref
-          python3 run_suite.py --suite nightly-test-accuracy-text-models-tpu-v6e-1
+          python3 run_suite.py --suite nightly-test-accuracy-text-models-tpu-v6e-1 --auto-partition-id ${{ matrix.part }} --auto-partition-size 4
 
   nightly-test-accuracy-text-models-4-tpu:
     if: github.repository == 'sgl-project/sglang-jax'
     runs-on: arc-runner-v6e-4
+    strategy:
+      fail-fast: false
+      matrix:
+        part: [0, 1 , 2, 3 , 4, 5]
     continue-on-error: true
     steps:
       - name: Checkout code
@@ -62,9 +69,10 @@ jobs:
           source .venv/bin/activate
           pip install uv
           uv pip install -e "python[all]"
+          uv pip install evalscope==0.17.1
           bash scripts/killall_sglang.sh
           cd test/srt
-          python3 run_suite.py --suite nightly-test-accuracy-text-models-tpu-v6e-4
+          python3 run_suite.py --suite nightly-test-accuracy-text-models-tpu-v6e-4 --auto-partition-id ${{ matrix.part }} --auto-partition-size 6
 
   nightly-test-perf-text-models-1-tpu:
     if: github.repository == 'sgl-project/sglang-jax'
