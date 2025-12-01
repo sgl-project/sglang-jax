@@ -31,7 +31,7 @@ class TestModelAccuracy(CustomTestCase):
         model = QWEN_7B
         base_url = DEFAULT_URL_FOR_TEST
         api_url_for_eval = f"{base_url}/v1"
-        csv_file_path = "../nightly_test_output/benchmark/benchmark_results.csv"
+        csv_file_path = "./test/nightly_test_output/benchmark/benchmark_results.csv"
 
         # launch server
         process = popen_launch_server(
@@ -151,7 +151,7 @@ class TestModelAccuracy(CustomTestCase):
         model = QWEN3_8B
         base_url = DEFAULT_URL_FOR_TEST
         api_url_for_eval = f"{base_url}/v1"
-        csv_file_path = "../nightly_test_output/benchmark/benchmark_results.csv"
+        csv_file_path = "./test/nightly_test_output/benchmark/benchmark_results.csv"
 
         # launch server
         process = popen_launch_server(
@@ -271,7 +271,7 @@ class TestModelAccuracy(CustomTestCase):
         model = DEEPSEEK_R1_DISTILL_QWEN_1_5B
         base_url = DEFAULT_URL_FOR_TEST
         api_url_for_eval = f"{base_url}/v1"
-        csv_file_path = "../nightly_test_output/benchmark/benchmark_results.csv"
+        csv_file_path = "./test/nightly_test_output/benchmark/benchmark_results.csv"
         process = popen_launch_server(
             model,
             base_url,
@@ -390,7 +390,7 @@ class TestModelAccuracy(CustomTestCase):
         model = GEMMA2_2B_IT
         base_url = DEFAULT_URL_FOR_TEST
         api_url_for_eval = f"{base_url}/v1"
-        csv_file_path = "../nightly_test_output/benchmark/benchmark_results.csv"
+        csv_file_path = "./test/nightly_test_output/benchmark/benchmark_results.csv"
         process = popen_launch_server(
             model,
             base_url,
@@ -508,7 +508,7 @@ class TestModelAccuracy(CustomTestCase):
         model = QWEN_7B
         base_url = DEFAULT_URL_FOR_TEST
         api_url_for_eval = f"{base_url}/v1"
-        csv_file_path = "../nightly_test_output/benchmark/benchmark_tp_4_results.csv"
+        csv_file_path = "./test/nightly_test_output/benchmark/benchmark_tp_4_results.csv"
         process = popen_launch_server(
             model,
             DEFAULT_URL_FOR_TEST,
@@ -626,7 +626,7 @@ class TestModelAccuracy(CustomTestCase):
         model = QWEN3_8B
         base_url = DEFAULT_URL_FOR_TEST
         api_url_for_eval = f"{base_url}/v1"
-        csv_file_path = "../nightly_test_output/benchmark/benchmark_tp_4_results.csv"
+        csv_file_path = "./test/nightly_test_output/benchmark/benchmark_tp_4_results.csv"
         process = popen_launch_server(
             model,
             DEFAULT_URL_FOR_TEST,
@@ -744,7 +744,7 @@ class TestModelAccuracy(CustomTestCase):
         model = GEMMA2_2B_IT
         base_url = DEFAULT_URL_FOR_TEST
         api_url_for_eval = f"{base_url}/v1"
-        csv_file_path = "../nightly_test_output/benchmark/benchmark_tp_4_results.csv"
+        csv_file_path = "./test/nightly_test_output/benchmark/benchmark_tp_4_results.csv"
         process = popen_launch_server(
             model,
             DEFAULT_URL_FOR_TEST,
@@ -863,7 +863,7 @@ class TestModelAccuracy(CustomTestCase):
         model = QWEN3_CODER_30B_A3B_INSTRUCT
         base_url = DEFAULT_URL_FOR_TEST
         api_url_for_eval = f"{base_url}/v1"
-        csv_file_path = "../nightly_test_output/benchmark/benchmark_tp_4_results.csv"
+        csv_file_path = "./test/nightly_test_output/benchmark/benchmark_tp_4_results.csv"
         process = popen_launch_server(
             model,
             DEFAULT_URL_FOR_TEST,
@@ -984,7 +984,7 @@ class TestModelAccuracy(CustomTestCase):
         model = DEEPSEEK_R1_DISTILL_QWEN_1_5B
         base_url = DEFAULT_URL_FOR_TEST
         api_url_for_eval = f"{base_url}/v1"
-        csv_file_path = "../nightly_test_output/benchmark/benchmark_tp_4_results.csv"
+        csv_file_path = "./test/nightly_test_output/benchmark/benchmark_tp_4_results.csv"
         process = popen_launch_server(
             model,
             DEFAULT_URL_FOR_TEST,
@@ -1103,7 +1103,7 @@ class TestModelAccuracy(CustomTestCase):
         model = bailing_moe
         base_url = DEFAULT_URL_FOR_TEST
         api_url_for_eval = f"{base_url}/v1"
-        csv_file_path = "../nightly_test_output/benchmark/benchmark_tp_2_ep_2results.csv"
+        csv_file_path = "./test/nightly_test_output/benchmark/benchmark_tp_2_ep_2results.csv"
         process = popen_launch_server(
             model,
             DEFAULT_URL_FOR_TEST,
@@ -1224,7 +1224,7 @@ class TestModelAccuracy(CustomTestCase):
         model = QWEN3_CODER_30B_A3B_INSTRUCT
         base_url = DEFAULT_URL_FOR_TEST
         api_url_for_eval = f"{base_url}/v1"
-        csv_file_path = "../nightly_test_output/benchmark/benchmark_tp_2_ep_2results.csv"
+        csv_file_path = "./test/nightly_test_output/benchmark/benchmark_tp_2_ep_2results.csv"
         process = popen_launch_server(
             model,
             DEFAULT_URL_FOR_TEST,
