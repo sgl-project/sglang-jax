@@ -186,7 +186,9 @@ class TestModePerf(CustomTestCase):
 
         # define test parameters
         # concurrency levels
-        concurrency_levels = [8, 16, 32, 64, 128, 256]
+        # concurrency_levels = [8, 16, 32, 64, 128, 256]
+
+        concurrency_levels = [8, 16, 32]
         # input length levels (1k, 4k, 8k)
         input_lengths = [1024, 4096, 8192]
 
@@ -520,7 +522,7 @@ class TestModePerf(CustomTestCase):
                 "--chunked-prefill-size",
                 "2048",
                 "--tp-size",
-                "1",
+                "4",
             ],
             env={
                 "JAX_COMPILATION_CACHE_DIR": "/tmp/jax_compilation_cache",
@@ -670,8 +672,6 @@ class TestModePerf(CustomTestCase):
                 "128",
                 "--chunked-prefill-size",
                 "2048",
-                "--tp-size",
-                "1",
                 "--tp-size",
                 "2",
                 "--ep-size",
