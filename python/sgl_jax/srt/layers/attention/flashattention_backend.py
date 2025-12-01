@@ -246,12 +246,30 @@ class FlashAttention(AttentionBackend):
     def get_eagle_multi_step_metadata(self, batch: ModelWorkerBatch):
 
         indices = np.arange(0, len(batch.cache_loc), self.page_size)
-        selected_cache_locs = batch.cache_loc[indices]
+        # NOTE: Use original_selected_cache_locs as the source of truth for all steps
+        # to avoid the bug where selected_cache_locs is overwritten by truncated data in loops.
+        original_selected_cache_locs = batch.cache_loc[indices]
         assert batch.forward_mode is ForwardMode.DECODE
-        selected_cache_locs_for_draft_decode = np.zeros_like(selected_cache_locs)
+
         page_indices = []
         cu_kv_lens = []
         seq_lens = np.copy(batch.seq_lens)
+
+        # Vectorized preparation
+        real_bs = batch.real_bs
+        current_seq_lens = batch.seq_lens[:real_bs]
+        allocate_lens = batch.spec_info.allocate_lens[:real_bs]
+
+        draft_allocs = allocate_lens - current_seq_lens
+
+        alloc_tokens = current_seq_lens + draft_allocs
+        alloc_pages = cdiv(alloc_tokens, self.page_size)
+
+        # src_starts (offset2) is constant across steps
+        src_starts = np.concatenate(([0], np.cumsum(alloc_pages)[:-1]))
+
+        full_size = len(original_selected_cache_locs)
+
         for speculative_step_id in range(batch.speculative_num_steps):
             seq_lens += batch.speculative_eagle_topk * (speculative_step_id + 1)
             aligned_seq_lens = ((seq_lens + self.page_size - 1) // self.page_size) * self.page_size
@@ -263,29 +281,37 @@ class FlashAttention(AttentionBackend):
                     ]
                 )
             )
-            # for draft decode
-            offset1 = 0
-            offset2 = 0
-            for i in range(batch.real_bs):
-                draft_alloc = batch.spec_info.allocate_lens[i] - batch.seq_lens[i]
-                assert (
-                    draft_alloc == EagleDraftInput.ALLOC_LEN_PER_DECODE
-                ), f"{draft_alloc=} but {EagleDraftInput.ALLOC_LEN_PER_DECODE=}, speculative prepare_for_decode will error"
-                seq_len = int(batch.seq_lens[i])
-                spec_tokens = seq_len + (speculative_step_id + 1) * batch.speculative_eagle_topk
-                alloc_tokens = seq_len + draft_alloc
-                spec_pages = cdiv(spec_tokens, self.page_size)
-                alloc_pages = cdiv(alloc_tokens, self.page_size)
-                selected_cache_locs_for_draft_decode[offset1 : offset1 + spec_pages] = (
-                    selected_cache_locs[offset2 : offset2 + spec_pages]
-                )
-                offset1 += spec_pages
-                offset2 += alloc_pages
-            selected_cache_locs = selected_cache_locs_for_draft_decode
-            page_indices_cur_step = (selected_cache_locs // self.page_size).astype(np.int32)
-            if page_indices_cur_step.shape[0] < 16384:
-                padding_size = 16834 - page_indices_cur_step.shape[0]
-                page_indices_cur_step = np.pad(page_indices_cur_step, ((0, padding_size)))
+
+            # Vectorized calculation of spec_pages
+            step_spec_tokens = (
+                current_seq_lens + (speculative_step_id + 1) * batch.speculative_eagle_topk
+            )
+            step_spec_pages = cdiv(step_spec_tokens, self.page_size)
+
+            total_spec_pages = np.sum(step_spec_pages)
+            dst_starts = np.concatenate(([0], np.cumsum(step_spec_pages)[:-1]))
+
+            # Vectorized Gather
+            repeats = step_spec_pages
+            gather_indices = np.repeat(src_starts, repeats) + (
+                np.arange(total_spec_pages) - np.repeat(dst_starts, repeats)
+            )
+
+            gathered_locs = original_selected_cache_locs[gather_indices]
+
+            # Reconstruct the full array (sparse/padded)
+            result_locs = np.zeros(full_size, dtype=original_selected_cache_locs.dtype)
+            result_locs[:total_spec_pages] = gathered_locs
+
+            page_indices_cur_step = (result_locs // self.page_size).astype(np.int32)
+
+            # Handle padding
+            TARGET_PADDING = 16384
+            if page_indices_cur_step.shape[0] < TARGET_PADDING:
+                padding_size = TARGET_PADDING - page_indices_cur_step.shape[0]
+                # Use np.pad to keep it on CPU/Numpy until device_array call
+                page_indices_cur_step = np.pad(page_indices_cur_step, (0, padding_size))
+
             page_indices.append(page_indices_cur_step)
 
         if batch.spec_algorithm.is_none():
