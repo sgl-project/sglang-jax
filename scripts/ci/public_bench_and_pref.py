@@ -72,9 +72,7 @@ def verify_token_permissions(repo_owner, repo_name, token):
 
 def get_branch_sha(repo_owner, repo_name, branch, token):
     """Get SHA of the branch head"""
-    url = (
-        f"https://api.github.com/repos/{repo_owner}/{repo_name}/git/refs/heads/{branch}"
-    )
+    url = f"https://api.github.com/repos/{repo_owner}/{repo_name}/git/refs/heads/{branch}"
     response = make_github_request(url, token)
     data = json.loads(response)
     return data["object"]["sha"]
@@ -149,9 +147,7 @@ def create_tree(repo_owner, repo_name, base_tree_sha, files, token, max_retries=
                 raise
 
 
-def create_commit(
-    repo_owner, repo_name, tree_sha, parent_sha, message, token, max_retries=3
-):
+def create_commit(repo_owner, repo_name, tree_sha, parent_sha, message, token, max_retries=3):
     """Create a new commit"""
     url = f"https://api.github.com/repos/{repo_owner}/{repo_name}/git/commits"
 
@@ -163,7 +159,9 @@ def create_commit(
             commit_sha = json.loads(response)["sha"]
 
             # Verify the commit was actually created
-            verify_url = f"https://api.github.com/repos/{repo_owner}/{repo_name}/git/commits/{commit_sha}"
+            verify_url = (
+                f"https://api.github.com/repos/{repo_owner}/{repo_name}/git/commits/{commit_sha}"
+            )
             verify_response = make_github_request(verify_url, token)
             verify_data = json.loads(verify_response)
             if verify_data["sha"] != commit_sha:
@@ -185,9 +183,7 @@ def create_commit(
 
 def update_branch_ref(repo_owner, repo_name, branch, commit_sha, token, max_retries=3):
     """Update branch reference to point to new commit"""
-    url = (
-        f"https://api.github.com/repos/{repo_owner}/{repo_name}/git/refs/heads/{branch}"
-    )
+    url = f"https://api.github.com/repos/{repo_owner}/{repo_name}/git/refs/heads/{branch}"
 
     data = {"sha": commit_sha}
 
@@ -277,9 +273,7 @@ def publish_traces(traces_dir, run_id, run_number):
 
     # Verify token permissions before proceeding
     if not verify_token_permissions(repo_owner, repo_name, token):
-        print(
-            "Token permission verification failed. Please check the token permissions."
-        )
+        print("Token permission verification failed. Please check the token permissions.")
         sys.exit(1)
 
     max_retries = 5
@@ -296,9 +290,7 @@ def publish_traces(traces_dir, run_id, run_number):
             print(f"Current tree SHA: {tree_sha}")
 
             # Create new tree with all files
-            new_tree_sha = create_tree(
-                repo_owner, repo_name, tree_sha, files_to_upload, token
-            )
+            new_tree_sha = create_tree(repo_owner, repo_name, tree_sha, files_to_upload, token)
             print(f"Created new tree: {new_tree_sha}")
 
             # Create commit
@@ -349,14 +341,12 @@ def publish_traces(traces_dir, run_id, run_number):
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Publish files to a GitHub repository"
-    )
+    parser = argparse.ArgumentParser(description="Publish files to a GitHub repository")
     parser.add_argument(
         "--source-dir",
         type=str,
         required=True,
-        help="Source directory with files to publish", 
+        help="Source directory with files to publish",
     )
     args = parser.parse_args()
 
@@ -365,17 +355,15 @@ def main():
     run_number = os.getenv("GITHUB_RUN_NUMBER", "12345")
 
     if not run_id or not run_number:
-        print(
-            "Error: GITHUB_RUN_ID and GITHUB_RUN_NUMBER environment variables must be set"
-        )
+        print("Error: GITHUB_RUN_ID and GITHUB_RUN_NUMBER environment variables must be set")
         sys.exit(1)
 
     # Use source directory
-    source_dir = args.source_dir 
+    source_dir = args.source_dir
     print(f"Processing files from directory: {source_dir}")
 
     # Publish files
-    publish_traces(source_dir, run_id, run_number) 
+    publish_traces(source_dir, run_id, run_number)
 
 
 if __name__ == "__main__":

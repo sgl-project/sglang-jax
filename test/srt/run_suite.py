@@ -158,50 +158,110 @@ suites = {
     "nightly-test-accuracy-text-models-tpu-v6e-1": [
         TestFile(
             "nightly-test/test_accuracy.py",
-
-             test_methods=["TestModelAccuracy.test_qwen_7b",
-                          "TestModelAccuracy.test_qwen3_8b",
-                          "TestModelAccuracy.test_DEEPSEEK_R1_DISTILL_QWEN_1_5B",  
-                          "TestModelAccuracy.test_GEMMA2_2B_IT", 
-                          ],
-
-        )
+            estimated_time=7,
+            test_methods=["TestModelAccuracy.test_qwen_7b"],
+        ),
+        TestFile(
+            "nightly-test/test_accuracy.py",
+            estimated_time=8,
+            test_methods=["TestModelAccuracy.test_qwen3_8b"],
+        ),
+        TestFile(
+            "nightly-test/test_accuracy.py",
+            estimated_time=1.5,
+            test_methods=["TestModelAccuracy.test_DEEPSEEK_R1_DISTILL_QWEN_1_5B"],
+        ),
+        TestFile(
+            "nightly-test/test_accuracy.py",
+            estimated_time=2,
+            test_methods=["TestModelAccuracy.test_GEMMA2_2B_IT"],
+        ),
     ],
     "nightly-test-accuracy-text-models-tpu-v6e-4": [
         TestFile(
             "nightly-test/test_accuracy.py",
-            test_methods=["TestModelAccuracy.test_qwen_7b_tp_4",
-                "TestModelAccuracy.test_qwen3_8b_tp_4",
-                "TestModelAccuracy.test_bailing_moe_tp_2_ep2", 
-                "TestModelAccuracy.test_DEEPSEEK_R1_DISTILL_QWEN_1_5B_tp_4",
-                "TestModelAccuracy.test_QWEN3_CODER_30B_A3B_INSTRUCT_tp_2_ep_2",  
-                "TestModelAccuracy.test_GEMMA2_2B_IT_tp_4", 
-                ],
-        )
+            estimated_time=7,
+            test_methods=["TestModelAccuracy.test_qwen_7b_tp_4"],
+        ),
+        TestFile(
+            "nightly-test/test_accuracy.py",
+            estimated_time=8,
+            test_methods=["TestModelAccuracy.test_qwen3_8b_tp_4"],
+        ),
+        TestFile(
+            "nightly-test/test_accuracy.py",
+            estimated_time=25,
+            test_methods=["TestModelAccuracy.test_bailing_moe_tp_2_ep2"],
+        ),
+        TestFile(
+            "nightly-test/test_accuracy.py",
+            estimated_time=1.5,
+            test_methods=["TestModelAccuracy.test_DEEPSEEK_R1_DISTILL_QWEN_1_5B_tp_4"],
+        ),
+        TestFile(
+            "nightly-test/test_accuracy.py",
+            estimated_time=30,
+            test_methods=["TestModelAccuracy.test_QWEN3_CODER_30B_A3B_INSTRUCT_tp_2_ep_2"],
+        ),
+        TestFile(
+            "nightly-test/test_accuracy.py",
+            estimated_time=2,
+            test_methods=["TestModelAccuracy.test_GEMMA2_2B_IT_tp_4"],
+        ),
     ],
     "nightly-test-perf-text-models-tpu-v6e-1": [
         TestFile(
             "nightly-test/test_pref.py",
-            test_methods=[
-                "TestModePerf.test_qwen_7b_performance_tp_1",
-                "TestModePerf.test_qwen3_8b_performance_tp_1",
-                "TestModePerf.test_GEMMA2_2B_IT_performance_tp_1",
-                "TestModePerf.test_QWEN2_5_7B_INSTRUCT_performance_tp_1",
-            ],
-        )
+            estimated_time=7,
+            test_methods=["TestModePerf.test_qwen_7b_performance_tp_1"],
+        ),
+        TestFile(
+            "nightly-test/test_pref.py",
+            estimated_time=8,
+            test_methods=["TestModePerf.test_qwen3_8b_performance_tp_1"],
+        ),
+        TestFile(
+            "nightly-test/test_pref.py",
+            estimated_time=2,
+            test_methods=["TestModePerf.test_GEMMA2_2B_IT_performance_tp_1"],
+        ),
+        TestFile(
+            "nightly-test/test_pref.py",
+            estimated_time=2.5,
+            test_methods=["TestModePerf.test_QWEN2_5_7B_INSTRUCT_performance_tp_1"],
+        ),
     ],
     "nightly-test-perf-text-models-tpu-v6e-4": [
         TestFile(
             "nightly-test/test_pref.py",
-            test_methods=[
-                "TestModePerf.test_qwen_7b_performance_tp_4",
-                "TestModePerf.test_qwen3_8b_performance_tp_4",
-                "TestModePerf.test_QWEN3_CODER_30B_A3B_INSTRUCT_performance_tp_2_ep_2",
-                "TestModePerf.test_GEMMA2_2B_IT_performance_tp_4",
-                "TestModePerf.test_bailing_moe_performance_tp_2_ep_2",
-                "TestModePerf.test_QWEN2_5_7B_INSTRUCT_performance_tp_4",
-            ],
-        )
+            estimated_time=7,
+            test_methods=["TestModePerf.test_qwen_7b_performance_tp_4"],
+        ),
+        TestFile(
+            "nightly-test/test_pref.py",
+            estimated_time=8,
+            test_methods=["TestModePerf.test_qwen3_8b_performance_tp_4"],
+        ),
+        TestFile(
+            "nightly-test/test_pref.py",
+            estimated_time=30,
+            test_methods=["TestModePerf.test_QWEN3_CODER_30B_A3B_INSTRUCT_performance_tp_2_ep_2"],
+        ),
+        TestFile(
+            "nightly-test/test_pref.py",
+            estimated_time=2,
+            test_methods=["TestModePerf.test_GEMMA2_2B_IT_performance_tp_4"],
+        ),
+        TestFile(
+            "nightly-test/test_pref.py",
+            estimated_time=20,
+            test_methods=["TestModePerf.test_bailing_moe_performance_tp_2_ep_2"],
+        ),
+        TestFile(
+            "nightly-test/test_pref.py",
+            estimated_time=2.5,
+            test_methods=["TestModePerf.test_QWEN2_5_7B_INSTRUCT_performance_tp_4"],
+        ),
     ],
     "sglang_dependency_test": [],
     "unit-test-tpu-v6e-1": [
