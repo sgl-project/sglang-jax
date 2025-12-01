@@ -1020,20 +1020,29 @@ def assign_req_to_token_pool(
     end_offsets,
     out_cache_loc,
 ):
-    bs = start_offsets.shape[0]
+    # Ensure inputs are numpy arrays (CPU) to avoid JAX sync overhead
+    start_offsets = np.asarray(start_offsets, dtype=np.int32)
+    end_offsets = np.asarray(end_offsets, dtype=np.int32)
+    out_cache_loc = np.asarray(out_cache_loc, dtype=np.int32)
+
     out_cache_lens = end_offsets - start_offsets
-    out_cache_loc_start_positions = np.concatenate(
-        [np.array([0], dtype=np.int32), np.cumsum(out_cache_lens)]
-    )[0:-1]
-    all_cache_loc_len = out_cache_loc.shape[0]
-    allocate_len = 0
-    for i in range(bs):
-        out_cache_loc_start = out_cache_loc_start_positions[i]
-        req_to_token_pool.write(
-            (req_pool_indices[i], slice(start_offsets[i], end_offsets[i])),
-            out_cache_loc[out_cache_loc_start : out_cache_loc_start + out_cache_lens[i]],
-        )
-        allocate_len += out_cache_lens[i]
+    repeats = out_cache_lens
+    total_elements = np.sum(repeats)
+
     assert (
-        allocate_len == all_cache_loc_len
-    ), f"not all allocate cache loc is assigned to req_token_pool, it's may lead to mem leak, assigned {allocate_len}, allocate {all_cache_loc_len}"
+        total_elements == out_cache_loc.shape[0]
+    ), f"not all allocate cache loc is assigned to req_token_pool, it's may lead to mem leak, assigned {total_elements}, allocate {out_cache_loc.shape[0]}"
+
+    if total_elements == 0:
+        return
+
+    # 1. Row indices: repeat req_pool_indices
+    row_indices = np.repeat(req_pool_indices, repeats)
+
+    # 2. Col indices: generate ranges
+    block_starts = np.concatenate(([0], np.cumsum(repeats)[:-1]))
+    shifts = np.repeat(block_starts, repeats)
+    col_indices = np.arange(total_elements) - shifts + np.repeat(start_offsets, repeats)
+
+    # 3. Assign
+    req_to_token_pool.req_to_token[row_indices, col_indices] = out_cache_loc
