@@ -4,7 +4,6 @@ from typing import Any
 import jax
 import jax.numpy as jnp
 from flax import nnx
-from flax.nnx import rnglib
 from flax.nnx.nn import dtypes
 from flax.typing import Array, Axes, Dtype
 from jax import lax
@@ -40,7 +39,6 @@ class RMSNorm(nnx.Module):
         axis_name: str | None = None,
         axis_index_groups: Any = None,
         use_fast_variance: bool = True,
-        rngs: rnglib.Rngs | None = None,
     ):
         feature_shape = (num_features,)
 
@@ -189,7 +187,6 @@ class GemmaRMSNorm(nnx.Module):
         hidden_size: int,
         epsilon: float = 1e-6,
         kernel_axes: Sequence[str] | None = None,
-        rngs: nnx.Rngs = None,
     ):
         self.epsilon = epsilon
         self.weight = nnx.Param(

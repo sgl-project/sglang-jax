@@ -45,7 +45,6 @@ class LlamaMLP(nnx.Module):
         hidden_size: int,
         intermediate_size: int,
         layer_id: int = 0,
-        rngs: nnx.Rngs = None,
         dtype: jnp.dtype = jnp.bfloat16,
         mesh: jax.sharding.Mesh = None,
     ) -> None:
@@ -57,7 +56,6 @@ class LlamaMLP(nnx.Module):
             kernel_axes=(None, "tensor"),
             use_bias=False,
             params_dtype=dtype,
-            rngs=rngs,
             mesh=mesh,
         )
 
@@ -67,7 +65,6 @@ class LlamaMLP(nnx.Module):
             kernel_axes=(None, "tensor"),
             use_bias=False,
             params_dtype=dtype,
-            rngs=rngs,
             mesh=mesh,
         )
 
@@ -77,7 +74,6 @@ class LlamaMLP(nnx.Module):
             kernel_axes=("tensor", None),
             use_bias=False,
             params_dtype=dtype,
-            rngs=rngs,
             mesh=mesh,
         )
 
@@ -105,7 +101,6 @@ class LlamaAttention(nnx.Module):
         rope_is_neox_style: bool = True,
         max_position_embeddings: int = 8192,
         dtype: jnp.dtype = jnp.bfloat16,
-        rngs: nnx.Rngs = None,
         attention_bias: bool = False,
         mesh: jax.sharding.Mesh = None,
     ) -> None:
@@ -129,7 +124,6 @@ class LlamaAttention(nnx.Module):
             output_size=num_heads * self.head_dim,
             use_bias=attention_bias,
             kernel_axes=(None, "tensor"),
-            rngs=rngs,
             params_dtype=dtype,
             mesh=mesh,
         )
@@ -138,7 +132,6 @@ class LlamaAttention(nnx.Module):
             output_size=num_kv_heads * self.head_dim,
             use_bias=attention_bias,
             kernel_axes=(None, "tensor"),
-            rngs=rngs,
             params_dtype=dtype,
             mesh=mesh,
         )
@@ -147,7 +140,6 @@ class LlamaAttention(nnx.Module):
             output_size=num_kv_heads * self.head_dim,
             use_bias=attention_bias,
             kernel_axes=(None, "tensor"),
-            rngs=rngs,
             params_dtype=dtype,
             mesh=mesh,
         )
@@ -156,7 +148,6 @@ class LlamaAttention(nnx.Module):
             output_size=hidden_size,
             use_bias=attention_bias,
             kernel_axes=("tensor", None),
-            rngs=rngs,
             params_dtype=dtype,
             mesh=mesh,
         )
@@ -208,7 +199,6 @@ class LlamaDecoderLayer(nnx.Module):
         config: LlamaConfig,
         layer_id: int = 0,
         dtype: jnp.dtype = jnp.bfloat16,
-        rngs: nnx.Rngs = None,
         mesh: jax.sharding.Mesh = None,
     ) -> None:
         # super().__init__()
@@ -238,14 +228,12 @@ class LlamaDecoderLayer(nnx.Module):
             rope_is_neox_style=rope_is_neox_style,
             max_position_embeddings=max_position_embeddings,
             attention_bias=attention_bias,
-            rngs=rngs,
             dtype=dtype,
             mesh=mesh,
         )
         self.mlp = LlamaMLP(
             hidden_size=self.hidden_size,
             intermediate_size=config.intermediate_size,
-            rngs=rngs,
             dtype=dtype,
             mesh=mesh,
         )
@@ -253,14 +241,12 @@ class LlamaDecoderLayer(nnx.Module):
             config.hidden_size,
             epsilon=config.rms_norm_eps,
             param_dtype=dtype,
-            rngs=rngs,
             dtype=dtype,
         )
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size,
             epsilon=config.rms_norm_eps,
             param_dtype=dtype,
-            rngs=rngs,
             dtype=dtype,
         )
 
@@ -315,7 +301,6 @@ class LlamaModel(nnx.Module):
         self,
         config: LlamaConfig,
         dtype: jnp.dtype = jnp.bfloat16,
-        rngs: nnx.Rngs = None,
         is_draft_model: bool = False,
         mesh: jax.sharding.Mesh = None,
     ) -> None:
@@ -327,7 +312,6 @@ class LlamaModel(nnx.Module):
             self.embed_tokens = Embed(
                 config.vocab_size,
                 config.hidden_size,
-                rngs=rngs,
                 dtype=dtype,
                 kernel_axes=("tensor", None),
                 param_dtype=dtype,
@@ -340,7 +324,6 @@ class LlamaModel(nnx.Module):
                         config=config,
                         layer_id=i,
                         dtype=dtype,
-                        rngs=rngs,
                         mesh=mesh,
                     )
                     for i in range(config.num_hidden_layers)
@@ -351,7 +334,6 @@ class LlamaModel(nnx.Module):
                 config.hidden_size,
                 epsilon=config.rms_norm_eps,
                 param_dtype=dtype,
-                rngs=rngs,
             )
         self.layers_to_capture = []
 
@@ -394,14 +376,13 @@ class LlamaForCausalLM(nnx.Module):
         self,
         config: PretrainedConfig,
         dtype: jnp.dtype = jnp.bfloat16,
-        rngs: nnx.Rngs = None,
         mesh: jax.sharding.Mesh = None,
     ):
         self.mesh = mesh
         self.config = config
         self.dtype = dtype
         logger.info("LlamaForCausalLM config dtype: %s", self.dtype)
-        self.model = LlamaModel(config, dtype=self.dtype, rngs=rngs, mesh=mesh)
+        self.model = LlamaModel(config, dtype=self.dtype, mesh=mesh)
         if not getattr(self.config, "tie_word_embeddings", False):
             self.lm_head = ParallelLMHead(
                 config.vocab_size,
@@ -409,14 +390,11 @@ class LlamaForCausalLM(nnx.Module):
                 dtype=self.dtype,
                 param_dtype=self.dtype,
                 kernel_axes=("tensor", None),
-                rngs=rngs,
             )
         self.logits_processor = LogitsProcessor(config.vocab_size, mesh=self.mesh)
         self.capture_aux_hidden_states = False
 
     def load_weights(self, model_config: ModelConfig, rng_key: jax.Array):
-        self.rng = nnx.Rngs(rng_key)
-
         loader = WeightLoader(
             model=self,
             model_config=model_config,

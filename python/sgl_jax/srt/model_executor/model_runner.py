@@ -109,7 +109,6 @@ class ModelRunner:
                 load_format=server_args.load_format,
                 download_dir=server_args.download_dir,
             ),
-            rngs=rngs,
             mesh=self.mesh,
         )
 

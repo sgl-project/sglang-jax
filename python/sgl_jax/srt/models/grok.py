@@ -35,7 +35,7 @@ logger = logging.getLogger(__name__)
 init_fn = nnx.initializers.uniform()
 
 
-def _yarn_linear_ramp_mask(low: float, high: float, dim: int, dtype: jnp.dtype[Any]) -> jax.Array:
+def _yarn_linear_ramp_mask(low: float, high: float, dim: int, dtype: jnp.dtype) -> jax.Array:
     """Create a linear ramp mask for YaRN scaling."""
     if low == high:
         low -= 0.001  # Prevent singularity
@@ -83,7 +83,7 @@ class ScalingRotaryEmbedding(RotaryEmbedding):
         base: int,
         is_neox_style: bool,
         scaling_factor: float,
-        dtype: jnp.dtype[Any],
+        dtype: jnp.dtype,
         *,
         extra_method: str = "yarn_log",
         extrapolation_factor: float = 1,
@@ -157,8 +157,7 @@ class Grok1MLP(nnx.Module):
         hidden_size: int,
         intermediate_size: int,
         layer_id: int,
-        rngs: nnx.Rngs | None = None,
-        dtype: jnp.dtype[Any] = jnp.bfloat16,
+        dtype: jnp.dtype = jnp.bfloat16,
         reduce_results: bool = True,
         mesh: jax.sharding.Mesh | None = None,
     ) -> None:
@@ -170,7 +169,6 @@ class Grok1MLP(nnx.Module):
             use_bias=False,
             params_dtype=dtype,
             kernel_axes=(None, "tensor"),
-            rngs=rngs,
             mesh=mesh,
         )
         self.up_proj = LinearBase(
@@ -179,7 +177,6 @@ class Grok1MLP(nnx.Module):
             use_bias=False,
             params_dtype=dtype,
             kernel_axes=(None, "tensor"),
-            rngs=rngs,
             mesh=mesh,
         )
         self.down_proj = LinearBase(
@@ -188,7 +185,6 @@ class Grok1MLP(nnx.Module):
             use_bias=False,
             params_dtype=dtype,
             kernel_axes=("tensor", None),
-            rngs=rngs,
             mesh=mesh,
         )
         self.act_fn = GeluAndMul(approximate="tanh")
@@ -218,9 +214,8 @@ class Grok1MoE(nnx.Module):
         top_k: int,
         hidden_size: int,
         intermediate_size: int,
-        rngs: nnx.Rngs | None,
         mesh: jax.sharding.Mesh | None,
-        dtype: jnp.dtype[Any] = jnp.bfloat16,
+        dtype: jnp.dtype = jnp.bfloat16,
     ):
         super().__init__()
         self.hidden_size = hidden_size
@@ -237,7 +232,6 @@ class Grok1MoE(nnx.Module):
             use_bias=False,
             params_dtype=jnp.float32,
             kernel_axes=(None, None),
-            rngs=rngs,
             mesh=mesh,
         )
 
@@ -336,7 +330,6 @@ class Grok1Attention(nnx.Module):
         max_position: int = 4096 * 32,
         rope_theta: float = 10000,
         *,
-        rngs: nnx.Rngs | None,
         mesh: jax.sharding.Mesh | None = None,
     ) -> None:
         super().__init__()
@@ -364,7 +357,6 @@ class Grok1Attention(nnx.Module):
             use_bias=False,
             params_dtype=jnp.bfloat16,
             kernel_axes=(None, "tensor"),
-            rngs=rngs,
             mesh=mesh,
         )
 
@@ -374,7 +366,6 @@ class Grok1Attention(nnx.Module):
             use_bias=False,
             params_dtype=jnp.bfloat16,
             kernel_axes=(None, "tensor"),
-            rngs=rngs,
             mesh=mesh,
         )
 
@@ -384,7 +375,6 @@ class Grok1Attention(nnx.Module):
             use_bias=False,
             params_dtype=jnp.bfloat16,
             kernel_axes=(None, "tensor"),
-            rngs=rngs,
             mesh=mesh,
         )
 
@@ -394,7 +384,6 @@ class Grok1Attention(nnx.Module):
             use_bias=False,
             params_dtype=jnp.bfloat16,
             kernel_axes=("tensor", None),
-            rngs=rngs,
             mesh=mesh,
         )
 
@@ -472,7 +461,6 @@ class Grok1DecoderLayer(nnx.Module):
         self,
         config: PretrainedConfig,
         layer_id: int,
-        rngs: nnx.Rngs | None,
         mesh: jax.sharding.Mesh | None,
     ) -> None:
         super().__init__()
@@ -496,7 +484,6 @@ class Grok1DecoderLayer(nnx.Module):
             num_kv_heads=config.num_key_value_heads,
             layer_id=layer_id,
             rope_theta=rope_theta,
-            rngs=rngs,
             mesh=mesh,
         )
 
@@ -518,7 +505,6 @@ class Grok1DecoderLayer(nnx.Module):
                 top_k=config.num_experts_per_tok,
                 hidden_size=config.hidden_size,
                 intermediate_size=intermediate_size,
-                rngs=rngs,
                 mesh=mesh,
             )
             if self.residual_moe:
@@ -526,7 +512,6 @@ class Grok1DecoderLayer(nnx.Module):
                     hidden_size=config.hidden_size,
                     intermediate_size=config.intermediate_size,
                     layer_id=layer_id,
-                    rngs=rngs,
                     reduce_results=False,
                     mesh=mesh,
                 )
@@ -534,10 +519,22 @@ class Grok1DecoderLayer(nnx.Module):
             raise NotImplementedError()
 
         # Layer normalization (using eps instead of epsilon to match PyTorch)
-        self.pre_attn_norm = RMSNorm(config.hidden_size, epsilon=config.rms_norm_eps, rngs=rngs)
-        self.post_attn_norm = RMSNorm(config.hidden_size, epsilon=config.rms_norm_eps, rngs=rngs)
-        self.pre_moe_norm = RMSNorm(config.hidden_size, epsilon=config.rms_norm_eps, rngs=rngs)
-        self.post_moe_norm = RMSNorm(config.hidden_size, epsilon=config.rms_norm_eps, rngs=rngs)
+        self.pre_attn_norm = RMSNorm(
+            config.hidden_size,
+            epsilon=config.rms_norm_eps,
+        )
+        self.post_attn_norm = RMSNorm(
+            config.hidden_size,
+            epsilon=config.rms_norm_eps,
+        )
+        self.pre_moe_norm = RMSNorm(
+            config.hidden_size,
+            epsilon=config.rms_norm_eps,
+        )
+        self.post_moe_norm = RMSNorm(
+            config.hidden_size,
+            epsilon=config.rms_norm_eps,
+        )
 
         # Setup FFN function based on configuration (matching PyTorch logic)
         if self.num_experts > 0:
@@ -615,7 +612,6 @@ class Grok1Model(nnx.Module):
         self,
         config: PretrainedConfig,
         *,
-        rngs: nnx.Rngs | None,
         mesh: jax.sharding.Mesh | None,
     ) -> None:
         super().__init__()
@@ -628,7 +624,6 @@ class Grok1Model(nnx.Module):
         self.embed_tokens = Embed(
             num_embeddings=config.vocab_size,
             features=config.hidden_size,
-            rngs=rngs,
             dtype=jnp.bfloat16,
             kernel_axes=("tensor", None),
             param_dtype=jnp.bfloat16,
@@ -638,13 +633,16 @@ class Grok1Model(nnx.Module):
         # Transformer layers
         self.layers = nnx.List(
             [
-                Grok1DecoderLayer(config=config, layer_id=i, mesh=mesh, rngs=rngs)
+                Grok1DecoderLayer(config=config, layer_id=i, mesh=mesh)
                 for i in range(config.num_hidden_layers)
             ]
         )
 
         # Final layer norm (using eps to match PyTorch)
-        self.norm = RMSNorm(config.hidden_size, epsilon=config.rms_norm_eps, rngs=rngs)
+        self.norm = RMSNorm(
+            config.hidden_size,
+            epsilon=config.rms_norm_eps,
+        )
 
     def __call__(
         self,
@@ -696,8 +694,7 @@ class Grok1ForCausalLM(nnx.Module):
     def __init__(
         self,
         config: PretrainedConfig,
-        dtype: jnp.dtype[Any],
-        rngs: nnx.Rngs | None = None,
+        dtype: jnp.dtype,
         mesh: jax.sharding.Mesh | None = None,
     ) -> None:
         super().__init__()
@@ -709,7 +706,7 @@ class Grok1ForCausalLM(nnx.Module):
         self.replicate_lm_head = getattr(config, "replicate_lm_head", False)
 
         # Main model
-        self.model = Grok1Model(config, rngs=rngs, mesh=mesh)
+        self.model = Grok1Model(config, mesh=mesh)
 
         # Language modeling head (matching PyTorch logic for replicated vs parallel)
         self.lm_head: LinearBase | ParallelLMHead
@@ -721,7 +718,6 @@ class Grok1ForCausalLM(nnx.Module):
                 use_bias=False,
                 params_dtype=jnp.bfloat16,
                 kernel_axes=("tensor", None),
-                rngs=rngs,
             )
         else:
             self.lm_head = ParallelLMHead(
@@ -729,7 +725,6 @@ class Grok1ForCausalLM(nnx.Module):
                 features=config.hidden_size,
                 param_dtype=jnp.bfloat16,
                 kernel_axes=("tensor", None),
-                rngs=rngs,
             )
         soft_cap = getattr(config, "final_logit_softcapping", 0.0) if config else 0.0
         self.logits_processor = LogitsProcessor(config.vocab_size, mesh=mesh, soft_cap=soft_cap)
@@ -790,8 +785,6 @@ class Grok1ForCausalLM(nnx.Module):
         return output, layers_kv_fused, True
 
     def load_weights(self, model_config: ModelConfig, rng_key: jax.Array) -> None:
-        self.rngs = nnx.Rngs(rng_key)
-
         loader = WeightLoader(
             model=self,
             model_config=model_config,
