@@ -461,8 +461,14 @@ class ModelWorker:
             forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
 
         # Prepare LoRA batch if LoRA is enabled
-        if self.worker.server_args.enable_lora and self.need_prepare_lora_batch:
-            self.get_model_runner().lora_manager.prepare_lora_batch(model_worker_batch)
+        if self.worker.server_args.enable_lora:
+            if model_worker_batch.lora_batch_info is None:
+                self.get_model_runner().lora_manager.prepare_lora_batch(model_worker_batch)
+
+            if model_worker_batch.lora_batch_info is not None:
+                self.get_model_runner().lora_manager.set_batch_info(
+                    model_worker_batch.lora_batch_info
+                )
 
         if forward_metadata is None:
             forward_metadata = self.worker.model_runner.attn_backend.get_forward_metadata(
