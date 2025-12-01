@@ -432,27 +432,10 @@ class LoRAManager:
 
         for i, uid in enumerate(model_worker_batch.lora_ids):
             weight_indices[i] = self.memory_pool.get_buffer_id(uid)
-            print(
-                f"  [{i}] uid={uid}, buffer_id={weight_indices[i]}, uid_in_loras={uid in self.loras if uid is not None else False}"
-            )
             if uid is not None and uid in self.loras:
                 lora = self.loras[uid]
-                print(
-                    f"      -> Setting lora_ranks[{weight_indices[i]}]={lora.config.r}, scalings[{weight_indices[i]}]={lora.scaling}"
-                )
                 lora_ranks[weight_indices[i]] = lora.config.r
                 scalings[weight_indices[i]] = lora.scaling
-
-                # Check if weights are actually loaded in the buffer
-                import jax.numpy as jnp
-
-                sample_module = list(self.target_modules)[0] if self.target_modules else None
-                if sample_module and sample_module in self.memory_pool.A_buffer:
-                    layer_0_weights = self.memory_pool.A_buffer[sample_module][0][weight_indices[i]]
-                    weight_norm = jnp.linalg.norm(layer_0_weights)
-                    print(
-                        f"      -> Buffer slot {weight_indices[i]} weights norm (layer 0, {sample_module}): {weight_norm}"
-                    )
 
         self.lora_backend.prepare_lora_batch(
             model_worker_batch=model_worker_batch,
