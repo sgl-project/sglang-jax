@@ -19,7 +19,6 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import jax
-import jax.numpy as jnp
 from flax import nnx
 from jax.sharding import Mesh
 
@@ -94,11 +93,10 @@ class LoRALinear(BaseLayerWithLoRA):
         if (
             current_A is not None
             and isinstance(self.A_buffer, nnx.Param)
-            and self.A_buffer.value.shape == A_buffer.shape
+            and self.A_buffer.shape == A_buffer.shape
         ):
-
-            self.A_buffer.value = A_buffer
-            self.B_buffer.value = B_buffer
+            self.A_buffer[...] = A_buffer
+            self.B_buffer[...] = B_buffer
         else:
             # first initialize
             self.A_buffer = nnx.Param(A_buffer)
@@ -106,13 +104,12 @@ class LoRALinear(BaseLayerWithLoRA):
 
     def apply_lora(self, operands) -> jax.Array:
         base_output, x = operands
-        jax.debug.print("A_buffer row means: {}", jnp.mean(self.A_buffer.value, axis=1))
         lora_a_output = self.lora_backend.run_lora_a_gemm(
-            x=x, weights=self.A_buffer.value, sharding=self.lora_a_output_sharding
+            x=x, weights=self.A_buffer, sharding=self.lora_a_output_sharding
         )
         lora_output = self.lora_backend.run_lora_b_gemm(
             x=lora_a_output,
-            weights=self.B_buffer.value,
+            weights=self.B_buffer,
             base_output=base_output,
             sharding=self.lora_b_output_sharding,
         )
