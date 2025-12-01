@@ -67,13 +67,27 @@ install-plugins:
 
 # Setup .zshrc configuration file
 setup-zshrc:
-	@echo "Setting up .zshrc configuration..."
-	@if [ -f "$$HOME/.zshrc" ]; then \
-		echo "Backing up existing ~/.zshrc to ~/.zshrc.backup.$$(date +%Y%m%d_%H%M%S)"; \
-		cp $$HOME/.zshrc $$HOME/.zshrc.backup.$$(date +%Y%m%d_%H%M%S); \
-	fi
-	@cp .zshrc $$HOME/.zshrc
-	@echo ".zshrc configuration updated"
+	@echo "========================================"
+	@echo "  Manual Setup Required for Zsh"
+	@echo "========================================"
+	@echo ""
+	@echo "⚠️  To preserve your existing configuration (tokens, PATH, aliases, etc.),"
+	@echo "    please manually add the following content to your ~/.zshrc file."
+	@echo ""
+	@echo "Option 1: Append the entire file"
+	@echo "  cat scripts/.zshrc >> ~/.zshrc"
+	@echo ""
+	@echo "Option 2: Copy specific sections you need from scripts/.zshrc"
+	@echo ""
+	@echo "After updating, reload your shell:"
+	@echo "  source ~/.zshrc"
+	@echo ""
+	@echo "Key configurations in scripts/.zshrc:"
+	@echo "  - Oh My Zsh setup with 'refined' theme"
+	@echo "  - Plugins: git, zsh-autosuggestions, zsh-syntax-highlighting"
+	@echo "  - Conda initialization"
+	@echo ""
+	@echo "========================================"
 
 # Setup SSH key permissions
 setup-ssh:
