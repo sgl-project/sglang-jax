@@ -5,8 +5,10 @@ from enum import Enum
 import jax
 from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
+from jax.tree_util import register_pytree_node_class
 
 
+@register_pytree_node_class
 @dataclass
 class LoRABatchInfo:
     # scaling of each lora adapter, in shape (num_tokens,)
@@ -17,6 +19,13 @@ class LoRABatchInfo:
 
     # (num_tokens,)
     lora_ranks: jax.Array
+
+    def tree_flatten(self):
+        return ((self.scalings, self.token_lora_indices, self.lora_ranks), None)
+
+    @classmethod
+    def tree_unflatten(cls, aux_data, children):
+        return cls(*children)
 
 
 class LoRAType(Enum):

@@ -1,6 +1,7 @@
 import jax
 import jax.numpy as jnp
 import numpy as np
+from flax import nnx
 from jax.sharding import NamedSharding
 
 from sgl_jax.srt.lora.backend.base_backend import BaseLoRABackend
@@ -9,6 +10,10 @@ from sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
 
 MIN_CHUNK_SIZE = 16
+
+
+class BatchInfo(nnx.Variable):
+    pass
 
 
 class BgmvLoRABackend(BaseLoRABackend):
@@ -25,6 +30,18 @@ class BgmvLoRABackend(BaseLoRABackend):
     ):
         super().__init__(max_loras_per_batch)
         self.max_lora_rank = max_lora_rank
+
+        # Initialize with dummy arrays to ensure consistent PyTree structure for JIT
+        # using empty arrays (size 0) is sufficient for structure matching
+        dummy_arr = jnp.array([], dtype=jnp.int32)
+        dummy_scalings = jnp.array([], dtype=jnp.float32)
+        self.batch_info = BatchInfo(
+            LoRABatchInfo(
+                scalings=dummy_scalings,
+                token_lora_indices=dummy_arr,
+                lora_ranks=dummy_arr,
+            )
+        )
 
     def run_lora_a_gemm(
         self,
@@ -43,9 +60,8 @@ class BgmvLoRABackend(BaseLoRABackend):
         Returns:
              result with shape (s, r)
         """
-        return shrink(
-            x, weights, self.batch_info.token_lora_indices, self.batch_info.scalings, sharding
-        ).astype(x.dtype)
+        info = self.batch_info.value
+        return shrink(x, weights, info.token_lora_indices, info.scalings, sharding).astype(x.dtype)
 
     def run_lora_b_gemm(
         self,
@@ -66,12 +82,13 @@ class BgmvLoRABackend(BaseLoRABackend):
         Returns:
              result with shape (s, output_dim)
         """
+        info = self.batch_info.value
         return jnp.add(
             base_output,
             expand(
                 x,
                 weights,
-                self.batch_info.token_lora_indices,
+                info.token_lora_indices,
                 (weights.shape[1],),
                 self.max_lora_rank,
                 sharding,
@@ -116,16 +133,15 @@ class BgmvLoRABackend(BaseLoRABackend):
             qkv_lora_b_concated = qkv_lora_b
 
         # (s, 3*r)
-        lora_a_output = bgmv_shrink(
-            x, qkv_lora_a, self.batch_info.token_lora_indices, self.batch_info.scalings
-        )
+        info = self.batch_info.value
+        lora_a_output = bgmv_shrink(x, qkv_lora_a, info.token_lora_indices, info.scalings)
 
         return jnp.add(
             base_output,
             expand(
                 lora_a_output,
                 qkv_lora_b_concated,
-                self.batch_info.token_lora_indices,
+                info.token_lora_indices,
                 output_slices,
                 self.max_lora_rank,
             ).astype(x.dtype),
@@ -158,16 +174,15 @@ class BgmvLoRABackend(BaseLoRABackend):
             gate_up_lora_b_concated = gate_up_lora_b
 
         # (s, 2*r)
-        lora_a_output = bgmv_shrink(
-            x, gate_up_lora_a, self.batch_info.token_lora_indices, self.batch_info.scalings
-        )
+        info = self.batch_info.value
+        lora_a_output = bgmv_shrink(x, gate_up_lora_a, info.token_lora_indices, info.scalings)
 
         return jnp.add(
             base_output,
             expand(
                 lora_a_output,
                 gate_up_lora_b_concated,
-                self.batch_info.token_lora_indices,
+                info.token_lora_indices,
                 (gate_up_lora_b_concated.shape[1] // 2, gate_up_lora_b_concated.shape[1] // 2),
                 self.max_lora_rank,
             ).astype(x.dtype),
@@ -234,27 +249,7 @@ class BgmvLoRABackend(BaseLoRABackend):
             lora_ranks=jnp.array(padded_lora_ranks_cpu, dtype=jnp.int32),
         )
 
-        # Print batch info on CPU for debugging
-        print(f"\n[LoRA Batch Info - {model_worker_batch.forward_mode.name}]")
-        print(f"  Input shape: {model_worker_batch.input_ids.shape}")
-        print(f"  Batch size: {len(model_worker_batch.seq_lens)}")
-        print(f"  Seq lens: {model_worker_batch.seq_lens}")
-        print(f"  Weight indices (per seq): {weight_indices}")
-        print(f"  LoRA ranks (per seq): {lora_ranks_bs}")
-        print(f"  Scalings (per seq): {scalings_bs}")
-        print("\n  CPU Arrays (per token):")
-        print(f"    token_lora_indices shape: {padded_token_lora_indices_cpu.shape}")
-        print(f"    token_lora_indices: {padded_token_lora_indices_cpu}")
-        print(f"    lora_ranks shape: {padded_lora_ranks_cpu.shape}")
-        print(f"    lora_ranks: {padded_lora_ranks_cpu}")
-        print(f"    scalings shape: {padded_scalings_cpu.shape}")
-        print(f"    scalings: {padded_scalings_cpu}")
-        print(
-            f"  Num padding tokens: {num_to_pad if model_worker_batch.forward_mode == ForwardMode.EXTEND else 0}"
-        )
-        print()
-
-        self.batch_info = batch_info
+        self.batch_info = BatchInfo(batch_info)
 
 
 def shrink(

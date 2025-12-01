@@ -757,7 +757,6 @@ class SWARadixCache(BasePrefixCache):
     def _split_node(self, child: TreeNode, split_len: int) -> TreeNode:
         # new_node -> child
         new_node = TreeNode()
-        new_node.extra_key = child.extra_key  # Preserve extra_key
         new_node.parent = child.parent
         new_node.swa_tombstone = child.swa_tombstone
         new_node.full_lock_ref = child.full_lock_ref
