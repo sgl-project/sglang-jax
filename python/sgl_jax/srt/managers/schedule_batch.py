@@ -1406,12 +1406,19 @@ class ScheduleBatch:
             # For prefill: create positions for each token in sequences
             # Calculate total tokens without padding first
             if positions_cpu is None:
-                positions_cpu = np.concatenate(
-                    [
-                        np.arange(prefix_len, seq_len, dtype=seq_lens_cpu.dtype)
-                        for seq_len, prefix_len in zip(seq_lens_cpu, self.prefix_lens)
-                    ]
-                )
+                lengths = seq_lens_cpu - self.prefix_lens
+                if len(lengths) > 0:
+                    repeats = lengths
+                    total_len = np.sum(repeats)
+                    # Generate range [0, 1, ... len-1] for each sequence
+                    block_starts = np.concatenate(([0], np.cumsum(repeats)[:-1]))
+                    shifts = np.repeat(block_starts, repeats)
+                    ranges = np.arange(total_len) - shifts
+                    # Add prefix_len to each range
+                    positions_cpu = np.repeat(self.prefix_lens, repeats) + ranges
+                    positions_cpu = positions_cpu.astype(seq_lens_cpu.dtype)
+                else:
+                    positions_cpu = np.array([], dtype=seq_lens_cpu.dtype)
             # Start location of each sequence in the flattened array
             extend_start_loc = np.cumsum(
                 np.concatenate([np.array([0]), extend_seq_lens[:-1]]),
@@ -1453,7 +1460,9 @@ class ScheduleBatch:
                     and not self.spec_algorithm.is_none()
                     and self.spec_info.allocate_lens is not None
                 ):
-                    allocated_len = self.spec_info.allocate_lens[: len(self.reqs)]
+                    # Explicitly convert to numpy to avoid JAX device synchronization overhead
+                    allocated_len_cpu = np.array(self.spec_info.allocate_lens)
+                    allocated_len = allocated_len_cpu[: len(self.reqs)]
                     aligned_lengths = ((allocated_len + page_size - 1) // page_size) * page_size
                     alread_allocated_lens = allocated_len
                 else:
@@ -1463,18 +1472,35 @@ class ScheduleBatch:
 
                 # Pre-allocate the result array
                 cache_loc_flat = np.zeros(total_aligned_length, dtype=np.int32)
-                # Fill the array efficiently
-                offset = 0
-                for i, (seq_idx, alread_allocated_len, aligned_len) in enumerate(
-                    zip(valid_indices, alread_allocated_lens, aligned_lengths)
-                ):
 
-                    # Copy the actual data
-                    cache_loc_flat[offset : offset + alread_allocated_len] = (
-                        token_indices_with_all_reqs[seq_idx, :alread_allocated_len]
-                    )
-                    # Padding is already zero from initialization
-                    offset += aligned_len
+                # Vectorized filling of cache_loc_flat
+                # Calculate destination offsets for each block (where each block starts in cache_loc_flat)
+                dst_offsets = np.concatenate(([0], np.cumsum(aligned_lengths)[:-1]))
+
+                # We need to copy 'alread_allocated_lens' elements for each request
+                repeats = alread_allocated_lens
+                total_elements = np.sum(repeats)
+
+                if total_elements > 0:
+                    # 1. Generate Source Indices (row, col) for token_indices_with_all_reqs
+                    row_indices = np.repeat(valid_indices, repeats)
+
+                    # Generate col indices: 0..len-1 for each row
+                    # Using the shift trick: global_range - block_start_offsets
+                    block_starts = np.concatenate(([0], np.cumsum(repeats)[:-1]))
+                    shifts = np.repeat(block_starts, repeats)
+                    col_indices = np.arange(total_elements) - shifts
+
+                    # Extract source data
+                    source_data = token_indices_with_all_reqs[row_indices, col_indices]
+
+                    # 2. Generate Destination Indices for cache_loc_flat
+                    # Base offset for each block + local col index
+                    dst_base_offsets = np.repeat(dst_offsets, repeats)
+                    dst_indices = dst_base_offsets + col_indices
+
+                    # Assign
+                    cache_loc_flat[dst_indices] = source_data
 
         if precision_tracer.get_trace_active():
             self._generate_trace_info(real_bs, bid)
