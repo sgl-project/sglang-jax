@@ -91,7 +91,6 @@ class ModelRunner:
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
         self.is_hybrid = False
         self.use_mla_backend = self.model_config.attention_arch == AttentionArch.MLA
-        self.is_draft_worker = is_draft_worker
         self.spec_algorithm = SpeculativeAlgorithm.from_string(server_args.speculative_algorithm)
 
         self.forward_pass_id = 0
@@ -135,8 +134,6 @@ class ModelRunner:
         self.sampler = Sampler(nnx.Rngs(server_args.random_seed), mesh=self.mesh)
         total_device_memory = self.get_available_device_memory()
         self.load_model()
-        if not self.is_draft_worker:
-            self.initialize_jit()
 
         # Check if the model is using hybrid SWA
         if (
@@ -150,7 +147,8 @@ class ModelRunner:
         if server_args.enable_lora:
             self.init_lora_manager()
 
-        self.initialize_jit()
+        if not self.is_draft_worker:
+            self.initialize_jit()
 
         # Init memory pool and attention backends
         self.init_memory_pool(
@@ -203,6 +201,10 @@ class ModelRunner:
 
         def run_model_wrapper(forward_batch, logits_metadata):
             token_to_kv_pool = self.token_to_kv_pool
+
+            # Re-capture model state to get the latest LoRA weights
+            _, model_state = nnx.split(self.model)
+            model_state_leaves, _ = jax.tree_util.tree_flatten(model_state)
 
             return jitted_run_model(
                 model_def,
