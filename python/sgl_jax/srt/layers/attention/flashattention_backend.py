@@ -282,7 +282,11 @@ class FlashAttention(AttentionBackend):
                 offset1 += spec_pages
                 offset2 += alloc_pages
             selected_cache_locs = selected_cache_locs_for_draft_decode
-            page_indices.append((selected_cache_locs // self.page_size).astype(np.int32))
+            page_indices_cur_step = (selected_cache_locs // self.page_size).astype(np.int32)
+            if page_indices_cur_step.shape[0] < 16384:
+                padding_size = 16834 - page_indices_cur_step.shape[0]
+                page_indices_cur_step = jnp.pad(page_indices_cur_step, ((0, padding_size)))
+            page_indices.append(page_indices_cur_step)
 
         if batch.spec_algorithm.is_none():
             raise RuntimeError("should not reach here")

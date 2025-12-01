@@ -181,18 +181,23 @@ def get_last_loc_large_page_size_large_top_k(
 
 def build_tree_kernel_efficient_preprocess(
     verified_id: jax.Array,
-    score_list: list[jax.Array],
-    token_list: list[jax.Array],
-    parents_list: list[jax.Array],
+    scores: jax.Array,
+    tokens: jax.Array,
+    parents: jax.Array,
     num_verify_tokens: int,
+    batch_size: int,
+    speculative_num_steps: int,
 ):
+    # score_list   (bs, 1 + (step - 1) * topk  , eagle_topk)
+    # token_list   (bs, topk + (step - 1) * topk * topk)
+    # parents_list (bs, topk + 1 + (step - 1) * topk)
     # Concatenate score_list along dim=1 and flatten from dim=1 onwards
     # b, n, topk; n = 1 + (num_steps-1) * self.topk
-    score_tensor = jnp.concatenate(score_list, axis=1)
+    score_tensor = scores
     score_tensor = score_tensor.reshape(score_tensor.shape[0], -1)
 
     # Concatenate token lists: b, (self.topk + (num_steps-1) * self.topk)
-    ss_token_list = jnp.concatenate(token_list, axis=1)
+    ss_token_list = tokens
 
     # Get top scores and indices
     _, top_scores_index = jax.lax.top_k(score_tensor, num_verify_tokens - 1)
@@ -206,11 +211,9 @@ def build_tree_kernel_efficient_preprocess(
     ).flatten()
 
     # Build parent list
-    if len(parents_list) > 1:
-        parent_list = jnp.concatenate(parents_list[:-1], axis=1)
+    if speculative_num_steps > 1:
+        parent_list = parents
     else:
-        batch_size = parents_list[0].shape[0]
-        # parent_list = jnp.empty((batch_size, 0), dtype=jnp.int32)
         parent_list = jnp.full((batch_size, 1), -1, dtype=jnp.int32)
 
     return parent_list, top_scores_index, draft_tokens
@@ -290,14 +293,16 @@ def build_tree_mask_for_draft_decode(
 
 def build_tree_kernel_efficient(
     verified_id: jax.Array,
-    score_list: list[jax.Array],
-    token_list: list[jax.Array],
-    parents_list: list[jax.Array],
+    score_list: jax.Array,
+    token_list: jax.Array,
+    parents_list: jax.Array,
     seq_lens: jax.Array,
     seq_lens_sum: jax.Array,
     topk: int,
     num_verify_tokens: int,
     max_seq_len_per_req: int,
+    batch_size: int,
+    speculative_num_steps: int,
     mesh: Mesh,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
     """JAX implementation of build_tree_kernel_efficient.
@@ -318,7 +323,13 @@ def build_tree_kernel_efficient(
                  retrive_next_sibling, draft_tokens)
     """
     parent_list, top_scores_index, draft_tokens = build_tree_kernel_efficient_preprocess(
-        verified_id, score_list, token_list, parents_list, num_verify_tokens
+        verified_id,
+        score_list,
+        token_list,
+        parents_list,
+        num_verify_tokens,
+        batch_size,
+        speculative_num_steps,
     )
 
     # Get batch size
