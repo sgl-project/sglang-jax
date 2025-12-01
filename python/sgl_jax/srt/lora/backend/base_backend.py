@@ -1,9 +1,10 @@
 import jax
+from flax import nnx
 
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
 
 
-class BaseLoRABackend:
+class BaseLoRABackend(nnx.Module):
     """Base class for different Lora backends.
        Each backend has its own implementation of Lora kernels.
 
@@ -14,6 +15,7 @@ class BaseLoRABackend:
     """
 
     def __init__(self, max_loras_per_batch: int):
+        super().__init__()
         self.max_loras_per_batch = max_loras_per_batch
 
     def run_lora_a_gemm(self, x: jax.Array, weights: jax.Array, *args, **kwargs) -> jax.Array:
