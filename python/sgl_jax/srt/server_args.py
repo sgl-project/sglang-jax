@@ -163,7 +163,6 @@ class ServerArgs:
     enable_static_lora: bool | None = None
     lora_scaling: float | None = None
 
-
     def __post_init__(self):
         # Set missing default values
         if self.tokenizer_path is None:
@@ -1010,95 +1009,7 @@ class ServerArgs:
         if self.speculative_algorithm is not None and not self.disable_overlap_schedule:
             raise ValueError(
                 "Speculative decoding does not support overlap scheduler. "
-                "Please pass --disable-overlap-schedule when using --speculative-algorithm.")
-
-        # Check LoRA configuration
-        self.check_lora_server_args()
-
-    def check_lora_server_args(self):
-        """Validate and normalize LoRA-related server arguments."""
-        # Import LoRARef here to avoid circular imports
-        from sgl_jax.srt.lora import LoRARef
-
-        # Validate max_loras_per_batch
-        assert self.max_loras_per_batch > 0, "max_loras_per_batch must be positive"
-
-        # Auto-enable LoRA if lora_paths are provided
-        if self.lora_paths and self.enable_lora is None:
-            self.enable_lora = True
-            logger.info("Auto-enabling LoRA because lora_paths are provided")
-
-        # Early return if LoRA is not enabled
-        if not self.enable_lora:
-            return
-
-        # Expand target modules
-        if self.lora_target_modules:
-            self.lora_target_modules = set(self.lora_target_modules)
-            if "all" in self.lora_target_modules:
-                assert (
-                    len(self.lora_target_modules) == 1
-                ), "If 'all' is specified in --lora-target-modules, it should be the only module specified."
-                self.lora_target_modules = set(SUPPORTED_LORA_TARGET_MODULES)
-
-        # Ensure sufficient information is provided for LoRA initialization.
-        assert self.lora_paths or (
-            self.max_lora_rank and self.lora_target_modules
-        ), "When no initial --lora-paths is provided, you need to specify both --max-lora-rank and --lora-target-modules for LoRA initialization."
-
-        # Normalize lora_paths to List[LoRARef]
-        if self.lora_paths is not None:
-            normalized_lora_refs = []
-
-            if isinstance(self.lora_paths, dict):
-                # Dict format: {"name": "path", ...}
-                for name, path in self.lora_paths.items():
-                    normalized_lora_refs.append(
-                        LoRARef(lora_name=name, lora_path=path, pinned=True)
-                    )
-            elif isinstance(self.lora_paths, list):
-                for item in self.lora_paths:
-                    if isinstance(item, str):
-                        # String format: "name=path" or just "path"
-                        if "=" in item:
-                            name, path = item.split("=", 1)
-                            normalized_lora_refs.append(
-                                LoRARef(lora_name=name.strip(), lora_path=path.strip(), pinned=True)
-                            )
-                        else:
-                            # Use basename as name
-                            import os
-
-                            name = os.path.basename(item.rstrip("/"))
-                            normalized_lora_refs.append(
-                                LoRARef(lora_name=name, lora_path=item, pinned=True)
-                            )
-                    elif isinstance(item, dict):
-                        # Dict format in list: {"name": "adapter1", "path": "/path/to/adapter"}
-                        name = item.get("name") or item.get("lora_name")
-                        path = item.get("path") or item.get("lora_path")
-                        pinned = item.get("pinned", True)
-                        normalized_lora_refs.append(
-                            LoRARef(lora_name=name, lora_path=path, pinned=pinned)
-                        )
-                    elif hasattr(item, "lora_name"):
-                        # Already a LoRARef object
-                        normalized_lora_refs.append(item)
-                    else:
-                        raise ValueError(f"Unsupported lora_paths item format: {item}")
-
-            self.lora_paths = normalized_lora_refs
-
-            # Validate max_loaded_loras
-            if self.max_loaded_loras is not None:
-                assert (
-                    self.max_loaded_loras >= self.max_loras_per_batch
-                ), "max_loaded_loras must be >= max_loras_per_batch"
-
-            logger.info(
-                "Loaded %d LoRA adapters: %s",
-                len(self.lora_paths),
-                [ref.lora_name for ref in self.lora_paths],
+                "Please pass --disable-overlap-schedule when using --speculative-algorithm."
             )
 
     def check_lora_server_args(self):

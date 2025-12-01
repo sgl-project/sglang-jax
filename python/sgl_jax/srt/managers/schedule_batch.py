@@ -1709,6 +1709,8 @@ class ModelWorkerBatch:
     # If set, the output of the batch contains the hidden states of the run.
     capture_hidden_mode: CaptureHiddenMode = None
 
+    lora_batch_info: Any | None = None
+
     tree_cache: BasePrefixCache = None
 
     def padding_model_worker_batch(
