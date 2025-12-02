@@ -23,20 +23,25 @@ Here we give the feature which is to support structure output as an example. Not
 1. Create a root issue to trace your job in this feature, like [314](https://github.com/sgl-project/sglang-jax/issues/314)
 
 2. Split your job to at least two subissues, like:
-  - Design document subissue, such as [315](https://github.com/sgl-project/sglang-jax/issues/315)
-    - Note: A google document is required to elaborate your design, such as [structure output](https://docs.google.com/document/d/1lZ09hEB00KZjJW_W1Bht1euGwgl3jxu8bVnStJihHXg/edit?tab=t.0). This document is required to be reviewed. You have to include motivation, goals, design and tests.
-  - Code development subissue, such as [331](https://github.com/sgl-project/sglang-jax/issues/331)
+   - Design document subissue, such as [315](https://github.com/sgl-project/sglang-jax/issues/315)
+   - Code development subissue, such as [331](https://github.com/sgl-project/sglang-jax/issues/331)
 
-3. Codes development:
-  - TPU resources: Please refer to [TPU Resources Guide](./tpu_resources_guide.md).
-  - Setup environment: Please refer to [install SGLang-Jax from source](#install-sglang-jax-from-source).
-  - Code style: Please refer to [format codes](#format-code-with-pre-commit) before you push.
-  - Testing:
-    - Please add unit tests under `python/srt/test/*` and E2E tests under `test/srt/*` to ensure the feature works. File names are required to start with `test_`.
-    - If the feature were to add new accuracy or performance baselines or influence the existing accuracy or performance, please add them in nightly tests. Nightly tests are under construction.
-      - Example: Add a new model implementation.
-  - Description in PR: Please add accuracy or benchmark baselines in pull requests if the feature meeted the above scenarios.
-  - Review: Assign at least one reviewer.
+3. Design document: A google document is required to elaborate your design, such as [structure output](https://docs.google.com/document/d/1lZ09hEB00KZjJW_W1Bht1euGwgl3jxu8bVnStJihHXg/edit?tab=t.0). This document is required to be reviewed. You have to include motivation, goals, design and tests.
+   - Note:
+     - Please put the design document link in the issue.
+     - When the document is ready, please copy the document content into `docs/features/feature.md` and merge it into main.
+
+
+4. Codes development:
+   - TPU resources: Please refer to [TPU Resources Guide](./tpu_resources_guide.md).
+   - Setup environment: Please refer to [install SGLang-Jax from source](#install-sglang-jax-from-source).
+   - Code style: Please refer to [format codes](#format-code-with-pre-commit) before you push.
+   - Testing:
+     - Please add unit tests under `python/srt/test/*` and E2E tests under `test/srt/*` to ensure the feature works. File names are required to start with `test_`.
+     - If the feature were to add new accuracy or performance baselines or influence the existing accuracy or performance, please add them in nightly tests. Nightly tests are under construction.
+       - Example: Add a new model implementation.
+   - Description in PR: Please add accuracy or benchmark baselines in pull requests if the feature meeted the above scenarios.
+   - Review: Assign at least one reviewer.
 
 4. If you resolved all comments from code reviews, the pull request would be merged into main. Congrantulations to you!
 
