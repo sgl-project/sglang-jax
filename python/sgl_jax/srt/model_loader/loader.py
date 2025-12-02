@@ -50,9 +50,8 @@ class JAXModelLoader(BaseModelLoader):
                 model_config.revision,
             )
 
-    def __init__(self, load_config: LoadConfig, rngs: jax.Array, mesh: jax.sharding.Mesh):
+    def __init__(self, load_config: LoadConfig, mesh: jax.sharding.Mesh):
         super().__init__(load_config)
-        self.rng = rngs
         self.mesh = mesh
 
     def download_model(self, model_config: ModelConfig) -> str:
@@ -90,10 +89,10 @@ class JAXModelLoader(BaseModelLoader):
     def _get_model(self, model_class: Any, model_config: ModelConfig) -> nnx.Module:
         with jax.set_mesh(self.mesh):
             model = nnx.eval_shape(
-                lambda: model_class(model_config.hf_config, model_config.dtype, self.rng, self.mesh)
+                lambda: model_class(model_config.hf_config, model_config.dtype, self.mesh)
             )
 
-        model.load_weights(model_config, None if self.rng is None else self.rng.default.key.value)
+        model.load_weights(model_config)
         return model
 
     def _maybe_download_from_modelscope(self, model: str, revision: str | None) -> str | None:
@@ -144,14 +143,13 @@ class JAXModelLoader(BaseModelLoader):
 class JAXDummyModelLoader(BaseModelLoader):
     """Model loader that will set model weights to random values for JAX models."""
 
-    def __init__(self, load_config: LoadConfig, rngs: jax.Array, mesh: jax.sharding.Mesh):
+    def __init__(self, load_config: LoadConfig, mesh: jax.sharding.Mesh):
         super().__init__(load_config)
         if load_config.model_loader_extra_config:
             raise ValueError(
                 f"Model loader extra config is not supported for "
                 f"load format {load_config.load_format}"
             )
-        self.rng = rngs
         self.mesh = mesh
 
     def download_model(self, model_config: ModelConfig) -> None:
@@ -172,28 +170,26 @@ class JAXDummyModelLoader(BaseModelLoader):
 
         with jax.set_mesh(self.mesh):
             model = nnx.eval_shape(
-                lambda: model_class(model_config.hf_config, model_config.dtype, self.rng, self.mesh)
+                lambda: model_class(model_config.hf_config, model_config.dtype, self.mesh)
             )
 
         # Use model's load_weights with dummy mode to ensure correct sharding
         # Set a marker in model_config to indicate dummy mode
         model_config._dummy_mode = True
-        model.load_weights(model_config, self.rng.default.key.value if self.rng else None)
+        model.load_weights(model_config)
 
         return model
 
 
-def get_model_loader(
-    load_config: LoadConfig, rngs: jax.Array, mesh: jax.sharding.Mesh
-) -> BaseModelLoader:
+def get_model_loader(load_config: LoadConfig, mesh: jax.sharding.Mesh) -> BaseModelLoader:
     """Get a model loader based on the load format."""
     if isinstance(load_config.load_format, type):
         return load_config.load_format(load_config)
 
     if load_config.load_format == LoadFormat.DUMMY:
-        return JAXDummyModelLoader(load_config, rngs, mesh)
+        return JAXDummyModelLoader(load_config, mesh)
 
     if load_config.load_format == LoadFormat.JAX:
-        return JAXModelLoader(load_config, rngs, mesh)
+        return JAXModelLoader(load_config, mesh)
 
-    return JAXModelLoader(load_config, rngs, mesh)
+    return JAXModelLoader(load_config, mesh)
