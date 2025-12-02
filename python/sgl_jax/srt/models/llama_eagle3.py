@@ -249,7 +249,7 @@ class LlamaForCausalLMEagle3(LlamaForCausalLM):
         self.capture_aux_hidden_states = True
         self.hot_token_ids = nnx.Param(jnp.arange(config.draft_vocab_size))
 
-    def load_weights(self, model_config: ModelConfig, rng_key: jax.Array) -> None:
+    def load_weights(self, model_config: ModelConfig) -> None:
         loader = WeightLoader(
             model=self,
             model_config=model_config,

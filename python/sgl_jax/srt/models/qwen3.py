@@ -371,7 +371,7 @@ class Qwen3ForCausalLM(nnx.Module):
         # For EAGLE3 support
         self.capture_aux_hidden_states = False
 
-    def load_weights(self, model_config: ModelConfig, rng_key: jax.Array):
+    def load_weights(self, model_config: ModelConfig):
         loader = WeightLoader(
             model=self,
             model_config=model_config,

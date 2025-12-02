@@ -317,7 +317,7 @@ class Gemma2ForCausalLM(nnx.Module):
             mesh=self.mesh,
         )
 
-    def load_weights(self, model_config: ModelConfig, rng_key: jax.Array):
+    def load_weights(self, model_config: ModelConfig):
         loader = WeightLoader(
             model=self, model_config=model_config, mesh=self.mesh, dtype=self.dtype
         )
