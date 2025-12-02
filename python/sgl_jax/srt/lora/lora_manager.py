@@ -98,7 +98,7 @@ class LoRAManager:
         """
         self.base_model = base_model
         self.base_hf_config = base_hf_config
-        self.max_loras_per_batch = 1 if server_args.enable_static_lora else max_loras_per_batch
+        self.max_loras_per_batch = max_loras_per_batch
         self.dtype = dtype
         self.mesh = mesh
         self.server_args = server_args
@@ -111,6 +111,7 @@ class LoRAManager:
         self.num_attention_heads = base_hf_config.num_attention_heads
         self.num_kv_heads = getattr(base_hf_config, "num_key_value_heads", self.num_attention_heads)
         self.head_dim = getattr(base_hf_config, "head_dim", None)
+        self.static_lora = server_args.enable_static_lora
 
         # Get original num_kv_heads and tp_size for replication
         if model_config is not None:
@@ -453,7 +454,7 @@ class LoRAManager:
                 scalings=scalings,
             )
 
-        if self.server_args.enable_static_lora:
+        if self.static_lora:
             prepare_static_lora_batch()
         else:
             prepare_dynamic_lora_batch()
@@ -461,7 +462,7 @@ class LoRAManager:
         # Update LoRA layer buffer references after loading new weights
         # This is necessary because JAX arrays are immutable, and load_lora_weight_to_buffer
         # creates new arrays. We need to update the references in LoRALinear layers.
-        if not self.server_args.enable_static_lora:
+        if not self.static_lora:
             self.update_lora_info()
 
         logger.debug("Prepared LoRA batch: %d unique adapters", len(cur_uids))

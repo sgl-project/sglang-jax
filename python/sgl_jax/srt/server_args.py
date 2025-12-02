@@ -1007,6 +1007,8 @@ class ServerArgs:
             self.enable_lora and self.enable_static_lora
         ), f"{self.enable_lora} and {self.enable_static_lora} can not be enable at the same time"
 
+        self.enable_lora = True
+
         # Validate max_loras_per_batch
         assert self.max_loras_per_batch > 0, "max_loras_per_batch must be positive"
 

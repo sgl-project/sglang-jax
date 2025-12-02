@@ -4,6 +4,8 @@ import traceback
 from collections.abc import Callable
 from typing import Any
 
+import jax
+import jax.numpy as jnp
 from pydantic import BaseModel
 
 logger = logging.getLogger(__name__)
@@ -67,3 +69,65 @@ def convert_json_schema_to_str(json_schema: dict | str | type[BaseModel]) -> str
             + "schema specification"
         )
     return schema_str
+
+
+def _create_dummy_buffer(buffer):
+    """Create dummy buffer with sequential values, preserving type and sharding."""
+    if hasattr(buffer, "value"):
+        # It's a Param-wrapped value
+        arr = buffer.value
+        # Get sharding from the actual array, not the Param wrapper
+        sharding = arr.sharding if hasattr(arr, "sharding") else None
+        new_arr = jax.device_put(
+            jnp.arange(arr.size, dtype=arr.dtype).reshape(arr.shape),
+            device=sharding,
+        )
+        # Re-wrap in the same type (e.g., nnx.Param)
+        return type(buffer)(value=new_arr)
+    else:
+        # It's a raw Array
+        sharding = buffer.sharding if hasattr(buffer, "sharding") else None
+        new_arr = jax.device_put(
+            jnp.arange(buffer.size, dtype=buffer.dtype).reshape(buffer.shape),
+            device=sharding,
+        )
+        return new_arr
+
+
+def traverse_and_update(state_obj, target_modules):
+    """
+    Recursively traverse state structure and update A_buffer/B_buffer in target modules.
+
+    Args:
+        state_obj: Can be State/Params (dict-like), list, or leaf values (Param, Array, etc.)
+
+    Returns:
+        Updated state with same type as input
+    """
+    if target_modules is None or len(target_modules) == 0:
+        return state_obj
+    # Case 1: State or Params (dict-like with .items() method, but not a Param leaf node)
+    if hasattr(state_obj, "items") and not hasattr(state_obj, "value"):
+        updated = {}
+
+        for key, value in state_obj.items():
+            if key in ("A_buffer", "B_buffer"):
+                # Found a LoRA buffer to replace
+                updated[key] = _create_dummy_buffer(value)
+            elif key in target_modules:
+                # This key is a target module name, recurse into it
+                updated[key] = traverse_and_update(value, target_modules)
+            else:
+                # Regular key, recurse normally
+                updated[key] = traverse_and_update(value, target_modules)
+
+        # Preserve type: return State if input was State, otherwise return same type
+        return type(state_obj)(updated)
+
+    # Case 2: List (e.g., layers list)
+    elif isinstance(state_obj, list):
+        return [traverse_and_update(item, target_modules) for item in state_obj]
+
+    # Case 3: Leaf nodes (Param objects, raw arrays, or other values)
+    else:
+        return state_obj

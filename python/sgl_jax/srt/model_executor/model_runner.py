@@ -145,7 +145,7 @@ class ModelRunner:
             self.is_hybrid = True
 
         # Init lora
-        if server_args.enable_lora or server_args.enable_static_lora:
+        if server_args.enable_lora:
             self.init_lora_manager()
 
         if not self.is_draft_worker:
