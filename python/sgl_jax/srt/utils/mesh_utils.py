@@ -4,6 +4,11 @@ import jax
 import numpy as np
 from jax._src import mesh_utils
 
+default_mesh_axes = [
+    "data",  # data parallelism
+    "tensor",  # tensor parallelism
+]
+
 
 def create_device_mesh(
     ici_parallelism: Sequence[int],
@@ -13,6 +18,7 @@ def create_device_mesh(
     num_slices: int = 1,
     allow_split_physical_axes: bool = True,
     use_explicit_sharding: bool = True,
+    mesh_axes: Sequence[str] = default_mesh_axes,
 ) -> jax.sharding.Mesh:
     """Create a device mesh"""
     if devices is None:
@@ -62,9 +68,3 @@ def fill_unspecified_parallelism(parallelism: Sequence[int], num_devices: int) -
     ), "Unspecified value unable to be determined with the given parallelism values"
     parallelism[unspecified_axis_idx] = int(determined_val)
     return parallelism
-
-
-mesh_axes = [
-    "data",  # data parallelism
-    "tensor",  # tensor parallelism
-]

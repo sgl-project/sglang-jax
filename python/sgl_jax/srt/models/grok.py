@@ -17,6 +17,7 @@ from sgl_jax.srt.layers.embeddings import (
     _yarn_find_correction_range,
     _yarn_get_mscale,
 )
+from sgl_jax.srt.layers.fused_moe import FusedEPMoE
 from sgl_jax.srt.layers.layernorm import RMSNorm, dual_rmsnorm_forward
 from sgl_jax.srt.layers.linear import LinearBase
 from sgl_jax.srt.layers.logits_processor import (
@@ -206,6 +207,8 @@ class Grok1MoE(nnx.Module):
     kernel is used for the forward pass, with outputs reduced across ranks.
     """
 
+    experts: FusedEPMoE | EPMoE
+
     def __init__(
         self,
         config: PretrainedConfig,
@@ -237,18 +240,37 @@ class Grok1MoE(nnx.Module):
 
         self.router_logit_softcapping = getattr(config, "router_logit_softcapping", 30.0)
 
-        self.experts = EPMoE(
-            config=config,
-            num_experts=num_experts,
-            num_experts_per_tok=self.top_k,
-            intermediate_dim=intermediate_size,
-            mesh=mesh,
-            activation="gelu",
-            ep_size=config.ep_size,
-            weight_dtype=dtype,
-            dtype=dtype,
-            layer_id=layer_id,
-        )
+        # Select MoE backend based on config
+        self.moe_backend = getattr(config, "moe_backend", "epmoe")
+        self.use_fused = self.moe_backend == "fused"
+
+        if self.use_fused:
+            self.experts = FusedEPMoE(
+                hidden_size=hidden_size,
+                num_experts=num_experts,
+                num_experts_per_tok=self.top_k,
+                intermediate_dim=intermediate_size,
+                mesh=mesh,
+                activation="gelu",
+                ep_size=config.ep_size,
+                weight_dtype=dtype,
+                dtype=dtype,
+                layer_id=layer_id,
+                renormalize_topk_logits=False,  # Match sglang behavior
+            )
+        else:
+            self.experts = EPMoE(
+                hidden_size=config.hidden_size,
+                num_experts=num_experts,
+                num_experts_per_tok=self.top_k,
+                intermediate_dim=intermediate_size,
+                mesh=mesh,
+                activation="gelu",
+                ep_size=config.ep_size,
+                weight_dtype=dtype,
+                dtype=dtype,
+                layer_id=layer_id,
+            )
 
     def __call__(self, hidden_states: jax.Array) -> jax.Array:
         # Router computation with soft capping
@@ -259,15 +281,22 @@ class Grok1MoE(nnx.Module):
             router_logits = router_logits / self.router_logit_softcapping
             router_logits = jax.nn.tanh(router_logits) * self.router_logit_softcapping
 
-        # Compute top-k routing weights using sglang-style approach:
-        # 1. Compute global softmax over ALL experts (not just top-k)
-        # 2. Select top-k experts based on logits
-        # 3. Extract corresponding weights (no renormalization)
-        top_k_weights, top_k_indices = self._custom_topk(
-            router_logits, self.top_k, renormalize=False
-        )
+        if self.use_fused:
+            # Fused kernel: pass router_logits directly
+            # Top-K selection is handled internally by the kernel
+            assert isinstance(self.experts, FusedEPMoE)
+            return self.experts(hidden_states, router_logits)
+        else:
+            # EPMoE: compute top-k routing weights using sglang-style approach:
+            # 1. Compute global softmax over ALL experts (not just top-k)
+            # 2. Select top-k experts based on logits
+            # 3. Extract corresponding weights (no renormalization)
+            assert isinstance(self.experts, EPMoE)
+            top_k_weights, top_k_indices = self._custom_topk(
+                router_logits, self.top_k, renormalize=False
+            )
 
-        return self.experts(hidden_states, top_k_weights, top_k_indices)
+            return self.experts(hidden_states, top_k_weights, top_k_indices)
 
     def _custom_topk(
         self, router_logits: jax.Array, top_k: int, renormalize: bool = False
@@ -904,35 +933,95 @@ class Grok1ForCausalLM(nnx.Module):
             ),
         }
 
-        # CRITICAL: Correct MoE weight mapping
-        # w1 (gate_proj) -> wi_0, w3 (up_proj) -> wi_1, w2 (down_proj) -> wo
-        for name, target_name in [("w1", "wi_0"), ("w3", "wi_1"), ("w2", "wo")]:
-            target_path = [f"{target_prefix}.block_sparse_moe.experts.{target_name}"]
-            target_path.extend(
+        moe_backend = getattr(self.config, "moe_backend", "epmoe")
+        use_fused = moe_backend == "fused"
+
+        if use_fused:
+            # Fused MoE Mapping
+            # w1: gate(w1) -> (num_experts, hidden, intermediate)
+            # w3: up(w3)   -> (num_experts, hidden, intermediate)
+            # w2: down(w2) -> (num_experts, intermediate, hidden)
+
+            target_path_w1 = [f"{target_prefix}.block_sparse_moe.experts.w1"]
+            target_path_w1.extend(
                 [
-                    f"{prefix}.block_sparse_moe.experts.{i}.{name}.weight"
+                    f"{prefix}.block_sparse_moe.experts.{i}.w1.weight"
+                    for i in range(self.config.num_local_experts)
+                ]
+            )
+            mappings[f"__MOE_EXPERTS__{prefix}.block_sparse_moe.w1"] = WeightMapping(
+                target_path=target_path_w1,
+                sharding=("tensor", None, None),  # (E, H, I)
+                transpose=True,
+                concat_axis=0,
+            )
+
+            target_path_w3 = [f"{target_prefix}.block_sparse_moe.experts.w3"]
+            target_path_w3.extend(
+                [
+                    f"{prefix}.block_sparse_moe.experts.{i}.w3.weight"
+                    for i in range(self.config.num_local_experts)
+                ]
+            )
+            mappings[f"__MOE_EXPERTS__{prefix}.block_sparse_moe.w3"] = WeightMapping(
+                target_path=target_path_w3,
+                sharding=("tensor", None, None),  # (E, H, I)
+                transpose=True,
+                concat_axis=0,
+            )
+
+            target_path_w2 = [f"{target_prefix}.block_sparse_moe.experts.w2"]
+            target_path_w2.extend(
+                [
+                    f"{prefix}.block_sparse_moe.experts.{i}.w2.weight"
                     for i in range(self.config.num_local_experts)
                 ]
             )
 
-            sharding = (
-                ("expert", "tensor", None) if target_name == "wo" else ("expert", None, "tensor")
+            mappings[f"__MOE_EXPERTS__{prefix}.block_sparse_moe.w2"] = WeightMapping(
+                target_path=target_path_w2,
+                sharding=("tensor", None, None),  # (E, I, H)
+                transpose=True,
+                concat_axis=-1,
             )
 
-            if name == "w2":
-                # w2 (down_proj) -> wo: HF shape (8192, 2048), concat -> (8192, 16384), transpose -> (16384, 8192)
-                mappings[f"__MOE_EXPERTS__{prefix}.block_sparse_moe.experts.{target_name}"] = (
-                    WeightMapping(
-                        target_path=target_path, sharding=sharding, transpose=True, concat_axis=-1
-                    )
+        else:
+            # Standard EPMoE Mapping
+            for name, target_name in [("w1", "wi_0"), ("w3", "wi_1"), ("w2", "wo")]:
+                target_path = [f"{target_prefix}.block_sparse_moe.experts.{target_name}"]
+                target_path.extend(
+                    [
+                        f"{prefix}.block_sparse_moe.experts.{i}.{name}.weight"
+                        for i in range(self.config.num_local_experts)
+                    ]
                 )
-            else:
-                # w1/w3 (gate/up) -> wi_0/wi_1: HF shape (2048, 8192), concat -> (16384, 8192), transpose -> (8192, 16384)
-                mappings[f"__MOE_EXPERTS__{prefix}.block_sparse_moe.experts.{target_name}"] = (
-                    WeightMapping(
-                        target_path=target_path, sharding=sharding, transpose=True, concat_axis=0
-                    )
+
+                sharding = (
+                    ("expert", "tensor", None)
+                    if target_name == "wo"
+                    else ("expert", None, "tensor")
                 )
+
+                if name == "w2":
+                    # w2 (down_proj) -> wo
+                    mappings[f"__MOE_EXPERTS__{prefix}.block_sparse_moe.experts.{target_name}"] = (
+                        WeightMapping(
+                            target_path=target_path,
+                            sharding=sharding,
+                            transpose=True,
+                            concat_axis=-1,
+                        )
+                    )
+                else:
+                    # w1/w3 (gate/up) -> wi_0/wi_1
+                    mappings[f"__MOE_EXPERTS__{prefix}.block_sparse_moe.experts.{target_name}"] = (
+                        WeightMapping(
+                            target_path=target_path,
+                            sharding=sharding,
+                            transpose=True,
+                            concat_axis=0,
+                        )
+                    )
 
         return mappings
 

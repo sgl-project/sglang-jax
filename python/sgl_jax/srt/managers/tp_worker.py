@@ -122,7 +122,8 @@ class ModelWorker:
             else server_args.max_running_requests
         )
         pool_limit = self.model_runner.req_to_token_pool.size
-        constraints = [server_limit, pool_limit, attn_backend_limit]
+        # constraints = [server_limit, pool_limit, attn_backend_limit]
+        constraints = [server_limit, pool_limit]
         self.max_running_requests = min(constraints)
         # Log each constraint for debugging
         logger.info("Max running requests constraints:")
@@ -175,7 +176,7 @@ class ModelWorker:
         )
         self.precompile_bs_paddings = []
         for bs in bs_padding_list:
-            if bs <= self.max_padded_batch_size:
+            if bs <= self.max_padded_batch_size and bs >= self.tp_size * 2:
                 self.precompile_bs_paddings.append(bs)
         self.precompile_bs_paddings.sort()
         if (
