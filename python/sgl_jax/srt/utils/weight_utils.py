@@ -506,7 +506,9 @@ class WeightLoader:
         processed_weight = hf_weight
 
         if mapping.transpose and not hf_key.endswith(".bias"):
-            processed_weight = jnp.transpose(processed_weight, (1, 0))
+            # Only transpose if the weight has at least 2 dimensions
+            if processed_weight.ndim >= 2:
+                processed_weight = jnp.transpose(processed_weight, (1, 0))
 
         if isinstance(mapping.target_path, list):
             self._handle_split_weight(params, hf_key, processed_weight, mapping)
