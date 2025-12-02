@@ -240,7 +240,7 @@ class BaseMultimodalProcessor(ABC):
         result = processor.__call__(
             text=[input_text],
             padding=True,
-            return_tensors="pt",
+            return_tensors="np",
             **kwargs,
         )
         if not self.server_args.keep_mm_feature_on_device:
