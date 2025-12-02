@@ -1473,6 +1473,39 @@ def ragged_paged_attention(
         jnp.full((6,), -1, jnp.int32),
     )
 
+    max_num_tokens = q.shape[0]
+    max_num_seqs = kv_lens.shape[0]
+    total_mapped_pages = page_indices.shape[0]
+
+    # Estimate context length based on page_indices capacity
+    # page_indices.shape[0] approx (batch * context_len) / page_size
+    est_avg_context_len = (total_mapped_pages * page_size) // max_num_seqs
+    total_interactions = max_num_tokens * est_avg_context_len
+
+    # FLOPs calculation:
+    # Attention = Softmax(Q @ K.T) @ V
+    # Two matmuls: (Q @ K.T) and (Score @ V).
+    # Each element interaction involves 1 multiply + 1 add = 2 FLOPs.
+    # Total FLOPs = 2 * (2 * num_heads * head_dim * total_interactions)
+    flops = 4 * actual_num_q_heads * head_dim * total_interactions
+
+    q_bytes = q.size * q.itemsize
+    o_bytes = q_bytes
+
+    # Bytes Accessed calculation:
+    # 1. Read Q and Write O (linear scan).
+    # 2. Read KV: FlashAttention loads KV blocks repeatedly for each Q block.
+    #    KV_Read ≈ (Total_Interactions / Q_Block_Size) * KV_Block_Size
+    # 3. Write KV: Write new KV data for the current Q tokens.
+    kv_dtype_size = kv_cache_fused_processed.dtype.itemsize
+    kv_bytes_read = (
+        (total_interactions // bq_sz) * actual_num_kv_heads * 2 * head_dim * kv_dtype_size
+    )
+    kv_bytes_write = max_num_tokens * actual_num_kv_heads * 2 * head_dim * kv_dtype_size
+
+    bytes_accessed = q_bytes + o_bytes + kv_bytes_read + kv_bytes_write
+    cost_estimate = pl.CostEstimate(flops=flops, bytes_accessed=bytes_accessed, transcendentals=0)
+
     scope_name = f"RPA-bq_{bq_sz}-bkvp_{bkv_p}-p_{page_size}"
     kernel = jax.named_scope(scope_name)(
         pl.pallas_call(
@@ -1503,6 +1536,7 @@ def ragged_paged_attention(
                 vmem_limit_bytes=vmem_limit_bytes,
                 disable_bounds_checks=True,
             ),
+            cost_estimate=cost_estimate,
             out_shape=[
                 jax.ShapeDtypeStruct(shape=q.shape, dtype=q.dtype),
                 jax.ShapeDtypeStruct(
