@@ -363,6 +363,7 @@ class Qwen2_5_VisionPatchEmbed(nnx.Module):
     ):
         self.patch_size = patch_size
         self.temporal_patch_size = temporal_patch_size
+        self.in_channels = in_channels
         self.hidden_size = hidden_size
         kernel_size = (temporal_patch_size, patch_size, patch_size)
         self.proj = nnx.Conv(in_features=in_channels,
@@ -370,6 +371,7 @@ class Qwen2_5_VisionPatchEmbed(nnx.Module):
                              kernel_size=kernel_size,
                              strides=kernel_size,
                              use_bias=False,
+                             padding="VALID",
                              param_dtype=dtype,
                              kernel_init=nnx.with_partitioning(
                                  nnx.initializers.uniform(),
@@ -382,10 +384,10 @@ class Qwen2_5_VisionPatchEmbed(nnx.Module):
         L, dim = x.shape
         C = dim // (self.temporal_patch_size * self.patch_size *
                     self.patch_size)
-        # Reshape to (L, T, H, W, C) for Conv3D with channels_last
+        # Reshape to (L, C, T, H, W) first
         x = x.reshape(L, C, self.temporal_patch_size, self.patch_size,
                       self.patch_size)
-        # L,T,H,W,C
+        # Transpose to (L, T, H, W, C) for Conv3D with channels_last format
         x = jnp.transpose(x, (0, 2, 3, 4, 1))
         x = self.proj(x)
         # After conv, shape is (L, T_out, H_out, W_out, C_out)
@@ -466,6 +468,8 @@ class Qwen2_5_VisionTransformer(nnx.Module):
                  dtype: jnp.dtype = jnp.bfloat16,
                  rngs: nnx.Rngs = None,
                  mesh: Mesh = None):
+        self.dtype = dtype
+        
         # args for get_window_index_thw
         self.window_size = config.vision_config.window_size
         self.patch_size = config.vision_config.patch_size
@@ -743,7 +747,18 @@ class Qwen2_5_VLForConditionalGeneration(nnx.Module):
         pixel_values = jnp.concatenate([item.feature for item in items], axis=0).astype(
             self.visual.dtype
         )
-        image_grid_thw = jnp.concatenate([item.image_grid_thw for item in items], axis=0)
+        # Collect image_grid_thw, handling cases where it might not exist
+        image_grid_thw_list = []
+        for item in items:
+            if hasattr(item, 'image_grid_thw') and item.image_grid_thw is not None:
+                # Convert PyTorch tensors to NumPy arrays if needed
+                grid_thw = item.image_grid_thw
+                if hasattr(grid_thw, 'detach'):  # PyTorch tensor
+                    grid_thw = grid_thw.detach().cpu().numpy()
+                image_grid_thw_list.append(grid_thw)
+            else:
+                raise ValueError(f"MultimodalDataItem missing image_grid_thw attribute")
+        image_grid_thw = jnp.concatenate(image_grid_thw_list, axis=0)
         assert pixel_values.ndim == 2, pixel_values.ndim
         assert image_grid_thw.ndim == 2, image_grid_thw.ndim
         image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw)
@@ -754,7 +769,18 @@ class Qwen2_5_VLForConditionalGeneration(nnx.Module):
         pixel_values = jnp.concatenate([item.feature for item in items], axis=0).astype(
             self.visual.dtype
         )
-        video_grid_thw = jnp.concatenate([item.video_grid_thw for item in items], axis=0)
+        # Collect video_grid_thw, handling cases where it might not exist
+        video_grid_thw_list = []
+        for item in items:
+            if hasattr(item, 'video_grid_thw') and item.video_grid_thw is not None:
+                # Convert PyTorch tensors to NumPy arrays if needed
+                grid_thw = item.video_grid_thw
+                if hasattr(grid_thw, 'detach'):  # PyTorch tensor
+                    grid_thw = grid_thw.detach().cpu().numpy()
+                video_grid_thw_list.append(grid_thw)
+            else:
+                raise ValueError(f"MultimodalDataItem missing video_grid_thw attribute")
+        video_grid_thw = jnp.concatenate(video_grid_thw_list, axis=0)
         assert pixel_values.ndim == 2, pixel_values.ndim
         assert video_grid_thw.ndim == 2, video_grid_thw.ndim
         video_embeds = self.visual(pixel_values, grid_thw=video_grid_thw)
@@ -821,8 +847,57 @@ class Qwen2_5_VLForConditionalGeneration(nnx.Module):
         
         weight_mappings = self._create_qwen2_5_vl_weight_mappings()
         
-        loader.load_weights_from_safetensors(weight_mappings)
+        self._load_weights_with_custom_conv3d(loader, weight_mappings)
         logger.info("Qwen2.5-VL weights loaded successfully!")
+    
+    def _load_weights_with_custom_conv3d(self, loader: WeightLoader, weight_mappings: dict):
+        """Custom weight loading that handles Conv3D weight permutation."""
+        import copy
+        
+        # Create a copy of mappings for modification
+        modified_mappings = copy.deepcopy(weight_mappings)
+        
+        # Remove the Conv3D weight from normal loading
+        conv3d_mapping = modified_mappings.pop("visual.patch_embed.proj.weight", None)
+        
+        # Load all other weights normally
+        loader.load_weights_from_safetensors(modified_mappings)
+        
+        # Handle Conv3D weight separately if it exists
+        if conv3d_mapping:
+            self._load_conv3d_weight(loader, conv3d_mapping)
+    
+    def _load_conv3d_weight(self, loader: WeightLoader, mapping: WeightMapping):
+        """Load and properly permute Conv3D weight."""
+        # Get the model parameters
+        params = nnx.state(self)
+        
+        # Find the Conv3D weight in the safetensors files
+        for hf_key, hf_weight in loader._iterate_weights():
+            if hf_key == "visual.patch_embed.proj.weight":
+                # HuggingFace format: (out_channels, in_channels, T, H, W)
+                # Flax format: (T, H, W, in_channels, out_channels)
+                # Permute from (0,1,2,3,4) to (2,3,4,1,0)
+                permuted_weight = jnp.transpose(hf_weight, (2, 3, 4, 1, 0))
+                
+                # Apply sharding
+                sharded_weight = loader._shard_weight(permuted_weight, mapping.sharding)
+                
+                # Get the target parameter and assign
+                target_param = loader._get_param(params, mapping.target_path)
+                target_param.value = sharded_weight.astype(target_param.value.dtype)
+                
+                logger.debug(
+                    "Loaded Conv3D weight: %s -> %s, original shape: %s, permuted shape: %s",
+                    hf_key,
+                    mapping.target_path,
+                    hf_weight.shape,
+                    permuted_weight.shape,
+                )
+                break
+        
+        # Update the model with modified parameters
+        nnx.update(self, params)
     
     def _create_qwen2_5_vl_weight_mappings(self) -> dict:
         """Create weight mappings for Qwen2.5-VL model.
