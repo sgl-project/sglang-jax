@@ -1106,6 +1106,7 @@ class ScheduleBatch:
         bs_paddings: list,
         cache_loc_paddings: list,
         page_size: int,
+        enable_static_lora: bool = False,
         skip_padding: bool = False,
     ) -> ModelWorkerBatch:
         if skip_padding:
@@ -1378,7 +1379,11 @@ class ScheduleBatch:
             extend_seq_lens=(extend_seq_lens if self.forward_mode == ForwardMode.EXTEND else None),
             extend_logprob_start_lens=extend_logprob_start_lens,
             extend_input_logprob_token_ids=self.extend_input_logprob_token_ids,
-            lora_ids=lora_ids,
+            lora_ids=(
+                [req.lora_id for req in self.reqs] + [None] * bs_padding_size
+                if not enable_static_lora
+                else ["0"] * bs_paddings[select_bs_index]
+            ),
             real_bs=real_bs,
             capture_hidden_mode=CaptureHiddenMode.NULL,
             launch_done=self.launch_done,
