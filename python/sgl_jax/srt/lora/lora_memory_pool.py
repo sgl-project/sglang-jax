@@ -364,7 +364,7 @@ class LoRAMemoryPool:
         self,
         cur_uids: set[str | None],
         lora_adapters: dict[str | None, LoRAAdapter],
-    ):
+    ) -> bool:
         """
         Prepare LoRA batch by loading adapters into buffer slots.
 
@@ -373,6 +373,9 @@ class LoRAMemoryPool:
         Args:
             cur_uids: Set of lora_ids needed for current batch
             lora_adapters: Dict mapping lora_id to LoRAAdapter
+
+        Returns:
+            bool: True if new weights were loaded (requires updating references), False otherwise.
 
         Raises:
             ValueError: If no buffer slots available
@@ -389,6 +392,8 @@ class LoRAMemoryPool:
                 self.max_loras_per_batch,
             )
 
+        has_new_weights = False
+
         # Load each adapter that's not already loaded
         for uid in cur_uids:
             if uid not in self.uid_to_buffer_id:
@@ -397,9 +402,12 @@ class LoRAMemoryPool:
                 self.load_lora_weight_to_buffer(uid, buffer_id, lora_adapter)
                 self.uid_to_buffer_id[uid] = buffer_id
                 self.buffer_id_to_uid[buffer_id] = uid
+                has_new_weights = True
                 logger.info("Loaded LoRA %s into buffer slot %d", uid, buffer_id)
             else:
                 logger.debug("LoRA %s already in buffer slot %d", uid, self.uid_to_buffer_id[uid])
+
+        return has_new_weights
 
     def load_lora_weight_to_buffer(
         self,

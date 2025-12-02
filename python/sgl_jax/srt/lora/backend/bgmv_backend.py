@@ -249,7 +249,10 @@ class BgmvLoRABackend(BaseLoRABackend):
             lora_ranks=jnp.array(padded_lora_ranks_cpu, dtype=jnp.int32),
         )
 
-        self.batch_info = BatchInfo(batch_info)
+        return batch_info
+
+    def set_batch_info(self, batch_info: LoRABatchInfo):
+        self.batch_info.value = batch_info
 
 
 def shrink(

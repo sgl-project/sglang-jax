@@ -421,7 +421,7 @@ class LoRAManager:
         assert len(cur_uids) <= self.max_loras_per_batch
 
         # Load adapters into device memory pool (CPU -> device transfer)
-        self.memory_pool.prepare_lora_batch(
+        has_new_weights = self.memory_pool.prepare_lora_batch(
             cur_uids=cur_uids,
             lora_adapters=self.loras,
         )
@@ -437,19 +437,26 @@ class LoRAManager:
                 lora_ranks[weight_indices[i]] = lora.config.r
                 scalings[weight_indices[i]] = lora.scaling
 
-        self.lora_backend.prepare_lora_batch(
+        batch_info = self.lora_backend.prepare_lora_batch(
             model_worker_batch=model_worker_batch,
             weight_indices=weight_indices,
             lora_ranks=lora_ranks,
             scalings=scalings,
         )
+        model_worker_batch.lora_batch_info = batch_info
 
         # Update LoRA layer buffer references after loading new weights
         # This is necessary because JAX arrays are immutable, and load_lora_weight_to_buffer
         # creates new arrays. We need to update the references in LoRALinear layers.
-        self.update_lora_info()
+        if has_new_weights:
+            self.update_lora_info()
 
         logger.debug("Prepared LoRA batch: %d unique adapters", len(cur_uids))
+
+    def set_batch_info(self, batch_info):
+        """Set batch info in backend."""
+        if hasattr(self, "lora_backend"):
+            self.lora_backend.set_batch_info(batch_info)
 
     def get_buffer_id(self, lora_id: str | None) -> int:
         """Get buffer slot ID for a given LoRA adapter ID."""
