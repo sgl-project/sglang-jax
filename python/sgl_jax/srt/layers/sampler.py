@@ -12,6 +12,7 @@ from sgl_jax.srt.layers.binary_search import topk_mask, topp_mask
 from sgl_jax.srt.layers.logits_processor import LogitsProcessorOutput
 from sgl_jax.srt.sampling.sampling_batch_info import SamplingMetadata
 from sgl_jax.srt.utils.jax_utils import is_tpu_runtime
+from sgl_jax.srt.utils.profiling_utils import named_scope
 
 
 class Sampler(nnx.Module):
@@ -156,6 +157,7 @@ class Sampler(nnx.Module):
 
         return logits + stop_penalty.astype(logits.dtype)
 
+    @named_scope
     def __call__(
         self,
         logits_output: LogitsProcessorOutput,

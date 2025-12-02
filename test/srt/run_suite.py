@@ -390,6 +390,7 @@ suites = {
     "unit-test-tpu-v6e-1": [
         TestFile("python/sgl_jax/test/test_flashattention.py", 20),
         TestFile("python/sgl_jax/test/test_moe_topk.py", 1),
+        TestFile("python/sgl_jax/test/kernels/fused_moe_v1_test.py", 10),
         TestFile("python/sgl_jax/test/test_sampler.py", 0.2),
         TestFile("python/sgl_jax/test/test_utils.py", 0.2),
         TestFile("python/sgl_jax/test/test_kernel_utils.py", 0.1),

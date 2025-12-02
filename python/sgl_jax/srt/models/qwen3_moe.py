@@ -8,6 +8,7 @@ from transformers import PretrainedConfig
 
 from sgl_jax.srt.configs.model_config import ModelConfig
 from sgl_jax.srt.layers.embeddings import Embed, ParallelLMHead, RotaryEmbedding
+from sgl_jax.srt.layers.fused_moe import FusedEPMoE
 from sgl_jax.srt.layers.layernorm import RMSNorm
 from sgl_jax.srt.layers.linear import LinearBase
 from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
@@ -181,25 +182,45 @@ class QWen3MoeDecoderLayer(nnx.Module):
             num_experts = getattr(config, "num_experts", 128)
             num_experts_per_tok = getattr(config, "num_experts_per_tok", 8)
             moe_intermediate_size = getattr(config, "moe_intermediate_size", 768)
-            self.topk = TopK(
-                topk=num_experts_per_tok,
-                renormalize=config.norm_topk_prob,
-            )
+
+            self.moe_backend = getattr(config, "moe_backend", "epmoe")
+            self.use_fused = self.moe_backend == "fused"
+
             self.moe_gate = GateLogit(
                 input_size=config.hidden_size,
                 num_experts=num_experts,
             )
-            self.mlp = EPMoE(
-                config=config,
-                num_experts=num_experts,
-                num_experts_per_tok=num_experts_per_tok,
-                intermediate_dim=moe_intermediate_size,
-                mesh=mesh,
-                ep_size=config.ep_size,
-                weight_dtype=dtype,
-                dtype=dtype,
-                layer_id=layer_id,
-            )
+
+            if self.use_fused:
+                self.mlp = FusedEPMoE(
+                    hidden_size=config.hidden_size,
+                    num_experts=num_experts,
+                    num_experts_per_tok=num_experts_per_tok,
+                    intermediate_dim=moe_intermediate_size,
+                    mesh=mesh,
+                    activation="silu",
+                    ep_size=config.ep_size,
+                    weight_dtype=dtype,
+                    dtype=dtype,
+                    layer_id=layer_id,
+                    renormalize_topk_logits=config.norm_topk_prob,
+                )
+            else:
+                self.topk = TopK(
+                    topk=num_experts_per_tok,
+                    renormalize=config.norm_topk_prob,
+                )
+                self.mlp = EPMoE(
+                    hidden_size=config.hidden_size,
+                    num_experts=num_experts,
+                    num_experts_per_tok=num_experts_per_tok,
+                    intermediate_dim=moe_intermediate_size,
+                    mesh=mesh,
+                    ep_size=config.ep_size,
+                    weight_dtype=dtype,
+                    dtype=dtype,
+                    layer_id=layer_id,
+                )
             self.is_moe_layer = True
 
         self.input_layernorm = RMSNorm(
@@ -242,8 +263,12 @@ class QWen3MoeDecoderLayer(nnx.Module):
 
         if self.is_moe_layer:
             router_logits = self.moe_gate(hidden_states)
-            topk_weights, topk_ids = self.topk(router_logits)
-            hidden_states = self.mlp(hidden_states, topk_weights, topk_ids)
+
+            if self.use_fused:
+                hidden_states = self.mlp(hidden_states, router_logits)
+            else:
+                topk_weights, topk_ids = self.topk(router_logits)
+                hidden_states = self.mlp(hidden_states, topk_weights, topk_ids)
         else:
             hidden_states = self.mlp(hidden_states)
             topk_ids = None
@@ -481,47 +506,62 @@ class Qwen3MoeForCausalLM(nnx.Module):
                 transpose=True,
             )
 
+            moe_backend = getattr(self.config, "moe_backend", "epmoe")
+            use_fused = moe_backend == "fused"
             num_experts = getattr(self.config, "num_experts", 128)
-            for expert_type in ["gate_proj", "up_proj", "down_proj"]:
-                target_name = {
-                    "gate_proj": "wi_0",
-                    "up_proj": "wi_1",
-                    "down_proj": "wo",
-                }[expert_type]
 
-                expert_keys = [
-                    f"{prefix}.mlp.experts.{i}.{expert_type}.weight" for i in range(num_experts)
+            if use_fused:
+                # Fused MoE Mapping
+                # w1: gate_proj -> (num_experts, hidden, intermediate)
+                # w3: up_proj   -> (num_experts, hidden, intermediate)
+                # w2: down_proj -> (num_experts, intermediate, hidden)
+                w1_expert_keys = [
+                    f"{prefix}.mlp.experts.{i}.gate_proj.weight" for i in range(num_experts)
                 ]
-
-                if expert_type == "down_proj":
-                    sharding = ("expert", "tensor", None)
-                else:
-                    sharding = ("expert", None, "tensor")
-                # world_size = (
-                #     self.mesh.shape.get("data", 1)
-                #     * self.mesh.shape.get("tensor", 1)
-                #     * self.mesh.shape.get("expert", 1)
-                # )
-                # tp_size = world_size // self.config.ep_size
-
-                # if self.config.ep_size == 1:
-                #     # TP
-                #     if expert_type == "down_proj":
-                #         sharding = (None, ("data", "tensor"), None)
-                #     else:
-                #         sharding = (None, None, ("data", "tensor"))
-                # elif tp_size > 1:
-                #     # ETP
-
-                # else:
-                #     # EP
-                #     sharding = (("data", "tensor"), None, None)
-
-                mappings[f"__MOE_EXPERTS__{prefix}.mlp.{target_name}"] = WeightMapping(
-                    target_path=[f"{target_prefix}.mlp.{target_name}"] + expert_keys,
-                    sharding=sharding,
+                mappings[f"__MOE_EXPERTS__{prefix}.mlp.w1"] = WeightMapping(
+                    target_path=[f"{target_prefix}.mlp.w1"] + w1_expert_keys,
+                    sharding=("tensor", None, None),  # (E, H, I)
                     transpose=True,
                 )
+                w3_expert_keys = [
+                    f"{prefix}.mlp.experts.{i}.up_proj.weight" for i in range(num_experts)
+                ]
+                mappings[f"__MOE_EXPERTS__{prefix}.mlp.w3"] = WeightMapping(
+                    target_path=[f"{target_prefix}.mlp.w3"] + w3_expert_keys,
+                    sharding=("tensor", None, None),  # (E, H, I)
+                    transpose=True,
+                )
+                w2_expert_keys = [
+                    f"{prefix}.mlp.experts.{i}.down_proj.weight" for i in range(num_experts)
+                ]
+                mappings[f"__MOE_EXPERTS__{prefix}.mlp.w2"] = WeightMapping(
+                    target_path=[f"{target_prefix}.mlp.w2"] + w2_expert_keys,
+                    sharding=("tensor", None, None),  # (E, I, H)
+                    transpose=True,
+                )
+            else:
+                # EPMoE mapping - always use expert sharding
+                for expert_type in ["gate_proj", "up_proj", "down_proj"]:
+                    target_name = {
+                        "gate_proj": "wi_0",
+                        "up_proj": "wi_1",
+                        "down_proj": "wo",
+                    }[expert_type]
+
+                    expert_keys = [
+                        f"{prefix}.mlp.experts.{i}.{expert_type}.weight" for i in range(num_experts)
+                    ]
+
+                    if expert_type == "down_proj":
+                        sharding = ("expert", "tensor", None)
+                    else:
+                        sharding = ("expert", None, "tensor")
+
+                    mappings[f"__MOE_EXPERTS__{prefix}.mlp.{target_name}"] = WeightMapping(
+                        target_path=[f"{target_prefix}.mlp.{target_name}"] + expert_keys,
+                        sharding=sharding,
+                        transpose=True,
+                    )
 
         return mappings
 
