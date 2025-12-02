@@ -43,6 +43,7 @@ dependencies = [
     "partial_json_parser",
     "pathwaysutils",
     "pybase64",
+    "qwix"
 ]
 
 [project.optional-dependencies]

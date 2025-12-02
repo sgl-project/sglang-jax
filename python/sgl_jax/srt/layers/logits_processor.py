@@ -12,6 +12,7 @@ from jax.tree_util import register_pytree_node_class
 
 from sgl_jax.srt.layers.embeddings import Embed
 from sgl_jax.srt.utils.jax_utils import device_array
+from sgl_jax.srt.utils.profiling_utils import named_scope
 
 if TYPE_CHECKING:
     from sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch
@@ -225,6 +226,7 @@ class LogitsProcessor(nnx.Module):
         self.soft_cap = soft_cap
         self.mesh = mesh
 
+    @named_scope
     def __call__(
         self,
         hidden_states: jax.Array,
