@@ -1194,6 +1194,7 @@ class Scheduler(
                 precompile_bs_paddings,
                 precompile_cache_loc_paddings,
                 self.page_size,
+                self.server_args.enable_static_lora,
             )
 
             if self.enable_overlap:
@@ -1234,6 +1235,7 @@ class Scheduler(
                 precompile_bs_paddings,
                 precompile_cache_loc_paddings,
                 self.page_size,
+                self.server_args.enable_static_lora,
                 # eagle's model_worker_batch will be modified and repadding within eagle_worker
                 skip_padding=True,
             )
