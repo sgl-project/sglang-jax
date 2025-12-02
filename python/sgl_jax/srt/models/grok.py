@@ -784,7 +784,7 @@ class Grok1ForCausalLM(nnx.Module):
 
         return output, layers_kv_fused, True
 
-    def load_weights(self, model_config: ModelConfig, rng_key: jax.Array) -> None:
+    def load_weights(self, model_config: ModelConfig) -> None:
         loader = WeightLoader(
             model=self,
             model_config=model_config,

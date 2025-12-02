@@ -394,7 +394,7 @@ class LlamaForCausalLM(nnx.Module):
         self.logits_processor = LogitsProcessor(config.vocab_size, mesh=self.mesh)
         self.capture_aux_hidden_states = False
 
-    def load_weights(self, model_config: ModelConfig, rng_key: jax.Array):
+    def load_weights(self, model_config: ModelConfig):
         loader = WeightLoader(
             model=self,
             model_config=model_config,

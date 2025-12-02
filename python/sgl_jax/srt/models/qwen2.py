@@ -326,7 +326,7 @@ class Qwen2ForCausalLM(nnx.Module):
             )
         self.logits_processor = LogitsProcessor(config.vocab_size, mesh=self.mesh)
 
-    def load_weights(self, model_config: ModelConfig, rng_key: jax.Array):
+    def load_weights(self, model_config: ModelConfig):
         loader = WeightLoader(
             model=self,
             model_config=model_config,

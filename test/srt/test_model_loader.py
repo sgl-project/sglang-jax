@@ -345,7 +345,7 @@ class TestModelLoaderWithRealModel(unittest.TestCase):
             print(f"🔄 Starting weight loading from: {self.model_path}")
 
             # Attempt to load weights
-            model.load_weights(model_config, jax.random.PRNGKey(42))
+            model.load_weights(model_config)
 
             print("PASS: Weight loading completed successfully!")
 
