@@ -9,6 +9,7 @@ import requests
 
 from sgl_jax.bench_serving import run_benchmark
 from sgl_jax.test.test_utils import (
+    BAILING_MOE,
     DEEPSEEK_R1_DISTILL_QWEN_1_5B,
     DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -20,7 +21,6 @@ from sgl_jax.test.test_utils import (
     QWEN3_MOE_30B,
     QWEN_7B,
     CustomTestCase,
-    BAILING_MOE,
     is_in_ci,
     popen_launch_server,
     run_bench_serving,
@@ -73,7 +73,6 @@ class TestModePerf(CustomTestCase):
                 "1",
                 "--mem-fraction-static",
                 "0.8",
-
             ],
             env={
                 "JAX_COMPILATION_CACHE_DIR": "/tmp/jax_compilation_cache",
@@ -1565,6 +1564,7 @@ class TestModePerf(CustomTestCase):
                     writer.writeheader()
 
                 writer.writerows(results_summary)
+
 
 if __name__ == "__main__":
     unittest.main()

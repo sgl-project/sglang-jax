@@ -12,6 +12,7 @@ from run_eval import run_eval
 
 from sgl_jax.srt.utils import kill_process_tree
 from sgl_jax.test.test_utils import (
+    BAILING_MOE,
     DEEPSEEK_R1_DISTILL_QWEN_1_5B,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -21,7 +22,6 @@ from sgl_jax.test.test_utils import (
     QWEN3_CODER_30B_A3B_INSTRUCT,
     QWEN_7B,
     CustomTestCase,
-    BAILING_MOE,
     popen_launch_server,
 )
 
