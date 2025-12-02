@@ -1000,6 +1000,10 @@ class ServerArgs:
         # Import LoRARef here to avoid circular imports
         from sgl_jax.srt.lora.lora_registry import LoRARef
 
+        if self.lora_paths:
+            self.enable_lora = True
+            logger.info("Auto-enabling LoRA because lora_paths are provided")
+
         if not self.enable_lora and not self.enable_static_lora:
             return
 
