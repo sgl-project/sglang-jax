@@ -8,10 +8,6 @@ This module mirrors the approach used by
   (bucketed) shape signature and device kind.
 - Runtime uses the table when available, otherwise falls back to a fixed
   baseline config (and callers may apply override/validation logic).
-
-Note: In this fused_moe kernel, `bt` is the expert-side token tile size used for
-HBM<->VMEM staging and output tiling. `FusedMoEBlockConfig.effective_for(...)`
-may clamp `bt` (and `btc`) based on the runtime shape.
 """
 
 # ruff: noqa: E501
@@ -32,44 +28,38 @@ from .kernel import FusedMoEBlockConfig
 #   - hidden_size
 #   - intermediate_size
 #   - ep_size
-#   - subc_quant_wsz (0 means None)
+#   - use_shared_expert
+#   - use_grouped_topk
 #
-# Value:
-#   - (bt, bf, bd1, bd2, btc, bfc, bd1c, bd2c) OR
-#   - (bt, bf, bd1, bd2, btc, bfc, bd1c, bd2c, bse)
+# Value (current):
+#   - (bt, bf, bd1, bd2, bts, btc, bfc, bd1c, bd2c, bse)
 # fmt: off
 TUNED_BLOCK_CONFIGS: dict[str, dict[tuple, tuple[int, ...]]] = {
     # Populate per-device kind, e.g. "TPU v6e", "TPU v7".
-    "TPU v6e": {
-        ("bfloat16", 128, 8, 8, 8192, 2048, 4): (32, 2048, 2048, 2048, 32, 2048, 2048, 2048),
-        ("bfloat16", 4096, 8, 8, 8192, 2048, 4): (128, 1024, 2048, 2048, 128, 1024, 2048, 2048),
-    },
     "TPU v7": {
-        ("bfloat16", 16, 256, 8, 8192, 2048, 8): (2, 1024, 2048, 2048, 2, 1024, 2048, 2048),
-        ("bfloat16", 32, 256, 8, 8192, 2048, 8): (4, 2048, 1024, 1024, 4, 2048, 1024, 1024),
-        ("bfloat16", 64, 256, 8, 8192, 2048, 8): (8, 2048, 1024, 1024, 8, 2048, 1024, 1024),
-        ("bfloat16", 128, 256, 8, 8192, 2048, 8): (16, 1024, 2048, 2048, 16, 1024, 2048, 2048),
-        ("bfloat16", 256, 256, 8, 8192, 2048, 8): (32, 512, 4096, 4096, 32, 512, 4096, 4096),
-        ("bfloat16", 512, 256, 8, 8192, 2048, 8): (64, 512, 2048, 2048, 64, 512, 2048, 2048),
-        ("bfloat16", 1024, 256, 8, 8192, 2048, 8): (64, 512, 2048, 2048, 64, 512, 2048, 2048),
-        ("bfloat16", 2048, 256, 8, 8192, 2048, 8): (64, 512, 2048, 2048, 64, 512, 2048, 2048),
-        ("bfloat16", 4096, 256, 8, 8192, 2048, 8): (64, 1024, 1024, 1024, 64, 1024, 1024, 1024),
-        ('bfloat16', 64, 256, 8, 8192, 2048, 32): (2, 2048, 2048, 2048, 2, 2048, 2048, 2048, 256),
-        ('bfloat16', 128, 256, 8, 8192, 2048, 32): (4, 2048, 2048, 2048, 4, 2048, 2048, 2048, 256),
-        ('bfloat16', 256, 256, 8, 8192, 2048, 32): (8, 2048, 2048, 2048, 8, 2048, 2048, 2048, 256),
-        ('bfloat16', 512, 256, 8, 8192, 2048, 32): (16, 2048, 1024, 1024, 16, 2048, 1024, 1024, 2048),
-        ('bfloat16', 1024, 256, 8, 8192, 2048, 32): (32, 2048, 1024, 1024, 32, 2048, 1024, 1024, 1024),
-        ('bfloat16', 2048, 256, 8, 8192, 2048, 32): (64, 1024, 2048, 2048, 64, 1024, 2048, 2048, 512),
-        ('bfloat16', 4096, 256, 8, 8192, 2048, 32): (128, 1024, 1024, 1024, 128, 1024, 1024, 1024, 512),
-        ('bfloat16', 16, 256, 8, 2048, 512, 8): (2, 512, 2048, 2048, 2, 512, 2048, 2048, 512),
-        ('bfloat16', 32, 256, 8, 2048, 512, 8): (4, 512, 2048, 2048, 4, 512, 2048, 2048, 512),
-        ('bfloat16', 64, 256, 8, 2048, 512, 8): (8, 512, 2048, 2048, 8, 512, 2048, 2048, 512),
-        ('bfloat16', 128, 256, 8, 2048, 512, 8): (16, 512, 2048, 2048, 16, 512, 2048, 2048, 256),
-        ('bfloat16', 256, 256, 8, 2048, 512, 8): (32, 512, 2048, 2048, 32, 512, 2048, 2048, 512),
-        ('bfloat16', 512, 256, 8, 2048, 512, 8): (64, 512, 2048, 2048, 64, 512, 2048, 2048, 512),
-        ('bfloat16', 1024, 256, 8, 2048, 512, 8): (128, 512, 2048, 2048, 128, 512, 2048, 2048, 512),
-        ('bfloat16', 2048, 256, 8, 2048, 512, 8): (256, 512, 2048, 2048, 256, 512, 2048, 2048, 512),
-        ('bfloat16', 4096, 256, 8, 2048, 512, 8): (512, 512, 2048, 2048, 256, 512, 2048, 2048, 128),
+        ('bfloat16', 64, 256, 8, 8192, 2048, 32, False, False): (2, 2048, 2048, 2048, 2, 2, 2048, 2048, 2048, 2048),
+        ('bfloat16', 128, 256, 8, 8192, 2048, 32, False, False): (4, 2048, 2048, 2048, 4, 4, 2048, 2048, 2048, 2048),
+        ('bfloat16', 256, 256, 8, 8192, 2048, 32, False, False): (8, 2048, 2048, 2048, 8, 8, 2048, 2048, 2048, 2048),
+        ('bfloat16', 512, 256, 8, 8192, 2048, 32, False, False): (16, 2048, 2048, 2048, 16, 16, 2048, 2048, 2048, 2048),
+        ('bfloat16', 1024, 256, 8, 8192, 2048, 32, False, False): (32, 512, 8192, 8192, 32, 32, 512, 8192, 8192, 512),
+        ('bfloat16', 2048, 256, 8, 8192, 2048, 32, False, False): (64, 1024, 2048, 2048, 64, 64, 1024, 2048, 2048, 1024),
+        ('bfloat16', 4096, 256, 8, 8192, 2048, 32, False, False): (128, 1024, 1024, 1024, 128, 128, 1024, 1024, 1024, 1024),
+
+        ('bfloat16', 64, 256, 8, 8192, 2048, 32, True, False): (2, 2048, 2048, 2048, 2, 2, 2048, 2048, 2048, 256),
+        ('bfloat16', 128, 256, 8, 8192, 2048, 32, True, False): (4, 2048, 2048, 2048, 4, 4, 2048, 2048, 2048, 256),
+        ('bfloat16', 256, 256, 8, 8192, 2048, 32, True, False): (8, 2048, 2048, 2048, 8, 8, 2048, 2048, 2048, 256),
+        ('bfloat16', 512, 256, 8, 8192, 2048, 32, True, False): (16, 2048, 1024, 1024, 16, 16, 2048, 1024, 1024, 2048),
+        ('bfloat16', 1024, 256, 8, 8192, 2048, 32, True, False): (32, 2048, 1024, 1024, 32, 32, 2048, 1024, 1024, 1024),
+        ('bfloat16', 2048, 256, 8, 8192, 2048, 32, True, False): (64, 1024, 2048, 2048, 64, 64, 1024, 2048, 2048, 512),
+        ('bfloat16', 4096, 256, 8, 8192, 2048, 32, True, False): (128, 1024, 1024, 1024, 128, 128, 1024, 1024, 1024, 512),
+
+        ('bfloat16', 64, 256, 8, 8192, 2048, 32, True, True): (2, 2048, 2048, 2048, 2, 2, 2048, 2048, 2048, 256),
+        ('bfloat16', 128, 256, 8, 8192, 2048, 32, True, True): (4, 2048, 2048, 2048, 4, 4, 2048, 2048, 2048, 256),
+        ('bfloat16', 256, 256, 8, 8192, 2048, 32, True, True): (8, 2048, 2048, 2048, 8, 8, 2048, 2048, 2048, 256),
+        ('bfloat16', 512, 256, 8, 8192, 2048, 32, True, True): (16, 2048, 1024, 1024, 16, 16, 2048, 1024, 1024, 2048),
+        ('bfloat16', 1024, 256, 8, 8192, 2048, 32, True, True): (32, 2048, 1024, 1024, 32, 32, 2048, 1024, 1024, 1024),
+        ('bfloat16', 2048, 256, 8, 8192, 2048, 32, True, True): (64, 1024, 2048, 2048, 64, 64, 1024, 2048, 2048, 512),
+        ('bfloat16', 4096, 256, 8, 8192, 2048, 32, True, True): (128, 1024, 1024, 1024, 128, 128, 1024, 1024, 1024, 512),
     },
     # Fallback for any device kind.
     "*": {},
@@ -98,6 +88,8 @@ def get_simplified_key(
     hidden_size: int,
     intermediate_size: int,
     ep_size: int,
+    use_shared_expert: bool,
+    use_grouped_topk: bool,
 ) -> tuple:
     """Get a simplified key to reduce the number of tuned combinations."""
     if ep_size <= 0:
@@ -116,6 +108,8 @@ def get_simplified_key(
         hidden_size,
         intermediate_size,
         ep_size,
+        bool(use_shared_expert),
+        bool(use_grouped_topk),
     )
 
 
@@ -128,6 +122,8 @@ def get_tuned_fused_moe_block_config(
     intermediate_size: int,
     dtype: jnp.dtype,
     ep_size: int,
+    use_shared_expert: bool,
+    use_grouped_topk: bool,
 ):
     """Look up the best block config from the tuned table.
 
@@ -143,6 +139,8 @@ def get_tuned_fused_moe_block_config(
         hidden_size=hidden_size,
         intermediate_size=intermediate_size,
         ep_size=ep_size,
+        use_shared_expert=use_shared_expert,
+        use_grouped_topk=use_grouped_topk,
     )
     device_name = keys[0]
     table_key = keys[1:]
@@ -156,12 +154,10 @@ def get_tuned_fused_moe_block_config(
     if cfg_tuple is None:
         return DEFAULT_FUSED_MOE_BLOCK_CONFIG
 
-    if len(cfg_tuple) == 8:
-        # Legacy config without bse
-        bt, bf, bd1, bd2, btc, bfc, bd1c, bd2c = cfg_tuple
-        bse = bf  # Default bse to bf
-    else:
-        bt, bf, bd1, bd2, btc, bfc, bd1c, bd2c, bse = cfg_tuple
+    if len(cfg_tuple) != 10:
+        raise ValueError(f"Unexpected tuned config tuple length: {len(cfg_tuple)}")
+
+    bt, bf, bd1, bd2, bts, btc, bfc, bd1c, bd2c, bse = cfg_tuple
 
     cfg = FusedMoEBlockConfig(
         bt=bt,
@@ -173,5 +169,6 @@ def get_tuned_fused_moe_block_config(
         bd1c=bd1c,
         bd2c=bd2c,
         bse=bse,
+        bts=bts,
     )
     return cfg

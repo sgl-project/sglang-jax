@@ -197,7 +197,7 @@ class MoEKernelTest(jtu.JaxTestCase):
                     w3_shared, w_dtype, subc_quant_wsz
                 )
 
-        actual, _ = fused_ep_moe(
+        actual = fused_ep_moe(
             mesh=self.mesh,
             tokens=a,
             w1=w1,

@@ -541,16 +541,6 @@ class FusedEPMoE(nnx.Module):
         moe_shared_expert_intermediate_size: int | None = None,
         *,
         balanced_topk: bool = False,
-        disable_a2a: bool = False,
-        disable_dynamic_ffn1: bool = False,
-        disable_dynamic_ffn2: bool = False,
-        disable_weight_load: bool = False,
-        disable_a2a_s_tile_read: bool = False,
-        disable_a2a_s_acc_tile_write: bool = False,
-        disable_shared_expert: bool = False,
-        disable_topk: bool = False,
-        disable_all_reduce_metadata: bool = False,
-        disable_sync_barrier: bool = False,
     ):
         self.hidden_size = hidden_size
         self.num_experts = num_experts
@@ -572,16 +562,6 @@ class FusedEPMoE(nnx.Module):
         )
         self.balanced_topk = balanced_topk
         self.mesh = mesh
-        self.disable_a2a = disable_a2a
-        self.disable_dynamic_ffn1 = disable_dynamic_ffn1
-        self.disable_dynamic_ffn2 = disable_dynamic_ffn2
-        self.disable_weight_load = disable_weight_load
-        self.disable_a2a_s_tile_read = disable_a2a_s_tile_read
-        self.disable_a2a_s_acc_tile_write = disable_a2a_s_acc_tile_write
-        self.disable_shared_expert = disable_shared_expert
-        self.disable_topk = disable_topk
-        self.disable_all_reduce_metadata = disable_all_reduce_metadata
-        self.disable_sync_barrier = disable_sync_barrier
 
         if num_experts % self.ep_size != 0:
             raise ValueError(
@@ -678,7 +658,7 @@ class FusedEPMoE(nnx.Module):
         w3_shared_val = self.w3_shared.value if self.w3_shared is not None else None
         w2_shared_val = self.w2_shared.value if self.w2_shared is not None else None
 
-        output, expert_counts = fused_ep_moe(
+        output = fused_ep_moe(
             mesh=self.mesh,
             tokens=hidden_states,
             w1=self.w1.value,
@@ -708,29 +688,7 @@ class FusedEPMoE(nnx.Module):
             b3=None,
             dp_axis_name="data",
             tp_axis_name="tensor",
-            disable_a2a=self.disable_a2a,
-            disable_dynamic_ffn1=self.disable_dynamic_ffn1,
-            disable_dynamic_ffn2=self.disable_dynamic_ffn2,
-            disable_weight_load=self.disable_weight_load,
-            disable_a2a_s_tile_read=self.disable_a2a_s_tile_read,
-            disable_a2a_s_acc_tile_write=self.disable_a2a_s_acc_tile_write,
-            disable_shared_expert=self.disable_shared_expert,
-            disable_topk=self.disable_topk,
-            disable_all_reduce_metadata=self.disable_all_reduce_metadata,
-            disable_sync_barrier=self.disable_sync_barrier,
         )
 
         output = jax.sharding.reshard(output, NamedSharding(self.mesh, P(None, None)))
-        # 2. 对 output 进行 reshard
-        output = jax.sharding.reshard(output, NamedSharding(self.mesh, P(None, None)))
-
-        # 3. 处理 expert_counts
-        # 目前 expert_counts 的形状是 (num_bt, padded_num_experts)
-        # 如果你想评估负载，通常需要对所有 block 求和得到每个 Expert 的总负载
-        # 注意：由于 kernel 内部已经做了全网 All-Reduce，
-        # 所以每个 Device 上的 expert_counts 数据在逻辑上是全局同步后的
-        total_expert_counts = jnp.sum(expert_counts, axis=0)  # (padded_num_experts,)
-
-        # 如果 padded_num_experts 多于实际的 num_experts，截断它
-        total_expert_counts = total_expert_counts[: self.num_experts]
-        return output, total_expert_counts
+        return output

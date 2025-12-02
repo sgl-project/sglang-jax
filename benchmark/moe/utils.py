@@ -394,32 +394,24 @@ class MoEImbalanceSimulator:
 
             zero_spot_count = kwargs.get("zero_expert_count", 0) if mode == "sparse_hotspot" else 0
 
-            # 边界检查
             hotspot_count = max(1, min(hotspot_count, num_experts - zero_spot_count - 1))
 
-            # 分层挑选索引
             zero_indices = all_indices[:zero_spot_count]
             hot_indices = all_indices[zero_spot_count : zero_spot_count + hotspot_count]
             base_indices = all_indices[zero_spot_count + hotspot_count :]
 
-            # 1. 零负载组
             probs[zero_indices] = 0.0
-            # 2. 热点组 (平分热点配额)
             probs[hot_indices] = hotspot_ratio / hotspot_count
-            # 3. 基础活跃组 (按 Dirichlet 分布划分剩余配额)
             if len(base_indices) > 0:
                 base_dist = rng.dirichlet([alpha_base] * len(base_indices))
                 probs[base_indices] = base_dist * (1 - hotspot_ratio)
             else:
-                # 如果没有基础组，热点组拿走全部
                 probs[hot_indices] = 1.0 / hotspot_count
 
         else:
             raise ValueError(f"Unknown mode: {mode}")
 
-        # 将概率转换为具体的 token 数量
         counts = np.floor(probs * total_picks).astype(int)
-        # 补齐因舍入导致的差值
         diff = total_picks - counts.sum()
         if diff > 0:
             indices = np.random.choice(num_experts, diff, p=probs)
@@ -429,29 +421,18 @@ class MoEImbalanceSimulator:
 
     @staticmethod
     def create_logits_from_counts(num_tokens, num_experts, top_k, counts):
-        """
-        根据目标 count 构造 router_logits。
-        构造逻辑：为每个 token 分配 top_k 个专家，确保全局总数符合 counts。
-        """
-        """
-        贪心策略逻辑：
-        1. 专家按负载从高到低排序 (Expert Descending)。
-        2. 遍历专家，每次优先挑选当前填充度最低的 Token (Token Ascending)。
-        """
+        """Construct router logits from per-expert counts via greedy assignment."""
         counts = np.array(counts).astype(int)
         total_slots = num_tokens * top_k
 
-        # 基础校验与补偿
         if counts.sum() != total_slots:
             diff = total_slots - counts.sum()
             counts[np.argmax(counts)] += diff
 
         # assignments[token_id, slot_id]
         assignments = np.full((num_tokens, top_k), -1, dtype=np.int32)
-        # 记录每个 token 已被分配了几个专家
         token_fill_count = np.zeros(num_tokens, dtype=np.int32)
 
-        # 1. 专家遍历顺序：负载从多到少
         expert_ids = np.argsort(counts)[::-1]
 
         for e_id in expert_ids:
@@ -459,28 +440,21 @@ class MoEImbalanceSimulator:
             if needed <= 0:
                 continue
 
-            # 2. 对 Token 进行排序：按当前填充数量从少到多
-            # argsort 会返回填充度最小的 token 的索引
             sorted_token_indices = np.argsort(token_fill_count)
 
-            # 3. 选取前 needed 个 token 分配当前专家
-            # 在这种逻辑下，只要 hotspot_count >= top_k，就绝对不会报错
             chosen_tokens = sorted_token_indices[:needed]
 
-            # 检查物理极限：如果选出的 token 里已经有满了的，说明参数设置不合理
             if token_fill_count[chosen_tokens[-1]] >= top_k:
                 raise ValueError(
                     f"分配失败：专家 {e_id} 需要分配给 Token，但最空的 Token 也已经填满了。\n"
                     f"这通常是因为 top_k ({top_k}) 相对于热点专家数过多导致的。"
                 )
 
-            # 4. 执行填充
             for t_id in chosen_tokens:
                 slot_idx = token_fill_count[t_id]
                 assignments[t_id, slot_idx] = e_id
                 token_fill_count[t_id] += 1
 
-        # 5. 构造 Logits (JAX 数组)
         logits = np.full((num_tokens, num_experts), -10.0, dtype=np.float32)
         row_indices = np.arange(num_tokens)[:, None]
         logits[row_indices, assignments] = 10.0

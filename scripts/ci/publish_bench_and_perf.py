@@ -233,7 +233,7 @@ def prepare_files_for_upload(source_dir, target_base_path):
     # Walk through source directory and find .csv files
     for root, dirs, files in os.walk(source_dir):
         for file in files:
-            if file.endswith(".csv"):  # <--- 修改点
+            if file.endswith(".csv"):
                 source_file = os.path.join(root, file)
                 # Calculate relative path from source_dir
                 rel_path = os.path.relpath(source_file, source_dir)

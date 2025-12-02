@@ -8,8 +8,10 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import faulthandler
 import math
-import os
+import sys
+import traceback
 
 import jax
 import jax.numpy as jnp
@@ -39,34 +41,6 @@ from sgl_jax.srt.layers.moe import FusedEPMoE
 # Leave headroom for compiler padding/alignment and any unmodeled VMEM usage.
 DEFAULT_TPU_VMEM_BUDGET_MB = 60
 DEFAULT_TPU_VMEM_BUDGET_BYTES = DEFAULT_TPU_VMEM_BUDGET_MB * 1024 * 1024
-
-
-def _env_bool(name: str, default: bool = False) -> bool:
-    val = os.getenv(name)
-    if val is None:
-        return default
-    val = val.strip().lower()
-    if val in ("1", "true", "t", "yes", "y", "on"):
-        return True
-    if val in ("0", "false", "f", "no", "n", "off", ""):
-        return False
-    raise ValueError(f"Invalid boolean env var {name}={val!r} (expected 0/1/true/false).")
-
-
-def _env_bool_opt(name: str) -> bool | None:
-    """Return None if unset, otherwise parse as bool."""
-    val = os.getenv(name)
-    if val is None:
-        return None
-    return _env_bool(name)
-
-
-def _with_all_disable(env_name: str, *, all_disable: bool) -> bool:
-    """Use per-flag env override if set; otherwise fall back to all_disable."""
-    specific = _env_bool_opt(env_name)
-    if specific is not None:
-        return specific
-    return all_disable
 
 
 def _dtype_packing(dtype: jnp.dtype) -> int:
@@ -281,17 +255,6 @@ def select_block_configs(
     raw_bse_candidates = bse_candidates if bse_candidates is not None else bf_candidates
     bse_candidates_i = _pick_candidates(candidates=raw_bse_candidates, multiple_of=128)
 
-    def default_bts_for_bt(bt: int) -> list[int]:
-        out: list[int] = []
-        v = bt
-        while v >= t_packing:
-            if v % t_packing == 0:
-                out.append(v)
-            if v == t_packing:
-                break
-            v //= 2
-        return out
-
     def validate(cfg: FusedMoEBlockConfig) -> tuple[bool, str]:
         bt = cfg.bt
         bts = bt if cfg.bts is None else int(cfg.bts)
@@ -387,7 +350,9 @@ def select_block_configs(
 
     for bt in bt_candidates:
         if bts_candidates_i is None:
-            bts_list: list[int] = default_bts_for_bt(bt)
+            # Match the historical behavior: when `bts` isn't explicitly tuned, it
+            # defaults to `bt` (both in the kernel and in tuned table entries).
+            bts_list: list[int] = [bt]
         else:
             bts_list = [v for v in bts_candidates_i if v <= bt]
         for bts in bts_list:
@@ -583,7 +548,6 @@ def run_all(
             include_shared_expert=use_shared_expert,
         )
 
-        # --- 注入不均衡模拟器逻辑 ---
         print(f"{imbalance_mode=}")
         target_counts = MoEImbalanceSimulator.generate_counts(
             case.num_tokens,
@@ -597,12 +561,10 @@ def run_all(
             zero_expert_count=zero_expert_count,
             non_hotspot_alpha=non_hotspot_alpha,
         )
-        # 构造定制化的 Logits
         custom_logits = MoEImbalanceSimulator.create_logits_from_counts(
             case.num_tokens, case.num_experts, case.top_k, target_counts
         )
 
-        # 重新分片并覆盖原有的 router_logits
         data["router_logits"] = jax.device_put(
             custom_logits, jax.sharding.NamedSharding(mesh, P("tensor", None))
         )
@@ -625,7 +587,6 @@ def run_all(
             block_cfgs = [None]
 
         with jax.set_mesh(mesh):
-            all_disable = _env_bool("FUSED_MOE_BENCHMARK_ALL_DISABLE", False)
             fused_layer = FusedEPMoE(
                 hidden_size=case.hidden_size,
                 num_experts=case.num_experts,
@@ -644,49 +605,6 @@ def run_all(
                 num_shared_experts=1 if use_shared_expert else 0,
                 moe_shared_expert_intermediate_size=(
                     case.intermediate_size if use_shared_expert else None
-                ),
-                # Env helpers:
-                # - Set `FUSED_MOE_BENCHMARK_ALL_DISABLE=1` to disable all major stages.
-                # - Any specific `FUSED_MOE_BENCHMARK_DISABLE_*` overrides ALL_DISABLE.
-                disable_a2a=_with_all_disable(
-                    "FUSED_MOE_BENCHMARK_DISABLE_A2A",
-                    all_disable=all_disable,
-                ),
-                disable_dynamic_ffn1=_with_all_disable(
-                    "FUSED_MOE_BENCHMARK_DISABLE_DYNAMIC_FFN1",
-                    all_disable=all_disable,
-                ),
-                disable_dynamic_ffn2=_with_all_disable(
-                    "FUSED_MOE_BENCHMARK_DISABLE_DYNAMIC_FFN2",
-                    all_disable=all_disable,
-                ),
-                disable_weight_load=_with_all_disable(
-                    "FUSED_MOE_BENCHMARK_DISABLE_WEIGHT_LOAD",
-                    all_disable=all_disable,
-                ),
-                disable_a2a_s_tile_read=_with_all_disable(
-                    "FUSED_MOE_BENCHMARK_DISABLE_A2A_S_TILE_READ",
-                    all_disable=all_disable,
-                ),
-                disable_a2a_s_acc_tile_write=_with_all_disable(
-                    "FUSED_MOE_BENCHMARK_DISABLE_A2A_S_ACC_TILE_WRITE",
-                    all_disable=all_disable,
-                ),
-                disable_shared_expert=_with_all_disable(
-                    "FUSED_MOE_BENCHMARK_DISABLE_SHARED_EXPERT",
-                    all_disable=all_disable,
-                ),
-                disable_topk=_with_all_disable(
-                    "FUSED_MOE_BENCHMARK_DISABLE_TOPK",
-                    all_disable=all_disable,
-                ),
-                disable_all_reduce_metadata=_with_all_disable(
-                    "FUSED_MOE_BENCHMARK_DISABLE_ALL_REDUCE_METADATA",
-                    all_disable=all_disable,
-                ),
-                disable_sync_barrier=_with_all_disable(
-                    "FUSED_MOE_BENCHMARK_DISABLE_SYNC_BARRIER",
-                    all_disable=all_disable,
                 ),
             )
 
@@ -756,6 +674,28 @@ def run_all(
                 except ValueError as e:
                     print(f"SKIP fused_moe blocks [{i+1}/{len(block_cfgs)}], reason: {e}")
                     continue
+                except SystemExit as e:
+                    # In some TPU environments stderr isn't captured/aggregated, and some internal
+                    # errors can surface as SystemExit(1). Print the traceback to stdout so it's
+                    # visible in logs.
+                    print(
+                        f"ERROR fused_moe blocks [{i+1}/{len(block_cfgs)}]: "
+                        f"{type(e).__name__}: {e}",
+                        flush=True,
+                    )
+                    print(traceback.format_exc(), flush=True)
+                    raise
+                except Exception as e:
+                    # Some failures (e.g., TPU compilation/runtime issues or missing profiler trace
+                    # output) can surface as non-ValueError exceptions. Print the full traceback to
+                    # stdout so benchmark runs don't appear to exit silently.
+                    print(
+                        f"ERROR fused_moe blocks [{i+1}/{len(block_cfgs)}]: "
+                        f"{type(e).__name__}: {e}",
+                        flush=True,
+                    )
+                    print(traceback.format_exc(), flush=True)
+                    continue
                 if len(times) > 1:
                     times = times[1:]
                 mean_ms = float(np.mean(times)) if times else float("nan")
@@ -778,12 +718,15 @@ def run_all(
                         case.hidden_size,
                         case.intermediate_size,
                         case.ep_size,
+                        use_shared_expert,
+                        use_grouped_topk,
                     )
                     cfg_tuple = (
                         best_cfg.bt,
                         best_cfg.bf,
                         best_cfg.bd1,
                         best_cfg.bd2,
+                        best_cfg.bts if best_cfg.bts is not None else best_cfg.bt,
                         best_cfg.btc,
                         best_cfg.bfc,
                         best_cfg.bd1c,
@@ -806,7 +749,8 @@ def run_all(
             entries = tuned_results[device_name]
             print(f'TUNED_BLOCK_CONFIGS.setdefault("{device_name}", {{}}).update({{')
             for k in sorted(
-                entries.keys(), key=lambda t: (t[1], t[2], t[3], t[4], t[5], t[6], t[0])
+                entries.keys(),
+                key=lambda t: (t[1], t[2], t[3], t[4], t[5], t[6], t[7], t[8], t[0]),
             ):
                 print(f"    {k}: {entries[k]},")
             print("})\n")
@@ -930,31 +874,42 @@ def parse_args() -> argparse.Namespace:
 
 
 if __name__ == "__main__":
+    # In some TPU environments only stdout is captured/aggregated. Route fatal Python
+    # traces (e.g., segfaults, timeouts) to stdout to avoid "silent" exits.
+    try:
+        faulthandler.enable(file=sys.stdout, all_threads=True)
+    except Exception:
+        pass
     args = parse_args()
     if args.compilation_cache_dir:
         _compilation_cache.set_cache_dir(args.compilation_cache_dir)
     tpu_vmem_budget_bytes = int(args.tpu_vmem_budget_mb) * 1024 * 1024
     full_args_dict = vars(args)
-    run_all(
-        args.iters,
-        warmup_iters=args.warmup_iters,
-        tune_block_config=args.tune_block_config,
-        bt_candidates=args.bt_candidates,
-        bts_candidates=args.bts_candidates,
-        bf_candidates=args.bf_candidates,
-        bd_candidates=args.bd_candidates,
-        bse_candidates=args.bse_candidates,
-        num_tokens=args.num_tokens,
-        tpu_vmem_budget_bytes=tpu_vmem_budget_bytes,
-        max_configs=args.max_configs,
-        config_mode=args.config_mode,
-        use_shared_expert=args.use_shared_expert,
-        use_grouped_topk=args.use_grouped_topk,
-        imbalance_mode=args.imbalance_mode,
-        alpha=args.alpha,
-        zipf_s=args.zipf_s,
-        hotspot_ratio=args.hotspot_ratio,
-        hotspot_count=args.hotspot_count,
-        zero_expert_count=args.zero_expert_count,
-        non_hotspot_alpha=args.non_hotspot_alpha,
-    )
+    try:
+        run_all(
+            args.iters,
+            warmup_iters=args.warmup_iters,
+            tune_block_config=args.tune_block_config,
+            bt_candidates=args.bt_candidates,
+            bts_candidates=args.bts_candidates,
+            bf_candidates=args.bf_candidates,
+            bd_candidates=args.bd_candidates,
+            bse_candidates=args.bse_candidates,
+            num_tokens=args.num_tokens,
+            tpu_vmem_budget_bytes=tpu_vmem_budget_bytes,
+            max_configs=args.max_configs,
+            config_mode=args.config_mode,
+            use_shared_expert=args.use_shared_expert,
+            use_grouped_topk=args.use_grouped_topk,
+            imbalance_mode=args.imbalance_mode,
+            alpha=args.alpha,
+            zipf_s=args.zipf_s,
+            hotspot_ratio=args.hotspot_ratio,
+            hotspot_count=args.hotspot_count,
+            zero_expert_count=args.zero_expert_count,
+            non_hotspot_alpha=args.non_hotspot_alpha,
+        )
+    except BaseException as e:
+        print(f"FATAL: {type(e).__name__}: {e}", flush=True)
+        print(traceback.format_exc(), flush=True)
+        raise

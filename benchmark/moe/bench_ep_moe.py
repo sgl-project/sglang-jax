@@ -2,7 +2,7 @@
 Benchmark ep_moe (reference path) for comparison with fused_moe.
 
 Usage:
-    python -m benchmark.moe.bench_ep_moe [--scenario random|balanced|imbalanced]
+    python -m benchmark.moe.bench_fused_moe --use-shared-expert  --use-grouped-topk --num-tokens 128 --imbalance-mode sparse_hotspot --hotspot-ratio 1 --hotspot-count 48
 """
 
 from __future__ import annotations
