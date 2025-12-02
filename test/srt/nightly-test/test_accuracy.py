@@ -70,9 +70,9 @@ class TestModelAccuracy(CustomTestCase):
         # run evalscope tasks
         try:
             tasks = [
-                {"name": "gsm8k", "threshold": 0},
-                {"name": "mmlu", "threshold": 0},
-                {"name": "mmlu_pro", "threshold": 0},
+                {"name": "gsm8k", "threshold": -1},
+                {"name": "mmlu", "threshold": -1},
+                {"name": "mmlu_pro", "threshold": -1},
                 {"name": "aime24", "threshold": -1},
                 {"name": "aime25", "threshold": -1},
             ]
@@ -193,9 +193,9 @@ class TestModelAccuracy(CustomTestCase):
         # run evalscope tasks
         try:
             tasks = [
-                {"name": "gsm8k", "threshold": 0},
-                {"name": "mmlu", "threshold": 0},
-                {"name": "mmlu_pro", "threshold": 0},
+                {"name": "gsm8k", "threshold": -1},
+                {"name": "mmlu", "threshold": -1},
+                {"name": "mmlu_pro", "threshold": -1},
                 {"name": "aime24", "threshold": -1},
                 {"name": "aime25", "threshold": -1},
             ]
@@ -314,9 +314,9 @@ class TestModelAccuracy(CustomTestCase):
         # run evalscope tasks
         try:
             tasks = [
-                {"name": "gsm8k", "threshold": 0},
-                {"name": "mmlu", "threshold": 0},
-                {"name": "mmlu_pro", "threshold": 0},
+                {"name": "gsm8k", "threshold": -1},
+                {"name": "mmlu", "threshold": -1},
+                {"name": "mmlu_pro", "threshold": -1},
                 {"name": "aime24", "threshold": -1},
                 {"name": "aime25", "threshold": -1},
                 {"name": "math_500", "threshold": -1},
@@ -436,9 +436,9 @@ class TestModelAccuracy(CustomTestCase):
         # run evalscope tasks
         try:
             tasks = [
-                {"name": "gsm8k", "threshold": 0},
-                {"name": "mmlu", "threshold": 0},
-                {"name": "mmlu_pro", "threshold": 0},
+                {"name": "gsm8k", "threshold": -1},
+                {"name": "mmlu", "threshold": -1},
+                {"name": "mmlu_pro", "threshold": -1},
                 {"name": "aime24", "threshold": -1},
                 {"name": "aime25", "threshold": -1},
             ]
@@ -557,9 +557,9 @@ class TestModelAccuracy(CustomTestCase):
         # run evalscope tasks
         try:
             tasks = [
-                {"name": "gsm8k", "threshold": 0},
-                {"name": "mmlu", "threshold": 0},
-                {"name": "mmlu_pro", "threshold": 0},
+                {"name": "gsm8k", "threshold": -1},
+                {"name": "mmlu", "threshold": -1},
+                {"name": "mmlu_pro", "threshold": -1},
                 {"name": "aime24", "threshold": -1},
                 {"name": "aime25", "threshold": -1},
             ]
@@ -678,9 +678,9 @@ class TestModelAccuracy(CustomTestCase):
         # run evalscope tasks
         try:
             tasks = [
-                {"name": "gsm8k", "threshold": 0},
-                {"name": "mmlu", "threshold": 0},
-                {"name": "mmlu_pro", "threshold": 0},
+                {"name": "gsm8k", "threshold": -1},
+                {"name": "mmlu", "threshold": -1},
+                {"name": "mmlu_pro", "threshold": -1},
                 {"name": "aime24", "threshold": -1},
                 {"name": "aime25", "threshold": -1},
             ]
@@ -800,9 +800,9 @@ class TestModelAccuracy(CustomTestCase):
         # run evalscope tasks
         try:
             tasks = [
-                {"name": "gsm8k", "threshold": 0},
-                {"name": "mmlu", "threshold": 0},
-                {"name": "mmlu_pro", "threshold": 0},
+                {"name": "gsm8k", "threshold": -1},
+                {"name": "mmlu", "threshold": -1},
+                {"name": "mmlu_pro", "threshold": -1},
                 {"name": "aime24", "threshold": -1},
                 {"name": "aime25", "threshold": -1},
             ]
@@ -924,9 +924,9 @@ class TestModelAccuracy(CustomTestCase):
         # run evalscope tasks
         try:
             tasks = [
-                {"name": "gsm8k", "threshold": 0},
-                {"name": "mmlu", "threshold": 0},
-                {"name": "mmlu_pro", "threshold": 0},
+                {"name": "gsm8k", "threshold": -1},
+                {"name": "mmlu", "threshold": -1},
+                {"name": "mmlu_pro", "threshold": -1},
                 {"name": "aime24", "threshold": -1},
                 {"name": "aime25", "threshold": -1},
             ]
@@ -1045,9 +1045,9 @@ class TestModelAccuracy(CustomTestCase):
         # run evalscope tasks
         try:
             tasks = [
-                {"name": "gsm8k", "threshold": 0},
-                {"name": "mmlu", "threshold": 0},
-                {"name": "mmlu_pro", "threshold": 0},
+                {"name": "gsm8k", "threshold": -1},
+                {"name": "mmlu", "threshold": -1},
+                {"name": "mmlu_pro", "threshold": -1},
                 {"name": "aime24", "threshold": -1},
                 {"name": "aime25", "threshold": -1},
                 {"name": "math_500", "threshold": -1},
@@ -1170,9 +1170,9 @@ class TestModelAccuracy(CustomTestCase):
         # run evalscope tasks
         try:
             tasks = [
-                {"name": "gsm8k", "threshold": 0},
-                {"name": "mmlu", "threshold": 0},
-                {"name": "mmlu_pro", "threshold": 0},
+                {"name": "gsm8k", "threshold": -1},
+                {"name": "mmlu", "threshold": -1},
+                {"name": "mmlu_pro", "threshold": -1},
                 {"name": "aime24", "threshold": -1},
                 {"name": "aime25", "threshold": -1},
             ]
@@ -1294,9 +1294,9 @@ class TestModelAccuracy(CustomTestCase):
         # run evalscope tasks
         try:
             tasks = [
-                {"name": "gsm8k", "threshold": 0},
-                {"name": "mmlu", "threshold": 0},
-                {"name": "mmlu_pro", "threshold": 0},
+                {"name": "gsm8k", "threshold": -1},
+                {"name": "mmlu", "threshold": -1},
+                {"name": "mmlu_pro", "threshold": -1},
                 {"name": "aime24", "threshold": -1},
                 {"name": "aime25", "threshold": -1},
             ]

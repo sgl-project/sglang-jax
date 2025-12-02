@@ -5,7 +5,7 @@ from run_eval import run_eval
 
 from sgl_jax.srt.utils import kill_process_tree
 from sgl_jax.test.test_utils import (
-    DEEPSEEK_R1_QWEN_1_5B,
+    DEEPSEEK_R1_DISTILL_QWEN_1_5B,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
@@ -16,7 +16,7 @@ from sgl_jax.test.test_utils import (
 class TestQwen1_5Model(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model = DEEPSEEK_R1_QWEN_1_5B
+        cls.model = DEEPSEEK_R1_DISTILL_QWEN_1_5B
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
             cls.model,
