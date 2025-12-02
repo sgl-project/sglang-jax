@@ -1,0 +1,124 @@
+name: Nightly Test
+
+on:
+  push:
+    branches:
+      - main
+      - "epic/*"
+    paths:
+      - "python/**"
+      - "scripts/**"
+      - "test/**"
+      - ".github/workflows/pr-test.yml"
+      - ".github/workflows/nightly-test.yml"
+  pull_request:
+    branches:
+      - main
+      - "epic/*"
+    paths:
+      - "python/**"
+      - "scripts/**"
+      - "test/**"
+      - ".github/workflows/pr-test.yml"
+      - ".github/workflows/nightly-test.yml"
+
+concurrency:
+  group: nightly-test-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+
+  nightly-test-accuracy-text-models-1-tpu:
+    if: github.repository == 'sgl-project/sglang-jax'
+    runs-on: arc-runner-v6e-1
+    continue-on-error: true
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - name: Run eval test for text models
+        timeout-minutes: 120
+        run: |
+          python3.12 -m venv .venv
+          source .venv/bin/activate
+          pip install uv
+          uv pip install -e "python[all]"
+          bash scripts/killall_sglang.sh
+          cd test/srt
+          python3 run_suite.py --suite nightly-test-accuracy-text-models-tpu-v6e-1
+
+  nightly-test-accuracy-text-models-4-tpu:
+    if: github.repository == 'sgl-project/sglang-jax'
+    runs-on: arc-runner-v6e-4
+    continue-on-error: true
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - name: Run eval test for text models
+        timeout-minutes: 120
+        run: |
+          python3.12 -m venv .venv
+          source .venv/bin/activate
+          pip install uv
+          uv pip install -e "python[all]"
+          bash scripts/killall_sglang.sh
+          cd test/srt
+          python3 run_suite.py --suite nightly-test-accuracy-text-models-tpu-v6e-4
+
+  nightly-test-perf-text-models-1-tpu:
+    if: github.repository == 'sgl-project/sglang-jax'
+    runs-on: arc-runner-v6e-1
+    continue-on-error: true
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - name: Run performance test for text models
+        timeout-minutes: 180
+        env:
+          TRACE_BASE_URL: https://raw.githubusercontent.com/sglang-bot/sglang-ci-data/main/traces/${{ github.run_id }}
+          PERFETTO_RELAY_URL: ${{ vars.PERFETTO_RELAY_URL }}
+        run: |
+          python3.12 -m venv .venv
+          source .venv/bin/activate
+          pip install uv
+          uv pip install -e "python[all]"
+          bash scripts/killall_sglang.sh
+          cd test/srt
+          python3 run_suite.py --suite nightly-test-perf-text-models-tpu-v6e-1
+
+#      - name: Publish traces to storage repo
+#        env:
+#          GITHUB_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
+#          GITHUB_RUN_ID: ${{ github.run_id }}
+#          GITHUB_RUN_NUMBER: ${{ github.run_number }}
+#        run: |
+#          python3 scripts/ci/publish_traces.py --traces-dir test/srt/performance_profiles_text_models
+
+  nightly-test-perf-text-models-4-tpu:
+    if: github.repository == 'sgl-project/sglang-jax'
+    runs-on: arc-runner-v6e-4
+    continue-on-error: true
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Run performance test for text models
+        timeout-minutes: 180
+        env:
+          TRACE_BASE_URL: https://raw.githubusercontent.com/sglang-bot/sglang-ci-data/main/traces/${{ github.run_id }}
+          PERFETTO_RELAY_URL: ${{ vars.PERFETTO_RELAY_URL }}
+        run: |
+          python3.12 -m venv .venv
+          source .venv/bin/activate
+          pip install uv
+          uv pip install -e "python[all]"
+          bash scripts/killall_sglang.sh
+          cd test/srt
+          python3 run_suite.py --suite  nightly-test-perf-text-models-tpu-v6e-4
+
+#      - name: Publish traces to storage repo
+#        env:
+#          GITHUB_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
+#          GITHUB_RUN_ID: ${{ github.run_id }}
+#          GITHUB_RUN_NUMBER: ${{ github.run_number }}
+#        run: |
+#          python3 scripts/ci/publish_traces.py --traces-dir test/srt/performance_profiles_text_models

@@ -155,7 +155,43 @@ def run_unittest_files(files: List[TestFile], timeout_per_file: float):
 
 
 suites = {
-    "nightly": [],
+    "nightly-test-accuracy-text-models-tpu-v6e-1": [
+        TestFile(
+            "nightly-test/test_accuracy.py",
+            test_methods=["TestModelAccuracy.test_qwen_7b", "TestModelAccuracy.test_qwen3_8b"],
+        )
+    ],
+    "nightly-test-accuracy-text-models-tpu-v6e-4": [
+        TestFile(
+            "nightly-test/test_accuracy.py",
+            test_methods=[
+                "TestModelAccuracy.test_qwen_7b_tp_4",
+                "TestModelAccuracy.test_qwen3_8b_tp_4",
+            ],
+        )
+    ],
+    "nightly-test-perf-text-models-tpu-v6e-1": [
+        TestFile(
+            "nightly-test/test_pref.py",
+            test_methods=[
+                "TestModePerf.test_input_throughput_qwen_7b_con_8_1k_1",
+                "TestModePerf.test_output_throughput_qwen_7b_con_8_1k_1",
+                "TestModePerf.test_ttft_qwen_7b_con_8_1k_1",
+                "TestModePerf.test_itl_qwen_7b_con_8_1k_1",
+            ],
+        )
+    ],
+    "nightly-test-perf-text-models-tpu-v6e-4": [
+        TestFile(
+            "nightly-test/test_pref.py",
+            test_methods=[
+                "TestModePerf.test_input_throughput_qwen_7b_tp_4_con_8_1k_1",
+                "TestModePerf.test_output_throughput_qwen_7b_tp_4_con_8_1k_1",
+                "TestModePerf.test_ttft_qwen_7b_tp_4_con_8_1k_1",
+                "TestModePerf.test_itl_qwen_7b_tp_4_con_8_1k_1",
+            ],
+        )
+    ],
     "sglang_dependency_test": [],
     "unit-test-tpu-v6e-1": [
         TestFile("python/sgl_jax/test/test_flashattention.py", 20),
