@@ -1656,7 +1656,7 @@ if __name__ == "__main__":
         "--backend",
         type=str,
         choices=list(ASYNC_REQUEST_FUNCS.keys()),
-        default="sglang",
+        default="sgl-jax",
         help="Must specify a backend, depending on the LLM Inference Engine.",
     )
     parser.add_argument(
