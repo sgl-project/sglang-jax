@@ -233,7 +233,7 @@ class BgmvLoRABackend(BaseLoRABackend):
                     scalings_cpu, [0, num_to_pad], mode="constant", constant_values=0.0
                 )
                 padded_token_lora_indices_cpu = np.pad(
-                    token_lora_indices_cpu, [0, num_to_pad], mode="constant", constant_values=-1
+                    token_lora_indices_cpu, [0, num_to_pad], mode="constant", constant_values=0
                 )
                 padded_lora_ranks_cpu = np.pad(
                     lora_ranks_cpu, [0, num_to_pad], mode="constant", constant_values=0

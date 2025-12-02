@@ -14,9 +14,13 @@ limitations under the License.
 """
 
 import unittest
+from typing import List
 
 import jax.numpy as jnp
+from flax import nnx
 
+from sgl_jax.srt.entrypoints.engine import Engine
+from sgl_jax.srt.hf_transformers_utils import get_tokenizer
 from sgl_jax.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
