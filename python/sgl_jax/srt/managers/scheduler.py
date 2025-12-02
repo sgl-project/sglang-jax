@@ -1207,6 +1207,11 @@ class Scheduler(
                 # eagle's model_worker_batch will be modified and repadding within eagle_worker
                 skip_padding=True,
             )
+            model_worker_batch.speculative_eagle_topk = self.server_args.speculative_eagle_topk
+            model_worker_batch.speculative_num_draft_tokens = (
+                self.server_args.speculative_num_draft_tokens
+            )
+            model_worker_batch.speculative_num_steps = self.server_args.speculative_num_steps
             batch_output = self.draft_worker.forward_batch_speculative_generation(
                 model_worker_batch
             )
