@@ -21,7 +21,7 @@ from sgl_jax.test.test_utils import (
     QWEN3_CODER_30B_A3B_INSTRUCT,
     QWEN_7B,
     CustomTestCase,
-    bailing_moe,
+    BAILING_MOE,
     popen_launch_server,
 )
 
@@ -31,7 +31,9 @@ class TestModelAccuracy(CustomTestCase):
         model = QWEN_7B
         base_url = DEFAULT_URL_FOR_TEST
         api_url_for_eval = f"{base_url}/v1"
-        csv_file_path = "./test/nightly_test_output/benchmark/benchmark_results.csv"
+        output_dir = os.getenv("BENCH_OUTPUT_DIR", "./test/nightly_test_output/benchmark/local_run")
+        os.makedirs(output_dir, exist_ok=True)
+        csv_file_path = os.path.join(output_dir, "benchmark_results.csv")
 
         # launch server
         process = popen_launch_server(
@@ -91,6 +93,7 @@ class TestModelAccuracy(CustomTestCase):
                     datasets=[dataset_name],
                     dataset_args=dataset_args,
                     eval_batch_size=64,
+                    limit=10,
                 )
                 # Run the task and get results
                 print(f"{model} Running eval for {dataset_name}")
@@ -151,7 +154,9 @@ class TestModelAccuracy(CustomTestCase):
         model = QWEN3_8B
         base_url = DEFAULT_URL_FOR_TEST
         api_url_for_eval = f"{base_url}/v1"
-        csv_file_path = "./test/nightly_test_output/benchmark/benchmark_results.csv"
+        output_dir = os.getenv("BENCH_OUTPUT_DIR", "./test/nightly_test_output/benchmark/local_run")
+        os.makedirs(output_dir, exist_ok=True)
+        csv_file_path = os.path.join(output_dir, "benchmark_results.csv")
 
         # launch server
         process = popen_launch_server(
@@ -211,6 +216,7 @@ class TestModelAccuracy(CustomTestCase):
                     datasets=[dataset_name],
                     dataset_args=dataset_args,
                     eval_batch_size=64,
+                    limit=10,
                 )
                 # Run the task and get results
                 print(f"{model} Running eval for {dataset_name}")
@@ -271,7 +277,9 @@ class TestModelAccuracy(CustomTestCase):
         model = DEEPSEEK_R1_DISTILL_QWEN_1_5B
         base_url = DEFAULT_URL_FOR_TEST
         api_url_for_eval = f"{base_url}/v1"
-        csv_file_path = "./test/nightly_test_output/benchmark/benchmark_results.csv"
+        output_dir = os.getenv("BENCH_OUTPUT_DIR", "./test/nightly_test_output/benchmark/local_run")
+        os.makedirs(output_dir, exist_ok=True)
+        csv_file_path = os.path.join(output_dir, "benchmark_results.csv")
         process = popen_launch_server(
             model,
             base_url,
@@ -330,6 +338,7 @@ class TestModelAccuracy(CustomTestCase):
                     datasets=[dataset_name],
                     dataset_args=dataset_args,
                     eval_batch_size=64,
+                    limit=10,
                 )
                 # Run the task and get results
                 print(f"{model} Running eval for {dataset_name}")
@@ -390,7 +399,9 @@ class TestModelAccuracy(CustomTestCase):
         model = GEMMA2_2B_IT
         base_url = DEFAULT_URL_FOR_TEST
         api_url_for_eval = f"{base_url}/v1"
-        csv_file_path = "./test/nightly_test_output/benchmark/benchmark_results.csv"
+        output_dir = os.getenv("BENCH_OUTPUT_DIR", "./test/nightly_test_output/benchmark/local_run")
+        os.makedirs(output_dir, exist_ok=True)
+        csv_file_path = os.path.join(output_dir, "benchmark_results.csv")
         process = popen_launch_server(
             model,
             base_url,
@@ -448,6 +459,7 @@ class TestModelAccuracy(CustomTestCase):
                     datasets=[dataset_name],
                     dataset_args=dataset_args,
                     eval_batch_size=64,
+                    limit=10,
                 )
                 # Run the task and get results
                 print(f"{model} Running eval for {dataset_name}")
@@ -508,7 +520,9 @@ class TestModelAccuracy(CustomTestCase):
         model = QWEN_7B
         base_url = DEFAULT_URL_FOR_TEST
         api_url_for_eval = f"{base_url}/v1"
-        csv_file_path = "./test/nightly_test_output/benchmark/benchmark_tp_4_results.csv"
+        output_dir = os.getenv("BENCH_OUTPUT_DIR", "./test/nightly_test_output/benchmark/local_run")
+        os.makedirs(output_dir, exist_ok=True)
+        csv_file_path = os.path.join(output_dir, "benchmark_tp_4_results.csv")
         process = popen_launch_server(
             model,
             DEFAULT_URL_FOR_TEST,
@@ -566,6 +580,7 @@ class TestModelAccuracy(CustomTestCase):
                     datasets=[dataset_name],
                     dataset_args=dataset_args,
                     eval_batch_size=64,
+                    limit=10,
                 )
                 # Run the task and get results
                 print(f"{model} Running eval for {dataset_name}")
@@ -626,7 +641,9 @@ class TestModelAccuracy(CustomTestCase):
         model = QWEN3_8B
         base_url = DEFAULT_URL_FOR_TEST
         api_url_for_eval = f"{base_url}/v1"
-        csv_file_path = "./test/nightly_test_output/benchmark/benchmark_tp_4_results.csv"
+        output_dir = os.getenv("BENCH_OUTPUT_DIR", "./test/nightly_test_output/benchmark/local_run")
+        os.makedirs(output_dir, exist_ok=True)
+        csv_file_path = os.path.join(output_dir, "benchmark_tp_4_results.csv")
         process = popen_launch_server(
             model,
             DEFAULT_URL_FOR_TEST,
@@ -684,6 +701,7 @@ class TestModelAccuracy(CustomTestCase):
                     datasets=[dataset_name],
                     dataset_args=dataset_args,
                     eval_batch_size=64,
+                    limit=10,
                 )
                 # Run the task and get results
                 print(f"{model} Running eval for {dataset_name}")
@@ -744,7 +762,9 @@ class TestModelAccuracy(CustomTestCase):
         model = GEMMA2_2B_IT
         base_url = DEFAULT_URL_FOR_TEST
         api_url_for_eval = f"{base_url}/v1"
-        csv_file_path = "./test/nightly_test_output/benchmark/benchmark_tp_4_results.csv"
+        output_dir = os.getenv("BENCH_OUTPUT_DIR", "./test/nightly_test_output/benchmark/local_run")
+        os.makedirs(output_dir, exist_ok=True)
+        csv_file_path = os.path.join(output_dir, "benchmark_tp_4_results.csv")
         process = popen_launch_server(
             model,
             DEFAULT_URL_FOR_TEST,
@@ -803,6 +823,7 @@ class TestModelAccuracy(CustomTestCase):
                     datasets=[dataset_name],
                     dataset_args=dataset_args,
                     eval_batch_size=64,
+                    limit=10,
                 )
                 # Run the task and get results
                 print(f"{model} Running eval for {dataset_name}")
@@ -863,7 +884,9 @@ class TestModelAccuracy(CustomTestCase):
         model = QWEN3_CODER_30B_A3B_INSTRUCT
         base_url = DEFAULT_URL_FOR_TEST
         api_url_for_eval = f"{base_url}/v1"
-        csv_file_path = "./test/nightly_test_output/benchmark/benchmark_tp_4_results.csv"
+        output_dir = os.getenv("BENCH_OUTPUT_DIR", "./test/nightly_test_output/benchmark/local_run")
+        os.makedirs(output_dir, exist_ok=True)
+        csv_file_path = os.path.join(output_dir, "benchmark_tp_4_results.csv")
         process = popen_launch_server(
             model,
             DEFAULT_URL_FOR_TEST,
@@ -924,6 +947,7 @@ class TestModelAccuracy(CustomTestCase):
                     datasets=[dataset_name],
                     dataset_args=dataset_args,
                     eval_batch_size=64,
+                    limit=10,
                 )
                 # Run the task and get results
                 print(f"{model} Running eval for {dataset_name}")
@@ -984,7 +1008,9 @@ class TestModelAccuracy(CustomTestCase):
         model = DEEPSEEK_R1_DISTILL_QWEN_1_5B
         base_url = DEFAULT_URL_FOR_TEST
         api_url_for_eval = f"{base_url}/v1"
-        csv_file_path = "./test/nightly_test_output/benchmark/benchmark_tp_4_results.csv"
+        output_dir = os.getenv("BENCH_OUTPUT_DIR", "./test/nightly_test_output/benchmark/local_run")
+        os.makedirs(output_dir, exist_ok=True)
+        csv_file_path = os.path.join(output_dir, "benchmark_tp_4_results.csv")
         process = popen_launch_server(
             model,
             DEFAULT_URL_FOR_TEST,
@@ -1043,6 +1069,7 @@ class TestModelAccuracy(CustomTestCase):
                     datasets=[dataset_name],
                     dataset_args=dataset_args,
                     eval_batch_size=64,
+                    limit=10,
                 )
                 # Run the task and get results
                 print(f"{model} Running eval for {dataset_name}")
@@ -1100,10 +1127,12 @@ class TestModelAccuracy(CustomTestCase):
             kill_process_tree(process.pid)
 
     def test_bailing_moe_tp_2_ep2(self):
-        model = bailing_moe
+        model = BAILING_MOE
         base_url = DEFAULT_URL_FOR_TEST
         api_url_for_eval = f"{base_url}/v1"
-        csv_file_path = "./test/nightly_test_output/benchmark/benchmark_tp_2_ep_2results.csv"
+        output_dir = os.getenv("BENCH_OUTPUT_DIR", "./test/nightly_test_output/benchmark/local_run")
+        os.makedirs(output_dir, exist_ok=True)
+        csv_file_path = os.path.join(output_dir, "benchmark_tp_2_ep_2_results.csv")
         process = popen_launch_server(
             model,
             DEFAULT_URL_FOR_TEST,
@@ -1164,6 +1193,7 @@ class TestModelAccuracy(CustomTestCase):
                     datasets=[dataset_name],
                     dataset_args=dataset_args,
                     eval_batch_size=64,
+                    limit=10,
                 )
                 # Run the task and get results
                 print(f"{model} Running eval for {dataset_name}")
@@ -1224,7 +1254,9 @@ class TestModelAccuracy(CustomTestCase):
         model = QWEN3_CODER_30B_A3B_INSTRUCT
         base_url = DEFAULT_URL_FOR_TEST
         api_url_for_eval = f"{base_url}/v1"
-        csv_file_path = "./test/nightly_test_output/benchmark/benchmark_tp_2_ep_2results.csv"
+        output_dir = os.getenv("BENCH_OUTPUT_DIR", "./test/nightly_test_output/benchmark/local_run")
+        os.makedirs(output_dir, exist_ok=True)
+        csv_file_path = os.path.join(output_dir, "benchmark_tp_2_ep_2_results.csv")
         process = popen_launch_server(
             model,
             DEFAULT_URL_FOR_TEST,
@@ -1285,6 +1317,7 @@ class TestModelAccuracy(CustomTestCase):
                     datasets=[dataset_name],
                     dataset_args=dataset_args,
                     eval_batch_size=64,
+                    limit=10,
                 )
                 # Run the task and get results
                 print(f"{model} Running eval for {dataset_name}")

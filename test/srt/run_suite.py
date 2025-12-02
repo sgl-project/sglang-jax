@@ -158,17 +158,17 @@ suites = {
     "nightly-test-accuracy-text-models-tpu-v6e-1": [
         TestFile(
             "nightly-test/test_accuracy.py",
-            estimated_time=7,
+            estimated_time=300,
             test_methods=["TestModelAccuracy.test_qwen_7b"],
         ),
         TestFile(
             "nightly-test/test_accuracy.py",
-            estimated_time=8,
+            estimated_time=312,
             test_methods=["TestModelAccuracy.test_qwen3_8b"],
         ),
         TestFile(
             "nightly-test/test_accuracy.py",
-            estimated_time=1.5,
+            estimated_time=171,
             test_methods=["TestModelAccuracy.test_DEEPSEEK_R1_DISTILL_QWEN_1_5B"],
         ),
         TestFile(
@@ -180,27 +180,27 @@ suites = {
     "nightly-test-accuracy-text-models-tpu-v6e-4": [
         TestFile(
             "nightly-test/test_accuracy.py",
-            estimated_time=7,
+            estimated_time=53,
             test_methods=["TestModelAccuracy.test_qwen_7b_tp_4"],
         ),
         TestFile(
             "nightly-test/test_accuracy.py",
-            estimated_time=8,
+            estimated_time=64,
             test_methods=["TestModelAccuracy.test_qwen3_8b_tp_4"],
         ),
         TestFile(
             "nightly-test/test_accuracy.py",
-            estimated_time=25,
+            estimated_time=50,
             test_methods=["TestModelAccuracy.test_bailing_moe_tp_2_ep2"],
         ),
         TestFile(
             "nightly-test/test_accuracy.py",
-            estimated_time=1.5,
+            estimated_time=90,
             test_methods=["TestModelAccuracy.test_DEEPSEEK_R1_DISTILL_QWEN_1_5B_tp_4"],
         ),
         TestFile(
             "nightly-test/test_accuracy.py",
-            estimated_time=30,
+            estimated_time=62,
             test_methods=["TestModelAccuracy.test_QWEN3_CODER_30B_A3B_INSTRUCT_tp_2_ep_2"],
         ),
         TestFile(

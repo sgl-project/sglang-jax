@@ -40,6 +40,9 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
       - name: Run eval test for text models
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_HUB_DOWNLOAD_TIMEOUT: ${{ vars.HF_HUB_DOWNLOAD_TIMEOUT }}
         timeout-minutes: 1200
         run: |
           python3.12 -m venv .venv
@@ -47,9 +50,11 @@ jobs:
           pip install uv
           uv pip install -e "python[all]"
           uv pip install evalscope==0.17.1
-
-          mkdir -p ./test/nightly_test_output/benchmark
-          mkdir -p ./test/nightly_test_output/pref
+            
+          export OUTPUT_DIR_NAME=$(date +'%Y-%m-%d')
+          export BENCH_OUTPUT_DIR=./test/nightly_test_output/bench/$OUTPUT_DIR_NAME
+          echo "BENCH_OUTPUT_DIR=$BENCH_OUTPUT_DIR" >> $GITHUB_ENV
+          mkdir -p $BENCH_OUTPUT_DIR
 
           bash scripts/killall_sglang.sh
           cd test/srt
@@ -75,6 +80,9 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
       - name: Run eval test for text models
+        env:
+            HF_TOKEN: ${{ secrets.HF_TOKEN }}
+            HF_HUB_DOWNLOAD_TIMEOUT: ${{ vars.HF_HUB_DOWNLOAD_TIMEOUT }}
         timeout-minutes: 1200
         run: |
           python3.12 -m venv .venv
@@ -84,8 +92,10 @@ jobs:
           uv pip install evalscope==0.17.1
 
 
-          mkdir -p ./test/nightly_test_output/benchmark
-          mkdir -p ./test/nightly_test_output/pref
+          export OUTPUT_DIR_NAME=$(date +'%Y-%m-%d')
+          export BENCH_OUTPUT_DIR=./test/nightly_test_output/bench/$OUTPUT_DIR_NAME
+          echo "BENCH_OUTPUT_DIR=$BENCH_OUTPUT_DIR" >> $GITHUB_ENV
+          mkdir -p $BENCH_OUTPUT_DIR
 
 
           bash scripts/killall_sglang.sh
@@ -99,6 +109,7 @@ jobs:
         run: |
           python3 scripts/ci/public_bench_and_pref.py --source-dir test/nightly_test_output
 
+
   nightly-test-perf-text-models-1-tpu:
     if: github.repository == 'sgl-project/sglang-jax'
     runs-on: arc-runner-v6e-1
@@ -111,14 +122,19 @@ jobs:
         env:
           TRACE_BASE_URL: https://raw.githubusercontent.com/sglang-bot/sglang-ci-data/main/traces/${{ github.run_id }}
           PERFETTO_RELAY_URL: ${{ vars.PERFETTO_RELAY_URL }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_HUB_DOWNLOAD_TIMEOUT: ${{ vars.HF_HUB_DOWNLOAD_TIMEOUT }}
         run: |
           python3.12 -m venv .venv
           source .venv/bin/activate
           pip install uv
           uv pip install -e "python[all]"
+          
+          export OUTPUT_DIR_NAME=$(date +'%Y-%m-%d')
+          export PERF_OUTPUT_DIR=./test/nightly_test_output/pref/$OUTPUT_DIR_NAME
+          echo "PERF_OUTPUT_DIR=$PERF_OUTPUT_DIR" >> $GITHUB_ENV
+          mkdir -p $PERF_OUTPUT_DIR
 
-          mkdir -p ./test/nightly_test_output/benchmark
-          mkdir -p ./test/nightly_test_output/pref
 
 
           bash scripts/killall_sglang.sh
@@ -148,14 +164,18 @@ jobs:
         env:
           TRACE_BASE_URL: https://raw.githubusercontent.com/sglang-bot/sglang-ci-data/main/traces/${{ github.run_id }}
           PERFETTO_RELAY_URL: ${{ vars.PERFETTO_RELAY_URL }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_HUB_DOWNLOAD_TIMEOUT: ${{ vars.HF_HUB_DOWNLOAD_TIMEOUT }}
         run: |
           python3.12 -m venv .venv
           source .venv/bin/activate
           pip install uv
           uv pip install -e "python[all]"
 
-          mkdir -p ./test/nightly_test_output/benchmark
-          mkdir -p ./test/nightly_test_output/pref
+          export OUTPUT_DIR_NAME=$(date +'%Y-%m-%d')
+          export PERF_OUTPUT_DIR=./test/nightly_test_output/pref/$OUTPUT_DIR_NAME
+          echo "PERF_OUTPUT_DIR=$PERF_OUTPUT_DIR" >> $GITHUB_ENV
+          mkdir -p $PERF_OUTPUT_DIR
 
 
           bash scripts/killall_sglang.sh
