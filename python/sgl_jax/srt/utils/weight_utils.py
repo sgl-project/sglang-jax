@@ -31,6 +31,9 @@ class WeightMapping:
     kv_head_padding: bool = False
     concat_axis: int | None = None
     is_eagle3: bool = False
+    # MoE weight fusion configuration
+    fuse_moe_weights: bool = False
+    fuse_gate_up: tuple[str, str] | None = None
 
     def __post_init__(self):
         if self.sharding is None:
@@ -724,6 +727,102 @@ class WeightLoader:
 
         nnx.update(self.model, params)
         logger.info("All weights loaded successfully.")
+
+    def _process_fused_moe_group(
+        self,
+        params: nnx.State,
+        moe_key: str,
+        mapping: WeightMapping,
+        grouped_weights: dict[str, dict[str, list[jax.Array]]],
+    ):
+        """
+        Process fused MoE weight groups (gate + up weights).
+
+        Args:
+            params: Model parameter state
+            moe_key: MoE weight key (e.g., "__MOE_EXPERTS__model.layers.0.block_sparse_moe.experts.w1")
+            mapping: Weight mapping configuration
+            grouped_weights: Grouped weights dict
+                {
+                    "gate": {hf_key: [weight_shard1, weight_shard2, ...]},
+                    "up": {hf_key: [weight_shard1, weight_shard2, ...]}
+                }
+        """
+        target_path = mapping.target_path[0]
+
+        # Step 1: Process gate and up weights separately
+        gate_weights = []
+        up_weights = []
+
+        # Process gate weights (w1)
+        for hf_key in sorted(grouped_weights["gate"].keys()):
+            weights = grouped_weights["gate"][hf_key]
+
+            # Concatenate TP shards
+            if mapping.concat_axis is not None and len(weights) > 1:
+                weight = jnp.concatenate(weights, axis=mapping.concat_axis)
+            else:
+                weight = weights[0]
+
+            # Transpose
+            if mapping.transpose:
+                weight = jnp.transpose(weight, (1, 0))
+
+            gate_weights.append(weight)
+
+        # Process up weights (w3)
+        for hf_key in sorted(grouped_weights["up"].keys()):
+            weights = grouped_weights["up"][hf_key]
+
+            # Concatenate TP shards
+            if mapping.concat_axis is not None and len(weights) > 1:
+                weight = jnp.concatenate(weights, axis=mapping.concat_axis)
+            else:
+                weight = weights[0]
+
+            # Transpose
+            if mapping.transpose:
+                weight = jnp.transpose(weight, (1, 0))
+
+            up_weights.append(weight)
+
+        # Step 2: Stack to 3D tensors
+        # gate_stacked: (num_experts, hidden_size, intermediate_size)
+        # up_stacked: (num_experts, hidden_size, intermediate_size)
+        gate_stacked = jnp.stack(gate_weights, axis=0)
+        up_stacked = jnp.stack(up_weights, axis=0)
+
+        # Step 3: Fuse to 4D tensor
+        # fused_weight: (num_experts, 2, hidden_size, intermediate_size)
+        fused_weight = jnp.stack([gate_stacked, up_stacked], axis=1)
+
+        logger.info(
+            "Fused MoE weights: gate shape=%s, up shape=%s, fused shape=%s",
+            gate_stacked.shape,
+            up_stacked.shape,
+            fused_weight.shape,
+        )
+
+        # Step 4: Apply sharding
+        if "expert" in mapping.sharding:
+            ep_size = getattr(self.model_config.hf_config, "ep_size", 1)
+            world_size = self.mesh.shape.get("data", 1) * self.mesh.shape.get("tensor", 1)
+            tp_size = world_size // ep_size
+
+            devices = self.mesh.devices.flatten()
+            moe_mesh = jax.sharding.Mesh(
+                devices.reshape(ep_size, tp_size), axis_names=("expert", "tensor")
+            )
+
+            sharded_weight = self._shard_weight(fused_weight, mapping.sharding, mesh=moe_mesh)
+        else:
+            sharded_weight = self._shard_weight(fused_weight, mapping.sharding)
+
+        # Step 5: Assign to model parameter
+        model_param = self._get_param(params, target_path)
+        model_param.value = sharded_weight.astype(model_param.value.dtype)
+
+        logger.debug("Assigned fused MoE group %s, final shape: %s", moe_key, fused_weight.shape)
 
     def _load_dummy_weights(
         self,
