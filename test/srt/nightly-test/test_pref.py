@@ -7,7 +7,7 @@ from random import random, uniform
 
 import requests
 
-from sgl_jax.bench_serving import run_benchmark
+from sgl_jax.bench_serving import SHAREGPT_URL, download_and_cache_file, run_benchmark
 from sgl_jax.test.test_utils import (
     BAILING_MOE,
     DEEPSEEK_R1_DISTILL_QWEN_1_5B,
@@ -43,6 +43,10 @@ class TestModePerf(CustomTestCase):
         input_lengths = [1024]
 
         output_lengths = [1, 1024]
+
+        print("Downloading the ShareGPT dataset once before starting tests...")
+        sharegpt_dataset_path = download_and_cache_file(SHAREGPT_URL)
+        print(f"Dataset downloaded to: {sharegpt_dataset_path}")
 
         # launch server
         process = popen_launch_server(
@@ -104,12 +108,12 @@ class TestModePerf(CustomTestCase):
                             port=int(base_url.split(":")[-1]),
                             model=model,
                             tokenizer=model,
-                            dataset_name="random",
+                            dataset_name="sharegpt",
                             random_range_ratio=1.0,
                             request_rate=float("inf"),
                             warmup_requests=1,
                             flush_cache=True,
-                            dataset_path="",
+                            dataset_path=sharegpt_dataset_path,
                             output_file=None,
                             output_details=False,
                             disable_tqdm=False,
@@ -203,6 +207,10 @@ class TestModePerf(CustomTestCase):
 
         output_lengths = [1, 1024]
 
+        print("Downloading the ShareGPT dataset once before starting tests...")
+        sharegpt_dataset_path = download_and_cache_file(SHAREGPT_URL)
+        print(f"Dataset downloaded to: {sharegpt_dataset_path}")
+
         # launch server
         process = popen_launch_server(
             model,
@@ -263,12 +271,12 @@ class TestModePerf(CustomTestCase):
                             port=int(base_url.split(":")[-1]),
                             model=model,
                             tokenizer=model,
-                            dataset_name="random",
+                            dataset_name="sharegpt",
                             random_range_ratio=1.0,
                             request_rate=float("inf"),
                             warmup_requests=1,
                             flush_cache=True,
-                            dataset_path="",
+                            dataset_path=sharegpt_dataset_path,
                             output_file=None,
                             output_details=False,
                             disable_tqdm=False,
@@ -323,7 +331,7 @@ class TestModePerf(CustomTestCase):
 
             output_dir = os.getenv("PREF_OUTPUT_DIR", "./test/nightly_test_output/pref/local_run")
             os.makedirs(output_dir, exist_ok=True)
-            output_filename = os.path.join(output_dir, "performance_results.csv")
+            output_filename = os.path.join(output_dir, "performance_results_tp_4.csv")
             file_exists = os.path.exists(output_filename)
             with open(output_filename, "a", newline="", encoding="utf-8") as csvfile:
 
@@ -361,6 +369,10 @@ class TestModePerf(CustomTestCase):
         input_lengths = [1024]
 
         output_lengths = [1, 1024]
+
+        print("Downloading the ShareGPT dataset once before starting tests...")
+        sharegpt_dataset_path = download_and_cache_file(SHAREGPT_URL)
+        print(f"Dataset downloaded to: {sharegpt_dataset_path}")
 
         # launch server
         process = popen_launch_server(
@@ -422,12 +434,12 @@ class TestModePerf(CustomTestCase):
                             port=int(base_url.split(":")[-1]),
                             model=model,
                             tokenizer=model,
-                            dataset_name="random",
+                            dataset_name="sharegpt",
                             random_range_ratio=1.0,
                             request_rate=float("inf"),
                             warmup_requests=1,
                             flush_cache=True,
-                            dataset_path="",
+                            dataset_path=sharegpt_dataset_path,
                             output_file=None,
                             output_details=False,
                             disable_tqdm=False,
@@ -521,6 +533,10 @@ class TestModePerf(CustomTestCase):
 
         output_lengths = [1, 1024]
 
+        print("Downloading the ShareGPT dataset once before starting tests...")
+        sharegpt_dataset_path = download_and_cache_file(SHAREGPT_URL)
+        print(f"Dataset downloaded to: {sharegpt_dataset_path}")
+
         # launch server
         process = popen_launch_server(
             model,
@@ -581,12 +597,12 @@ class TestModePerf(CustomTestCase):
                             port=int(base_url.split(":")[-1]),
                             model=model,
                             tokenizer=model,
-                            dataset_name="random",
+                            dataset_name="sharegpt",
                             random_range_ratio=1.0,
                             request_rate=float("inf"),
                             warmup_requests=1,
                             flush_cache=True,
-                            dataset_path="",
+                            dataset_path=sharegpt_dataset_path,
                             output_file=None,
                             output_details=False,
                             disable_tqdm=False,
@@ -641,7 +657,7 @@ class TestModePerf(CustomTestCase):
 
             output_dir = os.getenv("PREF_OUTPUT_DIR", "./test/nightly_test_output/pref/local_run")
             os.makedirs(output_dir, exist_ok=True)
-            output_filename = os.path.join(output_dir, "performance_results.csv")
+            output_filename = os.path.join(output_dir, "performance_results_tp_4.csv")
             file_exists = os.path.exists(output_filename)
             with open(output_filename, "a", newline="", encoding="utf-8") as csvfile:
 
@@ -679,6 +695,10 @@ class TestModePerf(CustomTestCase):
         input_lengths = [1024]
 
         output_lengths = [1, 1024]
+
+        print("Downloading the ShareGPT dataset once before starting tests...")
+        sharegpt_dataset_path = download_and_cache_file(SHAREGPT_URL)
+        print(f"Dataset downloaded to: {sharegpt_dataset_path}")
 
         # launch server
         process = popen_launch_server(
@@ -742,12 +762,12 @@ class TestModePerf(CustomTestCase):
                             port=int(base_url.split(":")[-1]),
                             model=model,
                             tokenizer=model,
-                            dataset_name="random",
+                            dataset_name="sharegpt",
                             random_range_ratio=1.0,
                             request_rate=float("inf"),
                             warmup_requests=1,
                             flush_cache=True,
-                            dataset_path="",
+                            dataset_path=sharegpt_dataset_path,
                             output_file=None,
                             output_details=False,
                             disable_tqdm=False,
@@ -802,7 +822,7 @@ class TestModePerf(CustomTestCase):
 
             output_dir = os.getenv("PREF_OUTPUT_DIR", "./test/nightly_test_output/pref/local_run")
             os.makedirs(output_dir, exist_ok=True)
-            output_filename = os.path.join(output_dir, "performance_results.csv")
+            output_filename = os.path.join(output_dir, "performance_results_tp_2_ep_2.csv")
             file_exists = os.path.exists(output_filename)
             with open(output_filename, "a", newline="", encoding="utf-8") as csvfile:
 
@@ -839,6 +859,10 @@ class TestModePerf(CustomTestCase):
         input_lengths = [1024]
 
         output_lengths = [1, 1024]
+
+        print("Downloading the ShareGPT dataset once before starting tests...")
+        sharegpt_dataset_path = download_and_cache_file(SHAREGPT_URL)
+        print(f"Dataset downloaded to: {sharegpt_dataset_path}")
 
         # launch server
         process = popen_launch_server(
@@ -901,12 +925,12 @@ class TestModePerf(CustomTestCase):
                             port=int(base_url.split(":")[-1]),
                             model=model,
                             tokenizer=model,
-                            dataset_name="random",
+                            dataset_name="sharegpt",
                             random_range_ratio=1.0,
                             request_rate=float("inf"),
                             warmup_requests=1,
                             flush_cache=True,
-                            dataset_path="",
+                            dataset_path=sharegpt_dataset_path,
                             output_file=None,
                             output_details=False,
                             disable_tqdm=False,
@@ -1000,6 +1024,10 @@ class TestModePerf(CustomTestCase):
 
         output_lengths = [1, 1024]
 
+        print("Downloading the ShareGPT dataset once before starting tests...")
+        sharegpt_dataset_path = download_and_cache_file(SHAREGPT_URL)
+        print(f"Dataset downloaded to: {sharegpt_dataset_path}")
+
         # launch server
         process = popen_launch_server(
             model,
@@ -1061,12 +1089,12 @@ class TestModePerf(CustomTestCase):
                             port=int(base_url.split(":")[-1]),
                             model=model,
                             tokenizer=model,
-                            dataset_name="random",
+                            dataset_name="sharegpt",
                             random_range_ratio=1.0,
                             request_rate=float("inf"),
                             warmup_requests=1,
                             flush_cache=True,
-                            dataset_path="",
+                            dataset_path=sharegpt_dataset_path,
                             output_file=None,
                             output_details=False,
                             disable_tqdm=False,
@@ -1121,7 +1149,7 @@ class TestModePerf(CustomTestCase):
 
             output_dir = os.getenv("PREF_OUTPUT_DIR", "./test/nightly_test_output/pref/local_run")
             os.makedirs(output_dir, exist_ok=True)
-            output_filename = os.path.join(output_dir, "performance_results.csv")
+            output_filename = os.path.join(output_dir, "performance_results_tp_4.csv")
             file_exists = os.path.exists(output_filename)
             with open(output_filename, "a", newline="", encoding="utf-8") as csvfile:
 
@@ -1159,6 +1187,10 @@ class TestModePerf(CustomTestCase):
         input_lengths = [1024]
 
         output_lengths = [1, 1024]
+
+        print("Downloading the ShareGPT dataset once before starting tests...")
+        sharegpt_dataset_path = download_and_cache_file(SHAREGPT_URL)
+        print(f"Dataset downloaded to: {sharegpt_dataset_path}")
 
         # launch server
         process = popen_launch_server(
@@ -1222,12 +1254,12 @@ class TestModePerf(CustomTestCase):
                             port=int(base_url.split(":")[-1]),
                             model=model,
                             tokenizer=model,
-                            dataset_name="random",
+                            dataset_name="sharegpt",
                             random_range_ratio=1.0,
                             request_rate=float("inf"),
                             warmup_requests=1,
                             flush_cache=True,
-                            dataset_path="",
+                            dataset_path=sharegpt_dataset_path,
                             output_file=None,
                             output_details=False,
                             disable_tqdm=False,
@@ -1282,7 +1314,7 @@ class TestModePerf(CustomTestCase):
 
             output_dir = os.getenv("PREF_OUTPUT_DIR", "./test/nightly_test_output/pref/local_run")
             os.makedirs(output_dir, exist_ok=True)
-            output_filename = os.path.join(output_dir, "performance_results.csv")
+            output_filename = os.path.join(output_dir, "performance_results_tp_2_ep_2.csv")
             file_exists = os.path.exists(output_filename)
             with open(output_filename, "a", newline="", encoding="utf-8") as csvfile:
 
@@ -1308,6 +1340,10 @@ class TestModePerf(CustomTestCase):
         input_lengths = [1024]
 
         output_lengths = [1, 1024]
+
+        print("Downloading the ShareGPT dataset once before starting tests...")
+        sharegpt_dataset_path = download_and_cache_file(SHAREGPT_URL)
+        print(f"Dataset downloaded to: {sharegpt_dataset_path}")
 
         # launch server
         process = popen_launch_server(
@@ -1369,12 +1405,12 @@ class TestModePerf(CustomTestCase):
                             port=int(base_url.split(":")[-1]),
                             model=model,
                             tokenizer=model,
-                            dataset_name="random",
+                            dataset_name="sharegpt",
                             random_range_ratio=1.0,
                             request_rate=float("inf"),
                             warmup_requests=1,
                             flush_cache=True,
-                            dataset_path="",
+                            dataset_path=sharegpt_dataset_path,
                             output_file=None,
                             output_details=False,
                             disable_tqdm=False,
@@ -1457,6 +1493,10 @@ class TestModePerf(CustomTestCase):
 
         output_lengths = [1, 1024]
 
+        print("Downloading the ShareGPT dataset once before starting tests...")
+        sharegpt_dataset_path = download_and_cache_file(SHAREGPT_URL)
+        print(f"Dataset downloaded to: {sharegpt_dataset_path}")
+
         # launch server
         process = popen_launch_server(
             model,
@@ -1517,12 +1557,12 @@ class TestModePerf(CustomTestCase):
                             port=int(base_url.split(":")[-1]),
                             model=model,
                             tokenizer=model,
-                            dataset_name="random",
+                            dataset_name="sharegpt",
                             random_range_ratio=1.0,
                             request_rate=float("inf"),
                             warmup_requests=1,
                             flush_cache=True,
-                            dataset_path="",
+                            dataset_path=sharegpt_dataset_path,
                             output_file=None,
                             output_details=False,
                             disable_tqdm=False,
@@ -1577,7 +1617,7 @@ class TestModePerf(CustomTestCase):
 
             output_dir = os.getenv("PREF_OUTPUT_DIR", "./test/nightly_test_output/pref/local_run")
             os.makedirs(output_dir, exist_ok=True)
-            output_filename = os.path.join(output_dir, "performance_results.csv")
+            output_filename = os.path.join(output_dir, "performance_results_tp_4.csv")
             file_exists = os.path.exists(output_filename)
             with open(output_filename, "a", newline="", encoding="utf-8") as csvfile:
 
