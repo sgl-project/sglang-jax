@@ -79,8 +79,8 @@ repos:
       - id: mypy
         additional_dependencies: [
           # package list reference: python/sgl_jax/check_env.py, python/pyproject.toml
-          # sglang-jax,
-          # jax,
+          jax,
+          flax
           # jaxlib,
           # triton,
           # transformers,
@@ -99,7 +99,6 @@ repos:
           # uvloop,
           # openai,
           # tiktoken,
-          flax
         ]
         args: ["--config", "python/pyproject.toml"]
         pass_filenames: false

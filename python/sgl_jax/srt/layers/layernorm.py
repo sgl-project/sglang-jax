@@ -229,8 +229,8 @@ def rmsnorm_forward(x, residual, weight, epsilon) -> jax.Array | tuple[jax.Array
 def dual_rmsnorm_forward(
     x: jax.Array,
     residual: jax.Array,
-    weight1: jax.Array,
-    weight2: jax.Array,
+    weight1: nnx.Param[jax.Array],
+    weight2: nnx.Param[jax.Array],
     epsilon: float,
 ) -> tuple[jax.Array, jax.Array]:
     """Apply two RMSNorms with shared residual path, returning (y2, residual).

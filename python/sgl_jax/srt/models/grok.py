@@ -565,12 +565,14 @@ class Grok1DecoderLayer(nnx.Module):
         # Self Attention block (matching PyTorch logic exactly)
         if deferred_norm is not None:
             assert residual is not None
+            assert deferred_norm.scale is not None
+            assert self.pre_attn_norm.scale is not None
             # Apply deferred norm from previous layer and pre-attention norm
             hidden_states, residual = dual_rmsnorm_forward(
                 hidden_states,
                 residual,
-                cast(jax.Array, deferred_norm.scale),
-                cast(jax.Array, self.pre_attn_norm.scale),
+                deferred_norm.scale,
+                self.pre_attn_norm.scale,
                 deferred_norm.epsilon,
             )
         else:
@@ -586,11 +588,13 @@ class Grok1DecoderLayer(nnx.Module):
         )
 
         # # Apply post-attention norm and pre-MoE norm (matching PyTorch fused_dual_residual_rmsnorm)
+        assert self.post_attn_norm.scale is not None
+        assert self.pre_moe_norm.scale is not None
         hidden_states, residual = dual_rmsnorm_forward(
             hidden_states,
             residual,
-            cast(jax.Array, self.post_attn_norm.scale),
-            cast(jax.Array, self.pre_moe_norm.scale),
+            self.post_attn_norm.scale,
+            self.pre_moe_norm.scale,
             self.post_attn_norm.epsilon,
         )
 
@@ -676,11 +680,13 @@ class Grok1Model(nnx.Module):
         # Apply final normalization (matching PyTorch fused_dual_residual_rmsnorm)
         assert deferred_norm is not None
         assert residual is not None
+        assert deferred_norm.scale is not None
+        assert self.norm.scale is not None
         hidden_states, _ = dual_rmsnorm_forward(
             hidden_states,
             residual,
-            cast(jax.Array, deferred_norm.scale),
-            cast(jax.Array, self.norm.scale),
+            deferred_norm.scale,
+            self.norm.scale,
             deferred_norm.epsilon,
         )
 
