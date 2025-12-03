@@ -52,7 +52,7 @@ jobs:
           uv pip install evalscope==0.17.1
 
           export OUTPUT_DIR_NAME=$(date +'%Y-%m-%d')
-          export BENCH_OUTPUT_DIR=./test/nightly_test_output/bench/$OUTPUT_DIR_NAME
+          export BENCH_OUTPUT_DIR="$GITHUB_WORKSPACE/test/nightly_test_output/bench/$OUTPUT_DIR_NAME"
           echo "BENCH_OUTPUT_DIR=$BENCH_OUTPUT_DIR" >> $GITHUB_ENV
           mkdir -p $BENCH_OUTPUT_DIR
 
@@ -93,10 +93,9 @@ jobs:
 
 
           export OUTPUT_DIR_NAME=$(date +'%Y-%m-%d')
-          export BENCH_OUTPUT_DIR=./test/nightly_test_output/bench/$OUTPUT_DIR_NAME
+          export BENCH_OUTPUT_DIR="$GITHUB_WORKSPACE/test/nightly_test_output/bench/$OUTPUT_DIR_NAME"
           echo "BENCH_OUTPUT_DIR=$BENCH_OUTPUT_DIR" >> $GITHUB_ENV
           mkdir -p $BENCH_OUTPUT_DIR
-
 
           bash scripts/killall_sglang.sh
           cd test/srt
@@ -131,9 +130,9 @@ jobs:
           uv pip install -e "python[all]"
 
           export OUTPUT_DIR_NAME=$(date +'%Y-%m-%d')
-          export PERF_OUTPUT_DIR=./test/nightly_test_output/pref/$OUTPUT_DIR_NAME
-          echo "PERF_OUTPUT_DIR=$PERF_OUTPUT_DIR" >> $GITHUB_ENV
-          mkdir -p $PERF_OUTPUT_DIR
+          export PREF_OUTPUT_DIR="$GITHUB_WORKSPACE/test/nightly_test_output/pref/$OUTPUT_DIR_NAME"
+          echo "PREF_OUTPUT_DIR=$PREF_OUTPUT_DIR" >> $GITHUB_ENV
+          mkdir -p $PREF_OUTPUT_DIR
 
 
 
@@ -173,9 +172,10 @@ jobs:
           uv pip install -e "python[all]"
 
           export OUTPUT_DIR_NAME=$(date +'%Y-%m-%d')
-          export PERF_OUTPUT_DIR=./test/nightly_test_output/pref/$OUTPUT_DIR_NAME
-          echo "PERF_OUTPUT_DIR=$PERF_OUTPUT_DIR" >> $GITHUB_ENV
-          mkdir -p $PERF_OUTPUT_DIR
+          export PREF_OUTPUT_DIR="$GITHUB_WORKSPACE/test/nightly_test_output/pref/$OUTPUT_DIR_NAME"
+          echo "PREF_OUTPUT_DIR=$PREF_OUTPUT_DIR" >> $GITHUB_ENV
+          mkdir -p $PREF_OUTPUT_DIR
+
 
 
           bash scripts/killall_sglang.sh

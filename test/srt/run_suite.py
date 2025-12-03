@@ -173,7 +173,7 @@ suites = {
         ),
         TestFile(
             "nightly-test/test_accuracy.py",
-            estimated_time=2,
+            estimated_time=200,
             test_methods=["TestModelAccuracy.test_GEMMA2_2B_IT"],
         ),
     ],
