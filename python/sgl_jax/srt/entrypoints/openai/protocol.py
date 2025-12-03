@@ -165,6 +165,7 @@ class CompletionRequest(BaseModel):
     ignore_eos: bool = False
     skip_special_tokens: bool = True
     lora_path: list[str | None] | str | None | None = None
+    extra_key: str | None = None
     session_params: dict | None = None
 
     # For PD disaggregation
@@ -424,6 +425,7 @@ class ChatCompletionRequest(BaseModel):
     continue_final_message: bool = False
     skip_special_tokens: bool = True
     lora_path: list[str | None] | str | None | None = None
+    extra_key: str | None = None
     session_params: dict | None = None
     separate_reasoning: bool = True
     stream_reasoning: bool = True
