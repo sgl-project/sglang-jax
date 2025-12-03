@@ -29,6 +29,18 @@ from sgl_jax.test.test_utils import (
 
 
 class TestModePerf(CustomTestCase):
+    sharegpt_dataset_path = None
+
+    @classmethod
+    def setUpClass(cls):
+        print("\n" + "=" * 80)
+        print("Setting up TestModePerf: Downloading the ShareGPT dataset once for all tests...")
+
+        cls.sharegpt_dataset_path = download_and_cache_file(SHAREGPT_URL)
+
+        print(f"Dataset is ready at location: {cls.sharegpt_dataset_path}")
+        print("=" * 80 + "\n")
+
     def test_qwen_7b_performance_tp_1(self):
         model = QWEN_7B
         base_url = DEFAULT_URL_FOR_TEST
@@ -43,10 +55,6 @@ class TestModePerf(CustomTestCase):
         input_lengths = [1024]
 
         output_lengths = [1, 1024]
-
-        print("Downloading the ShareGPT dataset once before starting tests...")
-        sharegpt_dataset_path = download_and_cache_file(SHAREGPT_URL)
-        print(f"Dataset downloaded to: {sharegpt_dataset_path}")
 
         # launch server
         process = popen_launch_server(
@@ -113,7 +121,7 @@ class TestModePerf(CustomTestCase):
                             request_rate=float("inf"),
                             warmup_requests=1,
                             flush_cache=True,
-                            dataset_path=sharegpt_dataset_path,
+                            dataset_path=self.sharegpt_dataset_path,
                             output_file=None,
                             output_details=False,
                             disable_tqdm=False,
@@ -207,10 +215,6 @@ class TestModePerf(CustomTestCase):
 
         output_lengths = [1, 1024]
 
-        print("Downloading the ShareGPT dataset once before starting tests...")
-        sharegpt_dataset_path = download_and_cache_file(SHAREGPT_URL)
-        print(f"Dataset downloaded to: {sharegpt_dataset_path}")
-
         # launch server
         process = popen_launch_server(
             model,
@@ -276,7 +280,7 @@ class TestModePerf(CustomTestCase):
                             request_rate=float("inf"),
                             warmup_requests=1,
                             flush_cache=True,
-                            dataset_path=sharegpt_dataset_path,
+                            dataset_path=self.sharegpt_dataset_path,
                             output_file=None,
                             output_details=False,
                             disable_tqdm=False,
@@ -370,10 +374,6 @@ class TestModePerf(CustomTestCase):
 
         output_lengths = [1, 1024]
 
-        print("Downloading the ShareGPT dataset once before starting tests...")
-        sharegpt_dataset_path = download_and_cache_file(SHAREGPT_URL)
-        print(f"Dataset downloaded to: {sharegpt_dataset_path}")
-
         # launch server
         process = popen_launch_server(
             model,
@@ -439,7 +439,7 @@ class TestModePerf(CustomTestCase):
                             request_rate=float("inf"),
                             warmup_requests=1,
                             flush_cache=True,
-                            dataset_path=sharegpt_dataset_path,
+                            dataset_path=selfsharegpt_dataset_path,
                             output_file=None,
                             output_details=False,
                             disable_tqdm=False,
@@ -533,10 +533,6 @@ class TestModePerf(CustomTestCase):
 
         output_lengths = [1, 1024]
 
-        print("Downloading the ShareGPT dataset once before starting tests...")
-        sharegpt_dataset_path = download_and_cache_file(SHAREGPT_URL)
-        print(f"Dataset downloaded to: {sharegpt_dataset_path}")
-
         # launch server
         process = popen_launch_server(
             model,
@@ -602,7 +598,7 @@ class TestModePerf(CustomTestCase):
                             request_rate=float("inf"),
                             warmup_requests=1,
                             flush_cache=True,
-                            dataset_path=sharegpt_dataset_path,
+                            dataset_path=self.sharegpt_dataset_path,
                             output_file=None,
                             output_details=False,
                             disable_tqdm=False,
@@ -696,10 +692,6 @@ class TestModePerf(CustomTestCase):
 
         output_lengths = [1, 1024]
 
-        print("Downloading the ShareGPT dataset once before starting tests...")
-        sharegpt_dataset_path = download_and_cache_file(SHAREGPT_URL)
-        print(f"Dataset downloaded to: {sharegpt_dataset_path}")
-
         # launch server
         process = popen_launch_server(
             model,
@@ -767,7 +759,7 @@ class TestModePerf(CustomTestCase):
                             request_rate=float("inf"),
                             warmup_requests=1,
                             flush_cache=True,
-                            dataset_path=sharegpt_dataset_path,
+                            dataset_path=self.sharegpt_dataset_path,
                             output_file=None,
                             output_details=False,
                             disable_tqdm=False,
@@ -860,10 +852,6 @@ class TestModePerf(CustomTestCase):
 
         output_lengths = [1, 1024]
 
-        print("Downloading the ShareGPT dataset once before starting tests...")
-        sharegpt_dataset_path = download_and_cache_file(SHAREGPT_URL)
-        print(f"Dataset downloaded to: {sharegpt_dataset_path}")
-
         # launch server
         process = popen_launch_server(
             model,
@@ -930,7 +918,7 @@ class TestModePerf(CustomTestCase):
                             request_rate=float("inf"),
                             warmup_requests=1,
                             flush_cache=True,
-                            dataset_path=sharegpt_dataset_path,
+                            dataset_path=self.sharegpt_dataset_path,
                             output_file=None,
                             output_details=False,
                             disable_tqdm=False,
@@ -1024,10 +1012,6 @@ class TestModePerf(CustomTestCase):
 
         output_lengths = [1, 1024]
 
-        print("Downloading the ShareGPT dataset once before starting tests...")
-        sharegpt_dataset_path = download_and_cache_file(SHAREGPT_URL)
-        print(f"Dataset downloaded to: {sharegpt_dataset_path}")
-
         # launch server
         process = popen_launch_server(
             model,
@@ -1094,7 +1078,7 @@ class TestModePerf(CustomTestCase):
                             request_rate=float("inf"),
                             warmup_requests=1,
                             flush_cache=True,
-                            dataset_path=sharegpt_dataset_path,
+                            dataset_path=self.sharegpt_dataset_path,
                             output_file=None,
                             output_details=False,
                             disable_tqdm=False,
@@ -1188,10 +1172,6 @@ class TestModePerf(CustomTestCase):
 
         output_lengths = [1, 1024]
 
-        print("Downloading the ShareGPT dataset once before starting tests...")
-        sharegpt_dataset_path = download_and_cache_file(SHAREGPT_URL)
-        print(f"Dataset downloaded to: {sharegpt_dataset_path}")
-
         # launch server
         process = popen_launch_server(
             model,
@@ -1259,7 +1239,7 @@ class TestModePerf(CustomTestCase):
                             request_rate=float("inf"),
                             warmup_requests=1,
                             flush_cache=True,
-                            dataset_path=sharegpt_dataset_path,
+                            dataset_path=self.sharegpt_dataset_path,
                             output_file=None,
                             output_details=False,
                             disable_tqdm=False,
@@ -1341,10 +1321,6 @@ class TestModePerf(CustomTestCase):
 
         output_lengths = [1, 1024]
 
-        print("Downloading the ShareGPT dataset once before starting tests...")
-        sharegpt_dataset_path = download_and_cache_file(SHAREGPT_URL)
-        print(f"Dataset downloaded to: {sharegpt_dataset_path}")
-
         # launch server
         process = popen_launch_server(
             model,
@@ -1410,7 +1386,7 @@ class TestModePerf(CustomTestCase):
                             request_rate=float("inf"),
                             warmup_requests=1,
                             flush_cache=True,
-                            dataset_path=sharegpt_dataset_path,
+                            dataset_path=self.sharegpt_dataset_path,
                             output_file=None,
                             output_details=False,
                             disable_tqdm=False,
@@ -1493,10 +1469,6 @@ class TestModePerf(CustomTestCase):
 
         output_lengths = [1, 1024]
 
-        print("Downloading the ShareGPT dataset once before starting tests...")
-        sharegpt_dataset_path = download_and_cache_file(SHAREGPT_URL)
-        print(f"Dataset downloaded to: {sharegpt_dataset_path}")
-
         # launch server
         process = popen_launch_server(
             model,
@@ -1562,7 +1534,7 @@ class TestModePerf(CustomTestCase):
                             request_rate=float("inf"),
                             warmup_requests=1,
                             flush_cache=True,
-                            dataset_path=sharegpt_dataset_path,
+                            dataset_path=self.sharegpt_dataset_path,
                             output_file=None,
                             output_details=False,
                             disable_tqdm=False,
