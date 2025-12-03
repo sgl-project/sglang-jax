@@ -51,7 +51,9 @@ def get_hf_text_config(config: PretrainedConfig):
         # qwen2.5 omni
         thinker_config = config.thinker_config
         if hasattr(thinker_config, "text_config"):
-            thinker_config.text_config.torch_dtype = getattr(thinker_config, "torch_dtype", None)
+            thinker_config.text_config.torch_dtype = getattr(
+                thinker_config, "dtype", getattr(thinker_config, "torch_dtype", None)
+            )
             return thinker_config.text_config
         return thinker_config
     else:
