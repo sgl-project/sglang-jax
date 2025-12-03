@@ -33,7 +33,7 @@ class TestModelAccuracy(CustomTestCase):
         api_url_for_eval = f"{base_url}/v1"
         output_dir = os.getenv("BENCH_OUTPUT_DIR", "./test/nightly_test_output/benchmark/local_run")
         os.makedirs(output_dir, exist_ok=True)
-        csv_file_path = os.path.join(output_dir, "benchmark_results.csv")
+        csv_file_path = os.path.join(output_dir, "qwen_7b_benchmark_results.csv")
 
         # launch server
         process = popen_launch_server(
@@ -156,7 +156,7 @@ class TestModelAccuracy(CustomTestCase):
         api_url_for_eval = f"{base_url}/v1"
         output_dir = os.getenv("BENCH_OUTPUT_DIR", "./test/nightly_test_output/benchmark/local_run")
         os.makedirs(output_dir, exist_ok=True)
-        csv_file_path = os.path.join(output_dir, "benchmark_results.csv")
+        csv_file_path = os.path.join(output_dir, "qwen3_8b_benchmark_results.csv")
 
         # launch server
         process = popen_launch_server(
@@ -279,7 +279,9 @@ class TestModelAccuracy(CustomTestCase):
         api_url_for_eval = f"{base_url}/v1"
         output_dir = os.getenv("BENCH_OUTPUT_DIR", "./test/nightly_test_output/benchmark/local_run")
         os.makedirs(output_dir, exist_ok=True)
-        csv_file_path = os.path.join(output_dir, "benchmark_results.csv")
+        csv_file_path = os.path.join(
+            output_dir, "deepseek_r1_distill_qwen_1_5b_benchmark_results.csv"
+        )
         process = popen_launch_server(
             model,
             base_url,
@@ -401,7 +403,7 @@ class TestModelAccuracy(CustomTestCase):
         api_url_for_eval = f"{base_url}/v1"
         output_dir = os.getenv("BENCH_OUTPUT_DIR", "./test/nightly_test_output/benchmark/local_run")
         os.makedirs(output_dir, exist_ok=True)
-        csv_file_path = os.path.join(output_dir, "benchmark_results.csv")
+        csv_file_path = os.path.join(output_dir, "gemma2_2b_it_benchmark_results.csv")
         process = popen_launch_server(
             model,
             base_url,
@@ -522,7 +524,7 @@ class TestModelAccuracy(CustomTestCase):
         api_url_for_eval = f"{base_url}/v1"
         output_dir = os.getenv("BENCH_OUTPUT_DIR", "./test/nightly_test_output/benchmark/local_run")
         os.makedirs(output_dir, exist_ok=True)
-        csv_file_path = os.path.join(output_dir, "benchmark_tp_4_results.csv")
+        csv_file_path = os.path.join(output_dir, "qwen_7b_benchmark_tp_4_results.csv")
         process = popen_launch_server(
             model,
             DEFAULT_URL_FOR_TEST,
@@ -643,7 +645,7 @@ class TestModelAccuracy(CustomTestCase):
         api_url_for_eval = f"{base_url}/v1"
         output_dir = os.getenv("BENCH_OUTPUT_DIR", "./test/nightly_test_output/benchmark/local_run")
         os.makedirs(output_dir, exist_ok=True)
-        csv_file_path = os.path.join(output_dir, "benchmark_tp_4_results.csv")
+        csv_file_path = os.path.join(output_dir, "qwen3_8b_benchmark_tp_4_results.csv")
         process = popen_launch_server(
             model,
             DEFAULT_URL_FOR_TEST,
@@ -764,7 +766,7 @@ class TestModelAccuracy(CustomTestCase):
         api_url_for_eval = f"{base_url}/v1"
         output_dir = os.getenv("BENCH_OUTPUT_DIR", "./test/nightly_test_output/benchmark/local_run")
         os.makedirs(output_dir, exist_ok=True)
-        csv_file_path = os.path.join(output_dir, "benchmark_tp_4_results.csv")
+        csv_file_path = os.path.join(output_dir, "gemma2_2b_it_benchmark_tp_4_results.csv")
         process = popen_launch_server(
             model,
             DEFAULT_URL_FOR_TEST,
@@ -886,7 +888,9 @@ class TestModelAccuracy(CustomTestCase):
         api_url_for_eval = f"{base_url}/v1"
         output_dir = os.getenv("BENCH_OUTPUT_DIR", "./test/nightly_test_output/benchmark/local_run")
         os.makedirs(output_dir, exist_ok=True)
-        csv_file_path = os.path.join(output_dir, "benchmark_tp_4_results.csv")
+        csv_file_path = os.path.join(
+            output_dir, "QWEN3_CODER_30B_A3B_INSTRUCT_benchmark_tp_4_results.csv"
+        )
         process = popen_launch_server(
             model,
             DEFAULT_URL_FOR_TEST,
@@ -1010,7 +1014,9 @@ class TestModelAccuracy(CustomTestCase):
         api_url_for_eval = f"{base_url}/v1"
         output_dir = os.getenv("BENCH_OUTPUT_DIR", "./test/nightly_test_output/benchmark/local_run")
         os.makedirs(output_dir, exist_ok=True)
-        csv_file_path = os.path.join(output_dir, "benchmark_tp_4_results.csv")
+        csv_file_path = os.path.join(
+            output_dir, "deepseek_r1_distill_qwen_1_5b_benchmark_tp_4_results.csv"
+        )
         process = popen_launch_server(
             model,
             DEFAULT_URL_FOR_TEST,
@@ -1132,7 +1138,7 @@ class TestModelAccuracy(CustomTestCase):
         api_url_for_eval = f"{base_url}/v1"
         output_dir = os.getenv("BENCH_OUTPUT_DIR", "./test/nightly_test_output/benchmark/local_run")
         os.makedirs(output_dir, exist_ok=True)
-        csv_file_path = os.path.join(output_dir, "benchmark_tp_2_ep_2_results.csv")
+        csv_file_path = os.path.join(output_dir, "bailing_moe_benchmark_tp_2_ep_2_results.csv")
         process = popen_launch_server(
             model,
             DEFAULT_URL_FOR_TEST,
@@ -1256,7 +1262,9 @@ class TestModelAccuracy(CustomTestCase):
         api_url_for_eval = f"{base_url}/v1"
         output_dir = os.getenv("BENCH_OUTPUT_DIR", "./test/nightly_test_output/benchmark/local_run")
         os.makedirs(output_dir, exist_ok=True)
-        csv_file_path = os.path.join(output_dir, "benchmark_tp_2_ep_2_results.csv")
+        csv_file_path = os.path.join(
+            output_dir, "QWEN3_CODER_30B_A3B_INSTRUCT_benchmark_tp_2_ep_2_results.csv"
+        )
         process = popen_launch_server(
             model,
             DEFAULT_URL_FOR_TEST,

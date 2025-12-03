@@ -162,7 +162,7 @@ class TestModePerf(CustomTestCase):
             import csv
             import os
 
-            output_dir = os.getenv("PERF_OUTPUT_DIR", "./test/nightly_test_output/pref/local_run")
+            output_dir = os.getenv("PREF_OUTPUT_DIR", "./test/nightly_test_output/pref/local_run")
             os.makedirs(output_dir, exist_ok=True)
             output_filename = os.path.join(output_dir, "performance_results.csv")
             file_exists = os.path.exists(output_filename)
@@ -321,7 +321,7 @@ class TestModePerf(CustomTestCase):
             import csv
             import os
 
-            output_dir = os.getenv("PERF_OUTPUT_DIR", "./test/nightly_test_output/pref/local_run")
+            output_dir = os.getenv("PREF_OUTPUT_DIR", "./test/nightly_test_output/pref/local_run")
             os.makedirs(output_dir, exist_ok=True)
             output_filename = os.path.join(output_dir, "performance_results.csv")
             file_exists = os.path.exists(output_filename)
@@ -480,7 +480,7 @@ class TestModePerf(CustomTestCase):
             import csv
             import os
 
-            output_dir = os.getenv("PERF_OUTPUT_DIR", "./test/nightly_test_output/pref/local_run")
+            output_dir = os.getenv("PREF_OUTPUT_DIR", "./test/nightly_test_output/pref/local_run")
             os.makedirs(output_dir, exist_ok=True)
             output_filename = os.path.join(output_dir, "performance_results.csv")
             file_exists = os.path.exists(output_filename)
@@ -639,7 +639,7 @@ class TestModePerf(CustomTestCase):
             import csv
             import os
 
-            output_dir = os.getenv("PERF_OUTPUT_DIR", "./test/nightly_test_output/pref/local_run")
+            output_dir = os.getenv("PREF_OUTPUT_DIR", "./test/nightly_test_output/pref/local_run")
             os.makedirs(output_dir, exist_ok=True)
             output_filename = os.path.join(output_dir, "performance_results.csv")
             file_exists = os.path.exists(output_filename)
@@ -800,7 +800,7 @@ class TestModePerf(CustomTestCase):
             import csv
             import os
 
-            output_dir = os.getenv("PERF_OUTPUT_DIR", "./test/nightly_test_output/pref/local_run")
+            output_dir = os.getenv("PREF_OUTPUT_DIR", "./test/nightly_test_output/pref/local_run")
             os.makedirs(output_dir, exist_ok=True)
             output_filename = os.path.join(output_dir, "performance_results.csv")
             file_exists = os.path.exists(output_filename)
@@ -959,7 +959,7 @@ class TestModePerf(CustomTestCase):
             import csv
             import os
 
-            output_dir = os.getenv("PERF_OUTPUT_DIR", "./test/nightly_test_output/pref/local_run")
+            output_dir = os.getenv("PREF_OUTPUT_DIR", "./test/nightly_test_output/pref/local_run")
             os.makedirs(output_dir, exist_ok=True)
             output_filename = os.path.join(output_dir, "performance_results.csv")
             file_exists = os.path.exists(output_filename)
@@ -1119,7 +1119,7 @@ class TestModePerf(CustomTestCase):
             import csv
             import os
 
-            output_dir = os.getenv("PERF_OUTPUT_DIR", "./test/nightly_test_output/pref/local_run")
+            output_dir = os.getenv("PREF_OUTPUT_DIR", "./test/nightly_test_output/pref/local_run")
             os.makedirs(output_dir, exist_ok=True)
             output_filename = os.path.join(output_dir, "performance_results.csv")
             file_exists = os.path.exists(output_filename)
@@ -1280,7 +1280,7 @@ class TestModePerf(CustomTestCase):
             import csv
             import os
 
-            output_dir = os.getenv("PERF_OUTPUT_DIR", "./test/nightly_test_output/pref/local_run")
+            output_dir = os.getenv("PREF_OUTPUT_DIR", "./test/nightly_test_output/pref/local_run")
             os.makedirs(output_dir, exist_ok=True)
             output_filename = os.path.join(output_dir, "performance_results.csv")
             file_exists = os.path.exists(output_filename)
@@ -1427,7 +1427,7 @@ class TestModePerf(CustomTestCase):
             import csv
             import os
 
-            output_dir = os.getenv("PERF_OUTPUT_DIR", "./test/nightly_test_output/pref/local_run")
+            output_dir = os.getenv("PREF_OUTPUT_DIR", "./test/nightly_test_output/pref/local_run")
             os.makedirs(output_dir, exist_ok=True)
             output_filename = os.path.join(output_dir, "performance_results.csv")
             file_exists = os.path.exists(output_filename)
@@ -1575,7 +1575,7 @@ class TestModePerf(CustomTestCase):
             import csv
             import os
 
-            output_dir = os.getenv("PERF_OUTPUT_DIR", "./test/nightly_test_output/pref/local_run")
+            output_dir = os.getenv("PREF_OUTPUT_DIR", "./test/nightly_test_output/pref/local_run")
             os.makedirs(output_dir, exist_ok=True)
             output_filename = os.path.join(output_dir, "performance_results.csv")
             file_exists = os.path.exists(output_filename)
