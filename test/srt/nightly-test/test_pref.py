@@ -38,9 +38,6 @@ class TestModePerf(CustomTestCase):
         print("Setting up TestModePerf: Downloading the ShareGPT dataset once for all tests...")
 
         cls.sharegpt_dataset_path = download_and_cache_file(SHAREGPT_URL)
-        cls.dataset_path_local = os.path.join(
-            os.path.dirname(os.path.abspath(__file__)), "ShareGPT_V3_unfiltered_cleaned_split.json"
-        )
 
         print(f"Dataset is ready at location: {cls.sharegpt_dataset_path}")
         print("=" * 80 + "\n")
@@ -125,7 +122,7 @@ class TestModePerf(CustomTestCase):
                             request_rate=float("inf"),
                             warmup_requests=1,
                             flush_cache=True,
-                            dataset_path=self.dataset_path_local,
+                            dataset_path=self.sharegpt_dataset_path,
                             output_file=None,
                             output_details=False,
                             disable_tqdm=False,
@@ -284,7 +281,7 @@ class TestModePerf(CustomTestCase):
                             request_rate=float("inf"),
                             warmup_requests=1,
                             flush_cache=True,
-                            dataset_path=self.dataset_path_local,
+                            dataset_path=self.sharegpt_dataset_path,
                             output_file=None,
                             output_details=False,
                             disable_tqdm=False,
@@ -443,7 +440,7 @@ class TestModePerf(CustomTestCase):
                             request_rate=float("inf"),
                             warmup_requests=1,
                             flush_cache=True,
-                            dataset_path=self.dataset_path_local,
+                            dataset_path=self.sharegpt_dataset_path,
                             output_file=None,
                             output_details=False,
                             disable_tqdm=False,
@@ -602,7 +599,7 @@ class TestModePerf(CustomTestCase):
                             request_rate=float("inf"),
                             warmup_requests=1,
                             flush_cache=True,
-                            dataset_path=self.dataset_path_local,
+                            dataset_path=self.sharegpt_dataset_path,
                             output_file=None,
                             output_details=False,
                             disable_tqdm=False,
@@ -763,7 +760,7 @@ class TestModePerf(CustomTestCase):
                             request_rate=float("inf"),
                             warmup_requests=1,
                             flush_cache=True,
-                            dataset_path=self.dataset_path_local,
+                            dataset_path=self.sharegpt_dataset_path,
                             output_file=None,
                             output_details=False,
                             disable_tqdm=False,
@@ -922,7 +919,7 @@ class TestModePerf(CustomTestCase):
                             request_rate=float("inf"),
                             warmup_requests=1,
                             flush_cache=True,
-                            dataset_path=self.dataset_path_local,
+                            dataset_path=self.sharegpt_dataset_path,
                             output_file=None,
                             output_details=False,
                             disable_tqdm=False,
@@ -1082,7 +1079,7 @@ class TestModePerf(CustomTestCase):
                             request_rate=float("inf"),
                             warmup_requests=1,
                             flush_cache=True,
-                            dataset_path=self.dataset_path_local,
+                            dataset_path=self.sharegpt_dataset_path,
                             output_file=None,
                             output_details=False,
                             disable_tqdm=False,
@@ -1243,7 +1240,7 @@ class TestModePerf(CustomTestCase):
                             request_rate=float("inf"),
                             warmup_requests=1,
                             flush_cache=True,
-                            dataset_path=self.dataset_path_local,
+                            dataset_path=self.sharegpt_dataset_path,
                             output_file=None,
                             output_details=False,
                             disable_tqdm=False,
@@ -1390,7 +1387,7 @@ class TestModePerf(CustomTestCase):
                             request_rate=float("inf"),
                             warmup_requests=1,
                             flush_cache=True,
-                            dataset_path=self.dataset_path_local,
+                            dataset_path=self.sharegpt_dataset_path,
                             output_file=None,
                             output_details=False,
                             disable_tqdm=False,
@@ -1538,7 +1535,7 @@ class TestModePerf(CustomTestCase):
                             request_rate=float("inf"),
                             warmup_requests=1,
                             flush_cache=True,
-                            dataset_path=self.dataset_path_local,
+                            dataset_path=self.sharegpt_dataset_path,
                             output_file=None,
                             output_details=False,
                             disable_tqdm=False,
