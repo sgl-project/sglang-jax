@@ -86,8 +86,8 @@ class TestModelAccuracy(CustomTestCase):
                 dataset_args = {}
                 # if dataset_name == "mmlu" or dataset_name == "modelscope/mmlu":
                 #     dataset_args = {"mmlu": {"subset_list": ["global_facts"]}}
-                if dataset_name == "mmlu":
-                    dataset_args = {"mmlu": {"dataset_hub": "hf", "dataset_id": "cais/mmlu"}}
+                # if dataset_name == "mmlu":
+                #     dataset_args = {"mmlu": {"hub": "hf", "dataset_id": "cais/mmlu"}}
 
                 config = TaskConfig(
                     model=model,
@@ -213,8 +213,8 @@ class TestModelAccuracy(CustomTestCase):
                 dataset_args = {}
                 # if dataset_name == "mmlu" or dataset_name == "modelscope/mmlu":
                 #     dataset_args = {"mmlu": {"subset_list": ["global_facts"]}}
-                if dataset_name == "mmlu":
-                    dataset_args = {"mmlu": {"dataset_hub": "hf", "dataset_id": "cais/mmlu"}}
+                # if dataset_name == "mmlu":
+                #     dataset_args = {"mmlu": {"hub": "hf", "dataset_id": "cais/mmlu"}}
 
                 config = TaskConfig(
                     model=model,
@@ -341,8 +341,8 @@ class TestModelAccuracy(CustomTestCase):
                 dataset_args = {}
                 # if dataset_name == "mmlu" or dataset_name == "modelscope/mmlu":
                 #     dataset_args = {"mmlu": {"subset_list": ["global_facts"]}}
-                if dataset_name == "mmlu":
-                    dataset_args = {"mmlu": {"dataset_hub": "hf", "dataset_id": "cais/mmlu"}}
+                # if dataset_name == "mmlu":
+                #     dataset_args = {"mmlu": {"hub": "hf", "dataset_id": "cais/mmlu"}}
 
                 config = TaskConfig(
                     model=model,
@@ -466,8 +466,8 @@ class TestModelAccuracy(CustomTestCase):
                 dataset_args = {}
                 # if dataset_name == "mmlu" or dataset_name == "modelscope/mmlu":
                 #     dataset_args = {"mmlu": {"subset_list": ["global_facts"]}}
-                if dataset_name == "mmlu":
-                    dataset_args = {"mmlu": {"dataset_hub": "hf", "dataset_id": "cais/mmlu"}}
+                # if dataset_name == "mmlu":
+                #     dataset_args = {"mmlu": {"hub": "hf", "dataset_id": "cais/mmlu"}}
 
                 config = TaskConfig(
                     model=model,
@@ -591,8 +591,8 @@ class TestModelAccuracy(CustomTestCase):
                 dataset_args = {}
                 # if dataset_name == "mmlu" or dataset_name == "modelscope/mmlu":
                 #     dataset_args = {"mmlu": {"subset_list": ["global_facts"]}}
-                if dataset_name == "mmlu":
-                    dataset_args = {"mmlu": {"dataset_hub": "hf", "dataset_id": "cais/mmlu"}}
+                # if dataset_name == "mmlu":
+                #     dataset_args = {"mmlu": {"hub": "hf", "dataset_id": "cais/mmlu"}}
 
                 config = TaskConfig(
                     model=model,
@@ -716,8 +716,8 @@ class TestModelAccuracy(CustomTestCase):
                 dataset_args = {}
                 # if dataset_name == "mmlu" or dataset_name == "modelscope/mmlu":
                 #     dataset_args = {"mmlu": {"subset_list": ["global_facts"]}}
-                if dataset_name == "mmlu":
-                    dataset_args = {"mmlu": {"dataset_hub": "hf", "dataset_id": "cais/mmlu"}}
+                # if dataset_name == "mmlu":
+                #     dataset_args = {"mmlu": {"hub": "hf", "dataset_id": "cais/mmlu"}}
 
                 config = TaskConfig(
                     model=model,
@@ -842,8 +842,8 @@ class TestModelAccuracy(CustomTestCase):
                 dataset_args = {}
                 # if dataset_name == "mmlu" or dataset_name == "modelscope/mmlu":
                 #     dataset_args = {"mmlu": {"subset_list": ["global_facts"]}}
-                if dataset_name == "mmlu":
-                    dataset_args = {"mmlu": {"dataset_hub": "hf", "dataset_id": "cais/mmlu"}}
+                # if dataset_name == "mmlu":
+                #     dataset_args = {"mmlu": {"hub": "hf", "dataset_id": "cais/mmlu"}}
 
                 config = TaskConfig(
                     model=model,
@@ -972,8 +972,8 @@ class TestModelAccuracy(CustomTestCase):
                 dataset_args = {}
                 # if dataset_name == "mmlu" or dataset_name == "modelscope/mmlu":
                 #     dataset_args = {"mmlu": {"subset_list": ["global_facts"]}}
-                if dataset_name == "mmlu":
-                    dataset_args = {"mmlu": {"dataset_hub": "hf", "dataset_id": "cais/mmlu"}}
+                # if dataset_name == "mmlu":
+                #     dataset_args = {"mmlu": {"hub": "hf", "dataset_id": "cais/mmlu"}}
 
                 config = TaskConfig(
                     model=model,
@@ -1100,8 +1100,8 @@ class TestModelAccuracy(CustomTestCase):
                 dataset_args = {}
                 # if dataset_name == "mmlu" or dataset_name == "modelscope/mmlu":
                 #     dataset_args = {"mmlu": {"subset_list": ["global_facts"]}}
-                if dataset_name == "mmlu":
-                    dataset_args = {"mmlu": {"dataset_hub": "hf", "dataset_id": "cais/mmlu"}}
+                # if dataset_name == "mmlu":
+                #     dataset_args = {"mmlu": {"hub": "hf", "dataset_id": "cais/mmlu"}}
 
                 config = TaskConfig(
                     model=model,
@@ -1228,8 +1228,8 @@ class TestModelAccuracy(CustomTestCase):
                 dataset_args = {}
                 # if dataset_name == "mmlu" or dataset_name == "modelscope/mmlu":
                 #     dataset_args = {"mmlu": {"subset_list": ["global_facts"]}}
-                if dataset_name == "mmlu":
-                    dataset_args = {"mmlu": {"dataset_hub": "hf", "dataset_id": "cais/mmlu"}}
+                # if dataset_name == "mmlu":
+                #     dataset_args = {"mmlu": {"hub": "hf", "dataset_id": "cais/mmlu"}}
 
                 config = TaskConfig(
                     model=model,
@@ -1358,8 +1358,8 @@ class TestModelAccuracy(CustomTestCase):
                 dataset_args = {}
                 # if dataset_name == "mmlu" or dataset_name == "modelscope/mmlu":
                 #     dataset_args = {"mmlu": {"subset_list": ["global_facts"]}}
-                if dataset_name == "mmlu":
-                    dataset_args = {"mmlu": {"dataset_hub": "hf", "dataset_id": "cais/mmlu"}}
+                # if dataset_name == "mmlu":
+                #     dataset_args = {"mmlu": {"hub": "hf", "dataset_id": "cais/mmlu"}}
 
                 config = TaskConfig(
                     model=model,
