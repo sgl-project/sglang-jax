@@ -53,10 +53,12 @@ from sgl_jax.srt.managers.io_struct import (
     AbortReq,
     CloseSessionReqInput,
     ConfigureLoggingReq,
+    ContinueGenerationReqInput,
     EmbeddingReqInput,
     GenerateReqInput,
     OpenSessionReqInput,
     ParseFunctionCallReq,
+    PauseGenerationReqInput,
     ProfileReqInput,
     ReleaseMemoryOccupationReqInput,
     ResumeMemoryOccupationReqInput,
@@ -635,9 +637,9 @@ async def separate_reasoning_request(obj: SeparateReasoningReqInput, request: Re
 
 
 @app.post("/pause_generation")
-async def pause_generation(request: Request):
+async def pause_generation(obj: PauseGenerationReqInput, request: Request):
     """Pause generation."""
-    await _global_state.tokenizer_manager.pause_generation()
+    await _global_state.tokenizer_manager.pause_generation(obj)
     return ORJSONResponse(
         content={"message": "Generation paused successfully.", "status": "ok"},
         status_code=200,
@@ -645,9 +647,9 @@ async def pause_generation(request: Request):
 
 
 @app.post("/continue_generation")
-async def continue_generation(request: Request):
+async def continue_generation(obj: ContinueGenerationReqInput, request: Request):
     """Continue generation."""
-    await _global_state.tokenizer_manager.continue_generation()
+    await _global_state.tokenizer_manager.continue_generation(obj)
     return ORJSONResponse(
         content={"message": "Generation continued successfully.", "status": "ok"},
         status_code=200,
