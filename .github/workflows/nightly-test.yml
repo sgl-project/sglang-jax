@@ -119,7 +119,7 @@ jobs:
       - name: Run performance test for text models
         timeout-minutes: 1800
         env:
-          SGLANG_USE_MODELSCOPE: true
+          
           TRACE_BASE_URL: https://raw.githubusercontent.com/sglang-bot/sglang-ci-data/main/traces/${{ github.run_id }}
           PERFETTO_RELAY_URL: ${{ vars.PERFETTO_RELAY_URL }}
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
@@ -162,7 +162,7 @@ jobs:
       - name: Run performance test for text models
         timeout-minutes: 1800
         env:
-          SGLANG_USE_MODELSCOPE: true
+          
           TRACE_BASE_URL: https://raw.githubusercontent.com/sglang-bot/sglang-ci-data/main/traces/${{ github.run_id }}
           PERFETTO_RELAY_URL: ${{ vars.PERFETTO_RELAY_URL }}
           HF_TOKEN: ${{ secrets.HF_TOKEN }}

@@ -127,7 +127,8 @@ jobs:
         shell: bash
         env:
           SGLANG_JAX_IS_IN_CI: true
-          SGLANG_USE_MODELSCOPE: true
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_HUB_DOWNLOAD_TIMEOUT: ${{ vars.HF_HUB_DOWNLOAD_TIMEOUT }}
         run: |
           python3.12 -m venv .venv
           source .venv/bin/activate
@@ -153,7 +154,8 @@ jobs:
         shell: bash
         env:
           SGLANG_JAX_IS_IN_CI: true
-          SGLANG_USE_MODELSCOPE: true
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_HUB_DOWNLOAD_TIMEOUT: ${{ vars.HF_HUB_DOWNLOAD_TIMEOUT }}
         run: |
           python3.12 -m venv .venv
           source .venv/bin/activate
@@ -179,7 +181,8 @@ jobs:
         timeout-minutes: 20
         env:
           SGLANG_JAX_IS_IN_CI: true
-          SGLANG_USE_MODELSCOPE: true
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_HUB_DOWNLOAD_TIMEOUT: ${{ vars.HF_HUB_DOWNLOAD_TIMEOUT }}
         run: |
           python3.12 -m venv .venv
           source .venv/bin/activate
@@ -205,7 +208,8 @@ jobs:
         timeout-minutes: 50
         env:
           SGLANG_JAX_IS_IN_CI: true
-          SGLANG_USE_MODELSCOPE: true
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_HUB_DOWNLOAD_TIMEOUT: ${{ vars.HF_HUB_DOWNLOAD_TIMEOUT }}
         run: |
           python3.12 -m venv .venv
           source .venv/bin/activate
@@ -232,7 +236,8 @@ jobs:
         timeout-minutes: 30
         env:
           SGLANG_JAX_IS_IN_CI: true
-          SGLANG_USE_MODELSCOPE: true
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_HUB_DOWNLOAD_TIMEOUT: ${{ vars.HF_HUB_DOWNLOAD_TIMEOUT }}
         run: |
           python3.12 -m venv .venv
           source .venv/bin/activate
@@ -259,7 +264,8 @@ jobs:
 
         env:
           SGLANG_JAX_IS_IN_CI: true
-          SGLANG_USE_MODELSCOPE: true
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_HUB_DOWNLOAD_TIMEOUT: ${{ vars.HF_HUB_DOWNLOAD_TIMEOUT }}
         run: |
           python3.12 -m venv .venv
           source .venv/bin/activate
@@ -285,7 +291,8 @@ jobs:
         shell: bash
         env:
           SGLANG_JAX_IS_IN_CI: true
-          SGLANG_USE_MODELSCOPE: true
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_HUB_DOWNLOAD_TIMEOUT: ${{ vars.HF_HUB_DOWNLOAD_TIMEOUT }}
         run: |
           python3.12 -m venv .venv
           source .venv/bin/activate
