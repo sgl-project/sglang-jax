@@ -36,6 +36,7 @@ from sgl_jax.srt.managers.io_struct import (
     BatchTokenIDOut,
     CloseSessionReqInput,
     ConfigureLoggingReq,
+    ContinueGenerationReqInput,
     EmbeddingReqInput,
     FlushCacheReqInput,
     FlushCacheReqOutput,
@@ -45,6 +46,7 @@ from sgl_jax.srt.managers.io_struct import (
     HealthCheckOutput,
     OpenSessionReqInput,
     OpenSessionReqOutput,
+    PauseGenerationReqInput,
     ProfileReq,
     ProfileReqOutput,
     ProfileReqType,
@@ -616,14 +618,23 @@ class TokenizerManager:
             raise RuntimeError(result.message)
         return result
 
-    async def pause_generation(self):
+    async def pause_generation(self, obj: PauseGenerationReqInput):
         async with self._cond:
             self._updating = True
-            self.abort_request(abort_all=True)
+            if obj.mode != "abort":
+                await self.send_to_scheduler.send_pyobj(obj)
+            else:
+                # use len(self.rid_to_state) == 0 to ensure all requests are aborted
+                while True:
+                    self.abort_request(abort_all=True)
+                    if len(self.rid_to_state) == 0:
+                        break
+                    await asyncio.sleep(0.1)
 
-    async def continue_generation(self):
+    async def continue_generation(self, obj: ContinueGenerationReqInput):
         async with self._cond:
             self._updating = False
+            await self.send_to_scheduler.send_pyobj(obj)
             self._cond.notify_all()
 
     async def release_memory_occupation(

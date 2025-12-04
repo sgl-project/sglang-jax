@@ -609,6 +609,49 @@ class VertexGenerateReqInput(GenerateReqInput):
 
 
 @dataclass
+class PauseGenerationReqInput(RpcReqInput):
+    """
+    Request to pause generation.
+
+    abort: Abort and return all requests currently being processed.
+
+    in_place: Pause the scheduler's event_loop from performing inference;
+            only non-inference requests (e.g., control commands) will be handled.
+            The requests in the engine will be paused and stay in the event_loop,
+            then continue generation after continue_generation with the old kv cache.
+            Note: In 'inplace' mode, flush_cache will fail if there are any requests
+            in the running_batch.
+
+    retract: Pause the scheduler's event loop from performing inference;
+            only non-inference requests will be handled, and all currently running
+            requests will be retracted back to the waiting_queue.
+            Note: The KV cache can be flushed in this mode and will be automatically
+            recomputed after continue_generation.
+    """
+
+    mode: str = "abort"
+    request_id: str = ""
+
+    def __post_init__(self):
+        if not self.request_id:
+            self.request_id = f"pause_generation_{int(time.time())}"
+        allowed = ["abort", "retract", "in_place"]
+        if self.mode not in allowed:
+            raise ValueError(f"Invalid mode: {self.mode!r}. Expected one of {allowed}.")
+
+
+@dataclass
+class ContinueGenerationReqInput(RpcReqInput):
+    """Request to continue generation after pause."""
+
+    request_id: str = ""
+
+    def __post_init__(self):
+        if not self.request_id:
+            self.request_id = f"continue_generation_{int(time.time())}"
+
+
+@dataclass
 class StartTraceReqInput(RpcReqInput):
     """Request to start precision tracing."""
 
