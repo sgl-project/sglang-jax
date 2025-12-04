@@ -62,6 +62,8 @@ class TestModelAccuracy(CustomTestCase):
                 "2048",
                 "--tp-size",
                 "1",
+                "--mem-fraction-static",
+                "0.8",
             ],
             env={
                 "JAX_COMPILATION_CACHE_DIR": "/tmp/jax_compilation_cache",
@@ -71,7 +73,7 @@ class TestModelAccuracy(CustomTestCase):
         try:
             tasks = [
                 {"name": "gsm8k", "threshold": -1},
-                {"name": "cais/mmlu", "threshold": -1},
+                {"name": "mmlu", "threshold": -1},
                 {"name": "mmlu_pro", "threshold": -1},
                 {"name": "aime24", "threshold": -1},
                 {"name": "aime25", "threshold": -1},
@@ -84,6 +86,8 @@ class TestModelAccuracy(CustomTestCase):
                 dataset_args = {}
                 # if dataset_name == "mmlu" or dataset_name == "modelscope/mmlu":
                 #     dataset_args = {"mmlu": {"subset_list": ["global_facts"]}}
+                if dataset_name == "mmlu":
+                    dataset_args = {"mmlu": {"dataset_hub": "hf", "dataset_id": "cais/mmlu"}}
 
                 config = TaskConfig(
                     model=model,
@@ -185,6 +189,8 @@ class TestModelAccuracy(CustomTestCase):
                 "2048",
                 "--tp-size",
                 "1",
+                "--mem-fraction-static",
+                "0.8",
             ],
             env={
                 "JAX_COMPILATION_CACHE_DIR": "/tmp/jax_compilation_cache",
@@ -194,7 +200,7 @@ class TestModelAccuracy(CustomTestCase):
         try:
             tasks = [
                 {"name": "gsm8k", "threshold": -1},
-                {"name": "cais/mmlu", "threshold": -1},
+                {"name": "mmlu", "threshold": -1},
                 {"name": "mmlu_pro", "threshold": -1},
                 {"name": "aime24", "threshold": -1},
                 {"name": "aime25", "threshold": -1},
@@ -207,6 +213,8 @@ class TestModelAccuracy(CustomTestCase):
                 dataset_args = {}
                 # if dataset_name == "mmlu" or dataset_name == "modelscope/mmlu":
                 #     dataset_args = {"mmlu": {"subset_list": ["global_facts"]}}
+                if dataset_name == "mmlu":
+                    dataset_args = {"mmlu": {"dataset_hub": "hf", "dataset_id": "cais/mmlu"}}
 
                 config = TaskConfig(
                     model=model,
@@ -308,6 +316,8 @@ class TestModelAccuracy(CustomTestCase):
                 "2048",
                 "--tp-size",
                 "1",
+                "--mem-fraction-static",
+                "0.8",
             ],
             env={
                 "JAX_COMPILATION_CACHE_DIR": "/tmp/jax_compilation_cache",
@@ -317,7 +327,7 @@ class TestModelAccuracy(CustomTestCase):
         try:
             tasks = [
                 {"name": "gsm8k", "threshold": -1},
-                {"name": "cais/mmlu", "threshold": -1},
+                {"name": "mmlu", "threshold": -1},
                 {"name": "mmlu_pro", "threshold": -1},
                 {"name": "aime24", "threshold": -1},
                 {"name": "aime25", "threshold": -1},
@@ -331,6 +341,8 @@ class TestModelAccuracy(CustomTestCase):
                 dataset_args = {}
                 # if dataset_name == "mmlu" or dataset_name == "modelscope/mmlu":
                 #     dataset_args = {"mmlu": {"subset_list": ["global_facts"]}}
+                if dataset_name == "mmlu":
+                    dataset_args = {"mmlu": {"dataset_hub": "hf", "dataset_id": "cais/mmlu"}}
 
                 config = TaskConfig(
                     model=model,
@@ -430,6 +442,8 @@ class TestModelAccuracy(CustomTestCase):
                 "2048",
                 "--tp-size",
                 "1",
+                "--mem-fraction-static",
+                "0.8",
             ],
             env={
                 "JAX_COMPILATION_CACHE_DIR": "/tmp/jax_compilation_cache",
@@ -439,7 +453,7 @@ class TestModelAccuracy(CustomTestCase):
         try:
             tasks = [
                 {"name": "gsm8k", "threshold": -1},
-                {"name": "cais/mmlu", "threshold": -1},
+                {"name": "mmlu", "threshold": -1},
                 {"name": "mmlu_pro", "threshold": -1},
                 {"name": "aime24", "threshold": -1},
                 {"name": "aime25", "threshold": -1},
@@ -452,6 +466,8 @@ class TestModelAccuracy(CustomTestCase):
                 dataset_args = {}
                 # if dataset_name == "mmlu" or dataset_name == "modelscope/mmlu":
                 #     dataset_args = {"mmlu": {"subset_list": ["global_facts"]}}
+                if dataset_name == "mmlu":
+                    dataset_args = {"mmlu": {"dataset_hub": "hf", "dataset_id": "cais/mmlu"}}
 
                 config = TaskConfig(
                     model=model,
@@ -551,6 +567,8 @@ class TestModelAccuracy(CustomTestCase):
                 "2048",
                 "--tp-size",
                 "4",
+                "--mem-fraction-static",
+                "0.8",
             ],
             env={
                 "JAX_COMPILATION_CACHE_DIR": "/tmp/jax_compilation_cache",
@@ -560,7 +578,7 @@ class TestModelAccuracy(CustomTestCase):
         try:
             tasks = [
                 {"name": "gsm8k", "threshold": -1},
-                {"name": "cais/mmlu", "threshold": -1},
+                {"name": "mmlu", "threshold": -1},
                 {"name": "mmlu_pro", "threshold": -1},
                 {"name": "aime24", "threshold": -1},
                 {"name": "aime25", "threshold": -1},
@@ -571,8 +589,10 @@ class TestModelAccuracy(CustomTestCase):
                 threshold = task["threshold"]
 
                 dataset_args = {}
-                if dataset_name == "mmlu" or dataset_name == "modelscope/mmlu":
-                    dataset_args = {"mmlu": {"subset_list": ["global_facts"]}}
+                # if dataset_name == "mmlu" or dataset_name == "modelscope/mmlu":
+                #     dataset_args = {"mmlu": {"subset_list": ["global_facts"]}}
+                if dataset_name == "mmlu":
+                    dataset_args = {"mmlu": {"dataset_hub": "hf", "dataset_id": "cais/mmlu"}}
 
                 config = TaskConfig(
                     model=model,
@@ -672,6 +692,8 @@ class TestModelAccuracy(CustomTestCase):
                 "2048",
                 "--tp-size",
                 "4",
+                "--mem-fraction-static",
+                "0.8",
             ],
             env={
                 "JAX_COMPILATION_CACHE_DIR": "/tmp/jax_compilation_cache",
@@ -681,7 +703,7 @@ class TestModelAccuracy(CustomTestCase):
         try:
             tasks = [
                 {"name": "gsm8k", "threshold": -1},
-                {"name": "cais/mmlu", "threshold": -1},
+                {"name": "mmlu", "threshold": -1},
                 {"name": "mmlu_pro", "threshold": -1},
                 {"name": "aime24", "threshold": -1},
                 {"name": "aime25", "threshold": -1},
@@ -692,8 +714,10 @@ class TestModelAccuracy(CustomTestCase):
                 threshold = task["threshold"]
 
                 dataset_args = {}
-                if dataset_name == "mmlu" or dataset_name == "modelscope/mmlu":
-                    dataset_args = {"mmlu": {"subset_list": ["global_facts"]}}
+                # if dataset_name == "mmlu" or dataset_name == "modelscope/mmlu":
+                #     dataset_args = {"mmlu": {"subset_list": ["global_facts"]}}
+                if dataset_name == "mmlu":
+                    dataset_args = {"mmlu": {"dataset_hub": "hf", "dataset_id": "cais/mmlu"}}
 
                 config = TaskConfig(
                     model=model,
@@ -794,6 +818,8 @@ class TestModelAccuracy(CustomTestCase):
                 "--tp-size",
                 "4",
                 "--disable-hybrid-swa-memory",
+                "--mem-fraction-static",
+                "0.8",
             ],
             env={
                 "JAX_COMPILATION_CACHE_DIR": "/tmp/jax_compilation_cache",
@@ -803,7 +829,7 @@ class TestModelAccuracy(CustomTestCase):
         try:
             tasks = [
                 {"name": "gsm8k", "threshold": -1},
-                {"name": "cais/mmlu", "threshold": -1},
+                {"name": "mmlu", "threshold": -1},
                 {"name": "mmlu_pro", "threshold": -1},
                 {"name": "aime24", "threshold": -1},
                 {"name": "aime25", "threshold": -1},
@@ -814,8 +840,10 @@ class TestModelAccuracy(CustomTestCase):
                 threshold = task["threshold"]
 
                 dataset_args = {}
-                if dataset_name == "mmlu" or dataset_name == "modelscope/mmlu":
-                    dataset_args = {"mmlu": {"subset_list": ["global_facts"]}}
+                # if dataset_name == "mmlu" or dataset_name == "modelscope/mmlu":
+                #     dataset_args = {"mmlu": {"subset_list": ["global_facts"]}}
+                if dataset_name == "mmlu":
+                    dataset_args = {"mmlu": {"dataset_hub": "hf", "dataset_id": "cais/mmlu"}}
 
                 config = TaskConfig(
                     model=model,
@@ -919,6 +947,8 @@ class TestModelAccuracy(CustomTestCase):
                 "2",
                 "--ep-size",
                 "2",
+                "--mem-fraction-static",
+                "0.8",
             ],
             env={
                 "JAX_COMPILATION_CACHE_DIR": "/tmp/jax_compilation_cache",
@@ -929,7 +959,7 @@ class TestModelAccuracy(CustomTestCase):
         try:
             tasks = [
                 {"name": "gsm8k", "threshold": -1},
-                {"name": "cais/mmlu", "threshold": -1},
+                {"name": "mmlu", "threshold": -1},
                 {"name": "mmlu_pro", "threshold": -1},
                 {"name": "aime24", "threshold": -1},
                 {"name": "aime25", "threshold": -1},
@@ -940,8 +970,10 @@ class TestModelAccuracy(CustomTestCase):
                 threshold = task["threshold"]
 
                 dataset_args = {}
-                if dataset_name == "mmlu" or dataset_name == "modelscope/mmlu":
-                    dataset_args = {"mmlu": {"subset_list": ["global_facts"]}}
+                # if dataset_name == "mmlu" or dataset_name == "modelscope/mmlu":
+                #     dataset_args = {"mmlu": {"subset_list": ["global_facts"]}}
+                if dataset_name == "mmlu":
+                    dataset_args = {"mmlu": {"dataset_hub": "hf", "dataset_id": "cais/mmlu"}}
 
                 config = TaskConfig(
                     model=model,
@@ -1043,6 +1075,8 @@ class TestModelAccuracy(CustomTestCase):
                 "2048",
                 "--tp-size",
                 "4",
+                "--mem-fraction-static",
+                "0.8",
             ],
             env={
                 "JAX_COMPILATION_CACHE_DIR": "/tmp/jax_compilation_cache",
@@ -1052,7 +1086,7 @@ class TestModelAccuracy(CustomTestCase):
         try:
             tasks = [
                 {"name": "gsm8k", "threshold": -1},
-                {"name": "cais/mmlu", "threshold": -1},
+                {"name": "mmlu", "threshold": -1},
                 {"name": "mmlu_pro", "threshold": -1},
                 {"name": "aime24", "threshold": -1},
                 {"name": "aime25", "threshold": -1},
@@ -1064,8 +1098,10 @@ class TestModelAccuracy(CustomTestCase):
                 threshold = task["threshold"]
 
                 dataset_args = {}
-                if dataset_name == "mmlu" or dataset_name == "modelscope/mmlu":
-                    dataset_args = {"mmlu": {"subset_list": ["global_facts"]}}
+                # if dataset_name == "mmlu" or dataset_name == "modelscope/mmlu":
+                #     dataset_args = {"mmlu": {"subset_list": ["global_facts"]}}
+                if dataset_name == "mmlu":
+                    dataset_args = {"mmlu": {"dataset_hub": "hf", "dataset_id": "cais/mmlu"}}
 
                 config = TaskConfig(
                     model=model,
@@ -1167,6 +1203,8 @@ class TestModelAccuracy(CustomTestCase):
                 "2",
                 "--ep-size",
                 "2",
+                "--mem-fraction-static",
+                "0.8",
             ],
             env={
                 "JAX_COMPILATION_CACHE_DIR": "/tmp/jax_compilation_cache",
@@ -1177,7 +1215,7 @@ class TestModelAccuracy(CustomTestCase):
         try:
             tasks = [
                 {"name": "gsm8k", "threshold": -1},
-                {"name": "cais/mmlu", "threshold": -1},
+                {"name": "mmlu", "threshold": -1},
                 {"name": "mmlu_pro", "threshold": -1},
                 {"name": "aime24", "threshold": -1},
                 {"name": "aime25", "threshold": -1},
@@ -1188,8 +1226,10 @@ class TestModelAccuracy(CustomTestCase):
                 threshold = task["threshold"]
 
                 dataset_args = {}
-                if dataset_name == "mmlu" or dataset_name == "modelscope/mmlu":
-                    dataset_args = {"mmlu": {"subset_list": ["global_facts"]}}
+                # if dataset_name == "mmlu" or dataset_name == "modelscope/mmlu":
+                #     dataset_args = {"mmlu": {"subset_list": ["global_facts"]}}
+                if dataset_name == "mmlu":
+                    dataset_args = {"mmlu": {"dataset_hub": "hf", "dataset_id": "cais/mmlu"}}
 
                 config = TaskConfig(
                     model=model,
@@ -1293,6 +1333,8 @@ class TestModelAccuracy(CustomTestCase):
                 "2",
                 "--ep-size",
                 "2",
+                "--mem-fraction-static",
+                "0.8",
             ],
             env={
                 "JAX_COMPILATION_CACHE_DIR": "/tmp/jax_compilation_cache",
@@ -1303,7 +1345,7 @@ class TestModelAccuracy(CustomTestCase):
         try:
             tasks = [
                 {"name": "gsm8k", "threshold": -1},
-                {"name": "cais/mmlu", "threshold": -1},
+                {"name": "mmlu", "threshold": -1},
                 {"name": "mmlu_pro", "threshold": -1},
                 {"name": "aime24", "threshold": -1},
                 {"name": "aime25", "threshold": -1},
@@ -1314,8 +1356,10 @@ class TestModelAccuracy(CustomTestCase):
                 threshold = task["threshold"]
 
                 dataset_args = {}
-                if dataset_name == "mmlu" or dataset_name == "modelscope/mmlu":
-                    dataset_args = {"mmlu": {"subset_list": ["global_facts"]}}
+                # if dataset_name == "mmlu" or dataset_name == "modelscope/mmlu":
+                #     dataset_args = {"mmlu": {"subset_list": ["global_facts"]}}
+                if dataset_name == "mmlu":
+                    dataset_args = {"mmlu": {"dataset_hub": "hf", "dataset_id": "cais/mmlu"}}
 
                 config = TaskConfig(
                     model=model,
