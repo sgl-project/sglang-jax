@@ -158,39 +158,110 @@ suites = {
     "nightly-test-accuracy-text-models-tpu-v6e-1": [
         TestFile(
             "nightly-test/test_accuracy.py",
-            test_methods=["TestModelAccuracy.test_qwen_7b", "TestModelAccuracy.test_qwen3_8b"],
-        )
+            estimated_time=300,
+            test_methods=["TestModelAccuracy.test_qwen_7b"],
+        ),
+        TestFile(
+            "nightly-test/test_accuracy.py",
+            estimated_time=312,
+            test_methods=["TestModelAccuracy.test_qwen3_8b"],
+        ),
+        TestFile(
+            "nightly-test/test_accuracy.py",
+            estimated_time=171,
+            test_methods=["TestModelAccuracy.test_DEEPSEEK_R1_DISTILL_QWEN_1_5B"],
+        ),
+        TestFile(
+            "nightly-test/test_accuracy.py",
+            estimated_time=200,
+            test_methods=["TestModelAccuracy.test_GEMMA2_2B_IT"],
+        ),
     ],
     "nightly-test-accuracy-text-models-tpu-v6e-4": [
         TestFile(
             "nightly-test/test_accuracy.py",
-            test_methods=[
-                "TestModelAccuracy.test_qwen_7b_tp_4",
-                "TestModelAccuracy.test_qwen3_8b_tp_4",
-            ],
-        )
+            estimated_time=53,
+            test_methods=["TestModelAccuracy.test_qwen_7b_tp_4"],
+        ),
+        TestFile(
+            "nightly-test/test_accuracy.py",
+            estimated_time=64,
+            test_methods=["TestModelAccuracy.test_qwen3_8b_tp_4"],
+        ),
+        TestFile(
+            "nightly-test/test_accuracy.py",
+            estimated_time=50,
+            test_methods=["TestModelAccuracy.test_bailing_moe_tp_2_ep2"],
+        ),
+        TestFile(
+            "nightly-test/test_accuracy.py",
+            estimated_time=90,
+            test_methods=["TestModelAccuracy.test_DEEPSEEK_R1_DISTILL_QWEN_1_5B_tp_4"],
+        ),
+        TestFile(
+            "nightly-test/test_accuracy.py",
+            estimated_time=62,
+            test_methods=["TestModelAccuracy.test_QWEN3_CODER_30B_A3B_INSTRUCT_tp_2_ep_2"],
+        ),
+        TestFile(
+            "nightly-test/test_accuracy.py",
+            estimated_time=2,
+            test_methods=["TestModelAccuracy.test_GEMMA2_2B_IT_tp_4"],
+        ),
     ],
     "nightly-test-perf-text-models-tpu-v6e-1": [
         TestFile(
             "nightly-test/test_pref.py",
-            test_methods=[
-                "TestModePerf.test_input_throughput_qwen_7b_con_8_1k_1",
-                "TestModePerf.test_output_throughput_qwen_7b_con_8_1k_1",
-                "TestModePerf.test_ttft_qwen_7b_con_8_1k_1",
-                "TestModePerf.test_itl_qwen_7b_con_8_1k_1",
-            ],
-        )
+            estimated_time=7,
+            test_methods=["TestModePerf.test_qwen_7b_performance_tp_1"],
+        ),
+        TestFile(
+            "nightly-test/test_pref.py",
+            estimated_time=8,
+            test_methods=["TestModePerf.test_qwen3_8b_performance_tp_1"],
+        ),
+        TestFile(
+            "nightly-test/test_pref.py",
+            estimated_time=2,
+            test_methods=["TestModePerf.test_GEMMA2_2B_IT_performance_tp_1"],
+        ),
+        TestFile(
+            "nightly-test/test_pref.py",
+            estimated_time=2.5,
+            test_methods=["TestModePerf.test_QWEN2_5_7B_INSTRUCT_performance_tp_1"],
+        ),
     ],
     "nightly-test-perf-text-models-tpu-v6e-4": [
         TestFile(
             "nightly-test/test_pref.py",
-            test_methods=[
-                "TestModePerf.test_input_throughput_qwen_7b_tp_4_con_8_1k_1",
-                "TestModePerf.test_output_throughput_qwen_7b_tp_4_con_8_1k_1",
-                "TestModePerf.test_ttft_qwen_7b_tp_4_con_8_1k_1",
-                "TestModePerf.test_itl_qwen_7b_tp_4_con_8_1k_1",
-            ],
-        )
+            estimated_time=7,
+            test_methods=["TestModePerf.test_qwen_7b_performance_tp_4"],
+        ),
+        TestFile(
+            "nightly-test/test_pref.py",
+            estimated_time=8,
+            test_methods=["TestModePerf.test_qwen3_8b_performance_tp_4"],
+        ),
+        TestFile(
+            "nightly-test/test_pref.py",
+            estimated_time=30,
+            test_methods=["TestModePerf.test_QWEN3_CODER_30B_A3B_INSTRUCT_performance_tp_2_ep_2"],
+        ),
+        TestFile(
+            "nightly-test/test_pref.py",
+            estimated_time=2,
+            test_methods=["TestModePerf.test_GEMMA2_2B_IT_performance_tp_4"],
+        ),
+        TestFile(
+            "nightly-test/test_pref.py",
+            estimated_time=20,
+            test_methods=["TestModePerf.test_bailing_moe_performance_tp_2_ep_2"],
+        ),
+        TestFile(
+            "nightly-test/test_pref.py",
+            estimated_time=2.5,
+            test_methods=["TestModePerf.test_QWEN2_5_7B_INSTRUCT_performance_tp_4"],
+        ),
     ],
     "sglang_dependency_test": [],
     "unit-test-tpu-v6e-1": [
@@ -303,7 +374,7 @@ if __name__ == "__main__":
     arg_parser.add_argument(
         "--timeout-per-file",
         type=int,
-        default=1800,
+        default=180000,
         help="The time limit for running one file in seconds.",
     )
     arg_parser.add_argument(

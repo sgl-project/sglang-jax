@@ -47,13 +47,14 @@ For more features and usage details, please read the documents in the [`docs`](h
 
 SGL-JAX is designed for easy extension to new model architectures. It currently provides first-class, optimized support for:
 
--   **Qwen**
--   **Qwen 2**
--   **Qwen 2 MOE**
--   **Qwen 3**
--   **Qwen 3 MoE**
--   **Llama**
--   **Bailing MoE**
+-   **Qwen**: Performance needs to improve.
+-   **Qwen 2**: Performance needs to improve.
+-   **Qwen 2 MoE**: Performance needs to improve.
+-   **Qwen 3**: Currently these series have achieved our best performance.
+-   **Qwen 3 MoE**: Apart from models like Qwen-coder3-480B with large parameters, these series have achieved our best performance.
+-   **Llama**: Performance needs to improve.
+-   **Bailing MoE**: Performance needs to improve.
+
 
 ## Performance and Benchmarking
 
