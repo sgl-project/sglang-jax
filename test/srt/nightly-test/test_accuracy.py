@@ -71,7 +71,7 @@ class TestModelAccuracy(CustomTestCase):
         try:
             tasks = [
                 {"name": "gsm8k", "threshold": -1},
-                {"name": "mmlu", "threshold": -1},
+                {"name": "cais/mmlu", "threshold": -1},
                 {"name": "mmlu_pro", "threshold": -1},
                 {"name": "aime24", "threshold": -1},
                 {"name": "aime25", "threshold": -1},
@@ -194,7 +194,7 @@ class TestModelAccuracy(CustomTestCase):
         try:
             tasks = [
                 {"name": "gsm8k", "threshold": -1},
-                {"name": "mmlu", "threshold": -1},
+                {"name": "cais/mmlu", "threshold": -1},
                 {"name": "mmlu_pro", "threshold": -1},
                 {"name": "aime24", "threshold": -1},
                 {"name": "aime25", "threshold": -1},
@@ -317,7 +317,7 @@ class TestModelAccuracy(CustomTestCase):
         try:
             tasks = [
                 {"name": "gsm8k", "threshold": -1},
-                {"name": "mmlu", "threshold": -1},
+                {"name": "cais/mmlu", "threshold": -1},
                 {"name": "mmlu_pro", "threshold": -1},
                 {"name": "aime24", "threshold": -1},
                 {"name": "aime25", "threshold": -1},
@@ -439,7 +439,7 @@ class TestModelAccuracy(CustomTestCase):
         try:
             tasks = [
                 {"name": "gsm8k", "threshold": -1},
-                {"name": "mmlu", "threshold": -1},
+                {"name": "cais/mmlu", "threshold": -1},
                 {"name": "mmlu_pro", "threshold": -1},
                 {"name": "aime24", "threshold": -1},
                 {"name": "aime25", "threshold": -1},
@@ -560,7 +560,7 @@ class TestModelAccuracy(CustomTestCase):
         try:
             tasks = [
                 {"name": "gsm8k", "threshold": -1},
-                {"name": "mmlu", "threshold": -1},
+                {"name": "cais/mmlu", "threshold": -1},
                 {"name": "mmlu_pro", "threshold": -1},
                 {"name": "aime24", "threshold": -1},
                 {"name": "aime25", "threshold": -1},
@@ -681,7 +681,7 @@ class TestModelAccuracy(CustomTestCase):
         try:
             tasks = [
                 {"name": "gsm8k", "threshold": -1},
-                {"name": "mmlu", "threshold": -1},
+                {"name": "cais/mmlu", "threshold": -1},
                 {"name": "mmlu_pro", "threshold": -1},
                 {"name": "aime24", "threshold": -1},
                 {"name": "aime25", "threshold": -1},
@@ -803,7 +803,7 @@ class TestModelAccuracy(CustomTestCase):
         try:
             tasks = [
                 {"name": "gsm8k", "threshold": -1},
-                {"name": "mmlu", "threshold": -1},
+                {"name": "cais/mmlu", "threshold": -1},
                 {"name": "mmlu_pro", "threshold": -1},
                 {"name": "aime24", "threshold": -1},
                 {"name": "aime25", "threshold": -1},
@@ -929,7 +929,7 @@ class TestModelAccuracy(CustomTestCase):
         try:
             tasks = [
                 {"name": "gsm8k", "threshold": -1},
-                {"name": "mmlu", "threshold": -1},
+                {"name": "cais/mmlu", "threshold": -1},
                 {"name": "mmlu_pro", "threshold": -1},
                 {"name": "aime24", "threshold": -1},
                 {"name": "aime25", "threshold": -1},
@@ -1052,7 +1052,7 @@ class TestModelAccuracy(CustomTestCase):
         try:
             tasks = [
                 {"name": "gsm8k", "threshold": -1},
-                {"name": "mmlu", "threshold": -1},
+                {"name": "cais/mmlu", "threshold": -1},
                 {"name": "mmlu_pro", "threshold": -1},
                 {"name": "aime24", "threshold": -1},
                 {"name": "aime25", "threshold": -1},
@@ -1177,7 +1177,7 @@ class TestModelAccuracy(CustomTestCase):
         try:
             tasks = [
                 {"name": "gsm8k", "threshold": -1},
-                {"name": "mmlu", "threshold": -1},
+                {"name": "cais/mmlu", "threshold": -1},
                 {"name": "mmlu_pro", "threshold": -1},
                 {"name": "aime24", "threshold": -1},
                 {"name": "aime25", "threshold": -1},
@@ -1303,7 +1303,7 @@ class TestModelAccuracy(CustomTestCase):
         try:
             tasks = [
                 {"name": "gsm8k", "threshold": -1},
-                {"name": "mmlu", "threshold": -1},
+                {"name": "cais/mmlu", "threshold": -1},
                 {"name": "mmlu_pro", "threshold": -1},
                 {"name": "aime24", "threshold": -1},
                 {"name": "aime25", "threshold": -1},
