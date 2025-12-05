@@ -23,10 +23,9 @@ class Gemma2MLP(nnx.Module):
         self,
         hidden_size: int,
         intermediate_size: int,
+        mesh: jax.sharding.Mesh,
         layer_id: int = 0,
-        rngs: nnx.Rngs = None,
         dtype: jnp.dtype = jnp.bfloat16,
-        mesh: jax.sharding.Mesh = None,
     ):
         self.layer_id = layer_id
 
@@ -36,7 +35,6 @@ class Gemma2MLP(nnx.Module):
             kernel_axes=(None, "tensor"),
             use_bias=False,
             params_dtype=dtype,
-            rngs=rngs,
             mesh=mesh,
         )
 
@@ -46,7 +44,6 @@ class Gemma2MLP(nnx.Module):
             kernel_axes=(None, "tensor"),
             use_bias=False,
             params_dtype=dtype,
-            rngs=rngs,
             mesh=mesh,
         )
 
@@ -56,7 +53,6 @@ class Gemma2MLP(nnx.Module):
             use_bias=False,
             kernel_axes=("tensor", None),
             params_dtype=dtype,
-            rngs=rngs,
             mesh=mesh,
         )
 
@@ -79,14 +75,13 @@ class Gemma2Attention(nnx.Module):
         num_kv_heads: int,
         head_dim: int,
         max_position_embeddings: int,
+        mesh: jax.sharding.Mesh,
         rope_theta: float = 10000,
         query_pre_attn_scalar: int = 256,
         sliding_window_size: int = 0,
         logit_cap: float = 0,
         attention_bias: bool = False,
         dtype: jnp.dtype = jnp.bfloat16,
-        rngs: nnx.Rngs = None,
-        mesh: jax.sharding.Mesh = None,
     ):
         self.hidden_size = hidden_size
         self.num_heads = num_heads
@@ -99,7 +94,6 @@ class Gemma2Attention(nnx.Module):
             output_size=self.num_heads * self.head_dim,
             use_bias=attention_bias,
             kernel_axes=(None, "tensor"),
-            rngs=rngs,
             params_dtype=dtype,
             mesh=mesh,
         )
@@ -108,7 +102,6 @@ class Gemma2Attention(nnx.Module):
             output_size=self.num_kv_heads * self.head_dim,
             use_bias=attention_bias,
             kernel_axes=(None, "tensor"),
-            rngs=rngs,
             params_dtype=dtype,
             mesh=mesh,
         )
@@ -117,7 +110,6 @@ class Gemma2Attention(nnx.Module):
             output_size=self.num_kv_heads * self.head_dim,
             use_bias=attention_bias,
             kernel_axes=(None, "tensor"),
-            rngs=rngs,
             params_dtype=dtype,
             mesh=mesh,
         )
@@ -126,7 +118,6 @@ class Gemma2Attention(nnx.Module):
             output_size=self.hidden_size,
             use_bias=attention_bias,
             kernel_axes=("tensor", None),
-            rngs=rngs,
             params_dtype=dtype,
             mesh=mesh,
         )
@@ -174,10 +165,9 @@ class Gemma2DecoderLayer(nnx.Module):
     def __init__(
         self,
         config: PretrainedConfig,
+        mesh: jax.sharding.Mesh,
         layer_id: int = 0,
         dtype: jnp.dtype = jnp.bfloat16,
-        rngs: nnx.Rngs = None,
-        mesh: jax.sharding.Mesh = None,
     ):
         self.layer_id = layer_id
         use_sliding_window = config.layer_types[layer_id] == "sliding_attention"
@@ -194,7 +184,6 @@ class Gemma2DecoderLayer(nnx.Module):
             logit_cap=config.attn_logit_softcapping,
             attention_bias=config.attention_bias,
             dtype=dtype,
-            rngs=rngs,
             mesh=mesh,
         )
         self.mlp = Gemma2MLP(
@@ -202,21 +191,24 @@ class Gemma2DecoderLayer(nnx.Module):
             config.intermediate_size,
             layer_id=layer_id,
             dtype=dtype,
-            rngs=rngs,
             mesh=mesh,
         )
 
         self.input_layernorm = GemmaRMSNorm(
-            config.hidden_size, epsilon=config.rms_norm_eps, rngs=rngs
+            config.hidden_size,
+            epsilon=config.rms_norm_eps,
         )
         self.post_attention_layernorm = GemmaRMSNorm(
-            config.hidden_size, epsilon=config.rms_norm_eps, rngs=rngs
+            config.hidden_size,
+            epsilon=config.rms_norm_eps,
         )
         self.pre_feedforward_layernorm = GemmaRMSNorm(
-            config.hidden_size, epsilon=config.rms_norm_eps, rngs=rngs
+            config.hidden_size,
+            epsilon=config.rms_norm_eps,
         )
         self.post_feedforward_layernorm = GemmaRMSNorm(
-            config.hidden_size, epsilon=config.rms_norm_eps, rngs=rngs
+            config.hidden_size,
+            epsilon=config.rms_norm_eps,
         )
 
     def __call__(
@@ -256,14 +248,12 @@ class Gemma2Model(nnx.Module):
     def __init__(
         self,
         config: PretrainedConfig,
+        mesh: jax.sharding.Mesh,
         dtype: jnp.dtype = jnp.bfloat16,
-        rngs: nnx.Rngs = None,
-        mesh: jax.sharding.Mesh = None,
     ):
         self.embed_tokens = Embed(
             config.vocab_size,
             config.hidden_size,
-            rngs=rngs,
             dtype=dtype,
             param_dtype=dtype,
             kernel_axes=("tensor", None),
@@ -276,14 +266,13 @@ class Gemma2Model(nnx.Module):
                     config,
                     layer_id=i,
                     dtype=dtype,
-                    rngs=rngs,
                     mesh=mesh,
                 )
                 for i in range(config.num_hidden_layers)
             ]
         )
 
-        self.norm = GemmaRMSNorm(config.hidden_size, epsilon=config.rms_norm_eps, rngs=rngs)
+        self.norm = GemmaRMSNorm(config.hidden_size, epsilon=config.rms_norm_eps)
 
         self.hidden_size = config.hidden_size
 
@@ -315,23 +304,20 @@ class Gemma2ForCausalLM(nnx.Module):
     def __init__(
         self,
         config: PretrainedConfig,
+        mesh: jax.sharding.Mesh,
         dtype: jnp.dtype = jnp.bfloat16,
-        rngs: nnx.Rngs = None,
-        mesh: jax.sharding.Mesh = None,
     ):
         self.mesh = mesh
         self.config = config
         self.dtype = dtype
-        self.model = Gemma2Model(config, dtype=self.dtype, rngs=rngs, mesh=mesh)
+        self.model = Gemma2Model(config, dtype=self.dtype, mesh=mesh)
         self.logits_processor = LogitsProcessor(
             self.config.vocab_size,
             soft_cap=self.config.final_logit_softcapping,
             mesh=self.mesh,
         )
 
-    def load_weights(self, model_config: ModelConfig, rng_key: jax.Array):
-        self.rng = nnx.Rngs(rng_key)
-
+    def load_weights(self, model_config: ModelConfig):
         loader = WeightLoader(
             model=self, model_config=model_config, mesh=self.mesh, dtype=self.dtype
         )
