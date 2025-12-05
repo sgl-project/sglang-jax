@@ -167,7 +167,7 @@ class Gemma2DecoderLayer(nnx.Module):
         config: PretrainedConfig,
         mesh: jax.sharding.Mesh,
         layer_id: int = 0,
-        dtype: jnp.dtype = jnp.bfloat16,        
+        dtype: jnp.dtype = jnp.bfloat16,
     ):
         self.layer_id = layer_id
         use_sliding_window = config.layer_types[layer_id] == "sliding_attention"
