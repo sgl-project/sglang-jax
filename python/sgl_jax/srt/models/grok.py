@@ -801,7 +801,7 @@ class Grok1ForCausalLM(nnx.Module):
         weight_mappings = self._create_grok_weight_mappings()
 
         loader.load_weights_from_safetensors(
-            cast(dict[str, str | list[str] | WeightMapping], weight_mappings),
+            weight_mappings,
             safetensors_partition=8,
         )
         logger.info("Grok weights loaded successfully!")
