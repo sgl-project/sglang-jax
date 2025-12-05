@@ -29,6 +29,14 @@ class ModelImpl(str, Enum):
     TRANSFORMERS = "transformers"
 
 
+class MoEBackend(str, Enum):
+    """Backend for Mixture of Experts computation."""
+
+    EPMOE = "epmoe"  # Native Expert Parallel MoE (default)
+    FUSED = "fused"  # Fused Kernel (TPU-optimized)
+    AUTO = "auto"  # Automatically select based on ep_size
+
+
 class ModelConfig:
     def __init__(
         self,
@@ -44,6 +52,7 @@ class ModelConfig:
         model_impl: str | ModelImpl = ModelImpl.AUTO,
         quantization: str | None = None,
         model_layer_nums: int | None = None,
+        moe_backend: str | MoEBackend = MoEBackend.AUTO,
     ) -> None:
 
         self.model_path = model_path
@@ -53,6 +62,15 @@ class ModelConfig:
         # if ep_size > 1, use ep moe, else use fused moe
         # TODO: support ep moe with ETP
         self.ep_size = 1
+
+        # Process MoE backend selection
+        self.moe_backend = MoEBackend(moe_backend) if isinstance(moe_backend, str) else moe_backend
+
+        # Auto-select backend based on ep_size
+        if self.moe_backend == MoEBackend.AUTO:
+            # If ep_size > 1, use EPMoE (expert parallelism across devices)
+            # Otherwise use Fused kernel (single-device TPU optimization)
+            self.moe_backend = MoEBackend.EPMOE if self.ep_size > 1 else MoEBackend.FUSED
         # Parse args
         self.maybe_pull_model_tokenizer_from_remote()
         self.model_override_args = json.loads(model_override_args)
@@ -176,6 +194,7 @@ class ModelConfig:
             quantization=server_args.quantization,
             model_impl=server_args.model_impl,
             model_layer_nums=server_args.model_layer_nums,
+            moe_backend=server_args.moe_backend,
             **kwargs,
         )
 
