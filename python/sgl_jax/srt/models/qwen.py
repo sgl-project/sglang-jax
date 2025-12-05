@@ -26,9 +26,9 @@ class QWenMLP(nnx.Module):
         self,
         hidden_size: int,
         intermediate_size: int,
+        mesh: jax.sharding.Mesh,
         layer_id: int = 0,
         dtype: jnp.dtype = jnp.float16,
-        mesh: jax.sharding.Mesh = None,
     ):
         self.layer_id = layer_id
 
@@ -75,11 +75,11 @@ class QWenAttention(nnx.Module):
         hidden_size: int,
         num_heads: int,
         max_position_embeddings: int,
+        mesh: jax.sharding.Mesh,
         rope_theta: float = 10000,
         rope_scaling: dict[str, Any] | None = None,
         layer_id: int = 0,
         dtype: jnp.dtype = jnp.float16,
-        mesh: jax.sharding.Mesh = None,
     ):
         self.hidden_size = hidden_size
         self.num_heads = num_heads
@@ -162,9 +162,9 @@ class QWenBlock(nnx.Module):
     def __init__(
         self,
         config: PretrainedConfig,
+        mesh: jax.sharding.Mesh,
         layer_id: int = 0,
         dtype: jnp.dtype = jnp.float16,
-        mesh: jax.sharding.Mesh = None,
     ):
         self.layer_id = layer_id
 
@@ -232,8 +232,8 @@ class QWenModel(nnx.Module):
     def __init__(
         self,
         config: PretrainedConfig,
+        mesh: jax.sharding.Mesh,
         dtype: jnp.dtype = jnp.float16,
-        mesh: jax.sharding.Mesh = None,
     ):
         vocab_size = ((config.vocab_size + 63) // 64) * 64
 
@@ -290,8 +290,8 @@ class QWenLMHeadModel(nnx.Module):
     def __init__(
         self,
         config: PretrainedConfig,
+        mesh: jax.sharding.Mesh,
         dtype: jnp.dtype = jnp.bfloat16,
-        mesh: jax.sharding.Mesh = None,
     ):
         self.mesh = mesh
         self.config = config

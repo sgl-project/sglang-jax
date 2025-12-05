@@ -29,6 +29,7 @@ class BailingMoEAttention(nnx.Module):
         num_heads: int,
         num_kv_heads: int,
         max_position_embeddings: int,
+        mesh: jax.sharding.Mesh,
         rope_theta: float = 10000,
         rope_scaling: dict[str, Any] | None = None,
         head_dim: int | None = None,
@@ -38,7 +39,6 @@ class BailingMoEAttention(nnx.Module):
         layer_id: int = 0,
         attention_bias: bool = False,
         dtype: jnp.dtype = jnp.bfloat16,
-        mesh: jax.sharding.Mesh = None,
     ):
         self.layer_id = layer_id
         assert num_heads % num_kv_heads == 0
@@ -149,9 +149,9 @@ class BailingMoEMLP(nnx.Module):
         self,
         hidden_size: int,
         intermediate_size: int,
+        mesh: jax.sharding.Mesh,
         layer_id: int = 0,
         dtype: jnp.dtype = jnp.bfloat16,
-        mesh: jax.sharding.Mesh = None,
     ) -> None:
         self.layer_id = layer_id
 
@@ -196,9 +196,9 @@ class BailingMoEDecoderLayer(nnx.Module):
     def __init__(
         self,
         config: PretrainedConfig,
+        mesh: jax.sharding.Mesh,
         layer_id: int = 0,
         dtype: jnp.dtype = jnp.bfloat16,
-        mesh: jax.sharding.Mesh = None,
     ):
         self.layer_id = layer_id
         self.hidden_size = config.hidden_size
@@ -353,8 +353,8 @@ class BailingMoEModel(nnx.Module):
     def __init__(
         self,
         config: PretrainedConfig,
+        mesh: jax.sharding.Mesh,
         dtype: jnp.dtype = jnp.bfloat16,
-        mesh: jax.sharding.Mesh = None,
     ):
         self.config = config
         self.padding_idx = config.pad_token_id
@@ -416,8 +416,8 @@ class BailingMoEForCausalLM(nnx.Module):
     def __init__(
         self,
         config: PretrainedConfig,
+        mesh: jax.sharding.Mesh,
         dtype: jnp.dtype = jnp.bfloat16,
-        mesh: jax.sharding.Mesh = None,
     ):
         self.mesh = mesh
         self.config = config

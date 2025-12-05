@@ -23,9 +23,9 @@ class Gemma2MLP(nnx.Module):
         self,
         hidden_size: int,
         intermediate_size: int,
+        mesh: jax.sharding.Mesh,
         layer_id: int = 0,
         dtype: jnp.dtype = jnp.bfloat16,
-        mesh: jax.sharding.Mesh = None,
     ):
         self.layer_id = layer_id
 
@@ -75,13 +75,13 @@ class Gemma2Attention(nnx.Module):
         num_kv_heads: int,
         head_dim: int,
         max_position_embeddings: int,
+        mesh: jax.sharding.Mesh,
         rope_theta: float = 10000,
         query_pre_attn_scalar: int = 256,
         sliding_window_size: int = 0,
         logit_cap: float = 0,
         attention_bias: bool = False,
         dtype: jnp.dtype = jnp.bfloat16,
-        mesh: jax.sharding.Mesh = None,
     ):
         self.hidden_size = hidden_size
         self.num_heads = num_heads
@@ -165,9 +165,9 @@ class Gemma2DecoderLayer(nnx.Module):
     def __init__(
         self,
         config: PretrainedConfig,
+        mesh: jax.sharding.Mesh,
         layer_id: int = 0,
-        dtype: jnp.dtype = jnp.bfloat16,
-        mesh: jax.sharding.Mesh = None,
+        dtype: jnp.dtype = jnp.bfloat16,        
     ):
         self.layer_id = layer_id
         use_sliding_window = config.layer_types[layer_id] == "sliding_attention"
@@ -248,8 +248,8 @@ class Gemma2Model(nnx.Module):
     def __init__(
         self,
         config: PretrainedConfig,
+        mesh: jax.sharding.Mesh,
         dtype: jnp.dtype = jnp.bfloat16,
-        mesh: jax.sharding.Mesh = None,
     ):
         self.embed_tokens = Embed(
             config.vocab_size,
@@ -304,8 +304,8 @@ class Gemma2ForCausalLM(nnx.Module):
     def __init__(
         self,
         config: PretrainedConfig,
+        mesh: jax.sharding.Mesh,
         dtype: jnp.dtype = jnp.bfloat16,
-        mesh: jax.sharding.Mesh = None,
     ):
         self.mesh = mesh
         self.config = config

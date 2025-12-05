@@ -30,6 +30,7 @@ class QWen3MoeAttention(nnx.Module):
         num_heads: int,
         num_kv_heads: int,
         max_position_embeddings: int,
+        mesh: jax.sharding.Mesh,
         rope_theta: float = 10000,
         rope_scaling: dict[str, Any] | None = None,
         head_dim: int | None = None,
@@ -37,7 +38,6 @@ class QWen3MoeAttention(nnx.Module):
         layer_id: int = 0,
         attention_bias: bool = False,
         dtype: jnp.dtype = jnp.bfloat16,
-        mesh: jax.sharding.Mesh = None,
     ):
         self.layer_id = layer_id
         assert num_heads % num_kv_heads == 0
@@ -138,9 +138,9 @@ class QWen3MoeDecoderLayer(nnx.Module):
     def __init__(
         self,
         config: PretrainedConfig,
+        mesh: jax.sharding.Mesh,
         layer_id: int = 0,
         dtype: jnp.dtype = jnp.bfloat16,
-        mesh: jax.sharding.Mesh = None,
     ):
         self.layer_id = layer_id
         self.hidden_size = config.hidden_size
@@ -254,8 +254,8 @@ class QWen3MoeModel(nnx.Module):
     def __init__(
         self,
         config: PretrainedConfig,
+        mesh: jax.sharding.Mesh,
         dtype: jnp.dtype = jnp.bfloat16,
-        mesh: jax.sharding.Mesh = None,
     ):
         self.config = config
         self.padding_idx = config.pad_token_id
@@ -319,8 +319,8 @@ class Qwen3MoeForCausalLM(nnx.Module):
     def __init__(
         self,
         config: PretrainedConfig,
+        mesh: jax.sharding.Mesh,
         dtype: jnp.dtype = jnp.bfloat16,
-        mesh: jax.sharding.Mesh = None,
     ):
         self.mesh = mesh
         self.config = config

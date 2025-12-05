@@ -64,7 +64,7 @@ class WeightLoader:
         self,
         model: nnx.Module,
         model_config: ModelConfig,
-        mesh: Mesh | None,
+        mesh: Mesh,
         dtype: jnp.dtype = jnp.bfloat16,
     ):
         self.model = model

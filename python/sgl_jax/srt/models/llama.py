@@ -44,9 +44,9 @@ class LlamaMLP(nnx.Module):
         self,
         hidden_size: int,
         intermediate_size: int,
+        mesh: jax.sharding.Mesh,
         layer_id: int = 0,
         dtype: jnp.dtype = jnp.bfloat16,
-        mesh: jax.sharding.Mesh = None,
     ) -> None:
         self.layer_id = layer_id
 
@@ -93,6 +93,7 @@ class LlamaAttention(nnx.Module):
         hidden_size: int,
         num_heads: int,
         num_kv_heads: int,
+        mesh: jax.sharding.Mesh,
         layer_id: int = 0,
         rope_theta: float = 10000,
         rope_scaling: dict[str, Any] | None = None,
@@ -102,7 +103,6 @@ class LlamaAttention(nnx.Module):
         max_position_embeddings: int = 8192,
         dtype: jnp.dtype = jnp.bfloat16,
         attention_bias: bool = False,
-        mesh: jax.sharding.Mesh = None,
     ) -> None:
         self.hidden_size = hidden_size
         self.q_head_num = num_heads
@@ -197,9 +197,9 @@ class LlamaDecoderLayer(nnx.Module):
     def __init__(
         self,
         config: LlamaConfig,
+        mesh: jax.sharding.Mesh,
         layer_id: int = 0,
         dtype: jnp.dtype = jnp.bfloat16,
-        mesh: jax.sharding.Mesh = None,
     ) -> None:
         # super().__init__()
         self.hidden_size = config.hidden_size
@@ -300,9 +300,9 @@ class LlamaModel(nnx.Module):
     def __init__(
         self,
         config: LlamaConfig,
+        mesh: jax.sharding.Mesh,
         dtype: jnp.dtype = jnp.bfloat16,
         is_draft_model: bool = False,
-        mesh: jax.sharding.Mesh = None,
     ) -> None:
         super().__init__()
         self.config = config
@@ -375,8 +375,8 @@ class LlamaForCausalLM(nnx.Module):
     def __init__(
         self,
         config: PretrainedConfig,
+        mesh: jax.sharding.Mesh,
         dtype: jnp.dtype = jnp.bfloat16,
-        mesh: jax.sharding.Mesh = None,
     ):
         self.mesh = mesh
         self.config = config

@@ -47,9 +47,9 @@ class LlamaDecoderLayer(LlamaDecoderLayer):
     def __init__(
         self,
         config: LlamaConfig,
+        mesh: jax.sharding.Mesh,
         layer_id: int = 0,
         dtype: jnp.dtype = jnp.bfloat16,
-        mesh: jax.sharding.Mesh = None,
     ) -> None:
         super().__init__(config, layer_id, dtype=dtype, mesh=mesh)
 
@@ -130,8 +130,8 @@ class LlamaEagleModel(LlamaModel):
     def __init__(
         self,
         config: LlamaConfig,
+        mesh: jax.sharding.Mesh,
         dtype: jnp.dtype = jnp.bfloat16,
-        mesh: jax.sharding.Mesh = None,
     ) -> None:
         super().__init__(config=config, dtype=dtype, is_draft_model=True, mesh=mesh)
         self.config = config
@@ -222,8 +222,8 @@ class LlamaForCausalLMEagle3(LlamaForCausalLM):
     def __init__(
         self,
         config: LlamaConfig,
+        mesh: jax.sharding.Mesh,
         dtype: jnp.dtype = jnp.bfloat16,
-        mesh: jax.sharding.Mesh = None,
     ) -> None:
         self.config = config
         self.mesh = mesh
