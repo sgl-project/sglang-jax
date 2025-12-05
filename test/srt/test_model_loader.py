@@ -272,7 +272,9 @@ class TestModelLoaderWithRealModel(unittest.TestCase):
 
             # Create QWen model instance with mesh context
             with jax.set_mesh(self.mesh):
-                model = QWenLMHeadModel(model_config.hf_config, model_config.dtype, self.mesh)
+                model = QWenLMHeadModel(
+                    model_config.hf_config, dtype=model_config.dtype, mesh=self.mesh
+                )
 
             self.assertIsInstance(model, QWenLMHeadModel)
             self.assertEqual(model.config, model_config.hf_config)
@@ -320,7 +322,9 @@ class TestModelLoaderWithRealModel(unittest.TestCase):
 
             # Create QWen model instance with mesh context
             with jax.set_mesh(self.mesh):
-                model = QWenLMHeadModel(model_config.hf_config, model_config.dtype, self.mesh)
+                model = QWenLMHeadModel(
+                    model_config.hf_config, dtype=model_config.dtype, mesh=self.mesh
+                )
 
             # Print the actual parameter structure of the model
             try:
@@ -403,7 +407,9 @@ class TestModelLoaderWithRealModel(unittest.TestCase):
 
             # Create QWen model instance with mesh context
             with jax.set_mesh(self.mesh):
-                model = QWenLMHeadModel(model_config.hf_config, model_config.dtype, self.mesh)
+                model = QWenLMHeadModel(
+                    model_config.hf_config, dtype=model_config.dtype, mesh=self.mesh
+                )
 
             # Check what attributes the model actually has
             print(" Model Attributes:")
@@ -507,7 +513,9 @@ class TestModelLoaderWithRealModel(unittest.TestCase):
 
             # Create QWen model instance with mesh context
             with jax.set_mesh(self.mesh):
-                model = QWenLMHeadModel(model_config.hf_config, model_config.dtype, self.mesh)
+                model = QWenLMHeadModel(
+                    model_config.hf_config, dtype=model_config.dtype, mesh=self.mesh
+                )
 
             print(" Validating Model Parameter Structure:")
             print(f"  Model type: {type(model).__name__}")
