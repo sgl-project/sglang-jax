@@ -9,7 +9,7 @@ resources:
 
 setup: |
   if [ -d "sglang-jax" ]; then pip uninstall -y sgl-jax || true && rm -rf sglang-jax; fi
-  git clone git@github.com:xiuhu17/sglang-jax.git
+  git clone https://github.com/sgl-project/sglang-jax.git
   cd sglang-jax && git fetch origin $REF:$REF && git checkout $REF
   uv venv --python 3.12
   source .venv/bin/activate
