@@ -158,9 +158,9 @@ class ServerArgs:
         # update device
         if self.device:
             platform_env = os.environ.get("JAX_PLATFORMS", self.device)
-            assert self.device == platform_env, (
-                f"device {self.device} is not consistent with 'JAX_PLATFORMS' {platform_env}"
-            )
+            assert (
+                self.device == platform_env
+            ), f"device {self.device} is not consistent with 'JAX_PLATFORMS' {platform_env}"
         else:
             platform_env = os.environ.get("JAX_PLATFORMS", "")
             if platform_env != "":
@@ -927,9 +927,9 @@ class ServerArgs:
         # Check chunked prefill
         # Skip validation if chunked prefill is disabled (i.e., size <= 0).
         if self.chunked_prefill_size > 0:
-            assert self.chunked_prefill_size % self.page_size == 0, (
-                "chunked_prefill_size must be divisible by page_size"
-            )
+            assert (
+                self.chunked_prefill_size % self.page_size == 0
+            ), "chunked_prefill_size must be divisible by page_size"
 
         # Disallow overlap scheduler when speculative decoding is enabled
         if self.speculative_algorithm is not None and not self.disable_overlap_schedule:

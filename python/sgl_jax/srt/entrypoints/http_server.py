@@ -250,9 +250,9 @@ async def get_model_info():
 @app.get("/get_server_info")
 async def get_server_info():
     # Returns interna states per DP.
-    internal_states: list[
-        dict[Any, Any]
-    ] = await _global_state.tokenizer_manager.get_internal_state()
+    internal_states: list[dict[Any, Any]] = (
+        await _global_state.tokenizer_manager.get_internal_state()
+    )
     return {
         **dataclasses.asdict(_global_state.tokenizer_manager.server_args),
         **_global_state.scheduler_info,
