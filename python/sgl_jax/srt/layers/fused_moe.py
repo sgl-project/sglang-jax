@@ -122,30 +122,12 @@ class FusedEPMoE(nnx.Module):
         self.ep_size = ep_size
         self.activation = activation
         self.renormalize_topk_logits = renormalize_topk_logits
-        self.original_mesh = mesh
         self.mesh = mesh
 
         if num_experts % self.ep_size != 0:
             raise ValueError(
                 f"num_experts({num_experts}) must be divisible by ep_size ({self.ep_size})"
             )
-
-        world_size = self.mesh.shape.get("data", 1) * mesh.shape.get("tensor", 1)
-        self.tp_size = world_size // self.ep_size
-        self.experts_per_device = num_experts // self.ep_size
-
-        # Create MoE mesh for expert parallelism
-        devices = self.mesh.devices.flatten()
-        self.moe_mesh = jax.sharding.Mesh(
-            devices.reshape(self.ep_size, self.tp_size),
-            axis_names=("expert", "tensor"),
-            axis_types=(jax.sharding.AxisType.Explicit, jax.sharding.AxisType.Explicit),
-        )
-
-        abstract_mesh = self.mesh.abstract_mesh
-        self.updated_mesh = abstract_mesh.update(
-            axis_sizes=(self.ep_size, self.tp_size), axis_names=("expert", "tensor")
-        )
 
         # Auto-select tile sizes if not provided
         if any(param is None for param in [bt, bf, bd1, bd2, btc, bfc, bd1c, bd2c]):
@@ -169,24 +151,23 @@ class FusedEPMoE(nnx.Module):
         self.bd2c = bd2c
 
         # Initialize weights in fused format
-        with jax.sharding.use_abstract_mesh(self.updated_mesh):
-            self.w1 = nnx.Param(
-                jax.random.normal(
-                    jax.random.key(0),
-                    (num_experts, 2, config.hidden_size, intermediate_dim),
-                    dtype=weight_dtype,
-                    out_sharding=P("expert", None, None, "tensor"),
-                )
+        self.w1 = nnx.Param(
+            jax.random.normal(
+                jax.random.key(0),
+                (num_experts, 2, config.hidden_size, intermediate_dim),
+                dtype=weight_dtype,
+                out_sharding=P("tensor", None, None, None),
             )
+        )
 
-            self.w2 = nnx.Param(
-                jax.random.normal(
-                    jax.random.key(0),
-                    (num_experts, intermediate_dim, config.hidden_size),
-                    dtype=weight_dtype,
-                    out_sharding=P("expert", "tensor", None),
-                )
+        self.w2 = nnx.Param(
+            jax.random.normal(
+                jax.random.key(0),
+                (num_experts, intermediate_dim, config.hidden_size),
+                dtype=weight_dtype,
+                out_sharding=P("tensor", None, None),
             )
+        )
 
     def __call__(self, hidden_states: jax.Array, router_logits: jax.Array) -> jax.Array:
         """
@@ -203,10 +184,8 @@ class FusedEPMoE(nnx.Module):
         """
         assert hidden_states.ndim == 2
 
-        # Call the fused kernel
-        # Note: ep_size > 1 is handled internally by the kernel via mesh
         output = fused_ep_moe(
-            mesh=self.moe_mesh,
+            mesh=self.mesh,
             tokens=hidden_states,
             w1=self.w1.value,
             w2=self.w2.value,
@@ -229,6 +208,8 @@ class FusedEPMoE(nnx.Module):
             w2_scale=None,
             b1=None,
             b2=None,
+            ep_axis_name="tensor",
+            # tp_axis_name="data",
         )
 
         return output

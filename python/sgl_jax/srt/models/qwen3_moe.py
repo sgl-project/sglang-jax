@@ -8,6 +8,7 @@ from transformers import PretrainedConfig
 
 from sgl_jax.srt.configs.model_config import ModelConfig
 from sgl_jax.srt.layers.embeddings import Embed, ParallelLMHead, RotaryEmbedding
+from sgl_jax.srt.layers.fused_moe import FusedEPMoE
 from sgl_jax.srt.layers.layernorm import RMSNorm
 from sgl_jax.srt.layers.linear import LinearBase
 from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
@@ -191,8 +192,6 @@ class QWen3MoeDecoderLayer(nnx.Module):
             )
 
             if self.use_fused:
-                from sgl_jax.srt.layers.fused_moe import FusedEPMoE
-
                 self.mlp = FusedEPMoE(
                     config=config,
                     num_experts=num_experts,
@@ -513,16 +512,16 @@ class Qwen3MoeForCausalLM(nnx.Module):
                 # w2: down_proj(w2) -> (num_experts, intermediate, hidden)
 
                 # 1. Fused w1 (gate + up)
-                target_path_w1 = [f"{target_prefix}.mlp.experts.w1"]
+                target_path_w1 = [f"{target_prefix}.mlp.w1"]
                 # Add source keys for gate_proj and up_proj
                 for name in ["gate_proj", "up_proj"]:
                     target_path_w1.extend(
                         [f"{prefix}.mlp.experts.{i}.{name}.weight" for i in range(num_experts)]
                     )
 
-                mappings[f"__MOE_EXPERTS__{prefix}.mlp.experts.w1"] = WeightMapping(
+                mappings[f"__MOE_EXPERTS__{prefix}.mlp.w1"] = WeightMapping(
                     target_path=target_path_w1,
-                    sharding=("expert", None, None, "tensor"),  # (E, 2, H, I/TP)
+                    sharding=("tensor", None, None, None),  # (E, 2, H, I)
                     transpose=True,
                     concat_axis=0,
                     fuse_moe_weights=True,
@@ -530,14 +529,14 @@ class Qwen3MoeForCausalLM(nnx.Module):
                 )
 
                 # 2. w2 (down)
-                target_path_w2 = [f"{target_prefix}.mlp.experts.w2"]
+                target_path_w2 = [f"{target_prefix}.mlp.w2"]
                 target_path_w2.extend(
                     [f"{prefix}.mlp.experts.{i}.down_proj.weight" for i in range(num_experts)]
                 )
 
-                mappings[f"__MOE_EXPERTS__{prefix}.mlp.experts.w2"] = WeightMapping(
+                mappings[f"__MOE_EXPERTS__{prefix}.mlp.w2"] = WeightMapping(
                     target_path=target_path_w2,
-                    sharding=("expert", "tensor", None),  # (E, I/TP, H)
+                    sharding=("tensor", None, None),  # (E, I, H)
                     transpose=True,
                     concat_axis=-1,
                 )
@@ -554,9 +553,9 @@ class Qwen3MoeForCausalLM(nnx.Module):
                     ]
 
                     if expert_type == "down_proj":
-                        sharding = ("expert", "tensor", None)
+                        sharding = ("tensor", None, None)
                     else:
-                        sharding = ("expert", None, "tensor")
+                        sharding = ("tensor", None, None)
 
                     mappings[f"__MOE_EXPERTS__{prefix}.mlp.{target_name}"] = WeightMapping(
                         target_path=[f"{target_prefix}.mlp.{target_name}"] + expert_keys,
@@ -599,6 +598,8 @@ class Qwen3MoeForCausalLM(nnx.Module):
         logits_metadata: LogitsMetadata,
     ):
         hidden_states, layers_kv_fused = self.model(forward_batch, token_to_kv_pool)
+        hidden_states = jax.sharding.reshard(hidden_states, jax.sharding.PartitionSpec(None, None))
+
         if not getattr(self.config, "tie_word_embeddings", False):
             output = self.logits_processor(hidden_states, self.lm_head, logits_metadata)
         else:

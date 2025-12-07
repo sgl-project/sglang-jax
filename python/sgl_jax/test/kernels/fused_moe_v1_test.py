@@ -51,9 +51,9 @@ def gen_moe_inputs(
 
     if has_bias:
         b1 = (
-            jax.random.normal(k3, (num_experts, 2, intermediate_size), dtype=jnp.float32) / 10
+            jax.random.normal(k3, (num_experts, 2, 1, intermediate_size), dtype=jnp.float32) / 10
         ).astype(dtype)
-        b2 = (jax.random.normal(k4, (num_experts, hidden_size), dtype=jnp.float32) / 10).astype(
+        b2 = (jax.random.normal(k4, (num_experts, 1, hidden_size), dtype=jnp.float32) / 10).astype(
             dtype
         )
     else:
@@ -100,7 +100,7 @@ def sub_channel_quantize(x, quant_dtype, wsz=256):
         w = (y / scale).astype(quant_dtype)
         w_lst.append(w)
         scale_lst.append(scale)
-    return jnp.concat(w_lst, axis=-2), jnp.concat(scale_lst, axis=-2)
+    return jnp.concat(w_lst, axis=-2), jnp.expand_dims(jnp.concat(scale_lst, axis=-2), axis=-2)
 
 
 @jtu.with_config(jax_numpy_dtype_promotion="standard")
@@ -115,7 +115,7 @@ class MoEKernelTest(jtu.JaxTestCase):
                 (-1 if x.coords[0] % 2 else 1) * x.coords[1],
             ),
         )
-        self.mesh = Mesh(np.array(self.mesh_devices).reshape(1, -1), axis_names=("data", "tensor"))
+        self.mesh = Mesh(np.array(self.mesh_devices).reshape(-1, 1), axis_names=("tensor", "data"))
 
     def _test_moe(
         self,
@@ -182,6 +182,7 @@ class MoEKernelTest(jtu.JaxTestCase):
             bfc=bfc,
             bd1c=bd1c,
             bd2c=bd2c,
+            ep_axis_name="tensor",
         )
         expected = ref_moe(
             a,
@@ -192,7 +193,7 @@ class MoEKernelTest(jtu.JaxTestCase):
             b1=b1,
             b2=b2,
             renormalize_topk_logits=renormalize_topk_logits,
-            activation=act_fn,
+            act_fn=act_fn,
             subc_quant_wsz=subc_quant_wsz,
             w1_scale=w1_scale,
             w2_scale=w2_scale,
