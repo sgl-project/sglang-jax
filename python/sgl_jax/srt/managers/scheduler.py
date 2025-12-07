@@ -472,6 +472,11 @@ class Scheduler(
         while True:
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
+
+            # Skip batch processing when engine is paused
+            if self._engine_paused:
+                continue
+
             batch = self.get_next_batch_to_run()
             self.cur_batch = batch
 
@@ -493,6 +498,10 @@ class Scheduler(
         while True:
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
+
+            # Skip batch processing when engine is paused
+            if self._engine_paused:
+                continue
 
             batch = self.get_next_batch_to_run()
             self.cur_batch = batch
@@ -755,6 +764,23 @@ class Scheduler(
             "kvcache": round(self.token_to_kv_pool_allocator.get_kvcache().mem_usage, 2),
             "token_capacity": int(self.max_total_num_tokens),
         }
+
+        # state for pause/continue generation
+        ret["engine_paused"] = self._engine_paused
+        ret["waiting_queue_size"] = len(self.waiting_queue)
+        ret["running_batch_size"] = (
+            0 if self.running_batch.is_empty() else len(self.running_batch.reqs)
+        )
+        ret["prefill_decode_size"] = ret["waiting_queue_size"] + ret["running_batch_size"]
+        ret["waiting_queue_rids"] = [req.rid for req in self.waiting_queue]
+        ret["running_batch_rids"] = (
+            [req.rid for req in self.running_batch.reqs]
+            if not self.running_batch.is_empty()
+            else []
+        )
+
+        # kv cache stat
+        ret["available_kv_tokens"] = self.token_to_kv_pool_allocator.available_size()
 
         return GetInternalStateReqOutput(internal_state=ret)
 
@@ -1386,7 +1412,6 @@ class Scheduler(
                 req.to_finish = FINISH_ABORT()
 
     def pause_generation(self, recv_req: PauseGenerationReqInput):
-        """Pause generation processing."""
         self._engine_paused = True
 
         # finish all in-flight request; in overlap mode, last_batch is running
@@ -1399,6 +1424,7 @@ class Scheduler(
         if recv_req.mode == "retract":
             self.running_batch.filter_batch()
             if len(self.running_batch.reqs) != 0:
+                # clear the kv cache
                 retracted_reqs = self.running_batch.retract_all(self.server_args)
                 for req in retracted_reqs:
                     self._add_request_to_queue(req)
@@ -1408,11 +1434,8 @@ class Scheduler(
             logger.info("Paused generation retracted")
         elif recv_req.mode == "in_place":
             logger.info("Paused generation in place")
-        else:
-            logger.info("Paused generation abort")
 
     def continue_generation(self, recv_req: ContinueGenerationReqInput):
-        """Continue generation processing after pause."""
         self._engine_paused = False
         logger.info("Generation continued")
 
