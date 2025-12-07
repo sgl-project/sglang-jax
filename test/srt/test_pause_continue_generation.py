@@ -25,7 +25,7 @@ from sgl_jax.test.test_utils import (
 class TestPauseContinueGeneration(CustomTestCase):
     """
     Test pause_generation and continue_generation endpoints.
-    
+
     Tests include:
     - Retract mode: Verify generation is paused, running batch requests are
       moved to waiting queue, and KV cache is cleared
@@ -126,7 +126,7 @@ class TestPauseContinueGeneration(CustomTestCase):
     def test_pause_generation_retract_mode(self):
         """
         Test pause_generation with retract mode.
-        
+
         Verify:
         1. Generation is actually paused
         2. Running batch requests are moved to waiting queue
@@ -136,72 +136,84 @@ class TestPauseContinueGeneration(CustomTestCase):
         initial_state = self._get_internal_state()
         initial_internal = initial_state["internal_states"][0]
         initial_available_tokens = initial_internal["available_kv_tokens"]
-        
+
         # Start multiple long-running requests
         num_requests = 8
         with ThreadPoolExecutor(num_requests) as executor:
             futures = [executor.submit(self._run_decode, 2000) for _ in range(num_requests)]
-            
+
             # Wait for requests to start generating (in running batch)
             time.sleep(3)
-            
+
             # Get state before pause - should have requests in running batch
             state_before_pause = self._get_internal_state()
             internal_before = state_before_pause["internal_states"][0]
-            
+
             # Verify there are requests in running batch
+            running_before_pause = internal_before["running_batch_size"]
+            waiting_before_pause = internal_before["waiting_queue_size"]
             self.assertGreater(
-                internal_before["running_batch_size"], 0,
-                "Expected requests in running batch before pause"
+                running_before_pause, 0, "Expected requests in running batch before pause"
             )
-            
+
             # Record available tokens before pause (should be less due to KV cache usage)
             tokens_before_pause = internal_before["available_kv_tokens"]
             self.assertLess(
-                tokens_before_pause, initial_available_tokens,
-                "KV cache should be used before pause"
+                tokens_before_pause,
+                initial_available_tokens,
+                "KV cache should be used before pause",
             )
-            
+
             # Pause generation with retract mode
             pause_response = self._pause_generation(mode="retract")
             self.assertEqual(pause_response["status"], "ok")
-            
+
             # Wait for pause to take effect
             time.sleep(0.5)
-            
+
             # Get state after pause
             state_after_pause = self._get_internal_state()
             internal_after = state_after_pause["internal_states"][0]
-            
+
             # Verify engine is paused
             self.assertTrue(
-                internal_after["engine_paused"],
-                "Engine should be paused after pause_generation"
+                internal_after["engine_paused"], "Engine should be paused after pause_generation"
             )
-            
+
             # Verify running batch is empty (requests retracted)
+            running_after_pause = internal_after["running_batch_size"]
+            waiting_after_pause = internal_after["waiting_queue_size"]
             self.assertEqual(
-                internal_after["running_batch_size"], 0,
-                "Running batch should be empty after retract mode pause"
+                running_after_pause, 0, "Running batch should be empty after retract mode pause"
             )
-            
+
             # Verify requests are in waiting queue
             self.assertGreater(
-                internal_after["waiting_queue_size"], 0,
-                "Requests should be moved to waiting queue after retract"
+                waiting_after_pause, 0, "Requests should be moved to waiting queue after retract"
             )
-            
+
+            # Verify quantity: waiting queue increase == running batch decrease
+            waiting_queue_increase = waiting_after_pause - waiting_before_pause
+            running_batch_decrease = running_before_pause - running_after_pause
+            self.assertEqual(
+                waiting_queue_increase,
+                running_batch_decrease,
+                f"Waiting queue increase ({waiting_queue_increase}) should equal "
+                f"running batch decrease ({running_batch_decrease})",
+            )
+
             # Verify KV cache is cleared (available tokens increase back toward initial)
             tokens_after_pause = internal_after["available_kv_tokens"]
             self.assertGreater(
-                tokens_after_pause, tokens_before_pause,
-                "KV cache should be cleared after retract mode pause"
+                tokens_after_pause,
+                tokens_before_pause,
+                "KV cache should be cleared after retract mode pause",
             )
-            
+
             # Continue generation
             continue_response = self._continue_generation()
             self.assertEqual(continue_response["status"], "ok")
-            
+
             # Wait for all requests to complete
             results = []
             for future in as_completed(futures):
@@ -210,21 +222,22 @@ class TestPauseContinueGeneration(CustomTestCase):
                     results.append(result)
                 except Exception as e:
                     results.append({"error": str(e)})
-            
+
             # Verify all requests completed successfully
             for result in results:
                 self.assertIn("text", result, f"Request should complete with text output: {result}")
                 # The finish reason should indicate successful completion (length)
                 finish_reason = result.get("meta_info", {}).get("finish_reason", {})
                 self.assertEqual(
-                    finish_reason.get("type"), "length",
-                    f"Request should finish due to length limit: {result}"
+                    finish_reason.get("type"),
+                    "length",
+                    f"Request should finish due to length limit: {result}",
                 )
-    
+
     def test_pause_generation_in_place_mode(self):
         """
         Test pause_generation with in_place mode.
-        
+
         Verify:
         1. Generation is actually paused
         2. Running batch is NOT changed (requests stay in running batch)
@@ -234,67 +247,76 @@ class TestPauseContinueGeneration(CustomTestCase):
         num_requests = 8
         with ThreadPoolExecutor(num_requests) as executor:
             futures = [executor.submit(self._run_decode, 2000) for _ in range(num_requests)]
-            
+
             # Wait for requests to start generating (in running batch)
             time.sleep(3)
-            
+
             # Get state before pause
             state_before_pause = self._get_internal_state()
             internal_before = state_before_pause["internal_states"][0]
-            
+
             # Verify there are requests in running batch
             running_before = internal_before["running_batch_size"]
-            self.assertGreater(
-                running_before, 0,
-                "Expected requests in running batch before pause"
-            )
-            
-            # Record running batch rids and available tokens
+            self.assertGreater(running_before, 0, "Expected requests in running batch before pause")
+
+            # Record running batch rids, waiting queue size, and available tokens
             rids_before = set(internal_before["running_batch_rids"])
             tokens_before_pause = internal_before["available_kv_tokens"]
-            
+            waiting_before_pause = internal_before["waiting_queue_size"]
+
             # Pause generation with in_place mode
             pause_response = self._pause_generation(mode="in_place")
             self.assertEqual(pause_response["status"], "ok")
-            
+
             # Wait for pause to take effect
             time.sleep(0.5)
-            
+
             # Get state after pause
             state_after_pause = self._get_internal_state()
             internal_after = state_after_pause["internal_states"][0]
-            
+
             # Verify engine is paused
             self.assertTrue(
-                internal_after["engine_paused"],
-                "Engine should be paused after pause_generation"
+                internal_after["engine_paused"], "Engine should be paused after pause_generation"
             )
-            
+
             # Verify running batch is NOT empty (in_place mode keeps requests)
             running_after = internal_after["running_batch_size"]
             self.assertEqual(
-                running_after, running_before,
-                f"Running batch size should be unchanged in in_place mode: {running_before} -> {running_after}"
+                running_after,
+                running_before,
+                f"Running batch size should be unchanged in in_place mode: {running_before} -> {running_after}",
             )
-            
+
             # Verify same requests are still in running batch
             rids_after = set(internal_after["running_batch_rids"])
             self.assertEqual(
-                rids_before, rids_after,
-                "Same requests should be in running batch after in_place pause"
+                rids_before,
+                rids_after,
+                "Same requests should be in running batch after in_place pause",
             )
-            
+
+            # Verify waiting queue is unchanged
+            waiting_after_pause = internal_after["waiting_queue_size"]
+            self.assertEqual(
+                waiting_after_pause,
+                waiting_before_pause,
+                f"Waiting queue should be unchanged in in_place mode: "
+                f"{waiting_before_pause} -> {waiting_after_pause}",
+            )
+
             # Verify KV cache is NOT cleared
             tokens_after_pause = internal_after["available_kv_tokens"]
             self.assertEqual(
-                tokens_after_pause, tokens_before_pause,
-                "KV cache should NOT be cleared in in_place mode"
+                tokens_after_pause,
+                tokens_before_pause,
+                "KV cache should NOT be cleared in in_place mode",
             )
-            
+
             # Continue generation
             continue_response = self._continue_generation()
             self.assertEqual(continue_response["status"], "ok")
-            
+
             # Wait for all requests to complete
             results = []
             for future in as_completed(futures):
@@ -303,7 +325,7 @@ class TestPauseContinueGeneration(CustomTestCase):
                     results.append(result)
                 except Exception as e:
                     results.append({"error": str(e)})
-            
+
             # Verify all requests completed successfully
             for result in results:
                 self.assertIn("text", result, f"Request should complete with text output: {result}")
@@ -311,32 +333,32 @@ class TestPauseContinueGeneration(CustomTestCase):
     def test_pause_continue_flush_cache_retract_mode(self):
         """
         Test that flush_cache works after pause with retract mode.
-        
+
         In retract mode, requests are moved to waiting queue and KV cache is cleared,
         so flush_cache should succeed.
         """
         # Start a request
         with ThreadPoolExecutor(1) as executor:
             future = executor.submit(self._run_decode, 2000)
-            
+
             # Wait for request to start
             time.sleep(2)
-            
+
             # Pause with retract mode
             pause_response = self._pause_generation(mode="retract")
             self.assertEqual(pause_response["status"], "ok")
-            
+
             # Wait for pause
             time.sleep(0.5)
-            
+
             # Flush cache should succeed in retract mode
             # (Note: The requests are in waiting_queue, but there's no running batch,
             #  so we need to abort them first or flush should handle this case)
-            
+
             # Continue generation to let requests complete
             continue_response = self._continue_generation()
             self.assertEqual(continue_response["status"], "ok")
-            
+
             # Wait for completion
             try:
                 result = future.result(timeout=60)
@@ -347,48 +369,46 @@ class TestPauseContinueGeneration(CustomTestCase):
     def test_pause_continue_multiple_cycles(self):
         """
         Test multiple pause/continue cycles.
-        
+
         Verify that the server can handle multiple pause/continue cycles
         without issues.
         """
         num_cycles = 3
-        
+
         with ThreadPoolExecutor(4) as executor:
             futures = [executor.submit(self._run_decode, 3000) for _ in range(4)]
-            
+
             for cycle in range(num_cycles):
                 # Wait for some generation to happen
                 time.sleep(2)
-                
+
                 # Pause with alternating modes
                 mode = "retract" if cycle % 2 == 0 else "in_place"
                 pause_response = self._pause_generation(mode=mode)
                 self.assertEqual(
-                    pause_response["status"], "ok",
-                    f"Cycle {cycle}: pause should succeed"
+                    pause_response["status"], "ok", f"Cycle {cycle}: pause should succeed"
                 )
-                
+
                 # Verify paused
                 state = self._get_internal_state()
                 self.assertTrue(
                     state["internal_states"][0]["engine_paused"],
-                    f"Cycle {cycle}: engine should be paused"
+                    f"Cycle {cycle}: engine should be paused",
                 )
-                
+
                 # Continue
                 continue_response = self._continue_generation()
                 self.assertEqual(
-                    continue_response["status"], "ok",
-                    f"Cycle {cycle}: continue should succeed"
+                    continue_response["status"], "ok", f"Cycle {cycle}: continue should succeed"
                 )
-                
+
                 # Verify not paused
                 state = self._get_internal_state()
                 self.assertFalse(
                     state["internal_states"][0]["engine_paused"],
-                    f"Cycle {cycle}: engine should not be paused after continue"
+                    f"Cycle {cycle}: engine should not be paused after continue",
                 )
-            
+
             # Wait for all requests to complete
             results = []
             for future in as_completed(futures):
@@ -397,7 +417,7 @@ class TestPauseContinueGeneration(CustomTestCase):
                     results.append(result)
                 except Exception as e:
                     results.append({"error": str(e)})
-            
+
             # All requests should complete
             for i, result in enumerate(results):
                 self.assertIn("text", result, f"Request {i} should complete: {result}")
@@ -496,43 +516,57 @@ class TestPauseContinueGenerationNoOverlap(CustomTestCase):
         num_requests = 4
         with ThreadPoolExecutor(num_requests) as executor:
             futures = [executor.submit(self._run_decode, 2000) for _ in range(num_requests)]
-            
+
             # Wait for requests to start generating
             time.sleep(3)
-            
+
             # Get state before pause
             state_before = self._get_internal_state()
             internal_before = state_before["internal_states"][0]
             tokens_before = internal_before["available_kv_tokens"]
-            
+            running_before = internal_before["running_batch_size"]
+            waiting_before = internal_before["waiting_queue_size"]
+
             # Pause with retract mode
             pause_response = self._pause_generation(mode="retract")
             self.assertEqual(pause_response["status"], "ok")
-            
+
             # Wait for pause
             time.sleep(0.5)
-            
+
             # Get state after pause
             state_after = self._get_internal_state()
             internal_after = state_after["internal_states"][0]
-            
+
             # Verify paused
             self.assertTrue(internal_after["engine_paused"])
-            
+
             # Verify running batch cleared
-            self.assertEqual(internal_after["running_batch_size"], 0)
-            
+            running_after = internal_after["running_batch_size"]
+            waiting_after = internal_after["waiting_queue_size"]
+            self.assertEqual(running_after, 0)
+
             # Verify requests moved to waiting queue
-            self.assertGreater(internal_after["waiting_queue_size"], 0)
-            
+            self.assertGreater(waiting_after, 0)
+
+            # Verify quantity: waiting queue increase == running batch decrease
+            waiting_queue_increase = waiting_after - waiting_before
+            running_batch_decrease = running_before - running_after
+            self.assertEqual(
+                waiting_queue_increase,
+                running_batch_decrease,
+                f"Waiting queue increase ({waiting_queue_increase}) should equal "
+                f"running batch decrease ({running_batch_decrease})",
+            )
+
             # Verify KV cache cleared
             tokens_after = internal_after["available_kv_tokens"]
             self.assertGreater(tokens_after, tokens_before)
-            
+
             # Continue
             continue_response = self._continue_generation()
             self.assertEqual(continue_response["status"], "ok")
-            
+
             # Wait for completion
             for future in as_completed(futures):
                 result = future.result()
@@ -545,41 +579,52 @@ class TestPauseContinueGenerationNoOverlap(CustomTestCase):
         num_requests = 4
         with ThreadPoolExecutor(num_requests) as executor:
             futures = [executor.submit(self._run_decode, 2000) for _ in range(num_requests)]
-            
+
             # Wait for requests to start generating
             time.sleep(3)
-            
+
             # Get state before pause
             state_before = self._get_internal_state()
             internal_before = state_before["internal_states"][0]
             running_before = internal_before["running_batch_size"]
+            waiting_before = internal_before["waiting_queue_size"]
             tokens_before = internal_before["available_kv_tokens"]
-            
+
             # Pause with in_place mode
             pause_response = self._pause_generation(mode="in_place")
             self.assertEqual(pause_response["status"], "ok")
-            
+
             # Wait for pause
             time.sleep(0.5)
-            
+
             # Get state after pause
             state_after = self._get_internal_state()
             internal_after = state_after["internal_states"][0]
-            
+
             # Verify paused
             self.assertTrue(internal_after["engine_paused"])
-            
+
             # Verify running batch unchanged
-            self.assertEqual(internal_after["running_batch_size"], running_before)
-            
+            running_after = internal_after["running_batch_size"]
+            waiting_after = internal_after["waiting_queue_size"]
+            self.assertEqual(running_after, running_before)
+
+            # Verify waiting queue unchanged
+            self.assertEqual(
+                waiting_after,
+                waiting_before,
+                f"Waiting queue should be unchanged in in_place mode: "
+                f"{waiting_before} -> {waiting_after}",
+            )
+
             # Verify KV cache preserved
             tokens_after = internal_after["available_kv_tokens"]
             self.assertEqual(tokens_after, tokens_before)
-            
+
             # Continue
             continue_response = self._continue_generation()
             self.assertEqual(continue_response["status"], "ok")
-            
+
             # Wait for completion
             for future in as_completed(futures):
                 result = future.result()
@@ -588,4 +633,3 @@ class TestPauseContinueGenerationNoOverlap(CustomTestCase):
 
 if __name__ == "__main__":
     unittest.main()
-
