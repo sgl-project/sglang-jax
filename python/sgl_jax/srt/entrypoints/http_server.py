@@ -250,9 +250,9 @@ async def get_model_info():
 @app.get("/get_server_info")
 async def get_server_info():
     # Returns interna states per DP.
-    internal_states: list[dict[Any, Any]] = (
-        await _global_state.tokenizer_manager.get_internal_state()
-    )
+    internal_states: list[
+        dict[Any, Any]
+    ] = await _global_state.tokenizer_manager.get_internal_state()
     return {
         **dataclasses.asdict(_global_state.tokenizer_manager.server_args),
         **_global_state.scheduler_info,
@@ -751,7 +751,7 @@ def _create_error_response(e):
     return ORJSONResponse({"error": {"message": str(e)}}, status_code=HTTPStatus.BAD_REQUEST)
 
 
-def launch_server(
+def launch(
     server_args: ServerArgs,
     pipe_finish_writer: multiprocessing.connection.Connection | None = None,
     launch_callback: Callable[[], None] | None = None,

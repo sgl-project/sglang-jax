@@ -23,7 +23,7 @@ import requests
 
 from sgl_jax.bench_serving import get_tokenizer, sample_random_requests
 from sgl_jax.profiler import run_profile
-from sgl_jax.srt.entrypoints.http_server import launch_server
+from sgl_jax.srt.entrypoints import http_server
 from sgl_jax.srt.server_args import ServerArgs
 from sgl_jax.srt.utils import kill_process_tree
 from sgl_jax.test.test_utils import is_in_ci, write_github_step_summary
@@ -80,7 +80,7 @@ class BenchArgs:
 
 def launch_server_internal(server_args):
     try:
-        launch_server(server_args)
+        http_server.launch(server_args)
     except Exception as e:
         raise e
     finally:

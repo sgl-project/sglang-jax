@@ -158,9 +158,9 @@ class ServerArgs:
         # update device
         if self.device:
             platform_env = os.environ.get("JAX_PLATFORMS", self.device)
-            assert (
-                self.device == platform_env
-            ), f"device {self.device} is not consistent with 'JAX_PLATFORMS' {platform_env}"
+            assert self.device == platform_env, (
+                f"device {self.device} is not consistent with 'JAX_PLATFORMS' {platform_env}"
+            )
         else:
             platform_env = os.environ.get("JAX_PLATFORMS", "")
             if platform_env != "":
@@ -884,6 +884,26 @@ class ServerArgs:
         attrs = [attr.name for attr in dataclasses.fields(cls)]
         return cls(**{attr: getattr(args, attr) for attr in attrs})
 
+    @classmethod
+    def from_cli(cls, argv: list[str] | None = None) -> "ServerArgs":
+        """
+        Create ServerArgs from command line arguments.
+
+        Args:
+            argv: Command line arguments. If None, uses sys.argv[1:].
+
+        Returns:
+            The server arguments.
+        """
+        import sys
+
+        if argv is None:
+            argv = sys.argv[1:]
+        parser = argparse.ArgumentParser()
+        cls.add_cli_args(parser)
+        args = parser.parse_args(argv)
+        return cls.from_cli_args(args)
+
     def url(self):
         if is_valid_ipv6_address(self.host):
             return f"http://[{self.host}]:{self.port}"
@@ -907,9 +927,9 @@ class ServerArgs:
         # Check chunked prefill
         # Skip validation if chunked prefill is disabled (i.e., size <= 0).
         if self.chunked_prefill_size > 0:
-            assert (
-                self.chunked_prefill_size % self.page_size == 0
-            ), "chunked_prefill_size must be divisible by page_size"
+            assert self.chunked_prefill_size % self.page_size == 0, (
+                "chunked_prefill_size must be divisible by page_size"
+            )
 
         # Disallow overlap scheduler when speculative decoding is enabled
         if self.speculative_algorithm is not None and not self.disable_overlap_schedule:
@@ -917,24 +937,6 @@ class ServerArgs:
                 "Speculative decoding does not support overlap scheduler. "
                 "Please pass --disable-overlap-schedule when using --speculative-algorithm."
             )
-
-
-def prepare_server_args(argv: list[str]) -> ServerArgs:
-    """
-    Prepare the server arguments from the command line arguments.
-
-    Args:
-        args: The command line arguments. Typically, it should be `sys.argv[1:]`
-            to ensure compatibility with `parse_args` when no arguments are passed.
-
-    Returns:
-        The server arguments.
-    """
-    parser = argparse.ArgumentParser()
-    ServerArgs.add_cli_args(parser)
-    raw_args = parser.parse_args(argv)
-    server_args = ServerArgs.from_cli_args(raw_args)
-    return server_args
 
 
 ZMQ_TCP_PORT_DELTA = 233
