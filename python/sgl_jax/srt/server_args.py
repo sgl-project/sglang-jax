@@ -890,19 +890,16 @@ class ServerArgs:
         Create ServerArgs from command line arguments.
 
         Args:
-            argv: Command line arguments. If None, uses sys.argv[1:].
+            argv: Command line arguments. If None or empty, uses sys.argv[1:].
 
         Returns:
             The server arguments.
         """
         import sys
 
-        if argv is None:
-            argv = sys.argv[1:]
         parser = argparse.ArgumentParser()
         cls.add_cli_args(parser)
-        args = parser.parse_args(argv)
-        return cls.from_cli_args(args)
+        return cls.from_cli_args(parser.parse_args(argv or sys.argv[1:]))
 
     def url(self):
         if is_valid_ipv6_address(self.host):
