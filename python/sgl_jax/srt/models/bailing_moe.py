@@ -612,7 +612,7 @@ class BailingMoEForCausalLM(nnx.Module):
                         [f"{prefix}.mlp.experts.{i}.{name}.weight" for i in range(num_experts)]
                     )
 
-                mappings[f"__MOE_EXPERTS__{prefix}.mlp.experts.w1"] = WeightMapping(
+                mappings[f"__MOE_EXPERTS__{prefix}.mlp.w1"] = WeightMapping(
                     target_path=target_path_w1,
                     sharding=("expert", None, None, "tensor"),  # (E, 2, H, I/TP)
                     transpose=True,
@@ -627,7 +627,7 @@ class BailingMoEForCausalLM(nnx.Module):
                     [f"{prefix}.mlp.experts.{i}.down_proj.weight" for i in range(num_experts)]
                 )
 
-                mappings[f"__MOE_EXPERTS__{prefix}.mlp.experts.w2"] = WeightMapping(
+                mappings[f"__MOE_EXPERTS__{prefix}.mlp.w2"] = WeightMapping(
                     target_path=target_path_w2,
                     sharding=("expert", "tensor", None),  # (E, I/TP, H)
                     transpose=True,

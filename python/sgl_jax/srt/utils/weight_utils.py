@@ -796,13 +796,6 @@ class WeightLoader:
         # fused_weight: (num_experts, 2, hidden_size, intermediate_size)
         fused_weight = jnp.stack([gate_stacked, up_stacked], axis=1)
 
-        logger.info(
-            "Fused MoE weights: gate shape=%s, up shape=%s, fused shape=%s",
-            gate_stacked.shape,
-            up_stacked.shape,
-            fused_weight.shape,
-        )
-
         # Step 4: Apply sharding
         if "expert" in mapping.sharding:
             ep_size = getattr(self.model_config.hf_config, "ep_size", 1)

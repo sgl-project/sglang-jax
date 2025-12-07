@@ -17,6 +17,7 @@ from sgl_jax.srt.layers.embeddings import (
     _yarn_find_correction_range,
     _yarn_get_mscale,
 )
+from sgl_jax.srt.layers.fused_moe import FusedEPMoE
 from sgl_jax.srt.layers.layernorm import RMSNorm, dual_rmsnorm_forward
 from sgl_jax.srt.layers.linear import LinearBase
 from sgl_jax.srt.layers.logits_processor import (
@@ -206,6 +207,8 @@ class Grok1MoE(nnx.Module):
     kernel is used for the forward pass, with outputs reduced across ranks.
     """
 
+    experts: FusedEPMoE | EPMoE
+
     def __init__(
         self,
         config: PretrainedConfig,
@@ -242,8 +245,6 @@ class Grok1MoE(nnx.Module):
         self.use_fused = self.moe_backend == "fused"
 
         if self.use_fused:
-            from sgl_jax.srt.layers.fused_moe import FusedEPMoE
-
             self.experts = FusedEPMoE(
                 config=config,
                 num_experts=num_experts,
@@ -283,12 +284,14 @@ class Grok1MoE(nnx.Module):
         if self.use_fused:
             # Fused kernel: pass router_logits directly
             # Top-K selection is handled internally by the kernel
+            assert isinstance(self.experts, FusedEPMoE)
             return self.experts(hidden_states, router_logits)
         else:
             # EPMoE: compute top-k routing weights using sglang-style approach:
             # 1. Compute global softmax over ALL experts (not just top-k)
             # 2. Select top-k experts based on logits
             # 3. Extract corresponding weights (no renormalization)
+            assert isinstance(self.experts, EPMoE)
             top_k_weights, top_k_indices = self._custom_topk(
                 router_logits, self.top_k, renormalize=False
             )
@@ -939,7 +942,7 @@ class Grok1ForCausalLM(nnx.Module):
             # w2: down(w2) -> (num_experts, intermediate, hidden)
 
             # 1. Fused w1 (gate + up)
-            target_path_w1 = [f"{target_prefix}.block_sparse_moe.experts.w1"]
+            target_path_w1 = [f"{target_prefix}.block_sparse_moe.w1"]
             # Add source keys for w1 (gate) and w3 (up)
             # Note: Grok experts are 0..N-1
             for name in ["w1", "w3"]:
@@ -950,7 +953,7 @@ class Grok1ForCausalLM(nnx.Module):
                     ]
                 )
 
-            mappings[f"__MOE_EXPERTS__{prefix}.block_sparse_moe.experts.w1"] = WeightMapping(
+            mappings[f"__MOE_EXPERTS__{prefix}.block_sparse_moe.w1"] = WeightMapping(
                 target_path=target_path_w1,
                 sharding=("expert", None, None, "tensor"),  # (E, 2, H, I/TP)
                 transpose=True,
@@ -960,7 +963,7 @@ class Grok1ForCausalLM(nnx.Module):
             )
 
             # 2. w2 (down)
-            target_path_w2 = [f"{target_prefix}.block_sparse_moe.experts.w2"]
+            target_path_w2 = [f"{target_prefix}.block_sparse_moe.w2"]
             target_path_w2.extend(
                 [
                     f"{prefix}.block_sparse_moe.experts.{i}.w2.weight"
@@ -968,8 +971,7 @@ class Grok1ForCausalLM(nnx.Module):
                 ]
             )
 
-
-            mappings[f"__MOE_EXPERTS__{prefix}.block_sparse_moe.experts.w2"] = WeightMapping(
+            mappings[f"__MOE_EXPERTS__{prefix}.block_sparse_moe.w2"] = WeightMapping(
                 target_path=target_path_w2,
                 sharding=("expert", "tensor", None),  # (E, I/TP, H)
                 transpose=True,
@@ -987,7 +989,11 @@ class Grok1ForCausalLM(nnx.Module):
                     ]
                 )
 
-                sharding = ("expert", "tensor", None) if target_name == "wo" else ("expert", None, "tensor")
+                sharding = (
+                    ("expert", "tensor", None)
+                    if target_name == "wo"
+                    else ("expert", None, "tensor")
+                )
 
                 if name == "w2":
                     # w2 (down_proj) -> wo
