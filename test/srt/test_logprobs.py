@@ -101,9 +101,7 @@ class TestLogprobsDense(unittest.TestCase):
             )
             max_logprobs = output_top_logprob[0][0]
             for j, logprob in enumerate(output_top_logprob):
-                self.assertGreaterEqual(
-                    max_logprobs, logprob[0], "the logprob is not the max"
-                )
+                self.assertGreaterEqual(max_logprobs, logprob[0], "the logprob is not the max")
 
         self.assertEqual(
             len(output_meta["input_token_ids_logprobs"]),
