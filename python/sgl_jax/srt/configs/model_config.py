@@ -427,7 +427,9 @@ def _get_and_verify_dtype(
     config: PretrainedConfig,
     dtype: str | jnp.dtype,
 ) -> jnp.dtype:
-    config_dtype = getattr(config, "torch_dtype", None)
+    config_dtype = getattr(config, "dtype", None)
+    if config_dtype is None:
+        config_dtype = getattr(config, "torch_dtype", None)
     if isinstance(config_dtype, str):
         config_dtype = _STR_DTYPE_TO_JAX_DTYPE.get(config_dtype)
     elif config_dtype is not None:

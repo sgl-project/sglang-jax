@@ -228,7 +228,7 @@ class LogitsMetadata:
 class LogitsProcessor(nnx.Module):
     """Logits processor for the model."""
 
-    def __init__(self, vocab_size: int, soft_cap: float | None = None, mesh: Mesh = None):
+    def __init__(self, vocab_size: int, mesh: Mesh, soft_cap: float | None = None):
         self.vocab_size = vocab_size
         self.soft_cap = soft_cap
         self.mesh = mesh

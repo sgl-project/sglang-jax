@@ -1,6 +1,7 @@
 import glob
 import logging
 import os
+from collections.abc import Mapping
 from dataclasses import dataclass
 
 import jax
@@ -101,14 +102,14 @@ class WeightLoader:
 
     def load_weights_from_safetensors(
         self,
-        weight_mappings: dict[str, str | list[str] | WeightMapping],
+        weight_mappings: Mapping[str, str | list[str] | WeightMapping],
         safetensors_partition=1,
         dummy=False,
     ):
         """Load weights from safetensors files or generate dummy weights.
 
         Args:
-            weight_mappings: Mapping from HF keys to model paths with sharding info
+            weight_mappings: A read-only (covariant) mapping from HF keys to model paths with sharding info(Do not modify this dictionary in place)
             safetensors_partition: Number of safetensors partitions
             dummy: If True, generate random weights instead of loading from files
         """
