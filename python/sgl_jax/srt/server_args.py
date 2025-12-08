@@ -884,6 +884,23 @@ class ServerArgs:
         attrs = [attr.name for attr in dataclasses.fields(cls)]
         return cls(**{attr: getattr(args, attr) for attr in attrs})
 
+    @classmethod
+    def from_cli(cls, argv: list[str] | None = None) -> "ServerArgs":
+        """
+        Create ServerArgs from command line arguments.
+
+        Args:
+            argv: Command line arguments. If None or empty, uses sys.argv[1:].
+
+        Returns:
+            The server arguments.
+        """
+        import sys
+
+        parser = argparse.ArgumentParser()
+        cls.add_cli_args(parser)
+        return cls.from_cli_args(parser.parse_args(argv or sys.argv[1:]))
+
     def url(self):
         if is_valid_ipv6_address(self.host):
             return f"http://[{self.host}]:{self.port}"
@@ -917,24 +934,6 @@ class ServerArgs:
                 "Speculative decoding does not support overlap scheduler. "
                 "Please pass --disable-overlap-schedule when using --speculative-algorithm."
             )
-
-
-def prepare_server_args(argv: list[str]) -> ServerArgs:
-    """
-    Prepare the server arguments from the command line arguments.
-
-    Args:
-        args: The command line arguments. Typically, it should be `sys.argv[1:]`
-            to ensure compatibility with `parse_args` when no arguments are passed.
-
-    Returns:
-        The server arguments.
-    """
-    parser = argparse.ArgumentParser()
-    ServerArgs.add_cli_args(parser)
-    raw_args = parser.parse_args(argv)
-    server_args = ServerArgs.from_cli_args(raw_args)
-    return server_args
 
 
 ZMQ_TCP_PORT_DELTA = 233
