@@ -121,27 +121,16 @@ class TestLogprobsDense(unittest.TestCase):
         ]
         for i, logprob in enumerate(output_meta["output_token_logprobs"]):
             self.assertEqual(
-                logprob[0],
-                expected_output_logprobs[i][0],
-                f"{logprob[0]} logprob is invalid",
+                logprob[0], expected_output_logprobs[i][0], f"{logprob[0]} logprob is invalid"
             )
             self.assertEqual(
-                logprob[1],
-                expected_output_logprobs[i][1],
-                f"{logprob[1]} output id is invalid",
+                logprob[1], expected_output_logprobs[i][1], f"{logprob[1]} output id is invalid"
             )
             self.assertEqual(
-                logprob[2],
-                expected_output_logprobs[i][2],
-                f"{logprob[2]} token is invalid",
+                logprob[2], expected_output_logprobs[i][2], f"{logprob[2]} token is invalid"
             )
 
-        sampling_params = {
-            "n": 1,
-            "temperature": 0.6,
-            "top_p": 0.95,
-            "max_new_tokens": 3,
-        }
+        sampling_params = {"n": 1, "temperature": 0.6, "top_p": 0.95, "max_new_tokens": 3}
 
         expected_output_logprobs = [
             [-0.8046875, 32313, "Okay"],  ## todo use output compute is -0.79296875
@@ -160,19 +149,13 @@ class TestLogprobsDense(unittest.TestCase):
         output_meta = output["meta_info"]
         for i, logprob in enumerate(output_meta["output_token_logprobs"]):
             self.assertEqual(
-                logprob[0],
-                expected_output_logprobs[i][0],
-                f"{logprob[0]} logprob is invalid",
+                logprob[0], expected_output_logprobs[i][0], f"{logprob[0]} logprob is invalid"
             )
             self.assertEqual(
-                logprob[1],
-                expected_output_logprobs[i][1],
-                f"{logprob[1]} output id is invalid",
+                logprob[1], expected_output_logprobs[i][1], f"{logprob[1]} output id is invalid"
             )
             self.assertEqual(
-                logprob[2],
-                expected_output_logprobs[i][2],
-                f"{logprob[2]} token is invalid",
+                logprob[2], expected_output_logprobs[i][2], f"{logprob[2]} token is invalid"
             )
 
 
