@@ -47,12 +47,11 @@ class LlamaDecoderLayer(LlamaDecoderLayer):
     def __init__(
         self,
         config: LlamaConfig,
+        mesh: jax.sharding.Mesh,
         layer_id: int = 0,
-        rngs: nnx.Rngs = None,
         dtype: jnp.dtype = jnp.bfloat16,
-        mesh: jax.sharding.Mesh = None,
     ) -> None:
-        super().__init__(config, layer_id, dtype=dtype, rngs=rngs, mesh=mesh)
+        super().__init__(config, layer_id, dtype=dtype, mesh=mesh)
 
         # override qkv
         attention_bias = getattr(config, "attention_bias", False) or getattr(config, "bias", False)
@@ -61,7 +60,6 @@ class LlamaDecoderLayer(LlamaDecoderLayer):
             output_size=self.self_attn.q_head_num * self.self_attn.head_dim,
             use_bias=attention_bias,
             kernel_axes=(None, "tensor"),
-            rngs=rngs,
             params_dtype=dtype,
             mesh=mesh,
         )
@@ -70,7 +68,6 @@ class LlamaDecoderLayer(LlamaDecoderLayer):
             output_size=self.self_attn.kv_head_num * self.self_attn.head_dim,
             use_bias=attention_bias,
             kernel_axes=(None, "tensor"),
-            rngs=rngs,
             params_dtype=dtype,
             mesh=mesh,
         )
@@ -79,7 +76,6 @@ class LlamaDecoderLayer(LlamaDecoderLayer):
             output_size=config.num_key_value_heads * self.self_attn.head_dim,
             use_bias=attention_bias,
             kernel_axes=("tensor", None),
-            rngs=rngs,
             params_dtype=dtype,
             mesh=mesh,
         )
@@ -92,14 +88,11 @@ class LlamaDecoderLayer(LlamaDecoderLayer):
         self.mlp = LlamaMLP(
             hidden_size=self.hidden_size,
             intermediate_size=inter_size,
-            rngs=rngs,
             dtype=dtype,
             mesh=mesh,
         )
 
-        self.hidden_norm = RMSNorm(
-            num_features=config.hidden_size, epsilon=config.rms_norm_eps, rngs=rngs
-        )
+        self.hidden_norm = RMSNorm(num_features=config.hidden_size, epsilon=config.rms_norm_eps)
 
     def __call__(
         self,
@@ -137,11 +130,10 @@ class LlamaEagleModel(LlamaModel):
     def __init__(
         self,
         config: LlamaConfig,
+        mesh: jax.sharding.Mesh,
         dtype: jnp.dtype = jnp.bfloat16,
-        rngs: nnx.Rngs = None,
-        mesh: jax.sharding.Mesh = None,
     ) -> None:
-        super().__init__(config=config, dtype=dtype, rngs=rngs, is_draft_model=True, mesh=mesh)
+        super().__init__(config=config, dtype=dtype, is_draft_model=True, mesh=mesh)
         self.config = config
 
         self.is_mrope_enabled = (
@@ -157,7 +149,6 @@ class LlamaEagleModel(LlamaModel):
         self.embed_tokens = Embed(
             config.vocab_size,
             config.hidden_size,
-            rngs=rngs,
             dtype=dtype,
             param_dtype=dtype,
             kernel_axes=("tensor", None),
@@ -176,16 +167,13 @@ class LlamaEagleModel(LlamaModel):
                 use_bias=getattr(config, "bias", False),
                 params_dtype=dtype,
                 kernel_axes=(None, None),
-                rngs=rngs,
                 mesh=mesh,
             )
         )
 
-        self.midlayer = LlamaDecoderLayer(
-            config=config, layer_id=0, rngs=rngs, dtype=dtype, mesh=mesh
-        )
+        self.midlayer = LlamaDecoderLayer(config=config, layer_id=0, dtype=dtype, mesh=mesh)
 
-        self.norm = RMSNorm(num_features=config.hidden_size, epsilon=config.rms_norm_eps, rngs=rngs)
+        self.norm = RMSNorm(num_features=config.hidden_size, epsilon=config.rms_norm_eps)
 
     def __call__(
         self,
@@ -234,16 +222,15 @@ class LlamaForCausalLMEagle3(LlamaForCausalLM):
     def __init__(
         self,
         config: LlamaConfig,
+        mesh: jax.sharding.Mesh,
         dtype: jnp.dtype = jnp.bfloat16,
-        rngs: nnx.Rngs = None,
-        mesh: jax.sharding.Mesh = None,
     ) -> None:
         self.config = config
         self.mesh = mesh
         if self.config.num_hidden_layers != 1:
             raise ValueError("EAGLE3 currently only supports 1 layer")
         self.dtype = dtype
-        self.model = LlamaEagleModel(config, dtype=dtype, rngs=rngs, mesh=mesh)
+        self.model = LlamaEagleModel(config, dtype=dtype, mesh=mesh)
         # Llama 3.2 1B Instruct set tie_word_embeddings to True
         # Llama 3.1 8B Instruct set tie_word_embeddings to False
         self.load_lm_head_from_target = False
@@ -254,15 +241,15 @@ class LlamaForCausalLMEagle3(LlamaForCausalLM):
                 self.load_lm_head_from_target = True
                 config.draft_vocab_size = config.vocab_size
             self.lm_head = ParallelLMHead(
-                config.draft_vocab_size, config.hidden_size, dtype=dtype, rngs=rngs
+                config.draft_vocab_size,
+                config.hidden_size,
+                dtype=dtype,
             )
         self.logits_processor = LogitsProcessor(vocab_size=config.vocab_size, mesh=self.mesh)
         self.capture_aux_hidden_states = True
         self.hot_token_ids = nnx.Param(jnp.arange(config.draft_vocab_size))
 
-    def load_weights(self, model_config: ModelConfig, rng_key: jax.Array) -> None:
-        self.rng = nnx.Rngs(rng_key)
-
+    def load_weights(self, model_config: ModelConfig) -> None:
         loader = WeightLoader(
             model=self,
             model_config=model_config,

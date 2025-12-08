@@ -44,9 +44,6 @@ class TestModelLoader(unittest.TestCase):
             self.mesh = Mesh(devices, ("tensor",), axis_types=(jax.sharding.AxisType.Explicit,))
             print(f" Using single-device mesh: {self.mesh}")
 
-        # Initialize RNG
-        self.rng = nnx.Rngs(42)
-
         # Create temporary directory for test
         self.temp_dir = tempfile.mkdtemp()
 
@@ -55,16 +52,15 @@ class TestModelLoader(unittest.TestCase):
 
     def test_jax_model_loader_init(self):
         """Test JAXModelLoader initialization."""
-        loader = JAXModelLoader(self.load_config, self.rng, self.mesh)
+        loader = JAXModelLoader(self.load_config, self.mesh)
 
         self.assertIsInstance(loader, JAXModelLoader)
         self.assertEqual(loader.load_config, self.load_config)
         self.assertEqual(loader.mesh, self.mesh)
-        self.assertEqual(loader.rng, self.rng)
 
     def test_get_model_loader(self):
         """Test get_model_loader function."""
-        loader = get_model_loader(self.load_config, self.rng, self.mesh)
+        loader = get_model_loader(self.load_config, self.mesh)
 
         self.assertIsInstance(loader, JAXModelLoader)
 
@@ -238,9 +234,6 @@ class TestModelLoaderWithRealModel(unittest.TestCase):
             print(f" Using single-device mesh: {self.mesh}")
         print(f"[MESH CHECK] mesh shape: {self.mesh.shape}, mesh devices: {self.mesh.devices}")
 
-        # Initialize RNG
-        self.rng = nnx.Rngs(42)
-
         # Get download directory from environment or use default
         download_dir = os.environ.get("DOWNLOAD_DIR", "/dev/shm")
 
@@ -280,7 +273,7 @@ class TestModelLoaderWithRealModel(unittest.TestCase):
             # Create QWen model instance with mesh context
             with jax.set_mesh(self.mesh):
                 model = QWenLMHeadModel(
-                    model_config.hf_config, model_config.dtype, self.rng, self.mesh
+                    model_config.hf_config, dtype=model_config.dtype, mesh=self.mesh
                 )
 
             self.assertIsInstance(model, QWenLMHeadModel)
@@ -301,7 +294,7 @@ class TestModelLoaderWithRealModel(unittest.TestCase):
         )
 
         # Download model if it's a HuggingFace ID
-        loader = get_model_loader(self.load_config, self.rng, self.mesh)
+        loader = get_model_loader(self.load_config, self.mesh)
         local_path = loader.download_model(model_config)
 
         safetensor_files = []
@@ -323,14 +316,14 @@ class TestModelLoaderWithRealModel(unittest.TestCase):
             )
 
             # Download model if needed
-            loader = get_model_loader(self.load_config, self.rng, self.mesh)
+            loader = get_model_loader(self.load_config, self.mesh)
             local_path = loader.download_model(model_config)
             model_config.model_path = local_path
 
             # Create QWen model instance with mesh context
             with jax.set_mesh(self.mesh):
                 model = QWenLMHeadModel(
-                    model_config.hf_config, model_config.dtype, self.rng, self.mesh
+                    model_config.hf_config, dtype=model_config.dtype, mesh=self.mesh
                 )
 
             # Print the actual parameter structure of the model
@@ -345,7 +338,7 @@ class TestModelLoaderWithRealModel(unittest.TestCase):
             print(f"🔄 Starting weight loading from: {self.model_path}")
 
             # Attempt to load weights
-            model.load_weights(model_config, jax.random.PRNGKey(42))
+            model.load_weights(model_config)
 
             print("PASS: Weight loading completed successfully!")
 
@@ -402,7 +395,7 @@ class TestModelLoaderWithRealModel(unittest.TestCase):
             )
 
             # Download model if needed
-            loader = get_model_loader(self.load_config, self.rng, self.mesh)
+            loader = get_model_loader(self.load_config, self.mesh)
             local_path = loader.download_model(model_config)
             model_config.model_path = local_path
 
@@ -415,7 +408,7 @@ class TestModelLoaderWithRealModel(unittest.TestCase):
             # Create QWen model instance with mesh context
             with jax.set_mesh(self.mesh):
                 model = QWenLMHeadModel(
-                    model_config.hf_config, model_config.dtype, self.rng, self.mesh
+                    model_config.hf_config, dtype=model_config.dtype, mesh=self.mesh
                 )
 
             # Check what attributes the model actually has
@@ -444,7 +437,7 @@ class TestModelLoaderWithRealModel(unittest.TestCase):
             )
 
             # Create loader
-            loader = get_model_loader(self.load_config, self.rng, self.mesh)
+            loader = get_model_loader(self.load_config, self.mesh)
 
             print("🔄 Testing full loading pipeline...")
 
@@ -514,14 +507,14 @@ class TestModelLoaderWithRealModel(unittest.TestCase):
             )
 
             # Download model if needed
-            loader = get_model_loader(self.load_config, self.rng, self.mesh)
+            loader = get_model_loader(self.load_config, self.mesh)
             local_path = loader.download_model(model_config)
             model_config.model_path = local_path
 
             # Create QWen model instance with mesh context
             with jax.set_mesh(self.mesh):
                 model = QWenLMHeadModel(
-                    model_config.hf_config, model_config.dtype, self.rng, self.mesh
+                    model_config.hf_config, dtype=model_config.dtype, mesh=self.mesh
                 )
 
             print(" Validating Model Parameter Structure:")
@@ -629,7 +622,7 @@ class TestModelLoaderWithRealModel(unittest.TestCase):
             print(f"🔄 Testing multi-device tensor parallelism with {len(devices[:4])} devices...")
 
             # Create loader with multi-device mesh and download model if needed
-            loader = get_model_loader(self.load_config, self.rng, self.mesh)
+            loader = get_model_loader(self.load_config, self.mesh)
             local_path = loader.download_model(model_config)
             model_config.model_path = local_path
 
@@ -706,7 +699,7 @@ class TestModelLoaderWithRealModel(unittest.TestCase):
             print("🔄 Testing tensor parallel computation...")
 
             # Create loader, download model if needed, and load model
-            loader = get_model_loader(self.load_config, self.rng, self.mesh)
+            loader = get_model_loader(self.load_config, self.mesh)
             local_path = loader.download_model(model_config)
             model_config.model_path = local_path
             model = loader.load_model(model_config=model_config)
@@ -766,7 +759,6 @@ class TestModelLoaderEdgeCases(unittest.TestCase):
             self.mesh = Mesh(devices, ("tensor",), axis_types=(jax.sharding.AxisType.Explicit,))
             print(f" Using single-device mesh: {self.mesh}")
 
-        self.rng = nnx.Rngs(42)
         self.temp_dir = tempfile.mkdtemp()
 
     def tearDown(self):

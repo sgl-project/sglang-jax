@@ -36,12 +36,11 @@ class LinearBase(nnx.Module):
         self,
         input_size: int,
         output_size: int,
+        mesh: jax.sharding.Mesh,
         use_bias: bool = True,
         skip_bias_add: bool = False,
         params_dtype: jnp.dtype | None = jnp.bfloat16,
-        kernel_axes: Sequence[str] | None = None,
-        rngs: nnx.Rngs = None,
-        mesh: jax.sharding.Mesh = None,
+        kernel_axes: Sequence[str | None] | None = None,
     ):
         """Initialize parameters and quantization method."""
         self.skip_bias_add = skip_bias_add

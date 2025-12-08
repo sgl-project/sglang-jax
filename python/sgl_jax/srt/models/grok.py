@@ -1,4 +1,6 @@
 import logging
+from collections.abc import Callable
+from typing import Any, cast
 
 import jax
 import jax.lax
@@ -17,7 +19,11 @@ from sgl_jax.srt.layers.embeddings import (
 )
 from sgl_jax.srt.layers.layernorm import RMSNorm, dual_rmsnorm_forward
 from sgl_jax.srt.layers.linear import LinearBase
-from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
+from sgl_jax.srt.layers.logits_processor import (
+    LogitsMetadata,
+    LogitsProcessor,
+    LogitsProcessorOutput,
+)
 from sgl_jax.srt.layers.moe import EPMoE
 from sgl_jax.srt.layers.radix_attention import RadixAttention
 from sgl_jax.srt.mem_cache.memory_pool import KVCache
@@ -39,7 +45,7 @@ def _yarn_linear_ramp_mask(low: float, high: float, dim: int, dtype: jnp.dtype) 
     return ramp_func
 
 
-def get_rope_scaling(config):
+def get_rope_scaling(config: PretrainedConfig) -> dict[str, Any] | None:
     """Extract RoPE scaling configuration from model config."""
     rope_type = getattr(config, "rope_type", None)
     if rope_type:
@@ -151,10 +157,9 @@ class Grok1MLP(nnx.Module):
         hidden_size: int,
         intermediate_size: int,
         layer_id: int,
-        rngs: nnx.Rngs = None,
+        mesh: jax.sharding.Mesh,
         dtype: jnp.dtype = jnp.bfloat16,
         reduce_results: bool = True,
-        mesh: jax.sharding.Mesh = None,
     ) -> None:
         super().__init__()
 
@@ -164,7 +169,6 @@ class Grok1MLP(nnx.Module):
             use_bias=False,
             params_dtype=dtype,
             kernel_axes=(None, "tensor"),
-            rngs=rngs,
             mesh=mesh,
         )
         self.up_proj = LinearBase(
@@ -173,7 +177,6 @@ class Grok1MLP(nnx.Module):
             use_bias=False,
             params_dtype=dtype,
             kernel_axes=(None, "tensor"),
-            rngs=rngs,
             mesh=mesh,
         )
         self.down_proj = LinearBase(
@@ -182,14 +185,13 @@ class Grok1MLP(nnx.Module):
             use_bias=False,
             params_dtype=dtype,
             kernel_axes=("tensor", None),
-            rngs=rngs,
             mesh=mesh,
         )
         self.act_fn = GeluAndMul(approximate="tanh")
         self.layer_id = layer_id
         self.reduce_results = reduce_results
 
-    def __call__(self, x):
+    def __call__(self, x: jax.Array) -> jax.Array:
         gate, _ = self.gate_proj(x)
         up, _ = self.up_proj(x)
         x, _ = self.act_fn(gate, up)
@@ -212,7 +214,6 @@ class Grok1MoE(nnx.Module):
         top_k: int,
         hidden_size: int,
         intermediate_size: int,
-        rngs: nnx.Rngs,
         mesh: jax.sharding.Mesh,
         dtype: jnp.dtype = jnp.bfloat16,
     ):
@@ -231,7 +232,6 @@ class Grok1MoE(nnx.Module):
             use_bias=False,
             params_dtype=jnp.float32,
             kernel_axes=(None, None),
-            rngs=rngs,
             mesh=mesh,
         )
 
@@ -326,12 +326,10 @@ class Grok1Attention(nnx.Module):
         hidden_size: int,
         num_heads: int,
         num_kv_heads: int,
+        mesh: jax.sharding.Mesh,
         layer_id: int = 0,
         max_position: int = 4096 * 32,
         rope_theta: float = 10000,
-        *,
-        rngs: nnx.Rngs,
-        mesh: jax.sharding.Mesh = None,
     ) -> None:
         super().__init__()
         self.config = config
@@ -358,7 +356,6 @@ class Grok1Attention(nnx.Module):
             use_bias=False,
             params_dtype=jnp.bfloat16,
             kernel_axes=(None, "tensor"),
-            rngs=rngs,
             mesh=mesh,
         )
 
@@ -368,7 +365,6 @@ class Grok1Attention(nnx.Module):
             use_bias=False,
             params_dtype=jnp.bfloat16,
             kernel_axes=(None, "tensor"),
-            rngs=rngs,
             mesh=mesh,
         )
 
@@ -378,7 +374,6 @@ class Grok1Attention(nnx.Module):
             use_bias=False,
             params_dtype=jnp.bfloat16,
             kernel_axes=(None, "tensor"),
-            rngs=rngs,
             mesh=mesh,
         )
 
@@ -388,13 +383,12 @@ class Grok1Attention(nnx.Module):
             use_bias=False,
             params_dtype=jnp.bfloat16,
             kernel_axes=("tensor", None),
-            rngs=rngs,
             mesh=mesh,
         )
 
         # Initialize rotary embeddings based on scaling configuration
         if rope_scaling is not None:
-            self.rotary_emb = ScalingRotaryEmbedding(
+            self.rotary_emb: RotaryEmbedding = ScalingRotaryEmbedding(
                 self.head_dim,
                 rotary_dim=(
                     self.head_dim if not self.rope_rotate_half_dims else self.head_dim // 2
@@ -433,10 +427,10 @@ class Grok1Attention(nnx.Module):
         hidden_states: jax.Array,
         forward_batch: ForwardBatch,
         token_to_kv_pool: KVCache,
-    ) -> jax.Array:
+    ) -> tuple[jax.Array, jax.Array]:
         # Short circuit for empty sequences
         if hidden_states.shape[0] == 0:
-            return hidden_states
+            return hidden_states, hidden_states
 
         # Project Q, K, V separately
         q, _ = self.q_proj(hidden_states)
@@ -466,7 +460,6 @@ class Grok1DecoderLayer(nnx.Module):
         self,
         config: PretrainedConfig,
         layer_id: int,
-        rngs: nnx.Rngs,
         mesh: jax.sharding.Mesh,
     ) -> None:
         super().__init__()
@@ -490,24 +483,27 @@ class Grok1DecoderLayer(nnx.Module):
             num_kv_heads=config.num_key_value_heads,
             layer_id=layer_id,
             rope_theta=rope_theta,
-            rngs=rngs,
             mesh=mesh,
         )
 
         # Feed-forward networks
         if self.num_experts > 0:
+            intermediate_size = getattr(
+                config,
+                "moe_intermediate_size",
+                getattr(config, "intermediate_size", None),
+            )
+            if intermediate_size is None:
+                raise ValueError(
+                    "MoE layers require 'moe_intermediate_size' or 'intermediate_size' in config."
+                )
             self.block_sparse_moe = Grok1MoE(
                 config=config,
                 layer_id=layer_id,
                 num_experts=config.num_local_experts,
                 top_k=config.num_experts_per_tok,
                 hidden_size=config.hidden_size,
-                intermediate_size=getattr(
-                    config,
-                    "moe_intermediate_size",
-                    getattr(config, "intermediate_size", None),
-                ),
-                rngs=rngs,
+                intermediate_size=intermediate_size,
                 mesh=mesh,
             )
             if self.residual_moe:
@@ -515,7 +511,6 @@ class Grok1DecoderLayer(nnx.Module):
                     hidden_size=config.hidden_size,
                     intermediate_size=config.intermediate_size,
                     layer_id=layer_id,
-                    rngs=rngs,
                     reduce_results=False,
                     mesh=mesh,
                 )
@@ -523,13 +518,26 @@ class Grok1DecoderLayer(nnx.Module):
             raise NotImplementedError()
 
         # Layer normalization (using eps instead of epsilon to match PyTorch)
-        self.pre_attn_norm = RMSNorm(config.hidden_size, epsilon=config.rms_norm_eps, rngs=rngs)
-        self.post_attn_norm = RMSNorm(config.hidden_size, epsilon=config.rms_norm_eps, rngs=rngs)
-        self.pre_moe_norm = RMSNorm(config.hidden_size, epsilon=config.rms_norm_eps, rngs=rngs)
-        self.post_moe_norm = RMSNorm(config.hidden_size, epsilon=config.rms_norm_eps, rngs=rngs)
+        self.pre_attn_norm = RMSNorm(
+            config.hidden_size,
+            epsilon=config.rms_norm_eps,
+        )
+        self.post_attn_norm = RMSNorm(
+            config.hidden_size,
+            epsilon=config.rms_norm_eps,
+        )
+        self.pre_moe_norm = RMSNorm(
+            config.hidden_size,
+            epsilon=config.rms_norm_eps,
+        )
+        self.post_moe_norm = RMSNorm(
+            config.hidden_size,
+            epsilon=config.rms_norm_eps,
+        )
 
         # Setup FFN function based on configuration (matching PyTorch logic)
         if self.num_experts > 0:
+            self.ffn: Callable[[jax.Array], jax.Array] | Grok1MoE
             if self.residual_moe:
                 self.ffn = self.moe_with_rmoe
             else:
@@ -537,7 +545,7 @@ class Grok1DecoderLayer(nnx.Module):
         else:
             raise NotImplementedError()
 
-    def moe_with_rmoe(self, x):
+    def moe_with_rmoe(self, x: jax.Array) -> jax.Array:
         """Combine MoE and residual MLP outputs (matches PyTorch implementation)."""
         mlp_result = self.mlp(x)
         moe_result = self.block_sparse_moe(x)
@@ -552,11 +560,13 @@ class Grok1DecoderLayer(nnx.Module):
         token_to_kv_pool: KVCache,
         residual: jax.Array | None = None,
         deferred_norm: RMSNorm | None = None,
-    ) -> tuple[jax.Array, jax.Array, RMSNorm]:
+    ) -> tuple[jax.Array, jax.Array, RMSNorm, jax.Array]:
 
         # Self Attention block (matching PyTorch logic exactly)
         if deferred_norm is not None:
             assert residual is not None
+            assert deferred_norm.scale is not None
+            assert self.pre_attn_norm.scale is not None
             # Apply deferred norm from previous layer and pre-attention norm
             hidden_states, residual = dual_rmsnorm_forward(
                 hidden_states,
@@ -578,6 +588,8 @@ class Grok1DecoderLayer(nnx.Module):
         )
 
         # # Apply post-attention norm and pre-MoE norm (matching PyTorch fused_dual_residual_rmsnorm)
+        assert self.post_attn_norm.scale is not None
+        assert self.pre_moe_norm.scale is not None
         hidden_states, residual = dual_rmsnorm_forward(
             hidden_states,
             residual,
@@ -603,7 +615,6 @@ class Grok1Model(nnx.Module):
         self,
         config: PretrainedConfig,
         *,
-        rngs: nnx.Rngs,
         mesh: jax.sharding.Mesh,
     ) -> None:
         super().__init__()
@@ -616,7 +627,6 @@ class Grok1Model(nnx.Module):
         self.embed_tokens = Embed(
             num_embeddings=config.vocab_size,
             features=config.hidden_size,
-            rngs=rngs,
             dtype=jnp.bfloat16,
             kernel_axes=("tensor", None),
             param_dtype=jnp.bfloat16,
@@ -626,13 +636,16 @@ class Grok1Model(nnx.Module):
         # Transformer layers
         self.layers = nnx.List(
             [
-                Grok1DecoderLayer(config=config, layer_id=i, mesh=mesh, rngs=rngs)
+                Grok1DecoderLayer(config=config, layer_id=i, mesh=mesh)
                 for i in range(config.num_hidden_layers)
             ]
         )
 
         # Final layer norm (using eps to match PyTorch)
-        self.norm = RMSNorm(config.hidden_size, epsilon=config.rms_norm_eps, rngs=rngs)
+        self.norm = RMSNorm(
+            config.hidden_size,
+            epsilon=config.rms_norm_eps,
+        )
 
     def __call__(
         self,
@@ -640,8 +653,8 @@ class Grok1Model(nnx.Module):
         positions: jax.Array,
         forward_batch: ForwardBatch,
         token_to_kv_pool: KVCache,
-        input_embeds: jax.Array = None,
-    ) -> jax.Array:
+        input_embeds: jax.Array | None = None,
+    ) -> tuple[jax.Array, list[jax.Array]]:
         # Get embeddings, hidden_states: [B, N, hidden_size]
         if input_embeds is None:
             hidden_states = self.embed_tokens(input_ids)
@@ -665,6 +678,10 @@ class Grok1Model(nnx.Module):
             )
             layers_kv_fused.append(kv_fused)
         # Apply final normalization (matching PyTorch fused_dual_residual_rmsnorm)
+        assert deferred_norm is not None
+        assert residual is not None
+        assert deferred_norm.scale is not None
+        assert self.norm.scale is not None
         hidden_states, _ = dual_rmsnorm_forward(
             hidden_states,
             residual,
@@ -683,8 +700,7 @@ class Grok1ForCausalLM(nnx.Module):
         self,
         config: PretrainedConfig,
         dtype: jnp.dtype,
-        rngs: nnx.Rngs | None = None,
-        mesh: jax.sharding.Mesh | None = None,
+        mesh: jax.sharding.Mesh,
     ) -> None:
         super().__init__()
         assert dtype == jnp.bfloat16
@@ -695,9 +711,10 @@ class Grok1ForCausalLM(nnx.Module):
         self.replicate_lm_head = getattr(config, "replicate_lm_head", False)
 
         # Main model
-        self.model = Grok1Model(config, rngs=rngs, mesh=mesh)
+        self.model = Grok1Model(config, mesh=mesh)
 
         # Language modeling head (matching PyTorch logic for replicated vs parallel)
+        self.lm_head: LinearBase | ParallelLMHead
         if self.replicate_lm_head:
             # ReplicatedLinear equivalent
             self.lm_head = LinearBase(
@@ -706,7 +723,7 @@ class Grok1ForCausalLM(nnx.Module):
                 use_bias=False,
                 params_dtype=jnp.bfloat16,
                 kernel_axes=("tensor", None),
-                rngs=rngs,
+                mesh=mesh,
             )
         else:
             self.lm_head = ParallelLMHead(
@@ -714,20 +731,19 @@ class Grok1ForCausalLM(nnx.Module):
                 features=config.hidden_size,
                 param_dtype=jnp.bfloat16,
                 kernel_axes=("tensor", None),
-                rngs=rngs,
             )
         soft_cap = getattr(config, "final_logit_softcapping", 0.0) if config else 0.0
         self.logits_processor = LogitsProcessor(config.vocab_size, mesh=mesh, soft_cap=soft_cap)
 
-        self.loaded_param_names = set()
+        self.loaded_param_names: set[str] = set()
 
-    def named_parameters(self):
+    def named_parameters(self) -> list[tuple[str, nnx.Param[Any]]]:
         """Recursively yield (full_path, nnx.Param) over all parameters in this module.
         Paths resemble PyTorch-style dotted names, starting from this module.
         """
         params = {}
 
-        def _collect(obj, prefix: str):
+        def _collect(obj: Any, prefix: str) -> None:
             from flax import nnx as _nnx
 
             # nnx.Param
@@ -763,20 +779,18 @@ class Grok1ForCausalLM(nnx.Module):
         forward_batch: ForwardBatch,
         token_to_kv_pool: KVCache,
         logits_metadata: LogitsMetadata,
-    ) -> tuple[jax.Array, list, bool]:
+    ) -> tuple[LogitsProcessorOutput, list[jax.Array], bool]:
         """Forward pass through the model using unified forward_batch API."""
         input_ids = forward_batch.input_ids
         positions = forward_batch.positions
         hidden_states, layers_kv_fused = self.model(
             input_ids, positions, forward_batch, token_to_kv_pool, None
         )
-        output = self.logits_processor(hidden_states, self.lm_head, logits_metadata)
+        output = self.logits_processor(hidden_states, cast(Embed, self.lm_head), logits_metadata)
 
         return output, layers_kv_fused, True
 
-    def load_weights(self, model_config: ModelConfig, rng_key: jax.Array):
-        self.rngs = nnx.Rngs(rng_key)
-
+    def load_weights(self, model_config: ModelConfig) -> None:
         loader = WeightLoader(
             model=self,
             model_config=model_config,
@@ -786,10 +800,13 @@ class Grok1ForCausalLM(nnx.Module):
 
         weight_mappings = self._create_grok_weight_mappings()
 
-        loader.load_weights_from_safetensors(weight_mappings, safetensors_partition=8)
+        loader.load_weights_from_safetensors(
+            weight_mappings,
+            safetensors_partition=8,
+        )
         logger.info("Grok weights loaded successfully!")
 
-    def _create_grok_weight_mappings(self):
+    def _create_grok_weight_mappings(self) -> dict[str, WeightMapping]:
         mappings = {
             "model.embed_tokens.weight": WeightMapping(
                 target_path="model.embed_tokens.embedding",
@@ -811,7 +828,7 @@ class Grok1ForCausalLM(nnx.Module):
 
         return mappings
 
-    def _create_layer_mappings(self, layer_idx: int) -> dict:
+    def _create_layer_mappings(self, layer_idx: int) -> dict[str, WeightMapping]:
         prefix = f"model.layers.{layer_idx}"
         target_prefix = f"model.layers.{layer_idx}"
 
@@ -898,10 +915,9 @@ class Grok1ForCausalLM(nnx.Module):
                 ]
             )
 
-            if target_name == "wo":
-                sharding = ("expert", "tensor", None)
-            else:
-                sharding = ("expert", None, "tensor")
+            sharding = (
+                ("expert", "tensor", None) if target_name == "wo" else ("expert", None, "tensor")
+            )
 
             if name == "w2":
                 # w2 (down_proj) -> wo: HF shape (8192, 2048), concat -> (8192, 16384), transpose -> (16384, 8192)
