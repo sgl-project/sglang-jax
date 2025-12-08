@@ -21,9 +21,10 @@ Implement a complete sgl-jax rollout adapter for Tunix integration. This enables
    - Provides parameter synchronization and per-token logprobs calculation
    - Includes factory function `create_sgljax_rollout` for easy setup
 
-
 ##### `update_params` API
+
 For sgl-jax, we directly update the model runner's model state since both use the same NNX format.
+
 ```python
 def update_params(
     self,
@@ -51,6 +52,7 @@ def update_params(
     else:
         nnx.update(self._model, updated_weights)
 ```
+
 Note: Add key_mappings and transpose_keys which follows the example of `utils.transfer_state_with_mappings` to handle the mapping and transformation between states.
 
 #### Usage Example
@@ -80,7 +82,6 @@ rl_cluster = rl_cluster_lib.RLCluster(
 grpo_trainer = GrpoLearner(rl_cluster, reward_fns, grpo_config)
 grpo_trainer.train(dataset)
 ```
-
 
 ### Work in Sgl-jax
 
@@ -141,9 +142,33 @@ def generate(
 
 ```python
 from sgl_jax.srt.entrypoints.engine import Engine
+from sgl_jax.srt.server_args import ServerArgs
+
 if __name__ == '__main__':
-    engine = Engine(model_path = 'Qwen/Qwen-7B-Chat', trust_remote_code = True, dist_init_addr = '0.0.0.0:10011', nnodes = 1 , tp_size = 4, device = 'tpu' ,random_seed = 3, node_rank = 0, mem_fraction_static = 0.4, chunked_prefill_size = 8192, download_dir = '/tmp', dtype = 'bfloat16', precompile_bs_paddings = [64], max_running_requests = 64, skip_server_warmup = True, attention_backend = 'fa',precompile_token_paddings = [8192], page_size = 64 ,log_requests = True, log_requests_level = 3)
-    output = engine.generate(prompt = ['您好', "hello"], sampling_params = {"n",2, "temperature": 0.7})
+    server_args = ServerArgs(
+        model_path='Qwen/Qwen-7B-Chat',
+        trust_remote_code=True,
+        dist_init_addr='0.0.0.0:10011',
+        nnodes=1,
+        tp_size=4,
+        device='tpu',
+        random_seed=3,
+        node_rank=0,
+        mem_fraction_static=0.4,
+        chunked_prefill_size=8192,
+        download_dir='/tmp',
+        dtype='bfloat16',
+        precompile_bs_paddings=[64],
+        max_running_requests=64,
+        skip_server_warmup=True,
+        attention_backend='fa',
+        precompile_token_paddings=[8192],
+        page_size=64,
+        log_requests=True,
+        log_requests_level=3,
+    )
+    engine = Engine(server_args)
+    output = engine.generate(prompt=['您好', "hello"], sampling_params={"n": 2, "temperature": 0.7})
     print(len(list(output)), output)
 ```
 
@@ -152,11 +177,11 @@ if __name__ == '__main__':
 ##### Fields Discussion
 
 - `seed`: It is set by tunix sampler but is not used when sampling. Will it be used in the future?
-   - Answer: It will be used in the future. But now it is used to test. It is not sure that whether the deterministic inference will be required or not by algorithm engineers. So here we decide to support deterministic sampling for every request.
+  - Answer: It will be used in the future. But now it is used to test. It is not sure that whether the deterministic inference will be required or not by algorithm engineers. So here we decide to support deterministic sampling for every request.
 - `presence_penalty` & `frequency_penalty`: Will they be used in the future?
-   - Answer: Support them.
+  - Answer: Support them.
 - `logprobs`: Does it mean logprobs of `top_number+1` for every output position? 1 means it include output_id's logprob.
-   - Answer: No, only output_ids' logprobs are required. But the output_ids' logprobs will be recalculated due to accuracy problem between inference framework and training framework. So these logprobs are not required.
+  - Answer: No, only output_ids' logprobs are required. But the output_ids' logprobs will be recalculated due to accuracy problem between inference framework and training framework. So these logprobs are not required.
 
   > From vLLM: Number of log probabilities to return per output token. When set to
     `None`, no probability is returned. If set to a non-`None` value, the
@@ -167,7 +192,7 @@ if __name__ == '__main__':
     response. When set to -1, return all `vocab_size` log probabilities.
 
 - `prompt_logprobs`: Does it mean logprobs of `top_number` for every prompt position?
-   - Answer: No, they are not required.
+  - Answer: No, they are not required.
   > From vLLM: Number of log probabilities to return per prompt token.
     When set to -1, return all `vocab_size` log probabilities.
 
@@ -231,12 +256,12 @@ def _launch_subprocesses_or_threads(
         return _launch_subprocesses(server_args, port_args)
 ```
 
-
 ## Discussion
 
 D1. Will beam search be required in the future?
 Sglang has a MR[https://github.com/sgl-project/sglang/pull/3066] to support it, but it has no progress.
-  - Answer: Currently it is not required.
+
+- Answer: Currently it is not required.
 
 ## Test
 
