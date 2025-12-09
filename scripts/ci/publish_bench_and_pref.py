@@ -222,24 +222,24 @@ def update_branch_ref(repo_owner, repo_name, branch, commit_sha, token, max_retr
                 raise
 
 
-def copy_trace_files(source_dir, target_base_path):
-    """Copy trace files and return list of files to upload"""
+def prepare_files_for_upload(source_dir, target_base_path):
+    """Prepare files from a directory and return a list of files to upload"""
     files_to_upload = []
 
     if not os.path.exists(source_dir):
-        print(f"Warning: Traces directory {source_dir} does not exist")
+        print(f"Warning: Source directory {source_dir} does not exist")
         return files_to_upload
 
-    # Walk through source directory and find .json.gz files
+    # Walk through source directory and find .csv files
     for root, dirs, files in os.walk(source_dir):
         for file in files:
-            if file.endswith(".json.gz"):
+            if file.endswith(".csv"):  # <--- 修改点
                 source_file = os.path.join(root, file)
                 # Calculate relative path from source_dir
                 rel_path = os.path.relpath(source_file, source_dir)
                 target_path = f"{target_base_path}/{rel_path}"
 
-                # Read file content
+                # Read file content as binary
                 with open(source_file, "rb") as f:
                     content = f.read()
 
@@ -260,16 +260,16 @@ def publish_traces(traces_dir, run_id, run_number):
     repo_owner = "pathfinder-pf"
     repo_name = "sglang-jax-ci-data"
     branch = "main"
-    target_base_path = f"traces/{run_id}"
+    target_base_path = f"csv_data/{run_id}"
 
     # Copy trace files
-    files_to_upload = copy_trace_files(traces_dir, target_base_path)
+    files_to_upload = prepare_files_for_upload(traces_dir, target_base_path)
 
     if not files_to_upload:
-        print("No trace files found to upload")
+        print("No csv files found to upload")
         return
 
-    print(f"Found {len(files_to_upload)} files to upload")
+    print(f"Found {len(files_to_upload)} CSV files to upload")
 
     # Verify token permissions before proceeding
     if not verify_token_permissions(repo_owner, repo_name, token):
@@ -294,9 +294,7 @@ def publish_traces(traces_dir, run_id, run_number):
             print(f"Created new tree: {new_tree_sha}")
 
             # Create commit
-            commit_message = (
-                f"Nightly traces for run {run_id} at {run_number} ({len(files_to_upload)} files)"
-            )
+            commit_message = f"CSV files of Nightly-test for run {run_id} at {run_number} ({len(files_to_upload)} files)"
             commit_sha = create_commit(
                 repo_owner,
                 repo_name,
@@ -311,7 +309,7 @@ def publish_traces(traces_dir, run_id, run_number):
             update_branch_ref(repo_owner, repo_name, branch, commit_sha, token)
             print("Updated branch reference")
 
-            print("Successfully published all traces in a single commit")
+            print("Successfully published all csv files in a single commit")
             return
 
         except Exception as e:
@@ -343,12 +341,12 @@ def publish_traces(traces_dir, run_id, run_number):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Publish performance traces to GitHub repository")
+    parser = argparse.ArgumentParser(description="Publish files to a GitHub repository")
     parser.add_argument(
-        "--traces-dir",
+        "--source-dir",
         type=str,
         required=True,
-        help="Traces directory to publish",
+        help="Source directory with files to publish",
     )
     args = parser.parse_args()
 
@@ -360,12 +358,12 @@ def main():
         print("Error: GITHUB_RUN_ID and GITHUB_RUN_NUMBER environment variables must be set")
         sys.exit(1)
 
-    # Use traces directory
-    traces_dir = args.traces_dir
-    print(f"Processing traces from directory: {traces_dir}")
+    # Use source directory
+    source_dir = args.source_dir
+    print(f"Processing files from directory: {source_dir}")
 
-    # Publish traces
-    publish_traces(traces_dir, run_id, run_number)
+    # Publish files
+    publish_traces(source_dir, run_id, run_number)
 
 
 if __name__ == "__main__":
