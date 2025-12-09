@@ -1,26 +1,14 @@
 name: Nightly Test
 
 on:
+  schedule:
+    - cron: '0 0 * * *'
   push:
     branches:
       - main
-      - "epic/*"
     paths:
-      - "python/**"
-      - "scripts/**"
-      - "test/**"
-      - ".github/workflows/pr-test.yml"
-      - ".github/workflows/nightly-test.yml"
-  pull_request:
-    branches:
-      - main
-      - "epic/*"
-    paths:
-      - "python/**"
-      - "scripts/**"
-      - "test/**"
-      - ".github/workflows/pr-test.yml"
-      - ".github/workflows/nightly-test.yml"
+      - "python/sglang/version.py"
+  workflow_dispatch:
 
 concurrency:
   group: nightly-test-${{ github.ref }}
