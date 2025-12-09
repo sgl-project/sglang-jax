@@ -113,7 +113,7 @@ class RadixCache(BasePrefixCache):
         self.num_processes = jax.process_count()
         self.local_devices = jax.local_device_count()
 
-        #self.cpu_device = jax.local_devices(backend="cpu")[0]
+        # self.cpu_device = jax.local_devices(backend="cpu")[0]
         self.is_eagle = is_eagle
 
         if is_eagle:

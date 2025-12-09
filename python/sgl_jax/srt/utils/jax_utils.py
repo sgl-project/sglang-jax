@@ -119,7 +119,8 @@ def get_available_device_memory(device, distributed=False, empty_cache=True):
         live_arrays = jax.live_arrays()
         pathways_hbm_used_mem = pathways_hbm_usage_gb(live_arrays, devices)
         avail_mem = jnp.array(
-            [(hbm_limit - hbm_used)/(1<<10) for hbm_used, hbm_limit in pathways_hbm_used_mem], dtype=jnp.float32
+            [(hbm_limit - hbm_used) / (1 << 10) for hbm_used, hbm_limit in pathways_hbm_used_mem],
+            dtype=jnp.float32,
         )
     elif device in ("gpu", "cuda"):
         if empty_cache:
