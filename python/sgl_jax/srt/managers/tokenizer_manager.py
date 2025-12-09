@@ -145,8 +145,8 @@ class TokenizerManager:
         self.is_generation = self.model_config.is_generation
         self.context_len = self.model_config.context_len
         self.image_token_id = self.model_config.image_token_id
-        self._updating = False
-        self._cond = asyncio.Condition()
+        self.is_pause = False
+        self.is_pause_cond = asyncio.Condition()
 
         self.mm_processor = None
 
@@ -245,8 +245,8 @@ class TokenizerManager:
         request: fastapi.Request | None = None,
     ):
         created_time = time.time()
-        async with self._cond:
-            await self._cond.wait_for(lambda: not self._updating)
+        async with self.is_pause_cond:
+            await self.is_pause_cond.wait_for(lambda: not self.is_pause)
 
         self.auto_create_handle_loop()
         obj.normalize_batch_and_arguments()
@@ -619,8 +619,8 @@ class TokenizerManager:
         return result
 
     async def pause_generation(self, obj: PauseGenerationReqInput):
-        async with self._cond:
-            self._updating = True
+        async with self.is_pause_cond:
+            self.is_pause = True
             if obj.mode != "abort":
                 await self.send_to_scheduler.send_pyobj(obj)
             else:
@@ -632,10 +632,10 @@ class TokenizerManager:
                     await asyncio.sleep(0.1)
 
     async def continue_generation(self, obj: ContinueGenerationReqInput):
-        async with self._cond:
-            self._updating = False
+        async with self.is_pause_cond:
+            self.is_pause = False
             await self.send_to_scheduler.send_pyobj(obj)
-            self._cond.notify_all()
+            self.is_pause_cond.notify_all()
 
     async def release_memory_occupation(
         self,

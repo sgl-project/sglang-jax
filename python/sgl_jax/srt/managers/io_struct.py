@@ -3,7 +3,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any
+from typing import Any, Literal
 
 from sgl_jax.srt.managers.schedule_batch import BaseFinishReason
 
@@ -162,7 +162,7 @@ class PauseGenerationReqInput(BaseReq):
             recomputed after continue_generation.
     """
 
-    mode: str = "abort"
+    mode: Literal["abort", "retract", "in_place"] = "abort"
 
     def __post_init__(self):
         allowed = ["abort", "retract", "in_place"]
