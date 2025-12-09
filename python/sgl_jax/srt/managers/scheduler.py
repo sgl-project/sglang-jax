@@ -847,10 +847,8 @@ class Scheduler(
     def flush_cache_wrapped(self, recv_req: FlushCacheReqInput):
         success, error_msg, flushed_items = self.flush_cache()
         return FlushCacheReqOutput(
-            request_id=recv_req.request_id,
+            rid=recv_req.rid,
             success=success,
-            error_msg=error_msg,
-            flushed_items=flushed_items,
         )
 
     def _can_flush_cache(self) -> tuple[bool, str]:
@@ -1386,7 +1384,7 @@ class Scheduler(
             # This only works for requests that have not started anything.
             # We still need to send something back to TokenizerManager to clean up the state.
             req = self.waiting_queue.pop(i)
-            self.send_to_tokenizer.send_pyobj(AbortReq(req.rid))
+            self.send_to_tokenizer.send_pyobj(AbortReq(rid=req.rid))
             logger.debug("Abort queued request. rid=%s", req.rid)
 
         # Delete the requests in the grammar queue
