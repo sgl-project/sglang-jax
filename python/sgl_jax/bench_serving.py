@@ -32,6 +32,7 @@ from typing import Any
 import aiohttp
 import numpy as np
 import requests
+from requests.adapters import HTTPAdapter
 from tqdm.asyncio import tqdm
 from transformers import (
     AutoTokenizer,
@@ -39,6 +40,7 @@ from transformers import (
     PreTrainedTokenizerBase,
     PreTrainedTokenizerFast,
 )
+from urllib3.util.retry import Retry
 
 ASSISTANT_SUFFIX = "Assistant:"
 
@@ -606,9 +608,27 @@ def download_and_cache_file(url: str, filename: str | None = None):
 
     print(f"Downloading from {url} to {filename}")
 
-    # Stream the response to show the progress bar
-    response = requests.get(url, stream=True)
-    response.raise_for_status()  # Check for request errors
+    session = requests.Session()
+
+    hf_token = os.getenv("HF_TOKEN")
+    if hf_token:
+        print("Using HF_TOKEN for authentication.")
+        session.headers.update({"Authorization": f"Bearer {hf_token}"})
+    else:
+        print("Warning: No HF_TOKEN found. Request will be anonymous (lower rate limit).")
+
+    retries = Retry(
+        total=5,
+        backoff_factor=1,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["HEAD", "GET", "OPTIONS"],
+    )
+    adapter = HTTPAdapter(max_retries=retries)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+
+    response = session.get(url, stream=True)
+    response.raise_for_status()
 
     # Total size of the file in bytes
     total_size = int(response.headers.get("content-length", 0))
@@ -630,6 +650,43 @@ def download_and_cache_file(url: str, filename: str | None = None):
             bar.update(len(chunk))
 
     return filename
+
+
+# def download_and_cache_file(url: str, filename: str | None = None):
+#     """Read and cache a file from a url."""
+#     if filename is None:
+#         filename = os.path.join("/tmp", url.split("/")[-1])
+
+#     # Check if the cache file already exists
+#     if is_file_valid_json(filename):
+#         return filename
+
+#     print(f"Downloading from {url} to {filename}")
+
+#     # Stream the response to show the progress bar
+#     response = requests.get(url, stream=True)
+#     response.raise_for_status()  # Check for request errors
+
+#     # Total size of the file in bytes
+#     total_size = int(response.headers.get("content-length", 0))
+#     chunk_size = 1024  # Download in chunks of 1KB
+
+#     # Use tqdm to display the progress bar
+#     with (
+#         open(filename, "wb") as f,
+#         tqdm(
+#             desc=filename,
+#             total=total_size,
+#             unit="B",
+#             unit_scale=True,
+#             unit_divisor=1024,
+#         ) as bar,
+#     ):
+#         for chunk in response.iter_content(chunk_size=chunk_size):
+#             f.write(chunk)
+#             bar.update(len(chunk))
+
+#     return filename
 
 
 def is_file_valid_json(path):
