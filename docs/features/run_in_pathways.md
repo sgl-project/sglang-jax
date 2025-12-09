@@ -2,7 +2,7 @@
 
 ## For Single Host
 
-Note: 
+Note:
 1. Before you execute the following script, please ensure your google account has been a member of PROJECT. Contact with @Prayer3th.
 2. You can execute the `Setup Pathways` on CPU VM, and you will omit to configure on your personal computer.
 
@@ -103,7 +103,7 @@ spec:
 ```
 
 
-### Interact with Pathways
+### Run SGLangJax in Interactive Mode
 
 Note: Refer to [Run an interactive workload with Pathways](https://docs.cloud.google.com/ai-hypercomputer/docs/workloads/pathways-on-cloud/pathways-interactive-mode).
 
@@ -138,4 +138,37 @@ Check the configution: `kubectl get pods`, the successful results are similar to
 NAME                                        READY   STATUS    RESTARTS   AGE
 pathways-aolemila-pathways-head-0-0-s5zjl   2/2     Running   0          11m
 pathways-aolemila-worker-0-0-ccfhs          1/1     Running   0          11m
+```
+
+Step3: Launch SGLangJax
+
+```bash
+JAX_PLATFORMS=proxy \
+JAX_BACKEND_TARGET=grpc://127.0.0.1:29000 \
+JAX_USE_SHARDY_PARTITIONER=0 \
+python3 -u -m sgl_jax.launch_server \
+--model-path deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B \
+--trust-remote-code  \
+--tp-size=4  \
+--mem-fraction-static=0.8 \
+--chunked-prefill-size=2048 \
+--download-dir=/tmp \
+--dtype=bfloat16 \
+--max-running-requests 8 \
+--skip-server-warmup \
+--page-size=64  \
+--max-total-tokens=257536 \
+--random-seed=27 \
+--precompile-token-paddings=2048 \
+--precompile-bs-paddings=8 \
+--enable-single-process
+```
+
+```bash
+# curl
+curl -X POST 'http://127.0.0.1:30000/generate' -d '{"sampling_params": {"max_new_tokens": 10,"temperature":0.6, "top_k":10, "top_p":0.9, "min_p":0.6}, "text": "the capital of France is"}' -H 'Content-Type: application/json'
+
+## curl result
+curl -X POST 'http://127.0.0.1:30000/generate' -d '{"sampling_params": {"max_new_tokens": 10,"temperature":0.6, "top_k":10, "top_p":0.9, "min_p":0.6}, "text": "the capital of France is"}' -H 'Content-Type: application/json'
+{"text":" the capital of the capital of France.\n\nIs this","output_ids":[279,6722,315,279,6722,315,9625,382,3872,419],"meta_info":{"id":"1b990e673c494324b1a2b6a9e5e3cc0a","finish_reason":{"type":"length","length":10},"prompt_tokens":6,"completion_tokens":10,"cached_tokens":0,"cache_miss_count":0,"e2e_latency":2.1345818042755127}}
 ```
