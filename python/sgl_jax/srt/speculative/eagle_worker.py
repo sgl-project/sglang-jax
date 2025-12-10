@@ -561,7 +561,6 @@ class EAGLEWorker(ModelWorker):
         model_worker_batch.speculative_eagle_topk = self.topk
         model_worker_batch.speculative_num_steps = self.speculative_num_steps
         model_worker_batch.speculative_num_draft_tokens = self.speculative_num_draft_tokens
-        # 这里需要150ms, 需要优化
         self.copy_model_worker_batch_to_cpu(model_worker_batch)
         metadata_per_step = self.draft_model_runner.attn_backend.get_eagle_multi_step_metadata(
             model_worker_batch,
@@ -575,39 +574,22 @@ class EAGLEWorker(ModelWorker):
             model_worker_batch, self.draft_model_runner.mesh
         )
         forward_batch = ForwardBatch.init_new(model_worker_batch, self.draft_model_runner)
-        forward_batch.out_cache_loc = jnp.empty((1,))
-        forward_batch.cache_loc = jnp.empty((1,))
+        forward_batch.out_cache_loc = np.empty((1,))
+        forward_batch.cache_loc = np.empty((1,))
         forward_batch.spec_info = EagleDraftInput()
-        forward_batch.spec_info.hidden_states = jnp.empty((bs * self.topk, hidden_states.shape[1]))
+        forward_batch.spec_info.hidden_states = np.empty((bs * self.topk, hidden_states.shape[1]))
         for i in range(self.speculative_num_steps):
             input_ids, hidden_states, scores, tree_info = select_top_k_tokens(
                 i, topk_p, topk_index, hidden_states, scores, self.topk
             )
-            if i == 0:
-                score_list = score_list.at[:bs, :1, :].set(tree_info[0][:bs])
-                token_list = token_list.at[:bs, : self.topk].set(tree_info[1][:bs])
-                parents_list = parents_list.at[:bs, : self.topk + 1].set(tree_info[2][:bs])
-            else:
-                score_start = 1 + (i - 1) * self.topk
-                token_start = self.topk + (i - 1) * self.topk * self.topk
-                parent_start = self.topk + 1 + (i - 1) * self.topk
-                score_list = score_list.at[:bs, score_start : score_start + self.topk, :].set(
-                    tree_info[0][:bs]
-                )
-                token_list = token_list.at[
-                    :bs, token_start : token_start + self.topk * self.topk
-                ].set(tree_info[1][:bs])
-                parents_list = parents_list.at[:bs, parent_start : parent_start + self.topk].set(
-                    tree_info[2][:bs]
-                )
+            score_list, token_list, parents_list = update_eagle_lists(
+                i, score_list, token_list, parents_list, tree_info, self.topk
+            )
             if i == self.speculative_num_steps - 1:
                 break
-            forward_batch.input_ids = forward_batch.input_ids.at[:].set(input_ids[:])
-            # FIXME(pc) hiddenstate will become NAN when forward path is very long, we still have no reason for this
-            forward_batch.spec_info.hidden_states = forward_batch.spec_info.hidden_states.at[:].set(
-                hidden_states[:]
+            forward_batch = update_forward_batch_info(
+                forward_batch, i, input_ids, hidden_states, positions_base
             )
-            forward_batch.positions = forward_batch.positions.at[:].set(positions_base[:] + i)
             self.draft_model_runner.attn_backend.forward_metadata = metadata_per_step[i]
 
             # Run forward
@@ -623,31 +605,6 @@ class EAGLEWorker(ModelWorker):
             hidden_states = logits_output.hidden_states[
                 : model_worker_batch.real_bs * self.topk * self.topk, :
             ]
-        # score_list_array = []
-        # token_list_array = []
-        # parents_list_array = []
-        # bs = model_worker_batch.real_bs
-        # for i in range(model_worker_batch.speculative_num_steps):
-
-        #     if i == 0:
-        #         score_list_array.append(score_list[:bs, :1, :])
-        #         token_list_array.append(token_list[:bs, : self.topk])
-        #         parents_list_array.append(parents_list[:bs, : self.topk + 1])
-        #     else:
-        #         score_start = 1 + (i - 1) * self.topk
-        #         token_start = self.topk + (i - 1) * self.topk * self.topk
-        #         parent_start = self.topk + 1 + (i - 1) * self.topk
-        #         score_list_array.append(score_list[:bs, score_start : score_start + self.topk, :])
-        #         token_list_array.append(
-        #             token_list[:bs, token_start : token_start + self.topk * self.topk]
-        #         )
-        #         parents_list_array.append(
-        #             parents_list[:bs, parent_start : parent_start + self.topk]
-        #         )
-
-        # # assert jnp.allclose(jnp.concatenate(score_list_array, axis=1),score_list)
-        # # assert jnp.all(jnp.concatenate(token_list_array, axis=1), token_list)
-        # # assert jnp.all(jnp.concatenate(parents_list_array[:-1], axis=1), parents_list)
 
         return score_list, token_list, parents_list
 
@@ -768,6 +725,57 @@ def fast_topk(values, topk, axis=-1):
 
 
 # FIXME(pc) this should be jitted or convert as np.ndarray
+@functools.partial(jax.jit, static_argnames=["i", "topk"], donate_argnums=(1, 2, 3))
+def update_eagle_lists(
+    i: int,
+    score_list: jax.Array,
+    token_list: jax.Array,
+    parents_list: jax.Array,
+    tree_info: tuple[jax.Array, jax.Array, jax.Array],
+    topk: int,
+):
+    bs = score_list.shape[0]
+    scores_update, tokens_update, parents_update = tree_info
+
+    if i == 0:
+        score_list = score_list.at[:bs, :1, :].set(scores_update[:bs])
+        token_list = token_list.at[:bs, :topk].set(tokens_update[:bs])
+        parents_list = parents_list.at[:bs, : topk + 1].set(parents_update[:bs])
+    else:
+        score_start = 1 + (i - 1) * topk
+        token_start = topk + (i - 1) * topk * topk
+        parent_start = topk + 1 + (i - 1) * topk
+
+        score_list = score_list.at[:bs, score_start : score_start + topk, :].set(scores_update[:bs])
+        token_list = token_list.at[:bs, token_start : token_start + topk * topk].set(
+            tokens_update[:bs]
+        )
+        parents_list = parents_list.at[:bs, parent_start : parent_start + topk].set(
+            parents_update[:bs]
+        )
+    return score_list, token_list, parents_list
+
+
+# FIXME(pc) this should be jitted or convert as np.ndarray
+@functools.partial(jax.jit, static_argnames=["i"], donate_argnums=(0, 2))
+def update_forward_batch_info(
+    forward_batch: ForwardBatch,
+    i: int,
+    input_ids: jax.Array,
+    hidden_states: jax.Array,
+    positions_base: jax.Array,
+) -> ForwardBatch:
+    forward_batch.input_ids = forward_batch.input_ids.at[:].set(input_ids[:].astype(jnp.int32))
+    # FIXME(pc) hiddenstate will become NAN when forward path is very long, we still have no reason for this
+    forward_batch.spec_info.hidden_states = forward_batch.spec_info.hidden_states.at[:].set(
+        hidden_states[:]
+    )
+    forward_batch.positions = forward_batch.positions.at[:].set(
+        (positions_base[:] + i).astype(jnp.int32)
+    )
+    return forward_batch
+
+
 def select_top_k_tokens(
     i: int,
     topk_p: jax.Array,
