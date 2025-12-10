@@ -40,6 +40,7 @@ dependencies = [
     "aiohttp",
     "pybase64",
     "partial_json_parser",
+    "pathwaysutils",
 ]
 
 [project.optional-dependencies]
