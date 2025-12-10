@@ -500,7 +500,6 @@ class Scheduler(
                         next_batch_sampling_info=self.tp_worker.cur_sampling_info,
                     )
                     with jax.profiler.TraceAnnotation("process_batch_result"):
-
                         self.process_batch_result(tmp_batch, None, batch.launch_done)
 
             if self.last_batch:
