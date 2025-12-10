@@ -15,6 +15,7 @@ from types import SimpleNamespace
 
 import jax
 import numpy as np
+import pathwaysutils
 import psutil
 import setproctitle
 import zmq
@@ -219,6 +220,10 @@ class Scheduler(
         # init distribution
         if self.nnodes > 1:
             jax.distributed.initialize(server_args.dist_init_addr, self.nnodes, self.node_rank)
+
+        platform = os.getenv("JAX_PLATFORMS", None)
+        if platform == "proxy":
+            pathwaysutils.initialize()
         self.mesh = create_device_mesh(
             ici_parallelism=[-1, self.tp_size],
             dcn_parallelism=[1, 1],
