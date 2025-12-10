@@ -184,6 +184,9 @@ class FusedEPMoE(nnx.Module):
         """
         assert hidden_states.ndim == 2
 
+        hidden_states = jax.sharding.reshard(hidden_states, P("tensor", None))
+        router_logits = jax.sharding.reshard(router_logits, P("tensor", None))
+
         output = fused_ep_moe(
             mesh=self.mesh,
             tokens=hidden_states,
@@ -212,4 +215,5 @@ class FusedEPMoE(nnx.Module):
             # tp_axis_name="data",
         )
 
-        return output
+        final_output = jax.sharding.reshard(output, P(None))
+        return final_output
