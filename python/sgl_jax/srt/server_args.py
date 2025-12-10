@@ -122,6 +122,7 @@ class ServerArgs:
 
     # Kernel backend
     attention_backend: str | None = "fa"
+    moe_backend: str = "epmoe"
 
     grammar_backend: str | None = None
 
@@ -712,6 +713,14 @@ class ServerArgs:
             type=int,
             default=ServerArgs.dp_size,
             help="The data parallelism size.",
+        )
+
+        parser.add_argument(
+            "--moe-backend",
+            type=str,
+            choices=["epmoe", "fused", "auto"],
+            default=ServerArgs.moe_backend,
+            help="The backend to use for MoE models.",
         )
 
         # Multi-node distributed serving

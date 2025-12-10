@@ -166,7 +166,7 @@ class ModelWorker:
         )
         self.precompile_bs_paddings = []
         for bs in bs_padding_list:
-            if bs <= self.max_padded_batch_size:
+            if bs <= self.max_padded_batch_size and bs >= self.tp_size * 2:
                 self.precompile_bs_paddings.append(bs)
         self.precompile_bs_paddings.sort()
         if (
