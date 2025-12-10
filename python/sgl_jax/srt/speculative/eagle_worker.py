@@ -577,11 +577,13 @@ class EAGLEWorker(ModelWorker):
         forward_batch.out_cache_loc = np.empty((1,))
         forward_batch.cache_loc = np.empty((1,))
         forward_batch.spec_info = EagleDraftInput()
-        forward_batch.spec_info.hidden_states = np.empty((bs * self.topk, hidden_states.shape[1]))
+        forward_batch.spec_info.hidden_states = jnp.empty((bs * self.topk, hidden_states.shape[1]))
         for i in range(self.speculative_num_steps):
             input_ids, hidden_states, scores, tree_info = select_top_k_tokens(
                 i, topk_p, topk_index, hidden_states, scores, self.topk
             )
+            # update_eagle_lists and update_forward_batch_info this two function will make accept rate very low if be jitted
+            # FIXME we should find it out why lead this ?
             score_list, token_list, parents_list = update_eagle_lists(
                 i, score_list, token_list, parents_list, tree_info, self.topk
             )
@@ -725,7 +727,7 @@ def fast_topk(values, topk, axis=-1):
 
 
 # FIXME(pc) this should be jitted or convert as np.ndarray
-@functools.partial(jax.jit, static_argnames=["i", "topk"], donate_argnums=(1, 2, 3))
+# @functools.partial(jax.jit, static_argnames=["i", "topk"])
 def update_eagle_lists(
     i: int,
     score_list: jax.Array,
@@ -757,7 +759,7 @@ def update_eagle_lists(
 
 
 # FIXME(pc) this should be jitted or convert as np.ndarray
-@functools.partial(jax.jit, static_argnames=["i"], donate_argnums=(0, 2))
+# @functools.partial(jax.jit, static_argnames=["i"])
 def update_forward_batch_info(
     forward_batch: ForwardBatch,
     i: int,
