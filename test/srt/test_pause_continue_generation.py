@@ -22,6 +22,22 @@ from sgl_jax.test.test_utils import (
 )
 
 
+class Colors:
+    """ANSI color codes for terminal output."""
+
+    GREEN = "\033[92m"
+    RED = "\033[91m"
+    YELLOW = "\033[93m"
+    BLUE = "\033[94m"
+    BOLD = "\033[1m"
+    RESET = "\033[0m"
+
+
+def print_test_passed(test_name: str):
+    """Print a colored PASS message."""
+    print(f"{Colors.BOLD}{Colors.GREEN}✓ PASS: {test_name}{Colors.RESET}")
+
+
 class TestPauseContinueGeneration(CustomTestCase):
     """
     Test pause_generation and continue_generation endpoints.
@@ -234,6 +250,8 @@ class TestPauseContinueGeneration(CustomTestCase):
                     f"Request should finish due to length limit: {result}",
                 )
 
+        print_test_passed("TestPauseContinueGeneration.test_pause_generation_retract_mode")
+
     def test_pause_generation_in_place_mode(self):
         """
         Test pause_generation with in_place mode.
@@ -330,6 +348,8 @@ class TestPauseContinueGeneration(CustomTestCase):
             for result in results:
                 self.assertIn("text", result, f"Request should complete with text output: {result}")
 
+        print_test_passed("TestPauseContinueGeneration.test_pause_generation_in_place_mode")
+
     def test_pause_continue_flush_cache_retract_mode(self):
         """
         Test that flush_cache works after pause with retract mode.
@@ -365,6 +385,8 @@ class TestPauseContinueGeneration(CustomTestCase):
                 self.assertIn("text", result)
             except Exception as e:
                 self.fail(f"Request should complete: {e}")
+
+        print_test_passed("TestPauseContinueGeneration.test_pause_continue_flush_cache_retract_mode")
 
     def test_pause_continue_multiple_cycles(self):
         """
@@ -421,6 +443,8 @@ class TestPauseContinueGeneration(CustomTestCase):
             # All requests should complete
             for i, result in enumerate(results):
                 self.assertIn("text", result, f"Request {i} should complete: {result}")
+
+        print_test_passed("TestPauseContinueGeneration.test_pause_continue_multiple_cycles")
 
 
 class TestPauseContinueGenerationNoOverlap(CustomTestCase):
@@ -572,6 +596,8 @@ class TestPauseContinueGenerationNoOverlap(CustomTestCase):
                 result = future.result()
                 self.assertIn("text", result)
 
+        print_test_passed("TestPauseContinueGenerationNoOverlap.test_pause_retract_no_overlap")
+
     def test_pause_in_place_no_overlap(self):
         """
         Test pause_generation with in_place mode without overlap schedule.
@@ -629,6 +655,8 @@ class TestPauseContinueGenerationNoOverlap(CustomTestCase):
             for future in as_completed(futures):
                 result = future.result()
                 self.assertIn("text", result)
+
+        print_test_passed("TestPauseContinueGenerationNoOverlap.test_pause_in_place_no_overlap")
 
 
 if __name__ == "__main__":
