@@ -295,9 +295,7 @@ def throughput_test(
     bench_args: BenchArgs,
 ):
     if bench_args.backend == "engine":
-        backend = Engine(**dataclasses.asdict(server_args))
-        if not backend:
-            raise ValueError("Please provide valid engine arguments")
+        backend = Engine(server_args)
     elif bench_args.backend == "runtime":
         # backend = Runtime(**dataclasses.asdict(server_args))
         raise NotImplementedError("Runtime backend is not supported")

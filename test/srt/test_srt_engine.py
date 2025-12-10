@@ -9,6 +9,7 @@ from typing import List
 from sgl_jax.srt.entrypoints.engine import Engine
 from sgl_jax.srt.hf_transformers_utils import get_tokenizer
 from sgl_jax.srt.sampling.sampling_params import SamplingParams
+from sgl_jax.srt.server_args import ServerArgs
 from sgl_jax.test.test_utils import QWEN3_8B, CustomTestCase
 
 
@@ -17,24 +18,26 @@ class TestSRTEngine(CustomTestCase):
     def setUpClass(cls):
         cls.model_path = QWEN3_8B
         cls.engine = Engine(
-            model_path=cls.model_path,
-            trust_remote_code=True,
-            tp_size=1,
-            device="tpu",
-            random_seed=3,
-            node_rank=0,
-            mem_fraction_static=0.6,
-            chunked_prefill_size=1024,
-            download_dir="/tmp",
-            dtype="bfloat16",
-            precompile_bs_paddings=[8],
-            max_running_requests=8,
-            skip_server_warmup=True,
-            attention_backend="fa",
-            precompile_token_paddings=[1024],
-            page_size=64,
-            log_requests=False,
-            enable_deterministic_sampling=True,
+            ServerArgs(
+                model_path=cls.model_path,
+                trust_remote_code=True,
+                tp_size=1,
+                device="tpu",
+                random_seed=3,
+                node_rank=0,
+                mem_fraction_static=0.6,
+                chunked_prefill_size=1024,
+                download_dir="/tmp",
+                dtype="bfloat16",
+                precompile_bs_paddings=[8],
+                max_running_requests=8,
+                skip_server_warmup=True,
+                attention_backend="fa",
+                precompile_token_paddings=[1024],
+                page_size=64,
+                log_requests=False,
+                enable_deterministic_sampling=True,
+            )
         )
         cls.tokenizer = get_tokenizer(cls.model_path)
 

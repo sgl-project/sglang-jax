@@ -2,6 +2,7 @@ import os
 import unittest
 
 from sgl_jax.srt.entrypoints.engine import Engine
+from sgl_jax.srt.server_args import ServerArgs
 from sgl_jax.test.test_utils import DEEPSEEK_R1_QWEN_1_5B
 
 # JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache python3 -u -m sgl_jax.launch_server --model-path deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B --trust-remote-code --dist-init-addr=0.0.0.0:10011 --nnodes=1 --tp-size=1 --device=tpu --random-seed=27 --node-rank=0 --mem-fraction-static=0.8 --chunked-prefill-size=8192 --download-dir=/tmp --dtype=bfloat16 --precompile-bs-paddings 1 64 --max-running-requests 64 --max-total-tokens 257536 --skip-server-warmup --attention-backend=fa --precompile-token-paddings 8192 --page-size=64 --disable-overlap-schedule --log-requests --log-requests-level=3 --enable-precision-tracer --use-sort-for-toppk-minp
@@ -11,35 +12,34 @@ os.environ["JAX_COMPILATION_CACHE_DIR"] = "/tmp/jit_cache"
 
 print("Running on Google TPU")
 # Default engine configuration
-DEFAULT_ENGINE_CONFIG = {
-    "model_path": DEEPSEEK_R1_QWEN_1_5B,
-    "random_seed": 27,
-    "device": "tpu",
-    "chunked_prefill_size": 8192,
-    "dtype": "bfloat16",
-    "max_running_requests": 64,
-    "page_size": 64,
-    "max_total_tokens": 257536,
-    "precompile_token_paddings": [8192],
-    "precompile_bs_paddings": [1, 64],
-    "use_sort_for_toppk_minp": True,
-    "mem_fraction_static": 0.8,
-    "disable_overlap_schedule": True,
-    "trust_remote_code": True,
-    "skip_server_warmup": True,
-    "tp_size": 1,
-    "enable_precision_tracer": True,
-    "log_level": "info",
-}
+DEFAULT_ENGINE_CONFIG = ServerArgs(
+    model_path=DEEPSEEK_R1_QWEN_1_5B,
+    random_seed=27,
+    device="tpu",
+    chunked_prefill_size=8192,
+    dtype="bfloat16",
+    max_running_requests=64,
+    page_size=64,
+    max_total_tokens=257536,
+    precompile_token_paddings=[8192],
+    precompile_bs_paddings=[1, 64],
+    use_sort_for_toppk_minp=True,
+    mem_fraction_static=0.8,
+    disable_overlap_schedule=True,
+    trust_remote_code=True,
+    skip_server_warmup=True,
+    tp_size=1,
+    enable_precision_tracer=True,
+    log_level="info",
+)
 
 
 class TestLogprobsDense(unittest.TestCase):
-
     @classmethod
     def setUpClass(cls):
         """Set up the test class - initialize the engine once for all tests."""
         print(f"Launching SGLang-Jax Engine with {DEEPSEEK_R1_QWEN_1_5B}...")
-        cls.engine = Engine(**DEFAULT_ENGINE_CONFIG)
+        cls.engine = Engine(DEFAULT_ENGINE_CONFIG)
 
     @classmethod
     def tearDownClass(cls):

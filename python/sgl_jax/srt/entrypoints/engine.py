@@ -72,20 +72,13 @@ class Engine(EngineBase):
     2. Inter-process communication is done through ICP (each process uses a different port) via the ZMQ library.
     """
 
-    def __init__(self, **kwargs):
+    def __init__(self, server_args: ServerArgs):
         """
-        The arguments of this function is the same as `sglang/srt/server_args.py::ServerArgs`.
-        Please refer to `ServerArgs` for the documentation.
+        Initialize the Engine.
+
+        Args:
+            server_args: The server configuration. See `ServerArgs` for available options.
         """
-        if "server_args" in kwargs:
-            # Directly load server_args
-            server_args = kwargs["server_args"]
-        else:
-            # Construct server_args from kwargs
-            if "log_level" not in kwargs:
-                # Do not print logs by default
-                kwargs["log_level"] = "error"
-            server_args = ServerArgs(**kwargs)
 
         # Shutdown the subprocesses automatically when the program exits
         atexit.register(self.shutdown)
