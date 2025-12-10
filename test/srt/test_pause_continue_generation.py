@@ -386,7 +386,9 @@ class TestPauseContinueGeneration(CustomTestCase):
             except Exception as e:
                 self.fail(f"Request should complete: {e}")
 
-        print_test_passed("TestPauseContinueGeneration.test_pause_continue_flush_cache_retract_mode")
+        print_test_passed(
+            "TestPauseContinueGeneration.test_pause_continue_flush_cache_retract_mode"
+        )
 
     def test_pause_continue_multiple_cycles(self):
         """
