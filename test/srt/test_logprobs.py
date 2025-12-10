@@ -119,16 +119,16 @@ class TestLogprobsDense(unittest.TestCase):
             [0.0, 11, ","],
             [-0.3515625, 773, " so"],
         ]
-        for i, logprob in enumerate(output_meta["output_token_logprobs"]):
-            self.assertEqual(
-                logprob[0], expected_output_logprobs[i][0], f"{logprob[0]} logprob is invalid"
-            )
-            self.assertEqual(
-                logprob[1], expected_output_logprobs[i][1], f"{logprob[1]} output id is invalid"
-            )
-            self.assertEqual(
-                logprob[2], expected_output_logprobs[i][2], f"{logprob[2]} token is invalid"
-            )
+        self.check_output(output_meta, "output_token_logprobs", expected_output_logprobs)
+
+        output = self.engine.generate(
+            input_ids=input_ids,
+            sampling_params=sampling_params,
+            return_logprob=True,
+        )
+        output_meta = output["meta_info"]
+        self.assertEqual(output_meta["cache_miss_count"], 0, "occur cache_miss")
+        self.check_output(output_meta, "output_token_logprobs", expected_output_logprobs)
 
         sampling_params = {"n": 1, "temperature": 0.6, "top_p": 0.95, "max_new_tokens": 3}
 
@@ -147,16 +147,22 @@ class TestLogprobsDense(unittest.TestCase):
             token_ids_logprob=token_ids_logprob,
         )
         output_meta = output["meta_info"]
-        for i, logprob in enumerate(output_meta["output_token_logprobs"]):
-            self.assertEqual(
-                logprob[0], expected_output_logprobs[i][0], f"{logprob[0]} logprob is invalid"
-            )
-            self.assertEqual(
-                logprob[1], expected_output_logprobs[i][1], f"{logprob[1]} output id is invalid"
-            )
-            self.assertEqual(
-                logprob[2], expected_output_logprobs[i][2], f"{logprob[2]} token is invalid"
-            )
+        self.check_output(output_meta, "output_token_logprobs", expected_output_logprobs)
+
+        output = self.engine.generate(
+            input_ids=input_ids,
+            sampling_params=sampling_params,
+            return_logprob=True,
+        )
+        output_meta = output["meta_info"]
+        self.assertEqual(output_meta["cache_miss_count"], 0, "occur cache_miss")
+        self.check_output(output_meta, "output_token_logprobs", expected_output_logprobs)
+
+    def check_output(self, actual, key, expected):
+        for i, logprob in enumerate(actual[key]):
+            self.assertEqual(logprob[0], expected[i][0], f"{logprob[0]} logprob is invalid")
+            self.assertEqual(logprob[1], expected[i][1], f"{logprob[1]} output id is invalid")
+            self.assertEqual(logprob[2], expected[i][2], f"{logprob[2]} token is invalid")
 
 
 if __name__ == "__main__":

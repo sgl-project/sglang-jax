@@ -283,6 +283,7 @@ def create_test_data(
         extend_seq_lens=np.asarray(extend_seq_lens),
         extend_prefix_lens=np.asarray(extend_prefix_lens),
         return_logprob=False,
+        return_output_logprob_only=False,
         top_logprobs_nums=None,
         token_ids_logprobs=None,
         extend_logprob_start_lens=None,
