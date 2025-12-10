@@ -127,9 +127,8 @@ class TestEnginePauseContinue(CustomTestCase):
                 "KV cache should be used before pause",
             )
 
-            # Pause generation with retract mode
-            pause_response = self.engine.pause_generation(mode="retract")
-            self.assertEqual(pause_response["status"], "ok")
+            # Pause generation with retract mode (returns None)
+            self.engine.pause_generation(mode="retract")
 
             # Wait for pause to take effect
             time.sleep(0.5)
@@ -173,9 +172,8 @@ class TestEnginePauseContinue(CustomTestCase):
                 "KV cache should be cleared after retract mode pause",
             )
 
-            # Continue generation
-            continue_response = self.engine.continue_generation()
-            self.assertEqual(continue_response["status"], "ok")
+            # Continue generation (returns None)
+            self.engine.continue_generation()
 
             # Wait for all requests to complete
             results = []
@@ -229,9 +227,8 @@ class TestEnginePauseContinue(CustomTestCase):
             tokens_before_pause = internal_before["available_kv_tokens"]
             waiting_before_pause = internal_before["waiting_queue_size"]
 
-            # Pause generation with in_place mode
-            pause_response = self.engine.pause_generation(mode="in_place")
-            self.assertEqual(pause_response["status"], "ok")
+            # Pause generation with in_place mode (returns None)
+            self.engine.pause_generation(mode="in_place")
 
             # Wait for pause to take effect
             time.sleep(0.5)
@@ -278,9 +275,8 @@ class TestEnginePauseContinue(CustomTestCase):
                 "KV cache should NOT be cleared in in_place mode",
             )
 
-            # Continue generation
-            continue_response = self.engine.continue_generation()
-            self.assertEqual(continue_response["status"], "ok")
+            # Continue generation (returns None)
+            self.engine.continue_generation()
 
             # Wait for all requests to complete
             results = []
@@ -313,12 +309,9 @@ class TestEnginePauseContinue(CustomTestCase):
                 # Wait for some generation to happen
                 time.sleep(2)
 
-                # Pause with alternating modes
+                # Pause with alternating modes (returns None)
                 mode = "retract" if cycle % 2 == 0 else "in_place"
-                pause_response = self.engine.pause_generation(mode=mode)
-                self.assertEqual(
-                    pause_response["status"], "ok", f"Cycle {cycle}: pause should succeed"
-                )
+                self.engine.pause_generation(mode=mode)
 
                 # Verify paused
                 state = self._get_internal_state()
@@ -327,11 +320,8 @@ class TestEnginePauseContinue(CustomTestCase):
                     f"Cycle {cycle}: engine should be paused",
                 )
 
-                # Continue
-                continue_response = self.engine.continue_generation()
-                self.assertEqual(
-                    continue_response["status"], "ok", f"Cycle {cycle}: continue should succeed"
-                )
+                # Continue (returns None)
+                self.engine.continue_generation()
 
                 # Verify not paused
                 state = self._get_internal_state()
