@@ -31,7 +31,7 @@ jobs:
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           HF_HUB_DOWNLOAD_TIMEOUT: ${{ vars.HF_HUB_DOWNLOAD_TIMEOUT }}
-        timeout-minutes: 1200
+        timeout-minutes: 3000
         run: |
           python3.12 -m venv .venv
           source .venv/bin/activate

@@ -27,6 +27,29 @@ from sgl_jax.test.test_utils import (
 
 
 class TestModelAccuracy(CustomTestCase):
+    BASIC_SERVER_ARGS = [
+        "--trust-remote-code",
+        "--skip-server-warmup",
+        "--random-seed",
+        "3",
+        "--max-prefill-tokens",
+        "16384",
+        "--download-dir",
+        "/dev/shm/",
+        "--dtype",
+        "bfloat16",
+        "--max-running-requests",
+        "256",
+        "--attention-backend",
+        "fa",
+        "--page-size",
+        "128",
+        "--chunked-prefill-size",
+        "2048",
+        "--mem-fraction-static",
+        "0.8",
+    ]
+
     def test_qwen_7b(self):
         model = QWEN_7B
         base_url = DEFAULT_URL_FOR_TEST
@@ -34,37 +57,17 @@ class TestModelAccuracy(CustomTestCase):
         output_dir = os.getenv("BENCH_OUTPUT_DIR", "./test/nightly_test_output/benchmark/local_run")
         os.makedirs(output_dir, exist_ok=True)
         csv_file_path = os.path.join(output_dir, "qwen_7b_benchmark_results.csv")
-
+        specific_args = self.BASIC_SERVER_ARGS + [
+            "--tp-size",
+            "1",
+        ]
         # launch server
         process = popen_launch_server(
             model,
             base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             device="tpu",
-            other_args=[
-                "--trust-remote-code",
-                "--skip-server-warmup",
-                "--random-seed",
-                "3",
-                "--max-prefill-tokens",
-                "16384",
-                "--download-dir",
-                "/dev/shm/",
-                "--dtype",
-                "bfloat16",
-                "--max-running-requests",
-                "256",
-                "--attention-backend",
-                "fa",
-                "--page-size",
-                "128",
-                "--chunked-prefill-size",
-                "2048",
-                "--tp-size",
-                "1",
-                "--mem-fraction-static",
-                "0.8",
-            ],
+            other_args=specific_args,
             env={
                 "JAX_COMPILATION_CACHE_DIR": "/tmp/jax_compilation_cache",
             },
@@ -160,37 +163,17 @@ class TestModelAccuracy(CustomTestCase):
         output_dir = os.getenv("BENCH_OUTPUT_DIR", "./test/nightly_test_output/benchmark/local_run")
         os.makedirs(output_dir, exist_ok=True)
         csv_file_path = os.path.join(output_dir, "qwen3_8b_benchmark_results.csv")
-
+        specific_args = self.BASIC_SERVER_ARGS + [
+            "--tp-size",
+            "1",
+        ]
         # launch server
         process = popen_launch_server(
             model,
             DEFAULT_URL_FOR_TEST,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             device="tpu",
-            other_args=[
-                "--trust-remote-code",
-                "--skip-server-warmup",
-                "--random-seed",
-                "3",
-                "--max-prefill-tokens",
-                "16384",
-                "--download-dir",
-                "/dev/shm/",
-                "--dtype",
-                "bfloat16",
-                "--max-running-requests",
-                "256",
-                "--attention-backend",
-                "fa",
-                "--page-size",
-                "128",
-                "--chunked-prefill-size",
-                "2048",
-                "--tp-size",
-                "1",
-                "--mem-fraction-static",
-                "0.8",
-            ],
+            other_args=specific_args,
             env={
                 "JAX_COMPILATION_CACHE_DIR": "/tmp/jax_compilation_cache",
             },
@@ -288,35 +271,16 @@ class TestModelAccuracy(CustomTestCase):
         csv_file_path = os.path.join(
             output_dir, "deepseek_r1_distill_qwen_1_5b_benchmark_results.csv"
         )
+        specific_args = self.BASIC_SERVER_ARGS + [
+            "--tp-size",
+            "1",
+        ]
         process = popen_launch_server(
             model,
             base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             device="tpu",
-            other_args=[
-                "--trust-remote-code",
-                "--skip-server-warmup",
-                "--random-seed",
-                "3",
-                "--max-prefill-tokens",
-                "16384",
-                "--download-dir",
-                "/dev/shm/",
-                "--dtype",
-                "bfloat16",
-                "--max-running-requests",
-                "256",
-                "--attention-backend",
-                "fa",
-                "--page-size",
-                "128",
-                "--chunked-prefill-size",
-                "2048",
-                "--tp-size",
-                "1",
-                "--mem-fraction-static",
-                "0.8",
-            ],
+            other_args=specific_args,
             env={
                 "JAX_COMPILATION_CACHE_DIR": "/tmp/jax_compilation_cache",
             },
@@ -413,35 +377,18 @@ class TestModelAccuracy(CustomTestCase):
         output_dir = os.getenv("BENCH_OUTPUT_DIR", "./test/nightly_test_output/benchmark/local_run")
         os.makedirs(output_dir, exist_ok=True)
         csv_file_path = os.path.join(output_dir, "gemma2_2b_it_benchmark_results.csv")
+        specific_args = self.BASIC_SERVER_ARGS + [
+            "--tp-size",
+            "1",
+            "--disable-hybrid-swa-memory",
+        ]
+        # launch server
         process = popen_launch_server(
             model,
             base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             device="tpu",
-            other_args=[
-                "--trust-remote-code",
-                "--skip-server-warmup",
-                "--random-seed",
-                "3",
-                "--max-prefill-tokens",
-                "16384",
-                "--download-dir",
-                "/dev/shm/",
-                "--dtype",
-                "bfloat16",
-                "--max-running-requests",
-                "256",
-                "--attention-backend",
-                "fa",
-                "--page-size",
-                "1",
-                "--chunked-prefill-size",
-                "2048",
-                "--tp-size",
-                "1",
-                "--mem-fraction-static",
-                "0.8",
-            ],
+            other_args=specific_args,
             env={
                 "JAX_COMPILATION_CACHE_DIR": "/tmp/jax_compilation_cache",
             },
@@ -537,35 +484,17 @@ class TestModelAccuracy(CustomTestCase):
         output_dir = os.getenv("BENCH_OUTPUT_DIR", "./test/nightly_test_output/benchmark/local_run")
         os.makedirs(output_dir, exist_ok=True)
         csv_file_path = os.path.join(output_dir, "qwen_7b_benchmark_tp_4_results.csv")
+        specific_args = self.BASIC_SERVER_ARGS + [
+            "--tp-size",
+            "4",
+        ]
+        # launch server
         process = popen_launch_server(
             model,
             DEFAULT_URL_FOR_TEST,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             device="tpu",
-            other_args=[
-                "--trust-remote-code",
-                "--skip-server-warmup",
-                "--random-seed",
-                "3",
-                "--max-prefill-tokens",
-                "16384",
-                "--download-dir",
-                "/dev/shm/",
-                "--dtype",
-                "bfloat16",
-                "--max-running-requests",
-                "256",
-                "--attention-backend",
-                "fa",
-                "--page-size",
-                "128",
-                "--chunked-prefill-size",
-                "2048",
-                "--tp-size",
-                "4",
-                "--mem-fraction-static",
-                "0.8",
-            ],
+            other_args=specific_args,
             env={
                 "JAX_COMPILATION_CACHE_DIR": "/tmp/jax_compilation_cache",
             },
@@ -661,35 +590,16 @@ class TestModelAccuracy(CustomTestCase):
         output_dir = os.getenv("BENCH_OUTPUT_DIR", "./test/nightly_test_output/benchmark/local_run")
         os.makedirs(output_dir, exist_ok=True)
         csv_file_path = os.path.join(output_dir, "qwen3_8b_benchmark_tp_4_results.csv")
+        specific_args = self.BASIC_SERVER_ARGS + [
+            "--tp-size",
+            "4",
+        ]
         process = popen_launch_server(
             model,
             DEFAULT_URL_FOR_TEST,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             device="tpu",
-            other_args=[
-                "--trust-remote-code",
-                "--skip-server-warmup",
-                "--random-seed",
-                "3",
-                "--max-prefill-tokens",
-                "16384",
-                "--download-dir",
-                "/dev/shm/",
-                "--dtype",
-                "bfloat16",
-                "--max-running-requests",
-                "256",
-                "--attention-backend",
-                "fa",
-                "--page-size",
-                "128",
-                "--chunked-prefill-size",
-                "2048",
-                "--tp-size",
-                "4",
-                "--mem-fraction-static",
-                "0.8",
-            ],
+            other_args=specific_args,
             env={
                 "JAX_COMPILATION_CACHE_DIR": "/tmp/jax_compilation_cache",
             },
@@ -785,36 +695,18 @@ class TestModelAccuracy(CustomTestCase):
         output_dir = os.getenv("BENCH_OUTPUT_DIR", "./test/nightly_test_output/benchmark/local_run")
         os.makedirs(output_dir, exist_ok=True)
         csv_file_path = os.path.join(output_dir, "gemma2_2b_it_benchmark_tp_4_results.csv")
+        specific_args = self.BASIC_SERVER_ARGS + [
+            "--tp-size",
+            "4",
+            "--disable-hybrid-swa-memory",
+        ]
+        # launch server
         process = popen_launch_server(
             model,
             DEFAULT_URL_FOR_TEST,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             device="tpu",
-            other_args=[
-                "--trust-remote-code",
-                "--skip-server-warmup",
-                "--random-seed",
-                "3",
-                "--max-prefill-tokens",
-                "16384",
-                "--download-dir",
-                "/dev/shm/",
-                "--dtype",
-                "bfloat16",
-                "--max-running-requests",
-                "256",
-                "--attention-backend",
-                "fa",
-                "--page-size",
-                "128",
-                "--chunked-prefill-size",
-                "2048",
-                "--tp-size",
-                "4",
-                "--disable-hybrid-swa-memory",
-                "--mem-fraction-static",
-                "0.8",
-            ],
+            other_args=specific_args,
             env={
                 "JAX_COMPILATION_CACHE_DIR": "/tmp/jax_compilation_cache",
             },
@@ -912,37 +804,18 @@ class TestModelAccuracy(CustomTestCase):
         csv_file_path = os.path.join(
             output_dir, "QWEN3_CODER_30B_A3B_INSTRUCT_benchmark_tp_4_results.csv"
         )
+        specific_args = self.BASIC_SERVER_ARGS + [
+            "--tp-size",
+            "2",
+            "--ep-size",
+            "2",
+        ]
         process = popen_launch_server(
             model,
             DEFAULT_URL_FOR_TEST,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             device="tpu",
-            other_args=[
-                "--trust-remote-code",
-                "--skip-server-warmup",
-                "--random-seed",
-                "3",
-                "--max-prefill-tokens",
-                "16384",
-                "--download-dir",
-                "/dev/shm/",
-                "--dtype",
-                "bfloat16",
-                "--max-running-requests",
-                "256",
-                "--attention-backend",
-                "fa",
-                "--page-size",
-                "128",
-                "--chunked-prefill-size",
-                "2048",
-                "--tp-size",
-                "2",
-                "--ep-size",
-                "2",
-                "--mem-fraction-static",
-                "0.8",
-            ],
+            other_args=specific_args,
             env={
                 "JAX_COMPILATION_CACHE_DIR": "/tmp/jax_compilation_cache",
             },
@@ -1041,35 +914,16 @@ class TestModelAccuracy(CustomTestCase):
         csv_file_path = os.path.join(
             output_dir, "deepseek_r1_distill_qwen_1_5b_benchmark_tp_4_results.csv"
         )
+        specific_args = self.BASIC_SERVER_ARGS + [
+            "--tp-size",
+            "4",
+        ]
         process = popen_launch_server(
             model,
             DEFAULT_URL_FOR_TEST,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             device="tpu",
-            other_args=[
-                "--trust-remote-code",
-                "--skip-server-warmup",
-                "--random-seed",
-                "3",
-                "--max-prefill-tokens",
-                "16384",
-                "--download-dir",
-                "/dev/shm/",
-                "--dtype",
-                "bfloat16",
-                "--max-running-requests",
-                "256",
-                "--attention-backend",
-                "fa",
-                "--page-size",
-                "128",
-                "--chunked-prefill-size",
-                "2048",
-                "--tp-size",
-                "4",
-                "--mem-fraction-static",
-                "0.8",
-            ],
+            other_args=specific_args,
             env={
                 "JAX_COMPILATION_CACHE_DIR": "/tmp/jax_compilation_cache",
             },
@@ -1166,37 +1020,18 @@ class TestModelAccuracy(CustomTestCase):
         output_dir = os.getenv("BENCH_OUTPUT_DIR", "./test/nightly_test_output/benchmark/local_run")
         os.makedirs(output_dir, exist_ok=True)
         csv_file_path = os.path.join(output_dir, "bailing_moe_benchmark_tp_2_ep_2_results.csv")
+        specific_args = self.BASIC_SERVER_ARGS + [
+            "--tp-size",
+            "2",
+            "--ep-size",
+            "2",
+        ]
         process = popen_launch_server(
             model,
             DEFAULT_URL_FOR_TEST,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             device="tpu",
-            other_args=[
-                "--trust-remote-code",
-                "--skip-server-warmup",
-                "--random-seed",
-                "3",
-                "--max-prefill-tokens",
-                "16384",
-                "--download-dir",
-                "/dev/shm/",
-                "--dtype",
-                "bfloat16",
-                "--max-running-requests",
-                "256",
-                "--attention-backend",
-                "fa",
-                "--page-size",
-                "128",
-                "--chunked-prefill-size",
-                "2048",
-                "--tp-size",
-                "2",
-                "--ep-size",
-                "2",
-                "--mem-fraction-static",
-                "0.8",
-            ],
+            other_args=specific_args,
             env={
                 "JAX_COMPILATION_CACHE_DIR": "/tmp/jax_compilation_cache",
             },
@@ -1295,37 +1130,18 @@ class TestModelAccuracy(CustomTestCase):
         csv_file_path = os.path.join(
             output_dir, "QWEN3_CODER_30B_A3B_INSTRUCT_benchmark_tp_2_ep_2_results.csv"
         )
+        specific_args = self.BASIC_SERVER_ARGS + [
+            "--tp-size",
+            "2",
+            "--ep-size",
+            "2",
+        ]
         process = popen_launch_server(
             model,
             DEFAULT_URL_FOR_TEST,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             device="tpu",
-            other_args=[
-                "--trust-remote-code",
-                "--skip-server-warmup",
-                "--random-seed",
-                "3",
-                "--max-prefill-tokens",
-                "16384",
-                "--download-dir",
-                "/dev/shm/",
-                "--dtype",
-                "bfloat16",
-                "--max-running-requests",
-                "256",
-                "--attention-backend",
-                "fa",
-                "--page-size",
-                "128",
-                "--chunked-prefill-size",
-                "2048",
-                "--tp-size",
-                "2",
-                "--ep-size",
-                "2",
-                "--mem-fraction-static",
-                "0.8",
-            ],
+            other_args=specific_args,
             env={
                 "JAX_COMPILATION_CACHE_DIR": "/tmp/jax_compilation_cache",
             },

@@ -652,43 +652,6 @@ def download_and_cache_file(url: str, filename: str | None = None):
     return filename
 
 
-# def download_and_cache_file(url: str, filename: str | None = None):
-#     """Read and cache a file from a url."""
-#     if filename is None:
-#         filename = os.path.join("/tmp", url.split("/")[-1])
-
-#     # Check if the cache file already exists
-#     if is_file_valid_json(filename):
-#         return filename
-
-#     print(f"Downloading from {url} to {filename}")
-
-#     # Stream the response to show the progress bar
-#     response = requests.get(url, stream=True)
-#     response.raise_for_status()  # Check for request errors
-
-#     # Total size of the file in bytes
-#     total_size = int(response.headers.get("content-length", 0))
-#     chunk_size = 1024  # Download in chunks of 1KB
-
-#     # Use tqdm to display the progress bar
-#     with (
-#         open(filename, "wb") as f,
-#         tqdm(
-#             desc=filename,
-#             total=total_size,
-#             unit="B",
-#             unit_scale=True,
-#             unit_divisor=1024,
-#         ) as bar,
-#     ):
-#         for chunk in response.iter_content(chunk_size=chunk_size):
-#             f.write(chunk)
-#             bar.update(len(chunk))
-
-#     return filename
-
-
 def is_file_valid_json(path):
     if not os.path.isfile(path):
         return False
