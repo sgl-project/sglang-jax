@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import ctypes
 import dataclasses
@@ -442,3 +443,201 @@ def next_power_of_2(x: int):
     if x == 1:
         return 1
     return 1 << (x - 1).bit_length()
+
+
+class RWLock:
+    """An async reader-writer lock for LoRA adapter management."""
+
+    def __init__(self):
+        # Protects internal state
+        self._lock = asyncio.Lock()
+
+        # Condition variable used to wait for state changes
+        self._cond = asyncio.Condition(self._lock)
+
+        # Number of readers currently holding the lock
+        self._readers = 0
+
+        # Whether a writer is currently holding the lock
+        self._writer_active = False
+
+        # How many writers are queued waiting for a turn
+        self._waiting_writers = 0
+
+    @property
+    def reader_lock(self):
+        """
+        A context manager for acquiring a shared (reader) lock.
+
+        Example:
+            async with rwlock.reader_lock:
+                # read-only access
+        """
+        return _ReaderLock(self)
+
+    @property
+    def writer_lock(self):
+        """
+        A context manager for acquiring an exclusive (writer) lock.
+
+        Example:
+            async with rwlock.writer_lock:
+                # exclusive access
+        """
+        return _WriterLock(self)
+
+    async def acquire_reader(self):
+        async with self._lock:
+            # Wait until there is no active writer or waiting writer
+            # to ensure fairness.
+            while self._writer_active or self._waiting_writers > 0:
+                await self._cond.wait()
+            self._readers += 1
+
+    async def release_reader(self):
+        async with self._lock:
+            self._readers -= 1
+            # If this was the last reader, wake up anyone waiting
+            # (potentially a writer or new readers).
+            if self._readers == 0:
+                self._cond.notify_all()
+
+    async def acquire_writer(self):
+        async with self._lock:
+            # Increment the count of writers waiting
+            self._waiting_writers += 1
+            try:
+                # Wait while either a writer is active or readers are present
+                while self._writer_active or self._readers > 0:
+                    await self._cond.wait()
+                self._writer_active = True
+            finally:
+                # Decrement waiting writers only after we've acquired the writer lock
+                self._waiting_writers -= 1
+
+    async def release_writer(self):
+        async with self._lock:
+            self._writer_active = False
+            # Wake up anyone waiting (readers or writers)
+            self._cond.notify_all()
+
+
+class _ReaderLock:
+    def __init__(self, rwlock: RWLock):
+        self._rwlock = rwlock
+
+    async def __aenter__(self):
+        await self._rwlock.acquire_reader()
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        await self._rwlock.release_reader()
+
+
+class _WriterLock:
+    def __init__(self, rwlock: RWLock):
+        self._rwlock = rwlock
+
+    async def __aenter__(self):
+        await self._rwlock.acquire_writer()
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        await self._rwlock.release_writer()
+
+
+# LoRA-related constants and utilities
+SUPPORTED_LORA_TARGET_MODULES = [
+    "q_proj",
+    "k_proj",
+    "v_proj",
+    "o_proj",
+    "gate_proj",
+    "up_proj",
+    "down_proj",
+]
+
+LORA_TARGET_ALL_MODULES = "all"
+
+
+class ConcurrentCounter:
+    """
+    An asynchronous counter for managing concurrent tasks that need
+    coordinated increments, decrements, and waiting until the count reaches zero.
+
+    This class is useful for scenarios like tracking the number of in-flight LoRA requests
+    and waiting for them to complete before unloading adapters.
+    """
+
+    def __init__(self, initial: int = 0):
+        """
+        Initialize the counter with an optional initial value.
+
+        Args:
+            initial (int): The initial value of the counter. Default is 0.
+        """
+        self._count = initial
+        self._condition = asyncio.Condition()
+
+    def value(self) -> int:
+        """
+        Return the current value of the counter.
+
+        Note:
+            This method is not synchronized. It may return a stale value
+            if other coroutines are concurrently modifying the counter.
+
+        Returns:
+            int: The current counter value.
+        """
+        return self._count
+
+    async def increment(self, n: int = 1, notify_all: bool = True):
+        """
+        Atomically increment the counter by a given amount and notify all waiters.
+
+        Args:
+            n (int): The amount to increment the counter by. Default is 1.
+            notify_all (bool): Whether to notify all waiters after incrementing. Default is True.
+        """
+        async with self._condition:
+            self._count += n
+            if notify_all:
+                self._condition.notify_all()
+
+    async def decrement(self, n: int = 1, notify_all: bool = True):
+        """
+        Atomically decrement the counter by a given amount and notify all waiters.
+
+        Args:
+            n (int): The amount to decrement the counter by. Default is 1.
+            notify_all (bool): Whether to notify all waiters after decrementing. Default is True.
+        """
+        async with self._condition:
+            self._count -= n
+            if notify_all:
+                self._condition.notify_all()
+
+    async def wait_for(self, condition: Callable[[int], bool]):
+        """
+        Asynchronously wait until the counter satisfies a given condition.
+
+        This suspends the calling coroutine without blocking the thread, allowing
+        other tasks to run while waiting. When the condition is met, the coroutine resumes.
+
+        Args:
+            condition (Callable[[int], bool]): A function that takes the current counter
+                value and returns True if the wait condition is satisfied.
+        """
+        async with self._condition:
+            while not condition(self._count):
+                await self._condition.wait()
+
+    async def wait_for_zero(self):
+        """
+        Asynchronously wait until the counter reaches zero.
+
+        This suspends the calling coroutine without blocking the thread, allowing
+        other tasks to run while waiting. When the counter becomes zero, the coroutine resumes.
+        """
+        await self.wait_for(lambda count: count == 0)

@@ -267,7 +267,11 @@ def _run_forward_and_sample(model_runner, batch: ScheduleBatch, token_first_arg:
     )
 
     model_worker_batch = batch.get_model_worker_batch(
-        [token_first_arg], [bs_needed], [cache_loc_needed], page_size
+        [token_first_arg],
+        [bs_needed],
+        [cache_loc_needed],
+        page_size,
+        False,
     )
 
     # Prepare attention forward metadata (required by FlashAttention backend)

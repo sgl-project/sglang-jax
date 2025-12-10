@@ -32,6 +32,9 @@ class ModelWorkerClient:
     ):
         # Load the model
         self.worker = ModelWorker(server_args, mesh=mesh)
+        # overlap mode set worker need_prepare_lora_batch to False
+        self.worker.need_prepare_lora_batch = False
+
         self.max_running_requests = self.worker.max_running_requests
         self.device = self.worker.device
 
@@ -169,6 +172,10 @@ class ModelWorkerClient:
         forward_metadata = self.worker.model_runner.attn_backend.get_forward_metadata(
             model_worker_batch
         )
+
+        # Prepare LoRA batch if LoRA is enabled
+        if self.worker.server_args.enable_lora:
+            self.get_model_runner().lora_manager.prepare_lora_batch(model_worker_batch)
 
         # Push a new batch to the queue (JAX handles synchronization automatically)
         self.input_queue.put(
