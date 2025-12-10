@@ -282,21 +282,33 @@ class Engine(EngineBase):
         return False
 
     def flush_cache(self):
+        """
+        Descriptioin: requests will be sent to tokenizer manager. It will flush all cache: tree_cache(radix cache), req_to_token_pool, token_to_kv_pool_allocator(free physical cache through allocator)
+        """
         loop = asyncio.get_event_loop()
         return loop.run_until_complete(self.tokenizer_manager.flush_cache())
 
     def pause_generation(self, mode: str = "retract"):
+        """
+        Input: the pause generation mode: ["abort", "retract", "in-place"]
+
+        Description: pause in-flight generation, requests will be sent to tokenizer manager
+        """
         obj = PauseGenerationReqInput(mode=mode)
         loop = asyncio.get_event_loop()
         return loop.run_until_complete(self.tokenizer_manager.pause_generation(obj))
 
     def continue_generation(self):
+        """
+        Description: continue previous paused generation
+        """
         obj = ContinueGenerationReqInput()
         loop = asyncio.get_event_loop()
         return loop.run_until_complete(self.tokenizer_manager.continue_generation(obj))
 
     # abort request is sync, therefore do not need event loop
     def abort_request(self, rid: str | None = None, abort_all: bool = False):
+        """Abort a request."""
         self.tokenizer_manager.abort_request(rid=rid, abort_all=abort_all)
 
     def start_profile(self):

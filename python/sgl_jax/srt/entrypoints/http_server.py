@@ -350,7 +350,11 @@ async def classify_request(obj: EmbeddingReqInput, request: Request):
 
 @app.api_route("/flush_cache", methods=["GET", "POST"])
 async def flush_cache():
-    """Flush the radix cache."""
+    """
+    Descriptioin: requests will be sent to tokenizer manager. It will flush all cache: tree_cache(radix cache), req_to_token_pool, token_to_kv_pool_allocator(free physical cache through allocator)
+
+    Return: status code indicating it work correctly
+    """
     ret = await _global_state.tokenizer_manager.flush_cache()
     content = (
         "Cache flushed.\nPlease check backend logs for more details. "
@@ -638,7 +642,13 @@ async def separate_reasoning_request(obj: SeparateReasoningReqInput, request: Re
 
 @app.post("/pause_generation")
 async def pause_generation(obj: PauseGenerationReqInput, request: Request):
-    """Pause generation."""
+    """
+    Description: pause in-flight generation, requests will be sent to tokenizer manager
+
+    Input: PauseGenerationReqInput, request obj for pause generation
+
+    Return: status code indicating it work correctly
+    """
     await _global_state.tokenizer_manager.pause_generation(obj)
     return ORJSONResponse(
         content={"message": "Generation paused successfully.", "status": "ok"},
@@ -648,7 +658,13 @@ async def pause_generation(obj: PauseGenerationReqInput, request: Request):
 
 @app.post("/continue_generation")
 async def continue_generation(obj: ContinueGenerationReqInput, request: Request):
-    """Continue generation."""
+    """
+    Description: continue previous paused generation
+
+    Input: ContinueGenerationReqInput, request obj to indicate continue generating
+
+    Return: status code indicating it work correctly
+    """
     await _global_state.tokenizer_manager.continue_generation(obj)
     return ORJSONResponse(
         content={"message": "Generation continued successfully.", "status": "ok"},
