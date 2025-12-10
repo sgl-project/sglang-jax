@@ -32,7 +32,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import ORJSONResponse, Response, StreamingResponse
 
-from sgl_jax.srt.entrypoints.engine import _launch_subprocesses_or_threads
+from sgl_jax.srt.entrypoints.engine import Engine
 from sgl_jax.srt.entrypoints.openai.protocol import (
     ChatCompletionRequest,
     CompletionRequest,
@@ -87,6 +87,7 @@ asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 # Store global states
 @dataclasses.dataclass
 class _GlobalState:
+    engine: Engine
     tokenizer_manager: TokenizerManager
     template_manager: TemplateManager
     scheduler_info: dict
@@ -282,7 +283,8 @@ async def generate_request(obj: GenerateReqInput, request: Request):
 
         async def stream_results() -> AsyncIterator[bytes]:
             try:
-                async for out in _global_state.tokenizer_manager.generate_request(obj, request):
+                generator = await _global_state.engine.async_generate(obj, request)
+                async for out in generator:
                     yield (b"data: " + orjson.dumps(out, option=orjson.OPT_NON_STR_KEYS) + b"\n\n")
             except ValueError as e:
                 out = {"error": {"message": str(e)}}
@@ -297,7 +299,7 @@ async def generate_request(obj: GenerateReqInput, request: Request):
         )
     else:
         try:
-            ret = await _global_state.tokenizer_manager.generate_request(obj, request).__anext__()
+            ret = await _global_state.engine.async_generate(obj, request)
             return ret
         except ValueError as e:
             logger.error("[http_server] Error: %s", e)
@@ -774,16 +776,15 @@ def launch(
     # Initialize precision tracer enable state in HTTP server process
     precision_tracer.set_enable_precision_tracer(server_args.enable_precision_tracer)
 
-    tokenizer_manager, template_manager, scheduler_info = _launch_subprocesses_or_threads(
-        server_args=server_args, port_args=None
-    )
-    ## don't expose scheduler in server mode
+    engine = Engine(server_args=server_args)
+    scheduler_info = engine.scheduler_info
     if "scheduler" in scheduler_info:
         del scheduler_info["scheduler"]
     set_global_state(
         _GlobalState(
-            tokenizer_manager=tokenizer_manager,
-            template_manager=template_manager,
+            engine=engine,
+            tokenizer_manager=engine.tokenizer_manager,
+            template_manager=engine.template_manager,
             scheduler_info=scheduler_info,
         )
     )

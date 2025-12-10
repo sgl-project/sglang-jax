@@ -14,7 +14,10 @@ import os
 import signal
 import threading
 from collections.abc import AsyncIterator, Iterator
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    import fastapi
 
 import uvloop
 import zmq
@@ -24,7 +27,6 @@ import zmq.asyncio
 # Fix a bug of Python threading
 threading._register_atexit = lambda *args, **kwargs: None
 
-from sgl_jax.srt.entrypoints.EngineBase import EngineBase
 from sgl_jax.srt.hf_transformers_utils import get_generation_config
 from sgl_jax.srt.managers.detokenizer_manager import (
     run_detokenizer_process,
@@ -58,7 +60,7 @@ logger = logging.getLogger(__name__)
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
 
-class Engine(EngineBase):
+class Engine:
     """
     The entry point to the inference engine.
 
@@ -109,34 +111,9 @@ class Engine(EngineBase):
 
     def generate(
         self,
-        prompt: list[str] | str | None = None,
-        sampling_params: list[dict] | dict | None = None,
-        # The token ids for text; one can either specify text or input_ids.
-        input_ids: list[list[int]] | list[int] | None = None,
-        return_logprob: list[bool] | bool | None = False,
-        logprob_start_len: list[int] | int | None = None,
-        top_logprobs_num: list[int] | int | None = None,
-        token_ids_logprob: list[list[int]] | list[int] | None = None,
-        stream: bool = False,
+        obj: GenerateReqInput,
     ) -> dict | Iterator[dict]:
-        """
-        The arguments of this function is the same as `sglang/srt/managers/io_struct.py::GenerateReqInput`.
-        Please refer to `GenerateReqInput` for the documentation.
-        """
-
-        if sampling_params is None:
-            sampling_params = self.get_default_sampling_params()
-
-        obj = GenerateReqInput(
-            text=prompt,
-            input_ids=input_ids,
-            sampling_params=sampling_params,
-            return_logprob=return_logprob,
-            logprob_start_len=logprob_start_len,
-            top_logprobs_num=top_logprobs_num,
-            token_ids_logprob=token_ids_logprob,
-            stream=stream,
-        )
+        """Generate outputs based on given request."""
         try:
             loop = asyncio.get_event_loop()
         except RuntimeError:
@@ -144,7 +121,7 @@ class Engine(EngineBase):
             asyncio.set_event_loop(loop)
         generator = self.tokenizer_manager.generate_request(obj, None)
 
-        if stream:
+        if obj.stream:
 
             def generator_wrapper():
                 while True:
@@ -161,35 +138,13 @@ class Engine(EngineBase):
 
     async def async_generate(
         self,
-        sampling_params: list[dict] | dict | None = None,
-        # The token ids for text; one can either specify text or input_ids.
-        input_ids: list[list[int]] | list[int] | None = None,
-        return_logprob: list[bool] | bool | None = False,
-        logprob_start_len: list[int] | int | None = None,
-        top_logprobs_num: list[int] | int | None = None,
-        token_ids_logprob: list[list[int]] | list[int] | None = None,
-        stream: bool = False,
+        obj: GenerateReqInput,
+        request: "fastapi.Request | None" = None,
     ) -> dict | AsyncIterator[dict]:
-        """
-        The arguments of this function is the same as `sglang/srt/managers/io_struct.py::GenerateReqInput`.
-        Please refer to `GenerateReqInput` for the documentation.
-        """
+        """Generate outputs based on given request."""
+        generator = self.tokenizer_manager.generate_request(obj, request)
 
-        if sampling_params is None:
-            sampling_params = self.get_default_sampling_params()
-
-        obj = GenerateReqInput(
-            input_ids=input_ids,
-            sampling_params=sampling_params,
-            return_logprob=return_logprob,
-            logprob_start_len=logprob_start_len,
-            top_logprobs_num=top_logprobs_num,
-            token_ids_logprob=token_ids_logprob,
-            stream=stream,
-        )
-        generator = self.tokenizer_manager.generate_request(obj, None)
-
-        if stream is True:
+        if obj.stream:
             return generator
         else:
             return await generator.__anext__()
