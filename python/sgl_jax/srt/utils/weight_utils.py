@@ -749,42 +749,48 @@ class WeightLoader:
                 }
         """
         target_path = mapping.target_path[0]
+        expected_hf_keys = mapping.target_path[1:]
 
         # Step 1: Process gate and up weights separately
+        # Use the predefined order from expected_hf_keys, not sorting
         gate_weights = []
         up_weights = []
 
-        # Process gate weights (w1)
-        for hf_key in sorted(grouped_weights["gate"].keys()):
-            weights = grouped_weights["gate"][hf_key]
+        gate_id, up_id = mapping.fuse_gate_up
 
-            # Concatenate TP shards
-            if mapping.concat_axis is not None and len(weights) > 1:
-                weight = jnp.concatenate(weights, axis=mapping.concat_axis)
-            else:
-                weight = weights[0]
+        # Separate expected keys into gate and up based on fuse_gate_up config
+        for hf_key in expected_hf_keys:
+            if gate_id in hf_key:
+                # This is a gate weight
+                weights = grouped_weights["gate"][hf_key]
 
-            # Transpose
-            if mapping.transpose:
-                weight = jnp.transpose(weight, (1, 0))
+                # Concatenate TP shards
+                if mapping.concat_axis is not None and len(weights) > 1:
+                    weight = jnp.concatenate(weights, axis=mapping.concat_axis)
+                else:
+                    weight = weights[0]
 
-            gate_weights.append(weight)
+                # Transpose
+                if mapping.transpose:
+                    weight = jnp.transpose(weight, (1, 0))
 
-        # Process up weights (w3)
-        for hf_key in sorted(grouped_weights["up"].keys()):
-            weights = grouped_weights["up"][hf_key]
+                gate_weights.append(weight)
 
-            # Concatenate TP shards
-            if mapping.concat_axis is not None and len(weights) > 1:
-                weight = jnp.concatenate(weights, axis=mapping.concat_axis)
-            else:
-                weight = weights[0]
+            elif up_id in hf_key:
+                # This is an up weight
+                weights = grouped_weights["up"][hf_key]
 
-            # Transpose
-            if mapping.transpose:
-                weight = jnp.transpose(weight, (1, 0))
+                # Concatenate TP shards
+                if mapping.concat_axis is not None and len(weights) > 1:
+                    weight = jnp.concatenate(weights, axis=mapping.concat_axis)
+                else:
+                    weight = weights[0]
 
-            up_weights.append(weight)
+                # Transpose
+                if mapping.transpose:
+                    weight = jnp.transpose(weight, (1, 0))
+
+                up_weights.append(weight)
 
         # Step 2: Stack to 3D tensors
         # gate_stacked: (num_experts, hidden_size, intermediate_size)
@@ -813,9 +819,24 @@ class WeightLoader:
 
         # Step 5: Assign to model parameter
         model_param = self._get_param(params, target_path)
-        model_param.value = sharded_weight.astype(model_param.value.dtype)
+        original_dtype = model_param.value.dtype
+        expected_shape = model_param.value.shape
 
-        logger.debug("Assigned fused MoE group %s, final shape: %s", moe_key, fused_weight.shape)
+        # Validate shape before assignment
+        if fused_weight.shape != expected_shape:
+            raise ValueError(
+                f"Fused MoE weight shape mismatch for {target_path}: "
+                f"expected {expected_shape}, got {fused_weight.shape}"
+            )
+
+        model_param.value = sharded_weight.astype(original_dtype)
+
+        # Verify assignment was successful
+        actual_shape = model_param.value.shape
+        if actual_shape != expected_shape:
+            raise RuntimeError(
+                f"Failed to assign fused MoE weight to {target_path}: shape mismatch"
+            )
 
     def _load_dummy_weights(
         self,
@@ -1235,3 +1256,72 @@ class WeightLoader:
 
         layer_num = int(parts[2])
         return layer_num >= self.model_config.num_hidden_layers
+
+    def _verify_fused_moe_weights(
+        self, params: nnx.State, moe_mappings: dict[str, WeightMapping]
+    ) -> None:
+        """Verify that all fused MoE weights were loaded correctly."""
+        # Get all fused w1 mappings
+        fused_w1_mappings = {
+            k: v for k, v in moe_mappings.items() if getattr(v, "fuse_moe_weights", False)
+        }
+
+        # Get corresponding w2 mappings (same layer, but w2 instead of w1)
+        w2_mappings = {}
+        for k in fused_w1_mappings:
+            w2_key = k.replace(".w1", ".w2")
+            if w2_key in moe_mappings:
+                w2_mappings[w2_key] = moe_mappings[w2_key]
+
+        if not fused_w1_mappings:
+            return
+
+        all_verified = True
+        verified_count = 0
+
+        # Verify w1 and w2 weights
+        for _, mapping in fused_w1_mappings.items():
+            target_path = mapping.target_path[0]
+            try:
+                model_param = self._get_param(params, target_path)
+                weight_shape = model_param.value.shape
+                weight_values = model_param.value
+
+                if (
+                    len(weight_shape) != 4
+                    or weight_shape[1] != 2
+                    or jnp.all(weight_values == 0)
+                    or jnp.any(jnp.isnan(weight_values))
+                ):
+                    logger.error("✗ %s: Invalid or corrupted weights", target_path)
+                    all_verified = False
+                else:
+                    verified_count += 1
+            except (KeyError, AttributeError, ValueError) as e:
+                logger.error("✗ %s: Failed to access - %s", target_path, str(e))
+                all_verified = False
+
+        for _, mapping in w2_mappings.items():
+            target_path = mapping.target_path[0]
+            try:
+                model_param = self._get_param(params, target_path)
+                weight_shape = model_param.value.shape
+                weight_values = model_param.value
+
+                if (
+                    len(weight_shape) != 3
+                    or jnp.all(weight_values == 0)
+                    or jnp.any(jnp.isnan(weight_values))
+                ):
+                    logger.error("✗ %s (w2): Invalid or corrupted weights", target_path)
+                    all_verified = False
+                else:
+                    verified_count += 1
+            except (KeyError, AttributeError, ValueError) as e:
+                logger.error("✗ %s (w2): Failed to access - %s", target_path, str(e))
+                all_verified = False
+
+        if all_verified:
+            logger.info("✓ Fused MoE weights verified: %d layers", verified_count // 2)
+        else:
+            raise RuntimeError("Fused MoE weight verification failed")
