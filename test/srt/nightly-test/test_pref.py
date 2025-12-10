@@ -31,6 +31,28 @@ from sgl_jax.test.test_utils import (
 
 class TestModePerf(CustomTestCase):
     sharegpt_dataset_path = None
+    BASIC_SERVER_ARGS = [
+        "--trust-remote-code",
+        "--skip-server-warmup",
+        "--random-seed",
+        "3",
+        "--max-prefill-tokens",
+        "16384",
+        "--download-dir",
+        "/dev/shm/",
+        "--dtype",
+        "bfloat16",
+        "--max-running-requests",
+        "256",
+        "--attention-backend",
+        "fa",
+        "--page-size",
+        "128",
+        "--chunked-prefill-size",
+        "2048",
+        "--mem-fraction-static",
+        "0.8",
+    ]
 
     @classmethod
     def setUpClass(cls):
@@ -56,37 +78,17 @@ class TestModePerf(CustomTestCase):
         # input_lengths = [1024]
 
         output_lengths = [1, 1024]
-
+        specific_args = self.BASIC_SERVER_ARGS + [
+            "--tp-size",
+            "1",
+        ]
         # launch server
         process = popen_launch_server(
             model,
             base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             device="tpu",
-            other_args=[
-                "--trust-remote-code",
-                "--skip-server-warmup",
-                "--random-seed",
-                "3",
-                "--download-dir",
-                "/dev/shm/",
-                "--dtype",
-                "bfloat16",
-                "--max-running-requests",
-                "256",
-                "--max-prefill-tokens",
-                "16384",
-                "--attention-backend",
-                "fa",
-                "--page-size",
-                "128",
-                "--chunked-prefill-size",
-                "2048",
-                "--tp-size",
-                "1",
-                "--mem-fraction-static",
-                "0.8",
-            ],
+            other_args=specific_args,
             env={
                 "JAX_COMPILATION_CACHE_DIR": "/tmp/jax_compilation_cache",
             },
@@ -215,37 +217,17 @@ class TestModePerf(CustomTestCase):
         # input_lengths = [1024]
 
         output_lengths = [1, 1024]
-
+        specific_args = self.BASIC_SERVER_ARGS + [
+            "--tp-size",
+            "4",
+        ]
         # launch server
         process = popen_launch_server(
             model,
             base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             device="tpu",
-            other_args=[
-                "--trust-remote-code",
-                "--skip-server-warmup",
-                "--random-seed",
-                "3",
-                "--download-dir",
-                "/dev/shm/",
-                "--dtype",
-                "bfloat16",
-                "--max-running-requests",
-                "256",
-                "--max-prefill-tokens",
-                "16384",
-                "--attention-backend",
-                "fa",
-                "--page-size",
-                "128",
-                "--chunked-prefill-size",
-                "2048",
-                "--tp-size",
-                "4",
-                "--mem-fraction-static",
-                "0.8",
-            ],
+            other_args=specific_args,
             env={
                 "JAX_COMPILATION_CACHE_DIR": "/tmp/jax_compilation_cache",
             },
@@ -374,37 +356,17 @@ class TestModePerf(CustomTestCase):
         # input_lengths = [1024]
 
         output_lengths = [1, 1024]
-
+        specific_args = self.BASIC_SERVER_ARGS + [
+            "--tp-size",
+            "1",
+        ]
         # launch server
         process = popen_launch_server(
             model,
             base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             device="tpu",
-            other_args=[
-                "--trust-remote-code",
-                "--skip-server-warmup",
-                "--random-seed",
-                "3",
-                "--download-dir",
-                "/dev/shm/",
-                "--dtype",
-                "bfloat16",
-                "--max-running-requests",
-                "256",
-                "--max-prefill-tokens",
-                "16384",
-                "--attention-backend",
-                "fa",
-                "--page-size",
-                "128",
-                "--chunked-prefill-size",
-                "2048",
-                "--tp-size",
-                "1",
-                "--mem-fraction-static",
-                "0.8",
-            ],
+            other_args=specific_args,
             env={
                 "JAX_COMPILATION_CACHE_DIR": "/tmp/jax_compilation_cache",
             },
@@ -533,37 +495,17 @@ class TestModePerf(CustomTestCase):
         # input_lengths = [1024]
 
         output_lengths = [1, 1024]
-
+        specific_args = self.BASIC_SERVER_ARGS + [
+            "--tp-size",
+            "4",
+        ]
         # launch server
         process = popen_launch_server(
             model,
             base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             device="tpu",
-            other_args=[
-                "--trust-remote-code",
-                "--skip-server-warmup",
-                "--random-seed",
-                "3",
-                "--download-dir",
-                "/dev/shm/",
-                "--dtype",
-                "bfloat16",
-                "--max-running-requests",
-                "256",
-                "--max-prefill-tokens",
-                "16384",
-                "--attention-backend",
-                "fa",
-                "--page-size",
-                "128",
-                "--chunked-prefill-size",
-                "2048",
-                "--tp-size",
-                "4",
-                "--mem-fraction-static",
-                "0.8",
-            ],
+            other_args=specific_args,
             env={
                 "JAX_COMPILATION_CACHE_DIR": "/tmp/jax_compilation_cache",
             },
@@ -692,39 +634,19 @@ class TestModePerf(CustomTestCase):
         # input_lengths = [1024]
 
         output_lengths = [1, 1024]
-
+        specific_args = self.BASIC_SERVER_ARGS + [
+            "--tp-size",
+            "2",
+            "--ep-size",
+            "2",
+        ]
         # launch server
         process = popen_launch_server(
             model,
             base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             device="tpu",
-            other_args=[
-                "--trust-remote-code",
-                "--skip-server-warmup",
-                "--random-seed",
-                "3",
-                "--download-dir",
-                "/dev/shm/",
-                "--dtype",
-                "bfloat16",
-                "--max-running-requests",
-                "256",
-                "--max-prefill-tokens",
-                "16384",
-                "--attention-backend",
-                "fa",
-                "--page-size",
-                "128",
-                "--chunked-prefill-size",
-                "2048",
-                "--tp-size",
-                "2",
-                "--ep-size",
-                "2",
-                "--mem-fraction-static",
-                "0.8",
-            ],
+            other_args=specific_args,
             env={
                 "JAX_COMPILATION_CACHE_DIR": "/tmp/jax_compilation_cache",
             },
@@ -852,38 +774,18 @@ class TestModePerf(CustomTestCase):
         # input_lengths = [1024]
 
         output_lengths = [1, 1024]
-
+        specific_args = self.BASIC_SERVER_ARGS + [
+            "--tp-size",
+            "1",
+            "--disable-hybrid-swa-memory",
+        ]
         # launch server
         process = popen_launch_server(
             model,
             base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             device="tpu",
-            other_args=[
-                "--trust-remote-code",
-                "--skip-server-warmup",
-                "--random-seed",
-                "3",
-                "--download-dir",
-                "/dev/shm/",
-                "--dtype",
-                "bfloat16",
-                "--max-running-requests",
-                "256",
-                "--max-prefill-tokens",
-                "16384",
-                "--attention-backend",
-                "fa",
-                "--page-size",
-                "128",
-                "--chunked-prefill-size",
-                "2048",
-                "--tp-size",
-                "1",
-                "--disable-hybrid-swa-memory",
-                "--mem-fraction-static",
-                "0.8",
-            ],
+            other_args=specific_args,
             env={
                 "JAX_COMPILATION_CACHE_DIR": "/tmp/jax_compilation_cache",
             },
@@ -1012,7 +914,11 @@ class TestModePerf(CustomTestCase):
         # input_lengths = [1024]
 
         output_lengths = [1, 1024]
-
+        specific_args = self.BASIC_SERVER_ARGS + [
+            "--tp-size",
+            "4",
+            "--disable-hybrid-swa-memory",
+        ]
         # launch server
         process = popen_launch_server(
             model,
@@ -1172,39 +1078,19 @@ class TestModePerf(CustomTestCase):
         # input_lengths = [1024]
 
         output_lengths = [1, 1024]
-
+        specific_args = self.BASIC_SERVER_ARGS + [
+            "--tp-size",
+            "2",
+            "--ep-size",
+            "2",
+        ]
         # launch server
         process = popen_launch_server(
             model,
             base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             device="tpu",
-            other_args=[
-                "--trust-remote-code",
-                "--skip-server-warmup",
-                "--random-seed",
-                "3",
-                "--download-dir",
-                "/dev/shm/",
-                "--dtype",
-                "bfloat16",
-                "--max-running-requests",
-                "256",
-                "--max-prefill-tokens",
-                "16384",
-                "--attention-backend",
-                "fa",
-                "--page-size",
-                "128",
-                "--chunked-prefill-size",
-                "2048",
-                "--tp-size",
-                "2",
-                "--ep-size",
-                "2",
-                "--mem-fraction-static",
-                "0.8",
-            ],
+            other_args=specific_args,
             env={
                 "JAX_COMPILATION_CACHE_DIR": "/tmp/jax_compilation_cache",
             },
@@ -1321,37 +1207,17 @@ class TestModePerf(CustomTestCase):
         # input_lengths = [1024]
 
         output_lengths = [1, 1024]
-
+        specific_args = self.BASIC_SERVER_ARGS + [
+            "--tp-size",
+            "1",
+        ]
         # launch server
         process = popen_launch_server(
             model,
             base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             device="tpu",
-            other_args=[
-                "--trust-remote-code",
-                "--skip-server-warmup",
-                "--random-seed",
-                "3",
-                "--download-dir",
-                "/dev/shm/",
-                "--dtype",
-                "bfloat16",
-                "--max-running-requests",
-                "256",
-                "--max-prefill-tokens",
-                "16384",
-                "--attention-backend",
-                "fa",
-                "--page-size",
-                "128",
-                "--chunked-prefill-size",
-                "2048",
-                "--tp-size",
-                "1",
-                "--mem-fraction-static",
-                "0.8",
-            ],
+            other_args=specific_args,
             env={
                 "JAX_COMPILATION_CACHE_DIR": "/tmp/jax_compilation_cache",
             },
@@ -1469,37 +1335,17 @@ class TestModePerf(CustomTestCase):
         # input_lengths = [1024]
 
         output_lengths = [1, 1024]
-
+        specific_args = self.BASIC_SERVER_ARGS + [
+            "--tp-size",
+            "4",
+        ]
         # launch server
         process = popen_launch_server(
             model,
             base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             device="tpu",
-            other_args=[
-                "--trust-remote-code",
-                "--skip-server-warmup",
-                "--random-seed",
-                "3",
-                "--download-dir",
-                "/dev/shm/",
-                "--dtype",
-                "bfloat16",
-                "--max-running-requests",
-                "256",
-                "--max-prefill-tokens",
-                "16384",
-                "--attention-backend",
-                "fa",
-                "--page-size",
-                "128",
-                "--chunked-prefill-size",
-                "2048",
-                "--tp-size",
-                "4",
-                "--mem-fraction-static",
-                "0.8",
-            ],
+            other_args=specific_args,
             env={
                 "JAX_COMPILATION_CACHE_DIR": "/tmp/jax_compilation_cache",
             },
