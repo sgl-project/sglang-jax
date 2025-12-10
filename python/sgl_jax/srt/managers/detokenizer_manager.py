@@ -54,7 +54,6 @@ class DetokenizerManager:
         server_args: ServerArgs,
         port_args: PortArgs,
     ):
-        # Init inter-process communication
         context = zmq.Context(2)
         self.recv_from_scheduler = get_zmq_socket(
             context, zmq.PULL, port_args.detokenizer_ipc_name, True
@@ -86,9 +85,7 @@ class DetokenizerManager:
         """The event loop that handles requests"""
         while True:
             recv_obj = self.recv_from_scheduler.recv_pyobj()
-
             output = self._request_dispatcher(recv_obj)
-            # if recv_obj is not None:
             self.send_to_tokenizer.send_pyobj(output)
 
     def trim_matched_stop(self, output: str | list[int], finished_reason: dict, no_stop_trim: bool):

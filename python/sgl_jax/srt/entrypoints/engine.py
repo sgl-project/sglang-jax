@@ -107,6 +107,12 @@ class Engine(EngineBase):
         context = zmq.Context(2)
         self.send_to_rpc = get_zmq_socket(context, zmq.DEALER, self.port_args.rpc_ipc_name, True)
 
+        try:
+            self.loop = asyncio.get_running_loop()
+        except RuntimeError:
+            self.loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(self.loop)
+
     def generate(
         self,
         prompt: list[str] | str | None = None,
@@ -137,11 +143,7 @@ class Engine(EngineBase):
             token_ids_logprob=token_ids_logprob,
             stream=stream,
         )
-        try:
-            loop = asyncio.get_event_loop()
-        except RuntimeError:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
+
         generator = self.tokenizer_manager.generate_request(obj, None)
 
         if stream:
@@ -149,14 +151,14 @@ class Engine(EngineBase):
             def generator_wrapper():
                 while True:
                     try:
-                        chunk = loop.run_until_complete(generator.__anext__())
+                        chunk = self.loop.run_until_complete(generator.__anext__())
                         yield chunk
                     except StopAsyncIteration:
                         break
 
             return generator_wrapper()
         else:
-            ret = loop.run_until_complete(generator.__anext__())
+            ret = self.loop.run_until_complete(generator.__anext__())
             return ret
 
     async def async_generate(
