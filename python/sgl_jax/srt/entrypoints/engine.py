@@ -36,8 +36,10 @@ from sgl_jax.srt.managers.detokenizer_manager import (
     run_detokenizer_thread,
 )
 from sgl_jax.srt.managers.io_struct import (
+    ContinueGenerationReqInput,
     EmbeddingReqInput,
     GenerateReqInput,
+    PauseGenerationReqInput,
     ReleaseMemoryOccupationReqInput,
     ResumeMemoryOccupationReqInput,
 )
@@ -282,6 +284,20 @@ class Engine(EngineBase):
     def flush_cache(self):
         loop = asyncio.get_event_loop()
         return loop.run_until_complete(self.tokenizer_manager.flush_cache())
+
+    def pause_generation(self, mode: str = "retract"):
+        obj = PauseGenerationReqInput(mode=mode)
+        loop = asyncio.get_event_loop()
+        return loop.run_until_complete(self.tokenizer_manager.pause_generation(obj))
+
+    def continue_generation(self):
+        obj = ContinueGenerationReqInput()
+        loop = asyncio.get_event_loop()
+        return loop.run_until_complete(self.tokenizer_manager.continue_generation(obj))
+
+    # abort request is sync, therefore do not need event loop
+    def abort_request(self, rid: str | None = None, abort_all: bool = False):
+        self.tokenizer_manager.abort_request(rid=rid, abort_all=abort_all)
 
     def start_profile(self):
         loop = asyncio.get_event_loop()
