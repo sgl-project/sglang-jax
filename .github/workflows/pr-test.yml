@@ -128,7 +128,7 @@ jobs:
         env:
           SGLANG_JAX_IS_IN_CI: true
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
-          HF_HUB_DOWNLOAD_TIMEOUT: ${{ vars.HF_HUB_DOWNLOAD_TIMEOUT }}
+          HF_HUB_DOWNLOAD_TIMEOUT: 300
         run: |
           python3.12 -m venv .venv
           source .venv/bin/activate
@@ -155,7 +155,7 @@ jobs:
         env:
           SGLANG_JAX_IS_IN_CI: true
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
-          HF_HUB_DOWNLOAD_TIMEOUT: ${{ vars.HF_HUB_DOWNLOAD_TIMEOUT }}
+          HF_HUB_DOWNLOAD_TIMEOUT: 300
         run: |
           python3.12 -m venv .venv
           source .venv/bin/activate
@@ -182,7 +182,7 @@ jobs:
         env:
           SGLANG_JAX_IS_IN_CI: true
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
-          HF_HUB_DOWNLOAD_TIMEOUT: ${{ vars.HF_HUB_DOWNLOAD_TIMEOUT }}
+          HF_HUB_DOWNLOAD_TIMEOUT: 300
         run: |
           python3.12 -m venv .venv
           source .venv/bin/activate
@@ -209,7 +209,7 @@ jobs:
         env:
           SGLANG_JAX_IS_IN_CI: true
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
-          HF_HUB_DOWNLOAD_TIMEOUT: ${{ vars.HF_HUB_DOWNLOAD_TIMEOUT }}
+          HF_HUB_DOWNLOAD_TIMEOUT: 300
         run: |
           python3.12 -m venv .venv
           source .venv/bin/activate
@@ -237,7 +237,7 @@ jobs:
         env:
           SGLANG_JAX_IS_IN_CI: true
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
-          HF_HUB_DOWNLOAD_TIMEOUT: ${{ vars.HF_HUB_DOWNLOAD_TIMEOUT }}
+          HF_HUB_DOWNLOAD_TIMEOUT: 300
         run: |
           python3.12 -m venv .venv
           source .venv/bin/activate
@@ -265,7 +265,7 @@ jobs:
         env:
           SGLANG_JAX_IS_IN_CI: true
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
-          HF_HUB_DOWNLOAD_TIMEOUT: ${{ vars.HF_HUB_DOWNLOAD_TIMEOUT }}
+          HF_HUB_DOWNLOAD_TIMEOUT: 300
         run: |
           python3.12 -m venv .venv
           source .venv/bin/activate
@@ -292,7 +292,7 @@ jobs:
         env:
           SGLANG_JAX_IS_IN_CI: true
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
-          HF_HUB_DOWNLOAD_TIMEOUT: ${{ vars.HF_HUB_DOWNLOAD_TIMEOUT }}
+          HF_HUB_DOWNLOAD_TIMEOUT: 300
         run: |
           python3.12 -m venv .venv
           source .venv/bin/activate
