@@ -7,7 +7,7 @@ on:
     branches:
       - main
     paths:
-      - "python/sglang/version.py"
+      - "python/sgl_jax/version.py"
   workflow_dispatch:
 
 concurrency:
