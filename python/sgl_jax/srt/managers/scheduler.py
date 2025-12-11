@@ -30,10 +30,12 @@ from sgl_jax.srt.hf_transformers_utils import get_tokenizer
 from sgl_jax.srt.layers.logits_processor import LogitsProcessorOutput
 from sgl_jax.srt.managers.io_struct import (
     AbortReq,
+    ContinueGenerationReqInput,
     FlushCacheReqInput,
     FlushCacheReqOutput,
     GetInternalStateReq,
     GetInternalStateReqOutput,
+    PauseGenerationReqInput,
     ProfileReq,
     SetInternalStateReq,
     SetInternalStateReqOutput,
@@ -304,6 +306,9 @@ class Scheduler(
             self.chunked_prefill_size is not None and server_args.enable_mixed_chunk
         )
 
+        # Init pause/continue state
+        self._engine_paused = False
+
         # Init schedule policy and new token estimation
         self.policy = SchedulePolicy(
             self.schedule_policy,
@@ -342,6 +347,8 @@ class Scheduler(
                 (FlushCacheReqInput, self.flush_cache_wrapped),
                 (GetInternalStateReq, self.get_internal_state),
                 (SetInternalStateReq, self.set_internal_state),
+                (PauseGenerationReqInput, self.pause_generation),
+                (ContinueGenerationReqInput, self.continue_generation),
             ]
         )
 
@@ -460,6 +467,11 @@ class Scheduler(
         while True:
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
+
+            # Skip batch processing when engine is paused
+            if self._engine_paused:
+                continue
+
             batch = self.get_next_batch_to_run()
             self.cur_batch = batch
 
@@ -481,6 +493,10 @@ class Scheduler(
         while True:
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
+
+            # Skip batch processing when engine is paused
+            if self._engine_paused:
+                continue
 
             batch = self.get_next_batch_to_run()
             self.cur_batch = batch
@@ -741,6 +757,23 @@ class Scheduler(
             "token_capacity": int(self.max_total_num_tokens),
         }
 
+        # state for pause/continue generation
+        ret["engine_paused"] = self._engine_paused
+        ret["waiting_queue_size"] = len(self.waiting_queue)
+        ret["running_batch_size"] = (
+            0 if self.running_batch.is_empty() else len(self.running_batch.reqs)
+        )
+        ret["prefill_decode_size"] = ret["waiting_queue_size"] + ret["running_batch_size"]
+        ret["waiting_queue_rids"] = [req.rid for req in self.waiting_queue]
+        ret["running_batch_rids"] = (
+            [req.rid for req in self.running_batch.reqs]
+            if not self.running_batch.is_empty()
+            else []
+        )
+
+        # kv cache stat
+        ret["available_kv_tokens"] = self.token_to_kv_pool_allocator.available_size()
+
         return GetInternalStateReqOutput(internal_state=ret)
 
     def set_internal_state(self, recv_req: SetInternalStateReq):
@@ -806,10 +839,8 @@ class Scheduler(
     def flush_cache_wrapped(self, recv_req: FlushCacheReqInput):
         success, error_msg, flushed_items = self.flush_cache()
         return FlushCacheReqOutput(
-            request_id=recv_req.request_id,
+            rid=recv_req.rid,
             success=success,
-            error_msg=error_msg,
-            flushed_items=flushed_items,
         )
 
     def _can_flush_cache(self) -> tuple[bool, str]:
@@ -1327,7 +1358,7 @@ class Scheduler(
             # This only works for requests that have not started anything.
             # We still need to send something back to TokenizerManager to clean up the state.
             req = self.waiting_queue.pop(i)
-            self.send_to_tokenizer.send_pyobj(AbortReq(req.rid))
+            self.send_to_tokenizer.send_pyobj(AbortReq(rid=req.rid))
             logger.debug("Abort queued request. rid=%s", req.rid)
 
         # Delete the requests in the grammar queue
@@ -1351,6 +1382,34 @@ class Scheduler(
                 # Then we reuse all existing code to clean up the KV cache allocation.
                 logger.debug("Abort running request. rid=%s", req.rid)
                 req.to_finish = FINISH_ABORT()
+
+    def pause_generation(self, recv_req: PauseGenerationReqInput):
+        self._engine_paused = True
+
+        # finish all in-flight request; in overlap mode, last_batch is running
+        if self.enable_overlap and self.last_batch:
+            tmp_batch, tmp_result = self.result_queue.popleft()
+            self.process_batch_result(tmp_batch, tmp_result)
+            self.last_batch = None
+            self.cur_batch = None
+
+        if recv_req.mode == "retract":
+            self.running_batch.filter_batch()
+            if len(self.running_batch.reqs) != 0:
+                # clear the kv cache
+                retracted_reqs = self.running_batch.retract_all(self.server_args)
+                for req in retracted_reqs:
+                    self._add_request_to_queue(req)
+
+            self.running_batch.batch_is_full = False
+            self.chunked_req = None
+            logger.info("Paused generation retracted")
+        elif recv_req.mode == "in_place":
+            logger.info("Paused generation in place")
+
+    def continue_generation(self, recv_req: ContinueGenerationReqInput):
+        self._engine_paused = False
+        logger.info("Generation continued")
 
 
 def run_scheduler_process(
