@@ -519,8 +519,7 @@ class ModelRunner:
         logits_metadata: LogitsMetadata,
     ) -> tuple[LogitsProcessorOutput, int]:
         self.forward_pass_id += 1
-        # hack this bid will always be same
-        precision_tracer.start_batch_trace(1)
+        precision_tracer.start_batch_trace(forward_batch.bid)
         precision_tracer.set_current_forward_pass_id(self.forward_pass_id)
         with jax.profiler.TraceAnnotation("_forward_raw"):
             ret = self._forward_raw(forward_batch, logits_metadata)

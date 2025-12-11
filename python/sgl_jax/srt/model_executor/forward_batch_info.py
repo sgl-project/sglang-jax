@@ -147,7 +147,6 @@ class ForwardBatch:
     # decode token position in kv cache
     # this field will not be used
     out_cache_loc: jax.Array
-
     # Position information [total_tokens]
     positions: jax.Array = None
     # Start position for each sequence in extend mode [batch_size]

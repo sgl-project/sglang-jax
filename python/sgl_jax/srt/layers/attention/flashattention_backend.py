@@ -341,7 +341,7 @@ class FlashAttention(AttentionBackend):
 
             page_indices_cur_step = (result_locs // self.page_size).astype(np.int32)
 
-            # Handle padding
+            # FIXME Handle padding, this will be move to precompile
             TARGET_PADDING = 16384
             if page_indices_cur_step.shape[0] < TARGET_PADDING:
                 padding_size = TARGET_PADDING - page_indices_cur_step.shape[0]

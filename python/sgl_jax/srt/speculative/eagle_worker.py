@@ -134,12 +134,10 @@ class EAGLEWorker(ModelWorker):
             logits_output, next_token_ids, cache_miss_count, bid, seq_lens = (
                 self.forward_target_extend(model_worker_batch, sampling_metadata)
             )
-
             # draft extend for Update Draft State
             self.draft_extend_for_prefill(
                 model_worker_batch, logits_output.hidden_states, next_token_ids
             )
-
             # FIXME(pc) refactor this to batch output
             batch_output = GenerationBatchResult(
                 logits_output=logits_output,
@@ -154,7 +152,6 @@ class EAGLEWorker(ModelWorker):
             return batch_output
 
         else:
-
             cur_allocate_lens = model_worker_batch.spec_info.allocate_lens
             self.draft(model_worker_batch)
 
