@@ -83,7 +83,7 @@ echo ""
 sky launch "$TEMP_YAML" \
     --cluster="$CLUSTER_NAME" \
     --infra=gcp \
-    -i 10 \
+    -i 30 \
     --down \
     -y
 
