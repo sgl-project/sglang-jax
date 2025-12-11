@@ -606,6 +606,7 @@ class Scheduler(
             recv_req.input_ids,
             recv_req.sampling_params,
             return_logprob=recv_req.return_logprob,
+            return_output_logprob_only=recv_req.return_output_logprob_only,
             top_logprobs_num=recv_req.top_logprobs_num,
             token_ids_logprob=recv_req.token_ids_logprob,
             stream=recv_req.stream,

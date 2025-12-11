@@ -11,7 +11,7 @@
 
 The wrapped forward function is `jitted_run_model` and `jitted_sampler`, which are used in prefill and decode. The input parameter `forward_batch`, `logits_metadata`, `logits_output` and `sampling_metadata` have to be registered as PyTrees. At the same time, the subclasses in it are required to register too. Besides, we use `nnx.split` and `nnx.merge` on model to keep satisfy the `jit` requirements.
 
-Note: `return_logprob` is supported in `jitted_run_model` and `jitted_sampler` with performance degradation, It will be optimized later.
+Note: `return_logprob` is supported in `jitted_run_model` and `jitted_sampler` with performance degradation, It will be optimized later. However, if you only specify `return_logprob` and only need the log probabilities of the output tokens, it is optimized.
 
 ### Precompile and padding
 
