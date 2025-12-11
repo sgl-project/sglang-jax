@@ -231,131 +231,39 @@ def quantization_config_file_path_to_dict(
 
 
 def apply_qwix_quantization(
-        vllm_config: "VllmConfig", model_or_model_fn: Callable | nnx.Module,
-        rng: jax.Array, mesh: Mesh,
-        apply_to_abstract_model: bool) -> nnx.Module | Callable:
-    """
-    Will apply quantization if a valid quantization config with Qwix rules is provided.  See README
-    for more details on Qwix.
-
-    Note that we currently support different methods for applying Qwix quantization.  The typical
-    approach is to apply quantization on the concrete model, which already has the weights
-    loaded in.  However, for models like DeepSeek, which are already quantized, we need to
-    first create the abstract model, then apply Qwix quantization to the abstract model, and
-    finally load the weights in.  To use the latter approach, you will need to modify the
-    model weight loading code appropriately (see deepseek_v3.py for an example) and
-    pass and `use_abstract_model=True` in the quantization config.
-
-    Args:
-        vllm_config: the base VLLM config
-        model_or_model_fn: if `apply_to_abstract_model` is True, this will be a Callable that returns the abstract model
-            (e.g. _create_abstract_model).  Otherwise, this will be the concrete model (nnx.Module).
-        rng: JAX RNG
-        mesh: model Mesh
-        apply_to_abstract_model: if True, we will apply Qwix quantization to the abstract model, which
-            assumes that, during weight loading, the caller will thus override the QArray weights
-            (see deepseek_v3.py for an example).  Otherwise, we will will apply Qwix quantization to the
-            concrete model, which already has the weights loaded in.
-
-    Returns:
-        Either the concrete model (nnx.Module) or the abstract model (Callable) (if `apply_to_abstract_model` is True)
-    """
-    qwix_config = None
-    # if quantization_config := vllm_config.additional_config.get(
-    #         "quantization"):
-    #     qwix_config = quantization_config.get("qwix").get("rules")
-    # if not qwix_config:
-    #     return model_or_model_fn
-    
-    # TODO(Bob): only for testing
-    qwix_config_file = os.path.join(QUANTIZATION_CONFIG_PATH, "fp8_all_modules_w_only.yaml")
-    # just read qwix_config from the file
-    with open(qwix_config_file, "r") as f:
-        qwix_config = yaml.safe_load(f).get("qwix").get("rules")
-
-    logging_abstract_model_str = "abstract" if apply_to_abstract_model else "concrete"
-    logger.info(
-        f"Applying Qwix quantization on {logging_abstract_model_str} model")
-
-    block_size = vllm_config.cache_config.block_size
-    model_config = vllm_config.model_config
-
-    # Pad num_kv_heads to multiple of TP size
-    num_kv_heads = utils.get_padded_num_heads(
-        model_config.get_total_num_kv_heads(), mesh.shape["model"])
-
-    # Pad head_dim to multiple of 128
-    head_size = model_config.get_head_size()
-    head_size = utils.get_padded_head_dim(head_size)
-
-    kv_cache_dtype = vllm_config.cache_config.cache_dtype
-
-    if not apply_to_abstract_model:
-        assert isinstance(model_or_model_fn, nnx.Module)
-        qwix_quantize_nnx_model_with_config = functools.partial(
-            qwix_quantize_nnx_model, qwix_config=qwix_config)
-        # NOTE: it's REALLY important `qwix_quantize_nnx_model_with_config` is jitted
-        # or else you'll run into hanging
-        model_or_model_fn = nnx.jit(
-            qwix_quantize_nnx_model_with_config,
-            donate_argnums=(0, ),
-            static_argnames=(
-                "mesh",
-                "num_hidden_layers",
-                "kv_cache_block_size",
-                "kv_cache_num_kv_heads",
-                "kv_cache_head_size",
-                "kv_cache_dtype",
-            ))(model=model_or_model_fn,
-               rng=rng,
-               mesh=mesh,
-               num_hidden_layers=vllm_config.model_config.hf_config.
-               num_hidden_layers,
-               kv_cache_block_size=block_size,
-               kv_cache_num_kv_heads=num_kv_heads,
-               kv_cache_head_size=head_size,
-               kv_cache_dtype=kv_cache_dtype)
-
-        return model_or_model_fn
-
-    hf_config = vllm_config.model_config.hf_config
-    if hasattr(hf_config, "text_config") and hasattr(hf_config.text_config,
-                                                     "num_hidden_layers"):
-        num_hidden_layers = hf_config.text_config.num_hidden_layers
-        logger.info(
-            f"Using num_hidden_layers from hf_config.text_config: {num_hidden_layers}"
+        model_config: ModelConfig, model: nnx.Module, mesh: Mesh, attn_backend: AttentionBackend) -> nnx.Module:
+        qwix_config = quantization_config_file_path_to_dict(
+                # TODO: fix since it is hardcoded
+                os.path.join("int8_all_modules_w_only.yaml")
         )
-    elif hasattr(hf_config, "num_hidden_layers"):
-        num_hidden_layers = hf_config.num_hidden_layers
-        logger.info(
-            f"Using num_hidden_layers directly from hf_config: {num_hidden_layers}"
-        )
-    else:
-        raise AttributeError(
-            "Could not find 'num_hidden_layers' in hf_config or hf_config.text_config."
-        )
-
-    qwix_quantize_fn_for_eval = functools.partial(
-        qwix_quantize_nnx_model,
-        qwix_config=qwix_config,
-        mesh=mesh,
-        num_hidden_layers=num_hidden_layers,
-        kv_cache_block_size=block_size,
-        kv_cache_num_kv_heads=num_kv_heads,
-        kv_cache_head_size=head_size,
-        kv_cache_dtype=kv_cache_dtype)
-
-    def create_and_quantize_model_factory() -> Callable:
-        """
-        Helper function to create and quantize the abstract model.
-        """
-        model = model_or_model_fn()
-        # Handle the DeepSeek case, where this needs to be called in the abstract model
-        if hasattr(model, 'initialize_cache'):
-            model.initialize_cache()
-        return qwix_quantize_fn_for_eval(model=model, rng=rng)
-
-    return create_and_quantize_model_factory
+        qwix_config = qwix_config.get("qwix").get("rules")
+        
+        bs = 1
+        num_tokens = model_config.vocab_size
+        max_seq_len = 4096
+        model_worker_batch = generate_model_worker_batch(bs, num_tokens, ForwardMode.DECODE, model_config.vocab_size, max_seq_len)
+        qwix_quantize_nnx_model_with_config_and_attn_backend = functools.partial(
+            qwix_quantize_nnx_model, qwix_config=qwix_config, model_worker_batch=model_worker_batch)
+        with jax.set_mesh(mesh):
+            model = nnx.jit(
+                    qwix_quantize_nnx_model_with_config_and_attn_backend,
+                    static_argnames=(
+                        "mesh",
+                        "head_num",
+                        "head_dim",
+                        "layer_num",
+                        "vocab_size",
+                        "max_seq_len",
+                    ))(
+                    attn_backend=attn_backend,
+                    mesh=mesh,
+                    head_num=model_config.get_total_num_kv_heads_with_replication(mesh.shape["tensor"]),
+                    head_dim=(model_config.head_dim + 127) // 128 * 128,
+                    layer_num=model_config.num_hidden_layers,
+                    vocab_size=model_config.vocab_size,
+                    max_seq_len=4096,
+                    model=model)
+        return model
 
 
 def apply_qwix_on_abstract_model(vllm_config: "VllmConfig") -> bool:
@@ -663,6 +571,7 @@ def generate_model_worker_batch(
             seq_lens=np.array([1] * bs, dtype=np.int32),
             out_cache_loc=np.concat([valid_out_cache_loc, invalid_out_cache_loc], axis=0),
             return_logprob=False,
+            return_output_logprob_only=True,
             sampling_info=(
                 SamplingBatchInfo.generate_for_precompile(bs, vocab_size)
                 if speculative_algotithm is None
