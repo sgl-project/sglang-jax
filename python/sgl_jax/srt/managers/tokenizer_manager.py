@@ -652,6 +652,7 @@ class TokenizerManager:
         await self.send_to_scheduler.send_pyobj(obj)
 
     async def get_internal_state(self) -> list[dict[Any, Any]]:
+        self.auto_create_handle_loop()
         req = GetInternalStateReq()
         responses: list[GetInternalStateReqOutput] = await self.get_internal_state_communicator(req)
         # Many DP ranks
