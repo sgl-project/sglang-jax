@@ -1,6 +1,7 @@
 import glob
 import logging
 import os
+from collections.abc import Mapping
 from dataclasses import dataclass
 
 import jax
@@ -101,14 +102,14 @@ class WeightLoader:
 
     def load_weights_from_safetensors(
         self,
-        weight_mappings: dict[str, str | list[str] | WeightMapping],
+        weight_mappings: Mapping[str, str | list[str] | WeightMapping],
         safetensors_partition=1,
         dummy=False,
     ):
         """Load weights from safetensors files or generate dummy weights.
 
         Args:
-            weight_mappings: Mapping from HF keys to model paths with sharding info
+            weight_mappings: A read-only (covariant) mapping from HF keys to model paths with sharding info(Do not modify this dictionary in place)
             safetensors_partition: Number of safetensors partitions
             dummy: If True, generate random weights instead of loading from files
         """
@@ -452,13 +453,16 @@ class WeightLoader:
         weights_files.sort()
 
         skipped_files = 0
+
+        platform = os.getenv("JAX_PLATFORMS", None)
+        backend = "cpu" if platform != "proxy" else "proxy"
         with tqdm(weights_files, desc="[LOADING] MODEL WEIGHTS", unit="file") as pbar:
             for st_file in pbar:
                 filename = os.path.basename(st_file)
                 pbar.set_postfix({"file": filename})
 
                 with (
-                    jax.default_device(jax.local_devices(backend="cpu")[0]),
+                    jax.default_device(jax.local_devices(backend=backend)[0]),
                     safe_open(st_file, framework="flax") as f,
                 ):
                     needed_keys = []

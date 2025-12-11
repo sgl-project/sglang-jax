@@ -2,7 +2,7 @@ import os
 import unittest
 
 from sgl_jax.srt.entrypoints.engine import Engine
-from sgl_jax.test.test_utils import DEEPSEEK_R1_QWEN_1_5B
+from sgl_jax.test.test_utils import DEEPSEEK_R1_DISTILL_QWEN_1_5B
 
 # JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache python3 -u -m sgl_jax.launch_server --model-path deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B --trust-remote-code --dist-init-addr=0.0.0.0:10011 --nnodes=1 --tp-size=1 --device=tpu --random-seed=27 --node-rank=0 --mem-fraction-static=0.8 --chunked-prefill-size=8192 --download-dir=/tmp --dtype=bfloat16 --precompile-bs-paddings 1 64 --max-running-requests 64 --max-total-tokens 257536 --skip-server-warmup --attention-backend=fa --precompile-token-paddings 8192 --page-size=64 --disable-overlap-schedule --log-requests --log-requests-level=3 --enable-precision-tracer --use-sort-for-toppk-minp
 
@@ -12,7 +12,7 @@ os.environ["JAX_COMPILATION_CACHE_DIR"] = "/tmp/jit_cache"
 print("Running on Google TPU")
 # Default engine configuration
 DEFAULT_ENGINE_CONFIG = {
-    "model_path": DEEPSEEK_R1_QWEN_1_5B,
+    "model_path": DEEPSEEK_R1_DISTILL_QWEN_1_5B,
     "random_seed": 27,
     "device": "tpu",
     "chunked_prefill_size": 8192,
@@ -38,7 +38,7 @@ class TestLogprobsDense(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         """Set up the test class - initialize the engine once for all tests."""
-        print(f"Launching SGLang-Jax Engine with {DEEPSEEK_R1_QWEN_1_5B}...")
+        print(f"Launching SGLang-Jax Engine with {DEEPSEEK_R1_DISTILL_QWEN_1_5B}...")
         cls.engine = Engine(**DEFAULT_ENGINE_CONFIG)
 
     @classmethod
@@ -119,16 +119,16 @@ class TestLogprobsDense(unittest.TestCase):
             [0.0, 11, ","],
             [-0.3515625, 773, " so"],
         ]
-        for i, logprob in enumerate(output_meta["output_token_logprobs"]):
-            self.assertEqual(
-                logprob[0], expected_output_logprobs[i][0], f"{logprob[0]} logprob is invalid"
-            )
-            self.assertEqual(
-                logprob[1], expected_output_logprobs[i][1], f"{logprob[1]} output id is invalid"
-            )
-            self.assertEqual(
-                logprob[2], expected_output_logprobs[i][2], f"{logprob[2]} token is invalid"
-            )
+        self.check_output(output_meta, "output_token_logprobs", expected_output_logprobs)
+
+        output = self.engine.generate(
+            input_ids=input_ids,
+            sampling_params=sampling_params,
+            return_logprob=True,
+        )
+        output_meta = output["meta_info"]
+        self.assertEqual(output_meta["cache_miss_count"], 0, "occur cache_miss")
+        self.check_output(output_meta, "output_token_logprobs", expected_output_logprobs)
 
         sampling_params = {"n": 1, "temperature": 0.6, "top_p": 0.95, "max_new_tokens": 3}
 
@@ -147,16 +147,22 @@ class TestLogprobsDense(unittest.TestCase):
             token_ids_logprob=token_ids_logprob,
         )
         output_meta = output["meta_info"]
-        for i, logprob in enumerate(output_meta["output_token_logprobs"]):
-            self.assertEqual(
-                logprob[0], expected_output_logprobs[i][0], f"{logprob[0]} logprob is invalid"
-            )
-            self.assertEqual(
-                logprob[1], expected_output_logprobs[i][1], f"{logprob[1]} output id is invalid"
-            )
-            self.assertEqual(
-                logprob[2], expected_output_logprobs[i][2], f"{logprob[2]} token is invalid"
-            )
+        self.check_output(output_meta, "output_token_logprobs", expected_output_logprobs)
+
+        output = self.engine.generate(
+            input_ids=input_ids,
+            sampling_params=sampling_params,
+            return_logprob=True,
+        )
+        output_meta = output["meta_info"]
+        self.assertEqual(output_meta["cache_miss_count"], 0, "occur cache_miss")
+        self.check_output(output_meta, "output_token_logprobs", expected_output_logprobs)
+
+    def check_output(self, actual, key, expected):
+        for i, logprob in enumerate(actual[key]):
+            self.assertEqual(logprob[0], expected[i][0], f"{logprob[0]} logprob is invalid")
+            self.assertEqual(logprob[1], expected[i][1], f"{logprob[1]} output id is invalid")
+            self.assertEqual(logprob[2], expected[i][2], f"{logprob[2]} token is invalid")
 
 
 if __name__ == "__main__":

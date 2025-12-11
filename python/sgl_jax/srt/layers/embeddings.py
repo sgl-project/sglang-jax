@@ -37,7 +37,6 @@ class Embed(nnx.Module):
       param_dtype: the dtype of the embedding parameters.
       promote_dtype: the dtype promotion function.
       kernel_axes: the axes of kernel weights.
-      rngs: rng keys.
     """
 
     def __init__(
@@ -47,9 +46,8 @@ class Embed(nnx.Module):
         dtype: jnp.dtype | None = None,
         param_dtype: jnp.dtype = jnp.bfloat16,
         promote_dtype: PromoteDtypeFn = dtypes.promote_dtype,
-        kernel_axes: tuple[str, ...] = (None, "tensor"),
-        rngs: nnx.Rngs = None,
-        mesh: jax.sharding.Mesh = None,
+        kernel_axes: tuple[str | None, ...] = (None, "tensor"),
+        mesh: jax.sharding.Mesh | None = None,
     ):
         """
         Sets up the embedding parameters for the model.
@@ -66,7 +64,6 @@ class Embed(nnx.Module):
                         Controls memory usage and precision of stored weights.
             promote_dtype: Function to handle dtype promotion during mixed-precision
                           computations between query/embedding tensors.
-            rngs: Random number generator state for parameter initialization.
         """
         out_sharding = NamedSharding(mesh, P(*kernel_axes)) if mesh is not None else None
         self.embedding = nnx.Param(
@@ -139,9 +136,8 @@ class ParallelLMHead(Embed):
         dtype: jnp.dtype | None = None,
         param_dtype: jnp.dtype = jnp.bfloat16,
         promote_dtype: PromoteDtypeFn = dtypes.promote_dtype,
-        kernel_axes: tuple[str, ...] = ("tensor", None),
-        rngs: nnx.Rngs = None,
-        mesh: jax.sharding.Mesh = None,
+        kernel_axes: tuple[str | None, ...] = ("tensor", None),
+        mesh: jax.sharding.Mesh | None = None,
         use_bias: bool = False,
     ):
         """
@@ -155,7 +151,6 @@ class ParallelLMHead(Embed):
             param_dtype: Data type for parameter storage (weights and bias).
             promote_dtype: Function to handle dtype promotion during logits computation.
                           Controls how hidden_states and embedding tensors are promoted.
-            rngs: Random number generator for parameter initialization.
             use_bias: Whether to include bias parameters. Note: bias is currently
                      not used in logits computation, reserved for future extension.
         """
@@ -166,7 +161,6 @@ class ParallelLMHead(Embed):
             param_dtype=param_dtype,
             promote_dtype=promote_dtype,
             kernel_axes=kernel_axes,
-            rngs=rngs,
             mesh=mesh,
         )
         if use_bias:

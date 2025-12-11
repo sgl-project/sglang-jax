@@ -100,6 +100,8 @@ class TokenizedGenerateReqInput:
     sampling_params: list[dict] | dict | None = None
     # Whether to return logprobs.
     return_logprob: list[bool] | bool | None = None
+    # Whether to return onutput logprobs only.
+    return_output_logprob_only: bool | None = None
     # If return logprobs, the start location in the prompt for returning logprobs.
     # By default, this value is "-1", which means it will only return logprobs for output tokens.
     logprob_start_len: list[int] | int | None = -1
@@ -146,6 +148,7 @@ class GenerateReqInput:
     stream: bool = False
     is_single: bool = True
     return_logprob: list[bool] | bool | None = None
+    return_output_logprob_only: bool | None = None
     # If return logprobs, the start location in the prompt for returning logprobs.
     logprob_start_len: list[int] | int | None = None
     # If return logprobs, the number of top logprobs to return at each position.

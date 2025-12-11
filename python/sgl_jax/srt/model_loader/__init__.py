@@ -1,6 +1,5 @@
 from typing import Any
 
-import jax
 from jax.sharding import Mesh
 
 from sgl_jax.srt.configs.load_config import LoadConfig
@@ -16,10 +15,9 @@ def get_model(
     *,
     model_config: ModelConfig,
     load_config: LoadConfig,
-    rng: jax.Array,
     mesh: Mesh,
 ) -> Any:
-    loader = get_model_loader(load_config, rng, mesh)
+    loader = get_model_loader(load_config, mesh)
     return loader.load_model(
         model_config=model_config,
     )

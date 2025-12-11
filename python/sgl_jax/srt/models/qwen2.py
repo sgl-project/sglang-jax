@@ -26,10 +26,9 @@ class Qwen2MLP(nnx.Module):
         self,
         hidden_size: int,
         intermediate_size: int,
+        mesh: jax.sharding.Mesh,
         layer_id: int = 0,
-        rngs: nnx.Rngs = None,
         dtype: jnp.dtype = jnp.bfloat16,
-        mesh: jax.sharding.Mesh = None,
     ) -> None:
         self.layer_id = layer_id
 
@@ -39,7 +38,6 @@ class Qwen2MLP(nnx.Module):
             kernel_axes=(None, "tensor"),
             use_bias=False,
             params_dtype=dtype,
-            rngs=rngs,
             mesh=mesh,
         )
 
@@ -49,7 +47,6 @@ class Qwen2MLP(nnx.Module):
             kernel_axes=(None, "tensor"),
             use_bias=False,
             params_dtype=dtype,
-            rngs=rngs,
             mesh=mesh,
         )
 
@@ -59,7 +56,6 @@ class Qwen2MLP(nnx.Module):
             kernel_axes=("tensor", None),
             use_bias=False,
             params_dtype=dtype,
-            rngs=rngs,
             mesh=mesh,
         )
 
@@ -80,13 +76,12 @@ class Qwen2Attention(nnx.Module):
         num_heads: int,
         num_kv_heads: int,
         max_position_embeddings: int,
+        mesh: jax.sharding.Mesh,
         rope_theta: float = 1000000,
         rope_scaling: dict[str, Any] | None = None,
         head_dim: int | None = None,
         layer_id: int = 0,
         dtype: jnp.dtype = jnp.bfloat16,
-        rngs: nnx.Rngs = None,
-        mesh: jax.sharding.Mesh = None,
     ):
         self.layer_id = layer_id
         assert (
@@ -105,7 +100,6 @@ class Qwen2Attention(nnx.Module):
             output_size=num_heads * self.head_dim,
             use_bias=True,
             kernel_axes=(None, "tensor"),
-            rngs=rngs,
             params_dtype=dtype,
             mesh=mesh,
         )
@@ -114,7 +108,6 @@ class Qwen2Attention(nnx.Module):
             output_size=num_kv_heads * self.head_dim,
             use_bias=True,
             kernel_axes=(None, "tensor"),
-            rngs=rngs,
             params_dtype=dtype,
             mesh=mesh,
         )
@@ -123,7 +116,6 @@ class Qwen2Attention(nnx.Module):
             output_size=num_kv_heads * self.head_dim,
             use_bias=True,
             kernel_axes=(None, "tensor"),
-            rngs=rngs,
             params_dtype=dtype,
             mesh=mesh,
         )
@@ -132,7 +124,6 @@ class Qwen2Attention(nnx.Module):
             output_size=hidden_size,
             use_bias=False,
             kernel_axes=("tensor", None),
-            rngs=rngs,
             params_dtype=dtype,
             mesh=mesh,
         )
@@ -179,10 +170,9 @@ class Qwen2DecoderLayer(nnx.Module):
     def __init__(
         self,
         config: PretrainedConfig,
+        mesh: jax.sharding.Mesh,
         layer_id: int = 0,
         dtype: jnp.dtype = jnp.bfloat16,
-        rngs: nnx.Rngs = None,
-        mesh: jax.sharding.Mesh = None,
     ):
         self.layer_id = layer_id
         self.hidden_size = config.hidden_size
@@ -200,7 +190,6 @@ class Qwen2DecoderLayer(nnx.Module):
             head_dim=head_dim,
             layer_id=layer_id,
             dtype=dtype,
-            rngs=rngs,
             mesh=mesh,
         )
 
@@ -209,20 +198,17 @@ class Qwen2DecoderLayer(nnx.Module):
             intermediate_size=config.intermediate_size,
             layer_id=layer_id,
             dtype=dtype,
-            rngs=rngs,
             mesh=mesh,
         )
         self.input_layernorm = RMSNorm(
             config.hidden_size,
             epsilon=config.rms_norm_eps,
             param_dtype=dtype,
-            rngs=rngs,
         )
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size,
             epsilon=config.rms_norm_eps,
             param_dtype=dtype,
-            rngs=rngs,
         )
 
     def __call__(
@@ -261,14 +247,12 @@ class Qwen2Model(nnx.Module):
     def __init__(
         self,
         config: PretrainedConfig,
+        mesh: jax.sharding.Mesh,
         dtype: jnp.dtype = jnp.bfloat16,
-        rngs: nnx.Rngs = None,
-        mesh: jax.sharding.Mesh = None,
     ):
         self.embed_tokens = Embed(
             num_embeddings=config.vocab_size,
             features=config.hidden_size,
-            rngs=rngs,
             dtype=dtype,
             kernel_axes=("tensor", None),
             param_dtype=dtype,
@@ -281,7 +265,6 @@ class Qwen2Model(nnx.Module):
                     config=config,
                     layer_id=i,
                     dtype=dtype,
-                    rngs=rngs,
                     mesh=mesh,
                 )
                 for i in range(config.num_hidden_layers)
@@ -292,7 +275,6 @@ class Qwen2Model(nnx.Module):
             config.hidden_size,
             epsilon=config.rms_norm_eps,
             param_dtype=dtype,
-            rngs=rngs,
         )
 
     def __call__(
@@ -326,15 +308,14 @@ class Qwen2ForCausalLM(nnx.Module):
     def __init__(
         self,
         config: PretrainedConfig,
+        mesh: jax.sharding.Mesh,
         dtype: jnp.dtype = jnp.bfloat16,
-        rngs: nnx.Rngs = None,
-        mesh: jax.sharding.Mesh = None,
     ):
         self.mesh = mesh
         self.config = config
         self.dtype = dtype
         logger.info("Qwen2ForCausalLM config dtype: %s", self.dtype)
-        self.model = Qwen2Model(config, dtype=self.dtype, rngs=rngs, mesh=mesh)
+        self.model = Qwen2Model(config, dtype=self.dtype, mesh=mesh)
         if not getattr(self.config, "tie_word_embeddings", False):
             self.lm_head = ParallelLMHead(
                 config.vocab_size,
@@ -342,13 +323,10 @@ class Qwen2ForCausalLM(nnx.Module):
                 dtype=self.dtype,
                 param_dtype=self.dtype,
                 kernel_axes=("tensor", None),
-                rngs=rngs,
             )
         self.logits_processor = LogitsProcessor(config.vocab_size, mesh=self.mesh)
 
-    def load_weights(self, model_config: ModelConfig, rng_key: jax.Array):
-        self.rng = nnx.Rngs(rng_key)
-
+    def load_weights(self, model_config: ModelConfig):
         loader = WeightLoader(
             model=self,
             model_config=model_config,

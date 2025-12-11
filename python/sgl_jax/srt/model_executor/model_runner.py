@@ -15,7 +15,7 @@ from jax.sharding import PartitionSpec as P
 from sgl_jax.srt.configs.load_config import LoadConfig
 from sgl_jax.srt.configs.model_config import AttentionArch, MockModelConfig, ModelConfig
 from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessorOutput
-from sgl_jax.srt.layers.sampler import Sampler
+from sgl_jax.srt.layers.sampler import Sampler, compute_logprobs
 from sgl_jax.srt.managers.schedule_batch import (
     GLOBAL_SERVER_ARGS_KEYS,
     global_server_args_dict,
@@ -109,7 +109,6 @@ class ModelRunner:
                 load_format=server_args.load_format,
                 download_dir=server_args.download_dir,
             ),
-            rngs=rngs,
             mesh=self.mesh,
         )
 
@@ -191,6 +190,10 @@ class ModelRunner:
             sampler = nnx.merge(sampler_def, model_state)
             return sampler(*args, use_sort_for_toppk_minp=use_sort_for_toppk_minp)
 
+        @partial(jax.jit, static_argnames=["mesh"])
+        def jitted_compute_logprobs(mesh, logits, next_tokens):
+            return compute_logprobs(mesh, logits, next_tokens)
+
         def run_model_wrapper(forward_batch, logits_metadata):
             token_to_kv_pool = self.token_to_kv_pool
 
@@ -212,6 +215,8 @@ class ModelRunner:
             sampler_state_leaves,
             self.use_sort_for_toppk_minp,
         )
+
+        self.jitted_compute_logprobs = partial(jitted_compute_logprobs, self.mesh)
 
     def get_available_device_memory(self):
         distributed = jax.process_count() != 1
@@ -570,6 +575,9 @@ class ModelRunner:
             logits_output,
             sampling_metadata,
         )
+
+    def compute_logprobs(self, logits, token_ids: jax.Array) -> jax.Array:
+        return self.jitted_compute_logprobs(logits, token_ids)
 
     def set_num_token_hybrid(self):
         assert self.sliding_window_size is not None and self.sliding_window_size > 0

@@ -115,10 +115,12 @@ def get_available_device_memory(device, distributed=False, empty_cache=True):
             avail_mem.append(stats["bytes_limit"] - stats["bytes_in_use"])
         avail_mem = jnp.array([min(avail_mem) / (1 << 10)], dtype=jnp.float32)
     elif device == "proxy":
+        devices = jax.devices()
         live_arrays = jax.live_arrays()
         pathways_hbm_used_mem = pathways_hbm_usage_gb(live_arrays, devices)
         avail_mem = jnp.array(
-            [(hbm_limit - hbm_used) for hbm_used, hbm_limit in pathways_hbm_used_mem]
+            [(hbm_limit - hbm_used) / (1 << 10) for hbm_used, hbm_limit in pathways_hbm_used_mem],
+            dtype=jnp.float32,
         )
     elif device in ("gpu", "cuda"):
         if empty_cache:

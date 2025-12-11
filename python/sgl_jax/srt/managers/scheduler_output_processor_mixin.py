@@ -58,6 +58,10 @@ class SchedulerOutputProcessorMixin:
             )
         else:
             # Move next_token_ids and logprobs to cpu
+            if batch.return_output_logprob_only and logits_output.next_token_logprobs is not None:
+                logits_output.next_token_logprobs = jax.device_get(
+                    logits_output.next_token_logprobs
+                ).astype(float)
             if batch.return_logprob:
                 if logits_output.next_token_logprobs is not None:
                     logits_output.next_token_logprobs = jax.device_get(
@@ -103,6 +107,10 @@ class SchedulerOutputProcessorMixin:
                 elif not batch.decoding_reqs or req not in batch.decoding_reqs:
                     # This updates radix so others can match
                     self.tree_cache.cache_unfinished_req(req)
+
+                if req.return_output_logprob_only:
+                    req.output_token_logprobs_val.append(logits_output.next_token_logprobs[i])
+                    req.output_token_logprobs_idx.append(next_token_ids[i])
 
                 if req.return_logprob:
                     assert extend_logprob_start_len_per_req is not None
@@ -168,7 +176,13 @@ class SchedulerOutputProcessorMixin:
 
         self.set_next_batch_sampling_info_done(batch)
 
-        self.stream_output(batch.reqs, batch.return_logprob, skip_stream_req, cache_miss_count)
+        self.stream_output(
+            batch.reqs,
+            batch.return_logprob,
+            batch.return_output_logprob_only,
+            skip_stream_req,
+            cache_miss_count,
+        )
 
         batch.spec_info = result.next_draft_input
 
@@ -223,7 +237,7 @@ class SchedulerOutputProcessorMixin:
             next_token_logprobs = logits_output.next_token_logprobs
         else:
             # spec decoding handles output logprobs inside verify process.
-            if batch.return_logprob:
+            if batch.return_logprob or batch.return_output_logprob_only:
                 next_token_logprobs = jax.device_get(logits_output.next_token_logprobs).astype(
                     float
                 )
@@ -291,6 +305,10 @@ class SchedulerOutputProcessorMixin:
                         precision_tracer.stop_trace()
                 self.tree_cache.cache_finished_req(req)
 
+            if req.return_output_logprob_only:
+                req.output_token_logprobs_val.append(next_token_logprobs[i])
+                req.output_token_logprobs_idx.append(next_token_id)
+
             if req.return_logprob and (
                 batch.spec_algorithm is None or batch.spec_algorithm.is_none()
             ):
@@ -327,7 +345,12 @@ class SchedulerOutputProcessorMixin:
             if req.return_hidden_states and logits_output.hidden_states is not None:
                 req.hidden_states.append(logits_output.hidden_states[i])
         self.set_next_batch_sampling_info_done(batch)
-        self.stream_output(batch.reqs, batch.return_logprob, cache_miss_count=cache_miss_count)
+        self.stream_output(
+            batch.reqs,
+            batch.return_logprob,
+            batch.return_output_logprob_only,
+            cache_miss_count=cache_miss_count,
+        )
         self.token_to_kv_pool_allocator.free_group_end()
 
         self.forward_ct_decode = (self.forward_ct_decode + 1) % (1 << 30)
@@ -495,17 +518,21 @@ class SchedulerOutputProcessorMixin:
         self: Scheduler,
         reqs: list[Req],
         return_logprob: bool,
+        return_output_logprob_only: bool,
         skip_req: Req | None = None,
         cache_miss_count: int = None,
     ):
         """Stream the output to detokenizer."""
         assert self.is_generation
-        self.stream_output_generation(reqs, return_logprob, skip_req, cache_miss_count)
+        self.stream_output_generation(
+            reqs, return_logprob, return_output_logprob_only, skip_req, cache_miss_count
+        )
 
     def stream_output_generation(
         self: Scheduler,
         reqs: list[Req],
         return_logprob: bool,
+        return_output_logprob_only: bool,
         skip_req: Req | None = None,
         cache_miss_count: int = None,
     ):
@@ -540,6 +567,14 @@ class SchedulerOutputProcessorMixin:
             input_token_ids_logprobs_idx = []
             output_token_ids_logprobs_val = []
             output_token_ids_logprobs_idx = []
+        elif return_output_logprob_only:
+            output_token_logprobs_val = []
+            output_token_logprobs_idx = []
+            input_token_logprobs_val = input_token_logprobs_idx = input_top_logprobs_val = (
+                input_top_logprobs_idx
+            ) = output_top_logprobs_val = output_top_logprobs_idx = input_token_ids_logprobs_val = (
+                input_token_ids_logprobs_idx
+            ) = output_token_ids_logprobs_val = output_token_ids_logprobs_idx = None
         else:
             input_token_logprobs_val = input_token_logprobs_idx = output_token_logprobs_val = (
                 output_token_logprobs_idx
@@ -605,6 +640,13 @@ class SchedulerOutputProcessorMixin:
                     spec_verify_ct.append(req.spec_verify_ct)
                     spec_accepted_tokens.append(req.spec_accepted_tokens)
 
+                if req.return_output_logprob_only:
+                    output_token_logprobs_val.append(
+                        req.output_token_logprobs_val[send_output_token_logprobs_offset:]
+                    )
+                    output_token_logprobs_idx.append(
+                        req.output_token_logprobs_idx[send_output_token_logprobs_offset:]
+                    )
                 if return_logprob:
                     if req.return_logprob and not req.input_logprob_sent:
                         input_token_logprobs_val.append(req.input_token_logprobs_val)

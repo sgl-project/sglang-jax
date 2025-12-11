@@ -15,6 +15,7 @@ from types import SimpleNamespace
 
 import jax
 import numpy as np
+import pathwaysutils
 import psutil
 import setproctitle
 import zmq
@@ -219,6 +220,10 @@ class Scheduler(
         # init distribution
         if self.nnodes > 1:
             jax.distributed.initialize(server_args.dist_init_addr, self.nnodes, self.node_rank)
+
+        platform = os.getenv("JAX_PLATFORMS", None)
+        if platform == "proxy":
+            pathwaysutils.initialize()
         self.mesh = create_device_mesh(
             ici_parallelism=[-1, self.tp_size],
             dcn_parallelism=[1, 1],
@@ -495,7 +500,6 @@ class Scheduler(
                         next_batch_sampling_info=self.tp_worker.cur_sampling_info,
                     )
                     with jax.profiler.TraceAnnotation("process_batch_result"):
-
                         self.process_batch_result(tmp_batch, None, batch.launch_done)
 
             if self.last_batch:
@@ -602,6 +606,7 @@ class Scheduler(
             recv_req.input_ids,
             recv_req.sampling_params,
             return_logprob=recv_req.return_logprob,
+            return_output_logprob_only=recv_req.return_output_logprob_only,
             top_logprobs_num=recv_req.top_logprobs_num,
             token_ids_logprob=recv_req.token_ids_logprob,
             stream=recv_req.stream,

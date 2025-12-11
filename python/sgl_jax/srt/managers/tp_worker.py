@@ -351,6 +351,7 @@ class ModelWorker:
             seq_lens=np.array([1] * bs, dtype=np.int32),
             out_cache_loc=np.concat([valid_out_cache_loc, invalid_out_cache_loc], axis=0),
             return_logprob=False,
+            return_output_logprob_only=True,
             sampling_info=(
                 SamplingBatchInfo.generate_for_precompile(bs, self.model_config.vocab_size)
                 if speculative_algotithm is None
@@ -475,11 +476,14 @@ class ModelWorker:
                 self._update_grammar_vocab_mask(model_worker_batch, sampling_metadata)
 
             with jtu.count_pjit_cpp_cache_miss() as count:
-                next_token_ids_device, new_logits_output = self.model_runner.sample(
+                next_token_ids_device, token_logprobs, new_logits_output = self.model_runner.sample(
                     logits_output,
                     sampling_metadata,
                 )
                 cache_miss_count += count()
+            if model_worker_batch.return_output_logprob_only:
+                logprobs = self.model_runner.compute_logprobs(token_logprobs, next_token_ids_device)
+                logits_output.next_token_logprobs = logprobs[: model_worker_batch.real_bs]
         if new_logits_output is not None:
             logits_output = new_logits_output
             if logits_output.next_token_top_logprobs_val is not None:
