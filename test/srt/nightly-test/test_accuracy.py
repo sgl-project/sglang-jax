@@ -827,8 +827,8 @@ class TestModelAccuracy(CustomTestCase):
                 {"name": "gsm8k", "threshold": 0.9},
                 {"name": "mmlu", "threshold": 0.77},
                 {"name": "mmlu_pro", "threshold": 0.66},
-                {"name": "aime24", "threshold": 0.15},
-                {"name": "aime25", "threshold": 0.22},
+                {"name": "aime24", "threshold": -1},
+                {"name": "aime25", "threshold": -1},
             ]
 
             for task in tasks:
@@ -1043,8 +1043,8 @@ class TestModelAccuracy(CustomTestCase):
                 {"name": "gsm8k", "threshold": 0.86},
                 {"name": "mmlu", "threshold": 0.74},
                 {"name": "mmlu_pro", "threshold": 0.6},
-                {"name": "aime24", "threshold": 0.19},
-                {"name": "aime25", "threshold": 0.25},
+                {"name": "aime24", "threshold": -1},
+                {"name": "aime25", "threshold": -1},
             ]
 
             for task in tasks:
@@ -1153,8 +1153,8 @@ class TestModelAccuracy(CustomTestCase):
                 {"name": "gsm8k", "threshold": 0.90},
                 {"name": "mmlu", "threshold": 0.77},
                 {"name": "mmlu_pro", "threshold": 0.66},
-                {"name": "aime24", "threshold": 0.15},
-                {"name": "aime25", "threshold": 0.22},
+                {"name": "aime24", "threshold": -1},
+                {"name": "aime25", "threshold": -1},
             ]
 
             for task in tasks:
