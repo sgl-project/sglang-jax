@@ -101,9 +101,9 @@ class TestEnginePauseContinue(CustomTestCase):
 
     async def _run_test_retract_mode(self):
         """Test pause_generation with retract mode using async."""
-        # Get initial state
-        initial_state = await self._async_get_internal_state()
-        initial_internal = initial_state.internal_state
+        # Get initial state (returns list of dicts, take first one)
+        initial_states = await self._async_get_internal_state()
+        initial_internal = initial_states[0]
         initial_available_tokens = initial_internal["available_kv_tokens"]
 
         # Start multiple long-running requests concurrently
@@ -117,8 +117,8 @@ class TestEnginePauseContinue(CustomTestCase):
         await asyncio.sleep(3)
 
         # Get state before pause
-        state_before = await self._async_get_internal_state()
-        internal_before = state_before.internal_state
+        states_before = await self._async_get_internal_state()
+        internal_before = states_before[0]
 
         # Verify there are requests in running batch
         running_before_pause = internal_before["running_batch_size"]
@@ -142,8 +142,8 @@ class TestEnginePauseContinue(CustomTestCase):
         await asyncio.sleep(0.5)
 
         # Get state after pause
-        state_after = await self._async_get_internal_state()
-        internal_after = state_after.internal_state
+        states_after = await self._async_get_internal_state()
+        internal_after = states_after[0]
 
         # Verify engine is paused
         self.assertTrue(
@@ -210,9 +210,9 @@ class TestEnginePauseContinue(CustomTestCase):
         # Wait a bit for requests to start generating
         await asyncio.sleep(3)
 
-        # Get state before pause
-        state_before = await self._async_get_internal_state()
-        internal_before = state_before.internal_state
+        # Get state before pause (returns list, take first)
+        states_before = await self._async_get_internal_state()
+        internal_before = states_before[0]
 
         # Verify there are requests in running batch
         running_before = internal_before["running_batch_size"]
@@ -230,8 +230,8 @@ class TestEnginePauseContinue(CustomTestCase):
         await asyncio.sleep(0.5)
 
         # Get state after pause
-        state_after = await self._async_get_internal_state()
-        internal_after = state_after.internal_state
+        states_after = await self._async_get_internal_state()
+        internal_after = states_after[0]
 
         # Verify engine is paused
         self.assertTrue(
@@ -298,9 +298,9 @@ class TestEnginePauseContinue(CustomTestCase):
             await self._async_pause_generation(mode=mode)
 
             # Verify paused
-            state = await self._async_get_internal_state()
+            states = await self._async_get_internal_state()
             self.assertTrue(
-                state.internal_state["engine_paused"],
+                states[0]["engine_paused"],
                 f"Cycle {cycle}: engine should be paused",
             )
 
@@ -308,9 +308,9 @@ class TestEnginePauseContinue(CustomTestCase):
             await self._async_continue_generation()
 
             # Verify not paused
-            state = await self._async_get_internal_state()
+            states = await self._async_get_internal_state()
             self.assertFalse(
-                state.internal_state["engine_paused"],
+                states[0]["engine_paused"],
                 f"Cycle {cycle}: engine should not be paused after continue",
             )
 
