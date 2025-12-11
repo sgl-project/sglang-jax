@@ -467,6 +467,7 @@ class ModelWorker:
             launch_done.set()
 
         if skip_sample:
+            new_logits_output = None
             next_token_ids_device = None
         else:
             import jax._src.test_util as jtu

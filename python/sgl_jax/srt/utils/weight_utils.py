@@ -66,11 +66,13 @@ class WeightLoader:
         model_config: ModelConfig,
         mesh: Mesh,
         dtype: jnp.dtype = jnp.bfloat16,
+        is_eagle: bool = False,
     ):
         self.model = model
         self.model_config = model_config
         self.mesh = mesh
         self.dtype = dtype
+        self.is_eagle = is_eagle
         self.dummy_mode = getattr(model_config, "_dummy_mode", False)
 
         self.num_heads = model_config.num_attention_heads
@@ -196,8 +198,10 @@ class WeightLoader:
             else:
                 if self._is_excluded_layer_weight(hf_key):
                     logger.debug("Skipping excluded layer weight: %s", hf_key)
-                else:
+                elif not self.is_eagle:
                     logger.warning("No mapping found for weight: %s", hf_key)
+                else:
+                    pass
 
         if moe_buffer:
             for moe_key in moe_buffer:
