@@ -156,6 +156,7 @@ class Req:
         origin_input_ids: list[int],
         sampling_params: SamplingParams,
         return_logprob: bool = False,
+        return_output_logprob_only: bool = False,
         top_logprobs_num: int = 0,
         token_ids_logprob: list[int] = None,
         stream: bool = False,
@@ -242,6 +243,7 @@ class Req:
 
         # Logprobs (arguments)
         self.return_logprob = return_logprob
+        self.return_output_logprob_only = return_output_logprob_only
         # Start index to compute logprob from.
         self.logprob_start_len = 0
         self.top_logprobs_num = top_logprobs_num
@@ -265,7 +267,7 @@ class Req:
         self.temp_input_token_ids_logprobs_val: list[float] | None = None
         self.temp_input_token_ids_logprobs_idx: list[int] | None = None
 
-        if return_logprob:
+        if return_logprob or return_output_logprob_only:
             # shape: (bs, 1)
             self.output_token_logprobs_val = []
             self.output_token_logprobs_idx = []
@@ -527,6 +529,7 @@ class ScheduleBatch:
 
     # For processing logprobs
     return_logprob: bool = False
+    return_output_logprob_only: bool = False
     top_logprobs_nums: list[int] | None = None
     token_ids_logprobs: list[list[int]] | None = None
 
@@ -581,7 +584,7 @@ class ScheduleBatch:
         mesh: mesh_lib.Mesh = None,
     ):
         return_logprob = any(req.return_logprob for req in reqs)
-
+        return_output_logprob_only = all(req.return_output_logprob_only for req in reqs)
         is_hybrid = False
         if isinstance(token_to_kv_pool_allocator, SWATokenToKVPoolAllocator):
             assert tree_cache is None or isinstance(
@@ -597,6 +600,7 @@ class ScheduleBatch:
             is_hybrid=is_hybrid,
             model_config=model_config,
             return_logprob=return_logprob,
+            return_output_logprob_only=return_output_logprob_only,
             enable_overlap=enable_overlap,
             has_stream=any(req.stream for req in reqs),
             has_grammar=any(req.grammar for req in reqs),
@@ -1030,6 +1034,7 @@ class ScheduleBatch:
             keep_indices = np.array(keep_indices)
         self.output_ids = self.output_ids[keep_indices] if self.output_ids is not None else None
         self.return_logprob = any(req.return_logprob for req in self.reqs)
+        self.return_output_logprob_only = any(req.return_output_logprob_only for req in self.reqs)
         if self.return_logprob:
             self.top_logprobs_nums = [self.top_logprobs_nums[i] for i in keep_indices]
             self.token_ids_logprobs = [self.token_ids_logprobs[i] for i in keep_indices]
@@ -1079,6 +1084,7 @@ class ScheduleBatch:
         self.reqs.extend(other.reqs)
 
         self.return_logprob |= other.return_logprob
+        self.return_output_logprob_only |= other.return_output_logprob_only
         self.has_stream |= other.has_stream
         self.has_grammar |= other.has_grammar
         self.return_hidden_states |= other.return_hidden_states
@@ -1345,6 +1351,7 @@ class ScheduleBatch:
             seq_lens=seq_lens_cpu,
             out_cache_loc=out_cache_loc_cpu,
             return_logprob=self.return_logprob,
+            return_output_logprob_only=self.return_output_logprob_only,
             top_logprobs_nums=self.top_logprobs_nums,
             token_ids_logprobs=self.token_ids_logprobs,
             sampling_info=sampling_info,
@@ -1486,6 +1493,7 @@ class ScheduleBatch:
             seq_lens=seq_lens_cpu,
             out_cache_loc=out_cache_loc_cpu,
             return_logprob=self.return_logprob,
+            return_output_logprob_only=self.return_output_logprob_only,
             top_logprobs_nums=self.top_logprobs_nums,
             token_ids_logprobs=self.token_ids_logprobs,
             sampling_info=self.sampling_info,
@@ -1552,6 +1560,7 @@ class ScheduleBatch:
             forward_mode=self.forward_mode,
             out_cache_loc=self.out_cache_loc,
             return_logprob=self.return_logprob,
+            return_output_logprob_only=self.return_output_logprob_only,
             decoding_reqs=self.decoding_reqs,
             is_prefill_only=self.is_prefill_only,
         )
@@ -1639,6 +1648,7 @@ class ModelWorkerBatch:
 
     # For logprob
     return_logprob: bool
+    return_output_logprob_only: bool
     top_logprobs_nums: list[int] | None
     token_ids_logprobs: list[list[int]] | None
 

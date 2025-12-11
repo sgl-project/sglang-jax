@@ -344,11 +344,22 @@ class TokenizerManager:
             input_ids,
             sampling_params,
             obj.return_logprob,
+            obj.return_output_logprob_only,
             obj.logprob_start_len,
             obj.top_logprobs_num,
             obj.token_ids_logprob,
             obj.stream,
         )
+        # note: When only `return_logprob` is specified, we assume that only the output probability is required.
+        if (
+            tokenized_obj.return_logprob
+            and (obj.logprob_start_len is None or obj.logprob_start_len == -1)
+            and (obj.top_logprobs_num == 0 or obj.top_logprobs_num is None)
+            and obj.token_ids_logprob is None
+        ):
+            tokenized_obj.return_logprob = False
+            obj.return_output_logprob_only = True
+            tokenized_obj.return_output_logprob_only = True
 
         return tokenized_obj
 
@@ -885,7 +896,9 @@ class TokenizerManager:
                 "prompt_tokens": recv_obj.prompt_tokens[i],
             }
 
-            if getattr(state.obj, "return_logprob", False):
+            if getattr(state.obj, "return_logprob", False) or getattr(
+                state.obj, "return_output_logprob_only", False
+            ):
                 self.convert_logprob_style(
                     meta_info,
                     state,
@@ -970,6 +983,19 @@ class TokenizerManager:
         recv_obj: BatchStrOut,
         recv_obj_index: int,
     ):
+        if state.obj.return_output_logprob_only:
+            state.output_token_logprobs_val.extend(
+                recv_obj.output_token_logprobs_val[recv_obj_index]
+            )
+            state.output_token_logprobs_idx.extend(
+                recv_obj.output_token_logprobs_idx[recv_obj_index]
+            )
+            meta_info["output_token_logprobs"] = self.detokenize_logprob_tokens(
+                state.output_token_logprobs_val,
+                state.output_token_logprobs_idx,
+                return_text_in_logprobs,
+            )
+            return
         if recv_obj.input_token_logprobs_val is None:
             return
         if len(recv_obj.input_token_logprobs_val) > 0:
