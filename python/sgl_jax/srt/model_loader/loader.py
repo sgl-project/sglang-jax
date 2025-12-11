@@ -13,6 +13,12 @@ from sgl_jax.srt.configs.model_config import ModelConfig
 from sgl_jax.srt.model_loader.arch import get_model_architecture
 from sgl_jax.srt.utils.common_utils import get_bool_env_var
 
+from qwix._src.core.qarray import QArray
+from qwix._src.providers import ptq
+from sgl_jax.srt.utils.quantization.quantization_utils import quantization_config_file_path_to_dict, qwix_quantize_nnx_model, generate_model_worker_batch, ForwardMode
+import functools
+from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
+
 logger = logging.getLogger(__name__)
 
 
@@ -63,6 +69,7 @@ class JAXModelLoader(BaseModelLoader):
         self,
         *,
         model_config: ModelConfig,
+        attn_backend,
     ) -> Any:
         # prepare model file
         hf_folder = self.download_model(model_config)
@@ -71,7 +78,7 @@ class JAXModelLoader(BaseModelLoader):
         model = self._initialize_model(model_config)
 
         # Load weights
-        jit_model = self._get_model(model, model_config)
+        jit_model = self._get_model(model, model_config, attn_backend)
 
         return jit_model
 
@@ -86,7 +93,7 @@ class JAXModelLoader(BaseModelLoader):
 
         return model_class
 
-    def _get_model(self, model_class: Any, model_config: ModelConfig) -> nnx.Module:
+    def _get_model(self, model_class: Any, model_config: ModelConfig, attn_backend) -> nnx.Module:
         with jax.set_mesh(self.mesh):
             model = nnx.eval_shape(
                 lambda: model_class(
@@ -94,7 +101,43 @@ class JAXModelLoader(BaseModelLoader):
                 )
             )
 
-        model.load_weights(model_config)
+        model.load_weights(model_config, None if self.rng is None else self.rng.default.key.value)
+        
+        # apply the quantization
+        qwix_config = quantization_config_file_path_to_dict(
+            os.path.join("int8_all_modules_w_only.yaml")
+        )
+        qwix_config = qwix_config.get("qwix").get("rules")
+        logging.info("qwix_config: %s", qwix_config)
+        logging.info("type of qwix_config: %s", type(qwix_config))
+        logging.info("attn_backend: %s", attn_backend)
+        
+        bs = 1
+        num_tokens = model_config.vocab_size
+        max_seq_len = 4096
+        model_worker_batch = generate_model_worker_batch(bs, num_tokens, ForwardMode.DECODE, model_config.vocab_size, max_seq_len)
+        qwix_quantize_nnx_model_with_config_and_attn_backend = functools.partial(
+            qwix_quantize_nnx_model, qwix_config=qwix_config, model_worker_batch=model_worker_batch)
+        with jax.set_mesh(self.mesh):
+            model = nnx.jit(
+                    qwix_quantize_nnx_model_with_config_and_attn_backend,
+                    static_argnames=(
+                        "mesh",
+                        "head_num",
+                        "head_dim",
+                        "layer_num",
+                        "vocab_size",
+                        "max_seq_len",
+                    ))(
+                    attn_backend=attn_backend,
+                    mesh=self.mesh,
+                    head_num=model_config.get_total_num_kv_heads_with_replication(self.mesh.shape["tensor"]),
+                    head_dim=(model_config.head_dim + 127) // 128 * 128,
+                    layer_num=model_config.num_hidden_layers,
+                    vocab_size=model_config.vocab_size,
+                    max_seq_len=4096,
+                    model=model)
+        jax.eval_shape(model.init, jax.random.key(0), jax.random.uniform(jax.random.key(0), (8, 16)))['params']
         return model
 
     def _maybe_download_from_modelscope(self, model: str, revision: str | None) -> str | None:
