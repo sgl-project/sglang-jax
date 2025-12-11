@@ -109,6 +109,12 @@ class Engine(EngineBase):
         context = zmq.Context(2)
         self.send_to_rpc = get_zmq_socket(context, zmq.DEALER, self.port_args.rpc_ipc_name, True)
 
+        try:
+            self.loop = asyncio.get_running_loop()
+        except RuntimeError:
+            self.loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(self.loop)
+
     def generate(
         self,
         prompt: list[str] | str | None = None,
@@ -139,11 +145,6 @@ class Engine(EngineBase):
             token_ids_logprob=token_ids_logprob,
             stream=stream,
         )
-        try:
-            loop = asyncio.get_event_loop()
-        except RuntimeError:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
         generator = self.tokenizer_manager.generate_request(obj, None)
 
         if stream:
@@ -151,14 +152,14 @@ class Engine(EngineBase):
             def generator_wrapper():
                 while True:
                     try:
-                        chunk = loop.run_until_complete(generator.__anext__())
+                        chunk = self.loop.run_until_complete(generator.__anext__())
                         yield chunk
                     except StopAsyncIteration:
                         break
 
             return generator_wrapper()
         else:
-            ret = loop.run_until_complete(generator.__anext__())
+            ret = self.loop.run_until_complete(generator.__anext__())
             return ret
 
     async def async_generate(
@@ -207,9 +208,8 @@ class Engine(EngineBase):
         obj = EmbeddingReqInput(
             text=prompt,
         )
-        loop = asyncio.get_event_loop()
         generator = self.tokenizer_manager.generate_request(obj, None)
-        ret = loop.run_until_complete(generator.__anext__())
+        ret = self.loop.run_until_complete(generator.__anext__())
         return ret
 
     async def async_encode(
@@ -237,9 +237,8 @@ class Engine(EngineBase):
         Please refer to `EmbeddingReqInput` for the documentation.
         """
         obj = EmbeddingReqInput(text=prompt, is_cross_encoder_request=True)
-        loop = asyncio.get_event_loop()
         generator = self.tokenizer_manager.generate_request(obj, None)
-        ret = loop.run_until_complete(generator.__anext__())
+        ret = self.loop.run_until_complete(generator.__anext__())
         return ret
 
     def shutdown(self):
@@ -259,8 +258,7 @@ class Engine(EngineBase):
         """
         Descriptioin: requests will be sent to tokenizer manager. It will flush all cache: tree_cache(radix cache), req_to_token_pool, token_to_kv_pool_allocator(free physical cache through allocator)
         """
-        loop = asyncio.get_event_loop()
-        return loop.run_until_complete(self.tokenizer_manager.flush_cache())
+        return self.loop.run_until_complete(self.tokenizer_manager.flush_cache())
 
     def pause_generation(self, mode: str = "retract"):
         """
@@ -269,16 +267,14 @@ class Engine(EngineBase):
         Description: pause in-flight generation, requests will be sent to tokenizer manager
         """
         obj = PauseGenerationReqInput(mode=mode)
-        loop = asyncio.get_event_loop()
-        return loop.run_until_complete(self.tokenizer_manager.pause_generation(obj))
+        return self.loop.run_until_complete(self.tokenizer_manager.pause_generation(obj))
 
     def continue_generation(self):
         """
         Description: continue previous paused generation
         """
         obj = ContinueGenerationReqInput()
-        loop = asyncio.get_event_loop()
-        return loop.run_until_complete(self.tokenizer_manager.continue_generation(obj))
+        return self.loop.run_until_complete(self.tokenizer_manager.continue_generation(obj))
 
     # abort request is sync, therefore do not need event loop
     def abort_request(self, rid: str | None = None, abort_all: bool = False):
@@ -290,16 +286,13 @@ class Engine(EngineBase):
         self.tokenizer_manager.abort_request(rid=rid, abort_all=abort_all)
 
     def start_profile(self):
-        loop = asyncio.get_event_loop()
-        loop.run_until_complete(self.tokenizer_manager.start_profile())
+        self.loop.run_until_complete(self.tokenizer_manager.start_profile())
 
     def stop_profile(self):
-        loop = asyncio.get_event_loop()
-        loop.run_until_complete(self.tokenizer_manager.stop_profile())
+        self.loop.run_until_complete(self.tokenizer_manager.stop_profile())
 
     def get_server_info(self):
-        loop = asyncio.get_event_loop()
-        internal_states = loop.run_until_complete(self.tokenizer_manager.get_internal_state())
+        internal_states = self.loop.run_until_complete(self.tokenizer_manager.get_internal_state())
         return {
             **dataclasses.asdict(self.tokenizer_manager.server_args),
             **self.scheduler_info,
@@ -309,13 +302,15 @@ class Engine(EngineBase):
 
     def release_memory_occupation(self, tags: list[str] | None = None):
         obj = ReleaseMemoryOccupationReqInput(tags=tags)
-        loop = asyncio.get_event_loop()
-        return loop.run_until_complete(self.tokenizer_manager.release_memory_occupation(obj, None))
+        return self.loop.run_until_complete(
+            self.tokenizer_manager.release_memory_occupation(obj, None)
+        )
 
     def resume_memory_occupation(self, tags: list[str] | None = None):
         obj = ResumeMemoryOccupationReqInput(tags=tags)
-        loop = asyncio.get_event_loop()
-        return loop.run_until_complete(self.tokenizer_manager.resume_memory_occupation(obj, None))
+        return self.loop.run_until_complete(
+            self.tokenizer_manager.resume_memory_occupation(obj, None)
+        )
 
     def score(
         self,
@@ -356,8 +351,7 @@ class Engine(EngineBase):
             ValueError: If query is not provided, or if items is not provided,
                       or if token IDs are out of vocabulary, or if logprobs are not available for the specified tokens.
         """
-        loop = asyncio.get_event_loop()
-        return loop.run_until_complete(
+        return self.loop.run_until_complete(
             self.tokenizer_manager.score_request(
                 query=query,
                 items=items,
