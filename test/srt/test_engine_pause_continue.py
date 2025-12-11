@@ -5,9 +5,9 @@ Usage:
 python3 -m unittest test_engine_pause_continue.TestEnginePauseContinue
 """
 
+import threading
 import time
 import unittest
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from sgl_jax.srt.entrypoints.engine import Engine
 from sgl_jax.srt.hf_transformers_utils import get_tokenizer
@@ -71,20 +71,48 @@ class TestEnginePauseContinue(CustomTestCase):
     def tearDownClass(cls):
         cls.engine.shutdown()
 
-    def _run_decode(self, max_new_tokens=1000):
-        """Run a decode request that generates many tokens."""
-        return self.engine.generate(
-            prompt="Write a very long story about a magical forest. Once upon a time, in a land far away,",
-            sampling_params={
-                "temperature": 0,
-                "max_new_tokens": max_new_tokens,
-                "ignore_eos": True,
-            },
-        )
-
     def _get_internal_state(self):
         """Get the internal state of the engine."""
         return self.engine.get_server_info()
+
+    def _start_background_requests(self, num_requests: int, max_new_tokens: int = 2000):
+        """
+        Start multiple requests in background threads.
+        Returns list of (thread, result_holder) tuples.
+        """
+        results = []
+        threads = []
+
+        def run_request(result_holder):
+            try:
+                result = self.engine.generate(
+                    prompt="Write a very long story about a magical forest. Once upon a time, in a land far away,",
+                    sampling_params={
+                        "temperature": 0,
+                        "max_new_tokens": max_new_tokens,
+                        "ignore_eos": True,
+                    },
+                )
+                result_holder["result"] = result
+            except Exception as e:
+                result_holder["error"] = str(e)
+
+        for _ in range(num_requests):
+            result_holder = {}
+            results.append(result_holder)
+            t = threading.Thread(target=run_request, args=(result_holder,))
+            threads.append(t)
+
+        # Start all threads
+        for t in threads:
+            t.start()
+
+        return threads, results
+
+    def _wait_for_threads(self, threads, timeout=120):
+        """Wait for all threads to complete."""
+        for t in threads:
+            t.join(timeout=timeout)
 
     def test_1_pause_generation_retract_mode(self):
         """
@@ -100,11 +128,11 @@ class TestEnginePauseContinue(CustomTestCase):
         initial_internal = initial_state["internal_states"][0]
         initial_available_tokens = initial_internal["available_kv_tokens"]
 
-        # Start multiple long-running requests
+        # Start multiple long-running requests in background threads
         num_requests = 8
-        with ThreadPoolExecutor(num_requests) as executor:
-            futures = [executor.submit(self._run_decode, 2000) for _ in range(num_requests)]
+        threads, results = self._start_background_requests(num_requests, max_new_tokens=2000)
 
+        try:
             # Wait for requests to start generating (in running batch)
             time.sleep(3)
 
@@ -175,25 +203,24 @@ class TestEnginePauseContinue(CustomTestCase):
             # Continue generation (returns None)
             self.engine.continue_generation()
 
+        finally:
             # Wait for all requests to complete
-            results = []
-            for future in as_completed(futures):
-                try:
-                    result = future.result()
-                    results.append(result)
-                except Exception as e:
-                    results.append({"error": str(e)})
+            self._wait_for_threads(threads)
 
-            # Verify all requests completed successfully
-            for result in results:
-                self.assertIn("text", result, f"Request should complete with text output: {result}")
-                # The finish reason should indicate successful completion (length)
-                finish_reason = result.get("meta_info", {}).get("finish_reason", {})
-                self.assertEqual(
-                    finish_reason.get("type"),
-                    "length",
-                    f"Request should finish due to length limit: {result}",
-                )
+        # Verify all requests completed successfully
+        for result_holder in results:
+            self.assertIn(
+                "result", result_holder, f"Request should complete: {result_holder.get('error')}"
+            )
+            result = result_holder["result"]
+            self.assertIn("text", result, f"Request should have text output: {result}")
+            # The finish reason should indicate successful completion (length)
+            finish_reason = result.get("meta_info", {}).get("finish_reason", {})
+            self.assertEqual(
+                finish_reason.get("type"),
+                "length",
+                f"Request should finish due to length limit: {result}",
+            )
 
         print_test_passed("TestEnginePauseContinue.test_1_pause_generation_retract_mode")
 
@@ -206,11 +233,11 @@ class TestEnginePauseContinue(CustomTestCase):
         2. Running batch is NOT changed (requests stay in running batch)
         3. KV cache is NOT cleared (available tokens stay the same)
         """
-        # Start multiple long-running requests
+        # Start multiple long-running requests in background threads
         num_requests = 8
-        with ThreadPoolExecutor(num_requests) as executor:
-            futures = [executor.submit(self._run_decode, 2000) for _ in range(num_requests)]
+        threads, results = self._start_background_requests(num_requests, max_new_tokens=2000)
 
+        try:
             # Wait for requests to start generating (in running batch)
             time.sleep(3)
 
@@ -278,18 +305,17 @@ class TestEnginePauseContinue(CustomTestCase):
             # Continue generation (returns None)
             self.engine.continue_generation()
 
+        finally:
             # Wait for all requests to complete
-            results = []
-            for future in as_completed(futures):
-                try:
-                    result = future.result()
-                    results.append(result)
-                except Exception as e:
-                    results.append({"error": str(e)})
+            self._wait_for_threads(threads)
 
-            # Verify all requests completed successfully
-            for result in results:
-                self.assertIn("text", result, f"Request should complete with text output: {result}")
+        # Verify all requests completed successfully
+        for result_holder in results:
+            self.assertIn(
+                "result", result_holder, f"Request should complete: {result_holder.get('error')}"
+            )
+            result = result_holder["result"]
+            self.assertIn("text", result, f"Request should have text output: {result}")
 
         print_test_passed("TestEnginePauseContinue.test_2_pause_generation_in_place_mode")
 
@@ -302,9 +328,10 @@ class TestEnginePauseContinue(CustomTestCase):
         """
         num_cycles = 3
 
-        with ThreadPoolExecutor(4) as executor:
-            futures = [executor.submit(self._run_decode, 3000) for _ in range(4)]
+        # Start requests in background threads
+        threads, results = self._start_background_requests(4, max_new_tokens=3000)
 
+        try:
             for cycle in range(num_cycles):
                 # Wait for some generation to happen
                 time.sleep(2)
@@ -330,18 +357,19 @@ class TestEnginePauseContinue(CustomTestCase):
                     f"Cycle {cycle}: engine should not be paused after continue",
                 )
 
+        finally:
             # Wait for all requests to complete
-            results = []
-            for future in as_completed(futures):
-                try:
-                    result = future.result(timeout=120)
-                    results.append(result)
-                except Exception as e:
-                    results.append({"error": str(e)})
+            self._wait_for_threads(threads)
 
-            # All requests should complete
-            for i, result in enumerate(results):
-                self.assertIn("text", result, f"Request {i} should complete: {result}")
+        # All requests should complete
+        for i, result_holder in enumerate(results):
+            self.assertIn(
+                "result",
+                result_holder,
+                f"Request {i} should complete: {result_holder.get('error')}",
+            )
+            result = result_holder["result"]
+            self.assertIn("text", result, f"Request {i} should have text output: {result}")
 
         print_test_passed("TestEnginePauseContinue.test_3_pause_continue_multiple_cycles")
 
