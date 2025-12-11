@@ -499,6 +499,9 @@ class EagleDraftInput:
         model_worker_batch.seq_lens = (
             model_worker_batch.seq_lens[: model_worker_batch.real_bs] + batch_output.accept_lens
         )
+        print(f"{batch_output.accept_lens=}")
+        print(f"{verified_id=}")
+
         model_worker_batch.extend_seq_lens = np.asarray(
             [batch_output.accept_lens[i] for i in range(batch_output.accept_lens.shape[0])]
         )
@@ -509,6 +512,11 @@ class EagleDraftInput:
         forward_metadata = draft_model_runner.attn_backend.get_eagle_forward_metadata(
             model_worker_batch
         )
+        print(
+            f"{forward_metadata=} {model_worker_batch.cache_loc[:50]=} {model_worker_batch.spec_info.allocate_lens=}"
+        )
+        print("\n=============\n")
+
         draft_model_runner.attn_backend.forward_metadata = forward_metadata
         from sgl_jax.srt.layers.logits_processor import LogitsMetadata
 

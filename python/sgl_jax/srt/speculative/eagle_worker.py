@@ -130,14 +130,19 @@ class EAGLEWorker(ModelWorker):
                 self.mesh,
                 vocab_size=self.model_config.vocab_size,
             )
+            print(f"1 {model_worker_batch.seq_lens=}")
             # target extend
             logits_output, next_token_ids, cache_miss_count, bid, seq_lens = (
                 self.forward_target_extend(model_worker_batch, sampling_metadata)
             )
+            print(f"2 {model_worker_batch.seq_lens=}")
+
             # draft extend for Update Draft State
             self.draft_extend_for_prefill(
                 model_worker_batch, logits_output.hidden_states, next_token_ids
             )
+            print(f"3 {model_worker_batch.seq_lens=}")
+
             # FIXME(pc) refactor this to batch output
             batch_output = GenerationBatchResult(
                 logits_output=logits_output,
@@ -152,6 +157,8 @@ class EAGLEWorker(ModelWorker):
             return batch_output
 
         else:
+            print(f"4 {model_worker_batch.seq_lens=}")
+
             cur_allocate_lens = model_worker_batch.spec_info.allocate_lens
             self.draft(model_worker_batch)
 
@@ -190,6 +197,7 @@ class EAGLEWorker(ModelWorker):
             verified_id=next_token_ids[: model_worker_batch.real_bs],
             num_tokens_per_batch=np.asarray(1, dtype=jnp.int32),
             num_tokens_for_logprob_per_batch=np.asarray(1, dtype=jnp.int32),
+            allocate_lens=model_worker_batch.seq_lens,
         )
         model_worker_batch.return_hidden_states = False
         model_worker_batch.spec_info.prepare_for_extend_after_target_prefill(
@@ -324,6 +332,7 @@ class EAGLEWorker(ModelWorker):
 
     def verify(self, model_worker_batch: ModelWorkerBatch, cur_allocate_lens: jax.Array):
         spec_info: EagleVerifyInput = model_worker_batch.spec_info
+        spec_info.allocate_lens = cur_allocate_lens
         spec_info.prepare_for_verify(model_worker_batch, self.page_size, self.target_worker)
         model_worker_batch.padding_model_worker_batch(
             self.precompile_token_paddings,
@@ -459,6 +468,7 @@ class EAGLEWorker(ModelWorker):
             return
         draft_input = EagleDraftInput(
             hidden_states=batch_output.logits_output.hidden_states,
+            allocate_lens=batch_output.allocate_lens,
         )
         forward_batch, logits_meatadata = draft_input.prepare_for_extend_after_verify(
             model_worker_batch,
@@ -515,6 +525,8 @@ class EAGLEWorker(ModelWorker):
             spec_info.topk_index,
             spec_info.hidden_states,
         )
+        print(f"{hidden_states[0]=}")
+        print(f"{hidden_states[1]=}")
         if self.hot_token_ids is not None:
             topk_index = self.hot_token_ids[topk_index]
         # if we need custom mask, we should create for all at once and update it within loop
@@ -593,7 +605,7 @@ class EAGLEWorker(ModelWorker):
                 forward_batch, i, input_ids, hidden_states, positions_base
             )
             self.draft_model_runner.attn_backend.forward_metadata = metadata_per_step[i]
-
+            print(f"{self.draft_model_runner.attn_backend.forward_metadata=}")
             # Run forward
             logits_output, _ = self.draft_model_runner.forward(
                 forward_batch,

@@ -167,10 +167,8 @@ class FlashAttention(AttentionBackend):
         """Return the metadata for a forward pass."""
         # below code is for verify and draft extend phase
         metadata = FlashAttentionMetadata()
-
         indices = np.arange(0, len(batch.cache_loc), self.page_size)
         selected_cache_locs = batch.cache_loc[indices]
-
         page_indices = (selected_cache_locs // self.page_size).astype(np.int32)
 
         if batch.forward_mode == ForwardMode.TARGET_VERIFY:
@@ -216,6 +214,43 @@ class FlashAttention(AttentionBackend):
                 np.cumsum(aligned_seq_lens),
             ]
         )
+
+        if batch.forward_mode == ForwardMode.DRAFT_EXTEND:
+            # Reconstruct page_indices properly respecting ragged allocation
+            page_indices_list = []
+            offset = 0
+            allocate_lens = batch.spec_info.allocate_lens
+            # Ensure it's accessible as array
+            if hasattr(allocate_lens, "device"):
+                allocate_lens = jax.device_get(allocate_lens)
+
+            num_pages_per_seq = aligned_seq_lens // self.page_size
+
+            for i in range(batch.real_bs):
+                alloc_len = (
+                    (int(allocate_lens[i]) + self.page_size - 1) // self.page_size
+                ) * self.page_size
+                needed_pages = int(num_pages_per_seq[i])
+
+                if needed_pages > 0:
+                    # Get the slice of cache_loc for this request
+                    # We assume batch.cache_loc is ordered and packed according to allocate_lens
+                    req_cache_loc = batch.cache_loc[offset : offset + alloc_len]
+
+                    # Select the first token of each page
+                    # The tokens are at indices 0, page_size, 2*page_size...
+                    # We need `needed_pages` entries.
+
+                    indices = np.arange(needed_pages) * self.page_size
+                    selected = req_cache_loc[indices]
+                    page_indices_list.extend(selected // self.page_size)
+
+                offset += alloc_len
+
+            page_indices = np.pad(
+                np.array(page_indices_list, dtype=np.int32),
+                (0, page_indices.shape[0] - len(page_indices_list)),
+            )
 
         num_seqs = np.sum(batch.seq_lens > 0, dtype=np.int32).reshape(
             1,
@@ -269,9 +304,10 @@ class FlashAttention(AttentionBackend):
         src_starts = np.concatenate(([0], np.cumsum(alloc_pages)[:-1]))
 
         full_size = len(original_selected_cache_locs)
-
+        seq_lens_list = []
         for speculative_step_id in range(batch.speculative_num_steps):
-            seq_lens += batch.speculative_eagle_topk * (speculative_step_id + 1)
+            seq_lens = batch.seq_lens + (speculative_step_id + 1)
+            seq_lens_list.append(seq_lens)
             aligned_seq_lens = ((seq_lens + self.page_size - 1) // self.page_size) * self.page_size
             cu_kv_lens.append(
                 np.concatenate(
@@ -341,7 +377,14 @@ class FlashAttention(AttentionBackend):
                 metadata_tmp.seq_lens,
                 metadata_tmp.distribution,
             ) = device_array(
-                (num_seqs, cu_q_lens, cu_kv_lens[i], page_indices[i], seq_lens, distribution),
+                (
+                    num_seqs,
+                    cu_q_lens,
+                    cu_kv_lens[i],
+                    page_indices[i],
+                    seq_lens_list[i],
+                    distribution,
+                ),
                 sharding=(NamedSharding(self.mesh, P()) if jax.process_count() == 1 else None),
             )
             metadata.append(metadata_tmp)
