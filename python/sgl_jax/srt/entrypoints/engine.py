@@ -308,7 +308,11 @@ class Engine(EngineBase):
 
     # abort request is sync, therefore do not need event loop
     def abort_request(self, rid: str | None = None, abort_all: bool = False):
-        """Abort a request."""
+        """
+        Description: Abort a request.
+
+        Input: rid is request id, abort_all determines whether abort all requests
+        """
         self.tokenizer_manager.abort_request(rid=rid, abort_all=abort_all)
 
     def start_profile(self):
