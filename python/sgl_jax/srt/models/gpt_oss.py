@@ -567,6 +567,7 @@ class GptOssModel(nnx.Module):
         )
         layers_callback_flag.append(callback_flag)
 
+        return x, None, layers_callback_flag
         for block in self.block:
             x, kv_fused, callback_flag = block(x)
             layers_kv_fused.append(kv_fused)
@@ -597,7 +598,24 @@ class GptOssForCausalLM(nnx.Module):
         pass
 
     def load_weights(self, model_config: ModelConfig):
-        pass
+        loader = WeightLoader(
+            model=self,
+            model_config=model_config,
+            mesh=self.mesh,
+            dtype=self.dtype,
+        )
+        weight_mappings = self._create_llama_weight_mappings()
+        loader.load_weights_from_safetensors(weight_mappings)
+
+    def _create_llama_weight_mappings(self) -> dict:
+        mappings = {
+            "model.embed_tokens.weight": WeightMapping(
+                target_path="model.embedding.embedding",
+                sharding=("tensor", None),
+                transpose=False,
+            ),
+            }
+        return mappings
 
     def __call__(
         self,
