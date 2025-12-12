@@ -509,27 +509,30 @@ class WeightLoader:
                 if isinstance(mapping, (str, list)):
                     mapping = WeightMapping(target_path=mapping)
 
-                # Check for Grok-style TP Split (Multiple files for one key)
                 is_split_weight = len(infos) > 1 and mapping.concat_axis is not None
 
-                # Conditions for fast path
-                # We relax 'not mapping.transpose' restriction because we can transpose the result
                 can_optimize = (
                     isinstance(mapping.target_path, str)
                     and mapping.reshape is None
                     and not mapping.kv_head_padding
+                    and not mapping.head_dim_padding
                     and mapping.sharding is not None
                 )
 
                 if can_optimize:
                     try:
-                        spec = P(*mapping.sharding)
+                        if mapping.transpose and len(mapping.sharding) == 2:
+                            # Swap: (dim0, dim1) -> (dim1, dim0)
+                            sharding_tuple = mapping.sharding[::-1]
+                        else:
+                            sharding_tuple = mapping.sharding
+
+                        spec = P(*sharding_tuple)
                         final_sharding = jax.sharding.NamedSharding(self.mesh, spec)
 
                         lazy_weight = None
 
                         if is_split_weight:
-                            # For tp split tensor
                             lazy_weight = self._create_split_lazy_tensor(
                                 hf_key,
                                 infos,
@@ -569,7 +572,7 @@ class WeightLoader:
                             mode_str,
                             lazy_weight.shape,
                         )
-                        continue  # Done, skip fallback
+                        continue
 
                     except Exception as e:
                         logger.warning(
@@ -584,12 +587,7 @@ class WeightLoader:
                     target_sharding=None,
                 )
 
-                # If split weight fallback, we handle it in _process_and_assign_weight or custom logic
-                # But _process_and_assign_weight mainly handles single array logic unless specialized.
-                # For safety, if it's a simple split weight that failed fast path, we stitch it here manually
-                # to mimic the old behavior if necessary.
                 if len(lazy_arrays) > 1 and mapping.concat_axis is not None:
-                    # Manual concat for fallback path
                     lazy_weight = jnp.concatenate(lazy_arrays, axis=mapping.concat_axis)
                 else:
                     lazy_weight = lazy_arrays[0]
