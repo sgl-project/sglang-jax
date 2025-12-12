@@ -21,63 +21,63 @@ logger = logging.getLogger(__name__)
 
 init_fn = nnx.initializers.uniform()
 
-import dataclasses
+# import dataclasses
 import math
-from functools import partial
+# from functools import partial
 from typing import Tuple
 
 import jax
 from flax import nnx
-from jax import P
+# from jax import P
 from jax import numpy as jnp
 from jaxtyping import Array, ArrayLike
 
 
 
-@dataclasses.dataclass(frozen=True)
-class ModelConfig:
-    num_hidden_layers: int
-    num_experts: int
-    experts_per_token: int
-    vocab_size: int
-    hidden_size: int
-    intermediate_size: int
-    swiglu_limit: float
-    head_dim: int
-    num_attention_heads: int
-    num_key_value_heads: int
-    sliding_window: int
-    initial_context_length: int
-    rope_theta: float
-    rope_scaling_factor: float
-    rope_ntk_alpha: float
-    rope_ntk_beta: float
+# @dataclasses.dataclass(frozen=True)
+# class ModelConfig:
+#     num_hidden_layers: int
+#     num_experts: int
+#     experts_per_token: int
+#     vocab_size: int
+#     hidden_size: int
+#     intermediate_size: int
+#     swiglu_limit: float
+#     head_dim: int
+#     num_attention_heads: int
+#     num_key_value_heads: int
+#     sliding_window: int
+#     initial_context_length: int
+#     rope_theta: float
+#     rope_scaling_factor: float
+#     rope_ntk_alpha: float
+#     rope_ntk_beta: float
 
-    @classmethod
-    def _from_param(cls, **kwargs):
-        return cls(**kwargs)
+#     @classmethod
+#     def _from_param(cls, **kwargs):
+#         return cls(**kwargs)
 
-    @classmethod
-    def default(cls):
-        """Default OSS model configuration."""
-        return cls._from_param(
-            num_hidden_layers=36,
-            num_experts=128,
-            experts_per_token=4,
-            vocab_size=201088,
-            hidden_size=2880,
-            intermediate_size=2880,
-            swiglu_limit=7.0,
-            head_dim=64,
-            num_attention_heads=64,
-            num_key_value_heads=8,
-            sliding_window=128,
-            initial_context_length=4096,
-            rope_theta=150000.0,
-            rope_scaling_factor=32.0,
-            rope_ntk_alpha=1.0,
-            rope_ntk_beta=32.0,
-        )
+#     @classmethod
+#     def default(cls):
+#         """Default OSS model configuration."""
+#         return cls._from_param(
+#             num_hidden_layers=36,
+#             num_experts=128,
+#             experts_per_token=4,
+#             vocab_size=201088,
+#             hidden_size=2880,
+#             intermediate_size=2880,
+#             swiglu_limit=7.0,
+#             head_dim=64,
+#             num_attention_heads=64,
+#             num_key_value_heads=8,
+#             sliding_window=128,
+#             initial_context_length=4096,
+#             rope_theta=150000.0,
+#             rope_scaling_factor=32.0,
+#             rope_ntk_alpha=1.0,
+#             rope_ntk_beta=32.0,
+#         )
 
 
 
@@ -286,7 +286,7 @@ class AttentionBlock(nnx.Module):
 
     def __call__(self, x: Array) -> Array:
         t = self.norm(x)
-        qkv = self.qkv(t)
+        qkv, _ = self.qkv(t)
 
         # Split QKV
         # qkv shape: [batch, seq_len, qkv_dim]
@@ -491,9 +491,20 @@ class TransformerBlock(nnx.Module):
         self.mlp = MLPBlock(config, mesh, dtype)
 
     def __call__(self, x: Array) -> Array:
+        layer_callback_flag = []
         x = self.attn(x)
+        attn_callback_flag = precision_tracer.jit_pure_callback_record(
+            x, "self_attn_output", "SELF_ATTN", self.layer_idx
+        )
+        layer_callback_flag.append(attn_callback_flag)
+        
         x = self.mlp(x)
-        return x
+        mlp_callback_flag = precision_tracer.jit_pure_callback_record(
+            x, "mlp_output", "MLP", self.layer_idx
+        )
+        layer_callback_flag.append(mlp_callback_flag)
+        kv_fused = None
+        return x, kv_fused, layer_callback_flag
 
 
 class GptOssModel(nnx.Module):
@@ -513,9 +524,12 @@ class GptOssModel(nnx.Module):
             num_embeddings=config.vocab_size,
             features=config.hidden_size,
             dtype=dtype,
+            kernel_axes=("tensor", None),
+            param_dtype=dtype,
+            mesh=mesh,
         )
 
-        self.block = nnx.List(
+        self.block = nnx.data(
             [TransformerBlock(config, mesh, layer_idx, dtype)
              for layer_idx in range(config.num_hidden_layers)]
         )
@@ -538,21 +552,34 @@ class GptOssModel(nnx.Module):
             params_dtype=dtype,
             kernel_axes=(None, "tensor"))
 
-    def __call__(self, x: Array) -> Array:
-        # Access embedding value using .at[].get() pattern (same as qwen3)
-        # Handle both actual arrays and ShapeDtypeStruct (during shape inference)
-        embedding_value = self.embedding.embedding.value
-        if hasattr(embedding_value, 'at'):
-            x = embedding_value.at[(x,)].get()
-        else:
-            # If embedding.value is still ShapeDtypeStruct, try direct call
-            # This should work if embedding was properly initialized
-            x = self.embedding(x)
+    def __call__(
+        self,
+        forward_batch: ForwardBatch,
+        token_to_kv_pool: KVCache
+    ):
+        layers_kv_fused = []
+        layers_callback_flag = []
+
+        x = self.embedding(forward_batch.input_ids)
+
+        callback_flag = precision_tracer.jit_pure_callback_record(
+            x, "embedding", "EMBEDDING"
+        )
+        layers_callback_flag.append(callback_flag)
+
         for block in self.block:
-            x = block(x)
+            x, kv_fused, callback_flag = block(x)
+            layers_kv_fused.append(kv_fused)
+            layers_callback_flag.extend(callback_flag)
+
         x = self.norm(x)
         x = self.unembedding(x)
-        return x
+
+        callback_flag = precision_tracer.jit_pure_callback_record(
+            x, "transformer_output", "TRANSFORMER"
+        )
+        layers_callback_flag.append(callback_flag)
+        return x, layers_kv_fused, layers_callback_flag
 
 
 class GptOssForCausalLM(nnx.Module):
@@ -578,7 +605,8 @@ class GptOssForCausalLM(nnx.Module):
         token_to_kv_pool: KVCache,
         logits_metadata: LogitsMetadata,
     ):
-        raise NotImplementedError
+        x, layers_kv_fused, layers_callback_flag = self.model(forward_batch, token_to_kv_pool)
+        return x, layers_kv_fused, layers_callback_flag
 
 
 EntryClass = GptOssForCausalLM
