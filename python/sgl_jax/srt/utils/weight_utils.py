@@ -28,6 +28,9 @@ class WeightMapping:
     kv_head_padding: bool = False
     concat_axis: int | None = None
     is_eagle3: bool = False
+    # MoE weight fusion configuration
+    fuse_moe_weights: bool = False
+    fuse_gate_up: tuple[str, str] | None = None
 
     def __post_init__(self):
         if self.sharding is None:
@@ -159,36 +162,92 @@ class WeightLoader:
                 for moe_key, mapping in moe_mappings.items():
                     expected_hf_keys = mapping.target_path[1:]  # list of expected HF keys
                     if hf_key in expected_hf_keys:
-                        if moe_key not in moe_buffer:
-                            moe_buffer[moe_key] = {}
-                        if hf_key not in moe_buffer[moe_key]:
-                            moe_buffer[moe_key][hf_key] = []
-                        moe_buffer[moe_key][hf_key].append(hf_weight)
-                        assigned = True
-
-                        if len(moe_buffer[moe_key]) == len(expected_hf_keys):
-                            shard_counts = [len(v) for v in moe_buffer[moe_key].values()]
-                            # Validate all weights have consistent shard counts
-                            if len(set(shard_counts)) != 1:
+                        if mapping.fuse_moe_weights:
+                            # Fused MoE Logic
+                            gate_id, up_id = mapping.fuse_gate_up
+                            if gate_id in hf_key:
+                                group_type = "gate"
+                            elif up_id in hf_key:
+                                group_type = "up"
+                            else:
+                                logger.warning(
+                                    "Fused key %s matches neither %s nor %s",
+                                    hf_key,
+                                    gate_id,
+                                    up_id,
+                                )
                                 continue
 
-                            # Auto-detect TP sharding:
-                            # - Grok-2: concat_axis is set, needs multiple shards (e.g., 8)
-                            if mapping.concat_axis is not None:
-                                # TP-sharded weights: need to collect all TP shards
-                                # Expected number of shards = total model files / experts per file
-                                if shard_counts[0] < safetensors_partition:
-                                    # Still collecting shards, wait for more
-                                    continue
-                            else:
-                                # Non-TP-sharded weights: expect exactly 1 copy per expert
-                                if shard_counts[0] != 1:
+                            if moe_key not in moe_buffer:
+                                moe_buffer[moe_key] = {"gate": {}, "up": {}}
+
+                            if hf_key not in moe_buffer[moe_key][group_type]:
+                                moe_buffer[moe_key][group_type][hf_key] = []
+
+                            moe_buffer[moe_key][group_type][hf_key].append(hf_weight)
+                            assigned = True
+
+                            # Check if we have all necessary weights
+                            total_captured = len(moe_buffer[moe_key]["gate"]) + len(
+                                moe_buffer[moe_key]["up"]
+                            )
+
+                            if total_captured == len(expected_hf_keys):
+                                # Validate shard counts for ALL weights
+                                all_shard_counts = []
+                                for g_type in ["gate", "up"]:
+                                    for w_list in moe_buffer[moe_key][g_type].values():
+                                        all_shard_counts.append(len(w_list))
+
+                                if not all_shard_counts:  # Should not happen if total_captured > 0
                                     continue
 
-                            self._process_single_moe_group(
-                                params, moe_key, mapping, moe_buffer[moe_key]
-                            )
-                            del moe_buffer[moe_key]  # free memory
+                                if len(set(all_shard_counts)) != 1:
+                                    continue
+
+                                if mapping.concat_axis is not None:
+                                    if all_shard_counts[0] < safetensors_partition:
+                                        continue
+                                elif all_shard_counts[0] != 1:
+                                    continue
+
+                                self._process_fused_moe_group(
+                                    params, moe_key, mapping, moe_buffer[moe_key]
+                                )
+                                del moe_buffer[moe_key]
+
+                        else:
+                            # Regular (Non-Fused) MoE Logic
+                            if moe_key not in moe_buffer:
+                                moe_buffer[moe_key] = {}
+                            if hf_key not in moe_buffer[moe_key]:
+                                moe_buffer[moe_key][hf_key] = []
+                            moe_buffer[moe_key][hf_key].append(hf_weight)
+                            assigned = True
+
+                            if len(moe_buffer[moe_key]) == len(expected_hf_keys):
+                                shard_counts = [len(v) for v in moe_buffer[moe_key].values()]
+                                # Validate all weights have consistent shard counts
+                                if len(set(shard_counts)) != 1:
+                                    continue
+
+                                # Auto-detect TP sharding:
+                                # - Grok-2: concat_axis is set, needs multiple shards (e.g., 8)
+                                if mapping.concat_axis is not None:
+                                    # TP-sharded weights: need to collect all TP shards
+                                    # Expected number of shards = total model files / experts per file
+                                    if shard_counts[0] < safetensors_partition:
+                                        # Still collecting shards, wait for more
+                                        continue
+                                else:
+                                    # Non-TP-sharded weights: expect exactly 1 copy per expert
+                                    if shard_counts[0] != 1:
+                                        continue
+
+                                self._process_single_moe_group(
+                                    params, moe_key, mapping, moe_buffer[moe_key]
+                                )
+                                del moe_buffer[moe_key]  # free memory
                         break
 
                 if not assigned:
@@ -203,10 +262,24 @@ class WeightLoader:
             for moe_key in moe_buffer:
                 mapping = moe_mappings[moe_key]
                 expected = len(mapping.target_path[1:])
-                got = len(moe_buffer[moe_key])
-                shard_counts = (
-                    [len(v) for v in moe_buffer[moe_key].values()] if moe_buffer[moe_key] else []
-                )
+
+                if mapping.fuse_moe_weights:
+                    got_gate = len(moe_buffer[moe_key].get("gate", {}))
+                    got_up = len(moe_buffer[moe_key].get("up", {}))
+                    got = got_gate + got_up
+                    shard_counts = []
+                    if "gate" in moe_buffer[moe_key]:
+                        shard_counts.extend([len(v) for v in moe_buffer[moe_key]["gate"].values()])
+                    if "up" in moe_buffer[moe_key]:
+                        shard_counts.extend([len(v) for v in moe_buffer[moe_key]["up"].values()])
+                else:
+                    got = len(moe_buffer[moe_key])
+                    shard_counts = (
+                        [len(v) for v in moe_buffer[moe_key].values()]
+                        if moe_buffer[moe_key]
+                        else []
+                    )
+
                 logger.error(
                     "MoE group %s incomplete: %s/%s weights loaded, shard_counts=%s, concat_axis=%s",
                     moe_key,
@@ -218,6 +291,9 @@ class WeightLoader:
             raise RuntimeError("Incomplete MoE expert weights detected.")
 
         nnx.update(self.model, params)
+
+        # Final verification: check all fused MoE layers
+        self._verify_fused_moe_weights(params, moe_mappings)
 
     def _process_single_moe_group(
         self,
@@ -263,6 +339,116 @@ class WeightLoader:
         model_param.value = sharded_weight.astype(model_param.value.dtype)
 
         logger.debug("Assigned MoE group %s, shape: %s", moe_key, stacked_weight.shape)
+
+    def _process_fused_moe_group(
+        self,
+        params: nnx.State,
+        moe_key: str,
+        mapping: WeightMapping,
+        grouped_weights: dict[str, dict[str, list[jax.Array]]],
+    ):
+        """
+        Process fused MoE weight groups (gate + up weights).
+
+        Args:
+            params: Model parameter state
+            moe_key: MoE weight key (e.g., "__MOE_EXPERTS__model.layers.0.block_sparse_moe.experts.w1")
+            mapping: Weight mapping configuration
+            grouped_weights: Grouped weights dict
+                {
+                    "gate": {hf_key: [weight_shard1, weight_shard2, ...]},
+                    "up": {hf_key: [weight_shard1, weight_shard2, ...]}
+                }
+        """
+        target_path = mapping.target_path[0]
+        expected_hf_keys = mapping.target_path[1:]
+
+        # Step 1: Process gate and up weights separately
+        # Use the predefined order from expected_hf_keys, not sorting
+        gate_weights = []
+        up_weights = []
+
+        gate_id, up_id = mapping.fuse_gate_up
+
+        # Separate expected keys into gate and up based on fuse_gate_up config
+        for hf_key in expected_hf_keys:
+            if gate_id in hf_key:
+                # This is a gate weight
+                weights = grouped_weights["gate"][hf_key]
+
+                # Concatenate TP shards
+                if mapping.concat_axis is not None and len(weights) > 1:
+                    weight = jnp.concatenate(weights, axis=mapping.concat_axis)
+                else:
+                    weight = weights[0]
+
+                # Transpose
+                if mapping.transpose:
+                    weight = jnp.transpose(weight, (1, 0))
+
+                gate_weights.append(weight)
+
+            elif up_id in hf_key:
+                # This is an up weight
+                weights = grouped_weights["up"][hf_key]
+
+                # Concatenate TP shards
+                if mapping.concat_axis is not None and len(weights) > 1:
+                    weight = jnp.concatenate(weights, axis=mapping.concat_axis)
+                else:
+                    weight = weights[0]
+
+                # Transpose
+                if mapping.transpose:
+                    weight = jnp.transpose(weight, (1, 0))
+
+                up_weights.append(weight)
+
+        # Step 2: Stack to 3D tensors
+        # gate_stacked: (num_experts, hidden_size, intermediate_size)
+        # up_stacked: (num_experts, hidden_size, intermediate_size)
+        gate_stacked = jnp.stack(gate_weights, axis=0)
+        up_stacked = jnp.stack(up_weights, axis=0)
+
+        # Step 3: Fuse to 4D tensor
+        # fused_weight: (num_experts, 2, hidden_size, intermediate_size)
+        fused_weight = jnp.stack([gate_stacked, up_stacked], axis=1)
+
+        # Step 4: Apply sharding
+        if "expert" in mapping.sharding:
+            ep_size = getattr(self.model_config.hf_config, "ep_size", 1)
+            world_size = self.mesh.shape.get("data", 1) * self.mesh.shape.get("tensor", 1)
+            tp_size = world_size // ep_size
+
+            devices = self.mesh.devices.flatten()
+            moe_mesh = jax.sharding.Mesh(
+                devices.reshape(ep_size, tp_size), axis_names=("expert", "tensor")
+            )
+
+            sharded_weight = self._shard_weight(fused_weight, mapping.sharding, mesh=moe_mesh)
+        else:
+            sharded_weight = self._shard_weight(fused_weight, mapping.sharding)
+
+        # Step 5: Assign to model parameter
+        model_param = self._get_param(params, target_path)
+        original_dtype = model_param.value.dtype
+        expected_shape = model_param.value.shape
+
+        # Validate shape before assignment
+        if fused_weight.shape != expected_shape:
+            raise ValueError(
+                f"Fused MoE weight shape mismatch for {target_path}: "
+                f"expected {expected_shape}, got {fused_weight.shape}"
+            )
+
+        model_param.value = sharded_weight.astype(original_dtype)
+
+        # Verify assignment was successful
+        actual_shape = model_param.value.shape
+        if actual_shape != expected_shape:
+            raise RuntimeError(
+                f"Failed to assign fused MoE weight to {target_path}: shape mismatch"
+            )
 
     def _load_dummy_weights(
         self,
@@ -841,3 +1027,72 @@ class WeightLoader:
 
         layer_num = int(parts[2])
         return layer_num >= self.model_config.num_hidden_layers
+
+    def _verify_fused_moe_weights(
+        self, params: nnx.State, moe_mappings: dict[str, WeightMapping]
+    ) -> None:
+        """Verify that all fused MoE weights were loaded correctly."""
+        # Get all fused w1 mappings
+        fused_w1_mappings = {
+            k: v for k, v in moe_mappings.items() if getattr(v, "fuse_moe_weights", False)
+        }
+
+        # Get corresponding w2 mappings (same layer, but w2 instead of w1)
+        w2_mappings = {}
+        for k in fused_w1_mappings:
+            w2_key = k.replace(".w1", ".w2")
+            if w2_key in moe_mappings:
+                w2_mappings[w2_key] = moe_mappings[w2_key]
+
+        if not fused_w1_mappings:
+            return
+
+        all_verified = True
+        verified_count = 0
+
+        # Verify w1 and w2 weights
+        for _, mapping in fused_w1_mappings.items():
+            target_path = mapping.target_path[0]
+            try:
+                model_param = self._get_param(params, target_path)
+                weight_shape = model_param.value.shape
+                weight_values = model_param.value
+
+                if (
+                    len(weight_shape) != 4
+                    or weight_shape[1] != 2
+                    or jnp.all(weight_values == 0)
+                    or jnp.any(jnp.isnan(weight_values))
+                ):
+                    logger.error("✗ %s: Invalid or corrupted weights", target_path)
+                    all_verified = False
+                else:
+                    verified_count += 1
+            except (KeyError, AttributeError, ValueError) as e:
+                logger.error("✗ %s: Failed to access - %s", target_path, str(e))
+                all_verified = False
+
+        for _, mapping in w2_mappings.items():
+            target_path = mapping.target_path[0]
+            try:
+                model_param = self._get_param(params, target_path)
+                weight_shape = model_param.value.shape
+                weight_values = model_param.value
+
+                if (
+                    len(weight_shape) != 3
+                    or jnp.all(weight_values == 0)
+                    or jnp.any(jnp.isnan(weight_values))
+                ):
+                    logger.error("✗ %s (w2): Invalid or corrupted weights", target_path)
+                    all_verified = False
+                else:
+                    verified_count += 1
+            except (KeyError, AttributeError, ValueError) as e:
+                logger.error("✗ %s (w2): Failed to access - %s", target_path, str(e))
+                all_verified = False
+
+        if all_verified:
+            logger.info("✓ Fused MoE weights verified: %d layers", verified_count // 2)
+        else:
+            raise RuntimeError("Fused MoE weight verification failed")

@@ -5,10 +5,13 @@ This script launches a server and uses the HTTP interface.
 It accepts server arguments (the same as launch_server.py) and benchmark arguments (e.g., batch size, input lengths).
 
 Usage:
-python3 -m sglang.bench_one_batch_server --model meta-llama/Meta-Llama-3.1-8B --batch-size 1 16 64 --input-len 1024 --output-len 8
+python3 -m sgl_jax.bench_one_batch_server --model meta-llama/Meta-Llama-3.1-8B --batch-size 1 16 64 --input-len 1024 --output-len 8
 
-python3 -m sglang.bench_one_batch_server --model None --base-url http://localhost:30000 --batch-size 16 --input-len 1024 --output-len 8
-python3 -m sglang.bench_one_batch_server --model None --base-url http://localhost:30000 --batch-size 16 --input-len 1024 --output-len 8 --show-report --profile --profile-by-stage
+python3 -m sgl_jax.bench_one_batch_server --model None --base-url http://localhost:30000 --batch-size 16 --input-len 1024 --output-len 8
+python3 -m sgl_jax.bench_one_batch_server --model None --base-url http://localhost:30000 --batch-size 16 --input-len 1024 --output-len 8 --show-report --profile --profile-by-stage
+
+# Use OpenAI-compatible API:
+python3 -m sgl_jax.bench_one_batch_server --model None --base-url http://localhost:30000 --batch-size 16 --input-len 1024 --output-len 8 --api-type openai
 """
 
 import argparse
@@ -45,6 +48,7 @@ class BenchArgs:
     show_report: bool = False
     profile: bool = False
     profile_by_stage: bool = False
+    api_type: str = "native"  # "native" or "openai"
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
@@ -70,6 +74,13 @@ class BenchArgs:
         parser.add_argument("--show-report", action="store_true")
         parser.add_argument("--profile", action="store_true")
         parser.add_argument("--profile-by-stage", action="store_true")
+        parser.add_argument(
+            "--api-type",
+            type=str,
+            default=BenchArgs.api_type,
+            choices=["native", "openai"],
+            help="API type to use: 'native' for /generate or 'openai' for /v1/completions",
+        )
 
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace):
@@ -122,8 +133,12 @@ def run_one_case(
     tokenizer,
     profile: bool = False,
     profile_by_stage: bool = False,
+    api_type: str = "native",
 ):
     requests.post(url + "/flush_cache")
+
+    # Determine whether to use text or input_ids based on API type
+    return_text = api_type == "openai"
     input_requests = sample_random_requests(
         input_len=input_len,
         output_len=output_len,
@@ -132,7 +147,7 @@ def run_one_case(
         tokenizer=tokenizer,
         dataset_path="",
         random_sample=True,
-        return_text=False,
+        return_text=return_text,
     )
 
     use_structured_outputs = False
@@ -153,40 +168,96 @@ def run_one_case(
         profile_link: str = run_profile(url, 3, ["CPU", "GPU"], None, None, profile_by_stage)
 
     tic = time.perf_counter()
-    response = requests.post(
-        url + "/generate",
-        json={
-            "input_ids": [req.prompt for req in input_requests],
-            "sampling_params": {
+
+    if api_type == "openai":
+        # Use OpenAI API - send requests as a batch with n parameter
+        # Convert prompts to a single request with n > 1 if batch_size > 1
+        if batch_size == 1:
+            request_data = {
+                "model": "default",
+                "prompt": input_requests[0].prompt,
+                "max_tokens": output_len,
                 "temperature": temperature,
-                "max_new_tokens": output_len,
-                "ignore_eos": True,
-                "json_schema": json_schema,
-                "stream_interval": stream_interval,
+                "logprobs": 1 if return_logprob else None,
+                "stream": True,
+            }
+        else:
+            # For batch, we'll send the first prompt with n=batch_size
+            # Note: This assumes all prompts should be the same, which may not be ideal
+            # For different prompts, we'd need to send separate requests
+            request_data = {
+                "model": "default",
+                "prompt": [req.prompt for req in input_requests],
+                "max_tokens": output_len,
+                "temperature": temperature,
+                "logprobs": 1 if return_logprob else None,
+                "stream": True,
+            }
+
+        response = requests.post(
+            url + "/v1/completions",
+            json=request_data,
+            stream=True,
+        )
+
+        # Parse OpenAI streaming response
+        ttft = 0.0
+        first_token_received = False
+        total_chunks = 0
+        for chunk in response.iter_lines(decode_unicode=False):
+            chunk = chunk.decode("utf-8")
+            if chunk and chunk.startswith("data:"):
+                if chunk == "data: [DONE]":
+                    break
+                data = json.loads(chunk[5:].strip("\n"))
+                if "error" in data:
+                    raise RuntimeError(f"Request has failed. {data}.")
+
+                # Track first token time (across all choices in batch)
+                if data.get("choices") and len(data["choices"]) > 0:
+                    # Check if any choice has generated text
+                    for choice in data["choices"]:
+                        if choice.get("text") and not first_token_received:
+                            ttft = time.perf_counter() - tic
+                            first_token_received = True
+                            break
+                    total_chunks += 1
+    else:
+        # Use native API
+        response = requests.post(
+            url + "/generate",
+            json={
+                "input_ids": [req.prompt for req in input_requests],
+                "sampling_params": {
+                    "temperature": temperature,
+                    "max_new_tokens": output_len,
+                    "ignore_eos": True,
+                    "json_schema": json_schema,
+                    "stream_interval": stream_interval,
+                },
+                "return_logprob": return_logprob,
+                "stream": True,
             },
-            "return_logprob": return_logprob,
-            "stream": True,
-        },
-        stream=True,
-    )
+            stream=True,
+        )
 
-    # The TTFT of the last request in the batch
-    ttft = 0.0
-    for chunk in response.iter_lines(decode_unicode=False):
-        chunk = chunk.decode("utf-8")
-        if chunk and chunk.startswith("data:"):
-            if chunk == "data: [DONE]":
-                break
-            data = json.loads(chunk[5:].strip("\n"))
-            if "error" in data:
-                raise RuntimeError(f"Request has failed. {data}.")
+        # The TTFT of the last request in the batch
+        ttft = 0.0
+        for chunk in response.iter_lines(decode_unicode=False):
+            chunk = chunk.decode("utf-8")
+            if chunk and chunk.startswith("data:"):
+                if chunk == "data: [DONE]":
+                    break
+                data = json.loads(chunk[5:].strip("\n"))
+                if "error" in data:
+                    raise RuntimeError(f"Request has failed. {data}.")
 
-            assert (
-                data["meta_info"]["finish_reason"] is None
-                or data["meta_info"]["finish_reason"]["type"] == "length"
-            )
-            if data["meta_info"]["completion_tokens"] == 1:
-                ttft = time.perf_counter() - tic
+                assert (
+                    data["meta_info"]["finish_reason"] is None
+                    or data["meta_info"]["finish_reason"]["type"] == "length"
+                )
+                if data["meta_info"]["completion_tokens"] == 1:
+                    ttft = time.perf_counter() - tic
 
     latency = time.perf_counter() - tic
     input_throughput = batch_size * input_len / ttft
@@ -262,6 +333,7 @@ def run_benchmark(server_args: ServerArgs, bench_args: BenchArgs):
             run_name="",
             result_filename="",
             tokenizer=tokenizer,
+            api_type=bench_args.api_type,
         )
         print("=" * 8 + " Warmup End   " + "=" * 8 + "\n")
 
@@ -285,6 +357,7 @@ def run_benchmark(server_args: ServerArgs, bench_args: BenchArgs):
                     run_name=bench_args.run_name,
                     result_filename=bench_args.result_filename,
                     tokenizer=tokenizer,
+                    api_type=bench_args.api_type,
                 )
             )
 
@@ -309,6 +382,7 @@ def run_benchmark(server_args: ServerArgs, bench_args: BenchArgs):
                                 tokenizer=tokenizer,
                                 profile=bench_args.profile,
                                 profile_by_stage=bench_args.profile_by_stage,
+                                api_type=bench_args.api_type,
                             )[-1],
                         )
                     )

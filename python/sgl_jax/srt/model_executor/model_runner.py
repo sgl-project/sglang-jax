@@ -246,6 +246,7 @@ class ModelRunner:
         self.model_config.configure_for_tensor_parallel(self.tp_size)
         self.model_config.log_kv_heads_info(self.tp_size)
         self.model_config.hf_config.ep_size = self.ep_size
+        self.model_config.hf_config.moe_backend = self.model_config.moe_backend.value
 
         self.model = self.model_loader.load_model(
             model_config=self.model_config,

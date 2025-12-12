@@ -2,7 +2,7 @@
 Run live profiling.
 
 Usage:
-python3 -m sglang.profiler
+python3 -m sgl_jax.profiler
 """
 
 import argparse
@@ -14,7 +14,7 @@ from pathlib import Path
 
 import requests
 
-PARENT_FOLDER = "/tmp/sglang-profile"
+PARENT_FOLDER = "/tmp/sgl-jax-profile"
 
 
 def _run_profile(

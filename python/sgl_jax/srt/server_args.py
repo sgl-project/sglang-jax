@@ -122,6 +122,7 @@ class ServerArgs:
 
     # Kernel backend
     attention_backend: str | None = "fa"
+    moe_backend: str = "epmoe"
 
     grammar_backend: str | None = None
 
@@ -795,6 +796,13 @@ class ServerArgs:
             ],
             default=ServerArgs.attention_backend,
             help="Choose the kernels for attention layers.",
+        )
+        parser.add_argument(
+            "--moe-backend",
+            type=str,
+            choices=["epmoe", "fused", "auto"],
+            default=ServerArgs.moe_backend,
+            help="The backend to use for MoE models.",
         )
 
         parser.add_argument(
