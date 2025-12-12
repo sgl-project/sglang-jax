@@ -231,7 +231,7 @@ def quantization_config_file_path_to_dict(
 
 
 def apply_qwix_quantization(
-        model_config: ModelConfig, model: nnx.Module, mesh: Mesh, attn_backend: AttentionBackend) -> nnx.Module:
+        model_config: ModelConfig, model: nnx.Module, mesh: Mesh, attn_backend) -> nnx.Module:
         qwix_config = quantization_config_file_path_to_dict(
                 # TODO: fix since it is hardcoded
                 os.path.join("int8_all_modules_w_only.yaml")
@@ -241,7 +241,7 @@ def apply_qwix_quantization(
         bs = 1
         num_tokens = model_config.vocab_size
         max_seq_len = 4096
-        model_worker_batch = generate_model_worker_batch(bs, num_tokens, ForwardMode.DECODE, model_config.vocab_size, max_seq_len)
+        model_worker_batch = generate_mock_model_worker_batch(bs, num_tokens, ForwardMode.DECODE, model_config.vocab_size, max_seq_len)
         qwix_quantize_nnx_model_with_config_and_attn_backend = functools.partial(
             qwix_quantize_nnx_model, qwix_config=qwix_config, model_worker_batch=model_worker_batch)
         with jax.set_mesh(mesh):
@@ -535,7 +535,7 @@ def get_quant_dtype_from_qwix_config(
     return scale_dtype, quant_dtype
 
 
-def generate_model_worker_batch(
+def generate_mock_model_worker_batch(
         bs: int,
         num_tokens: int,
         mode: ForwardMode,
