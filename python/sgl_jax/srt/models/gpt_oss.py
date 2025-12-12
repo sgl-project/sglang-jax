@@ -81,20 +81,20 @@ class ModelConfig:
 
 
 
-class RMSNorm(nnx.Module):
-    def __init__(self, num_features: int, cfg: ModelConfig, *, rngs: nnx.Rngs, eps: float = 1e-05):
-        self.num_features = num_features
-        self.eps = eps
-        self.scale = nnx.Param(nnx.initializers.ones_init()(rngs.params(), (num_features,)))
+# class RMSNorm(nnx.Module):
+#     def __init__(self, num_features: int, cfg: ModelConfig, *, rngs: nnx.Rngs, eps: float = 1e-05):
+#         self.num_features = num_features
+#         self.eps = eps
+#         self.scale = nnx.Param(nnx.initializers.ones_init()(rngs.params(), (num_features,)))
         
 
-    @jax.named_scope("rms_norm")
-    def __call__(self, x: Array) -> Array:
-        assert x.shape[-1] == self.num_features
-        dtype = x.dtype
-        t = jnp.astype(x, jnp.float32)
-        rms = jnp.sqrt(jnp.mean(t**2, axis=-1, keepdims=True) + self.eps)
-        return jnp.astype((t / rms) * self.scale.value, dtype)
+#     @jax.named_scope("rms_norm")
+#     def __call__(self, x: Array) -> Array:
+#         assert x.shape[-1] == self.num_features
+#         dtype = x.dtype
+#         t = jnp.astype(x, jnp.float32)
+#         rms = jnp.sqrt(jnp.mean(t**2, axis=-1, keepdims=True) + self.eps)
+#         return jnp.astype((t / rms) * self.scale.value, dtype)
 
 
 def _apply_rotary_emb(x: jnp.ndarray, cos: jnp.ndarray, sin: jnp.ndarray) -> jnp.ndarray:
@@ -118,7 +118,6 @@ class RotaryEmbedding(nnx.Module):
         ntk_alpha: float = 1.0,
         ntk_beta: float = 32.0,
         *,
-        rngs: nnx.Rngs,
     ):
         self.head_dim = head_dim
         self.base = base
@@ -232,7 +231,7 @@ def sdpa(
 
 
 class AttentionBlock(nnx.Module):
-    def __init__(self, config: ModelConfig, layer_idx: int, *, rngs: nnx.Rngs):
+    def __init__(self, config: ModelConfig, layer_idx: int, *):
         self.head_dim = config.head_dim
         self.num_attention_heads = config.num_attention_heads
         self.num_key_value_heads = config.num_key_value_heads
@@ -241,20 +240,23 @@ class AttentionBlock(nnx.Module):
 
         # Sink tokens parameter
         self.sinks = nnx.Param(jnp.zeros((config.num_attention_heads,), dtype=jnp.bfloat16))
-        self.norm = RMSNorm(config.hidden_size, config, rngs=rngs)
+        # self.norm = RMSNorm(config.hidden_size, config, rngs=rngs)
+        self.norm = RMSNorm(config.hidden_size)
 
         # QKV projection
         qkv_dim = config.head_dim * (config.num_attention_heads + 2 * config.num_key_value_heads)
-        self.qkv = nnx.Linear(config.hidden_size, qkv_dim, use_bias=False, dtype=jnp.bfloat16, rngs=rngs)
+        # self.qkv = nnx.Linear(config.hidden_size, qkv_dim, use_bias=False, dtype=jnp.bfloat16, rngs=rngs)
+        self.qkv = LinearBase(config.hidden_size, qkv_dim, mesh, use_bias=False, dtype=jnp.bfloat16)
 
         # Output projection
-        self.out = nnx.Linear(
-                config.head_dim * config.num_attention_heads,
-                config.hidden_size,
-                use_bias=False,
-                dtype=jnp.bfloat16,
-                rngs=rngs,
-            )
+        # self.out = nnx.Linear(
+        #         config.head_dim * config.num_attention_heads,
+        #         config.hidden_size,
+        #         use_bias=False,
+        #         dtype=jnp.bfloat16,
+        #         rngs=nnx.Rngs(0),
+        #     )
+        self.out = LinearBase(config.head_dim * config.num_attention_heads, config.hidden_size, mesh, use_bias=False, dtype=jnp.bfloat16)
 
         self.sm_scale = 1.0 / math.sqrt(config.head_dim)
         self.rope = RotaryEmbedding(
@@ -265,7 +267,6 @@ class AttentionBlock(nnx.Module):
             scaling_factor=config.rope_scaling_factor,
             ntk_alpha=config.rope_ntk_alpha,
             ntk_beta=config.rope_ntk_beta,
-            rngs=rngs,
         )
 
     @jax.named_scope("attention")
@@ -309,15 +310,16 @@ def swiglu(x: jnp.ndarray, alpha: float = 1.702, limit: float = 7.0) -> jnp.ndar
 
 
 class MLPBlock(nnx.Module):
-    def __init__(self, config: ModelConfig, *, rngs: nnx.Rngs):
+    def __init__(self, config: ModelConfig, *):
         self.num_experts = config.num_experts
         self.experts_per_token = config.experts_per_token
         self.swiglu_limit = config.swiglu_limit
 
-        self.norm = RMSNorm(config.hidden_size, config, rngs=rngs)
+        # self.norm = RMSNorm(config.hidden_size, config, rngs=rngs)
+        self.norm = RMSNorm(config.hidden_size)
 
         # Gate projection
-        self.gate = nnx.Linear(config.hidden_size, config.num_experts, use_bias=False, dtype=jnp.bfloat16, rngs=rngs)
+        self.gate = nnx.Linear(config.hidden_size, config.num_experts, use_bias=False, dtype=jnp.bfloat16, rngs=nnx.Rngs(0))
 
 
         # MLP weights (per expert)
@@ -506,7 +508,7 @@ class Transformer(nnx.Module):
         x = self.norm(x)
         x = self.unembedding(x)
         return x
-        
+
 
 class GptOssForCausalLM(nnx.Module):
     def __init__(
