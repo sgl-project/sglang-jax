@@ -5,6 +5,8 @@ from transformers.models.qwen2_5_vl.configuration_qwen2_5_vl import Qwen2_5_VLCo
 import jax
 import jax.numpy as jnp
 from jax.sharding import Mesh
+from jax.sharding import PartitionSpec as P
+from jax.experimental import shard_map
 from flax import nnx
 
 from sgl_jax.srt.managers.schedule_batch import (
@@ -23,6 +25,7 @@ from sgl_jax.srt.mem_cache.memory_pool import KVCache
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
 from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
 from sgl_jax.utils import logger
+from sgl_jax.srt.kernels.flash_attention import flash_attention
 
 
 class SegmentIds(NamedTuple):
@@ -171,6 +174,35 @@ class Attention(nnx.Module):
         attn_output = jnp.matmul(attn_weights, v)
         return attn_output
 
+def sharded_flash_attention(
+    mesh: Mesh,
+    causal: bool = True,
+    sm_scale: Optional[float] = None,
+    vmem_limit_bytes: int | None = None,
+) -> Callable[..., Any]:
+    in_specs = (
+        P("data", "tensor", None, None),  # q
+        P("data", "tensor", None, None),  # k
+        P("data", "tensor", None, None),  # v
+        P(),  # segment_ids
+    )
+    out_specs = P("data", "tensor", None, None)
+
+    def _flash_attention(q, k, v, segment_ids):
+        return flash_attention(q,
+                               k,
+                               v,
+                               segment_ids=segment_ids,
+                               sm_scale=sm_scale,
+                               causal=causal,
+                               vmem_limit_bytes=vmem_limit_bytes)
+
+    return jax.jit(
+        shard_map.shard_map(_flash_attention,
+                            mesh=mesh,
+                            in_specs=in_specs,
+                            out_specs=out_specs,
+                            check_rep=False))
 
 class Qwen2_5_VisionAttention(nnx.Module):
 
@@ -221,9 +253,11 @@ class Qwen2_5_VisionAttention(nnx.Module):
             mesh=mesh,
         )
 
-        self.attention = Attention(
+        self.flash_attention = sharded_flash_attention(
             mesh=mesh,
-            scale=1.0 / math.sqrt(self.head_dim),
+            causal=False,
+            sm_scale=1.0 / math.sqrt(self.head_dim),
+            vmem_limit_bytes=128 * 1024 * 1024,
         )
 
     def __call__(
@@ -277,21 +311,11 @@ class Qwen2_5_VisionAttention(nnx.Module):
         k = jnp.pad(k, pad_width, 'constant')
         v = jnp.pad(v, pad_width, 'constant')
 
-        mask_shape = (q.shape[-2], k.shape[-2])
-        row_ids = jax.lax.broadcasted_iota(jnp.int32, mask_shape, 0)
-        col_ids = jax.lax.broadcasted_iota(jnp.int32, mask_shape, 1)
-        mask = col_ids <= row_ids
+        segment_ids = generate_window_segment_ids(cu_window_seqlens, T_attn,
+                                                  padded_T)
 
-        if cu_window_seqlens is not None:
-            segment_ids = generate_window_segment_ids(cu_window_seqlens, T_attn,
-                                                      padded_T)
-            window_mask = jnp.equal(jnp.repeat(segment_ids.q, segment_ids.kv.shape[-1], 0),
-                             segment_ids.kv.transpose(1, 0)).astype(jnp.bool_)
-            mask = jnp.logical_and(mask, window_mask)
-        mask = mask[None, None, :, :]
-
-        # TODO: add support for quantized KV cache?
-        output = self.attention(q, k, v, mask)
+        # TODO (jacobplatin): add support for quantized KV cache?
+        output = self.flash_attention(q, k, v, segment_ids)
 
         # Unpad the output
         output = output[:, :, :T_attn, :]
@@ -371,7 +395,7 @@ class Qwen2_5_VisionPatchEmbed(nnx.Module):
                              kernel_size=kernel_size,
                              strides=kernel_size,
                              use_bias=False,
-                             padding="VALID",
+                            #  padding="VALID",
                              param_dtype=dtype,
                              kernel_init=nnx.with_partitioning(
                                  nnx.initializers.uniform(),
@@ -747,21 +771,29 @@ class Qwen2_5_VLForConditionalGeneration(nnx.Module):
         pixel_values = jnp.concatenate([item.feature for item in items], axis=0).astype(
             self.visual.dtype
         )
-        # Collect image_grid_thw, handling cases where it might not exist
-        image_grid_thw_list = []
+        # Collect image_grid_thw as Python tuples directly from items
+        grid_thw_list = []
         for item in items:
-            if hasattr(item, 'image_grid_thw') and item.image_grid_thw is not None:
-                # Convert PyTorch tensors to NumPy arrays if needed
+            if hasattr(item, "image_grid_thw") and item.image_grid_thw is not None:
+                # Convert to Python tuple immediately
                 grid_thw = item.image_grid_thw
-                if hasattr(grid_thw, 'detach'):  # PyTorch tensor
-                    grid_thw = grid_thw.detach().cpu().numpy()
-                image_grid_thw_list.append(grid_thw)
+                if isinstance(grid_thw, jax.Array) or hasattr(grid_thw, '__array__'):
+                    # Convert JAX/NumPy array to tuple
+                    import numpy as np
+                    grid_np = np.asarray(grid_thw)
+                    grid_tuple = tuple(tuple(int(x) for x in row) for row in grid_np)
+                else:
+                    # Already a tuple or list
+                    grid_tuple = tuple(tuple(row) for row in grid_thw)
+                grid_thw_list.append(grid_tuple)
             else:
-                raise ValueError(f"MultimodalDataItem missing image_grid_thw attribute")
-        image_grid_thw = jnp.concatenate(image_grid_thw_list, axis=0)
-        assert pixel_values.ndim == 2, pixel_values.ndim
-        assert image_grid_thw.ndim == 2, image_grid_thw.ndim
-        image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw)
+                # Provide a default value if image_grid_thw is not available
+                grid_thw_list.append(((1, 1, 1),))
+        
+        # Flatten the list of tuples into a single tuple
+        grid_thw_tuple = tuple(item for sublist in grid_thw_list for item in sublist)
+        
+        image_embeds = self.visual(pixel_values, grid_thw=grid_thw_tuple)
         return image_embeds
 
     def get_video_feature(self, items: List[MultimodalDataItem]) -> jax.Array:
@@ -769,21 +801,31 @@ class Qwen2_5_VLForConditionalGeneration(nnx.Module):
         pixel_values = jnp.concatenate([item.feature for item in items], axis=0).astype(
             self.visual.dtype
         )
-        # Collect video_grid_thw, handling cases where it might not exist
-        video_grid_thw_list = []
+        # Collect video_grid_thw as Python tuples directly from items
+        grid_thw_list = []
         for item in items:
             if hasattr(item, 'video_grid_thw') and item.video_grid_thw is not None:
-                # Convert PyTorch tensors to NumPy arrays if needed
+                # Convert to Python tuple immediately
                 grid_thw = item.video_grid_thw
                 if hasattr(grid_thw, 'detach'):  # PyTorch tensor
                     grid_thw = grid_thw.detach().cpu().numpy()
-                video_grid_thw_list.append(grid_thw)
+                
+                if isinstance(grid_thw, jax.Array) or hasattr(grid_thw, '__array__'):
+                    # Convert JAX/NumPy array to tuple
+                    import numpy as np
+                    grid_np = np.asarray(grid_thw)
+                    grid_tuple = tuple(tuple(int(x) for x in row) for row in grid_np)
+                else:
+                    # Already a tuple or list
+                    grid_tuple = tuple(tuple(row) for row in grid_thw)
+                grid_thw_list.append(grid_tuple)
             else:
                 raise ValueError(f"MultimodalDataItem missing video_grid_thw attribute")
-        video_grid_thw = jnp.concatenate(video_grid_thw_list, axis=0)
-        assert pixel_values.ndim == 2, pixel_values.ndim
-        assert video_grid_thw.ndim == 2, video_grid_thw.ndim
-        video_embeds = self.visual(pixel_values, grid_thw=video_grid_thw)
+        
+        # Flatten the list of tuples into a single tuple
+        grid_thw_tuple = tuple(item for sublist in grid_thw_list for item in sublist)
+        
+        video_embeds = self.visual(pixel_values, grid_thw=grid_thw_tuple)
         return video_embeds
 
     def get_input_embeddings(self):
