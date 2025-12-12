@@ -22,7 +22,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        part: [0, 1 , 2, 3]
+        part: [0, 1 , 2, 3 ,4]
     continue-on-error: true
     steps:
       - name: Checkout code
@@ -46,7 +46,7 @@ jobs:
 
           bash scripts/killall_sglang.sh
           cd test/srt
-          python3 run_suite.py --suite nightly-test-accuracy-text-models-tpu-v6e-1 --auto-partition-id ${{ matrix.part }} --auto-partition-size 4
+          python3 run_suite.py --suite nightly-test-accuracy-text-models-tpu-v6e-1 --auto-partition-id ${{ matrix.part }} --auto-partition-size 5
       - name: Publish traces to storage repo
         env:
           GITHUB_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}

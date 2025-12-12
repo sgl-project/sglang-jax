@@ -174,7 +174,12 @@ suites = {
         TestFile(
             "nightly-test/test_accuracy.py",
             estimated_time=200,
-            test_methods=["TestModelAccuracy.test_GEMMA2_2B_IT"],
+            test_methods=["TestModelAccuracy.test_GEMMA2_2B_IT_PART_1"],
+        ),
+        TestFile(
+            "nightly-test/test_accuracy.py",
+            estimated_time=200,
+            test_methods=["TestModelAccuracy.test_GEMMA2_2B_IT_PART_2"],
         ),
     ],
     "nightly-test-accuracy-text-models-tpu-v6e-4": [
