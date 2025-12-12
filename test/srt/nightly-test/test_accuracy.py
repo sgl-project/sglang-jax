@@ -19,7 +19,7 @@ from sgl_jax.test.test_utils import (
     GEMMA2_2B_IT,
     QWEN2_5_7B_INSTRUCT,
     QWEN3_8B,
-    QWEN3_CODER_30B_A3B_INSTRUCT,
+    QWEN3_MOE_30B,
     QWEN_7B,
     CustomTestCase,
     popen_launch_server,
@@ -897,116 +897,6 @@ class TestModelAccuracy(CustomTestCase):
         finally:
             kill_process_tree(process.pid)
 
-    def test_QWEN3_CODER_30B_A3B_INSTRUCT_tp_4(self):
-        model = QWEN3_CODER_30B_A3B_INSTRUCT
-        base_url = DEFAULT_URL_FOR_TEST
-        api_url_for_eval = f"{base_url}/v1"
-        output_dir = os.getenv("BENCH_OUTPUT_DIR", "./test/nightly_test_output/benchmark/local_run")
-        os.makedirs(output_dir, exist_ok=True)
-        csv_file_path = os.path.join(
-            output_dir, "QWEN3_CODER_30B_A3B_INSTRUCT_benchmark_tp_4_results.csv"
-        )
-        specific_args = self.BASIC_SERVER_ARGS + [
-            "--tp-size",
-            "2",
-            "--ep-size",
-            "2",
-        ]
-        process = popen_launch_server(
-            model,
-            DEFAULT_URL_FOR_TEST,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            device="tpu",
-            other_args=specific_args,
-            env={
-                "JAX_COMPILATION_CACHE_DIR": "/tmp/jax_compilation_cache",
-            },
-        )
-
-        # run evalscope tasks
-        try:
-            tasks = [
-                {"name": "gsm8k", "threshold": 0.9},
-                {"name": "mmlu", "threshold": 0.77},
-                {"name": "mmlu_pro", "threshold": 0.66},
-                {"name": "aime24", "threshold": -1},
-                {"name": "aime25", "threshold": -1},
-            ]
-
-            for task in tasks:
-                dataset_name = task["name"]
-                threshold = task["threshold"]
-
-                dataset_args = {}
-                # if dataset_name == "mmlu" or dataset_name == "modelscope/mmlu":
-                #     dataset_args = {"mmlu": {"subset_list": ["global_facts"]}}
-                # if dataset_name == "mmlu":
-                #     dataset_args = {"mmlu": {"hub": "hf", "dataset_id": "cais/mmlu"}}
-
-                config = TaskConfig(
-                    model=model,
-                    api_url=api_url_for_eval,
-                    api_key="EMPTY",
-                    eval_type="service",
-                    datasets=[dataset_name],
-                    dataset_args=dataset_args,
-                    eval_batch_size=64,
-                )
-                # Run the task and get results
-                print(f"{model} Running eval for {dataset_name}")
-                results = run_task(config)
-                print(f"SDK Results: {results}")
-                if dataset_name in results:
-                    report = results[dataset_name]
-                    score = report.score
-                    try:
-                        rows = []
-                        fieldnames = ["Model"]
-
-                        if os.path.exists(csv_file_path):
-                            with open(csv_file_path, "r", newline="", encoding="utf-8") as f:
-                                reader = csv.DictReader(f)
-                                if reader.fieldnames:
-                                    fieldnames = reader.fieldnames
-                                rows = list(reader)
-
-                        if dataset_name not in fieldnames:
-                            fieldnames.append(dataset_name)
-
-                        model_found = False
-                        for row in rows:
-                            if row.get("Model") == model:
-                                row[dataset_name] = score
-                                model_found = True
-                                break
-
-                        if not model_found:
-
-                            new_row = {"Model": model, dataset_name: score}
-                            rows.append(new_row)
-
-                        with open(csv_file_path, "w", newline="", encoding="utf-8") as f:
-                            writer = csv.DictWriter(f, fieldnames=fieldnames)
-                            writer.writeheader()
-                            writer.writerows(rows)
-
-                        print(f"Updated CSV {csv_file_path}: {model} - {dataset_name} = {score}")
-
-                    except Exception as e:
-                        print(f"Warning: Failed to update CSV file: {e}")
-
-                    print(f"[{dataset_name}] Final Score: {score}")
-                    self.assertGreater(
-                        score,
-                        threshold,
-                        f"{dataset_name} score {score} is too low (target: {threshold})",
-                    )
-                else:
-                    self.fail(f"Dataset {dataset_name} not found in results: {results.keys()}")
-
-        finally:
-            kill_process_tree(process.pid)
-
     def test_DEEPSEEK_R1_DISTILL_QWEN_1_5B_tp_4(self):
         model = DEEPSEEK_R1_DISTILL_QWEN_1_5B
         base_url = DEFAULT_URL_FOR_TEST
@@ -1223,15 +1113,13 @@ class TestModelAccuracy(CustomTestCase):
         finally:
             kill_process_tree(process.pid)
 
-    def test_QWEN3_CODER_30B_A3B_INSTRUCT_tp_2_ep_2(self):
-        model = QWEN3_CODER_30B_A3B_INSTRUCT
+    def test_QWEN3_30B_A3B_tp_2_ep_2(self):
+        model = QWEN3_MOE_30B
         base_url = DEFAULT_URL_FOR_TEST
         api_url_for_eval = f"{base_url}/v1"
         output_dir = os.getenv("BENCH_OUTPUT_DIR", "./test/nightly_test_output/benchmark/local_run")
         os.makedirs(output_dir, exist_ok=True)
-        csv_file_path = os.path.join(
-            output_dir, "QWEN3_CODER_30B_A3B_INSTRUCT_benchmark_tp_2_ep_2_results.csv"
-        )
+        csv_file_path = os.path.join(output_dir, "qwen3_30b_a3b_benchmark_tp_2_ep_2_results.csv")
         specific_args = self.BASIC_SERVER_ARGS + [
             "--tp-size",
             "2",
