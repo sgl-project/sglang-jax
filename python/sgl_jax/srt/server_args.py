@@ -49,6 +49,7 @@ class ServerArgs:
     dtype: str = "auto"
     quantization: str | None = None
     quantization_param_path: str | None = None
+    quantization_post_dtype: str | None = None
     kv_cache_dtype: str = "auto"
 
     # Memory and scheduling
@@ -414,6 +415,14 @@ class ServerArgs:
             "scaling factors. This should generally be supplied, when "
             "KV cache dtype is FP8. Otherwise, KV cache scaling factors "
             "default to 1.0, which may cause accuracy issues. ",
+        )
+        parser.add_argument(
+            "--post-quantization",
+            dest="quantization_post_dtype",
+            choices=["fp8", "int8"],
+            type=str,
+            default=None,
+            help="The datatype of the post-quantized weight.",
         )
         parser.add_argument(
             "--kv-cache-dtype",

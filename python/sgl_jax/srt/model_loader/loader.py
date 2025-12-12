@@ -13,6 +13,10 @@ from sgl_jax.srt.configs.model_config import ModelConfig
 from sgl_jax.srt.model_loader.arch import get_model_architecture
 from sgl_jax.srt.utils.common_utils import get_bool_env_var
 
+from qwix._src.core.qarray import QArray
+from qwix._src.providers import ptq
+from sgl_jax.srt.utils.quantization.quantization_utils import apply_qwix_quantization
+
 logger = logging.getLogger(__name__)
 
 
@@ -63,6 +67,7 @@ class JAXModelLoader(BaseModelLoader):
         self,
         *,
         model_config: ModelConfig,
+        attn_backend,
     ) -> Any:
         # prepare model file
         hf_folder = self.download_model(model_config)
@@ -71,7 +76,7 @@ class JAXModelLoader(BaseModelLoader):
         model = self._initialize_model(model_config)
 
         # Load weights
-        jit_model = self._get_model(model, model_config)
+        jit_model = self._get_model(model, model_config, attn_backend)
 
         return jit_model
 
@@ -86,15 +91,18 @@ class JAXModelLoader(BaseModelLoader):
 
         return model_class
 
-    def _get_model(self, model_class: Any, model_config: ModelConfig) -> nnx.Module:
+    def _get_model(self, model_class: Any, model_config: ModelConfig, attn_backend) -> nnx.Module:
+        logging.info("model_config quantization_post_dtype: %s", model_config.quantization_post_dtype)
         with jax.set_mesh(self.mesh):
             model = nnx.eval_shape(
                 lambda: model_class(
                     model_config.hf_config, dtype=model_config.dtype, mesh=self.mesh
                 )
             )
-
         model.load_weights(model_config)
+        
+        if model_config.quantization_post_dtype != None:
+            model = apply_qwix_quantization(model_config, model, self.mesh, attn_backend)
         return model
 
     def _maybe_download_from_modelscope(self, model: str, revision: str | None) -> str | None:
