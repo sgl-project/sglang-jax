@@ -13,26 +13,19 @@ import time
 import jax
 import jax.numpy as jnp
 import numpy as np
+from flax import nnx
 
 from benchmark.moe.utils import (
+    BAILING_BASE,
     MoEBenchmarkCase,
     build_group_sizes,
+    build_mesh,
     format_load_info,
     generate_router_logits,
     select_cases,
 )
 from benchmark.utils import multiple_iteration_timeit_from_trace
 from sgl_jax.srt.layers.moe import EPMoE, TopK
-
-
-def build_mesh(ep_size: int = 1, tp_size: int = 1):
-    from sgl_jax.srt.utils.mesh_utils import create_device_mesh
-
-    return create_device_mesh(
-        ici_parallelism=[1, tp_size * ep_size],
-        dcn_parallelism=[1, 1],
-        mesh_axes=("data", "tensor"),
-    )
 
 
 def prepare_ep_moe_inputs(
@@ -66,16 +59,40 @@ def run_all(
     scenario: str,
     iters: int,
     dtype: jnp.dtype = jnp.bfloat16,
+    *,
+    num_tokens: list[int] | None = None,
 ) -> None:
-    cases = list(select_cases())
+    raw_cases: list[MoEBenchmarkCase] | None = None
+    if num_tokens is not None:
+        raw_cases = [
+            MoEBenchmarkCase(
+                name=(
+                    f"custom_nt{n}_ne{BAILING_BASE['num_experts']}_tk{BAILING_BASE['top_k']}"
+                    f"_h{BAILING_BASE['hidden_size']}_i{BAILING_BASE['intermediate_size']}"
+                ),
+                num_tokens=n,
+                **BAILING_BASE,
+            )
+            for n in num_tokens
+        ]
+    cases = list(select_cases(raw_cases))
 
     print(f"Running ep_moe benchmarks with scenario='{scenario}', dtype={dtype}")
     for case in cases:
         assert case.ep_size is not None
         assert case.tp_size is not None
+        if case.ep_size * case.tp_size != len(jax.devices()):
+            raise ValueError(
+                f"Expected ep_size*tp_size to match device_count: "
+                f"{case.ep_size}*{case.tp_size} != {len(jax.devices())}"
+            )
         print(
             f"\n[case={case.name}] tokens={case.num_tokens}, experts={case.num_experts}, "
             f"top_k={case.top_k}, hidden={case.hidden_size}, intermediate={case.intermediate_size}"
+        )
+        print(
+            f"  mesh: ep_size={case.ep_size}, tp_size={case.tp_size}, "
+            f"devices_used={case.ep_size * case.tp_size}/{len(jax.devices())}"
         )
 
         mesh = build_mesh(ep_size=case.ep_size, tp_size=case.tp_size)
@@ -105,19 +122,55 @@ def run_all(
                 layer_id=0,
             )
 
-            @jax.jit
-            def ep_moe_fn(hidden_states, router_logits):
-                topk_weights, topk_ids = topk_layer(router_logits)
-                return ep_moe_layer(hidden_states, topk_weights, topk_ids)
+            # Avoid capturing massive expert weights as XLA constants: split NNx modules
+            # into (def, state) and pass the state leaves as explicit jitted inputs.
+            topk_def, topk_state = nnx.split(topk_layer)
+            topk_state_leaves, topk_state_def = jax.tree_util.tree_flatten(topk_state)
+            moe_def, moe_state = nnx.split(ep_moe_layer)
+            moe_state_leaves, moe_state_def = jax.tree_util.tree_flatten(moe_state)
+
+            @jax.jit(static_argnames=("topk_state_def", "moe_state_def"))
+            def ep_moe_fn(
+                hidden_states,
+                router_logits,
+                *,
+                topk_state_def,
+                topk_state_leaves,
+                moe_state_def,
+                moe_state_leaves,
+            ):
+                topk_state = jax.tree_util.tree_unflatten(topk_state_def, topk_state_leaves)
+                topk = nnx.merge(topk_def, topk_state)
+                moe_state = jax.tree_util.tree_unflatten(moe_state_def, moe_state_leaves)
+                moe = nnx.merge(moe_def, moe_state)
+
+                topk_weights, topk_ids = topk(router_logits)
+                return moe(hidden_states, topk_weights, topk_ids)
 
             # warmup
             start = time.perf_counter()
-            jax.block_until_ready(ep_moe_fn(data["tokens"], data["router_logits"]))
+            jax.block_until_ready(
+                ep_moe_fn(
+                    data["tokens"],
+                    data["router_logits"],
+                    topk_state_def=topk_state_def,
+                    topk_state_leaves=topk_state_leaves,
+                    moe_state_def=moe_state_def,
+                    moe_state_leaves=moe_state_leaves,
+                )
+            )
             elapsed_ms = (time.perf_counter() - start) * 1000
             print(f"warmup in {elapsed_ms} ms")
 
             times = multiple_iteration_timeit_from_trace(
-                compute_func=lambda: ep_moe_fn(data["tokens"], data["router_logits"]),
+                compute_func=lambda: ep_moe_fn(
+                    data["tokens"],
+                    data["router_logits"],
+                    topk_state_def=topk_state_def,
+                    topk_state_leaves=topk_state_leaves,
+                    moe_state_def=moe_state_def,
+                    moe_state_leaves=moe_state_leaves,
+                ),
                 data_generator=lambda: (),
                 task=f"ep_moe_{case.name}",
                 tries=iters,
@@ -136,9 +189,16 @@ def parse_args() -> argparse.Namespace:
         help="Router logits distribution pattern.",
     )
     parser.add_argument("--iters", type=int, default=3, help="Number of benchmark iterations.")
+    parser.add_argument(
+        "--num-tokens",
+        type=int,
+        nargs="+",
+        default=None,
+        help="Override benchmark cases with custom num_tokens list (e.g. --num-tokens 8 16 256 4096).",
+    )
     return parser.parse_args()
 
 
 if __name__ == "__main__":
     args = parse_args()
-    run_all(args.scenario, args.iters)
+    run_all(args.scenario, args.iters, num_tokens=args.num_tokens)

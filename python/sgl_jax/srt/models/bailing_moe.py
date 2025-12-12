@@ -265,7 +265,7 @@ class BailingMoEDecoderLayer(nnx.Module):
 
             if self.use_fused:
                 self.mlp = FusedEPMoE(
-                    config=config,
+                    hidden_size=config.hidden_size,
                     num_experts=config.num_experts,
                     num_experts_per_tok=config.num_experts_per_tok,
                     intermediate_dim=config.moe_intermediate_size,

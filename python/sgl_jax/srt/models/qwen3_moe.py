@@ -193,7 +193,7 @@ class QWen3MoeDecoderLayer(nnx.Module):
 
             if self.use_fused:
                 self.mlp = FusedEPMoE(
-                    config=config,
+                    hidden_size=config.hidden_size,
                     num_experts=num_experts,
                     num_experts_per_tok=num_experts_per_tok,
                     intermediate_dim=moe_intermediate_size,

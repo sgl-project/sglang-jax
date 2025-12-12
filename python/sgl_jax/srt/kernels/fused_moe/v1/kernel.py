@@ -5,7 +5,6 @@
 from __future__ import annotations
 
 import functools
-import zlib
 from dataclasses import dataclass
 
 import jax
@@ -479,7 +478,12 @@ def _fused_ep_moe_kernel(
         bt_sem_id = (bt_id + 2) % 2
         b_gating_sem = local_sems.at[bt_sem_id, 0]
         bt_start = bt_id * bt
-        bt_start = pl.multiple_of(bt_start, 8) if bt % 8 == 0 else bt_start
+        # Hint Mosaic about HBM tiling alignment for `tpu.memref_slice`:
+        # - f32 is typically tiled as (8, 128)
+        # - bf16/f16 is typically tiled as (16, 128)
+        # Using a dtype-derived factor is more robust than hardcoding 8.
+        gating_tile0 = 256 // dtypes.itemsize_bits(gating_hbm.dtype)
+        bt_start = pl.multiple_of(bt_start, gating_tile0) if bt % gating_tile0 == 0 else bt_start
         pltpu.make_async_copy(
             src_ref=gating_hbm.at[pl.ds(bt_start, bt)],
             dst_ref=b_gating_x2_vmem.at[bt_sem_id, pl.ds(0, bt)],
@@ -1381,6 +1385,18 @@ def _validate_fused_ep_moe_args(
         block_config=block_config,
     )
 
+    # `gating_output` is DMA'd from HBM in (bt, num_experts) tiles. Mosaic requires
+    # the tile start index to be divisible by the HBM tiling factor, which depends
+    # on dtype (e.g. f32 -> 8, bf16 -> 16).
+    local_num_tokens = num_tokens // ep_size
+    num_bt = cdiv(local_num_tokens, block_config.bt)
+    gating_tile0 = 256 // dtypes.itemsize_bits(gating_output.dtype)
+    if num_bt > 1 and block_config.bt % gating_tile0 != 0:
+        raise ValueError(
+            f"Expected {block_config.bt=} to be aligned to {gating_tile0=} when {num_bt=} > 1 "
+            f"(for gating dtype {gating_output.dtype})."
+        )
+
     # Note: we should dump scale as the kernel expected shape in the
     # checkpoint offline or reshape right after weight loading.
     if w1_scale is not None:
@@ -1455,7 +1471,6 @@ def _validate_fused_ep_moe_args(
         "subc_quant_wsz",
         "block_config",
         "ep_axis_name",
-        "collective_id",
     ],
 )
 def fused_ep_moe(
@@ -1484,7 +1499,6 @@ def fused_ep_moe(
     b3: jax.Array | None = None,  # F32(num_experts, 1, intermediate_size)
     block_config: FusedMoEBlockConfig | None = None,
     ep_axis_name: str = "tensor",
-    collective_id: int | None = None,
 ):
     ep_size = mesh.shape[ep_axis_name]
     if block_config is None:
@@ -1501,16 +1515,6 @@ def fused_ep_moe(
             dtype=tokens.dtype,
             ep_size=ep_size,
         )
-        jax.debug.print(
-            "num_tokens: {}, hidden_size: {}, top_k: {}, num_experts: {}, intermediate_size: {}, ep_size: {}",
-            num_tokens,
-            hidden_size,
-            top_k,
-            num_experts,
-            intermediate_size,
-            ep_size,
-        )
-        jax.debug.print("block_config: {}", block_config)
     block_config = block_config.effective_for(
         num_tokens=tokens.shape[0],
         ep_size=ep_size,
@@ -1584,21 +1588,6 @@ def fused_ep_moe(
         f"-bt_{block_config.bt}_{block_config.btc}-bf_{block_config.bf}_{block_config.bfc}"
         f"-bd1_{block_config.bd1}_{block_config.bd1c}-bd2_{block_config.bd2}_{block_config.bd2c}"
     )
-    if collective_id is None:
-        # Remote DMA / semaphore ops are backed by global on-device resources; if
-        # multiple compiled programs execute concurrently (e.g. server prefill+decode
-        # overlap), a non-unique `collective_id` can cause cross-program interference.
-        payload = (
-            f"fused_moe_v1|{scope_name}"
-            f"|tokens={tuple(tokens.shape)}"
-            f"|w1={tuple(w1.shape)}|w2={tuple(w2.shape)}|w3={tuple(w3.shape)}"
-            f"|gating={tuple(gating_output.shape)}"
-            f"|dtype={t_dtype}|gating_dtype={gating_dtype}"
-            f"|ep_axis={ep_axis_name}|ep_size={ep_size}"
-            f"|subc_quant_wsz={subc_quant_wsz}"
-        )
-        collective_id = zlib.crc32(payload.encode("utf-8")) & 0x7FFFFFFF
-        collective_id = 1 if collective_id == 0 else collective_id
 
     w1_scale_scratch = None
     if w1_scale is not None:
@@ -1698,9 +1687,6 @@ def fused_ep_moe(
                 scratch_shapes=scratch_shapes,
             ),
             compiler_params=pltpu.CompilerParams(
-                collective_id=collective_id,
-                allow_collective_id_without_custom_barrier=True,
-                has_side_effects=True,
                 vmem_limit_bytes=64 * 1024 * 1024,
             ),
             name=scope_name,
@@ -1724,7 +1710,7 @@ def fused_ep_moe(
             P(ep_axis_name),  # gating_output_hbm
             P(),  # a2a_g_hbm
         ),
-        out_specs=P(ep_axis_name),
+        out_specs=P(None),
         check_vma=False,
     )
     def kernel(
@@ -1741,7 +1727,7 @@ def fused_ep_moe(
         gating_output,
         a2a_g_hbm_scratch,
     ):
-        return fused_moe(
+        local_output = fused_moe(
             pltpu.with_memory_space_constraint(tokens, pltpu.HBM),  # tokens_hbm
             pltpu.with_memory_space_constraint(w1, pltpu.HBM),  # w1_hbm
             pltpu.with_memory_space_constraint(w2, pltpu.HBM),  # w2_hbm
@@ -1767,6 +1753,7 @@ def fused_ep_moe(
             pltpu.with_memory_space_constraint(gating_output, pltpu.HBM),  # gating_output_hbm
             pltpu.with_memory_space_constraint(a2a_g_hbm_scratch, pltpu.HBM),  # a2a_g_hbm
         )
+        return jax.lax.all_gather(local_output, axis_name=ep_axis_name, axis=0, tiled=True)
 
     a2a_g_hbm_scratch = pl.empty(
         (num_experts, block_config.bt, t_packing, hidden_size // t_packing), t_dtype

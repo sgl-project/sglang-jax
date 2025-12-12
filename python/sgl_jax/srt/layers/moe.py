@@ -5,7 +5,7 @@ from jax import shard_map
 from jax.sharding import Mesh
 from jax.sharding import PartitionSpec as P
 
-from sgl_jax.srt.kernels.fused_moe.v1.kernel import fused_ep_moe
+from sgl_jax.srt.kernels.fused_moe.v1.kernel import FusedMoEBlockConfig, fused_ep_moe
 from sgl_jax.srt.kernels.gmm.megablox_gmm_backend import gmm
 
 
@@ -501,7 +501,7 @@ class FusedEPMoE(nnx.Module):
     - Implementation: Uses Pallas kernel with manual memory management for TPU optimization
 
     Args:
-        config: Model configuration
+        hidden_size: Hidden size of the model
         num_experts: Total number of experts
         num_experts_per_tok: Number of experts to select per token (top_k)
         ep_size: Expert parallel size (number of devices to shard experts across)
@@ -517,7 +517,7 @@ class FusedEPMoE(nnx.Module):
 
     def __init__(
         self,
-        config,
+        hidden_size: int,
         num_experts: int,
         num_experts_per_tok: int,
         ep_size: int,
@@ -529,7 +529,7 @@ class FusedEPMoE(nnx.Module):
         layer_id: int = 0,
         renormalize_topk_logits: bool = False,
     ):
-        self.config = config
+        self.hidden_size = hidden_size
         self.num_experts = num_experts
         self.num_experts_per_tok = num_experts_per_tok
         self.intermediate_dim = intermediate_dim
@@ -550,7 +550,7 @@ class FusedEPMoE(nnx.Module):
         self.w1 = nnx.Param(
             jax.random.normal(
                 jax.random.key(0),
-                (num_experts, config.hidden_size, intermediate_dim),
+                (num_experts, hidden_size, intermediate_dim),
                 dtype=weight_dtype,
                 out_sharding=P("tensor", None, None),
             )
@@ -558,7 +558,7 @@ class FusedEPMoE(nnx.Module):
         self.w3 = nnx.Param(
             jax.random.normal(
                 jax.random.key(1),
-                (num_experts, config.hidden_size, intermediate_dim),
+                (num_experts, hidden_size, intermediate_dim),
                 dtype=weight_dtype,
                 out_sharding=P("tensor", None, None),
             )
@@ -567,13 +567,19 @@ class FusedEPMoE(nnx.Module):
         self.w2 = nnx.Param(
             jax.random.normal(
                 jax.random.key(0),
-                (num_experts, intermediate_dim, config.hidden_size),
+                (num_experts, intermediate_dim, hidden_size),
                 dtype=weight_dtype,
                 out_sharding=P("tensor", None, None),
             )
         )
 
-    def __call__(self, hidden_states: jax.Array, router_logits: jax.Array) -> jax.Array:
+    def __call__(
+        self,
+        hidden_states: jax.Array,
+        router_logits: jax.Array,
+        *,
+        block_config: FusedMoEBlockConfig | None = None,
+    ) -> jax.Array:
         """
         Forward pass through the fused MoE layer.
 
@@ -588,9 +594,6 @@ class FusedEPMoE(nnx.Module):
         """
         assert hidden_states.ndim == 2
 
-        hidden_states = jax.sharding.reshard(hidden_states, P("tensor", None))
-        router_logits = jax.sharding.reshard(router_logits, P("tensor", None))
-
         output = fused_ep_moe(
             mesh=self.mesh,
             tokens=hidden_states,
@@ -601,7 +604,7 @@ class FusedEPMoE(nnx.Module):
             top_k=self.num_experts_per_tok,
             renormalize_topk_logits=self.renormalize_topk_logits,
             act_fn=self.activation,
-            block_config=None,
+            block_config=block_config,
             # Optional parameters (not used in basic case)
             subc_quant_wsz=None,
             w1_scale=None,
@@ -613,5 +616,4 @@ class FusedEPMoE(nnx.Module):
             ep_axis_name="tensor",
         )
 
-        final_output = jax.sharding.reshard(output, P(None))
-        return final_output
+        return output

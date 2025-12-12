@@ -246,7 +246,7 @@ class Grok1MoE(nnx.Module):
 
         if self.use_fused:
             self.experts = FusedEPMoE(
-                config=config,
+                hidden_size=hidden_size,
                 num_experts=num_experts,
                 num_experts_per_tok=self.top_k,
                 intermediate_dim=intermediate_size,

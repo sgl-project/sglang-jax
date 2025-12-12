@@ -11,6 +11,8 @@ from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.utils.mesh_utils import create_device_mesh
 
+MARKER = "SGL_BENCH"
+
 
 @dataclasses.dataclass
 class MoEBenchmarkCase:
@@ -47,27 +49,27 @@ BAILING_BASE = dict(
     renormalize_topk_logits=True,
     num_expert_group=8,
     topk_group=4,
-    # Hint EP=4 to match server (tp=4, ep=4 on 16 devices).
-    ep_size=4,
+    # Let benchmarks pick ep_size based on available devices by default.
+    ep_size=None,
 )
 
-_EXTEND_NUM_TOKENS = (4096,)
-_DECODE_NUM_TOKENS = (8, 16, 32, 64, 128, 256)
+_EXTEND_NUM_TOKENS = (512, 1024, 2048, 4096)
+_DECODE_NUM_TOKENS = (16, 32, 64, 128, 256)
 
 GROUP_GEMM_CASES: Iterable[MoEBenchmarkCase] = tuple(
-    MoEBenchmarkCase(
-        name=f"bailing_extend_nt{n}_ne256_tk8_h8192_i2048_ep4",
-        num_tokens=n,
-        **BAILING_BASE,
-    )
-    for n in _EXTEND_NUM_TOKENS
-) + tuple(
     MoEBenchmarkCase(
         name=f"bailing_decode_nt{n}_ne256_tk8_h8192_i2048_ep4",
         num_tokens=n,
         **BAILING_BASE,
     )
     for n in _DECODE_NUM_TOKENS
+) + tuple(
+    MoEBenchmarkCase(
+        name=f"bailing_extend_nt{n}_ne256_tk8_h8192_i2048_ep4",
+        num_tokens=n,
+        **BAILING_BASE,
+    )
+    for n in _EXTEND_NUM_TOKENS
 )
 
 
@@ -154,15 +156,22 @@ def prepare_fused_moe_inputs(
     mesh: jax.sharding.Mesh | None = None,
     *,
     ep_axis_name: str = "tensor",
+    include_weights: bool = True,
 ) -> Dict[str, jax.Array]:
     if mesh is None:
         tokens = jnp.empty((case.num_tokens, case.hidden_size), dtype=dtype)
-        w1 = jnp.empty((case.num_experts, case.hidden_size, case.intermediate_size), dtype=dtype)
-        w3 = jnp.empty((case.num_experts, case.hidden_size, case.intermediate_size), dtype=dtype)
-        w2 = jnp.empty(
-            (case.num_experts, case.intermediate_size, case.hidden_size),
-            dtype=dtype,
-        )
+        out: dict[str, jax.Array] = {"tokens": tokens}
+        if include_weights:
+            out["w1"] = jnp.empty(
+                (case.num_experts, case.hidden_size, case.intermediate_size), dtype=dtype
+            )
+            out["w3"] = jnp.empty(
+                (case.num_experts, case.hidden_size, case.intermediate_size), dtype=dtype
+            )
+            out["w2"] = jnp.empty(
+                (case.num_experts, case.intermediate_size, case.hidden_size),
+                dtype=dtype,
+            )
         router_logits = generate_router_logits(
             case.num_tokens,
             case.num_experts,
@@ -170,13 +179,8 @@ def prepare_fused_moe_inputs(
             num_experts_per_tok=case.top_k,
             imbalance_factor=case.routed_scaling_factor or 3.0,
         ).astype(dtype)
-        return {
-            "tokens": tokens,
-            "w1": w1,
-            "w2": w2,
-            "w3": w3,
-            "router_logits": router_logits,
-        }
+        out["router_logits"] = router_logits
+        return out
 
     ep_size = mesh.shape[ep_axis_name]
     if case.num_tokens % ep_size != 0:
@@ -201,27 +205,29 @@ def prepare_fused_moe_inputs(
         lambda: jnp.zeros((case.num_tokens, case.hidden_size), dtype=dtype),
         out_shardings=tokens_sharding,
     )()
-    w1 = jax.jit(
-        lambda: jnp.zeros(
-            (case.num_experts, case.hidden_size, case.intermediate_size),
-            dtype=dtype,
-        ),
-        out_shardings=w1_sharding,
-    )()
-    w3 = jax.jit(
-        lambda: jnp.zeros(
-            (case.num_experts, case.hidden_size, case.intermediate_size),
-            dtype=dtype,
-        ),
-        out_shardings=w3_sharding,
-    )()
-    w2 = jax.jit(
-        lambda: jnp.zeros(
-            (case.num_experts, case.intermediate_size, case.hidden_size),
-            dtype=dtype,
-        ),
-        out_shardings=w2_sharding,
-    )()
+    out: dict[str, jax.Array] = {"tokens": tokens}
+    if include_weights:
+        out["w1"] = jax.jit(
+            lambda: jnp.zeros(
+                (case.num_experts, case.hidden_size, case.intermediate_size),
+                dtype=dtype,
+            ),
+            out_shardings=w1_sharding,
+        )()
+        out["w3"] = jax.jit(
+            lambda: jnp.zeros(
+                (case.num_experts, case.hidden_size, case.intermediate_size),
+                dtype=dtype,
+            ),
+            out_shardings=w3_sharding,
+        )()
+        out["w2"] = jax.jit(
+            lambda: jnp.zeros(
+                (case.num_experts, case.intermediate_size, case.hidden_size),
+                dtype=dtype,
+            ),
+            out_shardings=w2_sharding,
+        )()
     router_logits = generate_router_logits(
         case.num_tokens,
         case.num_experts,
@@ -230,13 +236,8 @@ def prepare_fused_moe_inputs(
         imbalance_factor=case.routed_scaling_factor or 3.0,
     ).astype(dtype)
     router_logits = jax.device_put(router_logits, logits_sharding)
-    return {
-        "tokens": tokens,
-        "w1": w1,
-        "w2": w2,
-        "w3": w3,
-        "router_logits": router_logits,
-    }
+    out["router_logits"] = router_logits
+    return out
 
 
 def compute_gmm_tiling(m: int, k: int, n: int) -> tuple[int, int, int]:
@@ -256,25 +257,37 @@ def format_load_info(group_sizes: jax.Array) -> str:
     return f"dispatch={total}, avg_per_expert={avg:.1f}, " f"min={sizes.min()}, max={sizes.max()}"
 
 
-def select_cases() -> Iterable[MoEBenchmarkCase]:
+def select_cases(cases: Iterable[MoEBenchmarkCase] | None = None) -> Iterable[MoEBenchmarkCase]:
     num_devices = len(jax.devices())
+    raw_cases: Iterable[MoEBenchmarkCase] = GROUP_GEMM_CASES if cases is None else cases
 
     def choose_parallelism(case: MoEBenchmarkCase) -> tuple[int, int]:
-        """Pick (ep_size, tp_size) to use all available devices when possible."""
-        ep_hint = case.ep_size or case.num_experts
-        target = min(ep_hint, case.num_experts, num_devices)
-        for ep in range(target, 0, -1):
+        """Pick (ep_size, tp_size) for benchmarks.
+
+        If `case.ep_size` is None, try EP sizes starting from device_count.
+        Always return (ep_size, tp_size) such that ep_size * tp_size == device_count.
+        """
+        if case.ep_size is None:
+            target_ep = num_devices
+        else:
+            target_ep = case.ep_size
+        target_ep = min(target_ep, case.num_experts, num_devices)
+        for ep in range(target_ep, 0, -1):
             if num_devices % ep != 0:
                 continue
             if case.num_tokens % ep != 0:
                 continue
             if case.num_experts % ep != 0:
                 continue
+            # Fused MoE kernel requires local_num_tokens to be aligned to the
+            # dtype packing (bf16/fp16 => 2). Benchmarks default to bf16.
+            if (case.num_tokens // ep) % 2 != 0:
+                continue
             return ep, num_devices // ep
         return 1, num_devices
 
     cases = []
-    for case in GROUP_GEMM_CASES:
+    for case in raw_cases:
         ep_size, tp_size = choose_parallelism(case)
         cases.append(
             MoEBenchmarkCase(
@@ -296,8 +309,13 @@ def select_cases() -> Iterable[MoEBenchmarkCase]:
     return cases
 
 
-def build_mesh(ep_size: int = 1):
+def build_mesh(ep_size: int = 1, tp_size: int = 1):
+    if ep_size <= 0 or tp_size <= 0:
+        raise ValueError(f"Expected {ep_size=} and {tp_size=} to be > 0.")
+    devices = jax.devices()[: ep_size * tp_size]
     return create_device_mesh(
-        ici_parallelism=[-1, ep_size],
+        ici_parallelism=[tp_size, ep_size],
         dcn_parallelism=[1, 1],
+        devices=devices,
+        mesh_axes=("data", "tensor"),
     )
