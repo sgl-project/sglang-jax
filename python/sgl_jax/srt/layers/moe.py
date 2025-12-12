@@ -5,6 +5,7 @@ from jax import shard_map
 from jax.sharding import Mesh
 from jax.sharding import PartitionSpec as P
 
+from sgl_jax.srt.kernels.fused_moe.v1.kernel import fused_ep_moe
 from sgl_jax.srt.kernels.gmm.megablox_gmm_backend import gmm
 
 
@@ -174,7 +175,7 @@ class TopK(nnx.Module):
 class EPMoE(nnx.Module):
     def __init__(
         self,
-        config,
+        hidden_size: int,
         num_experts: int,
         num_experts_per_tok: int,
         ep_size: int,
@@ -185,7 +186,6 @@ class EPMoE(nnx.Module):
         activation: str = "silu",
         layer_id: int = 0,
     ):
-        self.config = config
         self.num_experts = num_experts
         self.num_experts_per_tok = num_experts_per_tok
         self.intermediate_dim = intermediate_dim
@@ -196,6 +196,7 @@ class EPMoE(nnx.Module):
         self.original_mesh = mesh
         self.mesh = mesh
         self.activation = activation
+        self.hidden_size = hidden_size
         if num_experts % self.ep_size != 0:
             raise ValueError(
                 f"num_experts({num_experts}) must be divisible by ep_size ({self.ep_size})"
@@ -220,7 +221,7 @@ class EPMoE(nnx.Module):
             self.wi_0 = nnx.Param(
                 jax.random.normal(
                     jax.random.PRNGKey(0),
-                    (num_experts, config.hidden_size, intermediate_dim),
+                    (num_experts, self.hidden_size, intermediate_dim),
                     dtype=weight_dtype,
                     out_sharding=P("expert", None, "tensor"),
                 )
@@ -229,7 +230,7 @@ class EPMoE(nnx.Module):
             self.wi_1 = nnx.Param(
                 jax.random.normal(
                     jax.random.PRNGKey(0),
-                    (num_experts, config.hidden_size, intermediate_dim),
+                    (num_experts, self.hidden_size, intermediate_dim),
                     dtype=weight_dtype,
                     out_sharding=P("expert", None, "tensor"),
                 )
@@ -238,7 +239,7 @@ class EPMoE(nnx.Module):
             self.wo = nnx.Param(
                 jax.random.normal(
                     jax.random.PRNGKey(0),
-                    (num_experts, intermediate_dim, config.hidden_size),
+                    (num_experts, intermediate_dim, self.hidden_size),
                     dtype=weight_dtype,
                     out_sharding=P("expert", "tensor", None),
                 )
@@ -483,4 +484,134 @@ class EPMoE(nnx.Module):
         else:
             final_output = output.reshape(batch_size, seq_len, -1).astype(self.dtype)
 
+        return final_output
+
+
+class FusedEPMoE(nnx.Module):
+    """
+    Expert Parallel MoE layer using fused TPU kernel.
+
+    This layer wraps the optimized fused_ep_moe kernel which combines Top-K selection,
+    expert computation, and aggregation into a single efficient operation.
+
+    Key differences from EPMoE:
+    - Weight format: w1/w3 are (num_experts, hidden_size, intermediate_size) for gate/up proj
+      and w2 is (num_experts, intermediate_size, hidden_size) for down proj
+    - Input: Takes router_logits directly instead of pre-computed topk_weights/topk_ids
+    - Implementation: Uses Pallas kernel with manual memory management for TPU optimization
+
+    Args:
+        config: Model configuration
+        num_experts: Total number of experts
+        num_experts_per_tok: Number of experts to select per token (top_k)
+        ep_size: Expert parallel size (number of devices to shard experts across)
+        mesh: JAX mesh for distributed execution
+        intermediate_dim: Intermediate dimension for expert FFN
+        weight_dtype: Data type for weights
+        dtype: Data type for computation
+        activation: Activation function ("silu", "gelu", "swigluoai")
+        layer_id: Layer index (for debugging)
+        renormalize_topk_logits: Whether to renormalize top-k weights
+        bt, bf, bd1, bd2, btc, bfc, bd1c, bd2c: Tile size parameters (auto-selected if None)
+    """
+
+    def __init__(
+        self,
+        config,
+        num_experts: int,
+        num_experts_per_tok: int,
+        ep_size: int,
+        mesh: Mesh,
+        intermediate_dim: int = 2048,
+        weight_dtype: jnp.dtype = jnp.bfloat16,
+        dtype: jnp.dtype = jnp.bfloat16,
+        activation: str = "silu",
+        layer_id: int = 0,
+        renormalize_topk_logits: bool = False,
+    ):
+        self.config = config
+        self.num_experts = num_experts
+        self.num_experts_per_tok = num_experts_per_tok
+        self.intermediate_dim = intermediate_dim
+        self.weight_dtype = weight_dtype
+        self.dtype = dtype
+        self.layer_id = layer_id
+        self.ep_size = ep_size
+        self.activation = activation
+        self.renormalize_topk_logits = renormalize_topk_logits
+        self.mesh = mesh
+
+        if num_experts % self.ep_size != 0:
+            raise ValueError(
+                f"num_experts({num_experts}) must be divisible by ep_size ({self.ep_size})"
+            )
+
+        # Initialize weights.
+        self.w1 = nnx.Param(
+            jax.random.normal(
+                jax.random.key(0),
+                (num_experts, config.hidden_size, intermediate_dim),
+                dtype=weight_dtype,
+                out_sharding=P("tensor", None, None),
+            )
+        )
+        self.w3 = nnx.Param(
+            jax.random.normal(
+                jax.random.key(1),
+                (num_experts, config.hidden_size, intermediate_dim),
+                dtype=weight_dtype,
+                out_sharding=P("tensor", None, None),
+            )
+        )
+
+        self.w2 = nnx.Param(
+            jax.random.normal(
+                jax.random.key(0),
+                (num_experts, intermediate_dim, config.hidden_size),
+                dtype=weight_dtype,
+                out_sharding=P("tensor", None, None),
+            )
+        )
+
+    def __call__(self, hidden_states: jax.Array, router_logits: jax.Array) -> jax.Array:
+        """
+        Forward pass through the fused MoE layer.
+
+        Args:
+            hidden_states: Input tokens, shape (num_tokens, hidden_size) or
+                          (batch_size, seq_len, hidden_size)
+            router_logits: Router output logits, shape (num_tokens, num_experts)
+                          Note: Should be raw logits, not after softmax or top-k
+
+        Returns:
+            MoE layer output, same shape as hidden_states
+        """
+        assert hidden_states.ndim == 2
+
+        hidden_states = jax.sharding.reshard(hidden_states, P("tensor", None))
+        router_logits = jax.sharding.reshard(router_logits, P("tensor", None))
+
+        output = fused_ep_moe(
+            mesh=self.mesh,
+            tokens=hidden_states,
+            w1=self.w1.value,
+            w2=self.w2.value,
+            w3=self.w3.value,
+            gating_output=router_logits,
+            top_k=self.num_experts_per_tok,
+            renormalize_topk_logits=self.renormalize_topk_logits,
+            act_fn=self.activation,
+            block_config=None,
+            # Optional parameters (not used in basic case)
+            subc_quant_wsz=None,
+            w1_scale=None,
+            w2_scale=None,
+            w3_scale=None,
+            b1=None,
+            b2=None,
+            b3=None,
+            ep_axis_name="tensor",
+        )
+
+        final_output = jax.sharding.reshard(output, P(None))
         return final_output

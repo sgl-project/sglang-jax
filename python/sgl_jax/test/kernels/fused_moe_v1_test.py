@@ -7,7 +7,11 @@ from absl.testing import absltest, parameterized
 from jax._src import test_util as jtu
 from jax.sharding import Mesh
 
-from sgl_jax.srt.kernels.fused_moe.v1.kernel import fused_ep_moe, ref_moe
+from sgl_jax.srt.kernels.fused_moe.v1.kernel import (
+    FusedMoEBlockConfig,
+    fused_ep_moe,
+    ref_moe,
+)
 
 jax.config.parse_flags_with_absl()
 
@@ -33,41 +37,42 @@ def gen_moe_inputs(
     has_bias=False,
 ):
     key = jax.random.key(seed)
-    k0, k1, k2, k3, k4, k5, k6 = jax.random.split(key, 7)
+    k0, k1, k2, k3, k4, k5, k6, k7, k8 = jax.random.split(key, 9)
 
     a = jax.random.normal(k0, (num_tokens, hidden_size), dtype=jnp.float32).astype(dtype) / 10
 
     w1 = (
-        jax.random.normal(
-            k1,
-            (num_experts, 2, hidden_size, intermediate_size),
-            dtype=jnp.float32,
-        )
-        / 10
+        jax.random.normal(k1, (num_experts, hidden_size, intermediate_size), dtype=jnp.float32) / 10
     ).astype(dtype)
     w2 = (
         jax.random.normal(k2, (num_experts, intermediate_size, hidden_size), dtype=jnp.float32) / 10
     ).astype(dtype)
+    w3 = (
+        jax.random.normal(k3, (num_experts, hidden_size, intermediate_size), dtype=jnp.float32) / 10
+    ).astype(dtype)
 
     if has_bias:
         b1 = (
-            jax.random.normal(k3, (num_experts, 2, 1, intermediate_size), dtype=jnp.float32) / 10
+            jax.random.normal(k4, (num_experts, 1, intermediate_size), dtype=jnp.float32) / 10
         ).astype(dtype)
-        b2 = (jax.random.normal(k4, (num_experts, 1, hidden_size), dtype=jnp.float32) / 10).astype(
+        b2 = (jax.random.normal(k5, (num_experts, 1, hidden_size), dtype=jnp.float32) / 10).astype(
             dtype
         )
+        b3 = (
+            jax.random.normal(k6, (num_experts, 1, intermediate_size), dtype=jnp.float32) / 10
+        ).astype(dtype)
     else:
-        b1 = b2 = None
+        b1 = b2 = b3 = None
 
     gating_output = (
-        jax.random.normal(k5, (num_tokens, num_experts), dtype=jnp.float32)
+        jax.random.normal(k7, (num_tokens, num_experts), dtype=jnp.float32)
         + jnp.arange(num_tokens * num_experts, dtype=jnp.float32).reshape(num_tokens, num_experts)
         / 100
     )
 
     # To generate unique top-k!
     top_k_indices = jax.random.randint(
-        k6, (num_tokens, top_k), minval=0, maxval=num_experts - 1, dtype=jnp.int32
+        k8, (num_tokens, top_k), minval=0, maxval=num_experts - 1, dtype=jnp.int32
     )
 
     one_hot = (
@@ -80,7 +85,7 @@ def gen_moe_inputs(
 
     gating_output = (gating_output + one_hot).astype(dtype)
 
-    return a, w1, w2, b1, b2, gating_output
+    return a, w1, w2, w3, b1, b2, b3, gating_output
 
 
 def sub_channel_quantize(x, quant_dtype, wsz=256):
@@ -142,7 +147,7 @@ class MoEKernelTest(jtu.JaxTestCase):
         atol=2e-1,
         rtol=2e-1,
     ):
-        a, w1, w2, b1, b2, gating_output = gen_moe_inputs(
+        a, w1, w2, w3, b1, b2, b3, gating_output = gen_moe_inputs(
             dtype,
             top_k,
             num_experts,
@@ -154,17 +159,20 @@ class MoEKernelTest(jtu.JaxTestCase):
         )
         w1_scale = None
         w2_scale = None
+        w3_scale = None
         if w_dtype is not None:
             if subc_quant_wsz is None:
                 subc_quant_wsz = 256
             w1, w1_scale = sub_channel_quantize(w1, w_dtype, subc_quant_wsz)
             w2, w2_scale = sub_channel_quantize(w2, w_dtype, subc_quant_wsz)
+            w3, w3_scale = sub_channel_quantize(w3, w_dtype, subc_quant_wsz)
 
         actual = fused_ep_moe(
             mesh=self.mesh,
             tokens=a,
             w1=w1,
             w2=w2,
+            w3=w3,
             gating_output=gating_output,
             top_k=top_k,
             renormalize_topk_logits=renormalize_topk_logits,
@@ -172,31 +180,38 @@ class MoEKernelTest(jtu.JaxTestCase):
             subc_quant_wsz=subc_quant_wsz,
             w1_scale=w1_scale,
             w2_scale=w2_scale,
+            w3_scale=w3_scale,
             b1=b1,
             b2=b2,
-            bt=bt,
-            bf=bf,
-            bd1=bd1,
-            bd2=bd2,
-            btc=btc,
-            bfc=bfc,
-            bd1c=bd1c,
-            bd2c=bd2c,
+            b3=b3,
+            block_config=FusedMoEBlockConfig(
+                bt=bt,
+                bf=bf,
+                bd1=bd1,
+                bd2=bd2,
+                btc=btc,
+                bfc=bfc,
+                bd1c=bd1c,
+                bd2c=bd2c,
+            ),
             ep_axis_name="tensor",
         )
         expected = ref_moe(
             a,
             w1,
             w2,
+            w3,
             gating_output,
             top_k,
             b1=b1,
             b2=b2,
+            b3=b3,
             renormalize_topk_logits=renormalize_topk_logits,
             act_fn=act_fn,
             subc_quant_wsz=subc_quant_wsz,
             w1_scale=w1_scale,
             w2_scale=w2_scale,
+            w3_scale=w3_scale,
         )
         self.assertAllClose(actual, expected, atol=atol, rtol=rtol)
 

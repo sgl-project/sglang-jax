@@ -241,7 +241,7 @@ class Qwen2MoeDecoderLayer(nnx.Module):
                 renormalize=getattr(config, "norm_topk_prob", True),
             )
             self.mlp = EPMoE(
-                config=config,
+                hidden_size=config.hidden_size,
                 num_experts=num_experts,
                 num_experts_per_tok=num_experts_per_tok,
                 intermediate_dim=moe_intermediate_size,
@@ -582,24 +582,28 @@ class Qwen2MoeForCausalLM(nnx.Module):
 
         if use_fused:
             # Fused MoE Mapping
-            # w1: fused gate_proj(w1) + up_proj(w3) -> (num_experts, 2, hidden, intermediate)
-            # w2: down_proj(w2) -> (num_experts, intermediate, hidden)
+            # w1: gate_proj -> (num_experts, hidden, intermediate)
+            # w3: up_proj   -> (num_experts, hidden, intermediate)
+            # w2: down_proj -> (num_experts, intermediate, hidden)
 
-            # 1. Fused w1 (gate + up)
             target_path_w1 = [f"{target_prefix}.mlp.w1"]
-            # Add source keys for gate_proj and up_proj
-            for name in ["gate_proj", "up_proj"]:
-                target_path_w1.extend(
-                    [f"{prefix}.mlp.experts.{i}.{name}.weight" for i in range(num_experts)]
-                )
-
+            target_path_w1.extend(
+                [f"{prefix}.mlp.experts.{i}.gate_proj.weight" for i in range(num_experts)]
+            )
             mappings[f"__MOE_EXPERTS__{prefix}.mlp.w1"] = WeightMapping(
                 target_path=target_path_w1,
-                sharding=("tensor", None, None, None),  # (E, 2, H, I)
+                sharding=("tensor", None, None),  # (E, H, I)
                 transpose=True,
-                concat_axis=0,
-                fuse_moe_weights=True,
-                fuse_gate_up=("gate_proj", "up_proj"),
+            )
+
+            target_path_w3 = [f"{target_prefix}.mlp.w3"]
+            target_path_w3.extend(
+                [f"{prefix}.mlp.experts.{i}.up_proj.weight" for i in range(num_experts)]
+            )
+            mappings[f"__MOE_EXPERTS__{prefix}.mlp.w3"] = WeightMapping(
+                target_path=target_path_w3,
+                sharding=("tensor", None, None),  # (E, H, I)
+                transpose=True,
             )
 
             # 2. w2 (down)
@@ -612,7 +616,6 @@ class Qwen2MoeForCausalLM(nnx.Module):
                 target_path=target_path_w2,
                 sharding=("tensor", None, None),  # (E, I, H)
                 transpose=True,
-                concat_axis=-1,
             )
         else:
             for expert_type in ["gate_proj", "up_proj", "down_proj"]:

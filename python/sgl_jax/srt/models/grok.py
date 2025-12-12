@@ -260,7 +260,7 @@ class Grok1MoE(nnx.Module):
             )
         else:
             self.experts = EPMoE(
-                config=config,
+                hidden_size=config.hidden_size,
                 num_experts=num_experts,
                 num_experts_per_tok=self.top_k,
                 intermediate_dim=intermediate_size,
@@ -938,32 +938,39 @@ class Grok1ForCausalLM(nnx.Module):
 
         if use_fused:
             # Fused MoE Mapping
-            # w1: fused gate(w1) + up(w3) -> (num_experts, 2, hidden, intermediate)
+            # w1: gate(w1) -> (num_experts, hidden, intermediate)
+            # w3: up(w3)   -> (num_experts, hidden, intermediate)
             # w2: down(w2) -> (num_experts, intermediate, hidden)
 
-            # 1. Fused w1 (gate + up)
-            target_path_w1 = [f"{target_prefix}.block_sparse_moe.w1"]
-            # Add source keys for w1 (gate) and w3 (up)
-            # Note: Grok experts are 0..N-1
-            for name in ["w1", "w3"]:
-                target_path_w1.extend(
-                    [
-                        f"{prefix}.block_sparse_moe.experts.{i}.{name}.weight"
-                        for i in range(self.config.num_local_experts)
-                    ]
-                )
-
+            target_path_w1 = [f"{target_prefix}.block_sparse_moe.experts.w1"]
+            target_path_w1.extend(
+                [
+                    f"{prefix}.block_sparse_moe.experts.{i}.w1.weight"
+                    for i in range(self.config.num_local_experts)
+                ]
+            )
             mappings[f"__MOE_EXPERTS__{prefix}.block_sparse_moe.w1"] = WeightMapping(
                 target_path=target_path_w1,
-                sharding=("tensor", None, None, None),  # (E, 2, H, I)
+                sharding=("tensor", None, None),  # (E, H, I)
                 transpose=True,
-                concat_axis=0,  # concat along E axis
-                fuse_moe_weights=True,
-                fuse_gate_up=("w1", "w3"),
+                concat_axis=0,
             )
 
-            # 2. w2 (down)
-            target_path_w2 = [f"{target_prefix}.block_sparse_moe.w2"]
+            target_path_w3 = [f"{target_prefix}.block_sparse_moe.experts.w3"]
+            target_path_w3.extend(
+                [
+                    f"{prefix}.block_sparse_moe.experts.{i}.w3.weight"
+                    for i in range(self.config.num_local_experts)
+                ]
+            )
+            mappings[f"__MOE_EXPERTS__{prefix}.block_sparse_moe.w3"] = WeightMapping(
+                target_path=target_path_w3,
+                sharding=("tensor", None, None),  # (E, H, I)
+                transpose=True,
+                concat_axis=0,
+            )
+
+            target_path_w2 = [f"{target_prefix}.block_sparse_moe.experts.w2"]
             target_path_w2.extend(
                 [
                     f"{prefix}.block_sparse_moe.experts.{i}.w2.weight"

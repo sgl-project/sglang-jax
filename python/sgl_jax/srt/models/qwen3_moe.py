@@ -211,7 +211,7 @@ class QWen3MoeDecoderLayer(nnx.Module):
                     renormalize=config.norm_topk_prob,
                 )
                 self.mlp = EPMoE(
-                    config=config,
+                    hidden_size=config.hidden_size,
                     num_experts=num_experts,
                     num_experts_per_tok=num_experts_per_tok,
                     intermediate_dim=moe_intermediate_size,
@@ -509,19 +509,24 @@ class Qwen3MoeForCausalLM(nnx.Module):
 
             if use_fused:
                 # Fused MoE Mapping
-                # w1: fused gate_proj(w1) + up_proj(w3) -> (num_experts, 2, hidden, intermediate)
-                # w2: down_proj(w2) -> (num_experts, intermediate, hidden)
-                w1_expert_keys = []
-                for expert_type in ["gate_proj", "up_proj"]:
-                    w1_expert_keys = w1_expert_keys + [
-                        f"{prefix}.mlp.experts.{i}.{expert_type}.weight" for i in range(num_experts)
-                    ]
+                # w1: gate_proj -> (num_experts, hidden, intermediate)
+                # w3: up_proj   -> (num_experts, hidden, intermediate)
+                # w2: down_proj -> (num_experts, intermediate, hidden)
+                w1_expert_keys = [
+                    f"{prefix}.mlp.experts.{i}.gate_proj.weight" for i in range(num_experts)
+                ]
                 mappings[f"__MOE_EXPERTS__{prefix}.mlp.w1"] = WeightMapping(
                     target_path=[f"{target_prefix}.mlp.w1"] + w1_expert_keys,
-                    sharding=("tensor", None, None, None),  # (E, 2, H, I)
+                    sharding=("tensor", None, None),  # (E, H, I)
                     transpose=True,
-                    fuse_moe_weights=True,
-                    fuse_gate_up=("gate_proj", "up_proj"),
+                )
+                w3_expert_keys = [
+                    f"{prefix}.mlp.experts.{i}.up_proj.weight" for i in range(num_experts)
+                ]
+                mappings[f"__MOE_EXPERTS__{prefix}.mlp.w3"] = WeightMapping(
+                    target_path=[f"{target_prefix}.mlp.w3"] + w3_expert_keys,
+                    sharding=("tensor", None, None),  # (E, H, I)
+                    transpose=True,
                 )
                 w2_expert_keys = [
                     f"{prefix}.mlp.experts.{i}.down_proj.weight" for i in range(num_experts)

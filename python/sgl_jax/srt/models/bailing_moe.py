@@ -6,12 +6,12 @@ from flax import nnx
 from jax import numpy as jnp
 from transformers import PretrainedConfig
 
-from sgl_jax.srt.configs.model_config import ModelConfig
+from sgl_jax.srt.configs.model_config import ModelConfig, MoEBackend
 from sgl_jax.srt.layers.embeddings import Embed, ParallelLMHead, RotaryEmbedding
 from sgl_jax.srt.layers.layernorm import RMSNorm
 from sgl_jax.srt.layers.linear import LinearBase
 from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
-from sgl_jax.srt.layers.moe import EPMoE, GateLogit, TopK
+from sgl_jax.srt.layers.moe import EPMoE, FusedEPMoE, GateLogit, TopK
 from sgl_jax.srt.layers.radix_attention import RadixAttention
 from sgl_jax.srt.mem_cache.memory_pool import KVCache
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
@@ -260,12 +260,10 @@ class BailingMoEDecoderLayer(nnx.Module):
                 score_func=getattr(config, "score_function", "sigmoid"),
             )
 
-            self.moe_backend = getattr(config, "moe_backend", "epmoe")
-            self.use_fused = self.moe_backend == "fused"
+            self.moe_backend = getattr(config, "moe_backend", MoEBackend.EPMOE)
+            self.use_fused = self.moe_backend == MoEBackend.FUSED
 
             if self.use_fused:
-                from sgl_jax.srt.layers.fused_moe import FusedEPMoE
-
                 self.mlp = FusedEPMoE(
                     config=config,
                     num_experts=config.num_experts,
@@ -287,7 +285,7 @@ class BailingMoEDecoderLayer(nnx.Module):
                     routed_scaling_factor=config.routed_scaling_factor,
                 )
                 self.mlp = EPMoE(
-                    config=config,
+                    hidden_size=config.hidden_size,
                     num_experts=config.num_experts,
                     num_experts_per_tok=config.num_experts_per_tok,
                     intermediate_dim=config.moe_intermediate_size,
@@ -601,37 +599,34 @@ class BailingMoEForCausalLM(nnx.Module):
 
             if use_fused:
                 # Fused MoE Mapping
-                # w1: fused gate_proj(w1) + up_proj(w3) -> (num_experts, 2, hidden, intermediate)
-                # w2: down_proj(w2) -> (num_experts, intermediate, hidden)
+                # w1: gate_proj -> (num_experts, hidden, intermediate)
+                # w3: up_proj   -> (num_experts, hidden, intermediate)
+                # w2: down_proj -> (num_experts, intermediate, hidden)
 
-                # 1. Fused w1 (gate + up)
-                target_path_w1 = [f"{target_prefix}.mlp.w1"]
-                # Add source keys for gate_proj and up_proj
-                for name in ["gate_proj", "up_proj"]:
-                    target_path_w1.extend(
-                        [f"{prefix}.mlp.experts.{i}.{name}.weight" for i in range(num_experts)]
+                def _add_expert_weight(
+                    *,
+                    target_name: str,
+                    hf_name: str,
+                    sharding: tuple[str | None, ...],
+                ) -> None:
+                    target_path = [f"{target_prefix}.mlp.{target_name}"]
+                    target_path.extend(
+                        [f"{prefix}.mlp.experts.{i}.{hf_name}.weight" for i in range(num_experts)]
+                    )
+                    mappings[f"__MOE_EXPERTS__{prefix}.mlp.{target_name}"] = WeightMapping(
+                        target_path=target_path,
+                        sharding=sharding,
+                        transpose=True,
                     )
 
-                mappings[f"__MOE_EXPERTS__{prefix}.mlp.w1"] = WeightMapping(
-                    target_path=target_path_w1,
-                    sharding=("tensor", None, None, None),  # (E, 2, H, I)
-                    transpose=True,
-                    concat_axis=0,
-                    fuse_moe_weights=True,
-                    fuse_gate_up=("gate_proj", "up_proj"),
+                _add_expert_weight(
+                    target_name="w1", hf_name="gate_proj", sharding=("tensor", None, None)
                 )
-
-                # 2. w2 (down)
-                target_path_w2 = [f"{target_prefix}.mlp.w2"]
-                target_path_w2.extend(
-                    [f"{prefix}.mlp.experts.{i}.down_proj.weight" for i in range(num_experts)]
+                _add_expert_weight(
+                    target_name="w3", hf_name="up_proj", sharding=("tensor", None, None)
                 )
-
-                mappings[f"__MOE_EXPERTS__{prefix}.mlp.w2"] = WeightMapping(
-                    target_path=target_path_w2,
-                    sharding=("tensor", None, None),  # (E, I, H)
-                    transpose=True,
-                    concat_axis=-1,
+                _add_expert_weight(
+                    target_name="w2", hf_name="down_proj", sharding=("tensor", None, None)
                 )
             else:
                 for expert_type in ["gate_proj", "up_proj", "down_proj"]:
