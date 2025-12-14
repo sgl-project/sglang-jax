@@ -295,7 +295,7 @@ class AttentionBlock(nnx.Module):
         self.attn = RadixAttention(
             num_heads=self.num_attention_heads,
             head_dim=self.head_dim,
-            scaling=self.scaling,
+            scaling=None,
             num_kv_heads=self.num_key_value_heads,
             layer_id=layer_idx,
             sliding_window_size=self.sliding_window,
@@ -331,7 +331,8 @@ class AttentionBlock(nnx.Module):
         k, _ = self.k_proj(t)
         v, _ = self.v_proj(t) # TODO: v 的精度有问题
 
-        q = q.reshape(-1, self.num_key_value_heads, self.num_attention_heads // self.num_key_value_heads, self.head_dim)
+        # q_dim = self.num_attention_heads * self.head_dim
+        q = q.reshape(-1, self.num_attention_heads, self.head_dim)
         k = k.reshape(-1, self.num_key_value_heads, self.head_dim)
         v = v.reshape(-1, self.num_key_value_heads, self.head_dim)
 
