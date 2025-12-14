@@ -152,8 +152,7 @@ def apply_qwix_quantization(
                     FlashAttention,
 )
         qwix_config_dict = quantization_config_file_path_to_dict(
-                # TODO: fix since it is hardcoded
-                os.path.join("int8_all_modules_w_only.yaml")
+                os.path.join(model_config.quantization_config_path)
         )
         qwix_config = qwix_config_dict.get("qwix").get("rules")
         

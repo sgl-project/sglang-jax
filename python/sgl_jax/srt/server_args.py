@@ -49,7 +49,7 @@ class ServerArgs:
     dtype: str = "auto"
     quantization: str | None = None
     quantization_param_path: str | None = None
-    quantization_post_dtype: str | None = None
+    quantization_config_path: str | None = None
     kv_cache_dtype: str = "auto"
 
     # Memory and scheduling
@@ -417,12 +417,11 @@ class ServerArgs:
             "default to 1.0, which may cause accuracy issues. ",
         )
         parser.add_argument(
-            "--post-quantization",
+            "--quantization-config-path",
             dest="quantization_post_dtype",
-            choices=["fp8", "int8"],
             type=str,
             default=None,
-            help="The datatype of the post-quantized weight.",
+            help="The config path for how to apply quantization to loaded model."
         )
         parser.add_argument(
             "--kv-cache-dtype",
