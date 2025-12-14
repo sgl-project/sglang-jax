@@ -17,11 +17,10 @@ from qwix._src.core.qarray import QArray
 from qwix._src.providers import ptq
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
 
-from sgl_jax.srt.sampling.sampling_batch_info import SamplingBatchInfo, SamplingMetadata
+from sgl_jax.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sgl_jax.srt.layers.logits_processor import LogitsMetadata
 from sgl_jax.srt.managers.schedule_batch import (
     ModelWorkerBatch,
-    global_server_args_dict,
 )
 from sgl_jax.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
@@ -31,80 +30,9 @@ from sgl_jax.srt.configs.model_config import ModelConfig
 import numpy as np
 from sgl_jax.srt.mem_cache.memory_pool import KVCache, MHATokenToKVPool
 
-# from tpu_inference import utils
-# from tpu_inference.layers.common.attention_metadata import AttentionMetadata
-# from tpu_inference.logger import init_logger
-# from tpu_inference.runner.kv_cache import (DEFAULT_KV_CACHE_DTYPE,
-#                                            create_kv_caches)
-# from tpu_inference.utils import device_array
 
-# logger = init_logger(__name__)
-import logging
+
 QUANTIZATION_CONFIG_PATH = os.path.join(os.path.dirname(__file__), "configs")
-DEFAULT_NUM_BLOCKS_FOR_JIT_KV_CACHE = 2000
-DEFAULT_NUM_TOKENS_FOR_MODEL_INPUTS = 512
-DEFAULT_MAX_NUM_SEQS_FOR_MODEL_INPUTS = 256
-DEFAULT_MAX_NUM_BLOCKS_PER_REQ = 16
-
-DEFAULT_DEEPSEEK_FP8_CONFIG = {
-    "qwix": {
-        "use_abstract_model":
-        True,
-        "scale_dtype":
-        "bfloat16",
-        "rules": [
-            {
-                "module_path": ".*.custom_module.router.*",
-                "weight_qtype": None,
-            },
-            {
-                "module_path": ".*",
-                "weight_qtype": "float8_e4m3fn",
-                "act_qtype": "float8_e4m3fn",
-            },
-        ],
-    }
-}
-
-DEFAULT_LLAMA4_FP8_CONFIG = {
-    "qwix": {
-        "use_abstract_model":
-        True,
-        "scale_dtype":
-        "bfloat16",
-        "rules": [
-            {
-                "module_path": "layers.*.moe_ffw",
-                "op_names": "einsum",
-                "weight_qtype": "float8_e4m3fn",
-                "act_qtype": "float8_e4m3fn",
-            },
-        ],
-    }
-}
-
-# Default Qwix config for GPT-OSS MXFP4 checkpoints.
-# Notes:
-# - We quantize only the MoE expert weights by default (router stays in BF16).
-# - We use Qwix's abstract-model path so weights can be set directly into QArray
-#   fields during weight loading (similar to DeepSeek's flow).
-# - Activation quantization is not set but Qwix would pickup MoE sum if activated
-DEFAULT_GPT_OSS_FP4_CONFIG = {
-    "qwix": {
-        "use_abstract_model":
-        True,
-        "scale_dtype":
-        "bfloat16",
-        "rules": [
-            {
-                "module_path": ".*custom_module",
-                "weight_qtype": "float4_e2m1fn",
-                "act_qtype": None,
-                "tile_size": 32,
-            },
-        ],
-    }
-}
 
 
 def parse_qwix_config_to_rules(
@@ -132,8 +60,6 @@ def qwix_quantize_nnx_model(qwix_config: List[dict],
                             head_num: int,
                             head_dim: int,
                             layer_num: int,
-                            vocab_size: int,
-                            max_seq_len: int = 4096,
                             model: nnx.Module = None,
                             ) -> nnx.Module:
     """
@@ -171,19 +97,9 @@ def qwix_quantize_nnx_model(qwix_config: List[dict],
                                         head_dim=head_dim, layer_num=layer_num,
                                         mesh=mesh)
     qwix_rules = parse_qwix_config_to_rules(qwix_config)
-    logging.info(f"Qwix rules: {qwix_rules}")
-    # logging.info(f"Memory usage before applying quantization of params: "
-    #             f"hbm={utils.hbm_usage_gb(jax.local_devices())}Gb")
-
-    # TODO (jacobplatin): we should refactor this to pass a dtype (or config) directly
-    
-    
     logits_metadata = LogitsMetadata.from_model_worker_batch(model_worker_batch, mesh)
-    
     attn_backend.forward_metadata = attn_backend.get_forward_metadata(model_worker_batch)
-    
     forward_batch = ForwardBatch.init_from_batch(model_worker_batch, mesh, attn_backend)
-
     model_input = {
         "forward_batch": forward_batch,
         "token_to_kv_pool": token_to_kv_pool,
@@ -231,17 +147,38 @@ def quantization_config_file_path_to_dict(
 
 
 def apply_qwix_quantization(
-        model_config: ModelConfig, model: nnx.Module, mesh: Mesh, attn_backend) -> nnx.Module:
-        qwix_config = quantization_config_file_path_to_dict(
+        model_config: ModelConfig, model: nnx.Module, mesh: Mesh) -> nnx.Module:
+        from sgl_jax.srt.layers.attention.flashattention_backend import (
+                    FlashAttention,
+)
+        qwix_config_dict = quantization_config_file_path_to_dict(
                 # TODO: fix since it is hardcoded
                 os.path.join("int8_all_modules_w_only.yaml")
         )
-        qwix_config = qwix_config.get("qwix").get("rules")
+        qwix_config = qwix_config_dict.get("qwix").get("rules")
         
         bs = 1
-        num_tokens = model_config.vocab_size
         max_seq_len = 4096
-        model_worker_batch = generate_mock_model_worker_batch(bs, num_tokens, ForwardMode.DECODE, model_config.vocab_size, max_seq_len)
+        page_size = 1
+        num_tokens = model_config.vocab_size
+        num_attn_heads = model_config.num_attention_heads
+        num_kv_heads = model_config.get_total_num_kv_heads_with_replication(mesh.shape["tensor"])
+        head_dim = model_config.head_dim
+        vocab_size = model_config.vocab_size
+        layer_num = model_config.num_hidden_layers
+        
+        
+        model_worker_batch = generate_mock_model_worker_batch(bs, num_tokens, ForwardMode.DECODE, vocab_size, max_seq_len)
+        # prepare attn_backend
+        attn_backend = FlashAttention(
+            num_attn_heads=num_attn_heads,
+            num_kv_heads=num_kv_heads,
+            head_dim=head_dim,
+            page_size=page_size,
+            mesh=mesh,
+        )
+        
+        
         qwix_quantize_nnx_model_with_config_and_attn_backend = functools.partial(
             qwix_quantize_nnx_model, qwix_config=qwix_config, model_worker_batch=model_worker_batch)
         with jax.set_mesh(mesh):
@@ -252,16 +189,12 @@ def apply_qwix_quantization(
                         "head_num",
                         "head_dim",
                         "layer_num",
-                        "vocab_size",
-                        "max_seq_len",
                     ))(
                     attn_backend=attn_backend,
                     mesh=mesh,
-                    head_num=model_config.get_total_num_kv_heads_with_replication(mesh.shape["tensor"]),
-                    head_dim=(model_config.head_dim + 127) // 128 * 128,
-                    layer_num=model_config.num_hidden_layers,
-                    vocab_size=model_config.vocab_size,
-                    max_seq_len=4096,
+                    head_num=num_attn_heads,
+                    head_dim=(head_dim + 127) // 128 * 128,
+                    layer_num=layer_num,
                     model=model)
         return model
 

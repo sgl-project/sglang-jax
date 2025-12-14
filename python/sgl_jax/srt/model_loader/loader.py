@@ -67,7 +67,6 @@ class JAXModelLoader(BaseModelLoader):
         self,
         *,
         model_config: ModelConfig,
-        attn_backend,
     ) -> Any:
         # prepare model file
         hf_folder = self.download_model(model_config)
@@ -76,7 +75,7 @@ class JAXModelLoader(BaseModelLoader):
         model = self._initialize_model(model_config)
 
         # Load weights
-        jit_model = self._get_model(model, model_config, attn_backend)
+        jit_model = self._get_model(model, model_config)
 
         return jit_model
 
@@ -91,7 +90,7 @@ class JAXModelLoader(BaseModelLoader):
 
         return model_class
 
-    def _get_model(self, model_class: Any, model_config: ModelConfig, attn_backend) -> nnx.Module:
+    def _get_model(self, model_class: Any, model_config: ModelConfig) -> nnx.Module:
         logging.info("model_config quantization_post_dtype: %s", model_config.quantization_post_dtype)
         with jax.set_mesh(self.mesh):
             model = nnx.eval_shape(
@@ -100,11 +99,6 @@ class JAXModelLoader(BaseModelLoader):
                 )
             )
         model.load_weights(model_config)
-        
-        if model_config.quantization_post_dtype != None:
-            logging.info("Applying Qwix quantization to the model")
-            model = apply_qwix_quantization(model_config, model, self.mesh, attn_backend)
-            
         return model
 
     def _maybe_download_from_modelscope(self, model: str, revision: str | None) -> str | None:
