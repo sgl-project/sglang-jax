@@ -242,19 +242,65 @@ class AttentionBlock(nnx.Module):
 
         # Sink tokens parameter
         self.sinks = nnx.Param(jnp.zeros((config.num_attention_heads,), dtype))
-        # self.norm = RMSNorm(config.hidden_size, config, rngs=rngs)
         self.norm = RMSNorm(config.hidden_size, epsilon=1e-5, param_dtype=dtype)
 
         # QKV projection
         qkv_dim = config.head_dim * (config.num_attention_heads + 2 * config.num_key_value_heads)
         # self.qkv = nnx.Linear(config.hidden_size, qkv_dim, use_bias=False, dtype=jnp.bfloat16, rngs=rngs)
-        self.qkv = LinearBase(
+        # self.qkv = LinearBase(
+        #     config.hidden_size,
+        #     qkv_dim,
+        #     mesh,
+        #     use_bias=False,
+        #     params_dtype=dtype,
+        #     kernel_axes=(None, "tensor"))
+        q_dim = self.num_attention_heads * self.head_dim
+        self.q_proj = LinearBase(
             config.hidden_size,
-            qkv_dim,
+            q_dim,
             mesh,
-            use_bias=False,
+            use_bias=True,
             params_dtype=dtype,
-            kernel_axes=(None, "tensor"))
+            kernel_axes=("tensor", None))
+
+
+        kv_dim = self.num_key_value_heads * self.head_dim
+        self.k_proj = LinearBase(
+            config.hidden_size,
+            kv_dim,
+            mesh,
+            use_bias=True,
+            params_dtype=dtype,
+            kernel_axes=("tensor", None))
+        self.v_proj = LinearBase(
+            config.hidden_size,
+            kv_dim,
+            mesh,
+            use_bias=True,
+            params_dtype=dtype,
+            kernel_axes=("tensor", None))
+
+        self.sm_scale = 1.0 / math.sqrt(config.head_dim)
+        self.rope = RotaryEmbedding(
+            config.head_dim,
+            config.rope_theta,
+            initial_context_length=config.initial_context_length,
+            scaling_factor=config.rope_scaling["factor"],
+            # ntk_alpha=config.rope_ntk_alpha,
+            ntk_alpha=config.rope_scaling["beta_slow"],
+            # ntk_beta=config.rope_ntk_beta,
+            ntk_beta=config.rope_scaling["beta_fast"]
+        )
+
+
+        # self.attn = RadixAttention(
+        #     num_heads=num_heads,
+        #     head_dim=self.head_dim,
+        #     scaling=self.scaling,
+        #     num_kv_heads=num_heads,
+        #     layer_id=layer_idx,
+        #     sliding_window_size=self.sliding_window,
+        # )
 
         # Output projection
         # self.out = nnx.Linear(
@@ -272,41 +318,31 @@ class AttentionBlock(nnx.Module):
             params_dtype=dtype,
             kernel_axes=(None, "tensor"))
 
-        self.sm_scale = 1.0 / math.sqrt(config.head_dim)
-        self.rope = RotaryEmbedding(
-            config.head_dim,
-            config.rope_theta,
-            initial_context_length=config.initial_context_length,
-            scaling_factor=config.rope_scaling["factor"],
-            # ntk_alpha=config.rope_ntk_alpha,
-            ntk_alpha=config.rope_scaling["beta_slow"],
-            # ntk_beta=config.rope_ntk_beta,
-            ntk_beta=config.rope_scaling["beta_fast"]
-        )
 
-    def __call__(self, x: Array) -> Array:
-        t = self.norm(x)
-        qkv, _ = self.qkv(t)
 
-        # Split QKV
-        # qkv shape: [batch, seq_len, qkv_dim]
-        # qkv_dim = num_attention_heads * head_dim + 2 * num_key_value_heads * head_dim
-        q_dim = self.num_attention_heads * self.head_dim
-        kv_dim = self.num_key_value_heads * self.head_dim
-        q = qkv[:, :, :q_dim]  # [batch, seq_len, num_attention_heads * head_dim]
-        k = qkv[:, :, q_dim:q_dim + kv_dim]  # [batch, seq_len, num_key_value_heads * head_dim]
-        v = qkv[:, :, q_dim + kv_dim:q_dim + 2 * kv_dim]  # [batch, seq_len, num_key_value_heads * head_dim]
+    def __call__(
+        self,
+        positions: jax.Array,
+        hidden_states: jax.Array,
+        forward_batch: ForwardBatch,
+        token_to_kv_pool: KVCache
+    ):
+        t = self.norm(hidden_states)
+        q, _ = self.q_proj(t)
+        k, _ = self.k_proj(t)
+        v, _ = self.v_proj(t) # TODO: v 的精度有问题
 
-        # Reshape for attention
         q = q.reshape(-1, self.num_key_value_heads, self.num_attention_heads // self.num_key_value_heads, self.head_dim)
         k = k.reshape(-1, self.num_key_value_heads, self.head_dim)
         v = v.reshape(-1, self.num_key_value_heads, self.head_dim)
 
-        # Apply RoPE
         q, k = self.rope(q, k)
 
         # Apply attention
-        t = sdpa(q, k, v, self.sinks.value, self.sm_scale, self.sliding_window)
+
+        attn_output, kv_fused = self.attn(q, k, v, forward_batch, token_to_kv_pool)
+
+        #t = sdpa(q, k, v, self.sinks.value, self.sm_scale, self.sliding_window)
         t = self.out(t)
         t = x + t
         return t
@@ -514,12 +550,6 @@ class GptOssModel(nnx.Module):
         mesh: jax.sharding.Mesh,
         dtype: jnp.dtype
     ):
-        # self.embedding = nnx.Embed(
-        #         num_embeddings=config.vocab_size,
-        #         features=config.hidden_size,
-        #         dtype=jnp.bfloat16,
-        #         rngs=rngs,
-        #     )
         self.embedding = Embed(
             num_embeddings=config.vocab_size,
             features=config.hidden_size,
@@ -567,11 +597,12 @@ class GptOssModel(nnx.Module):
         )
         layers_callback_flag.append(callback_flag)
 
-        return x, None, layers_callback_flag
         for block in self.block:
             x, kv_fused, callback_flag = block(x)
             layers_kv_fused.append(kv_fused)
             layers_callback_flag.extend(callback_flag)
+
+            return x, None, layers_callback_flag
 
         x = self.norm(x)
         x = self.unembedding(x)
@@ -614,7 +645,70 @@ class GptOssForCausalLM(nnx.Module):
                 sharding=("tensor", None),
                 transpose=False,
             ),
-            }
+        }
+
+        num_layers = self.config.num_hidden_layers
+        for layer_idx in range(num_layers):
+            prefix = f"model.layers.{layer_idx}"
+            target_prefix = f"model.block.{layer_idx}"
+            mappings.update({
+                f"{prefix}.input_layernorm.weight": WeightMapping(
+                    target_path=f"{target_prefix}.attn.norm.scale",
+                    # sharding=("tensor", None),
+                    transpose=False,
+                ),
+            })
+            mappings.update({
+                f"{prefix}.self_attn.q_proj.bias": WeightMapping(
+                    target_path=f"{target_prefix}.attn.q_proj.bias",
+                    sharding=("tensor", ),
+                    transpose=False,
+                ),
+            })
+            mappings.update({
+                f"{prefix}.self_attn.q_proj.weight": WeightMapping(
+                    target_path=f"{target_prefix}.attn.q_proj.weight",
+                    sharding=(None, "tensor"),
+                    transpose=True,
+                ),
+            })
+            mappings.update({
+                f"{prefix}.self_attn.k_proj.bias": WeightMapping(
+                    target_path=f"{target_prefix}.attn.k_proj.bias",
+                    sharding=("tensor", ),
+                    transpose=False,
+                ),
+            })
+            mappings.update({
+                f"{prefix}.self_attn.k_proj.weight": WeightMapping(
+                    target_path=f"{target_prefix}.attn.k_proj.weight",
+                    sharding=(None, "tensor"),
+                    transpose=True,
+                ),
+            })
+            mappings.update({
+                f"{prefix}.self_attn.v_proj.bias": WeightMapping(
+                    target_path=f"{target_prefix}.attn.v_proj.bias",
+                    sharding=("tensor", ),
+                    transpose=False,
+                ),
+            })
+            mappings.update({
+                f"{prefix}.self_attn.v_proj.weight": WeightMapping(
+                    target_path=f"{target_prefix}.attn.v_proj.weight",
+                    sharding=(None, "tensor"),
+                    transpose=True,
+                ),
+            })
+            mappings.update({
+                f"{prefix}.self_attn.sinks": WeightMapping(
+                    target_path=f"{target_prefix}.attn.sinks",
+                    sharding=('tensor', ),
+                    transpose=False,
+                ),
+            })
+
+
         return mappings
 
     def __call__(
