@@ -124,7 +124,7 @@ class RotaryEmbedding(nnx.Module):
         self.ntk_alpha = ntk_alpha
         self.ntk_beta = ntk_beta
 
-    def _compute_concentration_and_inv_freq(self, num_tokens: int) -> Tuple[jnp.ndarray, jnp.ndarray]:
+    def _compute_concentration_and_inv_freq(self) -> Tuple[jnp.ndarray, jnp.ndarray]:
         """See YaRN paper: https://arxiv.org/abs/2309.00071"""
         freq = self.base ** (jnp.arange(0, self.head_dim, 2, dtype=jnp.float32) / self.head_dim)
 
@@ -157,18 +157,17 @@ class RotaryEmbedding(nnx.Module):
 
         return concentration, inv_freq
 
-    def _compute_cos_sin(self, num_tokens: int):
-        concentration, inv_freq = self._compute_concentration_and_inv_freq(num_tokens)
-        t = jnp.arange(num_tokens, dtype=jnp.float32)
-        freqs = jnp.einsum("i,j->ij", t, inv_freq)
+    def _compute_cos_sin(self, positions):
+        concentration, inv_freq = self._compute_concentration_and_inv_freq()
+        positions = positions.astype(jnp.float32)
+        freqs = jnp.einsum("i,j->ij", positions, inv_freq)
         cos = jnp.cos(freqs) * concentration
         sin = jnp.sin(freqs) * concentration
         return cos, sin
 
-    @jax.named_scope("rope")
-    def __call__(self, query: jnp.ndarray, key: jnp.ndarray) -> Tuple[jnp.ndarray, jnp.ndarray]:
+    def __call__(self, positions, query: jnp.ndarray, key: jnp.ndarray) -> Tuple[jnp.ndarray, jnp.ndarray]:
         num_tokens = query.shape[0]
-        cos, sin = self._compute_cos_sin(num_tokens)
+        cos, sin = self._compute_cos_sin(positions)
 
         query_shape = query.shape
         query = query.reshape(num_tokens, -1, self.head_dim)
@@ -286,21 +285,21 @@ class AttentionBlock(nnx.Module):
             config.rope_theta,
             initial_context_length=config.initial_context_length,
             scaling_factor=config.rope_scaling["factor"],
+            # TODO
             # ntk_alpha=config.rope_ntk_alpha,
             ntk_alpha=config.rope_scaling["beta_slow"],
             # ntk_beta=config.rope_ntk_beta,
             ntk_beta=config.rope_scaling["beta_fast"]
         )
 
-
-        # self.attn = RadixAttention(
-        #     num_heads=num_heads,
-        #     head_dim=self.head_dim,
-        #     scaling=self.scaling,
-        #     num_kv_heads=num_heads,
-        #     layer_id=layer_idx,
-        #     sliding_window_size=self.sliding_window,
-        # )
+        self.attn = RadixAttention(
+            num_heads=self.num_attention_heads,
+            head_dim=self.head_dim,
+            scaling=self.scaling,
+            num_kv_heads=self.num_key_value_heads,
+            layer_id=layer_idx,
+            sliding_window_size=self.sliding_window,
+        )
 
         # Output projection
         # self.out = nnx.Linear(
@@ -322,11 +321,11 @@ class AttentionBlock(nnx.Module):
 
     def __call__(
         self,
-        positions: jax.Array,
         hidden_states: jax.Array,
         forward_batch: ForwardBatch,
         token_to_kv_pool: KVCache
     ):
+        positions = forward_batch.positions
         t = self.norm(hidden_states)
         q, _ = self.q_proj(t)
         k, _ = self.k_proj(t)
@@ -336,8 +335,16 @@ class AttentionBlock(nnx.Module):
         k = k.reshape(-1, self.num_key_value_heads, self.head_dim)
         v = v.reshape(-1, self.num_key_value_heads, self.head_dim)
 
-        q, k = self.rope(q, k)
+        q, k = self.rope(positions, q, k)
 
+        # attn_output, kv_fused = forward_batch.attn_backend(
+        #     q,
+        #     k,
+        #     v,
+        #     self,
+        #     forward_batch,
+        #     token_to_kv_pool,
+        # )
         # Apply attention
 
         attn_output, kv_fused = self.attn(q, k, v, forward_batch, token_to_kv_pool)
@@ -526,9 +533,17 @@ class TransformerBlock(nnx.Module):
         self.attn = AttentionBlock(config, mesh, layer_idx, dtype)
         self.mlp = MLPBlock(config, mesh, dtype)
 
-    def __call__(self, x: Array) -> Array:
+    def __call__(
+        self,
+        hidden_states,
+        forward_batch,
+        token_to_kv_pool
+    ) -> Array:
         layer_callback_flag = []
-        x = self.attn(x)
+        x = self.attn(
+            hidden_states,
+            forward_batch,
+            token_to_kv_pool)
         attn_callback_flag = precision_tracer.jit_pure_callback_record(
             x, "self_attn_output", "SELF_ATTN", self.layer_idx
         )
@@ -598,7 +613,7 @@ class GptOssModel(nnx.Module):
         layers_callback_flag.append(callback_flag)
 
         for block in self.block:
-            x, kv_fused, callback_flag = block(x)
+            x, kv_fused, callback_flag = block(x, forward_batch, token_to_kv_pool)
             layers_kv_fused.append(kv_fused)
             layers_callback_flag.extend(callback_flag)
 
