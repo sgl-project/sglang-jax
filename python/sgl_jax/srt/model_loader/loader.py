@@ -104,10 +104,6 @@ class JAXModelLoader(BaseModelLoader):
         if model_config.quantization_post_dtype != None:
             logging.info("Applying Qwix quantization to the model")
             model = apply_qwix_quantization(model_config, model, self.mesh, attn_backend)
-            model_state = nnx.state(model)
-            print(model_state)
-        else:
-            logging.info("No quantization applied to the model")
             
         return model
 
