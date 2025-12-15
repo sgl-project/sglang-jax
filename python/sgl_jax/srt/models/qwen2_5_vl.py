@@ -2,6 +2,7 @@ import math
 from functools import partial
 from typing import List, Callable, NamedTuple, Optional, Any
 from transformers.models.qwen2_5_vl.configuration_qwen2_5_vl import Qwen2_5_VLConfig
+from transformers import modeling_flax_utils
 import jax
 import jax.numpy as jnp
 from jax.sharding import Mesh
@@ -450,7 +451,7 @@ class Qwen2_5_VisionPatchMerger(nnx.Module):
             rngs=rngs,
             mesh=mesh,
         )
-        self.mlp_act = jax.nn.gelu
+        self.mlp_act = modeling_flax_utils.ACT2FN["gelu"]
         self.mlp_fc2 = LinearBase(
             self.hidden_size,
             d_model,
