@@ -1,7 +1,6 @@
 import jax
 import jax.numpy as jnp
 import numpy as np
-from flax import nnx
 from jax.sharding import NamedSharding
 
 from sgl_jax.srt.lora.backend.base_backend import BaseLoRABackend
@@ -11,9 +10,7 @@ from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
 
 MIN_CHUNK_SIZE = 16
 
-
-class BatchInfo(nnx.Variable):
-    pass
+global batch_info_lora
 
 
 class BgmvLoRABackend(BaseLoRABackend):
@@ -35,13 +32,6 @@ class BgmvLoRABackend(BaseLoRABackend):
         # using empty arrays (size 0) is sufficient for structure matching
         dummy_arr = jnp.array([], dtype=jnp.int32)
         dummy_scalings = jnp.array([], dtype=jnp.float32)
-        self.batch_info = BatchInfo(
-            LoRABatchInfo(
-                scalings=dummy_scalings,
-                token_lora_indices=dummy_arr,
-                lora_ranks=dummy_arr,
-            )
-        )
 
     def run_lora_a_gemm(
         self,
@@ -60,7 +50,7 @@ class BgmvLoRABackend(BaseLoRABackend):
         Returns:
              result with shape (s, r)
         """
-        info = self.batch_info.value
+        info = batch_info_lora
         return shrink(x, weights, info.token_lora_indices, info.scalings, sharding).astype(x.dtype)
 
     def run_lora_b_gemm(
@@ -82,7 +72,7 @@ class BgmvLoRABackend(BaseLoRABackend):
         Returns:
              result with shape (s, output_dim)
         """
-        info = self.batch_info.value
+        info = batch_info_lora
         return jnp.add(
             base_output,
             expand(
@@ -133,7 +123,7 @@ class BgmvLoRABackend(BaseLoRABackend):
             qkv_lora_b_concated = qkv_lora_b
 
         # (s, 3*r)
-        info = self.batch_info.value
+        info = batch_info_lora
         lora_a_output = bgmv_shrink(x, qkv_lora_a, info.token_lora_indices, info.scalings)
 
         return jnp.add(
@@ -174,7 +164,7 @@ class BgmvLoRABackend(BaseLoRABackend):
             gate_up_lora_b_concated = gate_up_lora_b
 
         # (s, 2*r)
-        info = self.batch_info.value
+        info = batch_info_lora
         lora_a_output = bgmv_shrink(x, gate_up_lora_a, info.token_lora_indices, info.scalings)
 
         return jnp.add(
@@ -243,7 +233,8 @@ class BgmvLoRABackend(BaseLoRABackend):
             padded_token_lora_indices_cpu = np.array(weight_indices, dtype=np.int32)
             padded_lora_ranks_cpu = np.array(lora_ranks_bs, dtype=np.int32)
 
-        self.batch_info = LoRABatchInfo(
+        global batch_info_lora
+        batch_info_lora = LoRABatchInfo(
             scalings=jnp.array(padded_scalings_cpu, dtype=jnp.float32),
             token_lora_indices=jnp.array(padded_token_lora_indices_cpu, dtype=jnp.int32),
             lora_ranks=jnp.array(padded_lora_ranks_cpu, dtype=jnp.int32),
@@ -269,8 +260,6 @@ def expand(
     sharding: NamedSharding,
 ):
     """Optimized: Loop with slicing."""
-    # y_shape = output_shape
-    # y = y.reshape(-1, y.shape[-1])
     offset_output = 0
     offset_rank = 0
     output = jnp.zeros((x.shape[0], sum(output_slices)), dtype=x.dtype)
@@ -343,9 +332,6 @@ def bgmv_expand_slice(
         output_tensor: [num_tokens, total_out_features]
         lora_indices: [num_tokens]
     """
-    # if len(lora_weights.shape) == 4:
-    #     lora_weights = jnp.squeeze(lora_weights, axis=1)
-
     outputs = bgmv_jax(inputs, lora_weights, lora_indices, sharding)
 
     # Pad the outputs
