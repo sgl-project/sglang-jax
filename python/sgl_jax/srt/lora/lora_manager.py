@@ -424,6 +424,7 @@ class LoRAManager:
         weight_indices = [0] * len(model_worker_batch.lora_ids)
         lora_ranks = [0] * self.max_loras_per_batch
         scalings = [0] * self.max_loras_per_batch
+        has_new_weights = False
 
         def prepare_static_lora_batch():
             self.lora_backend.prepare_lora_batch(
@@ -435,7 +436,7 @@ class LoRAManager:
 
         def prepare_dynamic_lora_batch():
             # Load adapters into device memory pool (CPU -> device transfer)
-            self.memory_pool.prepare_lora_batch(
+            has_new_weights = self.memory_pool.prepare_lora_batch(
                 cur_uids=cur_uids,
                 lora_adapters=self.loras,
             )
@@ -453,16 +454,17 @@ class LoRAManager:
                 lora_ranks=lora_ranks,
                 scalings=scalings,
             )
+            return has_new_weights
 
         if self.static_lora:
             prepare_static_lora_batch()
         else:
-            prepare_dynamic_lora_batch()
+            has_new_weights = prepare_dynamic_lora_batch()
 
         # Update LoRA layer buffer references after loading new weights
         # This is necessary because JAX arrays are immutable, and load_lora_weight_to_buffer
         # creates new arrays. We need to update the references in LoRALinear layers.
-        if not self.static_lora:
+        if not self.static_lora and has_new_weights:
             self.update_lora_info()
 
         logger.debug("Prepared LoRA batch: %d unique adapters", len(cur_uids))
