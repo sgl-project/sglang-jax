@@ -206,7 +206,7 @@ suites = {
         TestFile(
             "nightly-test/test_accuracy.py",
             estimated_time=62,
-            test_methods=["TestModelAccuracy.test_QWEN3_CODER_30B_A3B_INSTRUCT_tp_2_ep_2"],
+            test_methods=["TestModelAccuracy.test_QWEN3_30B_A3B_tp_2_ep_2"],
         ),
         TestFile(
             "nightly-test/test_accuracy.py",
