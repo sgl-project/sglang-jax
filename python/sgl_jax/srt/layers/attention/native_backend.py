@@ -203,6 +203,18 @@ def forward_attention(
     # KV cache from get_kv_buffer is already in multi-head format: [cache_size, num_kv_heads, head_dim]
     k_heads = k_cache
     v_heads = v_cache
+    head_dim_in_kvpool = k_heads.shape[-1]
+
+    if head_dim < head_dim_in_kvpool:
+        q_heads = jnp.pad(
+            q_heads,
+            (
+                (0, 0),
+                (0, 0),
+                (0, head_dim_in_kvpool - head_dim),
+            ),
+            constant_values=0,
+        )
 
     # Transpose for efficient matrix operations
     # q: shape of (num_heads, num_tokens, head_dim)
@@ -262,6 +274,7 @@ def forward_attention(
     attn_weights = jax.nn.softmax(attn_logits, axis=-1)
 
     attn_output = jnp.matmul(attn_weights, v_t)
+    attn_output = attn_output[:,:,0:head_dim]
     attn_output = jnp.transpose(attn_output, (1, 0, 2))
     return attn_output.reshape(num_tokens, hidden_size)
 
@@ -272,6 +285,7 @@ def _apply_extend_mask(
     extend_prefix_lens: jax.Array,
     extend_seq_lens: jax.Array,
     is_causal: bool = True,
+    sliding_window: int = 0,
 ):
     """
     Applies a block-diagonal and optionally a causal mask in a unified,
@@ -307,6 +321,9 @@ def _apply_extend_mask(
         k_relative_positions = jnp.arange(key_len, dtype=jnp.int32) - k_starts_per_pos
 
         causal_mask = q_actual_positions[:, None] >= k_relative_positions[None, :]
+        if 0 < sliding_window:
+            sliding_window_mask = q_actual_positions[:, None] <= (k_relative_positions[None, :] + sliding_window)
+            causal_mask = causal_mask & sliding_window_mask
         final_mask = final_mask & causal_mask
 
     # --- 4. Apply the final combined mask ---

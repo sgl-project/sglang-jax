@@ -309,11 +309,11 @@ class AttentionBlock(nnx.Module):
         #         dtype=jnp.bfloat16,
         #         rngs=nnx.Rngs(0),
         #     )
-        self.out = LinearBase(
+        self.o_proj = LinearBase(
             config.head_dim * config.num_attention_heads,
             config.hidden_size,
             mesh,
-            use_bias=False,
+            use_bias=True,
             params_dtype=dtype,
             kernel_axes=(None, "tensor"))
 
@@ -350,10 +350,11 @@ class AttentionBlock(nnx.Module):
 
         attn_output, kv_fused = self.attn(q, k, v, forward_batch, token_to_kv_pool)
 
-        #t = sdpa(q, k, v, self.sinks.value, self.sm_scale, self.sliding_window)
-        t = self.out(t)
-        t = x + t
-        return t
+        # attn_output = sdpa(q, k, v, self.sinks.value, self.sm_scale, self.sliding_window,
+        #                    forward_batch, token_to_kv_pool)
+        t, _ = self.o_proj(attn_output)
+        t = hidden_states + t
+        return t, kv_fused
 
 
 def swiglu(x: jnp.ndarray, alpha: float = 1.702, limit: float = 7.0) -> jnp.ndarray:
@@ -529,7 +530,8 @@ class TransformerBlock(nnx.Module):
         config: PretrainedConfig,
         mesh: jax.sharding.Mesh,
         layer_idx: int,
-        dtype: jnp.dtype):
+        dtype: jnp.dtype
+    ):
         self.layer_idx = layer_idx
         self.attn = AttentionBlock(config, mesh, layer_idx, dtype)
         self.mlp = MLPBlock(config, mesh, dtype)
@@ -541,7 +543,7 @@ class TransformerBlock(nnx.Module):
         token_to_kv_pool
     ) -> Array:
         layer_callback_flag = []
-        x = self.attn(
+        t, kv_fused = self.attn(
             hidden_states,
             forward_batch,
             token_to_kv_pool)
@@ -550,12 +552,11 @@ class TransformerBlock(nnx.Module):
         )
         layer_callback_flag.append(attn_callback_flag)
         
-        x = self.mlp(x)
+        x = self.mlp(t)
         mlp_callback_flag = precision_tracer.jit_pure_callback_record(
             x, "mlp_output", "MLP", self.layer_idx
         )
         layer_callback_flag.append(mlp_callback_flag)
-        kv_fused = None
         return x, kv_fused, layer_callback_flag
 
 
@@ -712,6 +713,20 @@ class GptOssForCausalLM(nnx.Module):
             mappings.update({
                 f"{prefix}.self_attn.v_proj.weight": WeightMapping(
                     target_path=f"{target_prefix}.attn.v_proj.weight",
+                    sharding=(None, "tensor"),
+                    transpose=True,
+                ),
+            })
+            mappings.update({
+                f"{prefix}.self_attn.o_proj.bias": WeightMapping(
+                    target_path=f"{target_prefix}.attn.o_proj.bias",
+                    sharding=("tensor", ),
+                    transpose=False,
+                ),
+            })
+            mappings.update({
+                f"{prefix}.self_attn.o_proj.weight": WeightMapping(
+                    target_path=f"{target_prefix}.attn.o_proj.weight",
                     sharding=(None, "tensor"),
                     transpose=True,
                 ),
