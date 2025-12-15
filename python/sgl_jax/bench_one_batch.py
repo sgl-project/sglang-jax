@@ -6,13 +6,15 @@ It accepts server arguments (the same as launch_server.py) and benchmark argumen
 
 # Usage (latency test)
 ## with dummy weights:
-python -m sglang.bench_one_batch --model-path meta-llama/Meta-Llama-3-8B-Instruct --load-format dummy
+python -m sgl_jax.bench_one_batch --model-path meta-llama/Meta-Llama-3-8B-Instruct --load-format dummy
 ## sweep through multiple data points and store (append) the results in a jsonl file:
-python -m sglang.bench_one_batch --model-path meta-llama/Meta-Llama-3-8B-Instruct --batch 1 12 14 --input-len 256 512 --output-len 32 256 --run-name test_run
+python -m sgl_jax.bench_one_batch --model-path meta-llama/Meta-Llama-3-8B-Instruct --batch-size 1 12 14 --input-len 256 512 --output-len 32 256 --run-name test_run
 ## run with profiling:
-python -m sglang.bench_one_batch --model-path meta-llama/Meta-Llama-3-8B-Instruct --batch 1 12 14 --input-len 256 512 --profile
+python -m sgl_jax.bench_one_batch --model-path meta-llama/Meta-Llama-3-8B-Instruct --batch-size 1 12 14 --input-len 256 512 --profile
+## run with custom prompts from file:
+python -m sgl_jax.bench_one_batch --model-path meta-llama/Meta-Llama-3-8B-Instruct --prompt-filename prompts.txt --batch-size 4
 # Usage (correctness test):
-python -m sglang.bench_one_batch --model-path TinyLlama/TinyLlama-1.1B-Chat-v0.4 --correct
+python -m sgl_jax.bench_one_batch --model-path TinyLlama/TinyLlama-1.1B-Chat-v0.4 --correctness-test
 
 ## Reference output (of the correctness test above, can be tpu dependent):
 input_ids=[[1, 450, 7483, 310, 3444, 338], [1, 450, 7483, 310, 278, 3303, 13187, 290, 338], [1, 20628, 338, 263, 6575, 1460, 2462, 322, 306, 763]]
@@ -43,6 +45,7 @@ I'm going to the park
 """
 
 import argparse
+import copy
 import dataclasses
 import itertools
 import json
@@ -74,6 +77,7 @@ class BenchArgs:
     batch_size: tuple[int] = (1,)
     input_len: tuple[int] = (1024,)
     output_len: tuple[int] = (16,)
+    prompt_filename: str = ""
     result_filename: str = "result.jsonl"
     correctness_test: bool = False
     # This is only used for correctness test
@@ -88,6 +92,7 @@ class BenchArgs:
         parser.add_argument("--batch-size", type=int, nargs="+", default=BenchArgs.batch_size)
         parser.add_argument("--input-len", type=int, nargs="+", default=BenchArgs.input_len)
         parser.add_argument("--output-len", type=int, nargs="+", default=BenchArgs.output_len)
+        parser.add_argument("--prompt-filename", type=str, default=BenchArgs.prompt_filename)
         parser.add_argument("--result-filename", type=str, default=BenchArgs.result_filename)
         parser.add_argument("--correctness-test", action="store_true")
         parser.add_argument("--cut-len", type=int, default=BenchArgs.cut_len)
@@ -111,6 +116,17 @@ class BenchArgs:
         # use the default value's type to cast the args into correct types.
         attrs = [(attr.name, type(attr.default)) for attr in dataclasses.fields(cls)]
         return cls(**{attr: attr_type(getattr(args, attr)) for attr, attr_type in attrs})
+
+
+def _read_prompts_from_file(prompt_file, rank_print):
+    """Read custom prompts from the file specified by `--prompt-filename`."""
+    if not prompt_file:
+        return []
+    if not os.path.exists(prompt_file):
+        rank_print(f"Custom prompt file {prompt_file} not found. Using default inputs...")
+        return []
+    with open(prompt_file) as pf:
+        return pf.readlines()
 
 
 def load_model(server_args, port_args, tp_rank):
@@ -148,12 +164,16 @@ def load_model(server_args, port_args, tp_rank):
     return model_runner, tokenizer
 
 
-def prepare_inputs_for_correctness_test(bench_args, tokenizer):
-    prompts = [
-        "The capital of France is",
-        "The capital of the United Kindom is",
-        "Today is a sunny day and I like",
-    ]
+def prepare_inputs_for_correctness_test(bench_args, tokenizer, custom_prompts):
+    prompts = (
+        custom_prompts
+        if custom_prompts
+        else [
+            "The capital of France is",
+            "The capital of the United Kindom is",
+            "Today is a sunny day and I like",
+        ]
+    )
     input_ids = [tokenizer.encode(p) for p in prompts]
     sampling_params = SamplingParams(
         temperature=0,
@@ -190,8 +210,12 @@ def prepare_extend_inputs_for_correctness_test(bench_args, input_ids, reqs, mode
     return reqs
 
 
-def prepare_synthetic_inputs_for_latency_test(batch_size, input_len):
-    input_ids = np.random.randint(0, 10000, (batch_size, input_len), dtype=np.int32)
+def prepare_synthetic_inputs_for_latency_test(batch_size, input_len, custom_inputs=None):
+    input_ids = (
+        custom_inputs
+        if custom_inputs
+        else np.random.randint(0, 10000, (batch_size, input_len), dtype=np.int32)
+    )
     sampling_params = SamplingParams(
         temperature=0,
         max_new_tokens=(BenchArgs.output_len[0] if isinstance(BenchArgs.output_len, tuple) else 16),
@@ -309,7 +333,8 @@ def correctness_test(
     model_runner, tokenizer = load_model(server_args, port_args, tp_rank)
 
     # Prepare inputs
-    input_ids, reqs = prepare_inputs_for_correctness_test(bench_args, tokenizer)
+    custom_prompts = _read_prompts_from_file(bench_args.prompt_filename, rank_print)
+    input_ids, reqs = prepare_inputs_for_correctness_test(bench_args, tokenizer, custom_prompts)
     rank_print(f"\n{input_ids=}\n")
 
     if bench_args.cut_len > 0:
@@ -476,12 +501,34 @@ def latency_test(
 
     rank_print("Benchmark ...")
 
+    custom_inputs = _read_prompts_from_file(bench_args.prompt_filename, rank_print)
+    custom_inputs = [tokenizer.encode(p.strip()) for p in custom_inputs]
+    custom_input_len = len(custom_inputs)
+
     # Run the sweep
     result_list = []
     for bs, il, ol in itertools.product(
         bench_args.batch_size, bench_args.input_len, bench_args.output_len
     ):
-        reqs = prepare_synthetic_inputs_for_latency_test(bs, il)
+        bs_aligned_inputs = []
+        if custom_inputs:
+            if custom_input_len == bs:
+                bs_aligned_inputs = custom_inputs
+            elif custom_input_len > bs:
+                rank_print(
+                    f"Custom input size ({custom_input_len}) is larger than batch_size ({bs}). "
+                    f"Using the first {bs} prompts."
+                )
+                bs_aligned_inputs = copy.deepcopy(custom_inputs[:bs])
+            else:
+                rank_print(
+                    f"Custom input size ({custom_input_len}) is smaller than batch_size ({bs}). "
+                    f"Pad to the desired batch_size with the last prompt."
+                )
+                bs_aligned_inputs = copy.deepcopy(custom_inputs)
+                bs_aligned_inputs.extend([bs_aligned_inputs[-1]] * (bs - custom_input_len))
+
+        reqs = prepare_synthetic_inputs_for_latency_test(bs, il, bs_aligned_inputs)
         ret = latency_test_run_once(
             bench_args.run_name,
             model_runner,

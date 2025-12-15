@@ -139,7 +139,7 @@ class GenerateReqInput:
     batch_size: int = 1
     rid: list[str] | str | None = None
     text: list[str] | str | None = None
-    input_ids: list[int] = None
+    input_ids: list[list[int]] | list[int] | None = None
     # The embeddings for input_ids; one can specify either text or input_ids or input_embeds.
     input_embeds: list[list[list[float]]] | list[list[float]] | None = None
     sampling_params: Any | None = (
