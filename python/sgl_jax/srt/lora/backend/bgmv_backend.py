@@ -243,13 +243,11 @@ class BgmvLoRABackend(BaseLoRABackend):
             padded_token_lora_indices_cpu = np.array(weight_indices, dtype=np.int32)
             padded_lora_ranks_cpu = np.array(lora_ranks_bs, dtype=np.int32)
 
-        batch_info = LoRABatchInfo(
+        self.batch_info = LoRABatchInfo(
             scalings=jnp.array(padded_scalings_cpu, dtype=jnp.float32),
             token_lora_indices=jnp.array(padded_token_lora_indices_cpu, dtype=jnp.int32),
             lora_ranks=jnp.array(padded_lora_ranks_cpu, dtype=jnp.int32),
         )
-
-        self.batch_info = BatchInfo(batch_info)
 
 
 def shrink(

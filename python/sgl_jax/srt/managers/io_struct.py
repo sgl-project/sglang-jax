@@ -163,6 +163,7 @@ class GenerateReqInput:
     token_ids_logprob: list[list[int]] | list[int] | None = None
     # Whether to detokenize tokens in text in the returned logprobs.
     return_text_in_logprobs: bool = True
+
     # The path to the LoRA adaptors
     lora_path: list[str] | str | None = None
     # The uid of LoRA adaptors, should be initialized by tokenizer manager

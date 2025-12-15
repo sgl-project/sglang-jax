@@ -19,6 +19,7 @@ from typing import List
 import jax.numpy as jnp
 from flax import nnx
 
+
 from sgl_jax.srt.entrypoints.engine import Engine
 from sgl_jax.srt.hf_transformers_utils import get_tokenizer
 from sgl_jax.test.test_utils import (
@@ -42,198 +43,159 @@ LORA_SETS = [
 DTYPES = ["bfloat16"]
 
 PROMPTS = [
-    """
-### Instruction:
-Write a poem about the transformers Python library.
-Mention the word "large language models" in that poem.
-### Response:
-The Transformers are large language models,
-They're used to make predictions on text.
-""",
-    """
-### Instruction:
-Tell me about llamas and alpacas
-### Response:
-Llamas are large, long-necked animals with a woolly coat. They have two toes on each foot instead of three like other camelids (camels, dromedaries). Llamas live in the Andean mountains of South America where they graze on grasses and shrubs. Alpaca is another name for domesticated llama. The word "alpaca" comes from an Incan language meaning "golden fleece." Alpacas look very similar to llamas but are smaller than their wild relatives. Both species were used by ancient people as pack animals and for meat. Today both llamas and alpacas are raised primarily for their fiber which can be spun into yarn or knitted into clothing.
-### Question 2:
-What do you know about llamas?
-### Answer:
-""",
+    '\n### Instruction:\nWrite a poem about the transformers Python library.\nMention the word "large language models" in that poem.\n### Response:\nThe Transformers are large language models,\nThey\'re used to make predictions on text.\n',
+    '\n### Instruction:\nTell me about llamas and alpacas\n### Response:\nLlamas are large, long-necked animals with a woolly coat. They have two toes on each foot instead of three like other camelids (camels, dromedaries). Llamas live in the Andean mountains of South America where they graze on grasses and shrubs. Alpaca is another name for domesticated llama. The word "alpaca" comes from an Incan language meaning "golden fleece." Alpacas look very similar to llamas but are smaller than their wild relatives. Both species were used by ancient people as pack animals and for meat. Today both llamas and alpacas are raised primarily for their fiber which can be spun into yarn or knitted into clothing.\n### Question 2:\nWhat do you know about llamas?\n### Answer:\n',
 ]
 
 
 class TestLoRA(CustomTestCase):
-    def inference(self, prompts, lora_set, tp_size, dtype, max_new_tokens):
-        print("=================== testing inference =======================")
-        base_path = lora_set["base"]
+    def run_base_inference(self, base_url, prompts, max_new_tokens):
+        """Run inference on base model (no LoRA loaded) and return responses."""
+        print("=================== collecting base model responses =======================")
+        headers = {"Content-Type": "application/json"}
+        responses = []
+
+        for prompt in prompts:
+            payload = {
+                "text": prompt,
+                "sampling_params": {
+                    "max_new_tokens": max_new_tokens,
+                    "temperature": 0.0,
+                },
+            }
+
+            response = requests.post(
+                f"{base_url}/generate",
+                json=payload,
+                headers=headers,
+                timeout=60,
+            )
+            self.assertEqual(response.status_code, 200)
+            responses.append(response.json())
+
+        return responses
+
+    def run_inference_test(self, base_url, prompts, lora_set, max_new_tokens):
+        """Test inference with mixed batch (some with LoRA, some without)."""
+        print("=================== testing mixed inference =======================")
         all_lora_paths = lora_set["loras"]
-        batch_lora_names = [None]
+        batch_lora_paths = [None]
         i = 0
         for _ in range(len(prompts) - 1):
-            batch_lora_names.append(all_lora_paths[i])
+            lora_path = all_lora_paths[i]
+            lora_name = lora_path.split("/")[-1]
+            batch_lora_paths.append(lora_name)
             i = (i + 1) % len(all_lora_paths)
 
-        # Launch server with LoRA support
-        base_url = DEFAULT_URL_FOR_TEST
-        server_args = [
-            "--tp-size",
-            str(tp_size),
-            "--dtype",
-            dtype,
-            "--lora-paths",
-            *all_lora_paths,
-            "--max-loras-per-batch",
-            "3",
-            "--disable-radix-cache",
-        ]
+        headers = {"Content-Type": "application/json"}
+        responses = []
 
-        process = popen_launch_server(
-            base_path,
-            base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=server_args,
+        for prompt, lora_path in zip(prompts, batch_lora_paths):
+            payload = {
+                "text": prompt,
+                "sampling_params": {
+                    "max_new_tokens": max_new_tokens,
+                    "temperature": 0.0,
+                },
+            }
+            if lora_path is not None:
+                payload["lora_path"] = lora_path
+
+            response = requests.post(
+                f"{base_url}/generate",
+                json=payload,
+                headers=headers,
+                timeout=60,
+            )
+            self.assertEqual(response.status_code, 200)
+            responses.append(response.json())
+
+        # Verify we got valid responses
+        for i, response in enumerate(responses):
+            self.assertIn("text", response)
+            print(f"Response {i} (lora={batch_lora_paths[i]}): {response['text'][:100]}")
+
+    def run_base_comparison_test(self, base_url, prompts, max_new_tokens, expected_responses):
+        """
+        Verify that running the base model (without lora_path) on a LoRA-enabled server
+        produces the same output as the pure base model.
+        """
+        print("=================== testing base model equivalence =======================")
+        headers = {"Content-Type": "application/json"}
+
+        for i, prompt in enumerate(prompts):
+            payload = {
+                "text": prompt,
+                "sampling_params": {
+                    "max_new_tokens": max_new_tokens,
+                    "temperature": 0.0,
+                },
+            }
+
+            response = requests.post(
+                f"{base_url}/generate",
+                json=payload,
+                headers=headers,
+                timeout=60,
+            )
+            self.assertEqual(response.status_code, 200)
+            actual_response = response.json()
+
+            print(f"No LoRA support: {expected_responses[i]['text'][:100]}")
+            print(f"With LoRA support (unused): {actual_response['text'][:100]}")
+
+            self.assertEqual(
+                expected_responses[i]["text"],
+                actual_response["text"],
+                f"Base model output changed when LoRA support enabled (request {i})",
+            )
+
+    def run_lora_effect_test(self, base_url, prompts, lora_set, max_new_tokens, base_responses):
+        """Verify that LoRA actually changes the output compared to base model."""
+        print("=================== testing LoRA vs base difference =======================")
+        lora_path = lora_set["loras"][0]
+        lora_name = lora_path.split("/")[-1]
+        test_prompt = prompts[0]
+        base_text = base_responses[0]["text"]
+
+        headers = {"Content-Type": "application/json"}
+        payload_lora = {
+            "text": test_prompt,
+            "sampling_params": {
+                "max_new_tokens": max_new_tokens,
+                "temperature": 0.0,
+            },
+            "lora_path": lora_name,
+        }
+
+        response_lora = requests.post(
+            f"{base_url}/generate",
+            json=payload_lora,
+            headers=headers,
+            timeout=60,
         )
+        self.assertEqual(response_lora.status_code, 200)
+        lora_output = response_lora.json()
+        lora_text = lora_output["text"]
 
-        try:
-            import requests
+        print(f"\nPrompt: {test_prompt[:80]}...")
+        print(f"\nBase model output:\n{base_text}")
+        print(f"\nLoRA model output:\n{lora_text}")
 
-            # Test inference with mixed batch (some with LoRA, some without)
-            headers = {"Content-Type": "application/json"}
+        self.assertNotEqual(
+            base_text, lora_text, "LoRA output should differ from base model output! "
+        )
+        print("\n✓ SUCCESS: LoRA produces different output than base model")
 
-            # Make requests to the server
-            responses = []
-            for prompt, lora_name in zip(prompts, batch_lora_names):
-                payload = {
-                    "text": prompt,
-                    "sampling_params": {
-                        "max_new_tokens": max_new_tokens,
-                        "temperature": 0.0,
-                    },
-                }
-                if lora_name is not None:
-                    payload["lora_name"] = lora_name
-
-                response = requests.post(
-                    f"{base_url}/generate",
-                    json=payload,
-                    headers=headers,
-                    timeout=60,
-                )
-                self.assertEqual(response.status_code, 200)
-                responses.append(response.json())
-
-            # Verify we got valid responses
-            for i, response in enumerate(responses):
-                self.assertIn("text", response)
-                print(f"Response {i} (lora={batch_lora_names[i]}): {response['text'][:100]}")
-
-            # Test base model (no LoRA)
-            base_responses = []
-            for prompt in prompts:
-                payload = {
-                    "text": prompt,
-                    "sampling_params": {
-                        "max_new_tokens": max_new_tokens,
-                        "temperature": 0.0,
-                    },
-                }
-
-                response = requests.post(
-                    f"{base_url}/generate",
-                    json=payload,
-                    headers=headers,
-                    timeout=60,
-                )
-                self.assertEqual(response.status_code, 200)
-                base_responses.append(response.json())
-
-            # Verify base model responses differ from LoRA responses
-            for i in range(len(prompts)):
-                if batch_lora_names[i] is not None:
-                    # Responses with LoRA should potentially differ from base
-                    # (though not always guaranteed depending on the prompt)
-                    print(f"LoRA response {i}: {responses[i]['text'][:100]}")
-                    print(f"Base response {i}: {base_responses[i]['text'][:100]}")
-
-        finally:
-            kill_process_tree(process.pid)
-
-    def serving(self, prompts, lora_set, tp_size, dtype, max_new_tokens):
-        print("=================== testing serving =======================")
+    def run_test_suite(self, lora_set, dtype, tp_size=1, max_new_tokens=32):
         base_path = lora_set["base"]
         all_lora_paths = lora_set["loras"]
-        batch_lora_names = [None]
-        i = 0
-        for _ in range(len(prompts) - 1):
-            batch_lora_names.append(all_lora_paths[i])
-            i = (i + 1) % len(all_lora_paths)
-
-        # Launch server with LoRA support
         base_url = DEFAULT_URL_FOR_TEST
-        server_args = [
-            "--tp-size",
-            str(tp_size),
-            "--dtype",
-            dtype,
-            "--lora-paths",
-            *all_lora_paths,
-            "--max-loras-per-batch",
-            "3",
-            "--disable-radix-cache",
-        ]
 
-        process = popen_launch_server(
-            base_path,
-            base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=server_args,
-        )
-
-        try:
-            import requests
-
-            headers = {"Content-Type": "application/json"}
-
-            # Test batch serving
-            responses = []
-            for prompt, lora_name in zip(prompts, batch_lora_names):
-                payload = {
-                    "text": prompt,
-                    "sampling_params": {
-                        "max_new_tokens": max_new_tokens,
-                        "temperature": 0.0,
-                    },
-                }
-                if lora_name is not None:
-                    payload["lora_name"] = lora_name
-
-                response = requests.post(
-                    f"{base_url}/generate",
-                    json=payload,
-                    headers=headers,
-                    timeout=60,
-                )
-                self.assertEqual(response.status_code, 200)
-                responses.append(response.json())
-
-            # Verify responses
-            for i, response in enumerate(responses):
-                self.assertIn("text", response)
-                print(
-                    f"Serving response {i} (lora={batch_lora_names[i]}): {response['text'][:100]}"
-                )
-
-        finally:
-            kill_process_tree(process.pid)
-
-    def base_inference(self, prompts, lora_set, tp_size, dtype, max_new_tokens):
-        print("=================== testing base inference =======================")
-        base_path = lora_set["base"]
-        all_lora_paths = lora_set["loras"]
-        batch_lora_names = [None] * len(prompts)
-
-        # Launch server WITHOUT LoRA support
-        base_url_no_lora = DEFAULT_URL_FOR_TEST
+        # ----------------------------------------------------------------
+        # Phase 1: Base Model Server (No LoRA)
+        # ----------------------------------------------------------------
+        print(f"\n[Phase 1] Launching base server (No LoRA) for {base_path}")
         server_args_no_lora = [
             "--tp-size",
             str(tp_size),
@@ -243,211 +205,52 @@ class TestLoRA(CustomTestCase):
 
         process_no_lora = popen_launch_server(
             base_path,
-            base_url_no_lora,
+            base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=server_args_no_lora,
         )
 
+        base_responses = []
         try:
-            import requests
-
-            headers = {"Content-Type": "application/json"}
-
-            # Get base model responses
-            no_lora_responses = []
-            for prompt in prompts:
-                payload = {
-                    "text": prompt,
-                    "sampling_params": {
-                        "max_new_tokens": max_new_tokens,
-                        "temperature": 0.0,
-                    },
-                }
-
-                response = requests.post(
-                    f"{base_url_no_lora}/generate",
-                    json=payload,
-                    headers=headers,
-                    timeout=60,
-                )
-                self.assertEqual(response.status_code, 200)
-                no_lora_responses.append(response.json())
-
+            base_responses = self.run_base_inference(base_url, PROMPTS, max_new_tokens)
         finally:
             kill_process_tree(process_no_lora.pid)
 
-        # Launch server WITH LoRA support but don't use LoRA
-        base_url_with_lora = DEFAULT_URL_FOR_TEST
-        server_args_with_lora = [
+        # ----------------------------------------------------------------
+        # Phase 2: LoRA Model Server (With LoRA)
+        # ----------------------------------------------------------------
+        print(f"\n[Phase 2] Launching server with LoRA support for {base_path}")
+        server_args_lora = [
             "--tp-size",
             str(tp_size),
             "--dtype",
             dtype,
             "--lora-paths",
             *all_lora_paths,
-        ]
-
-        process_with_lora = popen_launch_server(
-            base_path,
-            base_url_with_lora,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=server_args_with_lora,
-        )
-
-        try:
-            import requests
-
-            # Get responses from server with LoRA support but not using LoRA
-            with_lora_base_responses = []
-            for prompt in prompts:
-                payload = {
-                    "text": prompt,
-                    "sampling_params": {
-                        "max_new_tokens": max_new_tokens,
-                        "temperature": 0.0,
-                    },
-                }
-
-                response = requests.post(
-                    f"{base_url_with_lora}/generate",
-                    json=payload,
-                    headers=headers,
-                    timeout=60,
-                )
-                self.assertEqual(response.status_code, 200)
-                with_lora_base_responses.append(response.json())
-
-            # Compare responses - they should be identical
-            for i in range(len(prompts)):
-                print(f"No LoRA support: {no_lora_responses[i]['text'][:100]}")
-                print(f"With LoRA support (unused): {with_lora_base_responses[i]['text'][:100]}")
-
-                # The outputs should be identical since we're not using LoRA
-                self.assertEqual(
-                    no_lora_responses[i]["text"],
-                    with_lora_base_responses[i]["text"],
-                    f"Base model output changed when LoRA support enabled (request {i})",
-                )
-
-        finally:
-            kill_process_tree(process_with_lora.pid)
-
-    def lora_vs_base_difference(self, prompts, lora_set, tp_size, dtype, max_new_tokens):
-        """
-        Test that LoRA actually changes the model output.
-
-        This test verifies that:
-        1. Using the same prompt with LoRA produces different output than without LoRA
-        2. The outputs are deterministic (temperature=0.0)
-        """
-        print("=================== testing LoRA vs base difference =======================")
-        base_path = lora_set["base"]
-        all_lora_paths = lora_set["loras"]
-
-        # Use the first LoRA adapter
-        lora_path = all_lora_paths[0]
-
-        # Launch server with LoRA support
-        base_url = DEFAULT_URL_FOR_TEST
-        server_args = [
-            "--tp-size",
-            str(tp_size),
-            "--dtype",
-            dtype,
-            "--lora-paths",
-            lora_path,
             "--max-loras-per-batch",
-            "2",
-            "--disable-radix-cache",
+            "3",
+            "--disable-overlap-schedule",
         ]
 
-        process = popen_launch_server(
+        process_lora = popen_launch_server(
             base_path,
             base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=server_args,
+            other_args=server_args_lora,
         )
 
         try:
-            import requests
-
-            headers = {"Content-Type": "application/json"}
-
-            # Test with the first prompt
-            test_prompt = prompts[0]
-
-            # Get base model output (without LoRA)
-            payload_base = {
-                "text": test_prompt,
-                "sampling_params": {
-                    "max_new_tokens": max_new_tokens,
-                    "temperature": 0.0,
-                },
-            }
-
-            response_base = requests.post(
-                f"{base_url}/generate",
-                json=payload_base,
-                headers=headers,
-                timeout=60,
-            )
-            self.assertEqual(response_base.status_code, 200)
-            base_output = response_base.json()
-
-            # Get LoRA output (with LoRA)
-            payload_lora = {
-                "text": test_prompt,
-                "sampling_params": {
-                    "max_new_tokens": max_new_tokens,
-                    "temperature": 0.0,
-                },
-                "lora_name": lora_path,
-            }
-
-            response_lora = requests.post(
-                f"{base_url}/generate",
-                json=payload_lora,
-                headers=headers,
-                timeout=60,
-            )
-            self.assertEqual(response_lora.status_code, 200)
-            lora_output = response_lora.json()
-
-            # Verify both produced valid outputs
-            self.assertIn("text", base_output)
-            self.assertIn("text", lora_output)
-
-            base_text = base_output["text"]
-            lora_text = lora_output["text"]
-
-            # Print outputs for inspection
-            print(f"\nPrompt: {test_prompt[:80]}...")
-            print(f"\nBase model output:\n{base_text}")
-            print(f"\nLoRA model output:\n{lora_text}")
-
-            # Assert that outputs are different
-            # This is the key test: LoRA should change the model's behavior
-            self.assertNotEqual(
-                base_text,
-                lora_text,
-                "LoRA output should differ from base model output! "
-                "If they are the same, LoRA is not being applied correctly.",
-            )
-
-            print("\n✓ SUCCESS: LoRA produces different output than base model")
-
+            # Run all tests that require LoRA server
+            self.run_inference_test(base_url, PROMPTS, lora_set, max_new_tokens)
+            self.run_base_comparison_test(base_url, PROMPTS, max_new_tokens, base_responses)
+            self.run_lora_effect_test(base_url, PROMPTS, lora_set, max_new_tokens, base_responses)
         finally:
-            kill_process_tree(process.pid)
+            kill_process_tree(process_lora.pid)
 
     def test_all(self):
         for lora_set in LORA_SETS:
             for dtype in DTYPES:
-                tp_size = 1
-                max_new_tokens = 32
-                self.inference(PROMPTS, lora_set, tp_size, dtype, max_new_tokens)
-                self.serving(PROMPTS, lora_set, tp_size, dtype, max_new_tokens)
-                self.base_inference(PROMPTS, lora_set, tp_size, dtype, max_new_tokens)
-                self.lora_vs_base_difference(PROMPTS, lora_set, tp_size, dtype, max_new_tokens)
+                self.run_test_suite(lora_set, dtype)
 
 
 if __name__ == "__main__":
