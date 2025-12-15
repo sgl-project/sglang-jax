@@ -20,6 +20,16 @@ class TestKernelUtils(unittest.TestCase):
         mock_jax_devices.return_value = [mock_device]
         self.assertEqual(get_tpu_version(), 4)
 
+        # Test TPU v5 lite
+        mock_device.device_kind = "TPU v5 lite"
+        mock_jax_devices.return_value = [mock_device]
+        self.assertEqual(get_tpu_version(), 5)
+
+        # Test TPU v6
+        mock_device.device_kind = "TPU v6 lite"
+        mock_jax_devices.return_value = [mock_device]
+        self.assertEqual(get_tpu_version(), 6)
+
         # Test TPU7x
         mock_device.device_kind = "TPU7x"
         mock_jax_devices.return_value = [mock_device]
