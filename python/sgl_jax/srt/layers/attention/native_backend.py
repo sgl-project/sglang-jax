@@ -53,6 +53,7 @@ class NativeAttention(AttentionBackend):
         layer: RadixAttention,
         forward_batch: ForwardBatch,
         token_to_kv_pool: KVCache,
+        sinks: jax.Array = None,
     ):
         """
         Args:
@@ -94,6 +95,8 @@ class NativeAttention(AttentionBackend):
             forward_batch.forward_mode,
             self.kv_sharding,
             xai_temperature_len=xai_temp_len,
+            sinks = sinks,
+            sliding_window_size = layer.sliding_window_size,
         )
 
         # Return full fused KV buffer for this layer so that caller can persist it outside JIT
@@ -159,6 +162,8 @@ def forward_attention(
     mode=ForwardMode.DECODE,
     kv_sharding=None,
     xai_temperature_len: float | None = None,
+    sinks=None,
+    sliding_window_size: None | int = None,
 ):
     """
     Forward pass using native JAX implementation with block-diagonal attention.
@@ -265,13 +270,23 @@ def forward_attention(
     # Apply appropriate masking
     if mode == ForwardMode.EXTEND:
         attn_logits = _apply_extend_mask(
-            attn_logits, seq_lengths, extend_prefix_lens, extend_seq_lens, is_causal
+            attn_logits, seq_lengths, extend_prefix_lens, extend_seq_lens, is_causal, sliding_window_size
         )
     else:
         attn_logits = _apply_decode_mask(attn_logits, seq_lengths)
 
+    _, nr_qs, nr_ks = attn_logits.shape
+
+    if sinks is not None:
+        sinks_expanded = sinks[:, None, None]  # 形状变为 (64, 1)
+        sinks_expanded = jnp.repeat(sinks_expanded, nr_qs, axis=1)  # 形状变为 (64, 1024, 1)
+        attn_logits = jnp.concatenate([attn_logits, sinks_expanded], axis=-1)
+
     # Softmax
     attn_weights = jax.nn.softmax(attn_logits, axis=-1)
+
+    if sinks is not None:
+        attn_weights = attn_weights[:, :, :nr_ks]
 
     attn_output = jnp.matmul(attn_weights, v_t)
     attn_output = attn_output[:,:,0:head_dim]
@@ -285,7 +300,7 @@ def _apply_extend_mask(
     extend_prefix_lens: jax.Array,
     extend_seq_lens: jax.Array,
     is_causal: bool = True,
-    sliding_window: int = 0,
+    sliding_window_size: None | int = None,
 ):
     """
     Applies a block-diagonal and optionally a causal mask in a unified,
@@ -321,8 +336,8 @@ def _apply_extend_mask(
         k_relative_positions = jnp.arange(key_len, dtype=jnp.int32) - k_starts_per_pos
 
         causal_mask = q_actual_positions[:, None] >= k_relative_positions[None, :]
-        if 0 < sliding_window:
-            sliding_window_mask = q_actual_positions[:, None] <= (k_relative_positions[None, :] + sliding_window)
+        if sliding_window_size is not None:
+            sliding_window_mask = q_actual_positions[:, None] <= (k_relative_positions[None, :] + sliding_window_size)
             causal_mask = causal_mask & sliding_window_mask
         final_mask = final_mask & causal_mask
 

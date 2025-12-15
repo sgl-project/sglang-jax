@@ -80,23 +80,6 @@ from jaxtyping import Array, ArrayLike
 #         )
 
 
-
-# class RMSNorm(nnx.Module):
-#     def __init__(self, num_features: int, cfg: ModelConfig, *, rngs: nnx.Rngs, eps: float = 1e-05):
-#         self.num_features = num_features
-#         self.eps = eps
-#         self.scale = nnx.Param(nnx.initializers.ones_init()(rngs.params(), (num_features,)))
-        
-
-#     @jax.named_scope("rms_norm")
-#     def __call__(self, x: Array) -> Array:
-#         assert x.shape[-1] == self.num_features
-#         dtype = x.dtype
-#         t = jnp.astype(x, jnp.float32)
-#         rms = jnp.sqrt(jnp.mean(t**2, axis=-1, keepdims=True) + self.eps)
-#         return jnp.astype((t / rms) * self.scale.value, dtype)
-
-
 def _apply_rotary_emb(x: jnp.ndarray, cos: jnp.ndarray, sin: jnp.ndarray) -> jnp.ndarray:
     """Apply rotary embedding to x."""
     cos = jnp.expand_dims(cos, axis=-2).astype(x.dtype)
@@ -181,52 +164,6 @@ class RotaryEmbedding(nnx.Module):
         return query, key
 
 
-def sdpa(
-    Q: jnp.ndarray,
-    K: jnp.ndarray,
-    V: jnp.ndarray,
-    S: jnp.ndarray,
-    sm_scale: float,
-    sliding_window: int = 0,
-) -> jnp.ndarray:
-    """Scaled dot-product attention with sliding window and sink tokens."""
-    # sliding_window == 0 means no sliding window
-    n_tokens, n_heads, q_mult, d_head = Q.shape
-    assert K.shape == (n_tokens, n_heads, d_head)
-    assert V.shape == (n_tokens, n_heads, d_head)
-
-    # Expand K and V to match Q's q_mult dimension
-    K = jnp.expand_dims(K, axis=2)  # [n_tokens, n_heads, 1, d_head]
-    K = jnp.broadcast_to(K, (n_tokens, n_heads, q_mult, d_head))
-    V = jnp.expand_dims(V, axis=2)  # [n_tokens, n_heads, 1, d_head]
-    V = jnp.broadcast_to(V, (n_tokens, n_heads, q_mult, d_head))
-
-    # Expand S to match attention shape
-    S = S.reshape(n_heads, q_mult, 1, 1)
-    S = jnp.broadcast_to(S, (n_heads, q_mult, n_tokens, 1))
-
-    # Create causal mask
-    mask = jnp.triu(jnp.full((n_tokens, n_tokens), -jnp.inf), k=1)
-    if sliding_window > 0:
-        mask += jnp.tril(jnp.full((n_tokens, n_tokens), -jnp.inf), k=-sliding_window)
-
-    # Compute attention scores
-    QK = jnp.einsum("qhmd,khmd->hmqk", Q, K)
-    QK = QK * sm_scale
-    QK = QK + mask[None, None, :, :]
-
-    # Concatenate sink tokens
-    QK = jnp.concatenate([QK, S], axis=-1)
-
-    # Softmax
-    W = jax.nn.softmax(QK, axis=-1)
-    W = W[..., :-1]  # Remove sink dimension
-
-    # Apply attention weights
-    attn = jnp.einsum("hmqk,khmd->qhmd", W, V)
-    return attn.reshape(n_tokens, -1)
-
-
 class AttentionBlock(nnx.Module):
     def __init__(self,
                  config: ModelConfig,
@@ -298,7 +235,6 @@ class AttentionBlock(nnx.Module):
             scaling=None,
             num_kv_heads=self.num_key_value_heads,
             layer_id=layer_idx,
-            sliding_window_size=self.sliding_window,
         )
 
         # Output projection
@@ -338,20 +274,11 @@ class AttentionBlock(nnx.Module):
 
         q, k = self.rope(positions, q, k)
 
-        # attn_output, kv_fused = forward_batch.attn_backend(
-        #     q,
-        #     k,
-        #     v,
-        #     self,
-        #     forward_batch,
-        #     token_to_kv_pool,
-        # )
-        # Apply attention
+        attn_output, kv_fused = self.attn(
+            q, k, v,
+            forward_batch, token_to_kv_pool,
+            sinks=self.sinks.value,)
 
-        attn_output, kv_fused = self.attn(q, k, v, forward_batch, token_to_kv_pool)
-
-        # attn_output = sdpa(q, k, v, self.sinks.value, self.sm_scale, self.sliding_window,
-        #                    forward_batch, token_to_kv_pool)
         t, _ = self.o_proj(attn_output)
         t = hidden_states + t
         return t, kv_fused
