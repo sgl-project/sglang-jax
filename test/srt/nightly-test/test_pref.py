@@ -619,8 +619,8 @@ class TestModePerf(CustomTestCase):
             )
         print("=" * 100)
 
-    def test_QWEN3_CODER_30B_A3B_INSTRUCT_performance_tp_2_ep_2(self):
-        model = QWEN3_CODER_30B_A3B_INSTRUCT
+    def test_QWEN3_MOE_30B_performance_tp_2_ep_2(self):
+        model = QWEN3_MOE_30B
         base_url = DEFAULT_URL_FOR_TEST
 
         # define test parameters
