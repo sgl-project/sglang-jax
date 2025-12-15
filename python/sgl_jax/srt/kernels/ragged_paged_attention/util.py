@@ -14,7 +14,7 @@ def align_to(x, a):
 
 
 def get_dtype_packing(dtype):
-    bits = dtypes.bit_width(dtype)
+    bits = dtypes.itemsize_bits(dtype)
     return 32 // bits
 
 
@@ -27,8 +27,30 @@ def get_tpu_version() -> int:
         return 7
     if kind.endswith(" lite"):
         kind = kind[: -len(" lite")]
-    assert kind[:-1] == "TPU v", kind
-    return int(kind[-1])
+
+    # Extract version number after "TPU"
+    # Supports formats: "TPU v5", "TPU v6", "TPU7x", "TPU6e", etc.
+    if kind.startswith("TPU v"):
+        # Format: "TPU v7x" or "TPU v5"
+        version_str = kind[len("TPU v") :]
+    elif kind.startswith("TPU"):
+        # Format: "TPU7x" or "TPU5"
+        version_str = kind[len("TPU") :]
+    else:
+        raise ValueError(f"Unexpected TPU device kind format: {kind}")
+
+    # Extract the numeric part (first consecutive digits)
+    version_digits = ""
+    for char in version_str:
+        if char.isdigit():
+            version_digits += char
+        else:
+            break
+
+    if not version_digits:
+        raise ValueError(f"Could not extract TPU version from: {kind}")
+
+    return int(version_digits)
 
 
 def get_device_name(num_devices: int | None = None):
