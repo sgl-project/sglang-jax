@@ -2,7 +2,7 @@
 Run live profiling.
 
 Usage:
-python3 -m sglang.profiler
+python3 -m sgl_jax.profiler
 """
 
 import argparse

@@ -1360,6 +1360,7 @@ def ragged_paged_attention(
             page_size,
             max_num_tokens,
             pages_per_seq,
+            causal,
         )
     kv_packing = get_dtype_packing(kv_cache_fused_processed.dtype)
     if page_size == 1:
