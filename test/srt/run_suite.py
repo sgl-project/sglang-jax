@@ -302,6 +302,10 @@ suites = {
             "test/srt/test_bench_serving_moe.py",
             13,
         ),
+        TestFile(
+            "test/srt/test_bench_serving_lora.py",
+            30,
+        ),
     ],
     "e2e-test-tpu-v6e-1": [
         # openai_server e2e test
