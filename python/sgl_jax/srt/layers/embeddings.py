@@ -463,21 +463,25 @@ class MRotaryEmbedding(RotaryEmbedding):
 
         # 3. Apply RoPE
         # Reshape query/key to [num_tokens, num_heads, head_size]
-        query_shape = query.shape
-        query = query.reshape(num_tokens, -1, self.head_size)
-        query_rot = query[..., : self.rotary_dim]
-        query_pass = query[..., self.rotary_dim :]
+        query_real = query[:num_tokens]
+        query_shape = query_real.shape
+        query_real = query_real.reshape(num_tokens, -1, self.head_size)
+        query_rot = query_real[..., : self.rotary_dim]
+        query_pass = query_real[..., self.rotary_dim :]
 
         query_rot = _apply_rotary_emb(query_rot, cos, sin, self.is_neox_style)
-        query = jnp.concatenate((query_rot, query_pass), axis=-1).reshape(query_shape)
+        query_real = jnp.concatenate((query_rot, query_pass), axis=-1).reshape(query_shape)
+        query = query.at[:num_tokens].set(query_real)
 
-        key_shape = key.shape
-        key = key.reshape(num_tokens, -1, self.head_size)
-        key_rot = key[..., : self.rotary_dim]
-        key_pass = key[..., self.rotary_dim :]
+        key_real = key[:num_tokens]
+        key_shape = key_real.shape
+        key_real = key_real.reshape(num_tokens, -1, self.head_size)
+        key_rot = key_real[..., : self.rotary_dim]
+        key_pass = key_real[..., self.rotary_dim :]
 
         key_rot = _apply_rotary_emb(key_rot, cos, sin, self.is_neox_style)
-        key = jnp.concatenate((key_rot, key_pass), axis=-1).reshape(key_shape)
+        key_real = jnp.concatenate((key_rot, key_pass), axis=-1).reshape(key_shape)
+        key = key.at[:num_tokens].set(key_real)
 
         return query, key
 

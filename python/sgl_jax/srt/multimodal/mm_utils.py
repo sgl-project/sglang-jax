@@ -474,6 +474,7 @@ def general_mm_embed_routine(
     ] = None,
     placeholder_tokens: Optional[dict[Modality, List[int]]] = None,
     use_deepstack: Dict[Modality, bool] = {},
+    positions: Optional[jax.Array] = None,
     **kwargs,
 ) -> Tuple[jax.Array, Any, Any]:
     """
@@ -533,6 +534,7 @@ def general_mm_embed_routine(
     hidden_states, layers_kv_fused, layers_callback_flag = language_model(
         forward_batch=forward_batch,
         token_to_kv_pool=token_to_kv_pool,
+        positions=positions,
         input_embeds=inputs_embeds,
     )
     return hidden_states, layers_kv_fused, layers_callback_flag

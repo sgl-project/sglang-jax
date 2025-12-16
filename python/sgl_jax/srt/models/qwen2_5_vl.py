@@ -868,6 +868,7 @@ class Qwen2_5_VLForConditionalGeneration(nnx.Module):
             language_model=self.model,
             token_to_kv_pool=token_to_kv_pool,
             multimodal_model=self,
+            positions=positions
         )
         
         return self.logits_processor(hidden_states, self.model.embed_tokens, logits_metadata), layers_kv_fused, layers_callback_flag

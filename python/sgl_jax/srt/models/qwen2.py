@@ -284,6 +284,7 @@ class Qwen2Model(nnx.Module):
         self,
         forward_batch: ForwardBatch,
         token_to_kv_pool: KVCache,
+        positions: jax.Array,
         input_embeds: jax.Array = None,
     ):
         residual = None
@@ -295,7 +296,7 @@ class Qwen2Model(nnx.Module):
         layers_callback_flag = []
         for layer in self.layers:
             hidden_states, residual, kv_fused, callback_flag = layer(
-                forward_batch.positions,
+                positions,
                 hidden_states,
                 forward_batch,
                 token_to_kv_pool,
@@ -495,7 +496,7 @@ class Qwen2ForCausalLM(nnx.Module):
         logits_metadata: LogitsMetadata,
     ):
         hidden_states, layers_kv_fused, layers_callback_flag = self.model(
-            forward_batch, token_to_kv_pool
+            forward_batch, token_to_kv_pool, forward_batch.positions
         )
         if not getattr(self.config, "tie_word_embeddings", False):
             output = self.logits_processor(hidden_states, self.lm_head, logits_metadata)
