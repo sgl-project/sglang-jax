@@ -404,7 +404,7 @@ def build_eagle_tree_structure_pallas_call(
     )
 
     return (
-        tree_mask[:, 0].astype(jnp.bool).reshape(-1),
+        tree_mask[:, 0].reshape(-1),
         positions,
         retrive_index,
         retrive_next_token,
