@@ -269,6 +269,7 @@ suites = {
         TestFile("python/sgl_jax/test/test_moe_topk.py", 1),
         TestFile("python/sgl_jax/test/test_sampler.py", 0.2),
         TestFile("python/sgl_jax/test/test_utils.py", 0.2),
+        TestFile("python/sgl_jax/test/test_kernel_utils.py", 0.1),
         TestFile("python/sgl_jax/test/mem_cache/test_kv_cache.py", 20),
         TestFile("python/sgl_jax/test/mem_cache/test_radix_cache.py", 0.2),
         TestFile("python/sgl_jax/test/mem_cache/test_swa_radix_cache.py", 0.2),
