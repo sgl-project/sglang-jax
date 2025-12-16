@@ -295,7 +295,6 @@ class ModelWorker:
                         model_worker_batch.forward_batch.input_ids,
                         future_token_ids_map,
                     )
-                print(f"{model_worker_batch.forward_batch.input_ids.shape=}")
                 _, next_token_ids, _ = self.forward_batch_generation(
                     model_worker_batch, None, False, sampling_metadata
                 )
