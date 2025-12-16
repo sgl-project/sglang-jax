@@ -304,7 +304,7 @@ suites = {
         ),
         TestFile(
             "test/srt/test_bench_serving_lora.py",
-            30,
+            45,
         ),
     ],
     "e2e-test-tpu-v6e-1": [

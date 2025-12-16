@@ -395,8 +395,8 @@ class ModelWorker:
         return self.model_runner
 
     def prepare_lora_batch(self, model_worker_batch: ModelWorkerBatch):
-        has_new_weights = self.model_runner.lora_manager.prepare_lora_batch(model_worker_batch)
-        if has_new_weights:
+        self.model_runner.lora_manager.prepare_lora_batch(model_worker_batch)
+        if self.model_runner.lora_manager.has_new_weights:
             _, model_state = nnx.split(self.model_runner.model)
             self.model_runner.model_state_leaves, _ = jax.tree_util.tree_flatten(model_state)
 

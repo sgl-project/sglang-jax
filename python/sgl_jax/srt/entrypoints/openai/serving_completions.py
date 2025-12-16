@@ -79,10 +79,6 @@ class OpenAIServingCompletion(OpenAIServingBase):
             return_text_in_logprobs=True,
             stream=request.stream,
             lora_path=request.lora_path,
-            # bootstrap_host=request.bootstrap_host,
-            # bootstrap_port=request.bootstrap_port,
-            # bootstrap_room=request.bootstrap_room,
-            # return_hidden_states=request.return_hidden_states,
             extra_key=request.extra_key,
             rid=request.rid,
         )
