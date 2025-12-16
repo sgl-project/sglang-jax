@@ -28,6 +28,8 @@ from sgl_jax.test.test_utils import (
     write_github_step_summary,
 )
 
+MOUNT_ROOT = os.getenv("CI_MOUNT_ROOT", "/models")
+
 
 class TestModePerf(CustomTestCase):
     sharegpt_dataset_path = None
@@ -56,16 +58,35 @@ class TestModePerf(CustomTestCase):
 
     @classmethod
     def setUpClass(cls):
-        print("\n" + "=" * 80)
-        print("Setting up TestModePerf: Downloading the ShareGPT dataset once for all tests...")
+        local_dataset_path = os.path.join(
+            MOUNT_ROOT, "dataset/sharegpt/ShareGPT_V3_unfiltered_cleaned_split.json"
+        )
 
-        cls.sharegpt_dataset_path = download_and_cache_file(SHAREGPT_URL)
+        if os.path.exists(local_dataset_path):
+            print(f"Using path: {local_dataset_path}")
+            cls.sharegpt_dataset_path = local_dataset_path
+        else:
+            print(f"Local dataset not found at '{local_dataset_path}'.")
+            cls.sharegpt_dataset_path = download_and_cache_file(SHAREGPT_URL)
 
         print(f"Dataset is ready at location: {cls.sharegpt_dataset_path}")
-        print("=" * 80 + "\n")
 
     def test_qwen_7b_performance_tp_1(self):
-        model = QWEN_7B
+        import os
+
+        MOUNT_ROOT = os.getenv("CI_MOUNT_ROOT", "/models")
+        raw_model_id = QWEN_7B
+        model_dir_name = "Qwen-7B"
+        cached_model_path = os.path.join(MOUNT_ROOT, "model_scope", model_dir_name)
+
+        print(f"[CI Info] Checking Model Cache at: {cached_model_path}")
+        if os.path.exists(cached_model_path):
+            print(f"[CI Info] Hit Model Cache: {cached_model_path}")
+            model_path_for_server = cached_model_path
+        else:
+            print(f"[CI Info] Cache Miss, downloading: {raw_model_id}")
+            model_path_for_server = raw_model_id
+
         base_url = DEFAULT_URL_FOR_TEST
 
         # define test parameters
@@ -84,7 +105,7 @@ class TestModePerf(CustomTestCase):
         ]
         # launch server
         process = popen_launch_server(
-            model,
+            model_path_for_server,
             base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             device="tpu",
@@ -117,8 +138,8 @@ class TestModePerf(CustomTestCase):
                             base_url=base_url,
                             host="0.0.0.0",
                             port=int(base_url.split(":")[-1]),
-                            model=model,
-                            tokenizer=model,
+                            model=model_path_for_server,
+                            tokenizer=model_path_for_server,
                             dataset_name="sharegpt",
                             random_range_ratio=1.0,
                             request_rate=float("inf"),
@@ -162,7 +183,7 @@ class TestModePerf(CustomTestCase):
                                 "itl_ms": metrics.get("mean_itl_ms", 0),
                                 "in_tps": metrics.get("input_throughput", 0),
                                 "out_tps": metrics.get("output_throughput", 0),
-                                "model_name": model,
+                                "model_name": raw_model_id,
                                 "tpu_size": 1,
                             }
                         )
@@ -203,7 +224,21 @@ class TestModePerf(CustomTestCase):
         print("=" * 100)
 
     def test_qwen_7b_performance_tp_4(self):
-        model = QWEN_7B
+        import os
+
+        MOUNT_ROOT = os.getenv("CI_MOUNT_ROOT", "/models")
+        raw_model_id = QWEN_7B
+        model_dir_name = "Qwen-7B"
+        cached_model_path = os.path.join(MOUNT_ROOT, "model_scope", model_dir_name)
+
+        print(f"[CI Info] Checking Model Cache at: {cached_model_path}")
+        if os.path.exists(cached_model_path):
+            print(f"[CI Info] Hit Model Cache: {cached_model_path}")
+            model_path_for_server = cached_model_path
+        else:
+            print(f"[CI Info] Cache Miss, downloading: {raw_model_id}")
+            model_path_for_server = raw_model_id
+
         base_url = DEFAULT_URL_FOR_TEST
 
         # define test parameters
@@ -223,7 +258,7 @@ class TestModePerf(CustomTestCase):
         ]
         # launch server
         process = popen_launch_server(
-            model,
+            model_path_for_server,
             base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             device="tpu",
@@ -256,8 +291,8 @@ class TestModePerf(CustomTestCase):
                             base_url=base_url,
                             host="0.0.0.0",
                             port=int(base_url.split(":")[-1]),
-                            model=model,
-                            tokenizer=model,
+                            model=model_path_for_server,
+                            tokenizer=model_path_for_server,
                             dataset_name="sharegpt",
                             random_range_ratio=1.0,
                             request_rate=float("inf"),
@@ -301,7 +336,7 @@ class TestModePerf(CustomTestCase):
                                 "itl_ms": metrics.get("mean_itl_ms", 0),
                                 "in_tps": metrics.get("input_throughput", 0),
                                 "out_tps": metrics.get("output_throughput", 0),
-                                "model_name": model,
+                                "model_name": raw_model_id,
                                 "tpu_size": 4,
                             }
                         )
@@ -342,7 +377,21 @@ class TestModePerf(CustomTestCase):
         print("=" * 100)
 
     def test_qwen3_8b_performance_tp_1(self):
-        model = QWEN3_8B
+        import os
+
+        MOUNT_ROOT = os.getenv("CI_MOUNT_ROOT", "/models")
+        raw_model_id = QWEN3_8B
+        model_dir_name = "QWEN3_8B"
+        cached_model_path = os.path.join(MOUNT_ROOT, "model_scope", model_dir_name)
+
+        print(f"[CI Info] Checking Model Cache at: {cached_model_path}")
+        if os.path.exists(cached_model_path):
+            print(f"[CI Info] Hit Model Cache: {cached_model_path}")
+            model_path_for_server = cached_model_path
+        else:
+            print(f"[CI Info] Cache Miss, downloading: {raw_model_id}")
+            model_path_for_server = raw_model_id
+
         base_url = DEFAULT_URL_FOR_TEST
 
         # define test parameters
@@ -362,7 +411,7 @@ class TestModePerf(CustomTestCase):
         ]
         # launch server
         process = popen_launch_server(
-            model,
+            model_path_for_server,
             base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             device="tpu",
@@ -395,8 +444,8 @@ class TestModePerf(CustomTestCase):
                             base_url=base_url,
                             host="0.0.0.0",
                             port=int(base_url.split(":")[-1]),
-                            model=model,
-                            tokenizer=model,
+                            model=model_path_for_server,
+                            tokenizer=model_path_for_server,
                             dataset_name="sharegpt",
                             random_range_ratio=1.0,
                             request_rate=float("inf"),
@@ -440,7 +489,7 @@ class TestModePerf(CustomTestCase):
                                 "itl_ms": metrics.get("mean_itl_ms", 0),
                                 "in_tps": metrics.get("input_throughput", 0),
                                 "out_tps": metrics.get("output_throughput", 0),
-                                "model_name": model,
+                                "model_name": raw_model_id,
                                 "tpu_size": 1,
                             }
                         )
@@ -481,7 +530,21 @@ class TestModePerf(CustomTestCase):
         print("=" * 100)
 
     def test_qwen3_8b_performance_tp_4(self):
-        model = QWEN3_8B
+        import os
+
+        MOUNT_ROOT = os.getenv("CI_MOUNT_ROOT", "/models")
+        raw_model_id = QWEN3_8B
+        model_dir_name = "QWEN3_8B"
+        cached_model_path = os.path.join(MOUNT_ROOT, "model_scope", model_dir_name)
+
+        print(f"[CI Info] Checking Model Cache at: {cached_model_path}")
+        if os.path.exists(cached_model_path):
+            print(f"[CI Info] Hit Model Cache: {cached_model_path}")
+            model_path_for_server = cached_model_path
+        else:
+            print(f"[CI Info] Cache Miss, downloading: {raw_model_id}")
+            model_path_for_server = raw_model_id
+
         base_url = DEFAULT_URL_FOR_TEST
 
         # define test parameters
@@ -501,7 +564,7 @@ class TestModePerf(CustomTestCase):
         ]
         # launch server
         process = popen_launch_server(
-            model,
+            model_path_for_server,
             base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             device="tpu",
@@ -534,8 +597,8 @@ class TestModePerf(CustomTestCase):
                             base_url=base_url,
                             host="0.0.0.0",
                             port=int(base_url.split(":")[-1]),
-                            model=model,
-                            tokenizer=model,
+                            model=model_path_for_server,
+                            tokenizer=model_path_for_server,
                             dataset_name="sharegpt",
                             random_range_ratio=1.0,
                             request_rate=float("inf"),
@@ -579,7 +642,7 @@ class TestModePerf(CustomTestCase):
                                 "itl_ms": metrics.get("mean_itl_ms", 0),
                                 "in_tps": metrics.get("input_throughput", 0),
                                 "out_tps": metrics.get("output_throughput", 0),
-                                "model_name": model,
+                                "model_name": raw_model_id,
                                 "tpu_size": 4,
                             }
                         )
@@ -620,7 +683,21 @@ class TestModePerf(CustomTestCase):
         print("=" * 100)
 
     def test_QWEN3_MOE_30B_performance_tp_2_ep_2(self):
-        model = QWEN3_MOE_30B
+        import os
+
+        MOUNT_ROOT = os.getenv("CI_MOUNT_ROOT", "/models")
+        raw_model_id = QWEN3_MOE_30B
+        model_dir_name = "QWEN3_MOE_30B"
+        cached_model_path = os.path.join(MOUNT_ROOT, "model_scope", model_dir_name)
+
+        print(f"[CI Info] Checking Model Cache at: {cached_model_path}")
+        if os.path.exists(cached_model_path):
+            print(f"[CI Info] Hit Model Cache: {cached_model_path}")
+            model_path_for_server = cached_model_path
+        else:
+            print(f"[CI Info] Cache Miss, downloading: {raw_model_id}")
+            model_path_for_server = raw_model_id
+
         base_url = DEFAULT_URL_FOR_TEST
 
         # define test parameters
@@ -642,7 +719,7 @@ class TestModePerf(CustomTestCase):
         ]
         # launch server
         process = popen_launch_server(
-            model,
+            model_path_for_server,
             base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             device="tpu",
@@ -675,8 +752,8 @@ class TestModePerf(CustomTestCase):
                             base_url=base_url,
                             host="0.0.0.0",
                             port=int(base_url.split(":")[-1]),
-                            model=model,
-                            tokenizer=model,
+                            model=model_path_for_server,
+                            tokenizer=model_path_for_server,
                             dataset_name="sharegpt",
                             random_range_ratio=1.0,
                             request_rate=float("inf"),
@@ -720,7 +797,7 @@ class TestModePerf(CustomTestCase):
                                 "itl_ms": metrics.get("mean_itl_ms", 0),
                                 "in_tps": metrics.get("input_throughput", 0),
                                 "out_tps": metrics.get("output_throughput", 0),
-                                "model_name": model,
+                                "model_name": raw_model_id,
                                 "tpu_size": 4,
                             }
                         )
@@ -761,7 +838,21 @@ class TestModePerf(CustomTestCase):
         print("=" * 100)
 
     def test_GEMMA2_2B_IT_performance_tp_1(self):
-        model = GEMMA2_2B_IT
+        import os
+
+        MOUNT_ROOT = os.getenv("CI_MOUNT_ROOT", "/models")
+        raw_model_id = GEMMA2_2B_IT
+        model_dir_name = "GEMMA2_2B_IT"
+        cached_model_path = os.path.join(MOUNT_ROOT, "model_scope", model_dir_name)
+
+        print(f"[CI Info] Checking Model Cache at: {cached_model_path}")
+        if os.path.exists(cached_model_path):
+            print(f"[CI Info] Hit Model Cache: {cached_model_path}")
+            model_path_for_server = cached_model_path
+        else:
+            print(f"[CI Info] Cache Miss, downloading: {raw_model_id}")
+            model_path_for_server = raw_model_id
+
         base_url = DEFAULT_URL_FOR_TEST
 
         # define test parameters
@@ -781,7 +872,7 @@ class TestModePerf(CustomTestCase):
         ]
         # launch server
         process = popen_launch_server(
-            model,
+            model_path_for_server,
             base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             device="tpu",
@@ -814,8 +905,8 @@ class TestModePerf(CustomTestCase):
                             base_url=base_url,
                             host="0.0.0.0",
                             port=int(base_url.split(":")[-1]),
-                            model=model,
-                            tokenizer=model,
+                            model=model_path_for_server,
+                            tokenizer=model_path_for_server,
                             dataset_name="sharegpt",
                             random_range_ratio=1.0,
                             request_rate=float("inf"),
@@ -859,7 +950,7 @@ class TestModePerf(CustomTestCase):
                                 "itl_ms": metrics.get("mean_itl_ms", 0),
                                 "in_tps": metrics.get("input_throughput", 0),
                                 "out_tps": metrics.get("output_throughput", 0),
-                                "model_name": model,
+                                "model_name": raw_model_id,
                                 "tpu_size": 1,
                             }
                         )
@@ -900,7 +991,21 @@ class TestModePerf(CustomTestCase):
         print("=" * 100)
 
     def test_GEMMA2_2B_IT_performance_tp_4(self):
-        model = GEMMA2_2B_IT
+        import os
+
+        MOUNT_ROOT = os.getenv("CI_MOUNT_ROOT", "/models")
+        raw_model_id = GEMMA2_2B_IT
+        model_dir_name = "GEMMA2_2B_IT"
+        cached_model_path = os.path.join(MOUNT_ROOT, "model_scope", model_dir_name)
+
+        print(f"[CI Info] Checking Model Cache at: {cached_model_path}")
+        if os.path.exists(cached_model_path):
+            print(f"[CI Info] Hit Model Cache: {cached_model_path}")
+            model_path_for_server = cached_model_path
+        else:
+            print(f"[CI Info] Cache Miss, downloading: {raw_model_id}")
+            model_path_for_server = raw_model_id
+
         base_url = DEFAULT_URL_FOR_TEST
 
         # define test parameters
@@ -921,7 +1026,7 @@ class TestModePerf(CustomTestCase):
         ]
         # launch server
         process = popen_launch_server(
-            model,
+            model_path_for_server,
             base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             device="tpu",
@@ -978,8 +1083,8 @@ class TestModePerf(CustomTestCase):
                             base_url=base_url,
                             host="0.0.0.0",
                             port=int(base_url.split(":")[-1]),
-                            model=model,
-                            tokenizer=model,
+                            model=model_path_for_server,
+                            tokenizer=model_path_for_server,
                             dataset_name="sharegpt",
                             random_range_ratio=1.0,
                             request_rate=float("inf"),
@@ -1023,7 +1128,7 @@ class TestModePerf(CustomTestCase):
                                 "itl_ms": metrics.get("mean_itl_ms", 0),
                                 "in_tps": metrics.get("input_throughput", 0),
                                 "out_tps": metrics.get("output_throughput", 0),
-                                "model_name": model,
+                                "model_name": raw_model_id,
                                 "tpu_size": 4,
                             }
                         )
@@ -1064,7 +1169,21 @@ class TestModePerf(CustomTestCase):
         print("=" * 100)
 
     def test_bailing_moe_performance_tp_2_ep_2(self):
-        model = BAILING_MOE
+        import os
+
+        MOUNT_ROOT = os.getenv("CI_MOUNT_ROOT", "/models")
+        raw_model_id = BAILING_MOE
+        model_dir_name = "BAILING_MOE"
+        cached_model_path = os.path.join(MOUNT_ROOT, "model_scope", model_dir_name)
+
+        print(f"[CI Info] Checking Model Cache at: {cached_model_path}")
+        if os.path.exists(cached_model_path):
+            print(f"[CI Info] Hit Model Cache: {cached_model_path}")
+            model_path_for_server = cached_model_path
+        else:
+            print(f"[CI Info] Cache Miss, downloading: {raw_model_id}")
+            model_path_for_server = raw_model_id
+
         base_url = DEFAULT_URL_FOR_TEST
 
         # define test parameters
@@ -1086,7 +1205,7 @@ class TestModePerf(CustomTestCase):
         ]
         # launch server
         process = popen_launch_server(
-            model,
+            model_path_for_server,
             base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             device="tpu",
@@ -1119,8 +1238,8 @@ class TestModePerf(CustomTestCase):
                             base_url=base_url,
                             host="0.0.0.0",
                             port=int(base_url.split(":")[-1]),
-                            model=model,
-                            tokenizer=model,
+                            model=model_path_for_server,
+                            tokenizer=model_path_for_server,
                             dataset_name="sharegpt",
                             random_range_ratio=1.0,
                             request_rate=float("inf"),
@@ -1164,7 +1283,7 @@ class TestModePerf(CustomTestCase):
                                 "itl_ms": metrics.get("mean_itl_ms", 0),
                                 "in_tps": metrics.get("input_throughput", 0),
                                 "out_tps": metrics.get("output_throughput", 0),
-                                "model_name": model,
+                                "model_name": raw_model_id,
                                 "tpu_size": 4,
                             }
                         )
@@ -1194,7 +1313,21 @@ class TestModePerf(CustomTestCase):
                 writer.writerows(results_summary)
 
     def test_QWEN2_5_7B_INSTRUCT_performance_tp_1(self):
-        model = QWEN2_5_7B_INSTRUCT
+        import os
+
+        MOUNT_ROOT = os.getenv("CI_MOUNT_ROOT", "/models")
+        raw_model_id = QWEN2_5_7B_INSTRUCT
+        model_dir_name = "QWEN2_5_7B_INSTRUCT"
+        cached_model_path = os.path.join(MOUNT_ROOT, "model_scope", model_dir_name)
+
+        print(f"[CI Info] Checking Model Cache at: {cached_model_path}")
+        if os.path.exists(cached_model_path):
+            print(f"[CI Info] Hit Model Cache: {cached_model_path}")
+            model_path_for_server = cached_model_path
+        else:
+            print(f"[CI Info] Cache Miss, downloading: {raw_model_id}")
+            model_path_for_server = raw_model_id
+
         base_url = DEFAULT_URL_FOR_TEST
 
         # define test parameters
@@ -1213,7 +1346,7 @@ class TestModePerf(CustomTestCase):
         ]
         # launch server
         process = popen_launch_server(
-            model,
+            model_path_for_server,
             base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             device="tpu",
@@ -1246,8 +1379,8 @@ class TestModePerf(CustomTestCase):
                             base_url=base_url,
                             host="0.0.0.0",
                             port=int(base_url.split(":")[-1]),
-                            model=model,
-                            tokenizer=model,
+                            model=model_path_for_server,
+                            tokenizer=model_path_for_server,
                             dataset_name="sharegpt",
                             random_range_ratio=1.0,
                             request_rate=float("inf"),
@@ -1291,7 +1424,7 @@ class TestModePerf(CustomTestCase):
                                 "itl_ms": metrics.get("mean_itl_ms", 0),
                                 "in_tps": metrics.get("input_throughput", 0),
                                 "out_tps": metrics.get("output_throughput", 0),
-                                "model_name": model,
+                                "model_name": raw_model_id,
                                 "tpu_size": 1,
                             }
                         )
@@ -1321,7 +1454,21 @@ class TestModePerf(CustomTestCase):
                 writer.writerows(results_summary)
 
     def test_QWEN2_5_7B_INSTRUCT_performance_tp_4(self):
-        model = QWEN2_5_7B_INSTRUCT
+        import os
+
+        MOUNT_ROOT = os.getenv("CI_MOUNT_ROOT", "/models")
+        raw_model_id = QWEN2_5_7B_INSTRUCT
+        model_dir_name = "QWEN2_5_7B_INSTRUCT"
+        cached_model_path = os.path.join(MOUNT_ROOT, "model_scope", model_dir_name)
+
+        print(f"[CI Info] Checking Model Cache at: {cached_model_path}")
+        if os.path.exists(cached_model_path):
+            print(f"[CI Info] Hit Model Cache: {cached_model_path}")
+            model_path_for_server = cached_model_path
+        else:
+            print(f"[CI Info] Cache Miss, downloading: {raw_model_id}")
+            model_path_for_server = raw_model_id
+
         base_url = DEFAULT_URL_FOR_TEST
 
         # define test parameters
@@ -1341,7 +1488,7 @@ class TestModePerf(CustomTestCase):
         ]
         # launch server
         process = popen_launch_server(
-            model,
+            model_path_for_server,
             base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             device="tpu",
@@ -1374,8 +1521,8 @@ class TestModePerf(CustomTestCase):
                             base_url=base_url,
                             host="0.0.0.0",
                             port=int(base_url.split(":")[-1]),
-                            model=model,
-                            tokenizer=model,
+                            model=model_path_for_server,
+                            tokenizer=model_path_for_server,
                             dataset_name="sharegpt",
                             random_range_ratio=1.0,
                             request_rate=float("inf"),
@@ -1419,7 +1566,7 @@ class TestModePerf(CustomTestCase):
                                 "itl_ms": metrics.get("mean_itl_ms", 0),
                                 "in_tps": metrics.get("input_throughput", 0),
                                 "out_tps": metrics.get("output_throughput", 0),
-                                "model_name": model,
+                                "model_name": raw_model_id,
                                 "tpu_size": 4,
                             }
                         )
