@@ -28,11 +28,6 @@ class BgmvLoRABackend(BaseLoRABackend):
         super().__init__(max_loras_per_batch)
         self.max_lora_rank = max_lora_rank
 
-        # Initialize with dummy arrays to ensure consistent PyTree structure for JIT
-        # using empty arrays (size 0) is sufficient for structure matching
-        dummy_arr = jnp.array([], dtype=jnp.int32)
-        dummy_scalings = jnp.array([], dtype=jnp.float32)
-
     def run_lora_a_gemm(
         self,
         x: jax.Array,
