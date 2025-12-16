@@ -1216,7 +1216,11 @@ class Scheduler(
                 model_worker_batch
             )
             if batch_output.accept_lens is not None:
+                # Decode
                 batch.seq_lens = batch.seq_lens + batch_output.accept_lens
+            else:
+                # Prefill
+                batch.seq_lens = batch.seq_lens + 1
             batch.spec_info = batch_output.next_draft_input
             next_token_ids = batch_output.next_token_ids
             logits_output = batch_output.logits_output

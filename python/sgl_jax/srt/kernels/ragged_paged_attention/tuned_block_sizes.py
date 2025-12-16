@@ -692,7 +692,12 @@ def get_tuned_block_sizes(
     page_size,
     max_num_tokens,
     pages_per_seq,
+    causal,
 ) -> tuple[int, int]:
+    if not causal:
+        # FIXME(pc) hack this to avoid oom when precompile, currently, we still have no better choice for non-causal's mask
+        # this should be optimied future
+        return 4, 4
     """Look up for the best (num_kv_pages_per_blk, num_queries_per_blk) from auto-tuned table."""
     tpu_version = get_tpu_version()
 

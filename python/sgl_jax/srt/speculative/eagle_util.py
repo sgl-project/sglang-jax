@@ -179,20 +179,26 @@ def get_last_loc_large_page_size_large_top_k(
     return prefix_lens, new_seq_lens, last_loc, num_new_pages_per_topk, extend_lens
 
 
+@jax.jit(static_argnames=["num_verify_tokens", "batch_size", "speculative_num_steps"])
 def build_tree_kernel_efficient_preprocess(
     verified_id: jax.Array,
-    score_list: list[jax.Array],
-    token_list: list[jax.Array],
-    parents_list: list[jax.Array],
+    scores: jax.Array,
+    tokens: jax.Array,
+    parents: jax.Array,
     num_verify_tokens: int,
+    batch_size: int,
+    speculative_num_steps: int,
 ):
+    # score_list   (bs, 1 + (step - 1) * topk  , eagle_topk)
+    # token_list   (bs, topk + (step - 1) * topk * topk)
+    # parents_list (bs, topk + 1 + (step - 1) * topk)
     # Concatenate score_list along dim=1 and flatten from dim=1 onwards
     # b, n, topk; n = 1 + (num_steps-1) * self.topk
-    score_tensor = jnp.concatenate(score_list, axis=1)
+    score_tensor = scores
     score_tensor = score_tensor.reshape(score_tensor.shape[0], -1)
 
     # Concatenate token lists: b, (self.topk + (num_steps-1) * self.topk)
-    ss_token_list = jnp.concatenate(token_list, axis=1)
+    ss_token_list = tokens
 
     # Get top scores and indices
     _, top_scores_index = jax.lax.top_k(score_tensor, num_verify_tokens - 1)
@@ -206,11 +212,9 @@ def build_tree_kernel_efficient_preprocess(
     ).flatten()
 
     # Build parent list
-    if len(parents_list) > 1:
-        parent_list = jnp.concatenate(parents_list[:-1], axis=1)
+    if speculative_num_steps > 1:
+        parent_list = parents
     else:
-        batch_size = parents_list[0].shape[0]
-        # parent_list = jnp.empty((batch_size, 0), dtype=jnp.int32)
         parent_list = jnp.full((batch_size, 1), -1, dtype=jnp.int32)
 
     return parent_list, top_scores_index, draft_tokens
@@ -290,14 +294,16 @@ def build_tree_mask_for_draft_decode(
 
 def build_tree_kernel_efficient(
     verified_id: jax.Array,
-    score_list: list[jax.Array],
-    token_list: list[jax.Array],
-    parents_list: list[jax.Array],
+    score_list: jax.Array,
+    token_list: jax.Array,
+    parents_list: jax.Array,
     seq_lens: jax.Array,
     seq_lens_sum: jax.Array,
     topk: int,
     num_verify_tokens: int,
     max_seq_len_per_req: int,
+    batch_size: int,
+    speculative_num_steps: int,
     mesh: Mesh,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
     """JAX implementation of build_tree_kernel_efficient.
@@ -318,7 +324,13 @@ def build_tree_kernel_efficient(
                  retrive_next_sibling, draft_tokens)
     """
     parent_list, top_scores_index, draft_tokens = build_tree_kernel_efficient_preprocess(
-        verified_id, score_list, token_list, parents_list, num_verify_tokens
+        verified_id,
+        score_list,
+        token_list,
+        parents_list,
+        num_verify_tokens,
+        batch_size,
+        speculative_num_steps,
     )
 
     # Get batch size
@@ -494,8 +506,8 @@ class EagleDraftInput:
         model_worker_batch.spec_info.capture_hidden_mode = CaptureHiddenMode.LAST
         model_worker_batch.forward_mode = ForwardMode.DRAFT_EXTEND
         model_worker_batch.spec_info.hidden_states = batch_output.next_draft_input.hidden_states
-        forward_metadata = draft_model_runner.attn_backend.get_forward_metadata(
-            model_worker_batch, is_eagle=True
+        forward_metadata = draft_model_runner.attn_backend.get_eagle_forward_metadata(
+            model_worker_batch
         )
         draft_model_runner.attn_backend.forward_metadata = forward_metadata
         from sgl_jax.srt.layers.logits_processor import LogitsMetadata
@@ -1009,20 +1021,29 @@ def assign_req_to_token_pool(
     end_offsets,
     out_cache_loc,
 ):
-    bs = start_offsets.shape[0]
+    # Ensure inputs are numpy arrays (CPU) to avoid JAX sync overhead
+    start_offsets = np.asarray(start_offsets, dtype=np.int32)
+    end_offsets = np.asarray(end_offsets, dtype=np.int32)
+    out_cache_loc = np.asarray(out_cache_loc, dtype=np.int32)
+
     out_cache_lens = end_offsets - start_offsets
-    out_cache_loc_start_positions = np.concatenate(
-        [np.array([0], dtype=np.int32), np.cumsum(out_cache_lens)]
-    )[0:-1]
-    all_cache_loc_len = out_cache_loc.shape[0]
-    allocate_len = 0
-    for i in range(bs):
-        out_cache_loc_start = out_cache_loc_start_positions[i]
-        req_to_token_pool.write(
-            (req_pool_indices[i], slice(start_offsets[i], end_offsets[i])),
-            out_cache_loc[out_cache_loc_start : out_cache_loc_start + out_cache_lens[i]],
-        )
-        allocate_len += out_cache_lens[i]
+    repeats = out_cache_lens
+    total_elements = np.sum(repeats)
+
     assert (
-        allocate_len == all_cache_loc_len
-    ), f"not all allocate cache loc is assigned to req_token_pool, it's may lead to mem leak, assigned {allocate_len}, allocate {all_cache_loc_len}"
+        total_elements == out_cache_loc.shape[0]
+    ), f"not all allocate cache loc is assigned to req_token_pool, it's may lead to mem leak, assigned {total_elements}, allocate {out_cache_loc.shape[0]}"
+
+    if total_elements == 0:
+        return
+
+    # 1. Row indices: repeat req_pool_indices
+    row_indices = np.repeat(req_pool_indices, repeats)
+
+    # 2. Col indices: generate ranges
+    block_starts = np.concatenate(([0], np.cumsum(repeats)[:-1]))
+    shifts = np.repeat(block_starts, repeats)
+    col_indices = np.arange(total_elements) - shifts + np.repeat(start_offsets, repeats)
+
+    # 3. Assign
+    req_to_token_pool.req_to_token[row_indices, col_indices] = out_cache_loc

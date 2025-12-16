@@ -1,4 +1,3 @@
-
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -44,6 +43,7 @@ class TestKernelUtils(unittest.TestCase):
         mock_device.device_kind = "NVIDIA H100"
         mock_jax_devices.return_value = [mock_device]
         self.assertEqual(get_tpu_version(), -1)
+
 
 if __name__ == "__main__":
     unittest.main()
