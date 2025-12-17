@@ -1,12 +1,3 @@
-"""
-Test pause_generation and continue_generation using Engine API directly.
-
-This test uses async/await pattern to avoid multi-threading event loop conflicts.
-
-Usage:
-python3 -m unittest test_engine_pause_continue.TestEnginePauseContinue
-"""
-
 import asyncio
 import time
 import unittest
