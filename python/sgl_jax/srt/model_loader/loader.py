@@ -151,9 +151,11 @@ class DefaultModelLoader(BaseModelLoader):
         if len(weights_files) == 0:
             raise RuntimeError(f"Cannot find any *.safetensors files in {hf_folder}")
         weights_files.sort()
+        platform = os.getenv("JAX_PLATFORMS", None)
+        backend = "cpu" if platform != "proxy" else "proxy"
         for st_file in weights_files:
             with (
-                jax.default_device(jax.local_devices(backend="cpu")[0]),
+                jax.default_device(jax.local_devices(backend=backend)[0]),
                 safe_open(st_file, framework="flax") as f,
             ):
                 for name in list(f.keys()):
