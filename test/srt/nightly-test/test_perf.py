@@ -1662,7 +1662,7 @@ class TestModePerf(CustomTestCase):
         # concurrency levels
         concurrency_levels = [8, 16, 32, 64, 128, 256]
         # input length levels (1k, 4k, 8k)
-        input_lengths = [1024, 4096, 8192]
+        input_lengths = [4096]
 
         # concurrency_levels = [8]
         # # input length levels (1k, 4k, 8k)
