@@ -186,10 +186,12 @@ class Req:
         self.sampling_params = sampling_params
         self.return_hidden_states = return_hidden_states
 
-        # LoRA info
-        self.lora_id = lora_id
         # Extra key for cache namespace isolation (e.g., cache_salt, lora_id)
+        if lora_id is not None:
+            extra_key = (extra_key or "") + lora_id  # lora_id is concatenated to the extra key
+
         self.extra_key = extra_key
+        self.lora_id = lora_id
 
         # Memory pool info
         self.req_pool_idx: int | None = None
