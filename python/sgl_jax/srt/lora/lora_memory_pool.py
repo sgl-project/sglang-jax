@@ -429,7 +429,6 @@ class LoRAMemoryPool:
             a_zero_matrix_shape = (max_lora_rank, input_dim)
             _, output_dim, max_lora_rank = self._get_lora_b_shape(module_name)
             b_zero_matrix_shape = (output_dim, max_lora_rank)
-            # jax.device_put(jnp.zeros(a_zero_matrix_shape,dtype=self.dtype), self._get_lora_a_sharding)
             return a_zero_matrix_shape, b_zero_matrix_shape
 
         with jax.set_mesh(self.mesh):
