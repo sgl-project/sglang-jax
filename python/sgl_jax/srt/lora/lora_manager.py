@@ -43,12 +43,6 @@ class LoRAManager:
     - No eviction policy (all adapters stay in CPU memory)
     - Adapters are transferred to device memory pool on-demand per batch
 
-    Key differences from PyTorch/SGLang version:
-    - Uses JAX arrays instead of PyTorch tensors
-    - Memory pool uses JAX sharding for multi-device support
-    - Layer wrapping uses Flax NNX Model Surgery
-    - No kernel backend (uses JAX/XLA compilation instead)
-
     Future enhancements (V2+):
     - Dynamic adapter loading/unloading
     - LRU/FIFO eviction policies
@@ -294,12 +288,12 @@ class LoRAManager:
             for module_name, module in layer_modules.items():
                 target_module = get_target_module_name(module_name, self.memory_pool.target_modules)
                 module.set_lora_info(
-                    self.memory_pool.get_tensor(
+                    self.memory_pool.get_array(
                         module_name=target_module,
                         layer_id=layer_id,
                         is_lora_a=True,
                     ),
-                    self.memory_pool.get_tensor(
+                    self.memory_pool.get_array(
                         module_name=target_module,
                         layer_id=layer_id,
                         is_lora_a=False,
@@ -523,8 +517,7 @@ class LoRAManager:
             elif hasattr(self.base_model, "model") and hasattr(self.base_model.model, "layers"):
                 layers = self.base_model.model.layers
             else:
-                logger.warning("Could not find model.layers, skipping surgery")
-                return
+                raise ValueError("Could not find model.layers, cannot apply lora surgery")
 
             # Iterate through layers
             for layer_idx in range(len(layers)):
@@ -563,16 +556,6 @@ class LoRAManager:
 
             # Count total replaced modules
             total_replaced = sum(len(layer_mods) for layer_mods in self.lora_modules)
-
-            # Log summary per layer
-            for layer_idx, layer_mods in enumerate(self.lora_modules):
-                if layer_mods:
-                    logger.info(
-                        "LoRA surgery layer %d: replaced %s",
-                        layer_idx,
-                        list(layer_mods.keys()),
-                    )
-
             logger.info(
                 "LoRA surgery completed successfully: replaced %d modules across %d layers",
                 total_replaced,

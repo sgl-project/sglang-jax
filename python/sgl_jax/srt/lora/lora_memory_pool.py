@@ -62,13 +62,6 @@ class LoRAMemoryPool:
     for JAX jit compatibility. No eviction policy is implemented - uses simple
     incremental buffer allocation.
 
-    Key differences from PyTorch version:
-    - Pytree-compatible for JAX jit
-    - Functional updates with .at[].set() instead of in-place mutations
-    - Sharding specs for distributed inference
-    - Simple buffer_id allocation without eviction
-    - CPU-side tracking (uid mappings) separate from JAX arrays
-
     Attributes:
         max_loras_per_batch: Maximum number of LoRA adapters per batch
         max_lora_rank: Maximum LoRA rank supported
@@ -149,7 +142,7 @@ class LoRAMemoryPool:
         self.uid_to_buffer_id: dict[str | None, int] = {}
         self.buffer_id_to_uid: list[str | None | EmptySlot] = [EMPTY_SLOT] * max_loras_per_batch
 
-        # GPU buffers (in pytree) - initialized in init_buffers()
+        # Device buffers (in pytree) - initialized in init_buffers()
         self.A_buffer: dict[str, list[jax.Array]] = {}
         self.B_buffer: dict[str, list[jax.Array]] = {}
 
@@ -857,9 +850,9 @@ class LoRAMemoryPool:
         """Get buffer slot ID for a given LoRA adapter ID."""
         return self.uid_to_buffer_id[lora_uid]
 
-    def get_tensor(self, module_name: str, layer_id: int, is_lora_a: bool) -> jax.Array:
+    def get_array(self, module_name: str, layer_id: int, is_lora_a: bool) -> jax.Array:
         """
-        Get LoRA tensor for a specific module and layer.
+        Get LoRA array for a specific module and layer.
 
         Args:
             module_name: Target module name (e.g., "qkv_proj")
