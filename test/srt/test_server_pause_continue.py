@@ -1,10 +1,3 @@
-"""
-Test pause_generation and continue_generation endpoints.
-
-Usage:
-python3 -m unittest test_pause_continue_generation.TestPauseContinueGeneration
-"""
-
 import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor, as_completed

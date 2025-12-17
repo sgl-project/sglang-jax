@@ -280,7 +280,7 @@ class Engine(EngineBase):
 
     def flush_cache(self):
         """
-        Descriptioin: requests will be sent to tokenizer manager. It will flush all cache: tree_cache(radix cache), req_to_token_pool, token_to_kv_pool_allocator(free physical cache through allocator)
+        Descriptioin: requests will be sent to tokenizer manager. It will flush all cache: tree_cache, req_to_token_pool, token_to_kv_pool_allocator(free physical cache through allocator)
         """
         return self.loop.run_until_complete(self.tokenizer_manager.flush_cache())
 
@@ -288,7 +288,7 @@ class Engine(EngineBase):
         """
         Input: the pause generation mode: ["abort", "retract", "in-place"]
 
-        Description: pause in-flight generation, requests will be sent to tokenizer manager
+        Description: Deal with requests according to mode. Now support abort, in_place and retract.
         """
         obj = PauseGenerationReqInput(mode=mode)
         return self.loop.run_until_complete(self.tokenizer_manager.pause_generation(obj))

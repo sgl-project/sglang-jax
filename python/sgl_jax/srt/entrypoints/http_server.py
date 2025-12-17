@@ -351,7 +351,7 @@ async def classify_request(obj: EmbeddingReqInput, request: Request):
 @app.api_route("/flush_cache", methods=["GET", "POST"])
 async def flush_cache():
     """
-    Descriptioin: requests will be sent to tokenizer manager. It will flush all cache: tree_cache(radix cache), req_to_token_pool, token_to_kv_pool_allocator(free physical cache through allocator)
+    Descriptioin: requests will be sent to tokenizer manager. It will flush all cache: tree_cache, req_to_token_pool, token_to_kv_pool_allocator(free physical cache through allocator)
 
     Return: status code indicating it work correctly
     """
@@ -643,7 +643,7 @@ async def separate_reasoning_request(obj: SeparateReasoningReqInput, request: Re
 @app.post("/pause_generation")
 async def pause_generation(obj: PauseGenerationReqInput, request: Request):
     """
-    Description: pause in-flight generation, requests will be sent to tokenizer manager
+    Description: Deal with requests according to mode. Now support abort, in_place and retract.
 
     Input: PauseGenerationReqInput, request obj for pause generation
 

@@ -244,6 +244,7 @@ class TokenizerManager:
         obj: GenerateReqInput | EmbeddingReqInput,
         request: fastapi.Request | None = None,
     ):
+
         created_time = time.time()
         async with self.is_pause_cond:
             await self.is_pause_cond.wait_for(lambda: not self.is_pause)
