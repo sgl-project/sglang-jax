@@ -240,7 +240,7 @@ class ModelWorker:
                 )
                 # Prepare LoRA batch if LoRA is enabled
                 if self.server_args.enable_lora:
-                    self.get_model_runner().lora_manager.prepare_lora_batch(model_worker_batch)
+                    self.prepare_lora_batch(model_worker_batch)
                 sampling_metadata = SamplingMetadata.from_model_worker_batch(
                     model_worker_batch,
                     0,
@@ -283,7 +283,7 @@ class ModelWorker:
                 )
                 # Prepare LoRA batch if LoRA is enabled
                 if self.server_args.enable_lora:
-                    self.get_model_runner().lora_manager.prepare_lora_batch(model_worker_batch)
+                    self.prepare_lora_batch(model_worker_batch)
                 sampling_metadata = SamplingMetadata.from_model_worker_batch(
                     model_worker_batch, 0, self.mesh, self.model_config.vocab_size
                 )
@@ -394,6 +394,12 @@ class ModelWorker:
     def get_model_runner(self):
         return self.model_runner
 
+    def prepare_lora_batch(self, model_worker_batch: ModelWorkerBatch):
+        self.model_runner.lora_manager.prepare_lora_batch(model_worker_batch)
+        if self.model_runner.lora_manager.has_new_weights:
+            _, model_state = nnx.split(self.model_runner.model)
+            self.model_runner.model_state_leaves, _ = jax.tree_util.tree_flatten(model_state)
+
     def get_worker_info(self):
         return (
             self.max_total_num_tokens,
@@ -466,7 +472,7 @@ class ModelWorker:
 
         # Prepare LoRA batch if LoRA is enabled
         if self.worker.server_args.enable_lora and self.need_prepare_lora_batch:
-            self.get_model_runner().lora_manager.prepare_lora_batch(model_worker_batch)
+            self.prepare_lora_batch(model_worker_batch)
 
         if forward_metadata is None:
             forward_metadata = self.worker.model_runner.attn_backend.get_forward_metadata(

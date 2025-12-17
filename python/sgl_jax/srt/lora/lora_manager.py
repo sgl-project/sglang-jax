@@ -469,6 +469,8 @@ class LoRAManager:
 
         logger.debug("Prepared LoRA batch: %d unique adapters", len(cur_uids))
 
+        self.has_new_weights = has_new_weights
+
     def get_buffer_id(self, lora_id: str | None) -> int:
         """Get buffer slot ID for a given LoRA adapter ID."""
         return self.memory_pool.get_buffer_id(lora_id)
