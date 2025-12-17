@@ -185,47 +185,53 @@ class DeepseekV2Attention(nnx.Module):
         token_to_kv_pool: KVCache,
     ) -> jax.Array:
         batch_size = hidden_states.shape[0]
-        
+
         # Q projection: output (B, num_heads * (qk_nope_head_dim + qk_rope_head_dim))
         q, _ = self.q_proj(hidden_states)
         q = q.reshape(batch_size, self.q_head_num, self.head_dim)  # (B, 16, 192)
-        
+
         # MLA: Compressed KV projection
-        compressed_kv, _ = self.kv_a_proj_with_mqa(hidden_states)  # (B, kv_lora_rank + qk_rope_head_dim)
-        
+        compressed_kv, _ = self.kv_a_proj_with_mqa(
+            hidden_states
+        )  # (B, kv_lora_rank + qk_rope_head_dim)
+
         # Split: kv_lora_rank for compression + qk_rope_head_dim for RoPE
-        compressed = compressed_kv[:, :self.kv_lora_rank]  # (B, 512)
-        k_pe = compressed_kv[:, self.kv_lora_rank:]  # (B, 64) for positional encoding
-        
+        compressed = compressed_kv[:, : self.kv_lora_rank]  # (B, 512)
+        k_pe = compressed_kv[:, self.kv_lora_rank :]  # (B, 64) for positional encoding
+
         # Normalize and expand compressed KV
         compressed = self.kv_a_layernorm(compressed)
-        kv_full, _ = self.kv_b_proj(compressed)  # (B, num_kv_heads * (qk_nope_head_dim + v_head_dim))
-        
+        kv_full, _ = self.kv_b_proj(
+            compressed
+        )  # (B, num_kv_heads * (qk_nope_head_dim + v_head_dim))
+
         # Split k_nope and v from kv_b_proj output
         # kv_full shape: (B, num_kv_heads * (qk_nope_head_dim + v_head_dim))
-        kv_full = kv_full.reshape(batch_size, self.kv_head_num, self.qk_nope_head_dim + self.v_head_dim)
-        k_nope = kv_full[:, :, :self.qk_nope_head_dim]  # (B, 16, 128)
-        v = kv_full[:, :, self.qk_nope_head_dim:]  # (B, 16, 128)
-        
+        kv_full = kv_full.reshape(
+            batch_size, self.kv_head_num, self.qk_nope_head_dim + self.v_head_dim
+        )
+        k_nope = kv_full[:, :, : self.qk_nope_head_dim]  # (B, 16, 128)
+        v = kv_full[:, :, self.qk_nope_head_dim :]  # (B, 16, 128)
+
         # Apply RoPE to q_rope and k_pe
         k_pe = k_pe.reshape(batch_size, 1, self.qk_rope_head_dim)  # (B, 1, 64) - MQA style
         k_pe = jnp.repeat(k_pe, self.kv_head_num, axis=1)  # (B, 16, 64)
-        
+
         # Split Q into nope and rope parts
-        q_nope = q[:, :, :self.qk_nope_head_dim]  # (B, 16, 128)
-        q_rope = q[:, :, self.qk_nope_head_dim:]  # (B, 16, 64)
-        
+        q_nope = q[:, :, : self.qk_nope_head_dim]  # (B, 16, 128)
+        q_rope = q[:, :, self.qk_nope_head_dim :]  # (B, 16, 64)
+
         # Apply RoPE to rope parts
         q_rope, k_pe = self.rotary_emb(positions, q_rope, k_pe)
-        
-        # For simplified MLA attention: 
+
+        # For simplified MLA attention:
         # Q = [q_nope, q_rope], K = [k_nope, k_pe], V = v
         # But FlashAttention expects same dimension for Q/K/V
         # Use v_head_dim for all, truncating Q and K
-        q_attn = q_nope[:, :, :self.v_head_dim]  # (B, 16, 128)
-        k_attn = k_nope[:, :, :self.v_head_dim]  # (B, 16, 128)
+        q_attn = q_nope[:, :, : self.v_head_dim]  # (B, 16, 128)
+        k_attn = k_nope[:, :, : self.v_head_dim]  # (B, 16, 128)
         v_attn = v  # (B, 16, 128)
-        
+
         attn_output, kv_fused = self.attn(q_attn, k_attn, v_attn, forward_batch, token_to_kv_pool)
 
         output, _ = self.o_proj(attn_output)
@@ -271,8 +277,10 @@ class DeepseekV2DecoderLayer(nnx.Module):
         num_experts = getattr(config, "n_routed_experts", 64)
         num_experts_per_tok = getattr(config, "num_experts_per_tok", 8)
         ep_size = getattr(config, "ep_size", 1)
-        shared_intermediate_size = getattr(config, "shared_expert_intermediate_size", config.intermediate_size)
-        
+        shared_intermediate_size = getattr(
+            config, "shared_expert_intermediate_size", config.intermediate_size
+        )
+
         # Always create shared_experts for all layers to ensure nnx.eval_shape can properly
         # evaluate the model structure. Layer 0 won't use it in forward pass.
         self.shared_experts = DeepseekV2MLP(
@@ -283,7 +291,7 @@ class DeepseekV2DecoderLayer(nnx.Module):
             rngs=rngs,
             mesh=mesh,
         )
-        
+
         if layer_id == 0:
             self.mlp = DeepseekV2MLP(
                 hidden_size=config.hidden_size,
@@ -307,9 +315,11 @@ class DeepseekV2DecoderLayer(nnx.Module):
                 topk=num_experts_per_tok,
                 renormalize=getattr(config, "norm_topk_prob", True),
             )
-            
+
             # MoE experts
-            moe_intermediate_size = getattr(config, "moe_intermediate_size", config.intermediate_size)
+            moe_intermediate_size = getattr(
+                config, "moe_intermediate_size", config.intermediate_size
+            )
             self.mlp = EPMoE(
                 config=config,
                 num_experts=num_experts,
@@ -361,7 +371,7 @@ class DeepseekV2DecoderLayer(nnx.Module):
         hidden_states += residual
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
-        
+
         # Layer 0 uses standard MLP, other layers use MoE
         if self.layer_id == 0:
             # Layer 0 doesn't use shared_experts even though it's created for structure consistency
@@ -370,13 +380,13 @@ class DeepseekV2DecoderLayer(nnx.Module):
             # MoE forward pass
             router_logits = self.moe_gate(hidden_states)
             topk_weights, topk_ids = self.topk(router_logits)
-            
+
             # Shared experts output
             shared_output = self.shared_experts(hidden_states)
-            
+
             # MoE experts output
             moe_output = self.mlp(hidden_states, topk_weights, topk_ids)
-            
+
             # Combine shared and MoE outputs
             hidden_states = shared_output + moe_output
 
@@ -553,52 +563,58 @@ class DeepseekV2ForCausalLM(nnx.Module):
                 transpose=True,
             ),
         }
-        
-        # DeepSeek Layer 0 FNN - Standard MLP (no mqa) 
+
+        # DeepSeek Layer 0 FNN - Standard MLP (no mqa)
         prefix_mlp = f"{prefix}.mlp"
         target_prefix_mlp = f"{target_prefix}.mlp"
-        if (layer_idx == 0):
-            mappings.update({
-                f"{prefix_mlp}.down_proj.weight": WeightMapping(
-                    target_path=f"{target_prefix_mlp}.down_proj.weight",
-                    sharding=("tensor", None),
-                    transpose=True,
-                ),
-                f"{prefix_mlp}.gate_proj.weight": WeightMapping(
-                    target_path=f"{target_prefix_mlp}.gate_proj.weight",
-                    sharding=(None, "tensor"),
-                    transpose=True,
-                ),
-            })
-            mappings.update({
-                f"{prefix_mlp}.up_proj.weight": WeightMapping(
-                    target_path=f"{target_prefix_mlp}.up_proj.weight",
-                    sharding=(None, "tensor"),
-                    transpose=True,
-                ),
-            })
+        if layer_idx == 0:
+            mappings.update(
+                {
+                    f"{prefix_mlp}.down_proj.weight": WeightMapping(
+                        target_path=f"{target_prefix_mlp}.down_proj.weight",
+                        sharding=("tensor", None),
+                        transpose=True,
+                    ),
+                    f"{prefix_mlp}.gate_proj.weight": WeightMapping(
+                        target_path=f"{target_prefix_mlp}.gate_proj.weight",
+                        sharding=(None, "tensor"),
+                        transpose=True,
+                    ),
+                }
+            )
+            mappings.update(
+                {
+                    f"{prefix_mlp}.up_proj.weight": WeightMapping(
+                        target_path=f"{target_prefix_mlp}.up_proj.weight",
+                        sharding=(None, "tensor"),
+                        transpose=True,
+                    ),
+                }
+            )
         else:
             # Add shared_experts mappings for layers > 0
             # Note: shared_experts is a direct attribute of DecoderLayer, not under mlp
             if layer_idx > 0:
-                mappings.update({
-                    f"{prefix_mlp}.shared_experts.down_proj.weight": WeightMapping(
-                        target_path=f"{target_prefix}.shared_experts.down_proj.weight",
-                        sharding=("tensor", None),
-                        transpose=True,
-                    ),
-                    f"{prefix_mlp}.shared_experts.gate_proj.weight": WeightMapping(
-                        target_path=f"{target_prefix}.shared_experts.gate_proj.weight",
-                        sharding=(None, "tensor"),
-                        transpose=True,
-                    ),
-                    f"{prefix_mlp}.shared_experts.up_proj.weight": WeightMapping(
-                        target_path=f"{target_prefix}.shared_experts.up_proj.weight",
-                        sharding=(None, "tensor"),
-                        transpose=True,
-                    ),
-                })
-            
+                mappings.update(
+                    {
+                        f"{prefix_mlp}.shared_experts.down_proj.weight": WeightMapping(
+                            target_path=f"{target_prefix}.shared_experts.down_proj.weight",
+                            sharding=("tensor", None),
+                            transpose=True,
+                        ),
+                        f"{prefix_mlp}.shared_experts.gate_proj.weight": WeightMapping(
+                            target_path=f"{target_prefix}.shared_experts.gate_proj.weight",
+                            sharding=(None, "tensor"),
+                            transpose=True,
+                        ),
+                        f"{prefix_mlp}.shared_experts.up_proj.weight": WeightMapping(
+                            target_path=f"{target_prefix}.shared_experts.up_proj.weight",
+                            sharding=(None, "tensor"),
+                            transpose=True,
+                        ),
+                    }
+                )
+
             # MoE experts mappings - use __MOE_EXPERTS__ prefix for grouped loading
             num_experts = getattr(self.config, "n_routed_experts", 64)
             for expert_type in ["gate_proj", "up_proj", "down_proj"]:
@@ -607,22 +623,22 @@ class DeepseekV2ForCausalLM(nnx.Module):
                     "up_proj": "wi_1",
                     "down_proj": "wo",
                 }[expert_type]
-                
+
                 expert_keys = [
                     f"{prefix}.mlp.experts.{i}.{expert_type}.weight" for i in range(num_experts)
                 ]
-                
+
                 if expert_type == "down_proj":
                     sharding = ("expert", "tensor", None)
                 else:
                     sharding = ("expert", None, "tensor")
-                
+
                 mappings[f"__MOE_EXPERTS__{prefix}.mlp.{target_name}"] = WeightMapping(
                     target_path=[f"{target_prefix}.mlp.{target_name}"] + expert_keys,
                     sharding=sharding,
                     transpose=True,
                 )
-            
+
             mappings[f"{prefix}.mlp.gate.weight"] = WeightMapping(
                 target_path=f"{target_prefix}.moe_gate.kernel",
                 sharding=(None, None),
@@ -631,7 +647,6 @@ class DeepseekV2ForCausalLM(nnx.Module):
 
         return mappings
 
-    
     def __call__(
         self,
         forward_batch: ForwardBatch,
