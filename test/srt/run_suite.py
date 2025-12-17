@@ -211,56 +211,61 @@ suites = {
     ],
     "nightly-test-perf-text-models-tpu-v6e-1": [
         TestFile(
-            "nightly-test/test_pref.py",
+            "nightly-test/test_perf.py",
             estimated_time=7,
             test_methods=["TestModePerf.test_qwen_7b_performance_tp_1"],
         ),
         TestFile(
-            "nightly-test/test_pref.py",
+            "nightly-test/test_perf.py",
             estimated_time=8,
             test_methods=["TestModePerf.test_qwen3_8b_performance_tp_1"],
         ),
         TestFile(
-            "nightly-test/test_pref.py",
+            "nightly-test/test_perf.py",
             estimated_time=2,
             test_methods=["TestModePerf.test_GEMMA2_2B_IT_performance_tp_1"],
         ),
         TestFile(
-            "nightly-test/test_pref.py",
+            "nightly-test/test_perf.py",
             estimated_time=2.5,
             test_methods=["TestModePerf.test_QWEN2_5_7B_INSTRUCT_performance_tp_1"],
         ),
     ],
     "nightly-test-perf-text-models-tpu-v6e-4": [
         TestFile(
-            "nightly-test/test_pref.py",
+            "nightly-test/test_perf.py",
             estimated_time=7,
             test_methods=["TestModePerf.test_qwen_7b_performance_tp_4"],
         ),
         TestFile(
-            "nightly-test/test_pref.py",
+            "nightly-test/test_perf.py",
             estimated_time=8,
             test_methods=["TestModePerf.test_qwen3_8b_performance_tp_4"],
         ),
         TestFile(
-            "nightly-test/test_pref.py",
+            "nightly-test/test_perf.py",
             estimated_time=30,
             test_methods=["TestModePerf.test_QWEN3_MOE_30B_performance_tp_2_ep_2"],
         ),
         TestFile(
-            "nightly-test/test_pref.py",
+            "nightly-test/test_perf.py",
             estimated_time=2,
             test_methods=["TestModePerf.test_GEMMA2_2B_IT_performance_tp_4"],
         ),
         TestFile(
-            "nightly-test/test_pref.py",
+            "nightly-test/test_perf.py",
             estimated_time=20,
             test_methods=["TestModePerf.test_bailing_moe_performance_tp_2_ep_2"],
         ),
         TestFile(
-            "nightly-test/test_pref.py",
+            "nightly-test/test_perf.py",
             estimated_time=2.5,
             test_methods=["TestModePerf.test_QWEN2_5_7B_INSTRUCT_performance_tp_4"],
+        ),
+        TestFile(
+            "nightly-test/test_perf.py",
+            estimated_time=45,
+            test_methods=["TestModePerf.test_qwen3_32B_lora_r32_performance_tp_4"],
         ),
     ],
     "sglang_dependency_test": [],
@@ -301,10 +306,6 @@ suites = {
         TestFile(
             "test/srt/test_bench_serving_moe.py",
             13,
-        ),
-        TestFile(
-            "test/srt/test_bench_serving_lora.py",
-            45,
         ),
     ],
     "e2e-test-tpu-v6e-1": [
