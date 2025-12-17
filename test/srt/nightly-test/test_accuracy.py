@@ -52,7 +52,18 @@ class TestModelAccuracy(CustomTestCase):
     ]
 
     def test_qwen_7b(self):
-        model = QWEN_7B
+        # args setting
+        MOUNT_ROOT = os.getenv("CI_MOUNT_ROOT", "/models")
+        raw_model_id = QWEN_7B
+        model_dir_name = "Qwen-7B"
+        cached_model_path = os.path.join(MOUNT_ROOT, "model_scope", model_dir_name)
+        print(f"[CI Info] Checking Model Cache at: {cached_model_path}")
+        if os.path.exists(cached_model_path):
+            print(f"[CI Info] Hit Model Cache: {cached_model_path}")
+            model_path_for_server = cached_model_path
+        else:
+            print(f"[CI Info] Cache Miss, downloading: {raw_model_id}")
+            model_path_for_server = raw_model_id
         base_url = DEFAULT_URL_FOR_TEST
         api_url_for_eval = f"{base_url}/v1"
         output_dir = os.getenv("BENCH_OUTPUT_DIR", "./test/nightly_test_output/benchmark/local_run")
@@ -62,9 +73,10 @@ class TestModelAccuracy(CustomTestCase):
             "--tp-size",
             "1",
         ]
+
         # launch server
         process = popen_launch_server(
-            model,
+            model_path_for_server,
             base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             device="tpu",
@@ -73,25 +85,28 @@ class TestModelAccuracy(CustomTestCase):
                 "JAX_COMPILATION_CACHE_DIR": "/tmp/jax_compilation_cache",
             },
         )
+
         # run evalscope tasks
         try:
             tasks = [
                 {"name": "gsm8k", "threshold": 0.41},
                 {"name": "mmlu", "threshold": 0.4},
             ]
-
             for task in tasks:
                 dataset_name = task["name"]
                 threshold = task["threshold"]
 
                 dataset_args = {}
-                # if dataset_name == "mmlu" or dataset_name == "modelscope/mmlu":
-                #     dataset_args = {"mmlu": {"subset_list": ["global_facts"]}}
-                # if dataset_name == "mmlu":
-                #     dataset_args = {"mmlu": {"hub": "hf", "dataset_id": "cais/mmlu"}}
+                cached_dataset_path = os.path.join(MOUNT_ROOT, "dataset", dataset_name)
+                if os.path.exists(cached_dataset_path):
+                    print(f"[CI Info] Hit Dataset Cache: {cached_dataset_path}")
+
+                    dataset_args = {dataset_name: {"local_path": cached_dataset_path}}
+                else:
+                    print(f"[CI Info] Dataset Cache Miss: {dataset_name}")
 
                 config = TaskConfig(
-                    model=model,
+                    model=raw_model_id,
                     api_url=api_url_for_eval,
                     api_key="EMPTY",
                     eval_type="service",
@@ -99,8 +114,9 @@ class TestModelAccuracy(CustomTestCase):
                     dataset_args=dataset_args,
                     eval_batch_size=64,
                 )
+
                 # Run the task and get results
-                print(f"{model} Running eval for {dataset_name}")
+                print(f"{raw_model_id} Running eval for {task['name']}")
                 results = run_task(config)
                 print(f"SDK Results: {results}")
                 if dataset_name in results:
@@ -122,14 +138,14 @@ class TestModelAccuracy(CustomTestCase):
 
                         model_found = False
                         for row in rows:
-                            if row.get("Model") == model:
+                            if row.get("Model") == raw_model_id:
                                 row[dataset_name] = score
                                 model_found = True
                                 break
 
                         if not model_found:
 
-                            new_row = {"Model": model, dataset_name: score}
+                            new_row = {"Model": raw_model_id, dataset_name: score}
                             rows.append(new_row)
 
                         with open(csv_file_path, "w", newline="", encoding="utf-8") as f:
@@ -137,7 +153,9 @@ class TestModelAccuracy(CustomTestCase):
                             writer.writeheader()
                             writer.writerows(rows)
 
-                        print(f"Updated CSV {csv_file_path}: {model} - {dataset_name} = {score}")
+                        print(
+                            f"Updated CSV {csv_file_path}: {raw_model_id} - {dataset_name} = {score}"
+                        )
 
                     except Exception as e:
                         print(f"Warning: Failed to update CSV file: {e}")
@@ -155,7 +173,18 @@ class TestModelAccuracy(CustomTestCase):
             kill_process_tree(process.pid)
 
     def test_qwen3_8b(self):
-        model = QWEN3_8B
+        # args setting
+        MOUNT_ROOT = os.getenv("CI_MOUNT_ROOT", "/models")
+        raw_model_id = QWEN3_8B
+        model_dir_name = "QWEN3_8B"
+        cached_model_path = os.path.join(MOUNT_ROOT, "model_scope", model_dir_name)
+        print(f"[CI Info] Checking Model Cache at: {cached_model_path}")
+        if os.path.exists(cached_model_path):
+            print(f"[CI Info] Hit Model Cache: {cached_model_path}")
+            model_path_for_server = cached_model_path
+        else:
+            print(f"[CI Info] Cache Miss, downloading: {raw_model_id}")
+            model_path_for_server = raw_model_id
         base_url = DEFAULT_URL_FOR_TEST
         api_url_for_eval = f"{base_url}/v1"
         output_dir = os.getenv("BENCH_OUTPUT_DIR", "./test/nightly_test_output/benchmark/local_run")
@@ -167,7 +196,7 @@ class TestModelAccuracy(CustomTestCase):
         ]
         # launch server
         process = popen_launch_server(
-            model,
+            model_path_for_server,
             DEFAULT_URL_FOR_TEST,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             device="tpu",
@@ -189,13 +218,16 @@ class TestModelAccuracy(CustomTestCase):
                 threshold = task["threshold"]
 
                 dataset_args = {}
-                # if dataset_name == "mmlu" or dataset_name == "modelscope/mmlu":
-                #     dataset_args = {"mmlu": {"subset_list": ["global_facts"]}}
-                # if dataset_name == "mmlu":
-                #     dataset_args = {"mmlu": {"hub": "hf", "dataset_id": "cais/mmlu"}}
+                cached_dataset_path = os.path.join(MOUNT_ROOT, "dataset", dataset_name)
+                if os.path.exists(cached_dataset_path):
+                    print(f"[CI Info] Hit Dataset Cache: {cached_dataset_path}")
+
+                    dataset_args = {dataset_name: {"local_path": cached_dataset_path}}
+                else:
+                    print(f"[CI Info] Dataset Cache Miss: {dataset_name}")
 
                 config = TaskConfig(
-                    model=model,
+                    model=raw_model_id,
                     api_url=api_url_for_eval,
                     api_key="EMPTY",
                     eval_type="service",
@@ -203,8 +235,9 @@ class TestModelAccuracy(CustomTestCase):
                     dataset_args=dataset_args,
                     eval_batch_size=64,
                 )
+
                 # Run the task and get results
-                print(f"{model} Running eval for {dataset_name}")
+                print(f"{raw_model_id} Running eval for {task['name']}")
                 results = run_task(config)
                 print(f"SDK Results: {results}")
                 if dataset_name in results:
@@ -226,14 +259,14 @@ class TestModelAccuracy(CustomTestCase):
 
                         model_found = False
                         for row in rows:
-                            if row.get("Model") == model:
+                            if row.get("Model") == raw_model_id:
                                 row[dataset_name] = score
                                 model_found = True
                                 break
 
                         if not model_found:
 
-                            new_row = {"Model": model, dataset_name: score}
+                            new_row = {"Model": raw_model_id, dataset_name: score}
                             rows.append(new_row)
 
                         with open(csv_file_path, "w", newline="", encoding="utf-8") as f:
@@ -241,7 +274,9 @@ class TestModelAccuracy(CustomTestCase):
                             writer.writeheader()
                             writer.writerows(rows)
 
-                        print(f"Updated CSV {csv_file_path}: {model} - {dataset_name} = {score}")
+                        print(
+                            f"Updated CSV {csv_file_path}: {raw_model_id} - {dataset_name} = {score}"
+                        )
 
                     except Exception as e:
                         print(f"Warning: Failed to update CSV file: {e}")
@@ -259,7 +294,18 @@ class TestModelAccuracy(CustomTestCase):
             kill_process_tree(process.pid)
 
     def test_DEEPSEEK_R1_DISTILL_QWEN_1_5B(self):
-        model = DEEPSEEK_R1_DISTILL_QWEN_1_5B
+        # args setting
+        MOUNT_ROOT = os.getenv("CI_MOUNT_ROOT", "/models")
+        raw_model_id = DEEPSEEK_R1_DISTILL_QWEN_1_5B
+        model_dir_name = "DEEPSEEK_R1_DISTILL_QWEN_1_5B"
+        cached_model_path = os.path.join(MOUNT_ROOT, "model_scope", model_dir_name)
+        print(f"[CI Info] Checking Model Cache at: {cached_model_path}")
+        if os.path.exists(cached_model_path):
+            print(f"[CI Info] Hit Model Cache: {cached_model_path}")
+            model_path_for_server = cached_model_path
+        else:
+            print(f"[CI Info] Cache Miss, downloading: {raw_model_id}")
+            model_path_for_server = raw_model_id
         base_url = DEFAULT_URL_FOR_TEST
         api_url_for_eval = f"{base_url}/v1"
         output_dir = os.getenv("BENCH_OUTPUT_DIR", "./test/nightly_test_output/benchmark/local_run")
@@ -273,7 +319,7 @@ class TestModelAccuracy(CustomTestCase):
         ]
 
         process = popen_launch_server(
-            model,
+            model_path_for_server,
             base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             device="tpu",
@@ -297,10 +343,18 @@ class TestModelAccuracy(CustomTestCase):
 
                 dataset_args = {}
                 generation_config = {}
-                # if dataset_name == "mmlu" or dataset_name == "modelscope/mmlu":
-                #     dataset_args = {"mmlu": {"subset_list": ["global_facts"]}}
+
+                cached_dataset_path = os.path.join(MOUNT_ROOT, "dataset", dataset_name)
+                if os.path.exists(cached_dataset_path):
+                    print(f"[CI Info] Hit Dataset Cache: {cached_dataset_path}")
+                    dataset_args = {dataset_name: {"local_path": cached_dataset_path}}
+                else:
+                    print(f"[CI Info] Dataset Cache Miss: {dataset_name}")
+                    pass
                 if dataset_name != "gsm8k":
-                    dataset_args = {dataset_name: {"metric_list": ["Pass@1"]}}
+                    if dataset_name not in dataset_args:
+                        dataset_args[dataset_name] = {}
+                    dataset_args[dataset_name]["metric_list"] = ["Pass@1"]
                     generation_config = {
                         "max_tokens": 32768,
                         "temperature": 0.6,
@@ -308,7 +362,7 @@ class TestModelAccuracy(CustomTestCase):
                     }
 
                 config = TaskConfig(
-                    model=model,
+                    model=raw_model_id,
                     api_url=api_url_for_eval,
                     api_key="EMPTY",
                     eval_type="service",
@@ -318,7 +372,7 @@ class TestModelAccuracy(CustomTestCase):
                     eval_batch_size=64,
                 )
                 # Run the task and get results
-                print(f"{model} Running eval for {dataset_name}")
+                print(f"{raw_model_id} Running eval for {task['name']}")
                 results = run_task(config)
                 print(f"SDK Results: {results}")
                 if dataset_name in results:
@@ -327,27 +381,23 @@ class TestModelAccuracy(CustomTestCase):
                     try:
                         rows = []
                         fieldnames = ["Model"]
-
                         if os.path.exists(csv_file_path):
                             with open(csv_file_path, "r", newline="", encoding="utf-8") as f:
                                 reader = csv.DictReader(f)
                                 if reader.fieldnames:
                                     fieldnames = reader.fieldnames
                                 rows = list(reader)
-
                         if dataset_name not in fieldnames:
                             fieldnames.append(dataset_name)
-
                         model_found = False
                         for row in rows:
-                            if row.get("Model") == model:
+                            if row.get("Model") == raw_model_id:
                                 row[dataset_name] = score
                                 model_found = True
                                 break
 
                         if not model_found:
-
-                            new_row = {"Model": model, dataset_name: score}
+                            new_row = {"Model": raw_model_id, dataset_name: score}
                             rows.append(new_row)
 
                         with open(csv_file_path, "w", newline="", encoding="utf-8") as f:
@@ -355,7 +405,9 @@ class TestModelAccuracy(CustomTestCase):
                             writer.writeheader()
                             writer.writerows(rows)
 
-                        print(f"Updated CSV {csv_file_path}: {model} - {dataset_name} = {score}")
+                        print(
+                            f"Updated CSV {csv_file_path}: {raw_model_id} - {dataset_name} = {score}"
+                        )
 
                     except Exception as e:
                         print(f"Warning: Failed to update CSV file: {e}")
@@ -373,7 +425,18 @@ class TestModelAccuracy(CustomTestCase):
             kill_process_tree(process.pid)
 
     def test_GEMMA2_2B_IT(self):
-        model = GEMMA2_2B_IT
+        # args setting
+        MOUNT_ROOT = os.getenv("CI_MOUNT_ROOT", "/models")
+        raw_model_id = GEMMA2_2B_IT
+        model_dir_name = "GEMMA2_2B_IT"
+        cached_model_path = os.path.join(MOUNT_ROOT, "model_scope", model_dir_name)
+        print(f"[CI Info] Checking Model Cache at: {cached_model_path}")
+        if os.path.exists(cached_model_path):
+            print(f"[CI Info] Hit Model Cache: {cached_model_path}")
+            model_path_for_server = cached_model_path
+        else:
+            print(f"[CI Info] Cache Miss, downloading: {raw_model_id}")
+            model_path_for_server = raw_model_id
         base_url = DEFAULT_URL_FOR_TEST
         api_url_for_eval = f"{base_url}/v1"
         output_dir = os.getenv("BENCH_OUTPUT_DIR", "./test/nightly_test_output/benchmark/local_run")
@@ -386,7 +449,7 @@ class TestModelAccuracy(CustomTestCase):
         ]
         # launch server
         process = popen_launch_server(
-            model,
+            model_path_for_server,
             base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             device="tpu",
@@ -407,13 +470,16 @@ class TestModelAccuracy(CustomTestCase):
                 threshold = task["threshold"]
 
                 dataset_args = {}
-                # if dataset_name == "mmlu" or dataset_name == "modelscope/mmlu":
-                #     dataset_args = {"mmlu": {"subset_list": ["global_facts"]}}
-                # if dataset_name == "mmlu":
-                #     dataset_args = {"mmlu": {"hub": "hf", "dataset_id": "cais/mmlu"}}
+                cached_dataset_path = os.path.join(MOUNT_ROOT, "dataset", dataset_name)
+                if os.path.exists(cached_dataset_path):
+                    print(f"[CI Info] Hit Dataset Cache: {cached_dataset_path}")
+
+                    dataset_args = {dataset_name: {"local_path": cached_dataset_path}}
+                else:
+                    print(f"[CI Info] Dataset Cache Miss: {dataset_name}")
 
                 config = TaskConfig(
-                    model=model,
+                    model=raw_model_id,
                     api_url=api_url_for_eval,
                     api_key="EMPTY",
                     eval_type="service",
@@ -422,7 +488,7 @@ class TestModelAccuracy(CustomTestCase):
                     eval_batch_size=64,
                 )
                 # Run the task and get results
-                print(f"{model} Running eval for {dataset_name}")
+                print(f"{raw_model_id} Running eval for {task['name']}")
                 results = run_task(config)
                 print(f"SDK Results: {results}")
                 if dataset_name in results:
@@ -444,14 +510,14 @@ class TestModelAccuracy(CustomTestCase):
 
                         model_found = False
                         for row in rows:
-                            if row.get("Model") == model:
+                            if row.get("Model") == raw_model_id:
                                 row[dataset_name] = score
                                 model_found = True
                                 break
 
                         if not model_found:
 
-                            new_row = {"Model": model, dataset_name: score}
+                            new_row = {"Model": raw_model_id, dataset_name: score}
                             rows.append(new_row)
 
                         with open(csv_file_path, "w", newline="", encoding="utf-8") as f:
@@ -459,7 +525,9 @@ class TestModelAccuracy(CustomTestCase):
                             writer.writeheader()
                             writer.writerows(rows)
 
-                        print(f"Updated CSV {csv_file_path}: {model} - {dataset_name} = {score}")
+                        print(
+                            f"Updated CSV {csv_file_path}: {raw_model_id} - {dataset_name} = {score}"
+                        )
 
                     except Exception as e:
                         print(f"Warning: Failed to update CSV file: {e}")
@@ -477,7 +545,18 @@ class TestModelAccuracy(CustomTestCase):
             kill_process_tree(process.pid)
 
     def test_qwen_7b_tp_4(self):
-        model = QWEN_7B
+        # args setting
+        MOUNT_ROOT = os.getenv("CI_MOUNT_ROOT", "/models")
+        raw_model_id = QWEN_7B
+        model_dir_name = "Qwen-7B"
+        cached_model_path = os.path.join(MOUNT_ROOT, "model_scope", model_dir_name)
+        print(f"[CI Info] Checking Model Cache at: {cached_model_path}")
+        if os.path.exists(cached_model_path):
+            print(f"[CI Info] Hit Model Cache: {cached_model_path}")
+            model_path_for_server = cached_model_path
+        else:
+            print(f"[CI Info] Cache Miss, downloading: {raw_model_id}")
+            model_path_for_server = raw_model_id
         base_url = DEFAULT_URL_FOR_TEST
         api_url_for_eval = f"{base_url}/v1"
         output_dir = os.getenv("BENCH_OUTPUT_DIR", "./test/nightly_test_output/benchmark/local_run")
@@ -489,7 +568,7 @@ class TestModelAccuracy(CustomTestCase):
         ]
         # launch server
         process = popen_launch_server(
-            model,
+            model_path_for_server,
             DEFAULT_URL_FOR_TEST,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             device="tpu",
@@ -510,13 +589,16 @@ class TestModelAccuracy(CustomTestCase):
                 threshold = task["threshold"]
 
                 dataset_args = {}
-                # if dataset_name == "mmlu" or dataset_name == "modelscope/mmlu":
-                #     dataset_args = {"mmlu": {"subset_list": ["global_facts"]}}
-                # if dataset_name == "mmlu":
-                #     dataset_args = {"mmlu": {"hub": "hf", "dataset_id": "cais/mmlu"}}
+                cached_dataset_path = os.path.join(MOUNT_ROOT, "dataset", dataset_name)
+                if os.path.exists(cached_dataset_path):
+                    print(f"[CI Info] Hit Dataset Cache: {cached_dataset_path}")
+
+                    dataset_args = {dataset_name: {"local_path": cached_dataset_path}}
+                else:
+                    print(f"[CI Info] Dataset Cache Miss: {dataset_name}")
 
                 config = TaskConfig(
-                    model=model,
+                    model=raw_model_id,
                     api_url=api_url_for_eval,
                     api_key="EMPTY",
                     eval_type="service",
@@ -525,7 +607,7 @@ class TestModelAccuracy(CustomTestCase):
                     eval_batch_size=64,
                 )
                 # Run the task and get results
-                print(f"{model} Running eval for {dataset_name}")
+                print(f"{raw_model_id} Running eval for {task['name']}")
                 results = run_task(config)
                 print(f"SDK Results: {results}")
                 if dataset_name in results:
@@ -547,14 +629,14 @@ class TestModelAccuracy(CustomTestCase):
 
                         model_found = False
                         for row in rows:
-                            if row.get("Model") == model:
+                            if row.get("Model") == raw_model_id:
                                 row[dataset_name] = score
                                 model_found = True
                                 break
 
                         if not model_found:
 
-                            new_row = {"Model": model, dataset_name: score}
+                            new_row = {"Model": raw_model_id, dataset_name: score}
                             rows.append(new_row)
 
                         with open(csv_file_path, "w", newline="", encoding="utf-8") as f:
@@ -562,7 +644,9 @@ class TestModelAccuracy(CustomTestCase):
                             writer.writeheader()
                             writer.writerows(rows)
 
-                        print(f"Updated CSV {csv_file_path}: {model} - {dataset_name} = {score}")
+                        print(
+                            f"Updated CSV {csv_file_path}: {raw_model_id} - {dataset_name} = {score}"
+                        )
 
                     except Exception as e:
                         print(f"Warning: Failed to update CSV file: {e}")
@@ -580,7 +664,18 @@ class TestModelAccuracy(CustomTestCase):
             kill_process_tree(process.pid)
 
     def test_qwen3_8b_tp_4(self):
-        model = QWEN3_8B
+        # args setting
+        MOUNT_ROOT = os.getenv("CI_MOUNT_ROOT", "/models")
+        raw_model_id = QWEN3_8B
+        model_dir_name = "QWEN3_8B"
+        cached_model_path = os.path.join(MOUNT_ROOT, "model_scope", model_dir_name)
+        print(f"[CI Info] Checking Model Cache at: {cached_model_path}")
+        if os.path.exists(cached_model_path):
+            print(f"[CI Info] Hit Model Cache: {cached_model_path}")
+            model_path_for_server = cached_model_path
+        else:
+            print(f"[CI Info] Cache Miss, downloading: {raw_model_id}")
+            model_path_for_server = raw_model_id
         base_url = DEFAULT_URL_FOR_TEST
         api_url_for_eval = f"{base_url}/v1"
         output_dir = os.getenv("BENCH_OUTPUT_DIR", "./test/nightly_test_output/benchmark/local_run")
@@ -591,7 +686,7 @@ class TestModelAccuracy(CustomTestCase):
             "4",
         ]
         process = popen_launch_server(
-            model,
+            model_path_for_server,
             DEFAULT_URL_FOR_TEST,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             device="tpu",
@@ -613,13 +708,16 @@ class TestModelAccuracy(CustomTestCase):
                 threshold = task["threshold"]
 
                 dataset_args = {}
-                # if dataset_name == "mmlu" or dataset_name == "modelscope/mmlu":
-                #     dataset_args = {"mmlu": {"subset_list": ["global_facts"]}}
-                # if dataset_name == "mmlu":
-                #     dataset_args = {"mmlu": {"hub": "hf", "dataset_id": "cais/mmlu"}}
+                cached_dataset_path = os.path.join(MOUNT_ROOT, "dataset", dataset_name)
+                if os.path.exists(cached_dataset_path):
+                    print(f"[CI Info] Hit Dataset Cache: {cached_dataset_path}")
+
+                    dataset_args = {dataset_name: {"local_path": cached_dataset_path}}
+                else:
+                    print(f"[CI Info] Dataset Cache Miss: {dataset_name}")
 
                 config = TaskConfig(
-                    model=model,
+                    model=raw_model_id,
                     api_url=api_url_for_eval,
                     api_key="EMPTY",
                     eval_type="service",
@@ -628,7 +726,7 @@ class TestModelAccuracy(CustomTestCase):
                     eval_batch_size=64,
                 )
                 # Run the task and get results
-                print(f"{model} Running eval for {dataset_name}")
+                print(f"{raw_model_id} Running eval for {task['name']}")
                 results = run_task(config)
                 print(f"SDK Results: {results}")
                 if dataset_name in results:
@@ -650,14 +748,14 @@ class TestModelAccuracy(CustomTestCase):
 
                         model_found = False
                         for row in rows:
-                            if row.get("Model") == model:
+                            if row.get("Model") == raw_model_id:
                                 row[dataset_name] = score
                                 model_found = True
                                 break
 
                         if not model_found:
 
-                            new_row = {"Model": model, dataset_name: score}
+                            new_row = {"Model": raw_model_id, dataset_name: score}
                             rows.append(new_row)
 
                         with open(csv_file_path, "w", newline="", encoding="utf-8") as f:
@@ -665,7 +763,9 @@ class TestModelAccuracy(CustomTestCase):
                             writer.writeheader()
                             writer.writerows(rows)
 
-                        print(f"Updated CSV {csv_file_path}: {model} - {dataset_name} = {score}")
+                        print(
+                            f"Updated CSV {csv_file_path}: {raw_model_id} - {dataset_name} = {score}"
+                        )
 
                     except Exception as e:
                         print(f"Warning: Failed to update CSV file: {e}")
@@ -683,7 +783,18 @@ class TestModelAccuracy(CustomTestCase):
             kill_process_tree(process.pid)
 
     def test_GEMMA2_2B_IT_tp_4(self):
-        model = GEMMA2_2B_IT
+        # args setting
+        MOUNT_ROOT = os.getenv("CI_MOUNT_ROOT", "/models")
+        raw_model_id = GEMMA2_2B_IT
+        model_dir_name = "GEMMA2_2B_IT"
+        cached_model_path = os.path.join(MOUNT_ROOT, "model_scope", model_dir_name)
+        print(f"[CI Info] Checking Model Cache at: {cached_model_path}")
+        if os.path.exists(cached_model_path):
+            print(f"[CI Info] Hit Model Cache: {cached_model_path}")
+            model_path_for_server = cached_model_path
+        else:
+            print(f"[CI Info] Cache Miss, downloading: {raw_model_id}")
+            model_path_for_server = raw_model_id
         base_url = DEFAULT_URL_FOR_TEST
         api_url_for_eval = f"{base_url}/v1"
         output_dir = os.getenv("BENCH_OUTPUT_DIR", "./test/nightly_test_output/benchmark/local_run")
@@ -696,7 +807,7 @@ class TestModelAccuracy(CustomTestCase):
         ]
         # launch server
         process = popen_launch_server(
-            model,
+            model_path_for_server,
             DEFAULT_URL_FOR_TEST,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             device="tpu",
@@ -717,13 +828,16 @@ class TestModelAccuracy(CustomTestCase):
                 threshold = task["threshold"]
 
                 dataset_args = {}
-                # if dataset_name == "mmlu" or dataset_name == "modelscope/mmlu":
-                #     dataset_args = {"mmlu": {"subset_list": ["global_facts"]}}
-                # if dataset_name == "mmlu":
-                #     dataset_args = {"mmlu": {"hub": "hf", "dataset_id": "cais/mmlu"}}
+                cached_dataset_path = os.path.join(MOUNT_ROOT, "dataset", dataset_name)
+                if os.path.exists(cached_dataset_path):
+                    print(f"[CI Info] Hit Dataset Cache: {cached_dataset_path}")
+
+                    dataset_args = {dataset_name: {"local_path": cached_dataset_path}}
+                else:
+                    print(f"[CI Info] Dataset Cache Miss: {dataset_name}")
 
                 config = TaskConfig(
-                    model=model,
+                    model=raw_model_id,
                     api_url=api_url_for_eval,
                     api_key="EMPTY",
                     eval_type="service",
@@ -732,7 +846,7 @@ class TestModelAccuracy(CustomTestCase):
                     eval_batch_size=64,
                 )
                 # Run the task and get results
-                print(f"{model} Running eval for {dataset_name}")
+                print(f"{raw_model_id} Running eval for {task['name']}")
                 results = run_task(config)
                 print(f"SDK Results: {results}")
                 if dataset_name in results:
@@ -754,14 +868,14 @@ class TestModelAccuracy(CustomTestCase):
 
                         model_found = False
                         for row in rows:
-                            if row.get("Model") == model:
+                            if row.get("Model") == raw_model_id:
                                 row[dataset_name] = score
                                 model_found = True
                                 break
 
                         if not model_found:
 
-                            new_row = {"Model": model, dataset_name: score}
+                            new_row = {"Model": raw_model_id, dataset_name: score}
                             rows.append(new_row)
 
                         with open(csv_file_path, "w", newline="", encoding="utf-8") as f:
@@ -769,7 +883,9 @@ class TestModelAccuracy(CustomTestCase):
                             writer.writeheader()
                             writer.writerows(rows)
 
-                        print(f"Updated CSV {csv_file_path}: {model} - {dataset_name} = {score}")
+                        print(
+                            f"Updated CSV {csv_file_path}: {raw_model_id} - {dataset_name} = {score}"
+                        )
 
                     except Exception as e:
                         print(f"Warning: Failed to update CSV file: {e}")
@@ -787,7 +903,18 @@ class TestModelAccuracy(CustomTestCase):
             kill_process_tree(process.pid)
 
     def test_DEEPSEEK_R1_DISTILL_QWEN_1_5B_tp_4(self):
-        model = DEEPSEEK_R1_DISTILL_QWEN_1_5B
+        # args setting
+        MOUNT_ROOT = os.getenv("CI_MOUNT_ROOT", "/models")
+        raw_model_id = DEEPSEEK_R1_DISTILL_QWEN_1_5B
+        model_dir_name = "DEEPSEEK_R1_DISTILL_QWEN_1_5B"
+        cached_model_path = os.path.join(MOUNT_ROOT, "model_scope", model_dir_name)
+        print(f"[CI Info] Checking Model Cache at: {cached_model_path}")
+        if os.path.exists(cached_model_path):
+            print(f"[CI Info] Hit Model Cache: {cached_model_path}")
+            model_path_for_server = cached_model_path
+        else:
+            print(f"[CI Info] Cache Miss, downloading: {raw_model_id}")
+            model_path_for_server = raw_model_id
         base_url = DEFAULT_URL_FOR_TEST
         api_url_for_eval = f"{base_url}/v1"
         output_dir = os.getenv("BENCH_OUTPUT_DIR", "./test/nightly_test_output/benchmark/local_run")
@@ -800,7 +927,7 @@ class TestModelAccuracy(CustomTestCase):
             "4",
         ]
         process = popen_launch_server(
-            model,
+            model_path_for_server,
             DEFAULT_URL_FOR_TEST,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             device="tpu",
@@ -824,10 +951,18 @@ class TestModelAccuracy(CustomTestCase):
 
                 dataset_args = {}
                 generation_config = {}
-                # if dataset_name == "mmlu" or dataset_name == "modelscope/mmlu":
-                #     dataset_args = {"mmlu": {"subset_list": ["global_facts"]}}
+
+                cached_dataset_path = os.path.join(MOUNT_ROOT, "dataset", dataset_name)
+                if os.path.exists(cached_dataset_path):
+                    print(f"[CI Info] Hit Dataset Cache: {cached_dataset_path}")
+                    dataset_args = {dataset_name: {"local_path": cached_dataset_path}}
+                else:
+                    print(f"[CI Info] Dataset Cache Miss: {dataset_name}")
+                    pass
                 if dataset_name != "gsm8k":
-                    dataset_args = {dataset_name: {"metric_list": ["Pass@1"]}}
+                    if dataset_name not in dataset_args:
+                        dataset_args[dataset_name] = {}
+                    dataset_args[dataset_name]["metric_list"] = ["Pass@1"]
                     generation_config = {
                         "max_tokens": 32768,
                         "temperature": 0.6,
@@ -835,7 +970,7 @@ class TestModelAccuracy(CustomTestCase):
                     }
 
                 config = TaskConfig(
-                    model=model,
+                    model=raw_model_id,
                     api_url=api_url_for_eval,
                     api_key="EMPTY",
                     eval_type="service",
@@ -845,7 +980,7 @@ class TestModelAccuracy(CustomTestCase):
                     eval_batch_size=64,
                 )
                 # Run the task and get results
-                print(f"{model} Running eval for {dataset_name}")
+                print(f"{raw_model_id} Running eval for {task['name']}")
                 results = run_task(config)
                 print(f"SDK Results: {results}")
                 if dataset_name in results:
@@ -854,27 +989,23 @@ class TestModelAccuracy(CustomTestCase):
                     try:
                         rows = []
                         fieldnames = ["Model"]
-
                         if os.path.exists(csv_file_path):
                             with open(csv_file_path, "r", newline="", encoding="utf-8") as f:
                                 reader = csv.DictReader(f)
                                 if reader.fieldnames:
                                     fieldnames = reader.fieldnames
                                 rows = list(reader)
-
                         if dataset_name not in fieldnames:
                             fieldnames.append(dataset_name)
-
                         model_found = False
                         for row in rows:
-                            if row.get("Model") == model:
+                            if row.get("Model") == raw_model_id:
                                 row[dataset_name] = score
                                 model_found = True
                                 break
 
                         if not model_found:
-
-                            new_row = {"Model": model, dataset_name: score}
+                            new_row = {"Model": raw_model_id, dataset_name: score}
                             rows.append(new_row)
 
                         with open(csv_file_path, "w", newline="", encoding="utf-8") as f:
@@ -882,7 +1013,9 @@ class TestModelAccuracy(CustomTestCase):
                             writer.writeheader()
                             writer.writerows(rows)
 
-                        print(f"Updated CSV {csv_file_path}: {model} - {dataset_name} = {score}")
+                        print(
+                            f"Updated CSV {csv_file_path}: {raw_model_id} - {dataset_name} = {score}"
+                        )
 
                     except Exception as e:
                         print(f"Warning: Failed to update CSV file: {e}")
@@ -900,7 +1033,17 @@ class TestModelAccuracy(CustomTestCase):
             kill_process_tree(process.pid)
 
     def test_bailing_moe_tp_2_ep2(self):
-        model = BAILING_MOE
+        MOUNT_ROOT = os.getenv("CI_MOUNT_ROOT", "/models")
+        raw_model_id = BAILING_MOE
+        model_dir_name = "BAILING_MOE"
+        cached_model_path = os.path.join(MOUNT_ROOT, "model_scope", model_dir_name)
+        print(f"[CI Info] Checking Model Cache at: {cached_model_path}")
+        if os.path.exists(cached_model_path):
+            print(f"[CI Info] Hit Model Cache: {cached_model_path}")
+            model_path_for_server = cached_model_path
+        else:
+            print(f"[CI Info] Cache Miss, downloading: {raw_model_id}")
+            model_path_for_server = raw_model_id
         base_url = DEFAULT_URL_FOR_TEST
         api_url_for_eval = f"{base_url}/v1"
         output_dir = os.getenv("BENCH_OUTPUT_DIR", "./test/nightly_test_output/benchmark/local_run")
@@ -913,7 +1056,7 @@ class TestModelAccuracy(CustomTestCase):
             "2",
         ]
         process = popen_launch_server(
-            model,
+            model_path_for_server,
             DEFAULT_URL_FOR_TEST,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             device="tpu",
@@ -936,10 +1079,18 @@ class TestModelAccuracy(CustomTestCase):
 
                 dataset_args = {}
                 generation_config = {}
-                # if dataset_name == "mmlu" or dataset_name == "modelscope/mmlu":
-                #     dataset_args = {"mmlu": {"subset_list": ["global_facts"]}}
-                if dataset_name == "aime25":
-                    dataset_args = {"aime25": {"metric_list": ["Pass@1"]}}
+
+                cached_dataset_path = os.path.join(MOUNT_ROOT, "dataset", dataset_name)
+                if os.path.exists(cached_dataset_path):
+                    print(f"[CI Info] Hit Dataset Cache: {cached_dataset_path}")
+                    dataset_args = {dataset_name: {"local_path": cached_dataset_path}}
+                else:
+                    print(f"[CI Info] Dataset Cache Miss: {dataset_name}")
+                    pass
+                if dataset_name != "mmlu_pro":
+                    if dataset_name not in dataset_args:
+                        dataset_args[dataset_name] = {}
+                    dataset_args[dataset_name]["metric_list"] = ["Pass@1"]
                     generation_config = {
                         "max_tokens": 16384,
                         "temperature": 0.6,
@@ -947,7 +1098,7 @@ class TestModelAccuracy(CustomTestCase):
                     }
 
                 config = TaskConfig(
-                    model=model,
+                    model=raw_model_id,
                     api_url=api_url_for_eval,
                     api_key="EMPTY",
                     eval_type="service",
@@ -956,8 +1107,9 @@ class TestModelAccuracy(CustomTestCase):
                     generation_config=generation_config,
                     eval_batch_size=64,
                 )
+
                 # Run the task and get results
-                print(f"{model} Running eval for {dataset_name}")
+                print(f"{raw_model_id} Running eval for {task['name']}")
                 results = run_task(config)
                 print(f"SDK Results: {results}")
                 if dataset_name in results:
@@ -966,27 +1118,23 @@ class TestModelAccuracy(CustomTestCase):
                     try:
                         rows = []
                         fieldnames = ["Model"]
-
                         if os.path.exists(csv_file_path):
                             with open(csv_file_path, "r", newline="", encoding="utf-8") as f:
                                 reader = csv.DictReader(f)
                                 if reader.fieldnames:
                                     fieldnames = reader.fieldnames
                                 rows = list(reader)
-
                         if dataset_name not in fieldnames:
                             fieldnames.append(dataset_name)
-
                         model_found = False
                         for row in rows:
-                            if row.get("Model") == model:
+                            if row.get("Model") == raw_model_id:
                                 row[dataset_name] = score
                                 model_found = True
                                 break
 
                         if not model_found:
-
-                            new_row = {"Model": model, dataset_name: score}
+                            new_row = {"Model": raw_model_id, dataset_name: score}
                             rows.append(new_row)
 
                         with open(csv_file_path, "w", newline="", encoding="utf-8") as f:
@@ -994,7 +1142,9 @@ class TestModelAccuracy(CustomTestCase):
                             writer.writeheader()
                             writer.writerows(rows)
 
-                        print(f"Updated CSV {csv_file_path}: {model} - {dataset_name} = {score}")
+                        print(
+                            f"Updated CSV {csv_file_path}: {raw_model_id} - {dataset_name} = {score}"
+                        )
 
                     except Exception as e:
                         print(f"Warning: Failed to update CSV file: {e}")
@@ -1012,7 +1162,18 @@ class TestModelAccuracy(CustomTestCase):
             kill_process_tree(process.pid)
 
     def test_QWEN3_30B_A3B_tp_2_ep_2(self):
-        model = QWEN3_MOE_30B
+        # args setting
+        MOUNT_ROOT = os.getenv("CI_MOUNT_ROOT", "/models")
+        raw_model_id = QWEN3_MOE_30B
+        model_dir_name = "QWEN3_MOE_30B"
+        cached_model_path = os.path.join(MOUNT_ROOT, "model_scope", model_dir_name)
+        print(f"[CI Info] Checking Model Cache at: {cached_model_path}")
+        if os.path.exists(cached_model_path):
+            print(f"[CI Info] Hit Model Cache: {cached_model_path}")
+            model_path_for_server = cached_model_path
+        else:
+            print(f"[CI Info] Cache Miss, downloading: {raw_model_id}")
+            model_path_for_server = raw_model_id
         base_url = DEFAULT_URL_FOR_TEST
         api_url_for_eval = f"{base_url}/v1"
         output_dir = os.getenv("BENCH_OUTPUT_DIR", "./test/nightly_test_output/benchmark/local_run")
@@ -1025,7 +1186,7 @@ class TestModelAccuracy(CustomTestCase):
             "2",
         ]
         process = popen_launch_server(
-            model,
+            model_path_for_server,
             DEFAULT_URL_FOR_TEST,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             device="tpu",
@@ -1048,13 +1209,16 @@ class TestModelAccuracy(CustomTestCase):
                 threshold = task["threshold"]
 
                 dataset_args = {}
-                # if dataset_name == "mmlu" or dataset_name == "modelscope/mmlu":
-                #     dataset_args = {"mmlu": {"subset_list": ["global_facts"]}}
-                # if dataset_name == "mmlu":
-                #     dataset_args = {"mmlu": {"hub": "hf", "dataset_id": "cais/mmlu"}}
+                cached_dataset_path = os.path.join(MOUNT_ROOT, "dataset", dataset_name)
+                if os.path.exists(cached_dataset_path):
+                    print(f"[CI Info] Hit Dataset Cache: {cached_dataset_path}")
+
+                    dataset_args = {dataset_name: {"local_path": cached_dataset_path}}
+                else:
+                    print(f"[CI Info] Dataset Cache Miss: {dataset_name}")
 
                 config = TaskConfig(
-                    model=model,
+                    model=raw_model_id,
                     api_url=api_url_for_eval,
                     api_key="EMPTY",
                     eval_type="service",
@@ -1063,7 +1227,7 @@ class TestModelAccuracy(CustomTestCase):
                     eval_batch_size=64,
                 )
                 # Run the task and get results
-                print(f"{model} Running eval for {dataset_name}")
+                print(f"{raw_model_id} Running eval for {task['name']}")
                 results = run_task(config)
                 print(f"SDK Results: {results}")
                 if dataset_name in results:
@@ -1085,14 +1249,14 @@ class TestModelAccuracy(CustomTestCase):
 
                         model_found = False
                         for row in rows:
-                            if row.get("Model") == model:
+                            if row.get("Model") == raw_model_id:
                                 row[dataset_name] = score
                                 model_found = True
                                 break
 
                         if not model_found:
 
-                            new_row = {"Model": model, dataset_name: score}
+                            new_row = {"Model": raw_model_id, dataset_name: score}
                             rows.append(new_row)
 
                         with open(csv_file_path, "w", newline="", encoding="utf-8") as f:
@@ -1100,7 +1264,9 @@ class TestModelAccuracy(CustomTestCase):
                             writer.writeheader()
                             writer.writerows(rows)
 
-                        print(f"Updated CSV {csv_file_path}: {model} - {dataset_name} = {score}")
+                        print(
+                            f"Updated CSV {csv_file_path}: {raw_model_id} - {dataset_name} = {score}"
+                        )
 
                     except Exception as e:
                         print(f"Warning: Failed to update CSV file: {e}")
