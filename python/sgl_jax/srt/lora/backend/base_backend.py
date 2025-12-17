@@ -28,7 +28,7 @@ class BaseLoRABackend(nnx.Module):
         Returns:
              result with shape (s, r)
         """
-        pass
+        raise NotImplementedError
 
     def run_lora_b_gemm(self, x: jax.Array, weights: jax.Array, *args, **kwargs) -> jax.Array:
         """Run gemm of lora b modules with current backend.
@@ -40,7 +40,7 @@ class BaseLoRABackend(nnx.Module):
         Returns:
              result with shape (s, output_dim)
         """
-        pass
+        raise NotImplementedError
 
     def run_qkv_lora(
         self,
@@ -65,7 +65,7 @@ class BaseLoRABackend(nnx.Module):
         Returns:
             result with shape (s, output_dim_q + 2 * output_dim_kv)
         """
-        pass
+        raise NotImplementedError
 
     def run_gate_up_lora(
         self,
@@ -109,4 +109,4 @@ class BaseLoRABackend(nnx.Module):
             batch_info: optional LoRABatchInfo object, if not provided, the backend should use its own
                         internal batch info
         """
-        pass
+        raise NotImplementedError

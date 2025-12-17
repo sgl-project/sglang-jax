@@ -26,21 +26,11 @@ from flax import nnx
 
 from sgl_jax.srt.configs.load_config import LoadConfig
 from sgl_jax.srt.hf_transformers_utils import AutoConfig
+from sgl_jax.srt.lora.backend.base_backend import BaseLoRABackend
 from sgl_jax.srt.lora.lora_config import LoRAConfig
 from sgl_jax.srt.model_loader.loader import DefaultModelLoader
 
 logger = logging.getLogger(__name__)
-
-
-class BaseLoRABackend:
-    pass
-
-
-class ChunkedSgmvLoRABackend(BaseLoRABackend):
-    pass
-
-
-SUPPORTED_BACKENDS = ChunkedSgmvLoRABackend
 
 
 class LoRALayer(nnx.Module):
@@ -61,7 +51,7 @@ class LoRAAdapter(nnx.Module):
         config: LoRAConfig,
         base_hf_config: AutoConfig,
         load_config: LoadConfig,
-        lora_backend: BaseLoRABackend,
+        lora_backend: BaseLoRABackend,  # note: Currently, only BgmvLoRABackend is supported.
     ):
         super().__init__()
         self.uid: str = uid
