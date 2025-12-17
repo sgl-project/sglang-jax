@@ -17,6 +17,7 @@ import unittest
 from typing import List
 
 import jax.numpy as jnp
+import requests
 from flax import nnx
 
 from sgl_jax.srt.entrypoints.engine import Engine
