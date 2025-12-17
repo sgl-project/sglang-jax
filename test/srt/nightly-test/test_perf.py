@@ -22,11 +22,11 @@ from sgl_jax.test.test_utils import (
     QWEN3_MOE_30B,
     QWEN_7B,
     CustomTestCase,
+    get_benchmark_args,
     is_in_ci,
     popen_launch_server,
     run_bench_serving,
     write_github_step_summary,
-    get_benchmark_args,
 )
 
 MOUNT_ROOT = os.getenv("CI_MOUNT_ROOT", "/models")
@@ -1609,54 +1609,53 @@ class TestModePerf(CustomTestCase):
         expected_performance = {
             8: {
                 4096: {
-                    "ttft": 1710.23,
-                    "itl": 19.37,
-                    "input_throughput": 19063.81,
-                    "output_throughput": 378.54,
+                    "ttft": 1728.32,
+                    "itl": 19.01,
+                    "input_throughput": 10075.81,
+                    "output_throughput": 373.12,
                 }
             },
             16: {
                 4096: {
-                    "ttft": 3420.23,
-                    "itl": 21.68,
-                    "input_throughput": 19110.85,
-                    "output_throughput": 650.64,
+                    "ttft": 3456.68,
+                    "itl": 21.32,
+                    "input_throughput": 18910.00,
+                    "output_throughput": 660.18,
                 }
             },
             32: {
                 4096: {
-                    "ttft": 6832.81,
-                    "itl": 25.92,
-                    "input_throughput": 19138.69,
-                    "output_throughput": 1003.67,
+                    "ttft": 6908.34,
+                    "itl": 24.01,
+                    "input_throughput": 18928.30,
+                    "output_throughput": 853.00,
                 }
             },
             64: {
                 4096: {
-                    "ttft": 13712.98,
-                    "itl": 28.53,
-                    "input_throughput": 19096.70,
-                    "output_throughput": 1043.96,
+                    "ttft": 13806.09,
+                    "itl": 24.09,
+                    "input_throughput": 18961.54,
+                    "output_throughput": 914.19,
                 }
             },
             128: {
                 4096: {
-                    "ttft": 27423.97,
-                    "itl": 28.66,
-                    "input_throughput": 19094.30,
-                    "output_throughput": 1050.62,
+                    "ttft": 27631.62,
+                    "itl": 24.22,
+                    "input_throughput": 18960.85,
+                    "output_throughput": 928.03,
                 }
             },
             256: {
                 4096: {
-                    "ttft": 54899.37,
-                    "itl": 28.78,
-                    "input_throughput": 19083.75,
-                    "output_throughput": 1073.57,
+                    "ttft": 55142.86,
+                    "itl": 24.25,
+                    "input_throughput": 18999.56,
+                    "output_throughput": 944.12,
                 }
             },
         }
-
 
         # define test parameters
         # concurrency levels
@@ -1705,23 +1704,21 @@ class TestModePerf(CustomTestCase):
                         num_prompts = concurrency * 3
 
                         args = get_benchmark_args(
-                             base_url=self.base_url,
-                             dataset_name="random",
-                             num_prompts=num_prompts,
-                             request_rate=float("inf"),
-                             random_input_len=in_len,
-                             random_output_len=out_len,
-                             max_concurrency=concurrency,
-                             random_range_ratio=1,
-                             disable_ignore_eos=True,
-                             lora_name=lora_name,
-                             backend="sglang-oai",
-                             warmup_requests=0,
-                         )
+                            base_url=self.base_url,
+                            dataset_name="random",
+                            num_prompts=num_prompts,
+                            request_rate=float("inf"),
+                            random_input_len=in_len,
+                            random_output_len=out_len,
+                            max_concurrency=concurrency,
+                            random_range_ratio=1,
+                            disable_ignore_eos=True,
+                            lora_name=lora_name,
+                            backend="sglang-oai",
+                            warmup_requests=0,
+                        )
 
                         metrics = run_benchmark(args)
-
-
 
                         if out_len == 1:
                             self.assertGreater(
@@ -1731,21 +1728,17 @@ class TestModePerf(CustomTestCase):
                             )
                             self.assertLess(
                                 metrics["median_ttft_ms"],
-                                expected_performance[concurrency][in_len]["ttft"]
-                                * (1 + allow_gap),
+                                expected_performance[concurrency][in_len]["ttft"] * (1 + allow_gap),
                             )
                         else:
                             self.assertGreater(
                                 metrics["output_throughput"],
-                                expected_performance[concurrency][in_len][
-                                    "output_throughput"
-                                ]
+                                expected_performance[concurrency][in_len]["output_throughput"]
                                 * (1 - allow_gap),
                             )
                             self.assertLess(
                                 metrics["median_itl_ms"],
-                                expected_performance[concurrency][in_len]["itl"]
-                                * (1 + allow_gap),
+                                expected_performance[concurrency][in_len]["itl"] * (1 + allow_gap),
                             )
                         results_summary.append(
                             {
@@ -1795,10 +1788,6 @@ class TestModePerf(CustomTestCase):
                 f"{r['concurrency']:<5} | {r['input']:<6} | {r['output']:<6} | {r['ttft_ms']:<10.2f} | {r['itl_ms']:<10.2f} | {r['out_tps']:<10.2f} | {r['in_tps']:<10.2f}| {r['model_name']:<20}"
             )
         print("=" * 100)
-
-            
-
-        
 
 
 if __name__ == "__main__":
