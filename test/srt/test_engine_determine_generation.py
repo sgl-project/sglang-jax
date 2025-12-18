@@ -287,16 +287,6 @@ class TestEngineDeterministicGeneration(CustomTestCase):
             "Re-generated result should match baseline (deterministic with temperature=0)",
         )
 
-        # Print summary
-        print(f"\n{Colors.BOLD}{Colors.BLUE}=== Abort Mode Summary ==={Colors.RESET}")
-        print(f"{Colors.YELLOW}Key Points:{Colors.RESET}")
-        print(
-            f"  1. Abort terminates request: {Colors.GREEN}✓{Colors.RESET} (partial result shorter)"
-        )
-        print(f"  2. Partial is prefix of baseline: {Colors.GREEN}✓{Colors.RESET} (deterministic)")
-        print(f"  3. Must RE-GENERATE after abort: {Colors.GREEN}✓{Colors.RESET} (cannot continue)")
-        print(f"  4. Re-generated matches baseline: {Colors.GREEN}✓{Colors.RESET} (deterministic)")
-        print(f"{Colors.BOLD}{Colors.BLUE}=========================={Colors.RESET}\n")
 
     # ============ Multiple Requests Tests ============
 
@@ -332,7 +322,7 @@ class TestEngineDeterministicGeneration(CustomTestCase):
         retract_texts = [r.get("text", "") if isinstance(r, dict) else "" for r in results]
 
         # Summary comparison
-        print(f"\n{Colors.BOLD}{Colors.BLUE}=== Multiple Requests Summary ==={Colors.RESET}")
+        print(f"\n{Colors.BOLD}{Colors.BLUE}=== Multiple Requests: Retract vs No Pause ==={Colors.RESET}")
         for i in range(num_requests):
             match = baseline_texts[i] == retract_texts[i]
             len_diff = len(retract_texts[i]) - len(baseline_texts[i])
@@ -409,7 +399,7 @@ class TestEngineDeterministicGeneration(CustomTestCase):
             regenerated_texts.append(text)
 
         # Summary comparison
-        print(f"\n{Colors.BOLD}{Colors.BLUE}=== Multiple Requests Abort Summary ==={Colors.RESET}")
+        print(f"\n{Colors.BOLD}{Colors.BLUE}=== Multiple Requests: Re-generated vs Baseline ==={Colors.RESET}")
         print(f"{Colors.YELLOW}Note: After abort, must RE-GENERATE (cannot continue){Colors.RESET}")
         print(f"\n{Colors.CYAN}Partial Results (Aborted):{Colors.RESET}")
         for i in range(num_requests):
