@@ -22,8 +22,9 @@ import jax.numpy as jnp
 from jax.sharding import Mesh
 
 from sgl_jax.srt.layers.linear import LinearBase
+from sgl_jax.srt.lora.backend.bgmv_backend import BgmvLoRABackend
 from sgl_jax.srt.lora.layers import BaseLayerWithLoRA
-from sgl_jax.srt.lora.lora import ChunkedSgmvLoRABackend, LoRAAdapter
+from sgl_jax.srt.lora.lora import LoRAAdapter
 from sgl_jax.srt.lora.lora_config import LoRAConfig
 from sgl_jax.srt.lora.lora_memory_pool import LoRAMemoryPool
 from sgl_jax.srt.lora.lora_registry import LoRARef
@@ -145,14 +146,19 @@ class LoRAManager:
                 "When no lora_paths provided, must specify both max_lora_rank and target_modules"
             )
 
-        # Initialize adapter storage
+        # Initialize adapter storage and load configs (but not weights yet)
         self.init_lora_adapters(lora_paths)
 
-        # Infer or validate shapes
+        # Infer or validate shapes (this sets self.max_lora_rank)
         self.init_lora_shapes(
             max_lora_rank=max_lora_rank,
             target_modules=target_modules,
         )
+
+        # Now load the weights (requires self.max_lora_rank to be set)
+        if lora_paths:
+            for lora_ref in lora_paths:
+                self.load_lora_weights(lora_ref)
 
         # Apply Model Surgery to add LoRA layers (if base_model provided)
         if self.base_model is not None:
@@ -170,12 +176,16 @@ class LoRAManager:
             self.max_loras_per_batch,
         )
 
-    def init_lora_adapters(self, lora_paths: list[LoRARef] | None = None):
+    def init_lora_adapters(
+        self,
+        lora_paths: list[LoRARef] | None = None,
+    ):
         """
         Initialize adapter storage and optionally load adapters.
 
         Args:
             lora_paths: Optional list of LoRARef to preload
+            load_weights: If True, load adapter weights; if False, only load configs
         """
         # Configs of all active LoRA adapters, indexed by LoRA ID
         self.configs: dict[str, LoRAConfig] = {}
@@ -191,7 +201,8 @@ class LoRAManager:
 
         if lora_paths:
             for lora_ref in lora_paths:
-                self.load_lora_adapter(lora_ref)
+                # Only load config, not weights
+                self.load_lora_config(lora_ref)
 
     def init_lora_shapes(
         self,
@@ -302,21 +313,18 @@ class LoRAManager:
                     self.mesh,
                 )
 
-    def load_lora_adapter(self, lora_ref: LoRARef):
+    def load_lora_config(self, lora_ref: LoRARef):
         """
-        Load a single LoRA adapter.
-
-        V1 implementation: Loads config and weights from disk to CPU memory once.
-        No dynamic loading/unloading.
+        Load only the config of a LoRA adapter (not the weights).
 
         Args:
             lora_ref: LoRARef object with lora_id, lora_name, lora_path
 
         Raises:
-            ValueError: If adapter already loaded or incompatible
+            ValueError: If config already loaded or incompatible
         """
-        if lora_ref.lora_id in self.loras:
-            raise ValueError(f"LoRA adapter {lora_ref.lora_id} already loaded")
+        if lora_ref.lora_id in self.configs:
+            raise ValueError(f"LoRA config {lora_ref.lora_id} already loaded")
 
         if lora_ref.pinned and self.num_pinned_loras >= self.max_loras_per_batch - 1:
             raise ValueError(
@@ -328,22 +336,18 @@ class LoRAManager:
         config = LoRAConfig(lora_ref.lora_path)
         self.configs[lora_ref.lora_id] = config
 
-        # Load adapter weights to CPU
-        self.load_lora_weights(lora_ref)
-
         # Store metadata
         self.lora_refs[lora_ref.lora_id] = lora_ref
         if lora_ref.pinned:
             self.num_pinned_loras += 1
 
         logger.info(
-            "Loaded LoRA adapter: %s (id=%s, rank=%d, alpha=%d, target_modules=%s, pinned=%s)",
+            "Loaded LoRA config: %s (id=%s, rank=%d, alpha=%d, target_modules=%s)",
             lora_ref.lora_name,
             lora_ref.lora_id,
             config.r,
             config.lora_alpha,
-            sorted(config.target_modules) if config.target_modules else "None",
-            lora_ref.pinned,
+            config.target_modules,
         )
 
     def load_lora_weights(self, lora_ref: LoRARef):
@@ -361,8 +365,11 @@ class LoRAManager:
         # Get load config (TODO: get from server_args if available)
         load_config = LoadConfig()
 
-        # Create LoRA backend (placeholder for v1)
-        lora_backend = ChunkedSgmvLoRABackend()
+        # Create LoRA backend
+        lora_backend = BgmvLoRABackend(
+            max_loras_per_batch=self.max_loras_per_batch,
+            max_lora_rank=self.max_lora_rank,
+        )
 
         # Create adapter
         adapter = LoRAAdapter(
