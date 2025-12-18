@@ -13,6 +13,7 @@ import jax
 import jax.numpy as jnp
 from flax import nnx
 from flax.nnx.statelib import State
+from huggingface_hub.errors import HFValidationError
 from jax.sharding import Mesh
 
 from sgl_jax.srt.configs.load_config import LoadConfig, LoadFormat
@@ -771,7 +772,7 @@ class TestModelLoaderEdgeCases(unittest.TestCase):
         """Test handling of nonexistent model path."""
         LoadConfig(load_format=LoadFormat.JAX)
 
-        with self.assertRaises((OSError, FileNotFoundError)):
+        with self.assertRaises((OSError, FileNotFoundError, HFValidationError)):
             ModelConfig(model_path="/nonexistent/path", trust_remote_code=True)
 
     def test_empty_directory(self):

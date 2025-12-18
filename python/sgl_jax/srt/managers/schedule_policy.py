@@ -146,7 +146,6 @@ class SchedulePolicy:
         for r in waiting_queue:
             prefix_ids = r.adjust_max_prefix_ids()
             extra_key = r.extra_key
-
             # NOTE: the prefix_indices must always be aligned with last_node
             r.prefix_indices, r.last_node, r.last_host_node, r.host_hit_length = (
                 self.tree_cache.match_prefix(

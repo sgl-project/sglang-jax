@@ -4,7 +4,7 @@ import time
 from dataclasses import dataclass
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, root_validator, validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 class ModelCard(BaseModel):
@@ -178,7 +178,7 @@ class CompletionRequest(BaseModel):
 
     return_routed_experts: list[bool] | bool | None = None
 
-    @validator("max_tokens")
+    @field_validator("max_tokens")
     @classmethod
     def validate_max_tokens_positive(cls, v):
         if v is not None and v <= 0:
@@ -303,7 +303,7 @@ class ChatCompletionMessageGenericParam(BaseModel):
     reasoning_content: str | None = None
     tool_calls: list[ToolCall] | None = Field(default=None, examples=[None])
 
-    @validator("role", pre=True)
+    @field_validator("role", mode="before")
     @classmethod
     def _normalize_role(cls, v):
         if isinstance(v, str):
@@ -405,7 +405,7 @@ class ChatCompletionRequest(BaseModel):
     )  # noqa
     return_hidden_states: bool = False
 
-    @root_validator(pre=True)
+    @model_validator(mode="before")
     @classmethod
     def set_tool_choice_default(cls, values):
         if values.get("tool_choice") is None:

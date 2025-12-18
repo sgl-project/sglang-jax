@@ -7,6 +7,7 @@ import jax.numpy as jnp
 from transformers import PretrainedConfig
 
 from sgl_jax.srt.hf_transformers_utils import (
+    download_from_hf,
     get_config,
     get_context_length,
     get_generation_config,
@@ -45,6 +46,7 @@ class ModelConfig:
         quantization: str | None = None,
         quantization_config_path: str | None = None,
         model_layer_nums: int | None = None,
+        multimodal: bool = False,
     ) -> None:
 
         self.model_path = model_path
@@ -61,9 +63,11 @@ class ModelConfig:
         kwargs = {}
         if override_config_file and override_config_file.strip():
             kwargs["_configuration_file"] = override_config_file.strip()
-
+        if multimodal:
+            self.model_path = download_from_hf(self.model_path, allow_patterns=None)
+        config_path = self.model_path + "/text_encoder" if multimodal else self.model_path
         self.hf_config = get_config(
-            self.model_path,
+            config_path,
             trust_remote_code=trust_remote_code,
             revision=revision,
             model_override_args=self.model_override_args,
@@ -71,7 +75,7 @@ class ModelConfig:
         )
 
         self.hf_generation_config = get_generation_config(
-            self.model_path,
+            config_path,
             trust_remote_code=trust_remote_code,
             revision=revision,
             **kwargs,
@@ -179,6 +183,7 @@ class ModelConfig:
             quantization_config_path=server_args.quantization_config_path,
             model_impl=server_args.model_impl,
             model_layer_nums=server_args.model_layer_nums,
+            multimodal=server_args.multimodal,
             **kwargs,
         )
 
@@ -526,6 +531,50 @@ multimodal_model_archs = [
     "Phi4MMForCausalLM",
     "VILAForConditionalGeneration",
 ]
+
+
+# Models that require attention_mask for padding token handling
+# These are typically Encoder-only or Embedding models
+ENCODER_ONLY_MODELS = [
+    # UMT5 Encoder variants
+    "UMT5EncoderModel",
+    "T5EncoderModel",
+    # BERT family
+    "BertModel",
+    "BertForSequenceClassification",
+    "XLMRobertaModel",
+    "XLMRobertaForSequenceClassification",
+    # CLIP components
+    "CLIPTextModel",
+    "CLIPVisionModel",
+    # Other Encoders
+    "Contriever",
+    # Embedding models
+    "LlamaEmbeddingModel",
+    "MistralModel",
+    "LlamaForSequenceClassification",
+    "LlamaForSequenceClassificationWithNormal_Weights",
+    "InternLM2ForRewardModel",
+    "Qwen2ForRewardModel",
+    "Qwen2ForSequenceClassification",
+]
+
+
+def need_attention_mask(model_architectures: list[str], is_embedding: bool = False) -> bool:
+    """
+    Determine if a model needs attention_mask for handling padding tokens.
+
+    Args:
+        model_architectures: List of model architecture names from HF config
+        is_embedding: Whether --is-embedding flag is set
+
+    Returns:
+        True if the model needs attention_mask (Encoder-only or Embedding models)
+    """
+    if is_embedding:
+        return True
+
+    return any(arch in ENCODER_ONLY_MODELS for arch in model_architectures)
 
 
 class MockModelConfig(ModelConfig):
