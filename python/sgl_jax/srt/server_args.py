@@ -1072,7 +1072,9 @@ class ServerArgs:
                         # Dict format: {"name": "path", ...}
                         for name, path in self.lora_paths.items():
                             if name == "0":
-                                raise ValueError(f"0 exists in {self.lora_paths} as key, it is not allowed")
+                                raise ValueError(
+                                    f"0 exists in {self.lora_paths} as key, it is not allowed"
+                                )
                             normalized_lora_refs.append(
                                 LoRARef(lora_name=name, lora_path=path, pinned=True)
                             )
