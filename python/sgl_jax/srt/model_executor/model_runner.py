@@ -419,13 +419,6 @@ class ModelRunner:
                 mesh=self.mesh,
             )
         else:
-            print("MHAtokentokvpool")
-            print("size: ", self.max_total_num_tokens)
-            print("page_size: ", self.page_size)
-            print("head_num: ", self.model_config.get_total_num_kv_heads_with_replication(self.tp_size))
-            print("head_dim: ", (self.model_config.head_dim + 127) // 128 * 128)
-            print("layer_num: ", self.model_config.num_hidden_layers)
-            print("mesh: ", self.mesh)
             self.token_to_kv_pool = MHATokenToKVPool(
                 size=self.max_total_num_tokens,
                 page_size=self.page_size,
