@@ -1071,6 +1071,10 @@ class ServerArgs:
                     if isinstance(self.lora_paths, dict):
                         # Dict format: {"name": "path", ...}
                         for name, path in self.lora_paths.items():
+                            if name == "0":
+                                raise ValueError(
+                                    "This key(0) is a server-reserved symbol, used for requests that do not go through LoRA."
+                                )
                             normalized_lora_refs.append(
                                 LoRARef(lora_name=name, lora_path=path, pinned=True)
                             )

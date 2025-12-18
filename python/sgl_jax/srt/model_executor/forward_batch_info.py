@@ -161,6 +161,9 @@ class ForwardBatch:
 
     # For LoRA
     lora_ids: list[str] | None = None
+    lora_scalings: jax.Array = None
+    lora_token_indices: jax.Array = None
+    lora_ranks: jax.Array = None
 
     trace_request_ids: list[str] | None = None
     trace_request_objects: list | None = None
@@ -181,6 +184,9 @@ class ForwardBatch:
             self.cache_loc,
             self.extend_prefix_lens,
             self.extend_seq_lens,
+            self.lora_scalings,
+            self.lora_token_indices,
+            self.lora_ranks,
             self.spec_info,
         )
 
@@ -213,7 +219,10 @@ class ForwardBatch:
         obj.cache_loc = children[7]
         obj.extend_prefix_lens = children[8]
         obj.extend_seq_lens = children[9]
-        obj.spec_info = children[10]
+        obj.lora_scalings = children[10]
+        obj.lora_token_indices = children[11]
+        obj.lora_ranks = children[12]
+        obj.spec_info = children[13]
         return obj
 
     def __repr__(self) -> str:
@@ -229,6 +238,9 @@ class ForwardBatch:
             "cache_loc",
             "extend_prefix_lens",
             "extend_seq_lens",
+            "lora_scalings",
+            "lora_token_indices",
+            "lora_ranks",
         ]:
             value = getattr(self, field_name, None)
             if value is not None and isinstance(value, jax.Array):
@@ -272,6 +284,30 @@ class ForwardBatch:
             ),
         )
 
+        if batch.lora_scalings is not None:
+            (
+                lora_scalings,
+                lora_token_indices,
+                lora_ranks,
+            ) = device_array(
+                (
+                    batch.lora_scalings,
+                    batch.lora_token_indices,
+                    batch.lora_ranks,
+                ),
+                sharding=(
+                    NamedSharding(model_runner.mesh, PartitionSpec())
+                    if jax.process_count() == 1
+                    else None
+                ),
+            )
+        else:
+            (lora_scalings, lora_token_indices, lora_ranks) = (
+                batch.lora_scalings,
+                batch.lora_token_indices,
+                batch.lora_ranks,
+            )
+
         obj = cls(
             bid=batch.bid,
             forward_mode=batch.forward_mode,
@@ -286,6 +322,9 @@ class ForwardBatch:
             extend_prefix_lens=extend_prefix_lens,
             extend_seq_lens=extend_seq_lens,
             lora_ids=batch.lora_ids,
+            lora_scalings=lora_scalings,
+            lora_token_indices=lora_token_indices,
+            lora_ranks=lora_ranks,
             attn_backend=model_runner.attn_backend,
             spec_info=batch.spec_info,
             spec_algorithm=batch.spec_algorithm,

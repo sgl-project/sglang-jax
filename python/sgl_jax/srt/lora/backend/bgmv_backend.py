@@ -4,13 +4,10 @@ import numpy as np
 from jax.sharding import NamedSharding
 
 from sgl_jax.srt.lora.backend.base_backend import BaseLoRABackend
-from sgl_jax.srt.lora.utils import LoRABatchInfo
 from sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
 
 MIN_CHUNK_SIZE = 16
-
-global batch_info_lora
 
 
 class BgmvLoRABackend(BaseLoRABackend):
@@ -33,6 +30,8 @@ class BgmvLoRABackend(BaseLoRABackend):
         x: jax.Array,
         weights: jax.Array,
         sharding: NamedSharding,
+        scalings: jax.Array,
+        token_indices: jax.Array,
         *args,
         **kwargs,
     ) -> jax.Array:
@@ -42,11 +41,13 @@ class BgmvLoRABackend(BaseLoRABackend):
              x: input matrix with shape (s, input_dim), here s is the sum of all sequence lengths
              weights: a set of lora weights with shape (num_lora, r, input_dim), r is lora rank,
                       usually input_dim is much larger than r
+             sharding: lora_a_output sharding
+             scalings: vector with shape (s,), alpha/rank
+             token_indices: vector with shape (s,)
         Returns:
              result with shape (s, r)
         """
-        info = batch_info_lora
-        return shrink(x, weights, info.token_lora_indices, info.scalings, sharding).astype(x.dtype)
+        return shrink(x, weights, token_indices, scalings, sharding).astype(x.dtype)
 
     def run_lora_b_gemm(
         self,
@@ -54,6 +55,7 @@ class BgmvLoRABackend(BaseLoRABackend):
         weights: jax.Array,
         base_output: jax.Array,
         sharding: NamedSharding,
+        token_indices: jax.Array,
         *args,
         **kwargs,
     ) -> jax.Array:
@@ -64,16 +66,17 @@ class BgmvLoRABackend(BaseLoRABackend):
              weights: a set of lora weights with shape (num_lora, output_dim, r)
                       usually output_dim is much larger than r
              base_output: (s, output_dim)
+             sharding: lora_b_output sharding
+             token_indices: vector with shape (s,)
         Returns:
              result with shape (s, output_dim)
         """
-        info = batch_info_lora
         return jnp.add(
             base_output,
             expand(
                 x,
                 weights,
-                info.token_lora_indices,
+                token_indices,
                 (weights.shape[1],),
                 self.max_lora_rank,
                 sharding,
@@ -87,6 +90,10 @@ class BgmvLoRABackend(BaseLoRABackend):
         qkv_lora_b: jax.Array | tuple[jax.Array],
         output_slices: tuple,
         base_output: jax.Array,
+        lora_a_output_sharding: NamedSharding,
+        lora_b_output_sharding: NamedSharding,
+        scalings: jax.Array,
+        token_indices: jax.Array,
         *args,
         **kwargs,
     ) -> jax.Array:
@@ -102,6 +109,10 @@ class BgmvLoRABackend(BaseLoRABackend):
                            and a combined lora_b module for kv, with shape (2, num_lora, output_dim_kv, r)
             output_slices: a fixed tuple which has three items, (output_dim_q, output_dim_kv, output_dim_kv)
             base_output: (s, 2 * output_dim)
+            lora_a_output_sharding: lora_a_output sharding
+            lora_b_output_sharding: lora_b_output sharding
+            scalings: vector with shape (s,), alpha/rank
+            token_indices: vector with shape (s,)
         Returns:
             result with shape (s, output_dim_q + 2 * output_dim_kv)
         """
@@ -118,17 +129,17 @@ class BgmvLoRABackend(BaseLoRABackend):
             qkv_lora_b_concated = qkv_lora_b
 
         # (s, 3*r)
-        info = batch_info_lora
-        lora_a_output = bgmv_shrink(x, qkv_lora_a, info.token_lora_indices, info.scalings)
+        lora_a_output = bgmv_shrink(x, qkv_lora_a, token_indices, lora_a_output_sharding, scalings)
 
         return jnp.add(
             base_output,
             expand(
                 lora_a_output,
                 qkv_lora_b_concated,
-                info.token_lora_indices,
+                token_indices,
                 output_slices,
                 self.max_lora_rank,
+                lora_b_output_sharding,
             ).astype(x.dtype),
         )
 
@@ -138,6 +149,10 @@ class BgmvLoRABackend(BaseLoRABackend):
         gate_up_lora_a: jax.Array,
         gate_up_lora_b: jax.Array | tuple[jax.Array],
         base_output: jax.Array,
+        lora_a_output_sharding: NamedSharding,
+        lora_b_output_sharding: NamedSharding,
+        scalings: jax.Array,
+        token_indices: jax.Array,
         *args,
         **kwargs,
     ) -> jax.Array:
@@ -150,6 +165,10 @@ class BgmvLoRABackend(BaseLoRABackend):
                         If passed in as a tensor, its shape should be (num_lora, 2 * output_dim, r)
                         If passed in as a tuple, it should contain two tensors with shape (num_lora, output_dim, r)
             base_output: (s, 2 * output_dim)
+            lora_a_output_sharding: lora_a_output sharding
+            lora_b_output_sharding: lora_b_output sharding
+            scalings: vector with shape (s,), alpha/rank
+            token_indices: vector with shape (s,)
         Returns:
             result with shape (s, 2 * output_dim)
         """
@@ -159,36 +178,34 @@ class BgmvLoRABackend(BaseLoRABackend):
             gate_up_lora_b_concated = gate_up_lora_b
 
         # (s, 2*r)
-        info = batch_info_lora
-        lora_a_output = bgmv_shrink(x, gate_up_lora_a, info.token_lora_indices, info.scalings)
+        lora_a_output = bgmv_shrink(
+            x, gate_up_lora_a, token_indices, lora_a_output_sharding, scalings
+        )
 
         return jnp.add(
             base_output,
             expand(
                 lora_a_output,
                 gate_up_lora_b_concated,
-                info.token_lora_indices,
+                token_indices,
                 (gate_up_lora_b_concated.shape[1] // 2, gate_up_lora_b_concated.shape[1] // 2),
                 self.max_lora_rank,
+                lora_b_output_sharding,
             ).astype(x.dtype),
         )
 
     def prepare_lora_batch(
         self,
         model_worker_batch: ModelWorkerBatch,
-        weight_indices: list[int],
-        lora_ranks: list[int],
-        scalings: list[float],
+        weight_indices: list[int],  # [bs,]
+        lora_ranks: list[int],  # [<=max_lora_per_batch,]
+        scalings: list[float],  # [<=max_lora_per_batch,]
     ):
         lora_ranks_bs = []
         scalings_bs = []
         for indice in weight_indices:
-            if indice != -1:
-                lora_ranks_bs.append(lora_ranks[indice])
-                scalings_bs.append(scalings[indice])
-            else:
-                lora_ranks_bs.append(0)
-                scalings_bs.append(0.0)
+            lora_ranks_bs.append(lora_ranks[indice])
+            scalings_bs.append(scalings[indice])
 
         assert len(model_worker_batch.seq_lens) == len(weight_indices)
         assert len(model_worker_batch.seq_lens) == len(lora_ranks_bs)
@@ -198,42 +215,40 @@ class BgmvLoRABackend(BaseLoRABackend):
 
         if model_worker_batch.forward_mode == ForwardMode.EXTEND:
             scalings_cpu = np.repeat(
-                np.array(scalings_bs, dtype=np.float32), model_worker_batch.seq_lens
+                np.array(scalings_bs, dtype=np.float32), model_worker_batch.extend_seq_lens
             )
-            token_lora_indices_cpu = np.repeat(
-                np.array(weight_indices, dtype=np.int32), model_worker_batch.seq_lens
+
+            lora_token_indices_cpu = np.repeat(
+                np.array(weight_indices, dtype=np.int32), model_worker_batch.extend_seq_lens
             )
             lora_ranks_cpu = np.repeat(
-                np.array(lora_ranks_bs, dtype=np.int32), model_worker_batch.seq_lens
+                np.array(lora_ranks_bs, dtype=np.int32), model_worker_batch.extend_seq_lens
             )
 
-            num_to_pad = target_len - jnp.sum(model_worker_batch.seq_lens)
+            num_to_pad = target_len - np.sum(model_worker_batch.extend_seq_lens)
 
             padded_scalings_cpu = scalings_cpu
-            padded_token_lora_indices_cpu = token_lora_indices_cpu
+            padded_lora_token_indices_cpu = lora_token_indices_cpu
             padded_lora_ranks_cpu = lora_ranks_cpu
 
             if num_to_pad > 0:
                 padded_scalings_cpu = np.pad(
                     scalings_cpu, [0, num_to_pad], mode="constant", constant_values=0.0
                 )
-                padded_token_lora_indices_cpu = np.pad(
-                    token_lora_indices_cpu, [0, num_to_pad], mode="constant", constant_values=0
+                padded_lora_token_indices_cpu = np.pad(
+                    lora_token_indices_cpu, [0, num_to_pad], mode="constant", constant_values=0
                 )
                 padded_lora_ranks_cpu = np.pad(
                     lora_ranks_cpu, [0, num_to_pad], mode="constant", constant_values=0
                 )
         elif model_worker_batch.forward_mode == ForwardMode.DECODE:
             padded_scalings_cpu = np.array(scalings_bs, dtype=np.float32)
-            padded_token_lora_indices_cpu = np.array(weight_indices, dtype=np.int32)
+            padded_lora_token_indices_cpu = np.array(weight_indices, dtype=np.int32)
             padded_lora_ranks_cpu = np.array(lora_ranks_bs, dtype=np.int32)
 
-        global batch_info_lora
-        batch_info_lora = LoRABatchInfo(
-            scalings=jnp.array(padded_scalings_cpu, dtype=jnp.float32),
-            token_lora_indices=jnp.array(padded_token_lora_indices_cpu, dtype=jnp.int32),
-            lora_ranks=jnp.array(padded_lora_ranks_cpu, dtype=jnp.int32),
-        )
+        model_worker_batch.lora_scalings = padded_scalings_cpu
+        model_worker_batch.lora_token_indices = padded_lora_token_indices_cpu
+        model_worker_batch.lora_ranks = padded_lora_ranks_cpu
 
 
 def shrink(
@@ -269,7 +284,6 @@ def expand(
         lora_b_slice = lora_b_stacked[
             :, offset_output : offset_output + output_slices[slice_idx], :
         ]
-        # lora_b_slice = jnp.expand_dims(lora_b_slice, axis=1)
 
         output = bgmv_expand_slice(
             x_slice,

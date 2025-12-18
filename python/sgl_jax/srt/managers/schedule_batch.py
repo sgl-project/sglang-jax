@@ -191,7 +191,7 @@ class Req:
             extra_key = (extra_key or "") + lora_id  # lora_id is concatenated to the extra key
 
         self.extra_key = extra_key
-        self.lora_id = lora_id
+        self.lora_id = lora_id if lora_id is not None else "0"
 
         # Memory pool info
         self.req_pool_idx: int | None = None
@@ -1382,7 +1382,7 @@ class ScheduleBatch:
             extend_logprob_start_lens=extend_logprob_start_lens,
             extend_input_logprob_token_ids=self.extend_input_logprob_token_ids,
             lora_ids=(
-                [req.lora_id for req in self.reqs] + [None] * bs_padding_size
+                [req.lora_id for req in self.reqs] + ["0"] * bs_padding_size
                 if not enable_static_lora
                 else ["0"] * bs_paddings[select_bs_index]
             ),
@@ -1717,6 +1717,9 @@ class ModelWorkerBatch:
 
     # For LoRA
     lora_ids: list[str] | None = None
+    lora_scalings: np.ndarray | None = None
+    lora_token_indices: np.ndarray | None = None
+    lora_ranks: np.ndarray | None = None
 
     capture_hidden_mode: CaptureHiddenMode = None
 
@@ -1739,8 +1742,6 @@ class ModelWorkerBatch:
     speculative_num_draft_tokens: int = 0
     # If set, the output of the batch contains the hidden states of the run.
     capture_hidden_mode: CaptureHiddenMode = None
-
-    lora_batch_info: Any | None = None
 
     tree_cache: BasePrefixCache = None
 
