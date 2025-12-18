@@ -357,7 +357,8 @@ class ModelWorker:
 
         valid_cache_loc = np.arange(bs)
         invalid_cache_loc = np.array([0] * (invalid_cache_loc_size), dtype=jnp.int32)
-        lora_ids = ["0"] if bs == 1 else ["0"] * (bs // 2) + [None] * (bs - bs // 2)
+        # Use None for precompile to avoid occupying a real LoRA buffer slot
+        lora_ids = [None] * bs
 
         return ModelWorkerBatch(
             bid=1,
@@ -388,7 +389,7 @@ class ModelWorker:
             extend_logprob_start_lens=None,
             capture_hidden_mode=CaptureHiddenMode.NULL,
             spec_algorithm=speculative_algotithm,
-            lora_ids=lora_ids if not enable_static_lora else ["0"] * bs,
+            lora_ids=lora_ids,  # Already set to [None] * bs above
         )
 
     def get_model_runner(self):
