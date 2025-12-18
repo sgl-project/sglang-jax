@@ -157,7 +157,8 @@ class ModelRunner:
 
     def initialize_jit(self):
         model_def, model_state = nnx.split(self.model)
-        model_state_leaves, model_state_def = jax.tree_util.tree_flatten(model_state)
+        # note export for external modification
+        self.model_state_leaves, model_state_def = jax.tree_util.tree_flatten(model_state)
         sampler_def, sampler_state = nnx.split(self.sampler)
         sampler_state_leaves, sampler_state_def = jax.tree_util.tree_flatten(sampler_state)
 
@@ -200,7 +201,7 @@ class ModelRunner:
             return jitted_run_model(
                 model_def,
                 model_state_def,
-                model_state_leaves,
+                self.model_state_leaves,
                 forward_batch,
                 token_to_kv_pool,
                 logits_metadata,
