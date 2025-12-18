@@ -342,7 +342,7 @@ class LoRAMemoryPool:
                     )()
                     self.B_buffer[module_name].append(b_buf)
 
-                logger.info(
+                logger.debug(
                     "Created LoRA buffers for %s: A_shape=%s (sharding=%s), B_shape=%s (sharding=%s)",
                     module_name,
                     a_shape,
