@@ -387,7 +387,9 @@ class ModelWorker:
             top_logprobs_nums=None,
             token_ids_logprobs=None,
             extend_logprob_start_lens=None,
-            capture_hidden_mode=CaptureHiddenMode.NULL,
+            capture_hidden_mode=(
+                CaptureHiddenMode.FULL if self.server_args.multimodal else CaptureHiddenMode.NULL
+            ),
             spec_algorithm=speculative_algotithm,
             lora_ids=lora_ids,  # Already set to [None] * bs above
         )

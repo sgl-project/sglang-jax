@@ -32,6 +32,7 @@ from sgl_jax.srt.mem_cache.memory_pool import (
     ReqToTokenPool,
     SWAKVPool,
 )
+from sgl_jax.srt.model_executor.base_model_runner import BaseModelRunner
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
 from sgl_jax.srt.model_loader.loader import get_model_loader
 from sgl_jax.srt.precision_tracer import precision_tracer
@@ -45,20 +46,7 @@ from sgl_jax.srt.utils.quantization.quantization_utils import apply_qwix_quantiz
 logger = logging.getLogger(__name__)
 
 
-class RankZeroFilter(logging.Filter):
-    """Filter that only allows INFO level logs from rank 0, but allows all other levels from any rank."""
-
-    def __init__(self, is_rank_zero):
-        super().__init__()
-        self.is_rank_zero = is_rank_zero
-
-    def filter(self, record):
-        if record.levelno == logging.INFO:
-            return self.is_rank_zero
-        return True
-
-
-class ModelRunner:
+class ModelRunner(BaseModelRunner):
     """ModelRunner runs the forward passes of the models."""
 
     def __init__(

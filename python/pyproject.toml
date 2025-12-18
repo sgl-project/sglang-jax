@@ -42,6 +42,8 @@ dependencies = [
     "pybase64",
     "partial_json_parser",
     "pathwaysutils",
+    "omegaconf",
+    "imageio[ffmpeg]"
 ]
 
 [project.optional-dependencies]

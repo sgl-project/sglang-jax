@@ -70,6 +70,7 @@ class DetokenizerManager:
                 tokenizer_mode=server_args.tokenizer_mode,
                 trust_remote_code=server_args.trust_remote_code,
                 revision=server_args.revision,
+                sub_dir="tokenizer" if server_args.multimodal else "",
             )
 
         self.decode_status = LimitedCapacityDict(capacity=DETOKENIZER_MAX_STATES)

@@ -97,7 +97,7 @@ class BatchTokenIDOut:
 
     # Hidden states
     output_hidden_states: list[list[float]]
-
+    output_hidden_states_for_mm: list[list[float]]
     # Cache miss count
     cache_miss_count: int = None
 
@@ -129,6 +129,8 @@ class TokenizedGenerateReqInput:
     lora_id: str | None = None  # None means just use the base model
     # Extra key for cache namespace isolation (e.g., cache_salt, lora_id)
     extra_key: str | None = None
+    # whether to return hidden states
+    return_hidden_states: bool = False
 
 
 @dataclass
