@@ -204,6 +204,30 @@ class TestPauseContinueGeneration(CustomTestCase):
             # Verify quantity: waiting queue increase == running batch decrease
             waiting_queue_increase = waiting_after_pause - waiting_before_pause
             running_batch_decrease = running_before_pause - running_after_pause
+
+            # Verify KV cache is cleared (available tokens increase back toward initial)
+            tokens_after_pause = internal_after["available_kv_tokens"]
+
+            # Print colorful log for retract mode state changes
+            print(f"\n{Colors.BOLD}{Colors.BLUE}=== Retract Mode State Changes ==={Colors.RESET}")
+            print(f"{Colors.YELLOW}Before Pause:{Colors.RESET}")
+            print(f"  Running Batch Size: {Colors.GREEN}{running_before_pause}{Colors.RESET}")
+            print(f"  Waiting Queue Size: {Colors.GREEN}{waiting_before_pause}{Colors.RESET}")
+            print(f"  Available KV Tokens: {Colors.GREEN}{tokens_before_pause}{Colors.RESET}")
+            print(f"{Colors.YELLOW}After Pause:{Colors.RESET}")
+            print(f"  Running Batch Size: {Colors.GREEN}{running_after_pause}{Colors.RESET}")
+            print(f"  Waiting Queue Size: {Colors.GREEN}{waiting_after_pause}{Colors.RESET}")
+            print(f"  Available KV Tokens: {Colors.GREEN}{tokens_after_pause}{Colors.RESET}")
+            print(f"{Colors.YELLOW}Changes:{Colors.RESET}")
+            print(f"  Running Batch Decrease: {Colors.RED}-{running_batch_decrease}{Colors.RESET}")
+            print(
+                f"  Waiting Queue Increase: {Colors.GREEN}+{waiting_queue_increase}{Colors.RESET}"
+            )
+            print(
+                f"  KV Tokens Freed: {Colors.GREEN}+{tokens_after_pause - tokens_before_pause}{Colors.RESET}"
+            )
+            print(f"{Colors.BOLD}{Colors.BLUE}================================={Colors.RESET}\n")
+
             self.assertEqual(
                 waiting_queue_increase,
                 running_batch_decrease,
@@ -211,8 +235,6 @@ class TestPauseContinueGeneration(CustomTestCase):
                 f"running batch decrease ({running_batch_decrease})",
             )
 
-            # Verify KV cache is cleared (available tokens increase back toward initial)
-            tokens_after_pause = internal_after["available_kv_tokens"]
             self.assertGreater(
                 tokens_after_pause,
                 tokens_before_pause,
@@ -441,6 +463,92 @@ class TestPauseContinueGeneration(CustomTestCase):
 
         print_test_passed("TestPauseContinueGeneration.test_pause_continue_multiple_cycles")
 
+    def test_pause_generation_abort_mode(self):
+        """
+        Test pause_generation with abort mode.
+
+        Verify:
+        1. All requests are aborted (waiting queue becomes empty)
+        2. Running batch becomes empty (all requests get to_finish=FINISH_ABORT())
+        3. All requests complete with abort finish_reason
+        """
+        # Start multiple long-running requests
+        num_requests = 8
+        with ThreadPoolExecutor(num_requests) as executor:
+            futures = [executor.submit(self._run_decode, 2000) for _ in range(num_requests)]
+
+            # Wait for requests to start generating (in running batch)
+            time.sleep(3)
+
+            # Get state before pause - should have requests in running batch or waiting queue
+            state_before_pause = self._get_internal_state()
+            internal_before = state_before_pause["internal_states"][0]
+
+            running_before = internal_before["running_batch_size"]
+            waiting_before = internal_before["waiting_queue_size"]
+            total_before = running_before + waiting_before
+            self.assertGreater(
+                total_before, 0, "Expected requests in running batch or waiting queue before pause"
+            )
+
+            # Pause generation with abort mode
+            pause_response = self._pause_generation(mode="abort")
+            self.assertEqual(pause_response["status"], "ok")
+
+            # Wait for abort to complete
+            time.sleep(1)
+
+            # Get state after pause
+            state_after_pause = self._get_internal_state()
+            internal_after = state_after_pause["internal_states"][0]
+
+            # Verify waiting queue is empty (abort clears waiting queue)
+            waiting_after = internal_after["waiting_queue_size"]
+            self.assertEqual(
+                waiting_after, 0, "Waiting queue should be empty after abort mode pause"
+            )
+
+            # Verify running batch is empty (all requests aborted via to_finish=FINISH_ABORT())
+            running_after = internal_after["running_batch_size"]
+            self.assertEqual(
+                running_after, 0, "Running batch should be empty after abort mode pause"
+            )
+
+            # Wait for all requests to complete
+            results = []
+            for future in as_completed(futures):
+                try:
+                    result = future.result(timeout=60)
+                    results.append(result)
+                except Exception as e:
+                    results.append({"error": str(e)})
+
+            # Verify all requests completed with abort status
+            for i, result in enumerate(results):
+                if "error" in result:
+                    # Some requests may fail due to abort
+                    self.assertIn(
+                        "abort",
+                        result["error"].lower(),
+                        f"Request {i} error should be abort-related: {result}",
+                    )
+                else:
+                    self.assertIn(
+                        "meta_info", result, f"Request {i} should have meta_info: {result}"
+                    )
+                    finish_reason = result.get("meta_info", {}).get("finish_reason", {})
+                    self.assertEqual(
+                        finish_reason.get("type"),
+                        "abort",
+                        f"Request {i} should finish due to abort: {result}",
+                    )
+
+            # Continue generation to reset state (abort mode sets is_pause=True)
+            continue_response = self._continue_generation()
+            self.assertEqual(continue_response["status"], "ok")
+
+        print_test_passed("TestPauseContinueGeneration.test_pause_generation_abort_mode")
+
 
 class TestPauseContinueGenerationNoOverlap(CustomTestCase):
     """
@@ -571,6 +679,32 @@ class TestPauseContinueGenerationNoOverlap(CustomTestCase):
             # Verify quantity: waiting queue increase == running batch decrease
             waiting_queue_increase = waiting_after - waiting_before
             running_batch_decrease = running_before - running_after
+
+            # Verify KV cache cleared
+            tokens_after = internal_after["available_kv_tokens"]
+
+            # Print colorful log for retract mode state changes (no overlap)
+            print(
+                f"\n{Colors.BOLD}{Colors.BLUE}=== Retract Mode State Changes (No Overlap) ==={Colors.RESET}"
+            )
+            print(f"{Colors.YELLOW}Before Pause:{Colors.RESET}")
+            print(f"  Running Batch Size: {Colors.GREEN}{running_before}{Colors.RESET}")
+            print(f"  Waiting Queue Size: {Colors.GREEN}{waiting_before}{Colors.RESET}")
+            print(f"  Available KV Tokens: {Colors.GREEN}{tokens_before}{Colors.RESET}")
+            print(f"{Colors.YELLOW}After Pause:{Colors.RESET}")
+            print(f"  Running Batch Size: {Colors.GREEN}{running_after}{Colors.RESET}")
+            print(f"  Waiting Queue Size: {Colors.GREEN}{waiting_after}{Colors.RESET}")
+            print(f"  Available KV Tokens: {Colors.GREEN}{tokens_after}{Colors.RESET}")
+            print(f"{Colors.YELLOW}Changes:{Colors.RESET}")
+            print(f"  Running Batch Decrease: {Colors.RED}-{running_batch_decrease}{Colors.RESET}")
+            print(
+                f"  Waiting Queue Increase: {Colors.GREEN}+{waiting_queue_increase}{Colors.RESET}"
+            )
+            print(f"  KV Tokens Freed: {Colors.GREEN}+{tokens_after - tokens_before}{Colors.RESET}")
+            print(
+                f"{Colors.BOLD}{Colors.BLUE}=============================================={Colors.RESET}\n"
+            )
+
             self.assertEqual(
                 waiting_queue_increase,
                 running_batch_decrease,
@@ -578,8 +712,6 @@ class TestPauseContinueGenerationNoOverlap(CustomTestCase):
                 f"running batch decrease ({running_batch_decrease})",
             )
 
-            # Verify KV cache cleared
-            tokens_after = internal_after["available_kv_tokens"]
             self.assertGreater(tokens_after, tokens_before)
 
             # Continue
@@ -652,6 +784,77 @@ class TestPauseContinueGenerationNoOverlap(CustomTestCase):
                 self.assertIn("text", result)
 
         print_test_passed("TestPauseContinueGenerationNoOverlap.test_pause_in_place_no_overlap")
+
+    def test_pause_abort_no_overlap(self):
+        """
+        Test pause_generation with abort mode without overlap schedule.
+        """
+        num_requests = 4
+        with ThreadPoolExecutor(num_requests) as executor:
+            futures = [executor.submit(self._run_decode, 2000) for _ in range(num_requests)]
+
+            # Wait for requests to start generating
+            time.sleep(3)
+
+            # Get state before pause
+            state_before = self._get_internal_state()
+            internal_before = state_before["internal_states"][0]
+            running_before = internal_before["running_batch_size"]
+            waiting_before = internal_before["waiting_queue_size"]
+            total_before = running_before + waiting_before
+            self.assertGreater(
+                total_before, 0, "Expected requests in running batch or waiting queue before pause"
+            )
+
+            # Pause with abort mode
+            pause_response = self._pause_generation(mode="abort")
+            self.assertEqual(pause_response["status"], "ok")
+
+            # Wait for abort to complete
+            time.sleep(1)
+
+            # Get state after pause
+            state_after = self._get_internal_state()
+            internal_after = state_after["internal_states"][0]
+
+            # Verify waiting queue is empty
+            waiting_after = internal_after["waiting_queue_size"]
+            self.assertEqual(waiting_after, 0)
+
+            # Verify running batch is empty (requests aborted via to_finish=FINISH_ABORT())
+            running_after = internal_after["running_batch_size"]
+            self.assertEqual(running_after, 0)
+
+            # Wait for all requests to complete
+            results = []
+            for future in as_completed(futures):
+                try:
+                    result = future.result(timeout=60)
+                    results.append(result)
+                except Exception as e:
+                    results.append({"error": str(e)})
+
+            # Verify all requests completed with abort status
+            for i, result in enumerate(results):
+                if "error" in result:
+                    self.assertIn(
+                        "abort",
+                        result["error"].lower(),
+                        f"Request {i} error should be abort-related: {result}",
+                    )
+                else:
+                    finish_reason = result.get("meta_info", {}).get("finish_reason", {})
+                    self.assertEqual(
+                        finish_reason.get("type"),
+                        "abort",
+                        f"Request {i} should finish due to abort: {result}",
+                    )
+
+            # Continue generation to reset state
+            continue_response = self._continue_generation()
+            self.assertEqual(continue_response["status"], "ok")
+
+        print_test_passed("TestPauseContinueGenerationNoOverlap.test_pause_abort_no_overlap")
 
 
 if __name__ == "__main__":

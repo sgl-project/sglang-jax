@@ -156,6 +156,28 @@ class TestEnginePauseContinue(CustomTestCase):
         # Verify quantity: waiting queue increase == running batch decrease
         waiting_queue_increase = waiting_after_pause - waiting_before_pause
         running_batch_decrease = running_before_pause - running_after_pause
+
+        # Verify KV cache is cleared
+        tokens_after_pause = internal_after["available_kv_tokens"]
+
+        # Print colorful log for retract mode state changes
+        print(f"\n{Colors.BOLD}{Colors.BLUE}=== Retract Mode State Changes ==={Colors.RESET}")
+        print(f"{Colors.YELLOW}Before Pause:{Colors.RESET}")
+        print(f"  Running Batch Size: {Colors.GREEN}{running_before_pause}{Colors.RESET}")
+        print(f"  Waiting Queue Size: {Colors.GREEN}{waiting_before_pause}{Colors.RESET}")
+        print(f"  Available KV Tokens: {Colors.GREEN}{tokens_before_pause}{Colors.RESET}")
+        print(f"{Colors.YELLOW}After Pause:{Colors.RESET}")
+        print(f"  Running Batch Size: {Colors.GREEN}{running_after_pause}{Colors.RESET}")
+        print(f"  Waiting Queue Size: {Colors.GREEN}{waiting_after_pause}{Colors.RESET}")
+        print(f"  Available KV Tokens: {Colors.GREEN}{tokens_after_pause}{Colors.RESET}")
+        print(f"{Colors.YELLOW}Changes:{Colors.RESET}")
+        print(f"  Running Batch Decrease: {Colors.RED}-{running_batch_decrease}{Colors.RESET}")
+        print(f"  Waiting Queue Increase: {Colors.GREEN}+{waiting_queue_increase}{Colors.RESET}")
+        print(
+            f"  KV Tokens Freed: {Colors.GREEN}+{tokens_after_pause - tokens_before_pause}{Colors.RESET}"
+        )
+        print(f"{Colors.BOLD}{Colors.BLUE}================================={Colors.RESET}\n")
+
         self.assertEqual(
             waiting_queue_increase,
             running_batch_decrease,
@@ -163,8 +185,6 @@ class TestEnginePauseContinue(CustomTestCase):
             f"running batch decrease ({running_batch_decrease})",
         )
 
-        # Verify KV cache is cleared
-        tokens_after_pause = internal_after["available_kv_tokens"]
         self.assertGreater(
             tokens_after_pause,
             tokens_before_pause,
@@ -314,6 +334,72 @@ class TestEnginePauseContinue(CustomTestCase):
                 self.fail(f"Request {i} failed with exception: {result}")
             self.assertIn("text", result, f"Request {i} should have text output: {result}")
 
+    async def _run_test_abort_mode(self):
+        """Test pause_generation with abort mode using async."""
+        # Start multiple long-running requests concurrently
+        num_requests = 8
+        tasks = [
+            asyncio.create_task(self._async_generate(max_new_tokens=2000))
+            for _ in range(num_requests)
+        ]
+
+        # Wait a bit for requests to start generating
+        await asyncio.sleep(3)
+
+        # Get state before pause
+        states_before = await self._async_get_internal_state()
+        internal_before = states_before[0]
+
+        # Verify there are requests in running batch or waiting queue
+        running_before = internal_before["running_batch_size"]
+        waiting_before = internal_before["waiting_queue_size"]
+        total_before = running_before + waiting_before
+        self.assertGreater(
+            total_before, 0, "Expected requests in running batch or waiting queue before pause"
+        )
+
+        # Pause generation with abort mode
+        await self._async_pause_generation(mode="abort")
+
+        # Wait for abort to complete
+        await asyncio.sleep(1)
+
+        # Get state after pause
+        states_after = await self._async_get_internal_state()
+        internal_after = states_after[0]
+
+        # Verify waiting queue is empty (abort clears waiting queue)
+        waiting_after = internal_after["waiting_queue_size"]
+        self.assertEqual(waiting_after, 0, "Waiting queue should be empty after abort mode pause")
+
+        # Verify running batch is empty (all requests aborted)
+        running_after = internal_after["running_batch_size"]
+        self.assertEqual(running_after, 0, "Running batch should be empty after abort mode pause")
+
+        # Wait for all tasks to complete
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        # Verify all requests completed with abort status
+        for i, result in enumerate(results):
+            if isinstance(result, Exception):
+                # Some requests may raise ValueError due to abort
+                self.assertIn(
+                    "abort",
+                    str(result).lower(),
+                    f"Request {i} exception should be abort-related: {result}",
+                )
+            else:
+                self.assertIn("meta_info", result, f"Request {i} should have meta_info: {result}")
+                finish_reason = result.get("meta_info", {}).get("finish_reason", {})
+                self.assertEqual(
+                    finish_reason.get("type"),
+                    "abort",
+                    f"Request {i} should finish due to abort: {result}",
+                )
+
+        # Continue generation to reset state (abort mode sets is_pause=True)
+        await self._async_continue_generation()
+
     def test_1_pause_generation_retract_mode(self):
         """Test pause_generation with retract mode."""
         self.engine.loop.run_until_complete(self._run_test_retract_mode())
@@ -328,6 +414,11 @@ class TestEnginePauseContinue(CustomTestCase):
         """Test multiple pause/continue cycles."""
         self.engine.loop.run_until_complete(self._run_test_multiple_cycles())
         print_test_passed("TestEnginePauseContinue.test_3_pause_continue_multiple_cycles")
+
+    def test_4_pause_generation_abort_mode(self):
+        """Test pause_generation with abort mode."""
+        self.engine.loop.run_until_complete(self._run_test_abort_mode())
+        print_test_passed("TestEnginePauseContinue.test_4_pause_generation_abort_mode")
 
 
 if __name__ == "__main__":
