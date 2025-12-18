@@ -196,6 +196,9 @@ class TestEngineDeterministicGeneration(CustomTestCase):
             "Retract Mode",
         )
 
+        print(f"Baseline text: {baseline_text}")
+        print(f"Retract text: {retract_text}")
+
         # With temperature=0 and retract mode, output should be identical
         # because retract clears KV cache and re-prefills deterministically
         self.assertEqual(
