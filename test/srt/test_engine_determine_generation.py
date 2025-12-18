@@ -62,7 +62,7 @@ class TestEngineDeterministicGeneration(CustomTestCase):
     """
     Test deterministic generation using Engine API.
 
-    Compares pause/continue modes (abort and retract) vs no pause with temperature=0.
+    Compares pause/continue modes (abort and retract) vs Baseline with temperature=0.
     """
 
     @classmethod
@@ -242,8 +242,8 @@ class TestEngineDeterministicGeneration(CustomTestCase):
     # ============ Single Request Tests ============
 
     async def _run_test_single_retract_vs_no_pause(self):
-        """Test single request: retract mode vs no pause."""
-        # Run baseline (no pause)
+        """Test single request: retract mode vs Baseline."""
+        # Run baseline 
         baseline_text = await self._run_generation_no_pause(self.test_prompt, self.max_new_tokens)
 
         # Run with retract mode (with state logging)
@@ -253,10 +253,10 @@ class TestEngineDeterministicGeneration(CustomTestCase):
 
         # Print comparison
         print_comparison(
-            "Single Request: Retract vs No Pause",
+            "Single Request: Retract vs Baseline",
             baseline_text,
             retract_text,
-            "No Pause (Baseline)",
+            "Baseline",
             "Retract Mode",
         )
 
@@ -273,25 +273,25 @@ class TestEngineDeterministicGeneration(CustomTestCase):
         self.assertEqual(
             len(baseline_text),
             len(retract_text),
-            f"Retract mode should produce same length output as no pause. "
+            f"Retract mode should produce same length output as Baseline. "
             f"Baseline: {len(baseline_text)}, Retract: {len(retract_text)}",
         )
         self.assertEqual(
             baseline_text,
             retract_text,
-            "Retract mode should produce identical output as no pause with temperature=0",
+            "Retract mode should produce identical output as Baseline with temperature=0",
         )
 
     async def _run_test_single_abort_vs_no_pause(self):
         """
-        Test single request: abort mode vs no pause.
+        Test single request: abort mode vs Baseline.
 
         Demonstrates:
         1. Abort terminates request and returns partial result
         2. After abort, must re-generate (not continue) to get full result
         3. Re-generated result matches baseline (deterministic with temperature=0)
         """
-        # Run baseline (no pause) - full generation
+        # Run baseline - full generation
         baseline_text = await self._run_generation_no_pause(self.test_prompt, self.max_new_tokens)
 
         # Run with abort, then re-generate
@@ -304,7 +304,7 @@ class TestEngineDeterministicGeneration(CustomTestCase):
             "Single Request: Re-generated vs Baseline",
             baseline_text,
             regenerated_text,
-            "No Pause (Baseline)",
+            "Baseline",
             "Re-generated After Abort",
         )
 
@@ -343,11 +343,11 @@ class TestEngineDeterministicGeneration(CustomTestCase):
     # ============ Multiple Requests Tests ============
 
     async def _run_test_multiple_retract_vs_no_pause(self):
-        """Test multiple requests: retract mode vs no pause."""
+        """Test multiple requests: retract mode vs Baseline."""
         num_requests = 4
         prompts = [f"{self.test_prompt} Story {i}:" for i in range(num_requests)]
 
-        # Run baseline (no pause) - run sequentially to ensure determinism
+        # Run baseline - run sequentially to ensure determinism
         baseline_texts = []
         for prompt in prompts:
             text = await self._run_generation_no_pause(prompt, self.max_new_tokens)
@@ -424,7 +424,7 @@ class TestEngineDeterministicGeneration(CustomTestCase):
         retract_texts = [r.get("text", "") if isinstance(r, dict) else "" for r in results]
 
         # Summary comparison
-        print(f"\n{Colors.BOLD}{Colors.BLUE}=== Multiple Requests: Retract vs No Pause ==={Colors.RESET}")
+        print(f"\n{Colors.BOLD}{Colors.BLUE}=== Multiple Requests: Retract vs Baseline ==={Colors.RESET}")
         for i in range(num_requests):
             match = baseline_texts[i] == retract_texts[i]
             len_diff = len(retract_texts[i]) - len(baseline_texts[i])
@@ -453,7 +453,7 @@ class TestEngineDeterministicGeneration(CustomTestCase):
 
     async def _run_test_multiple_abort_vs_no_pause(self):
         """
-        Test multiple requests: abort mode vs no pause.
+        Test multiple requests: abort mode vs Baseline.
 
         Demonstrates:
         1. Abort terminates ALL requests and returns partial results
@@ -463,7 +463,7 @@ class TestEngineDeterministicGeneration(CustomTestCase):
         num_requests = 4
         prompts = [f"{self.test_prompt} Story {i}:" for i in range(num_requests)]
 
-        # Run baseline (no pause) - full generation, run sequentially
+        # Run baseline - full generation, run sequentially
         baseline_texts = []
         for prompt in prompts:
             text = await self._run_generation_no_pause(prompt, self.max_new_tokens)
@@ -554,28 +554,28 @@ class TestEngineDeterministicGeneration(CustomTestCase):
             )
 
     def test_1_single_request_retract_vs_no_pause(self):
-        """Test single request: retract mode vs no pause (length and tokens)."""
+        """Test single request: retract mode vs Baseline (length and tokens)."""
         self.engine.loop.run_until_complete(self._run_test_single_retract_vs_no_pause())
         print_test_passed(
             "TestEngineDeterministicGeneration.test_1_single_request_retract_vs_no_pause"
         )
 
     def test_2_single_request_abort_vs_no_pause(self):
-        """Test single request: abort mode vs no pause (length and tokens)."""
+        """Test single request: abort mode vs Baseline (length and tokens)."""
         self.engine.loop.run_until_complete(self._run_test_single_abort_vs_no_pause())
         print_test_passed(
             "TestEngineDeterministicGeneration.test_2_single_request_abort_vs_no_pause"
         )
 
     def test_3_multiple_requests_retract_vs_no_pause(self):
-        """Test multiple requests: retract mode vs no pause (length and tokens)."""
+        """Test multiple requests: retract mode vs Baseline (length and tokens)."""
         self.engine.loop.run_until_complete(self._run_test_multiple_retract_vs_no_pause())
         print_test_passed(
             "TestEngineDeterministicGeneration.test_3_multiple_requests_retract_vs_no_pause"
         )
 
     def test_4_multiple_requests_abort_vs_no_pause(self):
-        """Test multiple requests: abort mode vs no pause (length and tokens)."""
+        """Test multiple requests: abort mode vs Baseline (length and tokens)."""
         self.engine.loop.run_until_complete(self._run_test_multiple_abort_vs_no_pause())
         print_test_passed(
             "TestEngineDeterministicGeneration.test_4_multiple_requests_abort_vs_no_pause"
