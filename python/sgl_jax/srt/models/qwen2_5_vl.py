@@ -891,56 +891,37 @@ class Qwen2_5_VLForConditionalGeneration(nnx.Module):
         
         weight_mappings = self._create_qwen2_5_vl_weight_mappings()
         
-        self._load_weights_with_custom_conv3d(loader, weight_mappings)
+        self._load_weights_with_special_conv3d(loader, weight_mappings)
         logger.info("Qwen2.5-VL weights loaded successfully!")
     
-    def _load_weights_with_custom_conv3d(self, loader: WeightLoader, weight_mappings: dict):
-        """Custom weight loading that handles Conv3D weight permutation."""
-        import copy
-        
-        # Create a copy of mappings for modification
-        modified_mappings = copy.deepcopy(weight_mappings)
-        
-        # Remove the Conv3D weight from normal loading
-        conv3d_mapping = modified_mappings.pop("visual.patch_embed.proj.weight", None)
-        
-        # Load all other weights normally
-        loader.load_weights_from_safetensors(modified_mappings)
-        
-        # Handle Conv3D weight separately if it exists
-        if conv3d_mapping:
-            self._load_conv3d_weight(loader, conv3d_mapping)
-    
-    def _load_conv3d_weight(self, loader: WeightLoader, mapping: WeightMapping):
-        """Load and properly permute Conv3D weight."""
-        # Get the model parameters
+    def _load_weights_with_special_conv3d(self, loader: WeightLoader, weight_mappings: dict):
+        """
+        Load weights with special handling for Conv3D to prevent incorrect mappings and improve efficiency.
+        """
         params = nnx.state(self)
-        
-        # Find the Conv3D weight in the safetensors files
+        conv3d_key = "visual.patch_embed.proj.weight"
+
         for hf_key, hf_weight in loader._iterate_weights():
-            if hf_key == "visual.patch_embed.proj.weight":
-                # HuggingFace format: (out_channels, in_channels, T, H, W)
-                # Flax format: (T, H, W, in_channels, out_channels)
-                # Permute from (0,1,2,3,4) to (2,3,4,1,0)
+            if hf_key == conv3d_key:
+                mapping = weight_mappings.get(hf_key)
+                if not mapping:
+                    logger.warning(f"No mapping found for Conv3D weight: {hf_key}")
+                    continue
+                
+                # Custom permutation for Conv3D weight
                 permuted_weight = jnp.transpose(hf_weight, (2, 3, 4, 1, 0))
-                
-                # Apply sharding
                 sharded_weight = loader._shard_weight(permuted_weight, mapping.sharding)
-                
-                # Get the target parameter and assign
                 target_param = loader._get_param(params, mapping.target_path)
                 target_param.value = sharded_weight.astype(target_param.value.dtype)
-                
-                logger.debug(
-                    "Loaded Conv3D weight: %s -> %s, original shape: %s, permuted shape: %s",
-                    hf_key,
-                    mapping.target_path,
-                    hf_weight.shape,
-                    permuted_weight.shape,
-                )
-                break
+                logger.debug(f"Loaded Conv3D weight: {hf_key} -> {mapping.target_path}")
+
+            elif hf_key in weight_mappings:
+                mapping = weight_mappings[hf_key]
+                loader._process_and_assign_weight(params, hf_key, hf_weight, mapping)
+            else:
+                if not loader._is_excluded_layer_weight(hf_key):
+                    logger.warning(f"No mapping found for weight: {hf_key}")
         
-        # Update the model with modified parameters
         nnx.update(self, params)
     
     def _create_qwen2_5_vl_weight_mappings(self) -> dict:
