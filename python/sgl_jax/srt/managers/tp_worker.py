@@ -357,8 +357,7 @@ class ModelWorker:
 
         valid_cache_loc = np.arange(bs)
         invalid_cache_loc = np.array([0] * (invalid_cache_loc_size), dtype=jnp.int32)
-        # Use None for precompile to avoid occupying a real LoRA buffer slot
-        lora_ids = [None] * bs
+        lora_ids = ["0"] * bs
 
         return ModelWorkerBatch(
             bid=1,
@@ -397,9 +396,9 @@ class ModelWorker:
 
     def prepare_lora_batch(self, model_worker_batch: ModelWorkerBatch):
         self.model_runner.lora_manager.prepare_lora_batch(model_worker_batch)
-        if self.model_runner.lora_manager.has_new_weights:
-            _, model_state = nnx.split(self.model_runner.model)
-            self.model_runner.model_state_leaves, _ = jax.tree_util.tree_flatten(model_state)
+        # if self.model_runner.lora_manager.has_new_weights:
+        _, model_state = nnx.split(self.model_runner.model)
+        self.model_runner.model_state_leaves, _ = jax.tree_util.tree_flatten(model_state)
 
     def get_worker_info(self):
         return (

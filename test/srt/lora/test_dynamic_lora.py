@@ -146,8 +146,8 @@ class TestLoRA(CustomTestCase):
             self.assertEqual(response.status_code, 200)
             actual_response = response.json()
 
-            print(f"No LoRA support: {expected_responses[i]['text'][:100]}")
-            print(f"With LoRA support (unused): {actual_response['text'][:100]}")
+            print(f"No LoRA support: {expected_responses[i]['text']}")
+            print(f"With LoRA support (unused): {actual_response['text']}")
 
             self.assertEqual(
                 expected_responses[i]["text"],

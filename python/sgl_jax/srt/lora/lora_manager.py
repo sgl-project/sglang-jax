@@ -462,6 +462,8 @@ class LoRAManager:
         else:
             has_new_weights = prepare_dynamic_lora_batch()
 
+        print(f"[lora_manager prepare_lora_batch] {model_worker_batch.lora_scalings.shape=}")
+
         # Update LoRA layer buffer references after loading new weights
         # This is necessary because JAX arrays are immutable, and load_lora_weight_to_buffer
         # creates new arrays. We need to update the references in LoRALinear layers.
