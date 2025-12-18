@@ -46,9 +46,15 @@ def print_comparison(
     print(f"  Length (words): {Colors.GREEN}{len(test_words)}{Colors.RESET}")
     print(f"  Preview: {Colors.CYAN}{test_text[:100]}...{Colors.RESET}")
     print(f"{Colors.YELLOW}Comparison:{Colors.RESET}")
-    print(f"  Char Length Diff: {Colors.MAGENTA}{len(test_text) - len(baseline_text)}{Colors.RESET}")
-    print(f"  Word Length Diff: {Colors.MAGENTA}{len(test_words) - len(baseline_words)}{Colors.RESET}")
-    print(f"  Texts Match: {Colors.GREEN if baseline_text == test_text else Colors.RED}{baseline_text == test_text}{Colors.RESET}")
+    print(
+        f"  Char Length Diff: {Colors.MAGENTA}{len(test_text) - len(baseline_text)}{Colors.RESET}"
+    )
+    print(
+        f"  Word Length Diff: {Colors.MAGENTA}{len(test_words) - len(baseline_words)}{Colors.RESET}"
+    )
+    print(
+        f"  Texts Match: {Colors.GREEN if baseline_text == test_text else Colors.RED}{baseline_text == test_text}{Colors.RESET}"
+    )
     print(f"{Colors.BOLD}{Colors.BLUE}{'=' * (len(title) + 8)}{Colors.RESET}\n")
 
 
@@ -125,7 +131,9 @@ class TestEngineDeterministicGeneration(CustomTestCase):
         result = await self._async_generate(prompt, max_new_tokens)
         return result.get("text", "")
 
-    async def _run_generation_with_retract(self, prompt: str, max_new_tokens: int, pause_delay: float = 1.0):
+    async def _run_generation_with_retract(
+        self, prompt: str, max_new_tokens: int, pause_delay: float = 1.0
+    ):
         """Run generation with retract mode pause in the middle."""
         task = asyncio.create_task(self._async_generate(prompt, max_new_tokens))
 
@@ -143,7 +151,9 @@ class TestEngineDeterministicGeneration(CustomTestCase):
         result = await task
         return result.get("text", "")
 
-    async def _run_generation_with_abort_and_regenerate(self, prompt: str, max_new_tokens: int, pause_delay: float = 1.0):
+    async def _run_generation_with_abort_and_regenerate(
+        self, prompt: str, max_new_tokens: int, pause_delay: float = 1.0
+    ):
         """
         Run generation with abort mode, then re-generate.
 
@@ -185,7 +195,9 @@ class TestEngineDeterministicGeneration(CustomTestCase):
         baseline_text = await self._run_generation_no_pause(self.test_prompt, self.max_new_tokens)
 
         # Run with retract mode
-        retract_text = await self._run_generation_with_retract(self.test_prompt, self.max_new_tokens)
+        retract_text = await self._run_generation_with_retract(
+            self.test_prompt, self.max_new_tokens
+        )
 
         # Print comparison
         print_comparison(
@@ -196,11 +208,16 @@ class TestEngineDeterministicGeneration(CustomTestCase):
             "Retract Mode",
         )
 
-        print(f"Baseline text: {baseline_text}")
-        print(f"Retract text: {retract_text}")
-
         # With temperature=0 and retract mode, output should be identical
         # because retract clears KV cache and re-prefills deterministically
+        if len(baseline_text) != len(retract_text):
+            print(f"\n{Colors.RED}=== Length Mismatch Detected ==={Colors.RESET}")
+            print(f"{Colors.YELLOW}Baseline ({len(baseline_text)} chars):{Colors.RESET}")
+            print(f"{Colors.CYAN}{baseline_text}{Colors.RESET}")
+            print(f"{Colors.YELLOW}Retract ({len(retract_text)} chars):{Colors.RESET}")
+            print(f"{Colors.CYAN}{retract_text}{Colors.RESET}")
+            print(f"{Colors.RED}================================{Colors.RESET}\n")
+
         self.assertEqual(
             len(baseline_text),
             len(retract_text),
@@ -230,7 +247,6 @@ class TestEngineDeterministicGeneration(CustomTestCase):
             self.test_prompt, self.max_new_tokens
         )
 
-
         # Print comparison: Re-generated vs Baseline
         print_comparison(
             "Single Request: Re-generated vs Baseline",
@@ -257,6 +273,14 @@ class TestEngineDeterministicGeneration(CustomTestCase):
             )
 
         # 3. Verify re-generated result matches baseline (deterministic)
+        if len(baseline_text) != len(regenerated_text):
+            print(f"\n{Colors.RED}=== Length Mismatch (Re-generated vs Baseline) ==={Colors.RESET}")
+            print(f"{Colors.YELLOW}Baseline ({len(baseline_text)} chars):{Colors.RESET}")
+            print(f"{Colors.CYAN}{baseline_text}{Colors.RESET}")
+            print(f"{Colors.YELLOW}Re-generated ({len(regenerated_text)} chars):{Colors.RESET}")
+            print(f"{Colors.CYAN}{regenerated_text}{Colors.RESET}")
+            print(f"{Colors.RED}================================================={Colors.RESET}\n")
+
         self.assertEqual(
             baseline_text,
             regenerated_text,
@@ -266,7 +290,9 @@ class TestEngineDeterministicGeneration(CustomTestCase):
         # Print summary
         print(f"\n{Colors.BOLD}{Colors.BLUE}=== Abort Mode Summary ==={Colors.RESET}")
         print(f"{Colors.YELLOW}Key Points:{Colors.RESET}")
-        print(f"  1. Abort terminates request: {Colors.GREEN}✓{Colors.RESET} (partial result shorter)")
+        print(
+            f"  1. Abort terminates request: {Colors.GREEN}✓{Colors.RESET} (partial result shorter)"
+        )
         print(f"  2. Partial is prefix of baseline: {Colors.GREEN}✓{Colors.RESET} (deterministic)")
         print(f"  3. Must RE-GENERATE after abort: {Colors.GREEN}✓{Colors.RESET} (cannot continue)")
         print(f"  4. Re-generated matches baseline: {Colors.GREEN}✓{Colors.RESET} (deterministic)")
@@ -318,6 +344,14 @@ class TestEngineDeterministicGeneration(CustomTestCase):
 
         # Verify all outputs match (deterministic with retract mode)
         for i in range(num_requests):
+            if len(baseline_texts[i]) != len(retract_texts[i]):
+                print(f"\n{Colors.RED}=== Request {i} Length Mismatch ==={Colors.RESET}")
+                print(f"{Colors.YELLOW}Baseline ({len(baseline_texts[i])} chars):{Colors.RESET}")
+                print(f"{Colors.CYAN}{baseline_texts[i]}{Colors.RESET}")
+                print(f"{Colors.YELLOW}Retract ({len(retract_texts[i])} chars):{Colors.RESET}")
+                print(f"{Colors.CYAN}{retract_texts[i]}{Colors.RESET}")
+                print(f"{Colors.RED}==================================={Colors.RESET}\n")
+
             self.assertEqual(
                 len(baseline_texts[i]),
                 len(retract_texts[i]),
@@ -407,6 +441,20 @@ class TestEngineDeterministicGeneration(CustomTestCase):
 
         # Verify re-generated results match baseline (deterministic)
         for i in range(num_requests):
+            if len(baseline_texts[i]) != len(regenerated_texts[i]):
+                print(
+                    f"\n{Colors.RED}=== Request {i} Re-generated Length Mismatch ==={Colors.RESET}"
+                )
+                print(f"{Colors.YELLOW}Baseline ({len(baseline_texts[i])} chars):{Colors.RESET}")
+                print(f"{Colors.CYAN}{baseline_texts[i]}{Colors.RESET}")
+                print(
+                    f"{Colors.YELLOW}Re-generated ({len(regenerated_texts[i])} chars):{Colors.RESET}"
+                )
+                print(f"{Colors.CYAN}{regenerated_texts[i]}{Colors.RESET}")
+                print(
+                    f"{Colors.RED}================================================{Colors.RESET}\n"
+                )
+
             self.assertEqual(
                 baseline_texts[i],
                 regenerated_texts[i],
@@ -416,24 +464,31 @@ class TestEngineDeterministicGeneration(CustomTestCase):
     def test_1_single_request_retract_vs_no_pause(self):
         """Test single request: retract mode vs no pause (length and tokens)."""
         self.engine.loop.run_until_complete(self._run_test_single_retract_vs_no_pause())
-        print_test_passed("TestEngineDeterministicGeneration.test_1_single_request_retract_vs_no_pause")
+        print_test_passed(
+            "TestEngineDeterministicGeneration.test_1_single_request_retract_vs_no_pause"
+        )
 
     def test_2_single_request_abort_vs_no_pause(self):
         """Test single request: abort mode vs no pause (length and tokens)."""
         self.engine.loop.run_until_complete(self._run_test_single_abort_vs_no_pause())
-        print_test_passed("TestEngineDeterministicGeneration.test_2_single_request_abort_vs_no_pause")
+        print_test_passed(
+            "TestEngineDeterministicGeneration.test_2_single_request_abort_vs_no_pause"
+        )
 
     def test_3_multiple_requests_retract_vs_no_pause(self):
         """Test multiple requests: retract mode vs no pause (length and tokens)."""
         self.engine.loop.run_until_complete(self._run_test_multiple_retract_vs_no_pause())
-        print_test_passed("TestEngineDeterministicGeneration.test_3_multiple_requests_retract_vs_no_pause")
+        print_test_passed(
+            "TestEngineDeterministicGeneration.test_3_multiple_requests_retract_vs_no_pause"
+        )
 
     def test_4_multiple_requests_abort_vs_no_pause(self):
         """Test multiple requests: abort mode vs no pause (length and tokens)."""
         self.engine.loop.run_until_complete(self._run_test_multiple_abort_vs_no_pause())
-        print_test_passed("TestEngineDeterministicGeneration.test_4_multiple_requests_abort_vs_no_pause")
+        print_test_passed(
+            "TestEngineDeterministicGeneration.test_4_multiple_requests_abort_vs_no_pause"
+        )
 
 
 if __name__ == "__main__":
     unittest.main()
-
