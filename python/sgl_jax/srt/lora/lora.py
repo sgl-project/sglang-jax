@@ -82,6 +82,8 @@ class LoRAAdapter(nnx.Module):
 
         weight_count = 0
         layer_weight_count = {}
+        skipped_layers = set()
+        num_layers = len(self.layers)
 
         for name, loaded_weight in loader._get_weights_iterator(
             DefaultModelLoader.Source(model_path, revision=revision, fall_back_to_pt=True)
@@ -89,6 +91,12 @@ class LoRAAdapter(nnx.Module):
             match = re.search(r"layers\.(\d+)\.", name)
             if match is not None:
                 layer_id = int(match.group(1))
+                # Skip layers that are out of range (when using --model-layer-nums)
+                if layer_id >= num_layers:
+                    if layer_id not in skipped_layers:
+                        skipped_layers.add(layer_id)
+                    continue
+
                 self.layers[layer_id].weights[name] = loaded_weight
                 layer_weight_count[layer_id] = layer_weight_count.get(layer_id, 0) + 1
                 weight_count += 1
@@ -104,6 +112,13 @@ class LoRAAdapter(nnx.Module):
             else:
                 self.weights[name] = loaded_weight
                 weight_count += 1
+
+        if skipped_layers:
+            logger.info(
+                "Skipped LoRA weights for layers %s (model only has %d layers)",
+                sorted(skipped_layers),
+                num_layers,
+            )
 
         logger.info(
             "LoRA weights loaded: total=%d weights, layer_distribution=%s",
