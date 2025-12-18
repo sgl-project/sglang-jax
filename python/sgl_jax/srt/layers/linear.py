@@ -69,7 +69,10 @@ class LinearBase(nnx.Module):
         else:
             self.bias = None
 
-    def __call__(self, x: jax.Array) -> tuple[jax.Array, jax.Array | None]:
+    def __call__(
+        self,
+        x: jax.Array,
+    ) -> tuple[jax.Array, jax.Array | None]:
         """Forward pass of the linear layer."""
         bias = self.bias if not self.skip_bias_add else None
         output_pspec = P(*([None] * (x.ndim - 1)), self.kernel_axes[-1])

@@ -280,6 +280,7 @@ suites = {
         TestFile("python/sgl_jax/test/mem_cache/test_swa_radix_cache.py", 0.2),
         TestFile("python/sgl_jax/test/speculative/test_eagle_tree_build.py", 1),
         TestFile("python/sgl_jax/test/speculative/test_eagle_utils.py", 1),
+        TestFile("test/srt/lora/test_bgmv_backend.py", 5),
     ],
     "unit-test-tpu-v6e-4": [
         TestFile("python/sgl_jax/test/test_mesh.py", 1),

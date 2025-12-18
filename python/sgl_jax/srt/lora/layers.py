@@ -23,13 +23,17 @@ from flax import nnx
 from jax.sharding import Mesh
 
 from sgl_jax.srt.layers.linear import LinearBase
+from sgl_jax.srt.lora.context_manager import LoraBatchContext
 from sgl_jax.srt.lora.utils import (
     get_lora_a_output_sharding,
     get_lora_b_output_sharding,
 )
+from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
 
 if TYPE_CHECKING:
     from sgl_jax.srt.lora.backend.base_backend import BaseLoRABackend
+
+global debug_count
 
 
 class BaseLayerWithLoRA(nnx.Module):
@@ -45,7 +49,7 @@ class BaseLayerWithLoRA(nnx.Module):
         if hasattr(self.base_layer, "weight"):
             self.weight = self.base_layer.weight
 
-    def __call__(self, x: jax.Array):
+    def __call__(self, x: jax.Array, forward_batch: ForwardBatch):
         return self.base_layer(x)
 
     def set_lora_info(self, *args):
@@ -103,19 +107,27 @@ class LoRALinear(BaseLayerWithLoRA):
             self.B_buffer = nnx.Param(B_buffer)
 
     def apply_lora(self, operands) -> jax.Array:
-        base_output, x = operands
+        base_output, x, scalings, token_indices = operands
         lora_a_output = self.lora_backend.run_lora_a_gemm(
-            x=x, weights=self.A_buffer, sharding=self.lora_a_output_sharding
+            x=x,
+            weights=self.A_buffer,
+            sharding=self.lora_a_output_sharding,
+            scalings=scalings,
+            token_indices=token_indices,
         )
         lora_output = self.lora_backend.run_lora_b_gemm(
             x=lora_a_output,
             weights=self.B_buffer,
             base_output=base_output,
             sharding=self.lora_b_output_sharding,
+            token_indices=token_indices,
         )
         return lora_output
 
-    def __call__(self, x: jax.Array) -> tuple[jax.Array, jax.Array | None]:
+    def __call__(
+        self,
+        x: jax.Array,
+    ) -> tuple[jax.Array, jax.Array | None]:
         """
         Forward pass with optional LoRA computation using backend.
 
@@ -125,12 +137,16 @@ class LoRALinear(BaseLayerWithLoRA):
         Returns:
             Output tensor with LoRA delta added (if enabled) and bias from base_model
         """
+        forward_batch = LoraBatchContext.get_batch()
+
         base_output, output_bias = self.base_layer(x)
 
         output = jax.lax.cond(
-            self.set_lora, self.apply_lora, lambda operands: operands[0], (base_output, x)
+            self.set_lora,
+            self.apply_lora,
+            lambda operands: operands[0],
+            (base_output, x, forward_batch.lora_scalings, forward_batch.lora_token_indices),
         )
-
         return output, output_bias
 
 
