@@ -150,6 +150,9 @@ class ServerArgs:
     # For sampling
     use_sort_for_toppk_minp: bool = False
 
+    # Multimodal
+    multimodal: bool = False
+
     def __post_init__(self):
         # Set missing default values
         if self.tokenizer_path is None:
@@ -877,8 +880,19 @@ class ServerArgs:
             help="Use jnp.sort to deal with top_k, top_p and min_p, which improves the grades for math-500 but increase precompile time a lot",
         )
 
+        parser.add_argument(
+            "--multimodal",
+            action="store_true",
+            help="Enable multimodal HTTP server.",
+        )
+
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace):
+        if cls is ServerArgs and getattr(args, "multimodal", False):
+            from sgl_jax.srt.multimodal.common.ServerArgs import MultimodalServerArgs
+
+            return MultimodalServerArgs.from_cli_args(args)
+
         args.tp_size = args.tensor_parallel_size
         args.dp_size = args.data_parallel_size
         attrs = [attr.name for attr in dataclasses.fields(cls)]

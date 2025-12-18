@@ -85,7 +85,15 @@ class Engine(EngineBase):
             if "log_level" not in kwargs:
                 # Do not print logs by default
                 kwargs["log_level"] = "error"
-            server_args = ServerArgs(**kwargs)
+
+            if kwargs.get("multimodal", False):
+                from sgl_jax.srt.multimodal.common.ServerArgs import (
+                    MultimodalServerArgs,
+                )
+
+                server_args = MultimodalServerArgs(**kwargs)
+            else:
+                server_args = ServerArgs(**kwargs)
 
         # Shutdown the subprocesses automatically when the program exits
         atexit.register(self.shutdown)

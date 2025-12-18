@@ -1,6 +1,6 @@
 import dataclasses
 
-from python.sgl_jax.srt.server_args import ServerArgs
+from sgl_jax.srt.server_args import ServerArgs
 
 
 @dataclasses.dataclass
