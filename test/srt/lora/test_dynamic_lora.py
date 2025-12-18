@@ -45,7 +45,7 @@ LORA_SETS = [
 DTYPES = ["bfloat16"]
 
 PROMPTS = [
-    "SGL is a",
+    "Chatgpt is a chat bot",
     "AI is a field of computer science focused on",
     "Computer science is the study of",
     "Write a short story.",
@@ -251,26 +251,65 @@ class TestLoRA(CustomTestCase):
             # Get HF reference data for this prompt
             hf_result = hf_data["results"][i]
 
-            # Compare decode logprobs (output_token_logprobs) only
-            if "meta_info" in sgl_output and "output_token_logprobs" in sgl_output["meta_info"]:
-                sgl_decode = sgl_output["meta_info"]["output_token_logprobs"]
+            # First, compare the output text
+            sgl_text = sgl_output.get("text", "")
+            hf_text = hf_result.get("output_str", "")
+
+            # Remove the prompt from sglang output if it's included
+            if sgl_text.startswith(prompt):
+                sgl_text = sgl_text[len(prompt) :]
+
+            print(f"  Text comparison:")
+            print(f"    SGL output: {sgl_text[:80]}...")
+            print(f"    HF output:  {hf_text[:80]}...")
+
+            if sgl_text.strip() == hf_text.strip():
+                print(f"    ✓ PASS: Output text matches exactly")
+            else:
+                print(f"    WARNING: Output text differs from HF")
+                print(f"    SGL full: {sgl_text}")
+                print(f"    HF full:  {hf_text}")
+
+            # Compare decode logprobs (output_top_logprobs) only
+            if "meta_info" in sgl_output and "output_top_logprobs" in sgl_output["meta_info"]:
+                import numpy as np
+
+                sgl_decode_raw = sgl_output["meta_info"]["output_top_logprobs"]
                 hf_decode = hf_result["decode_logprobs"]
 
-                print(f"  Decode logprobs comparison:")
-                print(f"    SGL shape: {len(sgl_decode)}")
-                print(f"    HF shape:  {hf_result['decode_shape']}")
+                # Convert sglang-jax output_top_logprobs to numpy array
+                # Format: [[(logprob, token_id, token_text), ...], ...] -> [[logprob, ...], ...]
+                sgl_decode_vals = []
+                for pos_logprobs in sgl_decode_raw:
+                    if pos_logprobs is not None:
+                        # Extract logprob values in order
+                        vals = [float(logprob) for logprob, _, _ in pos_logprobs]
+                        sgl_decode_vals.append(vals)
+                    else:
+                        # Handle None values (shouldn't happen normally)
+                        sgl_decode_vals.append([0.0] * 5)  # Assume top-5
 
-                # Compare logprobs values
-                for j, (sgl_lp, hf_lp) in enumerate(zip(sgl_decode, hf_decode)):
-                    if sgl_lp is not None and hf_lp is not None:
-                        for token_id, sgl_prob in sgl_lp.items():
-                            if str(token_id) in hf_lp:
-                                hf_prob = hf_lp[str(token_id)]
-                                diff = abs(sgl_prob - hf_prob)
-                                if diff > 0.01:  # tolerance
-                                    print(
-                                        f"      Warning: Large diff at position {j}, token {token_id}: {diff}"
-                                    )
+                # Convert to numpy arrays for comparison
+                sgl_tensor = np.array(sgl_decode_vals)
+                hf_tensor = np.array(hf_decode)
+
+                # Calculate differences (similar to original sglang)
+                diff = np.abs(sgl_tensor - hf_tensor)
+                max_diff = np.max(diff)
+                mean_diff = np.mean(diff)
+
+                print(f"  Decode logprobs comparison:")
+                print(f"    SGL shape:  {sgl_tensor.shape}")
+                print(f"    HF shape:   {hf_tensor.shape}")
+                print(f"    Max diff:   {max_diff:.6e}")
+                print(f"    Mean diff:  {mean_diff:.6e}")
+
+                # Check threshold
+                threshold = 0.01
+                if max_diff > threshold:
+                    print(f"    WARNING: Max diff {max_diff:.6e} exceeds threshold {threshold:.0e}")
+                else:
+                    print(f"    ✓ PASS: Max diff within threshold {threshold:.0e}")
 
         print("\n✓ Logprobs comparison completed")
 

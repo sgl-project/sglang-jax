@@ -48,7 +48,7 @@ from misc.hf_runner import HFRunner
 
 # Default configuration
 DEFAULT_TEST_PROMPTS = [
-    "SGL is a",
+    "Chatgpt is a chat bot",
     "AI is a field of computer science focused on",
     "Computer science is the study of",
     "Write a short story.",
