@@ -13,6 +13,7 @@ from sgl_jax.srt.layers.linear import LinearBase
 from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
 from sgl_jax.srt.layers.moe import EPMoE, GateLogit, TopK
 from sgl_jax.srt.layers.radix_attention import RadixAttention
+from sgl_jax.srt.lora.context_manager import LoraBatchContext
 from sgl_jax.srt.mem_cache.memory_pool import KVCache
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
 from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
@@ -395,15 +396,16 @@ class BailingMoEModel(nnx.Module):
         hidden_states = self.embed_tokens(forward_batch.input_ids)
         residual = None
         layers_kv_fused = []
-        for layer in self.layers:
-            hidden_states, residual, kv_fused = layer(
-                forward_batch.positions,
-                hidden_states,
-                forward_batch,
-                token_to_kv_pool,
-                residual,
-            )
-            layers_kv_fused.append(kv_fused)
+        with LoraBatchContext.set_batch(forward_batch):
+            for layer in self.layers:
+                hidden_states, residual, kv_fused = layer(
+                    forward_batch.positions,
+                    hidden_states,
+                    forward_batch,
+                    token_to_kv_pool,
+                    residual,
+                )
+                layers_kv_fused.append(kv_fused)
 
         if residual is not None:
             hidden_states += residual

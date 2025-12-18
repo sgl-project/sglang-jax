@@ -1,11 +1,10 @@
-import threading
 import contextlib
-from typing import Optional
-
+import threading
 
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
 
 _lora_context = threading.local()
+
 
 class LoraBatchContext:
     @staticmethod
@@ -18,5 +17,5 @@ class LoraBatchContext:
             _lora_context.batch = None
 
     @staticmethod
-    def get_batch() -> Optional[ForwardBatch]:
+    def get_batch() -> ForwardBatch | None:
         return getattr(_lora_context, "batch", None)

@@ -396,9 +396,9 @@ class ModelWorker:
 
     def prepare_lora_batch(self, model_worker_batch: ModelWorkerBatch):
         self.model_runner.lora_manager.prepare_lora_batch(model_worker_batch)
-        # if self.model_runner.lora_manager.has_new_weights:
-        _, model_state = nnx.split(self.model_runner.model)
-        self.model_runner.model_state_leaves, _ = jax.tree_util.tree_flatten(model_state)
+        if self.model_runner.lora_manager.has_new_weights:
+            _, model_state = nnx.split(self.model_runner.model)
+            self.model_runner.model_state_leaves, _ = jax.tree_util.tree_flatten(model_state)
 
     def get_worker_info(self):
         return (
@@ -464,15 +464,15 @@ class ModelWorker:
         sampling_metadata: SamplingMetadata = None,
         forward_metadata=None,
     ) -> tuple[LogitsProcessorOutput | jax.Array | int, jax.Array | None]:
+        # Prepare LoRA batch if LoRA is enabled
+        if self.worker.server_args.enable_lora and self.need_prepare_lora_batch:
+            self.prepare_lora_batch(model_worker_batch)
+
         # Use pre-initialized ForwardBatch if available (for overlap scheduling optimization)
         if model_worker_batch.forward_batch is not None:
             forward_batch = model_worker_batch.forward_batch
         else:
             forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
-
-        # Prepare LoRA batch if LoRA is enabled
-        if self.worker.server_args.enable_lora and self.need_prepare_lora_batch:
-            self.prepare_lora_batch(model_worker_batch)
 
         if forward_metadata is None:
             forward_metadata = self.worker.model_runner.attn_backend.get_forward_metadata(

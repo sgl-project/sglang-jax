@@ -26,6 +26,7 @@ from sgl_jax.srt.layers.logits_processor import (
 )
 from sgl_jax.srt.layers.moe import EPMoE
 from sgl_jax.srt.layers.radix_attention import RadixAttention
+from sgl_jax.srt.lora.context_manager import LoraBatchContext
 from sgl_jax.srt.mem_cache.memory_pool import KVCache
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
 from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
@@ -667,16 +668,17 @@ class Grok1Model(nnx.Module):
         # Process through transformer layers with deferred normalization
         residual, deferred_norm = None, None
         layers_kv_fused = []
-        for layer in self.layers:
-            hidden_states, residual, deferred_norm, kv_fused = layer(
-                positions,
-                hidden_states,
-                forward_batch,
-                token_to_kv_pool,
-                residual,
-                deferred_norm,
-            )
-            layers_kv_fused.append(kv_fused)
+        with LoraBatchContext.set_batch(forward_batch):
+            for layer in self.layers:
+                hidden_states, residual, deferred_norm, kv_fused = layer(
+                    positions,
+                    hidden_states,
+                    forward_batch,
+                    token_to_kv_pool,
+                    residual,
+                    deferred_norm,
+                )
+                layers_kv_fused.append(kv_fused)
         # Apply final normalization (matching PyTorch fused_dual_residual_rmsnorm)
         assert deferred_norm is not None
         assert residual is not None
