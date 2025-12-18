@@ -15,6 +15,7 @@ from jax.sharding import NamedSharding, PartitionSpec
 from sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch
 from sgl_jax.srt.managers.tp_worker import ModelWorker
 from sgl_jax.srt.managers.utils import resolve_future_token_ids, set_future_token_ids
+from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
 from sgl_jax.srt.sampling.sampling_batch_info import SamplingMetadata
 from sgl_jax.srt.server_args import ServerArgs
 from sgl_jax.utils import get_exception_traceback
@@ -176,6 +177,10 @@ class ModelWorkerClient:
         # Prepare LoRA batch if LoRA is enabled
         if self.worker.server_args.enable_lora:
             self.worker.prepare_lora_batch(model_worker_batch)
+
+        model_worker_batch.forward_batch = ForwardBatch.init_new(
+            model_worker_batch, self.worker.get_model_runner()
+        )
 
         # Push a new batch to the queue (JAX handles synchronization automatically)
         self.input_queue.put(

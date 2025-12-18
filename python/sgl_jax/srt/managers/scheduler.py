@@ -1199,12 +1199,6 @@ class Scheduler(
             )
 
             if self.enable_overlap:
-                # Pre-initialize ForwardBatch for overlap scheduling optimization
-                from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
-
-                model_worker_batch.forward_batch = ForwardBatch.init_new(
-                    model_worker_batch, self.tp_worker.get_model_runner()
-                )
                 with jax.profiler.TraceAnnotation(
                     f"forward_batch_generation_overlap {self.forward_ct}"
                 ):

@@ -12,9 +12,18 @@ from typing import Dict, List, Tuple
 import jax
 import jax.numpy as jnp
 import numpy as np
+from jax.sharding import NamedSharding, PartitionSpec
 
 from sgl_jax.srt.lora.backend.bgmv_backend import BgmvLoRABackend
+from sgl_jax.srt.lora.utils import (
+    get_lora_a_output_sharding,
+    get_lora_b_output_sharding,
+)
+from sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sgl_jax.srt.sampling.sampling_batch_info import SamplingBatchInfo
+from sgl_jax.srt.utils.jax_utils import device_array
+from sgl_jax.srt.utils.mesh_utils import create_device_mesh
 from sgl_jax.test.test_utils import CustomTestCase
 
 
@@ -251,6 +260,26 @@ class TestBgmvLoRABackend(CustomTestCase):
         self.qkv_output_slices = (256, 128, 128)
         self.gate_up_output_dim = 512
 
+        self.mesh = create_device_mesh(
+            ici_parallelism=[1, 1],
+            dcn_parallelism=[1, 1],
+        )
+
+    def get_lora_batch_info_on_device(self, batch: ModelWorkerBatch):
+        (
+            lora_scalings,
+            lora_token_indices,
+        ) = device_array(
+            (
+                batch.lora_scalings,
+                batch.lora_token_indices,
+            ),
+            sharding=(
+                NamedSharding(self.mesh, PartitionSpec()) if jax.process_count() == 1 else None
+            ),
+        )
+        return lora_scalings, lora_token_indices
+
     def generate_sequence_lengths(
         self, batch_size: int, batch_mode: BatchMode, max_len: int = None
     ) -> List[int]:
@@ -315,20 +344,35 @@ class TestBgmvLoRABackend(CustomTestCase):
 
         return lora_a, lora_b
 
-    def create_forward_batch(self, seq_lengths: List[int], batch_mode: BatchMode) -> ForwardBatch:
+    def create_model_worker_batch(
+        self, x: np.ndarray, seq_lengths: List[int], batch_mode: BatchMode
+    ) -> ModelWorkerBatch:
         """Create a ForwardBatch for testing."""
         batch_size = len(seq_lengths)
         total_tokens = sum(seq_lengths)
         forward_mode = ForwardMode.EXTEND if batch_mode == BatchMode.PREFILL else ForwardMode.DECODE
 
-        return ForwardBatch(
+        return ModelWorkerBatch(
             bid=0,
             forward_mode=forward_mode,
-            batch_size=batch_size,
-            input_ids=jnp.arange(total_tokens, dtype=jnp.int32),
-            req_pool_indices=jnp.arange(batch_size, dtype=jnp.int32),
-            seq_lens=jnp.array(seq_lengths, dtype=jnp.int32),
-            out_cache_loc=jnp.arange(total_tokens, dtype=jnp.int32),
+            input_ids=np.arange(total_tokens, dtype=jnp.int32),
+            real_input_ids_len=total_tokens,
+            seq_lens=np.array(seq_lengths, dtype=jnp.int32),
+            out_cache_loc=np.arange(total_tokens, dtype=jnp.int32),
+            req_pool_indices=np.arange(batch_size, dtype=jnp.int32),
+            sampling_info=SamplingBatchInfo.generate_for_precompile(batch_size, 32000),
+            positions=None,
+            extend_start_loc=None,
+            cache_loc=None,
+            return_logprob=False,
+            return_output_logprob_only=False,
+            top_logprobs_nums=1,
+            token_ids_logprobs=None,
+            extend_seq_lens=np.array(seq_lengths, dtype=np.int32),
+            extend_prefix_lens=None,
+            extend_logprob_start_lens=None,
+            extend_input_logprob_token_ids=None,
+            real_bs=batch_size,
         )
 
     def stack_lora_weights(
@@ -383,7 +427,7 @@ class TestBgmvLoRABackend(CustomTestCase):
             raise ValueError(f"Unknown batch composition: {batch_composition}")
 
         total_seq_len = sum(seq_lengths)
-        x = jnp.array(
+        x = np.array(
             np.random.randn(total_seq_len, self.input_dim) * 0.01,
             dtype=self.dtype,
         )
@@ -392,27 +436,44 @@ class TestBgmvLoRABackend(CustomTestCase):
             name if name is not None else "_NO_LORA_" for name in lora_assignments
         ]
         unique_loras = sorted(set(normalized_assignments))
-        lora_name_to_idx = {name: idx for idx, name in enumerate(unique_loras)}
+
+        weight_indices = [0] * len(normalized_assignments)
+        lora_ranks = [0] * len(self.lora_configs)
+        scalings = [0] * len(self.lora_configs)
+        lora_name_to_idx = {}
+
+        # no_lora_count=1
+
+        for i, lora_name in enumerate(unique_loras):
+            # if lora_name == "_NO_LORA_":
+            lora_name_to_idx[lora_name] = i
+            # else:
+            #    lora_name_to_idx[lora_name] = no_lora_count
+            #    no_lora_count+=1
+
+        for i, lora_name in enumerate(normalized_assignments):
+            weight_indices[i] = lora_name_to_idx[lora_name]
+            lora_ranks[weight_indices[i]] = self.lora_configs[lora_name][0]
+            scalings[weight_indices[i]] = 1.0
+
+        scalings_seq = [1.0 for _ in normalized_assignments]
 
         weights = {}
         for lora_name in unique_loras:
             weights[lora_name] = self.create_lora_weights(lora_name, num_slices, include_missing_k)
 
-        weight_indices = [lora_name_to_idx[name] for name in normalized_assignments]
-        lora_ranks = [self.lora_configs[name][0] for name in normalized_assignments]
-        scalings = [1.0 for _ in normalized_assignments]
-
-        forward_batch = self.create_forward_batch(seq_lengths, batch_mode)
+        model_worker_batch = self.create_model_worker_batch(x, seq_lengths, batch_mode)
 
         return (
-            x,
+            jnp.array(x),
             weights,
-            forward_batch,
+            model_worker_batch,
             seq_lengths,
             normalized_assignments,
             weight_indices,
             lora_ranks,
             scalings,
+            scalings_seq,
         )
 
     # === Test run_lora_a_gemm and run_lora_b_gemm ===
@@ -430,17 +491,21 @@ class TestBgmvLoRABackend(CustomTestCase):
                 (
                     x,
                     weights,
-                    forward_batch,
+                    model_worker_batch,
                     seq_lengths,
                     lora_assignments,
                     weight_indices,
                     lora_ranks,
                     scalings,
+                    scalings_seq,
                 ) = self.create_test_batch(composition, batch_size, mode, num_slices=1)
 
                 max_rank = max(self.lora_configs[name][0] for name in weights.keys())
                 backend = BgmvLoRABackend(max_loras_per_batch=len(weights), max_lora_rank=max_rank)
-                backend.prepare_lora_batch(forward_batch, weight_indices, lora_ranks, scalings)
+                backend.prepare_lora_batch(model_worker_batch, weight_indices, lora_ranks, scalings)
+                lora_scalings_device, lora_token_indces_device = self.get_lora_batch_info_on_device(
+                    model_worker_batch
+                )
 
                 # Stack weights
                 lora_a_weights = [weights[name][0] for name in sorted(weights.keys())]
@@ -453,10 +518,24 @@ class TestBgmvLoRABackend(CustomTestCase):
                     lora_b_weights, is_lora_a=False, max_rank=max_rank
                 )
 
+                lora_a_output_sharding = get_lora_a_output_sharding("q_proj", self.mesh)
+                lora_b_output_sharding = get_lora_b_output_sharding("q_proj", self.mesh)
+
                 # Test run_lora_a_gemm
-                backend_a_output = backend.run_lora_a_gemm(x, stacked_lora_a)
+                backend_a_output = backend.run_lora_a_gemm(
+                    x,
+                    stacked_lora_a,
+                    lora_a_output_sharding,
+                    lora_scalings_device,
+                    lora_token_indces_device,
+                )
                 reference_a_output = reference_lora_a_gemm(
-                    x, stacked_lora_a, seq_lengths, lora_assignments, self.lora_configs, scalings
+                    x,
+                    stacked_lora_a,
+                    seq_lengths,
+                    lora_assignments,
+                    self.lora_configs,
+                    scalings_seq,
                 )
 
                 # Compare only valid portions for shrink
@@ -484,7 +563,11 @@ class TestBgmvLoRABackend(CustomTestCase):
                 # Test run_lora_b_gemm
                 base_output = jnp.ones((x.shape[0], self.input_dim), dtype=self.dtype)
                 backend_b_output = backend.run_lora_b_gemm(
-                    reference_a_output, stacked_lora_b, base_output
+                    reference_a_output,
+                    stacked_lora_b,
+                    base_output,
+                    lora_b_output_sharding,
+                    lora_token_indces_device,
                 )
                 reference_b_output = reference_lora_b_gemm(
                     reference_a_output,
@@ -519,17 +602,21 @@ class TestBgmvLoRABackend(CustomTestCase):
                 (
                     x,
                     weights,
-                    forward_batch,
+                    model_worker_batch,
                     seq_lengths,
                     lora_assignments,
                     weight_indices,
                     lora_ranks,
                     scalings,
+                    scalings_seq,
                 ) = self.create_test_batch(composition, batch_size, mode, num_slices=3)
 
                 max_rank = max(self.lora_configs[name][0] for name in weights.keys())
                 backend = BgmvLoRABackend(max_loras_per_batch=len(weights), max_lora_rank=max_rank)
-                backend.prepare_lora_batch(forward_batch, weight_indices, lora_ranks, scalings)
+                backend.prepare_lora_batch(model_worker_batch, weight_indices, lora_ranks, scalings)
+                lora_scalings_device, lora_token_indces_device = self.get_lora_batch_info_on_device(
+                    model_worker_batch
+                )
 
                 # Stack weights
                 qkv_lora_a_weights = [weights[name][0] for name in sorted(weights.keys())]
@@ -544,9 +631,20 @@ class TestBgmvLoRABackend(CustomTestCase):
 
                 base_output = jnp.ones((x.shape[0], sum(self.qkv_output_slices)), dtype=self.dtype)
 
+                lora_a_output_sharding = get_lora_a_output_sharding("qkv_proj", self.mesh)
+                lora_b_output_sharding = get_lora_b_output_sharding("qkv_proj", self.mesh)
+
                 # Test run_qkv_lora
                 backend_output = backend.run_qkv_lora(
-                    x, stacked_qkv_lora_a, stacked_qkv_lora_b, self.qkv_output_slices, base_output
+                    x,
+                    stacked_qkv_lora_a,
+                    stacked_qkv_lora_b,
+                    self.qkv_output_slices,
+                    base_output,
+                    lora_a_output_sharding,
+                    lora_b_output_sharding,
+                    lora_scalings_device,
+                    lora_token_indces_device,
                 )
                 reference_output = reference_qkv_lora(
                     x,
@@ -555,7 +653,7 @@ class TestBgmvLoRABackend(CustomTestCase):
                     seq_lengths,
                     lora_assignments,
                     self.lora_configs,
-                    scalings,
+                    scalings_seq,
                     self.qkv_output_slices,
                     base_output,
                 )
@@ -584,17 +682,21 @@ class TestBgmvLoRABackend(CustomTestCase):
                 (
                     x,
                     weights,
-                    forward_batch,
+                    model_worker_batch,
                     seq_lengths,
                     lora_assignments,
                     weight_indices,
                     lora_ranks,
                     scalings,
+                    scalings_seq,
                 ) = self.create_test_batch(composition, batch_size, mode, num_slices=2)
 
                 max_rank = max(self.lora_configs[name][0] for name in weights.keys())
                 backend = BgmvLoRABackend(max_loras_per_batch=len(weights), max_lora_rank=max_rank)
-                backend.prepare_lora_batch(forward_batch, weight_indices, lora_ranks, scalings)
+                backend.prepare_lora_batch(model_worker_batch, weight_indices, lora_ranks, scalings)
+                lora_scalings_device, lora_token_indces_device = self.get_lora_batch_info_on_device(
+                    model_worker_batch
+                )
 
                 # Stack weights
                 gate_up_lora_a_weights = [weights[name][0] for name in sorted(weights.keys())]
@@ -609,9 +711,19 @@ class TestBgmvLoRABackend(CustomTestCase):
 
                 base_output = jnp.ones((x.shape[0], 2 * self.gate_up_output_dim), dtype=self.dtype)
 
+                lora_a_output_sharding = get_lora_a_output_sharding("gate_up", self.mesh)
+                lora_b_output_sharding = get_lora_b_output_sharding("gate_up", self.mesh)
+
                 # Test run_gate_up_lora
                 backend_output = backend.run_gate_up_lora(
-                    x, stacked_gate_up_lora_a, stacked_gate_up_lora_b, base_output
+                    x,
+                    stacked_gate_up_lora_a,
+                    stacked_gate_up_lora_b,
+                    base_output,
+                    lora_a_output_sharding,
+                    lora_b_output_sharding,
+                    lora_scalings_device,
+                    lora_token_indces_device,
                 )
                 reference_output = reference_gate_up_lora(
                     x,
@@ -620,7 +732,7 @@ class TestBgmvLoRABackend(CustomTestCase):
                     seq_lengths,
                     lora_assignments,
                     self.lora_configs,
-                    scalings,
+                    scalings_seq,
                     self.gate_up_output_dim,
                     base_output,
                 )
@@ -649,19 +761,23 @@ class TestBgmvLoRABackend(CustomTestCase):
                 (
                     x,
                     weights,
-                    forward_batch,
+                    model_worker_batch,
                     seq_lengths,
                     lora_assignments,
                     weight_indices,
                     lora_ranks,
                     scalings,
+                    scalings_seq,
                 ) = self.create_test_batch(
                     composition, batch_size, mode, num_slices=3, include_missing_k=True
                 )
 
                 max_rank = max(self.lora_configs[name][0] for name in weights.keys())
                 backend = BgmvLoRABackend(max_loras_per_batch=len(weights), max_lora_rank=max_rank)
-                backend.prepare_lora_batch(forward_batch, weight_indices, lora_ranks, scalings)
+                backend.prepare_lora_batch(model_worker_batch, weight_indices, lora_ranks, scalings)
+                lora_scalings_device, lora_token_indces_device = self.get_lora_batch_info_on_device(
+                    model_worker_batch
+                )
 
                 # Stack weights
                 qkv_lora_a_weights = [weights[name][0] for name in sorted(weights.keys())]
@@ -676,9 +792,20 @@ class TestBgmvLoRABackend(CustomTestCase):
 
                 base_output = jnp.ones((x.shape[0], sum(self.qkv_output_slices)), dtype=self.dtype)
 
+                lora_a_output_sharding = get_lora_a_output_sharding("qkv_proj", self.mesh)
+                lora_b_output_sharding = get_lora_b_output_sharding("qkv_proj", self.mesh)
+
                 # Test run_qkv_lora with missing k_proj
                 backend_output = backend.run_qkv_lora(
-                    x, stacked_qkv_lora_a, stacked_qkv_lora_b, self.qkv_output_slices, base_output
+                    x,
+                    stacked_qkv_lora_a,
+                    stacked_qkv_lora_b,
+                    self.qkv_output_slices,
+                    base_output,
+                    lora_a_output_sharding,
+                    lora_b_output_sharding,
+                    lora_scalings_device,
+                    lora_token_indces_device,
                 )
                 reference_output = reference_qkv_lora(
                     x,
@@ -687,7 +814,7 @@ class TestBgmvLoRABackend(CustomTestCase):
                     seq_lengths,
                     lora_assignments,
                     self.lora_configs,
-                    scalings,
+                    scalings_seq,
                     self.qkv_output_slices,
                     base_output,
                 )

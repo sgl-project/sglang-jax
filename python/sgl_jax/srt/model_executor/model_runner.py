@@ -16,6 +16,7 @@ from sgl_jax.srt.configs.load_config import LoadConfig
 from sgl_jax.srt.configs.model_config import AttentionArch, MockModelConfig, ModelConfig
 from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessorOutput
 from sgl_jax.srt.layers.sampler import Sampler, compute_logprobs
+from sgl_jax.srt.lora.context_manager import LoraBatchContext
 from sgl_jax.srt.managers.schedule_batch import (
     GLOBAL_SERVER_ARGS_KEYS,
     global_server_args_dict,
@@ -181,7 +182,8 @@ class ModelRunner:
         ):
             model_state = jax.tree_util.tree_unflatten(model_state_def, model_state_leaves)
             model = nnx.merge(model_def, model_state)
-            return model(forward_batch, token_to_kv_pool, logits_metadata)
+            with LoraBatchContext.set_batch(forward_batch):
+                return model(forward_batch, token_to_kv_pool, logits_metadata)
 
         @partial(jax.jit, static_argnames=["sampler_state_def", "use_sort_for_toppk_minp"])
         def jitted_sampler(
