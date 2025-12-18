@@ -1,7 +1,7 @@
 import asyncio
 import time
 import unittest
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 
 import requests
 
@@ -155,26 +155,39 @@ class TestEngineDeterministicGeneration(CustomTestCase):
         result = await task
         return result.get("text", "")
 
-    async def _run_generation_with_abort(self, prompt: str, max_new_tokens: int, pause_delay: float = 1.0):
-        """Run generation with abort mode pause."""
+    async def _run_generation_with_abort_and_regenerate(self, prompt: str, max_new_tokens: int, pause_delay: float = 1.0):
+        """
+        Run generation with abort mode, then re-generate.
+
+        Abort mode:
+        - Terminates ALL requests completely
+        - Returns partial result (whatever was generated before abort)
+        - Cannot continue aborted requests
+        - Must re-generate from scratch to get full result
+        """
         task = asyncio.create_task(self._async_generate(prompt, max_new_tokens))
 
-        # Wait for generation to start
+        # Wait for generation to start and produce some tokens
         await asyncio.sleep(pause_delay)
 
-        # Pause with abort mode
+        # Abort all requests - they will be terminated
         await self._async_pause_generation(mode="abort")
         await asyncio.sleep(0.5)
 
-        # Continue generation to reset state
+        # Reset is_paused flag (does NOT restore aborted requests)
         await self._async_continue_generation()
 
-        # Wait for task to complete (should be aborted)
+        # Get partial result from aborted request
         try:
-            result = await task
-            return result.get("text", "")
+            aborted_result = await task
+            partial_text = aborted_result.get("text", "")
         except Exception:
-            return ""
+            partial_text = ""
+
+        # Re-generate from scratch to get full result
+        regenerated_text = await self._run_generation_no_pause(prompt, max_new_tokens)
+
+        return partial_text, regenerated_text
 
     # ============ Single Request Tests ============
 
@@ -210,40 +223,71 @@ class TestEngineDeterministicGeneration(CustomTestCase):
         )
 
     async def _run_test_single_abort_vs_no_pause(self):
-        """Test single request: abort mode vs no pause."""
-        # Run baseline (no pause)
+        """
+        Test single request: abort mode vs no pause.
+
+        Demonstrates:
+        1. Abort terminates request and returns partial result
+        2. After abort, must re-generate (not continue) to get full result
+        3. Re-generated result matches baseline (deterministic with temperature=0)
+        """
+        # Run baseline (no pause) - full generation
         baseline_text = await self._run_generation_no_pause(self.test_prompt, self.max_new_tokens)
 
-        # Run with abort mode
-        abort_text = await self._run_generation_with_abort(self.test_prompt, self.max_new_tokens)
+        # Run with abort, then re-generate
+        partial_text, regenerated_text = await self._run_generation_with_abort_and_regenerate(
+            self.test_prompt, self.max_new_tokens
+        )
 
-        # Print comparison
+        # Print comparison: Partial (aborted) vs Baseline
         print_comparison(
-            "Single Request: Abort vs No Pause",
+            "Single Request: Aborted (Partial) vs Baseline",
             baseline_text,
-            abort_text,
+            partial_text,
             "No Pause (Baseline)",
-            "Abort Mode",
+            "Aborted (Partial Result)",
         )
 
-        # Abort mode should produce shorter output (aborted mid-generation)
+        # Print comparison: Re-generated vs Baseline
+        print_comparison(
+            "Single Request: Re-generated vs Baseline",
+            baseline_text,
+            regenerated_text,
+            "No Pause (Baseline)",
+            "Re-generated After Abort",
+        )
+
+        # 1. Verify abort produces shorter output (partial result)
         self.assertLess(
-            len(abort_text),
+            len(partial_text),
             len(baseline_text),
-            f"Abort mode should produce shorter output. "
-            f"Baseline: {len(baseline_text)}, Abort: {len(abort_text)}",
+            f"Aborted request should produce shorter output. "
+            f"Baseline: {len(baseline_text)}, Partial: {len(partial_text)}",
         )
 
-        # The abort text should be a prefix of baseline (up to the abort point)
-        # This may not always be exact due to timing, but abort should be shorter
-        baseline_words = baseline_text.split()
-        abort_words = abort_text.split()
-        self.assertLess(
-            len(abort_words),
-            len(baseline_words),
-            f"Abort mode should produce fewer words. "
-            f"Baseline: {len(baseline_words)}, Abort: {len(abort_words)}",
+        # 2. Verify partial text is a prefix of baseline (deterministic)
+        if partial_text:
+            self.assertTrue(
+                baseline_text.startswith(partial_text),
+                f"Partial text should be a prefix of baseline (deterministic). "
+                f"Partial: '{partial_text[:50]}...', Baseline starts: '{baseline_text[:50]}...'",
+            )
+
+        # 3. Verify re-generated result matches baseline (deterministic)
+        self.assertEqual(
+            baseline_text,
+            regenerated_text,
+            "Re-generated result should match baseline (deterministic with temperature=0)",
         )
+
+        # Print summary
+        print(f"\n{Colors.BOLD}{Colors.BLUE}=== Abort Mode Summary ==={Colors.RESET}")
+        print(f"{Colors.YELLOW}Key Points:{Colors.RESET}")
+        print(f"  1. Abort terminates request: {Colors.GREEN}✓{Colors.RESET} (partial result shorter)")
+        print(f"  2. Partial is prefix of baseline: {Colors.GREEN}✓{Colors.RESET} (deterministic)")
+        print(f"  3. Must RE-GENERATE after abort: {Colors.GREEN}✓{Colors.RESET} (cannot continue)")
+        print(f"  4. Re-generated matches baseline: {Colors.GREEN}✓{Colors.RESET} (deterministic)")
+        print(f"{Colors.BOLD}{Colors.BLUE}=========================={Colors.RESET}\n")
 
     # ============ Multiple Requests Tests ============
 
@@ -308,70 +352,108 @@ class TestEngineDeterministicGeneration(CustomTestCase):
             )
 
     async def _run_test_multiple_abort_vs_no_pause(self):
-        """Test multiple requests: abort mode vs no pause."""
+        """
+        Test multiple requests: abort mode vs no pause.
+
+        Demonstrates:
+        1. Abort terminates ALL requests and returns partial results
+        2. After abort, must re-generate (not continue) to get full results
+        3. Re-generated results match baseline (deterministic with temperature=0)
+        """
         num_requests = 4
         prompts = [f"{self.test_prompt} Story {i}:" for i in range(num_requests)]
 
-        # Run baseline (no pause) - run sequentially
+        # Run baseline (no pause) - full generation, run sequentially
         baseline_texts = []
         for prompt in prompts:
             text = await self._run_generation_no_pause(prompt, self.max_new_tokens)
             baseline_texts.append(text)
 
-        # Run with abort mode - all concurrent with abort in the middle
+        # Run with abort mode - all concurrent, will be terminated
         tasks = [
             asyncio.create_task(self._async_generate(prompt, self.max_new_tokens))
             for prompt in prompts
         ]
 
-        # Wait for generation to start
+        # Wait for generation to start and produce some tokens
         await asyncio.sleep(1.5)
 
-        # Pause with abort mode
+        # Abort ALL requests - they will be terminated
         await self._async_pause_generation(mode="abort")
         await asyncio.sleep(0.5)
 
-        # Continue to reset state
+        # Reset is_paused flag (does NOT restore aborted requests)
         await self._async_continue_generation()
 
-        # Wait for all tasks
+        # Get partial results from aborted requests
         results = await asyncio.gather(*tasks, return_exceptions=True)
-        abort_texts = []
+        partial_texts = []
         for r in results:
             if isinstance(r, dict):
-                abort_texts.append(r.get("text", ""))
+                partial_texts.append(r.get("text", ""))
             else:
-                abort_texts.append("")
+                partial_texts.append("")
+
+        # Re-generate ALL requests from scratch to get full results
+        regenerated_texts = []
+        for prompt in prompts:
+            text = await self._run_generation_no_pause(prompt, self.max_new_tokens)
+            regenerated_texts.append(text)
 
         # Print comparison for first request
         print_comparison(
-            "Multiple Requests: Abort vs No Pause (Request 0)",
+            "Multiple Requests: Aborted (Partial) vs Baseline (Request 0)",
             baseline_texts[0],
-            abort_texts[0],
+            partial_texts[0],
             "No Pause (Baseline)",
-            "Abort Mode",
+            "Aborted (Partial Result)",
+        )
+
+        print_comparison(
+            "Multiple Requests: Re-generated vs Baseline (Request 0)",
+            baseline_texts[0],
+            regenerated_texts[0],
+            "No Pause (Baseline)",
+            "Re-generated After Abort",
         )
 
         # Summary comparison
         print(f"\n{Colors.BOLD}{Colors.BLUE}=== Multiple Requests Abort Summary ==={Colors.RESET}")
+        print(f"{Colors.YELLOW}Note: After abort, must RE-GENERATE (cannot continue){Colors.RESET}")
+        print(f"\n{Colors.CYAN}Partial Results (Aborted):{Colors.RESET}")
         for i in range(num_requests):
             len_baseline = len(baseline_texts[i])
-            len_abort = len(abort_texts[i])
-            shorter = len_abort < len_baseline
+            len_partial = len(partial_texts[i])
+            shorter = len_partial < len_baseline
             print(
-                f"  Request {i}: Baseline={Colors.GREEN}{len_baseline}{Colors.RESET} chars, "
-                f"Abort={Colors.GREEN}{len_abort}{Colors.RESET} chars, "
+                f"  Request {i}: Baseline={Colors.GREEN}{len_baseline}{Colors.RESET}, "
+                f"Partial={Colors.GREEN}{len_partial}{Colors.RESET}, "
                 f"Shorter={Colors.GREEN if shorter else Colors.RED}{shorter}{Colors.RESET}"
+            )
+
+        print(f"\n{Colors.CYAN}Re-generated Results:{Colors.RESET}")
+        for i in range(num_requests):
+            match = baseline_texts[i] == regenerated_texts[i]
+            print(
+                f"  Request {i}: Match Baseline={Colors.GREEN if match else Colors.RED}{match}{Colors.RESET}"
             )
         print(f"{Colors.BOLD}{Colors.BLUE}======================================={Colors.RESET}\n")
 
-        # Verify abort produces shorter outputs
+        # Verify abort produces shorter outputs (partial results)
         for i in range(num_requests):
             self.assertLess(
-                len(abort_texts[i]),
+                len(partial_texts[i]),
                 len(baseline_texts[i]),
-                f"Request {i}: Abort mode should produce shorter output. "
-                f"Baseline: {len(baseline_texts[i])}, Abort: {len(abort_texts[i])}",
+                f"Request {i}: Aborted should produce shorter output. "
+                f"Baseline: {len(baseline_texts[i])}, Partial: {len(partial_texts[i])}",
+            )
+
+        # Verify re-generated results match baseline (deterministic)
+        for i in range(num_requests):
+            self.assertEqual(
+                baseline_texts[i],
+                regenerated_texts[i],
+                f"Request {i}: Re-generated should match baseline (deterministic).",
             )
 
     def test_1_single_request_retract_vs_no_pause(self):
@@ -529,46 +611,79 @@ class TestServerDeterministicGeneration(CustomTestCase):
         print_test_passed("TestServerDeterministicGeneration.test_1_single_request_retract_vs_no_pause")
 
     def test_2_single_request_abort_vs_no_pause(self):
-        """Test single request: abort mode vs no pause (length and tokens)."""
-        # Run baseline (no pause)
+        """
+        Test single request: abort mode vs no pause.
+
+        Demonstrates:
+        1. Abort terminates request and returns partial result
+        2. After abort, must re-generate (not continue) to get full result
+        3. Re-generated result matches baseline (deterministic)
+        """
+        # Run baseline (no pause) - full generation
         baseline_text = self._generate(self.test_prompt, self.max_new_tokens)
 
-        # Run with abort mode
+        # Run with abort mode - will get partial result
         with ThreadPoolExecutor(1) as executor:
             future = executor.submit(self._generate, self.test_prompt, self.max_new_tokens)
 
             # Wait for generation to start
             time.sleep(1.0)
 
-            # Pause with abort mode
+            # Abort the request
             self._pause_generation(mode="abort")
             time.sleep(0.5)
 
-            # Continue to reset state
+            # Reset is_paused flag (does NOT restore aborted request)
             self._continue_generation()
 
-            # Get result (may be empty or partial due to abort)
+            # Get partial result
             try:
-                abort_text = future.result(timeout=30)
+                partial_text = future.result(timeout=30)
             except Exception:
-                abort_text = ""
+                partial_text = ""
 
-        # Print comparison
+        # Re-generate from scratch to get full result
+        regenerated_text = self._generate(self.test_prompt, self.max_new_tokens)
+
+        # Print comparisons
         print_comparison(
-            "Server Single Request: Abort vs No Pause",
+            "Server Single Request: Aborted (Partial) vs Baseline",
             baseline_text,
-            abort_text,
+            partial_text,
             "No Pause (Baseline)",
-            "Abort Mode",
+            "Aborted (Partial Result)",
         )
 
-        # Verify abort produces shorter output
-        self.assertLess(
-            len(abort_text),
-            len(baseline_text),
-            f"Abort mode should produce shorter output. "
-            f"Baseline: {len(baseline_text)}, Abort: {len(abort_text)}",
+        print_comparison(
+            "Server Single Request: Re-generated vs Baseline",
+            baseline_text,
+            regenerated_text,
+            "No Pause (Baseline)",
+            "Re-generated After Abort",
         )
+
+        # 1. Verify abort produces shorter output
+        self.assertLess(
+            len(partial_text),
+            len(baseline_text),
+            f"Aborted should produce shorter output. "
+            f"Baseline: {len(baseline_text)}, Partial: {len(partial_text)}",
+        )
+
+        # 2. Verify re-generated matches baseline (deterministic)
+        self.assertEqual(
+            baseline_text,
+            regenerated_text,
+            "Re-generated should match baseline (deterministic with temperature=0)",
+        )
+
+        # Print summary
+        print(f"\n{Colors.BOLD}{Colors.BLUE}=== Server Abort Mode Summary ==={Colors.RESET}")
+        print(f"{Colors.YELLOW}Key Points:{Colors.RESET}")
+        print(f"  1. Abort terminates request: {Colors.GREEN}✓{Colors.RESET}")
+        print(f"  2. Must RE-GENERATE after abort: {Colors.GREEN}✓{Colors.RESET}")
+        print(f"  3. Re-generated matches baseline: {Colors.GREEN}✓{Colors.RESET}")
+        print(f"{Colors.BOLD}{Colors.BLUE}================================={Colors.RESET}\n")
 
         print_test_passed("TestServerDeterministicGeneration.test_2_single_request_abort_vs_no_pause")
 
@@ -634,14 +749,21 @@ class TestServerDeterministicGeneration(CustomTestCase):
         print_test_passed("TestServerDeterministicGeneration.test_3_multiple_requests_retract_vs_no_pause")
 
     def test_4_multiple_requests_abort_vs_no_pause(self):
-        """Test multiple requests: abort mode vs no pause (length and tokens)."""
+        """
+        Test multiple requests: abort mode vs no pause.
+
+        Demonstrates:
+        1. Abort terminates ALL requests and returns partial results
+        2. After abort, must re-generate (not continue) to get full results
+        3. Re-generated results match baseline (deterministic)
+        """
         num_requests = 4
         prompts = [f"{self.test_prompt} Story {i}:" for i in range(num_requests)]
 
-        # Run baseline (no pause) - sequential
+        # Run baseline (no pause) - full generation, sequential
         baseline_texts = [self._generate(prompt, self.max_new_tokens) for prompt in prompts]
 
-        # Run with abort mode - concurrent
+        # Run with abort mode - concurrent, will get partial results
         with ThreadPoolExecutor(num_requests) as executor:
             futures = [
                 executor.submit(self._generate, prompt, self.max_new_tokens)
@@ -651,50 +773,79 @@ class TestServerDeterministicGeneration(CustomTestCase):
             # Wait for generation to start
             time.sleep(1.5)
 
-            # Pause with abort mode
+            # Abort ALL requests
             self._pause_generation(mode="abort")
             time.sleep(0.5)
 
-            # Continue to reset state
+            # Reset is_paused flag (does NOT restore aborted requests)
             self._continue_generation()
 
-            # Get results
-            abort_texts = []
+            # Get partial results
+            partial_texts = []
             for f in futures:
                 try:
-                    abort_texts.append(f.result(timeout=30))
+                    partial_texts.append(f.result(timeout=30))
                 except Exception:
-                    abort_texts.append("")
+                    partial_texts.append("")
+
+        # Re-generate ALL requests from scratch to get full results
+        regenerated_texts = [self._generate(prompt, self.max_new_tokens) for prompt in prompts]
 
         # Print comparison for first request
         print_comparison(
-            "Server Multiple Requests: Abort vs No Pause (Request 0)",
+            "Server Multiple Requests: Aborted (Partial) vs Baseline (Request 0)",
             baseline_texts[0],
-            abort_texts[0],
+            partial_texts[0],
             "No Pause (Baseline)",
-            "Abort Mode",
+            "Aborted (Partial Result)",
+        )
+
+        print_comparison(
+            "Server Multiple Requests: Re-generated vs Baseline (Request 0)",
+            baseline_texts[0],
+            regenerated_texts[0],
+            "No Pause (Baseline)",
+            "Re-generated After Abort",
         )
 
         # Summary
         print(f"\n{Colors.BOLD}{Colors.BLUE}=== Server Multiple Requests Abort Summary ==={Colors.RESET}")
+        print(f"{Colors.YELLOW}Note: After abort, must RE-GENERATE (cannot continue){Colors.RESET}")
+
+        print(f"\n{Colors.CYAN}Partial Results (Aborted):{Colors.RESET}")
         for i in range(num_requests):
             len_baseline = len(baseline_texts[i])
-            len_abort = len(abort_texts[i])
-            shorter = len_abort < len_baseline
+            len_partial = len(partial_texts[i])
+            shorter = len_partial < len_baseline
             print(
                 f"  Request {i}: Baseline={Colors.GREEN}{len_baseline}{Colors.RESET}, "
-                f"Abort={Colors.GREEN}{len_abort}{Colors.RESET}, "
+                f"Partial={Colors.GREEN}{len_partial}{Colors.RESET}, "
                 f"Shorter={Colors.GREEN if shorter else Colors.RED}{shorter}{Colors.RESET}"
+            )
+
+        print(f"\n{Colors.CYAN}Re-generated Results:{Colors.RESET}")
+        for i in range(num_requests):
+            match = baseline_texts[i] == regenerated_texts[i]
+            print(
+                f"  Request {i}: Match Baseline={Colors.GREEN if match else Colors.RED}{match}{Colors.RESET}"
             )
         print(f"{Colors.BOLD}{Colors.BLUE}=============================================={Colors.RESET}\n")
 
-        # Verify abort produces shorter outputs
+        # Verify abort produces shorter outputs (partial results)
         for i in range(num_requests):
             self.assertLess(
-                len(abort_texts[i]),
+                len(partial_texts[i]),
                 len(baseline_texts[i]),
-                f"Request {i}: Abort should produce shorter output. "
-                f"Baseline: {len(baseline_texts[i])}, Abort: {len(abort_texts[i])}",
+                f"Request {i}: Aborted should produce shorter output. "
+                f"Baseline: {len(baseline_texts[i])}, Partial: {len(partial_texts[i])}",
+            )
+
+        # Verify re-generated results match baseline (deterministic)
+        for i in range(num_requests):
+            self.assertEqual(
+                baseline_texts[i],
+                regenerated_texts[i],
+                f"Request {i}: Re-generated should match baseline (deterministic).",
             )
 
         print_test_passed("TestServerDeterministicGeneration.test_4_multiple_requests_abort_vs_no_pause")
