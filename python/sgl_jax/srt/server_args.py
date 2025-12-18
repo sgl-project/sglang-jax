@@ -10,7 +10,11 @@ import tempfile
 import jax
 
 from sgl_jax.srt.function_call.function_call_parser import FunctionCallParser
-from sgl_jax.srt.hf_transformers_utils import check_gguf_file, get_config
+from sgl_jax.srt.hf_transformers_utils import (
+    check_gguf_file,
+    download_from_hf,
+    get_config,
+)
 from sgl_jax.srt.reasoning_parser import ReasoningParser
 from sgl_jax.srt.utils.common_utils import (
     LORA_TARGET_ALL_MODULES,
@@ -167,6 +171,9 @@ class ServerArgs:
     # For engine
     enable_engine_loop_run_forever_daemon: bool | None = None
 
+    # Multimodal
+    multimodal: bool = False
+
     def __post_init__(self):
         # Set missing default values
         if self.tokenizer_path is None:
@@ -237,6 +244,7 @@ class ServerArgs:
         if self.nnodes > 1 and self.device_indexes is not None:
             logger.warning("In a multi-machine scenario, device_indexes will be set to None.")
             self.device_indexes = None
+        self.model_path = download_from_hf(self.model_path)
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
@@ -900,6 +908,12 @@ class ServerArgs:
             help="Use jnp.sort to deal with top_k, top_p and min_p, which improves the grades for math-500 but increase precompile time a lot",
         )
 
+        parser.add_argument(
+            "--multimodal",
+            action="store_true",
+            help="Enable multimodal HTTP server.",
+        )
+
         # LoRA
         parser.add_argument(
             "--enable-lora",
@@ -970,6 +984,11 @@ class ServerArgs:
     def from_cli_args(cls, args: argparse.Namespace):
         args.tp_size = args.tensor_parallel_size
         args.dp_size = args.data_parallel_size
+        if cls is ServerArgs and getattr(args, "multimodal", False):
+            from sgl_jax.srt.multimodal.common.ServerArgs import MultimodalServerArgs
+
+            return MultimodalServerArgs.from_cli_args(args)
+
         attrs = [attr.name for attr in dataclasses.fields(cls)]
         return cls(**{attr: getattr(args, attr) for attr in attrs})
 
@@ -988,6 +1007,9 @@ class ServerArgs:
 
         parser = argparse.ArgumentParser()
         cls.add_cli_args(parser)
+        from sgl_jax.srt.multimodal.common.ServerArgs import MultimodalServerArgs
+
+        MultimodalServerArgs.add_cli_args(parser)
         return cls.from_cli_args(parser.parse_args(argv or sys.argv[1:]))
 
     def url(self):

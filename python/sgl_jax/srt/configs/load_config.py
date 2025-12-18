@@ -2,6 +2,7 @@ import enum
 import json
 import logging
 from dataclasses import dataclass, field
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -26,6 +27,7 @@ class LoadConfig:
     """
     download_dir: Directory to download and load the weights, default to the
         default cache directory of huggingface.
+    sub_dir: Sub-directory to look for in the download_dir. Default to None.
     load_format: The format of the model weights to load:
         "auto" will try to load the weights in the safetensors format and
             fall back to the pytorch bin format if safetensors format is
@@ -46,7 +48,9 @@ class LoadConfig:
 
     load_format: str | LoadFormat = LoadFormat.AUTO
     download_dir: str | None = None
+    sub_dir: str | None = None
     model_loader_extra_config: str | dict | None = field(default_factory=dict)
+    model_class: Any = None
     ignore_patterns: list[str] | str | None = None
     decryption_key_file: str | None = None
 

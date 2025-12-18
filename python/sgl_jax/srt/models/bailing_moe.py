@@ -161,7 +161,6 @@ class BailingMoEMLP(nnx.Module):
             kernel_axes=(None, "tensor"),
             use_bias=False,
             params_dtype=dtype,
-            mesh=mesh,
         )
 
         self.up_proj = LinearBase(
@@ -170,7 +169,6 @@ class BailingMoEMLP(nnx.Module):
             kernel_axes=(None, "tensor"),
             use_bias=False,
             params_dtype=dtype,
-            mesh=mesh,
         )
 
         self.down_proj = LinearBase(
@@ -179,12 +177,11 @@ class BailingMoEMLP(nnx.Module):
             kernel_axes=("tensor", None),
             use_bias=False,
             params_dtype=dtype,
-            mesh=mesh,
         )
 
         self.act_fn = jax.nn.silu
 
-    def __call__(self, hidden_states: jnp.ndarray):
+    def __call__(self, hidden_states: jax.Array):
         a1, _ = self.gate_proj(hidden_states)
         a2, _ = self.up_proj(hidden_states)
         intermediate_parallel = a2 * self.act_fn(a1)

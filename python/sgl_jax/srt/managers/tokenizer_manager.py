@@ -143,12 +143,17 @@ class TokenizerManager:
         # Read model args
         self.model_path = server_args.model_path
         self.served_model_name = server_args.served_model_name
-        self.model_config = ModelConfig.from_server_args(server_args)
-        self.is_generation = self.model_config.is_generation
-        self.context_len = self.model_config.context_len
-        self.image_token_id = self.model_config.image_token_id
+        if not server_args.multimodal:
+            self.model_config = ModelConfig.from_server_args(server_args)
+            self.is_generation = self.model_config.is_generation
+            self.context_len = self.model_config.context_len
+            self.image_token_id = self.model_config.image_token_id
+        else:
+            self.model_config = None
         self.is_pause = False
         self.is_pause_cond = asyncio.Condition()
+        self._updating = False
+        self._cond = asyncio.Condition()
 
         self.mm_processor = None
 
@@ -160,6 +165,7 @@ class TokenizerManager:
                 tokenizer_mode=server_args.tokenizer_mode,
                 trust_remote_code=server_args.trust_remote_code,
                 revision=server_args.revision,
+                sub_dir="tokenizer" if server_args.multimodal else "",
             )
 
         # Store states
@@ -442,7 +448,6 @@ class TokenizerManager:
         """Wait for the response of one request."""
         while True:
             try:
-
                 await asyncio.wait_for(state.event.wait(), timeout=self.wait_timeout)
             except TimeoutError:
                 if request is not None and await request.is_disconnected():

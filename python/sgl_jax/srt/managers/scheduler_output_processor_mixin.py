@@ -71,6 +71,7 @@ class SchedulerOutputProcessorMixin:
                     logits_output.input_token_logprobs = tuple(
                         jax.device_get(logits_output.input_token_logprobs).astype(float)
                     )
+        hidden_state_offset = 0
         # Check finish conditions
         logprob_pt = 0
         for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
@@ -127,7 +128,17 @@ class SchedulerOutputProcessorMixin:
                         logits_output,
                     )
                     logprob_pt += num_input_logprobs
-
+                if req.return_hidden_states and logits_output.hidden_states is not None:
+                    req.hidden_states.append(
+                        jax.device_get(
+                            logits_output.hidden_states[
+                                hidden_state_offset : (
+                                    hidden_state_offset := hidden_state_offset
+                                    + len(req.origin_input_ids)
+                                )
+                            ]
+                        ).astype(float)
+                    )
                 # Update grammar state after token sampling
                 if req.grammar is not None:
                     try:
@@ -692,6 +703,10 @@ class SchedulerOutputProcessorMixin:
                         output_token_ids_logprobs_val.append([])
                         output_token_ids_logprobs_idx.append([])
 
+                if req.return_hidden_states:
+                    if output_hidden_states is None:
+                        output_hidden_states = []
+                    output_hidden_states.append(req.hidden_states)
         # Send to detokenizer
         if rids:
             out = BatchTokenIDOut(
@@ -722,4 +737,7 @@ class SchedulerOutputProcessorMixin:
                 output_hidden_states,
                 cache_miss_count,
             )
-            self.send_to_detokenizer.send_pyobj(out)
+            if self._comm_backend is not None:
+                self._comm_backend.send_pyobj(out)
+            else:
+                self.send_to_detokenizer.send_pyobj(out)

@@ -615,6 +615,7 @@ class ScheduleBatch:
             has_stream=any(req.stream for req in reqs),
             has_grammar=any(req.grammar for req in reqs),
             chunked_req=chunked_req,
+            return_hidden_states=any(req.return_hidden_states for req in reqs),
             mesh=mesh,
             spec_algorithm=spec_algorithm,
             is_prefill_only=all(req.sampling_params.max_new_tokens == 0 for req in reqs),
@@ -1383,7 +1384,9 @@ class ScheduleBatch:
                 else ["0"] * bs_paddings[select_bs_index]
             ),
             real_bs=real_bs,
-            capture_hidden_mode=CaptureHiddenMode.NULL,
+            capture_hidden_mode=(
+                CaptureHiddenMode.FULL if self.return_hidden_states else CaptureHiddenMode.NULL
+            ),
             launch_done=self.launch_done,
         )
 
