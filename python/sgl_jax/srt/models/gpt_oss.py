@@ -314,7 +314,7 @@ class MLPBlock(nnx.Module):
             config.hidden_size,
             self.num_experts,
             mesh,
-            use_bias=False,
+            use_bias=True,
             params_dtype=dtype,
             kernel_axes=(None, "tensor"))
 
@@ -346,7 +346,7 @@ class MLPBlock(nnx.Module):
 
     def __call__(self, x: Array) -> Array:
         t = self.norm(x)
-        g = self.gate(t)  # [batch, seq_len, num_experts] or [batch, num_experts]
+        g, _ = self.gate(t)  # [batch, seq_len, num_experts] or [batch, num_experts]
 
         # Top-k expert selection
         # torch.topk operates on dim=-1 (last dimension), so if g is [batch, seq_len, num_experts],
@@ -363,23 +363,23 @@ class MLPBlock(nnx.Module):
         # mlp1_weight[expert_indices, ...] -> [batch, seq_len, experts_per_token, intermediate_size * 2, hidden_size]
         # Access Param value - use direct indexing which should work with nnx.Param
         # If _value is ShapeDtypeStruct, nnx will handle it during computation
-        try:
-            mlp1_weight = self.mlp1_weight[expert_indices, ...]
-            mlp1_bias = self.mlp1_bias[expert_indices, ...]
-        except (TypeError, AttributeError) as e:
-            # Fallback: try to access _value directly
-            from flax.nnx import variablelib
-            from jax import ShapeDtypeStruct
-            if isinstance(self.mlp1_weight, variablelib.Param):
-                mlp1_weight_val = getattr(self.mlp1_weight, '_value', None)
-                if mlp1_weight_val is not None and not isinstance(mlp1_weight_val, ShapeDtypeStruct):
-                    mlp1_weight = mlp1_weight_val[expert_indices, ...]
-                else:
-                    # If still ShapeDtypeStruct, this means weights weren't loaded
-                    # Try to get from the model's state directly
-                    raise RuntimeError(f"mlp1_weight is ShapeDtypeStruct - weights not loaded. Error: {e}")
-            else:
-                raise
+        mlp1_weight = self.mlp1_weight.at[expert_indices, ...].get(out_sharding=("Tensor", None))
+        mlp1_bias = self.mlp1_bias.at[expert_indices, ...].get(out_sharding=("Tensor", None))
+        # try:
+        # except (TypeError, AttributeError) as e:
+        #     # Fallback: try to access _value directly
+        #     from flax.nnx import variablelib
+        #     from jax import ShapeDtypeStruct
+        #     if isinstance(self.mlp1_weight, variablelib.Param):
+        #         mlp1_weight_val = getattr(self.mlp1_weight, '_value', None)
+        #         if mlp1_weight_val is not None and not isinstance(mlp1_weight_val, ShapeDtypeStruct):
+        #             mlp1_weight = mlp1_weight_val[expert_indices, ...]
+        #         else:
+        #             # If still ShapeDtypeStruct, this means weights weren't loaded
+        #             # Try to get from the model's state directly
+        #             raise RuntimeError(f"mlp1_weight is ShapeDtypeStruct - weights not loaded. Error: {e}")
+        #     else:
+        #         raise
         
         # einsum: handle both 2D and 3D cases
         # mlp1_weight: [batch, seq_len, experts_per_token, intermediate_size * 2, hidden_size] or [batch, experts_per_token, intermediate_size * 2, hidden_size]
@@ -475,7 +475,7 @@ class TransformerBlock(nnx.Module):
             forward_batch,
             token_to_kv_pool)
         attn_callback_flag = precision_tracer.jit_pure_callback_record(
-            x, "self_attn_output", "SELF_ATTN", self.layer_idx
+            t, "self_attn_output", "SELF_ATTN", self.layer_idx
         )
         layer_callback_flag.append(attn_callback_flag)
         
@@ -592,7 +592,7 @@ class GptOssForCausalLM(nnx.Module):
         }
 
         num_layers = self.config.num_hidden_layers
-        for layer_idx in range(num_layers):
+        for layer_idx in range(1): #TODO
             prefix = f"model.layers.{layer_idx}"
             target_prefix = f"model.block.{layer_idx}"
             mappings.update({
@@ -661,10 +661,63 @@ class GptOssForCausalLM(nnx.Module):
             mappings.update({
                 f"{prefix}.self_attn.sinks": WeightMapping(
                     target_path=f"{target_prefix}.attn.sinks",
-                    sharding=('tensor', ),
+                    sharding=("tensor", ),
                     transpose=False,
                 ),
             })
+            mappings.update({
+                f"{prefix}.post_attention_layernorm.weight": WeightMapping(
+                    target_path=f"{target_prefix}.mlp.norm.scale",
+                    sharding=("tensor", ),
+                    transpose=False,
+                ),
+            })
+            mappings.update({
+                f"{prefix}.mlp.router.weight": WeightMapping(
+                    target_path=f"{target_prefix}.mlp.gate.weight",
+                    sharding=(None, "tensor"),
+                    transpose=True,
+                ),
+            })
+            mappings.update({
+                f"{prefix}.mlp.router.bias": WeightMapping(
+                    target_path=f"{target_prefix}.mlp.gate.bias",
+                    sharding=("tensor", ),
+                    transpose=False,
+                ),
+            })
+            mappings.update({
+                f"{prefix}.mlp.router.bias": WeightMapping(
+                    target_path=f"{target_prefix}.mlp.gate.bias",
+                    sharding=("tensor", ),
+                    transpose=False,
+                ),
+            })
+
+            mappings.update({
+                f"{prefix}.mlp.experts.gate_up_proj_blocks": WeightMapping(
+                    target_path=f"{target_prefix}.mlp.mlp1_weight",
+                    sharding=("tensor", ),
+                    transpose=False,
+                ),
+            })
+
+            mappings.update({
+                f"{prefix}.mlp.experts.gate_up_proj_bias": WeightMapping(
+                    target_path=f"{target_prefix}.mlp.mlp1_bias",
+                    sharding=("tensor", ),
+                    transpose=False,
+                ),
+            })
+            # "model.layers.0.post_attention_layernorm.weight": "model-00000-of-00002.safetensors",
+            # "model.layers.0.mlp.router.bias": "model-00000-of-00002.safetensors",
+            # "model.layers.0.mlp.router.weight": "model-00000-of-00002.safetensors",
+            # "model.layers.0.mlp.experts.gate_up_proj_bias": "model-00000-of-00002.safetensors",
+            # "model.layers.0.mlp.experts.gate_up_proj_blocks": "model-00000-of-00002.safetensors",
+            # "model.layers.0.mlp.experts.gate_up_proj_scales": "model-00000-of-00002.safetensors",
+            # "model.layers.0.mlp.experts.down_proj_bias": "model-00000-of-00002.safetensors",
+            # "model.layers.0.mlp.experts.down_proj_blocks": "model-00000-of-00002.safetensors",
+            # "model.layers.0.mlp.experts.down_proj_scales": "model-00000-of-00002.safetensors",
 
 
         return mappings
