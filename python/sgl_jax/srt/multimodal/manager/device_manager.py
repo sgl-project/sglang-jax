@@ -1,0 +1,2 @@
+class DeviceManager:
+    pass

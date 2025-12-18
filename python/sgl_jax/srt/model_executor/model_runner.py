@@ -31,6 +31,7 @@ from sgl_jax.srt.mem_cache.memory_pool import (
     ReqToTokenPool,
     SWAKVPool,
 )
+from sgl_jax.srt.model_executor.base_model_runner import BaseModelRunner
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
 from sgl_jax.srt.model_loader.loader import get_model_loader
 from sgl_jax.srt.precision_tracer import precision_tracer
@@ -56,7 +57,7 @@ class RankZeroFilter(logging.Filter):
         return True
 
 
-class ModelRunner:
+class ModelRunner(BaseModelRunner):
     """ModelRunner runs the forward passes of the models."""
 
     def __init__(
