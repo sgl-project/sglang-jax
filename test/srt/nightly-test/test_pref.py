@@ -30,6 +30,14 @@ from sgl_jax.test.test_utils import (
 
 MOUNT_ROOT = os.getenv("CI_MOUNT_ROOT", "/models")
 
+trace_output_dir = os.path.abspath(
+    os.path.join(
+        os.getenv("PREF_OUTPUT_DIR", "./test/nightly_test_output/pref/local_run"), "model_traces"
+    )
+)
+os.makedirs(trace_output_dir, exist_ok=True)
+print(f"[CI Info] Precision Tracer Output Dir: {trace_output_dir}")
+
 
 class TestModePerf(CustomTestCase):
     sharegpt_dataset_path = None
@@ -54,6 +62,7 @@ class TestModePerf(CustomTestCase):
         "2048",
         "--mem-fraction-static",
         "0.8",
+        "--enable-precision-tracer",
     ]
 
     @classmethod
@@ -76,7 +85,7 @@ class TestModePerf(CustomTestCase):
 
         MOUNT_ROOT = os.getenv("CI_MOUNT_ROOT", "/models")
         raw_model_id = QWEN_7B
-        model_dir_name = "Qwen-7B"
+        model_dir_name = "QWEN_7B"
         cached_model_path = os.path.join(MOUNT_ROOT, "model_scope", model_dir_name)
 
         print(f"[CI Info] Checking Model Cache at: {cached_model_path}")
@@ -228,7 +237,7 @@ class TestModePerf(CustomTestCase):
 
         MOUNT_ROOT = os.getenv("CI_MOUNT_ROOT", "/models")
         raw_model_id = QWEN_7B
-        model_dir_name = "Qwen-7B"
+        model_dir_name = "QWEN_7B"
         cached_model_path = os.path.join(MOUNT_ROOT, "model_scope", model_dir_name)
 
         print(f"[CI Info] Checking Model Cache at: {cached_model_path}")
@@ -269,7 +278,6 @@ class TestModePerf(CustomTestCase):
         )
 
         results_summary = []
-
         try:
             for concurrency in concurrency_levels:
                 for in_len in input_lengths:

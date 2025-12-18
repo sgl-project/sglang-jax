@@ -55,7 +55,7 @@ class TestModelAccuracy(CustomTestCase):
         # args setting
         MOUNT_ROOT = os.getenv("CI_MOUNT_ROOT", "/models")
         raw_model_id = QWEN_7B
-        model_dir_name = "Qwen-7B"
+        model_dir_name = "QWEN_7B"
         cached_model_path = os.path.join(MOUNT_ROOT, "model_scope", model_dir_name)
         print(f"[CI Info] Checking Model Cache at: {cached_model_path}")
         if os.path.exists(cached_model_path):
@@ -109,7 +109,7 @@ class TestModelAccuracy(CustomTestCase):
                     model=raw_model_id,
                     api_url=api_url_for_eval,
                     api_key="EMPTY",
-                    eval_type="service",
+                    eval_type="server",
                     datasets=[dataset_name],
                     dataset_args=dataset_args,
                     eval_batch_size=64,
@@ -230,7 +230,7 @@ class TestModelAccuracy(CustomTestCase):
                     model=raw_model_id,
                     api_url=api_url_for_eval,
                     api_key="EMPTY",
-                    eval_type="service",
+                    eval_type="server",
                     datasets=[dataset_name],
                     dataset_args=dataset_args,
                     eval_batch_size=64,
@@ -365,7 +365,7 @@ class TestModelAccuracy(CustomTestCase):
                     model=raw_model_id,
                     api_url=api_url_for_eval,
                     api_key="EMPTY",
-                    eval_type="service",
+                    eval_type="server",
                     datasets=[dataset_name],
                     dataset_args=dataset_args,
                     generation_config=generation_config,
@@ -482,7 +482,7 @@ class TestModelAccuracy(CustomTestCase):
                     model=raw_model_id,
                     api_url=api_url_for_eval,
                     api_key="EMPTY",
-                    eval_type="service",
+                    eval_type="server",
                     datasets=[dataset_name],
                     dataset_args=dataset_args,
                     eval_batch_size=64,
@@ -548,7 +548,7 @@ class TestModelAccuracy(CustomTestCase):
         # args setting
         MOUNT_ROOT = os.getenv("CI_MOUNT_ROOT", "/models")
         raw_model_id = QWEN_7B
-        model_dir_name = "Qwen-7B"
+        model_dir_name = "QWEN_7B"
         cached_model_path = os.path.join(MOUNT_ROOT, "model_scope", model_dir_name)
         print(f"[CI Info] Checking Model Cache at: {cached_model_path}")
         if os.path.exists(cached_model_path):
@@ -601,7 +601,7 @@ class TestModelAccuracy(CustomTestCase):
                     model=raw_model_id,
                     api_url=api_url_for_eval,
                     api_key="EMPTY",
-                    eval_type="service",
+                    eval_type="server",
                     datasets=[dataset_name],
                     dataset_args=dataset_args,
                     eval_batch_size=64,
@@ -720,7 +720,7 @@ class TestModelAccuracy(CustomTestCase):
                     model=raw_model_id,
                     api_url=api_url_for_eval,
                     api_key="EMPTY",
-                    eval_type="service",
+                    eval_type="server",
                     datasets=[dataset_name],
                     dataset_args=dataset_args,
                     eval_batch_size=64,
@@ -840,7 +840,7 @@ class TestModelAccuracy(CustomTestCase):
                     model=raw_model_id,
                     api_url=api_url_for_eval,
                     api_key="EMPTY",
-                    eval_type="service",
+                    eval_type="server",
                     datasets=[dataset_name],
                     dataset_args=dataset_args,
                     eval_batch_size=64,
@@ -973,7 +973,7 @@ class TestModelAccuracy(CustomTestCase):
                     model=raw_model_id,
                     api_url=api_url_for_eval,
                     api_key="EMPTY",
-                    eval_type="service",
+                    eval_type="server",
                     datasets=[dataset_name],
                     dataset_args=dataset_args,
                     generation_config=generation_config,
@@ -1101,7 +1101,7 @@ class TestModelAccuracy(CustomTestCase):
                     model=raw_model_id,
                     api_url=api_url_for_eval,
                     api_key="EMPTY",
-                    eval_type="service",
+                    eval_type="server",
                     datasets=[dataset_name],
                     dataset_args=dataset_args,
                     generation_config=generation_config,
@@ -1185,10 +1185,28 @@ class TestModelAccuracy(CustomTestCase):
             "--ep-size",
             "2",
         ]
+
+        persistent_cache_dir = os.getenv(
+            "JAX_COMPILATION_CACHE_DIR", "/model/jax_compilation_cache/QWEN3_MOE_30B"
+        )
+
+        if not os.path.exists(persistent_cache_dir):
+            try:
+                os.makedirs(persistent_cache_dir, exist_ok=True)
+                print(f"[CI Info] Created JAX Cache Dir: {persistent_cache_dir}")
+            except Exception as e:
+                print(f"[CI Error] Failed to create cache dir: {e}. Fallback to /tmp")
+                persistent_cache_dir = "/tmp/jax_compilation_cache"
+
+        print(f"[CI Info] Using JAX Cache Dir: {persistent_cache_dir}")
+
+        os.makedirs(persistent_cache_dir, exist_ok=True)
+        print(f"[CI Info] Using JAX Cache Dir: {persistent_cache_dir}")
+
         process = popen_launch_server(
             model_path_for_server,
             DEFAULT_URL_FOR_TEST,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            timeout=3600,
             device="tpu",
             other_args=specific_args,
             env={
@@ -1221,7 +1239,7 @@ class TestModelAccuracy(CustomTestCase):
                     model=raw_model_id,
                     api_url=api_url_for_eval,
                     api_key="EMPTY",
-                    eval_type="service",
+                    eval_type="server",
                     datasets=[dataset_name],
                     dataset_args=dataset_args,
                     eval_batch_size=64,

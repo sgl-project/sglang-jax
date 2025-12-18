@@ -8,6 +8,15 @@ on:
       - main
     paths:
       - "python/sgl_jax/version.py"
+  pull_request:
+    branches:
+      - main
+      - "epic/*"
+    paths:
+      - "python/**"
+      - "scripts/**"
+      - "test/**"
+      - ".github/workflows/pr-test.yml"
   workflow_dispatch:
 
 concurrency:
