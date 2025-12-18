@@ -132,7 +132,7 @@ class TestEngineDeterministicGeneration(CustomTestCase):
         return result.get("text", "")
 
     async def _run_generation_with_retract(
-        self, prompt: str, max_new_tokens: int, pause_delay: float = 1.0
+        self, prompt: str, max_new_tokens: int, pause_delay: float = 1.0, log_state: bool = False
     ):
         """Run generation with retract mode pause in the middle."""
         task = asyncio.create_task(self._async_generate(prompt, max_new_tokens))
@@ -140,9 +140,61 @@ class TestEngineDeterministicGeneration(CustomTestCase):
         # Wait for generation to start
         await asyncio.sleep(pause_delay)
 
+        # Get state before pause
+        if log_state:
+            states_before = await self._async_get_internal_state()
+            internal_before = states_before[0]
+            running_before = internal_before["running_batch_size"]
+            waiting_before = internal_before["waiting_queue_size"]
+            tokens_before = internal_before["available_kv_tokens"]
+
         # Pause with retract mode
         await self._async_pause_generation(mode="retract")
         await asyncio.sleep(0.5)
+
+        # Get state after pause
+        if log_state:
+            states_after = await self._async_get_internal_state()
+            internal_after = states_after[0]
+            running_after = internal_after["running_batch_size"]
+            waiting_after = internal_after["waiting_queue_size"]
+            tokens_after = internal_after["available_kv_tokens"]
+
+            # Print state changes
+            print(f"\n{Colors.BOLD}{Colors.BLUE}=== Retract Mode State Changes ==={Colors.RESET}")
+            print(f"{Colors.YELLOW}Before Pause:{Colors.RESET}")
+            print(f"  Running Batch Size: {Colors.GREEN}{running_before}{Colors.RESET}")
+            print(f"  Waiting Queue Size: {Colors.GREEN}{waiting_before}{Colors.RESET}")
+            print(f"  Available KV Tokens: {Colors.GREEN}{tokens_before}{Colors.RESET}")
+            print(f"{Colors.YELLOW}After Pause:{Colors.RESET}")
+            print(f"  Running Batch Size: {Colors.GREEN}{running_after}{Colors.RESET}")
+            print(f"  Waiting Queue Size: {Colors.GREEN}{waiting_after}{Colors.RESET}")
+            print(f"  Available KV Tokens: {Colors.GREEN}{tokens_after}{Colors.RESET}")
+            print(f"{Colors.YELLOW}Changes:{Colors.RESET}")
+            print(f"  Running Batch: {Colors.RED}{running_before}{Colors.RESET} -> {Colors.GREEN}{running_after}{Colors.RESET} ({Colors.RED}-{running_before - running_after}{Colors.RESET})")
+            print(f"  Waiting Queue: {Colors.GREEN}{waiting_before}{Colors.RESET} -> {Colors.GREEN}{waiting_after}{Colors.RESET} ({Colors.GREEN}+{waiting_after - waiting_before}{Colors.RESET})")
+            print(f"  KV Tokens Freed: {Colors.GREEN}+{tokens_after - tokens_before}{Colors.RESET}")
+            print(f"{Colors.YELLOW}Verification:{Colors.RESET}")
+            
+            # Verify running batch is cleared
+            if running_after == 0:
+                print(f"  ✓ Running batch cleared: {Colors.GREEN}PASS{Colors.RESET}")
+            else:
+                print(f"  ✗ Running batch NOT cleared: {Colors.RED}FAIL{Colors.RESET} (size={running_after})")
+            
+            # Verify requests moved to waiting queue
+            if waiting_after > waiting_before:
+                print(f"  ✓ Requests moved to waiting queue: {Colors.GREEN}PASS{Colors.RESET}")
+            else:
+                print(f"  ✗ Requests NOT moved to waiting queue: {Colors.RED}FAIL{Colors.RESET}")
+            
+            # Verify KV cache cleared
+            if tokens_after > tokens_before:
+                print(f"  ✓ KV cache cleared (tokens freed): {Colors.GREEN}PASS{Colors.RESET}")
+            else:
+                print(f"  ✗ KV cache NOT cleared: {Colors.RED}FAIL{Colors.RESET}")
+            
+            print(f"{Colors.BOLD}{Colors.BLUE}=================================={Colors.RESET}\n")
 
         # Continue generation
         await self._async_continue_generation()
@@ -194,9 +246,9 @@ class TestEngineDeterministicGeneration(CustomTestCase):
         # Run baseline (no pause)
         baseline_text = await self._run_generation_no_pause(self.test_prompt, self.max_new_tokens)
 
-        # Run with retract mode
+        # Run with retract mode (with state logging)
         retract_text = await self._run_generation_with_retract(
-            self.test_prompt, self.max_new_tokens
+            self.test_prompt, self.max_new_tokens, log_state=True
         )
 
         # Print comparison
@@ -310,9 +362,59 @@ class TestEngineDeterministicGeneration(CustomTestCase):
         # Wait for generation to start
         await asyncio.sleep(1.5)
 
+        # Get state before pause
+        states_before = await self._async_get_internal_state()
+        internal_before = states_before[0]
+        running_before = internal_before["running_batch_size"]
+        waiting_before = internal_before["waiting_queue_size"]
+        tokens_before = internal_before["available_kv_tokens"]
+
         # Pause with retract mode
         await self._async_pause_generation(mode="retract")
         await asyncio.sleep(0.5)
+
+        # Get state after pause
+        states_after = await self._async_get_internal_state()
+        internal_after = states_after[0]
+        running_after = internal_after["running_batch_size"]
+        waiting_after = internal_after["waiting_queue_size"]
+        tokens_after = internal_after["available_kv_tokens"]
+
+        # Print state changes
+        print(f"\n{Colors.BOLD}{Colors.BLUE}=== Multiple Requests Retract Mode State Changes ==={Colors.RESET}")
+        print(f"{Colors.YELLOW}Before Pause:{Colors.RESET}")
+        print(f"  Running Batch Size: {Colors.GREEN}{running_before}{Colors.RESET}")
+        print(f"  Waiting Queue Size: {Colors.GREEN}{waiting_before}{Colors.RESET}")
+        print(f"  Available KV Tokens: {Colors.GREEN}{tokens_before}{Colors.RESET}")
+        print(f"{Colors.YELLOW}After Pause:{Colors.RESET}")
+        print(f"  Running Batch Size: {Colors.GREEN}{running_after}{Colors.RESET}")
+        print(f"  Waiting Queue Size: {Colors.GREEN}{waiting_after}{Colors.RESET}")
+        print(f"  Available KV Tokens: {Colors.GREEN}{tokens_after}{Colors.RESET}")
+        print(f"{Colors.YELLOW}Changes:{Colors.RESET}")
+        print(f"  Running Batch: {Colors.RED}{running_before}{Colors.RESET} -> {Colors.GREEN}{running_after}{Colors.RESET} ({Colors.RED}-{running_before - running_after}{Colors.RESET})")
+        print(f"  Waiting Queue: {Colors.GREEN}{waiting_before}{Colors.RESET} -> {Colors.GREEN}{waiting_after}{Colors.RESET} ({Colors.GREEN}+{waiting_after - waiting_before}{Colors.RESET})")
+        print(f"  KV Tokens Freed: {Colors.GREEN}+{tokens_after - tokens_before}{Colors.RESET}")
+        print(f"{Colors.YELLOW}Verification:{Colors.RESET}")
+        
+        # Verify running batch is cleared
+        if running_after == 0:
+            print(f"  ✓ Running batch cleared: {Colors.GREEN}PASS{Colors.RESET}")
+        else:
+            print(f"  ✗ Running batch NOT cleared: {Colors.RED}FAIL{Colors.RESET} (size={running_after})")
+        
+        # Verify requests moved to waiting queue
+        if waiting_after > waiting_before:
+            print(f"  ✓ Requests moved to waiting queue: {Colors.GREEN}PASS{Colors.RESET}")
+        else:
+            print(f"  ✗ Requests NOT moved to waiting queue: {Colors.RED}FAIL{Colors.RESET}")
+        
+        # Verify KV cache cleared
+        if tokens_after > tokens_before:
+            print(f"  ✓ KV cache cleared (tokens freed): {Colors.GREEN}PASS{Colors.RESET}")
+        else:
+            print(f"  ✗ KV cache NOT cleared: {Colors.RED}FAIL{Colors.RESET}")
+        
+        print(f"{Colors.BOLD}{Colors.BLUE}===================================================={Colors.RESET}\n")
 
         # Continue generation
         await self._async_continue_generation()
