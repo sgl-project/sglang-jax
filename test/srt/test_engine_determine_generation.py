@@ -227,14 +227,6 @@ class TestEngineDeterministicGeneration(CustomTestCase):
             self.test_prompt, self.max_new_tokens
         )
 
-        # Print comparison: Partial (aborted) vs Baseline
-        print_comparison(
-            "Single Request: Aborted (Partial) vs Baseline",
-            baseline_text,
-            partial_text,
-            "No Pause (Baseline)",
-            "Aborted (Partial Result)",
-        )
 
         # Print comparison: Re-generated vs Baseline
         print_comparison(
@@ -310,15 +302,6 @@ class TestEngineDeterministicGeneration(CustomTestCase):
         results = await asyncio.gather(*tasks, return_exceptions=True)
         retract_texts = [r.get("text", "") if isinstance(r, dict) else "" for r in results]
 
-        # Print comparison for first request
-        print_comparison(
-            "Multiple Requests: Retract vs No Pause (Request 0)",
-            baseline_texts[0],
-            retract_texts[0],
-            "No Pause (Baseline)",
-            "Retract Mode",
-        )
-
         # Summary comparison
         print(f"\n{Colors.BOLD}{Colors.BLUE}=== Multiple Requests Summary ==={Colors.RESET}")
         for i in range(num_requests):
@@ -387,23 +370,6 @@ class TestEngineDeterministicGeneration(CustomTestCase):
         for prompt in prompts:
             text = await self._run_generation_no_pause(prompt, self.max_new_tokens)
             regenerated_texts.append(text)
-
-        # Print comparison for first request
-        print_comparison(
-            "Multiple Requests: Aborted (Partial) vs Baseline (Request 0)",
-            baseline_texts[0],
-            partial_texts[0],
-            "No Pause (Baseline)",
-            "Aborted (Partial Result)",
-        )
-
-        print_comparison(
-            "Multiple Requests: Re-generated vs Baseline (Request 0)",
-            baseline_texts[0],
-            regenerated_texts[0],
-            "No Pause (Baseline)",
-            "Re-generated After Abort",
-        )
 
         # Summary comparison
         print(f"\n{Colors.BOLD}{Colors.BLUE}=== Multiple Requests Abort Summary ==={Colors.RESET}")
