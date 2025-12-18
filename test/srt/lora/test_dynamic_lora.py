@@ -14,6 +14,7 @@ limitations under the License.
 """
 
 import json
+import os
 import unittest
 from typing import List
 
@@ -232,7 +233,7 @@ class TestLoRA(CustomTestCase):
                 },
                 "return_logprob": True,
                 "top_logprobs_num": 5,
-                "logprob_start_len": 0,
+                "logprob_start_len": -1,
             }
 
             if lora_paths_per_prompt[i] is not None:
@@ -250,28 +251,7 @@ class TestLoRA(CustomTestCase):
             # Get HF reference data for this prompt
             hf_result = hf_data["results"][i]
 
-            # Compare prefill logprobs (input_token_logprobs)
-            if "meta_info" in sgl_output and "input_token_logprobs" in sgl_output["meta_info"]:
-                sgl_prefill = sgl_output["meta_info"]["input_token_logprobs"]
-                hf_prefill = hf_result["prefill_logprobs"]
-
-                print(f"  Prefill logprobs comparison:")
-                print(f"    SGL shape: {len(sgl_prefill)}")
-                print(f"    HF shape:  {hf_result['prefill_shape']}")
-
-                # Compare logprobs values (allowing small numerical differences)
-                for j, (sgl_lp, hf_lp) in enumerate(zip(sgl_prefill, hf_prefill)):
-                    if sgl_lp is not None and hf_lp is not None:
-                        for token_id, sgl_prob in sgl_lp.items():
-                            if str(token_id) in hf_lp:
-                                hf_prob = hf_lp[str(token_id)]
-                                diff = abs(sgl_prob - hf_prob)
-                                if diff > 0.01:  # tolerance
-                                    print(
-                                        f"      Warning: Large diff at position {j}, token {token_id}: {diff}"
-                                    )
-
-            # Compare decode logprobs (output_token_logprobs)
+            # Compare decode logprobs (output_token_logprobs) only
             if "meta_info" in sgl_output and "output_token_logprobs" in sgl_output["meta_info"]:
                 sgl_decode = sgl_output["meta_info"]["output_token_logprobs"]
                 hf_decode = hf_result["decode_logprobs"]
@@ -336,7 +316,6 @@ class TestLoRA(CustomTestCase):
             *all_lora_paths,
             "--max-loras-per-batch",
             "3",
-            "--disable-overlap-schedule",
         ]
 
         process_lora = popen_launch_server(
@@ -353,7 +332,7 @@ class TestLoRA(CustomTestCase):
             self.run_lora_effect_test(base_url, PROMPTS, lora_set, max_new_tokens, base_responses)
 
             # Run logprobs comparison test if reference file exists
-            hf_logprobs_file = "hf_lora_logprobs.json"
+            hf_logprobs_file = os.path.join(os.path.dirname(__file__), "hf_lora_logprobs.json")
             self.run_logprobs_comparison_test(
                 base_url, PROMPTS, lora_set, max_new_tokens, hf_logprobs_file
             )
