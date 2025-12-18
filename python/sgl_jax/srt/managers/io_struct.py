@@ -136,10 +136,8 @@ class AbortReq(BaseReq):
     # Whether to abort all requests
     abort_all: bool = False
 
-    def __post_init__(self):
-        # FIXME: This is a hack to keep the same with the old code
-        if self.rid is None:
-            self.rid = ""
+    finished_reason: BaseFinishReason | None = None
+    aborted_message: str | None = None
 
 
 @dataclass

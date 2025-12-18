@@ -124,14 +124,6 @@ class TestPauseContinueGeneration(CustomTestCase):
         )
         return response.json()
 
-    def _flush_cache(self):
-        """Flush the KV cache."""
-        response = requests.post(
-            self.base_url + "/flush_cache",
-            json={},
-        )
-        return response.json()
-
     def test_pause_generation_retract_mode(self):
         """
         Test pause_generation with retract mode.
@@ -364,46 +356,6 @@ class TestPauseContinueGeneration(CustomTestCase):
                 self.assertIn("text", result, f"Request should complete with text output: {result}")
 
         print_test_passed("TestPauseContinueGeneration.test_pause_generation_in_place_mode")
-
-    def test_pause_continue_flush_cache_retract_mode(self):
-        """
-        Test that flush_cache works after pause with retract mode.
-
-        In retract mode, requests are moved to waiting queue and KV cache is cleared,
-        so flush_cache should succeed.
-        """
-        # Start a request
-        with ThreadPoolExecutor(1) as executor:
-            future = executor.submit(self._run_decode, 2000)
-
-            # Wait for request to start
-            time.sleep(2)
-
-            # Pause with retract mode
-            pause_response = self._pause_generation(mode="retract")
-            self.assertEqual(pause_response["status"], "ok")
-
-            # Wait for pause
-            time.sleep(0.5)
-
-            # Flush cache should succeed in retract mode
-            # (Note: The requests are in waiting_queue, but there's no running batch,
-            #  so we need to abort them first or flush should handle this case)
-
-            # Continue generation to let requests complete
-            continue_response = self._continue_generation()
-            self.assertEqual(continue_response["status"], "ok")
-
-            # Wait for completion
-            try:
-                result = future.result(timeout=60)
-                self.assertIn("text", result)
-            except Exception as e:
-                self.fail(f"Request should complete: {e}")
-
-        print_test_passed(
-            "TestPauseContinueGeneration.test_pause_continue_flush_cache_retract_mode"
-        )
 
     def test_pause_continue_multiple_cycles(self):
         """
