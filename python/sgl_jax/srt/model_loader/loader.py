@@ -91,7 +91,6 @@ class JAXModelLoader(BaseModelLoader):
         return model_class
 
     def _get_model(self, model_class: Any, model_config: ModelConfig) -> nnx.Module:
-        logging.info("model_config quantization_post_dtype: %s", model_config.quantization_post_dtype)
         with jax.set_mesh(self.mesh):
             model = nnx.eval_shape(
                 lambda: model_class(

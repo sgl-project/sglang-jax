@@ -142,7 +142,7 @@ def quantization_config_file_path_to_dict(
             with open(path, "r") as f:
                 return yaml.safe_load(f)
     raise ValueError(
-        f"Could not find quantization config file with name '{quantization_config_file_path}' in 'tpu_inference/models/jax/utils/quantization/configs."
+        f"Could not find quantization config file with name '{quantization_config_file_path}' in 'sgl_jax/srt/utils/quantization/configs."
     )
 
 

@@ -418,7 +418,6 @@ class ServerArgs:
         )
         parser.add_argument(
             "--quantization-config-path",
-            dest="quantization_post_dtype",
             type=str,
             default=None,
             help="The config path for how to apply quantization to loaded model."
