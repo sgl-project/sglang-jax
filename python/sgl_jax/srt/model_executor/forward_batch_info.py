@@ -496,4 +496,12 @@ class ForwardBatch:
         self.mrope_positions = jnp.concatenate(
             mrope_positions_list,
             axis=1,
-        ).astype(jnp.int64)
+        ).astype(jnp.int64)        # Pad with zeros until the shape matches self.input_ids
+        if self.mrope_positions.shape[1] < self.input_ids.shape[0]:
+            padding_needed = self.input_ids.shape[0] - self.mrope_positions.shape[1]
+            self.mrope_positions = jnp.pad(
+                self.mrope_positions,
+                ((0, 0), (0, padding_needed)),
+                mode='constant',
+                constant_values=0
+            )
