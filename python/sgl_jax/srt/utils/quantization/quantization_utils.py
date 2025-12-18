@@ -57,7 +57,7 @@ def qwix_quantize_nnx_model(qwix_config: List[dict],
                             model_worker_batch: ModelWorkerBatch,
                             attn_backend,
                             mesh: Mesh,
-                            head_num: int,
+                            kv_head_num: int,
                             head_dim: int,
                             layer_num: int,
                             model: nnx.Module = None,
@@ -93,7 +93,7 @@ def qwix_quantize_nnx_model(qwix_config: List[dict],
         model: the quantized model
     """
     token_to_kv_pool = MHATokenToKVPool(size=2000, page_size=1, dtype=jnp.bfloat16, 
-                                        head_num=head_num,
+                                        head_num=kv_head_num,
                                         head_dim=head_dim, layer_num=layer_num,
                                         mesh=mesh)
     qwix_rules = parse_qwix_config_to_rules(qwix_config)
@@ -177,7 +177,6 @@ def apply_qwix_quantization(
             mesh=mesh,
         )
         
-        
         qwix_quantize_nnx_model_with_config_and_attn_backend = functools.partial(
             qwix_quantize_nnx_model, qwix_config=qwix_config, model_worker_batch=model_worker_batch)
         with jax.set_mesh(mesh):
@@ -185,13 +184,13 @@ def apply_qwix_quantization(
                     qwix_quantize_nnx_model_with_config_and_attn_backend,
                     static_argnames=(
                         "mesh",
-                        "head_num",
+                        "kv_head_num",
                         "head_dim",
                         "layer_num",
                     ))(
                     attn_backend=attn_backend,
                     mesh=mesh,
-                    head_num=num_attn_heads,
+                    kv_head_num=num_kv_heads,
                     head_dim=(head_dim + 127) // 128 * 128,
                     layer_num=layer_num,
                     model=model)
