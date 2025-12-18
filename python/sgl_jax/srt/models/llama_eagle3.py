@@ -25,7 +25,6 @@ from sgl_jax.srt.layers.embeddings import Embed, ParallelLMHead
 from sgl_jax.srt.layers.layernorm import RMSNorm
 from sgl_jax.srt.layers.linear import LinearBase
 from sgl_jax.srt.layers.logits_processor import LogitsProcessor
-from sgl_jax.srt.lora.context_manager import LoraBatchContext
 from sgl_jax.srt.mem_cache.memory_pool import KVCache
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
 from sgl_jax.srt.models.llama import (
@@ -200,15 +199,14 @@ class LlamaEagleModel(LlamaModel):
             hidden_states = self.fc(hidden_states)[0]
 
         residual = None
-        with LoraBatchContext.set_batch(forward_batch):
-            hidden_states, residual, kv_fused = self.midlayer(
-                positions=positions,
-                embeds=embeds,
-                hidden_states=hidden_states,
-                forward_batch=forward_batch,
-                token_to_kv_pool=token_to_kv_pool,
-                residual=residual,
-            )
+        hidden_states, residual, kv_fused = self.midlayer(
+            positions=positions,
+            embeds=embeds,
+            hidden_states=hidden_states,
+            forward_batch=forward_batch,
+            token_to_kv_pool=token_to_kv_pool,
+            residual=residual,
+        )
         if residual is not None:
             hidden_states = hidden_states + residual
             residual = hidden_states.copy()
