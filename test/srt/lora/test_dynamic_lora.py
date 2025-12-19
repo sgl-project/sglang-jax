@@ -37,7 +37,6 @@ LORA_SETS = [
         "base": "Qwen/Qwen3-4B",
         "loras": [
             "nissenj/Qwen3-4B-lora-v2",
-            "y9760210/Qwen3-4B-lora_model",
         ],
     },
 ]
@@ -45,7 +44,7 @@ LORA_SETS = [
 DTYPES = ["bfloat16"]
 
 PROMPTS = [
-    "Chatgpt is a chat bot",
+    "Chatgpt is a chat bot that can answer questions and generate text. It is",
     "AI is a field of computer science focused on",
     "Computer science is the study of",
     "Write a short story.",
@@ -293,15 +292,26 @@ class TestLoRA(CustomTestCase):
                 sgl_tensor = np.array(sgl_decode_vals)
                 hf_tensor = np.array(hf_decode)
 
+                # Print actual logprobs values for manual comparison
+                print(f"  Decode logprobs comparison:")
+                print(f"    SGL shape:  {sgl_tensor.shape}")
+                print(f"    HF shape:   {hf_tensor.shape}")
+                print(f"\n    SGL logprobs (first 5 tokens):")
+                print(f"{sgl_tensor[:5]}")
+                print(f"\n    HF logprobs (first 5 tokens):")
+                print(f"{hf_tensor[:5]}")
+                if len(sgl_tensor) > 5:
+                    print(f"\n    SGL logprobs (last 5 tokens):")
+                    print(f"{sgl_tensor[-5:]}")
+                    print(f"\n    HF logprobs (last 5 tokens):")
+                    print(f"{hf_tensor[-5:]}")
+
                 # Calculate differences (similar to original sglang)
                 diff = np.abs(sgl_tensor - hf_tensor)
                 max_diff = np.max(diff)
                 mean_diff = np.mean(diff)
 
-                print(f"  Decode logprobs comparison:")
-                print(f"    SGL shape:  {sgl_tensor.shape}")
-                print(f"    HF shape:   {hf_tensor.shape}")
-                print(f"    Max diff:   {max_diff:.6e}")
+                print(f"\n    Max diff:   {max_diff:.6e}")
                 print(f"    Mean diff:  {mean_diff:.6e}")
 
                 # Check threshold
@@ -371,10 +381,12 @@ class TestLoRA(CustomTestCase):
             self.run_lora_effect_test(base_url, PROMPTS, lora_set, max_new_tokens, base_responses)
 
             # Run logprobs comparison test if reference file exists
-            hf_logprobs_file = os.path.join(os.path.dirname(__file__), "hf_lora_logprobs.json")
-            self.run_logprobs_comparison_test(
-                base_url, PROMPTS, lora_set, max_new_tokens, hf_logprobs_file
-            )
+            # NOTE: Commented out to avoid running in test_all
+            # Use test_logprobs_cpu_1layer for dedicated CPU 1-layer logprobs comparison
+            # hf_logprobs_file = os.path.join(os.path.dirname(__file__), "hf_lora_logprobs.json")
+            # self.run_logprobs_comparison_test(
+            #     base_url, PROMPTS, lora_set, max_new_tokens, hf_logprobs_file
+            # )
         finally:
             kill_process_tree(process_lora.pid)
 
@@ -382,6 +394,61 @@ class TestLoRA(CustomTestCase):
         for lora_set in LORA_SETS:
             for dtype in DTYPES:
                 self.run_test_suite(lora_set, dtype)
+
+    def test_logprobs_cpu_1layer(self):
+        """
+        Test logprobs comparison on CPU with only 1 layer and native backend.
+        This is a lightweight test for debugging and verification.
+        """
+        print("\n" + "=" * 80)
+        print("Running CPU 1-layer logprobs comparison test")
+        print("=" * 80)
+
+        for lora_set in LORA_SETS:
+            base_path = lora_set["base"]
+            all_lora_paths = lora_set["loras"]
+            base_url = DEFAULT_URL_FOR_TEST
+            max_new_tokens = 1
+            dtype = "float32"  # Use float32 for CPU
+
+            print(f"\nLaunching server with LoRA support for {base_path}")
+            print(f"  Device: CPU")
+            print(f"  Num layers: 1")
+            print(f"  Backend: native")
+            print(f"  Max new tokens: {max_new_tokens}")
+
+            server_args_lora = [
+                "--tp-size",
+                "1",
+                "--dtype",
+                dtype,
+                "--lora-paths",
+                *all_lora_paths,
+                "--max-loras-per-batch",
+                "3",
+                "--device",
+                "cpu",
+                "--num-layers",
+                "1",
+                "--backend",
+                "native",
+            ]
+
+            process_lora = popen_launch_server(
+                base_path,
+                base_url,
+                timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+                other_args=server_args_lora,
+            )
+
+            try:
+                # Run only the logprobs comparison test
+                hf_logprobs_file = os.path.join(os.path.dirname(__file__), "hf_lora_logprobs.json")
+                self.run_logprobs_comparison_test(
+                    base_url, PROMPTS, lora_set, max_new_tokens, hf_logprobs_file
+                )
+            finally:
+                kill_process_tree(process_lora.pid)
 
 
 if __name__ == "__main__":

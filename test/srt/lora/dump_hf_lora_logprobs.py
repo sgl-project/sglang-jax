@@ -79,6 +79,8 @@ def run_hf_with_lora(
     prompts: List[str],
     max_new_tokens: int,
     torch_dtype: torch.dtype,
+    use_cpu: bool = False,
+    num_layers: Optional[int] = None,
 ) -> Dict[str, Any]:
     """
     Run HuggingFace with LoRA and return log probabilities.
@@ -101,6 +103,8 @@ def run_hf_with_lora(
     print(f"  Number of prompts: {len(prompts)}")
     print(f"  Max new tokens: {max_new_tokens}")
     print(f"  Data type: {torch_dtype}")
+    print(f"  Device: {'CPU' if use_cpu else 'GPU'}")
+    print(f"  Num layers: {num_layers if num_layers is not None else 'All'}")
 
     lora_paths_per_prompt = prepare_lora_paths_per_prompt(lora_paths, len(prompts))
 
@@ -114,6 +118,8 @@ def run_hf_with_lora(
         torch_dtype=torch_dtype,
         model_type="generation",
         patch_model_do_sample_false=True,
+        use_cpu=use_cpu,
+        num_layers=num_layers,
     ) as hf_runner:
         hf_outputs = hf_runner.forward(
             prompts,
@@ -266,8 +272,8 @@ def main():
     parser.add_argument(
         "--max-new-tokens",
         type=int,
-        default=32,
-        help="Maximum number of tokens to generate (default: 32)",
+        default=1,
+        help="Maximum number of tokens to generate (default: 1)",
     )
 
     parser.add_argument(
@@ -283,6 +289,19 @@ def main():
         default="float16",
         choices=["float16", "float32", "bfloat16"],
         help="Model data type (default: float16)",
+    )
+
+    parser.add_argument(
+        "--use-cpu",
+        action="store_true",
+        help="Run on CPU instead of GPU",
+    )
+
+    parser.add_argument(
+        "--num-layers",
+        type=int,
+        default=None,
+        help="Number of layers to forward (e.g., 1 for only first layer). None means all layers.",
     )
 
     args = parser.parse_args()
@@ -310,6 +329,8 @@ def main():
             prompts=prompts,
             max_new_tokens=args.max_new_tokens,
             torch_dtype=torch_dtype,
+            use_cpu=args.use_cpu,
+            num_layers=args.num_layers,
         )
 
         # Print summary
