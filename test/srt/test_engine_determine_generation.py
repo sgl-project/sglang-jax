@@ -1,9 +1,9 @@
-import asyncio
+import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from sgl_jax.srt.entrypoints.engine import Engine
 from sgl_jax.srt.hf_transformers_utils import get_tokenizer
-from sgl_jax.srt.managers.io_struct import GenerateReqInput
 from sgl_jax.test.test_utils import QWEN3_8B, CustomTestCase
 
 
@@ -95,67 +95,52 @@ class TestEngineDeterministicGeneration(CustomTestCase):
     def tearDownClass(cls):
         cls.engine.shutdown()
 
-    async def _async_get_internal_state(self):
-        """Get internal state using async method."""
-        return await self.engine.tokenizer_manager.get_internal_state()
+    def _get_internal_state(self):
+        """Get internal state using synchronous method."""
+        server_info = self.engine.get_server_info()
+        return server_info["internal_states"][0]
 
-    async def _async_pause_generation(self, mode: str):
-        """Pause generation using async method."""
-        from sgl_jax.srt.managers.io_struct import PauseGenerationReqInput
-
-        obj = PauseGenerationReqInput(mode=mode)
-        await self.engine.tokenizer_manager.pause_generation(obj)
-
-    async def _async_continue_generation(self):
-        """Continue generation using async method."""
-        from sgl_jax.srt.managers.io_struct import ContinueGenerationReqInput
-
-        obj = ContinueGenerationReqInput()
-        await self.engine.tokenizer_manager.continue_generation(obj)
-
-    async def _async_generate(self, prompt: str, max_new_tokens: int):
-        """Generate using async method with temperature=0 for determinism."""
-        obj = GenerateReqInput(
-            text=prompt,
+    def _generate(self, prompt: str, max_new_tokens: int):
+        """Generate using synchronous method with temperature=0 for determinism."""
+        return self.engine.generate(
+            prompt=prompt,
             sampling_params={
                 "temperature": 0,
                 "max_new_tokens": max_new_tokens,
                 "ignore_eos": True,
             },
         )
-        generator = self.engine.tokenizer_manager.generate_request(obj, None)
-        return await generator.__anext__()
 
-    async def _run_generation_no_pause(self, prompt: str, max_new_tokens: int):
+    def _run_generation_no_pause(self, prompt: str, max_new_tokens: int):
         """Run generation without any pause."""
-        result = await self._async_generate(prompt, max_new_tokens)
+        result = self._generate(prompt, max_new_tokens)
         return result.get("text", "")
 
-    async def _run_generation_with_retract(
+    def _run_generation_with_retract(
         self, prompt: str, max_new_tokens: int, pause_delay: float = 1.0, log_state: bool = False
     ):
         """Run generation with retract mode pause in the middle."""
-        task = asyncio.create_task(self._async_generate(prompt, max_new_tokens))
+        # Start generation in a separate thread
+        executor = ThreadPoolExecutor(max_workers=1)
+        future = executor.submit(self._generate, prompt, max_new_tokens)
 
         # Wait for generation to start
-        await asyncio.sleep(pause_delay)
+        time.sleep(pause_delay)
 
         # Get state before pause
         if log_state:
-            states_before = await self._async_get_internal_state()
-            internal_before = states_before[0]
+            internal_before = self._get_internal_state()
             running_before = internal_before["running_batch_size"]
             waiting_before = internal_before["waiting_queue_size"]
             tokens_before = internal_before["available_kv_tokens"]
 
         # Pause with retract mode
-        await self._async_pause_generation(mode="retract")
-        await asyncio.sleep(0.5)
+        self.engine.pause_generation(mode="retract")
+        time.sleep(0.5)
 
         # Get state after pause
         if log_state:
-            states_after = await self._async_get_internal_state()
-            internal_after = states_after[0]
+            internal_after = self._get_internal_state()
             running_after = internal_after["running_batch_size"]
             waiting_after = internal_after["waiting_queue_size"]
             tokens_after = internal_after["available_kv_tokens"]
@@ -171,39 +156,46 @@ class TestEngineDeterministicGeneration(CustomTestCase):
             print(f"  Waiting Queue Size: {Colors.GREEN}{waiting_after}{Colors.RESET}")
             print(f"  Available KV Tokens: {Colors.GREEN}{tokens_after}{Colors.RESET}")
             print(f"{Colors.YELLOW}Changes:{Colors.RESET}")
-            print(f"  Running Batch: {Colors.RED}{running_before}{Colors.RESET} -> {Colors.GREEN}{running_after}{Colors.RESET} ({Colors.RED}-{running_before - running_after}{Colors.RESET})")
-            print(f"  Waiting Queue: {Colors.GREEN}{waiting_before}{Colors.RESET} -> {Colors.GREEN}{waiting_after}{Colors.RESET} ({Colors.GREEN}+{waiting_after - waiting_before}{Colors.RESET})")
+            print(
+                f"  Running Batch: {Colors.RED}{running_before}{Colors.RESET} -> {Colors.GREEN}{running_after}{Colors.RESET} ({Colors.RED}-{running_before - running_after}{Colors.RESET})"
+            )
+            print(
+                f"  Waiting Queue: {Colors.GREEN}{waiting_before}{Colors.RESET} -> {Colors.GREEN}{waiting_after}{Colors.RESET} ({Colors.GREEN}+{waiting_after - waiting_before}{Colors.RESET})"
+            )
             print(f"  KV Tokens Freed: {Colors.GREEN}+{tokens_after - tokens_before}{Colors.RESET}")
             print(f"{Colors.YELLOW}Verification:{Colors.RESET}")
-            
+
             # Verify running batch is cleared
             if running_after == 0:
                 print(f"  ✓ Running batch cleared: {Colors.GREEN}PASS{Colors.RESET}")
             else:
-                print(f"  ✗ Running batch NOT cleared: {Colors.RED}FAIL{Colors.RESET} (size={running_after})")
-            
+                print(
+                    f"  ✗ Running batch NOT cleared: {Colors.RED}FAIL{Colors.RESET} (size={running_after})"
+                )
+
             # Verify requests moved to waiting queue
             if waiting_after > waiting_before:
                 print(f"  ✓ Requests moved to waiting queue: {Colors.GREEN}PASS{Colors.RESET}")
             else:
                 print(f"  ✗ Requests NOT moved to waiting queue: {Colors.RED}FAIL{Colors.RESET}")
-            
+
             # Verify KV cache cleared
             if tokens_after > tokens_before:
                 print(f"  ✓ KV cache cleared (tokens freed): {Colors.GREEN}PASS{Colors.RESET}")
             else:
                 print(f"  ✗ KV cache NOT cleared: {Colors.RED}FAIL{Colors.RESET}")
-            
+
             print(f"{Colors.BOLD}{Colors.BLUE}=================================={Colors.RESET}\n")
 
         # Continue generation
-        await self._async_continue_generation()
+        self.engine.continue_generation()
 
         # Wait for completion
-        result = await task
+        result = future.result()
+        executor.shutdown(wait=True)
         return result.get("text", "")
 
-    async def _run_generation_with_abort_and_regenerate(
+    def _run_generation_with_abort_and_regenerate(
         self, prompt: str, max_new_tokens: int, pause_delay: float = 1.0
     ):
         """
@@ -215,39 +207,43 @@ class TestEngineDeterministicGeneration(CustomTestCase):
         - Cannot continue aborted requests
         - Must re-generate from scratch to get full result
         """
-        task = asyncio.create_task(self._async_generate(prompt, max_new_tokens))
+        # Start generation in a separate thread
+        executor = ThreadPoolExecutor(max_workers=1)
+        future = executor.submit(self._generate, prompt, max_new_tokens)
 
         # Wait for generation to start and produce some tokens
-        await asyncio.sleep(pause_delay)
+        time.sleep(pause_delay)
 
         # Abort all requests - they will be terminated
-        await self._async_pause_generation(mode="abort")
-        await asyncio.sleep(0.5)
+        self.engine.pause_generation(mode="abort")
+        time.sleep(0.5)
 
         # Reset is_paused flag (does NOT restore aborted requests)
-        await self._async_continue_generation()
+        self.engine.continue_generation()
 
         # Get partial result from aborted request
         try:
-            aborted_result = await task
+            aborted_result = future.result()
             partial_text = aborted_result.get("text", "")
         except Exception:
             partial_text = ""
 
+        executor.shutdown(wait=True)
+
         # Re-generate from scratch to get full result
-        regenerated_text = await self._run_generation_no_pause(prompt, max_new_tokens)
+        regenerated_text = self._run_generation_no_pause(prompt, max_new_tokens)
 
         return partial_text, regenerated_text
 
     # ============ Single Request Tests ============
 
-    async def _run_test_single_retract_vs_no_pause(self):
-        """Test single request: retract mode vs Baseline."""
-        # Run baseline 
-        baseline_text = await self._run_generation_no_pause(self.test_prompt, self.max_new_tokens)
+    def test_1_single_request_retract_vs_no_pause(self):
+        """Test single request: retract mode vs Baseline (length and tokens)."""
+        # Run baseline
+        baseline_text = self._run_generation_no_pause(self.test_prompt, self.max_new_tokens)
 
         # Run with retract mode (with state logging)
-        retract_text = await self._run_generation_with_retract(
+        retract_text = self._run_generation_with_retract(
             self.test_prompt, self.max_new_tokens, log_state=True
         )
 
@@ -282,20 +278,17 @@ class TestEngineDeterministicGeneration(CustomTestCase):
             "Retract mode should produce identical output as Baseline with temperature=0",
         )
 
-    async def _run_test_single_abort_vs_no_pause(self):
-        """
-        Test single request: abort mode vs Baseline.
+        print_test_passed(
+            "TestEngineDeterministicGeneration.test_1_single_request_retract_vs_no_pause"
+        )
 
-        Demonstrates:
-        1. Abort terminates request and returns partial result
-        2. After abort, must re-generate (not continue) to get full result
-        3. Re-generated result matches baseline (deterministic with temperature=0)
-        """
+    def test_2_single_request_abort_vs_no_pause(self):
+        """Test single request: abort mode vs Baseline (length and tokens)."""
         # Run baseline - full generation
-        baseline_text = await self._run_generation_no_pause(self.test_prompt, self.max_new_tokens)
+        baseline_text = self._run_generation_no_pause(self.test_prompt, self.max_new_tokens)
 
         # Run with abort, then re-generate
-        partial_text, regenerated_text = await self._run_generation_with_abort_and_regenerate(
+        partial_text, regenerated_text = self._run_generation_with_abort_and_regenerate(
             self.test_prompt, self.max_new_tokens
         )
 
@@ -339,49 +332,52 @@ class TestEngineDeterministicGeneration(CustomTestCase):
             "Re-generated result should match baseline (deterministic with temperature=0)",
         )
 
+        print_test_passed(
+            "TestEngineDeterministicGeneration.test_2_single_request_abort_vs_no_pause"
+        )
 
     # ============ Multiple Requests Tests ============
 
-    async def _run_test_multiple_retract_vs_no_pause(self):
-        """Test multiple requests: retract mode vs Baseline."""
+    def test_3_multiple_requests_retract_vs_no_pause(self):
+        """Test multiple requests: retract mode vs Baseline (length and tokens)."""
         num_requests = 4
         prompts = [f"{self.test_prompt} Story {i}:" for i in range(num_requests)]
 
         # Run baseline - run sequentially to ensure determinism
         baseline_texts = []
         for prompt in prompts:
-            text = await self._run_generation_no_pause(prompt, self.max_new_tokens)
+            text = self._run_generation_no_pause(prompt, self.max_new_tokens)
             baseline_texts.append(text)
 
         # Run with retract mode - all concurrent with pause in the middle
-        tasks = [
-            asyncio.create_task(self._async_generate(prompt, self.max_new_tokens))
-            for prompt in prompts
+        executor = ThreadPoolExecutor(max_workers=num_requests)
+        futures = [
+            executor.submit(self._generate, prompt, self.max_new_tokens) for prompt in prompts
         ]
 
         # Wait for generation to start
-        await asyncio.sleep(1.5)
+        time.sleep(1.5)
 
         # Get state before pause
-        states_before = await self._async_get_internal_state()
-        internal_before = states_before[0]
+        internal_before = self._get_internal_state()
         running_before = internal_before["running_batch_size"]
         waiting_before = internal_before["waiting_queue_size"]
         tokens_before = internal_before["available_kv_tokens"]
 
         # Pause with retract mode
-        await self._async_pause_generation(mode="retract")
-        await asyncio.sleep(0.5)
+        self.engine.pause_generation(mode="retract")
+        time.sleep(0.5)
 
         # Get state after pause
-        states_after = await self._async_get_internal_state()
-        internal_after = states_after[0]
+        internal_after = self._get_internal_state()
         running_after = internal_after["running_batch_size"]
         waiting_after = internal_after["waiting_queue_size"]
         tokens_after = internal_after["available_kv_tokens"]
 
         # Print state changes
-        print(f"\n{Colors.BOLD}{Colors.BLUE}=== Multiple Requests Retract Mode State Changes ==={Colors.RESET}")
+        print(
+            f"\n{Colors.BOLD}{Colors.BLUE}=== Multiple Requests Retract Mode State Changes ==={Colors.RESET}"
+        )
         print(f"{Colors.YELLOW}Before Pause:{Colors.RESET}")
         print(f"  Running Batch Size: {Colors.GREEN}{running_before}{Colors.RESET}")
         print(f"  Waiting Queue Size: {Colors.GREEN}{waiting_before}{Colors.RESET}")
@@ -391,40 +387,57 @@ class TestEngineDeterministicGeneration(CustomTestCase):
         print(f"  Waiting Queue Size: {Colors.GREEN}{waiting_after}{Colors.RESET}")
         print(f"  Available KV Tokens: {Colors.GREEN}{tokens_after}{Colors.RESET}")
         print(f"{Colors.YELLOW}Changes:{Colors.RESET}")
-        print(f"  Running Batch: {Colors.RED}{running_before}{Colors.RESET} -> {Colors.GREEN}{running_after}{Colors.RESET} ({Colors.RED}-{running_before - running_after}{Colors.RESET})")
-        print(f"  Waiting Queue: {Colors.GREEN}{waiting_before}{Colors.RESET} -> {Colors.GREEN}{waiting_after}{Colors.RESET} ({Colors.GREEN}+{waiting_after - waiting_before}{Colors.RESET})")
+        print(
+            f"  Running Batch: {Colors.RED}{running_before}{Colors.RESET} -> {Colors.GREEN}{running_after}{Colors.RESET} ({Colors.RED}-{running_before - running_after}{Colors.RESET})"
+        )
+        print(
+            f"  Waiting Queue: {Colors.GREEN}{waiting_before}{Colors.RESET} -> {Colors.GREEN}{waiting_after}{Colors.RESET} ({Colors.GREEN}+{waiting_after - waiting_before}{Colors.RESET})"
+        )
         print(f"  KV Tokens Freed: {Colors.GREEN}+{tokens_after - tokens_before}{Colors.RESET}")
         print(f"{Colors.YELLOW}Verification:{Colors.RESET}")
-        
+
         # Verify running batch is cleared
         if running_after == 0:
             print(f"  ✓ Running batch cleared: {Colors.GREEN}PASS{Colors.RESET}")
         else:
-            print(f"  ✗ Running batch NOT cleared: {Colors.RED}FAIL{Colors.RESET} (size={running_after})")
-        
+            print(
+                f"  ✗ Running batch NOT cleared: {Colors.RED}FAIL{Colors.RESET} (size={running_after})"
+            )
+
         # Verify requests moved to waiting queue
         if waiting_after > waiting_before:
             print(f"  ✓ Requests moved to waiting queue: {Colors.GREEN}PASS{Colors.RESET}")
         else:
             print(f"  ✗ Requests NOT moved to waiting queue: {Colors.RED}FAIL{Colors.RESET}")
-        
+
         # Verify KV cache cleared
         if tokens_after > tokens_before:
             print(f"  ✓ KV cache cleared (tokens freed): {Colors.GREEN}PASS{Colors.RESET}")
         else:
             print(f"  ✗ KV cache NOT cleared: {Colors.RED}FAIL{Colors.RESET}")
-        
-        print(f"{Colors.BOLD}{Colors.BLUE}===================================================={Colors.RESET}\n")
+
+        print(
+            f"{Colors.BOLD}{Colors.BLUE}===================================================={Colors.RESET}\n"
+        )
 
         # Continue generation
-        await self._async_continue_generation()
+        self.engine.continue_generation()
 
         # Wait for all tasks
-        results = await asyncio.gather(*tasks, return_exceptions=True)
+        results = []
+        for future in as_completed(futures):
+            try:
+                results.append(future.result())
+            except Exception as e:
+                results.append(e)
+        executor.shutdown(wait=True)
+
         retract_texts = [r.get("text", "") if isinstance(r, dict) else "" for r in results]
 
         # Summary comparison
-        print(f"\n{Colors.BOLD}{Colors.BLUE}=== Multiple Requests: Retract vs Baseline ==={Colors.RESET}")
+        print(
+            f"\n{Colors.BOLD}{Colors.BLUE}=== Multiple Requests: Retract vs Baseline ==={Colors.RESET}"
+        )
         for i in range(num_requests):
             match = baseline_texts[i] == retract_texts[i]
             len_diff = len(retract_texts[i]) - len(baseline_texts[i])
@@ -451,57 +464,57 @@ class TestEngineDeterministicGeneration(CustomTestCase):
                 f"Baseline: {len(baseline_texts[i])}, Retract: {len(retract_texts[i])}",
             )
 
-    async def _run_test_multiple_abort_vs_no_pause(self):
-        """
-        Test multiple requests: abort mode vs Baseline.
+        print_test_passed(
+            "TestEngineDeterministicGeneration.test_3_multiple_requests_retract_vs_no_pause"
+        )
 
-        Demonstrates:
-        1. Abort terminates ALL requests and returns partial results
-        2. After abort, must re-generate (not continue) to get full results
-        3. Re-generated results match baseline (deterministic with temperature=0)
-        """
+    def test_4_multiple_requests_abort_vs_no_pause(self):
+        """Test multiple requests: abort mode vs Baseline (length and tokens)."""
         num_requests = 4
         prompts = [f"{self.test_prompt} Story {i}:" for i in range(num_requests)]
 
         # Run baseline - full generation, run sequentially
         baseline_texts = []
         for prompt in prompts:
-            text = await self._run_generation_no_pause(prompt, self.max_new_tokens)
+            text = self._run_generation_no_pause(prompt, self.max_new_tokens)
             baseline_texts.append(text)
 
         # Run with abort mode - all concurrent, will be terminated
-        tasks = [
-            asyncio.create_task(self._async_generate(prompt, self.max_new_tokens))
-            for prompt in prompts
+        executor = ThreadPoolExecutor(max_workers=num_requests)
+        futures = [
+            executor.submit(self._generate, prompt, self.max_new_tokens) for prompt in prompts
         ]
 
         # Wait for generation to start and produce some tokens
-        await asyncio.sleep(1.5)
+        time.sleep(1.5)
 
         # Abort ALL requests - they will be terminated
-        await self._async_pause_generation(mode="abort")
-        await asyncio.sleep(0.5)
+        self.engine.pause_generation(mode="abort")
+        time.sleep(0.5)
 
         # Reset is_paused flag (does NOT restore aborted requests)
-        await self._async_continue_generation()
+        self.engine.continue_generation()
 
         # Get partial results from aborted requests
-        results = await asyncio.gather(*tasks, return_exceptions=True)
         partial_texts = []
-        for r in results:
-            if isinstance(r, dict):
-                partial_texts.append(r.get("text", ""))
-            else:
+        for future in as_completed(futures):
+            try:
+                result = future.result()
+                partial_texts.append(result.get("text", ""))
+            except Exception:
                 partial_texts.append("")
+        executor.shutdown(wait=True)
 
         # Re-generate ALL requests from scratch to get full results
         regenerated_texts = []
         for prompt in prompts:
-            text = await self._run_generation_no_pause(prompt, self.max_new_tokens)
+            text = self._run_generation_no_pause(prompt, self.max_new_tokens)
             regenerated_texts.append(text)
 
         # Summary comparison
-        print(f"\n{Colors.BOLD}{Colors.BLUE}=== Multiple Requests: Re-generated vs Baseline ==={Colors.RESET}")
+        print(
+            f"\n{Colors.BOLD}{Colors.BLUE}=== Multiple Requests: Re-generated vs Baseline ==={Colors.RESET}"
+        )
         print(f"{Colors.YELLOW}Note: After abort, must RE-GENERATE (cannot continue){Colors.RESET}")
         print(f"\n{Colors.CYAN}Partial Results (Aborted):{Colors.RESET}")
         for i in range(num_requests):
@@ -553,30 +566,6 @@ class TestEngineDeterministicGeneration(CustomTestCase):
                 f"Request {i}: Re-generated should match baseline (deterministic).",
             )
 
-    def test_1_single_request_retract_vs_no_pause(self):
-        """Test single request: retract mode vs Baseline (length and tokens)."""
-        self.engine.loop.run_until_complete(self._run_test_single_retract_vs_no_pause())
-        print_test_passed(
-            "TestEngineDeterministicGeneration.test_1_single_request_retract_vs_no_pause"
-        )
-
-    def test_2_single_request_abort_vs_no_pause(self):
-        """Test single request: abort mode vs Baseline (length and tokens)."""
-        self.engine.loop.run_until_complete(self._run_test_single_abort_vs_no_pause())
-        print_test_passed(
-            "TestEngineDeterministicGeneration.test_2_single_request_abort_vs_no_pause"
-        )
-
-    def test_3_multiple_requests_retract_vs_no_pause(self):
-        """Test multiple requests: retract mode vs Baseline (length and tokens)."""
-        self.engine.loop.run_until_complete(self._run_test_multiple_retract_vs_no_pause())
-        print_test_passed(
-            "TestEngineDeterministicGeneration.test_3_multiple_requests_retract_vs_no_pause"
-        )
-
-    def test_4_multiple_requests_abort_vs_no_pause(self):
-        """Test multiple requests: abort mode vs Baseline (length and tokens)."""
-        self.engine.loop.run_until_complete(self._run_test_multiple_abort_vs_no_pause())
         print_test_passed(
             "TestEngineDeterministicGeneration.test_4_multiple_requests_abort_vs_no_pause"
         )
