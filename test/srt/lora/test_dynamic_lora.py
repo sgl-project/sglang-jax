@@ -44,7 +44,7 @@ LORA_SETS = [
 DTYPES = ["bfloat16"]
 
 PROMPTS = [
-    "Chatgpt is a chat bot that can answer questions and generate text. It is",
+    "Chatgpt is a chat bot",
     "AI is a field of computer science focused on",
     "Computer science is the study of",
     "Write a short story.",
@@ -426,12 +426,16 @@ class TestLoRA(CustomTestCase):
                 *all_lora_paths,
                 "--max-loras-per-batch",
                 "3",
-                "--device",
-                "cpu",
-                "--num-layers",
+                "--model-layer-nums",
                 "1",
-                "--backend",
+                "--attention-backend",
                 "native",
+                "--max-total-tokens",
+                "1024",
+                "--max-running-requests",
+                "8",
+                "--chunked-prefill-size",
+                "1024",
             ]
 
             process_lora = popen_launch_server(
@@ -439,6 +443,8 @@ class TestLoRA(CustomTestCase):
                 base_url,
                 timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
                 other_args=server_args_lora,
+                device="cpu",
+                check_cache_miss=False,
             )
 
             try:
