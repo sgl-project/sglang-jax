@@ -200,14 +200,27 @@ def apply_qwix_quantization(
             return model
         
         qwix_quantize_nnx_model_for_eval_shape = functools.partial(
-            qwix_quantize_nnx_model, qwix_config=qwix_config, model_worker_batch=model_worker_batch, mesh=mesh, kv_head_num=num_kv_heads, head_dim=(head_dim + 127) // 128 * 128, layer_num=layer_num)
+            qwix_quantize_nnx_model, qwix_config=qwix_config, model_worker_batch=model_worker_batch)
         
         def create_and_quantize_model_factory() -> Callable:
             """
             Helper function to create and quantize the abstract model.
             """
             model = model_or_model_fn()
-            return nnx.jit(qwix_quantize_nnx_model_for_eval_shape(model=model, attn_backend=attn_backend))
+            return nnx.jit(
+                        qwix_quantize_nnx_model_for_eval_shape,
+                        static_argnames=(
+                            "mesh",
+                            "kv_head_num",
+                            "head_dim",
+                            "layer_num",
+                        ))(
+                        attn_backend=attn_backend,
+                        mesh=mesh,
+                        kv_head_num=num_kv_heads,
+                        head_dim=(head_dim + 127) // 128 * 128,
+                        layer_num=layer_num,
+                        model=model)
         
         return create_and_quantize_model_factory
         
