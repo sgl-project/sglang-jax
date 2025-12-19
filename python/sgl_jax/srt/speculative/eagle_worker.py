@@ -90,7 +90,7 @@ class EAGLEWorker(ModelWorker):
         else:
             # Share the embedding and lm_head
             self.draft_model_runner.model.set_embed_and_head(embed, head)
-            
+
             if self.hot_token_ids is not None:
                 head = head.clone()
                 self.hot_token_ids = device_array(

@@ -91,7 +91,7 @@ class MiMoMTPForCausalLM(nnx.Module):
         self.dtype = dtype
         self.config = config
         self.mesh = mesh
-        self.model = MiMoMTPLayer(config, dtype=self.dtype,  mesh=mesh)
+        self.model = MiMoMTPLayer(config, dtype=self.dtype, mesh=mesh)
         self.lm_head = ParallelLMHead(
             config.vocab_size,
             config.hidden_size,

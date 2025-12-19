@@ -2,7 +2,6 @@ import logging
 
 import jax
 import jax.numpy as jnp
-from flax import nnx
 from transformers import PretrainedConfig
 
 from sgl_jax.srt.configs.model_config import ModelConfig
