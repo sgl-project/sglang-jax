@@ -4,11 +4,18 @@ import os
 from collections.abc import Callable
 
 import uvicorn
+from fastapi import Request
 
 from sgl_jax.srt.entrypoints.http_server import _GlobalState, app, set_global_state
 from sgl_jax.srt.managers.template_manager import TemplateManager
 from sgl_jax.srt.multimodal.common.ServerArgs import MultimodalServerArgs
 from sgl_jax.srt.multimodal.manager.global_scheduler import run_global_scheduler_process
+from sgl_jax.srt.multimodal.manager.io_struct import (
+    ImageGenerationsRequest,
+    ImageResponse,
+    VideoGenerationsRequest,
+    VideoResponse,
+)
 from sgl_jax.srt.multimodal.manager.multimodal_detokenizer import (
     run_multimodal_detokenizer_process,
 )
@@ -17,6 +24,18 @@ from sgl_jax.srt.server_args import PortArgs
 from sgl_jax.srt.utils import kill_process_tree, set_uvicorn_logging_configs
 
 logger = logging.getLogger(__name__)
+
+
+@app.api_route("/api/v1/images/generation", methods=["POST", "PUT"])
+async def images_generation(obj: ImageGenerationsRequest, request: Request):
+    print(f"receive req {obj}")
+    return ImageResponse(id="test")
+
+
+@app.api_route("/api/v1/videos/generation", methods=["POST", "PUT"])
+async def videos_generation(obj: VideoGenerationsRequest, request: Request):
+    print(f"receive req {obj}")
+    return VideoResponse(id="test")
 
 
 def launch(
@@ -84,7 +103,7 @@ def launch(
     try:
         # Update logging configs
         set_uvicorn_logging_configs()
-
+        app.server_args = server_args
         # Listen for HTTP requests
         uvicorn.run(
             app,

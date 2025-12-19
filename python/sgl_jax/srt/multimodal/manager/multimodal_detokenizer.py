@@ -6,11 +6,8 @@ import setproctitle
 
 from sgl_jax.srt.managers.detokenizer_manager import DetokenizerManager
 from sgl_jax.srt.server_args import PortArgs, ServerArgs
-from sgl_jax.srt.utils import (
-    configure_logger,
-    get_exception_traceback,
-    kill_itself_when_parent_died,
-)
+from sgl_jax.srt.utils import configure_logger, kill_itself_when_parent_died
+from sgl_jax.utils import get_exception_traceback
 
 logger = logging.getLogger(__name__)
 
