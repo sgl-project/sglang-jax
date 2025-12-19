@@ -111,7 +111,6 @@ class Qwen2_5_VisionMLP(nnx.Module):
             hidden_size: int,
             intermediate_size: int,
             dtype: jnp.dtype = jnp.bfloat16,
-            rngs: nnx.Rngs = None,
             mesh: Mesh = None
     ):
         self.gate_proj = LinearBase(
@@ -120,7 +119,6 @@ class Qwen2_5_VisionMLP(nnx.Module):
             kernel_axes=(None, "tensor"),
             use_bias=True,
             params_dtype=dtype,
-            rngs=rngs,
             mesh=mesh,
         )
         self.up_proj = LinearBase(
@@ -129,7 +127,6 @@ class Qwen2_5_VisionMLP(nnx.Module):
             kernel_axes=(None, "tensor"),
             use_bias=True,
             params_dtype=dtype,
-            rngs=rngs,
             mesh=mesh,
         )
         self.down_proj = LinearBase(
@@ -138,7 +135,6 @@ class Qwen2_5_VisionMLP(nnx.Module):
             kernel_axes=("tensor", None),
             use_bias=True,
             params_dtype=dtype,
-            rngs=rngs,
             mesh=mesh,
         )
         self.act_fn = jax.nn.swish
@@ -215,7 +211,6 @@ class Qwen2_5_VisionAttention(nnx.Module):
             rope_scaling: dict[str, Any] | None = None,
             head_dim: int | None = None,
             dtype: jnp.dtype = jnp.bfloat16,
-            rngs: nnx.Rngs = None,
             mesh: Mesh = None,
     ):
         self.num_heads = num_heads
@@ -240,7 +235,6 @@ class Qwen2_5_VisionAttention(nnx.Module):
             kernel_axes=(None, "tensor"),
             use_bias=True,
             params_dtype=dtype,
-            rngs=rngs,
             mesh=mesh,
         )
 
@@ -250,7 +244,6 @@ class Qwen2_5_VisionAttention(nnx.Module):
             kernel_axes=("tensor", None),
             use_bias=True,
             params_dtype=dtype,
-            rngs=rngs,
             mesh=mesh,
         )
 
@@ -355,12 +348,10 @@ class Qwen2_5_VisionBlock(nnx.Module):
                                             rope_scaling=config.rope_scaling,
                                             head_dim=config.vision_config.hidden_size // config.vision_config.num_heads,
                                             dtype=dtype,
-                                            rngs=rngs,
                                             mesh=mesh)
         self.mlp = Qwen2_5_VisionMLP(hidden_size=config.vision_config.hidden_size,
                                      intermediate_size=config.vision_config.intermediate_size,
                                      dtype=dtype,
-                                     rngs=rngs,
                                      mesh=mesh)
 
     def __call__(self,
@@ -379,12 +370,12 @@ class Qwen2_5_VisionPatchEmbed(nnx.Module):
 
     def __init__(
         self,
-        rngs: nnx.Rngs,
         patch_size: int = 14,
         temporal_patch_size: int = 2,
         in_channels: int = 3,
         hidden_size: int = 1152,
         dtype: jnp.dtype = jnp.bfloat16,
+        rngs: nnx.Rngs = None,
     ):
         self.patch_size = patch_size
         self.temporal_patch_size = temporal_patch_size
@@ -396,7 +387,6 @@ class Qwen2_5_VisionPatchEmbed(nnx.Module):
                              kernel_size=kernel_size,
                              strides=kernel_size,
                              use_bias=False,
-                            #  padding="VALID",
                              param_dtype=dtype,
                              kernel_init=nnx.with_partitioning(
                                  nnx.initializers.uniform(),
@@ -448,7 +438,6 @@ class Qwen2_5_VisionPatchMerger(nnx.Module):
             kernel_axes=(None, "tensor"),
             use_bias=True,
             params_dtype=dtype,
-            rngs=rngs,
             mesh=mesh,
         )
         self.mlp_act = modeling_flax_utils.ACT2FN["gelu"]
@@ -458,7 +447,6 @@ class Qwen2_5_VisionPatchMerger(nnx.Module):
             kernel_axes=("tensor", None),
             use_bias=True,
             params_dtype=dtype,
-            rngs=rngs,
             mesh=mesh,
         )
 
@@ -726,12 +714,11 @@ class Qwen2_5_VLForConditionalGeneration(nnx.Module):
         self,
         config: Qwen2_5_VLConfig,
         dtype: jnp.dtype = jnp.bfloat16,
-        rng_key: jax.Array | None = None,
         mesh: Mesh = None,
     ) -> None:
 
         self.config = config
-        self.rng = nnx.Rngs(rng_key)
+        self.rng = nnx.Rngs(params=0)
         self.dtype = dtype
         self.mesh = mesh
 
@@ -746,7 +733,6 @@ class Qwen2_5_VLForConditionalGeneration(nnx.Module):
         self.model = Qwen2Model(
             config=config,
             dtype=dtype,
-            rngs=self.rng,
             mesh=mesh,
         )
 
@@ -756,7 +742,6 @@ class Qwen2_5_VLForConditionalGeneration(nnx.Module):
             dtype=dtype,
             param_dtype=dtype,
             kernel_axes=("tensor", None),
-            rngs=self.rng,
         )
 
         self.is_mrope_enabled = "mrope_section" in config.rope_scaling
@@ -871,17 +856,14 @@ class Qwen2_5_VLForConditionalGeneration(nnx.Module):
             positions=positions
         )
         
-        return self.logits_processor(hidden_states, self.model.embed_tokens, logits_metadata), layers_kv_fused, layers_callback_flag
+        return self.logits_processor(hidden_states, self.lm_head, logits_metadata), layers_kv_fused, layers_callback_flag
 
-    def load_weights(self, model_config, rng_key: jax.Array):
+    def load_weights(self, model_config):
         """Load weights for Qwen2.5-VL model.
         
         Args:
             model_config: Model configuration containing model path and settings
-            rng_key: JAX random key for initialization
         """
-        self.rng = nnx.Rngs(rng_key)
-        
         loader = WeightLoader(
             model=self,
             model_config=model_config,
@@ -923,7 +905,7 @@ class Qwen2_5_VLForConditionalGeneration(nnx.Module):
                     logger.warning(f"No mapping found for weight: {hf_key}")
         
         nnx.update(self, params)
-    
+
     def _create_qwen2_5_vl_weight_mappings(self) -> dict:
         """Create weight mappings for Qwen2.5-VL model.
         

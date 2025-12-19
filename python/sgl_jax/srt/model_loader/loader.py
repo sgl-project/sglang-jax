@@ -225,7 +225,7 @@ class JAXModelLoader(DefaultModelLoader):
         with jax.set_mesh(self.mesh):
             model = nnx.eval_shape(
                 lambda: model_class(
-                    model_config.hf_config, dtype=model_config.dtype, mesh=self.mesh
+                    model_config.hf_config, dtype=model_config.dtype, mesh=self.mesh,
                 )
             )
         model.load_weights(model_config)
