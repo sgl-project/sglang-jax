@@ -1605,54 +1605,57 @@ class TestModePerf(CustomTestCase):
         allow_gap = 0.03
         # max_concurrency:input_seq_len:ttft|itl|input_throughput|output_throughput
         # Note: ttft is median_ttft_ms, itl is median_itl_ms
-        # Baseline: fix/perf-reconstruct-model-state
+        # Baseline:
+        # - branch: epic/support-multi-lora
+        # - commit: Fix/mismatch len lora (#573)
+        # See more metrics from gcloud storage bucket: perf_data_tmp/sglang_jax_lora/epic_lora_09f5dab3f9c_align_test_perf_launch.tar
         expected_performance = {
             8: {
                 4096: {
-                    "ttft": 1728.32,
-                    "itl": 19.01,
-                    "input_throughput": 10075.81,
-                    "output_throughput": 373.12,
+                    "ttft": 1663.94,
+                    "itl": 19.37,
+                    "input_throughput": 14414.54,
+                    "output_throughput": 377.76,
                 }
             },
             16: {
                 4096: {
-                    "ttft": 3456.68,
-                    "itl": 21.32,
-                    "input_throughput": 18910.00,
-                    "output_throughput": 660.18,
+                    "ttft": 3327.81,
+                    "itl": 21.76,
+                    "input_throughput": 19633.36,
+                    "output_throughput": 651.62,
                 }
             },
             32: {
                 4096: {
-                    "ttft": 6908.34,
-                    "itl": 24.01,
-                    "input_throughput": 18928.30,
-                    "output_throughput": 853.00,
+                    "ttft": 6654.10,
+                    "itl": 24.67,
+                    "input_throughput": 19647.09,
+                    "output_throughput": 843.85,
                 }
             },
             64: {
                 4096: {
-                    "ttft": 13806.09,
-                    "itl": 24.09,
-                    "input_throughput": 18961.54,
-                    "output_throughput": 914.19,
+                    "ttft": 13301.45,
+                    "itl": 24.72,
+                    "input_throughput": 19677.24,
+                    "output_throughput": 913.20,
                 }
             },
             128: {
                 4096: {
-                    "ttft": 27631.62,
-                    "itl": 24.22,
-                    "input_throughput": 18960.85,
-                    "output_throughput": 928.03,
+                    "ttft": 26595.13,
+                    "itl": 24.81,
+                    "input_throughput": 19691.40,
+                    "output_throughput": 947.15,
                 }
             },
             256: {
                 4096: {
-                    "ttft": 55142.86,
-                    "itl": 24.25,
-                    "input_throughput": 18999.56,
-                    "output_throughput": 944.12,
+                    "ttft": 53191.76,
+                    "itl": 24.78,
+                    "input_throughput": 19697.55,
+                    "output_throughput": 951.46,
                 }
             },
         }
