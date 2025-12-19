@@ -66,7 +66,6 @@ class EAGLEWorker(ModelWorker):
             self.speculative_num_steps * self.topk, self.speculative_num_draft_tokens
         )
         embed, head = self.target_worker.model_runner.model.get_embed_and_head()
-
         if self.speculative_algorithm.is_eagle3():
             # most cases EAGLE3 models don't share lm_head
             # but some models (e.g. nvidia/gpt-oss-120b-Eagle3) shares
@@ -89,6 +88,9 @@ class EAGLEWorker(ModelWorker):
                     ),
                 )
         else:
+            # Share the embedding and lm_head
+            self.draft_model_runner.model.set_embed_and_head(embed, head)
+            
             if self.hot_token_ids is not None:
                 head = head.clone()
                 self.hot_token_ids = device_array(
@@ -100,9 +102,6 @@ class EAGLEWorker(ModelWorker):
                     ),
                 )
                 head.data = head.data[self.hot_token_ids]
-
-            # Share the embedding and lm_head
-            self.draft_model_runner.model.set_embed_and_head(embed, head)
 
         self.model_runner.initialize_jit()
         (

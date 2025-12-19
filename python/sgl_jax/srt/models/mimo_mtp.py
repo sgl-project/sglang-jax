@@ -97,6 +97,7 @@ class MiMoMTPForCausalLM(nnx.Module):
             config.hidden_size,
             dtype=dtype,
             param_dtype=dtype,
+            kernel_axes=("tensor", None),
         )
         self.load_lm_head_from_target = True
         self.logits_processor = LogitsProcessor(config.vocab_size, mesh=self.mesh)
@@ -113,8 +114,13 @@ class MiMoMTPForCausalLM(nnx.Module):
         target_prefix = "model.mtp_layers"
 
         mappings = {
+            "model.embed_tokens.weight": WeightMapping(
+                target_path="model.embed_tokens.embedding",
+                sharding=("tensor", None),
+                transpose=False,
+            ),
             "lm_head.weight": WeightMapping(
-                target_path="lm_head.embedding", sharding=(None, None), transpose=False
+                target_path="lm_head.embedding", sharding=("tensor", None), transpose=False
             ),
             f"{prefix}.input_layernorm.weight": WeightMapping(
                 target_path=f"{target_prefix}.input_layernorm.scale",
@@ -258,20 +264,7 @@ class MiMoMTPForCausalLM(nnx.Module):
         embed_weight: jax.Array | None = None,
         head_weight: jax.Array | None = None,
     ) -> None:
-        """Set word embedding and LM Head weights.
-
-        Args:
-            embed_weight: Embedding matrix with shape [vocab_size, hidden_size].
-            head_weight:  LM Head matrix with shape [vocab_size, hidden_size].
-        """
-
-        # Set embedding weight
-        if embed_weight is not None:
-            self.model.embed_tokens.embedding.value = embed_weight
-
-        # Set LM Head weight
-        if head_weight is not None:
-            self.lm_head.embedding.value = head_weight
+        pass
 
 
 EntryClass = MiMoMTPForCausalLM
