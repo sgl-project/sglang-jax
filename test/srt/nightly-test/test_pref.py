@@ -121,6 +121,7 @@ class TestModePerf(CustomTestCase):
             other_args=specific_args,
             env={
                 "JAX_COMPILATION_CACHE_DIR": "/tmp/jax_compilation_cache",
+                "SGLANG_JAX_PROFILER_DIR": trace_output_dir,
             },
         )
 
@@ -164,7 +165,7 @@ class TestModePerf(CustomTestCase):
                             seed=42,
                             extra_request_body=None,
                             lora_name=None,
-                            profile=False,
+                            profile=True,
                             pd_separated=False,
                             tokenize_prompt=False,
                             adjust_prompt_max_retry=10,
@@ -200,6 +201,9 @@ class TestModePerf(CustomTestCase):
                         time.sleep(1)
 
         finally:
+            print("[CI Info] Waiting for traces to flush...")
+            time.sleep(5)
+
             process.terminate()
             process.wait()
 
@@ -274,6 +278,7 @@ class TestModePerf(CustomTestCase):
             other_args=specific_args,
             env={
                 "JAX_COMPILATION_CACHE_DIR": "/tmp/jax_compilation_cache",
+                "SGLANG_JAX_PROFILER_DIR": trace_output_dir,
             },
         )
 
@@ -316,7 +321,7 @@ class TestModePerf(CustomTestCase):
                             seed=42,
                             extra_request_body=None,
                             lora_name=None,
-                            profile=False,
+                            profile=True,
                             pd_separated=False,
                             tokenize_prompt=False,
                             adjust_prompt_max_retry=10,
@@ -426,6 +431,7 @@ class TestModePerf(CustomTestCase):
             other_args=specific_args,
             env={
                 "JAX_COMPILATION_CACHE_DIR": "/tmp/jax_compilation_cache",
+                "SGLANG_JAX_PROFILER_DIR": trace_output_dir,
             },
         )
 
@@ -469,7 +475,7 @@ class TestModePerf(CustomTestCase):
                             seed=42,
                             extra_request_body=None,
                             lora_name=None,
-                            profile=False,
+                            profile=True,
                             pd_separated=False,
                             tokenize_prompt=False,
                             adjust_prompt_max_retry=10,
@@ -579,6 +585,7 @@ class TestModePerf(CustomTestCase):
             other_args=specific_args,
             env={
                 "JAX_COMPILATION_CACHE_DIR": "/tmp/jax_compilation_cache",
+                "SGLANG_JAX_PROFILER_DIR": trace_output_dir,
             },
         )
 
@@ -622,7 +629,7 @@ class TestModePerf(CustomTestCase):
                             seed=42,
                             extra_request_body=None,
                             lora_name=None,
-                            profile=False,
+                            profile=True,
                             pd_separated=False,
                             tokenize_prompt=False,
                             adjust_prompt_max_retry=10,
@@ -734,6 +741,7 @@ class TestModePerf(CustomTestCase):
             other_args=specific_args,
             env={
                 "JAX_COMPILATION_CACHE_DIR": "/tmp/jax_compilation_cache",
+                "SGLANG_JAX_PROFILER_DIR": trace_output_dir,
             },
         )
 
@@ -777,7 +785,7 @@ class TestModePerf(CustomTestCase):
                             seed=42,
                             extra_request_body=None,
                             lora_name=None,
-                            profile=False,
+                            profile=True,
                             pd_separated=False,
                             tokenize_prompt=False,
                             adjust_prompt_max_retry=10,
@@ -887,6 +895,7 @@ class TestModePerf(CustomTestCase):
             other_args=specific_args,
             env={
                 "JAX_COMPILATION_CACHE_DIR": "/tmp/jax_compilation_cache",
+                "SGLANG_JAX_PROFILER_DIR": trace_output_dir,
             },
         )
 
@@ -930,7 +939,7 @@ class TestModePerf(CustomTestCase):
                             seed=42,
                             extra_request_body=None,
                             lora_name=None,
-                            profile=False,
+                            profile=True,
                             pd_separated=False,
                             tokenize_prompt=False,
                             adjust_prompt_max_retry=10,
@@ -1065,6 +1074,7 @@ class TestModePerf(CustomTestCase):
             ],
             env={
                 "JAX_COMPILATION_CACHE_DIR": "/tmp/jax_compilation_cache",
+                "SGLANG_JAX_PROFILER_DIR": trace_output_dir,
             },
         )
 
@@ -1108,7 +1118,7 @@ class TestModePerf(CustomTestCase):
                             seed=42,
                             extra_request_body=None,
                             lora_name=None,
-                            profile=False,
+                            profile=True,
                             pd_separated=False,
                             tokenize_prompt=False,
                             adjust_prompt_max_retry=10,
@@ -1220,6 +1230,7 @@ class TestModePerf(CustomTestCase):
             other_args=specific_args,
             env={
                 "JAX_COMPILATION_CACHE_DIR": "/tmp/jax_compilation_cache",
+                "SGLANG_JAX_PROFILER_DIR": trace_output_dir,
             },
         )
 
@@ -1263,7 +1274,7 @@ class TestModePerf(CustomTestCase):
                             seed=42,
                             extra_request_body=None,
                             lora_name=None,
-                            profile=False,
+                            profile=True,
                             pd_separated=False,
                             tokenize_prompt=False,
                             adjust_prompt_max_retry=10,
@@ -1361,6 +1372,7 @@ class TestModePerf(CustomTestCase):
             other_args=specific_args,
             env={
                 "JAX_COMPILATION_CACHE_DIR": "/tmp/jax_compilation_cache",
+                "SGLANG_JAX_PROFILER_DIR": trace_output_dir,
             },
         )
 
@@ -1404,7 +1416,7 @@ class TestModePerf(CustomTestCase):
                             seed=42,
                             extra_request_body=None,
                             lora_name=None,
-                            profile=False,
+                            profile=True,
                             pd_separated=False,
                             tokenize_prompt=False,
                             adjust_prompt_max_retry=10,
@@ -1503,6 +1515,7 @@ class TestModePerf(CustomTestCase):
             other_args=specific_args,
             env={
                 "JAX_COMPILATION_CACHE_DIR": "/tmp/jax_compilation_cache",
+                "SGLANG_JAX_PROFILER_DIR": trace_output_dir,
             },
         )
 
@@ -1546,7 +1559,7 @@ class TestModePerf(CustomTestCase):
                             seed=42,
                             extra_request_body=None,
                             lora_name=None,
-                            profile=False,
+                            profile=True,
                             pd_separated=False,
                             tokenize_prompt=False,
                             adjust_prompt_max_retry=10,
