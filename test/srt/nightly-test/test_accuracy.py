@@ -1186,23 +1186,6 @@ class TestModelAccuracy(CustomTestCase):
             "2",
         ]
 
-        persistent_cache_dir = os.getenv(
-            "JAX_COMPILATION_CACHE_DIR", "/model/jax_compilation_cache/QWEN3_MOE_30B"
-        )
-
-        if not os.path.exists(persistent_cache_dir):
-            try:
-                os.makedirs(persistent_cache_dir, exist_ok=True)
-                print(f"[CI Info] Created JAX Cache Dir: {persistent_cache_dir}")
-            except Exception as e:
-                print(f"[CI Error] Failed to create cache dir: {e}. Fallback to /tmp")
-                persistent_cache_dir = "/tmp/jax_compilation_cache"
-
-        print(f"[CI Info] Using JAX Cache Dir: {persistent_cache_dir}")
-
-        os.makedirs(persistent_cache_dir, exist_ok=True)
-        print(f"[CI Info] Using JAX Cache Dir: {persistent_cache_dir}")
-
         process = popen_launch_server(
             model_path_for_server,
             DEFAULT_URL_FOR_TEST,
