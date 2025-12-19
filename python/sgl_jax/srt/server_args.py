@@ -888,13 +888,12 @@ class ServerArgs:
 
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace):
+        args.tp_size = args.tensor_parallel_size
+        args.dp_size = args.data_parallel_size
         if cls is ServerArgs and getattr(args, "multimodal", False):
             from sgl_jax.srt.multimodal.common.ServerArgs import MultimodalServerArgs
 
             return MultimodalServerArgs.from_cli_args(args)
-
-        args.tp_size = args.tensor_parallel_size
-        args.dp_size = args.data_parallel_size
         attrs = [attr.name for attr in dataclasses.fields(cls)]
         return cls(**{attr: getattr(args, attr) for attr in attrs})
 
@@ -913,6 +912,9 @@ class ServerArgs:
 
         parser = argparse.ArgumentParser()
         cls.add_cli_args(parser)
+        from sgl_jax.srt.multimodal.common.ServerArgs import MultimodalServerArgs
+
+        MultimodalServerArgs.add_cli_args(parser)
         return cls.from_cli_args(parser.parse_args(argv or sys.argv[1:]))
 
     def url(self):
