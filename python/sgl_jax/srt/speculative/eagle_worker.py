@@ -268,7 +268,7 @@ class EAGLEWorker(ModelWorker):
 
     def capture_for_decode(
         self, logits_output: LogitsProcessorOutput, draft_input: EagleDraftInput
-    ):
+    ):  
         topk_p, topk_index = topk_probs_from_logits(logits_output.next_token_logits, self.topk)
         draft_input.topk_p = topk_p
         draft_input.topk_index = topk_index
@@ -580,34 +580,36 @@ class EAGLEWorker(ModelWorker):
         forward_batch.cache_loc = np.empty((1,))
         forward_batch.spec_info = EagleDraftInput()
         forward_batch.spec_info.hidden_states = jnp.empty((bs * self.topk, hidden_states.shape[1]))
-        for i in range(self.speculative_num_steps):
-            input_ids, hidden_states, scores, tree_info = select_top_k_tokens(
-                i, topk_p, topk_index, hidden_states, scores, self.topk
-            )
-            # update_eagle_lists and update_forward_batch_info this two function will make accept rate very low if be jitted
-            # FIXME we should find it out why lead this ?
-            score_list, token_list, parents_list = update_eagle_lists(
-                i, score_list, token_list, parents_list, tree_info, self.topk
-            )
-            if i == self.speculative_num_steps - 1:
-                break
-            forward_batch = update_forward_batch_info(
-                forward_batch, i, input_ids, hidden_states, positions_base
-            )
-            self.draft_model_runner.attn_backend.forward_metadata = metadata_per_step[i]
-            # Run forward
-            logits_output, _ = self.draft_model_runner.forward(
-                forward_batch,
-                logits_metadata=logits_metadata,
-            )
-            topk_p, topk_index = topk_probs_from_logits(
-                logits_output.next_token_logits[: model_worker_batch.real_bs * self.topk], self.topk
-            )
-            if self.hot_token_ids is not None:
-                topk_index = self.hot_token_ids[topk_index]
-            hidden_states = logits_output.hidden_states[
-                : model_worker_batch.real_bs * self.topk * self.topk, :
-            ]
+        ctx = jax.set_mesh(self.mesh)
+        with ctx:
+            for i in range(self.speculative_num_steps):
+                input_ids, hidden_states, scores, tree_info = select_top_k_tokens(
+                    i, topk_p, topk_index, hidden_states, scores, self.topk
+                )
+                # update_eagle_lists and update_forward_batch_info this two function will make accept rate very low if be jitted
+                # FIXME we should find it out why lead this ?
+                score_list, token_list, parents_list = update_eagle_lists(
+                    i, score_list, token_list, parents_list, tree_info, self.topk
+                )
+                if i == self.speculative_num_steps - 1:
+                    break
+                forward_batch = update_forward_batch_info(
+                    forward_batch, i, input_ids, hidden_states, positions_base
+                )
+                self.draft_model_runner.attn_backend.forward_metadata = metadata_per_step[i]
+                # Run forward
+                logits_output, _ = self.draft_model_runner.forward(
+                    forward_batch,
+                    logits_metadata=logits_metadata,
+                )
+                topk_p, topk_index = topk_probs_from_logits(
+                    logits_output.next_token_logits[: model_worker_batch.real_bs * self.topk], self.topk
+                )
+                if self.hot_token_ids is not None:
+                    topk_index = self.hot_token_ids[topk_index]
+                hidden_states = logits_output.hidden_states[
+                    : model_worker_batch.real_bs * self.topk * self.topk, :
+                ]
 
         return score_list, token_list, parents_list
 
@@ -838,9 +840,12 @@ def select_top_k_tokens_step_greater_0(
     topk_index = topk_index.reshape(-1, topk**2)
     input_ids = jnp.take_along_axis(topk_index, topk_cs_index, axis=1).flatten()
     if hidden_states.shape[0] > 0:
-        selected_input_index = topk_cs_index.flatten() // topk + jnp.repeat(
-            jnp.arange(0, hidden_states.shape[0], topk), topk
-        )
+        # Use broadcast instead of repeat to avoid "Please pass sharding" error
+        bs_dim = hidden_states.shape[0] // topk
+        base_indices = jnp.arange(0, hidden_states.shape[0], topk)
+        base_indices_expanded = jnp.broadcast_to(base_indices[:, None], (bs_dim, topk)).reshape(-1)
+
+        selected_input_index = topk_cs_index.flatten() // topk + base_indices_expanded
         hidden_states = hidden_states[selected_input_index, :]
     tree_info = (
         expand_scores,  # shape: (b, topk, topk)

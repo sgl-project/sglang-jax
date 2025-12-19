@@ -97,7 +97,6 @@ class MiMoMTPForCausalLM(nnx.Module):
             config.hidden_size,
             dtype=dtype,
             param_dtype=dtype,
-            kernel_axes=("tensor", None),
         )
         self.load_lm_head_from_target = True
         self.logits_processor = LogitsProcessor(config.vocab_size, mesh=self.mesh)
@@ -120,7 +119,7 @@ class MiMoMTPForCausalLM(nnx.Module):
                 transpose=False,
             ),
             "lm_head.weight": WeightMapping(
-                target_path="lm_head.embedding", sharding=("tensor", None), transpose=False
+                target_path="lm_head.embedding", sharding=(None, None), transpose=False
             ),
             f"{prefix}.input_layernorm.weight": WeightMapping(
                 target_path=f"{target_prefix}.input_layernorm.scale",
