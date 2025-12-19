@@ -16,6 +16,7 @@ import threading
 from collections.abc import AsyncIterator, Iterator
 from typing import Any
 
+import jax
 import uvloop
 import zmq
 import zmq.asyncio
@@ -213,7 +214,9 @@ class Engine(EngineBase):
         model_runner = self.scheduler_info["scheduler"].tp_worker.worker.model_runner
         model_state = nnx.split(model_runner.model)[1]
         new_state = traverse_and_update(model_state, target_modules)
-        nnx.update(model_runner.model, new_state)
+        self.scheduler_info["scheduler"].tp_worker.worker.model_runner.model_state_leaves, _ = (
+            jax.tree_util.tree_flatten(new_state)
+        )
 
     def encode(
         self,
