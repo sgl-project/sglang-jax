@@ -91,12 +91,26 @@ class JAXModelLoader(BaseModelLoader):
         return model_class
 
     def _get_model(self, model_class: Any, model_config: ModelConfig) -> nnx.Module:
+        # will add abstract model here
+        def create_model() -> nnx.Module:
+            """
+            Helper class to create model and can be used for nnx.eval_shape.
+
+            Returns:
+                An abstract model function.
+            """
+            return model_class(model_config.hf_config, dtype=model_config.dtype, mesh=self.mesh)
+        
+        model_fn = create_model
+        if model_config.use_abstract_model:
+            model_fn = apply_qwix_quantization(model_config, model_fn, self.mesh)
+            logger.info("abstract model_fn created...")
+            
         with jax.set_mesh(self.mesh):
             model = nnx.eval_shape(
-                lambda: model_class(
-                    model_config.hf_config, dtype=model_config.dtype, mesh=self.mesh
-                )
+                model_fn
             )
+            
         model.load_weights(model_config)
         return model
 

@@ -44,6 +44,7 @@ class ModelConfig:
         model_impl: str | ModelImpl = ModelImpl.AUTO,
         quantization: str | None = None,
         quantization_config_path: str | None = None,
+        use_abstract_model: bool = False,
         model_layer_nums: int | None = None,
     ) -> None:
 
@@ -52,6 +53,7 @@ class ModelConfig:
         self.model_impl = model_impl
         self.quantization = quantization
         self.quantization_config_path = quantization_config_path
+        self.use_abstract_model = use_abstract_model
         # if ep_size > 1, use ep moe, else use fused moe
         # TODO: support ep moe with ETP
         self.ep_size = 1
@@ -179,6 +181,7 @@ class ModelConfig:
             quantization_config_path=server_args.quantization_config_path,
             model_impl=server_args.model_impl,
             model_layer_nums=server_args.model_layer_nums,
+            use_abstract_model=server_args.use_abstract_model,
             **kwargs,
         )
 

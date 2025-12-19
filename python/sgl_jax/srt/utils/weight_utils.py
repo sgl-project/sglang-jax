@@ -15,6 +15,7 @@ from jax.sharding import Mesh
 from jax.sharding import PartitionSpec as P
 from safetensors import safe_open
 from tqdm import tqdm
+import qwix
 
 from sgl_jax.srt.configs.model_config import ModelConfig
 
@@ -721,6 +722,12 @@ class WeightLoader:
                         stacked_weight.shape,
                     )
 
+        # before update, quantize weights if use_abstract_model is True
+        if self.model_config.use_abstract_model:
+            # convert params to pure dict
+            params_dict = nnx.to_pure_dict(params)
+            # quantize params_dict
+            params = qwix.quantize_params(params_dict, self.model)
         nnx.update(self.model, params)
         logger.info("All weights loaded successfully.")
 

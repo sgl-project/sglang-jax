@@ -253,7 +253,7 @@ class ModelRunner:
             model_config=self.model_config,
         )
         
-        if self.model_config.quantization_config_path is not None:
+        if self.model_config.quantization_config_path is not None and not self.model_config.use_abstract_model:
             self.model = apply_qwix_quantization(self.model_config, self.model, self.mesh)
 
         # Parse other args

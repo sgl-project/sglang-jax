@@ -50,6 +50,7 @@ class ServerArgs:
     quantization: str | None = None
     quantization_param_path: str | None = None
     quantization_config_path: str | None = None
+    use_abstract_model: bool = False
     kv_cache_dtype: str = "auto"
 
     # Memory and scheduling
@@ -421,6 +422,11 @@ class ServerArgs:
             type=str,
             default=None,
             help="The config path for how to apply quantization to loaded model."
+        )
+        parser.add_argument(
+            "--use-abstract-model",
+            action="store_true",
+            help="Whether to use the abstract model.",
         )
         parser.add_argument(
             "--kv-cache-dtype",

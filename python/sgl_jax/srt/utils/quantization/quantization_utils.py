@@ -147,7 +147,7 @@ def quantization_config_file_path_to_dict(
 
 
 def apply_qwix_quantization(
-        model_config: ModelConfig, model: nnx.Module, mesh: Mesh) -> nnx.Module:
+        model_config: ModelConfig, model_or_model_fn: Callable | nnx.Module, mesh: Mesh) -> Callable | nnx.Module:
         from sgl_jax.srt.layers.attention.flashattention_backend import (
                     FlashAttention,
 )
@@ -165,6 +165,7 @@ def apply_qwix_quantization(
         head_dim = model_config.head_dim
         vocab_size = model_config.vocab_size
         layer_num = model_config.num_hidden_layers
+        apply_qwix_quantization = model_config.use_abstract_model
         
         
         model_worker_batch = generate_mock_model_worker_batch(bs, num_tokens, ForwardMode.DECODE, vocab_size, max_seq_len)
@@ -177,24 +178,41 @@ def apply_qwix_quantization(
             mesh=mesh,
         )
         
-        qwix_quantize_nnx_model_with_config_and_attn_backend = functools.partial(
+        
+        if not apply_qwix_quantization:
+            qwix_quantize_nnx_model_with_config_and_worker_batch = functools.partial(
             qwix_quantize_nnx_model, qwix_config=qwix_config, model_worker_batch=model_worker_batch)
-        with jax.set_mesh(mesh):
-            model = nnx.jit(
-                    qwix_quantize_nnx_model_with_config_and_attn_backend,
-                    static_argnames=(
-                        "mesh",
-                        "kv_head_num",
-                        "head_dim",
-                        "layer_num",
-                    ))(
-                    attn_backend=attn_backend,
-                    mesh=mesh,
-                    kv_head_num=num_kv_heads,
-                    head_dim=(head_dim + 127) // 128 * 128,
-                    layer_num=layer_num,
-                    model=model)
-        return model
+            with jax.set_mesh(mesh):
+                model = nnx.jit(
+                        qwix_quantize_nnx_model_with_config_and_worker_batch,
+                        static_argnames=(
+                            "mesh",
+                            "kv_head_num",
+                            "head_dim",
+                            "layer_num",
+                        ))(
+                        attn_backend=attn_backend,
+                        mesh=mesh,
+                        kv_head_num=num_kv_heads,
+                        head_dim=(head_dim + 127) // 128 * 128,
+                        layer_num=layer_num,
+                        model=model)
+            return model
+        
+        qwix_quantize_nnx_model_for_eval_shape = functools.partial(
+            qwix_quantize_nnx_model, qwix_config=qwix_config, model_worker_batch=model_worker_batch, mesh=mesh, kv_head_num=num_kv_heads, head_dim=(head_dim + 127) // 128 * 128, layer_num=layer_num)
+        
+        def create_and_quantize_model_factory() -> Callable:
+            """
+            Helper function to create and quantize the abstract model.
+            """
+            model = model_or_model_fn()
+            return nnx.jit(qwix_quantize_nnx_model_for_eval_shape(model=model, attn_backend=attn_backend))
+        
+        return create_and_quantize_model_factory
+        
+        
+        
 
 
 def manually_quantize_qwix_weight(weight: jax.Array, qtype: jnp.dtype,
