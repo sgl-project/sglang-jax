@@ -26,35 +26,32 @@ class MiMoMTPLayer(nnx.Module):
         config: PretrainedConfig,
         layer_id: int = 0,
         dtype: jnp.dtype = jnp.bfloat16,
-        rngs: nnx.Rngs | None = None,
         mesh: jax.sharding.Mesh | None = None,
     ):
         self.layer_id = layer_id
         self.embed_tokens = Embed(
             num_embeddings=config.vocab_size,
             features=config.hidden_size,
-            rngs=rngs,
             dtype=dtype,
             kernel_axes=("tensor", None),
             param_dtype=dtype,
             mesh=mesh,
         )
-        self.token_layernorm = RMSNorm(config.hidden_size, epsilon=config.rms_norm_eps, rngs=rngs)
-        self.hidden_layernorm = RMSNorm(config.hidden_size, epsilon=config.rms_norm_eps, rngs=rngs)
+        self.token_layernorm = RMSNorm(config.hidden_size, epsilon=config.rms_norm_eps)
+        self.hidden_layernorm = RMSNorm(config.hidden_size, epsilon=config.rms_norm_eps)
         self.input_proj = LinearBase(
             input_size=config.hidden_size * 2,
             output_size=config.hidden_size,
             use_bias=False,
             kernel_axes=(None, None),
-            rngs=rngs,
             params_dtype=dtype,
             mesh=mesh,
         )
 
         self.mtp_layers = Qwen2DecoderLayer(
-            config=config, layer_id=layer_id, dtype=dtype, rngs=rngs, mesh=mesh
+            config=config, layer_id=layer_id, dtype=dtype, mesh=mesh
         )
-        self.final_layernorm = RMSNorm(config.hidden_size, epsilon=config.rms_norm_eps, rngs=rngs)
+        self.final_layernorm = RMSNorm(config.hidden_size, epsilon=config.rms_norm_eps)
 
     def __call__(self, forward_batch: ForwardBatch, token_to_kv_pool: KVCache):
         hidden_states = self.embed_tokens(forward_batch.input_ids)
@@ -89,20 +86,17 @@ class MiMoMTPForCausalLM(nnx.Module):
         self,
         config: PretrainedConfig,
         dtype: jnp.dtype = jnp.bfloat16,
-        rngs: nnx.Rngs | None = None,
         mesh: jax.sharding.Mesh | None = None,
     ):
         self.dtype = dtype
-        self.rngs = rngs
         self.config = config
         self.mesh = mesh
-        self.model = MiMoMTPLayer(config, dtype=self.dtype, rngs=rngs, mesh=mesh)
+        self.model = MiMoMTPLayer(config, dtype=self.dtype,  mesh=mesh)
         self.lm_head = ParallelLMHead(
             config.vocab_size,
             config.hidden_size,
             dtype=dtype,
             param_dtype=dtype,
-            rngs=rngs,
         )
         self.load_lm_head_from_target = True
         self.logits_processor = LogitsProcessor(config.vocab_size, mesh=self.mesh)
@@ -221,11 +215,10 @@ class MiMoMTPForCausalLM(nnx.Module):
 
         return mappings
 
-    def load_weights(self, model_config: ModelConfig, rng_key: jax.Array):
-        self.rng = nnx.Rngs(rng_key)
+    def load_weights(self, model_config: ModelConfig):
 
         loader = WeightLoader(
-            model=self, model_config=model_config, mesh=self.mesh, dtype=self.dtype, is_eagle=True
+            model=self, model_config=model_config, mesh=self.mesh, dtype=self.dtype
         )
 
         weight_mappings = self._create_mimo_weight_mappings()
@@ -278,8 +271,7 @@ class MiMoMTPForCausalLM(nnx.Module):
 
         # Set LM Head weight
         if head_weight is not None:
-            pass
-            # self.lm_head.embedding.value = head_weight
+            self.lm_head.embedding.value = head_weight
 
 
 EntryClass = MiMoMTPForCausalLM

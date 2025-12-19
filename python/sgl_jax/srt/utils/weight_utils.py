@@ -97,13 +97,11 @@ class WeightLoader:
         model_config: ModelConfig,
         mesh: Mesh,
         dtype: jnp.dtype = jnp.bfloat16,
-        is_eagle: bool = False,
     ):
         self.model = model
         self.model_config = model_config
         self.mesh = mesh
         self.dtype = dtype
-        self.is_eagle = is_eagle
         self.dummy_mode = getattr(model_config, "_dummy_mode", False)
 
         self.num_heads = model_config.num_attention_heads
@@ -565,10 +563,7 @@ class WeightLoader:
                         target_path = mapping.target_path
                         model_param = self._get_param(params, target_path)
                         model_param.value = lazy_weight.astype(model_param.value.dtype)
-                elif not self.is_eagle:
-                    logger.warning("No mapping found for weight: %s", hf_key)
-                else:
-                    pass
+
                         mode_str = "Split-Stitch" if is_split_weight else "Direct"
                         logger.debug(
                             "Fast Loading %s -> %s (%s), shape: %s",

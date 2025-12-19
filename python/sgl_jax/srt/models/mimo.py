@@ -16,26 +16,23 @@ class MiMoModel(Qwen2Model):
     def __init__(
         self,
         config: PretrainedConfig,
-        dtype: jnp.dtype = jnp.bfloat16,
-        rngs: nnx.Rngs | None = None,
         mesh: jax.sharding.Mesh | None = None,
+        dtype: jnp.dtype = jnp.bfloat16,
     ):
-        super().__init__(config=config, dtype=dtype, rngs=rngs, mesh=mesh)
+        super().__init__(config=config, mesh=mesh, dtype=dtype)
 
 
 class MiMoForCausalLM(Qwen2ForCausalLM):
     def __init__(
         self,
         config: PretrainedConfig,
-        dtype: jnp.dtype = jnp.bfloat16,
-        rngs: nnx.Rngs | None = None,
         mesh: jax.sharding.Mesh | None = None,
+        dtype: jnp.dtype = jnp.bfloat16,
     ):
-        super().__init__(config, dtype, rngs, mesh)
-        self.model = MiMoModel(config, dtype=self.dtype, rngs=rngs, mesh=mesh)
+        super().__init__(config, mesh, dtype)
+        self.model = MiMoModel(config, mesh=mesh, dtype=self.dtype)
 
-    def load_weights(self, model_config: ModelConfig, rng_key: jax.Array):
-        self.rng = nnx.Rngs(rng_key)
+    def load_weights(self, model_config: ModelConfig):
 
         loader = WeightLoader(
             model=self,
