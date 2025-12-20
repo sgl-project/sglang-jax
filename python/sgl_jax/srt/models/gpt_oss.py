@@ -17,7 +17,7 @@ from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
 from sgl_jax.srt.precision_tracer import precision_tracer
 from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
 
-from jax.sharding import PartitionSpec as P
+from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 logger = logging.getLogger(__name__)
 
@@ -31,12 +31,19 @@ from flax import nnx
 from jax import numpy as jnp
 from jaxtyping import Array, ArrayLike
 
-def mxfp4_dequantization(scales, blocks):
+def mxfp4_dequantization(
+    scales,
+    blocks,
+    mesh: jax.sharding.Mesh,
+    sharding_spec,
+    dtype: jnp.dtype):
     nr_elem__per_blk = blocks.shape[-1] * 2
+
     high_bits = jnp.right_shift(blocks, 4) & 0x0F
     low_bits = blocks & 0x0F
 
     interleaved = jnp.stack([low_bits, high_bits], axis=-1)
+
     interleaved = interleaved.reshape(blocks.shape[:-1] + (nr_elem__per_blk,))
 
     e2m1__to__float = {
@@ -59,17 +66,21 @@ def mxfp4_dequantization(scales, blocks):
     }
     e2m1_lut = [e2m1__to__float[i] for i in range(16)]
     e2m1_lut = jnp.array(e2m1_lut, dtype=jnp.float16)
+    e2m1_lut = jax.device_put(e2m1_lut, jax.sharding.NamedSharding(mesh, P()))
 
-    interleaved = e2m1_lut[interleaved]
+    interleaved = e2m1_lut.at[interleaved].get(out_sharding=interleaved.sharding)
     scales = scales.astype(dtype=jnp.int16)
     scales = scales - 127
 
-    scales_expanded = scales[..., jnp.newaxis]
-    dequantized = jax.numpy.ldexp(interleaved, scales_expanded).astype(dtype=jnp.bfloat16)
+    scales = scales[..., jnp.newaxis]
+
+    dequantized = jax.numpy.ldexp(interleaved, scales).astype(dtype=dtype)
 
     dequantized = dequantized.reshape(dequantized.shape[:-2] + (-1,))
+    dequantized = dequantized.transpose((0, 2, 1))
+    dequantized = jax.device_put(dequantized, jax.sharding.NamedSharding(mesh, P(*sharding_spec)))
 
-    return dequantized.transpose((0, 2, 1))
+    return dequantized
 
 
 
@@ -302,12 +313,24 @@ class MLPBlock(nnx.Module):
         )
 
 
-    def init_weight(self):
-        self.gate_up_proj = nnx.Param(mxfp4_dequantization(self.gate_up_proj_scales.value, self.gate_up_proj_blocks.value))
+    def init_weight(
+        self,
+        mesh: jax.sharding.Mesh,
+        dtype: jnp.dtype,
+    ):
+        self.gate_up_proj = nnx.Param(mxfp4_dequantization(
+            self.gate_up_proj_scales.value,
+            self.gate_up_proj_blocks.value,
+            mesh, ("tensor", None, None), dtype)
+        )
         delattr(self, "gate_up_proj_scales")
         delattr(self, "gate_up_proj_blocks")
 
-        self.down_proj = nnx.Param(mxfp4_dequantization(self.down_proj_scales.value, self.down_proj_blocks.value))
+        self.down_proj = nnx.Param(mxfp4_dequantization(
+            self.down_proj_scales.value,
+            self.down_proj_blocks.value,
+            mesh, ("tensor", None, None), dtype)
+        )
         delattr(self, "down_proj_scales")
         delattr(self, "down_proj_blocks")
 
@@ -404,17 +427,9 @@ class GptOssModel(nnx.Module):
              for layer_idx in range(config.num_hidden_layers)]
         )
 
-        # self.norm = RMSNorm(config.hidden_size, config, rngs=rngs)
-        self.norm = RMSNorm(config.hidden_size,epsilon=1e-5, dtype=dtype)
+        self.norm = RMSNorm(config.hidden_size, epsilon=1e-5, dtype=dtype)
 
-        # self.unembedding = nnx.Linear(
-        #         config.hidden_size,
-        #         config.vocab_size,
-        #         use_bias=False,
-        #         dtype=jnp.bfloat16,
-        #         rngs=rngs,
-        #     )
-        self.unembedding = LinearBase(
+        self.lm_head = LinearBase(
             config.hidden_size,
             config.vocab_size,
             mesh,
@@ -443,7 +458,7 @@ class GptOssModel(nnx.Module):
             layers_callback_flag.extend(callback_flag)
 
         x = self.norm(x)
-        x = self.unembedding(x)
+        x = self.lm_head(x)
 
         callback_flag = precision_tracer.jit_pure_callback_record(
             x, "transformer_output", "TRANSFORMER"
@@ -477,7 +492,7 @@ class GptOssForCausalLM(nnx.Module):
         loader.load_weights_from_safetensors(weight_mappings)
 
         for layer_id in range(self.config.num_hidden_layers):
-            self.model.block[layer_id].mlp.init_weight()
+            self.model.block[layer_id].mlp.init_weight(self.mesh, self.dtype)
 
         params = nnx.state(self.model)
         nnx.update(self.model, params)
@@ -497,7 +512,7 @@ class GptOssForCausalLM(nnx.Module):
             mappings.update({
                 f"{prefix}.input_layernorm.weight": WeightMapping(
                     target_path=f"{target_prefix}.attn.norm.scale",
-                    # sharding=("tensor", None),
+                    sharding=("tensor", ),
                     transpose=False,
                 ),
             })
@@ -628,6 +643,21 @@ class GptOssForCausalLM(nnx.Module):
                 ),
             })
 
+        
+        mappings.update({
+            f"model.norm.weight": WeightMapping(
+                target_path=f"model.norm.scale",
+                sharding=("tensor", ),
+                transpose=False,
+            ),
+        })
+        mappings.update({
+            f"model.lm_head.weight": WeightMapping(
+                target_path=f"model.lm_head.weight",
+                sharding=(),
+                transpose=False,
+            ),
+        })
 
         return mappings
 
