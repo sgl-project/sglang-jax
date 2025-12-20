@@ -27,12 +27,13 @@ import math
 from typing import Any
 
 import jax
+import jax.numpy as jnp
+import numpy as np
 from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import triton as plgpu
-import jax.numpy as jnp
-import numpy as np
-from jax.sharding import Mesh, PartitionSpec as P
+from jax.sharding import Mesh
+from jax.sharding import PartitionSpec as P
 
 DEFAULT_MASK_VALUE = -0.7 * float(np.finfo(np.dtype("float32")).max)
 
@@ -187,7 +188,6 @@ def paged_attention_unbatched(
     mesh: Mesh | None = None,
     sharding_axis: str = "tensor",
 ) -> jax.Array:
-
     # This function receives the local tensor that has been split by shard_map.
     def _local_impl(
         q_loc, k_pages_loc, v_pages_loc, block_tables_loc, lengths_loc, k_scales_loc, v_scales_loc
@@ -242,7 +242,7 @@ def paged_attention_unbatched(
             v_scales_spec = None
 
         grid = (num_kv_heads, head_splits, k_splits)
-        o, l, m = pl.pallas_call(
+        partial_out, partial_exp_sums, partial_max_logits = pl.pallas_call(
             kernel,
             grid=grid,
             in_specs=[
@@ -285,20 +285,22 @@ def paged_attention_unbatched(
         )
 
         if q_heads_per_kv_head % block_h:
-            o = o[..., :q_heads_per_kv_head, :]
-            l = l[..., :q_heads_per_kv_head]
-            m = m[..., :q_heads_per_kv_head]
+            partial_out = partial_out[..., :q_heads_per_kv_head, :]
+            partial_exp_sums = partial_exp_sums[..., :q_heads_per_kv_head]
+            partial_max_logits = partial_max_logits[..., :q_heads_per_kv_head]
 
         # final round of flash
-        m_next = m.max(axis=0)
-        correction = jnp.exp(m - m_next[None])
-        o = o * correction[..., None].astype(o.dtype)
-        l_next = (l * correction).sum(axis=0)
+        m_next = partial_max_logits.max(axis=0)
+        correction = jnp.exp(partial_max_logits - m_next[None])
+        partial_out = partial_out * correction[..., None].astype(partial_out.dtype)
+        l_next = (partial_exp_sums * correction).sum(axis=0)
         eps = jnp.finfo(l_next.dtype).eps
-        o = o.sum(axis=0) / ((l_next[..., None] + eps).astype(o.dtype))
+        partial_out = partial_out.sum(axis=0) / (
+            (l_next[..., None] + eps).astype(partial_out.dtype)
+        )
 
-        o = o.reshape(q_loc.shape).astype(q_loc.dtype)
-        return o
+        partial_out = partial_out.reshape(q_loc.shape).astype(q_loc.dtype)
+        return partial_out
 
     if mesh is None:
         return _local_impl(q, k_pages, v_pages, block_table, length, k_scales_pages, v_scales_pages)
@@ -417,7 +419,7 @@ def paged_attention(
         )
     if head_dim_k != head_dim:
         raise ValueError(
-            "head_dim of Q must be the same as that of K/V. Got" f" {head_dim} and {head_dim_k}."
+            f"head_dim of Q must be the same as that of K/V. Got {head_dim} and {head_dim_k}."
         )
     if batch_size_paged_indices != batch_size:
         raise ValueError("`block_tables` and `q` must have the same batch size")

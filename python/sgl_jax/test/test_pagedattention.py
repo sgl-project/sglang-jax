@@ -1,4 +1,5 @@
 import unittest
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -47,7 +48,9 @@ class TestPagedAttention(CustomTestCase):
         )
 
         # 3. Construct Page Table and Paged K/V Buffers
-        actual_pages_needed_per_seq = [(l + page_size - 1) // page_size for l in seq_lens]
+        actual_pages_needed_per_seq = [
+            (seq_len + page_size - 1) // page_size for seq_len in seq_lens
+        ]
         max_actual_pages = max(actual_pages_needed_per_seq)
 
         # Pad width of block_tables to next power of two
@@ -160,7 +163,7 @@ class TestPagedAttention(CustomTestCase):
 
     def test_mha_standard(self):
         """Test standard Multi-Head Attention (MHA)."""
-        self.run_compare_test(
+        self.run_test(
             batch_size=4, num_heads=32, num_kv_heads=32, seq_lens=[128, 64, 512, 200], page_size=16
         )
 
@@ -168,19 +171,19 @@ class TestPagedAttention(CustomTestCase):
         """Iterate through page sizes to ensure correct safe-page and padding logic."""
         for ps in [1, 2, 4, 8, 16, 32]:
             with self.subTest(page_size=ps):
-                self.run_compare_test(
+                self.run_test(
                     batch_size=2, num_heads=16, num_kv_heads=16, seq_lens=[111, 222], page_size=ps
                 )
 
     def test_gqa_standard(self):
         """Test Grouped-Query Attention (GQA)."""
-        self.run_compare_test(
+        self.run_test(
             batch_size=2, num_heads=32, num_kv_heads=8, seq_lens=[1024, 513], page_size=16
         )
 
     def test_soft_cap(self):
         """Test Logit Soft Capping."""
-        self.run_compare_test(
+        self.run_test(
             batch_size=1, num_heads=8, num_kv_heads=8, seq_lens=[256], page_size=16, soft_cap=30.0
         )
 
@@ -189,7 +192,7 @@ class TestPagedAttention(CustomTestCase):
         if self.num_devices < 1:
             self.skipTest("At least 1 GPU/TPU device is required.")
 
-        self.run_compare_test(
+        self.run_test(
             batch_size=4,
             num_heads=16,
             num_kv_heads=4,
@@ -205,7 +208,7 @@ class TestPagedAttention(CustomTestCase):
 
     def test_irregular_lengths(self):
         """Test lengths that are not multiples of page_size."""
-        self.run_compare_test(
+        self.run_test(
             batch_size=8,
             num_heads=4,
             num_kv_heads=4,
@@ -214,9 +217,7 @@ class TestPagedAttention(CustomTestCase):
         )
 
     def test_long_sequences(self):
-        self.run_compare_test(
-            batch_size=1, num_heads=8, num_kv_heads=8, seq_lens=[16384], page_size=16
-        )
+        self.run_test(batch_size=1, num_heads=8, num_kv_heads=8, seq_lens=[16384], page_size=16)
 
 
 if __name__ == "__main__":
