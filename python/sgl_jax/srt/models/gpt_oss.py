@@ -629,7 +629,8 @@ class GptOssForCausalLM(nnx.Module):
         )
         weight_mappings = self._create_llama_weight_mappings()
         loader.load_weights_from_safetensors(weight_mappings)
-        for layer_id in range(1):
+
+        for layer_id in range(self.config.num_hidden_layers):
             self.model.block[layer_id].mlp.init_weight()
 
         params = nnx.state(self.model)
@@ -644,8 +645,7 @@ class GptOssForCausalLM(nnx.Module):
             ),
         }
 
-        num_layers = self.config.num_hidden_layers
-        for layer_idx in range(1): #TODO
+        for layer_idx in range(self.config.num_hidden_layers):
             prefix = f"model.layers.{layer_idx}"
             target_prefix = f"model.block.{layer_idx}"
             mappings.update({
