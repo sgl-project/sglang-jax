@@ -17,6 +17,8 @@ from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
 from sgl_jax.srt.precision_tracer import precision_tracer
 from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
 
+from jax.sharding import PartitionSpec as P
+
 logger = logging.getLogger(__name__)
 
 init_fn = nnx.initializers.uniform()
@@ -31,7 +33,51 @@ from flax import nnx
 # from jax import P
 from jax import numpy as jnp
 from jaxtyping import Array, ArrayLike
+from jax import lax
 
+def mxfp4_dequantization(scales, blocks):
+    nr_elem__per_blk = blocks.shape[-1] * 2
+    high_bits = jnp.right_shift(blocks, 4) & 0x0F
+    low_bits = blocks & 0x0F
+
+    interleaved = jnp.stack([high_bits, low_bits], axis=-1)
+    interleaved = interleaved.reshape(blocks.shape[:-1] + (nr_elem__per_blk,))
+
+    e2m1__to__float = {
+        0b1111:-6.0,
+        0b1110:-4.0,
+        0b1101:-3.0,
+        0b1100:-2.0,
+        0b1011:-1.5,
+        0b1010:-1.0,
+        0b1001:-0.5,
+        0b1000:-0.0,
+        0b0000:+0.0,
+        0b0001:+0.5,
+        0b0010:+1.0,
+        0b0011:+1.5,
+        0b0100:+2.0,
+        0b0101:+3.0,
+        0b0110:+4.0,
+        0b0111:+6.0,
+    }
+    e2m1_lut = [e2m1__to__float[i] for i in range(16)]
+    e2m1_lut = jnp.array(e2m1_lut, dtype=jnp.float16)
+
+    scale_lut = [2**(exp - 127) for exp in range(256)]
+    scale_lut = jnp.array(scale_lut, dtype=jnp.float64)
+
+    interleaved = e2m1_lut[interleaved]
+    scales = scale_lut[scales]
+
+    scales_expanded = scales[..., jnp.newaxis]  # 添加最后一个维度
+    scales_expanded = jnp.broadcast_to(scales_expanded, interleaved.shape)
+
+    dequantized = interleaved * scales_expanded
+    dequantized = dequantized.astype(dtype=jnp.bfloat16)
+    dequantized = dequantized.reshape(dequantized.shape[:-2] + (-1,))
+
+    return dequantized
 
 
 # @dataclasses.dataclass(frozen=True)
@@ -301,9 +347,11 @@ class MLPBlock(nnx.Module):
                  mesh: jax.sharding.Mesh,
                  dtype: jnp.dtype):
         # self.num_experts = config.num_experts
-        self.num_experts = 128
+        self.num_experts = config.num_local_experts
         self.experts_per_token = config.experts_per_token
         self.swiglu_limit = config.swiglu_limit
+        self.hidden_size = config.hidden_size
+        self.intermediate_size = config.intermediate_size
 
         # self.norm = RMSNorm(config.hidden_size, config, rngs=rngs)
         self.norm = RMSNorm(config.hidden_size, epsilon=1e-5, dtype=dtype)
@@ -317,6 +365,33 @@ class MLPBlock(nnx.Module):
             use_bias=True,
             params_dtype=dtype,
             kernel_axes=(None, "tensor"))
+
+
+        # self.gate_up_proj = nn.Parameter(torch.empty(self.num_experts, self.hidden_size, 2 * self.expert_dim))
+        # self.gate_up_proj_bias = nn.Parameter(torch.empty(self.num_experts, 2 * self.expert_dim))
+        # self.gate_up_proj = nnx.Param(
+        #         nnx.initializers.normal()(
+        #             nnx.Rngs(0).params(),
+        #             (self.num_experts, config.hidden_size, 2 * config.intermediate_size),
+        #         )
+        #     )
+
+
+        self.gate_up_proj_scales = nnx.Param(
+            jnp.zeros((self.num_experts, config.hidden_size, 2 * config.intermediate_size // 32), dtype=jnp.uint8)
+        )
+        self.gate_up_proj_blocks = nnx.Param(
+            jnp.zeros((self.num_experts, config.hidden_size, 2 * config.intermediate_size // 32, 32 // 2), dtype=jnp.uint8)
+        )
+
+        # self.up_proj = LinearBase(
+        #     input_size=config.hidden_size,
+        #     output_size=intermediate_size,
+        #     kernel_axes=(None, "tensor"),
+        #     use_bias=False,
+        #     params_dtype=dtype,
+        #     mesh=mesh,
+        # )
 
         # MLP weights (per expert)
         # mlp1: [num_experts, intermediate_size * 2, hidden_size]
@@ -344,6 +419,11 @@ class MLPBlock(nnx.Module):
         # mlp2 bias: [num_experts, hidden_size]
         self.mlp2_bias = nnx.Param(nnx.initializers.normal()(nnx.Rngs(0).params(), (self.num_experts, config.hidden_size)))
 
+    def init_weight(self):
+        ret = mxfp4_dequantization(self.gate_up_proj_scales.value, self.gate_up_proj_blocks.value)
+        self.gate_up_proj = nnx.Param(jnp.zeros((self.num_experts, self.hidden_size, 2 * self.intermediate_size)))
+        pass
+
     def __call__(self, x: Array) -> Array:
         t = self.norm(x)
         g, _ = self.gate(t)  # [batch, seq_len, num_experts] or [batch, num_experts]
@@ -357,14 +437,17 @@ class MLPBlock(nnx.Module):
         # torch softmax on dim=1 corresponds to axis=1 in jax (over experts_per_token dimension)
         expert_weights = jax.nn.softmax(expert_weights, axis=-1)
 
+        gate_up = jnp.einsum("", x, self.gate_up_proj.value)
+
+        gate_up = torch.bmm(hidden_states, self.gate_up_proj) + self.gate_up_proj_bias[..., None, :]
         # MLP #1
         # Gather expert weights
         # If expert_indices is [batch, seq_len, experts_per_token], then:
         # mlp1_weight[expert_indices, ...] -> [batch, seq_len, experts_per_token, intermediate_size * 2, hidden_size]
         # Access Param value - use direct indexing which should work with nnx.Param
         # If _value is ShapeDtypeStruct, nnx will handle it during computation
-        mlp1_weight = self.mlp1_weight.at[expert_indices, ...].get(out_sharding=("Tensor", None))
-        mlp1_bias = self.mlp1_bias.at[expert_indices, ...].get(out_sharding=("Tensor", None))
+        mlp1_weight = self.mlp1_weight.at[expert_indices, ...].get(out_sharding=P("tensor", None, None, None))
+        mlp1_bias = self.mlp1_bias.at[expert_indices, ...].get(out_sharding=P("tensor", None))
         # try:
         # except (TypeError, AttributeError) as e:
         #     # Fallback: try to access _value directly
@@ -581,6 +664,8 @@ class GptOssForCausalLM(nnx.Module):
         )
         weight_mappings = self._create_llama_weight_mappings()
         loader.load_weights_from_safetensors(weight_mappings)
+        for layer_id in range(1):
+            self.model.block[layer_id].mlp.init_weight()
 
     def _create_llama_weight_mappings(self) -> dict:
         mappings = {
@@ -693,22 +778,27 @@ class GptOssForCausalLM(nnx.Module):
                     transpose=False,
                 ),
             })
-
+            mappings.update({
+                f"{prefix}.mlp.experts.gate_up_proj_scales": WeightMapping(
+                    target_path=f"{target_prefix}.mlp.gate_up_proj_scales",
+                    sharding=(None, None, None),
+                    transpose=False,
+                ),
+            })
             mappings.update({
                 f"{prefix}.mlp.experts.gate_up_proj_blocks": WeightMapping(
-                    target_path=f"{target_prefix}.mlp.mlp1_weight",
-                    sharding=("tensor", ),
+                    target_path=f"{target_prefix}.mlp.gate_up_proj_blocks",
+                    sharding=(None, None, None, None),
                     transpose=False,
                 ),
             })
-
-            mappings.update({
-                f"{prefix}.mlp.experts.gate_up_proj_bias": WeightMapping(
-                    target_path=f"{target_prefix}.mlp.mlp1_bias",
-                    sharding=("tensor", ),
-                    transpose=False,
-                ),
-            })
+            # mappings.update({
+            #     f"{prefix}.mlp.experts.gate_up_proj_bias": WeightMapping(
+            #         target_path=f"{target_prefix}.mlp.mlp1_bias",
+            #         sharding=(None, None, None, None),
+            #         transpose=False,
+            #     ),
+            # })
             # "model.layers.0.post_attention_layernorm.weight": "model-00000-of-00002.safetensors",
             # "model.layers.0.mlp.router.bias": "model-00000-of-00002.safetensors",
             # "model.layers.0.mlp.router.weight": "model-00000-of-00002.safetensors",
