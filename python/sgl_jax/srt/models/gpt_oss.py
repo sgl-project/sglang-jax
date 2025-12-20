@@ -23,17 +23,13 @@ logger = logging.getLogger(__name__)
 
 init_fn = nnx.initializers.uniform()
 
-# import dataclasses
 import math
-# from functools import partial
 from typing import Tuple
 
 import jax
 from flax import nnx
-# from jax import P
 from jax import numpy as jnp
 from jaxtyping import Array, ArrayLike
-from jax import lax
 
 def mxfp4_dequantization(scales, blocks):
     nr_elem__per_blk = blocks.shape[-1] * 2
@@ -76,50 +72,6 @@ def mxfp4_dequantization(scales, blocks):
     return dequantized.transpose((0, 2, 1))
 
 
-# @dataclasses.dataclass(frozen=True)
-# class ModelConfig:
-#     num_hidden_layers: int
-#     num_experts: int
-#     experts_per_token: int
-#     vocab_size: int
-#     hidden_size: int
-#     intermediate_size: int
-#     swiglu_limit: float
-#     head_dim: int
-#     num_attention_heads: int
-#     num_key_value_heads: int
-#     sliding_window: int
-#     initial_context_length: int
-#     rope_theta: float
-#     rope_scaling_factor: float
-#     rope_ntk_alpha: float
-#     rope_ntk_beta: float
-
-#     @classmethod
-#     def _from_param(cls, **kwargs):
-#         return cls(**kwargs)
-
-#     @classmethod
-#     def default(cls):
-#         """Default OSS model configuration."""
-#         return cls._from_param(
-#             num_hidden_layers=36,
-#             num_experts=128,
-#             experts_per_token=4,
-#             vocab_size=201088,
-#             hidden_size=2880,
-#             intermediate_size=2880,
-#             swiglu_limit=7.0,
-#             head_dim=64,
-#             num_attention_heads=64,
-#             num_key_value_heads=8,
-#             sliding_window=128,
-#             initial_context_length=4096,
-#             rope_theta=150000.0,
-#             rope_scaling_factor=32.0,
-#             rope_ntk_alpha=1.0,
-#             rope_ntk_beta=32.0,
-#         )
 
 
 def _apply_rotary_emb(x: jnp.ndarray, cos: jnp.ndarray, sin: jnp.ndarray) -> jnp.ndarray:
@@ -215,23 +167,11 @@ class AttentionBlock(nnx.Module):
         self.head_dim = config.head_dim
         self.num_attention_heads = config.num_attention_heads
         self.num_key_value_heads = config.num_key_value_heads
-        # Only apply sliding window to every other layer
         self.sliding_window = config.sliding_window if layer_idx % 2 == 0 else 0
 
-        # Sink tokens parameter
         self.sinks = nnx.Param(jnp.zeros((config.num_attention_heads,), dtype))
         self.norm = RMSNorm(config.hidden_size, epsilon=1e-5, param_dtype=dtype)
 
-        # QKV projection
-        qkv_dim = config.head_dim * (config.num_attention_heads + 2 * config.num_key_value_heads)
-        # self.qkv = nnx.Linear(config.hidden_size, qkv_dim, use_bias=False, dtype=jnp.bfloat16, rngs=rngs)
-        # self.qkv = LinearBase(
-        #     config.hidden_size,
-        #     qkv_dim,
-        #     mesh,
-        #     use_bias=False,
-        #     params_dtype=dtype,
-        #     kernel_axes=(None, "tensor"))
         q_dim = self.num_attention_heads * self.head_dim
         self.q_proj = LinearBase(
             config.hidden_size,
@@ -279,14 +219,6 @@ class AttentionBlock(nnx.Module):
             layer_id=layer_idx,
         )
 
-        # Output projection
-        # self.out = nnx.Linear(
-        #         config.head_dim * config.num_attention_heads,
-        #         config.hidden_size,
-        #         use_bias=False,
-        #         dtype=jnp.bfloat16,
-        #         rngs=nnx.Rngs(0),
-        #     )
         self.o_proj = LinearBase(
             config.head_dim * config.num_attention_heads,
             config.hidden_size,
@@ -309,7 +241,6 @@ class AttentionBlock(nnx.Module):
         k, _ = self.k_proj(t)
         v, _ = self.v_proj(t) # TODO: v 的精度有问题
 
-        # q_dim = self.num_attention_heads * self.head_dim
         q = q.reshape(-1, self.num_attention_heads, self.head_dim)
         k = k.reshape(-1, self.num_key_value_heads, self.head_dim)
         v = v.reshape(-1, self.num_key_value_heads, self.head_dim)
@@ -326,32 +257,23 @@ class AttentionBlock(nnx.Module):
         return t, kv_fused
 
 
-def swiglu(x: jnp.ndarray, alpha: float = 1.702, limit: float = 7.0) -> jnp.ndarray:
-    """Swish-Gated Linear Unit activation."""
-    x_glu, x_linear = x[..., ::2], x[..., 1::2]
-    # Clamp the input values
-    x_glu = jnp.clip(x_glu, a_min=None, a_max=limit)
-    x_linear = jnp.clip(x_linear, a_min=-limit, a_max=limit)
-    out_glu = x_glu * jax.nn.sigmoid(alpha * x_glu)
-    # Note we add an extra bias of 1 to the linear layer
-    return out_glu * (x_linear + 1)
-
 
 class MLPBlock(nnx.Module):
     def __init__(self, 
                  config: ModelConfig,
                  mesh: jax.sharding.Mesh,
                  dtype: jnp.dtype):
-        # self.num_experts = config.num_experts
         self.num_experts = config.num_local_experts
         self.experts_per_token = config.experts_per_token
         self.swiglu_limit = config.swiglu_limit
         self.hidden_size = config.hidden_size
         self.expert_dim = config.intermediate_size
+        self.alpha = 1.702
+        self.limit = 7.0
 
         self.norm = RMSNorm(config.hidden_size, epsilon=1e-5, dtype=dtype)
 
-        self.gate = LinearBase(
+        self.router = LinearBase(
             config.hidden_size,
             self.num_experts,
             mesh,
@@ -391,112 +313,38 @@ class MLPBlock(nnx.Module):
 
     def __call__(self, x: Array) -> Array:
         t = self.norm(x)
-        g, _ = self.gate(t)  # [batch, seq_len, num_experts] or [batch, num_experts]
+        router_logits, _ = self.router(t)
 
-        # Top-k expert selection
-        # torch.topk operates on dim=-1 (last dimension), so if g is [batch, seq_len, num_experts],
-        # topk returns [batch, seq_len, experts_per_token]
-        expert_weights, expert_indices = jax.lax.top_k(g, k=self.experts_per_token)
-        # expert_weights: [batch, seq_len, experts_per_token] or [batch, experts_per_token]
-        # expert_indices: [batch, seq_len, experts_per_token] or [batch, experts_per_token]
-        # torch softmax on dim=1 corresponds to axis=1 in jax (over experts_per_token dimension)
-        expert_weights = jax.nn.softmax(expert_weights, axis=-1)
+        router_logits = jax.device_put(router_logits, P(None, None))
 
-        gate_up = jnp.einsum("", x, self.gate_up_proj.value)
+        router_top_value, router_indices = jax.lax.top_k(router_logits, k=self.experts_per_token)
 
-        gate_up = torch.bmm(hidden_states, self.gate_up_proj) + self.gate_up_proj_bias[..., None, :]
-        # MLP #1
-        # Gather expert weights
-        # If expert_indices is [batch, seq_len, experts_per_token], then:
-        # mlp1_weight[expert_indices, ...] -> [batch, seq_len, experts_per_token, intermediate_size * 2, hidden_size]
-        # Access Param value - use direct indexing which should work with nnx.Param
-        # If _value is ShapeDtypeStruct, nnx will handle it during computation
-        mlp1_weight = self.mlp1_weight.at[expert_indices, ...].get(out_sharding=P("tensor", None, None, None))
-        mlp1_bias = self.mlp1_bias.at[expert_indices, ...].get(out_sharding=P("tensor", None))
-        # try:
-        # except (TypeError, AttributeError) as e:
-        #     # Fallback: try to access _value directly
-        #     from flax.nnx import variablelib
-        #     from jax import ShapeDtypeStruct
-        #     if isinstance(self.mlp1_weight, variablelib.Param):
-        #         mlp1_weight_val = getattr(self.mlp1_weight, '_value', None)
-        #         if mlp1_weight_val is not None and not isinstance(mlp1_weight_val, ShapeDtypeStruct):
-        #             mlp1_weight = mlp1_weight_val[expert_indices, ...]
-        #         else:
-        #             # If still ShapeDtypeStruct, this means weights weren't loaded
-        #             # Try to get from the model's state directly
-        #             raise RuntimeError(f"mlp1_weight is ShapeDtypeStruct - weights not loaded. Error: {e}")
-        #     else:
-        #         raise
+        router_top_value = jax.device_put(router_top_value, P(None, None))
+        router_indices = jax.device_put(router_indices, P(None, None))
+
+        router_top_value = jax.nn.softmax(router_top_value, axis=-1)
+
+        nr_tokens = router_logits.shape[0]
+        token_indices = jnp.arange(nr_tokens)[:, None].repeat(self.experts_per_token, axis=1)
+    
+        router_scores = jnp.zeros_like(router_logits).at[token_indices, router_indices].set(router_top_value)
+    
+
+        t = t[None, ... ]
+        t = jnp.repeat(t, self.num_experts, axis=0)
         
-        # einsum: handle both 2D and 3D cases
-        # mlp1_weight: [batch, seq_len, experts_per_token, intermediate_size * 2, hidden_size] or [batch, experts_per_token, intermediate_size * 2, hidden_size]
-        # t: [batch, seq_len, hidden_size] or [batch, hidden_size]
-        # Use 'k' for hidden_size dimension to avoid conflict with 'c' (intermediate_size * 2)
-        if len(mlp1_weight.shape) == 5:
-            # 3D case: [batch, seq_len, experts_per_token, intermediate_size * 2, hidden_size]
-            # bseck: batch, seq_len, experts_per_token, intermediate_size*2, hidden_size
-            # bsk: batch, seq_len, hidden_size
-            # bsec: batch, seq_len, experts_per_token, intermediate_size*2
-            t = jnp.einsum("bseck,bsk->bsec", mlp1_weight, t) + mlp1_bias
-        else:
-            # 2D case: [batch, experts_per_token, intermediate_size * 2, hidden_size]
-            # beck: batch, experts_per_token, intermediate_size*2, hidden_size
-            # bk: batch, hidden_size
-            # bec: batch, experts_per_token, intermediate_size*2
-            t = jnp.einsum("beck,bk->bec", mlp1_weight, t) + mlp1_bias
-        t = swiglu(t, limit=self.swiglu_limit)
+        gate_up = jnp.matmul(t, self.gate_up_proj) + self.gate_up_proj_bias[:, None, :]
+        gate, up = gate_up[..., ::2], gate_up[..., 1::2]
 
-        # MLP #2
-        try:
-            mlp2_weight = self.mlp2_weight[expert_indices, ...]
-            mlp2_bias = self.mlp2_bias[expert_indices, ...]
-        except (TypeError, AttributeError) as e:
-            from flax.nnx import variablelib
-            from jax import ShapeDtypeStruct
-            if isinstance(self.mlp2_weight, variablelib.Param):
-                mlp2_weight_val = getattr(self.mlp2_weight, '_value', None)
-                if mlp2_weight_val is not None and not isinstance(mlp2_weight_val, ShapeDtypeStruct):
-                    mlp2_weight = mlp2_weight_val[expert_indices, ...]
-                else:
-                    raise RuntimeError(f"mlp2_weight is ShapeDtypeStruct - weights not loaded. Error: {e}")
-            else:
-                raise
+        gate = jnp.clip(gate, a_min=None, a_max=self.limit)
+        up = jnp.clip(up, a_min=-self.limit, a_max=self.limit)
+    
+        glu = gate * jax.nn.sigmoid(gate * self.alpha)
+        next_states = jnp.matmul((up + 1) * glu, self.down_proj) + self.down_proj_bias[..., None, :]
         
-        # einsum: handle both 2D and 3D cases
-        # mlp2_weight: [batch, seq_len, experts_per_token, hidden_size, intermediate_size] or [batch, experts_per_token, hidden_size, intermediate_size]
-        # t after swiglu: [batch, seq_len, experts_per_token, intermediate_size] or [batch, experts_per_token, intermediate_size]
-        # From PyTorch: einsum("beck,bek->bec") where:
-        # - mlp2_weight: [batch, experts_per_token, hidden_size, intermediate_size] (b, e, c, k)
-        # - t: [batch, experts_per_token, intermediate_size] (b, e, k)
-        # - output: [batch, experts_per_token, hidden_size] (b, e, c)
-        if len(mlp2_weight.shape) == 5:
-            # 3D case: [batch, seq_len, experts_per_token, hidden_size, intermediate_size]
-            # t: [batch, seq_len, experts_per_token, intermediate_size]
-            # Use 'bseck,bsek->bsec' where s=seq_len, e=experts_per_token, c=hidden_size, k=intermediate_size
-            t = jnp.einsum("bseck,bsek->bsec", mlp2_weight, t) + mlp2_bias
-        else:
-            # 2D case: [batch, experts_per_token, hidden_size, intermediate_size]
-            # t: [batch, experts_per_token, intermediate_size]
-            t = jnp.einsum("beck,bek->bec", mlp2_weight, t) + mlp2_bias
-        
-        # Combine expert outputs with weights
-        # expert_weights: [batch, seq_len, experts_per_token] or [batch, experts_per_token]
-        # t: [batch, seq_len, experts_per_token, hidden_size] or [batch, experts_per_token, hidden_size]
-        # From PyTorch: torch.einsum("bec,be->bc", t, expert_weights)
-        # where t is [batch, experts_per_token, hidden_size] and expert_weights is [batch, experts_per_token]
-        if len(expert_weights.shape) == 3:
-            # 3D case: [batch, seq_len, experts_per_token]
-            # t: [batch, seq_len, experts_per_token, hidden_size]
-            # Output: [batch, seq_len, hidden_size]
-            t = jnp.einsum("bsec,bse->bsc", t, expert_weights)
-        else:
-            # 2D case: [batch, experts_per_token]
-            # t: [batch, experts_per_token, hidden_size]
-            # Output: [batch, hidden_size]
-            t = jnp.einsum("bec,be->bc", t, expert_weights)
-
-        return x + t
+        next_states = next_states * router_scores.transpose((1, 0))[..., None]
+        next_states = jnp.sum(next_states, axis=0)
+        return next_states + x
 
 
 class TransformerBlock(nnx.Module):
@@ -593,8 +441,6 @@ class GptOssModel(nnx.Module):
             x, kv_fused, callback_flag = block(x, forward_batch, token_to_kv_pool)
             layers_kv_fused.append(kv_fused)
             layers_callback_flag.extend(callback_flag)
-
-            return x, None, layers_callback_flag
 
         x = self.norm(x)
         x = self.unembedding(x)
@@ -727,21 +573,14 @@ class GptOssForCausalLM(nnx.Module):
             })
             mappings.update({
                 f"{prefix}.mlp.router.weight": WeightMapping(
-                    target_path=f"{target_prefix}.mlp.gate.weight",
+                    target_path=f"{target_prefix}.mlp.router.weight",
                     sharding=(None, "tensor"),
                     transpose=True,
                 ),
             })
             mappings.update({
                 f"{prefix}.mlp.router.bias": WeightMapping(
-                    target_path=f"{target_prefix}.mlp.gate.bias",
-                    sharding=("tensor", ),
-                    transpose=False,
-                ),
-            })
-            mappings.update({
-                f"{prefix}.mlp.router.bias": WeightMapping(
-                    target_path=f"{target_prefix}.mlp.gate.bias",
+                    target_path=f"{target_prefix}.mlp.router.bias",
                     sharding=("tensor", ),
                     transpose=False,
                 ),
@@ -749,42 +588,42 @@ class GptOssForCausalLM(nnx.Module):
             mappings.update({
                 f"{prefix}.mlp.experts.gate_up_proj_scales": WeightMapping(
                     target_path=f"{target_prefix}.mlp.gate_up_proj_scales",
-                    sharding=(None, None, None),
+                    sharding=("tensor", None, None),
                     transpose=False,
                 ),
             })
             mappings.update({
                 f"{prefix}.mlp.experts.gate_up_proj_blocks": WeightMapping(
                     target_path=f"{target_prefix}.mlp.gate_up_proj_blocks",
-                    sharding=(None, None, None, None),
+                    sharding=("tensor", None, None, None),
                     transpose=False,
                 ),
             })
             mappings.update({
                 f"{prefix}.mlp.experts.gate_up_proj_bias": WeightMapping(
                     target_path=f"{target_prefix}.mlp.gate_up_proj_bias",
-                    sharding=(None, None),
+                    sharding=("tensor", None),
                     transpose=False,
                 ),
             })
             mappings.update({
                 f"{prefix}.mlp.experts.down_proj_scales": WeightMapping(
                     target_path=f"{target_prefix}.mlp.down_proj_scales",
-                    sharding=(None, None, None),
+                    sharding=("tensor", None, None),
                     transpose=False,
                 ),
             })
             mappings.update({
                 f"{prefix}.mlp.experts.down_proj_blocks": WeightMapping(
                     target_path=f"{target_prefix}.mlp.down_proj_blocks",
-                    sharding=(None, None, None, None),
+                    sharding=("tensor", None, None, None),
                     transpose=False,
                 ),
             })
             mappings.update({
                 f"{prefix}.mlp.experts.down_proj_bias": WeightMapping(
                     target_path=f"{target_prefix}.mlp.down_proj_bias",
-                    sharding=(None, None),
+                    sharding=("tensor", None),
                     transpose=False,
                 ),
             })
