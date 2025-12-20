@@ -40,7 +40,7 @@ def mxfp4_dequantization(scales, blocks):
     high_bits = jnp.right_shift(blocks, 4) & 0x0F
     low_bits = blocks & 0x0F
 
-    interleaved = jnp.stack([high_bits, low_bits], axis=-1)
+    interleaved = jnp.stack([low_bits, high_bits], axis=-1)
     interleaved = interleaved.reshape(blocks.shape[:-1] + (nr_elem__per_blk,))
 
     e2m1__to__float = {
@@ -64,20 +64,16 @@ def mxfp4_dequantization(scales, blocks):
     e2m1_lut = [e2m1__to__float[i] for i in range(16)]
     e2m1_lut = jnp.array(e2m1_lut, dtype=jnp.float16)
 
-    scale_lut = [2**(exp - 127) for exp in range(256)]
-    scale_lut = jnp.array(scale_lut, dtype=jnp.float64)
-
     interleaved = e2m1_lut[interleaved]
-    scales = scale_lut[scales]
+    scales = scales.astype(dtype=jnp.int16)
+    scales = scales - 127
 
-    scales_expanded = scales[..., jnp.newaxis]  # 添加最后一个维度
-    scales_expanded = jnp.broadcast_to(scales_expanded, interleaved.shape)
+    scales_expanded = scales[..., jnp.newaxis]
+    dequantized = jax.numpy.ldexp(interleaved, scales_expanded).astype(dtype=jnp.bfloat16)
 
-    dequantized = interleaved * scales_expanded
-    dequantized = dequantized.astype(dtype=jnp.bfloat16)
     dequantized = dequantized.reshape(dequantized.shape[:-2] + (-1,))
 
-    return dequantized
+    return dequantized.transpose((0, 2, 1))
 
 
 # @dataclasses.dataclass(frozen=True)
@@ -351,13 +347,10 @@ class MLPBlock(nnx.Module):
         self.experts_per_token = config.experts_per_token
         self.swiglu_limit = config.swiglu_limit
         self.hidden_size = config.hidden_size
-        self.intermediate_size = config.intermediate_size
+        self.expert_dim = config.intermediate_size
 
-        # self.norm = RMSNorm(config.hidden_size, config, rngs=rngs)
         self.norm = RMSNorm(config.hidden_size, epsilon=1e-5, dtype=dtype)
 
-        # Gate projection
-        # self.gate = nnx.Linear(config.hidden_size, config.num_experts, use_bias=False, dtype=jnp.bfloat16, rngs=nnx.Rngs(0))
         self.gate = LinearBase(
             config.hidden_size,
             self.num_experts,
@@ -366,63 +359,35 @@ class MLPBlock(nnx.Module):
             params_dtype=dtype,
             kernel_axes=(None, "tensor"))
 
-
-        # self.gate_up_proj = nn.Parameter(torch.empty(self.num_experts, self.hidden_size, 2 * self.expert_dim))
-        # self.gate_up_proj_bias = nn.Parameter(torch.empty(self.num_experts, 2 * self.expert_dim))
-        # self.gate_up_proj = nnx.Param(
-        #         nnx.initializers.normal()(
-        #             nnx.Rngs(0).params(),
-        #             (self.num_experts, config.hidden_size, 2 * config.intermediate_size),
-        #         )
-        #     )
-
-
         self.gate_up_proj_scales = nnx.Param(
-            jnp.zeros((self.num_experts, config.hidden_size, 2 * config.intermediate_size // 32), dtype=jnp.uint8)
+            jnp.zeros((self.num_experts, 2 * self.expert_dim, config.hidden_size // 32), dtype=jnp.uint8)
         )
         self.gate_up_proj_blocks = nnx.Param(
-            jnp.zeros((self.num_experts, config.hidden_size, 2 * config.intermediate_size // 32, 32 // 2), dtype=jnp.uint8)
+            jnp.zeros((self.num_experts, 2 * self.expert_dim, config.hidden_size // 32, 32 // 2), dtype=jnp.uint8)
+        )
+        self.gate_up_proj_bias = nnx.Param(
+            jnp.zeros((self.num_experts, 2 * self.expert_dim), dtype=jnp.bfloat16)
         )
 
-        # self.up_proj = LinearBase(
-        #     input_size=config.hidden_size,
-        #     output_size=intermediate_size,
-        #     kernel_axes=(None, "tensor"),
-        #     use_bias=False,
-        #     params_dtype=dtype,
-        #     mesh=mesh,
-        # )
+        self.down_proj_scales = nnx.Param(
+            jnp.zeros((self.num_experts, self.hidden_size, self.expert_dim // 32), dtype=jnp.uint8)
+        )
+        self.down_proj_blocks = nnx.Param(
+            jnp.zeros((self.num_experts, self.hidden_size, self.expert_dim // 32, 32 // 2), dtype=jnp.uint8)
+        )
+        self.down_proj_bias = nnx.Param(
+            jnp.zeros((self.num_experts, self.hidden_size), dtype=jnp.bfloat16)
+        )
 
-        # MLP weights (per expert)
-        # mlp1: [num_experts, intermediate_size * 2, hidden_size]
-        self.mlp1_weight = nnx.Param(
-                nnx.initializers.normal()(
-                    nnx.Rngs(0).params(),
-                    (self.num_experts, config.intermediate_size * 2, config.hidden_size),
-                )
-            )
-
-
-        # mlp1 bias: [num_experts, intermediate_size * 2]
-        self.mlp1_bias = nnx.Param(
-                nnx.initializers.normal()(nnx.Rngs(0).params(), (self.num_experts, config.intermediate_size * 2))
-            )
-
-        # mlp2: [num_experts, hidden_size, intermediate_size]
-        self.mlp2_weight = nnx.Param(
-                nnx.initializers.normal()(
-                    nnx.Rngs(0).params(),
-                    (self.num_experts, config.hidden_size, config.intermediate_size),
-                )
-            )
-
-        # mlp2 bias: [num_experts, hidden_size]
-        self.mlp2_bias = nnx.Param(nnx.initializers.normal()(nnx.Rngs(0).params(), (self.num_experts, config.hidden_size)))
 
     def init_weight(self):
-        ret = mxfp4_dequantization(self.gate_up_proj_scales.value, self.gate_up_proj_blocks.value)
-        self.gate_up_proj = nnx.Param(jnp.zeros((self.num_experts, self.hidden_size, 2 * self.intermediate_size)))
-        pass
+        self.gate_up_proj = nnx.Param(mxfp4_dequantization(self.gate_up_proj_scales.value, self.gate_up_proj_blocks.value))
+        delattr(self, "gate_up_proj_scales")
+        delattr(self, "gate_up_proj_blocks")
+
+        self.down_proj = nnx.Param(mxfp4_dequantization(self.down_proj_scales.value, self.down_proj_blocks.value))
+        delattr(self, "down_proj_scales")
+        delattr(self, "down_proj_blocks")
 
     def __call__(self, x: Array) -> Array:
         t = self.norm(x)
@@ -667,6 +632,9 @@ class GptOssForCausalLM(nnx.Module):
         for layer_id in range(1):
             self.model.block[layer_id].mlp.init_weight()
 
+        params = nnx.state(self.model)
+        nnx.update(self.model, params)
+
     def _create_llama_weight_mappings(self) -> dict:
         mappings = {
             "model.embed_tokens.weight": WeightMapping(
@@ -792,22 +760,34 @@ class GptOssForCausalLM(nnx.Module):
                     transpose=False,
                 ),
             })
-            # mappings.update({
-            #     f"{prefix}.mlp.experts.gate_up_proj_bias": WeightMapping(
-            #         target_path=f"{target_prefix}.mlp.mlp1_bias",
-            #         sharding=(None, None, None, None),
-            #         transpose=False,
-            #     ),
-            # })
-            # "model.layers.0.post_attention_layernorm.weight": "model-00000-of-00002.safetensors",
-            # "model.layers.0.mlp.router.bias": "model-00000-of-00002.safetensors",
-            # "model.layers.0.mlp.router.weight": "model-00000-of-00002.safetensors",
-            # "model.layers.0.mlp.experts.gate_up_proj_bias": "model-00000-of-00002.safetensors",
-            # "model.layers.0.mlp.experts.gate_up_proj_blocks": "model-00000-of-00002.safetensors",
-            # "model.layers.0.mlp.experts.gate_up_proj_scales": "model-00000-of-00002.safetensors",
-            # "model.layers.0.mlp.experts.down_proj_bias": "model-00000-of-00002.safetensors",
-            # "model.layers.0.mlp.experts.down_proj_blocks": "model-00000-of-00002.safetensors",
-            # "model.layers.0.mlp.experts.down_proj_scales": "model-00000-of-00002.safetensors",
+            mappings.update({
+                f"{prefix}.mlp.experts.gate_up_proj_bias": WeightMapping(
+                    target_path=f"{target_prefix}.mlp.gate_up_proj_bias",
+                    sharding=(None, None),
+                    transpose=False,
+                ),
+            })
+            mappings.update({
+                f"{prefix}.mlp.experts.down_proj_scales": WeightMapping(
+                    target_path=f"{target_prefix}.mlp.down_proj_scales",
+                    sharding=(None, None, None),
+                    transpose=False,
+                ),
+            })
+            mappings.update({
+                f"{prefix}.mlp.experts.down_proj_blocks": WeightMapping(
+                    target_path=f"{target_prefix}.mlp.down_proj_blocks",
+                    sharding=(None, None, None, None),
+                    transpose=False,
+                ),
+            })
+            mappings.update({
+                f"{prefix}.mlp.experts.down_proj_bias": WeightMapping(
+                    target_path=f"{target_prefix}.mlp.down_proj_bias",
+                    sharding=(None, None),
+                    transpose=False,
+                ),
+            })
 
 
         return mappings
