@@ -187,7 +187,9 @@ def apply_qwix_quantization(
                         "kv_head_num",
                         "head_dim",
                         "layer_num",
-                    ))(
+                    ),
+                    donate_argnames=("model",),
+                    )(
                     attn_backend=attn_backend,
                     mesh=mesh,
                     kv_head_num=num_kv_heads,
