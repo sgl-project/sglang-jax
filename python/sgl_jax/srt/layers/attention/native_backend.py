@@ -278,8 +278,8 @@ def forward_attention(
     _, nr_qs, nr_ks = attn_logits.shape
 
     if sinks is not None:
-        sinks_expanded = sinks[:, None, None]  # 形状变为 (64, 1)
-        sinks_expanded = jnp.repeat(sinks_expanded, nr_qs, axis=1)  # 形状变为 (64, 1024, 1)
+        sinks_expanded = sinks[:, None, None]
+        sinks_expanded = jnp.repeat(sinks_expanded, nr_qs, axis=1)
         attn_logits = jnp.concatenate([attn_logits, sinks_expanded], axis=-1)
 
     # Softmax
