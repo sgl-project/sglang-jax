@@ -241,3 +241,5 @@ CLAUDE.md
 
 #gemini code
 .gemini-clipboard
+.gemini/settings.json
+.gemini.md

@@ -349,6 +349,7 @@ class TokenizerManager:
             obj.top_logprobs_num,
             obj.token_ids_logprob,
             obj.stream,
+            obj.extra_key,
         )
         # note: When only `return_logprob` is specified, we assume that only the output probability is required.
         if (

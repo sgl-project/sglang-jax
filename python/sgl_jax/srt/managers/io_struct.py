@@ -111,6 +111,8 @@ class TokenizedGenerateReqInput:
     token_ids_logprob: list[list[int]] | list[int] | None = None
     # Whether to stream output
     stream: bool = False
+    # Extra key for cache namespace isolation (e.g., cache_salt, lora_id)
+    extra_key: str | None = None
 
 
 @dataclass
@@ -130,6 +132,8 @@ class EmbeddingReqInput:
     text: str = ""
     input_ids: list[int] = None
     normalize: bool = True
+    # Extra key for cache namespace isolation
+    extra_key: str | None = None
 
 
 @dataclass
@@ -157,6 +161,8 @@ class GenerateReqInput:
     token_ids_logprob: list[list[int]] | list[int] | None = None
     # Whether to detokenize tokens in text in the returned logprobs.
     return_text_in_logprobs: bool = True
+    # Extra key for cache namespace isolation (e.g., cache_salt)
+    extra_key: list[str] | str | None = None
 
     def _normalize_rid(self, num):
         """Normalize request IDs for batch processing."""
