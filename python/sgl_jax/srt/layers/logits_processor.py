@@ -30,7 +30,7 @@ class LogitsProcessorOutput:
     # Used by speculative decoding (EAGLE)
     # The last hidden layers
     hidden_states: jax.Array | None = None
-
+    hidden_states_sampled: jax.Array | None = None
     ## Part 2: This part will be assigned in python/sglang/srt/layers/sampler.py::Sampler
     # The logprobs of the next tokens.                              shape: [#seq]
     next_token_logprobs: jax.Array | None = None
@@ -65,6 +65,7 @@ class LogitsProcessorOutput:
             self.input_top_logprobs_idx,
             self.input_token_ids_logprobs_val,
             self.input_token_ids_logprobs_idx,
+            self.hidden_states_sampled,
         )
 
         aux_data = {}
@@ -87,6 +88,7 @@ class LogitsProcessorOutput:
         obj.input_top_logprobs_idx = children[9]
         obj.input_token_ids_logprobs_val = children[10]
         obj.input_token_ids_logprobs_idx = children[11]
+        obj.hidden_states_sampled = children[12]
 
         return obj
 
@@ -116,6 +118,7 @@ class LogitsMetadata:
     extend_return_top_logprob: bool = False
     extend_token_ids_logprob: bool = False
     extend_seq_lens: jax.Array | None = None
+    accept_lens: jax.Array | None = None
     extend_seq_lens_cpu: list[int] | None = None
     extend_logprob_start_lens_cpu: list[int] | None = None
     extend_logprob_pruned_lens_cpu: list[int] | None = None
@@ -132,6 +135,7 @@ class LogitsMetadata:
     def tree_flatten(self):
         children = (
             self.extend_seq_lens,
+            self.accept_lens,
             self.extend_input_logprob_token_ids_device,
             self.temperature,
             self.top_p,
@@ -159,9 +163,10 @@ class LogitsMetadata:
         obj = cls.__new__(cls)
 
         obj.extend_seq_lens = children[0]
-        obj.extend_input_logprob_token_ids_device = children[1]
-        obj.temperature = children[2]
-        obj.top_p = children[3]
+        obj.accept_lens = children[1]
+        obj.extend_input_logprob_token_ids_device = children[2]
+        obj.temperature = children[3]
+        obj.top_p = children[4]
 
         obj.forward_mode = aux_data["forward_mode"]
         obj.capture_hidden_mode = aux_data["capture_hidden_mode"]
@@ -207,6 +212,13 @@ class LogitsMetadata:
             extend_return_top_logprob=extend_return_top_logprob,
             extend_token_ids_logprob=extend_token_ids_logprob,
             extend_seq_lens=device_array(batch.extend_seq_lens, sharding=sharding),
+            accept_lens=(
+                device_array(batch.spec_info.accept_length, sharding=sharding)
+                if batch.spec_info is not None
+                and hasattr(batch.spec_info, "accept_length")
+                and batch.spec_info.accept_length is not None
+                else None
+            ),
             extend_seq_lens_cpu=extend_seq_lens_cpu,
             extend_logprob_start_lens_cpu=(
                 batch.extend_logprob_start_lens.tolist()
@@ -248,6 +260,16 @@ class LogitsProcessor(nnx.Module):
             input_logprob_indices = None
         elif logits_metadata.forward_mode.is_extend() and not logits_metadata.extend_return_logprob:
             last_index = jnp.cumsum(logits_metadata.extend_seq_lens, axis=0) - 1
+            if (
+                logits_metadata.forward_mode.is_draft_extend()
+                and logits_metadata.accept_lens is not None
+            ):
+                # if accpet_lens is [1, 1, 2, 1, 1]
+                #    extend_seq_lens is [4,4,4,4,4]
+                #    last_index should be [1, 5, 9, 13, 17] - 1 = [0,4,8,12,16]
+                last_index = last_index - (
+                    logits_metadata.extend_seq_lens - logits_metadata.accept_lens
+                )
             pruned_states = hidden_states[last_index]
             if aux_hidden_states is not None:
                 aux_pruned_states = [hidden[last_index] for hidden in aux_hidden_states]
@@ -296,6 +318,7 @@ class LogitsProcessor(nnx.Module):
 
         # Compute logits for both input and sampled tokens.
         logits = self._get_logits(pruned_states, lm_head)
+        hidden_states_sampled = pruned_states
         sampled_logits = logits[sample_indices] if sample_indices is not None else logits
 
         hidden_states_to_store: jax.Array | None = None
@@ -332,6 +355,7 @@ class LogitsProcessor(nnx.Module):
             return LogitsProcessorOutput(
                 next_token_logits=sampled_logits,
                 hidden_states=hidden_states_to_store,
+                hidden_states_sampled=hidden_states_sampled,
             )
         else:
             input_logprobs = logits[input_logprob_indices]

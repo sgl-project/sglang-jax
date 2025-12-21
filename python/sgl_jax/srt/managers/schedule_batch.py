@@ -1381,19 +1381,8 @@ class ScheduleBatch:
 
     def get_spec_model_worker_batch(
         self,
-        token_paddings: list,
-        bs_paddings: list,
-        cache_loc_paddings: list,
         page_size: int,
-        skip_padding: bool = False,
     ) -> ModelWorkerBatch:
-        if not skip_padding:
-            return self.get_model_worker_batch(
-                token_paddings=token_paddings,
-                bs_paddings=bs_paddings,
-                cache_loc_paddings=cache_loc_paddings,
-                page_size=page_size,
-            )
         if self.forward_mode.is_decode_or_idle():
             extend_seq_lens = extend_prefix_lens = extend_logprob_start_lens = None
         else:
@@ -1415,7 +1404,6 @@ class ScheduleBatch:
         real_bs = len(seq_lens_cpu)
         req_pool_indices_cpu = self.req_pool_indices
         token_indices_with_all_reqs = self.req_to_token_pool.req_to_token[self.req_pool_indices]
-
         # FIXME @pc, move this to eagle_worker
         # If enable spec inference, use positions in spec info firstly
         if self.spec_info is not None and getattr(self.spec_info, "positions", None) is not None:
