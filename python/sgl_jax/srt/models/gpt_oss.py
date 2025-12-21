@@ -654,7 +654,7 @@ class GptOssForCausalLM(nnx.Module):
         mappings.update({
             f"lm_head.weight": WeightMapping(
                 target_path=f"lm_head.embedding",
-                sharding=(),
+                sharding=(None, "tensor"),
                 transpose=False,
             ),
         })
@@ -668,7 +668,9 @@ class GptOssForCausalLM(nnx.Module):
         logits_metadata: LogitsMetadata,
     ):
         x, layers_kv_fused, layers_callback_flag = self.model(forward_batch, token_to_kv_pool)
+        x = jax.device_put(x, jax.sharding.NamedSharding(self.mesh, P()))
         output = self.logits_processor(x, self.lm_head, logits_metadata)
+        output = jax.device_put(output, jax.sharding.NamedSharding(self.mesh, P(None, "tensor")))
         return output, layers_kv_fused, layers_callback_flag
 
 
