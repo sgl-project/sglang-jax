@@ -33,6 +33,9 @@ from sgl_jax.srt.mem_cache.memory_pool import KVCache, MHATokenToKVPool
 
 
 QUANTIZATION_CONFIG_PATH = os.path.join(os.path.dirname(__file__), "configs")
+DEFAULT_PAGE_SIZE = 1
+DEFAULT_MAX_NUM_TOKENS = 2000
+DEFAULT_KV_CACHE_DTYPE = jnp.bfloat16
 
 
 def parse_qwix_config_to_rules(
@@ -92,7 +95,7 @@ def qwix_quantize_nnx_model(qwix_config: List[dict],
     Returns:
         model: the quantized model
     """
-    token_to_kv_pool = MHATokenToKVPool(size=2000, page_size=1, dtype=jnp.bfloat16, 
+    token_to_kv_pool = MHATokenToKVPool(size=DEFAULT_MAX_NUM_TOKENS, page_size=DEFAULT_PAGE_SIZE, dtype=jnp.bfloat16, 
                                         head_num=kv_head_num,
                                         head_dim=head_dim, layer_num=layer_num,
                                         mesh=mesh)
@@ -148,14 +151,19 @@ def quantization_config_file_path_to_dict(
 
 def apply_qwix_quantization(
         model_config: ModelConfig, model: nnx.Module, mesh: Mesh) -> nnx.Module:
+        """
+        Will apply quantization if a valid quantization config with Qwix rules is provided.  See README
+        for more details on Qwix.
+        """
         from sgl_jax.srt.layers.attention.flashattention_backend import (
                     FlashAttention,
-)
+        )
         qwix_config_dict = quantization_config_file_path_to_dict(
                 os.path.join(model_config.quantization_config_path)
         )
         qwix_config = qwix_config_dict.get("qwix").get("rules")
         
+        # prepare batch input
         bs = 1
         max_seq_len = 4096
         page_size = 1
@@ -166,9 +174,7 @@ def apply_qwix_quantization(
         vocab_size = model_config.vocab_size
         layer_num = model_config.num_hidden_layers
         
-        
         model_worker_batch = generate_mock_model_worker_batch(bs, num_tokens, ForwardMode.DECODE, vocab_size, max_seq_len)
-        # prepare attn_backend
         attn_backend = FlashAttention(
             num_attn_heads=num_attn_heads,
             num_kv_heads=num_kv_heads,
@@ -188,7 +194,7 @@ def apply_qwix_quantization(
                         "head_dim",
                         "layer_num",
                     ),
-                    donate_argnames=("model",),
+                    donate_argnames=("model",), # donate the model to the jitted function to save memory
                     )(
                     attn_backend=attn_backend,
                     mesh=mesh,
@@ -197,59 +203,6 @@ def apply_qwix_quantization(
                     layer_num=layer_num,
                     model=model)
         return model
-
-
-def manually_quantize_qwix_weight(weight: jax.Array, qtype: jnp.dtype,
-                                  channelwise_axes: List[int],
-                                  tiled_axes: dict,
-                                  calibration_method: str) -> QArray:
-    """
-    Manually quantizes a weight tensor using Qwix.  Only needed for the SparseMatmul DeepSeek case right now, since
-    otherwise, Qwix will handle this automatically (through our application of `qwix.quantize_model`).
-    """
-    # TODO (jacobplatin): clean this up; this is needed because of issues with Qwix quantizing the `shard_map` in SpraseMatmul
-    how_to_quantize = ptq.qarray.HowToQuantize(
-        qtype=qtype,
-        channelwise_axes=channelwise_axes,
-        tiled_axes=tiled_axes,
-        calibration_method=calibration_method)
-
-    return ptq.create_quantized_param(weight, how_to_quantize)
-
-
-def manually_quantize_qwix_activation(inputs: jax.Array, rule_name: str,
-                                      qtype: jnp.dtype,
-                                      channelwise_axes: List[int],
-                                      tiled_axes: dict,
-                                      calibration_method: str) -> QArray:
-    """
-    Manually quantizes an activation tensor using Qwix.  Needed for the SparseMatmul
-    DeepSeek MoE case currently.
-
-    Args:
-        inputs: The activation tensor to quantize.
-        rule_name: The name of the quantization rule to use.
-        qtype: The quantization type.
-        channelwise_axes: The channelwise axes to quantize.
-        tiled_axes: The tiled axes to quantize.
-        calibration_method: The calibration method to use.
-
-    Returns:
-        The quantized activation tensor.
-    """
-    rule = qpl.get_current_rule(rule_name)
-    lhs_how = ptq.qarray.HowToQuantize(qtype=qtype,
-                                       channelwise_axes=channelwise_axes,
-                                       tiled_axes=tiled_axes,
-                                       calibration_method=calibration_method)
-    # This is needed because we aren't passing `act_name` right now
-    assert not rule.act_static_scale, "Static scale not supported right now"
-
-    # channelwise_axes should be set to (a subset of) non-contraction axes. e.g.
-    # for ragged_dot [m, k] x [g, k, n], they are [0] and [0, 2]
-    # TODO (jacobplatin): add support for `act_name`
-    return ptq.quantize_act(inputs, lhs_how, rule, "")
-
 
 def generate_mock_model_worker_batch(
         bs: int,

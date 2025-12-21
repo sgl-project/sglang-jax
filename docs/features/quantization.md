@@ -60,7 +60,7 @@ uv run python -u -m sgl_jax.launch_server \
 ```
 
 # Supported models (To be updated)
-- qwen/qwen7B-chat
+- QWenLMHeadModel series
 
 ### TODOs:
 - add quantization tests
