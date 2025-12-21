@@ -250,7 +250,7 @@ class AttentionBlock(nnx.Module):
         t = self.norm(hidden_states)
         q, _ = self.q_proj(t)
         k, _ = self.k_proj(t)
-        v, _ = self.v_proj(t) # TODO: v 的精度有问题
+        v, _ = self.v_proj(t)
 
         q = q.reshape(-1, self.num_attention_heads, self.head_dim)
         k = k.reshape(-1, self.num_key_value_heads, self.head_dim)
