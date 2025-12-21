@@ -2,19 +2,14 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import functools
 import os
-from typing import TYPE_CHECKING, Callable, List
+from typing import List
 
 import jax
 import jax.numpy as jnp
 import qwix
-import qwix.pallas as qpl
 import yaml
 from flax import nnx
-from flax.typing import PRNGKey
-from jax.sharding import Mesh, NamedSharding
-from jax.sharding import PartitionSpec as P
-from qwix._src.core.qarray import QArray
-from qwix._src.providers import ptq
+from jax.sharding import Mesh
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
 
 from sgl_jax.srt.sampling.sampling_batch_info import SamplingBatchInfo
@@ -28,9 +23,7 @@ from sgl_jax.srt.model_executor.forward_batch_info import (
 )
 from sgl_jax.srt.configs.model_config import ModelConfig
 import numpy as np
-from sgl_jax.srt.mem_cache.memory_pool import KVCache, MHATokenToKVPool
-
-
+from sgl_jax.srt.mem_cache.memory_pool import MHATokenToKVPool
 
 QUANTIZATION_CONFIG_PATH = os.path.join(os.path.dirname(__file__), "configs")
 DEFAULT_PAGE_SIZE = 1
