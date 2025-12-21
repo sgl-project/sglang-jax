@@ -82,6 +82,7 @@ class OpenAIServingChat(OpenAIServingBase):
             logprob_start_len=-1,
             top_logprobs_num=request.top_logprobs or 0,
             stream=request.stream,
+            extra_key=request.extra_key,
             rid=request.rid,
         )
 
