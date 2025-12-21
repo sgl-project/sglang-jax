@@ -429,14 +429,6 @@ class GptOssModel(nnx.Module):
 
         self.norm = RMSNorm(config.hidden_size, epsilon=1e-5, dtype=dtype)
 
-        self.lm_head = LinearBase(
-            config.hidden_size,
-            config.vocab_size,
-            mesh,
-            use_bias=False,
-            params_dtype=dtype,
-            kernel_axes=(None, "tensor"))
-
     def __call__(
         self,
         forward_batch: ForwardBatch,
@@ -458,7 +450,6 @@ class GptOssModel(nnx.Module):
             layers_callback_flag.extend(callback_flag)
 
         x = self.norm(x)
-        x = self.lm_head(x)
 
         callback_flag = precision_tracer.jit_pure_callback_record(
             x, "transformer_output", "TRANSFORMER"
@@ -479,7 +470,15 @@ class GptOssForCausalLM(nnx.Module):
         self.dtype = dtype
         logger.info("GptOssForCausalLM config dtype: %s", self.dtype)
         self.model = GptOssModel(config, mesh, dtype)
-        pass
+
+        self.lm_head = ParallelLMHead(
+            config.vocab_size,
+            config.hidden_size,
+            dtype=self.dtype,
+            param_dtype=self.dtype,
+            kernel_axes=("tensor", None),
+        )
+        self.logits_processor = LogitsProcessor(config.vocab_size, mesh=self.mesh)
 
     def load_weights(self, model_config: ModelConfig):
         loader = WeightLoader(
@@ -496,6 +495,7 @@ class GptOssForCausalLM(nnx.Module):
 
         params = nnx.state(self.model)
         nnx.update(self.model, params)
+        logger.info("GptOss weights loaded successfully!")
 
     def _create_llama_weight_mappings(self) -> dict:
         mappings = {
@@ -652,8 +652,8 @@ class GptOssForCausalLM(nnx.Module):
             ),
         })
         mappings.update({
-            f"model.lm_head.weight": WeightMapping(
-                target_path=f"model.lm_head.weight",
+            f"lm_head.weight": WeightMapping(
+                target_path=f"lm_head.embedding",
                 sharding=(),
                 transpose=False,
             ),
@@ -668,7 +668,8 @@ class GptOssForCausalLM(nnx.Module):
         logits_metadata: LogitsMetadata,
     ):
         x, layers_kv_fused, layers_callback_flag = self.model(forward_batch, token_to_kv_pool)
-        return x, layers_kv_fused, layers_callback_flag
+        output = self.logits_processor(x, self.lm_head, logits_metadata)
+        return output, layers_kv_fused, layers_callback_flag
 
 
 EntryClass = GptOssForCausalLM
