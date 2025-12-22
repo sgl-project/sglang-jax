@@ -76,11 +76,13 @@ def get_examples(num_examples: int | None = None) -> list[dict[str, str]]:
             question = data["question"]
             answer = data["answer"]
             target = extract_answer_from_target(answer)
-            examples.append({
-                "question": question,
-                "answer": answer,
-                "target": target,
-            })
+            examples.append(
+                {
+                    "question": question,
+                    "answer": answer,
+                    "target": target,
+                }
+            )
             if num_examples and len(examples) >= num_examples:
                 break
     return examples
@@ -102,8 +104,7 @@ class GSM8KEval(Eval):
 
             prompt_messages = [
                 sampler._pack_message(
-                    content=INSTRUCTION_TEMPLATE.format(input=question),
-                    role="user"
+                    content=INSTRUCTION_TEMPLATE.format(input=question), role="user"
                 )
             ]
 
@@ -133,4 +134,3 @@ class GSM8KEval(Eval):
 
         results = common.map_with_progress(fn, self.examples, num_threads=self._num_threads)
         return common.aggregate_results(results, default_stats=("mean", "std"))
-
