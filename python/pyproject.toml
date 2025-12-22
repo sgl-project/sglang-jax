@@ -47,13 +47,13 @@ dependencies = [
 dev = [
 ]
 tpu = [
-    "jax[tpu]~=0.8.0",
+    "jax[tpu]==0.8.1",
 ]
 gpu = [
-    "jax[cuda12]~=0.8.0",
+    "jax[cuda12]==0.8.1",
 ]
 all = [
-    "jax[tpu]~=0.8.0",
+    "jax[tpu]==0.8.1",
 ]
 
 [tool.setuptools.packages.find]

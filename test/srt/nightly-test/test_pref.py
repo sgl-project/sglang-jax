@@ -43,7 +43,6 @@ class TestModePerf(CustomTestCase):
     sharegpt_dataset_path = None
     BASIC_SERVER_ARGS = [
         "--trust-remote-code",
-        "--skip-server-warmup",
         "--random-seed",
         "3",
         "--max-prefill-tokens",
@@ -61,7 +60,7 @@ class TestModePerf(CustomTestCase):
         "--chunked-prefill-size",
         "2048",
         "--mem-fraction-static",
-        "0.8",
+        "0.7",
         "--enable-precision-tracer",
     ]
 
