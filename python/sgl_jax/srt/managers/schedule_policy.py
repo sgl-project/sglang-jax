@@ -150,7 +150,8 @@ class SchedulePolicy:
             # NOTE: the prefix_indices must always be aligned with last_node
             r.prefix_indices, r.last_node, r.last_host_node, r.host_hit_length = (
                 self.tree_cache.match_prefix(
-                    rid=r.rid, key=RadixKey(token_ids=prefix_ids, extra_key=extra_key)
+                    rid=r.rid,
+                    key=RadixKey(token_ids=prefix_ids, extra_key=extra_key, dp_rank=r.dp_rank),
                 )
             )
 
@@ -163,7 +164,8 @@ class SchedulePolicy:
             # It is kind of common when the engine is long running (e.g., imagine the prefix "the").
             if len(r.prefix_indices) <= IN_BATCH_PREFIX_CACHING_CHECK_THRESHOLD:
                 in_batch_matching_prefixes, _, _, _ = self.waiting_queue_radix_tree.match_prefix(
-                    rid=r.rid, key=RadixKey(token_ids=prefix_ids, extra_key=extra_key)
+                    rid=r.rid,
+                    key=RadixKey(token_ids=prefix_ids, extra_key=extra_key, dp_rank=r.dp_rank),
                 )
                 if (
                     len(in_batch_matching_prefixes)
@@ -173,7 +175,7 @@ class SchedulePolicy:
                 else:
                     # Insert with a dummy key
                     self.waiting_queue_radix_tree.insert(
-                        RadixKey(token_ids=prefix_ids, extra_key=extra_key),
+                        RadixKey(token_ids=prefix_ids, extra_key=extra_key, dp_rank=r.dp_rank),
                         jnp.empty(len(prefix_ids), dtype=jnp.bool_),
                     )
         return temporary_deprioritized
