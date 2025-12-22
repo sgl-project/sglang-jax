@@ -16,6 +16,3 @@ setup: |
   uv pip install -e "python[all]"
   bash scripts/killall_sglang.sh
   uv tool install evalscope
-  python -m ensurepip --upgrade
-  python -m pip install --upgrade pip
-  pip install git+https://github.com/google/qwix
