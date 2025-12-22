@@ -314,7 +314,7 @@ class SWARadixCache(BasePrefixCache):
 
     def reset(self) -> None:
         self.root_node = TreeNode()
-        self.root_node.key = RadixKey(token_ids=[], extra_key=None)
+        self.root_node.key = RadixKey(token_ids=[], extra_key=None, dp_rank=None)
         self.root_node.value = []
         self.root_node.full_lock_ref = 1
         self.root_node.swa_lock_ref = 1
@@ -340,7 +340,8 @@ class SWARadixCache(BasePrefixCache):
         # Support both RadixKey and plain list for backward compatibility
         if not isinstance(key, RadixKey):
             extra_key = kwargs.get("extra_key")
-            key = RadixKey(key, extra_key)
+            dp_rank = kwargs.get("dp_rank")
+            key = RadixKey(key, extra_key, dp_rank)
 
         if self.disable or len(key) == 0:
             return MatchResult(
@@ -370,7 +371,7 @@ class SWARadixCache(BasePrefixCache):
 
         # Support both RadixKey and plain list for backward compatibility
         if not isinstance(key, RadixKey):
-            key = RadixKey(key, None)
+            key = RadixKey(key, None, None)
 
         if value is None:
             value = [x for x in key.token_ids]
@@ -403,7 +404,7 @@ class SWARadixCache(BasePrefixCache):
         # insert the token_ids and kv_indices into the radix tree
         # Note: the insert function already frees the overlapped kv_indices
         self.insert(
-            RadixKey(token_ids[:page_aligned_len], req.extra_key),
+            RadixKey(token_ids[:page_aligned_len], req.extra_key, req.dp_rank),
             page_aligned_kv_indices,
             len(req.prefix_indices),
         )
@@ -435,14 +436,14 @@ class SWARadixCache(BasePrefixCache):
         # Radix Cache takes one ref in memory pool
         # Note: the insert function already frees the overlapped kv_indices
         new_prefix_len = self.insert(
-            RadixKey(page_aligned_token_ids, req.extra_key),
+            RadixKey(page_aligned_token_ids, req.extra_key, req.dp_rank),
             page_aligned_kv_indices,
             len(req.prefix_indices),
         )
 
         # The prefix indices could be updated, reuse it
         new_indices, new_last_node, _, _ = self.match_prefix(
-            RadixKey(page_aligned_token_ids, req.extra_key)
+            RadixKey(page_aligned_token_ids, req.extra_key, req.dp_rank)
         )
         assert len(req.prefix_indices) <= len(new_indices), f"{req.prefix_indices=}, {new_indices=}"
         assert new_prefix_len <= len(new_indices), f"{new_prefix_len=}, {new_indices=}"
