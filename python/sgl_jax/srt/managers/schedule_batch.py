@@ -163,6 +163,7 @@ class Req:
         stream: bool = False,
         lora_id: str | None = None,
         extra_key: str | None = None,
+        dp_rank: int | None = None,
         origin_input_ids_unpadded: tuple[int] | None = None,
         eos_token_ids: set[int] | None = None,
         vocab_size: int | None = None,
@@ -193,6 +194,8 @@ class Req:
 
         self.extra_key = extra_key
         self.lora_id = lora_id if lora_id is not None else "0"
+        self.dp_rank = dp_rank
+
 
         # Memory pool info
         self.req_pool_idx: int | None = None
@@ -356,7 +359,7 @@ class Req:
                 self.last_host_node,
                 self.host_hit_length,
             ) = tree_cache.match_prefix(
-                key=RadixKey(self.adjust_max_prefix_ids(), self.extra_key),
+                key=RadixKey(self.adjust_max_prefix_ids(), self.extra_key, self.dp_rank),
             )
             self.last_matched_prefix_len = len(self.prefix_indices)
         self.extend_input_len = len(self.fill_ids) - len(self.prefix_indices)
