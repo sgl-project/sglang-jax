@@ -357,7 +357,6 @@ class TokenizerManager:
             obj.top_logprobs_num,
             obj.token_ids_logprob,
             obj.stream,
-            obj.extra_key,
             obj.lora_id,
             obj.extra_key,
         )

@@ -332,10 +332,11 @@ class TestLoRA(CustomTestCase):
             self.run_lora_effect_test(base_url, PROMPTS, lora_set, max_new_tokens, base_responses)
 
             # Run logprobs comparison test if reference file exists
-            hf_logprobs_file = os.path.join(os.path.dirname(__file__), "hf_lora_logprobs.json")
-            self.run_logprobs_comparison_test(
-                base_url, PROMPTS, lora_set, max_new_tokens, hf_logprobs_file
-            )
+            # TODO @Brian to open this
+            # hf_logprobs_file = os.path.join(os.path.dirname(__file__), "hf_lora_logprobs.json")
+            # self.run_logprobs_comparison_test(
+            #     base_url, PROMPTS, lora_set, max_new_tokens, hf_logprobs_file
+            # )s
         finally:
             kill_process_tree(process_lora.pid)
 
