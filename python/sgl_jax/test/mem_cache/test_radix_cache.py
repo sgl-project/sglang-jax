@@ -415,6 +415,131 @@ class TestRadixCache(unittest.TestCase):
         self.assertEqual(single.token_ids, [1])
         self.assertEqual(single.extra_key, "test_key")
 
+    def test_dp_rank_namespace_isolation(self):
+        """Test that same tokens with different dp_ranks don't share cache"""
+        req_pool, allocator = self._create_auto_device_setup()
+        cache = self._create_radix_cache(req_pool, allocator)
+
+        # Insert same token sequence with dp_rank=0
+        key = [1, 2, 3, 4, 5]
+        value_rank0 = allocator.alloc(len(key))
+        cache.insert(RadixKey(key, None, 0), value_rank0)
+
+        # Insert same token sequence with dp_rank=1
+        value_rank1 = allocator.alloc(len(key))
+        cache.insert(RadixKey(key, None, 1), value_rank1)
+
+        # Match with dp_rank=0 should return value_rank0
+        match_rank0 = cache.match_prefix(RadixKey(key, None, 0))
+        self.assertEqual(len(match_rank0.device_indices), len(key))
+        np.testing.assert_array_equal(match_rank0.device_indices, value_rank0)
+
+        # Match with dp_rank=1 should return value_rank1
+        match_rank1 = cache.match_prefix(RadixKey(key, None, 1))
+        self.assertEqual(len(match_rank1.device_indices), len(key))
+        np.testing.assert_array_equal(match_rank1.device_indices, value_rank1)
+
+        # Verify values are different (different cache namespaces)
+        self.assertFalse(np.array_equal(value_rank0, value_rank1))
+
+    def test_dp_rank_none_shared_namespace(self):
+        """Test that dp_rank=None creates a shared namespace"""
+        req_pool, allocator = self._create_auto_device_setup()
+        cache = self._create_radix_cache(req_pool, allocator)
+
+        # Insert with dp_rank=None
+        key = [10, 20, 30]
+        cache.insert(RadixKey(key, None, None))
+
+        # Match with dp_rank=None should hit cache
+        match = cache.match_prefix(RadixKey(key, None, None))
+        self.assertEqual(len(match.device_indices), len(key))
+
+        # Insert longer sequence with dp_rank=None should reuse prefix
+        longer_key = [10, 20, 30, 40, 50]
+        prefix_len = cache.insert(RadixKey(longer_key, None, None))
+        self.assertEqual(prefix_len, 3)  # Reused 3 tokens from cache
+
+    def test_dp_rank_none_vs_explicit_rank(self):
+        """Test that dp_rank=None and dp_rank=0 are different namespaces"""
+        req_pool, allocator = self._create_auto_device_setup()
+        cache = self._create_radix_cache(req_pool, allocator)
+
+        # Insert with dp_rank=None
+        key = [100, 200, 300]
+        value_none = allocator.alloc(len(key))
+        cache.insert(RadixKey(key, None, None), value_none)
+
+        # Insert with dp_rank=0
+        value_rank0 = allocator.alloc(len(key))
+        cache.insert(RadixKey(key, None, 0), value_rank0)
+
+        # Match with None should return value_none
+        match_none = cache.match_prefix(RadixKey(key, None, None))
+        np.testing.assert_array_equal(match_none.device_indices, value_none)
+
+        # Match with 0 should return value_rank0
+        match_rank0 = cache.match_prefix(RadixKey(key, None, 0))
+        np.testing.assert_array_equal(match_rank0.device_indices, value_rank0)
+
+        # Verify they are different
+        self.assertFalse(np.array_equal(value_none, value_rank0))
+
+    def test_combined_extra_key_and_dp_rank(self):
+        """Test that extra_key and dp_rank work together for dual isolation"""
+        req_pool, allocator = self._create_auto_device_setup()
+        cache = self._create_radix_cache(req_pool, allocator)
+
+        key = [7, 8, 9]
+
+        # Create 4 different cache namespaces
+        value_lora_a_rank0 = allocator.alloc(len(key))
+        cache.insert(RadixKey(key, "lora_a", 0), value_lora_a_rank0)
+
+        value_lora_a_rank1 = allocator.alloc(len(key))
+        cache.insert(RadixKey(key, "lora_a", 1), value_lora_a_rank1)
+
+        value_lora_b_rank0 = allocator.alloc(len(key))
+        cache.insert(RadixKey(key, "lora_b", 0), value_lora_b_rank0)
+
+        value_lora_b_rank1 = allocator.alloc(len(key))
+        cache.insert(RadixKey(key, "lora_b", 1), value_lora_b_rank1)
+
+        # Verify each combination returns its own value
+        match = cache.match_prefix(RadixKey(key, "lora_a", 0))
+        np.testing.assert_array_equal(match.device_indices, value_lora_a_rank0)
+
+        match = cache.match_prefix(RadixKey(key, "lora_a", 1))
+        np.testing.assert_array_equal(match.device_indices, value_lora_a_rank1)
+
+        match = cache.match_prefix(RadixKey(key, "lora_b", 0))
+        np.testing.assert_array_equal(match.device_indices, value_lora_b_rank0)
+
+        match = cache.match_prefix(RadixKey(key, "lora_b", 1))
+        np.testing.assert_array_equal(match.device_indices, value_lora_b_rank1)
+
+        # Verify all values are different
+        values = [value_lora_a_rank0, value_lora_a_rank1, value_lora_b_rank0, value_lora_b_rank1]
+        for i, v1 in enumerate(values):
+            for v2 in values[i + 1 :]:
+                self.assertFalse(np.array_equal(v1, v2))
+
+    def test_dp_rank_preserves_on_slicing(self):
+        """Test that RadixKey slicing preserves both extra_key and dp_rank"""
+        key = RadixKey([1, 2, 3, 4, 5], "test_key", 2)
+
+        # Test slicing
+        sliced = key[2:]
+        self.assertEqual(sliced.token_ids, [3, 4, 5])
+        self.assertEqual(sliced.extra_key, "test_key")
+        self.assertEqual(sliced.dp_rank, 2)
+
+        # Test single index access returns RadixKey with dp_rank
+        single = key[0]
+        self.assertEqual(single.token_ids, [1])
+        self.assertEqual(single.extra_key, "test_key")
+        self.assertEqual(single.dp_rank, 2)
+
 
 class MockRequest:
     """mock request object for testing cache request functionality"""

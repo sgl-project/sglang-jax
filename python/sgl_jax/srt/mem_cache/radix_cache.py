@@ -25,9 +25,12 @@ class RadixKey:
     The extra key enables cache namespace isolation (e.g., for different LoRA adapters).
     """
 
-    def __init__(self, token_ids: list[int], extra_key: str | None = None):
+    def __init__(
+        self, token_ids: list[int], extra_key: str | None = None, dp_rank: int | None = None
+    ):
         self.token_ids = token_ids
         self.extra_key = extra_key
+        self.dp_rank = dp_rank
 
     def __len__(self) -> int:
         return len(self.token_ids)
@@ -37,12 +40,12 @@ class RadixKey:
 
     def __getitem__(self, idx: int | slice) -> RadixKey:
         if isinstance(idx, slice):
-            return RadixKey(self.token_ids[idx], self.extra_key)
-        return RadixKey([self.token_ids[idx]], self.extra_key)
+            return RadixKey(self.token_ids[idx], self.extra_key, self.dp_rank)
+        return RadixKey([self.token_ids[idx]], self.extra_key, self.dp_rank)
 
     def __repr__(self) -> str:
         preview = self.token_ids[:10]
-        return f"RadixKey(extra_key={self.extra_key!r}, token_ids={preview}{'...' if len(self.token_ids) > 10 else ''})"
+        return f"RadixKey(extra_key={self.extra_key!r}, dp_rank={self.dp_rank!r}, token_ids={preview}{'...' if len(self.token_ids) > 10 else ''})"
 
 
 class TreeNode:
@@ -77,16 +80,20 @@ class TreeNode:
         return self.last_access_time < other.last_access_time
 
 
-def _check_extra_key(key0: RadixKey, key1: RadixKey):
-    """Check that two RadixKeys have the same extra_key."""
+def _check_composite_key(key0: RadixKey, key1: RadixKey):
+    """Check that two RadixKeys have matching extra_key and dp_rank."""
     if key0.extra_key != key1.extra_key:
         raise ValueError(
             f"_key_match should be run on the same extra key, but got key0.extra_key={key0.extra_key} != key1.extra_key={key1.extra_key}"
         )
+    if key0.dp_rank != key1.dp_rank:
+        raise ValueError(
+            f"_key_match should be run on the same dp_rank, but got key0.dp_rank={key0.dp_rank} != key1.dp_rank={key1.dp_rank}"
+        )
 
 
 def _key_match_page_size1(key0: RadixKey, key1: RadixKey):
-    _check_extra_key(key0, key1)
+    _check_composite_key(key0, key1)
     i = 0
     for k0, k1 in zip(key0.token_ids, key1.token_ids):
         if k0 != k1:
@@ -96,7 +103,7 @@ def _key_match_page_size1(key0: RadixKey, key1: RadixKey):
 
 
 def _key_match_paged(key0: RadixKey, key1: RadixKey, page_size: int):
-    _check_extra_key(key0, key1)
+    _check_composite_key(key0, key1)
     min_len = min(len(key0), len(key1))
 
     i = 0
@@ -109,9 +116,20 @@ def _key_match_paged(key0: RadixKey, key1: RadixKey, page_size: int):
 
 
 def get_child_key(key: RadixKey, page_size: int = 1):
-    """Get child key for tree traversal, incorporating extra_key for namespace isolation."""
+    """Get child key for tree traversal with namespace isolation via extra_key and dp_rank."""
     plain_key = key.token_ids[0] if page_size == 1 else tuple(key.token_ids[:page_size])
-    return plain_key if key.extra_key is None else (key.extra_key, plain_key)
+
+    has_extra_key = key.extra_key is not None
+    has_dp_rank = key.dp_rank is not None
+
+    if not has_extra_key and not has_dp_rank:
+        return plain_key
+    elif has_extra_key and not has_dp_rank:
+        return (key.extra_key, plain_key)
+    elif has_dp_rank and not has_extra_key:
+        return (key.dp_rank, plain_key)
+    else:  # Both present
+        return ((key.extra_key, key.dp_rank), plain_key)
 
 
 def _convert_to_bigram_key(tokens: list[int]) -> list[tuple[int, int]]:
@@ -178,7 +196,7 @@ class RadixCache(BasePrefixCache):
 
     def reset(self):
         self.root_node = TreeNode()
-        self.root_node.key = RadixKey(token_ids=[], extra_key=None)
+        self.root_node.key = RadixKey(token_ids=[], extra_key=None, dp_rank=None)
         self.root_node.value = []
         self.root_node.lock_ref = 1
         self.evictable_size_ = 0
@@ -188,7 +206,8 @@ class RadixCache(BasePrefixCache):
         # Support both RadixKey and plain list for backward compatibility
         if not isinstance(key, RadixKey):
             extra_key = kwargs.get("extra_key")
-            key = RadixKey(key, extra_key)
+            dp_rank = kwargs.get("dp_rank")
+            key = RadixKey(key, extra_key, dp_rank)
 
         if self.disable or len(key) == 0:
             empty_array = np.empty((0,), dtype=np.int32)
@@ -201,7 +220,7 @@ class RadixCache(BasePrefixCache):
             )
 
         # Convert and align key
-        converted_key = RadixKey(self.key_convert_fn(key.token_ids), key.extra_key)
+        converted_key = RadixKey(self.key_convert_fn(key.token_ids), key.extra_key, key.dp_rank)
 
         if self.page_size != 1:
             page_aligned_len = len(converted_key) // self.page_size * self.page_size
@@ -238,10 +257,10 @@ class RadixCache(BasePrefixCache):
 
         # Support both RadixKey and plain list for backward compatibility
         if not isinstance(key, RadixKey):
-            key = RadixKey(key, None)
+            key = RadixKey(key, None, None)
 
         # Convert key
-        converted_key = RadixKey(self.key_convert_fn(key.token_ids), key.extra_key)
+        converted_key = RadixKey(self.key_convert_fn(key.token_ids), key.extra_key, key.dp_rank)
 
         if value is None:
             value = self._create_tokens_data(converted_key.token_ids)
@@ -291,7 +310,8 @@ class RadixCache(BasePrefixCache):
 
         # Radix Cache takes over one reference from memory pool
         new_prefix_len = self.insert(
-            RadixKey(token_ids[:page_aligned_token_len], req.extra_key), page_aligned_kv_indices
+            RadixKey(token_ids[:page_aligned_token_len], req.extra_key, req.dp_rank),
+            page_aligned_kv_indices,
         )
 
         self.token_to_kv_pool_allocator.free(kv_indices[old_prefix_len:new_prefix_len])
@@ -332,7 +352,7 @@ class RadixCache(BasePrefixCache):
             old_prefix_len -= 1
 
         # Radix Cache takes over one reference from memory pool
-        radix_key = RadixKey(page_aligned_token_ids, req.extra_key)
+        radix_key = RadixKey(page_aligned_token_ids, req.extra_key, req.dp_rank)
         new_prefix_len = self.insert(radix_key, page_aligned_kv_indices)
         self.token_to_kv_pool_allocator.free(kv_indices[old_prefix_len:new_prefix_len])
 
