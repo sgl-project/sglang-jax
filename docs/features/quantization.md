@@ -63,8 +63,6 @@ uv run python -u -m sgl_jax.launch_server \
 - QWenLMHeadModel series
 
 ### TODOs:
-- add quantization tests
-- test more models on the performance and memory usage under different settings
 - add dynamic range quantization support
 
 

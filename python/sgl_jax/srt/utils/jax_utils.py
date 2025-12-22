@@ -115,7 +115,6 @@ def get_available_device_memory(device, distributed=False, empty_cache=True):
         for dev in devices:
             stats = dev.memory_stats()
             avail_mem.append(stats["bytes_limit"] - stats["bytes_in_use"])
-        print("avail_mem:", avail_mem)
         avail_mem = jnp.array([min(avail_mem) / (1 << 10)], dtype=jnp.float32)
     elif device == "proxy":
         devices = jax.devices()

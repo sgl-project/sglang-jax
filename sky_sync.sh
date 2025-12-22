@@ -20,7 +20,7 @@ fi
 
 # first copy to the head node
 echo "Copying python directory to ${target_cluster}"
-rsync -Pavz --ignore-times python/ ${target_cluster}:/home/gcpuser/sky_workdir/sglang-jax/python/
+rsync -Pavz --ignore-times test/ ${target_cluster}:/home/gcpuser/sky_workdir/sglang-jax/test/
 
 if [ "$NUM_WORKERS" -gt 1 ]; then
     for i in $(seq 1 $((NUM_WORKERS - 1))); do
