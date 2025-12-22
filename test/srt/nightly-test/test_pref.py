@@ -165,6 +165,7 @@ class TestModePerf(CustomTestCase):
                             extra_request_body=None,
                             lora_name=None,
                             profile=True,
+                            num_steps=10,
                             pd_separated=False,
                             tokenize_prompt=False,
                             adjust_prompt_max_retry=10,
