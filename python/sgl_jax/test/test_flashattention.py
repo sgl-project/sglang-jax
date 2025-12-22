@@ -287,8 +287,11 @@ def create_test_data(
         token_ids_logprobs=None,
         extend_logprob_start_lens=None,
         extend_input_logprob_token_ids=None,
+        logits_indices=np.asarray(extend_seq_lens),
         real_bs=seq_lens.shape[0],
         spec_info=spec_info,
+        dp_size=1,
+        per_dp_bs_size=seq_lens.shape[0],
     )
 
     fb = ForwardBatch(
@@ -430,7 +433,6 @@ class TestAttention(CustomTestCase):
             page_table,
             forward_batch.attn_backend.forward_metadata.cu_q_lens,
             # forward_batch.attn_backend.forward_metadata.cu_kv_lens,
-            forward_batch.attn_backend.forward_metadata.num_seqs,
             custom_mask=(
                 forward_batch.spec_info.custom_mask if forward_batch.spec_info is not None else None
             ),
