@@ -114,9 +114,6 @@ def traverse_and_update(state_obj, target_modules):
             if key in ("A_buffer", "B_buffer"):
                 # Found a LoRA buffer to replace
                 updated[key] = _create_dummy_buffer(value)
-            elif key in target_modules:
-                # This key is a target module name, recurse into it
-                updated[key] = traverse_and_update(value, target_modules)
             else:
                 # Regular key, recurse normally
                 updated[key] = traverse_and_update(value, target_modules)
