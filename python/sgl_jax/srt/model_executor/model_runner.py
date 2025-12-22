@@ -155,7 +155,6 @@ class ModelRunner:
             total_device_memory,
         )
 
-
     def initialize_jit(self):
         model_def, model_state = nnx.split(self.model)
         model_state_leaves, model_state_def = jax.tree_util.tree_flatten(model_state)
@@ -247,12 +246,11 @@ class ModelRunner:
         self.model_config.configure_for_tensor_parallel(self.tp_size)
         self.model_config.log_kv_heads_info(self.tp_size)
         self.model_config.hf_config.ep_size = self.ep_size
-        
 
         self.model = self.model_loader.load_model(
             model_config=self.model_config,
         )
-        
+
         if self.model_config.quantization_config_path is not None:
             self.model = apply_qwix_quantization(self.model_config, self.model, self.mesh)
 

@@ -13,10 +13,6 @@ from sgl_jax.srt.configs.model_config import ModelConfig
 from sgl_jax.srt.model_loader.arch import get_model_architecture
 from sgl_jax.srt.utils.common_utils import get_bool_env_var
 
-from qwix._src.core.qarray import QArray
-from qwix._src.providers import ptq
-from sgl_jax.srt.utils.quantization.quantization_utils import apply_qwix_quantization
-
 logger = logging.getLogger(__name__)
 
 

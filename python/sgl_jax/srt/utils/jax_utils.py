@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
+import gc
 from collections import defaultdict
 from typing import Any
 
 import jax
 import jax.numpy as jnp
 from jax.sharding import PartitionSpec
-import gc
 
 GBYTES = 1024 * 1024 * 1024
 TPU_HEAD_SIZE_ALIGNMENT = 128
@@ -109,7 +109,7 @@ def get_available_device_memory(device, distributed=False, empty_cache=True):
     if device == "tpu":
         devices = jax.local_devices()
         if empty_cache:
-            gc.collect() # collect garbage to free up memory used by quantization
+            gc.collect()  # collect garbage to free up memory used by quantization
             jax.clear_caches()
         avail_mem = []
         for dev in devices:

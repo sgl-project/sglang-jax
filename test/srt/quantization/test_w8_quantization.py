@@ -3,9 +3,9 @@ import unittest
 from types import SimpleNamespace
 
 import requests
+from run_eval import run_eval
 
 from sgl_jax.srt.utils import kill_process_tree
-from run_eval import run_eval
 from sgl_jax.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -87,14 +87,13 @@ class BaseW8Test(CustomTestCase):
         print(f"Throughput: {throughput} tokens/s")
         self.assertGreaterEqual(throughput, self.throughput_threshold)
 
+
 class TestW8Int8(BaseW8Test):
     model = "Qwen/Qwen3-32B"
     quantization_config_path = "int8_all_modules_w_only.yaml"
     gsm8k_accuracy_threshold = 0.96
     throughput_threshold = 100
-    other_args = [
-        "--tp-size=4"
-    ]
+    other_args = ["--tp-size=4"]
 
 
 if __name__ == "__main__":

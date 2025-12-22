@@ -420,7 +420,7 @@ class ServerArgs:
             "--quantization-config-path",
             type=str,
             default=None,
-            help="The config path for how to apply quantization to loaded model."
+            help="The config path for how to apply quantization to loaded model.",
         )
         parser.add_argument(
             "--kv-cache-dtype",

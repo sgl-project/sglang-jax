@@ -299,15 +299,15 @@ class ForwardBatch:
     ):
         """
         Create a ForwardBatch from ModelWorkerBatch, similar to init_new but without requiring ModelRunner.
-        
+
         This method follows the same pattern as init_new() used in precompile, but allows
         creating ForwardBatch when only mesh is available (e.g., for quantization).
-        
+
         Args:
             batch: The ModelWorkerBatch to convert
             mesh: The JAX mesh for sharding
             attn_backend: Optional attention backend (can be None for quantization)
-            
+
         Returns:
             ForwardBatch created from the ModelWorkerBatch
         """
@@ -334,11 +334,7 @@ class ForwardBatch:
                 batch.extend_prefix_lens,
                 batch.extend_seq_lens,
             ),
-            sharding=(
-                NamedSharding(mesh, PartitionSpec())
-                if jax.process_count() == 1
-                else None
-            ),
+            sharding=(NamedSharding(mesh, PartitionSpec()) if jax.process_count() == 1 else None),
         )
 
         obj = cls(

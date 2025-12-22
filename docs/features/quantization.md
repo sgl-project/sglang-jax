@@ -64,5 +64,3 @@ uv run python -u -m sgl_jax.launch_server \
 
 ### TODOs:
 - add dynamic range quantization support
-
-
