@@ -1,3 +1,7 @@
+import dataclasses
+import uuid
+
+import numpy as np
 from pydantic import BaseModel
 
 
@@ -37,3 +41,41 @@ class VideoGenerationsRequest(BaseModel):
 class VideoResponse(BaseModel):
     id: str
     path: str | None = None
+
+
+@dataclasses.dataclass
+class GenerateMMReqInput:
+    rid: str | None = None
+    prompt: str | None = None
+    input_ids: list[int] | None = None
+    n: int | None = 1
+    input_reference: str | None = None
+    size: str = None
+    seconds: int | None = None
+    fps: int | None = None
+    num_frames: int | None = None
+    output_format: str | None = None
+    background: str | None = None
+    response_format: str | None = None
+
+    def __post_init__(self):
+        self.rid = uuid.uuid4().hex
+
+
+@dataclasses.dataclass
+class TokenizedGenerateMMReqInput:
+    rid: str | None = None
+    prompt: str | None = None
+    input_ids: list[int] | None = None
+    negative_prompt: str | None = None
+    negative_input_ids: list[int] | None = None
+    n: int | None = 1
+    input_reference: str | None = None
+    preprocessed_image: np.ndarray | None = None
+    size: str = None
+    seconds: int | None = None
+    fps: int | None = None
+    num_frames: int | None = None
+    output_format: str | None = None
+    background: str | None = None
+    response_format: str | None = None

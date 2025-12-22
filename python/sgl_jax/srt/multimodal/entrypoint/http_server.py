@@ -2,17 +2,19 @@ import logging
 import multiprocessing as mp
 import os
 from collections.abc import Callable
+from http import HTTPStatus
 
 import uvicorn
 from fastapi import Request
+from fastapi.responses import ORJSONResponse
 
 from sgl_jax.srt.entrypoints.http_server import _GlobalState, app, set_global_state
 from sgl_jax.srt.managers.template_manager import TemplateManager
 from sgl_jax.srt.multimodal.common.ServerArgs import MultimodalServerArgs
 from sgl_jax.srt.multimodal.manager.global_scheduler import run_global_scheduler_process
 from sgl_jax.srt.multimodal.manager.io_struct import (
+    GenerateMMReqInput,
     ImageGenerationsRequest,
-    ImageResponse,
     VideoGenerationsRequest,
     VideoResponse,
 )
@@ -26,10 +28,27 @@ from sgl_jax.srt.utils import kill_process_tree, set_uvicorn_logging_configs
 logger = logging.getLogger(__name__)
 
 
+def _create_error_response(e):
+    return ORJSONResponse({"error": {"message": str(e)}}, status_code=HTTPStatus.BAD_REQUEST)
+
+
 @app.api_route("/api/v1/images/generation", methods=["POST", "PUT"])
 async def images_generation(obj: ImageGenerationsRequest, request: Request):
-    print(f"receive req {obj}")
-    return ImageResponse(id="test")
+    try:
+        from sgl_jax.srt.entrypoints.http_server import _global_state
+
+        internal_obj = await _convert_to_internal_request(obj)
+        ret = await _global_state.tokenizer_manager.generate_request(
+            internal_obj, request
+        ).__anext__()
+        return ret
+    except ValueError as e:
+        logger.error("[http_server] Error: %s", e)
+        return _create_error_response(e)
+
+
+async def _convert_to_internal_request(obj: ImageGenerationsRequest | VideoGenerationsRequest):
+    return GenerateMMReqInput(prompt=obj.prompt)
 
 
 @app.api_route("/api/v1/videos/generation", methods=["POST", "PUT"])
@@ -68,12 +87,16 @@ def launch(
     processes = []
 
     # 1. Global Scheduler (Main Engine)
+    scheduler_pipe_readers = []
+    scheduler_procs = []
+    reader, writer = mp.Pipe(duplex=False)
     scheduler_proc = mp.Process(
         target=run_global_scheduler_process,
-        args=(server_args, port_args),
+        args=(server_args, port_args, writer),
     )
     scheduler_proc.start()
     processes.append(scheduler_proc)
+    scheduler_procs.append(scheduler_proc)
 
     # 2. Multimodal Detokenizer
     detokenizer_proc = mp.Process(
@@ -83,6 +106,20 @@ def launch(
     detokenizer_proc.start()
     processes.append(detokenizer_proc)
 
+    for i in range(len(scheduler_pipe_readers)):
+        try:
+            data = scheduler_pipe_readers[i].recv()
+        except EOFError:
+            logger.error(
+                "Node %s jax_scheduler is dead. Please check if there are relevant logs.",
+                i,
+            )
+            scheduler_procs[i].join()
+            logger.error("Exit code: %s", scheduler_procs[i].exitcode)
+            raise
+
+        if data["status"] != "ready":
+            raise RuntimeError("Initialization failed. Please see the error messages above.")
     # 3. Multimodal Tokenizer (In-process)
     tokenizer_manager = MultimodalTokenizer(server_args, port_args)
 
