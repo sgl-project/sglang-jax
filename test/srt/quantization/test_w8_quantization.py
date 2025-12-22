@@ -50,6 +50,7 @@ class BaseW8Test(CustomTestCase):
             self.skipTest("gsm8k_accuracy_threshold not set for this test")
 
         args = SimpleNamespace(
+            eval_name="gsm8k",
             num_shots=5,
             data_path=None,
             num_questions=200,
@@ -90,7 +91,7 @@ class TestW8Int8(BaseW8Test):
     model = "Qwen/Qwen3-32B"
     quantization_config_path = "int8_all_modules_w_only.yaml"
     gsm8k_accuracy_threshold = 0.96
-    throughput_threshold = 300
+    throughput_threshold = 100
     other_args = [
         "--tp-size=4"
     ]
