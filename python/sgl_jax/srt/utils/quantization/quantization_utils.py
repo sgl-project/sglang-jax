@@ -24,8 +24,7 @@ from sgl_jax.srt.sampling.sampling_batch_info import SamplingBatchInfo
 # from sgl_jax.srt.model_executor.model_runner import ModelRunner
 
 QUANTIZATION_CONFIG_PATH = os.path.join(os.path.dirname(__file__), "configs")
-DEFAULT_PAGE_SIZE = 1
-DEFAULT_MAX_NUM_TOKENS = 2000
+DEFAULT_NUM_PAGES = 100
 
 
 def parse_qwix_config_to_rules(qwix_config: list[dict]) -> list[qwix.QuantizationRule]:
@@ -48,13 +47,9 @@ def parse_qwix_config_to_rules(qwix_config: list[dict]) -> list[qwix.Quantizatio
 def qwix_quantize_nnx_model(
     model: nnx.Module,
     qwix_config: list[dict],
-    model_worker_batch: ModelWorkerBatch,
-    model_runner,
-    attn_backend,
-    kv_head_num: int,
-    head_dim: int,
-    layer_num: int,
-    kv_cache_dtype: jnp.dtype,
+    forward_batch: ForwardBatch,
+    token_to_kv_pool: MHATokenToKVPool,
+    logits_metadata: LogitsMetadata,
 ) -> nnx.Module:
     """
     Quantizes a Flax NNX model using Qwix. 
@@ -79,19 +74,8 @@ def qwix_quantize_nnx_model(
     Returns:
         model: the quantized model
     """
-    token_to_kv_pool = MHATokenToKVPool(
-        size=DEFAULT_MAX_NUM_TOKENS,
-        page_size=model_runner.page_size,
-        dtype=kv_cache_dtype,
-        head_num=kv_head_num,
-        head_dim=head_dim,
-        layer_num=layer_num,
-        mesh=model_runner.mesh,
-    )
+    
     qwix_rules = parse_qwix_config_to_rules(qwix_config)
-    logits_metadata = LogitsMetadata.from_model_worker_batch(model_worker_batch, model_runner.mesh)
-    attn_backend.forward_metadata = attn_backend.get_forward_metadata(model_worker_batch)
-    forward_batch = ForwardBatch.init_new(model_worker_batch, model_runner)
     model_input = {
         "forward_batch": forward_batch,
         "token_to_kv_pool": token_to_kv_pool,
@@ -149,11 +133,27 @@ def apply_qwix_quantization(model_config: ModelConfig, model: nnx.Module, model_
     qwix_config = qwix_config_dict.get("qwix").get("rules")
 
     # prepare batch input
+    forward_batch, token_to_kv_pool, logits_metadata = prepare_inputs_for_quantization(model_config, model_runner)
+
+    qwix_quantize_nnx_model_with_config_and_attn_backend = functools.partial(
+        qwix_quantize_nnx_model, qwix_config=qwix_config,
+    )
+    with jax.set_mesh(model_runner.mesh):
+        model = nnx.jit(
+            qwix_quantize_nnx_model_with_config_and_attn_backend,
+            donate_argnames=("model",),  # donate the model to the jitted function to save memory
+        )(
+            forward_batch=forward_batch,
+            token_to_kv_pool=token_to_kv_pool,
+            logits_metadata=logits_metadata,
+            model=model,
+        )
+    return model
+
+def prepare_inputs_for_quantization(model_config: ModelConfig, model_runner) -> tuple[ForwardBatch, MHATokenToKVPool, LogitsMetadata]:
     bs = 1
     max_seq_len = 4096
-    page_size = 1
     num_tokens = model_config.vocab_size
-    num_attn_heads = model_config.num_attention_heads
     num_kv_heads = model_config.get_total_num_kv_heads_with_replication(model_runner.mesh.shape["tensor"])
     head_dim = model_config.head_dim
     vocab_size = model_config.vocab_size
@@ -165,38 +165,22 @@ def apply_qwix_quantization(model_config: ModelConfig, model: nnx.Module, model_
         kv_cache_dtype = jnp.bfloat16
 
     model_worker_batch = generate_mock_model_worker_batch(
-        bs, num_tokens, ForwardMode.DECODE, vocab_size, max_seq_len
+        bs, num_tokens, ForwardMode.DECODE, vocab_size, max_seq_len, model_runner.page_size,
     )
-    attn_backend = FlashAttention(
-        num_attn_heads=num_attn_heads,
-        num_kv_heads=num_kv_heads,
+    token_to_kv_pool = MHATokenToKVPool(
+        size=model_runner.page_size * DEFAULT_NUM_PAGES,
+        page_size=model_runner.page_size,
+        dtype=kv_cache_dtype,
+        head_num=num_kv_heads,
         head_dim=head_dim,
-        page_size=page_size,
+        layer_num=layer_num,
         mesh=model_runner.mesh,
     )
-
-    qwix_quantize_nnx_model_with_config_and_attn_backend = functools.partial(
-        qwix_quantize_nnx_model, qwix_config=qwix_config, model_worker_batch=model_worker_batch, model_runner=model_runner,
-    )
-    with jax.set_mesh(model_runner.mesh):
-        model = nnx.jit(
-            qwix_quantize_nnx_model_with_config_and_attn_backend,
-            static_argnames=(
-                "kv_head_num",
-                "head_dim",
-                "layer_num",
-                "kv_cache_dtype",
-            ),
-            donate_argnames=("model",),  # donate the model to the jitted function to save memory
-        )(
-            kv_head_num=num_kv_heads,
-            head_dim=(head_dim + 127) // 128 * 128,
-            layer_num=layer_num,
-            kv_cache_dtype=kv_cache_dtype,
-            model=model,
-            attn_backend=attn_backend,
-        )
-    return model
+    logits_metadata = LogitsMetadata.from_model_worker_batch(model_worker_batch, model_runner.mesh)
+    model_runner.attn_backend.forward_metadata = model_runner.attn_backend.get_forward_metadata(model_worker_batch)
+    forward_batch = ForwardBatch.init_new(model_worker_batch, model_runner)
+    
+    return forward_batch, token_to_kv_pool, logits_metadata
 
 
 def generate_mock_model_worker_batch(
