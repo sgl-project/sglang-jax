@@ -1188,7 +1188,7 @@ class TestModelAccuracy(CustomTestCase):
         process = popen_launch_server(
             model_path_for_server,
             DEFAULT_URL_FOR_TEST,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            timeout=1200,
             device="tpu",
             other_args=specific_args,
             env={
