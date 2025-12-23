@@ -41,6 +41,7 @@ dependencies = [
     "pybase64",
     "partial_json_parser",
     "pathwaysutils",
+    "omegaconf"
 ]
 
 [project.optional-dependencies]

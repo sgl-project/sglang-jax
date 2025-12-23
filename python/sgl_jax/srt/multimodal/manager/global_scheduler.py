@@ -1,10 +1,16 @@
 import logging
+import os
+import queue
 import signal
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Any
 
 import psutil
 import setproctitle
 import zmq
 
+from sgl_jax.srt.multimodal.manager.stage import Stage
+from sgl_jax.srt.multimodal.manager.utils import load_stage_configs_from_yaml
 from sgl_jax.srt.server_args import PortArgs, ServerArgs
 from sgl_jax.srt.utils import configure_logger, kill_itself_when_parent_died
 from sgl_jax.srt.utils.common_utils import get_zmq_socket
@@ -22,6 +28,43 @@ class GlobalScheduler:
         self.send_to_detokenizer = get_zmq_socket(
             context, zmq.PUSH, port_args.detokenizer_ipc_name, False
         )
+
+        self.stage_configs = load_stage_configs_from_yaml(
+            "../models/static_configs/wan2_1_stage_config.yaml"
+        )
+        self._init_stage()
+
+    def _init_stage(self):
+        def _build_stage(idx_cfg: tuple[int, Any]) -> tuple[int, Stage]:
+            idx, cfg = idx_cfg
+            return idx, Stage(cfg)
+
+        with ThreadPoolExecutor(
+            max_workers=min(len(self.stage_configs), max(1, os.cpu_count() or 1))
+        ) as executor:
+            futures = [
+                executor.submit(_build_stage, (idx, cfg))
+                for idx, cfg in enumerate(self.stage_configs)
+            ]
+            results: list[tuple[int, Stage]] = []
+            for fut in as_completed(futures):
+                results.append(fut.result())
+        results.sort(key=lambda x: x[0])
+        self.stage_list = [st for _, st in results]
+        self.in_queues = [queue.Queue() for _ in range(len(self.stage_list))]
+        self.out_queues = [queue.Queue() for _ in range(len(self.stage_list))]
+        for i, stage in enumerate(self.stage_list):
+            stage.set_in_queue(self.in_queues[i])
+            stage.set_out_queue(self.out_queues[i])
+            stage.set_stage_index(i)
+        self.start_stage()
+
+    def start_stage(self):
+        import threading
+
+        for stage in self.stage_list:
+            thread = threading.Thread(target=stage.run_stage)
+            thread.start()
 
     def recv_request(self):
         recv_reqs = []
@@ -41,6 +84,10 @@ class GlobalScheduler:
             print("recv_reqs from tokenizer", reqs)
             time.sleep(3)
             if reqs:
+                for req in reqs:
+                    self.in_queues[0].put_nowait(req)
+            else:
+                ## todo: try to collect result, and return to detokenizer
                 self.send_to_detokenizer.send_pyobj(reqs)
 
 
