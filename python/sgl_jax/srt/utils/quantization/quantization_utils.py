@@ -74,7 +74,7 @@ def qwix_quantize_nnx_model(
     Returns:
         model: the quantized model
     """
-    
+
     qwix_rules = parse_qwix_config_to_rules(qwix_config)
     model_input = {
         "forward_batch": forward_batch,
@@ -127,7 +127,6 @@ def apply_qwix_quantization(
     Will apply quantization if a valid quantization config with Qwix rules is provided.  See README
     for more details on Qwix.
     """
-    from sgl_jax.srt.layers.attention.flashattention_backend import FlashAttention
 
     qwix_config_dict = quantization_config_file_path_to_dict(
         os.path.join(model_config.quantization_config_path)
@@ -135,10 +134,13 @@ def apply_qwix_quantization(
     qwix_config = qwix_config_dict.get("qwix").get("rules")
 
     # prepare batch input
-    forward_batch, token_to_kv_pool, logits_metadata = prepare_inputs_for_quantization(model_config, model_runner)
+    forward_batch, token_to_kv_pool, logits_metadata = prepare_inputs_for_quantization(
+        model_config, model_runner
+    )
 
     qwix_quantize_nnx_model_with_config_and_attn_backend = functools.partial(
-        qwix_quantize_nnx_model, qwix_config=qwix_config,
+        qwix_quantize_nnx_model,
+        qwix_config=qwix_config,
     )
     with jax.set_mesh(model_runner.mesh):
         model = nnx.jit(
@@ -152,11 +154,16 @@ def apply_qwix_quantization(
         )
     return model
 
-def prepare_inputs_for_quantization(model_config: ModelConfig, model_runner) -> tuple[ForwardBatch, MHATokenToKVPool, LogitsMetadata]:
+
+def prepare_inputs_for_quantization(
+    model_config: ModelConfig, model_runner
+) -> tuple[ForwardBatch, MHATokenToKVPool, LogitsMetadata]:
     bs = 1
     max_seq_len = 4096
     num_tokens = model_config.vocab_size
-    num_kv_heads = model_config.get_total_num_kv_heads_with_replication(model_runner.mesh.shape["tensor"])
+    num_kv_heads = model_config.get_total_num_kv_heads_with_replication(
+        model_runner.mesh.shape["tensor"]
+    )
     head_dim = model_config.head_dim
     vocab_size = model_config.vocab_size
     layer_num = model_config.num_hidden_layers
@@ -167,7 +174,12 @@ def prepare_inputs_for_quantization(model_config: ModelConfig, model_runner) -> 
         kv_cache_dtype = jnp.bfloat16
 
     model_worker_batch = generate_mock_model_worker_batch(
-        bs, num_tokens, ForwardMode.DECODE, vocab_size, max_seq_len, model_runner.page_size,
+        bs,
+        num_tokens,
+        ForwardMode.DECODE,
+        vocab_size,
+        max_seq_len,
+        model_runner.page_size,
     )
     token_to_kv_pool = MHATokenToKVPool(
         size=model_runner.page_size * DEFAULT_NUM_PAGES,
@@ -179,9 +191,11 @@ def prepare_inputs_for_quantization(model_config: ModelConfig, model_runner) -> 
         mesh=model_runner.mesh,
     )
     logits_metadata = LogitsMetadata.from_model_worker_batch(model_worker_batch, model_runner.mesh)
-    model_runner.attn_backend.forward_metadata = model_runner.attn_backend.get_forward_metadata(model_worker_batch)
+    model_runner.attn_backend.forward_metadata = model_runner.attn_backend.get_forward_metadata(
+        model_worker_batch
+    )
     forward_batch = ForwardBatch.init_new(model_worker_batch, model_runner)
-    
+
     return forward_batch, token_to_kv_pool, logits_metadata
 
 
