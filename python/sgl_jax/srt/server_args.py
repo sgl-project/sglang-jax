@@ -13,6 +13,8 @@ from sgl_jax.srt.function_call.function_call_parser import FunctionCallParser
 from sgl_jax.srt.hf_transformers_utils import check_gguf_file, get_config
 from sgl_jax.srt.reasoning_parser import ReasoningParser
 from sgl_jax.srt.utils.common_utils import (
+    LORA_TARGET_ALL_MODULES,
+    SUPPORTED_LORA_TARGET_MODULES,
     is_remote_url,
     is_valid_ipv6_address,
     nullable_str,
@@ -149,6 +151,17 @@ class ServerArgs:
 
     # For sampling
     use_sort_for_toppk_minp: bool = False
+
+    # LoRA
+    enable_lora: bool | None = None
+    max_lora_rank: int | None = None
+    lora_target_modules: set[str] | list[str] | None = None
+    lora_paths: dict[str, str] | list[dict[str, str]] | list[str] | list | None = None
+    max_loaded_loras: int | None = None
+    max_loras_per_batch: int = 8
+    lora_eviction_policy: str = "lru"
+    enable_static_lora: bool | None = None
+    lora_scaling: float | None = None
 
     def __post_init__(self):
         # Set missing default values
@@ -877,6 +890,67 @@ class ServerArgs:
             help="Use jnp.sort to deal with top_k, top_p and min_p, which improves the grades for math-500 but increase precompile time a lot",
         )
 
+        # LoRA
+        parser.add_argument(
+            "--enable-lora",
+            action="store_true",
+            help="Enable LoRA support. LoRA (Low-Rank Adaptation) allows serving multiple fine-tuned models with minimal overhead.",
+        )
+        parser.add_argument(
+            "--lora-paths",
+            type=str,
+            nargs="*",
+            default=None,
+            help="List of LoRA adapters to preload. Can be local paths or HuggingFace repo IDs. "
+            "Format: 'adapter_name=path' or just 'path' (will use basename as name).",
+        )
+        parser.add_argument(
+            "--max-loras-per-batch",
+            type=int,
+            default=8,
+            help="Maximum number of different LoRA adapters that can be used in a single batch.",
+        )
+        parser.add_argument(
+            "--max-lora-rank",
+            type=int,
+            default=None,
+            help="Maximum LoRA rank to support. If not specified, will be determined from loaded adapters.",
+        )
+        parser.add_argument(
+            "--max-loaded-loras",
+            type=int,
+            default=None,
+            help="Maximum number of LoRA adapters to keep loaded in memory.",
+        )
+        parser.add_argument(
+            "--lora-target-modules",
+            type=str,
+            choices=SUPPORTED_LORA_TARGET_MODULES + [LORA_TARGET_ALL_MODULES],
+            nargs="*",
+            default=None,
+            help="List of module names to apply LoRA to. If not specified, will be determined from adapters. If not specified, "
+            "it will be automatically inferred from the adapters provided in --lora-paths. If 'all' is specified, "
+            "all supported modules will be targeted.",
+        )
+        parser.add_argument(
+            "--lora-eviction-policy",
+            type=str,
+            default="lru",
+            choices=["lru"],
+            help="Policy for evicting LoRA adapters when max_loaded_loras is reached.",
+        )
+        parser.add_argument(
+            "--enable-static-lora",
+            action="store_true",
+            help="Enable static LoRA support for RL, and it is different from the combination of enable-lora and max-loras-per-batch = 1",
+        )
+        parser.add_argument(
+            "--lora-scaling",
+            type=float,
+            default=ServerArgs.lora_scaling,
+            help="Lora scaling is required for static LoRA, scaling = alpha/rank",
+        )
+
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace):
         args.tp_size = args.tensor_parallel_size
@@ -928,12 +1002,135 @@ class ServerArgs:
                 self.chunked_prefill_size % self.page_size == 0
             ), "chunked_prefill_size must be divisible by page_size"
 
+        # Check LoRA configuration
+        self.check_lora_server_args()
+
         # Disallow overlap scheduler when speculative decoding is enabled
         if self.speculative_algorithm is not None and not self.disable_overlap_schedule:
             raise ValueError(
                 "Speculative decoding does not support overlap scheduler. "
                 "Please pass --disable-overlap-schedule when using --speculative-algorithm."
             )
+
+    def check_lora_server_args(self):
+        """Validate and normalize LoRA-related server arguments."""
+        # Import LoRARef here to avoid circular imports
+        from sgl_jax.srt.lora.lora_registry import LoRARef
+
+        if self.lora_paths:
+            self.enable_lora = True
+            logger.info("Auto-enabling LoRA because lora_paths are provided")
+
+        if not self.enable_lora and not self.enable_static_lora:
+            return
+
+        assert not (
+            self.enable_lora and self.enable_static_lora
+        ), f"{self.enable_lora} and {self.enable_static_lora} can not be enable at the same time"
+
+        self.enable_lora = True
+
+        # Validate max_loras_per_batch
+        assert self.max_loras_per_batch > 0, "max_loras_per_batch must be positive"
+
+        # Expand target modules
+        if self.lora_target_modules:
+            self.lora_target_modules = set(self.lora_target_modules)
+            if "all" in self.lora_target_modules:
+                assert (
+                    len(self.lora_target_modules) == 1
+                ), "If 'all' is specified in --lora-target-modules, it should be the only module specified."
+                self.lora_target_modules = set(SUPPORTED_LORA_TARGET_MODULES)
+
+        # Ensure sufficient information is provided for LoRA initialization.
+        assert self.lora_paths or (
+            self.max_lora_rank and self.lora_target_modules
+        ), "When no initial --lora-paths is provided, you need to specify both --max-lora-rank and --lora-target-modules for LoRA initialization."
+
+        def check_static_lora_args():
+            assert (
+                self.lora_scaling is not None
+            ), "lora_scaling is required when enable-static-lora is enabled"
+
+            assert (
+                self.lora_paths is None
+            ), "lora-paths is not required when enable-static-lora is enabled"
+            assert (
+                self.max_loras_per_batch == 1
+            ), "max-loras-per-batch is required to be 1 when enable-static-lora is enabled"
+
+        def check_dynamic_lora_args():
+            # Normalize lora_paths to List[LoRARef]
+            if self.lora_paths is not None:
+                normalized_lora_refs = []
+
+                # Normalize lora_paths to List[LoRARef]
+                if self.lora_paths is not None:
+                    normalized_lora_refs = []
+
+                    if isinstance(self.lora_paths, dict):
+                        # Dict format: {"name": "path", ...}
+                        for name, path in self.lora_paths.items():
+                            if name == "0":
+                                raise ValueError(
+                                    "This key(0) is a server-reserved symbol, used for requests that do not go through LoRA."
+                                )
+                            normalized_lora_refs.append(
+                                LoRARef(lora_name=name, lora_path=path, pinned=True)
+                            )
+                    elif isinstance(self.lora_paths, list):
+                        for item in self.lora_paths:
+                            if isinstance(item, str):
+                                # String format: "name=path" or just "path"
+                                if "=" in item:
+                                    name, path = item.split("=", 1)
+                                    normalized_lora_refs.append(
+                                        LoRARef(
+                                            lora_name=name.strip(),
+                                            lora_path=path.strip(),
+                                            pinned=True,
+                                        )
+                                    )
+                                else:
+                                    # Use basename as name
+                                    import os
+
+                                    name = os.path.basename(item.rstrip("/"))
+                                    normalized_lora_refs.append(
+                                        LoRARef(lora_name=name, lora_path=item, pinned=True)
+                                    )
+                            elif isinstance(item, dict):
+                                # Dict format in list: {"name": "adapter1", "path": "/path/to/adapter"}
+                                name = item.get("name") or item.get("lora_name")
+                                path = item.get("path") or item.get("lora_path")
+                                pinned = item.get("pinned", True)
+                                normalized_lora_refs.append(
+                                    LoRARef(lora_name=name, lora_path=path, pinned=pinned)
+                                )
+                            elif hasattr(item, "lora_name"):
+                                # Already a LoRARef object
+                                normalized_lora_refs.append(item)
+                            else:
+                                raise ValueError(f"Unsupported lora_paths item format: {item}")
+
+                    self.lora_paths = normalized_lora_refs
+
+                    # Validate max_loaded_loras
+                    if self.max_loaded_loras is not None:
+                        assert (
+                            self.max_loaded_loras >= self.max_loras_per_batch
+                        ), "max_loaded_loras must be >= max_loras_per_batch"
+
+                    logger.info(
+                        "Loaded %d LoRA adapters: %s",
+                        len(self.lora_paths),
+                        [ref.lora_name for ref in self.lora_paths],
+                    )
+
+        if self.enable_static_lora:
+            check_static_lora_args()
+        else:
+            check_dynamic_lora_args()
 
 
 ZMQ_TCP_PORT_DELTA = 233

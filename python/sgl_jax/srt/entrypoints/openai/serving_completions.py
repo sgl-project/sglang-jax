@@ -78,6 +78,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
             logprob_start_len=logprob_start_len,
             return_text_in_logprobs=True,
             stream=request.stream,
+            lora_path=request.lora_path,
             extra_key=request.extra_key,
             rid=request.rid,
         )

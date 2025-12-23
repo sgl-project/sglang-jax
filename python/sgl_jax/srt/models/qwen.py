@@ -272,7 +272,6 @@ class QWenModel(nnx.Module):
         hidden_states = self.embed_tokens(forward_batch.input_ids)
 
         layers_kv_fused = []
-
         for layer in self.layers:
             hidden_states, kv_fused = layer(
                 forward_batch.positions, hidden_states, forward_batch, token_to_kv_pool
