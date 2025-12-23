@@ -31,8 +31,16 @@ from sgl_jax.test.test_utils import (
 
 MOUNT_ROOT = os.getenv("CI_MOUNT_ROOT", "/models")
 
+trace_output_dir = os.path.abspath(
+    os.path.join(
+        os.getenv("PREF_OUTPUT_DIR", "./test/nightly_test_output/pref/local_run"), "model_traces"
+    )
+)
+os.makedirs(trace_output_dir, exist_ok=True)
+print(f"[CI Info] Precision Tracer Output Dir: {trace_output_dir}")
 
-class TestModePerf(CustomTestCase):
+
+class TestModePerfTrace(CustomTestCase):
     sharegpt_dataset_path = None
     BASIC_SERVER_ARGS = [
         "--trust-remote-code",
@@ -71,7 +79,7 @@ class TestModePerf(CustomTestCase):
 
         print(f"Dataset is ready at location: {cls.sharegpt_dataset_path}")
 
-    def test_qwen_7b_performance_tp_1(self):
+    def test_qwen_7b_performance_trace_tp_1(self):
         import os
 
         MOUNT_ROOT = os.getenv("CI_MOUNT_ROOT", "/models")
@@ -112,6 +120,7 @@ class TestModePerf(CustomTestCase):
             other_args=specific_args,
             env={
                 "JAX_COMPILATION_CACHE_DIR": "/tmp/jax_compilation_cache",
+                "SGLANG_JAX_PROFILER_DIR": trace_output_dir,
             },
         )
 
@@ -126,6 +135,8 @@ class TestModePerf(CustomTestCase):
                 "dataset_path": self.sharegpt_dataset_path,
                 "warmup_requests": 1,
                 "flush_cache": True,
+                "profile": True,
+                "num_steps": 10,
             }
 
             for concurrency in concurrency_levels:
@@ -207,7 +218,7 @@ class TestModePerf(CustomTestCase):
             )
         print("=" * 100)
 
-    def test_qwen_7b_performance_tp_4(self):
+    def test_qwen_7b_performance_trace_tp_4(self):
         import os
 
         MOUNT_ROOT = os.getenv("CI_MOUNT_ROOT", "/models")
@@ -249,6 +260,7 @@ class TestModePerf(CustomTestCase):
             other_args=specific_args,
             env={
                 "JAX_COMPILATION_CACHE_DIR": "/tmp/jax_compilation_cache",
+                "SGLANG_JAX_PROFILER_DIR": trace_output_dir,
             },
         )
 
@@ -262,6 +274,8 @@ class TestModePerf(CustomTestCase):
                 "dataset_path": self.sharegpt_dataset_path,
                 "warmup_requests": 1,
                 "flush_cache": True,
+                "profile": True,
+                "num_steps": 10,
             }
             for concurrency in concurrency_levels:
                 for in_len in input_lengths:
@@ -338,7 +352,7 @@ class TestModePerf(CustomTestCase):
             )
         print("=" * 100)
 
-    def test_qwen3_8b_performance_tp_1(self):
+    def test_qwen3_8b_performance_trace_tp_1(self):
         import os
 
         MOUNT_ROOT = os.getenv("CI_MOUNT_ROOT", "/models")
@@ -380,6 +394,7 @@ class TestModePerf(CustomTestCase):
             other_args=specific_args,
             env={
                 "JAX_COMPILATION_CACHE_DIR": "/tmp/jax_compilation_cache",
+                "SGLANG_JAX_PROFILER_DIR": trace_output_dir,
             },
         )
 
@@ -394,6 +409,8 @@ class TestModePerf(CustomTestCase):
                 "dataset_path": self.sharegpt_dataset_path,
                 "warmup_requests": 1,
                 "flush_cache": True,
+                "profile": True,
+                "num_steps": 10,
             }
             for concurrency in concurrency_levels:
                 for in_len in input_lengths:
@@ -471,7 +488,7 @@ class TestModePerf(CustomTestCase):
             )
         print("=" * 100)
 
-    def test_qwen3_8b_performance_tp_4(self):
+    def test_qwen3_8b_performance_trace_tp_4(self):
         import os
 
         MOUNT_ROOT = os.getenv("CI_MOUNT_ROOT", "/models")
@@ -513,6 +530,7 @@ class TestModePerf(CustomTestCase):
             other_args=specific_args,
             env={
                 "JAX_COMPILATION_CACHE_DIR": "/tmp/jax_compilation_cache",
+                "SGLANG_JAX_PROFILER_DIR": trace_output_dir,
             },
         )
 
@@ -527,6 +545,8 @@ class TestModePerf(CustomTestCase):
                 "dataset_path": self.sharegpt_dataset_path,
                 "warmup_requests": 1,
                 "flush_cache": True,
+                "profile": True,
+                "num_steps": 10,
             }
             for concurrency in concurrency_levels:
                 for in_len in input_lengths:
@@ -604,7 +624,7 @@ class TestModePerf(CustomTestCase):
             )
         print("=" * 100)
 
-    def test_QWEN3_MOE_30B_performance_tp_2_ep_2(self):
+    def test_QWEN3_MOE_30B_performance_trace_tp_2_ep_2(self):
         import os
 
         MOUNT_ROOT = os.getenv("CI_MOUNT_ROOT", "/models")
@@ -648,6 +668,7 @@ class TestModePerf(CustomTestCase):
             other_args=specific_args,
             env={
                 "JAX_COMPILATION_CACHE_DIR": "/tmp/jax_compilation_cache",
+                "SGLANG_JAX_PROFILER_DIR": trace_output_dir,
             },
         )
 
@@ -662,6 +683,8 @@ class TestModePerf(CustomTestCase):
                 "dataset_path": self.sharegpt_dataset_path,
                 "warmup_requests": 1,
                 "flush_cache": True,
+                "profile": True,
+                "num_steps": 10,
             }
             for concurrency in concurrency_levels:
                 for in_len in input_lengths:
@@ -739,7 +762,7 @@ class TestModePerf(CustomTestCase):
             )
         print("=" * 100)
 
-    def test_GEMMA2_2B_IT_performance_tp_1(self):
+    def test_GEMMA2_2B_IT_performance_trace_tp_1(self):
         import os
 
         MOUNT_ROOT = os.getenv("CI_MOUNT_ROOT", "/models")
@@ -781,6 +804,7 @@ class TestModePerf(CustomTestCase):
             other_args=specific_args,
             env={
                 "JAX_COMPILATION_CACHE_DIR": "/tmp/jax_compilation_cache",
+                "SGLANG_JAX_PROFILER_DIR": trace_output_dir,
             },
         )
 
@@ -795,6 +819,8 @@ class TestModePerf(CustomTestCase):
                 "dataset_path": self.sharegpt_dataset_path,
                 "warmup_requests": 1,
                 "flush_cache": True,
+                "profile": True,
+                "num_steps": 10,
             }
             for concurrency in concurrency_levels:
                 for in_len in input_lengths:
@@ -871,7 +897,7 @@ class TestModePerf(CustomTestCase):
             )
         print("=" * 100)
 
-    def test_GEMMA2_2B_IT_performance_tp_4(self):
+    def test_GEMMA2_2B_IT_performance_trace_tp_4(self):
         import os
 
         MOUNT_ROOT = os.getenv("CI_MOUNT_ROOT", "/models")
@@ -938,6 +964,7 @@ class TestModePerf(CustomTestCase):
             ],
             env={
                 "JAX_COMPILATION_CACHE_DIR": "/tmp/jax_compilation_cache",
+                "SGLANG_JAX_PROFILER_DIR": trace_output_dir,
             },
         )
 
@@ -952,6 +979,8 @@ class TestModePerf(CustomTestCase):
                 "dataset_path": self.sharegpt_dataset_path,
                 "warmup_requests": 1,
                 "flush_cache": True,
+                "profile": True,
+                "num_steps": 10,
             }
             for concurrency in concurrency_levels:
                 for in_len in input_lengths:
@@ -1028,7 +1057,7 @@ class TestModePerf(CustomTestCase):
             )
         print("=" * 100)
 
-    def test_bailing_moe_performance_tp_2_ep_2(self):
+    def test_bailing_moe_performance_trace_tp_2_ep_2(self):
         import os
 
         MOUNT_ROOT = os.getenv("CI_MOUNT_ROOT", "/models")
@@ -1072,6 +1101,7 @@ class TestModePerf(CustomTestCase):
             other_args=specific_args,
             env={
                 "JAX_COMPILATION_CACHE_DIR": "/tmp/jax_compilation_cache",
+                "SGLANG_JAX_PROFILER_DIR": trace_output_dir,
             },
         )
 
@@ -1086,6 +1116,8 @@ class TestModePerf(CustomTestCase):
                 "dataset_path": self.sharegpt_dataset_path,
                 "warmup_requests": 1,
                 "flush_cache": True,
+                "profile": True,
+                "num_steps": 10,
             }
             for concurrency in concurrency_levels:
                 for in_len in input_lengths:
@@ -1152,7 +1184,7 @@ class TestModePerf(CustomTestCase):
 
                 writer.writerows(results_summary)
 
-    def test_QWEN2_5_7B_INSTRUCT_performance_tp_1(self):
+    def test_QWEN2_5_7B_INSTRUCT_performance_trace_tp_1(self):
         import os
 
         MOUNT_ROOT = os.getenv("CI_MOUNT_ROOT", "/models")
@@ -1193,6 +1225,7 @@ class TestModePerf(CustomTestCase):
             other_args=specific_args,
             env={
                 "JAX_COMPILATION_CACHE_DIR": "/tmp/jax_compilation_cache",
+                "SGLANG_JAX_PROFILER_DIR": trace_output_dir,
             },
         )
 
@@ -1207,6 +1240,8 @@ class TestModePerf(CustomTestCase):
                 "dataset_path": self.sharegpt_dataset_path,
                 "warmup_requests": 1,
                 "flush_cache": True,
+                "profile": True,
+                "num_steps": 10,
             }
             for concurrency in concurrency_levels:
                 for in_len in input_lengths:
@@ -1272,7 +1307,7 @@ class TestModePerf(CustomTestCase):
 
                 writer.writerows(results_summary)
 
-    def test_QWEN2_5_7B_INSTRUCT_performance_tp_4(self):
+    def test_QWEN2_5_7B_INSTRUCT_performance_trace_tp_4(self):
         import os
 
         MOUNT_ROOT = os.getenv("CI_MOUNT_ROOT", "/models")
@@ -1314,6 +1349,7 @@ class TestModePerf(CustomTestCase):
             other_args=specific_args,
             env={
                 "JAX_COMPILATION_CACHE_DIR": "/tmp/jax_compilation_cache",
+                "SGLANG_JAX_PROFILER_DIR": trace_output_dir,
             },
         )
 
@@ -1328,6 +1364,8 @@ class TestModePerf(CustomTestCase):
                 "dataset_path": self.sharegpt_dataset_path,
                 "warmup_requests": 1,
                 "flush_cache": True,
+                "profile": True,
+                "num_steps": 10,
             }
 
             for concurrency in concurrency_levels:

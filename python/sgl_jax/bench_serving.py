@@ -1367,7 +1367,6 @@ async def benchmark(
         if profiler_auto_stops:
             print("Profiler was set to auto-stop with num_steps. Skipping manual stop request.")
         else:
-            # 只有没有设置 num_steps 时，才需要手动停止
             print("Stopping profiler...")
             profile_output = await async_request_profile(api_url=base_url + "/stop_profile")
             if profile_output.success:
@@ -1832,7 +1831,7 @@ if __name__ == "__main__":
         "--profile",
         action="store_true",
         help="Use Torch Profiler. The endpoint must be launched with "
-        "SGLANG_TORCH_PROFILER_DIR to enable profiler.",
+        "SGLANG_JAX_PROFILER_DIR to enable profiler.",
     )
     parser.add_argument(
         "--lora-name",
