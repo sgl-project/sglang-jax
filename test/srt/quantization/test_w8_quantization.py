@@ -53,7 +53,7 @@ class BaseW8Test(CustomTestCase):
             eval_name="gsm8k",
             num_shots=5,
             data_path=None,
-            num_questions=200,
+            num_examples=200,
             max_new_tokens=512,
             parallel=128,
             base_url=self.base_url,

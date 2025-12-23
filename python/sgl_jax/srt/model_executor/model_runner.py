@@ -252,7 +252,7 @@ class ModelRunner:
         )
 
         if self.model_config.quantization_config_path is not None:
-            self.model = apply_qwix_quantization(self.model_config, self.model, self.mesh)
+            self.model = apply_qwix_quantization(self.model_config, self.model, self)
 
         # Parse other args
         self.sliding_window_size = self.model_config.sliding_window

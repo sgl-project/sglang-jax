@@ -60,7 +60,7 @@ uv run python -u -m sgl_jax.launch_server \
 ```
 
 # Supported models (To be updated)
-- QWenLMHeadModel series
+- Dense models
 
 ### TODOs:
 - add dynamic range quantization support
