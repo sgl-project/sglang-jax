@@ -273,6 +273,7 @@ suites = {
         TestFile("python/sgl_jax/test/mem_cache/test_kv_cache.py", 20),
         TestFile("python/sgl_jax/test/mem_cache/test_radix_cache.py", 0.2),
         TestFile("python/sgl_jax/test/mem_cache/test_swa_radix_cache.py", 0.2),
+        TestFile("python/sgl_jax/test/mem_cache/test_paged_allocator_multi_dp.py", 1),
         TestFile("python/sgl_jax/test/speculative/test_eagle_tree_build.py", 1),
         TestFile("python/sgl_jax/test/speculative/test_eagle_utils.py", 1),
     ],
