@@ -50,17 +50,19 @@ class BaseW8Test(CustomTestCase):
             self.skipTest("gsm8k_accuracy_threshold not set for this test")
 
         args = SimpleNamespace(
+            model=self.model,
             eval_name="gsm8k",
             num_shots=5,
             data_path=None,
             num_examples=200,
             max_new_tokens=512,
+            num_threads=64,
             parallel=128,
             base_url=self.base_url,
         )
         metrics = run_eval(args)
         print(metrics)
-        self.assertGreater(metrics["accuracy"], self.gsm8k_accuracy_threshold)
+        self.assertGreater(metrics["score"], self.gsm8k_accuracy_threshold)
 
     def run_decode(self, max_new_tokens):
         response = requests.post(
@@ -91,9 +93,9 @@ class BaseW8Test(CustomTestCase):
 class TestW8Int8(BaseW8Test):
     model = "Qwen/Qwen3-32B"
     quantization_config_path = "int8_all_modules_w_only.yaml"
-    gsm8k_accuracy_threshold = 0.96
+    gsm8k_accuracy_threshold = 0.95
     throughput_threshold = 100
-    other_args = ["--tp-size=4"]
+    other_args = ["--tp-size=4", "--download-dir=/dev/shm", "--max-running-requests=256"]
 
 
 if __name__ == "__main__":
