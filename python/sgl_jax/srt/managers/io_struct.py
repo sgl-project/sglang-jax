@@ -111,6 +111,8 @@ class TokenizedGenerateReqInput:
     token_ids_logprob: list[list[int]] | list[int] | None = None
     # Whether to stream output
     stream: bool = False
+    # LoRA related
+    lora_id: str | None = None  # None means just use the base model
     # Extra key for cache namespace isolation (e.g., cache_salt, lora_id)
     extra_key: str | None = None
 
@@ -161,6 +163,11 @@ class GenerateReqInput:
     token_ids_logprob: list[list[int]] | list[int] | None = None
     # Whether to detokenize tokens in text in the returned logprobs.
     return_text_in_logprobs: bool = True
+
+    # The path to the LoRA adaptors
+    lora_path: list[str] | str | None = None
+    # The uid of LoRA adaptors, should be initialized by tokenizer manager
+    lora_id: list[str] | str | None = None
     # Extra key for cache namespace isolation (e.g., cache_salt)
     extra_key: list[str] | str | None = None
 
@@ -205,6 +212,11 @@ class GenerateReqInput:
             self.top_logprobs_num = 0
         if not self.token_ids_logprob:  # covers both None and []
             self.token_ids_logprob = None
+        if self.lora_path is not None and isinstance(self.lora_path, list):
+            if len(self.lora_path) == 1:
+                self.lora_path = self.lora_path[0]
+            elif len(self.lora_path) > 1:
+                raise ValueError("Single request cannot have multiple lora_paths")
 
     def _handle_parallel_sampling(self):
         """Handle parallel sampling parameters and adjust batch size if needed."""
@@ -246,6 +258,7 @@ class GenerateReqInput:
         self._normalize_rid(num)
         self._normalize_sampling_params(num)
         self._normalize_logprob_params(num)
+        self._normalize_lora_paths(num)
 
     def _expand_inputs(self, num):
         """Expand the main inputs (text, input_ids, input_embeds) for parallel sampling."""
@@ -335,6 +348,16 @@ class GenerateReqInput:
         elif self.parallel_sample_num > 1:
             raise ValueError("Cannot use list token_ids_logprob with parallel_sample_num > 1")
 
+    def _normalize_lora_paths(self, num):
+        """Normalize LoRA paths for batch processing."""
+        if self.lora_path is not None:
+            if isinstance(self.lora_path, str):
+                self.lora_path = [self.lora_path] * num
+            elif isinstance(self.lora_path, list):
+                self.lora_path = self.lora_path * self.parallel_sample_num
+            else:
+                raise ValueError("lora_path should be a list or a string.")
+
     def regenerate_rid(self):
         """Generate a new request ID and return it."""
         self.rid = uuid.uuid4().hex
@@ -352,6 +375,8 @@ class GenerateReqInput:
             token_ids_logprob=self.token_ids_logprob[i],
             return_text_in_logprobs=self.return_text_in_logprobs,
             stream=self.stream,
+            lora_path=self.lora_path[i] if self.lora_path is not None else None,
+            lora_id=self.lora_id[i] if self.lora_id is not None else None,
         )
 
 

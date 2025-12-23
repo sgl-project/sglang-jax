@@ -22,6 +22,7 @@ from sgl_jax.test.test_utils import (
     QWEN3_MOE_30B,
     QWEN_7B,
     CustomTestCase,
+    get_benchmark_args,
     is_in_ci,
     popen_launch_server,
     run_bench_serving,
@@ -1594,6 +1595,202 @@ class TestModePerf(CustomTestCase):
                     writer.writeheader()
 
                 writer.writerows(results_summary)
+
+    def test_qwen3_32B_lora_r32_performance_tp_4(self):
+        model = "Qwen/Qwen3-32B"
+        lora_path = "flyfishxu/DeepNews-LoRA-Qwen3-32B"
+        lora_name = "DeepNews-LoRA-Qwen3-32B"
+        base_url = DEFAULT_URL_FOR_TEST
+
+        allow_gap = 0.03
+        # max_concurrency:input_seq_len:ttft|itl|input_throughput|output_throughput
+        # Note: ttft is median_ttft_ms, itl is median_itl_ms
+        # Baseline:
+        # - branch: epic/support-multi-lora
+        # - commit: Fix/mismatch len lora (#573)
+        # See more metrics from gcloud storage bucket: perf_data_tmp/sglang_jax_lora/epic_lora_09f5dab3f9c_align_test_perf_launch.tar
+        expected_performance = {
+            8: {
+                4096: {
+                    "ttft": 1663.94,
+                    "itl": 19.37,
+                    "input_throughput": 14414.54,
+                    "output_throughput": 377.76,
+                }
+            },
+            16: {
+                4096: {
+                    "ttft": 3327.81,
+                    "itl": 21.76,
+                    "input_throughput": 19633.36,
+                    "output_throughput": 651.62,
+                }
+            },
+            32: {
+                4096: {
+                    "ttft": 6654.10,
+                    "itl": 24.67,
+                    "input_throughput": 19647.09,
+                    "output_throughput": 843.85,
+                }
+            },
+            64: {
+                4096: {
+                    "ttft": 13301.45,
+                    "itl": 24.72,
+                    "input_throughput": 19677.24,
+                    "output_throughput": 913.20,
+                }
+            },
+            128: {
+                4096: {
+                    "ttft": 26595.13,
+                    "itl": 24.81,
+                    "input_throughput": 19691.40,
+                    "output_throughput": 947.15,
+                }
+            },
+            256: {
+                4096: {
+                    "ttft": 53191.76,
+                    "itl": 24.78,
+                    "input_throughput": 19697.55,
+                    "output_throughput": 951.46,
+                }
+            },
+        }
+
+        # define test parameters
+        # concurrency levels
+        concurrency_levels = [8, 16, 32, 64, 128, 256]
+        # input length levels (1k, 4k, 8k)
+        input_lengths = [4096]
+
+        # concurrency_levels = [8]
+        # # input length levels (1k, 4k, 8k)
+        # input_lengths = [1024]
+
+        output_lengths = [1, 1024]
+        specific_args = self.BASIC_SERVER_ARGS + [
+            "--tp-size",
+            "4",
+            "--device",
+            "tpu",
+            "--disable-radix-cache",
+            "--lora-paths",
+            lora_path,
+        ]
+        # launch server
+        process = popen_launch_server(
+            model,
+            base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            device="tpu",
+            other_args=specific_args,
+            env={
+                "JAX_COMPILATION_CACHE_DIR": "/tmp/jax_compilation_cache",
+            },
+        )
+
+        results_summary = []
+
+        try:
+            for concurrency in concurrency_levels:
+                for in_len in input_lengths:
+                    for out_len in output_lengths:
+                        print(f"\n{'#'*60}")
+                        print(
+                            f"Testing Scenario: Concurrency={concurrency} | Input={in_len} | Output={out_len}"
+                        )
+                        print(f"{'#'*60}")
+
+                        num_prompts = concurrency * 3
+
+                        args = get_benchmark_args(
+                            base_url=self.base_url,
+                            dataset_name="random",
+                            num_prompts=num_prompts,
+                            request_rate=float("inf"),
+                            random_input_len=in_len,
+                            random_output_len=out_len,
+                            max_concurrency=concurrency,
+                            random_range_ratio=1,
+                            disable_ignore_eos=True,
+                            lora_name=lora_name,
+                            backend="sglang-oai",
+                            warmup_requests=0,
+                        )
+
+                        metrics = run_benchmark(args)
+
+                        if out_len == 1:
+                            self.assertGreater(
+                                metrics["input_throughput"],
+                                expected_performance[concurrency][in_len]["input_throughput"]
+                                * (1 - allow_gap),
+                            )
+                            self.assertLess(
+                                metrics["median_ttft_ms"],
+                                expected_performance[concurrency][in_len]["ttft"] * (1 + allow_gap),
+                            )
+                        else:
+                            self.assertGreater(
+                                metrics["output_throughput"],
+                                expected_performance[concurrency][in_len]["output_throughput"]
+                                * (1 - allow_gap),
+                            )
+                            self.assertLess(
+                                metrics["median_itl_ms"],
+                                expected_performance[concurrency][in_len]["itl"] * (1 + allow_gap),
+                            )
+                        results_summary.append(
+                            {
+                                "concurrency": concurrency,
+                                "input": in_len,
+                                "output": out_len,
+                                "ttft_ms": metrics.get("median_ttft_ms", 0),
+                                "itl_ms": metrics.get("median_itl_ms", 0),
+                                "in_tps": metrics.get("input_throughput", 0),
+                                "out_tps": metrics.get("output_throughput", 0),
+                                "model_name": model,
+                                "tpu_size": 4,
+                            }
+                        )
+
+                        time.sleep(1)
+
+        finally:
+            process.terminate()
+            process.wait()
+
+        if results_summary:
+            import csv
+            import os
+
+            output_dir = os.getenv("PREF_OUTPUT_DIR", "./test/nightly_test_output/pref/local_run")
+            os.makedirs(output_dir, exist_ok=True)
+            output_filename = os.path.join(output_dir, "performance_results_tp_4.csv")
+            file_exists = os.path.exists(output_filename)
+            with open(output_filename, "a", newline="", encoding="utf-8") as csvfile:
+
+                headers = results_summary[0].keys()
+                writer = csv.DictWriter(csvfile, fieldnames=headers)
+
+                if not file_exists:
+                    writer.writeheader()
+
+                writer.writerows(results_summary)
+
+        print("\n" + "=" * 100)
+        print(
+            f"{'Con':<5} | {'Input':<6} | {'Output':<6} | {'TTFT (ms)':<10} | {'ITL (ms)':<10} | {'Out TPS':<10} | {'In TPS':<10}| {'Model':<20}"
+        )
+        print("-" * 100)
+        for r in results_summary:
+            print(
+                f"{r['concurrency']:<5} | {r['input']:<6} | {r['output']:<6} | {r['ttft_ms']:<10.2f} | {r['itl_ms']:<10.2f} | {r['out_tps']:<10.2f} | {r['in_tps']:<10.2f}| {r['model_name']:<20}"
+            )
+        print("=" * 100)
 
 
 if __name__ == "__main__":
