@@ -9,7 +9,6 @@ import numpy as np
 import qwix
 import yaml
 from flax import nnx
-from jax.sharding import Mesh
 
 from sgl_jax.srt.configs.model_config import ModelConfig
 from sgl_jax.srt.layers.logits_processor import LogitsMetadata
@@ -21,6 +20,7 @@ from sgl_jax.srt.model_executor.forward_batch_info import (
     ForwardMode,
 )
 from sgl_jax.srt.sampling.sampling_batch_info import SamplingBatchInfo
+
 # from sgl_jax.srt.model_executor.model_runner import ModelRunner
 
 QUANTIZATION_CONFIG_PATH = os.path.join(os.path.dirname(__file__), "configs")
@@ -52,7 +52,7 @@ def qwix_quantize_nnx_model(
     logits_metadata: LogitsMetadata,
 ) -> nnx.Module:
     """
-    Quantizes a Flax NNX model using Qwix. 
+    Quantizes a Flax NNX model using Qwix.
 
     Args:
         model: the model to quantize
@@ -120,7 +120,9 @@ def quantization_config_file_path_to_dict(quantization_config_file_path: str) ->
     )
 
 
-def apply_qwix_quantization(model_config: ModelConfig, model: nnx.Module, model_runner) -> nnx.Module:
+def apply_qwix_quantization(
+    model_config: ModelConfig, model: nnx.Module, model_runner
+) -> nnx.Module:
     """
     Will apply quantization if a valid quantization config with Qwix rules is provided.  See README
     for more details on Qwix.
