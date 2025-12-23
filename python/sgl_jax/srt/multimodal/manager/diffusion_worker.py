@@ -1,2 +1,0 @@
-class DiffusionWorker:
-    pass

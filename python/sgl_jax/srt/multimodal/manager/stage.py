@@ -1,8 +1,12 @@
 from queue import Queue
 from typing import Any
 
+from sgl_jax.srt.managers.scheduler import Scheduler as AutoRegressiveScheduler
 from sgl_jax.srt.multimodal.manager.device_manager import device_manager
-from sgl_jax.srt.multimodal.manager.sched.diffusion_scheduler import DiffusionScheduler
+from sgl_jax.srt.multimodal.manager.scheduler.diffusion_scheduler import (
+    DiffusionScheduler,
+)
+from sgl_jax.srt.multimodal.manager.scheduler.vae_scheduler import VaeScheduler
 from sgl_jax.srt.utils.mesh_utils import create_device_mesh
 
 
@@ -10,7 +14,7 @@ class Stage:
     def __init__(self, stage_config: Any):
         self._in_queue = None
         self._out_queue = None
-        # self._stage_scheduler = []
+        # this parallelism setting is accord to stage config
         self.mesh = create_device_mesh(
             ici_parallelism=[-1, stage_config.runtime.num_tpus],
             dcn_parallelism=[1, 1],
@@ -30,7 +34,19 @@ class Stage:
     def run_stage(self):
         print(f"stage start {self.stage_index}")
         # todo according to config to decide which scheduler to use
-        self._stage_scheduler = DiffusionScheduler(
-            None, in_queue=self._in_queue, out_queue=self._out_queue, mesh=self.mesh
-        )
+        scheduler_class = get_scheduler_class(self.stage_config.scheduler)
+        self._stage_scheduler = scheduler_class(**self.stage_config.scheduler_params)
         self._stage_scheduler.event_loop()
+
+
+def get_scheduler_class(name: str):
+    if name == "diffusion":
+        return DiffusionScheduler
+    elif name == "auto_regressive":
+        # TODO add eventloop for auto regressive scheduler
+        return AutoRegressiveScheduler
+    elif name == "vae":
+        # TODO add eventloop for VAE scheduler
+        return VaeScheduler
+    else:
+        raise ValueError(f"Unknown scheduler name: {name}")

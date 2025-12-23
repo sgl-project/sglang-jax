@@ -44,19 +44,6 @@ from sgl_jax.srt.utils.jax_utils import get_available_device_memory
 logger = logging.getLogger(__name__)
 
 
-class RankZeroFilter(logging.Filter):
-    """Filter that only allows INFO level logs from rank 0, but allows all other levels from any rank."""
-
-    def __init__(self, is_rank_zero):
-        super().__init__()
-        self.is_rank_zero = is_rank_zero
-
-    def filter(self, record):
-        if record.levelno == logging.INFO:
-            return self.is_rank_zero
-        return True
-
-
 class ModelRunner(BaseModelRunner):
     """ModelRunner runs the forward passes of the models."""
 
