@@ -14,8 +14,19 @@ from sgl_jax.test.test_utils import CustomTestCase
 mesh = create_device_mesh(ici_parallelism=[1, -1], dcn_parallelism=[1, 1])
 jax.sharding.set_mesh(mesh)
 
+"""
+This test suite is designed to be executed on GPU.
+The PagedAttention kernel leverages JAX's GPU-backed operations.
+"""
+
 
 class TestPagedAttention(CustomTestCase):
+    """
+    Tests for the PagedAttention kernel.
+    NOTE: These tests require a GPU backend for performance and functional correctness,
+    especially for SPMD and custom kernel execution.
+    """
+
     def setUp(self):
         self.devices = jax.devices()
         self.num_devices = len(self.devices)
