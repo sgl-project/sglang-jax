@@ -570,7 +570,7 @@ class FusedEPMoE(nnx.Module):
                 jax.random.key(0),
                 (num_experts, hidden_size, intermediate_dim),
                 dtype=weight_dtype,
-                out_sharding=P("tensor", None, None),
+                out_sharding=P(("data", "tensor"), None, None),
             )
         )
         self.w3 = nnx.Param(
@@ -578,7 +578,7 @@ class FusedEPMoE(nnx.Module):
                 jax.random.key(1),
                 (num_experts, hidden_size, intermediate_dim),
                 dtype=weight_dtype,
-                out_sharding=P("tensor", None, None),
+                out_sharding=P(("data", "tensor"), None, None),
             )
         )
 
@@ -587,7 +587,7 @@ class FusedEPMoE(nnx.Module):
                 jax.random.key(0),
                 (num_experts, intermediate_dim, hidden_size),
                 dtype=weight_dtype,
-                out_sharding=P("tensor", None, None),
+                out_sharding=P(("data", "tensor"), None, None),
             )
         )
 
@@ -685,5 +685,5 @@ class FusedEPMoE(nnx.Module):
             tp_axis_name="tensor",
         )
 
-        output = jax.sharding.reshard(output, NamedSharding(self.mesh, P(None, None)))
+        output = jax.sharding.reshard(output, NamedSharding(self.mesh, P("data", None)))
         return output

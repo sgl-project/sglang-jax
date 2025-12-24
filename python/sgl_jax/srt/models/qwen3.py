@@ -4,6 +4,8 @@ from typing import Any
 import jax
 import jax.numpy as jnp
 from flax import nnx
+from jax.sharding import NamedSharding
+from jax.sharding import PartitionSpec as P
 from transformers import PretrainedConfig
 
 from sgl_jax.srt.configs.model_config import ModelConfig
@@ -48,6 +50,7 @@ class QWen3Attention(nnx.Module):
         self.q_size = num_heads * self.head_dim
         self.kv_size = num_kv_heads * self.head_dim
         self.scaling = self.head_dim**-0.5
+        self.mesh = mesh
 
         self.q_norm = RMSNorm(
             self.head_dim, epsilon=rms_norm_eps, param_dtype=dtype, scope_name="q_norm"
@@ -121,9 +124,24 @@ class QWen3Attention(nnx.Module):
         k, _ = self.k_proj(hidden_states)
         v, _ = self.v_proj(hidden_states)
 
-        q = q.reshape(-1, self.q_head_num, self.head_dim)
-        k = k.reshape(-1, self.kv_head_num, self.head_dim)
-        v = v.reshape(-1, self.kv_head_num, self.head_dim)
+        q = q.reshape(
+            -1,
+            self.q_head_num,
+            self.head_dim,
+            out_sharding=NamedSharding(self.mesh, P("data", "tensor", None)),
+        )
+        k = k.reshape(
+            -1,
+            self.kv_head_num,
+            self.head_dim,
+            out_sharding=NamedSharding(self.mesh, P("data", "tensor", None)),
+        )
+        v = v.reshape(
+            -1,
+            self.kv_head_num,
+            self.head_dim,
+            out_sharding=NamedSharding(self.mesh, P("data", "tensor", None)),
+        )
 
         q = self.q_norm(q)
         k = self.k_norm(k)
