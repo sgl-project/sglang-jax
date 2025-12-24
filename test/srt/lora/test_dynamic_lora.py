@@ -13,11 +13,13 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import asyncio
 import json
 import os
 import unittest
 from typing import List
 
+import aiohttp
 import jax.numpy as jnp
 import requests
 from flax import nnx
@@ -42,7 +44,9 @@ LORA_SETS = [
     },
 ]
 
-DTYPES = ["bfloat16"]
+DTYPES = [
+    "float32"
+]  # Note: According to https://github.com/sgl-project/sglang-jax/issues/587, adjust dtype from bfloat16 to float32.
 
 PROMPTS = [
     "SGL is a",
@@ -53,32 +57,53 @@ PROMPTS = [
 ]
 
 
+async def send_request(session, base_url, headers, payload):
+    async with session.post(
+        f"{base_url}/generate",
+        json=payload,
+        headers=headers,
+        timeout=aiohttp.ClientTimeout(total=60),
+    ) as response:
+        assert response.status == 200, f"Status code: {response.status}"
+        actual_response = await response.json()
+        return actual_response
+
+
+async def run_async_generate(base_url, headers, payloads):
+    async with aiohttp.ClientSession() as session:
+        tasks = [
+            send_request(
+                session,
+                base_url,
+                headers,
+                payload,
+            )
+            for payload in payloads
+        ]
+        actual_responses = await asyncio.gather(*tasks)
+
+    return actual_responses
+
+
 class TestLoRA(CustomTestCase):
     def run_base_inference(self, base_url, prompts, max_new_tokens):
         """Run inference on base model (no LoRA loaded) and return responses."""
         print("=================== collecting base model responses =======================")
         headers = {"Content-Type": "application/json"}
-        responses = []
 
+        payloads = []
         for prompt in prompts:
-            payload = {
-                "text": prompt,
-                "sampling_params": {
-                    "max_new_tokens": max_new_tokens,
-                    "temperature": 0.0,
-                },
-            }
-
-            response = requests.post(
-                f"{base_url}/generate",
-                json=payload,
-                headers=headers,
-                timeout=60,
+            payloads.append(
+                {
+                    "text": prompt,
+                    "sampling_params": {
+                        "max_new_tokens": max_new_tokens,
+                        "temperature": 0.0,
+                    },
+                }
             )
-            self.assertEqual(response.status_code, 200)
-            responses.append(response.json())
 
-        return responses
+        return asyncio.run(run_async_generate(base_url, headers, payloads))
 
     def run_inference_test(self, base_url, prompts, lora_set, max_new_tokens):
         """Test inference with mixed batch (some with LoRA, some without)."""
@@ -93,8 +118,8 @@ class TestLoRA(CustomTestCase):
             i = (i + 1) % len(all_lora_paths)
 
         headers = {"Content-Type": "application/json"}
-        responses = []
 
+        payloads = []
         for prompt, lora_path in zip(prompts, batch_lora_paths):
             payload = {
                 "text": prompt,
@@ -105,15 +130,9 @@ class TestLoRA(CustomTestCase):
             }
             if lora_path is not None:
                 payload["lora_path"] = lora_path
+            payloads.append(payload)
 
-            response = requests.post(
-                f"{base_url}/generate",
-                json=payload,
-                headers=headers,
-                timeout=60,
-            )
-            self.assertEqual(response.status_code, 200)
-            responses.append(response.json())
+        responses = asyncio.run(run_async_generate(base_url, headers, payloads))
 
         # Verify we got valid responses
         for i, response in enumerate(responses):
@@ -128,32 +147,26 @@ class TestLoRA(CustomTestCase):
         print("=================== testing base model equivalence =======================")
         headers = {"Content-Type": "application/json"}
 
-        for i, prompt in enumerate(prompts):
-            payload = {
-                "text": prompt,
-                "sampling_params": {
-                    "max_new_tokens": max_new_tokens,
-                    "temperature": 0.0,
-                },
-            }
-
-            response = requests.post(
-                f"{base_url}/generate",
-                json=payload,
-                headers=headers,
-                timeout=60,
+        payloads = []
+        for prompt in prompts:
+            payloads.append(
+                {
+                    "text": prompt,
+                    "sampling_params": {
+                        "max_new_tokens": max_new_tokens,
+                        "temperature": 0.0,
+                    },
+                }
             )
-            self.assertEqual(response.status_code, 200)
-            actual_response = response.json()
 
-            print(f"No LoRA support: {expected_responses[i]['text']}")
-            print(f"With LoRA support (unused): {actual_response['text']}")
+        actual_responses = asyncio.run(run_async_generate(base_url, headers, payloads))
 
-            # self.assertEqual(
-            #     expected_responses[i]["text"],
-            #     actual_response["text"],
-            #     f"Base model output changed when LoRA support enabled (request {i})",
-            # )
+        for i, (expected, actual) in enumerate(zip(expected_responses, actual_responses)):
+            print(f"No LoRA support: {expected['text']}")
+            print(f"With LoRA support (unused): {actual['text']}")
+            assert (
+                expected["text"] == actual["text"]
+            ), f"Base model output changed when LoRA support enabled (request {i})"
 
     def run_lora_effect_test(self, base_url, prompts, lora_set, max_new_tokens, base_responses):
         """Verify that LoRA actually changes the output compared to base model."""
