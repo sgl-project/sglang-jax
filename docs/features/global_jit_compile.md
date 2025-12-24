@@ -45,7 +45,7 @@ As mentioned above, padding use {bs = *bs*, num_tokens = *token*}:
 The following fields are required to padding:
 - input_ids/out_cache_loc/positions: pad its length to num_tokens
 - cache_loc: pad its length to the product of batch_size * max_req_len
-- req_pool_indices/seq_lens/req_pool_indices/extend_start_loc: pad its length to batch size
+- req_pool_indices/seq_lens/req_pool_indices: pad its length to batch size
 - extend_prefix_lens/extend_seq_lens: pad its length to batch size only for prefill
 
 

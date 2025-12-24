@@ -242,10 +242,6 @@ class EAGLEWorker(ModelWorker):
         model_worker_batch.positions = np.array(
             jax.device_get(model_worker_batch.positions), dtype=model_worker_batch.positions.dtype
         )
-        model_worker_batch.extend_start_loc = np.array(
-            jax.device_get(model_worker_batch.extend_start_loc),
-            dtype=model_worker_batch.extend_start_loc.dtype,
-        )
         model_worker_batch.req_pool_indices = np.array(
             jax.device_get(model_worker_batch.req_pool_indices),
             dtype=model_worker_batch.req_pool_indices.dtype,
