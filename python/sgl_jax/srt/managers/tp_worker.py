@@ -55,6 +55,11 @@ class ModelWorker:
             server_args.speculative_algorithm
         )
         self.server_args = server_args
+
+        # LoRA configurations
+        self.lora_paths = server_args.lora_paths
+        self.max_loras_per_batch = server_args.max_loras_per_batch
+
         # Init model and tokenizer
         self.model_config = ModelConfig.from_server_args(
             server_args,
@@ -73,6 +78,9 @@ class ModelWorker:
 
         self.mesh = mesh
         self.page_size = server_args.page_size
+
+        # need_prepare_lora_batch is False in overlap mode, default is True
+        self.need_prepare_lora_batch = True
 
         # Sync random seed across TP workers
         # Each process may have different random_seed. After broadcast, all processes will have the same random_seed.
@@ -228,7 +236,11 @@ class ModelWorker:
                     num_tokens,
                     ForwardMode.EXTEND,
                     self.precompile_cache_loc_paddings[-1],
+                    enable_static_lora=self.server_args.enable_static_lora,
                 )
+                # Prepare LoRA batch if LoRA is enabled
+                if self.server_args.enable_lora:
+                    self.prepare_lora_batch(model_worker_batch)
                 sampling_metadata = SamplingMetadata.from_model_worker_batch(
                     model_worker_batch,
                     0,
@@ -267,7 +279,11 @@ class ModelWorker:
                     bs,
                     ForwardMode.DECODE,
                     aligned_cache_loc_size,
+                    enable_static_lora=self.server_args.enable_static_lora,
                 )
+                # Prepare LoRA batch if LoRA is enabled
+                if self.server_args.enable_lora:
+                    self.prepare_lora_batch(model_worker_batch)
                 sampling_metadata = SamplingMetadata.from_model_worker_batch(
                     model_worker_batch, 0, self.mesh, self.model_config.vocab_size
                 )
@@ -327,6 +343,7 @@ class ModelWorker:
         max_cache_loc_size: int,
         do_penalties: bool = False,
         speculative_algotithm=None,
+        enable_static_lora: bool = None,
     ) -> ModelWorkerBatch:
         valid_input_ids = np.array([1] * bs, dtype=jnp.int32)
         invalid_input_ids = np.array([0] * (num_tokens - bs), dtype=jnp.int32)
@@ -340,6 +357,7 @@ class ModelWorker:
 
         valid_cache_loc = np.arange(bs)
         invalid_cache_loc = np.array([0] * (invalid_cache_loc_size), dtype=jnp.int32)
+        lora_ids = ["0"] * bs
 
         return ModelWorkerBatch(
             bid=1,
@@ -370,10 +388,17 @@ class ModelWorker:
             extend_logprob_start_lens=None,
             capture_hidden_mode=CaptureHiddenMode.NULL,
             spec_algorithm=speculative_algotithm,
+            lora_ids=lora_ids,  # Already set to [None] * bs above
         )
 
     def get_model_runner(self):
         return self.model_runner
+
+    def prepare_lora_batch(self, model_worker_batch: ModelWorkerBatch):
+        self.model_runner.lora_manager.prepare_lora_batch(model_worker_batch)
+        if self.model_runner.lora_manager.has_new_weights:
+            _, model_state = nnx.split(self.model_runner.model)
+            self.model_runner.model_state_leaves, _ = jax.tree_util.tree_flatten(model_state)
 
     def get_worker_info(self):
         return (
@@ -439,6 +464,10 @@ class ModelWorker:
         sampling_metadata: SamplingMetadata = None,
         forward_metadata=None,
     ) -> tuple[LogitsProcessorOutput | jax.Array | int, jax.Array | None]:
+        # Prepare LoRA batch if LoRA is enabled
+        if self.worker.server_args.enable_lora and self.need_prepare_lora_batch:
+            self.prepare_lora_batch(model_worker_batch)
+
         # Use pre-initialized ForwardBatch if available (for overlap scheduling optimization)
         if model_worker_batch.forward_batch is not None:
             forward_batch = model_worker_batch.forward_batch

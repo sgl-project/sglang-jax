@@ -16,6 +16,7 @@ from sgl_jax.srt.configs.load_config import LoadConfig
 from sgl_jax.srt.configs.model_config import AttentionArch, MockModelConfig, ModelConfig
 from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessorOutput
 from sgl_jax.srt.layers.sampler import Sampler, compute_logprobs
+from sgl_jax.srt.lora.context_manager import LoraBatchContext
 from sgl_jax.srt.managers.schedule_batch import (
     GLOBAL_SERVER_ARGS_KEYS,
     global_server_args_dict,
@@ -91,7 +92,6 @@ class ModelRunner:
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
         self.is_hybrid = False
         self.use_mla_backend = self.model_config.attention_arch == AttentionArch.MLA
-        self.is_draft_worker = is_draft_worker
         self.spec_algorithm = SpeculativeAlgorithm.from_string(server_args.speculative_algorithm)
 
         self.forward_pass_id = 0
@@ -135,8 +135,6 @@ class ModelRunner:
         self.sampler = Sampler(nnx.Rngs(server_args.random_seed), mesh=self.mesh)
         total_device_memory = self.get_available_device_memory()
         self.load_model()
-        if not self.is_draft_worker:
-            self.initialize_jit()
 
         # Check if the model is using hybrid SWA
         if (
@@ -145,6 +143,13 @@ class ModelRunner:
             and self.sliding_window_size > 0
         ):
             self.is_hybrid = True
+
+        # Init lora
+        if server_args.enable_lora:
+            self.init_lora_manager()
+
+        if not self.is_draft_worker:
+            self.initialize_jit()
 
         # Init memory pool and attention backends
         self.init_memory_pool(
@@ -177,7 +182,8 @@ class ModelRunner:
         ):
             model_state = jax.tree_util.tree_unflatten(model_state_def, model_state_leaves)
             model = nnx.merge(model_def, model_state)
-            return model(forward_batch, token_to_kv_pool, logits_metadata)
+            with LoraBatchContext.set_batch(forward_batch):
+                return model(forward_batch, token_to_kv_pool, logits_metadata)
 
         @partial(jax.jit, static_argnames=["sampler_state_def", "use_sort_for_toppk_minp"])
         def jitted_sampler(
@@ -635,6 +641,23 @@ class ModelRunner:
             "Use Sliding window memory pool. full_layer_tokens=%s, swa_layer_tokens=%s",
             self.full_max_total_num_tokens,
             self.swa_max_total_num_tokens,
+        )
+
+    def init_lora_manager(self):
+        """Initialize LoRA manager for LoRA adapter support."""
+        from sgl_jax.srt.lora.lora_manager import LoRAManager
+
+        self.lora_manager = LoRAManager(
+            base_model=self.model,
+            base_hf_config=self.model_config.hf_config,
+            max_loras_per_batch=self.server_args.max_loras_per_batch,
+            dtype=self.dtype,
+            mesh=self.mesh,
+            max_lora_rank=self.server_args.max_lora_rank,
+            target_modules=self.server_args.lora_target_modules,
+            lora_paths=self.server_args.lora_paths,
+            server_args=self.server_args,
+            model_config=self.model_config,
         )
 
 
