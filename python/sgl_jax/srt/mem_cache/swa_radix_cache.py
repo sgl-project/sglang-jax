@@ -379,12 +379,13 @@ class SWARadixCache(BasePrefixCache):
 
     def cache_finished_req(self, req: Req) -> None:
         """Cache request when it finishes."""
+        dp_rank = req.dp_rank if req.dp_rank is not None else 0
         if self.disable:
             kv_indices = self.req_to_token_pool.req_to_token[
                 req.req_pool_idx,
                 : len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0),
             ]
-            self.token_to_kv_pool_allocator.free(kv_indices)
+            self.token_to_kv_pool_allocator.free(kv_indices, dp_rank=dp_rank)
             self.req_to_token_pool.free(req.req_pool_idx)
             return
 
@@ -394,7 +395,7 @@ class SWARadixCache(BasePrefixCache):
         if self.page_size != 1:
             page_aligned_len = len(kv_indices) // self.page_size * self.page_size
             page_aligned_kv_indices = kv_indices[:page_aligned_len].copy()
-            self.token_to_kv_pool_allocator.free(kv_indices[page_aligned_len:])
+            self.token_to_kv_pool_allocator.free(kv_indices[page_aligned_len:], dp_rank=dp_rank)
         else:
             page_aligned_len = len(kv_indices)
             # Make a copy to avoid aliasing tree node values with req_to_token rows
@@ -486,7 +487,8 @@ class SWARadixCache(BasePrefixCache):
                 assert x.full_lock_ref == 0, f"node is in use, {x.id=}"
                 # 1. free node kv indices, evict full and swa tokens; count SWA freed accurately
                 actual_swa_free = self._swa_eff_len(x.value)
-                self.token_to_kv_pool_allocator.free(x.value)
+                node_dp_rank = x.key.dp_rank if x.key and x.key.dp_rank is not None else 0
+                self.token_to_kv_pool_allocator.free(x.value, dp_rank=node_dp_rank)
                 full_num_evicted += len(x.value)
                 swa_num_evicted += actual_swa_free
 
@@ -523,7 +525,8 @@ class SWARadixCache(BasePrefixCache):
                 if len(x.children) > 0:
                     # 1. an internal node, free swa tokens.
                     actual_swa_free = self._swa_eff_len(x.value)
-                    self.token_to_kv_pool_allocator.free_swa(x.value)
+                    node_dp_rank = x.key.dp_rank if x.key and x.key.dp_rank is not None else 0
+                    self.token_to_kv_pool_allocator.free_swa(x.value, dp_rank=node_dp_rank)
                     swa_num_evicted += actual_swa_free
 
                     # 2. get the next node, update the lru lists
@@ -539,7 +542,8 @@ class SWARadixCache(BasePrefixCache):
                     ), f"leaf node with full lock must also have swa lock, {x.id=}"
                     # 1. a leaf node, free full and swa tokens
                     actual_swa_free = self._swa_eff_len(x.value)
-                    self.token_to_kv_pool_allocator.free(x.value)
+                    node_dp_rank = x.key.dp_rank if x.key and x.key.dp_rank is not None else 0
+                    self.token_to_kv_pool_allocator.free(x.value, dp_rank=node_dp_rank)
                     full_num_evicted += len(x.value)
                     swa_num_evicted += actual_swa_free
 
@@ -827,11 +831,14 @@ class SWARadixCache(BasePrefixCache):
             # the prefill prefix matching will stuck.
             if update_kv_after_len < total_prefix_length + prefix_len:
                 first_diff_idx = max(0, update_kv_after_len - total_prefix_length)
+                node_dp_rank = node.key.dp_rank if node.key and node.key.dp_rank is not None else 0
                 if node.swa_tombstone:
                     assert (
                         node.swa_lock_ref == 0
                     ), f"tombstone swa_lock_ref should always be 0, {node.full_lock_ref=}, {node.swa_lock_ref=}, {node.id=}"
-                    self.token_to_kv_pool_allocator.free(node.value[first_diff_idx:])
+                    self.token_to_kv_pool_allocator.free(
+                        node.value[first_diff_idx:], dp_rank=node_dp_rank
+                    )
                     node.value = np.array(value[:prefix_len], copy=True)
                     node.swa_tombstone = False
 
@@ -840,7 +847,11 @@ class SWARadixCache(BasePrefixCache):
 
                     self.swa_evictable_size_ += self._swa_eff_len(node.value)
                 else:
-                    self.token_to_kv_pool_allocator.free(value[first_diff_idx:prefix_len])
+                    # value_dp_rank from the key parameter passed into _insert_helper
+                    value_dp_rank = key.dp_rank if key.dp_rank is not None else 0
+                    self.token_to_kv_pool_allocator.free(
+                        value[first_diff_idx:prefix_len], dp_rank=value_dp_rank
+                    )
 
             total_prefix_length += prefix_len
             key = key[prefix_len:]  # Slices RadixKey
@@ -875,7 +886,12 @@ class SWARadixCache(BasePrefixCache):
                 node.parent.swa_lock_ref == 0
             ), f"tombstone swa_lock_ref should always be 0, {node.parent.full_lock_ref=}, {node.parent.swa_lock_ref=}, {node.parent.id=}"
             # delete tombstone node evicts full tokens
-            self.token_to_kv_pool_allocator.free(node.parent.value)
+            parent_dp_rank = (
+                node.parent.key.dp_rank
+                if node.parent.key and node.parent.key.dp_rank is not None
+                else 0
+            )
+            self.token_to_kv_pool_allocator.free(node.parent.value, dp_rank=parent_dp_rank)
             full_num_evicted += len(node.parent.value)
             self.full_lru_list.remove_node(node.parent)
             self._delete_tombstone_leaf(node.parent)
