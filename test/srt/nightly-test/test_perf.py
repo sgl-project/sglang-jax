@@ -976,8 +976,8 @@ class TestModePerf(CustomTestCase):
                             seed=42,
                         )
 
-                        metrics = run_benchmark(args)
                         vars(args).update(static_config)
+                        metrics = run_benchmark(args)
 
                         results_summary.append(
                             {
