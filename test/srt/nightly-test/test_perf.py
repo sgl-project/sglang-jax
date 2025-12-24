@@ -1494,6 +1494,15 @@ class TestModePerf(CustomTestCase):
         results_summary = []
 
         try:
+            static_config = {
+                "model": model,
+                "host": "0.0.0.0",
+                "port": int(base_url.split(":")[-1]),
+                "dataset_name": "sharegpt",
+                "dataset_path": self.sharegpt_dataset_path,
+                "warmup_requests": 1,
+                "flush_cache": True,
+            }
             for concurrency in concurrency_levels:
                 for in_len in input_lengths:
                     for out_len in output_lengths:
@@ -1519,7 +1528,7 @@ class TestModePerf(CustomTestCase):
                             backend="sglang-oai",
                             warmup_requests=0,
                         )
-
+                        vars(args).update(static_config)
                         metrics = run_benchmark(args)
 
                         if out_len == 1:

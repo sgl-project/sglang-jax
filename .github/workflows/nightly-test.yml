@@ -146,7 +146,6 @@ jobs:
         run: |
 
           python3 scripts/ci/publish_bench_and_pref.py --source-dir ./test/nightly_test_output
-          python3 scripts/ci/publish_traces.py --source-dir ./test/nightly_test_output
 
 
   nightly-test-perf-text-models-4-tpu:
@@ -189,7 +188,6 @@ jobs:
           GITHUB_RUN_NUMBER: ${{ github.run_number }}
         run: |
           python3 scripts/ci/publish_bench_and_pref.py --source-dir ./test/nightly_test_output
-          python3 scripts/ci/publish_traces.py --source-dir ./test/nightly_test_output
 
 
   nightly-test-perf-trace-text-models-1-tpu:
@@ -230,7 +228,7 @@ jobs:
           GITHUB_RUN_ID: ${{ github.run_id }}
           GITHUB_RUN_NUMBER: ${{ github.run_number }}
         run: |
-          python3 scripts/ci/publish_traces.py --source-dir ./test/nightly_test_output
+          python3 scripts/ci/publish_traces.py --traces-dir ./test/nightly_test_output
 
 
   nightly-test-perf-trace-text-models-4-tpu:
@@ -272,4 +270,4 @@ jobs:
           GITHUB_RUN_ID: ${{ github.run_id }}
           GITHUB_RUN_NUMBER: ${{ github.run_number }}
         run: |
-          python3 scripts/ci/publish_traces.py --source-dir ./test/nightly_test_output
+          python3 scripts/ci/publish_traces.py --traces-dir ./test/nightly_test_output
