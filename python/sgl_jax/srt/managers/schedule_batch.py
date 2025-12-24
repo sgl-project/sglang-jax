@@ -195,7 +195,6 @@ class Req:
         self.lora_id = lora_id if lora_id is not None else "0"
         self.dp_rank = dp_rank
 
-
         # Memory pool info
         self.req_pool_idx: int | None = None
 
@@ -582,6 +581,24 @@ class ScheduleBatch:
     # Events
     launch_done: threading.Event | None = None
 
+    # Data Parallelism size
+    dp_size: int = 1
+
+    def __post_init__(self):
+        """Initialize method bindings based on dp_size."""
+        if self.dp_size == 1:
+            # Single DP rank - use simple implementations (zero overhead)
+            self._prepare_for_extend_impl = self._prepare_for_extend_single
+            self._prepare_for_decode_impl = self._prepare_for_decode_single
+            self._evict_tree_cache_if_needed_impl = self._evict_tree_cache_if_needed_single
+            self._is_available_size_sufficient_impl = self._is_available_size_sufficient_single
+        else:
+            # Multiple DP ranks - use grouped implementations
+            self._prepare_for_extend_impl = self._prepare_for_extend_multi
+            self._prepare_for_decode_impl = self._prepare_for_decode_multi
+            self._evict_tree_cache_if_needed_impl = self._evict_tree_cache_if_needed_multi
+            self._is_available_size_sufficient_impl = self._is_available_size_sufficient_multi
+
     @classmethod
     def init_new(
         cls,
@@ -605,6 +622,9 @@ class ScheduleBatch:
             ), "SWARadixCache or ChunkCache is required for SWATokenToKVPoolAllocator"
             is_hybrid = True
 
+        # Get dp_size from allocator
+        dp_size = getattr(token_to_kv_pool_allocator, "dp_size", 1)
+
         return cls(
             reqs=reqs,
             req_to_token_pool=req_to_token_pool,
@@ -621,6 +641,7 @@ class ScheduleBatch:
             mesh=mesh,
             spec_algorithm=spec_algorithm,
             is_prefill_only=all(req.sampling_params.max_new_tokens == 0 for req in reqs),
+            dp_size=dp_size,
         )
 
     def batch_size(self):
@@ -645,6 +666,7 @@ class ScheduleBatch:
         seq_lens: list[int],
         last_loc: list[int],
         backup_state: bool = False,
+        dp_rank: int = 0,
     ):
         num_tokens = len(seq_lens) * self.token_to_kv_pool_allocator.page_size
 
@@ -653,7 +675,9 @@ class ScheduleBatch:
         if backup_state:
             state = self.token_to_kv_pool_allocator.backup_state()
 
-        out_cache_loc = self.token_to_kv_pool_allocator.alloc_decode(seq_lens, last_loc)
+        out_cache_loc = self.token_to_kv_pool_allocator.alloc_decode(
+            seq_lens, last_loc, dp_rank=dp_rank
+        )
         if out_cache_loc is None:
             error_msg = (
                 f"Decode out of memory. Try to lower your batch size.\n"
@@ -693,7 +717,8 @@ class ScheduleBatch:
         self.extend_num_tokens += running_bs
         self.extend_logprob_start_lens.extend([0] * running_bs)
 
-    def prepare_for_extend(self):
+    def _prepare_for_extend_single(self):
+        """Prepare for extend phase (single DP rank)."""
         self.forward_mode = ForwardMode.EXTEND
 
         # Allocate req slots
@@ -776,9 +801,10 @@ class ScheduleBatch:
         else:
             extend_input_logprob_token_ids = None
 
-        # Allocate memory
+        # Allocate memory (single DP rank - all reqs have same dp_rank)
+        dp_rank = self.reqs[0].dp_rank if (self.reqs and self.reqs[0].dp_rank is not None) else 0
         if self.token_to_kv_pool_allocator.page_size == 1:
-            out_cache_loc = alloc_token_slots(self.tree_cache, extend_num_tokens)
+            out_cache_loc = alloc_token_slots(self.tree_cache, extend_num_tokens, dp_rank=dp_rank)
         else:
             last_loc_cpu = get_last_loc(
                 self.req_to_token_pool.req_to_token,
@@ -791,6 +817,7 @@ class ScheduleBatch:
                 seq_lens,
                 last_loc_cpu.tolist(),
                 extend_num_tokens,
+                dp_rank=dp_rank,
             )
 
         # Set fields
@@ -824,6 +851,148 @@ class ScheduleBatch:
             self,
             self.model_config.vocab_size,
         )
+
+    def _prepare_for_extend_multi(self):
+        """Prepare for extend phase (multiple DP ranks in batch)."""
+        self.forward_mode = ForwardMode.EXTEND
+
+        # Allocate req slots
+        bs = len(self.reqs)
+        req_pool_indices = self.alloc_req_slots(bs)
+
+        # Init arrays (same as single-rank)
+        reqs = self.reqs
+        input_ids = [r.fill_ids[len(r.prefix_indices) :] for r in reqs]
+        extend_num_tokens = sum(len(ids) for ids in input_ids)
+        seq_lens = [len(r.fill_ids) for r in reqs]
+        prefix_lens = [len(r.prefix_indices) for r in reqs]
+        extend_lens = [r.extend_input_len for r in reqs]
+
+        req_pool_indices_cpu = np.array(req_pool_indices, dtype=np.int32)
+        input_ids_cpu = np.array(sum(input_ids, []), dtype=np.int32)
+        seq_lens_cpu = np.array(seq_lens, dtype=np.int32)
+        prefix_lens_cpu = np.array(prefix_lens, dtype=np.int32)
+
+        # Copy prefix and do some basic check (same as single-rank)
+        extend_input_logprob_token_ids = []
+
+        for i, (req, seq_len, pre_len) in enumerate(zip(reqs, seq_lens, prefix_lens)):
+            req.req_pool_idx = req_pool_indices[i]
+            assert seq_len - pre_len == req.extend_input_len
+
+            prefix_indices = req.prefix_indices
+            if pre_len > 0:
+                self.req_to_token_pool.write((req.req_pool_idx, slice(0, pre_len)), prefix_indices)
+
+            req.cached_tokens += pre_len - req.already_computed
+            req.already_computed = seq_len
+            req.is_retracted = False
+
+            # Compute the relative logprob_start_len in an extend batch
+            if req.logprob_start_len >= pre_len:
+                req.extend_logprob_start_len = min(
+                    req.logprob_start_len - pre_len,
+                    req.extend_input_len,
+                    req.seqlen - 1,
+                )
+            else:
+                req.extend_logprob_start_len = 0
+
+            if self.return_logprob:
+                global_start_idx, global_end_idx = (
+                    len(req.prefix_indices),
+                    len(req.fill_ids),
+                )
+                if global_start_idx < req.logprob_start_len:
+                    global_start_idx = req.logprob_start_len
+
+                logprob_token_ids = req.origin_input_ids[global_start_idx + 1 : global_end_idx + 1]
+                extend_input_logprob_token_ids.extend(logprob_token_ids)
+                extend_input_logprob_token_ids.extend(
+                    [0]
+                    * (req.extend_input_len - req.extend_logprob_start_len - len(logprob_token_ids))
+                )
+
+        if self.return_logprob:
+            extend_input_logprob_token_ids = np.array(extend_input_logprob_token_ids)
+        else:
+            extend_input_logprob_token_ids = None
+
+        # GROUPED ALLOCATION by dp_rank (multi-rank specific)
+        dp_groups = self._group_reqs_by_dp_rank()
+        grouped_results = {}
+
+        for dp_rank, indices in dp_groups.items():
+            # Extract group-specific data
+            group_prefix_lens = [prefix_lens[i] for i in indices]
+            group_seq_lens = [seq_lens[i] for i in indices]
+            group_extend_num_tokens = sum(extend_lens[i] for i in indices)
+
+            # Allocate for this group
+            if self.token_to_kv_pool_allocator.page_size == 1:
+                grouped_results[dp_rank] = alloc_token_slots(
+                    self.tree_cache,
+                    group_extend_num_tokens,
+                    dp_rank=dp_rank,
+                )
+            else:
+                # Extract last_loc for this group
+                group_req_pool_indices = req_pool_indices_cpu[indices]
+                group_prefix_lens_cpu = prefix_lens_cpu[indices]
+                group_last_loc = get_last_loc(
+                    self.req_to_token_pool.req_to_token,
+                    group_req_pool_indices,
+                    group_prefix_lens_cpu,
+                )
+                grouped_results[dp_rank] = alloc_paged_token_slots_extend(
+                    self.tree_cache,
+                    group_prefix_lens,
+                    group_seq_lens,
+                    group_last_loc.tolist(),
+                    group_extend_num_tokens,
+                    dp_rank=dp_rank,
+                )
+
+        # Merge results back to original request order
+        out_cache_loc = self._merge_allocation_results_extend(
+            grouped_results, dp_groups, extend_lens
+        )
+
+        # Set fields (same as single-rank)
+        self.input_ids = input_ids_cpu
+        self.req_pool_indices = req_pool_indices_cpu
+        self.seq_lens = seq_lens_cpu
+        self.out_cache_loc = out_cache_loc
+        self.seq_lens_sum = sum(seq_lens)
+
+        if self.return_logprob:
+            self.top_logprobs_nums = [r.top_logprobs_num for r in reqs]
+            self.token_ids_logprobs = [r.token_ids_logprob for r in reqs]
+
+        self.extend_logprob_start_lens = [r.extend_logprob_start_len for r in reqs]
+        self.extend_num_tokens = extend_num_tokens
+        self.prefix_lens = prefix_lens
+        self.extend_lens = extend_lens
+        self.extend_input_logprob_token_ids = extend_input_logprob_token_ids
+
+        # Write to req_to_token_pool (same as single-rank)
+        pt = 0
+        for i in range(bs):
+            self.req_to_token_pool.write(
+                (req_pool_indices[i], slice(prefix_lens[i], seq_lens[i])),
+                out_cache_loc[pt : pt + extend_lens[i]],
+            )
+            pt += extend_lens[i]
+
+        # Build sampling info
+        self.sampling_info = SamplingBatchInfo.from_schedule_batch(
+            self,
+            self.model_config.vocab_size,
+        )
+
+    def prepare_for_extend(self):
+        """Public method - delegates to bound implementation."""
+        return self._prepare_for_extend_impl()
 
     def new_page_count_next_decode(self, selected_indices: list[int] | None = None):
         page_size = self.token_to_kv_pool_allocator.page_size
@@ -913,7 +1082,7 @@ class ScheduleBatch:
             token_indices = self.req_to_token_pool.req_to_token[
                 req.req_pool_idx, : seq_lens_cpu[idx]
             ]
-            self.token_to_kv_pool_allocator.free(token_indices)
+            self.token_to_kv_pool_allocator.free(token_indices, req.dp_rank)
             self.req_to_token_pool.free(req.req_pool_idx)
         else:
             last_uncached_pos = (
@@ -922,7 +1091,7 @@ class ScheduleBatch:
             token_indices = self.req_to_token_pool.req_to_token[
                 req.req_pool_idx, last_uncached_pos : seq_lens_cpu[idx]
             ]
-            self.token_to_kv_pool_allocator.free(token_indices)
+            self.token_to_kv_pool_allocator.free(token_indices, req.dp_rank)
             self.req_to_token_pool.free(req.req_pool_idx)
 
             # release the last node
@@ -957,7 +1126,8 @@ class ScheduleBatch:
             self.model_config.vocab_size,
         )
 
-    def prepare_for_decode(self):
+    def _prepare_for_decode_single(self):
+        """Prepare for decode phase (single DP rank)."""
         self.forward_mode = ForwardMode.DECODE
         bs = len(self.reqs)
         if self.spec_algorithm is not None and self.spec_algorithm.is_eagle():
@@ -996,18 +1166,91 @@ class ScheduleBatch:
             self.seq_lens = np.add(self.seq_lens, 1)
         self.seq_lens_sum += bs
 
-        # Allocate memory
+        # Allocate memory (single DP rank - all reqs have same dp_rank)
+        dp_rank = self.reqs[0].dp_rank if (self.reqs and self.reqs[0].dp_rank is not None) else 0
         if self.token_to_kv_pool_allocator.page_size == 1:
-            self.out_cache_loc = alloc_token_slots(self.tree_cache, bs)
+            self.out_cache_loc = alloc_token_slots(self.tree_cache, bs, dp_rank=dp_rank)
         else:
             last_loc = self.req_to_token_pool.req_to_token[self.req_pool_indices, self.seq_lens - 2]
             self.out_cache_loc = self.alloc_paged_token_slots_decode(
                 self.seq_lens.tolist(),
                 last_loc.tolist(),
+                dp_rank=dp_rank,
             )
         self.req_to_token_pool.write(
             (self.req_pool_indices, locs), self.out_cache_loc.astype(np.int32)
         )
+
+    def _prepare_for_decode_multi(self):
+        """Prepare for decode phase (multiple DP ranks in batch)."""
+        self.forward_mode = ForwardMode.DECODE
+        bs = len(self.reqs)
+        if self.spec_algorithm is not None and self.spec_algorithm.is_eagle():
+            draft_input: EagleDraftInput = self.spec_info
+            draft_input.prepare_for_decode(self)
+
+        if self.spec_algorithm is not None and not self.spec_algorithm.is_none():
+            return
+
+        if self.sampling_info.penalizer_orchestrator.is_required:
+            if self.enable_overlap:
+                delayed_output_ids = np.array(
+                    [
+                        (req.output_ids[-1] if len(req.output_ids) else req.origin_input_ids[-1])
+                        for req in self.reqs
+                    ],
+                    dtype=np.int64,
+                )
+                self.sampling_info.penalizer_orchestrator.cumulate_output_tokens(delayed_output_ids)
+            else:
+                self.sampling_info.penalizer_orchestrator.cumulate_output_tokens(self.output_ids)
+
+        # Update fields (same as single-rank)
+        self.input_ids = self.output_ids
+        self.output_ids = None
+        locs = self.seq_lens.copy()
+
+        if self.enable_overlap:
+            self.seq_lens = self.seq_lens + 1
+        else:
+            self.seq_lens = np.add(self.seq_lens, 1)
+        self.seq_lens_sum += bs
+
+        # GROUPED ALLOCATION by dp_rank (multi-rank specific)
+        dp_groups = self._group_reqs_by_dp_rank()
+        grouped_results = {}
+
+        for dp_rank, indices in dp_groups.items():
+            group_size = len(indices)
+
+            if self.token_to_kv_pool_allocator.page_size == 1:
+                grouped_results[dp_rank] = alloc_token_slots(
+                    self.tree_cache, group_size, dp_rank=dp_rank
+                )
+            else:
+                # Extract group-specific data
+                group_req_pool_indices = self.req_pool_indices[indices]
+                group_seq_lens = self.seq_lens[indices]
+                group_last_loc = self.req_to_token_pool.req_to_token[
+                    group_req_pool_indices, group_seq_lens - 2
+                ]
+                grouped_results[dp_rank] = self.alloc_paged_token_slots_decode(
+                    group_seq_lens.tolist(),
+                    group_last_loc.tolist(),
+                    dp_rank=dp_rank,
+                )
+
+        # Merge results back to original request order
+        self.out_cache_loc = self._merge_allocation_results_decode(grouped_results, dp_groups)
+
+        # Write to pool
+        self.req_to_token_pool.write(
+            (self.req_pool_indices, locs), self.out_cache_loc.astype(np.int32)
+        )
+
+    def prepare_for_decode(self):
+        """Public method - delegates to bound implementation."""
+        return self._prepare_for_decode_impl()
 
     def filter_batch(
         self,
@@ -1606,16 +1849,95 @@ class ScheduleBatch:
             is_prefill_only=self.is_prefill_only,
         )
 
-    def _evict_tree_cache_if_needed(
+    def _group_reqs_by_dp_rank(self) -> dict[int, list[int]]:
+        """
+        Group request indices by dp_rank (for multi-rank batches).
+
+        Returns:
+            {dp_rank: [original_indices]}
+            Example: {0: [0, 2], 1: [1, 3], 2: [4]}
+        """
+        from collections import defaultdict
+
+        groups = defaultdict(list)
+        for idx, req in enumerate(self.reqs):
+            dp_rank = req.dp_rank if req.dp_rank is not None else 0
+            groups[dp_rank].append(idx)
+        return dict(groups)
+
+    def _merge_allocation_results_extend(
+        self,
+        grouped_results: dict[int, np.ndarray],
+        dp_groups: dict[int, list[int]],
+        extend_lens: list[int],
+    ) -> np.ndarray:
+        """
+        Merge per-group allocation results for extend phase.
+
+        grouped_results[dp_rank] = flat array of allocated indices for that group
+        dp_groups[dp_rank] = list of original request indices
+        extend_lens = per-request extend lengths (in original order)
+
+        Returns: flat array of allocated indices in original request order
+        """
+        total_tokens = sum(extend_lens)
+        result = np.empty(total_tokens, dtype=np.int32)
+
+        # Build mapping: original_req_idx -> (start_pos, end_pos) in result
+        req_positions = {}
+        offset = 0
+        for idx, extend_len in enumerate(extend_lens):
+            req_positions[idx] = (offset, offset + extend_len)
+            offset += extend_len
+
+        # Fill result from grouped_results
+        for dp_rank, req_indices in dp_groups.items():
+            group_result = grouped_results[dp_rank]
+            group_offset = 0
+
+            for req_idx in req_indices:
+                start, end = req_positions[req_idx]
+                req_len = end - start
+                result[start:end] = group_result[group_offset : group_offset + req_len]
+                group_offset += req_len
+
+        return result
+
+    def _merge_allocation_results_decode(
+        self,
+        grouped_results: dict[int, np.ndarray],
+        dp_groups: dict[int, list[int]],
+    ) -> np.ndarray:
+        """
+        Merge per-group allocation results for decode phase (one token per request).
+
+        Returns: array in original request order
+        """
+        bs = len(self.reqs)
+        result = np.empty(bs, dtype=np.int32)
+
+        for dp_rank, req_indices in dp_groups.items():
+            group_result = grouped_results[dp_rank]
+            for i, req_idx in enumerate(req_indices):
+                result[req_idx] = group_result[i]
+
+        return result
+
+    def _evict_tree_cache_if_needed_single(
         self,
         num_tokens: int,
     ) -> None:
+        """Evict from tree cache if needed (single DP rank)."""
         if isinstance(self.tree_cache, ChunkCache):
             return
 
+        # Single DP rank - all reqs have same dp_rank
+        dp_rank = self.reqs[0].dp_rank if (self.reqs and self.reqs[0].dp_rank is not None) else 0
         if self.is_hybrid:
-            full_available_size = self.token_to_kv_pool_allocator.full_available_size()
-            swa_available_size = self.token_to_kv_pool_allocator.swa_available_size()
+            full_available_size = self.token_to_kv_pool_allocator.full_available_size(
+                dp_rank=dp_rank
+            )
+            swa_available_size = self.token_to_kv_pool_allocator.swa_available_size(dp_rank=dp_rank)
 
             if (
                 full_available_size < num_tokens or swa_available_size < num_tokens
@@ -1625,36 +1947,151 @@ class ScheduleBatch:
                 self.tree_cache.evict(full_num_tokens, swa_num_tokens)
         else:
             if (
-                self.token_to_kv_pool_allocator.available_size() < num_tokens
+                self.token_to_kv_pool_allocator.available_size(dp_rank=dp_rank) < num_tokens
                 and self.tree_cache is not None
             ):
                 self.tree_cache.evict(num_tokens)
 
-    def _is_available_size_sufficient(self, num_tokens: int) -> bool:
+    def _evict_tree_cache_if_needed_multi(
+        self,
+        num_tokens: int,
+    ) -> None:
+        """Evict from tree cache for multiple DP ranks if needed."""
+        if isinstance(self.tree_cache, ChunkCache):
+            return
+
+        # Collect all unique dp_ranks in batch
+        dp_ranks = set()
+        for req in self.reqs:
+            dp_rank = req.dp_rank if req.dp_rank is not None else 0
+            dp_ranks.add(dp_rank)
+
+        # Evict for each dp_rank if needed
+        for dp_rank in dp_ranks:
+            if self.is_hybrid:
+                full_available = self.token_to_kv_pool_allocator.full_available_size(
+                    dp_rank=dp_rank
+                )
+                swa_available = self.token_to_kv_pool_allocator.swa_available_size(dp_rank=dp_rank)
+                if (
+                    full_available < num_tokens or swa_available < num_tokens
+                ) and self.tree_cache is not None:
+                    full_num = max(0, num_tokens - full_available)
+                    swa_num = max(0, num_tokens - swa_available)
+                    self.tree_cache.evict(full_num, swa_num)
+            else:
+                available = self.token_to_kv_pool_allocator.available_size(dp_rank=dp_rank)
+                if available < num_tokens and self.tree_cache is not None:
+                    self.tree_cache.evict(num_tokens)
+
+    def _evict_tree_cache_if_needed(
+        self,
+        num_tokens: int,
+    ) -> None:
+        """Public method - delegates to bound implementation."""
+        return self._evict_tree_cache_if_needed_impl(num_tokens)
+
+    def _is_available_size_sufficient_single(self, num_tokens: int) -> bool:
+        """Check if sufficient memory for single DP rank batch."""
+        # Single DP rank - all reqs have same dp_rank
+        dp_rank = self.reqs[0].dp_rank if (self.reqs and self.reqs[0].dp_rank is not None) else 0
         if self.is_hybrid:
             return (
-                self.token_to_kv_pool_allocator.full_available_size() >= num_tokens
-                and self.token_to_kv_pool_allocator.swa_available_size() >= num_tokens
+                self.token_to_kv_pool_allocator.full_available_size(dp_rank=dp_rank) >= num_tokens
+                and self.token_to_kv_pool_allocator.swa_available_size(dp_rank=dp_rank)
+                >= num_tokens
             )
         else:
-            return self.token_to_kv_pool_allocator.available_size() >= num_tokens
+            return self.token_to_kv_pool_allocator.available_size(dp_rank=dp_rank) >= num_tokens
+
+    def _is_available_size_sufficient_multi(self, num_tokens: int) -> bool:
+        """Check if sufficient memory for all DP ranks in batch."""
+        # Collect all unique dp_ranks
+        dp_ranks = set()
+        for req in self.reqs:
+            dp_rank = req.dp_rank if req.dp_rank is not None else 0
+            dp_ranks.add(dp_rank)
+
+        # Check each dp_rank
+        for dp_rank in dp_ranks:
+            if self.is_hybrid:
+                full_ok = (
+                    self.token_to_kv_pool_allocator.full_available_size(dp_rank=dp_rank)
+                    >= num_tokens
+                )
+                swa_ok = (
+                    self.token_to_kv_pool_allocator.swa_available_size(dp_rank=dp_rank)
+                    >= num_tokens
+                )
+                if not (full_ok and swa_ok):
+                    return False
+            else:
+                if self.token_to_kv_pool_allocator.available_size(dp_rank=dp_rank) < num_tokens:
+                    return False
+
+        return True
+
+    def _is_available_size_sufficient(self, num_tokens: int) -> bool:
+        """Public method - delegates to bound implementation."""
+        return self._is_available_size_sufficient_impl(num_tokens)
 
     def _available_and_evictable_str(self) -> str:
-        if self.is_hybrid:
-            full_available_size = self.token_to_kv_pool_allocator.full_available_size()
-            swa_available_size = self.token_to_kv_pool_allocator.swa_available_size()
-            full_evictable_size = self.tree_cache.full_evictable_size()
-            swa_evictable_size = self.tree_cache.swa_evictable_size()
-            return (
-                f"Available full tokens: {full_available_size + full_evictable_size} ({full_available_size=} + {full_evictable_size=})\n"
-                f"Available swa tokens: {swa_available_size + swa_evictable_size} ({swa_available_size=} + {swa_evictable_size=})\n"
-                f"Full LRU list evictable size: {self.tree_cache.full_lru_list_evictable_size()}\n"
-                f"SWA LRU list evictable size: {self.tree_cache.swa_lru_list_evictable_size()}\n"
+        """Get debug string for available and evictable memory."""
+        if self.dp_size == 1:
+            # Single DP rank - get dp_rank from first request
+            dp_rank = (
+                self.reqs[0].dp_rank if (self.reqs and self.reqs[0].dp_rank is not None) else 0
             )
+            if self.is_hybrid:
+                full_available_size = self.token_to_kv_pool_allocator.full_available_size(
+                    dp_rank=dp_rank
+                )
+                swa_available_size = self.token_to_kv_pool_allocator.swa_available_size(
+                    dp_rank=dp_rank
+                )
+                full_evictable_size = self.tree_cache.full_evictable_size()
+                swa_evictable_size = self.tree_cache.swa_evictable_size()
+                return (
+                    f"Available full tokens: {full_available_size + full_evictable_size} ({full_available_size=} + {full_evictable_size=})\n"
+                    f"Available swa tokens: {swa_available_size + swa_evictable_size} ({swa_available_size=} + {swa_evictable_size=})\n"
+                    f"Full LRU list evictable size: {self.tree_cache.full_lru_list_evictable_size()}\n"
+                    f"SWA LRU list evictable size: {self.tree_cache.swa_lru_list_evictable_size()}\n"
+                )
+            else:
+                available_size = self.token_to_kv_pool_allocator.available_size(dp_rank=dp_rank)
+                evictable_size = self.tree_cache.evictable_size()
+                return f"Available tokens: {available_size + evictable_size} ({available_size=} + {evictable_size=})\n"
         else:
-            available_size = self.token_to_kv_pool_allocator.available_size()
-            evictable_size = self.tree_cache.evictable_size()
-            return f"Available tokens: {available_size + evictable_size} ({available_size=} + {evictable_size=})\n"
+            # Multi-rank - show info for all dp_ranks in batch
+            dp_ranks = set()
+            for req in self.reqs:
+                dp_rank = req.dp_rank if req.dp_rank is not None else 0
+                dp_ranks.add(dp_rank)
+
+            result_strs = []
+            for dp_rank in sorted(dp_ranks):
+                if self.is_hybrid:
+                    full_available_size = self.token_to_kv_pool_allocator.full_available_size(
+                        dp_rank=dp_rank
+                    )
+                    swa_available_size = self.token_to_kv_pool_allocator.swa_available_size(
+                        dp_rank=dp_rank
+                    )
+                    full_evictable_size = self.tree_cache.full_evictable_size()
+                    swa_evictable_size = self.tree_cache.swa_evictable_size()
+                    result_strs.append(
+                        f"[DP rank {dp_rank}] Available full tokens: {full_available_size + full_evictable_size} ({full_available_size=} + {full_evictable_size=})\n"
+                        f"[DP rank {dp_rank}] Available swa tokens: {swa_available_size + swa_evictable_size} ({swa_available_size=} + {swa_evictable_size=})\n"
+                        f"[DP rank {dp_rank}] Full LRU list evictable size: {self.tree_cache.full_lru_list_evictable_size()}\n"
+                        f"[DP rank {dp_rank}] SWA LRU list evictable size: {self.tree_cache.swa_lru_list_evictable_size()}\n"
+                    )
+                else:
+                    available_size = self.token_to_kv_pool_allocator.available_size(dp_rank=dp_rank)
+                    evictable_size = self.tree_cache.evictable_size()
+                    result_strs.append(
+                        f"[DP rank {dp_rank}] Available tokens: {available_size + evictable_size} ({available_size=} + {evictable_size=})\n"
+                    )
+            return "".join(result_strs)
 
 
 def align_to_size(lst: list, size: int, value: int = 0) -> list:
