@@ -199,8 +199,9 @@ class RadixCache(BasePrefixCache):
         self.root_node.key = RadixKey(token_ids=[], extra_key=None, dp_rank=None)
         self.root_node.value = []
         self.root_node.lock_ref = 1
-        self.evictable_size_ = 0
-        self.protected_size_ = 0
+        # Track evictable and protected size per DP rank
+        self.evictable_size_ = defaultdict(int)
+        self.protected_size_ = defaultdict(int)
 
     def match_prefix(self, key: RadixKey | list[int], **kwargs) -> MatchResult:
         # Support both RadixKey and plain list for backward compatibility
@@ -276,13 +277,14 @@ class RadixCache(BasePrefixCache):
     def cache_finished_req(self, req: Req):
         """Cache completed requests"""
         all_token_len = len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0)
+        dp_rank = req.dp_rank if req.dp_rank is not None else 0
         if self.disable:
             kv_indices = self.req_to_token_pool.read(
                 req.req_pool_idx,
                 all_token_len,
             )
             kv_indices = kv_indices[kv_indices != 0]
-            self.token_to_kv_pool_allocator.free(kv_indices)
+            self.token_to_kv_pool_allocator.free(kv_indices, dp_rank=dp_rank)
             self.req_to_token_pool.free(req.req_pool_idx)
             return
 
@@ -296,7 +298,7 @@ class RadixCache(BasePrefixCache):
         if self.page_size != 1:
             page_aligned_len = actual_kv_len // self.page_size * self.page_size
             page_aligned_kv_indices = kv_indices[:page_aligned_len].copy()
-            self.token_to_kv_pool_allocator.free(kv_indices[page_aligned_len:])
+            self.token_to_kv_pool_allocator.free(kv_indices[page_aligned_len:], dp_rank=dp_rank)
         else:
             page_aligned_len = actual_kv_len
             page_aligned_kv_indices = kv_indices[:page_aligned_len].copy()
@@ -314,9 +316,11 @@ class RadixCache(BasePrefixCache):
             page_aligned_kv_indices,
         )
 
-        self.token_to_kv_pool_allocator.free(kv_indices[old_prefix_len:new_prefix_len])
+        self.token_to_kv_pool_allocator.free(
+            kv_indices[old_prefix_len:new_prefix_len], dp_rank=dp_rank
+        )
         # free the unaligned tail
-        self.token_to_kv_pool_allocator.free(kv_indices[page_aligned_len:])
+        self.token_to_kv_pool_allocator.free(kv_indices[page_aligned_len:], dp_rank=dp_rank)
 
         # Remove request slot and release cache lock
         self.req_to_token_pool.free(req.req_pool_idx)
@@ -327,6 +331,7 @@ class RadixCache(BasePrefixCache):
         if self.disable:
             return
 
+        dp_rank = req.dp_rank if req.dp_rank is not None else 0
         token_ids = req.fill_ids
         all_token_len = len(token_ids)
         # For EAGLE radix cache, we will convert the key to bigram key, e.g. [1,2,3,4] -> [(1,2), (2,3), (3,4)], the length will -1. ((len([(1,2), (2,3), (3,4)]) = len([1,2,3,4]) - 1))
@@ -354,7 +359,9 @@ class RadixCache(BasePrefixCache):
         # Radix Cache takes over one reference from memory pool
         radix_key = RadixKey(page_aligned_token_ids, req.extra_key, req.dp_rank)
         new_prefix_len = self.insert(radix_key, page_aligned_kv_indices)
-        self.token_to_kv_pool_allocator.free(kv_indices[old_prefix_len:new_prefix_len])
+        self.token_to_kv_pool_allocator.free(
+            kv_indices[old_prefix_len:new_prefix_len], dp_rank=dp_rank
+        )
 
         # Prefix indices may have been updated, reuse them
         new_match_result = self.match_prefix(radix_key)
@@ -386,13 +393,13 @@ class RadixCache(BasePrefixCache):
         print(f"\n[process {self.process_id}] Radix Tree structure:")
         self._print_helper(self.root_node, 0)
         print(f"total tokens: {self.total_size()}")
-        print(f"evictable size: {self.evictable_size_}")
-        print(f"protected size: {self.protected_size_}")
+        print(f"evictable size per dp_rank: {dict(self.evictable_size_)}")
+        print(f"protected size per dp_rank: {dict(self.protected_size_)}")
 
     def total_size(self):
         return self._total_size_helper()
 
-    def evict(self, num_tokens: int):
+    def evict(self, num_tokens: int, dp_rank: int | None = None):
         if self.disable:
             return
 
@@ -408,7 +415,14 @@ class RadixCache(BasePrefixCache):
             if x.lock_ref > 0:
                 continue
 
-            self.token_to_kv_pool_allocator.free(x.value)
+            # Get dp_rank from node's key
+            node_dp_rank = x.key.dp_rank if x.key and x.key.dp_rank is not None else 0
+
+            # Filter by dp_rank if specified
+            if dp_rank is not None and node_dp_rank != dp_rank:
+                continue
+
+            self.token_to_kv_pool_allocator.free(x.value, dp_rank=node_dp_rank)
             num_evicted += len(x.value)
             self._delete_leaf(x)
 
@@ -422,8 +436,10 @@ class RadixCache(BasePrefixCache):
         delta = 0
         while node != self.root_node:
             if node.lock_ref == 0:
-                self.evictable_size_ -= len(node.value)
-                self.protected_size_ += len(node.value)
+                # Get dp_rank from node's key
+                node_dp_rank = node.key.dp_rank if node.key and node.key.dp_rank is not None else 0
+                self.evictable_size_[node_dp_rank] -= len(node.value)
+                self.protected_size_[node_dp_rank] += len(node.value)
                 delta -= len(node.value)
             node.lock_ref += 1
             node = node.parent
@@ -436,18 +452,20 @@ class RadixCache(BasePrefixCache):
         delta = 0
         while node != self.root_node:
             if node.lock_ref == 1:
-                self.evictable_size_ += len(node.value)
-                self.protected_size_ -= len(node.value)
+                # Get dp_rank from node's key
+                node_dp_rank = node.key.dp_rank if node.key and node.key.dp_rank is not None else 0
+                self.evictable_size_[node_dp_rank] += len(node.value)
+                self.protected_size_[node_dp_rank] -= len(node.value)
                 delta += len(node.value)
             node.lock_ref -= 1
             node = node.parent
         return delta
 
-    def evictable_size(self):
-        return self.evictable_size_
+    def evictable_size(self, dp_rank: int = 0):
+        return self.evictable_size_[dp_rank]
 
-    def protected_size(self):
-        return self.protected_size_
+    def protected_size(self, dp_rank: int = 0):
+        return self.protected_size_[dp_rank]
 
     def take_events(self):
         """Atomically takes all events and clears the queue."""
@@ -538,7 +556,9 @@ class RadixCache(BasePrefixCache):
             new_node.key = key
             new_node.value = value
             node.children[child_key] = new_node
-            self.evictable_size_ += len(value)
+            # Track evictable size per DP rank
+            node_dp_rank = key.dp_rank if key.dp_rank is not None else 0
+            self.evictable_size_[node_dp_rank] += len(value)
 
         return total_prefix_length
 
@@ -571,7 +591,9 @@ class RadixCache(BasePrefixCache):
             if v == node:
                 break
         del node.parent.children[k]
-        self.evictable_size_ -= len(node.key)
+        # Track evictable size per DP rank
+        node_dp_rank = node.key.dp_rank if node.key and node.key.dp_rank is not None else 0
+        self.evictable_size_[node_dp_rank] -= len(node.key)
 
     def _total_size_helper(self):
         total_size = 0

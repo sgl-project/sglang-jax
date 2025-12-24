@@ -23,7 +23,6 @@ import threading
 from http import HTTPStatus
 from typing import TYPE_CHECKING, Any
 
-import jax
 import numpy as np
 from jax import numpy as jnp
 from jax._src import mesh as mesh_lib
@@ -51,6 +50,7 @@ from sgl_jax.srt.precision_tracer import (
 from sgl_jax.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sgl_jax.srt.sampling.sampling_params import DEFAULT_SAMPLING_SEED, SamplingParams
 from sgl_jax.srt.server_args import ServerArgs
+from sgl_jax.srt.utils.common_utils import get_bool_env_var
 
 if TYPE_CHECKING:
     from sgl_jax.srt.speculative.eagle_util import EagleDraftInput, EagleVerifyInput
@@ -203,7 +203,6 @@ class Req:
         self.extra_key = extra_key
         self.lora_id = lora_id if lora_id is not None else "0"
         self.dp_rank = dp_rank
-
 
         # Memory pool info
         self.req_pool_idx: int | None = None
@@ -533,104 +532,139 @@ def acc_global_bid():
 
 
 @dataclasses.dataclass
-class ScheduleBatch:
-    """Store all information of a batch on the scheduler."""
-
-    # Request, memory pool, and cache
-    reqs: list[Req]
-    bid: int = None
-    req_to_token_pool: ReqToTokenPool = None
-    token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator = None
-    tree_cache: BasePrefixCache = None
-    is_hybrid: bool = False
-
-    # Batch configs
-    model_config: ModelConfig = None
-    forward_mode: ForwardMode = None
-    enable_overlap: bool = False
-    # Tell whether the current running batch is full so that we can skip
-    # the check of whether to prefill new requests.
-    # This is an optimization to reduce the overhead of the prefill check.
-    batch_is_full: bool = False
-
+class ScheduleReqsInfo:
+    """Store per-DP information for a batch of requests."""
+    # Requests assigned to this DP rank
+    reqs: list[Req] = None
     chunked_req: Req | None = None
 
-    # Sampling info
+    # Sampling info for this DP rank
     sampling_info: SamplingBatchInfo = None
-    next_batch_sampling_info: SamplingBatchInfo = None
 
-    # Batched arguments to model runner
-    input_ids: np.ndarray = None  # shape: [b], int32
-    req_pool_indices: np.ndarray = None  # shape: [b], int32
-    seq_lens: np.ndarray = None  # shape: [b], int32
-    # The output locations of the KV cache
-    out_cache_loc: np.ndarray = None  # shape: [b], int32
-    output_ids: np.ndarray = None  # shape: [b], int32
+    # Batched arguments to model runner (per DP)
+    input_ids: np.ndarray = None  # shape: [b_per_dp], int32
+    req_pool_indices: np.ndarray = None  # shape: [b_per_dp], int32
+    seq_lens: np.ndarray = None  # shape: [b_per_dp], int32
+    out_cache_loc: np.ndarray = None  # shape: [b_per_dp], int32
+    output_ids: np.ndarray = None  # shape: [b_per_dp], int32
 
-    # The sum of all sequence lengths
-    seq_lens_sum: int = None
+    # The sum of all sequence lengths for this DP rank
+    seq_lens_sum: int = 0
 
-    # For processing logprobs
-    return_logprob: bool = False
-    return_output_logprob_only: bool = False
+    # For processing logprobs (per DP)
     top_logprobs_nums: list[int] | None = None
     token_ids_logprobs: list[list[int]] | None = None
 
-    # For logits and logprob post processing
-    temp_scaled_logprobs: bool = False
-    top_p_normalized_logprobs: bool = False
-
-    # For extend and mixed chunekd prefill
+    # For extend and mixed chunked prefill (per DP)
     prefix_lens: list[int] = None
     extend_lens: list[int] = None
     extend_num_tokens: int | None = None
     decoding_reqs: list[Req] = None
     extend_logprob_start_lens: list[int] = None
-    # It comes empty list if logprob is not required.
     extend_input_logprob_token_ids: np.ndarray | None = None
 
-    # Stream
+    # Speculative decoding info (per DP)
+    spec_info: EagleDraftInput | EagleVerifyInput | None = None
+
+    # Whether this DP rank's batch is full
+    batch_is_full: bool = False
+
+
+@dataclasses.dataclass
+class ScheduleBatch:
+    """Store all information of a batch on the scheduler.
+
+    For DP > 1, per-DP request information is stored in reqs_info list.
+    Global/shared state is stored directly in this class.
+    """
+
+    # Per-DP request information (list of length dp_size)
+    reqs_info: list[ScheduleReqsInfo] = None
+
+    # Memory pool and cache (shared across all DP ranks)
+    req_to_token_pool: ReqToTokenPool = None
+    token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator = None
+    tree_cache: BasePrefixCache = None
+    is_hybrid: bool = False
+
+    # Batch configs (shared)
+    model_config: ModelConfig = None
+    forward_mode: ForwardMode = None
+    enable_overlap: bool = False
+
+    # For processing logprobs (shared settings)
+    return_logprob: bool = False
+    return_output_logprob_only: bool = False
+
+    # For logits and logprob post processing (shared settings)
+    temp_scaled_logprobs: bool = False
+    top_p_normalized_logprobs: bool = False
+
+    # Stream (shared)
     has_stream: bool = False
 
-    # Grammar-constrained decoding
+    # Grammar-constrained decoding (shared)
     has_grammar: bool = False
 
-    # device mesh
+    # device mesh (shared)
     mesh: mesh_lib.Mesh = None
 
     cache_miss_count: int = 0
 
+    # Speculative decoding algorithm (shared)
     spec_algorithm: SpeculativeAlgorithm = None
-    spec_info: EagleDraftInput | EagleVerifyInput | None = None
 
-    # Whether to return hidden states
+    # Whether to return hidden states (shared)
     return_hidden_states: bool = False
 
-    # Whether this batch is prefill-only (no token generation needed)
+    # Whether this batch is prefill-only (no token generation needed) (shared)
     is_prefill_only: bool = False
 
-    # Events
+    # next batch sampling info for overlap scheduling
+    next_batch_sampling_info: ModelWorkerSamplingInfo | None = None
+
+    # Events (shared)
     launch_done: threading.Event | None = None
 
     # Whether to return captured experts
     return_routed_experts: bool = False
 
+    # Data Parallelism size
+    dp_size: int = 1
+    # Padded batch size per DP rank (set during get_model_worker_batch)
+    per_dp_bs_size: int = 0
+
     @classmethod
     def init_new(
         cls,
-        reqs: list[Req],
+        reqs: list[list[Req]],  # Per-DP requests: list of length dp_size
         req_to_token_pool: ReqToTokenPool,
         token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
         tree_cache: BasePrefixCache,
         model_config: ModelConfig,
         enable_overlap: bool,
+        dp_size: int,
         spec_algorithm: SpeculativeAlgorithm = None,
         enable_custom_logit_processor: bool = False,
-        chunked_req: Req | None = None,
+        chunked_reqs: (
+            list[Req | None] | None
+        ) = None,  # Per-DP chunked requests: list of length dp_size
         mesh: mesh_lib.Mesh = None,
     ):
-        return_logprob = any(req.return_logprob for req in reqs)
-        return_output_logprob_only = all(req.return_output_logprob_only for req in reqs)
+        # Validate input
+        assert len(reqs) == dp_size, f"reqs length {len(reqs)} != dp_size {dp_size}"
+        if chunked_reqs is not None:
+            assert (
+                len(chunked_reqs) == dp_size
+            ), f"chunked_reqs length {len(chunked_reqs)} != dp_size {dp_size}"
+        else:
+            chunked_reqs = [None] * dp_size
+
+        # Flatten all reqs for global checks
+        all_reqs = [req for dp_reqs in reqs for req in dp_reqs]
+
+        return_logprob = any(req.return_logprob for req in all_reqs)
+        return_output_logprob_only = all(req.return_output_logprob_only for req in all_reqs)
         is_hybrid = False
         if isinstance(token_to_kv_pool_allocator, SWATokenToKVPoolAllocator):
             assert tree_cache is None or isinstance(
@@ -638,8 +672,16 @@ class ScheduleBatch:
             ), "SWARadixCache or ChunkCache is required for SWATokenToKVPoolAllocator"
             is_hybrid = True
 
+        # Initialize reqs_info based on dp_size with pre-distributed reqs
+        reqs_info = []
+        for dp_rank in range(dp_size):
+            info = ScheduleReqsInfo()
+            info.reqs = reqs[dp_rank]
+            info.chunked_req = chunked_reqs[dp_rank]
+            reqs_info.append(info)
+
         return cls(
-            reqs=reqs,
+            reqs_info=reqs_info,
             req_to_token_pool=req_to_token_pool,
             token_to_kv_pool_allocator=token_to_kv_pool_allocator,
             tree_cache=tree_cache,
@@ -648,21 +690,32 @@ class ScheduleBatch:
             return_logprob=return_logprob,
             return_output_logprob_only=return_output_logprob_only,
             enable_overlap=enable_overlap,
-            has_stream=any(req.stream for req in reqs),
-            has_grammar=any(req.grammar for req in reqs),
-            chunked_req=chunked_req,
-            return_hidden_states=any(req.return_hidden_states for req in reqs),
+            has_stream=any(req.stream for req in all_reqs),
+            has_grammar=any(req.grammar for req in all_reqs),
             mesh=mesh,
             spec_algorithm=spec_algorithm,
-            is_prefill_only=all(req.sampling_params.max_new_tokens == 0 for req in reqs),
-            return_routed_experts=any(req.return_routed_experts for req in reqs),
+            is_prefill_only=all(req.sampling_params.max_new_tokens == 0 for req in all_reqs),
+            return_routed_experts=any(req.return_routed_experts for req in all_reqs),
+            dp_size=dp_size,
         )
 
-    def batch_size(self):
-        return len(self.reqs)
+    @property
+    def batch_is_full(self) -> bool:
+        return all(info.batch_is_full for info in self.reqs_info)
 
-    def is_empty(self):
-        return len(self.reqs) == 0
+    def batch_size(self) -> int:
+        """Get total number of requests across all DP ranks."""
+        return sum(len(info.reqs) if info.reqs else 0 for info in self.reqs_info)
+
+    def batch_size_per_dp(self, dp_rank: int) -> int:
+        """Get number of requests for a specific DP rank."""
+        if self.reqs_info[dp_rank].reqs is None:
+            return 0
+        return len(self.reqs_info[dp_rank].reqs)
+
+    def is_empty(self) -> bool:
+        """Check if batch is empty (no requests in any DP rank)."""
+        return self.batch_size() == 0
 
     def alloc_req_slots(self, num_reqs: int):
         req_pool_indices = self.req_to_token_pool.alloc(num_reqs)
@@ -680,15 +733,18 @@ class ScheduleBatch:
         seq_lens: list[int],
         last_loc: list[int],
         backup_state: bool = False,
+        dp_rank: int = 0,
     ):
         num_tokens = len(seq_lens) * self.token_to_kv_pool_allocator.page_size
 
-        self._evict_tree_cache_if_needed(num_tokens)
+        self._evict_tree_cache_if_needed({dp_rank: num_tokens})
 
         if backup_state:
             state = self.token_to_kv_pool_allocator.backup_state()
 
-        out_cache_loc = self.token_to_kv_pool_allocator.alloc_decode(seq_lens, last_loc)
+        out_cache_loc = self.token_to_kv_pool_allocator.alloc_decode(
+            seq_lens, last_loc, dp_rank=dp_rank
+        )
         if out_cache_loc is None:
             error_msg = (
                 f"Decode out of memory. Try to lower your batch size.\n"
@@ -708,7 +764,13 @@ class ScheduleBatch:
         self.forward_mode = ForwardMode.EXTEND
         running_bs = running_batch.batch_size()
 
-        for i, req in enumerate(running_batch.reqs):
+        # Collect all requests from all DP ranks
+        all_running_reqs = []
+        for info in running_batch.reqs_info:
+            if info.reqs:
+                all_running_reqs.extend(info.reqs)
+
+        for i, req in enumerate(all_running_reqs):
             req.fill_ids = req.origin_input_ids + req.output_ids
             req.extend_input_len = 1
 
@@ -722,233 +784,380 @@ class ScheduleBatch:
         delta = 0 if self.enable_overlap else -1
         # NOTE: prefix_indices is what has been cached, but we don't cache each decode step
         self.prefix_lens.extend(
-            [len(r.origin_input_ids) + len(r.output_ids) + delta for r in running_batch.reqs]
+            [len(r.origin_input_ids) + len(r.output_ids) + delta for r in all_running_reqs]
         )
         self.extend_lens.extend([1] * running_bs)
         self.extend_num_tokens += running_bs
         self.extend_logprob_start_lens.extend([0] * running_bs)
 
     def prepare_for_extend(self):
+        """Prepare for extend phase (unified for all dp_size >= 1).
+
+        Process each DP rank independently. For dp_size=1, this is equivalent to
+        the old single-rank logic but with cleaner structure.
+        """
         self.forward_mode = ForwardMode.EXTEND
 
-        # Allocate req slots
-        bs = len(self.reqs)
-        req_pool_indices = self.alloc_req_slots(bs)
+        # Process each DP rank
+        for dp_rank in range(self.dp_size):
+            info = self.reqs_info[dp_rank]
+            reqs = info.reqs
 
-        # Init arrays
-        reqs = self.reqs
-        input_ids = [r.fill_ids[len(r.prefix_indices) :] for r in reqs]
-        extend_num_tokens = sum(len(ids) for ids in input_ids)
-        seq_lens = [len(r.fill_ids) for r in reqs]
-        prefix_lens = [len(r.prefix_indices) for r in reqs]
-        extend_lens = [r.extend_input_len for r in reqs]
+            # Skip empty DP ranks
+            if not reqs:
+                # Clear fields to avoid stale data
+                info.input_ids = None
+                info.seq_lens = None
+                info.prefix_lens = None
+                info.extend_lens = None
+                info.out_cache_loc = None
+                info.seq_lens_sum = 0
+                info.extend_num_tokens = None
+                continue
 
-        req_pool_indices_cpu = np.array(req_pool_indices, dtype=np.int32)
-        input_ids_cpu = np.array(sum(input_ids, []), dtype=np.int32)
-        seq_lens_cpu = np.array(seq_lens, dtype=np.int32)
-        prefix_lens_cpu = np.array(prefix_lens, dtype=np.int32)
+            # Allocate req slots
+            bs = len(reqs)
+            req_pool_indices = self.alloc_req_slots(bs)
 
-        # Copy prefix and do some basic check
-        extend_input_logprob_token_ids = []
+            # Init arrays
+            input_ids = [r.fill_ids[len(r.prefix_indices) :] for r in reqs]
+            extend_num_tokens = sum(len(ids) for ids in input_ids)
+            seq_lens = [len(r.fill_ids) for r in reqs]
+            prefix_lens = [len(r.prefix_indices) for r in reqs]
+            extend_lens = [r.extend_input_len for r in reqs]
 
-        for i, (req, seq_len, pre_len) in enumerate(zip(reqs, seq_lens, prefix_lens)):
-            req.req_pool_idx = req_pool_indices[i]
-            assert seq_len - pre_len == req.extend_input_len
+            req_pool_indices_cpu = np.array(req_pool_indices, dtype=np.int32)
+            input_ids_cpu = np.array(sum(input_ids, []), dtype=np.int32)
+            seq_lens_cpu = np.array(seq_lens, dtype=np.int32)
+            prefix_lens_cpu = np.array(prefix_lens, dtype=np.int32)
 
-            prefix_indices = req.prefix_indices
-            if pre_len > 0:
-                # note: prefix_indices has to locate on device, or will meet Received incompatible devices for jitted computation
-                self.req_to_token_pool.write((req.req_pool_idx, slice(0, pre_len)), prefix_indices)
+            # Copy prefix and do some basic check
+            extend_input_logprob_token_ids = []
 
-            req.cached_tokens += pre_len - req.already_computed
-            req.already_computed = seq_len
-            req.is_retracted = False
+            for i, (req, seq_len, pre_len) in enumerate(zip(reqs, seq_lens, prefix_lens)):
+                req.req_pool_idx = req_pool_indices[i]
+                assert seq_len - pre_len == req.extend_input_len
 
-            # Compute the relative logprob_start_len in an extend batch
-            if req.logprob_start_len >= pre_len:
-                req.extend_logprob_start_len = min(
-                    req.logprob_start_len - pre_len,
-                    req.extend_input_len,
-                    req.seqlen - 1,
-                )
-            else:
-                req.extend_logprob_start_len = 0
+                prefix_indices = req.prefix_indices
+                if pre_len > 0:
+                    # note: prefix_indices has to locate on device, or will meet Received incompatible devices for jitted computation
+                    self.req_to_token_pool.write(
+                        (req.req_pool_idx, slice(0, pre_len)), prefix_indices
+                    )
+
+                req.cached_tokens += pre_len - req.already_computed
+                req.already_computed = seq_len
+                req.is_retracted = False
+
+                # Compute the relative logprob_start_len in an extend batch
+                if req.logprob_start_len >= pre_len:
+                    req.extend_logprob_start_len = min(
+                        req.logprob_start_len - pre_len,
+                        req.extend_input_len,
+                        req.seqlen - 1,
+                    )
+                else:
+                    req.extend_logprob_start_len = 0
+
+                if self.return_logprob:
+                    # Find input logprob token ids.
+                    # First, find a global index within origin_input_ids and slide it by 1
+                    # to compute input logprobs. It is because you need the next token
+                    # to compute input logprobs. E.g., (chunk size 2)
+                    #
+                    # input_logprobs = [1, 2, 3, 4]
+                    # fill_ids = [1, 2]
+                    # extend_input_logprob_token_id = [2, 3]
+                    #
+                    # Note that it can also overflow. In this case, we pad it with 0.
+                    # input_logprobs = [1, 2, 3, 4]
+                    # fill_ids = [3, 4]
+                    # extend_input_logprob_token_id = [4, 0]
+                    global_start_idx, global_end_idx = (
+                        len(req.prefix_indices),
+                        len(req.fill_ids),
+                    )
+                    # Apply logprob_start_len
+                    if global_start_idx < req.logprob_start_len:
+                        global_start_idx = req.logprob_start_len
+
+                    logprob_token_ids = req.origin_input_ids[
+                        global_start_idx + 1 : global_end_idx + 1
+                    ]
+                    extend_input_logprob_token_ids.extend(logprob_token_ids)
+
+                    # We will need req.extend_input_len - req.extend_logprob_start_len number of
+                    # tokens, and logprob_token_ids is for input logprob, so pad the rest of them by 0.
+                    extend_input_logprob_token_ids.extend(
+                        [0]
+                        * (
+                            req.extend_input_len
+                            - req.extend_logprob_start_len
+                            - len(logprob_token_ids)
+                        )
+                    )
 
             if self.return_logprob:
-                # Find input logprob token ids.
-                # First, find a global index within origin_input_ids and slide it by 1
-                # to compute input logprobs. It is because you need the next token
-                # to compute input logprobs. E.g., (chunk size 2)
-                #
-                # input_logprobs = [1, 2, 3, 4]
-                # fill_ids = [1, 2]
-                # extend_input_logprob_token_id = [2, 3]
-                #
-                # Note that it can also overflow. In this case, we pad it with 0.
-                # input_logprobs = [1, 2, 3, 4]
-                # fill_ids = [3, 4]
-                # extend_input_logprob_token_id = [4, 0]
-                global_start_idx, global_end_idx = (
-                    len(req.prefix_indices),
-                    len(req.fill_ids),
+                extend_input_logprob_token_ids = np.array(extend_input_logprob_token_ids)
+            else:
+                extend_input_logprob_token_ids = None
+
+            # Allocate memory for this DP rank
+            if self.token_to_kv_pool_allocator.page_size == 1:
+                out_cache_loc = alloc_token_slots(
+                    self.tree_cache, extend_num_tokens, dp_rank=dp_rank
                 )
-                # Apply logprob_start_len
-                if global_start_idx < req.logprob_start_len:
-                    global_start_idx = req.logprob_start_len
-
-                logprob_token_ids = req.origin_input_ids[global_start_idx + 1 : global_end_idx + 1]
-                extend_input_logprob_token_ids.extend(logprob_token_ids)
-
-                # We will need req.extend_input_len - req.extend_logprob_start_len number of
-                # tokens, and logprob_token_ids is for input logprob, so pad the rest of them by 0.
-                extend_input_logprob_token_ids.extend(
-                    [0]
-                    * (req.extend_input_len - req.extend_logprob_start_len - len(logprob_token_ids))
+            else:
+                last_loc_cpu = get_last_loc(
+                    self.req_to_token_pool.req_to_token,
+                    req_pool_indices_cpu,
+                    prefix_lens_cpu,
+                )
+                out_cache_loc = alloc_paged_token_slots_extend(
+                    self.tree_cache,
+                    prefix_lens,
+                    seq_lens,
+                    last_loc_cpu.tolist(),
+                    extend_num_tokens,
+                    dp_rank=dp_rank,
                 )
 
-        if self.return_logprob:
-            extend_input_logprob_token_ids = np.array(extend_input_logprob_token_ids)
-        else:
-            extend_input_logprob_token_ids = None
+            # Set fields for this DP rank's info
+            info.input_ids = input_ids_cpu
+            info.req_pool_indices = req_pool_indices_cpu
+            info.seq_lens = seq_lens_cpu
+            info.out_cache_loc = out_cache_loc
+            info.seq_lens_sum = sum(seq_lens)
 
-        # Allocate memory
-        if self.token_to_kv_pool_allocator.page_size == 1:
-            out_cache_loc = alloc_token_slots(self.tree_cache, extend_num_tokens)
-        else:
-            last_loc_cpu = get_last_loc(
-                self.req_to_token_pool.req_to_token,
-                req_pool_indices_cpu,
-                prefix_lens_cpu,
+            if self.return_logprob:
+                info.top_logprobs_nums = [r.top_logprobs_num for r in reqs]
+                info.token_ids_logprobs = [r.token_ids_logprob for r in reqs]
+
+            info.extend_logprob_start_lens = [r.extend_logprob_start_len for r in reqs]
+            info.extend_num_tokens = extend_num_tokens
+            info.prefix_lens = prefix_lens
+            info.extend_lens = extend_lens
+            info.extend_input_logprob_token_ids = extend_input_logprob_token_ids
+
+            # Write to req_to_token_pool
+            pt = 0
+            for i in range(bs):
+                self.req_to_token_pool.write(
+                    (req_pool_indices[i], slice(prefix_lens[i], seq_lens[i])),
+                    out_cache_loc[pt : pt + extend_lens[i]],
+                )
+
+                pt += extend_lens[i]
+
+            info.sampling_info = SamplingBatchInfo.from_schedule_batch(
+                info,
+                self.model_config.vocab_size,
+                batch=self,
             )
-            out_cache_loc = alloc_paged_token_slots_extend(
-                self.tree_cache,
-                prefix_lens,
-                seq_lens,
-                last_loc_cpu.tolist(),
-                extend_num_tokens,
-            )
 
-        # Set fields
-        self.input_ids = input_ids_cpu
-        self.req_pool_indices = req_pool_indices_cpu
-        self.seq_lens = seq_lens_cpu
-        self.out_cache_loc = out_cache_loc
-        self.seq_lens_sum = sum(seq_lens)
+    def new_page_count_next_decode(
+        self,
+        dp_rank: int,
+        selected_indices: list[int] | None = None,
+    ) -> int:
+        """Calculate new page count for next decode for a specific DP rank.
 
-        if self.return_logprob:
-            self.top_logprobs_nums = [r.top_logprobs_num for r in reqs]
-            self.token_ids_logprobs = [r.token_ids_logprob for r in reqs]
+        Args:
+            dp_rank: DP rank to calculate for
+            selected_indices: Optional local indices within this DP rank
 
-        self.extend_logprob_start_lens = [r.extend_logprob_start_len for r in reqs]
-        self.extend_num_tokens = extend_num_tokens
-        self.prefix_lens = prefix_lens
-        self.extend_lens = extend_lens
-        self.extend_input_logprob_token_ids = extend_input_logprob_token_ids
-
-        # Write to req_to_token_pool
-        pt = 0
-        for i in range(bs):
-            self.req_to_token_pool.write(
-                (req_pool_indices[i], slice(prefix_lens[i], seq_lens[i])),
-                out_cache_loc[pt : pt + extend_lens[i]],
-            )
-            pt += extend_lens[i]
-
-        # Build sampling info
-        self.sampling_info = SamplingBatchInfo.from_schedule_batch(
-            self,
-            self.model_config.vocab_size,
-        )
-
-    def new_page_count_next_decode(self, selected_indices: list[int] | None = None):
+        Returns:
+            Number of new pages needed for this DP rank.
+        """
         page_size = self.token_to_kv_pool_allocator.page_size
+        info = self.reqs_info[dp_rank]
+
+        if not info.reqs:
+            return 0
+
         requests = (
-            self.reqs if selected_indices is None else [self.reqs[i] for i in selected_indices]
+            info.reqs if selected_indices is None else [info.reqs[i] for i in selected_indices]
         )
+
         if page_size == 1:
             return len(requests)
-        # In the decoding phase, the length of a request's KV cache should be
-        # the total length of the request minus 1
+
         return (
             sum(1 for req in requests if req.seqlen % page_size == 0)
             if self.enable_overlap
             else sum(1 for req in requests if (req.seqlen - 1) % page_size == 0)
         )
 
-    def check_decode_mem(self, buf_multiplier=1, selected_indices: list[int] | None = None):
-        num_tokens = (
-            self.new_page_count_next_decode(selected_indices)
-            * buf_multiplier
-            * self.token_to_kv_pool_allocator.page_size
-        )
+    def check_decode_mem(
+        self, buf_multiplier=1, selected_indices: dict[int, list[int]] | None = None
+    ):
+        """Check if all DP ranks have sufficient memory for next decode step.
 
-        self._evict_tree_cache_if_needed(num_tokens)
-        return self._is_available_size_sufficient(num_tokens)
+        Args:
+            buf_multiplier: Buffer multiplier for memory calculation
+            selected_indices: Optional per-DP indices to check
+                              Format: {dp_rank: [local_index_0, local_index_1, ...]}
+                              If None, checks all requests in all DP ranks
+
+        Returns:
+            False if any DP rank has insufficient memory.
+        """
+        # Calculate tokens needed per DP rank
+        num_tokens_per_dp = {}
+        for dp_rank in range(self.dp_size):
+            info = self.reqs_info[dp_rank]
+            if not info.reqs:
+                continue
+
+            # Get indices for this specific DP rank
+            indices = selected_indices.get(dp_rank) if selected_indices else None
+
+            # Calculate tokens needed for THIS specific DP rank
+            num_pages = self.new_page_count_next_decode(dp_rank, indices)
+            num_tokens_per_dp[dp_rank] = (
+                num_pages * buf_multiplier * self.token_to_kv_pool_allocator.page_size
+            )
+
+        # Try to evict if needed, then check if sufficient
+        self._evict_tree_cache_if_needed(num_tokens_per_dp)
+        return self._is_available_size_sufficient(num_tokens_per_dp)
 
     def retract_decode(self, server_args: ServerArgs):
-        """Retract the decoding requests when there is not enough memory."""
-        sorted_indices = list(range(len(self.reqs)))
+        """Retract requests when memory insufficient.
 
-        sorted_indices.sort(
-            key=lambda i: (
-                len(self.reqs[i].output_ids),
-                -len(self.reqs[i].origin_input_ids),
-            ),
-            reverse=True,
-        )
+        Each DP rank independently:
+        - Checks its own memory
+        - Sorts its requests by priority
+        - Retracts until sufficient
+
+        Returns:
+            retracted_reqs: All retracted requests
+            new_estimate_ratio: Updated estimate
+        """
+
+        # Helper function: check if memory is sufficient for given DP rank
+        def has_sufficient_memory(dp_rank: int, indices: list[int]) -> bool:
+            num_pages = self.new_page_count_next_decode(dp_rank, indices)
+            num_tokens = num_pages * self.token_to_kv_pool_allocator.page_size
+
+            # Evict if needed
+            if not isinstance(self.tree_cache, ChunkCache) and self.tree_cache:
+                if self.is_hybrid:
+                    full_avail = self.token_to_kv_pool_allocator.full_available_size(
+                        dp_rank=dp_rank
+                    )
+                    swa_avail = self.token_to_kv_pool_allocator.swa_available_size(dp_rank=dp_rank)
+                    if full_avail < num_tokens or swa_avail < num_tokens:
+                        self.tree_cache.evict(
+                            max(0, num_tokens - full_avail),
+                            max(0, num_tokens - swa_avail),
+                            dp_rank=dp_rank,
+                        )
+                else:
+                    avail = self.token_to_kv_pool_allocator.available_size(dp_rank=dp_rank)
+                    if avail < num_tokens:
+                        self.tree_cache.evict(num_tokens, dp_rank=dp_rank)
+
+            # Check if sufficient
+            if self.is_hybrid:
+                full_ok = (
+                    self.token_to_kv_pool_allocator.full_available_size(dp_rank=dp_rank)
+                    >= num_tokens
+                )
+                swa_ok = (
+                    self.token_to_kv_pool_allocator.swa_available_size(dp_rank=dp_rank)
+                    >= num_tokens
+                )
+                return full_ok and swa_ok
+            else:
+                return self.token_to_kv_pool_allocator.available_size(dp_rank=dp_rank) >= num_tokens
 
         retracted_reqs = []
-        first_iter = True
-        while (not self.check_decode_mem(selected_indices=sorted_indices)) or first_iter:
-            if len(sorted_indices) == 1:
-                # Corner case: only one request left
-                if self.is_hybrid:
-                    full_available_size = self.token_to_kv_pool_allocator.full_available_size()
-                    swa_available_size = self.token_to_kv_pool_allocator.swa_available_size()
-                    assert (
-                        full_available_size > 0 and swa_available_size > 0
-                    ), f"No space left for only one request in SWA mode {full_available_size=}, {swa_available_size=}"
-                else:
-                    assert (
-                        self.token_to_kv_pool_allocator.available_size() > 0
-                    ), f"No space left for only one request, {self.token_to_kv_pool_allocator.available_size()=}"
-                break
+        keep_indices_per_dp = {}
 
-            first_iter = False
-            idx = sorted_indices.pop()
-            req = self.reqs[idx]
-            retracted_reqs.append(req)
-            self.release_req(idx, len(sorted_indices), server_args)
+        # Process each DP rank independently
+        for dp_rank in range(self.dp_size):
+            info = self.reqs_info[dp_rank]
 
-            if len(retracted_reqs) == 0:
-                # Corner case: only one request left
-                raise ValueError(
-                    "Failed to retract any request. No space left for only one request."
-                )
+            # Skip empty ranks
+            if not info.reqs or len(info.reqs) == 0:
+                keep_indices_per_dp[dp_rank] = []
+                continue
 
-        self.filter_batch(keep_indices=sorted_indices)
+            # Sort requests by priority (local to this rank)
+            sorted_indices = list(range(len(info.reqs)))
+            sorted_indices.sort(
+                key=lambda i: (
+                    len(info.reqs[i].output_ids),
+                    -len(info.reqs[i].origin_input_ids),
+                ),
+                reverse=True,
+            )
 
-        # Reqs in batch are filtered
-        total_decoded_tokens = sum(len(r.output_ids) for r in self.reqs)
-        total_max_new_tokens = sum(r.sampling_params.max_new_tokens for r in self.reqs)
+            # Retract until sufficient for this rank
+            first_iter = True
+            while not has_sufficient_memory(dp_rank, sorted_indices) or first_iter:
+                if len(sorted_indices) == 1:
+                    # Assert some space available
+                    if self.is_hybrid:
+                        full_avail = self.token_to_kv_pool_allocator.full_available_size(
+                            dp_rank=dp_rank
+                        )
+                        swa_avail = self.token_to_kv_pool_allocator.swa_available_size(
+                            dp_rank=dp_rank
+                        )
+                        assert (
+                            full_avail > 0 and swa_avail > 0
+                        ), f"[DP {dp_rank}] No space for single request (hybrid)"
+                    else:
+                        avail = self.token_to_kv_pool_allocator.available_size(dp_rank=dp_rank)
+                        assert avail > 0, f"[DP {dp_rank}] No space for single request"
+                    break
+
+                first_iter = False
+                retract_idx = sorted_indices.pop()
+                req = info.reqs[retract_idx]
+                retracted_reqs.append(req)
+
+                # Release the request using its local index within this DP rank
+                self.release_req(retract_idx, dp_rank, len(sorted_indices), server_args)
+
+            keep_indices_per_dp[dp_rank] = sorted_indices
+
+        # Apply filtering
+        self.filter_batch(keep_indices=keep_indices_per_dp)
+
+        # Calculate global estimate ratio by aggregating across all DP ranks
+        all_reqs = [req for info in self.reqs_info for req in (info.reqs if info.reqs else [])]
+        total_decoded_tokens = sum(len(r.output_ids) for r in all_reqs)
+        total_max_new_tokens = sum(r.sampling_params.max_new_tokens for r in all_reqs)
 
         new_estimate_ratio = (
-            total_decoded_tokens + global_config.retract_decode_steps * len(self.reqs)
+            total_decoded_tokens + global_config.retract_decode_steps * len(all_reqs)
         ) / total_max_new_tokens
         new_estimate_ratio = min(1.0, new_estimate_ratio)
 
         return retracted_reqs, new_estimate_ratio
 
-    def release_req(self, idx: int, remaing_req_count: int, server_args: ServerArgs):
-        req = self.reqs[idx]
-        seq_lens_cpu = self.seq_lens
+    def release_req(self, idx: int, dp_rank: int, remaing_req_count: int, server_args: ServerArgs):
+        """Release a request and free its resources.
+
+        Args:
+            idx: Index of the request within the DP rank's request list
+            dp_rank: The DP rank this request belongs to
+            remaing_req_count: Number of remaining requests
+            server_args: Server arguments
+        """
+        info = self.reqs_info[dp_rank]
+        req = info.reqs[idx]
+        seq_lens_cpu = info.seq_lens
 
         if isinstance(self.tree_cache, ChunkCache):
             # ChunkCache does not have eviction
             token_indices = self.req_to_token_pool.req_to_token[
                 req.req_pool_idx, : seq_lens_cpu[idx]
             ]
-            self.token_to_kv_pool_allocator.free(token_indices)
+            self.token_to_kv_pool_allocator.free(token_indices, req.dp_rank)
             self.req_to_token_pool.free(req.req_pool_idx)
         else:
             last_uncached_pos = (
@@ -957,7 +1166,7 @@ class ScheduleBatch:
             token_indices = self.req_to_token_pool.req_to_token[
                 req.req_pool_idx, last_uncached_pos : seq_lens_cpu[idx]
             ]
-            self.token_to_kv_pool_allocator.free(token_indices)
+            self.token_to_kv_pool_allocator.free(token_indices, req.dp_rank)
             self.req_to_token_pool.free(req.req_pool_idx)
 
             # release the last node
@@ -967,7 +1176,7 @@ class ScheduleBatch:
                 self.tree_cache.dec_lock_ref(req.last_node)
 
             num_tokens = remaing_req_count * global_config.retract_decode_steps
-            self._evict_tree_cache_if_needed(num_tokens)
+            self._evict_tree_cache_if_needed({req.dp_rank: num_tokens})
 
         req.reset_for_retract()
 
@@ -980,173 +1189,628 @@ class ScheduleBatch:
         return retracted_reqs
 
     def prepare_for_idle(self):
+        """Prepare for idle phase (unified for all dp_size >= 1).
+
+        Initialize empty arrays for each DP rank.
+        """
         self.forward_mode = ForwardMode.IDLE
-        self.input_ids = np.empty(0, np.int32)
-        self.seq_lens = np.empty(0, np.int32)
-        self.out_cache_loc = np.empty(0, np.int32)
-        self.req_pool_indices = np.empty(0, np.int32)
-        self.seq_lens_sum = 0
-        self.extend_num_tokens = 0
-        self.sampling_info = SamplingBatchInfo.from_schedule_batch(
-            self,
-            self.model_config.vocab_size,
-        )
+
+        # Process each DP rank
+        for dp_rank in range(self.dp_size):
+            info = self.reqs_info[dp_rank]
+
+            # Set empty arrays for this DP rank
+            info.input_ids = np.empty(0, np.int32)
+            info.seq_lens = np.empty(0, np.int32)
+            info.out_cache_loc = np.empty(0, np.int32)
+            info.req_pool_indices = np.empty(0, np.int32)
+            info.seq_lens_sum = 0
+            info.extend_num_tokens = 0
+
+            info.sampling_info = SamplingBatchInfo.from_schedule_batch(
+                info,
+                self.model_config.vocab_size,
+                batch=self,
+            )
 
     def prepare_for_decode(self):
+        """Prepare for decode phase (unified for all dp_size >= 1).
+
+        Process each DP rank independently. For dp_size=1, this is equivalent to
+        the old single-rank logic but with cleaner structure.
+        """
         self.forward_mode = ForwardMode.DECODE
-        bs = len(self.reqs)
-        if self.spec_algorithm is not None and self.spec_algorithm.is_eagle():
-            # if spec decoding is used, the decode batch is prepared inside
-            # `forward_batch_speculative_generation` after running draft models.
-            draft_input: EagleDraftInput = self.spec_info
-            draft_input.prepare_for_decode(self)
 
-        if self.spec_algorithm is not None and not self.spec_algorithm.is_none():
-            return
+        # Process each DP rank
+        for dp_rank in range(self.dp_size):
+            info = self.reqs_info[dp_rank]
+            reqs = info.reqs
 
-        if self.sampling_info.penalizer_orchestrator.is_required:
+            # Skip empty DP ranks
+            if not reqs:
+                # Clear fields to avoid stale data
+                info.input_ids = None
+                info.output_ids = None
+                info.seq_lens = None
+                info.out_cache_loc = None
+                info.seq_lens_sum = 0
+                continue
+
+            bs = len(reqs)
+
+            # Handle spec decoding if enabled
+            if self.spec_algorithm is not None and self.spec_algorithm.is_eagle():
+                # if spec decoding is used, the decode batch is prepared inside
+                # `forward_batch_speculative_generation` after running draft models.
+                draft_input: EagleDraftInput = info.spec_info
+                draft_input.prepare_for_decode(self)
+
+            if self.spec_algorithm is not None and not self.spec_algorithm.is_none():
+                continue  # Skip to next DP rank
+
+            # Handle penalizer if required
+            if info.sampling_info.penalizer_orchestrator.is_required:
+                if self.enable_overlap:
+                    # TODO: this can be slow, optimize this.
+                    delayed_output_ids = np.array(
+                        [
+                            (
+                                req.output_ids[-1]
+                                if len(req.output_ids)
+                                else req.origin_input_ids[-1]
+                            )
+                            for req in reqs
+                        ],
+                        dtype=np.int64,
+                    )
+                    info.sampling_info.penalizer_orchestrator.cumulate_output_tokens(
+                        delayed_output_ids
+                    )
+                else:
+                    info.sampling_info.penalizer_orchestrator.cumulate_output_tokens(
+                        info.output_ids
+                    )
+
+            # Update fields
+            info.input_ids = info.output_ids
+            info.output_ids = None
+            locs = info.seq_lens.copy()
+
             if self.enable_overlap:
-                # TODO: this can be slow, optimize this.
-                delayed_output_ids = np.array(
-                    [
-                        (req.output_ids[-1] if len(req.output_ids) else req.origin_input_ids[-1])
-                        for req in self.reqs
-                    ],
-                    dtype=np.int64,
-                )
-                self.sampling_info.penalizer_orchestrator.cumulate_output_tokens(delayed_output_ids)
+                info.seq_lens = info.seq_lens + 1
             else:
-                self.sampling_info.penalizer_orchestrator.cumulate_output_tokens(self.output_ids)
+                info.seq_lens = np.add(info.seq_lens, 1)
+            info.seq_lens_sum += bs
 
-        # Update fields
-        self.input_ids = self.output_ids
+            # Allocate memory for this DP rank
+            if self.token_to_kv_pool_allocator.page_size == 1:
+                info.out_cache_loc = alloc_token_slots(self.tree_cache, bs, dp_rank=dp_rank)
+            else:
+                last_loc = self.req_to_token_pool.req_to_token[
+                    info.req_pool_indices, info.seq_lens - 2
+                ]
+                info.out_cache_loc = self.alloc_paged_token_slots_decode(
+                    info.seq_lens.tolist(),
+                    last_loc.tolist(),
+                    dp_rank=dp_rank,
+                )
 
-        self.output_ids = None
-
-        locs = self.seq_lens.copy()
-
-        if self.enable_overlap:
-            self.seq_lens = self.seq_lens + 1
-        else:
-            self.seq_lens = np.add(self.seq_lens, 1)
-        self.seq_lens_sum += bs
-
-        # Allocate memory
-        if self.token_to_kv_pool_allocator.page_size == 1:
-            self.out_cache_loc = alloc_token_slots(self.tree_cache, bs)
-        else:
-            last_loc = self.req_to_token_pool.req_to_token[self.req_pool_indices, self.seq_lens - 2]
-            self.out_cache_loc = self.alloc_paged_token_slots_decode(
-                self.seq_lens.tolist(),
-                last_loc.tolist(),
+            # Write to pool
+            self.req_to_token_pool.write(
+                (info.req_pool_indices, locs), info.out_cache_loc.astype(np.int32)
             )
-        self.req_to_token_pool.write(
-            (self.req_pool_indices, locs), self.out_cache_loc.astype(np.int32)
-        )
 
     def filter_batch(
         self,
-        chunked_req_to_exclude: Req | list[Req] | None = None,
-        keep_indices: list[int] | None = None,
+        chunked_req_to_exclude: dict[int, Req] | None = None,
+        keep_indices: dict[int, list[int]] | None = None,
     ):
-        if keep_indices is None:
-            if isinstance(chunked_req_to_exclude, Req):
-                chunked_req_to_exclude = [chunked_req_to_exclude]
-            elif chunked_req_to_exclude is None:
-                chunked_req_to_exclude = []
-            keep_indices = [
-                i
-                for i in range(len(self.reqs))
-                if not self.reqs[i].finished() and self.reqs[i] not in chunked_req_to_exclude
-            ]
+        """Filter completed requests from batch.
 
-        if keep_indices is None or len(keep_indices) == 0:
-            # Filter out all requests
-            self.reqs = []
-            return
+        Args:
+            chunked_req_to_exclude: Optional dict mapping dp_rank -> chunked request to exclude for that rank
+            keep_indices: Optional dict mapping dp_rank -> list of indices to keep for that rank.
+                         If None, automatically calculates based on finished() status.
+        """
+        # Normalize exclusion dict
+        if chunked_req_to_exclude is None:
+            chunked_req_to_exclude = {}
 
-        if len(keep_indices) == len(self.reqs):
-            # No need to filter
-            return
+        # Unified DP filtering logic (works for all dp_size including 1)
+        for dp_rank in range(self.dp_size):
+            info = self.reqs_info[dp_rank]
 
-        self.reqs = [self.reqs[i] for i in keep_indices]
-        self.req_pool_indices = self.req_pool_indices[keep_indices]
-        # TODO: uniform data type in scheduler batch
-        if isinstance(self.seq_lens, jax.Array):
-            self.seq_lens = np.array(self.seq_lens)
-            self.output_ids = np.array(self.output_ids)
-        self.seq_lens = self.seq_lens[keep_indices]
-        if self.spec_info is not None and self.spec_info.topk_p is not None:
-            keep_indices_jax = jnp.asarray(keep_indices, dtype=jnp.int32)
-            self.spec_info.topk_p = self.spec_info.topk_p[keep_indices_jax]
-            self.spec_info.topk_index = self.spec_info.topk_index[keep_indices_jax]
-            self.spec_info.hidden_states = self.spec_info.hidden_states[keep_indices_jax]
-            self.spec_info.verified_id = self.spec_info.verified_id[keep_indices_jax]
-            self.spec_info.allocate_lens = self.spec_info.allocate_lens[keep_indices_jax]
+            # Skip if this DP rank has no requests
+            if not info.reqs or len(info.reqs) == 0:
+                continue
 
-        self.out_cache_loc = None
-        self.seq_lens_sum = self.seq_lens.sum().item()
-        if not isinstance(keep_indices, np.ndarray):
-            keep_indices = np.array(keep_indices)
-        self.output_ids = self.output_ids[keep_indices] if self.output_ids is not None else None
-        self.return_logprob = any(req.return_logprob for req in self.reqs)
-        self.return_output_logprob_only = any(req.return_output_logprob_only for req in self.reqs)
-        if self.return_logprob:
-            self.top_logprobs_nums = [self.top_logprobs_nums[i] for i in keep_indices]
-            self.token_ids_logprobs = [self.token_ids_logprobs[i] for i in keep_indices]
-        else:
-            self.top_logprobs_nums = None
-            self.token_ids_logprobs = None
+            # Get chunked request to exclude for this rank
+            chunked_req = chunked_req_to_exclude.get(dp_rank)
 
-        self.has_stream = any(req.stream for req in self.reqs)
-        self.has_grammar = any(req.grammar for req in self.reqs)
-
-        self.sampling_info.filter_batch(np.array(keep_indices))
-        if self.spec_info is not None:
-            if chunked_req_to_exclude is not None and len(chunked_req_to_exclude) > 0:
-                has_been_filtered = False
+            # Get keep_indices for this DP rank
+            if keep_indices is not None:
+                # Use provided keep_indices for this rank
+                keep_indices_dp = keep_indices.get(dp_rank, [])
+                if keep_indices_dp is None:
+                    keep_indices_dp = []
             else:
-                has_been_filtered = True
-            self.spec_info.filter_batch(
-                new_indices=keep_indices, has_been_filtered=has_been_filtered
+                keep_indices_dp = [
+                    i
+                    for i in range(len(info.reqs))
+                    if not info.reqs[i].finished()
+                    and (chunked_req is None or info.reqs[i] != chunked_req)
+                ]
+
+            # Early exit: Clear all if nothing to keep
+            if len(keep_indices_dp) == 0:
+                info.reqs = []
+                info.req_pool_indices = None
+                info.seq_lens = None
+                info.output_ids = None
+                info.out_cache_loc = None
+                info.seq_lens_sum = 0
+                info.top_logprobs_nums = None
+                info.token_ids_logprobs = None
+                info.sampling_info = None
+                info.spec_info = None
+                continue
+
+            # Early exit: No filtering needed if all requests kept
+            if len(keep_indices_dp) == len(info.reqs):
+                continue
+
+            # Filter reqs list
+            info.reqs = [info.reqs[i] for i in keep_indices_dp]
+
+            # Filter memory pool indices
+            if info.req_pool_indices is not None:
+                info.req_pool_indices = info.req_pool_indices[keep_indices_dp]
+
+            # Filter sequence data
+            if info.seq_lens is not None:
+                info.seq_lens = info.seq_lens[keep_indices_dp]
+
+            if info.output_ids is not None:
+                info.output_ids = info.output_ids[keep_indices_dp]
+
+            # Reset cache location (will be recomputed)
+            info.out_cache_loc = None
+
+            # Recalculate seq_lens_sum for this DP rank
+            if info.seq_lens is not None:
+                info.seq_lens_sum = info.seq_lens.sum().item()
+            else:
+                info.seq_lens_sum = 0
+
+            # Filter speculative decoding arrays manually (if present)
+            if info.spec_info is not None and info.spec_info.topk_p is not None:
+                keep_indices_jax = jnp.asarray(keep_indices_dp, dtype=jnp.int32)
+                info.spec_info.topk_p = info.spec_info.topk_p[keep_indices_jax]
+                info.spec_info.topk_index = info.spec_info.topk_index[keep_indices_jax]
+                info.spec_info.hidden_states = info.spec_info.hidden_states[keep_indices_jax]
+                info.spec_info.verified_id = info.spec_info.verified_id[keep_indices_jax]
+                info.spec_info.allocate_lens = info.spec_info.allocate_lens[keep_indices_jax]
+
+            # Filter logprob lists
+            if info.top_logprobs_nums is not None:
+                info.top_logprobs_nums = [info.top_logprobs_nums[i] for i in keep_indices_dp]
+                info.token_ids_logprobs = [info.token_ids_logprobs[i] for i in keep_indices_dp]
+
+            # Filter sampling_info
+            if info.sampling_info is not None:
+                info.sampling_info.filter_batch(np.array(keep_indices_dp))
+
+            # Filter spec_info (method call)
+            if info.spec_info is not None:
+                # Note: has_been_filtered logic matches original implementation
+                if chunked_req_to_exclude is not None and len(chunked_req_to_exclude) > 0:
+                    has_been_filtered = False
+                else:
+                    has_been_filtered = True
+                info.spec_info.filter_batch(
+                    new_indices=keep_indices_dp, has_been_filtered=has_been_filtered
+                )
+
+        # Recalculate global batch flags from all remaining requests
+        all_reqs = [req for info in self.reqs_info for req in (info.reqs if info.reqs else [])]
+
+        if len(all_reqs) > 0:
+            self.return_logprob = any(req.return_logprob for req in all_reqs)
+            self.return_output_logprob_only = all(
+                req.return_output_logprob_only for req in all_reqs
             )
+            self.has_stream = any(req.stream for req in all_reqs)
+            self.has_grammar = any(req.grammar for req in all_reqs)
+        else:
+            self.return_logprob = False
+            self.return_output_logprob_only = False
+            self.has_stream = False
+            self.has_grammar = False
 
     def merge_batch(self, other: ScheduleBatch):
-        # Penalizer orchestrator must be merged before Batch.reqs is merged. This is because
-        # orchestrator.merge() depends on Batch.reqs during preparation of each penalizers, so it
-        # needs to be called with pre-merged Batch.reqs.
-        self.sampling_info.merge_batch(other.sampling_info)
+        """Merge another batch into this batch (unified for all dp_size >= 1).
 
-        self.req_pool_indices = np.concat([self.req_pool_indices, other.req_pool_indices])
-        self.seq_lens = np.concat([self.seq_lens, other.seq_lens])
-        self.out_cache_loc = None
-        self.seq_lens_sum += other.seq_lens_sum
-        if self.output_ids is not None:
-            self.output_ids = np.concat(
-                [
-                    self.output_ids[: len(self.seq_lens)],
-                    other.output_ids[: len(other.seq_lens)],
-                ]
+        Merge each DP rank independently.
+        """
+        # Ensure both batches have same dp_size
+        assert (
+            self.dp_size == other.dp_size
+        ), f"Cannot merge batches with different dp_size: {self.dp_size} vs {other.dp_size}"
+
+        # Merge each DP rank independently
+        for dp_rank in range(self.dp_size):
+            self_info = self.reqs_info[dp_rank]
+            other_info = other.reqs_info[dp_rank]
+
+            # Skip if other batch has no requests for this DP rank
+            if not other_info.reqs or len(other_info.reqs) == 0:
+                continue
+
+            # Initialize self_info if it's empty
+            if not self_info.reqs or len(self_info.reqs) == 0:
+                # Copy everything from other_info
+                self_info.reqs = other_info.reqs.copy()
+                self_info.sampling_info = other_info.sampling_info
+                self_info.req_pool_indices = other_info.req_pool_indices
+                self_info.seq_lens = other_info.seq_lens
+                self_info.out_cache_loc = other_info.out_cache_loc
+                self_info.seq_lens_sum = other_info.seq_lens_sum
+                self_info.output_ids = other_info.output_ids
+                self_info.top_logprobs_nums = other_info.top_logprobs_nums
+                self_info.token_ids_logprobs = other_info.token_ids_logprobs
+                self_info.spec_info = other_info.spec_info
+                continue
+
+            # Penalizer orchestrator must be merged before Batch.reqs is merged. This is because
+            # orchestrator.merge() depends on Batch.reqs during preparation of each penalizers, so it
+            # needs to be called with pre-merged Batch.reqs.
+            if self_info.sampling_info and other_info.sampling_info:
+                self_info.sampling_info.merge_batch(other_info.sampling_info)
+
+            # Merge arrays
+            self_info.req_pool_indices = np.concat(
+                [self_info.req_pool_indices, other_info.req_pool_indices]
             )
-        if self.return_logprob and other.return_logprob:
-            self.top_logprobs_nums.extend(other.top_logprobs_nums)
-            self.token_ids_logprobs.extend(other.token_ids_logprobs)
-        elif self.return_logprob:
-            self.top_logprobs_nums.extend([0] * len(other.reqs))
-            self.token_ids_logprobs.extend([None] * len(other.reqs))
-        elif other.return_logprob:
-            self.top_logprobs_nums = [0] * len(self.reqs) + other.top_logprobs_nums
-            self.token_ids_logprobs = [None] * len(self.reqs) + other.token_ids_logprobs
-        self.reqs.extend(other.reqs)
+            self_info.seq_lens = np.concat([self_info.seq_lens, other_info.seq_lens])
+            self_info.out_cache_loc = None  # Will be recomputed
+            self_info.seq_lens_sum += other_info.seq_lens_sum
 
+            # Merge output_ids
+            if self_info.output_ids is not None and other_info.output_ids is not None:
+                self_info.output_ids = np.concat(
+                    [
+                        self_info.output_ids[: len(self_info.seq_lens) - len(other_info.seq_lens)],
+                        other_info.output_ids[: len(other_info.seq_lens)],
+                    ]
+                )
+
+            # Merge logprobs
+            if self.return_logprob and other.return_logprob:
+                if (
+                    self_info.top_logprobs_nums is not None
+                    and other_info.top_logprobs_nums is not None
+                ):
+                    self_info.top_logprobs_nums.extend(other_info.top_logprobs_nums)
+                    self_info.token_ids_logprobs.extend(other_info.token_ids_logprobs)
+            elif self.return_logprob and self_info.top_logprobs_nums is not None:
+                self_info.top_logprobs_nums.extend([0] * len(other_info.reqs))
+                self_info.token_ids_logprobs.extend([None] * len(other_info.reqs))
+            elif other.return_logprob and other_info.top_logprobs_nums is not None:
+                self_info.top_logprobs_nums = [0] * len(
+                    self_info.reqs
+                ) + other_info.top_logprobs_nums
+                self_info.token_ids_logprobs = [None] * len(
+                    self_info.reqs
+                ) + other_info.token_ids_logprobs
+
+            # Merge reqs list
+            self_info.reqs.extend(other_info.reqs)
+
+            # Merge spec_info
+            if self_info.spec_info and other_info.spec_info:
+                self_info.spec_info.merge_batch(other_info.spec_info)
+
+        # Update global flags
         self.return_logprob |= other.return_logprob
         self.return_output_logprob_only |= other.return_output_logprob_only
         self.has_stream |= other.has_stream
         self.has_grammar |= other.has_grammar
         self.return_hidden_states |= other.return_hidden_states
 
-        if self.spec_info:
-            self.spec_info.merge_batch(other.spec_info)
+    def _compute_global_padding_sizes(
+        self,
+        token_paddings: list,
+        bs_paddings: list,
+    ) -> tuple[int, int, int, int]:
+        """Compute global padding sizes across all DP ranks.
+
+        Returns:
+            (per_dp_token_padding, total_token_size, per_dp_bs_padding, total_bs)
+        """
+        # Find max token count and batch size across all DP ranks
+        max_tokens_per_dp = 0
+        max_bs_per_dp = 0
+
+        for dp_rank in range(self.dp_size):
+            info = self.reqs_info[dp_rank]
+            if info.input_ids is not None:
+                max_tokens_per_dp = max(max_tokens_per_dp, len(info.input_ids))
+            if info.seq_lens is not None:
+                max_bs_per_dp = max(max_bs_per_dp, len(info.seq_lens))
+
+        token_padding, _ = find_padding_size(max_tokens_per_dp * self.dp_size, token_paddings)
+        bs_padding, _ = find_padding_size(max_bs_per_dp * self.dp_size, bs_paddings)
+
+        return (
+            token_padding // self.dp_size,
+            token_padding,
+            bs_padding // self.dp_size,
+            bs_padding,
+        )
+
+    def _merge_input_and_positions(
+        self,
+        per_dp_token_size: int,
+        total_token_size: int,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, int]:
+        """Merge input_ids, positions, and out_cache_loc from all DP ranks.
+
+        Returns:
+            (input_ids, positions, out_cache_loc, real_input_ids_len)
+        """
+        input_ids_cpu = np.zeros(total_token_size, dtype=np.int32)
+        positions_cpu = np.zeros(total_token_size, dtype=np.int32)
+        out_cache_loc_cpu = np.full(total_token_size, -1, dtype=np.int32)
+
+        offset = 0
+        real_input_ids_len = 0
+
+        for dp_rank in range(self.dp_size):
+            info = self.reqs_info[dp_rank]
+
+            if info.input_ids is None or len(info.input_ids) == 0:
+                # Empty DP rank, just add padding
+                offset += per_dp_token_size
+                continue
+
+            # Get data from this DP rank
+            dp_input_ids = info.input_ids
+            dp_len = len(dp_input_ids)
+            real_input_ids_len += dp_len
+
+            # Copy data to merged array
+            input_ids_cpu[offset : offset + dp_len] = dp_input_ids
+
+            # Build positions for this DP rank
+            if self.forward_mode.is_extend():
+                # For extend: positions are [prefix_len, prefix_len+1, ..., seq_len-1] for each request
+                dp_positions = []
+                for seq_len, prefix_len in zip(info.seq_lens, info.prefix_lens):
+                    dp_positions.extend(range(prefix_len, seq_len))
+                positions_cpu[offset : offset + len(dp_positions)] = dp_positions
+            else:
+                # For decode: positions are [seq_len-1] for each request
+                dp_positions = info.seq_lens - 1
+                positions_cpu[offset : offset + len(dp_positions)] = dp_positions
+
+            # Copy out_cache_loc if available
+            if info.out_cache_loc is not None:
+                out_len = min(len(info.out_cache_loc), dp_len)
+                out_cache_loc_cpu[offset : offset + out_len] = info.out_cache_loc[:out_len]
+
+            # Move to next DP rank's section (with padding)
+            offset += per_dp_token_size
+
+        return input_ids_cpu, positions_cpu, out_cache_loc_cpu, real_input_ids_len
+
+    def _merge_batch_metadata(
+        self,
+        per_dp_bs_size: int,
+        total_bs: int,
+    ):
+        """Merge batch-level metadata from all DP ranks.
+
+        Returns:
+            (req_pool_indices, seq_lens, extend_prefix_lens,
+             extend_seq_lens, extend_logprob_start_lens, logits_indices, real_bs)
+        """
+        req_pool_indices_cpu = np.full(total_bs, -1, dtype=np.int32)
+        seq_lens_cpu = np.zeros(total_bs, dtype=np.int32)
+
+        if self.forward_mode.is_extend():
+            extend_prefix_lens = np.zeros(total_bs, dtype=np.int32)
+            extend_seq_lens = np.zeros(total_bs, dtype=np.int32)
+            extend_logprob_start_lens = np.zeros(total_bs, dtype=np.int32)
+            logits_indices = np.full(total_bs, 0, dtype=np.int32)
+        else:
+            extend_prefix_lens = None
+            extend_seq_lens = None
+            extend_logprob_start_lens = None
+            logits_indices = None
+
+        offset_bs = 0
+        real_bs = 0
+
+        for dp_rank in range(self.dp_size):
+            info = self.reqs_info[dp_rank]
+
+            if info.seq_lens is None or len(info.seq_lens) == 0:
+                # Empty DP rank
+                offset_bs += per_dp_bs_size
+                continue
+
+            # Get data from this DP rank
+            dp_bs = len(info.seq_lens)
+            real_bs += dp_bs
+
+            # Copy batch metadata
+            req_pool_indices_cpu[offset_bs : offset_bs + dp_bs] = info.req_pool_indices
+            seq_lens_cpu[offset_bs : offset_bs + dp_bs] = info.seq_lens
+
+            if self.forward_mode.is_extend():
+                # Copy extend-specific metadata
+                extend_prefix_lens[offset_bs : offset_bs + dp_bs] = info.prefix_lens
+                extend_seq_lens[offset_bs : offset_bs + dp_bs] = info.extend_lens
+                dp_extend_lens = np.array(info.extend_lens, dtype=np.int32)
+                local_last = np.cumsum(dp_extend_lens, dtype=np.int32) - 1
+                logits_indices[offset_bs : offset_bs + dp_bs] = local_last
+
+                # Copy extend_logprob_start_lens if available
+                if (
+                    hasattr(info, "extend_logprob_start_lens")
+                    and info.extend_logprob_start_lens is not None
+                ):
+                    extend_logprob_start_lens[offset_bs : offset_bs + dp_bs] = (
+                        info.extend_logprob_start_lens
+                    )
+
+            offset_bs += per_dp_bs_size
+
+        return (
+            req_pool_indices_cpu,
+            seq_lens_cpu,
+            extend_prefix_lens,
+            extend_seq_lens,
+            extend_logprob_start_lens,
+            logits_indices,
+            real_bs,
+        )
+
+    def _merge_cache_loc(
+        self,
+        bs_paddings: list,
+        cache_loc_paddings: list,
+        page_size: int,
+        per_dp_bs_size: int,
+    ) -> np.ndarray:
+        """Merge cache_loc from all DP ranks with page alignment.
+
+        Returns:
+            cache_loc array
+        """
+        # Calculate total cache_loc size needed
+        total_cache_loc_size = 0
+        if self.forward_mode.is_extend():
+            total_cache_loc_size = cache_loc_paddings[-1]  # Use largest padding
+        else:
+            # For decode mode, use the cache_loc_padding that corresponds to the bs bucket.
+            # This matches the precompile logic in tp_worker.precompile_decode() which uses:
+            #   aligned_cache_loc_size = (bs * max_req_len + page_size - 1) // page_size * page_size
+            # and precompile_cache_loc_paddings is defined as:
+            #   [bs * ((max_req_len + page_size - 1) // page_size * page_size) for bs in bs_paddings]
+            # We select cache_loc_padding based on bs bucket to match precompiled kernels.
+            total_bs = per_dp_bs_size * self.dp_size
+            _, bs_index = find_padding_size(total_bs, bs_paddings)
+            total_cache_loc_size = cache_loc_paddings[bs_index]
+
+        per_dp_cache_loc_size = total_cache_loc_size // self.dp_size
+        cache_loc_cpu = np.zeros(total_cache_loc_size, dtype=np.int32)
+
+        offset_bs = 0
+        offset_cache = 0
+
+        for dp_rank in range(self.dp_size):
+            info = self.reqs_info[dp_rank]
+
+            if info.seq_lens is None or len(info.seq_lens) == 0:
+                offset_bs += per_dp_cache_loc_size
+                continue
+
+            # Get token indices from req_to_token pool for this DP rank
+            token_indices = self.req_to_token_pool.req_to_token[info.req_pool_indices]
+
+            # Ensure we start writing at the correct offset for this DP rank
+            offset_cache = offset_bs
+
+            # Build cache_loc for each request in this DP rank
+            for i, seq_len in enumerate(info.seq_lens):
+                if seq_len > 0:
+                    # Calculate page-aligned length
+                    aligned_len = ((seq_len + page_size - 1) // page_size) * page_size
+
+                    # Safety check to prevent overflow
+                    if offset_cache + seq_len > offset_bs + per_dp_cache_loc_size:
+                        raise RuntimeError(
+                            f"Cache loc overflow in DP rank {dp_rank}. "
+                            f"Offset {offset_cache} + len {seq_len} > limit {offset_bs + per_dp_cache_loc_size}. "
+                            f"Chosen bucket size: {per_dp_cache_loc_size}"
+                        )
+
+                    # Copy actual token indices
+                    tokens_to_copy = token_indices[i, :seq_len]
+                    cache_loc_cpu[offset_cache : offset_cache + seq_len] = tokens_to_copy
+
+                    # Move to next page-aligned position
+                    offset_cache += aligned_len
+
+            # Move to next DP rank's section (fixed stride)
+            offset_bs += per_dp_cache_loc_size
+
+        return cache_loc_cpu
+
+    def _merge_sampling_info(
+        self,
+        per_dp_bs_size: int,
+        total_bs: int,
+    ) -> SamplingBatchInfo:
+        """Merge sampling info from all DP ranks.
+
+        Returns:
+            Merged SamplingBatchInfo
+        """
+        # Collect all requests for grammar support
+        all_reqs = []
+        for info in self.reqs_info:
+            if info.reqs:
+                all_reqs.extend(info.reqs)
+
+        # Initialize merged arrays (with padding)
+        temperatures = np.ones((total_bs, 1), dtype=np.float32)
+        top_ps = np.ones(total_bs, dtype=np.float32)
+        top_ks = np.ones(total_bs, dtype=np.int32)
+        min_ps = np.zeros(total_bs, dtype=np.float32)
+        sampling_seeds = None
+
+        offset_bs = 0
+        has_sampling_seeds = False
+        vocab_size = 0
+
+        for dp_rank in range(self.dp_size):
+            info = self.reqs_info[dp_rank]
+
+            if info.sampling_info is None or info.seq_lens is None or len(info.seq_lens) == 0:
+                offset_bs += per_dp_bs_size
+                continue
+
+            dp_bs = len(info.seq_lens)
+            dp_sampling = info.sampling_info
+            if vocab_size == 0:
+                vocab_size = dp_sampling.vocab_size
+
+            # Copy sampling parameters
+            temperatures[offset_bs : offset_bs + dp_bs] = dp_sampling.temperatures[:dp_bs]
+            top_ps[offset_bs : offset_bs + dp_bs] = dp_sampling.top_ps[:dp_bs]
+            top_ks[offset_bs : offset_bs + dp_bs] = dp_sampling.top_ks[:dp_bs]
+            min_ps[offset_bs : offset_bs + dp_bs] = dp_sampling.min_ps[:dp_bs]
+
+            if dp_sampling.sampling_seeds is not None:
+                if sampling_seeds is None:
+                    sampling_seeds = np.full(total_bs, DEFAULT_SAMPLING_SEED, dtype=np.int64)
+                    has_sampling_seeds = True
+                sampling_seeds[offset_bs : offset_bs + dp_bs] = dp_sampling.sampling_seeds[:dp_bs]
+
+            # Move to next DP rank's slot (fixed slot size)
+            offset_bs += per_dp_bs_size
+
+        return ModelWorkerSamplingInfo(
+            temperatures=temperatures,
+            top_ps=top_ps,
+            top_ks=top_ks,
+            min_ps=min_ps,
+            vocab_size=vocab_size,
+            sampling_seeds=sampling_seeds if has_sampling_seeds else None,
+            grammars=[req.grammar for req in all_reqs] if self.has_grammar else None,
+        )
 
     def get_model_worker_batch(
         self,
@@ -1157,268 +1821,62 @@ class ScheduleBatch:
         enable_static_lora: bool = False,
     ) -> ModelWorkerBatch:
         if self.forward_mode.is_decode_or_idle():
-            extend_seq_lens = extend_prefix_lens = extend_logprob_start_lens = None
             token_paddings = bs_paddings
         else:
-            extend_seq_lens = np.array(self.extend_lens, dtype=np.int32)
-            extend_prefix_lens = np.array(self.prefix_lens, dtype=np.int32)
             bs_paddings = bs_paddings[-1:]
             cache_loc_paddings = cache_loc_paddings[-1:]
-            extend_logprob_start_lens = self.extend_logprob_start_lens
 
         bid = acc_global_bid()
 
-        if self.input_ids is None:
-            input_ids_cpu = np.empty(0, dtype=np.int32)
-        else:
-            input_ids_cpu = self.input_ids.flatten()
-
-        real_input_ids_len = len(input_ids_cpu)
-        out_cache_loc_cpu = self.out_cache_loc
-        seq_lens_cpu = self.seq_lens
-        real_bs = len(seq_lens_cpu)
-        req_pool_indices_cpu = self.req_pool_indices
-        token_indices_with_all_reqs = self.req_to_token_pool.req_to_token[self.req_pool_indices]
-
-        # padding seq
-        # extend & decode: input_ids, positions, out_cache_loc, cache_loc
-        padding_size = 0
-        token_paddings.sort()
-        for size in token_paddings:
-            if size >= len(input_ids_cpu):
-                padding_size = size - len(input_ids_cpu)
-                break
-
-        if padding_size > 0:
-            input_ids_cpu = np.concat(
-                [
-                    input_ids_cpu,
-                    np.array([0] * padding_size, dtype=input_ids_cpu.dtype),
-                ],
-                axis=0,
-            )
-
-        padded_input_ids_len = len(input_ids_cpu)
-        out_cache_loc_num_to_padding = padded_input_ids_len - len(out_cache_loc_cpu)
-        if out_cache_loc_num_to_padding > 0:
-            out_cache_loc_cpu = np.concatenate(
-                [
-                    out_cache_loc_cpu,
-                    np.array(
-                        [-1] * out_cache_loc_num_to_padding,
-                        dtype=out_cache_loc_cpu.dtype,
-                    ),
-                ],
-                axis=0,
-            )
-
-        # Calculate positions and extend_start_loc after padding
-        if self.forward_mode.is_extend():
-            # For prefill: create positions for each token in sequences
-            # Calculate total tokens without padding first
-            total_tokens_before_padding = sum([extend_len for extend_len in self.extend_lens])
-            positions_cpu = np.concatenate(
-                [
-                    np.arange(prefix_len, seq_len, dtype=seq_lens_cpu.dtype)
-                    for seq_len, prefix_len in zip(seq_lens_cpu, self.prefix_lens)
-                ]
-            )
-
-            # If input_ids was padded, pad positions too
-            padding_size = len(input_ids_cpu) - total_tokens_before_padding
-            if padding_size:
-                positions_cpu = np.concatenate(
-                    [positions_cpu, np.zeros(padding_size, dtype=positions_cpu.dtype)]
-                )
-
-            # Start location of each sequence in the flattened array
-            extend_start_loc = np.cumsum(
-                np.concatenate([np.array([0]), extend_seq_lens[:-1]]),
-                dtype=seq_lens_cpu.dtype,
-            )
-        else:
-            # For decode: each sequence contributes one token at the next position (seq_len)
-            # Create positions for actual tokens (one per sequence at seq_len)
-            batch_positions = seq_lens_cpu - 1
-            # Create positions array matching the length of input_ids (including padding)
-            positions_cpu = np.zeros(len(input_ids_cpu), dtype=batch_positions.dtype)
-            # Fill in the actual positions for the real tokens
-            # positions = positions.at[: len(batch_positions)].set(batch_positions)
-            positions_cpu[: len(batch_positions)] = batch_positions
-            # The padding tokens (if any) will have position 0, which is fine for padding
-            # For decode, extend_start_loc is typically not used but we'll set it anyway
-            extend_start_loc = np.arange(len(seq_lens_cpu), dtype=seq_lens_cpu.dtype)
-
-        mrope_positions_cpu = _compute_mrope_positions_for_batch(
-            self.reqs,
-            self.forward_mode,
-            seq_lens_cpu,
-            len(input_ids_cpu),
-            extend_prefix_lens,
-            extend_seq_lens,
+        # Step 1: Compute global padding sizes across all DP ranks
+        per_dp_token_padding, total_token_size, per_dp_bs_padding, total_bs = (
+            self._compute_global_padding_sizes(token_paddings, bs_paddings)
         )
 
-        bs_padding_size = 0
-        bs_paddings.sort()
-        select_bs_index = -1
-        for i, size in enumerate(bs_paddings):
-            if size >= len(seq_lens_cpu):
-                bs_padding_size = size - len(seq_lens_cpu)
-                select_bs_index = i
-                break
+        # Save per_dp_bs_size for later use (e.g., in process_batch_result_decode)
+        self.per_dp_bs_size = per_dp_bs_padding
 
-        cache_loc_flat = np.array([], dtype=np.int32)
-        if len(seq_lens_cpu) > 0:
-            # Filter out empty sequences
-            valid_mask = seq_lens_cpu > 0
-            if np.any(valid_mask):
-                valid_indices = np.where(valid_mask)[0]
-                valid_seq_lens = seq_lens_cpu[valid_mask]
+        # Step 2: Merge input_ids, positions, and out_cache_loc from all DP ranks
+        input_ids_cpu, positions_cpu, out_cache_loc_cpu, real_input_ids_len = (
+            self._merge_input_and_positions(per_dp_token_padding, total_token_size)
+        )
 
-                # Calculate aligned lengths for all valid sequences at once
-                aligned_lengths = ((valid_seq_lens + page_size - 1) // page_size) * page_size
-                total_aligned_length = np.sum(aligned_lengths)
+        # Step 3: Merge batch-level metadata from all DP ranks
+        (
+            req_pool_indices_cpu,
+            seq_lens_cpu,
+            extend_prefix_lens,
+            extend_seq_lens,
+            extend_logprob_start_lens,
+            logits_indices,
+            real_bs,
+        ) = self._merge_batch_metadata(per_dp_bs_padding, total_bs)
 
-                # Pre-allocate the result array
-                cache_loc_flat = np.zeros(total_aligned_length, dtype=np.int32)
+        # Step 4: Merge cache_loc from all DP ranks
+        cache_loc_cpu = self._merge_cache_loc(
+            bs_paddings, cache_loc_paddings, page_size, per_dp_bs_padding
+        )
 
-                # Fill the array efficiently
-                offset = 0
-                for i, (seq_idx, seq_len, aligned_len) in enumerate(
-                    zip(valid_indices, valid_seq_lens, aligned_lengths)
-                ):
-                    # Copy the actual data
-                    cache_loc_flat[offset : offset + seq_len] = token_indices_with_all_reqs[
-                        seq_idx, :seq_len
-                    ]
-                    # Padding is already zero from initialization
-                    offset += aligned_len
+        # Step 5: Merge sampling info from all DP ranks
+        sampling_info = self._merge_sampling_info(per_dp_bs_padding, total_bs)
 
-        offset = np.sum(seq_lens_cpu[seq_lens_cpu > 0]) if len(seq_lens_cpu) > 0 else 0
-
-        total_cache_loc_size = cache_loc_paddings[select_bs_index]
-        assert total_cache_loc_size >= len(cache_loc_flat)
-
-        cache_loc_cpu = np.empty(total_cache_loc_size, dtype=np.int32)
-        if len(cache_loc_flat) > 0:
-            cache_loc_cpu[: len(cache_loc_flat)] = cache_loc_flat
-        # Initialize padding area to ensure multiprocess consistency
-        if len(cache_loc_flat) < total_cache_loc_size:
-            cache_loc_cpu[len(cache_loc_flat) :] = 0
-
-        if bs_padding_size > 0:
-            invalid_req_pool_indices = np.array(
-                [-1] * bs_padding_size, dtype=req_pool_indices_cpu.dtype
-            )
-            req_pool_indices_cpu = np.concat(
-                [
-                    req_pool_indices_cpu,
-                    invalid_req_pool_indices,
-                ],
-                axis=0,
-            )
-            invalid_seq_lens = np.array([0] * bs_padding_size, dtype=seq_lens_cpu.dtype)
-            seq_lens_cpu = np.concat([seq_lens_cpu, invalid_seq_lens], axis=0)
-            if self.forward_mode.is_extend():
-                invalid_extend_start_loc = np.array(
-                    [extend_start_loc[-1] + extend_seq_lens[-1]] * bs_padding_size,
-                    dtype=extend_start_loc.dtype,
-                )
-                extend_start_loc = np.concat([extend_start_loc, invalid_extend_start_loc], axis=0)
-                invalid_extend_prefix_lens = np.array(
-                    [0] * bs_padding_size, dtype=extend_prefix_lens.dtype
-                )
-                extend_prefix_lens = np.concat(
-                    [extend_prefix_lens, invalid_extend_prefix_lens], axis=0
-                )
-                invalid_extend_seq_lens = np.array(
-                    [0] * bs_padding_size, dtype=extend_seq_lens.dtype
-                )
-                extend_seq_lens = np.concat([extend_seq_lens, invalid_extend_seq_lens], axis=0)
-
-                invalid_extend_logprob_start_lens = np.array([0] * bs_padding_size, dtype=np.int32)
-                extend_logprob_start_lens = np.concat(
-                    [extend_logprob_start_lens, invalid_extend_logprob_start_lens], axis=0
-                )
-
-            else:
-                invalid_extend_start_loc = np.array(
-                    [len(seq_lens_cpu)] * bs_padding_size, dtype=extend_start_loc.dtype
-                )
-                extend_start_loc = np.concat([extend_start_loc, invalid_extend_start_loc], axis=0)
-
-        sampling_info = self.sampling_info
-        if self.sampling_info:
-            new_temperatures = np.concatenate(
-                [
-                    sampling_info.temperatures,
-                    np.array([1.0] * bs_padding_size, dtype=sampling_info.temperatures.dtype),
-                ]
-            ).reshape(-1, 1)
-            new_top_ps = np.concatenate(
-                [
-                    sampling_info.top_ps,
-                    np.array([1.0] * bs_padding_size, dtype=sampling_info.top_ps.dtype),
-                ]
-            )
-            new_top_ks = np.concatenate(
-                [
-                    sampling_info.top_ks,
-                    np.array([1] * bs_padding_size, dtype=sampling_info.top_ks.dtype),
-                ]
-            )
-            new_min_ps = np.concatenate(
-                [
-                    sampling_info.min_ps,
-                    np.array([0.0] * bs_padding_size, dtype=sampling_info.min_ps.dtype),
-                ]
-            )
-            updates = {
-                "temperatures": new_temperatures,
-                "top_ps": new_top_ps,
-                "top_ks": new_top_ks,
-                "min_ps": new_min_ps,
-                "grammars": ([req.grammar for req in self.reqs] if self.has_grammar else None),
-            }
-            if sampling_info.sampling_seeds is not None:
-                updates["sampling_seeds"] = np.concatenate(
-                    [
-                        sampling_info.sampling_seeds,
-                        np.array(
-                            [DEFAULT_SAMPLING_SEED] * bs_padding_size,
-                            dtype=sampling_info.sampling_seeds.dtype,
-                        ),
-                    ]
-                )
-            sampling_info = dataclasses.replace(sampling_info, **updates)
-
+        # Step 6: Generate trace info if needed
         if precision_tracer.get_trace_active():
             self._generate_trace_info(real_bs, bid)
 
-        # Extract lora_ids from requests
-        lora_ids = [req.lora_id for req in self.reqs]
-        # Pad lora_ids to match seq_lens_cpu length (after bs padding)
-        if bs_padding_size > 0:
-            lora_ids = lora_ids + [None] * bs_padding_size
-        input_embedding = None
-        if self.forward_mode == ForwardMode.EXTEND:
-            input_embedding_list = []
-            for req, prefix_len, extend_len in zip(self.reqs, self.prefix_lens, self.extend_lens):
-                mm_embedding = req.mm_inputs.get("multimodal_embedding") if req.mm_inputs else None
-                if mm_embedding is not None:
-                    mm_full = np.asarray(mm_embedding)
-                    start = int(prefix_len or 0)
-                    end = start + int(extend_len or 0)
-                    input_embedding_list.append(mm_full[start:end])
-            if input_embedding_list:
-                input_embedding = np.concatenate(input_embedding_list, axis=0)
-                if len(input_embedding) < len(input_ids_cpu):
-                    pad_rows = len(input_ids_cpu) - len(input_embedding)
-                    pad = np.zeros(
-                        (pad_rows, input_embedding.shape[1]),
-                        dtype=input_embedding.dtype,
-                    )
-                    input_embedding = np.concatenate([input_embedding, pad], axis=0)
+        # Step 7: Collect lora_ids from all requests
+        all_reqs = []
+        for info in self.reqs_info:
+            if info.reqs:
+                all_reqs.extend(info.reqs)
+
+        if enable_static_lora:
+            lora_ids = ["0"] * total_bs
+        else:
+            lora_ids = [req.lora_id for req in all_reqs[:real_bs]]
+            # Pad to total_bs
+            lora_ids = lora_ids + ["0"] * (total_bs - real_bs)
+
         return ModelWorkerBatch(
             bid=bid,
             forward_mode=self.forward_mode,
@@ -1429,30 +1887,24 @@ class ScheduleBatch:
             out_cache_loc=out_cache_loc_cpu,
             return_logprob=self.return_logprob,
             return_output_logprob_only=self.return_output_logprob_only,
-            top_logprobs_nums=self.top_logprobs_nums,
-            token_ids_logprobs=self.token_ids_logprobs,
+            top_logprobs_nums=None,  # TODO: @Brian pad logprob info
+            token_ids_logprobs=None,  # TODO
             sampling_info=sampling_info,
             positions=positions_cpu,
-            mrope_positions=mrope_positions_cpu,
-            extend_start_loc=extend_start_loc,
             cache_loc=cache_loc_cpu,
-            extend_prefix_lens=(
-                extend_prefix_lens if self.forward_mode == ForwardMode.EXTEND else None
-            ),
-            extend_seq_lens=(extend_seq_lens if self.forward_mode == ForwardMode.EXTEND else None),
+            extend_prefix_lens=extend_prefix_lens,
+            extend_seq_lens=extend_seq_lens,
             extend_logprob_start_lens=extend_logprob_start_lens,
-            extend_input_logprob_token_ids=self.extend_input_logprob_token_ids,
-            lora_ids=(
-                [req.lora_id for req in self.reqs] + ["0"] * bs_padding_size
-                if not enable_static_lora
-                else ["0"] * bs_paddings[select_bs_index]
-            ),
+            extend_input_logprob_token_ids=None,
+            logits_indices=logits_indices,
+            lora_ids=lora_ids,
             real_bs=real_bs,
             capture_hidden_mode=(
                 CaptureHiddenMode.FULL if self.return_hidden_states else CaptureHiddenMode.NULL
             ),
+            dp_size=self.dp_size,
+            per_dp_bs_size=per_dp_bs_padding,
             launch_done=self.launch_done,
-            input_embedding=input_embedding,
         )
 
     def get_spec_model_worker_batch(
@@ -1469,6 +1921,12 @@ class ScheduleBatch:
             extend_seq_lens = np.array(self.extend_lens, dtype=np.int32)
             extend_prefix_lens = np.array(self.prefix_lens, dtype=np.int32)
             extend_logprob_start_lens = self.extend_logprob_start_lens
+        logits_indices = None
+        if self.forward_mode.is_extend() and extend_seq_lens is not None:
+            if len(extend_seq_lens) > 0:
+                logits_indices = np.cumsum(extend_seq_lens, dtype=np.int32) - 1
+            else:
+                logits_indices = np.array([], dtype=np.int32)
 
         acc_global_bid()
 
@@ -1490,7 +1948,7 @@ class ScheduleBatch:
         else:
             positions_cpu = None
 
-        # Calculate positions and extend_start_loc after padding
+        # Calculate positions after padding
         if self.forward_mode.is_extend():
             # For prefill: create positions for each token in sequences
             # Calculate total tokens without padding first
@@ -1508,11 +1966,6 @@ class ScheduleBatch:
                     positions_cpu = positions_cpu.astype(seq_lens_cpu.dtype)
                 else:
                     positions_cpu = np.array([], dtype=seq_lens_cpu.dtype)
-            # Start location of each sequence in the flattened array
-            extend_start_loc = np.cumsum(
-                np.concatenate([np.array([0]), extend_seq_lens[:-1]]),
-                dtype=seq_lens_cpu.dtype,
-            )
         else:
             if positions_cpu is None:
                 # For decode: each sequence contributes one token at the next position (seq_len)
@@ -1524,8 +1977,6 @@ class ScheduleBatch:
                 # positions = positions.at[: len(batch_positions)].set(batch_positions)
                 positions_cpu[: len(batch_positions)] = batch_positions
                 # The padding tokens (if any) will have position 0, which is fine for padding
-                # For decode, extend_start_loc is typically not used but we'll set it anyway
-            extend_start_loc = np.arange(len(seq_lens_cpu), dtype=seq_lens_cpu.dtype)
 
         mrope_positions_cpu = _compute_mrope_positions_for_batch(
             self.reqs,
@@ -1620,12 +2071,12 @@ class ScheduleBatch:
             sampling_info=self.sampling_info,
             positions=positions_cpu,
             mrope_positions=mrope_positions_cpu,
-            extend_start_loc=extend_start_loc,
             cache_loc=cache_loc_flat,
             extend_prefix_lens=(extend_prefix_lens if self.forward_mode.is_extend() else None),
             extend_seq_lens=(extend_seq_lens if self.forward_mode.is_extend() else None),
             extend_logprob_start_lens=extend_logprob_start_lens,
             extend_input_logprob_token_ids=self.extend_input_logprob_token_ids,
+            logits_indices=logits_indices,
             lora_ids=lora_ids,
             real_bs=real_bs,
             capture_hidden_mode=(
@@ -1644,92 +2095,163 @@ class ScheduleBatch:
         )
 
     def _generate_trace_info(self, real_bs: int, bid: int) -> list[str]:
-        for req in self.reqs[:real_bs]:
-            if precision_tracer.get_trace_active():
-                # for chunked prefill trace
-                if req.fill_ids:
-                    if self.forward_mode == ForwardMode.EXTEND:
-                        input_ids_to_trace = req.fill_ids[len(req.prefix_indices) :]
-                    else:
-                        input_ids_to_trace = req.fill_ids
-                else:
-                    input_ids_to_trace = req.origin_input_ids
+        """Generate trace information for requests (unified for all dp_size >= 1)."""
+        if not precision_tracer.get_trace_active():
+            return
 
-                precision_tracer.add_request_to_batch_requests_mapping(
-                    bid,
-                    PrecisionTracerRequestMetadata(req.rid, input_ids_to_trace, self.forward_mode),
-                )
+        # Collect all requests from all DP ranks
+        all_reqs = []
+        for info in self.reqs_info:
+            if info.reqs:
+                all_reqs.extend(info.reqs)
+
+        # Process first real_bs requests (real_bs limits to actual requests before padding)
+        for req in all_reqs[:real_bs]:
+            # for chunked prefill trace
+            if req.fill_ids:
                 if self.forward_mode == ForwardMode.EXTEND:
-                    precision_tracer.add_request_counter()
-                    logger.info(
-                        "Starting trace for request %d: %s",
-                        precision_tracer.get_request_counter(),
-                        req.rid,
-                    )
+                    input_ids_to_trace = req.fill_ids[len(req.prefix_indices) :]
+                else:
+                    input_ids_to_trace = req.fill_ids
+            else:
+                input_ids_to_trace = req.origin_input_ids
+
+            precision_tracer.add_request_to_batch_requests_mapping(
+                bid,
+                PrecisionTracerRequestMetadata(req.rid, input_ids_to_trace, self.forward_mode),
+            )
+            if self.forward_mode == ForwardMode.EXTEND:
+                precision_tracer.add_request_counter()
+                logger.info(
+                    "Starting trace for request %d: %s",
+                    precision_tracer.get_request_counter(),
+                    req.rid,
+                )
 
     def copy(self):
-        # Only contain fields that will be used by process_batch_result
+        """Create a shallow copy of this batch.
+
+        Only contain fields that will be used by process_batch_result.
+        """
+        # Copy reqs_info for each DP rank
+        copied_reqs_info = []
+        for info in self.reqs_info:
+            # Create a new ScheduleReqsInfo with shallow copies of necessary fields
+            new_info = ScheduleReqsInfo()
+            new_info.reqs = info.reqs  # Shallow copy (list reference)
+            new_info.out_cache_loc = info.out_cache_loc
+            new_info.decoding_reqs = info.decoding_reqs
+            copied_reqs_info.append(new_info)
+
         return ScheduleBatch(
-            reqs=self.reqs,
+            reqs_info=copied_reqs_info,
             model_config=self.model_config,
             forward_mode=self.forward_mode,
-            out_cache_loc=self.out_cache_loc,
             return_logprob=self.return_logprob,
             return_output_logprob_only=self.return_output_logprob_only,
-            decoding_reqs=self.decoding_reqs,
             is_prefill_only=self.is_prefill_only,
             bid=self.bid,
+            dp_size=self.dp_size,
+            per_dp_bs_size=self.per_dp_bs_size,
         )
 
-    def _evict_tree_cache_if_needed(
-        self,
-        num_tokens: int,
-    ) -> None:
+    def _evict_tree_cache_if_needed(self, num_tokens_per_dp: dict[int, int]) -> None:
+        """Evict from tree cache if needed for any DP rank.
+
+        Per-DP aware implementation. Tree cache is global, eviction affects all DP ranks.
+
+        Args:
+            num_tokens_per_dp: Dict mapping dp_rank to tokens needed for that rank
+        """
         if isinstance(self.tree_cache, ChunkCache):
             return
 
-        if self.is_hybrid:
-            full_available_size = self.token_to_kv_pool_allocator.full_available_size()
-            swa_available_size = self.token_to_kv_pool_allocator.swa_available_size()
+        # Per-DP loop
+        for dp_rank, num_tokens in num_tokens_per_dp.items():
+            if self.is_hybrid:
+                full_available = self.token_to_kv_pool_allocator.full_available_size(
+                    dp_rank=dp_rank
+                )
+                swa_available = self.token_to_kv_pool_allocator.swa_available_size(dp_rank=dp_rank)
 
-            if (
-                full_available_size < num_tokens or swa_available_size < num_tokens
-            ) and self.tree_cache is not None:
-                full_num_tokens = max(0, num_tokens - full_available_size)
-                swa_num_tokens = max(0, num_tokens - swa_available_size)
-                self.tree_cache.evict(full_num_tokens, swa_num_tokens)
-        else:
-            if (
-                self.token_to_kv_pool_allocator.available_size() < num_tokens
-                and self.tree_cache is not None
-            ):
-                self.tree_cache.evict(num_tokens)
+                if (full_available < num_tokens or swa_available < num_tokens) and self.tree_cache:
+                    full_num = max(0, num_tokens - full_available)
+                    swa_num = max(0, num_tokens - swa_available)
+                    self.tree_cache.evict(full_num, swa_num, dp_rank=dp_rank)
+            else:
+                available = self.token_to_kv_pool_allocator.available_size(dp_rank=dp_rank)
+                if available < num_tokens and self.tree_cache:
+                    self.tree_cache.evict(num_tokens, dp_rank=dp_rank)
 
-    def _is_available_size_sufficient(self, num_tokens: int) -> bool:
-        if self.is_hybrid:
-            return (
-                self.token_to_kv_pool_allocator.full_available_size() >= num_tokens
-                and self.token_to_kv_pool_allocator.swa_available_size() >= num_tokens
-            )
-        else:
-            return self.token_to_kv_pool_allocator.available_size() >= num_tokens
+    def _is_available_size_sufficient(self, num_tokens_per_dp: dict[int, int]) -> bool:
+        """Check if sufficient memory available across all DP ranks.
+
+        Per-DP aware implementation. Returns False if ANY DP rank has insufficient memory.
+
+        Args:
+            num_tokens_per_dp: Dict mapping dp_rank to tokens needed for that rank
+
+        Returns:
+            True if all DP ranks have sufficient memory, False otherwise.
+        """
+        for dp_rank, num_tokens in num_tokens_per_dp.items():
+            if self.is_hybrid:
+                full_ok = (
+                    self.token_to_kv_pool_allocator.full_available_size(dp_rank=dp_rank)
+                    >= num_tokens
+                )
+                swa_ok = (
+                    self.token_to_kv_pool_allocator.swa_available_size(dp_rank=dp_rank)
+                    >= num_tokens
+                )
+                if not (full_ok and swa_ok):
+                    return False
+            else:
+                if self.token_to_kv_pool_allocator.available_size(dp_rank=dp_rank) < num_tokens:
+                    return False
+
+        return True
 
     def _available_and_evictable_str(self) -> str:
-        if self.is_hybrid:
-            full_available_size = self.token_to_kv_pool_allocator.full_available_size()
-            swa_available_size = self.token_to_kv_pool_allocator.swa_available_size()
-            full_evictable_size = self.tree_cache.full_evictable_size()
-            swa_evictable_size = self.tree_cache.swa_evictable_size()
-            return (
-                f"Available full tokens: {full_available_size + full_evictable_size} ({full_available_size=} + {full_evictable_size=})\n"
-                f"Available swa tokens: {swa_available_size + swa_evictable_size} ({swa_available_size=} + {swa_evictable_size=})\n"
-                f"Full LRU list evictable size: {self.tree_cache.full_lru_list_evictable_size()}\n"
-                f"SWA LRU list evictable size: {self.tree_cache.swa_lru_list_evictable_size()}\n"
-            )
-        else:
-            available_size = self.token_to_kv_pool_allocator.available_size()
-            evictable_size = self.tree_cache.evictable_size()
-            return f"Available tokens: {available_size + evictable_size} ({available_size=} + {evictable_size=})\n"
+        """Get debug string for available and evictable memory (unified for all dp_size >= 1)."""
+        # Collect all DP ranks that have requests
+        dp_ranks_with_reqs = set()
+        for dp_rank, info in enumerate(self.reqs_info):
+            if info.reqs and len(info.reqs) > 0:
+                dp_ranks_with_reqs.add(dp_rank)
+
+        # If no requests at all, default to showing dp_rank 0
+        if not dp_ranks_with_reqs:
+            dp_ranks_with_reqs.add(0)
+
+        result_strs = []
+        for dp_rank in sorted(dp_ranks_with_reqs):
+            # Prefix for multi-DP output
+            prefix = f"[DP rank {dp_rank}] " if self.dp_size > 1 else ""
+
+            if self.is_hybrid:
+                full_available_size = self.token_to_kv_pool_allocator.full_available_size(
+                    dp_rank=dp_rank
+                )
+                swa_available_size = self.token_to_kv_pool_allocator.swa_available_size(
+                    dp_rank=dp_rank
+                )
+                full_evictable_size = self.tree_cache.full_evictable_size(dp_rank=dp_rank)
+                swa_evictable_size = self.tree_cache.swa_evictable_size(dp_rank=dp_rank)
+                result_strs.append(
+                    f"{prefix}Available full tokens: {full_available_size + full_evictable_size} ({full_available_size=} + {full_evictable_size=})\n"
+                    f"{prefix}Available swa tokens: {swa_available_size + swa_evictable_size} ({swa_available_size=} + {swa_evictable_size=})\n"
+                    f"{prefix}Full LRU list evictable size: {self.tree_cache.full_lru_list_evictable_size()}\n"
+                    f"{prefix}SWA LRU list evictable size: {self.tree_cache.swa_lru_list_evictable_size()}\n"
+                )
+            else:
+                available_size = self.token_to_kv_pool_allocator.available_size(dp_rank=dp_rank)
+                evictable_size = self.tree_cache.evictable_size(dp_rank=dp_rank)
+                result_strs.append(
+                    f"{prefix}Available tokens: {available_size + evictable_size} ({available_size=} + {evictable_size=})\n"
+                )
+
+        return "".join(result_strs)
 
 
 def align_to_size(lst: list, size: int, value: int = 0) -> list:
@@ -1833,6 +2355,162 @@ def _compute_mrope_positions_for_batch(
         mrope_positions = np.concatenate([mrope_positions, pad], axis=1)
     return mrope_positions
 
+def find_padding_size(current_len: int, size_buckets: list[int]) -> tuple[int, int]:
+    """Find appropriate padding size from sorted size buckets.
+
+    Args:
+        current_len: Current length of the array
+        size_buckets: Sorted list of size buckets
+
+    Returns:
+        (target_size, index): Target size (bucket size) and index in sorted size_buckets
+
+    Raises:
+        AssertionError: If current_len exceeds all available buckets
+    """
+    size_buckets_sorted = sorted(size_buckets)
+    for index, size in enumerate(size_buckets_sorted):
+        if size >= current_len:
+            return size, index
+
+    # No suitable bucket found - this is a configuration error
+    raise AssertionError(
+        f"No suitable padding bucket found for length {current_len}. "
+        f"Available buckets: {size_buckets_sorted}. "
+        f"Please increase bucket sizes in configuration."
+    )
+
+
+def pad_array_to_size(
+    arr: np.ndarray, target_size: int, pad_value: int = 0, dtype: np.dtype = None
+) -> np.ndarray:
+    """Pad numpy array to target size.
+
+    Args:
+        arr: Array to pad
+        target_size: Target size after padding
+        pad_value: Value to use for padding
+        dtype: Data type for padding values (defaults to arr.dtype)
+
+    Returns:
+        Padded array
+    """
+    if len(arr) >= target_size:
+        return arr
+
+    if dtype is None:
+        dtype = arr.dtype
+
+    padding_size = target_size - len(arr)
+    padding = np.array([pad_value] * padding_size, dtype=dtype)
+    return np.concatenate([arr, padding], axis=0)
+
+
+@dataclasses.dataclass
+class ModelWorkerSamplingInfo:
+    """Unified sampling information for a generation batch."""
+
+    # Basic batched sampling params
+    temperatures: np.ndarray
+    top_ps: np.ndarray
+    top_ks: np.ndarray
+    min_ps: np.ndarray
+
+    vocab_size: int
+
+    # Whether all requests use greedy sampling
+    is_all_greedy: bool = False
+
+    # Whether any requests use top_p sampling
+    need_top_p_sampling: bool = False
+
+    # Whether any requests use top_k sampling
+    need_top_k_sampling: bool = False
+
+    # Whether any request needs min_p sampling
+    need_min_p_sampling: bool = False
+
+    # An event used for overlap schedule
+    sampling_info_done: threading.Event | None = None
+
+    sampling_seeds: np.ndarray | None = None
+
+    linear_penalty: np.ndarray | None = None
+
+    penalizer_orchestrator: Any | None = None
+
+    grammars: list | None = None  # list[BaseGrammarObject | None]
+    vocab_mask: np.ndarray | None = None  # Shape: [batch_size, vocab_size // 32]
+
+    @classmethod
+    def generate_for_precompile(
+        cls,
+        bs: int,
+        vocab_size: int = 32000,
+    ):
+        temperatures = np.array([0.6 for _ in range(bs)], dtype=np.float32)
+        top_ps = np.array([0.9 for _ in range(bs)], dtype=np.float32)
+        top_ks = np.array([30 for _ in range(bs)], dtype=np.int32)
+        min_ps = np.array([0.6 for _ in range(bs)], dtype=np.float32)
+        if get_bool_env_var("SGLANG_ENABLE_DETERMINISTIC_SAMPLING"):
+            sampling_seeds = np.array([DEFAULT_SAMPLING_SEED for _ in range(bs)], dtype=np.int32)
+        else:
+            sampling_seeds = None
+
+        num_int32_per_vocab = (vocab_size + 31) // 32
+        vocab_mask = np.zeros((bs, num_int32_per_vocab), dtype=np.int32)
+
+        ret = cls(
+            temperatures=temperatures.reshape(-1, 1),
+            top_ps=top_ps,
+            top_ks=top_ks,
+            min_ps=min_ps,
+            vocab_size=vocab_size,
+            is_all_greedy=False,
+            need_top_p_sampling=False,
+            need_top_k_sampling=True,
+            need_min_p_sampling=True,
+            sampling_info_done=None,
+            sampling_seeds=sampling_seeds,
+            penalizer_orchestrator=None,
+            linear_penalty=None,
+            vocab_mask=vocab_mask,
+        )
+        return ret
+
+    @classmethod
+    def generate_for_precompile_all_greedy(
+        cls, bs: int, vocab_size: int = 32000, do_penalties: bool = False
+    ):
+        temperatures = np.array([0.0 for _ in range(bs)], dtype=np.float32)
+        top_ps = np.array([1.0 for _ in range(bs)], dtype=np.float32)
+        top_ks = np.array([1 for _ in range(bs)], dtype=np.int32)
+        min_ps = np.array([1.0 for _ in range(bs)], dtype=np.float32)
+        if get_bool_env_var("SGLANG_ENABLE_DETERMINISTIC_SAMPLING"):
+            sampling_seeds = np.array([DEFAULT_SAMPLING_SEED for _ in range(bs)], dtype=np.int32)
+        else:
+            sampling_seeds = None
+
+        ret = cls(
+            temperatures=temperatures.reshape(-1, 1),
+            top_ps=top_ps,
+            top_ks=top_ks,
+            min_ps=min_ps,
+            vocab_size=vocab_size,
+            is_all_greedy=True,
+            need_top_p_sampling=False,
+            need_top_k_sampling=True,
+            need_min_p_sampling=True,
+            sampling_info_done=None,
+            sampling_seeds=sampling_seeds,
+            penalizer_orchestrator=None,
+            linear_penalty=None,
+        )
+        return ret
+
+    def update_penalties(self):
+        self.linear_penalty = None
+
 
 @dataclasses.dataclass
 class ModelWorkerBatch:
@@ -1851,11 +2529,9 @@ class ModelWorkerBatch:
     # The indices of requests in the req_to_token_pool
     req_pool_indices: np.ndarray
     # Sampling info
-    sampling_info: SamplingBatchInfo
+    sampling_info: ModelWorkerSamplingInfo
     # Position information [total_tokens]
     positions: np.ndarray
-    # Start position for each sequence in extend mode [batch_size]
-    extend_start_loc: np.ndarray
     # cache_loc
     cache_loc: np.ndarray
 
@@ -1871,9 +2547,14 @@ class ModelWorkerBatch:
     extend_prefix_lens: np.ndarray | None
     extend_logprob_start_lens: list[int] | None
     extend_input_logprob_token_ids: np.ndarray | None
+    logits_indices: np.ndarray | None
 
     # For padding
     real_bs: int
+
+    # For Data Parallelism
+    dp_size: int = 1
+    per_dp_bs_size: int = 0  # Batch size per DP rank (with padding)
 
     # For LoRA
     lora_ids: list[str] | None = None
@@ -1923,16 +2604,6 @@ class ModelWorkerBatch:
 
 
 def get_last_loc(
-    req_to_token: np.ndarray,
-    req_pool_indices: np.ndarray,
-    prefix_lens: np.ndarray,
-) -> np.ndarray:
-    impl = get_last_loc_jax
-
-    return impl(req_to_token, req_pool_indices, prefix_lens)
-
-
-def get_last_loc_jax(
     req_to_token: np.ndarray,
     req_pool_indices: np.ndarray,
     prefix_lens: np.ndarray,

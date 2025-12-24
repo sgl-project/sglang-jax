@@ -57,6 +57,7 @@ class ModelRunner(BaseModelRunner):
         model_config: ModelConfig,
         mem_fraction_static: float,
         tp_size: int,
+        dp_size: int,
         server_args: ServerArgs,
         mesh: jax.sharding.Mesh,
         is_draft_worker: bool = False,
@@ -74,10 +75,14 @@ class ModelRunner(BaseModelRunner):
         self.mesh = mesh
         # model args
         self.num_attn_heads = model_config.num_attention_heads
-        self.num_kv_heads = model_config.get_total_num_kv_heads_with_replication(tp_size)
         self.rngs = rngs
 
         self.tp_size = tp_size
+        self.dp_size = dp_size
+        self.attention_tp_size = self.tp_size // self.dp_size
+        self.num_kv_heads = model_config.get_total_num_kv_heads_with_replication(
+            self.attention_tp_size
+        )
         self.ep_size = server_args.ep_size
         self.server_args = server_args
         self.is_generation = model_config.is_generation
@@ -154,6 +159,7 @@ class ModelRunner(BaseModelRunner):
             server_args.max_running_requests,
             server_args.max_total_tokens,
             total_device_memory,
+            dp_size=server_args.dp_size,
         )
 
         # Init routed experts capturer
@@ -271,9 +277,9 @@ class ModelRunner(BaseModelRunner):
         return min_available_device_memory
 
     def load_model(self):
-        self.model_config.validate_tensor_parallel_config(self.tp_size)
-        self.model_config.configure_for_tensor_parallel(self.tp_size)
-        self.model_config.log_kv_heads_info(self.tp_size)
+        self.model_config.validate_tensor_parallel_config(self.attention_tp_size)
+        self.model_config.configure_for_tensor_parallel(self.attention_tp_size)
+        self.model_config.log_kv_heads_info(self.attention_tp_size)
         self.model_config.hf_config.ep_size = self.ep_size
         self.model_config.hf_config.moe_backend = self.model_config.moe_backend.value
         self.model = self.model_loader.load_model(
@@ -345,7 +351,7 @@ class ModelRunner(BaseModelRunner):
         if head_dim_aligned % 128 != 0:
             head_dim_aligned = (self.model_config.head_dim + 127) // 128 * 128
         cell_size = (
-            self.model_config.get_num_kv_heads(self.tp_size)
+            self.model_config.get_num_kv_heads(self.attention_tp_size)
             * head_dim_aligned
             * self.model_config.num_hidden_layers
             * 2
@@ -377,6 +383,7 @@ class ModelRunner(BaseModelRunner):
         max_num_reqs: int | None = None,
         max_total_tokens: int | None = None,
         total_device_memory: int | None = None,
+        dp_size: int = 1,
     ):
         """Initialize memory pool for KV cache."""
         # Set KV cache data type
@@ -443,6 +450,13 @@ class ModelRunner(BaseModelRunner):
             self.max_total_num_tokens // self.server_args.page_size * self.server_args.page_size
         )
 
+        self.max_total_num_tokens = self.max_total_num_tokens * dp_size
+        logger.info(
+            "ModelRunner per dp max_total_num_tokens after dp_size %s: %s",
+            dp_size,
+            self.max_total_num_tokens,
+        )
+
         # create token size for hybrid cache
         if self.is_hybrid:
             self.set_num_token_hybrid()
@@ -450,7 +464,7 @@ class ModelRunner(BaseModelRunner):
         if self.max_total_num_tokens <= 0:
             raise RuntimeError("Not enough memory. Please try to increase --mem-fraction-static.")
 
-        logger.info("ModelRunner max_total_num_tokens: %s", self.max_total_num_tokens)
+        logger.info("ModelRunner final max_total_num_tokens: %s", self.max_total_num_tokens)
 
         # Create request to token pool if not already created
         if self.req_to_token_pool is None:
@@ -462,13 +476,15 @@ class ModelRunner(BaseModelRunner):
 
         # Create KV cache pool
         if self.is_hybrid:
-            self.token_to_kv_pool = SWAKVPool(
+            self.token_to_kv_pool = SWAKVPool(  # TODO @Brian dp in swa
                 size=self.full_max_total_num_tokens,
                 size_swa=self.swa_max_total_num_tokens,
                 swa_attention_layer_ids=self.model_config.swa_attention_layer_ids,
                 full_attention_layer_ids=self.model_config.full_attention_layer_ids,
                 dtype=self.kv_cache_dtype,
-                head_num=self.model_config.get_total_num_kv_heads_with_replication(self.tp_size),
+                head_num=self.model_config.get_total_num_kv_heads_with_replication(
+                    self.attention_tp_size
+                ),
                 head_dim=self.model_config.head_dim,
                 mesh=self.mesh,
             )
@@ -477,10 +493,13 @@ class ModelRunner(BaseModelRunner):
                 size=self.max_total_num_tokens,
                 page_size=self.page_size,
                 dtype=self.kv_cache_dtype,
-                head_num=self.model_config.get_total_num_kv_heads_with_replication(self.tp_size),
+                head_num=self.model_config.get_total_num_kv_heads_with_replication(
+                    self.attention_tp_size
+                ),
                 head_dim=(self.model_config.head_dim + 127) // 128 * 128,
                 layer_num=self.model_config.num_hidden_layers,
                 mesh=self.mesh,
+                dp_size=dp_size,
             )
 
         # Create KV pool allocator
@@ -491,19 +510,24 @@ class ModelRunner(BaseModelRunner):
                         self.full_max_total_num_tokens,
                         self.swa_max_total_num_tokens,
                         kvcache=self.token_to_kv_pool,
+                        dp_size=dp_size,
                     )
                 else:
                     self.token_to_kv_pool_allocator = TokenToKVPoolAllocator(
                         size=self.max_total_num_tokens,
                         kvcache=self.token_to_kv_pool,
+                        dp_size=dp_size,
                     )
             else:
-                assert not self.is_hybrid
+                assert (
+                    not self.is_hybrid
+                ), f"model_runner: is_hybrid should be False in non-DP mode, got is_hybrid={self.is_hybrid}"
                 self.token_to_kv_pool_allocator = PagedTokenToKVPoolAllocator(
                     size=self.max_total_num_tokens,
                     page_size=self.page_size,
                     kvcache=self.token_to_kv_pool,
                     debug_mode=False,
+                    dp_size=dp_size,
                 )
 
     def init_attention_backend(self):
@@ -564,7 +588,11 @@ class ModelRunner(BaseModelRunner):
         if self.tp_size == 1:
             target_sharding = NamedSharding(
                 self.token_to_kv_pool.mesh,
-                P(None, self.token_to_kv_pool.kv_partition_axis, None),
+                P(
+                    self.token_to_kv_pool.attention_data_partition_axis,
+                    self.token_to_kv_pool.kv_partition_axis,
+                    None,
+                ),
             )
             layers_kv_fused = [
                 jax.device_put(layer_kv_fused, target_sharding)
@@ -726,13 +754,17 @@ class MockModelRunner(ModelRunner):
     ):
         self.server_args = server_args
         self.tp_size = server_args.tp_size
+        self.dp_size = server_args.dp_size
+        self.attention_tp_size = self.tp_size // self.dp_size
 
         if isinstance(model_config, MockModelConfig):
             self.num_kv_heads = model_config.num_kv_heads
             self.num_attn_heads = model_config.num_heads
             self.rngs = rngs
         else:
-            self.num_kv_heads = model_config.get_total_num_kv_heads_with_replication(self.tp_size)
+            self.num_kv_heads = model_config.get_total_num_kv_heads_with_replication(
+                self.attention_tp_size
+            )
             self.num_attn_heads = model_config.num_attention_heads
             self.rngs = rngs
 
@@ -746,7 +778,7 @@ class MockModelRunner(ModelRunner):
 
         # Validate tensor parallel configuration for MockModelRunner too
         if not isinstance(model_config, MockModelConfig):
-            self.model_config.validate_tensor_parallel_config(self.tp_size)
+            self.model_config.validate_tensor_parallel_config(self.attention_tp_size)
 
         # If it is a draft model, tp_group can be different
         max_num_reqs = min(
@@ -766,7 +798,9 @@ class MockModelRunner(ModelRunner):
             size=self.max_total_num_tokens,
             page_size=self.page_size,
             dtype=self.kv_cache_dtype,
-            head_num=self.model_config.get_total_num_kv_heads_with_replication(self.tp_size),
+            head_num=self.model_config.get_total_num_kv_heads_with_replication(
+                self.attention_tp_size
+            ),
             head_dim=(self.model_config.head_dim + 127) // 128 * 128,
             layer_num=self.model_config.num_hidden_layers,
             mesh=mesh,
