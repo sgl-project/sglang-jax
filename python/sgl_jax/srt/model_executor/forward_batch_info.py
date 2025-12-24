@@ -150,8 +150,6 @@ class ForwardBatch:
     out_cache_loc: jax.Array
     # Position information [total_tokens]
     positions: jax.Array = None
-    # Start position for each sequence in extend mode [batch_size]
-    extend_start_loc: jax.Array = None
 
     attn_backend: AttentionBackend = None
 
@@ -187,7 +185,6 @@ class ForwardBatch:
             self.seq_lens,
             self.out_cache_loc,
             self.positions,
-            self.extend_start_loc,
             self.attn_backend,
             self.cache_loc,
             self.extend_prefix_lens,
@@ -226,16 +223,14 @@ class ForwardBatch:
         obj.seq_lens = children[2]
         obj.out_cache_loc = children[3]
         obj.positions = children[4]
-        obj.extend_start_loc = children[5]
-        obj.attn_backend = children[6]
-        obj.cache_loc = children[7]
-        obj.extend_prefix_lens = children[8]
-        obj.extend_seq_lens = children[9]
-        obj.lora_scalings = children[10]
-        obj.lora_token_indices = children[11]
-        obj.lora_ranks = children[12]
-        obj.spec_info = children[13]
-
+        obj.attn_backend = children[5]
+        obj.cache_loc = children[6]
+        obj.extend_prefix_lens = children[7]
+        obj.extend_seq_lens = children[8]
+        obj.lora_scalings = children[9]
+        obj.lora_token_indices = children[10]
+        obj.lora_ranks = children[11]
+        obj.spec_info = children[12]
         # Handle optional children for backward compatibility
         obj.attention_mask = children[14] if len(children) > 14 else None
         obj.input_embedding = children[15] if len(children) > 15 else None
@@ -251,7 +246,6 @@ class ForwardBatch:
             "seq_lens",
             "out_cache_loc",
             "positions",
-            "extend_start_loc",
             "cache_loc",
             "extend_prefix_lens",
             "extend_seq_lens",
@@ -290,7 +284,6 @@ class ForwardBatch:
             seq_lens,
             out_cache_loc,
             positions,
-            extend_start_loc,
             req_pool_indices,
             cache_loc,
             extend_prefix_lens,
@@ -301,14 +294,13 @@ class ForwardBatch:
                 batch.seq_lens,
                 batch.out_cache_loc,
                 batch.positions,
-                batch.extend_start_loc,
                 batch.req_pool_indices,
                 batch.cache_loc,
                 batch.extend_prefix_lens,
                 batch.extend_seq_lens,
             ),
             sharding=(
-                NamedSharding(model_runner.mesh, PartitionSpec())
+                NamedSharding(model_runner.mesh, PartitionSpec("data"))
                 if jax.process_count() == 1
                 else None
             ),
@@ -336,7 +328,7 @@ class ForwardBatch:
                     batch.lora_ranks,
                 ),
                 sharding=(
-                    NamedSharding(model_runner.mesh, PartitionSpec())
+                    NamedSharding(model_runner.mesh, PartitionSpec("data"))
                     if jax.process_count() == 1
                     else None
                 ),
@@ -356,7 +348,6 @@ class ForwardBatch:
             seq_lens=seq_lens,
             out_cache_loc=out_cache_loc,
             positions=positions,
-            extend_start_loc=extend_start_loc,
             req_pool_indices=req_pool_indices,
             cache_loc=cache_loc,
             extend_prefix_lens=extend_prefix_lens,
