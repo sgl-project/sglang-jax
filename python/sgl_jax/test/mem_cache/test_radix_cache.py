@@ -553,6 +553,7 @@ class MockRequest:
         prefix_indices,
         last_node,
         extra_key=None,
+        dp_rank=None,
     ):
         self.req_pool_idx = req_pool_idx
         self.origin_input_ids = origin_input_ids
@@ -561,6 +562,7 @@ class MockRequest:
         self.prefix_indices = prefix_indices
         self.last_node = last_node
         self.extra_key = extra_key
+        self.dp_rank = dp_rank
 
 
 class TestRadixCacheWithRequests(unittest.TestCase):
