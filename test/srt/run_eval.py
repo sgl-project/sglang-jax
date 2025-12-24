@@ -48,6 +48,10 @@ def run_eval(args):
         from eval.simple_eval_humaneval import HumanEval
 
         eval_obj = HumanEval(args.num_examples, args.num_threads)
+    elif args.eval_name == "gsm8k":
+        from eval.simple_eval_gsm8k import GSM8KEval
+
+        eval_obj = GSM8KEval(args.num_examples, args.num_threads)
     else:
         raise ValueError(f"Invalid eval name: {args.eval_name}")
 

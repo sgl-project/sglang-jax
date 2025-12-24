@@ -28,7 +28,6 @@ class LinearBase(nnx.Module):
         use_bias: If true, add bias.
         skip_bias_add: If true, skip adding bias but instead return it.
         params_dtype: Data type for the parameters.
-        quant_config: Quantization configure.
         partition_spec: Partition spec for the linear layer.
     """
 

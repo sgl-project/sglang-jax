@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+import gc
 from collections import defaultdict
 from typing import Any
 
@@ -108,6 +109,7 @@ def get_available_device_memory(device, distributed=False, empty_cache=True):
     if device == "tpu":
         devices = jax.local_devices()
         if empty_cache:
+            gc.collect()  # collect garbage to free up memory used by quantization
             jax.clear_caches()
         avail_mem = []
         for dev in devices:

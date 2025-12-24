@@ -43,6 +43,7 @@ class ModelConfig:
         is_draft_model: bool = False,
         model_impl: str | ModelImpl = ModelImpl.AUTO,
         quantization: str | None = None,
+        quantization_config_path: str | None = None,
         model_layer_nums: int | None = None,
     ) -> None:
 
@@ -50,6 +51,7 @@ class ModelConfig:
         self.revision = revision
         self.model_impl = model_impl
         self.quantization = quantization
+        self.quantization_config_path = quantization_config_path
         # if ep_size > 1, use ep moe, else use fused moe
         # TODO: support ep moe with ETP
         self.ep_size = 1
@@ -174,6 +176,7 @@ class ModelConfig:
             is_embedding=server_args.is_embedding,
             dtype=server_args.dtype,
             quantization=server_args.quantization,
+            quantization_config_path=server_args.quantization_config_path,
             model_impl=server_args.model_impl,
             model_layer_nums=server_args.model_layer_nums,
             **kwargs,
