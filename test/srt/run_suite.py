@@ -331,6 +331,7 @@ suites = {
         TestFile("test/srt/test_chunked_prefill_size.py", 4),
         # TestFile("test/srt/test_sliding_window_attention.py", 30), # add after gpt-oss supported
         TestFile("test/srt/test_model_loader.py", 2),
+        TestFile("test/srt/quantization/test_w8_quantization.py", 10),
     ],
 }
 

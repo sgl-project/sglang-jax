@@ -40,6 +40,7 @@ from sgl_jax.srt.server_args import ServerArgs
 from sgl_jax.srt.speculative.spec_info import SpeculativeAlgorithm
 from sgl_jax.srt.utils.common_utils import get_bool_env_var
 from sgl_jax.srt.utils.jax_utils import get_available_device_memory
+from sgl_jax.srt.utils.quantization.quantization_utils import apply_qwix_quantization
 
 logger = logging.getLogger(__name__)
 
@@ -134,6 +135,7 @@ class ModelRunner:
         # Load the model
         self.sampler = Sampler(nnx.Rngs(server_args.random_seed), mesh=self.mesh)
         total_device_memory = self.get_available_device_memory()
+        self.init_attention_backend()
         self.load_model()
 
         # Check if the model is using hybrid SWA
@@ -157,8 +159,6 @@ class ModelRunner:
             server_args.max_total_tokens,
             total_device_memory,
         )
-
-        self.init_attention_backend()
 
     def initialize_jit(self):
         model_def, model_state = nnx.split(self.model)
@@ -257,6 +257,9 @@ class ModelRunner:
         self.model = self.model_loader.load_model(
             model_config=self.model_config,
         )
+
+        if self.model_config.quantization_config_path is not None:
+            self.model = apply_qwix_quantization(self.model_config, self.model, self)
 
         # Parse other args
         self.sliding_window_size = self.model_config.sliding_window
