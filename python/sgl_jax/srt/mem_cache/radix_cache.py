@@ -276,13 +276,14 @@ class RadixCache(BasePrefixCache):
     def cache_finished_req(self, req: Req):
         """Cache completed requests"""
         all_token_len = len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0)
+        dp_rank = req.dp_rank if req.dp_rank is not None else 0
         if self.disable:
             kv_indices = self.req_to_token_pool.read(
                 req.req_pool_idx,
                 all_token_len,
             )
             kv_indices = kv_indices[kv_indices != 0]
-            self.token_to_kv_pool_allocator.free(kv_indices)
+            self.token_to_kv_pool_allocator.free(kv_indices, dp_rank=dp_rank)
             self.req_to_token_pool.free(req.req_pool_idx)
             return
 
@@ -296,7 +297,7 @@ class RadixCache(BasePrefixCache):
         if self.page_size != 1:
             page_aligned_len = actual_kv_len // self.page_size * self.page_size
             page_aligned_kv_indices = kv_indices[:page_aligned_len].copy()
-            self.token_to_kv_pool_allocator.free(kv_indices[page_aligned_len:])
+            self.token_to_kv_pool_allocator.free(kv_indices[page_aligned_len:], dp_rank=dp_rank)
         else:
             page_aligned_len = actual_kv_len
             page_aligned_kv_indices = kv_indices[:page_aligned_len].copy()
@@ -314,9 +315,11 @@ class RadixCache(BasePrefixCache):
             page_aligned_kv_indices,
         )
 
-        self.token_to_kv_pool_allocator.free(kv_indices[old_prefix_len:new_prefix_len])
+        self.token_to_kv_pool_allocator.free(
+            kv_indices[old_prefix_len:new_prefix_len], dp_rank=dp_rank
+        )
         # free the unaligned tail
-        self.token_to_kv_pool_allocator.free(kv_indices[page_aligned_len:])
+        self.token_to_kv_pool_allocator.free(kv_indices[page_aligned_len:], dp_rank=dp_rank)
 
         # Remove request slot and release cache lock
         self.req_to_token_pool.free(req.req_pool_idx)
@@ -327,6 +330,7 @@ class RadixCache(BasePrefixCache):
         if self.disable:
             return
 
+        dp_rank = req.dp_rank if req.dp_rank is not None else 0
         token_ids = req.fill_ids
         all_token_len = len(token_ids)
         # For EAGLE radix cache, we will convert the key to bigram key, e.g. [1,2,3,4] -> [(1,2), (2,3), (3,4)], the length will -1. ((len([(1,2), (2,3), (3,4)]) = len([1,2,3,4]) - 1))
@@ -354,7 +358,9 @@ class RadixCache(BasePrefixCache):
         # Radix Cache takes over one reference from memory pool
         radix_key = RadixKey(page_aligned_token_ids, req.extra_key, req.dp_rank)
         new_prefix_len = self.insert(radix_key, page_aligned_kv_indices)
-        self.token_to_kv_pool_allocator.free(kv_indices[old_prefix_len:new_prefix_len])
+        self.token_to_kv_pool_allocator.free(
+            kv_indices[old_prefix_len:new_prefix_len], dp_rank=dp_rank
+        )
 
         # Prefix indices may have been updated, reuse them
         new_match_result = self.match_prefix(radix_key)
@@ -408,7 +414,9 @@ class RadixCache(BasePrefixCache):
             if x.lock_ref > 0:
                 continue
 
-            self.token_to_kv_pool_allocator.free(x.value)
+            # Get dp_rank from node's key
+            node_dp_rank = x.key.dp_rank if x.key and x.key.dp_rank is not None else 0
+            self.token_to_kv_pool_allocator.free(x.value, dp_rank=node_dp_rank)
             num_evicted += len(x.value)
             self._delete_leaf(x)
 
