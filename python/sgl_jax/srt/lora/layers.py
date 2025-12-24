@@ -44,7 +44,6 @@ class BaseLayerWithLoRA(nnx.Module):
     ):
         super().__init__()
         self.base_layer: nnx.Module = base_layer
-        self.set_lora: bool = False
         self.lora_backend: BaseLoRABackend = lora_backend
         if hasattr(self.base_layer, "weight"):
             self.weight = self.base_layer.weight
@@ -89,7 +88,6 @@ class LoRALinear(BaseLayerWithLoRA):
         module_name: str,
         mesh: Mesh,
     ):
-        self.set_lora = True
         self.lora_a_output_sharding = get_lora_a_output_sharding(module_name, mesh)
         self.lora_b_output_sharding = get_lora_b_output_sharding(module_name, mesh)
 
@@ -106,8 +104,7 @@ class LoRALinear(BaseLayerWithLoRA):
             self.A_buffer = nnx.Param(A_buffer)
             self.B_buffer = nnx.Param(B_buffer)
 
-    def apply_lora(self, operands) -> jax.Array:
-        base_output, x, scalings, token_indices = operands
+    def apply_lora(self, base_output, x, scalings, token_indices) -> jax.Array:
         lora_a_output = self.lora_backend.run_lora_a_gemm(
             x=x,
             weights=self.A_buffer,
@@ -141,11 +138,8 @@ class LoRALinear(BaseLayerWithLoRA):
 
         base_output, output_bias = self.base_layer(x)
 
-        output = jax.lax.cond(
-            self.set_lora,
-            self.apply_lora,
-            lambda operands: operands[0],
-            (base_output, x, forward_batch.lora_scalings, forward_batch.lora_token_indices),
+        output = self.apply_lora(
+            base_output, x, forward_batch.lora_scalings, forward_batch.lora_token_indices
         )
         return output, output_bias
 
