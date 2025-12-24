@@ -79,7 +79,7 @@ class SchedulerOutputProcessorMixin:
 
             if self.is_mixed_chunk and self.enable_overlap and req.finished():
                 j = len(batch.out_cache_loc) - len(batch.reqs) + i
-                self.token_to_kv_pool_allocator.free(batch.out_cache_loc[j : j + 1])
+                self.token_to_kv_pool_allocator.free(batch.out_cache_loc[j : j + 1], req.dp_rank)
                 continue
 
             if req.is_chunked <= 0:
@@ -258,7 +258,7 @@ class SchedulerOutputProcessorMixin:
                     if (len(req.origin_input_ids) + len(req.output_ids) - 1) % self.page_size == 0:
                         indices_to_free = batch.out_cache_loc[i : i + 1]
                 if indices_to_free is not None:
-                    self.token_to_kv_pool_allocator.free(indices_to_free)
+                    self.token_to_kv_pool_allocator.free(indices_to_free, req.dp_rank)
                 continue
 
             new_accepted_len = 1
@@ -286,7 +286,7 @@ class SchedulerOutputProcessorMixin:
                         len(kv_indices) <= EagleDraftInput.ALLOC_LEN_PER_DECODE
                     ), f"redundant kv indices {len(kv_indices)=} should less than {EagleDraftInput.ALLOC_LEN_PER_DECODE=}"
 
-                    self.token_to_kv_pool_allocator.free(kv_indices)
+                    self.token_to_kv_pool_allocator.free(kv_indices, req.dp_rank)
                 # End trace for finished request
                 if precision_tracer.get_trace_active():
                     precision_tracer.set_request_status_to_completed(req.rid)
