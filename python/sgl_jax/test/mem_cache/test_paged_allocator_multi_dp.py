@@ -79,7 +79,7 @@ class TestPagedAllocatorMultiDP(unittest.TestCase):
             # Verify available size decreased for this rank
             expected_free_pages = pages_per_rank - 2
             self.assertEqual(
-                len(allocator.free_pages_per_rank[rank]),
+                len(allocator.free_pages[rank]),
                 expected_free_pages,
                 f"Rank {rank} should have {expected_free_pages} free pages",
             )
@@ -92,7 +92,7 @@ class TestPagedAllocatorMultiDP(unittest.TestCase):
 
             # Verify pages returned to correct rank's pool
             self.assertEqual(
-                len(allocator.free_pages_per_rank[rank]),
+                len(allocator.free_pages[rank]),
                 pages_per_rank,
                 f"Rank {rank} should have all pages back after free",
             )
@@ -107,14 +107,15 @@ class TestPagedAllocatorMultiDP(unittest.TestCase):
         indices2 = allocator.alloc(alloc_size, dp_rank=0)
         indices3 = allocator.alloc(alloc_size, dp_rank=0)
 
-        initial_free_pages = len(allocator.free_pages)
+        initial_free_pages = len(allocator.free_pages[0])
 
         # Begin batching
         allocator.free_group_begin()
 
-        # Verify free_group is a list
+        # Verify free_group is a list of lists
         self.assertIsInstance(allocator.free_group, list)
-        self.assertEqual(allocator.free_group, [])
+        self.assertEqual(len(allocator.free_group), 1)
+        self.assertEqual(allocator.free_group[0], [])
 
         # Free multiple chunks
         allocator.free(indices1, dp_rank=0)
@@ -122,8 +123,8 @@ class TestPagedAllocatorMultiDP(unittest.TestCase):
         allocator.free(indices3, dp_rank=0)
 
         # Verify indices NOT immediately freed (accumulated in list)
-        self.assertEqual(len(allocator.free_group), 3)
-        self.assertEqual(len(allocator.free_pages), initial_free_pages)
+        self.assertEqual(len(allocator.free_group[0]), 3)
+        self.assertEqual(len(allocator.free_pages[0]), initial_free_pages)
 
         # End batching
         allocator.free_group_end()
@@ -133,10 +134,10 @@ class TestPagedAllocatorMultiDP(unittest.TestCase):
 
         # Verify all indices freed in batch
         expected_free_pages = initial_free_pages + 6  # 3 allocations × 2 pages each
-        self.assertEqual(len(allocator.free_pages), expected_free_pages)
+        self.assertEqual(len(allocator.free_pages[0]), expected_free_pages)
 
         # Verify free_group reset to []
-        self.assertEqual(allocator.free_group, [])
+        self.assertEqual(allocator.free_group[0], [])
 
     def test_free_group_batching_multi_rank(self):
         """Test free_group_begin/end batching for multiple DP ranks (dp_size>1)."""
@@ -153,16 +154,16 @@ class TestPagedAllocatorMultiDP(unittest.TestCase):
             ]
 
         # Record initial free page counts
-        initial_free_pages = {
-            rank: len(allocator.free_pages_per_rank[rank]) for rank in range(dp_size)
-        }
+        initial_free_pages = {rank: len(allocator.free_pages[rank]) for rank in range(dp_size)}
 
         # Begin batching
         allocator.free_group_begin()
 
-        # Verify free_group initialized as dict
-        self.assertIsInstance(allocator.free_group, dict)
-        self.assertEqual(allocator.free_group, {})
+        # Verify free_group initialized as list of lists
+        self.assertIsInstance(allocator.free_group, list)
+        self.assertEqual(len(allocator.free_group), dp_size)
+        for rank in range(dp_size):
+            self.assertEqual(allocator.free_group[rank], [])
 
         # Free for ranks in mixed order
         allocator.free(allocated_indices[1][0], dp_rank=1)
@@ -173,14 +174,13 @@ class TestPagedAllocatorMultiDP(unittest.TestCase):
         allocator.free(allocated_indices[2][1], dp_rank=2)
 
         # Verify indices accumulated in dict
-        self.assertEqual(set(allocator.free_group.keys()), {0, 1, 2})
         for rank in range(dp_size):
             self.assertEqual(len(allocator.free_group[rank]), 2)
 
         # Verify NOT immediately freed
         for rank in range(dp_size):
             self.assertEqual(
-                len(allocator.free_pages_per_rank[rank]),
+                len(allocator.free_pages[rank]),
                 initial_free_pages[rank],
                 f"Rank {rank} pages should not be freed yet",
             )
@@ -196,13 +196,14 @@ class TestPagedAllocatorMultiDP(unittest.TestCase):
         for rank in range(dp_size):
             expected_pages = initial_free_pages[rank] + 4  # 2 allocations × 2 pages each
             self.assertEqual(
-                len(allocator.free_pages_per_rank[rank]),
+                len(allocator.free_pages[rank]),
                 expected_pages,
                 f"Rank {rank} should have correct pages after batch free",
             )
 
-        # Verify free_group reset to {}
-        self.assertEqual(allocator.free_group, {})
+        # Verify free_group reset to empty lists
+        for rank in range(dp_size):
+            self.assertEqual(allocator.free_group[rank], [])
 
     def test_per_rank_pool_isolation(self):
         """Test that per-rank memory pools are isolated."""
@@ -220,12 +221,12 @@ class TestPagedAllocatorMultiDP(unittest.TestCase):
                 all_indices_rank0.append(indices)
 
         # Verify rank 0 pool exhausted
-        self.assertEqual(len(allocator.free_pages_per_rank[0]), 0)
+        self.assertEqual(len(allocator.free_pages[0]), 0)
         rank0_alloc = allocator.alloc(self.page_size, dp_rank=0)
         self.assertIsNone(rank0_alloc, "Rank 0 should be out of pages")
 
         # Verify rank 1 pool still has free pages
-        self.assertEqual(len(allocator.free_pages_per_rank[1]), pages_per_rank)
+        self.assertEqual(len(allocator.free_pages[1]), pages_per_rank)
         rank1_alloc = allocator.alloc(self.page_size, dp_rank=1)
         self.assertIsNotNone(rank1_alloc, "Rank 1 should still have free pages")
 
@@ -237,10 +238,10 @@ class TestPagedAllocatorMultiDP(unittest.TestCase):
         allocator.merge_and_sort_free(dp_rank=0)
 
         # Verify rank 0 pool has 2 free pages
-        self.assertEqual(len(allocator.free_pages_per_rank[0]), 2)
+        self.assertEqual(len(allocator.free_pages[0]), 2)
 
         # Verify rank 1 pool unchanged (still pages_per_rank - 1)
-        self.assertEqual(len(allocator.free_pages_per_rank[1]), pages_per_rank - 1)
+        self.assertEqual(len(allocator.free_pages[1]), pages_per_rank - 1)
 
     def test_cross_rank_free_group_no_contamination(self):
         """Test that batched frees don't contaminate other ranks."""
@@ -254,9 +255,7 @@ class TestPagedAllocatorMultiDP(unittest.TestCase):
             allocated_indices[rank] = allocator.alloc(alloc_size, dp_rank=rank)
 
         # Record initial free page counts
-        initial_free_pages = {
-            rank: len(allocator.free_pages_per_rank[rank]) for rank in range(dp_size)
-        }
+        initial_free_pages = {rank: len(allocator.free_pages[rank]) for rank in range(dp_size)}
 
         # Begin batched free
         allocator.free_group_begin()
@@ -276,7 +275,7 @@ class TestPagedAllocatorMultiDP(unittest.TestCase):
         for rank in range(dp_size):
             expected_pages = initial_free_pages[rank] + 3
             self.assertEqual(
-                len(allocator.free_pages_per_rank[rank]),
+                len(allocator.free_pages[rank]),
                 expected_pages,
                 f"Rank {rank} should have exactly {expected_pages} pages (no cross-contamination)",
             )
@@ -286,14 +285,14 @@ class TestPagedAllocatorMultiDP(unittest.TestCase):
         pages_per_rank = num_pages // dp_size
         for rank in range(dp_size):
             self.assertEqual(
-                len(allocator.free_pages_per_rank[rank]),
+                len(allocator.free_pages[rank]),
                 pages_per_rank,
                 f"Rank {rank} should have all pages back",
             )
 
     def test_free_group_structure(self):
         """Test that free_group uses correct data structure."""
-        # Single rank: verify free_group is list
+        # Single rank: verify free_group is list of lists
         allocator_single = self._create_allocator(dp_size=1)
         allocator_single.free_group_begin()
         self.assertIsInstance(
@@ -301,41 +300,18 @@ class TestPagedAllocatorMultiDP(unittest.TestCase):
             list,
             "Single-rank allocator should use list for free_group",
         )
+        self.assertEqual(len(allocator_single.free_group), 1)
+        self.assertEqual(allocator_single.free_group[0], [])
 
-        # Multi rank: verify free_group is dict
+        # Multi rank: verify free_group is list of lists
         allocator_multi = self._create_allocator(dp_size=3)
         allocator_multi.free_group_begin()
         self.assertIsInstance(
-            allocator_multi.free_group, dict, "Multi-rank allocator should use dict for free_group"
+            allocator_multi.free_group, list, "Multi-rank allocator should use list for free_group"
         )
-
-    def test_dynamic_method_binding(self):
-        """Test that correct methods are bound based on dp_size."""
-        # Single rank: verify methods bound to _*_single variants
-        allocator_single = self._create_allocator(dp_size=1)
-        self.assertEqual(
-            allocator_single.free_group_begin.__name__,
-            "_free_group_begin_single",
-            "Single-rank should bind to _free_group_begin_single",
-        )
-        self.assertEqual(
-            allocator_single.free_group_end.__name__,
-            "_free_group_end_single",
-            "Single-rank should bind to _free_group_end_single",
-        )
-
-        # Multi rank: verify methods bound to _*_multi variants
-        allocator_multi = self._create_allocator(dp_size=3)
-        self.assertEqual(
-            allocator_multi.free_group_begin.__name__,
-            "_free_group_begin_multi",
-            "Multi-rank should bind to _free_group_begin_multi",
-        )
-        self.assertEqual(
-            allocator_multi.free_group_end.__name__,
-            "_free_group_end_multi",
-            "Multi-rank should bind to _free_group_end_multi",
-        )
+        self.assertEqual(len(allocator_multi.free_group), 3)
+        for rank in range(3):
+            self.assertEqual(allocator_multi.free_group[rank], [])
 
 
 if __name__ == "__main__":

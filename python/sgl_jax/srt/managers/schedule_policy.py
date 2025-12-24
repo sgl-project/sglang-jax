@@ -258,6 +258,7 @@ class PrefillAdder:
         rem_input_tokens: int,
         rem_chunk_tokens: int | None,
         mixed_with_decode_tokens: int = 0,
+        dp_size: int = 1,
     ):
         self.page_size = page_size
         self.tree_cache = tree_cache
@@ -266,15 +267,19 @@ class PrefillAdder:
         self.new_token_ratio = new_token_ratio
         self.rem_input_tokens = rem_input_tokens - mixed_with_decode_tokens
         self.rem_chunk_tokens = rem_chunk_tokens
+        self.dp_size = dp_size
         if self.rem_chunk_tokens is not None:
             self.rem_chunk_tokens -= mixed_with_decode_tokens
+            self.rem_chunk_tokens_list = [self.rem_chunk_tokens] * dp_size
+        else:
+            self.rem_chunk_tokens_list = None
 
         self.rem_total_token_offset = mixed_with_decode_tokens
         self.cur_rem_token_offset = mixed_with_decode_tokens
 
         self.req_states = None
         self.can_run_list = []
-        self.new_chunked_req = None
+        self.new_chunked_reqs = [None] * dp_size
         self.log_hit_tokens = 0
         self.log_input_tokens = 0
 
@@ -324,6 +329,23 @@ class PrefillAdder:
 
         return available_and_evictable - self.cur_rem_token_offset
 
+    def get_available_tokens_for_dp_rank(self, dp_rank: int = 0) -> int:
+        """Get available tokens for a specific dp_rank."""
+        if self.is_hybrid:
+            available_and_evictable = min(
+                self.token_to_kv_pool_allocator.full_available_size(dp_rank=dp_rank)
+                + self.tree_cache.full_evictable_size(),
+                self.token_to_kv_pool_allocator.swa_available_size(dp_rank=dp_rank)
+                + self.tree_cache.swa_evictable_size(),
+            )
+        else:
+            available_and_evictable = (
+                self.token_to_kv_pool_allocator.available_size(dp_rank=dp_rank)
+                + self.tree_cache.evictable_size()
+            )
+
+        return available_and_evictable - self.rem_total_token_offset
+
     def ceil_paged_tokens(self, tokens: int) -> int:
         return -(-tokens // self.page_size) * self.page_size
 
@@ -332,14 +354,21 @@ class PrefillAdder:
             return AddReqResult.NO_TOKEN
 
         if self.rem_input_tokens <= 0 or (
-            self.rem_chunk_tokens is not None and self.rem_chunk_tokens <= 0
+            self.rem_chunk_tokens_list is not None
+            and all(t <= 0 for t in self.rem_chunk_tokens_list)
         ):
             return AddReqResult.OTHER
 
         return AddReqResult.CONTINUE
 
     def add_chunked_req(self, req: Req):
-        _rem_tokens = min(self.rem_chunk_tokens, int(self.rem_total_tokens))
+        dp_rank = req.dp_rank if req.dp_rank is not None else 0
+        rem_chunk_tokens = (
+            self.rem_chunk_tokens_list[dp_rank]
+            if self.rem_chunk_tokens_list is not None
+            else int(self.rem_total_tokens)
+        )
+        _rem_tokens = min(rem_chunk_tokens, int(self.rem_total_tokens))
         truncated = req.extend_input_len > _rem_tokens
         req.extend_input_len = min(req.extend_input_len, _rem_tokens)
         req.fill_ids = req.fill_ids[: len(req.prefix_indices) + req.extend_input_len]
@@ -352,19 +381,26 @@ class PrefillAdder:
                 if not truncated
                 else 0
             ),
+            dp_rank=dp_rank,
         )
 
         # Return if chunked prefill not finished
         return req if truncated else None
 
-    def _update_prefill_budget(self, prefix_len: int, extend_input_len: int, max_new_tokens: int):
+    def _update_prefill_budget(
+        self,
+        prefix_len: int,
+        extend_input_len: int,
+        max_new_tokens: int,
+        dp_rank: int = 0,
+    ):
         extend_input_len = self.ceil_paged_tokens(extend_input_len)
 
         self.rem_total_token_offset += extend_input_len + max_new_tokens
         self.cur_rem_token_offset += extend_input_len
         self.rem_input_tokens -= extend_input_len
-        if self.rem_chunk_tokens is not None:
-            self.rem_chunk_tokens -= extend_input_len
+        if self.rem_chunk_tokens_list is not None:
+            self.rem_chunk_tokens_list[dp_rank] -= extend_input_len
 
         self.log_hit_tokens += prefix_len
         self.log_input_tokens += extend_input_len
@@ -431,9 +467,14 @@ class PrefillAdder:
                     return AddReqResult.NO_TOKEN
                 tokens_freed += tokens_occupied
 
+        dp_rank = req.dp_rank if req.dp_rank is not None else 0
+        rem_chunk_tokens = (
+            self.rem_chunk_tokens_list[dp_rank] if self.rem_chunk_tokens_list is not None else None
+        )
+
         if (
-            self.rem_chunk_tokens is None  # chunked prefill is disabled
-            or req.extend_input_len <= self.rem_chunk_tokens  # it is the last chunk
+            rem_chunk_tokens is None  # chunked prefill is disabled
+            or req.extend_input_len <= rem_chunk_tokens  # it is the last chunk
         ):
             # Non-chunked prefill
             self.can_run_list.append(req)
@@ -441,25 +482,29 @@ class PrefillAdder:
                 0,
                 req.extend_input_len,
                 min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS_ESTIMATION),
+                dp_rank=dp_rank,
             )
         else:
-            if self.rem_chunk_tokens <= 0:
+            if rem_chunk_tokens <= 0:
                 return AddReqResult.OTHER
 
             # Chunked prefill
-            trunc_len = self.rem_chunk_tokens
+            trunc_len = rem_chunk_tokens
 
             req.extend_input_len = trunc_len
             req.fill_ids = req.fill_ids[:trunc_len]
             self.can_run_list.append(req)
-            self.new_chunked_req = req
-            self._update_prefill_budget(0, trunc_len, 0)
+            self.new_chunked_reqs[dp_rank] = req
+            self._update_prefill_budget(0, trunc_len, 0, dp_rank=dp_rank)
 
         return self.budget_state()
 
     def add_one_req(self, req: Req):
         if req.sampling_params.ignore_eos and getattr(self.tree_cache, "disable", True):
             return self.add_one_req_ignore_eos(req)
+
+        # Check available memory for this specific dp_rank
+        available_tokens = self.get_available_tokens_for_dp_rank(req.dp_rank)
 
         total_tokens = req.extend_input_len + min(
             req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS_ESTIMATION
@@ -470,15 +515,16 @@ class PrefillAdder:
         real_input_tokens = self.ceil_paged_tokens(real_input_tokens)
         prefix_len = len(req.prefix_indices)
 
-        if total_tokens >= self.rem_total_tokens:
+        if total_tokens >= available_tokens:
             return AddReqResult.NO_TOKEN
 
         if real_input_tokens >= self.rem_input_tokens and len(self.can_run_list) != 0:
             return AddReqResult.OTHER
 
         with self._lock_node(req.last_node):
-            # self.rem_total_tokens may decrease after the lock acquisition
-            if total_tokens >= self.rem_total_tokens:
+            # available_tokens may decrease after the lock acquisition
+            available_tokens = self.get_available_tokens_for_dp_rank(req.dp_rank)
+            if total_tokens >= available_tokens:
                 return AddReqResult.NO_TOKEN
             req.last_matched_prefix_len = prefix_len
             input_tokens = self.ceil_paged_tokens(req.extend_input_len)
@@ -486,7 +532,14 @@ class PrefillAdder:
             if input_tokens >= self.rem_input_tokens and len(self.can_run_list) != 0:
                 return AddReqResult.OTHER
 
-            if self.rem_chunk_tokens is None or input_tokens <= self.rem_chunk_tokens:
+            dp_rank = req.dp_rank if req.dp_rank is not None else 0
+            rem_chunk_tokens = (
+                self.rem_chunk_tokens_list[dp_rank]
+                if self.rem_chunk_tokens_list is not None
+                else None
+            )
+
+            if rem_chunk_tokens is None or input_tokens <= rem_chunk_tokens:
                 # Non-chunked prefill
                 self.can_run_list.append(req)
                 if self.is_hybrid:
@@ -501,10 +554,11 @@ class PrefillAdder:
                         req.sampling_params.max_new_tokens,
                         CLIP_MAX_NEW_TOKENS_ESTIMATION,
                     ),
+                    dp_rank=dp_rank,
                 )
             else:
                 # Make sure at least one page is available
-                trunc_len = self.rem_chunk_tokens // self.page_size * self.page_size
+                trunc_len = rem_chunk_tokens // self.page_size * self.page_size
                 if trunc_len <= 0:
                     return AddReqResult.OTHER
 
@@ -513,12 +567,12 @@ class PrefillAdder:
                 req.fill_ids = req.fill_ids[: len(req.prefix_indices) + trunc_len]
 
                 self.can_run_list.append(req)
-                self.new_chunked_req = req
+                self.new_chunked_reqs[dp_rank] = req
                 if self.is_hybrid:
                     swa_uuid_for_lock = self.tree_cache.inc_lock_ref(req.last_node)
                     req.swa_uuid_for_lock = swa_uuid_for_lock
                 else:
                     self.tree_cache.inc_lock_ref(req.last_node)
-                self._update_prefill_budget(prefix_len, trunc_len, 0)
+                self._update_prefill_budget(prefix_len, trunc_len, 0, dp_rank=dp_rank)
 
         return self.budget_state()

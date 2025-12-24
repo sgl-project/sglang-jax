@@ -160,6 +160,9 @@ class ModelWorker:
 
         self.max_padded_batch_size, self.max_padded_num_tokens = self.get_max_padded_size()
 
+        # Store dp_size for DP-aware padding
+        self.dp_size = server_args.dp_size
+
         # precompile
         self.precompile_token_paddings = server_args.precompile_token_paddings
 
@@ -189,6 +192,19 @@ class ModelWorker:
             (item * self.max_req_len + self.page_size - 1) // self.page_size * self.page_size
             for item in self.precompile_bs_paddings
         ]
+
+        # Store per-DP paddings (current values)
+        self.per_dp_token_paddings = self.precompile_token_paddings.copy()
+        self.per_dp_bs_paddings = self.precompile_bs_paddings.copy()
+        self.per_dp_cache_loc_paddings = self.precompile_cache_loc_paddings.copy()
+
+        # Calculate total paddings = per_dp * dp_size
+        if self.dp_size > 1:
+            self.precompile_token_paddings = [p * self.dp_size for p in self.per_dp_token_paddings]
+            self.precompile_bs_paddings = [p * self.dp_size for p in self.per_dp_bs_paddings]
+            self.precompile_cache_loc_paddings = [
+                p * self.dp_size for p in self.per_dp_cache_loc_paddings
+            ]
 
     def normalize_token_paddings(self):
         normalized_token_paddings = []

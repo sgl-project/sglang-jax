@@ -301,10 +301,11 @@ class Scheduler(
         self.spec_num_forward_ct = 0
         self.draft_token = 0
         # Init chunked prefill
+        self.dp_size = server_args.dp_size
         self.chunked_prefill_size = server_args.chunked_prefill_size
         if self.chunked_prefill_size <= 0:  # -1 means disable
             self.chunked_prefill_size = None
-        self.chunked_req = None
+        self.chunked_reqs = [None] * self.dp_size  # Per-DP chunked request tracking
         self.is_mixed_chunk = (
             self.chunked_prefill_size is not None and server_args.enable_mixed_chunk
         )
@@ -338,6 +339,9 @@ class Scheduler(
 
         self.init_metrics()
 
+        # Initialize DP scheduling state
+        self.dp_round_robin_counter = 0
+
         # Init request dispatcher
         self._request_dispatcher = TypeBasedDispatcher(
             [
@@ -359,6 +363,22 @@ class Scheduler(
                 logger.info("[Scheduler] Begins to run spec_decode worker precompile.")
                 self.draft_worker.run_spec_decode_precompile()
                 logger.info("[Scheduler] Completes spec_decode worker precompile.")
+
+    def select_dp_for_request(self, recv_reqs: list[Req]) -> None:
+        """Assign dp_rank to request using round-robin strategy."""
+        if self.dp_size == 1:
+            for req in recv_reqs:
+                req.dp_rank = 0
+            return
+
+        for req in recv_reqs:
+            # Skip if dp_rank already set (e.g., sticky sessions)
+            if req.dp_rank is not None:
+                continue
+
+            # Round-robin assignment
+            req.dp_rank = self.dp_round_robin_counter % self.server_args.dp_size
+            self.dp_round_robin_counter += 1
 
     def sync_pub(self):
         logger.info(
@@ -464,6 +484,8 @@ class Scheduler(
         """A normal scheduler loop."""
         while True:
             recv_reqs = self.recv_requests()
+            # Assign DP rank to incoming requests
+            self.select_dp_for_request(recv_reqs)
             self.process_input_requests(recv_reqs)
             batch = self.get_next_batch_to_run()
             self.cur_batch = batch
@@ -485,6 +507,8 @@ class Scheduler(
 
         while True:
             recv_reqs = self.recv_requests()
+            # Assign DP rank to incoming requests
+            self.select_dp_for_request(recv_reqs)
             self.process_input_requests(recv_reqs)
 
             batch = self.get_next_batch_to_run()
@@ -617,6 +641,7 @@ class Scheduler(
             stream=recv_req.stream,
             lora_id=recv_req.lora_id,
             extra_key=recv_req.extra_key,
+            dp_rank=recv_req.dp_rank,
             eos_token_ids=self.model_config.hf_eos_token_id,
             vocab_size=self.model_config.vocab_size,
         )
@@ -832,7 +857,7 @@ class Scheduler(
         running_reqs = _batch_size(self.running_batch)
         current_batch_reqs = _batch_size(self.cur_batch)
         last_batch_reqs = _batch_size(self.last_batch)
-        chunked_pending = self.chunked_req is not None
+        chunked_pending = any(req is not None for req in self.chunked_reqs)
         pending_results = len(getattr(self, "result_queue", ())) if self.enable_overlap else 0
 
         has_pending = (
@@ -865,7 +890,7 @@ class Scheduler(
         self.cur_batch = None
         self.last_batch = None
         self.running_batch = ScheduleBatch(reqs=[], batch_is_full=False)
-        self.chunked_req = None
+        self.chunked_reqs = [None] * self.dp_size
         if self.enable_overlap:
             self.result_queue = deque()
 
@@ -972,18 +997,21 @@ class Scheduler(
 
     def get_next_batch_to_run(self) -> ScheduleBatch | None:
         chunked_req_to_exclude = set()
-        if self.chunked_req:
-            # Move the chunked request out of the batch so that we can merge
-            # only finished requests to running_batch.
-            chunked_req_to_exclude.add(self.chunked_req)
-            self.tree_cache.cache_unfinished_req(self.chunked_req)
-            # chunked request keeps its rid but will get a new req_pool_idx
-            self.req_to_token_pool.free(self.chunked_req.req_pool_idx)
+        for req in self.chunked_reqs:
+            if req is not None:
+                # Move the chunked request out of the batch so that we can merge
+                # only finished requests to running_batch.
+                chunked_req_to_exclude.add(req)
+                self.tree_cache.cache_unfinished_req(req)
+                # chunked request keeps its rid but will get a new req_pool_idx
+                self.req_to_token_pool.free(req.req_pool_idx)
 
         # Merge the prefill batch into the running batch
         if self.last_batch and self.last_batch.forward_mode.is_extend():
-            if self.last_batch.chunked_req is not None:
-                chunked_req_to_exclude.add(self.last_batch.chunked_req)
+            if self.last_batch.chunked_reqs is not None:
+                for req in self.last_batch.chunked_reqs:
+                    if req is not None:
+                        chunked_req_to_exclude.add(req)
 
             # Filter batch
             last_bs = self.last_batch.batch_size()
@@ -1020,9 +1048,10 @@ class Scheduler(
             self.move_ready_grammar_requests()
 
         # Handle the cases where prefill is not allowed
+        any_chunked_req = any(req is not None for req in self.chunked_reqs)
         if (
             self.running_batch.batch_is_full or len(self.waiting_queue) == 0
-        ) and self.chunked_req is None:
+        ) and not any_chunked_req:
             return None
 
         running_bs = len(self.running_batch.reqs)
@@ -1042,11 +1071,14 @@ class Scheduler(
             self.max_prefill_tokens,
             self.chunked_prefill_size,
             running_bs if self.is_mixed_chunk else 0,
+            dp_size=self.server_args.dp_size,
         )
 
-        if self.chunked_req is not None:
-            self.chunked_req.init_next_round_input()
-            self.chunked_req = adder.add_chunked_req(self.chunked_req)
+        if self.chunked_reqs:
+            for i, req in enumerate(self.chunked_reqs):
+                if req is not None:
+                    req.init_next_round_input()
+                    self.chunked_reqs[i] = adder.add_chunked_req(req)
 
         # Collect existing LoRA IDs in the running batch if LoRA is enabled
         if self.lora_paths is not None:
@@ -1087,12 +1119,15 @@ class Scheduler(
 
         self.waiting_queue = [x for x in self.waiting_queue if x not in set(can_run_list)]
 
-        if adder.new_chunked_req is not None:
-            assert self.chunked_req is None
-            self.chunked_req = adder.new_chunked_req
+        if adder.new_chunked_reqs:
+            for i, req in enumerate(adder.new_chunked_reqs):
+                if req is not None:
+                    assert self.chunked_reqs[i] is None
+                    self.chunked_reqs[i] = req
 
-        if self.chunked_req:
-            self.chunked_req.is_chunked += 1
+        for req in self.chunked_reqs:
+            if req:
+                req.is_chunked += 1
 
         self.log_prefill_stats(adder, can_run_list, running_bs)
 
@@ -1105,7 +1140,7 @@ class Scheduler(
             self.model_config,
             self.enable_overlap,
             enable_custom_logit_processor=False,
-            chunked_req=self.chunked_req,
+            chunked_reqs=self.chunked_reqs,
             mesh=self.mesh,
             spec_algorithm=self.spec_algorithm,
         )
@@ -1217,6 +1252,14 @@ class Scheduler(
                 next_token_ids = np.array(jax.device_get(next_token_ids_device))[
                     : model_worker_batch.real_bs
                 ]
+
+            # Reorder results back to original request order if needed
+            if model_worker_batch.dp_reorder_map is not None:
+                reordered_tokens = [None] * len(next_token_ids)
+                for new_idx, orig_idx in enumerate(model_worker_batch.dp_reorder_map):
+                    if new_idx < len(next_token_ids):
+                        reordered_tokens[orig_idx] = next_token_ids[new_idx]
+                next_token_ids = np.array(reordered_tokens)
         else:
 
             (

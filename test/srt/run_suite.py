@@ -281,6 +281,7 @@ suites = {
         TestFile("python/sgl_jax/test/mem_cache/test_paged_allocator_multi_dp.py", 1),
         TestFile("python/sgl_jax/test/speculative/test_eagle_tree_build.py", 1),
         TestFile("python/sgl_jax/test/speculative/test_eagle_utils.py", 1),
+        TestFile("python/sgl_jax/test/scheduler/test_chunked_prefill_dp.py", 1),
         TestFile("test/srt/lora/test_bgmv_backend.py", 5),
     ],
     "unit-test-tpu-v6e-4": [

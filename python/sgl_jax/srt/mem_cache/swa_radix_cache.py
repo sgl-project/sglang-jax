@@ -304,10 +304,15 @@ class SWARadixCache(BasePrefixCache):
         self.reset()
 
     # Effective SWA length for a set of FULL indices (number of indices still mapped to SWA)
-    def _swa_eff_len(self, full_indices: np.ndarray) -> int:
+    def _swa_eff_len(self, full_indices: np.ndarray, dp_rank: int = 0) -> int:
         if full_indices is None or len(full_indices) == 0:
             return 0
         mapping = self.token_to_kv_pool_allocator.full_to_swa_index_mapping
+        # Handle both list (multi-DP) and single array (single-DP) formats
+        if isinstance(mapping, list):
+            # Clamp dp_rank to valid range [0, len(mapping)-1]
+            dp_rank = min(dp_rank, len(mapping) - 1)
+            mapping = mapping[dp_rank]
         return int((mapping[full_indices] > 0).sum())
 
     ##### Public API #####
@@ -486,8 +491,8 @@ class SWARadixCache(BasePrefixCache):
                 assert x != self.root_node, f"root node should not exist in full lru list, {x.id=}"
                 assert x.full_lock_ref == 0, f"node is in use, {x.id=}"
                 # 1. free node kv indices, evict full and swa tokens; count SWA freed accurately
-                actual_swa_free = self._swa_eff_len(x.value)
                 node_dp_rank = x.key.dp_rank if x.key and x.key.dp_rank is not None else 0
+                actual_swa_free = self._swa_eff_len(x.value, dp_rank=node_dp_rank)
                 self.token_to_kv_pool_allocator.free(x.value, dp_rank=node_dp_rank)
                 full_num_evicted += len(x.value)
                 swa_num_evicted += actual_swa_free
@@ -524,8 +529,8 @@ class SWARadixCache(BasePrefixCache):
 
                 if len(x.children) > 0:
                     # 1. an internal node, free swa tokens.
-                    actual_swa_free = self._swa_eff_len(x.value)
                     node_dp_rank = x.key.dp_rank if x.key and x.key.dp_rank is not None else 0
+                    actual_swa_free = self._swa_eff_len(x.value, dp_rank=node_dp_rank)
                     self.token_to_kv_pool_allocator.free_swa(x.value, dp_rank=node_dp_rank)
                     swa_num_evicted += actual_swa_free
 
@@ -541,8 +546,8 @@ class SWARadixCache(BasePrefixCache):
                         x.full_lock_ref == 0
                     ), f"leaf node with full lock must also have swa lock, {x.id=}"
                     # 1. a leaf node, free full and swa tokens
-                    actual_swa_free = self._swa_eff_len(x.value)
                     node_dp_rank = x.key.dp_rank if x.key and x.key.dp_rank is not None else 0
+                    actual_swa_free = self._swa_eff_len(x.value, dp_rank=node_dp_rank)
                     self.token_to_kv_pool_allocator.free(x.value, dp_rank=node_dp_rank)
                     full_num_evicted += len(x.value)
                     swa_num_evicted += actual_swa_free
@@ -588,13 +593,14 @@ class SWARadixCache(BasePrefixCache):
             # caller needs to pass the swa_uuid_for_lock to dec_lock_ref
             if swa_lock_size < self.sliding_window_size:
                 assert not node.swa_tombstone, f"inc_lock_swa on swa_tombstone node, {node.id=}"
+                node_dp_rank = node.key.dp_rank if node.key and node.key.dp_rank is not None else 0
                 if node.swa_lock_ref == 0:
-                    eff = self._swa_eff_len(node.value)
+                    eff = self._swa_eff_len(node.value, dp_rank=node_dp_rank)
                     self.swa_evictable_size_ -= eff
                     self.swa_protected_size_ += eff
                 node.swa_lock_ref += 1
                 # Count effective SWA tokens towards sliding window
-                swa_lock_size += self._swa_eff_len(node.value)
+                swa_lock_size += self._swa_eff_len(node.value, dp_rank=node_dp_rank)
                 if swa_lock_size >= self.sliding_window_size:
                     if node.swa_uuid is None:
                         node.swa_uuid = gen_swa_uuid()
@@ -629,7 +635,10 @@ class SWARadixCache(BasePrefixCache):
                 ), f"dec_lock_ref on node with {node.swa_lock_ref=}, {node.id=}"
 
                 if node.swa_lock_ref == 1:
-                    eff = self._swa_eff_len(node.value)
+                    node_dp_rank = (
+                        node.key.dp_rank if node.key and node.key.dp_rank is not None else 0
+                    )
+                    eff = self._swa_eff_len(node.value, dp_rank=node_dp_rank)
                     self.swa_evictable_size_ += eff
                     self.swa_protected_size_ -= eff
                 node.swa_lock_ref -= 1
@@ -669,7 +678,8 @@ class SWARadixCache(BasePrefixCache):
         x = self.swa_lru_list.get_lru_no_lock()
         total = 0
         while self.swa_lru_list.in_list(x):
-            total += self._swa_eff_len(x.value)
+            node_dp_rank = x.key.dp_rank if x.key and x.key.dp_rank is not None else 0
+            total += self._swa_eff_len(x.value, dp_rank=node_dp_rank)
             x = self.swa_lru_list.get_prev_no_lock(x)
         return total
 
@@ -845,7 +855,7 @@ class SWARadixCache(BasePrefixCache):
                     # insert the node into the lru lists
                     self.swa_lru_list.insert_mru(node)
 
-                    self.swa_evictable_size_ += self._swa_eff_len(node.value)
+                    self.swa_evictable_size_ += self._swa_eff_len(node.value, dp_rank=node_dp_rank)
                 else:
                     # value_dp_rank from the key parameter passed into _insert_helper
                     value_dp_rank = key.dp_rank if key.dp_rank is not None else 0
@@ -869,7 +879,8 @@ class SWARadixCache(BasePrefixCache):
             self.swa_lru_list.insert_mru(new_node)
             node.children[child_key] = new_node
             self.full_evictable_size_ += len(value)
-            self.swa_evictable_size_ += self._swa_eff_len(new_node.value)
+            new_node_dp_rank = key.dp_rank if key.dp_rank is not None else 0
+            self.swa_evictable_size_ += self._swa_eff_len(new_node.value, dp_rank=new_node_dp_rank)
 
         return total_prefix_length
 

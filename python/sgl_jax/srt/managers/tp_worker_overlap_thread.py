@@ -117,11 +117,25 @@ class ModelWorkerClient:
                     )
                 )
 
-            # Update the future token ids map
+            # Reorder tokens back to original request order if DP reordering was applied
+            # This ensures future_token_ids_map has correct mapping for reordered future IDs
+            tokens_for_map = next_token_ids
+            if model_worker_batch.dp_reorder_map is not None:
+                # Create inverse mapping: new_idx -> orig_idx (dp_reorder_map)
+                # We need orig_idx -> new_idx to reorder tokens back
+                reordered_tokens = jnp.zeros_like(next_token_ids)
+                for new_idx, orig_idx in enumerate(model_worker_batch.dp_reorder_map):
+                    if new_idx < len(next_token_ids):
+                        reordered_tokens = reordered_tokens.at[orig_idx].set(
+                            next_token_ids[new_idx]
+                        )
+                tokens_for_map = reordered_tokens
+
+            # Update the future token ids map with tokens in original request order
             self.future_token_ids_map = set_future_token_ids(
                 self.future_token_ids_map,
                 future_token_ids_ct,
-                next_token_ids,
+                tokens_for_map,
             )
             self.output_queue.put((None, logits_output, next_token_ids, cache_miss_count))
 

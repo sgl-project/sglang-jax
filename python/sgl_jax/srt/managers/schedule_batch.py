@@ -522,7 +522,7 @@ class ScheduleBatch:
     # This is an optimization to reduce the overhead of the prefill check.
     batch_is_full: bool = False
 
-    chunked_req: Req | None = None
+    chunked_reqs: list[Req | None] = None
 
     # Sampling info
     sampling_info: SamplingBatchInfo = None
@@ -610,7 +610,7 @@ class ScheduleBatch:
         enable_overlap: bool,
         spec_algorithm: SpeculativeAlgorithm = None,
         enable_custom_logit_processor: bool = False,
-        chunked_req: Req | None = None,
+        chunked_reqs: list[Req | None] = None,
         mesh: mesh_lib.Mesh = None,
     ):
         return_logprob = any(req.return_logprob for req in reqs)
@@ -637,7 +637,7 @@ class ScheduleBatch:
             enable_overlap=enable_overlap,
             has_stream=any(req.stream for req in reqs),
             has_grammar=any(req.grammar for req in reqs),
-            chunked_req=chunked_req,
+            chunked_reqs=chunked_reqs,
             mesh=mesh,
             spec_algorithm=spec_algorithm,
             is_prefill_only=all(req.sampling_params.max_new_tokens == 0 for req in reqs),
@@ -1368,109 +1368,235 @@ class ScheduleBatch:
                 skip_padding=skip_padding,
             )
 
+        # Calculate per-DP paddings (when dp_size=1, this is same as original)
+        per_dp_token_paddings = [p // self.dp_size for p in token_paddings]
+        per_dp_bs_paddings = [p // self.dp_size for p in bs_paddings]
+        per_dp_cache_loc_paddings = [p // self.dp_size for p in cache_loc_paddings]
+
+        # Group requests by dp_rank
+        dp_groups = self._group_reqs_by_dp_rank()
+        sorted_dp_ranks = sorted(dp_groups.keys())
+
+        # Build index mapping for result reordering
+        new_to_orig_idx = []
+        for dp_rank in sorted_dp_ranks:
+            new_to_orig_idx.extend(dp_groups[dp_rank])
+
         if self.forward_mode.is_decode_or_idle():
             extend_seq_lens = extend_prefix_lens = extend_logprob_start_lens = None
-            token_paddings = bs_paddings
+            token_paddings = per_dp_bs_paddings
         else:
             extend_seq_lens = np.array(self.extend_lens, dtype=np.int32)
             extend_prefix_lens = np.array(self.prefix_lens, dtype=np.int32)
-            bs_paddings = bs_paddings[-1:]
-            cache_loc_paddings = cache_loc_paddings[-1:]
+            bs_paddings = per_dp_bs_paddings[-1:]
+            cache_loc_paddings = per_dp_cache_loc_paddings[-1:]
             extend_logprob_start_lens = self.extend_logprob_start_lens
+            token_paddings = per_dp_token_paddings
 
         global bid
         bid += 1
 
-        if self.input_ids is None:
-            input_ids_cpu = np.empty(0, dtype=np.int32)
-        else:
-            input_ids_cpu = self.input_ids.flatten()
+        # Build arrays in dp_rank order with per-DP padding
+        all_input_ids = []
+        all_out_cache_loc = []
+        all_positions = []
+        all_seq_lens = []
+        all_req_pool_indices = []
+        all_extend_start_loc = [] if self.forward_mode.is_extend() else None
 
-        real_input_ids_len = len(input_ids_cpu)
-        out_cache_loc_cpu = self.out_cache_loc
-        seq_lens_cpu = self.seq_lens
-        real_bs = len(seq_lens_cpu)
-        req_pool_indices_cpu = self.req_pool_indices
-        token_indices_with_all_reqs = self.req_to_token_pool.req_to_token[self.req_pool_indices]
+        real_bs = len(self.reqs)
+        total_padded_tokens = 0
 
-        # padding seq
-        # extend & decode: input_ids, positions, out_cache_loc, cache_loc
-        padding_size = 0
-        token_paddings.sort()
-        for size in token_paddings:
-            if size >= len(input_ids_cpu):
-                padding_size = size - len(input_ids_cpu)
+        # Pre-calculate cumsum_lens once for extracting out_cache_loc per request
+        # (self.out_cache_loc is in original self.reqs order after merge)
+        cumsum_lens = np.cumsum(
+            [0] + self.extend_lens if self.forward_mode.is_extend() else [0] + [1] * len(self.reqs)
+        )
+
+        # Pre-sort paddings once (used for finding padding size per group)
+        token_paddings_sorted = sorted(token_paddings)
+        bs_paddings_sorted = sorted(bs_paddings)
+
+        # Calculate max token/BS count across all DP groups to ensure uniform padding
+        max_group_token_count = 0
+        max_group_bs = 0
+
+        for dp_rank in sorted_dp_ranks:
+            group_indices = dp_groups[dp_rank]
+            group_bs = len(group_indices)
+            max_group_bs = max(max_group_bs, group_bs)
+
+            if self.forward_mode.is_extend():
+                group_token_count = sum(self.extend_lens[i] for i in group_indices)
+            else:
+                group_token_count = group_bs
+            max_group_token_count = max(max_group_token_count, group_token_count)
+
+        # Select SINGLE padding for ALL DP groups
+        selected_per_dp_token_padding = None
+        for size in token_paddings_sorted:
+            if size >= max_group_token_count:
+                selected_per_dp_token_padding = size
                 break
 
-        if padding_size > 0:
-            input_ids_cpu = np.concat(
-                [
-                    input_ids_cpu,
-                    np.array([0] * padding_size, dtype=input_ids_cpu.dtype),
-                ],
-                axis=0,
-            )
-
-        padded_input_ids_len = len(input_ids_cpu)
-        out_cache_loc_num_to_padding = padded_input_ids_len - len(out_cache_loc_cpu)
-        if out_cache_loc_num_to_padding > 0:
-            out_cache_loc_cpu = np.concatenate(
-                [
-                    out_cache_loc_cpu,
-                    np.array(
-                        [-1] * out_cache_loc_num_to_padding,
-                        dtype=out_cache_loc_cpu.dtype,
-                    ),
-                ],
-                axis=0,
-            )
-
-        # Calculate positions and extend_start_loc after padding
-        if self.forward_mode.is_extend():
-            # For prefill: create positions for each token in sequences
-            # Calculate total tokens without padding first
-            total_tokens_before_padding = sum([extend_len for extend_len in self.extend_lens])
-            positions_cpu = np.concatenate(
-                [
-                    np.arange(prefix_len, seq_len, dtype=seq_lens_cpu.dtype)
-                    for seq_len, prefix_len in zip(seq_lens_cpu, self.prefix_lens)
-                ]
-            )
-
-            # If input_ids was padded, pad positions too
-            padding_size = len(input_ids_cpu) - total_tokens_before_padding
-            if padding_size:
-                positions_cpu = np.concatenate(
-                    [positions_cpu, np.zeros(padding_size, dtype=positions_cpu.dtype)]
+        if selected_per_dp_token_padding is None:
+            if token_paddings_sorted:
+                selected_per_dp_token_padding = token_paddings_sorted[-1]
+            else:
+                raise ValueError(
+                    f"No token padding size available for {max_group_token_count} tokens"
                 )
 
-            # Start location of each sequence in the flattened array
-            extend_start_loc = np.cumsum(
-                np.concatenate([np.array([0]), extend_seq_lens[:-1]]),
-                dtype=seq_lens_cpu.dtype,
-            )
-        else:
-            # For decode: each sequence contributes one token at the next position (seq_len)
-            # Create positions for actual tokens (one per sequence at seq_len)
-            batch_positions = seq_lens_cpu - 1
-            # Create positions array matching the length of input_ids (including padding)
-            positions_cpu = np.zeros(len(input_ids_cpu), dtype=batch_positions.dtype)
-            # Fill in the actual positions for the real tokens
-            # positions = positions.at[: len(batch_positions)].set(batch_positions)
-            positions_cpu[: len(batch_positions)] = batch_positions
-            # The padding tokens (if any) will have position 0, which is fine for padding
-            # For decode, extend_start_loc is typically not used but we'll set it anyway
-            extend_start_loc = np.arange(len(seq_lens_cpu), dtype=seq_lens_cpu.dtype)
-
-        bs_padding_size = 0
-        bs_paddings.sort()
-        select_bs_index = -1
-        for i, size in enumerate(bs_paddings):
-            if size >= len(seq_lens_cpu):
-                bs_padding_size = size - len(seq_lens_cpu)
-                select_bs_index = i
+        selected_per_dp_bs_padding = None
+        for size in bs_paddings_sorted:
+            if size >= max_group_bs:
+                selected_per_dp_bs_padding = size
                 break
 
+        if selected_per_dp_bs_padding is None:
+            if bs_paddings_sorted:
+                selected_per_dp_bs_padding = bs_paddings_sorted[-1]
+            else:
+                raise ValueError(f"No BS padding size available for {max_group_bs} requests")
+
+        for dp_rank in sorted_dp_ranks:
+            group_indices = dp_groups[dp_rank]
+
+            # Build input_ids for this group
+            group_input_ids = []
+            group_out_cache_loc = []
+            group_seq_lens = []
+            group_req_pool_indices = []
+            group_extend_lens = [] if self.forward_mode.is_extend() else None
+            group_prefix_lens = [] if self.forward_mode.is_extend() else None
+
+            for req_idx in group_indices:
+                req = self.reqs[req_idx]
+                if self.forward_mode.is_extend():
+                    # Prefill mode: use fill_ids
+                    group_input_ids.extend(req.fill_ids)
+                    group_extend_lens.append(req.extend_input_len)
+                    group_prefix_lens.append(len(req.prefix_indices))
+                else:
+                    # Decode mode: use last output token
+                    group_input_ids.append(req.output_ids[-1])
+
+                group_seq_lens.append(req.seqlen)
+                group_req_pool_indices.append(req.req_pool_idx)
+
+            # Get out_cache_loc for this group from self.out_cache_loc
+            # We need to extract the corresponding part for this group
+            if self.out_cache_loc is not None and len(self.out_cache_loc) > 0:
+                for req_idx in group_indices:
+                    start_idx = cumsum_lens[req_idx]
+                    end_idx = cumsum_lens[req_idx + 1]
+                    group_out_cache_loc.extend(self.out_cache_loc[start_idx:end_idx])
+
+            # Apply uniform per-DP token padding for this group
+            padding_size = selected_per_dp_token_padding - len(group_input_ids)
+            assert (
+                padding_size >= 0
+            ), f"Negative padding: {selected_per_dp_token_padding} - {len(group_input_ids)}"
+
+            if padding_size > 0:
+                group_input_ids.extend([0] * padding_size)
+
+            # Pad out_cache_loc to match input_ids length
+            out_cache_loc_padding = len(group_input_ids) - len(group_out_cache_loc)
+            if out_cache_loc_padding > 0:
+                group_out_cache_loc.extend([-1] * out_cache_loc_padding)
+
+            # Calculate positions for this group
+            if self.forward_mode.is_extend():
+                # Prefill: positions for each token
+                group_positions = []
+                for seq_len, prefix_len in zip(group_seq_lens, group_prefix_lens):
+                    group_positions.extend(list(range(prefix_len, seq_len)))
+
+                # Pad positions
+                pos_padding = len(group_input_ids) - len(group_positions)
+                if pos_padding > 0:
+                    group_positions.extend([0] * pos_padding)
+
+                # Calculate extend_start_loc for this group
+                group_extend_start_loc = np.cumsum(
+                    [0] + group_extend_lens[:-1], dtype=np.int32
+                ).tolist()
+                all_extend_start_loc.extend(group_extend_start_loc)
+            else:
+                # Decode: positions are seq_len - 1 for each request
+                group_positions = [seq_len - 1 for seq_len in group_seq_lens]
+                # Pad to match token count (should be equal in decode mode)
+                pos_padding = len(group_input_ids) - len(group_positions)
+                if pos_padding > 0:
+                    group_positions.extend([0] * pos_padding)
+
+            # Apply uniform BS padding for this group
+            bs_padding_size = selected_per_dp_bs_padding - len(group_seq_lens)
+            assert (
+                bs_padding_size >= 0
+            ), f"Negative BS padding: {selected_per_dp_bs_padding} - {len(group_seq_lens)}"
+
+            # Add BS padding entries
+            if bs_padding_size > 0:
+                group_seq_lens.extend([0] * bs_padding_size)
+                group_req_pool_indices.extend([-1] * bs_padding_size)
+
+            # Append group data to final arrays
+            all_input_ids.extend(group_input_ids)
+            all_out_cache_loc.extend(group_out_cache_loc)
+            all_positions.extend(group_positions)
+            all_seq_lens.extend(group_seq_lens)
+            all_req_pool_indices.extend(group_req_pool_indices)
+
+            total_padded_tokens += len(group_input_ids)
+
+        # Validate total batch size matches precompiled size
+        total_tokens = len(all_input_ids)
+        expected_total_tokens = selected_per_dp_token_padding * self.dp_size
+
+        if total_tokens != expected_total_tokens:
+            raise ValueError(
+                f"DP batch size mismatch: total={total_tokens}, "
+                f"expected={expected_total_tokens} "
+                f"(per_dp={selected_per_dp_token_padding} * dp_size={self.dp_size})"
+            )
+
+        # Verify matches precompiled size
+        if expected_total_tokens not in token_paddings:
+            logger.warning(
+                "Total batch size %s not in precompiled token_paddings %s. "
+                "This may trigger recompilation!",
+                expected_total_tokens,
+                token_paddings,
+            )
+
+        # Validate BS
+        total_bs = len(all_seq_lens)
+        expected_total_bs = selected_per_dp_bs_padding * self.dp_size
+        if total_bs != expected_total_bs:
+            raise ValueError(f"DP BS mismatch: total={total_bs}, expected={expected_total_bs}")
+
+        # Convert to numpy arrays
+        input_ids_cpu = np.array(all_input_ids, dtype=np.int32)
+        out_cache_loc_cpu = np.array(all_out_cache_loc, dtype=np.int32)
+        positions_cpu = np.array(all_positions, dtype=np.int32)
+        seq_lens_cpu = np.array(all_seq_lens, dtype=np.int32)
+        req_pool_indices_cpu = np.array(all_req_pool_indices, dtype=np.int32)
+        if self.forward_mode.is_extend():
+            extend_start_loc = np.array(all_extend_start_loc, dtype=np.int32)
+
+        real_input_ids_len = sum(
+            len(self.reqs[i].fill_ids) if self.forward_mode.is_extend() else 1
+            for i in range(len(self.reqs))
+        )
+        token_indices_with_all_reqs = self.req_to_token_pool.req_to_token[req_pool_indices_cpu]
+
+        # For decode mode, set extend_start_loc
+        if not self.forward_mode.is_extend():
+            extend_start_loc = np.arange(len(seq_lens_cpu), dtype=seq_lens_cpu.dtype)
+
+        # Build cache_loc
         cache_loc_flat = np.array([], dtype=np.int32)
         if len(seq_lens_cpu) > 0:
             # Filter out empty sequences
@@ -1500,8 +1626,36 @@ class ScheduleBatch:
 
         offset = np.sum(seq_lens_cpu[seq_lens_cpu > 0]) if len(seq_lens_cpu) > 0 else 0
 
-        total_cache_loc_size = cache_loc_paddings[select_bs_index]
-        assert total_cache_loc_size >= len(cache_loc_flat)
+        # Calculate total cache_loc size based on uniform BS padding
+        # Note: cache_loc_paddings was divided by dp_size at line 1374 (per_dp values)
+        # Find the cache_loc_padding that corresponds to selected_per_dp_bs_padding
+        cache_loc_paddings_sorted = sorted(cache_loc_paddings)
+
+        # Find corresponding cache_loc_padding for selected_per_dp_bs_padding
+        # Since cache_loc_paddings[i] is calculated from bs_paddings[i],
+        # we find the index of selected_per_dp_bs_padding in bs_paddings
+        try:
+            bs_idx = per_dp_bs_paddings.index(selected_per_dp_bs_padding)
+            selected_per_dp_cache_loc_padding = per_dp_cache_loc_paddings[bs_idx]
+        except (ValueError, IndexError):
+            # Fallback: select the smallest cache_loc_padding that fits
+            selected_per_dp_cache_loc_padding = None
+            for size in cache_loc_paddings_sorted:
+                if size * self.dp_size >= len(cache_loc_flat):
+                    selected_per_dp_cache_loc_padding = size
+                    break
+            if selected_per_dp_cache_loc_padding is None:
+                selected_per_dp_cache_loc_padding = (
+                    cache_loc_paddings_sorted[-1]
+                    if cache_loc_paddings_sorted
+                    else ((len(cache_loc_flat) + self.dp_size - 1) // self.dp_size)
+                )
+
+        total_cache_loc_size = selected_per_dp_cache_loc_padding * self.dp_size
+
+        assert total_cache_loc_size >= len(
+            cache_loc_flat
+        ), f"cache_loc size {total_cache_loc_size} < required {len(cache_loc_flat)}"
 
         cache_loc_cpu = np.empty(total_cache_loc_size, dtype=np.int32)
         if len(cache_loc_flat) > 0:
@@ -1509,47 +1663,6 @@ class ScheduleBatch:
         # Initialize padding area to ensure multiprocess consistency
         if len(cache_loc_flat) < total_cache_loc_size:
             cache_loc_cpu[len(cache_loc_flat) :] = 0
-
-        if bs_padding_size > 0:
-            invalid_req_pool_indices = np.array(
-                [-1] * bs_padding_size, dtype=req_pool_indices_cpu.dtype
-            )
-            req_pool_indices_cpu = np.concat(
-                [
-                    req_pool_indices_cpu,
-                    invalid_req_pool_indices,
-                ],
-                axis=0,
-            )
-            invalid_seq_lens = np.array([0] * bs_padding_size, dtype=seq_lens_cpu.dtype)
-            seq_lens_cpu = np.concat([seq_lens_cpu, invalid_seq_lens], axis=0)
-            if self.forward_mode.is_extend():
-                invalid_extend_start_loc = np.array(
-                    [extend_start_loc[-1] + extend_seq_lens[-1]] * bs_padding_size,
-                    dtype=extend_start_loc.dtype,
-                )
-                extend_start_loc = np.concat([extend_start_loc, invalid_extend_start_loc], axis=0)
-                invalid_extend_prefix_lens = np.array(
-                    [0] * bs_padding_size, dtype=extend_prefix_lens.dtype
-                )
-                extend_prefix_lens = np.concat(
-                    [extend_prefix_lens, invalid_extend_prefix_lens], axis=0
-                )
-                invalid_extend_seq_lens = np.array(
-                    [0] * bs_padding_size, dtype=extend_seq_lens.dtype
-                )
-                extend_seq_lens = np.concat([extend_seq_lens, invalid_extend_seq_lens], axis=0)
-
-                invalid_extend_logprob_start_lens = np.array([0] * bs_padding_size, dtype=np.int32)
-                extend_logprob_start_lens = np.concat(
-                    [extend_logprob_start_lens, invalid_extend_logprob_start_lens], axis=0
-                )
-
-            else:
-                invalid_extend_start_loc = np.array(
-                    [len(seq_lens_cpu)] * bs_padding_size, dtype=extend_start_loc.dtype
-                )
-                extend_start_loc = np.concat([extend_start_loc, invalid_extend_start_loc], axis=0)
 
         sampling_info = self.sampling_info
         if self.sampling_info:
@@ -1599,11 +1712,16 @@ class ScheduleBatch:
         if precision_tracer.get_trace_active():
             self._generate_trace_info(real_bs, bid)
 
-        # Extract lora_ids from requests
-        lora_ids = [req.lora_id for req in self.reqs]
-        # Pad lora_ids to match seq_lens_cpu length (after bs padding)
-        if bs_padding_size > 0:
-            lora_ids = lora_ids + [None] * bs_padding_size
+        # Build lora_ids in dp_rank order (matching seq_lens_cpu which includes padding)
+        lora_ids_ordered = []
+        for orig_idx in new_to_orig_idx:
+            lora_ids_ordered.append(self.reqs[orig_idx].lora_id)
+
+        # Add padding lora_ids to match seq_lens_cpu length
+        total_bs_with_padding = len(seq_lens_cpu)
+        num_bs_padding = total_bs_with_padding - len(lora_ids_ordered)
+        if num_bs_padding > 0:
+            lora_ids_ordered.extend([None] * num_bs_padding)
 
         return ModelWorkerBatch(
             bid=bid,
@@ -1627,12 +1745,9 @@ class ScheduleBatch:
             extend_seq_lens=(extend_seq_lens if self.forward_mode == ForwardMode.EXTEND else None),
             extend_logprob_start_lens=extend_logprob_start_lens,
             extend_input_logprob_token_ids=self.extend_input_logprob_token_ids,
-            lora_ids=(
-                [req.lora_id for req in self.reqs] + ["0"] * bs_padding_size
-                if not enable_static_lora
-                else ["0"] * bs_paddings[select_bs_index]
-            ),
+            lora_ids=lora_ids_ordered if not enable_static_lora else ["0"] * total_bs_with_padding,
             real_bs=real_bs,
+            dp_reorder_map=new_to_orig_idx if self.dp_size > 1 else None,
             capture_hidden_mode=CaptureHiddenMode.NULL,
             launch_done=self.launch_done,
         )
@@ -2154,6 +2269,8 @@ class ModelWorkerBatch:
 
     # For padding
     real_bs: int
+    # Maps new_idx -> orig_idx for DP-aware batches (None for dp_size=1)
+    dp_reorder_map: list[int] | None = None
 
     # For LoRA
     lora_ids: list[str] | None = None

@@ -71,6 +71,26 @@ class TestSWARadixCache(unittest.TestCase):
             disable=False,
         )
 
+    def _create_swa_allocator(self, dp_size: int):
+        kv_pool = SWAKVPool(
+            size=128,
+            size_swa=128,
+            swa_attention_layer_ids=[0],
+            full_attention_layer_ids=[1],
+            token_to_kv_pool_class=MHATokenToKVPool,
+            page_size=1,
+            dtype=self.dtype,
+            head_num=self.kv_head_num,
+            head_dim=self.head_dim,
+            mesh=self.mesh,
+        )
+        return SWATokenToKVPoolAllocator(
+            size=128,
+            size_swa=128,
+            kvcache=kv_pool,
+            dp_size=dp_size,
+        )
+
     def _alloc_indices(self, n: int) -> np.ndarray:
         idx = self.allocator.alloc(n)
         self.assertIsNotNone(idx)
@@ -434,6 +454,40 @@ class TestSWARadixCache(unittest.TestCase):
         self.assertEqual(single.token_ids, [1])
         self.assertEqual(single.extra_key, "test_key")
         self.assertEqual(single.dp_rank, 2)
+
+    def test_swa_free_group_batching_multi_rank(self):
+        """Test SWA allocator free_group batching for multiple DP ranks."""
+        dp_size = 2
+        allocator = self._create_swa_allocator(dp_size=dp_size)
+
+        initial_full = [allocator.full_available_size(dp_rank=r) for r in range(dp_size)]
+        initial_swa = [allocator.swa_available_size(dp_rank=r) for r in range(dp_size)]
+
+        alloc_size = 4
+        alloc_r0 = allocator.alloc(alloc_size, dp_rank=0)
+        alloc_r1 = allocator.alloc(alloc_size, dp_rank=1)
+        self.assertIsNotNone(alloc_r0)
+        self.assertIsNotNone(alloc_r1)
+
+        allocator.free_group_begin()
+        self.assertIsInstance(allocator.free_group, list)
+        self.assertEqual(len(allocator.free_group), dp_size)
+        for rank in range(dp_size):
+            self.assertEqual(allocator.free_group[rank], [])
+
+        allocator.free(alloc_r0, dp_rank=0)
+        allocator.free(alloc_r1, dp_rank=1)
+
+        self.assertEqual(allocator.full_available_size(dp_rank=0), initial_full[0] - alloc_size)
+        self.assertEqual(allocator.full_available_size(dp_rank=1), initial_full[1] - alloc_size)
+        self.assertEqual(allocator.swa_available_size(dp_rank=0), initial_swa[0] - alloc_size)
+        self.assertEqual(allocator.swa_available_size(dp_rank=1), initial_swa[1] - alloc_size)
+
+        allocator.free_group_end()
+        self.assertEqual(allocator.full_available_size(dp_rank=0), initial_full[0])
+        self.assertEqual(allocator.full_available_size(dp_rank=1), initial_full[1])
+        self.assertEqual(allocator.swa_available_size(dp_rank=0), initial_swa[0])
+        self.assertEqual(allocator.swa_available_size(dp_rank=1), initial_swa[1])
 
 
 if __name__ == "__main__":
