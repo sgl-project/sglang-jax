@@ -5,6 +5,11 @@ from jax import shard_map
 from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 
+from sgl_jax.srt.eplb.expert_location import (
+    ExpertLocationMetadata,
+    get_global_expert_location_metadata,
+    topk_ids_logical_to_physical,
+)
 from sgl_jax.srt.kernels.fused_moe.v1.kernel import FusedMoEBlockConfig, fused_ep_moe
 from sgl_jax.srt.kernels.gmm.megablox_gmm_backend import gmm
 from sgl_jax.srt.utils.jax_utils import is_tpu_runtime
@@ -74,15 +79,22 @@ class TopK(nnx.Module):
         num_expert_group: int = 0,
         topk_group: int = 0,
         routed_scaling_factor: float | None = None,
+        layer_id: int = 0,
     ):
         self.topk = topk
         self.renormalize = renormalize
         self.num_expert_group = num_expert_group
         self.topk_group = topk_group
         self.routed_scaling_factor = routed_scaling_factor
+        self.layer_id = layer_id
 
     @named_scope
-    def __call__(self, router_logits: jax.Array, correction_bias: jax.Array = None):
+    def __call__(
+        self,
+        router_logits: jax.Array,
+        correction_bias: jax.Array = None,
+        dispatch_info: ExpertLocationMetadata | None = None,
+    ):
         router_logits = router_logits.astype(jnp.float32)
 
         if self.num_expert_group > 0 or self.topk_group > 0:
@@ -95,6 +107,9 @@ class TopK(nnx.Module):
                 topk_weights, topk_ids = self._biased_topk(router_logits, correction_bias)
             else:
                 topk_weights, topk_ids = self._topk(router_logits)
+
+        if dispatch_info is not None:
+            topk_ids = topk_ids_logical_to_physical(topk_ids, dispatch_info, self.layer_id)
 
         if self.renormalize:
             topk_weights = topk_weights / (jnp.sum(topk_weights, axis=-1, keepdims=True))
@@ -203,9 +218,17 @@ class EPMoE(nnx.Module):
         activation: str = "silu",
         layer_id: int = 0,
         quantization_config=None,
+        physical_to_logical_map: "jax.Array | None" = None,
     ):
-        self.num_experts = num_experts
         self.num_experts_per_tok = num_experts_per_tok
+        self.physical_to_logical_map = physical_to_logical_map
+
+        metadata = get_global_expert_location_metadata()
+        if metadata is not None and layer_id is not None:
+            self.num_experts = metadata.num_physical_experts
+        else:
+            self.num_experts = num_experts
+
         self.intermediate_dim = intermediate_dim
         self.weight_dtype = weight_dtype
         self.dtype = dtype  # original dtype
@@ -224,13 +247,13 @@ class EPMoE(nnx.Module):
             quantization_config.get_moe_activation_dtype() if quantization_config else None
         )
 
-        if num_experts % self.ep_size != 0:
+        if self.num_experts % self.ep_size != 0:
             raise ValueError(
-                f"num_experts({num_experts}) must be divisible by ep_size ({self.ep_size})"
+                f"num_experts({self.num_experts}) must be divisible by ep_size ({self.ep_size})"
             )
         world_size = self.mesh.shape.get("data", 1) * mesh.shape.get("tensor", 1)
         self.tp_size = world_size // self.ep_size
-        self.experts_per_device = num_experts // self.ep_size
+        self.experts_per_device = self.num_experts // self.ep_size
 
         devices = self.mesh.devices.flatten()
         self.moe_mesh = jax.sharding.Mesh(
@@ -249,7 +272,7 @@ class EPMoE(nnx.Module):
             self.wi_0 = nnx.Param(
                 jax.random.normal(
                     jax.random.PRNGKey(0),
-                    (num_experts, intermediate_dim, hidden_size),
+                    (self.num_experts, intermediate_dim, hidden_size),
                     dtype=weight_dtype,
                     out_sharding=P("expert", "tensor", None),
                 )
@@ -258,7 +281,7 @@ class EPMoE(nnx.Module):
             self.wi_1 = nnx.Param(
                 jax.random.normal(
                     jax.random.PRNGKey(0),
-                    (num_experts, intermediate_dim, hidden_size),
+                    (self.num_experts, intermediate_dim, hidden_size),
                     dtype=weight_dtype,
                     out_sharding=P("expert", "tensor", None),
                 )
@@ -267,7 +290,7 @@ class EPMoE(nnx.Module):
             self.wo = nnx.Param(
                 jax.random.normal(
                     jax.random.PRNGKey(0),
-                    (num_experts, hidden_size, intermediate_dim),
+                    (self.num_experts, hidden_size, intermediate_dim),
                     dtype=weight_dtype,
                     out_sharding=P("expert", None, "tensor"),
                 )
@@ -739,7 +762,6 @@ class FusedEPMoE(nnx.Module):
         quantization_config=None,
     ):
         self.hidden_size = hidden_size
-        self.num_experts = num_experts
         self.num_experts_per_tok = num_experts_per_tok
         self.intermediate_dim = intermediate_dim
         self.weight_dtype = weight_dtype
@@ -758,9 +780,15 @@ class FusedEPMoE(nnx.Module):
         )
         self.mesh = mesh
 
-        if num_experts % self.ep_size != 0:
+        metadata = get_global_expert_location_metadata()
+        if metadata is not None and layer_id is not None:
+            self.num_experts = metadata.num_physical_experts
+        else:
+            self.num_experts = num_experts
+
+        if self.num_experts % self.ep_size != 0:
             raise ValueError(
-                f"num_experts({num_experts}) must be divisible by ep_size ({self.ep_size})"
+                f"num_experts({self.num_experts}) must be divisible by ep_size ({self.ep_size})"
             )
 
         self.quantized_dtype = (
@@ -774,7 +802,7 @@ class FusedEPMoE(nnx.Module):
         self.w1 = nnx.Param(
             jax.random.normal(
                 jax.random.key(0),
-                (num_experts, hidden_size, intermediate_dim),
+                (self.num_experts, hidden_size, intermediate_dim),
                 dtype=weight_dtype,
                 out_sharding=P(("data", "tensor"), None, None),
             )
@@ -782,7 +810,7 @@ class FusedEPMoE(nnx.Module):
         self.w3 = nnx.Param(
             jax.random.normal(
                 jax.random.key(1),
-                (num_experts, hidden_size, intermediate_dim),
+                (self.num_experts, hidden_size, intermediate_dim),
                 dtype=weight_dtype,
                 out_sharding=P(("data", "tensor"), None, None),
             )
@@ -791,7 +819,7 @@ class FusedEPMoE(nnx.Module):
         self.w2 = nnx.Param(
             jax.random.normal(
                 jax.random.key(0),
-                (num_experts, intermediate_dim, hidden_size),
+                (self.num_experts, intermediate_dim, hidden_size),
                 dtype=weight_dtype,
                 out_sharding=P(("data", "tensor"), None, None),
             )
@@ -1003,6 +1031,8 @@ class FusedEPMoE(nnx.Module):
         router_logits: jax.Array,
         router_bias: jax.Array | None = None,
         token_valid_mask: jax.Array | None = None,
+        l2p_map: jax.Array | None = None,
+        l2p_num_valid: jax.Array | None = None,
         *,
         block_config: FusedMoEBlockConfig | None = None,
     ) -> jax.Array:
@@ -1026,9 +1056,6 @@ class FusedEPMoE(nnx.Module):
         w1_shared_val = self.w1_shared.value if self.w1_shared is not None else None
         w3_shared_val = self.w3_shared.value if self.w3_shared is not None else None
         w2_shared_val = self.w2_shared.value if self.w2_shared is not None else None
-        # w1_shared_val = None
-        # w3_shared_val = None
-        # w2_shared_val = None
 
         w1_scale = self.w1_scale.value if self.w1_scale is not None else None
         w3_scale = self.w3_scale.value if self.w3_scale is not None else None
@@ -1036,10 +1063,10 @@ class FusedEPMoE(nnx.Module):
         w1_shared_scale = self.w1_shared_scale.value if self.w1_shared_scale is not None else None
         w3_shared_scale = self.w3_shared_scale.value if self.w3_shared_scale is not None else None
         w2_shared_scale = self.w2_shared_scale.value if self.w2_shared_scale is not None else None
-        # w1_shared_scale = None
-        # w3_shared_scale = None
-        # w2_shared_scale = None
+
         subc_quant_wsz = self.subc_quant_wsz if self.subc_quant_wsz is not None else None
+        l2p_map_value = l2p_map[self.layer_id] if l2p_map is not None else None
+        l2p_num_valid_value = l2p_num_valid[self.layer_id] if l2p_num_valid is not None else None
 
         output = fused_ep_moe(
             mesh=self.mesh,
@@ -1072,6 +1099,8 @@ class FusedEPMoE(nnx.Module):
             b1=None,
             b2=None,
             b3=None,
+            l2p_map=l2p_map_value,
+            l2p_num_valid=l2p_num_valid_value,
             dp_axis_name="data",
             tp_axis_name="tensor",
         )
@@ -1096,8 +1125,27 @@ def create_moe_weights_mapping(
     moe_backend: str = "epmoe",
     moe_path: str = "mlp",
     source_expert_pattern: str = "experts.{i}",
+    physical_to_logical_map=None,  # np.ndarray shape (num_physical,) or None
+    layer_id: int | None = None,
 ) -> dict:
     """Generate a unified mapping dictionary for MoE layer expert weights."""
+    if physical_to_logical_map is None and layer_id is not None:
+        try:
+            from sgl_jax.srt.eplb.expert_location import (
+                get_global_expert_location_metadata,
+            )
+        except Exception:
+            get_global_expert_location_metadata = None
+
+        if get_global_expert_location_metadata is not None:
+            metadata = get_global_expert_location_metadata()
+        else:
+            metadata = None
+
+        if metadata is not None and metadata.physical_to_logical_map is not None:
+            physical_to_logical_map = metadata.physical_to_logical_map[layer_id]
+            num_experts = metadata.num_physical_experts
+
     if moe_backend == "epmoe":
         expert_type_map = {
             expert_type_names[0]: "wi_0",
@@ -1121,7 +1169,7 @@ def create_moe_weights_mapping(
         # Target path for JAX model parameters (matching EPMoE internal variables)
         target_path_base = f"{target_prefix}.{moe_path}.{target_name}"
 
-        # Source weight paths for all experts to be loaded and concatenated
+        # Source weight paths for logical experts only
         expert_keys = [
             f"{prefix}.{moe_path}.{source_expert_pattern.format(i=i)}.{source_name}.weight"
             for i in range(num_experts)
@@ -1152,6 +1200,7 @@ def create_moe_weights_mapping(
             sharding=sharding,
             transpose=transpose,
             concat_axis=concat_axis,
+            physical_to_logical_map=physical_to_logical_map,
         )
 
     return mappings

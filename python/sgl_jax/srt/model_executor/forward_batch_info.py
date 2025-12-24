@@ -28,6 +28,10 @@ from jax.sharding import NamedSharding, PartitionSpec
 from jax.tree_util import register_pytree_node_class
 
 from sgl_jax.srt.configs.model_config import need_attention_mask
+from sgl_jax.srt.eplb.expert_location import (
+    ExpertLocationMetadata,
+    get_global_expert_location_metadata,
+)
 from sgl_jax.srt.speculative.spec_info import SpeculativeAlgorithm
 from sgl_jax.srt.utils.jax_utils import device_array
 
@@ -165,6 +169,9 @@ class ForwardBatch:
     lora_token_indices: jax.Array = None
     lora_ranks: jax.Array = None
 
+    # For EPLB
+    expert_location_metadata: ExpertLocationMetadata | None = None
+
     trace_request_ids: list[str] | None = None
     trace_request_objects: list | None = None
 
@@ -195,6 +202,7 @@ class ForwardBatch:
             self.lora_token_indices,
             self.lora_ranks,
             self.spec_info,
+            self.expert_location_metadata,
             self.attention_mask,
             self.input_embedding,
             self.mrope_positions,
@@ -235,6 +243,7 @@ class ForwardBatch:
         obj.lora_token_indices = children[10]
         obj.lora_ranks = children[11]
         obj.spec_info = children[12]
+        obj.expert_location_metadata = children[13]
         # Handle optional children for backward compatibility
         obj.attention_mask = children[14] if len(children) > 14 else None
         obj.input_embedding = children[15] if len(children) > 15 else None
@@ -258,6 +267,7 @@ class ForwardBatch:
             "lora_token_indices",
             "lora_ranks",
             "mrope_positions",
+            "expert_location_metadata",
         ]:
             value = getattr(self, field_name, None)
             if value is not None and isinstance(value, jax.Array):
@@ -356,6 +366,8 @@ class ForwardBatch:
                 batch.lora_ranks,
             )
 
+        expert_location_metadata = get_global_expert_location_metadata()
+
         obj = cls(
             bid=batch.bid,
             forward_mode=batch.forward_mode,
@@ -377,6 +389,7 @@ class ForwardBatch:
             spec_algorithm=batch.spec_algorithm,
             capture_hidden_mode=batch.capture_hidden_mode,
             input_embedding=input_embedding,
+            expert_location_metadata=expert_location_metadata,
         )
 
         # Auto-generate attention mask for Encoder-only models (e.g. UMT5Encoder, BERT)

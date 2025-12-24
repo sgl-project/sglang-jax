@@ -9,6 +9,7 @@ from jax.sharding import PartitionSpec as P
 from transformers import PretrainedConfig
 
 from sgl_jax.srt.configs.model_config import ModelConfig, MoEBackend
+from sgl_jax.srt.eplb.expert_location import ExpertLocationMetadata
 from sgl_jax.srt.layers.embeddings import Embed, ParallelLMHead, RotaryEmbedding
 from sgl_jax.srt.layers.layernorm import RMSNorm
 from sgl_jax.srt.layers.linear import LinearBase
@@ -340,6 +341,7 @@ class BailingMoEDecoderLayer(nnx.Module):
                     num_expert_group=config.n_group,
                     topk_group=config.topk_group,
                     routed_scaling_factor=config.routed_scaling_factor,
+                    layer_id=layer_id,
                 )
                 self.mlp = EPMoE(
                     hidden_size=config.hidden_size,
@@ -386,6 +388,7 @@ class BailingMoEDecoderLayer(nnx.Module):
         forward_batch: ForwardBatch,
         token_to_kv_pool: KVCache,
         residual: jax.Array | None = None,
+        dispatch_info: ExpertLocationMetadata | None = None,
     ) -> tuple[jax.Array, jax.Array]:
         if residual is None:
             residual = hidden_states
@@ -420,10 +423,17 @@ class BailingMoEDecoderLayer(nnx.Module):
                     router_logits,
                     router_bias=correction_bias,
                     token_valid_mask=token_valid_mask,
+                    l2p_map=dispatch_info.logical_to_all_physical_map,
+                    l2p_num_valid=dispatch_info.logical_to_all_physical_map_num_valid,
                 )
                 topk_ids = None
             else:
-                topk_weights, topk_ids = self.topk(router_logits, correction_bias)
+                router_logits = jax.sharding.reshard(router_logits, P())
+                topk_weights, topk_ids = self.topk(
+                    router_logits,
+                    correction_bias=correction_bias,
+                    dispatch_info=dispatch_info,
+                )
                 hidden_states = self.mlp(hidden_states, topk_weights, topk_ids)
 
             if shared_output is not None:
@@ -488,6 +498,7 @@ class BailingMoEModel(nnx.Module):
                 forward_batch,
                 token_to_kv_pool,
                 residual,
+                dispatch_info=forward_batch.expert_location_metadata,
             )
             layers_kv_fused.append(kv_fused)
             layers_topk_ids.append(topk_ids)
@@ -690,7 +701,7 @@ class BailingMoEForCausalLM(nnx.Module):
                     target_path=f"{target_prefix}.moe_gate.bias", sharding=(None,)
                 )
 
-            num_experts = getattr(self.config, "num_experts", 256)
+            num_logical_experts = getattr(self.config, "num_experts", 256)
             moe_backend = getattr(self.config, "moe_backend", "epmoe")
             use_fused = moe_backend == "fused"
 
@@ -698,12 +709,25 @@ class BailingMoEForCausalLM(nnx.Module):
             hidden_size = self.config.hidden_size
             inter_size = getattr(self.config, "moe_intermediate_size", 2048)
 
+            # Get physical to logical mapping for redundant experts
+            from sgl_jax.srt.eplb.expert_location import (
+                get_global_expert_location_metadata,
+            )
+
+            metadata = get_global_expert_location_metadata()
+            phy_to_log = None
+            num_experts = num_logical_experts
+            if metadata is not None:
+                num_experts = metadata.num_physical_experts
+                phy_to_log = metadata.physical_to_logical_map[layer_idx]
+
             moe_mappings = create_moe_weights_mapping(
                 prefix=prefix,
                 target_prefix=target_prefix,
-                num_experts=num_experts,
+                num_experts=num_logical_experts,
                 expert_type_names=("gate_proj", "up_proj", "down_proj"),
                 moe_backend=moe_backend,
+                physical_to_logical_map=phy_to_log,
             )
 
             if is_static_quant:
@@ -717,6 +741,7 @@ class BailingMoEForCausalLM(nnx.Module):
                         sharding=mapping.sharding,
                         transpose=mapping.transpose,
                         concat_axis=mapping.concat_axis,
+                        physical_to_logical_map=mapping.physical_to_logical_map,
                     )
 
                     scale_key = key + "_scale"
@@ -748,6 +773,7 @@ class BailingMoEForCausalLM(nnx.Module):
                             reshape=scale_reshape,
                             repeat=scale_repeat,
                             concat_axis=mapping.concat_axis,
+                            physical_to_logical_map=mapping.physical_to_logical_map,
                         )
 
                     else:
@@ -769,6 +795,7 @@ class BailingMoEForCausalLM(nnx.Module):
                             reshape=scale_reshape,
                             repeat=scale_repeat,
                             concat_axis=mapping.concat_axis,
+                            physical_to_logical_map=mapping.physical_to_logical_map,
                         )
 
                 mappings.update(new_moe_mappings)
@@ -868,7 +895,8 @@ class BailingMoEForCausalLM(nnx.Module):
         logits_metadata: LogitsMetadata,
     ):
         hidden_states, layers_kv_fused, layers_topk_ids = self.model(
-            forward_batch, token_to_kv_pool
+            forward_batch,
+            token_to_kv_pool,
         )
         if not getattr(self.config, "tie_word_embeddings", False):
             output = self.logits_processor(hidden_states, self.lm_head, logits_metadata)

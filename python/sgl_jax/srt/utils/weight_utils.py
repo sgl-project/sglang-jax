@@ -52,6 +52,7 @@ class WeightMapping:
     kv_head_padding: bool = False
     concat_axis: int | None = None
     is_eagle3: bool = False
+    physical_to_logical_map: np.ndarray | None = None
 
     def __post_init__(self):
         if self.sharding is None:
@@ -382,14 +383,19 @@ class WeightLoader:
         concat_axis: int,
         do_transpose: bool = False,
         target_sharding: jax.sharding.NamedSharding = None,
+        physical_to_logical_map: np.ndarray | None = None,
     ) -> jax.Array:
         """
         Lazy loader for TP-Split MOE weights (e.g., Grok MOE).
         """
-        num_experts = len(expected_hf_keys)
+        num_logical_experts = len(expected_hf_keys)
+        num_physical_experts = (
+            len(physical_to_logical_map)
+            if physical_to_logical_map is not None
+            else num_logical_experts
+        )
 
         # 1. Build file intervals for each expert
-        # expert_file_intervals[expert_idx] = [(start, end, info), ...]
         expert_file_intervals = []
         expert_global_shapes = []
 
@@ -410,14 +416,12 @@ class WeightLoader:
         }
         target_dtype = dtype_map.get(st_dtype, jnp.float32)
 
-        for expert_idx, hf_key in enumerate(expected_hf_keys):
+        for hf_key in expected_hf_keys:
             infos = weight_infos[hf_key]
             sorted_infos = sorted(infos, key=lambda x: x["file"])
-
             cumulative_start = 0
-            file_intervals = []  # List of (start, end, info)
+            file_intervals = []
             base_shape = list(sorted_infos[0]["shape"])
-
             for info in sorted_infos:
                 shape = info["shape"]
                 length = shape[concat_axis]
@@ -425,131 +429,88 @@ class WeightLoader:
                 end = start + length
                 file_intervals.append((start, end, info))
                 cumulative_start = end
-
-            # Global shape for this expert (after TP concat)
             global_shape = list(base_shape)
             global_shape[concat_axis] = cumulative_start
-            global_shape = tuple(global_shape)
-
             expert_file_intervals.append(file_intervals)
-            expert_global_shapes.append(global_shape)
+            expert_global_shapes.append(tuple(global_shape))
 
-        # All experts should have the same global shape
         single_expert_shape = expert_global_shapes[0]
-
-        # 2. Determine final shape considering transpose
-        if do_transpose:
-            if len(single_expert_shape) >= 2:
-                final_single_shape = list(single_expert_shape)
-                final_single_shape[-1], final_single_shape[-2] = (
-                    final_single_shape[-2],
-                    final_single_shape[-1],
-                )
-                final_single_shape = tuple(final_single_shape)
-            else:
-                final_single_shape = single_expert_shape
+        if do_transpose and len(single_expert_shape) >= 2:
+            final_single_shape = list(single_expert_shape)
+            final_single_shape[-1], final_single_shape[-2] = (
+                final_single_shape[-2],
+                final_single_shape[-1],
+            )
+            final_single_shape = tuple(final_single_shape)
         else:
             final_single_shape = single_expert_shape
 
-        stacked_shape = (num_experts, *final_single_shape)
+        stacked_shape = (num_physical_experts, *final_single_shape)
+        sharding = target_sharding or jax.sharding.NamedSharding(self.mesh, P())
 
-        if target_sharding is None:
-            sharding = jax.sharding.NamedSharding(self.mesh, P())
-        else:
-            sharding = target_sharding
-
-        # 3. Define helper to load a single expert's slice with smart stitching
         def _load_single_expert_slice(expert_idx, inner_index):
-            """
-            Load a slice from a single expert, handling TP-split files.
-            inner_index: the slice indices for dimensions after expert dimension.
-            """
             hf_key = expected_hf_keys[expert_idx]
             file_intervals = expert_file_intervals[expert_idx]
             expert_shape = expert_global_shapes[expert_idx]
-
-            # Adjust concat_axis for transpose if needed
-            effective_concat_axis = concat_axis
-
-            slice_on_axis = inner_index[effective_concat_axis]
-
-            # Normalize slice
-            req_start, req_stop, req_step = slice_on_axis.indices(
-                expert_shape[effective_concat_axis]
-            )
-            assert req_step == 1, "Strided access not supported in split loader yet"
-
+            slice_on_axis = inner_index[concat_axis]
+            req_start, req_stop, req_step = slice_on_axis.indices(expert_shape[concat_axis])
+            assert req_step == 1
             collected_chunks = []
-
             for f_start, f_end, info in file_intervals:
-                # Calculate Intersection: [req_start, req_stop) AND [f_start, f_end)
                 intersect_start = max(req_start, f_start)
                 intersect_end = min(req_stop, f_end)
-
                 if intersect_start < intersect_end:
-                    local_start = intersect_start - f_start
-                    local_end = intersect_end - f_start
-
-                    # Construct read index for this file
                     file_read_index = list(inner_index)
-                    file_read_index[effective_concat_axis] = slice(local_start, local_end)
-                    file_read_index = tuple(file_read_index)
-
-                    # Read directly
+                    file_read_index[concat_axis] = slice(
+                        intersect_start - f_start, intersect_end - f_start
+                    )
                     f = file_manager.get_handle(info["file"])
-                    chunk = f.get_slice(hf_key)[file_read_index]
+                    chunk = f.get_slice(hf_key)[tuple(file_read_index)]
                     collected_chunks.append(chunk)
-
             if not collected_chunks:
                 return np.zeros((0,) * len(expert_shape), dtype=target_dtype)
-
-            if len(collected_chunks) == 1:
-                result = collected_chunks[0]
+            if len(collected_chunks) > 1:
+                result = np.concatenate(collected_chunks, axis=concat_axis)
             else:
-                # Cross-file boundary, needs stitching
-                result = np.concatenate(collected_chunks, axis=effective_concat_axis)
-
+                result = collected_chunks[0]
             result = _view_as_fp8_if_needed(result, target_dtype)
-
-            # Apply transpose if needed
             if do_transpose:
                 result = np.transpose(result)
-
             return result
 
-        # 4. Define callback that loads all experts and stacks them
         def _load_stacked_slice(index):
             expert_slice = index[0]
             inner_slice = index[1:]
-
-            start, stop, step = expert_slice.indices(num_experts)
-            expert_indices = list(range(start, stop, step))
-            sliced_num_experts = len(expert_indices)
-
-            if sliced_num_experts == 0:
+            start, stop, step = expert_slice.indices(num_physical_experts)
+            physical_indices = list(range(start, stop, step))
+            if not physical_indices:
                 return np.zeros((0, *[1] * len(inner_slice)), dtype=target_dtype)
 
-            # Load each expert sequentially (expert 0 -> expert_num - 1)
-            expert_slices = []
-            for expert_idx in expert_indices:
-                # Convert inner_slice to work with original (non-transposed) shape
-                if do_transpose:
-                    # Reverse the last two dimensions in the slice
-                    original_inner_slice = list(inner_slice)
-                    if len(original_inner_slice) >= 2:
-                        original_inner_slice[-1], original_inner_slice[-2] = (
-                            original_inner_slice[-2],
-                            original_inner_slice[-1],
-                        )
-                    original_inner_slice = tuple(original_inner_slice)
-                else:
-                    original_inner_slice = inner_slice
+            if physical_to_logical_map is not None:
+                logical_indices = [int(physical_to_logical_map[p]) for p in physical_indices]
+                if physical_indices[0] == 0:
+                    sample_size = min(10, len(physical_indices))
+                    sample_map = {
+                        p: logical_indices[i] for i, p in enumerate(physical_indices[:sample_size])
+                    }
+                    logger.info("Cloning split-experts map (sample): %s", sample_map)
+            else:
+                logical_indices = physical_indices
 
-                expert_data = _load_single_expert_slice(expert_idx, original_inner_slice)
-                expert_slices.append(expert_data)
+            unique_logical = sorted(list(set(logical_indices)))
+            logical_cache = {}
+            for log_idx in unique_logical:
+                orig_inner = list(inner_slice)
+                if do_transpose and len(orig_inner) >= 2:
+                    orig_inner[-1], orig_inner[-2] = orig_inner[-2], orig_inner[-1]
+                logical_cache[log_idx] = _load_single_expert_slice(log_idx, tuple(orig_inner))
 
-            # Stack all experts together
-            return np.stack(expert_slices, axis=0)
+            out_array = np.empty(
+                (len(physical_indices), *logical_cache[unique_logical[0]].shape), dtype=target_dtype
+            )
+            for i, log_idx in enumerate(logical_indices):
+                out_array[i] = logical_cache[log_idx]
+            return out_array
 
         return jax.make_array_from_callback(stacked_shape, sharding, _load_stacked_slice).astype(
             target_dtype
@@ -562,18 +523,14 @@ class WeightLoader:
         file_manager: SequentialSafetensorManager,
         do_transpose: bool = False,
         target_sharding: jax.sharding.NamedSharding = None,
+        physical_to_logical_map: np.ndarray | None = None,
     ) -> jax.Array:
         """
-        Lazy loader for MoE weights:
-        1. Global Loading: Directly shards data to avoid redundant I/O.
-        2. CPU Transpose: Performs transpose on CPU to reduce TPU memory peak.
-        3. Pre-allocation: Uses np.empty instead of np.stack to save memory.
-        4. Threaded I/O: High concurrency for GCS throughput.
+        Lazy loader for MoE weights with support for redundant expert cloning.
         """
 
         # 1. Get base info from the first expert
         first_key = expected_hf_keys[0]
-        # assume len(infos) == 1 for standard MoE
         info = weight_info[first_key][0]
 
         single_expert_shape = info["shape"]
@@ -591,7 +548,12 @@ class WeightLoader:
         }
         target_dtype = dtype_map.get(st_dtype, jnp.float32)
 
-        num_experts = len(expected_hf_keys)
+        num_logical_experts = len(expected_hf_keys)
+        num_physical_experts = (
+            len(physical_to_logical_map)
+            if physical_to_logical_map is not None
+            else num_logical_experts
+        )
 
         # Determine the final stacked shape, considering optional transpose
         if do_transpose:
@@ -607,7 +569,7 @@ class WeightLoader:
         else:
             final_single_shape = single_expert_shape
 
-        stacked_shape = (num_experts, *final_single_shape)
+        stacked_shape = (num_physical_experts, *final_single_shape)
 
         if target_sharding is None:
             sharding = jax.sharding.NamedSharding(self.mesh, P())
@@ -620,54 +582,54 @@ class WeightLoader:
             expert_slice = index[0]
             inner_slice = index[1:]
 
-            start, stop, step = expert_slice.indices(num_experts)
-            expert_indices = list(range(start, stop, step))
-            sliced_num_experts = len(expert_indices)
+            start, stop, step = expert_slice.indices(num_physical_experts)
+            physical_indices = list(range(start, stop, step))
+            sliced_num_physical = len(physical_indices)
 
-            if sliced_num_experts == 0:
+            if sliced_num_physical == 0:
                 return np.zeros((0, *[1] * len(inner_slice)), dtype=target_dtype)
 
-            first_idx = expert_indices[0]
-            first_hf_key = expected_hf_keys[first_idx]
+            # Optimization: Load all required unique logical experts once
+            if physical_to_logical_map is not None:
+                logical_indices_to_load = [
+                    int(physical_to_logical_map[p]) for p in physical_indices
+                ]
+                # Log mapping for the first chunk to verify logic
+                if physical_indices[0] == 0:
+                    sample_size = min(10, len(physical_indices))
+                    sample_map = {
+                        p: logical_indices_to_load[i]
+                        for i, p in enumerate(physical_indices[:sample_size])
+                    }
+                    logger.info("Cloning experts map (sample): %s", sample_map)
+            else:
+                logical_indices_to_load = physical_indices
 
-            fname_first = weight_info[first_hf_key][0]["file"]
-            f_first = file_manager.get_handle(fname_first)
+            unique_logical_needed = sorted(list(set(logical_indices_to_load)))
+            logical_cache = {}
 
-            # Read raw data
-            first_data = f_first.get_slice(first_hf_key)[:]
-
-            # Process first data (transpose if needed) to determine final buffer properties
-            first_data_processed = np.transpose(first_data) if do_transpose else first_data
-
-            # Slice according to inner_slice to determine the exact shape required
-            first_final_chunk = first_data_processed[inner_slice]
-
-            out_shape = (sliced_num_experts, *first_final_chunk.shape)
-            out_array = np.empty(out_shape, dtype=first_final_chunk.dtype)
-
-            # Fill the first slot
-            out_array[0] = first_final_chunk
-
-            def load_one_expert(args):
-                i, expert_idx = args
-                hf_key = expected_hf_keys[expert_idx]
+            def load_one_logical_expert(log_idx):
+                hf_key = expected_hf_keys[log_idx]
                 fname = weight_info[hf_key][0]["file"]
                 f = file_manager.get_handle(fname)
-
                 data = f.get_slice(hf_key)[:]
                 data = _view_as_fp8_if_needed(data, target_dtype)
-
                 if do_transpose:
                     data = np.transpose(data)
-                out_array[i] = data[inner_slice]
+                return log_idx, data[inner_slice]
 
-            tasks = []
-            for i, expert_idx in enumerate(expert_indices[1:], start=1):
-                tasks.append((i, expert_idx))
-
-            if tasks:
+            if unique_logical_needed:
                 with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-                    list(executor.map(load_one_expert, tasks))
+                    results = list(executor.map(load_one_logical_expert, unique_logical_needed))
+                    for log_idx, data in results:
+                        logical_cache[log_idx] = data
+
+            # Construct the final array by picking from cache (handles reordering and duplication)
+            out_shape = (sliced_num_physical, *logical_cache[unique_logical_needed[0]].shape)
+            out_array = np.empty(out_shape, dtype=logical_cache[unique_logical_needed[0]].dtype)
+
+            for i, log_idx in enumerate(logical_indices_to_load):
+                out_array[i] = logical_cache[log_idx]
 
             return out_array
 
@@ -749,7 +711,7 @@ class WeightLoader:
 
                 infos = weight_info[hf_key]
 
-                if isinstance(mapping, (str, list)):
+                if isinstance(mapping, str | list):
                     mapping = WeightMapping(target_path=mapping)
 
                 is_split_weight = len(infos) > 1 and mapping.concat_axis is not None
@@ -922,6 +884,7 @@ class WeightLoader:
                         file_manager,
                         do_transpose=mapping.transpose,  # CPU transpose
                         target_sharding=final_sharding,  # Global loading
+                        physical_to_logical_map=mapping.physical_to_logical_map,
                     )
 
                     if mapping.reshape is not None:
@@ -940,11 +903,22 @@ class WeightLoader:
                     else:
                         model_param.value = stacked_weight.astype(model_param.value.dtype)
 
-                    logger.debug(
-                        "Assigned MoE group %s, shape: %s",
-                        moe_key,
-                        stacked_weight.shape,
-                    )
+                    if mapping.physical_to_logical_map is not None:
+                        num_logical = len(expected_hf_keys)
+                        num_physical = len(mapping.physical_to_logical_map)
+                        logger.info(
+                            "Assigned MoE group %s with redundant experts: %d logical -> %d physical, shape: %s",
+                            moe_key,
+                            num_logical,
+                            num_physical,
+                            stacked_weight.shape,
+                        )
+                    else:
+                        logger.info(
+                            "Assigned MoE group %s, shape: %s",
+                            moe_key,
+                            stacked_weight.shape,
+                        )
                 else:
                     ep_size = getattr(self.model_config.hf_config, "ep_size", 1)
                     if "expert" in mapping.sharding:
@@ -973,6 +947,7 @@ class WeightLoader:
                         concat_axis=mapping.concat_axis,
                         do_transpose=mapping.transpose,
                         target_sharding=final_sharding,
+                        physical_to_logical_map=mapping.physical_to_logical_map,
                     )
 
                     if mapping.reshape is not None:
@@ -1017,7 +992,7 @@ class WeightLoader:
 
         for hf_key, mapping in regular_mappings.items():
 
-            if isinstance(mapping, (str, list)):
+            if isinstance(mapping, str | list):
                 mapping = WeightMapping(target_path=mapping)
 
             target_path = (
@@ -1074,7 +1049,7 @@ class WeightLoader:
             )
 
         for moe_key, mapping in moe_mappings.items():
-            if isinstance(mapping, (str, list)):
+            if isinstance(mapping, str | list):
                 mapping = WeightMapping(target_path=mapping)
 
             target_path = mapping.target_path[0]

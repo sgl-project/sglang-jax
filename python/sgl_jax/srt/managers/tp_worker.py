@@ -475,6 +475,7 @@ class ModelWorker:
                     bs, self.model_config.vocab_size
                 )
             ),
+            per_dp_real_bs=[bs // dp_size] * dp_size,
             extend_input_logprob_token_ids=None,
             positions=np.concat([valid_positions, invalid_positions], axis=0),
             cache_loc=np.concat([valid_cache_loc, invalid_cache_loc], axis=0),
