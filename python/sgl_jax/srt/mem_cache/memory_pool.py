@@ -317,7 +317,7 @@ class MHATokenToKVPool(KVCache):
         )
         logger.info(
             "Total fused KV cache memory per layer: %.2f GB, dtype: %s",
-            total_memory_per_layer / 1024**3,
+            total_memory_per_layer / GB,
             self.dtype,
         )
         with self.mesh:
