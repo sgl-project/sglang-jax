@@ -666,7 +666,7 @@ class Encoder3d(nnx.Module):
         self.conv_in = CausalConv3d(in_channels, dims[0], (3,3,3), padding=(1,1,1), rngs = rngs)
 
         # downsample blocks
-        self.down_blocks = nnx.list([])
+        self.down_blocks = nnx.List([])
         for i, (in_dim, out_dim) in enumerate(zip(dims[:-1], dims[1:])):
             # residual (+attention) blocks
             if is_residual:
