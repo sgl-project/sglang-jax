@@ -65,7 +65,7 @@ def mxfp4_dequantization(
         0b0111:+6.0,
     }
     e2m1_lut = [e2m1__to__float[i] for i in range(16)]
-    e2m1_lut = jnp.array(e2m1_lut, dtype=jnp.float32)
+    e2m1_lut = jnp.array(e2m1_lut, dtype=jnp.float64)
     e2m1_lut = jax.device_put(e2m1_lut, jax.sharding.NamedSharding(mesh, P()))
 
     interleaved = e2m1_lut.at[interleaved].get(out_sharding=interleaved.sharding)
@@ -181,7 +181,7 @@ class AttentionBlock(nnx.Module):
         self.sliding_window = config.sliding_window if layer_idx % 2 == 0 else 0
 
         self.sinks = nnx.Param(jnp.zeros((config.num_attention_heads,), dtype))
-        self.norm = RMSNorm(config.hidden_size, epsilon=1e-5, param_dtype=dtype)
+        self.norm = RMSNorm(config.hidden_size, epsilon=1e-5, param_dtype=jnp.float32)
 
         q_dim = self.num_attention_heads * self.head_dim
         self.q_proj = LinearBase(
@@ -282,7 +282,7 @@ class MLPBlock(nnx.Module):
         self.alpha = 1.702
         self.limit = 7.0
 
-        self.norm = RMSNorm(config.hidden_size, epsilon=1e-5, dtype=dtype)
+        self.norm = RMSNorm(config.hidden_size, epsilon=1e-5, dtype=jnp.float32)
 
         self.router = LinearBase(
             config.hidden_size,
@@ -299,7 +299,7 @@ class MLPBlock(nnx.Module):
             jnp.zeros((self.num_experts, 2 * self.expert_dim, config.hidden_size // 32, 32 // 2), dtype=jnp.uint8)
         )
         self.gate_up_proj_bias = nnx.Param(
-            jnp.zeros((self.num_experts, 2 * self.expert_dim), dtype=jnp.bfloat16)
+            jnp.zeros((self.num_experts, 2 * self.expert_dim), dtype=dtype)
         )
 
         self.down_proj_scales = nnx.Param(
@@ -309,7 +309,7 @@ class MLPBlock(nnx.Module):
             jnp.zeros((self.num_experts, self.hidden_size, self.expert_dim // 32, 32 // 2), dtype=jnp.uint8)
         )
         self.down_proj_bias = nnx.Param(
-            jnp.zeros((self.num_experts, self.hidden_size), dtype=jnp.bfloat16)
+            jnp.zeros((self.num_experts, self.hidden_size), dtype=dtype)
         )
 
 
@@ -427,7 +427,7 @@ class GptOssModel(nnx.Module):
              for layer_idx in range(config.num_hidden_layers)]
         )
 
-        self.norm = RMSNorm(config.hidden_size, epsilon=1e-5, dtype=dtype)
+        self.norm = RMSNorm(config.hidden_size, epsilon=1e-5, dtype=jnp.float32)
 
     def __call__(
         self,
