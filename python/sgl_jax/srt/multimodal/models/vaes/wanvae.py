@@ -35,7 +35,7 @@ class CausalConv3d(nnx.Module):
         *,
         rngs: nnx.Rngs,
         padding: tuple[int, int, int] = (0, 0, 0),
-        stride: tuple[int, int, int] = (0,0,0),
+        strides: tuple[int, int, int] = (0,0,0),
     ):
         self.kernel_size = kernel_size
         self.temporal_padding = padding[0]  # Save for cache size calculation
@@ -43,7 +43,7 @@ class CausalConv3d(nnx.Module):
             in_features=in_channels,
             out_features=out_channels,
             kernel_size=kernel_size,
-            stride=stride,
+            strides=strides,
             padding="VALID",  # We'll handle padding manually
             rngs=rngs,
             precision=Precision.HIGHEST,  # todo make this parameters
@@ -274,7 +274,7 @@ class Downsample2d(nnx.Module):
             in_features=in_channels,
             out_features=out_channels,
             kernel_size=(3, 3),
-            stride=(2, 2),
+            strides=(2, 2),
             rngs=rngs,
             precision=Precision.HIGHEST,
         )
@@ -303,13 +303,13 @@ class Downsample3d(nnx.Module):
         self.in_channels = in_channels
         self.out_channels = out_channels
         self.time_conv = CausalConv3d(
-            in_channels, in_channels, kernel_size=(3, 1, 1), stride = (2, 1, 1), rngs=rngs
+            in_channels, in_channels, kernel_size=(3, 1, 1), strides = (2, 1, 1), rngs=rngs
         )
         self.spatial_conv = nnx.Conv(
             in_features=in_channels,
             out_features=out_channels,
             kernel_size=(3, 3),
-            stride = (2, 2),
+            strides = (2, 2),
             rngs=rngs,
             precision=Precision.HIGHEST,
         )
