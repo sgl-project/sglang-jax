@@ -21,8 +21,6 @@ from flax import nnx
 from jax import Array
 from jax.lax import Precision
 
-from sglang.python.sglang.multimodal_gen.runtime.models.vaes.wanvae import feat_cache
-
 CACHE_T = 2
 
 
@@ -337,7 +335,7 @@ class Downsample3d(nnx.Module):
             else:
                 cache_x = x[:, :, -1:, :, :].clone()
                 x, _ = self.time_conv(jnp.concatenate([cache_list[idx][:, -1:, :, :, :], x], 1))
-                feat_cache[idx] = cache_x
+                cache_list[idx] = cache_x
                 cache_idx[0] += 1
         return x, cache_list
 
