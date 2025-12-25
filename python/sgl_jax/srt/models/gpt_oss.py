@@ -65,7 +65,7 @@ def mxfp4_dequantization(
         0b0111:+6.0,
     }
     e2m1_lut = [e2m1__to__float[i] for i in range(16)]
-    e2m1_lut = jnp.array(e2m1_lut, dtype=jnp.float64)
+    e2m1_lut = jnp.array(e2m1_lut, dtype=jnp.float32)
     e2m1_lut = jax.device_put(e2m1_lut, jax.sharding.NamedSharding(mesh, P()))
 
     interleaved = e2m1_lut.at[interleaved].get(out_sharding=interleaved.sharding)
