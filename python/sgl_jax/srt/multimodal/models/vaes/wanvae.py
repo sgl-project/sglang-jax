@@ -21,6 +21,8 @@ from flax import nnx
 from jax import Array
 from jax.lax import Precision
 
+from sglang.python.sglang.multimodal_gen.runtime.models.vaes.wanvae import feat_cache
+
 CACHE_T = 2
 
 
@@ -35,6 +37,7 @@ class CausalConv3d(nnx.Module):
         *,
         rngs: nnx.Rngs,
         padding: tuple[int, int, int] = (0, 0, 0),
+        stride: tuple[int, int, int] = (0,0,0),
     ):
         self.kernel_size = kernel_size
         self.temporal_padding = padding[0]  # Save for cache size calculation
@@ -42,6 +45,7 @@ class CausalConv3d(nnx.Module):
             in_features=in_channels,
             out_features=out_channels,
             kernel_size=kernel_size,
+            stride=stride,
             padding="VALID",  # We'll handle padding manually
             rngs=rngs,
             precision=Precision.HIGHEST,  # todo make this parameters
@@ -172,7 +176,7 @@ class ResidualBlock(nnx.Module):
         return x + residual, cache_list
 
 
-class Upsample2D(nnx.Module):
+class Upsample2d(nnx.Module):
     """Spatial 2x upsample that also halves channels, mirroring torch Resample."""
 
     def __init__(self, in_channels: int, out_channels: int, *, rngs: nnx.Rngs):
@@ -201,7 +205,7 @@ class Upsample2D(nnx.Module):
         return x.reshape(b, t, h * 2, w * 2, self.out_channels), cache_list
 
 
-class Upsample3D(nnx.Module):
+class Upsample3d(nnx.Module):
     """Temporal+spatial 2x upsample with channel reduction (like torch Resample)."""
 
     def __init__(self, in_channels: int, out_channels: int, *, rngs: nnx.Rngs):
@@ -261,6 +265,81 @@ class Upsample3D(nnx.Module):
         ).astype(orig_dtype)
         x = self.spatial_conv(x)
         return x.reshape(b, t_out, h * 2, w * 2, self.out_channels), cache_list
+
+class Downsample2d(nnx.Module):
+    """Spatial 2x upsample that also halves channels, mirroring torch Resample."""
+
+    def __init__(self, in_channels: int, out_channels: int, *, rngs: nnx.Rngs):
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.spatial_conv = nnx.Conv(
+            in_features=in_channels,
+            out_features=out_channels,
+            kernel_size=(3, 3),
+            stride=(2, 2),
+            rngs=rngs,
+            precision=Precision.HIGHEST,
+        )
+        self.padding = (
+            (0, 0),
+            (0, 0),
+            (0, 1),
+            (1, 0),
+            (0, 0),
+        )
+
+    def __call__(
+        self, x: jax.Array, cache_list: tuple[jax.Array, ...] = None, cache_idx: list[int] = None
+    ) -> tuple[jax.Array, tuple[jax.Array, ...]]:
+        # x: [B, T, H, W, Cin]
+        b, t, h, w, _ = x.shape
+        x = jnp.pad(x, self.padding, mode="constant")
+        x = self.spatial_conv(x)
+        return x, cache_list
+
+
+class Downsample3d(nnx.Module):
+    """Temporal+spatial 2x upsample with channel reduction (like torch Resample)."""
+
+    def __init__(self, in_channels: int, out_channels: int, *, rngs: nnx.Rngs):
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.time_conv = CausalConv3d(
+            in_channels, in_channels, kernel_size=(3, 1, 1), stride = (2, 1, 1), rngs=rngs
+        )
+        self.spatial_conv = nnx.Conv(
+            in_features=in_channels,
+            out_features=out_channels,
+            kernel_size=(3, 3),
+            stride = (2, 2),
+            rngs=rngs,
+            precision=Precision.HIGHEST,
+        )
+        self.padding = (
+            (0, 0),
+            (0, 0),
+            (0, 1),
+            (1, 0),
+            (0, 0),
+        )
+
+    def __call__(
+        self, x: jax.Array, cache_list: tuple[jax.Array, ...] = None, cache_idx: list[int] = None
+    ) -> tuple[jax.Array, tuple[jax.Array, ...]]:
+        b, t, h, w, _ = x.shape
+        x = jnp.pad(x, self.padding, mode = "constant")
+        x = self.spatial_conv(x)
+        if cache_list is not None:
+            idx = cache_idx[0]
+            if cache_list[idx] is None:
+                cache_list[idx] = x.copy()
+                cache_idx[0] += 1
+            else:
+                cache_x = x[:, :, -1:, :, :].clone()
+                x, _ = self.time_conv(jnp.concatenate([cache_list[idx][:, -1:, :, :, :], x], 1))
+                feat_cache[idx] = cache_x
+                cache_idx[0] += 1
+        return x, cache_list
 
 
 class AttentionBlock(nnx.Module):
@@ -397,9 +476,9 @@ class UpBlock(nnx.Module):
         upsamplers = []
         if upsample_mode is not None:
             if upsample_mode == "upsample2d":
-                upsamplers.append(Upsample2D(out_dim, out_dim // 2, rngs=rngs))
+                upsamplers.append(Upsample2d(out_dim, out_dim // 2, rngs=rngs))
             elif upsample_mode == "upsample3d":
-                upsamplers.append(Upsample3D(out_dim, out_dim // 2, rngs=rngs))
+                upsamplers.append(Upsample3d(out_dim, out_dim // 2, rngs=rngs))
         self.upsamplers = nnx.List(upsamplers)
 
         self.gradient_checkpointing = False
@@ -430,7 +509,7 @@ class UpBlock(nnx.Module):
         return x, cache_list
 
 
-class Decoder3D(nnx.Module):
+class Decoder3d(nnx.Module):
     r"""
     A 3D decoder module.
 
@@ -544,8 +623,135 @@ class Decoder3D(nnx.Module):
         return x, cache_list
 
 
+class Encoder3d(nnx.Module):
+    r"""
+    A 3D encoder module.
+
+    Args:
+        dim (int): The base number of channels in the first layer.
+        z_dim (int): The dimensionality of the latent space.
+        dim_mult (list of int): Multipliers for the number of channels in each block.
+        num_res_blocks (int): Number of residual blocks in each block.
+        attn_scales (list of float): Scales at which to apply attention mechanisms.
+        temperal_downsample (list of bool): Whether to downsample temporally in each block.
+        dropout (float): Dropout rate for the dropout layers.
+        non_linearity (str): Type of non-linearity to use.
+    """
+
+    def __init__(
+        self,
+        in_channels: int = 3,
+        dim=128,
+        z_dim=4,
+        dim_mult=[1, 2, 4, 4],
+        num_res_blocks=2,
+        attn_scales=[],
+        temperal_downsample=[True, True, False],
+        dropout=0.0,
+        is_residual: bool = False,  # wan 2.2 vae use a residual downblock
+        *,
+        rngs: nnx.Rngs = None,
+    ):
+        super().__init__()
+        self.dim = dim
+        self.z_dim = z_dim
+        self.dim_mult = dim_mult
+        self.num_res_blocks = num_res_blocks
+        self.attn_scales = attn_scales
+        self.temperal_downsample = temperal_downsample
+
+        # dimensions
+        dims = [dim * u for u in [1] + dim_mult]
+        scale = 1.0
+
+        # init block
+        self.conv_in = CausalConv3d(in_channels, dims[0], (3,3,3), padding=(1,1,1), rngs = rngs)
+
+        # downsample blocks
+        self.down_blocks = nnx.list([])
+        for i, (in_dim, out_dim) in enumerate(zip(dims[:-1], dims[1:])):
+            # residual (+attention) blocks
+            if is_residual:
+                raise NotImplementedError
+            else:
+                for _ in range(num_res_blocks):
+                    self.down_blocks.append(ResidualBlock(in_dim, out_dim, dropout))
+                    if scale in attn_scales:
+                        self.down_blocks.append(AttentionBlock(out_dim))
+                    in_dim = out_dim
+
+                # downsample block
+                if i != len(dim_mult) - 1:
+                    if temperal_downsample[i]:
+                        self.down_blocks.append(Downsample3d(out_dim, out_dim,  rngs = rngs))
+                    else:
+                        self.down_blocks.append(Downsample2d(out_dim, out_dim, rngs = rngs))
+                    scale /= 2.0
+
+        # middle blocks
+        self.mid_block = MidBlock(out_dim, dropout, num_layers=1)
+
+        # output blocks
+        self.norm_out = RMSNorm(out_dim, images=False)
+        self.conv_out = CausalConv3d(out_dim, z_dim, (3,3,3), padding=(1,1,1))
+
+        self.gradient_checkpointing = False
+
+    def __call__(self, x, cache_list = None, cache_idx=[0]):
+        if cache_list is not None:
+            idx = cache_idx[0]
+            x, new_cache = self.conv_in(x, cache_list[idx])
+            if new_cache.shape[2] < 2 and cache_list[idx] is not None:
+                new_cache = jnp.concatenate(
+                    [jnp.expand_dims(cache_list[idx][:, -1, :, :, :], 1), new_cache], axis = 1
+                )
+            cache_list = (*cache_list[:idx], new_cache, *cache_list[idx + 1:])
+            cache_idx[0] += 1
+        else:
+            x = self.conv_in(x)
+
+        ## downsamples
+        for layer in self.down_blocks:
+            if cache_list is not None:
+                x, cache_list = layer(x, cache_list=cache_list, cache_idx=cache_idx)
+            else:
+                x = layer(x)
+
+        ## middle
+        x, cache_list = self.mid_block(x, cache_list=cache_list, cache_idx=cache_idx)
+
+        ## head
+        x = self.norm_out(x)
+        x = nnx.relu(x)
+        if cache_list is not None:
+            idx = cache_idx[0]
+            x, new_cache = self.conv_out(x, cache_list[idx])
+            if new_cache.shape[2] < 2 and cache_list[idx] is not None:
+                new_cache = jnp.concatenate(
+                    [jnp.expand_dims(cache_list[idx][:, -1, :, :, :], 1), new_cache], axis = 1
+                )
+            cache_list = (*cache_list[:idx], new_cache, *cache_list[idx + 1:])
+            cache_idx[0] += 1
+        else:
+            x, _ = self.conv_out(x)
+
+        return x, cache_list
+
+
 if __name__ == "__main__":
-    model = Decoder3D(dim=96, z_dim=16, rngs=nnx.Rngs(0))
+    # model = Decoder3D(dim=96, z_dim=16, rngs=nnx.Rngs(0))
+    # model_def, model_state = nnx.split(model)
+    # for key, value in model_state.flat_state():
+    #     print(key, value.shape)
+    # key = jax.random.PRNGKey(42)
+    # key, subkey = jax.random.split(key)
+    # x = jax.random.uniform(subkey, shape=(1, 2, 3, 4, 16))
+    # y, cache_list = model(x, cache_list=tuple([None] * 32), cache_idx=[0])
+    # print(y.shape)
+    # for i, cache in enumerate(cache_list):
+    #     print(i, cache.shape)
+
+    model = Encoder3d(dim=96, z_dim=16, rngs=nnx.Rngs(0))
     model_def, model_state = nnx.split(model)
     for key, value in model_state.flat_state():
         print(key, value.shape)

@@ -9,7 +9,7 @@ import torch
 from diffusers import AutoencoderKLWan
 from flax import nnx
 from safetensors import safe_open
-from wanvae import Decoder3D
+from wanvae import Decoder3d
 from weight_mapping import to_mappings
 
 path = "/models/models--Wan-AI--Wan2.1-T2V-1.3B-Diffusers/snapshots/0fad780a534b6463e45facd96134c9f345acfa5b"
@@ -51,7 +51,7 @@ def get_weight_map(path):
 
 
 def get_jax_output(path):
-    model = Decoder3D(dim=96, z_dim=16, rngs=nnx.Rngs(0))
+    model = Decoder3d(dim=96, z_dim=16, rngs=nnx.Rngs(0))
     graph_def, state  = nnx.split(model)
     weight_map = get_weight_map(path)
     flat_state = state.flat_state()
