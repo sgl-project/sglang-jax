@@ -673,9 +673,9 @@ class Encoder3d(nnx.Module):
                 raise NotImplementedError
             else:
                 for _ in range(num_res_blocks):
-                    self.down_blocks.append(ResidualBlock(in_dim, out_dim, dropout))
+                    self.down_blocks.append(ResidualBlock(in_dim, out_dim, dropout, rngs=rngs))
                     if scale in attn_scales:
-                        self.down_blocks.append(AttentionBlock(out_dim))
+                        self.down_blocks.append(AttentionBlock(out_dim, rngs=rngs))
                     in_dim = out_dim
 
                 # downsample block
@@ -687,11 +687,11 @@ class Encoder3d(nnx.Module):
                     scale /= 2.0
 
         # middle blocks
-        self.mid_block = MidBlock(out_dim, dropout, num_layers=1)
+        self.mid_block = MidBlock(out_dim, dropout, num_layers=1, rngs=rngs)
 
         # output blocks
-        self.norm_out = RMSNorm(out_dim, images=False)
-        self.conv_out = CausalConv3d(out_dim, z_dim, (3,3,3), padding=(1,1,1))
+        self.norm_out = RMSNorm(out_dim, images=False, rngs = rngs)
+        self.conv_out = CausalConv3d(out_dim, z_dim, (3,3,3), padding=(1,1,1), rngs = rngs)
 
         self.gradient_checkpointing = False
 
