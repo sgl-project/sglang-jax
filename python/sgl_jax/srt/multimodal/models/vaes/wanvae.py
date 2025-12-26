@@ -644,7 +644,7 @@ class Encoder3d(nnx.Module):
         dim_mult=[1, 2, 4, 4],
         num_res_blocks=2,
         attn_scales=[],
-        temperal_downsample=[True, True, False],
+        temperal_downsample=[False, True, True],
         dropout=0.0,
         is_residual: bool = False,  # wan 2.2 vae use a residual downblock
         *,
