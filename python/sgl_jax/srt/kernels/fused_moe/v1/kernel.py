@@ -1687,7 +1687,11 @@ def fused_ep_moe(
                 scratch_shapes=scratch_shapes,
             ),
             compiler_params=pltpu.CompilerParams(
-                vmem_limit_bytes=64 * 1024 * 1024,
+                # TPU VMEM is 64MiB per core; requesting more is invalid and can
+                # crash compilation/runtime on some platforms.
+                vmem_limit_bytes=64
+                * 1024
+                * 1024,
             ),
             name=scope_name,
         )
@@ -1710,7 +1714,7 @@ def fused_ep_moe(
             P(ep_axis_name),  # gating_output_hbm
             P(),  # a2a_g_hbm
         ),
-        out_specs=P(None),
+        out_specs=P(ep_axis_name),
         check_vma=False,
     )
     def kernel(
@@ -1753,7 +1757,7 @@ def fused_ep_moe(
             pltpu.with_memory_space_constraint(gating_output, pltpu.HBM),  # gating_output_hbm
             pltpu.with_memory_space_constraint(a2a_g_hbm_scratch, pltpu.HBM),  # a2a_g_hbm
         )
-        return jax.lax.all_gather(local_output, axis_name=ep_axis_name, axis=0, tiled=True)
+        return local_output
 
     a2a_g_hbm_scratch = pl.empty(
         (num_experts, block_config.bt, t_packing, hidden_size // t_packing), t_dtype

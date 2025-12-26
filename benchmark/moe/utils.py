@@ -58,14 +58,14 @@ _DECODE_NUM_TOKENS = (16, 32, 64, 128, 256)
 
 GROUP_GEMM_CASES: Iterable[MoEBenchmarkCase] = tuple(
     MoEBenchmarkCase(
-        name=f"bailing_decode_nt{n}_ne256_tk8_h8192_i2048_ep4",
+        name=f"bailing_decode_nt{n}_ne256_tk8_h8192_i2048",
         num_tokens=n,
         **BAILING_BASE,
     )
     for n in _DECODE_NUM_TOKENS
 ) + tuple(
     MoEBenchmarkCase(
-        name=f"bailing_extend_nt{n}_ne256_tk8_h8192_i2048_ep4",
+        name=f"bailing_extend_nt{n}_ne256_tk8_h8192_i2048",
         num_tokens=n,
         **BAILING_BASE,
     )
@@ -240,16 +240,6 @@ def prepare_fused_moe_inputs(
     return out
 
 
-def compute_gmm_tiling(m: int, k: int, n: int) -> tuple[int, int, int]:
-    """Match layer tiling heuristic for gmm (gate/down projections)."""
-    default_tile_size = (512, 1024, 1024)
-    return (
-        min(default_tile_size[0], m),
-        min(default_tile_size[1], k),
-        min(default_tile_size[2], n),
-    )
-
-
 def format_load_info(group_sizes: jax.Array) -> str:
     sizes = jnp.asarray(group_sizes)
     total = int(sizes.sum())
@@ -272,16 +262,13 @@ def select_cases(cases: Iterable[MoEBenchmarkCase] | None = None) -> Iterable[Mo
         else:
             target_ep = case.ep_size
         target_ep = min(target_ep, case.num_experts, num_devices)
+
         for ep in range(target_ep, 0, -1):
             if num_devices % ep != 0:
                 continue
             if case.num_tokens % ep != 0:
                 continue
             if case.num_experts % ep != 0:
-                continue
-            # Fused MoE kernel requires local_num_tokens to be aligned to the
-            # dtype packing (bf16/fp16 => 2). Benchmarks default to bf16.
-            if (case.num_tokens // ep) % 2 != 0:
                 continue
             return ep, num_devices // ep
         return 1, num_devices

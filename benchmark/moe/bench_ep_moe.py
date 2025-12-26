@@ -8,7 +8,6 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import time
 
 import jax
 import jax.numpy as jnp
@@ -81,11 +80,6 @@ def run_all(
     for case in cases:
         assert case.ep_size is not None
         assert case.tp_size is not None
-        if case.ep_size * case.tp_size != len(jax.devices()):
-            raise ValueError(
-                f"Expected ep_size*tp_size to match device_count: "
-                f"{case.ep_size}*{case.tp_size} != {len(jax.devices())}"
-            )
         print(
             f"\n[case={case.name}] tokens={case.num_tokens}, experts={case.num_experts}, "
             f"top_k={case.top_k}, hidden={case.hidden_size}, intermediate={case.intermediate_size}"
@@ -147,21 +141,6 @@ def run_all(
                 topk_weights, topk_ids = topk(router_logits)
                 return moe(hidden_states, topk_weights, topk_ids)
 
-            # warmup
-            start = time.perf_counter()
-            jax.block_until_ready(
-                ep_moe_fn(
-                    data["tokens"],
-                    data["router_logits"],
-                    topk_state_def=topk_state_def,
-                    topk_state_leaves=topk_state_leaves,
-                    moe_state_def=moe_state_def,
-                    moe_state_leaves=moe_state_leaves,
-                )
-            )
-            elapsed_ms = (time.perf_counter() - start) * 1000
-            print(f"warmup in {elapsed_ms} ms")
-
             times = multiple_iteration_timeit_from_trace(
                 compute_func=lambda: ep_moe_fn(
                     data["tokens"],
@@ -175,7 +154,8 @@ def run_all(
                 task=f"ep_moe_{case.name}",
                 tries=iters,
             )
-
+            if len(times) > 1:
+                times = times[1:]
             mean_ms = float(np.mean(times)) if times else float("nan")
             print(f"  ep_moe: {mean_ms:.3f} ms (trace) | samples={times}")
 

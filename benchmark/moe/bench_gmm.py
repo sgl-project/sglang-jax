@@ -14,14 +14,19 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from benchmark.moe.utils import (
-    compute_gmm_tiling,
-    format_load_info,
-    prepare_gmm_inputs,
-    select_cases,
-)
+from benchmark.moe.utils import format_load_info, prepare_gmm_inputs, select_cases
 from benchmark.utils import multiple_iteration_timeit_from_trace
 from sgl_jax.srt.kernels.gmm.megablox_gmm_backend import gmm
+
+
+def compute_gmm_tiling(m: int, k: int, n: int) -> tuple[int, int, int]:
+    """Match layer tiling heuristic for gmm (gate/down projections)."""
+    default_tile_size = (512, 1024, 1024)
+    return (
+        min(default_tile_size[0], m),
+        min(default_tile_size[1], k),
+        min(default_tile_size[2], n),
+    )
 
 
 def run_all(
@@ -79,7 +84,7 @@ def run_all(
         )
 
         mean_ms = float(np.mean(times)) if times else float("nan")
-        print(f"  megablox_gmm: {mean_ms:.3f} ms")
+        print(f"  megablox_gmm: {mean_ms:.3f} ms (trace)")
 
 
 def parse_args() -> argparse.Namespace:

@@ -21,13 +21,14 @@ from benchmark.moe.utils import (
     prepare_fused_moe_inputs,
     select_cases,
 )
-from benchmark.utils import multiple_iteration_timeit_from_trace
+from benchmark.utils import multiple_tasks_timeit_from_trace
 from sgl_jax.srt.kernels.fused_moe.v1.kernel import FusedMoEBlockConfig
 from sgl_jax.srt.layers.moe import FusedEPMoE
 
 TPU_VMEM_CAP_BYTES = 64 * 1024 * 1024
 # Leave headroom for compiler padding/alignment and any unmodeled VMEM usage.
-TPU_VMEM_BUDGET_BYTES = 60 * 1024 * 1024
+DEFAULT_TPU_VMEM_BUDGET_MB = 60
+DEFAULT_TPU_VMEM_BUDGET_BYTES = DEFAULT_TPU_VMEM_BUDGET_MB * 1024 * 1024
 
 
 def _dtype_packing(dtype: jnp.dtype) -> int:
@@ -76,6 +77,8 @@ def select_block_configs(
     bt_candidates: list[int],
     bf_candidates: list[int],
     bd_candidates: list[int],
+    tpu_vmem_budget_bytes: int,
+    max_configs: int,
 ) -> list[FusedMoEBlockConfig]:
     """Enumerate block configs from the explicit candidate lists.
 
@@ -104,10 +107,6 @@ def select_block_configs(
                 continue
             out.append(v)
         return sorted(set(out))
-
-    print(f"{bt_candidates=}")
-    print(f"{bf_candidates=}")
-    print(f"{bd_candidates=}")
 
     bt_candidates = _pick_candidates(candidates=bt_candidates, multiple_of=t_packing)
     bf_candidates = _pick_candidates(candidates=bf_candidates, multiple_of=128)
@@ -164,10 +163,10 @@ def select_block_configs(
 
         # TPU VMEM is 64MB per core; exceeding it is a compile-time OOM.
         est = _estimate_vmem_bytes(case, dtype, cfg)
-        if est > TPU_VMEM_BUDGET_BYTES:
+        if est > tpu_vmem_budget_bytes:
             return (
                 False,
-                f"vmem_est={est / (1024 * 1024):.1f}MB > budget={TPU_VMEM_BUDGET_BYTES / (1024 * 1024):.1f}MB",
+                f"vmem_est={est / (1024 * 1024):.1f}MB > budget={tpu_vmem_budget_bytes / (1024 * 1024):.1f}MB",
             )
         return True, "ok"
 
@@ -175,11 +174,8 @@ def select_block_configs(
     seen: set[tuple[int, ...]] = set()
 
     def add(*, raw: FusedMoEBlockConfig, effective: FusedMoEBlockConfig) -> None:
-        ok, reason = validate(effective)
+        ok, _ = validate(effective)
         if not ok:
-            print(
-                f"  skip: raw={raw.as_kwargs()} -> effective={effective.as_kwargs()} reason={reason}"
-            )
             return
         key = (
             effective.bt,
@@ -214,7 +210,55 @@ def select_block_configs(
                 )
                 add(raw=raw, effective=effective)
 
-    return configs
+    if max_configs <= 0:
+        raise ValueError(f"Expected {max_configs=} to be > 0.")
+    if len(configs) <= max_configs:
+        return configs
+
+    # Keep benchmark runtime bounded while retaining some coverage across `bt`.
+    #
+    # Strategy:
+    #  1) Take the single best config per `bt` (large tiles first) to preserve coverage.
+    #  2) Fill remaining slots from a global ranking (so a single-bt case can still
+    #     produce up to `max_configs` candidates).
+    def score(c: FusedMoEBlockConfig) -> tuple[int, int, int, int, int, int, int, int]:
+        # Lexicographic "weighted" ranking; larger tiles tend to run faster.
+        return (c.bt, c.bf, c.bd1, c.bd2, c.btc, c.bfc, c.bd1c, c.bd2c)
+
+    by_bt: dict[int, list[FusedMoEBlockConfig]] = {}
+    for cfg in configs:
+        by_bt.setdefault(cfg.bt, []).append(cfg)
+    bt_values = sorted(by_bt.keys(), reverse=True)
+    for bt in bt_values:
+        by_bt[bt].sort(key=score, reverse=True)
+
+    selected: list[FusedMoEBlockConfig] = []
+    selected_keys: set[tuple[int, ...]] = set()
+
+    def _add(cfg: FusedMoEBlockConfig) -> None:
+        key = score(cfg)
+        if key in selected_keys:
+            return
+        selected_keys.add(key)
+        selected.append(cfg)
+
+    for bt in bt_values:
+        if by_bt[bt]:
+            _add(by_bt[bt][0])
+            if len(selected) >= max_configs:
+                print(
+                    f"  limit: {len(configs)} valid configs -> {len(selected)} (max={max_configs})"
+                )
+                return selected
+
+    ranked = sorted(configs, key=score, reverse=True)
+    for cfg in ranked:
+        _add(cfg)
+        if len(selected) >= max_configs:
+            break
+
+    print(f"  limit: {len(configs)} valid configs -> {len(selected)} (max={max_configs})")
+    return selected
 
 
 def run_all(
@@ -222,11 +266,14 @@ def run_all(
     iters: int,
     dtype: jnp.dtype = jnp.bfloat16,
     *,
+    warmup: int = 1,
     tune_block_config: bool = False,
     bt_candidates: list[int] | None = None,
     bf_candidates: list[int] | None = None,
     bd_candidates: list[int] | None = None,
     num_tokens: list[int] | None = None,
+    tpu_vmem_budget_bytes: int = DEFAULT_TPU_VMEM_BUDGET_BYTES,
+    max_configs: int = 9,
 ) -> None:
     raw_cases: list[MoEBenchmarkCase] | None = None
     if num_tokens is not None:
@@ -241,7 +288,26 @@ def run_all(
             )
             for n in num_tokens
         ]
-    cases = list(select_cases(raw_cases))
+    cases_all = list(select_cases(raw_cases))
+    cases: list[MoEBenchmarkCase] = []
+    for c in cases_all:
+        # Fused MoE benchmark currently assumes TP is disabled (tp_size=1).
+        # For small num_tokens (e.g. decode shapes), select_cases may pick a smaller
+        # ep_size so that tokens can be evenly sharded; that implies tp_size>1 when
+        # device_count is larger. Skip such cases to keep results comparable.
+        if c.tp_size != 1:
+            print(
+                f"skip [case={c.name}] because tp_size={c.tp_size} (require tp_size=1 for fused_moe)"
+            )
+            continue
+        cases.append(c)
+    if not cases:
+        print("No runnable fused_moe cases after filtering tp_size!=1.")
+        return
+
+    tuned_results: dict[str, dict[tuple, tuple[int, int, int, int, int, int, int, int]]] = {}
+    if tune_block_config:
+        from sgl_jax.srt.utils.jax_utils import get_device_name
 
     print(f"Running fused_moe benchmarks with scenario='{scenario}', dtype={dtype}")
     for case in cases:
@@ -263,9 +329,11 @@ def run_all(
             block_cfgs = select_block_configs(
                 case,
                 dtype,
-                bt_candidates=bt_candidates or [64, 128],
-                bf_candidates=bf_candidates or [2048, 1024, 512],
-                bd_candidates=bd_candidates or [4096, 2048, 1024, 512],
+                bt_candidates=bt_candidates or [2, 4, 8, 16, 32, 64, 128, 256, 512],
+                bf_candidates=bf_candidates or [128, 256, 512, 1024, 2048],
+                bd_candidates=bd_candidates or [256, 512, 1024, 2048, 4096, 8192],
+                tpu_vmem_budget_bytes=tpu_vmem_budget_bytes,
+                max_configs=max_configs,
             )
         else:
             block_cfgs = [None]
@@ -283,7 +351,6 @@ def run_all(
                 activation=case.activation,
                 layer_id=0,
                 renormalize_topk_logits=case.renormalize_topk_logits,
-                debug_sharding=False,
             )
 
             moe_def, moe_state = nnx.split(fused_layer)
@@ -296,36 +363,42 @@ def run_all(
                 return moe(tokens, router_logits, block_config=block_config)
 
             best: tuple[float, FusedMoEBlockConfig | None] | None = None
+            ordered: list[tuple[str, FusedMoEBlockConfig | None]] = []
+            task_to_compute: dict[str, object] = {}
             for i, block_cfg in enumerate(block_cfgs):
                 tag = "default" if block_cfg is None else str(i)
+                ordered.append((tag, block_cfg))
                 if block_cfg is None:
                     print("  fused_moe blocks] -> (block_config=None)")
                 else:
                     print(
                         f"  fused_moe blocks [{i+1}/{len(block_cfgs)}] -> {block_cfg.as_kwargs()}"
                     )
-                # Warmup compile
-                jax.block_until_ready(
-                    run(
+
+                def _compute(block_cfg=block_cfg):
+                    return run(
                         data["tokens"],
                         data["router_logits"],
                         moe_state_def=moe_state_def,
                         moe_state_leaves=moe_state_leaves,
                         block_config=block_cfg,
                     )
-                )
-                times = multiple_iteration_timeit_from_trace(
-                    compute_func=lambda: run(
-                        data["tokens"],
-                        data["router_logits"],
-                        moe_state_def=moe_state_def,
-                        moe_state_leaves=moe_state_leaves,
-                        block_config=block_cfg,
-                    ),
-                    data_generator=lambda: (),
-                    task=f"fused_moe_{case.name}_{tag}",
-                    tries=iters,
-                )
+
+                task = f"fused_moe_{case.name}_{tag}"
+                task_to_compute[task] = _compute
+
+            times_by_task = multiple_tasks_timeit_from_trace(
+                task_to_compute,
+                tries=iters,
+                warmup=warmup,
+                trace_group=f"fused_moe_{case.name}",
+            )
+
+            for tag, block_cfg in ordered:
+                task = f"fused_moe_{case.name}_{tag}"
+                times = list(times_by_task.get(task, []))
+                if len(times) > 1:
+                    times = times[1:]
                 mean_ms = float(np.mean(times)) if times else float("nan")
                 print(f"     fused_moe[{tag}]: {mean_ms:.3f} ms (trace) | samples={times}")
                 if tune_block_config and np.isfinite(mean_ms):
@@ -333,12 +406,11 @@ def run_all(
                         best = (mean_ms, block_cfg)
 
             if tune_block_config and best is not None:
-                from sgl_jax.srt.utils.jax_utils import get_device_name
-
                 best_ms, best_cfg = best
                 if best_cfg is None:
                     print(f"  best: default ({best_ms:.3f} ms)")
                 else:
+                    device_name = get_device_name()
                     table_key = (
                         jnp.dtype(dtype).name,
                         case.num_tokens,
@@ -359,7 +431,25 @@ def run_all(
                         best_cfg.bd2c,
                     )
                     print(f"  best: {best_cfg.as_kwargs()} ({best_ms:.3f} ms)")
-                    print(f"  tuned_table[{get_device_name()}][{table_key}] = {cfg_tuple}")
+                    print(f"  tuned_table[{device_name}][{table_key}] = {cfg_tuple}")
+                    per_device = tuned_results.setdefault(device_name, {})
+                    if table_key in per_device and per_device[table_key] != cfg_tuple:
+                        print(
+                            f"  overwrite tuned entry: {device_name}[{table_key}] "
+                            f"{per_device[table_key]} -> {cfg_tuple}"
+                        )
+                    per_device[table_key] = cfg_tuple
+
+    if tune_block_config and tuned_results:
+        print("\n# --- Copy/paste into tuned_block_configs.py ---")
+        for device_name in sorted(tuned_results.keys()):
+            entries = tuned_results[device_name]
+            print(f'TUNED_BLOCK_CONFIGS.setdefault("{device_name}", {{}}).update({{')
+            for k in sorted(
+                entries.keys(), key=lambda t: (t[1], t[2], t[3], t[4], t[5], t[6], t[0])
+            ):
+                print(f"    {k}: {entries[k]},")
+            print("})\n")
 
 
 def parse_args() -> argparse.Namespace:
@@ -372,6 +462,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--iters", type=int, default=3, help="Number of benchmark iterations.")
     parser.add_argument(
+        "--warmup",
+        type=int,
+        default=1,
+        help="Warmup iterations per config (excluded from trace).",
+    )
+    parser.add_argument(
         "--tune-block-config",
         action="store_true",
         help="Benchmark multiple block_config variants and print the best tuned table entry.",
@@ -380,21 +476,18 @@ def parse_args() -> argparse.Namespace:
         "--bt-candidates",
         type=int,
         nargs="+",
-        default=[64, 128],
         help="Candidate list for bt (local token tile), e.g. --bt-candidates 32 64 128",
     )
     parser.add_argument(
         "--bf-candidates",
         type=int,
         nargs="+",
-        default=[2048, 1024, 512],
         help="Candidate list for bf (intermediate tile), e.g. --bf-candidates 512 1024 2048",
     )
     parser.add_argument(
         "--bd-candidates",
         type=int,
         nargs="+",
-        default=[4096, 2048, 1024, 512],
         help="Candidate list for bd1/bd2 (hidden tile), e.g. --bd-candidates 512 1024 2048 4096",
     )
     parser.add_argument(
@@ -404,17 +497,33 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Override benchmark cases with custom num_tokens list (e.g. --num-tokens 8 16 256 4096).",
     )
+    parser.add_argument(
+        "--tpu-vmem-budget-mb",
+        type=int,
+        default=DEFAULT_TPU_VMEM_BUDGET_MB,
+        help="VMEM budget used to filter candidate block configs (MiB).",
+    )
+    parser.add_argument(
+        "--max-configs",
+        type=int,
+        default=9,
+        help="Maximum number of block configs to benchmark per case when --tune-block-config is set.",
+    )
     return parser.parse_args()
 
 
 if __name__ == "__main__":
     args = parse_args()
+    tpu_vmem_budget_bytes = int(args.tpu_vmem_budget_mb) * 1024 * 1024
     run_all(
         args.scenario,
         args.iters,
+        warmup=args.warmup,
         tune_block_config=args.tune_block_config,
         bt_candidates=args.bt_candidates,
         bf_candidates=args.bf_candidates,
         bd_candidates=args.bd_candidates,
         num_tokens=args.num_tokens,
+        tpu_vmem_budget_bytes=tpu_vmem_budget_bytes,
+        max_configs=args.max_configs,
     )

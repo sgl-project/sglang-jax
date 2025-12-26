@@ -2,7 +2,7 @@ import jax
 from flax import nnx
 from jax import numpy as jnp
 from jax import shard_map
-from jax.sharding import Mesh
+from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.kernels.fused_moe.v1.kernel import FusedMoEBlockConfig, fused_ep_moe
@@ -318,9 +318,6 @@ class EPMoE(nnx.Module):
             group_offset,
         )
 
-        if self.ep_size > 1:
-            intermediate_output = self._combine(intermediate_output)
-
         output = self._unpermute(
             intermediate_output,
             sorted_selected_experts,
@@ -328,6 +325,10 @@ class EPMoE(nnx.Module):
             batch_size,
             seq_len,
         )
+        # Combine across expert shards after unpermute to reduce EP communication
+        # volume from O(T*K*H) to O(T*H).
+        if self.ep_size > 1:
+            output = self._combine(output)
         return output
 
     def _gmm_compute(self, x, group_sizes, w0_kernel, w1_kernel, wo_kernel, group_offset):
@@ -616,4 +617,5 @@ class FusedEPMoE(nnx.Module):
             ep_axis_name="tensor",
         )
 
+        output = jax.sharding.reshard(output, NamedSharding(self.mesh, P(None, None)))
         return output
