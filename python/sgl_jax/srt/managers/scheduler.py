@@ -302,6 +302,7 @@ class Scheduler(
         self.accept_token = 0
         self.spec_num_forward_ct = 0
         self.draft_token = 0
+        self.dp_size = server_args.dp_size
         # Init chunked prefill
         self.chunked_prefill_size = server_args.chunked_prefill_size
         if self.chunked_prefill_size <= 0:  # -1 means disable
@@ -342,6 +343,9 @@ class Scheduler(
         self.init_profier()
 
         self.init_metrics()
+
+        # Initialize DP scheduling state
+        self.dp_round_robin_counter = 0
 
         # Init request dispatcher
         self._request_dispatcher = TypeBasedDispatcher(
@@ -467,10 +471,28 @@ class Scheduler(
 
         self.decode_mem_cache_buf_multiplier = 1
 
+    def select_dp_for_request(self, recv_reqs: list[Req]) -> None:
+        """Assign dp_rank to request using round-robin strategy."""
+        if self.dp_size == 1:
+            for req in recv_reqs:
+                req.dp_rank = 0
+            return
+
+        for req in recv_reqs:
+            # Skip if dp_rank already set (e.g., sticky sessions)
+            if req.dp_rank is not None:
+                continue
+
+            # Round-robin assignment
+            req.dp_rank = self.dp_round_robin_counter % self.dp_size
+            self.dp_round_robin_counter += 1
+
     def event_loop_normal(self):
         """A normal scheduler loop."""
         while True:
             recv_reqs = self.recv_requests()
+            # Assign DP rank to incoming requests
+            self.select_dp_for_request(recv_reqs)
             self.process_input_requests(recv_reqs)
 
             # Skip batch processing when engine is paused
@@ -497,6 +519,8 @@ class Scheduler(
 
         while True:
             recv_reqs = self.recv_requests()
+            # Assign DP rank to incoming requests
+            self.select_dp_for_request(recv_reqs)
             self.process_input_requests(recv_reqs)
 
             # Skip batch processing when engine is paused
@@ -633,6 +657,7 @@ class Scheduler(
             stream=recv_req.stream,
             lora_id=recv_req.lora_id,
             extra_key=recv_req.extra_key,
+            dp_rank=recv_req.dp_rank,
             eos_token_ids=self.model_config.hf_eos_token_id,
             vocab_size=self.model_config.vocab_size,
         )
