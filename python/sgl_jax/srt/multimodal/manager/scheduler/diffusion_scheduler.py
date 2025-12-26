@@ -24,5 +24,9 @@ class DiffusionScheduler:
     def run_diffusion_step(self, req):
         # padding request data for JIT
         # schedule_batch -> worker_batch -> forward_batch
-        padded_req = self.pad_request(req)
-        self.diffusion_worker.forward(padded_req, self.mesh)
+        batch = self.prepare_diffusion_batch(req)
+        self.diffusion_worker.forward(batch, self.mesh)
+
+    def prepare_diffusion_batch(self, req):
+        # prepare batch for diffusion worker
+        return req
