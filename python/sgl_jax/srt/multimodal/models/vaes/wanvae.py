@@ -292,9 +292,9 @@ class Downsample2d(nnx.Module):
         # x: [B, T, H, W, Cin]
         b, t, h, w, c = x.shape
         x = jnp.pad(x, self.padding, mode="constant")
-        x = x.reshape(b * t, h, w, c)
+        x = x.reshape(b * t, x.shape[2], x.shape[3], x.shape[4])
         x = self.spatial_conv(x)
-        return x.reshape(b, t, x.shape(1), x.shape(2), x.shape(3)), cache_list
+        return x.reshape(b, t, x.shape[1], x.shape[2], x.shape[3]), cache_list
 
 
 class Downsample3d(nnx.Module):
