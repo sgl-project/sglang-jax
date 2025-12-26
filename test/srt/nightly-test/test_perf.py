@@ -32,7 +32,7 @@ from sgl_jax.test.test_utils import (
 MOUNT_ROOT = os.getenv("CI_MOUNT_ROOT", "/models")
 
 
-class TestModePerf(CustomTestCase):
+class TestModelPerf(CustomTestCase):
     sharegpt_dataset_path = None
     BASIC_SERVER_ARGS = [
         "--trust-remote-code",
@@ -137,7 +137,7 @@ class TestModePerf(CustomTestCase):
                         )
                         print(f"{'#'*60}")
 
-                        current_num_prompts = max(concurrency * 3, 50)
+                        current_num_prompts = concurrency * 3
 
                         args = get_benchmark_args(
                             base_url=base_url,
@@ -182,7 +182,7 @@ class TestModePerf(CustomTestCase):
             import csv
             import os
 
-            output_dir = os.getenv("PREF_OUTPUT_DIR", "./test/nightly_test_output/pref/local_run")
+            output_dir = os.getenv("PERF_OUTPUT_DIR", "./test/nightly_test_output/perf/local_run")
             os.makedirs(output_dir, exist_ok=True)
             output_filename = os.path.join(output_dir, "performance_results.csv")
             file_exists = os.path.exists(output_filename)
@@ -272,7 +272,7 @@ class TestModePerf(CustomTestCase):
                         )
                         print(f"{'#'*60}")
 
-                        current_num_prompts = max(concurrency * 3, 50)
+                        current_num_prompts = concurrency * 3
 
                         args = get_benchmark_args(
                             base_url=base_url,
@@ -313,7 +313,7 @@ class TestModePerf(CustomTestCase):
             import csv
             import os
 
-            output_dir = os.getenv("PREF_OUTPUT_DIR", "./test/nightly_test_output/pref/local_run")
+            output_dir = os.getenv("PERF_OUTPUT_DIR", "./test/nightly_test_output/perf/local_run")
             os.makedirs(output_dir, exist_ok=True)
             output_filename = os.path.join(output_dir, "performance_results_tp_4.csv")
             file_exists = os.path.exists(output_filename)
@@ -404,7 +404,7 @@ class TestModePerf(CustomTestCase):
                         )
                         print(f"{'#'*60}")
 
-                        current_num_prompts = max(concurrency * 3, 50)
+                        current_num_prompts = concurrency * 3
 
                         args = get_benchmark_args(
                             base_url=base_url,
@@ -446,7 +446,7 @@ class TestModePerf(CustomTestCase):
             import csv
             import os
 
-            output_dir = os.getenv("PREF_OUTPUT_DIR", "./test/nightly_test_output/pref/local_run")
+            output_dir = os.getenv("PERF_OUTPUT_DIR", "./test/nightly_test_output/perf/local_run")
             os.makedirs(output_dir, exist_ok=True)
             output_filename = os.path.join(output_dir, "performance_results.csv")
             file_exists = os.path.exists(output_filename)
@@ -537,7 +537,7 @@ class TestModePerf(CustomTestCase):
                         )
                         print(f"{'#'*60}")
 
-                        current_num_prompts = max(concurrency * 3, 50)
+                        current_num_prompts = concurrency * 3
 
                         args = get_benchmark_args(
                             base_url=base_url,
@@ -579,7 +579,7 @@ class TestModePerf(CustomTestCase):
             import csv
             import os
 
-            output_dir = os.getenv("PREF_OUTPUT_DIR", "./test/nightly_test_output/pref/local_run")
+            output_dir = os.getenv("PERF_OUTPUT_DIR", "./test/nightly_test_output/perf/local_run")
             os.makedirs(output_dir, exist_ok=True)
             output_filename = os.path.join(output_dir, "performance_results_tp_4.csv")
             file_exists = os.path.exists(output_filename)
@@ -672,7 +672,7 @@ class TestModePerf(CustomTestCase):
                         )
                         print(f"{'#'*60}")
 
-                        current_num_prompts = max(concurrency * 3, 50)
+                        current_num_prompts = concurrency * 3
 
                         args = get_benchmark_args(
                             base_url=base_url,
@@ -714,7 +714,7 @@ class TestModePerf(CustomTestCase):
             import csv
             import os
 
-            output_dir = os.getenv("PREF_OUTPUT_DIR", "./test/nightly_test_output/pref/local_run")
+            output_dir = os.getenv("PERF_OUTPUT_DIR", "./test/nightly_test_output/perf/local_run")
             os.makedirs(output_dir, exist_ok=True)
             output_filename = os.path.join(output_dir, "performance_results_tp_2_ep_2.csv")
             file_exists = os.path.exists(output_filename)
@@ -805,7 +805,7 @@ class TestModePerf(CustomTestCase):
                         )
                         print(f"{'#'*60}")
 
-                        current_num_prompts = max(concurrency * 3, 50)
+                        current_num_prompts = concurrency * 3
 
                         args = get_benchmark_args(
                             base_url=base_url,
@@ -846,7 +846,7 @@ class TestModePerf(CustomTestCase):
             import csv
             import os
 
-            output_dir = os.getenv("PREF_OUTPUT_DIR", "./test/nightly_test_output/pref/local_run")
+            output_dir = os.getenv("PERF_OUTPUT_DIR", "./test/nightly_test_output/perf/local_run")
             os.makedirs(output_dir, exist_ok=True)
             output_filename = os.path.join(output_dir, "performance_results.csv")
             file_exists = os.path.exists(output_filename)
@@ -911,31 +911,7 @@ class TestModePerf(CustomTestCase):
             base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             device="tpu",
-            other_args=[
-                "--trust-remote-code",
-                "--skip-server-warmup",
-                "--random-seed",
-                "3",
-                "--download-dir",
-                "/dev/shm/",
-                "--dtype",
-                "bfloat16",
-                "--max-running-requests",
-                "256",
-                "--max-prefill-tokens",
-                "16384",
-                "--attention-backend",
-                "fa",
-                "--page-size",
-                "128",
-                "--chunked-prefill-size",
-                "2048",
-                "--tp-size",
-                "4",
-                "--disable-hybrid-swa-memory",
-                "--mem-fraction-static",
-                "0.8",
-            ],
+            other_args=specific_args,
             env={
                 "JAX_COMPILATION_CACHE_DIR": "/tmp/jax_compilation_cache",
             },
@@ -962,7 +938,7 @@ class TestModePerf(CustomTestCase):
                         )
                         print(f"{'#'*60}")
 
-                        current_num_prompts = max(concurrency * 3, 50)
+                        current_num_prompts = concurrency * 3
 
                         args = get_benchmark_args(
                             base_url=base_url,
@@ -1003,7 +979,7 @@ class TestModePerf(CustomTestCase):
             import csv
             import os
 
-            output_dir = os.getenv("PREF_OUTPUT_DIR", "./test/nightly_test_output/pref/local_run")
+            output_dir = os.getenv("PERF_OUTPUT_DIR", "./test/nightly_test_output/perf/local_run")
             os.makedirs(output_dir, exist_ok=True)
             output_filename = os.path.join(output_dir, "performance_results_tp_4.csv")
             file_exists = os.path.exists(output_filename)
@@ -1096,7 +1072,7 @@ class TestModePerf(CustomTestCase):
                         )
                         print(f"{'#'*60}")
 
-                        current_num_prompts = max(concurrency * 3, 50)
+                        current_num_prompts = concurrency * 3
 
                         args = get_benchmark_args(
                             base_url=base_url,
@@ -1138,7 +1114,7 @@ class TestModePerf(CustomTestCase):
             import csv
             import os
 
-            output_dir = os.getenv("PREF_OUTPUT_DIR", "./test/nightly_test_output/pref/local_run")
+            output_dir = os.getenv("PERF_OUTPUT_DIR", "./test/nightly_test_output/perf/local_run")
             os.makedirs(output_dir, exist_ok=True)
             output_filename = os.path.join(output_dir, "performance_results_tp_2_ep_2.csv")
             file_exists = os.path.exists(output_filename)
@@ -1217,7 +1193,7 @@ class TestModePerf(CustomTestCase):
                         )
                         print(f"{'#'*60}")
 
-                        current_num_prompts = max(concurrency * 3, 50)
+                        current_num_prompts = concurrency * 3
 
                         args = get_benchmark_args(
                             base_url=base_url,
@@ -1258,7 +1234,7 @@ class TestModePerf(CustomTestCase):
             import csv
             import os
 
-            output_dir = os.getenv("PREF_OUTPUT_DIR", "./test/nightly_test_output/pref/local_run")
+            output_dir = os.getenv("PERF_OUTPUT_DIR", "./test/nightly_test_output/perf/local_run")
             os.makedirs(output_dir, exist_ok=True)
             output_filename = os.path.join(output_dir, "performance_results.csv")
             file_exists = os.path.exists(output_filename)
@@ -1339,7 +1315,7 @@ class TestModePerf(CustomTestCase):
                         )
                         print(f"{'#'*60}")
 
-                        current_num_prompts = max(concurrency * 3, 50)
+                        current_num_prompts = concurrency * 3
 
                         args = get_benchmark_args(
                             base_url=base_url,
@@ -1381,7 +1357,7 @@ class TestModePerf(CustomTestCase):
             import csv
             import os
 
-            output_dir = os.getenv("PREF_OUTPUT_DIR", "./test/nightly_test_output/pref/local_run")
+            output_dir = os.getenv("PERF_OUTPUT_DIR", "./test/nightly_test_output/perf/local_run")
             os.makedirs(output_dir, exist_ok=True)
             output_filename = os.path.join(output_dir, "performance_results_tp_4.csv")
             file_exists = os.path.exists(output_filename)
@@ -1515,7 +1491,7 @@ class TestModePerf(CustomTestCase):
                         num_prompts = concurrency * 3
 
                         args = get_benchmark_args(
-                            base_url=self.base_url,
+                            base_url=base_url,
                             dataset_name="random",
                             num_prompts=num_prompts,
                             request_rate=float("inf"),
@@ -1575,7 +1551,7 @@ class TestModePerf(CustomTestCase):
             import csv
             import os
 
-            output_dir = os.getenv("PREF_OUTPUT_DIR", "./test/nightly_test_output/pref/local_run")
+            output_dir = os.getenv("PERF_OUTPUT_DIR", "./test/nightly_test_output/perf/local_run")
             os.makedirs(output_dir, exist_ok=True)
             output_filename = os.path.join(output_dir, "performance_results_tp_4.csv")
             file_exists = os.path.exists(output_filename)
