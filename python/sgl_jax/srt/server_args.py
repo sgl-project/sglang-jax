@@ -51,6 +51,7 @@ class ServerArgs:
     dtype: str = "auto"
     quantization: str | None = None
     quantization_param_path: str | None = None
+    quantization_config_path: str | None = None
     kv_cache_dtype: str = "auto"
 
     # Memory and scheduling
@@ -427,6 +428,12 @@ class ServerArgs:
             "scaling factors. This should generally be supplied, when "
             "KV cache dtype is FP8. Otherwise, KV cache scaling factors "
             "default to 1.0, which may cause accuracy issues. ",
+        )
+        parser.add_argument(
+            "--quantization-config-path",
+            type=str,
+            default=None,
+            help="The config path for how to apply quantization to loaded model.",
         )
         parser.add_argument(
             "--kv-cache-dtype",

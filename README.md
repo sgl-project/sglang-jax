@@ -4,7 +4,8 @@ SGL-JAX is a high-performance, JAX-based inference engine for Large Language Mod
 
 The engine incorporates state-of-the-art techniques to maximize hardware utilization and serving efficiency, making it ideal for deploying large-scale models in production on TPUs.
 
-[![Pypi](https://img.shields.io/badge/pypi-sglang--jax-orange.svg)](https://pypi.org/project/sglang-jax) [![License](https://img.shields.io/badge/license-Apache--2.0-green.svg)](https://github.com/sgl-project/sglang-jax?tab=Apache-2.0-1-ov-file#readme)
+[![Pypi](https://img.shields.io/badge/pypi-sglang--jax-orange.svg)](https://pypi.org/project/sglang-jax) [![License](https://img.shields.io/badge/license-Apache--2.0-green.svg)](https://github.com/sgl-project/sglang-jax?tab=Apache-2.0-1-ov-file#readme) [![View Code Wiki](https://www.gstatic.com/_/boq-sdlc-agents-ui/_/r/YUi5dj2UWvE.svg)](https://codewiki.google/github.com/sgl-project/sglang-jax)
+
 
 ## Key Features
 
