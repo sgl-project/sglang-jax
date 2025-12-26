@@ -275,6 +275,7 @@ class Downsample2d(nnx.Module):
             out_features=out_channels,
             kernel_size=(3, 3),
             strides=(2, 2),
+            padding = "VALID",
             rngs=rngs,
             precision=Precision.HIGHEST,
         )
@@ -311,6 +312,7 @@ class Downsample3d(nnx.Module):
             out_features=out_channels,
             kernel_size=(3, 3),
             strides = (2, 2),
+            padding = "VALID",
             rngs=rngs,
             precision=Precision.HIGHEST,
         )
