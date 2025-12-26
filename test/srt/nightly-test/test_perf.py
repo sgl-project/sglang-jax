@@ -1704,7 +1704,7 @@ class TestModePerf(CustomTestCase):
             backend="sglang-oai",
             warmup_requests=0,
         )
-        run_benchmark(args) 
+        run_benchmark(args)
 
         try:
             for concurrency in concurrency_levels:
