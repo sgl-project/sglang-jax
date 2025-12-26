@@ -35,7 +35,7 @@ class CausalConv3d(nnx.Module):
         *,
         rngs: nnx.Rngs,
         padding: tuple[int, int, int] = (0, 0, 0),
-        strides: tuple[int, int, int] = (0,0,0),
+        strides: tuple[int, int, int] | None = None,
     ):
         self.kernel_size = kernel_size
         self.temporal_padding = padding[0]  # Save for cache size calculation
