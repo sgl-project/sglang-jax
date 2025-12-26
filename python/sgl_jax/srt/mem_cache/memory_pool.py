@@ -796,7 +796,6 @@ def update_fused_kv_cache_vectorized(
     return kv_cache
 
 
-
 class MLATokenToKVPool(KVCache):
     def __init__(
         self,
