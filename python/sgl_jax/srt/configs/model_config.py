@@ -120,7 +120,27 @@ class ModelConfig:
             self.hf_text_config.hidden_size // self.hf_text_config.num_attention_heads,
         )
 
-        self.attention_arch = AttentionArch.MHA
+        # DeepSeek-V2/V3 uses MLA (Multi-head Latent Attention) with different head dimensions
+        # Q/K: qk_nope_head_dim + qk_rope_head_dim, V: v_head_dim
+        if self.hf_config.model_type in ["deepseek_v2", "deepseek_v3"]:
+            self.attention_arch = AttentionArch.MLA
+            # For MLA, head_dim should be qk_nope_head_dim + qk_rope_head_dim for attention computation
+            qk_nope_head_dim = getattr(self.hf_text_config, "qk_nope_head_dim", 128)
+            qk_rope_head_dim = getattr(self.hf_text_config, "qk_rope_head_dim", 64)
+            self.v_head_dim = getattr(self.hf_text_config, "v_head_dim", 128)
+            self.qk_nope_head_dim = qk_nope_head_dim
+            self.qk_rope_head_dim = qk_rope_head_dim
+            # Use v_head_dim as head_dim for KV cache allocation since that's the dimension stored
+            self.head_dim = self.v_head_dim
+            logger.info(
+                "DeepSeek-V2/V3 MLA config: qk_nope_head_dim=%s, qk_rope_head_dim=%s, v_head_dim=%s, head_dim=%s",
+                qk_nope_head_dim,
+                qk_rope_head_dim,
+                self.v_head_dim,
+                self.head_dim,
+            )
+        else:
+            self.attention_arch = AttentionArch.MHA
         self.num_attention_heads = self.hf_text_config.num_attention_heads
         self.num_key_value_heads = getattr(self.hf_text_config, "num_key_value_heads", None)
 
