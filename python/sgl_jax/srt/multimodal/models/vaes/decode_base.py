@@ -75,11 +75,15 @@ def get_jax_output(path):
                 actual_src = ".".join(src_parts)
                 # Check if this is a scanned parameter (has 'layer' in sharding spec)
                 if transpose_and_sharding[0] is not None:
-                    v.value = jnp.transpose(
+                    new_x = jnp.transpose(
                         jnp.array(weight_map[actual_src], jnp.float32), transpose_and_sharding[0]
                     )
                 else:
-                    v.value = jnp.array(weight_map[actual_src], jnp.float32)
+                    new_x = jnp.array(weight_map[actual_src], jnp.float32)
+                if new_x.shape != v.value.shape:
+                    print("shape not match new_x.shape {new_x.shape} {v.value.shape}")
+                else:
+                    v.value = new_x
                 if matched:
                     mapped = True
                     break
