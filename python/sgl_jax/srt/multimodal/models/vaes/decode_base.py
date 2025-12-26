@@ -81,7 +81,7 @@ def get_jax_output(path):
                 else:
                     new_x = jnp.array(weight_map[actual_src], jnp.float32)
                 if new_x.shape != v.value.shape:
-                    print("shape not match new_x.shape {new_x.shape} {v.value.shape}")
+                    print(f"shape {actual_src} -> {path} not match new_x.shape {new_x.shape} {v.value.shape}")
                 else:
                     v.value = new_x
                 if matched:
