@@ -51,7 +51,7 @@ def get_weight_map(path):
 
 
 def get_jax_output(path):
-    model = Encoder3d(dim=96, z_dim=16, rngs=nnx.Rngs(0))
+    model = Encoder3d(dim=96, z_dim=16 * 2, rngs=nnx.Rngs(0))
     graph_def, state  = nnx.split(model)
     weight_map = get_weight_map(path)
     flat_state = state.flat_state()
