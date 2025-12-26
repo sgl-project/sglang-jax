@@ -132,11 +132,11 @@ def to_mappings() -> dict[str, MappingEntry]:
         "encoder.conv_out.bias": ("conv_out.conv.bias", (None, (None, "model"))),
 
         "encoder.down_blocks.*.conv1.bias": ("down_blocks.*.conv1.conv.bias", (None, (None, "model"))),
-        "encoder.down_blocks.*.conv1.weight": ("down_blocks.*.conv1.conv.kernel", (None, (TRANSPOSE.TRANSPOSE_3D_CONV.value, "model"))),
+        "encoder.down_blocks.*.conv1.weight": ("down_blocks.*.conv1.conv.kernel", (TRANSPOSE.TRANSPOSE_3D_CONV.value, (None, "model"))),
         "encoder.down_blocks.*.conv2.bias": ("down_blocks.*.conv2.conv.bias", (None, (None, "model"))),
-        "encoder.down_blocks.*.conv2.weight": ("down_blocks.*.conv2.conv.kernel", (None, (TRANSPOSE.TRANSPOSE_3D_CONV.value, "model"))),
-        "encoder.down_blocks.*.norm1.gamma": ("down_blocks.*.norm1.scale", (None, (TRANSPOSE.TRANSPOSE_3D_SCALE.value, "model"))),
-        "encoder.down_blocks.*.norm2.gamma": ("down_blocks.*.norm2.scale", (None, (TRANSPOSE.TRANSPOSE_3D_SCALE.value, "model"))),
+        "encoder.down_blocks.*.conv2.weight": ("down_blocks.*.conv2.conv.kernel", (TRANSPOSE.TRANSPOSE_3D_CONV.value, (None, "model"))),
+        "encoder.down_blocks.*.norm1.gamma": ("down_blocks.*.norm1.scale", (TRANSPOSE.TRANSPOSE_3D_SCALE.value, (None, "model"))),
+        "encoder.down_blocks.*.norm2.gamma": ("down_blocks.*.norm2.scale", (TRANSPOSE.TRANSPOSE_3D_SCALE.value, (None, "model"))),
         "encoder.down_blocks.*.resample.1.bias": (
             "down_blocks.*.spatial_conv.bias",
             (None, "model"),
