@@ -19,9 +19,9 @@ from benchmark.moe.utils import (
     build_group_sizes,
     format_load_info,
     generate_router_logits,
-    multiple_iteration_timeit_from_trace,
     select_cases,
 )
+from benchmark.utils import multiple_iteration_timeit_from_trace
 from sgl_jax.srt.layers.moe import EPMoE, TopK
 
 

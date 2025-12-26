@@ -14,12 +14,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from benchmark.moe.utils import (
-    MoEBenchmarkCase,
-    multiple_iteration_timeit_from_trace,
-    prepare_fused_moe_inputs,
-    select_cases,
-)
+from benchmark.moe.utils import MoEBenchmarkCase, prepare_fused_moe_inputs, select_cases
+from benchmark.utils import multiple_iteration_timeit_from_trace
 from sgl_jax.srt.kernels.fused_moe.v1.kernel import FusedMoEBlockConfig, fused_ep_moe
 
 

@@ -17,10 +17,10 @@ import numpy as np
 from benchmark.moe.utils import (
     compute_gmm_tiling,
     format_load_info,
-    multiple_iteration_timeit_from_trace,
     prepare_gmm_inputs,
     select_cases,
 )
+from benchmark.utils import multiple_iteration_timeit_from_trace
 from sgl_jax.srt.kernels.gmm.megablox_gmm_backend import gmm
 
 
