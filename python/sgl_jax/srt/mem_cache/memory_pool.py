@@ -796,12 +796,6 @@ def update_fused_kv_cache_vectorized(
     return kv_cache
 
 
-# @partial(jax.jit, static_argnames=["layer_id"])
-def _get_kv_buffer(
-    layer_id: int, k_cache: jax.Array, v_cache: jax.Array
-) -> tuple[jax.Array, jax.Array]:
-    return k_cache[layer_id], v_cache[layer_id]
-
 
 class MLATokenToKVPool(KVCache):
     def __init__(
