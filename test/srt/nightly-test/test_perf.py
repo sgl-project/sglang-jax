@@ -1674,10 +1674,6 @@ class TestModePerf(CustomTestCase):
             "--disable-radix-cache",
             "--lora-paths",
             lora_path,
-            "--precompile-token-paddings",
-            "2048",
-            "--precompile-bs-paddings",
-            "256",
         ]
         # launch server
         process = popen_launch_server(
