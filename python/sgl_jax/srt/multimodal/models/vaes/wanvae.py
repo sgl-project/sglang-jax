@@ -290,10 +290,11 @@ class Downsample2d(nnx.Module):
         self, x: jax.Array, cache_list: tuple[jax.Array, ...] = None, cache_idx: list[int] = None
     ) -> tuple[jax.Array, tuple[jax.Array, ...]]:
         # x: [B, T, H, W, Cin]
-        b, t, h, w, _ = x.shape
+        b, t, h, w, c = x.shape
         x = jnp.pad(x, self.padding, mode="constant")
+        x = x.reshape(b * t, h, w, c)
         x = self.spatial_conv(x)
-        return x, cache_list
+        return x.reshape(b, t, x.shape(1), x.shape(2), x.shape(3)), cache_list
 
 
 class Downsample3d(nnx.Module):
