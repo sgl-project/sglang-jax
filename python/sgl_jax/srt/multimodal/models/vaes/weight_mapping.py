@@ -141,15 +141,23 @@ def to_mappings() -> dict[str, MappingEntry]:
             (None, "model"),
         ),
         "encoder.down_blocks.*.resample.1.weight": (
-            "up_blocks.*.spatial_conv.kernel",
+            "down_blocks.*.spatial_conv.kernel",
             (TRANSPOSE.TRANSPOSE_2D_CONV.value, (None, "model")),
         ),
         "encoder.down_blocks.*.time_conv.bias": (
-            "up_blocks.*.time_conv.conv.bias",
+            "down_blocks.*.time_conv.conv.bias",
             (None, "model"),
         ),
         "encoder.down_blocks.*.time_conv.weight": (
-            "up_blocks.*.time_conv.conv.kernel",
+            "down_blocks.*.time_conv.conv.kernel",
+            (TRANSPOSE.TRANSPOSE_3D_CONV.value, (None, "model")),
+        ),
+        "encoder.down_blocks.*.conv_shortcut.bias": (
+            "down_blocks..*.skip_conv.conv.bias",
+            (None, (None, "model")),
+        ),
+        "encoder.down_blocks.*.conv_shortcut.weight": (
+            "down_blocks.*.skip_conv.conv.kernel",
             (TRANSPOSE.TRANSPOSE_3D_CONV.value, (None, "model")),
         ),
 
