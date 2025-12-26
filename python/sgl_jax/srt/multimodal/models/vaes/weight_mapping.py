@@ -153,7 +153,7 @@ def to_mappings() -> dict[str, MappingEntry]:
             (TRANSPOSE.TRANSPOSE_3D_CONV.value, (None, "model")),
         ),
         "encoder.down_blocks.*.conv_shortcut.bias": (
-            "down_blocks..*.skip_conv.conv.bias",
+            "down_blocks.*.skip_conv.conv.bias",
             (None, (None, "model")),
         ),
         "encoder.down_blocks.*.conv_shortcut.weight": (
