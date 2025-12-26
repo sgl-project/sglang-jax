@@ -24,7 +24,7 @@ def get_transformer_output(path):
     vae.eval()
     # (1, 2, 3, 4, 16)
     latents_original = (
-        torch.tensor(np.arange(1 * 1 * 3 * 4 * 3), dtype=torch.float32)
+        torch.tensor(np.arange(1 * 1 * 192 * 192 * 3), dtype=torch.float32)
         .reshape(1, 1, 192, 192, 3)
         .permute((0, 4, 1, 2, 3))
     )
