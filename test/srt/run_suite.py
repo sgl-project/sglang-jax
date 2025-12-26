@@ -262,12 +262,11 @@ suites = {
             estimated_time=2.5,
             test_methods=["TestModelPerf.test_QWEN2_5_7B_INSTRUCT_performance_tp_4"],
         ),
-        # note: the test has bug
-        # TestFile(
-        #     "nightly-test/test_perf.py",
-        #     estimated_time=45,
-        #     test_methods=["TestModelPerf.test_qwen3_32B_lora_r32_performance_tp_4"],
-        # ),
+        TestFile(
+            "nightly-test/test_perf.py",
+            estimated_time=45,
+            test_methods=["TestModelPerf.test_qwen3_32B_lora_r32_performance_tp_4"],
+        ),
     ],
     "nightly-test-perf-trace-text-models-tpu-v6e-1": [
         TestFile(
