@@ -29,8 +29,8 @@ def get_transformer_output(path):
         .permute((0, 4, 1, 2, 3))
     )
     y = vae.encode(latents_original)
-    print(y.sample.shape)
-    return y.sample.detach().numpy()
+    print(y.latent_dist.shape)
+    return y.latent_dist.detach().numpy()
 
 
 def get_weight_map(path):
