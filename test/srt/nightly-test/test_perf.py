@@ -1662,7 +1662,7 @@ class TestModePerf(CustomTestCase):
 
         # define test parameters
         # concurrency levels
-        concurrency_levels = [1, 8, 16, 32, 64, 128, 256]
+        concurrency_levels = [8, 16, 32, 64, 128, 256]
         input_lengths = [4096]
 
         output_lengths = [1, 1024]
@@ -1689,6 +1689,23 @@ class TestModePerf(CustomTestCase):
 
         results_summary = []
 
+        # warmup to load weight
+        args = get_benchmark_args(
+            base_url=base_url,
+            dataset_name="random",
+            num_prompts=1,
+            request_rate=float("inf"),
+            random_input_len=1024,
+            random_output_len=1,
+            max_concurrency=1,
+            random_range_ratio=1,
+            disable_ignore_eos=True,
+            lora_name=lora_name,
+            backend="sglang-oai",
+            warmup_requests=0,
+        )
+        run_benchmark(args) 
+
         try:
             for concurrency in concurrency_levels:
                 for in_len in input_lengths:
@@ -1701,51 +1718,22 @@ class TestModePerf(CustomTestCase):
 
                         num_prompts = concurrency * 3
 
-                        args = argparse.Namespace(
-                            backend="sglang-oai",
+                        args = get_benchmark_args(
                             base_url=base_url,
-                            host="127.0.0.1",
-                            port=int(base_url.split(":")[-1]),
                             dataset_name="random",
-                            dataset_path="",
-                            model=None,
-                            tokenizer=None,
                             num_prompts=num_prompts,
-                            sharegpt_output_len=None,
-                            sharegpt_context_len=None,
+                            request_rate=float("inf"),
                             random_input_len=in_len,
                             random_output_len=out_len,
-                            random_range_ratio=1.0,
-                            request_rate=float("inf"),
                             max_concurrency=concurrency,
-                            output_file=None,
-                            output_details=False,
-                            disable_tqdm=False,
-                            disable_stream=False,
-                            return_logprob=False,
-                            seed=1,
+                            random_range_ratio=1,
                             disable_ignore_eos=True,
-                            extra_request_body=None,
-                            apply_chat_template=False,
-                            profile=False,
                             lora_name=lora_name,
-                            prompt_suffix="",
-                            pd_separated=False,
-                            flush_cache=False,
+                            backend="sglang-oai",
                             warmup_requests=0,
-                            tokenize_prompt=False,
-                            adjust_prompt_max_retry=10,
-                            gsp_num_groups=64,
-                            gsp_prompts_per_group=16,
-                            gsp_system_prompt_len=2048,
-                            gsp_question_len=128,
-                            gsp_output_len=256,
                         )
 
                         metrics = run_benchmark(args)
-
-                        if concurrency == 1:
-                            continue
 
                         if out_len == 1:
                             self.assertGreater(
