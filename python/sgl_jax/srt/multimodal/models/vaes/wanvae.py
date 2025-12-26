@@ -330,12 +330,12 @@ class Downsample3d(nnx.Module):
         if cache_list is not None:
             idx = cache_idx[0]
             if cache_list[idx] is None:
-                cache_list[idx] = x.copy()
+                cache_list = (*cache_list[:idx], x.copy(), *cache_list[idx + 1 :])
                 cache_idx[0] += 1
             else:
                 cache_x = x[:, :, -1:, :, :].clone()
                 x, _ = self.time_conv(jnp.concatenate([cache_list[idx][:, -1:, :, :, :], x], 1))
-                cache_list[idx] = cache_x
+                cache_list = (*cache_list[:idx], cache_x, *cache_list[idx + 1 :])
                 cache_idx[0] += 1
         return x, cache_list
 
