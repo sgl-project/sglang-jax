@@ -1599,7 +1599,7 @@ class TestModePerf(CustomTestCase):
     def test_qwen3_32B_lora_r32_performance_tp_4(self):
         model = "Qwen/Qwen3-32B"
         lora_path = "flyfishxu/DeepNews-LoRA-Qwen3-32B"
-        lora_name = "DeepNews-LoRA-Qwen3-32B"
+        lora_name = ["DeepNews-LoRA-Qwen3-32B"]
         base_url = DEFAULT_URL_FOR_TEST
 
         allow_gap = 0.03
@@ -1663,12 +1663,7 @@ class TestModePerf(CustomTestCase):
         # define test parameters
         # concurrency levels
         concurrency_levels = [8, 16, 32, 64, 128, 256]
-        # input length levels (1k, 4k, 8k)
         input_lengths = [4096]
-
-        # concurrency_levels = [8]
-        # # input length levels (1k, 4k, 8k)
-        # input_lengths = [1024]
 
         output_lengths = [1, 1024]
         specific_args = self.BASIC_SERVER_ARGS + [
@@ -1694,6 +1689,23 @@ class TestModePerf(CustomTestCase):
 
         results_summary = []
 
+        # warmup to load weight
+        args = get_benchmark_args(
+            base_url=base_url,
+            dataset_name="random",
+            num_prompts=1,
+            request_rate=float("inf"),
+            random_input_len=1024,
+            random_output_len=1,
+            max_concurrency=1,
+            random_range_ratio=1,
+            disable_ignore_eos=True,
+            lora_name=lora_name,
+            backend="sglang-oai",
+            warmup_requests=0,
+        )
+        run_benchmark(args)
+
         try:
             for concurrency in concurrency_levels:
                 for in_len in input_lengths:
@@ -1707,7 +1719,7 @@ class TestModePerf(CustomTestCase):
                         num_prompts = concurrency * 3
 
                         args = get_benchmark_args(
-                            base_url=self.base_url,
+                            base_url=base_url,
                             dataset_name="random",
                             num_prompts=num_prompts,
                             request_rate=float("inf"),
