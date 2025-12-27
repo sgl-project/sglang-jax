@@ -119,13 +119,9 @@ class TestModelPerf(CustomTestCase):
 
         try:
             static_config = {
-                "model": model_path_for_server,
-                "host": "0.0.0.0",
-                "port": int(base_url.split(":")[-1]),
-                "dataset_name": "sharegpt",
+                "dataset_name": "random",
                 "dataset_path": self.sharegpt_dataset_path,
-                "warmup_requests": 1,
-                "flush_cache": True,
+                "warmup_requests": 0,
             }
 
             for concurrency in concurrency_levels:
@@ -255,13 +251,9 @@ class TestModelPerf(CustomTestCase):
         results_summary = []
         try:
             static_config = {
-                "model": model_path_for_server,
-                "host": "0.0.0.0",
-                "port": int(base_url.split(":")[-1]),
-                "dataset_name": "sharegpt",
+                "dataset_name": "random",
                 "dataset_path": self.sharegpt_dataset_path,
-                "warmup_requests": 1,
-                "flush_cache": True,
+                "warmup_requests": 0,
             }
             for concurrency in concurrency_levels:
                 for in_len in input_lengths:
@@ -387,13 +379,9 @@ class TestModelPerf(CustomTestCase):
 
         try:
             static_config = {
-                "model": model_path_for_server,
-                "host": "0.0.0.0",
-                "port": int(base_url.split(":")[-1]),
-                "dataset_name": "sharegpt",
+                "dataset_name": "random",
                 "dataset_path": self.sharegpt_dataset_path,
-                "warmup_requests": 1,
-                "flush_cache": True,
+                "warmup_requests": 0,
             }
             for concurrency in concurrency_levels:
                 for in_len in input_lengths:
@@ -520,13 +508,9 @@ class TestModelPerf(CustomTestCase):
 
         try:
             static_config = {
-                "model": model_path_for_server,
-                "host": "0.0.0.0",
-                "port": int(base_url.split(":")[-1]),
-                "dataset_name": "sharegpt",
+                "dataset_name": "random",
                 "dataset_path": self.sharegpt_dataset_path,
-                "warmup_requests": 1,
-                "flush_cache": True,
+                "warmup_requests": 0,
             }
             for concurrency in concurrency_levels:
                 for in_len in input_lengths:
@@ -655,13 +639,9 @@ class TestModelPerf(CustomTestCase):
 
         try:
             static_config = {
-                "model": model_path_for_server,
-                "host": "0.0.0.0",
-                "port": int(base_url.split(":")[-1]),
-                "dataset_name": "sharegpt",
+                "dataset_name": "random",
                 "dataset_path": self.sharegpt_dataset_path,
-                "warmup_requests": 1,
-                "flush_cache": True,
+                "warmup_requests": 0,
             }
             for concurrency in concurrency_levels:
                 for in_len in input_lengths:
@@ -788,13 +768,9 @@ class TestModelPerf(CustomTestCase):
 
         try:
             static_config = {
-                "model": model_path_for_server,
-                "host": "0.0.0.0",
-                "port": int(base_url.split(":")[-1]),
-                "dataset_name": "sharegpt",
+                "dataset_name": "random",
                 "dataset_path": self.sharegpt_dataset_path,
-                "warmup_requests": 1,
-                "flush_cache": True,
+                "warmup_requests": 0,
             }
             for concurrency in concurrency_levels:
                 for in_len in input_lengths:
@@ -921,13 +897,9 @@ class TestModelPerf(CustomTestCase):
 
         try:
             static_config = {
-                "model": model_path_for_server,
-                "host": "0.0.0.0",
-                "port": int(base_url.split(":")[-1]),
-                "dataset_name": "sharegpt",
+                "dataset_name": "random",
                 "dataset_path": self.sharegpt_dataset_path,
-                "warmup_requests": 1,
-                "flush_cache": True,
+                "warmup_requests": 0,
             }
             for concurrency in concurrency_levels:
                 for in_len in input_lengths:
@@ -1055,13 +1027,9 @@ class TestModelPerf(CustomTestCase):
 
         try:
             static_config = {
-                "model": model_path_for_server,
-                "host": "0.0.0.0",
-                "port": int(base_url.split(":")[-1]),
-                "dataset_name": "sharegpt",
+                "dataset_name": "random",
                 "dataset_path": self.sharegpt_dataset_path,
-                "warmup_requests": 1,
-                "flush_cache": True,
+                "warmup_requests": 0,
             }
             for concurrency in concurrency_levels:
                 for in_len in input_lengths:
@@ -1176,13 +1144,9 @@ class TestModelPerf(CustomTestCase):
 
         try:
             static_config = {
-                "model": model_path_for_server,
-                "host": "0.0.0.0",
-                "port": int(base_url.split(":")[-1]),
-                "dataset_name": "sharegpt",
+                "dataset_name": "random",
                 "dataset_path": self.sharegpt_dataset_path,
-                "warmup_requests": 1,
-                "flush_cache": True,
+                "warmup_requests": 0,
             }
             for concurrency in concurrency_levels:
                 for in_len in input_lengths:
@@ -1297,13 +1261,9 @@ class TestModelPerf(CustomTestCase):
 
         try:
             static_config = {
-                "model": model_path_for_server,
-                "host": "0.0.0.0",
-                "port": int(base_url.split(":")[-1]),
-                "dataset_name": "sharegpt",
+                "dataset_name": "random",
                 "dataset_path": self.sharegpt_dataset_path,
-                "warmup_requests": 1,
-                "flush_cache": True,
+                "warmup_requests": 0,
             }
 
             for concurrency in concurrency_levels:
@@ -1414,7 +1374,7 @@ class TestModelPerf(CustomTestCase):
                     "ttft": 13301.45,
                     "itl": 24.72,
                     "input_throughput": 19677.24,
-                    "output_throughput": 913.20,
+                    "output_throughput": 845.64,
                 }
             },
             128: {
@@ -1422,7 +1382,7 @@ class TestModelPerf(CustomTestCase):
                     "ttft": 26595.13,
                     "itl": 24.81,
                     "input_throughput": 19691.40,
-                    "output_throughput": 947.15,
+                    "output_throughput": 845.10,
                 }
             },
             256: {
@@ -1430,7 +1390,7 @@ class TestModelPerf(CustomTestCase):
                     "ttft": 53191.76,
                     "itl": 24.78,
                     "input_throughput": 19697.55,
-                    "output_throughput": 951.46,
+                    "output_throughput": 860.46,
                 }
             },
         }
@@ -1474,7 +1434,6 @@ class TestModelPerf(CustomTestCase):
             random_output_len=1,
             max_concurrency=1,
             random_range_ratio=1,
-            disable_ignore_eos=True,
             lora_name=lora_name,
             backend="sglang-oai",
             warmup_requests=0,
@@ -1482,15 +1441,6 @@ class TestModelPerf(CustomTestCase):
         run_benchmark(args)
 
         try:
-            static_config = {
-                "model": model,
-                "host": "0.0.0.0",
-                "port": int(base_url.split(":")[-1]),
-                "dataset_name": "sharegpt",
-                "dataset_path": self.sharegpt_dataset_path,
-                "warmup_requests": 1,
-                "flush_cache": True,
-            }
             for concurrency in concurrency_levels:
                 for in_len in input_lengths:
                     for out_len in output_lengths:
@@ -1511,12 +1461,10 @@ class TestModelPerf(CustomTestCase):
                             random_output_len=out_len,
                             max_concurrency=concurrency,
                             random_range_ratio=1,
-                            disable_ignore_eos=True,
                             lora_name=lora_name,
                             backend="sglang-oai",
                             warmup_requests=0,
                         )
-                        vars(args).update(static_config)
                         metrics = run_benchmark(args)
 
                         if out_len == 1:
