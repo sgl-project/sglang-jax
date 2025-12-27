@@ -26,7 +26,7 @@ if TYPE_CHECKING:
 class LogitsProcessorOutput:
     ## Part 1: This part will be assigned in python/sglang/srt/layers/logits_processor.py::LogitsProcessor
     # The logits of the next tokens.       shape: [#seq, vocab_size]
-    next_token_logits: jax.Array
+    next_token_logits: jax.Array  # TODO @Brian: Data-Parallel sharding
     # Used by speculative decoding (EAGLE)
     # The last hidden layers
     hidden_states: jax.Array | None = None
@@ -240,6 +240,7 @@ class LogitsProcessor(nnx.Module):
         logits_metadata: LogitsMetadata,
         aux_hidden_states: jax.Array | None = None,
     ) -> LogitsProcessorOutput:
+        # TODO @Brian: use shard_map to manually select logits
         if (
             logits_metadata.forward_mode.is_decode_or_idle()
             or logits_metadata.forward_mode.is_target_verify()
@@ -250,7 +251,9 @@ class LogitsProcessor(nnx.Module):
             sample_indices = None
             input_logprob_indices = None
         elif logits_metadata.forward_mode.is_extend() and not logits_metadata.extend_return_logprob:
-            last_index = jnp.cumsum(logits_metadata.extend_seq_lens, axis=0) - 1
+            last_index = (
+                jnp.cumsum(logits_metadata.extend_seq_lens, axis=0) - 1
+            )  # TODO @Brian in dp case cumsum not work
             pruned_states = hidden_states[last_index]
             if aux_hidden_states is not None:
                 aux_pruned_states = [hidden[last_index] for hidden in aux_hidden_states]

@@ -158,8 +158,6 @@ def create_test_data(
 
     # Create fake positions, not used in attention
     positions = jnp.arange(total_aligned_tokens, dtype=jnp.int32)
-    # Create fake extend_start_loc, not used in attention
-    extend_start_loc = jnp.ones((batch_size,), dtype=jnp.int32)
     # fake req_pool_indices, not used in attention
     req_pool_indices = jnp.arange(batch_size, dtype=jnp.int32)
 
@@ -278,7 +276,6 @@ def create_test_data(
         req_pool_indices=np.asarray(req_pool_indices),
         sampling_info=None,
         positions=np.asarray(positions),
-        extend_start_loc=np.asarray(extend_start_loc),
         cache_loc=np.asarray(cache_loc),
         extend_seq_lens=np.asarray(extend_seq_lens),
         extend_prefix_lens=np.asarray(extend_prefix_lens),
@@ -301,7 +298,6 @@ def create_test_data(
         seq_lens=seq_lens,
         out_cache_loc=out_cache_loc,
         positions=positions,
-        extend_start_loc=extend_start_loc,
         attn_backend=attention_backend,
         cache_loc=cache_loc,
         extend_prefix_lens=extend_prefix_lens,
