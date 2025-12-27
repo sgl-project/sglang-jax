@@ -46,6 +46,7 @@ class ModelOutput:
     output_token_logprobs_lst: List[List[Tuple[float, int, None]]] = None
     token_ids_input_logprobs: List[torch.Tensor] = None
     token_ids_output_logprobs: List[torch.Tensor] = None
+    last_token_logits_list: List[torch.Tensor] = None
 
 
 class HFRunner:
@@ -58,11 +59,15 @@ class HFRunner:
         trust_remote_code: bool = False,
         patch_model_do_sample_false: bool = False,
         matryoshka_dim: Optional[int] = None,
+        use_cpu: bool = False,
+        num_layers: Optional[int] = None,  # None means all layers, 1 means only first layer
     ):
         self.model_type = model_type
         self.output_str_only = output_str_only
         self.trust_remote_code = trust_remote_code
         self.patch_model_do_sample_false = patch_model_do_sample_false
+        self.use_cpu = use_cpu
+        self.num_layers = num_layers
 
         self.in_queue = mp.Queue()
         self.out_queue = mp.Queue()
@@ -137,6 +142,9 @@ class HFRunner:
         # Apply model-specific patches
         monkey_patch_gemma2_sdpa()
 
+        # Determine device
+        device = "cpu" if self.use_cpu else "cuda"
+
         # Load the model and tokenizer
         if self.model_type == "generation":
             config = AutoConfig.from_pretrained(
@@ -152,7 +160,7 @@ class HFRunner:
                 torch_dtype=torch_dtype,
                 trust_remote_code=self.trust_remote_code,
                 low_cpu_mem_usage=True,
-            ).cuda()
+            ).to(device)
         elif self.model_type == "embedding":
             if "gme-qwen2-vl" in model_path.lower():
                 self.model = AutoModelForVision2Seq.from_pretrained(
@@ -160,14 +168,14 @@ class HFRunner:
                     torch_dtype=torch_dtype,
                     trust_remote_code=False,
                     low_cpu_mem_usage=True,
-                ).cuda()
+                ).to(device)
                 self.processor = AutoProcessor.from_pretrained(model_path)
             elif "clip" in model_path.lower():
-                self.model = AutoModel.from_pretrained(model_path).cuda()
+                self.model = AutoModel.from_pretrained(model_path).device()
                 self.processor = AutoProcessor.from_pretrained(model_path)
             else:
                 self.model = _get_sentence_transformer_embedding_model(
-                    model_path, torch_dtype, matryoshka_dim=matryoshka_dim
+                    model_path, torch_dtype, matryoshka_dim=matryoshka_dim, use_cpu=self.use_cpu
                 )
         elif self.model_type == "reward" or self.model_type == "cross_encoder":
             from transformers import AutoModelForSequenceClassification
@@ -176,7 +184,7 @@ class HFRunner:
                 model_path,
                 torch_dtype=torch_dtype,
                 trust_remote_code=self.needs_trust_remote_code(model_path),
-            ).cuda()
+            ).to(device)
         else:
             raise Exception(f"Unrecognized model type {self.model_type}")
         self.tokenizer = get_tokenizer(
@@ -204,10 +212,12 @@ class HFRunner:
                             output_str_only=self.output_str_only,
                             token_ids_logprob=token_ids_logprob,
                             patch_model_do_sample_false=self.patch_model_do_sample_false,
+                            use_cpu=self.use_cpu,
+                            num_layers=self.num_layers,
                         )
                     )
                 elif self.model_type == "cross_encoder":
-                    inputs = self.tokenizer(prompts, padding=True, return_tensors="pt").to("cuda")
+                    inputs = self.tokenizer(prompts, padding=True, return_tensors="pt").to(device)
                     scores = self.model(**inputs).logits
                     scores = scores.squeeze().tolist()
                     if not isinstance(scores, list):
@@ -221,7 +231,7 @@ class HFRunner:
                             conv, tokenize=False, return_dict=False
                         )
                         conv_tokenized = self.tokenizer(conv_formatted, return_tensors="pt").to(
-                            "cuda"
+                            device
                         )
                         scores.append(float(self.model(**conv_tokenized).logits[0][0].item()))
                     out_queue.put(ModelOutput(scores=scores))
@@ -261,7 +271,10 @@ class HFRunner:
         output_str_only: bool = False,
         token_ids_logprob: Optional[int] = None,
         patch_model_do_sample_false: Optional[bool] = False,
+        use_cpu: bool = False,
+        num_layers: Optional[int] = None,
     ) -> ModelOutput:
+        device = "cpu" if use_cpu else "cuda"
         output_strs = []
         top_input_logprobs = []
         top_output_logprobs = []
@@ -270,12 +283,13 @@ class HFRunner:
             token_ids_output_logprobs = []
         else:
             token_ids_input_logprobs = token_ids_output_logprobs = None
+        last_token_logits_list=[]
 
         for i, p in enumerate(prompts):
             if isinstance(p, str):
-                input_ids = tokenizer.encode(p, return_tensors="pt").cuda()
+                input_ids = tokenizer.encode(p, return_tensors="pt").to(device)
             else:
-                input_ids = torch.tensor([p], device="cuda")
+                input_ids = torch.tensor([p], device=device)
 
             if lora_paths is not None and lora_paths[i] is not None:
                 from peft import PeftModel
@@ -331,7 +345,45 @@ class HFRunner:
                     )
                 del outputs
 
-                input_logits = model.forward(input_ids).logits[0]
+                # Forward with limited layers if num_layers is specified
+                if num_layers is not None:
+                    # Use output_hidden_states to get intermediate layer outputs
+                    outputs = model.forward(input_ids, output_hidden_states=True, return_dict=True)
+                    # hidden_states: tuple of (num_layers + 1) tensors
+                    # Index 0 is embedding, 1 is after first layer, etc.
+                    # So num_layers=1 means we want hidden_states[1]
+                    hidden_state = outputs.hidden_states[num_layers]
+
+                    # Manually apply norm and lm_head to get logits
+                    # Try to find the base model
+                    base = model.base_model if hasattr(model, "base_model") else model
+                    if hasattr(base, "model"):
+                        base = base.model
+
+                    # Apply final norm if it exists (try different common names)
+                    if hasattr(base, "norm"):
+                        hidden_state = base.norm(hidden_state)
+                    elif hasattr(base, "final_layernorm"):
+                        hidden_state = base.final_layernorm(hidden_state)
+                    elif hasattr(base, "ln_f"):
+                        hidden_state = base.ln_f(hidden_state)
+                    # If no norm found, skip it (some models might not have it)
+
+                    # Apply lm_head
+                    if hasattr(model, "lm_head"):
+                        input_logits = model.lm_head(hidden_state)[0]
+                    elif hasattr(base, "lm_head"):
+                        input_logits = base.lm_head(hidden_state)[0]
+                    else:
+                        # If no lm_head found, just use the hidden state as "logits"
+                        input_logits = hidden_state[0]                    
+                else:
+                    output = model.forward(input_ids)
+                    input_logits = output.logits[0]
+                    
+
+                last_token_logits = input_logits[-1,:]
+                last_token_logits_list.append(last_token_logits)
                 top_input_logprobs.append(get_top_logprobs(input_logits, NUM_TOP_LOGPROBS).tolist())
                 if token_ids_logprob is not None:
                     token_ids_input_logprobs.append(
@@ -349,6 +401,7 @@ class HFRunner:
             top_output_logprobs=top_output_logprobs,
             token_ids_input_logprobs=token_ids_input_logprobs,
             token_ids_output_logprobs=token_ids_output_logprobs,
+            last_token_logits_list=last_token_logits_list,
         )
 
 
@@ -393,10 +446,12 @@ def get_token_ids_logprobs(logits, token_ids):
 
 
 def _get_sentence_transformer_embedding_model(
-    model_path, torch_dtype, matryoshka_dim: Optional[int] = None
+    model_path, torch_dtype, matryoshka_dim: Optional[int] = None, use_cpu: bool = False
 ):
     from sentence_transformers import SentenceTransformer
     from sentence_transformers.util import is_sentence_transformer_model
+
+    device = "cpu" if use_cpu else "cuda"
 
     if is_sentence_transformer_model(model_path):
         model = SentenceTransformer(
@@ -416,4 +471,4 @@ def _get_sentence_transformer_embedding_model(
             modules=[word_embedding_model, pooling_model], truncate_dim=matryoshka_dim
         )
 
-    return model.cuda()
+    return model.to(device)

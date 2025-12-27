@@ -14,26 +14,34 @@
 # ==============================================================================
 
 """
-Dump HuggingFace LoRA log probabilities for comparison with sglang-jax.
-Attention: Need install torch, transformer and sglang package first.
+Dump HuggingFace LoRA logits for comparison with sglang-jax.
+Attention: Need install torch, transformer, peft and sglang package first.
 
 This script:
-1. Runs HuggingFace with LoRA adapters
-2. Collects log probabilities (prefill and decode)
+1. Runs HuggingFace with LoRA adapters with precision is equal to float32
+2. Collects last layer's logits for prefill and decode
 3. Saves the results to a JSON file for use in sglang-jax comparison
 
 Usage:
-    python dump_hf_lora_logprobs.py --model meta-llama/Llama-2-7b-hf \
+    python dump_hf_lora_output.py --model meta-llama/Llama-2-7b-hf \
         --lora-path yushengsu/sglang_lora_logprob_diff_without_tuning \
-        --output hf_logprobs.json
+        --output hf_lora_output.json
 
     # Multiple prompts and LoRA adapters
-    python dump_hf_lora_logprobs.py \
+    python dump_hf_lora_output.py \
         --model meta-llama/Llama-2-7b-hf \
         --lora-path adapter1 adapter2 \
         --prompt "Hello" "How are you?" \
         --max-new-tokens 64 \
-        --output hf_logprobs.json
+        --output hf_lora_output.json
+
+    python dump_hf_lora_output.py --model Qwen/Qwen3-4B \
+        --lora-path y9760210/Qwen3-4B-lora_model \
+        --prompt "AI is a field of computer science focused on" \
+        --max-new-tokens 1 \
+        --output hf_lora_prefill_output.json \
+        --use-cpu \
+        --dtype float32
 """
 
 import argparse
@@ -79,9 +87,11 @@ def run_hf_with_lora(
     prompts: List[str],
     max_new_tokens: int,
     torch_dtype: torch.dtype,
+    use_cpu: bool = False,
+    num_layers: Optional[int] = None,
 ) -> Dict[str, Any]:
     """
-    Run HuggingFace with LoRA and return log probabilities.
+    Run HuggingFace with LoRA and return logits.
 
     Args:
         model_path: Path to the base model
@@ -101,6 +111,8 @@ def run_hf_with_lora(
     print(f"  Number of prompts: {len(prompts)}")
     print(f"  Max new tokens: {max_new_tokens}")
     print(f"  Data type: {torch_dtype}")
+    print(f"  Device: {'CPU' if use_cpu else 'GPU'}")
+    print(f"  Num layers: {num_layers if num_layers is not None else 'All'}")
 
     lora_paths_per_prompt = prepare_lora_paths_per_prompt(lora_paths, len(prompts))
 
@@ -114,6 +126,8 @@ def run_hf_with_lora(
         torch_dtype=torch_dtype,
         model_type="generation",
         patch_model_do_sample_false=True,
+        use_cpu=use_cpu,
+        num_layers=num_layers,
     ) as hf_runner:
         hf_outputs = hf_runner.forward(
             prompts,
@@ -126,6 +140,7 @@ def run_hf_with_lora(
         "top_output_logprobs": hf_outputs.top_output_logprobs,
         "output_strs": hf_outputs.output_strs,
         "lora_paths": lora_paths_per_prompt,
+        "last_token_logits_list": hf_outputs.last_token_logits_list,
     }
 
 
@@ -150,7 +165,7 @@ def convert_to_serializable(obj):
     return obj
 
 
-def save_logprobs_to_json(
+def save_data_to_json(
     data: Dict[str, Any],
     output_path: str,
     model_path: str,
@@ -188,6 +203,8 @@ def save_logprobs_to_json(
             "decode_logprobs": convert_to_serializable(data["top_output_logprobs"][i]),
             "prefill_shape": list(np.array(data["top_input_logprobs"][i]).shape),
             "decode_shape": list(np.array(data["top_output_logprobs"][i]).shape),
+            "last_token_logits": convert_to_serializable(data["last_token_logits_list"][i]),
+            "last_token_logits_shape":list(np.array(data["last_token_logits_list"][i]).shape),
         }
         output_data["results"].append(result)
 
@@ -226,6 +243,8 @@ def print_summary(data: Dict[str, Any], prompts: List[str]):
         print(f"  Prefill logprobs shape: {prefill_shape}")
         print(f"  Decode logprobs shape:  {decode_shape}")
 
+        print(f"  Last token logits shape: {np.array(data['last_token_logits_list'][i]).shape}")
+
         output_str = data["output_strs"][i]
         display_len = 100
         output_display = (
@@ -236,7 +255,7 @@ def print_summary(data: Dict[str, Any], prompts: List[str]):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Dump HuggingFace LoRA log probabilities for sglang-jax comparison",
+        description="Dump HuggingFace LoRA logits for sglang-jax comparison",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
 
@@ -266,8 +285,8 @@ def main():
     parser.add_argument(
         "--max-new-tokens",
         type=int,
-        default=32,
-        help="Maximum number of tokens to generate (default: 32)",
+        default=2,
+        help="Maximum number of tokens to generate (default: 2)",
     )
 
     parser.add_argument(
@@ -280,9 +299,22 @@ def main():
     parser.add_argument(
         "--dtype",
         type=str,
-        default="float16",
+        default="float32",
         choices=["float16", "float32", "bfloat16"],
         help="Model data type (default: float16)",
+    )
+
+    parser.add_argument(
+        "--use-cpu",
+        action="store_true",
+        help="Run on CPU instead of GPU",
+    )
+
+    parser.add_argument(
+        "--num-layers",
+        type=int,
+        default=None,
+        help="Number of layers to forward (e.g., 1 for only first layer). None means all layers.",
     )
 
     args = parser.parse_args()
@@ -310,13 +342,15 @@ def main():
             prompts=prompts,
             max_new_tokens=args.max_new_tokens,
             torch_dtype=torch_dtype,
+            use_cpu=args.use_cpu,
+            num_layers=args.num_layers,
         )
 
         # Print summary
         print_summary(data, prompts)
 
         # Save to JSON
-        save_logprobs_to_json(
+        save_data_to_json(
             data=data,
             output_path=args.output,
             model_path=args.model,
