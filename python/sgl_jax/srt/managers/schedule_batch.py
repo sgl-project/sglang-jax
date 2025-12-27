@@ -503,118 +503,153 @@ bid = 0
 
 
 @dataclasses.dataclass
-class ScheduleBatch:
-    """Store all information of a batch on the scheduler."""
+class ScheduleReqsInfo:
+    """Store per-DP information for a batch of requests."""
 
-    # Request, memory pool, and cache
-    reqs: list[Req]
-    req_to_token_pool: ReqToTokenPool = None
-    token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator = None
-    tree_cache: BasePrefixCache = None
-    is_hybrid: bool = False
-
-    # Batch configs
-    model_config: ModelConfig = None
-    forward_mode: ForwardMode = None
-    enable_overlap: bool = False
-    # Tell whether the current running batch is full so that we can skip
-    # the check of whether to prefill new requests.
-    # This is an optimization to reduce the overhead of the prefill check.
-    batch_is_full: bool = False
-
+    # Requests assigned to this DP rank
+    reqs: list[Req] = None
     chunked_req: Req | None = None
 
-    # Sampling info
+    # Sampling info for this DP rank
     sampling_info: SamplingBatchInfo = None
     next_batch_sampling_info: SamplingBatchInfo = None
 
-    # Batched arguments to model runner
-    input_ids: np.ndarray = None  # shape: [b], int32
-    req_pool_indices: np.ndarray = None  # shape: [b], int32
-    seq_lens: np.ndarray = None  # shape: [b], int32
-    # The output locations of the KV cache
-    out_cache_loc: np.ndarray = None  # shape: [b], int32
-    output_ids: np.ndarray = None  # shape: [b], int32
+    # Batched arguments to model runner (per DP)
+    input_ids: np.ndarray = None  # shape: [b_per_dp], int32
+    req_pool_indices: np.ndarray = None  # shape: [b_per_dp], int32
+    seq_lens: np.ndarray = None  # shape: [b_per_dp], int32
+    out_cache_loc: np.ndarray = None  # shape: [b_per_dp], int32
+    output_ids: np.ndarray = None  # shape: [b_per_dp], int32
 
-    # The sum of all sequence lengths
-    seq_lens_sum: int = None
+    # The sum of all sequence lengths for this DP rank
+    seq_lens_sum: int = 0
 
-    # For processing logprobs
-    return_logprob: bool = False
-    return_output_logprob_only: bool = False
+    # For processing logprobs (per DP)
     top_logprobs_nums: list[int] | None = None
     token_ids_logprobs: list[list[int]] | None = None
 
-    # For logits and logprob post processing
-    temp_scaled_logprobs: bool = False
-    top_p_normalized_logprobs: bool = False
-
-    # For extend and mixed chunekd prefill
+    # For extend and mixed chunked prefill (per DP)
     prefix_lens: list[int] = None
     extend_lens: list[int] = None
     extend_num_tokens: int | None = None
     decoding_reqs: list[Req] = None
     extend_logprob_start_lens: list[int] = None
-    # It comes empty list if logprob is not required.
     extend_input_logprob_token_ids: np.ndarray | None = None
 
-    # Stream
+    # Speculative decoding info (per DP)
+    spec_info: EagleDraftInput | EagleVerifyInput | None = None
+
+    # Whether this DP rank's batch is full
+    batch_is_full: bool = False
+
+
+@dataclasses.dataclass
+class ScheduleBatch:
+    """Store all information of a batch on the scheduler.
+
+    For DP > 1, per-DP request information is stored in reqs_info list.
+    Global/shared state is stored directly in this class.
+    """
+
+    # Per-DP request information (list of length dp_size)
+    reqs_info: list[ScheduleReqsInfo] = None
+
+    # Memory pool and cache (shared across all DP ranks)
+    req_to_token_pool: ReqToTokenPool = None
+    token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator = None
+    tree_cache: BasePrefixCache = None
+    is_hybrid: bool = False
+
+    # Batch configs (shared)
+    model_config: ModelConfig = None
+    forward_mode: ForwardMode = None
+    enable_overlap: bool = False
+
+    # Tell whether the current running batch is full globally (across all DP ranks)
+    # This is an optimization to reduce the overhead of the prefill check.
+    batch_is_full: bool = False
+
+    # For processing logprobs (shared settings)
+    return_logprob: bool = False
+    return_output_logprob_only: bool = False
+
+    # For logits and logprob post processing (shared settings)
+    temp_scaled_logprobs: bool = False
+    top_p_normalized_logprobs: bool = False
+
+    # Stream (shared)
     has_stream: bool = False
 
-    # Grammar-constrained decoding
+    # Grammar-constrained decoding (shared)
     has_grammar: bool = False
 
-    # device mesh
+    # device mesh (shared)
     mesh: mesh_lib.Mesh = None
 
     cache_miss_count: int = 0
 
+    # Speculative decoding algorithm (shared)
     spec_algorithm: SpeculativeAlgorithm = None
-    spec_info: EagleDraftInput | EagleVerifyInput | None = None
 
-    # Whether to return hidden states
+    # Whether to return hidden states (shared)
     return_hidden_states: bool = False
 
-    # Whether this batch is prefill-only (no token generation needed)
+    # Whether this batch is prefill-only (no token generation needed) (shared)
     is_prefill_only: bool = False
 
-    # Events
+    # Events (shared)
     launch_done: threading.Event | None = None
 
     # Data Parallelism size
     dp_size: int = 1
 
     def __post_init__(self):
-        """Initialize method bindings based on dp_size."""
+        """Initialize method bindings based on dp_size and ensure reqs_info is initialized."""
+        # Initialize reqs_info if not already set
+        if self.reqs_info is None:
+            self.reqs_info = [ScheduleReqsInfo() for _ in range(self.dp_size)]
+
+        # Bind implementation methods based on dp_size
         if self.dp_size == 1:
             # Single DP rank - use simple implementations (zero overhead)
             self._prepare_for_extend_impl = self._prepare_for_extend_single
             self._prepare_for_decode_impl = self._prepare_for_decode_single
-            self._evict_tree_cache_if_needed_impl = self._evict_tree_cache_if_needed_single
-            self._is_available_size_sufficient_impl = self._is_available_size_sufficient_single
         else:
             # Multiple DP ranks - use grouped implementations
             self._prepare_for_extend_impl = self._prepare_for_extend_multi
             self._prepare_for_decode_impl = self._prepare_for_decode_multi
-            self._evict_tree_cache_if_needed_impl = self._evict_tree_cache_if_needed_multi
-            self._is_available_size_sufficient_impl = self._is_available_size_sufficient_multi
 
     @classmethod
     def init_new(
         cls,
-        reqs: list[Req],
+        reqs: list[list[Req]],  # Per-DP requests: list of length dp_size
         req_to_token_pool: ReqToTokenPool,
         token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
         tree_cache: BasePrefixCache,
         model_config: ModelConfig,
         enable_overlap: bool,
+        dp_size: int,
         spec_algorithm: SpeculativeAlgorithm = None,
         enable_custom_logit_processor: bool = False,
-        chunked_req: Req | None = None,
+        chunked_reqs: (
+            list[Req | None] | None
+        ) = None,  # Per-DP chunked requests: list of length dp_size
         mesh: mesh_lib.Mesh = None,
     ):
-        return_logprob = any(req.return_logprob for req in reqs)
-        return_output_logprob_only = all(req.return_output_logprob_only for req in reqs)
+        # Validate input
+        assert len(reqs) == dp_size, f"reqs length {len(reqs)} != dp_size {dp_size}"
+        if chunked_reqs is not None:
+            assert (
+                len(chunked_reqs) == dp_size
+            ), f"chunked_reqs length {len(chunked_reqs)} != dp_size {dp_size}"
+        else:
+            chunked_reqs = [None] * dp_size
+
+        # Flatten all reqs for global checks
+        all_reqs = [req for dp_reqs in reqs for req in dp_reqs]
+
+        return_logprob = any(req.return_logprob for req in all_reqs)
+        return_output_logprob_only = all(req.return_output_logprob_only for req in all_reqs)
         is_hybrid = False
         if isinstance(token_to_kv_pool_allocator, SWATokenToKVPoolAllocator):
             assert tree_cache is None or isinstance(
@@ -622,11 +657,16 @@ class ScheduleBatch:
             ), "SWARadixCache or ChunkCache is required for SWATokenToKVPoolAllocator"
             is_hybrid = True
 
-        # Get dp_size from allocator
-        dp_size = getattr(token_to_kv_pool_allocator, "dp_size", 1)
+        # Initialize reqs_info based on dp_size with pre-distributed reqs
+        reqs_info = []
+        for dp_rank in range(dp_size):
+            info = ScheduleReqsInfo()
+            info.reqs = reqs[dp_rank]
+            info.chunked_req = chunked_reqs[dp_rank]
+            reqs_info.append(info)
 
         return cls(
-            reqs=reqs,
+            reqs_info=reqs_info,
             req_to_token_pool=req_to_token_pool,
             token_to_kv_pool_allocator=token_to_kv_pool_allocator,
             tree_cache=tree_cache,
@@ -635,20 +675,202 @@ class ScheduleBatch:
             return_logprob=return_logprob,
             return_output_logprob_only=return_output_logprob_only,
             enable_overlap=enable_overlap,
-            has_stream=any(req.stream for req in reqs),
-            has_grammar=any(req.grammar for req in reqs),
-            chunked_req=chunked_req,
+            has_stream=any(req.stream for req in all_reqs),
+            has_grammar=any(req.grammar for req in all_reqs),
             mesh=mesh,
             spec_algorithm=spec_algorithm,
-            is_prefill_only=all(req.sampling_params.max_new_tokens == 0 for req in reqs),
+            is_prefill_only=all(req.sampling_params.max_new_tokens == 0 for req in all_reqs),
             dp_size=dp_size,
         )
 
-    def batch_size(self):
-        return len(self.reqs)
+    # Convenience properties for accessing reqs across all DP ranks
+    @property
+    def reqs(self) -> list[Req]:
+        """Get all requests across all DP ranks (flattened)."""
+        all_reqs = []
+        for info in self.reqs_info:
+            if info.reqs is not None:
+                all_reqs.extend(info.reqs)
+        return all_reqs
 
-    def is_empty(self):
-        return len(self.reqs) == 0
+    @property
+    def chunked_req(self) -> Req | None:
+        """Get the chunked request (from first non-None DP rank)."""
+        for info in self.reqs_info:
+            if info.chunked_req is not None:
+                return info.chunked_req
+        return None
+
+    # Convenience properties for per-DP data (for backward compatibility with dp_size=1)
+    # When dp_size=1, these properties allow transparent access to the single DP rank's data
+    @property
+    def input_ids(self) -> np.ndarray | None:
+        """Get input_ids (for dp_size=1, returns from first DP rank)."""
+        return self.reqs_info[0].input_ids if self.reqs_info else None
+
+    @input_ids.setter
+    def input_ids(self, value: np.ndarray):
+        """Set input_ids (for dp_size=1, sets to first DP rank)."""
+        if self.reqs_info:
+            self.reqs_info[0].input_ids = value
+
+    @property
+    def req_pool_indices(self) -> np.ndarray | None:
+        return self.reqs_info[0].req_pool_indices if self.reqs_info else None
+
+    @req_pool_indices.setter
+    def req_pool_indices(self, value: np.ndarray):
+        if self.reqs_info:
+            self.reqs_info[0].req_pool_indices = value
+
+    @property
+    def seq_lens(self) -> np.ndarray | None:
+        return self.reqs_info[0].seq_lens if self.reqs_info else None
+
+    @seq_lens.setter
+    def seq_lens(self, value: np.ndarray):
+        if self.reqs_info:
+            self.reqs_info[0].seq_lens = value
+
+    @property
+    def out_cache_loc(self) -> np.ndarray | None:
+        return self.reqs_info[0].out_cache_loc if self.reqs_info else None
+
+    @out_cache_loc.setter
+    def out_cache_loc(self, value: np.ndarray):
+        if self.reqs_info:
+            self.reqs_info[0].out_cache_loc = value
+
+    @property
+    def output_ids(self) -> np.ndarray | None:
+        return self.reqs_info[0].output_ids if self.reqs_info else None
+
+    @output_ids.setter
+    def output_ids(self, value: np.ndarray):
+        if self.reqs_info:
+            self.reqs_info[0].output_ids = value
+
+    @property
+    def seq_lens_sum(self) -> int:
+        return self.reqs_info[0].seq_lens_sum if self.reqs_info else 0
+
+    @seq_lens_sum.setter
+    def seq_lens_sum(self, value: int):
+        if self.reqs_info:
+            self.reqs_info[0].seq_lens_sum = value
+
+    @property
+    def prefix_lens(self) -> list[int] | None:
+        return self.reqs_info[0].prefix_lens if self.reqs_info else None
+
+    @prefix_lens.setter
+    def prefix_lens(self, value: list[int]):
+        if self.reqs_info:
+            self.reqs_info[0].prefix_lens = value
+
+    @property
+    def extend_lens(self) -> list[int] | None:
+        return self.reqs_info[0].extend_lens if self.reqs_info else None
+
+    @extend_lens.setter
+    def extend_lens(self, value: list[int]):
+        if self.reqs_info:
+            self.reqs_info[0].extend_lens = value
+
+    @property
+    def extend_num_tokens(self) -> int | None:
+        return self.reqs_info[0].extend_num_tokens if self.reqs_info else None
+
+    @extend_num_tokens.setter
+    def extend_num_tokens(self, value: int):
+        if self.reqs_info:
+            self.reqs_info[0].extend_num_tokens = value
+
+    @property
+    def decoding_reqs(self) -> list[Req] | None:
+        return self.reqs_info[0].decoding_reqs if self.reqs_info else None
+
+    @decoding_reqs.setter
+    def decoding_reqs(self, value: list[Req]):
+        if self.reqs_info:
+            self.reqs_info[0].decoding_reqs = value
+
+    @property
+    def extend_logprob_start_lens(self) -> list[int] | None:
+        return self.reqs_info[0].extend_logprob_start_lens if self.reqs_info else None
+
+    @extend_logprob_start_lens.setter
+    def extend_logprob_start_lens(self, value: list[int]):
+        if self.reqs_info:
+            self.reqs_info[0].extend_logprob_start_lens = value
+
+    @property
+    def extend_input_logprob_token_ids(self) -> np.ndarray | None:
+        return self.reqs_info[0].extend_input_logprob_token_ids if self.reqs_info else None
+
+    @extend_input_logprob_token_ids.setter
+    def extend_input_logprob_token_ids(self, value: np.ndarray):
+        if self.reqs_info:
+            self.reqs_info[0].extend_input_logprob_token_ids = value
+
+    @property
+    def sampling_info(self) -> SamplingBatchInfo | None:
+        return self.reqs_info[0].sampling_info if self.reqs_info else None
+
+    @sampling_info.setter
+    def sampling_info(self, value: SamplingBatchInfo):
+        if self.reqs_info:
+            self.reqs_info[0].sampling_info = value
+
+    @property
+    def next_batch_sampling_info(self) -> SamplingBatchInfo | None:
+        return self.reqs_info[0].next_batch_sampling_info if self.reqs_info else None
+
+    @next_batch_sampling_info.setter
+    def next_batch_sampling_info(self, value: SamplingBatchInfo):
+        if self.reqs_info:
+            self.reqs_info[0].next_batch_sampling_info = value
+
+    @property
+    def top_logprobs_nums(self) -> list[int] | None:
+        return self.reqs_info[0].top_logprobs_nums if self.reqs_info else None
+
+    @top_logprobs_nums.setter
+    def top_logprobs_nums(self, value: list[int]):
+        if self.reqs_info:
+            self.reqs_info[0].top_logprobs_nums = value
+
+    @property
+    def token_ids_logprobs(self) -> list[list[int]] | None:
+        return self.reqs_info[0].token_ids_logprobs if self.reqs_info else None
+
+    @token_ids_logprobs.setter
+    def token_ids_logprobs(self, value: list[list[int]]):
+        if self.reqs_info:
+            self.reqs_info[0].token_ids_logprobs = value
+
+    @property
+    def spec_info(self) -> EagleDraftInput | EagleVerifyInput | None:
+        return self.reqs_info[0].spec_info if self.reqs_info else None
+
+    @spec_info.setter
+    def spec_info(self, value: EagleDraftInput | EagleVerifyInput):
+        if self.reqs_info:
+            self.reqs_info[0].spec_info = value
+
+    def batch_size(self) -> int:
+        """Get total number of requests across all DP ranks."""
+        return sum(len(info.reqs) if info.reqs else 0 for info in self.reqs_info)
+
+    def batch_size_per_dp(self, dp_rank: int) -> int:
+        """Get number of requests for a specific DP rank."""
+        if self.reqs_info[dp_rank].reqs is None:
+            return 0
+        return len(self.reqs_info[dp_rank].reqs)
+
+    def is_empty(self) -> bool:
+        """Check if batch is empty (no requests in any DP rank)."""
+        return self.batch_size() == 0
 
     def alloc_req_slots(self, num_reqs: int):
         req_pool_indices = self.req_to_token_pool.alloc(num_reqs)
@@ -670,7 +892,7 @@ class ScheduleBatch:
     ):
         num_tokens = len(seq_lens) * self.token_to_kv_pool_allocator.page_size
 
-        self._evict_tree_cache_if_needed(num_tokens)
+        self._evict_tree_cache_if_needed({dp_rank: num_tokens})
 
         if backup_state:
             state = self.token_to_kv_pool_allocator.backup_state()
@@ -1009,60 +1231,189 @@ class ScheduleBatch:
             else sum(1 for req in requests if (req.seqlen - 1) % page_size == 0)
         )
 
-    def check_decode_mem(self, buf_multiplier=1, selected_indices: list[int] | None = None):
-        num_tokens = (
-            self.new_page_count_next_decode(selected_indices)
-            * buf_multiplier
-            * self.token_to_kv_pool_allocator.page_size
+    def new_page_count_next_decode_per_dp(
+        self,
+        dp_rank: int,
+        selected_indices: list[int] | None = None,
+    ) -> int:
+        """Calculate new page count for next decode for a specific DP rank.
+
+        Args:
+            dp_rank: DP rank to calculate for
+            selected_indices: Optional local indices within this DP rank
+
+        Returns:
+            Number of new pages needed for this DP rank.
+        """
+        page_size = self.token_to_kv_pool_allocator.page_size
+        info = self.reqs_info[dp_rank]
+
+        if not info.reqs:
+            return 0
+
+        requests = (
+            info.reqs if selected_indices is None else [info.reqs[i] for i in selected_indices]
         )
 
-        self._evict_tree_cache_if_needed(num_tokens)
-        return self._is_available_size_sufficient(num_tokens)
+        if page_size == 1:
+            return len(requests)
+
+        return (
+            sum(1 for req in requests if req.seqlen % page_size == 0)
+            if self.enable_overlap
+            else sum(1 for req in requests if (req.seqlen - 1) % page_size == 0)
+        )
+
+    def check_decode_mem(
+        self, buf_multiplier=1, selected_indices: dict[int, list[int]] | None = None
+    ):
+        """Check if all DP ranks have sufficient memory for next decode step.
+
+        Args:
+            buf_multiplier: Buffer multiplier for memory calculation
+            selected_indices: Optional per-DP indices to check
+                              Format: {dp_rank: [local_index_0, local_index_1, ...]}
+                              If None, checks all requests in all DP ranks
+
+        Returns:
+            False if any DP rank has insufficient memory.
+        """
+        # Calculate tokens needed per DP rank
+        num_tokens_per_dp = {}
+        for dp_rank in range(self.dp_size):
+            info = self.reqs_info[dp_rank]
+            if not info.reqs:
+                continue
+
+            # Get indices for this specific DP rank
+            indices = selected_indices.get(dp_rank) if selected_indices else None
+
+            # Calculate tokens needed for THIS specific DP rank
+            num_pages = self.new_page_count_next_decode_per_dp(dp_rank, indices)
+            num_tokens_per_dp[dp_rank] = (
+                num_pages * buf_multiplier * self.token_to_kv_pool_allocator.page_size
+            )
+
+        # Try to evict if needed, then check if sufficient
+        self._evict_tree_cache_if_needed(num_tokens_per_dp)
+        return self._is_available_size_sufficient(num_tokens_per_dp)
 
     def retract_decode(self, server_args: ServerArgs):
-        """Retract the decoding requests when there is not enough memory."""
-        sorted_indices = list(range(len(self.reqs)))
+        """Retract requests when memory insufficient.
 
-        sorted_indices.sort(
-            key=lambda i: (
-                len(self.reqs[i].output_ids),
-                -len(self.reqs[i].origin_input_ids),
-            ),
-            reverse=True,
-        )
+        Each DP rank independently:
+        - Checks its own memory
+        - Sorts its requests by priority
+        - Retracts until sufficient
 
+        Returns:
+            retracted_reqs: All retracted requests
+            new_estimate_ratio: Updated estimate
+        """
         retracted_reqs = []
-        first_iter = True
-        while (not self.check_decode_mem(selected_indices=sorted_indices)) or first_iter:
-            if len(sorted_indices) == 1:
-                # Corner case: only one request left
+        keep_indices_per_dp = {}
+
+        # Process each DP rank independently
+        for dp_rank in range(self.dp_size):
+            info = self.reqs_info[dp_rank]
+
+            # Skip empty ranks
+            if not info.reqs or len(info.reqs) == 0:
+                keep_indices_per_dp[dp_rank] = []
+                continue
+
+            # Sort requests by priority (local to this rank)
+            sorted_indices = list(range(len(info.reqs)))
+            sorted_indices.sort(
+                key=lambda i: (
+                    len(info.reqs[i].output_ids),
+                    -len(info.reqs[i].origin_input_ids),
+                ),
+                reverse=True,
+            )
+
+            # Helper: check memory for this DP rank
+            def has_sufficient_memory(indices):
+                num_pages = self.new_page_count_next_decode_per_dp(dp_rank, indices)
+                num_tokens = num_pages * self.token_to_kv_pool_allocator.page_size
+
+                # Evict if needed
+                if not isinstance(self.tree_cache, ChunkCache) and self.tree_cache:
+                    if self.is_hybrid:
+                        full_avail = self.token_to_kv_pool_allocator.full_available_size(
+                            dp_rank=dp_rank
+                        )
+                        swa_avail = self.token_to_kv_pool_allocator.swa_available_size(
+                            dp_rank=dp_rank
+                        )
+                        if full_avail < num_tokens or swa_avail < num_tokens:
+                            self.tree_cache.evict(
+                                max(0, num_tokens - full_avail), max(0, num_tokens - swa_avail)
+                            )
+                    else:
+                        avail = self.token_to_kv_pool_allocator.available_size(dp_rank=dp_rank)
+                        if avail < num_tokens:
+                            self.tree_cache.evict(num_tokens)
+
+                # Check if sufficient
                 if self.is_hybrid:
-                    full_available_size = self.token_to_kv_pool_allocator.full_available_size()
-                    swa_available_size = self.token_to_kv_pool_allocator.swa_available_size()
-                    assert (
-                        full_available_size > 0 and swa_available_size > 0
-                    ), f"No space left for only one request in SWA mode {full_available_size=}, {swa_available_size=}"
+                    full_ok = (
+                        self.token_to_kv_pool_allocator.full_available_size(dp_rank=dp_rank)
+                        >= num_tokens
+                    )
+                    swa_ok = (
+                        self.token_to_kv_pool_allocator.swa_available_size(dp_rank=dp_rank)
+                        >= num_tokens
+                    )
+                    return full_ok and swa_ok
                 else:
-                    assert (
-                        self.token_to_kv_pool_allocator.available_size() > 0
-                    ), f"No space left for only one request, {self.token_to_kv_pool_allocator.available_size()=}"
-                break
+                    return (
+                        self.token_to_kv_pool_allocator.available_size(dp_rank=dp_rank)
+                        >= num_tokens
+                    )
 
-            first_iter = False
-            idx = sorted_indices.pop()
-            req = self.reqs[idx]
-            retracted_reqs.append(req)
-            self.release_req(idx, len(sorted_indices), server_args)
+            # Retract until sufficient for this rank
+            first_iter = True
+            while not has_sufficient_memory(sorted_indices) or first_iter:
+                if len(sorted_indices) == 1:
+                    # Assert some space available
+                    if self.is_hybrid:
+                        full_avail = self.token_to_kv_pool_allocator.full_available_size(
+                            dp_rank=dp_rank
+                        )
+                        swa_avail = self.token_to_kv_pool_allocator.swa_available_size(
+                            dp_rank=dp_rank
+                        )
+                        assert (
+                            full_avail > 0 and swa_avail > 0
+                        ), f"[DP {dp_rank}] No space for single request (hybrid)"
+                    else:
+                        avail = self.token_to_kv_pool_allocator.available_size(dp_rank=dp_rank)
+                        assert avail > 0, f"[DP {dp_rank}] No space for single request"
+                    break
 
-            if len(retracted_reqs) == 0:
-                # Corner case: only one request left
-                raise ValueError(
-                    "Failed to retract any request. No space left for only one request."
+                first_iter = False
+                retract_idx = sorted_indices.pop()
+                req = info.reqs[retract_idx]
+                retracted_reqs.append(req)
+
+                # Calculate flat index for release_req
+                flat_idx = (
+                    sum(
+                        len(self.reqs_info[r].reqs) if self.reqs_info[r].reqs else 0
+                        for r in range(dp_rank)
+                    )
+                    + retract_idx
                 )
 
-        self.filter_batch(keep_indices=sorted_indices)
+                self.release_req(flat_idx, len(self.reqs) - len(retracted_reqs) - 1, server_args)
 
-        # Reqs in batch are filtered
+            keep_indices_per_dp[dp_rank] = sorted_indices
+
+        # Apply filtering
+        self.filter_batch(keep_indices=keep_indices_per_dp)
+
+        # Calculate global estimate ratio
         total_decoded_tokens = sum(len(r.output_ids) for r in self.reqs)
         total_max_new_tokens = sum(r.sampling_params.max_new_tokens for r in self.reqs)
 
@@ -1101,7 +1452,7 @@ class ScheduleBatch:
                 self.tree_cache.dec_lock_ref(req.last_node)
 
             num_tokens = remaing_req_count * global_config.retract_decode_steps
-            self._evict_tree_cache_if_needed(num_tokens)
+            self._evict_tree_cache_if_needed({req.dp_rank: num_tokens})
 
         req.reset_for_retract()
 
@@ -1246,70 +1597,151 @@ class ScheduleBatch:
 
     def filter_batch(
         self,
-        chunked_req_to_exclude: Req | list[Req] | None = None,
-        keep_indices: list[int] | None = None,
+        chunked_req_to_exclude: dict[int, Req] | None = None,
+        keep_indices: dict[int, list[int]] | None = None,
     ):
-        if keep_indices is None:
-            if isinstance(chunked_req_to_exclude, Req):
-                chunked_req_to_exclude = [chunked_req_to_exclude]
-            elif chunked_req_to_exclude is None:
-                chunked_req_to_exclude = []
-            keep_indices = [
-                i
-                for i in range(len(self.reqs))
-                if not self.reqs[i].finished() and self.reqs[i] not in chunked_req_to_exclude
-            ]
+        """Filter completed requests from batch.
 
-        if keep_indices is None or len(keep_indices) == 0:
-            # Filter out all requests
-            self.reqs = []
-            return
+        Args:
+            chunked_req_to_exclude: Optional dict mapping dp_rank -> chunked request to exclude for that rank
+            keep_indices: Optional dict mapping dp_rank -> list of indices to keep for that rank.
+                         If None, automatically calculates based on finished() status.
+        """
+        # Normalize exclusion dict
+        if chunked_req_to_exclude is None:
+            chunked_req_to_exclude = {}
 
-        if len(keep_indices) == len(self.reqs):
-            # No need to filter
-            return
+        # Unified DP filtering logic (works for all dp_size including 1)
+        for dp_rank in range(self.dp_size):
+            info = self.reqs_info[dp_rank]
 
-        self.reqs = [self.reqs[i] for i in keep_indices]
-        self.req_pool_indices = self.req_pool_indices[keep_indices]
-        # TODO: uniform data type in scheduler batch
-        if isinstance(self.seq_lens, jax.Array):
-            self.seq_lens = np.array(self.seq_lens)
-            self.output_ids = np.array(self.output_ids)
-        self.seq_lens = self.seq_lens[keep_indices]
-        if self.spec_info is not None and self.spec_info.topk_p is not None:
-            keep_indices_jax = jnp.asarray(keep_indices, dtype=jnp.int32)
-            self.spec_info.topk_p = self.spec_info.topk_p[keep_indices_jax]
-            self.spec_info.topk_index = self.spec_info.topk_index[keep_indices_jax]
-            self.spec_info.hidden_states = self.spec_info.hidden_states[keep_indices_jax]
-            self.spec_info.verified_id = self.spec_info.verified_id[keep_indices_jax]
-            self.spec_info.allocate_lens = self.spec_info.allocate_lens[keep_indices_jax]
+            # Skip if this DP rank has no requests
+            if not info.reqs or len(info.reqs) == 0:
+                continue
 
-        self.out_cache_loc = None
-        self.seq_lens_sum = self.seq_lens.sum().item()
-        if not isinstance(keep_indices, np.ndarray):
-            keep_indices = np.array(keep_indices)
-        self.output_ids = self.output_ids[keep_indices] if self.output_ids is not None else None
-        self.return_logprob = any(req.return_logprob for req in self.reqs)
-        self.return_output_logprob_only = any(req.return_output_logprob_only for req in self.reqs)
-        if self.return_logprob:
-            self.top_logprobs_nums = [self.top_logprobs_nums[i] for i in keep_indices]
-            self.token_ids_logprobs = [self.token_ids_logprobs[i] for i in keep_indices]
-        else:
-            self.top_logprobs_nums = None
-            self.token_ids_logprobs = None
+            # Get chunked request to exclude for this rank
+            chunked_req = chunked_req_to_exclude.get(dp_rank)
 
-        self.has_stream = any(req.stream for req in self.reqs)
-        self.has_grammar = any(req.grammar for req in self.reqs)
-
-        self.sampling_info.filter_batch(np.array(keep_indices))
-        if self.spec_info is not None:
-            if chunked_req_to_exclude is not None and len(chunked_req_to_exclude) > 0:
-                has_been_filtered = False
+            # Get keep_indices for this DP rank
+            if keep_indices is not None:
+                # Use provided keep_indices for this rank
+                keep_indices_dp = keep_indices.get(dp_rank, [])
+                if keep_indices_dp is None:
+                    keep_indices_dp = []
             else:
-                has_been_filtered = True
-            self.spec_info.filter_batch(
-                new_indices=keep_indices, has_been_filtered=has_been_filtered
+                # Calculate keep_indices automatically
+                keep_indices_dp = [
+                    i
+                    for i in range(len(info.reqs))
+                    if not info.reqs[i].finished()
+                    and (chunked_req is None or info.reqs[i] != chunked_req)
+                ]
+
+            # Early exit: Clear all if nothing to keep
+            if len(keep_indices_dp) == 0:
+                info.reqs = []
+                info.req_pool_indices = None
+                info.seq_lens = None
+                info.output_ids = None
+                info.out_cache_loc = None
+                info.seq_lens_sum = 0
+                info.top_logprobs_nums = None
+                info.token_ids_logprobs = None
+                info.sampling_info = None
+                info.spec_info = None
+                continue
+
+            # Early exit: No filtering needed if all requests kept
+            if len(keep_indices_dp) == len(info.reqs):
+                continue
+
+            # Filter reqs list
+            info.reqs = [info.reqs[i] for i in keep_indices_dp]
+
+            # Filter memory pool indices
+            if info.req_pool_indices is not None:
+                info.req_pool_indices = info.req_pool_indices[keep_indices_dp]
+
+            # Convert JAX arrays to NumPy if needed
+            if isinstance(info.seq_lens, jax.Array):
+                info.seq_lens = np.array(info.seq_lens)
+                info.output_ids = np.array(info.output_ids)
+
+            # Filter sequence data
+            if info.seq_lens is not None:
+                info.seq_lens = info.seq_lens[keep_indices_dp]
+
+            if info.output_ids is not None:
+                info.output_ids = info.output_ids[keep_indices_dp]
+
+            # Reset cache location (will be recomputed)
+            info.out_cache_loc = None
+
+            # Recalculate seq_lens_sum for this DP rank
+            if info.seq_lens is not None:
+                info.seq_lens_sum = info.seq_lens.sum().item()
+            else:
+                info.seq_lens_sum = 0
+
+            # Filter speculative decoding arrays manually (if present)
+            if info.spec_info is not None and info.spec_info.topk_p is not None:
+                keep_indices_jax = jnp.asarray(keep_indices_dp, dtype=jnp.int32)
+                info.spec_info.topk_p = info.spec_info.topk_p[keep_indices_jax]
+                info.spec_info.topk_index = info.spec_info.topk_index[keep_indices_jax]
+                info.spec_info.hidden_states = info.spec_info.hidden_states[keep_indices_jax]
+                info.spec_info.verified_id = info.spec_info.verified_id[keep_indices_jax]
+                info.spec_info.allocate_lens = info.spec_info.allocate_lens[keep_indices_jax]
+
+            # Filter logprob lists
+            if info.top_logprobs_nums is not None:
+                info.top_logprobs_nums = [info.top_logprobs_nums[i] for i in keep_indices_dp]
+                info.token_ids_logprobs = [info.token_ids_logprobs[i] for i in keep_indices_dp]
+
+            # Filter extend-mode lists
+            if info.prefix_lens is not None:
+                info.prefix_lens = [info.prefix_lens[i] for i in keep_indices_dp]
+            if info.extend_lens is not None:
+                info.extend_lens = [info.extend_lens[i] for i in keep_indices_dp]
+            if info.extend_logprob_start_lens is not None:
+                info.extend_logprob_start_lens = [
+                    info.extend_logprob_start_lens[i] for i in keep_indices_dp
+                ]
+            if info.decoding_reqs is not None:
+                info.decoding_reqs = [info.decoding_reqs[i] for i in keep_indices_dp]
+
+            # Filter sampling_info
+            if info.sampling_info is not None:
+                info.sampling_info.filter_batch(np.array(keep_indices_dp))
+
+            # Filter spec_info (method call)
+            if info.spec_info is not None:
+                # Note: has_been_filtered logic matches original implementation
+                if chunked_req_to_exclude is not None and len(chunked_req_to_exclude) > 0:
+                    has_been_filtered = False
+                else:
+                    has_been_filtered = True
+                info.spec_info.filter_batch(
+                    new_indices=keep_indices_dp, has_been_filtered=has_been_filtered
+                )
+
+        # Recalculate global batch flags from all remaining requests
+        all_reqs = self.reqs  # Uses property to get flattened list
+
+        if len(all_reqs) > 0:
+            self.return_logprob = any(req.return_logprob for req in all_reqs)
+            self.return_output_logprob_only = all(
+                req.return_output_logprob_only for req in all_reqs
             )
+            self.has_stream = any(req.stream for req in all_reqs)
+            self.has_grammar = any(req.grammar for req in all_reqs)
+        else:
+            self.return_logprob = False
+            self.return_output_logprob_only = False
+            self.has_stream = False
+            self.has_grammar = False
+
+        # Batch is full only if ALL DP ranks are full
+        self.batch_is_full = all(info.batch_is_full for info in self.reqs_info)
 
     def merge_batch(self, other: ScheduleBatch):
         # Penalizer orchestrator must be merged before Batch.reqs is merged. This is because
@@ -1938,97 +2370,46 @@ class ScheduleBatch:
 
         return result
 
-    def _evict_tree_cache_if_needed_single(
-        self,
-        num_tokens: int,
-    ) -> None:
-        """Evict from tree cache if needed (single DP rank)."""
+    def _evict_tree_cache_if_needed(self, num_tokens_per_dp: dict[int, int]) -> None:
+        """Evict from tree cache if needed for any DP rank.
+
+        Per-DP aware implementation. Tree cache is global, eviction affects all DP ranks.
+
+        Args:
+            num_tokens_per_dp: Dict mapping dp_rank to tokens needed for that rank
+        """
         if isinstance(self.tree_cache, ChunkCache):
             return
 
-        # Single DP rank - all reqs have same dp_rank
-        dp_rank = self.reqs[0].dp_rank if (self.reqs and self.reqs[0].dp_rank is not None) else 0
-        if self.is_hybrid:
-            full_available_size = self.token_to_kv_pool_allocator.full_available_size(
-                dp_rank=dp_rank
-            )
-            swa_available_size = self.token_to_kv_pool_allocator.swa_available_size(dp_rank=dp_rank)
-
-            if (
-                full_available_size < num_tokens or swa_available_size < num_tokens
-            ) and self.tree_cache is not None:
-                full_num_tokens = max(0, num_tokens - full_available_size)
-                swa_num_tokens = max(0, num_tokens - swa_available_size)
-                self.tree_cache.evict(full_num_tokens, swa_num_tokens)
-        else:
-            if (
-                self.token_to_kv_pool_allocator.available_size(dp_rank=dp_rank) < num_tokens
-                and self.tree_cache is not None
-            ):
-                self.tree_cache.evict(num_tokens)
-
-    def _evict_tree_cache_if_needed_multi(
-        self,
-        num_tokens: int,
-    ) -> None:
-        """Evict from tree cache for multiple DP ranks if needed."""
-        if isinstance(self.tree_cache, ChunkCache):
-            return
-
-        # Collect all unique dp_ranks in batch
-        dp_ranks = set()
-        for req in self.reqs:
-            dp_rank = req.dp_rank if req.dp_rank is not None else 0
-            dp_ranks.add(dp_rank)
-
-        # Evict for each dp_rank if needed
-        for dp_rank in dp_ranks:
+        # Per-DP loop
+        for dp_rank, num_tokens in num_tokens_per_dp.items():
             if self.is_hybrid:
                 full_available = self.token_to_kv_pool_allocator.full_available_size(
                     dp_rank=dp_rank
                 )
                 swa_available = self.token_to_kv_pool_allocator.swa_available_size(dp_rank=dp_rank)
-                if (
-                    full_available < num_tokens or swa_available < num_tokens
-                ) and self.tree_cache is not None:
+
+                if (full_available < num_tokens or swa_available < num_tokens) and self.tree_cache:
                     full_num = max(0, num_tokens - full_available)
                     swa_num = max(0, num_tokens - swa_available)
                     self.tree_cache.evict(full_num, swa_num)
             else:
                 available = self.token_to_kv_pool_allocator.available_size(dp_rank=dp_rank)
-                if available < num_tokens and self.tree_cache is not None:
+                if available < num_tokens and self.tree_cache:
                     self.tree_cache.evict(num_tokens)
 
-    def _evict_tree_cache_if_needed(
-        self,
-        num_tokens: int,
-    ) -> None:
-        """Public method - delegates to bound implementation."""
-        return self._evict_tree_cache_if_needed_impl(num_tokens)
+    def _is_available_size_sufficient(self, num_tokens_per_dp: dict[int, int]) -> bool:
+        """Check if sufficient memory available across all DP ranks.
 
-    def _is_available_size_sufficient_single(self, num_tokens: int) -> bool:
-        """Check if sufficient memory for single DP rank batch."""
-        # Single DP rank - all reqs have same dp_rank
-        dp_rank = self.reqs[0].dp_rank if (self.reqs and self.reqs[0].dp_rank is not None) else 0
-        if self.is_hybrid:
-            return (
-                self.token_to_kv_pool_allocator.full_available_size(dp_rank=dp_rank) >= num_tokens
-                and self.token_to_kv_pool_allocator.swa_available_size(dp_rank=dp_rank)
-                >= num_tokens
-            )
-        else:
-            return self.token_to_kv_pool_allocator.available_size(dp_rank=dp_rank) >= num_tokens
+        Per-DP aware implementation. Returns False if ANY DP rank has insufficient memory.
 
-    def _is_available_size_sufficient_multi(self, num_tokens: int) -> bool:
-        """Check if sufficient memory for all DP ranks in batch."""
-        # Collect all unique dp_ranks
-        dp_ranks = set()
-        for req in self.reqs:
-            dp_rank = req.dp_rank if req.dp_rank is not None else 0
-            dp_ranks.add(dp_rank)
+        Args:
+            num_tokens_per_dp: Dict mapping dp_rank to tokens needed for that rank
 
-        # Check each dp_rank
-        for dp_rank in dp_ranks:
+        Returns:
+            True if all DP ranks have sufficient memory, False otherwise.
+        """
+        for dp_rank, num_tokens in num_tokens_per_dp.items():
             if self.is_hybrid:
                 full_ok = (
                     self.token_to_kv_pool_allocator.full_available_size(dp_rank=dp_rank)
@@ -2045,10 +2426,6 @@ class ScheduleBatch:
                     return False
 
         return True
-
-    def _is_available_size_sufficient(self, num_tokens: int) -> bool:
-        """Public method - delegates to bound implementation."""
-        return self._is_available_size_sufficient_impl(num_tokens)
 
     def _available_and_evictable_str(self) -> str:
         """Get debug string for available and evictable memory."""
@@ -2112,6 +2489,44 @@ class ScheduleBatch:
 def align_to_size(lst: list, size: int, value: int = 0) -> list:
     align_len = (len(lst) + size - 1) // size * size
     return lst[:] + [value] * (align_len - len(lst))
+
+
+@dataclasses.dataclass
+class ModelWorkerSamplingInfo:
+    """Unified sampling information for a generation batch."""
+
+    # Basic batched sampling params
+    temperatures: np.ndarray
+    top_ps: np.ndarray
+    top_ks: np.ndarray
+    min_ps: np.ndarray
+
+    vocab_size: int
+
+    # Whether all requests use greedy sampling
+    is_all_greedy: bool = False
+
+    # Whether any requests use top_p sampling
+    need_top_p_sampling: bool = False
+
+    # Whether any requests use top_k sampling
+    need_top_k_sampling: bool = False
+
+    # Whether any request needs min_p sampling
+    need_min_p_sampling: bool = False
+
+    # An event used for overlap schedule
+    sampling_info_done: threading.Event | None = None
+
+    sampling_seeds: np.ndarray | None = None
+
+    # Penalizer
+    penalizer_orchestrator: penaltylib.BatchedPenalizerOrchestrator | None = None
+    linear_penalty: np.ndarray = None
+
+    # Grammar-constrained decoding
+    grammars: list | None = None  # list[BaseGrammarObject | None]
+    vocab_mask: np.ndarray | None = None  # Shape: [batch_size, vocab_size // 32]
 
 
 @dataclasses.dataclass
