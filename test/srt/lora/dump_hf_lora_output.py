@@ -15,7 +15,7 @@
 
 """
 Dump HuggingFace LoRA logits for comparison with sglang-jax.
-Attention: Need install torch, transformer and sglang package first.
+Attention: Need install torch, transformer, peft and sglang package first.
 
 This script:
 1. Runs HuggingFace with LoRA adapters with precision is equal to float32
@@ -23,17 +23,25 @@ This script:
 3. Saves the results to a JSON file for use in sglang-jax comparison
 
 Usage:
-    python dump_hf_lora_logprobs.py --model meta-llama/Llama-2-7b-hf \
+    python dump_hf_lora_output.py --model meta-llama/Llama-2-7b-hf \
         --lora-path yushengsu/sglang_lora_logprob_diff_without_tuning \
-        --output hf_logprobs.json
+        --output hf_lora_output.json
 
     # Multiple prompts and LoRA adapters
-    python dump_hf_lora_logprobs.py \
+    python dump_hf_lora_output.py \
         --model meta-llama/Llama-2-7b-hf \
         --lora-path adapter1 adapter2 \
         --prompt "Hello" "How are you?" \
         --max-new-tokens 64 \
-        --output hf_logprobs.json
+        --output hf_lora_output.json
+
+    python dump_hf_lora_output.py --model Qwen/Qwen3-4B \
+        --lora-path y9760210/Qwen3-4B-lora_model \
+        --prompt "AI is a field of computer science focused on" \
+        --max-new-tokens 1 \
+        --output hf_lora_prefill_output.json \
+        --use-cpu \
+        --dtype float32
 """
 
 import argparse
@@ -83,7 +91,7 @@ def run_hf_with_lora(
     num_layers: Optional[int] = None,
 ) -> Dict[str, Any]:
     """
-    Run HuggingFace with LoRA and return log probabilities.
+    Run HuggingFace with LoRA and return logits.
 
     Args:
         model_path: Path to the base model
@@ -132,6 +140,7 @@ def run_hf_with_lora(
         "top_output_logprobs": hf_outputs.top_output_logprobs,
         "output_strs": hf_outputs.output_strs,
         "lora_paths": lora_paths_per_prompt,
+        "last_token_logits_list": hf_outputs.last_token_logits_list,
     }
 
 
@@ -156,7 +165,7 @@ def convert_to_serializable(obj):
     return obj
 
 
-def save_logprobs_to_json(
+def save_data_to_json(
     data: Dict[str, Any],
     output_path: str,
     model_path: str,
@@ -194,6 +203,8 @@ def save_logprobs_to_json(
             "decode_logprobs": convert_to_serializable(data["top_output_logprobs"][i]),
             "prefill_shape": list(np.array(data["top_input_logprobs"][i]).shape),
             "decode_shape": list(np.array(data["top_output_logprobs"][i]).shape),
+            "last_token_logits": convert_to_serializable(data["last_token_logits_list"][i]),
+            "last_token_logits_shape":list(np.array(data["last_token_logits_list"][i]).shape),
         }
         output_data["results"].append(result)
 
@@ -231,6 +242,8 @@ def print_summary(data: Dict[str, Any], prompts: List[str]):
 
         print(f"  Prefill logprobs shape: {prefill_shape}")
         print(f"  Decode logprobs shape:  {decode_shape}")
+
+        print(f"  Last token logits shape: {np.array(data['last_token_logits_list'][i]).shape}")
 
         output_str = data["output_strs"][i]
         display_len = 100
@@ -337,7 +350,7 @@ def main():
         print_summary(data, prompts)
 
         # Save to JSON
-        save_logprobs_to_json(
+        save_data_to_json(
             data=data,
             output_path=args.output,
             model_path=args.model,

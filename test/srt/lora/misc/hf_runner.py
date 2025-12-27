@@ -46,6 +46,7 @@ class ModelOutput:
     output_token_logprobs_lst: List[List[Tuple[float, int, None]]] = None
     token_ids_input_logprobs: List[torch.Tensor] = None
     token_ids_output_logprobs: List[torch.Tensor] = None
+    last_token_logits_list: List[torch.Tensor] = None
 
 
 class HFRunner:
@@ -282,6 +283,7 @@ class HFRunner:
             token_ids_output_logprobs = []
         else:
             token_ids_input_logprobs = token_ids_output_logprobs = None
+        last_token_logits_list=[]
 
         for i, p in enumerate(prompts):
             if isinstance(p, str):
@@ -374,9 +376,14 @@ class HFRunner:
                         input_logits = base.lm_head(hidden_state)[0]
                     else:
                         # If no lm_head found, just use the hidden state as "logits"
-                        input_logits = hidden_state[0]
+                        input_logits = hidden_state[0]                    
                 else:
-                    input_logits = model.forward(input_ids).logits[0]
+                    output = model.forward(input_ids)
+                    input_logits = output.logits[0]
+                    
+
+                last_token_logits = input_logits[-1,:]
+                last_token_logits_list.append(last_token_logits)
                 top_input_logprobs.append(get_top_logprobs(input_logits, NUM_TOP_LOGPROBS).tolist())
                 if token_ids_logprob is not None:
                     token_ids_input_logprobs.append(
@@ -394,6 +401,7 @@ class HFRunner:
             top_output_logprobs=top_output_logprobs,
             token_ids_input_logprobs=token_ids_input_logprobs,
             token_ids_output_logprobs=token_ids_output_logprobs,
+            last_token_logits_list=last_token_logits_list,
         )
 
 

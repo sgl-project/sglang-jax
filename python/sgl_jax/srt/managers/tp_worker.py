@@ -501,7 +501,7 @@ class ModelWorker:
         save_logits_file_info=os.getenv("DUMP_LAST_LAYER_LOGITS_FILENAMES", None)
         if save_logits_file_info:
             save_logits_with_json(
-                logits_output.next_token_logits,
+                logits_output.next_token_logits[:model_worker_batch.real_bs,:],
                 save_logits_file_info,
                 forward_batch.forward_mode,
                 )
@@ -641,7 +641,7 @@ class MockModelWorker:
             ),
             None,
         )
-        
+
 def save_logits_with_json(
     logits:jax.Array,
     file_info:str,
@@ -655,7 +655,9 @@ def save_logits_with_json(
         file_name=file_slice[1]
     else:
         raise ValueError(f"Unsupported {forward_mode} to save logits with json")
-    logits_np=jax.device_get(logits)
-    
-    with open(file_name, 'w') as f:
-        json.dump(logits_np.tolist(), f)
+
+    os.makedirs(os.path.dirname(file_name), exist_ok=True)
+    np.savetxt(file_name, np.asarray(jax.device_get(logits)).flatten(),fmt='%.15f')
+    #with open(file_name, 'w') as f:
+        #logits_np=jax.device_get(logits).flatten()
+        #json.dump(logits_np.tolist(), f)
