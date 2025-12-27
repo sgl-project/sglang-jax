@@ -131,13 +131,9 @@ class TestModelPerfTrace(CustomTestCase):
 
         try:
             static_config = {
-                "model": model_path_for_server,
-                "host": "0.0.0.0",
-                "port": int(base_url.split(":")[-1]),
-                "dataset_name": "sharegpt",
+                "dataset_name": "random",
                 "dataset_path": self.sharegpt_dataset_path,
-                "warmup_requests": 1,
-                "flush_cache": True,
+                "warmup_requests": 0,
                 "profile": True,
                 "num_steps": 10,
             }
@@ -270,13 +266,9 @@ class TestModelPerfTrace(CustomTestCase):
         results_summary = []
         try:
             static_config = {
-                "model": model_path_for_server,
-                "host": "0.0.0.0",
-                "port": int(base_url.split(":")[-1]),
-                "dataset_name": "sharegpt",
+                "dataset_name": "random",
                 "dataset_path": self.sharegpt_dataset_path,
-                "warmup_requests": 1,
-                "flush_cache": True,
+                "warmup_requests": 0,
                 "profile": True,
                 "num_steps": 10,
             }
@@ -405,13 +397,9 @@ class TestModelPerfTrace(CustomTestCase):
 
         try:
             static_config = {
-                "model": model_path_for_server,
-                "host": "0.0.0.0",
-                "port": int(base_url.split(":")[-1]),
-                "dataset_name": "sharegpt",
+                "dataset_name": "random",
                 "dataset_path": self.sharegpt_dataset_path,
-                "warmup_requests": 1,
-                "flush_cache": True,
+                "warmup_requests": 0,
                 "profile": True,
                 "num_steps": 10,
             }
@@ -541,13 +529,9 @@ class TestModelPerfTrace(CustomTestCase):
 
         try:
             static_config = {
-                "model": model_path_for_server,
-                "host": "0.0.0.0",
-                "port": int(base_url.split(":")[-1]),
-                "dataset_name": "sharegpt",
+                "dataset_name": "random",
                 "dataset_path": self.sharegpt_dataset_path,
-                "warmup_requests": 1,
-                "flush_cache": True,
+                "warmup_requests": 0,
                 "profile": True,
                 "num_steps": 10,
             }
@@ -679,13 +663,9 @@ class TestModelPerfTrace(CustomTestCase):
 
         try:
             static_config = {
-                "model": model_path_for_server,
-                "host": "0.0.0.0",
-                "port": int(base_url.split(":")[-1]),
-                "dataset_name": "sharegpt",
+                "dataset_name": "random",
                 "dataset_path": self.sharegpt_dataset_path,
-                "warmup_requests": 1,
-                "flush_cache": True,
+                "warmup_requests": 0,
                 "profile": True,
                 "num_steps": 10,
             }
@@ -815,13 +795,9 @@ class TestModelPerfTrace(CustomTestCase):
 
         try:
             static_config = {
-                "model": model_path_for_server,
-                "host": "0.0.0.0",
-                "port": int(base_url.split(":")[-1]),
-                "dataset_name": "sharegpt",
+                "dataset_name": "random",
                 "dataset_path": self.sharegpt_dataset_path,
-                "warmup_requests": 1,
-                "flush_cache": True,
+                "warmup_requests": 0,
                 "profile": True,
                 "num_steps": 10,
             }
@@ -951,13 +927,9 @@ class TestModelPerfTrace(CustomTestCase):
 
         try:
             static_config = {
-                "model": model_path_for_server,
-                "host": "0.0.0.0",
-                "port": int(base_url.split(":")[-1]),
-                "dataset_name": "sharegpt",
+                "dataset_name": "random",
                 "dataset_path": self.sharegpt_dataset_path,
-                "warmup_requests": 1,
-                "flush_cache": True,
+                "warmup_requests": 0,
                 "profile": True,
                 "num_steps": 10,
             }
@@ -1088,13 +1060,9 @@ class TestModelPerfTrace(CustomTestCase):
 
         try:
             static_config = {
-                "model": model_path_for_server,
-                "host": "0.0.0.0",
-                "port": int(base_url.split(":")[-1]),
-                "dataset_name": "sharegpt",
+                "dataset_name": "random",
                 "dataset_path": self.sharegpt_dataset_path,
-                "warmup_requests": 1,
-                "flush_cache": True,
+                "warmup_requests": 0,
                 "profile": True,
                 "num_steps": 10,
             }
@@ -1212,13 +1180,9 @@ class TestModelPerfTrace(CustomTestCase):
 
         try:
             static_config = {
-                "model": model_path_for_server,
-                "host": "0.0.0.0",
-                "port": int(base_url.split(":")[-1]),
-                "dataset_name": "sharegpt",
+                "dataset_name": "random",
                 "dataset_path": self.sharegpt_dataset_path,
-                "warmup_requests": 1,
-                "flush_cache": True,
+                "warmup_requests": 0,
                 "profile": True,
                 "num_steps": 10,
             }
@@ -1336,13 +1300,9 @@ class TestModelPerfTrace(CustomTestCase):
 
         try:
             static_config = {
-                "model": model_path_for_server,
-                "host": "0.0.0.0",
-                "port": int(base_url.split(":")[-1]),
-                "dataset_name": "sharegpt",
+                "dataset_name": "random",
                 "dataset_path": self.sharegpt_dataset_path,
-                "warmup_requests": 1,
-                "flush_cache": True,
+                "warmup_requests": 0,
                 "profile": True,
                 "num_steps": 10,
             }
