@@ -89,8 +89,6 @@ def get_jax_output(path):
                     break
         if not mapped:
             print(f"{path} not found")
-    new_state = state.from_flat_path(flat_state)
-    nnx.update(model, new_state)
 
     x = jnp.array(np.arange(1 * 1 * 192 * 192 * 3), dtype=jnp.float32).reshape(1, 1, 192, 192, 3)
 

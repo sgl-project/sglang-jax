@@ -723,7 +723,7 @@ class Encoder3d(nnx.Module):
 
         ## head
         x = self.norm_out(x)
-        x = nnx.relu(x)
+        x = nnx.silu(x)
         if cache_list is not None:
             idx = cache_idx[0]
             x, new_cache = self.conv_out(x, cache_list[idx])
