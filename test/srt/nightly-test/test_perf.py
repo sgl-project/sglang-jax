@@ -102,6 +102,8 @@ class TestModelPerf(CustomTestCase):
         specific_args = self.BASIC_SERVER_ARGS + [
             "--tp-size",
             "1",
+            "--context-length",  #  because the seq_length in the config.json is 8192
+            "10240",
         ]
         # launch server
         process = popen_launch_server(
@@ -235,6 +237,8 @@ class TestModelPerf(CustomTestCase):
         specific_args = self.BASIC_SERVER_ARGS + [
             "--tp-size",
             "4",
+            "--context-length",  #  because the seq_length in the config.json is 8192
+            "10240",
         ]
         # launch server
         process = popen_launch_server(
@@ -751,6 +755,8 @@ class TestModelPerf(CustomTestCase):
             "--tp-size",
             "1",
             "--disable-hybrid-swa-memory",
+            "--context-length",  #  because the seq_length in the config.json is 8192
+            "10240",
         ]
         # launch server
         process = popen_launch_server(
@@ -880,6 +886,8 @@ class TestModelPerf(CustomTestCase):
             "--tp-size",
             "4",
             "--disable-hybrid-swa-memory",
+            "--context-length",  #  because the seq_length in the config.json is 8192
+            "10240",
         ]
         # launch server
         process = popen_launch_server(
