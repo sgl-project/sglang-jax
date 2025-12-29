@@ -34,7 +34,7 @@ Here we give the feature which is to support structure output as an example. Not
 
 4. Codes development:
    - TPU resources: Please refer to [TPU Resources Guide](./tpu_resources_guide.md).
-   - Setup environment: Please refer to [install SGLang-Jax from source](#install-sglang-jax-from-source).
+   - Setup environment: Please refer to [Setup environment](#Setup-environment-for-SGL-JAX).
    - Code style: Please refer to [format codes](#format-code-with-pre-commit) before you push.
    - Testing:
      - Please add unit tests under `python/srt/test/*` and E2E tests under `test/srt/*` to ensure the feature works. File names are required to start with `test_`.
@@ -43,7 +43,7 @@ Here we give the feature which is to support structure output as an example. Not
    - Description in PR: Please add accuracy or benchmark baselines in pull requests if the feature meeted the above scenarios.
    - Review: Assign at least one reviewer.
 
-4. If you resolved all comments from code reviews, the pull request would be merged into main. Congrantulations to you!
+5. If you resolved all comments from code reviews, the pull request would be merged into main. Congrantulations to you!
 
 
 **Bugs && Add tests**
@@ -57,7 +57,7 @@ Here we give the feature which is to support structure output as an example. Not
 4. If you resolved all comments from code reviews, the pull request would be merged into main. Congrantulations to you!
 
 
-## Install SGLang-Jax from Source
+## Setup environment for SGL-JAX
 
 ### Fork and clone the repository
 
@@ -67,9 +67,18 @@ Here we give the feature which is to support structure output as an example. Not
 git clone https://github.com/<your_user_name>/sglang-jax.git
 ```
 
-### Build from source
+### Install Development Dependencies
 
-Refer to [Install SGLang-Jax from Source](../get_started/install.md#method-2-from-source).
+
+We recommend using [`uv`](https://github.com/astral-sh/uv) to manage Python dependencies for the `SGL-JAX` project, as it provides fast, reliable, and reproducible environments. You can install `uv` by following the instructions on [its GitHub page](https://github.com/astral-sh/uv?tab=readme-ov-file#installation).
+
+```python
+cd sglang-jax
+uv venv --python 3.12 && source .venv/bin/activate
+# Replace <backend> with `cpu`, `gpu`, or `tpu` based on your hardware.
+uv pip install -e "python[<backend>]"
+```
+
 
 ## Format code with pre-commit
 
