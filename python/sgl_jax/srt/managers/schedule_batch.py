@@ -21,7 +21,7 @@ import dataclasses
 import logging
 import threading
 from http import HTTPStatus
-from typing import TYPE_CHECKING, Any, Union
+from typing import TYPE_CHECKING, Any, Union, Optional
 from enum import Enum, auto
 
 import jax
@@ -273,7 +273,7 @@ class MultimodalInputs:
     """The multimodal data related inputs."""
 
     # items of data
-    mm_items: List[MultimodalDataItem]
+    mm_items: list[MultimodalDataItem]
     image_pad_len: Optional[list] = None
     num_image_tokens: Optional[int] = None
 
@@ -1990,7 +1990,7 @@ class ModelWorkerBatch:
     extend_input_logprob_token_ids: np.ndarray | None
 
     # For multimodal
-    multimodal_inputs: Optional[List[MultimodalInputs]]
+    multimodal_inputs: Optional[list[MultimodalInputs]]
     
     # For padding
     real_bs: int

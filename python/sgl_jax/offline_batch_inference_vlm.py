@@ -1,5 +1,4 @@
 """
-https://github.com/sgl-project/sglang/blob/main/examples/runtime/engine/offline_batch_inference_vlm.py
 Usage:
 python offline_batch_inference_vlm.py --model-path Qwen/Qwen2.5-VL-7B-Instruct
 """
@@ -42,8 +41,6 @@ def main(
     vlm.shutdown()
 
 
-# The __main__ condition is necessary here because we use "spawn" to create subprocesses
-# Spawn starts a fresh program every time, if there is no __main__, it will run into infinite loop to keep spawning processes from sgl.Engine
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     ServerArgs.add_cli_args(parser)

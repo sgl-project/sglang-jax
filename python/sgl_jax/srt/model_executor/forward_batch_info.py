@@ -271,8 +271,6 @@ class ForwardBatch:
             "lora_scalings",
             "lora_token_indices",
             "lora_ranks",
-            "extend_prefix_lens_cpu",
-            "extend_seq_lens_cpu"
         ]:
             value = getattr(self, field_name, None)
             if value is not None and isinstance(value, jax.Array):
@@ -339,9 +337,6 @@ class ForwardBatch:
                 batch.lora_token_indices,
                 batch.lora_ranks,
             )
-
-        extend_prefix_lens_cpu = batch.extend_prefix_lens
-        extend_seq_lens_cpu = batch.extend_seq_lens
         
         obj = cls(
             bid=batch.bid,
@@ -361,8 +356,8 @@ class ForwardBatch:
             lora_scalings=lora_scalings,
             lora_token_indices=lora_token_indices,
             lora_ranks=lora_ranks,
-            extend_prefix_lens_cpu=extend_prefix_lens_cpu,
-            extend_seq_lens_cpu=extend_seq_lens_cpu,
+            extend_prefix_lens_cpu=batch.extend_prefix_lens,
+            extend_seq_lens_cpu=batch.extend_seq_lens,
             attn_backend=model_runner.attn_backend,
             spec_info=batch.spec_info,
             spec_algorithm=batch.spec_algorithm,

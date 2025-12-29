@@ -83,7 +83,7 @@ class TemplateManager:
             model_path: Path to the model
         """
         if chat_template_arg:
-            self._load_explicit_chat_template(tokenizer_manager, chat_template_arg)
+            self._load_explicit_chat_template(chat_template_arg)
         else:
             # Guess chat template from model path
             self.guess_chat_template_from_model_path(model_path)
@@ -101,7 +101,7 @@ class TemplateManager:
                     logger.info("No chat template found")
 
     def _load_explicit_chat_template(
-        self, tokenizer_manager, chat_template_arg: str
+        self, chat_template_arg: str
     ) -> None:
         """Load explicitly specified chat template."""
         logger.info(f"Loading chat template from argument: {chat_template_arg}")
