@@ -92,7 +92,7 @@ class TestVerifyTree(CustomTestCase):
 
         # Check the expected output.
         self.assertEqual(predicts.flatten().tolist(), [3, 0, 0, 4, 5, 18, 11, 0, 0, 0, 12, 18, 0])
-        self.assertEqual(accept_index.tolist(), [[0, 3, 4, 5], [6, 10, 11, -1]])
+        self.assertEqual(accept_index.tolist(), [[0, 3, 4, 5, -1], [6, 10, 11, -1, -1]])
         self.assertEqual(accept_token_num.tolist(), [3, 2])
 
     def _test_tree_speculative_sampling_target_only(
