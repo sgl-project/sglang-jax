@@ -9,8 +9,10 @@ import torch
 from diffusers import AutoencoderKLWan
 from flax import nnx
 from safetensors import safe_open
-from wanvae import Decoder3d
+from wanvae import AutoencoderKLWan as JaxWan
 from weight_mapping import to_mappings
+
+from sgl_jax.srt.multimodal.configs.models.vaes.wanvae import WanVAEConfig
 
 path = "/models/models--Wan-AI--Wan2.1-T2V-1.3B-Diffusers/snapshots/0fad780a534b6463e45facd96134c9f345acfa5b"
 
@@ -51,8 +53,8 @@ def get_weight_map(path):
 
 
 def get_jax_output(path):
-    model = Decoder3d(dim=96, z_dim=16, rngs=nnx.Rngs(0))
-    graph_def, state  = nnx.split(model)
+    model = JaxWan(WanVAEConfig(), rngs=nnx.Rngs(0))
+    graph_def, state = nnx.split(model)
     weight_map = get_weight_map(path)
     flat_state = state.flat_state()
     for keys, v in flat_state:
@@ -81,7 +83,9 @@ def get_jax_output(path):
                 else:
                     new_x = jnp.array(weight_map[actual_src], jnp.float32)
                 if new_x.shape != v.value.shape:
-                    print(f"shape {actual_src} -> {path} not match new_x.shape {new_x.shape} {v.value.shape}")
+                    print(
+                        f"shape {actual_src} -> {path} not match new_x.shape {new_x.shape} {v.value.shape}"
+                    )
                 else:
                     v.value = new_x
                 if matched:
@@ -100,5 +104,5 @@ def get_jax_output(path):
 if __name__ == "__main__":
     transformer_y = get_transformer_output(path)
     jax_y = get_jax_output(path)
-    print(transformer_y, '---', jax_y)
+    print(transformer_y, "---", jax_y)
     print(np.allclose(transformer_y, jax_y, 1e-5, 1e-5))

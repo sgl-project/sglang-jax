@@ -21,6 +21,8 @@ from flax import nnx
 from jax import Array
 from jax.lax import Precision
 
+from sgl_jax.srt.multimodal.configs.models.vaes.wanvae import WanVAEConfig
+
 CACHE_T = 2
 
 
@@ -264,6 +266,7 @@ class Upsample3d(nnx.Module):
         x = self.spatial_conv(x)
         return x.reshape(b, t_out, h * 2, w * 2, self.out_channels), cache_list
 
+
 class Downsample2d(nnx.Module):
     """Spatial 2x upsample that also halves channels, mirroring torch Resample."""
 
@@ -275,7 +278,7 @@ class Downsample2d(nnx.Module):
             out_features=out_channels,
             kernel_size=(3, 3),
             strides=(2, 2),
-            padding = "VALID",
+            padding="VALID",
             rngs=rngs,
             precision=Precision.HIGHEST,
         )
@@ -305,14 +308,14 @@ class Downsample3d(nnx.Module):
         self.in_channels = in_channels
         self.out_channels = out_channels
         self.time_conv = CausalConv3d(
-            in_channels, in_channels, kernel_size=(3, 1, 1), strides = (2, 1, 1), rngs=rngs
+            in_channels, in_channels, kernel_size=(3, 1, 1), strides=(2, 1, 1), rngs=rngs
         )
         self.spatial_conv = nnx.Conv(
             in_features=in_channels,
             out_features=out_channels,
             kernel_size=(3, 3),
-            strides = (2, 2),
-            padding = "VALID",
+            strides=(2, 2),
+            padding="VALID",
             rngs=rngs,
             precision=Precision.HIGHEST,
         )
@@ -328,7 +331,7 @@ class Downsample3d(nnx.Module):
         self, x: jax.Array, cache_list: tuple[jax.Array, ...] = None, cache_idx: list[int] = None
     ) -> tuple[jax.Array, tuple[jax.Array, ...]]:
         b, t, h, w, _ = x.shape
-        x = jnp.pad(x, self.padding, mode = "constant")
+        x = jnp.pad(x, self.padding, mode="constant")
         x = self.spatial_conv(x)
         if cache_list is not None:
             idx = cache_idx[0]
@@ -666,7 +669,7 @@ class Encoder3d(nnx.Module):
         scale = 1.0
 
         # init block
-        self.conv_in = CausalConv3d(in_channels, dims[0], (3,3,3), padding=(1,1,1), rngs = rngs)
+        self.conv_in = CausalConv3d(in_channels, dims[0], (3, 3, 3), padding=(1, 1, 1), rngs=rngs)
 
         # downsample blocks
         self.down_blocks = nnx.List([])
@@ -684,29 +687,29 @@ class Encoder3d(nnx.Module):
                 # downsample block
                 if i != len(dim_mult) - 1:
                     if temperal_downsample[i]:
-                        self.down_blocks.append(Downsample3d(out_dim, out_dim,  rngs = rngs))
+                        self.down_blocks.append(Downsample3d(out_dim, out_dim, rngs=rngs))
                     else:
-                        self.down_blocks.append(Downsample2d(out_dim, out_dim, rngs = rngs))
+                        self.down_blocks.append(Downsample2d(out_dim, out_dim, rngs=rngs))
                     scale /= 2.0
 
         # middle blocks
         self.mid_block = MidBlock(out_dim, dropout, num_layers=1, rngs=rngs)
 
         # output blocks
-        self.norm_out = RMSNorm(out_dim, images=False, rngs = rngs)
-        self.conv_out = CausalConv3d(out_dim, z_dim, (3,3,3), padding=(1,1,1), rngs = rngs)
+        self.norm_out = RMSNorm(out_dim, images=False, rngs=rngs)
+        self.conv_out = CausalConv3d(out_dim, z_dim, (3, 3, 3), padding=(1, 1, 1), rngs=rngs)
 
         self.gradient_checkpointing = False
 
-    def __call__(self, x, cache_list = None, cache_idx=[0]):
+    def __call__(self, x, cache_list=None, cache_idx=[0]):
         if cache_list is not None:
             idx = cache_idx[0]
             x, new_cache = self.conv_in(x, cache_list[idx])
             if new_cache.shape[2] < 2 and cache_list[idx] is not None:
                 new_cache = jnp.concatenate(
-                    [jnp.expand_dims(cache_list[idx][:, -1, :, :, :], 1), new_cache], axis = 1
+                    [jnp.expand_dims(cache_list[idx][:, -1, :, :, :], 1), new_cache], axis=1
                 )
-            cache_list = (*cache_list[:idx], new_cache, *cache_list[idx + 1:])
+            cache_list = (*cache_list[:idx], new_cache, *cache_list[idx + 1 :])
             cache_idx[0] += 1
         else:
             x = self.conv_in(x)
@@ -729,9 +732,9 @@ class Encoder3d(nnx.Module):
             x, new_cache = self.conv_out(x, cache_list[idx])
             if new_cache.shape[2] < 2 and cache_list[idx] is not None:
                 new_cache = jnp.concatenate(
-                    [jnp.expand_dims(cache_list[idx][:, -1, :, :, :], 1), new_cache], axis = 1
+                    [jnp.expand_dims(cache_list[idx][:, -1, :, :, :], 1), new_cache], axis=1
                 )
-            cache_list = (*cache_list[:idx], new_cache, *cache_list[idx + 1:])
+            cache_list = (*cache_list[:idx], new_cache, *cache_list[idx + 1 :])
             cache_idx[0] += 1
         else:
             x, _ = self.conv_out(x)
@@ -739,7 +742,154 @@ class Encoder3d(nnx.Module):
         return x, cache_list
 
 
+class AutoencoderKLWan(nnx.Module):
+    r"""
+    A VAE model with KL loss for encoding videos into latents and decoding latent representations into videos.
+    Introduced in [Wan 2.1].
+    """
+
+    _supports_gradient_checkpointing = False
+
+    def __init__(self, config: WanVAEConfig, *, rngs=nnx.Rngs) -> None:
+
+        self.z_dim = config.z_dim
+        self.temperal_downsample = list(config.temperal_downsample)
+        self.temperal_upsample = list(config.temperal_downsample)[::-1]
+
+        if config.decoder_base_dim is None:
+            decoder_base_dim = config.base_dim
+        else:
+            decoder_base_dim = config.decoder_base_dim
+
+        self.latents_mean = list(config.latents_mean)
+        self.latents_std = list(config.latents_std)
+        self.shift_factor = config.shift_factor
+
+        if config.load_encoder:
+            self.encoder = Encoder3d(
+                in_channels=config.in_channels,
+                dim=config.base_dim,
+                z_dim=self.z_dim * 2,
+                dim_mult=config.dim_mult,
+                num_res_blocks=config.num_res_blocks,
+                attn_scales=config.attn_scales,
+                temperal_downsample=self.temperal_downsample,
+                dropout=config.dropout,
+                is_residual=config.is_residual,
+                rngs=rngs,
+            )
+        self.quant_conv = CausalConv3d(self.z_dim * 2, self.z_dim * 2, (1, 1, 1), rngs=rngs)
+        self.post_quant_conv = CausalConv3d(self.z_dim, self.z_dim, (1, 1, 1), rngs=rngs)
+
+        if config.load_decoder:
+            self.decoder = Decoder3d(
+                dim=decoder_base_dim,
+                z_dim=self.z_dim,
+                dim_mult=config.dim_mult,
+                num_res_blocks=config.num_res_blocks,
+                attn_scales=config.attn_scales,
+                temperal_upsample=self.temperal_upsample,
+                dropout=config.dropout,
+                out_channels=config.out_channels,
+                is_residual=config.is_residual,
+                rngs=rngs,
+            )
+
+        self.use_feature_cache = config.use_feature_cache
+
+    def clear_cache(self) -> None:
+
+        def _count_conv3d(model) -> int:
+            # todo: compute
+            # count = 0
+            # for m in model.modules():
+            #     if isinstance(m, CausalConv3d):
+            #         count += 1
+            return 64
+
+        if self.config.load_decoder:
+            self._conv_num = _count_conv3d(self.decoder)
+            self._conv_idx = [0]
+            self._feat_map = tuple([None] * self._conv_num)
+        # cache encode
+        if self.config.load_encoder:
+            self._enc_conv_num = _count_conv3d(self.encoder)
+            self._enc_conv_idx = [0]
+            self._enc_feat_map = tuple([None] * self._enc_conv_num)
+
+    def encode(self, x: jax.Array) -> jax.Array:
+        if self.use_feature_cache:
+            self.clear_cache()
+            # if self.config.patch_size is not None:
+            #     x = patchify(x, patch_size=self.config.patch_size)
+            # with forward_context(
+            #     feat_cache_arg=self._enc_feat_map, feat_idx_arg=self._enc_conv_idx
+            # ):
+            t = x.shape[1]
+            iter_ = 1 + (t - 1) // 4
+            cache_list = self._enc_feat_map
+            for i in range(iter_):
+                # feat_idx.set(0)
+                cache_idx = self._enc_conv_idx
+                if i == 0:
+                    out, cache_list = self.encoder(
+                        x[:, :1, :, :, :], cache_list=cache_list, cache_idx=cache_idx
+                    )
+                else:
+                    out_, cache_list = self.encoder(
+                        x[:, 1 + 4 * (i - 1) : 1 + 4 * i, :, :, :],
+                        cache_list=cache_list,
+                        cache_idx=cache_idx,
+                    )
+                    out = jnp.concatenate([out, out_], 1)
+            enc = self.quant_conv(out)
+            mu, logvar = enc[:, :, :, :, : self.z_dim], enc[:, :, :, :, self.z_dim :]
+            enc = jnp.concatenate([mu, logvar], axis=4)
+            # enc = DiagonalGaussianDistribution(enc)
+            self.clear_cache()
+        else:
+            raise NotImplementedError
+            # for block in self.encoder.down_blocks:
+            #     if isinstance(block, WanResample) and block.mode == "downsample3d":
+            #         _padding = list(block.time_conv._padding)
+            #         _padding[4] = 2
+            #         block.time_conv._padding = tuple(_padding)
+            # enc = ParallelTiledVAE.encode(self, x)
+
+        return enc
+
+    def decode(self, z: jax.Array) -> jax.Array:
+        if self.use_feature_cache:
+            self.clear_cache()
+            iter_ = z.shape[1]
+            x = self.post_quant_conv(z)
+            cache_list = self._feat_map
+            for i in range(iter_):
+                cache_idx = self._enc_conv_idx
+                if i == 0:
+                    out, cache_list = self.decoder(
+                        x[:, i : i + 1, :, :, :], cache_list=cache_list, cache_idx=cache_idx
+                    )
+                else:
+                    out_, cache_list = self.decoder(
+                        x[:, i : i + 1, :, :, :], cache_list=cache_list, cache_idx=cache_idx
+                    )
+                    out = jnp.concatenate([out, out_], 1)
+
+            out = jnp.clip(out, min=-1.0, max=1.0)
+            self.clear_cache()
+        else:
+            raise NotImplementedError
+
+        return out
+
+
+EntryClass = AutoencoderKLWan
+
+
 if __name__ == "__main__":
+    pass
+
     # model = Decoder3D(dim=96, z_dim=16, rngs=nnx.Rngs(0))
     # model_def, model_state = nnx.split(model)
     # for key, value in model_state.flat_state():
@@ -752,17 +902,17 @@ if __name__ == "__main__":
     # for i, cache in enumerate(cache_list):
     #     print(i, cache.shape)
 
-    model = Encoder3d(dim=96, z_dim=16, rngs=nnx.Rngs(0))
-    model_def, model_state = nnx.split(model)
-    for key, value in model_state.flat_state():
-        print(key, value.shape)
-    key = jax.random.PRNGKey(42)
-    key, subkey = jax.random.split(key)
-    x = jax.random.uniform(subkey, shape=(1, 2, 3, 4, 16))
-    y, cache_list = model(x, cache_list=tuple([None] * 32), cache_idx=[0])
-    print(y.shape)
-    for i, cache in enumerate(cache_list):
-        print(i, cache.shape)
+    # model = Encoder3d(dim=96, z_dim=16, rngs=nnx.Rngs(0))
+    # model_def, model_state = nnx.split(model)
+    # for key, value in model_state.flat_state():
+    #     print(key, value.shape)
+    # key = jax.random.PRNGKey(42)
+    # key, subkey = jax.random.split(key)
+    # x = jax.random.uniform(subkey, shape=(1, 2, 3, 4, 16))
+    # y, cache_list = model(x, cache_list=tuple([None] * 32), cache_idx=[0])
+    # print(y.shape)
+    # for i, cache in enumerate(cache_list):
+    #     print(i, cache.shape)
 
 # class AutoencoderKLWan(nnx.Module):
 #     def __init__(
