@@ -374,9 +374,13 @@ class LoRAMemoryPool:
             ValueError: If no buffer slots available
         """
 
-        def get_available_buffer_slot() -> int:
+        def get_available_buffer_slot(uid: str) -> int:
             """Find next available buffer slot (simple incremental allocation)."""
-            for buffer_id in range(self.max_loras_per_batch):
+            # 0 is reserved for request without LoRA
+            if uid == "0":
+                return 0
+            for buffer_id in range(1, self.max_loras_per_batch + 1):
+                # 0 is reserved for zeros, so add 1 to match user's expectation.
                 if self.buffer_id_to_uid[buffer_id] == EMPTY_SLOT:
                     return buffer_id
 
@@ -390,11 +394,11 @@ class LoRAMemoryPool:
         # Load each adapter that's not already loaded
         for uid in cur_uids:
             if uid not in self.uid_to_buffer_id:
-                buffer_id = get_available_buffer_slot()
-                lora_adapter = lora_adapters.get(uid)
-                self.load_lora_weight_to_buffer(uid, buffer_id, lora_adapter)
+                buffer_id = get_available_buffer_slot(uid)
                 self.uid_to_buffer_id[uid] = buffer_id
                 self.buffer_id_to_uid[buffer_id] = uid
+                lora_adapter = lora_adapters.get(uid)
+                self.load_lora_weight_to_buffer(uid, buffer_id, lora_adapter)
                 has_new_weights = True
                 logger.info("Loaded LoRA %s into buffer slot %d", uid, buffer_id)
             else:
