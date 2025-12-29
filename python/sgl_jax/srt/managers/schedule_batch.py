@@ -1387,14 +1387,6 @@ class ScheduleBatch:
         page_size: int,
         enable_static_lora: bool = False,
     ) -> ModelWorkerBatch:
-        if self.forward_mode.is_extend():
-            return self.get_model_worker_batch(
-                token_paddings=token_paddings,
-                bs_paddings=bs_paddings,
-                cache_loc_paddings=cache_loc_paddings,
-                page_size=page_size,
-                enable_static_lora=enable_static_lora,
-            )
         if self.forward_mode.is_decode_or_idle():
             extend_seq_lens = extend_prefix_lens = extend_logprob_start_lens = None
         else:
