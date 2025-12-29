@@ -34,7 +34,7 @@ Here we give the feature which is to support structure output as an example. Not
 
 4. Codes development:
    - TPU resources: Please refer to [TPU Resources Guide](./tpu_resources_guide.md).
-   - Setup environment: Please refer to [Setup environment](#Setup-environment-for-SGL-JAX).
+   - Setup environment: Please refer to [Setup environment](#setup-environment-for-sgl-jax).
    - Code style: Please refer to [format codes](#format-code-with-pre-commit) before you push.
    - Testing:
      - Please add unit tests under `python/srt/test/*` and E2E tests under `test/srt/*` to ensure the feature works. File names are required to start with `test_`.
@@ -43,7 +43,7 @@ Here we give the feature which is to support structure output as an example. Not
    - Description in PR: Please add accuracy or benchmark baselines in pull requests if the feature meeted the above scenarios.
    - Review: Assign at least one reviewer.
 
-5. If you resolved all comments from code reviews, the pull request would be merged into main. Congrantulations to you!
+5. If you resolved all comments from code reviews, the pull request would be merged into main. Congratulations to you!
 
 
 **Bugs && Add tests**
@@ -72,7 +72,7 @@ git clone https://github.com/<your_user_name>/sglang-jax.git
 
 We recommend using [`uv`](https://github.com/astral-sh/uv) to manage Python dependencies for the `SGL-JAX` project, as it provides fast, reliable, and reproducible environments. You can install `uv` by following the instructions on [its GitHub page](https://github.com/astral-sh/uv?tab=readme-ov-file#installation).
 
-```python
+```bash
 cd sglang-jax
 uv venv --python 3.12 && source .venv/bin/activate
 # Replace <backend> with `cpu`, `gpu`, or `tpu` based on your hardware.
