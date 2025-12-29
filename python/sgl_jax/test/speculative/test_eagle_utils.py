@@ -57,7 +57,7 @@ class TestVerifyTree(CustomTestCase):
                 if jnp.max(target_logits[i][j]) < 10:
                     target_logits = target_logits.at[i, j, 18].set(10)
 
-        target_logits = target_logits.flatten()
+        target_logits = target_logits.reshape(-1, target_logits.shape[-1])
         predict_shape = (12,)
 
         bs = candidates.shape[0]
