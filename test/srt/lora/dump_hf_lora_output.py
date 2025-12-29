@@ -69,8 +69,11 @@ def prepare_lora_paths_per_prompt(lora_paths: List[str], num_prompts: int) -> Li
     """
     if not lora_paths:
         return [None] * num_prompts
-    
-    return [lora_paths[i % len(lora_paths)] if lora_paths[i%len(lora_paths)] != "" else None for i in range(num_prompts)]
+
+    return [
+        lora_paths[i % len(lora_paths)] if lora_paths[i % len(lora_paths)] != "" else None
+        for i in range(num_prompts)
+    ]
 
 
 def run_hf_with_lora(
@@ -197,9 +200,13 @@ def save_data_to_json(
             "prefill_shape": list(np.array(data["top_input_logprobs"][i]).shape),
             "decode_shape": list(np.array(data["top_output_logprobs"][i]).shape),
             "last_token_logits": convert_to_serializable(data["last_token_logits_list"][i]),
-            "last_token_logits_shape":list(np.array(data["last_token_logits_list"][i]).shape),
-            "last_layer_hidden_states":convert_to_serializable(data["last_layer_hidden_states_list"][i]),
-            "last_layer_hidden_states_shape": list(np.array(data["last_layer_hidden_states_list"][i]).shape),
+            "last_token_logits_shape": list(np.array(data["last_token_logits_list"][i]).shape),
+            "last_layer_hidden_states": convert_to_serializable(
+                data["last_layer_hidden_states_list"][i]
+            ),
+            "last_layer_hidden_states_shape": list(
+                np.array(data["last_layer_hidden_states_list"][i]).shape
+            ),
         }
         output_data["results"].append(result)
 
@@ -250,10 +257,13 @@ def print_summary(data: Dict[str, Any], prompts: List[str]):
 
 
 def parse_key_value_pair(pair_string):
-    parts = pair_string.split('=', 1)
+    parts = pair_string.split("=", 1)
     if len(parts) != 2:
-        raise argparse.ArgumentTypeError(f"Invalid key-value pair: {pair_string}. Expected format: key=value")
+        raise argparse.ArgumentTypeError(
+            f"Invalid key-value pair: {pair_string}. Expected format: key=value"
+        )
     return parts[0], parts[1]
+
 
 def main():
     parser = argparse.ArgumentParser(

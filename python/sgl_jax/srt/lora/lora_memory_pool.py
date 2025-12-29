@@ -374,7 +374,7 @@ class LoRAMemoryPool:
             ValueError: If no buffer slots available
         """
 
-        def get_available_buffer_slot(uid:str) -> int:
+        def get_available_buffer_slot(uid: str) -> int:
             """Find next available buffer slot (simple incremental allocation)."""
             # 0 is reserved for request without LoRA
             if uid == "0":

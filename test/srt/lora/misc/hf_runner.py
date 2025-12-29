@@ -284,8 +284,8 @@ class HFRunner:
             token_ids_output_logprobs = []
         else:
             token_ids_input_logprobs = token_ids_output_logprobs = None
-        last_token_logits_list=[]
-        last_layer_hidden_states_list=[]
+        last_token_logits_list = []
+        last_layer_hidden_states_list = []
 
         for i, p in enumerate(prompts):
             if isinstance(p, str):
@@ -346,8 +346,7 @@ class HFRunner:
                         ]
                     )
 
-
-                full_sequence_ids = outputs.sequences[:,:-1] # [1, orig_len + actual_new_tokens]
+                full_sequence_ids = outputs.sequences[:, :-1]  # [1, orig_len + actual_new_tokens]
                 print(f"[recompute] {full_sequence_ids.shape=}, {full_sequence_ids=}")
                 print(f"[recompute] {input_ids.shape=}, {input_ids=}")
                 input_ids = full_sequence_ids
@@ -357,12 +356,14 @@ class HFRunner:
                     # Forward with limited layers if num_layers is specified
                     if num_layers is not None:
                         # Use output_hidden_states to get intermediate layer outputs
-                        outputs = model.forward(input_ids, output_hidden_states=True, return_dict=True)
+                        outputs = model.forward(
+                            input_ids, output_hidden_states=True, return_dict=True
+                        )
                         # Current implementation may be not right, so return zero tensor to remind user this is not supported when he/she uses it.
                         # hidden_states: tuple of (num_layers + 1) tensors
                         # Index 0 is embedding, 1 is after first layer, etc.
                         # So num_layers=1 means we want hidden_states[1]
-                        #hidden_states = outputs.hidden_states[num_layers]
+                        # hidden_states = outputs.hidden_states[num_layers]
 
                         # # Manually apply norm and lm_head to get logits
                         # # Try to find the base model
@@ -388,23 +389,27 @@ class HFRunner:
                         #     # If no lm_head found, just use the hidden state as "logits"
                         #     input_logits = hidden_state[0]
                     else:
-                        outputs = model.forward(input_ids,output_hidden_states=True, return_dict=True)
+                        outputs = model.forward(
+                            input_ids, output_hidden_states=True, return_dict=True
+                        )
                         input_logits = outputs.logits[0]
                         # hidden_states = outputs.hidden_states[0] # Support in the future
 
                     return input_logits
 
-                input_tokens_logits= get_logits_and_hidden_states(num_layers, input_ids)
+                input_tokens_logits = get_logits_and_hidden_states(num_layers, input_ids)
                 if max_new_tokens > 1:
                     # For full_sequences logits
                     full_tokens_logits = get_logits_and_hidden_states(num_layers, full_sequence_ids)
                 else:
                     full_tokens_logits = input_tokens_logits
 
-                last_token_logit = full_tokens_logits[-1,:].detach()
+                last_token_logit = full_tokens_logits[-1, :].detach()
                 last_token_logits_list.append(last_token_logit)
                 last_layer_hidden_states_list.append(None)
-                top_input_logprobs.append(get_top_logprobs(input_tokens_logits, NUM_TOP_LOGPROBS).tolist())
+                top_input_logprobs.append(
+                    get_top_logprobs(input_tokens_logits, NUM_TOP_LOGPROBS).tolist()
+                )
                 if token_ids_logprob is not None:
                     token_ids_input_logprobs.append(
                         get_token_ids_logprobs(input_tokens_logits, token_ids_logprob).tolist()
@@ -424,6 +429,7 @@ class HFRunner:
             last_token_logits_list=last_token_logits_list,
             last_layer_hidden_states_list=last_layer_hidden_states_list,
         )
+
 
 def monkey_patch_gemma2_sdpa():
     """
