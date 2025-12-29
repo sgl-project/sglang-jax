@@ -179,6 +179,7 @@ class AttentionBlock(nnx.Module):
         self.num_attention_heads = config.num_attention_heads
         self.num_key_value_heads = config.num_key_value_heads
         self.sliding_window = config.sliding_window if layer_idx % 2 == 0 else 0
+        self.dtype = dtype
 
         self.sinks = nnx.Param(jnp.zeros((config.num_attention_heads,), dtype))
         self.norm = RMSNorm(config.hidden_size, epsilon=1e-5, param_dtype=jnp.float32)
@@ -189,7 +190,7 @@ class AttentionBlock(nnx.Module):
             q_dim,
             mesh,
             use_bias=True,
-            params_dtype=dtype,
+            params_dtype=jnp.float32,
             kernel_axes=("tensor", None))
 
 
@@ -199,14 +200,14 @@ class AttentionBlock(nnx.Module):
             kv_dim,
             mesh,
             use_bias=True,
-            params_dtype=dtype,
+            params_dtype=jnp.float32,
             kernel_axes=("tensor", None))
         self.v_proj = LinearBase(
             config.hidden_size,
             kv_dim,
             mesh,
             use_bias=True,
-            params_dtype=dtype,
+            params_dtype=jnp.float32,
             kernel_axes=("tensor", None))
 
         self.sm_scale = 1.0 / math.sqrt(config.head_dim)
@@ -235,7 +236,7 @@ class AttentionBlock(nnx.Module):
             config.hidden_size,
             mesh,
             use_bias=True,
-            params_dtype=dtype,
+            params_dtype=jnp.float32,
             kernel_axes=(None, "tensor"))
 
 
@@ -257,6 +258,9 @@ class AttentionBlock(nnx.Module):
         v = v.reshape(-1, self.num_key_value_heads, self.head_dim)
 
         q, k = self.rope(positions, q, k)
+
+        k = k.astype(self.dtype)
+        v = v.astype(self.dtype)
 
         attn_output, kv_fused = self.attn(
             q, k, v,
@@ -281,6 +285,8 @@ class MLPBlock(nnx.Module):
         self.expert_dim = config.intermediate_size
         self.alpha = 1.702
         self.limit = 7.0
+        self.dtype = dtype
+        self.mesh = mesh
 
         self.norm = RMSNorm(config.hidden_size, epsilon=1e-5, dtype=jnp.float32)
 
@@ -289,7 +295,7 @@ class MLPBlock(nnx.Module):
             self.num_experts,
             mesh,
             use_bias=True,
-            params_dtype=dtype,
+            params_dtype=jnp.float32,
             kernel_axes=(None, "tensor"))
 
         self.gate_up_proj_scales = nnx.Param(
@@ -313,15 +319,11 @@ class MLPBlock(nnx.Module):
         )
 
 
-    def init_weight(
-        self,
-        mesh: jax.sharding.Mesh,
-        dtype: jnp.dtype,
-    ):
+    def init_weight(self):
         self.gate_up_proj = nnx.Param(mxfp4_dequantization(
             self.gate_up_proj_scales.value,
             self.gate_up_proj_blocks.value,
-            mesh, ("tensor", None, None), dtype)
+            self.mesh, ("tensor", None, None), self.dtype)
         )
         delattr(self, "gate_up_proj_scales")
         delattr(self, "gate_up_proj_blocks")
@@ -329,7 +331,7 @@ class MLPBlock(nnx.Module):
         self.down_proj = nnx.Param(mxfp4_dequantization(
             self.down_proj_scales.value,
             self.down_proj_blocks.value,
-            mesh, ("tensor", None, None), dtype)
+            self.mesh, ("tensor", None, None), self.dtype)
         )
         delattr(self, "down_proj_scales")
         delattr(self, "down_proj_blocks")
@@ -367,7 +369,9 @@ class MLPBlock(nnx.Module):
         
         next_states = next_states * router_scores.transpose((1, 0))[..., None]
         next_states = jnp.sum(next_states, axis=0)
-        return next_states + x
+        ret = next_states + x
+        ret = ret.astype(self.dtype)
+        return ret
 
 
 class TransformerBlock(nnx.Module):
@@ -443,7 +447,6 @@ class GptOssModel(nnx.Module):
             x, "embedding", "EMBEDDING"
         )
         layers_callback_flag.append(callback_flag)
-
         for block in self.block:
             x, kv_fused, callback_flag = block(x, forward_batch, token_to_kv_pool)
             layers_kv_fused.append(kv_fused)
@@ -491,7 +494,7 @@ class GptOssForCausalLM(nnx.Module):
         loader.load_weights_from_safetensors(weight_mappings)
 
         for layer_id in range(self.config.num_hidden_layers):
-            self.model.block[layer_id].mlp.init_weight(self.mesh, self.dtype)
+            self.model.block[layer_id].mlp.init_weight()
 
         params = nnx.state(self.model)
         nnx.update(self.model, params)
