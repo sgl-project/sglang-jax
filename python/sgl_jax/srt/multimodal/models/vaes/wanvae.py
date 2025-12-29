@@ -83,14 +83,12 @@ class CausalConv3d(nnx.Module):
 
         # Extract cache for next iteration: last cache_t frames of INPUT (before conv)
         # Always create cache if we have temporal padding (even on first frame)
-        if cache_t > 0:
-            new_cache = x[:, -cache_t:, :, :, :]  # [B, <=CACHE_T, H, W, C]
-            # Pad on the left if we do not yet have cache_t frames (e.g., first call with T=1).
-            # if new_cache.shape[1] < cache_t:
-            #     pad_t = cache_t - new_cache.shape[1]
-            #     new_cache = jnp.pad(new_cache, ((0, 0), (pad_t, 0), (0, 0), (0, 0), (0, 0)), mode="constant")
-        else:
-            new_cache = None
+        new_cache = x[:, -cache_t:, :, :, :] if cache_t > 0 else None
+        # new_cache = x[:, -cache_t:, :, :, :]  # [B, <=CACHE_T, H, W, C]
+        # Pad on the left if we do not yet have cache_t frames (e.g., first call with T=1).
+        # if new_cache.shape[1] < cache_t:
+        #     pad_t = cache_t - new_cache.shape[1]
+        #     new_cache = jnp.pad(new_cache, ((0, 0), (pad_t, 0), (0, 0), (0, 0), (0, 0)), mode="constant")
 
         return out, new_cache
 
@@ -340,7 +338,7 @@ class Downsample3d(nnx.Module):
                 cache_list = (*cache_list[:idx], x.copy(), *cache_list[idx + 1 :])
                 cache_idx[0] += 1
             else:
-                cache_x = x[:, :, -1:, :, :].clone()
+                cache_x = x[:, -1:, :, :, :]
                 x, _ = self.time_conv(jnp.concatenate([cache_list[idx][:, -1:, :, :, :], x], 1))
                 cache_list = (*cache_list[:idx], cache_x, *cache_list[idx + 1 :])
                 cache_idx[0] += 1
@@ -425,7 +423,7 @@ class MidBlock(nnx.Module):
 
         self.gradient_checkpointing = False
 
-    def __call__(self, x, cache_list: tuple[jax.Array, ...] = None, cache_idx=[0]):
+    def __call__(self, x, cache_list: tuple[jax.Array, ...] = None, cache_idx=None):
         # First residual block
         x, cache_list = self.resnets[0](x, cache_list=cache_list, cache_idx=cache_idx)
 
@@ -488,7 +486,9 @@ class UpBlock(nnx.Module):
 
         self.gradient_checkpointing = False
 
-    def __call__(self, x: jax.Array, cache_list: jax.Array = None, cache_idx=[0], first_chunk=None):
+    def __call__(
+        self, x: jax.Array, cache_list: jax.Array = None, cache_idx=None, first_chunk=None
+    ):
         """
         Forward pass through the upsampling block.
 
@@ -648,10 +648,10 @@ class Encoder3d(nnx.Module):
         in_channels: int = 3,
         dim=128,
         z_dim=4,
-        dim_mult=[1, 2, 4, 4],
+        dim_mult=(1, 2, 4, 4),
         num_res_blocks=2,
-        attn_scales=[],
-        temperal_downsample=[False, True, True],
+        attn_scales=None,
+        temperal_downsample=(False, True, True),
         dropout=0.0,
         is_residual: bool = False,  # wan 2.2 vae use a residual downblock
         *,
@@ -702,7 +702,7 @@ class Encoder3d(nnx.Module):
 
         self.gradient_checkpointing = False
 
-    def __call__(self, x, cache_list=None, cache_idx=[0]):
+    def __call__(self, x, cache_list=None, cache_idx=None):
         if cache_list is not None:
             idx = cache_idx[0]
             x, new_cache = self.conv_in(x, cache_list[idx])

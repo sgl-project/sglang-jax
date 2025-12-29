@@ -1,15 +1,22 @@
-import jax
-import jax.numpy as jnp
-from flax import nnx
+import dataclasses
 from typing import Optional
 
+import jax
+import jax.numpy as jnp
+from jax.tree_util import register_pytree_node_class
+
+
+@register_pytree_node_class
+@dataclasses.dataclass
 class DiagonalGaussianDistribution:
+    parameters: jax.Array
+    deterministic: bool = False
+
     # todo: test this
-    def __init__(self, parameters: jax.Array, deterministic: bool = False):
-        self.parameters = parameters
-        self.mean, self.logvar = jnp.split(parameters, 2, axis=4)
+    def __post_init__(self):
+        self.mean, self.logvar = jnp.split(self.parameters, 2, axis=4)
         self.logvar = jnp.clip(self.logvar, -30.0, 20.0)
-        self.deterministic = deterministic
+        self.deterministic = self.deterministic
         self.std = jnp.exp(0.5 * self.logvar)
         self.var = jnp.exp(self.logvar)
         if self.deterministic:
@@ -17,18 +24,29 @@ class DiagonalGaussianDistribution:
                 self.mean, device=self.parameters.device, dtype=self.parameters.dtype
             )
 
-    def sample(self, random:int) -> jax.Array:
+    def tree_flatten(self):
+        children = (self.parameters,)
+
+        aux_data = {"deterministic": self.deterministic}
+        return (children, aux_data)
+
+    @classmethod
+    def tree_unflatten(cls, aux_data, children):
+        obj = cls.__new__(cls)
+        obj.parameters = children[0]
+        obj.deterministic = aux_data["deterministic"]
+        obj.__post_init__()
+        return obj
+
+    def sample(self, random: int) -> jax.Array:
         # make sure sample is on the same device as the parameters and has same dtype
         sample = jax.random.normal(
-            jax.random.PRNGKey(random),
-            self.mean.shape,
-            dtype=self.parameters.dtype)
+            jax.random.PRNGKey(random), self.mean.shape, dtype=self.parameters.dtype
+        )
         x = self.mean + self.std * sample
         return x
 
-    def kl(
-        self, other: Optional["DiagonalGaussianDistribution"] = None
-    ) -> jax.Array:
+    def kl(self, other: Optional["DiagonalGaussianDistribution"] = None) -> jax.Array:
         if self.deterministic:
             return jax.Array([0.0])
         else:
@@ -47,9 +65,7 @@ class DiagonalGaussianDistribution:
                     axis=[1, 2, 3],
                 )
 
-    def nll(
-        self, sample: jax.Array, dims: tuple[int, ...] = (1, 2, 3)
-    ) -> jax.Array:
+    def nll(self, sample: jax.Array, dims: tuple[int, ...] = (1, 2, 3)) -> jax.Array:
         if self.deterministic:
             return jax.Array([0.0])
         logtwopi = jnp.log(2.0 * jnp.pi)
