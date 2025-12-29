@@ -119,6 +119,7 @@ class SamplingMetadata:
             sampling_seeds_device = None
 
         positions = batch.positions if batch.forward_mode.is_decode() else batch.seq_lens - 1
+
         (temperatures_device, top_ps_device, top_ks_device, min_ps_device, positions_device) = (
             device_array(
                 (

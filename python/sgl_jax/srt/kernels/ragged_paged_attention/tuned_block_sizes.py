@@ -728,6 +728,7 @@ def get_tuned_block_sizes(
     #     raise ValueError(
     #         f"Invalid block sizes: {keys=}, {bkv_p=}, {bq=}. Please check {page_size=}, {actual_num_q_heads=}, {actual_num_kv_heads=}, {head_dim=}, {max_num_tokens=}, {pages_per_seq=}"
     #     )
+
     return (min(pages_per_seq, bkv_p), min(max_num_tokens, bq))
 
 

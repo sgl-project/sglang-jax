@@ -30,7 +30,7 @@ class LogitsProcessorOutput:
     # Used by speculative decoding (EAGLE)
     # The last hidden layers
     hidden_states: jax.Array | None = None
-    hidden_states_sampled: jax.Array | None = None
+
     ## Part 2: This part will be assigned in python/sglang/srt/layers/sampler.py::Sampler
     # The logprobs of the next tokens.                              shape: [#seq]
     next_token_logprobs: jax.Array | None = None
@@ -65,7 +65,6 @@ class LogitsProcessorOutput:
             self.input_top_logprobs_idx,
             self.input_token_ids_logprobs_val,
             self.input_token_ids_logprobs_idx,
-            self.hidden_states_sampled,
         )
 
         aux_data = {}
@@ -88,7 +87,6 @@ class LogitsProcessorOutput:
         obj.input_top_logprobs_idx = children[9]
         obj.input_token_ids_logprobs_val = children[10]
         obj.input_token_ids_logprobs_idx = children[11]
-        obj.hidden_states_sampled = children[12]
 
         return obj
 
@@ -318,7 +316,6 @@ class LogitsProcessor(nnx.Module):
 
         # Compute logits for both input and sampled tokens.
         logits = self._get_logits(pruned_states, lm_head)
-        hidden_states_sampled = pruned_states
         sampled_logits = logits[sample_indices] if sample_indices is not None else logits
 
         hidden_states_to_store: jax.Array | None = None
@@ -355,7 +352,6 @@ class LogitsProcessor(nnx.Module):
             return LogitsProcessorOutput(
                 next_token_logits=sampled_logits,
                 hidden_states=hidden_states_to_store,
-                hidden_states_sampled=hidden_states_sampled,
             )
         else:
             input_logprobs = logits[input_logprob_indices]
