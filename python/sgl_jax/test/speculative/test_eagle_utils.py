@@ -57,7 +57,7 @@ class TestVerifyTree(CustomTestCase):
                 if jnp.max(target_logits[i][j]) < 10:
                     target_logits = target_logits.at[i, j, 18].set(10)
 
-        target_predict = jnp.argmax(target_logits, axis=-1).flatten()
+        target_logits = target_logits.flatten()
         predict_shape = (12,)
 
         bs = candidates.shape[0]
@@ -81,14 +81,13 @@ class TestVerifyTree(CustomTestCase):
                 ctx = mesh
         with ctx:
             accept_index, accept_token_num, predicts = verify_tree_greedy(
-                predicts=predicts,
-                accept_index=accept_index,
-                accept_token_num=accept_token_num,
-                candidates=candidates,
+                speculative_num_steps=4,
+                num_draft_tokens=6,
+                draft_tokens=candidates,
                 retrive_index=retrive_index,
                 retrive_next_token=retrive_next_token,
                 retrive_next_sibling=retrive_next_sibling,
-                target_predict=target_predict,
+                next_token_logits=target_logits,
             )
 
         # Check the expected output.

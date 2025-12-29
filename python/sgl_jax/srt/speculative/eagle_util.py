@@ -487,9 +487,6 @@ class EagleDraftInput:
         speculative_num_draft_tokens: int,
     ):
         model_worker_batch.spec_info = self
-        # verified_id = batch_output.next_draft_input.verified_id
-        # model_worker_batch.input_ids = verified_id
-
         model_worker_batch.seq_lens[: model_worker_batch.real_bs] = (
             model_worker_batch.seq_lens[: model_worker_batch.real_bs]
             + speculative_num_draft_tokens
@@ -828,11 +825,6 @@ class EagleVerifyInput:
                     ctx = mesh
             with ctx:
                 accept_index, accept_length, predict = verify_tree_greedy(
-                    # predicts=predict,
-                    # accept_index=accept_index,
-                    # accept_token_num=accept_length,
-                    # candidates=candidates,
-                    bs=bs,
                     speculative_num_steps=self.spec_steps,
                     num_draft_tokens=self.draft_token_num,
                     draft_tokens=self.draft_token,
@@ -911,10 +903,8 @@ class EagleVerifyInput:
 
         accept_length = accept_length + 1
         accept_index = accept_index.flatten()
-        # accept_index = accept_index[accept_index != -1]
         verified_id = np.zeros_like(accept_index, dtype=predict.dtype)
         verified_id[accept_index != -1] = predict[accept_index[accept_index != -1]]
-        # verified_id = predict[accept_index]
         return predict, verified_id, accept_length, accept_index
 
 

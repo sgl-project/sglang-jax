@@ -264,9 +264,8 @@ def verify_tree_greedy_pallas_call(
     return accept_index, accept_token_num, predicts
 
 
-@jax.jit(static_argnames=["bs", "speculative_num_steps", "num_draft_tokens"])
+@jax.jit(static_argnames=["speculative_num_steps", "num_draft_tokens"])
 def verify_tree_greedy(
-    bs: int,
     speculative_num_steps: int,
     num_draft_tokens: int,
     draft_tokens: jax.Array,
