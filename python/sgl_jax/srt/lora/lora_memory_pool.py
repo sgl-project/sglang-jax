@@ -379,7 +379,8 @@ class LoRAMemoryPool:
             # 0 is reserved for request without LoRA
             if uid == "0":
                 return 0
-            for buffer_id in range(1, self.max_loras_per_batch):
+            for buffer_id in range(1, self.max_loras_per_batch + 1):
+                # 0 is reserved for zeros, so add 1 to match user's expectation.
                 if self.buffer_id_to_uid[buffer_id] == EMPTY_SLOT:
                     return buffer_id
 

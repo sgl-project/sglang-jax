@@ -1122,9 +1122,6 @@ class ServerArgs:
 
                     self.lora_paths = normalized_lora_refs
 
-                    # add max_loras_per_batch, '0' is reserved for requests without LoRA
-                    self.max_loras_per_batch += 1
-
                     # Validate max_loaded_loras
                     if self.max_loaded_loras is not None:
                         assert (

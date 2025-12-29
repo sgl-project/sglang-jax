@@ -74,6 +74,8 @@ class TestAlignLoRAAccuracy(CustomTestCase):
             )
         if device == "cpu":
             os.environ["JAX_PLATFORMS"] = "cpu"
+        else:
+            del os.environ["JAX_PLATFORMS"]
         engine = Engine(
             model_path=self.model_path,
             trust_remote_code=True,
