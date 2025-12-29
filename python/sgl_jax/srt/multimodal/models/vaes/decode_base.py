@@ -46,7 +46,7 @@ def get_weight_map(path):
             jax.default_device(jax.local_devices(backend="cpu")[0]),
             safe_open(st_file, framework="flax") as f,
         ):
-            for name in f.keys():
+            for name in list(f.keys()):
                 weight_tensor = f.get_tensor(name)
                 update_map |= {name: weight_tensor}
     return update_map
