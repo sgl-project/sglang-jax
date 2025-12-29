@@ -21,11 +21,10 @@ from benchmark.moe.utils import (
     prepare_fused_moe_inputs,
     select_cases,
 )
-from benchmark.utils import multiple_tasks_timeit_from_trace
+from benchmark.utils import multiple_iteration_timeit_from_trace
 from sgl_jax.srt.kernels.fused_moe.v1.kernel import FusedMoEBlockConfig
 from sgl_jax.srt.layers.moe import FusedEPMoE
 
-TPU_VMEM_CAP_BYTES = 64 * 1024 * 1024
 # Leave headroom for compiler padding/alignment and any unmodeled VMEM usage.
 DEFAULT_TPU_VMEM_BUDGET_MB = 60
 DEFAULT_TPU_VMEM_BUDGET_BYTES = DEFAULT_TPU_VMEM_BUDGET_MB * 1024 * 1024
@@ -174,8 +173,9 @@ def select_block_configs(
     seen: set[tuple[int, ...]] = set()
 
     def add(*, raw: FusedMoEBlockConfig, effective: FusedMoEBlockConfig) -> None:
-        ok, _ = validate(effective)
+        ok, reason = validate(effective)
         if not ok:
+            print(f"SKIP {effective}, reason: {reason}")
             return
         key = (
             effective.bt,
@@ -266,7 +266,8 @@ def run_all(
     iters: int,
     dtype: jnp.dtype = jnp.bfloat16,
     *,
-    warmup: int = 1,
+    warmup_iters: int = 1,
+    a2a_only: bool = False,
     tune_block_config: bool = False,
     bt_candidates: list[int] | None = None,
     bf_candidates: list[int] | None = None,
@@ -310,6 +311,8 @@ def run_all(
         from sgl_jax.srt.utils.jax_utils import get_device_name
 
     print(f"Running fused_moe benchmarks with scenario='{scenario}', dtype={dtype}")
+    if a2a_only:
+        print("  mode: a2a_only=True")
     for case in cases:
         print(
             f"\n[case={case.name}] tokens={case.num_tokens}, experts={case.num_experts}, "
@@ -351,6 +354,7 @@ def run_all(
                 activation=case.activation,
                 layer_id=0,
                 renormalize_topk_logits=case.renormalize_topk_logits,
+                a2a_only=a2a_only,
             )
 
             moe_def, moe_state = nnx.split(fused_layer)
@@ -363,17 +367,16 @@ def run_all(
                 return moe(tokens, router_logits, block_config=block_config)
 
             best: tuple[float, FusedMoEBlockConfig | None] | None = None
-            ordered: list[tuple[str, FusedMoEBlockConfig | None]] = []
-            task_to_compute: dict[str, object] = {}
             for i, block_cfg in enumerate(block_cfgs):
                 tag = "default" if block_cfg is None else str(i)
-                ordered.append((tag, block_cfg))
                 if block_cfg is None:
                     print("  fused_moe blocks] -> (block_config=None)")
                 else:
                     print(
                         f"  fused_moe blocks [{i+1}/{len(block_cfgs)}] -> {block_cfg.as_kwargs()}"
                     )
+
+                task = "fused-moe-k_.*"
 
                 def _compute(block_cfg=block_cfg):
                     return run(
@@ -384,19 +387,13 @@ def run_all(
                         block_config=block_cfg,
                     )
 
-                task = f"fused_moe_{case.name}_{tag}"
-                task_to_compute[task] = _compute
-
-            times_by_task = multiple_tasks_timeit_from_trace(
-                task_to_compute,
-                tries=iters,
-                warmup=warmup,
-                trace_group=f"fused_moe_{case.name}",
-            )
-
-            for tag, block_cfg in ordered:
-                task = f"fused_moe_{case.name}_{tag}"
-                times = list(times_by_task.get(task, []))
+                times = multiple_iteration_timeit_from_trace(
+                    compute_func=_compute,
+                    data_generator=lambda: (),
+                    task=task,
+                    tries=iters,
+                    warmup=warmup_iters,
+                )
                 if len(times) > 1:
                     times = times[1:]
                 mean_ms = float(np.mean(times)) if times else float("nan")
@@ -462,10 +459,15 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--iters", type=int, default=3, help="Number of benchmark iterations.")
     parser.add_argument(
-        "--warmup",
+        "--warmup-iters",
         type=int,
         default=1,
-        help="Warmup iterations per config (excluded from trace).",
+        help="Number of warmup iterations before profiling (per case / block_config).",
+    )
+    parser.add_argument(
+        "--a2a-only",
+        action="store_true",
+        help="Skip expert FFN compute (measure mostly routing + A2A + accumulation).",
     )
     parser.add_argument(
         "--tune-block-config",
@@ -518,7 +520,8 @@ if __name__ == "__main__":
     run_all(
         args.scenario,
         args.iters,
-        warmup=args.warmup,
+        warmup_iters=args.warmup_iters,
+        a2a_only=args.a2a_only,
         tune_block_config=args.tune_block_config,
         bt_candidates=args.bt_candidates,
         bf_candidates=args.bf_candidates,
