@@ -2,6 +2,7 @@
 
 import itertools
 import logging
+import os
 import threading
 import time
 
@@ -495,6 +496,15 @@ class ModelWorker:
         if launch_done is not None:
             launch_done.set()
 
+        # SAVE last layer logits
+        save_logits_file_info = os.getenv("DUMP_LAST_LAYER_LOGITS_FILENAMES", None)
+        if save_logits_file_info:
+            save_logits_with_txt(
+                logits_output.next_token_logits[: model_worker_batch.real_bs, :],
+                save_logits_file_info,
+                forward_batch.forward_mode,
+            )
+
         if skip_sample:
             next_token_ids_device = None
             new_logits_output = None
@@ -629,3 +639,21 @@ class MockModelWorker:
             ),
             None,
         )
+
+
+def save_logits_with_txt(
+    arr: jax.Array,
+    file_info: str,
+    forward_mode: ForwardMode,
+):
+    # format: {prefill_file_name},{decode_file_name}
+    file_slice = file_info.split(",")
+    if forward_mode.is_extend():
+        file_name = file_slice[0]
+    elif forward_mode.is_decode():
+        file_name = file_slice[1]
+    else:
+        raise ValueError(f"Unsupported {forward_mode} to save logits with txt")
+
+    os.makedirs(os.path.dirname(file_name), exist_ok=True)
+    np.savetxt(file_name, np.asarray(jax.device_get(arr)).flatten(), fmt="%.15f")
