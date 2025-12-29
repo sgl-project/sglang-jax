@@ -321,6 +321,11 @@ suites = {
             estimated_time=2.5,
             test_methods=["TestModePerfTrace.test_QWEN2_5_7B_INSTRUCT_performance_trace_tp_4"],
         ),
+        TestFile(
+            "nightly-test/test_pref_trace.py",
+            estimated_time=45,
+            test_methods=["TestModePerfTrace.test_qwen3_32B_lora_r32_performance_trace_tp_4"],
+        ),
     ],
     "sglang_dependency_test": [],
     "unit-test-tpu-v6e-1": [

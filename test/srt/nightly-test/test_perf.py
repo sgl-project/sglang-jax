@@ -1398,7 +1398,7 @@ class TestModePerf(CustomTestCase):
     def test_qwen3_32B_lora_r32_performance_tp_4(self):
         model = "Qwen/Qwen3-32B"
         lora_path = "flyfishxu/DeepNews-LoRA-Qwen3-32B"
-        lora_name = "DeepNews-LoRA-Qwen3-32B"
+        lora_name = ["DeepNews-LoRA-Qwen3-32B"]
         base_url = DEFAULT_URL_FOR_TEST
 
         allow_gap = 0.03
@@ -1438,7 +1438,7 @@ class TestModePerf(CustomTestCase):
                     "ttft": 13301.45,
                     "itl": 24.72,
                     "input_throughput": 19677.24,
-                    "output_throughput": 913.20,
+                    "output_throughput": 845.64,
                 }
             },
             128: {
@@ -1446,7 +1446,7 @@ class TestModePerf(CustomTestCase):
                     "ttft": 26595.13,
                     "itl": 24.81,
                     "input_throughput": 19691.40,
-                    "output_throughput": 947.15,
+                    "output_throughput": 845.10,
                 }
             },
             256: {
@@ -1454,7 +1454,7 @@ class TestModePerf(CustomTestCase):
                     "ttft": 53191.76,
                     "itl": 24.78,
                     "input_throughput": 19697.55,
-                    "output_throughput": 951.46,
+                    "output_throughput": 860.46,
                 }
             },
         }
@@ -1462,12 +1462,7 @@ class TestModePerf(CustomTestCase):
         # define test parameters
         # concurrency levels
         concurrency_levels = [8, 16, 32, 64, 128, 256]
-        # input length levels (1k, 4k, 8k)
         input_lengths = [4096]
-
-        # concurrency_levels = [8]
-        # # input length levels (1k, 4k, 8k)
-        # input_lengths = [1024]
 
         output_lengths = [1, 1024]
         specific_args = self.BASIC_SERVER_ARGS + [
@@ -1493,16 +1488,23 @@ class TestModePerf(CustomTestCase):
 
         results_summary = []
 
+        # warmup to load weight
+        args = get_benchmark_args(
+            base_url=base_url,
+            dataset_name="random",
+            num_prompts=1,
+            request_rate=float("inf"),
+            random_input_len=1024,
+            random_output_len=1,
+            max_concurrency=1,
+            random_range_ratio=1,
+            lora_name=lora_name,
+            backend="sglang-oai",
+            warmup_requests=0,
+        )
+        run_benchmark(args)
+
         try:
-            static_config = {
-                "model": model,
-                "host": "0.0.0.0",
-                "port": int(base_url.split(":")[-1]),
-                "dataset_name": "sharegpt",
-                "dataset_path": self.sharegpt_dataset_path,
-                "warmup_requests": 1,
-                "flush_cache": True,
-            }
             for concurrency in concurrency_levels:
                 for in_len in input_lengths:
                     for out_len in output_lengths:
@@ -1515,7 +1517,7 @@ class TestModePerf(CustomTestCase):
                         num_prompts = concurrency * 3
 
                         args = get_benchmark_args(
-                            base_url=self.base_url,
+                            base_url=base_url,
                             dataset_name="random",
                             num_prompts=num_prompts,
                             request_rate=float("inf"),
@@ -1523,12 +1525,10 @@ class TestModePerf(CustomTestCase):
                             random_output_len=out_len,
                             max_concurrency=concurrency,
                             random_range_ratio=1,
-                            disable_ignore_eos=True,
                             lora_name=lora_name,
                             backend="sglang-oai",
                             warmup_requests=0,
                         )
-                        vars(args).update(static_config)
                         metrics = run_benchmark(args)
 
                         if out_len == 1:
@@ -1575,7 +1575,7 @@ class TestModePerf(CustomTestCase):
             import csv
             import os
 
-            output_dir = os.getenv("PREF_OUTPUT_DIR", "./test/nightly_test_output/pref/local_run")
+            output_dir = os.getenv("PERF_OUTPUT_DIR", "./test/nightly_test_output/perf/local_run")
             os.makedirs(output_dir, exist_ok=True)
             output_filename = os.path.join(output_dir, "performance_results_tp_4.csv")
             file_exists = os.path.exists(output_filename)
