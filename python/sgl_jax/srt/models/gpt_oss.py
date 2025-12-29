@@ -227,6 +227,7 @@ class AttentionBlock(nnx.Module):
             num_heads=self.num_attention_heads,
             head_dim=self.head_dim,
             scaling=None,
+            sliding_window_size=self.sliding_window,
             num_kv_heads=self.num_key_value_heads,
             layer_id=layer_idx,
         )
