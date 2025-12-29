@@ -492,11 +492,12 @@ class EagleDraftInput:
 
         model_worker_batch.seq_lens[: model_worker_batch.real_bs] = (
             model_worker_batch.seq_lens[: model_worker_batch.real_bs]
-            + speculative_num_draft_tokens - 1
+            + speculative_num_draft_tokens
+            - 1
         )
         bs = batch_output.accept_lens.shape[0]
         step_plus_1 = model_worker_batch.input_ids.shape[0] // bs
-        model_worker_batch.positions = model_worker_batch.positions - 1
+        model_worker_batch.positions = model_worker_batch.positions
         model_worker_batch.extend_seq_lens = np.full((bs,), step_plus_1, dtype=np.int32)
         model_worker_batch.extend_seq_lens[model_worker_batch.real_bs :] = 0
         model_worker_batch.capture_hidden_mode = CaptureHiddenMode.FULL
@@ -515,7 +516,6 @@ class EagleDraftInput:
         logits_metadata = LogitsMetadata.from_model_worker_batch(
             model_worker_batch, draft_model_runner.mesh
         )
-
         return model_worker_batch, logits_metadata
 
     def prepare_for_decode(self, schedule_batch: ScheduleBatch):

@@ -343,11 +343,7 @@ class EAGLEWorker(ModelWorker):
         model_worker_batch.capture_hidden_mode = CaptureHiddenMode.LAST
 
         # out_cache_loc = model_worker_batch.out_cache_loc
-        topk_p, topk_index, hidden_states = (
-            spec_info.topk_p,
-            spec_info.topk_index,
-            spec_info.hidden_states,
-        )
+        topk_index = spec_info.topk_index
         if self.hot_token_ids is not None:
             model_worker_batch.spec_info.topk_index = self.hot_token_ids[topk_index]
         # if we need custom mask, we should create for all at once and update it within loop
@@ -432,7 +428,6 @@ class EAGLEWorker(ModelWorker):
             model_worker_batch.speculative_num_steps,
             self.mesh,
         )
-
         model_worker_batch.spec_info = EagleVerifyInput(
             draft_token=draft_tokens,
             custom_mask=tree_mask,
