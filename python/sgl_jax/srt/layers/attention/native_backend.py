@@ -273,7 +273,7 @@ def forward_attention(
             attn_logits, seq_lengths, extend_prefix_lens, extend_seq_lens, is_causal, sliding_window_size
         )
     else:
-        attn_logits = _apply_decode_mask(attn_logits, seq_lengths)
+        attn_logits = _apply_decode_mask(attn_logits, seq_lengths, sliding_window_size)
 
     _, nr_qs, nr_ks = attn_logits.shape
 
@@ -350,7 +350,11 @@ def _apply_extend_mask(
     return jnp.where(final_mask, attn_weights, mask_value)
 
 
-def _apply_decode_mask(attn_weights: jax.Array, seq_lengths: jax.Array):
+def _apply_decode_mask(
+    attn_weights: jax.Array,
+    seq_lengths: jax.Array,
+    sliding_window_size: None | int = None,
+):
     """Create a sequence mask that ensures tokens only attend within their sequence."""
     _, query_len, key_len = attn_weights.shape
     num_seqs = len(seq_lengths)
@@ -359,8 +363,12 @@ def _apply_decode_mask(attn_weights: jax.Array, seq_lengths: jax.Array):
         total_prefix_len = key_len
         seq_starts = jnp.cumsum(jnp.concatenate([jnp.array([0]), seq_lengths[:-1]]))
         seq_ends = seq_starts + seq_lengths
+        if sliding_window_size is not None:
+            window_starts = jnp.where(seq_lengths < sliding_window_size, seq_starts, seq_ends - sliding_window_size)
+        else:
+            window_starts = seq_starts
         all_positions = jnp.arange(total_prefix_len)
-        seq_mask = (all_positions[None, :] >= seq_starts[:, None]) & (
+        seq_mask = (all_positions[None, :] >= window_starts[:, None]) & (
             all_positions[None, :] < seq_ends[:, None]
         )
         return seq_mask
