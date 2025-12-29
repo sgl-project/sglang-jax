@@ -112,8 +112,6 @@ class TestAlignLoRAAccuracy(CustomTestCase):
             lora_path=lora_paths,
         )
 
-        print(f"==========={outputs=}")
-
         self.assertEqual(len(outputs), len(prompts))
 
         def get_content_from_files(
@@ -291,8 +289,6 @@ python3 dump_hf_lora_output.py --model Qwen/Qwen3-4B \
         hf_lora_decode_logits_file = os.path.join(
             os.path.dirname(__file__), "lora_data/hf/multi_prompts_decode_output_cpu.json"
         )
-
-        print(f"==========={hf_lora_decode_logits_file}")
 
         try:
             assert os.path.exists(hf_lora_decode_logits_file)
