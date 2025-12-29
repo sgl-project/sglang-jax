@@ -1363,14 +1363,12 @@ def ragged_paged_attention(
             causal,
         )
     kv_packing = get_dtype_packing(kv_cache_fused_processed.dtype)
-
     if page_size == 1:
         bkv_p = bkv_p // 2
         if bkv_p == 0:
             bkv_p = 1
     bkv_p = align_to(bkv_p, kv_packing) if bkv_p != 0 else kv_packing
     bkv_sz = bkv_p * page_size
-
     if vmem_limit_bytes is None:
         vmem_limit_bytes = int(
             get_vmem_estimate_bytes(
