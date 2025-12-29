@@ -213,59 +213,113 @@ suites = {
         TestFile(
             "nightly-test/test_perf.py",
             estimated_time=7,
-            test_methods=["TestModePerf.test_qwen_7b_performance_tp_1"],
+            test_methods=["TestModelPerf.test_qwen_7b_performance_tp_1"],
         ),
         TestFile(
             "nightly-test/test_perf.py",
             estimated_time=8,
-            test_methods=["TestModePerf.test_qwen3_8b_performance_tp_1"],
+            test_methods=["TestModelPerf.test_qwen3_8b_performance_tp_1"],
         ),
         TestFile(
             "nightly-test/test_perf.py",
             estimated_time=2,
-            test_methods=["TestModePerf.test_GEMMA2_2B_IT_performance_tp_1"],
+            test_methods=["TestModelPerf.test_GEMMA2_2B_IT_performance_tp_1"],
         ),
         TestFile(
             "nightly-test/test_perf.py",
             estimated_time=2.5,
-            test_methods=["TestModePerf.test_QWEN2_5_7B_INSTRUCT_performance_tp_1"],
+            test_methods=["TestModelPerf.test_QWEN2_5_7B_INSTRUCT_performance_tp_1"],
         ),
     ],
     "nightly-test-perf-text-models-tpu-v6e-4": [
         TestFile(
             "nightly-test/test_perf.py",
             estimated_time=7,
-            test_methods=["TestModePerf.test_qwen_7b_performance_tp_4"],
+            test_methods=["TestModelPerf.test_qwen_7b_performance_tp_4"],
         ),
         TestFile(
             "nightly-test/test_perf.py",
             estimated_time=8,
-            test_methods=["TestModePerf.test_qwen3_8b_performance_tp_4"],
+            test_methods=["TestModelPerf.test_qwen3_8b_performance_tp_4"],
         ),
         TestFile(
             "nightly-test/test_perf.py",
             estimated_time=30,
-            test_methods=["TestModePerf.test_QWEN3_MOE_30B_performance_tp_2_ep_2"],
+            test_methods=["TestModelPerf.test_QWEN3_MOE_30B_performance_tp_2_ep_2"],
         ),
         TestFile(
             "nightly-test/test_perf.py",
             estimated_time=2,
-            test_methods=["TestModePerf.test_GEMMA2_2B_IT_performance_tp_4"],
+            test_methods=["TestModelPerf.test_GEMMA2_2B_IT_performance_tp_4"],
         ),
         TestFile(
             "nightly-test/test_perf.py",
             estimated_time=20,
-            test_methods=["TestModePerf.test_bailing_moe_performance_tp_2_ep_2"],
+            test_methods=["TestModelPerf.test_bailing_moe_performance_tp_2_ep_2"],
         ),
         TestFile(
             "nightly-test/test_perf.py",
             estimated_time=2.5,
-            test_methods=["TestModePerf.test_QWEN2_5_7B_INSTRUCT_performance_tp_4"],
+            test_methods=["TestModelPerf.test_QWEN2_5_7B_INSTRUCT_performance_tp_4"],
         ),
         TestFile(
             "nightly-test/test_perf.py",
             estimated_time=45,
-            test_methods=["TestModePerf.test_qwen3_32B_lora_r32_performance_tp_4"],
+            test_methods=["TestModelPerf.test_qwen3_32B_lora_r32_performance_tp_4"],
+        ),
+    ],
+    "nightly-test-perf-trace-text-models-tpu-v6e-1": [
+        TestFile(
+            "nightly-test/test_perf_trace.py",
+            estimated_time=7,
+            test_methods=["TestModelPerfTrace.test_qwen_7b_performance_trace_tp_1"],
+        ),
+        TestFile(
+            "nightly-test/test_perf_trace.py",
+            estimated_time=8,
+            test_methods=["TestModelPerfTrace.test_qwen3_8b_performance_trace_tp_1"],
+        ),
+        TestFile(
+            "nightly-test/test_perf_trace.py",
+            estimated_time=2,
+            test_methods=["TestModelPerfTrace.test_GEMMA2_2B_IT_performance_trace_tp_1"],
+        ),
+        TestFile(
+            "nightly-test/test_perf_trace.py",
+            estimated_time=2.5,
+            test_methods=["TestModelPerfTrace.test_QWEN2_5_7B_INSTRUCT_performance_trace_tp_1"],
+        ),
+    ],
+    "nightly-test-perf-trace-text-models-tpu-v6e-4": [
+        TestFile(
+            "nightly-test/test_perf_trace.py",
+            estimated_time=7,
+            test_methods=["TestModelPerfTrace.test_qwen_7b_performance_trace_tp_4"],
+        ),
+        TestFile(
+            "nightly-test/test_perf_trace.py",
+            estimated_time=8,
+            test_methods=["TestModelPerfTrace.test_qwen3_8b_performance_trace_tp_4"],
+        ),
+        TestFile(
+            "nightly-test/test_perf_trace.py",
+            estimated_time=30,
+            test_methods=["TestModelPerfTrace.test_QWEN3_MOE_30B_performance_trace_tp_2_ep_2"],
+        ),
+        TestFile(
+            "nightly-test/test_perf_trace.py",
+            estimated_time=2,
+            test_methods=["TestModelPerfTrace.test_GEMMA2_2B_IT_performance_trace_tp_4"],
+        ),
+        TestFile(
+            "nightly-test/test_perf_trace.py",
+            estimated_time=20,
+            test_methods=["TestModelPerfTrace.test_bailing_moe_performance_trace_tp_2_ep_2"],
+        ),
+        TestFile(
+            "nightly-test/test_perf_trace.py",
+            estimated_time=2.5,
+            test_methods=["TestModelPerfTrace.test_QWEN2_5_7B_INSTRUCT_performance_trace_tp_4"],
         ),
     ],
     "nightly-test-perf-trace-text-models-tpu-v6e-1": [
@@ -390,6 +444,7 @@ suites = {
         TestFile("test/srt/test_chunked_prefill_size.py", 4),
         # TestFile("test/srt/test_sliding_window_attention.py", 30), # add after gpt-oss supported
         TestFile("test/srt/test_model_loader.py", 2),
+        TestFile("test/srt/quantization/test_w8_quantization.py", 10),
     ],
 }
 

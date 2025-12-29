@@ -62,7 +62,7 @@ jobs:
           GITHUB_RUN_ID: ${{ github.run_id }}
           GITHUB_RUN_NUMBER: ${{ github.run_number }}
         run: |
-          python3 scripts/ci/publish_bench_and_pref.py --source-dir ./test/nightly_test_output
+          python3 scripts/ci/publish_bench_and_perf.py --source-dir ./test/nightly_test_output
 
 
   nightly-test-accuracy-text-models-4-tpu:
@@ -103,7 +103,7 @@ jobs:
           GITHUB_RUN_ID: ${{ github.run_id }}
           GITHUB_RUN_NUMBER: ${{ github.run_number }}
         run: |
-          python3 scripts/ci/publish_bench_and_pref.py --source-dir ./test/nightly_test_output
+          python3 scripts/ci/publish_bench_and_perf.py --source-dir ./test/nightly_test_output
 
 
   nightly-test-perf-text-models-1-tpu:
@@ -128,9 +128,9 @@ jobs:
           uv pip install -e "python[all]"
 
           export OUTPUT_DIR_NAME=$(date +'%Y-%m-%d')
-          export PREF_OUTPUT_DIR="$GITHUB_WORKSPACE/test/nightly_test_output/pref/$OUTPUT_DIR_NAME"
-          echo "PREF_OUTPUT_DIR=$PREF_OUTPUT_DIR" >> $GITHUB_ENV
-          mkdir -p $PREF_OUTPUT_DIR
+          export PERF_OUTPUT_DIR="$GITHUB_WORKSPACE/test/nightly_test_output/perf/$OUTPUT_DIR_NAME"
+          echo "PERF_OUTPUT_DIR=$PERF_OUTPUT_DIR" >> $GITHUB_ENV
+          mkdir -p $PERF_OUTPUT_DIR
 
 
 
@@ -145,7 +145,7 @@ jobs:
           GITHUB_RUN_NUMBER: ${{ github.run_number }}
         run: |
 
-          python3 scripts/ci/publish_bench_and_pref.py --source-dir ./test/nightly_test_output
+          python3 scripts/ci/publish_bench_and_perf.py --source-dir ./test/nightly_test_output
 
 
   nightly-test-perf-text-models-4-tpu:
@@ -171,9 +171,9 @@ jobs:
           uv pip install -e "python[all]"
 
           export OUTPUT_DIR_NAME=$(date +'%Y-%m-%d')
-          export PREF_OUTPUT_DIR="$GITHUB_WORKSPACE/test/nightly_test_output/pref/$OUTPUT_DIR_NAME"
-          echo "PREF_OUTPUT_DIR=$PREF_OUTPUT_DIR" >> $GITHUB_ENV
-          mkdir -p $PREF_OUTPUT_DIR
+          export PERF_OUTPUT_DIR="$GITHUB_WORKSPACE/test/nightly_test_output/perf/$OUTPUT_DIR_NAME"
+          echo "PERF_OUTPUT_DIR=$PERF_OUTPUT_DIR" >> $GITHUB_ENV
+          mkdir -p $PERF_OUTPUT_DIR
 
 
 

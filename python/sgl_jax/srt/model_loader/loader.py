@@ -218,7 +218,6 @@ class JAXModelLoader(DefaultModelLoader):
                     model_config.hf_config, dtype=model_config.dtype, mesh=self.mesh
                 )
             )
-
         model.load_weights(model_config)
         return model
 
