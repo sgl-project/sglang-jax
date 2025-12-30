@@ -152,6 +152,11 @@ class Scheduler(
         self.page_size = server_args.page_size
         self.enable_overlap = not server_args.disable_overlap_schedule
         self.spec_algorithm = SpeculativeAlgorithm.from_string(server_args.speculative_algorithm)
+
+        # LoRA configurations
+        self.lora_paths = server_args.lora_paths
+        self.max_loras_per_batch = server_args.max_loras_per_batch
+
         # Init inter-process communication
         context = zmq.Context(2)
 
@@ -610,6 +615,8 @@ class Scheduler(
             top_logprobs_num=recv_req.top_logprobs_num,
             token_ids_logprob=recv_req.token_ids_logprob,
             stream=recv_req.stream,
+            lora_id=recv_req.lora_id,
+            extra_key=recv_req.extra_key,
             eos_token_ids=self.model_config.hf_eos_token_id,
             vocab_size=self.model_config.vocab_size,
         )
@@ -1041,10 +1048,28 @@ class Scheduler(
             self.chunked_req.init_next_round_input()
             self.chunked_req = adder.add_chunked_req(self.chunked_req)
 
+        # Collect existing LoRA IDs in the running batch if LoRA is enabled
+        if self.lora_paths is not None:
+            lora_set = (
+                set([req.lora_id for req in self.running_batch.reqs])
+                if self.running_batch is not None
+                else set([])
+            )
+
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
             if running_bs + len(adder.can_run_list) >= self.max_running_requests:
                 self.running_batch.batch_is_full = True
+                break
+
+            # Check LoRA constraint: ensure we don't exceed max_loras_per_batch
+            if (
+                self.lora_paths is not None
+                and len(
+                    lora_set | set([req.lora_id for req in adder.can_run_list]) | set([req.lora_id])
+                )
+                > self.max_loras_per_batch
+            ):
                 break
 
             req.init_next_round_input(self.tree_cache)
@@ -1156,28 +1181,21 @@ class Scheduler(
 
         # Run forward
         assert self.is_generation
-
+        (
+            precompile_token_paddings,
+            precompile_bs_paddings,
+            precompile_cache_loc_paddings,
+        ) = self.tp_worker.get_precompile_paddings()
         if self.spec_algorithm is None or self.spec_algorithm.is_none():
-            (
-                precompile_token_paddings,
-                precompile_bs_paddings,
-                precompile_cache_loc_paddings,
-            ) = self.tp_worker.get_precompile_paddings()
-
             model_worker_batch = batch.get_model_worker_batch(
                 precompile_token_paddings,
                 precompile_bs_paddings,
                 precompile_cache_loc_paddings,
                 self.page_size,
+                self.server_args.enable_static_lora,
             )
 
             if self.enable_overlap:
-                # Pre-initialize ForwardBatch for overlap scheduling optimization
-                from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
-
-                model_worker_batch.forward_batch = ForwardBatch.init_new(
-                    model_worker_batch, self.tp_worker.get_model_runner()
-                )
                 with jax.profiler.TraceAnnotation(
                     f"forward_batch_generation_overlap {self.forward_ct}"
                 ):
@@ -1198,19 +1216,12 @@ class Scheduler(
                     : model_worker_batch.real_bs
                 ]
         else:
-
-            (
-                precompile_token_paddings,
-                precompile_bs_paddings,
-                precompile_cache_loc_paddings,
-            ) = self.draft_worker.get_precompile_paddings()
-            model_worker_batch = batch.get_model_worker_batch(
+            model_worker_batch = batch.get_spec_model_worker_batch(
                 precompile_token_paddings,
                 precompile_bs_paddings,
                 precompile_cache_loc_paddings,
                 self.page_size,
-                # eagle's model_worker_batch will be modified and repadding within eagle_worker
-                skip_padding=True,
+                self.server_args.enable_static_lora,
             )
             batch_output = self.draft_worker.forward_batch_speculative_generation(
                 model_worker_batch

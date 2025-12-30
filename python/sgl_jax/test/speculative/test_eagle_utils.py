@@ -57,7 +57,7 @@ class TestVerifyTree(CustomTestCase):
                 if jnp.max(target_logits[i][j]) < 10:
                     target_logits = target_logits.at[i, j, 18].set(10)
 
-        target_predict = jnp.argmax(target_logits, axis=-1).flatten()
+        target_logits = target_logits.reshape(-1, target_logits.shape[-1])
         predict_shape = (12,)
 
         bs = candidates.shape[0]
@@ -81,19 +81,18 @@ class TestVerifyTree(CustomTestCase):
                 ctx = mesh
         with ctx:
             accept_index, accept_token_num, predicts = verify_tree_greedy(
-                predicts=predicts,
-                accept_index=accept_index,
-                accept_token_num=accept_token_num,
-                candidates=candidates,
+                speculative_num_steps=4,
+                num_draft_tokens=6,
+                draft_tokens=candidates,
                 retrive_index=retrive_index,
                 retrive_next_token=retrive_next_token,
                 retrive_next_sibling=retrive_next_sibling,
-                target_predict=target_predict,
+                next_token_logits=target_logits,
             )
 
         # Check the expected output.
-        self.assertEqual(predicts.flatten().tolist(), [3, 0, 0, 4, 5, 18, 11, 0, 0, 0, 12, 18])
-        self.assertEqual(accept_index.tolist(), [[0, 3, 4, 5], [6, 10, 11, -1]])
+        self.assertEqual(predicts.flatten().tolist(), [3, 0, 0, 4, 5, 18, 11, 0, 0, 0, 12, 18, 0])
+        self.assertEqual(accept_index.tolist(), [[0, 3, 4, 5, -1], [6, 10, 11, -1, -1]])
         self.assertEqual(accept_token_num.tolist(), [3, 2])
 
     def _test_tree_speculative_sampling_target_only(

@@ -12,7 +12,7 @@ from jax import numpy as jnp
 from sgl_jax.srt.managers.schedule_batch import Req, ScheduleBatch
 from sgl_jax.srt.mem_cache.allocator import SWATokenToKVPoolAllocator
 from sgl_jax.srt.mem_cache.base_prefix_cache import BasePrefixCache
-from sgl_jax.srt.mem_cache.radix_cache import RadixCache, TreeNode
+from sgl_jax.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
 
 if TYPE_CHECKING:
     from sgl_jax.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
@@ -145,10 +145,13 @@ class SchedulePolicy:
 
         for r in waiting_queue:
             prefix_ids = r.adjust_max_prefix_ids()
+            extra_key = r.extra_key
 
             # NOTE: the prefix_indices must always be aligned with last_node
             r.prefix_indices, r.last_node, r.last_host_node, r.host_hit_length = (
-                self.tree_cache.match_prefix(rid=r.rid, key=prefix_ids)
+                self.tree_cache.match_prefix(
+                    rid=r.rid, key=RadixKey(token_ids=prefix_ids, extra_key=extra_key)
+                )
             )
 
             # NOTE(sang): This logic is for in-batch prefix caching;
@@ -160,7 +163,7 @@ class SchedulePolicy:
             # It is kind of common when the engine is long running (e.g., imagine the prefix "the").
             if len(r.prefix_indices) <= IN_BATCH_PREFIX_CACHING_CHECK_THRESHOLD:
                 in_batch_matching_prefixes, _, _, _ = self.waiting_queue_radix_tree.match_prefix(
-                    rid=r.rid, key=prefix_ids
+                    rid=r.rid, key=RadixKey(token_ids=prefix_ids, extra_key=extra_key)
                 )
                 if (
                     len(in_batch_matching_prefixes)
@@ -170,7 +173,8 @@ class SchedulePolicy:
                 else:
                     # Insert with a dummy key
                     self.waiting_queue_radix_tree.insert(
-                        prefix_ids, jnp.empty(len(prefix_ids), dtype=jnp.bool_)
+                        RadixKey(token_ids=prefix_ids, extra_key=extra_key),
+                        jnp.empty(len(prefix_ids), dtype=jnp.bool_),
                     )
         return temporary_deprioritized
 

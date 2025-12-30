@@ -16,9 +16,14 @@ import threading
 from collections.abc import AsyncIterator, Iterator
 from typing import Any
 
+import jax
 import uvloop
 import zmq
 import zmq.asyncio
+from flax import nnx
+
+from sgl_jax.srt.utils.common_utils import SUPPORTED_LORA_TARGET_MODULES
+from sgl_jax.utils import traverse_and_update
 
 # ruff: noqa: E402
 # Fix a bug of Python threading
@@ -124,6 +129,7 @@ class Engine(EngineBase):
         top_logprobs_num: list[int] | int | None = None,
         token_ids_logprob: list[list[int]] | list[int] | None = None,
         stream: bool = False,
+        lora_path: list[str] | str | None = None,
     ) -> dict | Iterator[dict]:
         """
         The arguments of this function is the same as `sglang/srt/managers/io_struct.py::GenerateReqInput`.
@@ -142,6 +148,7 @@ class Engine(EngineBase):
             top_logprobs_num=top_logprobs_num,
             token_ids_logprob=token_ids_logprob,
             stream=stream,
+            lora_path=lora_path,
         )
 
         generator = self.tokenizer_manager.generate_request(obj, None)
@@ -195,6 +202,23 @@ class Engine(EngineBase):
             return generator
         else:
             return await generator.__anext__()
+
+    def apply_dummy_lora_ab_buffer(self, target_modules: list | None = None):
+        if target_modules is None or len(target_modules) == 0:
+            logger.warning("No %v is specified, so skip to apply", target_modules)
+            return
+
+        if "all" in target_modules:
+            target_modules = SUPPORTED_LORA_TARGET_MODULES
+
+        logger.info("Applying dummy LoRA buffers to modules: %v", target_modules)
+
+        model_runner = self.scheduler_info["scheduler"].tp_worker.worker.model_runner
+        model_state = nnx.split(model_runner.model)[1]
+        new_state = traverse_and_update(model_state, target_modules)
+        self.scheduler_info["scheduler"].tp_worker.worker.model_runner.model_state_leaves, _ = (
+            jax.tree_util.tree_flatten(new_state)
+        )
 
     def encode(
         self,

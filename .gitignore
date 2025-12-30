@@ -8,6 +8,7 @@ __pycache__/
 
 # Distribution / packaging
 .Python
+.python-version
 build/
 develop-eggs/
 dist/
@@ -241,3 +242,5 @@ CLAUDE.md
 
 #gemini code
 .gemini-clipboard
+.gemini/settings.json
+.gemini.md

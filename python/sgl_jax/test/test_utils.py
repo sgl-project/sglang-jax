@@ -415,9 +415,11 @@ def get_benchmark_args(
     device="auto",
     pd_separated: bool = False,
     lora_name=None,
+    backend="sgl-jax",
+    warmup_requests=1,
 ):
     return SimpleNamespace(
-        backend="sgl-jax",
+        backend=backend,
         base_url=base_url,
         host=None,
         port=None,
@@ -447,6 +449,7 @@ def get_benchmark_args(
         prompt_suffix="",
         device=device,
         pd_separated=pd_separated,
+        warmup_requests=warmup_requests,
     )
 
 

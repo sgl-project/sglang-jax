@@ -161,7 +161,7 @@ class BenchArgs:
             "--profile",
             action="store_true",
             help="Use Torch Profiler. The endpoint must be launched with "
-            "SGLANG_TORCH_PROFILER_DIR to enable profiler.",
+            "SGLANG_JAX_PROFILER_DIR to enable profiler.",
         )
         parser.add_argument(
             "--skip-warmup",
@@ -218,8 +218,8 @@ def throughput_test_once(
     ]
 
     if profile:
-        assert "SGLANG_TORCH_PROFILER_DIR" in os.environ, "Please set SGLANG_TORCH_PROFILER_DIR."
-        os.makedirs(os.environ["SGLANG_TORCH_PROFILER_DIR"], exist_ok=True)
+        assert "SGLANG_JAX_PROFILER_DIR" in os.environ, "Please set SGLANG_JAX_PROFILER_DIR."
+        os.makedirs(os.environ["SGLANG_JAX_PROFILER_DIR"], exist_ok=True)
         backend.start_profile()
 
     st = time.perf_counter()
@@ -227,7 +227,7 @@ def throughput_test_once(
     latency = time.perf_counter() - st
 
     if profile:
-        dir = os.getenv("SGLANG_TORCH_PROFILER_DIR")
+        dir = os.getenv("SGLANG_JAX_PROFILER_DIR")
         known_files = set(os.listdir(dir))
         backend.stop_profile()
         monitor_trace_file(known_files, dir)
