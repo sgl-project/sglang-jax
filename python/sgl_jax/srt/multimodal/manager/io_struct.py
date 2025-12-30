@@ -36,6 +36,10 @@ class VideoGenerationsRequest(BaseModel):
     size: str | None = "720x1280"
     fps: int | None = None
     num_frames: int | None = None
+    num_steps: int | None = 30
+    guidance_scale: float | None = 5.0
+    text_embeds: np.ndarray | None = None
+    latents: np.ndarray | None = None
 
 
 class VideoResponse(BaseModel):

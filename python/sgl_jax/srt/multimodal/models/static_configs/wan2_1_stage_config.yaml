@@ -7,7 +7,6 @@ stage_args:
      engine_type: xxx, ar or diffusion
      model_stage: thinker
      model_arch: Qwen3OmniMoeForConditionalGeneration
-     # 要想跟vllm保持一致感觉还比较麻烦
      mem_fraction_static: 0.6
      trust_remote_code: true
      engine_output_type: latent  # Output hidden states for talker

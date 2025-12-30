@@ -14,6 +14,7 @@ class DiffusionModelWorker:
         self.initialize()
 
     def initialize(self):
+        self.model_loader.load_model()
         pass
         # init cache here if needed
         # init different attention backend if needed
