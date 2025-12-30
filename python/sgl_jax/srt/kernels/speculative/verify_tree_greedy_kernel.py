@@ -264,17 +264,24 @@ def verify_tree_greedy_pallas_call(
     return accept_index, accept_token_num, predicts
 
 
-@jax.jit
+@jax.jit(static_argnames=["speculative_num_steps", "num_draft_tokens"])
 def verify_tree_greedy(
-    predicts: jax.Array,  # shape: (bs*num_draft_tokens,)
-    accept_index: jax.Array,  # shape: (bs*num_spec_step,)
-    accept_token_num: jax.Array,  # shape: (bs,)
-    candidates: jax.Array,  # shape: (bs, num_draft_tokens)
+    speculative_num_steps: int,
+    num_draft_tokens: int,
+    draft_tokens: jax.Array,
     retrive_index: jax.Array,  # shape: (bs, num_draft_tokens)
     retrive_next_token: jax.Array,  # shape: (bs, num_draft_tokens)
     retrive_next_sibling: jax.Array,  # shape: (bs, num_draft_tokens)
-    target_predict: jax.Array,  # shape: (bs*num_draft_tokens,)
+    next_token_logits: jax.Array,  # shape: (bs*num_draft_tokens,)
 ):
+    bs = retrive_index.shape[0]
+    candidates = draft_tokens.reshape(bs, num_draft_tokens)
+    predict_shape = list(next_token_logits.shape)[:-1]
+    predict_shape[-1] += 1
+    predicts = jnp.zeros(predict_shape, dtype=jnp.int32)
+    accept_index = jnp.full((bs, speculative_num_steps + 1), -1, dtype=jnp.int32)
+    accept_token_num = jnp.zeros((bs,), dtype=jnp.int32)
+    target_predict = jnp.argmax(next_token_logits, axis=-1).flatten()
     in_specs = (
         P(),  # predicts
         P(),  # accept_index

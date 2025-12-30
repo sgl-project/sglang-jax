@@ -517,6 +517,7 @@ class WeightLoader:
                     and not mapping.kv_head_padding
                     and not mapping.head_dim_padding
                     and mapping.sharding is not None
+                    and hf_key != "d2t"
                 )
 
                 if can_optimize:
