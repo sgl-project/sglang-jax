@@ -390,7 +390,7 @@ suites = {
         TestFile("test/srt/test_engine_determin_generation.py", 2),
         TestFile("test/srt/test_engine_flush_cache.py", 2),
         TestFile("test/srt/test_engine_pause_continue.py", 2),
-        TestFile("test/srt/test_server_pause_continue.py", 2),
+        TestFile("test/srt/test_server_pause_continue.py", 6),
     ],
 }
 
