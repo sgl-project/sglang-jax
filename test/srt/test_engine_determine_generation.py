@@ -361,7 +361,7 @@ class TestEngineDeterministicGeneration(CustomTestCase):
 
         # Pause with retract mode
         await self._async_pause_generation(mode="retract")
-        await asyncio.sleep(0.5)
+        await asyncio.sleep(1.5)
 
         # Get state after pause
         states_after = await self._async_get_internal_state()
