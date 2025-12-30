@@ -7,7 +7,7 @@ import flax
 import jax
 import jax.numpy as jnp
 
-from python.sgl_jax.srt.multimodal.models.diffusion_solvers.scheduler_util import (
+from sgl_jax.srt.multimodal.models.diffusion_solvers.scheduler_util import (
     CommonSchedulerState,
     SchedulerMixin,
     add_noise_common,
@@ -683,7 +683,7 @@ class UniPCMultistepScheduler(SchedulerMixin):
         timestep: int | jnp.ndarray,  # Current discrete timestep from the scheduler's sequence
         sample: jnp.ndarray,  # Current noisy sample (latent)
         return_dict: bool = True,
-        generator: jax.random.PRNGKey | None = None,  # JAX random key
+        # generator: jax.random.PRNGKey | None = None,  # JAX random key
     ):
         """
         Predict the sample from the previous timestep by reversing the SDE. This function propagates the sample with

@@ -5,6 +5,7 @@ import psutil
 import setproctitle
 
 from sgl_jax.srt.managers.detokenizer_manager import DetokenizerManager
+from sgl_jax.srt.multimodal.manager.schedule_batch import Req
 from sgl_jax.srt.server_args import PortArgs, ServerArgs
 from sgl_jax.srt.utils import configure_logger, kill_itself_when_parent_died
 from sgl_jax.utils import TypeBasedDispatcher, get_exception_traceback
@@ -21,13 +22,13 @@ class MultimodalDetokenizer(DetokenizerManager):
         super().__init__(server_args, port_args)
         self._request_dispatcher = TypeBasedDispatcher(
             [
-                (list, self.save_result),
+                (Req, self.save_result),
             ]
         )
 
-    def save_result(self, reqs: list):
+    def save_result(self, req: Req):
         print("save_result...")
-        return reqs
+        return [req]
 
 
 def run_multimodal_detokenizer_process(

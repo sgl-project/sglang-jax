@@ -4,8 +4,8 @@
 from dataclasses import dataclass, field
 from typing import Any
 
-from python.sgl_jax.srt.multimodal.configs.attention_util import AttentionBackendEnum
-from python.sgl_jax.srt.multimodal.configs.base import ArchConfig, ModelConfig
+from sgl_jax.srt.multimodal.configs.attention_util import AttentionBackendEnum
+from sgl_jax.srt.multimodal.configs.base import ArchConfig, ModelConfig
 
 
 @dataclass

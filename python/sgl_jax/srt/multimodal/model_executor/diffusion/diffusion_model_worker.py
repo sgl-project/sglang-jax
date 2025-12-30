@@ -1,5 +1,5 @@
-from python.sgl_jax.srt.model_loader.loader import get_model_loader
-from python.sgl_jax.srt.multimodal.model_executor.diffusion.diffusion_model_runner import (
+from sgl_jax.srt.model_loader.loader import get_model_loader
+from sgl_jax.srt.multimodal.model_executor.diffusion.diffusion_model_runner import (
     DiffusionModelRunner,
 )
 

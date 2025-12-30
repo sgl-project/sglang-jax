@@ -110,6 +110,8 @@ class MultimodalTokenizer(TokenizerManager):
             obj.rid,
             obj.prompt,
             input_ids,
+            size=obj.size,
+            num_frames=obj.num_frames,
         )
         return tokenized_obj
 

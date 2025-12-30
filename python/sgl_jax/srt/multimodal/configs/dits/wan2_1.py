@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 from dataclasses import dataclass, field
 
-from python.sgl_jax.srt.multimodal.configs.dits.base import DiTArchConfig, DiTConfig
+from sgl_jax.srt.multimodal.configs.dits.base import DiTArchConfig, DiTConfig
 
 
 def is_blocks(n: str, m) -> bool:

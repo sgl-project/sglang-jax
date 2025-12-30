@@ -48,7 +48,7 @@ async def images_generation(obj: ImageGenerationsRequest, request: Request):
 
 
 async def _convert_to_internal_request(obj: ImageGenerationsRequest | VideoGenerationsRequest):
-    return GenerateMMReqInput(prompt=obj.prompt)
+    return GenerateMMReqInput(prompt=obj.prompt, size=obj.size, num_frames=1)
 
 
 @app.api_route("/api/v1/videos/generation", methods=["POST", "PUT"])
@@ -82,7 +82,7 @@ def launch(
     """
     # Allocate ports
     port_args = PortArgs.init_new(server_args)
-
+    mp.set_start_method("spawn", force=True)
     # Launch processes
     processes = []
 

@@ -1,11 +1,12 @@
-from dataclasses import field
+from dataclasses import dataclass, field
 from typing import Any
 
 import jax
-import PIL
+import PIL.Image
 
 
-class Request:
+@dataclass
+class Req:
     """
     Complete state passed through the diffusion execution.
 
@@ -19,9 +20,9 @@ class Request:
     # specific arguments.
     # data_type: DataType
 
-    request_id: str | None = None
+    rid: str | None = None
     # 随机数生成器
-    generator: jax.random.PRNGKey | list[jax.random.PRNGKey.PRNGKey] | None = None
+    # generator: jax.random.PRNGKey | list[jax.random.PRNGKey] | None = None
 
     # Image inputs
     image_path: str | None = None
@@ -34,7 +35,9 @@ class Request:
 
     # Text inputs
     prompt: str | list[str] | None = None
+    input_ids: list[int] | None = None
     negative_prompt: str | list[str] | None = None
+    negative_input_ids: list[int] | None = None
     prompt_path: str | None = None
     output_path: str = "outputs/"
     # without extension
