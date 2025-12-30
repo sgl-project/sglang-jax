@@ -356,11 +356,15 @@ class TestEngineFlushCache(CustomTestCase):
 
         print(f"\n{Colors.BOLD}{Colors.BLUE}=== Multiple Flush Cycles ==={Colors.RESET}")
 
-        # Get initial available tokens
+        # Get initial state
         initial_states = await self._async_get_internal_state()
-        initial_tokens = initial_states[0]["available_kv_tokens"]
+        initial = initial_states[0]
+        initial_tokens = initial["available_kv_tokens"]
+        print(f"{Colors.YELLOW}Initial State:{Colors.RESET}")
+        print(f"  available_kv_tokens: {Colors.GREEN}{initial_tokens}{Colors.RESET}")
+        print(f"  tree_cache_size: {Colors.GREEN}{initial['tree_cache_size']}{Colors.RESET}")
         print(
-            f"{Colors.YELLOW}Initial Available KV Tokens: {Colors.GREEN}{initial_tokens}{Colors.RESET}"
+            f"  req_to_token_pool_used: {Colors.GREEN}{initial['req_to_token_pool_used']}{Colors.RESET}"
         )
 
         for cycle in range(num_cycles):
@@ -374,9 +378,17 @@ class TestEngineFlushCache(CustomTestCase):
 
             # Get state after generation
             states_after_gen = await self._async_get_internal_state()
-            tokens_after_gen = states_after_gen[0]["available_kv_tokens"]
+            after_gen = states_after_gen[0]
+            print(f"  {Colors.YELLOW}After Generation:{Colors.RESET}")
             print(
-                f"  After Generation: {Colors.GREEN}{tokens_after_gen}{Colors.RESET} tokens available"
+                f"    available_kv_tokens: {Colors.GREEN}{after_gen['available_kv_tokens']}{Colors.RESET}"
+            )
+            print(f"    tree_cache_size: {Colors.GREEN}{after_gen['tree_cache_size']}{Colors.RESET}")
+            print(
+                f"    req_to_token_pool_used: {Colors.GREEN}{after_gen['req_to_token_pool_used']}{Colors.RESET}"
+            )
+            print(
+                f"    forward_ct_decode: {Colors.GREEN}{after_gen['forward_ct_decode']}{Colors.RESET}"
             )
 
             # Flush
@@ -384,16 +396,82 @@ class TestEngineFlushCache(CustomTestCase):
 
             # Get state after flush
             states_after_flush = await self._async_get_internal_state()
-            tokens_after_flush = states_after_flush[0]["available_kv_tokens"]
+            after_flush = states_after_flush[0]
+            print(f"  {Colors.YELLOW}After Flush:{Colors.RESET}")
             print(
-                f"  After Flush: {Colors.GREEN}{tokens_after_flush}{Colors.RESET} tokens available"
+                f"    available_kv_tokens: {Colors.GREEN}{after_flush['available_kv_tokens']}{Colors.RESET}"
+            )
+            print(
+                f"    tree_cache_size: {Colors.GREEN}{after_flush['tree_cache_size']}{Colors.RESET}"
+            )
+            print(
+                f"    req_to_token_pool_used: {Colors.GREEN}{after_flush['req_to_token_pool_used']}{Colors.RESET}"
+            )
+            print(
+                f"    forward_ct_decode: {Colors.GREEN}{after_flush['forward_ct_decode']}{Colors.RESET}"
+            )
+            print(
+                f"    new_token_ratio: {Colors.GREEN}{after_flush['new_token_ratio']}{Colors.RESET}"
             )
 
-            # Verify tokens restored
+            # Verify all states restored/cleared
+            print(f"  {Colors.YELLOW}Verification:{Colors.RESET}")
+
+            # Verify KV cache restored
+            if after_flush["available_kv_tokens"] == initial_tokens:
+                print(f"    ✓ KV cache restored: {Colors.GREEN}PASS{Colors.RESET}")
+            else:
+                print(f"    ✗ KV cache NOT restored: {Colors.RED}FAIL{Colors.RESET}")
+
+            # Verify tree cache cleared
+            if after_flush["tree_cache_size"] == 0:
+                print(f"    ✓ Tree cache cleared: {Colors.GREEN}PASS{Colors.RESET}")
+            else:
+                print(f"    ✗ Tree cache NOT cleared: {Colors.RED}FAIL{Colors.RESET}")
+
+            # Verify req_to_token_pool cleared
+            if after_flush["req_to_token_pool_used"] == 0:
+                print(f"    ✓ req_to_token_pool cleared: {Colors.GREEN}PASS{Colors.RESET}")
+            else:
+                print(f"    ✗ req_to_token_pool NOT cleared: {Colors.RED}FAIL{Colors.RESET}")
+
+            # Verify forward_ct_decode reset
+            if after_flush["forward_ct_decode"] == 0:
+                print(f"    ✓ forward_ct_decode reset: {Colors.GREEN}PASS{Colors.RESET}")
+            else:
+                print(f"    ✗ forward_ct_decode NOT reset: {Colors.RED}FAIL{Colors.RESET}")
+
+            # Verify new_token_ratio reset
+            if after_flush["new_token_ratio"] == after_flush["init_new_token_ratio"]:
+                print(f"    ✓ new_token_ratio reset: {Colors.GREEN}PASS{Colors.RESET}")
+            else:
+                print(f"    ✗ new_token_ratio NOT reset: {Colors.RED}FAIL{Colors.RESET}")
+
+            # Assertions
             self.assertEqual(
-                tokens_after_flush,
+                after_flush["available_kv_tokens"],
                 initial_tokens,
-                f"Cycle {cycle}: Tokens should be restored after flush",
+                f"Cycle {cycle}: KV cache should be restored after flush",
+            )
+            self.assertEqual(
+                after_flush["tree_cache_size"],
+                0,
+                f"Cycle {cycle}: Tree cache should be cleared",
+            )
+            self.assertEqual(
+                after_flush["req_to_token_pool_used"],
+                0,
+                f"Cycle {cycle}: req_to_token_pool should be cleared",
+            )
+            self.assertEqual(
+                after_flush["forward_ct_decode"],
+                0,
+                f"Cycle {cycle}: forward_ct_decode should be reset",
+            )
+            self.assertEqual(
+                after_flush["new_token_ratio"],
+                after_flush["init_new_token_ratio"],
+                f"Cycle {cycle}: new_token_ratio should be reset to init value",
             )
 
         print(f"\n{Colors.BOLD}{Colors.BLUE}============================={Colors.RESET}\n")
