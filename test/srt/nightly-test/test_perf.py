@@ -71,7 +71,7 @@ class TestModelPerf(CustomTestCase):
 
         print(f"Dataset is ready at location: {cls.sharegpt_dataset_path}")
 
-    def test_qwen_7b_performance_tp_1(self):
+    def _test_qwen_7b_performance_tp_1(self, concurrency_levels):
         import os
 
         MOUNT_ROOT = os.getenv("CI_MOUNT_ROOT", "/models")
@@ -91,7 +91,7 @@ class TestModelPerf(CustomTestCase):
 
         # define test parameters
         # concurrency levels
-        concurrency_levels = [8, 16, 32, 64, 128, 256]
+        
         # input length levels (1k, 4k, 8k)
         input_lengths = [1024, 4096, 8192]
         # concurrency_levels = [8]
@@ -334,7 +334,7 @@ class TestModelPerf(CustomTestCase):
             )
         print("=" * 100)
 
-    def test_qwen3_8b_performance_tp_1(self):
+    def _test_qwen3_8b_performance_tp_1(self, concurrency_levels):
         import os
 
         MOUNT_ROOT = os.getenv("CI_MOUNT_ROOT", "/models")
@@ -354,7 +354,7 @@ class TestModelPerf(CustomTestCase):
 
         # define test parameters
         # concurrency levels
-        concurrency_levels = [8, 16, 32, 64, 128, 256]
+        
         # input length levels (1k, 4k, 8k)
         input_lengths = [1024, 4096, 8192]
 
@@ -723,7 +723,7 @@ class TestModelPerf(CustomTestCase):
             )
         print("=" * 100)
 
-    def test_GEMMA2_2B_IT_performance_tp_1(self):
+    def _test_GEMMA2_2B_IT_performance_tp_1(self, concurrency_levels):
         import os
 
         MOUNT_ROOT = os.getenv("CI_MOUNT_ROOT", "/models")
@@ -743,7 +743,7 @@ class TestModelPerf(CustomTestCase):
 
         # define test parameters
         # concurrency levels
-        concurrency_levels = [8, 16, 32, 64, 128, 256]
+        
         # input length levels (1k, 4k, 8k)
         input_lengths = [1024, 4096, 8192]
         # concurrency_levels = [8]
@@ -1104,7 +1104,7 @@ class TestModelPerf(CustomTestCase):
 
                 writer.writerows(results_summary)
 
-    def test_QWEN2_5_7B_INSTRUCT_performance_tp_1(self):
+    def _test_QWEN2_5_7B_INSTRUCT_performance_tp_1(self, concurrency_levels):
         import os
 
         MOUNT_ROOT = os.getenv("CI_MOUNT_ROOT", "/models")
@@ -1124,7 +1124,7 @@ class TestModelPerf(CustomTestCase):
 
         # define test parameters
         # concurrency levels
-        concurrency_levels = [8, 16, 32, 64, 128, 256]
+        
         # input length levels (1k, 4k, 8k)
         input_lengths = [1024, 4096, 8192]
         # concurrency_levels = [8]
@@ -1544,6 +1544,37 @@ class TestModelPerf(CustomTestCase):
             )
         print("=" * 100)
 
+    def test_qwen_7b_performance_tp_1_low_concurrency(self):
+        concurrency_levels = [8, 16, 32, 64]
+        self._test_qwen_7b_performance_tp_1(concurrency_levels)
 
+    def test_qwen_7b_performance_tp_1_high_concurrency(self):
+        concurrency_levels = [128, 256]
+        self._test_qwen_7b_performance_tp_1(concurrency_levels)
+    
+    def test_qwen3_8b_performance_tp_1_low_concurrency(self):
+        concurrency_levels = [8, 16, 32, 64]
+        self._test_qwen3_8b_performance_tp_1(concurrency_levels)
+
+    def test_qwen3_8b_performance_tp_1_high_concurrency(self):
+        concurrency_levels = [128, 256]
+        self._test_qwen3_8b_performance_tp_1(concurrency_levels)
+
+    def test_GEMMA2_2B_IT_performance_tp_1_low_concurrency(self):
+        concurrency_levels = [8, 16, 32, 64]
+        self._test_GEMMA2_2B_IT_performance_tp_1(concurrency_levels)
+
+    def test_GEMMA2_2B_IT_performance_tp_1_high_concurrency(self):
+        concurrency_levels = [128, 256]
+        self._test_GEMMA2_2B_IT_performance_tp_1(concurrency_levels)
+
+    def test_QWEN2_5_7B_INSTRUCT_performance_tp_1_low_concurrency(self):
+        concurrency_levels = [8, 16, 32, 64]
+        self._test_QWEN2_5_7B_INSTRUCT_performance_tp_1(concurrency_levels)
+
+    def test_QWEN2_5_7B_INSTRUCT_performance_tp_1_high_concurrency(self):
+        concurrency_levels = [128, 256]
+        self._test_QWEN2_5_7B_INSTRUCT_performance_tp_1(concurrency_levels)
+    
 if __name__ == "__main__":
     unittest.main()
