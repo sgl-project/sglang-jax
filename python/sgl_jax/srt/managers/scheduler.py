@@ -779,8 +779,32 @@ class Scheduler(
             else []
         )
 
-        # kv cache stat
+        # scheduling state
+        ret["cur_batch_is_none"] = self.cur_batch is None
+        ret["last_batch_is_none"] = self.last_batch is None
+        ret["chunked_req_is_none"] = self.chunked_req is None
+
+        # request cache stat
+        ret["tree_cache_size"] = self.tree_cache.total_size() if self.tree_cache is not None else 0
+        if self.req_to_token_pool is not None:
+            ret["req_to_token_pool_total"] = self.req_to_token_pool.size
+            ret["req_to_token_pool_available"] = self.req_to_token_pool.available_size()
+            ret["req_to_token_pool_used"] = (
+                self.req_to_token_pool.size - self.req_to_token_pool.available_size()
+            )
+        else:
+            ret["req_to_token_pool_total"] = 0
+            ret["req_to_token_pool_available"] = 0
+            ret["req_to_token_pool_used"] = 0
+
+        # physical kv cache stat
         ret["available_kv_tokens"] = self.token_to_kv_pool_allocator.available_size()
+
+        # counters
+        ret["num_generated_tokens"] = self.num_generated_tokens
+        ret["forward_ct_decode"] = self.forward_ct_decode
+        ret["new_token_ratio"] = self.new_token_ratio
+        ret["init_new_token_ratio"] = self.init_new_token_ratio
 
         return GetInternalStateReqOutput(internal_state=ret)
 
