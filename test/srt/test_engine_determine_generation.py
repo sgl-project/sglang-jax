@@ -350,7 +350,7 @@ class TestEngineDeterministicGeneration(CustomTestCase):
         ]
 
         # Wait for generation to start
-        await asyncio.sleep(1.5)
+        await asyncio.sleep(3)
 
         # Get state before pause
         states_before = await self._async_get_internal_state()
