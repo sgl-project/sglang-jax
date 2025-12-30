@@ -113,10 +113,11 @@ class TestEngineFlushCache(CustomTestCase):
         num_requests = 4
         prompts = [f"{self.test_prompt} Story {i}:" for i in range(num_requests)]
 
-        results = []
-        for prompt in prompts:
-            result = await self._async_generate(prompt, self.max_new_tokens)
-            results.append(result)
+        tasks = [
+            asyncio.create_task(self._async_generate(prompt, self.max_new_tokens))
+            for prompt in prompts
+        ]
+        results = await asyncio.gather(*tasks)
 
         # Verify all requests completed
         for i, result in enumerate(results):

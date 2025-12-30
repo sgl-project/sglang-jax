@@ -497,10 +497,11 @@ class TestEngineDeterministicGeneration(CustomTestCase):
                 partial_texts.append("")
 
         # Re-generate ALL requests from scratch to get full results
-        regenerated_texts = []
-        for prompt in prompts:
-            text = await self._run_generation_no_pause(prompt, self.max_new_tokens)
-            regenerated_texts.append(text)
+        tasks = [
+            asyncio.create_task(self._run_generation_no_pause(prompt, self.max_new_tokens))
+            for prompt in prompts
+        ]
+        regenerated_texts = await asyncio.gather(*tasks)
 
         # Summary comparison
         print(
