@@ -3,7 +3,6 @@ import unittest
 
 from sgl_jax.srt.entrypoints.engine import Engine
 from sgl_jax.srt.hf_transformers_utils import get_tokenizer
-from sgl_jax.srt.managers.io_struct import GenerateReqInput
 from sgl_jax.test.test_utils import QWEN3_8B, CustomTestCase
 
 
@@ -84,16 +83,15 @@ class TestEngineFlushCache(CustomTestCase):
 
     async def _async_generate(self, prompt: str, max_new_tokens: int):
         """Generate using async method."""
-        obj = GenerateReqInput(
-            text=prompt,
+        return await self.engine.async_generate(
+            prompt=prompt,
             sampling_params={
                 "temperature": 0,
                 "max_new_tokens": max_new_tokens,
                 "ignore_eos": True,
             },
+            stream=False,
         )
-        generator = self.engine.tokenizer_manager.generate_request(obj, None)
-        return await generator.__anext__()
 
     async def _run_test_flush_cache_after_generation(self):
         """Test flush_cache restores all states after generation completes."""

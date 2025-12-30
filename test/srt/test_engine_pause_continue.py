@@ -4,7 +4,6 @@ import unittest
 
 from sgl_jax.srt.entrypoints.engine import Engine
 from sgl_jax.srt.hf_transformers_utils import get_tokenizer
-from sgl_jax.srt.managers.io_struct import GenerateReqInput
 from sgl_jax.test.test_utils import QWEN3_8B, CustomTestCase
 
 
@@ -74,16 +73,15 @@ class TestEnginePauseContinue(CustomTestCase):
 
     async def _async_generate(self, max_new_tokens: int = 2000):
         """Generate using async method."""
-        obj = GenerateReqInput(
-            text="Write a very long story about a magical forest. Once upon a time, in a land far away,",
+        return await self.engine.async_generate(
+            prompt="Write a very long story about a magical forest. Once upon a time, in a land far away,",
             sampling_params={
                 "temperature": 0,
                 "max_new_tokens": max_new_tokens,
                 "ignore_eos": True,
             },
+            stream=False,
         )
-        generator = self.engine.tokenizer_manager.generate_request(obj, None)
-        return await generator.__anext__()
 
     async def _run_test_retract_mode(self):
         """Test pause_generation with retract mode using async."""

@@ -171,6 +171,7 @@ class Engine(EngineBase):
 
     async def async_generate(
         self,
+        prompt: list[str] | str | None = None,
         sampling_params: list[dict] | dict | None = None,
         # The token ids for text; one can either specify text or input_ids.
         input_ids: list[list[int]] | list[int] | None = None,
@@ -189,6 +190,7 @@ class Engine(EngineBase):
             sampling_params = self.get_default_sampling_params()
 
         obj = GenerateReqInput(
+            text=prompt,
             input_ids=input_ids,
             sampling_params=sampling_params,
             return_logprob=return_logprob,
