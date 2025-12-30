@@ -53,6 +53,9 @@ tpu = [
 gpu = [
     "jax[cuda12]==0.8.1",
 ]
+cpu = [
+    "jax[cpu]==0.8.1",
+]
 all = [
     "jax[tpu]==0.8.1",
 ]
