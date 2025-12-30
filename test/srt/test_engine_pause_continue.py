@@ -1,9 +1,10 @@
+import asyncio
 import time
 import unittest
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from sgl_jax.srt.entrypoints.engine import Engine
 from sgl_jax.srt.hf_transformers_utils import get_tokenizer
+from sgl_jax.srt.managers.io_struct import GenerateReqInput
 from sgl_jax.test.test_utils import QWEN3_8B, CustomTestCase
 
 
@@ -27,7 +28,7 @@ class TestEnginePauseContinue(CustomTestCase):
     """
     Test pause_generation and continue_generation using Engine API directly.
 
-    Uses synchronous methods from Engine class.
+    Uses async/await pattern to avoid multi-threading event loop conflicts.
     """
 
     @classmethod
@@ -53,46 +54,57 @@ class TestEnginePauseContinue(CustomTestCase):
             log_requests=False,
         )
         cls.tokenizer = get_tokenizer(cls.model_path)
-        cls.test_prompt = (
-            "Write a very long story about a magical forest. Once upon a time, in a land far away,"
-        )
 
     @classmethod
     def tearDownClass(cls):
         cls.engine.shutdown()
 
-    def _get_internal_state(self):
-        """Get internal state using synchronous method."""
-        server_info = self.engine.get_server_info()
-        return server_info["internal_states"][0]
+    async def _async_get_internal_state(self):
+        """Get internal state using Engine's async API."""
+        server_info = await self.engine.async_get_server_info()
+        return server_info["internal_states"]
 
-    def _generate(self, max_new_tokens: int = 2000):
-        """Generate using synchronous method."""
-        return self.engine.generate(
-            prompt=self.test_prompt,
+    async def _async_pause_generation(self, mode: str):
+        """Pause generation using Engine's async API."""
+        await self.engine.async_pause_generation(mode=mode)
+
+    async def _async_continue_generation(self):
+        """Continue generation using Engine's async API."""
+        await self.engine.async_continue_generation()
+
+    async def _async_generate(self, max_new_tokens: int = 2000):
+        """Generate using async method."""
+        obj = GenerateReqInput(
+            text="Write a very long story about a magical forest. Once upon a time, in a land far away,",
             sampling_params={
                 "temperature": 0,
                 "max_new_tokens": max_new_tokens,
                 "ignore_eos": True,
             },
         )
+        generator = self.engine.tokenizer_manager.generate_request(obj, None)
+        return await generator.__anext__()
 
-    def test_1_pause_generation_retract_mode(self):
-        """Test pause_generation with retract mode."""
-        # Get initial state
-        initial_internal = self._get_internal_state()
+    async def _run_test_retract_mode(self):
+        """Test pause_generation with retract mode using async."""
+        # Get initial state (returns list of dicts, take first one)
+        initial_states = await self._async_get_internal_state()
+        initial_internal = initial_states[0]
         initial_available_tokens = initial_internal["available_kv_tokens"]
 
         # Start multiple long-running requests concurrently
         num_requests = 8
-        executor = ThreadPoolExecutor(max_workers=num_requests)
-        futures = [executor.submit(self._generate, 2000) for _ in range(num_requests)]
+        tasks = [
+            asyncio.create_task(self._async_generate(max_new_tokens=2000))
+            for _ in range(num_requests)
+        ]
 
         # Wait a bit for requests to start generating
-        time.sleep(3)
+        await asyncio.sleep(3)
 
         # Get state before pause
-        internal_before = self._get_internal_state()
+        states_before = await self._async_get_internal_state()
+        internal_before = states_before[0]
 
         # Verify there are requests in running batch
         running_before_pause = internal_before["running_batch_size"]
@@ -110,13 +122,14 @@ class TestEnginePauseContinue(CustomTestCase):
         )
 
         # Pause generation with retract mode
-        self.engine.pause_generation(mode="retract")
+        await self._async_pause_generation(mode="retract")
 
         # Wait for pause to take effect
-        time.sleep(0.5)
+        await asyncio.sleep(0.5)
 
         # Get state after pause
-        internal_after = self._get_internal_state()
+        states_after = await self._async_get_internal_state()
+        internal_after = states_after[0]
 
         # Verify engine is paused
         self.assertTrue(
@@ -174,16 +187,10 @@ class TestEnginePauseContinue(CustomTestCase):
         )
 
         # Continue generation
-        self.engine.continue_generation()
+        await self._async_continue_generation()
 
         # Wait for all tasks to complete
-        results = []
-        for future in as_completed(futures):
-            try:
-                results.append(future.result())
-            except Exception as e:
-                results.append(e)
-        executor.shutdown(wait=True)
+        results = await asyncio.gather(*tasks, return_exceptions=True)
 
         # Verify all requests completed successfully
         for result in results:
@@ -197,20 +204,21 @@ class TestEnginePauseContinue(CustomTestCase):
                 f"Request should finish due to length limit: {result}",
             )
 
-        print_test_passed("TestEnginePauseContinue.test_1_pause_generation_retract_mode")
-
-    def test_2_pause_generation_in_place_mode(self):
-        """Test pause_generation with in_place mode."""
+    async def _run_test_in_place_mode(self):
+        """Test pause_generation with in_place mode using async."""
         # Start multiple long-running requests concurrently
         num_requests = 8
-        executor = ThreadPoolExecutor(max_workers=num_requests)
-        futures = [executor.submit(self._generate, 2000) for _ in range(num_requests)]
+        tasks = [
+            asyncio.create_task(self._async_generate(max_new_tokens=2000))
+            for _ in range(num_requests)
+        ]
 
         # Wait a bit for requests to start generating
-        time.sleep(3)
+        await asyncio.sleep(3)
 
-        # Get state before pause
-        internal_before = self._get_internal_state()
+        # Get state before pause (returns list, take first)
+        states_before = await self._async_get_internal_state()
+        internal_before = states_before[0]
 
         # Verify there are requests in running batch
         running_before = internal_before["running_batch_size"]
@@ -222,13 +230,14 @@ class TestEnginePauseContinue(CustomTestCase):
         waiting_before_pause = internal_before["waiting_queue_size"]
 
         # Pause generation with in_place mode
-        self.engine.pause_generation(mode="in_place")
+        await self._async_pause_generation(mode="in_place")
 
         # Wait for pause to take effect
-        time.sleep(0.5)
+        await asyncio.sleep(0.5)
 
         # Get state after pause
-        internal_after = self._get_internal_state()
+        states_after = await self._async_get_internal_state()
+        internal_after = states_after[0]
 
         # Verify engine is paused
         self.assertTrue(
@@ -268,16 +277,10 @@ class TestEnginePauseContinue(CustomTestCase):
         )
 
         # Continue generation
-        self.engine.continue_generation()
+        await self._async_continue_generation()
 
         # Wait for all tasks to complete
-        results = []
-        for future in as_completed(futures):
-            try:
-                results.append(future.result())
-            except Exception as e:
-                results.append(e)
-        executor.shutdown(wait=True)
+        results = await asyncio.gather(*tasks, return_exceptions=True)
 
         # Verify all requests completed
         for result in results:
@@ -285,49 +288,40 @@ class TestEnginePauseContinue(CustomTestCase):
                 self.fail(f"Request failed with exception: {result}")
             self.assertIn("text", result, f"Request should have text output: {result}")
 
-        print_test_passed("TestEnginePauseContinue.test_2_pause_generation_in_place_mode")
-
-    def test_3_pause_continue_multiple_cycles(self):
-        """Test multiple pause/continue cycles."""
+    async def _run_test_multiple_cycles(self):
+        """Test multiple pause/continue cycles using async."""
         num_cycles = 3
 
         # Start requests concurrently
-        executor = ThreadPoolExecutor(max_workers=4)
-        futures = [executor.submit(self._generate, 3000) for _ in range(4)]
+        tasks = [asyncio.create_task(self._async_generate(max_new_tokens=3000)) for _ in range(4)]
 
         for cycle in range(num_cycles):
             # Wait for some generation to happen
-            time.sleep(2)
+            await asyncio.sleep(2)
 
             # Pause with alternating modes
             mode = "retract" if cycle % 2 == 0 else "in_place"
-            self.engine.pause_generation(mode=mode)
+            await self._async_pause_generation(mode=mode)
 
             # Verify paused
-            internal = self._get_internal_state()
+            states = await self._async_get_internal_state()
             self.assertTrue(
-                internal["engine_paused"],
+                states[0]["engine_paused"],
                 f"Cycle {cycle}: engine should be paused",
             )
 
             # Continue
-            self.engine.continue_generation()
+            await self._async_continue_generation()
 
             # Verify not paused
-            internal = self._get_internal_state()
+            states = await self._async_get_internal_state()
             self.assertFalse(
-                internal["engine_paused"],
+                states[0]["engine_paused"],
                 f"Cycle {cycle}: engine should not be paused after continue",
             )
 
         # Wait for all tasks to complete
-        results = []
-        for future in as_completed(futures):
-            try:
-                results.append(future.result())
-            except Exception as e:
-                results.append(e)
-        executor.shutdown(wait=True)
+        results = await asyncio.gather(*tasks, return_exceptions=True)
 
         # Verify all requests completed
         for i, result in enumerate(results):
@@ -335,20 +329,21 @@ class TestEnginePauseContinue(CustomTestCase):
                 self.fail(f"Request {i} failed with exception: {result}")
             self.assertIn("text", result, f"Request {i} should have text output: {result}")
 
-        print_test_passed("TestEnginePauseContinue.test_3_pause_continue_multiple_cycles")
-
-    def test_4_pause_generation_abort_mode(self):
-        """Test pause_generation with abort mode."""
+    async def _run_test_abort_mode(self):
+        """Test pause_generation with abort mode using async."""
         # Start multiple long-running requests concurrently
         num_requests = 8
-        executor = ThreadPoolExecutor(max_workers=num_requests)
-        futures = [executor.submit(self._generate, 2000) for _ in range(num_requests)]
+        tasks = [
+            asyncio.create_task(self._async_generate(max_new_tokens=2000))
+            for _ in range(num_requests)
+        ]
 
         # Wait a bit for requests to start generating
-        time.sleep(3)
+        await asyncio.sleep(3)
 
         # Get state before pause
-        internal_before = self._get_internal_state()
+        states_before = await self._async_get_internal_state()
+        internal_before = states_before[0]
 
         # Verify there are requests in running batch or waiting queue
         running_before = internal_before["running_batch_size"]
@@ -359,13 +354,14 @@ class TestEnginePauseContinue(CustomTestCase):
         )
 
         # Pause generation with abort mode
-        self.engine.pause_generation(mode="abort")
+        await self._async_pause_generation(mode="abort")
 
         # Wait for abort to complete
-        time.sleep(1)
+        await asyncio.sleep(1)
 
         # Get state after pause
-        internal_after = self._get_internal_state()
+        states_after = await self._async_get_internal_state()
+        internal_after = states_after[0]
 
         # Verify waiting queue is empty (abort clears waiting queue)
         waiting_after = internal_after["waiting_queue_size"]
@@ -376,13 +372,7 @@ class TestEnginePauseContinue(CustomTestCase):
         self.assertEqual(running_after, 0, "Running batch should be empty after abort mode pause")
 
         # Wait for all tasks to complete
-        results = []
-        for future in as_completed(futures):
-            try:
-                results.append(future.result())
-            except Exception as e:
-                results.append(e)
-        executor.shutdown(wait=True)
+        results = await asyncio.gather(*tasks, return_exceptions=True)
 
         # Verify all requests completed with abort status
         for i, result in enumerate(results):
@@ -403,8 +393,26 @@ class TestEnginePauseContinue(CustomTestCase):
                 )
 
         # Continue generation to reset state (abort mode sets is_pause=True)
-        self.engine.continue_generation()
+        await self._async_continue_generation()
 
+    def test_1_pause_generation_retract_mode(self):
+        """Test pause_generation with retract mode."""
+        self.engine.loop.run_until_complete(self._run_test_retract_mode())
+        print_test_passed("TestEnginePauseContinue.test_1_pause_generation_retract_mode")
+
+    def test_2_pause_generation_in_place_mode(self):
+        """Test pause_generation with in_place mode."""
+        self.engine.loop.run_until_complete(self._run_test_in_place_mode())
+        print_test_passed("TestEnginePauseContinue.test_2_pause_generation_in_place_mode")
+
+    def test_3_pause_continue_multiple_cycles(self):
+        """Test multiple pause/continue cycles."""
+        self.engine.loop.run_until_complete(self._run_test_multiple_cycles())
+        print_test_passed("TestEnginePauseContinue.test_3_pause_continue_multiple_cycles")
+
+    def test_4_pause_generation_abort_mode(self):
+        """Test pause_generation with abort mode."""
+        self.engine.loop.run_until_complete(self._run_test_abort_mode())
         print_test_passed("TestEnginePauseContinue.test_4_pause_generation_abort_mode")
 
 

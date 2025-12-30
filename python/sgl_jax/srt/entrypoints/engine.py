@@ -278,6 +278,37 @@ class Engine(EngineBase):
         self.shutdown()
         return False
 
+    async def async_flush_cache(self):
+        """
+        Descriptioin: requests will be sent to tokenizer manager. It will flush all cache: tree_cache, req_to_token_pool, token_to_kv_pool_allocator(free physical cache through allocator)
+        """
+        return await self.tokenizer_manager.flush_cache()
+
+    async def async_pause_generation(self, mode: str = "retract"):
+        """
+        Input: the pause generation mode: ["abort", "retract", "in-place"]
+
+        Description: Deal with requests according to mode. Now support abort, in_place and retract.
+        """
+        obj = PauseGenerationReqInput(mode=mode)
+        return await self.tokenizer_manager.pause_generation(obj)
+
+    async def async_continue_generation(self):
+        """
+        Description: continue previous paused generation
+        """
+        obj = ContinueGenerationReqInput()
+        return await self.tokenizer_manager.continue_generation(obj)
+
+    async def async_get_server_info(self):
+        internal_states = await self.tokenizer_manager.get_internal_state()
+        return {
+            **dataclasses.asdict(self.tokenizer_manager.server_args),
+            **self.scheduler_info,
+            "internal_states": internal_states,
+            "version": __version__,
+        }
+
     def flush_cache(self):
         """
         Descriptioin: requests will be sent to tokenizer manager. It will flush all cache: tree_cache, req_to_token_pool, token_to_kv_pool_allocator(free physical cache through allocator)
