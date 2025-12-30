@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from typing import Callable, List, Optional
 
 from sgl_jax.srt.utils import kill_process_tree
+from sgl_jax.test.test_utils import managed_subprocess
 
 
 @dataclass
@@ -91,14 +92,14 @@ def run_unittest_files(files: List[TestFile], timeout_per_file: float):
                     test_path = f"{module_name}.{method}"
                     print(f"Running: python3 -m unittest {test_path}\n", flush=True)
 
-                    process = subprocess.Popen(
+                    with managed_subprocess(
                         ["uv", "run", "python3", "-m", "unittest", test_path],
                         stdout=sys.stdout,
                         stderr=sys.stderr,
                         env=os.environ,
                         cwd=os.path.dirname(filename),
-                    )
-                    process.wait()
+                    ) as process:
+                        process.wait()
 
                     # If any test fails, return immediately
                     if process.returncode != 0:
@@ -115,13 +116,13 @@ def run_unittest_files(files: List[TestFile], timeout_per_file: float):
                     flush=True,
                 )
 
-                process = subprocess.Popen(
+                with managed_subprocess(
                     ["uv", "run", "python3", filename],
                     stdout=sys.stdout,
                     stderr=sys.stderr,
                     env=os.environ,
-                )
-                process.wait()
+                ) as process:
+                    process.wait()
 
             elapsed = time.perf_counter() - tic
             print(
@@ -137,7 +138,9 @@ def run_unittest_files(files: List[TestFile], timeout_per_file: float):
             ret_code = run_with_timeout(run_one_file, args=(filename,), timeout=timeout_per_file)
             assert ret_code == 0, f"expected return code 0, but {filename} returned {ret_code}"
         except TimeoutError:
-            kill_process_tree(process.pid)
+            # Context manager should have already cleaned up, but check as a safeguard
+            if process is not None and process.poll() is None:
+                kill_process_tree(process.pid)
             time.sleep(5)
             print(
                 f"\nTimeout after {timeout_per_file} seconds when running {filename}\n",

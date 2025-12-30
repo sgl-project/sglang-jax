@@ -10,6 +10,7 @@ import threading
 import time
 import unittest
 from collections.abc import Awaitable, Callable, Sequence
+import contextlib
 from contextlib import nullcontext, suppress
 from types import SimpleNamespace
 
@@ -288,6 +289,34 @@ def kill_process_tree(parent_pid, include_parent: bool = True, skip_pid: int = N
             # Sometime processes cannot be killed with SIGKILL (e.g, PID=1 launched by kubernetes),
             # so we send an additional signal to kill them.
             itself.send_signal(signal.SIGQUIT)
+
+
+@contextlib.contextmanager
+def managed_subprocess(*args, **kwargs):
+    """Context manager for subprocess.Popen with automatic cleanup.
+
+    This ensures that subprocesses are properly cleaned up even if
+    an exception occurs, preventing ResourceWarning about leaked processes.
+
+    Usage:
+        with managed_subprocess(["cmd", "arg"]) as proc:
+            proc.wait()
+            # or proc.communicate()
+
+    Args:
+        *args: Positional arguments passed to subprocess.Popen
+        **kwargs: Keyword arguments passed to subprocess.Popen
+
+    Yields:
+        subprocess.Popen: The created process object
+    """
+    process = None
+    try:
+        process = subprocess.Popen(*args, **kwargs)
+        yield process
+    finally:
+        if process is not None and process.poll() is None:
+            kill_process_tree(process.pid)
 
 
 def generate_server_args() -> ServerArgs:
