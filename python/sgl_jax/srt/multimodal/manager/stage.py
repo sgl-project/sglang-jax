@@ -20,6 +20,7 @@ class Stage:
             dcn_parallelism=[1, 1],
             device_indexes=device_manager.allocate(stage_config.runtime.num_tpus),
         )
+        self.stage_config = stage_config
         # mesh
 
     def set_in_queue(self, in_queue: Queue):
@@ -35,8 +36,17 @@ class Stage:
         print(f"stage start {self.stage_index}")
         # todo according to config to decide which scheduler to use
         scheduler_class = get_scheduler_class(self.stage_config.scheduler)
-        self._stage_scheduler = scheduler_class(**self.stage_config.scheduler_params)
+        self._stage_scheduler = scheduler_class(
+            in_queue=self._in_queue, out_queue=self._out_queue, **self.stage_config.scheduler_params
+        )
         self._stage_scheduler.event_loop()
+
+    def try_collect(self):
+        assert self._out_queue is not None
+        try:
+            return self._out_queue.get_nowait()
+        except Exception:
+            return None
 
 
 def get_scheduler_class(name: str):

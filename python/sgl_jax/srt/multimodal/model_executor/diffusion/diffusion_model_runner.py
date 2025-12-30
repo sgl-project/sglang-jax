@@ -4,13 +4,13 @@ import time
 import jax
 import jax.numpy as jnp
 
-from python.sgl_jax.srt.model_loader.loader import get_model_loader
-from python.sgl_jax.srt.multimodal.configs.dits.configs import WanModelConfig
-from python.sgl_jax.srt.multimodal.manager.io_struct import VideoGenerationsRequest
-from python.sgl_jax.srt.multimodal.models.diffusion_solvers.unipc_multistep_scheduler import (
+from sgl_jax.srt.model_executor.base_model_runner import BaseModelRunner
+from sgl_jax.srt.model_loader.loader import get_model_loader
+from sgl_jax.srt.multimodal.configs.dits.configs import WanModelConfig
+from sgl_jax.srt.multimodal.manager.io_struct import VideoGenerationsRequest
+from sgl_jax.srt.multimodal.models.diffusion_solvers.unipc_multistep_scheduler import (
     UniPCMultistepScheduler,
 )
-from sgl_jax.srt.model_executor.base_model_runner import BaseModelRunner
 
 logger = logging.getLogger(__name__)
 

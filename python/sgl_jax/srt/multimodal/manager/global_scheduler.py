@@ -9,12 +9,14 @@ import psutil
 import setproctitle
 import zmq
 
+from sgl_jax.srt.multimodal.manager.io_struct import TokenizedGenerateMMReqInput
+from sgl_jax.srt.multimodal.manager.schedule_batch import Req
 from sgl_jax.srt.multimodal.manager.stage import Stage
 from sgl_jax.srt.multimodal.manager.utils import load_stage_configs_from_yaml
 from sgl_jax.srt.server_args import PortArgs, ServerArgs
 from sgl_jax.srt.utils import configure_logger, kill_itself_when_parent_died
 from sgl_jax.srt.utils.common_utils import get_zmq_socket
-from sgl_jax.utils import get_exception_traceback
+from sgl_jax.utils import TypeBasedDispatcher, get_exception_traceback
 
 logger = logging.getLogger(__name__)
 
@@ -30,7 +32,7 @@ class GlobalScheduler:
         )
 
         self.stage_configs = load_stage_configs_from_yaml(
-            "../models/static_configs/wan2_1_stage_config.yaml"
+            "/home/gcpuser/sky_workdir/sglang-jax/python/sgl_jax/srt/multimodal/models/static_configs/wan2_1_stage_config.yaml"
         )
         self._init_stage()
 
@@ -58,6 +60,23 @@ class GlobalScheduler:
             stage.set_out_queue(self.out_queues[i])
             stage.set_stage_index(i)
         self.start_stage()
+        self._request_dispatcher = TypeBasedDispatcher(
+            [
+                (TokenizedGenerateMMReqInput, self.convert_request),
+            ]
+        )
+
+    def convert_request(self, input: TokenizedGenerateMMReqInput):
+        req = Req(
+            rid=input.rid,
+            input_ids=input.input_ids,
+            negative_input_ids=input.negative_input_ids,
+            num_outputs_per_prompt=input.n,
+            height_latents=int(input.size.split("*")[0]),
+            width_latents=int(input.size.split("*")[1]),
+            num_frames=input.num_frames,
+        )
+        return req
 
     def start_stage(self):
         import threading
@@ -85,10 +104,18 @@ class GlobalScheduler:
             time.sleep(3)
             if reqs:
                 for req in reqs:
-                    self.in_queues[0].put_nowait(req)
+                    self.in_queues[0].put_nowait(self._request_dispatcher(req))
             else:
-                ## todo: try to collect result, and return to detokenizer
-                self.send_to_detokenizer.send_pyobj(reqs)
+                for i, stage in enumerate(self.stage_list):
+                    stage_result = stage.try_collect()
+                    print("stage result", stage_result)
+                    if stage_result is None:
+                        continue
+                    else:
+                        if self.stage_configs[i].final_output:
+                            self.send_to_detokenizer.send_pyobj(stage_result)
+                        else:
+                            self.in_queues[i + 1].put_nowait(stage_result)
 
 
 def run_global_scheduler_process(
