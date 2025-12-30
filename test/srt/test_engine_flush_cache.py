@@ -383,7 +383,9 @@ class TestEngineFlushCache(CustomTestCase):
             print(
                 f"    available_kv_tokens: {Colors.GREEN}{after_gen['available_kv_tokens']}{Colors.RESET}"
             )
-            print(f"    tree_cache_size: {Colors.GREEN}{after_gen['tree_cache_size']}{Colors.RESET}")
+            print(
+                f"    tree_cache_size: {Colors.GREEN}{after_gen['tree_cache_size']}{Colors.RESET}"
+            )
             print(
                 f"    req_to_token_pool_used: {Colors.GREEN}{after_gen['req_to_token_pool_used']}{Colors.RESET}"
             )
