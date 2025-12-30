@@ -90,24 +90,6 @@ class LogitsProcessorOutput:
 
         return obj
 
-    def truncate_logits_processor_output(self, batch: "ModelWorkerBatch"):
-        from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
-
-        # note: here only need to truncate next_token_logits and hidden_states
-        if batch.forward_mode == ForwardMode.TARGET_VERIFY:
-            # For ForwardMode.TARGET_VERIFY mode, we should take draft_token_num token for tree verify later
-            self.next_token_logits = self.next_token_logits[
-                0 : batch.real_bs * batch.spec_info.draft_token_num
-            ]
-
-        else:
-            self.next_token_logits = self.next_token_logits[0 : batch.real_bs]
-            if len(self.hidden_states.shape) == 1:
-                self.hidden_states = jnp.expand_dims(self.hidden_states, axis=0)
-            self.hidden_states = self.hidden_states[0 : batch.real_bs]
-
-        # assert not batch.capture_hidden_mode.need_capture()
-
 
 @register_pytree_node_class
 @dataclasses.dataclass
@@ -119,6 +101,7 @@ class LogitsMetadata:
     extend_return_top_logprob: bool = False
     extend_token_ids_logprob: bool = False
     extend_seq_lens: jax.Array | None = None
+    accept_lens: jax.Array | None = None
     extend_seq_lens_cpu: list[int] | None = None
     extend_logprob_start_lens_cpu: list[int] | None = None
     extend_logprob_pruned_lens_cpu: list[int] | None = None
@@ -135,6 +118,7 @@ class LogitsMetadata:
     def tree_flatten(self):
         children = (
             self.extend_seq_lens,
+            self.accept_lens,
             self.extend_input_logprob_token_ids_device,
             self.temperature,
             self.top_p,
@@ -162,9 +146,10 @@ class LogitsMetadata:
         obj = cls.__new__(cls)
 
         obj.extend_seq_lens = children[0]
-        obj.extend_input_logprob_token_ids_device = children[1]
-        obj.temperature = children[2]
-        obj.top_p = children[3]
+        obj.accept_lens = children[1]
+        obj.extend_input_logprob_token_ids_device = children[2]
+        obj.temperature = children[3]
+        obj.top_p = children[4]
 
         obj.forward_mode = aux_data["forward_mode"]
         obj.capture_hidden_mode = aux_data["capture_hidden_mode"]
@@ -210,6 +195,13 @@ class LogitsMetadata:
             extend_return_top_logprob=extend_return_top_logprob,
             extend_token_ids_logprob=extend_token_ids_logprob,
             extend_seq_lens=device_array(batch.extend_seq_lens, sharding=sharding),
+            accept_lens=(
+                device_array(batch.spec_info.accept_length, sharding=sharding)
+                if batch.spec_info is not None
+                and hasattr(batch.spec_info, "accept_length")
+                and batch.spec_info.accept_length is not None
+                else None
+            ),
             extend_seq_lens_cpu=extend_seq_lens_cpu,
             extend_logprob_start_lens_cpu=(
                 batch.extend_logprob_start_lens.tolist()
@@ -251,6 +243,16 @@ class LogitsProcessor(nnx.Module):
             input_logprob_indices = None
         elif logits_metadata.forward_mode.is_extend() and not logits_metadata.extend_return_logprob:
             last_index = jnp.cumsum(logits_metadata.extend_seq_lens, axis=0) - 1
+            if (
+                logits_metadata.forward_mode.is_draft_extend()
+                and logits_metadata.accept_lens is not None
+            ):
+                # if accpet_lens is [1, 1, 2, 1, 1]
+                #    extend_seq_lens is [4,4,4,4,4]
+                #    last_index should be [1, 5, 9, 13, 17] - 1 = [0,4,8,12,16]
+                last_index = last_index - (
+                    logits_metadata.extend_seq_lens - logits_metadata.accept_lens
+                )
             pruned_states = hidden_states[last_index]
             if aux_hidden_states is not None:
                 aux_pruned_states = [hidden[last_index] for hidden in aux_hidden_states]

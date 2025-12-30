@@ -51,7 +51,7 @@ class LlamaDecoderLayer(LlamaDecoderLayer):
         layer_id: int = 0,
         dtype: jnp.dtype = jnp.bfloat16,
     ) -> None:
-        super().__init__(config, layer_id, dtype=dtype, mesh=mesh)
+        super().__init__(config, mesh=mesh, layer_id=layer_id, dtype=dtype)
 
         # override qkv
         attention_bias = getattr(config, "attention_bias", False) or getattr(config, "bias", False)

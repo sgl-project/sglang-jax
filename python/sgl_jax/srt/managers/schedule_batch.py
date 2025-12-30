@@ -1109,19 +1109,7 @@ class ScheduleBatch:
         cache_loc_paddings: list,
         page_size: int,
         enable_static_lora: bool = False,
-        skip_padding: bool = False,
     ) -> ModelWorkerBatch:
-        if skip_padding:
-            # FIXME(pc) spec decode model_worker_batch will be modified at decode stage, and padding laterly
-            # this may has some redundant code, we need clear future
-            return self.get_spec_model_worker_batch(
-                token_paddings=token_paddings,
-                bs_paddings=bs_paddings,
-                cache_loc_paddings=cache_loc_paddings,
-                page_size=page_size,
-                skip_padding=skip_padding,
-            )
-
         if self.forward_mode.is_decode_or_idle():
             extend_seq_lens = extend_prefix_lens = extend_logprob_start_lens = None
             token_paddings = bs_paddings
@@ -1397,9 +1385,8 @@ class ScheduleBatch:
         bs_paddings: list,
         cache_loc_paddings: list,
         page_size: int,
-        skip_padding: bool = False,
+        enable_static_lora: bool = False,
     ) -> ModelWorkerBatch:
-
         if self.forward_mode.is_decode_or_idle():
             extend_seq_lens = extend_prefix_lens = extend_logprob_start_lens = None
         else:
@@ -1421,7 +1408,6 @@ class ScheduleBatch:
         real_bs = len(seq_lens_cpu)
         req_pool_indices_cpu = self.req_pool_indices
         token_indices_with_all_reqs = self.req_to_token_pool.req_to_token[self.req_pool_indices]
-
         # FIXME @pc, move this to eagle_worker
         # If enable spec inference, use positions in spec info firstly
         if self.spec_info is not None and getattr(self.spec_info, "positions", None) is not None:
@@ -1532,11 +1518,10 @@ class ScheduleBatch:
 
         if precision_tracer.get_trace_active():
             self._generate_trace_info(real_bs, bid)
-
         # Extract lora_ids from requests
         lora_ids = [req.lora_id for req in self.reqs]
 
-        res = ModelWorkerBatch(
+        return ModelWorkerBatch(
             bid=bid,
             forward_mode=self.forward_mode,
             input_ids=input_ids_cpu,
@@ -1572,14 +1557,6 @@ class ScheduleBatch:
             spec_algorithm=self.spec_algorithm,
             tree_cache=self.tree_cache,
         )
-        if skip_padding:
-            return res
-        res.padding_model_worker_batch(
-            token_paddings=token_paddings,
-            bs_paddings=bs_paddings,
-            cache_loc_paddings=cache_loc_paddings,
-        )
-        return res
 
     def _generate_trace_info(self, real_bs: int, bid: int) -> list[str]:
         for req in self.reqs[:real_bs]:
@@ -1744,215 +1721,6 @@ class ModelWorkerBatch:
     capture_hidden_mode: CaptureHiddenMode = None
 
     tree_cache: BasePrefixCache = None
-
-    def padding_model_worker_batch(
-        self,
-        token_paddings: list,
-        bs_paddings: list,
-        cache_loc_paddings: list,
-    ):
-        if self.forward_mode.is_decode_or_idle():
-            token_paddings = bs_paddings
-        else:
-            bs_paddings = bs_paddings[-1:]
-            cache_loc_paddings = cache_loc_paddings[-1:]
-        # padding seq
-        # extend & decode: input_ids, positions, out_cache_loc, cache_loc
-        padding_size = 0
-        token_paddings.sort()
-        for size in token_paddings:
-            if size >= len(self.input_ids):
-                padding_size = size - len(self.input_ids)
-                break
-        if padding_size >= 0:
-            input_ids_cpu = np.concat(
-                [
-                    self.input_ids,
-                    np.array([0] * padding_size, dtype=np.int32),
-                ],
-                axis=0,
-            )
-        padded_input_ids_len = len(input_ids_cpu)
-        out_cache_loc_num_to_padding = padded_input_ids_len - len(self.out_cache_loc)
-        if out_cache_loc_num_to_padding >= 0:
-            out_cache_loc_cpu = np.concatenate(
-                [
-                    self.out_cache_loc,
-                    np.array(
-                        [-1] * out_cache_loc_num_to_padding,
-                        dtype=self.out_cache_loc.dtype,
-                    ),
-                ],
-                axis=0,
-            )
-        else:
-            # this maybe more than input_ids when eagle, but it will always be fix shape, so we should'd padding this
-            out_cache_loc_cpu = self.out_cache_loc
-        # todo padding position
-        seq_lens_cpu = self.seq_lens
-        bs_padding_size = 0
-        bs_paddings.sort()
-        select_bs_index = -1
-        for i, size in enumerate(bs_paddings):
-            if size >= len(seq_lens_cpu):
-                bs_padding_size = size - len(seq_lens_cpu)
-                select_bs_index = i
-                break
-        # offset = np.sum(seq_lens_cpu[seq_lens_cpu > 0]) if len(seq_lens_cpu) > 0 else 0
-
-        total_cache_loc_size = cache_loc_paddings[select_bs_index]
-        assert total_cache_loc_size >= len(self.cache_loc)
-
-        cache_loc_cpu = np.empty(total_cache_loc_size, dtype=np.int32)
-        if len(self.cache_loc) > 0:
-            cache_loc_cpu[: len(self.cache_loc)] = self.cache_loc
-        # Initialize padding area to ensure multiprocess consistency
-        if len(self.cache_loc) < total_cache_loc_size:
-            cache_loc_cpu[len(self.cache_loc) :] = 0
-        extend_start_loc = self.extend_start_loc
-        extend_prefix_lens = self.extend_prefix_lens
-        extend_seq_lens = self.extend_seq_lens
-        req_pool_indices_cpu = self.req_pool_indices
-        if bs_padding_size > 0:
-            invalid_req_pool_indices = np.array(
-                [-1] * bs_padding_size, dtype=self.req_pool_indices.dtype
-            )
-            req_pool_indices_cpu = np.concat(
-                [
-                    self.req_pool_indices,
-                    invalid_req_pool_indices,
-                ],
-                axis=0,
-            )
-            invalid_seq_lens = np.array([0] * bs_padding_size, dtype=seq_lens_cpu.dtype)
-            seq_lens_cpu = np.concat([seq_lens_cpu, invalid_seq_lens], axis=0)
-
-            # Pad lora_ids if present
-            if self.lora_ids is not None:
-                self.lora_ids = self.lora_ids + [None] * bs_padding_size
-
-            if self.forward_mode.is_extend():
-                invalid_extend_start_loc = np.array(
-                    [self.extend_start_loc[-1] + self.extend_seq_lens[-1]] * bs_padding_size,
-                    dtype=(
-                        self.extend_start_loc.dtype
-                        if self.extend_start_loc is not None
-                        else np.int32
-                    ),
-                )
-                extend_start_loc = np.concat(
-                    [self.extend_start_loc, invalid_extend_start_loc], axis=0
-                )
-                invalid_extend_prefix_lens = np.array(
-                    [0] * bs_padding_size,
-                    dtype=np.int32,
-                )
-                extend_prefix_lens = (
-                    np.concat([self.extend_prefix_lens, invalid_extend_prefix_lens], axis=0)
-                    if self.extend_prefix_lens is not None
-                    and invalid_extend_prefix_lens.shape[0] > 0
-                    and self.extend_prefix_lens.shape[0] > 0
-                    else self.extend_prefix_lens
-                )
-                invalid_extend_seq_lens = np.array(
-                    [0] * bs_padding_size,
-                    dtype=(
-                        self.extend_seq_lens.dtype if self.extend_seq_lens is not None else np.int32
-                    ),
-                )
-                extend_seq_lens = (
-                    np.concat([self.extend_seq_lens, invalid_extend_seq_lens], axis=0)
-                    if self.extend_seq_lens is not None
-                    and invalid_extend_seq_lens.shape[0] > 0
-                    and self.extend_seq_lens.shape[0] > 0
-                    else self.extend_seq_lens
-                )
-            else:
-                invalid_extend_start_loc = np.array(
-                    [len(seq_lens_cpu)] * bs_padding_size,
-                    dtype=(
-                        self.extend_start_loc.dtype
-                        if self.extend_start_loc is not None
-                        else np.int32
-                    ),
-                )
-                extend_start_loc = np.concat(
-                    [self.extend_start_loc, invalid_extend_start_loc], axis=0
-                )
-                # padding
-        sampling_info = self.sampling_info
-        if self.sampling_info:
-            new_temperatures = np.concatenate(
-                [
-                    sampling_info.temperatures.reshape(sampling_info.temperatures.shape[0]),
-                    np.array([1.0] * bs_padding_size, dtype=sampling_info.temperatures.dtype),
-                ]
-            ).reshape(-1, 1)
-            new_top_ps = np.concatenate(
-                [
-                    sampling_info.top_ps,
-                    np.array([1.0] * bs_padding_size, dtype=sampling_info.top_ps.dtype),
-                ]
-            )
-            new_top_ks = np.concatenate(
-                [
-                    sampling_info.top_ks,
-                    np.array([1] * bs_padding_size, dtype=sampling_info.top_ks.dtype),
-                ]
-            )
-            new_min_ps = np.concatenate(
-                [
-                    sampling_info.min_ps,
-                    np.array([0.0] * bs_padding_size, dtype=sampling_info.min_ps.dtype),
-                ]
-            )
-            updates = {
-                "temperatures": new_temperatures,
-                "top_ps": new_top_ps,
-                "top_ks": new_top_ks,
-                "min_ps": new_min_ps,
-                # "grammars": ([req.grammar for req in self.reqs] if self.has_grammar else None),
-            }
-            if sampling_info.sampling_seeds is not None:
-                updates["sampling_seeds"] = np.concatenate(
-                    [
-                        sampling_info.sampling_seeds,
-                        np.array(
-                            [DEFAULT_SAMPLING_SEED] * bs_padding_size,
-                            dtype=sampling_info.sampling_seeds.dtype,
-                        ),
-                    ]
-                )
-            sampling_info = dataclasses.replace(sampling_info, **updates)
-        padding_size = 0
-        if (
-            self.forward_mode == ForwardMode.DRAFT_EXTEND
-            or self.forward_mode == ForwardMode.TARGET_VERIFY
-        ):
-            padding_size = len(input_ids_cpu) - len(self.positions)
-        elif self.forward_mode == ForwardMode.EXTEND or self.forward_mode == ForwardMode.MIXED:
-            total_tokens_before_padding = sum([extend_len for extend_len in extend_seq_lens])
-            padding_size = len(input_ids_cpu) - total_tokens_before_padding
-        elif not self.spec_algorithm.is_none() and self.forward_mode == ForwardMode.DECODE:
-            padding_size = len(input_ids_cpu) - len(self.positions)
-        else:
-            pass
-        if padding_size >= 0:
-            zeros_pad = np.zeros(padding_size, dtype=np.int32)
-            positions_cpu = np.concatenate([self.positions, zeros_pad], axis=0)
-        if len(positions_cpu) > len(input_ids_cpu):
-            positions_cpu = self.positions[: len(input_ids_cpu)]
-
-        self.seq_lens = seq_lens_cpu
-        self.extend_start_loc = extend_start_loc
-        self.extend_prefix_lens = extend_prefix_lens
-        self.extend_seq_lens = extend_seq_lens if self.forward_mode.is_extend() else None
-        self.cache_loc = cache_loc_cpu
-        self.input_ids = input_ids_cpu
-        self.out_cache_loc = out_cache_loc_cpu
-        self.req_pool_indices = req_pool_indices_cpu
-        self.positions = positions_cpu
-        self.sampling_info = sampling_info
 
 
 def get_last_loc(

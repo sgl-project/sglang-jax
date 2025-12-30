@@ -1181,14 +1181,12 @@ class Scheduler(
 
         # Run forward
         assert self.is_generation
-
+        (
+            precompile_token_paddings,
+            precompile_bs_paddings,
+            precompile_cache_loc_paddings,
+        ) = self.tp_worker.get_precompile_paddings()
         if self.spec_algorithm is None or self.spec_algorithm.is_none():
-            (
-                precompile_token_paddings,
-                precompile_bs_paddings,
-                precompile_cache_loc_paddings,
-            ) = self.tp_worker.get_precompile_paddings()
-
             model_worker_batch = batch.get_model_worker_batch(
                 precompile_token_paddings,
                 precompile_bs_paddings,
@@ -1218,20 +1216,12 @@ class Scheduler(
                     : model_worker_batch.real_bs
                 ]
         else:
-
-            (
-                precompile_token_paddings,
-                precompile_bs_paddings,
-                precompile_cache_loc_paddings,
-            ) = self.draft_worker.get_precompile_paddings()
-            model_worker_batch = batch.get_model_worker_batch(
+            model_worker_batch = batch.get_spec_model_worker_batch(
                 precompile_token_paddings,
                 precompile_bs_paddings,
                 precompile_cache_loc_paddings,
                 self.page_size,
                 self.server_args.enable_static_lora,
-                # eagle's model_worker_batch will be modified and repadding within eagle_worker
-                skip_padding=True,
             )
             batch_output = self.draft_worker.forward_batch_speculative_generation(
                 model_worker_batch
