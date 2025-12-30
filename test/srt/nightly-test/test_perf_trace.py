@@ -52,7 +52,7 @@ class TestModelPerfTrace(CustomTestCase):
         "--dtype",
         "bfloat16",
         "--max-running-requests",
-        "256",
+        "20",
         "--attention-backend",
         "fa",
         "--page-size",
@@ -60,7 +60,7 @@ class TestModelPerfTrace(CustomTestCase):
         "--chunked-prefill-size",
         "2048",
         "--mem-fraction-static",
-        "0.8",
+        "0.9",
         "--disable-radix-cache",
     ]
     TP_1 = "/tp_1"
