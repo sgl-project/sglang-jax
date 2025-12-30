@@ -136,7 +136,7 @@ class AbortReq(BaseReq):
     # Whether to abort all requests
     abort_all: bool = False
 
-    finished_reason: BaseFinishReason | None = None
+    finished_reason: dict[str, Any] | None = None
     aborted_message: str | None = None
 
 
