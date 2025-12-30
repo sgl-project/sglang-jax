@@ -367,4 +367,3 @@ jobs:
             GITHUB_RUN_NUMBER: ${{ github.run_number }}
           run: |
             python3 scripts/ci/publish_traces.py --traces-dir ./test/nightly_test_output
-  

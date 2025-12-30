@@ -91,7 +91,7 @@ class TestModelPerf(CustomTestCase):
 
         # define test parameters
         # concurrency levels
-        
+
         # input length levels (1k, 4k, 8k)
         input_lengths = [1024, 4096, 8192]
         # concurrency_levels = [8]
@@ -354,7 +354,7 @@ class TestModelPerf(CustomTestCase):
 
         # define test parameters
         # concurrency levels
-        
+
         # input length levels (1k, 4k, 8k)
         input_lengths = [1024, 4096, 8192]
 
@@ -743,7 +743,7 @@ class TestModelPerf(CustomTestCase):
 
         # define test parameters
         # concurrency levels
-        
+
         # input length levels (1k, 4k, 8k)
         input_lengths = [1024, 4096, 8192]
         # concurrency_levels = [8]
@@ -1124,7 +1124,7 @@ class TestModelPerf(CustomTestCase):
 
         # define test parameters
         # concurrency levels
-        
+
         # input length levels (1k, 4k, 8k)
         input_lengths = [1024, 4096, 8192]
         # concurrency_levels = [8]
@@ -1551,7 +1551,7 @@ class TestModelPerf(CustomTestCase):
     def test_qwen_7b_performance_tp_1_high_concurrency(self):
         concurrency_levels = [128, 256]
         self._test_qwen_7b_performance_tp_1(concurrency_levels)
-    
+
     def test_qwen3_8b_performance_tp_1_low_concurrency(self):
         concurrency_levels = [8, 16, 32, 64]
         self._test_qwen3_8b_performance_tp_1(concurrency_levels)
@@ -1575,6 +1575,7 @@ class TestModelPerf(CustomTestCase):
     def test_QWEN2_5_7B_INSTRUCT_performance_tp_1_high_concurrency(self):
         concurrency_levels = [128, 256]
         self._test_QWEN2_5_7B_INSTRUCT_performance_tp_1(concurrency_levels)
-    
+
+
 if __name__ == "__main__":
     unittest.main()

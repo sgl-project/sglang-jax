@@ -1593,11 +1593,11 @@ class TestModelPerfTrace(CustomTestCase):
     def test_qwen_7b_performance_trace_tp_1_high_concurrency(self):
         concurrency_levels = [128, 256]
         self._test_qwen_7b_performance_trace_tp_1(concurrency_levels)
-    
+
     def test_qwen3_8b_performance_trace_tp_1_low_concurrency(self):
         concurrency_levels = [8, 16, 32, 64]
         self._test_qwen3_8b_performance_trace_tp_1(concurrency_levels)
-        
+
     def test_qwen3_8b_performance_trace_tp_1_high_concurrency(self):
         concurrency_levels = [128, 256]
         self._test_qwen3_8b_performance_trace_tp_1(concurrency_levels)
@@ -1617,6 +1617,7 @@ class TestModelPerfTrace(CustomTestCase):
     def test_QWEN2_5_7B_INSTRUCT_performance_trace_tp_1_high_concurrency(self):
         concurrency_levels = [128, 256]
         self._test_QWEN2_5_7B_INSTRUCT_performance_trace_tp_1(concurrency_levels)
+
 
 if __name__ == "__main__":
     unittest.main()
