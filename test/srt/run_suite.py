@@ -210,21 +210,21 @@ suites = {
         ),
     ],
     "nightly-test-perf-text-models-tpu-v6e-1": [
-        # TestFile(
-        #     "nightly-test/test_perf.py",
-        #     estimated_time=7,
-        #     test_methods=["TestModelPerf.test_qwen_7b_performance_tp_1_low_concurrency"],
-        # ),
-        # TestFile(
-        #     "nightly-test/test_perf.py",
-        #     estimated_time=8,
-        #     test_methods=["TestModelPerf.test_qwen_7b_performance_tp_1_high_concurrency"],
-        # ),
-        # TestFile(
-        #     "nightly-test/test_perf.py",
-        #     estimated_time=2,
-        #     test_methods=["TestModelPerf.test_qwen3_8b_performance_tp_1_low_concurrency"],
-        # ),
+        TestFile(
+            "nightly-test/test_perf.py",
+            estimated_time=7,
+            test_methods=["TestModelPerf.test_qwen_7b_performance_tp_1_low_concurrency"],
+        ),
+        TestFile(
+            "nightly-test/test_perf.py",
+            estimated_time=8,
+            test_methods=["TestModelPerf.test_qwen_7b_performance_tp_1_high_concurrency"],
+        ),
+        TestFile(
+            "nightly-test/test_perf.py",
+            estimated_time=2,
+            test_methods=["TestModelPerf.test_qwen3_8b_performance_tp_1_low_concurrency"],
+        ),
         TestFile(
             "nightly-test/test_perf.py",
             estimated_time=2.5,
@@ -295,25 +295,25 @@ suites = {
         ),
     ],
     "nightly-test-perf-trace-text-models-tpu-v6e-1": [
-        # TestFile(
-        #     "nightly-test/test_perf_trace.py",
-        #     estimated_time=7,
-        #     test_methods=["TestModelPerfTrace.test_qwen_7b_performance_trace_tp_1_low_concurrency"],
-        # ),
-        # TestFile(
-        #     "nightly-test/test_perf_trace.py",
-        #     estimated_time=8,
-        #     test_methods=[
-        #         "TestModelPerfTrace.test_qwen_7b_performance_trace_tp_1_high_concurrency"
-        #     ],
-        # ),
-        # TestFile(
-        #     "nightly-test/test_perf_trace.py",
-        #     estimated_time=2,
-        #     test_methods=[
-        #         "TestModelPerfTrace.test_qwen3_8b_performance_trace_tp_1_low_concurrency"
-        #     ],
-        # ),
+        TestFile(
+            "nightly-test/test_perf_trace.py",
+            estimated_time=7,
+            test_methods=["TestModelPerfTrace.test_qwen_7b_performance_trace_tp_1_low_concurrency"],
+        ),
+        TestFile(
+            "nightly-test/test_perf_trace.py",
+            estimated_time=8,
+            test_methods=[
+                "TestModelPerfTrace.test_qwen_7b_performance_trace_tp_1_high_concurrency"
+            ],
+        ),
+        TestFile(
+            "nightly-test/test_perf_trace.py",
+            estimated_time=2,
+            test_methods=[
+                "TestModelPerfTrace.test_qwen3_8b_performance_trace_tp_1_low_concurrency"
+            ],
+        ),
         TestFile(
             "nightly-test/test_perf_trace.py",
             estimated_time=2.5,
@@ -382,11 +382,6 @@ suites = {
             "nightly-test/test_perf_trace.py",
             estimated_time=2.5,
             test_methods=["TestModelPerfTrace.test_QWEN2_5_7B_INSTRUCT_performance_trace_tp_4"],
-        ),
-        TestFile(
-            "nightly-test/test_perf_trace.py",
-            estimated_time=45,
-            test_methods=["TestModelPerfTrace.test_qwen3_32B_lora_r32_performance_trace_tp_4"],
         ),
     ],
     "sglang_dependency_test": [],
