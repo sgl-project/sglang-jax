@@ -99,6 +99,7 @@ def benchmark_backend(
             cu_q_lens,
             cu_kv_lens,
             distribution,
+            None,
             sm_scale=sm_scale,
             num_kv_pages_per_block=num_kv_pages_per_block,
             num_queries_per_block=num_queries_per_block,
@@ -190,7 +191,7 @@ def main():
                                 )
                             )
 
-    num_kv_pages_per_blk_config = [1, 2, 4, 8, 16, 32]
+    num_kv_pages_per_blk_config = [1, 2, 4, 8, 16, 32, 64]
     num_queries_per_block_config = [1, 2, 4, 8, 16, 32, 64, 128]
 
     block_spec_configs = []
@@ -235,9 +236,14 @@ def main():
             except Exception:
                 pass
 
-        print(
-            f"('{q_dtype}', '{k_dtype}', {q_head_num}, {kv_head_num}, {head_dim}, {page_size}, {max_num_batched_tokens}): ({best_config[0]}, {best_config[1]}),"
-        )
+        if best_config is not None:
+            print(
+                f"('{q_dtype}', '{k_dtype}', {q_head_num}, {kv_head_num}, {head_dim}, {page_size}, {max_num_batched_tokens}): ({best_config[0]}, {best_config[1]}),"
+            )
+        else:
+            print(
+                f"Skipping configuration: {q_head_num} heads, {page_size} page size, {max_num_batched_tokens} tokens (All block sizes failed)"
+            )
 
 
 if __name__ == "__main__":
