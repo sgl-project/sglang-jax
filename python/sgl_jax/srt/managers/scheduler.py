@@ -785,7 +785,12 @@ class Scheduler(
         ret["chunked_req_is_none"] = self.chunked_req is None
 
         # request cache stat
-        ret["tree_cache_size"] = self.tree_cache.total_size() if self.tree_cache is not None else 0
+        if isinstance(self.tree_cache, ChunkCache):
+            ret["tree_cache_size"] = 0
+        else:
+            ret["tree_cache_size"] = (
+                self.tree_cache.total_size() if self.tree_cache is not None else 0
+            )
         if self.req_to_token_pool is not None:
             ret["req_to_token_pool_total"] = self.req_to_token_pool.size
             ret["req_to_token_pool_available"] = self.req_to_token_pool.available_size()
