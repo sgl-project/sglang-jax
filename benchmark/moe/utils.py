@@ -41,7 +41,7 @@ class MoEBenchmarkCase:
 # Decode precompile in server logs:
 #   bs paddings: 8, 16, 32, 64, 128, 256  (num_tokens matches bs for decode)
 BAILING_BASE = dict(
-    num_experts=16,
+    num_experts=256,
     top_k=8,
     hidden_size=1024,
     intermediate_size=256,

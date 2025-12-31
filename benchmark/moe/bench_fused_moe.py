@@ -51,11 +51,11 @@ def _estimate_vmem_bytes(case: MoEBenchmarkCase, dtype: jnp.dtype, cfg: FusedMoE
     token_bytes = jnp.dtype(dtype).itemsize
     weight_bytes = token_bytes
 
-    a2a_s = 2 * bt * num_devices * hidden * token_bytes
+    # NOTE: a2a_s is staged into HBM in this kernel variant; exclude from VMEM.
     a2a_s_acc = 2 * bt * num_devices * hidden * token_bytes
     a2a_g_acc = top_k * bt * hidden * token_bytes
-    b_output = 2 * bt * hidden * token_bytes
-    b_gating = 2 * bt * ((case.num_experts + 127) // 128 * 128) * token_bytes
+    b_output = bt * hidden * token_bytes
+    b_gating = bt * ((case.num_experts + 127) // 128 * 128) * token_bytes
 
     # See kernel scratch shapes: b_w1_x2_vmem/b_w3_x2_vmem/b_w2_x2_vmem.
     w1 = 2 * bd1 * bf * weight_bytes
@@ -66,7 +66,7 @@ def _estimate_vmem_bytes(case: MoEBenchmarkCase, dtype: jnp.dtype, cfg: FusedMoE
     b_acc = bt * num_devices * (bf * 2) * 4
 
     # Skip optional scale/bias buffers (unused in this benchmark).
-    return a2a_s + a2a_s_acc + a2a_g_acc + b_output + b_gating + w1 + w3 + w2 + b_acc
+    return a2a_s_acc + a2a_g_acc + b_output + b_gating + w1 + w3 + w2 + b_acc
 
 
 def select_block_configs(
@@ -107,6 +107,9 @@ def select_block_configs(
             out.append(v)
         return sorted(set(out))
 
+    # Outer `bt` is fixed to local_num_tokens in this fused_moe kernel variant.
+    # We keep the CLI flag name for backwards compatibility and treat it as
+    # candidates for `btc` (the inner compute token tile).
     bt_candidates = _pick_candidates(candidates=bt_candidates, multiple_of=t_packing)
     bf_candidates = _pick_candidates(candidates=bf_candidates, multiple_of=128)
     bd_candidates = _pick_candidates(candidates=bd_candidates, multiple_of=tile_align)
@@ -123,8 +126,8 @@ def select_block_configs(
 
         if bt <= 0 or bf <= 0 or bd1 <= 0 or bd2 <= 0:
             return False, "non-positive tile size"
-        if local_num_tokens % bt != 0:
-            return False, f"local_num_tokens({local_num_tokens}) % bt({bt}) != 0"
+        if bt != local_num_tokens:
+            return False, f"expected bt==local_num_tokens ({bt=} != {local_num_tokens=})"
         if bt % t_packing != 0:
             return False, f"bt({bt}) % t_packing({t_packing}) != 0"
         if not (0 < btc <= bt):
@@ -152,13 +155,6 @@ def select_block_configs(
             return False, f"bd1c({bd1c})/bd2c({bd2c}) not aligned to tile_align({tile_align})"
         if bd1 % bd1c != 0 or bd2 % bd2c != 0:
             return False, f"bd1({bd1}) % bd1c({bd1c}) != 0 or bd2({bd2}) % bd2c({bd2c}) != 0"
-
-        # Match kernel guard: when the token loop has multiple blocks, DMA tiling
-        # requires bt to satisfy a dtype-dependent alignment.
-        num_bt = (local_num_tokens + bt - 1) // bt
-        gating_tile0 = 256 // (jnp.dtype(dtype).itemsize * 8)
-        if num_bt > 1 and bt % gating_tile0 != 0:
-            return False, f"bt({bt}) % gating_tile0({gating_tile0}) != 0 (num_bt={num_bt})"
 
         # TPU VMEM is 64MB per core; exceeding it is a compile-time OOM.
         est = _estimate_vmem_bytes(case, dtype, cfg)
@@ -192,15 +188,16 @@ def select_block_configs(
         seen.add(key)
         configs.append(effective)
 
-    for bt in bt_candidates:
+    # Outer bt is fixed (bt == local_num_tokens); interpret bt_candidates as btc candidates.
+    for btc in bt_candidates:
         for bf in bf_candidates:
             for bd in bd_candidates:
                 raw = FusedMoEBlockConfig(
-                    bt=bt,
+                    bt=local_num_tokens,
                     bf=bf,
                     bd1=bd,
                     bd2=bd,
-                    btc=bt,
+                    btc=btc,
                     bfc=bf,
                     bd1c=bd,
                     bd2c=bd,
@@ -215,22 +212,10 @@ def select_block_configs(
     if len(configs) <= max_configs:
         return configs
 
-    # Keep benchmark runtime bounded while retaining some coverage across `bt`.
-    #
-    # Strategy:
-    #  1) Take the single best config per `bt` (large tiles first) to preserve coverage.
-    #  2) Fill remaining slots from a global ranking (so a single-bt case can still
-    #     produce up to `max_configs` candidates).
+    # Keep benchmark runtime bounded while retaining coverage across (btc, bf, bd).
     def score(c: FusedMoEBlockConfig) -> tuple[int, int, int, int, int, int, int, int]:
         # Lexicographic "weighted" ranking; larger tiles tend to run faster.
         return (c.bt, c.bf, c.bd1, c.bd2, c.btc, c.bfc, c.bd1c, c.bd2c)
-
-    by_bt: dict[int, list[FusedMoEBlockConfig]] = {}
-    for cfg in configs:
-        by_bt.setdefault(cfg.bt, []).append(cfg)
-    bt_values = sorted(by_bt.keys(), reverse=True)
-    for bt in bt_values:
-        by_bt[bt].sort(key=score, reverse=True)
 
     selected: list[FusedMoEBlockConfig] = []
     selected_keys: set[tuple[int, ...]] = set()
@@ -241,15 +226,6 @@ def select_block_configs(
             return
         selected_keys.add(key)
         selected.append(cfg)
-
-    for bt in bt_values:
-        if by_bt[bt]:
-            _add(by_bt[bt][0])
-            if len(selected) >= max_configs:
-                print(
-                    f"  limit: {len(configs)} valid configs -> {len(selected)} (max={max_configs})"
-                )
-                return selected
 
     ranked = sorted(configs, key=score, reverse=True)
     for cfg in ranked:
@@ -478,7 +454,10 @@ def parse_args() -> argparse.Namespace:
         "--bt-candidates",
         type=int,
         nargs="+",
-        help="Candidate list for bt (local token tile), e.g. --bt-candidates 32 64 128",
+        help=(
+            "Candidate list for btc (inner token tile). "
+            "Note: outer bt is fixed to local_num_tokens in this kernel variant."
+        ),
     )
     parser.add_argument(
         "--bf-candidates",

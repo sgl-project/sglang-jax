@@ -8,6 +8,11 @@ This module mirrors the approach used by
   (bucketed) shape signature and device kind.
 - Runtime uses the table when available, otherwise falls back to a fixed
   baseline config (and callers may apply override/validation logic).
+
+Note: The current fused_moe kernel variant fixes `bt` to `local_num_tokens`
+(`num_tokens // ep_size`) and uses the tuned table values primarily for
+`btc/bf/bd*` choices. `FusedMoEBlockConfig.effective_for(...)` applies the
+override at runtime.
 """
 
 from __future__ import annotations
