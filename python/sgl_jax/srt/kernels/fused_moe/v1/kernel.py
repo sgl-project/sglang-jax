@@ -364,7 +364,6 @@ def _fused_ep_moe_kernel(
     b3_hbm,  # None | F32(local_num_experts, 1, intermediate_size)
     gating_hbm,  # (local_num_tokens, padded_num_experts)
     a2a_s_hbm,  # (2, bt * num_devices, t_packing, hidden_size // t_packing)
-    a2a_s_acc_hbm,  # (2, bt * num_devices, t_packing, hidden_size // t_packing)
     a2a_g_hbm,  # (num_experts, bt, t_packing, hidden_size // t_packing)
     # Output
     output_hbm,  # (local_num_tokens, hidden_size)
@@ -391,10 +390,9 @@ def _fused_ep_moe_kernel(
     b_b2_x2_vmem,  # None | <bw_sem_id> (2, t_packing, 1, bd2 // t_packing)
     b_acc_vmem,  # F32(2, bt * num_devices, 1, bf)
     t_stage_b32_x2_vmem,  # U32(2, bt, bd1 // t_packing)
-    a2a_s_acc_stage_b32_x3_vmem,  # U32(3, bt, bd2 // t_packing)
+    a2a_s_acc_x2_vmem,  # <e_sem_id> (2, bt * num_devices, t_packing, hidden_size // t_packing)
     ### Semaphores:
     token_stage_sems,  # DMA(2, 2): <bt_sem_id, token_buf_id>
-    a2a_s_acc_stage_sems,  # DMA(2, 3): <bt_sem_id, stage_buf_id>
     local_sems,  # (2, 5): 2 x [b_gating_sem, b_w1_sem, b_w2_sem, b_w3_sem, b_output_sem]
     send_sems,  # <e_sem_id> (2,)
     recv_sems,  # <e_sem_id> (2,)
@@ -684,7 +682,7 @@ def _fused_ep_moe_kernel(
         my_e_id = my_id * local_num_experts + local_e_id
         bt_sem_id = bt_id % 2
         start = 0
-        src_ref = a2a_s_hbm if a2a_only else a2a_s_acc_hbm
+        src_ref = a2a_s_hbm if a2a_only else a2a_s_acc_x2_vmem
         for recv_id in range(num_devices):
             sz = d2e_count_x2_smem[bt_sem_id, recv_id, 0, my_e_id]
             is_local = recv_id == my_id
@@ -1117,7 +1115,7 @@ def _fused_ep_moe_kernel(
         a2a_s_b32_hbm = a2a_s_hbm.bitcast(jnp.uint32).reshape(
             2, bt * num_devices, hidden_size // t_packing
         )
-        a2a_s_acc_b32_hbm = a2a_s_acc_hbm.bitcast(jnp.uint32).reshape(
+        a2a_s_acc_b32_vmem = a2a_s_acc_x2_vmem.bitcast(jnp.uint32).reshape(
             2, bt * num_devices, hidden_size // t_packing
         )
         b_acc_vmem_2d = b_acc_vmem.reshape(2, bt * num_devices, bf)
@@ -1157,55 +1155,7 @@ def _fused_ep_moe_kernel(
                 sem=token_stage_sems.at[bt_sem_id, buf_id],
             ).wait()
 
-        # FFN2 staging is pipelined like FFN1:
-        # - stage previous partial results from HBM -> VMEM,
-        # - run compute in-place on the VMEM tile,
-        # - async copy VMEM -> HBM for gather.
-        # For FFN2 we use triple buffering to allow load/compute/store overlap.
-        num_a2a_s_acc_stage_bufs = 3
-
-        def start_stage_a2a_s_acc_from_hbm(tile_start, bd2_start, buf_id):
-            sem = a2a_s_acc_stage_sems.at[bt_sem_id, buf_id]
-            pltpu.make_async_copy(
-                src_ref=a2a_s_acc_b32_hbm.at[
-                    e_sem_id,
-                    pl.ds(tile_start, token_tile),
-                    pl.ds(bd2_start, bd2_per_t_packing),
-                ],
-                dst_ref=a2a_s_acc_stage_b32_x3_vmem.at[
-                    buf_id,
-                    pl.ds(0, token_tile),
-                    pl.ds(0, bd2_per_t_packing),
-                ],
-                sem=sem,
-            ).start()
-
-        def start_store_a2a_s_acc_to_hbm(tile_start, bd2_start, buf_id):
-            sem = a2a_s_acc_stage_sems.at[bt_sem_id, buf_id]
-            pltpu.make_async_copy(
-                src_ref=a2a_s_acc_stage_b32_x3_vmem.at[
-                    buf_id,
-                    pl.ds(0, token_tile),
-                    pl.ds(0, bd2_per_t_packing),
-                ],
-                dst_ref=a2a_s_acc_b32_hbm.at[
-                    e_sem_id,
-                    pl.ds(tile_start, token_tile),
-                    pl.ds(bd2_start, bd2_per_t_packing),
-                ],
-                sem=sem,
-            ).start()
-
-        def wait_stage_a2a_s_acc(buf_id):
-            sem = a2a_s_acc_stage_sems.at[bt_sem_id, buf_id]
-            pltpu.make_async_copy(
-                src_ref=a2a_s_acc_stage_b32_x3_vmem.at[buf_id, pl.ds(0, token_tile)],
-                dst_ref=a2a_s_acc_stage_b32_x3_vmem.at[buf_id, pl.ds(0, token_tile)],
-                sem=sem,
-            ).wait()
-
         for bf_id in range(num_bf):
-            should_load_ffn2 = bf_id != 0
             for bd1_id in range(num_bd1):
                 start_fetch_next_bw(local_e_id, bw_sem_id, bf_id, bd1_id, 0)
                 w1_scale_vmem = (
@@ -1230,7 +1180,7 @@ def _fused_ep_moe_kernel(
 
                 def run_ffn1_tile(
                     token_tile_id,
-                    token_buf,
+                    token_buf_id,
                     num_token_tiles=num_token_tiles,
                     token_tile=token_tile,
                     dyn_sz_i32=dyn_sz_i32,
@@ -1246,18 +1196,18 @@ def _fused_ep_moe_kernel(
                     tile_start = token_tile_id * token_tile
 
                     next_tile_id = token_tile_id + 1
-                    next_buf = token_buf ^ jnp.int32(1)
+                    next_buf_id = token_buf_id ^ jnp.int32(1)
                     next_start = next_tile_id * token_tile
 
                     @pl.when(next_tile_id < num_token_tiles)
-                    def _prefetch(next_start=next_start, next_buf=next_buf, bd1_id=bd1_id):
-                        start_stage_a2a_s_tile_from_hbm(next_start, bd1_id, next_buf)
+                    def _prefetch(next_start=next_start, next_buf_id=next_buf_id, bd1_id=bd1_id):
+                        start_stage_a2a_s_tile_from_hbm(next_start, bd1_id, next_buf_id)
 
-                    wait_stage_a2a_s_tile(token_buf)
+                    wait_stage_a2a_s_tile(token_buf_id)
 
                     tile_sz = jnp.maximum(jnp.minimum(dyn_sz_i32 - tile_start, token_tile), 0)
                     dynamic_ffn1(
-                        t_b32_vmem=t_stage_b32_x2_vmem.at[token_buf],
+                        t_b32_vmem=t_stage_b32_x2_vmem.at[token_buf_id],
                         w1_vmem=w1_vmem,
                         w1_scale_vmem=w1_scale_vmem,
                         b1_vmem=b1_vmem,
@@ -1269,7 +1219,7 @@ def _fused_ep_moe_kernel(
                         dyn_sz=tile_sz,
                         should_init=should_init_ffn1,
                     )
-                    return next_buf
+                    return next_buf_id
 
                 lax.fori_loop(
                     0,
@@ -1294,44 +1244,18 @@ def _fused_ep_moe_kernel(
                 w2_vmem = b_w2_x2_vmem.at[bw_sem_id]
                 should_init_ffn2 = bf_id == 0
 
-                # Prefetch the first tile for accumulation (bf_id > 0 only).
-                if should_load_ffn2:
-                    wait_stage_a2a_s_acc(0)
-
-                    @pl.when(num_token_tiles > 0)
-                    def _(bd2_start=bd2_start):
-                        start_stage_a2a_s_acc_from_hbm(tile_start=0, bd2_start=bd2_start, buf_id=0)
-
                 def run_ffn2_tile(
                     token_tile_id,
                     _,
                     bd2_start=bd2_start,
-                    num_token_tiles=num_token_tiles,
                     token_tile=token_tile,
                     dyn_sz_i32=dyn_sz_i32,
                     w2_vmem=w2_vmem,
                     w2_scale_vmem=w2_scale_vmem,
                     b2_vmem=b2_vmem,
-                    should_load_ffn2=should_load_ffn2,
                     should_init_ffn2=should_init_ffn2,
                 ):
                     tile_start = token_tile_id * token_tile
-                    stage_buf = lax.rem(token_tile_id, num_a2a_s_acc_stage_bufs)
-
-                    next_tile_id = token_tile_id + 1
-                    next_buf = lax.rem(next_tile_id, num_a2a_s_acc_stage_bufs)
-                    next_start = next_tile_id * token_tile
-
-                    @pl.when((next_tile_id < num_token_tiles) & should_load_ffn2)
-                    def _prefetch(next_start=next_start, next_buf=next_buf, bd2_start=bd2_start):
-                        wait_stage_a2a_s_acc(next_buf)
-                        start_stage_a2a_s_acc_from_hbm(
-                            tile_start=next_start,
-                            bd2_start=bd2_start,
-                            buf_id=next_buf,
-                        )
-
-                    wait_stage_a2a_s_acc(stage_buf)
 
                     tile_sz = jnp.maximum(jnp.minimum(dyn_sz_i32 - tile_start, token_tile), 0)
                     dynamic_ffn2(
@@ -1340,23 +1264,17 @@ def _fused_ep_moe_kernel(
                         w2_vmem=w2_vmem,
                         w2_scale_vmem=w2_scale_vmem,
                         b2_vmem=b2_vmem,
-                        res_b32_vmem=a2a_s_acc_stage_b32_x3_vmem.at[stage_buf],
+                        res_b32_vmem=a2a_s_acc_b32_vmem.at[
+                            e_sem_id,
+                            pl.ds(tile_start, token_tile),
+                            pl.ds(bd2_start, bd2_per_t_packing),
+                        ],
                         dyn_sz=tile_sz,
                         should_init=should_init_ffn2,
-                    )
-
-                    start_store_a2a_s_acc_to_hbm(
-                        tile_start=tile_start,
-                        bd2_start=bd2_start,
-                        buf_id=stage_buf,
                     )
                     return None
 
                 lax.fori_loop(0, num_token_tiles, run_ffn2_tile, None, unroll=False)
-
-                # Ensure all outstanding stores complete before the next bf_id/bd2_id.
-                for buf_id in range(num_a2a_s_acc_stage_bufs):
-                    wait_stage_a2a_s_acc(buf_id)
                 bw_sem_id = (bw_sem_id + 1) % 2
 
     def bt_acc(bt_id, top_k_logits_lst):
@@ -1772,7 +1690,6 @@ def fused_ep_moe(
         f"-bt_{block_config.bt}_{block_config.btc}-bf_{block_config.bf}_{block_config.bfc}"
         f"-bd1_{block_config.bd1}_{block_config.bd1c}-bd2_{block_config.bd2}_{block_config.bd2c}"
         "-a2a_s_hbm"
-        "-a2a_s_acc_hbm"
     )
 
     w1_scale_scratch = None
@@ -1824,10 +1741,9 @@ def fused_ep_moe(
         b2_scratch,  # b_b2_x2_vmem
         pltpu.VMEM((2, bt_x_devices, 1, block_config.bf), jnp.float32),  # b_acc_vmem
         pltpu.VMEM((2, block_config.bt, bd1_per_pack), jnp.uint32),  # t_stage_b32_x2_vmem
-        pltpu.VMEM((3, block_config.bt, bd2_per_pack), jnp.uint32),  # a2a_s_acc_stage_b32_x3_vmem
+        pltpu.VMEM((2, bt_x_devices, t_packing, hidden_per_pack), t_dtype),  # a2a_s_acc_x2_vmem
         # Semaphores.
         pltpu.SemaphoreType.DMA((2, 2)),  # token_stage_sems
-        pltpu.SemaphoreType.DMA((2, 3)),  # a2a_s_acc_stage_sems
         pltpu.SemaphoreType.DMA((2, 5)),  # local_sems
         pltpu.SemaphoreType.DMA((2,)),  # send_sems
         pltpu.SemaphoreType.DMA((2,)),  # recv_sems
@@ -1870,7 +1786,6 @@ def fused_ep_moe(
                     None if b3 is None else hbm_block_spec,  # b3_hbm
                     hbm_block_spec,  # gating_output_hbm
                     hbm_block_spec,  # a2a_s_hbm
-                    hbm_block_spec,  # a2a_s_acc_hbm
                     hbm_block_spec,  # a2a_g_hbm
                 ],
                 out_specs=pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),
@@ -1903,7 +1818,6 @@ def fused_ep_moe(
             None if b3 is None else P(ep_axis_name),  # b3_hbm
             P(ep_axis_name),  # gating_output_hbm
             P(),  # a2a_s_hbm
-            P(),  # a2a_s_acc_hbm
             P(),  # a2a_g_hbm
         ),
         out_specs=P(ep_axis_name),
@@ -1922,7 +1836,6 @@ def fused_ep_moe(
         b3,
         gating_output,
         a2a_s_hbm_scratch,
-        a2a_s_acc_hbm_scratch,
         a2a_g_hbm_scratch,
     ):
         local_output = fused_moe(
@@ -1950,15 +1863,11 @@ def fused_ep_moe(
             (None if b3 is None else pltpu.with_memory_space_constraint(b3, pltpu.HBM)),  # b3_hbm
             pltpu.with_memory_space_constraint(gating_output, pltpu.HBM),  # gating_output_hbm
             pltpu.with_memory_space_constraint(a2a_s_hbm_scratch, pltpu.HBM),  # a2a_s_hbm
-            pltpu.with_memory_space_constraint(a2a_s_acc_hbm_scratch, pltpu.HBM),  # a2a_s_acc_hbm
             pltpu.with_memory_space_constraint(a2a_g_hbm_scratch, pltpu.HBM),  # a2a_g_hbm
         )
         return local_output
 
     a2a_s_hbm_scratch = pl.empty((2, bt_x_devices, t_packing, hidden_size // t_packing), t_dtype)
-    a2a_s_acc_hbm_scratch = pl.empty(
-        (2, bt_x_devices, t_packing, hidden_size // t_packing), t_dtype
-    )
     a2a_g_hbm_scratch = pl.empty(
         (num_experts, block_config.bt, t_packing, hidden_size // t_packing), t_dtype
     )
@@ -1975,6 +1884,5 @@ def fused_ep_moe(
         b3,
         gating_output,
         a2a_s_hbm_scratch,
-        a2a_s_acc_hbm_scratch,
         a2a_g_hbm_scratch,
     )
