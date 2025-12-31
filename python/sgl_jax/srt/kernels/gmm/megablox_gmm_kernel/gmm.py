@@ -10,7 +10,7 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from tpu_inference.kernels.megablox import common
+from sgl_jax.srt.kernels.gmm.megablox_gmm_kernel import common
 
 partial = functools.partial
 
