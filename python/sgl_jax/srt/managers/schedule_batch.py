@@ -933,6 +933,14 @@ class ScheduleBatch:
 
         req.reset_for_retract()
 
+    def retract_all(self, server_args: ServerArgs):
+        retracted_reqs = self.reqs
+        for idx in range(len(self.reqs)):
+            self.release_req(idx, len(self.reqs) - idx, server_args)
+
+        self.filter_batch(retracted_reqs)
+        return retracted_reqs
+
     def prepare_for_idle(self):
         self.forward_mode = ForwardMode.IDLE
         self.input_ids = np.empty(0, np.int32)

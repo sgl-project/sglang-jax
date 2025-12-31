@@ -36,8 +36,10 @@ from sgl_jax.srt.managers.detokenizer_manager import (
     run_detokenizer_thread,
 )
 from sgl_jax.srt.managers.io_struct import (
+    ContinueGenerationReqInput,
     EmbeddingReqInput,
     GenerateReqInput,
+    PauseGenerationReqInput,
     ReleaseMemoryOccupationReqInput,
     ResumeMemoryOccupationReqInput,
 )
@@ -150,7 +152,6 @@ class Engine(EngineBase):
             stream=stream,
             lora_path=lora_path,
         )
-
         generator = self.tokenizer_manager.generate_request(obj, None)
 
         if stream:
@@ -170,6 +171,7 @@ class Engine(EngineBase):
 
     async def async_generate(
         self,
+        prompt: list[str] | str | None = None,
         sampling_params: list[dict] | dict | None = None,
         # The token ids for text; one can either specify text or input_ids.
         input_ids: list[list[int]] | list[int] | None = None,
@@ -188,6 +190,7 @@ class Engine(EngineBase):
             sampling_params = self.get_default_sampling_params()
 
         obj = GenerateReqInput(
+            text=prompt,
             input_ids=input_ids,
             sampling_params=sampling_params,
             return_logprob=return_logprob,
@@ -231,9 +234,8 @@ class Engine(EngineBase):
         obj = EmbeddingReqInput(
             text=prompt,
         )
-        loop = asyncio.get_event_loop()
         generator = self.tokenizer_manager.generate_request(obj, None)
-        ret = loop.run_until_complete(generator.__anext__())
+        ret = self.loop.run_until_complete(generator.__anext__())
         return ret
 
     async def async_encode(
@@ -261,9 +263,8 @@ class Engine(EngineBase):
         Please refer to `EmbeddingReqInput` for the documentation.
         """
         obj = EmbeddingReqInput(text=prompt, is_cross_encoder_request=True)
-        loop = asyncio.get_event_loop()
         generator = self.tokenizer_manager.generate_request(obj, None)
-        ret = loop.run_until_complete(generator.__anext__())
+        ret = self.loop.run_until_complete(generator.__anext__())
         return ret
 
     def shutdown(self):
@@ -279,21 +280,76 @@ class Engine(EngineBase):
         self.shutdown()
         return False
 
+    async def async_flush_cache(self):
+        """
+        Descriptioin: requests will be sent to tokenizer manager. It will flush all cache: tree_cache, req_to_token_pool, token_to_kv_pool_allocator(free physical cache through allocator)
+        """
+        return await self.tokenizer_manager.flush_cache()
+
+    async def async_pause_generation(self, mode: str = "retract"):
+        """
+        Input: the pause generation mode: ["abort", "retract", "in-place"]
+
+        Description: Deal with requests according to mode. Now support abort, in_place and retract.
+        """
+        obj = PauseGenerationReqInput(mode=mode)
+        return await self.tokenizer_manager.pause_generation(obj)
+
+    async def async_continue_generation(self):
+        """
+        Description: continue previous paused generation
+        """
+        obj = ContinueGenerationReqInput()
+        return await self.tokenizer_manager.continue_generation(obj)
+
+    async def async_get_server_info(self):
+        internal_states = await self.tokenizer_manager.get_internal_state()
+        return {
+            **dataclasses.asdict(self.tokenizer_manager.server_args),
+            **self.scheduler_info,
+            "internal_states": internal_states,
+            "version": __version__,
+        }
+
     def flush_cache(self):
-        loop = asyncio.get_event_loop()
-        return loop.run_until_complete(self.tokenizer_manager.flush_cache())
+        """
+        Descriptioin: requests will be sent to tokenizer manager. It will flush all cache: tree_cache, req_to_token_pool, token_to_kv_pool_allocator(free physical cache through allocator)
+        """
+        return self.loop.run_until_complete(self.tokenizer_manager.flush_cache())
+
+    def pause_generation(self, mode: str = "retract"):
+        """
+        Input: the pause generation mode: ["abort", "retract", "in-place"]
+
+        Description: Deal with requests according to mode. Now support abort, in_place and retract.
+        """
+        obj = PauseGenerationReqInput(mode=mode)
+        return self.loop.run_until_complete(self.tokenizer_manager.pause_generation(obj))
+
+    def continue_generation(self):
+        """
+        Description: continue previous paused generation
+        """
+        obj = ContinueGenerationReqInput()
+        return self.loop.run_until_complete(self.tokenizer_manager.continue_generation(obj))
+
+    # abort request is sync, therefore do not need event loop
+    def abort_request(self, rid: str | None = None, abort_all: bool = False):
+        """
+        Description: Abort a request.
+
+        Input: rid is request id, abort_all determines whether abort all requests
+        """
+        self.tokenizer_manager.abort_request(rid=rid, abort_all=abort_all)
 
     def start_profile(self):
-        loop = asyncio.get_event_loop()
-        loop.run_until_complete(self.tokenizer_manager.start_profile())
+        self.loop.run_until_complete(self.tokenizer_manager.start_profile())
 
     def stop_profile(self):
-        loop = asyncio.get_event_loop()
-        loop.run_until_complete(self.tokenizer_manager.stop_profile())
+        self.loop.run_until_complete(self.tokenizer_manager.stop_profile())
 
     def get_server_info(self):
-        loop = asyncio.get_event_loop()
-        internal_states = loop.run_until_complete(self.tokenizer_manager.get_internal_state())
+        internal_states = self.loop.run_until_complete(self.tokenizer_manager.get_internal_state())
         return {
             **dataclasses.asdict(self.tokenizer_manager.server_args),
             **self.scheduler_info,
@@ -303,13 +359,15 @@ class Engine(EngineBase):
 
     def release_memory_occupation(self, tags: list[str] | None = None):
         obj = ReleaseMemoryOccupationReqInput(tags=tags)
-        loop = asyncio.get_event_loop()
-        return loop.run_until_complete(self.tokenizer_manager.release_memory_occupation(obj, None))
+        return self.loop.run_until_complete(
+            self.tokenizer_manager.release_memory_occupation(obj, None)
+        )
 
     def resume_memory_occupation(self, tags: list[str] | None = None):
         obj = ResumeMemoryOccupationReqInput(tags=tags)
-        loop = asyncio.get_event_loop()
-        return loop.run_until_complete(self.tokenizer_manager.resume_memory_occupation(obj, None))
+        return self.loop.run_until_complete(
+            self.tokenizer_manager.resume_memory_occupation(obj, None)
+        )
 
     def score(
         self,
@@ -350,8 +408,7 @@ class Engine(EngineBase):
             ValueError: If query is not provided, or if items is not provided,
                       or if token IDs are out of vocabulary, or if logprobs are not available for the specified tokens.
         """
-        loop = asyncio.get_event_loop()
-        return loop.run_until_complete(
+        return self.loop.run_until_complete(
             self.tokenizer_manager.score_request(
                 query=query,
                 items=items,
