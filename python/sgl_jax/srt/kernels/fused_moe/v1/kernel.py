@@ -1325,7 +1325,7 @@ def _fused_ep_moe_kernel(
 
     wait_fetch_b_gating()
 
-    b_gating = b_gating_vmem
+    b_gating = b_gating_vmem[...]
     b_gating_score = jax.nn.softmax(b_gating, axis=-1)
     top_k_logits_lst, t2e_routing, expert_sizes, expert_starts = get_top_k(
         b_gating_score, top_k, renormalize_topk_logits
