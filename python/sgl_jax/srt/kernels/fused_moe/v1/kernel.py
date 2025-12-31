@@ -390,8 +390,8 @@ def _fused_ep_moe_kernel(
     b_b3_x2_vmem,  # None | <bw_sem_id> (2, 1, bf)
     b_b2_x2_vmem,  # None | <bw_sem_id> (2, t_packing, 1, bd2 // t_packing)
     b_acc_vmem,  # F32(2, bt * num_devices, 1, bf)
-    t_stage_b32_x2_vmem,  # U32(2, btc, bd1 // t_packing)
-    a2a_s_acc_stage_b32_x3_vmem,  # U32(3, btc, bd2 // t_packing)
+    t_stage_b32_x2_vmem,  # U32(2, bt, bd1 // t_packing)
+    a2a_s_acc_stage_b32_x3_vmem,  # U32(3, bt, bd2 // t_packing)
     ### Semaphores:
     token_stage_sems,  # DMA(2, 2): <bt_sem_id, token_buf_id>
     a2a_s_acc_stage_sems,  # DMA(2, 3): <bt_sem_id, stage_buf_id>
@@ -920,9 +920,10 @@ def _fused_ep_moe_kernel(
         dyn_sz,
         should_init,
     ):
-        assert t_b32_vmem.shape == (btc, bd1 // t_packing)
+        token_tile = t_b32_vmem.shape[0]
+        assert t_b32_vmem.shape == (token_tile, bd1 // t_packing)
         assert w1_vmem.shape == w3_vmem.shape == (t_packing, bd1_per_t_packing, bf)
-        assert acc1_vmem.shape == acc3_vmem.shape == (btc, bf)
+        assert acc1_vmem.shape == acc3_vmem.shape == (token_tile, bf)
         assert bd1 % (t_packing * 128) == 0, (bd1, t_packing)
         assert bd1c % (t_packing * 128) == 0, (bd1c, t_packing)
         assert bd1_per_t_packing % bd1c_per_t_packing == 0
@@ -943,7 +944,8 @@ def _fused_ep_moe_kernel(
             )
             assert bd1c_per_t_packing == subc_quant_wsz
 
-        num_loops = lax.select(dyn_sz > 0, 1, 0)
+        dyn_sz_i32 = dyn_sz.astype(jnp.int32)
+        num_loops = lax.select(dyn_sz_i32 > 0, (dyn_sz_i32 + (btc - 1)) // btc, 0)
         repack_ty = jnp.dtype(f"int{t_bitwidth}")
 
         def body(btc_id, _):
@@ -1028,9 +1030,10 @@ def _fused_ep_moe_kernel(
         dyn_sz,
         should_init,
     ):
-        assert res_b32_vmem.shape == (btc, bd2_per_t_packing)
+        token_tile = res_b32_vmem.shape[0]
+        assert res_b32_vmem.shape == (token_tile, bd2_per_t_packing)
         assert w2_vmem.shape == (t_packing, bf, bd2_per_t_packing)
-        assert acc1_vmem.shape == acc3_vmem.shape == (btc, bf)
+        assert acc1_vmem.shape == acc3_vmem.shape == (token_tile, bf)
         assert bd2 % (t_packing * 128) == 0, (bd2, t_packing)
         assert bd2c % (t_packing * 128) == 0, (bd2c, t_packing)
         assert t_dtype in (jnp.float32, jnp.bfloat16)
@@ -1044,10 +1047,11 @@ def _fused_ep_moe_kernel(
             )
             assert bfc == subc_quant_wsz
 
-        num_loops = lax.select(dyn_sz > 0, 1, 0)
+        dyn_sz_i32 = dyn_sz.astype(jnp.int32)
+        num_loops = lax.select(dyn_sz_i32 > 0, (dyn_sz_i32 + (btc - 1)) // btc, 0)
         assert bd2c % (t_packing * 128) == 0, (bd2c, t_packing)
 
-        def body(_, __):
+        def body(btc_id, __):
             for bd2c_id in range(cdiv(bd2, bd2c)):
                 res_lst = []
                 for p_id in range(t_packing):
@@ -1063,7 +1067,7 @@ def _fused_ep_moe_kernel(
                         res += b2
 
                     for bfc_id in range(cdiv(bf, bfc)):
-                        acc_slices = (pl.ds(0, btc), pl.ds(bfc_id * bfc, bfc))
+                        acc_slices = (pl.ds(btc_id * btc, btc), pl.ds(bfc_id * bfc, bfc))
                         acc1 = acc1_vmem[*acc_slices]
                         acc3 = acc3_vmem[*acc_slices]
                         act = activation_fn(acc1, acc3, act_fn)
@@ -1089,12 +1093,12 @@ def _fused_ep_moe_kernel(
                     else:
                         assert t_packing == 1
                     res_lst.append(res)
-                res = res_lst[0]
-                # TODO(jevinjiang): use interleaved packing when it is exposed to Pallas
-                for i in range(1, t_packing):
-                    res |= res_lst[i]
+                    res = res_lst[0]
+                    # TODO(jevinjiang): use interleaved packing when it is exposed to Pallas
+                    for i in range(1, t_packing):
+                        res |= res_lst[i]
                 sliced_res_vmem = res_b32_vmem.at[
-                    pl.ds(0, btc),
+                    pl.ds(btc_id * btc, btc),
                     pl.ds(bd2c_id * bd2c_per_t_packing, bd2c_per_t_packing),
                 ]
                 if should_init:
@@ -1122,14 +1126,36 @@ def _fused_ep_moe_kernel(
 
         e_id = my_id * local_num_experts + local_e_id
         dyn_sz = expert_sizes_x2_smem[bt_sem_id, 0, e_id]
+        dyn_sz_i32 = dyn_sz.astype(jnp.int32)
 
         bd1_per_t_packing = bd1 // t_packing
         bd2_per_t_packing = bd2 // t_packing
-        num_token_tiles = (bt * num_devices + btc - 1) // btc
+        # Stage tokens in bt-sized tiles from HBM -> VMEM (to reduce staging frequency),
+        # while keeping `btc` as the inner compute block size.
+        token_tile = bt
+        num_token_tiles = (dyn_sz_i32 + (token_tile - 1)) // token_tile
 
-        def tile_size_for_start(token_start):
-            remaining = dyn_sz - token_start
-            return jnp.maximum(jnp.minimum(remaining, btc), 0)
+        def start_stage_a2a_s_tile_from_hbm(tile_start, bd1_id, buf_id):
+            pltpu.make_async_copy(
+                src_ref=a2a_s_b32_hbm.at[
+                    e_sem_id,
+                    pl.ds(tile_start, token_tile),
+                    pl.ds(bd1_id * bd1_per_t_packing, bd1_per_t_packing),
+                ],
+                dst_ref=t_stage_b32_x2_vmem.at[
+                    buf_id,
+                    pl.ds(0, token_tile),
+                    pl.ds(0, bd1_per_t_packing),
+                ],
+                sem=token_stage_sems.at[bt_sem_id, buf_id],
+            ).start()
+
+        def wait_stage_a2a_s_tile(buf_id):
+            pltpu.make_async_copy(
+                src_ref=t_stage_b32_x2_vmem.at[buf_id, pl.ds(0, token_tile)],
+                dst_ref=t_stage_b32_x2_vmem.at[buf_id, pl.ds(0, token_tile)],
+                sem=token_stage_sems.at[bt_sem_id, buf_id],
+            ).wait()
 
         # FFN2 staging is pipelined like FFN1:
         # - stage previous partial results from HBM -> VMEM,
@@ -1138,33 +1164,33 @@ def _fused_ep_moe_kernel(
         # For FFN2 we use triple buffering to allow load/compute/store overlap.
         num_a2a_s_acc_stage_bufs = 3
 
-        def start_stage_a2a_s_acc_from_hbm(token_start, bd2_start, buf_id):
+        def start_stage_a2a_s_acc_from_hbm(tile_start, bd2_start, buf_id):
             sem = a2a_s_acc_stage_sems.at[bt_sem_id, buf_id]
             pltpu.make_async_copy(
                 src_ref=a2a_s_acc_b32_hbm.at[
                     e_sem_id,
-                    pl.ds(token_start, btc),
+                    pl.ds(tile_start, token_tile),
                     pl.ds(bd2_start, bd2_per_t_packing),
                 ],
                 dst_ref=a2a_s_acc_stage_b32_x3_vmem.at[
                     buf_id,
-                    pl.ds(0, btc),
+                    pl.ds(0, token_tile),
                     pl.ds(0, bd2_per_t_packing),
                 ],
                 sem=sem,
             ).start()
 
-        def start_store_a2a_s_acc_to_hbm(token_start, bd2_start, buf_id):
+        def start_store_a2a_s_acc_to_hbm(tile_start, bd2_start, buf_id):
             sem = a2a_s_acc_stage_sems.at[bt_sem_id, buf_id]
             pltpu.make_async_copy(
                 src_ref=a2a_s_acc_stage_b32_x3_vmem.at[
                     buf_id,
-                    pl.ds(0, btc),
+                    pl.ds(0, token_tile),
                     pl.ds(0, bd2_per_t_packing),
                 ],
                 dst_ref=a2a_s_acc_b32_hbm.at[
                     e_sem_id,
-                    pl.ds(token_start, btc),
+                    pl.ds(tile_start, token_tile),
                     pl.ds(bd2_start, bd2_per_t_packing),
                 ],
                 sem=sem,
@@ -1173,12 +1199,13 @@ def _fused_ep_moe_kernel(
         def wait_stage_a2a_s_acc(buf_id):
             sem = a2a_s_acc_stage_sems.at[bt_sem_id, buf_id]
             pltpu.make_async_copy(
-                src_ref=a2a_s_acc_stage_b32_x3_vmem.at[buf_id, pl.ds(0, btc)],
-                dst_ref=a2a_s_acc_stage_b32_x3_vmem.at[buf_id, pl.ds(0, btc)],
+                src_ref=a2a_s_acc_stage_b32_x3_vmem.at[buf_id, pl.ds(0, token_tile)],
+                dst_ref=a2a_s_acc_stage_b32_x3_vmem.at[buf_id, pl.ds(0, token_tile)],
                 sem=sem,
             ).wait()
 
         for bf_id in range(num_bf):
+            should_load_ffn2 = bf_id != 0
             for bd1_id in range(num_bd1):
                 start_fetch_next_bw(local_e_id, bw_sem_id, bf_id, bd1_id, 0)
                 w1_scale_vmem = (
@@ -1191,67 +1218,66 @@ def _fused_ep_moe_kernel(
                 b3_vmem = None if b_b3_x2_vmem is None else b_b3_x2_vmem.at[bf_id % 2]
                 wait_fetch_bw1(local_e_id, bw_sem_id, bf_id, bd1_id)
                 wait_fetch_bw3(local_e_id, bw_sem_id, bf_id, bd1_id)
+                w1_vmem = b_w1_x2_vmem.at[bw_sem_id]
+                w3_vmem = b_w3_x2_vmem.at[bw_sem_id]
+                should_init_ffn1 = bd1_id == 0
 
                 # Double-buffer token staging from HBM -> VMEM to overlap with FFN1 compute.
                 # Note: a2a_s_hbm is already double-buffered by e_sem_id.
-                token_buf = 0
+                @pl.when(num_token_tiles > 0)
+                def _(bd1_id=bd1_id):
+                    start_stage_a2a_s_tile_from_hbm(0, bd1_id, 0)
 
-                def start_stage(token_start, tile_sz, buf_id, *, bd1_id=bd1_id):
-                    pltpu.make_async_copy(
-                        src_ref=a2a_s_b32_hbm.at[
-                            e_sem_id,
-                            pl.ds(token_start, tile_sz),
-                            pl.ds(bd1_id * bd1_per_t_packing, bd1_per_t_packing),
-                        ],
-                        dst_ref=t_stage_b32_x2_vmem.at[
-                            buf_id,
-                            pl.ds(0, tile_sz),
-                            pl.ds(0, bd1_per_t_packing),
-                        ],
-                        sem=token_stage_sems.at[bt_sem_id, buf_id],
-                    ).start()
-
-                def wait_stage(tile_sz, buf_id):
-                    pltpu.make_async_copy(
-                        src_ref=t_stage_b32_x2_vmem.at[buf_id, pl.ds(0, tile_sz)],
-                        dst_ref=t_stage_b32_x2_vmem.at[buf_id, pl.ds(0, tile_sz)],
-                        sem=token_stage_sems.at[bt_sem_id, buf_id],
-                    ).wait()
-
-                # Prefetch the first tile.
-                start0 = 0
-                sz0 = tile_size_for_start(start0)
-                start_stage(start0, sz0, token_buf)
-
-                for token_tile_id in range(num_token_tiles):
-                    token_start = token_tile_id * btc
-                    tile_sz = tile_size_for_start(token_start)
+                def run_ffn1_tile(
+                    token_tile_id,
+                    token_buf,
+                    num_token_tiles=num_token_tiles,
+                    token_tile=token_tile,
+                    dyn_sz_i32=dyn_sz_i32,
+                    bd1_id=bd1_id,
+                    w1_vmem=w1_vmem,
+                    w1_scale_vmem=w1_scale_vmem,
+                    b1_vmem=b1_vmem,
+                    w3_vmem=w3_vmem,
+                    w3_scale_vmem=w3_scale_vmem,
+                    b3_vmem=b3_vmem,
+                    should_init_ffn1=should_init_ffn1,
+                ):
+                    tile_start = token_tile_id * token_tile
 
                     next_tile_id = token_tile_id + 1
-                    next_buf = (token_buf + 1) % 2
-                    next_start = next_tile_id * btc
-                    next_sz = tile_size_for_start(next_start)
+                    next_buf = token_buf ^ jnp.int32(1)
+                    next_start = next_tile_id * token_tile
 
-                    # Prefetch next tile while waiting/compute on current.
-                    if next_tile_id < num_token_tiles:
-                        start_stage(next_start, next_sz, next_buf)
+                    @pl.when(next_tile_id < num_token_tiles)
+                    def _prefetch(next_start=next_start, next_buf=next_buf, bd1_id=bd1_id):
+                        start_stage_a2a_s_tile_from_hbm(next_start, bd1_id, next_buf)
 
-                    wait_stage(tile_sz, token_buf)
+                    wait_stage_a2a_s_tile(token_buf)
 
+                    tile_sz = jnp.maximum(jnp.minimum(dyn_sz_i32 - tile_start, token_tile), 0)
                     dynamic_ffn1(
                         t_b32_vmem=t_stage_b32_x2_vmem.at[token_buf],
-                        w1_vmem=b_w1_x2_vmem.at[bw_sem_id],
+                        w1_vmem=w1_vmem,
                         w1_scale_vmem=w1_scale_vmem,
                         b1_vmem=b1_vmem,
-                        w3_vmem=b_w3_x2_vmem.at[bw_sem_id],
+                        w3_vmem=w3_vmem,
                         w3_scale_vmem=w3_scale_vmem,
                         b3_vmem=b3_vmem,
-                        acc1_vmem=b_acc1_vmem.at[pl.ds(token_start, btc)],
-                        acc3_vmem=b_acc3_vmem.at[pl.ds(token_start, btc)],
+                        acc1_vmem=b_acc1_vmem.at[pl.ds(tile_start, token_tile)],
+                        acc3_vmem=b_acc3_vmem.at[pl.ds(tile_start, token_tile)],
                         dyn_sz=tile_sz,
-                        should_init=(bd1_id == 0),
+                        should_init=should_init_ffn1,
                     )
-                    token_buf = next_buf
+                    return next_buf
+
+                lax.fori_loop(
+                    0,
+                    num_token_tiles,
+                    run_ffn1_tile,
+                    jnp.int32(0),
+                    unroll=False,
+                )
                 bw_sem_id = (bw_sem_id + 1) % 2
 
             for bd2_id in range(num_bd2):
@@ -1265,48 +1291,68 @@ def _fused_ep_moe_kernel(
                 )
                 b2_vmem = None if b_b2_x2_vmem is None else b_b2_x2_vmem.at[bd2_id % 2]
                 bd2_start = bd2_id * bd2_per_t_packing
-                # Prefetch the first tile for accumulation.
-                if bf_id != 0:
-                    wait_stage_a2a_s_acc(0)
-                    start_stage_a2a_s_acc_from_hbm(token_start=0, bd2_start=bd2_start, buf_id=0)
+                w2_vmem = b_w2_x2_vmem.at[bw_sem_id]
+                should_init_ffn2 = bf_id == 0
 
-                for token_tile_id in range(num_token_tiles):
-                    token_start = token_tile_id * btc
-                    tile_dyn_sz = tile_size_for_start(token_start)
-                    stage_buf = token_tile_id % num_a2a_s_acc_stage_bufs
+                # Prefetch the first tile for accumulation (bf_id > 0 only).
+                if should_load_ffn2:
+                    wait_stage_a2a_s_acc(0)
+
+                    @pl.when(num_token_tiles > 0)
+                    def _(bd2_start=bd2_start):
+                        start_stage_a2a_s_acc_from_hbm(tile_start=0, bd2_start=bd2_start, buf_id=0)
+
+                def run_ffn2_tile(
+                    token_tile_id,
+                    _,
+                    bd2_start=bd2_start,
+                    num_token_tiles=num_token_tiles,
+                    token_tile=token_tile,
+                    dyn_sz_i32=dyn_sz_i32,
+                    w2_vmem=w2_vmem,
+                    w2_scale_vmem=w2_scale_vmem,
+                    b2_vmem=b2_vmem,
+                    should_load_ffn2=should_load_ffn2,
+                    should_init_ffn2=should_init_ffn2,
+                ):
+                    tile_start = token_tile_id * token_tile
+                    stage_buf = lax.rem(token_tile_id, num_a2a_s_acc_stage_bufs)
 
                     next_tile_id = token_tile_id + 1
-                    next_buf = next_tile_id % num_a2a_s_acc_stage_bufs
-                    next_start = next_tile_id * btc
+                    next_buf = lax.rem(next_tile_id, num_a2a_s_acc_stage_bufs)
+                    next_start = next_tile_id * token_tile
 
-                    # Prefetch next tile while compute runs on current tile.
-                    if bf_id != 0 and next_tile_id < num_token_tiles:
+                    @pl.when((next_tile_id < num_token_tiles) & should_load_ffn2)
+                    def _prefetch(next_start=next_start, next_buf=next_buf, bd2_start=bd2_start):
                         wait_stage_a2a_s_acc(next_buf)
                         start_stage_a2a_s_acc_from_hbm(
-                            token_start=next_start,
+                            tile_start=next_start,
                             bd2_start=bd2_start,
                             buf_id=next_buf,
                         )
 
-                    # Make sure the current stage buffer is ready (loaded or free).
                     wait_stage_a2a_s_acc(stage_buf)
 
+                    tile_sz = jnp.maximum(jnp.minimum(dyn_sz_i32 - tile_start, token_tile), 0)
                     dynamic_ffn2(
-                        acc1_vmem=b_acc1_vmem.at[pl.ds(token_start, btc)],
-                        acc3_vmem=b_acc3_vmem.at[pl.ds(token_start, btc)],
-                        w2_vmem=b_w2_x2_vmem.at[bw_sem_id],
+                        acc1_vmem=b_acc1_vmem.at[pl.ds(tile_start, token_tile)],
+                        acc3_vmem=b_acc3_vmem.at[pl.ds(tile_start, token_tile)],
+                        w2_vmem=w2_vmem,
                         w2_scale_vmem=w2_scale_vmem,
                         b2_vmem=b2_vmem,
                         res_b32_vmem=a2a_s_acc_stage_b32_x3_vmem.at[stage_buf],
-                        dyn_sz=tile_dyn_sz,
-                        should_init=(bf_id == 0),
+                        dyn_sz=tile_sz,
+                        should_init=should_init_ffn2,
                     )
 
                     start_store_a2a_s_acc_to_hbm(
-                        token_start=token_start,
+                        tile_start=tile_start,
                         bd2_start=bd2_start,
                         buf_id=stage_buf,
                     )
+                    return None
+
+                lax.fori_loop(0, num_token_tiles, run_ffn2_tile, None, unroll=False)
 
                 # Ensure all outstanding stores complete before the next bf_id/bd2_id.
                 for buf_id in range(num_a2a_s_acc_stage_bufs):
@@ -1777,8 +1823,8 @@ def fused_ep_moe(
         b3_scratch,  # b_b3_x2_vmem
         b2_scratch,  # b_b2_x2_vmem
         pltpu.VMEM((2, bt_x_devices, 1, block_config.bf), jnp.float32),  # b_acc_vmem
-        pltpu.VMEM((2, block_config.btc, bd1_per_pack), jnp.uint32),  # t_stage_b32_x2_vmem
-        pltpu.VMEM((3, block_config.btc, bd2_per_pack), jnp.uint32),  # a2a_s_acc_stage_b32_x3_vmem
+        pltpu.VMEM((2, block_config.bt, bd1_per_pack), jnp.uint32),  # t_stage_b32_x2_vmem
+        pltpu.VMEM((3, block_config.bt, bd2_per_pack), jnp.uint32),  # a2a_s_acc_stage_b32_x3_vmem
         # Semaphores.
         pltpu.SemaphoreType.DMA((2, 2)),  # token_stage_sems
         pltpu.SemaphoreType.DMA((2, 3)),  # a2a_s_acc_stage_sems
