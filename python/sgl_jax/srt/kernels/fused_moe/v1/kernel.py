@@ -1093,10 +1093,10 @@ def _fused_ep_moe_kernel(
                     else:
                         assert t_packing == 1
                     res_lst.append(res)
-                    res = res_lst[0]
-                    # TODO(jevinjiang): use interleaved packing when it is exposed to Pallas
-                    for i in range(1, t_packing):
-                        res |= res_lst[i]
+                res = res_lst[0]
+                # TODO(jevinjiang): use interleaved packing when it is exposed to Pallas
+                for i in range(1, t_packing):
+                    res |= res_lst[i]
                 sliced_res_vmem = res_b32_vmem.at[
                     pl.ds(btc_id * btc, btc),
                     pl.ds(bd2c_id * bd2c_per_t_packing, bd2c_per_t_packing),
