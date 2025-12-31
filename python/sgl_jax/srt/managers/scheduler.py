@@ -872,7 +872,9 @@ class Scheduler(
         success, error_msg, flushed_items = self.flush_cache()
         return FlushCacheReqOutput(
             rid=recv_req.rid,
+            error_msg=error_msg,
             success=success,
+            flushed_items=flushed_items,
         )
 
     def _can_flush_cache(self) -> tuple[bool, str]:

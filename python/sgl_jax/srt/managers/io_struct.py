@@ -181,6 +181,8 @@ class FlushCacheReqInput(BaseReq):
 @dataclass
 class FlushCacheReqOutput(BaseReq):
     success: bool
+    flushed_items: int = 0
+    error_msg: str = ""
 
 
 # Additional classes needed for engine.py imports
