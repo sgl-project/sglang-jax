@@ -263,17 +263,13 @@ class EPMoE(nnx.Module):
             topk_weights_reshard = jax.sharding.reshard(topk_weights, P(None))
             topk_ids_reshard = jax.sharding.reshard(topk_ids, P(None))
             
-            w0_kernel_value = self.wi_0.qvalue if getattr(self.wi_0, 'qvalue') else self.wi_0.value
-            w1_kernel_value = self.wi_1.qvalue if getattr(self.wi_1, 'qvalue') else self.wi_1.value
-            wo_kernel_value = self.wo.qvalue if getattr(self.wo, 'qvalue') else self.wo.value
+            w0_kernel_value = self.wi_0.qvalue if getattr(self.wi_0, 'qvalue', None) else self.wi_0.value
+            w1_kernel_value = self.wi_1.qvalue if getattr(self.wi_1, 'qvalue', None) else self.wi_1.value
+            wo_kernel_value = self.wo.qvalue if getattr(self.wo, 'qvalue', None) else self.wo.value
 
-            w0_kernel_scale = self.wi_0.scale if getattr(self.wi_0, 'scale') else None
-            w1_kernel_scale = self.wi_1.scale if getattr(self.wi_1, 'scale') else None
-            wo_kernel_scale = self.wo.scale if getattr(self.wo, 'scale') else None
-
-            w0_kernel_bias = self.wi_0.bias if getattr(self.wi_0, 'bias') else None
-            w1_kernel_bias = self.wi_1.bias if getattr(self.wi_1, 'bias') else None
-            wo_kernel_bias = self.wo.bias if getattr(self.wo, 'bias') else None
+            w0_kernel_scale = getattr(self.wi_0, 'scale', None)
+            w1_kernel_scale = getattr(self.wi_1, 'scale', None)
+            wo_kernel_scale = getattr(self.wo, 'scale', None)
 
             result = shard_map(
                 self._forward,
@@ -304,7 +300,7 @@ class EPMoE(nnx.Module):
                 w0_kernel_value,
                 w1_kernel_value,
                 wo_kernel_value,
-                w0_kernel_scale, w1_kernel_scale, wo_kernel_scale, w0_kernel_bias, w1_kernel_bias, wo_kernel_bias,
+                w0_kernel_scale, w1_kernel_scale, wo_kernel_scale, None, None, None,
             )
 
         output_pspec = P(*([None] * (result.ndim)))
