@@ -36,6 +36,7 @@ from sgl_jax.srt.managers.io_struct import (
     BatchTokenIDOut,
     CloseSessionReqInput,
     ConfigureLoggingReq,
+    ContinueGenerationReqInput,
     EmbeddingReqInput,
     FlushCacheReqInput,
     FlushCacheReqOutput,
@@ -45,6 +46,7 @@ from sgl_jax.srt.managers.io_struct import (
     HealthCheckOutput,
     OpenSessionReqInput,
     OpenSessionReqOutput,
+    PauseGenerationReqInput,
     ProfileReq,
     ProfileReqOutput,
     ProfileReqType,
@@ -143,8 +145,8 @@ class TokenizerManager:
         self.is_generation = self.model_config.is_generation
         self.context_len = self.model_config.context_len
         self.image_token_id = self.model_config.image_token_id
-        self._updating = False
-        self._cond = asyncio.Condition()
+        self.is_pause = False
+        self.is_pause_cond = asyncio.Condition()
 
         self.mm_processor = None
 
@@ -242,9 +244,10 @@ class TokenizerManager:
         obj: GenerateReqInput | EmbeddingReqInput,
         request: fastapi.Request | None = None,
     ):
+
         created_time = time.time()
-        async with self._cond:
-            await self._cond.wait_for(lambda: not self._updating)
+        async with self.is_pause_cond:
+            await self.is_pause_cond.wait_for(lambda: not self.is_pause)
 
         self.auto_create_handle_loop()
         obj.normalize_batch_and_arguments()
@@ -582,7 +585,7 @@ class TokenizerManager:
     def abort_request(self, rid: str = "", abort_all: bool = False):
         if not abort_all and rid not in self.rid_to_state:
             return
-        req = AbortReq(rid, abort_all)
+        req = AbortReq(rid=rid, abort_all=abort_all)
         self.send_to_scheduler.send_pyobj(req)
 
     async def start_profile(
@@ -616,15 +619,24 @@ class TokenizerManager:
             raise RuntimeError(result.message)
         return result
 
-    async def pause_generation(self):
-        async with self._cond:
-            self._updating = True
-            self.abort_request(abort_all=True)
+    async def pause_generation(self, obj: PauseGenerationReqInput):
+        async with self.is_pause_cond:
+            self.is_pause = True
+            if obj.mode != "abort":
+                await self.send_to_scheduler.send_pyobj(obj)
+            else:
+                # use len(self.rid_to_state) == 0 to ensure all requests are aborted
+                while True:
+                    self.abort_request(abort_all=True)
+                    if len(self.rid_to_state) == 0:
+                        break
+                    await asyncio.sleep(0.1)
 
-    async def continue_generation(self):
-        async with self._cond:
-            self._updating = False
-            self._cond.notify_all()
+    async def continue_generation(self, obj: ContinueGenerationReqInput):
+        async with self.is_pause_cond:
+            self.is_pause = False
+            await self.send_to_scheduler.send_pyobj(obj)
+            self.is_pause_cond.notify_all()
 
     async def release_memory_occupation(
         self,

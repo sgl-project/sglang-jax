@@ -387,6 +387,10 @@ suites = {
         # TestFile("test/srt/test_sliding_window_attention.py", 30), # add after gpt-oss supported
         TestFile("test/srt/test_model_loader.py", 2),
         TestFile("test/srt/quantization/test_w8_quantization.py", 10),
+        TestFile("test/srt/test_engine_determine_generation.py", 3),
+        TestFile("test/srt/test_engine_flush_cache.py", 3),
+        TestFile("test/srt/test_engine_pause_continue.py", 3),
+        TestFile("test/srt/test_server_pause_continue.py", 6),
     ],
 }
 

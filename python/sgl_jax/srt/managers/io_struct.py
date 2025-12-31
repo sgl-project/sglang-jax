@@ -1,11 +1,25 @@
 import copy
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any
+from typing import Any, Literal
 
 from sgl_jax.srt.managers.schedule_batch import BaseFinishReason
+
+
+@dataclass
+class BaseReq:
+    rid: str | list[str] | None = field(default=None, kw_only=True)
+    http_worker_ipc: str | None = field(default=None, kw_only=True)
+
+    def regenerate_rid(self):
+        """Generate a new request ID and return it."""
+        if isinstance(self.rid, list):
+            self.rid = [uuid.uuid4().hex for _ in range(len(self.rid))]
+        else:
+            self.rid = uuid.uuid4().hex
+        return self.rid
 
 
 @dataclass
@@ -118,11 +132,57 @@ class TokenizedGenerateReqInput:
 
 
 @dataclass
-class AbortReq:
-    # The request id
-    rid: str = ""
+class AbortReq(BaseReq):
     # Whether to abort all requests
     abort_all: bool = False
+
+    finished_reason: dict[str, Any] | None = None
+    aborted_message: str | None = None
+
+
+@dataclass
+class PauseGenerationReqInput(BaseReq):
+    """
+    Note that the PauseGenerationRequests is only supported in SGLang Server.
+    abort: Abort and return all requests currently being processed.
+
+    in_place: Pause the scheduler's event_loop from performing inference;
+            only non-inference requests (e.g., control commands) will be handled.
+            The requests in the engine will be paused and stay in the event_loop,
+            then continue generation after continue_generation with the old kv cache.
+            Note: In 'inplace' mode, flush_cache will fail if there are any requests
+            in the running_batch.
+
+    retract: Pause the scheduler's event loop from performing inference;
+            only non-inference requests will be handled, and all currently running
+            requests will be retracted back to the waiting_queue.
+            Note: The KV cache can be flushed in this mode and will be automatically
+            recomputed after continue_generation.
+    """
+
+    mode: Literal["abort", "retract", "in_place"] = "abort"
+
+    def __post_init__(self):
+        allowed = ["abort", "retract", "in_place"]
+        if self.mode not in allowed:
+            raise ValueError(f"Invalid mode: {self.mode!r}. " f"Expected one of {allowed}.")
+
+
+@dataclass
+class ContinueGenerationReqInput(BaseReq):
+    pass
+
+
+@dataclass
+class FlushCacheReqInput(BaseReq):
+    pass
+
+
+@dataclass
+class FlushCacheReqOutput(BaseReq):
+    success: bool
+    flushed_items: int = 0
+    error_msg: str = ""
 
 
 # Additional classes needed for engine.py imports
@@ -454,18 +514,6 @@ class ConfigureLoggingReq(RpcReqInput):
     log_file: str | None = None
 
 
-@dataclass
-class FlushCacheReqInput(RpcReqInput):
-    """Request to flush cache."""
-
-    request_id: str = ""
-    cache_type: str = "all"
-
-    def __post_init__(self):
-        if not self.request_id:
-            self.request_id = f"flush_cache_{int(time.time())}"
-
-
 # Internal state classes
 @dataclass
 class GetInternalStateReq:
@@ -568,13 +616,6 @@ class ConfigureLoggingReqOutput(RpcReqOutput):
     """Output for ConfigureLoggingReq."""
 
     pass
-
-
-@dataclass
-class FlushCacheReqOutput(RpcReqOutput):
-    """Output for FlushCacheReqInput."""
-
-    flushed_items: int = 0
 
 
 @dataclass
