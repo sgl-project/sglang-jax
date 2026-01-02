@@ -521,18 +521,22 @@ class Grok1DecoderLayer(nnx.Module):
         self.pre_attn_norm = RMSNorm(
             config.hidden_size,
             epsilon=config.rms_norm_eps,
+            dtype=jnp.bfloat16,
         )
         self.post_attn_norm = RMSNorm(
             config.hidden_size,
             epsilon=config.rms_norm_eps,
+            dtype=jnp.bfloat16,
         )
         self.pre_moe_norm = RMSNorm(
             config.hidden_size,
             epsilon=config.rms_norm_eps,
+            dtype=jnp.bfloat16,
         )
         self.post_moe_norm = RMSNorm(
             config.hidden_size,
             epsilon=config.rms_norm_eps,
+            dtype=jnp.bfloat16,
         )
 
         # Setup FFN function based on configuration (matching PyTorch logic)

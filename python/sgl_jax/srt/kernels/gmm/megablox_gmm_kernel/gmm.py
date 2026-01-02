@@ -320,7 +320,7 @@ def gmm(
     tiling: tuple[int, int, int] | LutFn | None = (128, 128, 128),
     group_offset: jnp.ndarray | None = None,
     existing_out: jnp.ndarray | None = None,
-    transpose_rhs: bool = False,
+    transpose_rhs: bool = True,
     interpret: bool = False,
 ) -> jnp.ndarray:
     """Compute lhs[sizes[i-1]:sizes[i], :] @ rhs for each group 'i'.
@@ -347,6 +347,9 @@ def gmm(
     # TODO(kyuyeunk): Instead of transpose_rhs==True, modify logic to only
     # transpose_rhs==False instead as it simplifies the logic in kernel.
     assert transpose_rhs
+    # TODO (Qinghan): transpose_rhs for now and will be changed later
+    if transpose_rhs:
+        rhs = jnp.transpose(rhs, (0, 2, 1))
 
     if existing_out is not None:
         assert isinstance(existing_out, jax.Array)
