@@ -3,9 +3,10 @@ from flax import nnx
 from jax import numpy as jnp
 from jax import shard_map
 from jax.sharding import Mesh
-from jax.sharding import PartitionSpec as P
+from jax.sharding import PartitionSpec as P, reshard
 
 from sgl_jax.srt.kernels.gmm.megablox_gmm_backend import gmm
+from sgl_jax.srt.utils.quantization.quantization_utils import quantize_tensor
 
 
 class GateLogit(nnx.Module):
@@ -215,6 +216,7 @@ class EPMoE(nnx.Module):
         self.updated_mesh = abstract_mesh.update(
             axis_sizes=(self.ep_size, self.tp_size), axis_names=("expert", "tensor")
         )
+        print("self.updated_mesh: ", self.updated_mesh)
 
         with jax.sharding.use_abstract_mesh(self.updated_mesh):
             self.wi_0 = nnx.Param(
@@ -243,6 +245,8 @@ class EPMoE(nnx.Module):
                     out_sharding=P("expert", "tensor", None),
                 )
             )
+            
+            self.quantized_dtype = jnp.int8
 
     def _detect_device_capabilities(self):
         try:
@@ -262,15 +266,17 @@ class EPMoE(nnx.Module):
             hidden_states_reshard = jax.sharding.reshard(hidden_states, P(None))
             topk_weights_reshard = jax.sharding.reshard(topk_weights, P(None))
             topk_ids_reshard = jax.sharding.reshard(topk_ids, P(None))
+            self.wi_0.value = reshard(self.wi_0.value, P("expert", None, "tensor"))
+            self.wi_1.value = reshard(self.wi_1.value, P("expert", None, "tensor"))
+            self.wo.value = reshard(self.wo.value, P("expert", "tensor", None))
+            w0_kernel_value, w0_kernel_scale = quantize_tensor(self.quantized_dtype, self.wi_0.value, axis=1)
+            w1_kernel_value, w1_kernel_scale = quantize_tensor(self.quantized_dtype, self.wi_1.value, axis=1)
+            wo_kernel_value, wo_kernel_scale = quantize_tensor(self.quantized_dtype, self.wo.value, axis=1)
+            # reshape scale to match 4d shape required by gmm
+            w0_kernel_scale = w0_kernel_scale.reshape(w0_kernel_scale.shape[0], 1, 1, w0_kernel_scale.shape[1])
+            w1_kernel_scale = w1_kernel_scale.reshape(w1_kernel_scale.shape[0], 1, 1, w1_kernel_scale.shape[1])
+            wo_kernel_scale = wo_kernel_scale.reshape(wo_kernel_scale.shape[0], 1, 1, wo_kernel_scale.shape[1])
             
-            w0_kernel_value = self.wi_0.qvalue if getattr(self.wi_0, 'qvalue', None) else self.wi_0.value
-            w1_kernel_value = self.wi_1.qvalue if getattr(self.wi_1, 'qvalue', None) else self.wi_1.value
-            wo_kernel_value = self.wo.qvalue if getattr(self.wo, 'qvalue', None) else self.wo.value
-
-            w0_kernel_scale = getattr(self.wi_0, 'scale', None)
-            w1_kernel_scale = getattr(self.wi_1, 'scale', None)
-            wo_kernel_scale = getattr(self.wo, 'scale', None)
-
             result = shard_map(
                 self._forward,
                 mesh=self.moe_mesh,
@@ -283,9 +289,9 @@ class EPMoE(nnx.Module):
                     P("expert", None, "tensor"),
                     P("expert", "tensor", None),
                     # scale
-                    P("expert", None, "tensor"),
-                    P("expert", None, "tensor"),
-                    P("expert", "tensor", None),
+                    P("expert", None, None, "tensor"),
+                    P("expert", None, None, "tensor"),
+                    P("expert", None, None, None),
                     # bias
                     P("expert", None, "tensor"),
                     P("expert", None, "tensor"),
