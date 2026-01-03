@@ -82,7 +82,6 @@ def qwix_quantize_nnx_model(
         "logits_metadata": logits_metadata,
     }
     model = qwix.quantize_model(model, qwix.PtqProvider(qwix_rules), **model_input)
-    print("eval_shape: ", jax.eval_shape(nnx.to_pure_dict, nnx.state(model)))
     return model
 
 
@@ -299,17 +298,12 @@ def quantize_tensor(
     tensor_q = jnp.clip(tensor / scale, dtype_min, dtype_max)
     tensor_q = tensor_q.reshape(orig_shape)
     tensor_q = tensor_q.astype(dtype)
-    
-    print("tensor_q: ", tensor_q.shape)
 
     # To avoid padded values affecting output of quantized matmul, we mask them
     # out with 0s.
     tensor_q = jnp.where(mask, tensor_q, 0)
 
-    print("before squeeze: ", scale.shape)
     scale = jnp.squeeze(scale, axis).astype(jnp.float32)
-
-    print("after squeeze: ", scale.shape)
 
     return tensor_q, scale
 
