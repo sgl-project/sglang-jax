@@ -3,9 +3,10 @@ from flax import nnx
 from jax import numpy as jnp
 from jax import shard_map
 from jax.sharding import Mesh
-from jax.sharding import PartitionSpec as P
+from jax.sharding import PartitionSpec as P, reshard
 
 from sgl_jax.srt.kernels.gmm.megablox_gmm_backend import gmm
+from sgl_jax.srt.utils.quantization.quantization_utils import quantize_tensor
 
 
 class GateLogit(nnx.Module):
@@ -174,7 +175,7 @@ class TopK(nnx.Module):
 class EPMoE(nnx.Module):
     def __init__(
         self,
-        config,
+        config, #PretrainedConfig
         num_experts: int,
         num_experts_per_tok: int,
         ep_size: int,
@@ -243,6 +244,8 @@ class EPMoE(nnx.Module):
                     out_sharding=P("expert", "tensor", None),
                 )
             )
+            
+            self.quantized_dtype = jnp.int8
 
     def _detect_device_capabilities(self):
         try:
@@ -262,7 +265,17 @@ class EPMoE(nnx.Module):
             hidden_states_reshard = jax.sharding.reshard(hidden_states, P(None))
             topk_weights_reshard = jax.sharding.reshard(topk_weights, P(None))
             topk_ids_reshard = jax.sharding.reshard(topk_ids, P(None))
-
+            self.wi_0.value = reshard(self.wi_0.value, P("expert", None, "tensor"))
+            self.wi_1.value = reshard(self.wi_1.value, P("expert", None, "tensor"))
+            self.wo.value = reshard(self.wo.value, P("expert", "tensor", None))
+            w0_kernel_value, w0_kernel_scale = quantize_tensor(self.quantized_dtype, self.wi_0.value, axis=1)
+            w1_kernel_value, w1_kernel_scale = quantize_tensor(self.quantized_dtype, self.wi_1.value, axis=1)
+            wo_kernel_value, wo_kernel_scale = quantize_tensor(self.quantized_dtype, self.wo.value, axis=1)
+            # reshape scale to match 4d shape required by gmm
+            w0_kernel_scale = w0_kernel_scale.reshape(w0_kernel_scale.shape[0], 1, 1, w0_kernel_scale.shape[1])
+            w1_kernel_scale = w1_kernel_scale.reshape(w1_kernel_scale.shape[0], 1, 1, w1_kernel_scale.shape[1])
+            wo_kernel_scale = wo_kernel_scale.reshape(wo_kernel_scale.shape[0], 1, 1, wo_kernel_scale.shape[1])
+            
             result = shard_map(
                 self._forward,
                 mesh=self.moe_mesh,
@@ -270,6 +283,15 @@ class EPMoE(nnx.Module):
                     P(None),
                     P(None),
                     P(None),
+                    # value
+                    P("expert", None, "tensor"),
+                    P("expert", None, "tensor"),
+                    P("expert", "tensor", None),
+                    # scale
+                    P("expert", None, None, "tensor"),
+                    P("expert", None, None, "tensor"),
+                    P("expert", None, None, None),
+                    # bias
                     P("expert", None, "tensor"),
                     P("expert", None, "tensor"),
                     P("expert", "tensor", None),
@@ -280,9 +302,10 @@ class EPMoE(nnx.Module):
                 hidden_states_reshard,
                 topk_weights_reshard,
                 topk_ids_reshard,
-                self.wi_0.value,
-                self.wi_1.value,
-                self.wo.value,
+                w0_kernel_value,
+                w1_kernel_value,
+                wo_kernel_value,
+                w0_kernel_scale, w1_kernel_scale, wo_kernel_scale, None, None, None,
             )
 
         output_pspec = P(*([None] * (result.ndim)))
@@ -290,7 +313,8 @@ class EPMoE(nnx.Module):
             result, jax.sharding.NamedSharding(self.original_mesh, output_pspec)
         )
 
-    def _forward(self, hidden_states, topk_weights, topk_ids, w0_weights, w1_weights, wo_weights):
+    def _forward(self, hidden_states, topk_weights, topk_ids, w0_weights, w1_weights, wo_weights,
+             w0_kernel_scale = None, w1_kernel_scale = None, wo_kernel_scale = None, w0_kernel_bias = None, w1_kernel_bias = None, wo_kernel_bias = None):
         expert_shard_id = jax.lax.axis_index("expert")
 
         if hidden_states.ndim == 2:
@@ -315,6 +339,7 @@ class EPMoE(nnx.Module):
             w1_weights,
             wo_weights,
             group_offset,
+            w0_kernel_scale, w1_kernel_scale, wo_kernel_scale, w0_kernel_bias, w1_kernel_bias, wo_kernel_bias,
         )
 
         if self.ep_size > 1:
@@ -329,7 +354,8 @@ class EPMoE(nnx.Module):
         )
         return output
 
-    def _gmm_compute(self, x, group_sizes, w0_kernel, w1_kernel, wo_kernel, group_offset):
+    def _gmm_compute(self, x, group_sizes, w0_kernel, w1_kernel, wo_kernel, group_offset,
+                     w0_kernel_scale = None, w1_kernel_scale = None, wo_kernel_scale = None, w0_kernel_bias = None, w1_kernel_bias = None, wo_kernel_bias = None):
         if x.shape[0] == 0:
             empty_output = jnp.zeros((0, wo_kernel.shape[-1]), dtype=x.dtype)
             return empty_output
@@ -357,6 +383,8 @@ class EPMoE(nnx.Module):
             rhs=w0_kernel,
             group_sizes=group_sizes,
             preferred_element_type=self.dtype,
+            rhs_scale=w0_kernel_scale,
+            rhs_bias=w0_kernel_bias,
             tiling=tiling_gate,
             group_offset=group_offset,
         )
@@ -366,6 +394,8 @@ class EPMoE(nnx.Module):
             rhs=w1_kernel,
             group_sizes=group_sizes,
             preferred_element_type=self.dtype,
+            rhs_scale=w1_kernel_scale,
+            rhs_bias=w1_kernel_bias,
             tiling=tiling_gate,
             group_offset=group_offset,
         )
@@ -383,6 +413,8 @@ class EPMoE(nnx.Module):
             rhs=wo_kernel,
             group_sizes=group_sizes,
             preferred_element_type=self.dtype,
+            rhs_scale=wo_kernel_scale,
+            rhs_bias=wo_kernel_bias,
             tiling=tiling_down,
             group_offset=group_offset,
         )
