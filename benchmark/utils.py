@@ -7,6 +7,7 @@ import pathlib
 import random
 import re
 import string
+import time
 from typing import Any
 
 import jax
@@ -104,10 +105,12 @@ def multiple_iteration_timeit_from_trace(
     trace_dir = os.path.join(trace_root, trace_name)
     os.makedirs(trace_dir, exist_ok=True)
 
+    start = time.perf_counter()
     for _ in range(max(0, int(warmup))):
         data_args = data_generator()
         out = compute_func(*data_args)
         jax.block_until_ready(out)
+    print(f"warmed up in {(time.perf_counter() - start) * 1000} ms")
 
     with jax.profiler.trace(trace_dir):
         for i in range(tries):
