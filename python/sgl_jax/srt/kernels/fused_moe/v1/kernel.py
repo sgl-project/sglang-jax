@@ -1401,7 +1401,9 @@ def _fused_ep_moe_kernel(
         b_output_flat = b_output_x2_vmem.reshape(2, output_bt, hidden_size)
 
         def start_load_bt(*, load_buf_id, tile_start):
-            for t_i in range(output_bt):
+            # Important: use `lax.fori_loop` to avoid unrolling `output_bt` and
+            # generating enormous MLIR for large token tiles.
+            def _load_one(t_i, _):
                 t_id = tile_start + t_i
                 for k_id in range(top_k):
                     e_id = t2e_routing_smem[t_id, k_id]
@@ -1412,6 +1414,9 @@ def _fused_ep_moe_kernel(
                         dst_ref=a2a_g_acc_vmem.at[load_buf_id, k_id, pl.ds(t_i, 1)],
                         sem=a2a_acc_sems.at[load_buf_id],
                     ).start()
+                return None
+
+            lax.fori_loop(0, output_bt, _load_one, None, unroll=False)
 
         def wait_load_bt(*, load_buf_id):
             pltpu.make_async_copy(
@@ -1435,18 +1440,15 @@ def _fused_ep_moe_kernel(
             ).start()
 
         def bt_acc(*, load_buf_id, tile_start, tile_sz, out_buf_id):
-            for t_i in range(tile_sz):
+            # Important: use `lax.fori_loop` to avoid unrolling `tile_sz` and
+            # generating enormous MLIR for large token tiles.
+            def _acc_one(t_i, _):
                 t_id = tile_start + t_i
-                output_vec = None
+                output_vec = jnp.zeros((t_packing, h_per_t_packing), dtype=jnp.float32)
                 for k_id in range(top_k):
                     acc = a2a_g_acc_vmem[load_buf_id, k_id, t_i]
                     logit = top_k_logits_lst[k_id][t_id, 0]
-                    contrib = acc.astype(jnp.float32) * logit
-                    if output_vec is None:
-                        output_vec = contrib
-                    else:
-                        output_vec += contrib
-                assert output_vec is not None
+                    output_vec += acc.astype(jnp.float32) * logit
                 out_row_ref = b_output_x2_vmem.at[
                     out_buf_id,
                     pl.ds(t_i, 1),
@@ -1456,6 +1458,9 @@ def _fused_ep_moe_kernel(
                 out_row_ref[...] = output_vec.reshape(1, t_packing, h_per_t_packing).astype(
                     output_hbm.dtype
                 )
+                return None
+
+            lax.fori_loop(0, tile_sz, _acc_one, None, unroll=False)
 
         num_tiles = (local_num_tokens + output_bt - 1) // output_bt
 
@@ -1467,12 +1472,12 @@ def _fused_ep_moe_kernel(
             out_buf_id = tile_idx & 1
             load_buf_id = tile_idx & 1
             tile_sz = min(output_bt, local_num_tokens - tile_start)
-            if tile_idx >= 2:
-                wait_store_output(out_buf_id=out_buf_id)
-
             next_tile_start = tile_start + output_bt
             if tile_idx + 1 < num_tiles:
                 start_load_bt(load_buf_id=load_buf_id ^ 1, tile_start=next_tile_start)
+
+            if tile_idx >= 2:
+                wait_store_output(out_buf_id=out_buf_id)
 
             wait_load_bt(load_buf_id=load_buf_id)
             bt_acc(
