@@ -14,6 +14,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from flax import nnx
+from jax.experimental.compilation_cache import compilation_cache as _compilation_cache
 
 from benchmark.moe.utils import (
     BAILING_BASE,
@@ -545,6 +546,12 @@ def parse_args() -> argparse.Namespace:
         help="VMEM budget used to filter candidate block configs (MiB).",
     )
     parser.add_argument(
+        "--compilation-cache-dir",
+        type=str,
+        default=None,
+        help="Optional JAX compilation cache directory to reuse compiled executables across runs.",
+    )
+    parser.add_argument(
         "--max-configs",
         type=int,
         default=9,
@@ -555,6 +562,8 @@ def parse_args() -> argparse.Namespace:
 
 if __name__ == "__main__":
     args = parse_args()
+    if args.compilation_cache_dir:
+        _compilation_cache.set_cache_dir(args.compilation_cache_dir)
     tpu_vmem_budget_bytes = int(args.tpu_vmem_budget_mb) * 1024 * 1024
     run_all(
         args.scenario,

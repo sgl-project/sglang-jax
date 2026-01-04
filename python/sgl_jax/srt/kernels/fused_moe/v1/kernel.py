@@ -615,17 +615,17 @@ def _fused_ep_moe_kernel(
 
     def start_a2a_scatter(e_sem_id, local_e_id):
         # Counting the number of remote sends from the current device.
-        send_sz = 0
-        for t_id in range(local_num_tokens):
+        # Use `lax.fori_loop` to avoid unrolling `local_num_tokens` (huge MLIR / slow compile).
+        def _scatter_one(t_id, send_sz, e_sem_id=e_sem_id, local_e_id=local_e_id):
             for k_id in range(top_k):
                 e_id = t2e_routing_smem[t_id, k_id]
                 is_active_expert = e_id % local_num_experts == local_e_id
                 recv_id = e_id // local_num_experts
                 offset = expert_offsets_smem[0, e_id]
-                sz = lax.select(is_active_expert, 1, 0)
+                sz = lax.select(is_active_expert, jnp.int32(1), jnp.int32(0))
                 is_local = recv_id == my_id
-                local_sz = lax.select(is_local, sz, 0)
-                remote_sz = lax.select(is_local, 0, sz)
+                local_sz = lax.select(is_local, sz, jnp.int32(0))
+                remote_sz = lax.select(is_local, jnp.int32(0), sz)
                 send_sz += remote_sz
                 expert_offsets_smem[0, e_id] = offset + local_sz + remote_sz
                 start = expert_starts_smem[0, e_id] + offset
@@ -643,6 +643,15 @@ def _fused_ep_moe_kernel(
                     device_id=get_mesh_device_id(recv_id),
                     device_id_type=pltpu.DeviceIdType.MESH,
                 ).start()
+            return send_sz
+
+        send_sz = lax.fori_loop(
+            0,
+            local_num_tokens,
+            _scatter_one,
+            jnp.int32(0),
+            unroll=False,
+        )
         a2a_s_sends_x2_smem[e_sem_id] = send_sz
 
     def wait_a2a_scatter_recv(e_sem_id, local_e_id):
