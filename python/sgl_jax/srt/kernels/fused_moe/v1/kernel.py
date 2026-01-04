@@ -1294,21 +1294,6 @@ def _fused_ep_moe_kernel(
                             jnp.int32(0), bd2_start, init_buf_compute
                         )
 
-                def _acc_dma_pending_get(p0, p1, p2, idx):
-                    return lax.select(idx == 0, p0, lax.select(idx == 1, p1, p2))
-
-                def _acc_dma_pending_set(p0, p1, p2, idx, val):
-                    p0 = lax.select(idx == 0, val, p0)
-                    p1 = lax.select(idx == 1, val, p1)
-                    p2 = lax.select(idx == 2, val, p2)
-                    return p0, p1, p2
-
-                acc_dma_pending_buf0 = jnp.int32(0)
-                acc_dma_pending_buf1 = jnp.int32(0)
-                acc_dma_pending_buf2 = jnp.int32(0)
-                if not should_init_ffn2:
-                    acc_dma_pending_buf0 = lax.select(has_tiles, jnp.int32(1), acc_dma_pending_buf0)
-
                 def run_ffn2_tile(
                     token_tile_id,
                     state,
@@ -1322,44 +1307,39 @@ def _fused_ep_moe_kernel(
                     b2_vmem=b2_vmem,
                     should_init_ffn2=should_init_ffn2,
                 ):
-                    buf_compute, buf_store, buf_load, pending0, pending1, pending2 = state
+                    buf_compute, buf_store, buf_load = state
                     tile_start = token_tile_id * token_tile
                     tile_sz = jnp.maximum(jnp.minimum(dyn_sz_i32 - tile_start, token_tile), 0)
 
-                    # Prefetch next tile's accumulator (if accumulating across bf blocks).
+                    # Prefetch next tile's accumulator (when accumulating across bf blocks).
                     if not should_init_ffn2:
                         do_prefetch = token_tile_id + 1 < num_token_tiles
                         next_tile_start = (token_tile_id + 1) * token_tile
 
-                        pending_load = _acc_dma_pending_get(pending0, pending1, pending2, buf_load)
-
-                        @pl.when(jnp.logical_and(do_prefetch, pending_load == 1))
-                        def _():
+                        # Triple-buffer ring:
+                        # - buf_compute holds the current tile's loaded accumulator
+                        # - buf_load holds the buffer from two tiles ago (store in-flight)
+                        # We only need to wait before reusing `buf_load` starting from tile 2.
+                        @pl.when(jnp.logical_and(do_prefetch, token_tile_id >= 2))
+                        def _(buf_load=buf_load):
                             wait_stage_a2a_s_acc_tile(buf_load)
 
                         @pl.when(do_prefetch)
-                        def _():
+                        def _(
+                            next_tile_start=next_tile_start, bd2_start=bd2_start, buf_load=buf_load
+                        ):
                             start_load_stage_a2a_s_acc_tile_from_hbm(
                                 next_tile_start, bd2_start, buf_load
                             )
 
-                        pending_load_val = lax.select(do_prefetch, jnp.int32(1), pending_load)
-                        pending0, pending1, pending2 = _acc_dma_pending_set(
-                            pending0, pending1, pending2, buf_load, pending_load_val
-                        )
-
                         # Ensure current tile's load has completed before compute.
-                        pending_compute = _acc_dma_pending_get(
-                            pending0, pending1, pending2, buf_compute
-                        )
-
-                        @pl.when(pending_compute == 1)
-                        def _():
+                        wait_stage_a2a_s_acc_tile(buf_compute)
+                    else:
+                        # When initializing (no loads), the only hazard is reusing a buffer that still
+                        # has an in-flight store from 3 tiles ago.
+                        @pl.when(token_tile_id >= 3)
+                        def _(buf_compute=buf_compute):
                             wait_stage_a2a_s_acc_tile(buf_compute)
-
-                        pending0, pending1, pending2 = _acc_dma_pending_set(
-                            pending0, pending1, pending2, buf_compute, jnp.int32(0)
-                        )
 
                     dynamic_ffn2(
                         acc1_vmem=b_acc1_vmem.at[pl.ds(tile_start, token_tile)],
@@ -1372,37 +1352,24 @@ def _fused_ep_moe_kernel(
                         should_init=should_init_ffn2,
                     )
                     start_store_stage_a2a_s_acc_tile_to_hbm(tile_start, bd2_start, buf_compute)
-                    pending0, pending1, pending2 = _acc_dma_pending_set(
-                        pending0, pending1, pending2, buf_compute, jnp.int32(1)
-                    )
                     # Rotate buffers: compute <- load, store <- compute, load <- store.
-                    return (buf_load, buf_compute, buf_store, pending0, pending1, pending2)
+                    return (buf_load, buf_compute, buf_store)
 
-                state = (
-                    init_buf_compute,
-                    init_buf_store,
-                    init_buf_load,
-                    acc_dma_pending_buf0,
-                    acc_dma_pending_buf1,
-                    acc_dma_pending_buf2,
-                )
+                state = (init_buf_compute, init_buf_store, init_buf_load)
                 state = lax.fori_loop(0, num_token_tiles, run_ffn2_tile, state, unroll=False)
-                # Drain outstanding DMA before the next bd2 slice / gather.
-                acc_dma_pending_buf0 = state[3]
-                acc_dma_pending_buf1 = state[4]
-                acc_dma_pending_buf2 = state[5]
 
-                @pl.when(acc_dma_pending_buf0 == 1)
+                # Drain outstanding stores before the next bd2 slice / gather.
+                @pl.when(num_token_tiles >= 1)
                 def _():
                     wait_stage_a2a_s_acc_tile(jnp.int32(0))
 
-                @pl.when(acc_dma_pending_buf1 == 1)
-                def _():
-                    wait_stage_a2a_s_acc_tile(jnp.int32(1))
-
-                @pl.when(acc_dma_pending_buf2 == 1)
+                @pl.when(num_token_tiles >= 2)
                 def _():
                     wait_stage_a2a_s_acc_tile(jnp.int32(2))
+
+                @pl.when(num_token_tiles >= 3)
+                def _():
+                    wait_stage_a2a_s_acc_tile(jnp.int32(1))
 
                 bw_sem_id = (bw_sem_id + 1) % 2
 
