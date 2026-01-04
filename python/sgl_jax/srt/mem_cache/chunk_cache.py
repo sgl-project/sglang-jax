@@ -40,7 +40,7 @@ class ChunkCache(BasePrefixCache):
             : len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0),
         ]
         self.req_to_token_pool.free(req.req_pool_idx)
-        self.token_to_kv_pool_allocator.free(kv_indices)
+        self.token_to_kv_pool_allocator.free(kv_indices, req.dp_rank)
 
     def cache_unfinished_req(self, req: Req):
         req.prefix_indices = self.req_to_token_pool.req_to_token[

@@ -243,7 +243,6 @@ def generate_mock_model_worker_batch(
         ),
         extend_input_logprob_token_ids=None,
         positions=np.concat([valid_positions, invalid_positions], axis=0),
-        extend_start_loc=np.arange(bs, dtype=np.int64),
         cache_loc=np.concat([valid_cache_loc, invalid_cache_loc], axis=0),
         extend_prefix_lens=(np.array([0] * bs) if mode == ForwardMode.EXTEND else None),
         extend_seq_lens=np.array([1] * bs) if mode == ForwardMode.EXTEND else None,
@@ -252,4 +251,6 @@ def generate_mock_model_worker_batch(
         extend_logprob_start_lens=None,
         capture_hidden_mode=CaptureHiddenMode.NULL,
         spec_algorithm=speculative_algotithm,
+        dp_size=1,
+        per_dp_bs_size=bs,
     )
