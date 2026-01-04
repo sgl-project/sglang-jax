@@ -107,20 +107,31 @@ class FlashAttention(AttentionBackend):
         selected_cache_locs = batch.cache_loc[indices]
         page_indices = (selected_cache_locs // self.page_size).astype(np.int32)
 
+        # Compute cu_q_lens per DP rank section (each section starts from 0)
         if batch.forward_mode == ForwardMode.EXTEND:
-            cu_q_lens = np.concatenate(
-                [
-                    np.array([0], dtype=np.int32),
-                    np.cumsum(batch.extend_seq_lens, dtype=np.int32),
-                ]
-            )
+            cu_q_lens_sections = []
+            for i in range(0, len(batch.extend_seq_lens), batch.per_dp_bs_size):
+                section_lens = batch.extend_seq_lens[i : i + batch.per_dp_bs_size]
+                section_cu = np.concatenate(
+                    [
+                        np.array([0], dtype=np.int32),
+                        np.cumsum(section_lens, dtype=np.int32),
+                    ]
+                )
+                cu_q_lens_sections.append(section_cu)
+            cu_q_lens = np.concatenate(cu_q_lens_sections)
         elif batch.forward_mode == ForwardMode.DECODE:
-            cu_q_lens = np.concatenate(
-                [
-                    np.array([0], dtype=np.int32),
-                    np.cumsum(np.ones(len(batch.seq_lens), dtype=np.int32)),
-                ]
-            )
+            cu_q_lens_sections = []
+            for i in range(0, len(batch.seq_lens), batch.per_dp_bs_size):
+                section_size = min(batch.per_dp_bs_size, len(batch.seq_lens) - i)
+                section_cu = np.concatenate(
+                    [
+                        np.array([0], dtype=np.int32),
+                        np.cumsum(np.ones(section_size, dtype=np.int32)),
+                    ]
+                )
+                cu_q_lens_sections.append(section_cu)
+            cu_q_lens = np.concatenate(cu_q_lens_sections)
         else:
             raise ValueError(f"Invalid forward mode: {batch.forward_mode}")
 
@@ -129,12 +140,19 @@ class FlashAttention(AttentionBackend):
         aligned_seq_lens = (
             (batch.seq_lens + self.page_size - 1) // self.page_size
         ) * self.page_size
-        cu_kv_lens = np.concatenate(
-            [
-                np.array([0], dtype=np.int32),
-                np.cumsum(aligned_seq_lens),
-            ]
-        )
+
+        # Compute cu_kv_lens per DP rank section (each section starts from 0)
+        cu_kv_lens_sections = []
+        for i in range(0, len(aligned_seq_lens), batch.per_dp_bs_size):
+            section_lens = aligned_seq_lens[i : i + batch.per_dp_bs_size]
+            section_cu = np.concatenate(
+                [
+                    np.array([0], dtype=np.int32),
+                    np.cumsum(section_lens, dtype=np.int32),
+                ]
+            )
+            cu_kv_lens_sections.append(section_cu)
+        cu_kv_lens = np.concatenate(cu_kv_lens_sections)
 
         num_seqs = np.sum(batch.seq_lens > 0, dtype=np.int32).reshape(
             1,
