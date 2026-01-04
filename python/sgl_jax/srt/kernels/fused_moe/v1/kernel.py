@@ -371,7 +371,7 @@ def _fused_ep_moe_kernel(
     a2a_g_acc_vmem,  # (2, top_k, 1, t_packing, hidden_size // t_packing)
     ### Expert weight double buffering:
     b_gating_vmem,  # (local_num_tokens, padded_num_experts)
-    b_output_x2_vmem,  # (2, bt, hidden_size)
+    b_output_x2_vmem,  # (2, bt, t_packing, hidden_size // t_packing)
     b_w1_x2_vmem,  # <bw_sem_id> (2, t_packing, bd1 // t_packing, bf)
     b_w3_x2_vmem,  # <bw_sem_id> (2, t_packing, bd1 // t_packing, bf)
     b_w2_x2_vmem,  # <bw_sem_id> (2, t_packing, bf, bd2 // t_packing)
@@ -1283,20 +1283,20 @@ def _fused_ep_moe_kernel(
                             jnp.int32(0), bd2_start, init_buf_compute
                         )
 
-                def _pending_get(p0, p1, p2, idx):
+                def _acc_dma_pending_get(p0, p1, p2, idx):
                     return lax.select(idx == 0, p0, lax.select(idx == 1, p1, p2))
 
-                def _pending_set(p0, p1, p2, idx, val):
+                def _acc_dma_pending_set(p0, p1, p2, idx, val):
                     p0 = lax.select(idx == 0, val, p0)
                     p1 = lax.select(idx == 1, val, p1)
                     p2 = lax.select(idx == 2, val, p2)
                     return p0, p1, p2
 
-                pending0 = jnp.int32(0)
-                pending1 = jnp.int32(0)
-                pending2 = jnp.int32(0)
+                acc_dma_pending_buf0 = jnp.int32(0)
+                acc_dma_pending_buf1 = jnp.int32(0)
+                acc_dma_pending_buf2 = jnp.int32(0)
                 if not should_init_ffn2:
-                    pending0 = lax.select(has_tiles, jnp.int32(1), pending0)
+                    acc_dma_pending_buf0 = lax.select(has_tiles, jnp.int32(1), acc_dma_pending_buf0)
 
                 def run_ffn2_tile(
                     token_tile_id,
@@ -1320,7 +1320,7 @@ def _fused_ep_moe_kernel(
                         do_prefetch = token_tile_id + 1 < num_token_tiles
                         next_tile_start = (token_tile_id + 1) * token_tile
 
-                        pending_load = _pending_get(pending0, pending1, pending2, buf_load)
+                        pending_load = _acc_dma_pending_get(pending0, pending1, pending2, buf_load)
 
                         @pl.when(jnp.logical_and(do_prefetch, pending_load == 1))
                         def _():
@@ -1333,18 +1333,20 @@ def _fused_ep_moe_kernel(
                             )
 
                         pending_load_val = lax.select(do_prefetch, jnp.int32(1), pending_load)
-                        pending0, pending1, pending2 = _pending_set(
+                        pending0, pending1, pending2 = _acc_dma_pending_set(
                             pending0, pending1, pending2, buf_load, pending_load_val
                         )
 
                         # Ensure current tile's load has completed before compute.
-                        pending_compute = _pending_get(pending0, pending1, pending2, buf_compute)
+                        pending_compute = _acc_dma_pending_get(
+                            pending0, pending1, pending2, buf_compute
+                        )
 
                         @pl.when(pending_compute == 1)
                         def _():
                             wait_stage_a2a_s_acc_tile(buf_compute)
 
-                        pending0, pending1, pending2 = _pending_set(
+                        pending0, pending1, pending2 = _acc_dma_pending_set(
                             pending0, pending1, pending2, buf_compute, jnp.int32(0)
                         )
 
@@ -1359,7 +1361,7 @@ def _fused_ep_moe_kernel(
                         should_init=should_init_ffn2,
                     )
                     start_store_stage_a2a_s_acc_tile_to_hbm(tile_start, bd2_start, buf_compute)
-                    pending0, pending1, pending2 = _pending_set(
+                    pending0, pending1, pending2 = _acc_dma_pending_set(
                         pending0, pending1, pending2, buf_compute, jnp.int32(1)
                     )
                     # Rotate buffers: compute <- load, store <- compute, load <- store.
@@ -1369,31 +1371,33 @@ def _fused_ep_moe_kernel(
                     init_buf_compute,
                     init_buf_store,
                     init_buf_load,
-                    pending0,
-                    pending1,
-                    pending2,
+                    acc_dma_pending_buf0,
+                    acc_dma_pending_buf1,
+                    acc_dma_pending_buf2,
                 )
                 state = lax.fori_loop(0, num_token_tiles, run_ffn2_tile, state, unroll=False)
                 # Drain outstanding DMA before the next bd2 slice / gather.
-                pending0 = state[3]
-                pending1 = state[4]
-                pending2 = state[5]
+                acc_dma_pending_buf0 = state[3]
+                acc_dma_pending_buf1 = state[4]
+                acc_dma_pending_buf2 = state[5]
 
-                @pl.when(pending0 == 1)
+                @pl.when(acc_dma_pending_buf0 == 1)
                 def _():
                     wait_stage_a2a_s_acc_tile(jnp.int32(0))
 
-                @pl.when(pending1 == 1)
+                @pl.when(acc_dma_pending_buf1 == 1)
                 def _():
                     wait_stage_a2a_s_acc_tile(jnp.int32(1))
 
-                @pl.when(pending2 == 1)
+                @pl.when(acc_dma_pending_buf2 == 1)
                 def _():
                     wait_stage_a2a_s_acc_tile(jnp.int32(2))
 
                 bw_sem_id = (bw_sem_id + 1) % 2
 
     def acc_and_store_output(top_k_logits_lst):
+        output_packed_hbm = output_hbm.reshape(local_num_tokens, t_packing, h_per_t_packing)
+
         def start_fetch_a2a_g_token(*, acc_buf_id, t_id):
             for k_id in range(top_k):
                 e_id = t2e_routing_smem[t_id, k_id]
@@ -1420,19 +1424,13 @@ def _fused_ep_moe_kernel(
             ).wait()
 
         out_buf_id = 0
-        out_pending0 = False
-        out_pending1 = False
+        output_store_inflight = [False, False]
 
         for tile_start in range(0, local_num_tokens, bt):
             tile_sz = min(bt, local_num_tokens - tile_start)
-            if out_buf_id == 0:
-                if out_pending0:
-                    wait_store_output(out_buf_id=out_buf_id)
-                    out_pending0 = False
-            else:
-                if out_pending1:
-                    wait_store_output(out_buf_id=out_buf_id)
-                    out_pending1 = False
+            if output_store_inflight[out_buf_id]:
+                wait_store_output(out_buf_id=out_buf_id)
+                output_store_inflight[out_buf_id] = False
 
             # Token-level double-buffering to overlap a2a_g_hbm reads with reduction.
             acc_buf_id = 0
@@ -1452,34 +1450,37 @@ def _fused_ep_moe_kernel(
 
                 output_vec = None
                 for k_id in range(top_k):
-                    acc = a2a_g_acc_vmem[acc_buf_id, k_id, 0].reshape(hidden_size)
+                    acc = a2a_g_acc_vmem[acc_buf_id, k_id, 0]
                     logit = top_k_logits_lst[k_id][t_id, 0]
-                    contrib = acc * logit
+                    contrib = acc.astype(jnp.float32) * logit
                     if output_vec is None:
                         output_vec = contrib
                     else:
                         output_vec += contrib
                 assert output_vec is not None
-                out_row_ref = b_output_x2_vmem.at[out_buf_id, pl.ds(t_i, 1), pl.ds(0, hidden_size)]
-                out_row_ref[...] = output_vec.reshape(1, hidden_size).astype(output_hbm.dtype)
+                out_row_ref = b_output_x2_vmem.at[
+                    out_buf_id,
+                    pl.ds(t_i, 1),
+                    pl.ds(0, t_packing),
+                    pl.ds(0, h_per_t_packing),
+                ]
+                out_row_ref[...] = output_vec.reshape(1, t_packing, h_per_t_packing).astype(
+                    output_hbm.dtype
+                )
                 acc_buf_id = next_buf_id
 
             pltpu.make_async_copy(
                 src_ref=b_output_x2_vmem.at[out_buf_id, pl.ds(0, tile_sz)],
-                dst_ref=output_hbm.at[pl.ds(tile_start, tile_sz)],
+                dst_ref=output_packed_hbm.at[pl.ds(tile_start, tile_sz)],
                 sem=local_sems.at[out_buf_id, 4],
             ).start()
-            if out_buf_id == 0:
-                out_pending0 = True
-            else:
-                out_pending1 = True
+            output_store_inflight[out_buf_id] = True
             out_buf_id ^= 1
 
         # Drain any outstanding output stores before returning.
-        if out_pending0:
-            wait_store_output(out_buf_id=0)
-        if out_pending1:
-            wait_store_output(out_buf_id=1)
+        for buf_id in (0, 1):
+            if output_store_inflight[buf_id]:
+                wait_store_output(out_buf_id=buf_id)
 
     ### ------- Kernel start ------- ###
     sync_barrier()
@@ -1854,7 +1855,7 @@ def fused_ep_moe(
         pltpu.VMEM((2, top_k, 1, t_packing, hidden_per_pack), t_dtype),  # a2a_g_acc_vmem
         # Expert compute scratch.
         pltpu.VMEM((local_num_tokens, padded_num_experts), gating_dtype),  # b_gating_vmem
-        pltpu.VMEM((2, block_config.bt, hidden_size), t_dtype),  # b_output_x2_vmem
+        pltpu.VMEM((2, block_config.bt, t_packing, hidden_per_pack), t_dtype),  # b_output_x2_vmem
         pltpu.VMEM((2, t_packing, bd1_per_pack, block_config.bf), w1.dtype),  # b_w1_x2_vmem
         pltpu.VMEM((2, t_packing, bd1_per_pack, block_config.bf), w3.dtype),  # b_w3_x2_vmem
         pltpu.VMEM((2, t_packing, block_config.bf, bd2_per_pack), w2.dtype),  # b_w2_x2_vmem
