@@ -251,4 +251,6 @@ def generate_mock_model_worker_batch(
         extend_logprob_start_lens=None,
         capture_hidden_mode=CaptureHiddenMode.NULL,
         spec_algorithm=speculative_algotithm,
+        dp_size=1,
+        per_dp_bs_size=bs,
     )

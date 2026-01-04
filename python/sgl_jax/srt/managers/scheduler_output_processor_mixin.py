@@ -87,20 +87,15 @@ class SchedulerOutputProcessorMixin:
                 continue
 
             # Check finish conditions for each request in this DP rank
-            for local_idx, (req, next_token_id) in enumerate(zip(reqs, dp_output_ids)):
-                # Calculate index in DP-formatted arrays: [dp0_slots..., dp1_slots..., ...]
-                i = per_dp_bs_size * dp_rank + local_idx
-
+            for i, (req, next_token_id) in enumerate(zip(reqs, dp_output_ids)):
                 if req.is_retracted:
                     continue
 
                 if (
                     self.is_mixed_chunk and self.enable_overlap and req.finished()
                 ):  # TODO @Brian fix it
-                    j = len(batch.out_cache_loc) - batch.batch_size() + i
-                    self.token_to_kv_pool_allocator.free(
-                        batch.out_cache_loc[j : j + 1], req.dp_rank
-                    )
+                    j = len(info.out_cache_loc) - batch.batch_size() + i
+                    self.token_to_kv_pool_allocator.free(info.out_cache_loc[j : j + 1], req.dp_rank)
                     continue
 
                 if req.is_chunked <= 0:
@@ -286,10 +281,7 @@ class SchedulerOutputProcessorMixin:
                 continue
 
             # Check finish condition for each request in this DP rank
-            for local_idx, (req, next_token_id) in enumerate(zip(reqs, dp_output_ids)):
-                # Calculate index in DP-formatted arrays: [dp0_slots..., dp1_slots..., ...]
-                i = per_dp_bs_size * dp_rank + local_idx
-
+            for i, (req, next_token_id) in enumerate(zip(reqs, dp_output_ids)):
                 req: Req
                 if req.is_retracted:
                     continue
@@ -297,12 +289,12 @@ class SchedulerOutputProcessorMixin:
                 indices_to_free = None
                 if self.enable_overlap and req.finished():
                     if self.page_size == 1:
-                        indices_to_free = batch.out_cache_loc[i : i + 1]
+                        indices_to_free = info.out_cache_loc[i : i + 1]
                     else:
                         if (
                             len(req.origin_input_ids) + len(req.output_ids) - 1
                         ) % self.page_size == 0:
-                            indices_to_free = batch.out_cache_loc[i : i + 1]
+                            indices_to_free = info.out_cache_loc[i : i + 1]
                     if indices_to_free is not None:
                         self.token_to_kv_pool_allocator.free(indices_to_free, req.dp_rank)
                     continue
@@ -318,7 +310,7 @@ class SchedulerOutputProcessorMixin:
 
                 if req.finished():
                     if batch.spec_algorithm is not None and batch.spec_algorithm.is_eagle():
-                        cur_allocate_len = batch.spec_info.allocate_lens[i]
+                        cur_allocate_len = info.spec_info.allocate_lens[i]
                         all_token_len = len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0)
                         if self.page_size > 1:
                             all_token_len = cdiv(all_token_len, self.page_size) * self.page_size
@@ -353,7 +345,7 @@ class SchedulerOutputProcessorMixin:
                     self.tree_cache.cache_finished_req(req)
 
                 if req.return_output_logprob_only:
-                    req.output_token_logprobs_val.append(next_token_logprobs[i])
+                    req.output_token_logprobs_val.append(next_token_logprobs[i])  # TODO @Brian fix
                     req.output_token_logprobs_idx.append(next_token_id)
 
                 if req.return_logprob and (

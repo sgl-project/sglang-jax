@@ -243,7 +243,9 @@ class LogitsProcessor(nnx.Module):
             sample_indices = None
             input_logprob_indices = None
         elif logits_metadata.forward_mode.is_extend() and not logits_metadata.extend_return_logprob:
-            last_index = jnp.cumsum(logits_metadata.extend_seq_lens, axis=0) - 1 # TODO @Brian in dp case cumsum not work
+            last_index = (
+                jnp.cumsum(logits_metadata.extend_seq_lens, axis=0) - 1
+            )  # TODO @Brian in dp case cumsum not work
             if (
                 logits_metadata.forward_mode.is_draft_extend()
                 and logits_metadata.accept_lens is not None

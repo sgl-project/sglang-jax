@@ -287,6 +287,8 @@ def create_test_data(
         extend_input_logprob_token_ids=None,
         real_bs=seq_lens.shape[0],
         spec_info=spec_info,
+        dp_size=1,
+        per_dp_bs_size=seq_lens.shape[0],
     )
 
     fb = ForwardBatch(
