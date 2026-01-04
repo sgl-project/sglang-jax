@@ -73,6 +73,8 @@ def _estimate_vmem_bytes(case: MoEBenchmarkCase, dtype: jnp.dtype, cfg: FusedMoE
     b_gating = local_num_tokens * padded_num_experts * token_bytes
     # t2e_routing_smem scratch: (local_num_tokens, padded_top_k) int32
     t2e_routing = local_num_tokens * padded_top_k * 4
+    # top_k_logits_vmem scratch: (local_num_tokens, top_k) float32
+    top_k_logits = local_num_tokens * top_k * 4
 
     # See kernel scratch shapes: b_w1_x2_vmem/b_w3_x2_vmem/b_w2_x2_vmem.
     w1 = 2 * bd1 * bf * weight_bytes
@@ -120,6 +122,7 @@ def _estimate_vmem_bytes(case: MoEBenchmarkCase, dtype: jnp.dtype, cfg: FusedMoE
         + b_output
         + b_gating
         + t2e_routing
+        + top_k_logits
         + w1
         + w3
         + w2

@@ -370,6 +370,7 @@ def _fused_ep_moe_kernel(
     a2a_s_sends_x2_smem,  # <e_sem_id> (2,)
     ### Accumulation for gathered tokens:
     a2a_g_acc_vmem,  # (2, top_k, output_bt, t_packing, hidden_size // t_packing)
+    top_k_logits_vmem,  # F32(local_num_tokens, top_k)
     ### Expert weight double buffering:
     b_gating_vmem,  # (local_num_tokens, padded_num_experts)
     b_output_x2_vmem,  # (2, output_bt, t_packing, hidden_size // t_packing)
@@ -1396,7 +1397,7 @@ def _fused_ep_moe_kernel(
 
                 bw_sem_id = (bw_sem_id + 1) % 2
 
-    def acc_and_store_output(top_k_logits_lst):
+    def acc_and_store_output():
         output_bt = b_output_x2_vmem.shape[1]
         b_output_flat = b_output_x2_vmem.reshape(2, output_bt, hidden_size)
 
@@ -1440,43 +1441,44 @@ def _fused_ep_moe_kernel(
             ).start()
 
         def bt_acc(*, load_buf_id, tile_start, tile_sz, out_buf_id):
-            # Important: use `lax.fori_loop` to avoid unrolling `tile_sz` and
-            # generating enormous MLIR for large token tiles.
-            def _acc_one(t_i, _):
-                t_id = tile_start + t_i
-                output_vec = jnp.zeros((t_packing, h_per_t_packing), dtype=jnp.float32)
-                for k_id in range(top_k):
-                    acc = a2a_g_acc_vmem[load_buf_id, k_id, t_i]
-                    logit = top_k_logits_lst[k_id][t_id, 0]
-                    output_vec += acc.astype(jnp.float32) * logit
-                out_row_ref = b_output_x2_vmem.at[
-                    out_buf_id,
-                    pl.ds(t_i, 1),
-                    pl.ds(0, t_packing),
-                    pl.ds(0, h_per_t_packing),
-                ]
-                out_row_ref[...] = output_vec.reshape(1, t_packing, h_per_t_packing).astype(
-                    output_hbm.dtype
-                )
-                return None
+            # Vectorized per-tile reduction to avoid dynamic_slice in TPU TC lowering.
+            output_tile = jnp.zeros((tile_sz, t_packing, h_per_t_packing), dtype=jnp.float32)
+            logits_tile = top_k_logits_vmem.at[
+                pl.ds(tile_start, tile_sz),
+                pl.ds(0, top_k),
+            ][...]
+            for k_id in range(top_k):
+                acc_tile = a2a_g_acc_vmem[load_buf_id, k_id, :tile_sz].astype(jnp.float32)
+                logits = logits_tile[:, k_id].reshape(tile_sz, 1, 1)
+                output_tile += acc_tile * logits
 
-            lax.fori_loop(0, tile_sz, _acc_one, None, unroll=False)
+            b_output_x2_vmem.at[out_buf_id, pl.ds(0, tile_sz)][...] = output_tile.astype(
+                output_hbm.dtype
+            )
 
-        num_tiles = (local_num_tokens + output_bt - 1) // output_bt
+        num_tiles = local_num_tokens // output_bt
 
         # Prefetch the first bt tile so the loop body can follow the
         # load(next) -> wait(curr) -> compute(curr) -> store(curr) structure.
-        start_load_bt(load_buf_id=0, tile_start=0)
+        start_load_bt(load_buf_id=0, tile_start=jnp.int32(0))
 
-        for tile_idx, tile_start in enumerate(range(0, local_num_tokens, output_bt)):
+        def run_tile(tile_idx, _):
             out_buf_id = tile_idx & 1
             load_buf_id = tile_idx & 1
-            tile_sz = min(output_bt, local_num_tokens - tile_start)
-            next_tile_start = tile_start + output_bt
-            if tile_idx + 1 < num_tiles:
-                start_load_bt(load_buf_id=load_buf_id ^ 1, tile_start=next_tile_start)
+            tile_start = tile_idx * output_bt
+            tile_sz = output_bt
 
-            if tile_idx >= 2:
+            next_tile_start = tile_start + output_bt
+
+            @pl.when(tile_idx + 1 < num_tiles)
+            def _start_next(
+                next_tile_start=next_tile_start,
+                next_load_buf_id=load_buf_id ^ 1,
+            ):
+                start_load_bt(load_buf_id=next_load_buf_id, tile_start=next_tile_start)
+
+            @pl.when(tile_idx >= 2)
+            def _wait_reuse(out_buf_id=out_buf_id):
                 wait_store_output(out_buf_id=out_buf_id)
 
             wait_load_bt(load_buf_id=load_buf_id)
@@ -1487,6 +1489,9 @@ def _fused_ep_moe_kernel(
                 out_buf_id=out_buf_id,
             )
             start_store_output(tile_start=tile_start, tile_sz=tile_sz, out_buf_id=out_buf_id)
+            return None
+
+        lax.fori_loop(0, num_tiles, run_tile, None, unroll=False)
 
         # Drain any outstanding output stores before returning.
         @pl.when(num_tiles == 1)
@@ -1510,6 +1515,13 @@ def _fused_ep_moe_kernel(
     top_k_logits_lst, t2e_routing, expert_sizes, expert_starts = get_top_k(
         b_gating_score, top_k, renormalize_topk_logits
     )
+
+    # Materialize per-token top-k logits into a compact VMEM buffer to avoid
+    # dynamic_slice on `top_k_logits_lst[k_id][t_id, 0]` inside acc_and_store_output.
+    for k_id in range(top_k):
+        top_k_logits_vmem.at[pl.ds(0, local_num_tokens), pl.ds(k_id, 1)][...] = top_k_logits_lst[
+            k_id
+        ][:, :1].astype(jnp.float32)
 
     all_reduce_metadata(t2e_routing=t2e_routing, starts=expert_starts, sizes=expert_sizes)
     sync_barrier()
@@ -1559,7 +1571,7 @@ def _fused_ep_moe_kernel(
     wait_a2a_gather_recv_all()
 
     # Accumulate results for current batch and write to output_hbm.
-    acc_and_store_output(top_k_logits_lst)
+    acc_and_store_output()
 
     # Drain the last outstanding gather sends (the loop body waits `local_e_id - 2`).
     wait_a2a_gather_send(
@@ -1872,6 +1884,7 @@ def fused_ep_moe(
         pltpu.SMEM((1, padded_num_experts), jnp.int32),  # expert_sizes_smem
         pltpu.SMEM((2,), jnp.int32),  # a2a_s_sends_x2_smem
         pltpu.VMEM((2, top_k, output_bt, t_packing, hidden_per_pack), t_dtype),  # a2a_g_acc_vmem
+        pltpu.VMEM((local_num_tokens, top_k), jnp.float32),  # top_k_logits_vmem
         # Expert compute scratch.
         pltpu.VMEM((local_num_tokens, padded_num_experts), gating_dtype),  # b_gating_vmem
         pltpu.VMEM((2, output_bt, t_packing, hidden_per_pack), t_dtype),  # b_output_x2_vmem
