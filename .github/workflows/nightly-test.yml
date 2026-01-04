@@ -9,7 +9,15 @@ on:
     paths:
       - "python/sgl_jax/version.py"
   workflow_dispatch:
-
+  pull_request:
+      branches:
+        - main
+        - "epic/*"
+      paths:
+        - "python/**"
+        - "scripts/**"
+        - "test/**"
+        - ".github/workflows/pr-test.yml"
 concurrency:
   group: nightly-test-${{ github.ref }}
   cancel-in-progress: true
@@ -31,7 +39,6 @@ jobs:
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           HF_HUB_DOWNLOAD_TIMEOUT: ${{ vars.HF_HUB_DOWNLOAD_TIMEOUT }}
-          MODEL_SCOPE_TOKEN: ${{ secrets.MODEL_SCOPE_TOKEN }}
         timeout-minutes: 3000
         run: |
           python3.12 -m venv .venv
@@ -72,7 +79,6 @@ jobs:
         env:
             HF_TOKEN: ${{ secrets.HF_TOKEN }}
             HF_HUB_DOWNLOAD_TIMEOUT: ${{ vars.HF_HUB_DOWNLOAD_TIMEOUT }}
-            MODEL_SCOPE_TOKEN: ${{ secrets.MODEL_SCOPE_TOKEN }}
         timeout-minutes: 1200
         run: |
           python3.12 -m venv .venv
@@ -235,7 +241,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        part: [0, 1 , 2, 3, 4, 5, 6, 7 ,8]
+        part: [0, 1 , 2, 3, 4, 5, 6, 7]
     continue-on-error: true
     steps:
       - name: Checkout code
@@ -356,3 +362,23 @@ jobs:
             GITHUB_RUN_NUMBER: ${{ github.run_number }}
           run: |
             python3 scripts/ci/publish_traces.py --traces-dir ./test/nightly_test_output
+
+        - name: Generate CSV Entry and publish
+          env:
+              GITHUB_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
+              GITHUB_RUN_ID: ${{ github.run_id }}
+              GITHUB_RUN_NUMBER: ${{ github.run_number }}
+          if: always()
+          run: |
+            mkdir -p ./test
+            SHA=${{ github.sha }}
+            AUTHOR=$(git log -1 --pretty=%an)
+            MSG=$(git log -1 --pretty=%B | tr -d ',' | head -n 1)
+            RUN_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            FILE="./test/nightly_report.csv"
+            if [ ! -f "$FILE" ]; then
+              echo "SHA,Author,Commit_Msg,Run_URL" > $FILE
+            fi
+            echo "$SHA,$AUTHOR,$MSG,$RUN_URL" >> $FILE
+            echo "CSV line added: $SHA, $AUTHOR, $MSG"
+            python3 scripts/ci/publish_traces.py --traces-dir ./test

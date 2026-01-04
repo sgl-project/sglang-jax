@@ -182,7 +182,9 @@ class TestModelPerf(CustomTestCase):
 
             output_dir = os.getenv("PERF_OUTPUT_DIR", "./test/nightly_test_output/perf/local_run")
             os.makedirs(output_dir, exist_ok=True)
-            output_filename = os.path.join(output_dir, "performance_results.csv")
+            concurrency_str = "_".join(map(str, concurrency_levels))
+            filename = f"performance_results_{model_dir_name}_c_{concurrency_str}.csv"
+            output_filename = os.path.join(output_dir, filename)
             file_exists = os.path.exists(output_filename)
             with open(output_filename, "a", newline="", encoding="utf-8") as csvfile:
 
@@ -311,7 +313,9 @@ class TestModelPerf(CustomTestCase):
 
             output_dir = os.getenv("PERF_OUTPUT_DIR", "./test/nightly_test_output/perf/local_run")
             os.makedirs(output_dir, exist_ok=True)
-            output_filename = os.path.join(output_dir, "performance_results_tp_4.csv")
+            output_filename = os.path.join(
+                output_dir, f"performance_results_{model_dir_name}_tp_4.csv"
+            )
             file_exists = os.path.exists(output_filename)
             with open(output_filename, "a", newline="", encoding="utf-8") as csvfile:
 
@@ -440,7 +444,9 @@ class TestModelPerf(CustomTestCase):
 
             output_dir = os.getenv("PERF_OUTPUT_DIR", "./test/nightly_test_output/perf/local_run")
             os.makedirs(output_dir, exist_ok=True)
-            output_filename = os.path.join(output_dir, "performance_results.csv")
+            concurrency_str = "_".join(map(str, concurrency_levels))
+            filename = f"performance_results_{model_dir_name}_c_{concurrency_str}.csv"
+            output_filename = os.path.join(output_dir, filename)
             file_exists = os.path.exists(output_filename)
             with open(output_filename, "a", newline="", encoding="utf-8") as csvfile:
 
@@ -569,7 +575,9 @@ class TestModelPerf(CustomTestCase):
 
             output_dir = os.getenv("PERF_OUTPUT_DIR", "./test/nightly_test_output/perf/local_run")
             os.makedirs(output_dir, exist_ok=True)
-            output_filename = os.path.join(output_dir, "performance_results_tp_4.csv")
+            output_filename = os.path.join(
+                output_dir, f"performance_results_{model_dir_name}_tp_4.csv"
+            )
             file_exists = os.path.exists(output_filename)
             with open(output_filename, "a", newline="", encoding="utf-8") as csvfile:
 
@@ -700,7 +708,9 @@ class TestModelPerf(CustomTestCase):
 
             output_dir = os.getenv("PERF_OUTPUT_DIR", "./test/nightly_test_output/perf/local_run")
             os.makedirs(output_dir, exist_ok=True)
-            output_filename = os.path.join(output_dir, "performance_results_tp_2_ep_2.csv")
+            output_filename = os.path.join(
+                output_dir, f"performance_results_{model_dir_name}_tp_2_ep_2.csv"
+            )
             file_exists = os.path.exists(output_filename)
             with open(output_filename, "a", newline="", encoding="utf-8") as csvfile:
 
@@ -830,7 +840,9 @@ class TestModelPerf(CustomTestCase):
 
             output_dir = os.getenv("PERF_OUTPUT_DIR", "./test/nightly_test_output/perf/local_run")
             os.makedirs(output_dir, exist_ok=True)
-            output_filename = os.path.join(output_dir, "performance_results.csv")
+            concurrency_str = "_".join(map(str, concurrency_levels))
+            filename = f"performance_results_{model_dir_name}_c_{concurrency_str}.csv"
+            output_filename = os.path.join(output_dir, filename)
             file_exists = os.path.exists(output_filename)
             with open(output_filename, "a", newline="", encoding="utf-8") as csvfile:
 
@@ -961,7 +973,9 @@ class TestModelPerf(CustomTestCase):
 
             output_dir = os.getenv("PERF_OUTPUT_DIR", "./test/nightly_test_output/perf/local_run")
             os.makedirs(output_dir, exist_ok=True)
-            output_filename = os.path.join(output_dir, "performance_results_tp_4.csv")
+            output_filename = os.path.join(
+                output_dir, f"performance_results_{model_dir_name}_tp_4.csv"
+            )
             file_exists = os.path.exists(output_filename)
             with open(output_filename, "a", newline="", encoding="utf-8") as csvfile:
 
@@ -1092,7 +1106,9 @@ class TestModelPerf(CustomTestCase):
 
             output_dir = os.getenv("PERF_OUTPUT_DIR", "./test/nightly_test_output/perf/local_run")
             os.makedirs(output_dir, exist_ok=True)
-            output_filename = os.path.join(output_dir, "performance_results_tp_2_ep_2.csv")
+            output_filename = os.path.join(
+                output_dir, f"performance_results_{model_dir_name}_tp_2_ep_2.csv"
+            )
             file_exists = os.path.exists(output_filename)
             with open(output_filename, "a", newline="", encoding="utf-8") as csvfile:
 
@@ -1208,7 +1224,9 @@ class TestModelPerf(CustomTestCase):
 
             output_dir = os.getenv("PERF_OUTPUT_DIR", "./test/nightly_test_output/perf/local_run")
             os.makedirs(output_dir, exist_ok=True)
-            output_filename = os.path.join(output_dir, "performance_results.csv")
+            concurrency_str = "_".join(map(str, concurrency_levels))
+            filename = f"performance_results_{model_dir_name}_c_{concurrency_str}.csv"
+            output_filename = os.path.join(output_dir, filename)
             file_exists = os.path.exists(output_filename)
             with open(output_filename, "a", newline="", encoding="utf-8") as csvfile:
 
@@ -1327,7 +1345,9 @@ class TestModelPerf(CustomTestCase):
 
             output_dir = os.getenv("PERF_OUTPUT_DIR", "./test/nightly_test_output/perf/local_run")
             os.makedirs(output_dir, exist_ok=True)
-            output_filename = os.path.join(output_dir, "performance_results_tp_4.csv")
+            output_filename = os.path.join(
+                output_dir, f"performance_results_{model_dir_name}_tp_4.csv"
+            )
             file_exists = os.path.exists(output_filename)
             with open(output_filename, "a", newline="", encoding="utf-8") as csvfile:
 
@@ -1521,7 +1541,7 @@ class TestModelPerf(CustomTestCase):
 
             output_dir = os.getenv("PERF_OUTPUT_DIR", "./test/nightly_test_output/perf/local_run")
             os.makedirs(output_dir, exist_ok=True)
-            output_filename = os.path.join(output_dir, "performance_results_tp_4.csv")
+            output_filename = os.path.join(output_dir, f"performance_results_{model}_tp_4.csv")
             file_exists = os.path.exists(output_filename)
             with open(output_filename, "a", newline="", encoding="utf-8") as csvfile:
 

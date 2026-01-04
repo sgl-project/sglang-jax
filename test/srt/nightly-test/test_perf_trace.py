@@ -52,7 +52,7 @@ class TestModelPerfTrace(CustomTestCase):
         "--dtype",
         "bfloat16",
         "--max-running-requests",
-        "20",
+        "256",
         "--attention-backend",
         "fa",
         "--page-size",
@@ -82,7 +82,7 @@ class TestModelPerfTrace(CustomTestCase):
 
         print(f"Dataset is ready at location: {cls.sharegpt_dataset_path}")
 
-    def _test_qwen_7b_performance_trace_tp_1(self, concurrency_levels, input_lengths):
+    def _test_qwen_7b_performance_trace_tp_1(self, concurrency_levels):
         import os
 
         MOUNT_ROOT = os.getenv("CI_MOUNT_ROOT", "/models")
@@ -103,7 +103,7 @@ class TestModelPerfTrace(CustomTestCase):
         # define test parameters
         # concurrency levels
         # input length levels (1k, 4k, 8k)
-        # input_lengths = [1024, 4096, 8192]
+        input_lengths = [1024, 4096, 8192]
         # concurrency_levels = [8]
         # # input length levels (1k, 4k, 8k)
         # input_lengths = [1024]
@@ -115,6 +115,8 @@ class TestModelPerfTrace(CustomTestCase):
             "--context-length",  #  because the seq_length in the config.json is 8192
             "10240",
         ]
+        c_str = "_".join(map(str, concurrency_levels))
+        jax_profile_dir = f"{trace_output_dir}/{raw_model_id}{self.TP_1}_c{c_str}"
         # launch server
         process = popen_launch_server(
             model_path_for_server,
@@ -124,7 +126,7 @@ class TestModelPerfTrace(CustomTestCase):
             other_args=specific_args,
             env={
                 "JAX_COMPILATION_CACHE_DIR": "/tmp/jax_compilation_cache",
-                "SGLANG_JAX_PROFILER_DIR": trace_output_dir + "/" + raw_model_id + self.TP_1,
+                "SGLANG_JAX_PROFILER_DIR": jax_profile_dir,
             },
         )
 
@@ -382,6 +384,8 @@ class TestModelPerfTrace(CustomTestCase):
             "--tp-size",
             "1",
         ]
+        c_str = "_".join(map(str, concurrency_levels))
+        jax_profile_dir = f"{trace_output_dir}/{raw_model_id}{self.TP_1}_c{c_str}"
         # launch server
         process = popen_launch_server(
             model_path_for_server,
@@ -391,7 +395,7 @@ class TestModelPerfTrace(CustomTestCase):
             other_args=specific_args,
             env={
                 "JAX_COMPILATION_CACHE_DIR": "/tmp/jax_compilation_cache",
-                "SGLANG_JAX_PROFILER_DIR": trace_output_dir + "/" + raw_model_id + self.TP_1,
+                "SGLANG_JAX_PROFILER_DIR": jax_profile_dir,
             },
         )
 
@@ -781,6 +785,8 @@ class TestModelPerfTrace(CustomTestCase):
             "--context-length",  #  because the seq_length in the config.json is 8192
             "10240",
         ]
+        c_str = "_".join(map(str, concurrency_levels))
+        jax_profile_dir = f"{trace_output_dir}/{raw_model_id}{self.TP_1}_c{c_str}"
         # launch server
         process = popen_launch_server(
             model_path_for_server,
@@ -790,7 +796,7 @@ class TestModelPerfTrace(CustomTestCase):
             other_args=specific_args,
             env={
                 "JAX_COMPILATION_CACHE_DIR": "/tmp/jax_compilation_cache",
-                "SGLANG_JAX_PROFILER_DIR": trace_output_dir + "/" + raw_model_id + self.TP_1,
+                "SGLANG_JAX_PROFILER_DIR": jax_profile_dir,
             },
         )
 
@@ -1167,6 +1173,8 @@ class TestModelPerfTrace(CustomTestCase):
             "--tp-size",
             "1",
         ]
+        c_str = "_".join(map(str, concurrency_levels))
+        jax_profile_dir = f"{trace_output_dir}/{raw_model_id}{self.TP_1}_c{c_str}"
         # launch server
         process = popen_launch_server(
             model_path_for_server,
@@ -1176,7 +1184,7 @@ class TestModelPerfTrace(CustomTestCase):
             other_args=specific_args,
             env={
                 "JAX_COMPILATION_CACHE_DIR": "/tmp/jax_compilation_cache",
-                "SGLANG_JAX_PROFILER_DIR": trace_output_dir + "/" + raw_model_id + self.TP_1,
+                "SGLANG_JAX_PROFILER_DIR": jax_profile_dir,
             },
         )
 
@@ -1380,15 +1388,9 @@ class TestModelPerfTrace(CustomTestCase):
         concurrency_levels = [8, 16, 32, 64, 128]
         self._test_qwen_7b_performance_trace_tp_1(concurrency_levels)
 
-    def test_qwen_7b_performance_trace_tp_1_high_concurrency_part1(self):
+    def test_qwen_7b_performance_trace_tp_1_high_concurrency(self):
         concurrency_levels = [256]
-        input_lengths = [1024, 4096]
-        self._test_qwen_7b_performance_trace_tp_1(concurrency_levels, input_lengths)
-
-    def test_qwen_7b_performance_trace_tp_1_high_concurrency_part2(self):
-        concurrency_levels = [256]
-        input_lengths = [8192]
-        self._test_qwen_7b_performance_trace_tp_1(concurrency_levels, input_lengths)
+        self._test_qwen_7b_performance_trace_tp_1(concurrency_levels)
 
     def test_qwen3_8b_performance_trace_tp_1_low_concurrency(self):
         concurrency_levels = [8, 16, 32, 64, 128]
