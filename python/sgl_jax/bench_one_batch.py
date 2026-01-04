@@ -239,14 +239,19 @@ def prepare_synthetic_inputs_for_latency_test(batch_size, input_len, custom_inpu
 
 
 def extend(reqs, model_runner):
+    # For benchmark, put all reqs in DP rank 0 (single DP)
+    reqs_per_dp = [reqs]
+
     batch = ScheduleBatch.init_new(
-        reqs=reqs,
+        reqs=reqs_per_dp,
         req_to_token_pool=model_runner.req_to_token_pool,
         token_to_kv_pool_allocator=model_runner.token_to_kv_pool_allocator,
         tree_cache=None,
         model_config=model_runner.model_config,
         enable_overlap=False,
+        dp_size=1,
         enable_custom_logit_processor=False,
+        chunked_reqs=None,
     )
     batch.prepare_for_extend()
     _maybe_prepare_mlp_sync_batch(batch, model_runner)

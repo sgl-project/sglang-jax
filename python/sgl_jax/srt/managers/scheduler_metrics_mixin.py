@@ -81,7 +81,7 @@ class SchedulerMetricsMixin:
         self.last_decode_stats_tic = time.perf_counter()
         self.last_gen_throughput = self.num_generated_tokens / gap_latency
         self.num_generated_tokens = 0
-        num_running_reqs = len(batch.reqs)
+        num_running_reqs = batch.batch_size()
         if self.is_hybrid:
             (
                 full_num_used,
