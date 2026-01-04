@@ -9,10 +9,9 @@ This module mirrors the approach used by
 - Runtime uses the table when available, otherwise falls back to a fixed
   baseline config (and callers may apply override/validation logic).
 
-Note: The current fused_moe kernel variant fixes `bt` to `local_num_tokens`
-(`num_tokens // ep_size`) and uses the tuned table values primarily for
-`btc/bf/bd*` choices. `FusedMoEBlockConfig.effective_for(...)` applies the
-override at runtime.
+Note: In this fused_moe kernel, `bt` is the expert-side token tile size used for
+HBM<->VMEM staging and output tiling. `FusedMoEBlockConfig.effective_for(...)`
+may clamp `bt` (and `btc`) based on the runtime shape.
 """
 
 from __future__ import annotations

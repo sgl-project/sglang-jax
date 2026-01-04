@@ -51,22 +51,33 @@ def _estimate_vmem_bytes(case: MoEBenchmarkCase, dtype: jnp.dtype, cfg: FusedMoE
     token_bytes = jnp.dtype(dtype).itemsize
     weight_bytes = token_bytes
 
-    # NOTE: a2a_s is staged into HBM in this kernel variant; exclude from VMEM.
-    a2a_s_acc = 2 * bt * num_devices * hidden * token_bytes
+    t_packing = _dtype_packing(dtype)
+    local_num_tokens = case.num_tokens // case.ep_size
+    padded_num_experts = ((case.num_experts + 127) // 128) * 128
+    # Max tokens per active expert buffer is `local_num_tokens * num_devices`, padded up
+    # to a multiple of `bt` for safe (bt-sized) token tiling in the kernel.
+    a2a_max_tokens = ((local_num_tokens * num_devices + bt - 1) // bt) * bt
+
     a2a_g_acc = top_k * bt * hidden * token_bytes
     b_output = bt * hidden * token_bytes
-    b_gating = bt * ((case.num_experts + 127) // 128 * 128) * token_bytes
+    b_gating = local_num_tokens * padded_num_experts * token_bytes
 
     # See kernel scratch shapes: b_w1_x2_vmem/b_w3_x2_vmem/b_w2_x2_vmem.
     w1 = 2 * bd1 * bf * weight_bytes
     w3 = 2 * bd1 * bf * weight_bytes
     w2 = 2 * bf * bd2 * weight_bytes
 
-    # b_acc_vmem is F32(2, bt * num_devices, 1, bf)
-    b_acc = bt * num_devices * (bf * 2) * 4
+    # b_acc_vmem is F32(2, a2a_max_tokens, 1, bf)
+    b_acc = 2 * a2a_max_tokens * bf * 4
+    # U32 token staging for FFN1: (2, bt, bd1 // t_packing)
+    t_stage_b32 = 2 * bt * (bd1 // t_packing) * 4
+    # U32 staging for FFN2 output slice: (2, bt, bd2 // t_packing)
+    a2a_s_acc_stage_b32 = 2 * bt * (bd2 // t_packing) * 4
 
     # Skip optional scale/bias buffers (unused in this benchmark).
-    return a2a_s_acc + a2a_g_acc + b_output + b_gating + w1 + w3 + w2 + b_acc
+    return (
+        a2a_g_acc + b_output + b_gating + w1 + w3 + w2 + b_acc + t_stage_b32 + a2a_s_acc_stage_b32
+    )
 
 
 def select_block_configs(
@@ -107,9 +118,6 @@ def select_block_configs(
             out.append(v)
         return sorted(set(out))
 
-    # Outer `bt` is fixed to local_num_tokens in this fused_moe kernel variant.
-    # We keep the CLI flag name for backwards compatibility and treat it as
-    # candidates for `btc` (the inner compute token tile).
     bt_candidates = _pick_candidates(candidates=bt_candidates, multiple_of=t_packing)
     bf_candidates = _pick_candidates(candidates=bf_candidates, multiple_of=128)
     bd_candidates = _pick_candidates(candidates=bd_candidates, multiple_of=tile_align)
@@ -126,8 +134,8 @@ def select_block_configs(
 
         if bt <= 0 or bf <= 0 or bd1 <= 0 or bd2 <= 0:
             return False, "non-positive tile size"
-        if bt != local_num_tokens:
-            return False, f"expected bt==local_num_tokens ({bt=} != {local_num_tokens=})"
+        if bt > local_num_tokens * case.ep_size:
+            return False, f"bt({bt}) > max_expert_tokens({local_num_tokens * case.ep_size})"
         if bt % t_packing != 0:
             return False, f"bt({bt}) % t_packing({t_packing}) != 0"
         if not (0 < btc <= bt):
@@ -188,16 +196,15 @@ def select_block_configs(
         seen.add(key)
         configs.append(effective)
 
-    # Outer bt is fixed (bt == local_num_tokens); interpret bt_candidates as btc candidates.
-    for btc in bt_candidates:
+    for bt in bt_candidates:
         for bf in bf_candidates:
             for bd in bd_candidates:
                 raw = FusedMoEBlockConfig(
-                    bt=local_num_tokens,
+                    bt=bt,
                     bf=bf,
                     bd1=bd,
                     bd2=bd,
-                    btc=btc,
+                    btc=bt,
                     bfc=bf,
                     bd1c=bd,
                     bd2c=bd,
