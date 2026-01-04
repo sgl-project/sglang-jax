@@ -1547,7 +1547,7 @@ def _fused_ep_moe_kernel(
     wait_a2a_gather_recv_all()
 
     # Accumulate results for current batch and write to output_hbm.
-    acc_and_store_output()
+    # acc_and_store_output()
 
     # Drain the last outstanding gather sends (the loop body waits `local_e_id - 2`).
     wait_a2a_gather_send(
