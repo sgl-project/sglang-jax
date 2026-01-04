@@ -477,7 +477,9 @@ class SWARadixCache(BasePrefixCache):
     def total_size(self) -> tuple[int, int]:
         return self._total_size_helper()
 
-    def evict(self, full_num_tokens: int, swa_num_tokens: int = 0) -> None:
+    def evict(
+        self, full_num_tokens: int, swa_num_tokens: int = 0, dp_rank: int | None = None
+    ) -> None:
         if self.disable:
             return
 
@@ -490,8 +492,17 @@ class SWARadixCache(BasePrefixCache):
             while full_num_evicted < full_num_tokens and self.full_lru_list.in_list(x):
                 assert x != self.root_node, f"root node should not exist in full lru list, {x.id=}"
                 assert x.full_lock_ref == 0, f"node is in use, {x.id=}"
-                # 1. free node kv indices, evict full and swa tokens; count SWA freed accurately
+
+                # Get dp_rank from node's key
                 node_dp_rank = x.key.dp_rank if x.key and x.key.dp_rank is not None else 0
+
+                # Filter by dp_rank if specified
+                if dp_rank is not None and node_dp_rank != dp_rank:
+                    x_next = self.full_lru_list.get_prev_leaf_no_lock(x)
+                    x = x_next
+                    continue
+
+                # 1. free node kv indices, evict full and swa tokens; count SWA freed accurately
                 actual_swa_free = self._swa_eff_len(x.value, dp_rank=node_dp_rank)
                 self.token_to_kv_pool_allocator.free(x.value, dp_rank=node_dp_rank)
                 full_num_evicted += len(x.value)
@@ -527,9 +538,17 @@ class SWARadixCache(BasePrefixCache):
                 assert x != self.root_node, f"root node is not evictable, {x.id=}"
                 assert x.swa_lock_ref == 0, f"node is in use by swa kv indices, {x.id=}"
 
+                # Get dp_rank from node's key
+                node_dp_rank = x.key.dp_rank if x.key and x.key.dp_rank is not None else 0
+
+                # Filter by dp_rank if specified
+                if dp_rank is not None and node_dp_rank != dp_rank:
+                    x_next = self.swa_lru_list.get_prev_no_lock(x)
+                    x = x_next
+                    continue
+
                 if len(x.children) > 0:
                     # 1. an internal node, free swa tokens.
-                    node_dp_rank = x.key.dp_rank if x.key and x.key.dp_rank is not None else 0
                     actual_swa_free = self._swa_eff_len(x.value, dp_rank=node_dp_rank)
                     self.token_to_kv_pool_allocator.free_swa(x.value, dp_rank=node_dp_rank)
                     swa_num_evicted += actual_swa_free
@@ -546,7 +565,6 @@ class SWARadixCache(BasePrefixCache):
                         x.full_lock_ref == 0
                     ), f"leaf node with full lock must also have swa lock, {x.id=}"
                     # 1. a leaf node, free full and swa tokens
-                    node_dp_rank = x.key.dp_rank if x.key and x.key.dp_rank is not None else 0
                     actual_swa_free = self._swa_eff_len(x.value, dp_rank=node_dp_rank)
                     self.token_to_kv_pool_allocator.free(x.value, dp_rank=node_dp_rank)
                     full_num_evicted += len(x.value)

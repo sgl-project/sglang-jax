@@ -1008,12 +1008,14 @@ class ScheduleBatch:
                     swa_avail = self.token_to_kv_pool_allocator.swa_available_size(dp_rank=dp_rank)
                     if full_avail < num_tokens or swa_avail < num_tokens:
                         self.tree_cache.evict(
-                            max(0, num_tokens - full_avail), max(0, num_tokens - swa_avail)
+                            max(0, num_tokens - full_avail),
+                            max(0, num_tokens - swa_avail),
+                            dp_rank=dp_rank,
                         )
                 else:
                     avail = self.token_to_kv_pool_allocator.available_size(dp_rank=dp_rank)
                     if avail < num_tokens:
-                        self.tree_cache.evict(num_tokens)
+                        self.tree_cache.evict(num_tokens, dp_rank=dp_rank)
 
             # Check if sufficient
             if self.is_hybrid:
@@ -1347,18 +1349,6 @@ class ScheduleBatch:
                 info.top_logprobs_nums = [info.top_logprobs_nums[i] for i in keep_indices_dp]
                 info.token_ids_logprobs = [info.token_ids_logprobs[i] for i in keep_indices_dp]
 
-            # Filter extend-mode lists
-            if info.prefix_lens is not None:
-                info.prefix_lens = [info.prefix_lens[i] for i in keep_indices_dp]
-            if info.extend_lens is not None:
-                info.extend_lens = [info.extend_lens[i] for i in keep_indices_dp]
-            if info.extend_logprob_start_lens is not None:
-                info.extend_logprob_start_lens = [
-                    info.extend_logprob_start_lens[i] for i in keep_indices_dp
-                ]
-            if info.decoding_reqs is not None:
-                info.decoding_reqs = [info.decoding_reqs[i] for i in keep_indices_dp]
-
             # Filter sampling_info
             if info.sampling_info is not None:
                 info.sampling_info.filter_batch(np.array(keep_indices_dp))
@@ -1573,12 +1563,12 @@ class ScheduleBatch:
         self,
         per_dp_bs_size: int,
         total_bs: int,
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, int]:
+    ):
         """Merge batch-level metadata from all DP ranks.
 
         Returns:
             (req_pool_indices, seq_lens, extend_prefix_lens,
-             extend_seq_lens, extend_logprob_start_lens, real_bs)
+             extend_seq_lens, extend_logprob_start_lens, logits_indices, real_bs)
         """
         req_pool_indices_cpu = np.full(total_bs, -1, dtype=np.int32)
         seq_lens_cpu = np.zeros(total_bs, dtype=np.int32)
@@ -1587,10 +1577,12 @@ class ScheduleBatch:
             extend_prefix_lens = np.zeros(total_bs, dtype=np.int32)
             extend_seq_lens = np.zeros(total_bs, dtype=np.int32)
             extend_logprob_start_lens = np.zeros(total_bs, dtype=np.int32)
+            logits_indices = np.full(total_bs, 0, dtype=np.int32)
         else:
             extend_prefix_lens = None
             extend_seq_lens = None
             extend_logprob_start_lens = None
+            logits_indices = None
 
         offset_bs = 0
         real_bs = 0
@@ -1615,6 +1607,9 @@ class ScheduleBatch:
                 # Copy extend-specific metadata
                 extend_prefix_lens[offset_bs : offset_bs + dp_bs] = info.prefix_lens
                 extend_seq_lens[offset_bs : offset_bs + dp_bs] = info.extend_lens
+                dp_extend_lens = np.array(info.extend_lens, dtype=np.int32)
+                local_last = np.cumsum(dp_extend_lens, dtype=np.int32) - 1
+                logits_indices[offset_bs : offset_bs + dp_bs] = local_last
 
                 # Copy extend_logprob_start_lens if available
                 if (
@@ -1633,6 +1628,7 @@ class ScheduleBatch:
             extend_prefix_lens,
             extend_seq_lens,
             extend_logprob_start_lens,
+            logits_indices,
             real_bs,
         )
 
@@ -1790,6 +1786,7 @@ class ScheduleBatch:
             extend_prefix_lens,
             extend_seq_lens,
             extend_logprob_start_lens,
+            logits_indices,
             real_bs,
         ) = self._merge_batch_metadata(per_dp_bs_padding, total_bs)
 
@@ -1837,6 +1834,7 @@ class ScheduleBatch:
             extend_seq_lens=extend_seq_lens,
             extend_logprob_start_lens=extend_logprob_start_lens,
             extend_input_logprob_token_ids=None,
+            logits_indices=logits_indices,
             lora_ids=lora_ids,
             real_bs=real_bs,
             dp_size=self.dp_size,
@@ -1859,6 +1857,12 @@ class ScheduleBatch:
             extend_seq_lens = np.array(self.extend_lens, dtype=np.int32)
             extend_prefix_lens = np.array(self.prefix_lens, dtype=np.int32)
             extend_logprob_start_lens = self.extend_logprob_start_lens
+        logits_indices = None
+        if self.forward_mode.is_extend() and extend_seq_lens is not None:
+            if len(extend_seq_lens) > 0:
+                logits_indices = np.cumsum(extend_seq_lens, dtype=np.int32) - 1
+            else:
+                logits_indices = np.array([], dtype=np.int32)
 
         global bid
         bid += 1
@@ -1999,6 +2003,7 @@ class ScheduleBatch:
             extend_seq_lens=(extend_seq_lens if self.forward_mode.is_extend() else None),
             extend_logprob_start_lens=extend_logprob_start_lens,
             extend_input_logprob_token_ids=self.extend_input_logprob_token_ids,
+            logits_indices=logits_indices,
             lora_ids=lora_ids,
             real_bs=real_bs,
             capture_hidden_mode=(
@@ -2098,11 +2103,11 @@ class ScheduleBatch:
                 if (full_available < num_tokens or swa_available < num_tokens) and self.tree_cache:
                     full_num = max(0, num_tokens - full_available)
                     swa_num = max(0, num_tokens - swa_available)
-                    self.tree_cache.evict(full_num, swa_num)
+                    self.tree_cache.evict(full_num, swa_num, dp_rank=dp_rank)
             else:
                 available = self.token_to_kv_pool_allocator.available_size(dp_rank=dp_rank)
                 if available < num_tokens and self.tree_cache:
-                    self.tree_cache.evict(num_tokens)
+                    self.tree_cache.evict(num_tokens, dp_rank=dp_rank)
 
     def _is_available_size_sufficient(self, num_tokens_per_dp: dict[int, int]) -> bool:
         """Check if sufficient memory available across all DP ranks.
@@ -2372,6 +2377,7 @@ class ModelWorkerBatch:
     extend_prefix_lens: np.ndarray | None
     extend_logprob_start_lens: list[int] | None
     extend_input_logprob_token_ids: np.ndarray | None
+    logits_indices: np.ndarray | None
 
     # For padding
     real_bs: int

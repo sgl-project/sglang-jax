@@ -48,7 +48,7 @@ class BasePrefixCache(abc.ABC):
         pass
 
     @abc.abstractmethod
-    def evict(self, num_tokens: int):
+    def evict(self, num_tokens: int, dp_rank: int | None = None):
         pass
 
     @abc.abstractmethod

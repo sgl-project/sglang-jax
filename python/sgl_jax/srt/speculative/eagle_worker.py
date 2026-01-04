@@ -120,9 +120,10 @@ class EAGLEWorker(ModelWorker):
     ):
         if model_worker_batch.forward_mode.is_extend():
             # FIXME(pc) add padding logic here
-            model_worker_batch.sampling_info.temperatures = (
-                model_worker_batch.sampling_info.temperatures[:, None]
-            )
+            if model_worker_batch.sampling_info.temperatures.ndim == 1:
+                model_worker_batch.sampling_info.temperatures = (
+                    model_worker_batch.sampling_info.temperatures[:, None]
+                )
             sampling_metadata = SamplingMetadata.from_model_worker_batch(
                 model_worker_batch,
                 len(model_worker_batch.seq_lens) - model_worker_batch.real_bs,

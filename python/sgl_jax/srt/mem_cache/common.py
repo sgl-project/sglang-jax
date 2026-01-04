@@ -81,11 +81,11 @@ def evict_from_tree_cache(tree_cache: BasePrefixCache | None, num_tokens: int, d
         if full_available_size < num_tokens or swa_available_size < num_tokens:
             full_num_tokens = max(0, num_tokens - full_available_size)
             swa_num_tokens = max(0, num_tokens - swa_available_size)
-            tree_cache.evict(full_num_tokens, swa_num_tokens)
+            tree_cache.evict(full_num_tokens, swa_num_tokens, dp_rank=dp_rank)
     else:
         # Standard allocator
         if allocator.available_size(dp_rank=dp_rank) < num_tokens:
-            tree_cache.evict(num_tokens)
+            tree_cache.evict(num_tokens, dp_rank=dp_rank)
 
 
 def available_and_evictable_str(tree_cache, dp_rank: int = 0) -> str:

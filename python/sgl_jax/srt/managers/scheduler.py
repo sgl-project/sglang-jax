@@ -818,7 +818,7 @@ class Scheduler(
         ret["engine_paused"] = self._engine_paused
         ret["waiting_queue_size"] = len(self.waiting_queue)
         ret["running_batch_size"] = (
-            0 if self.running_batch.is_empty() else len(self.running_batch.reqs)
+            0 if self.running_batch.is_empty() else self.running_batch.batch_size()
         )
         ret["prefill_decode_size"] = ret["waiting_queue_size"] + ret["running_batch_size"]
         ret["waiting_queue_rids"] = [req.rid for req in self.waiting_queue]

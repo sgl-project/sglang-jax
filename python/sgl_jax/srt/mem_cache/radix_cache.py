@@ -398,7 +398,7 @@ class RadixCache(BasePrefixCache):
     def total_size(self):
         return self._total_size_helper()
 
-    def evict(self, num_tokens: int):
+    def evict(self, num_tokens: int, dp_rank: int | None = None):
         if self.disable:
             return
 
@@ -416,6 +416,11 @@ class RadixCache(BasePrefixCache):
 
             # Get dp_rank from node's key
             node_dp_rank = x.key.dp_rank if x.key and x.key.dp_rank is not None else 0
+
+            # Filter by dp_rank if specified
+            if dp_rank is not None and node_dp_rank != dp_rank:
+                continue
+
             self.token_to_kv_pool_allocator.free(x.value, dp_rank=node_dp_rank)
             num_evicted += len(x.value)
             self._delete_leaf(x)

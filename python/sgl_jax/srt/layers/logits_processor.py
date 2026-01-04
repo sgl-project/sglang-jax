@@ -102,6 +102,7 @@ class LogitsMetadata:
     extend_token_ids_logprob: bool = False
     extend_seq_lens: jax.Array | None = None
     accept_lens: jax.Array | None = None
+    logits_indices: jax.Array | None = None
     extend_seq_lens_cpu: list[int] | None = None
     extend_logprob_start_lens_cpu: list[int] | None = None
     extend_logprob_pruned_lens_cpu: list[int] | None = None
@@ -119,6 +120,7 @@ class LogitsMetadata:
         children = (
             self.extend_seq_lens,
             self.accept_lens,
+            self.logits_indices,
             self.extend_input_logprob_token_ids_device,
             self.temperature,
             self.top_p,
@@ -147,9 +149,10 @@ class LogitsMetadata:
 
         obj.extend_seq_lens = children[0]
         obj.accept_lens = children[1]
-        obj.extend_input_logprob_token_ids_device = children[2]
-        obj.temperature = children[3]
-        obj.top_p = children[4]
+        obj.logits_indices = children[2]
+        obj.extend_input_logprob_token_ids_device = children[3]
+        obj.temperature = children[4]
+        obj.top_p = children[5]
 
         obj.forward_mode = aux_data["forward_mode"]
         obj.capture_hidden_mode = aux_data["capture_hidden_mode"]
@@ -195,6 +198,7 @@ class LogitsMetadata:
             extend_return_top_logprob=extend_return_top_logprob,
             extend_token_ids_logprob=extend_token_ids_logprob,
             extend_seq_lens=device_array(batch.extend_seq_lens, sharding=sharding),
+            logits_indices=device_array(batch.logits_indices, sharding=sharding),
             accept_lens=(
                 device_array(batch.spec_info.accept_length, sharding=sharding)
                 if batch.spec_info is not None
@@ -225,6 +229,20 @@ class LogitsProcessor(nnx.Module):
         self.soft_cap = soft_cap
         self.mesh = mesh
 
+    def _select_hidden_states(self, hidden_states: jax.Array, indices: jax.Array) -> jax.Array:
+        if self.mesh.shape.get("data", 1) == 1:
+            return hidden_states[indices]
+
+        def select_local_fn(local_states, local_indices):
+            return local_states[local_indices]
+
+        return jax.shard_map(
+            select_local_fn,
+            mesh=self.mesh,
+            in_specs=(P("data", None), P("data")),
+            out_specs=P("data", None),
+        )(hidden_states, indices)
+
     def __call__(
         self,
         hidden_states: jax.Array,
@@ -243,7 +261,7 @@ class LogitsProcessor(nnx.Module):
             sample_indices = None
             input_logprob_indices = None
         elif logits_metadata.forward_mode.is_extend() and not logits_metadata.extend_return_logprob:
-            last_index = jnp.cumsum(logits_metadata.extend_seq_lens, axis=0) - 1 # TODO @Brian in dp case cumsum not work
+            last_index = logits_metadata.logits_indices
             if (
                 logits_metadata.forward_mode.is_draft_extend()
                 and logits_metadata.accept_lens is not None
@@ -254,9 +272,11 @@ class LogitsProcessor(nnx.Module):
                 last_index = last_index - (
                     logits_metadata.extend_seq_lens - logits_metadata.accept_lens
                 )
-            pruned_states = hidden_states[last_index]
+            pruned_states = self._select_hidden_states(hidden_states, last_index)
             if aux_hidden_states is not None:
-                aux_pruned_states = [hidden[last_index] for hidden in aux_hidden_states]
+                aux_pruned_states = [
+                    self._select_hidden_states(hidden, last_index) for hidden in aux_hidden_states
+                ]
 
             sample_indices = None
             input_logprob_indices = None

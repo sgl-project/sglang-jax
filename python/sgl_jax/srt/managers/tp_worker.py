@@ -407,6 +407,8 @@ class ModelWorker:
         valid_cache_loc = np.arange(bs)
         invalid_cache_loc = np.array([0] * (invalid_cache_loc_size), dtype=jnp.int32)
         lora_ids = ["0"] * bs
+        extend_seq_lens = np.array([1] * bs) if mode == ForwardMode.EXTEND else None
+        logits_indices = np.array([0] * bs) if mode == ForwardMode.EXTEND else None
 
         return ModelWorkerBatch(
             bid=1,
@@ -430,10 +432,11 @@ class ModelWorker:
             positions=np.concat([valid_positions, invalid_positions], axis=0),
             cache_loc=np.concat([valid_cache_loc, invalid_cache_loc], axis=0),
             extend_prefix_lens=(np.array([0] * bs) if mode == ForwardMode.EXTEND else None),
-            extend_seq_lens=np.array([1] * bs) if mode == ForwardMode.EXTEND else None,
+            extend_seq_lens=extend_seq_lens,
             top_logprobs_nums=None,
             token_ids_logprobs=None,
             extend_logprob_start_lens=None,
+            logits_indices=logits_indices,
             capture_hidden_mode=CaptureHiddenMode.NULL,
             spec_algorithm=speculative_algotithm,
             lora_ids=lora_ids,  # Already set to [None] * bs above
