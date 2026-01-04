@@ -369,7 +369,7 @@ def _fused_ep_moe_kernel(
     expert_sizes_smem,  # (1, padded_num_experts)
     a2a_s_sends_x2_smem,  # <e_sem_id> (2,)
     ### Accumulation for gathered tokens:
-    a2a_g_acc_vmem,  # (2, top_k, output_bt, t_packing, hidden_size // t_packing)
+    a2a_g_acc_vmem,  # (2, top_k, acc_bt, t_packing, hidden_size // t_packing)
     top_k_logits_vmem,  # F32(local_num_tokens, top_k)
     ### Expert weight double buffering:
     b_gating_vmem,  # (local_num_tokens, padded_num_experts)
@@ -1376,10 +1376,10 @@ def _fused_ep_moe_kernel(
     def acc_and_store_output():
         output_bt = b_output_x2_vmem.shape[1]
         b_output_flat = b_output_x2_vmem.reshape(2, output_bt, hidden_size)
+        acc_bt = a2a_g_acc_vmem.shape[2]
+        assert output_bt % acc_bt == 0, (output_bt, acc_bt)
 
-        def start_load_bt(*, load_buf_id, tile_start):
-            # Important: use `lax.fori_loop` to avoid unrolling `output_bt` and
-            # generating enormous MLIR for large token tiles.
+        def start_load_acc_bt(*, load_buf_id, tile_start):
             def _load_one(t_i, _):
                 t_id = tile_start + t_i
                 for k_id in range(top_k):
@@ -1393,9 +1393,10 @@ def _fused_ep_moe_kernel(
                     ).start()
                 return None
 
-            lax.fori_loop(0, output_bt, _load_one, None, unroll=False)
+            # Important: use `lax.fori_loop` to avoid unrolling `acc_bt`.
+            lax.fori_loop(0, acc_bt, _load_one, None, unroll=False)
 
-        def wait_load_bt(*, load_buf_id):
+        def wait_load_acc_bt(*, load_buf_id):
             pltpu.make_async_copy(
                 src_ref=a2a_g_acc_vmem.at[load_buf_id],
                 dst_ref=a2a_g_acc_vmem.at[load_buf_id],
@@ -1416,55 +1417,68 @@ def _fused_ep_moe_kernel(
                 sem=local_sems.at[out_buf_id, 4],
             ).start()
 
-        def bt_acc(*, load_buf_id, tile_start, tile_sz, out_buf_id):
-            # Vectorized per-tile reduction to avoid dynamic_slice in TPU TC lowering.
-            output_tile = jnp.zeros((tile_sz, t_packing, h_per_t_packing), dtype=jnp.float32)
+        def bt_acc_acc_bt(*, load_buf_id, tile_start, out_buf_id, out_offset):
+            # Vectorized per-(acc_bt) reduction to avoid dynamic_slice in TPU TC lowering.
+            output_tile = jnp.zeros((acc_bt, t_packing, h_per_t_packing), dtype=jnp.float32)
             logits_tile = top_k_logits_vmem.at[
-                pl.ds(tile_start, tile_sz),
+                pl.ds(tile_start, acc_bt),
                 pl.ds(0, top_k),
             ][...]
             for k_id in range(top_k):
-                acc_tile = a2a_g_acc_vmem[load_buf_id, k_id, :tile_sz].astype(jnp.float32)
-                logits = logits_tile[:, k_id].reshape(tile_sz, 1, 1)
+                acc_tile = a2a_g_acc_vmem[load_buf_id, k_id, :acc_bt].astype(jnp.float32)
+                logits = logits_tile[:, k_id].reshape(acc_bt, 1, 1)
                 output_tile += acc_tile * logits
 
-            b_output_x2_vmem.at[out_buf_id, pl.ds(0, tile_sz)][...] = output_tile.astype(
+            b_output_x2_vmem.at[out_buf_id, pl.ds(out_offset, acc_bt)][...] = output_tile.astype(
                 output_hbm.dtype
             )
 
         num_tiles = local_num_tokens // output_bt
-
-        # Prefetch the first bt tile so the loop body can follow the
-        # load(next) -> wait(curr) -> compute(curr) -> store(curr) structure.
-        start_load_bt(load_buf_id=0, tile_start=jnp.int32(0))
+        num_acc_tiles = output_bt // acc_bt
 
         def run_tile(tile_idx, _):
             out_buf_id = tile_idx & 1
-            load_buf_id = tile_idx & 1
             tile_start = tile_idx * output_bt
-            tile_sz = output_bt
-
-            next_tile_start = tile_start + output_bt
-
-            @pl.when(tile_idx + 1 < num_tiles)
-            def _start_next(
-                next_tile_start=next_tile_start,
-                next_load_buf_id=load_buf_id ^ 1,
-            ):
-                start_load_bt(load_buf_id=next_load_buf_id, tile_start=next_tile_start)
 
             @pl.when(tile_idx >= 2)
             def _wait_reuse(out_buf_id=out_buf_id):
                 wait_store_output(out_buf_id=out_buf_id)
 
-            wait_load_bt(load_buf_id=load_buf_id)
-            bt_acc(
-                load_buf_id=load_buf_id,
-                tile_start=tile_start,
-                tile_sz=tile_sz,
-                out_buf_id=out_buf_id,
+            def run_acc_tile(acc_tile_idx, load_buf_id):
+                acc_tile_start = tile_start + acc_tile_idx * acc_bt
+                out_offset = acc_tile_idx * acc_bt
+                next_load_buf_id = load_buf_id ^ jnp.int32(1)
+                next_acc_tile_idx = acc_tile_idx + 1
+                next_acc_tile_start = tile_start + next_acc_tile_idx * acc_bt
+
+                @pl.when(next_acc_tile_idx < num_acc_tiles)
+                def _start_next(
+                    next_load_buf_id=next_load_buf_id,
+                    next_acc_tile_start=next_acc_tile_start,
+                ):
+                    start_load_acc_bt(
+                        load_buf_id=next_load_buf_id,
+                        tile_start=next_acc_tile_start,
+                    )
+
+                wait_load_acc_bt(load_buf_id=load_buf_id)
+                bt_acc_acc_bt(
+                    load_buf_id=load_buf_id,
+                    tile_start=acc_tile_start,
+                    out_buf_id=out_buf_id,
+                    out_offset=out_offset,
+                )
+                return next_load_buf_id
+
+            start_load_acc_bt(load_buf_id=jnp.int32(0), tile_start=tile_start)
+            lax.fori_loop(
+                0,
+                num_acc_tiles,
+                run_acc_tile,
+                jnp.int32(0),
+                unroll=False,
             )
-            start_store_output(tile_start=tile_start, tile_sz=tile_sz, out_buf_id=out_buf_id)
+            start_store_output(tile_start=tile_start, tile_sz=output_bt, out_buf_id=out_buf_id)
             return None
 
         lax.fori_loop(0, num_tiles, run_tile, None, unroll=False)
@@ -1859,7 +1873,10 @@ def fused_ep_moe(
         pltpu.SMEM((1, padded_num_experts), jnp.int32),  # expert_starts_smem
         pltpu.SMEM((1, padded_num_experts), jnp.int32),  # expert_sizes_smem
         pltpu.SMEM((2,), jnp.int32),  # a2a_s_sends_x2_smem
-        pltpu.VMEM((2, top_k, output_bt, t_packing, hidden_per_pack), t_dtype),  # a2a_g_acc_vmem
+        pltpu.VMEM(
+            (2, top_k, math.gcd(output_bt, 8), t_packing, hidden_per_pack),
+            t_dtype,
+        ),  # a2a_g_acc_vmem
         pltpu.VMEM((local_num_tokens, top_k), jnp.float32),  # top_k_logits_vmem
         # Expert compute scratch.
         pltpu.VMEM((local_num_tokens, padded_num_experts), gating_dtype),  # b_gating_vmem
