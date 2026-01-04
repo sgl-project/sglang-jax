@@ -1286,13 +1286,11 @@ def _fused_ep_moe_kernel(
                 init_buf_load = jnp.int32(2)
                 has_tiles = num_token_tiles > 0
 
-                if not should_init_ffn2:
-
-                    @pl.when(has_tiles)
-                    def _(bd2_start=bd2_start, init_buf_compute=init_buf_compute):
-                        start_load_stage_a2a_s_acc_tile_from_hbm(
-                            jnp.int32(0), bd2_start, init_buf_compute
-                        )
+                @pl.when(has_tiles and not should_init_ffn2)
+                def _(bd2_start=bd2_start, init_buf_compute=init_buf_compute):
+                    start_load_stage_a2a_s_acc_tile_from_hbm(
+                        jnp.int32(0), bd2_start, init_buf_compute
+                    )
 
                 def run_ffn2_tile(
                     token_tile_id,
