@@ -13,6 +13,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from flax import nnx
+from jax.experimental.compilation_cache import compilation_cache as _compilation_cache
 
 from benchmark.moe.utils import (
     BAILING_BASE,
@@ -176,9 +177,17 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Override benchmark cases with custom num_tokens list (e.g. --num-tokens 8 16 256 4096).",
     )
+    parser.add_argument(
+        "--compilation-cache-dir",
+        type=str,
+        default=None,
+        help="Optional JAX compilation cache directory (persists compiled executables across runs).",
+    )
     return parser.parse_args()
 
 
 if __name__ == "__main__":
     args = parse_args()
+    if args.compilation_cache_dir:
+        _compilation_cache.set_cache_dir(args.compilation_cache_dir)
     run_all(args.scenario, args.iters, num_tokens=args.num_tokens)

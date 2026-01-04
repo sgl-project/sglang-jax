@@ -14,6 +14,30 @@ import jax
 
 MARKER = "SGLANG_JAX_BENCH"
 
+_COMPILATION_CACHE_ENV_VARS = ("SGLANG_JAX_COMPILATION_CACHE_DIR", "JAX_COMPILATION_CACHE_DIR")
+
+
+def _maybe_enable_compilation_cache_from_env() -> None:
+    cache_dir = None
+    for key in _COMPILATION_CACHE_ENV_VARS:
+        value = os.environ.get(key)
+        if value:
+            cache_dir = value
+            break
+    if not cache_dir:
+        return
+
+    try:
+        from jax.experimental.compilation_cache import (
+            compilation_cache as _compilation_cache,
+        )
+    except Exception:
+        return
+    _compilation_cache.set_cache_dir(cache_dir)
+
+
+_maybe_enable_compilation_cache_from_env()
+
 
 def _extract_marker_durations_ms(trace: dict[str, Any], task: str | None = None) -> list[float]:
     marker_events: list[dict[str, Any]] = []
