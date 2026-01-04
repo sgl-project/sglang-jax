@@ -39,7 +39,12 @@ def _dtype_packing(dtype: jnp.dtype) -> int:
 
 
 def _estimate_vmem_bytes(case: MoEBenchmarkCase, dtype: jnp.dtype, cfg: FusedMoEBlockConfig) -> int:
-    """Rough VMEM estimate to avoid compile-time OOM (TPU VMEM is 64MB/core)."""
+    """Rough VMEM estimate to avoid compile-time OOM (TPU VMEM is 64MB/core).
+
+    Note: this intentionally overestimates a bit because the fused_moe kernel
+    materializes several routing/top-k temporaries (see `get_top_k` in the
+    pallas kernel body), which are not part of the explicit scratch buffers.
+    """
     bt = cfg.bt
     bf = cfg.bf
     bd1 = cfg.bd1
@@ -54,6 +59,7 @@ def _estimate_vmem_bytes(case: MoEBenchmarkCase, dtype: jnp.dtype, cfg: FusedMoE
     t_packing = _dtype_packing(dtype)
     local_num_tokens = case.num_tokens // case.ep_size
     padded_num_experts = ((case.num_experts + 127) // 128) * 128
+    padded_top_k = ((case.top_k + 127) // 128) * 128
     # Max tokens per active expert buffer is `local_num_tokens * num_devices`, padded up
     # to a multiple of `bt` for safe (bt-sized) token tiling in the kernel.
     a2a_max_tokens = ((local_num_tokens * num_devices + bt - 1) // bt) * bt
@@ -61,6 +67,8 @@ def _estimate_vmem_bytes(case: MoEBenchmarkCase, dtype: jnp.dtype, cfg: FusedMoE
     a2a_g_acc = top_k * bt * hidden * token_bytes
     b_output = bt * hidden * token_bytes
     b_gating = local_num_tokens * padded_num_experts * token_bytes
+    # t2e_routing_smem scratch: (local_num_tokens, padded_top_k) int32
+    t2e_routing = local_num_tokens * padded_top_k * 4
 
     # See kernel scratch shapes: b_w1_x2_vmem/b_w3_x2_vmem/b_w2_x2_vmem.
     w1 = 2 * bd1 * bf * weight_bytes
@@ -74,9 +82,46 @@ def _estimate_vmem_bytes(case: MoEBenchmarkCase, dtype: jnp.dtype, cfg: FusedMoE
     # U32 staging for FFN2 output slice: (2, bt, bd2 // t_packing)
     a2a_s_acc_stage_b32 = 2 * bt * (bd2 // t_packing) * 4
 
+    # Routing / top-k temporaries in kernel (best-effort conservative estimate):
+    # - softmax + get_top_k use float32 work buffers and broadcasted iotas
+    # - top_k_logits/indices are stored as lists of `padded_top_k` columns
+    # This is separate from `t2e_routing_smem` above.
+    routing_work_f32 = local_num_tokens * padded_num_experts * 4  # softmax result (approx)
+    get_top_k_input_f32 = local_num_tokens * padded_num_experts * 4
+    get_top_k_t2e = local_num_tokens * padded_num_experts * 4
+    get_top_k_iota = local_num_tokens * padded_num_experts * 4
+    get_top_k_mask = local_num_tokens * padded_num_experts * 4
+    get_top_k_padded_iota = local_num_tokens * padded_top_k * 4
+    get_top_k_t2e_routing = local_num_tokens * padded_top_k * 4
+    get_top_k_logits_sum = local_num_tokens * padded_top_k * 4
+    get_top_k_logits_lst = top_k * local_num_tokens * padded_top_k * 4
+    get_top_k_indices_lst = top_k * local_num_tokens * padded_top_k * 4
+    routing_temporaries = (
+        routing_work_f32
+        + get_top_k_input_f32
+        + get_top_k_t2e
+        + get_top_k_iota
+        + get_top_k_mask
+        + get_top_k_padded_iota
+        + get_top_k_t2e_routing
+        + get_top_k_logits_sum
+        + get_top_k_logits_lst
+        + get_top_k_indices_lst
+    )
+
     # Skip optional scale/bias buffers (unused in this benchmark).
     return (
-        a2a_g_acc + b_output + b_gating + w1 + w3 + w2 + b_acc + t_stage_b32 + a2a_s_acc_stage_b32
+        a2a_g_acc
+        + b_output
+        + b_gating
+        + t2e_routing
+        + w1
+        + w3
+        + w2
+        + b_acc
+        + t_stage_b32
+        + a2a_s_acc_stage_b32
+        + routing_temporaries
     )
 
 
