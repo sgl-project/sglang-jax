@@ -142,6 +142,7 @@ def select_block_configs(
     dtype: jnp.dtype,
     *,
     bt_candidates: list[int],
+    bts_candidates: list[int] | None = None,
     bf_candidates: list[int],
     bd_candidates: list[int],
     tpu_vmem_budget_bytes: int,
@@ -176,6 +177,10 @@ def select_block_configs(
         return sorted(set(out))
 
     bt_candidates = _pick_candidates(candidates=bt_candidates, multiple_of=t_packing)
+    bts_candidates_i = (
+        [0] if bts_candidates is None else list(bts_candidates)
+    )  # 0 means "use bt" (bts=None)
+    bts_candidates_i = _pick_candidates(candidates=bts_candidates_i, multiple_of=t_packing)
     bf_candidates = _pick_candidates(candidates=bf_candidates, multiple_of=128)
     bd_candidates = _pick_candidates(candidates=bd_candidates, multiple_of=tile_align)
 
@@ -250,6 +255,7 @@ def select_block_configs(
             effective.bf,
             effective.bd1,
             effective.bd2,
+            effective.bts,
             effective.btc,
             effective.bfc,
             effective.bd1c,
@@ -261,22 +267,24 @@ def select_block_configs(
         configs.append(effective)
 
     for bt in bt_candidates:
-        for bf in bf_candidates:
-            for bd in bd_candidates:
-                raw = FusedMoEBlockConfig(
-                    bt=bt,
-                    bf=bf,
-                    bd1=bd,
-                    bd2=bd,
-                    btc=bt,
-                    bfc=bf,
-                    bd1c=bd,
-                    bd2c=bd,
-                )
-                effective = raw.effective_for(
-                    num_tokens=case.num_tokens, ep_size=case.ep_size, dtype=dtype
-                )
-                add(raw=raw, effective=effective)
+        for bts in bts_candidates_i:
+            for bf in bf_candidates:
+                for bd in bd_candidates:
+                    raw = FusedMoEBlockConfig(
+                        bt=bt,
+                        bf=bf,
+                        bd1=bd,
+                        bd2=bd,
+                        btc=bt,
+                        bfc=bf,
+                        bd1c=bd,
+                        bd2c=bd,
+                        bts=None if bts == 0 else bts,
+                    )
+                    effective = raw.effective_for(
+                        num_tokens=case.num_tokens, ep_size=case.ep_size, dtype=dtype
+                    )
+                    add(raw=raw, effective=effective)
 
     if max_configs <= 0:
         raise ValueError(f"Expected {max_configs=} to be > 0.")
@@ -284,9 +292,9 @@ def select_block_configs(
         return configs
 
     # Keep benchmark runtime bounded while retaining coverage across (btc, bf, bd).
-    def score(c: FusedMoEBlockConfig) -> tuple[int, int, int, int, int, int, int, int]:
+    def score(c: FusedMoEBlockConfig) -> tuple[int, int, int, int, int, int, int, int, int]:
         # Lexicographic "weighted" ranking; larger tiles tend to run faster.
-        return (c.bt, c.bf, c.bd1, c.bd2, c.btc, c.bfc, c.bd1c, c.bd2c)
+        return (c.bt, c.bts or c.bt, c.bf, c.bd1, c.bd2, c.btc, c.bfc, c.bd1c, c.bd2c)
 
     selected: list[FusedMoEBlockConfig] = []
     selected_keys: set[tuple[int, ...]] = set()
@@ -317,6 +325,7 @@ def run_all(
     a2a_only: bool = False,
     tune_block_config: bool = False,
     bt_candidates: list[int] | None = None,
+    bts_candidates: list[int] | None = None,
     bf_candidates: list[int] | None = None,
     bd_candidates: list[int] | None = None,
     num_tokens: list[int] | None = None,
@@ -380,6 +389,7 @@ def run_all(
                 case,
                 dtype,
                 bt_candidates=bt_candidates or [2, 4, 8, 16, 32, 64, 128, 256, 512],
+                bts_candidates=bts_candidates,
                 bf_candidates=bf_candidates or [128, 256, 512, 1024, 2048],
                 bd_candidates=bd_candidates or [256, 512, 1024, 2048, 4096, 8192],
                 tpu_vmem_budget_bytes=tpu_vmem_budget_bytes,
@@ -526,8 +536,17 @@ def parse_args() -> argparse.Namespace:
         type=int,
         nargs="+",
         help=(
-            "Candidate list for btc (inner token tile). "
-            "Note: outer bt is fixed to local_num_tokens in this kernel variant."
+            "Candidate list for bt (outer token tile size). "
+            "Note: the kernel uses output_bt=gcd(bt, local_num_tokens) for run_bt tiling."
+        ),
+    )
+    parser.add_argument(
+        "--bts-candidates",
+        type=int,
+        nargs="+",
+        help=(
+            "Candidate list for bts (token staging tile inside expert_ffn). "
+            "Use 0 to mean 'bts=bt'. Example: --bts-candidates 0 8 16 32 64"
         ),
     )
     parser.add_argument(
@@ -582,6 +601,7 @@ if __name__ == "__main__":
         a2a_only=args.a2a_only,
         tune_block_config=args.tune_block_config,
         bt_candidates=args.bt_candidates,
+        bts_candidates=args.bts_candidates,
         bf_candidates=args.bf_candidates,
         bd_candidates=args.bd_candidates,
         num_tokens=args.num_tokens,
