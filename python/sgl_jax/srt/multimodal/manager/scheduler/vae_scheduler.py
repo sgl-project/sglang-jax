@@ -27,16 +27,17 @@ class VaeScheduler:
             if len(reqs) > 0:
                 for req in reqs:
                     if req.latents is None:
-                        req.latents = jnp.array(np.arange(1 * 5 * 3 * 4 * 16), dtype=jnp.float32).reshape(
-                            1, 5, 3, 4, 16
-                        )
+                        req.latents = jnp.array(
+                            np.arange(1 * 5 * 3 * 4 * 16), dtype=jnp.float32
+                        ).reshape(1, 5, 3, 4, 16)
                     assert req.latents is not None
                 self.run_vae_batch(reqs)
 
-    def run_vae_batch(self, batch:list[Req]):
+    def run_vae_batch(self, batch: list[Req]):
         for req in batch:
             output = self.vae_worker.forward(req)
-            req.output = output
+            req.output = jax.device_get(output)
+            req.latents = None
             self._comm_backend.send_pyobj(req)
 
 

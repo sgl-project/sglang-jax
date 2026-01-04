@@ -9,6 +9,7 @@ import psutil
 import setproctitle
 import zmq
 
+from sgl_jax.srt.multimodal.manager.device_manager import DeviceManager
 from sgl_jax.srt.multimodal.manager.io_struct import TokenizedGenerateMMReqInput
 from sgl_jax.srt.multimodal.manager.schedule_batch import Req
 from sgl_jax.srt.multimodal.manager.stage import Stage
@@ -34,12 +35,13 @@ class GlobalScheduler:
         self.stage_configs = load_stage_configs_from_yaml(
             "/home/gcpuser/sky_workdir/sglang-jax/python/sgl_jax/srt/multimodal/models/static_configs/wan2_1_stage_config.yaml"
         )
+        self.device_manager = DeviceManager()
         self._init_stage()
 
     def _init_stage(self):
         def _build_stage(idx_cfg: tuple[int, Any]) -> tuple[int, Stage]:
             idx, cfg = idx_cfg
-            return idx, Stage(cfg)
+            return idx, Stage(cfg, device_manager=self.device_manager)
 
         with ThreadPoolExecutor(
             max_workers=min(len(self.stage_configs), max(1, os.cpu_count() or 1))

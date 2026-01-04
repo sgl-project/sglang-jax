@@ -3,7 +3,7 @@ from typing import Any
 
 from sgl_jax.srt.managers.communication import QueueBackend
 from sgl_jax.srt.managers.scheduler import Scheduler as AutoRegressiveScheduler
-from sgl_jax.srt.multimodal.manager.device_manager import device_manager
+from sgl_jax.srt.multimodal.manager.device_manager import DeviceManager
 from sgl_jax.srt.multimodal.manager.scheduler.diffusion_scheduler import (
     DiffusionScheduler,
 )
@@ -12,7 +12,7 @@ from sgl_jax.srt.utils.mesh_utils import create_device_mesh
 
 
 class Stage:
-    def __init__(self, stage_config: Any):
+    def __init__(self, stage_config: Any, *, device_manager: DeviceManager):
         self._in_queue = None
         self._out_queue = None
         # this parallelism setting is accord to stage config

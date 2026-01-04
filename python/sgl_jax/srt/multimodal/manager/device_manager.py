@@ -13,6 +13,3 @@ class DeviceManager:
         current_devices = self.allocatable[:num_tpus]
         self.allocatable = self.allocatable[num_tpus:]
         return current_devices
-
-
-device_manager = DeviceManager()
