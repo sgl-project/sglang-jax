@@ -80,7 +80,8 @@ def _estimate_vmem_bytes(case: MoEBenchmarkCase, dtype: jnp.dtype, cfg: FusedMoE
     # U32 token staging for FFN1: (2, bt, bd1 // t_packing)
     t_stage_b32 = 2 * bt * (bd1 // t_packing) * 4
     # U32 staging for FFN2 output slice: (2, bt, bd2 // t_packing)
-    a2a_s_acc_stage_b32 = 2 * bt * (bd2 // t_packing) * 4
+    # Kernel uses triple-buffering for a2a_s_acc staging: (3, bt, bd2 // t_packing)
+    a2a_s_acc_stage_b32 = 3 * bt * (bd2 // t_packing) * 4
 
     # Routing / top-k temporaries in kernel (best-effort conservative estimate):
     # - softmax + get_top_k use float32 work buffers and broadcasted iotas

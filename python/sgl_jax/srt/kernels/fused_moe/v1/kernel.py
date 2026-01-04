@@ -383,9 +383,10 @@ def _fused_ep_moe_kernel(
     b_b2_x2_vmem,  # None | <bw_sem_id> (2, t_packing, 1, bd2 // t_packing)
     b_acc_vmem,  # F32(2, align_to(local_num_tokens * num_devices, bt), 1, bf)
     t_stage_b32_x2_vmem,  # U32(2, bt, bd1 // t_packing)
-    a2a_s_acc_stage_b32_x2_vmem,  # U32(2, bt, bd2 // t_packing)
+    a2a_s_acc_stage_b32_x3_vmem,  # U32(3, bt, bd2 // t_packing)
     ### Semaphores:
     token_stage_sems,  # DMA(2,): <token_buf_id>
+    acc_stage_sems,  # DMA(3,): <acc_buf_id>
     local_sems,  # (2, 5): weight ping-pong semaphores (plus gating/output on slot 0)
     send_sems,  # <e_sem_id> (2,)
     recv_sems,  # <e_sem_id> (2,)
@@ -1135,24 +1136,37 @@ def _fused_ep_moe_kernel(
                 sem=token_stage_sems.at[buf_id],
             ).wait()
 
-        def load_stage_a2a_s_acc_tile_from_hbm(tile_start, bd2_start, buf_id):
+        def start_load_stage_a2a_s_acc_tile_from_hbm(tile_start, bd2_start, buf_id):
             pltpu.make_async_copy(
                 src_ref=a2a_s_acc_b32_hbm.at[
                     e_sem_id,
                     pl.ds(tile_start, token_tile),
                     pl.ds(bd2_start, bd2_per_t_packing),
                 ],
-                dst_ref=a2a_s_acc_stage_b32_x2_vmem.at[
+                dst_ref=a2a_s_acc_stage_b32_x3_vmem.at[
                     buf_id,
                     pl.ds(0, token_tile),
                     pl.ds(0, bd2_per_t_packing),
                 ],
-                sem=token_stage_sems.at[buf_id],
+                sem=acc_stage_sems.at[buf_id],
+            ).start()
+
+        def wait_stage_a2a_s_acc_tile(buf_id):
+            pltpu.make_async_copy(
+                src_ref=a2a_s_acc_stage_b32_x3_vmem.at[
+                    buf_id,
+                    pl.ds(0, token_tile),
+                ],
+                dst_ref=a2a_s_acc_stage_b32_x3_vmem.at[
+                    buf_id,
+                    pl.ds(0, token_tile),
+                ],
+                sem=acc_stage_sems.at[buf_id],
             ).wait()
 
-        def store_stage_a2a_s_acc_tile_to_hbm(tile_start, bd2_start, buf_id):
+        def start_store_stage_a2a_s_acc_tile_to_hbm(tile_start, bd2_start, buf_id):
             pltpu.make_async_copy(
-                src_ref=a2a_s_acc_stage_b32_x2_vmem.at[
+                src_ref=a2a_s_acc_stage_b32_x3_vmem.at[
                     buf_id,
                     pl.ds(0, token_tile),
                     pl.ds(0, bd2_per_t_packing),
@@ -1162,8 +1176,8 @@ def _fused_ep_moe_kernel(
                     pl.ds(tile_start, token_tile),
                     pl.ds(bd2_start, bd2_per_t_packing),
                 ],
-                sem=token_stage_sems.at[buf_id],
-            ).wait()
+                sem=acc_stage_sems.at[buf_id],
+            ).start()
 
         for bf_id in range(num_bf):
             for bd1_id in range(num_bd1):
@@ -1254,36 +1268,101 @@ def _fused_ep_moe_kernel(
                 w2_vmem = b_w2_x2_vmem.at[bw_sem_id]
                 should_init_ffn2 = bf_id == 0
 
+                # Triple-buffer a2a_s_acc staging to overlap:
+                # - load(next tile) / compute(curr tile) / store(prev tile)
+                init_buf_compute = jnp.int32(0)
+                init_buf_store = jnp.int32(1)
+                init_buf_load = jnp.int32(2)
+                has_tiles = num_token_tiles > 0
+
+                if not should_init_ffn2:
+
+                    @pl.when(has_tiles)
+                    def _(bd2_start=bd2_start, init_buf_compute=init_buf_compute):
+                        start_load_stage_a2a_s_acc_tile_from_hbm(
+                            jnp.int32(0), bd2_start, init_buf_compute
+                        )
+
+                pending_init = jnp.zeros((3,), dtype=jnp.int32)
+                if not should_init_ffn2:
+                    pending_init = pending_init.at[init_buf_compute].set(
+                        lax.select(has_tiles, jnp.int32(1), jnp.int32(0))
+                    )
+
                 def run_ffn2_tile(
                     token_tile_id,
-                    buf_id,
+                    state,
+                    *,
                     bd2_start=bd2_start,
                     token_tile=token_tile,
                     dyn_sz_i32=dyn_sz_i32,
+                    num_token_tiles=num_token_tiles,
                     w2_vmem=w2_vmem,
                     w2_scale_vmem=w2_scale_vmem,
                     b2_vmem=b2_vmem,
                     should_init_ffn2=should_init_ffn2,
                 ):
+                    buf_compute, buf_store, buf_load, pending = state
                     tile_start = token_tile_id * token_tile
-
                     tile_sz = jnp.maximum(jnp.minimum(dyn_sz_i32 - tile_start, token_tile), 0)
+
+                    # Prefetch next tile's accumulator (if accumulating across bf blocks).
                     if not should_init_ffn2:
-                        load_stage_a2a_s_acc_tile_from_hbm(tile_start, bd2_start, buf_id)
+                        do_prefetch = token_tile_id + 1 < num_token_tiles
+                        next_tile_start = (token_tile_id + 1) * token_tile
+
+                        @pl.when(jnp.logical_and(do_prefetch, pending[buf_load] == 1))
+                        def _():
+                            wait_stage_a2a_s_acc_tile(buf_load)
+
+                        @pl.when(do_prefetch)
+                        def _():
+                            start_load_stage_a2a_s_acc_tile_from_hbm(
+                                next_tile_start, bd2_start, buf_load
+                            )
+
+                        pending_load_val = lax.select(do_prefetch, jnp.int32(1), pending[buf_load])
+                        pending = pending.at[buf_load].set(pending_load_val)
+
+                        # Ensure current tile's load has completed before compute.
+                        @pl.when(pending[buf_compute] == 1)
+                        def _():
+                            wait_stage_a2a_s_acc_tile(buf_compute)
+
+                        pending = pending.at[buf_compute].set(jnp.int32(0))
+
                     dynamic_ffn2(
                         acc1_vmem=b_acc1_vmem.at[pl.ds(tile_start, token_tile)],
                         acc3_vmem=b_acc3_vmem.at[pl.ds(tile_start, token_tile)],
                         w2_vmem=w2_vmem,
                         w2_scale_vmem=w2_scale_vmem,
                         b2_vmem=b2_vmem,
-                        res_b32_vmem=a2a_s_acc_stage_b32_x2_vmem.at[buf_id],
+                        res_b32_vmem=a2a_s_acc_stage_b32_x3_vmem.at[buf_compute],
                         dyn_sz=tile_sz,
                         should_init=should_init_ffn2,
                     )
-                    store_stage_a2a_s_acc_tile_to_hbm(tile_start, bd2_start, buf_id)
-                    return buf_id ^ jnp.int32(1)
+                    start_store_stage_a2a_s_acc_tile_to_hbm(tile_start, bd2_start, buf_compute)
+                    pending = pending.at[buf_compute].set(jnp.int32(1))
+                    # Rotate buffers: compute <- load, store <- compute, load <- store.
+                    return (buf_load, buf_compute, buf_store, pending)
 
-                lax.fori_loop(0, num_token_tiles, run_ffn2_tile, jnp.int32(0), unroll=False)
+                state = (init_buf_compute, init_buf_store, init_buf_load, pending_init)
+                state = lax.fori_loop(0, num_token_tiles, run_ffn2_tile, state, unroll=False)
+                # Drain outstanding DMA before the next bd2 slice / gather.
+                pending = state[3]
+
+                @pl.when(pending[0] == 1)
+                def _():
+                    wait_stage_a2a_s_acc_tile(jnp.int32(0))
+
+                @pl.when(pending[1] == 1)
+                def _():
+                    wait_stage_a2a_s_acc_tile(jnp.int32(1))
+
+                @pl.when(pending[2] == 1)
+                def _():
+                    wait_stage_a2a_s_acc_tile(jnp.int32(2))
+
                 bw_sem_id = (bw_sem_id + 1) % 2
 
     def acc_and_store_output(top_k_logits_lst):
@@ -1716,9 +1795,10 @@ def fused_ep_moe(
         b2_scratch,  # b_b2_x2_vmem
         pltpu.VMEM((2, a2a_max_tokens, 1, block_config.bf), jnp.float32),  # b_acc_vmem
         pltpu.VMEM((2, block_config.bt, bd1_per_pack), jnp.uint32),  # t_stage_b32_x2_vmem
-        pltpu.VMEM((2, block_config.bt, bd2_per_pack), jnp.uint32),  # a2a_s_acc_stage_b32_x2_vmem
+        pltpu.VMEM((3, block_config.bt, bd2_per_pack), jnp.uint32),  # a2a_s_acc_stage_b32_x3_vmem
         # Semaphores.
         pltpu.SemaphoreType.DMA((2,)),  # token_stage_sems
+        pltpu.SemaphoreType.DMA((3,)),  # acc_stage_sems
         pltpu.SemaphoreType.DMA((2, 5)),  # local_sems
         pltpu.SemaphoreType.DMA((2,)),  # send_sems
         pltpu.SemaphoreType.DMA((2,)),  # recv_sems
