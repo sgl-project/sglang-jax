@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import functools
+import math
 from dataclasses import dataclass
 
 import jax
@@ -184,6 +185,12 @@ def validate_fused_moe_block_config(
     t_packing = get_dtype_packing(dtype)
     tile_align = t_packing * 128
     local_num_tokens = num_tokens // ep_size
+
+    # Mosaic TPU lowering requires token-axis slices to be 8-aligned for the
+    # tiled layout used in DMA (e.g. output writeback). Fail early with a clear
+    # error instead of hitting a compile-time MosaicError.
+    if local_num_tokens % 8 != 0:
+        raise ValueError(f"Expected {local_num_tokens=} to be aligned to 8.")
 
     bt = block_config.bt
     bf = block_config.bf
@@ -1396,7 +1403,8 @@ def _fused_ep_moe_kernel(
                 bw_sem_id = (bw_sem_id + 1) % 2
 
     def acc_and_store_output(top_k_logits_lst):
-        b_output_flat = b_output_x2_vmem.reshape(2, bt, hidden_size)
+        output_bt = b_output_x2_vmem.shape[1]
+        b_output_flat = b_output_x2_vmem.reshape(2, output_bt, hidden_size)
 
         def start_fetch_a2a_g_token(*, acc_buf_id, t_id):
             for k_id in range(top_k):
@@ -1418,8 +1426,8 @@ def _fused_ep_moe_kernel(
 
         def wait_store_output(*, out_buf_id):
             pltpu.make_async_copy(
-                src_ref=b_output_x2_vmem.at[out_buf_id, pl.ds(0, bt)],
-                dst_ref=b_output_x2_vmem.at[out_buf_id, pl.ds(0, bt)],
+                src_ref=b_output_x2_vmem.at[out_buf_id, pl.ds(0, output_bt)],
+                dst_ref=b_output_x2_vmem.at[out_buf_id, pl.ds(0, output_bt)],
                 sem=local_sems.at[out_buf_id, 4],
             ).wait()
 
@@ -1468,11 +1476,11 @@ def _fused_ep_moe_kernel(
                 )
                 acc_buf_id = next_buf_id
 
-        num_tiles = (local_num_tokens + bt - 1) // bt
+        num_tiles = (local_num_tokens + output_bt - 1) // output_bt
 
-        for tile_idx, tile_start in enumerate(range(0, local_num_tokens, bt)):
+        for tile_idx, tile_start in enumerate(range(0, local_num_tokens, output_bt)):
             out_buf_id = tile_idx & 1
-            tile_sz = min(bt, local_num_tokens - tile_start)
+            tile_sz = min(output_bt, local_num_tokens - tile_start)
             if tile_idx >= 2:
                 wait_store_output(out_buf_id=out_buf_id)
 
@@ -1782,6 +1790,9 @@ def fused_ep_moe(
     num_experts, intermediate_size, _ = w2.shape
 
     local_num_tokens = num_tokens // ep_size
+    output_bt = math.gcd(block_config.bt, local_num_tokens)
+    if output_bt <= 0:
+        raise ValueError(f"Expected {output_bt=} to be > 0.")
     padded_num_experts = align_to(num_experts, 128)
     padded_top_k = align_to(top_k, 128)
     t_dtype = tokens.dtype
@@ -1863,7 +1874,7 @@ def fused_ep_moe(
         pltpu.VMEM((2, top_k, 1, t_packing, hidden_per_pack), t_dtype),  # a2a_g_acc_vmem
         # Expert compute scratch.
         pltpu.VMEM((local_num_tokens, padded_num_experts), gating_dtype),  # b_gating_vmem
-        pltpu.VMEM((2, block_config.bt, t_packing, hidden_per_pack), t_dtype),  # b_output_x2_vmem
+        pltpu.VMEM((2, output_bt, t_packing, hidden_per_pack), t_dtype),  # b_output_x2_vmem
         pltpu.VMEM((2, t_packing, bd1_per_pack, block_config.bf), w1.dtype),  # b_w1_x2_vmem
         pltpu.VMEM((2, t_packing, bd1_per_pack, block_config.bf), w3.dtype),  # b_w3_x2_vmem
         pltpu.VMEM((2, t_packing, block_config.bf, bd2_per_pack), w2.dtype),  # b_w2_x2_vmem

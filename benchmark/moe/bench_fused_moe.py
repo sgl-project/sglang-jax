@@ -8,6 +8,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import math
 
 import jax
 import jax.numpy as jnp
@@ -66,8 +67,9 @@ def _estimate_vmem_bytes(case: MoEBenchmarkCase, dtype: jnp.dtype, cfg: FusedMoE
 
     # a2a_g_acc_vmem is token-level double-buffered: (2, top_k, 1, ..., hidden)
     a2a_g_acc = 2 * top_k * hidden * token_bytes
-    # b_output is tile-level double-buffered: (2, bt, hidden_size)
-    b_output = 2 * bt * hidden * token_bytes
+    # b_output is tile-level double-buffered: (2, output_bt, hidden_size)
+    output_bt = math.gcd(bt, local_num_tokens)
+    b_output = 2 * output_bt * hidden * token_bytes
     b_gating = local_num_tokens * padded_num_experts * token_bytes
     # t2e_routing_smem scratch: (local_num_tokens, padded_top_k) int32
     t2e_routing = local_num_tokens * padded_top_k * 4
