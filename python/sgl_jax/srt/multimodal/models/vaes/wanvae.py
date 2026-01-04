@@ -104,12 +104,12 @@ class RMSNorm(nnx.Module):
         # gamma shape: (dim,) will broadcast to [B, T, H, W, C] or [B, H, W, C]
         shape = (1, 1, dim) if images else (1, 1, 1, dim)
         self.scale = nnx.Param(jnp.ones(shape), dtype=jnp.float32)
-        self.eps = 1e-12
+        self.epsilon = 1e-12
 
     def __call__(self, x: jax.Array) -> jax.Array:
         # x: [B, T, H, W, C] for 3D or [B, H, W, C] for 2D
         # Normalize to unit RMS along the channel dimension manually since jax.nn.normalize is unavailable.
-        rms = jnp.sqrt(jnp.sum(jnp.square(x), axis=-1, keepdims=True) + self.eps)
+        rms = jnp.sqrt(jnp.sum(jnp.square(x), axis=-1, keepdims=True) + self.epsilon)
         x_normalized = x / rms
         return x_normalized * self.scale_factor * self.scale.get_value()
 

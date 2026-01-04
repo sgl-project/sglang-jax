@@ -24,12 +24,12 @@ class WanTransformerBlock(nnx.Module):
         num_heads: int,
         qk_norm: str = "rms_norm_across_heads",
         cross_attn_norm: bool = False,
-        eps: float = 1e-6,
+        epsilon: float = 1e-6,
         added_kv_proj_dim: int | None = None,
     ):
         super().__init__()
 
-        self.norm1 = FP32LayerNorm(num_features=dim, epsilon=eps)
+        self.norm1 = FP32LayerNorm(num_features=dim, epsilon=epsilon)
 
         self.to_q = ReplicatedLinear(input_size=dim, output_size=dim, use_bias=True)
         self.to_k = ReplicatedLinear(input_size=dim, output_size=dim, use_bias=True)
@@ -47,12 +47,12 @@ class WanTransformerBlock(nnx.Module):
         self.num_attention_heads = num_heads
         dim_head = dim // num_heads
         if qk_norm == "rms_norm":
-            self.norm_q = RMSNorm(dim_head, eps=eps)
-            self.norm_k = RMSNorm(dim_head, eps=eps)
+            self.norm_q = RMSNorm(dim_head, epsilon=epsilon)
+            self.norm_k = RMSNorm(dim_head, epsilon=epsilon)
         elif qk_norm == "rms_norm_across_heads":
             # LTX applies qk norm across all heads
-            self.norm_q = RMSNorm(dim, eps=eps)
-            self.norm_k = RMSNorm(dim, eps=eps)
+            self.norm_q = RMSNorm(dim, epsilon=epsilon)
+            self.norm_k = RMSNorm(dim, epsilon=epsilon)
         else:
             print("QK Norm type not supported")
             raise Exception
@@ -60,7 +60,7 @@ class WanTransformerBlock(nnx.Module):
         self.self_attn_residual_norm = ScaleResidualLayerNormScaleShift(
             dim,
             norm_type="layer",
-            eps=eps,
+            epsilon=epsilon,
             elementwise_affine=True,
             dtype=jnp.float32,
             compute_dtype=jnp.float32,
@@ -73,7 +73,7 @@ class WanTransformerBlock(nnx.Module):
                 dim,
                 num_heads,
                 qk_norm=qk_norm,
-                eps=eps,
+                epsilon=epsilon,
             )
         else:
             # T2V
@@ -81,12 +81,12 @@ class WanTransformerBlock(nnx.Module):
                 dim,
                 num_heads,
                 qk_norm=qk_norm,
-                eps=eps,
+                epsilon=epsilon,
             )
         self.cross_attn_residual_norm = ScaleResidualLayerNormScaleShift(
             dim,
             norm_type="layer",
-            eps=eps,
+            epsilon=epsilon,
             elementwise_affine=False,
             dtype=jnp.float32,
             compute_dtype=jnp.float32,
@@ -98,7 +98,7 @@ class WanTransformerBlock(nnx.Module):
 
         self.scale_shift_table = nnx.Param(jax.random.randn(1, 6, dim) / dim**0.5)
 
-    def forward(
+    def call(
         self,
         hidden_states: jax.Array,
         encoder_hidden_states: jax.Array,
@@ -183,12 +183,142 @@ def _apply_rotary_emb(
     pass
 
 
-class WanT2VCrossAttention(nnx.Module):
-    pass
+class WanSelfAttention(nnx.Module):
+
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int,
+        window_size=(-1, -1),
+        qk_norm=True,
+        epsilon=1e-6,
+        parallel_attention=False,
+    ) -> None:
+        assert dim % num_heads == 0
+        super().__init__()
+        self.dim = dim
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        self.window_size = window_size
+        self.qk_norm = qk_norm
+        self.epsilon = epsilon
+        self.parallel_attention = parallel_attention
+
+        # layers
+        self.to_q = ReplicatedLinear(dim, dim)
+        self.to_k = ReplicatedLinear(dim, dim)
+        self.to_v = ReplicatedLinear(dim, dim)
+        self.to_out = ReplicatedLinear(dim, dim)
+        self.norm_q = RMSNorm(dim, epsilon=self.epsilon)
+        self.norm_k = RMSNorm(dim, epsilon=self.epsilon)
+
+        # Scaled dot product attention
+        self.attn = USPAttention(
+            num_heads=num_heads,
+            head_size=self.head_dim,
+            dropout_rate=0,
+            softmax_scale=None,
+            causal=False,
+        )
+
+    def call(self, x: jax.Array, context: jax.Array, context_lens: int):
+        r"""
+        Args:
+            x(Tensor): Shape [B, L, num_heads, C / num_heads]
+            seq_lens(Tensor): Shape [B]
+            grid_sizes(Tensor): Shape [B, 3], the second dimension contains (F, H, W)
+            freqs(Tensor): Rope freqs, shape [1024, C / num_heads / 2]
+        """
+        pass
 
 
-class WanI2VCrossAttention(nnx.Module):
-    pass
+class WanT2VCrossAttention(WanSelfAttention):
+
+    def call(self, x, context, context_lens, crossattn_cache=None):
+        r"""
+        Args:
+            x(Tensor): Shape [B, L1, C]
+            context(Tensor): Shape [B, L2, C]
+            context_lens(Tensor): Shape [B]
+        """
+        b, n, d = x.size(0), self.num_heads, self.head_dim
+
+        # compute query, key, value
+        q = self.norm_q(self.to_q(x)[0]).view(b, -1, n, d)
+
+        if crossattn_cache is not None:
+            if not crossattn_cache["is_init"]:
+                crossattn_cache["is_init"] = True
+                k = self.norm_k(self.to_k(context)[0]).view(b, -1, n, d)
+                v = self.to_v(context)[0].view(b, -1, n, d)
+                crossattn_cache["k"] = k
+                crossattn_cache["v"] = v
+            else:
+                k = crossattn_cache["k"]
+                v = crossattn_cache["v"]
+        else:
+            k = self.norm_k(self.to_k(context)[0]).view(b, -1, n, d)
+            v = self.to_v(context)[0].view(b, -1, n, d)
+
+        # compute attention
+        x = self.attn(q, k, v)
+
+        # output
+        x = x.flatten(2)
+        x, _ = self.to_out(x)
+        return x
+
+
+class WanI2VCrossAttention(WanSelfAttention):
+
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int,
+        window_size=(-1, -1),
+        qk_norm=True,
+        epsilon=1e-6,
+    ) -> None:
+        super().__init__(
+            dim,
+            num_heads,
+            window_size,
+            qk_norm,
+            epsilon,
+        )
+
+        self.add_k_proj = ReplicatedLinear(dim, dim)
+        self.add_v_proj = ReplicatedLinear(dim, dim)
+        self.norm_added_k = RMSNorm(dim, epsilon=epsilon)
+        self.norm_added_q = RMSNorm(dim, epsilon=epsilon)
+
+    def call(self, x, context, context_lens):
+        r"""
+        Args:
+            x(Tensor): Shape [B, L1, C]
+            context(Tensor): Shape [B, L2, C]
+            context_lens(Tensor): Shape [B]
+        """
+        context_img = context[:, :257]
+        context = context[:, 257:]
+        b, n, d = x.size(0), self.num_heads, self.head_dim
+
+        # compute query, key, value
+        q = self.norm_q(self.to_q(x)[0]).view(b, -1, n, d)
+        k = self.norm_k(self.to_k(context)[0]).view(b, -1, n, d)
+        v = self.to_v(context)[0].view(b, -1, n, d)
+        k_img = self.norm_added_k(self.add_k_proj(context_img)[0]).view(b, -1, n, d)
+        v_img = self.add_v_proj(context_img)[0].view(b, -1, n, d)
+        img_x = self.attn(q, k_img, v_img)
+        # compute attention
+        x = self.attn(q, k, v)
+
+        # output
+        x = x.flatten(2)
+        img_x = img_x.flatten(2)
+        x = x + img_x
+        x, _ = self.to_out(x)
+        return x
 
 
 class WanTimeTextImageEmbedding(nnx.Module):
@@ -230,7 +360,7 @@ class WanTransformer3DModel:
                     config.num_attention_heads,
                     config.qk_norm,
                     config.cross_attn_norm,
-                    config.eps,
+                    config.epsilon,
                     config.added_kv_proj_dim,
                 )
                 for i in range(config.num_layers)
@@ -244,13 +374,13 @@ class WanTransformer3DModel:
         )
         pass
 
-    def forward(
+    def call(
         self,
         hidden_states: jax.Array,
         encoder_hidden_states: jax.Array | list[jax.Array],
         timesteps: jax.Array,
         encoder_hidden_states_image: jax.Array | list[jax.Array] | None,
-        guidance_scale=1.0 | None,
+        guidance_scale=1.0,
         **kwargs,
     ):
         # origin_dtype = hidden_states.dtype

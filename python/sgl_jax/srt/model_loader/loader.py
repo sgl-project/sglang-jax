@@ -61,7 +61,6 @@ class JAXModelLoader(BaseModelLoader):
 
     def load_model(
         self,
-        *,
         model_config: ModelConfig,
     ) -> Any:
         # prepare model file

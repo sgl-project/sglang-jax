@@ -62,7 +62,7 @@ class ScaleResidualLayerNormScaleShift(nnx.Module):
         self,
         hidden_size: int,
         norm_type: str = "rms",
-        eps: float = 1e-6,
+        epsilon: float = 1e-6,
         elementwise_affine: bool = False,
         dtype: jnp.dtype = jnp.float32,
         compute_dtype: jnp.dtype | None = None,
@@ -72,14 +72,14 @@ class ScaleResidualLayerNormScaleShift(nnx.Module):
             self.norm = RMSNorm(
                 hidden_size,
                 use_scale=elementwise_affine,
-                epsilon=eps,
+                epsilon=epsilon,
                 dtype=dtype,
             )
         elif norm_type == "layer":
             if compute_dtype == jnp.float32:
                 self.norm = FP32LayerNorm(
                     hidden_size,
-                    epsilon=eps,
+                    epsilon=epsilon,
                     use_scale=elementwise_affine,
                     use_bias=elementwise_affine,
                     dtype=dtype,
@@ -87,7 +87,7 @@ class ScaleResidualLayerNormScaleShift(nnx.Module):
             else:
                 self.norm = nnx.LayerNorm(
                     hidden_size,
-                    epsilon=eps,
+                    epsilon=epsilon,
                     use_scale=elementwise_affine,
                     use_bias=elementwise_affine,
                     dtype=dtype,

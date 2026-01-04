@@ -68,7 +68,7 @@ class WanVideoArchConfig(DiTArchConfig):
     num_layers: int = 40
     cross_attn_norm: bool = True
     qk_norm: str = "rms_norm_across_heads"
-    eps: float = 1e-6
+    epsilon: float = 1e-6
     image_dim: int | None = None
     added_kv_proj_dim: int | None = None
     rope_max_seq_len: int = 1024

@@ -1,16 +1,13 @@
-from sgl_jax.srt.model_loader.loader import get_model_loader
+from sgl_jax.srt.multimodal.common.ServerArgs import MultimodalServerArgs
 from sgl_jax.srt.multimodal.model_executor.diffusion.diffusion_model_runner import (
     DiffusionModelRunner,
 )
 
 
 class DiffusionModelWorker:
-    def __init__(self, model_config, mesh):
-        self.model_config = model_config
+    def __init__(self, server_args: MultimodalServerArgs, mesh):
         self.mesh = mesh
-        # Initialize model here based on model_config
-        self.model_loader = get_model_loader(model_config, mesh)
-        self.model_runner = DiffusionModelRunner(self.model_loader, model_config)
+        self.model_runner = DiffusionModelRunner(server_args, self.mesh)
         self.initialize()
 
     def initialize(self):

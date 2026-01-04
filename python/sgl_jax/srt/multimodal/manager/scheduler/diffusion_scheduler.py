@@ -1,6 +1,7 @@
 import jax.sharding
 
 from sgl_jax.srt.managers.communication import CommunicationBackend
+from sgl_jax.srt.multimodal.common.ServerArgs import MultimodalServerArgs
 from sgl_jax.srt.multimodal.model_executor.diffusion.diffusion_model_worker import (
     DiffusionModelWorker,
 )
@@ -9,15 +10,13 @@ from sgl_jax.srt.multimodal.model_executor.diffusion.diffusion_model_worker impo
 class DiffusionScheduler:
     def __init__(
         self,
-        server_args,
+        server_args: MultimodalServerArgs,
         mesh: jax.sharding.Mesh,
         communication_backend: CommunicationBackend = None,
     ):
-        # self._in_queue = in_queue
-        # self._out_queue = out_queue
         self.communication_backend = communication_backend
         self.mesh = mesh
-        self.diffusion_worker = DiffusionModelWorker(server_args.model_config, mesh=mesh)
+        self.diffusion_worker = DiffusionModelWorker(server_args, mesh=mesh)
 
     def event_loop(self):
 
