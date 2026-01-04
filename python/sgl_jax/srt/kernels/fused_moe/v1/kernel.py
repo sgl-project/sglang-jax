@@ -1396,6 +1396,8 @@ def _fused_ep_moe_kernel(
                 bw_sem_id = (bw_sem_id + 1) % 2
 
     def acc_and_store_output(top_k_logits_lst):
+        b_output_flat = b_output_x2_vmem.reshape(2, bt, hidden_size)
+
         def start_fetch_a2a_g_token(*, acc_buf_id, t_id):
             for k_id in range(top_k):
                 e_id = t2e_routing_smem[t_id, k_id]
@@ -1422,15 +1424,11 @@ def _fused_ep_moe_kernel(
             ).wait()
 
         def start_store_output(*, tile_start, tile_sz, out_buf_id):
-            for p in range(t_packing):
-                pltpu.make_async_copy(
-                    src_ref=b_output_x2_vmem.at[out_buf_id, pl.ds(0, tile_sz), p],
-                    dst_ref=output_hbm.at[
-                        pl.ds(tile_start, tile_sz),
-                        pl.ds(p * h_per_t_packing, h_per_t_packing),
-                    ],
-                    sem=local_sems.at[out_buf_id, 4],
-                ).start()
+            pltpu.make_async_copy(
+                src_ref=b_output_flat.at[out_buf_id, pl.ds(0, tile_sz), pl.ds(0, hidden_size)],
+                dst_ref=output_hbm.at[pl.ds(tile_start, tile_sz), pl.ds(0, hidden_size)],
+                sem=local_sems.at[out_buf_id, 4],
+            ).start()
 
         def bt_acc(*, tile_start, tile_sz, out_buf_id):
             # Token-level double-buffering to overlap a2a_g_hbm reads with reduction, while producing a
