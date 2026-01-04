@@ -186,12 +186,6 @@ def validate_fused_moe_block_config(
     tile_align = t_packing * 128
     local_num_tokens = num_tokens // ep_size
 
-    # Mosaic TPU lowering requires token-axis slices to be 8-aligned for the
-    # tiled layout used in DMA (e.g. output writeback). Fail early with a clear
-    # error instead of hitting a compile-time MosaicError.
-    if local_num_tokens % 8 != 0:
-        raise ValueError(f"Expected {local_num_tokens=} to be aligned to 8.")
-
     bt = block_config.bt
     bf = block_config.bf
     bd1 = block_config.bd1
@@ -375,10 +369,10 @@ def _fused_ep_moe_kernel(
     expert_sizes_smem,  # (1, padded_num_experts)
     a2a_s_sends_x2_smem,  # <e_sem_id> (2,)
     ### Accumulation for gathered tokens:
-    a2a_g_acc_vmem,  # (2, top_k, 1, t_packing, hidden_size // t_packing)
+    a2a_g_acc_vmem,  # (2, top_k, output_bt, t_packing, hidden_size // t_packing)
     ### Expert weight double buffering:
     b_gating_vmem,  # (local_num_tokens, padded_num_experts)
-    b_output_x2_vmem,  # (2, bt, t_packing, hidden_size // t_packing)
+    b_output_x2_vmem,  # (2, output_bt, t_packing, hidden_size // t_packing)
     b_w1_x2_vmem,  # <bw_sem_id> (2, t_packing, bd1 // t_packing, bf)
     b_w3_x2_vmem,  # <bw_sem_id> (2, t_packing, bd1 // t_packing, bf)
     b_w2_x2_vmem,  # <bw_sem_id> (2, t_packing, bf, bd2 // t_packing)
@@ -398,7 +392,7 @@ def _fused_ep_moe_kernel(
     send_sems,  # <e_sem_id> (2,)
     recv_sems,  # <e_sem_id> (2,)
     a2a_gather_sem,
-    a2a_acc_sems,  # DMA(2,): <acc_buf_id>
+    a2a_acc_sems,  # DMA(2,): <load_buf_id>
     barrier_sem,
     *,
     top_k: int,
@@ -1406,22 +1400,24 @@ def _fused_ep_moe_kernel(
         output_bt = b_output_x2_vmem.shape[1]
         b_output_flat = b_output_x2_vmem.reshape(2, output_bt, hidden_size)
 
-        def start_fetch_a2a_g_token(*, acc_buf_id, t_id):
-            for k_id in range(top_k):
-                e_id = t2e_routing_smem[t_id, k_id]
-                offset = expert_offsets_smem[1, e_id]
-                expert_offsets_smem[1, e_id] = offset + 1
-                pltpu.make_async_copy(
-                    src_ref=a2a_g_hbm.at[e_id, pl.ds(offset, 1)],
-                    dst_ref=a2a_g_acc_vmem.at[acc_buf_id, k_id, pl.ds(0, 1)],
-                    sem=a2a_acc_sems.at[acc_buf_id],
-                ).start()
+        def start_load_bt(*, load_buf_id, tile_start):
+            for t_i in range(output_bt):
+                t_id = tile_start + t_i
+                for k_id in range(top_k):
+                    e_id = t2e_routing_smem[t_id, k_id]
+                    offset = expert_offsets_smem[1, e_id]
+                    expert_offsets_smem[1, e_id] = offset + 1
+                    pltpu.make_async_copy(
+                        src_ref=a2a_g_hbm.at[e_id, pl.ds(offset, 1)],
+                        dst_ref=a2a_g_acc_vmem.at[load_buf_id, k_id, pl.ds(t_i, 1)],
+                        sem=a2a_acc_sems.at[load_buf_id],
+                    ).start()
 
-        def wait_fetch_a2a_g_token(*, acc_buf_id):
+        def wait_load_bt(*, load_buf_id):
             pltpu.make_async_copy(
-                src_ref=a2a_g_acc_vmem.at[acc_buf_id, pl.ds(0, top_k), pl.ds(0, 1)],
-                dst_ref=a2a_g_acc_vmem.at[acc_buf_id, pl.ds(0, top_k), pl.ds(0, 1)],
-                sem=a2a_acc_sems.at[acc_buf_id],
+                src_ref=a2a_g_acc_vmem.at[load_buf_id],
+                dst_ref=a2a_g_acc_vmem.at[load_buf_id],
+                sem=a2a_acc_sems.at[load_buf_id],
             ).wait()
 
         def wait_store_output(*, out_buf_id):
@@ -1438,26 +1434,12 @@ def _fused_ep_moe_kernel(
                 sem=local_sems.at[out_buf_id, 4],
             ).start()
 
-        def bt_acc(*, tile_start, tile_sz, out_buf_id):
-            # Token-level double-buffering to overlap a2a_g_hbm reads with reduction, while producing a
-            # contiguous bt-tile in `b_output_x2_vmem[out_buf_id]`.
-            acc_buf_id = 0
-            start_fetch_a2a_g_token(acc_buf_id=acc_buf_id, t_id=tile_start)
+        def bt_acc(*, load_buf_id, tile_start, tile_sz, out_buf_id):
             for t_i in range(tile_sz):
                 t_id = tile_start + t_i
-                next_t_i = t_i + 1
-                next_buf_id = acc_buf_id ^ 1
-                if next_t_i < tile_sz:
-                    start_fetch_a2a_g_token(
-                        acc_buf_id=next_buf_id,
-                        t_id=tile_start + next_t_i,
-                    )
-
-                wait_fetch_a2a_g_token(acc_buf_id=acc_buf_id)
-
                 output_vec = None
                 for k_id in range(top_k):
-                    acc = a2a_g_acc_vmem[acc_buf_id, k_id, 0]
+                    acc = a2a_g_acc_vmem[load_buf_id, k_id, t_i]
                     logit = top_k_logits_lst[k_id][t_id, 0]
                     contrib = acc.astype(jnp.float32) * logit
                     if output_vec is None:
@@ -1474,18 +1456,31 @@ def _fused_ep_moe_kernel(
                 out_row_ref[...] = output_vec.reshape(1, t_packing, h_per_t_packing).astype(
                     output_hbm.dtype
                 )
-                acc_buf_id = next_buf_id
 
         num_tiles = (local_num_tokens + output_bt - 1) // output_bt
 
+        # Prefetch the first bt tile so the loop body can follow the
+        # load(next) -> wait(curr) -> compute(curr) -> store(curr) structure.
+        start_load_bt(load_buf_id=0, tile_start=0)
+
         for tile_idx, tile_start in enumerate(range(0, local_num_tokens, output_bt)):
             out_buf_id = tile_idx & 1
+            load_buf_id = tile_idx & 1
             tile_sz = min(output_bt, local_num_tokens - tile_start)
             if tile_idx >= 2:
                 wait_store_output(out_buf_id=out_buf_id)
 
-            bt_acc(tile_start=tile_start, tile_sz=tile_sz, out_buf_id=out_buf_id)
+            next_tile_start = tile_start + output_bt
+            if tile_idx + 1 < num_tiles:
+                start_load_bt(load_buf_id=load_buf_id ^ 1, tile_start=next_tile_start)
 
+            wait_load_bt(load_buf_id=load_buf_id)
+            bt_acc(
+                load_buf_id=load_buf_id,
+                tile_start=tile_start,
+                tile_sz=tile_sz,
+                out_buf_id=out_buf_id,
+            )
             start_store_output(tile_start=tile_start, tile_sz=tile_sz, out_buf_id=out_buf_id)
 
         # Drain any outstanding output stores before returning.
@@ -1871,7 +1866,7 @@ def fused_ep_moe(
         pltpu.SMEM((1, padded_num_experts), jnp.int32),  # expert_starts_smem
         pltpu.SMEM((1, padded_num_experts), jnp.int32),  # expert_sizes_smem
         pltpu.SMEM((2,), jnp.int32),  # a2a_s_sends_x2_smem
-        pltpu.VMEM((2, top_k, 1, t_packing, hidden_per_pack), t_dtype),  # a2a_g_acc_vmem
+        pltpu.VMEM((2, top_k, output_bt, t_packing, hidden_per_pack), t_dtype),  # a2a_g_acc_vmem
         # Expert compute scratch.
         pltpu.VMEM((local_num_tokens, padded_num_experts), gating_dtype),  # b_gating_vmem
         pltpu.VMEM((2, output_bt, t_packing, hidden_per_pack), t_dtype),  # b_output_x2_vmem

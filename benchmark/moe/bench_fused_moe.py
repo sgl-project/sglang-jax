@@ -65,10 +65,10 @@ def _estimate_vmem_bytes(case: MoEBenchmarkCase, dtype: jnp.dtype, cfg: FusedMoE
     # to a multiple of `bt` for safe (bt-sized) token tiling in the kernel.
     a2a_max_tokens = ((local_num_tokens * num_devices + bt - 1) // bt) * bt
 
-    # a2a_g_acc_vmem is token-level double-buffered: (2, top_k, 1, ..., hidden)
-    a2a_g_acc = 2 * top_k * hidden * token_bytes
-    # b_output is tile-level double-buffered: (2, output_bt, hidden_size)
+    # a2a_g_acc_vmem stages one output tile with double-buffering: (2, top_k, output_bt, hidden_size)
     output_bt = math.gcd(bt, local_num_tokens)
+    a2a_g_acc = 2 * top_k * output_bt * hidden * token_bytes
+    # b_output is tile-level double-buffered: (2, output_bt, hidden_size)
     b_output = 2 * output_bt * hidden * token_bytes
     b_gating = local_num_tokens * padded_num_experts * token_bytes
     # t2e_routing_smem scratch: (local_num_tokens, padded_top_k) int32
