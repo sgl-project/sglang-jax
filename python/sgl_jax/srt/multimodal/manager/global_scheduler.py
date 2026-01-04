@@ -33,7 +33,7 @@ class GlobalScheduler:
         )
 
         self.stage_configs = load_stage_configs_from_yaml(
-            "/home/gcpuser/sky_workdir/sglang-jax/python/sgl_jax/srt/multimodal/models/static_configs/wan2_1_stage_config.yaml"
+            "./sgl_jax/srt/multimodal/models/static_configs/wan2_1_stage_config.yaml"
         )
         self.device_manager = DeviceManager()
         self._init_stage()

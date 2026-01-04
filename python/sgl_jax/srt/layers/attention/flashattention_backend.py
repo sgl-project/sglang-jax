@@ -423,8 +423,7 @@ class FlashAttention(AttentionBackend):
         layer: RadixAttention,
         forward_batch: ForwardBatch,
         token_to_kv_pool: KVCache,
-        attention_mask: jax.Array = None,
-        kv_partition_axis: str = "tensor",
+        causal: int = 1,
     ):
         """
         Args:
@@ -435,9 +434,17 @@ class FlashAttention(AttentionBackend):
         Returns:
             Output tensor of shape [total_tokens, hidden_size]
         """
-        kv_cache_fused = self._get_fused_kv_cache(forward_batch, token_to_kv_pool, layer.layer_id)
-
-        scale = 1.0 / jnp.sqrt(layer.head_dim) if layer.scaling is None else layer.scaling
+        if forward_batch is not None and token_to_kv_pool is not None:
+            kv_cache_fused = self._get_fused_kv_cache(
+                forward_batch, token_to_kv_pool, layer.layer_id
+            )
+        else:
+            kv_cache_fused = jnp.zeros((0, self.num_kv_heads * 2, self.head_dim), dtype=q.dtype)
+        scale = (
+            1.0 / jnp.sqrt(layer.head_dim)
+            if (layer is None or layer.scaling is None)
+            else layer.scaling
+        )
 
         # Prepare fused KV cache for paged format: [num_pages, page_size, num_kv_heads * 2, head_dim]
         total_tokens = kv_cache_fused.shape[0]
@@ -445,10 +452,6 @@ class FlashAttention(AttentionBackend):
         kv_cache_fused_paged = kv_cache_fused.reshape(
             num_pages, self.page_size, -1, (self.head_dim + 127) // 128 * 128
         )
-
-        causal = 1
-
-        # custom_mask = self.forward_metadata.custom_mask
         if self.forward_metadata.custom_mask is not None:
             causal = 0
         # Select page indices and remap to SWA pool if KV cache supports it
