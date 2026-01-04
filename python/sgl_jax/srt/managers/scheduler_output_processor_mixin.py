@@ -722,4 +722,7 @@ class SchedulerOutputProcessorMixin:
                 output_hidden_states,
                 cache_miss_count,
             )
-            self.send_to_detokenizer.send_pyobj(out)
+            if self._comm_backend is not None:
+                self._comm_backend.send_pyobj(out)
+            else:
+                self.send_to_detokenizer.send_pyobj(out)

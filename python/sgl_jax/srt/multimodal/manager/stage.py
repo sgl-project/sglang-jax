@@ -1,6 +1,7 @@
 from queue import Queue
 from typing import Any
 
+from sgl_jax.srt.managers.communication import QueueBackend
 from sgl_jax.srt.managers.scheduler import Scheduler as AutoRegressiveScheduler
 from sgl_jax.srt.multimodal.manager.device_manager import device_manager
 from sgl_jax.srt.multimodal.manager.scheduler.diffusion_scheduler import (
@@ -36,8 +37,9 @@ class Stage:
         print(f"stage start {self.stage_index}")
         # todo according to config to decide which scheduler to use
         scheduler_class = get_scheduler_class(self.stage_config.scheduler)
+        comm_backend = QueueBackend(in_queue=self._in_queue, out_queue=self._out_queue)
         self._stage_scheduler = scheduler_class(
-            in_queue=self._in_queue, out_queue=self._out_queue, **self.stage_config.scheduler_params
+            communication_backend=comm_backend, **self.stage_config.scheduler_params
         )
         self._stage_scheduler.event_loop()
 
