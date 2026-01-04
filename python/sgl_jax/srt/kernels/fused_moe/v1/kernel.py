@@ -1283,11 +1283,20 @@ def _fused_ep_moe_kernel(
                             jnp.int32(0), bd2_start, init_buf_compute
                         )
 
-                pending_init = jnp.zeros((3,), dtype=jnp.int32)
+                def _pending_get(p0, p1, p2, idx):
+                    return lax.select(idx == 0, p0, lax.select(idx == 1, p1, p2))
+
+                def _pending_set(p0, p1, p2, idx, val):
+                    p0 = lax.select(idx == 0, val, p0)
+                    p1 = lax.select(idx == 1, val, p1)
+                    p2 = lax.select(idx == 2, val, p2)
+                    return p0, p1, p2
+
+                pending0 = jnp.int32(0)
+                pending1 = jnp.int32(0)
+                pending2 = jnp.int32(0)
                 if not should_init_ffn2:
-                    pending_init = pending_init.at[init_buf_compute].set(
-                        lax.select(has_tiles, jnp.int32(1), jnp.int32(0))
-                    )
+                    pending0 = lax.select(has_tiles, jnp.int32(1), pending0)
 
                 def run_ffn2_tile(
                     token_tile_id,
@@ -1302,7 +1311,7 @@ def _fused_ep_moe_kernel(
                     b2_vmem=b2_vmem,
                     should_init_ffn2=should_init_ffn2,
                 ):
-                    buf_compute, buf_store, buf_load, pending = state
+                    buf_compute, buf_store, buf_load, pending0, pending1, pending2 = state
                     tile_start = token_tile_id * token_tile
                     tile_sz = jnp.maximum(jnp.minimum(dyn_sz_i32 - tile_start, token_tile), 0)
 
@@ -1311,7 +1320,9 @@ def _fused_ep_moe_kernel(
                         do_prefetch = token_tile_id + 1 < num_token_tiles
                         next_tile_start = (token_tile_id + 1) * token_tile
 
-                        @pl.when(jnp.logical_and(do_prefetch, pending[buf_load] == 1))
+                        pending_load = _pending_get(pending0, pending1, pending2, buf_load)
+
+                        @pl.when(jnp.logical_and(do_prefetch, pending_load == 1))
                         def _():
                             wait_stage_a2a_s_acc_tile(buf_load)
 
@@ -1321,15 +1332,21 @@ def _fused_ep_moe_kernel(
                                 next_tile_start, bd2_start, buf_load
                             )
 
-                        pending_load_val = lax.select(do_prefetch, jnp.int32(1), pending[buf_load])
-                        pending = pending.at[buf_load].set(pending_load_val)
+                        pending_load_val = lax.select(do_prefetch, jnp.int32(1), pending_load)
+                        pending0, pending1, pending2 = _pending_set(
+                            pending0, pending1, pending2, buf_load, pending_load_val
+                        )
 
                         # Ensure current tile's load has completed before compute.
-                        @pl.when(pending[buf_compute] == 1)
+                        pending_compute = _pending_get(pending0, pending1, pending2, buf_compute)
+
+                        @pl.when(pending_compute == 1)
                         def _():
                             wait_stage_a2a_s_acc_tile(buf_compute)
 
-                        pending = pending.at[buf_compute].set(jnp.int32(0))
+                        pending0, pending1, pending2 = _pending_set(
+                            pending0, pending1, pending2, buf_compute, jnp.int32(0)
+                        )
 
                     dynamic_ffn2(
                         acc1_vmem=b_acc1_vmem.at[pl.ds(tile_start, token_tile)],
@@ -1342,24 +1359,35 @@ def _fused_ep_moe_kernel(
                         should_init=should_init_ffn2,
                     )
                     start_store_stage_a2a_s_acc_tile_to_hbm(tile_start, bd2_start, buf_compute)
-                    pending = pending.at[buf_compute].set(jnp.int32(1))
+                    pending0, pending1, pending2 = _pending_set(
+                        pending0, pending1, pending2, buf_compute, jnp.int32(1)
+                    )
                     # Rotate buffers: compute <- load, store <- compute, load <- store.
-                    return (buf_load, buf_compute, buf_store, pending)
+                    return (buf_load, buf_compute, buf_store, pending0, pending1, pending2)
 
-                state = (init_buf_compute, init_buf_store, init_buf_load, pending_init)
+                state = (
+                    init_buf_compute,
+                    init_buf_store,
+                    init_buf_load,
+                    pending0,
+                    pending1,
+                    pending2,
+                )
                 state = lax.fori_loop(0, num_token_tiles, run_ffn2_tile, state, unroll=False)
                 # Drain outstanding DMA before the next bd2 slice / gather.
-                pending = state[3]
+                pending0 = state[3]
+                pending1 = state[4]
+                pending2 = state[5]
 
-                @pl.when(pending[0] == 1)
+                @pl.when(pending0 == 1)
                 def _():
                     wait_stage_a2a_s_acc_tile(jnp.int32(0))
 
-                @pl.when(pending[1] == 1)
+                @pl.when(pending1 == 1)
                 def _():
                     wait_stage_a2a_s_acc_tile(jnp.int32(1))
 
-                @pl.when(pending[2] == 1)
+                @pl.when(pending2 == 1)
                 def _():
                     wait_stage_a2a_s_acc_tile(jnp.int32(2))
 
