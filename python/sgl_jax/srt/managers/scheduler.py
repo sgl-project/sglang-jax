@@ -28,6 +28,7 @@ from sgl_jax.srt.constrained.base_grammar_backend import (
 )
 from sgl_jax.srt.hf_transformers_utils import get_tokenizer
 from sgl_jax.srt.layers.logits_processor import LogitsProcessorOutput
+from sgl_jax.srt.managers.communication import CommunicationBackend
 from sgl_jax.srt.managers.io_struct import (
     AbortReq,
     FlushCacheReqInput,
@@ -126,6 +127,7 @@ class Scheduler(
         self,
         server_args: ServerArgs,
         port_args: PortArgs,
+        communication_backend: CommunicationBackend = None,
     ):
         # set jit cache
         jit_cache_dir = os.getenv("JAX_COMPILATION_CACHE_DIR", None)
@@ -154,33 +156,40 @@ class Scheduler(
         self.spec_algorithm = SpeculativeAlgorithm.from_string(server_args.speculative_algorithm)
         # Init inter-process communication
         context = zmq.Context(2)
+        self._comm_backend = None
 
         if self.node_rank == 0:
-            self.recv_from_tokenizer = get_zmq_socket(
-                context, zmq.PULL, port_args.scheduler_input_ipc_name, False
-            )
-            self.send_to_tokenizer = get_zmq_socket(
-                context, zmq.PUSH, port_args.tokenizer_ipc_name, False
-            )
-
-            if server_args.skip_tokenizer_init:
-                # Directly send to the TokenizerManager
-                self.send_to_detokenizer = get_zmq_socket(
+            # todo: support multi host
+            if communication_backend is not None:
+                self._comm_backend = communication_backend
+            else:
+                self.recv_from_tokenizer = get_zmq_socket(
+                    context, zmq.PULL, port_args.scheduler_input_ipc_name, False
+                )
+                self.send_to_tokenizer = get_zmq_socket(
                     context, zmq.PUSH, port_args.tokenizer_ipc_name, False
                 )
-            else:
-                # Send to the DetokenizerManager
-                self.send_to_detokenizer = get_zmq_socket(
-                    context, zmq.PUSH, port_args.detokenizer_ipc_name, False
-                )
 
-            self.recv_from_rpc = get_zmq_socket(context, zmq.DEALER, port_args.rpc_ipc_name, False)
-            if self.nnodes > 1:
-                self.publisher = get_zmq_socket(context, zmq.PUB, self.pub_sub_addr, bind=True)
-                self.publisher_sync = get_zmq_socket(
-                    context, zmq.REP, self.pub_sub_sync_addr, bind=True
+                if server_args.skip_tokenizer_init:
+                    # Directly send to the TokenizerManager
+                    self.send_to_detokenizer = get_zmq_socket(
+                        context, zmq.PUSH, port_args.tokenizer_ipc_name, False
+                    )
+                else:
+                    # Send to the DetokenizerManager
+                    self.send_to_detokenizer = get_zmq_socket(
+                        context, zmq.PUSH, port_args.detokenizer_ipc_name, False
+                    )
+
+                self.recv_from_rpc = get_zmq_socket(
+                    context, zmq.DEALER, port_args.rpc_ipc_name, False
                 )
-                self.num_subscribers = self.nnodes - 1
+                if self.nnodes > 1:
+                    self.publisher = get_zmq_socket(context, zmq.PUB, self.pub_sub_addr, bind=True)
+                    self.publisher_sync = get_zmq_socket(
+                        context, zmq.REP, self.pub_sub_sync_addr, bind=True
+                    )
+                    self.num_subscribers = self.nnodes - 1
         else:
             self.recv_from_tokenizer = None
             self.recv_from_rpc = None
@@ -458,7 +467,11 @@ class Scheduler(
     def event_loop_normal(self):
         """A normal scheduler loop."""
         while True:
-            recv_reqs = self.recv_requests()
+            recv_reqs = (
+                self._comm_backend.recv_requests()
+                if self._comm_backend is not None
+                else self.recv_requests()
+            )
             self.process_input_requests(recv_reqs)
             batch = self.get_next_batch_to_run()
             self.cur_batch = batch
@@ -479,7 +492,11 @@ class Scheduler(
         self.result_queue = deque()
 
         while True:
-            recv_reqs = self.recv_requests()
+            recv_reqs = (
+                self._comm_backend.recv_requests()
+                if self._comm_backend is not None
+                else self.recv_requests()
+            )
             self.process_input_requests(recv_reqs)
 
             batch = self.get_next_batch_to_run()
