@@ -48,6 +48,7 @@ def _estimate_vmem_bytes(case: MoEBenchmarkCase, dtype: jnp.dtype, cfg: FusedMoE
     pallas kernel body), which are not part of the explicit scratch buffers.
     """
     bt = cfg.bt
+    bts = bt if cfg.bts is None else int(cfg.bts)
     bf = cfg.bf
     bd1 = cfg.bd1
     bd2 = cfg.bd2
@@ -62,22 +63,23 @@ def _estimate_vmem_bytes(case: MoEBenchmarkCase, dtype: jnp.dtype, cfg: FusedMoE
     local_num_tokens = case.num_tokens // case.ep_size
     padded_num_experts = ((case.num_experts + 127) // 128) * 128
     padded_top_k = ((case.top_k + 127) // 128) * 128
-    # Max tokens per active expert buffer is `local_num_tokens * num_devices`, padded up
-    # to a multiple of `bt` for safe (bt-sized) token tiling in the kernel.
-    a2a_max_tokens = ((local_num_tokens * num_devices + bt - 1) // bt) * bt
+    output_bt = math.gcd(bt, local_num_tokens)
+    # With run_bt tiling, the a2a scratch only needs to cover one `output_bt` tile
+    # (across all EP devices), padded up to a multiple of `bts` for safe token staging.
+    a2a_max_tokens = ((output_bt * num_devices + bts - 1) // bts) * bts
 
     # Output-side staging (no overlap):
     # - a2a_g_acc_vmem: (1, top_k, acc_bt, hidden_size)
     # - b_output: (1, output_bt, hidden_size)
-    output_bt = math.gcd(bt, local_num_tokens)
     acc_bt = math.gcd(output_bt, 8)  # Must match fused_moe kernel scratch shape.
     a2a_g_acc = 1 * top_k * acc_bt * hidden * token_bytes
     b_output = 1 * output_bt * hidden * token_bytes
-    b_gating = local_num_tokens * padded_num_experts * token_bytes
-    # t2e_routing_smem scratch: (local_num_tokens, padded_top_k) int32
-    t2e_routing = local_num_tokens * padded_top_k * 4
-    # top_k_logits_vmem scratch: (local_num_tokens, top_k) float32
-    top_k_logits = local_num_tokens * top_k * 4
+    # b_gating_vmem is double-buffered for run_bt overlap.
+    b_gating = 2 * output_bt * padded_num_experts * token_bytes
+    # t2e_routing_smem scratch: (output_bt, padded_top_k) int32
+    t2e_routing = output_bt * padded_top_k * 4
+    # top_k_logits_vmem scratch: (output_bt, top_k) float32
+    top_k_logits = output_bt * top_k * 4
 
     # See kernel scratch shapes: b_w1_x2_vmem/b_w3_x2_vmem/b_w2_x2_vmem.
     w1 = 2 * bd1 * bf * weight_bytes
@@ -86,26 +88,25 @@ def _estimate_vmem_bytes(case: MoEBenchmarkCase, dtype: jnp.dtype, cfg: FusedMoE
 
     # b_acc_vmem is F32(2, a2a_max_tokens, 1, bf)
     b_acc = 2 * a2a_max_tokens * bf * 4
-    # U32 token staging for FFN1: (2, bt, bd1 // t_packing)
-    t_stage_b32 = 2 * bt * (bd1 // t_packing) * 4
-    # U32 staging for FFN2 output slice: (2, bt, bd2 // t_packing)
-    # Kernel uses triple-buffering for a2a_s_acc staging: (3, bt, bd2 // t_packing)
-    a2a_s_acc_stage_b32 = 3 * bt * (bd2 // t_packing) * 4
+    # U32 token staging for FFN1: (2, bts, bd1 // t_packing)
+    t_stage_b32 = 2 * bts * (bd1 // t_packing) * 4
+    # Kernel uses triple-buffering for a2a_s_acc staging: (3, bts, bd2 // t_packing)
+    a2a_s_acc_stage_b32 = 3 * bts * (bd2 // t_packing) * 4
 
     # Routing / top-k temporaries in kernel (best-effort conservative estimate):
     # - softmax + get_top_k use float32 work buffers and broadcasted iotas
     # - top_k_logits/indices are stored as lists of `padded_top_k` columns
     # This is separate from `t2e_routing_smem` above.
-    routing_work_f32 = local_num_tokens * padded_num_experts * 4  # softmax result (approx)
-    get_top_k_input_f32 = local_num_tokens * padded_num_experts * 4
-    get_top_k_t2e = local_num_tokens * padded_num_experts * 4
-    get_top_k_iota = local_num_tokens * padded_num_experts * 4
-    get_top_k_mask = local_num_tokens * padded_num_experts * 4
-    get_top_k_padded_iota = local_num_tokens * padded_top_k * 4
-    get_top_k_t2e_routing = local_num_tokens * padded_top_k * 4
-    get_top_k_logits_sum = local_num_tokens * padded_top_k * 4
-    get_top_k_logits_lst = top_k * local_num_tokens * padded_top_k * 4
-    get_top_k_indices_lst = top_k * local_num_tokens * padded_top_k * 4
+    routing_work_f32 = output_bt * padded_num_experts * 4  # softmax result (approx)
+    get_top_k_input_f32 = output_bt * padded_num_experts * 4
+    get_top_k_t2e = output_bt * padded_num_experts * 4
+    get_top_k_iota = output_bt * padded_num_experts * 4
+    get_top_k_mask = output_bt * padded_num_experts * 4
+    get_top_k_padded_iota = output_bt * padded_top_k * 4
+    get_top_k_t2e_routing = output_bt * padded_top_k * 4
+    get_top_k_logits_sum = output_bt * padded_top_k * 4
+    get_top_k_logits_lst = top_k * output_bt * padded_top_k * 4
+    get_top_k_indices_lst = top_k * output_bt * padded_top_k * 4
     routing_temporaries = (
         routing_work_f32
         + get_top_k_input_f32
@@ -180,6 +181,7 @@ def select_block_configs(
 
     def validate(cfg: FusedMoEBlockConfig) -> tuple[bool, str]:
         bt = cfg.bt
+        bts = bt if cfg.bts is None else int(cfg.bts)
         bf = cfg.bf
         bd1 = cfg.bd1
         bd2 = cfg.bd2
@@ -194,10 +196,16 @@ def select_block_configs(
             return False, f"bt({bt}) > max_expert_tokens({local_num_tokens * case.ep_size})"
         if bt % t_packing != 0:
             return False, f"bt({bt}) % t_packing({t_packing}) != 0"
-        if not (0 < btc <= bt):
-            return False, f"btc({btc}) not in (0, bt({bt})]"
+        if bts % t_packing != 0:
+            return False, f"bts({bts}) % t_packing({t_packing}) != 0"
+        if not (0 < bts <= bt):
+            return False, f"bts({bts}) not in (0, bt({bt})]"
+        if not (0 < btc <= bts):
+            return False, f"btc({btc}) not in (0, bts({bts})]"
         if btc % t_packing != 0:
             return False, f"btc({btc}) % t_packing({t_packing}) != 0"
+        if bts % btc != 0:
+            return False, f"bts({bts}) % btc({btc}) != 0"
 
         if case.intermediate_size % bf != 0:
             return False, f"intermediate_size({case.intermediate_size}) % bf({bf}) != 0"
