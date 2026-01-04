@@ -218,7 +218,12 @@ suites = {
         TestFile(
             "nightly-test/test_perf.py",
             estimated_time=8,
-            test_methods=["TestModelPerf.test_qwen_7b_performance_tp_1_high_concurrency"],
+            test_methods=["TestModelPerf.test_qwen_7b_performance_tp_1_high_concurrency_part1"],
+        ),
+        TestFile(
+            "nightly-test/test_perf.py",
+            estimated_time=8,
+            test_methods=["TestModelPerf.test_qwen_7b_performance_tp_1_high_concurrency_part2"],
         ),
         TestFile(
             "nightly-test/test_perf.py",

@@ -82,7 +82,7 @@ class TestModelPerfTrace(CustomTestCase):
 
         print(f"Dataset is ready at location: {cls.sharegpt_dataset_path}")
 
-    def _test_qwen_7b_performance_trace_tp_1(self, concurrency_levels):
+    def _test_qwen_7b_performance_trace_tp_1(self, concurrency_levels, input_lengths):
         import os
 
         MOUNT_ROOT = os.getenv("CI_MOUNT_ROOT", "/models")
@@ -103,7 +103,7 @@ class TestModelPerfTrace(CustomTestCase):
         # define test parameters
         # concurrency levels
         # input length levels (1k, 4k, 8k)
-        input_lengths = [1024, 4096, 8192]
+        # input_lengths = [1024, 4096, 8192]
         # concurrency_levels = [8]
         # # input length levels (1k, 4k, 8k)
         # input_lengths = [1024]
@@ -1380,9 +1380,15 @@ class TestModelPerfTrace(CustomTestCase):
         concurrency_levels = [8, 16, 32, 64, 128]
         self._test_qwen_7b_performance_trace_tp_1(concurrency_levels)
 
-    def test_qwen_7b_performance_trace_tp_1_high_concurrency(self):
+    def test_qwen_7b_performance_trace_tp_1_high_concurrency_part1(self):
         concurrency_levels = [256]
-        self._test_qwen_7b_performance_trace_tp_1(concurrency_levels)
+        input_lengths = [1024, 4096]
+        self._test_qwen_7b_performance_trace_tp_1(concurrency_levels, input_lengths)
+
+    def test_qwen_7b_performance_trace_tp_1_high_concurrency_part2(self):
+        concurrency_levels = [256]
+        input_lengths = [8192]
+        self._test_qwen_7b_performance_trace_tp_1(concurrency_levels, input_lengths)
 
     def test_qwen3_8b_performance_trace_tp_1_low_concurrency(self):
         concurrency_levels = [8, 16, 32, 64, 128]
