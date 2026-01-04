@@ -1423,19 +1423,18 @@ def _fused_ep_moe_kernel(
                 sem=local_sems.at[out_buf_id, 4],
             ).wait()
 
-        out_buf_id = 0
-        output_store_inflight = [False, False]
+        def start_store_output(*, tile_start, tile_sz, out_buf_id):
+            pltpu.make_async_copy(
+                src_ref=b_output_x2_vmem.at[out_buf_id, pl.ds(0, tile_sz)],
+                dst_ref=output_packed_hbm.at[pl.ds(tile_start, tile_sz)],
+                sem=local_sems.at[out_buf_id, 4],
+            ).start()
 
-        for tile_start in range(0, local_num_tokens, bt):
-            tile_sz = min(bt, local_num_tokens - tile_start)
-            if output_store_inflight[out_buf_id]:
-                wait_store_output(out_buf_id=out_buf_id)
-                output_store_inflight[out_buf_id] = False
-
-            # Token-level double-buffering to overlap a2a_g_hbm reads with reduction.
+        def bt_acc(*, tile_start, tile_sz, out_buf_id):
+            # Token-level double-buffering to overlap a2a_g_hbm reads with reduction, while producing a
+            # contiguous bt-tile in `b_output_x2_vmem[out_buf_id]`.
             acc_buf_id = 0
-            t_id0 = tile_start + 0
-            start_fetch_a2a_g_token(acc_buf_id=acc_buf_id, t_id=t_id0)
+            start_fetch_a2a_g_token(acc_buf_id=acc_buf_id, t_id=tile_start)
             for t_i in range(tile_sz):
                 t_id = tile_start + t_i
                 next_t_i = t_i + 1
@@ -1469,18 +1468,27 @@ def _fused_ep_moe_kernel(
                 )
                 acc_buf_id = next_buf_id
 
-            pltpu.make_async_copy(
-                src_ref=b_output_x2_vmem.at[out_buf_id, pl.ds(0, tile_sz)],
-                dst_ref=output_packed_hbm.at[pl.ds(tile_start, tile_sz)],
-                sem=local_sems.at[out_buf_id, 4],
-            ).start()
-            output_store_inflight[out_buf_id] = True
-            out_buf_id ^= 1
+        num_tiles = (local_num_tokens + bt - 1) // bt
+
+        for tile_idx, tile_start in enumerate(range(0, local_num_tokens, bt)):
+            out_buf_id = tile_idx & 1
+            tile_sz = min(bt, local_num_tokens - tile_start)
+            if tile_idx >= 2:
+                wait_store_output(out_buf_id=out_buf_id)
+
+            bt_acc(tile_start=tile_start, tile_sz=tile_sz, out_buf_id=out_buf_id)
+
+            start_store_output(tile_start=tile_start, tile_sz=tile_sz, out_buf_id=out_buf_id)
 
         # Drain any outstanding output stores before returning.
-        for buf_id in (0, 1):
-            if output_store_inflight[buf_id]:
-                wait_store_output(out_buf_id=buf_id)
+        @pl.when(num_tiles == 1)
+        def _():
+            wait_store_output(out_buf_id=jnp.int32(0))
+
+        @pl.when(num_tiles >= 2)
+        def _():
+            wait_store_output(out_buf_id=jnp.int32((num_tiles - 2) & 1))
+            wait_store_output(out_buf_id=jnp.int32((num_tiles - 1) & 1))
 
     ### ------- Kernel start ------- ###
     sync_barrier()
