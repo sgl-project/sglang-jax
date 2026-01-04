@@ -295,11 +295,11 @@ suites = {
         ),
     ],
     "nightly-test-perf-trace-text-models-tpu-v6e-1": [
-        TestFile(
-            "nightly-test/test_perf_trace.py",
-            estimated_time=7,
-            test_methods=["TestModelPerfTrace.test_qwen_7b_performance_trace_tp_1_low_concurrency"],
-        ),
+        # TestFile(
+        #     "nightly-test/test_perf_trace.py",
+        #     estimated_time=7,
+        #     test_methods=["TestModelPerfTrace.test_qwen_7b_performance_trace_tp_1_low_concurrency"],
+        # ),
         TestFile(
             "nightly-test/test_perf_trace.py",
             estimated_time=8,

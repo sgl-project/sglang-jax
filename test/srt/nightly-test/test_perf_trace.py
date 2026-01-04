@@ -60,7 +60,7 @@ class TestModelPerfTrace(CustomTestCase):
         "--chunked-prefill-size",
         "2048",
         "--mem-fraction-static",
-        "0.9",
+        "0.5",
         "--disable-radix-cache",
     ]
     TP_1 = "/tp_1"
