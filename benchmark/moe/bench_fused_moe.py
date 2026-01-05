@@ -96,7 +96,7 @@ def _estimate_vmem_bytes(case: MoEBenchmarkCase, dtype: jnp.dtype, cfg: FusedMoE
 
     # Routing / top-k temporaries in kernel (best-effort conservative estimate):
     # - softmax + get_top_k use float32 work buffers and broadcasted iotas
-    # - top_k_logits/indices are stored as lists of `padded_top_k` columns
+    # - top_k logits are materialized as `top_k` arrays of shape (output_bt, padded_top_k)
     # This is separate from `t2e_routing_smem` above.
     routing_work_f32 = output_bt * padded_num_experts * 4  # softmax result (approx)
     get_top_k_input_f32 = output_bt * padded_num_experts * 4
@@ -107,7 +107,6 @@ def _estimate_vmem_bytes(case: MoEBenchmarkCase, dtype: jnp.dtype, cfg: FusedMoE
     get_top_k_t2e_routing = output_bt * padded_top_k * 4
     get_top_k_logits_sum = output_bt * padded_top_k * 4
     get_top_k_logits_lst = top_k * output_bt * padded_top_k * 4
-    get_top_k_indices_lst = top_k * output_bt * padded_top_k * 4
     routing_temporaries = (
         routing_work_f32
         + get_top_k_input_f32
@@ -118,7 +117,6 @@ def _estimate_vmem_bytes(case: MoEBenchmarkCase, dtype: jnp.dtype, cfg: FusedMoE
         + get_top_k_t2e_routing
         + get_top_k_logits_sum
         + get_top_k_logits_lst
-        + get_top_k_indices_lst
     )
 
     # Skip optional scale/bias buffers (unused in this benchmark).
@@ -199,8 +197,9 @@ def select_block_configs(
 
         if bt <= 0 or bf <= 0 or bd1 <= 0 or bd2 <= 0:
             return False, "non-positive tile size"
-        if bt > local_num_tokens * case.ep_size:
-            return False, f"bt({bt}) > max_expert_tokens({local_num_tokens * case.ep_size})"
+        # bt/bts are per-core tile sizes; local_num_tokens is the per-core token count.
+        if bt > local_num_tokens:
+            return False, f"bt({bt}) > local_num_tokens({local_num_tokens})"
         if bt % t_packing != 0:
             return False, f"bt({bt}) % t_packing({t_packing}) != 0"
         if bts % t_packing != 0:
@@ -561,7 +560,8 @@ def parse_args() -> argparse.Namespace:
         nargs="+",
         help=(
             "Candidate list for bt (outer token tile size). "
-            "Note: the kernel uses output_bt=gcd(bt, local_num_tokens) for run_bt tiling."
+            "Note: bt is per-core; local_num_tokens = num_tokens / ep_size. "
+            "The kernel uses output_bt=gcd(bt, local_num_tokens) for run_bt tiling."
         ),
     )
     parser.add_argument(
@@ -570,7 +570,8 @@ def parse_args() -> argparse.Namespace:
         nargs="+",
         help=(
             "Candidate list for bts (token staging tile inside expert_ffn). "
-            "When omitted, bts defaults to bt. Example: --bts-candidates 8 16 32 64"
+            "When omitted, bts defaults to bt (and bts must be <= bt). "
+            "Example: --bts-candidates 8 16 32 64"
         ),
     )
     parser.add_argument(
