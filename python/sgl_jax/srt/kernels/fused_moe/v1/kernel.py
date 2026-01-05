@@ -379,7 +379,8 @@ def _fused_ep_moe_kernel(
     expert_sizes_x2_smem,  # (2, 1, padded_num_experts)
     a2a_s_sends_x2_smem,  # <e_sem_id> (2,)
     ### Accumulation for gathered tokens:
-    a2a_g_acc_vmem,  # (top_k, bt, t_packing, hidden_size // t_packing)
+    a2a_g_acc_vmem,  # (1, top_k, acc_bt, t_packing, hidden_size // t_packing)
+    top_k_logits_vmem,  # F32(bt, top_k)
     ### Expert weight double buffering:
     b_gating_x2_vmem,  # (2, bt, padded_num_experts)
     b_output_x2_vmem,  # (2, bt, t_packing, hidden_size // t_packing)
@@ -513,12 +514,11 @@ def _fused_ep_moe_kernel(
             sem=b_gating_sem,
         ).wait()
 
-    def get_top_k(input, top_k, renormalize_topk_logits):
+    def get_top_k(input, top_k, renormalize_topk_logits, *, out_top_k_logits_vmem):
         assert len(input.shape) == 2, input.shape
         input = input.astype(jnp.float32)
         padded_k_shape = (input.shape[0], padded_top_k)
         top_k_logits_lst = []
-        top_k_indices_lst = []
         t2e = jnp.zeros(input.shape, dtype=jnp.int32)
         t2e_routing = jnp.zeros(padded_k_shape, dtype=jnp.int32)
         iota = jax.lax.broadcasted_iota(jnp.int32, input.shape, 1)
@@ -539,7 +539,6 @@ def _fused_ep_moe_kernel(
                 jnp.argmax(input[:, :num_experts], axis=1, keepdims=True),
                 padded_k_shape,
             )
-            top_k_indices_lst.append(top_k_indices)
             t2e_routing = jnp.where(padded_k_iota == k_id, top_k_indices, t2e_routing)
             mask = iota == broadcast_minor(top_k_indices, input.shape)
             t2e += mask.astype(jnp.int32)
@@ -550,9 +549,16 @@ def _fused_ep_moe_kernel(
             for k_id in range(top_k):
                 top_k_logits_lst[k_id] /= top_k_logits_sum
 
+        # Materialize per-token top-k logits into a compact VMEM buffer to avoid
+        # dynamic_slice on `top_k_logits_lst[k_id][t_id, 0]` inside acc_and_store_output.
+        for k_id in range(top_k):
+            out_top_k_logits_vmem.at[pl.ds(0, input.shape[0]), pl.ds(k_id, 1)][...] = (
+                top_k_logits_lst[k_id][:, :1].astype(jnp.float32)
+            )
+
         expert_sizes = jnp.sum(t2e, axis=0, keepdims=True)
         expert_starts = jnp.zeros_like(expert_sizes)
-        return top_k_logits_lst, t2e_routing, expert_sizes, expert_starts
+        return t2e_routing, expert_sizes, expert_starts
 
     def all_reduce_metadata(*, bt_sem_id, t2e_routing, starts, sizes):
         send_sem = send_x2_sems.at[0]
@@ -1400,34 +1406,68 @@ def _fused_ep_moe_kernel(
 
                 bw_sem_id = (bw_sem_id + 1) % 2
 
-    def bt_acc(*, bt_sem_id, top_k_logits_lst):
-        def _load_one(bt_t_id, _):
+    def acc_and_store_output(*, bt_sem_id, out_buf_id):
+        acc_bt = a2a_g_acc_vmem.shape[2]
+        assert bt % acc_bt == 0, (bt, acc_bt)
+
+        def load_acc_bt_sync(*, tile_start):
+            def _load_one(t_i, _):
+                t_id = tile_start + t_i
+                for k_id in range(top_k):
+                    e_id = t2e_routing_x2_smem[bt_sem_id, t_id, k_id]
+                    offset = expert_offsets_x2_smem[bt_sem_id, 1, e_id]
+                    expert_offsets_x2_smem[bt_sem_id, 1, e_id] = offset + 1
+                    pltpu.make_async_copy(
+                        src_ref=a2a_g_hbm.at[e_id, pl.ds(offset, 1)],
+                        dst_ref=a2a_g_acc_vmem.at[0, k_id, pl.ds(t_i, 1)],
+                        sem=a2a_acc_sems.at[0],
+                    ).start()
+                return None
+
+            lax.fori_loop(0, acc_bt, _load_one, None, unroll=False)
+            pltpu.make_async_copy(
+                src_ref=a2a_g_acc_vmem.at[0],
+                dst_ref=a2a_g_acc_vmem.at[0],
+                sem=a2a_acc_sems.at[0],
+            ).wait()
+
+        def bt_acc_acc_bt(*, tile_start, out_offset):
+            # Vectorized per-(acc_bt) reduction to avoid dynamic_slice in TPU TC lowering.
+            output_tile = jnp.zeros((acc_bt, t_packing, h_per_t_packing), dtype=jnp.float32)
+            logits_tile = top_k_logits_vmem.at[
+                pl.ds(tile_start, acc_bt),
+                pl.ds(0, top_k),
+            ][...]
             for k_id in range(top_k):
-                e_id = t2e_routing_x2_smem[bt_sem_id, bt_t_id, k_id]
-                offset = expert_offsets_x2_smem[bt_sem_id, 1, e_id]
-                expert_offsets_x2_smem[bt_sem_id, 1, e_id] = offset + 1
-                pltpu.make_async_copy(
-                    src_ref=a2a_g_hbm.at[e_id, pl.ds(offset, 1)],
-                    dst_ref=a2a_g_acc_vmem.at[k_id, pl.ds(bt_t_id, 1)],
-                    sem=a2a_acc_sems.at[0],
-                ).start()
+                acc_tile = a2a_g_acc_vmem[0, k_id, :acc_bt].astype(jnp.float32)
+                logits = logits_tile[:, k_id].reshape(acc_bt, 1, 1)
+                output_tile += acc_tile * logits
+
+            b_output_x2_vmem.at[out_buf_id, pl.ds(out_offset, acc_bt)][...] = output_tile.astype(
+                output_hbm.dtype
+            )
+
+        num_acc_tiles = bt // acc_bt
+
+        def run_acc_tile(acc_tile_idx, _):
+            acc_tile_start = acc_tile_idx * acc_bt
+            out_offset = acc_tile_idx * acc_bt
+
+            load_acc_bt_sync(tile_start=acc_tile_start)
+            bt_acc_acc_bt(
+                tile_start=acc_tile_start,
+                out_offset=out_offset,
+            )
             return None
 
-        lax.fori_loop(0, bt, _load_one, None, unroll=False)
-        pltpu.make_async_copy(
-            src_ref=a2a_g_acc_vmem,
-            dst_ref=a2a_g_acc_vmem,
-            sem=a2a_acc_sems.at[0],
-        ).wait()
-
-        output = None
-        for k_id in range(top_k):
-            acc = a2a_g_acc_vmem[k_id].reshape(bt, hidden_size)
-            logits = broadcast_minor(top_k_logits_lst[k_id], acc.shape)
-            acc = acc.astype(jnp.float32) * logits.astype(jnp.float32)
-            output = acc if output is None else (output + acc)
-        assert output is not None
-        return output.astype(output_hbm.dtype)
+        lax.fori_loop(
+            0,
+            num_acc_tiles,
+            run_acc_tile,
+            None,
+            unroll=False,
+        )
+        return None
 
     def start_send_bo(*, bt_id, priority=0):
         bt_sem_id = bt_id & jnp.int32(1)
@@ -1442,8 +1482,8 @@ def _fused_ep_moe_kernel(
 
     def wait_store_output(*, bt_id):
         is_valid = jnp.logical_and(bt_id >= 0, bt_id < num_bt)
-        sz = pl.multiple_of(lax.select(is_valid, jnp.int32(bt), jnp.int32(0)), bt)
-        bt_sem_id = (bt_id + jnp.int32(2)) & jnp.int32(1)
+        sz = pl.multiple_of(lax.select(is_valid, bt, 0), bt)
+        bt_sem_id = (bt_id + 2) & 1
         pltpu.make_async_copy(
             src_ref=output_hbm.at[pl.ds(0, sz)],
             dst_ref=output_hbm.at[pl.ds(0, sz)],
@@ -1522,10 +1562,11 @@ def _fused_ep_moe_kernel(
             is_local_expert = jnp.logical_and(expert_iota >= e0, expert_iota < e1)
             b_gating = jnp.where(is_local_expert, b_gating, jnp.array(-jnp.inf, b_gating.dtype))
         b_gating_score = jax.nn.softmax(b_gating, axis=-1)
-        top_k_logits_lst, t2e_routing, expert_sizes, expert_starts = get_top_k(
+        t2e_routing, expert_sizes, expert_starts = get_top_k(
             b_gating_score,
             top_k,
             renormalize_topk_logits,
+            out_top_k_logits_vmem=top_k_logits_vmem,
         )
 
         all_reduce_metadata(
@@ -1557,14 +1598,9 @@ def _fused_ep_moe_kernel(
         sync_barrier()
 
         out_buf_id = bt_id & jnp.int32(1)
-        # Make sure it is safe to overwrite output buffer (bt_id-2 uses the same buffer).
-        # Note: epic overlaps this wait with bt_acc compute by delaying the store into b_output_x2_vmem.
-        # Our acc path writes directly into b_output_x2_vmem during reduction, so we must wait before acc.
-        wait_store_output(bt_id=bt_id - jnp.int32(2))
-
+        wait_store_output(bt_id=bt_id - 2)
         # Accumulate results for current bt into b_output_x2_vmem, then start async send to output_hbm.
-        output = bt_acc(bt_sem_id=bt_sem_id, top_k_logits_lst=top_k_logits_lst)
-        b_output_x2_vmem.at[out_buf_id][...] = output.reshape(bt, t_packing, h_per_t_packing)
+        acc_and_store_output(bt_sem_id=bt_sem_id, out_buf_id=out_buf_id)
         start_send_bo(bt_id=bt_id)
 
         # Drain the last outstanding gather sends (the loop body waits `local_e_id - 2`).
@@ -1888,7 +1924,11 @@ def fused_ep_moe(
         pltpu.SMEM((2, 1, padded_num_experts), jnp.int32),  # expert_starts_x2_smem
         pltpu.SMEM((2, 1, padded_num_experts), jnp.int32),  # expert_sizes_x2_smem
         pltpu.SMEM((2,), jnp.int32),  # a2a_s_sends_x2_smem
-        pltpu.VMEM((top_k, bt, t_packing, hidden_per_pack), t_dtype),  # a2a_g_acc_vmem
+        pltpu.VMEM(
+            (1, top_k, math.gcd(bt, 8), t_packing, hidden_per_pack),
+            t_dtype,
+        ),  # a2a_g_acc_vmem
+        pltpu.VMEM((bt, top_k), jnp.float32),  # top_k_logits_vmem
         # Expert compute scratch.
         pltpu.VMEM((2, bt, padded_num_experts), gating_dtype),  # b_gating_x2_vmem
         pltpu.VMEM((2, bt, t_packing, hidden_per_pack), t_dtype),  # b_output_x2_vmem
