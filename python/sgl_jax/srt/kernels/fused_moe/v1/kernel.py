@@ -1769,7 +1769,6 @@ def _validate_fused_ep_moe_args(
         "act_fn",
         "a2a_only",
         "no_comm",
-        "collective_id",
         "subc_quant_wsz",
         "block_config",
         "ep_axis_name",
@@ -2009,10 +2008,6 @@ def fused_ep_moe(
             ),
             compiler_params=pltpu.CompilerParams(
                 collective_id=0,
-                allow_collective_id_without_custom_barrier=True,
-                has_side_effects=True,
-                # TPU VMEM is 64MiB per core; requesting more is invalid and can
-                # crash compilation/runtime on some platforms.
                 vmem_limit_bytes=64 * 1024 * 1024,
             ),
             name=scope_name,
