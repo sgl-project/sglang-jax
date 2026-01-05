@@ -1,3 +1,5 @@
+import jax
+
 from sgl_jax.srt.multimodal.common.ServerArgs import MultimodalServerArgs
 from sgl_jax.srt.multimodal.model_executor.diffusion.diffusion_model_runner import (
     DiffusionModelRunner,
@@ -5,7 +7,7 @@ from sgl_jax.srt.multimodal.model_executor.diffusion.diffusion_model_runner impo
 
 
 class DiffusionModelWorker:
-    def __init__(self, server_args: MultimodalServerArgs, mesh):
+    def __init__(self, server_args: MultimodalServerArgs, mesh: jax.sharding.Mesh = None):
         self.mesh = mesh
         self.model_runner = DiffusionModelRunner(server_args, self.mesh)
         self.initialize()

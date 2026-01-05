@@ -17,10 +17,10 @@ class FP32LayerNorm(nnx.LayerNorm):
         x = (x - mean) * jax.lax.rsqrt(var + self.epsilon)
 
         if self.scale is not None:
-            x = x * self.scale.value.astype(jnp.float32)
+            x = x * self.scale[...].astype(jnp.float32)
 
         if self.bias is not None:
-            x = x + self.bias.value.astype(jnp.float32)
+            x = x + self.bias[...].astype(jnp.float32)
 
         return x.astype(origin_dtype)
 
@@ -83,6 +83,7 @@ class ScaleResidualLayerNormScaleShift(nnx.Module):
                     use_scale=elementwise_affine,
                     use_bias=elementwise_affine,
                     dtype=dtype,
+                    rngs=nnx.Rngs(0),
                 )
             else:
                 self.norm = nnx.LayerNorm(
@@ -91,6 +92,7 @@ class ScaleResidualLayerNormScaleShift(nnx.Module):
                     use_scale=elementwise_affine,
                     use_bias=elementwise_affine,
                     dtype=dtype,
+                    rngs=nnx.Rngs(0),
                 )
         else:
             raise NotImplementedError(f"Norm type {norm_type} not implemented")
@@ -165,3 +167,70 @@ class ScaleResidualLayerNormScaleShift(nnx.Module):
             modulated = normalized * (1 + scale) + shift
 
         return modulated, residual_output
+
+
+class LayerNormScaleShift(nnx.Module):
+    """
+    Fused operation that combines LayerNorm with scale and shift operations.
+    This reduces memory bandwidth by combining memory-bound operations.
+    """
+
+    def __init__(
+        self,
+        hidden_size: int,
+        norm_type: str = "rms",
+        epsilon: float = 1e-6,
+        elementwise_affine: bool = False,
+        dtype: jnp.dtype = jnp.float32,
+        compute_dtype: jnp.dtype | None = None,
+        prefix: str = "",
+    ):
+        super().__init__()
+        self.compute_dtype = compute_dtype
+        if norm_type == "rms":
+            self.norm = RMSNorm(hidden_size, use_scale=elementwise_affine, epsilon=epsilon)
+        elif norm_type == "layer":
+            if self.compute_dtype == jnp.float32:
+                self.norm = FP32LayerNorm(
+                    hidden_size,
+                    epsilon=epsilon,
+                    use_scale=elementwise_affine,
+                    use_bias=elementwise_affine,
+                    dtype=dtype,
+                    rngs=nnx.Rngs(0),
+                )
+            else:
+                self.norm = nnx.LayerNorm(
+                    hidden_size,
+                    epsilon=epsilon,
+                    use_scale=elementwise_affine,
+                    use_bias=elementwise_affine,
+                    dtype=dtype,
+                    rngs=nnx.Rngs(0),
+                )
+        else:
+            raise NotImplementedError(f"Norm type {norm_type} not implemented")
+
+    def __call__(self, x: jax.Array, shift: jax.Array, scale: jax.Array) -> jax.Array:
+        """Apply layernorm followed by scale and shift in a single fused operation."""
+        # x.shape: [batch_size, seq_len, inner_dim]
+        normalized = self.norm(x)
+        if self.compute_dtype == jnp.float32:
+            normalized = normalized.astype(jnp.float32)
+
+        if scale.ndim == 4:
+            # scale.shape: [batch_size, num_frames, 1, inner_dim]
+            b, seq_len, c = normalized.shape
+            num_frames = scale.shape[1]
+            frame_seqlen = seq_len // num_frames
+
+            # Reshape to match scale/shift dimensions
+            normalized_reshaped = normalized.reshape((b, num_frames, frame_seqlen, c))
+            output_reshaped = normalized_reshaped * (1.0 + scale) + shift
+            output = output_reshaped.reshape((b, seq_len, c))
+        else:
+            # scale.shape: [batch_size, 1, inner_dim]
+            # shift.shape: [batch_size, 1, inner_dim]
+            output = normalized * (1.0 + scale) + shift
+
+        return output

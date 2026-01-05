@@ -42,7 +42,6 @@ class Qwen2MoeMLP(nnx.Module):
             kernel_axes=(None, "tensor"),
             use_bias=gate_up_down_bias,
             params_dtype=dtype,
-            mesh=mesh,
         )
 
         self.up_proj = LinearBase(
@@ -51,7 +50,6 @@ class Qwen2MoeMLP(nnx.Module):
             kernel_axes=(None, "tensor"),
             use_bias=gate_up_down_bias,
             params_dtype=dtype,
-            mesh=mesh,
         )
 
         self.down_proj = LinearBase(
@@ -60,12 +58,11 @@ class Qwen2MoeMLP(nnx.Module):
             kernel_axes=("tensor", None),
             use_bias=gate_up_down_bias,
             params_dtype=dtype,
-            mesh=mesh,
         )
 
         self.act_fn = jax.nn.silu
 
-    def __call__(self, hidden_states: jnp.ndarray):
+    def __call__(self, hidden_states: jax.Array):
         a1, _ = self.gate_proj(hidden_states)
         a2, _ = self.up_proj(hidden_states)
         intermediate_parallel = a2 * self.act_fn(a1)
@@ -109,7 +106,6 @@ class Qwen2MoeAttention(nnx.Module):
             use_bias=qkv_bias,
             kernel_axes=(None, "tensor"),
             params_dtype=dtype,
-            mesh=mesh,
         )
         self.k_proj = LinearBase(
             input_size=hidden_size,
@@ -117,7 +113,6 @@ class Qwen2MoeAttention(nnx.Module):
             use_bias=qkv_bias,
             kernel_axes=(None, "tensor"),
             params_dtype=dtype,
-            mesh=mesh,
         )
         self.v_proj = LinearBase(
             input_size=hidden_size,
@@ -125,7 +120,6 @@ class Qwen2MoeAttention(nnx.Module):
             use_bias=qkv_bias,
             kernel_axes=(None, "tensor"),
             params_dtype=dtype,
-            mesh=mesh,
         )
         self.o_proj = LinearBase(
             input_size=num_heads * self.head_dim,
@@ -133,7 +127,6 @@ class Qwen2MoeAttention(nnx.Module):
             use_bias=o_bias,
             kernel_axes=("tensor", None),
             params_dtype=dtype,
-            mesh=mesh,
         )
         self.rotary_emb = RotaryEmbedding(
             head_size=self.head_dim,
@@ -237,7 +230,6 @@ class Qwen2MoeDecoderLayer(nnx.Module):
                 use_bias=False,
                 kernel_axes=(None, None),
                 params_dtype=dtype,
-                mesh=mesh,
             )
         else:
             self.shared_experts = None

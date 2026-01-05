@@ -3,6 +3,7 @@ import time
 
 import jax
 import jax.numpy as jnp
+from flax import nnx
 
 from sgl_jax.srt.configs.load_config import LoadConfig
 from sgl_jax.srt.model_executor.base_model_runner import BaseModelRunner
@@ -25,7 +26,7 @@ logger = logging.getLogger(__name__)
 
 # DiffusionModelRunner is responsible for running denoising steps within diffusion model inference
 class DiffusionModelRunner(BaseModelRunner):
-    def __init__(self, server_args: MultimodalServerArgs, mesh):
+    def __init__(self, server_args: MultimodalServerArgs, mesh: jax.sharding.Mesh = None):
         self.model_config = MultiModalModelConfigs.from_server_args(server_args)
         load_config = LoadConfig(
             load_format=server_args.load_format,
@@ -45,10 +46,13 @@ class DiffusionModelRunner(BaseModelRunner):
         self.model_config = WanModelConfig
         # Additional initialization for diffusion model if needed
         # e.g., setting up noise schedulers, diffusion steps, etc.
+        self.initialize()
 
     def initialize(self):
         # self.model = self.model_loader.load_model(model_config=self.model_config)
-        self.model = WanTransformer3DModel(self.model_config)
+        rngs = nnx.Rngs(params=nnx.Rngs(0))
+        with jax.set_mesh(self.mesh):
+            self.model = WanTransformer3DModel(self.model_config, rngs=rngs)
         self.solver = UniPCMultistepScheduler(
             num_train_timesteps=1000,
             beta_start=0.0001,

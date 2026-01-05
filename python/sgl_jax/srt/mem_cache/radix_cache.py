@@ -424,7 +424,7 @@ class RadixCache(BasePrefixCache):
         return new_node
 
     def _insert_helper(self, node: TreeNode, key: list, value):
-        if isinstance(value, jnp.ndarray):
+        if isinstance(value, jax.Array):
             assert value.ndim == 1, "value must be a 1D array"
 
         node.last_access_time = time.monotonic()

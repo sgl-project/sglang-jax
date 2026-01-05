@@ -19,6 +19,7 @@ from enum import Enum
 from typing import ClassVar
 
 import flax
+import jax
 import jax.numpy as jnp
 
 SCHEDULER_CONFIG_NAME = "scheduler_config.json"
@@ -42,12 +43,12 @@ class SchedulerOutput:
     Base class for the scheduler's step function output.
 
     Args:
-        prev_sample (`jnp.ndarray` of shape `(batch_size, num_channels, height, width)` for images):
+        prev_sample (`jax.Array` of shape `(batch_size, num_channels, height, width)` for images):
             Computed sample (x_{t-1}) of previous timestep. `prev_sample` should be used as next model input in the
             denoising loop.
     """
 
-    prev_sample: jnp.ndarray
+    prev_sample: jax.Array
 
 
 class SchedulerMixin:
@@ -186,14 +187,14 @@ class SchedulerMixin:
         return compatible_classes
 
 
-def broadcast_to_shape_from_left(x: jnp.ndarray, shape: tuple[int]) -> jnp.ndarray:
+def broadcast_to_shape_from_left(x: jax.Array, shape: tuple[int]) -> jax.Array:
     assert len(shape) >= x.ndim
     return jnp.broadcast_to(x.reshape(x.shape + (1,) * (len(shape) - x.ndim)), shape)
 
 
 def betas_for_alpha_bar(
     num_diffusion_timesteps: int, max_beta=0.999, dtype=jnp.float32
-) -> jnp.ndarray:
+) -> jax.Array:
     """
     Create a beta schedule that discretizes the given alpha_t_bar function, which defines the cumulative product of
     (1-beta) over time from t = [0,1].
@@ -208,7 +209,7 @@ def betas_for_alpha_bar(
                      prevent singularities.
 
     Returns:
-        betas (`jnp.ndarray`): the betas used by the scheduler to step the model outputs
+        betas (`jax.Array`): the betas used by the scheduler to step the model outputs
     """
 
     def alpha_bar(time_step):
@@ -252,9 +253,9 @@ def rescale_betas_zero_snr(betas):
 
 @flax.struct.dataclass
 class CommonSchedulerState:
-    alphas: jnp.ndarray
-    betas: jnp.ndarray
-    alphas_cumprod: jnp.ndarray
+    alphas: jax.Array
+    betas: jax.Array
+    alphas_cumprod: jax.Array
 
     @classmethod
     def create(cls, scheduler):
@@ -304,9 +305,9 @@ class CommonSchedulerState:
 
 def get_sqrt_alpha_prod(
     state: CommonSchedulerState,
-    original_samples: jnp.ndarray,
-    noise: jnp.ndarray,
-    timesteps: jnp.ndarray,
+    original_samples: jax.Array,
+    noise: jax.Array,
+    timesteps: jax.Array,
 ):
     alphas_cumprod = state.alphas_cumprod
 
@@ -325,9 +326,9 @@ def get_sqrt_alpha_prod(
 
 def add_noise_common(
     state: CommonSchedulerState,
-    original_samples: jnp.ndarray,
-    noise: jnp.ndarray,
-    timesteps: jnp.ndarray,
+    original_samples: jax.Array,
+    noise: jax.Array,
+    timesteps: jax.Array,
 ):
     sqrt_alpha_prod, sqrt_one_minus_alpha_prod = get_sqrt_alpha_prod(
         state, original_samples, noise, timesteps
@@ -337,7 +338,7 @@ def add_noise_common(
 
 
 def get_velocity_common(
-    state: CommonSchedulerState, sample: jnp.ndarray, noise: jnp.ndarray, timesteps: jnp.ndarray
+    state: CommonSchedulerState, sample: jax.Array, noise: jax.Array, timesteps: jax.Array
 ):
     sqrt_alpha_prod, sqrt_one_minus_alpha_prod = get_sqrt_alpha_prod(
         state, sample, noise, timesteps

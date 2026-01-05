@@ -38,7 +38,6 @@ class QWenMLP(nnx.Module):
             use_bias=False,
             kernel_axes=(None, "tensor"),
             params_dtype=dtype,
-            mesh=mesh,
         )
 
         self.w2 = LinearBase(
@@ -47,7 +46,6 @@ class QWenMLP(nnx.Module):
             use_bias=False,
             kernel_axes=(None, "tensor"),
             params_dtype=dtype,
-            mesh=mesh,
         )
 
         self.c_proj = LinearBase(
@@ -56,12 +54,11 @@ class QWenMLP(nnx.Module):
             use_bias=False,
             kernel_axes=("tensor", None),
             params_dtype=dtype,
-            mesh=mesh,
         )
 
         self.act_func = jax.nn.silu
 
-    def __call__(self, hidden_states: jnp.ndarray):
+    def __call__(self, hidden_states: jax.Array):
         a1, _ = self.w1(hidden_states)
         a2, _ = self.w2(hidden_states)
         intermediate_parallel = a1 * jax.nn.silu(a2)
@@ -93,7 +90,6 @@ class QWenAttention(nnx.Module):
             use_bias=True,
             kernel_axes=(None, "tensor"),
             params_dtype=dtype,
-            mesh=mesh,
         )
         self.k_proj = LinearBase(
             input_size=hidden_size,
@@ -101,7 +97,6 @@ class QWenAttention(nnx.Module):
             use_bias=True,
             kernel_axes=(None, "tensor"),
             params_dtype=dtype,
-            mesh=mesh,
         )
         self.v_proj = LinearBase(
             input_size=hidden_size,
@@ -109,7 +104,6 @@ class QWenAttention(nnx.Module):
             use_bias=True,
             kernel_axes=(None, "tensor"),
             params_dtype=dtype,
-            mesh=mesh,
         )
         self.c_proj = LinearBase(
             input_size=num_heads * head_size,
@@ -117,7 +111,6 @@ class QWenAttention(nnx.Module):
             use_bias=False,
             kernel_axes=("tensor", None),
             params_dtype=dtype,
-            mesh=mesh,
         )
 
         self.rotary_emb = RotaryEmbedding(

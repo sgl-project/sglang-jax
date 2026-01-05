@@ -23,21 +23,21 @@ class UniPCMultistepSchedulerState:
     common: CommonSchedulerState
 
     # Core schedule parameters (derived from CommonSchedulerState in create_state)
-    sigmas: jnp.ndarray
-    alpha_t: jnp.ndarray
-    sigma_t: jnp.ndarray
-    lambda_t: jnp.ndarray
+    sigmas: jax.Array
+    alpha_t: jax.Array
+    sigma_t: jax.Array
+    lambda_t: jax.Array
     init_noise_sigma: float
 
     # History buffers for multi-step solver
     # `model_outputs` stores previous converted model outputs (e.g., predicted x0 or epsilon)
-    timesteps: jnp.ndarray = None
-    model_outputs: jnp.ndarray = None
-    timestep_list: jnp.ndarray = None  # Stores corresponding timesteps for `model_outputs`
+    timesteps: jax.Array = None
+    model_outputs: jax.Array = None
+    timestep_list: jax.Array = None  # Stores corresponding timesteps for `model_outputs`
 
     # State variables for tracking progress and solver order
     lower_order_nums: int = 0
-    last_sample: jnp.ndarray | None = None  # Sample from the previous predictor step
+    last_sample: jax.Array | None = None  # Sample from the previous predictor step
     step_index: int | None = None
     begin_index: int | None = None  # Used for img2img/inpaing
     this_order: int = 0  # Current effective order of the UniPC solver for this step
@@ -46,11 +46,11 @@ class UniPCMultistepSchedulerState:
     def create(
         cls,
         common_state: CommonSchedulerState,
-        alpha_t: jnp.ndarray,
-        sigma_t: jnp.ndarray,
-        lambda_t: jnp.ndarray,
-        sigmas: jnp.ndarray,
-        init_noise_sigma: jnp.ndarray,
+        alpha_t: jax.Array,
+        sigma_t: jax.Array,
+        lambda_t: jax.Array,
+        sigmas: jax.Array,
+        init_noise_sigma: jax.Array,
     ):
         return cls(
             common=common_state,
@@ -85,7 +85,7 @@ class UniPCMultistepScheduler(SchedulerMixin):
         beta_start: float = 0.0001,
         beta_end: float = 0.02,
         beta_schedule: str = "linear",
-        trained_betas: jnp.ndarray | list[float] | None = None,
+        trained_betas: jax.Array | list[float] | None = None,
         solver_order: int = 2,
         prediction_type: str = "epsilon",
         thresholding: bool = False,
@@ -290,9 +290,9 @@ class UniPCMultistepScheduler(SchedulerMixin):
     def convert_model_output(
         self,
         state: UniPCMultistepSchedulerState,
-        model_output: jnp.ndarray,
-        sample: jnp.ndarray,
-    ) -> jnp.ndarray:
+        model_output: jax.Array,
+        sample: jax.Array,
+    ) -> jax.Array:
         """
         Converts the model output based on the prediction type and current state.
         """
@@ -340,10 +340,10 @@ class UniPCMultistepScheduler(SchedulerMixin):
     def multistep_uni_p_bh_update(
         self,
         state: UniPCMultistepSchedulerState,
-        model_output: jnp.ndarray,
-        sample: jnp.ndarray,
+        model_output: jax.Array,
+        sample: jax.Array,
         order: int,
-    ) -> jnp.ndarray:
+    ) -> jax.Array:
         """
         One step for the UniP (B(h) version) - the Predictor.
         """
@@ -486,11 +486,11 @@ class UniPCMultistepScheduler(SchedulerMixin):
     def multistep_uni_c_bh_update(
         self,
         state: UniPCMultistepSchedulerState,
-        this_model_output: jnp.ndarray,
-        last_sample: jnp.ndarray,  # Sample after predictor `x_{t-1}`
-        this_sample: jnp.ndarray,  # Sample before corrector `x_t` (after predictor step)
+        this_model_output: jax.Array,
+        last_sample: jax.Array,  # Sample after predictor `x_{t-1}`
+        this_sample: jax.Array,  # Sample before corrector `x_t` (after predictor step)
         order: int,
-    ) -> jnp.ndarray:
+    ) -> jax.Array:
         """
         One step for the UniC (B(h) version) - the Corrector.
         """
@@ -641,8 +641,8 @@ class UniPCMultistepScheduler(SchedulerMixin):
     def index_for_timestep(
         self,
         state: UniPCMultistepSchedulerState,
-        timestep: int | jnp.ndarray,
-        schedule_timesteps: jnp.ndarray | None = None,
+        timestep: int | jax.Array,
+        schedule_timesteps: jax.Array | None = None,
     ) -> int:
         """ "Gets the step_index for timestep."""
         if schedule_timesteps is None:
@@ -651,7 +651,7 @@ class UniPCMultistepScheduler(SchedulerMixin):
         # QUINN!!
         # timestep_val = (
         #     timestep.item()
-        #     if isinstance(timestep, jnp.ndarray) and timestep.ndim == 0
+        #     if isinstance(timestep, jax.Array) and timestep.ndim == 0
         #     else timestep
         # )
         timestep_val = timestep
@@ -666,7 +666,7 @@ class UniPCMultistepScheduler(SchedulerMixin):
         return step_index
 
     def _init_step_index(
-        self, state: UniPCMultistepSchedulerState, timestep: int | jnp.ndarray
+        self, state: UniPCMultistepSchedulerState, timestep: int | jax.Array
     ) -> UniPCMultistepSchedulerState:
         """Initializes the step_index counter for the scheduler."""
         if state.begin_index is None:
@@ -679,9 +679,9 @@ class UniPCMultistepScheduler(SchedulerMixin):
     def step(
         self,
         state: UniPCMultistepSchedulerState,
-        model_output: jnp.ndarray,  # This is the direct output from the diffusion model (e.g., noise prediction)
-        timestep: int | jnp.ndarray,  # Current discrete timestep from the scheduler's sequence
-        sample: jnp.ndarray,  # Current noisy sample (latent)
+        model_output: jax.Array,  # This is the direct output from the diffusion model (e.g., noise prediction)
+        timestep: int | jax.Array,  # Current discrete timestep from the scheduler's sequence
+        sample: jax.Array,  # Current noisy sample (latent)
         return_dict: bool = True,
         # generator: jax.random.PRNGKey | None = None,  # JAX random key
     ):
@@ -798,8 +798,8 @@ class UniPCMultistepScheduler(SchedulerMixin):
         return prev_sample, state
 
     def scale_model_input(
-        self, state: UniPCMultistepSchedulerState, sample: jnp.ndarray, *args, **kwargs
-    ) -> jnp.ndarray:
+        self, state: UniPCMultistepSchedulerState, sample: jax.Array, *args, **kwargs
+    ) -> jax.Array:
         """
         UniPC does not scale model input, so it returns the sample unchanged.
         """
@@ -808,10 +808,10 @@ class UniPCMultistepScheduler(SchedulerMixin):
     def add_noise(
         self,
         state: UniPCMultistepSchedulerState,
-        original_samples: jnp.ndarray,
-        noise: jnp.ndarray,
-        timesteps: jnp.ndarray,
-    ) -> jnp.ndarray:
+        original_samples: jax.Array,
+        noise: jax.Array,
+        timesteps: jax.Array,
+    ) -> jax.Array:
         return add_noise_common(state.common, original_samples, noise, timesteps)
 
     def _sigma_to_alpha_sigma_t(self, sigma):

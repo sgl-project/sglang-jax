@@ -29,6 +29,8 @@ class PatchEmbed(nnx.Module):
         bias: bool = True,
         dtype: jnp.dtype = jnp.float32,
         prefix: str = "",
+        *,
+        rngs: nnx.Rngs = None,
     ):
         # Convert patch_size to tuple
         if isinstance(patch_size, (list, tuple)):
@@ -49,6 +51,7 @@ class PatchEmbed(nnx.Module):
             use_bias=bias,
             dtype=dtype,
             padding="VALID",
+            rngs=rngs,
         )
 
         self.norm = norm_layer(embed_dim) if norm_layer else lambda x: x
@@ -84,9 +87,9 @@ class TimestepEmbedder(nnx.Module):
         self.max_period = max_period
 
         self.mlp = MLP(
-            frequency_embedding_size,
-            hidden_size,
-            hidden_size,
+            input_dim=frequency_embedding_size,
+            mlp_hidden_dim=hidden_size,
+            output_dim=hidden_size,
             act_type=act_layer,
             dtype=dtype,
         )
@@ -151,7 +154,10 @@ class ModulateProjection(nnx.Module):
         self.factor = factor
         self.hidden_size = hidden_size
         self.linear = ReplicatedLinear(
-            hidden_size, hidden_size * factor, bias=True, params_dtype=dtype
+            input_size=hidden_size,
+            output_size=hidden_size * factor,
+            use_bias=True,
+            params_dtype=dtype,
         )
         self.act = get_act_fn(act_layer)
 
@@ -159,6 +165,6 @@ class ModulateProjection(nnx.Module):
         """
         Apply the modulated projection to the input tensor.
         """
-        x = self.linear(x)
-        x, _ = self.act(x)
+        x = self.act(x)
+        x, _ = self.linear(x)
         return x

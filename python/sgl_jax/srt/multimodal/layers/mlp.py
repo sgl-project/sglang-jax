@@ -25,7 +25,6 @@ class MLP(nnx.Module):
         self,
         input_dim: int,
         mlp_hidden_dim: int,
-        mesh: jax.sharding.Mesh,
         output_dim: int | None = None,
         bias: bool = True,
         act_type: str = "gelu_pytorch_tanh",
@@ -33,9 +32,8 @@ class MLP(nnx.Module):
         prefix: str = "",
     ):
         self.fc_in = ReplicatedLinear(
-            input_dim,
-            mlp_hidden_dim,
-            mesh=mesh,
+            input_size=input_dim,
+            output_size=mlp_hidden_dim,
             use_bias=bias,
             params_dtype=dtype,
         )
@@ -44,7 +42,7 @@ class MLP(nnx.Module):
         if output_dim is None:
             output_dim = input_dim
         self.fc_out = ReplicatedLinear(
-            mlp_hidden_dim, output_dim, mesh=mesh, use_bias=bias, params_dtype=dtype
+            input_size=mlp_hidden_dim, output_size=output_dim, use_bias=bias, params_dtype=dtype
         )
 
     def __call__(self, x: jax.Array) -> jax.Array:

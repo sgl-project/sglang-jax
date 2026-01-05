@@ -25,7 +25,6 @@ class ReplicatedLinear(LinearBase):
         self,
         input_size: int,
         output_size: int,
-        mesh: jax.sharding.Mesh,
         use_bias: bool = True,
         skip_bias_add: bool = False,
         params_dtype: jnp.dtype | None = jnp.bfloat16,
@@ -34,7 +33,6 @@ class ReplicatedLinear(LinearBase):
         super().__init__(
             input_size=input_size,
             output_size=output_size,
-            mesh=mesh,
             use_bias=use_bias,
             skip_bias_add=skip_bias_add,
             params_dtype=params_dtype,
@@ -54,9 +52,9 @@ class ReplicatedLinear(LinearBase):
             )
 
     def __call__(self, inputs: jax.Array) -> tuple[jax.Array, jax.Array | None]:
-        output = jnp.dot(inputs, self.weight.value)
+        output = jnp.dot(inputs, self.weight[...])
         if self.skip_bias_add:
-            return output, self.bias.value if hasattr(self, "bias") else None
+            return output, self.bias[...] if hasattr(self, "bias") else None
         if hasattr(self, "bias"):
-            output = output + self.bias.value
-        return output, self.bias.value if hasattr(self, "bias") else None
+            output = output + self.bias[...]
+        return output, self.bias[...] if hasattr(self, "bias") else None

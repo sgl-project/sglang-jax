@@ -36,7 +36,6 @@ class LinearBase(nnx.Module):
         self,
         input_size: int,
         output_size: int,
-        mesh: jax.sharding.Mesh,
         use_bias: bool = True,
         skip_bias_add: bool = False,
         params_dtype: jnp.dtype | None = jnp.bfloat16,
@@ -46,7 +45,6 @@ class LinearBase(nnx.Module):
         self.skip_bias_add = skip_bias_add
         self.params_dtype = params_dtype
         self.kernel_axes = kernel_axes
-        self.mesh = mesh
         self.weight = nnx.Param(
             jax.random.normal(
                 jax.random.PRNGKey(0),
