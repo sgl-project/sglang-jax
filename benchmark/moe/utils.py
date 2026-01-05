@@ -34,12 +34,6 @@ class MoEBenchmarkCase:
 
 
 # Bailing MoE defaults (matches the observed precompile shapes).
-#
-# Extend (prefill) precompile in server logs:
-#   num_tokens: 256, 512, 1024, 2048
-#
-# Decode precompile in server logs:
-#   bs paddings: 8, 16, 32, 64, 128, 256  (num_tokens matches bs for decode)
 BAILING_BASE = dict(
     num_experts=256,
     top_k=8,
@@ -53,23 +47,15 @@ BAILING_BASE = dict(
     ep_size=None,
 )
 
-_EXTEND_NUM_TOKENS = (512, 1024, 2048, 4096)
-_DECODE_NUM_TOKENS = (16, 32, 64, 128, 256)
+_NUM_TOKENS = (16, 32, 64, 128, 256, 512, 1024, 2048, 4096)
 
 GROUP_GEMM_CASES: Iterable[MoEBenchmarkCase] = tuple(
     MoEBenchmarkCase(
-        name=f"bailing_decode_nt{n}_ne256_tk8_h8192_i2048",
+        name=f"bailing_nt{n}_ne256_tk8_h8192_i2048",
         num_tokens=n,
         **BAILING_BASE,
     )
-    for n in _DECODE_NUM_TOKENS
-) + tuple(
-    MoEBenchmarkCase(
-        name=f"bailing_extend_nt{n}_ne256_tk8_h8192_i2048",
-        num_tokens=n,
-        **BAILING_BASE,
-    )
-    for n in _EXTEND_NUM_TOKENS
+    for n in _NUM_TOKENS
 )
 
 

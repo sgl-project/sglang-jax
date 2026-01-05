@@ -459,7 +459,6 @@ def _fused_ep_moe_kernel(
 
     t_dtype = tokens_hbm.dtype
     t_packing = get_dtype_packing(t_dtype)
-    t_bitwidth = 32 // t_packing
     assert a2a_g_hbm.dtype == t_dtype
     assert w1_hbm.dtype == w2_hbm.dtype
     assert w3_hbm.dtype == w2_hbm.dtype
@@ -971,7 +970,7 @@ def _fused_ep_moe_kernel(
             raise RuntimeError("Unreachable")
 
     def dynamic_ffn1(
-        t_b32_vmem,
+        t_vmem,
         w1_vmem,
         w1_scale_vmem,
         b1_vmem,
@@ -983,8 +982,8 @@ def _fused_ep_moe_kernel(
         dyn_sz,
         should_init,
     ):
-        token_tile = t_b32_vmem.shape[0]
-        assert t_b32_vmem.shape == (token_tile, bd1 // t_packing)
+        token_tile = t_vmem.shape[0]
+        assert t_vmem.shape == (token_tile, t_packing, bd1 // t_packing)
         assert w1_vmem.shape == w3_vmem.shape == (t_packing, bd1_per_t_packing, bf)
         assert acc1_vmem.shape == acc3_vmem.shape == (token_tile, bf)
         assert bd1 % (t_packing * 128) == 0, (bd1, t_packing)
@@ -1009,17 +1008,15 @@ def _fused_ep_moe_kernel(
 
         dyn_sz_i32 = dyn_sz.astype(jnp.int32)
         num_loops = lax.select(dyn_sz_i32 > 0, (dyn_sz_i32 + (btc - 1)) // btc, 0)
-        repack_ty = jnp.dtype(f"int{t_bitwidth}")
 
         def body(btc_id, _):
             for bd1c_id in range(cdiv(bd1, bd1c)):
-                t_b32 = t_b32_vmem[
-                    pl.ds(btc_id * btc, btc),
-                    pl.ds(bd1c_id * bd1c_per_t_packing, bd1c_per_t_packing),
-                ]
                 for p_id in range(t_packing):
-                    t = pltpu.bitcast(t_b32.astype(repack_ty), t_dtype)
-                    t_b32 = t_b32 >> t_bitwidth
+                    t = t_vmem[
+                        pl.ds(btc_id * btc, btc),
+                        p_id,
+                        pl.ds(bd1c_id * bd1c_per_t_packing, bd1c_per_t_packing),
+                    ]
                     for bfc_id in range(cdiv(bf, bfc)):
                         w_slices = (
                             p_id,
@@ -1089,12 +1086,12 @@ def _fused_ep_moe_kernel(
         w2_vmem,
         w2_scale_vmem,
         b2_vmem,
-        res_b32_vmem,
+        res_vmem,
         dyn_sz,
         should_init,
     ):
-        token_tile = res_b32_vmem.shape[0]
-        assert res_b32_vmem.shape == (token_tile, bd2_per_t_packing)
+        token_tile = res_vmem.shape[0]
+        assert res_vmem.shape == (token_tile, t_packing, bd2_per_t_packing)
         assert w2_vmem.shape == (t_packing, bf, bd2_per_t_packing)
         assert acc1_vmem.shape == acc3_vmem.shape == (token_tile, bf)
         assert bd2 % (t_packing * 128) == 0, (bd2, t_packing)
@@ -1116,7 +1113,6 @@ def _fused_ep_moe_kernel(
 
         def body(btc_id, __):
             for bd2c_id in range(cdiv(bd2, bd2c)):
-                res_lst = []
                 for p_id in range(t_packing):
                     res = jnp.zeros((btc, bd2c_per_t_packing), dtype=jnp.float32)
 
@@ -1150,29 +1146,15 @@ def _fused_ep_moe_kernel(
                             w2_scale = jnp.broadcast_to(w2_scale_vmem[*w2_scale_slices], acc.shape)
                             acc *= w2_scale
                         res += acc
-                    res = pltpu.bitcast(res, jnp.uint32)
-                    if t_packing == 2:
-                        res = res >> 16 << (16 * p_id)
+                    res_slice = res_vmem.at[
+                        pl.ds(btc_id * btc, btc),
+                        p_id,
+                        pl.ds(bd2c_id * bd2c_per_t_packing, bd2c_per_t_packing),
+                    ]
+                    if should_init:
+                        res_slice[...] = res.astype(t_dtype)
                     else:
-                        assert t_packing == 1
-                    res_lst.append(res)
-                # TODO(jevinjiang): use interleaved packing when it is exposed to Pallas.
-                if t_packing == 1:
-                    res = res_lst[0]
-                else:
-                    assert t_packing == 2
-                    res = res_lst[0] | res_lst[1]
-                sliced_res_vmem = res_b32_vmem.at[
-                    pl.ds(btc_id * btc, btc),
-                    pl.ds(bd2c_id * bd2c_per_t_packing, bd2c_per_t_packing),
-                ]
-                if should_init:
-                    sliced_res_vmem[...] = res
-                else:
-                    sliced_res_vmem[...] = pltpu.bitcast(
-                        sliced_res_vmem.bitcast(t_dtype)[...] + pltpu.bitcast(res, t_dtype),
-                        sliced_res_vmem.dtype,
-                    )
+                        res_slice[...] = (res_slice[...].astype(jnp.float32) + res).astype(t_dtype)
 
         lax.fori_loop(0, num_loops, body, None)
 
@@ -1316,9 +1298,7 @@ def _fused_ep_moe_kernel(
 
                     tile_sz = jnp.maximum(jnp.minimum(dyn_sz_i32 - tile_start, token_tile), 0)
                     dynamic_ffn1(
-                        t_b32_vmem=t_stage_x2_vmem.at[token_buf_id]
-                        .bitcast(jnp.uint32)
-                        .reshape(token_tile, bd1_per_t_packing),
+                        t_vmem=t_stage_x2_vmem.at[token_buf_id],
                         w1_vmem=w1_vmem,
                         w1_scale_vmem=w1_scale_vmem,
                         b1_vmem=b1_vmem,
@@ -1427,9 +1407,7 @@ def _fused_ep_moe_kernel(
                         w2_vmem=w2_vmem,
                         w2_scale_vmem=w2_scale_vmem,
                         b2_vmem=b2_vmem,
-                        res_b32_vmem=a2a_s_acc_stage_x3_vmem.at[buf_compute]
-                        .bitcast(jnp.uint32)
-                        .reshape(token_tile, bd2_per_t_packing),
+                        res_vmem=a2a_s_acc_stage_x3_vmem.at[buf_compute],
                         dyn_sz=tile_sz,
                         should_init=should_init_ffn2,
                     )
