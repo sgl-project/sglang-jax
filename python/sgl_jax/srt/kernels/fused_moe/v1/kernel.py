@@ -758,12 +758,16 @@ def _fused_ep_moe_kernel(
             sem=send_x2_sems.at[e_sem_id],
         ).wait()
 
-    def wait_a2a_gather_recv_all():
+    def wait_a2a_gather_recv_all(*, bt_size):
         if no_comm:
             return
         # Same rationale as `wait_a2a_gather_send`: wait on the semaphore without
         # touching `a2a_g_hbm` to avoid corrupting gathered tokens.
-        ref = a2a_s_x2_hbm.at[0, pl.ds(0, 1)]
+        # Important: the waited-on slice size must match what the recv semaphore
+        # was signaled with (in bytes). For each `bt` tile, we receive exactly
+        # `bt * top_k` token vectors back onto this device.
+        sz = jnp.int32(bt_size * top_k)
+        ref = a2a_s_x2_hbm.at[0, pl.ds(0, sz)]
         pltpu.make_async_copy(
             src_ref=ref,
             dst_ref=ref,
@@ -1596,7 +1600,7 @@ def _fused_ep_moe_kernel(
         )
 
         # Wait to receive a2a gather for ALL experts before consuming `a2a_g_hbm`.
-        wait_a2a_gather_recv_all()
+        wait_a2a_gather_recv_all(bt_size=bt)
         sync_barrier()
 
         out_buf_id = bt_id & jnp.int32(1)
