@@ -325,6 +325,9 @@ class PrefillAdder:
     def ceil_paged_tokens(self, tokens: int) -> int:
         return -(-tokens // self.page_size) * self.page_size
 
+    def align_page_size(self, size: int) -> int:
+        return (size + self.page_size - 1) // self.page_size * self.page_size
+
     def budget_state(self):
         if self.rem_total_tokens <= 0 or self.cur_rem_tokens <= 0:
             return AddReqResult.NO_TOKEN
@@ -390,7 +393,9 @@ class PrefillAdder:
 
         def add_req_state(r, insert_sort=False):
             new_token_ratio = 1.0 if r.sampling_params.ignore_eos else self.new_token_ratio
-            tokens_left = r.sampling_params.max_new_tokens * new_token_ratio - len(r.output_ids)
+            tokens_left = self.align_page_size(
+                r.sampling_params.max_new_tokens * new_token_ratio
+            ) - len(r.output_ids)
             tokens_occupied = len(r.origin_input_ids) + len(r.output_ids)
 
             if tokens_left <= 0:
