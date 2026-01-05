@@ -376,6 +376,15 @@ def run_all(
     if no_comm:
         print("  mode: no_comm=True")
     for case in cases:
+        t_packing = _dtype_packing(dtype)
+        local_num_tokens = case.num_tokens // case.ep_size
+        if local_num_tokens % t_packing != 0:
+            print(
+                f"skip [case={case.name}] because local_num_tokens={local_num_tokens} "
+                f"is not aligned to t_packing={t_packing} (dtype={jnp.dtype(dtype).name})"
+            )
+            continue
+
         print(
             f"\n[case={case.name}] tokens={case.num_tokens}, experts={case.num_experts}, "
             f"top_k={case.top_k}, hidden={case.hidden_size}, intermediate={case.intermediate_size}, ep_size={case.ep_size}"
