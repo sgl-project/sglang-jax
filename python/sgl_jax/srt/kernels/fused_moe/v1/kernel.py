@@ -144,24 +144,6 @@ def broadcast_minor(src, shape):
     ]
 
 
-# TODO(jevinjiang): Apply the same trick for load.
-def store_with_retiling(ref, val, *, is_acc: bool = False):
-    """Retiling (8, 128) to (1, 128) in store."""
-    assert ref.shape == val.shape
-    assert ref.dtype == val.dtype
-    assert get_dtype_packing(ref.dtype) == 1
-    assert len(ref.shape) == 2
-    assert ref.shape[1] % 128 == 0
-    a, b = ref.shape
-    folds = b // 128
-    reshaped_ref = ref.reshape(a * folds, 128)
-    for i in range(folds):
-        if is_acc:
-            reshaped_ref[pl.ds(i, a, folds)] += val[:, i * 128 : (i + 1) * 128]
-        else:
-            reshaped_ref[pl.ds(i, a, folds)] = val[:, i * 128 : (i + 1) * 128]
-
-
 def swigluoai(
     gate: jax.Array, up: jax.Array, *, alpha: float = 1.702, limit: float = 7.0
 ) -> jax.Array:
@@ -271,39 +253,6 @@ def validate_fused_moe_block_config(
             raise ValueError(f"Expected {bfc=} to be {subc_quant_wsz=} when quantized.")
 
 
-def _kernel_like_top_k(
-    gating_logits: jax.Array,  # (num_tokens, num_experts)
-    top_k: int,
-    *,
-    renormalize_topk_logits: bool,
-) -> tuple[jax.Array, jax.Array]:
-    """Matches the pallas-kernel `get_top_k` behavior (argmax loop on F32)."""
-    x = gating_logits.astype(jnp.float32)
-    if x.ndim != 2:
-        raise ValueError(f"Expected 2D logits, got shape={x.shape}.")
-    num_tokens, num_experts = x.shape
-    indices = []
-    values = []
-
-    iota = jax.lax.broadcasted_iota(jnp.int32, (num_tokens, num_experts), 1)
-    for k_id in range(top_k):
-        v = jnp.max(x, axis=1)
-        idx = jnp.argmax(x, axis=1).astype(jnp.int32)
-        values.append(v)
-        indices.append(idx)
-        if k_id != top_k - 1:
-            mask = iota == idx[:, None]
-            x = jnp.where(mask, -jnp.inf, x)
-
-    top_k_logits = jnp.stack(values, axis=1)  # (num_tokens, top_k)
-    top_k_indices = jnp.stack(indices, axis=1)  # (num_tokens, top_k)
-
-    if renormalize_topk_logits:
-        top_k_logits = top_k_logits / jnp.sum(top_k_logits, axis=1, keepdims=True)
-
-    return top_k_logits, top_k_indices
-
-
 def ref_moe(
     tokens: jax.Array,  # (num_tokens, hidden_size)
     w1: jax.Array,  # (num_experts, hidden_size, intermediate_size)
@@ -334,9 +283,10 @@ def ref_moe(
     gating_logits = jax.nn.softmax(gating_output, axis=-1)  # [num_tokens, n_experts]
 
     # Select top-k experts per token
-    top_k_logits, top_k_indices = _kernel_like_top_k(
-        gating_logits, top_k, renormalize_topk_logits=renormalize_topk_logits
-    )
+    top_k_logits, top_k_indices = lax.top_k(gating_logits, top_k)  # [num_tokens, top_k]
+
+    if renormalize_topk_logits:
+        top_k_logits = top_k_logits / jnp.sum(top_k_logits, axis=-1, keepdims=True)
 
     t_outputs = []
     hidden_size, intermediate_size = w1.shape[-2:]
@@ -1098,15 +1048,11 @@ def _fused_ep_moe_kernel(
                                 b3 = jnp.broadcast_to(b3_vmem[*b3_scale_slices], acc1.shape)
                                 acc3 += b3
 
-                            acc1_vmem_slice = acc1_vmem.at[*acc_slices]
-                            acc3_vmem_slice = acc3_vmem.at[*acc_slices]
-                            store_with_retiling(acc1_vmem_slice, acc1)
-                            store_with_retiling(acc3_vmem_slice, acc3)
+                            acc1_vmem[*acc_slices] = acc1
+                            acc3_vmem[*acc_slices] = acc3
                         else:
-                            acc1_vmem_slice = acc1_vmem.at[*acc_slices]
-                            acc3_vmem_slice = acc3_vmem.at[*acc_slices]
-                            store_with_retiling(acc1_vmem_slice, acc1, is_acc=True)
-                            store_with_retiling(acc3_vmem_slice, acc3, is_acc=True)
+                            acc1_vmem[*acc_slices] += acc1
+                            acc3_vmem[*acc_slices] += acc3
 
         lax.fori_loop(0, num_loops, body, None)
 
