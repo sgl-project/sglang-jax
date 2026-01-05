@@ -178,10 +178,11 @@ def select_block_configs(
         return sorted(set(out))
 
     bt_candidates = _pick_candidates(candidates=bt_candidates, multiple_of=t_packing)
-    bts_candidates_i = (
-        [0] if bts_candidates is None else list(bts_candidates)
-    )  # 0 means "use bt" (bts=None)
-    bts_candidates_i = _pick_candidates(candidates=bts_candidates_i, multiple_of=t_packing)
+    bts_candidates_i: list[int] | None
+    if bts_candidates is None:
+        bts_candidates_i = None  # Default: bts follows bt.
+    else:
+        bts_candidates_i = _pick_candidates(candidates=list(bts_candidates), multiple_of=t_packing)
     bf_candidates = _pick_candidates(candidates=bf_candidates, multiple_of=128)
     bd_candidates = _pick_candidates(candidates=bd_candidates, multiple_of=tile_align)
 
@@ -268,7 +269,8 @@ def select_block_configs(
         configs.append(effective)
 
     for bt in bt_candidates:
-        for bts in bts_candidates_i:
+        bts_list: list[int | None] = [None] if bts_candidates_i is None else bts_candidates_i
+        for bts in bts_list:
             for bf in bf_candidates:
                 for bd in bd_candidates:
                     raw = FusedMoEBlockConfig(
@@ -280,7 +282,7 @@ def select_block_configs(
                         bfc=bf,
                         bd1c=bd,
                         bd2c=bd,
-                        bts=None if bts == 0 else bts,
+                        bts=bts,
                     )
                     effective = raw.effective_for(
                         num_tokens=case.num_tokens, ep_size=case.ep_size, dtype=dtype
@@ -324,6 +326,7 @@ def run_all(
     *,
     warmup_iters: int = 1,
     a2a_only: bool = False,
+    no_comm: bool = False,
     tune_block_config: bool = False,
     bt_candidates: list[int] | None = None,
     bts_candidates: list[int] | None = None,
@@ -370,6 +373,8 @@ def run_all(
     print(f"Running fused_moe benchmarks with scenario='{scenario}', dtype={dtype}")
     if a2a_only:
         print("  mode: a2a_only=True")
+    if no_comm:
+        print("  mode: no_comm=True")
     for case in cases:
         print(
             f"\n[case={case.name}] tokens={case.num_tokens}, experts={case.num_experts}, "
@@ -413,6 +418,7 @@ def run_all(
                 layer_id=0,
                 renormalize_topk_logits=case.renormalize_topk_logits,
                 a2a_only=a2a_only,
+                no_comm=no_comm,
             )
 
             moe_def, moe_state = nnx.split(fused_layer)
@@ -528,6 +534,14 @@ def parse_args() -> argparse.Namespace:
         help="Skip expert FFN compute (measure mostly routing + A2A + accumulation).",
     )
     parser.add_argument(
+        "--no-comm",
+        action="store_true",
+        help=(
+            "Disable cross-device communication (no all-reduce / no A2A remote copies). "
+            "This is a perf microbenchmark mode and does not preserve EP-MoE semantics."
+        ),
+    )
+    parser.add_argument(
         "--tune-block-config",
         action="store_true",
         help="Benchmark multiple block_config variants and print the best tuned table entry.",
@@ -547,7 +561,7 @@ def parse_args() -> argparse.Namespace:
         nargs="+",
         help=(
             "Candidate list for bts (token staging tile inside expert_ffn). "
-            "Use 0 to mean 'bts=bt'. Example: --bts-candidates 0 8 16 32 64"
+            "When omitted, bts defaults to bt. Example: --bts-candidates 8 16 32 64"
         ),
     )
     parser.add_argument(
@@ -600,6 +614,7 @@ if __name__ == "__main__":
         args.iters,
         warmup_iters=args.warmup_iters,
         a2a_only=args.a2a_only,
+        no_comm=args.no_comm,
         tune_block_config=args.tune_block_config,
         bt_candidates=args.bt_candidates,
         bts_candidates=args.bts_candidates,

@@ -534,6 +534,7 @@ class FusedEPMoE(nnx.Module):
         layer_id: int = 0,
         renormalize_topk_logits: bool = False,
         a2a_only: bool = True,
+        no_comm: bool = False,
     ):
         self.hidden_size = hidden_size
         self.num_experts = num_experts
@@ -546,6 +547,7 @@ class FusedEPMoE(nnx.Module):
         self.activation = activation
         self.renormalize_topk_logits = renormalize_topk_logits
         self.a2a_only = a2a_only
+        self.no_comm = no_comm
         self.mesh = mesh
 
         if num_experts % self.ep_size != 0:
@@ -587,6 +589,7 @@ class FusedEPMoE(nnx.Module):
         *,
         block_config: FusedMoEBlockConfig | None = None,
         a2a_only: bool = False,
+        no_comm: bool = False,
     ) -> jax.Array:
         """
         Forward pass through the fused MoE layer.
@@ -614,6 +617,7 @@ class FusedEPMoE(nnx.Module):
             act_fn=self.activation,
             block_config=block_config,
             a2a_only=self.a2a_only,
+            no_comm=self.no_comm,
             # Optional parameters (not used in basic case)
             subc_quant_wsz=None,
             w1_scale=None,

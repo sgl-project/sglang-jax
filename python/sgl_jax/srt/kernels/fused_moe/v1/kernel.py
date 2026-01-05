@@ -428,6 +428,7 @@ def _fused_ep_moe_kernel(
     ep_axis_name: str,
     act_fn: str,
     a2a_only: bool = False,
+    no_comm: bool = False,
     subc_quant_wsz: int | None = None,
     # Kernel tuning params.
     bt: int,  # Outer token tile size (output tiling).
@@ -500,6 +501,8 @@ def _fused_ep_moe_kernel(
         return (dp_rank, ep_rank)
 
     def sync_barrier():
+        if no_comm:
+            return
         for i in range(num_devices):
             pltpu.semaphore_signal(
                 barrier_sem,
@@ -609,27 +612,33 @@ def _fused_ep_moe_kernel(
                 dst_ref=t2e_routing_smem.at[bt_sem_id],
                 sem=send_sem,
             )
-            reduced_sizes = sizes
-            reduced_starts = starts
-            row_id = my_id
-            d2e_count_vmem[row_id] = sizes
-            for i in range(num_devices - 1):
-                sync_barrier()
-                # TODO(jevinjiang): we can use double buffering to improve AR if needed.
-                pltpu.async_remote_copy(
-                    src_ref=d2e_count_vmem.at[row_id],
-                    dst_ref=d2e_count_vmem.at[row_id],
-                    send_sem=send_sem,
-                    recv_sem=recv_sem,
-                    device_id=get_mesh_device_id(right_id),
-                    device_id_type=pltpu.DeviceIdType.MESH,
-                ).wait()
-                row_id = (row_id + num_devices - 1) % num_devices
-                new_sizes = d2e_count_vmem[row_id]
-                reduced_sizes += new_sizes
-                reduced_starts += lax.select(my_id > i, new_sizes, jnp.zeros_like(new_sizes))
-            starts_vmem[...] = reduced_starts
-            sizes_vmem[...] = reduced_sizes
+            if no_comm:
+                d2e_count_vmem[...] = jnp.zeros_like(d2e_count_vmem)
+                d2e_count_vmem[my_id] = sizes
+                starts_vmem[...] = jnp.zeros_like(starts_vmem)
+                sizes_vmem[...] = sizes
+            else:
+                reduced_sizes = sizes
+                reduced_starts = starts
+                row_id = my_id
+                d2e_count_vmem[row_id] = sizes
+                for i in range(num_devices - 1):
+                    sync_barrier()
+                    # TODO(jevinjiang): we can use double buffering to improve AR if needed.
+                    pltpu.async_remote_copy(
+                        src_ref=d2e_count_vmem.at[row_id],
+                        dst_ref=d2e_count_vmem.at[row_id],
+                        send_sem=send_sem,
+                        recv_sem=recv_sem,
+                        device_id=get_mesh_device_id(right_id),
+                        device_id_type=pltpu.DeviceIdType.MESH,
+                    ).wait()
+                    row_id = (row_id + num_devices - 1) % num_devices
+                    new_sizes = d2e_count_vmem[row_id]
+                    reduced_sizes += new_sizes
+                    reduced_starts += lax.select(my_id > i, new_sizes, jnp.zeros_like(new_sizes))
+                starts_vmem[...] = reduced_starts
+                sizes_vmem[...] = reduced_sizes
 
             starts_copy = pltpu.async_copy(
                 src_ref=starts_vmem,
@@ -680,7 +689,7 @@ def _fused_ep_moe_kernel(
                 sz = lax.select(is_active_expert, jnp.int32(1), jnp.int32(0))
                 is_local = recv_id == my_id
                 local_sz = lax.select(is_local, sz, jnp.int32(0))
-                remote_sz = lax.select(is_local, jnp.int32(0), sz)
+                remote_sz = jnp.int32(0) if no_comm else lax.select(is_local, jnp.int32(0), sz)
                 send_sz += remote_sz
                 expert_offsets_smem[bt_sem_id, 0, e_id] = offset + local_sz + remote_sz
                 start = expert_starts_smem[bt_sem_id, 0, e_id] + offset
@@ -690,14 +699,15 @@ def _fused_ep_moe_kernel(
                     dst_ref=a2a_s_hbm.at[e_sem_id, pl.ds(start, local_sz)],
                     sem=recv_sems.at[e_sem_id],
                 ).start()
-                pltpu.make_async_remote_copy(
-                    src_ref=tokens_hbm.at[pl.ds(src_t_id, remote_sz)],
-                    dst_ref=a2a_s_hbm.at[e_sem_id, pl.ds(start, remote_sz)],
-                    send_sem=send_sems.at[e_sem_id],
-                    recv_sem=recv_sems.at[e_sem_id],
-                    device_id=get_mesh_device_id(recv_id),
-                    device_id_type=pltpu.DeviceIdType.MESH,
-                ).start()
+                if not no_comm:
+                    pltpu.make_async_remote_copy(
+                        src_ref=tokens_hbm.at[pl.ds(src_t_id, remote_sz)],
+                        dst_ref=a2a_s_hbm.at[e_sem_id, pl.ds(start, remote_sz)],
+                        send_sem=send_sems.at[e_sem_id],
+                        recv_sem=recv_sems.at[e_sem_id],
+                        device_id=get_mesh_device_id(recv_id),
+                        device_id_type=pltpu.DeviceIdType.MESH,
+                    ).start()
             return send_sz
 
         send_sz = lax.fori_loop(
@@ -734,20 +744,21 @@ def _fused_ep_moe_kernel(
             sz = d2e_count_smem[bt_sem_id, recv_id, 0, my_e_id]
             is_local = recv_id == my_id
             local_sz = lax.select(is_local, sz, 0)
-            remote_sz = lax.select(is_local, 0, sz)
+            remote_sz = jnp.int32(0) if no_comm else lax.select(is_local, 0, sz)
             pltpu.make_async_copy(
                 src_ref=src_ref.at[e_sem_id, pl.ds(start, local_sz)],
                 dst_ref=a2a_g_hbm.at[my_e_id, pl.ds(0, local_sz)],
                 sem=a2a_gather_sem,
             ).start()
-            pltpu.make_async_remote_copy(
-                src_ref=src_ref.at[e_sem_id, pl.ds(start, remote_sz)],
-                dst_ref=a2a_g_hbm.at[my_e_id, pl.ds(0, remote_sz)],
-                send_sem=send_sems.at[e_sem_id],
-                recv_sem=a2a_gather_sem,
-                device_id=get_mesh_device_id(recv_id),
-                device_id_type=pltpu.DeviceIdType.MESH,
-            ).start()
+            if not no_comm:
+                pltpu.make_async_remote_copy(
+                    src_ref=src_ref.at[e_sem_id, pl.ds(start, remote_sz)],
+                    dst_ref=a2a_g_hbm.at[my_e_id, pl.ds(0, remote_sz)],
+                    send_sem=send_sems.at[e_sem_id],
+                    recv_sem=a2a_gather_sem,
+                    device_id=get_mesh_device_id(recv_id),
+                    device_id_type=pltpu.DeviceIdType.MESH,
+                ).start()
             start += sz
 
     def wait_a2a_gather_send(*, bt_sem_id, e_sem_id, local_e_id):
@@ -1786,6 +1797,7 @@ def _validate_fused_ep_moe_args(
         "renormalize_topk_logits",
         "act_fn",
         "a2a_only",
+        "no_comm",
         "subc_quant_wsz",
         "block_config",
         "ep_axis_name",
@@ -1818,6 +1830,7 @@ def fused_ep_moe(
     block_config: FusedMoEBlockConfig | None = None,
     ep_axis_name: str = "tensor",
     a2a_only: bool = False,
+    no_comm: bool = False,
 ):
     ep_size = mesh.shape[ep_axis_name]
     if block_config is None:
@@ -1986,6 +1999,7 @@ def fused_ep_moe(
                 ep_axis_name=ep_axis_name,
                 act_fn=act_fn,
                 a2a_only=a2a_only,
+                no_comm=no_comm,
                 subc_quant_wsz=subc_quant_wsz,
                 bt=block_config.bt,
                 bf=block_config.bf,
