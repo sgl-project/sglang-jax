@@ -1176,7 +1176,7 @@ def _fused_ep_moe_kernel(
         lax.fori_loop(0, num_loops, body, None)
 
     def expert_ffn(bt_sem_id, e_sem_id, local_e_id):
-        bw_sem_id = 0
+        bw_sem_id = jnp.int32(0)
         a2a_s_b32_hbm = a2a_s_hbm.bitcast(jnp.uint32).reshape(
             2, a2a_max_tokens, hidden_size // t_packing
         )
@@ -1263,9 +1263,23 @@ def _fused_ep_moe_kernel(
                 sem=acc_stage_sems.at[buf_id],
             ).start()
 
-        for bf_id in range(num_bf):
-            for bd1_id in range(num_bd1):
-                start_fetch_next_bw(local_e_id, bw_sem_id, bf_id, bd1_id, 0)
+        def run_gate_up_slices(*, bf_id: int, bw_sem_id):
+            def prefetch_next_gate_up_or_down(*, bd1_id, bw_sem_id):
+                next_bw_sem_id = (bw_sem_id + jnp.int32(1)) & jnp.int32(1)
+                next_bd1_id = bd1_id + jnp.int32(1)
+
+                @pl.when(next_bd1_id < num_bd1)
+                def _():
+                    start_fetch_bw1(local_e_id, next_bw_sem_id, bf_id, next_bd1_id)
+                    start_fetch_bw3(local_e_id, next_bw_sem_id, bf_id, next_bd1_id)
+
+                @pl.when(next_bd1_id == num_bd1)
+                def _():
+                    start_fetch_bw2(local_e_id, next_bw_sem_id, bf_id, jnp.int32(0))
+
+            def run_gate_up_bd1(*, bd1_id, bw_sem_id, should_init_ffn1: bool):
+                prefetch_next_gate_up_or_down(bd1_id=bd1_id, bw_sem_id=bw_sem_id)
+
                 w1_scale_vmem = (
                     None if b_w1_scale_x2_vmem is None else b_w1_scale_x2_vmem.at[bw_sem_id]
                 )
@@ -1274,17 +1288,17 @@ def _fused_ep_moe_kernel(
                 )
                 b1_vmem = None if b_b1_x2_vmem is None else b_b1_x2_vmem.at[bf_id % 2]
                 b3_vmem = None if b_b3_x2_vmem is None else b_b3_x2_vmem.at[bf_id % 2]
+
                 wait_fetch_bw1(local_e_id, bw_sem_id, bf_id, bd1_id)
                 wait_fetch_bw3(local_e_id, bw_sem_id, bf_id, bd1_id)
                 w1_vmem = b_w1_x2_vmem.at[bw_sem_id]
                 w3_vmem = b_w3_x2_vmem.at[bw_sem_id]
-                should_init_ffn1 = bd1_id == 0
 
                 # Double-buffer token staging from HBM -> VMEM to overlap with FFN1 compute.
                 # Note: a2a_s_hbm is already double-buffered by e_sem_id.
                 @pl.when(num_token_tiles > 0)
                 def _(bd1_id=bd1_id):
-                    start_stage_a2a_s_tile_from_hbm(0, bd1_id, 0)
+                    start_stage_a2a_s_tile_from_hbm(jnp.int32(0), bd1_id, jnp.int32(0))
 
                 def run_ffn1_tile(
                     token_tile_id,
@@ -1336,25 +1350,58 @@ def _fused_ep_moe_kernel(
                     jnp.int32(0),
                     unroll=False,
                 )
-                bw_sem_id = (bw_sem_id + 1) % 2
+                return (bw_sem_id + jnp.int32(1)) & jnp.int32(1)
 
-            for bd2_id in range(num_bd2):
-                start_fetch_next_bw(local_e_id, bw_sem_id, bf_id, num_bd1, bd2_id)
+            if num_bd1 <= 0:
+                return bw_sem_id
+
+            # Peel bd1_id=0 so `should_init_ffn1` stays static (avoids tracer -> python `if`).
+            bw_sem_id = run_gate_up_bd1(
+                bd1_id=jnp.int32(0), bw_sem_id=bw_sem_id, should_init_ffn1=True
+            )
+
+            def run_one_bd1_no_init(bd1_id, bw_sem_id):
+                return run_gate_up_bd1(bd1_id=bd1_id, bw_sem_id=bw_sem_id, should_init_ffn1=False)
+
+            return lax.fori_loop(1, num_bd1, run_one_bd1_no_init, bw_sem_id, unroll=False)
+
+        def run_down_slices(*, bf_id: int, bw_sem_id):
+            should_init_ffn2 = bf_id == 0
+
+            def prefetch_next_down_or_next_gate_up(*, bd2_id, bw_sem_id):
+                next_bw_sem_id = (bw_sem_id + jnp.int32(1)) & jnp.int32(1)
+                next_bd2_id = bd2_id + jnp.int32(1)
+
+                @pl.when(next_bd2_id < num_bd2)
+                def _():
+                    start_fetch_bw2(local_e_id, next_bw_sem_id, bf_id, next_bd2_id)
+
+                if bf_id + 1 < num_bf:
+
+                    @pl.when(next_bd2_id == num_bd2)
+                    def _():
+                        start_fetch_bw1(local_e_id, next_bw_sem_id, bf_id + 1, jnp.int32(0))
+                        start_fetch_bw3(local_e_id, next_bw_sem_id, bf_id + 1, jnp.int32(0))
+
+            def run_down_bd2(bd2_id, bw_sem_id):
+                prefetch_next_down_or_next_gate_up(bd2_id=bd2_id, bw_sem_id=bw_sem_id)
                 wait_fetch_bw2(local_e_id, bw_sem_id, bf_id, bd2_id)
-                if bf_id == bd2_id == 0:
-                    wait_a2a_gather_send(
-                        bt_sem_id=bt_sem_id,
-                        e_sem_id=e_sem_id,
-                        local_e_id=local_e_id - 2,
-                    )
+                if should_init_ffn2:
+
+                    @pl.when(bd2_id == 0)
+                    def _():
+                        wait_a2a_gather_send(
+                            bt_sem_id=bt_sem_id,
+                            e_sem_id=e_sem_id,
+                            local_e_id=local_e_id - 2,
+                        )
 
                 w2_scale_vmem = (
                     None if b_w2_scale_x2_vmem is None else b_w2_scale_x2_vmem.at[bw_sem_id]
                 )
-                b2_vmem = None if b_b2_x2_vmem is None else b_b2_x2_vmem.at[bd2_id % 2]
+                b2_vmem = None if b_b2_x2_vmem is None else b_b2_x2_vmem.at[bd2_id & 1]
                 bd2_start = bd2_id * bd2_per_t_packing
                 w2_vmem = b_w2_x2_vmem.at[bw_sem_id]
-                should_init_ffn2 = bf_id == 0
 
                 # Triple-buffer a2a_s_acc staging to overlap:
                 # - load(next tile) / compute(curr tile) / store(prev tile)
@@ -1448,7 +1495,13 @@ def _fused_ep_moe_kernel(
                 def _():
                     wait_stage_a2a_s_acc_tile(jnp.int32(1))
 
-                bw_sem_id = (bw_sem_id + 1) % 2
+                return (bw_sem_id + jnp.int32(1)) & jnp.int32(1)
+
+            return lax.fori_loop(0, num_bd2, run_down_bd2, bw_sem_id, unroll=False)
+
+        for bf_id in range(num_bf):
+            bw_sem_id = run_gate_up_slices(bf_id=bf_id, bw_sem_id=bw_sem_id)
+            bw_sem_id = run_down_slices(bf_id=bf_id, bw_sem_id=bw_sem_id)
 
     def acc_and_store_output(*, bt_sem_id, out_buf_id):
         acc_bt = a2a_g_acc_vmem.shape[2]
@@ -1468,7 +1521,6 @@ def _fused_ep_moe_kernel(
                     ).start()
                 return None
 
-            # Important: use `lax.fori_loop` to avoid unrolling `acc_bt`.
             lax.fori_loop(0, acc_bt, _load_one, None, unroll=False)
             pltpu.make_async_copy(
                 src_ref=a2a_g_acc_vmem.at[0],
