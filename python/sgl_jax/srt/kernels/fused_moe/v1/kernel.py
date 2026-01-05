@@ -1375,24 +1375,22 @@ def _fused_ep_moe_kernel(
                     bd2_start = bd2_id * bd2_per_t_packing
                     w2_vmem = b_w2_x2_vmem.at[bw_sem_id]
 
-                    # Triple-buffer a2a_s_acc staging to overlap:
-                    # - load(next tile) / compute(curr tile) / store(prev tile)
-                    init_buf_compute = jnp.int32(0)
-                    init_buf_store = jnp.int32(1)
-                    init_buf_load = jnp.int32(2)
+                    # Synchronous (no-overlap) version to avoid subtle semaphore hazards:
+                    # load(curr tile) -> compute(curr tile) -> store(curr tile) for each token tile.
+                    buf_id = jnp.int32(0)
                     has_tiles = num_token_tiles > 0
 
                     if not should_init_ffn2:
 
                         @pl.when(has_tiles)
-                        def _(bd2_start=bd2_start, init_buf_compute=init_buf_compute):
+                        def _(bd2_start=bd2_start, buf_id=buf_id):
                             start_load_stage_a2a_s_acc_tile_from_hbm(
-                                jnp.int32(0), bd2_start, init_buf_compute
+                                jnp.int32(0), bd2_start, buf_id
                             )
 
                     def run_ffn2_tile(
                         token_tile_id,
-                        state,
+                        _,
                         *,
                         bd2_start=bd2_start,
                         token_tile=token_tile,
@@ -1402,42 +1400,13 @@ def _fused_ep_moe_kernel(
                         w2_scale_vmem=w2_scale_vmem,
                         b2_vmem=b2_vmem,
                         should_init_ffn2=should_init_ffn2,
+                        buf_id=buf_id,
                     ):
-                        buf_compute, buf_store, buf_load = state
                         tile_start = token_tile_id * token_tile
                         tile_sz = jnp.maximum(jnp.minimum(dyn_sz_i32 - tile_start, token_tile), 0)
 
-                        # Prefetch next tile's accumulator (when accumulating across bf blocks).
                         if not should_init_ffn2:
-                            do_prefetch = token_tile_id + 1 < num_token_tiles
-                            next_tile_start = (token_tile_id + 1) * token_tile
-
-                            # Triple-buffer ring:
-                            # - buf_compute holds the current tile's loaded accumulator
-                            # - buf_load holds the buffer from two tiles ago (store in-flight)
-                            # We only need to wait before reusing `buf_load` starting from tile 2.
-                            @pl.when(jnp.logical_and(do_prefetch, token_tile_id >= 2))
-                            def _(buf_load=buf_load):
-                                wait_stage_a2a_s_acc_tile(buf_load)
-
-                            @pl.when(do_prefetch)
-                            def _(
-                                next_tile_start=next_tile_start,
-                                bd2_start=bd2_start,
-                                buf_load=buf_load,
-                            ):
-                                start_load_stage_a2a_s_acc_tile_from_hbm(
-                                    next_tile_start, bd2_start, buf_load
-                                )
-
-                            # Ensure current tile's load has completed before compute.
-                            wait_stage_a2a_s_acc_tile(buf_compute)
-                        else:
-                            # When initializing (no loads), the only hazard is reusing a buffer that still
-                            # has an in-flight store from 3 tiles ago.
-                            @pl.when(token_tile_id >= 3)
-                            def _(buf_compute=buf_compute):
-                                wait_stage_a2a_s_acc_tile(buf_compute)
+                            wait_stage_a2a_s_acc_tile(buf_id)
 
                         dynamic_ffn2(
                             acc1_vmem=b_acc1_vmem.at[pl.ds(tile_start, token_tile)],
@@ -1445,23 +1414,26 @@ def _fused_ep_moe_kernel(
                             w2_vmem=w2_vmem,
                             w2_scale_vmem=w2_scale_vmem,
                             b2_vmem=b2_vmem,
-                            res_vmem=a2a_s_acc_stage_x3_vmem.at[buf_compute],
+                            res_vmem=a2a_s_acc_stage_x3_vmem.at[buf_id],
                             dyn_sz=tile_sz,
                             should_init=should_init_ffn2,
                         )
-                        start_store_stage_a2a_s_acc_tile_to_hbm(tile_start, bd2_start, buf_compute)
-                        # Rotate buffers: compute <- load, store <- compute, load <- store.
-                        return (buf_load, buf_compute, buf_store)
+                        start_store_stage_a2a_s_acc_tile_to_hbm(tile_start, bd2_start, buf_id)
+                        wait_stage_a2a_s_acc_tile(buf_id)
 
-                    state = (init_buf_compute, init_buf_store, init_buf_load)
-                    state = lax.fori_loop(0, num_token_tiles, run_ffn2_tile, state, unroll=False)
+                        if not should_init_ffn2:
+                            next_tile_id = token_tile_id + 1
+                            next_start = next_tile_id * token_tile
 
-                    # Drain any outstanding HBM stores before the next bd2 slice / gather.
-                    @pl.when(num_token_tiles > 0)
-                    def _():
-                        wait_stage_a2a_s_acc_tile(jnp.int32(0))
-                        wait_stage_a2a_s_acc_tile(jnp.int32(1))
-                        wait_stage_a2a_s_acc_tile(jnp.int32(2))
+                            @pl.when(next_tile_id < num_token_tiles)
+                            def _(next_start=next_start, bd2_start=bd2_start, buf_id=buf_id):
+                                start_load_stage_a2a_s_acc_tile_from_hbm(
+                                    next_start, bd2_start, buf_id
+                                )
+
+                        return None
+
+                    lax.fori_loop(0, num_token_tiles, run_ffn2_tile, None, unroll=False)
 
                     return jnp.int32(next_bw_sem_id)
 
