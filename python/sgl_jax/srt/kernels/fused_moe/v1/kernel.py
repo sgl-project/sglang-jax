@@ -411,8 +411,8 @@ def _fused_ep_moe_kernel(
     b_b3_x2_vmem,  # None | <bw_sem_id> (2, 1, bf)
     b_b2_x2_vmem,  # None | <bw_sem_id> (2, t_packing, 1, bd2 // t_packing)
     b_acc_vmem,  # F32(2, align_to(output_bt * num_devices, bts), 1, bf)
-    t_stage_b32_x2_vmem,  # U32(2, bts, bd1 // t_packing)
-    a2a_s_acc_stage_b32_x3_vmem,  # U32(3, bts, bd2 // t_packing)
+    t_stage_x2_vmem,  # <token_buf_id> (2, bts, t_packing, bd1 // t_packing)
+    a2a_s_acc_stage_x3_vmem,  # <acc_buf_id> (3, bts, t_packing, bd2 // t_packing)
     ### Semaphores:
     token_stage_sems,  # DMA(2,): <token_buf_id>
     acc_stage_sems,  # DMA(3,): <acc_buf_id>
@@ -1177,12 +1177,6 @@ def _fused_ep_moe_kernel(
 
     def expert_ffn(bt_sem_id, e_sem_id, local_e_id):
         bw_sem_id = 0
-        a2a_s_b32_hbm = a2a_s_hbm.bitcast(jnp.uint32).reshape(
-            2, a2a_max_tokens, hidden_size // t_packing
-        )
-        a2a_s_acc_b32_hbm = a2a_s_acc_hbm.bitcast(jnp.uint32).reshape(
-            2, a2a_max_tokens, hidden_size // t_packing
-        )
         b_acc_vmem_2d = b_acc_vmem.reshape(2, a2a_max_tokens, bf)
         b_acc1_vmem = b_acc_vmem_2d.at[0]
         b_acc3_vmem = b_acc_vmem_2d.at[1]
@@ -1200,14 +1194,16 @@ def _fused_ep_moe_kernel(
 
         def start_stage_a2a_s_tile_from_hbm(tile_start, bd1_id, buf_id):
             pltpu.make_async_copy(
-                src_ref=a2a_s_b32_hbm.at[
+                src_ref=a2a_s_hbm.at[
                     e_sem_id,
                     pl.ds(tile_start, token_tile),
+                    pl.ds(0, t_packing),
                     pl.ds(bd1_id * bd1_per_t_packing, bd1_per_t_packing),
                 ],
-                dst_ref=t_stage_b32_x2_vmem.at[
+                dst_ref=t_stage_x2_vmem.at[
                     buf_id,
                     pl.ds(0, token_tile),
+                    pl.ds(0, t_packing),
                     pl.ds(0, bd1_per_t_packing),
                 ],
                 sem=token_stage_sems.at[buf_id],
@@ -1215,21 +1211,23 @@ def _fused_ep_moe_kernel(
 
         def wait_stage_a2a_s_tile(buf_id):
             pltpu.make_async_copy(
-                src_ref=t_stage_b32_x2_vmem.at[buf_id, pl.ds(0, token_tile)],
-                dst_ref=t_stage_b32_x2_vmem.at[buf_id, pl.ds(0, token_tile)],
+                src_ref=t_stage_x2_vmem.at[buf_id, pl.ds(0, token_tile)],
+                dst_ref=t_stage_x2_vmem.at[buf_id, pl.ds(0, token_tile)],
                 sem=token_stage_sems.at[buf_id],
             ).wait()
 
         def start_load_stage_a2a_s_acc_tile_from_hbm(tile_start, bd2_start, buf_id):
             pltpu.make_async_copy(
-                src_ref=a2a_s_acc_b32_hbm.at[
+                src_ref=a2a_s_acc_hbm.at[
                     e_sem_id,
                     pl.ds(tile_start, token_tile),
+                    pl.ds(0, t_packing),
                     pl.ds(bd2_start, bd2_per_t_packing),
                 ],
-                dst_ref=a2a_s_acc_stage_b32_x3_vmem.at[
+                dst_ref=a2a_s_acc_stage_x3_vmem.at[
                     buf_id,
                     pl.ds(0, token_tile),
+                    pl.ds(0, t_packing),
                     pl.ds(0, bd2_per_t_packing),
                 ],
                 sem=acc_stage_sems.at[buf_id],
@@ -1237,11 +1235,11 @@ def _fused_ep_moe_kernel(
 
         def wait_stage_a2a_s_acc_tile(buf_id):
             pltpu.make_async_copy(
-                src_ref=a2a_s_acc_stage_b32_x3_vmem.at[
+                src_ref=a2a_s_acc_stage_x3_vmem.at[
                     buf_id,
                     pl.ds(0, token_tile),
                 ],
-                dst_ref=a2a_s_acc_stage_b32_x3_vmem.at[
+                dst_ref=a2a_s_acc_stage_x3_vmem.at[
                     buf_id,
                     pl.ds(0, token_tile),
                 ],
@@ -1250,14 +1248,16 @@ def _fused_ep_moe_kernel(
 
         def start_store_stage_a2a_s_acc_tile_to_hbm(tile_start, bd2_start, buf_id):
             pltpu.make_async_copy(
-                src_ref=a2a_s_acc_stage_b32_x3_vmem.at[
+                src_ref=a2a_s_acc_stage_x3_vmem.at[
                     buf_id,
                     pl.ds(0, token_tile),
+                    pl.ds(0, t_packing),
                     pl.ds(0, bd2_per_t_packing),
                 ],
-                dst_ref=a2a_s_acc_b32_hbm.at[
+                dst_ref=a2a_s_acc_hbm.at[
                     e_sem_id,
                     pl.ds(tile_start, token_tile),
+                    pl.ds(0, t_packing),
                     pl.ds(bd2_start, bd2_per_t_packing),
                 ],
                 sem=acc_stage_sems.at[buf_id],
@@ -1315,7 +1315,9 @@ def _fused_ep_moe_kernel(
 
                     tile_sz = jnp.maximum(jnp.minimum(dyn_sz_i32 - tile_start, token_tile), 0)
                     dynamic_ffn1(
-                        t_b32_vmem=t_stage_b32_x2_vmem.at[token_buf_id],
+                        t_b32_vmem=t_stage_x2_vmem.at[token_buf_id]
+                        .bitcast(jnp.uint32)
+                        .reshape(token_tile, bd1_per_t_packing),
                         w1_vmem=w1_vmem,
                         w1_scale_vmem=w1_scale_vmem,
                         b1_vmem=b1_vmem,
@@ -1424,7 +1426,9 @@ def _fused_ep_moe_kernel(
                         w2_vmem=w2_vmem,
                         w2_scale_vmem=w2_scale_vmem,
                         b2_vmem=b2_vmem,
-                        res_b32_vmem=a2a_s_acc_stage_b32_x3_vmem.at[buf_compute],
+                        res_b32_vmem=a2a_s_acc_stage_x3_vmem.at[buf_compute]
+                        .bitcast(jnp.uint32)
+                        .reshape(token_tile, bd2_per_t_packing),
                         dyn_sz=tile_sz,
                         should_init=should_init_ffn2,
                     )
@@ -1991,8 +1995,11 @@ def fused_ep_moe(
         b3_scratch,  # b_b3_x2_vmem
         b2_scratch,  # b_b2_x2_vmem
         pltpu.VMEM((2, a2a_max_tokens, 1, block_config.bf), jnp.float32),  # b_acc_vmem
-        pltpu.VMEM((2, block_config.bts, bd1_per_pack), jnp.uint32),  # t_stage_b32_x2_vmem
-        pltpu.VMEM((3, block_config.bts, bd2_per_pack), jnp.uint32),  # a2a_s_acc_stage_b32_x3_vmem
+        pltpu.VMEM((2, block_config.bts, t_packing, bd1_per_pack), t_dtype),  # t_stage_x2_vmem
+        pltpu.VMEM(
+            (3, block_config.bts, t_packing, bd2_per_pack),
+            t_dtype,
+        ),  # a2a_s_acc_stage_x3_vmem
         # Semaphores.
         pltpu.SemaphoreType.DMA((2,)),  # token_stage_sems
         pltpu.SemaphoreType.DMA((3,)),  # acc_stage_sems
