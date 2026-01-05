@@ -748,29 +748,24 @@ def _fused_ep_moe_kernel(
         remote_sz = sz - local_sz
         is_valid = jnp.logical_and(local_e_id >= 0, local_e_id < local_num_experts)
         remote_sz = lax.select(is_valid, remote_sz, 0)
-        # Important: avoid using `a2a_g_hbm.reshape(...)` as the wait-handle.
-        # A dummy HBM self-copy can clobber in-flight/just-written gather buffers.
-        # Waiting via a disjoint buffer is safer and empirically preserves accuracy.
-        ref = a2a_s_x2_hbm.at[e_sem_id, pl.ds(0, remote_sz)]
+        # Important: use `a2a_g_hbm.reshape(...)` as the wait-handle so Mosaic
+        # can keep correct ordering between gather DMAs and later reads from
+        # `a2a_g_hbm` (waiting on an unrelated buffer can lead to reordering).
+        ref = a2a_g_hbm.reshape(num_experts * bt, t_packing, h_per_t_packing)
         pltpu.make_async_copy(
-            src_ref=ref,
-            dst_ref=ref,
+            src_ref=ref.at[pl.ds(0, remote_sz)],
+            dst_ref=ref.at[pl.ds(0, remote_sz)],
             sem=send_x2_sems.at[e_sem_id],
         ).wait()
 
     def wait_a2a_gather_recv_all(*, bt_size):
         if no_comm:
             return
-        # Same rationale as `wait_a2a_gather_send`: wait on the semaphore without
-        # touching `a2a_g_hbm` to avoid corrupting gathered tokens.
-        # Important: the waited-on slice size must match what the recv semaphore
-        # was signaled with (in bytes). For each `bt` tile, we receive exactly
-        # `bt * top_k` token vectors back onto this device.
         sz = jnp.int32(bt_size * top_k)
-        ref = a2a_s_x2_hbm.at[0, pl.ds(0, sz)]
+        ref = a2a_g_hbm.reshape(num_experts * bt, t_packing, h_per_t_packing)
         pltpu.make_async_copy(
-            src_ref=ref,
-            dst_ref=ref,
+            src_ref=ref.at[pl.ds(0, sz)],
+            dst_ref=ref.at[pl.ds(0, sz)],
             sem=a2a_gather_sem,
         ).wait()
 
