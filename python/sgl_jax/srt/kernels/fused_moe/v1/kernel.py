@@ -1264,93 +1264,103 @@ def _fused_ep_moe_kernel(
             ).start()
 
         def run_gate_up_slices(*, bf_id: int, bw_sem_id):
-            def prefetch_next_gate_up_or_down(*, bd1_id, bw_sem_id):
-                next_bw_sem_id = (bw_sem_id + jnp.int32(1)) & jnp.int32(1)
-                next_bd1_id = bd1_id + jnp.int32(1)
-
-                @pl.when(next_bd1_id < num_bd1)
-                def _():
-                    start_fetch_bw1(local_e_id, next_bw_sem_id, bf_id, next_bd1_id)
-                    start_fetch_bw3(local_e_id, next_bw_sem_id, bf_id, next_bd1_id)
-
-                @pl.when(next_bd1_id == num_bd1)
-                def _():
-                    start_fetch_bw2(local_e_id, next_bw_sem_id, bf_id, jnp.int32(0))
+            def with_static_bw(bw_sem_id, body):
+                return lax.cond(
+                    bw_sem_id == 0,
+                    lambda _: body(0),
+                    lambda _: body(1),
+                    operand=None,
+                )
 
             def run_gate_up_bd1(*, bd1_id, bw_sem_id, should_init_ffn1: bool):
-                prefetch_next_gate_up_or_down(bd1_id=bd1_id, bw_sem_id=bw_sem_id)
+                def body(bw_sem_id: int):
+                    next_bw_sem_id = 1 - bw_sem_id
+                    next_bd1_id = bd1_id + jnp.int32(1)
 
-                w1_scale_vmem = (
-                    None if b_w1_scale_x2_vmem is None else b_w1_scale_x2_vmem.at[bw_sem_id]
-                )
-                w3_scale_vmem = (
-                    None if b_w3_scale_x2_vmem is None else b_w3_scale_x2_vmem.at[bw_sem_id]
-                )
-                b1_vmem = None if b_b1_x2_vmem is None else b_b1_x2_vmem.at[bf_id % 2]
-                b3_vmem = None if b_b3_x2_vmem is None else b_b3_x2_vmem.at[bf_id % 2]
+                    @pl.when(next_bd1_id < num_bd1)
+                    def _():
+                        start_fetch_bw1(local_e_id, next_bw_sem_id, bf_id, next_bd1_id)
+                        start_fetch_bw3(local_e_id, next_bw_sem_id, bf_id, next_bd1_id)
 
-                wait_fetch_bw1(local_e_id, bw_sem_id, bf_id, bd1_id)
-                wait_fetch_bw3(local_e_id, bw_sem_id, bf_id, bd1_id)
-                w1_vmem = b_w1_x2_vmem.at[bw_sem_id]
-                w3_vmem = b_w3_x2_vmem.at[bw_sem_id]
+                    @pl.when(next_bd1_id == num_bd1)
+                    def _():
+                        start_fetch_bw2(local_e_id, next_bw_sem_id, bf_id, jnp.int32(0))
 
-                # Double-buffer token staging from HBM -> VMEM to overlap with FFN1 compute.
-                # Note: a2a_s_hbm is already double-buffered by e_sem_id.
-                @pl.when(num_token_tiles > 0)
-                def _(bd1_id=bd1_id):
-                    start_stage_a2a_s_tile_from_hbm(jnp.int32(0), bd1_id, jnp.int32(0))
+                    w1_scale_vmem = (
+                        None if b_w1_scale_x2_vmem is None else b_w1_scale_x2_vmem.at[bw_sem_id]
+                    )
+                    w3_scale_vmem = (
+                        None if b_w3_scale_x2_vmem is None else b_w3_scale_x2_vmem.at[bw_sem_id]
+                    )
+                    b1_vmem = None if b_b1_x2_vmem is None else b_b1_x2_vmem.at[bf_id % 2]
+                    b3_vmem = None if b_b3_x2_vmem is None else b_b3_x2_vmem.at[bf_id % 2]
 
-                def run_ffn1_tile(
-                    token_tile_id,
-                    token_buf_id,
-                    num_token_tiles=num_token_tiles,
-                    token_tile=token_tile,
-                    dyn_sz_i32=dyn_sz_i32,
-                    bd1_id=bd1_id,
-                    w1_vmem=w1_vmem,
-                    w1_scale_vmem=w1_scale_vmem,
-                    b1_vmem=b1_vmem,
-                    w3_vmem=w3_vmem,
-                    w3_scale_vmem=w3_scale_vmem,
-                    b3_vmem=b3_vmem,
-                    should_init_ffn1=should_init_ffn1,
-                ):
-                    tile_start = token_tile_id * token_tile
+                    wait_fetch_bw1(local_e_id, bw_sem_id, bf_id, bd1_id)
+                    wait_fetch_bw3(local_e_id, bw_sem_id, bf_id, bd1_id)
+                    w1_vmem = b_w1_x2_vmem.at[bw_sem_id]
+                    w3_vmem = b_w3_x2_vmem.at[bw_sem_id]
 
-                    next_tile_id = token_tile_id + 1
-                    next_buf_id = token_buf_id ^ jnp.int32(1)
-                    next_start = next_tile_id * token_tile
+                    # Double-buffer token staging from HBM -> VMEM to overlap with FFN1 compute.
+                    # Note: a2a_s_hbm is already double-buffered by e_sem_id.
+                    @pl.when(num_token_tiles > 0)
+                    def _(bd1_id=bd1_id):
+                        start_stage_a2a_s_tile_from_hbm(jnp.int32(0), bd1_id, jnp.int32(0))
 
-                    @pl.when(next_tile_id < num_token_tiles)
-                    def _prefetch(next_start=next_start, next_buf_id=next_buf_id, bd1_id=bd1_id):
-                        start_stage_a2a_s_tile_from_hbm(next_start, bd1_id, next_buf_id)
-
-                    wait_stage_a2a_s_tile(token_buf_id)
-
-                    tile_sz = jnp.maximum(jnp.minimum(dyn_sz_i32 - tile_start, token_tile), 0)
-                    dynamic_ffn1(
-                        t_b32_vmem=t_stage_b32_x2_vmem.at[token_buf_id],
+                    def run_ffn1_tile(
+                        token_tile_id,
+                        token_buf_id,
+                        num_token_tiles=num_token_tiles,
+                        token_tile=token_tile,
+                        dyn_sz_i32=dyn_sz_i32,
+                        bd1_id=bd1_id,
                         w1_vmem=w1_vmem,
                         w1_scale_vmem=w1_scale_vmem,
                         b1_vmem=b1_vmem,
                         w3_vmem=w3_vmem,
                         w3_scale_vmem=w3_scale_vmem,
                         b3_vmem=b3_vmem,
-                        acc1_vmem=b_acc1_vmem.at[pl.ds(tile_start, token_tile)],
-                        acc3_vmem=b_acc3_vmem.at[pl.ds(tile_start, token_tile)],
-                        dyn_sz=tile_sz,
-                        should_init=should_init_ffn1,
-                    )
-                    return next_buf_id
+                        should_init_ffn1=should_init_ffn1,
+                    ):
+                        tile_start = token_tile_id * token_tile
 
-                lax.fori_loop(
-                    0,
-                    num_token_tiles,
-                    run_ffn1_tile,
-                    jnp.int32(0),
-                    unroll=False,
-                )
-                return (bw_sem_id + jnp.int32(1)) & jnp.int32(1)
+                        next_tile_id = token_tile_id + 1
+                        next_buf_id = token_buf_id ^ jnp.int32(1)
+                        next_start = next_tile_id * token_tile
+
+                        @pl.when(next_tile_id < num_token_tiles)
+                        def _prefetch(
+                            next_start=next_start, next_buf_id=next_buf_id, bd1_id=bd1_id
+                        ):
+                            start_stage_a2a_s_tile_from_hbm(next_start, bd1_id, next_buf_id)
+
+                        wait_stage_a2a_s_tile(token_buf_id)
+
+                        tile_sz = jnp.maximum(jnp.minimum(dyn_sz_i32 - tile_start, token_tile), 0)
+                        dynamic_ffn1(
+                            t_b32_vmem=t_stage_b32_x2_vmem.at[token_buf_id],
+                            w1_vmem=w1_vmem,
+                            w1_scale_vmem=w1_scale_vmem,
+                            b1_vmem=b1_vmem,
+                            w3_vmem=w3_vmem,
+                            w3_scale_vmem=w3_scale_vmem,
+                            b3_vmem=b3_vmem,
+                            acc1_vmem=b_acc1_vmem.at[pl.ds(tile_start, token_tile)],
+                            acc3_vmem=b_acc3_vmem.at[pl.ds(tile_start, token_tile)],
+                            dyn_sz=tile_sz,
+                            should_init=should_init_ffn1,
+                        )
+                        return next_buf_id
+
+                    lax.fori_loop(
+                        0,
+                        num_token_tiles,
+                        run_ffn1_tile,
+                        jnp.int32(0),
+                        unroll=False,
+                    )
+                    return jnp.int32(next_bw_sem_id)
+
+                return with_static_bw(bw_sem_id, body)
 
             if num_bd1 <= 0:
                 return bw_sem_id
@@ -1368,134 +1378,145 @@ def _fused_ep_moe_kernel(
         def run_down_slices(*, bf_id: int, bw_sem_id):
             should_init_ffn2 = bf_id == 0
 
-            def prefetch_next_down_or_next_gate_up(*, bd2_id, bw_sem_id):
-                next_bw_sem_id = (bw_sem_id + jnp.int32(1)) & jnp.int32(1)
-                next_bd2_id = bd2_id + jnp.int32(1)
-
-                @pl.when(next_bd2_id < num_bd2)
-                def _():
-                    start_fetch_bw2(local_e_id, next_bw_sem_id, bf_id, next_bd2_id)
-
-                if bf_id + 1 < num_bf:
-
-                    @pl.when(next_bd2_id == num_bd2)
-                    def _():
-                        start_fetch_bw1(local_e_id, next_bw_sem_id, bf_id + 1, jnp.int32(0))
-                        start_fetch_bw3(local_e_id, next_bw_sem_id, bf_id + 1, jnp.int32(0))
+            def with_static_bw(bw_sem_id, body):
+                return lax.cond(
+                    bw_sem_id == 0,
+                    lambda _: body(0),
+                    lambda _: body(1),
+                    operand=None,
+                )
 
             def run_down_bd2(bd2_id, bw_sem_id):
-                prefetch_next_down_or_next_gate_up(bd2_id=bd2_id, bw_sem_id=bw_sem_id)
-                wait_fetch_bw2(local_e_id, bw_sem_id, bf_id, bd2_id)
-                if should_init_ffn2:
+                def body(bw_sem_id: int):
+                    next_bw_sem_id = 1 - bw_sem_id
+                    next_bd2_id = bd2_id + jnp.int32(1)
 
-                    @pl.when(bd2_id == 0)
+                    @pl.when(next_bd2_id < num_bd2)
                     def _():
-                        wait_a2a_gather_send(
-                            bt_sem_id=bt_sem_id,
-                            e_sem_id=e_sem_id,
-                            local_e_id=local_e_id - 2,
-                        )
+                        start_fetch_bw2(local_e_id, next_bw_sem_id, bf_id, next_bd2_id)
 
-                w2_scale_vmem = (
-                    None if b_w2_scale_x2_vmem is None else b_w2_scale_x2_vmem.at[bw_sem_id]
-                )
-                b2_vmem = None if b_b2_x2_vmem is None else b_b2_x2_vmem.at[bd2_id & 1]
-                bd2_start = bd2_id * bd2_per_t_packing
-                w2_vmem = b_w2_x2_vmem.at[bw_sem_id]
+                    if bf_id + 1 < num_bf:
 
-                # Triple-buffer a2a_s_acc staging to overlap:
-                # - load(next tile) / compute(curr tile) / store(prev tile)
-                init_buf_compute = jnp.int32(0)
-                init_buf_store = jnp.int32(1)
-                init_buf_load = jnp.int32(2)
-                has_tiles = num_token_tiles > 0
+                        @pl.when(next_bd2_id == num_bd2)
+                        def _():
+                            start_fetch_bw1(local_e_id, next_bw_sem_id, bf_id + 1, jnp.int32(0))
+                            start_fetch_bw3(local_e_id, next_bw_sem_id, bf_id + 1, jnp.int32(0))
 
-                if not should_init_ffn2:
+                    wait_fetch_bw2(local_e_id, bw_sem_id, bf_id, bd2_id)
+                    if should_init_ffn2:
 
-                    @pl.when(has_tiles)
-                    def _(bd2_start=bd2_start, init_buf_compute=init_buf_compute):
-                        start_load_stage_a2a_s_acc_tile_from_hbm(
-                            jnp.int32(0), bd2_start, init_buf_compute
-                        )
-
-                def run_ffn2_tile(
-                    token_tile_id,
-                    state,
-                    *,
-                    bd2_start=bd2_start,
-                    token_tile=token_tile,
-                    dyn_sz_i32=dyn_sz_i32,
-                    num_token_tiles=num_token_tiles,
-                    w2_vmem=w2_vmem,
-                    w2_scale_vmem=w2_scale_vmem,
-                    b2_vmem=b2_vmem,
-                    should_init_ffn2=should_init_ffn2,
-                ):
-                    buf_compute, buf_store, buf_load = state
-                    tile_start = token_tile_id * token_tile
-                    tile_sz = jnp.maximum(jnp.minimum(dyn_sz_i32 - tile_start, token_tile), 0)
-
-                    # Prefetch next tile's accumulator (when accumulating across bf blocks).
-                    if not should_init_ffn2:
-                        do_prefetch = token_tile_id + 1 < num_token_tiles
-                        next_tile_start = (token_tile_id + 1) * token_tile
-
-                        # Triple-buffer ring:
-                        # - buf_compute holds the current tile's loaded accumulator
-                        # - buf_load holds the buffer from two tiles ago (store in-flight)
-                        # We only need to wait before reusing `buf_load` starting from tile 2.
-                        @pl.when(jnp.logical_and(do_prefetch, token_tile_id >= 2))
-                        def _(buf_load=buf_load):
-                            wait_stage_a2a_s_acc_tile(buf_load)
-
-                        @pl.when(do_prefetch)
-                        def _(
-                            next_tile_start=next_tile_start, bd2_start=bd2_start, buf_load=buf_load
-                        ):
-                            start_load_stage_a2a_s_acc_tile_from_hbm(
-                                next_tile_start, bd2_start, buf_load
+                        @pl.when(bd2_id == 0)
+                        def _():
+                            wait_a2a_gather_send(
+                                bt_sem_id=bt_sem_id,
+                                e_sem_id=e_sem_id,
+                                local_e_id=local_e_id - 2,
                             )
 
-                        # Ensure current tile's load has completed before compute.
-                        wait_stage_a2a_s_acc_tile(buf_compute)
-                    else:
-                        # When initializing (no loads), the only hazard is reusing a buffer that still
-                        # has an in-flight store from 3 tiles ago.
-                        @pl.when(token_tile_id >= 3)
-                        def _(buf_compute=buf_compute):
-                            wait_stage_a2a_s_acc_tile(buf_compute)
+                    w2_scale_vmem = (
+                        None if b_w2_scale_x2_vmem is None else b_w2_scale_x2_vmem.at[bw_sem_id]
+                    )
+                    b2_vmem = None if b_b2_x2_vmem is None else b_b2_x2_vmem.at[bd2_id & 1]
+                    bd2_start = bd2_id * bd2_per_t_packing
+                    w2_vmem = b_w2_x2_vmem.at[bw_sem_id]
 
-                    dynamic_ffn2(
-                        acc1_vmem=b_acc1_vmem.at[pl.ds(tile_start, token_tile)],
-                        acc3_vmem=b_acc3_vmem.at[pl.ds(tile_start, token_tile)],
+                    # Triple-buffer a2a_s_acc staging to overlap:
+                    # - load(next tile) / compute(curr tile) / store(prev tile)
+                    init_buf_compute = jnp.int32(0)
+                    init_buf_store = jnp.int32(1)
+                    init_buf_load = jnp.int32(2)
+                    has_tiles = num_token_tiles > 0
+
+                    if not should_init_ffn2:
+
+                        @pl.when(has_tiles)
+                        def _(bd2_start=bd2_start, init_buf_compute=init_buf_compute):
+                            start_load_stage_a2a_s_acc_tile_from_hbm(
+                                jnp.int32(0), bd2_start, init_buf_compute
+                            )
+
+                    def run_ffn2_tile(
+                        token_tile_id,
+                        state,
+                        *,
+                        bd2_start=bd2_start,
+                        token_tile=token_tile,
+                        dyn_sz_i32=dyn_sz_i32,
+                        num_token_tiles=num_token_tiles,
                         w2_vmem=w2_vmem,
                         w2_scale_vmem=w2_scale_vmem,
                         b2_vmem=b2_vmem,
-                        res_b32_vmem=a2a_s_acc_stage_b32_x3_vmem.at[buf_compute],
-                        dyn_sz=tile_sz,
-                        should_init=should_init_ffn2,
-                    )
-                    start_store_stage_a2a_s_acc_tile_to_hbm(tile_start, bd2_start, buf_compute)
-                    # Rotate buffers: compute <- load, store <- compute, load <- store.
-                    return (buf_load, buf_compute, buf_store)
+                        should_init_ffn2=should_init_ffn2,
+                    ):
+                        buf_compute, buf_store, buf_load = state
+                        tile_start = token_tile_id * token_tile
+                        tile_sz = jnp.maximum(jnp.minimum(dyn_sz_i32 - tile_start, token_tile), 0)
 
-                state = (init_buf_compute, init_buf_store, init_buf_load)
-                state = lax.fori_loop(0, num_token_tiles, run_ffn2_tile, state, unroll=False)
+                        # Prefetch next tile's accumulator (when accumulating across bf blocks).
+                        if not should_init_ffn2:
+                            do_prefetch = token_tile_id + 1 < num_token_tiles
+                            next_tile_start = (token_tile_id + 1) * token_tile
 
-                # Drain outstanding stores before the next bd2 slice / gather.
-                @pl.when(num_token_tiles >= 1)
-                def _():
-                    wait_stage_a2a_s_acc_tile(jnp.int32(0))
+                            # Triple-buffer ring:
+                            # - buf_compute holds the current tile's loaded accumulator
+                            # - buf_load holds the buffer from two tiles ago (store in-flight)
+                            # We only need to wait before reusing `buf_load` starting from tile 2.
+                            @pl.when(jnp.logical_and(do_prefetch, token_tile_id >= 2))
+                            def _(buf_load=buf_load):
+                                wait_stage_a2a_s_acc_tile(buf_load)
 
-                @pl.when(num_token_tiles >= 2)
-                def _():
-                    wait_stage_a2a_s_acc_tile(jnp.int32(2))
+                            @pl.when(do_prefetch)
+                            def _(
+                                next_tile_start=next_tile_start,
+                                bd2_start=bd2_start,
+                                buf_load=buf_load,
+                            ):
+                                start_load_stage_a2a_s_acc_tile_from_hbm(
+                                    next_tile_start, bd2_start, buf_load
+                                )
 
-                @pl.when(num_token_tiles >= 3)
-                def _():
-                    wait_stage_a2a_s_acc_tile(jnp.int32(1))
+                            # Ensure current tile's load has completed before compute.
+                            wait_stage_a2a_s_acc_tile(buf_compute)
+                        else:
+                            # When initializing (no loads), the only hazard is reusing a buffer that still
+                            # has an in-flight store from 3 tiles ago.
+                            @pl.when(token_tile_id >= 3)
+                            def _(buf_compute=buf_compute):
+                                wait_stage_a2a_s_acc_tile(buf_compute)
 
-                return (bw_sem_id + jnp.int32(1)) & jnp.int32(1)
+                        dynamic_ffn2(
+                            acc1_vmem=b_acc1_vmem.at[pl.ds(tile_start, token_tile)],
+                            acc3_vmem=b_acc3_vmem.at[pl.ds(tile_start, token_tile)],
+                            w2_vmem=w2_vmem,
+                            w2_scale_vmem=w2_scale_vmem,
+                            b2_vmem=b2_vmem,
+                            res_b32_vmem=a2a_s_acc_stage_b32_x3_vmem.at[buf_compute],
+                            dyn_sz=tile_sz,
+                            should_init=should_init_ffn2,
+                        )
+                        start_store_stage_a2a_s_acc_tile_to_hbm(tile_start, bd2_start, buf_compute)
+                        # Rotate buffers: compute <- load, store <- compute, load <- store.
+                        return (buf_load, buf_compute, buf_store)
+
+                    state = (init_buf_compute, init_buf_store, init_buf_load)
+                    state = lax.fori_loop(0, num_token_tiles, run_ffn2_tile, state, unroll=False)
+
+                    # Drain outstanding stores before the next bd2 slice / gather.
+                    @pl.when(num_token_tiles >= 1)
+                    def _():
+                        wait_stage_a2a_s_acc_tile(jnp.int32(0))
+
+                    @pl.when(num_token_tiles >= 2)
+                    def _():
+                        wait_stage_a2a_s_acc_tile(jnp.int32(2))
+
+                    @pl.when(num_token_tiles >= 3)
+                    def _():
+                        wait_stage_a2a_s_acc_tile(jnp.int32(1))
+
+                    return jnp.int32(next_bw_sem_id)
+
+                return with_static_bw(bw_sem_id, body)
 
             return lax.fori_loop(0, num_bd2, run_down_bd2, bw_sem_id, unroll=False)
 
