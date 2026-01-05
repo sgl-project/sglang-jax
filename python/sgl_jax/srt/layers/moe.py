@@ -174,7 +174,7 @@ class TopK(nnx.Module):
 class EPMoE(nnx.Module):
     def __init__(
         self,
-        config,
+        config, #PretrainedConfig
         num_experts: int,
         num_experts_per_tok: int,
         ep_size: int,
@@ -270,6 +270,7 @@ class EPMoE(nnx.Module):
                     P(None),
                     P(None),
                     P(None),
+                    # value
                     P("expert", None, "tensor"),
                     P("expert", None, "tensor"),
                     P("expert", "tensor", None),
@@ -290,7 +291,8 @@ class EPMoE(nnx.Module):
             result, jax.sharding.NamedSharding(self.original_mesh, output_pspec)
         )
 
-    def _forward(self, hidden_states, topk_weights, topk_ids, w0_weights, w1_weights, wo_weights):
+    def _forward(self, hidden_states, topk_weights, topk_ids, w0_weights, w1_weights, wo_weights,
+             w0_kernel_scale = None, w1_kernel_scale = None, wo_kernel_scale = None, w0_kernel_bias = None, w1_kernel_bias = None, wo_kernel_bias = None):
         expert_shard_id = jax.lax.axis_index("expert")
 
         if hidden_states.ndim == 2:
@@ -315,6 +317,7 @@ class EPMoE(nnx.Module):
             w1_weights,
             wo_weights,
             group_offset,
+            w0_kernel_scale, w1_kernel_scale, wo_kernel_scale, w0_kernel_bias, w1_kernel_bias, wo_kernel_bias,
         )
 
         if self.ep_size > 1:
@@ -329,7 +332,8 @@ class EPMoE(nnx.Module):
         )
         return output
 
-    def _gmm_compute(self, x, group_sizes, w0_kernel, w1_kernel, wo_kernel, group_offset):
+    def _gmm_compute(self, x, group_sizes, w0_kernel, w1_kernel, wo_kernel, group_offset,
+                     w0_kernel_scale = None, w1_kernel_scale = None, wo_kernel_scale = None, w0_kernel_bias = None, w1_kernel_bias = None, wo_kernel_bias = None):
         if x.shape[0] == 0:
             empty_output = jnp.zeros((0, wo_kernel.shape[-1]), dtype=x.dtype)
             return empty_output
@@ -357,6 +361,8 @@ class EPMoE(nnx.Module):
             rhs=w0_kernel,
             group_sizes=group_sizes,
             preferred_element_type=self.dtype,
+            rhs_scale=w0_kernel_scale,
+            rhs_bias=w0_kernel_bias,
             tiling=tiling_gate,
             group_offset=group_offset,
         )
@@ -366,6 +372,8 @@ class EPMoE(nnx.Module):
             rhs=w1_kernel,
             group_sizes=group_sizes,
             preferred_element_type=self.dtype,
+            rhs_scale=w1_kernel_scale,
+            rhs_bias=w1_kernel_bias,
             tiling=tiling_gate,
             group_offset=group_offset,
         )
@@ -383,6 +391,8 @@ class EPMoE(nnx.Module):
             rhs=wo_kernel,
             group_sizes=group_sizes,
             preferred_element_type=self.dtype,
+            rhs_scale=wo_kernel_scale,
+            rhs_bias=wo_kernel_bias,
             tiling=tiling_down,
             group_offset=group_offset,
         )
