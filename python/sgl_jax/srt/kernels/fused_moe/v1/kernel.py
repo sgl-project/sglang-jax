@@ -6,7 +6,6 @@ from __future__ import annotations
 
 import functools
 import math
-import zlib
 from dataclasses import dataclass
 
 import jax
@@ -54,11 +53,12 @@ class FusedMoEBlockConfig:
         t_packing = get_dtype_packing(dtype)
         local_num_tokens = num_tokens // ep_size
 
-        # `bt` is the outer token tile size used for expert-side processing and output tiling.
+        # `bt` is the outer token tile size used for routing/comm and output tiling.
+        # It must not exceed the local token count and must evenly divide it.
         # `bts` is the token tile size used inside expert_ffn for HBM<->VMEM staging and
         # inner GEMM batching. When unset, `bts` defaults to `bt`.
-        max_expert_tokens = local_num_tokens * ep_size
-        bt = min(self.bt, max_expert_tokens)
+        bt = min(self.bt, local_num_tokens)
+        bt = math.gcd(bt, local_num_tokens)
         bts = bt if self.bts is None else min(self.bts, bt)
         btc = min(self.btc, bts)
         if bts % btc != 0:
@@ -205,6 +205,8 @@ def validate_fused_moe_block_config(
         raise ValueError(f"Expected {local_num_tokens=} to be aligned to {t_packing=}.")
     if bt % t_packing != 0:
         raise ValueError(f"Expected {bt=} to be aligned to {t_packing=}.")
+    if local_num_tokens % bt != 0:
+        raise ValueError(f"Expected {local_num_tokens=} to be divisible by {bt=}.")
     if bts % t_packing != 0:
         raise ValueError(f"Expected {bts=} to be aligned to {t_packing=}.")
     if bts > bt:
@@ -364,24 +366,24 @@ def _fused_ep_moe_kernel(
     b2_hbm,  # None | F32(local_num_experts, 1, hidden_size)
     b3_hbm,  # None | F32(local_num_experts, 1, intermediate_size)
     gating_hbm,  # (local_num_tokens, padded_num_experts)
-    a2a_s_hbm,  # (2, align_to(output_bt * num_devices, bts), t_packing, hidden_size // t_packing)
-    a2a_s_acc_hbm,  # (2, align_to(output_bt * num_devices, bts), t_packing, hidden_size // t_packing)
-    a2a_g_hbm,  # (num_experts, output_bt, t_packing, hidden_size // t_packing)
+    a2a_s_x2_hbm,  # (2, align_to(bt * num_devices, bts), t_packing, hidden_size // t_packing)
+    a2a_s_acc_x2_hbm,  # (2, align_to(bt * num_devices, bts), t_packing, hidden_size // t_packing)
+    a2a_g_hbm,  # (num_experts, bt, t_packing, hidden_size // t_packing)
     # Output
     output_hbm,  # (local_num_tokens, hidden_size)
     # Scratch
-    t2e_routing_smem,  # (2, output_bt, padded_top_k)
-    d2e_count_smem,  # (2, num_devices, 1, padded_num_experts)
-    expert_offsets_smem,  # (2, 2, padded_num_experts): <bt_sem_id> x (a2a_s/a2a_g)
-    expert_starts_smem,  # (2, 1, padded_num_experts)
-    expert_sizes_smem,  # (2, 1, padded_num_experts)
+    t2e_routing_x2_smem,  # (2, bt, padded_top_k)
+    d2e_count_x2_smem,  # (2, num_devices, 1, padded_num_experts)
+    expert_offsets_x2_smem,  # (2, 2, padded_num_experts): <bt_sem_id> x (a2a_s/a2a_g)
+    expert_starts_x2_smem,  # (2, 1, padded_num_experts)
+    expert_sizes_x2_smem,  # (2, 1, padded_num_experts)
     a2a_s_sends_x2_smem,  # <e_sem_id> (2,)
     ### Accumulation for gathered tokens:
     a2a_g_acc_vmem,  # (1, top_k, acc_bt, t_packing, hidden_size // t_packing)
-    top_k_logits_vmem,  # F32(output_bt, top_k)
+    top_k_logits_vmem,  # F32(bt, top_k)
     ### Expert weight double buffering:
-    b_gating_vmem,  # (2, output_bt, padded_num_experts)
-    b_output_x2_vmem,  # (2, output_bt, t_packing, hidden_size // t_packing)
+    b_gating_x2_vmem,  # (2, bt, padded_num_experts)
+    b_output_x2_vmem,  # (2, bt, t_packing, hidden_size // t_packing)
     b_w1_x2_vmem,  # <bw_sem_id> (2, t_packing, bd1 // t_packing, bf)
     b_w3_x2_vmem,  # <bw_sem_id> (2, t_packing, bd1 // t_packing, bf)
     b_w2_x2_vmem,  # <bw_sem_id> (2, t_packing, bf, bd2 // t_packing)
@@ -391,15 +393,15 @@ def _fused_ep_moe_kernel(
     b_b1_x2_vmem,  # None | <bw_sem_id> (2, 1, bf)
     b_b3_x2_vmem,  # None | <bw_sem_id> (2, 1, bf)
     b_b2_x2_vmem,  # None | <bw_sem_id> (2, t_packing, 1, bd2 // t_packing)
-    b_acc_vmem,  # F32(2, align_to(output_bt * num_devices, bts), 1, bf)
+    b_acc_vmem,  # F32(2, align_to(bt * num_devices, bts), 1, bf)
     t_stage_x2_vmem,  # <token_buf_id> (2, bts, t_packing, bd1 // t_packing)
     a2a_s_acc_stage_x3_vmem,  # <acc_buf_id> (3, bts, t_packing, bd2 // t_packing)
     ### Semaphores:
-    token_stage_sems,  # DMA(2,): <token_buf_id>
-    acc_stage_sems,  # DMA(3,): <acc_buf_id>
+    token_stage_x2_sems,  # DMA(2,): <token_buf_id>
+    acc_stage_x3_sems,  # DMA(3,): <acc_buf_id>
     local_sems,  # (2, 5): weight ping-pong semaphores (plus gating/output on slot 0)
-    send_sems,  # <e_sem_id> (2,)
-    recv_sems,  # <e_sem_id> (2,)
+    send_x2_sems,  # <e_sem_id> (2,)
+    recv_x2_sems,  # <e_sem_id> (2,)
     a2a_gather_sem,
     a2a_acc_sems,  # DMA(1,)
     barrier_sem,
@@ -426,14 +428,14 @@ def _fused_ep_moe_kernel(
     num_devices = lax.axis_size(ep_axis_name)
     local_num_tokens = tokens_hbm.shape[0]
     local_num_experts, intermediate_size, hidden_size = w2_hbm.shape
-    output_bt = b_output_x2_vmem.shape[1]
-    assert local_num_tokens % output_bt == 0, (local_num_tokens, output_bt)
-    num_bt = local_num_tokens // output_bt
-    a2a_max_tokens = a2a_s_hbm.shape[1]
+    assert b_output_x2_vmem.shape[1] == bt, (b_output_x2_vmem.shape[1], bt)
+    assert local_num_tokens % bt == 0, (local_num_tokens, bt)
+    num_bt = local_num_tokens // bt
+    a2a_max_tokens = a2a_s_x2_hbm.shape[1]
     right_id = (my_id + 1) % num_devices
     num_experts = a2a_g_hbm.shape[0]
-    padded_num_experts = d2e_count_smem.shape[-1]
-    padded_top_k = t2e_routing_smem.shape[-1]
+    padded_num_experts = d2e_count_x2_smem.shape[-1]
+    padded_top_k = t2e_routing_x2_smem.shape[-1]
     assert padded_num_experts == align_to(num_experts, 128)
     assert padded_top_k == align_to(top_k, 128)
 
@@ -492,21 +494,14 @@ def _fused_ep_moe_kernel(
         pltpu.semaphore_wait(barrier_sem, num_devices)
 
     def start_fetch_b_gating(*, bt_id, priority=0):
-        bt_sem_id = (bt_id + jnp.int32(2)) & jnp.int32(1)
+        bt_sem_id = bt_id & jnp.int32(1)
         b_gating_sem = local_sems.at[bt_sem_id, 0]
-        bt_start = bt_id * output_bt
-        bt_size = output_bt
-        # Hint Mosaic about HBM tiling alignment for `tpu.memref_slice`:
-        # - f32 is typically tiled as (8, 128)
-        # - bf16/f16 is typically tiled as (16, 128)
-        # Using a dtype-derived factor is more robust than hardcoding 8.
-        gating_tile0 = 256 // (jnp.dtype(gating_hbm.dtype).itemsize * 8)
-        bt_start = (
-            pl.multiple_of(bt_start, gating_tile0) if bt_size % gating_tile0 == 0 else bt_start
-        )
+        is_valid = jnp.logical_and(bt_id >= 0, bt_id < num_bt)
+        sz = pl.multiple_of(lax.select(is_valid, bt, 0), bt)
+        bt_start = lax.select(is_valid, bt_id * bt, 0)
         pltpu.make_async_copy(
-            src_ref=gating_hbm.at[pl.ds(bt_start, bt_size)],
-            dst_ref=b_gating_vmem.at[bt_sem_id, pl.ds(0, bt_size)],
+            src_ref=gating_hbm.at[pl.ds(bt_start, sz)],
+            dst_ref=b_gating_x2_vmem.at[bt_sem_id, pl.ds(0, sz)],
             sem=b_gating_sem,
         ).start(priority=priority)
 
@@ -514,8 +509,8 @@ def _fused_ep_moe_kernel(
         bt_sem_id = bt_id & jnp.int32(1)
         b_gating_sem = local_sems.at[bt_sem_id, 0]
         pltpu.make_async_copy(
-            src_ref=b_gating_vmem.at[bt_sem_id],
-            dst_ref=b_gating_vmem.at[bt_sem_id],
+            src_ref=b_gating_x2_vmem.at[bt_sem_id],
+            dst_ref=b_gating_x2_vmem.at[bt_sem_id],
             sem=b_gating_sem,
         ).wait()
 
@@ -568,8 +563,8 @@ def _fused_ep_moe_kernel(
         return t2e_routing, expert_sizes, expert_starts
 
     def all_reduce_metadata(*, bt_sem_id, t2e_routing, starts, sizes):
-        send_sem = send_sems.at[0]
-        recv_sem = recv_sems.at[0]
+        send_sem = send_x2_sems.at[0]
+        recv_sem = recv_x2_sems.at[0]
 
         # All-reduce to accumulate starts and sizes and transfer to SMEM.
         def _all_reduce_metadata(
@@ -583,20 +578,20 @@ def _fused_ep_moe_kernel(
             # TODO(jevinjiang): check how slow is VMEM -> SMEM.
             offsets_copy = pltpu.async_copy(
                 src_ref=offsets_vmem,
-                dst_ref=expert_offsets_smem.at[bt_sem_id],
+                dst_ref=expert_offsets_x2_smem.at[bt_sem_id],
                 sem=send_sem,
             )
             t2e_routing_vmem[...] = t2e_routing
             t2e_routing_copy = pltpu.async_copy(
                 src_ref=t2e_routing_vmem,
-                dst_ref=t2e_routing_smem.at[bt_sem_id],
+                dst_ref=t2e_routing_x2_smem.at[bt_sem_id],
                 sem=send_sem,
             )
             if no_comm:
                 d2e_count_vmem[...] = jnp.zeros_like(d2e_count_vmem)
                 d2e_count_vmem[my_id] = sizes
                 sizes_vmem[...] = sizes
-                # Layout tokens packed in `a2a_s_hbm` as a local-only prefix sum.
+                # Layout tokens packed in `a2a_s_x2_hbm` as a local-only prefix sum.
                 starts_vmem[...] = jnp.cumsum(sizes_vmem, axis=1) - sizes_vmem
             else:
                 reduced_sizes = sizes
@@ -623,12 +618,12 @@ def _fused_ep_moe_kernel(
 
             starts_copy = pltpu.async_copy(
                 src_ref=starts_vmem,
-                dst_ref=expert_starts_smem.at[bt_sem_id],
+                dst_ref=expert_starts_x2_smem.at[bt_sem_id],
                 sem=send_sem,
             )
             sizes_copy = pltpu.async_copy(
                 src_ref=sizes_vmem,
-                dst_ref=expert_sizes_smem.at[bt_sem_id],
+                dst_ref=expert_sizes_x2_smem.at[bt_sem_id],
                 sem=send_sem,
             )
 
@@ -636,7 +631,7 @@ def _fused_ep_moe_kernel(
             # to SMEM partially.
             d2e_count_copy = pltpu.async_copy(
                 src_ref=d2e_count_vmem,
-                dst_ref=d2e_count_smem.at[bt_sem_id],
+                dst_ref=d2e_count_x2_smem.at[bt_sem_id],
                 sem=send_sem,
             )
 
@@ -648,44 +643,44 @@ def _fused_ep_moe_kernel(
 
         pl.run_scoped(
             _all_reduce_metadata,
-            pltpu.VMEM(t2e_routing_smem.shape[1:], t2e_routing_smem.dtype),
-            pltpu.VMEM(d2e_count_smem.shape[1:], d2e_count_smem.dtype),
-            pltpu.VMEM(expert_offsets_smem.shape[1:], expert_offsets_smem.dtype),
-            pltpu.VMEM(expert_starts_smem.shape[1:], expert_starts_smem.dtype),
-            pltpu.VMEM(expert_sizes_smem.shape[1:], expert_sizes_smem.dtype),
+            pltpu.VMEM(t2e_routing_x2_smem.shape[1:], t2e_routing_x2_smem.dtype),
+            pltpu.VMEM(d2e_count_x2_smem.shape[1:], d2e_count_x2_smem.dtype),
+            pltpu.VMEM(expert_offsets_x2_smem.shape[1:], expert_offsets_x2_smem.dtype),
+            pltpu.VMEM(expert_starts_x2_smem.shape[1:], expert_starts_x2_smem.dtype),
+            pltpu.VMEM(expert_sizes_x2_smem.shape[1:], expert_sizes_x2_smem.dtype),
         )
 
     def start_a2a_scatter(*, bt_sem_id, e_sem_id, local_e_id, bt_start):
         # Counting the number of remote sends from the current device.
-        # Use `lax.fori_loop` to avoid unrolling `output_bt` (huge MLIR / slow compile).
+        # Use `lax.fori_loop` to avoid unrolling `bt` (huge MLIR / slow compile).
         def _scatter_one(
             t_id, send_sz, e_sem_id=e_sem_id, local_e_id=local_e_id, bt_start=bt_start
         ):
             src_t_id = bt_start + t_id
             for k_id in range(top_k):
-                e_id = t2e_routing_smem[bt_sem_id, t_id, k_id]
+                e_id = t2e_routing_x2_smem[bt_sem_id, t_id, k_id]
                 is_active_expert = e_id % local_num_experts == local_e_id
                 recv_id = e_id // local_num_experts
-                offset = expert_offsets_smem[bt_sem_id, 0, e_id]
+                offset = expert_offsets_x2_smem[bt_sem_id, 0, e_id]
                 sz = lax.select(is_active_expert, jnp.int32(1), jnp.int32(0))
                 is_local = recv_id == my_id
                 local_sz = lax.select(is_local, sz, jnp.int32(0))
                 remote_sz = jnp.int32(0) if no_comm else lax.select(is_local, jnp.int32(0), sz)
                 send_sz += remote_sz
-                expert_offsets_smem[bt_sem_id, 0, e_id] = offset + local_sz + remote_sz
-                start = expert_starts_smem[bt_sem_id, 0, e_id] + offset
+                expert_offsets_x2_smem[bt_sem_id, 0, e_id] = offset + local_sz + remote_sz
+                start = expert_starts_x2_smem[bt_sem_id, 0, e_id] + offset
                 # TODO(jevinjiang): compare the perf when using branches.
                 pltpu.make_async_copy(
                     src_ref=tokens_hbm.at[pl.ds(src_t_id, local_sz)],
-                    dst_ref=a2a_s_hbm.at[e_sem_id, pl.ds(start, local_sz)],
-                    sem=recv_sems.at[e_sem_id],
+                    dst_ref=a2a_s_x2_hbm.at[e_sem_id, pl.ds(start, local_sz)],
+                    sem=recv_x2_sems.at[e_sem_id],
                 ).start()
                 if not no_comm:
                     pltpu.make_async_remote_copy(
                         src_ref=tokens_hbm.at[pl.ds(src_t_id, remote_sz)],
-                        dst_ref=a2a_s_hbm.at[e_sem_id, pl.ds(start, remote_sz)],
-                        send_sem=send_sems.at[e_sem_id],
-                        recv_sem=recv_sems.at[e_sem_id],
+                        dst_ref=a2a_s_x2_hbm.at[e_sem_id, pl.ds(start, remote_sz)],
+                        send_sem=send_x2_sems.at[e_sem_id],
+                        recv_sem=recv_x2_sems.at[e_sem_id],
                         device_id=get_mesh_device_id(recv_id),
                         device_id_type=pltpu.DeviceIdType.MESH,
                     ).start()
@@ -693,7 +688,7 @@ def _fused_ep_moe_kernel(
 
         send_sz = lax.fori_loop(
             0,
-            output_bt,
+            bt,
             _scatter_one,
             jnp.int32(0),
             unroll=False,
@@ -702,11 +697,11 @@ def _fused_ep_moe_kernel(
 
     def wait_a2a_scatter_recv(*, bt_sem_id, e_sem_id, local_e_id):
         e_id = my_id * local_num_experts + local_e_id
-        sz = expert_sizes_smem[bt_sem_id, 0, e_id]
+        sz = expert_sizes_x2_smem[bt_sem_id, 0, e_id]
         pltpu.make_async_copy(
-            src_ref=a2a_s_hbm.at[e_sem_id, pl.ds(0, sz)],
-            dst_ref=a2a_s_hbm.at[e_sem_id, pl.ds(0, sz)],
-            sem=recv_sems.at[e_sem_id],
+            src_ref=a2a_s_x2_hbm.at[e_sem_id, pl.ds(0, sz)],
+            dst_ref=a2a_s_x2_hbm.at[e_sem_id, pl.ds(0, sz)],
+            sem=recv_x2_sems.at[e_sem_id],
         ).wait()
 
     def wait_a2a_scatter_send(e_sem_id):
@@ -714,17 +709,17 @@ def _fused_ep_moe_kernel(
             return
         sz = a2a_s_sends_x2_smem[e_sem_id]
         pltpu.make_async_copy(
-            src_ref=a2a_s_hbm.at[e_sem_id, pl.ds(0, sz)],
-            dst_ref=a2a_s_hbm.at[e_sem_id, pl.ds(0, sz)],
-            sem=send_sems.at[e_sem_id],
+            src_ref=a2a_s_x2_hbm.at[e_sem_id, pl.ds(0, sz)],
+            dst_ref=a2a_s_x2_hbm.at[e_sem_id, pl.ds(0, sz)],
+            sem=send_x2_sems.at[e_sem_id],
         ).wait()
 
     def start_a2a_gather(*, bt_sem_id, e_sem_id, local_e_id):
         my_e_id = my_id * local_num_experts + local_e_id
         start = 0
-        src_ref = a2a_s_hbm if a2a_only else a2a_s_acc_hbm
+        src_ref = a2a_s_x2_hbm if a2a_only else a2a_s_acc_x2_hbm
         for recv_id in range(num_devices):
-            sz = d2e_count_smem[bt_sem_id, recv_id, 0, my_e_id]
+            sz = d2e_count_x2_smem[bt_sem_id, recv_id, 0, my_e_id]
             is_local = recv_id == my_id
             local_sz = lax.select(is_local, sz, 0)
             remote_sz = jnp.int32(0) if no_comm else lax.select(is_local, 0, sz)
@@ -737,7 +732,7 @@ def _fused_ep_moe_kernel(
                 pltpu.make_async_remote_copy(
                     src_ref=src_ref.at[e_sem_id, pl.ds(start, remote_sz)],
                     dst_ref=a2a_g_hbm.at[my_e_id, pl.ds(0, remote_sz)],
-                    send_sem=send_sems.at[e_sem_id],
+                    send_sem=send_x2_sems.at[e_sem_id],
                     recv_sem=a2a_gather_sem,
                     device_id=get_mesh_device_id(recv_id),
                     device_id_type=pltpu.DeviceIdType.MESH,
@@ -748,26 +743,30 @@ def _fused_ep_moe_kernel(
         if no_comm:
             return
         my_e_id = my_id * local_num_experts + local_e_id
-        sz = expert_sizes_smem[bt_sem_id, 0, my_e_id]
-        local_sz = d2e_count_smem[bt_sem_id, my_id, 0, my_e_id]
+        sz = expert_sizes_x2_smem[bt_sem_id, 0, my_e_id]
+        local_sz = d2e_count_x2_smem[bt_sem_id, my_id, 0, my_e_id]
         remote_sz = sz - local_sz
         is_valid = jnp.logical_and(local_e_id >= 0, local_e_id < local_num_experts)
         remote_sz = lax.select(is_valid, remote_sz, 0)
-        ref = a2a_g_hbm.reshape(-1, t_packing, hidden_size // t_packing)
+        # Important: avoid using `a2a_g_hbm.reshape(...)` as the wait-handle.
+        # A dummy HBM self-copy can clobber in-flight/just-written gather buffers.
+        # Waiting via a disjoint buffer is safer and empirically preserves accuracy.
+        ref = a2a_s_x2_hbm.at[e_sem_id, pl.ds(0, remote_sz)]
         pltpu.make_async_copy(
-            src_ref=ref.at[pl.ds(0, remote_sz)],
-            dst_ref=ref.at[pl.ds(0, remote_sz)],
-            sem=send_sems.at[e_sem_id],
+            src_ref=ref,
+            dst_ref=ref,
+            sem=send_x2_sems.at[e_sem_id],
         ).wait()
 
-    def wait_a2a_gather_recv_all(*, bt_size):
+    def wait_a2a_gather_recv_all():
         if no_comm:
             return
-        sz = top_k * bt_size
-        ref = a2a_g_hbm.reshape(-1, t_packing, hidden_size // t_packing)
+        # Same rationale as `wait_a2a_gather_send`: wait on the semaphore without
+        # touching `a2a_g_hbm` to avoid corrupting gathered tokens.
+        ref = a2a_s_x2_hbm.at[0, pl.ds(0, 1)]
         pltpu.make_async_copy(
-            src_ref=ref.at[pl.ds(0, sz)],
-            dst_ref=ref.at[pl.ds(0, sz)],
+            src_ref=ref,
+            dst_ref=ref,
             sem=a2a_gather_sem,
         ).wait()
 
@@ -1141,7 +1140,7 @@ def _fused_ep_moe_kernel(
         b_acc3_vmem = b_acc_vmem_2d.at[1]
 
         e_id = my_id * local_num_experts + local_e_id
-        dyn_sz = expert_sizes_smem[bt_sem_id, 0, e_id]
+        dyn_sz = expert_sizes_x2_smem[bt_sem_id, 0, e_id]
         dyn_sz_i32 = dyn_sz.astype(jnp.int32)
 
         bd1_per_t_packing = bd1 // t_packing
@@ -1153,7 +1152,7 @@ def _fused_ep_moe_kernel(
 
         def start_stage_a2a_s_tile_from_hbm(tile_start, bd1_id, buf_id):
             pltpu.make_async_copy(
-                src_ref=a2a_s_hbm.at[
+                src_ref=a2a_s_x2_hbm.at[
                     e_sem_id,
                     pl.ds(tile_start, token_tile),
                     pl.ds(0, t_packing),
@@ -1165,19 +1164,19 @@ def _fused_ep_moe_kernel(
                     pl.ds(0, t_packing),
                     pl.ds(0, bd1_per_t_packing),
                 ],
-                sem=token_stage_sems.at[buf_id],
+                sem=token_stage_x2_sems.at[buf_id],
             ).start()
 
         def wait_stage_a2a_s_tile(buf_id):
             pltpu.make_async_copy(
                 src_ref=t_stage_x2_vmem.at[buf_id, pl.ds(0, token_tile)],
                 dst_ref=t_stage_x2_vmem.at[buf_id, pl.ds(0, token_tile)],
-                sem=token_stage_sems.at[buf_id],
+                sem=token_stage_x2_sems.at[buf_id],
             ).wait()
 
         def start_load_stage_a2a_s_acc_tile_from_hbm(tile_start, bd2_start, buf_id):
             pltpu.make_async_copy(
-                src_ref=a2a_s_acc_hbm.at[
+                src_ref=a2a_s_acc_x2_hbm.at[
                     e_sem_id,
                     pl.ds(tile_start, token_tile),
                     pl.ds(0, t_packing),
@@ -1189,7 +1188,7 @@ def _fused_ep_moe_kernel(
                     pl.ds(0, t_packing),
                     pl.ds(0, bd2_per_t_packing),
                 ],
-                sem=acc_stage_sems.at[buf_id],
+                sem=acc_stage_x3_sems.at[buf_id],
             ).start()
 
         def wait_stage_a2a_s_acc_tile(buf_id):
@@ -1202,7 +1201,7 @@ def _fused_ep_moe_kernel(
                     buf_id,
                     pl.ds(0, token_tile),
                 ],
-                sem=acc_stage_sems.at[buf_id],
+                sem=acc_stage_x3_sems.at[buf_id],
             ).wait()
 
         def start_store_stage_a2a_s_acc_tile_to_hbm(tile_start, bd2_start, buf_id):
@@ -1213,13 +1212,13 @@ def _fused_ep_moe_kernel(
                     pl.ds(0, t_packing),
                     pl.ds(0, bd2_per_t_packing),
                 ],
-                dst_ref=a2a_s_acc_hbm.at[
+                dst_ref=a2a_s_acc_x2_hbm.at[
                     e_sem_id,
                     pl.ds(tile_start, token_tile),
                     pl.ds(0, t_packing),
                     pl.ds(bd2_start, bd2_per_t_packing),
                 ],
-                sem=acc_stage_sems.at[buf_id],
+                sem=acc_stage_x3_sems.at[buf_id],
             ).start()
 
         for bf_id in range(num_bf):
@@ -1240,7 +1239,7 @@ def _fused_ep_moe_kernel(
                 should_init_ffn1 = bd1_id == 0
 
                 # Double-buffer token staging from HBM -> VMEM to overlap with FFN1 compute.
-                # Note: a2a_s_hbm is already double-buffered by e_sem_id.
+                # Note: a2a_s_x2_hbm is already double-buffered by e_sem_id.
                 @pl.when(num_token_tiles > 0)
                 def _(bd1_id=bd1_id):
                     start_stage_a2a_s_tile_from_hbm(0, bd1_id, 0)
@@ -1411,15 +1410,15 @@ def _fused_ep_moe_kernel(
 
     def acc_and_store_output(*, bt_sem_id, out_buf_id):
         acc_bt = a2a_g_acc_vmem.shape[2]
-        assert output_bt % acc_bt == 0, (output_bt, acc_bt)
+        assert bt % acc_bt == 0, (bt, acc_bt)
 
         def load_acc_bt_sync(*, tile_start):
             def _load_one(t_i, _):
                 t_id = tile_start + t_i
                 for k_id in range(top_k):
-                    e_id = t2e_routing_smem[bt_sem_id, t_id, k_id]
-                    offset = expert_offsets_smem[bt_sem_id, 1, e_id]
-                    expert_offsets_smem[bt_sem_id, 1, e_id] = offset + 1
+                    e_id = t2e_routing_x2_smem[bt_sem_id, t_id, k_id]
+                    offset = expert_offsets_x2_smem[bt_sem_id, 1, e_id]
+                    expert_offsets_x2_smem[bt_sem_id, 1, e_id] = offset + 1
                     pltpu.make_async_copy(
                         src_ref=a2a_g_hbm.at[e_id, pl.ds(offset, 1)],
                         dst_ref=a2a_g_acc_vmem.at[0, k_id, pl.ds(t_i, 1)],
@@ -1450,7 +1449,7 @@ def _fused_ep_moe_kernel(
                 output_hbm.dtype
             )
 
-        num_acc_tiles = output_bt // acc_bt
+        num_acc_tiles = bt // acc_bt
 
         def run_acc_tile(acc_tile_idx, _):
             acc_tile_start = acc_tile_idx * acc_bt
@@ -1474,18 +1473,18 @@ def _fused_ep_moe_kernel(
 
     def start_send_bo(*, bt_id, priority=0):
         bt_sem_id = bt_id & jnp.int32(1)
-        bt_start = bt_id * output_bt
+        bt_start = bt_id * bt
         b_output_sem = local_sems.at[bt_sem_id, 4]
-        b_output_flat = b_output_x2_vmem.reshape(2, output_bt, hidden_size)
+        b_output_flat = b_output_x2_vmem.reshape(2, bt, hidden_size)
         pltpu.make_async_copy(
-            src_ref=b_output_flat.at[bt_sem_id, pl.ds(0, output_bt), pl.ds(0, hidden_size)],
-            dst_ref=output_hbm.at[pl.ds(bt_start, output_bt), pl.ds(0, hidden_size)],
+            src_ref=b_output_flat.at[bt_sem_id, pl.ds(0, bt), pl.ds(0, hidden_size)],
+            dst_ref=output_hbm.at[pl.ds(bt_start, bt), pl.ds(0, hidden_size)],
             sem=b_output_sem,
         ).start(priority=priority)
 
     def wait_store_output(*, bt_id):
         is_valid = jnp.logical_and(bt_id >= 0, bt_id < num_bt)
-        sz = pl.multiple_of(lax.select(is_valid, jnp.int32(output_bt), jnp.int32(0)), output_bt)
+        sz = pl.multiple_of(lax.select(is_valid, jnp.int32(bt), jnp.int32(0)), bt)
         bt_sem_id = (bt_id + jnp.int32(2)) & jnp.int32(1)
         pltpu.make_async_copy(
             src_ref=output_hbm.at[pl.ds(0, sz)],
@@ -1546,7 +1545,7 @@ def _fused_ep_moe_kernel(
         start_fetch_b_gating(bt_id=jnp.int32(0))
 
     def run_bt(bt_id, e_sem_id):
-        bt_start = bt_id * output_bt
+        bt_start = bt_id * bt
         bt_sem_id = bt_id & jnp.int32(1)
         next_bt_id = bt_id + jnp.int32(1)
 
@@ -1556,7 +1555,7 @@ def _fused_ep_moe_kernel(
 
         wait_fetch_b_gating(bt_id=bt_id)
 
-        b_gating = b_gating_vmem.at[bt_sem_id][...]
+        b_gating = b_gating_x2_vmem.at[bt_sem_id][...]
         if no_comm:
             # Force local-only routing so the kernel can execute end-to-end without EP communication.
             e0 = my_id * local_num_experts
@@ -1597,7 +1596,7 @@ def _fused_ep_moe_kernel(
         )
 
         # Wait to receive a2a gather for ALL experts before consuming `a2a_g_hbm`.
-        wait_a2a_gather_recv_all(bt_size=output_bt)
+        wait_a2a_gather_recv_all()
         sync_barrier()
 
         out_buf_id = bt_id & jnp.int32(1)
@@ -1804,7 +1803,6 @@ def fused_ep_moe(
     ep_axis_name: str = "tensor",
     a2a_only: bool = False,
     no_comm: bool = False,
-    collective_id: int | None = None,
 ):
     ep_size = mesh.shape[ep_axis_name]
     if block_config is None:
@@ -1852,17 +1850,17 @@ def fused_ep_moe(
     num_experts, intermediate_size, _ = w2.shape
 
     local_num_tokens = num_tokens // ep_size
-    output_bt = math.gcd(block_config.bt, local_num_tokens)
-    if output_bt <= 0:
-        raise ValueError(f"Expected {output_bt=} to be > 0.")
+    bt = block_config.bt
+    if bt <= 0:
+        raise ValueError(f"Expected {bt=} to be > 0.")
     padded_num_experts = align_to(num_experts, 128)
     padded_top_k = align_to(top_k, 128)
     t_dtype = tokens.dtype
     gating_dtype = gating_output.dtype
     t_packing = get_dtype_packing(t_dtype)
     hidden_per_pack = hidden_size // t_packing
-    # With run_bt tiling in the pallas kernel, a2a scratch only needs to cover one output_bt tile.
-    a2a_max_tokens = align_to(output_bt * num_devices, block_config.bts)
+    # With run_bt tiling in the pallas kernel, a2a scratch only needs to cover one bt tile.
+    a2a_max_tokens = align_to(bt * num_devices, block_config.bts)
     bd1_per_pack = block_config.bd1 // t_packing
     bd2_per_pack = block_config.bd2 // t_packing
 
@@ -1897,24 +1895,7 @@ def fused_ep_moe(
         f"fused-moe-k_{top_k}{renorm_str}"
         f"-bt_{block_config.bt}_{block_config.bts}_{block_config.btc}-bf_{block_config.bf}_{block_config.bfc}"
         f"-bd1_{block_config.bd1}_{block_config.bd1c}-bd2_{block_config.bd2}_{block_config.bd2c}"
-        "-a2a_s_hbm-a2a_s_acc_hbm"
     )
-
-    if collective_id is None:
-        # Remote DMA / semaphore ops are backed by global on-device resources; if
-        # multiple compiled programs execute concurrently, a non-unique
-        # `collective_id` can cause cross-program interference.
-        payload = (
-            f"fused_moe_v1|{scope_name}"
-            f"|tokens={tuple(tokens.shape)}"
-            f"|w1={tuple(w1.shape)}|w2={tuple(w2.shape)}|w3={tuple(w3.shape)}"
-            f"|gating={tuple(gating_output.shape)}"
-            f"|dtype={t_dtype}|gating_dtype={gating_dtype}"
-            f"|ep_axis={ep_axis_name}|ep_size={ep_size}"
-            f"|subc_quant_wsz={subc_quant_wsz}"
-        )
-        collective_id = zlib.crc32(payload.encode("utf-8")) & 0x7FFFFFFF
-        collective_id = 1 if collective_id == 0 else collective_id
 
     w1_scale_scratch = None
     if w1_scale is not None:
@@ -1944,20 +1925,20 @@ def fused_ep_moe(
     b2_scratch = None if b2 is None else pltpu.VMEM((2, t_packing, 1, bd2_per_pack), jnp.float32)
     scratch_shapes = (
         # Routing / metadata.
-        pltpu.SMEM((2, output_bt, padded_top_k), jnp.int32),  # t2e_routing_smem
-        pltpu.SMEM((2, num_devices, 1, padded_num_experts), jnp.int32),  # d2e_count_smem
-        pltpu.SMEM((2, 2, padded_num_experts), jnp.int32),  # expert_offsets_smem
-        pltpu.SMEM((2, 1, padded_num_experts), jnp.int32),  # expert_starts_smem
-        pltpu.SMEM((2, 1, padded_num_experts), jnp.int32),  # expert_sizes_smem
+        pltpu.SMEM((2, bt, padded_top_k), jnp.int32),  # t2e_routing_x2_smem
+        pltpu.SMEM((2, num_devices, 1, padded_num_experts), jnp.int32),  # d2e_count_x2_smem
+        pltpu.SMEM((2, 2, padded_num_experts), jnp.int32),  # expert_offsets_x2_smem
+        pltpu.SMEM((2, 1, padded_num_experts), jnp.int32),  # expert_starts_x2_smem
+        pltpu.SMEM((2, 1, padded_num_experts), jnp.int32),  # expert_sizes_x2_smem
         pltpu.SMEM((2,), jnp.int32),  # a2a_s_sends_x2_smem
         pltpu.VMEM(
-            (1, top_k, math.gcd(output_bt, 8), t_packing, hidden_per_pack),
+            (1, top_k, math.gcd(bt, 8), t_packing, hidden_per_pack),
             t_dtype,
         ),  # a2a_g_acc_vmem
-        pltpu.VMEM((output_bt, top_k), jnp.float32),  # top_k_logits_vmem
+        pltpu.VMEM((bt, top_k), jnp.float32),  # top_k_logits_vmem
         # Expert compute scratch.
-        pltpu.VMEM((2, output_bt, padded_num_experts), gating_dtype),  # b_gating_vmem
-        pltpu.VMEM((2, output_bt, t_packing, hidden_per_pack), t_dtype),  # b_output_x2_vmem
+        pltpu.VMEM((2, bt, padded_num_experts), gating_dtype),  # b_gating_x2_vmem
+        pltpu.VMEM((2, bt, t_packing, hidden_per_pack), t_dtype),  # b_output_x2_vmem
         pltpu.VMEM((2, t_packing, bd1_per_pack, block_config.bf), w1.dtype),  # b_w1_x2_vmem
         pltpu.VMEM((2, t_packing, bd1_per_pack, block_config.bf), w3.dtype),  # b_w3_x2_vmem
         pltpu.VMEM((2, t_packing, block_config.bf, bd2_per_pack), w2.dtype),  # b_w2_x2_vmem
@@ -1974,11 +1955,11 @@ def fused_ep_moe(
             t_dtype,
         ),  # a2a_s_acc_stage_x3_vmem
         # Semaphores.
-        pltpu.SemaphoreType.DMA((2,)),  # token_stage_sems
-        pltpu.SemaphoreType.DMA((3,)),  # acc_stage_sems
+        pltpu.SemaphoreType.DMA((2,)),  # token_stage_x2_sems
+        pltpu.SemaphoreType.DMA((3,)),  # acc_stage_x3_sems
         pltpu.SemaphoreType.DMA((2, 5)),  # local_sems
-        pltpu.SemaphoreType.DMA((2,)),  # send_sems
-        pltpu.SemaphoreType.DMA((2,)),  # recv_sems
+        pltpu.SemaphoreType.DMA((2,)),  # send_x2_sems
+        pltpu.SemaphoreType.DMA((2,)),  # recv_x2_sems
         pltpu.SemaphoreType.DMA,  # a2a_gather_sem
         pltpu.SemaphoreType.DMA((1,)),  # a2a_acc_sems
         pltpu.SemaphoreType.BARRIER,  # barrier_sem
@@ -1994,7 +1975,7 @@ def fused_ep_moe(
                 a2a_only=a2a_only,
                 no_comm=no_comm,
                 subc_quant_wsz=subc_quant_wsz,
-                bt=block_config.bt,
+                bt=bt,
                 bf=block_config.bf,
                 bd1=block_config.bd1,
                 bd2=block_config.bd2,
@@ -2019,15 +2000,15 @@ def fused_ep_moe(
                     None if b2 is None else hbm_block_spec,  # b2_hbm
                     None if b3 is None else hbm_block_spec,  # b3_hbm
                     hbm_block_spec,  # gating_output_hbm
-                    hbm_block_spec,  # a2a_s_hbm
-                    hbm_block_spec,  # a2a_s_acc_hbm
+                    hbm_block_spec,  # a2a_s_x2_hbm
+                    hbm_block_spec,  # a2a_s_acc_x2_hbm
                     hbm_block_spec,  # a2a_g_hbm
                 ],
                 out_specs=pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),
                 scratch_shapes=scratch_shapes,
             ),
             compiler_params=pltpu.CompilerParams(
-                collective_id=collective_id,
+                collective_id=0,
                 allow_collective_id_without_custom_barrier=True,
                 has_side_effects=True,
                 # TPU VMEM is 64MiB per core; requesting more is invalid and can
@@ -2053,8 +2034,8 @@ def fused_ep_moe(
             None if b2 is None else P(ep_axis_name),  # b2_hbm
             None if b3 is None else P(ep_axis_name),  # b3_hbm
             P(ep_axis_name),  # gating_output_hbm
-            P(),  # a2a_s_hbm
-            P(),  # a2a_s_acc_hbm
+            P(),  # a2a_s_x2_hbm
+            P(),  # a2a_s_acc_x2_hbm
             P(),  # a2a_g_hbm
         ),
         out_specs=P(ep_axis_name),
@@ -2072,8 +2053,8 @@ def fused_ep_moe(
         b2,
         b3,
         gating_output,
-        a2a_s_hbm_scratch,
-        a2a_s_acc_hbm_scratch,
+        a2a_s_x2_hbm_scratch,
+        a2a_s_acc_x2_hbm_scratch,
         a2a_g_hbm_scratch,
     ):
         local_output = fused_moe(
@@ -2100,19 +2081,21 @@ def fused_ep_moe(
             (None if b2 is None else pltpu.with_memory_space_constraint(b2, pltpu.HBM)),  # b2_hbm
             (None if b3 is None else pltpu.with_memory_space_constraint(b3, pltpu.HBM)),  # b3_hbm
             pltpu.with_memory_space_constraint(gating_output, pltpu.HBM),  # gating_output_hbm
-            pltpu.with_memory_space_constraint(a2a_s_hbm_scratch, pltpu.HBM),  # a2a_s_hbm
-            pltpu.with_memory_space_constraint(a2a_s_acc_hbm_scratch, pltpu.HBM),  # a2a_s_acc_hbm
+            pltpu.with_memory_space_constraint(a2a_s_x2_hbm_scratch, pltpu.HBM),  # a2a_s_x2_hbm
+            pltpu.with_memory_space_constraint(
+                a2a_s_acc_x2_hbm_scratch, pltpu.HBM
+            ),  # a2a_s_acc_x2_hbm
             pltpu.with_memory_space_constraint(a2a_g_hbm_scratch, pltpu.HBM),  # a2a_g_hbm
         )
         return local_output
 
-    a2a_s_hbm_scratch = pl.empty((2, a2a_max_tokens, t_packing, hidden_size // t_packing), t_dtype)
-    a2a_s_acc_hbm_scratch = pl.empty(
+    a2a_s_x2_hbm_scratch = pl.empty(
         (2, a2a_max_tokens, t_packing, hidden_size // t_packing), t_dtype
     )
-    a2a_g_hbm_scratch = pl.empty(
-        (num_experts, output_bt, t_packing, hidden_size // t_packing), t_dtype
+    a2a_s_acc_x2_hbm_scratch = pl.empty(
+        (2, a2a_max_tokens, t_packing, hidden_size // t_packing), t_dtype
     )
+    a2a_g_hbm_scratch = pl.empty((num_experts, bt, t_packing, hidden_size // t_packing), t_dtype)
     return kernel(
         tokens,
         w1,
@@ -2125,7 +2108,7 @@ def fused_ep_moe(
         b2,
         b3,
         gating_output,
-        a2a_s_hbm_scratch,
-        a2a_s_acc_hbm_scratch,
+        a2a_s_x2_hbm_scratch,
+        a2a_s_acc_x2_hbm_scratch,
         a2a_g_hbm_scratch,
     )
