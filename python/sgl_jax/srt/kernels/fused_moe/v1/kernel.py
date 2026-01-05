@@ -1428,7 +1428,7 @@ def _fused_ep_moe_kernel(
             bw_sem_id = run_gate_up_slices(bf_id=bf_id, bw_sem_id=bw_sem_id)
             bw_sem_id = run_down_slices(bf_id=bf_id, bw_sem_id=bw_sem_id)
 
-    def acc_and_store_output(*, bt_sem_id, out_buf_id, b_gating_score):
+    def acc_and_store_output(*, bt_sem_id, out_buf_id):
         acc_bt = a2a_g_acc_vmem.shape[2]
         assert bt % acc_bt == 0, (bt, acc_bt)
 
@@ -1456,28 +1456,10 @@ def _fused_ep_moe_kernel(
         def bt_acc_acc_bt(*, tile_start, out_offset):
             # Vectorized per-(acc_bt) reduction to avoid dynamic_slice in TPU TC lowering.
             output_tile = jnp.zeros((acc_bt, t_packing, h_per_t_packing), dtype=jnp.float32)
-            # Gather per-token routing logits from the softmax gating scores using the routed expert ids.
-            # This avoids relying on the auxiliary `top_k_logits_vmem` materialization, which can be
-            # error-prone under retiling/VMEM slice semantics.
-            logits_tile = jnp.zeros((acc_bt, top_k), dtype=jnp.float32)
-
-            def _fill_one_t(t_i, logits_tile):
-                t_id = tile_start + t_i
-
-                def _fill_one_k(k_id, logits_tile):
-                    e_id = t2e_routing_x2_smem[bt_sem_id, t_id, k_id]
-                    logits_tile = logits_tile.at[t_i, k_id].set(b_gating_score[t_id, e_id])
-                    return logits_tile
-
-                return lax.fori_loop(0, top_k, _fill_one_k, logits_tile, unroll=False)
-
-            logits_tile = lax.fori_loop(0, acc_bt, _fill_one_t, logits_tile, unroll=False)
-
-            if renormalize_topk_logits:
-                denom = jnp.sum(logits_tile, axis=1, keepdims=True)
-                denom = jnp.where(denom == 0, jnp.ones_like(denom), denom)
-                logits_tile = logits_tile / denom
-
+            logits_tile = top_k_logits_vmem.at[
+                pl.ds(tile_start, acc_bt),
+                pl.ds(0, top_k),
+            ][...]
             for k_id in range(top_k):
                 acc_tile = a2a_g_acc_vmem[0, k_id, :acc_bt].astype(jnp.float32)
                 logits = logits_tile[:, k_id].reshape(acc_bt, 1, 1)
@@ -1534,6 +1516,7 @@ def _fused_ep_moe_kernel(
     sync_barrier()
 
     def run_per_expert(local_e_id, e_sem_id, *, bt_sem_id, bt_start):
+        sync_barrier()
         if not a2a_only:
             # Prefetch weights for CURRENT active expert.
             # TODO(jevinjiang): It is hard to prefetch weights in previous iteration
@@ -1576,7 +1559,6 @@ def _fused_ep_moe_kernel(
 
         # A must-wait before next sync_barrier.
         wait_a2a_scatter_send(e_sem_id)
-        sync_barrier()
         return next_e_sem_id
 
     if num_bt >= 1:
@@ -1640,11 +1622,7 @@ def _fused_ep_moe_kernel(
         out_buf_id = bt_id & jnp.int32(1)
         wait_store_output(bt_id=bt_id - 2)
         # Accumulate results for current bt into b_output_x2_vmem, then start async send to output_hbm.
-        acc_and_store_output(
-            bt_sem_id=bt_sem_id,
-            out_buf_id=out_buf_id,
-            b_gating_score=b_gating_score,
-        )
+        acc_and_store_output(bt_sem_id=bt_sem_id, out_buf_id=out_buf_id)
         start_send_bo(bt_id=bt_id)
 
         # Drain the last outstanding gather sends (the loop body waits `local_e_id - 2`).
