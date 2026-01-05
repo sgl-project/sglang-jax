@@ -748,24 +748,28 @@ def _fused_ep_moe_kernel(
         remote_sz = sz - local_sz
         is_valid = jnp.logical_and(local_e_id >= 0, local_e_id < local_num_experts)
         remote_sz = lax.select(is_valid, remote_sz, 0)
-        # Important: use `a2a_g_hbm.reshape(...)` as the wait-handle so Mosaic
-        # can keep correct ordering between gather DMAs and later reads from
-        # `a2a_g_hbm` (waiting on an unrelated buffer can lead to reordering).
-        ref = a2a_g_hbm.reshape(num_experts * bt, t_packing, h_per_t_packing)
+        # Important: wait via `a2a_g_hbm` itself (matches f5b4) so reads from
+        # `a2a_g_hbm` can't be reordered before the gather completes.
+        ref = a2a_g_hbm.at[0, pl.ds(0, remote_sz)]
         pltpu.make_async_copy(
-            src_ref=ref.at[pl.ds(0, remote_sz)],
-            dst_ref=ref.at[pl.ds(0, remote_sz)],
+            src_ref=ref,
+            dst_ref=ref,
             sem=send_x2_sems.at[e_sem_id],
         ).wait()
 
     def wait_a2a_gather_recv_all(*, bt_size):
         if no_comm:
             return
-        sz = jnp.int32(bt_size * top_k)
-        ref = a2a_g_hbm.reshape(num_experts * bt, t_packing, h_per_t_packing)
+        # Consume the full gather semaphore for this bt tile: total gathered token
+        # vectors is exactly `bt_size * top_k`.
+        #
+        # Use a slice of `a2a_g_hbm` (not a reshape view) to match f5b4-style
+        # dependency and avoid issues with using a reshaped HBM ref as DMA dst.
+        assert top_k <= num_experts, (top_k, num_experts)
+        ref = a2a_g_hbm.at[pl.ds(0, top_k), pl.ds(0, bt_size)]
         pltpu.make_async_copy(
-            src_ref=ref.at[pl.ds(0, sz)],
-            dst_ref=ref.at[pl.ds(0, sz)],
+            src_ref=ref,
+            dst_ref=ref,
             sem=a2a_gather_sem,
         ).wait()
 
