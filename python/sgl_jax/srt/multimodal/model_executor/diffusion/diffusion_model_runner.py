@@ -33,8 +33,8 @@ class DiffusionModelRunner(BaseModelRunner):
             download_dir=server_args.download_dir,
         )
         # self.model_loader = get_model_loader(load_config, mesh)
-        # hack here to use JAXModelLoader directly
         self.model_loader = JAXModelLoader(load_config, mesh)
+
         self.transformer_model = None
         self.transformer_2_model = None
         self.solver = None

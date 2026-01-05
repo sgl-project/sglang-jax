@@ -12,7 +12,31 @@ from sgl_jax.srt.multimodal.layers.layernorm import (
 from sgl_jax.srt.multimodal.layers.linear import ReplicatedLinear
 from sgl_jax.srt.multimodal.layers.mlp import MLP
 from sgl_jax.srt.multimodal.layers.rotary_embedding import NDRotaryEmbedding
-from sgl_jax.srt.multimodal.layers.visual_embedding import PatchEmbed
+from sgl_jax.srt.multimodal.layers.visual_embedding import (
+    ModulateProjection,
+    PatchEmbed,
+    TimestepEmbedder,
+)
+
+
+class WanImageEmbedding(nnx.Module):
+    def __init__(self, in_features: int, out_features: int):
+        super().__init__()
+
+        self.norm1 = FP32LayerNorm(in_features)
+        self.ff = MLP(in_features, in_features, out_features, act_type="gelu")
+        self.norm2 = FP32LayerNorm(out_features)
+
+    def __call__(self, x: jax.Array) -> jax.Array:
+        """
+        Args:
+            x: Input tensor of shape (B, L, C) -> Channel Last
+        """
+        origin_dtype = x.dtype
+        x = self.norm1(x)
+        x = self.ff(x)
+        x = self.norm2(x).astype(origin_dtype)
+        return x
 
 
 class WanTransformerBlock(nnx.Module):
@@ -98,7 +122,7 @@ class WanTransformerBlock(nnx.Module):
 
         self.scale_shift_table = nnx.Param(jax.random.randn(1, 6, dim) / dim**0.5)
 
-    def call(
+    def __call__(
         self,
         hidden_states: jax.Array,
         encoder_hidden_states: jax.Array,
@@ -221,7 +245,7 @@ class WanSelfAttention(nnx.Module):
             causal=False,
         )
 
-    def call(self, x: jax.Array, context: jax.Array, context_lens: int):
+    def __call__(self, x: jax.Array, context: jax.Array, context_lens: int):
         r"""
         Args:
             x(Tensor): Shape [B, L, num_heads, C / num_heads]
@@ -234,7 +258,7 @@ class WanSelfAttention(nnx.Module):
 
 class WanT2VCrossAttention(WanSelfAttention):
 
-    def call(self, x, context, context_lens, crossattn_cache=None):
+    def __call__(self, x, context, context_lens, crossattn_cache=None):
         r"""
         Args:
             x(Tensor): Shape [B, L1, C]
@@ -292,7 +316,7 @@ class WanI2VCrossAttention(WanSelfAttention):
         self.norm_added_k = RMSNorm(dim, epsilon=epsilon)
         self.norm_added_q = RMSNorm(dim, epsilon=epsilon)
 
-    def call(self, x, context, context_lens):
+    def __call__(self, x, context, context_lens):
         r"""
         Args:
             x(Tensor): Shape [B, L1, C]
@@ -322,10 +346,45 @@ class WanI2VCrossAttention(WanSelfAttention):
 
 
 class WanTimeTextImageEmbedding(nnx.Module):
-    pass
+
+    def __init__(
+        self,
+        dim: int,
+        time_freq_dim: int,
+        text_embed_dim: int,
+        image_embed_dim: int | None = None,
+    ):
+        super().__init__()
+
+        self.time_embedder = TimestepEmbedder(
+            dim, frequency_embedding_size=time_freq_dim, act_layer="silu"
+        )
+        self.time_modulation = ModulateProjection(dim, factor=6, act_layer="silu")
+        self.text_embedder = MLP(text_embed_dim, dim, dim, bias=True, act_type="gelu_pytorch_tanh")
+
+        self.image_embedder = None
+        if image_embed_dim is not None:
+            self.image_embedder = WanImageEmbedding(image_embed_dim, dim)
+
+    def forward(
+        self,
+        timestep: jax.Array,
+        encoder_hidden_states: jax.Array,
+        encoder_hidden_states_image: jax.Array | None = None,
+        timestep_seq_len: int | None = None,
+    ):
+        temb = self.time_embedder(timestep, timestep_seq_len)
+        timestep_proj = self.time_modulation(temb)
+
+        encoder_hidden_states = self.text_embedder(encoder_hidden_states)
+        if encoder_hidden_states_image is not None:
+            assert self.image_embedder is not None
+            encoder_hidden_states_image = self.image_embedder(encoder_hidden_states_image)
+
+        return temb, timestep_proj, encoder_hidden_states, encoder_hidden_states_image
 
 
-class WanTransformer3DModel:
+class WanTransformer3DModel(nnx.Module):
     def __init__(self, config):
         self.patch_size = config.patch_size
         self.hidden_size = config.hidden_dim
@@ -374,7 +433,7 @@ class WanTransformer3DModel:
         )
         pass
 
-    def call(
+    def __call__(
         self,
         hidden_states: jax.Array,
         encoder_hidden_states: jax.Array | list[jax.Array],
