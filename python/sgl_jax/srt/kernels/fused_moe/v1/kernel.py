@@ -383,7 +383,7 @@ def _fused_ep_moe_kernel(
     top_k_logits_vmem,  # F32(bt, top_k)
     ### Expert weight double buffering:
     b_gating_x2_vmem,  # (2, bt, padded_num_experts)
-    b_output_x2_vmem,  # (2, bt, t_packing, hidden_size // t_packing)
+    b_output_x2_vmem,  # (2, bt, hidden_size)
     b_w1_x2_vmem,  # <bw_sem_id> (2, t_packing, bd1 // t_packing, bf)
     b_w3_x2_vmem,  # <bw_sem_id> (2, t_packing, bd1 // t_packing, bf)
     b_w2_x2_vmem,  # <bw_sem_id> (2, t_packing, bf, bd2 // t_packing)
@@ -1465,9 +1465,9 @@ def _fused_ep_moe_kernel(
                 logits = logits_tile[:, k_id].reshape(acc_bt, 1, 1)
                 output_tile += acc_tile * logits
 
-            b_output_x2_vmem.at[out_buf_id, pl.ds(out_offset, acc_bt)][...] = output_tile.astype(
-                output_hbm.dtype
-            )
+            b_output_x2_vmem.at[out_buf_id, pl.ds(out_offset, acc_bt), pl.ds(0, hidden_size)][
+                ...
+            ] = output_tile.reshape(acc_bt, hidden_size).astype(output_hbm.dtype)
 
         num_acc_tiles = bt // acc_bt
 
@@ -1495,17 +1495,11 @@ def _fused_ep_moe_kernel(
         bt_sem_id = bt_id & jnp.int32(1)
         bt_start = bt_id * bt
         b_output_sem = local_sems.at[bt_sem_id, 4]
-        # Copy packed output (bt, t_packing, hidden/t_packing) into the flat HBM output buffer.
-        # Using per-pack DMAs avoids relying on reshape views of HBM/VMEM refs.
-        for p_id in range(t_packing):
-            offset = p_id * h_per_t_packing
-            pltpu.make_async_copy(
-                src_ref=b_output_x2_vmem.at[
-                    bt_sem_id, pl.ds(0, bt), p_id, pl.ds(0, h_per_t_packing)
-                ],
-                dst_ref=output_hbm.at[pl.ds(bt_start, bt), pl.ds(offset, h_per_t_packing)],
-                sem=b_output_sem,
-            ).start(priority=priority)
+        pltpu.make_async_copy(
+            src_ref=b_output_x2_vmem.at[bt_sem_id],
+            dst_ref=output_hbm.at[pl.ds(bt_start, bt)],
+            sem=b_output_sem,
+        ).start(priority=priority)
 
     def wait_store_output(*, bt_id):
         is_valid = jnp.logical_and(bt_id >= 0, bt_id < num_bt)
@@ -1958,7 +1952,7 @@ def fused_ep_moe(
         pltpu.VMEM((bt, top_k), jnp.float32),  # top_k_logits_vmem
         # Expert compute scratch.
         pltpu.VMEM((2, bt, padded_num_experts), gating_dtype),  # b_gating_x2_vmem
-        pltpu.VMEM((2, bt, t_packing, hidden_per_pack), t_dtype),  # b_output_x2_vmem
+        pltpu.VMEM((2, bt, hidden_size), t_dtype),  # b_output_x2_vmem
         pltpu.VMEM((2, t_packing, bd1_per_pack, block_config.bf), w1.dtype),  # b_w1_x2_vmem
         pltpu.VMEM((2, t_packing, bd1_per_pack, block_config.bf), w3.dtype),  # b_w3_x2_vmem
         pltpu.VMEM((2, t_packing, block_config.bf, bd2_per_pack), w2.dtype),  # b_w2_x2_vmem
