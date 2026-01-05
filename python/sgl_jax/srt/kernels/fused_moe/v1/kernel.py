@@ -1495,12 +1495,17 @@ def _fused_ep_moe_kernel(
         bt_sem_id = bt_id & jnp.int32(1)
         bt_start = bt_id * bt
         b_output_sem = local_sems.at[bt_sem_id, 4]
-        b_output_flat = b_output_x2_vmem.reshape(2, bt, hidden_size)
-        pltpu.make_async_copy(
-            src_ref=b_output_flat.at[bt_sem_id, pl.ds(0, bt), pl.ds(0, hidden_size)],
-            dst_ref=output_hbm.at[pl.ds(bt_start, bt), pl.ds(0, hidden_size)],
-            sem=b_output_sem,
-        ).start(priority=priority)
+        # Copy packed output (bt, t_packing, hidden/t_packing) into the flat HBM output buffer.
+        # Using per-pack DMAs avoids relying on reshape views of HBM/VMEM refs.
+        for p_id in range(t_packing):
+            offset = p_id * h_per_t_packing
+            pltpu.make_async_copy(
+                src_ref=b_output_x2_vmem.at[
+                    bt_sem_id, pl.ds(0, bt), p_id, pl.ds(0, h_per_t_packing)
+                ],
+                dst_ref=output_hbm.at[pl.ds(bt_start, bt), pl.ds(offset, h_per_t_packing)],
+                sem=b_output_sem,
+            ).start(priority=priority)
 
     def wait_store_output(*, bt_id):
         is_valid = jnp.logical_and(bt_id >= 0, bt_id < num_bt)
