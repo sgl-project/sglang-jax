@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import functools
 import math
+import zlib
 from dataclasses import dataclass
 
 import jax
@@ -1815,6 +1816,7 @@ def _validate_fused_ep_moe_args(
         "act_fn",
         "a2a_only",
         "no_comm",
+        "collective_id",
         "subc_quant_wsz",
         "block_config",
         "ep_axis_name",
@@ -1848,6 +1850,7 @@ def fused_ep_moe(
     ep_axis_name: str = "tensor",
     a2a_only: bool = False,
     no_comm: bool = False,
+    collective_id: int | None = None,
 ):
     ep_size = mesh.shape[ep_axis_name]
     if block_config is None:
@@ -1942,6 +1945,22 @@ def fused_ep_moe(
         f"-bd1_{block_config.bd1}_{block_config.bd1c}-bd2_{block_config.bd2}_{block_config.bd2c}"
         "-a2a_s_hbm-a2a_s_acc_hbm"
     )
+
+    if collective_id is None:
+        # Remote DMA / semaphore ops are backed by global on-device resources; if
+        # multiple compiled programs execute concurrently, a non-unique
+        # `collective_id` can cause cross-program interference.
+        payload = (
+            f"fused_moe_v1|{scope_name}"
+            f"|tokens={tuple(tokens.shape)}"
+            f"|w1={tuple(w1.shape)}|w2={tuple(w2.shape)}|w3={tuple(w3.shape)}"
+            f"|gating={tuple(gating_output.shape)}"
+            f"|dtype={t_dtype}|gating_dtype={gating_dtype}"
+            f"|ep_axis={ep_axis_name}|ep_size={ep_size}"
+            f"|subc_quant_wsz={subc_quant_wsz}"
+        )
+        collective_id = zlib.crc32(payload.encode("utf-8")) & 0x7FFFFFFF
+        collective_id = 1 if collective_id == 0 else collective_id
 
     w1_scale_scratch = None
     if w1_scale is not None:
@@ -2054,11 +2073,12 @@ def fused_ep_moe(
                 scratch_shapes=scratch_shapes,
             ),
             compiler_params=pltpu.CompilerParams(
+                collective_id=collective_id,
+                allow_collective_id_without_custom_barrier=True,
+                has_side_effects=True,
                 # TPU VMEM is 64MiB per core; requesting more is invalid and can
                 # crash compilation/runtime on some platforms.
-                vmem_limit_bytes=64
-                * 1024
-                * 1024,
+                vmem_limit_bytes=64 * 1024 * 1024,
             ),
             name=scope_name,
         )
