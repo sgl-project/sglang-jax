@@ -615,8 +615,9 @@ def _fused_ep_moe_kernel(
             if no_comm:
                 d2e_count_vmem[...] = jnp.zeros_like(d2e_count_vmem)
                 d2e_count_vmem[my_id] = sizes
-                starts_vmem[...] = jnp.zeros_like(starts_vmem)
                 sizes_vmem[...] = sizes
+                # Layout tokens packed in `a2a_s_hbm` as a local-only prefix sum.
+                starts_vmem[...] = jnp.cumsum(sizes_vmem, axis=1) - sizes_vmem
             else:
                 reduced_sizes = sizes
                 reduced_starts = starts
@@ -729,6 +730,8 @@ def _fused_ep_moe_kernel(
         ).wait()
 
     def wait_a2a_scatter_send(e_sem_id):
+        if no_comm:
+            return
         sz = a2a_s_sends_x2_smem[e_sem_id]
         pltpu.make_async_copy(
             src_ref=a2a_s_hbm.at[e_sem_id, pl.ds(0, sz)],
@@ -762,6 +765,8 @@ def _fused_ep_moe_kernel(
             start += sz
 
     def wait_a2a_gather_send(*, bt_sem_id, e_sem_id, local_e_id):
+        if no_comm:
+            return
         my_e_id = my_id * local_num_experts + local_e_id
         sz = expert_sizes_smem[bt_sem_id, 0, my_e_id]
         local_sz = d2e_count_smem[bt_sem_id, my_id, 0, my_e_id]
@@ -776,6 +781,8 @@ def _fused_ep_moe_kernel(
         ).wait()
 
     def wait_a2a_gather_recv_all(*, bt_size):
+        if no_comm:
+            return
         sz = top_k * bt_size
         ref = a2a_g_hbm.reshape(-1, t_packing, hidden_size // t_packing)
         pltpu.make_async_copy(
@@ -1592,6 +1599,13 @@ def _fused_ep_moe_kernel(
         wait_fetch_b_gating(bt_id=bt_id)
 
         b_gating = b_gating_vmem.at[bt_sem_id][...]
+        if no_comm:
+            # Force local-only routing so the kernel can execute end-to-end without EP communication.
+            e0 = my_id * local_num_experts
+            e1 = e0 + local_num_experts
+            expert_iota = jax.lax.broadcasted_iota(jnp.int32, (padded_num_experts,), 0)
+            is_local_expert = jnp.logical_and(expert_iota >= e0, expert_iota < e1)
+            b_gating = jnp.where(is_local_expert, b_gating, jnp.array(-jnp.inf, b_gating.dtype))
         b_gating_score = jax.nn.softmax(b_gating, axis=-1)
         t2e_routing, expert_sizes, expert_starts = get_top_k(
             b_gating_score,
