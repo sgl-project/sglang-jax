@@ -1256,15 +1256,13 @@ def _fused_ep_moe_kernel(
                     w3_vmem = b_w3_x2_vmem.at[bw_sem_id]
 
                     # Double-buffer token staging from HBM -> VMEM to overlap with FFN1 compute.
-                    # Note: a2a_s_x2_hbm is already double-buffered by e_sem_id.
-                    @pl.when(num_token_tiles > 0)
-                    def _(bd1_id=bd1_id):
-                        start_stage_a2a_s_tile_from_hbm(0, bd1_id, 0)
+                    # Temporarily run synchronously (no overlap) to rule out staging/semaphore hazards.
+                    token_buf_id = jnp.int32(0)
 
                     def run_ffn1_tile(
                         token_tile_id,
-                        token_buf_id,
-                        num_token_tiles=num_token_tiles,
+                        _,
+                        *,
                         token_tile=token_tile,
                         dyn_sz_i32=dyn_sz_i32,
                         bd1_id=bd1_id,
@@ -1275,19 +1273,10 @@ def _fused_ep_moe_kernel(
                         w3_scale_vmem=w3_scale_vmem,
                         b3_vmem=b3_vmem,
                         should_init_ffn1=should_init_ffn1,
+                        token_buf_id=token_buf_id,
                     ):
                         tile_start = token_tile_id * token_tile
-
-                        next_tile_id = token_tile_id + 1
-                        next_buf_id = token_buf_id ^ jnp.int32(1)
-                        next_start = next_tile_id * token_tile
-
-                        @pl.when(next_tile_id < num_token_tiles)
-                        def _prefetch(
-                            next_start=next_start, next_buf_id=next_buf_id, bd1_id=bd1_id
-                        ):
-                            start_stage_a2a_s_tile_from_hbm(next_start, bd1_id, next_buf_id)
-
+                        start_stage_a2a_s_tile_from_hbm(tile_start, bd1_id, token_buf_id)
                         wait_stage_a2a_s_tile(token_buf_id)
 
                         tile_sz = jnp.maximum(jnp.minimum(dyn_sz_i32 - tile_start, token_tile), 0)
@@ -1304,15 +1293,9 @@ def _fused_ep_moe_kernel(
                             dyn_sz=tile_sz,
                             should_init=should_init_ffn1,
                         )
-                        return next_buf_id
+                        return None
 
-                    lax.fori_loop(
-                        0,
-                        num_token_tiles,
-                        run_ffn1_tile,
-                        jnp.int32(0),
-                        unroll=False,
-                    )
+                    lax.fori_loop(0, num_token_tiles, run_ffn1_tile, None, unroll=False)
                     return jnp.int32(next_bw_sem_id)
 
                 return with_static_bw(bw_sem_id, body)
