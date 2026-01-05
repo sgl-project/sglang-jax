@@ -64,25 +64,25 @@ def gen_moe_inputs(
     else:
         b1 = b2 = b3 = None
 
-    gating_output = (
-        jax.random.normal(k7, (num_tokens, num_experts), dtype=jnp.float32)
-        + jnp.arange(num_tokens * num_experts, dtype=jnp.float32).reshape(num_tokens, num_experts)
-        / 100
-    )
+    # Construct gating logits with deterministic, strictly-ordered top-k per token.
+    #
+    # Important: avoid BF16 quantization ties in gating logits; otherwise different
+    # top-k implementations (kernel vs `lax.top_k`) can legitimately pick different
+    # experts among equal logits, causing large output diffs.
+    gating_output = jax.random.normal(k7, (num_tokens, num_experts), dtype=jnp.float32)
 
-    # To generate unique top-k!
-    top_k_indices = jax.random.randint(
-        k8, (num_tokens, top_k), minval=0, maxval=num_experts - 1, dtype=jnp.int32
-    )
+    # Generate unique top-k indices per token (sample without replacement).
+    token_keys = jax.random.split(k8, num_tokens)
+    top_k_indices = jax.vmap(lambda kk: jax.random.permutation(kk, num_experts)[:top_k])(
+        token_keys
+    ).astype(jnp.int32)
 
-    one_hot = (
-        jnp.sum(
-            jax.nn.one_hot(top_k_indices, num_experts, dtype=jnp.float32),
-            axis=1,
-        )
-        * 30
+    # Add a strictly decreasing boost so top-1 > top-2 > ... > top-k, all well above the rest.
+    boosts = (30.0 - jnp.arange(top_k, dtype=jnp.float32)).reshape(1, top_k)
+    one_hot = jnp.sum(
+        jax.nn.one_hot(top_k_indices, num_experts, dtype=jnp.float32) * boosts[..., None],
+        axis=1,
     )
-
     gating_output = (gating_output + one_hot).astype(dtype)
 
     return a, w1, w2, w3, b1, b2, b3, gating_output
