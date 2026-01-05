@@ -1465,6 +1465,7 @@ def _fused_ep_moe_kernel(
                 logits = logits_tile[:, k_id].reshape(acc_bt, 1, 1)
                 output_tile += acc_tile * logits
 
+            out_offset = pl.multiple_of(out_offset, 16)
             b_output_x2_vmem.at[out_buf_id, pl.ds(out_offset, acc_bt), pl.ds(0, hidden_size)][
                 ...
             ] = output_tile.reshape(acc_bt, hidden_size).astype(output_hbm.dtype)
@@ -1946,7 +1947,7 @@ def fused_ep_moe(
         pltpu.SMEM((2, 1, padded_num_experts), jnp.int32),  # expert_sizes_x2_smem
         pltpu.SMEM((2,), jnp.int32),  # a2a_s_sends_x2_smem
         pltpu.VMEM(
-            (1, top_k, math.gcd(bt, 8), t_packing, hidden_per_pack),
+            (1, top_k, math.gcd(bt, 16), t_packing, hidden_per_pack),
             t_dtype,
         ),  # a2a_g_acc_vmem
         pltpu.VMEM((bt, top_k), jnp.float32),  # top_k_logits_vmem
