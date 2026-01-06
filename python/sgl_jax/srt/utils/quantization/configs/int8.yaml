@@ -1,0 +1,15 @@
+# INT8 quantization config
+# Works for both dense and MoE models
+
+quantization:
+  # Qwix rules for dense layers (attention, MLP, embeddings)
+  qwix:
+    rules:
+      - module_path: '.*'
+        weight_qtype: 'int8'
+
+  # MoE-specific settings (experts weights)
+  moe:
+    weight_dtype: 'int8'
+    activation_dtype: null
+
