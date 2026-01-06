@@ -94,6 +94,7 @@ def launch(
         target=run_global_scheduler_process,
         args=(server_args, port_args, writer),
     )
+    scheduler_pipe_readers.append(reader)
     scheduler_proc.start()
     processes.append(scheduler_proc)
     scheduler_procs.append(scheduler_proc)

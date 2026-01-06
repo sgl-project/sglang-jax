@@ -1,5 +1,9 @@
+import logging
+import signal
 from queue import Queue
 from typing import Any
+
+import psutil
 
 from sgl_jax.srt.managers.communication import QueueBackend
 from sgl_jax.srt.managers.scheduler import Scheduler as AutoRegressiveScheduler
@@ -9,6 +13,9 @@ from sgl_jax.srt.multimodal.manager.scheduler.diffusion_scheduler import (
 )
 from sgl_jax.srt.multimodal.manager.scheduler.vae_scheduler import VaeScheduler
 from sgl_jax.srt.utils.mesh_utils import create_device_mesh
+from sgl_jax.utils import get_exception_traceback
+
+logger = logging.getLogger(__name__)
 
 
 class Stage:
@@ -34,14 +41,21 @@ class Stage:
         self.stage_index = stage_index
 
     def run_stage(self):
-        print(f"stage start {self.stage_index}")
-        # todo according to config to decide which scheduler to use
-        scheduler_class = get_scheduler_class(self.stage_config.scheduler)
-        comm_backend = QueueBackend(in_queue=self._in_queue, out_queue=self._out_queue)
-        self._stage_scheduler = scheduler_class(
-            communication_backend=comm_backend, **self.stage_config.scheduler_params
-        )
-        self._stage_scheduler.event_loop()
+        parent_process = psutil.Process().parent()
+        try:
+            print(f"stage start {self.stage_index}")
+            # todo according to config to decide which scheduler to use
+            scheduler_class = get_scheduler_class(self.stage_config.scheduler)
+            comm_backend = QueueBackend(in_queue=self._in_queue, out_queue=self._out_queue)
+            self._stage_scheduler = scheduler_class(
+                communication_backend=comm_backend, **self.stage_config.scheduler_params
+            )
+            self._out_queue.put_nowait({"status": "ready"})
+            self._stage_scheduler.event_loop()
+        except Exception:
+            traceback = get_exception_traceback()
+            logger.error("stage hit an exception: %s", traceback)
+            parent_process.send_signal(signal.SIGQUIT)
 
     def try_collect(self):
         assert self._out_queue is not None
