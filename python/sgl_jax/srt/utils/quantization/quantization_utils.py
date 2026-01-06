@@ -11,6 +11,7 @@ import yaml
 from flax import nnx
 from jax.sharding import auto_axes
 import itertools
+from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.configs.model_config import ModelConfig
 from sgl_jax.srt.layers.logits_processor import LogitsMetadata
@@ -130,6 +131,57 @@ def apply_qwix_quantization(
     return model
 
 
+def apply_moe_quantization(
+    model_config: ModelConfig, model: nnx.Module
+) -> nnx.Module:
+    """
+    Quantize MoE weights in-place. Call this after apply_qwix_quantization.
+    
+    This walks through the model and calls quantize_weights() on each EPMoE module,
+    which quantizes wi_0, wi_1, wo weights and stores the scales as separate parameters.
+    
+    Uses the unified QuantizationConfig from model_config.quantization_config.
+    """
+    # Import here to avoid circular imports
+    from sgl_jax.srt.layers.moe import EPMoE
+    
+    quant_config = model_config.quantization_config
+    if quant_config is None:
+        return model
+    
+    if not quant_config.has_moe_quantization():
+        return model
+    
+    # Walk through the model and quantize all EPMoE modules
+    # Models with MoE typically have: model.model.layers[i].block_sparse_moe.experts
+    # or similar structure. We recursively search for EPMoE instances.
+    def _quantize_moe_recursive(obj, visited=None):
+        if visited is None:
+            visited = set()
+        
+        obj_id = id(obj)
+        if obj_id in visited:
+            return
+        visited.add(obj_id)
+        
+        if isinstance(obj, EPMoE):
+            obj.quantize_weights()
+            return
+        
+        # Try to iterate through attributes
+        if hasattr(obj, '__dict__'):
+            for attr_name, attr_value in obj.__dict__.items():
+                if isinstance(attr_value, nnx.Module):
+                    _quantize_moe_recursive(attr_value, visited)
+                elif isinstance(attr_value, (list, tuple)):
+                    for item in attr_value:
+                        if isinstance(item, nnx.Module):
+                            _quantize_moe_recursive(item, visited)
+    
+    _quantize_moe_recursive(model)
+    return model
+
+
 def prepare_inputs_for_quantization(
     model_config: ModelConfig, model_runner
 ) -> tuple[ForwardBatch, MHATokenToKVPool, LogitsMetadata]:
@@ -194,12 +246,14 @@ def quantize_tensor_simple(x: jax.Array, dtype: jnp.dtype, dim: int = -1, out_sh
 
     return _quantize_tensor(x, out_sharding=out_sharding)
 
+
 def quantize_tensor(
     dtype: jnp.dtype,
     tensor: jax.Array,
     axis: int | tuple | None = -1,
     block_size: int | None = None,
     pad_tensor: bool = False,
+    out_sharding: P = None,
 ) -> tuple[jax.Array, jax.Array]:
     """Quantize tensor.
 
@@ -209,77 +263,106 @@ def quantize_tensor(
         axis: Axis to perform quantization. None denotes per-tensor.
         block_size: Specify block quantization size.
         pad_tensor: Whether to pad the axis along block size.
+        out_sharding: Optional output sharding specification for the quantized tensor.
+                      The scale sharding is automatically derived by removing the
+                      squeezed axes from this spec.
 
     Returns:
-        Tensor quantized to dtype.
+        Tuple of (quantized tensor, scale).
     """
+    # Normalize axis outside the inner function to avoid closure reassignment issues
     if axis is None:
-        # Perform per-tensor quantization.
-        axis = [i for i in range(tensor.ndim)]
-    if isinstance(axis, int):
-        axis = [axis]
+        axis_normalized = list(range(tensor.ndim))
+    elif isinstance(axis, int):
+        axis_normalized = [axis]
+    else:
+        axis_normalized = list(axis)
+    
+    # Convert negative axes to positive
+    axis_normalized = [a if a >= 0 else tensor.ndim + a for a in axis_normalized]
 
-    orig_shape = tensor.shape
-    mask = jnp.ones_like(tensor, jnp.int32)
-
+    # Normalize block_size
     if block_size is not None:
         if isinstance(block_size, int):
-            block_size = [block_size] * len(axis)
+            block_size_normalized = [block_size] * len(axis_normalized)
+        else:
+            block_size_normalized = list(block_size)
+    else:
+        block_size_normalized = None
 
-        blocked_shape = [[i] for i in orig_shape]
-        pad_width = [[0, 0] for _ in range(tensor.ndim)]
-        for i, block in zip(axis, block_size):
-            num_blocks = (tensor.shape[i] + block - 1) // block
-            padding_size = num_blocks * block - tensor.shape[i]
-            if padding_size and not pad_tensor:
-                raise ValueError(
-                    f"Unable to perform block quantization. axis={i} of "
-                    f"{tensor.shape=} is not divisible by {block=}")
-
-            # Pad the tensor to align with block size.
-            pad_width[i][1] = padding_size
-
-            blocked_shape[i] = (num_blocks, block)
-
-        # In order to avoid padded values affecting scale value, we pad it
-        # using edge value of the tensor.
-        tensor = jnp.pad(tensor, pad_width, "edge")
-        mask = jnp.pad(mask, pad_width)
-
-        orig_shape = tensor.shape
-        # Convert all axis into positive values.
-        axis = sorted([i % tensor.ndim for i in axis])
-        # Shift axis by 1 since its original position is now occupied by
-        # num_blocks dim. Also, if n axes before an axis was also quantized,
-        # shift its position by n.
-        axis = [1 + n + i for n, i in enumerate(axis)]
-
-        # Flatten list of lists that contains (num_blocks, block).
-        blocked_shape = list(itertools.chain(*blocked_shape))
-        tensor = tensor.reshape(blocked_shape)
-
+    # Get dtype info
     if jnp.issubdtype(dtype, jnp.integer):
         dtype_info = jnp.iinfo(dtype)
     else:
         dtype_info = jnp.finfo(dtype)
-
     dtype_max = float(dtype_info.max)
     dtype_min = float(dtype_info.min)
 
-    abs_max = jnp.max(jnp.abs(tensor), axis=axis, keepdims=True)
-    scale = abs_max / dtype_max
+    # Derive scale sharding by removing the squeezed axes from tensor sharding
+    if out_sharding is not None:
+        tensor_sharding = out_sharding
+        # Scale has axes squeezed out - remove those from the sharding spec
+        scale_spec_list = [s for i, s in enumerate(out_sharding) if i not in axis_normalized]
+        scale_sharding = P(*scale_spec_list)
+        combined_sharding = (tensor_sharding, scale_sharding)
+    else:
+        combined_sharding = None
 
-    tensor_q = jnp.clip(tensor / scale, dtype_min, dtype_max)
-    tensor_q = tensor_q.reshape(orig_shape)
-    tensor_q = tensor_q.astype(dtype)
+    @auto_axes
+    def _quantize_tensor(x: jax.Array):
+        orig_shape = x.shape
+        mask = jnp.ones_like(x, jnp.int32)
+        quant_axis = axis_normalized
 
-    # To avoid padded values affecting output of quantized matmul, we mask them
-    # out with 0s.
-    tensor_q = jnp.where(mask, tensor_q, 0)
+        if block_size_normalized is not None:
+            blocked_shape = [[i] for i in orig_shape]
+            pad_width = [[0, 0] for _ in range(x.ndim)]
+            for i, block in zip(quant_axis, block_size_normalized):
+                num_blocks = (x.shape[i] + block - 1) // block
+                padding_size = num_blocks * block - x.shape[i]
+                if padding_size and not pad_tensor:
+                    raise ValueError(
+                        f"Unable to perform block quantization. axis={i} of "
+                        f"{x.shape=} is not divisible by {block=}")
 
-    scale = jnp.squeeze(scale, axis).astype(jnp.float32)
+                # Pad the tensor to align with block size.
+                pad_width[i][1] = padding_size
+                blocked_shape[i] = (num_blocks, block)
 
-    return tensor_q, scale
+            # In order to avoid padded values affecting scale value, we pad it
+            # using edge value of the tensor.
+            x = jnp.pad(x, pad_width, "edge")
+            mask = jnp.pad(mask, pad_width)
+
+            padded_shape = x.shape
+            # Convert all axis into positive values.
+            quant_axis = sorted([i % x.ndim for i in quant_axis])
+            # Shift axis by 1 since its original position is now occupied by
+            # num_blocks dim. Also, if n axes before an axis was also quantized,
+            # shift its position by n.
+            quant_axis = [1 + n + i for n, i in enumerate(quant_axis)]
+
+            # Flatten list of lists that contains (num_blocks, block).
+            blocked_shape = list(itertools.chain(*blocked_shape))
+            x = x.reshape(blocked_shape)
+        else:
+            padded_shape = orig_shape
+
+        abs_max = jnp.max(jnp.abs(x), axis=quant_axis, keepdims=True)
+        scale = abs_max / dtype_max
+
+        x_q = jnp.clip(x / scale, dtype_min, dtype_max)
+        x_q = x_q.reshape(padded_shape)
+        x_q = x_q.astype(dtype)
+
+        # To avoid padded values affecting output of quantized matmul, we mask them
+        # out with 0s.
+        x_q = jnp.where(mask, x_q, 0)
+
+        scale = jnp.squeeze(scale, quant_axis).astype(jnp.float32)
+        return x_q, scale
+
+    return _quantize_tensor(tensor, out_sharding=combined_sharding)
 
 def dequantize_tensor(
     tensor_q: jax.Array,
