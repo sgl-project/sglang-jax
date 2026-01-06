@@ -24,7 +24,10 @@ from benchmark.moe.utils import (
     select_cases,
 )
 from benchmark.utils import multiple_iteration_timeit_from_trace
-from sgl_jax.srt.kernels.fused_moe.v1.kernel import FusedMoEBlockConfig
+from sgl_jax.srt.kernels.fused_moe.v1.kernel import (
+    FusedMoEBlockConfig,
+    validate_fused_moe_block_config,
+)
 from sgl_jax.srt.layers.moe import FusedEPMoE
 
 # Leave headroom for compiler padding/alignment and any unmodeled VMEM usage.
@@ -390,14 +393,17 @@ def run_all(
     print("  mode: balanced_topk=True (deterministic cyclic routing)")
     for case in cases:
         t_packing = _dtype_packing(dtype)
-        local_num_tokens = case.num_tokens // case.ep_size
+        mesh = build_mesh(ep_size=case.ep_size, tp_size=case.tp_size)
+        mesh_ep = mesh.shape["tensor"]
+        if mesh_ep != case.ep_size:
+            print(f"warning [case={case.name}] mesh_ep={mesh_ep} != case.ep_size={case.ep_size}")
+        local_num_tokens = case.num_tokens // mesh_ep
         if local_num_tokens % t_packing != 0:
             print(
                 f"skip [case={case.name}] because local_num_tokens={local_num_tokens} "
-                f"is not aligned to t_packing={t_packing} (dtype={jnp.dtype(dtype).name})"
+                f"is not aligned to t_packing={t_packing} (dtype={jnp.dtype(dtype).name}, ep_size={mesh_ep})"
             )
             continue
-
         print(
             f"\n[case={case.name}] tokens={case.num_tokens}, experts={case.num_experts}, "
             f"top_k={case.top_k}, hidden={case.hidden_size}, intermediate={case.intermediate_size}, ep_size={case.ep_size}"
@@ -406,8 +412,6 @@ def run_all(
             f"  mesh: ep_size={case.ep_size}, tp_size={case.tp_size}, "
             f"devices_used={case.ep_size * case.tp_size}/{len(jax.devices())}"
         )
-
-        mesh = build_mesh(ep_size=case.ep_size, tp_size=case.tp_size)
         data = prepare_fused_moe_inputs(case, dtype=dtype, mesh=mesh, include_weights=False)
         block_cfgs: list[FusedMoEBlockConfig | None]
         if tune_block_config:
@@ -471,6 +475,18 @@ def run_all(
                     )
 
                 try:
+                    if block_cfg is not None:
+                        validate_fused_moe_block_config(
+                            num_tokens=case.num_tokens,
+                            num_experts=case.num_experts,
+                            top_k=case.top_k,
+                            hidden_size=case.hidden_size,
+                            intermediate_size=case.intermediate_size,
+                            dtype=dtype,
+                            ep_size=mesh_ep,
+                            subc_quant_wsz=None,
+                            block_config=block_cfg,
+                        )
                     times = multiple_iteration_timeit_from_trace(
                         compute_func=_compute,
                         data_generator=lambda: (),
