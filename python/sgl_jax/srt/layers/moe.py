@@ -301,15 +301,19 @@ class EPMoE(nnx.Module):
             self.wo_scale = wo_scale.reshape(wo_scale.shape[0], 1, 1, wo_scale.shape[1])
 
     def __call__(self, hidden_states, topk_weights, topk_ids) -> jax.Array:
+        hidden_states_reshard = None
+        hidden_states_scale = None
+        if self.quantized_dtype is not None:
+            hidden_states_reshard, hidden_states_scale = quantize_tensor(self.quantized_dtype, hidden_states, axis=1, out_sharding=P(None))
         with jax.sharding.use_abstract_mesh(self.updated_mesh):
-            hidden_states_reshard = jax.sharding.reshard(hidden_states, P(None))
+            hidden_states_reshard = jax.sharding.reshard(hidden_states_reshard, P(None))
             topk_weights_reshard = jax.sharding.reshard(topk_weights, P(None))
             topk_ids_reshard = jax.sharding.reshard(topk_ids, P(None))
             
             # Use weights and scales directly
             # - If quantize_weights() was called: weights are quantized, scales are computed
             # - If not called: weights are bf16, scales are identity (1s)
-            result = shard_map(
+            result_q = shard_map(
                 self._forward,
                 mesh=self.moe_mesh,
                 in_specs=(
@@ -341,8 +345,15 @@ class EPMoE(nnx.Module):
                 self.wi_0_scale, self.wi_1_scale, self.wo_scale, None, None, None,
             )
 
-        output_pspec = P(*([None] * (result.ndim)))
-        return jax.sharding.reshard(result, jax.sharding.NamedSharding(self.original_mesh, output_pspec))
+        output_pspec = P(*([None] * (result_q.ndim)))
+        hidden_states_scale_reshard = jax.sharding.reshard(hidden_states_scale, jax.sharding.NamedSharding(self.original_mesh, output_pspec))
+        result_q = jax.sharding.reshard(result_q, jax.sharding.NamedSharding(self.original_mesh, output_pspec))
+        # print scale's sharding
+        if self.quantized_dtype is not None:
+            result = dequantize_tensor(result_q, hidden_states_scale_reshard, axis=1)
+        else:
+            result = result_q
+        return result
 
     def _forward(self, hidden_states, topk_weights, topk_ids, w0_weights, w1_weights, wo_weights,
              w0_kernel_scale = None, w1_kernel_scale = None, wo_kernel_scale = None, w0_kernel_bias = None, w1_kernel_bias = None, wo_kernel_bias = None):
