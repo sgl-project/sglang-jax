@@ -4,6 +4,8 @@ from typing import Any
 import jax
 import PIL.Image
 
+from sgl_jax.srt.managers.io_struct import BatchTokenIDOut, TokenizedGenerateReqInput
+
 
 @dataclass
 class Req:
@@ -153,3 +155,16 @@ class Req:
 
     # results
     output: jax.Array | None = None
+
+    def to_stage_req(self, scheduler: str):
+        if scheduler == "auto_regressive":
+            return TokenizedGenerateReqInput(rid=self.rid, input_ids=self.input_ids)
+        else:
+            return self
+
+    @staticmethod
+    def from_stage(stage_result: Any):
+        if type(stage_result) is BatchTokenIDOut:
+            return Req(rid=stage_result.rids[0], prompt_embeds=stage_result.output_hidden_states)
+        else:
+            return stage_result

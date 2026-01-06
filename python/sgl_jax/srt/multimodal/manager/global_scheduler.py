@@ -113,7 +113,7 @@ class GlobalScheduler:
                     self.in_queues[0].put_nowait(self._request_dispatcher(req))
             else:
                 for i, stage in enumerate(self.stage_list):
-                    stage_result = stage.try_collect()
+                    stage_result = Req.from_stage(stage.try_collect())
                     print("stage result", stage_result)
                     if stage_result is None:
                         continue
@@ -121,7 +121,9 @@ class GlobalScheduler:
                         if self.stage_configs[i].final_output:
                             self.send_to_detokenizer.send_pyobj(stage_result)
                         else:
-                            self.in_queues[i + 1].put_nowait(stage_result)
+                            self.in_queues[i + 1].put_nowait(
+                                stage_result.to_stage_req(self.stage_configs[i].scheduler)
+                            )
 
 
 def run_global_scheduler_process(
