@@ -435,8 +435,11 @@ class ServerArgs:
         parser.add_argument(
             "--quantization-config-path",
             type=str,
-            default=None,
-            help="The config path for how to apply quantization to loaded model.",
+            default=ServerArgs.quantization_config_path,
+            help="Path to quantization config YAML file. Can be an absolute path, "
+            "relative path, or just a filename (will look up in built-in configs). "
+            "Built-in configs: int8_all_modules_w_only.yaml, fp8_all_modules_w_only.yaml, "
+            "fp8_all_modules_w8a8.yaml",
         )
         parser.add_argument(
             "--kv-cache-dtype",

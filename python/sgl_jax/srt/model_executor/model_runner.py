@@ -258,8 +258,11 @@ class ModelRunner:
             model_config=self.model_config,
         )
 
-        if self.model_config.quantization_config_path is not None:
-            self.model = apply_qwix_quantization(self.model_config, self.model, self)
+        # Apply qwix quantization if quantization config has qwix rules
+        if self.model_config.quantization_config is not None:
+            qwix_rules = self.model_config.quantization_config.get_qwix_rules()
+            if qwix_rules:
+                self.model = apply_qwix_quantization(self.model_config, self.model, self)
 
         # Parse other args
         self.sliding_window_size = self.model_config.sliding_window
