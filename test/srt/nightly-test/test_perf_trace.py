@@ -108,7 +108,7 @@ class TestModelPerfTrace(CustomTestCase):
         # # input length levels (1k, 4k, 8k)
         # input_lengths = [1024]
 
-        output_lengths = [1, 256]
+        output_lengths = [1, 16]
         specific_args = self.BASIC_SERVER_ARGS + [
             "--tp-size",
             "1",
@@ -249,7 +249,7 @@ class TestModelPerfTrace(CustomTestCase):
         # concurrency_levels = [8]
         # # input length levels (1k, 4k, 8k)
         # input_lengths = [1024]
-        output_lengths = [1, 256]
+        output_lengths = [1, 16]
         specific_args = self.BASIC_SERVER_ARGS + [
             "--tp-size",
             "4",
@@ -380,7 +380,7 @@ class TestModelPerfTrace(CustomTestCase):
         # # input length levels (1k, 4k, 8k)
         # input_lengths = [1024]
 
-        output_lengths = [1, 256]
+        output_lengths = [1, 16]
         specific_args = self.BASIC_SERVER_ARGS + [
             "--tp-size",
             "1",
@@ -514,7 +514,7 @@ class TestModelPerfTrace(CustomTestCase):
         # # input length levels (1k, 4k, 8k)
         # input_lengths = [1024]
 
-        output_lengths = [1, 256]
+        output_lengths = [1, 16]
         specific_args = self.BASIC_SERVER_ARGS + [
             "--tp-size",
             "4",
@@ -646,7 +646,7 @@ class TestModelPerfTrace(CustomTestCase):
         # # input length levels (1k, 4k, 8k)
         # input_lengths = [1024]
 
-        output_lengths = [1, 256]
+        output_lengths = [1, 16]
         specific_args = self.BASIC_SERVER_ARGS + [
             "--tp-size",
             "2",
@@ -778,7 +778,7 @@ class TestModelPerfTrace(CustomTestCase):
         # # input length levels (1k, 4k, 8k)
         # input_lengths = [1024]
 
-        output_lengths = [1, 256]
+        output_lengths = [1, 16]
         specific_args = self.BASIC_SERVER_ARGS + [
             "--tp-size",
             "1",
@@ -914,7 +914,7 @@ class TestModelPerfTrace(CustomTestCase):
         # # input length levels (1k, 4k, 8k)
         # input_lengths = [1024]
 
-        output_lengths = [1, 256]
+        output_lengths = [1, 16]
         specific_args = self.BASIC_SERVER_ARGS + [
             "--tp-size",
             "4",
@@ -1048,7 +1048,7 @@ class TestModelPerfTrace(CustomTestCase):
         # # input length levels (1k, 4k, 8k)
         # input_lengths = [1024]
 
-        output_lengths = [1, 256]
+        output_lengths = [1, 16]
         specific_args = self.BASIC_SERVER_ARGS + [
             "--tp-size",
             "2",
@@ -1169,7 +1169,7 @@ class TestModelPerfTrace(CustomTestCase):
         # # input length levels (1k, 4k, 8k)
         # input_lengths = [1024]
 
-        output_lengths = [1, 256]
+        output_lengths = [1, 16]
         specific_args = self.BASIC_SERVER_ARGS + [
             "--tp-size",
             "1",
@@ -1291,7 +1291,7 @@ class TestModelPerfTrace(CustomTestCase):
         # # input length levels (1k, 4k, 8k)
         # input_lengths = [1024]
 
-        output_lengths = [1, 256]
+        output_lengths = [1, 16]
         specific_args = self.BASIC_SERVER_ARGS + [
             "--tp-size",
             "4",
