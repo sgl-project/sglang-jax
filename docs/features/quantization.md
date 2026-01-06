@@ -56,7 +56,7 @@ uv run python -u -m sgl_jax.launch_server \
   --download-dir=/tmp \
   --dtype=bfloat16 \
   --skip-server-warmup \
-  --quantization-config-path=sgl_jax/srt/utils/quantization/configs/int8_all_modules_w_only.yaml
+  --quantization-config-path=int8.yaml
 ```
 
 # Supported models (To be updated)
