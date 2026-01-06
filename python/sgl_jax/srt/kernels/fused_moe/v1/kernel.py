@@ -481,13 +481,17 @@ def _fused_ep_moe_kernel(
         return (dp_rank, ep_rank)
 
     def sync_barrier():
-        # Match f5b4's ring-style barrier: one-hop signal + one wait.
-        pltpu.semaphore_signal(
-            barrier_sem,
-            device_id=get_mesh_device_id(right_id),
-            device_id_type=pltpu.DeviceIdType.MESH,
-        )
-        pltpu.semaphore_wait(barrier_sem, 1)
+        # Full mesh barrier (matches epic/integrate-fused-moe). The previous
+        # "signal right + wait 1" is only a neighbor fence (not a global barrier)
+        # and can lead to rare deadlocks when subsequent comm assumes all peers
+        # reached the same phase.
+        for i in range(num_devices):
+            pltpu.semaphore_signal(
+                barrier_sem,
+                device_id=get_mesh_device_id(i),
+                device_id_type=pltpu.DeviceIdType.MESH,
+            )
+        pltpu.semaphore_wait(barrier_sem, num_devices)
 
     def start_fetch_b_gating(*, bt_id, priority=0):
         bt_sem_id = bt_id & jnp.int32(1)
@@ -701,17 +705,23 @@ def _fused_ep_moe_kernel(
     def wait_a2a_scatter_recv(*, bt_sem_id, e_sem_id, local_e_id):
         e_id = my_id * local_num_experts + local_e_id
         sz = expert_sizes_x2_smem[bt_sem_id, 0, e_id]
-        pltpu.make_async_copy(
-            src_ref=a2a_s_x2_hbm.at[e_sem_id, pl.ds(0, sz)],
-            dst_ref=a2a_s_x2_hbm.at[e_sem_id, pl.ds(0, sz)],
-            sem=recv_x2_sems.at[e_sem_id],
-        ).wait()
+
+        @pl.when(sz > 0)
+        def _(sz=sz, e_sem_id=e_sem_id):
+            pltpu.make_async_copy(
+                src_ref=a2a_s_x2_hbm.at[e_sem_id, pl.ds(0, sz)],
+                dst_ref=a2a_s_x2_hbm.at[e_sem_id, pl.ds(0, sz)],
+                sem=recv_x2_sems.at[e_sem_id],
+            ).wait()
 
     def wait_a2a_scatter_send(e_sem_id):
         sz = a2a_s_sends_x2_smem[e_sem_id]
+        # Avoid 0-length DMA waits (can be flaky) while keeping a "must-wait"
+        # fence on `send_x2_sems`.
+        wait_sz = lax.select(sz > 0, sz, jnp.int32(1))
         pltpu.make_async_copy(
-            src_ref=a2a_s_x2_hbm.at[e_sem_id, pl.ds(0, sz)],
-            dst_ref=a2a_s_x2_hbm.at[e_sem_id, pl.ds(0, sz)],
+            src_ref=a2a_s_x2_hbm.at[e_sem_id, pl.ds(0, wait_sz)],
+            dst_ref=a2a_s_x2_hbm.at[e_sem_id, pl.ds(0, wait_sz)],
             sem=send_x2_sems.at[e_sem_id],
         ).wait()
 
@@ -759,14 +769,17 @@ def _fused_ep_moe_kernel(
         remote_sz = sz - local_sz
         is_valid = jnp.logical_and(local_e_id >= 0, local_e_id < local_num_experts)
         remote_sz = lax.select(is_valid, remote_sz, 0)
+
         # Important: wait via `a2a_g_hbm` itself (matches f5b4) so reads from
         # `a2a_g_hbm` can't be reordered before the gather completes.
-        ref = a2a_g_hbm.at[0, pl.ds(0, remote_sz)]
-        pltpu.make_async_copy(
-            src_ref=ref,
-            dst_ref=ref,
-            sem=send_x2_sems.at[e_sem_id],
-        ).wait()
+        @pl.when(remote_sz > 0)
+        def _(remote_sz=remote_sz, e_sem_id=e_sem_id):
+            ref = a2a_g_hbm.at[0, pl.ds(0, remote_sz)]
+            pltpu.make_async_copy(
+                src_ref=ref,
+                dst_ref=ref,
+                sem=send_x2_sems.at[e_sem_id],
+            ).wait()
 
     def wait_a2a_gather_recv_all(*, bt_size):
         # Align to f5b4: wait using a flat slice into `a2a_g_hbm` sized to the
@@ -1550,13 +1563,16 @@ def _fused_ep_moe_kernel(
 
     def wait_store_output(*, bt_id):
         is_valid = jnp.logical_and(bt_id >= 0, bt_id < num_bt)
-        sz = pl.multiple_of(lax.select(is_valid, bt, 0), bt)
-        bt_sem_id = (bt_id + 2) & 1
-        pltpu.make_async_copy(
-            src_ref=output_hbm.at[pl.ds(0, sz)],
-            dst_ref=output_hbm.at[pl.ds(0, sz)],
-            sem=local_sems.at[bt_sem_id, 4],
-        ).wait()
+
+        @pl.when(is_valid)
+        def _(bt_id=bt_id):
+            sz = pl.multiple_of(bt, bt)
+            bt_sem_id = (bt_id + 2) & 1
+            pltpu.make_async_copy(
+                src_ref=output_hbm.at[pl.ds(0, sz)],
+                dst_ref=output_hbm.at[pl.ds(0, sz)],
+                sem=local_sems.at[bt_sem_id, 4],
+            ).wait()
 
     ### ------- Kernel start ------- ###
     sync_barrier()
