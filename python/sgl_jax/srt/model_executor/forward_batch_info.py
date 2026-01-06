@@ -161,8 +161,8 @@ class ForwardBatch:
     # For extend
     extend_prefix_lens: jax.Array | None = None
     extend_seq_lens: jax.Array | None = None
-    extend_prefix_lens_cpu: Optional[jax.Array[int]] = None
-    extend_seq_lens_cpu: Optional[jax.Array[int]] = None
+    extend_prefix_lens_cpu: list[int] | None = None
+    extend_seq_lens_cpu: list[int] | None = None
 
     # For LoRA
     lora_ids: list[str] | None = None
@@ -177,7 +177,7 @@ class ForwardBatch:
     spec_algorithm: SpeculativeAlgorithm = None
     capture_hidden_mode: CaptureHiddenMode = None
     # For multimodal
-    mm_inputs: Optional[jax.Array[MultimodalInputs]] = None
+    mm_inputs:  jax.Array[MultimodalInputs] | None = None
     mrope_positions: jax.Array | None = None
 
     # Encoder-Decoder specific fields

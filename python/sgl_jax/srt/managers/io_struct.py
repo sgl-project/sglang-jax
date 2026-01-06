@@ -3,7 +3,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, TYPE_CHECKING, Union, Dict, List, Optional
+from typing import Any, TYPE_CHECKING, Union, Dict, List, Optional, Literal
 
 
 import numpy as np

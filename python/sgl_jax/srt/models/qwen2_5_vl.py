@@ -147,30 +147,6 @@ class Qwen2_5_VisionMLP(nnx.Module):
         return result
 
 
-class Attention(nnx.Module):
-
-    def __init__(
-            self,
-            mesh: Mesh = None,
-            scale: Optional[float] = None,
-    ):
-        self.mesh = mesh
-        self.scale = scale
-
-    def __call__(self, q, k, v, mask=None):
-        attn_logits = jnp.einsum("bnth,bnsh->bnts", q, k) * self.scale
-
-        # Apply appropriate masking
-        if mask is not None:
-            mask_value = jnp.finfo(attn_logits.dtype).min
-            attn_logits = jnp.where(mask, attn_logits, mask_value)
-
-        # Softmax
-        attn_weights = jax.nn.softmax(attn_logits, axis=-1)
-
-        attn_output = jnp.matmul(attn_weights, v)
-        return attn_output
-
 def sharded_flash_attention(
     mesh: Mesh,
     causal: bool = True,
