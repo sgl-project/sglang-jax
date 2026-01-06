@@ -255,6 +255,11 @@ class EPMoE(nnx.Module):
                 )
             )
             
+            # Initialize scales to identity (1s) - will be set by quantize_weights() if quantization enabled
+            # Shape is 4D for GMM kernel: (num_experts, 1, 1, output_dim)
+            self.wi_0_scale = jnp.ones((num_experts, 1, 1, intermediate_dim), dtype=jnp.float32)
+            self.wi_1_scale = jnp.ones((num_experts, 1, 1, intermediate_dim), dtype=jnp.float32)
+            self.wo_scale = jnp.ones((num_experts, 1, 1, config.hidden_size), dtype=jnp.float32)
 
 
     def _detect_device_capabilities(self):
@@ -270,23 +275,40 @@ class EPMoE(nnx.Module):
         except Exception as _:
             return False, "cpu"
 
+    def quantize_weights(self):
+        """Quantize MoE weights in-place. Call once after model loading.
+        
+        This method quantizes wi_0, wi_1, wo weights and updates the scales.
+        After calling this, __call__ will use the pre-quantized weights.
+        """
+        if self.quantized_dtype is None:
+            return
+        
+        with jax.sharding.use_abstract_mesh(self.updated_mesh):
+            # Quantize weights
+            w0_value, w0_scale = quantize_tensor(self.quantized_dtype, self.wi_0.value, axis=1, out_sharding=P("expert", None, "tensor"))
+            w1_value, w1_scale = quantize_tensor(self.quantized_dtype, self.wi_1.value, axis=1, out_sharding=P("expert", None, "tensor"))
+            wo_value, wo_scale = quantize_tensor(self.quantized_dtype, self.wo.value, axis=1, out_sharding=P("expert", "tensor", None))
+            
+            # Replace original weights with quantized versions
+            self.wi_0.value = w0_value
+            self.wi_1.value = w1_value
+            self.wo.value = wo_value
+            
+            # Update scales (reshape to 4D for GMM kernel)
+            self.wi_0_scale = w0_scale.reshape(w0_scale.shape[0], 1, 1, w0_scale.shape[1])
+            self.wi_1_scale = w1_scale.reshape(w1_scale.shape[0], 1, 1, w1_scale.shape[1])
+            self.wo_scale = wo_scale.reshape(wo_scale.shape[0], 1, 1, wo_scale.shape[1])
+
     def __call__(self, hidden_states, topk_weights, topk_ids) -> jax.Array:
         with jax.sharding.use_abstract_mesh(self.updated_mesh):
-            hidden_states, hidden_states_scale = quantize_tensor(self.quantized_dtype, hidden_states, axis=-1)
             hidden_states_reshard = jax.sharding.reshard(hidden_states, P(None))
             topk_weights_reshard = jax.sharding.reshard(topk_weights, P(None))
             topk_ids_reshard = jax.sharding.reshard(topk_ids, P(None))
-            self.wi_0.value = reshard(self.wi_0.value, P("expert", None, "tensor"))
-            self.wi_1.value = reshard(self.wi_1.value, P("expert", None, "tensor"))
-            self.wo.value = reshard(self.wo.value, P("expert", "tensor", None))
-            w0_kernel_value, w0_kernel_scale = quantize_tensor(self.quantized_dtype, self.wi_0.value, axis=1)
-            w1_kernel_value, w1_kernel_scale = quantize_tensor(self.quantized_dtype, self.wi_1.value, axis=1)
-            wo_kernel_value, wo_kernel_scale = quantize_tensor(self.quantized_dtype, self.wo.value, axis=1)
-            # reshape scale to match 4d shape required by gmm
-            w0_kernel_scale = w0_kernel_scale.reshape(w0_kernel_scale.shape[0], 1, 1, w0_kernel_scale.shape[1])
-            w1_kernel_scale = w1_kernel_scale.reshape(w1_kernel_scale.shape[0], 1, 1, w1_kernel_scale.shape[1])
-            wo_kernel_scale = wo_kernel_scale.reshape(wo_kernel_scale.shape[0], 1, 1, wo_kernel_scale.shape[1])
             
+            # Use weights and scales directly
+            # - If quantize_weights() was called: weights are quantized, scales are computed
+            # - If not called: weights are bf16, scales are identity (1s)
             result = shard_map(
                 self._forward,
                 mesh=self.moe_mesh,
@@ -313,16 +335,14 @@ class EPMoE(nnx.Module):
                 hidden_states_reshard,
                 topk_weights_reshard,
                 topk_ids_reshard,
-                w0_kernel_value,
-                w1_kernel_value,
-                wo_kernel_value,
-                w0_kernel_scale, w1_kernel_scale, wo_kernel_scale, None, None, None,
+                self.wi_0.value,
+                self.wi_1.value,
+                self.wo.value,
+                self.wi_0_scale, self.wi_1_scale, self.wo_scale, None, None, None,
             )
 
         output_pspec = P(*([None] * (result.ndim)))
-        result_reshard_quantized = jax.sharding.reshard(result, jax.sharding.NamedSharding(self.original_mesh, output_pspec))
-        result_reshard = dequantize_tensor(result_reshard_quantized, hidden_states_scale, axis=-1, out_dtype=self.dtype)
-        return result_reshard
+        return jax.sharding.reshard(result, jax.sharding.NamedSharding(self.original_mesh, output_pspec))
 
     def _forward(self, hidden_states, topk_weights, topk_ids, w0_weights, w1_weights, wo_weights,
              w0_kernel_scale = None, w1_kernel_scale = None, wo_kernel_scale = None, w0_kernel_bias = None, w1_kernel_bias = None, wo_kernel_bias = None):

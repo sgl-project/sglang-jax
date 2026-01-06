@@ -40,7 +40,7 @@ from sgl_jax.srt.server_args import ServerArgs
 from sgl_jax.srt.speculative.spec_info import SpeculativeAlgorithm
 from sgl_jax.srt.utils.common_utils import get_bool_env_var
 from sgl_jax.srt.utils.jax_utils import get_available_device_memory
-from sgl_jax.srt.utils.quantization.quantization_utils import apply_qwix_quantization
+from sgl_jax.srt.utils.quantization.quantization_utils import apply_qwix_quantization, apply_moe_quantization
 
 logger = logging.getLogger(__name__)
 
@@ -258,11 +258,16 @@ class ModelRunner:
             model_config=self.model_config,
         )
 
-        # Apply qwix quantization if quantization config has qwix rules
+        # Apply quantization if quantization config is set
         if self.model_config.quantization_config is not None:
+            # Apply qwix quantization for dense layers
             qwix_rules = self.model_config.quantization_config.get_qwix_rules()
             if qwix_rules:
                 self.model = apply_qwix_quantization(self.model_config, self.model, self)
+            
+            # Apply MoE quantization for expert layers
+            if self.model_config.quantization_config.has_moe_quantization():
+                self.model = apply_moe_quantization(self.model_config, self.model)
 
         # Parse other args
         self.sliding_window_size = self.model_config.sliding_window
