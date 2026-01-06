@@ -665,31 +665,19 @@ def _fused_ep_moe_kernel(
                 send_sz += remote_sz
                 expert_offsets_x2_smem[bt_sem_id, 0, e_id] = offset + local_sz + remote_sz
                 start = expert_starts_x2_smem[bt_sem_id, 0, e_id] + offset
-
-                @pl.when(local_sz > 0)
-                def _(local_sz=local_sz, start=start, src_t_id=src_t_id, e_sem_id=e_sem_id):
-                    pltpu.make_async_copy(
-                        src_ref=tokens_hbm.at[pl.ds(src_t_id, local_sz)],
-                        dst_ref=a2a_s_x2_hbm.at[e_sem_id, pl.ds(start, local_sz)],
-                        sem=recv_x2_sems.at[e_sem_id],
-                    ).start()
-
-                @pl.when(remote_sz > 0)
-                def _(
-                    remote_sz=remote_sz,
-                    start=start,
-                    src_t_id=src_t_id,
-                    e_sem_id=e_sem_id,
-                    recv_id=recv_id,
-                ):
-                    pltpu.make_async_remote_copy(
-                        src_ref=tokens_hbm.at[pl.ds(src_t_id, remote_sz)],
-                        dst_ref=a2a_s_x2_hbm.at[e_sem_id, pl.ds(start, remote_sz)],
-                        send_sem=send_x2_sems.at[e_sem_id],
-                        recv_sem=recv_x2_sems.at[e_sem_id],
-                        device_id=get_mesh_device_id(recv_id),
-                        device_id_type=pltpu.DeviceIdType.MESH,
-                    ).start()
+                pltpu.make_async_copy(
+                    src_ref=tokens_hbm.at[pl.ds(src_t_id, local_sz)],
+                    dst_ref=a2a_s_x2_hbm.at[e_sem_id, pl.ds(start, local_sz)],
+                    sem=recv_x2_sems.at[e_sem_id],
+                ).start()
+                pltpu.make_async_remote_copy(
+                    src_ref=tokens_hbm.at[pl.ds(src_t_id, remote_sz)],
+                    dst_ref=a2a_s_x2_hbm.at[e_sem_id, pl.ds(start, remote_sz)],
+                    send_sem=send_x2_sems.at[e_sem_id],
+                    recv_sem=recv_x2_sems.at[e_sem_id],
+                    device_id=get_mesh_device_id(recv_id),
+                    device_id_type=pltpu.DeviceIdType.MESH,
+                ).start()
 
             return send_sz
 
@@ -705,23 +693,17 @@ def _fused_ep_moe_kernel(
     def wait_a2a_scatter_recv(*, bt_sem_id, e_sem_id, local_e_id):
         e_id = my_id * local_num_experts + local_e_id
         sz = expert_sizes_x2_smem[bt_sem_id, 0, e_id]
-
-        @pl.when(sz > 0)
-        def _(sz=sz, e_sem_id=e_sem_id):
-            pltpu.make_async_copy(
-                src_ref=a2a_s_x2_hbm.at[e_sem_id, pl.ds(0, sz)],
-                dst_ref=a2a_s_x2_hbm.at[e_sem_id, pl.ds(0, sz)],
-                sem=recv_x2_sems.at[e_sem_id],
-            ).wait()
+        pltpu.make_async_copy(
+            src_ref=a2a_s_x2_hbm.at[e_sem_id, pl.ds(0, sz)],
+            dst_ref=a2a_s_x2_hbm.at[e_sem_id, pl.ds(0, sz)],
+            sem=recv_x2_sems.at[e_sem_id],
+        ).wait()
 
     def wait_a2a_scatter_send(e_sem_id):
         sz = a2a_s_sends_x2_smem[e_sem_id]
-        # Avoid 0-length DMA waits (can be flaky) while keeping a "must-wait"
-        # fence on `send_x2_sems`.
-        wait_sz = lax.select(sz > 0, sz, jnp.int32(1))
         pltpu.make_async_copy(
-            src_ref=a2a_s_x2_hbm.at[e_sem_id, pl.ds(0, wait_sz)],
-            dst_ref=a2a_s_x2_hbm.at[e_sem_id, pl.ds(0, wait_sz)],
+            src_ref=a2a_s_x2_hbm.at[e_sem_id, pl.ds(0, sz)],
+            dst_ref=a2a_s_x2_hbm.at[e_sem_id, pl.ds(0, sz)],
             sem=send_x2_sems.at[e_sem_id],
         ).wait()
 
@@ -734,31 +716,19 @@ def _fused_ep_moe_kernel(
             is_local = recv_id == my_id
             local_sz = lax.select(is_local, sz, 0)
             remote_sz = lax.select(is_local, 0, sz)
-
-            @pl.when(local_sz > 0)
-            def _(start=start, local_sz=local_sz, e_sem_id=e_sem_id, my_e_id=my_e_id):
-                pltpu.make_async_copy(
-                    src_ref=src_ref.at[e_sem_id, pl.ds(start, local_sz)],
-                    dst_ref=a2a_g_hbm.at[my_e_id, pl.ds(0, local_sz)],
-                    sem=a2a_gather_sem,
-                ).start()
-
-            @pl.when(remote_sz > 0)
-            def _(
-                start=start,
-                remote_sz=remote_sz,
-                e_sem_id=e_sem_id,
-                my_e_id=my_e_id,
-                recv_id=recv_id,
-            ):
-                pltpu.make_async_remote_copy(
-                    src_ref=src_ref.at[e_sem_id, pl.ds(start, remote_sz)],
-                    dst_ref=a2a_g_hbm.at[my_e_id, pl.ds(0, remote_sz)],
-                    send_sem=send_x2_sems.at[e_sem_id],
-                    recv_sem=a2a_gather_sem,
-                    device_id=get_mesh_device_id(recv_id),
-                    device_id_type=pltpu.DeviceIdType.MESH,
-                ).start()
+            pltpu.make_async_copy(
+                src_ref=src_ref.at[e_sem_id, pl.ds(start, local_sz)],
+                dst_ref=a2a_g_hbm.at[my_e_id, pl.ds(0, local_sz)],
+                sem=a2a_gather_sem,
+            ).start()
+            pltpu.make_async_remote_copy(
+                src_ref=src_ref.at[e_sem_id, pl.ds(start, remote_sz)],
+                dst_ref=a2a_g_hbm.at[my_e_id, pl.ds(0, remote_sz)],
+                send_sem=send_x2_sems.at[e_sem_id],
+                recv_sem=a2a_gather_sem,
+                device_id=get_mesh_device_id(recv_id),
+                device_id_type=pltpu.DeviceIdType.MESH,
+            ).start()
 
             start += sz
 
@@ -772,14 +742,12 @@ def _fused_ep_moe_kernel(
 
         # Important: wait via `a2a_g_hbm` itself (matches f5b4) so reads from
         # `a2a_g_hbm` can't be reordered before the gather completes.
-        @pl.when(remote_sz > 0)
-        def _(remote_sz=remote_sz, e_sem_id=e_sem_id):
-            ref = a2a_g_hbm.at[0, pl.ds(0, remote_sz)]
-            pltpu.make_async_copy(
-                src_ref=ref,
-                dst_ref=ref,
-                sem=send_x2_sems.at[e_sem_id],
-            ).wait()
+        ref = a2a_g_hbm.at[0, pl.ds(0, remote_sz)]
+        pltpu.make_async_copy(
+            src_ref=ref,
+            dst_ref=ref,
+            sem=send_x2_sems.at[e_sem_id],
+        ).wait()
 
     def wait_a2a_gather_recv_all(*, bt_size):
         # Align to f5b4: wait using a flat slice into `a2a_g_hbm` sized to the
@@ -1563,16 +1531,13 @@ def _fused_ep_moe_kernel(
 
     def wait_store_output(*, bt_id):
         is_valid = jnp.logical_and(bt_id >= 0, bt_id < num_bt)
-
-        @pl.when(is_valid)
-        def _(bt_id=bt_id):
-            sz = pl.multiple_of(bt, bt)
-            bt_sem_id = (bt_id + 2) & 1
-            pltpu.make_async_copy(
-                src_ref=output_hbm.at[pl.ds(0, sz)],
-                dst_ref=output_hbm.at[pl.ds(0, sz)],
-                sem=local_sems.at[bt_sem_id, 4],
-            ).wait()
+        sz = pl.multiple_of(lax.select(is_valid, bt, 0), bt)
+        bt_sem_id = (bt_id + 2) & 1
+        pltpu.make_async_copy(
+            src_ref=output_hbm.at[pl.ds(0, sz)],
+            dst_ref=output_hbm.at[pl.ds(0, sz)],
+            sem=local_sems.at[bt_sem_id, 4],
+        ).wait()
 
     ### ------- Kernel start ------- ###
     sync_barrier()
@@ -1614,8 +1579,9 @@ def _fused_ep_moe_kernel(
         # Start a2a gather to send back tokens for CURRENT active expert.
         start_a2a_gather(bt_sem_id=bt_sem_id, e_sem_id=e_sem_id, local_e_id=local_e_id)
 
-        # A must-wait before next sync_barrier.
+        # A must-wait before sync_barrier (matches epic/integrate-fused-moe).
         wait_a2a_scatter_send(e_sem_id)
+        sync_barrier()
         return next_e_sem_id
 
     if num_bt >= 1:
