@@ -1556,7 +1556,6 @@ def _fused_ep_moe_kernel(
     sync_barrier()
 
     def run_per_expert(local_e_id, e_sem_id, *, bt_sem_id, bt_start):
-        sync_barrier()
         if not a2a_only:
             # Prefetch weights for CURRENT active expert.
             # TODO(jevinjiang): It is hard to prefetch weights in previous iteration
