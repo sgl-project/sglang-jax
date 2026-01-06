@@ -86,6 +86,10 @@ class GlobalScheduler:
         for stage in self.stage_list:
             thread = threading.Thread(target=stage.run_stage)
             thread.start()
+        for i, q in enumerate(self.out_queues):
+            status = q.get()
+            if status["status"] != "ready":
+                raise Exception(f"stage {i} init failed")
 
     def recv_request(self):
         recv_reqs = []
