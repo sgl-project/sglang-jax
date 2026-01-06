@@ -137,7 +137,6 @@ def prepare_gmm_inputs(
 
 def prepare_fused_moe_inputs(
     case: MoEBenchmarkCase,
-    scenario: str,
     dtype: jnp.dtype = jnp.bfloat16,
     mesh: jax.sharding.Mesh | None = None,
     *,
@@ -158,13 +157,9 @@ def prepare_fused_moe_inputs(
                 (case.num_experts, case.intermediate_size, case.hidden_size),
                 dtype=dtype,
             )
-        router_logits = generate_router_logits(
-            case.num_tokens,
-            case.num_experts,
-            scenario,
-            num_experts_per_tok=case.top_k,
-            imbalance_factor=case.routed_scaling_factor or 3.0,
-        ).astype(dtype)
+        # For fused_moe benchmarks, routing can be made deterministic inside the
+        # kernel via `balanced_topk`, so router logits are unnecessary here.
+        router_logits = jnp.zeros((case.num_tokens, case.num_experts), dtype=dtype)
         out["router_logits"] = router_logits
         return out
 
@@ -214,14 +209,12 @@ def prepare_fused_moe_inputs(
             ),
             out_shardings=w2_sharding,
         )()
-    router_logits = generate_router_logits(
-        case.num_tokens,
-        case.num_experts,
-        scenario,
-        num_experts_per_tok=case.top_k,
-        imbalance_factor=case.routed_scaling_factor or 3.0,
-    ).astype(dtype)
-    router_logits = jax.device_put(router_logits, logits_sharding)
+    # For fused_moe benchmarks, routing can be made deterministic inside the
+    # kernel via `balanced_topk`, so router logits are unnecessary here.
+    router_logits = jax.jit(
+        lambda: jnp.zeros((case.num_tokens, case.num_experts), dtype=dtype),
+        out_shardings=logits_sharding,
+    )()
     out["router_logits"] = router_logits
     return out
 

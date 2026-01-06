@@ -533,6 +533,8 @@ class FusedEPMoE(nnx.Module):
         activation: str = "silu",
         layer_id: int = 0,
         renormalize_topk_logits: bool = False,
+        *,
+        balanced_topk: bool = False,
     ):
         self.hidden_size = hidden_size
         self.num_experts = num_experts
@@ -544,6 +546,7 @@ class FusedEPMoE(nnx.Module):
         self.ep_size = ep_size
         self.activation = activation
         self.renormalize_topk_logits = renormalize_topk_logits
+        self.balanced_topk = balanced_topk
         self.mesh = mesh
 
         if num_experts % self.ep_size != 0:
@@ -608,6 +611,7 @@ class FusedEPMoE(nnx.Module):
             gating_output=router_logits,
             top_k=self.num_experts_per_tok,
             renormalize_topk_logits=self.renormalize_topk_logits,
+            balanced_topk=self.balanced_topk,
             act_fn=self.activation,
             block_config=block_config,
             # Optional parameters (not used in basic case)

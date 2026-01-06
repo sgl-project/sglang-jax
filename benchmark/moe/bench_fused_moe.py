@@ -2,7 +2,7 @@
 Benchmark fused_moe kernel with grouped-GEMM-like MoE shapes.
 
 Usage:
-    python -m benchmark.moe.bench_fused_moe [--scenario random|balanced|imbalanced] [--tune-block-config]
+    python -m benchmark.moe.bench_fused_moe [--tune-block-config]
 """
 
 from __future__ import annotations
@@ -338,7 +338,6 @@ def select_block_configs(
 
 
 def run_all(
-    scenario: str,
     iters: int,
     dtype: jnp.dtype = jnp.bfloat16,
     *,
@@ -386,7 +385,9 @@ def run_all(
     if tune_block_config:
         from sgl_jax.srt.utils.jax_utils import get_device_name
 
-    print(f"Running fused_moe benchmarks with scenario='{scenario}', dtype={dtype}")
+    balanced_topk = True
+    print(f"Running fused_moe benchmarks with dtype={dtype}")
+    print("  mode: balanced_topk=True (deterministic cyclic routing)")
     for case in cases:
         t_packing = _dtype_packing(dtype)
         local_num_tokens = case.num_tokens // case.ep_size
@@ -407,9 +408,7 @@ def run_all(
         )
 
         mesh = build_mesh(ep_size=case.ep_size, tp_size=case.tp_size)
-        data = prepare_fused_moe_inputs(
-            case, scenario, dtype=dtype, mesh=mesh, include_weights=False
-        )
+        data = prepare_fused_moe_inputs(case, dtype=dtype, mesh=mesh, include_weights=False)
         block_cfgs: list[FusedMoEBlockConfig | None]
         if tune_block_config:
             block_cfgs = select_block_configs(
@@ -438,6 +437,7 @@ def run_all(
                 activation=case.activation,
                 layer_id=0,
                 renormalize_topk_logits=case.renormalize_topk_logits,
+                balanced_topk=balanced_topk,
             )
 
             moe_def, moe_state = nnx.split(fused_layer)
@@ -534,12 +534,6 @@ def run_all(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Benchmark fused_moe.")
-    parser.add_argument(
-        "--scenario",
-        choices=["random", "balanced", "imbalanced"],
-        default="random",
-        help="Router logits distribution pattern.",
-    )
     parser.add_argument("--iters", type=int, default=3, help="Number of benchmark iterations.")
     parser.add_argument(
         "--warmup-iters",
@@ -619,7 +613,6 @@ if __name__ == "__main__":
         _compilation_cache.set_cache_dir(args.compilation_cache_dir)
     tpu_vmem_budget_bytes = int(args.tpu_vmem_budget_mb) * 1024 * 1024
     run_all(
-        args.scenario,
         args.iters,
         warmup_iters=args.warmup_iters,
         tune_block_config=args.tune_block_config,

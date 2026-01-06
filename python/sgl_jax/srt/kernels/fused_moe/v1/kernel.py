@@ -408,6 +408,7 @@ def _fused_ep_moe_kernel(
     *,
     top_k: int,
     renormalize_topk_logits: bool,
+    balanced_topk: bool,
     ep_axis_name: str,
     act_fn: str,
     subc_quant_wsz: int | None = None,
@@ -520,6 +521,31 @@ def _fused_ep_moe_kernel(
         ).wait()
 
     def get_top_k(input, top_k, renormalize_topk_logits, *, out_top_k_logits_vmem):
+        if balanced_topk:
+            # Deterministic cyclic routing for benchmarking / tuning. This mirrors
+            # 6be3aa2b9... "balanced gate" top-k: it avoids data-dependent routing
+            # variance so tuning can focus on compute/comm tiling.
+            num_tokens = input.shape[0]
+            token_iota = jax.lax.broadcasted_iota(jnp.int32, (num_tokens, padded_top_k), 0)
+            k_iota = jax.lax.broadcasted_iota(jnp.int32, (num_tokens, padded_top_k), 1)
+            t2e_routing = jnp.where(
+                k_iota < top_k,
+                (token_iota * top_k + k_iota) % num_experts,
+                jnp.int32(0),
+            )
+
+            avg_size = (num_tokens * top_k) // num_experts
+            expert_sizes = jnp.full((1, padded_num_experts), avg_size, dtype=jnp.int32)
+            remainder = (num_tokens * top_k) % num_experts
+            expert_idx_iota = jax.lax.broadcasted_iota(jnp.int32, (1, padded_num_experts), 1)
+            expert_sizes = jnp.where(expert_idx_iota < remainder, expert_sizes + 1, expert_sizes)
+
+            out_top_k_logits_vmem[...] = jnp.full(
+                out_top_k_logits_vmem.shape, 1.0 / top_k, dtype=jnp.float32
+            )
+            expert_starts = jnp.zeros_like(expert_sizes)
+            return t2e_routing, expert_sizes, expert_starts
+
         assert len(input.shape) == 2, input.shape
         input = input.astype(jnp.float32)
         padded_k_shape = (input.shape[0], padded_top_k)
@@ -1814,6 +1840,7 @@ def fused_ep_moe(
     top_k: int,
     *,
     renormalize_topk_logits: bool = False,
+    balanced_topk: bool = False,
     act_fn: str = "silu",
     subc_quant_wsz: int | None = None,
     w1_scale: (
@@ -1997,6 +2024,7 @@ def fused_ep_moe(
                 _fused_ep_moe_kernel,
                 top_k=top_k,
                 renormalize_topk_logits=renormalize_topk_logits,
+                balanced_topk=balanced_topk,
                 ep_axis_name=ep_axis_name,
                 act_fn=act_fn,
                 subc_quant_wsz=subc_quant_wsz,
