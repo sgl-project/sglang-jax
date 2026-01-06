@@ -324,8 +324,6 @@ def run_all(
     dtype: jnp.dtype = jnp.bfloat16,
     *,
     warmup_iters: int = 1,
-    a2a_only: bool = False,
-    no_comm: bool = False,
     tune_block_config: bool = False,
     bt_candidates: list[int] | None = None,
     bts_candidates: list[int] | None = None,
@@ -370,10 +368,6 @@ def run_all(
         from sgl_jax.srt.utils.jax_utils import get_device_name
 
     print(f"Running fused_moe benchmarks with scenario='{scenario}', dtype={dtype}")
-    if a2a_only:
-        print("  mode: a2a_only=True")
-    if no_comm:
-        print("  mode: no_comm=True")
     for case in cases:
         t_packing = _dtype_packing(dtype)
         local_num_tokens = case.num_tokens // case.ep_size
@@ -425,8 +419,6 @@ def run_all(
                 activation=case.activation,
                 layer_id=0,
                 renormalize_topk_logits=case.renormalize_topk_logits,
-                a2a_only=a2a_only,
-                no_comm=no_comm,
             )
 
             moe_def, moe_state = nnx.split(fused_layer)
@@ -537,19 +529,6 @@ def parse_args() -> argparse.Namespace:
         help="Number of warmup iterations before profiling (per case / block_config).",
     )
     parser.add_argument(
-        "--a2a-only",
-        action="store_true",
-        help="Skip expert FFN compute (measure mostly routing + A2A + accumulation).",
-    )
-    parser.add_argument(
-        "--no-comm",
-        action="store_true",
-        help=(
-            "Disable cross-device communication (no all-reduce / no A2A remote copies). "
-            "This is a perf microbenchmark mode and does not preserve EP-MoE semantics."
-        ),
-    )
-    parser.add_argument(
         "--tune-block-config",
         action="store_true",
         help="Benchmark multiple block_config variants and print the best tuned table entry.",
@@ -623,8 +602,6 @@ if __name__ == "__main__":
         args.scenario,
         args.iters,
         warmup_iters=args.warmup_iters,
-        a2a_only=args.a2a_only,
-        no_comm=args.no_comm,
         tune_block_config=args.tune_block_config,
         bt_candidates=args.bt_candidates,
         bts_candidates=args.bts_candidates,
