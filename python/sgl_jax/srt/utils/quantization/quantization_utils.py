@@ -97,7 +97,7 @@ def apply_qwix_quantization(
     if quant_config is None:
         raise ValueError(
             "apply_qwix_quantization called but model_config.quantization_config is None. "
-            "Ensure quantization_mode is set."
+            "Ensure --quantization-config-path is set."
         )
 
     qwix_config = quant_config.get_qwix_rules()

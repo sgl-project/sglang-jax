@@ -438,8 +438,7 @@ class ServerArgs:
             default=ServerArgs.quantization_config_path,
             help="Path to quantization config YAML file. Can be an absolute path, "
             "relative path, or just a filename (will look up in built-in configs). "
-            "Built-in configs: int8_all_modules_w_only.yaml, fp8_all_modules_w_only.yaml, "
-            "fp8_all_modules_w8a8.yaml",
+            "Built-in configs: int8.yaml, fp8.yaml, fp8_w8a8.yaml",
         )
         parser.add_argument(
             "--kv-cache-dtype",
