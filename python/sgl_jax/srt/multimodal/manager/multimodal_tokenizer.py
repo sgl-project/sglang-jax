@@ -42,8 +42,10 @@ class MMReqState:
 class MultimodalTokenizer(TokenizerManager):
     def __init__(self, server_args, port_args):
         super().__init__(server_args, port_args)
+        #  this will cast warning when use_fast=True  like
+        #  "Using `use_fast=True` but `torchvision` is not available. Falling back to the slow image processor."
         self.mm_processor = AutoImageProcessor.from_pretrained(
-            server_args.model_path, use_fast=True
+            server_args.model_path, use_fast=False
         )
         self.rid_to_state: dict[str, MMReqState] = {}
         # todo: rewrite this
@@ -57,7 +59,9 @@ class MultimodalTokenizer(TokenizerManager):
         )
 
     def _handle_batch_output(self, reqs: list):
-        print(f"handle_batch_output {reqs}, self.rid_to_state {self.rid_to_state}")
+        print("_handle_batch_output...")
+        if len(reqs) > 0 and self.server_args.log_requests:
+            logger.info("handle_batch_output %s, self.rid_to_state %s", reqs, self.rid_to_state)
         for req in reqs:
             if req.rid in self.rid_to_state:
                 self.rid_to_state[req.rid].finished = True

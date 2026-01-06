@@ -94,7 +94,7 @@ class UniPCMultistepScheduler(SchedulerMixin):
         predict_x0: bool = True,
         solver_type: str = "bh2",
         lower_order_final: bool = True,
-        # disable_corrector: list[int] = [],
+        disable_corrector: list[int] | tuple = (),
         solver_p: SchedulerMixin | None = None,
         use_karras_sigmas: bool | None = False,
         use_exponential_sigmas: bool | None = False,
@@ -246,7 +246,7 @@ class UniPCMultistepScheduler(SchedulerMixin):
             sigmas = jnp.flip(
                 self.config.flow_shift * sigmas / (1 + (self.config.flow_shift - 1) * sigmas)
             )[:-1].copy()
-            timesteps = (sigmas * self.config.num_train_timesteps).copy().astype(jnp.int64)
+            timesteps = (sigmas * self.config.num_train_timesteps).copy().astype(jnp.int32)
             if self.config.final_sigmas_type == "sigma_min":
                 sigma_last = sigmas[-1]
             elif self.config.final_sigmas_type == "zero":

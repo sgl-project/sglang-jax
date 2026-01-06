@@ -484,7 +484,17 @@ class WanTransformer3DModel(nnx.Module):
         print("[1] input:", hidden_states.shape)
         # origin_dtype = hidden_states.dtype
         if isinstance(encoder_hidden_states, list):
-            encoder_hidden_states = encoder_hidden_states[0]
+            # assert len(encoder_hidden_states) > 1, "encoder_hidden_states list is empty"
+            # FIXME(pc)
+            if len(encoder_hidden_states) == 0:
+                # Mock encoder hidden states for testing when no text encoder is used
+                # 4096 is the typical hidden dimension for T5 encoder used in Wan2.1
+                # Use a sequence length of 512 to better match typical T5 output
+                encoder_hidden_states = jax.random.normal(
+                    jax.random.key(0), (hidden_states.shape[0], 512, 4096)
+                )
+            else:
+                encoder_hidden_states = encoder_hidden_states[0]
         if isinstance(encoder_hidden_states_image, list):
             encoder_hidden_states_image = encoder_hidden_states_image[0]
         batch_size, num_channels, num_frames, height, width = hidden_states.shape
@@ -546,12 +556,12 @@ class WanTransformer3DModel(nnx.Module):
 
         # 4. Transformer blocks
         print("[5] blocks")
-        freqs_cis = (freqs_cos, freqs_sin)
+        # freqs_cis = (freqs_cos, freqs_sin)
         for i, block in enumerate(self.blocks):
             print(f"  [5.{i}] block {i}")
-            hidden_states = block(
-                hidden_states, encoder_hidden_states, timestep_proj, freqs_cis, req
-            )
+            # hidden_states = block(
+            #     hidden_states, encoder_hidden_states, timestep_proj, freqs_cis, req
+            # )
 
         # 5. Output norm, projection & unpatchify
         print("[6] norm_out")

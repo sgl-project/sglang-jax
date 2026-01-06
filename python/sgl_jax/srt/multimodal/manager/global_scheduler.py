@@ -25,6 +25,7 @@ logger = logging.getLogger(__name__)
 class GlobalScheduler:
     def __init__(self, server_args: ServerArgs, port_args: PortArgs) -> None:
         context = zmq.Context(2)
+        self.server_args = server_args
         self.recv_from_tokenizer = get_zmq_socket(
             context, zmq.PULL, port_args.scheduler_input_ipc_name, False
         )
@@ -42,7 +43,7 @@ class GlobalScheduler:
     def _init_stage(self):
         def _build_stage(idx_cfg: tuple[int, Any]) -> tuple[int, Stage]:
             idx, cfg = idx_cfg
-            return idx, Stage(cfg, device_manager=self.device_manager)
+            return idx, Stage(cfg, device_manager=self.device_manager, server_args=self.server_args)
 
         with ThreadPoolExecutor(
             max_workers=min(len(self.stage_configs), max(1, os.cpu_count() or 1))
@@ -61,7 +62,6 @@ class GlobalScheduler:
         for i, stage in enumerate(self.stage_list):
             stage.set_in_queue(self.in_queues[i])
             stage.set_out_queue(self.out_queues[i])
-            stage.set_stage_index(i)
         self.start_stage()
         self._request_dispatcher = TypeBasedDispatcher(
             [
@@ -112,7 +112,8 @@ class GlobalScheduler:
 
         while True:
             reqs = self.recv_request()
-            print("recv_reqs from tokenizer", reqs)
+            if len(reqs) > 0 and self.server_args.log_requests:
+                logger.info("recv_reqs from tokenizer %s", reqs)
             time.sleep(3)
             if reqs:
                 for req in reqs:
@@ -120,7 +121,13 @@ class GlobalScheduler:
             else:
                 for i, stage in enumerate(self.stage_list):
                     stage_result = Req.from_stage(stage.try_collect(), self.req_store)
-                    print("stage result", stage_result)
+                    if stage_result is not None and self.server_args.log_requests:
+                        logger.info(
+                            "stage-%d result_type=%s is_final=%s",
+                            i,
+                            type(stage_result),
+                            self.stage_configs[i].final_output,
+                        )
                     if stage_result is None:
                         continue
                     else:

@@ -1,6 +1,7 @@
 import jax
 
 from sgl_jax.srt.multimodal.common.ServerArgs import MultimodalServerArgs
+from sgl_jax.srt.multimodal.manager.schedule_batch import Req
 from sgl_jax.srt.multimodal.model_executor.diffusion.diffusion_model_runner import (
     DiffusionModelRunner,
 )
@@ -13,12 +14,12 @@ class DiffusionModelWorker:
         self.initialize()
 
     def initialize(self):
-        self.model_loader.load_model()
         pass
+        # self.model_loader.load_model()
         # init cache here if needed
         # init different attention backend if needed
 
-    def forward(self, batch, mesh):
+    def forward(self, batch: Req, mesh: jax.sharding.Mesh):
         # Implement the diffusion model inference logic here
         # latents: Array,
         # text_embeds: Array,

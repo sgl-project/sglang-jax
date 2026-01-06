@@ -13,13 +13,14 @@ class WanModelConfig:
     precision = Precision.HIGHEST
     num_layers: int = 30
     hidden_dim: int = 1536
-    latent_input_dim: int = 16
-    latent_output_dim: int = 16
+    in_channels: int = 16
+    out_channels: int = 16
     ffn_dim: int = 8960
     freq_dim: int = 256
     num_heads: int = 12
-    head_dim: int = 128
-    text_embed_dim: int = 4096
+    attention_head_dim: int = 128
+    text_dim: int = 4096
+    image_dim: int = 4096
     max_text_len: int = 512
     num_frames: int = 11
     latent_size: tuple[int, int] = (60, 90)
@@ -31,6 +32,12 @@ class WanModelConfig:
     epsilon: float = 1e-6
     added_kv_proj_dim: int | None = None  # None for T2V, set for I2V
     rope_max_seq_len: int = 1024
+    # Aliases for compatibility
+    latent_input_dim: int = 16
+    latent_output_dim: int = 16
+    head_dim: int = 128
+    text_embed_dim: int = 4096
+    num_attention_heads: int = 12
 
     def __post_init__(self):
         assert (

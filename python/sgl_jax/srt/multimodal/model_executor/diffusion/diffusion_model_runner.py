@@ -10,12 +10,10 @@ from sgl_jax.srt.model_executor.base_model_runner import BaseModelRunner
 from sgl_jax.srt.model_loader.loader import JAXModelLoader
 from sgl_jax.srt.multimodal.common.ServerArgs import MultimodalServerArgs
 from sgl_jax.srt.multimodal.configs.dits.configs import WanModelConfig
-from sgl_jax.srt.multimodal.configs.multimodal_model_configs import (
-    MultiModalModelConfigs,
-)
-from sgl_jax.srt.multimodal.manager.io_struct import VideoGenerationsRequest
+from sgl_jax.srt.multimodal.manager.schedule_batch import Req
 from sgl_jax.srt.multimodal.models.diffusion_solvers.unipc_multistep_scheduler import (
     UniPCMultistepScheduler,
+    UniPCMultistepSchedulerState,
 )
 from sgl_jax.srt.multimodal.models.wan2_1.diffusion.wan2_1_dit import (
     WanTransformer3DModel,
@@ -27,22 +25,20 @@ logger = logging.getLogger(__name__)
 # DiffusionModelRunner is responsible for running denoising steps within diffusion model inference
 class DiffusionModelRunner(BaseModelRunner):
     def __init__(self, server_args: MultimodalServerArgs, mesh: jax.sharding.Mesh = None):
-        self.model_config = MultiModalModelConfigs.from_server_args(server_args)
+        self.mesh = mesh
         load_config = LoadConfig(
             load_format=server_args.load_format,
-            # hack here
             download_dir=server_args.download_dir,
         )
-        # self.model_loader = get_model_loader(load_config, mesh)
         self.model_loader = JAXModelLoader(load_config, mesh)
 
         self.transformer_model = None
         self.transformer_2_model = None
         self.solver = None
         self.guidance = None
-        # cache-dit state (for delayed mounting and idempotent control)
         self._cache_dit_enabled = False
         self._cached_num_steps = None
+        # TODO: load model_config from server_args based on model architecture
         self.model_config = WanModelConfig
         # Additional initialization for diffusion model if needed
         # e.g., setting up noise schedulers, diffusion steps, etc.
@@ -53,7 +49,7 @@ class DiffusionModelRunner(BaseModelRunner):
         rngs = nnx.Rngs(0)
         with jax.set_mesh(self.mesh):
             self.model = WanTransformer3DModel(self.model_config, rngs=rngs)
-        self.solver = UniPCMultistepScheduler(
+        self.solver: UniPCMultistepScheduler = UniPCMultistepScheduler(
             num_train_timesteps=1000,
             beta_start=0.0001,
             beta_end=0.02,
@@ -71,12 +67,14 @@ class DiffusionModelRunner(BaseModelRunner):
         self.solver_state = self.solver.create_state()
         # Any additional initialization specific to diffusion models
 
-    def forward(self, batch: VideoGenerationsRequest, mesh):
+    def forward(self, batch: Req, mesh: jax.sharding.Mesh):
         # Implement the diffusion model inference logic here
         # This might include steps like adding noise, denoising, etc.
 
-        time_steps = batch.num_steps
-        text_embeds = batch.text_embeds
+        num_inference_steps = batch.num_inference_steps
+        # time_steps = batch.timesteps
+        text_embeds = batch.prompt_embeds
+        print(f"{text_embeds=}")
         guidance_scale = batch.guidance_scale
         do_classifier_free_guidance = guidance_scale > 1.0
         batch.latents = jax.random.normal(
@@ -91,22 +89,25 @@ class DiffusionModelRunner(BaseModelRunner):
             dtype=jnp.float32,
         )  # Placeholder for latents
         latents = batch.latents
-        solver_state = None
-        solver_state = self.solver.set_time_steps(
-            solver_state, num_inference=time_steps, shape=latents.transpose(0, 4, 1, 2, 3).shape
+        solver_state: UniPCMultistepSchedulerState = self.solver.set_timesteps(
+            self.solver_state,
+            num_inference_steps=num_inference_steps,
+            shape=latents.transpose(0, 4, 1, 2, 3).shape,
         )
-        for step in time_steps:
+        for step in range(num_inference_steps):
             start_time = time.time()
             logging.info("Starting diffusion step %d", step)
             t_scalar = jnp.array(solver_state.timesteps, dtype=jnp.int32)[step]
             t_batch = jnp.broadcast_to(t_scalar, latents.shape[0])
             if do_classifier_free_guidance:
                 latents = jnp.concatenate([latents] * 2)
+            # Transpose to channel-first (B, T, H, W, C) -> (B, C, T, H, W) for model
+            latents_cf = latents.transpose(0, 4, 1, 2, 3)
             # Perform denoising step
-            noise_pred: jax.Array = self.model.forward(
-                hidden_states=latents,
+            noise_pred: jax.Array = self.model(
+                hidden_states=latents_cf,
                 encoder_hidden_states=text_embeds,
-                time_steps=t_batch,
+                timesteps=t_batch,
                 encoder_hidden_states_image=None,
                 guidance_scale=None,
             )
@@ -116,11 +117,13 @@ class DiffusionModelRunner(BaseModelRunner):
                 noise_pred = noise_pred[:bsz]
                 noise_pred = noise_uncond + guidance_scale * (noise_pred - noise_uncond)
                 latents = latents[:bsz]
-            latents, self.solver_state = self.solver.step(
-                self.solver_state,
-                noise_pred.transpose(0, 4, 1, 2, 3),
+            # noise_pred is already channel-first (B, C, T, H, W) from model
+            # latents is channel-last (B, T, H, W, C), need to transpose for solver
+            latents, solver_state = self.solver.step(
+                solver_state,
+                noise_pred,  # already (B, C, T, H, W)
                 t_scalar,
-                latents.transpose(0, 4, 1, 2, 3),
+                latents.transpose(0, 4, 1, 2, 3),  # (B, T, H, W, C) -> (B, C, T, H, W)
             )
 
             latents = latents.transpose(0, 2, 3, 4, 1)  # back to channel-last

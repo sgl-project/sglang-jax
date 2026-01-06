@@ -101,7 +101,7 @@ class Req:
     boundary_ratio: float | None = None
 
     # Scheduler parameters
-    num_inference_steps: int = 50
+    num_inference_steps: int = 5
     ## guidance_scale 越大，图像或者视频更贴近prompt
     guidance_scale: float = 1.0
     guidance_scale_2: float | None = None

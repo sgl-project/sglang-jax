@@ -12,6 +12,7 @@ from sgl_jax.srt.multimodal.manager.scheduler.diffusion_scheduler import (
     DiffusionScheduler,
 )
 from sgl_jax.srt.multimodal.manager.scheduler.vae_scheduler import VaeScheduler
+from sgl_jax.srt.server_args import ServerArgs
 from sgl_jax.srt.utils.mesh_utils import create_device_mesh
 from sgl_jax.utils import get_exception_traceback
 
@@ -19,7 +20,9 @@ logger = logging.getLogger(__name__)
 
 
 class Stage:
-    def __init__(self, stage_config: Any, *, device_manager: DeviceManager):
+    def __init__(
+        self, stage_config: Any, *, device_manager: DeviceManager, server_args: ServerArgs
+    ):
         self._in_queue = None
         self._out_queue = None
         # this parallelism setting is accord to stage config
@@ -29,6 +32,8 @@ class Stage:
             device_indexes=device_manager.allocate(stage_config.runtime.num_tpus),
         )
         self.stage_config = stage_config
+        self.server_args = server_args
+        self.stage_id = stage_config.stage_id
         # mesh
 
     def set_in_queue(self, in_queue: Queue):
@@ -37,24 +42,34 @@ class Stage:
     def set_out_queue(self, out_queue: Queue):
         self._out_queue = out_queue
 
-    def set_stage_index(self, stage_index):
-        self.stage_index = stage_index
-
     def run_stage(self):
         parent_process = psutil.Process().parent()
         try:
-            print(f"stage start {self.stage_index}")
+            logger.info(
+                "Stage-%d is initializing, Scheduler:%s, Params:%s",
+                self.stage_id,
+                self.stage_config.scheduler,
+                self.stage_config.scheduler_params,
+            )
             # todo according to config to decide which scheduler to use
             scheduler_class = get_scheduler_class(self.stage_config.scheduler)
             comm_backend = QueueBackend(in_queue=self._in_queue, out_queue=self._out_queue)
             self._stage_scheduler = scheduler_class(
-                communication_backend=comm_backend, **self.stage_config.scheduler_params
+                communication_backend=comm_backend,
+                mesh=self.mesh,
+                server_args=self.server_args,
+                **self.stage_config.scheduler_params,
             )
             self._out_queue.put_nowait({"status": "ready"})
+            logger.info(
+                "Stage-%d initialized successfully, Scheduler:%s",
+                self.stage_id,
+                self.stage_config.scheduler,
+            )
             self._stage_scheduler.event_loop()
         except Exception:
             traceback = get_exception_traceback()
-            logger.error("stage hit an exception: %s", traceback)
+            logger.error("Stage-%d hit exception: %s", self.stage_id, traceback)
             parent_process.send_signal(signal.SIGQUIT)
 
     def try_collect(self):

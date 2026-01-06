@@ -11,6 +11,7 @@ def load_stage_configs_from_yaml(config_path: str) -> list:
         List of stage configuration dictionaries from the file's stage_args
     """
     config_data = OmegaConf.load(config_path)
+
     return config_data.stage_args
 
 
