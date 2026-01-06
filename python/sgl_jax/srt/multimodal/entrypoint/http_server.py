@@ -13,10 +13,10 @@ from sgl_jax.srt.managers.template_manager import TemplateManager
 from sgl_jax.srt.multimodal.common.ServerArgs import MultimodalServerArgs
 from sgl_jax.srt.multimodal.manager.global_scheduler import run_global_scheduler_process
 from sgl_jax.srt.multimodal.manager.io_struct import (
+    DataType,
     GenerateMMReqInput,
     ImageGenerationsRequest,
     VideoGenerationsRequest,
-    VideoResponse,
 )
 from sgl_jax.srt.multimodal.manager.multimodal_detokenizer import (
     run_multimodal_detokenizer_process,
@@ -48,13 +48,36 @@ async def images_generation(obj: ImageGenerationsRequest, request: Request):
 
 
 async def _convert_to_internal_request(obj: ImageGenerationsRequest | VideoGenerationsRequest):
-    return GenerateMMReqInput(prompt=obj.prompt, size=obj.size, num_frames=1)
+    if type(obj) is ImageGenerationsRequest:
+        num_frames = 1
+        data_type = DataType.IMAGE
+    elif type(obj) is VideoGenerationsRequest:
+        num_frames = obj.num_frames
+        data_type = DataType.VIDEO
+    else:
+        raise Exception(f"not supported type {type(obj)}")
+    return GenerateMMReqInput(
+        prompt=obj.prompt,
+        size=obj.size,
+        num_frames=num_frames,
+        data_type=data_type,
+        save_output=obj.save_output,
+    )
 
 
 @app.api_route("/api/v1/videos/generation", methods=["POST", "PUT"])
 async def videos_generation(obj: VideoGenerationsRequest, request: Request):
-    print(f"receive req {obj}")
-    return VideoResponse(id="test")
+    try:
+        from sgl_jax.srt.entrypoints.http_server import _global_state
+
+        internal_obj = await _convert_to_internal_request(obj)
+        ret = await _global_state.tokenizer_manager.generate_request(
+            internal_obj, request
+        ).__anext__()
+        return ret
+    except ValueError as e:
+        logger.error("[http_server] Error: %s", e)
+        return _create_error_response(e)
 
 
 def launch(

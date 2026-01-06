@@ -1,5 +1,6 @@
 import dataclasses
 import uuid
+from enum import Enum, auto
 
 import numpy as np
 from pydantic import BaseModel
@@ -13,6 +14,7 @@ class ImageGenerationsRequest(BaseModel):
     size: str | None = "1024x1024"  # e.g., 1024x1024
     background: str | None = "auto"  # transparent | opaque | auto
     output_format: str | None = None  # png | jpeg | webp
+    save_output: bool = True
 
 
 class ImageResponse(BaseModel):
@@ -29,6 +31,7 @@ class VideoGenerationsRequest(BaseModel):
     size: str | None = "720x1280"
     fps: int | None = None
     num_frames: int | None = None
+    save_output: bool = True
     # num_steps: int | None = 30
     # guidance_scale: float | None = 5.0
     # text_embeds: np.ndarray | None = None
@@ -40,9 +43,21 @@ class VideoResponse(BaseModel):
     path: str | None = None
 
 
+class DataType(Enum):
+    IMAGE = auto()
+    VIDEO = auto()
+
+    def get_default_extension(self) -> str:
+        if self == DataType.IMAGE:
+            return "jpg"
+        else:
+            return "mp4"
+
+
 @dataclasses.dataclass
 class GenerateMMReqInput:
     rid: str | None = None
+    data_type: DataType | None = None
     prompt: str | None = None
     input_ids: list[int] | None = None
     n: int | None = 1
@@ -51,6 +66,7 @@ class GenerateMMReqInput:
     seconds: int | None = None
     fps: int | None = None
     num_frames: int | None = None
+    save_output: bool = True
     output_format: str | None = None
     background: str | None = None
     response_format: str | None = None
@@ -62,6 +78,7 @@ class GenerateMMReqInput:
 @dataclasses.dataclass
 class TokenizedGenerateMMReqInput:
     rid: str | None = None
+    data_type: DataType | None = None
     prompt: str | None = None
     input_ids: list[int] | None = None
     negative_prompt: str | None = None
@@ -74,5 +91,6 @@ class TokenizedGenerateMMReqInput:
     fps: int | None = None
     num_frames: int | None = None
     output_format: str | None = None
+    save_output: bool = True
     background: str | None = None
     response_format: str | None = None

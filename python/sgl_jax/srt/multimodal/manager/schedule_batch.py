@@ -5,6 +5,7 @@ import jax
 import PIL.Image
 
 from sgl_jax.srt.managers.io_struct import BatchTokenIDOut, TokenizedGenerateReqInput
+from sgl_jax.srt.multimodal.manager.io_struct import DataType
 from sgl_jax.srt.sampling.sampling_params import SamplingParams
 
 
@@ -21,7 +22,7 @@ class Req:
     # TODO(will): double check that args are separate from server_args
     # properly. Also maybe think about providing an abstraction for pipeline
     # specific arguments.
-    # data_type: DataType
+    data_type: DataType
 
     rid: str | None = None
     # 随机数生成器
@@ -169,8 +170,12 @@ class Req:
             return self
 
     @staticmethod
-    def from_stage(stage_result: Any):
+    def from_stage(stage_result: Any, req_store: dict):
         if type(stage_result) is BatchTokenIDOut:
-            return Req(rid=stage_result.rids[0], prompt_embeds=stage_result.output_hidden_states)
+            if stage_result.rids[0] not in req_store:
+                raise RuntimeError(f"{stage_result.rids[0]} is not in req_store")
+            req = req_store[stage_result.rids[0]]
+            req.prompt_embeds = stage_result.output_hidden_states
+            return req
         else:
             return stage_result

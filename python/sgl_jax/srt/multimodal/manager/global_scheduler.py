@@ -37,6 +37,7 @@ class GlobalScheduler:
         )
         self.device_manager = DeviceManager()
         self._init_stage()
+        self.req_store = dict()
 
     def _init_stage(self):
         def _build_stage(idx_cfg: tuple[int, Any]) -> tuple[int, Stage]:
@@ -77,7 +78,12 @@ class GlobalScheduler:
             height_latents=int(input.size.split("*")[0]),
             width_latents=int(input.size.split("*")[1]),
             num_frames=input.num_frames,
+            data_type=input.data_type,
+            save_output=input.save_output,
         )
+        if req.rid in self.req_store:
+            raise RuntimeError(f"{req.rid} is already in req_store")
+        self.req_store[req.rid] = req
         return req
 
     def start_stage(self):
@@ -113,7 +119,7 @@ class GlobalScheduler:
                     self.in_queues[0].put_nowait(self._request_dispatcher(req))
             else:
                 for i, stage in enumerate(self.stage_list):
-                    stage_result = Req.from_stage(stage.try_collect())
+                    stage_result = Req.from_stage(stage.try_collect(), self.req_store)
                     print("stage result", stage_result)
                     if stage_result is None:
                         continue
