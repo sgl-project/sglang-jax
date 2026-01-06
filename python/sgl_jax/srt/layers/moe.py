@@ -175,7 +175,7 @@ class TopK(nnx.Module):
 class EPMoE(nnx.Module):
     def __init__(
         self,
-        config, #PretrainedConfig
+        config,
         num_experts: int,
         num_experts_per_tok: int,
         ep_size: int,
@@ -198,14 +198,10 @@ class EPMoE(nnx.Module):
         self.mesh = mesh
         self.activation = activation
 
-        # Get quantization settings from config (unified QuantizationConfig)
+        # Get quantization settings from config
         quant_config = getattr(config, 'quantization_config', None)
-        if quant_config is not None:
-            self.quantized_dtype = quant_config.get_moe_weight_dtype()
-            self.activation_quantized_dtype = quant_config.get_moe_activation_dtype()
-        else:
-            self.quantized_dtype = None
-            self.activation_quantized_dtype = None
+        self.quantized_dtype = quant_config.get_moe_weight_dtype() if quant_config else None
+        self.activation_quantized_dtype = quant_config.get_moe_activation_dtype() if quant_config else None
 
         if num_experts % self.ep_size != 0:
             raise ValueError(
@@ -276,11 +272,7 @@ class EPMoE(nnx.Module):
             return False, "cpu"
 
     def quantize_weights(self):
-        """Quantize MoE weights in-place. Call once after model loading.
-        
-        This method quantizes wi_0, wi_1, wo weights and updates the scales.
-        After calling this, __call__ will use the pre-quantized weights.
-        """
+        """Quantize MoE weights in-place. Call once after model loading."""
         if self.quantized_dtype is None:
             return
         
@@ -301,12 +293,18 @@ class EPMoE(nnx.Module):
             self.wo_scale = wo_scale.reshape(wo_scale.shape[0], 1, 1, wo_scale.shape[1])
 
     def __call__(self, hidden_states, topk_weights, topk_ids) -> jax.Array:
-        hidden_states_reshard = None
-        hidden_states_scale = None
-        if self.quantized_dtype is not None:
-            hidden_states_reshard, hidden_states_scale = quantize_tensor(self.quantized_dtype, hidden_states, axis=1, out_sharding=P(None))
+        # Quantize activations if enabled
+        if self.activation_quantized_dtype is not None:
+            hidden_states_q, hidden_states_scale = quantize_tensor(
+                self.activation_quantized_dtype, hidden_states, axis=1, out_sharding=P(None)
+            )
+        else:
+            hidden_states_q = hidden_states
+            hidden_states_scale = None
+
+        # Run MoE computation on the expert-parallel mesh
         with jax.sharding.use_abstract_mesh(self.updated_mesh):
-            hidden_states_reshard = jax.sharding.reshard(hidden_states_reshard, P(None))
+            hidden_states_reshard = jax.sharding.reshard(hidden_states_q, P(None))
             topk_weights_reshard = jax.sharding.reshard(topk_weights, P(None))
             topk_ids_reshard = jax.sharding.reshard(topk_ids, P(None))
             
@@ -317,18 +315,16 @@ class EPMoE(nnx.Module):
                 self._forward,
                 mesh=self.moe_mesh,
                 in_specs=(
-                    P(None),
-                    P(None),
-                    P(None),
-                    # value
+                    P(None), P(None), P(None),
+                    # weights
                     P("expert", None, "tensor"),
                     P("expert", None, "tensor"),
                     P("expert", "tensor", None),
-                    # scale
+                    # scales
                     P("expert", None, None, "tensor"),
                     P("expert", None, None, "tensor"),
                     P("expert", None, None, None),
-                    # bias
+                    # biases (unused)
                     P("expert", None, "tensor"),
                     P("expert", None, "tensor"),
                     P("expert", "tensor", None),
@@ -336,23 +332,23 @@ class EPMoE(nnx.Module):
                 out_specs=P(None),
                 check_vma=False,
             )(
-                hidden_states_reshard,
-                topk_weights_reshard,
-                topk_ids_reshard,
-                self.wi_0.value,
-                self.wi_1.value,
-                self.wo.value,
-                self.wi_0_scale, self.wi_1_scale, self.wo_scale, None, None, None,
+                hidden_states_reshard, topk_weights_reshard, topk_ids_reshard,
+                self.wi_0.value, self.wi_1.value, self.wo.value,
+                self.wi_0_scale, self.wi_1_scale, self.wo_scale,
+                None, None, None,
             )
 
-        output_pspec = P(*([None] * (result_q.ndim)))
-        hidden_states_scale_reshard = jax.sharding.reshard(hidden_states_scale, jax.sharding.NamedSharding(self.original_mesh, output_pspec))
-        result_q = jax.sharding.reshard(result_q, jax.sharding.NamedSharding(self.original_mesh, output_pspec))
-        # print scale's sharding
-        if self.quantized_dtype is not None:
-            result = dequantize_tensor(result_q, hidden_states_scale_reshard, axis=1)
-        else:
-            result = result_q
+        # Reshard result back to original mesh
+        replicated_pspec = P(*([None] * result_q.ndim))
+        result = jax.sharding.reshard(
+            result_q, jax.sharding.NamedSharding(self.mesh, replicated_pspec)
+        )
+        
+        # Dequantize if activations were quantized
+        # (hidden_states_scale was created outside the abstract mesh block, already on original mesh)
+        if hidden_states_scale is not None:
+            result = dequantize_tensor(result, hidden_states_scale, axis=1)
+        
         return result
 
     def _forward(self, hidden_states, topk_weights, topk_ids, w0_weights, w1_weights, wo_weights,
