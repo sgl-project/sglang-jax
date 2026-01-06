@@ -50,7 +50,7 @@ class DiffusionModelRunner(BaseModelRunner):
 
     def initialize(self):
         # self.model = self.model_loader.load_model(model_config=self.model_config)
-        rngs = nnx.Rngs(params=nnx.Rngs(0))
+        rngs = nnx.Rngs(0)
         with jax.set_mesh(self.mesh):
             self.model = WanTransformer3DModel(self.model_config, rngs=rngs)
         self.solver = UniPCMultistepScheduler(

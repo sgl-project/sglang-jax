@@ -105,7 +105,6 @@ class TimestepEmbedder(nnx.Module):
             ), "timestep length is not divisible by timestep_seq_len"
             batch_size = t_freq.shape[0] // timestep_seq_len
             t_freq = t_freq.reshape((batch_size, timestep_seq_len, -1))
-        # t_freq = t_freq.to(self.mlp.fc_in.weight.dtype)
         t_emb = self.mlp(t_freq)
         return t_emb
 

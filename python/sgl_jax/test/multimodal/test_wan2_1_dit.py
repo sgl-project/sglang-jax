@@ -1,8 +1,13 @@
 import unittest
 
 import jax
+import jax.numpy as jnp
 from flax import nnx
 
+from sgl_jax.srt.layers.attention.flashattention_backend import (
+    FlashAttention,
+    FlashAttentionMetadata,
+)
 from sgl_jax.srt.multimodal.models.wan2_1.diffusion.wan2_1_dit import (
     WanTransformer3DModel,
 )
@@ -27,7 +32,26 @@ class MockConfig:
         self.cross_attn_norm = True
         self.epsilon = 1e-6
         self.added_kv_proj_dim = None
-        self.num_layers = 1
+        self.num_layers = 30
+
+
+class MockRequest:
+    def __init__(self, config, batch_size=1, seq_len=256):
+        self.attention_backend = FlashAttention(
+            num_attn_heads=config.num_attention_heads,
+            num_kv_heads=config.num_attention_heads,
+            head_dim=config.attention_head_dim,
+        )
+        # Mock attention metadata
+        metadata = FlashAttentionMetadata()
+        metadata.num_seqs = jnp.array([batch_size], dtype=jnp.int32)
+        metadata.cu_q_lens = jnp.array([0, seq_len], dtype=jnp.int32)
+        metadata.cu_kv_lens = jnp.array([0, seq_len], dtype=jnp.int32)
+        metadata.page_indices = jnp.arange(seq_len, dtype=jnp.int32)
+        metadata.seq_lens = jnp.array([seq_len], dtype=jnp.int32)
+        metadata.distribution = jnp.array([0, batch_size, batch_size], dtype=jnp.int32)
+        metadata.custom_mask = None
+        self.attention_backend.forward_metadata = metadata
 
 
 class TestWanTransformer3DModel(unittest.TestCase):
@@ -50,21 +74,12 @@ class TestWanTransformer3DModel(unittest.TestCase):
         # image embeddings
         encoder_hidden_states_image = jax.random.normal(jax.random.key(2), (1, 1, 32))  # B, L, D
 
-        # Run forward
-        # We wrap in nnx.jit to ensure it works with JAX transformations, though simple call is fine too.
-        @nnx.jit
-        def forward_pass(
-            model, hidden_states, encoder_hidden_states, timesteps, encoder_hidden_states_image
-        ):
-            return model(
-                hidden_states=hidden_states,
-                encoder_hidden_states=encoder_hidden_states,
-                timesteps=timesteps,
-                encoder_hidden_states_image=encoder_hidden_states_image,
-            )
-
-        output = forward_pass(
-            model, hidden_states, encoder_hidden_states, timesteps, encoder_hidden_states_image
+        # Run forward (no req needed for diffusion - uses simple attention)
+        output = model(
+            hidden_states=hidden_states,
+            encoder_hidden_states=encoder_hidden_states,
+            timesteps=timesteps,
+            encoder_hidden_states_image=encoder_hidden_states_image,
         )
 
         # Expected output shape: same as input (B, C, F, H, W) = (1, 4, 1, 32, 32)

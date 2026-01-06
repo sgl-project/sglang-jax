@@ -25,12 +25,7 @@ class WanImageEmbedding(nnx.Module):
         super().__init__()
 
         self.norm1 = FP32LayerNorm(num_features=in_features, rngs=nnx.Rngs(0))
-        self.ff = MLP(
-            input_dim=in_features,
-            mlp_hidden_dim=in_features,
-            output_dim=out_features,
-            act_type="gelu",
-        )
+        self.ff = MLP(in_features, in_features, out_features, act_type="gelu")
         self.norm2 = FP32LayerNorm(num_features=out_features, rngs=nnx.Rngs(0))
 
     def __call__(self, x: jax.Array) -> jax.Array:
@@ -136,6 +131,7 @@ class WanTransformerBlock(nnx.Module):
         encoder_hidden_states: jax.Array,
         temb: jax.Array,
         freqs_cis: tuple[jax.Array, jax.Array],
+        req=None,
     ) -> jax.Array:
         if len(hidden_states.shape) == 4:
             hidden_states = hidden_states.squeeze(1)
@@ -168,35 +164,44 @@ class WanTransformerBlock(nnx.Module):
         k, _ = self.to_k(norm_hidden_states)
         v, _ = self.to_v(norm_hidden_states)
 
-        if self.norm_q is not None:
+        if self.norm_q is not None and self.norm_q.num_features == self.hidden_dim:
             q = self.norm_q(q)
-        if self.norm_k is not None:
+        if self.norm_k is not None and self.norm_k.num_features == self.hidden_dim:
             k = self.norm_k(k)
-        q = q.squeeze(1).reshape(q.shape[0], q.shape[2], self.num_attention_heads, -1)
-        k = k.squeeze(1).reshape(k.shape[0], k.shape[2], self.num_attention_heads, -1)
-        v = v.squeeze(1).reshape(v.shape[0], v.shape[2], self.num_attention_heads, -1)
+
+        q = q.reshape(bs, seq_len, self.num_attention_heads, -1)
+        k = k.reshape(bs, seq_len, self.num_attention_heads, -1)
+        v = v.reshape(bs, seq_len, self.num_attention_heads, -1)
+
+        if self.norm_q is not None and self.norm_q.num_features != self.hidden_dim:
+            q = self.norm_q(q)
+        if self.norm_k is not None and self.norm_k.num_features != self.hidden_dim:
+            k = self.norm_k(k)
         # Apply rotary embeddings
         cos, sin = freqs_cis
         q, k = apply_rotary_emb(q, cos, sin, is_neox_style=False), apply_rotary_emb(
             k, cos, sin, is_neox_style=False
         )
-        attn_output = self.attn1(q, k, v)
-        attn_output = attn_output.flatten(2)
+        attn_output = self.attn1(q, k, v, req)
+        # Flatten last two dims: (B, seq, heads, head_dim) -> (B, seq, heads*head_dim)
+        attn_output = attn_output.reshape(attn_output.shape[0], attn_output.shape[1], -1)
         attn_output, _ = self.to_out(attn_output)
-        attn_output = attn_output.squeeze(1)
+        # Only squeeze if dim 1 has size 1 (PyTorch squeeze is no-op otherwise, JAX raises error)
+        if attn_output.shape[1] == 1:
+            attn_output = attn_output.squeeze(1)
 
-        null_shift = null_scale = jnp.zeros_like((1,), dtype=origin_dtype)
+        null_shift = null_scale = jnp.zeros((1,), dtype=origin_dtype)
         norm_hidden_states, hidden_states = self.self_attn_residual_norm(
-            hidden_states, attn_output, null_shift, null_scale
+            hidden_states, attn_output, gate_msa, null_shift, null_scale
         )
         norm_hidden_states, hidden_states = norm_hidden_states.astype(
             origin_dtype
         ), hidden_states.astype(origin_dtype)
 
         # 2. Cross-attention
-        attn_output = self.attn2(norm_hidden_states, encoder_hidden_states, context_len=None)
+        attn_output = self.attn2(norm_hidden_states, encoder_hidden_states, context_lens=None)
         norm_hidden_states, hidden_states = self.cross_attn_residual_norm(
-            hidden_states, attn_output, c_shift_msa, c_scale_msa
+            hidden_states, attn_output, 1, c_shift_msa, c_scale_msa
         )
         norm_hidden_states, hidden_states = norm_hidden_states.astype(
             origin_dtype
@@ -267,30 +272,30 @@ class WanT2VCrossAttention(WanSelfAttention):
             context(Tensor): Shape [B, L2, C]
             context_lens(Tensor): Shape [B]
         """
-        b, n, d = x.size(0), self.num_heads, self.head_dim
+        b, n, d = x.shape[0], self.num_heads, self.head_dim
 
         # compute query, key, value
-        q = self.norm_q(self.to_q(x)[0]).view(b, -1, n, d)
+        q = self.norm_q(self.to_q(x)[0]).reshape(b, -1, n, d)
 
         if crossattn_cache is not None:
             if not crossattn_cache["is_init"]:
                 crossattn_cache["is_init"] = True
-                k = self.norm_k(self.to_k(context)[0]).view(b, -1, n, d)
-                v = self.to_v(context)[0].view(b, -1, n, d)
+                k = self.norm_k(self.to_k(context)[0]).reshape(b, -1, n, d)
+                v = self.to_v(context)[0].reshape(b, -1, n, d)
                 crossattn_cache["k"] = k
                 crossattn_cache["v"] = v
             else:
                 k = crossattn_cache["k"]
                 v = crossattn_cache["v"]
         else:
-            k = self.norm_k(self.to_k(context)[0]).view(b, -1, n, d)
-            v = self.to_v(context)[0].view(b, -1, n, d)
+            k = self.norm_k(self.to_k(context)[0]).reshape(b, -1, n, d)
+            v = self.to_v(context)[0].reshape(b, -1, n, d)
 
         # compute attention
         x = self.attn(q, k, v)
 
-        # output
-        x = x.flatten(2)
+        # output - flatten last two dims: (B, seq, heads, head_dim) -> (B, seq, heads*head_dim)
+        x = x.reshape(x.shape[0], x.shape[1], -1)
         x, _ = self.to_out(x)
         return x
 
@@ -327,21 +332,21 @@ class WanI2VCrossAttention(WanSelfAttention):
         """
         context_img = context[:, :257]
         context = context[:, 257:]
-        b, n, d = x.size(0), self.num_heads, self.head_dim
+        b, n, d = x.shape[0], self.num_heads, self.head_dim
 
         # compute query, key, value
-        q = self.norm_q(self.to_q(x)[0]).view(b, -1, n, d)
-        k = self.norm_k(self.to_k(context)[0]).view(b, -1, n, d)
-        v = self.to_v(context)[0].view(b, -1, n, d)
-        k_img = self.norm_added_k(self.add_k_proj(context_img)[0]).view(b, -1, n, d)
-        v_img = self.add_v_proj(context_img)[0].view(b, -1, n, d)
+        q = self.norm_q(self.to_q(x)[0]).reshape(b, -1, n, d)
+        k = self.norm_k(self.to_k(context)[0]).reshape(b, -1, n, d)
+        v = self.to_v(context)[0].reshape(b, -1, n, d)
+        k_img = self.norm_added_k(self.add_k_proj(context_img)[0]).reshape(b, -1, n, d)
+        v_img = self.add_v_proj(context_img)[0].reshape(b, -1, n, d)
         img_x = self.attn(q, k_img, v_img)
         # compute attention
         x = self.attn(q, k, v)
 
-        # output
-        x = x.flatten(2)
-        img_x = img_x.flatten(2)
+        # output - flatten last two dims: (B, seq, heads, head_dim) -> (B, seq, heads*head_dim)
+        x = x.reshape(x.shape[0], x.shape[1], -1)
+        img_x = img_x.reshape(img_x.shape[0], img_x.shape[1], -1)
         x = x + img_x
         x, _ = self.to_out(x)
         return x
@@ -473,8 +478,10 @@ class WanTransformer3DModel(nnx.Module):
         timesteps: jax.Array,
         encoder_hidden_states_image: jax.Array | list[jax.Array] | None,
         guidance_scale=1.0,
+        req=None,
         **kwargs,
     ):
+        print("[1] input:", hidden_states.shape)
         # origin_dtype = hidden_states.dtype
         if isinstance(encoder_hidden_states, list):
             encoder_hidden_states = encoder_hidden_states[0]
@@ -486,6 +493,7 @@ class WanTransformer3DModel(nnx.Module):
         post_patch_height = height // p_h
         post_patch_width = width // p_w
 
+        print("[2] rotary_emb")
         freqs_cos, freqs_sin = self.rotary_emb.forward_from_grid(
             (
                 post_patch_num_frames,
@@ -497,12 +505,7 @@ class WanTransformer3DModel(nnx.Module):
         )
         assert freqs_cos.dtype == jnp.float32
 
-        # freqs_cis = (
-        #     (freqs_cos.astype(jnp.float32), freqs_sin.astype(jnp.float32))
-        #     if freqs_cos is not None
-        #     else None
-        # )
-
+        print("[3] patch_embedding")
         # Convert from channel-first (B, C, F, H, W) to channel-last (B, F, H, W, C) for nnx.Conv
         hidden_states = jnp.transpose(hidden_states, (0, 2, 3, 4, 1))
         hidden_states = self.patch_embedding(hidden_states)
@@ -519,6 +522,7 @@ class WanTransformer3DModel(nnx.Module):
         else:
             ts_seq_len = None
 
+        print("[4] condition_embedder")
         temb, timestep_proj, encoder_hidden_states, encoder_hidden_states_image = (
             self.condition_embedder(
                 timesteps,
@@ -541,11 +545,16 @@ class WanTransformer3DModel(nnx.Module):
             )
 
         # 4. Transformer blocks
+        print("[5] blocks")
         freqs_cis = (freqs_cos, freqs_sin)
-        for block in self.blocks:
-            hidden_states = block(hidden_states, encoder_hidden_states, timestep_proj, freqs_cis)
+        for i, block in enumerate(self.blocks):
+            print(f"  [5.{i}] block {i}")
+            hidden_states = block(
+                hidden_states, encoder_hidden_states, timestep_proj, freqs_cis, req
+            )
 
         # 5. Output norm, projection & unpatchify
+        print("[6] norm_out")
         if temb.ndim == 3:
             # batch_size, seq_len, inner_dim (wan 2.2 ti2v)
             combined = self.scale_shift_table[None, :, :, :] + temb[:, :, None, :]
@@ -559,10 +568,12 @@ class WanTransformer3DModel(nnx.Module):
             shift, scale = jnp.split(combined, 2, axis=1)
 
         hidden_states = self.norm_out(hidden_states, shift, scale)
+        print("[7] proj_out")
         hidden_states = self.proj_out(hidden_states)
 
         # Unpatchify: reshape from patches back to image space
         # hidden_states shape: [batch_size, num_patches, out_channels * patch_volume]
+        print("[8] unpatchify")
         p_t, p_h, p_w = self.patch_size
         hidden_states = hidden_states.reshape(
             batch_size,
@@ -586,6 +597,7 @@ class WanTransformer3DModel(nnx.Module):
             post_patch_width * p_w,
         )
 
+        print("[9] done, output:", output.shape)
         return output
 
 

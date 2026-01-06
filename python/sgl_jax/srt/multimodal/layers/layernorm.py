@@ -33,16 +33,16 @@ class ScaleResidual(nnx.Module):
     def __init__(self, prefix: str = ""):
         super().__init__()
 
-    def forward(self, residual: jax.Array, x: jax.Array, gate: jax.Array) -> jax.Array:
+    def __call__(self, residual: jax.Array, x: jax.Array, gate: jax.Array) -> jax.Array:
         """Apply gated residual connection."""
         # x.shape: [batch_size, seq_len, inner_dim]
-        if gate.dim() == 4:
+        if gate.ndim == 4:
             # gate.shape: [batch_size, num_frames, 1, inner_dim]
+            b, s, d = x.shape
             num_frames = gate.shape[1]
-            frame_seqlen = x.shape[1] // num_frames
-            return residual + (x.unflatten(dim=1, sizes=(num_frames, frame_seqlen)) * gate).flatten(
-                1, 2
-            )
+            frame_seqlen = s // num_frames
+            x_reshaped = x.reshape((b, num_frames, frame_seqlen, d))
+            return residual + (x_reshaped * gate).reshape((b, s, d))
         else:
             # gate.shape: [batch_size, 1, inner_dim]
             return residual + x * gate
