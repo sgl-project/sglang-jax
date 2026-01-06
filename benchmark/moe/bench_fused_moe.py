@@ -470,13 +470,19 @@ def run_all(
                         block_config=block_cfg,
                     )
 
-                times = multiple_iteration_timeit_from_trace(
-                    compute_func=_compute,
-                    data_generator=lambda: (),
-                    task=task,
-                    tries=iters,
-                    warmup=warmup_iters,
-                )
+                try:
+                    times = multiple_iteration_timeit_from_trace(
+                        compute_func=_compute,
+                        data_generator=lambda: (),
+                        task=task,
+                        tries=iters,
+                        warmup=warmup_iters,
+                    )
+                except ValueError as e:
+                    # Guard against shape constraints enforced by the fused kernel
+                    # (e.g. local_num_tokens alignment to dtype packing).
+                    print(f"SKIP fused_moe blocks [{i+1}/{len(block_cfgs)}], reason: {e}")
+                    continue
                 if len(times) > 1:
                     times = times[1:]
                 mean_ms = float(np.mean(times)) if times else float("nan")
