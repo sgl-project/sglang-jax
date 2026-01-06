@@ -178,11 +178,27 @@ def select_block_configs(
     bt_candidates = _pick_candidates(candidates=bt_candidates, multiple_of=t_packing)
     bts_candidates_i: list[int] | None
     if bts_candidates is None:
-        bts_candidates_i = None  # Default: bts follows bt.
+        # Default: explore bts <= bt (not forced equal to bt). This lets tuning
+        # keep `bt` large for routing/output while shrinking the inner staging
+        # tile to fit VMEM.
+        bts_candidates_i = None
     else:
         bts_candidates_i = _pick_candidates(candidates=list(bts_candidates), multiple_of=t_packing)
     bf_candidates = _pick_candidates(candidates=bf_candidates, multiple_of=128)
     bd_candidates = _pick_candidates(candidates=bd_candidates, multiple_of=tile_align)
+
+    def default_bts_for_bt(bt: int) -> list[int]:
+        # Heuristic: powers-of-two ladder (bt, bt/2, bt/4, ...) down to t_packing.
+        # Keeps the candidate set small and predictable.
+        out: list[int] = []
+        v = bt
+        while v >= t_packing:
+            if v % t_packing == 0:
+                out.append(v)
+            if v == t_packing:
+                break
+            v //= 2
+        return out
 
     def validate(cfg: FusedMoEBlockConfig) -> tuple[bool, str]:
         bt = cfg.bt
@@ -268,7 +284,10 @@ def select_block_configs(
         configs.append(effective)
 
     for bt in bt_candidates:
-        bts_list: list[int | None] = [None] if bts_candidates_i is None else bts_candidates_i
+        if bts_candidates_i is None:
+            bts_list: list[int] = default_bts_for_bt(bt)
+        else:
+            bts_list = [v for v in bts_candidates_i if v <= bt]
         for bts in bts_list:
             for bf in bf_candidates:
                 for bd in bd_candidates:
@@ -549,7 +568,8 @@ def parse_args() -> argparse.Namespace:
         nargs="+",
         help=(
             "Candidate list for bts (token staging tile inside expert_ffn). "
-            "When omitted, bts defaults to bt (and bts must be <= bt). "
+            "When omitted, bts is auto-searched as a <=bt ladder (bt, bt/2, bt/4, ...) "
+            "to fit within the VMEM budget (bts must be <= bt). "
             "Example: --bts-candidates 8 16 32 64"
         ),
     )
