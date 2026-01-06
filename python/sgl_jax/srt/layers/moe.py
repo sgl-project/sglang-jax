@@ -6,7 +6,7 @@ from jax.sharding import Mesh
 from jax.sharding import PartitionSpec as P, reshard
 
 from sgl_jax.srt.kernels.gmm.megablox_gmm_backend import gmm
-from sgl_jax.srt.utils.quantization.quantization_utils import quantize_tensor
+from sgl_jax.srt.utils.quantization.quantization_utils import quantize_tensor, dequantize_tensor
 
 
 class GateLogit(nnx.Module):
@@ -191,12 +191,22 @@ class EPMoE(nnx.Module):
         self.num_experts_per_tok = num_experts_per_tok
         self.intermediate_dim = intermediate_dim
         self.weight_dtype = weight_dtype
-        self.dtype = dtype
+        self.dtype = dtype #original dtype
         self.layer_id = layer_id
         self.ep_size = ep_size
         self.original_mesh = mesh
         self.mesh = mesh
         self.activation = activation
+
+        # Get quantization settings from config (unified QuantizationConfig)
+        quant_config = getattr(config, 'quantization_config', None)
+        if quant_config is not None:
+            self.quantized_dtype = quant_config.get_moe_weight_dtype()
+            self.activation_quantized_dtype = quant_config.get_moe_activation_dtype()
+        else:
+            self.quantized_dtype = None
+            self.activation_quantized_dtype = None
+
         if num_experts % self.ep_size != 0:
             raise ValueError(
                 f"num_experts({num_experts}) must be divisible by ep_size ({self.ep_size})"
@@ -245,7 +255,7 @@ class EPMoE(nnx.Module):
                 )
             )
             
-            self.quantized_dtype = jnp.int8
+
 
     def _detect_device_capabilities(self):
         try:
@@ -262,6 +272,7 @@ class EPMoE(nnx.Module):
 
     def __call__(self, hidden_states, topk_weights, topk_ids) -> jax.Array:
         with jax.sharding.use_abstract_mesh(self.updated_mesh):
+            hidden_states, hidden_states_scale = quantize_tensor(self.quantized_dtype, hidden_states, axis=-1)
             hidden_states_reshard = jax.sharding.reshard(hidden_states, P(None))
             topk_weights_reshard = jax.sharding.reshard(topk_weights, P(None))
             topk_ids_reshard = jax.sharding.reshard(topk_ids, P(None))
@@ -309,9 +320,9 @@ class EPMoE(nnx.Module):
             )
 
         output_pspec = P(*([None] * (result.ndim)))
-        return jax.sharding.reshard(
-            result, jax.sharding.NamedSharding(self.original_mesh, output_pspec)
-        )
+        result_reshard_quantized = jax.sharding.reshard(result, jax.sharding.NamedSharding(self.original_mesh, output_pspec))
+        result_reshard = dequantize_tensor(result_reshard_quantized, hidden_states_scale, axis=-1, out_dtype=self.dtype)
+        return result_reshard
 
     def _forward(self, hidden_states, topk_weights, topk_ids, w0_weights, w1_weights, wo_weights,
              w0_kernel_scale = None, w1_kernel_scale = None, wo_kernel_scale = None, w0_kernel_bias = None, w1_kernel_bias = None, wo_kernel_bias = None):

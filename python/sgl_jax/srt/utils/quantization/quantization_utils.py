@@ -23,9 +23,7 @@ from sgl_jax.srt.model_executor.forward_batch_info import (
 )
 from sgl_jax.srt.sampling.sampling_batch_info import SamplingBatchInfo
 
-QUANTIZATION_CONFIG_PATH = os.path.join(os.path.dirname(__file__), "configs")
 DEFAULT_NUM_PAGES = 100
-
 
 def parse_qwix_config_to_rules(qwix_config: list[dict]) -> list[qwix.QuantizationRule]:
     """
@@ -85,53 +83,29 @@ def qwix_quantize_nnx_model(
     return model
 
 
-def quantization_config_file_path_to_dict(quantization_config_file_path: str) -> dict:
-    """
-    Converts a quantization config YAML file path to a dictionary.
-
-    The expected format of the quantization config YAML file is as follows:
-    ```yaml
-        qwix:
-            # optional, defaults to False if not specified
-            use_abstract_model: True
-            rules:
-                # NOTE: each entry corresponds to a qwix.QuantizationRule
-                - module_path: '.*attn.*'
-                weight_qtype: 'int8'
-                - module_path: '.*'
-                weight_qtype: 'int8'
-                act_qtype: 'int8'
-    ```
-
-    Args:
-        quantization_config_file_path: the path to the quantization config YAML file
-
-    Returns:
-        a dictionary containing the quantization config
-    """
-    all_entries = os.listdir(QUANTIZATION_CONFIG_PATH)
-    for filename in all_entries:
-        if filename == quantization_config_file_path:
-            path = os.path.join(QUANTIZATION_CONFIG_PATH, filename)
-            with open(path) as f:
-                return yaml.safe_load(f)
-    raise ValueError(
-        f"Could not find quantization config file with name '{quantization_config_file_path}' in 'sgl_jax/srt/utils/quantization/configs."
-    )
-
-
 def apply_qwix_quantization(
     model_config: ModelConfig, model: nnx.Module, model_runner
 ) -> nnx.Module:
     """
     Will apply quantization if a valid quantization config with Qwix rules is provided.  See README
     for more details on Qwix.
-    """
 
-    qwix_config_dict = quantization_config_file_path_to_dict(
-        os.path.join(model_config.quantization_config_path)
-    )
-    qwix_config = qwix_config_dict.get("qwix").get("rules")
+    Uses the unified QuantizationConfig from model_config.quantization_config.
+    """
+    # Get qwix rules from the unified QuantizationConfig
+    quant_config = model_config.quantization_config
+    if quant_config is None:
+        raise ValueError(
+            "apply_qwix_quantization called but model_config.quantization_config is None. "
+            "Ensure quantization_mode is set."
+        )
+
+    qwix_config = quant_config.get_qwix_rules()
+    if not qwix_config:
+        raise ValueError(
+            "No qwix rules found in quantization config. "
+            "Check your quantization config YAML file."
+        )
 
     # prepare batch input
     forward_batch, token_to_kv_pool, logits_metadata = prepare_inputs_for_quantization(
@@ -306,6 +280,60 @@ def quantize_tensor(
     scale = jnp.squeeze(scale, axis).astype(jnp.float32)
 
     return tensor_q, scale
+
+def dequantize_tensor(
+    tensor_q: jax.Array,
+    scale: jax.Array,
+    axis: int | None | tuple = -1,
+    out_dtype: jnp.dtype = jnp.bfloat16,
+) -> jax.Array:
+    """Dequantize a quantized tensor
+
+    Args:
+        tensor_q: Quantized tensor.
+        scale: Quantization scale.
+        axis: The axis tensor was quantized. None denotes per-tensor.
+        out_dtype: Dtype of the output.
+
+    Returns:
+        Dequantized tensor_q.
+    """
+    if axis is None:
+        # Perform per-tensor quantization.
+        axis = [i for i in range(tensor_q.ndim)]
+    if isinstance(axis, int):
+        axis = [axis]
+
+    orig_shape = tensor_q.shape
+    if tensor_q.ndim == scale.ndim:
+        # Indicates the tensor was block quantized.
+        blocked_shape = [[i] for i in orig_shape]
+        for i in axis:
+            num_blocks = scale.shape[i]
+            if tensor_q.shape[i] % num_blocks:
+                raise ValueError(
+                    f"Unable to perform block dequantization. axis={i} of "
+                    f"{tensor_q.shape=} is not divisible by {num_blocks=}", )
+            block_size = tensor_q.shape[i] // num_blocks
+
+            blocked_shape[i] = (num_blocks, block_size)
+
+        # Convert all axis into positive values.
+        axis = sorted([(i + tensor_q.ndim) % tensor_q.ndim for i in axis])
+        # Shift axis by 1 since its original position is now occupied by
+        # num_blocks dim. Also, if n axes before an axis was also quantized,
+        # shift its position by n.
+        axis = [1 + n + i for n, i in enumerate(axis)]
+
+        # Flatten list of lists that contains (num_blocks, block).
+        blocked_shape = list(itertools.chain(*blocked_shape))
+        tensor_q = tensor_q.reshape(blocked_shape)
+
+    scale = jnp.expand_dims(scale, axis)
+
+    tensor = (tensor_q.astype(jnp.float32) * scale).astype(out_dtype)
+
+    return tensor.reshape(orig_shape)
 
 
 def generate_mock_model_worker_batch(
