@@ -5,6 +5,7 @@ import jax
 import PIL.Image
 
 from sgl_jax.srt.managers.io_struct import BatchTokenIDOut, TokenizedGenerateReqInput
+from sgl_jax.srt.sampling.sampling_params import SamplingParams
 
 
 @dataclass
@@ -158,7 +159,12 @@ class Req:
 
     def to_stage_req(self, scheduler: str):
         if scheduler == "auto_regressive":
-            return TokenizedGenerateReqInput(rid=self.rid, input_ids=self.input_ids)
+            return TokenizedGenerateReqInput(
+                rid=self.rid,
+                input_ids=self.input_ids,
+                sampling_params=SamplingParams(max_new_tokens=1),
+                return_hidden_states=True,
+            )
         else:
             return self
 
