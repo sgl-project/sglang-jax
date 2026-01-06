@@ -496,12 +496,17 @@ def _fused_ep_moe_kernel(
     def start_fetch_b_gating(*, bt_id, priority=0):
         bt_sem_id = bt_id & jnp.int32(1)
         b_gating_sem = local_sems.at[bt_sem_id, 0]
-        is_valid = jnp.logical_and(bt_id >= 0, bt_id < num_bt)
-        sz = pl.multiple_of(lax.select(is_valid, bt, 0), bt)
-        bt_start = lax.select(is_valid, bt_id * bt, 0)
+        bt_start = bt_id * bt
+        bt_size = bt
+        # Hint Mosaic about HBM tiling alignment for `tpu.memref_slice`:
+        # - f32 is typically tiled as (8, 128)
+        # - bf16/f16 is typically tiled as (16, 128)
+        gating_tile0 = 256 // (jnp.dtype(gating_hbm.dtype).itemsize * 8)
+        if bt_size % gating_tile0 == 0:
+            bt_start = pl.multiple_of(bt_start, gating_tile0)
         pltpu.make_async_copy(
-            src_ref=gating_hbm.at[pl.ds(bt_start, sz)],
-            dst_ref=b_gating_x2_vmem.at[bt_sem_id, pl.ds(0, sz)],
+            src_ref=gating_hbm.at[pl.ds(bt_start, bt_size)],
+            dst_ref=b_gating_x2_vmem.at[bt_sem_id, pl.ds(0, bt_size)],
             sem=b_gating_sem,
         ).start(priority=priority)
 
