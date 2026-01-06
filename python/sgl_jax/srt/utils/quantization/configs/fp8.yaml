@@ -1,0 +1,15 @@
+# FP8 weight-only quantization config
+# Works for both dense and MoE models
+
+quantization:
+  # Qwix rules for dense layers (attention, MLP, embeddings)
+  qwix:
+    rules:
+      - module_path: '.*'
+        weight_qtype: 'float8_e4m3fn'
+
+  # MoE-specific settings (experts weights)
+  moe:
+    weight_dtype: 'float8_e4m3fn'
+    activation_dtype: null
+
