@@ -107,11 +107,13 @@ class MultimodalTokenizer(TokenizerManager):
 
     def _create_tokenized_object(self, obj: GenerateMMReqInput, input_text, input_ids):
         tokenized_obj = TokenizedGenerateMMReqInput(
-            obj.rid,
-            obj.prompt,
-            input_ids,
+            rid=obj.rid,
+            prompt=obj.prompt,
+            input_ids=input_ids,
             size=obj.size,
             num_frames=obj.num_frames,
+            data_type=obj.data_type,
+            save_output=obj.save_output,
         )
         return tokenized_obj
 
