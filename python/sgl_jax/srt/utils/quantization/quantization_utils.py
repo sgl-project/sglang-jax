@@ -118,7 +118,6 @@ def apply_qwix_quantization(
         qwix_config=qwix_config,
     )
     with jax.set_mesh(model_runner.mesh):
-        print("model_runner.mesh: ", model_runner.mesh)
         model = nnx.jit(
             qwix_quantize_nnx_model_with_config_and_attn_backend,
             donate_argnames=("model",),  # donate the model to the jitted function to save memory
