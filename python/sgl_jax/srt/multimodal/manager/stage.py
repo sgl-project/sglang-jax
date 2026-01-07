@@ -66,7 +66,10 @@ class Stage:
                 self.stage_id,
                 self.stage_config.scheduler,
             )
-            self._stage_scheduler.event_loop()
+            if getattr(self._stage_scheduler, "enable_overlap", False):
+                self._stage_scheduler.event_loop_overlap()
+            else:
+                self._stage_scheduler.event_loop_normal()
         except Exception:
             traceback = get_exception_traceback()
             logger.error("Stage-%d hit exception: %s", self.stage_id, traceback)

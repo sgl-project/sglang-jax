@@ -19,7 +19,7 @@ class DiffusionScheduler:
         self.mesh = mesh
         self.diffusion_worker = DiffusionModelWorker(server_args, mesh=mesh)
 
-    def event_loop(self):
+    def event_loop_normal(self):
 
         while True:
             req = self.communication_backend.recv_requests()

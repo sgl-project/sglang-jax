@@ -117,7 +117,7 @@ class GlobalScheduler:
             time.sleep(3)
             if reqs:
                 for req in reqs:
-                    self.in_queues[0].put_nowait(self._request_dispatcher(req))
+                    self.in_queues[0].put_nowait(self._request_dispatcher(req).to_stage_req(self.stage_configs[0].scheduler))
             else:
                 for i, stage in enumerate(self.stage_list):
                     stage_result = Req.from_stage(stage.try_collect(), self.req_store)

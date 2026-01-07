@@ -126,8 +126,9 @@ class Scheduler(
     def __init__(
         self,
         server_args: ServerArgs,
-        port_args: PortArgs,
+        port_args: PortArgs = None,
         communication_backend: CommunicationBackend = None,
+        mesh: jax.sharding.Mesh = None,
     ):
         # set jit cache
         jit_cache_dir = os.getenv("JAX_COMPILATION_CACHE_DIR", None)
@@ -144,8 +145,9 @@ class Scheduler(
         self.server_args = server_args
         self.node_rank = server_args.node_rank
         self.nnodes = server_args.nnodes
-        self.pub_sub_addr = port_args.pub_sub_addr
-        self.pub_sub_sync_addr = port_args.pub_sub_sync_addr
+        if port_args is not None:
+            self.pub_sub_addr = port_args.pub_sub_addr
+            self.pub_sub_sync_addr = port_args.pub_sub_sync_addr
         self.tp_size = server_args.tp_size
         self.schedule_policy = server_args.schedule_policy
         self.skip_tokenizer_init = server_args.skip_tokenizer_init
@@ -233,11 +235,14 @@ class Scheduler(
         platform = os.getenv("JAX_PLATFORMS", None)
         if platform == "proxy":
             pathwaysutils.initialize()
-        self.mesh = create_device_mesh(
-            ici_parallelism=[-1, self.tp_size],
-            dcn_parallelism=[1, 1],
-            device_indexes=server_args.device_indexes,
-        )
+        if mesh is not None:
+            self.mesh = mesh
+        else:
+            self.mesh = create_device_mesh(
+                ici_parallelism=[-1, self.tp_size],
+                dcn_parallelism=[1, 1],
+                device_indexes=server_args.device_indexes,
+            )
 
         TpWorkerClass = ModelWorkerClient if self.enable_overlap else ModelWorker
 

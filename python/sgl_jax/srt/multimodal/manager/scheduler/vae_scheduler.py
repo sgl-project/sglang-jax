@@ -21,7 +21,7 @@ class VaeScheduler:
         self.mesh = mesh
         self.vae_worker = VaeModelWorker(None, mesh=mesh)
 
-    def event_loop(self):
+    def event_loop_normal(self):
         while True:
             reqs = self._comm_backend.recv_requests()
             if len(reqs) > 0:
