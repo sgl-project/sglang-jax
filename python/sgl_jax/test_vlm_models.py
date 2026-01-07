@@ -150,6 +150,7 @@ class TestVLMModels(CustomTestCase):
                     str(self.parsed_args.mem_fraction_static),  # Use class variable
                     "--log-level",
                     log_level,
+                    "--enable-single-process"
                 ],
                 env=process_env,
                 check_cache_miss=False,

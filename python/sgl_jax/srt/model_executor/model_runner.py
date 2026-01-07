@@ -49,6 +49,9 @@ from sgl_jax.srt.utils.quantization.quantization_utils import (
     apply_moe_quantization,
     apply_qwix_quantization,
 )
+from sgl_jax.srt.utils.quantization.quantization_utils import apply_qwix_quantization
+import sgl_jax.srt.multimodal.mm_utils as mm_utils
+from sgl_jax.srt.multimodal.mm_utils import Modality
 
 logger = logging.getLogger(__name__)
 
@@ -235,6 +238,21 @@ class ModelRunner(BaseModelRunner):
         )
 
         self.jitted_compute_logprobs = partial(jitted_compute_logprobs, self.mesh)
+
+        @partial(jax.jit, static_argnames=["model_state_def"])
+        def jitted_get_image_feature(model_def, model_state_def, model_state_leaves, embedding_items):
+            model_state = jax.tree_util.tree_unflatten(model_state_def, model_state_leaves)
+            model = nnx.merge(model_def, model_state)
+            return model.get_image_feature(embedding_items)
+
+        @partial(jax.jit, static_argnames=["model_state_def"])
+        def jitted_get_video_feature(model_def, model_state_def, model_state_leaves, embedding_items):
+            model_state = jax.tree_util.tree_unflatten(model_state_def, model_state_leaves)
+            model = nnx.merge(model_def, model_state)
+            return model.get_video_feature(embedding_items)
+
+        self.jitted_get_image_feature = partial(jitted_get_image_feature, model_def, model_state_def)
+        self.jitted_get_video_feature = partial(jitted_get_video_feature, model_def, model_state_def)
 
     def get_available_device_memory(self):
         distributed = jax.process_count() != 1
@@ -513,11 +531,63 @@ class ModelRunner(BaseModelRunner):
         else:
             raise ValueError(f"Unsupported attention backend: {self.server_args.attention_backend}")
 
+    def compute_multimodal_embeddings(self, forward_batch: ForwardBatch):
+        """
+        Compute multimodal embeddings eagerly (outside of the main model JIT) to enable caching.
+        """
+        if not forward_batch.mm_inputs:
+            return
+
+        # Flatten all items
+        all_items = []
+        for mm_input in forward_batch.mm_inputs:
+            if mm_input is not None:
+                all_items.extend(mm_input.mm_items)
+        
+        if not all_items:
+            return
+
+        for item in all_items:
+            if item.precomputed_embeddings is not None:
+                # Optimization: Clear feature to avoid passing large unused arrays to JIT
+                item.feature = None
+                continue
+            
+            # Check cache
+            if mm_utils.embedding_cache is not None:
+                cached = mm_utils.embedding_cache.get([item.hash])
+                if cached is not None:
+                    item.precomputed_embeddings = cached
+                    item.feature = None
+                    continue
+            
+            # Compute if not cached
+            jit_func = None
+            if item.modality == Modality.IMAGE and hasattr(self.model, "get_image_feature"):
+                jit_func = self.jitted_get_image_feature
+            elif item.modality == Modality.VIDEO and hasattr(self.model, "get_video_feature"):
+                jit_func = self.jitted_get_video_feature
+            elif item.modality == Modality.AUDIO and hasattr(self.model, "get_audio_feature"):
+                jit_func = self.jitted_get_audio_feature
+            
+            if jit_func:
+                # Process one by one to ensure correct mapping and caching
+                # This avoids complex splitting logic for batched results
+                embedding = jit_func(self.model_state_leaves, [item])
+                item.precomputed_embeddings = embedding
+                item.feature = None
+                
+                if mm_utils.embedding_cache is not None:
+                    key = mm_utils.embedding_cache.combine_hashes([item.hash])
+                    mm_utils.embedding_cache.set(key, embedding)
+
     def _forward(
         self,
         forward_batch: ForwardBatch,
         logits_metadata: LogitsMetadata,
     ):
+        # Pre-compute multimodal embeddings to use cache and separate JIT
+        self.compute_multimodal_embeddings(forward_batch)
         cache_miss_count = 0
         import jax._src.test_util as jtu
 

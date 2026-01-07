@@ -372,6 +372,8 @@ class GenerateReqInput:
         self._expand_inputs(num)
         self._normalize_rid(num)
         self._normalize_image_data(num)
+        self._normalize_video_data(num)
+        self._normalize_audio_data(num)
         self._normalize_sampling_params(num)
         self._normalize_logprob_params(num)
         self._normalize_lora_paths(num)
@@ -433,6 +435,24 @@ class GenerateReqInput:
                     # Expand for parallel sampling
                     self.image_data = wrapped_images * self.parallel_sample_num
                     self.modalities = ["image"] * num
+
+    def _normalize_video_data(self, num):
+        """Normalize video data for batch processing."""
+        if self.video_data is None:
+            self.video_data = [None] * num
+        elif not isinstance(self.video_data, list):
+            self.video_data = [self.video_data] * num
+        elif isinstance(self.video_data, list):
+            self.video_data = self.video_data * self.parallel_sample_num
+
+    def _normalize_audio_data(self, num):
+        """Normalize audio data for batch processing."""
+        if self.audio_data is None:
+            self.audio_data = [None] * num
+        elif not isinstance(self.audio_data, list):
+            self.audio_data = [self.audio_data] * num
+        elif isinstance(self.audio_data, list):
+            self.audio_data = self.audio_data * self.parallel_sample_num
 
     def _validate_inputs(self):
         """Validate that the input configuration is valid."""

@@ -9,6 +9,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import numpy as np
 import jax
 import jax.numpy as jnp
+from jax import lax
 from flax import nnx
 
 from sgl_jax.srt.managers.schedule_batch import (
@@ -147,70 +148,44 @@ def get_embedding_chunk(
     return embedding_chunk, start_index, end_index
 
 
-def _get_precomputed_embedding(
-    items: List[MultimodalDataItem],
-) -> Optional[jax.Array]:
-    """
-    If all items have precomputed_embeddings, return their concatenation.
-    If some but not all have precomputed_embeddings, raise NotImplementedError.
-    If none have precomputed_embeddings, return None.
-    """
-    precomputed_embeddings = [item.precomputed_embeddings for item in items]
-    if any(feature is not None for feature in precomputed_embeddings):
-        if not all(feature is not None for feature in precomputed_embeddings):
-            raise NotImplementedError(
-                "MM inputs where only some items are precomputed."
-            )
-        result = jnp.concatenate(precomputed_embeddings, axis=0)
-        # some models embedding is 3-dim, reshape it to 2-dim (similar to get_embedding_chunk)
-        result = result.reshape(-1, result.shape[-1])
-        return result
-    return None
-
-
 def _get_chunked_prefill_embedding(
-    data_embedding_func: Callable[[List[MultimodalDataItem]], jax.Array],
     embedding_items: List[MultimodalDataItem],
     items_size: List[int],
-    prefix_length: List[int],
-    extend_length: List[int],
+    prefix_length: jax.Array,
     items_offset_list: List[List[Tuple[int, int]]],
 ) -> Optional[jax.Array]:
-    # Calculate embedding for each request, try to get it from cache to avoid repeated calculation
+    
     embedding_list = []
-    # FIXME(Xinyuan): temporary workaround for eagle3, which may have len(items_size) > len(prefix_length)
     max_iterations = min(len(items_size) - 1, len(prefix_length))
+    
     for i in range(max_iterations):
         if items_size[i] == items_size[i + 1]:
             continue
-        embedding_items_per_req = embedding_items[items_size[i]:items_size[i + 1]]
-        items_offset = items_offset_list[i]
-        assert items_offset is not None, items_offset
-        # if all items has been prefixed, we do not need to calculate embedding
-        if all([offset_end < prefix_length[i] for _, offset_end in items_offset]):
-            continue
-        item_hashes = [item.hash for item in embedding_items_per_req]
-        embedding_items_hash = MultiModalStaticCache.combine_hashes(item_hashes)
-        embedding_per_req = embedding_cache.get(item_hashes)
-        if embedding_per_req is None:
-            embedding_per_req = data_embedding_func(embedding_items_per_req)
-            if not embedding_cache.set(embedding_items_hash, embedding_per_req):
-                print_warning_once(
-                    "Multimodal embedding cache is full. This typically occurs when a single "
-                    "embedding exceeds the cache size limit. Consider increasing the "
-                    "`SGLANG_VLM_CACHE_SIZE_MB` environment variable or reducing the input "
-                    "embedding size."
-                )
 
-        embedding_per_req_chunk, _, _ = get_embedding_chunk(
-            embedding=embedding_per_req,
-            extend_prefix_len=prefix_length[i],
-            extend_seq_len=extend_length[i] if i < len(extend_length) else 0,
-            items_offset=items_offset,
+        embedding_items_per_req = embedding_items[items_size[i]:items_size[i + 1]]
+
+        # Try to get precomputed embeddings first
+        precomputed = [item.precomputed_embeddings for item in embedding_items_per_req]
+        if all(p is not None for p in precomputed):
+            embedding_per_req = jnp.concatenate(precomputed, axis=0)
+
+        items_offset = jnp.array(items_offset_list[i]) # shape: (num_items, 2)
+        offset_ends = items_offset[:, 1]
+        
+        all_items_prefixed = jnp.all(offset_ends < prefix_length[i])
+
+        actual_embedding = lax.cond(
+            all_items_prefixed,
+            lambda _: jnp.zeros(embedding_per_req.shape, dtype=embedding_per_req.dtype),
+            lambda _: embedding_per_req,
+            operand=None
         )
-        embedding_list.append(embedding_per_req_chunk)
+        
+        embedding_list.append(actual_embedding)
+
     if len(embedding_list) == 0:
         return None
+    
     return jnp.concatenate(embedding_list, axis=0)
 
 
@@ -249,20 +224,17 @@ def _adjust_embedding_length(
 
 
 def get_embedding_and_mask(
-    data_embedding_func: Callable[[List[MultimodalDataItem]], jax.Array],
     embedding_items: List[MultimodalDataItem],
     placeholder_tensor: jax.Array,
     input_ids: jax.Array,
     items_size: List[int],
     prefix_length: List[int],
-    extend_length: List[int],
     items_offset_list: List[List[Tuple[int, int]]],
 ) -> Tuple[jax.Array, jax.Array]:
     """
     Generate multimodal embeddings and create a mask for identifying their positions in the input sequence.
 
     Args:
-        data_embedding_func: Function that generates embeddings for multimodal items
         embedding_items: List of multimodal items to embed
         placeholder_tensor: Tensor containing token IDs that serve as placeholders for multimodal content
         input_ids: The input token IDs tensor
@@ -277,36 +249,25 @@ def get_embedding_and_mask(
         - A boolean mask tensor indicating where these embeddings should be placed
     """
     # 1. Get embedding
-    embedding = _get_precomputed_embedding(embedding_items)
+    embedding = _get_chunked_prefill_embedding(
+        embedding_items,
+        items_size,
+        prefix_length,
+        items_offset_list,
+    )
     if embedding is None:
-        embedding = _get_chunked_prefill_embedding(
-            data_embedding_func,
-            embedding_items,
-            items_size,
-            prefix_length,
-            extend_length,
-            items_offset_list,
-        )
-        if embedding is None:
-            return None, None
+        return None, None
     # 2. Get mask
     special_multimodal_mask = _get_multimodal_mask(input_ids, placeholder_tensor)
-    # 3. Adjust embedding length if needed
-    embedding = _adjust_embedding_length(embedding, special_multimodal_mask, logger)
     return embedding, special_multimodal_mask
 
 
 def embed_mm_inputs(
     mm_inputs_list: List[MultimodalInputs],
     extend_prefix_lens: List[int],
-    extend_seq_lens: List[int],
     forward_batch: ForwardBatch,
     input_embedding: nnx.Module,
     multimodal_model: nnx.Module = None,
-    data_embedding_func_mapping: Dict[
-        Modality, Callable[[List[MultimodalDataItem]], jax.Array]
-    ] = None,
-    placeholder_tokens: dict[Modality, List[int]] = None,
     use_deepstack: Dict[Modality, bool] = {},
 ) -> Optional[jax.Array]:
     """
@@ -342,17 +303,7 @@ def embed_mm_inputs(
         items = [
             item for item in item_flatten_list if item.is_modality(modality=modality)
         ]
-        embedder = (
-            None
-            if data_embedding_func_mapping is None
-            else data_embedding_func_mapping.get(modality, None)
-        )
-        if embedder is None:
-            # "image", "video", etc
-            modality_id = modality.name.lower()
-            embedder = getattr(multimodal_model, f"get_{modality_id}_feature", None)
         if len(items) != 0:
-            assert embedder is not None, f"no embedding method found for {modality}"
             placeholder_tensor = jnp.asarray(
                 [item.pad_value for item in items],
                 dtype=jnp.int32,
@@ -377,13 +328,11 @@ def embed_mm_inputs(
                 items_size.append(items_size[-1] + items_size_temp[i])
 
             embedding, mask = get_embedding_and_mask(
-                data_embedding_func=embedder,
                 embedding_items=items,
                 placeholder_tensor=placeholder_tensor,
                 input_ids=forward_batch.input_ids,
                 items_size=items_size,
                 prefix_length=extend_prefix_lens,
-                extend_length=extend_seq_lens,
                 items_offset_list=items_offsets,
             )
 
@@ -469,10 +418,6 @@ def general_mm_embed_routine(
     language_model: nnx.Module,
     token_to_kv_pool: KVCache,
     multimodal_model: Optional[nnx.Module] = None,
-    data_embedding_funcs: Dict[
-        Modality, Callable[[List[MultimodalDataItem]], jax.Array]
-    ] = None,
-    placeholder_tokens: Optional[dict[Modality, List[int]]] = None,
     use_deepstack: Dict[Modality, bool] = {},
     positions: Optional[jax.Array] = None,
     **kwargs,
@@ -483,8 +428,6 @@ def general_mm_embed_routine(
     Args:
         forward_batch: Batch information for model forward pass
         language_model: Base language model to use
-        data_embedding_funcs: A dictionary mapping from modality type to the corresponding embedding function.
-        placeholder_tokens: Token IDs for multimodal placeholders
         use_deepstack: Whether to use deepstack embeddings for each modality, default False
         **kwargs: Additional arguments passed to language model
 
@@ -503,23 +446,15 @@ def general_mm_embed_routine(
         ]
         extend_prefix_lens = [
             prefix_len
-            for i, prefix_len in enumerate(forward_batch.extend_prefix_lens_cpu)
-            if forward_batch.seq_lens[i] is not None
-        ]
-        extend_seq_lens = [
-            seq_len
-            for i, seq_len in enumerate(forward_batch.extend_seq_lens_cpu)
+            for i, prefix_len in enumerate(forward_batch.extend_prefix_lens)
             if forward_batch.seq_lens[i] is not None
         ]
         inputs_embeds, other_info = embed_mm_inputs(
             mm_inputs_list=mm_inputs_list,
             extend_prefix_lens=extend_prefix_lens,
-            extend_seq_lens=extend_seq_lens,
             forward_batch=forward_batch,
             multimodal_model=multimodal_model,
             input_embedding=embed_tokens,
-            data_embedding_func_mapping=data_embedding_funcs,
-            placeholder_tokens=placeholder_tokens,
             use_deepstack=use_deepstack,
         )
         # add for qwen3_vl deepstack

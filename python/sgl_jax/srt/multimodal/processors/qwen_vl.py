@@ -7,6 +7,9 @@ from typing import List, Union
 import numpy as np
 from PIL import Image
 
+import jax
+import jax.numpy as jnp
+
 from sgl_jax.srt.environ import envs
 from sgl_jax.srt.layers.embeddings import MRotaryEmbedding
 from sgl_jax.srt.models.qwen2_5_vl import Qwen2_5_VLForConditionalGeneration
@@ -131,6 +134,82 @@ def smart_nframes(
         )
     return nframes
 
+
+# process video, qwen-specific
+async def preprocess_video(
+    vr,
+    image_factor: int = IMAGE_FACTOR,
+    video_config: dict | None = None,
+) -> tuple[jnp.ndarray, dict]:
+    if video_config is None:
+        video_config = {}
+    entry_time = time.perf_counter()
+
+    total_frames, video_fps = len(vr), vr.get_avg_fps()
+    nframes = smart_nframes(video_config, total_frames=total_frames, video_fps=video_fps)
+    idx = np.linspace(0, total_frames - 1, num=nframes, dtype=np.int64)
+    idx = np.unique(idx)
+    video_np = vr.get_batch(idx).asnumpy()
+
+    # Convert to JAX array and adjust dimension order (TCHW)
+    video = jax.device_put(video_np)
+    video = jnp.transpose(video, (0, 3, 1, 2))  # Convert from THWC to TCHW
+
+    nframes, _, height, width = video.shape
+    min_pixels = video_config.get("min_pixels", VIDEO_MIN_PIXELS)
+    total_pixels = video_config.get("total_pixels", VIDEO_TOTAL_PIXELS)
+    max_pixels = max(
+        min(
+            video_config.get("max_pixels", VIDEO_MAX_PIXELS),
+            total_pixels / nframes * FRAME_FACTOR,
+        ),
+        int(min_pixels * 1.05),
+    )
+
+    get_batch_time = time.perf_counter()
+
+    max_pixels_supposed = video_config.get("max_pixels", max_pixels)
+
+    if max_pixels_supposed > max_pixels:
+        logger.warning(f"The given max_pixels[{max_pixels_supposed}] exceeds limit[{max_pixels}].")
+    max_pixels = min(max_pixels_supposed, max_pixels)
+    if "resized_height" in video_config and "resized_width" in video_config:
+        resized_height, resized_width = smart_resize(
+            video_config["resized_height"],
+            video_config["resized_width"],
+            factor=image_factor,
+        )
+    else:
+        resized_height, resized_width = smart_resize(
+            height,
+            width,
+            factor=image_factor,
+            min_pixels=min_pixels,
+            max_pixels=max_pixels,
+        )
+    smart_resize_time = time.perf_counter()
+
+    # JAX-based video resize
+    video = jax.image.resize(video, (nframes, 3, resized_height, resized_width), method="bilinear")
+
+    video = np.array(video)
+
+    video_metadata = {
+        "fps": video_fps,
+        "duration": total_frames / video_fps,
+        "total_num_frames": total_frames,
+        "frames_indices": idx,
+        "video_backend": "jax",
+    }
+    resize_time = time.perf_counter()
+    logger.debug(
+        f"[preprocess_video Perf], "
+        f"get_batch_time: {(get_batch_time - entry_time) * 1000:.2f} ms, "
+        f"smart_resize_time: {(smart_resize_time - get_batch_time) * 1000:.2f} ms, "
+        f"resize_time: {(resize_time - smart_resize_time) * 1000:.2f} ms, "
+        f"total_time: {(resize_time - entry_time) * 1000:.2f} ms"
+    )
+    return video, video_metadata
 
 
 # Compatible with Qwen-VL & Qwen-Omni Series

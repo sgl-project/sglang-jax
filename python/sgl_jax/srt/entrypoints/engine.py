@@ -14,7 +14,7 @@ import os
 import signal
 import threading
 from collections.abc import AsyncIterator, Iterator
-from typing import Any, Optional
+from typing import Any
 
 import jax
 import uvloop
@@ -149,7 +149,7 @@ class Engine(EngineBase):
         sampling_params: list[dict] | dict | None = None,
         # The token ids for text; one can either specify text or input_ids.
         input_ids: list[list[int]] | list[int] | None = None,
-        image_data: Optional[MultimodalDataInputFormat] = None,
+        image_data: list[MultimodalDataInputFormat] | None = None,
         return_logprob: list[bool] | bool | None = False,
         logprob_start_len: list[int] | int | None = None,
         top_logprobs_num: list[int] | int | None = None,

@@ -3,13 +3,15 @@ import concurrent.futures
 import dataclasses
 import multiprocessing as mp
 import os
+import sys
 import re
 from abc import ABC, abstractmethod
 from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
-
-import jax
 import numpy as np
 from PIL import Image
+from urllib.parse import urlparse
+
+import jax
 
 from sgl_jax.srt.managers.schedule_batch import Modality, MultimodalDataItem
 from sgl_jax.srt.utils import (
@@ -19,6 +21,7 @@ from sgl_jax.srt.utils import (
     logger,
 )
 
+sys.modules[load_video.__module__].urlparse = urlparse
 
 
 @dataclasses.dataclass
@@ -237,12 +240,26 @@ class BaseMultimodalProcessor(ABC):
                 kwargs["audios"] = audios
 
         processor = self._processor
-        result = processor.__call__(
-            text=[input_text],
-            padding=True,
-            return_tensors="np",
-            **kwargs,
+        if self.server_args.disable_fast_image_processor:
+            result = processor.__call__(
+                text=[input_text],
+                padding=True,
+                return_tensors="np",
+                **kwargs,
         )
+        else:
+            result = processor.__call__(
+                text=[input_text],
+                padding=True,
+                return_tensors="pt",
+                **kwargs,
+            )
+            # Convert all tensors to numpy arrays
+            for key in list(result.keys()):
+                if hasattr(result[key], "cpu"):  # Handle PyTorch tensors
+                    # Move to CPU first, then convert to numpy
+                    arr = result[key].cpu().numpy()
+                    result[key] = arr
         if not self.server_args.keep_mm_feature_on_device:
             # move feature tensors to cpu
             for feature_name in self.FEATURE_NAMES:

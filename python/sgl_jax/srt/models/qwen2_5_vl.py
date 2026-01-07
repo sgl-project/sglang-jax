@@ -3,9 +3,11 @@ from functools import partial
 from typing import List, Callable, NamedTuple, Optional, Any
 from transformers.models.qwen2_5_vl.configuration_qwen2_5_vl import Qwen2_5_VLConfig
 from transformers import modeling_flax_utils
+import numpy as np
+
 import jax
 import jax.numpy as jnp
-from jax.sharding import Mesh
+from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 from jax.experimental import shard_map
 from flax import nnx
@@ -352,6 +354,7 @@ class Qwen2_5_VisionPatchEmbed(nnx.Module):
         hidden_size: int = 1152,
         dtype: jnp.dtype = jnp.bfloat16,
         rngs: nnx.Rngs = None,
+        mesh: Mesh = None,
     ):
         self.patch_size = patch_size
         self.temporal_patch_size = temporal_patch_size
@@ -369,6 +372,7 @@ class Qwen2_5_VisionPatchEmbed(nnx.Module):
                                  (None, None, None, None, "tensor")
                              ),
                              rngs=rngs)
+        self.mesh = mesh
 
     def __call__(self, x: jax.Array) -> jax.Array:
         # x is (L, C * T * H * W)
@@ -380,7 +384,32 @@ class Qwen2_5_VisionPatchEmbed(nnx.Module):
                       self.patch_size)
         # Transpose to (L, T, H, W, C) for Conv3D with channels_last format
         x = jnp.transpose(x, (0, 2, 3, 4, 1))
-        x = self.proj(x)
+
+        out_sharding = None
+        if self.mesh is not None:
+            out_sharding = NamedSharding(self.mesh, P(None, None, None, None, "tensor"))
+
+        lhs_dilation = self.proj.input_dilation
+        if isinstance(lhs_dilation, int):
+            lhs_dilation = (lhs_dilation,) * 3
+
+        rhs_dilation = self.proj.kernel_dilation
+        if isinstance(rhs_dilation, int):
+            rhs_dilation = (rhs_dilation,) * 3
+
+        x = jax.lax.conv_general_dilated(
+            lhs=x,
+            rhs=self.proj.kernel.value,
+            window_strides=self.proj.strides,
+            padding=self.proj.padding,
+            lhs_dilation=lhs_dilation,
+            rhs_dilation=rhs_dilation,
+            dimension_numbers=('NDHWC', 'DHWIO', 'NDHWC'),
+            feature_group_count=self.proj.feature_group_count,
+            batch_group_count=1,
+            out_sharding=out_sharding,
+        )
+
         # After conv, shape is (L, T_out, H_out, W_out, C_out)
         # With stride=kernel_size, T_out=H_out=W_out=1.
         # So shape is (L, 1, 1, 1, hidden_size)
@@ -400,6 +429,7 @@ class Qwen2_5_VisionPatchMerger(nnx.Module):
             rngs: nnx.Rngs = None,
             mesh: Mesh = None
     ):
+        self.mesh = mesh
         self.hidden_size = context_dim * (spatial_merge_size**2)
         self.ln_q = norm_layer(context_dim,
                                dtype=dtype,
@@ -428,7 +458,12 @@ class Qwen2_5_VisionPatchMerger(nnx.Module):
 
     def __call__(self, x: jax.Array) -> jax.Array:
         x = self.ln_q(x)
-        x = x.reshape(-1, self.hidden_size)
+        if self.mesh:
+            out_sharding = NamedSharding(self.mesh, P(None, "tensor"))
+            x = jax.lax.reshape(x, (x.size // self.hidden_size, self.hidden_size),
+                                out_sharding=out_sharding)
+        else:
+            x = x.reshape(-1, self.hidden_size)
         x = self.mlp_fc1(x)[0]
         x = self.mlp_act(x)
         x = self.mlp_fc2(x)[0]
@@ -472,7 +507,8 @@ class Qwen2_5_VisionTransformer(nnx.Module):
             in_channels=config.vision_config.in_channels,
             hidden_size=config.vision_config.hidden_size,
             dtype=dtype,
-            rngs=rngs)
+            rngs=rngs,
+            mesh=mesh)
 
         head_dim = config.vision_config.hidden_size // config.vision_config.num_heads
         self.rotary_pos_emb = Qwen2_5_VisionRotaryEmbedding(head_dim // 2)
@@ -733,29 +769,10 @@ class Qwen2_5_VLForConditionalGeneration(nnx.Module):
         pixel_values = jnp.concatenate([item.feature for item in items], axis=0).astype(
             self.visual.dtype
         )
-        # Collect image_grid_thw as Python tuples directly from items
-        grid_thw_list = []
-        for item in items:
-            if hasattr(item, "image_grid_thw") and item.image_grid_thw is not None:
-                # Convert to Python tuple immediately
-                grid_thw = item.image_grid_thw
-                if isinstance(grid_thw, jax.Array) or hasattr(grid_thw, '__array__'):
-                    # Convert JAX/NumPy array to tuple
-                    import numpy as np
-                    grid_np = np.asarray(grid_thw)
-                    grid_tuple = tuple(tuple(int(x) for x in row) for row in grid_np)
-                else:
-                    # Already a tuple or list
-                    grid_tuple = tuple(tuple(row) for row in grid_thw)
-                grid_thw_list.append(grid_tuple)
-            else:
-                # Provide a default value if image_grid_thw is not available
-                grid_thw_list.append(((1, 1, 1),))
-        
-        # Flatten the list of tuples into a single tuple
-        grid_thw_tuple = tuple(item for sublist in grid_thw_list for item in sublist)
-        
-        image_embeds = self.visual(pixel_values, grid_thw=grid_thw_tuple)
+        image_grid_thw = np.concatenate([item.image_grid_thw for item in items], axis=0)
+        assert pixel_values.ndim == 2, pixel_values.ndim
+        assert image_grid_thw.ndim == 2, image_grid_thw.ndim
+        image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw)
         return image_embeds
 
     def get_video_feature(self, items: List[MultimodalDataItem]) -> jax.Array:
@@ -763,31 +780,10 @@ class Qwen2_5_VLForConditionalGeneration(nnx.Module):
         pixel_values = jnp.concatenate([item.feature for item in items], axis=0).astype(
             self.visual.dtype
         )
-        # Collect video_grid_thw as Python tuples directly from items
-        grid_thw_list = []
-        for item in items:
-            if hasattr(item, 'video_grid_thw') and item.video_grid_thw is not None:
-                # Convert to Python tuple immediately
-                grid_thw = item.video_grid_thw
-                if hasattr(grid_thw, 'detach'):  # PyTorch tensor
-                    grid_thw = grid_thw.detach().cpu().numpy()
-                
-                if isinstance(grid_thw, jax.Array) or hasattr(grid_thw, '__array__'):
-                    # Convert JAX/NumPy array to tuple
-                    import numpy as np
-                    grid_np = np.asarray(grid_thw)
-                    grid_tuple = tuple(tuple(int(x) for x in row) for row in grid_np)
-                else:
-                    # Already a tuple or list
-                    grid_tuple = tuple(tuple(row) for row in grid_thw)
-                grid_thw_list.append(grid_tuple)
-            else:
-                raise ValueError(f"MultimodalDataItem missing video_grid_thw attribute")
-        
-        # Flatten the list of tuples into a single tuple
-        grid_thw_tuple = tuple(item for sublist in grid_thw_list for item in sublist)
-        
-        video_embeds = self.visual(pixel_values, grid_thw=grid_thw_tuple)
+        video_grid_thw = np.concatenate([item.video_grid_thw for item in items], axis=0)
+        assert pixel_values.ndim == 2, pixel_values.ndim
+        assert video_grid_thw.ndim == 2, video_grid_thw.ndim
+        video_embeds = self.visual(pixel_values, grid_thw=video_grid_thw)
         return video_embeds
 
     def get_input_embeddings(self):
@@ -849,38 +845,13 @@ class Qwen2_5_VLForConditionalGeneration(nnx.Module):
         
         weight_mappings = self._create_qwen2_5_vl_weight_mappings()
         
-        self._load_weights_with_special_conv3d(loader, weight_mappings)
-        logger.info("Qwen2.5-VL weights loaded successfully!")
-    
-    def _load_weights_with_special_conv3d(self, loader: WeightLoader, weight_mappings: dict):
-        """
-        Load weights with special handling for Conv3D to prevent incorrect mappings and improve efficiency.
-        """
-        params = nnx.state(self)
-        conv3d_key = "visual.patch_embed.proj.weight"
-
-        for hf_key, hf_weight in loader._iterate_weights():
-            if hf_key == conv3d_key:
-                mapping = weight_mappings.get(hf_key)
-                if not mapping:
-                    logger.warning(f"No mapping found for Conv3D weight: {hf_key}")
-                    continue
-                
-                # Custom permutation for Conv3D weight
-                permuted_weight = jnp.transpose(hf_weight, (2, 3, 4, 1, 0))
-                sharded_weight = loader._shard_weight(permuted_weight, mapping.sharding)
-                target_param = loader._get_param(params, mapping.target_path)
-                target_param.value = sharded_weight.astype(target_param.value.dtype)
-                logger.debug(f"Loaded Conv3D weight: {hf_key} -> {mapping.target_path}")
-
-            elif hf_key in weight_mappings:
-                mapping = weight_mappings[hf_key]
-                loader._process_and_assign_weight(params, hf_key, hf_weight, mapping)
-            else:
-                if not loader._is_excluded_layer_weight(hf_key):
-                    logger.warning(f"No mapping found for weight: {hf_key}")
+        loader.load_weights_from_safetensors(weight_mappings)
         
-        nnx.update(self, params)
+        if getattr(self.config, "tie_word_embeddings", False):
+            self.lm_head.embedding = self.model.embed_tokens.embedding
+            logger.info("Tied word embeddings: lm_head's weights are now tied to embed_tokens'.")
+        
+        logger.info("Qwen2.5-VL weights loaded successfully!")
 
     def _create_qwen2_5_vl_weight_mappings(self) -> dict:
         """Create weight mappings for Qwen2.5-VL model.
@@ -936,6 +907,7 @@ class Qwen2_5_VLForConditionalGeneration(nnx.Module):
             target_path="visual.patch_embed.proj.kernel",
             sharding=(None, None, None, None, "tensor"),
             transpose=False,
+            transpose_dims=(2, 3, 4, 1, 0),
         )
         
         # Note: In the model definition, use_bias=False is set for the proj Conv layer
@@ -1071,9 +1043,7 @@ class Qwen2_5_VLForConditionalGeneration(nnx.Module):
             
         Returns:
             Dictionary mapping layer weight names to model paths
-        """
-        from sgl_jax.srt.utils.weight_utils import WeightMapping
-        
+        """        
         prefix = f"model.layers.{layer_idx}"
         target_prefix = f"model.layers.{layer_idx}"
         

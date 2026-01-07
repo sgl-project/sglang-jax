@@ -225,15 +225,15 @@ class Conversation:
 
     def append_image(self, image_url: str, detail: str = "auto"):
         """Append image data."""
-        self.image_data.append({"url": image_url, "detail": detail})
+        self.image_data.append(image_url)
 
     def append_video(self, video_url: str):
         """Append video data."""
-        self.video_data.append({"url": video_url})
+        self.video_data.append(video_url)
 
     def append_audio(self, audio_url: str):
         """Append audio data."""
-        self.audio_data.append({"url": audio_url})
+        self.audio_data.append(audio_url)
 
     def get_prompt(self) -> str:
         """Get the conversation prompt."""

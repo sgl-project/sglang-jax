@@ -166,7 +166,7 @@ class TokenizerManager:
                     tokenizer_mode=server_args.tokenizer_mode,
                     trust_remote_code=server_args.trust_remote_code,
                     revision=server_args.revision,
-                    use_fast=False,
+                    use_fast=not server_args.disable_fast_image_processor,
                 )
             except ValueError as e:
                 error_message = str(e)

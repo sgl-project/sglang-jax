@@ -161,8 +161,6 @@ class ForwardBatch:
     # For extend
     extend_prefix_lens: jax.Array | None = None
     extend_seq_lens: jax.Array | None = None
-    extend_prefix_lens_cpu: list[int] | None = None
-    extend_seq_lens_cpu: list[int] | None = None
 
     # For LoRA
     lora_ids: list[str] | None = None
@@ -201,6 +199,7 @@ class ForwardBatch:
             self.lora_ranks,
             self.spec_info,
             self.mrope_positions,
+            self.mm_inputs,
             self.attention_mask,
         )
 
@@ -210,7 +209,6 @@ class ForwardBatch:
             "spec_algorithm": self.spec_algorithm,
             "capture_hidden_mode": self.capture_hidden_mode,
             "deterministic": self.deterministic,
-            "mm_inputs": self.mm_inputs,
             "extend_prefix_lens_cpu": self.extend_prefix_lens_cpu,
             "extend_seq_lens_cpu": self.extend_seq_lens_cpu,
         }
@@ -225,7 +223,6 @@ class ForwardBatch:
         obj.spec_algorithm = aux_data["spec_algorithm"]
         obj.capture_hidden_mode = aux_data["capture_hidden_mode"]
         obj.deterministic = aux_data.get("deterministic", True)
-        obj.mm_inputs = aux_data["mm_inputs"]
         obj.extend_prefix_lens_cpu = aux_data["extend_prefix_lens_cpu"]
         obj.extend_seq_lens_cpu = aux_data["extend_seq_lens_cpu"]
         obj.trace_request_ids = None
@@ -246,10 +243,11 @@ class ForwardBatch:
         obj.lora_ranks = children[12]
         obj.spec_info = children[13]
         obj.mrope_positions = children[14]
+        obj.mm_inputs = children[15]
 
         # Handle optional children for backward compatibility
-        if len(children) > 15:
-            obj.attention_mask = children[15]
+        if len(children) > 16:
+            obj.attention_mask = children[16]
         else:
             obj.attention_mask = None
 
@@ -337,6 +335,20 @@ class ForwardBatch:
                 batch.lora_token_indices,
                 batch.lora_ranks,
             )
+
+        if batch.multimodal_inputs:
+            for mm_input in batch.multimodal_inputs:
+                if mm_input is not None:
+                    for item in mm_input.mm_items:
+                        if item.feature is not None:
+                            (item.feature,) = device_array(
+                                (item.feature,),
+                                sharding=(
+                                    NamedSharding(model_runner.mesh, PartitionSpec())
+                                    if jax.process_count() == 1
+                                    else None
+                                ),
+                            )
         
         obj = cls(
             bid=batch.bid,
@@ -356,8 +368,6 @@ class ForwardBatch:
             lora_scalings=lora_scalings,
             lora_token_indices=lora_token_indices,
             lora_ranks=lora_ranks,
-            extend_prefix_lens_cpu=batch.extend_prefix_lens,
-            extend_seq_lens_cpu=batch.extend_seq_lens,
             attn_backend=model_runner.attn_backend,
             spec_info=batch.spec_info,
             spec_algorithm=batch.spec_algorithm,
@@ -378,7 +388,8 @@ class ForwardBatch:
 
             # Generate mask: 1 for valid tokens, 0 for padding
             obj.attention_mask = (obj.input_ids != pad_token_id).astype(jnp.int32)
-        if model_runner.model_is_mrope:
+            
+        if batch.multimodal_inputs:
             obj._compute_mrope_positions(model_runner, batch)
 
         return obj
@@ -458,6 +469,7 @@ class ForwardBatch:
                         mm_input, self.seq_lens[batch_idx]
                     )
                     mrope_positions_list[batch_idx] = mrope_positions
+                    mm_input.mrope_positions = None
             elif self.forward_mode.is_extend():
                 extend_seq_len, extend_prefix_len = (
                     batch.extend_seq_lens[batch_idx],
@@ -486,6 +498,7 @@ class ForwardBatch:
                         mrope_positions = self._expand_mrope_from_input(
                             mm_input, self.seq_lens[batch_idx], model_runner.device
                         )
+                    mm_input.mrope_positions = None
                 mrope_positions_list[batch_idx] = mrope_positions
 
         self.mrope_positions = jnp.concatenate(

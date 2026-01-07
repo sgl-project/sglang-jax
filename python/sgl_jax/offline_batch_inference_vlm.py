@@ -25,7 +25,7 @@ def main(
 
     sampling_params = {
         "temperature": 0.001,
-        "max_new_tokens": 30,
+        "max_new_tokens": 100,
     }
 
     output = vlm.generate(
@@ -36,6 +36,7 @@ def main(
 
     print("===============================")
     print(f"Prompt: {prompt}")
+    print("===============================")
     print(f"Generated text: {output['text']}")
 
     vlm.shutdown()

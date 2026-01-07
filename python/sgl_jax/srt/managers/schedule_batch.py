@@ -28,6 +28,7 @@ import jax
 import numpy as np
 from jax import numpy as jnp
 from jax._src import mesh as mesh_lib
+from jax.tree_util import register_pytree_node_class
 
 from sgl_jax.global_config import global_config
 from sgl_jax.srt.configs.model_config import ModelConfig
@@ -167,6 +168,7 @@ class Modality(Enum):
         return [Modality.IMAGE, Modality.VIDEO, Modality.AUDIO]
 
 
+@register_pytree_node_class
 @dataclasses.dataclass
 class MultimodalDataItem:
     """
@@ -267,7 +269,42 @@ class MultimodalDataItem:
         self.hash = hash((self.hash, other.hash))
         self.set_pad_value()
 
+    def tree_flatten(self):
+        # Dynamic part: JAX arrays and other pytrees (like dicts of arrays).
+        children = (self.feature, self.precomputed_embeddings)
 
+        def make_hashable(value):
+            if isinstance(value, (list, tuple)):
+                return tuple(make_hashable(v) for v in value)
+            if isinstance(value, np.ndarray):
+                return tuple(make_hashable(v) for v in value.tolist())
+            if isinstance(value, dict):
+                return tuple(sorted((k, make_hashable(v)) for k, v in value.items()))
+            return value
+
+        # Static part: Metadata that doesn't change and isn't an array.
+        sanitized_model_data = tuple(sorted((k, make_hashable(v)) for k, v in self.model_specific_data.items()))
+        offsets_tuple = tuple(self.offsets) if self.offsets is not None else None
+        aux_data = (self.modality, self.hash, self.pad_value, offsets_tuple, sanitized_model_data)
+        return children, aux_data
+
+    @classmethod
+    def tree_unflatten(cls, aux_data, children):
+        (modality, hash_val, pad_value, offsets, sanitized_model_data) = aux_data
+        (feature, precomputed_embeddings) = children
+        model_specific_data = dict(sanitized_model_data)
+        return cls(
+            modality=modality,
+            hash=hash_val,
+            pad_value=pad_value,
+            offsets=list(offsets) if offsets is not None else None,
+            feature=feature,
+            precomputed_embeddings=precomputed_embeddings,
+            model_specific_data=model_specific_data,
+        )
+
+
+@register_pytree_node_class
 @dataclasses.dataclass
 class MultimodalInputs:
     """The multimodal data related inputs."""
@@ -378,6 +415,44 @@ class MultimodalInputs:
                     setattr(self, key, getattr(other, key, None))
         # other args would be kept intact
 
+    def tree_flatten(self):
+        children = (self.mm_items, self.mrope_positions, self.mrope_position_delta)
+        aux_data = (
+            self.image_pad_len,
+            self.num_image_tokens,
+            self.im_token_id,
+            self.im_start_id,
+            self.im_end_id,
+            self.slice_start_id,
+            self.slice_end_id,
+            self.video_token_id,
+            self.audio_token_id,
+            self.audio_start_id,
+            self.audio_end_id,
+        )
+        return children, aux_data
+
+    @classmethod
+    def tree_unflatten(cls, aux_data, children):
+        obj = cls.__new__(cls)
+        # Set dynamic children
+        obj.mm_items, obj.mrope_positions, obj.mrope_position_delta = children
+        # Set static aux_data
+        (
+            obj.image_pad_len,
+            obj.num_image_tokens,
+            obj.im_token_id,
+            obj.im_start_id,
+            obj.im_end_id,
+            obj.slice_start_id,
+            obj.slice_end_id,
+            obj.video_token_id,
+            obj.audio_token_id,
+            obj.audio_start_id,
+            obj.audio_end_id,
+        ) = aux_data
+        return obj
+    
         
 class Req:
     """The input and output status of a request."""
