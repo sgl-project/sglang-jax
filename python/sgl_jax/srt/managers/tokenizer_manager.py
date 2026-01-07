@@ -28,6 +28,7 @@ from fastapi import BackgroundTasks
 
 from sgl_jax.srt.configs.model_config import ModelConfig
 from sgl_jax.srt.hf_transformers_utils import get_tokenizer
+from sgl_jax.srt.lora.lora_registry import LoRARegistry
 from sgl_jax.srt.managers.io_struct import (
     AbortReq,
     BatchEmbeddingOut,
@@ -35,6 +36,7 @@ from sgl_jax.srt.managers.io_struct import (
     BatchTokenIDOut,
     CloseSessionReqInput,
     ConfigureLoggingReq,
+    ContinueGenerationReqInput,
     EmbeddingReqInput,
     FlushCacheReqInput,
     FlushCacheReqOutput,
@@ -44,6 +46,7 @@ from sgl_jax.srt.managers.io_struct import (
     HealthCheckOutput,
     OpenSessionReqInput,
     OpenSessionReqOutput,
+    PauseGenerationReqInput,
     ProfileReq,
     ProfileReqOutput,
     ProfileReqType,
@@ -142,8 +145,8 @@ class TokenizerManager:
         self.is_generation = self.model_config.is_generation
         self.context_len = self.model_config.context_len
         self.image_token_id = self.model_config.image_token_id
-        self._updating = False
-        self._cond = asyncio.Condition()
+        self.is_pause = False
+        self.is_pause_cond = asyncio.Condition()
 
         self.mm_processor = None
 
@@ -192,6 +195,9 @@ class TokenizerManager:
             self.send_to_scheduler, server_args.dp_size
         )
 
+        # LoRA
+        self.lora_registry = LoRARegistry(self.server_args.lora_paths)
+
         self._result_dispatcher = TypeBasedDispatcher(
             [
                 (
@@ -238,12 +244,17 @@ class TokenizerManager:
         obj: GenerateReqInput | EmbeddingReqInput,
         request: fastapi.Request | None = None,
     ):
+
         created_time = time.time()
-        async with self._cond:
-            await self._cond.wait_for(lambda: not self._updating)
+        async with self.is_pause_cond:
+            await self.is_pause_cond.wait_for(lambda: not self.is_pause)
 
         self.auto_create_handle_loop()
         obj.normalize_batch_and_arguments()
+
+        # Acquire LoRA ID if lora_path is provided
+        if isinstance(obj, GenerateReqInput) and self.server_args.enable_lora and obj.lora_path:
+            obj.lora_id = await self.lora_registry.acquire(obj.lora_path)
 
         if isinstance(obj, EmbeddingReqInput) and self.is_generation:
             raise ValueError(
@@ -344,11 +355,24 @@ class TokenizerManager:
             input_ids,
             sampling_params,
             obj.return_logprob,
+            obj.return_output_logprob_only,
             obj.logprob_start_len,
             obj.top_logprobs_num,
             obj.token_ids_logprob,
             obj.stream,
+            obj.lora_id,
+            obj.extra_key,
         )
+        # note: When only `return_logprob` is specified, we assume that only the output probability is required.
+        if (
+            tokenized_obj.return_logprob
+            and (obj.logprob_start_len is None or obj.logprob_start_len == -1)
+            and (obj.top_logprobs_num == 0 or obj.top_logprobs_num is None)
+            and obj.token_ids_logprob is None
+        ):
+            tokenized_obj.return_logprob = False
+            obj.return_output_logprob_only = True
+            tokenized_obj.return_output_logprob_only = True
 
         return tokenized_obj
 
@@ -555,12 +579,13 @@ class TokenizerManager:
                         pass
 
     async def flush_cache(self) -> FlushCacheReqOutput:
+        self.auto_create_handle_loop()
         return (await self.flush_cache_communicator(FlushCacheReqInput()))[0]
 
     def abort_request(self, rid: str = "", abort_all: bool = False):
         if not abort_all and rid not in self.rid_to_state:
             return
-        req = AbortReq(rid, abort_all)
+        req = AbortReq(rid=rid, abort_all=abort_all)
         self.send_to_scheduler.send_pyobj(req)
 
     async def start_profile(
@@ -594,15 +619,24 @@ class TokenizerManager:
             raise RuntimeError(result.message)
         return result
 
-    async def pause_generation(self):
-        async with self._cond:
-            self._updating = True
-            self.abort_request(abort_all=True)
+    async def pause_generation(self, obj: PauseGenerationReqInput):
+        async with self.is_pause_cond:
+            self.is_pause = True
+            if obj.mode != "abort":
+                await self.send_to_scheduler.send_pyobj(obj)
+            else:
+                # use len(self.rid_to_state) == 0 to ensure all requests are aborted
+                while True:
+                    self.abort_request(abort_all=True)
+                    if len(self.rid_to_state) == 0:
+                        break
+                    await asyncio.sleep(0.1)
 
-    async def continue_generation(self):
-        async with self._cond:
-            self._updating = False
-            self._cond.notify_all()
+    async def continue_generation(self, obj: ContinueGenerationReqInput):
+        async with self.is_pause_cond:
+            self.is_pause = False
+            await self.send_to_scheduler.send_pyobj(obj)
+            self.is_pause_cond.notify_all()
 
     async def release_memory_occupation(
         self,
@@ -641,6 +675,7 @@ class TokenizerManager:
         await self.send_to_scheduler.send_pyobj(obj)
 
     async def get_internal_state(self) -> list[dict[Any, Any]]:
+        self.auto_create_handle_loop()
         req = GetInternalStateReq()
         responses: list[GetInternalStateReqOutput] = await self.get_internal_state_communicator(req)
         # Many DP ranks
@@ -885,7 +920,9 @@ class TokenizerManager:
                 "prompt_tokens": recv_obj.prompt_tokens[i],
             }
 
-            if getattr(state.obj, "return_logprob", False):
+            if getattr(state.obj, "return_logprob", False) or getattr(
+                state.obj, "return_output_logprob_only", False
+            ):
                 self.convert_logprob_style(
                     meta_info,
                     state,
@@ -949,6 +986,14 @@ class TokenizerManager:
             if state.finished:
                 state.finished_time = time.time()
                 meta_info["e2e_latency"] = state.finished_time - state.created_time
+                # Release LoRA ID if it was acquired
+                # Note: Only GenerateReqInput supports LoRA, not EmbeddingReqInput
+                if (
+                    isinstance(state.obj, GenerateReqInput)
+                    and self.server_args.enable_lora
+                    and state.obj.lora_id
+                ):
+                    asyncio.create_task(self.lora_registry.release(state.obj.lora_id))
                 del self.rid_to_state[rid]
 
             state.out_list.append(out_dict)
@@ -970,6 +1015,19 @@ class TokenizerManager:
         recv_obj: BatchStrOut,
         recv_obj_index: int,
     ):
+        if state.obj.return_output_logprob_only:
+            state.output_token_logprobs_val.extend(
+                recv_obj.output_token_logprobs_val[recv_obj_index]
+            )
+            state.output_token_logprobs_idx.extend(
+                recv_obj.output_token_logprobs_idx[recv_obj_index]
+            )
+            meta_info["output_token_logprobs"] = self.detokenize_logprob_tokens(
+                state.output_token_logprobs_val,
+                state.output_token_logprobs_idx,
+                return_text_in_logprobs,
+            )
+            return
         if recv_obj.input_token_logprobs_val is None:
             return
         if len(recv_obj.input_token_logprobs_val) > 0:

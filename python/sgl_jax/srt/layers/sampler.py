@@ -206,7 +206,7 @@ class Sampler(nnx.Module):
         if sampling_metadata.return_logprob:
             new_logits_output = self._process_logprob_results(logprob_operands)
 
-        return batch_next_token_ids, new_logits_output
+        return batch_next_token_ids, logprobs, new_logits_output
 
 
 def get_top_logprobs(logprobs: jax.Array, top_logprobs_nums: list[int]):
@@ -452,3 +452,12 @@ def top_k_top_p_min_p_sampling_from_probs_jax_with_mask(args):
     )
 
     return sampled_index.flatten()
+
+
+def compute_logprobs(
+    mesh: jax.sharding.Mesh, logprobs: jax.Array, token_ids: jax.Array
+) -> jax.Array:
+    out_sharding = NamedSharding(mesh, P(None))
+    batch_idx = jnp.arange(logprobs.shape[0])
+    token_logprobs = logprobs.at[batch_idx, token_ids].get(out_sharding=out_sharding)
+    return token_logprobs

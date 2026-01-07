@@ -28,7 +28,6 @@ class LinearBase(nnx.Module):
         use_bias: If true, add bias.
         skip_bias_add: If true, skip adding bias but instead return it.
         params_dtype: Data type for the parameters.
-        quant_config: Quantization configure.
         partition_spec: Partition spec for the linear layer.
     """
 
@@ -69,7 +68,10 @@ class LinearBase(nnx.Module):
         else:
             self.bias = None
 
-    def __call__(self, x: jax.Array) -> tuple[jax.Array, jax.Array | None]:
+    def __call__(
+        self,
+        x: jax.Array,
+    ) -> tuple[jax.Array, jax.Array | None]:
         """Forward pass of the linear layer."""
         bias = self.bias if not self.skip_bias_add else None
         output_pspec = P(*([None] * (x.ndim - 1)), self.kernel_axes[-1])

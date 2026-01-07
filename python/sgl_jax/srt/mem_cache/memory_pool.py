@@ -317,7 +317,7 @@ class MHATokenToKVPool(KVCache):
         )
         logger.info(
             "Total fused KV cache memory per layer: %.2f GB, dtype: %s",
-            total_memory_per_layer / 1024**3,
+            total_memory_per_layer / GB,
             self.dtype,
         )
         with self.mesh:
@@ -794,13 +794,6 @@ def update_fused_kv_cache_vectorized(
     )
 
     return kv_cache
-
-
-# @partial(jax.jit, static_argnames=["layer_id"])
-def _get_kv_buffer(
-    layer_id: int, k_cache: jax.Array, v_cache: jax.Array
-) -> tuple[jax.Array, jax.Array]:
-    return k_cache[layer_id], v_cache[layer_id]
 
 
 class MLATokenToKVPool(KVCache):

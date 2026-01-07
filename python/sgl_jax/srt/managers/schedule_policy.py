@@ -12,7 +12,7 @@ from jax import numpy as jnp
 from sgl_jax.srt.managers.schedule_batch import Req, ScheduleBatch
 from sgl_jax.srt.mem_cache.allocator import SWATokenToKVPoolAllocator
 from sgl_jax.srt.mem_cache.base_prefix_cache import BasePrefixCache
-from sgl_jax.srt.mem_cache.radix_cache import RadixCache, TreeNode
+from sgl_jax.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
 
 if TYPE_CHECKING:
     from sgl_jax.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
@@ -145,10 +145,13 @@ class SchedulePolicy:
 
         for r in waiting_queue:
             prefix_ids = r.adjust_max_prefix_ids()
+            extra_key = r.extra_key
 
             # NOTE: the prefix_indices must always be aligned with last_node
             r.prefix_indices, r.last_node, r.last_host_node, r.host_hit_length = (
-                self.tree_cache.match_prefix(rid=r.rid, key=prefix_ids)
+                self.tree_cache.match_prefix(
+                    rid=r.rid, key=RadixKey(token_ids=prefix_ids, extra_key=extra_key)
+                )
             )
 
             # NOTE(sang): This logic is for in-batch prefix caching;
@@ -160,7 +163,7 @@ class SchedulePolicy:
             # It is kind of common when the engine is long running (e.g., imagine the prefix "the").
             if len(r.prefix_indices) <= IN_BATCH_PREFIX_CACHING_CHECK_THRESHOLD:
                 in_batch_matching_prefixes, _, _, _ = self.waiting_queue_radix_tree.match_prefix(
-                    rid=r.rid, key=prefix_ids
+                    rid=r.rid, key=RadixKey(token_ids=prefix_ids, extra_key=extra_key)
                 )
                 if (
                     len(in_batch_matching_prefixes)
@@ -170,7 +173,8 @@ class SchedulePolicy:
                 else:
                     # Insert with a dummy key
                     self.waiting_queue_radix_tree.insert(
-                        prefix_ids, jnp.empty(len(prefix_ids), dtype=jnp.bool_)
+                        RadixKey(token_ids=prefix_ids, extra_key=extra_key),
+                        jnp.empty(len(prefix_ids), dtype=jnp.bool_),
                     )
         return temporary_deprioritized
 
@@ -321,6 +325,9 @@ class PrefillAdder:
     def ceil_paged_tokens(self, tokens: int) -> int:
         return -(-tokens // self.page_size) * self.page_size
 
+    def align_page_size(self, size: int) -> int:
+        return (size + self.page_size - 1) // self.page_size * self.page_size
+
     def budget_state(self):
         if self.rem_total_tokens <= 0 or self.cur_rem_tokens <= 0:
             return AddReqResult.NO_TOKEN
@@ -386,7 +393,9 @@ class PrefillAdder:
 
         def add_req_state(r, insert_sort=False):
             new_token_ratio = 1.0 if r.sampling_params.ignore_eos else self.new_token_ratio
-            tokens_left = r.sampling_params.max_new_tokens * new_token_ratio - len(r.output_ids)
+            tokens_left = self.align_page_size(
+                r.sampling_params.max_new_tokens * new_token_ratio
+            ) - len(r.output_ids)
             tokens_occupied = len(r.origin_input_ids) + len(r.output_ids)
 
             if tokens_left <= 0:

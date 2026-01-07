@@ -1,11 +1,25 @@
 import copy
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any
+from typing import Any, Literal
 
 from sgl_jax.srt.managers.schedule_batch import BaseFinishReason
+
+
+@dataclass
+class BaseReq:
+    rid: str | list[str] | None = field(default=None, kw_only=True)
+    http_worker_ipc: str | None = field(default=None, kw_only=True)
+
+    def regenerate_rid(self):
+        """Generate a new request ID and return it."""
+        if isinstance(self.rid, list):
+            self.rid = [uuid.uuid4().hex for _ in range(len(self.rid))]
+        else:
+            self.rid = uuid.uuid4().hex
+        return self.rid
 
 
 @dataclass
@@ -100,6 +114,8 @@ class TokenizedGenerateReqInput:
     sampling_params: list[dict] | dict | None = None
     # Whether to return logprobs.
     return_logprob: list[bool] | bool | None = None
+    # Whether to return onutput logprobs only.
+    return_output_logprob_only: bool | None = None
     # If return logprobs, the start location in the prompt for returning logprobs.
     # By default, this value is "-1", which means it will only return logprobs for output tokens.
     logprob_start_len: list[int] | int | None = -1
@@ -109,14 +125,64 @@ class TokenizedGenerateReqInput:
     token_ids_logprob: list[list[int]] | list[int] | None = None
     # Whether to stream output
     stream: bool = False
+    # LoRA related
+    lora_id: str | None = None  # None means just use the base model
+    # Extra key for cache namespace isolation (e.g., cache_salt, lora_id)
+    extra_key: str | None = None
 
 
 @dataclass
-class AbortReq:
-    # The request id
-    rid: str = ""
+class AbortReq(BaseReq):
     # Whether to abort all requests
     abort_all: bool = False
+
+    finished_reason: dict[str, Any] | None = None
+    aborted_message: str | None = None
+
+
+@dataclass
+class PauseGenerationReqInput(BaseReq):
+    """
+    Note that the PauseGenerationRequests is only supported in SGLang Server.
+    abort: Abort and return all requests currently being processed.
+
+    in_place: Pause the scheduler's event_loop from performing inference;
+            only non-inference requests (e.g., control commands) will be handled.
+            The requests in the engine will be paused and stay in the event_loop,
+            then continue generation after continue_generation with the old kv cache.
+            Note: In 'inplace' mode, flush_cache will fail if there are any requests
+            in the running_batch.
+
+    retract: Pause the scheduler's event loop from performing inference;
+            only non-inference requests will be handled, and all currently running
+            requests will be retracted back to the waiting_queue.
+            Note: The KV cache can be flushed in this mode and will be automatically
+            recomputed after continue_generation.
+    """
+
+    mode: Literal["abort", "retract", "in_place"] = "abort"
+
+    def __post_init__(self):
+        allowed = ["abort", "retract", "in_place"]
+        if self.mode not in allowed:
+            raise ValueError(f"Invalid mode: {self.mode!r}. " f"Expected one of {allowed}.")
+
+
+@dataclass
+class ContinueGenerationReqInput(BaseReq):
+    pass
+
+
+@dataclass
+class FlushCacheReqInput(BaseReq):
+    pass
+
+
+@dataclass
+class FlushCacheReqOutput(BaseReq):
+    success: bool
+    flushed_items: int = 0
+    error_msg: str = ""
 
 
 # Additional classes needed for engine.py imports
@@ -128,6 +194,8 @@ class EmbeddingReqInput:
     text: str = ""
     input_ids: list[int] = None
     normalize: bool = True
+    # Extra key for cache namespace isolation
+    extra_key: str | None = None
 
 
 @dataclass
@@ -137,7 +205,7 @@ class GenerateReqInput:
     batch_size: int = 1
     rid: list[str] | str | None = None
     text: list[str] | str | None = None
-    input_ids: list[int] = None
+    input_ids: list[list[int]] | list[int] | None = None
     # The embeddings for input_ids; one can specify either text or input_ids or input_embeds.
     input_embeds: list[list[list[float]]] | list[list[float]] | None = None
     sampling_params: Any | None = (
@@ -146,6 +214,7 @@ class GenerateReqInput:
     stream: bool = False
     is_single: bool = True
     return_logprob: list[bool] | bool | None = None
+    return_output_logprob_only: bool | None = None
     # If return logprobs, the start location in the prompt for returning logprobs.
     logprob_start_len: list[int] | int | None = None
     # If return logprobs, the number of top logprobs to return at each position.
@@ -154,6 +223,13 @@ class GenerateReqInput:
     token_ids_logprob: list[list[int]] | list[int] | None = None
     # Whether to detokenize tokens in text in the returned logprobs.
     return_text_in_logprobs: bool = True
+
+    # The path to the LoRA adaptors
+    lora_path: list[str] | str | None = None
+    # The uid of LoRA adaptors, should be initialized by tokenizer manager
+    lora_id: list[str] | str | None = None
+    # Extra key for cache namespace isolation (e.g., cache_salt)
+    extra_key: list[str] | str | None = None
 
     def _normalize_rid(self, num):
         """Normalize request IDs for batch processing."""
@@ -196,6 +272,11 @@ class GenerateReqInput:
             self.top_logprobs_num = 0
         if not self.token_ids_logprob:  # covers both None and []
             self.token_ids_logprob = None
+        if self.lora_path is not None and isinstance(self.lora_path, list):
+            if len(self.lora_path) == 1:
+                self.lora_path = self.lora_path[0]
+            elif len(self.lora_path) > 1:
+                raise ValueError("Single request cannot have multiple lora_paths")
 
     def _handle_parallel_sampling(self):
         """Handle parallel sampling parameters and adjust batch size if needed."""
@@ -237,6 +318,7 @@ class GenerateReqInput:
         self._normalize_rid(num)
         self._normalize_sampling_params(num)
         self._normalize_logprob_params(num)
+        self._normalize_lora_paths(num)
 
     def _expand_inputs(self, num):
         """Expand the main inputs (text, input_ids, input_embeds) for parallel sampling."""
@@ -326,6 +408,16 @@ class GenerateReqInput:
         elif self.parallel_sample_num > 1:
             raise ValueError("Cannot use list token_ids_logprob with parallel_sample_num > 1")
 
+    def _normalize_lora_paths(self, num):
+        """Normalize LoRA paths for batch processing."""
+        if self.lora_path is not None:
+            if isinstance(self.lora_path, str):
+                self.lora_path = [self.lora_path] * num
+            elif isinstance(self.lora_path, list):
+                self.lora_path = self.lora_path * self.parallel_sample_num
+            else:
+                raise ValueError("lora_path should be a list or a string.")
+
     def regenerate_rid(self):
         """Generate a new request ID and return it."""
         self.rid = uuid.uuid4().hex
@@ -343,6 +435,8 @@ class GenerateReqInput:
             token_ids_logprob=self.token_ids_logprob[i],
             return_text_in_logprobs=self.return_text_in_logprobs,
             stream=self.stream,
+            lora_path=self.lora_path[i] if self.lora_path is not None else None,
+            lora_id=self.lora_id[i] if self.lora_id is not None else None,
         )
 
 
@@ -418,18 +512,6 @@ class ConfigureLoggingReq(RpcReqInput):
 
     log_level: str
     log_file: str | None = None
-
-
-@dataclass
-class FlushCacheReqInput(RpcReqInput):
-    """Request to flush cache."""
-
-    request_id: str = ""
-    cache_type: str = "all"
-
-    def __post_init__(self):
-        if not self.request_id:
-            self.request_id = f"flush_cache_{int(time.time())}"
 
 
 # Internal state classes
@@ -534,13 +616,6 @@ class ConfigureLoggingReqOutput(RpcReqOutput):
     """Output for ConfigureLoggingReq."""
 
     pass
-
-
-@dataclass
-class FlushCacheReqOutput(RpcReqOutput):
-    """Output for FlushCacheReqInput."""
-
-    flushed_items: int = 0
 
 
 @dataclass

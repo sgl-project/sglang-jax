@@ -204,6 +204,7 @@ async def async_request_openai_completions(
             "max_tokens": request_func_input.output_len,
             "stream": not args.disable_stream,
             "ignore_eos": not args.disable_ignore_eos,
+            "lora_path": request_func_input.lora_name,
             **request_func_input.extra_request_body,
         }
         headers = get_auth_headers()
@@ -447,11 +448,11 @@ async def async_request_gserver(
     raise NotImplementedError()
 
 
-async def async_request_profile(api_url: str) -> RequestFuncOutput:
+async def async_request_profile(api_url: str, data: dict = None) -> RequestFuncOutput:
     async with _create_bench_client_session() as session:
         output = RequestFuncOutput()
         try:
-            async with session.post(url=api_url) as response:
+            async with session.post(url=api_url, json=data) as response:
                 if response.status == 200:
                     output.success = True
                 else:
@@ -1303,12 +1304,28 @@ async def benchmark(
 
     time.sleep(1.0)
 
+    profiler_auto_stops = False
+
     # Start profiler
     if profile:
-        print("Starting profiler...")
-        profile_output = await async_request_profile(api_url=base_url + "/start_profile")
+        steps_to_profile = getattr(args, "num_steps", 10)
+
+        print(f"Starting profiler (steps={steps_to_profile})...")
+
+        profile_payload = {}
+        if steps_to_profile:
+            profile_payload["num_steps"] = steps_to_profile
+            profiler_auto_stops = True
+
+        profile_output = await async_request_profile(
+            api_url=base_url + "/start_profile", data=profile_payload
+        )
+
         if profile_output.success:
-            print("Profiler started")
+            if profiler_auto_stops:
+                print(f"Profiler started (will auto-stop after {steps_to_profile} steps)")
+            else:
+                print("Profiler started (continuous mode)")
 
     pbar = None if disable_tqdm else tqdm(total=len(input_requests))
 
@@ -1340,12 +1357,14 @@ async def benchmark(
         )
     outputs: list[RequestFuncOutput] = await asyncio.gather(*tasks)
 
-    # Stop profiler
     if profile:
-        print("Stopping profiler...")
-        profile_output = await async_request_profile(api_url=base_url + "/stop_profile")
-        if profile_output.success:
-            print("Profiler stopped")
+        if profiler_auto_stops:
+            print("Profiler was set to auto-stop with num_steps. Skipping manual stop request.")
+        else:
+            print("Stopping profiler...")
+            profile_output = await async_request_profile(api_url=base_url + "/stop_profile")
+            if profile_output.success:
+                print("Profiler stopped")
 
     if pbar is not None:
         pbar.close()
@@ -1676,7 +1695,7 @@ if __name__ == "__main__":
         "--backend",
         type=str,
         choices=list(ASYNC_REQUEST_FUNCS.keys()),
-        default="sglang",
+        default="sgl-jax",
         help="Must specify a backend, depending on the LLM Inference Engine.",
     )
     parser.add_argument(
@@ -1806,7 +1825,7 @@ if __name__ == "__main__":
         "--profile",
         action="store_true",
         help="Use Torch Profiler. The endpoint must be launched with "
-        "SGLANG_TORCH_PROFILER_DIR to enable profiler.",
+        "SGLANG_JAX_PROFILER_DIR to enable profiler.",
     )
     parser.add_argument(
         "--lora-name",

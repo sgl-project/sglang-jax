@@ -6,13 +6,15 @@ It accepts server arguments (the same as launch_server.py) and benchmark argumen
 
 # Usage (latency test)
 ## with dummy weights:
-python -m sglang.bench_one_batch --model-path meta-llama/Meta-Llama-3-8B-Instruct --load-format dummy
+python -m sgl_jax.bench_one_batch --model-path meta-llama/Meta-Llama-3-8B-Instruct --load-format dummy
 ## sweep through multiple data points and store (append) the results in a jsonl file:
-python -m sglang.bench_one_batch --model-path meta-llama/Meta-Llama-3-8B-Instruct --batch 1 12 14 --input-len 256 512 --output-len 32 256 --run-name test_run
+python -m sgl_jax.bench_one_batch --model-path meta-llama/Meta-Llama-3-8B-Instruct --batch-size 1 12 14 --input-len 256 512 --output-len 32 256 --run-name test_run
 ## run with profiling:
-python -m sglang.bench_one_batch --model-path meta-llama/Meta-Llama-3-8B-Instruct --batch 1 12 14 --input-len 256 512 --profile
+python -m sgl_jax.bench_one_batch --model-path meta-llama/Meta-Llama-3-8B-Instruct --batch-size 1 12 14 --input-len 256 512 --profile
+## run with custom prompts from file:
+python -m sgl_jax.bench_one_batch --model-path meta-llama/Meta-Llama-3-8B-Instruct --prompt-filename prompts.txt --batch-size 4
 # Usage (correctness test):
-python -m sglang.bench_one_batch --model-path TinyLlama/TinyLlama-1.1B-Chat-v0.4 --correct
+python -m sgl_jax.bench_one_batch --model-path TinyLlama/TinyLlama-1.1B-Chat-v0.4 --correctness-test
 
 ## Reference output (of the correctness test above, can be tpu dependent):
 input_ids=[[1, 450, 7483, 310, 3444, 338], [1, 450, 7483, 310, 278, 3303, 13187, 290, 338], [1, 20628, 338, 263, 6575, 1460, 2462, 322, 306, 763]]
@@ -43,12 +45,14 @@ I'm going to the park
 """
 
 import argparse
+import copy
 import dataclasses
 import itertools
 import json
 import logging
 import os
 import time
+from types import SimpleNamespace
 
 import jax
 import numpy as np
@@ -66,6 +70,7 @@ from sgl_jax.srt.sampling.sampling_batch_info import SamplingMetadata
 from sgl_jax.srt.sampling.sampling_params import SamplingParams
 from sgl_jax.srt.server_args import PortArgs, ServerArgs
 from sgl_jax.srt.utils import configure_logger, kill_process_tree
+from sgl_jax.srt.utils.mesh_utils import create_device_mesh
 
 
 @dataclasses.dataclass
@@ -74,6 +79,7 @@ class BenchArgs:
     batch_size: tuple[int] = (1,)
     input_len: tuple[int] = (1024,)
     output_len: tuple[int] = (16,)
+    prompt_filename: str = ""
     result_filename: str = "result.jsonl"
     correctness_test: bool = False
     # This is only used for correctness test
@@ -88,6 +94,7 @@ class BenchArgs:
         parser.add_argument("--batch-size", type=int, nargs="+", default=BenchArgs.batch_size)
         parser.add_argument("--input-len", type=int, nargs="+", default=BenchArgs.input_len)
         parser.add_argument("--output-len", type=int, nargs="+", default=BenchArgs.output_len)
+        parser.add_argument("--prompt-filename", type=str, default=BenchArgs.prompt_filename)
         parser.add_argument("--result-filename", type=str, default=BenchArgs.result_filename)
         parser.add_argument("--correctness-test", action="store_true")
         parser.add_argument("--cut-len", type=int, default=BenchArgs.cut_len)
@@ -113,6 +120,17 @@ class BenchArgs:
         return cls(**{attr: attr_type(getattr(args, attr)) for attr, attr_type in attrs})
 
 
+def _read_prompts_from_file(prompt_file, rank_print):
+    """Read custom prompts from the file specified by `--prompt-filename`."""
+    if not prompt_file:
+        return []
+    if not os.path.exists(prompt_file):
+        rank_print(f"Custom prompt file {prompt_file} not found. Using default inputs...")
+        return []
+    with open(prompt_file) as pf:
+        return pf.readlines()
+
+
 def load_model(server_args, port_args, tp_rank):
     rank_print = print if tp_rank == 0 else lambda *args, **kwargs: None
 
@@ -122,9 +140,11 @@ def load_model(server_args, port_args, tp_rank):
     # Use a size-1 'data' axis and shard across the 'tensor' axis per tp_size.
     all_devices = jax.devices()
     tp = min(server_args.tp_size, len(all_devices))
-    devices = all_devices[:tp]
-    devices_array = np.array(devices, dtype=object).reshape((1, tp))
-    mesh = jax.sharding.Mesh(devices_array, ("data", "tensor"))
+    mesh = create_device_mesh(
+        ici_parallelism=[-1, tp],
+        dcn_parallelism=[1, 1],
+        device_indexes=server_args.device_indexes,
+    )
 
     model_runner = ModelRunner(
         model_config=model_config,
@@ -148,12 +168,16 @@ def load_model(server_args, port_args, tp_rank):
     return model_runner, tokenizer
 
 
-def prepare_inputs_for_correctness_test(bench_args, tokenizer):
-    prompts = [
-        "The capital of France is",
-        "The capital of the United Kindom is",
-        "Today is a sunny day and I like",
-    ]
+def prepare_inputs_for_correctness_test(bench_args, tokenizer, custom_prompts):
+    prompts = (
+        custom_prompts
+        if custom_prompts
+        else [
+            "The capital of France is",
+            "The capital of the United Kindom is",
+            "Today is a sunny day and I like",
+        ]
+    )
     input_ids = [tokenizer.encode(p) for p in prompts]
     sampling_params = SamplingParams(
         temperature=0,
@@ -190,8 +214,12 @@ def prepare_extend_inputs_for_correctness_test(bench_args, input_ids, reqs, mode
     return reqs
 
 
-def prepare_synthetic_inputs_for_latency_test(batch_size, input_len):
-    input_ids = np.random.randint(0, 10000, (batch_size, input_len), dtype=np.int32)
+def prepare_synthetic_inputs_for_latency_test(batch_size, input_len, custom_inputs=None):
+    input_ids = (
+        custom_inputs
+        if custom_inputs
+        else np.random.randint(0, 10000, (batch_size, input_len), dtype=np.int32)
+    )
     sampling_params = SamplingParams(
         temperature=0,
         max_new_tokens=(BenchArgs.output_len[0] if isinstance(BenchArgs.output_len, tuple) else 16),
@@ -215,11 +243,16 @@ def prepare_synthetic_inputs_for_latency_test(batch_size, input_len):
 
 
 def extend(reqs, model_runner):
+    # Create dummy tree_cache for benchmarks (no prefix caching, just allocation)
+    dummy_tree_cache = SimpleNamespace(
+        token_to_kv_pool_allocator=model_runner.token_to_kv_pool_allocator,
+    )
+
     batch = ScheduleBatch.init_new(
         reqs=reqs,
         req_to_token_pool=model_runner.req_to_token_pool,
         token_to_kv_pool_allocator=model_runner.token_to_kv_pool_allocator,
-        tree_cache=None,
+        tree_cache=dummy_tree_cache,
         model_config=model_runner.model_config,
         enable_overlap=False,
         enable_custom_logit_processor=False,
@@ -267,7 +300,11 @@ def _run_forward_and_sample(model_runner, batch: ScheduleBatch, token_first_arg:
     )
 
     model_worker_batch = batch.get_model_worker_batch(
-        [token_first_arg], [bs_needed], [cache_loc_needed], page_size
+        [token_first_arg],
+        [bs_needed],
+        [cache_loc_needed],
+        page_size,
+        False,
     )
 
     # Prepare attention forward metadata (required by FlashAttention backend)
@@ -278,8 +315,6 @@ def _run_forward_and_sample(model_runner, batch: ScheduleBatch, token_first_arg:
     logits_metadata = LogitsMetadata.from_model_worker_batch(
         model_worker_batch, mesh=model_runner.mesh
     )
-    positions = model_worker_batch.positions
-
     logits_output, _ = model_runner.forward(forward_batch, logits_metadata=logits_metadata)
 
     pad_size = len(model_worker_batch.seq_lens) - model_worker_batch.real_bs
@@ -289,7 +324,7 @@ def _run_forward_and_sample(model_runner, batch: ScheduleBatch, token_first_arg:
         mesh=model_runner.mesh,
         vocab_size=model_runner.model_config.vocab_size,
     )
-    next_token_ids = model_runner.sample(logits_output, sampling_metadata, positions)
+    next_token_ids, _, _ = model_runner.sample(logits_output, sampling_metadata)
     # NOTE(Bob): seems that now next_token_ids is a jax array, not a numpy array
 
     return next_token_ids, logits_output.next_token_logits
@@ -309,7 +344,8 @@ def correctness_test(
     model_runner, tokenizer = load_model(server_args, port_args, tp_rank)
 
     # Prepare inputs
-    input_ids, reqs = prepare_inputs_for_correctness_test(bench_args, tokenizer)
+    custom_prompts = _read_prompts_from_file(bench_args.prompt_filename, rank_print)
+    input_ids, reqs = prepare_inputs_for_correctness_test(bench_args, tokenizer, custom_prompts)
     rank_print(f"\n{input_ids=}\n")
 
     if bench_args.cut_len > 0:
@@ -404,10 +440,13 @@ def latency_test_run_once(
 
     # Decode
     decode_latencies = []
+    # Convert JAX array to numpy array for decode
+    next_token_ids_cpu = np.array(next_token_ids)
     for i in range(output_len - 1):
         synchronize(device)
         tic = time.perf_counter()
-        next_token_ids, _ = decode(next_token_ids, batch, model_runner)
+        next_token_ids, _ = decode(next_token_ids_cpu, batch, model_runner)
+        next_token_ids_cpu = np.array(next_token_ids)
         synchronize(device)
         latency = time.perf_counter() - tic
         tot_latency += latency
@@ -476,12 +515,34 @@ def latency_test(
 
     rank_print("Benchmark ...")
 
+    custom_inputs = _read_prompts_from_file(bench_args.prompt_filename, rank_print)
+    custom_inputs = [tokenizer.encode(p.strip()) for p in custom_inputs]
+    custom_input_len = len(custom_inputs)
+
     # Run the sweep
     result_list = []
     for bs, il, ol in itertools.product(
         bench_args.batch_size, bench_args.input_len, bench_args.output_len
     ):
-        reqs = prepare_synthetic_inputs_for_latency_test(bs, il)
+        bs_aligned_inputs = []
+        if custom_inputs:
+            if custom_input_len == bs:
+                bs_aligned_inputs = custom_inputs
+            elif custom_input_len > bs:
+                rank_print(
+                    f"Custom input size ({custom_input_len}) is larger than batch_size ({bs}). "
+                    f"Using the first {bs} prompts."
+                )
+                bs_aligned_inputs = copy.deepcopy(custom_inputs[:bs])
+            else:
+                rank_print(
+                    f"Custom input size ({custom_input_len}) is smaller than batch_size ({bs}). "
+                    f"Pad to the desired batch_size with the last prompt."
+                )
+                bs_aligned_inputs = copy.deepcopy(custom_inputs)
+                bs_aligned_inputs.extend([bs_aligned_inputs[-1]] * (bs - custom_input_len))
+
+        reqs = prepare_synthetic_inputs_for_latency_test(bs, il, bs_aligned_inputs)
         ret = latency_test_run_once(
             bench_args.run_name,
             model_runner,
@@ -542,17 +603,6 @@ def main(server_args, bench_args):
             bs_max,
             in_max,
             out_max,
-        )
-
-    # Prefer native attention on single-TPU runs to avoid large FA compile-time temps
-    if (
-        (server_args.device is None or server_args.device == "tpu")
-        and server_args.tp_size == 1
-        and getattr(server_args, "attention_backend", "fa") == "fa"
-    ):
-        server_args.attention_backend = "native"
-        logging.info(
-            "Switching attention backend to 'native' for single TPU to reduce compile-time memory"
         )
 
     _set_envs_and_config(server_args)

@@ -41,6 +41,7 @@ from sgl_jax.srt.mem_cache.common import (
     alloc_token_slots,
 )
 from sgl_jax.srt.mem_cache.memory_pool import ReqToTokenPool
+from sgl_jax.srt.mem_cache.radix_cache import RadixKey
 from sgl_jax.srt.mem_cache.swa_radix_cache import SWARadixCache
 from sgl_jax.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
 from sgl_jax.srt.precision_tracer import (
@@ -156,9 +157,12 @@ class Req:
         origin_input_ids: list[int],
         sampling_params: SamplingParams,
         return_logprob: bool = False,
+        return_output_logprob_only: bool = False,
         top_logprobs_num: int = 0,
         token_ids_logprob: list[int] = None,
         stream: bool = False,
+        lora_id: str | None = None,
+        extra_key: str | None = None,
         origin_input_ids_unpadded: tuple[int] | None = None,
         eos_token_ids: set[int] | None = None,
         vocab_size: int | None = None,
@@ -181,6 +185,13 @@ class Req:
         # Sampling info
         self.sampling_params = sampling_params
         self.return_hidden_states = return_hidden_states
+
+        # Extra key for cache namespace isolation (e.g., cache_salt, lora_id)
+        if lora_id is not None:
+            extra_key = (extra_key or "") + lora_id  # lora_id is concatenated to the extra key
+
+        self.extra_key = extra_key
+        self.lora_id = lora_id if lora_id is not None else "0"
 
         # Memory pool info
         self.req_pool_idx: int | None = None
@@ -242,6 +253,7 @@ class Req:
 
         # Logprobs (arguments)
         self.return_logprob = return_logprob
+        self.return_output_logprob_only = return_output_logprob_only
         # Start index to compute logprob from.
         self.logprob_start_len = 0
         self.top_logprobs_num = top_logprobs_num
@@ -265,7 +277,7 @@ class Req:
         self.temp_input_token_ids_logprobs_val: list[float] | None = None
         self.temp_input_token_ids_logprobs_idx: list[int] | None = None
 
-        if return_logprob:
+        if return_logprob or return_output_logprob_only:
             # shape: (bs, 1)
             self.output_token_logprobs_val = []
             self.output_token_logprobs_idx = []
@@ -339,7 +351,7 @@ class Req:
                 self.last_host_node,
                 self.host_hit_length,
             ) = tree_cache.match_prefix(
-                key=self.adjust_max_prefix_ids(),
+                key=RadixKey(self.adjust_max_prefix_ids(), self.extra_key),
             )
             self.last_matched_prefix_len = len(self.prefix_indices)
         self.extend_input_len = len(self.fill_ids) - len(self.prefix_indices)
@@ -527,6 +539,7 @@ class ScheduleBatch:
 
     # For processing logprobs
     return_logprob: bool = False
+    return_output_logprob_only: bool = False
     top_logprobs_nums: list[int] | None = None
     token_ids_logprobs: list[list[int]] | None = None
 
@@ -581,7 +594,7 @@ class ScheduleBatch:
         mesh: mesh_lib.Mesh = None,
     ):
         return_logprob = any(req.return_logprob for req in reqs)
-
+        return_output_logprob_only = all(req.return_output_logprob_only for req in reqs)
         is_hybrid = False
         if isinstance(token_to_kv_pool_allocator, SWATokenToKVPoolAllocator):
             assert tree_cache is None or isinstance(
@@ -597,6 +610,7 @@ class ScheduleBatch:
             is_hybrid=is_hybrid,
             model_config=model_config,
             return_logprob=return_logprob,
+            return_output_logprob_only=return_output_logprob_only,
             enable_overlap=enable_overlap,
             has_stream=any(req.stream for req in reqs),
             has_grammar=any(req.grammar for req in reqs),
@@ -919,6 +933,14 @@ class ScheduleBatch:
 
         req.reset_for_retract()
 
+    def retract_all(self, server_args: ServerArgs):
+        retracted_reqs = self.reqs
+        for idx in range(len(self.reqs)):
+            self.release_req(idx, len(self.reqs) - idx, server_args)
+
+        self.filter_batch(retracted_reqs)
+        return retracted_reqs
+
     def prepare_for_idle(self):
         self.forward_mode = ForwardMode.IDLE
         self.input_ids = np.empty(0, np.int32)
@@ -1030,6 +1052,7 @@ class ScheduleBatch:
             keep_indices = np.array(keep_indices)
         self.output_ids = self.output_ids[keep_indices] if self.output_ids is not None else None
         self.return_logprob = any(req.return_logprob for req in self.reqs)
+        self.return_output_logprob_only = any(req.return_output_logprob_only for req in self.reqs)
         if self.return_logprob:
             self.top_logprobs_nums = [self.top_logprobs_nums[i] for i in keep_indices]
             self.token_ids_logprobs = [self.token_ids_logprobs[i] for i in keep_indices]
@@ -1079,6 +1102,7 @@ class ScheduleBatch:
         self.reqs.extend(other.reqs)
 
         self.return_logprob |= other.return_logprob
+        self.return_output_logprob_only |= other.return_output_logprob_only
         self.has_stream |= other.has_stream
         self.has_grammar |= other.has_grammar
         self.return_hidden_states |= other.return_hidden_states
@@ -1092,19 +1116,8 @@ class ScheduleBatch:
         bs_paddings: list,
         cache_loc_paddings: list,
         page_size: int,
-        skip_padding: bool = False,
+        enable_static_lora: bool = False,
     ) -> ModelWorkerBatch:
-        if skip_padding:
-            # FIXME(pc) spec decode model_worker_batch will be modified at decode stage, and padding laterly
-            # this may has some redundant code, we need clear future
-            return self.get_spec_model_worker_batch(
-                token_paddings=token_paddings,
-                bs_paddings=bs_paddings,
-                cache_loc_paddings=cache_loc_paddings,
-                page_size=page_size,
-                skip_padding=skip_padding,
-            )
-
         if self.forward_mode.is_decode_or_idle():
             extend_seq_lens = extend_prefix_lens = extend_logprob_start_lens = None
             token_paddings = bs_paddings
@@ -1336,6 +1349,12 @@ class ScheduleBatch:
         if precision_tracer.get_trace_active():
             self._generate_trace_info(real_bs, bid)
 
+        # Extract lora_ids from requests
+        lora_ids = [req.lora_id for req in self.reqs]
+        # Pad lora_ids to match seq_lens_cpu length (after bs padding)
+        if bs_padding_size > 0:
+            lora_ids = lora_ids + [None] * bs_padding_size
+
         return ModelWorkerBatch(
             bid=bid,
             forward_mode=self.forward_mode,
@@ -1345,6 +1364,7 @@ class ScheduleBatch:
             seq_lens=seq_lens_cpu,
             out_cache_loc=out_cache_loc_cpu,
             return_logprob=self.return_logprob,
+            return_output_logprob_only=self.return_output_logprob_only,
             top_logprobs_nums=self.top_logprobs_nums,
             token_ids_logprobs=self.token_ids_logprobs,
             sampling_info=sampling_info,
@@ -1357,6 +1377,11 @@ class ScheduleBatch:
             extend_seq_lens=(extend_seq_lens if self.forward_mode == ForwardMode.EXTEND else None),
             extend_logprob_start_lens=extend_logprob_start_lens,
             extend_input_logprob_token_ids=self.extend_input_logprob_token_ids,
+            lora_ids=(
+                [req.lora_id for req in self.reqs] + ["0"] * bs_padding_size
+                if not enable_static_lora
+                else ["0"] * bs_paddings[select_bs_index]
+            ),
             real_bs=real_bs,
             capture_hidden_mode=CaptureHiddenMode.NULL,
             launch_done=self.launch_done,
@@ -1368,9 +1393,8 @@ class ScheduleBatch:
         bs_paddings: list,
         cache_loc_paddings: list,
         page_size: int,
-        skip_padding: bool = False,
+        enable_static_lora: bool = False,
     ) -> ModelWorkerBatch:
-
         if self.forward_mode.is_decode_or_idle():
             extend_seq_lens = extend_prefix_lens = extend_logprob_start_lens = None
         else:
@@ -1392,7 +1416,6 @@ class ScheduleBatch:
         real_bs = len(seq_lens_cpu)
         req_pool_indices_cpu = self.req_pool_indices
         token_indices_with_all_reqs = self.req_to_token_pool.req_to_token[self.req_pool_indices]
-
         # FIXME @pc, move this to eagle_worker
         # If enable spec inference, use positions in spec info firstly
         if self.spec_info is not None and getattr(self.spec_info, "positions", None) is not None:
@@ -1405,12 +1428,19 @@ class ScheduleBatch:
             # For prefill: create positions for each token in sequences
             # Calculate total tokens without padding first
             if positions_cpu is None:
-                positions_cpu = np.concatenate(
-                    [
-                        np.arange(prefix_len, seq_len, dtype=seq_lens_cpu.dtype)
-                        for seq_len, prefix_len in zip(seq_lens_cpu, self.prefix_lens)
-                    ]
-                )
+                lengths = seq_lens_cpu - self.prefix_lens
+                if len(lengths) > 0:
+                    repeats = lengths
+                    total_len = np.sum(repeats)
+                    # Generate range [0, 1, ... len-1] for each sequence
+                    block_starts = np.concatenate(([0], np.cumsum(repeats)[:-1]))
+                    shifts = np.repeat(block_starts, repeats)
+                    ranges = np.arange(total_len) - shifts
+                    # Add prefix_len to each range
+                    positions_cpu = np.repeat(self.prefix_lens, repeats) + ranges
+                    positions_cpu = positions_cpu.astype(seq_lens_cpu.dtype)
+                else:
+                    positions_cpu = np.array([], dtype=seq_lens_cpu.dtype)
             # Start location of each sequence in the flattened array
             extend_start_loc = np.cumsum(
                 np.concatenate([np.array([0]), extend_seq_lens[:-1]]),
@@ -1452,7 +1482,9 @@ class ScheduleBatch:
                     and not self.spec_algorithm.is_none()
                     and self.spec_info.allocate_lens is not None
                 ):
-                    allocated_len = self.spec_info.allocate_lens[: len(self.reqs)]
+                    # Explicitly convert to numpy to avoid JAX device synchronization overhead
+                    allocated_len_cpu = np.array(self.spec_info.allocate_lens)
+                    allocated_len = allocated_len_cpu[: len(self.reqs)]
                     aligned_lengths = ((allocated_len + page_size - 1) // page_size) * page_size
                     alread_allocated_lens = allocated_len
                 else:
@@ -1462,22 +1494,42 @@ class ScheduleBatch:
 
                 # Pre-allocate the result array
                 cache_loc_flat = np.zeros(total_aligned_length, dtype=np.int32)
-                # Fill the array efficiently
-                offset = 0
-                for i, (seq_idx, alread_allocated_len, aligned_len) in enumerate(
-                    zip(valid_indices, alread_allocated_lens, aligned_lengths)
-                ):
 
-                    # Copy the actual data
-                    cache_loc_flat[offset : offset + alread_allocated_len] = (
-                        token_indices_with_all_reqs[seq_idx, :alread_allocated_len]
-                    )
-                    # Padding is already zero from initialization
-                    offset += aligned_len
+                # Vectorized filling of cache_loc_flat
+                # Calculate destination offsets for each block (where each block starts in cache_loc_flat)
+                dst_offsets = np.concatenate(([0], np.cumsum(aligned_lengths)[:-1]))
+
+                # We need to copy 'alread_allocated_lens' elements for each request
+                repeats = alread_allocated_lens
+                total_elements = np.sum(repeats)
+
+                if total_elements > 0:
+                    # 1. Generate Source Indices (row, col) for token_indices_with_all_reqs
+                    row_indices = np.repeat(valid_indices, repeats)
+
+                    # Generate col indices: 0..len-1 for each row
+                    # Using the shift trick: global_range - block_start_offsets
+                    block_starts = np.concatenate(([0], np.cumsum(repeats)[:-1]))
+                    shifts = np.repeat(block_starts, repeats)
+                    col_indices = np.arange(total_elements) - shifts
+
+                    # Extract source data
+                    source_data = token_indices_with_all_reqs[row_indices, col_indices]
+
+                    # 2. Generate Destination Indices for cache_loc_flat
+                    # Base offset for each block + local col index
+                    dst_base_offsets = np.repeat(dst_offsets, repeats)
+                    dst_indices = dst_base_offsets + col_indices
+
+                    # Assign
+                    cache_loc_flat[dst_indices] = source_data
 
         if precision_tracer.get_trace_active():
             self._generate_trace_info(real_bs, bid)
-        res = ModelWorkerBatch(
+        # Extract lora_ids from requests
+        lora_ids = [req.lora_id for req in self.reqs]
+
+        return ModelWorkerBatch(
             bid=bid,
             forward_mode=self.forward_mode,
             input_ids=input_ids_cpu,
@@ -1486,6 +1538,7 @@ class ScheduleBatch:
             seq_lens=seq_lens_cpu,
             out_cache_loc=out_cache_loc_cpu,
             return_logprob=self.return_logprob,
+            return_output_logprob_only=self.return_output_logprob_only,
             top_logprobs_nums=self.top_logprobs_nums,
             token_ids_logprobs=self.token_ids_logprobs,
             sampling_info=self.sampling_info,
@@ -1496,6 +1549,7 @@ class ScheduleBatch:
             extend_seq_lens=(extend_seq_lens if self.forward_mode.is_extend() else None),
             extend_logprob_start_lens=extend_logprob_start_lens,
             extend_input_logprob_token_ids=self.extend_input_logprob_token_ids,
+            lora_ids=lora_ids,
             real_bs=real_bs,
             capture_hidden_mode=(
                 CaptureHiddenMode.FULL
@@ -1511,14 +1565,6 @@ class ScheduleBatch:
             spec_algorithm=self.spec_algorithm,
             tree_cache=self.tree_cache,
         )
-        if skip_padding:
-            return res
-        res.padding_model_worker_batch(
-            token_paddings=token_paddings,
-            bs_paddings=bs_paddings,
-            cache_loc_paddings=cache_loc_paddings,
-        )
-        return res
 
     def _generate_trace_info(self, real_bs: int, bid: int) -> list[str]:
         for req in self.reqs[:real_bs]:
@@ -1552,6 +1598,7 @@ class ScheduleBatch:
             forward_mode=self.forward_mode,
             out_cache_loc=self.out_cache_loc,
             return_logprob=self.return_logprob,
+            return_output_logprob_only=self.return_output_logprob_only,
             decoding_reqs=self.decoding_reqs,
             is_prefill_only=self.is_prefill_only,
         )
@@ -1639,6 +1686,7 @@ class ModelWorkerBatch:
 
     # For logprob
     return_logprob: bool
+    return_output_logprob_only: bool
     top_logprobs_nums: list[int] | None
     token_ids_logprobs: list[list[int]] | None
 
@@ -1651,6 +1699,12 @@ class ModelWorkerBatch:
 
     # For padding
     real_bs: int
+
+    # For LoRA
+    lora_ids: list[str] | None = None
+    lora_scalings: np.ndarray | None = None
+    lora_token_indices: np.ndarray | None = None
+    lora_ranks: np.ndarray | None = None
 
     capture_hidden_mode: CaptureHiddenMode = None
 
@@ -1668,214 +1722,13 @@ class ModelWorkerBatch:
 
     spec_info: EagleDraftInput | EagleVerifyInput | None = None
     spec_algorithm: SpeculativeAlgorithm = None
+    speculative_num_steps: int = 0
+    speculative_eagle_topk: int = 0
+    speculative_num_draft_tokens: int = 0
     # If set, the output of the batch contains the hidden states of the run.
     capture_hidden_mode: CaptureHiddenMode = None
 
     tree_cache: BasePrefixCache = None
-
-    def padding_model_worker_batch(
-        self,
-        token_paddings: list,
-        bs_paddings: list,
-        cache_loc_paddings: list,
-    ):
-        if self.forward_mode.is_decode_or_idle():
-            token_paddings = bs_paddings
-        else:
-            bs_paddings = bs_paddings[-1:]
-            cache_loc_paddings = cache_loc_paddings[-1:]
-        # padding seq
-        # extend & decode: input_ids, positions, out_cache_loc, cache_loc
-        padding_size = 0
-        token_paddings.sort()
-        for size in token_paddings:
-            if size >= len(self.input_ids):
-                padding_size = size - len(self.input_ids)
-                break
-        if padding_size >= 0:
-            input_ids_cpu = np.concat(
-                [
-                    self.input_ids,
-                    np.array([0] * padding_size, dtype=self.input_ids.dtype),
-                ],
-                axis=0,
-            )
-        padded_input_ids_len = len(input_ids_cpu)
-        out_cache_loc_num_to_padding = padded_input_ids_len - len(self.out_cache_loc)
-        if out_cache_loc_num_to_padding >= 0:
-            out_cache_loc_cpu = np.concatenate(
-                [
-                    self.out_cache_loc,
-                    np.array(
-                        [-1] * out_cache_loc_num_to_padding,
-                        dtype=self.out_cache_loc.dtype,
-                    ),
-                ],
-                axis=0,
-            )
-        else:
-            # this maybe more than input_ids when eagle, but it will always be fix shape, so we should'd padding this
-            out_cache_loc_cpu = self.out_cache_loc
-        # todo padding position
-        seq_lens_cpu = self.seq_lens
-        bs_padding_size = 0
-        bs_paddings.sort()
-        select_bs_index = -1
-        for i, size in enumerate(bs_paddings):
-            if size >= len(seq_lens_cpu):
-                bs_padding_size = size - len(seq_lens_cpu)
-                select_bs_index = i
-                break
-        # offset = np.sum(seq_lens_cpu[seq_lens_cpu > 0]) if len(seq_lens_cpu) > 0 else 0
-
-        total_cache_loc_size = cache_loc_paddings[select_bs_index]
-        assert total_cache_loc_size >= len(self.cache_loc)
-
-        cache_loc_cpu = np.empty(total_cache_loc_size, dtype=np.int32)
-        if len(self.cache_loc) > 0:
-            cache_loc_cpu[: len(self.cache_loc)] = self.cache_loc
-        # Initialize padding area to ensure multiprocess consistency
-        if len(self.cache_loc) < total_cache_loc_size:
-            cache_loc_cpu[len(self.cache_loc) :] = 0
-        extend_start_loc = self.extend_start_loc
-        extend_prefix_lens = self.extend_prefix_lens
-        extend_seq_lens = self.extend_seq_lens
-        req_pool_indices_cpu = self.req_pool_indices
-        if bs_padding_size > 0:
-            invalid_req_pool_indices = np.array(
-                [-1] * bs_padding_size, dtype=self.req_pool_indices.dtype
-            )
-            req_pool_indices_cpu = np.concat(
-                [
-                    self.req_pool_indices,
-                    invalid_req_pool_indices,
-                ],
-                axis=0,
-            )
-            invalid_seq_lens = np.array([0] * bs_padding_size, dtype=seq_lens_cpu.dtype)
-            seq_lens_cpu = np.concat([seq_lens_cpu, invalid_seq_lens], axis=0)
-            if self.forward_mode.is_extend():
-                invalid_extend_start_loc = np.array(
-                    [self.extend_start_loc[-1] + self.extend_seq_lens[-1]] * bs_padding_size,
-                    dtype=(
-                        self.extend_start_loc.dtype
-                        if self.extend_start_loc is not None
-                        else np.int32
-                    ),
-                )
-                extend_start_loc = np.concat(
-                    [self.extend_start_loc, invalid_extend_start_loc], axis=0
-                )
-                invalid_extend_prefix_lens = np.array(
-                    [0] * bs_padding_size,
-                    dtype=np.int32,
-                )
-                extend_prefix_lens = (
-                    np.concat([self.extend_prefix_lens, invalid_extend_prefix_lens], axis=0)
-                    if self.extend_prefix_lens is not None
-                    and invalid_extend_prefix_lens.shape[0] > 0
-                    and self.extend_prefix_lens.shape[0] > 0
-                    else self.extend_prefix_lens
-                )
-                invalid_extend_seq_lens = np.array(
-                    [0] * bs_padding_size,
-                    dtype=(
-                        self.extend_seq_lens.dtype if self.extend_seq_lens is not None else np.int32
-                    ),
-                )
-                extend_seq_lens = (
-                    np.concat([self.extend_seq_lens, invalid_extend_seq_lens], axis=0)
-                    if self.extend_seq_lens is not None
-                    and invalid_extend_seq_lens.shape[0] > 0
-                    and self.extend_seq_lens.shape[0] > 0
-                    else self.extend_seq_lens
-                )
-            else:
-                invalid_extend_start_loc = np.array(
-                    [len(seq_lens_cpu)] * bs_padding_size,
-                    dtype=(
-                        self.extend_start_loc.dtype
-                        if self.extend_start_loc is not None
-                        else np.int32
-                    ),
-                )
-                extend_start_loc = np.concat(
-                    [self.extend_start_loc, invalid_extend_start_loc], axis=0
-                )
-                # padding
-        sampling_info = self.sampling_info
-        if self.sampling_info:
-            new_temperatures = np.concatenate(
-                [
-                    sampling_info.temperatures.reshape(sampling_info.temperatures.shape[0]),
-                    np.array([1.0] * bs_padding_size, dtype=sampling_info.temperatures.dtype),
-                ]
-            ).reshape(-1, 1)
-            new_top_ps = np.concatenate(
-                [
-                    sampling_info.top_ps,
-                    np.array([1.0] * bs_padding_size, dtype=sampling_info.top_ps.dtype),
-                ]
-            )
-            new_top_ks = np.concatenate(
-                [
-                    sampling_info.top_ks,
-                    np.array([1] * bs_padding_size, dtype=sampling_info.top_ks.dtype),
-                ]
-            )
-            new_min_ps = np.concatenate(
-                [
-                    sampling_info.min_ps,
-                    np.array([0.0] * bs_padding_size, dtype=sampling_info.min_ps.dtype),
-                ]
-            )
-            updates = {
-                "temperatures": new_temperatures,
-                "top_ps": new_top_ps,
-                "top_ks": new_top_ks,
-                "min_ps": new_min_ps,
-                # "grammars": ([req.grammar for req in self.reqs] if self.has_grammar else None),
-            }
-            if sampling_info.sampling_seeds is not None:
-                updates["sampling_seeds"] = np.concatenate(
-                    [
-                        sampling_info.sampling_seeds,
-                        np.array(
-                            [DEFAULT_SAMPLING_SEED] * bs_padding_size,
-                            dtype=sampling_info.sampling_seeds.dtype,
-                        ),
-                    ]
-                )
-            sampling_info = dataclasses.replace(sampling_info, **updates)
-        padding_size = 0
-        if (
-            self.forward_mode == ForwardMode.DRAFT_EXTEND
-            or self.forward_mode == ForwardMode.TARGET_VERIFY
-        ):
-            padding_size = len(input_ids_cpu) - len(self.positions)
-        elif self.forward_mode == ForwardMode.EXTEND or self.forward_mode == ForwardMode.MIXED:
-            total_tokens_before_padding = sum([extend_len for extend_len in extend_seq_lens])
-            padding_size = len(input_ids_cpu) - total_tokens_before_padding
-        elif not self.spec_algorithm.is_none() and self.forward_mode == ForwardMode.DECODE:
-            padding_size = len(input_ids_cpu) - len(self.positions)
-        else:
-            pass
-        if padding_size >= 0:
-            zeros_pad = np.zeros(padding_size, dtype=np.int32)
-            positions_cpu = np.concatenate([self.positions, zeros_pad], axis=0)
-        if len(positions_cpu) > len(input_ids_cpu):
-            positions_cpu = self.positions[: len(input_ids_cpu)]
-
-        self.seq_lens = seq_lens_cpu
-        self.extend_start_loc = extend_start_loc
-        self.extend_prefix_lens = extend_prefix_lens
-        self.extend_seq_lens = extend_seq_lens if self.forward_mode.is_extend() else None
-        self.cache_loc = cache_loc_cpu
-        self.input_ids = input_ids_cpu
-        self.out_cache_loc = out_cache_loc_cpu
-        self.req_pool_indices = req_pool_indices_cpu
-        self.positions = positions_cpu
-        self.sampling_info = sampling_info
 
 
 def get_last_loc(
