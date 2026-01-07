@@ -9,15 +9,6 @@ on:
     paths:
       - "python/sgl_jax/version.py"
   workflow_dispatch:
-  pull_request:
-    branches:
-      - main
-      - "epic/*"
-    paths:
-      - "python/**"
-      - "scripts/**"
-      - "test/**"
-      - ".github/workflows/pr-test.yml"
 concurrency:
   group: nightly-test-${{ github.ref }}
   cancel-in-progress: true
