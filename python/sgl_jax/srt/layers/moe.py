@@ -14,7 +14,7 @@ class GateLogit(nnx.Module):
         self,
         input_size: int,
         num_experts: int = 0,
-        weight_dtype: jnp.dtype = jnp.bfloat16,
+        weight_dtype: jnp.dtype = jnp.float32,
         enable_expert_bias: bool | None = False,
         score_func: str | None = "softmax",
     ):
@@ -37,7 +37,7 @@ class GateLogit(nnx.Module):
             self.bias = None
 
     def __call__(self, hidden_states: jax.Array) -> tuple[jax.Array, jax.Array | None]:
-        logits = hidden_states.astype(self.weight_dtype) @ self.kernel
+        logits = hidden_states.astype(jnp.float32) @ self.kernel
 
         if self.score_func:
             if self.score_func == "softmax":
