@@ -45,6 +45,8 @@ dependencies = [
     "omegaconf",
     "imageio[ffmpeg]",
     "qwix",
+    "torchvision",
+    "lmms_eval"
 ]
 
 [project.optional-dependencies]
