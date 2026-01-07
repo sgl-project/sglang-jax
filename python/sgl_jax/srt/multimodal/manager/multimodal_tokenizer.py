@@ -44,9 +44,12 @@ class MultimodalTokenizer(TokenizerManager):
         super().__init__(server_args, port_args)
         #  this will cast warning when use_fast=True  like
         #  "Using `use_fast=True` but `torchvision` is not available. Falling back to the slow image processor."
-        self.mm_processor = AutoImageProcessor.from_pretrained(
-            server_args.model_path, use_fast=False
-        )
+        try:
+            self.mm_processor = AutoImageProcessor.from_pretrained(
+                server_args.model_path, use_fast=False
+            )
+        except Exception:
+            logger.warning("Failed to load processor from %s", server_args.model_path)
         self.rid_to_state: dict[str, MMReqState] = {}
         # todo: rewrite this
         self._result_dispatcher = TypeBasedDispatcher(
