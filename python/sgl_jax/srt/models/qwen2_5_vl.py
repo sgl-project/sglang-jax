@@ -849,38 +849,13 @@ class Qwen2_5_VLForConditionalGeneration(nnx.Module):
         
         weight_mappings = self._create_qwen2_5_vl_weight_mappings()
         
-        self._load_weights_with_special_conv3d(loader, weight_mappings)
-        logger.info("Qwen2.5-VL weights loaded successfully!")
-    
-    def _load_weights_with_special_conv3d(self, loader: WeightLoader, weight_mappings: dict):
-        """
-        Load weights with special handling for Conv3D to prevent incorrect mappings and improve efficiency.
-        """
-        params = nnx.state(self)
-        conv3d_key = "visual.patch_embed.proj.weight"
-
-        for hf_key, hf_weight in loader._iterate_weights():
-            if hf_key == conv3d_key:
-                mapping = weight_mappings.get(hf_key)
-                if not mapping:
-                    logger.warning(f"No mapping found for Conv3D weight: {hf_key}")
-                    continue
-                
-                # Custom permutation for Conv3D weight
-                permuted_weight = jnp.transpose(hf_weight, (2, 3, 4, 1, 0))
-                sharded_weight = loader._shard_weight(permuted_weight, mapping.sharding)
-                target_param = loader._get_param(params, mapping.target_path)
-                target_param.value = sharded_weight.astype(target_param.value.dtype)
-                logger.debug(f"Loaded Conv3D weight: {hf_key} -> {mapping.target_path}")
-
-            elif hf_key in weight_mappings:
-                mapping = weight_mappings[hf_key]
-                loader._process_and_assign_weight(params, hf_key, hf_weight, mapping)
-            else:
-                if not loader._is_excluded_layer_weight(hf_key):
-                    logger.warning(f"No mapping found for weight: {hf_key}")
+        loader.load_weights_from_safetensors(weight_mappings)
         
-        nnx.update(self, params)
+        if getattr(self.config, "tie_word_embeddings", False):
+            self.lm_head.embedding = self.model.embed_tokens.embedding
+            logger.info("Tied word embeddings: lm_head's weights are now tied to embed_tokens'.")
+        
+        logger.info("Qwen2.5-VL weights loaded successfully!")
 
     def _create_qwen2_5_vl_weight_mappings(self) -> dict:
         """Create weight mappings for Qwen2.5-VL model.
@@ -936,6 +911,7 @@ class Qwen2_5_VLForConditionalGeneration(nnx.Module):
             target_path="visual.patch_embed.proj.kernel",
             sharding=(None, None, None, None, "tensor"),
             transpose=False,
+            transpose_dims=(2, 3, 4, 1, 0),
         )
         
         # Note: In the model definition, use_bias=False is set for the proj Conv layer
@@ -1071,9 +1047,7 @@ class Qwen2_5_VLForConditionalGeneration(nnx.Module):
             
         Returns:
             Dictionary mapping layer weight names to model paths
-        """
-        from sgl_jax.srt.utils.weight_utils import WeightMapping
-        
+        """        
         prefix = f"model.layers.{layer_idx}"
         target_prefix = f"model.layers.{layer_idx}"
         

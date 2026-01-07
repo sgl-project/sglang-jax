@@ -26,6 +26,7 @@ class WeightMapping:
     target_path: str | list[str]
     sharding: tuple | None = None
     transpose: bool = False
+    transpose_dims: tuple | None = None
     reshape: tuple | None = None
     head_dim_padding: bool = False
     kv_head_padding: bool = False
@@ -549,8 +550,10 @@ class WeightLoader:
                                 target_sharding=final_sharding,
                             )
                             lazy_weight = lazy_arrays[0]
-
-                        if mapping.transpose:
+                        
+                        if mapping.transpose_dims:
+                            lazy_weight = jnp.transpose(lazy_weight, mapping.transpose_dims)
+                        elif mapping.transpose:
                             lazy_weight = jnp.transpose(lazy_weight, (1, 0))
 
                         if "lm_head" in hf_key and hasattr(
@@ -887,63 +890,6 @@ class WeightLoader:
         nnx.update(self.model, params)
         logger.info("Dummy weights generated successfully!")
 
-    def _iterate_weights(self):
-            model_path = self.model_config.model_path
-            weights_files = glob.glob(os.path.join(model_path, "*.safetensors"))
-
-            if len(weights_files) == 0:
-                raise RuntimeError(f"Cannot find any *.safetensors files in {model_path}")
-
-            weights_files.sort()
-
-            skipped_files = 0
-
-            platform = os.getenv("JAX_PLATFORMS", None)
-            backend = "cpu" if platform != "proxy" else "proxy"
-            with tqdm(weights_files, desc="[LOADING] MODEL WEIGHTS", unit="file") as pbar:
-                for st_file in pbar:
-                    filename = os.path.basename(st_file)
-                    pbar.set_postfix({"file": filename})
-
-                    with (
-                        jax.default_device(jax.local_devices(backend=backend)[0]),
-                        safe_open(st_file, framework="flax") as f,
-                    ):
-                        needed_keys = []
-                        for name in f.keys():  # noqa: SIM118
-                            if not name.startswith("model.layers."):
-                                needed_keys.append(name)
-                                continue
-
-                            if not self._is_excluded_layer_weight(name):
-                                needed_keys.append(name)
-
-                        if not needed_keys:
-                            skipped_files += 1
-                            logger.debug(
-                                "Skipping %s: 0/%s weights needed",
-                                filename,
-                                len(f.keys()),
-                            )
-                            continue
-
-                        logger.debug(
-                            "Loading %s: %s/%s weights needed",
-                            filename,
-                            len(needed_keys),
-                            len(f.keys()),
-                        )
-                        for name in needed_keys:
-                            weight_tensor = f.get_tensor(name)
-                            yield name, weight_tensor
-
-            if skipped_files > 0:
-                logger.info(
-                    "Memory optimization: Skipped %s/%s files with no needed weights",
-                    skipped_files,
-                    len(weights_files),
-                )
-
     def _process_and_assign_weight(
         self,
         params: nnx.State,
@@ -952,8 +898,10 @@ class WeightLoader:
         mapping: WeightMapping,
     ):
         processed_weight = hf_weight
-
-        if mapping.transpose and not hf_key.endswith(".bias"):
+        
+        if mapping.transpose_dims:
+            processed_weight = jnp.transpose(processed_weight, mapping.transpose_dims)
+        elif mapping.transpose and not hf_key.endswith(".bias"):
             processed_weight = jnp.transpose(processed_weight, (1, 0))
 
         if isinstance(mapping.target_path, list):

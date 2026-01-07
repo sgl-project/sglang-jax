@@ -237,12 +237,20 @@ class BaseMultimodalProcessor(ABC):
                 kwargs["audios"] = audios
 
         processor = self._processor
-        result = processor.__call__(
-            text=[input_text],
-            padding=True,
-            return_tensors="np",
-            **kwargs,
+        if self.server_args.disable_fast_image_processor:
+            result = processor.__call__(
+                text=[input_text],
+                padding=True,
+                return_tensors="np",
+                **kwargs,
         )
+        else:
+            result = processor.__call__(
+                text=[input_text],
+                padding=True,
+                return_tensors="pt",
+                **kwargs,
+            )
         if not self.server_args.keep_mm_feature_on_device:
             # move feature tensors to cpu
             for feature_name in self.FEATURE_NAMES:
