@@ -1,19 +1,19 @@
-# FP8 W8A8 quantization with MoE gate in full precision
+# FP8 weight-only quantization with MoE gate in full precision
 # - MoE gate (router) is NOT quantized for numerical stability
-# - All other layers: FP8 weights AND activations
+# - All other layers: FP8 weights only, NO activation quantization
 # - Reference: https://arxiv.org/pdf/2101.03961
 
 quantization:
   qwix:
     rules:
-      # All layers EXCEPT MoE gate and experts - full W8A8
+      # All layers EXCEPT MoE gate - weight only
       # MoE gate is completely excluded (no weight, no activation quantization)
       - module_path: '^(?!.*block_sparse_moe/gate).*$'
         weight_qtype: 'float8_e4m3fn'
-        act_qtype: 'float8_e4m3fn'
+        # No act_qtype - activations stay in original dtype
 
-  # MoE experts: FP8 weights AND FP8 activations
+  # MoE experts: FP8 weights only, NO activation quantization
   moe:
     weight_dtype: 'float8_e4m3fn'
-    activation_dtype: 'float8_e4m3fn'
+    activation_dtype: null
 
