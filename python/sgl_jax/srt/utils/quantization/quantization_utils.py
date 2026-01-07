@@ -224,26 +224,20 @@ def prepare_inputs_for_quantization(
 
     return forward_batch, token_to_kv_pool, logits_metadata
 
-@functools.partial(jax.jit, static_argnums=(1,2))
-def quantize_tensor_simple(x: jax.Array, dtype: jnp.dtype, dim: int = -1, out_sharding = None):
-    
-    @auto_axes
-    def _quantize_tensor(x: jax.Array):
-        if jnp.issubdtype(dtype, jnp.integer):
-            dtype_info = jnp.iinfo(dtype)
-            max_val = int(dtype_info.max)
-            min_val = int(dtype_info.min)
-        else:
-            dtype_info = jnp.finfo(dtype)
-            max_val = float(dtype_info.max)
-            min_val = float(dtype_info.min)
+def quantize_tensor_simple(x: jax.Array, dtype: jnp.dtype, dim: int = -1, out_dtype: jnp.dtype = jnp.float32):
+    if jnp.issubdtype(dtype, jnp.integer):
+        dtype_info = jnp.iinfo(dtype)
+        max_val = int(dtype_info.max)
+        min_val = int(dtype_info.min)
+    else:
+        dtype_info = jnp.finfo(dtype)
+        max_val = float(dtype_info.max)
+        min_val = float(dtype_info.min)
 
-        x_abs_max = jnp.max(jnp.abs(x), axis=dim, keepdims=True)
-        scale = x_abs_max / max_val
-        x_q = jnp.clip(x / scale, min_val, max_val).astype(dtype)
-        return x_q, scale.astype(jnp.float32)
-
-    return _quantize_tensor(x, out_sharding=out_sharding)
+    x_abs_max = jnp.max(jnp.abs(x), axis=dim, keepdims=True)
+    scale = x_abs_max / max_val
+    x_q = jnp.clip(x / scale, min_val, max_val).astype(dtype)
+    return x_q, scale.astype(out_dtype)
 
 
 def quantize_tensor(

@@ -6,7 +6,7 @@ from jax.sharding import Mesh
 from jax.sharding import PartitionSpec as P, reshard
 
 from sgl_jax.srt.kernels.gmm.megablox_gmm_backend import gmm
-from sgl_jax.srt.utils.quantization.quantization_utils import quantize_tensor, dequantize_tensor
+from sgl_jax.srt.utils.quantization.quantization_utils import quantize_tensor, quantize_tensor_simple, dequantize_tensor
 
 
 class GateLogit(nnx.Module):
@@ -293,25 +293,19 @@ class EPMoE(nnx.Module):
             self.wo_scale = wo_scale.reshape(wo_scale.shape[0], 1, 1, wo_scale.shape[1])
 
     def __call__(self, hidden_states, topk_weights, topk_ids) -> jax.Array:
-        # Quantize activations if enabled
-        if self.activation_quantized_dtype is not None:
-            hidden_states_q, hidden_states_scale = quantize_tensor(
-                self.activation_quantized_dtype, hidden_states, axis=1, out_sharding=P(None)
-            )
-        else:
-            hidden_states_q = hidden_states
-            hidden_states_scale = None
+        # Activation quantization is now handled per-GEMM inside _gmm_compute
+        # (aligned with sglang-gpu scheme: quantize before each GEMM, dequantize after)
 
         # Run MoE computation on the expert-parallel mesh
         with jax.sharding.use_abstract_mesh(self.updated_mesh):
-            hidden_states_reshard = jax.sharding.reshard(hidden_states_q, P(None))
+            hidden_states_reshard = jax.sharding.reshard(hidden_states, P(None))
             topk_weights_reshard = jax.sharding.reshard(topk_weights, P(None))
             topk_ids_reshard = jax.sharding.reshard(topk_ids, P(None))
             
             # Use weights and scales directly
             # - If quantize_weights() was called: weights are quantized, scales are computed
             # - If not called: weights are bf16, scales are identity (1s)
-            result_q = shard_map(
+            result = shard_map(
                 self._forward,
                 mesh=self.moe_mesh,
                 in_specs=(
@@ -339,17 +333,10 @@ class EPMoE(nnx.Module):
             )
 
         # Reshard result back to original mesh
-        replicated_pspec = P(*([None] * result_q.ndim))
-        result = jax.sharding.reshard(
-            result_q, jax.sharding.NamedSharding(self.mesh, replicated_pspec)
+        replicated_pspec = P(*([None] * result.ndim))
+        return jax.sharding.reshard(
+            result, jax.sharding.NamedSharding(self.mesh, replicated_pspec)
         )
-        
-        # Dequantize if activations were quantized
-        # (hidden_states_scale was created outside the abstract mesh block, already on original mesh)
-        if hidden_states_scale is not None:
-            result = dequantize_tensor(result, hidden_states_scale, axis=1)
-        
-        return result
 
     def _forward(self, hidden_states, topk_weights, topk_ids, w0_weights, w1_weights, wo_weights,
              w0_kernel_scale = None, w1_kernel_scale = None, wo_kernel_scale = None, w0_kernel_bias = None, w1_kernel_bias = None, wo_kernel_bias = None):
@@ -416,8 +403,17 @@ class EPMoE(nnx.Module):
 
         group_sizes = group_sizes.astype(jnp.int32)
 
+        # === GEMM1: x @ w0 and x @ w1 ===
+        # Quantize input activation for GEMM1 if activation quantization enabled
+        if self.activation_quantized_dtype is not None:
+            x_q, x_scale = quantize_tensor_simple(x, self.activation_quantized_dtype, dim=-1)
+            gemm1_lhs = x_q
+        else:
+            gemm1_lhs = x
+            x_scale = None
+
         layer_w0 = gmm(
-            lhs=x,
+            lhs=gemm1_lhs,
             rhs=w0_kernel,
             group_sizes=group_sizes,
             preferred_element_type=self.dtype,
@@ -428,7 +424,7 @@ class EPMoE(nnx.Module):
         )
 
         layer_w1 = gmm(
-            lhs=x,
+            lhs=gemm1_lhs,
             rhs=w1_kernel,
             group_sizes=group_sizes,
             preferred_element_type=self.dtype,
@@ -438,6 +434,13 @@ class EPMoE(nnx.Module):
             group_offset=group_offset,
         )
 
+        # Dequantize GEMM1 output (apply LHS scale if quantized)
+        if x_scale is not None:
+            # x_scale shape: (m, 1) with keepdims=True, broadcasts to (m, n_gate)
+            layer_w0 = layer_w0 * x_scale
+            layer_w1 = layer_w1 * x_scale
+
+        # === Activation in BF16 (not quantized) ===
         if self.activation == "silu":
             layer_act = jax.nn.silu(layer_w0)
         elif self.activation == "gelu":
@@ -446,8 +449,19 @@ class EPMoE(nnx.Module):
             raise ValueError(f"Unsupported activation function {self.activation}")
         intermediate_layer = jnp.multiply(layer_act, layer_w1)
 
+        # === GEMM2: intermediate @ wo ===
+        # Quantize intermediate activation for GEMM2 if activation quantization enabled
+        if self.activation_quantized_dtype is not None:
+            intermediate_q, intermediate_scale = quantize_tensor_simple(
+                intermediate_layer, self.activation_quantized_dtype, dim=-1
+            )
+            gemm2_lhs = intermediate_q
+        else:
+            gemm2_lhs = intermediate_layer
+            intermediate_scale = None
+
         intermediate_output = gmm(
-            lhs=intermediate_layer,
+            lhs=gemm2_lhs,
             rhs=wo_kernel,
             group_sizes=group_sizes,
             preferred_element_type=self.dtype,
@@ -456,6 +470,11 @@ class EPMoE(nnx.Module):
             tiling=tiling_down,
             group_offset=group_offset,
         )
+
+        # Dequantize GEMM2 output (apply LHS scale if quantized)
+        if intermediate_scale is not None:
+            # intermediate_scale shape: (m, 1) with keepdims=True, broadcasts to (m, n_down)
+            intermediate_output = intermediate_output * intermediate_scale
 
         if self.tp_size > 1:
             intermediate_output = jax.lax.psum(intermediate_output, "tensor")
