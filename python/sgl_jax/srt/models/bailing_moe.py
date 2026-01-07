@@ -278,6 +278,10 @@ class BailingMoEDecoderLayer(nnx.Module):
                     dtype=dtype,
                     layer_id=layer_id,
                     renormalize_topk_logits=config.norm_topk_prob,
+                    routed_scaling_factor=config.routed_scaling_factor,
+                    use_grouped_topk=config.n_group > 0,
+                    num_groups=config.n_group,
+                    top_k_groups=config.topk_group,
                 )
             else:
                 self.topk = TopK(
@@ -362,12 +366,10 @@ class BailingMoEDecoderLayer(nnx.Module):
                 shared_output = None
             router_logits = self.moe_gate(hidden_states)
 
+            correction_bias = self.moe_gate.bias.value if self.moe_gate.bias is not None else None
             if self.use_fused:
-                hidden_states = self.mlp(hidden_states, router_logits)
+                hidden_states = self.mlp(hidden_states, router_logits, correction_bias)
             else:
-                correction_bias = (
-                    self.moe_gate.bias.value if self.moe_gate.bias is not None else None
-                )
                 topk_weights, topk_ids = self.topk(router_logits, correction_bias)
                 hidden_states = self.mlp(hidden_states, topk_weights, topk_ids)
 
