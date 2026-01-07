@@ -6,10 +6,11 @@
 quantization:
   qwix:
     rules:
-      # All layers EXCEPT MoE gate and experts - full W8A8
+      # All layers EXCEPT MoE gate, experts, and logits_processor - full W8A8
       # MoE gate: completely excluded (no weight, no activation quantization)
       # MoE experts unpermute: excluded from qwix
-      - module_path: '^(?!.*(block_sparse_moe/gate|block_sparse_moe/experts)).*$'
+      # logits_processor: excluded for accuracy
+      - module_path: '^(?!.*(block_sparse_moe/gate|block_sparse_moe/experts|logits_processor)).*$'
         weight_qtype: 'float8_e4m3fn'
         act_qtype: 'float8_e4m3fn'
 
