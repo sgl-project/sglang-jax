@@ -1,17 +1,15 @@
 # Adapted from https://github.com/vllm-project/tpu-inference/blob/main/tpu_inference/models/jax/utils/qwix/qwix_utils.py
 
 import functools
-import os
+import itertools
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import qwix
-import yaml
 from flax import nnx
-from jax.sharding import auto_axes
-import itertools
 from jax.sharding import PartitionSpec as P
+from jax.sharding import auto_axes
 
 from sgl_jax.srt.configs.model_config import ModelConfig
 from sgl_jax.srt.layers.logits_processor import LogitsMetadata
@@ -25,6 +23,7 @@ from sgl_jax.srt.model_executor.forward_batch_info import (
 from sgl_jax.srt.sampling.sampling_batch_info import SamplingBatchInfo
 
 DEFAULT_NUM_PAGES = 100
+
 
 def parse_qwix_config_to_rules(qwix_config: list[dict]) -> list[qwix.QuantizationRule]:
     """
@@ -130,45 +129,43 @@ def apply_qwix_quantization(
     return model
 
 
-def apply_moe_quantization(
-    model_config: ModelConfig, model: nnx.Module
-) -> nnx.Module:
+def apply_moe_quantization(model_config: ModelConfig, model: nnx.Module) -> nnx.Module:
     """
     Quantize MoE weights in-place. Call this after apply_qwix_quantization.
-    
+
     This walks through the model and calls quantize_weights() on each EPMoE module,
     which quantizes wi_0, wi_1, wo weights and stores the scales as separate parameters.
-    
+
     Uses the unified QuantizationConfig from model_config.quantization_config.
     """
     # Import here to avoid circular imports
     from sgl_jax.srt.layers.moe import EPMoE
-    
+
     quant_config = model_config.quantization_config
     if quant_config is None:
         return model
-    
+
     if not quant_config.has_moe_quantization():
         return model
-    
+
     # Walk through the model and quantize all EPMoE modules
     # Models with MoE typically have: model.model.layers[i].block_sparse_moe.experts
     # or similar structure. We recursively search for EPMoE instances.
     def _quantize_moe_recursive(obj, visited=None):
         if visited is None:
             visited = set()
-        
+
         obj_id = id(obj)
         if obj_id in visited:
             return
         visited.add(obj_id)
-        
+
         if isinstance(obj, EPMoE):
             obj.quantize_weights()
             return
-        
+
         # Try to iterate through attributes
-        if hasattr(obj, '__dict__'):
+        if hasattr(obj, "__dict__"):
             for attr_name, attr_value in obj.__dict__.items():
                 if isinstance(attr_value, nnx.Module):
                     _quantize_moe_recursive(attr_value, visited)
@@ -176,7 +173,7 @@ def apply_moe_quantization(
                     for item in attr_value:
                         if isinstance(item, nnx.Module):
                             _quantize_moe_recursive(item, visited)
-    
+
     _quantize_moe_recursive(model)
     return model
 
@@ -224,7 +221,10 @@ def prepare_inputs_for_quantization(
 
     return forward_batch, token_to_kv_pool, logits_metadata
 
-def quantize_tensor_simple(x: jax.Array, dtype: jnp.dtype, dim: int = -1, out_dtype: jnp.dtype = jnp.float32):
+
+def quantize_tensor_simple(
+    x: jax.Array, dtype: jnp.dtype, dim: int = -1, out_dtype: jnp.dtype = jnp.float32
+):
     if jnp.issubdtype(dtype, jnp.integer):
         dtype_info = jnp.iinfo(dtype)
         max_val = int(dtype_info.max)
@@ -270,7 +270,7 @@ def quantize_tensor(
         axis_normalized = [axis]
     else:
         axis_normalized = list(axis)
-    
+
     # Convert negative axes to positive
     axis_normalized = [a if a >= 0 else tensor.ndim + a for a in axis_normalized]
 
@@ -284,10 +284,7 @@ def quantize_tensor(
         block_size_normalized = None
 
     # Get dtype info
-    if jnp.issubdtype(dtype, jnp.integer):
-        dtype_info = jnp.iinfo(dtype)
-    else:
-        dtype_info = jnp.finfo(dtype)
+    dtype_info = jnp.iinfo(dtype) if jnp.issubdtype(dtype, jnp.integer) else jnp.finfo(dtype)
     dtype_max = float(dtype_info.max)
     dtype_min = float(dtype_info.min)
 
@@ -316,7 +313,8 @@ def quantize_tensor(
                 if padding_size and not pad_tensor:
                     raise ValueError(
                         f"Unable to perform block quantization. axis={i} of "
-                        f"{x.shape=} is not divisible by {block=}")
+                        f"{x.shape=} is not divisible by {block=}"
+                    )
 
                 # Pad the tensor to align with block size.
                 pad_width[i][1] = padding_size
@@ -357,6 +355,7 @@ def quantize_tensor(
 
     return _quantize_tensor(tensor, out_sharding=combined_sharding)
 
+
 def dequantize_tensor(
     tensor_q: jax.Array,
     scale: jax.Array,
@@ -389,7 +388,8 @@ def dequantize_tensor(
             if tensor_q.shape[i] % num_blocks:
                 raise ValueError(
                     f"Unable to perform block dequantization. axis={i} of "
-                    f"{tensor_q.shape=} is not divisible by {num_blocks=}", )
+                    f"{tensor_q.shape=} is not divisible by {num_blocks=}",
+                )
             block_size = tensor_q.shape[i] // num_blocks
 
             blocked_shape[i] = (num_blocks, block_size)

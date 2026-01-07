@@ -13,4 +13,3 @@ quantization:
   moe:
     weight_dtype: 'int8'
     activation_dtype: 'int8'
-
