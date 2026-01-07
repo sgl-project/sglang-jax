@@ -6,11 +6,11 @@
 quantization:
   qwix:
     rules:
-      # All layers EXCEPT MoE gate - weight only
+      # All layers EXCEPT MoE gate - full W8A8
       # MoE gate is completely excluded (no weight, no activation quantization)
       - module_path: '^(?!.*block_sparse_moe/gate).*$'
         weight_qtype: 'float8_e4m3fn'
-        # No act_qtype - activations stay in original dtype
+        act_qtype: 'float8_e4m3fn'
 
   # MoE experts: FP8 weights only, NO activation quantization
   moe:
