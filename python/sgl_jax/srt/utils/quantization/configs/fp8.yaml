@@ -12,4 +12,3 @@ quantization:
   moe:
     weight_dtype: 'float8_e4m3fn'
     activation_dtype: null
-

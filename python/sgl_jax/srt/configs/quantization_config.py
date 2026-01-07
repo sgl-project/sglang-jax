@@ -32,9 +32,7 @@ def _str_to_dtype(dtype_str: str | None) -> jnp.dtype | None:
     if dtype_str is None:
         return None
     if dtype_str not in DTYPE_MAP:
-        raise ValueError(
-            f"Unsupported dtype: {dtype_str}. Supported: {list(DTYPE_MAP.keys())}"
-        )
+        raise ValueError(f"Unsupported dtype: {dtype_str}. Supported: {list(DTYPE_MAP.keys())}")
     return DTYPE_MAP[dtype_str]
 
 
