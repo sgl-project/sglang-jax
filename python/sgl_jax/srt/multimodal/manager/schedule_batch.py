@@ -22,7 +22,7 @@ class Req:
     # TODO(will): double check that args are separate from server_args
     # properly. Also maybe think about providing an abstraction for pipeline
     # specific arguments.
-    data_type: DataType
+    data_type: DataType | None = None
 
     rid: str | None = None
     # 随机数生成器

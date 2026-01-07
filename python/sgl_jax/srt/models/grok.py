@@ -169,6 +169,7 @@ class Grok1MLP(nnx.Module):
             use_bias=False,
             params_dtype=dtype,
             kernel_axes=(None, "tensor"),
+            mesh=mesh,
         )
         self.up_proj = LinearBase(
             input_size=hidden_size,
@@ -176,6 +177,7 @@ class Grok1MLP(nnx.Module):
             use_bias=False,
             params_dtype=dtype,
             kernel_axes=(None, "tensor"),
+            mesh=mesh,
         )
         self.down_proj = LinearBase(
             input_size=intermediate_size,
@@ -183,6 +185,7 @@ class Grok1MLP(nnx.Module):
             use_bias=False,
             params_dtype=dtype,
             kernel_axes=("tensor", None),
+            mesh=mesh,
         )
         self.act_fn = GeluAndMul(approximate="tanh")
         self.layer_id = layer_id
@@ -229,6 +232,7 @@ class Grok1MoE(nnx.Module):
             use_bias=False,
             params_dtype=jnp.float32,
             kernel_axes=(None, None),
+            mesh=mesh,
         )
 
         self.router_logit_softcapping = getattr(config, "router_logit_softcapping", 30.0)
@@ -352,6 +356,7 @@ class Grok1Attention(nnx.Module):
             use_bias=False,
             params_dtype=jnp.bfloat16,
             kernel_axes=(None, "tensor"),
+            mesh=mesh,
         )
 
         self.k_proj = LinearBase(
@@ -360,6 +365,7 @@ class Grok1Attention(nnx.Module):
             use_bias=False,
             params_dtype=jnp.bfloat16,
             kernel_axes=(None, "tensor"),
+            mesh=mesh,
         )
 
         self.v_proj = LinearBase(
@@ -368,6 +374,7 @@ class Grok1Attention(nnx.Module):
             use_bias=False,
             params_dtype=jnp.bfloat16,
             kernel_axes=(None, "tensor"),
+            mesh=mesh,
         )
 
         self.o_proj = LinearBase(
@@ -376,6 +383,7 @@ class Grok1Attention(nnx.Module):
             use_bias=False,
             params_dtype=jnp.bfloat16,
             kernel_axes=("tensor", None),
+            mesh=mesh,
         )
 
         # Initialize rotary embeddings based on scaling configuration
@@ -715,6 +723,7 @@ class Grok1ForCausalLM(nnx.Module):
                 use_bias=False,
                 params_dtype=jnp.bfloat16,
                 kernel_axes=("tensor", None),
+                mesh=mesh,
             )
         else:
             self.lm_head = ParallelLMHead(

@@ -38,6 +38,7 @@ class Qwen2MLP(nnx.Module):
             kernel_axes=(None, "tensor"),
             use_bias=False,
             params_dtype=dtype,
+            mesh=mesh,
         )
 
         self.up_proj = LinearBase(
@@ -46,6 +47,7 @@ class Qwen2MLP(nnx.Module):
             kernel_axes=(None, "tensor"),
             use_bias=False,
             params_dtype=dtype,
+            mesh=mesh,
         )
 
         self.down_proj = LinearBase(
@@ -54,6 +56,7 @@ class Qwen2MLP(nnx.Module):
             kernel_axes=("tensor", None),
             use_bias=False,
             params_dtype=dtype,
+            mesh=mesh,
         )
 
         self.act_fn = jax.nn.silu
@@ -98,6 +101,7 @@ class Qwen2Attention(nnx.Module):
             use_bias=True,
             kernel_axes=(None, "tensor"),
             params_dtype=dtype,
+            mesh=mesh,
         )
         self.k_proj = LinearBase(
             input_size=hidden_size,
@@ -105,6 +109,7 @@ class Qwen2Attention(nnx.Module):
             use_bias=True,
             kernel_axes=(None, "tensor"),
             params_dtype=dtype,
+            mesh=mesh,
         )
         self.v_proj = LinearBase(
             input_size=hidden_size,
@@ -112,6 +117,7 @@ class Qwen2Attention(nnx.Module):
             use_bias=True,
             kernel_axes=(None, "tensor"),
             params_dtype=dtype,
+            mesh=mesh,
         )
         self.o_proj = LinearBase(
             input_size=num_heads * self.head_dim,
@@ -119,6 +125,7 @@ class Qwen2Attention(nnx.Module):
             use_bias=False,
             kernel_axes=("tensor", None),
             params_dtype=dtype,
+            mesh=mesh,
         )
         self.rotary_emb = RotaryEmbedding(
             head_size=self.head_dim,

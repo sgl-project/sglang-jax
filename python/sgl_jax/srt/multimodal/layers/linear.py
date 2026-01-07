@@ -33,6 +33,8 @@ class ReplicatedLinear(LinearBase):
         super().__init__(
             input_size=input_size,
             output_size=output_size,
+            # FIXME(pc) use true mesh here
+            mesh=None,
             use_bias=use_bias,
             skip_bias_add=skip_bias_add,
             params_dtype=params_dtype,

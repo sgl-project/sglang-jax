@@ -67,6 +67,7 @@ class QWen3MoeAttention(nnx.Module):
             use_bias=attention_bias,
             kernel_axes=(None, "tensor"),
             params_dtype=dtype,
+            mesh=mesh,
         )
         self.k_proj = LinearBase(
             input_size=hidden_size,
@@ -74,6 +75,7 @@ class QWen3MoeAttention(nnx.Module):
             use_bias=attention_bias,
             kernel_axes=(None, "tensor"),
             params_dtype=dtype,
+            mesh=mesh,
         )
         self.v_proj = LinearBase(
             input_size=hidden_size,
@@ -81,6 +83,7 @@ class QWen3MoeAttention(nnx.Module):
             use_bias=attention_bias,
             kernel_axes=(None, "tensor"),
             params_dtype=dtype,
+            mesh=mesh,
         )
         self.c_proj = LinearBase(
             input_size=num_heads * self.head_dim,
@@ -88,6 +91,7 @@ class QWen3MoeAttention(nnx.Module):
             use_bias=attention_bias,
             kernel_axes=("tensor", None),
             params_dtype=dtype,
+            mesh=mesh,
         )
         self.rotary_emb = RotaryEmbedding(
             head_size=self.head_dim,

@@ -56,6 +56,7 @@ class LlamaMLP(nnx.Module):
             kernel_axes=(None, "tensor"),
             use_bias=False,
             params_dtype=dtype,
+            mesh=mesh,
         )
 
         self.up_proj = LinearBase(
@@ -64,6 +65,7 @@ class LlamaMLP(nnx.Module):
             kernel_axes=(None, "tensor"),
             use_bias=False,
             params_dtype=dtype,
+            mesh=mesh,
         )
 
         self.down_proj = LinearBase(
@@ -72,6 +74,7 @@ class LlamaMLP(nnx.Module):
             kernel_axes=("tensor", None),
             use_bias=False,
             params_dtype=dtype,
+            mesh=mesh,
         )
 
         self.act_fn = jax.nn.silu
@@ -122,6 +125,7 @@ class LlamaAttention(nnx.Module):
             use_bias=attention_bias,
             kernel_axes=(None, "tensor"),
             params_dtype=dtype,
+            mesh=mesh,
         )
         self.k_proj = LinearBase(
             input_size=hidden_size,
@@ -129,6 +133,7 @@ class LlamaAttention(nnx.Module):
             use_bias=attention_bias,
             kernel_axes=(None, "tensor"),
             params_dtype=dtype,
+            mesh=mesh,
         )
         self.v_proj = LinearBase(
             input_size=hidden_size,
@@ -136,6 +141,7 @@ class LlamaAttention(nnx.Module):
             use_bias=attention_bias,
             kernel_axes=(None, "tensor"),
             params_dtype=dtype,
+            mesh=mesh,
         )
         self.o_proj = LinearBase(
             input_size=num_heads * self.head_dim,
@@ -143,6 +149,7 @@ class LlamaAttention(nnx.Module):
             use_bias=attention_bias,
             kernel_axes=("tensor", None),
             params_dtype=dtype,
+            mesh=mesh,
         )
         self.rotary_emb = get_rope(
             head_size=self.head_dim,
