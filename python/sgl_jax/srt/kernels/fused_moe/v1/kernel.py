@@ -283,6 +283,12 @@ def ref_moe(
     b1: jax.Array | None = None,  # F32(num_experts, 1, intermediate_size)
     b2: jax.Array | None = None,  # F32(num_experts, 1, hidden_size)
     b3: jax.Array | None = None,  # F32(num_experts, 1, intermediate_size)
+    w1_shared: jax.Array | None = None,  # (hidden_size, se_intermediate_size) [Gate]
+    w2_shared: jax.Array | None = None,  # (se_intermediate_size, hidden_size) [Down]
+    w3_shared: jax.Array | None = None,  # (hidden_size, se_intermediate_size) [Up]
+    w1_shared_scale: jax.Array | None = None,  # (hidden_size // subc, 1, se_inter)
+    w2_shared_scale: jax.Array | None = None,  # (se_inter // subc, 1, hidden_size)
+    w3_shared_scale: jax.Array | None = None,  # (hidden_size // subc, 1, se_inter)
 ):
     n_tokens = tokens.shape[0]  # num_tokens
     num_experts = gating_output.shape[-1]
@@ -390,7 +396,36 @@ def ref_moe(
 
         t_outputs.append(weighted_output.astype(tokens.dtype))
 
-    return jnp.concatenate(t_outputs, axis=0)  # [actual_num_tokens, hidden_size]
+    moe_output = jnp.concatenate(t_outputs, axis=0)  # [actual_num_tokens, hidden_size]
+
+    if w1_shared is not None:
+        se_w1_gate = w1_shared.astype(jnp.float32)
+        se_w1_up = w3_shared.astype(jnp.float32)
+
+        if w1_shared_scale is not None:
+            s_gate = jnp.repeat(w1_shared_scale[:, 0, :], subc_quant_wsz, axis=0)[:hidden_size]
+            se_w1_gate *= s_gate
+
+        if w3_shared_scale is not None:
+            s_up = jnp.repeat(w3_shared_scale[:, 0, :], subc_quant_wsz, axis=0)[:hidden_size]
+            se_w1_up *= s_up
+
+        gate_out = tokens.astype(jnp.float32) @ se_w1_gate
+        up_out = tokens.astype(jnp.float32) @ se_w1_up
+
+        act = activation_fn(gate_out, up_out, act_fn)
+
+        se_w2 = w2_shared.astype(jnp.float32)
+        if w2_shared_scale is not None:
+            se_inter_size = w2_shared.shape[0]
+            s_down = jnp.repeat(w2_shared_scale[:, 0, :], subc_quant_wsz, axis=0)[:se_inter_size]
+            se_w2 *= s_down
+
+        se_output = act @ se_w2
+
+        return moe_output + se_output.astype(moe_output.dtype)
+
+    return moe_output
 
 
 def _fused_ep_moe_kernel(
@@ -1903,7 +1938,6 @@ def _fused_ep_moe_kernel(
         se_inter_size = w2_shared_hbm.shape[0]
         se_total_blocks = cdiv(se_inter_size, bf)
 
-        # 辅助函数：处理量化 Scale 的广播
         def broadcast_quant_scale(scale, current_block_size, group_size):
             # scale shape: (..., 1, bf) or (..., 1, bd2_chunk)
             # current_block_size: bd1_per_t_packing or bf
@@ -1911,22 +1945,15 @@ def _fused_ep_moe_kernel(
             if group_size is None or group_size <= 0:
                 return scale.squeeze(-2)
 
-            # 显式广播：(..., 1, 1, last_dim) -> (..., groups, 1, last_dim) -> flatten
             s = jnp.expand_dims(scale, axis=-2)
             s = jnp.broadcast_to(s, s.shape[:-2] + (group_size, 1, s.shape[-1]))
             s = s.reshape(scale.shape[:-3] + (current_block_size, 1, scale.shape[-1]))
             return s.squeeze(-2)
 
         def run_se_block(block_id, _):
-            # ==================================================================
-            # Phase 1: Gate & Up Projection (W1, W3)
-            # ==================================================================
-
-            # 初始化累加器 (FP32)
             init_act_gate = jnp.zeros((bt, bf), dtype=jnp.float32)
             init_act_up = jnp.zeros((bt, bf), dtype=jnp.float32)
 
-            # [Pipeline] Prefetch 第一块 W1/W3
             if num_bd1 > 0:
                 start_fetch_se_w1(0, block_id, 0)
                 start_fetch_se_w3(0, block_id, 0)
@@ -1937,20 +1964,16 @@ def _fused_ep_moe_kernel(
                 next_sem = (bd1_idx + 1) % 2
                 next_bd1_idx = bd1_idx + 1
 
-                # [Pipeline] Prefetch 下一块
                 @pl.when(next_bd1_idx < num_bd1)
                 def _():
                     start_fetch_se_w1(next_sem, block_id, next_bd1_idx)
                     start_fetch_se_w3(next_sem, block_id, next_bd1_idx)
 
-                # Wait 当前块
                 wait_fetch_se_w1(curr_sem)
                 wait_fetch_se_w3(curr_sem)
 
                 # Compute: Tokens @ W1/W3
                 for p_id in range(t_packing):
-                    # 获取 Tokens 切片 (注意：tokens 需提前 fetch 到 b_se_tokens_vmem)
-                    # Shape: (bt, bd1_per_t_packing)
                     t = b_se_tokens_vmem[
                         bt_sem_id,
                         pl.ds(0, bt),
@@ -1959,7 +1982,6 @@ def _fused_ep_moe_kernel(
                     ]
                     t_f32 = t.astype(jnp.float32)
 
-                    # 获取 Gate 权重 & 计算
                     w1_gate = b_se_w1_x2_vmem[curr_sem, p_id]
                     if w1_shared_scale_hbm is not None:
                         s_gate = b_se_w1_scale_x2_vmem[curr_sem, p_id]
@@ -1969,7 +1991,6 @@ def _fused_ep_moe_kernel(
                     else:
                         acc_gate_part = jnp.dot(t_f32, w1_gate.astype(jnp.float32))
 
-                    # 获取 Up 权重 & 计算
                     w3_up = b_se_w3_x2_vmem[curr_sem, p_id]
                     if w3_shared_scale_hbm is not None:
                         s_up = b_se_w3_scale_x2_vmem[curr_sem, p_id]
@@ -1984,17 +2005,10 @@ def _fused_ep_moe_kernel(
 
                 return (act_gate_acc, act_up_acc)
 
-            # 执行 Gate/Up 循环
             act_gate, act_up = lax.fori_loop(0, num_bd1, body_w1w3, (init_act_gate, init_act_up))
 
-            # 激活函数
             act = activation_fn(act_gate, act_up, act_fn)
 
-            # ==================================================================
-            # Phase 2: Down Projection (W2)
-            # ==================================================================
-
-            # [Pipeline] Prefetch 第一块 W2
             if num_bd2 > 0:
                 start_fetch_se_w2(0, block_id, 0)
 
@@ -2003,47 +2017,35 @@ def _fused_ep_moe_kernel(
                 next_sem = (bd2_idx + 1) % 2
                 next_bd2_idx = bd2_idx + 1
 
-                # [Pipeline] Prefetch 下一块
                 @pl.when(next_bd2_idx < num_bd2)
                 def _():
                     start_fetch_se_w2(next_sem, block_id, next_bd2_idx)
 
-                # Wait 当前块
                 wait_fetch_se_w2(curr_sem)
 
-                # Compute: Act @ W2 & Accumulate to Output
                 for p_id in range(t_packing):
-                    w2_val = b_se_w2_x2_vmem[curr_sem, p_id]  # Shape: (bf, bd2_per_t_packing)
+                    w2_val = b_se_w2_x2_vmem[curr_sem, p_id]  # (bf, bd2_per_t_packing)
 
-                    # Apply Scale W2
                     if w2_shared_scale_hbm is not None:
                         s2 = b_se_w2_scale_x2_vmem[curr_sem, p_id]
-                        # 注意 W2 scale 的广播：bf 维度被量化，需要广播回 bf
                         s2 = broadcast_quant_scale(s2, bf, subc_quant_wsz)
                         w2_f = w2_val.astype(jnp.float32) * s2
                         acc_chunk = jnp.dot(act, w2_f)
                     else:
                         acc_chunk = jnp.dot(act, w2_val.astype(jnp.float32))
 
-                    # [关键] 写入主 Output Buffer
-                    # 计算偏移：(p_id * h_per_pack) + (bd2_idx * bd2_per_pack)
                     hidden_offset = p_id * h_per_t_packing + bd2_idx * bd2_per_t_packing
 
-                    # 获取 Output Slice (Read-Modify-Write)
-                    # b_output_x2_vmem shape: (2, bt, hidden_size)
                     out_slice = b_output_x2_vmem.at[
                         bt_sem_id, pl.ds(0, bt), pl.ds(hidden_offset, bd2_per_t_packing)
                     ]
 
-                    # Read (BF16) -> Convert (F32) -> Add (F32) -> Cast (BF16) -> Write
                     out_slice[...] = (out_slice[...].astype(jnp.float32) + acc_chunk).astype(
                         output_hbm.dtype
                     )
 
-            # 执行 Down 循环
             lax.fori_loop(0, num_bd2, body_w2, None)
 
-        # 遍历 Shared Expert 的所有 Intermediate Blocks
         lax.fori_loop(0, se_total_blocks, run_se_block, None)
 
     if num_bt >= 1:

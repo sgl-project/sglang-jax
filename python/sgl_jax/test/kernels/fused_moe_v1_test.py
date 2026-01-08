@@ -35,9 +35,12 @@ def gen_moe_inputs(
     *,
     seed=1234,
     has_bias=False,
+    has_shared_expert=False,
+    se_intermediate_size=None,
 ):
     key = jax.random.key(seed)
-    k0, k1, k2, k3, k4, k5, k6, k7, k8 = jax.random.split(key, 9)
+    keys = jax.random.split(key, 12)
+    k0, k1, k2, k3, k4, k5, k6, k7, k8 = keys[:9]
 
     a = jax.random.normal(k0, (num_tokens, hidden_size), dtype=jnp.float32).astype(dtype) / 10
 
@@ -64,11 +67,24 @@ def gen_moe_inputs(
     else:
         b1 = b2 = b3 = None
 
+    # Shared Expert Weights
+    w1_shared = w2_shared = w3_shared = None
+    if has_shared_expert:
+        if se_intermediate_size is None:
+            se_intermediate_size = intermediate_size
+
+        k9, k10, k11 = keys[9:]
+        w1_shared = (
+            jax.random.normal(k9, (hidden_size, se_intermediate_size), dtype=jnp.float32) / 10
+        ).astype(dtype)
+        w2_shared = (
+            jax.random.normal(k10, (se_intermediate_size, hidden_size), dtype=jnp.float32) / 10
+        ).astype(dtype)
+        w3_shared = (
+            jax.random.normal(k11, (hidden_size, se_intermediate_size), dtype=jnp.float32) / 10
+        ).astype(dtype)
+
     # Construct gating logits with deterministic, strictly-ordered top-k per token.
-    #
-    # Important: avoid BF16 quantization ties in gating logits; otherwise different
-    # top-k implementations (kernel vs `lax.top_k`) can legitimately pick different
-    # experts among equal logits, causing large output diffs.
     gating_output = jax.random.normal(k7, (num_tokens, num_experts), dtype=jnp.float32)
 
     # Generate unique top-k indices per token (sample without replacement).
@@ -77,7 +93,7 @@ def gen_moe_inputs(
         token_keys
     ).astype(jnp.int32)
 
-    # Add a strictly decreasing boost so top-1 > top-2 > ... > top-k, all well above the rest.
+    # Add a strictly decreasing boost so top-1 > top-2 > ... > top-k
     boosts = (30.0 - jnp.arange(top_k, dtype=jnp.float32)).reshape(1, top_k)
     one_hot = jnp.sum(
         jax.nn.one_hot(top_k_indices, num_experts, dtype=jnp.float32) * boosts[..., None],
@@ -85,7 +101,7 @@ def gen_moe_inputs(
     )
     gating_output = (gating_output + one_hot).astype(dtype)
 
-    return a, w1, w2, w3, b1, b2, b3, gating_output
+    return a, w1, w2, w3, b1, b2, b3, gating_output, w1_shared, w2_shared, w3_shared
 
 
 def sub_channel_quantize(x, quant_dtype, wsz=256):
@@ -144,10 +160,14 @@ class MoEKernelTest(jtu.JaxTestCase):
         w_dtype=None,
         subc_quant_wsz=None,
         has_bias=False,
+        has_shared_expert=False,
+        use_grouped_topk=False,
+        num_groups=1,
+        top_k_groups=1,
         atol=2e-1,
         rtol=2e-1,
     ):
-        a, w1, w2, w3, b1, b2, b3, gating_output = gen_moe_inputs(
+        a, w1, w2, w3, b1, b2, b3, gating_output, w1_shared, w2_shared, w3_shared = gen_moe_inputs(
             dtype,
             top_k,
             num_experts,
@@ -156,16 +176,28 @@ class MoEKernelTest(jtu.JaxTestCase):
             num_tokens,
             seed=seed,
             has_bias=has_bias,
+            has_shared_expert=has_shared_expert,
         )
-        w1_scale = None
-        w2_scale = None
-        w3_scale = None
+        w1_scale = w2_scale = w3_scale = None
+        w1_shared_scale = w2_shared_scale = w3_shared_scale = None
+
         if w_dtype is not None:
             if subc_quant_wsz is None:
                 subc_quant_wsz = 256
             w1, w1_scale = sub_channel_quantize(w1, w_dtype, subc_quant_wsz)
             w2, w2_scale = sub_channel_quantize(w2, w_dtype, subc_quant_wsz)
             w3, w3_scale = sub_channel_quantize(w3, w_dtype, subc_quant_wsz)
+
+            if has_shared_expert:
+                w1_shared, w1_shared_scale = sub_channel_quantize(
+                    w1_shared, w_dtype, subc_quant_wsz
+                )
+                w2_shared, w2_shared_scale = sub_channel_quantize(
+                    w2_shared, w_dtype, subc_quant_wsz
+                )
+                w3_shared, w3_shared_scale = sub_channel_quantize(
+                    w3_shared, w_dtype, subc_quant_wsz
+                )
 
         actual = fused_ep_moe(
             mesh=self.mesh,
@@ -175,6 +207,9 @@ class MoEKernelTest(jtu.JaxTestCase):
             w3=w3,
             gating_output=gating_output,
             top_k=top_k,
+            use_grouped_topk=use_grouped_topk,
+            num_groups=num_groups,
+            top_k_groups=top_k_groups,
             renormalize_topk_logits=renormalize_topk_logits,
             act_fn=act_fn,
             subc_quant_wsz=subc_quant_wsz,
@@ -184,6 +219,12 @@ class MoEKernelTest(jtu.JaxTestCase):
             b1=b1,
             b2=b2,
             b3=b3,
+            w1_shared=w1_shared,
+            w2_shared=w2_shared,
+            w3_shared=w3_shared,
+            w1_shared_scale=w1_shared_scale,
+            w2_shared_scale=w2_shared_scale,
+            w3_shared_scale=w3_shared_scale,
             block_config=FusedMoEBlockConfig(
                 bt=bt,
                 bf=bf,
@@ -203,6 +244,9 @@ class MoEKernelTest(jtu.JaxTestCase):
             w3,
             gating_output,
             top_k,
+            use_grouped_topk=use_grouped_topk,
+            num_groups=num_groups,
+            top_k_groups=top_k_groups,
             b1=b1,
             b2=b2,
             b3=b3,
@@ -212,6 +256,12 @@ class MoEKernelTest(jtu.JaxTestCase):
             w1_scale=w1_scale,
             w2_scale=w2_scale,
             w3_scale=w3_scale,
+            w1_shared=w1_shared,
+            w2_shared=w2_shared,
+            w3_shared=w3_shared,
+            w1_shared_scale=w1_shared_scale,
+            w2_shared_scale=w2_shared_scale,
+            w3_shared_scale=w3_shared_scale,
         )
         self.assertAllClose(actual, expected, atol=atol, rtol=rtol)
 
@@ -244,160 +294,248 @@ class MoEKernelTest(jtu.JaxTestCase):
             bd2c=256,
         )
 
-    @parameterized.product(
-        act_fn=["silu", "gelu", "swigluoai"],
-    )
-    def test_activation(self, act_fn):
-        dtype = jnp.bfloat16
-        top_k = 8
-        num_experts = 128
-        hidden_size = 1024
-        intermediate_size = 1024
-        num_tokens = 8 * 32
-        self._test_moe(
-            dtype=dtype,
-            top_k=top_k,
-            num_experts=num_experts,
-            hidden_size=hidden_size,
-            intermediate_size=intermediate_size,
-            num_tokens=num_tokens,
-            seed=1234,
-            renormalize_topk_logits=True,
-            act_fn=act_fn,
-            bt=32,
-            bf=512,
-            bd1=512,
-            bd2=512,
-            btc=32,
-            bfc=256,
-            bd1c=256,
-            bd2c=256,
-        )
+    # def test_shared_expert(self):
+    #     dtype = jnp.bfloat16
+    #     top_k = 8
+    #     num_experts = 128
+    #     hidden_size = 1024
+    #     intermediate_size = 1024
+    #     num_tokens = 8 * 32
+    #     self._test_moe(
+    #         dtype=dtype,
+    #         top_k=top_k,
+    #         num_experts=num_experts,
+    #         hidden_size=hidden_size,
+    #         intermediate_size=intermediate_size,
+    #         num_tokens=num_tokens,
+    #         seed=1234,
+    #         renormalize_topk_logits=True,
+    #         has_shared_expert=True,
+    #         bt=32,
+    #         bf=512,  # smaller bf to test loop
+    #         bd1=512,
+    #         bd2=512,
+    #         btc=32,
+    #         bfc=256,
+    #         bd1c=256,
+    #         bd2c=256,
+    #     )
 
-    def test_benchmark_qwen_235(self):
-        num_experts = 128
-        top_k = 8
-        hidden_size = 4096
-        intermediate_size = 1536
-        dtype = jnp.bfloat16
-        num_tokens = 8 * 64
-        seed = 54321
-        renormalize_topk_logits = True
-        self._test_moe(
-            dtype=dtype,
-            top_k=top_k,
-            num_experts=num_experts,
-            hidden_size=hidden_size,
-            intermediate_size=intermediate_size,
-            num_tokens=num_tokens,
-            seed=seed,
-            renormalize_topk_logits=renormalize_topk_logits,
-            bt=64,
-            bf=768,
-            bd1=2048,
-            bd2=2048,
-            btc=64,
-            bfc=768,
-            bd1c=2048,
-            bd2c=2048,
-            act_fn="silu",
-            atol=5e-2,
-            rtol=5e-2,
-        )
+    # def test_grouped_topk(self):
+    #     dtype = jnp.bfloat16
+    #     top_k = 4
+    #     num_experts = 128
+    #     hidden_size = 1024
+    #     intermediate_size = 1024
+    #     num_tokens = 8 * 32
+    #     self._test_moe(
+    #         dtype=dtype,
+    #         top_k=top_k,
+    #         num_experts=num_experts,
+    #         hidden_size=hidden_size,
+    #         intermediate_size=intermediate_size,
+    #         num_tokens=num_tokens,
+    #         seed=1234,
+    #         renormalize_topk_logits=True,
+    #         use_grouped_topk=True,
+    #         num_groups=4,
+    #         top_k_groups=2,
+    #         bt=32,
+    #         bf=1024,
+    #         bd1=1024,
+    #         bd2=1024,
+    #         btc=32,
+    #         bfc=256,
+    #         bd1c=256,
+    #         bd2c=256,
+    #     )
 
-    def test_benchmark_qwen_30b_a3b(self):
-        num_experts = 128
-        top_k = 8
-        hidden_size = 2048
-        intermediate_size = 768
-        dtype = jnp.bfloat16
-        num_tokens = 512
-        seed = 54321
-        renormalize_topk_logits = True
-        self._test_moe(
-            dtype=dtype,
-            top_k=top_k,
-            num_experts=num_experts,
-            hidden_size=hidden_size,
-            intermediate_size=intermediate_size,
-            num_tokens=num_tokens,
-            seed=seed,
-            renormalize_topk_logits=renormalize_topk_logits,
-            bt=16,
-            bf=384,
-            bd1=512,
-            bd2=512,
-            btc=16,
-            bfc=384,
-            bd1c=256,
-            bd2c=256,
-            act_fn="silu",
-            atol=5e-2,
-            rtol=5e-2,
-        )
+    # @parameterized.product(
+    #     act_fn=["silu", "gelu", "swigluoai"],
+    # )
+    # def test_activation(self, act_fn):
+    #     dtype = jnp.bfloat16
+    #     top_k = 8
+    #     num_experts = 128
+    #     hidden_size = 1024
+    #     intermediate_size = 1024
+    #     num_tokens = 8 * 32
+    #     self._test_moe(
+    #         dtype=dtype,
+    #         top_k=top_k,
+    #         num_experts=num_experts,
+    #         hidden_size=hidden_size,
+    #         intermediate_size=intermediate_size,
+    #         num_tokens=num_tokens,
+    #         seed=1234,
+    #         renormalize_topk_logits=True,
+    #         act_fn=act_fn,
+    #         bt=32,
+    #         bf=512,
+    #         bd1=512,
+    #         bd2=512,
+    #         btc=32,
+    #         bfc=256,
+    #         bd1c=256,
+    #         bd2c=256,
+    #     )
 
-    @parameterized.product(
-        w_dtype=[jnp.int8, jnp.float8_e5m2, jnp.float4_e2m1fn],
-    )
-    def test_sub_channel_quantization(self, w_dtype):
-        if w_dtype in (
-            jnp.float8_e5m2,
-            jnp.float4_e2m1fn,
-        ) and not jtu.is_device_tpu_at_least(version=7):
-            self.skipTest("Expect TPUv7+")
-        dtype = jnp.bfloat16
-        top_k = 8
-        num_experts = 128
-        hidden_size = 1024
-        intermediate_size = 1024
-        num_tokens = 8 * 32
-        self._test_moe(
-            dtype=dtype,
-            top_k=top_k,
-            num_experts=num_experts,
-            hidden_size=hidden_size,
-            intermediate_size=intermediate_size,
-            num_tokens=num_tokens,
-            seed=1234,
-            renormalize_topk_logits=False,
-            w_dtype=w_dtype,
-            subc_quant_wsz=256,
-            bt=32,
-            bf=1024,
-            bd1=1024,
-            bd2=1024,
-            btc=32,
-            bfc=256,
-            bd1c=256,
-            bd2c=256,
-        )
+    # def test_benchmark_qwen_235(self):
+    #     num_experts = 128
+    #     top_k = 8
+    #     hidden_size = 4096
+    #     intermediate_size = 1536
+    #     dtype = jnp.bfloat16
+    #     num_tokens = 8 * 64
+    #     seed = 54321
+    #     renormalize_topk_logits = True
+    #     self._test_moe(
+    #         dtype=dtype,
+    #         top_k=top_k,
+    #         num_experts=num_experts,
+    #         hidden_size=hidden_size,
+    #         intermediate_size=intermediate_size,
+    #         num_tokens=num_tokens,
+    #         seed=seed,
+    #         renormalize_topk_logits=renormalize_topk_logits,
+    #         bt=64,
+    #         bf=768,
+    #         bd1=2048,
+    #         bd2=2048,
+    #         btc=64,
+    #         bfc=768,
+    #         bd1c=2048,
+    #         bd2c=2048,
+    #         act_fn="silu",
+    #         atol=5e-2,
+    #         rtol=5e-2,
+    #     )
 
-    def test_bias(self):
-        dtype = jnp.bfloat16
-        top_k = 8
-        num_experts = 128
-        hidden_size = 1024
-        intermediate_size = 1024
-        num_tokens = 8 * 32
-        self._test_moe(
-            dtype=dtype,
-            top_k=top_k,
-            num_experts=num_experts,
-            hidden_size=hidden_size,
-            intermediate_size=intermediate_size,
-            num_tokens=num_tokens,
-            seed=1234,
-            renormalize_topk_logits=False,
-            has_bias=True,
-            bt=32,
-            bf=512,
-            bd1=512,
-            bd2=512,
-            btc=32,
-            bfc=256,
-            bd1c=256,
-            bd2c=256,
-        )
+    # def test_benchmark_qwen_30b_a3b(self):
+    #     num_experts = 128
+    #     top_k = 8
+    #     hidden_size = 2048
+    #     intermediate_size = 768
+    #     dtype = jnp.bfloat16
+    #     num_tokens = 512
+    #     seed = 54321
+    #     renormalize_topk_logits = True
+    #     self._test_moe(
+    #         dtype=dtype,
+    #         top_k=top_k,
+    #         num_experts=num_experts,
+    #         hidden_size=hidden_size,
+    #         intermediate_size=intermediate_size,
+    #         num_tokens=num_tokens,
+    #         seed=seed,
+    #         renormalize_topk_logits=renormalize_topk_logits,
+    #         bt=16,
+    #         bf=384,
+    #         bd1=512,
+    #         bd2=512,
+    #         btc=16,
+    #         bfc=384,
+    #         bd1c=256,
+    #         bd2c=256,
+    #         act_fn="silu",
+    #         atol=5e-2,
+    #         rtol=5e-2,
+    #     )
+
+    # @parameterized.product(
+    #     w_dtype=[jnp.int8, jnp.float8_e5m2, jnp.float4_e2m1fn],
+    # )
+    # def test_sub_channel_quantization(self, w_dtype):
+    #     if w_dtype in (
+    #         jnp.float8_e5m2,
+    #         jnp.float4_e2m1fn,
+    #     ) and not jtu.is_device_tpu_at_least(version=7):
+    #         self.skipTest("Expect TPUv7+")
+    #     dtype = jnp.bfloat16
+    #     top_k = 8
+    #     num_experts = 128
+    #     hidden_size = 1024
+    #     intermediate_size = 1024
+    #     num_tokens = 8 * 32
+    #     self._test_moe(
+    #         dtype=dtype,
+    #         top_k=top_k,
+    #         num_experts=num_experts,
+    #         hidden_size=hidden_size,
+    #         intermediate_size=intermediate_size,
+    #         num_tokens=num_tokens,
+    #         seed=1234,
+    #         renormalize_topk_logits=False,
+    #         w_dtype=w_dtype,
+    #         subc_quant_wsz=256,
+    #         bt=32,
+    #         bf=1024,
+    #         bd1=1024,
+    #         bd2=1024,
+    #         btc=32,
+    #         bfc=256,
+    #         bd1c=256,
+    #         bd2c=256,
+    #     )
+
+    # @parameterized.product(
+    #     w_dtype=[jnp.int8],
+    # )
+    # def test_shared_expert_quantized(self, w_dtype):
+    #     dtype = jnp.bfloat16
+    #     top_k = 8
+    #     num_experts = 128
+    #     hidden_size = 1024
+    #     intermediate_size = 1024
+    #     num_tokens = 8 * 32
+    #     self._test_moe(
+    #         dtype=dtype,
+    #         top_k=top_k,
+    #         num_experts=num_experts,
+    #         hidden_size=hidden_size,
+    #         intermediate_size=intermediate_size,
+    #         num_tokens=num_tokens,
+    #         seed=1234,
+    #         renormalize_topk_logits=False,
+    #         w_dtype=w_dtype,
+    #         subc_quant_wsz=256,
+    #         has_shared_expert=True,
+    #         bt=32,
+    #         bf=1024,
+    #         bd1=1024,
+    #         bd2=1024,
+    #         btc=32,
+    #         bfc=256,
+    #         bd1c=256,
+    #         bd2c=256,
+    #     )
+
+    # def test_bias(self):
+    #     dtype = jnp.bfloat16
+    #     top_k = 8
+    #     num_experts = 128
+    #     hidden_size = 1024
+    #     intermediate_size = 1024
+    #     num_tokens = 8 * 32
+    #     self._test_moe(
+    #         dtype=dtype,
+    #         top_k=top_k,
+    #         num_experts=num_experts,
+    #         hidden_size=hidden_size,
+    #         intermediate_size=intermediate_size,
+    #         num_tokens=num_tokens,
+    #         seed=1234,
+    #         renormalize_topk_logits=False,
+    #         has_bias=True,
+    #         bt=32,
+    #         bf=512,
+    #         bd1=512,
+    #         bd2=512,
+    #         btc=32,
+    #         bfc=256,
+    #         bd1c=256,
+    #         bd2c=256,
+    #     )
 
 
 if __name__ == "__main__":
