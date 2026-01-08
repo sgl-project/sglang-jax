@@ -90,7 +90,9 @@ class ModelConfig:
             self.hf_config.architectures[0] = "MiMoMTP"
         # Check model type
         self.is_generation = is_generation_model(self.hf_config.architectures, is_embedding)
-        self.is_multimodal = False
+        self.is_multimodal = is_multimodal_model(
+            self.hf_config.architectures
+        )
         self.dtype = _get_and_verify_dtype(self.hf_text_config, dtype)
 
         # Derive context length
@@ -528,6 +530,15 @@ multimodal_model_archs = [
 ]
 
 
+def is_multimodal_model(model_architectures: list[str]):
+    if any(
+        multi_model_arch in model_architectures
+        for multi_model_arch in multimodal_model_archs
+    ):
+        return True
+    else:
+        return False
+        
 class MockModelConfig(ModelConfig):
     def __init__(
         self,

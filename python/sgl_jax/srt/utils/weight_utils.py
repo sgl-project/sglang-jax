@@ -26,6 +26,7 @@ class WeightMapping:
     target_path: str | list[str]
     sharding: tuple | None = None
     transpose: bool = False
+    transpose_dims: tuple | None = None
     reshape: tuple | None = None
     head_dim_padding: bool = False
     kv_head_padding: bool = False
@@ -549,8 +550,10 @@ class WeightLoader:
                                 target_sharding=final_sharding,
                             )
                             lazy_weight = lazy_arrays[0]
-
-                        if mapping.transpose:
+                        
+                        if mapping.transpose_dims:
+                            lazy_weight = jnp.transpose(lazy_weight, mapping.transpose_dims)
+                        elif mapping.transpose:
                             lazy_weight = jnp.transpose(lazy_weight, (1, 0))
 
                         if "lm_head" in hf_key and hasattr(
@@ -895,8 +898,10 @@ class WeightLoader:
         mapping: WeightMapping,
     ):
         processed_weight = hf_weight
-
-        if mapping.transpose and not hf_key.endswith(".bias"):
+        
+        if mapping.transpose_dims:
+            processed_weight = jnp.transpose(processed_weight, mapping.transpose_dims)
+        elif mapping.transpose and not hf_key.endswith(".bias"):
             processed_weight = jnp.transpose(processed_weight, (1, 0))
 
         if isinstance(mapping.target_path, list):

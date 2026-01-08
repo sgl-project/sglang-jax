@@ -387,6 +387,7 @@ class ModelWorker:
             top_logprobs_nums=None,
             token_ids_logprobs=None,
             extend_logprob_start_lens=None,
+            multimodal_inputs=None,
             capture_hidden_mode=CaptureHiddenMode.NULL,
             spec_algorithm=speculative_algotithm,
             lora_ids=lora_ids,  # Already set to [None] * bs above
