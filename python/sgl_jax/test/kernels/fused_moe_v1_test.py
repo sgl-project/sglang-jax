@@ -3,7 +3,7 @@
 import jax
 import jax.numpy as jnp
 import numpy as np
-from absl.testing import absltest
+from absl.testing import absltest, parameterized
 from jax._src import test_util as jtu
 from jax.sharding import Mesh
 
@@ -478,39 +478,10 @@ class MoEKernelTest(jtu.JaxTestCase):
     #         bd2c=256,
     #     )
 
-    # @parameterized.product(
-    #     w_dtype=[jnp.int8],
-    # )
-    # def test_shared_expert_quantized(self, w_dtype):
-    #     dtype = jnp.bfloat16
-    #     top_k = 8
-    #     num_experts = 128
-    #     hidden_size = 1024
-    #     intermediate_size = 1024
-    #     num_tokens = 8 * 32
-    #     self._test_moe(
-    #         dtype=dtype,
-    #         top_k=top_k,
-    #         num_experts=num_experts,
-    #         hidden_size=hidden_size,
-    #         intermediate_size=intermediate_size,
-    #         num_tokens=num_tokens,
-    #         seed=1234,
-    #         renormalize_topk_logits=False,
-    #         w_dtype=w_dtype,
-    #         subc_quant_wsz=256,
-    #         has_shared_expert=True,
-    #         bt=32,
-    #         bf=1024,
-    #         bd1=1024,
-    #         bd2=1024,
-    #         btc=32,
-    #         bfc=256,
-    #         bd1c=256,
-    #         bd2c=256,
-    #     )
-
-    def test_bias(self):
+    @parameterized.product(
+        w_dtype=[jnp.int8],
+    )
+    def test_shared_expert_quantized(self, w_dtype):
         dtype = jnp.bfloat16
         top_k = 8
         num_experts = 128
@@ -526,16 +497,45 @@ class MoEKernelTest(jtu.JaxTestCase):
             num_tokens=num_tokens,
             seed=1234,
             renormalize_topk_logits=False,
-            has_bias=True,
+            w_dtype=w_dtype,
+            subc_quant_wsz=256,
+            has_shared_expert=True,
             bt=32,
-            bf=512,
-            bd1=512,
-            bd2=512,
+            bf=1024,
+            bd1=1024,
+            bd2=1024,
             btc=32,
             bfc=256,
             bd1c=256,
             bd2c=256,
         )
+
+    # def test_bias(self):
+    #     dtype = jnp.bfloat16
+    #     top_k = 8
+    #     num_experts = 128
+    #     hidden_size = 1024
+    #     intermediate_size = 1024
+    #     num_tokens = 8 * 32
+    #     self._test_moe(
+    #         dtype=dtype,
+    #         top_k=top_k,
+    #         num_experts=num_experts,
+    #         hidden_size=hidden_size,
+    #         intermediate_size=intermediate_size,
+    #         num_tokens=num_tokens,
+    #         seed=1234,
+    #         renormalize_topk_logits=False,
+    #         has_bias=True,
+    #         bt=32,
+    #         bf=512,
+    #         bd1=512,
+    #         bd2=512,
+    #         btc=32,
+    #         bfc=256,
+    #         bd1c=256,
+    #         bd2c=256,
+    #     )
 
 
 if __name__ == "__main__":
