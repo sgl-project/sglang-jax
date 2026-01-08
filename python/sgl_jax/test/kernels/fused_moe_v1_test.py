@@ -294,61 +294,61 @@ class MoEKernelTest(jtu.JaxTestCase):
             bd2c=256,
         )
 
-    # def test_shared_expert(self):
-    #     dtype = jnp.bfloat16
-    #     top_k = 8
-    #     num_experts = 128
-    #     hidden_size = 1024
-    #     intermediate_size = 1024
-    #     num_tokens = 8 * 32
-    #     self._test_moe(
-    #         dtype=dtype,
-    #         top_k=top_k,
-    #         num_experts=num_experts,
-    #         hidden_size=hidden_size,
-    #         intermediate_size=intermediate_size,
-    #         num_tokens=num_tokens,
-    #         seed=1234,
-    #         renormalize_topk_logits=True,
-    #         has_shared_expert=True,
-    #         bt=32,
-    #         bf=512,  # smaller bf to test loop
-    #         bd1=512,
-    #         bd2=512,
-    #         btc=32,
-    #         bfc=256,
-    #         bd1c=256,
-    #         bd2c=256,
-    #     )
+    def test_shared_expert(self):
+        dtype = jnp.bfloat16
+        top_k = 8
+        num_experts = 128
+        hidden_size = 1024
+        intermediate_size = 1024
+        num_tokens = 8 * 32
+        self._test_moe(
+            dtype=dtype,
+            top_k=top_k,
+            num_experts=num_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            num_tokens=num_tokens,
+            seed=1234,
+            renormalize_topk_logits=True,
+            has_shared_expert=True,
+            bt=32,
+            bf=512,  # smaller bf to test loop
+            bd1=512,
+            bd2=512,
+            btc=32,
+            bfc=256,
+            bd1c=256,
+            bd2c=256,
+        )
 
-    # def test_grouped_topk(self):
-    #     dtype = jnp.bfloat16
-    #     top_k = 4
-    #     num_experts = 128
-    #     hidden_size = 1024
-    #     intermediate_size = 1024
-    #     num_tokens = 8 * 32
-    #     self._test_moe(
-    #         dtype=dtype,
-    #         top_k=top_k,
-    #         num_experts=num_experts,
-    #         hidden_size=hidden_size,
-    #         intermediate_size=intermediate_size,
-    #         num_tokens=num_tokens,
-    #         seed=1234,
-    #         renormalize_topk_logits=True,
-    #         use_grouped_topk=True,
-    #         num_groups=4,
-    #         top_k_groups=2,
-    #         bt=32,
-    #         bf=1024,
-    #         bd1=1024,
-    #         bd2=1024,
-    #         btc=32,
-    #         bfc=256,
-    #         bd1c=256,
-    #         bd2c=256,
-    #     )
+    def test_grouped_topk(self):
+        dtype = jnp.bfloat16
+        top_k = 4
+        num_experts = 128
+        hidden_size = 1024
+        intermediate_size = 1024
+        num_tokens = 8 * 32
+        self._test_moe(
+            dtype=dtype,
+            top_k=top_k,
+            num_experts=num_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            num_tokens=num_tokens,
+            seed=1234,
+            renormalize_topk_logits=True,
+            use_grouped_topk=True,
+            num_groups=4,
+            top_k_groups=2,
+            bt=32,
+            bf=1024,
+            bd1=1024,
+            bd2=1024,
+            btc=32,
+            bfc=256,
+            bd1c=256,
+            bd2c=256,
+        )
 
     # @parameterized.product(
     #     act_fn=["silu", "gelu", "swigluoai"],
