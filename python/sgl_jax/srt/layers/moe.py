@@ -323,7 +323,7 @@ class EPMoE(nnx.Module):
             topk_ids_reshard = jax.sharding.reshard(topk_ids, P(None))
 
             # Extract scale values - scales are nnx.Param after quantize_weights(), else None
-            if self.quantized_dtype is not None:
+            if self.wi_0_scale is not None:
                 w0_scale = self.wi_0_scale.value
                 w1_scale = self.wi_1_scale.value
                 wo_scale = self.wo_scale.value
