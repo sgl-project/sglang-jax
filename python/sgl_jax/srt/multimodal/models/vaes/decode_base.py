@@ -10,9 +10,9 @@ from diffusers import AutoencoderKLWan
 from flax import nnx
 from safetensors import safe_open
 from wanvae import AutoencoderKLWan as JaxWan
-from weight_mapping import to_mappings
 
 from sgl_jax.srt.multimodal.configs.models.vaes.wanvae import WanVAEConfig
+from sgl_jax.srt.multimodal.models.vaes.vae_weights_mappings import to_mappings
 
 path = "/models/models--Wan-AI--Wan2.1-T2V-1.3B-Diffusers/snapshots/0fad780a534b6463e45facd96134c9f345acfa5b"
 

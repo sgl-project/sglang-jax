@@ -65,6 +65,12 @@ class JAXModelLoader(BaseModelLoader):
     ) -> Any:
         # prepare model file
         hf_folder = self.download_model(model_config)
+        
+        # if sub_dir is specified, use it
+        if self.load_config.sub_dir is not None:
+            hf_folder = os.path.join(hf_folder, self.load_config.sub_dir)
+            model_config = copy.copy(model_config)
+            
         model_config.model_path = hf_folder
         # Initialize JAX model
         model = self._initialize_model(model_config)

@@ -59,7 +59,9 @@ class TestWanTransformer3DModel(unittest.TestCase):
         config = MockConfig()
         rngs = nnx.Rngs(params=jax.random.key(0))
 
-        model = WanTransformer3DModel(config, rngs=rngs)
+        model = WanTransformer3DModel(
+            config, rngs=rngs, mesh=jax.sharding.Mesh(jax.devices(), ("data",))
+        )
 
         # (batch_size, num_channels, num_frames, height, width) - channel-first format
         input_shape = (1, 4, 1, 32, 32)

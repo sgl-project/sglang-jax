@@ -1,16 +1,21 @@
+import math
+
 import jax
 import jax.numpy as jnp
 from flax import nnx
 
 from sgl_jax.srt.layers.embeddings import apply_rotary_emb
 from sgl_jax.srt.layers.layernorm import RMSNorm
+from sgl_jax.srt.layers.linear import LinearBase
+
+# from sgl_jax.srt.multimodal.configs.dits.wan2_1 import WanVideoArchConfig, WanVideoConfig
+from sgl_jax.srt.multimodal.configs.dits.configs import WanModelConfig
 from sgl_jax.srt.multimodal.layers.attention.layer import USPAttention
 from sgl_jax.srt.multimodal.layers.layernorm import (
     FP32LayerNorm,
     ScaleResidual,
     ScaleResidualLayerNormScaleShift,
 )
-from sgl_jax.srt.multimodal.layers.linear import ReplicatedLinear
 from sgl_jax.srt.multimodal.layers.mlp import MLP
 from sgl_jax.srt.multimodal.layers.rotary_embedding import NDRotaryEmbedding
 from sgl_jax.srt.multimodal.layers.visual_embedding import (
@@ -21,11 +26,11 @@ from sgl_jax.srt.multimodal.layers.visual_embedding import (
 
 
 class WanImageEmbedding(nnx.Module):
-    def __init__(self, in_features: int, out_features: int):
+    def __init__(self, in_features: int, out_features: int, mesh: jax.sharding.Mesh | None = None):
         super().__init__()
 
         self.norm1 = FP32LayerNorm(num_features=in_features, rngs=nnx.Rngs(0))
-        self.ff = MLP(in_features, in_features, out_features, act_type="gelu")
+        self.ff = MLP(in_features, in_features, out_features, act_type="gelu", mesh=mesh)
         self.norm2 = FP32LayerNorm(num_features=out_features, rngs=nnx.Rngs(0))
 
     def __call__(self, x: jax.Array) -> jax.Array:
@@ -51,15 +56,24 @@ class WanTransformerBlock(nnx.Module):
         cross_attn_norm: bool = False,
         epsilon: float = 1e-6,
         added_kv_proj_dim: int | None = None,
+        mesh: jax.sharding.Mesh | None = None,
     ):
         super().__init__()
 
         self.norm1 = FP32LayerNorm(num_features=dim, epsilon=epsilon, rngs=nnx.Rngs(0))
 
-        self.to_q = ReplicatedLinear(input_size=dim, output_size=dim, use_bias=True)
-        self.to_k = ReplicatedLinear(input_size=dim, output_size=dim, use_bias=True)
-        self.to_v = ReplicatedLinear(input_size=dim, output_size=dim, use_bias=True)
-        self.to_out = ReplicatedLinear(input_size=dim, output_size=dim, use_bias=True)
+        self.to_q = LinearBase(
+            input_size=dim, output_size=dim, use_bias=True, mesh=mesh, kernel_axes=(None, None)
+        )
+        self.to_k = LinearBase(
+            input_size=dim, output_size=dim, use_bias=True, mesh=mesh, kernel_axes=(None, None)
+        )
+        self.to_v = LinearBase(
+            input_size=dim, output_size=dim, use_bias=True, mesh=mesh, kernel_axes=(None, None)
+        )
+        self.to_out = LinearBase(
+            input_size=dim, output_size=dim, use_bias=True, mesh=mesh, kernel_axes=(None, None)
+        )
 
         # 1. Self-attention
 
@@ -79,8 +93,7 @@ class WanTransformerBlock(nnx.Module):
             self.norm_q = RMSNorm(dim, epsilon=epsilon)
             self.norm_k = RMSNorm(dim, epsilon=epsilon)
         else:
-            print("QK Norm type not supported")
-            raise Exception
+            raise RuntimeError("QK Norm type not supported")
         assert cross_attn_norm is True
         self.self_attn_residual_norm = ScaleResidualLayerNormScaleShift(
             dim,
@@ -99,6 +112,7 @@ class WanTransformerBlock(nnx.Module):
                 num_heads,
                 qk_norm=qk_norm,
                 epsilon=epsilon,
+                mesh=mesh,
             )
         else:
             # T2V
@@ -107,6 +121,7 @@ class WanTransformerBlock(nnx.Module):
                 num_heads,
                 qk_norm=qk_norm,
                 epsilon=epsilon,
+                mesh=mesh,
             )
         self.cross_attn_residual_norm = ScaleResidualLayerNormScaleShift(
             dim,
@@ -118,7 +133,9 @@ class WanTransformerBlock(nnx.Module):
         )
 
         # 3. Feed-forward
-        self.ffn = MLP(input_dim=dim, mlp_hidden_dim=ffn_dim, act_type="gelu_pytorch_tanh")
+        self.ffn = MLP(
+            input_dim=dim, mlp_hidden_dim=ffn_dim, act_type="gelu_pytorch_tanh", mesh=mesh
+        )
         self.mlp_residual = ScaleResidual()
 
         self.scale_shift_table = nnx.Param(
@@ -224,6 +241,7 @@ class WanSelfAttention(nnx.Module):
         qk_norm=True,
         epsilon=1e-6,
         parallel_attention=False,
+        mesh: jax.sharding.Mesh | None = None,
     ) -> None:
         assert dim % num_heads == 0
         super().__init__()
@@ -236,10 +254,18 @@ class WanSelfAttention(nnx.Module):
         self.parallel_attention = parallel_attention
 
         # layers
-        self.to_q = ReplicatedLinear(dim, dim)
-        self.to_k = ReplicatedLinear(dim, dim)
-        self.to_v = ReplicatedLinear(dim, dim)
-        self.to_out = ReplicatedLinear(dim, dim)
+        self.to_q = LinearBase(
+            input_size=dim, output_size=dim, use_bias=True, mesh=mesh, kernel_axes=(None, None)
+        )
+        self.to_k = LinearBase(
+            input_size=dim, output_size=dim, use_bias=True, mesh=mesh, kernel_axes=(None, None)
+        )
+        self.to_v = LinearBase(
+            input_size=dim, output_size=dim, use_bias=True, mesh=mesh, kernel_axes=(None, None)
+        )
+        self.to_out = LinearBase(
+            input_size=dim, output_size=dim, use_bias=True, mesh=mesh, kernel_axes=(None, None)
+        )
         self.norm_q = RMSNorm(dim, epsilon=self.epsilon)
         self.norm_k = RMSNorm(dim, epsilon=self.epsilon)
 
@@ -309,6 +335,7 @@ class WanI2VCrossAttention(WanSelfAttention):
         window_size=(-1, -1),
         qk_norm=True,
         epsilon=1e-6,
+        mesh: jax.sharding.Mesh | None = None,
     ) -> None:
         super().__init__(
             dim,
@@ -318,8 +345,12 @@ class WanI2VCrossAttention(WanSelfAttention):
             epsilon,
         )
 
-        self.add_k_proj = ReplicatedLinear(dim, dim)
-        self.add_v_proj = ReplicatedLinear(dim, dim)
+        self.add_k_proj = LinearBase(
+            input_size=dim, output_size=dim, use_bias=True, mesh=mesh, kernel_axes=(None, None)
+        )
+        self.add_v_proj = LinearBase(
+            input_size=dim, output_size=dim, use_bias=True, mesh=mesh, kernel_axes=(None, None)
+        )
         self.norm_added_k = RMSNorm(dim, epsilon=epsilon)
         self.norm_added_q = RMSNorm(dim, epsilon=epsilon)
 
@@ -360,25 +391,27 @@ class WanTimeTextImageEmbedding(nnx.Module):
         time_freq_dim: int,
         text_embed_dim: int,
         image_embed_dim: int | None = None,
+        mesh: jax.sharding.Mesh | None = None,
     ):
         super().__init__()
 
         self.time_embedder = TimestepEmbedder(
-            dim, frequency_embedding_size=time_freq_dim, act_layer="silu"
+            dim, frequency_embedding_size=time_freq_dim, act_layer="silu", mesh=mesh
         )
-        self.time_modulation = ModulateProjection(dim, factor=6, act_layer="silu")
+        self.time_modulation = ModulateProjection(dim, factor=6, act_layer="silu", mesh=mesh)
         self.text_embedder = MLP(
             input_dim=text_embed_dim,
             mlp_hidden_dim=dim,
             output_dim=dim,
             bias=True,
             act_type="gelu_pytorch_tanh",
+            mesh=mesh,
         )
 
         self.image_embedder = None
         if image_embed_dim is not None:
             self.image_embedder = nnx.data(
-                WanImageEmbedding(in_features=image_embed_dim, out_features=dim)
+                WanImageEmbedding(in_features=image_embed_dim, out_features=dim, mesh=mesh)
             )
 
     def __call__(
@@ -400,7 +433,14 @@ class WanTimeTextImageEmbedding(nnx.Module):
 
 
 class WanTransformer3DModel(nnx.Module):
-    def __init__(self, config, *, rngs: nnx.Rngs = None):
+    def __init__(
+        self,
+        config: WanModelConfig,
+        *,
+        rngs: nnx.Rngs = None,
+        dtype=jnp.bfloat16,
+        mesh: jax.sharding.Mesh | None = None,
+    ):
         self.patch_size = config.patch_size
         self.hidden_size = config.hidden_dim
         self.num_attention_heads = config.num_heads
@@ -409,7 +449,7 @@ class WanTransformer3DModel(nnx.Module):
         d = self.hidden_size // self.num_attention_heads
         self.rope_dim_list = [d - 4 * (d // 6), 2 * (d // 6), 2 * (d // 6)]
         inner_dim = config.num_attention_heads * config.attention_head_dim
-
+        self.mesh = mesh
         self.patch_embedding = PatchEmbed(
             in_chans=config.in_channels,
             embed_dim=inner_dim,
@@ -423,6 +463,7 @@ class WanTransformer3DModel(nnx.Module):
             time_freq_dim=config.freq_dim,
             text_embed_dim=config.text_dim,
             image_embed_dim=config.image_dim,
+            mesh=mesh,
         )
 
         # 3. Transformer blocks
@@ -438,6 +479,7 @@ class WanTransformer3DModel(nnx.Module):
                     config.cross_attn_norm,
                     config.epsilon,
                     config.added_kv_proj_dim,
+                    mesh=mesh,
                 )
                 for i in range(config.num_layers)
             ]
@@ -463,7 +505,7 @@ class WanTransformer3DModel(nnx.Module):
         out_channels = getattr(config, "out_channels", config.in_channels)
         self.proj_out = nnx.Linear(
             in_features=inner_dim,
-            out_features=out_channels * int(jnp.prod(jnp.array(config.patch_size))),
+            out_features=out_channels * math.prod(config.patch_size),
             use_bias=True,
             rngs=rngs,
         )
@@ -609,6 +651,67 @@ class WanTransformer3DModel(nnx.Module):
 
         print("[9] done, output:", output.shape)
         return output
+
+    def load_weights(self, model_path: str) -> None:
+        """
+        Load weights from HuggingFace safetensors files.
+
+        Args:
+            model_path: Path to the transformer directory containing safetensors files
+        """
+        import logging
+
+        from sgl_jax.srt.multimodal.models.wan2_1.diffusion.wan2_1_dit_weights_mapping import (
+            to_i2v_mappings,
+            to_mappings,
+        )
+        from sgl_jax.srt.utils.weight_utils import WeightLoader
+
+        logger = logging.getLogger(__name__)
+
+        # Determine if this is I2V model based on image_embedder
+        is_i2v = hasattr(self.condition_embedder, "image_embedder") and (
+            self.condition_embedder.image_embedder is not None
+        )
+
+        # Get weight mappings
+        if is_i2v:
+            weight_mappings = to_i2v_mappings()
+            logger.info("Using I2V weight mappings")
+        else:
+            weight_mappings = to_mappings()
+            logger.info("Using T2V weight mappings")
+
+        # Create a minimal config object for WeightLoader
+        class MinimalConfig:
+            def __init__(self, path, hidden_size, num_heads, num_kv_heads):
+                self.model_path = path
+                self.hidden_size = hidden_size
+                self.num_attention_heads = num_heads
+                self.num_key_value_heads = num_kv_heads
+                self.hf_config = type("HFConfig", (), {})()
+
+            def get_total_num_kv_heads(self):
+                return self.num_key_value_heads
+
+            def needs_kv_head_replication(self, tp_size):
+                return False
+
+        model_config = MinimalConfig(
+            path=model_path,
+            hidden_size=self.hidden_size,
+            num_heads=self.num_attention_heads,
+            num_kv_heads=self.num_attention_heads,
+        )
+
+        # Create weight loader and load weights
+        loader = WeightLoader(
+            model=self,
+            model_config=model_config,
+            mesh=self.mesh,
+        )
+        loader.load_weights_from_safetensors(weight_mappings)
+        logger.info("Weights loaded successfully for WanTransformer3DModel")
 
 
 EntryClass = WanTransformer3DModel

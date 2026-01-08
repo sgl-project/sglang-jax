@@ -2,7 +2,7 @@ import jax
 import jax.numpy as jnp
 from flax import nnx
 
-from sgl_jax.srt.multimodal.layers.linear import ReplicatedLinear
+from sgl_jax.srt.layers.linear import LinearBase
 
 
 def get_act_fn(act_type: str):
@@ -29,20 +29,28 @@ class MLP(nnx.Module):
         bias: bool = True,
         act_type: str = "gelu_pytorch_tanh",
         dtype: jnp.dtype | None = jnp.bfloat16,
+        mesh: jax.sharding.Mesh | None = None,
         prefix: str = "",
     ):
-        self.fc_in = ReplicatedLinear(
+        self.fc_in = LinearBase(
             input_size=input_dim,
             output_size=mlp_hidden_dim,
             use_bias=bias,
             params_dtype=dtype,
+            mesh=mesh,
+            kernel_axes=(None, None),
         )
 
         self.act = get_act_fn(act_type)
         if output_dim is None:
             output_dim = input_dim
-        self.fc_out = ReplicatedLinear(
-            input_size=mlp_hidden_dim, output_size=output_dim, use_bias=bias, params_dtype=dtype
+        self.fc_out = LinearBase(
+            input_size=mlp_hidden_dim,
+            output_size=output_dim,
+            use_bias=bias,
+            params_dtype=dtype,
+            mesh=mesh,
+            kernel_axes=(None, None),
         )
 
     def __call__(self, x: jax.Array) -> jax.Array:

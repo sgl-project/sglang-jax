@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
 from typing import Any
 
 import jax
@@ -21,10 +22,14 @@ from flax import nnx
 from jax import Array
 from jax.lax import Precision
 
+from sgl_jax.srt.configs.model_config import ModelConfig
 from sgl_jax.srt.multimodal.configs.models.vaes.wanvae import WanVAEConfig
 from sgl_jax.srt.multimodal.models.vaes.commons import DiagonalGaussianDistribution
+from sgl_jax.srt.multimodal.models.vaes.vae_weights_mappings import to_mappings
+from sgl_jax.srt.utils.weight_utils import WeightLoader
 
 CACHE_T = 2
+logger = logging.getLogger(__name__)
 
 
 class CausalConv3d(nnx.Module):
@@ -883,6 +888,19 @@ class AutoencoderKLWan(nnx.Module):
             raise NotImplementedError
 
         return out
+
+    def load_weights(self, model_config: ModelConfig):
+        loader = WeightLoader(
+            model=self,
+            model_config=model_config,
+            mesh=self.mesh,
+            dtype=self.dtype,
+        )
+
+        weight_mappings = to_mappings()
+
+        loader.load_weights_from_safetensors(weight_mappings)
+        logger.info("wanvae weights loaded successfully!")
 
 
 EntryClass = AutoencoderKLWan

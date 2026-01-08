@@ -5,7 +5,7 @@ import jax
 import jax.numpy as jnp
 from flax import nnx
 
-from sgl_jax.srt.multimodal.layers.linear import ReplicatedLinear
+from sgl_jax.srt.layers.linear import LinearBase
 from sgl_jax.srt.multimodal.layers.mlp import MLP, get_act_fn
 
 
@@ -81,6 +81,7 @@ class TimestepEmbedder(nnx.Module):
         dtype=None,
         freq_dtype=jnp.float32,
         prefix: str = "",
+        mesh: jax.sharding.Mesh | None = None,
     ):
         super().__init__()
         self.frequency_embedding_size = frequency_embedding_size
@@ -92,6 +93,7 @@ class TimestepEmbedder(nnx.Module):
             output_dim=hidden_size,
             act_type=act_layer,
             dtype=dtype,
+            mesh=mesh,
         )
         self.freq_dtype = freq_dtype
 
@@ -147,16 +149,19 @@ class ModulateProjection(nnx.Module):
         factor: int = 2,
         act_layer: str = "silu",
         dtype: jnp.dtype | None = None,
+        mesh: jax.sharding.Mesh | None = None,
         prefix: str = "",
     ):
         super().__init__()
         self.factor = factor
         self.hidden_size = hidden_size
-        self.linear = ReplicatedLinear(
+        self.linear = LinearBase(
             input_size=hidden_size,
             output_size=hidden_size * factor,
+            mesh=mesh,
             use_bias=True,
             params_dtype=dtype,
+            kernel_axes=(None, None),
         )
         self.act = get_act_fn(act_layer)
 

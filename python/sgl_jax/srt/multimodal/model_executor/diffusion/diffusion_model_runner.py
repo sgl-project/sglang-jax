@@ -39,7 +39,7 @@ class DiffusionModelRunner(BaseModelRunner):
         self._cache_dit_enabled = False
         self._cached_num_steps = None
         # TODO: load model_config from server_args based on model architecture
-        self.model_config = WanModelConfig
+        self.model_config = WanModelConfig()
         # Additional initialization for diffusion model if needed
         # e.g., setting up noise schedulers, diffusion steps, etc.
         self.initialize()
@@ -48,7 +48,9 @@ class DiffusionModelRunner(BaseModelRunner):
         # self.model = self.model_loader.load_model(model_config=self.model_config)
         rngs = nnx.Rngs(0)
         with jax.set_mesh(self.mesh):
-            self.model = WanTransformer3DModel(self.model_config, rngs=rngs)
+            self.model = WanTransformer3DModel(
+                self.model_config, rngs=rngs, mesh=self.mesh, dtype=self.model_config.dtype
+            )
         self.solver: UniPCMultistepScheduler = UniPCMultistepScheduler(
             num_train_timesteps=1000,
             beta_start=0.0001,
