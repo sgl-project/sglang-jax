@@ -39,7 +39,7 @@ jobs:
           uv pip install evalscope==0.17.1
 
           export OUTPUT_DIR_NAME=$(date +'%Y-%m-%d')
-          export BENCH_OUTPUT_DIR="$GITHUB_WORKSPACE/test/nightly_test_output/bench/$OUTPUT_DIR_NAME"
+          export BENCH_OUTPUT_DIR="$GITHUB_WORKSPACE/test/nightly_test_output/benchmark/$OUTPUT_DIR_NAME"
           echo "BENCH_OUTPUT_DIR=$BENCH_OUTPUT_DIR" >> $GITHUB_ENV
           mkdir -p $BENCH_OUTPUT_DIR
 
@@ -54,6 +54,26 @@ jobs:
         run: |
           python3 scripts/ci/publish_bench_and_perf.py --source-dir ./test/nightly_test_output
 
+      - name: Generate CSV Entry and publish
+        env:
+          GITHUB_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+          GITHUB_RUN_NUMBER: ${{ github.run_number }}
+        if: always()
+        run: |
+          mkdir -p ./test
+          SHA=${{ github.sha }}
+          AUTHOR=$(git log -1 --pretty=%an)
+          MSG=$(git log -1 --pretty=%B | tr -d ',' | head -n 1)
+          RUN_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          export OUTPUT_DIR_NAME=$(date +'%Y-%m-%d')
+          FILE="./meta/benchmark/"$OUTPUT_DIR_NAME"/nightly_report.csv"
+          if [ ! -f "$FILE" ]; then
+            echo "SHA,Author,Commit_Msg,Run_URL" > $FILE
+          fi
+          echo "$SHA,$AUTHOR,$MSG,$RUN_URL" >> $FILE
+          echo "CSV line added: $SHA, $AUTHOR, $MSG"
+          python3 scripts/ci/publish_bench_and_perf.py --source-dir ./meta
 
   nightly-test-accuracy-text-models-4-tpu:
     if: github.repository == 'sgl-project/sglang-jax'
@@ -80,7 +100,7 @@ jobs:
 
 
           export OUTPUT_DIR_NAME=$(date +'%Y-%m-%d')
-          export BENCH_OUTPUT_DIR="$GITHUB_WORKSPACE/test/nightly_test_output/bench/$OUTPUT_DIR_NAME"
+          export BENCH_OUTPUT_DIR="$GITHUB_WORKSPACE/test/nightly_test_output/benchmark/$OUTPUT_DIR_NAME"
           echo "BENCH_OUTPUT_DIR=$BENCH_OUTPUT_DIR" >> $GITHUB_ENV
           mkdir -p $BENCH_OUTPUT_DIR
 
@@ -195,13 +215,14 @@ jobs:
           AUTHOR=$(git log -1 --pretty=%an)
           MSG=$(git log -1 --pretty=%B | tr -d ',' | head -n 1)
           RUN_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-          FILE="./test/nightly_report.csv"
+          export OUTPUT_DIR_NAME=$(date +'%Y-%m-%d')
+          FILE="./meta/perf/"$OUTPUT_DIR_NAME"/nightly_report.csv"
           if [ ! -f "$FILE" ]; then
             echo "SHA,Author,Commit_Msg,Run_URL" > $FILE
           fi
           echo "$SHA,$AUTHOR,$MSG,$RUN_URL" >> $FILE
           echo "CSV line added: $SHA, $AUTHOR, $MSG"
-          python3 scripts/ci/publish_bench_and_perf.py --source-dir ./test
+          python3 scripts/ci/publish_bench_and_perf.py --source-dir ./meta
 
 
   nightly-test-perf-text-models-4-tpu-part2:
@@ -314,7 +335,7 @@ jobs:
           uv pip install -e "python[all]"
 
           export OUTPUT_DIR_NAME=$(date +'%Y-%m-%d')
-          export PERF_OUTPUT_DIR="$GITHUB_WORKSPACE/test/nightly_test_output/perf/$OUTPUT_DIR_NAME"
+          export PERF_OUTPUT_DIR="$GITHUB_WORKSPACE/test/nightly_test_output/trace/$OUTPUT_DIR_NAME"
           echo "PERF_OUTPUT_DIR=$PERF_OUTPUT_DIR" >> $GITHUB_ENV
           mkdir -p $PERF_OUTPUT_DIR
 
@@ -356,7 +377,7 @@ jobs:
           uv pip install -e "python[all]"
 
           export OUTPUT_DIR_NAME=$(date +'%Y-%m-%d')
-          export PERF_OUTPUT_DIR="$GITHUB_WORKSPACE/test/nightly_test_output/perf/$OUTPUT_DIR_NAME"
+          export PERF_OUTPUT_DIR="$GITHUB_WORKSPACE/test/nightly_test_output/trace/$OUTPUT_DIR_NAME"
           echo "PERF_OUTPUT_DIR=$PERF_OUTPUT_DIR" >> $GITHUB_ENV
           mkdir -p $PERF_OUTPUT_DIR
 
@@ -398,7 +419,7 @@ jobs:
             uv pip install -e "python[all]"
 
             export OUTPUT_DIR_NAME=$(date +'%Y-%m-%d')
-            export PERF_OUTPUT_DIR="$GITHUB_WORKSPACE/test/nightly_test_output/perf/$OUTPUT_DIR_NAME"
+            export PERF_OUTPUT_DIR="$GITHUB_WORKSPACE/test/nightly_test_output/trace/$OUTPUT_DIR_NAME"
             echo "PERF_OUTPUT_DIR=$PERF_OUTPUT_DIR" >> $GITHUB_ENV
             mkdir -p $PERF_OUTPUT_DIR
 
@@ -418,9 +439,9 @@ jobs:
 
         - name: Generate CSV Entry and publish
           env:
-              GITHUB_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
-              GITHUB_RUN_ID: ${{ github.run_id }}
-              GITHUB_RUN_NUMBER: ${{ github.run_number }}
+            GITHUB_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
+            GITHUB_RUN_ID: ${{ github.run_id }}
+            GITHUB_RUN_NUMBER: ${{ github.run_number }}
           if: always()
           run: |
             mkdir -p ./test
@@ -428,10 +449,11 @@ jobs:
             AUTHOR=$(git log -1 --pretty=%an)
             MSG=$(git log -1 --pretty=%B | tr -d ',' | head -n 1)
             RUN_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-            FILE="./test/nightly_report.csv"
+            export OUTPUT_DIR_NAME=$(date +'%Y-%m-%d')
+            FILE="./meta/trace/"$OUTPUT_DIR_NAME"/nightly_report.csv"
             if [ ! -f "$FILE" ]; then
               echo "SHA,Author,Commit_Msg,Run_URL" > $FILE
             fi
             echo "$SHA,$AUTHOR,$MSG,$RUN_URL" >> $FILE
             echo "CSV line added: $SHA, $AUTHOR, $MSG"
-            python3 scripts/ci/publish_bench_and_perf.py --source-dir ./test
+            python3 scripts/ci/publish_bench_and_perf.py --source-dir ./meta
