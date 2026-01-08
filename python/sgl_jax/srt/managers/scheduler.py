@@ -214,7 +214,7 @@ class Scheduler(
         # Init grammar backend for structured output
         self.grammar_backend = None
         self.grammar_queue: list[Req] = []  # Requests waiting for grammar compilation
-        if not server_args.skip_tokenizer_init:
+        if not server_args.skip_tokenizer_init and not server_args.multimodal:
             self.grammar_backend = create_grammar_backend(
                 server_args,
                 self.tokenizer,
@@ -434,6 +434,7 @@ class Scheduler(
                 tokenizer_mode=server_args.tokenizer_mode,
                 trust_remote_code=server_args.trust_remote_code,
                 revision=server_args.revision,
+                sub_dir= "tokenizer" if server_args.multimodal else "",
             )
 
     def init_memory_pool_and_cache(self):
