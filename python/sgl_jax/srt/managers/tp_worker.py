@@ -99,6 +99,7 @@ class ModelWorker:
             model_config=self.model_config,
             mem_fraction_static=server_args.mem_fraction_static,
             tp_size=server_args.tp_size,
+            dp_size=server_args.dp_size,
             server_args=server_args,
             mesh=self.mesh,
             is_draft_worker=is_draft_worker,
@@ -208,7 +209,7 @@ class ModelWorker:
         # padding cache_loc_paddings
         # note: the length of following two cache_loc_paddings must keep the same to length of separate bs_paddings.
         self.precompile_cache_loc_paddings = [
-            (item * self.max_req_len + self.page_size - 1) // self.page_size * self.page_size
+            item * ((self.max_req_len + self.page_size - 1) // self.page_size * self.page_size)
             for item in self.precompile_bs_paddings
         ]
 
@@ -291,6 +292,7 @@ class ModelWorker:
                     model_worker_batch.forward_batch.input_ids = resolve_future_token_ids(
                         model_worker_batch.forward_batch.input_ids,
                         future_token_ids_map,
+                        self.mesh,
                     )
 
                 self.forward_batch_generation(model_worker_batch, None, False, sampling_metadata)
@@ -333,12 +335,13 @@ class ModelWorker:
                     model_worker_batch.forward_batch.input_ids = resolve_future_token_ids(
                         model_worker_batch.forward_batch.input_ids,
                         future_token_ids_map,
+                        self.mesh,
                     )
                 _, next_token_ids, _ = self.forward_batch_generation(
                     model_worker_batch, None, False, sampling_metadata
                 )
                 if future_token_ids_map is not None:
-                    set_future_token_ids(future_token_ids_map, 0, next_token_ids)
+                    set_future_token_ids(future_token_ids_map, 0, next_token_ids, self.mesh)
 
         end_time = time.perf_counter()
         logger.info("[DECODE] Precompile finished in %.0f secs", end_time - start_time)
