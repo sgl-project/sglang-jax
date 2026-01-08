@@ -307,9 +307,10 @@ class EPMoE(nnx.Module):
             self.wo.value = wo_value
 
             # Update scales (reshape to 4D for GMM kernel)
-            self.wi_0_scale = w0_scale.reshape(w0_scale.shape[0], 1, 1, w0_scale.shape[1])
-            self.wi_1_scale = w1_scale.reshape(w1_scale.shape[0], 1, 1, w1_scale.shape[1])
-            self.wo_scale = wo_scale.reshape(wo_scale.shape[0], 1, 1, wo_scale.shape[1])
+            # Wrap with nnx.Param since these were initialized as None (static attributes)
+            self.wi_0_scale = nnx.Param(w0_scale.reshape(w0_scale.shape[0], 1, 1, w0_scale.shape[1]))
+            self.wi_1_scale = nnx.Param(w1_scale.reshape(w1_scale.shape[0], 1, 1, w1_scale.shape[1]))
+            self.wo_scale = nnx.Param(wo_scale.reshape(wo_scale.shape[0], 1, 1, wo_scale.shape[1]))
 
     def __call__(self, hidden_states, topk_weights, topk_ids) -> jax.Array:
         # Activation quantization is now handled per-GEMM inside _gmm_compute
@@ -321,9 +322,14 @@ class EPMoE(nnx.Module):
             topk_weights_reshard = jax.sharding.reshard(topk_weights, P(None))
             topk_ids_reshard = jax.sharding.reshard(topk_ids, P(None))
 
-            # Use weights and scales directly
-            # - If quantize_weights() was called: weights are quantized, scales are computed
-            # - If not called: weights are bf16, scales are identity (1s)
+            # Extract scale values - scales are nnx.Param after quantize_weights(), else None
+            if self.quantized_dtype is not None:
+                w0_scale = self.wi_0_scale.value
+                w1_scale = self.wi_1_scale.value
+                wo_scale = self.wo_scale.value
+            else:
+                w0_scale = w1_scale = wo_scale = None
+
             result = shard_map(
                 self._forward,
                 mesh=self.moe_mesh,
@@ -353,9 +359,9 @@ class EPMoE(nnx.Module):
                 self.wi_0.value,
                 self.wi_1.value,
                 self.wo.value,
-                self.wi_0_scale,
-                self.wi_1_scale,
-                self.wo_scale,
+                w0_scale,
+                w1_scale,
+                wo_scale,
                 None,
                 None,
                 None,
