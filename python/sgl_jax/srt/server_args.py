@@ -164,6 +164,9 @@ class ServerArgs:
     enable_static_lora: bool | None = None
     lora_scaling: float | None = None
 
+    # For engine
+    enable_engine_loop_run_forever_daemon: bool | None = None
+
     def __post_init__(self):
         # Set missing default values
         if self.tokenizer_path is None:
@@ -956,6 +959,11 @@ class ServerArgs:
             type=float,
             default=ServerArgs.lora_scaling,
             help="Lora scaling is required for static LoRA, scaling = alpha/rank",
+        )
+        parser.add_argument(
+            "--enable-engine-loop-run-forever-daemon",
+            action="store_true",
+            help="Run engine loop forever when engine.async_generate is called in other threads, this is used in Tunix",
         )
 
     @classmethod
