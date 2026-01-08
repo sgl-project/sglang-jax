@@ -161,7 +161,6 @@ class Scheduler(
 
         # Init inter-process communication
         context = zmq.Context(2)
-
         if self.node_rank == 0:
             self.recv_from_tokenizer = get_zmq_socket(
                 context, zmq.PULL, port_args.scheduler_input_ipc_name, False
@@ -203,7 +202,6 @@ class Scheduler(
 
         if self.nnodes > 1:
             self.sync_pub_sub()
-
         # Init tokenizer
         self.init_tokenizer()
 
@@ -223,7 +221,6 @@ class Scheduler(
         if not self.is_generation:
             self.enable_overlap = False
             logger.info("Overlap scheduler is disabled for embedding models.")
-
         # init distribution
         if self.nnodes > 1:
             jax.distributed.initialize(server_args.dist_init_addr, self.nnodes, self.node_rank)
@@ -237,13 +234,12 @@ class Scheduler(
             device_indexes=server_args.device_indexes,
         )
 
+        self.mesh = create_device_mesh(ici_parallelism=[-1, self.tp_size], dcn_parallelism=[1, 1])
         TpWorkerClass = ModelWorkerClient if self.enable_overlap else ModelWorker
-
         self.tp_worker = TpWorkerClass(
             server_args=server_args,
             mesh=self.mesh,
         )
-
         # launch draft worker
         if self.spec_algorithm is not None and self.spec_algorithm.is_eagle():
             from sgl_jax.srt.speculative.eagle_worker import EAGLEWorker
@@ -612,6 +608,15 @@ class Scheduler(
 
     def process_input_requests(self, recv_reqs: list):
         for recv_req in recv_reqs:
+            # If it is a health check generation request and there are running requests, ignore it.
+            if is_health_check_generate_req(recv_req) and (
+                self.chunked_req is not None
+                or not self.running_batch.is_empty()
+                or len(self.offload_tags) > 0
+            ):
+                self.return_health_check_ct += 1
+                continue
+
             output = self._request_dispatcher(recv_req)
             if output is not None:
                 self.send_to_tokenizer.send_pyobj(output)
@@ -637,6 +642,104 @@ class Scheduler(
             vocab_size=self.model_config.vocab_size,
         )
         req.tokenizer = self.tokenizer
+
+        if hasattr(recv_req, "mm_inputs") and recv_req.mm_inputs:
+            import jax.numpy as jnp
+
+            mm_items = recv_req.mm_inputs.get("mm_items", [])
+
+            # Filter for image and video items
+            from sgl_jax.srt.managers.schedule_batch import MultimodalDataItem
+
+            image_items = []
+            video_items = []
+            all_mm_items = []
+            for item in mm_items:
+                if isinstance(item, MultimodalDataItem):
+                    all_mm_items.append(item)
+                    if item.is_image():
+                        image_items.append(item)
+                    elif item.is_video():
+                        video_items.append(item)
+                elif isinstance(item, dict):
+                    # Handle dict format
+                    item_obj = MultimodalDataItem.from_dict(item)
+                    all_mm_items.append(item_obj)
+                    if item_obj.is_image():
+                        image_items.append(item_obj)
+                    elif item_obj.is_video():
+                        video_items.append(item_obj)
+
+            # Extract pixel values from image and video items
+            pixel_values_list = []
+            for item in image_items:
+                if item.feature is not None:
+                    pixel_values_list.append(item.feature)
+            for item in video_items:
+                if item.feature is not None:
+                    pixel_values_list.append(item.feature)
+
+            if pixel_values_list:
+                import numpy as np
+
+                # Concatenate all pixel values (keep as numpy)
+                pixel_values = np.concatenate(pixel_values_list, axis=0)
+
+                # Store raw multimodal data - embeddings will be computed in model forward pass
+                req.pixel_values = pixel_values
+
+                # Handle image_grid_thw
+                if (
+                    "image_grid_thw" in recv_req.mm_inputs
+                    and recv_req.mm_inputs["image_grid_thw"] is not None
+                ):
+                    image_grid_thw = recv_req.mm_inputs["image_grid_thw"]
+                    # Convert image_grid_thw to tuple if needed
+                    if isinstance(image_grid_thw, jnp.ndarray):
+                        image_grid_thw = tuple(map(tuple, image_grid_thw.tolist()))
+                    elif isinstance(image_grid_thw, list):
+                        image_grid_thw = tuple(
+                            tuple(x) if isinstance(x, list) else x for x in image_grid_thw
+                        )
+                    req.image_grid_thw = image_grid_thw
+
+                # Handle video_grid_thw
+                if (
+                    "video_grid_thw" in recv_req.mm_inputs
+                    and recv_req.mm_inputs["video_grid_thw"] is not None
+                ):
+                    video_grid_thw = recv_req.mm_inputs["video_grid_thw"]
+                    # Convert video_grid_thw to tuple if needed
+                    if isinstance(video_grid_thw, jnp.ndarray):
+                        video_grid_thw = tuple(map(tuple, video_grid_thw.tolist()))
+                    elif isinstance(video_grid_thw, list):
+                        video_grid_thw = tuple(
+                            tuple(x) if isinstance(x, list) else x for x in video_grid_thw
+                        )
+                    req.video_grid_thw = video_grid_thw
+
+                # Replace placeholder tokens with hash-based pad_values for radix cache differentiation
+                # This ensures different images/videos have unique cache keys
+                # IMPORTANT: Store in cache_input_ids, NOT origin_input_ids
+                # origin_input_ids must keep original placeholder tokens for model embedding merge
+                from sgl_jax.srt.managers.mm_utils import pad_input_tokens
+
+                im_token_id = recv_req.mm_inputs.get("im_token_id")
+                video_token_id = recv_req.mm_inputs.get("video_token_id")
+                audio_token_id = recv_req.mm_inputs.get("audio_token_id")
+
+                padded_input_ids = pad_input_tokens(
+                    input_ids=req.origin_input_ids,
+                    mm_items=all_mm_items,
+                    im_token_id=im_token_id,
+                    video_token_id=video_token_id,
+                    audio_token_id=audio_token_id,
+                )
+                # Store padded IDs for cache matching only (NOT for model forward)
+                req.cache_input_ids = padded_input_ids
+            else:
+                if image_items or video_items:
+                    logger.warning("No pixel_values found in mm_items for request %s", recv_req.rid)
 
         # Validate prompt length
         error_msg = validate_input_length(
@@ -1457,6 +1560,11 @@ class Scheduler(
     def continue_generation(self, recv_req: ContinueGenerationReqInput):
         self._engine_paused = False
         logger.info("Generation continued")
+
+
+def is_health_check_generate_req(recv_req):
+    rid = getattr(recv_req, "rid", None)
+    return rid is not None and rid.startswith("HEALTH_CHECK")
 
 
 def run_scheduler_process(

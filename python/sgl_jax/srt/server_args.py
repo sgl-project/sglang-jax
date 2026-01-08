@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import tempfile
+from typing import Any
 
 import jax
 
@@ -37,6 +38,7 @@ class ServerArgs:
     trust_remote_code: bool = False
     context_length: int | None = None
     is_embedding: bool = False
+    enable_multimodal: bool | None = None
     revision: str | None = None
     model_impl: str = "auto"
     model_layer_nums: int | None = None
@@ -81,6 +83,7 @@ class ServerArgs:
     dist_timeout: int | None = None  # timeout for distributed initialization
     download_dir: str | None = None
     sleep_on_idle: bool = False
+    mm_process_config: dict[str, Any] | None = None
 
     # Data parallel
     dp_size: int = 1
@@ -122,6 +125,7 @@ class ServerArgs:
     enable_tokenizer_batch_encode: bool = False
     disable_overlap_schedule: bool = False
     enable_precision_tracer: bool = False
+    disable_fast_image_processor: bool = False
 
     # Kernel backend
     attention_backend: str | None = "fa"
@@ -163,6 +167,10 @@ class ServerArgs:
     lora_eviction_policy: str = "lru"
     enable_static_lora: bool | None = None
     lora_scaling: float | None = None
+    # For Multi-Modal
+    mm_max_concurrent_calls: int = 32
+    mm_per_request_timeout: float = 10.0
+    enable_broadcast_mm_inputs_process: bool = False
 
     def __post_init__(self):
         # Set missing default values
@@ -181,6 +189,9 @@ class ServerArgs:
                 self.device = platform_env
             else:
                 self.device = "tpu"
+
+        if self.mm_process_config is None:
+            self.mm_process_config = {}
 
         if self.served_model_name is None:
             self.served_model_name = self.model_path
@@ -226,6 +237,9 @@ class ServerArgs:
         # Normalize speculative_algorithm: treat empty string as None
         if isinstance(self.speculative_algorithm, str) and self.speculative_algorithm.strip() == "":
             self.speculative_algorithm = None
+
+        if self.disable_fast_image_processor:
+            logger.info("Fast image processor is disabled")
 
         os.environ["SGLANG_ENABLE_DETERMINISTIC_SAMPLING"] = (
             "1" if self.enable_deterministic_sampling else "0"
@@ -486,6 +500,17 @@ class ServerArgs:
             help="Disable the overlap scheduler, which overlaps the CPU scheduler with GPU model worker.",
         )
         parser.add_argument(
+            "--enable-multimodal",
+            default=ServerArgs.enable_multimodal,
+            action="store_true",
+            help="Enable the multimodal functionality for the served model. If the model being served is not multimodal, nothing will happen",
+        )
+        parser.add_argument(
+            "--disable-fast-image-processor",
+            action="store_true",
+            help="Disable the fast image processor and use the slow one instead.",
+        )
+        parser.add_argument(
             "--schedule-policy",
             type=str,
             default=ServerArgs.schedule_policy,
@@ -595,6 +620,33 @@ class ServerArgs:
             "--sleep-on-idle",
             action="store_true",
             help="Reduce CPU usage when sglang is idle.",
+        )
+
+        parser.add_argument(
+            "--mm-process-config",
+            type=json.loads,
+            default=ServerArgs.mm_process_config,
+            help="Multimodal preprocessing config, a json config contains keys: `image`, `video`, `audio`",
+        )
+
+        # For Multi-Modal
+        parser.add_argument(
+            "--mm-max-concurrent-calls",
+            type=int,
+            default=ServerArgs.mm_max_concurrent_calls,
+            help="The max concurrent calls for async mm data processing.",
+        )
+        parser.add_argument(
+            "--mm-per-request-timeout",
+            type=int,
+            default=ServerArgs.mm_per_request_timeout,
+            help="The timeout for each multi-modal request in seconds.",
+        )
+        parser.add_argument(
+            "--enable-broadcast-mm-inputs-process",
+            action="store_true",
+            default=ServerArgs.enable_broadcast_mm_inputs_process,
+            help="Enable broadcast mm-inputs process in scheduler.",
         )
 
         # Logging

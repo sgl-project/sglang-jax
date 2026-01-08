@@ -32,7 +32,7 @@ from sgl_jax.srt.mem_cache.memory_pool import (
     ReqToTokenPool,
     SWAKVPool,
 )
-from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
+from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sgl_jax.srt.model_loader.loader import get_model_loader
 from sgl_jax.srt.precision_tracer import precision_tracer
 from sgl_jax.srt.sampling.sampling_batch_info import SamplingMetadata
@@ -96,9 +96,9 @@ class ModelRunner:
         self.spec_algorithm = SpeculativeAlgorithm.from_string(server_args.speculative_algorithm)
 
         self.forward_pass_id = 0
-
         # For sampling
         self.use_sort_for_toppk_minp = server_args.use_sort_for_toppk_minp
+        self.is_multimodal = model_config.is_multimodal
 
         # Global vars
         global_server_args_dict.update(
@@ -112,10 +112,8 @@ class ModelRunner:
             ),
             mesh=self.mesh,
         )
-
         # Initialize precision tracer enable state
         precision_tracer.set_enable_precision_tracer(server_args.enable_precision_tracer)
-
         # If it is a draft model, tp_group can be different
         self.initialize()
 
@@ -170,7 +168,7 @@ class ModelRunner:
         @partial(
             jax.jit,
             donate_argnames=["token_to_kv_pool"],  # just donate KV cache
-            static_argnames=["model_state_def"],
+            static_argnames=["model_state_def", "is_multimodal"],
         )
         def jitted_run_model(
             model_def,
@@ -179,11 +177,21 @@ class ModelRunner:
             forward_batch,
             token_to_kv_pool,
             logits_metadata,
+            is_multimodal,
         ):
             model_state = jax.tree_util.tree_unflatten(model_state_def, model_state_leaves)
             model = nnx.merge(model_def, model_state)
             with LoraBatchContext.set_batch(forward_batch):
-                return model(forward_batch, token_to_kv_pool, logits_metadata)
+                # Pass input_embeds to the model if it's multimodal
+                if is_multimodal:
+                    return model(
+                        forward_batch,
+                        token_to_kv_pool,
+                        logits_metadata,
+                        input_embeds=forward_batch.input_embeds,
+                    )
+                else:
+                    return model(forward_batch, token_to_kv_pool, logits_metadata)
 
         @partial(jax.jit, static_argnames=["sampler_state_def", "use_sort_for_toppk_minp"])
         def jitted_sampler(
@@ -211,6 +219,7 @@ class ModelRunner:
                 forward_batch,
                 token_to_kv_pool,
                 logits_metadata,
+                self.is_multimodal,
             )
 
         self.jitted_run_model = run_model_wrapper
@@ -488,6 +497,7 @@ class ModelRunner:
         else:
             raise ValueError(f"Unsupported attention backend: {self.server_args.attention_backend}")
 
+    # Process multimodal forward pass
     def _forward(
         self,
         forward_batch: ForwardBatch,
@@ -496,7 +506,67 @@ class ModelRunner:
         cache_miss_count = 0
         import jax._src.test_util as jtu
 
+        # Pre-compute vision embeddings BEFORE JIT (if needed)
+        # Only process vision during EXTEND (prefill) - not during DECODE
+        input_embeds = None
+        if self.is_multimodal:
+            is_prefill = (
+                hasattr(forward_batch, "forward_mode")
+                and forward_batch.forward_mode == ForwardMode.EXTEND
+            )
+            has_cached_embeds = (
+                hasattr(forward_batch, "cached_vision_embeds")
+                and forward_batch.cached_vision_embeds is not None
+            )
+            has_pixel_values = (
+                hasattr(forward_batch, "pixel_values") and forward_batch.pixel_values is not None
+            )
+            has_grid_info = (
+                hasattr(forward_batch, "image_grid_thw")
+                and forward_batch.image_grid_thw is not None
+            ) or (
+                hasattr(forward_batch, "video_grid_thw")
+                and forward_batch.video_grid_thw is not None
+            )
+
+            if is_prefill and has_grid_info:
+                import jax.numpy as jnp
+
+                video_grid_thw = getattr(forward_batch, "video_grid_thw", None)
+
+                if has_cached_embeds:
+                    # Use cached vision embeddings (for chunked prefill after first chunk)
+                    vision_embeds = jnp.array(forward_batch.cached_vision_embeds)
+                elif has_pixel_values:
+                    # Compute vision embeddings from pixel values (first chunk)
+                    vision_embeds = self.model.encode_vision(
+                        pixel_values=jnp.array(forward_batch.pixel_values),
+                        image_grid_thw=forward_batch.image_grid_thw,
+                        video_grid_thw=video_grid_thw,
+                    )
+                    # Cache the vision embeddings on the requests for subsequent chunks
+                    reqs_with_vision = getattr(forward_batch, "reqs_with_vision", None)
+                    if reqs_with_vision:
+                        # Convert to numpy for storage
+                        vision_embeds_np = np.array(vision_embeds)
+                        for req in reqs_with_vision:
+                            req.cached_vision_embeds = vision_embeds_np
+                            # Clear pixel_values to free memory
+                            req.pixel_values = None
+                else:
+                    vision_embeds = None
+
+                if vision_embeds is not None:
+                    input_embeds = self.model.get_input_embeddings(
+                        input_ids=forward_batch.input_ids,
+                        multimodal_embeddings=vision_embeds,
+                    )
+
         with jtu.count_pjit_cpp_cache_miss() as count:
+            # Pass pre-computed embeddings to JIT-compiled forward
+            if input_embeds is not None:
+                # Store embeddings in forward_batch or pass separately
+                forward_batch.input_embeds = input_embeds
             output, layers_kv_fused, _ = self.jitted_run_model(forward_batch, logits_metadata)
             cache_miss_count = count()
         self._set_kv_cache_after_forward(layers_kv_fused)
@@ -674,6 +744,7 @@ class MockModelRunner(ModelRunner):
     ):
         self.server_args = server_args
         self.tp_size = server_args.tp_size
+        self.is_multimodal = model_config.is_multimodal
 
         if isinstance(model_config, MockModelConfig):
             self.num_kv_heads = model_config.num_kv_heads
