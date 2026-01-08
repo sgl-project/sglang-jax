@@ -14,6 +14,7 @@ from sgl_jax.srt.multimodal.manager.io_struct import TokenizedGenerateMMReqInput
 from sgl_jax.srt.multimodal.manager.schedule_batch import Req
 from sgl_jax.srt.multimodal.manager.stage import Stage
 from sgl_jax.srt.multimodal.manager.utils import load_stage_configs_from_yaml
+from sgl_jax.srt.multimodal.models.static_configs import get_stage_config_path
 from sgl_jax.srt.server_args import PortArgs, ServerArgs
 from sgl_jax.srt.utils import configure_logger, kill_itself_when_parent_died
 from sgl_jax.srt.utils.common_utils import get_zmq_socket
@@ -33,9 +34,9 @@ class GlobalScheduler:
             context, zmq.PUSH, port_args.detokenizer_ipc_name, False
         )
 
-        self.stage_configs = load_stage_configs_from_yaml(
-            "./sgl_jax/srt/multimodal/models/static_configs/wan2_1_stage_config.yaml"
-        )
+        stage_config_path = get_stage_config_path(server_args.model_path)
+        logger.info("Loading stage config from: %s", stage_config_path)
+        self.stage_configs = load_stage_configs_from_yaml(stage_config_path)
         self.device_manager = DeviceManager()
         self._init_stage()
         self.req_store = dict()
@@ -117,7 +118,9 @@ class GlobalScheduler:
             time.sleep(3)
             if reqs:
                 for req in reqs:
-                    self.in_queues[0].put_nowait(self._request_dispatcher(req).to_stage_req(self.stage_configs[0].scheduler))
+                    self.in_queues[0].put_nowait(
+                        self._request_dispatcher(req).to_stage_req(self.stage_configs[0].scheduler)
+                    )
             else:
                 for i, stage in enumerate(self.stage_list):
                     stage_result = Req.from_stage(stage.try_collect(), self.req_store)
