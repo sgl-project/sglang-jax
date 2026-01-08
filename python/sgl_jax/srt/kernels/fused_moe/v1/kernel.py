@@ -618,6 +618,7 @@ def _fused_ep_moe_kernel(
         ).wait()
 
     def get_top_k(input_logits, top_k, renormalize_topk_logits, *, out_top_k_logits_vmem):
+        input_logits = input_logits.astype(jnp.float32)
         num_tokens = input_logits.shape[0]
 
         if b_bias_vmem is not None:
