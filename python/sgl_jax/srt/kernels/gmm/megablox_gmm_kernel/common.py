@@ -42,9 +42,6 @@ def assert_is_supported_dtype(dtype: jnp.dtype) -> None:
         jnp.float8_e4m3fn,
         jnp.float8_e5m2,
         jnp.int8,
-        jnp.int4,
-        jnp.float4_e2m1fn,
-        jnp.uint4,
     ]:
         raise ValueError(f"No support for {dtype=}.")
 
