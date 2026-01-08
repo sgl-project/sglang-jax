@@ -256,11 +256,11 @@ class EPMoE(nnx.Module):
                 )
             )
 
-            # Initialize scales to identity (1s) - will be set by quantize_weights() if quantization enabled
-            # Shape is 4D for GMM kernel: (num_experts, 1, 1, output_dim)
-            self.wi_0_scale = jnp.ones((num_experts, 1, 1, intermediate_dim), dtype=jnp.float32)
-            self.wi_1_scale = jnp.ones((num_experts, 1, 1, intermediate_dim), dtype=jnp.float32)
-            self.wo_scale = jnp.ones((num_experts, 1, 1, config.hidden_size), dtype=jnp.float32)
+            # Scales are None by default - only set by quantize_weights() if quantization is enabled
+            # gmm kernel handles None scales properly (no scaling applied)
+            self.wi_0_scale = None
+            self.wi_1_scale = None
+            self.wo_scale = None
 
     def _detect_device_capabilities(self):
         try:
