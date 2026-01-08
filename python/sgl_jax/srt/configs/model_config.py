@@ -11,6 +11,7 @@ from sgl_jax.srt.hf_transformers_utils import (
     get_context_length,
     get_generation_config,
     get_hf_text_config,
+    download_from_hf,
 )
 from sgl_jax.srt.server_args import ServerArgs
 from sgl_jax.srt.utils.common_utils import get_bool_env_var
@@ -44,6 +45,7 @@ class ModelConfig:
         model_impl: str | ModelImpl = ModelImpl.AUTO,
         quantization: str | None = None,
         model_layer_nums: int | None = None,
+        sub_dir: str = ""
     ) -> None:
 
         self.model_path = model_path
@@ -59,7 +61,8 @@ class ModelConfig:
         kwargs = {}
         if override_config_file and override_config_file.strip():
             kwargs["_configuration_file"] = override_config_file.strip()
-
+        self.model_path = download_from_hf(self.model_path)
+        self.model_path = self.model_path + "/" + sub_dir
         self.hf_config = get_config(
             self.model_path,
             trust_remote_code=trust_remote_code,
@@ -176,6 +179,7 @@ class ModelConfig:
             quantization=server_args.quantization,
             model_impl=server_args.model_impl,
             model_layer_nums=server_args.model_layer_nums,
+            sub_dir= "text_encoder" if server_args.multimodal else "",
             **kwargs,
         )
 
