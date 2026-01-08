@@ -955,12 +955,15 @@ def _fused_ep_moe_kernel(
                     dst_ref=b_w1_scale_x2_vmem.at[bw1_sem_id, p],
                     sem=local_sems.at[bw1_sem_id, 1],
                 ).start()
-        if b1_hbm is not None and bd1_id == 0:
-            pltpu.make_async_copy(
-                src_ref=b1_hbm.at[local_e_id, pl.ds(0, 1), pl.ds(bf_id * bf, bf)],
-                dst_ref=b_b1_x2_vmem.at[bf_id % 2],
-                sem=local_sems.at[bw1_sem_id, 1],
-            ).start()
+        if b1_hbm is not None:
+
+            @pl.when(bd1_id == 0)
+            def _():
+                pltpu.make_async_copy(
+                    src_ref=b1_hbm.at[local_e_id, pl.ds(0, 1), pl.ds(bf_id * bf, bf)],
+                    dst_ref=b_b1_x2_vmem.at[bf_id % 2],
+                    sem=local_sems.at[bw1_sem_id, 1],
+                ).start()
 
     def start_fetch_bw2(local_e_id, bw2_sem_id, bf_id, bd2_id):
         for p in range(t_packing):
@@ -1020,12 +1023,15 @@ def _fused_ep_moe_kernel(
                     dst_ref=b_w3_scale_x2_vmem.at[bw3_sem_id, p],
                     sem=local_sems.at[bw3_sem_id, 3],
                 ).start()
-        if b3_hbm is not None and bd3_id == 0:
-            pltpu.make_async_copy(
-                src_ref=b3_hbm.at[local_e_id, pl.ds(0, 1), pl.ds(bf_id * bf, bf)],
-                dst_ref=b_b3_x2_vmem.at[bf_id % 2],
-                sem=local_sems.at[bw3_sem_id, 3],
-            ).start()
+        if b3_hbm is not None:
+
+            @pl.when(bd3_id == 0)
+            def _():
+                pltpu.make_async_copy(
+                    src_ref=b3_hbm.at[local_e_id, pl.ds(0, 1), pl.ds(bf_id * bf, bf)],
+                    dst_ref=b_b3_x2_vmem.at[bf_id % 2],
+                    sem=local_sems.at[bw3_sem_id, 3],
+                ).start()
 
     def wait_fetch_bw1(local_e_id, bw1_sem_id, bf_id, bd1_id):
         del local_e_id
@@ -1040,12 +1046,15 @@ def _fused_ep_moe_kernel(
                 dst_ref=b_w1_scale_x2_vmem.at[bw1_sem_id],
                 sem=local_sems.at[bw1_sem_id, 1],
             ).wait()
-        if b1_hbm is not None and bd1_id == 0:
-            pltpu.make_async_copy(
-                src_ref=b_b1_x2_vmem.at[bf_id % 2],
-                dst_ref=b_b1_x2_vmem.at[bf_id % 2],
-                sem=local_sems.at[bw1_sem_id, 1],
-            ).wait()
+        if b1_hbm is not None:
+
+            @pl.when(bd1_id == 0)
+            def _():
+                pltpu.make_async_copy(
+                    src_ref=b_b1_x2_vmem.at[bf_id % 2],
+                    dst_ref=b_b1_x2_vmem.at[bf_id % 2],
+                    sem=local_sems.at[bw1_sem_id, 1],
+                ).wait()
 
     def wait_fetch_bw2(local_e_id, bw2_sem_id, bf_id, bd2_id):
         del local_e_id
@@ -1080,12 +1089,15 @@ def _fused_ep_moe_kernel(
                 dst_ref=b_w3_scale_x2_vmem.at[bw3_sem_id],
                 sem=local_sems.at[bw3_sem_id, 3],
             ).wait()
-        if b3_hbm is not None and bd3_id == 0:
-            pltpu.make_async_copy(
-                src_ref=b_b3_x2_vmem.at[bf_id % 2],
-                dst_ref=b_b3_x2_vmem.at[bf_id % 2],
-                sem=local_sems.at[bw3_sem_id, 3],
-            ).wait()
+        if b3_hbm is not None:
+
+            @pl.when(bd3_id == 0)
+            def _():
+                pltpu.make_async_copy(
+                    src_ref=b_b3_x2_vmem.at[bf_id % 2],
+                    dst_ref=b_b3_x2_vmem.at[bf_id % 2],
+                    sem=local_sems.at[bw3_sem_id, 3],
+                ).wait()
 
     def start_fetch_next_bw(local_e_id, bw_sem_id, bf_id, bd1_id, bd2_id):
         next_bd1_id = bd1_id + 1
