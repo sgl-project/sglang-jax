@@ -537,6 +537,8 @@ class FusedEPMoE(nnx.Module):
         top_k_groups: int = 1,
         renormalize_topk_logits: bool = False,
         routed_scaling_factor: float | None = None,
+        num_shared_experts: int = 0,
+        moe_shared_expert_intermediate_size: int | None = None,
         *,
         balanced_topk: bool = False,
     ):
@@ -554,6 +556,10 @@ class FusedEPMoE(nnx.Module):
         self.top_k_groups = top_k_groups
         self.renormalize_topk_logits = renormalize_topk_logits
         self.routed_scaling_factor = routed_scaling_factor
+        self.num_shared_experts = num_shared_experts
+        self.moe_shared_expert_intermediate_size = (
+            moe_shared_expert_intermediate_size or intermediate_dim
+        )
         self.balanced_topk = balanced_topk
         self.mesh = mesh
 
@@ -589,6 +595,40 @@ class FusedEPMoE(nnx.Module):
             )
         )
 
+        if self.num_shared_experts > 0:
+            se_inter_dim = self.moe_shared_expert_intermediate_size * self.num_shared_experts
+
+            self.w1_shared = nnx.Param(
+                jax.random.normal(
+                    jax.random.key(0),
+                    (hidden_size, se_inter_dim),
+                    dtype=weight_dtype,
+                    out_sharding=P(None, None),
+                )
+            )
+
+            self.w2_shared = nnx.Param(
+                jax.random.normal(
+                    jax.random.key(0),
+                    (se_inter_dim, hidden_size),
+                    dtype=weight_dtype,
+                    out_sharding=P(None, None),
+                )
+            )
+
+            self.w3_shared = nnx.Param(
+                jax.random.normal(
+                    jax.random.key(0),
+                    (hidden_size, se_inter_dim),
+                    dtype=weight_dtype,
+                    out_sharding=P(None, None),
+                )
+            )
+        else:
+            self.w1_shared = None
+            self.w3_shared = None
+            self.w2_shared = None
+
     def __call__(
         self,
         hidden_states: jax.Array,
@@ -614,6 +654,10 @@ class FusedEPMoE(nnx.Module):
         if router_bias is not None:
             router_bias = jax.sharding.reshard(router_bias, P())
 
+        w1_shared_val = self.w1_shared.value if self.w1_shared is not None else None
+        w3_shared_val = self.w3_shared.value if self.w3_shared is not None else None
+        w2_shared_val = self.w2_shared.value if self.w2_shared is not None else None
+
         output = fused_ep_moe(
             mesh=self.mesh,
             tokens=hidden_states,
@@ -636,6 +680,9 @@ class FusedEPMoE(nnx.Module):
             w1_scale=None,
             w2_scale=None,
             w3_scale=None,
+            w1_shared=w1_shared_val,
+            w2_shared=w2_shared_val,
+            w3_shared=w3_shared_val,
             b1=None,
             b2=None,
             b3=None,
