@@ -1,45 +1,63 @@
 # Quantization
 
-Quantization in sglang-jax primarily uses the qwix quantization library. For implementation details and supported features, see the qwix repository: https://github.com/google/qwix
+sglang-jax supports post-training quantization (PTQ) for reducing memory footprint and increasing inference throughput.
 
-## Motivation
-- Reduce memory footprint
-- Increase inference throughput
+## Overview
 
-# Supported features
-## Quantization targets
-- Weight quantization.
-- Activation quantization
+The quantization system consists of two components:
 
-## Quantization modes:
-- Post training quantization (PTQ)
+1. **QWIX** - For dense layers (attention, MLP, embeddings, etc.)
+2. **MoE Quantization** - For Mixture-of-Experts layers (expert weights and activations)
 
-## numeric formats
-- int8, fp8
+For QWIX implementation details, see: https://github.com/google/qwix
 
-# Configuration and Customization
-Quantization behavior is defined through qwix configuration rules.
+## Supported Features
 
-Example configuration files can be found under:
+### Quantization Targets
+- **Weight quantization** - Quantize model weights (pre-quantized at load time)
+- **Activation quantization** - Quantize activations on-the-fly during inference
 
-```python
-sgl_jax/srt/utils/quantization/configs/
-```
+### Numeric Formats
+- `int8` - 8-bit integer quantization
+- `float8_e4m3fn` - 8-bit floating point (4 exponent bits, 3 mantissa bits, finite values + NaN)
 
-qwix supports multiple quantization granularities:
-
+### Quantization Granularity (QWIX)
 - Per-channel
-
 - Per-matrix
-
 - Per-tile
 
-You can define custom rules in YAML to control how weights and activations are quantized.
+## Configuration
 
-To apply a quantization rule, pass the configuration file path using the
-"--quantization-config-path" flag.
+Quantization behavior is defined through YAML configuration files with two sections:
 
-example command:
+```yaml
+quantization:
+  # QWIX rules for dense layers
+  qwix:
+    rules:
+      - module_path: '<regex pattern>'
+        weight_qtype: '<dtype>'      # Optional: weight quantization type
+        act_qtype: '<dtype>'         # Optional: activation quantization type
+
+  # MoE-specific settings (for MoE models only)
+  moe:
+    weight_dtype: '<dtype>'          # Expert weight quantization
+    activation_dtype: '<dtype>'      # Expert activation quantization (null to disable)
+```
+
+### Available Configuration File Examples
+
+| Config File | Weights | Activations | Description |
+|-------------|---------|-------------|-------------|
+| `fp8.yaml` | FP8 | None | FP8 weight-only quantization |
+| `fp8_w8a8.yaml` | FP8 | FP8 | Full FP8 quantization |
+| `int8.yaml` | INT8 | None | INT8 weight-only quantization |
+| `int8_w8a8.yaml` | INT8 | INT8 | Full INT8 quantization |
+
+## Usage Example
+
+Pass the configuration file path using `--quantization-config-path`:
+
 ```bash
 JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache \
 uv run python -u -m sgl_jax.launch_server \
@@ -58,9 +76,3 @@ uv run python -u -m sgl_jax.launch_server \
   --skip-server-warmup \
   --quantization-config-path=int8.yaml
 ```
-
-# Supported models (To be updated)
-- Dense models
-
-### TODOs:
-- add dynamic range quantization support
