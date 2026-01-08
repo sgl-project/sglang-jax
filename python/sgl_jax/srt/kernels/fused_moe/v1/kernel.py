@@ -1952,15 +1952,17 @@ def _fused_ep_moe_kernel(
         se_total_blocks = cdiv(se_inter_size, bf)
 
         def broadcast_quant_scale(scale, current_block_size, group_size):
-            # scale shape: (..., 1, bf) or (..., 1, bd2_chunk)
-            # current_block_size: bd1_per_t_packing or bf
-            # group_size: subc_quant_wsz
             if group_size is None or group_size <= 0:
                 return scale.squeeze(-2)
 
-            s = jnp.expand_dims(scale, axis=-2)
-            s = jnp.broadcast_to(s, s.shape[:-2] + (group_size, 1, s.shape[-1]))
-            s = s.reshape(scale.shape[:-3] + (current_block_size, 1, scale.shape[-1]))
+            s = jnp.expand_dims(scale, axis=-3)
+
+            target_shape = scale.shape[:-2] + (group_size, 1, scale.shape[-1])
+            s = jnp.broadcast_to(s, target_shape)
+
+            final_shape = scale.shape[:-3] + (current_block_size, 1, scale.shape[-1])
+            s = s.reshape(final_shape)
+
             return s.squeeze(-2)
 
         def run_se_block(block_id, _):
