@@ -1956,10 +1956,8 @@ def _fused_ep_moe_kernel(
                 return scale.squeeze(-2)
 
             s = jnp.expand_dims(scale, axis=-3)
-
             target_shape = scale.shape[:-2] + (group_size, 1, scale.shape[-1])
             s = jnp.broadcast_to(s, target_shape)
-
             final_shape = scale.shape[:-3] + (current_block_size, 1, scale.shape[-1])
             s = s.reshape(final_shape)
 
@@ -2629,7 +2627,7 @@ def fused_ep_moe(
             if w1_shared_scale is None
             else pltpu.VMEM(
                 (2, t_packing, block_config.bd1 // t_packing // subc_quant_wsz, 1, block_config.bf),
-                t_dtype,
+                jnp.float32,
             )
         ),  # b_se_w1_scale_x2_vmem
         (
@@ -2637,7 +2635,7 @@ def fused_ep_moe(
             if w3_shared_scale is None
             else pltpu.VMEM(
                 (2, t_packing, block_config.bd1 // t_packing // subc_quant_wsz, 1, block_config.bf),
-                t_dtype,
+                jnp.float32,
             )
         ),  # b_se_w3_scale_x2_vmem
         (
@@ -2645,7 +2643,7 @@ def fused_ep_moe(
             if w2_shared_scale is None
             else pltpu.VMEM(
                 (2, t_packing, block_config.bf // subc_quant_wsz, 1, block_config.bd2 // t_packing),
-                t_dtype,
+                jnp.float32,
             )
         ),  # b_se_w2_scale_x2_vmem
         # Semaphores.
