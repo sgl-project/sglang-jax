@@ -68,6 +68,7 @@ jobs:
           RUN_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           export OUTPUT_DIR_NAME=$(date +'%Y-%m-%d')
           FILE="./meta/benchmark/"$OUTPUT_DIR_NAME"/nightly_report.csv"
+          mkdir -p ./meta/benchmark/$OUTPUT_DIR_NAME
           if [ ! -f "$FILE" ]; then
             echo "SHA,Author,Commit_Msg,Run_URL" > $FILE
           fi
@@ -217,6 +218,7 @@ jobs:
           RUN_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           export OUTPUT_DIR_NAME=$(date +'%Y-%m-%d')
           FILE="./meta/perf/"$OUTPUT_DIR_NAME"/nightly_report.csv"
+          mkdir -p ./meta/perf/$OUTPUT_DIR_NAME
           if [ ! -f "$FILE" ]; then
             echo "SHA,Author,Commit_Msg,Run_URL" > $FILE
           fi
@@ -451,6 +453,7 @@ jobs:
             RUN_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
             export OUTPUT_DIR_NAME=$(date +'%Y-%m-%d')
             FILE="./meta/trace/"$OUTPUT_DIR_NAME"/nightly_report.csv"
+            mkdir -p ./meta/trace/$OUTPUT_DIR_NAME
             if [ ! -f "$FILE" ]; then
               echo "SHA,Author,Commit_Msg,Run_URL" > $FILE
             fi
