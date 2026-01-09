@@ -58,6 +58,20 @@ BAILING_MINI = dict(
     ep_size=None,
 )
 
+# Bailing MoE defaults (matches the observed precompile shapes).
+BAILING_MINI_BASE = dict(
+    num_experts=256,
+    top_k=8,
+    hidden_size=2048,
+    intermediate_size=512,
+    activation="silu",
+    renormalize_topk_logits=True,
+    num_expert_group=8,
+    topk_group=4,
+    # Let benchmarks pick ep_size based on available devices by default.
+    ep_size=None,
+)
+
 _NUM_TOKENS = (16, 32, 64, 128, 256, 512, 1024, 2048, 4096)
 
 BASE_CASES: Iterable[MoEBenchmarkCase] = tuple(
@@ -346,3 +360,93 @@ def build_mesh(ep_size: int = 1, tp_size: int = 1):
         devices=devices,
         mesh_axes=("data", "tensor"),
     )
+
+
+class MoEImbalanceSimulator:
+    @staticmethod
+    def generate_counts(num_tokens, top_k, num_experts, mode, **kwargs):
+        np.random.seed(42)
+        rng = np.random.default_rng(42)
+        total_picks = num_tokens * top_k
+
+        all_indices = np.arange(num_experts)
+        rng.shuffle(all_indices)
+        probs = np.zeros(num_experts)
+
+        if mode == "balanced":
+            probs = np.full(num_experts, 1.0 / num_experts)
+
+        elif mode == "dirichlet":
+            alpha = kwargs.get("alpha", 1.0)
+            probs = rng.dirichlet([alpha] * num_experts)
+
+        elif mode == "zipf":
+            s = kwargs.get("zipf_s", 1.1)
+            ranks = np.arange(1, num_experts + 1)
+            weights = 1 / (ranks**s)
+            rng.shuffle(weights)
+            probs = weights / weights.sum()
+
+        elif mode in ["hotspot", "sparse_hotspot"]:
+            hotspot_ratio = kwargs.get("hotspot_ratio", 0.5)
+            hotspot_count = kwargs.get("hotspot_count", 1)
+            alpha_base = kwargs.get("non_hotspot_alpha", 100.0)
+
+            zero_spot_count = kwargs.get("zero_expert_count", 0) if mode == "sparse_hotspot" else 0
+
+            # 边界检查
+            hotspot_count = max(1, min(hotspot_count, num_experts - zero_spot_count - 1))
+
+            # 分层挑选索引
+            zero_indices = all_indices[:zero_spot_count]
+            hot_indices = all_indices[zero_spot_count : zero_spot_count + hotspot_count]
+            base_indices = all_indices[zero_spot_count + hotspot_count :]
+
+            # 1. 零负载组
+            probs[zero_indices] = 0.0
+            # 2. 热点组 (平分热点配额)
+            probs[hot_indices] = hotspot_ratio / hotspot_count
+            # 3. 基础活跃组 (按 Dirichlet 分布划分剩余配额)
+            if len(base_indices) > 0:
+                base_dist = rng.dirichlet([alpha_base] * len(base_indices))
+                probs[base_indices] = base_dist * (1 - hotspot_ratio)
+            else:
+                # 如果没有基础组，热点组拿走全部
+                probs[hot_indices] = 1.0 / hotspot_count
+
+        else:
+            raise ValueError(f"Unknown mode: {mode}")
+
+        # 将概率转换为具体的 token 数量
+        print(f"{probs=}")
+        counts = np.floor(probs * total_picks).astype(int)
+        # 补齐因舍入导致的差值
+        diff = total_picks - counts.sum()
+        if diff > 0:
+            indices = np.random.choice(num_experts, diff, p=probs)
+            for idx in indices:
+                counts[idx] += 1
+        return counts
+
+    @staticmethod
+    def create_logits_from_counts(num_tokens, num_experts, top_k, counts):
+        """
+        根据目标 count 构造 router_logits。
+        构造逻辑：为每个 token 分配 top_k 个专家，确保全局总数符合 counts。
+        """
+        # 创建专家池，按 counts 数量填充专家 ID
+        expert_pool = []
+        for e_id, c in enumerate(counts):
+            expert_pool.extend([e_id] * c)
+        np.random.shuffle(expert_pool)
+
+        # 填充到 (num_tokens, top_k)
+        expert_pool = expert_pool[: num_tokens * top_k]
+        assignments = np.array(expert_pool).reshape(num_tokens, top_k)
+
+        # 构造 logits: 被选中的专家给高分 (10.0), 未选中的给低分 (-10.0)
+        logits = np.full((num_tokens, num_experts), -10.0, dtype=np.float32)
+        row_indices = np.arange(num_tokens)[:, None]
+        logits[row_indices, assignments] = 10.0
+
+        return jnp.array(logits)

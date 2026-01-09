@@ -463,6 +463,7 @@ def _fused_ep_moe_kernel(
     w2_shared_scale_hbm,  # None | (se_inter // subc, 1, hidden_size)
     # Output
     output_hbm,  # (local_num_tokens, hidden_size)
+    expert_counts_hbm,  # 新增: (num_bt, padded_num_experts)
     # Scratch
     t2e_routing_x2_smem,  # (2, bt, padded_top_k)
     d2e_count_x2_smem,  # (2, num_devices, 1, padded_num_experts)
@@ -505,6 +506,7 @@ def _fused_ep_moe_kernel(
     a2a_gather_sem,
     a2a_acc_sems,  # DMA(1,)
     barrier_sem,
+    expert_size_sem,
     *,
     top_k: int,
     use_grouped_topk: bool = False,
@@ -527,6 +529,7 @@ def _fused_ep_moe_kernel(
     bfc: int,  # Compute size of block intermediate_size.
     bd1c: int,  # Compute size of block hidden_size.
     bd2c: int,  # Compute size of block hidden_size.
+    a2a_only: bool,
 ):
     dp_rank = lax.axis_index(dp_axis_name)
     tp_rank = lax.axis_index(tp_axis_name)
@@ -1921,8 +1924,9 @@ def _fused_ep_moe_kernel(
         # because the expert_ffn keeps overwriting the buffers. Triple buffering
         # could resolve this but it takes more VMEM scratch. Need further
         # experiment on this.
-        start_fetch_bw1(local_e_id, bw1_sem_id=0, bf_id=0, bd1_id=0)
-        start_fetch_bw3(local_e_id, bw3_sem_id=0, bf_id=0, bd3_id=0)
+        if not a2a_only:
+            start_fetch_bw1(local_e_id, bw1_sem_id=0, bf_id=0, bd1_id=0)
+            start_fetch_bw3(local_e_id, bw3_sem_id=0, bf_id=0, bd3_id=0)
 
         # Next ids.
         next_e_sem_id = lax.select(e_sem_id == 0, 1, 0)
@@ -1947,7 +1951,14 @@ def _fused_ep_moe_kernel(
         wait_a2a_scatter_recv(bt_sem_id=bt_sem_id, e_sem_id=e_sem_id, local_e_id=local_e_id)
 
         # Perform FFN for CURRENT active expert.
-        expert_ffn(bt_sem_id, e_sem_id, local_e_id)
+        if not a2a_only:
+            expert_ffn(bt_sem_id, e_sem_id, local_e_id)
+        else:
+            wait_a2a_gather_send(
+                bt_sem_id=bt_sem_id,
+                e_sem_id=e_sem_id,
+                local_e_id=local_e_id - 2,
+            )
 
         # Start a2a gather to send back tokens for CURRENT active expert.
         start_a2a_gather(bt_sem_id=bt_sem_id, e_sem_id=e_sem_id, local_e_id=local_e_id)
@@ -2074,6 +2085,20 @@ def _fused_ep_moe_kernel(
 
         lax.fori_loop(0, se_total_blocks, run_se_block, None)
 
+    def copy_expert_size(bt_sem_id, bt_id):
+        pltpu.make_async_copy(
+            src_ref=expert_sizes_x2_smem.at[bt_sem_id, pl.ds(0, 1)],
+            dst_ref=expert_counts_hbm.at[pl.ds(bt_id, 1)],
+            sem=expert_size_sem,
+        ).start()
+
+    def wait_copy_expert_size():
+        pltpu.make_async_copy(
+            src_ref=expert_counts_hbm.at[pl.ds(0, 1)],
+            dst_ref=expert_counts_hbm.at[pl.ds(0, 1)],
+            sem=expert_size_sem,
+        ).wait()
+
     if num_bt >= 1:
         start_fetch_b_gating(bt_id=jnp.int32(0))
         start_fetch_se_tokens(bt_id=jnp.int32(0))
@@ -2104,6 +2129,10 @@ def _fused_ep_moe_kernel(
             starts=expert_starts,
             sizes=expert_sizes,
         )
+        # --- 新增: 将当前 bt 块内每个 expert 接收的全局 token 数量存回 HBM ---
+        # expert_sizes_x2_smem 此时存储的是经过 All-Reduce 后的全局 count
+        # 我们将其保存到 expert_counts_hbm 的第 bt_id 行
+        copy_expert_size(bt_sem_id, bt_id)
         sync_barrier()
 
         # Start a2a scatter for first active expert.
@@ -2152,6 +2181,7 @@ def _fused_ep_moe_kernel(
     # Drain outstanding output stores (matches epic wait_send_bo for last two bts).
     wait_store_output(bt_id=jnp.int32(num_bt - 2))
     wait_store_output(bt_id=jnp.int32(num_bt - 1))
+    wait_copy_expert_size()
 
     ### ------- Kernel end ------- ###
 
@@ -2387,6 +2417,7 @@ def _validate_fused_ep_moe_args(
         "dp_axis_name",
         "tp_axis_name",
         "balanced_topk",
+        "a2a_only",
     ],
 )
 def fused_ep_moe(
@@ -2428,6 +2459,7 @@ def fused_ep_moe(
     block_config: FusedMoEBlockConfig | None = None,
     dp_axis_name: str = "data",
     tp_axis_name: str = "tensor",
+    a2a_only: bool = False,
 ):
 
     ep_size = get_ep_size(mesh, dp_axis_name, tp_axis_name)
@@ -2670,7 +2702,12 @@ def fused_ep_moe(
         pltpu.SemaphoreType.DMA,  # a2a_gather_sem
         pltpu.SemaphoreType.DMA((1,)),  # a2a_acc_sems
         pltpu.SemaphoreType.BARRIER,  # barrier_sem
+        pltpu.SemaphoreType.DMA,
     )
+
+    num_bt = cdiv(local_num_tokens, block_config.bt)
+    expert_counts_shape = (num_bt, padded_num_experts)
+
     fused_moe = jax.named_scope(scope_name)(
         pl.pallas_call(
             functools.partial(
@@ -2695,8 +2732,12 @@ def fused_ep_moe(
                 bfc=block_config.bfc,
                 bd1c=block_config.bd1c,
                 bd2c=block_config.bd2c,
+                a2a_only=a2a_only,
             ),
-            out_shape=jax.ShapeDtypeStruct((local_num_tokens, hidden_size), t_dtype),
+            out_shape=(
+                jax.ShapeDtypeStruct((local_num_tokens, hidden_size), t_dtype),
+                jax.ShapeDtypeStruct(expert_counts_shape, jnp.int32),
+            ),
             grid_spec=pltpu.PrefetchScalarGridSpec(
                 num_scalar_prefetch=0,
                 in_specs=[
@@ -2722,7 +2763,10 @@ def fused_ep_moe(
                     None if w3_shared_scale is None else hbm_block_spec,  # w3_shared_scale_hbm
                     None if w2_shared_scale is None else hbm_block_spec,  # w2_shared_scale_hbm
                 ],
-                out_specs=pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),
+                out_specs=(
+                    pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),
+                    pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),  # expert_counts_hbm
+                ),
                 scratch_shapes=scratch_shapes,
             ),
             compiler_params=pltpu.CompilerParams(
@@ -2807,8 +2851,11 @@ def fused_ep_moe(
             None if w3_shared_scale is None else P(),  # w3_shared_scale
             None if w2_shared_scale is None else P(),  # w2_shared_scale
         ),
-        out_specs=P(
-            (dp_axis_name, tp_axis_name),
+        out_specs=(
+            P(
+                (dp_axis_name, tp_axis_name),
+            ),
+            P(None),
         ),
         check_vma=False,
     )
@@ -2835,7 +2882,7 @@ def fused_ep_moe(
         w3_shared_scale=None,
         w2_shared_scale=None,
     ):
-        local_output = fused_moe(
+        local_output, local_expert_counts = fused_moe(
             pltpu.with_memory_space_constraint(tokens, pltpu.HBM),  # tokens_hbm
             pltpu.with_memory_space_constraint(w1, pltpu.HBM),  # w1_hbm
             pltpu.with_memory_space_constraint(w2, pltpu.HBM),  # w2_hbm
@@ -2896,7 +2943,7 @@ def fused_ep_moe(
                 else pltpu.with_memory_space_constraint(w2_shared_scale, pltpu.HBM)
             ),
         )
-        return local_output
+        return local_output, local_expert_counts
 
     a2a_s_x2_hbm_scratch = pl.empty(
         (2, a2a_max_tokens_with_top_k, t_packing, hidden_size // t_packing), t_dtype

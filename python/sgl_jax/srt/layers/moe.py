@@ -541,6 +541,7 @@ class FusedEPMoE(nnx.Module):
         moe_shared_expert_intermediate_size: int | None = None,
         *,
         balanced_topk: bool = False,
+        a2a_only: bool = False,
     ):
         self.hidden_size = hidden_size
         self.num_experts = num_experts
@@ -562,6 +563,7 @@ class FusedEPMoE(nnx.Module):
         )
         self.balanced_topk = balanced_topk
         self.mesh = mesh
+        self.a2a_only = a2a_only
 
         if num_experts % self.ep_size != 0:
             raise ValueError(
@@ -636,6 +638,7 @@ class FusedEPMoE(nnx.Module):
         router_bias: jax.Array | None = None,
         *,
         block_config: FusedMoEBlockConfig | None = None,
+        a2a_only: bool = False,
     ) -> jax.Array:
         """
         Forward pass through the fused MoE layer.
@@ -658,7 +661,7 @@ class FusedEPMoE(nnx.Module):
         w3_shared_val = self.w3_shared.value if self.w3_shared is not None else None
         w2_shared_val = self.w2_shared.value if self.w2_shared is not None else None
 
-        output = fused_ep_moe(
+        output, expert_counts = fused_ep_moe(
             mesh=self.mesh,
             tokens=hidden_states,
             w1=self.w1.value,
@@ -688,7 +691,27 @@ class FusedEPMoE(nnx.Module):
             b3=None,
             dp_axis_name="data",
             tp_axis_name="tensor",
+            a2a_only=self.a2a_only,
         )
 
         output = jax.sharding.reshard(output, NamedSharding(self.mesh, P(None, None)))
-        return output
+        # 2. 对 output 进行 reshard
+        output = jax.sharding.reshard(output, NamedSharding(self.mesh, P(None, None)))
+
+        # 3. 处理 expert_counts
+        # 目前 expert_counts 的形状是 (num_bt, padded_num_experts)
+        # 如果你想评估负载，通常需要对所有 block 求和得到每个 Expert 的总负载
+        # 注意：由于 kernel 内部已经做了全网 All-Reduce，
+        # 所以每个 Device 上的 expert_counts 数据在逻辑上是全局同步后的
+        total_expert_counts = jnp.sum(expert_counts, axis=0)  # (padded_num_experts,)
+
+        # 如果 padded_num_experts 多于实际的 num_experts，截断它
+        total_expert_counts = total_expert_counts[: self.num_experts]
+
+        # 将 count 也 reshard 到一个确定的 sharding 上（通常是全复制 P() 方便后续分析）
+        jax.debug.print(
+            "total_expert_counts: {total_expert_counts}, hidden_states.shape: {shape}",
+            total_expert_counts=total_expert_counts,
+            shape=hidden_states.shape,
+        )
+        return output, total_expert_counts
