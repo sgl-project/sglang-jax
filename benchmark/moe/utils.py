@@ -37,8 +37,8 @@ class MoEBenchmarkCase:
 BAILING_BASE = dict(
     num_experts=256,
     top_k=8,
-    hidden_size=8192,
-    intermediate_size=2048,
+    hidden_size=2048,
+    intermediate_size=512,
     activation="silu",
     renormalize_topk_logits=True,
     num_expert_group=8,
