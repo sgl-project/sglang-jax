@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import math
+import os
 
 import jax
 import jax.numpy as jnp
@@ -53,6 +54,7 @@ def _estimate_vmem_bytes(
     dtype: jnp.dtype,
     cfg: FusedMoEBlockConfig,
     use_shared_expert: bool = False,
+    verbose: bool = False,
 ) -> int:
     """Rough VMEM estimate to avoid compile-time OOM (TPU VMEM is 64MB/core).
 
@@ -72,26 +74,26 @@ def _estimate_vmem_bytes(
     token_bytes = jnp.dtype(dtype).itemsize
     weight_bytes = token_bytes
 
-    local_num_tokens = case.num_tokens // case.ep_size
+    t_packing = _dtype_packing(dtype)
     padded_num_experts = ((case.num_experts + 127) // 128) * 128
-    output_bt = math.gcd(bt, local_num_tokens)
-    # With run_bt tiling, the a2a scratch only needs to cover one `output_bt` tile
-    # (across all EP devices), padded up to a multiple of `bts` for safe token staging.
-    a2a_max_tokens = ((output_bt * num_devices + bts - 1) // bts) * bts
+    padded_top_k = ((case.top_k + 127) // 128) * 128
+    # Kernel scratch shapes use bt directly.
+    # a2a_max_tokens = align_to(bt * num_devices, bts)
+    a2a_max_tokens = ((bt * num_devices + bts - 1) // bts) * bts
 
     # Output-side staging (no overlap):
-    # - a2a_g_acc_vmem: (1, top_k, acc_bt, hidden_size)
-    # - b_output: (1, output_bt, hidden_size)
-    acc_bt = math.gcd(output_bt, 8)  # Must match fused_moe kernel scratch shape.
+    # - a2a_g_acc_vmem: (1, top_k, gcd(bt, 16), t_packing, hidden_per_pack)
+    # - b_output_x2_vmem: (2, bt, hidden_size)
+    acc_bt = math.gcd(bt, 16)  # Must match fused_moe kernel scratch shape.
     a2a_g_acc = 1 * top_k * acc_bt * hidden * token_bytes
     # b_output_x2_vmem is double-buffered to overlap store(output_hbm) with next bt's compute.
-    b_output = 2 * output_bt * hidden * token_bytes
-    # b_gating_vmem is double-buffered for run_bt overlap.
-    b_gating = 2 * output_bt * padded_num_experts * token_bytes
+    b_output = 2 * bt * hidden * token_bytes
+    # b_gating_x2_vmem is double-buffered for run_bt overlap: (2, bt, padded_num_experts)
+    b_gating = 2 * bt * padded_num_experts * token_bytes
     # t2e_routing_smem scratch is placed in SMEM (not VMEM).
     t2e_routing = 0
-    # top_k_logits_vmem scratch: (output_bt, top_k) float32
-    top_k_logits = output_bt * top_k * 4
+    # top_k_logits_vmem scratch: (bt, top_k) float32
+    top_k_logits = bt * top_k * 4
 
     # See kernel scratch shapes: b_w1_x2_vmem/b_w3_x2_vmem/b_w2_x2_vmem.
     w1 = 2 * bd1 * bf * weight_bytes
@@ -107,17 +109,18 @@ def _estimate_vmem_bytes(
     a2a_s_acc_stage_b32 = 3 * bts * (bd2 // 2) * 4  # Approximation
 
     # Routing / top-k temporaries in kernel (best-effort conservative estimate):
-    # ... (Same as before)
-    padded_top_k = ((case.top_k + 127) // 128) * 128
-    routing_work_f32 = output_bt * padded_num_experts * 4
-    get_top_k_input_f32 = output_bt * padded_num_experts * 4
-    get_top_k_t2e = output_bt * padded_num_experts * 4
-    get_top_k_iota = output_bt * padded_num_experts * 4
-    get_top_k_mask = output_bt * padded_num_experts * 4
-    get_top_k_padded_iota = output_bt * padded_top_k * 4
-    get_top_k_t2e_routing = output_bt * padded_top_k * 4
-    get_top_k_logits_sum = output_bt * padded_top_k * 4
-    get_top_k_logits_lst = top_k * output_bt * padded_top_k * 4
+    # - softmax + get_top_k use float32 work buffers and broadcasted iotas
+    # - top_k logits are materialized as `top_k` arrays of shape (bt, padded_top_k)
+    # This is separate from `t2e_routing_smem` above.
+    routing_work_f32 = bt * padded_num_experts * 4  # softmax result (approx)
+    get_top_k_input_f32 = bt * padded_num_experts * 4
+    get_top_k_t2e = bt * padded_num_experts * 4
+    get_top_k_iota = bt * padded_num_experts * 4
+    get_top_k_mask = bt * padded_num_experts * 4
+    get_top_k_padded_iota = bt * padded_top_k * 4
+    get_top_k_t2e_routing = bt * padded_top_k * 4
+    get_top_k_logits_sum = bt * padded_top_k * 4
+    get_top_k_logits_lst = top_k * bt * padded_top_k * 4
     routing_temporaries = (
         routing_work_f32
         + get_top_k_input_f32
@@ -151,6 +154,48 @@ def _estimate_vmem_bytes(
         se_w2 = 2 * cfg.bse * bd2 * weight_bytes
         se_tokens = 2 * bt * hidden * token_bytes  # (2, bt, hidden)
         total_bytes += se_w1 + se_w3 + se_w2 + se_tokens
+
+    if verbose:
+
+        def _mb(b: int) -> str:
+            return f"{b / (1024 * 1024):.2f}"
+
+        print("    VMEM Breakdown:")
+        print(
+            f"      b_w1_x2_vmem:           {_mb(w1)} MB  (2, {t_packing}, {bd1 // t_packing}, {bf})"
+        )
+        print(
+            f"      b_w3_x2_vmem:           {_mb(w3)} MB  (2, {t_packing}, {bd1 // t_packing}, {bf})"
+        )
+        print(
+            f"      b_w2_x2_vmem:           {_mb(w2)} MB  (2, {t_packing}, {bf}, {bd2 // t_packing})"
+        )
+        print(f"      b_acc_vmem:             {_mb(b_acc)} MB  (2, {a2a_max_tokens}, 1, {bf}) f32")
+        print(f"      b_output_x2_vmem:       {_mb(b_output)} MB  (2, {bt}, {hidden})")
+        print(
+            f"      a2a_g_acc_vmem:         {_mb(a2a_g_acc)} MB  (1, {top_k}, {acc_bt}, {t_packing}, {hidden // t_packing})"
+        )
+        print(
+            f"      t_stage_x2_vmem:        {_mb(t_stage_b32)} MB  (2, {bts}, {t_packing}, {bd1 // t_packing})"
+        )
+        print(
+            f"      a2a_s_acc_stage_x3:     {_mb(a2a_s_acc_stage_b32)} MB  (3, {bts}, {t_packing}, {bd2 // t_packing})"
+        )
+        print(f"      b_gating_x2_vmem:       {_mb(b_gating)} MB  (2, {bt}, {padded_num_experts})")
+        print(f"      routing_temporaries:    {_mb(routing_temporaries)} MB")
+        if use_shared_expert:
+            print(
+                f"      b_se_w1_x2_vmem:        {_mb(se_w1)} MB  (2, {t_packing}, {bd1 // t_packing}, {bf})"
+            )
+            print(
+                f"      b_se_w3_x2_vmem:        {_mb(se_w3)} MB  (2, {t_packing}, {bd1 // t_packing}, {bf})"
+            )
+            print(
+                f"      b_se_w2_x2_vmem:        {_mb(se_w2)} MB  (2, {t_packing}, {bf}, {bd2 // t_packing})"
+            )
+            print(f"      b_se_tokens_vmem:       {_mb(se_tokens)} MB  (2, {bt}, {hidden})")
+        print("      ----------------------------")
+        print(f"      Total:                  {_mb(total_bytes)} MB")
 
     return total_bytes
 
@@ -326,6 +371,34 @@ def select_block_configs(
 
     if max_configs <= 0:
         raise ValueError(f"Expected {max_configs=} to be > 0.")
+
+    # Pareto-optimal filtering: remove configs that are dominated by others.
+    # A config is "dominated" if another config is >= in ALL dimensions and > in at least one.
+    # Since larger block sizes are generally more efficient, we keep only non-dominated configs.
+    def _config_tuple(c: FusedMoEBlockConfig) -> tuple[int, ...]:
+        return (c.bt, c.bts or c.bt, c.bf, c.bd1, c.bd2, c.btc, c.bfc, c.bd1c, c.bd2c)
+
+    def _dominates(a: tuple[int, ...], b: tuple[int, ...]) -> bool:
+        """Returns True if `a` dominates `b` (a >= b in all dims, a > b in at least one)."""
+        all_geq = all(x >= y for x, y in zip(a, b))
+        any_gt = any(x > y for x, y in zip(a, b))
+        return all_geq and any_gt
+
+    config_tuples = [_config_tuple(c) for c in configs]
+    non_dominated_indices: list[int] = []
+    for i, t_i in enumerate(config_tuples):
+        is_dominated = False
+        for j, t_j in enumerate(config_tuples):
+            if i != j and _dominates(t_j, t_i):
+                is_dominated = True
+                break
+        if not is_dominated:
+            non_dominated_indices.append(i)
+
+    pareto_configs = [configs[i] for i in non_dominated_indices]
+    print(f"  pareto filter: {len(configs)} valid configs -> {len(pareto_configs)} non-dominated")
+    configs = pareto_configs
+
     if len(configs) <= max_configs:
         return configs
 
@@ -528,6 +601,17 @@ def run_all(
                     case.intermediate_size if use_shared_expert else None
                 ),
                 a2a_only=a2a_only,
+                disable_a2a=os.getenv("FUSED_MOE_BENCHMARK_DISABLE_A2A", False),
+                disable_dynamic_ffn1=os.getenv("FUSED_MOE_BENCHMARK_DISABLE_DYNAMIC_FFN1", False),
+                disable_dynamic_ffn2=os.getenv("FUSED_MOE_BENCHMARK_DISABLE_DYNAMIC_FFN2", False),
+                disable_weight_load=os.getenv("FUSED_MOE_BENCHMARK_DISABLE_WEIGHT_LOAD", False),
+                disable_a2a_s_tile_read=os.getenv(
+                    "FUSED_MOE_BENCHMARK_DISABLE_A2A_S_TILE_READ", False
+                ),
+                disable_a2a_s_acc_tile_write=os.getenv(
+                    "FUSED_MOE_BENCHMARK_DISABLE_A2A_S_ACC_TILE_WRITE", False
+                ),
+                disable_shared_expert=os.getenv("FUSED_MOE_BENCHMARK_DISABLE_SHARED_EXPERT", False),
             )
 
             moe_def, moe_state = nnx.split(fused_layer)
@@ -547,6 +631,18 @@ def run_all(
                 else:
                     print(
                         f"  fused_moe blocks [{i+1}/{len(block_cfgs)}] -> {block_cfg.as_kwargs()}"
+                    )
+                    vmem_bytes = _estimate_vmem_bytes(
+                        case,
+                        dtype,
+                        block_cfg,
+                        use_shared_expert=use_shared_expert,
+                        verbose=True,
+                    )
+                    vmem_mb = vmem_bytes / (1024 * 1024)
+                    vmem_remaining_mb = 64.0 - vmem_mb
+                    print(
+                        f"    => VMEM: {vmem_mb:.2f} MB / 64 MB (remaining: {vmem_remaining_mb:.2f} MB)"
                     )
 
                 task = "fused-moe-k_.*"

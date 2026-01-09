@@ -418,7 +418,6 @@ class MoEImbalanceSimulator:
             raise ValueError(f"Unknown mode: {mode}")
 
         # 将概率转换为具体的 token 数量
-        print(f"{probs=}")
         counts = np.floor(probs * total_picks).astype(int)
         # 补齐因舍入导致的差值
         diff = total_picks - counts.sum()
@@ -434,17 +433,54 @@ class MoEImbalanceSimulator:
         根据目标 count 构造 router_logits。
         构造逻辑：为每个 token 分配 top_k 个专家，确保全局总数符合 counts。
         """
-        # 创建专家池，按 counts 数量填充专家 ID
-        expert_pool = []
-        for e_id, c in enumerate(counts):
-            expert_pool.extend([e_id] * c)
-        np.random.shuffle(expert_pool)
+        """
+        贪心策略逻辑：
+        1. 专家按负载从高到低排序 (Expert Descending)。
+        2. 遍历专家，每次优先挑选当前填充度最低的 Token (Token Ascending)。
+        """
+        counts = np.array(counts).astype(int)
+        total_slots = num_tokens * top_k
 
-        # 填充到 (num_tokens, top_k)
-        expert_pool = expert_pool[: num_tokens * top_k]
-        assignments = np.array(expert_pool).reshape(num_tokens, top_k)
+        # 基础校验与补偿
+        if counts.sum() != total_slots:
+            diff = total_slots - counts.sum()
+            counts[np.argmax(counts)] += diff
 
-        # 构造 logits: 被选中的专家给高分 (10.0), 未选中的给低分 (-10.0)
+        # assignments[token_id, slot_id]
+        assignments = np.full((num_tokens, top_k), -1, dtype=np.int32)
+        # 记录每个 token 已被分配了几个专家
+        token_fill_count = np.zeros(num_tokens, dtype=np.int32)
+
+        # 1. 专家遍历顺序：负载从多到少
+        expert_ids = np.argsort(counts)[::-1]
+
+        for e_id in expert_ids:
+            needed = int(counts[e_id])
+            if needed <= 0:
+                continue
+
+            # 2. 对 Token 进行排序：按当前填充数量从少到多
+            # argsort 会返回填充度最小的 token 的索引
+            sorted_token_indices = np.argsort(token_fill_count)
+
+            # 3. 选取前 needed 个 token 分配当前专家
+            # 在这种逻辑下，只要 hotspot_count >= top_k，就绝对不会报错
+            chosen_tokens = sorted_token_indices[:needed]
+
+            # 检查物理极限：如果选出的 token 里已经有满了的，说明参数设置不合理
+            if token_fill_count[chosen_tokens[-1]] >= top_k:
+                raise ValueError(
+                    f"分配失败：专家 {e_id} 需要分配给 Token，但最空的 Token 也已经填满了。\n"
+                    f"这通常是因为 top_k ({top_k}) 相对于热点专家数过多导致的。"
+                )
+
+            # 4. 执行填充
+            for t_id in chosen_tokens:
+                slot_idx = token_fill_count[t_id]
+                assignments[t_id, slot_idx] = e_id
+                token_fill_count[t_id] += 1
+
+        # 5. 构造 Logits (JAX 数组)
         logits = np.full((num_tokens, num_experts), -10.0, dtype=np.float32)
         row_indices = np.arange(num_tokens)[:, None]
         logits[row_indices, assignments] = 10.0

@@ -542,6 +542,13 @@ class FusedEPMoE(nnx.Module):
         *,
         balanced_topk: bool = False,
         a2a_only: bool = False,
+        disable_a2a: bool = False,
+        disable_dynamic_ffn1: bool = False,
+        disable_dynamic_ffn2: bool = False,
+        disable_weight_load: bool = False,
+        disable_a2a_s_tile_read: bool = False,
+        disable_a2a_s_acc_tile_write: bool = False,
+        disable_shared_expert: bool = False,
     ):
         self.hidden_size = hidden_size
         self.num_experts = num_experts
@@ -564,6 +571,13 @@ class FusedEPMoE(nnx.Module):
         self.balanced_topk = balanced_topk
         self.mesh = mesh
         self.a2a_only = a2a_only
+        self.disable_a2a = disable_a2a
+        self.disable_dynamic_ffn1 = disable_dynamic_ffn1
+        self.disable_dynamic_ffn2 = disable_dynamic_ffn2
+        self.disable_weight_load = disable_weight_load
+        self.disable_a2a_s_tile_read = disable_a2a_s_tile_read
+        self.disable_a2a_s_acc_tile_write = disable_a2a_s_acc_tile_write
+        self.disable_shared_expert = disable_shared_expert
 
         if num_experts % self.ep_size != 0:
             raise ValueError(
@@ -638,7 +652,6 @@ class FusedEPMoE(nnx.Module):
         router_bias: jax.Array | None = None,
         *,
         block_config: FusedMoEBlockConfig | None = None,
-        a2a_only: bool = False,
     ) -> jax.Array:
         """
         Forward pass through the fused MoE layer.
@@ -692,6 +705,13 @@ class FusedEPMoE(nnx.Module):
             dp_axis_name="data",
             tp_axis_name="tensor",
             a2a_only=self.a2a_only,
+            disable_a2a=self.disable_a2a,
+            disable_dynamic_ffn1=self.disable_dynamic_ffn1,
+            disable_dynamic_ffn2=self.disable_dynamic_ffn2,
+            disable_weight_load=self.disable_weight_load,
+            disable_a2a_s_tile_read=self.disable_a2a_s_tile_read,
+            disable_a2a_s_acc_tile_write=self.disable_a2a_s_acc_tile_write,
+            disable_shared_expert=self.disable_shared_expert,
         )
 
         output = jax.sharding.reshard(output, NamedSharding(self.mesh, P(None, None)))

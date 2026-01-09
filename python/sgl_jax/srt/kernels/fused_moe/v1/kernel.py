@@ -542,6 +542,13 @@ def _fused_ep_moe_kernel(
     bd2c: int,  # Compute size of block hidden_size.
     bse: int,  # Block size for SE intermediate_size.
     a2a_only: bool,
+    disable_a2a: bool,
+    disable_dynamic_ffn1: bool,
+    disable_dynamic_ffn2: bool,
+    disable_weight_load: bool,
+    disable_a2a_s_tile_read: bool,
+    disable_a2a_s_acc_tile_write: bool,
+    disable_shared_expert: bool,
 ):
     dp_rank = lax.axis_index(dp_axis_name)
     tp_rank = lax.axis_index(tp_axis_name)
@@ -839,6 +846,9 @@ def _fused_ep_moe_kernel(
         )
 
     def start_a2a_scatter(*, bt_sem_id, e_sem_id, local_e_id, bt_start):
+        if disable_a2a:
+            return
+
         # Counting the number of remote sends from the current device.
         # Use `lax.fori_loop` to avoid unrolling `bt` (huge MLIR / slow compile).
         def _scatter_one(
@@ -883,6 +893,8 @@ def _fused_ep_moe_kernel(
         a2a_s_sends_x2_smem[e_sem_id] = send_sz
 
     def wait_a2a_scatter_recv(*, bt_sem_id, e_sem_id, local_e_id):
+        if disable_a2a:
+            return
         e_id = my_id * local_num_experts + local_e_id
         sz = expert_sizes_x2_smem[bt_sem_id, 0, e_id]
         pltpu.make_async_copy(
@@ -892,6 +904,8 @@ def _fused_ep_moe_kernel(
         ).wait()
 
     def wait_a2a_scatter_send(e_sem_id):
+        if disable_a2a:
+            return
         sz = a2a_s_sends_x2_smem[e_sem_id]
         pltpu.make_async_copy(
             src_ref=a2a_s_x2_hbm.at[e_sem_id, pl.ds(0, sz)],
@@ -900,6 +914,8 @@ def _fused_ep_moe_kernel(
         ).wait()
 
     def start_a2a_gather(*, bt_sem_id, e_sem_id, local_e_id):
+        if disable_a2a:
+            return
         my_e_id = my_id * local_num_experts + local_e_id
         start = 0
         src_ref = a2a_s_acc_x2_hbm
@@ -925,6 +941,8 @@ def _fused_ep_moe_kernel(
             start += sz
 
     def wait_a2a_gather_send(*, bt_sem_id, e_sem_id, local_e_id):
+        if disable_a2a:
+            return
         my_e_id = my_id * local_num_experts + local_e_id
         sz = expert_sizes_x2_smem[bt_sem_id, 0, my_e_id]
         local_sz = d2e_count_x2_smem[bt_sem_id, my_id, 0, my_e_id]
@@ -942,6 +960,8 @@ def _fused_ep_moe_kernel(
         ).wait()
 
     def wait_a2a_gather_recv_all(*, bt_size):
+        if disable_a2a:
+            return
         # Align to f5b4: wait using a flat slice into `a2a_g_hbm` sized to the
         # total gathered token vectors for this bt tile (`top_k * bt_size`).
         sz = jnp.int32(bt_size * top_k)
@@ -963,6 +983,8 @@ def _fused_ep_moe_kernel(
             bias_copy.wait()
 
     def start_fetch_bw1(local_e_id, bw1_sem_id, bf_id, bd1_id):
+        if disable_weight_load:
+            return
         for p in range(t_packing):
             offset = p * h_per_t_packing + bd1_id * bd1_per_t_packing
             pltpu.make_async_copy(
@@ -1000,6 +1022,8 @@ def _fused_ep_moe_kernel(
                 ).start()
 
     def start_fetch_bw2(local_e_id, bw2_sem_id, bf_id, bd2_id):
+        if disable_weight_load:
+            return
         for p in range(t_packing):
             offset = p * h_per_t_packing + bd2_id * bd2_per_t_packing
             pltpu.make_async_copy(
@@ -1031,6 +1055,8 @@ def _fused_ep_moe_kernel(
                 ).start()
 
     def start_fetch_bw3(local_e_id, bw3_sem_id, bf_id, bd3_id):
+        if disable_weight_load:
+            return
         for p in range(t_packing):
             offset = p * h_per_t_packing + bd3_id * bd1_per_t_packing
             pltpu.make_async_copy(
@@ -1069,6 +1095,8 @@ def _fused_ep_moe_kernel(
 
     def wait_fetch_bw1(local_e_id, bw1_sem_id, bf_id, bd1_id):
         del local_e_id
+        if disable_weight_load:
+            return
         pltpu.make_async_copy(
             src_ref=b_w1_x2_vmem.at[bw1_sem_id],
             dst_ref=b_w1_x2_vmem.at[bw1_sem_id],
@@ -1092,6 +1120,8 @@ def _fused_ep_moe_kernel(
 
     def wait_fetch_bw2(local_e_id, bw2_sem_id, bf_id, bd2_id):
         del local_e_id
+        if disable_weight_load:
+            return
         pltpu.make_async_copy(
             src_ref=b_w2_x2_vmem.at[bw2_sem_id],
             dst_ref=b_w2_x2_vmem.at[bw2_sem_id],
@@ -1112,6 +1142,8 @@ def _fused_ep_moe_kernel(
 
     def wait_fetch_bw3(local_e_id, bw3_sem_id, bf_id, bd3_id):
         del local_e_id
+        if disable_weight_load:
+            return
         pltpu.make_async_copy(
             src_ref=b_w3_x2_vmem.at[bw3_sem_id],
             dst_ref=b_w3_x2_vmem.at[bw3_sem_id],
@@ -1132,25 +1164,6 @@ def _fused_ep_moe_kernel(
                     dst_ref=b_b3_x2_vmem.at[bf_id % 2],
                     sem=local_sems.at[bw3_sem_id, 3],
                 ).wait()
-
-    def start_fetch_next_bw(local_e_id, bw_sem_id, bf_id, bd1_id, bd2_id):
-        next_bd1_id = bd1_id + 1
-        next_bd2_id = bd2_id + 1
-        next_sem_id = (bw_sem_id + 1) % 2
-
-        if bf_id >= num_bf:
-            return
-        if next_bd1_id < num_bd1:
-            start_fetch_bw1(local_e_id, next_sem_id, bf_id, next_bd1_id)
-            start_fetch_bw3(local_e_id, next_sem_id, bf_id, next_bd1_id)
-        elif next_bd1_id == num_bd1:
-            start_fetch_bw2(local_e_id, next_sem_id, bf_id, 0)
-        elif next_bd2_id < num_bd2:
-            start_fetch_bw2(local_e_id, next_sem_id, bf_id, next_bd2_id)
-        elif next_bd2_id == num_bd2:
-            start_fetch_next_bw(local_e_id, bw_sem_id, bf_id + 1, -1, -1)
-        else:
-            raise RuntimeError("Unreachable")
 
     def start_fetch_se_tokens(bt_id):
         if w1_shared_hbm is None:
@@ -1513,7 +1526,7 @@ def _fused_ep_moe_kernel(
         dyn_sz = expert_sizes_x2_smem[bt_sem_id, 0, e_id]
         dyn_sz_i32 = dyn_sz.astype(jnp.int32)
 
-        bd1_per_t_packing = bd1 // t_packing
+        # bd1_per_t_packing = bd1 // t_packing
         bd2_per_t_packing = bd2 // t_packing
         # Stage tokens in bt-sized tiles from HBM -> VMEM (to reduce staging frequency),
         # while keeping `btc` as the inner compute block size.
@@ -1521,6 +1534,8 @@ def _fused_ep_moe_kernel(
         num_token_tiles = (dyn_sz_i32 + (token_tile - 1)) // token_tile
 
         def start_stage_a2a_s_tile_from_hbm(tile_start, bd1_id, buf_id):
+            if disable_a2a_s_tile_read:
+                return
             pltpu.make_async_copy(
                 src_ref=a2a_s_x2_hbm.at[
                     e_sem_id,
@@ -1538,6 +1553,8 @@ def _fused_ep_moe_kernel(
             ).start()
 
         def wait_stage_a2a_s_tile(buf_id):
+            if disable_a2a_s_tile_read:
+                return
             pltpu.make_async_copy(
                 src_ref=t_stage_x2_vmem.at[buf_id, pl.ds(0, token_tile)],
                 dst_ref=t_stage_x2_vmem.at[buf_id, pl.ds(0, token_tile)],
@@ -1545,6 +1562,8 @@ def _fused_ep_moe_kernel(
             ).wait()
 
         def start_load_stage_a2a_s_acc_tile_from_hbm(tile_start, bd2_start, buf_id):
+            if disable_a2a_s_acc_tile_write:
+                return
             pltpu.make_async_copy(
                 src_ref=a2a_s_acc_x2_hbm.at[
                     e_sem_id,
@@ -1562,6 +1581,8 @@ def _fused_ep_moe_kernel(
             ).start()
 
         def wait_stage_a2a_s_acc_tile(buf_id):
+            if disable_a2a_s_acc_tile_write:
+                return
             pltpu.make_async_copy(
                 src_ref=a2a_s_acc_stage_x3_vmem.at[
                     buf_id,
@@ -1575,6 +1596,8 @@ def _fused_ep_moe_kernel(
             ).wait()
 
         def start_store_stage_a2a_s_acc_tile_to_hbm(tile_start, bd2_start, buf_id):
+            if disable_a2a_s_acc_tile_write:
+                return
             pltpu.make_async_copy(
                 src_ref=a2a_s_acc_stage_x3_vmem.at[
                     buf_id,
@@ -1662,6 +1685,9 @@ def _fused_ep_moe_kernel(
                             start_stage_a2a_s_tile_from_hbm(next_start, bd1_id, next_buf_id)
 
                         wait_stage_a2a_s_tile(token_buf_id)
+
+                        if disable_dynamic_ffn1:
+                            return next_buf_id
 
                         tile_sz = jnp.maximum(jnp.minimum(dyn_sz_i32 - tile_start, token_tile), 0)
                         dynamic_ffn1(
@@ -1796,6 +1822,12 @@ def _fused_ep_moe_kernel(
                             @pl.when(token_tile_id >= 3)
                             def _(buf_compute=buf_compute):
                                 wait_stage_a2a_s_acc_tile(buf_compute)
+
+                        if disable_dynamic_ffn2:
+                            start_store_stage_a2a_s_acc_tile_to_hbm(
+                                tile_start, bd2_start, buf_compute
+                            )
+                            return (buf_load, buf_compute, buf_store)
 
                         dynamic_ffn2(
                             acc1_vmem=b_acc1_vmem.at[pl.ds(tile_start, token_tile)],
@@ -1933,6 +1965,9 @@ def _fused_ep_moe_kernel(
         return s.squeeze(-2)
 
     def run_shared_expert_slice(block_id, bt_sem_id, out_buf_id):
+        if disable_shared_expert:
+            return
+        
         if w1_shared_hbm is None:
             return
 
@@ -2080,7 +2115,6 @@ def _fused_ep_moe_kernel(
             starts=expert_starts,
             sizes=expert_sizes,
         )
-        # copy_expert_size(bt_sem_id, bt_id)
         sync_barrier()
 
         wait_store_output(bt_id=bt_id - 2)
@@ -2164,7 +2198,6 @@ def _fused_ep_moe_kernel(
     # Drain outstanding output stores (matches epic wait_send_bo for last two bts).
     wait_store_output(bt_id=jnp.int32(num_bt - 2))
     wait_store_output(bt_id=jnp.int32(num_bt - 1))
-    # wait_copy_expert_size()
 
     ### ------- Kernel end ------- ###
 
@@ -2398,6 +2431,13 @@ def _validate_fused_ep_moe_args(
         "tp_axis_name",
         "balanced_topk",
         "a2a_only",
+        "disable_a2a",
+        "disable_dynamic_ffn1",
+        "disable_dynamic_ffn2",
+        "disable_weight_load",
+        "disable_a2a_s_tile_read",
+        "disable_a2a_s_acc_tile_write",
+        "disable_shared_expert",
     ],
 )
 def fused_ep_moe(
@@ -2440,6 +2480,13 @@ def fused_ep_moe(
     dp_axis_name: str = "data",
     tp_axis_name: str = "tensor",
     a2a_only: bool = False,
+    disable_a2a: bool = False,
+    disable_dynamic_ffn1: bool = False,
+    disable_dynamic_ffn2: bool = False,
+    disable_weight_load: bool = False,
+    disable_a2a_s_tile_read: bool = False,
+    disable_a2a_s_acc_tile_write: bool = False,
+    disable_shared_expert: bool = False,
 ):
 
     ep_size = get_ep_size(mesh, dp_axis_name, tp_axis_name)
@@ -2732,6 +2779,13 @@ def fused_ep_moe(
                 bd2c=block_config.bd2c,
                 bse=block_config.bse,
                 a2a_only=a2a_only,
+                disable_a2a=disable_a2a,
+                disable_dynamic_ffn1=disable_dynamic_ffn1,
+                disable_dynamic_ffn2=disable_dynamic_ffn2,
+                disable_weight_load=disable_weight_load,
+                disable_a2a_s_tile_read=disable_a2a_s_tile_read,
+                disable_a2a_s_acc_tile_write=disable_a2a_s_acc_tile_write,
+                disable_shared_expert=disable_shared_expert,
             ),
             out_shape=(
                 jax.ShapeDtypeStruct((local_num_tokens, hidden_size), t_dtype),
