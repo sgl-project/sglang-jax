@@ -156,12 +156,7 @@ def _estimate_vmem_bytes(
 
         # 2. SE Tokens Buffer (b_se_tokens_vmem) -> (2, bt, hidden)
         se_tokens = 2 * bt * hidden * token_bytes
-
-        # 3. SE Accumulator (b_se_acc, usually accumulates into output or temp float buffer)
-        # In the kernel: (None if w1_shared is None else pltpu.VMEM((2, block_config.bt, hidden_size), jnp.float32))
-        se_acc = 2 * bt * hidden * 4  # Float32 accumulation buffer
-
-        total_bytes += se_w1 + se_w3 + se_w2 + se_tokens + se_acc
+        total_bytes += se_w1 + se_w3 + se_w2 + se_tokens
 
     return total_bytes
 
