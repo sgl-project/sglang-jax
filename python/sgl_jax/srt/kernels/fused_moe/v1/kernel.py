@@ -539,7 +539,7 @@ def _fused_ep_moe_kernel(
     assert b_output_x2_vmem.shape[1] == bt, (b_output_x2_vmem.shape[1], bt)
     assert local_num_tokens % bt == 0, (local_num_tokens, bt)
     num_bt = local_num_tokens // bt
-    a2a_max_tokens = a2a_s_x2_hbm.shape[1]
+    a2a_max_tokens = a2a_s_acc_x2_hbm.shape[1]
     right_id = (my_id + 1) % num_devices
     num_experts = a2a_g_hbm.shape[0]
     padded_num_experts = d2e_count_x2_smem.shape[-1]
