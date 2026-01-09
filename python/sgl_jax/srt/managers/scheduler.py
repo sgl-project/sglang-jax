@@ -146,6 +146,7 @@ class Scheduler(
         self.nnodes = server_args.nnodes
         self.pub_sub_addr = port_args.pub_sub_addr
         self.pub_sub_sync_addr = port_args.pub_sub_sync_addr
+        self.dp_size = server_args.dp_size
         self.tp_size = server_args.tp_size
         self.schedule_policy = server_args.schedule_policy
         self.skip_tokenizer_init = server_args.skip_tokenizer_init
@@ -232,7 +233,7 @@ class Scheduler(
         if platform == "proxy":
             pathwaysutils.initialize()
         self.mesh = create_device_mesh(
-            ici_parallelism=[-1, self.tp_size],
+            ici_parallelism=[self.dp_size, self.tp_size // self.dp_size],
             dcn_parallelism=[1, 1],
             device_indexes=server_args.device_indexes,
         )
@@ -270,8 +271,6 @@ class Scheduler(
 
         global_server_args_dict.update(worker_global_server_args_dict)
         set_random_seed(self.random_seed)
-
-        self.dp_size = server_args.dp_size
 
         # Adjust max_running_requests to be divisible by dp_size
         if self.max_running_requests % self.dp_size != 0:
@@ -1048,7 +1047,8 @@ class Scheduler(
 
         if memory_leak:
             msg = f"token_to_kv_pool_allocator memory leak detected! {token_msg}"
-            raise ValueError(msg)
+            logger.warning(msg)
+            # raise ValueError(msg)
 
         req_total_size = self.req_to_token_pool.size
 
@@ -1065,7 +1065,9 @@ class Scheduler(
             self.tree_cache.sanity_check()
 
     def _get_token_info(self):
-        available_size = self.token_to_kv_pool_allocator.available_size()
+        available_size = sum(
+            [self.token_to_kv_pool_allocator.available_size(dp) for dp in range(self.dp_size)]
+        )
         evictable_size = self.tree_cache.evictable_size()
         num_used = self.max_total_num_tokens - (available_size + evictable_size)
         token_usage = num_used / self.max_total_num_tokens

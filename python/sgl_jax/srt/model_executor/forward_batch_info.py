@@ -271,7 +271,7 @@ class ForwardBatch:
                 batch.extend_seq_lens,
             ),
             sharding=(
-                NamedSharding(model_runner.mesh, PartitionSpec())
+                NamedSharding(model_runner.mesh, PartitionSpec("data"))
                 if jax.process_count() == 1
                 else None
             ),
@@ -289,7 +289,7 @@ class ForwardBatch:
                     batch.lora_ranks,
                 ),
                 sharding=(
-                    NamedSharding(model_runner.mesh, PartitionSpec())
+                    NamedSharding(model_runner.mesh, PartitionSpec("data"))
                     if jax.process_count() == 1
                     else None
                 ),

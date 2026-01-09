@@ -103,7 +103,7 @@ class ModelWorkerClient:
             # Resolve future tokens in the input
             input_ids = model_worker_batch.forward_batch.input_ids
             model_worker_batch.forward_batch.input_ids = resolve_future_token_ids(
-                input_ids, self.future_token_ids_map
+                input_ids, self.future_token_ids_map, self.mesh
             )
 
             # Run forward
@@ -122,6 +122,7 @@ class ModelWorkerClient:
                 self.future_token_ids_map,
                 future_token_ids_ct,
                 next_token_ids,
+                self.mesh,
             )
             self.output_queue.put((None, logits_output, next_token_ids, cache_miss_count))
 
