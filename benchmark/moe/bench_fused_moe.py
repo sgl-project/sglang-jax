@@ -479,10 +479,8 @@ def run_all(
                 layer_id=0,
                 renormalize_topk_logits=case.renormalize_topk_logits,
                 balanced_topk=balanced_topk,
-                # [New] Pass feature flags to the Layer (assuming Layer support)
-                num_expert_group=case.num_expert_group if use_grouped_topk else 1,
+                num_groups=case.num_expert_group if use_grouped_topk else 1,
                 topk_group=case.topk_group if use_grouped_topk else 1,
-                # Assuming FusedEPMoE uses a param like 'shared_expert_intermediate_size' to toggle SE
                 shared_expert_intermediate_size=(
                     case.intermediate_size if use_shared_expert else None
                 ),
