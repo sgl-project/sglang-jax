@@ -158,6 +158,7 @@ class ModelRunner:
             server_args.max_running_requests,
             server_args.max_total_tokens,
             total_device_memory,
+            dp_size=server_args.dp_size,
         )
 
     def initialize_jit(self):
@@ -328,6 +329,7 @@ class ModelRunner:
         max_num_reqs: int | None = None,
         max_total_tokens: int | None = None,
         total_device_memory: int | None = None,
+        dp_size: int = 1,
     ):
         """Initialize memory pool for KV cache."""
         # Set KV cache data type
@@ -442,11 +444,13 @@ class ModelRunner:
                         self.full_max_total_num_tokens,
                         self.swa_max_total_num_tokens,
                         kvcache=self.token_to_kv_pool,
+                        dp_size=dp_size,
                     )
                 else:
                     self.token_to_kv_pool_allocator = TokenToKVPoolAllocator(
                         size=self.max_total_num_tokens,
                         kvcache=self.token_to_kv_pool,
+                        dp_size=dp_size,
                     )
             else:
                 assert not self.is_hybrid
@@ -455,6 +459,7 @@ class ModelRunner:
                     page_size=self.page_size,
                     kvcache=self.token_to_kv_pool,
                     debug_mode=False,
+                    dp_size=dp_size,
                 )
 
     def init_attention_backend(self):

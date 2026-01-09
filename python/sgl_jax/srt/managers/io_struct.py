@@ -129,6 +129,8 @@ class TokenizedGenerateReqInput:
     lora_id: str | None = None  # None means just use the base model
     # Extra key for cache namespace isolation (e.g., cache_salt, lora_id)
     extra_key: str | None = None
+    # The data parallel rank for this request
+    dp_rank: int | None = None
 
 
 @dataclass
