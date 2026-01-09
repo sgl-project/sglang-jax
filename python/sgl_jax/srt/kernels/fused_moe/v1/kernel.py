@@ -2499,7 +2499,8 @@ def fused_ep_moe(
     # With run_bt tiling in the pallas kernel, a2a scratch only needs to cover one bt tile.
     # TODO: FIXME(prayer): kernel Anomalies error temporary solution
     # After a detailed investigation of a2a, this topk multiplication needs to be removed
-    a2a_max_tokens = align_to(bt * num_devices * top_k, block_config.bts)
+    a2a_max_tokens = align_to(bt * num_devices, block_config.bts)
+    a2a_max_tokens_with_top_k = align_to(bt * num_devices * top_k, block_config.bts)
     bd1_per_pack = block_config.bd1 // t_packing
     bd2_per_pack = block_config.bd2 // t_packing
 
@@ -2898,7 +2899,7 @@ def fused_ep_moe(
         return local_output
 
     a2a_s_x2_hbm_scratch = pl.empty(
-        (2, a2a_max_tokens, t_packing, hidden_size // t_packing), t_dtype
+        (2, a2a_max_tokens_with_top_k, t_packing, hidden_size // t_packing), t_dtype
     )
     a2a_s_acc_x2_hbm_scratch = pl.empty(
         (2, a2a_max_tokens, t_packing, hidden_size // t_packing), t_dtype
