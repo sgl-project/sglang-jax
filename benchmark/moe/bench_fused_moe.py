@@ -480,8 +480,9 @@ def run_all(
                 renormalize_topk_logits=case.renormalize_topk_logits,
                 balanced_topk=balanced_topk,
                 num_groups=case.num_expert_group if use_grouped_topk else 1,
-                topk_group=case.topk_group if use_grouped_topk else 1,
-                shared_expert_intermediate_size=(
+                top_k_groups=case.topk_group if use_grouped_topk else 1,
+                num_shared_experts=1 if use_shared_expert else 0,
+                moe_shared_expert_intermediate_size=(
                     case.intermediate_size if use_shared_expert else None
                 ),
             )
