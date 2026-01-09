@@ -263,14 +263,14 @@ class ModelRunner:
 
         # Apply quantization if quantization config is set
         if self.model_config.quantization_config is not None:
+            # Apply MoE quantization first (before QWIX, so scales are set when QWIX runs model)
+            if self.model_config.quantization_config.has_moe_quantization():
+                self.model = apply_moe_quantization(self.model_config, self.model)
+
             # Apply qwix quantization for dense layers
             qwix_rules = self.model_config.quantization_config.get_qwix_rules()
             if qwix_rules:
                 self.model = apply_qwix_quantization(self.model_config, self.model, self)
-
-            # Apply MoE quantization for expert layers
-            if self.model_config.quantization_config.has_moe_quantization():
-                self.model = apply_moe_quantization(self.model_config, self.model)
 
         # Parse other args
         self.sliding_window_size = self.model_config.sliding_window

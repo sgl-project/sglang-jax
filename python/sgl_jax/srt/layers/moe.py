@@ -307,10 +307,10 @@ class EPMoE(nnx.Module):
             self.wo.value = wo_value
 
             # Update scales (reshape to 4D for GMM kernel)
-            # Wrap with nnx.Param since these were initialized as None (static attributes)
-            self.wi_0_scale = nnx.Param(w0_scale.reshape(w0_scale.shape[0], 1, 1, w0_scale.shape[1]))
-            self.wi_1_scale = nnx.Param(w1_scale.reshape(w1_scale.shape[0], 1, 1, w1_scale.shape[1]))
-            self.wo_scale = nnx.Param(wo_scale.reshape(wo_scale.shape[0], 1, 1, wo_scale.shape[1]))
+            # Wrap with nnx.data() to override static attribute status
+            self.wi_0_scale = nnx.data(w0_scale.reshape(w0_scale.shape[0], 1, 1, w0_scale.shape[1]))
+            self.wi_1_scale = nnx.data(w1_scale.reshape(w1_scale.shape[0], 1, 1, w1_scale.shape[1]))
+            self.wo_scale = nnx.data(wo_scale.reshape(wo_scale.shape[0], 1, 1, wo_scale.shape[1]))
 
     def __call__(self, hidden_states, topk_weights, topk_ids) -> jax.Array:
         # Activation quantization is now handled per-GEMM inside _gmm_compute
@@ -322,13 +322,10 @@ class EPMoE(nnx.Module):
             topk_weights_reshard = jax.sharding.reshard(topk_weights, P(None))
             topk_ids_reshard = jax.sharding.reshard(topk_ids, P(None))
 
-            # Extract scale values - scales are nnx.Param after quantize_weights(), else None
-            if self.wi_0_scale is not None:
-                w0_scale = self.wi_0_scale.value
-                w1_scale = self.wi_1_scale.value
-                wo_scale = self.wo_scale.value
-            else:
-                w0_scale = w1_scale = wo_scale = None
+            # Scales are raw arrays after quantize_weights() (via nnx.data), else None
+            w0_scale = self.wi_0_scale
+            w1_scale = self.wi_1_scale
+            wo_scale = self.wo_scale
 
             result = shard_map(
                 self._forward,
