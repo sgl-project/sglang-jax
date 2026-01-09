@@ -2,7 +2,7 @@
 Benchmark fused_moe kernel with grouped-GEMM-like MoE shapes.
 
 Usage:
-    python -m benchmark.moe.bench_fused_moe [--tune-block-config]
+    python -m benchmark.moe.bench_fused_moe [--tune-block-config] --config-mode [base|mini|all] [--use-shared-expert]
 """
 
 from __future__ import annotations
@@ -18,6 +18,9 @@ from jax.experimental.compilation_cache import compilation_cache as _compilation
 
 from benchmark.moe.utils import (
     BAILING_BASE,
+    BASE_CASES,
+    GROUP_GEMM_CASES,
+    MINI_CASES,
     MoEBenchmarkCase,
     build_mesh,
     prepare_fused_moe_inputs,
@@ -43,7 +46,12 @@ def _dtype_packing(dtype: jnp.dtype) -> int:
     return 32 // bits
 
 
-def _estimate_vmem_bytes(case: MoEBenchmarkCase, dtype: jnp.dtype, cfg: FusedMoEBlockConfig) -> int:
+def _estimate_vmem_bytes(
+    case: MoEBenchmarkCase,
+    dtype: jnp.dtype,
+    cfg: FusedMoEBlockConfig,
+    use_shared_expert: bool = False,
+) -> int:
     """Rough VMEM estimate to avoid compile-time OOM (TPU VMEM is 64MB/core).
 
     Note: this intentionally overestimates a bit because the fused_moe kernel
@@ -122,8 +130,7 @@ def _estimate_vmem_bytes(case: MoEBenchmarkCase, dtype: jnp.dtype, cfg: FusedMoE
         + get_top_k_logits_lst
     )
 
-    # Skip optional scale/bias buffers (unused in this benchmark).
-    return (
+    total_bytes = (
         a2a_g_acc
         + b_output
         + b_gating
@@ -138,6 +145,26 @@ def _estimate_vmem_bytes(case: MoEBenchmarkCase, dtype: jnp.dtype, cfg: FusedMoE
         + routing_temporaries
     )
 
+    if use_shared_expert:
+        # 1. SE Weights Double Buffering (b_se_w*_x2_vmem)
+        # shape: (2, t_packing, bd/pack, bf)
+        # NOTE: bd and bf here refer to block sizes, se_inter usage depends on total blocks
+        # but scratch is fixed size by bd/bf.
+        se_w1 = 2 * bd1 * bf * weight_bytes
+        se_w3 = 2 * bd1 * bf * weight_bytes
+        se_w2 = 2 * bf * bd2 * weight_bytes
+
+        # 2. SE Tokens Buffer (b_se_tokens_vmem) -> (2, bt, hidden)
+        se_tokens = 2 * bt * hidden * token_bytes
+
+        # 3. SE Accumulator (b_se_acc, usually accumulates into output or temp float buffer)
+        # In the kernel: (None if w1_shared is None else pltpu.VMEM((2, block_config.bt, hidden_size), jnp.float32))
+        se_acc = 2 * bt * hidden * 4  # Float32 accumulation buffer
+
+        total_bytes += se_w1 + se_w3 + se_w2 + se_tokens + se_acc
+
+    return total_bytes
+
 
 def select_block_configs(
     case: MoEBenchmarkCase,
@@ -149,6 +176,7 @@ def select_block_configs(
     bd_candidates: list[int],
     tpu_vmem_budget_bytes: int,
     max_configs: int,
+    use_shared_expert: bool = False,
 ) -> list[FusedMoEBlockConfig]:
     """Enumerate block configs from the explicit candidate lists.
 
@@ -165,10 +193,6 @@ def select_block_configs(
         candidates: list[int],
         multiple_of: int,
     ) -> list[int]:
-        # Keep this strictly "what you see is what you get":
-        # - Do not filter by the current case shape here.
-        # - Let `FusedMoEBlockConfig.effective_for(...)` apply kernel overrides
-        #   (notably clamping `bt` for small local token counts), then validate.
         out: list[int] = []
         for v in candidates:
             if v <= 0:
@@ -181,9 +205,6 @@ def select_block_configs(
     bt_candidates = _pick_candidates(candidates=bt_candidates, multiple_of=t_packing)
     bts_candidates_i: list[int] | None
     if bts_candidates is None:
-        # Default: explore bts <= bt (not forced equal to bt). This lets tuning
-        # keep `bt` large for routing/output while shrinking the inner staging
-        # tile to fit VMEM.
         bts_candidates_i = None
     else:
         bts_candidates_i = _pick_candidates(candidates=list(bts_candidates), multiple_of=t_packing)
@@ -191,8 +212,6 @@ def select_block_configs(
     bd_candidates = _pick_candidates(candidates=bd_candidates, multiple_of=tile_align)
 
     def default_bts_for_bt(bt: int) -> list[int]:
-        # Heuristic: powers-of-two ladder (bt, bt/2, bt/4, ...) down to t_packing.
-        # Keeps the candidate set small and predictable.
         out: list[int] = []
         v = bt
         while v >= t_packing:
@@ -216,7 +235,6 @@ def select_block_configs(
 
         if bt <= 0 or bf <= 0 or bd1 <= 0 or bd2 <= 0:
             return False, "non-positive tile size"
-        # bt/bts are per-core tile sizes; local_num_tokens is the per-core token count.
         if bt > local_num_tokens:
             return False, f"bt({bt}) > local_num_tokens({local_num_tokens})"
         if bt % t_packing != 0:
@@ -253,8 +271,8 @@ def select_block_configs(
         if bd1 % bd1c != 0 or bd2 % bd2c != 0:
             return False, f"bd1({bd1}) % bd1c({bd1c}) != 0 or bd2({bd2}) % bd2c({bd2c}) != 0"
 
-        # TPU VMEM is 64MB per core; exceeding it is a compile-time OOM.
-        est = _estimate_vmem_bytes(case, dtype, cfg)
+        # Pass use_shared_expert to estimate correct VMEM
+        est = _estimate_vmem_bytes(case, dtype, cfg, use_shared_expert=use_shared_expert)
         if est > tpu_vmem_budget_bytes:
             return (
                 False,
@@ -315,9 +333,7 @@ def select_block_configs(
     if len(configs) <= max_configs:
         return configs
 
-    # Keep benchmark runtime bounded while retaining coverage across (btc, bf, bd).
     def score(c: FusedMoEBlockConfig) -> tuple[int, int, int, int, int, int, int, int, int]:
-        # Lexicographic "weighted" ranking; larger tiles tend to run faster.
         return (c.bt, c.bts or c.bt, c.bf, c.bd1, c.bd2, c.btc, c.bfc, c.bd1c, c.bd2c)
 
     selected: list[FusedMoEBlockConfig] = []
@@ -353,9 +369,13 @@ def run_all(
     num_tokens: list[int] | None = None,
     tpu_vmem_budget_bytes: int = DEFAULT_TPU_VMEM_BUDGET_BYTES,
     max_configs: int = 9,
+    config_mode: str = "base",
+    use_shared_expert: bool = False,
+    use_grouped_topk: bool = False,
 ) -> None:
     raw_cases: list[MoEBenchmarkCase] | None = None
     if num_tokens is not None:
+        # If num_tokens is explicit, use base config as template
         raw_cases = [
             MoEBenchmarkCase(
                 name=(
@@ -367,13 +387,19 @@ def run_all(
             )
             for n in num_tokens
         ]
+    else:
+        if config_mode == "base":
+            raw_cases = BASE_CASES
+        elif config_mode == "mini":
+            raw_cases = MINI_CASES
+        elif config_mode == "all":
+            raw_cases = GROUP_GEMM_CASES
+        else:
+            raise ValueError(f"Unknown config_mode: {config_mode}")
+
     cases_all = list(select_cases(raw_cases))
     cases: list[MoEBenchmarkCase] = []
     for c in cases_all:
-        # Fused MoE benchmark currently assumes TP is disabled (tp_size=1).
-        # For small num_tokens (e.g. decode shapes), select_cases may pick a smaller
-        # ep_size so that tokens can be evenly sharded; that implies tp_size>1 when
-        # device_count is larger. Skip such cases to keep results comparable.
         if c.tp_size != 1:
             print(
                 f"skip [case={c.name}] because tp_size={c.tp_size} (require tp_size=1 for fused_moe)"
@@ -391,6 +417,9 @@ def run_all(
     balanced_topk = True
     print(f"Running fused_moe benchmarks with dtype={dtype}")
     print("  mode: balanced_topk=True (deterministic cyclic routing)")
+    print(f"  config_mode: {config_mode}")
+    print(f"  features: shared_expert={use_shared_expert}, grouped_topk={use_grouped_topk}")
+
     for case in cases:
         t_packing = _dtype_packing(dtype)
         mesh = build_mesh(ep_size=case.ep_size, tp_size=case.tp_size)
@@ -412,7 +441,14 @@ def run_all(
             f"  mesh: ep_size={case.ep_size}, tp_size={case.tp_size}, "
             f"devices_used={case.ep_size * case.tp_size}/{len(jax.devices())}"
         )
-        data = prepare_fused_moe_inputs(case, dtype=dtype, mesh=mesh, include_weights=False)
+        data = prepare_fused_moe_inputs(
+            case,
+            dtype=dtype,
+            mesh=mesh,
+            include_weights=False,
+            include_shared_expert=use_shared_expert,
+        )
+
         block_cfgs: list[FusedMoEBlockConfig | None]
         if tune_block_config:
             block_cfgs = select_block_configs(
@@ -424,6 +460,7 @@ def run_all(
                 bd_candidates=bd_candidates or [256, 512, 1024, 2048, 4096, 8192],
                 tpu_vmem_budget_bytes=tpu_vmem_budget_bytes,
                 max_configs=max_configs,
+                use_shared_expert=use_shared_expert,
             )
         else:
             block_cfgs = [None]
@@ -442,6 +479,13 @@ def run_all(
                 layer_id=0,
                 renormalize_topk_logits=case.renormalize_topk_logits,
                 balanced_topk=balanced_topk,
+                # [New] Pass feature flags to the Layer (assuming Layer support)
+                num_expert_group=case.num_expert_group if use_grouped_topk else 1,
+                topk_group=case.topk_group if use_grouped_topk else 1,
+                # Assuming FusedEPMoE uses a param like 'shared_expert_intermediate_size' to toggle SE
+                shared_expert_intermediate_size=(
+                    case.intermediate_size if use_shared_expert else None
+                ),
             )
 
             moe_def, moe_state = nnx.split(fused_layer)
@@ -495,8 +539,6 @@ def run_all(
                         warmup=warmup_iters,
                     )
                 except ValueError as e:
-                    # Guard against shape constraints enforced by the fused kernel
-                    # (e.g. local_num_tokens alignment to dtype packing).
                     print(f"SKIP fused_moe blocks [{i+1}/{len(block_cfgs)}], reason: {e}")
                     continue
                 if len(times) > 1:
@@ -626,6 +668,24 @@ def parse_args() -> argparse.Namespace:
         default=9,
         help="Maximum number of block configs to benchmark per case when --tune-block-config is set.",
     )
+    # [New] Feature flags
+    parser.add_argument(
+        "--config-mode",
+        type=str,
+        default="base",
+        choices=["base", "mini", "all"],
+        help="Select which set of benchmark cases to run (default: base).",
+    )
+    parser.add_argument(
+        "--use-grouped-topk",
+        action="store_true",
+        help="Enable grouped top-k routing logic.",
+    )
+    parser.add_argument(
+        "--use-shared-expert",
+        action="store_true",
+        help="Enable shared expert logic (allocates extra VMEM buffers).",
+    )
     return parser.parse_args()
 
 
@@ -645,4 +705,7 @@ if __name__ == "__main__":
         num_tokens=args.num_tokens,
         tpu_vmem_budget_bytes=tpu_vmem_budget_bytes,
         max_configs=args.max_configs,
+        config_mode=args.config_mode,
+        use_shared_expert=args.use_shared_expert,
+        use_grouped_topk=args.use_grouped_topk,
     )

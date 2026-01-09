@@ -37,19 +37,30 @@ class MoEBenchmarkCase:
 BAILING_BASE = dict(
     num_experts=256,
     top_k=8,
+    hidden_size=8192,
+    intermediate_size=2048,
+    activation="silu",
+    renormalize_topk_logits=True,
+    num_expert_group=8,
+    topk_group=4,
+    ep_size=None,
+)
+
+BAILING_MINI = dict(
+    num_experts=256,
+    top_k=8,
     hidden_size=2048,
     intermediate_size=512,
     activation="silu",
     renormalize_topk_logits=True,
     num_expert_group=8,
     topk_group=4,
-    # Let benchmarks pick ep_size based on available devices by default.
     ep_size=None,
 )
 
 _NUM_TOKENS = (16, 32, 64, 128, 256, 512, 1024, 2048, 4096)
 
-GROUP_GEMM_CASES: Iterable[MoEBenchmarkCase] = tuple(
+BASE_CASES: Iterable[MoEBenchmarkCase] = tuple(
     MoEBenchmarkCase(
         name=f"bailing_nt{n}_ne256_tk8_h8192_i2048",
         num_tokens=n,
@@ -57,6 +68,17 @@ GROUP_GEMM_CASES: Iterable[MoEBenchmarkCase] = tuple(
     )
     for n in _NUM_TOKENS
 )
+
+MINI_CASES: Iterable[MoEBenchmarkCase] = tuple(
+    MoEBenchmarkCase(
+        name=f"bailing_mini_nt{n}_ne256_tk8_h2048_i512",
+        num_tokens=n,
+        **BAILING_MINI,
+    )
+    for n in _NUM_TOKENS
+)
+
+GROUP_GEMM_CASES: Iterable[MoEBenchmarkCase] = BASE_CASES + MINI_CASES
 
 
 def generate_router_logits(
@@ -142,6 +164,8 @@ def prepare_fused_moe_inputs(
     *,
     ep_axis_name: str = "tensor",
     include_weights: bool = True,
+    include_shared_expert: bool = False,
+    se_intermediate_size: int | None = None,
 ) -> Dict[str, jax.Array]:
     if mesh is None:
         tokens = jnp.empty((case.num_tokens, case.hidden_size), dtype=dtype)
@@ -157,6 +181,13 @@ def prepare_fused_moe_inputs(
                 (case.num_experts, case.intermediate_size, case.hidden_size),
                 dtype=dtype,
             )
+            if include_shared_expert:
+                if se_intermediate_size is None:
+                    se_intermediate_size = case.intermediate_size
+                out["w1_shared"] = jnp.empty((case.hidden_size, se_intermediate_size), dtype=dtype)
+                out["w3_shared"] = jnp.empty((case.hidden_size, se_intermediate_size), dtype=dtype)
+                out["w2_shared"] = jnp.empty((se_intermediate_size, case.hidden_size), dtype=dtype)
+
         # For fused_moe benchmarks, routing can be made deterministic inside the
         # kernel via `balanced_topk`, so router logits are unnecessary here.
         router_logits = jnp.zeros((case.num_tokens, case.num_experts), dtype=dtype)
@@ -178,6 +209,10 @@ def prepare_fused_moe_inputs(
     w1_sharding = NamedSharding(mesh, P(ep_axis_name, None, None))
     w2_sharding = NamedSharding(mesh, P(ep_axis_name, None, None))
     w3_sharding = NamedSharding(mesh, P(ep_axis_name, None, None))
+
+    se_w1_sharding = NamedSharding(mesh, P())
+    se_w2_sharding = NamedSharding(mesh, P())
+    se_w3_sharding = NamedSharding(mesh, P())
 
     # Avoid `jax.device_put(host_array, NamedSharding(...))` for large weights:
     # on multi-host runs it may trigger a cross-host equality check (allgather)
@@ -209,6 +244,32 @@ def prepare_fused_moe_inputs(
             ),
             out_shardings=w2_sharding,
         )()
+
+        if include_shared_expert:
+            if se_intermediate_size is None:
+                se_intermediate_size = case.intermediate_size
+            out["w1_shared"] = jax.jit(
+                lambda: jnp.zeros(
+                    (case.hidden_size, se_intermediate_size),
+                    dtype=dtype,
+                ),
+                out_shardings=se_w1_sharding,
+            )()
+            out["w3_shared"] = jax.jit(
+                lambda: jnp.zeros(
+                    (case.hidden_size, se_intermediate_size),
+                    dtype=dtype,
+                ),
+                out_shardings=se_w3_sharding,
+            )()
+            out["w2_shared"] = jax.jit(
+                lambda: jnp.zeros(
+                    (se_intermediate_size, case.hidden_size),
+                    dtype=dtype,
+                ),
+                out_shardings=se_w2_sharding,
+            )()
+
     # For fused_moe benchmarks, routing can be made deterministic inside the
     # kernel via `balanced_topk`, so router logits are unnecessary here.
     router_logits = jax.jit(
