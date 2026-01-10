@@ -6,6 +6,10 @@ from jax.sharding import Mesh
 from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.kernels.gmm.megablox_gmm_backend import gmm
+from sgl_jax.srt.utils.quantization.quantization_utils import (
+    quantize_tensor,
+    quantize_tensor_simple,
+)
 
 
 class GateLogit(nnx.Module):
@@ -36,7 +40,7 @@ class GateLogit(nnx.Module):
             self.bias = None
 
     def __call__(self, hidden_states: jax.Array) -> tuple[jax.Array, jax.Array | None]:
-        logits = hidden_states.astype(self.weight_dtype) @ self.kernel
+        logits = hidden_states.astype(jnp.float32) @ self.kernel
 
         if self.score_func:
             if self.score_func == "softmax":
@@ -190,12 +194,20 @@ class EPMoE(nnx.Module):
         self.num_experts_per_tok = num_experts_per_tok
         self.intermediate_dim = intermediate_dim
         self.weight_dtype = weight_dtype
-        self.dtype = dtype
+        self.dtype = dtype  # original dtype
         self.layer_id = layer_id
         self.ep_size = ep_size
         self.original_mesh = mesh
         self.mesh = mesh
         self.activation = activation
+
+        # Get quantization settings from config
+        quant_config = getattr(config, "quantization_config", None)
+        self.quantized_dtype = quant_config.get_moe_weight_dtype() if quant_config else None
+        self.activation_quantized_dtype = (
+            quant_config.get_moe_activation_dtype() if quant_config else None
+        )
+
         if num_experts % self.ep_size != 0:
             raise ValueError(
                 f"num_experts({num_experts}) must be divisible by ep_size ({self.ep_size})"
@@ -244,6 +256,12 @@ class EPMoE(nnx.Module):
                 )
             )
 
+            # Scales are None by default - only set by quantize_weights() if quantization is enabled
+            # gmm kernel handles None scales properly (no scaling applied)
+            self.wi_0_scale = None
+            self.wi_1_scale = None
+            self.wo_scale = None
+
     def _detect_device_capabilities(self):
         try:
             devices = jax.devices()
@@ -257,11 +275,57 @@ class EPMoE(nnx.Module):
         except Exception as _:
             return False, "cpu"
 
+    def quantize_weights(self):
+        """Quantize MoE weights in-place. Call once after model loading."""
+        if self.quantized_dtype is None:
+            return
+
+        with jax.sharding.use_abstract_mesh(self.updated_mesh):
+            # Quantize weights
+            w0_value, w0_scale = quantize_tensor(
+                self.quantized_dtype,
+                self.wi_0.value,
+                axis=1,
+                out_sharding=P("expert", None, "tensor"),
+            )
+            w1_value, w1_scale = quantize_tensor(
+                self.quantized_dtype,
+                self.wi_1.value,
+                axis=1,
+                out_sharding=P("expert", None, "tensor"),
+            )
+            wo_value, wo_scale = quantize_tensor(
+                self.quantized_dtype,
+                self.wo.value,
+                axis=1,
+                out_sharding=P("expert", "tensor", None),
+            )
+
+            # Replace original weights with quantized versions
+            self.wi_0.value = w0_value
+            self.wi_1.value = w1_value
+            self.wo.value = wo_value
+
+            # Update scales (reshape to 4D for GMM kernel)
+            # Wrap with nnx.data() to override static attribute status
+            self.wi_0_scale = nnx.data(w0_scale.reshape(w0_scale.shape[0], 1, 1, w0_scale.shape[1]))
+            self.wi_1_scale = nnx.data(w1_scale.reshape(w1_scale.shape[0], 1, 1, w1_scale.shape[1]))
+            self.wo_scale = nnx.data(wo_scale.reshape(wo_scale.shape[0], 1, 1, wo_scale.shape[1]))
+
     def __call__(self, hidden_states, topk_weights, topk_ids) -> jax.Array:
+        # Activation quantization is now handled per-GEMM inside _gmm_compute
+        # (aligned with sglang-gpu scheme: quantize before each GEMM, dequantize after)
+
+        # Run MoE computation on the expert-parallel mesh
         with jax.sharding.use_abstract_mesh(self.updated_mesh):
             hidden_states_reshard = jax.sharding.reshard(hidden_states, P(None))
             topk_weights_reshard = jax.sharding.reshard(topk_weights, P(None))
             topk_ids_reshard = jax.sharding.reshard(topk_ids, P(None))
+
+            # Scales are raw arrays after quantize_weights() (via nnx.data), else None
+            w0_scale = self.wi_0_scale
+            w1_scale = self.wi_1_scale
+            wo_scale = self.wo_scale
 
             result = shard_map(
                 self._forward,
@@ -270,6 +334,15 @@ class EPMoE(nnx.Module):
                     P(None),
                     P(None),
                     P(None),
+                    # weights
+                    P("expert", None, "tensor"),
+                    P("expert", None, "tensor"),
+                    P("expert", "tensor", None),
+                    # scales
+                    P("expert", None, None, "tensor"),
+                    P("expert", None, None, "tensor"),
+                    P("expert", None, None, None),
+                    # biases (unused)
                     P("expert", None, "tensor"),
                     P("expert", None, "tensor"),
                     P("expert", "tensor", None),
@@ -283,14 +356,33 @@ class EPMoE(nnx.Module):
                 self.wi_0.value,
                 self.wi_1.value,
                 self.wo.value,
+                w0_scale,
+                w1_scale,
+                wo_scale,
+                None,
+                None,
+                None,
             )
 
-        output_pspec = P(*([None] * (result.ndim)))
-        return jax.sharding.reshard(
-            result, jax.sharding.NamedSharding(self.original_mesh, output_pspec)
-        )
+        # Reshard result back to original mesh
+        replicated_pspec = P(*([None] * result.ndim))
+        return jax.sharding.reshard(result, jax.sharding.NamedSharding(self.mesh, replicated_pspec))
 
-    def _forward(self, hidden_states, topk_weights, topk_ids, w0_weights, w1_weights, wo_weights):
+    def _forward(
+        self,
+        hidden_states,
+        topk_weights,
+        topk_ids,
+        w0_weights,
+        w1_weights,
+        wo_weights,
+        w0_kernel_scale=None,
+        w1_kernel_scale=None,
+        wo_kernel_scale=None,
+        w0_kernel_bias=None,
+        w1_kernel_bias=None,
+        wo_kernel_bias=None,
+    ):
         expert_shard_id = jax.lax.axis_index("expert")
 
         if hidden_states.ndim == 2:
@@ -315,6 +407,12 @@ class EPMoE(nnx.Module):
             w1_weights,
             wo_weights,
             group_offset,
+            w0_kernel_scale,
+            w1_kernel_scale,
+            wo_kernel_scale,
+            w0_kernel_bias,
+            w1_kernel_bias,
+            wo_kernel_bias,
         )
 
         if self.ep_size > 1:
@@ -329,7 +427,21 @@ class EPMoE(nnx.Module):
         )
         return output
 
-    def _gmm_compute(self, x, group_sizes, w0_kernel, w1_kernel, wo_kernel, group_offset):
+    def _gmm_compute(
+        self,
+        x,
+        group_sizes,
+        w0_kernel,
+        w1_kernel,
+        wo_kernel,
+        group_offset,
+        w0_kernel_scale=None,
+        w1_kernel_scale=None,
+        wo_kernel_scale=None,
+        w0_kernel_bias=None,
+        w1_kernel_bias=None,
+        wo_kernel_bias=None,
+    ):
         if x.shape[0] == 0:
             empty_output = jnp.zeros((0, wo_kernel.shape[-1]), dtype=x.dtype)
             return empty_output
@@ -352,24 +464,44 @@ class EPMoE(nnx.Module):
 
         group_sizes = group_sizes.astype(jnp.int32)
 
+        # === GEMM1: x @ w0 and x @ w1 ===
+        # Quantize input activation for GEMM1 if activation quantization enabled
+        if self.activation_quantized_dtype is not None:
+            x_q, x_scale = quantize_tensor_simple(x, self.activation_quantized_dtype, dim=-1)
+            gemm1_lhs = x_q
+        else:
+            gemm1_lhs = x
+            x_scale = None
+
         layer_w0 = gmm(
-            lhs=x,
+            lhs=gemm1_lhs,
             rhs=w0_kernel,
             group_sizes=group_sizes,
             preferred_element_type=self.dtype,
+            rhs_scale=w0_kernel_scale,
+            rhs_bias=w0_kernel_bias,
             tiling=tiling_gate,
             group_offset=group_offset,
         )
 
         layer_w1 = gmm(
-            lhs=x,
+            lhs=gemm1_lhs,
             rhs=w1_kernel,
             group_sizes=group_sizes,
             preferred_element_type=self.dtype,
+            rhs_scale=w1_kernel_scale,
+            rhs_bias=w1_kernel_bias,
             tiling=tiling_gate,
             group_offset=group_offset,
         )
 
+        # Dequantize GEMM1 output (apply LHS scale if quantized)
+        if x_scale is not None:
+            # x_scale shape: (m, 1) with keepdims=True, broadcasts to (m, n_gate)
+            layer_w0 = layer_w0 * x_scale
+            layer_w1 = layer_w1 * x_scale
+
+        # === Activation in BF16 (not quantized) ===
         if self.activation == "silu":
             layer_act = jax.nn.silu(layer_w0)
         elif self.activation == "gelu":
@@ -378,14 +510,32 @@ class EPMoE(nnx.Module):
             raise ValueError(f"Unsupported activation function {self.activation}")
         intermediate_layer = jnp.multiply(layer_act, layer_w1)
 
+        # === GEMM2: intermediate @ wo ===
+        # Quantize intermediate activation for GEMM2 if activation quantization enabled
+        if self.activation_quantized_dtype is not None:
+            intermediate_q, intermediate_scale = quantize_tensor_simple(
+                intermediate_layer, self.activation_quantized_dtype, dim=-1
+            )
+            gemm2_lhs = intermediate_q
+        else:
+            gemm2_lhs = intermediate_layer
+            intermediate_scale = None
+
         intermediate_output = gmm(
-            lhs=intermediate_layer,
+            lhs=gemm2_lhs,
             rhs=wo_kernel,
             group_sizes=group_sizes,
             preferred_element_type=self.dtype,
+            rhs_scale=wo_kernel_scale,
+            rhs_bias=wo_kernel_bias,
             tiling=tiling_down,
             group_offset=group_offset,
         )
+
+        # Dequantize GEMM2 output (apply LHS scale if quantized)
+        if intermediate_scale is not None:
+            # intermediate_scale shape: (m, 1) with keepdims=True, broadcasts to (m, n_down)
+            intermediate_output = intermediate_output * intermediate_scale
 
         if self.tp_size > 1:
             intermediate_output = jax.lax.psum(intermediate_output, "tensor")
