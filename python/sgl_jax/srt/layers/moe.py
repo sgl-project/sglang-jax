@@ -17,7 +17,7 @@ class GateLogit(nnx.Module):
         self,
         input_size: int,
         num_experts: int = 0,
-        weight_dtype: jnp.dtype = jnp.float32,
+        weight_dtype: jnp.dtype = jnp.bfloat16,
         enable_expert_bias: bool | None = False,
         score_func: str | None = "softmax",
     ):
