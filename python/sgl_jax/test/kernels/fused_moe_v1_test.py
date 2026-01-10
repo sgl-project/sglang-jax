@@ -156,6 +156,7 @@ class MoEKernelTest(jtu.JaxTestCase):
         bfc,
         bd1c,
         bd2c,
+        bse,
         act_fn="silu",
         w_dtype=None,
         subc_quant_wsz=None,
@@ -199,7 +200,7 @@ class MoEKernelTest(jtu.JaxTestCase):
                     w3_shared, w_dtype, subc_quant_wsz
                 )
 
-        actual = fused_ep_moe(
+        actual, _ = fused_ep_moe(
             mesh=self.mesh,
             tokens=a,
             w1=w1,
@@ -234,8 +235,9 @@ class MoEKernelTest(jtu.JaxTestCase):
                 bfc=bfc,
                 bd1c=bd1c,
                 bd2c=bd2c,
+                bse=bse,
             ),
-            ep_axis_name="tensor",
+            tp_axis_name="tensor",
         )
         expected = ref_moe(
             a,
@@ -292,6 +294,7 @@ class MoEKernelTest(jtu.JaxTestCase):
             bfc=256,
             bd1c=256,
             bd2c=256,
+            bse=512,
         )
 
     def test_shared_expert(self):
@@ -319,6 +322,7 @@ class MoEKernelTest(jtu.JaxTestCase):
             bfc=256,
             bd1c=256,
             bd2c=256,
+            bse=512,
         )
 
     def test_grouped_topk(self):
@@ -348,6 +352,7 @@ class MoEKernelTest(jtu.JaxTestCase):
             bfc=256,
             bd1c=256,
             bd2c=256,
+            bse=512,
         )
 
     @parameterized.product(
@@ -378,6 +383,7 @@ class MoEKernelTest(jtu.JaxTestCase):
             bfc=256,
             bd1c=256,
             bd2c=256,
+            bse=512,
         )
 
     def test_benchmark_qwen_235(self):
@@ -406,6 +412,7 @@ class MoEKernelTest(jtu.JaxTestCase):
             bfc=768,
             bd1c=2048,
             bd2c=2048,
+            bse=512,
             act_fn="silu",
             atol=5e-2,
             rtol=5e-2,
@@ -437,6 +444,7 @@ class MoEKernelTest(jtu.JaxTestCase):
             bfc=384,
             bd1c=256,
             bd2c=256,
+            bse=512,
             act_fn="silu",
             atol=5e-2,
             rtol=5e-2,
@@ -476,6 +484,7 @@ class MoEKernelTest(jtu.JaxTestCase):
             bfc=256,
             bd1c=256,
             bd2c=256,
+            bse=512,
         )
 
     @parameterized.product(
@@ -508,6 +517,7 @@ class MoEKernelTest(jtu.JaxTestCase):
             bfc=256,
             bd1c=256,
             bd2c=256,
+            bse=512,
         )
 
     def test_bias(self):
@@ -535,6 +545,7 @@ class MoEKernelTest(jtu.JaxTestCase):
             bfc=256,
             bd1c=256,
             bd2c=256,
+            bse=512,
         )
 
 

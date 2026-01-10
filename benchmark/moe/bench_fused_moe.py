@@ -72,10 +72,8 @@ def _estimate_vmem_bytes(
     token_bytes = jnp.dtype(dtype).itemsize
     weight_bytes = token_bytes
 
-    t_packing = _dtype_packing(dtype)
     local_num_tokens = case.num_tokens // case.ep_size
     padded_num_experts = ((case.num_experts + 127) // 128) * 128
-    padded_top_k = ((case.top_k + 127) // 128) * 128
     output_bt = math.gcd(bt, local_num_tokens)
     # With run_bt tiling, the a2a scratch only needs to cover one `output_bt` tile
     # (across all EP devices), padded up to a multiple of `bts` for safe token staging.
@@ -103,15 +101,15 @@ def _estimate_vmem_bytes(
     # b_acc_vmem is F32(2, a2a_max_tokens, 1, bf)
     b_acc = 2 * a2a_max_tokens * bf * 4
     # U32 token staging for FFN1: (2, bts, bd1 // t_packing)
-    t_stage_b32 = 2 * bts * (bd1 // t_packing) * 4
+    # Note: Using 4 bytes for packing factor adjustment roughly
+    t_stage_b32 = 2 * bts * (bd1 // 2) * 4  # Approximation
     # Kernel uses triple-buffering for a2a_s_acc staging: (3, bts, bd2 // t_packing)
-    a2a_s_acc_stage_b32 = 3 * bts * (bd2 // t_packing) * 4
+    a2a_s_acc_stage_b32 = 3 * bts * (bd2 // 2) * 4  # Approximation
 
     # Routing / top-k temporaries in kernel (best-effort conservative estimate):
-    # - softmax + get_top_k use float32 work buffers and broadcasted iotas
-    # - top_k logits are materialized as `top_k` arrays of shape (output_bt, padded_top_k)
-    # This is separate from `t2e_routing_smem` above.
-    routing_work_f32 = output_bt * padded_num_experts * 4  # softmax result (approx)
+    # ... (Same as before)
+    padded_top_k = ((case.top_k + 127) // 128) * 128
+    routing_work_f32 = output_bt * padded_num_experts * 4
     get_top_k_input_f32 = output_bt * padded_num_experts * 4
     get_top_k_t2e = output_bt * padded_num_experts * 4
     get_top_k_iota = output_bt * padded_num_experts * 4
@@ -148,16 +146,10 @@ def _estimate_vmem_bytes(
     )
 
     if use_shared_expert:
-        # 1. SE Weights Double Buffering (b_se_w*_x2_vmem)
-        # shape: (2, t_packing, bd/pack, bf)
-        # NOTE: bd and bf here refer to block sizes, se_inter usage depends on total blocks
-        # but scratch is fixed size by bd/bf.
-        se_w1 = 2 * bd1 * bf * weight_bytes
-        se_w3 = 2 * bd1 * bf * weight_bytes
-        se_w2 = 2 * bf * bd2 * weight_bytes
-
-        # 2. SE Tokens Buffer (b_se_tokens_vmem) -> (2, bt, hidden)
-        se_tokens = 2 * bt * hidden * token_bytes
+        se_w1 = 2 * bd1 * cfg.bse * weight_bytes  # (2, t_packing, bd/pack, bse)
+        se_w3 = 2 * bd1 * cfg.bse * weight_bytes
+        se_w2 = 2 * cfg.bse * bd2 * weight_bytes
+        se_tokens = 2 * bt * hidden * token_bytes  # (2, bt, hidden)
         total_bytes += se_w1 + se_w3 + se_w2 + se_tokens
 
     return total_bytes
@@ -171,16 +163,12 @@ def select_block_configs(
     bts_candidates: list[int] | None = None,
     bf_candidates: list[int],
     bd_candidates: list[int],
+    bse_candidates: list[int] | None = None,
     tpu_vmem_budget_bytes: int,
     max_configs: int,
     use_shared_expert: bool = False,
 ) -> list[FusedMoEBlockConfig]:
-    """Enumerate block configs from the explicit candidate lists.
-
-    This function is intentionally "what you see is what you get": it filters
-    only by basic divisibility/alignment constraints and VMEM budget, without
-    applying additional heuristics (e.g. "keep only the largest two").
-    """
+    """Enumerate block configs from the explicit candidate lists."""
     t_packing = _dtype_packing(dtype)
     tile_align = t_packing * 128
     local_num_tokens = case.num_tokens // case.ep_size
@@ -208,6 +196,9 @@ def select_block_configs(
     bf_candidates = _pick_candidates(candidates=bf_candidates, multiple_of=128)
     bd_candidates = _pick_candidates(candidates=bd_candidates, multiple_of=tile_align)
 
+    raw_bse_candidates = bse_candidates if bse_candidates is not None else bf_candidates
+    bse_candidates_i = _pick_candidates(candidates=raw_bse_candidates, multiple_of=128)
+
     def default_bts_for_bt(bt: int) -> list[int]:
         out: list[int] = []
         v = bt
@@ -229,6 +220,7 @@ def select_block_configs(
         bfc = cfg.bfc
         bd1c = cfg.bd1c
         bd2c = cfg.bd2c
+        bse = cfg.bse
 
         if bt <= 0 or bf <= 0 or bd1 <= 0 or bd2 <= 0:
             return False, "non-positive tile size"
@@ -255,6 +247,8 @@ def select_block_configs(
             return False, f"bfc({bfc}) % 128 != 0"
         if bf % bfc != 0:
             return False, f"bf({bf}) % bfc({bfc}) != 0"
+        if bse % 128 != 0:
+            return False, f"bse({bse}) % 128 != 0"
 
         if case.hidden_size % bd1 != 0 or case.hidden_size % bd2 != 0:
             return (
@@ -295,6 +289,7 @@ def select_block_configs(
             effective.bfc,
             effective.bd1c,
             effective.bd2c,
+            effective.bse,
         )
         if key in seen:
             return
@@ -309,29 +304,46 @@ def select_block_configs(
         for bts in bts_list:
             for bf in bf_candidates:
                 for bd in bd_candidates:
-                    raw = FusedMoEBlockConfig(
-                        bt=bt,
-                        bf=bf,
-                        bd1=bd,
-                        bd2=bd,
-                        btc=bt,
-                        bfc=bf,
-                        bd1c=bd,
-                        bd2c=bd,
-                        bts=bts,
-                    )
-                    effective = raw.effective_for(
-                        num_tokens=case.num_tokens, ep_size=case.ep_size, dtype=dtype
-                    )
-                    add(raw=raw, effective=effective)
+                    current_bse_list = bse_candidates_i if use_shared_expert else [bf]
+
+                    for bse in current_bse_list:
+                        raw = FusedMoEBlockConfig(
+                            bt=bt,
+                            bf=bf,
+                            bd1=bd,
+                            bd2=bd,
+                            btc=bt,
+                            bfc=bf,
+                            bd1c=bd,
+                            bd2c=bd,
+                            bts=bts,
+                            bse=bse,
+                        )
+                        effective = raw.effective_for(
+                            num_tokens=case.num_tokens, ep_size=case.ep_size, dtype=dtype
+                        )
+                        add(raw=raw, effective=effective)
 
     if max_configs <= 0:
         raise ValueError(f"Expected {max_configs=} to be > 0.")
     if len(configs) <= max_configs:
         return configs
 
-    def score(c: FusedMoEBlockConfig) -> tuple[int, int, int, int, int, int, int, int, int]:
-        return (c.bt, c.bts or c.bt, c.bf, c.bd1, c.bd2, c.btc, c.bfc, c.bd1c, c.bd2c)
+    def score(
+        c: FusedMoEBlockConfig,
+    ) -> tuple[int, int, int, int, int, int, int, int, int, int]:
+        return (
+            c.bt,
+            c.bts or c.bt,
+            c.bf,
+            c.bd1,
+            c.bd2,
+            c.btc,
+            c.bfc,
+            c.bd1c,
+            c.bd2c,
+            c.bse,
+        )
 
     selected: list[FusedMoEBlockConfig] = []
     selected_keys: set[tuple[int, ...]] = set()
@@ -363,13 +375,14 @@ def run_all(
     bts_candidates: list[int] | None = None,
     bf_candidates: list[int] | None = None,
     bd_candidates: list[int] | None = None,
+    bse_candidates: list[int] | None = None,
     num_tokens: list[int] | None = None,
     tpu_vmem_budget_bytes: int = DEFAULT_TPU_VMEM_BUDGET_BYTES,
     max_configs: int = 9,
     config_mode: str = "base",
     use_shared_expert: bool = False,
     use_grouped_topk: bool = False,
-    imbalance_mode: str = None,  # 手动显式传入
+    imbalance_mode: str = None,
     alpha: float = None,
     zipf_s: float = None,
     hotspot_ratio: float = None,
@@ -415,7 +428,7 @@ def run_all(
         print("No runnable fused_moe cases after filtering tp_size!=1.")
         return
 
-    tuned_results: dict[str, dict[tuple, tuple[int, int, int, int, int, int, int, int]]] = {}
+    tuned_results: dict[str, dict[tuple, tuple[int, int, int, int, int, int, int, int, int]]] = {}
     if tune_block_config:
         from sgl_jax.srt.utils.jax_utils import get_device_name
 
@@ -486,6 +499,7 @@ def run_all(
                 bts_candidates=bts_candidates,
                 bf_candidates=bf_candidates or [128, 256, 512, 1024, 2048],
                 bd_candidates=bd_candidates or [256, 512, 1024, 2048, 4096, 8192],
+                bse_candidates=bse_candidates,
                 tpu_vmem_budget_bytes=tpu_vmem_budget_bytes,
                 max_configs=max_configs,
                 use_shared_expert=use_shared_expert,
@@ -601,6 +615,7 @@ def run_all(
                         best_cfg.bfc,
                         best_cfg.bd1c,
                         best_cfg.bd2c,
+                        best_cfg.bse,
                     )
                     print(f"  best: {best_cfg.as_kwargs()} ({best_ms:.3f} ms)")
                     print(f"  tuned_table[{device_name}][{table_key}] = {cfg_tuple}")
@@ -670,6 +685,12 @@ def parse_args() -> argparse.Namespace:
         type=int,
         nargs="+",
         help="Candidate list for bd1/bd2 (hidden tile), e.g. --bd-candidates 512 1024 2048 4096",
+    )
+    parser.add_argument(
+        "--bse-candidates",
+        type=int,
+        nargs="+",
+        help="Candidate list for bse (shared expert intermediate tile), e.g. --bse-candidates 128 256 512",
     )
     parser.add_argument(
         "--num-tokens",
@@ -754,13 +775,14 @@ if __name__ == "__main__":
         bts_candidates=args.bts_candidates,
         bf_candidates=args.bf_candidates,
         bd_candidates=args.bd_candidates,
+        bse_candidates=args.bse_candidates,
         num_tokens=args.num_tokens,
         tpu_vmem_budget_bytes=tpu_vmem_budget_bytes,
         max_configs=args.max_configs,
         config_mode=args.config_mode,
         use_shared_expert=args.use_shared_expert,
         use_grouped_topk=args.use_grouped_topk,
-        imbalance_mode=args.imbalance_mode,  # 手动显式传入
+        imbalance_mode=args.imbalance_mode,
         alpha=args.alpha,
         zipf_s=args.zipf_s,
         hotspot_ratio=args.hotspot_ratio,

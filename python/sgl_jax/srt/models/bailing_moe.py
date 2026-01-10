@@ -627,11 +627,11 @@ class BailingMoEForCausalLM(nnx.Module):
                         sharding=(None, None),
                         transpose=True,
                     )
-                mappings[f"{prefix}.mlp.shared_experts.down_proj.weight"] = WeightMapping(
-                    target_path=f"{target_prefix}.mlp.w2_shared",
-                    sharding=(None, None),
-                    transpose=True,
-                )
+                    mappings[f"{prefix}.mlp.shared_experts.down_proj.weight"] = WeightMapping(
+                        target_path=f"{target_prefix}.mlp.w2_shared",
+                        sharding=(None, None),
+                        transpose=True,
+                    )
             else:
                 for expert_type in ["gate_proj", "up_proj", "down_proj"]:
                     target_name = {
