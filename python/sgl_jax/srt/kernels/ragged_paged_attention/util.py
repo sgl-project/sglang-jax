@@ -56,3 +56,7 @@ def get_device_name(num_devices: int | None = None):
     if num_devices is not None:
         name += f"-{num_devices}"
     return name
+
+
+def get_dtype_bitwidth(dtype):
+    return dtypes.bit_width(dtype) if hasattr(dtypes, "bit_width") else dtypes.itemsize_bits(dtype)
