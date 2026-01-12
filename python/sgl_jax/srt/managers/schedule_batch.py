@@ -773,6 +773,14 @@ class ScheduleBatch:
 
             # Skip empty DP ranks
             if not reqs:
+                # Clear fields to avoid stale data
+                info.input_ids = None
+                info.seq_lens = None
+                info.prefix_lens = None
+                info.extend_lens = None
+                info.out_cache_loc = None
+                info.seq_lens_sum = 0
+                info.extend_num_tokens = None
                 continue
 
             # Allocate req slots
@@ -906,6 +914,7 @@ class ScheduleBatch:
                     (req_pool_indices[i], slice(prefix_lens[i], seq_lens[i])),
                     out_cache_loc[pt : pt + extend_lens[i]],
                 )
+
                 pt += extend_lens[i]
 
             info.sampling_info = SamplingBatchInfo.from_schedule_batch(
@@ -1187,6 +1196,12 @@ class ScheduleBatch:
 
             # Skip empty DP ranks
             if not reqs:
+                # Clear fields to avoid stale data
+                info.input_ids = None
+                info.output_ids = None
+                info.seq_lens = None
+                info.out_cache_loc = None
+                info.seq_lens_sum = 0
                 continue
 
             bs = len(reqs)
@@ -1697,9 +1712,8 @@ class ScheduleBatch:
                         )
 
                     # Copy actual token indices
-                    cache_loc_cpu[offset_cache : offset_cache + seq_len] = token_indices[
-                        i, :seq_len
-                    ]
+                    tokens_to_copy = token_indices[i, :seq_len]
+                    cache_loc_cpu[offset_cache : offset_cache + seq_len] = tokens_to_copy
 
                     # Move to next page-aligned position
                     offset_cache += aligned_len

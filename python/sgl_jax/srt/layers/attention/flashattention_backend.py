@@ -174,11 +174,6 @@ class FlashAttention(AttentionBackend):
             cu_kv_lens_sections.append(section_cu)
         cu_kv_lens = np.concatenate(cu_kv_lens_sections)
 
-        print(
-            f"[DEBUG FA METADATA] cu_q_lens={cu_q_lens}, cu_kv_lens={cu_kv_lens}, page_indices={page_indices}, seq_lens={seq_lens}"
-            f"per_dp_bs_size={batch.per_dp_bs_size}"
-        )
-
         distribution_list = []
 
         # Iterate through each DP rank's section of the batch
@@ -491,17 +486,12 @@ class FlashAttention(AttentionBackend):
         # Prepare fused KV cache for paged format: [num_pages, page_size, num_kv_heads * 2, head_dim]
         total_tokens = kv_cache_fused.shape[0]
         num_pages = total_tokens // self.page_size
-        print(
-            f"[DEBUG FA_BACKEND] kv_cache_fused.shape={kv_cache_fused.shape}, total_tokens={total_tokens}, num_pages={num_pages}, page_size={self.page_size}, head_dim={self.head_dim}"
-        )
+
         aligned_head_dim = (self.head_dim + 127) // 128 * 128
-        print(
-            f"[DEBUG FA_BACKEND] aligned_head_dim={aligned_head_dim}, will reshape to ({num_pages}, {self.page_size}, -1, {aligned_head_dim})"
-        )
+
         kv_cache_fused_paged = kv_cache_fused.reshape(
             num_pages, self.page_size, -1, aligned_head_dim
         )
-        print(f"[DEBUG FA_BACKEND] kv_cache_fused_paged.shape={kv_cache_fused_paged.shape}")
 
         causal = 1
 

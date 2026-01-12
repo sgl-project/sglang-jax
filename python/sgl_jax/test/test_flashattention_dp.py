@@ -325,7 +325,6 @@ class TestAttention(CustomTestCase):
 
         is_bf16 = dtype == jnp.bfloat16
 
-        print(f"[DEBUG] Creating test data for mode={mode}, dp_size={dp_size}")
         (
             forward_batch,
             token_to_kv_pool,
@@ -353,7 +352,6 @@ class TestAttention(CustomTestCase):
             },
             max_total_token_size=max_total_token_size,
         )
-        print(f"[DEBUG] Test data created, q.shape={q.shape}, k.shape={k.shape}, v.shape={v.shape}")
 
         expected_np = compute_dp_reference_attention(
             mode=mode,
@@ -375,9 +373,6 @@ class TestAttention(CustomTestCase):
         q_shard = jax.device_put(q, sharding)
         k_shard = jax.device_put(k, sharding)
         v_shard = jax.device_put(v, sharding)
-        print(
-            f"[DEBUG] Q/K/V sharded, q_shard.shape={q_shard.shape}, k_shard.shape={k_shard.shape}, v_shard.shape={v_shard.shape}"
-        )
 
         # JAX attention
         attn = RadixAttention(
@@ -399,14 +394,11 @@ class TestAttention(CustomTestCase):
             return out
 
         # run
-        print("[DEBUG] Running jit_attn...")
         jax_output, _ = jit_attn(q_shard, k_shard, v_shard, forward_batch, token_to_kv_pool)
-        print("[DEBUG] jit_attn completed")
         jax_output = jax.block_until_ready(jax_output)
 
         # Compare
         jax_output_np = np.array(jax_output)
-        print(f"[DEBUG] jax_output.shape={jax_output_np.shape}, expected.shape={expected_np.shape}")
 
         np.testing.assert_allclose(
             jax_output_np,

@@ -490,10 +490,16 @@ class Scheduler(
         """Assign dp_rank to request using round-robin strategy."""
         if self.dp_size == 1:
             for req in recv_reqs:
-                req.dp_rank = 0
+                # Only assign dp_rank to TokenizedGenerateReqInput
+                if isinstance(req, TokenizedGenerateReqInput):
+                    req.dp_rank = 0
             return
 
         for req in recv_reqs:
+            # Only assign dp_rank to TokenizedGenerateReqInput
+            if not isinstance(req, TokenizedGenerateReqInput):
+                continue
+
             # Skip if dp_rank already set (e.g., sticky sessions)
             if req.dp_rank is not None:
                 continue
