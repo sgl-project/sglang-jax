@@ -125,7 +125,10 @@ class TiktokenTokenizer:
         )
         return self.encode(ret) if tokenize else ret
 
-    def __call__(self, text: list[str], **kwargs):
+    def __call__(self, text: list[str] | str, **kwargs):
+        if isinstance(text, str):
+            return {"input_ids": self.encode(text)}
+
         return {
             "input_ids": [self.encode(x) for x in text],
         }
