@@ -302,15 +302,58 @@ class EPMoE(nnx.Module):
             )
 
             # Replace original weights with quantized versions
-            self.wi_0.value = w0_value
-            self.wi_1.value = w1_value
-            self.wo.value = wo_value
+            self.wi_0 = nnx.Param(
+                jax.sharding.reshard(w0_value, P("expert", None, "tensor")),
+                out_sharding=P("expert", None, "tensor"),
+            )
+            self.wi_1 = nnx.Param(
+                jax.sharding.reshard(w1_value, P("expert", None, "tensor")),
+                out_sharding=P("expert", None, "tensor"),
+            )
+            self.wo = nnx.Param(
+                jax.sharding.reshard(wo_value, P("expert", "tensor", None)),
+                out_sharding=P("expert", "tensor", None),
+            )
 
             # Update scales (reshape to 4D for GMM kernel)
-            # Wrap with nnx.data() to override static attribute status
-            self.wi_0_scale = nnx.data(w0_scale.reshape(w0_scale.shape[0], 1, 1, w0_scale.shape[1]))
-            self.wi_1_scale = nnx.data(w1_scale.reshape(w1_scale.shape[0], 1, 1, w1_scale.shape[1]))
-            self.wo_scale = nnx.data(wo_scale.reshape(wo_scale.shape[0], 1, 1, wo_scale.shape[1]))
+            if hasattr(self, "wi_0_scale"):
+                del self.wi_0_scale
+            self.wi_0_scale = nnx.Param(
+                w0_scale.reshape(
+                    w0_scale.shape[0],
+                    1,
+                    1,
+                    w0_scale.shape[1],
+                    out_sharding=P("expert", None, None, "tensor"),
+                ),
+                out_sharding=P("expert", None, None, "tensor"),
+            )
+
+            if hasattr(self, "wi_1_scale"):
+                del self.wi_1_scale
+            self.wi_1_scale = nnx.Param(
+                w1_scale.reshape(
+                    w1_scale.shape[0],
+                    1,
+                    1,
+                    w1_scale.shape[1],
+                    out_sharding=P("expert", None, None, "tensor"),
+                ),
+                out_sharding=P("expert", None, None, "tensor"),
+            )
+
+            if hasattr(self, "wo_scale"):
+                del self.wo_scale
+            self.wo_scale = nnx.Param(
+                wo_scale.reshape(
+                    wo_scale.shape[0],
+                    1,
+                    1,
+                    wo_scale.shape[1],
+                    out_sharding=P("expert", None, None, "tensor"),
+                ),
+                out_sharding=P("expert", None, None, None),
+            )
 
     def __call__(self, hidden_states, topk_weights, topk_ids) -> jax.Array:
         # Activation quantization is now handled per-GEMM inside _gmm_compute
@@ -322,10 +365,14 @@ class EPMoE(nnx.Module):
             topk_weights_reshard = jax.sharding.reshard(topk_weights, P(None))
             topk_ids_reshard = jax.sharding.reshard(topk_ids, P(None))
 
-            # Scales are raw arrays after quantize_weights() (via nnx.data), else None
-            w0_scale = self.wi_0_scale
-            w1_scale = self.wi_1_scale
-            wo_scale = self.wo_scale
+            # def get_val(x):
+            #     if x is None:
+            #         return None
+            #     return x.value if hasattr(x, "value") else x
+
+            # w0_scale = get_val(self.wi_0_scale)
+            # w1_scale = get_val(self.wi_1_scale)
+            # wo_scale = get_val(self.wo_scale)
 
             result = shard_map(
                 self._forward,
@@ -343,9 +390,12 @@ class EPMoE(nnx.Module):
                     P("expert", None, None, "tensor"),
                     P("expert", None, None, None),
                     # biases (unused)
-                    P("expert", None, "tensor"),
-                    P("expert", None, "tensor"),
-                    P("expert", "tensor", None),
+                    P(None),
+                    P(None),
+                    P(None),
+                    # P("expert", None, "tensor"),
+                    # P("expert", None, "tensor"),
+                    # P("expert", "tensor", None),
                 ),
                 out_specs=P(None),
                 check_vma=False,
@@ -356,9 +406,9 @@ class EPMoE(nnx.Module):
                 self.wi_0.value,
                 self.wi_1.value,
                 self.wo.value,
-                w0_scale,
-                w1_scale,
-                wo_scale,
+                self.wi_0_scale.value,
+                self.wi_1_scale.value,
+                self.wo_scale.value,
                 None,
                 None,
                 None,
