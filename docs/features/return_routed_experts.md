@@ -270,7 +270,7 @@ class BatchStrOut:
 
 **Encoding Process**:
 ```python
-pybase64.b64encode(tensor.numpy().tobytes()).decode("utf-8")
+pybase64.b64encode(array.numpy().tobytes()).decode("utf-8")
 ```
 
 ---
@@ -382,7 +382,7 @@ def capture_fwd_routed_experts(self, layer_id: int, topk_ids: jax.Array):
     assert layer_id is not None, "capturing routing experts but get layer_id None"
     batch, _ = topk_ids.shape
     new_buffer = self.buffer.at[:batch, layer_id, :].set(topk_ids) # Note: This method may be changed in the real codes
-    
+
     self.buffer = new_buffer
     return new_buffer
 ```
@@ -483,7 +483,7 @@ def _sync_fwd_experts_buffer_DtoH(
 ```
 
 **Operation**:
-1. Retrieves `out_cache_loc` tensor mapping batch positions to token pool indices
+1. Retrieves `out_cache_loc` array mapping batch positions to token pool indices
 2. Performs indexed copy from device buffer to host buffer
 3. Synchronizes CPU and Device (blocking operation)
 
@@ -557,13 +557,13 @@ For padding, no extra padding is required because the topk is fixed after server
 
 ## 4. Test Plans
 
-Note: 
+Note:
 1. Get the selected experts from log firstly, and these will be used as baseline in tests.
 2. Add the test file into `run_suite.py`
 
-test_01_single_request_bs_padding_one: `precompile_bs_paddings = [1]` 
-test_02_single_request_bs_padding_four: `precompile_bs_paddings = [4]` 
-test_03_three_requests_bs_padding_four: `precompile_bs_paddings = [1]` 
+test_01_single_request_bs_padding_one: `precompile_bs_paddings = [1]`
+test_02_single_request_bs_padding_four: `precompile_bs_paddings = [4]`
+test_03_three_requests_bs_padding_four: `precompile_bs_paddings = [1]`
 test_04_four_requests_bs_padding_four: `precompile_bs_paddings = [4]`
 
 ---
