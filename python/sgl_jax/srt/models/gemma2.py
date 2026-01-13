@@ -423,7 +423,7 @@ class Gemma2ForCausalLM(nnx.Module):
     ):
         hidden_states, layers_kv_fused = self.model(forward_batch, token_to_kv_pool)
         output = self.logits_processor(hidden_states, self.model.embed_tokens, logits_metadata)
-        return output, layers_kv_fused, True
+        return output, layers_kv_fused, True, None
 
 
 EntryClass = Gemma2ForCausalLM

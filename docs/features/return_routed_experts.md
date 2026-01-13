@@ -450,10 +450,9 @@ Note:
 1. Get the selected experts from log firstly, and these will be used as baseline in tests.
 2. Add the test file into `run_suite.py`
 
-test_01_single_request_bs_padding_one: `precompile_bs_paddings = [1]`
-test_02_single_request_bs_padding_four: `precompile_bs_paddings = [4]`
-test_03_three_requests_bs_padding_four: `precompile_bs_paddings = [1]`
-test_04_four_requests_bs_padding_four: `precompile_bs_paddings = [4]`
+- case_01_multi_mixed_prompts_with_engine: Use engine.async_generate() concurrently to get response concurrently for PROMPT1(return), PROMPT2(return), PROMPT3(not return). Compare the every item with parsed_response and cls.prompt1|2|3_seq_layer_topk_ids, ensure every item is the same
+- case_02_single_prompt_with_enable_single_process_http_server: One prompt and enable single process. Others keep the same to case_01.
+
 
 ---
 

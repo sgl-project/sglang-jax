@@ -167,6 +167,7 @@ class Req:
         eos_token_ids: set[int] | None = None,
         vocab_size: int | None = None,
         return_hidden_states: bool = False,
+        return_routed_experts: bool = False,
     ):
         # Input and output info
         self.rid = rid
@@ -328,6 +329,10 @@ class Req:
         self.grammar_key: tuple[str, str] | None = None  # Cache key for grammar
         self.grammar_wait_ct = 0  # Counter for grammar compilation wait time
 
+        # capture routed experts
+        self.return_routed_experts = return_routed_experts
+        self.routed_experts: np.ndarray | None = None  # shape (seqlen, topk)
+
     @property
     def seqlen(self):
         return len(self.origin_input_ids) + len(self.output_ids)
@@ -480,6 +485,7 @@ class Req:
         self.is_chunked = 0
         self.req_pool_idx = None
         self.already_computed = 0
+        self.routed_experts = None
 
     def set_finish_with_abort(self, error_msg: str):
         # set it to one token to skip the long prefill
@@ -579,6 +585,9 @@ class ScheduleBatch:
     # Events
     launch_done: threading.Event | None = None
 
+    # Whether to return captured experts
+    return_routed_experts: bool = False
+
     @classmethod
     def init_new(
         cls,
@@ -618,6 +627,7 @@ class ScheduleBatch:
             mesh=mesh,
             spec_algorithm=spec_algorithm,
             is_prefill_only=all(req.sampling_params.max_new_tokens == 0 for req in reqs),
+            return_routed_experts=any(req.return_routed_experts for req in reqs),
         )
 
     def batch_size(self):
@@ -1729,6 +1739,17 @@ class ModelWorkerBatch:
     capture_hidden_mode: CaptureHiddenMode = None
 
     tree_cache: BasePrefixCache = None
+
+    def get_original_input_len(self):
+        """
+        return unpadded tokens number for prefill and real batch size for decode
+        """
+        if self.forward_mode.is_decode():
+            return self.real_bs
+        elif self.forward_mode.is_extend():
+            return self.real_input_ids_len
+        else:
+            raise ValueError(f"{self.forward_mode} is not support to get original token or bs num")
 
 
 def get_last_loc(

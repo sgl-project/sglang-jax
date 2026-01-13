@@ -5,6 +5,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Literal
 
+import numpy as np
+
 from sgl_jax.srt.managers.schedule_batch import BaseFinishReason
 
 
@@ -58,6 +60,9 @@ class BatchStrOut:
     # Cache miss count
     cache_miss_count: int = None
 
+    # The routed experts for each output token
+    output_routed_experts: list[str | None] = None
+
 
 @dataclass
 class BatchTokenIDOut:
@@ -101,6 +106,9 @@ class BatchTokenIDOut:
     # Cache miss count
     cache_miss_count: int = None
 
+    # The routed experts for each output token
+    output_routed_experts: list[np.ndarray] = None
+
 
 @dataclass
 class TokenizedGenerateReqInput:
@@ -129,6 +137,8 @@ class TokenizedGenerateReqInput:
     lora_id: str | None = None  # None means just use the base model
     # Extra key for cache namespace isolation (e.g., cache_salt, lora_id)
     extra_key: str | None = None
+    # return_routed_experts decides whether return expert indices for every token for every layer
+    return_routed_experts: list[bool] | bool | None = None
 
 
 @dataclass
@@ -231,6 +241,8 @@ class GenerateReqInput:
     # Extra key for cache namespace isolation (e.g., cache_salt)
     extra_key: list[str] | str | None = None
 
+    return_routed_experts: list[bool] | bool | None = None
+
     def _normalize_rid(self, num):
         """Normalize request IDs for batch processing."""
         if self.rid is None:
@@ -277,6 +289,8 @@ class GenerateReqInput:
                 self.lora_path = self.lora_path[0]
             elif len(self.lora_path) > 1:
                 raise ValueError("Single request cannot have multiple lora_paths")
+        if self.return_routed_experts is None:
+            self.return_routed_experts = False
 
     def _handle_parallel_sampling(self):
         """Handle parallel sampling parameters and adjust batch size if needed."""
@@ -319,6 +333,7 @@ class GenerateReqInput:
         self._normalize_sampling_params(num)
         self._normalize_logprob_params(num)
         self._normalize_lora_paths(num)
+        self._normalize_return_routed_experts(num)
 
     def _expand_inputs(self, num):
         """Expand the main inputs (text, input_ids, input_embeds) for parallel sampling."""
@@ -379,24 +394,34 @@ class GenerateReqInput:
                 self.is_single = False
                 self.batch_size = len(self.input_embeds)
 
+    def _normalize_return_routed_experts(self, num):
+        self.return_routed_experts = self._normalize_param(
+            self.return_routed_experts, False, "return_routed_experts", num
+        )
+
+    # Helper function to normalize a parameter
+    def _normalize_param(self, param, default_value, param_name, num):
+        if param is None:
+            return [default_value] * num
+        elif not isinstance(param, list):
+            return [param] * num
+        else:
+            if self.parallel_sample_num > 1:
+                raise ValueError(f"Cannot use list {param_name} with parallel_sample_num > 1")
+            return param
+
     def _normalize_logprob_params(self, num):
         """Normalize logprob-related parameters for batch processing."""
-
-        # Helper function to normalize a parameter
-        def normalize_param(param, default_value, param_name):
-            if param is None:
-                return [default_value] * num
-            elif not isinstance(param, list):
-                return [param] * num
-            else:
-                if self.parallel_sample_num > 1:
-                    raise ValueError(f"Cannot use list {param_name} with parallel_sample_num > 1")
-                return param
-
         # Normalize each logprob parameter
-        self.return_logprob = normalize_param(self.return_logprob, False, "return_logprob")
-        self.logprob_start_len = normalize_param(self.logprob_start_len, -1, "logprob_start_len")
-        self.top_logprobs_num = normalize_param(self.top_logprobs_num, 0, "top_logprobs_num")
+        self.return_logprob = self._normalize_param(
+            self.return_logprob, False, "return_logprob", num
+        )
+        self.logprob_start_len = self._normalize_param(
+            self.logprob_start_len, -1, "logprob_start_len", num
+        )
+        self.top_logprobs_num = self._normalize_param(
+            self.top_logprobs_num, 0, "top_logprobs_num", num
+        )
 
         # Handle token_ids_logprob specially due to its nested structure
         if not self.token_ids_logprob:  # covers both None and []
@@ -437,6 +462,7 @@ class GenerateReqInput:
             stream=self.stream,
             lora_path=self.lora_path[i] if self.lora_path is not None else None,
             lora_id=self.lora_id[i] if self.lora_id is not None else None,
+            return_routed_experts=self.return_routed_experts[i],
         )
 
 

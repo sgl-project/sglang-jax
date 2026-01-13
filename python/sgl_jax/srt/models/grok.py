@@ -250,7 +250,7 @@ class Grok1MoE(nnx.Module):
             layer_id=layer_id,
         )
 
-    def __call__(self, hidden_states: jax.Array) -> jax.Array:
+    def __call__(self, hidden_states: jax.Array) -> tuple[jax.Array, jax.Array]:
         # Router computation with soft capping
         router_logits, _ = self.gate(hidden_states)
 
@@ -267,7 +267,7 @@ class Grok1MoE(nnx.Module):
             router_logits, self.top_k, renormalize=False
         )
 
-        return self.experts(hidden_states, top_k_weights, top_k_indices)
+        return self.experts(hidden_states, top_k_weights, top_k_indices), top_k_indices
 
     def _custom_topk(
         self, router_logits: jax.Array, top_k: int, renormalize: bool = False
@@ -537,7 +537,7 @@ class Grok1DecoderLayer(nnx.Module):
 
         # Setup FFN function based on configuration (matching PyTorch logic)
         if self.num_experts > 0:
-            self.ffn: Callable[[jax.Array], jax.Array] | Grok1MoE
+            self.ffn: Callable[[jax.Array], tuple[jax.Array, jax.Array]] | Grok1MoE
             if self.residual_moe:
                 self.ffn = self.moe_with_rmoe
             else:
@@ -545,12 +545,12 @@ class Grok1DecoderLayer(nnx.Module):
         else:
             raise NotImplementedError()
 
-    def moe_with_rmoe(self, x: jax.Array) -> jax.Array:
+    def moe_with_rmoe(self, x: jax.Array) -> tuple[jax.Array, jax.Array]:
         """Combine MoE and residual MLP outputs (matches PyTorch implementation)."""
         mlp_result = self.mlp(x)
-        moe_result = self.block_sparse_moe(x)
+        moe_result, topk_ids = self.block_sparse_moe(x)
         # Scale factor from the paper: 1/sqrt(2)
-        return (mlp_result + moe_result) / 1.4142135623730951
+        return (mlp_result + moe_result) / 1.4142135623730951, topk_ids
 
     def __call__(
         self,
@@ -560,7 +560,7 @@ class Grok1DecoderLayer(nnx.Module):
         token_to_kv_pool: KVCache,
         residual: jax.Array | None = None,
         deferred_norm: RMSNorm | None = None,
-    ) -> tuple[jax.Array, jax.Array, RMSNorm, jax.Array]:
+    ) -> tuple[jax.Array, jax.Array, RMSNorm, jax.Array, jax.Array]:
 
         # Self Attention block (matching PyTorch logic exactly)
         if deferred_norm is not None:
@@ -600,12 +600,12 @@ class Grok1DecoderLayer(nnx.Module):
 
         # Feed-forward network
         if self.residual_moe:
-            hidden_states = self.moe_with_rmoe(hidden_states)
+            hidden_states, topk_ids = self.moe_with_rmoe(hidden_states)
         else:
-            hidden_states = self.block_sparse_moe(hidden_states)
+            hidden_states, topk_ids = self.block_sparse_moe(hidden_states)
 
         # Return with deferred post-MoE norm (matching PyTorch)
-        return hidden_states, residual, self.post_moe_norm, kv_fused
+        return hidden_states, residual, self.post_moe_norm, kv_fused, topk_ids
 
 
 class Grok1Model(nnx.Module):
@@ -654,7 +654,7 @@ class Grok1Model(nnx.Module):
         forward_batch: ForwardBatch,
         token_to_kv_pool: KVCache,
         input_embeds: jax.Array | None = None,
-    ) -> tuple[jax.Array, list[jax.Array]]:
+    ) -> tuple[jax.Array, list[jax.Array], list[jax.Array]]:
         # Get embeddings, hidden_states: [B, N, hidden_size]
         if input_embeds is None:
             hidden_states = self.embed_tokens(input_ids)
@@ -667,8 +667,9 @@ class Grok1Model(nnx.Module):
         # Process through transformer layers with deferred normalization
         residual, deferred_norm = None, None
         layers_kv_fused = []
+        layers_topk_ids = []
         for layer in self.layers:
-            hidden_states, residual, deferred_norm, kv_fused = layer(
+            hidden_states, residual, deferred_norm, kv_fused, topk_ids = layer(
                 positions,
                 hidden_states,
                 forward_batch,
@@ -677,6 +678,7 @@ class Grok1Model(nnx.Module):
                 deferred_norm,
             )
             layers_kv_fused.append(kv_fused)
+            layers_topk_ids.append(topk_ids)
         # Apply final normalization (matching PyTorch fused_dual_residual_rmsnorm)
         assert deferred_norm is not None
         assert residual is not None
@@ -690,7 +692,7 @@ class Grok1Model(nnx.Module):
             deferred_norm.epsilon,
         )
 
-        return hidden_states, layers_kv_fused
+        return hidden_states, layers_kv_fused, layers_topk_ids
 
 
 class Grok1ForCausalLM(nnx.Module):
@@ -779,16 +781,16 @@ class Grok1ForCausalLM(nnx.Module):
         forward_batch: ForwardBatch,
         token_to_kv_pool: KVCache,
         logits_metadata: LogitsMetadata,
-    ) -> tuple[LogitsProcessorOutput, list[jax.Array], bool]:
+    ) -> tuple[LogitsProcessorOutput, list[jax.Array], bool, list[jax.Array]]:
         """Forward pass through the model using unified forward_batch API."""
         input_ids = forward_batch.input_ids
         positions = forward_batch.positions
-        hidden_states, layers_kv_fused = self.model(
+        hidden_states, layers_kv_fused, layers_topk_ids = self.model(
             input_ids, positions, forward_batch, token_to_kv_pool, None
         )
         output = self.logits_processor(hidden_states, cast(Embed, self.lm_head), logits_metadata)
 
-        return output, layers_kv_fused, True
+        return output, layers_kv_fused, True, layers_topk_ids
 
     def load_weights(self, model_config: ModelConfig) -> None:
         loader = WeightLoader(

@@ -16,6 +16,7 @@ from tqdm import tqdm
 from sgl_jax.srt.configs.model_config import ModelConfig
 from sgl_jax.srt.constrained.bitmask_ops import allocate_token_bitmask
 from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessorOutput
+from sgl_jax.srt.layers.routed_experts_capturer import get_global_experts_capturer
 from sgl_jax.srt.managers.schedule_batch import (
     ModelWorkerBatch,
     global_server_args_dict,
@@ -489,10 +490,14 @@ class ModelWorker:
             )
 
         self.model_runner.attn_backend.forward_metadata = forward_metadata
-        logits_output, cache_miss_count = self.model_runner.forward(
+        logits_output, cache_miss_count, layers_topk_ids = self.model_runner.forward(
             forward_batch,
             logits_metadata=LogitsMetadata.from_model_worker_batch(model_worker_batch, self.mesh),
         )
+        get_global_experts_capturer().on_forward_end(layers_topk_ids, model_worker_batch)
+
+        self.dump_topk_ids(layers_topk_ids, model_worker_batch)
+
         if launch_done is not None:
             launch_done.set()
 
@@ -558,6 +563,48 @@ class ModelWorker:
             next_token_ids_device,
             cache_miss_count,
         )
+
+    def dump_topk_ids(self, layers_topk_ids: list[jax.Array], model_worker_batch: ModelWorkerBatch):
+        enable = self.server_args.enable_return_routed_experts
+        dump_topk_ids_file_info = os.getenv("DUMP_TOPK_IDS_FILEINFO", None)
+        if not enable or dump_topk_ids_file_info is None:
+            return
+
+        # format: {prefill_file_name},{decode_file_name}
+        file_slice = dump_topk_ids_file_info.split(",")
+        if model_worker_batch.forward_mode.is_extend():
+            file_name = file_slice[0]
+        elif model_worker_batch.forward_mode.is_decode():
+            file_name = file_slice[1]
+        else:
+            raise ValueError(
+                f"Unsupported {model_worker_batch.forward_mode} to save topk_ids with txt"
+            )
+        import datetime
+
+        unpadded_input_len = model_worker_batch.get_original_input_len()
+        layers_topk_ids_cpu = jax.device_get(layers_topk_ids)
+
+        file_name = (
+            f"{datetime.datetime.now().strftime('%Y-%m-%d_%H_%M_%S')}_{unpadded_input_len}"
+            + file_name
+        )
+
+        valid_topk_ids = []
+        for ids_cpu in layers_topk_ids_cpu:
+            valid_ids = ids_cpu[
+                :unpadded_input_len, : self.model_config.hf_text_config.num_experts_per_tok
+            ]
+            valid_topk_ids.append(valid_ids)
+
+        # Stack to create (num_layers, seq_len, num_experts_per_tok)
+        valid_topk_ids_stacked = np.stack(valid_topk_ids, axis=0)
+
+        # Transpose to (seq_len, num_layers, num_experts_per_tok)
+        seq_layer_topk_cpu = np.transpose(valid_topk_ids_stacked, (1, 0, 2))
+
+        # os.makedirs(os.path.dirname(file_name), exist_ok=True)
+        np.savetxt(file_name, np.asarray(seq_layer_topk_cpu).flatten(), fmt="%d")
 
 
 class MockModelWorker:

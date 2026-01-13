@@ -364,6 +364,7 @@ class TokenizerManager:
             obj.stream,
             obj.lora_id,
             obj.extra_key,
+            obj.return_routed_experts,
         )
         # note: When only `return_logprob` is specified, we assume that only the output probability is required.
         if (
@@ -955,6 +956,11 @@ class TokenizerManager:
 
             if getattr(recv_obj, "output_hidden_states", None):
                 meta_info["hidden_states"] = recv_obj.output_hidden_states[i]
+
+            if getattr(recv_obj, "output_routed_experts", None):
+                meta_info["routed_experts"] = recv_obj.output_routed_experts[i]
+
+            # print(f"[tokenizer_manager_handle_batch_output] {meta_info['routed_experts']=}")
 
             if getattr(recv_obj, "cache_miss_count", None) is not None:
                 if (
