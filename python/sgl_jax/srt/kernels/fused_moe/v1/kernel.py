@@ -541,7 +541,6 @@ def _fused_ep_moe_kernel(
     bd1c: int,  # Compute size of block hidden_size.
     bd2c: int,  # Compute size of block hidden_size.
     bse: int,  # Block size for SE intermediate_size.
-    a2a_only: bool,
     disable_a2a: bool,
     disable_dynamic_ffn1: bool,
     disable_dynamic_ffn2: bool,
@@ -1967,7 +1966,7 @@ def _fused_ep_moe_kernel(
     def run_shared_expert_slice(block_id, bt_sem_id, out_buf_id):
         if disable_shared_expert:
             return
-        
+
         if w1_shared_hbm is None:
             return
 
@@ -2126,23 +2125,11 @@ def _fused_ep_moe_kernel(
         def run_per_expert_pipelined(local_e_id, carry):
             curr_e_sem_id, curr_se_block = carry
 
-            run_shared_expert_slice(curr_se_block, bt_sem_id, out_buf_id)
-            curr_se_block += 1
+            @pl.when(curr_se_block == 0)
+            def _():
+                run_shared_expert_slice(0, bt_sem_id, out_buf_id)
 
-            wait_a2a_scatter_recv(
-                bt_sem_id=bt_sem_id, e_sem_id=curr_e_sem_id, local_e_id=local_e_id
-            )
-
-            if not a2a_only:
-                start_fetch_bw1(local_e_id, bw1_sem_id=0, bf_id=0, bd1_id=0)
-                start_fetch_bw3(local_e_id, bw3_sem_id=0, bf_id=0, bd3_id=0)
-                expert_ffn(bt_sem_id, curr_e_sem_id, local_e_id)
-            else:
-                wait_a2a_gather_send(
-                    bt_sem_id=bt_sem_id, e_sem_id=curr_e_sem_id, local_e_id=local_e_id - 2
-                )
-
-            start_a2a_gather(bt_sem_id=bt_sem_id, e_sem_id=curr_e_sem_id, local_e_id=local_e_id)
+            curr_se_block = lax.select(curr_se_block == 0, jnp.int32(1), curr_se_block)
 
             next_e_sem_id = lax.select(curr_e_sem_id == 0, 1, 0)
             next_local_e_id = local_e_id + 1
@@ -2155,6 +2142,16 @@ def _fused_ep_moe_kernel(
                     local_e_id=next_local_e_id,
                     bt_start=bt_start,
                 )
+
+            wait_a2a_scatter_recv(
+                bt_sem_id=bt_sem_id, e_sem_id=curr_e_sem_id, local_e_id=local_e_id
+            )
+
+            start_fetch_bw1(local_e_id, bw1_sem_id=0, bf_id=0, bd1_id=0)
+            start_fetch_bw3(local_e_id, bw3_sem_id=0, bf_id=0, bd3_id=0)
+            expert_ffn(bt_sem_id, curr_e_sem_id, local_e_id)
+
+            start_a2a_gather(bt_sem_id=bt_sem_id, e_sem_id=curr_e_sem_id, local_e_id=local_e_id)
 
             run_shared_expert_slice(curr_se_block, bt_sem_id, out_buf_id)
             curr_se_block += 1
@@ -2430,7 +2427,6 @@ def _validate_fused_ep_moe_args(
         "dp_axis_name",
         "tp_axis_name",
         "balanced_topk",
-        "a2a_only",
         "disable_a2a",
         "disable_dynamic_ffn1",
         "disable_dynamic_ffn2",
@@ -2479,7 +2475,6 @@ def fused_ep_moe(
     block_config: FusedMoEBlockConfig | None = None,
     dp_axis_name: str = "data",
     tp_axis_name: str = "tensor",
-    a2a_only: bool = False,
     disable_a2a: bool = False,
     disable_dynamic_ffn1: bool = False,
     disable_dynamic_ffn2: bool = False,
@@ -2778,7 +2773,6 @@ def fused_ep_moe(
                 bd1c=block_config.bd1c,
                 bd2c=block_config.bd2c,
                 bse=block_config.bse,
-                a2a_only=a2a_only,
                 disable_a2a=disable_a2a,
                 disable_dynamic_ffn1=disable_dynamic_ffn1,
                 disable_dynamic_ffn2=disable_dynamic_ffn2,

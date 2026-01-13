@@ -541,7 +541,6 @@ class FusedEPMoE(nnx.Module):
         moe_shared_expert_intermediate_size: int | None = None,
         *,
         balanced_topk: bool = False,
-        a2a_only: bool = False,
         disable_a2a: bool = False,
         disable_dynamic_ffn1: bool = False,
         disable_dynamic_ffn2: bool = False,
@@ -570,7 +569,6 @@ class FusedEPMoE(nnx.Module):
         )
         self.balanced_topk = balanced_topk
         self.mesh = mesh
-        self.a2a_only = a2a_only
         self.disable_a2a = disable_a2a
         self.disable_dynamic_ffn1 = disable_dynamic_ffn1
         self.disable_dynamic_ffn2 = disable_dynamic_ffn2
@@ -704,7 +702,6 @@ class FusedEPMoE(nnx.Module):
             b3=None,
             dp_axis_name="data",
             tp_axis_name="tensor",
-            a2a_only=self.a2a_only,
             disable_a2a=self.disable_a2a,
             disable_dynamic_ffn1=self.disable_dynamic_ffn1,
             disable_dynamic_ffn2=self.disable_dynamic_ffn2,
