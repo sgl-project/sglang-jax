@@ -51,12 +51,5 @@ def get_tpu_version() -> int:
     return int(version_digits)
 
 
-def get_device_name(num_devices: int | None = None):
-    name = " ".join(jax.devices()[0].device_kind.split()[:2])
-    if num_devices is not None:
-        name += f"-{num_devices}"
-    return name
-
-
 def get_dtype_bitwidth(dtype):
     return dtypes.bit_width(dtype) if hasattr(dtypes, "bit_width") else dtypes.itemsize_bits(dtype)

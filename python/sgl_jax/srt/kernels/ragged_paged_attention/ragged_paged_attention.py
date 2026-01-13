@@ -1340,6 +1340,10 @@ def static_validate_inputs_fused(
     del xai_temperature_len
 
 
+def get_kernel_scope_name(bq_size, bkv_p, page_size):
+    return f"RPA-bq_{bq_size}-bkvp_{bkv_p}-p_{page_size}-"
+
+
 @functools.partial(
     jax.jit,
     static_argnames=(
@@ -1617,7 +1621,7 @@ def ragged_paged_attention(
     bytes_accessed = q_bytes + o_bytes + kv_bytes_read + kv_bytes_write
     cost_estimate = pl.CostEstimate(flops=flops, bytes_accessed=bytes_accessed, transcendentals=0)
 
-    scope_name = f"RPA-bq_{bq_sz}-bkvp_{bkv_p}-p_{page_size}"
+    scope_name = get_kernel_scope_name(bq_sz, bkv_p, page_size)
     kernel = pl.pallas_call(
         functools.partial(
             _ragged_paged_attention_kernel,
