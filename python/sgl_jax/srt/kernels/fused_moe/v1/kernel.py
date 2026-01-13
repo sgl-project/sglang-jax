@@ -498,7 +498,7 @@ def _fused_ep_moe_kernel(
     b_b3_x2_vmem,  # None | <bw_sem_id> (2, 1, bf)
     b_b2_x2_vmem,  # None | <bw_sem_id> (2, t_packing, 1, bd2 // t_packing)
     b_acc_vmem,  # F32(2, align_to(bt * num_devices, bts), 1, bf)
-    t_stage_x2_vmem,  # <token_buf_id> (2, bts, t_packing, bd1 // t_packing)
+    b_stage_x2_vmem,  # <token_buf_id> (2, bts, t_packing, bd1 // t_packing)
     a2a_s_acc_stage_x3_vmem,  # <acc_buf_id> (3, bts, t_packing, bd2 // t_packing)
     b_bias_vmem,  # None | F32(padded_num_experts,)
     b_se_tokens_vmem,  # None | (bt, hidden_size // t_packing) [Input Buffer]
@@ -1542,7 +1542,7 @@ def _fused_ep_moe_kernel(
                     pl.ds(0, t_packing),
                     pl.ds(bd1_id * bd1_per_t_packing, bd1_per_t_packing),
                 ],
-                dst_ref=t_stage_x2_vmem.at[
+                dst_ref=b_stage_x2_vmem.at[
                     buf_id,
                     pl.ds(0, token_tile),
                     pl.ds(0, t_packing),
@@ -1555,8 +1555,8 @@ def _fused_ep_moe_kernel(
             if disable_a2a_s_tile_read:
                 return
             pltpu.make_async_copy(
-                src_ref=t_stage_x2_vmem.at[buf_id, pl.ds(0, token_tile)],
-                dst_ref=t_stage_x2_vmem.at[buf_id, pl.ds(0, token_tile)],
+                src_ref=b_stage_x2_vmem.at[buf_id, pl.ds(0, token_tile)],
+                dst_ref=b_stage_x2_vmem.at[buf_id, pl.ds(0, token_tile)],
                 sem=token_stage_x2_sems.at[buf_id],
             ).wait()
 
@@ -1690,7 +1690,7 @@ def _fused_ep_moe_kernel(
 
                         tile_sz = jnp.maximum(jnp.minimum(dyn_sz_i32 - tile_start, token_tile), 0)
                         dynamic_ffn1(
-                            t_vmem=t_stage_x2_vmem.at[token_buf_id],
+                            t_vmem=b_stage_x2_vmem.at[token_buf_id],
                             w1_vmem=w1_vmem,
                             w1_scale_vmem=w1_scale_vmem,
                             b1_vmem=b1_vmem,
@@ -2661,7 +2661,7 @@ def fused_ep_moe(
         b3_scratch,  # b_b3_x2_vmem
         b2_scratch,  # b_b2_x2_vmem
         pltpu.VMEM((2, a2a_max_tokens, 1, block_config.bf), jnp.float32),  # b_acc_vmem
-        pltpu.VMEM((2, block_config.bts, t_packing, bd1_per_pack), t_dtype),  # t_stage_x2_vmem
+        pltpu.VMEM((2, block_config.bts, t_packing, bd1_per_pack), t_dtype),  # b_stage_x2_vmem
         pltpu.VMEM(
             (3, block_config.bts, t_packing, bd2_per_pack),
             t_dtype,
