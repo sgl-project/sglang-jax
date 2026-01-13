@@ -2332,6 +2332,21 @@ def _validate_fused_ep_moe_args(
         block_config=block_config,
     )
 
+    # Mosaic DMA tiling constraint for `start_fetch_b_gating`: the slice size along
+    # the token dimension must be aligned to the underlying HBM tiling of router logits.
+    # For very small `bt` (e.g. 2) with `router_logits` in f32, Mosaic will tile as
+    # (min(8, local_num_tokens), 128) and reject unaligned slices.
+    local_num_tokens = num_tokens // ep_size
+    gating_bits = jnp.dtype(gating_output.dtype).itemsize * 8
+    router_tile0 = 256 // gating_bits
+    router_tile0 = min(router_tile0, local_num_tokens)
+    if block_config.bt % router_tile0 != 0:
+        raise ValueError(
+            "Unsupported block_config.bt for router_logits tiling: "
+            f"bt={block_config.bt} must be divisible by router_tile0={router_tile0} "
+            f"(router_logits dtype={jnp.dtype(gating_output.dtype).name}, local_num_tokens={local_num_tokens})."
+        )
+
     # Note: block_config.bt is the outer expert-side token tile (routing/comm + output tiling);
     # block_config.bts is the inner token staging tile used inside expert_ffn.
 
