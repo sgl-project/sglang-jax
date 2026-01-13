@@ -152,7 +152,9 @@ def _estimate_vmem_bytes(
         se_w1 = 2 * bd1 * cfg.bse * weight_bytes  # (2, t_packing, bd/pack, bse)
         se_w3 = 2 * bd1 * cfg.bse * weight_bytes
         se_w2 = 2 * cfg.bse * bd2 * weight_bytes
-        se_tokens = 2 * bt * hidden * token_bytes  # (2, bt, hidden)
+        # Matches fused_moe kernel scratch shape (bt ping-pong x bd1-slice ping-pong):
+        # (2, 2, bt, t_packing, bd1_per_pack) => 4 * bt * bd1 elements.
+        se_tokens = 4 * bt * bd1 * token_bytes
         total_bytes += se_w1 + se_w3 + se_w2 + se_tokens
 
     if verbose:
@@ -193,7 +195,9 @@ def _estimate_vmem_bytes(
             print(
                 f"      b_se_w2_x2_vmem:        {_mb(se_w2)} MB  (2, {t_packing}, {bf}, {bd2 // t_packing})"
             )
-            print(f"      b_se_tokens_vmem:       {_mb(se_tokens)} MB  (2, {bt}, {hidden})")
+            print(
+                f"      b_se_tokens_vmem:       {_mb(se_tokens)} MB  (2, 2, {bt}, {t_packing}, {bd1 // t_packing})"
+            )
         print("      ----------------------------")
         print(f"      Total:                  {_mb(total_bytes)} MB")
 
