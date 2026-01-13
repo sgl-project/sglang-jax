@@ -2166,7 +2166,6 @@ def _fused_ep_moe_kernel(
             start_fetch_se_tokens(next_bt_id)
 
         wait_fetch_b_gating(bt_id=bt_id)
-        wait_fetch_se_tokens(bt_id)
 
         b_gating = b_gating_x2_vmem.at[bt_sem_id][...]
         t2e_routing, expert_sizes, expert_starts = get_top_k(
