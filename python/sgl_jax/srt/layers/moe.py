@@ -308,9 +308,9 @@ class EPMoE(nnx.Module):
 
             # Update scales (reshape to 4D for GMM kernel)
             # Wrap with nnx.data() to override static attribute status
-            self.wi_0_scale = nnx.data(w0_scale.reshape(w0_scale.shape[0], 1, 1, w0_scale.shape[1]))
-            self.wi_1_scale = nnx.data(w1_scale.reshape(w1_scale.shape[0], 1, 1, w1_scale.shape[1]))
-            self.wo_scale = nnx.data(wo_scale.reshape(wo_scale.shape[0], 1, 1, wo_scale.shape[1]))
+            self.wi_0_scale = w0_scale.reshape(w0_scale.shape[0], 1, 1, w0_scale.shape[1])
+            self.wi_1_scale = w1_scale.reshape(w1_scale.shape[0], 1, 1, w1_scale.shape[1])
+            self.wo_scale = wo_scale.reshape(wo_scale.shape[0], 1, 1, wo_scale.shape[1])
 
     def __call__(self, hidden_states, topk_weights, topk_ids) -> jax.Array:
         # Activation quantization is now handled per-GEMM inside _gmm_compute
