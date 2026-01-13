@@ -9,8 +9,8 @@ pip install skypilot
 sky api login
 ```
 
-Enter your SkyPilot API server endpoint: Please join the [SGL-JAX Slack](https://sgl-fru7574.slack.com/archives/C09EBE5HT5X) and gain it from maintainers.
-
+Enter your SkyPilot API server endpoint: you must first join the SGLang Slack workspace (https://slack.sglang.io/), and then join the SGL-JAX Slack channel (https://sgl-fru7574.slack.com/archives/C09EBE5HT5X
+) to obtain it from the maintainers.
 ## Generate a Yaml
 
 ```yaml
