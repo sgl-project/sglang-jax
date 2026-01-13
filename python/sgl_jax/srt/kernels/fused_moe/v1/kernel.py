@@ -1692,10 +1692,6 @@ def _fused_ep_moe_kernel(
                         start_fetch_bw1(local_e_id, next_bw_sem_id, bf_id, next_bd1_id)
                         start_fetch_bw3(local_e_id, next_bw_sem_id, bf_id, next_bd1_id)
 
-                    @pl.when(next_bd1_id == num_bd1)
-                    def _():
-                        start_fetch_bw2(local_e_id, next_bw_sem_id, bf_id, jnp.int32(0))
-
                     @pl.when(num_token_tiles > 0)
                     def _(bd1_id=bd1_id):
                         start_stage_a2a_s_tile_from_hbm(jnp.int32(0), bd1_id, jnp.int32(0))
@@ -1713,6 +1709,10 @@ def _fused_ep_moe_kernel(
                     wait_fetch_bw3(local_e_id, bw_sem_id, bf_id, bd1_id)
                     w1_vmem = b_w1_x2_vmem.at[bw_sem_id]
                     w3_vmem = b_w3_x2_vmem.at[bw_sem_id]
+
+                    @pl.when(next_bd1_id == num_bd1)
+                    def _():
+                        start_fetch_bw2(local_e_id, next_bw_sem_id, bf_id, jnp.int32(0))
 
                     def run_ffn1_tile(
                         token_tile_id,
