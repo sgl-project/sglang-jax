@@ -1687,14 +1687,14 @@ def _fused_ep_moe_kernel(
                     next_bw_sem_id = 1 - bw_sem_id
                     next_bd1_id = bd1_id + jnp.int32(1)
 
+                    @pl.when(num_token_tiles > 0)
+                    def _(bd1_id=bd1_id):
+                        start_stage_a2a_s_tile_from_hbm(jnp.int32(0), bd1_id, jnp.int32(0))
+
                     @pl.when(next_bd1_id < num_bd1)
                     def _():
                         start_fetch_bw1(local_e_id, next_bw_sem_id, bf_id, next_bd1_id)
                         start_fetch_bw3(local_e_id, next_bw_sem_id, bf_id, next_bd1_id)
-
-                    @pl.when(num_token_tiles > 0)
-                    def _(bd1_id=bd1_id):
-                        start_stage_a2a_s_tile_from_hbm(jnp.int32(0), bd1_id, jnp.int32(0))
 
                     w1_scale_vmem = (
                         None if b_w1_scale_x2_vmem is None else b_w1_scale_x2_vmem.at[bw_sem_id]
