@@ -1164,38 +1164,67 @@ def _fused_ep_moe_kernel(
                     sem=local_sems.at[bw3_sem_id, 3],
                 ).wait()
 
-    def _se_token_sem(bt_sem_id, buf_id):
-        return local_sems.at[bt_sem_id, 8 + buf_id]
-
     def start_fetch_se_tokens_slice(*, bt_start, bt_sem_id, bd1_idx, buf_id):
         if w1_shared_hbm is None or disable_shared_expert:
             return
         bd1_start = bd1_idx * bd1_per_t_packing
-        pltpu.make_async_copy(
-            src_ref=tokens_hbm.at[
-                pl.ds(bt_start, bt),
-                pl.ds(0, t_packing),
-                pl.ds(bd1_start, bd1_per_t_packing),
-            ],
-            dst_ref=b_se_tokens_vmem.at[
-                bt_sem_id,
-                buf_id,
-                pl.ds(0, bt),
-                pl.ds(0, t_packing),
-                pl.ds(0, bd1_per_t_packing),
-            ],
-            sem=_se_token_sem(bt_sem_id, buf_id),
-        ).start()
+        src_ref = tokens_hbm.at[
+            pl.ds(bt_start, bt),
+            pl.ds(0, t_packing),
+            pl.ds(bd1_start, bd1_per_t_packing),
+        ]
+
+        # Use static semaphore indices; dynamic selection on the 2nd axis of
+        # `local_sems` can cause Mosaic scheduling issues / deadlocks.
+        @pl.when(buf_id == 0)
+        def _():
+            pltpu.make_async_copy(
+                src_ref=src_ref,
+                dst_ref=b_se_tokens_vmem.at[
+                    bt_sem_id,
+                    0,
+                    pl.ds(0, bt),
+                    pl.ds(0, t_packing),
+                    pl.ds(0, bd1_per_t_packing),
+                ],
+                sem=local_sems.at[bt_sem_id, 8],
+            ).start()
+
+        @pl.when(buf_id != 0)
+        def _():
+            pltpu.make_async_copy(
+                src_ref=src_ref,
+                dst_ref=b_se_tokens_vmem.at[
+                    bt_sem_id,
+                    1,
+                    pl.ds(0, bt),
+                    pl.ds(0, t_packing),
+                    pl.ds(0, bd1_per_t_packing),
+                ],
+                sem=local_sems.at[bt_sem_id, 9],
+            ).start()
 
     def wait_fetch_se_tokens_slice(*, bt_sem_id, buf_id):
         if w1_shared_hbm is None or disable_shared_expert:
             return
-        ref = b_se_tokens_vmem.at[bt_sem_id, buf_id]
-        pltpu.make_async_copy(
-            src_ref=ref,
-            dst_ref=ref,
-            sem=_se_token_sem(bt_sem_id, buf_id),
-        ).wait()
+
+        @pl.when(buf_id == 0)
+        def _():
+            ref = b_se_tokens_vmem.at[bt_sem_id, 0]
+            pltpu.make_async_copy(
+                src_ref=ref,
+                dst_ref=ref,
+                sem=local_sems.at[bt_sem_id, 8],
+            ).wait()
+
+        @pl.when(buf_id != 0)
+        def _():
+            ref = b_se_tokens_vmem.at[bt_sem_id, 1]
+            pltpu.make_async_copy(
+                src_ref=ref,
+                dst_ref=ref,
+                sem=local_sems.at[bt_sem_id, 9],
+            ).wait()
 
     def start_fetch_se_tokens(bt_id):
         if w1_shared_hbm is None or disable_shared_expert:
@@ -2001,6 +2030,18 @@ def _fused_ep_moe_kernel(
         @pl.when(block_id < se_total_blocks)
         def _():
             bt_start = bt_id * bt
+
+            # `b_se_tokens_vmem` is a (2, 2, ...) ping-pong buffer that gets overwritten
+            # as we stream over `bd1_idx`. For correctness, restart the stream from
+            # `bd1_idx=0` for each shared-expert block beyond the first.
+            @pl.when(block_id != 0)
+            def _():
+                start_fetch_se_tokens_slice(
+                    bt_start=bt_start,
+                    bt_sem_id=bt_sem_id,
+                    bd1_idx=jnp.int32(0),
+                    buf_id=jnp.int32(0),
+                )
 
             if num_bd1 > 0:
                 start_fetch_se_w1(0, block_id, 0)
