@@ -9,7 +9,9 @@ This document describes the design and implementation of the `enable_return_rout
 - Expert utilization monitoring
 - Research on MoE routing patterns
 
-Note: This design document refers to https://github.com/sgl-project/sglang/pull/12162/files#diff-8e61cb3c05ca6a5e195f011e21ea7544f9f7e08163e3ce4ffa0bacb4b5735259.
+Note:
+- This design document refers to [PR12162](https://github.com/sgl-project/sglang/pull/12162/files#diff-8e61cb3c05ca6a5e195f011e21ea7544f9f7e08163e3ce4ffa0bacb4b5735259).
+- Difference: `_RoutedExpertsDeviceCache` will be removed due to explicit axis and reshard performance problems in every layer.
 
 ---
 
@@ -23,7 +25,7 @@ The `enable_return_routed_experts` feature introduces a data capture and return 
 
 1. **Request Parameter Propagation**: A new boolean field `return_routed_experts` is added to request structures, flowing from client input through all intermediate components to the model runner.
 
-2. **Expert Capture Mechanism**: During model forward passes, expert routing decisions (topk expert IDs) are captured in device buffers and synchronously transferred to CPU memory for later retrieval.
+2. **Expert Capture Mechanism**: During model forward passes, expert routing decisions (topk expert IDs) are returned and synchronously transferred to CPU memory for later retrieval.
 
 3. **Result Aggregation**: After inference completes, the captured expert routing information is retrieved from the capturer, attached to the request state, and returned to the client alongside standard outputs.
 
@@ -279,10 +281,9 @@ pybase64.b64encode(array.numpy().tobytes()).decode("utf-8")
 
 #### 3.2.1 Architecture Overview
 
-The `RoutedExpertsCapturer` is the core component responsible for capturing, storing, and retrieving expert routing information from MoE models. It implements a two-tier caching strategy with:
+The `RoutedExpertsCapturer` is the core component responsible for capturing, storing, and retrieving expert routing information from MoE models. It implements with:
 
-1. **Device Cache**: Fast, volatile buffer for capturing expert IDs during forward passes
-2. **Host Cache**: Persistent, pinned memory buffer for long-term storage and retrieval
+1. **Host Cache**: Persistent, memory buffer for long-term storage and retrieval
 
 The component uses a **factory pattern** with two implementations:
 - `_RoutedExpertsCapturerReal`: Active implementation when feature is enabled
@@ -293,8 +294,6 @@ The component uses a **factory pattern** with two implementations:
 ```
 RoutedExpertsCapturer (ABC)
 ├── _RoutedExpertsCapturerReal
-│   ├── _RoutedExpertsDeviceCache (Device buffer)
-│   └── _RoutedExpertsHostCache (CPU buffer)
 └── _RoutedExpertsCapturerNoop (no-op)
 ```
 
@@ -320,119 +319,16 @@ def set_global_experts_capturer(capturer: RoutedExpertsCapturer):
 def create(
     enable: bool,
     model_config: ModelConfig,
-    num_fused_shared_experts: int,
     num_tokens: int,
-    max_running_requests: int,
 ) -> RoutedExpertsCapturer
 ```
 
 **Parameters**:
 - `enable`: Whether to create real or no-op capturer (from `server_args.enable_return_routed_experts`)
 - `model_config`: Model configuration containing layer count and expert topology
-- `num_fused_shared_experts`: Number of fused shared experts (used for buffer sizing)
 - `num_tokens`: Total size of token pool (determines host cache size)
-- `max_running_requests`: Maximum concurrent requests (determines device cache size with other factors in prefill, like chunked_prefill_size)
 
----
-
-#### 3.2.4 Device Cache: `_RoutedExpertsDeviceCache`
-
-**Purpose**: Device-side buffer for capturing expert IDs during forward passes.
-
-##### A. Initialization
-
-```python
-@register_pytree_node_class
-class _RoutedExpertsDeviceCache:
-    def __init__(
-        self,
-        max_running_requests: int,
-        num_hidden_layers: int,
-        num_experts_per_tok: int,
-        num_fused_shared_experts: int,
-    ) -> None:
-        self.buffer = jnp.zeros(
-            (
-                max(
-                    get_global_server_args().chunked_prefill_size,
-                    max_running_requests,
-                ),
-                num_hidden_layers,
-                num_experts_per_tok + num_fused_shared_experts,
-            ),
-            dtype=jnp.int32,
-        )
-```
-
-**Buffer Shape**:
-- Dimension 0: `max(chunked_prefill_size, max_running_requests)`
-  - Accommodates both prefill and decode batches
-- Dimension 1: `num_hidden_layers` - One slice per model layer
-- Dimension 2: `num_experts_per_tok + num_fused_shared_experts`
-  - Stores topk expert IDs plus fused shared experts
-
-**Memory Footprint Example** (Qwen3-30B-A3B MoE):
-- Shape: `[max(2048, 1024), 48, 8+0]` = `[2048, 48, 8]`
-- Size: `2048 × 48 × 8 × 4 bytes` = **3.0 MB**
-
-##### B. Capture Method
-
-```python
-def capture_fwd_routed_experts(self, layer_id: int, topk_ids: jax.Array):
-    assert layer_id is not None, "capturing routing experts but get layer_id None"
-    batch, _ = topk_ids.shape
-    new_buffer = self.buffer.at[:batch, layer_id, :].set(topk_ids) # Note: This method may be changed in the real codes
-
-    self.buffer = new_buffer
-    return new_buffer
-```
-
----
-
-#### 3.2.5 Host Cache: `_RoutedExpertsHostCache`
-
-**Purpose**: CPU-side pinned memory buffer for persistent storage of expert IDs.
-
-##### A. Initialization
-
-```python
-class _RoutedExpertsHostCache:
-    def __init__(
-        self,
-        num_tokens: int,
-        num_hidden_layers: int,
-        num_experts_per_tok: int,
-    ) -> None:
-        self.num_tokens = num_tokens
-        self.buffer = np.zeros(
-            (
-                num_tokens,
-                num_hidden_layers,
-                num_experts_per_tok,
-            ),
-            dtype=np.int32,
-        )
-```
-
-**Buffer Shape**:
-- Dimension 0: `num_tokens` - One slot per token in the token pool
-- Dimension 1: `num_hidden_layers` - One slice per layer
-- Dimension 2: `num_experts_per_tok` - Stores topk expert IDs only (no shared experts)
-
-**Memory Footprint Example** (Large deployment):
-- Shape: `[131072, 48, 8]` (128K tokens)
-- Size: `131072 × 48 × 8 × 4 bytes` = **192MB**
-
-##### B. Set Method
-
-```python
-def set_experts_buffer(self, layer_id: int, loc: np.ndarray, top_k: np.ndarray):
-    self.buffer[layer_id, loc, :] = top_k
-```
-
----
-
-#### 3.2.6 Real Capturer: `_RoutedExpertsCapturerReal`
+#### 3.2.4 Real Capturer: `_RoutedExpertsCapturerReal`
 
 ##### A. Initialization
 
@@ -442,42 +338,35 @@ class _RoutedExpertsCapturerReal(RoutedExpertsCapturer):
         self,
         model_config: ModelConfig,
         num_tokens: int,
-        max_running_requests: int,
-        num_fused_shared_experts: int,
     ):
-        self.num_fused_shared_experts = num_fused_shared_experts
         self.num_hidden_layers = model_config.hf_text_config.num_hidden_layers
         self.num_experts_per_tok = model_config.hf_text_config.num_experts_per_tok
 
-        self.host_cache = _RoutedExpertsHostCache(
-            num_tokens=num_tokens,
-            num_hidden_layers=self.num_hidden_layers,
-            num_experts_per_tok=self.num_experts_per_tok,
-        )
-
-        self.device_cache = _RoutedExpertsDeviceCache(
-            max_running_requests=max_running_requests,
-            num_hidden_layers=self.num_hidden_layers,
-            num_experts_per_tok=self.num_experts_per_tok,
-            num_fused_shared_experts=self.num_fused_shared_experts,
+        self.host_buffer = np.zeros(
+            (
+                num_tokens,
+                self.num_hidden_layers,
+                self.num_experts_per_tok,
+            ),
+            dtype=np.int32,
         )
 ```
 
-##### B. Capture Method
+**Host Buffer Shape**:
+Dimension 0: `num_tokens` - One slot per token in the token pool
+Dimension 1: `num_hidden_layers` - One slice per layer
+Dimension 2: `num_experts_per_tok` - Stores topk expert IDs only (no shared experts)
 
-```python
-def capture(self, layer_id: int, topk_ids: jax.Array):
-    self.device_cache.capture_fwd_routed_experts(layer_id, topk_ids)
-```
+**Memory Footprint Example (Large deployment)**:
+Shape: [131072, 48, 8] (128K tokens)
+Size: 131072 × 48 × 8 × 4 bytes = 192MB
 
-##### C. Device-to-Host Synchronization
+##### B. Device-to-Host Synchronization
 
 ```python
 def _sync_fwd_experts_buffer_DtoH(
     self,
-    forward_batch: ForwardBatch,
-    can_run_graph: bool,
-    cuda_graph_batch: int,
+    model_worker_batch: ModelWorkerBatch,
 ):
     pass
 ```
@@ -487,7 +376,7 @@ def _sync_fwd_experts_buffer_DtoH(
 2. Performs indexed copy from device buffer to host buffer
 3. Synchronizes CPU and Device (blocking operation)
 
-##### D. Retrieval Method
+##### C. Retrieval Method
 
 ```python
 def get_routed_experts(
@@ -508,18 +397,18 @@ def get_routed_experts(
 
 **Why `seqlen-1`?**: The last token in the sequence hasn't been routed yet during prefill, or represents the position where we want to generate the next token during decode.
 
-##### E. Forward End Hook
+##### D. Forward End Hook
 
 ```python
-def on_forward_end(self, forward_batch):
+def on_forward_end(self, model_worker_batch):
     self._sync_fwd_experts_buffer_DtoH(
-        forward_batch=forward_batch,
+        model_worker_batch=model_worker_batch,
     )
 ```
 
 ---
 
-#### 3.2.7 No-Op Capturer: `_RoutedExpertsCapturerNoop`
+#### 3.2.5 No-Op Capturer: `_RoutedExpertsCapturerNoop`
 
 **Purpose**: Zero-overhead placeholder when feature is disabled.
 
@@ -540,7 +429,7 @@ class _RoutedExpertsCapturerNoop(RoutedExpertsCapturer):
     ):
         pass
 
-    def on_forward_end(self, forward_batch):
+    def on_forward_end(self, model_worker_batch):
         pass
 
     # ... other no-op methods ...
