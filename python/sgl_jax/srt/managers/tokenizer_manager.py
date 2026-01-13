@@ -148,12 +148,14 @@ class TokenizerManager:
         )
         self.crash_dump_folder = server_args.crash_dump_folder
         self.crash_dump_performed = False  # Flag to ensure dump is only called once
+        self.event_loop = None  # Store the event loop to use
 
         # Init inter-process communication
         context = zmq.asyncio.Context(2)
         self.recv_from_detokenizer = get_zmq_socket(
             context, zmq.PULL, port_args.tokenizer_ipc_name, True
         )
+
         self.send_to_scheduler = get_zmq_socket(
             context, zmq.PUSH, port_args.scheduler_input_ipc_name, True
         )
@@ -595,6 +597,7 @@ class TokenizerManager:
         """Wait for the response of one request."""
         while True:
             try:
+
                 await asyncio.wait_for(state.event.wait(), timeout=self.wait_timeout)
             except TimeoutError:
                 if request is not None and await request.is_disconnected():
@@ -940,10 +943,19 @@ class TokenizerManager:
             return
 
         self.no_create_loop = True
-        loop = asyncio.get_event_loop()
-        self.asyncio_tasks.add(loop.create_task(print_exception_wrapper(self.handle_loop)))
+        # Use the provided event loop if available, otherwise get the current one
+        loop = self.event_loop if self.event_loop is not None else asyncio.get_event_loop()
 
-        self.event_loop = loop
+        try:
+            current_running_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            current_running_loop = None
+
+        if current_running_loop == loop:
+            task = loop.create_task(print_exception_wrapper(self.handle_loop))
+            self.asyncio_tasks.add(task)
+        else:
+            asyncio.run_coroutine_threadsafe(print_exception_wrapper(self.handle_loop), loop)
 
         # We cannot add signal handler when the tokenizer manager is not in
         # the main thread due to the CPython limitation.

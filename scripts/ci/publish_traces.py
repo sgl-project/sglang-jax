@@ -237,7 +237,9 @@ def copy_trace_files(source_dir, target_base_path):
                 source_file = os.path.join(root, file)
                 # Calculate relative path from source_dir
                 rel_path = os.path.relpath(source_file, source_dir)
-                target_path = f"{target_base_path}/{rel_path}"
+                target_path = (
+                    f"{target_base_path}/{rel_path}" if target_base_path != "" else f"{rel_path}"
+                )
 
                 # Read file content
                 with open(source_file, "rb") as f:
@@ -260,7 +262,7 @@ def publish_traces(traces_dir, run_id, run_number):
     repo_owner = "pathfinder-pf"
     repo_name = "sglang-jax-ci-data"
     branch = "main"
-    target_base_path = f"traces/{run_id}"
+    target_base_path = ""
 
     # Copy trace files
     files_to_upload = copy_trace_files(traces_dir, target_base_path)
