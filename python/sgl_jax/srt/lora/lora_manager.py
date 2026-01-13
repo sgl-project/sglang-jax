@@ -104,8 +104,12 @@ class LoRAManager:
         self.hidden_size = base_hf_config.hidden_size
         self.intermediate_size = getattr(base_hf_config, "intermediate_size", self.hidden_size * 4)
         self.num_attention_heads = base_hf_config.num_attention_heads
+        if self.hidden_size is None or self.num_attention_heads is None:
+            raise AssertionError("hidden_size and num_attention_heads must be set")
         self.num_kv_heads = getattr(base_hf_config, "num_key_value_heads", self.num_attention_heads)
         self.head_dim = getattr(base_hf_config, "head_dim", None)
+        if self.head_dim is None:
+            self.head_dim = self.hidden_size // self.num_attention_heads
         self.static_lora = server_args.enable_static_lora
 
         # Get original num_kv_heads and tp_size for replication
