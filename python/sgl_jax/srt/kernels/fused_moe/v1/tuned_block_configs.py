@@ -14,6 +14,8 @@ HBM<->VMEM staging and output tiling. `FusedMoEBlockConfig.effective_for(...)`
 may clamp `bt` (and `btc`) based on the runtime shape.
 """
 
+# ruff: noqa: E501
+
 from __future__ import annotations
 
 import jax.numpy as jnp
