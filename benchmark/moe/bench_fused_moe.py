@@ -651,6 +651,7 @@ def run_all(
                     vmem_bytes = _estimate_vmem_bytes(
                         case,
                         dtype,
+                        data["router_logits"].dtype,
                         block_cfg,
                         use_shared_expert=use_shared_expert,
                         verbose=True,
