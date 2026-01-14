@@ -94,16 +94,3 @@ class VaeModelRunner(BaseModelRunner):
         return output, cache_miss_count
 
 
-if __name__ == "__main__":
-    runner = VaeModelRunner()
-    x = jnp.array(np.arange(1 * 5 * 192 * 192 * 3), dtype=jnp.float32).reshape(1, 5, 192, 192, 3)
-    y, cache_miss = runner.forward(x, "encode")
-    print(f"encode cache_miss {cache_miss}")
-    y, cache_miss = runner.forward(x, "encode")
-    print(f"encode cache_miss {cache_miss}")
-
-    x = jnp.array(np.arange(1 * 5 * 3 * 4 * 16), dtype=jnp.float32).reshape(1, 5, 3, 4, 16)
-    y, cache_miss = runner.forward(x, "decode")
-    print(f"decode cache_miss {cache_miss}")
-    y, cache_miss = runner.forward(x, "decode")
-    print(f"decode cache_miss {cache_miss}")

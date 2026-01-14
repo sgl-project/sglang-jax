@@ -27,13 +27,11 @@ class Req:
     data_type: DataType | None = None
 
     rid: str | None = None
-    # 随机数生成器
     # generator: jax.random.PRNGKey | list[jax.random.PRNGKey] | None = None
 
     # Image inputs
     image_path: str | None = None
     # Image encoder hidden states
-    # 图像或者视频过vit之后的tensor
     image_embeds: list[jax.Array] = field(default_factory=list)
     pil_image: jax.Array | PIL.Image.Image | None = None
     pixel_values: jax.Array | PIL.Image.Image | None = None
@@ -54,11 +52,9 @@ class Req:
     negative_prompt_embeds: list[jax.Array] | None = None
     prompt_attention_mask: list[jax.Array] | None = None
     negative_attention_mask: list[jax.Array] | None = None
-    # clip 插入模型的位置
     clip_embedding_pos: list[jax.Array] | None = None
     clip_embedding_neg: list[jax.Array] | None = None
 
-    # 文本模型的输出
     pooled_embeds: list[jax.Array] = field(default_factory=list)
     neg_pooled_embeds: list[jax.Array] = field(default_factory=list)
 
@@ -104,7 +100,6 @@ class Req:
 
     # Scheduler parameters
     num_inference_steps: int = 5
-    ## guidance_scale 越大，图像或者视频更贴近prompt
     guidance_scale: float = 3.0
     guidance_scale_2: float | None = None
     guidance_rescale: float = 0.0
