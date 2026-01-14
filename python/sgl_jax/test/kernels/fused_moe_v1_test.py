@@ -2,8 +2,11 @@
 # Copyright 2025 The tpu-inference Authors. All rights reserved.
 import jax
 import jax.numpy as jnp
+import numpy as np
 from absl.testing import absltest, parameterized
+from jax import lax
 from jax._src import test_util as jtu
+from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.kernels.fused_moe.v1.kernel import (
     FusedMoEBlockConfig,
@@ -259,7 +262,28 @@ class MoEKernelTest(jtu.JaxTestCase):
             w2_shared_scale=w2_shared_scale,
             w3_shared_scale=w3_shared_scale,
         )
-        self.assertAllClose(actual, expected, atol=atol, rtol=rtol)
+
+        # In multi-host runs, `actual` is sharded across processes and is not fully addressable
+        # on any single process. Gather to a fully-replicated array for comparison.
+        @jax.jit
+        @jax.shard_map(
+            mesh=self.mesh,
+            in_specs=(
+                P(
+                    ("data", "tensor"),
+                ),
+            ),
+            out_specs=P(),
+            check_vma=False,
+        )
+        def _replicate_tokens(x):
+            x = lax.all_gather(x, axis_name="tensor", axis=0, tiled=True)
+            x = lax.all_gather(x, axis_name="data", axis=0, tiled=True)
+            return x
+
+        actual_host = np.asarray(jax.device_get(_replicate_tokens(actual)))
+        expected_host = np.asarray(jax.device_get(_replicate_tokens(expected)))
+        self.assertAllClose(actual_host, expected_host, atol=atol, rtol=rtol)
 
     @parameterized.product(
         renormalize_topk_logits=[True, False],
