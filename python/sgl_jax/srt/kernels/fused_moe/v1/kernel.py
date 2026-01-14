@@ -549,7 +549,7 @@ def _fused_ep_moe_kernel(
     disable_a2a_s_acc_tile_write: bool,
     disable_shared_expert: bool,
 ):
-    pl.debug_print("pl.debug_print bt: {bt}", bt=bt)
+    pl.debug_print("bt: {}", bt)
     dp_rank = lax.axis_index(dp_axis_name)
     tp_rank = lax.axis_index(tp_axis_name)
     tp_size = lax.axis_size(tp_axis_name)
