@@ -63,7 +63,8 @@ class ModelConfig:
         kwargs = {}
         if override_config_file and override_config_file.strip():
             kwargs["_configuration_file"] = override_config_file.strip()
-        self.model_path = download_from_hf(self.model_path)
+        if multimodal:
+            self.model_path = download_from_hf(self.model_path)
         config_path = self.model_path + "/text_encoder" if multimodal else self.model_path
         self.hf_config = get_config(
             config_path,
