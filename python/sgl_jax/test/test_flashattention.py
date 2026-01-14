@@ -40,6 +40,7 @@ def create_qkv_cache(
     head_dim,
     num_kv_heads,
     page_size=1,
+    dtype=jnp.bfloat16,
 ):
     batched_q_len = sum([q_len for q_len, _ in lens])
     # batched_kv_len = sum([kv_len for _, kv_len in lens])
@@ -50,11 +51,11 @@ def create_qkv_cache(
     batched_aligned_kv_len = jnp.sum(aligned_seq_lens).item()
 
     key = jax.random.PRNGKey(42)
-    q = jax.random.normal(key, (batched_q_len, num_heads, head_dim), dtype=jnp.bfloat16)
+    q = jax.random.normal(key, (batched_q_len, num_heads, head_dim), dtype=dtype)
 
     # Create k,v with proper alignment gaps between sequences
-    k = jnp.zeros((batched_aligned_kv_len, num_kv_heads, head_dim), dtype=jnp.bfloat16)
-    v = jnp.zeros((batched_aligned_kv_len, num_kv_heads, head_dim), dtype=jnp.bfloat16)
+    k = jnp.zeros((batched_aligned_kv_len, num_kv_heads, head_dim), dtype=dtype)
+    v = jnp.zeros((batched_aligned_kv_len, num_kv_heads, head_dim), dtype=dtype)
 
     # Fill in the actual data for each sequence with proper alignment
     aligned_pos = 0
@@ -66,12 +67,12 @@ def create_qkv_cache(
         seq_k = jax.random.normal(
             jax.random.split(key, len(lens) * 2)[actual_pos],
             (seq_len, num_kv_heads, head_dim),
-            dtype=jnp.bfloat16,
+            dtype=dtype,
         )
         seq_v = jax.random.normal(
             jax.random.split(key, len(lens) * 2)[actual_pos + len(lens)],
             (seq_len, num_kv_heads, head_dim),
-            dtype=jnp.bfloat16,
+            dtype=dtype,
         )
 
         # Place data at aligned positions
@@ -143,6 +144,7 @@ def create_test_data(
 ):
     """Create a real ForwardBatch for testing."""
     assert mode in ["prefill", "decode"]
+    dtype = jnp.bfloat16 if model_config["bf16"] else jnp.float32
     batch_size = len(lens)
     # Create sequence lengths array
     seq_lens = jnp.array([kv_len for _, kv_len in lens], dtype=jnp.int32)
@@ -166,14 +168,14 @@ def create_test_data(
     current_kv_cache = MHATokenToKVPool(
         size=max_total_token_size,
         page_size=page_size,
-        dtype=jnp.bfloat16 if model_config["bf16"] else jnp.float32,
+        dtype=dtype,
         head_num=model_config["num_kv_heads"],
         head_dim=model_config["head_dim"],
         layer_num=model_config["num_hidden_layers"],
         mesh=mesh,
     )
     # create q, k v
-    q, k, v = create_qkv_cache(lens, num_heads, head_dim, num_kv_heads, page_size)
+    q, k, v = create_qkv_cache(lens, num_heads, head_dim, num_kv_heads, page_size, dtype=dtype)
 
     # cache loc - match schedule_batch.py logic with align_to_size
     def align_to_size(lst, size, value=0):
@@ -807,7 +809,7 @@ class TestAttention(CustomTestCase):
         """Test JAX attention accuracy against PyTorch reference"""
         # Parameters
         num_heads = 8
-        num_kv_heads = 8
+        num_kv_heads = [8, 4]
         head_dim = 128
         lens = [(32, 32), (42, 66), (128, 256)]
         page_size = [
@@ -815,11 +817,12 @@ class TestAttention(CustomTestCase):
         ]
         causal_mask = False
         for size in page_size:
-            self.run_test(
-                "prefill",
-                lens,
-                (num_heads, head_dim, num_kv_heads, size, jnp.bfloat16, causal_mask),
-            )
+            for num_kv_head in num_kv_heads:
+                self.run_test(
+                    "prefill",
+                    lens,
+                    (num_heads, head_dim, num_kv_head, size, jnp.bfloat16, causal_mask),
+                )
 
     def test_mha_decode_with_custom_mask(self):
         pass

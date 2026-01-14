@@ -1,5 +1,4 @@
 import functools
-import time
 from math import inf
 
 import jax
@@ -7,8 +6,14 @@ import numpy as np
 from utils import create_decode_uniform_data, create_prefill_uniform_data
 
 from sgl_jax.srt.kernels.ragged_paged_attention.ragged_paged_attention import (
+    get_kernel_scope_name,
     ragged_paged_attention,
 )
+from sgl_jax.srt.kernels.utils.perf import multiple_iteration_timeit_from_trace
+
+
+def is_decode_only(max_num_batched_tokens):
+    return max_num_batched_tokens <= 256
 
 
 def benchmark_backend(
@@ -24,7 +29,7 @@ def benchmark_backend(
 ):
     scale = head_dim**-0.5
 
-    if max_num_batched_tokens > 256:
+    if not is_decode_only(max_num_batched_tokens):
         (
             q,
             k,
@@ -47,7 +52,7 @@ def benchmark_backend(
             head_dim,
             page_size=page_size,
         )
-    elif max_num_batched_tokens <= 256:
+    else:
         (
             q,
             k,
@@ -99,10 +104,10 @@ def benchmark_backend(
             cu_q_lens,
             cu_kv_lens,
             distribution,
+            None,
             sm_scale=sm_scale,
             num_kv_pages_per_block=num_kv_pages_per_block,
             num_queries_per_block=num_queries_per_block,
-            vmem_limit_bytes=64 * 1024 * 1024,
         )
 
     attn = functools.partial(
@@ -126,14 +131,13 @@ def benchmark_backend(
     jax.block_until_ready(output)
 
     # Benchmark
-    times = []
-    for i in range(3):
-        start = time.perf_counter()
-        output = attn()
-        jax.block_until_ready(output)
-        times.append(time.perf_counter() - start)
-
-    avg_time = np.mean(times)
+    times = multiple_iteration_timeit_from_trace(
+        compute_func=lambda: attn(),
+        data_generator=lambda: (),
+        task=get_kernel_scope_name(num_queries_per_block, num_kv_pages_per_block, page_size),
+        tries=3,
+    )
+    avg_time = float(np.mean(times)) if times else float("nan")
 
     # cal num_q_heads_per_blk, num_kv_heads_per_blk
     return (
@@ -148,7 +152,7 @@ def main():
     print("Device count:", jax.device_count())
     print()
 
-    page_size_config = [64, 128, 256]
+    page_size_config = [128, 256]
     max_num_batched_tokens_config = [
         1,
         2,
@@ -165,8 +169,8 @@ def main():
         4096,
         8192,
     ]
-    q_head_num_config = [2, 4, 8, 16, 32, 64]
-    kv_head_num_config = [2, 4, 8, 16, 32, 64]
+    q_head_num_config = [1, 2, 4, 8, 16, 32]
+    kv_head_num_config = [1, 2, 4, 8, 16, 32]
     head_dim_config = [128]
     max_kv_cache_tokens_config = [600000]
     all_combinations = []
@@ -193,14 +197,14 @@ def main():
     num_kv_pages_per_blk_config = [1, 2, 4, 8, 16, 32]
     num_queries_per_block_config = [1, 2, 4, 8, 16, 32, 64, 128]
 
-    block_spec_configs = []
+    prefill_only_block_spec_configs = []
     for num_kv_pages_per_blk in num_kv_pages_per_blk_config:
         for num_queries_per_block in num_queries_per_block_config:
-            block_spec_configs.append((num_kv_pages_per_blk, num_queries_per_block))
+            prefill_only_block_spec_configs.append((num_kv_pages_per_blk, num_queries_per_block))
 
-    print(
-        "(q_dtype, kv_dtype, num_q_heads_per_blk, num_kv_heads_per_blk, head_dim, page_size, max_num_batched_tokens): (num_kv_pages_per_block, num_queries_per_block)"
-    )
+    decode_only_block_spec_configs = []
+    for num_kv_pages_per_blk in num_kv_pages_per_blk_config:
+        decode_only_block_spec_configs.append((num_kv_pages_per_blk, 1))
 
     for i, (
         page_size,
@@ -212,6 +216,12 @@ def main():
     ) in enumerate(all_combinations):
         best_output = inf
         best_config = None
+        if is_decode_only(max_num_batched_tokens):
+            # decode only
+            block_spec_configs = decode_only_block_spec_configs
+        else:
+            block_spec_configs = prefill_only_block_spec_configs
+
         for i, (num_kv_pages_per_blk, num_queries_per_block) in enumerate(block_spec_configs):
             try:
                 (
@@ -234,10 +244,10 @@ def main():
                     best_config = (num_kv_pages_per_blk, num_queries_per_block)
             except Exception:
                 pass
-
-        print(
-            f"('{q_dtype}', '{k_dtype}', {q_head_num}, {kv_head_num}, {head_dim}, {page_size}, {max_num_batched_tokens}): ({best_config[0]}, {best_config[1]}),"
-        )
+        if best_config:
+            print(
+                f"('{q_dtype}', '{k_dtype}', {q_head_num}, {kv_head_num}, {head_dim}, {page_size}, {max_num_batched_tokens}): ({best_config[0]}, {best_config[1]}),"
+            )
 
 
 if __name__ == "__main__":
