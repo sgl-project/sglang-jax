@@ -1,8 +1,6 @@
 from functools import partial
 
 import jax
-import jax.numpy as jnp
-import numpy as np
 from flax import nnx
 
 from sgl_jax.srt.configs.load_config import LoadConfig
@@ -92,5 +90,3 @@ class VaeModelRunner(BaseModelRunner):
                 output = self.jitted_decode(x)
             cache_miss_count = count()
         return output, cache_miss_count
-
-

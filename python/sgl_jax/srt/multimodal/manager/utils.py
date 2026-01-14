@@ -13,4 +13,3 @@ def load_stage_configs_from_yaml(config_path: str) -> list:
     config_data = OmegaConf.load(config_path)
 
     return config_data.stage_args
-

@@ -15,7 +15,6 @@ import math
 import jax
 import jax.numpy as jnp
 from flax import nnx
-from jax import lax
 from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 from transformers import UMT5Config
