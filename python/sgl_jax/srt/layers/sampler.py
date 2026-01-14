@@ -130,11 +130,6 @@ class Sampler(nnx.Module):
         penalty = penalty.astype(logits.dtype)
 
         return logits + penalty
-    
-    def _identity_linear_penalty(self, operands):
-        logits, sampling_metadata = operands
-        penalty = sampling_metadata.linear_penalty.astype(logits.dtype)
-        return logits + jnp.zeros_like(penalty)
 
     def _apply_min_tokens_penalty(self, operands):
         """Apply min new tokens penalty to stop tokens"""
@@ -179,7 +174,7 @@ class Sampler(nnx.Module):
         logits = lax.cond(
             sampling_metadata.do_penalties,
             self._apply_linear_penalty,
-            self._identity_linear_penalty,
+            lambda operands: operands[0],
             (logits_output.next_token_logits, sampling_metadata),
         )
 
