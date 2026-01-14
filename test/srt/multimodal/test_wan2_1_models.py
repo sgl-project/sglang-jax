@@ -44,9 +44,8 @@ class TestWan2_1Model(CustomTestCase):
             timeout=1200,
         )
         response.raise_for_status()
-        # 解析返回的 JSON 数据
         result = response.json()
-        print("请求成功！")
+        print("success！")
         print(json.dumps(result, indent=4, ensure_ascii=False))
         process.kill()
 
@@ -77,9 +76,8 @@ class TestWan2_1Model(CustomTestCase):
             timeout=1200,
         )
         response.raise_for_status()
-        # 解析返回的 JSON 数据
         result = response.json()
-        print("请求成功！")
+        print("success！")
         print(json.dumps(result, indent=4, ensure_ascii=False))
         process.kill()
 
