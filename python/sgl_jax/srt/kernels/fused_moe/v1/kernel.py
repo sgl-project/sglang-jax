@@ -2184,14 +2184,15 @@ def _fused_ep_moe_kernel(
         wait_store_output(bt_id=bt_id - 2)
 
         start_a2a_scatter(bt_sem_id=bt_sem_id, e_sem_id=e_sem_id, local_e_id=0, bt_start=bt_start)
+        # Prefetch the first W1/W3 slices for expert0 early so they can overlap with
+        # routing/all-reduce metadata, scatter, and any shared-expert work.
+        start_fetch_bw1(jnp.int32(0), bw1_sem_id=0, bf_id=0, bd1_id=0)
+        start_fetch_bw3(jnp.int32(0), bw3_sem_id=0, bf_id=0, bd3_id=0)
 
         init_carry = (e_sem_id, jnp.int32(0))
 
         def run_per_expert_pipelined(local_e_id, carry):
             curr_e_sem_id, curr_se_block = carry
-
-            start_fetch_bw1(local_e_id, bw1_sem_id=0, bf_id=0, bd1_id=0)
-            start_fetch_bw3(local_e_id, bw3_sem_id=0, bf_id=0, bd3_id=0)
 
             @pl.when(curr_se_block == 0)
             def _():
@@ -2217,6 +2218,13 @@ def _fused_ep_moe_kernel(
             expert_ffn(bt_sem_id, curr_e_sem_id, local_e_id)
 
             start_a2a_gather(bt_sem_id=bt_sem_id, e_sem_id=curr_e_sem_id, local_e_id=local_e_id)
+
+            # Prefetch the next expert's initial W1/W3 slices and overlap with shared-expert
+            # compute and gather. This avoids stalling the next expert on weight loads.
+            @pl.when(next_local_e_id < local_num_experts)
+            def _():
+                start_fetch_bw1(next_local_e_id, bw1_sem_id=0, bf_id=0, bd1_id=0)
+                start_fetch_bw3(next_local_e_id, bw3_sem_id=0, bf_id=0, bd3_id=0)
 
             run_shared_expert_slice(curr_se_block, bt_id, bt_sem_id, out_buf_id)
             curr_se_block += 1
