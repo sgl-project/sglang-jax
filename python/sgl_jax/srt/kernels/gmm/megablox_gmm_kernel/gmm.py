@@ -338,9 +338,6 @@ def gmm(
     # TODO(kyuyeunk): Instead of transpose_rhs==True, modify logic to only
     # transpose_rhs==False instead as it simplifies the logic in kernel.
     assert transpose_rhs
-    # TODO (Qinghan): transpose_rhs for now and will be changed later
-    if transpose_rhs:
-        rhs = jnp.transpose(rhs, (0, 2, 1))
 
     if existing_out is not None:
         assert isinstance(existing_out, jax.Array)
