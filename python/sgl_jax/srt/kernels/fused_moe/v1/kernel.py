@@ -1710,23 +1710,12 @@ def _fused_ep_moe_kernel(
                     w1_vmem = b_w1_x2_vmem.at[bw_sem_id]
                     w3_vmem = b_w3_x2_vmem.at[bw_sem_id]
 
-                    # Prefetch W2 (down-projection) early so the first FFN2 slice is less likely
-                    # to stall. We load into the buffer that will become the *final* bw_sem_id
-                    # returned by the FFN1 (gate/up) loop.
-                    #
-                    # When num_bd1 > 1, the buffer returned after the FFN1 loop equals the
-                    # bw_sem_id observed at bd1_id == num_bd1 - 2 (since parity is unchanged by -2).
-                    if num_bd1 > 1:
-
-                        @pl.when(bd1_id == (num_bd1 - 2))
-                        def _():
-                            start_fetch_bw2(local_e_id, bw_sem_id, bf_id, jnp.int32(0))
-
-                    else:
-
-                        @pl.when(next_bd1_id == num_bd1)
-                        def _():
-                            start_fetch_bw2(local_e_id, next_bw_sem_id, bf_id, jnp.int32(0))
+                    # Prefetch W2 (down-projection) once FFN1 finishes for this (bf_id) so FFN2's
+                    # first slice is less likely to stall, without competing with the last FFN1
+                    # W1/W3 prefetches.
+                    @pl.when(next_bd1_id == num_bd1)
+                    def _():
+                        start_fetch_bw2(local_e_id, next_bw_sem_id, bf_id, jnp.int32(0))
 
                     def run_ffn1_tile(
                         token_tile_id,
