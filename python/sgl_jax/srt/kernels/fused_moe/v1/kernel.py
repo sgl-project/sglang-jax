@@ -638,18 +638,8 @@ def _fused_ep_moe_kernel(
         local_num_tokens = gating_hbm.shape[0]
         gating_bits = jnp.dtype(gating_hbm.dtype).itemsize * 8
         gating_tile0 = math.gcd(256 // gating_bits, local_num_tokens)
-
-        # Mosaic requires the slice shape along dim0 to match the HBM tiling. For very
-        # small `bt` (e.g. bt=2 with local_num_tokens=4 and f32 router logits), we
-        # instead fetch a full tile window and slice out the correct rows in VMEM.
-        if bt < gating_tile0:
-            bt_base = (bt_start // gating_tile0) * gating_tile0
-            bt_base = pl.multiple_of(bt_base, gating_tile0)
-            bt_start = bt_base
-            bt_size = gating_tile0
-        else:
-            bt_size = bt
-            bt_start = pl.multiple_of(bt_start, gating_tile0)
+        bt_size = bt
+        bt_start = pl.multiple_of(bt_start, gating_tile0)
         pltpu.make_async_copy(
             src_ref=gating_hbm.at[pl.ds(bt_start, bt_size)],
             dst_ref=b_gating_x2_vmem.at[bt_sem_id, pl.ds(0, bt_size)],
@@ -2176,15 +2166,7 @@ def _fused_ep_moe_kernel(
 
         wait_fetch_b_gating(bt_id=bt_id)
 
-        local_num_tokens = gating_hbm.shape[0]
-        gating_bits = jnp.dtype(gating_hbm.dtype).itemsize * 8
-        gating_tile0 = math.gcd(256 // gating_bits, local_num_tokens)
-        if bt < gating_tile0:
-            bt_base = (bt_start // gating_tile0) * gating_tile0
-            bt_off = bt_start - bt_base
-            b_gating = b_gating_x2_vmem.at[bt_sem_id, pl.ds(bt_off, bt)][...]
-        else:
-            b_gating = b_gating_x2_vmem.at[bt_sem_id][...]
+        b_gating = b_gating_x2_vmem.at[bt_sem_id][...]
         t2e_routing, expert_sizes, expert_starts = get_top_k(
             b_gating,
             top_k,
@@ -2349,17 +2331,12 @@ def _validate_fused_ep_moe_args(
         block_config=block_config,
     )
 
-    # Mosaic DMA tiling constraint for `start_fetch_b_gating`: the slice size along
-    # the token dimension must be aligned to the underlying HBM tiling of router logits.
-    # For very small `bt` (e.g. 2) with `router_logits` in f32, Mosaic will tile as
-    # (min(8, local_num_tokens), 128) and reject unaligned slices.
+    # Mosaic DMA tiling constraint for `start_fetch_b_gating`: the slice shape along the
+    # token dimension must be aligned to the underlying HBM tiling of router logits.
     local_num_tokens = num_tokens // ep_size
     gating_bits = jnp.dtype(gating_output.dtype).itemsize * 8
     router_tile0 = math.gcd(256 // gating_bits, local_num_tokens)
-    # We can handle bt < router_tile0 by fetching an aligned router_tile0 window for each
-    # bt tile and slicing in VMEM. For bt >= router_tile0 we require divisibility so the
-    # router logits fetch covers the full bt tile in one DMA.
-    if block_config.bt >= router_tile0 and block_config.bt % router_tile0 != 0:
+    if block_config.bt % router_tile0 != 0:
         raise ValueError(
             "Unsupported block_config.bt for router_logits tiling: "
             f"bt={block_config.bt} must be divisible by router_tile0={router_tile0} "
@@ -2648,14 +2625,6 @@ def fused_ep_moe(
     padded_top_k = align_to(top_k, 128)
     t_dtype = tokens.dtype
     gating_dtype = gating_output.dtype
-    gating_bits = jnp.dtype(gating_dtype).itemsize * 8
-    router_tile0 = math.gcd(256 // gating_bits, local_num_tokens)
-    if bt >= router_tile0 and bt % router_tile0 != 0:
-        raise ValueError(
-            f"Unsupported bt for router_logits tiling: bt={bt} must be divisible by router_tile0={router_tile0} "
-            f"(router_logits dtype={jnp.dtype(gating_dtype).name}, local_num_tokens={local_num_tokens})."
-        )
-    gating_buf_tokens = bt if bt >= router_tile0 else router_tile0
     t_packing = get_dtype_packing(t_dtype)
     hidden_per_pack = hidden_size // t_packing
     # With run_bt tiling in the pallas kernel, a2a scratch only needs to cover one bt tile.
@@ -2757,7 +2726,7 @@ def fused_ep_moe(
         ),  # a2a_g_acc_vmem
         pltpu.VMEM((bt, top_k), jnp.float32),  # top_k_logits_vmem
         # Expert compute scratch.
-        pltpu.VMEM((2, gating_buf_tokens, padded_num_experts), gating_dtype),  # b_gating_x2_vmem
+        pltpu.VMEM((2, bt, padded_num_experts), gating_dtype),  # b_gating_x2_vmem
         pltpu.VMEM((2, bt, hidden_size), t_dtype),  # b_output_x2_vmem
         pltpu.VMEM((2, t_packing, bd1_per_pack, block_config.bf), w1.dtype),  # b_w1_x2_vmem
         pltpu.VMEM((2, t_packing, bd1_per_pack, block_config.bf), w3.dtype),  # b_w3_x2_vmem

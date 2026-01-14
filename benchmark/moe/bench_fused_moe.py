@@ -90,13 +90,8 @@ def _estimate_vmem_bytes(
     a2a_g_acc = 1 * top_k * acc_bt * hidden * token_bytes
     # b_output_x2_vmem is double-buffered to overlap store(output_hbm) with next bt's compute.
     b_output = 2 * bt * hidden * token_bytes
-    # b_gating_x2_vmem is double-buffered for run_bt overlap. For very small `bt` that is
-    # smaller than the router-logits HBM tiling, the kernel fetches a full tile window.
-    router_bits = jnp.dtype(router_dtype).itemsize * 8
-    local_num_tokens = case.num_tokens // case.ep_size
-    router_tile0 = math.gcd(256 // router_bits, local_num_tokens)
-    gating_buf_tokens = bt if bt >= router_tile0 else router_tile0
-    b_gating = 2 * gating_buf_tokens * padded_num_experts * router_bytes
+    # b_gating_x2_vmem is double-buffered for run_bt overlap: (2, bt, padded_num_experts)
+    b_gating = 2 * bt * padded_num_experts * router_bytes
     # t2e_routing_smem scratch is placed in SMEM (not VMEM).
     t2e_routing = 0
     # top_k_logits_vmem scratch: (bt, top_k) float32
@@ -190,9 +185,7 @@ def _estimate_vmem_bytes(
         print(
             f"      a2a_s_acc_stage_x3:     {_mb(a2a_s_acc_stage_b32)} MB  (3, {bts}, {t_packing}, {bd2 // t_packing})"
         )
-        print(
-            f"      b_gating_x2_vmem:       {_mb(b_gating)} MB  (2, {gating_buf_tokens}, {padded_num_experts})"
-        )
+        print(f"      b_gating_x2_vmem:       {_mb(b_gating)} MB  (2, {bt}, {padded_num_experts})")
         print(f"      routing_temporaries:    {_mb(routing_temporaries)} MB")
         if use_shared_expert:
             print(
@@ -289,7 +282,7 @@ def select_block_configs(
             return False, f"bt({bt}) > local_num_tokens({local_num_tokens})"
         if bt % t_packing != 0:
             return False, f"bt({bt}) % t_packing({t_packing}) != 0"
-        if bt >= router_tile0 and bt % router_tile0 != 0:
+        if bt % router_tile0 != 0:
             return (
                 False,
                 f"bt({bt}) not aligned to router_tile0({router_tile0}) for router_dtype={jnp.dtype(router_dtype).name}",
