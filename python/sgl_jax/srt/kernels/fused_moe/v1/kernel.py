@@ -549,7 +549,6 @@ def _fused_ep_moe_kernel(
     disable_a2a_s_acc_tile_write: bool,
     disable_shared_expert: bool,
 ):
-    pl.debug_print("bt: {}", bt)
     dp_rank = lax.axis_index(dp_axis_name)
     tp_rank = lax.axis_index(tp_axis_name)
     tp_size = lax.axis_size(tp_axis_name)
@@ -1453,7 +1452,6 @@ def _fused_ep_moe_kernel(
                                 pl.ds(0, 1),
                                 pl.ds(bfc_id * bfc, bfc),
                             )
-                            # TODO(jevinjiang): can use mosaic to load with stride 0.
                             w1_scale = jnp.broadcast_to(w1_scale_vmem[*w1_scale_slices], acc1.shape)
                             acc1 *= w1_scale
 
@@ -1528,6 +1526,15 @@ def _fused_ep_moe_kernel(
         assert bd2c % (t_packing * 128) == 0, (bd2c, t_packing)
 
         def body(btc_id, __):
+            # `activation_fn(acc1, acc3)` depends only on (btc_id, bfc_id), not on p_id/bd2c_id.
+            # Hoist it out to avoid recomputing the same activation for each packed shard.
+            act_by_bfc = []
+            for bfc_id in range(cdiv(bf, bfc)):
+                acc_slices = (pl.ds(btc_id * btc, btc), pl.ds(bfc_id * bfc, bfc))
+                acc1 = acc1_vmem[*acc_slices]
+                acc3 = acc3_vmem[*acc_slices]
+                act_by_bfc.append(activation_fn(acc1, acc3, act_fn))
+
             for bd2c_id in range(cdiv(bd2, bd2c)):
                 for p_id in range(t_packing):
                     res = jnp.zeros((btc, bd2c_per_t_packing), dtype=jnp.float32)
@@ -1542,10 +1549,7 @@ def _fused_ep_moe_kernel(
                         res += b2
 
                     for bfc_id in range(cdiv(bf, bfc)):
-                        acc_slices = (pl.ds(btc_id * btc, btc), pl.ds(bfc_id * bfc, bfc))
-                        acc1 = acc1_vmem[*acc_slices]
-                        acc3 = acc3_vmem[*acc_slices]
-                        act = activation_fn(acc1, acc3, act_fn)
+                        act = act_by_bfc[bfc_id]
                         w2 = w2_vmem[
                             p_id,
                             pl.ds(bfc_id * bfc, bfc),
