@@ -189,7 +189,7 @@ class LogitsMetadata:
             extend_return_logprob = extend_return_top_logprob = extend_token_ids_logprob = False
             extend_logprob_pruned_lens_cpu = extend_seq_lens_cpu = None
 
-        sharding = NamedSharding(mesh, P()) if jax.process_count() == 1 else None
+        sharding = NamedSharding(mesh, P("data")) if jax.process_count() == 1 else None
 
         return cls(
             forward_mode=batch.forward_mode,
@@ -230,9 +230,6 @@ class LogitsProcessor(nnx.Module):
         self.mesh = mesh
 
     def _select_hidden_states(self, hidden_states: jax.Array, indices: jax.Array) -> jax.Array:
-        if self.mesh.shape.get("data", 1) == 1:
-            return hidden_states[indices]
-
         def select_local_fn(local_states, local_indices):
             return local_states[local_indices]
 
@@ -510,7 +507,9 @@ class LogitsProcessor(nnx.Module):
             dtype=lm_head.dtype,
         )
 
-        logits = jnp.dot(hidden_states, embedding.T)
+        logits = jnp.dot(
+            hidden_states, embedding.T, out_sharding=NamedSharding(self.mesh, P("data", "tensor"))
+        )
 
         logits = logits[:, : self.vocab_size] if logits.ndim > 1 else logits[: self.vocab_size]
 

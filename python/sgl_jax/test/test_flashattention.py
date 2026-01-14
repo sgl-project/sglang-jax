@@ -431,7 +431,6 @@ class TestAttention(CustomTestCase):
             page_table,
             forward_batch.attn_backend.forward_metadata.cu_q_lens,
             # forward_batch.attn_backend.forward_metadata.cu_kv_lens,
-            forward_batch.attn_backend.forward_metadata.num_seqs,
             custom_mask=(
                 forward_batch.spec_info.custom_mask if forward_batch.spec_info is not None else None
             ),

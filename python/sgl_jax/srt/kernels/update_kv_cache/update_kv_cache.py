@@ -115,6 +115,73 @@ def kv_cache_update_kernel(
         async_copy.wait()
 
 
+def kv_cache_update_impl(
+    new_kv,
+    slices,
+    kv_cache,
+    num_kv_update_slices,
+    page_size,
+    num_slices_per_block,
+):
+    assert (
+        slices.shape[1] % num_slices_per_block == 0
+    ), f"slices.shape[1]={slices.shape[1]} is not divisible by num_slices_per_block={num_slices_per_block}"
+    _, num_combined_kv_heads, head_dim = new_kv.shape
+
+    assert num_combined_kv_heads % 2 == 0, (
+        f"kv_cache_update_impl: num_combined_kv_heads={num_combined_kv_heads} should be even after pre-padding. "
+        "This indicates a configuration issue with kv heads padding."
+    )
+
+    assert (
+        kv_cache.shape[1] == num_combined_kv_heads
+    ), f"kv_cache.shape[1]={kv_cache.shape[1]} is not equal to num_combined_kv_heads={num_combined_kv_heads}"
+    assert (
+        kv_cache.shape[2] == head_dim
+    ), f"kv_cache.shape[2]={kv_cache.shape[2]} is not equal to head_dim={head_dim}"
+    assert head_dim % 128 == 0, f"head_dim={head_dim} is not divisible by 128"
+    # smaller or equal to page_size
+
+    in_specs = [
+        pl.BlockSpec(memory_space=pltpu.MemorySpace.ANY),
+        pl.BlockSpec(memory_space=pltpu.MemorySpace.ANY),
+    ]
+
+    out_specs = [pl.BlockSpec(memory_space=pltpu.MemorySpace.ANY)]
+    out_shape = [jax.ShapeDtypeStruct(kv_cache.shape, dtype=kv_cache.dtype)]
+
+    scalar_prefetches = [slices]
+    scratch = pltpu.VMEM(
+        (num_slices_per_block, page_size, num_combined_kv_heads, head_dim),
+        new_kv.dtype,
+    )
+
+    scratch_shapes = [
+        scratch,
+        pltpu.SemaphoreType.DMA,
+    ]
+
+    kernel = pl.pallas_call(
+        kv_cache_update_kernel,
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=len(scalar_prefetches),
+            in_specs=in_specs,
+            out_specs=out_specs,
+            grid=(cdiv(num_kv_update_slices[0], num_slices_per_block),),
+            scratch_shapes=scratch_shapes,
+        ),
+        compiler_params=pltpu.CompilerParams(
+            vmem_limit_bytes=VMEM_SIZE,
+        ),
+        out_shape=out_shape,
+        input_output_aliases={len(scalar_prefetches) + 1: 0},
+    )
+
+    result = kernel(*scalar_prefetches, new_kv, kv_cache)[0]
+
+    return result
+
+
 @partial(
     jax.jit,
     static_argnames=["page_size", "num_slices_per_block", "kv_partition_axis"],
@@ -146,62 +213,13 @@ def kv_cache_update(
         check_vma=False,
     )
     def _kv_cache_update_wrapper(new_kv, slices, kv_cache, num_kv_update_slices):
-        assert (
-            slices.shape[1] % num_slices_per_block == 0
-        ), f"slices.shape[1]={slices.shape[1]} is not divisible by num_slices_per_block={num_slices_per_block}"
-        _, num_combined_kv_heads, head_dim = new_kv.shape
-
-        assert num_combined_kv_heads % 2 == 0, (
-            f"num_combined_kv_heads={num_combined_kv_heads} should be even after pre-padding. "
-            "This indicates a configuration issue with kv heads padding."
+        return kv_cache_update_impl(
+            new_kv,
+            slices,
+            kv_cache,
+            num_kv_update_slices,
+            page_size,
+            num_slices_per_block,
         )
-
-        assert (
-            kv_cache.shape[1] == num_combined_kv_heads
-        ), f"kv_cache.shape[1]={kv_cache.shape[1]} is not equal to num_combined_kv_heads={num_combined_kv_heads}"
-        assert (
-            kv_cache.shape[2] == head_dim
-        ), f"kv_cache.shape[2]={kv_cache.shape[2]} is not equal to head_dim={head_dim}"
-        assert head_dim % 128 == 0, f"head_dim={head_dim} is not divisible by 128"
-        # smaller or equal to page_size
-
-        in_specs = [
-            pl.BlockSpec(memory_space=pltpu.MemorySpace.ANY),
-            pl.BlockSpec(memory_space=pltpu.MemorySpace.ANY),
-        ]
-
-        out_specs = [pl.BlockSpec(memory_space=pltpu.MemorySpace.ANY)]
-        out_shape = [jax.ShapeDtypeStruct(kv_cache.shape, dtype=kv_cache.dtype)]
-
-        scalar_prefetches = [slices]
-        scratch = pltpu.VMEM(
-            (num_slices_per_block, page_size, num_combined_kv_heads, head_dim),
-            new_kv.dtype,
-        )
-
-        scratch_shapes = [
-            scratch,
-            pltpu.SemaphoreType.DMA,
-        ]
-
-        kernel = pl.pallas_call(
-            kv_cache_update_kernel,
-            grid_spec=pltpu.PrefetchScalarGridSpec(
-                num_scalar_prefetch=len(scalar_prefetches),
-                in_specs=in_specs,
-                out_specs=out_specs,
-                grid=(cdiv(num_kv_update_slices[0], num_slices_per_block),),
-                scratch_shapes=scratch_shapes,
-            ),
-            compiler_params=pltpu.CompilerParams(
-                vmem_limit_bytes=VMEM_SIZE,
-            ),
-            out_shape=out_shape,
-            input_output_aliases={len(scalar_prefetches) + 1: 0},
-        )
-
-        result = kernel(*scalar_prefetches, new_kv, kv_cache)[0]
-
-        return result
 
     return _kv_cache_update_wrapper(new_kv, slices, kv_cache, num_kv_update_slices)

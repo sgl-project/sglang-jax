@@ -30,7 +30,7 @@ class Sampler(nnx.Module):
         """Regular sampling branch"""
         logits, sampling_metadata, rng, use_sort_for_toppk_minp = operands
 
-        logits = lax.with_sharding_constraint(logits, NamedSharding(self.mesh, P(None, None)))
+        logits = jax.sharding.reshard(logits, NamedSharding(self.mesh, P("data", None)))
 
         # Validate broadcast compatibility for temperature division
         logits_batch_size = logits.shape[0]
@@ -64,7 +64,10 @@ class Sampler(nnx.Module):
         )
 
         log_probs = jnp.log(probs).clip(min=jnp.finfo(probs.dtype).min)
-        return batch_next_token_ids, log_probs
+        return (
+            jax.sharding.reshard(batch_next_token_ids, NamedSharding(self.mesh, P("data"))),
+            jax.sharding.reshard(log_probs, NamedSharding(self.mesh, P("data", "tensor"))),
+        )
 
     def _process_logprob_results(self, operands):
         """Process logprob results when return_logprob=True"""

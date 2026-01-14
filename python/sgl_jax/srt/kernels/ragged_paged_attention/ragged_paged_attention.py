@@ -49,10 +49,14 @@ def ref_ragged_paged_attention_fused(
     if mask_value is None:
         mask_value = DEFAULT_MASK_VALUE
     _, _, num_kv_heads_interleaved, head_dim = kv_pages_fused.shape
-    assert num_kv_heads_interleaved % 2 == 0
+    assert (
+        num_kv_heads_interleaved % 2 == 0
+    ), f"num_kv_heads_interleaved must be even for head interleaving, got {num_kv_heads_interleaved}"
     num_kv_heads = num_kv_heads_interleaved // 2
     num_q_heads = queries.shape[1]
-    assert num_q_heads % num_kv_heads == 0
+    assert (
+        num_q_heads % num_kv_heads == 0
+    ), f"num_q_heads {num_q_heads} must be divisible by num_kv_heads {num_kv_heads}"
     num_query_per_kv = num_q_heads // num_kv_heads
 
     outputs = []
@@ -137,7 +141,9 @@ def ref_ragged_paged_attention(
         mask_value = DEFAULT_MASK_VALUE
     _, _, num_kv_heads, head_dim = k_pages.shape
     num_q_heads = queries.shape[1]
-    assert num_q_heads % num_kv_heads == 0
+    assert (
+        num_q_heads % num_kv_heads == 0
+    ), f"ref_ragged_paged_attention: num_q_heads {num_q_heads} must be divisible by num_kv_heads {num_kv_heads}"
     num_query_per_kv = num_q_heads // num_kv_heads
     outputs = []
     # cu_kv_lens = jnp.concatenate([jnp.array([0], dtype=jnp.int32), jnp.cumsum(kv_lens)])
@@ -325,8 +331,12 @@ def _ragged_paged_attention_kernel(
     bkv_p,
     bq_sz,
 ):
-    assert q_hbm_ref.shape == o_hbm_ref.shape
-    assert q_hbm_ref.shape[-1] == kv_cache_fused_hbm_ref.shape[-1]  # head_dim should match
+    assert (
+        q_hbm_ref.shape == o_hbm_ref.shape
+    ), f"q and o shape mismatch: q_hbm_ref.shape={q_hbm_ref.shape} vs o_hbm_ref.shape={o_hbm_ref.shape}"
+    assert (
+        q_hbm_ref.shape[-1] == kv_cache_fused_hbm_ref.shape[-1]
+    ), f"head_dim mismatch: q_hbm_ref.shape[-1]={q_hbm_ref.shape[-1]} vs kv_cache_fused_hbm_ref.shape[-1]={kv_cache_fused_hbm_ref.shape[-1]}"
     (
         actual_num_kv_heads,
         max_num_tokens,
@@ -344,10 +354,16 @@ def _ragged_paged_attention_kernel(
     num_q_heads_per_kv_head = num_q_heads_per_kv_head_per_packing * q_packing
     q_dtype = q_hbm_ref.dtype
     kv_dtype = kv_cache_fused_hbm_ref.dtype
-    assert o_hbm_ref.dtype == q_dtype
-    assert get_dtype_packing(q_dtype) == q_packing
-    assert get_dtype_packing(kv_dtype) == kv_packing
-    assert head_dim % 128 == 0
+    assert (
+        o_hbm_ref.dtype == q_dtype
+    ), f"output dtype mismatch: o_hbm_ref.dtype={o_hbm_ref.dtype} vs q_dtype={q_dtype}"
+    assert (
+        get_dtype_packing(q_dtype) == q_packing
+    ), f"q_dtype packing mismatch: get_dtype_packing({q_dtype})={get_dtype_packing(q_dtype)} vs q_packing={q_packing}"
+    assert (
+        get_dtype_packing(kv_dtype) == kv_packing
+    ), f"kv_dtype packing mismatch: get_dtype_packing({kv_dtype})={get_dtype_packing(kv_dtype)} vs kv_packing={kv_packing}"
+    assert head_dim % 128 == 0, f"head_dim must be divisible by 128, got head_dim={head_dim}"
     bkv_sz = bkv_p * page_size
     seq_idx = pl.program_id(0)
     num_seqs = pl.num_programs(0)
@@ -601,10 +617,12 @@ def _ragged_paged_attention_kernel(
         return res
 
     def strided_load(ref, start, step, *, dtype=None):
-        assert get_dtype_packing(ref.dtype) == 1
-        assert len(ref.shape) == 2
+        assert (
+            get_dtype_packing(ref.dtype) == 1
+        ), f"strided_load: dtype packing must be 1, got get_dtype_packing({ref.dtype})={get_dtype_packing(ref.dtype)}"
+        assert len(ref.shape) == 2, f"strided_load: ref must be 2D, got shape={ref.shape}"
         r, l = ref.shape  # noqa
-        assert l % 128 == 0
+        assert l % 128 == 0, f"strided_load: ref last dim must be divisible by 128, got l={l}"
         folds = l // 128
         ref = ref.reshape(r * folds, 128)
         start *= folds
@@ -615,8 +633,12 @@ def _ragged_paged_attention_kernel(
         return vec
 
     def strided_load_bkv_fused(bkv_sem_idx, start, step, *, bkv_bitmask):
-        assert start % kv_packing == 0
-        assert step % kv_packing == 0
+        assert (
+            start % kv_packing == 0
+        ), f"strided_load_bkv_fused: start must be divisible by kv_packing, got start={start}, kv_packing={kv_packing}"
+        assert (
+            step % kv_packing == 0
+        ), f"strided_load_bkv_fused: step must be divisible by kv_packing, got step={step}, kv_packing={kv_packing}"
         start //= kv_packing
         step //= kv_packing
 
@@ -651,8 +673,12 @@ def _ragged_paged_attention_kernel(
     def broadcast_minor(src, shape):
         if src.shape == shape:
             return src
-        assert src.shape[:-1] == shape[:-1]
-        assert src.shape[-1] % 128 == 0
+        assert (
+            src.shape[:-1] == shape[:-1]
+        ), f"broadcast_minor: shape mismatch except last dim, src.shape[:-1]={src.shape[:-1]} vs shape[:-1]={shape[:-1]}"
+        assert (
+            src.shape[-1] % 128 == 0
+        ), f"broadcast_minor: src last dim must be divisible by 128, got src.shape[-1]={src.shape[-1]}"
         target_minor = align_to(shape[-1], src.shape[-1])
         # no-op concatenation.
         return jnp.concatenate([src for _ in range(target_minor // src.shape[-1])], axis=-1)[
@@ -701,7 +727,9 @@ def _ragged_paged_attention_kernel(
 
             def compute_with_bkv(bkv_idx, _):
                 # Create bitmask for KV.
-                assert bkv_sz % kv_packing == 0
+                assert (
+                    bkv_sz % kv_packing == 0
+                ), f"compute_with_bkv: bkv_sz must be divisible by kv_packing, got bkv_sz={bkv_sz}, kv_packing={kv_packing}"
                 actual_bkv_sz = jnp.minimum(bkv_sz, kv_len - bkv_idx * bkv_sz)
                 bkv_shape = (bkv_sz, head_dim)
                 bkv_mask = lax.broadcasted_iota(jnp.int32, bkv_shape, 0) < actual_bkv_sz
@@ -966,8 +994,12 @@ def merge_kv(
     k: jax.Array,  # [max_num_tokens, actual_num_kv_heads, actual_head_dim],
     v: jax.Array,  # [max_num_tokens, actual_num_kv_heads, actual_head_dim],
 ):
-    assert k.shape == v.shape
-    assert k.dtype == v.dtype
+    assert (
+        k.shape == v.shape
+    ), f"merge_kv: k and v shape mismatch, k.shape={k.shape} vs v.shape={v.shape}"
+    assert (
+        k.dtype == v.dtype
+    ), f"merge_kv: k and v dtype mismatch, k.dtype={k.dtype} vs v.dtype={v.dtype}"
     max_num_tokens, actual_num_kv_heads, actual_head_dim = k.shape
     kv_packing = get_dtype_packing(k.dtype)
     actual_num_kv_heads_x2 = actual_num_kv_heads * 2
@@ -998,8 +1030,12 @@ def prepare_kv(
     k: jax.Array,  # [max_num_tokens, actual_num_kv_heads, actual_head_dim],
     v: jax.Array,  # [max_num_tokens, actual_num_kv_heads, actual_head_dim],
 ):
-    assert k.shape == v.shape
-    assert k.dtype == v.dtype
+    assert (
+        k.shape == v.shape
+    ), f"prepare_kv: k and v shape mismatch, k.shape={k.shape} vs v.shape={v.shape}"
+    assert (
+        k.dtype == v.dtype
+    ), f"prepare_kv: k and v dtype mismatch, k.dtype={k.dtype} vs v.dtype={v.dtype}"
     max_num_tokens, actual_num_kv_heads, actual_head_dim = k.shape
     kv_packing = get_dtype_packing(k.dtype)
     # actual_num_kv_heads_x2 = actual_num_kv_heads * 2
@@ -1043,7 +1079,9 @@ def prepare_inputs(
 ):
     max_num_tokens, actual_num_q_heads, actual_head_dim = q.shape
     actual_num_kv_heads = k.shape[1]
-    assert actual_num_q_heads % actual_num_kv_heads == 0
+    assert (
+        actual_num_q_heads % actual_num_kv_heads == 0
+    ), f"prepare_inputs: actual_num_q_heads {actual_num_q_heads} must be divisible by actual_num_kv_heads {actual_num_kv_heads}"
     actual_num_q_heads_per_kv_head = actual_num_q_heads // actual_num_kv_heads
     q_packing = get_dtype_packing(q.dtype)
     num_q_heads_per_kv_head = align_to(actual_num_q_heads_per_kv_head, q_packing)
@@ -1395,7 +1433,7 @@ def ragged_paged_attention(
         else:
             assert (
                 custom_mask.dtype == jnp.int32
-            ), "custom_mask bool dtype is not supported, use int32 instead. 0: False, 1: True"
+            ), f"custom_mask bool dtype is not supported, use int32 instead. 0: False, 1: True. Got dtype={custom_mask.dtype}"
 
         custom_mask = jnp.repeat(jnp.expand_dims(custom_mask, axis=1), repeats=head_dim, axis=1)
 
@@ -1597,7 +1635,9 @@ def prepare_kv_cache_fused(
     total_num_pages, page_size, actual_num_kv_heads_interleaved, actual_head_dim = (
         kv_cache_fused.shape
     )
-    assert actual_num_kv_heads_interleaved % 2 == 0
+    assert (
+        actual_num_kv_heads_interleaved % 2 == 0
+    ), f"prepare_kv_cache_fused: actual_num_kv_heads_interleaved must be even for head interleaving, got {actual_num_kv_heads_interleaved}"
 
     kv_packing = get_dtype_packing(kv_cache_fused.dtype)
     num_kv_heads_interleaved = align_to(actual_num_kv_heads_interleaved, kv_packing)

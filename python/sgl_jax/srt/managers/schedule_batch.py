@@ -773,6 +773,14 @@ class ScheduleBatch:
 
             # Skip empty DP ranks
             if not reqs:
+                # Clear fields to avoid stale data
+                info.input_ids = None
+                info.seq_lens = None
+                info.prefix_lens = None
+                info.extend_lens = None
+                info.out_cache_loc = None
+                info.seq_lens_sum = 0
+                info.extend_num_tokens = None
                 continue
 
             # Allocate req slots
@@ -906,6 +914,7 @@ class ScheduleBatch:
                     (req_pool_indices[i], slice(prefix_lens[i], seq_lens[i])),
                     out_cache_loc[pt : pt + extend_lens[i]],
                 )
+
                 pt += extend_lens[i]
 
             info.sampling_info = SamplingBatchInfo.from_schedule_batch(
@@ -1187,6 +1196,12 @@ class ScheduleBatch:
 
             # Skip empty DP ranks
             if not reqs:
+                # Clear fields to avoid stale data
+                info.input_ids = None
+                info.output_ids = None
+                info.seq_lens = None
+                info.out_cache_loc = None
+                info.seq_lens_sum = 0
                 continue
 
             bs = len(reqs)
@@ -1649,8 +1664,20 @@ class ScheduleBatch:
         if self.forward_mode.is_extend():
             per_dp_cache_loc_size = cache_loc_paddings[-1]  # Use largest padding
         else:
-            _, index = find_padding_size(per_dp_bs_size, bs_paddings)
-            per_dp_cache_loc_size = cache_loc_paddings[index]
+            # FIX: Calculate the actual max tokens needed across all DP ranks
+            # instead of inferring it from batch size bucket.
+            max_tokens_needed = 0
+            for dp_rank in range(self.dp_size):
+                info = self.reqs_info[dp_rank]
+                if info.seq_lens is not None and len(info.seq_lens) > 0:
+                    # Calculate aligned length for each request
+                    aligned_lens = ((info.seq_lens + page_size - 1) // page_size) * page_size
+                    total_aligned_len = np.sum(aligned_lens)
+                    max_tokens_needed = max(max_tokens_needed, total_aligned_len)
+
+            # Find the appropriate bucket that fits the actual content
+            per_dp_cache_loc_size, _ = find_padding_size(max_tokens_needed, cache_loc_paddings)
+
         total_cache_loc_size = per_dp_cache_loc_size * self.dp_size
         cache_loc_cpu = np.zeros(total_cache_loc_size, dtype=np.int32)
 
@@ -1666,21 +1693,32 @@ class ScheduleBatch:
 
             # Get token indices from req_to_token pool for this DP rank
             token_indices = self.req_to_token_pool.req_to_token[info.req_pool_indices]
+
+            # Ensure we start writing at the correct offset for this DP rank
             offset_cache = offset_bs
+
             # Build cache_loc for each request in this DP rank
             for i, seq_len in enumerate(info.seq_lens):
                 if seq_len > 0:
                     # Calculate page-aligned length
                     aligned_len = ((seq_len + page_size - 1) // page_size) * page_size
 
+                    # Safety check to prevent overflow
+                    if offset_cache + seq_len > offset_bs + per_dp_cache_loc_size:
+                        raise RuntimeError(
+                            f"Cache loc overflow in DP rank {dp_rank}. "
+                            f"Offset {offset_cache} + len {seq_len} > limit {offset_bs + per_dp_cache_loc_size}. "
+                            f"Chosen bucket size: {per_dp_cache_loc_size}"
+                        )
+
                     # Copy actual token indices
-                    cache_loc_cpu[offset_cache : offset_cache + seq_len] = token_indices[
-                        i, :seq_len
-                    ]
+                    tokens_to_copy = token_indices[i, :seq_len]
+                    cache_loc_cpu[offset_cache : offset_cache + seq_len] = tokens_to_copy
 
                     # Move to next page-aligned position
                     offset_cache += aligned_len
 
+            # Move to next DP rank's section (fixed stride)
             offset_bs += per_dp_cache_loc_size
 
         return cache_loc_cpu
