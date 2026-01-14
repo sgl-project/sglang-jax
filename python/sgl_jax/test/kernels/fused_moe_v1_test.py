@@ -2,16 +2,15 @@
 # Copyright 2025 The tpu-inference Authors. All rights reserved.
 import jax
 import jax.numpy as jnp
-import numpy as np
 from absl.testing import absltest, parameterized
 from jax._src import test_util as jtu
-from jax.sharding import Mesh
 
 from sgl_jax.srt.kernels.fused_moe.v1.kernel import (
     FusedMoEBlockConfig,
     fused_ep_moe,
     ref_moe,
 )
+from sgl_jax.test.test_utils import create_device_mesh
 
 jax.config.parse_flags_with_absl()
 
@@ -129,14 +128,9 @@ class MoEKernelTest(jtu.JaxTestCase):
 
     def setUp(self):
         super().setUp()
-        self.mesh_devices = sorted(
-            jax.devices(),
-            key=lambda x: (
-                x.coords[0],
-                (-1 if x.coords[0] % 2 else 1) * x.coords[1],
-            ),
-        )
-        self.mesh = Mesh(np.array(self.mesh_devices).reshape(-1, 1), axis_names=("tensor", "data"))
+        # Use the shared helper so multi-host runs get a consistent device ordering.
+        # Mesh axes are ("data", "tensor"), matching fused_ep_moe defaults.
+        self.mesh = create_device_mesh(ici_parallelism=[1, -1], dcn_parallelism=[1, 1])
 
     def _test_moe(
         self,
