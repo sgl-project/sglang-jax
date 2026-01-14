@@ -1526,8 +1526,6 @@ def _fused_ep_moe_kernel(
         assert bd2c % (t_packing * 128) == 0, (bd2c, t_packing)
 
         def body(btc_id, __):
-            # `activation_fn(acc1, acc3)` depends only on (btc_id, bfc_id), not on p_id/bd2c_id.
-            # Hoist it out to avoid recomputing the same activation for each packed shard.
             act_by_bfc = []
             for bfc_id in range(cdiv(bf, bfc)):
                 acc_slices = (pl.ds(btc_id * btc, btc), pl.ds(bfc_id * bfc, bfc))
