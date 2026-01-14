@@ -1428,7 +1428,7 @@ def _fused_ep_moe_kernel(
         dyn_sz_i32 = dyn_sz.astype(jnp.int32)
         num_loops = lax.select(dyn_sz_i32 > 0, (dyn_sz_i32 + (btc - 1)) // btc, 0)
 
-        def body(btc_id, _):
+        def compute_tile(btc_id, is_init_mode):
             for bd1c_id in range(cdiv(bd1, bd1c)):
                 for p_id in range(t_packing):
                     t = t_vmem[
@@ -1456,7 +1456,6 @@ def _fused_ep_moe_kernel(
                             acc1 *= w1_scale
 
                         w3 = w3_vmem[*w_slices]
-
                         acc3 = jnp.dot(t, w3, preferred_element_type=jnp.float32)
 
                         if w3_scale_vmem is not None:
@@ -1470,7 +1469,8 @@ def _fused_ep_moe_kernel(
                             acc3 *= w3_scale
 
                         acc_slices = (pl.ds(btc_id * btc, btc), pl.ds(bfc_id * bfc, bfc))
-                        if should_init and p_id == bd1c_id == 0:
+
+                        if is_init_mode and p_id == 0 and bd1c_id == 0:
                             if b1_vmem is not None:
                                 b1_scale_slices = (
                                     pl.ds(0, 1),
@@ -1492,7 +1492,18 @@ def _fused_ep_moe_kernel(
                             acc1_vmem[*acc_slices] += acc1
                             acc3_vmem[*acc_slices] += acc3
 
-        lax.fori_loop(0, num_loops, body, None)
+        if should_init:
+
+            def body_init(i, _):
+                compute_tile(i, is_init_mode=True)
+
+            lax.fori_loop(0, num_loops, body_init, None)
+        else:
+
+            def body_acc(i, _):
+                compute_tile(i, is_init_mode=False)
+
+            lax.fori_loop(0, num_loops, body_acc, None)
 
     def dynamic_ffn2(
         acc1_vmem,
@@ -1931,8 +1942,9 @@ def _fused_ep_moe_kernel(
     def acc_and_store_output(*, bt_sem_id, out_buf_id):
         acc_bt = a2a_g_acc_vmem.shape[2]
         assert bt % acc_bt == 0, (bt, acc_bt)
+        num_acc_tiles = bt // acc_bt
 
-        def load_acc_bt_sync(*, tile_start):
+        def start_load_acc_bt(*, tile_start, buf_id):
             def _load_one(t_i, _):
                 t_id = tile_start + t_i
                 for k_id in range(top_k):
@@ -1941,31 +1953,32 @@ def _fused_ep_moe_kernel(
                     expert_offsets_x2_smem[bt_sem_id, 1, e_id] = offset + 1
                     pltpu.make_async_copy(
                         src_ref=a2a_g_hbm.at[e_id, pl.ds(offset, 1)],
-                        dst_ref=a2a_g_acc_vmem.at[0, k_id, pl.ds(t_i, 1)],
+                        dst_ref=a2a_g_acc_vmem.at[buf_id, k_id, pl.ds(t_i, 1)],
                         sem=a2a_acc_sems.at[0],
                     ).start()
                 return None
 
             lax.fori_loop(0, acc_bt, _load_one, None, unroll=False)
+
+        def wait_load_acc_bt(*, buf_id):
             pltpu.make_async_copy(
-                src_ref=a2a_g_acc_vmem.at[0],
-                dst_ref=a2a_g_acc_vmem.at[0],
+                src_ref=a2a_g_acc_vmem.at[buf_id],
+                dst_ref=a2a_g_acc_vmem.at[buf_id],
                 sem=a2a_acc_sems.at[0],
             ).wait()
 
-        def acc_gather_to_output(*, tile_start, out_offset):
+        def acc_gather_to_output(*, tile_start, out_offset, buf_id):
             output_tile = jnp.zeros((acc_bt, t_packing, h_per_t_packing), dtype=jnp.float32)
             logits_tile = top_k_logits_vmem.at[
                 pl.ds(tile_start, acc_bt),
                 pl.ds(0, top_k),
             ][...]
             for k_id in range(top_k):
-                acc_tile = a2a_g_acc_vmem[0, k_id, :acc_bt].astype(jnp.float32)
+                acc_tile = a2a_g_acc_vmem[buf_id, k_id, :acc_bt].astype(jnp.float32)
                 logits = logits_tile[:, k_id].reshape(acc_bt, 1, 1)
                 output_tile += acc_tile * logits
 
             out_offset = pl.multiple_of(out_offset, 16)
-
             target_slice = b_output_x2_vmem.at[
                 out_buf_id, pl.ds(out_offset, acc_bt), pl.ds(0, hidden_size)
             ]
@@ -1979,16 +1992,28 @@ def _fused_ep_moe_kernel(
                     output_hbm.dtype
                 )
 
-        num_acc_tiles = bt // acc_bt
+        start_load_acc_bt(tile_start=0, buf_id=0)
 
-        def run_acc_tile(acc_tile_idx, _):
-            acc_tile_start = acc_tile_idx * acc_bt
-            out_offset = acc_tile_idx * acc_bt
-            load_acc_bt_sync(tile_start=acc_tile_start)
-            acc_gather_to_output(tile_start=acc_tile_start, out_offset=out_offset)
+        def run_acc_pipeline(i, _):
+            curr_buf_id = i % 2
+            next_buf_id = (i + 1) % 2
+
+            curr_tile_start = i * acc_bt
+            next_tile_start = (i + 1) * acc_bt
+            out_offset = i * acc_bt
+
+            @pl.when(i + 1 < num_acc_tiles)
+            def _():
+                start_load_acc_bt(tile_start=next_tile_start, buf_id=next_buf_id)
+
+            wait_load_acc_bt(buf_id=curr_buf_id)
+
+            acc_gather_to_output(
+                tile_start=curr_tile_start, out_offset=out_offset, buf_id=curr_buf_id
+            )
             return None
 
-        lax.fori_loop(0, num_acc_tiles, run_acc_tile, None, unroll=False)
+        lax.fori_loop(0, num_acc_tiles, run_acc_pipeline, None, unroll=False)
         return None
 
     def start_send_bo(*, bt_id, priority=0):
@@ -2046,8 +2071,11 @@ def _fused_ep_moe_kernel(
                 )
 
             if num_bd1 > 0:
-                start_fetch_se_w1(0, block_id, 0)
-                start_fetch_se_w3(0, block_id, 0)
+
+                @pl.when(block_id == 0)
+                def _():
+                    start_fetch_se_w1(0, block_id, 0)
+                    start_fetch_se_w3(0, block_id, 0)
 
             init_val = jnp.zeros((bt, bse), dtype=jnp.float32)
 
@@ -2121,6 +2149,16 @@ def _fused_ep_moe_kernel(
                 @pl.when(next_bd2_idx < num_bd2)
                 def _():
                     start_fetch_se_w2(next_sem, block_id, next_bd2_idx)
+
+                @pl.when(bd2_idx == 0)
+                def _():
+                    next_block_id = block_id + 1
+
+                    @pl.when(next_block_id < se_total_blocks)
+                    def _():
+                        if num_bd1 > 0:
+                            start_fetch_se_w1(0, next_block_id, 0)
+                            start_fetch_se_w3(0, next_block_id, 0)
 
                 wait_fetch_se_w2(curr_sem)
 
@@ -2724,7 +2762,7 @@ def fused_ep_moe(
         pltpu.SMEM((2, 1, padded_num_experts), jnp.int32),  # expert_sizes_x2_smem
         pltpu.SMEM((2,), jnp.int32),  # a2a_s_sends_x2_smem
         pltpu.VMEM(
-            (1, top_k, math.gcd(bt, 16), t_packing, hidden_per_pack),
+            (2, top_k, math.gcd(bt, 16), t_packing, hidden_per_pack),
             t_dtype,
         ),  # a2a_g_acc_vmem
         pltpu.VMEM((bt, top_k), jnp.float32),  # top_k_logits_vmem
