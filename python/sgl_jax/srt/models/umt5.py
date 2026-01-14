@@ -15,6 +15,7 @@ import math
 import jax
 import jax.numpy as jnp
 from flax import nnx
+from jax import lax
 from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 from transformers import UMT5Config
@@ -468,7 +469,7 @@ class UMT5EncoderModel(nnx.Module):
         # Dummy logits for interface compatibility
         bs = forward_batch.seq_lens.shape[0]
         dummy = jnp.zeros((bs, self.config.vocab_size), dtype=self.dtype)
-        dummy = jax.device_put(dummy, NamedSharding(self.mesh, P(None, "tensor")))
+        dummy = jax.sharding.reshard(dummy, NamedSharding(self.mesh, P(None, "tensor")))
         return LogitsProcessorOutput(next_token_logits=dummy, hidden_states=hidden), [], []
 
 

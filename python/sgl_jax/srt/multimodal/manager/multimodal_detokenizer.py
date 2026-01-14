@@ -30,7 +30,7 @@ class MultimodalDetokenizer(DetokenizerManager):
         )
 
     def save_result(self, req: Req):
-        print("save_result...")
+        logger.info("save_result...")
         if req.output is None or len(req.output) == 0:
             logger.warning("No output to save for request id: %s", req.rid)
             return [req]
