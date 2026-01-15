@@ -402,9 +402,7 @@ class TokenizerManager:
         tokenized_objs = []
         for i, req in enumerate(requests):
             # self._validate_token_len(obj[i], input_ids_list[i])
-            tokenized_objs.append(
-                self._create_tokenized_object(req, req.text, input_ids_list[i], None, None)
-            )
+            tokenized_objs.append(self._create_tokenized_object(req, req.text, input_ids_list[i]))
         logger.debug("Completed batch processing for %s requests", batch_size)
         return tokenized_objs
 
