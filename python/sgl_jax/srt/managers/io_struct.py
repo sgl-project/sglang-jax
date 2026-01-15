@@ -125,12 +125,12 @@ class TokenizedGenerateReqInput:
     token_ids_logprob: list[list[int]] | list[int] | None = None
     # Whether to stream output
     stream: bool = False
-    # whether to return hidden states
-    return_hidden_states: bool = False
     # LoRA related
     lora_id: str | None = None  # None means just use the base model
     # Extra key for cache namespace isolation (e.g., cache_salt, lora_id)
     extra_key: str | None = None
+    # whether to return hidden states
+    return_hidden_states: bool = False
 
 
 @dataclass
