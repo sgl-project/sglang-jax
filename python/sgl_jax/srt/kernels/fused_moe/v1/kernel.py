@@ -1626,7 +1626,10 @@ def _fused_ep_moe_kernel(
                         res += b2
 
                     for bfc_id in range(cdiv(bf, bfc)):
-                        act = act_by_bfc[bfc_id]
+                        acc_slices = (pl.ds(btc_id * btc, btc), pl.ds(bfc_id * bfc, bfc))
+                        acc1 = acc1_vmem[*acc_slices]
+                        acc3 = acc3_vmem[*acc_slices]
+                        act = activation_fn(acc1, acc3, act_fn)
                         w2 = w2_vmem[
                             p_id,
                             pl.ds(bfc_id * bfc, bfc),
