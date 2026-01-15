@@ -184,12 +184,12 @@ class Req:
                     if rid not in req_store:
                         raise RuntimeError(f"{rid} is not in req_store")
                     req = req_store[rid]
-                    req.negative_prompt_embeds = stage_result.output_hidden_states[i][0]
+                    req.negative_prompt_embeds = stage_result.output_hidden_states_for_mm[i][0]
                 else:
                     if rid not in req_store:
                         raise RuntimeError(f"{rid} is not in req_store")
                     req = req_store[rid]
-                    req.prompt_embeds = stage_result.output_hidden_states[i][0]
+                    req.prompt_embeds = stage_result.output_hidden_states_for_mm[i][0]
             if req.prompt_embeds is None or req.negative_prompt_embeds is None:
                 return None
             return req

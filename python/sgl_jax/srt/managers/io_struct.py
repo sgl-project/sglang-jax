@@ -97,7 +97,7 @@ class BatchTokenIDOut:
 
     # Hidden states
     output_hidden_states: list[list[float]]
-
+    output_hidden_states_for_mm: list[list[float]]
     # Cache miss count
     cache_miss_count: int = None
 

@@ -194,7 +194,8 @@ def get_tokenizer(
             f"Please use a local path or HuggingFace model name instead: {tokenizer_name}"
         )
     tokenizer_name = download_from_hf(tokenizer_name)
-    tokenizer_name += "/" + sub_dir
+    if sub_dir:
+        tokenizer_name += "/" + sub_dir
     try:
         tokenizer = AutoTokenizer.from_pretrained(
             tokenizer_name,

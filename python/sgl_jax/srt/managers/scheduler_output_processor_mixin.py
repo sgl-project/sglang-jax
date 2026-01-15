@@ -564,7 +564,7 @@ class SchedulerOutputProcessorMixin:
         spec_verify_ct = []
         spec_accepted_tokens = []
         output_hidden_states = None
-
+        output_hidden_states_for_mm = None
         if return_logprob:
             input_token_logprobs_val = []
             input_token_logprobs_idx = []
@@ -702,11 +702,10 @@ class SchedulerOutputProcessorMixin:
                         output_top_logprobs_idx.append([])
                         output_token_ids_logprobs_val.append([])
                         output_token_ids_logprobs_idx.append([])
-
                 if req.return_hidden_states:
-                    if output_hidden_states is None:
-                        output_hidden_states = []
-                    output_hidden_states.append(req.hidden_states)
+                    if output_hidden_states_for_mm is None:
+                        output_hidden_states_for_mm = []
+                    output_hidden_states_for_mm.append(req.hidden_states)
         # Send to detokenizer
         if rids:
             out = BatchTokenIDOut(
@@ -735,6 +734,7 @@ class SchedulerOutputProcessorMixin:
                 output_token_ids_logprobs_val,
                 output_token_ids_logprobs_idx,
                 output_hidden_states,
+                output_hidden_states_for_mm,
                 cache_miss_count,
             )
             if self._comm_backend is not None:
