@@ -860,11 +860,9 @@ def _fused_ep_moe_kernel(
             # issuing remote puts.
             sync_barrier()
             for peer_id in range(num_devices):
-                is_local = peer_id == my_id
-                sz = lax.select(is_local, jnp.int32(0), jnp.int32(padded_num_experts))
                 pltpu.make_async_remote_copy(
-                    src_ref=d2e_count_vmem.at[my_id, pl.ds(0, 1), pl.ds(0, sz)],
-                    dst_ref=d2e_count_vmem.at[my_id, pl.ds(0, 1), pl.ds(0, sz)],
+                    src_ref=d2e_count_vmem.at[my_id, pl.ds(0, 1), pl.ds(0, padded_num_experts)],
+                    dst_ref=d2e_count_vmem.at[my_id, pl.ds(0, 1), pl.ds(0, padded_num_experts)],
                     send_sem=send_sem,
                     recv_sem=recv_sem,
                     device_id=get_mesh_device_id(peer_id),
