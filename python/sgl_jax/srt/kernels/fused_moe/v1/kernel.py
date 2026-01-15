@@ -2964,6 +2964,7 @@ def fused_ep_moe(
         )
     )
 
+    @jax.jit
     @jax.shard_map(
         mesh=mesh,
         in_specs=(
@@ -3137,34 +3138,7 @@ def fused_ep_moe(
     )
     a2a_g_hbm_scratch = pl.empty((num_experts, bt, t_packing, hidden_size // t_packing), t_dtype)
 
-    compiled_kernel = (
-        jax.jit(kernel)
-        .lower(
-            tokens,
-            w1,
-            w2,
-            w3,
-            w1_scale,
-            w2_scale,
-            w3_scale,
-            b1,
-            b2,
-            b3,
-            gating_output,
-            a2a_s_x2_hbm_scratch,
-            a2a_s_acc_x2_hbm_scratch,
-            a2a_g_hbm_scratch,
-            bias,
-            w1_shared,
-            w3_shared,
-            w2_shared,
-            w1_shared_scale,
-            w3_shared_scale,
-            w2_shared_scale,
-        )
-        .compile({"xla_tpu_enable_log_recorder": "true"})
-    )
-    return compiled_kernel(
+    return kernel(
         tokens,
         w1,
         w2,
