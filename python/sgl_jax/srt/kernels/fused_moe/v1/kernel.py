@@ -541,6 +541,10 @@ def _fused_ep_moe_kernel(
     bd1c: int,  # Compute size of block hidden_size.
     bd2c: int,  # Compute size of block hidden_size.
     bse: int,  # Block size for SE intermediate_size.
+    # Profiling / ablation flags (primarily for microbenching).
+    disable_topk: bool,
+    disable_all_reduce_metadata: bool,
+    disable_sync_barrier: bool,
     disable_a2a: bool,
     disable_dynamic_ffn1: bool,
     disable_dynamic_ffn2: bool,
@@ -549,7 +553,6 @@ def _fused_ep_moe_kernel(
     disable_a2a_s_acc_tile_write: bool,
     disable_shared_expert: bool,
 ):
-    pl.debug_print("================================================ bt: {}", bt)
     dp_rank = lax.axis_index(dp_axis_name)
     tp_rank = lax.axis_index(tp_axis_name)
     tp_size = lax.axis_size(tp_axis_name)
@@ -620,6 +623,8 @@ def _fused_ep_moe_kernel(
         return (dp_rank, tp_rank)
 
     def sync_barrier():
+        if disable_sync_barrier:
+            return
         # Full mesh barrier (matches epic/integrate-fused-moe). The previous
         # "signal right + wait 1" is only a neighbor fence (not a global barrier)
         # and can lead to rare deadlocks when subsequent comm assumes all peers
@@ -765,6 +770,66 @@ def _fused_ep_moe_kernel(
     def all_reduce_metadata(*, bt_sem_id, t2e_routing, starts, sizes):
         send_sem = send_x2_sems.at[0]
         recv_sem = recv_x2_sems.at[0]
+
+        # Local-only metadata path for profiling. Not correct for multi-device routing;
+        # only use when A2A is disabled (or on ep_size=1).
+        if disable_all_reduce_metadata:
+
+            def _local_metadata(
+                t2e_routing_vmem,
+                d2e_count_vmem,
+                offsets_vmem,
+                starts_vmem,
+                sizes_vmem,
+            ):
+                offsets_vmem[...] = jnp.zeros_like(offsets_vmem)
+                t2e_routing_vmem[...] = t2e_routing
+                starts_vmem[...] = starts
+                sizes_vmem[...] = sizes
+                d2e_count_vmem[...] = jnp.zeros_like(d2e_count_vmem)
+                d2e_count_vmem[my_id] = sizes
+
+                offsets_copy = pltpu.async_copy(
+                    src_ref=offsets_vmem,
+                    dst_ref=expert_offsets_x2_smem.at[bt_sem_id],
+                    sem=send_sem,
+                )
+                t2e_routing_copy = pltpu.async_copy(
+                    src_ref=t2e_routing_vmem,
+                    dst_ref=t2e_routing_x2_smem.at[bt_sem_id],
+                    sem=send_sem,
+                )
+                starts_copy = pltpu.async_copy(
+                    src_ref=starts_vmem,
+                    dst_ref=expert_starts_x2_smem.at[bt_sem_id],
+                    sem=send_sem,
+                )
+                sizes_copy = pltpu.async_copy(
+                    src_ref=sizes_vmem,
+                    dst_ref=expert_sizes_x2_smem.at[bt_sem_id],
+                    sem=send_sem,
+                )
+                d2e_count_copy = pltpu.async_copy(
+                    src_ref=d2e_count_vmem,
+                    dst_ref=d2e_count_x2_smem.at[bt_sem_id],
+                    sem=send_sem,
+                )
+
+                t2e_routing_copy.wait()
+                d2e_count_copy.wait()
+                offsets_copy.wait()
+                starts_copy.wait()
+                sizes_copy.wait()
+
+            pl.run_scoped(
+                _local_metadata,
+                pltpu.VMEM(t2e_routing_x2_smem.shape[1:], t2e_routing_x2_smem.dtype),
+                pltpu.VMEM(d2e_count_x2_smem.shape[1:], d2e_count_x2_smem.dtype),
+                pltpu.VMEM(expert_offsets_x2_smem.shape[1:], expert_offsets_x2_smem.dtype),
+                pltpu.VMEM(expert_starts_x2_smem.shape[1:], expert_starts_x2_smem.dtype),
+                pltpu.VMEM(expert_sizes_x2_smem.shape[1:], expert_sizes_x2_smem.dtype),
+            )
+            return
 
         # All-reduce to accumulate starts and sizes and transfer to SMEM.
         def _all_reduce_metadata(
@@ -2218,13 +2283,26 @@ def _fused_ep_moe_kernel(
 
         wait_fetch_b_gating(bt_id=bt_id)
 
-        b_gating = b_gating_x2_vmem.at[bt_sem_id][...]
-        t2e_routing, expert_sizes, expert_starts = get_top_k(
-            b_gating,
-            top_k,
-            renormalize_topk_logits,
-            out_top_k_logits_vmem=top_k_logits_vmem,
-        )
+        if disable_topk:
+            # Deterministic dummy routing for profiling. Routes every (token,k) to expert 0 and
+            # sets logits to select k=0. This keeps subsequent indexing in-bounds.
+            t2e_routing = jnp.zeros((bt, padded_top_k), dtype=jnp.int32)
+            expert_sizes = (
+                jnp.zeros((1, padded_num_experts), dtype=jnp.int32).at[0, 0].set(bt * top_k)
+            )
+            expert_starts = jnp.zeros_like(expert_sizes)
+            top_k_logits_vmem[...] = jnp.zeros_like(top_k_logits_vmem)
+            top_k_logits_vmem.at[pl.ds(0, bt), pl.ds(0, 1)][...] = jnp.ones(
+                (bt, 1), dtype=jnp.float32
+            )
+        else:
+            b_gating = b_gating_x2_vmem.at[bt_sem_id][...]
+            t2e_routing, expert_sizes, expert_starts = get_top_k(
+                b_gating,
+                top_k,
+                renormalize_topk_logits,
+                out_top_k_logits_vmem=top_k_logits_vmem,
+            )
         all_reduce_metadata(
             bt_sem_id=bt_sem_id,
             t2e_routing=t2e_routing,
@@ -2561,6 +2639,9 @@ def _validate_fused_ep_moe_args(
         "dp_axis_name",
         "tp_axis_name",
         "balanced_topk",
+        "disable_topk",
+        "disable_all_reduce_metadata",
+        "disable_sync_barrier",
         "disable_a2a",
         "disable_dynamic_ffn1",
         "disable_dynamic_ffn2",
@@ -2616,9 +2697,21 @@ def fused_ep_moe(
     disable_a2a_s_tile_read: bool = False,
     disable_a2a_s_acc_tile_write: bool = False,
     disable_shared_expert: bool = False,
+    disable_topk: bool = False,
+    disable_all_reduce_metadata: bool = False,
+    disable_sync_barrier: bool = False,
 ):
 
     ep_size = get_ep_size(mesh, dp_axis_name, tp_axis_name)
+    if ep_size > 1 and not disable_a2a:
+        if disable_all_reduce_metadata:
+            raise ValueError(
+                "disable_all_reduce_metadata is only supported with disable_a2a=True or ep_size=1."
+            )
+        if disable_sync_barrier:
+            raise ValueError(
+                "disable_sync_barrier is only supported with disable_a2a=True or ep_size=1."
+            )
     if block_config is None:
         from .tuned_block_configs import get_tuned_fused_moe_block_config
 
@@ -2907,6 +3000,9 @@ def fused_ep_moe(
                 bd1c=block_config.bd1c,
                 bd2c=block_config.bd2c,
                 bse=block_config.bse,
+                disable_topk=disable_topk,
+                disable_all_reduce_metadata=disable_all_reduce_metadata,
+                disable_sync_barrier=disable_sync_barrier,
                 disable_a2a=disable_a2a,
                 disable_dynamic_ffn1=disable_dynamic_ffn1,
                 disable_dynamic_ffn2=disable_dynamic_ffn2,

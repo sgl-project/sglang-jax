@@ -41,6 +41,18 @@ DEFAULT_TPU_VMEM_BUDGET_MB = 60
 DEFAULT_TPU_VMEM_BUDGET_BYTES = DEFAULT_TPU_VMEM_BUDGET_MB * 1024 * 1024
 
 
+def _env_bool(name: str, default: bool = False) -> bool:
+    val = os.getenv(name)
+    if val is None:
+        return default
+    val = val.strip().lower()
+    if val in ("1", "true", "t", "yes", "y", "on"):
+        return True
+    if val in ("0", "false", "f", "no", "n", "off", ""):
+        return False
+    raise ValueError(f"Invalid boolean env var {name}={val!r} (expected 0/1/true/false).")
+
+
 def _dtype_packing(dtype: jnp.dtype) -> int:
     """Match get_dtype_packing() in fused_moe kernel (32-bit repack width)."""
     bits = jnp.dtype(dtype).itemsize * 8
@@ -616,17 +628,22 @@ def run_all(
                 moe_shared_expert_intermediate_size=(
                     case.intermediate_size if use_shared_expert else None
                 ),
-                disable_a2a=os.getenv("FUSED_MOE_BENCHMARK_DISABLE_A2A", False),
-                disable_dynamic_ffn1=os.getenv("FUSED_MOE_BENCHMARK_DISABLE_DYNAMIC_FFN1", False),
-                disable_dynamic_ffn2=os.getenv("FUSED_MOE_BENCHMARK_DISABLE_DYNAMIC_FFN2", False),
-                disable_weight_load=os.getenv("FUSED_MOE_BENCHMARK_DISABLE_WEIGHT_LOAD", False),
-                disable_a2a_s_tile_read=os.getenv(
+                disable_a2a=_env_bool("FUSED_MOE_BENCHMARK_DISABLE_A2A", False),
+                disable_dynamic_ffn1=_env_bool("FUSED_MOE_BENCHMARK_DISABLE_DYNAMIC_FFN1", False),
+                disable_dynamic_ffn2=_env_bool("FUSED_MOE_BENCHMARK_DISABLE_DYNAMIC_FFN2", False),
+                disable_weight_load=_env_bool("FUSED_MOE_BENCHMARK_DISABLE_WEIGHT_LOAD", False),
+                disable_a2a_s_tile_read=_env_bool(
                     "FUSED_MOE_BENCHMARK_DISABLE_A2A_S_TILE_READ", False
                 ),
-                disable_a2a_s_acc_tile_write=os.getenv(
+                disable_a2a_s_acc_tile_write=_env_bool(
                     "FUSED_MOE_BENCHMARK_DISABLE_A2A_S_ACC_TILE_WRITE", False
                 ),
-                disable_shared_expert=os.getenv("FUSED_MOE_BENCHMARK_DISABLE_SHARED_EXPERT", False),
+                disable_shared_expert=_env_bool("FUSED_MOE_BENCHMARK_DISABLE_SHARED_EXPERT", False),
+                disable_topk=_env_bool("FUSED_MOE_BENCHMARK_DISABLE_TOPK", False),
+                disable_all_reduce_metadata=_env_bool(
+                    "FUSED_MOE_BENCHMARK_DISABLE_ALL_REDUCE_METADATA", False
+                ),
+                disable_sync_barrier=_env_bool("FUSED_MOE_BENCHMARK_DISABLE_SYNC_BARRIER", False),
             )
 
             moe_def, moe_state = nnx.split(fused_layer)

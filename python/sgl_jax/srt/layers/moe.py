@@ -548,6 +548,9 @@ class FusedEPMoE(nnx.Module):
         disable_a2a_s_tile_read: bool = False,
         disable_a2a_s_acc_tile_write: bool = False,
         disable_shared_expert: bool = False,
+        disable_topk: bool = False,
+        disable_all_reduce_metadata: bool = False,
+        disable_sync_barrier: bool = False,
     ):
         self.hidden_size = hidden_size
         self.num_experts = num_experts
@@ -576,6 +579,9 @@ class FusedEPMoE(nnx.Module):
         self.disable_a2a_s_tile_read = disable_a2a_s_tile_read
         self.disable_a2a_s_acc_tile_write = disable_a2a_s_acc_tile_write
         self.disable_shared_expert = disable_shared_expert
+        self.disable_topk = disable_topk
+        self.disable_all_reduce_metadata = disable_all_reduce_metadata
+        self.disable_sync_barrier = disable_sync_barrier
 
         if num_experts % self.ep_size != 0:
             raise ValueError(
@@ -709,6 +715,9 @@ class FusedEPMoE(nnx.Module):
             disable_a2a_s_tile_read=self.disable_a2a_s_tile_read,
             disable_a2a_s_acc_tile_write=self.disable_a2a_s_acc_tile_write,
             disable_shared_expert=self.disable_shared_expert,
+            disable_topk=self.disable_topk,
+            disable_all_reduce_metadata=self.disable_all_reduce_metadata,
+            disable_sync_barrier=self.disable_sync_barrier,
         )
 
         output = jax.sharding.reshard(output, NamedSharding(self.mesh, P(None, None)))
