@@ -859,8 +859,6 @@ def _fused_ep_moe_kernel(
             # Ensure all peers have entered this scope (VMEM allocated) before
             # issuing remote puts.
             sync_barrier()
-            # Use a permutation schedule (one-to-one each step) to avoid many-to-one
-            # fan-in on a single DMA semaphore, which can deadlock on TPU.
             for step in range(1, num_devices):
                 peer_id = (my_id + step) % num_devices
                 pltpu.make_async_remote_copy(
@@ -870,7 +868,16 @@ def _fused_ep_moe_kernel(
                     recv_sem=recv_sem,
                     device_id=get_mesh_device_id(peer_id),
                     device_id_type=pltpu.DeviceIdType.MESH,
-                ).wait()
+                ).start()
+
+                # Drain one incoming update for this step to guarantee forward
+                # progress (remote copies signal `recv_sem` on the receiver).
+                src_peer = (my_id + num_devices - step) % num_devices
+                recv_ref = d2e_count_vmem.at[src_peer, pl.ds(0, 1), pl.ds(0, padded_num_experts)]
+                pltpu.make_async_copy(src_ref=recv_ref, dst_ref=recv_ref, sem=recv_sem).wait()
+
+                send_ref = d2e_count_vmem.at[my_id, pl.ds(0, 1), pl.ds(0, padded_num_experts)]
+                pltpu.make_async_copy(src_ref=send_ref, dst_ref=send_ref, sem=send_sem).wait()
 
             # Ensure all peers completed their sends before using gathered sizes.
             sync_barrier()
@@ -895,9 +902,6 @@ def _fused_ep_moe_kernel(
                 dst_ref=expert_sizes_x2_smem.at[bt_sem_id],
                 sem=send_sem,
             )
-
-            # TODO(jevinjiang): if d2e_count is too big, we can store in HBM and fetch
-            # to SMEM partially.
             d2e_count_copy = pltpu.async_copy(
                 src_ref=d2e_count_vmem,
                 dst_ref=d2e_count_x2_smem.at[bt_sem_id],
