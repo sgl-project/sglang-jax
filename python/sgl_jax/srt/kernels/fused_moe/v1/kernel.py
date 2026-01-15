@@ -1605,13 +1605,6 @@ def _fused_ep_moe_kernel(
         assert bd2c % (t_packing * 128) == 0, (bd2c, t_packing)
 
         def body(btc_id, __):
-            act_by_bfc = []
-            for bfc_id in range(cdiv(bf, bfc)):
-                acc_slices = (pl.ds(btc_id * btc, btc), pl.ds(bfc_id * bfc, bfc))
-                acc1 = acc1_vmem[*acc_slices]
-                acc3 = acc3_vmem[*acc_slices]
-                act_by_bfc.append(activation_fn(acc1, acc3, act_fn))
-
             for bd2c_id in range(cdiv(bd2, bd2c)):
                 for p_id in range(t_packing):
                     res = jnp.zeros((btc, bd2c_per_t_packing), dtype=jnp.float32)
