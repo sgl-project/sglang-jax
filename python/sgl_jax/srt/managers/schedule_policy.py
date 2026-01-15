@@ -137,6 +137,7 @@ class SchedulePolicy:
         self, waiting_queue: list[Req], policy: CacheAwarePolicy
     ) -> set[int]:
         """
+        # for test
         Computes and caches the matching prefixes for requests in the waiting queue,
             and handles in-batch prefix caching logic.
         """
