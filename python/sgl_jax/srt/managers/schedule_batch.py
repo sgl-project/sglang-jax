@@ -1509,14 +1509,14 @@ class ScheduleBatch:
             if info.seq_lens is not None:
                 max_bs_per_dp = max(max_bs_per_dp, len(info.seq_lens))
 
-        per_dp_token_padding, _ = find_padding_size(max_tokens_per_dp, token_paddings)
-        per_dp_bs_padding, _ = find_padding_size(max_bs_per_dp, bs_paddings)
+        token_padding, _ = find_padding_size(max_tokens_per_dp * self.dp_size, token_paddings)
+        bs_padding, _ = find_padding_size(max_bs_per_dp * self.dp_size, bs_paddings)
 
         return (
-            per_dp_token_padding,
-            per_dp_token_padding * self.dp_size,
-            per_dp_bs_padding,
-            per_dp_bs_padding * self.dp_size,
+            token_padding // self.dp_size,
+            token_padding,
+            bs_padding // self.dp_size,
+            bs_padding,
         )
 
     def _merge_input_and_positions(
@@ -1660,9 +1660,9 @@ class ScheduleBatch:
             cache_loc array
         """
         # Calculate total cache_loc size needed
-        per_dp_cache_loc_size = 0
+        total_cache_loc_size = 0
         if self.forward_mode.is_extend():
-            per_dp_cache_loc_size = cache_loc_paddings[-1]  # Use largest padding
+            total_cache_loc_size = cache_loc_paddings[-1]  # Use largest padding
         else:
             # FIX: Calculate the actual max tokens needed across all DP ranks
             # instead of inferring it from batch size bucket.
@@ -1676,9 +1676,9 @@ class ScheduleBatch:
                     max_tokens_needed = max(max_tokens_needed, total_aligned_len)
 
             # Find the appropriate bucket that fits the actual content
-            per_dp_cache_loc_size, _ = find_padding_size(max_tokens_needed, cache_loc_paddings)
+            total_cache_loc_size, _ = find_padding_size(max_tokens_needed, cache_loc_paddings)
 
-        total_cache_loc_size = per_dp_cache_loc_size * self.dp_size
+        per_dp_cache_loc_size = total_cache_loc_size // self.dp_size
         cache_loc_cpu = np.zeros(total_cache_loc_size, dtype=np.int32)
 
         offset_bs = 0
