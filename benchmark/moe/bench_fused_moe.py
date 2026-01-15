@@ -53,6 +53,22 @@ def _env_bool(name: str, default: bool = False) -> bool:
     raise ValueError(f"Invalid boolean env var {name}={val!r} (expected 0/1/true/false).")
 
 
+def _env_bool_opt(name: str) -> bool | None:
+    """Return None if unset, otherwise parse as bool."""
+    val = os.getenv(name)
+    if val is None:
+        return None
+    return _env_bool(name)
+
+
+def _with_all_disable(env_name: str, *, all_disable: bool) -> bool:
+    """Use per-flag env override if set; otherwise fall back to all_disable."""
+    specific = _env_bool_opt(env_name)
+    if specific is not None:
+        return specific
+    return all_disable
+
+
 def _dtype_packing(dtype: jnp.dtype) -> int:
     """Match get_dtype_packing() in fused_moe kernel (32-bit repack width)."""
     bits = jnp.dtype(dtype).itemsize * 8
@@ -609,6 +625,7 @@ def run_all(
             block_cfgs = [None]
 
         with jax.set_mesh(mesh):
+            all_disable = _env_bool("FUSED_MOE_BENCHMARK_ALL_DISABLE", False)
             fused_layer = FusedEPMoE(
                 hidden_size=case.hidden_size,
                 num_experts=case.num_experts,
@@ -628,22 +645,49 @@ def run_all(
                 moe_shared_expert_intermediate_size=(
                     case.intermediate_size if use_shared_expert else None
                 ),
-                disable_a2a=_env_bool("FUSED_MOE_BENCHMARK_DISABLE_A2A", False),
-                disable_dynamic_ffn1=_env_bool("FUSED_MOE_BENCHMARK_DISABLE_DYNAMIC_FFN1", False),
-                disable_dynamic_ffn2=_env_bool("FUSED_MOE_BENCHMARK_DISABLE_DYNAMIC_FFN2", False),
-                disable_weight_load=_env_bool("FUSED_MOE_BENCHMARK_DISABLE_WEIGHT_LOAD", False),
-                disable_a2a_s_tile_read=_env_bool(
-                    "FUSED_MOE_BENCHMARK_DISABLE_A2A_S_TILE_READ", False
+                # Env helpers:
+                # - Set `FUSED_MOE_BENCHMARK_ALL_DISABLE=1` to disable all major stages.
+                # - Any specific `FUSED_MOE_BENCHMARK_DISABLE_*` overrides ALL_DISABLE.
+                disable_a2a=_with_all_disable(
+                    "FUSED_MOE_BENCHMARK_DISABLE_A2A",
+                    all_disable=all_disable,
                 ),
-                disable_a2a_s_acc_tile_write=_env_bool(
-                    "FUSED_MOE_BENCHMARK_DISABLE_A2A_S_ACC_TILE_WRITE", False
+                disable_dynamic_ffn1=_with_all_disable(
+                    "FUSED_MOE_BENCHMARK_DISABLE_DYNAMIC_FFN1",
+                    all_disable=all_disable,
                 ),
-                disable_shared_expert=_env_bool("FUSED_MOE_BENCHMARK_DISABLE_SHARED_EXPERT", False),
-                disable_topk=_env_bool("FUSED_MOE_BENCHMARK_DISABLE_TOPK", False),
-                disable_all_reduce_metadata=_env_bool(
-                    "FUSED_MOE_BENCHMARK_DISABLE_ALL_REDUCE_METADATA", False
+                disable_dynamic_ffn2=_with_all_disable(
+                    "FUSED_MOE_BENCHMARK_DISABLE_DYNAMIC_FFN2",
+                    all_disable=all_disable,
                 ),
-                disable_sync_barrier=_env_bool("FUSED_MOE_BENCHMARK_DISABLE_SYNC_BARRIER", False),
+                disable_weight_load=_with_all_disable(
+                    "FUSED_MOE_BENCHMARK_DISABLE_WEIGHT_LOAD",
+                    all_disable=all_disable,
+                ),
+                disable_a2a_s_tile_read=_with_all_disable(
+                    "FUSED_MOE_BENCHMARK_DISABLE_A2A_S_TILE_READ",
+                    all_disable=all_disable,
+                ),
+                disable_a2a_s_acc_tile_write=_with_all_disable(
+                    "FUSED_MOE_BENCHMARK_DISABLE_A2A_S_ACC_TILE_WRITE",
+                    all_disable=all_disable,
+                ),
+                disable_shared_expert=_with_all_disable(
+                    "FUSED_MOE_BENCHMARK_DISABLE_SHARED_EXPERT",
+                    all_disable=all_disable,
+                ),
+                disable_topk=_with_all_disable(
+                    "FUSED_MOE_BENCHMARK_DISABLE_TOPK",
+                    all_disable=all_disable,
+                ),
+                disable_all_reduce_metadata=_with_all_disable(
+                    "FUSED_MOE_BENCHMARK_DISABLE_ALL_REDUCE_METADATA",
+                    all_disable=all_disable,
+                ),
+                disable_sync_barrier=_with_all_disable(
+                    "FUSED_MOE_BENCHMARK_DISABLE_SYNC_BARRIER",
+                    all_disable=all_disable,
+                ),
             )
 
             moe_def, moe_state = nnx.split(fused_layer)
