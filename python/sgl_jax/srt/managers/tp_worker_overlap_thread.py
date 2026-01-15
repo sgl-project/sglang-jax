@@ -194,7 +194,7 @@ class ModelWorkerClient:
         )
 
         # Allocate output future objects
-        bs = len([seq_len for seq_len in model_worker_batch.seq_lens if seq_len > 0])
+        bs = len(model_worker_batch.seq_lens)
 
         future_next_token_ids = np.arange(
             -(self.future_token_ids_ct + 1),
