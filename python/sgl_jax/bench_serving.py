@@ -1545,6 +1545,12 @@ def run_benchmark(args_: argparse.Namespace):
     if not hasattr(args, "adjust_prompt_max_retry"):
         args.adjust_prompt_max_retry = 10
 
+    if not hasattr(args, "return_logprob"):
+        args.return_logprob = False
+
+    if not hasattr(args, "return_routed_experts"):
+        args.return_routed_experts = False
+
     print(f"benchmark_args={args}")
 
     # Set global environments
