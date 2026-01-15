@@ -1820,6 +1820,20 @@ def _fused_ep_moe_kernel(
                             start_fetch_bw1(local_e_id, next_bw_sem_id, bf_id + 1, jnp.int32(0))
                             start_fetch_bw3(local_e_id, next_bw_sem_id, bf_id + 1, jnp.int32(0))
 
+                    is_last_bf = bf_id == num_bf - 1
+                    is_last_bd2 = next_bd2_id == num_bd2
+                    has_next_expert = local_e_id + 1 < local_num_experts
+
+                    @pl.when(
+                        jnp.logical_and(jnp.logical_and(is_last_bf, is_last_bd2), has_next_expert)
+                    )
+                    def _prefetch_next_expert():
+                        next_e_id = local_e_id + 1
+                        target_sem_id = jnp.int32(0)
+
+                        start_fetch_bw1(next_e_id, target_sem_id, jnp.int32(0), jnp.int32(0))
+                        start_fetch_bw3(next_e_id, target_sem_id, jnp.int32(0), jnp.int32(0))
+
                     wait_fetch_bw2(local_e_id, bw_sem_id, bf_id, bd2_id)
                     if should_init_ffn2:
 
@@ -2231,8 +2245,10 @@ def _fused_ep_moe_kernel(
         def run_per_expert_pipelined(local_e_id, carry):
             curr_e_sem_id, curr_se_block = carry
 
-            start_fetch_bw1(local_e_id, bw1_sem_id=0, bf_id=0, bd1_id=0)
-            start_fetch_bw3(local_e_id, bw3_sem_id=0, bf_id=0, bd3_id=0)
+            @pl.when(local_e_id == 0)
+            def _first_load():
+                start_fetch_bw1(local_e_id, bw1_sem_id=0, bf_id=0, bd1_id=0)
+                start_fetch_bw3(local_e_id, bw3_sem_id=0, bf_id=0, bd3_id=0)
 
             @pl.when(curr_se_block == 0)
             def _():
@@ -2251,6 +2267,9 @@ def _fused_ep_moe_kernel(
                     local_e_id=next_local_e_id,
                     bt_start=bt_start,
                 )
+
+            run_shared_expert_slice(curr_se_block, bt_id, bt_sem_id, out_buf_id)
+            curr_se_block += 1
 
             wait_a2a_scatter_recv(
                 bt_sem_id=bt_sem_id, e_sem_id=curr_e_sem_id, local_e_id=local_e_id
