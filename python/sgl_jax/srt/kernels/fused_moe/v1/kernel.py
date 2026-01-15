@@ -2287,11 +2287,12 @@ def _fused_ep_moe_kernel(
             # Deterministic dummy routing for profiling. Routes every (token,k) to expert 0 and
             # sets logits to select k=0. This keeps subsequent indexing in-bounds.
             t2e_routing = jnp.zeros((bt, padded_top_k), dtype=jnp.int32)
-            expert_sizes = (
-                jnp.zeros((1, padded_num_experts), dtype=jnp.int32).at[0, 0].set(bt * top_k)
-            )
+            # Avoid `.at[].set(...)` here because `scatter` is not supported in Pallas TPU lowering.
+            first = jnp.full((1, 1), bt * top_k, dtype=jnp.int32)
+            rest = jnp.zeros((1, padded_num_experts - 1), dtype=jnp.int32)
+            expert_sizes = jnp.concatenate((first, rest), axis=1)
             expert_starts = jnp.zeros_like(expert_sizes)
-            top_k_logits_vmem[...] = jnp.zeros_like(top_k_logits_vmem)
+            top_k_logits_vmem[...] = jnp.zeros((bt, top_k), dtype=jnp.float32)
             top_k_logits_vmem.at[pl.ds(0, bt), pl.ds(0, 1)][...] = jnp.ones(
                 (bt, 1), dtype=jnp.float32
             )
