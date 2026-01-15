@@ -1237,14 +1237,15 @@ class Scheduler(
             if dp_exhausted[dp_rank]:
                 continue
 
-            # Global checks (apply to all DP ranks)
-            total_can_run = sum(len(v) for v in adder.can_run_list.values())
-            if running_bs + total_can_run >= self.max_running_requests:
-                # Mark all DP ranks as full when global limit is reached
-                for info in self.running_batch.reqs_info:
-                    info.batch_is_full = True
-                self.running_batch.batch_is_full = True
-                break
+            if (
+                len(self.running_batch.reqs_info[dp_rank].reqs) + adder.can_run_list[dp_rank]
+                >= self.per_dp_max_running_requests
+            ):
+                self.running_batch.reqs_info[dp_rank].batch_is_full = True
+                if all(info.batch_is_full for info in self.running_batch.reqs_info):
+                    self.running_batch.batch_is_full = True
+                    break
+                continue
 
             # Check LoRA constraint: ensure we don't exceed max_loras_per_batch
             # This is GLOBAL - must be same across all DP ranks
