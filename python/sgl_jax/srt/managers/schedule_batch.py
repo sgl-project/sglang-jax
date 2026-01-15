@@ -1676,7 +1676,9 @@ class ScheduleBatch:
                     max_tokens_needed = max(max_tokens_needed, total_aligned_len)
 
             # Find the appropriate bucket that fits the actual content
-            total_cache_loc_size, _ = find_padding_size(max_tokens_needed, cache_loc_paddings)
+            total_cache_loc_size, _ = find_padding_size(
+                max_tokens_needed * self.dp_size, cache_loc_paddings
+            )
 
         per_dp_cache_loc_size = total_cache_loc_size // self.dp_size
         cache_loc_cpu = np.zeros(total_cache_loc_size, dtype=np.int32)
