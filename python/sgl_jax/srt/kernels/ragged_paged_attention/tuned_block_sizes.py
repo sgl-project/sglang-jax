@@ -1243,7 +1243,7 @@ def get_tuned_block_sizes(
             bkv_p, bq = TUNED_BLOCK_SIZES[device_name][keys[1:]]
         else:
             print(
-                f"Tuned RPA block sizes not found for {device_name}: {page_size=}, {actual_num_q_heads=}, {actual_num_kv_heads=}, {head_dim=}, {max_num_tokens=}, {pages_per_seq=}."
+                f"Tuned RPA block sizes not found for {device_name}: {q_dtype=} {page_size=}, {actual_num_q_heads=}, {actual_num_kv_heads=}, {head_dim=}, {max_num_tokens=}, {pages_per_seq=}."
             )
             print(f"Using default block size: {bkv_p=}, {bq=}.")
 

@@ -24,7 +24,7 @@ from sgl_jax.srt.layers.logits_processor import (
     LogitsProcessor,
     LogitsProcessorOutput,
 )
-from sgl_jax.srt.layers.moe import EPMoE
+from sgl_jax.srt.layers.moe import EPMoE, create_moe_weights_mapping
 from sgl_jax.srt.layers.radix_attention import RadixAttention
 from sgl_jax.srt.mem_cache.memory_pool import KVCache
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
@@ -908,35 +908,23 @@ class Grok1ForCausalLM(nnx.Module):
             ),
         }
 
-        # CRITICAL: Correct MoE weight mapping
-        # w1 (gate_proj) -> wi_0, w3 (up_proj) -> wi_1, w2 (down_proj) -> wo
-        for name, target_name in [("w1", "wi_0"), ("w3", "wi_1"), ("w2", "wo")]:
-            target_path = [f"{target_prefix}.block_sparse_moe.experts.{target_name}"]
-            target_path.extend(
-                [
-                    f"{prefix}.block_sparse_moe.experts.{i}.{name}.weight"
-                    for i in range(self.config.num_local_experts)
-                ]
-            )
-
-            sharding = (
-                ("expert", "tensor", None) if target_name == "wo" else ("expert", None, "tensor")
-            )
-
-            if name == "w2":
-                # w2 (down_proj) -> wo: HF shape (8192, 2048), concat -> (8192, 16384), transpose -> (16384, 8192)
-                mappings[f"__MOE_EXPERTS__{prefix}.block_sparse_moe.experts.{target_name}"] = (
-                    WeightMapping(
-                        target_path=target_path, sharding=sharding, transpose=True, concat_axis=-1
-                    )
-                )
-            else:
-                # w1/w3 (gate/up) -> wi_0/wi_1: HF shape (2048, 8192), concat -> (16384, 8192), transpose -> (8192, 16384)
-                mappings[f"__MOE_EXPERTS__{prefix}.block_sparse_moe.experts.{target_name}"] = (
-                    WeightMapping(
-                        target_path=target_path, sharding=sharding, transpose=True, concat_axis=0
-                    )
-                )
+        moe_mappings = create_moe_weights_mapping(
+            prefix=prefix,
+            target_prefix=target_prefix,
+            num_experts=self.config.num_local_experts,
+            moe_path="block_sparse_moe",
+            expert_type_map={
+                "w1": "wi_0",
+                "w3": "wi_1",
+                "w2": "wo",
+            },
+            expert_concat_axis_map={
+                "w1": 0,
+                "w3": 0,
+                "w2": -1,
+            },
+        )
+        mappings.update(moe_mappings)
 
         return mappings
 

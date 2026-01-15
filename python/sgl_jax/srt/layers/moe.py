@@ -10,6 +10,7 @@ from sgl_jax.srt.utils.quantization.quantization_utils import (
     quantize_tensor,
     quantize_tensor_simple,
 )
+from sgl_jax.srt.utils.weight_utils import WeightMapping
 
 
 class GateLogit(nnx.Module):
@@ -229,30 +230,31 @@ class EPMoE(nnx.Module):
         )
 
         with jax.sharding.use_abstract_mesh(self.updated_mesh):
+            # MOE weights' shape is (num_experts, n, k)
             self.wi_0 = nnx.Param(
                 jax.random.normal(
                     jax.random.PRNGKey(0),
-                    (num_experts, config.hidden_size, intermediate_dim),
+                    (num_experts, intermediate_dim, config.hidden_size),
                     dtype=weight_dtype,
-                    out_sharding=P("expert", None, "tensor"),
+                    out_sharding=P("expert", "tensor", None),
                 )
             )
 
             self.wi_1 = nnx.Param(
                 jax.random.normal(
                     jax.random.PRNGKey(0),
-                    (num_experts, config.hidden_size, intermediate_dim),
+                    (num_experts, intermediate_dim, config.hidden_size),
                     dtype=weight_dtype,
-                    out_sharding=P("expert", None, "tensor"),
+                    out_sharding=P("expert", "tensor", None),
                 )
             )
 
             self.wo = nnx.Param(
                 jax.random.normal(
                     jax.random.PRNGKey(0),
-                    (num_experts, intermediate_dim, config.hidden_size),
+                    (num_experts, config.hidden_size, intermediate_dim),
                     dtype=weight_dtype,
-                    out_sharding=P("expert", "tensor", None),
+                    out_sharding=P("expert", None, "tensor"),
                 )
             )
 
@@ -285,32 +287,64 @@ class EPMoE(nnx.Module):
             w0_value, w0_scale = quantize_tensor(
                 self.quantized_dtype,
                 self.wi_0.value,
-                axis=1,
-                out_sharding=P("expert", None, "tensor"),
+                axis=2,
             )
             w1_value, w1_scale = quantize_tensor(
                 self.quantized_dtype,
                 self.wi_1.value,
-                axis=1,
-                out_sharding=P("expert", None, "tensor"),
+                axis=2,
             )
             wo_value, wo_scale = quantize_tensor(
                 self.quantized_dtype,
                 self.wo.value,
-                axis=1,
-                out_sharding=P("expert", "tensor", None),
+                axis=2,
             )
 
             # Replace original weights with quantized versions
-            self.wi_0.value = w0_value
-            self.wi_1.value = w1_value
-            self.wo.value = wo_value
+            self.wi_0 = nnx.Param(w0_value, out_sharding=P("expert", "tensor", None))
+            self.wi_1 = nnx.Param(w1_value, out_sharding=P("expert", "tensor", None))
+            self.wo = nnx.Param(wo_value, out_sharding=P("expert", None, "tensor"))
 
             # Update scales (reshape to 4D for GMM kernel)
             # Wrap with nnx.data() to override static attribute status
-            self.wi_0_scale = w0_scale.reshape(w0_scale.shape[0], 1, 1, w0_scale.shape[1])
-            self.wi_1_scale = w1_scale.reshape(w1_scale.shape[0], 1, 1, w1_scale.shape[1])
-            self.wo_scale = wo_scale.reshape(wo_scale.shape[0], 1, 1, wo_scale.shape[1])
+            if hasattr(self, "wi_0_scale"):
+                del self.wi_0_scale
+            self.wi_0_scale = nnx.Param(
+                w0_scale.reshape(
+                    w0_scale.shape[0],
+                    1,
+                    1,
+                    w0_scale.shape[1],
+                    out_sharding=P("expert", None, None, "tensor"),
+                ),
+                out_sharding=P("expert", None, None, "tensor"),
+            )
+
+            if hasattr(self, "wi_1_scale"):
+                del self.wi_1_scale
+            self.wi_1_scale = nnx.Param(
+                w1_scale.reshape(
+                    w1_scale.shape[0],
+                    1,
+                    1,
+                    w1_scale.shape[1],
+                    out_sharding=P("expert", None, None, "tensor"),
+                ),
+                out_sharding=P("expert", None, None, "tensor"),
+            )
+
+            if hasattr(self, "wo_scale"):
+                del self.wo_scale
+            self.wo_scale = nnx.Param(
+                wo_scale.reshape(
+                    wo_scale.shape[0],
+                    1,
+                    1,
+                    wo_scale.shape[1],
+                    out_sharding=P("expert", None, None, "tensor"),
+                ),
+                out_sharding=P("expert", None, None, None),
+            )
 
     def __call__(self, hidden_states, topk_weights, topk_ids) -> jax.Array:
         # Activation quantization is now handled per-GEMM inside _gmm_compute
@@ -322,10 +356,9 @@ class EPMoE(nnx.Module):
             topk_weights_reshard = jax.sharding.reshard(topk_weights, P(None))
             topk_ids_reshard = jax.sharding.reshard(topk_ids, P(None))
 
-            # Scales are raw arrays after quantize_weights() (via nnx.data), else None
-            w0_scale = self.wi_0_scale
-            w1_scale = self.wi_1_scale
-            wo_scale = self.wo_scale
+            w0_scale = self.wi_0_scale.value if self.wi_0_scale is not None else None
+            w1_scale = self.wi_1_scale.value if self.wi_1_scale is not None else None
+            wo_scale = self.wo_scale.value if self.wo_scale is not None else None
 
             result = shard_map(
                 self._forward,
@@ -335,9 +368,9 @@ class EPMoE(nnx.Module):
                     P(None),
                     P(None),
                     # weights
-                    P("expert", None, "tensor"),
-                    P("expert", None, "tensor"),
                     P("expert", "tensor", None),
+                    P("expert", "tensor", None),
+                    P("expert", None, "tensor"),
                     # scales
                     P("expert", None, None, "tensor"),
                     P("expert", None, None, "tensor"),
@@ -634,3 +667,59 @@ class EPMoE(nnx.Module):
             final_output = output.reshape(batch_size, seq_len, -1).astype(self.dtype)
 
         return final_output
+
+
+# create_moe_weights_mapping is utility function to generate weight mapping for EPMoe layers
+def create_moe_weights_mapping(
+    prefix: str,
+    target_prefix: str,
+    num_experts: int,
+    expert_type_map: dict[
+        str, str
+    ] = None,  # Default mapping: HuggingFace weight name -> EPMoE internal variable name
+    expert_concat_axis_map: dict[
+        str, int
+    ] = None,  # Map from source weight name to its concatenation axis (default is 0)
+    moe_path: str = "mlp",  # Path to the MoE module within a layer (e.g., "mlp" or "block_sparse_moe")
+    source_expert_pattern: str = "experts.{i}",  # Pattern for expert indexing in the source weight file
+) -> dict:
+    """
+    Generate a unified mapping dictionary for MoE layer expert weights.
+    The sharding strategy is strictly aligned with the PartitionSpec defined in EPMoE.
+    """
+    if expert_type_map is None:
+        expert_type_map = {
+            "gate_proj": "wi_0",
+            "up_proj": "wi_1",
+            "down_proj": "wo",
+        }
+    if expert_concat_axis_map is None:
+        expert_concat_axis_map = {}
+
+    mappings = {}
+    for source_name, target_name in expert_type_map.items():
+        # Target path for JAX model parameters (matching EPMoE internal variables)
+        target_path_base = f"{target_prefix}.{moe_path}.{target_name}"
+
+        # Source weight paths for all experts to be loaded and concatenated
+        expert_keys = [
+            f"{prefix}.{moe_path}.{source_expert_pattern.format(i=i)}.{source_name}.weight"
+            for i in range(num_experts)
+        ]
+
+        # Sharding logic based on EPMoE PartitionSpec:
+        # wi_0/wi_1 (Input projections) use P("expert", "tensor", None)
+        # wo (Output projection) uses P("expert", None, "tensor")
+        sharding = ("expert", None, "tensor") if target_name == "wo" else ("expert", "tensor", None)
+
+        concat_axis = expert_concat_axis_map.get(source_name)
+
+        # Use __MOE_EXPERTS__ prefix to indicate aggregated MoE weight loading
+        mappings[f"__MOE_EXPERTS__{target_path_base}"] = WeightMapping(
+            target_path=[target_path_base] + expert_keys,
+            sharding=sharding,
+            transpose=False,
+            concat_axis=concat_axis,
+        )
+
+    return mappings
