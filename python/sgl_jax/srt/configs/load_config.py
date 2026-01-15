@@ -50,6 +50,7 @@ class LoadConfig:
     download_dir: str | None = None
     sub_dir: str | None = None
     model_loader_extra_config: str | dict | None = field(default_factory=dict)
+    # this will be used in MultiModal since it has serval model class for one model
     model_class: Any = None
     ignore_patterns: list[str] | str | None = None
     decryption_key_file: str | None = None

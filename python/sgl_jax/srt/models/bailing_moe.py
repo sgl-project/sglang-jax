@@ -161,6 +161,7 @@ class BailingMoEMLP(nnx.Module):
             kernel_axes=(None, "tensor"),
             use_bias=False,
             params_dtype=dtype,
+            mesh=mesh,
         )
 
         self.up_proj = LinearBase(
@@ -169,6 +170,7 @@ class BailingMoEMLP(nnx.Module):
             kernel_axes=(None, "tensor"),
             use_bias=False,
             params_dtype=dtype,
+            mesh=mesh,
         )
 
         self.down_proj = LinearBase(
@@ -177,6 +179,7 @@ class BailingMoEMLP(nnx.Module):
             kernel_axes=("tensor", None),
             use_bias=False,
             params_dtype=dtype,
+            mesh=mesh,
         )
 
         self.act_fn = jax.nn.silu

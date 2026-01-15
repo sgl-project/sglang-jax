@@ -61,6 +61,7 @@ class LlamaDecoderLayer(LlamaDecoderLayer):
             use_bias=attention_bias,
             kernel_axes=(None, "tensor"),
             params_dtype=dtype,
+            mesh=mesh,
         )
         self.self_attn.k_proj = LinearBase(
             input_size=2 * config.hidden_size,
@@ -68,6 +69,7 @@ class LlamaDecoderLayer(LlamaDecoderLayer):
             use_bias=attention_bias,
             kernel_axes=(None, "tensor"),
             params_dtype=dtype,
+            mesh=mesh,
         )
         self.self_attn.v_proj = LinearBase(
             input_size=2 * config.hidden_size,
@@ -75,6 +77,7 @@ class LlamaDecoderLayer(LlamaDecoderLayer):
             use_bias=attention_bias,
             kernel_axes=("tensor", None),
             params_dtype=dtype,
+            mesh=mesh,
         )
         if config.model_type == "llama4_text":
             # inter_size = config.intermediate_size_mlp
@@ -164,6 +167,7 @@ class LlamaEagleModel(LlamaModel):
                 use_bias=getattr(config, "bias", False),
                 params_dtype=dtype,
                 kernel_axes=(None, None),
+                mesh=mesh,
             )
         )
 
