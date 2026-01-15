@@ -859,7 +859,10 @@ def _fused_ep_moe_kernel(
             # Ensure all peers have entered this scope (VMEM allocated) before
             # issuing remote puts.
             sync_barrier()
-            for peer_id in range(num_devices):
+            # Use a permutation schedule (one-to-one each step) to avoid many-to-one
+            # fan-in on a single DMA semaphore, which can deadlock on TPU.
+            for step in range(1, num_devices):
+                peer_id = (my_id + step) % num_devices
                 pltpu.make_async_remote_copy(
                     src_ref=d2e_count_vmem.at[my_id, pl.ds(0, 1), pl.ds(0, padded_num_experts)],
                     dst_ref=d2e_count_vmem.at[my_id, pl.ds(0, 1), pl.ds(0, padded_num_experts)],
