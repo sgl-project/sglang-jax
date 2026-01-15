@@ -488,7 +488,8 @@ def _fused_ep_moe_kernel(
     ### Expert weight double buffering:
     b_gating_x2_vmem,  # (2, bt, padded_num_experts)
     b_output_x2_vmem,  # (2, bt, hidden_size)
-    b_w13_x2_vmem,  # <bw_sem_id> (2, t_packing, bd1 // t_packing, 2*bf) == concat(w1,w3)
+    b_w1_x2_vmem,  # <bw_sem_id> (2, t_packing, bd1 // t_packing, bf)
+    b_w3_x2_vmem,  # <bw_sem_id> (2, t_packing, bd1 // t_packing, bf)
     b_w2_x2_vmem,  # <bw_sem_id> (2, t_packing, bf, bd2 // t_packing)
     b_w1_scale_x2_vmem,  # None | <bw_sem_id> (2, t_packing, bd1 // t_packing // subc_quant_wsz, 1, bf)
     b_w3_scale_x2_vmem,  # None | <bw_sem_id> (2, t_packing, bd1 // t_packing // subc_quant_wsz, 1, bf)
@@ -548,6 +549,7 @@ def _fused_ep_moe_kernel(
     disable_a2a_s_acc_tile_write: bool,
     disable_shared_expert: bool,
 ):
+    pl.debug_print("================================================ bt: {}", bt)
     dp_rank = lax.axis_index(dp_axis_name)
     tp_rank = lax.axis_index(tp_axis_name)
     tp_size = lax.axis_size(tp_axis_name)
@@ -989,7 +991,7 @@ def _fused_ep_moe_kernel(
                     pl.ds(offset, bd1_per_t_packing),
                     pl.ds(bf_id * bf, bf),
                 ],
-                dst_ref=b_w13_x2_vmem.at[bw1_sem_id, p, pl.ds(0, bd1_per_t_packing), pl.ds(0, bf)],
+                dst_ref=b_w1_x2_vmem.at[bw1_sem_id, p],
                 sem=local_sems.at[bw1_sem_id, 1],
             ).start()
             if w1_scale_hbm is not None:
@@ -1061,7 +1063,7 @@ def _fused_ep_moe_kernel(
                     pl.ds(offset, bd1_per_t_packing),
                     pl.ds(bf_id * bf, bf),
                 ],
-                dst_ref=b_w13_x2_vmem.at[bw3_sem_id, p, pl.ds(0, bd1_per_t_packing), pl.ds(bf, bf)],
+                dst_ref=b_w3_x2_vmem.at[bw3_sem_id, p],
                 sem=local_sems.at[bw3_sem_id, 3],
             ).start()
             if w3_scale_hbm is not None:
@@ -1094,18 +1096,8 @@ def _fused_ep_moe_kernel(
         if disable_weight_load:
             return
         pltpu.make_async_copy(
-            src_ref=b_w13_x2_vmem.at[
-                bw1_sem_id,
-                pl.ds(0, t_packing),
-                pl.ds(0, bd1_per_t_packing),
-                pl.ds(0, bf),
-            ],
-            dst_ref=b_w13_x2_vmem.at[
-                bw1_sem_id,
-                pl.ds(0, t_packing),
-                pl.ds(0, bd1_per_t_packing),
-                pl.ds(0, bf),
-            ],
+            src_ref=b_w1_x2_vmem.at[bw1_sem_id],
+            dst_ref=b_w1_x2_vmem.at[bw1_sem_id],
             sem=local_sems.at[bw1_sem_id, 1],
         ).wait()
         if w1_scale_hbm is not None:
@@ -1151,18 +1143,8 @@ def _fused_ep_moe_kernel(
         if disable_weight_load:
             return
         pltpu.make_async_copy(
-            src_ref=b_w13_x2_vmem.at[
-                bw3_sem_id,
-                pl.ds(0, t_packing),
-                pl.ds(0, bd1_per_t_packing),
-                pl.ds(bf, bf),
-            ],
-            dst_ref=b_w13_x2_vmem.at[
-                bw3_sem_id,
-                pl.ds(0, t_packing),
-                pl.ds(0, bd1_per_t_packing),
-                pl.ds(bf, bf),
-            ],
+            src_ref=b_w3_x2_vmem.at[bw3_sem_id],
+            dst_ref=b_w3_x2_vmem.at[bw3_sem_id],
             sem=local_sems.at[bw3_sem_id, 3],
         ).wait()
         if w3_scale_hbm is not None:
@@ -1409,9 +1391,10 @@ def _fused_ep_moe_kernel(
 
     def dynamic_ffn1(
         t_vmem,
+        w1_vmem,
         w1_scale_vmem,
         b1_vmem,
-        w13_vmem,
+        w3_vmem,
         w3_scale_vmem,
         b3_vmem,
         acc1_vmem,
@@ -1421,7 +1404,7 @@ def _fused_ep_moe_kernel(
     ):
         token_tile = t_vmem.shape[0]
         assert t_vmem.shape == (token_tile, t_packing, bd1 // t_packing)
-        assert w13_vmem.shape == (t_packing, bd1_per_t_packing, 2 * bf)
+        assert w1_vmem.shape == w3_vmem.shape == (t_packing, bd1_per_t_packing, bf)
         assert acc1_vmem.shape == acc3_vmem.shape == (token_tile, bf)
         assert bd1 % (t_packing * 128) == 0, (bd1, t_packing)
         assert bd1c % (t_packing * 128) == 0, (bd1c, t_packing)
@@ -1454,45 +1437,54 @@ def _fused_ep_moe_kernel(
                         p_id,
                         pl.ds(bd1c_id * bd1c_per_t_packing, bd1c_per_t_packing),
                     ]
-                    if bfc == bf:
-                        w13 = w13_vmem[
+                    for bfc_id in range(cdiv(bf, bfc)):
+                        w_slices = (
                             p_id,
                             pl.ds(bd1c_id * bd1c_per_t_packing, bd1c_per_t_packing),
-                            pl.ds(0, 2 * bf),
-                        ]
-                        acc13 = jnp.dot(t, w13, preferred_element_type=jnp.float32)
-                        acc1 = acc13[:, :bf]
-                        acc3 = acc13[:, bf:]
+                            pl.ds(bfc_id * bfc, bfc),
+                        )
+                        w1 = w1_vmem[*w_slices]
+                        acc1 = jnp.dot(t, w1, preferred_element_type=jnp.float32)
 
                         if w1_scale_vmem is not None:
                             w1_scale_slices = (
                                 p_id,
                                 bd1c_id,
                                 pl.ds(0, 1),
-                                pl.ds(0, bf),
+                                pl.ds(bfc_id * bfc, bfc),
                             )
                             w1_scale = jnp.broadcast_to(w1_scale_vmem[*w1_scale_slices], acc1.shape)
                             acc1 *= w1_scale
+
+                        w3 = w3_vmem[*w_slices]
+                        acc3 = jnp.dot(t, w3, preferred_element_type=jnp.float32)
 
                         if w3_scale_vmem is not None:
                             w3_scale_slices = (
                                 p_id,
                                 bd1c_id,
                                 pl.ds(0, 1),
-                                pl.ds(0, bf),
+                                pl.ds(bfc_id * bfc, bfc),
                             )
                             w3_scale = jnp.broadcast_to(w3_scale_vmem[*w3_scale_slices], acc3.shape)
                             acc3 *= w3_scale
 
-                        acc_slices = (pl.ds(btc_id * btc, btc), pl.ds(0, bf))
-                        if should_init and p_id == bd1c_id == 0:
+                        acc_slices = (pl.ds(btc_id * btc, btc), pl.ds(bfc_id * bfc, bfc))
+
+                        if is_init_mode and p_id == 0 and bd1c_id == 0:
                             if b1_vmem is not None:
-                                b1_scale_slices = (pl.ds(0, 1), pl.ds(0, bf))
+                                b1_scale_slices = (
+                                    pl.ds(0, 1),
+                                    pl.ds(bfc_id * bfc, bfc),
+                                )
                                 b1 = jnp.broadcast_to(b1_vmem[*b1_scale_slices], acc1.shape)
                                 acc1 += b1
                             if b3_vmem is not None:
-                                b3_scale_slices = (pl.ds(0, 1), pl.ds(0, bf))
-                                b3 = jnp.broadcast_to(b3_vmem[*b3_scale_slices], acc3.shape)
+                                b3_scale_slices = (
+                                    pl.ds(0, 1),
+                                    pl.ds(bfc_id * bfc, bfc),
+                                )
+                                b3 = jnp.broadcast_to(b3_vmem[*b3_scale_slices], acc1.shape)
                                 acc3 += b3
 
                             acc1_vmem[*acc_slices] = acc1
@@ -1500,65 +1492,6 @@ def _fused_ep_moe_kernel(
                         else:
                             acc1_vmem[*acc_slices] += acc1
                             acc3_vmem[*acc_slices] += acc3
-                    else:
-                        # Fall back to the original per-bfc path when bfc < bf. We still
-                        # use the combined w13 buffer but avoid materializing a large
-                        # concat() tile.
-                        for bfc_id in range(cdiv(bf, bfc)):
-                            w_slices = (
-                                p_id,
-                                pl.ds(bd1c_id * bd1c_per_t_packing, bd1c_per_t_packing),
-                                pl.ds(bfc_id * bfc, bfc),
-                            )
-                            w1 = w13_vmem[*w_slices]
-                            w3 = w13_vmem[
-                                p_id,
-                                pl.ds(bd1c_id * bd1c_per_t_packing, bd1c_per_t_packing),
-                                pl.ds(bf + bfc_id * bfc, bfc),
-                            ]
-
-                            acc1 = jnp.dot(t, w1, preferred_element_type=jnp.float32)
-                            if w1_scale_vmem is not None:
-                                w1_scale_slices = (
-                                    p_id,
-                                    bd1c_id,
-                                    pl.ds(0, 1),
-                                    pl.ds(bfc_id * bfc, bfc),
-                                )
-                                w1_scale = jnp.broadcast_to(
-                                    w1_scale_vmem[*w1_scale_slices], acc1.shape
-                                )
-                                acc1 *= w1_scale
-
-                            acc3 = jnp.dot(t, w3, preferred_element_type=jnp.float32)
-                            if w3_scale_vmem is not None:
-                                w3_scale_slices = (
-                                    p_id,
-                                    bd1c_id,
-                                    pl.ds(0, 1),
-                                    pl.ds(bfc_id * bfc, bfc),
-                                )
-                                w3_scale = jnp.broadcast_to(
-                                    w3_scale_vmem[*w3_scale_slices], acc3.shape
-                                )
-                                acc3 *= w3_scale
-
-                            acc_slices = (pl.ds(btc_id * btc, btc), pl.ds(bfc_id * bfc, bfc))
-                            if should_init and p_id == bd1c_id == 0:
-                                if b1_vmem is not None:
-                                    b1_scale_slices = (pl.ds(0, 1), pl.ds(bfc_id * bfc, bfc))
-                                    b1 = jnp.broadcast_to(b1_vmem[*b1_scale_slices], acc1.shape)
-                                    acc1 += b1
-                                if b3_vmem is not None:
-                                    b3_scale_slices = (pl.ds(0, 1), pl.ds(bfc_id * bfc, bfc))
-                                    b3 = jnp.broadcast_to(b3_vmem[*b3_scale_slices], acc3.shape)
-                                    acc3 += b3
-
-                                acc1_vmem[*acc_slices] = acc1
-                                acc3_vmem[*acc_slices] = acc3
-                            else:
-                                acc1_vmem[*acc_slices] += acc1
-                                acc3_vmem[*acc_slices] += acc3
 
         if should_init:
 
@@ -1783,7 +1716,8 @@ def _fused_ep_moe_kernel(
 
                     wait_fetch_bw1(local_e_id, bw_sem_id, bf_id, bd1_id)
                     wait_fetch_bw3(local_e_id, bw_sem_id, bf_id, bd1_id)
-                    w13_vmem = b_w13_x2_vmem.at[bw_sem_id]
+                    w1_vmem = b_w1_x2_vmem.at[bw_sem_id]
+                    w3_vmem = b_w3_x2_vmem.at[bw_sem_id]
 
                     # Prefetch W2 (down-projection) once FFN1 finishes for this (bf_id) so FFN2's
                     # first slice is less likely to stall, without competing with the last FFN1
@@ -1799,9 +1733,10 @@ def _fused_ep_moe_kernel(
                         token_tile=token_tile,
                         dyn_sz_i32=dyn_sz_i32,
                         bd1_id=bd1_id,
+                        w1_vmem=w1_vmem,
                         w1_scale_vmem=w1_scale_vmem,
                         b1_vmem=b1_vmem,
-                        w13_vmem=w13_vmem,
+                        w3_vmem=w3_vmem,
                         w3_scale_vmem=w3_scale_vmem,
                         b3_vmem=b3_vmem,
                         should_init_ffn1=should_init_ffn1,
@@ -1826,9 +1761,10 @@ def _fused_ep_moe_kernel(
                         tile_sz = jnp.maximum(jnp.minimum(dyn_sz_i32 - tile_start, token_tile), 0)
                         dynamic_ffn1(
                             t_vmem=b_stage_x2_vmem.at[token_buf_id],
+                            w1_vmem=w1_vmem,
                             w1_scale_vmem=w1_scale_vmem,
                             b1_vmem=b1_vmem,
-                            w13_vmem=w13_vmem,
+                            w3_vmem=w3_vmem,
                             w3_scale_vmem=w3_scale_vmem,
                             b3_vmem=b3_vmem,
                             acc1_vmem=b_acc1_vmem.at[pl.ds(tile_start, token_tile)],
@@ -2849,7 +2785,8 @@ def fused_ep_moe(
         # Expert compute scratch.
         pltpu.VMEM((2, bt, padded_num_experts), gating_dtype),  # b_gating_x2_vmem
         pltpu.VMEM((2, bt, hidden_size), t_dtype),  # b_output_x2_vmem
-        pltpu.VMEM((2, t_packing, bd1_per_pack, 2 * block_config.bf), w1.dtype),  # b_w13_x2_vmem
+        pltpu.VMEM((2, t_packing, bd1_per_pack, block_config.bf), w1.dtype),  # b_w1_x2_vmem
+        pltpu.VMEM((2, t_packing, bd1_per_pack, block_config.bf), w3.dtype),  # b_w3_x2_vmem
         pltpu.VMEM((2, t_packing, block_config.bf, bd2_per_pack), w2.dtype),  # b_w2_x2_vmem
         w1_scale_scratch,  # b_w1_scale_x2_vmem
         w3_scale_scratch,  # b_w3_scale_x2_vmem
