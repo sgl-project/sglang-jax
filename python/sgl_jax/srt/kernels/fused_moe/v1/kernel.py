@@ -565,7 +565,6 @@ def _fused_ep_moe_kernel(
     assert local_num_tokens % bt == 0, (local_num_tokens, bt)
     num_bt = local_num_tokens // bt
     a2a_max_tokens = a2a_s_acc_x2_hbm.shape[1]
-    right_id = (my_id + 1) % num_devices
     num_experts = a2a_g_hbm.shape[0]
     padded_num_experts = d2e_count_x2_smem.shape[-1]
     padded_top_k = t2e_routing_x2_smem.shape[-1]
@@ -831,7 +830,8 @@ def _fused_ep_moe_kernel(
             )
             return
 
-        # All-reduce to accumulate starts and sizes and transfer to SMEM.
+        # Allgather to collect per-device sizes, then local prefix-sum to compute
+        # `starts` and global `sizes`.
         def _all_reduce_metadata(
             t2e_routing_vmem,
             d2e_count_vmem,
@@ -852,25 +852,35 @@ def _fused_ep_moe_kernel(
                 dst_ref=t2e_routing_x2_smem.at[bt_sem_id],
                 sem=send_sem,
             )
-            reduced_sizes = sizes
-            reduced_starts = starts
-            row_id = my_id
-            d2e_count_vmem[row_id] = sizes
-            for i in range(num_devices - 1):
-                sync_barrier()
-                # TODO(jevinjiang): we can use double buffering to improve AR if needed.
-                pltpu.async_remote_copy(
-                    src_ref=d2e_count_vmem.at[row_id],
-                    dst_ref=d2e_count_vmem.at[row_id],
+
+            d2e_count_vmem[...] = jnp.zeros_like(d2e_count_vmem)
+            d2e_count_vmem[my_id] = sizes
+
+            # Ensure all peers have entered this scope (VMEM allocated) before
+            # issuing remote puts.
+            sync_barrier()
+            for peer_id in range(num_devices):
+                is_local = peer_id == my_id
+                sz = lax.select(is_local, jnp.int32(0), jnp.int32(padded_num_experts))
+                pltpu.make_async_remote_copy(
+                    src_ref=d2e_count_vmem.at[my_id, pl.ds(0, 1), pl.ds(0, sz)],
+                    dst_ref=d2e_count_vmem.at[my_id, pl.ds(0, 1), pl.ds(0, sz)],
                     send_sem=send_sem,
                     recv_sem=recv_sem,
-                    device_id=get_mesh_device_id(right_id),
+                    device_id=get_mesh_device_id(peer_id),
                     device_id_type=pltpu.DeviceIdType.MESH,
                 ).wait()
-                row_id = (row_id + num_devices - 1) % num_devices
-                new_sizes = d2e_count_vmem[row_id]
-                reduced_sizes += new_sizes
-                reduced_starts += lax.select(my_id > i, new_sizes, jnp.zeros_like(new_sizes))
+
+            # Ensure all peers completed their sends before using gathered sizes.
+            sync_barrier()
+
+            reduced_sizes = jnp.zeros_like(sizes)
+            reduced_starts = jnp.zeros_like(starts)
+            for dev_id in range(num_devices):
+                dev_sizes = d2e_count_vmem[dev_id]
+                reduced_sizes += dev_sizes
+                reduced_starts += lax.select(dev_id < my_id, dev_sizes, jnp.zeros_like(dev_sizes))
+
             starts_vmem[...] = reduced_starts
             sizes_vmem[...] = reduced_sizes
 
