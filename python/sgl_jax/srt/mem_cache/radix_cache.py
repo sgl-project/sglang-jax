@@ -124,25 +124,6 @@ def _convert_to_bigram_key(tokens: list[int]) -> list[tuple[int, int]]:
     return [(tokens[i], tokens[i + 1]) for i in range(len(tokens) - 1)]
 
 
-def get_child_key(key: list, page_size: int = 1):
-    if page_size == 1:
-        val = key[0]
-        if hasattr(val, "item"):
-            val = int(val)
-        if isinstance(val, list):
-            return tuple(val)
-        return val
-
-    res = []
-    for x in key[:page_size]:
-        if hasattr(x, "item"):
-            x = int(x)
-        if isinstance(x, list):
-            x = tuple(x)
-        res.append(x)
-    return tuple(res)
-
-
 class RadixCache(BasePrefixCache):
     def __init__(
         self,
