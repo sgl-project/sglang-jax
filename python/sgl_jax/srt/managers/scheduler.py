@@ -1053,8 +1053,7 @@ class Scheduler(
 
         if memory_leak:
             msg = f"token_to_kv_pool_allocator memory leak detected! {token_msg}"
-            logger.warning(msg)
-            # raise ValueError(msg)
+            raise ValueError(msg)
 
         req_total_size = self.req_to_token_pool.size
 
@@ -1074,16 +1073,27 @@ class Scheduler(
         available_size = sum(
             [self.token_to_kv_pool_allocator.available_size(dp) for dp in range(self.dp_size)]
         )
-        evictable_size = self.tree_cache.evictable_size()
+        # Sum evictable size across all DP ranks
+        evictable_size = sum(
+            [self.tree_cache.evictable_size(dp_rank=dp) for dp in range(self.dp_size)]
+        )
         num_used = self.max_total_num_tokens - (available_size + evictable_size)
         token_usage = num_used / self.max_total_num_tokens
         return num_used, token_usage, available_size, evictable_size
 
     def _get_swa_token_info(self):
-        full_available_size = self.token_to_kv_pool_allocator.full_available_size()
-        full_evictable_size = self.tree_cache.full_evictable_size()
-        swa_available_size = self.token_to_kv_pool_allocator.swa_available_size()
-        swa_evictable_size = self.tree_cache.swa_evictable_size()
+        full_available_size = sum(
+            [self.token_to_kv_pool_allocator.full_available_size(dp) for dp in range(self.dp_size)]
+        )
+        full_evictable_size = sum(
+            [self.tree_cache.full_evictable_size(dp_rank=dp) for dp in range(self.dp_size)]
+        )
+        swa_available_size = sum(
+            [self.token_to_kv_pool_allocator.swa_available_size(dp) for dp in range(self.dp_size)]
+        )
+        swa_evictable_size = sum(
+            [self.tree_cache.swa_evictable_size(dp_rank=dp) for dp in range(self.dp_size)]
+        )
         full_num_used = self.full_tokens_per_layer - (full_available_size + full_evictable_size)
         swa_num_used = self.swa_tokens_per_layer - (swa_available_size + swa_evictable_size)
         full_token_usage = full_num_used / self.full_tokens_per_layer

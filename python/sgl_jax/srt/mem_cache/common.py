@@ -95,8 +95,8 @@ def available_and_evictable_str(tree_cache, dp_rank: int = 0) -> str:
     if False:
         full_available_size = token_to_kv_pool_allocator.full_available_size(dp_rank=dp_rank)
         swa_available_size = token_to_kv_pool_allocator.swa_available_size(dp_rank=dp_rank)
-        full_evictable_size = tree_cache.full_evictable_size()
-        swa_evictable_size = tree_cache.swa_evictable_size()
+        full_evictable_size = tree_cache.full_evictable_size(dp_rank=dp_rank)
+        swa_evictable_size = tree_cache.swa_evictable_size(dp_rank=dp_rank)
         return (
             f"Available full tokens: {full_available_size + full_evictable_size} ({full_available_size=} + {full_evictable_size=})\n"
             f"Available swa tokens: {swa_available_size + swa_evictable_size} ({swa_available_size=} + {swa_evictable_size=})\n"
@@ -105,5 +105,5 @@ def available_and_evictable_str(tree_cache, dp_rank: int = 0) -> str:
         )
     else:
         available_size = token_to_kv_pool_allocator.available_size(dp_rank=dp_rank)
-        evictable_size = tree_cache.evictable_size()
+        evictable_size = tree_cache.evictable_size(dp_rank=dp_rank)
         return f"Available tokens: {available_size + evictable_size} ({available_size=} + {evictable_size=})\n"

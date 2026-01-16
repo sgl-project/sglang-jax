@@ -250,7 +250,6 @@ def extend(reqs, model_runner):
     # For benchmark, put all reqs in DP rank 0 (single DP)
     reqs_per_dp = [reqs]
 
-
     batch = ScheduleBatch.init_new(
         reqs=reqs_per_dp,
         req_to_token_pool=model_runner.req_to_token_pool,
