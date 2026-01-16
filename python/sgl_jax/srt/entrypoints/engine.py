@@ -22,7 +22,10 @@ import zmq
 import zmq.asyncio
 from flax import nnx
 
-from sgl_jax.srt.utils.common_utils import SUPPORTED_LORA_TARGET_MODULES
+from sgl_jax.srt.utils.common_utils import (
+    SUPPORTED_LORA_TARGET_MODULES,
+    get_or_create_loop,
+)
 from sgl_jax.utils import traverse_and_update
 
 # ruff: noqa: E402
@@ -114,11 +117,22 @@ class Engine(EngineBase):
         context = zmq.Context(2)
         self.send_to_rpc = get_zmq_socket(context, zmq.DEALER, self.port_args.rpc_ipc_name, True)
 
-        try:
-            self.loop = asyncio.get_running_loop()
-        except RuntimeError:
-            self.loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(self.loop)
+        if self.server_args.enable_engine_loop_run_forever_daemon:
+            import queue
+
+            result_queue = queue.Queue()
+
+            def run_loop_forever():
+                loop = get_or_create_loop()
+                result_queue.put(loop)
+                loop.run_forever()
+
+            loop_thread = threading.Thread(target=run_loop_forever, daemon=True)
+            loop_thread.start()
+            self.loop = result_queue.get()
+            self.tokenizer_manager.event_loop = self.loop
+        else:
+            self.loop = get_or_create_loop()
 
     def generate(
         self,

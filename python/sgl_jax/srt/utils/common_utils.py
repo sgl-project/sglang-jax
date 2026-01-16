@@ -641,3 +641,12 @@ class ConcurrentCounter:
         other tasks to run while waiting. When the counter becomes zero, the coroutine resumes.
         """
         await self.wait_for(lambda count: count == 0)
+
+
+def get_or_create_loop():
+    try:
+        loop = asyncio.get_event_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+    return loop
