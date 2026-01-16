@@ -3,15 +3,15 @@
 import itertools
 import logging
 import os
+import signal
 import threading
 import time
-import psutil
-import signal
 from queue import Queue
 
 import jax
 import jax.numpy as jnp
 import numpy as np
+import psutil
 from flax import nnx
 from jax.experimental.multihost_utils import broadcast_one_to_all
 from tqdm import tqdm
@@ -206,19 +206,18 @@ class ModelWorker:
         )
         self.sync_expert_ids_d2h_thread.start()
 
-
     def _sync_expert_ids_d2h_thread_func(self):
         try:
-            self._sync_expert_ids_d2h()
+            self._sync_experts_ids_d2h()
         except Exception:
             traceback = get_exception_traceback()
             logger.error("ModelWorker sync thread hit an exception: %s", traceback)
             self.parent_process.send_signal(signal.SIGQUIT)
-    
+
     def _sync_experts_ids_d2h(self):
         while True:
             layers_topk_ids, model_worker_batch = self.sync_queue.get()
-            get_global_experts_capturer().on_forward_end(layers_topk_ids, model_worker_batch) 
+            get_global_experts_capturer().on_forward_end(layers_topk_ids, model_worker_batch)
 
     def normalize_token_paddings(self):
         normalized_token_paddings = []
@@ -533,7 +532,7 @@ class ModelWorker:
                 layers_topk_ids,
                 model_worker_batch,
             )
-        ) 
+        )
 
         # SAVE last layer logits
         save_logits_file_info = os.getenv("DUMP_LAST_LAYER_LOGITS_FILENAMES", None)

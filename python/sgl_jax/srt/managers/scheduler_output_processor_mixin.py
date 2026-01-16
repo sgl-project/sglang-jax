@@ -10,7 +10,7 @@ import numpy as np
 from sgl_jax.srt.layers.logits_processor import LogitsProcessorOutput
 from sgl_jax.srt.layers.routed_experts_capturer import get_global_experts_capturer
 from sgl_jax.srt.managers.io_struct import AbortReq, BatchTokenIDOut
-from sgl_jax.srt.managers.schedule_batch import BaseFinishReason, Req, ScheduleBatch, get_global_bid
+from sgl_jax.srt.managers.schedule_batch import BaseFinishReason, Req, ScheduleBatch
 from sgl_jax.srt.precision_tracer import precision_tracer
 from sgl_jax.srt.utils.common_utils import cdiv
 
@@ -51,7 +51,6 @@ class SchedulerOutputProcessorMixin:
         result: GenerationBatchResult,
         launch_done: threading.Event | None = None,
     ):
-        global_bid = get_global_bid()
         skip_stream_req = None
 
         assert self.is_generation
@@ -228,7 +227,6 @@ class SchedulerOutputProcessorMixin:
         result: GenerationBatchResult,
         launch_done: threading.Event | None = None,
     ):
-        global_bid = get_global_bid()
         logits_output, next_token_ids, cache_miss_count = (
             result.logits_output,
             result.next_token_ids,

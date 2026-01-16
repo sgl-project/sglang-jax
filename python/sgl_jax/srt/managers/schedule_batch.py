@@ -508,22 +508,25 @@ class Req:
 # Batch id
 bid = 0
 
+
 def get_global_bid():
     global bid
     return bid
 
+
 def acc_global_bid():
     global bid
-    bid+=1
+    bid += 1
     return bid
+
 
 @dataclasses.dataclass
 class ScheduleBatch:
     """Store all information of a batch on the scheduler."""
-    
-    bid: int
+
     # Request, memory pool, and cache
     reqs: list[Req]
+    bid: int = None
     req_to_token_pool: ReqToTokenPool = None
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator = None
     tree_cache: BasePrefixCache = None
@@ -1621,6 +1624,7 @@ class ScheduleBatch:
             return_output_logprob_only=self.return_output_logprob_only,
             decoding_reqs=self.decoding_reqs,
             is_prefill_only=self.is_prefill_only,
+            bid=self.bid,
         )
 
     def _evict_tree_cache_if_needed(

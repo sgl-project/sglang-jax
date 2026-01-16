@@ -10,7 +10,6 @@ from abc import ABC, abstractmethod
 import jax
 import numpy as np
 import pybase64
-import time
 
 from sgl_jax.srt.configs.model_config import ModelConfig
 from sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch
@@ -120,7 +119,7 @@ class _RoutedExpertsCapturerReal(RoutedExpertsCapturer):
             else:
                 valid_ids = ids_cpu[:unpadded_input_len, : self.num_experts_per_tok]
             self.host_buffer[layer_idx, valid_out_cache_loc_cpu, :] = valid_ids
-        
+
         self.bid = model_worker_batch.bid
 
     def get_routed_experts(
