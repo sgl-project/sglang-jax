@@ -1,5 +1,12 @@
+"""
+  Usage:
+  1. For test benchmark in ci
+  SGLANG_JAX_IS_IN_CI=true python benchmark/kernels/update_kv_cache/bench_update_kv_cache.py
+  2. For generic benchmark results
+  python benchmark/kernels/update_kv_cache/bench_update_kv_cache.py
+"""
+
 import functools
-import time
 
 import jax
 import numpy as np
@@ -12,7 +19,9 @@ from sgl_jax.srt.kernels.update_kv_cache.update_kv_cache import (
     get_slot_mapping,
     kv_cache_update_kernel,
 )
+from sgl_jax.srt.kernels.utils.perf import multiple_iteration_timeit_from_trace
 from sgl_jax.srt.utils import cdiv
+from sgl_jax.srt.utils.jax_utils import get_device_name
 from sgl_jax.test.test_utils import CustomTestCase, is_in_ci
 
 
@@ -71,6 +80,7 @@ def benchmark_backend(
             ),
             out_shape=out_shape,
             input_output_aliases={len(scalar_prefetches) + 1: 0},
+            name="kv_cache_update_kernel",
         )
         return kernel(*scalar_prefetches, new_value, cache)[0]
 
@@ -81,21 +91,17 @@ def benchmark_backend(
     jax.block_until_ready(out)
 
     # run
-    times = []
-    for i in range(3):
-        start = time.perf_counter()
-        out = wrap_kv_cache_update(
-            new_value,
-            cache,
-            slices,
-            page_size,
-            update_slices_num,
-            num_slices_per_block,
-        )
-        jax.block_until_ready(out)
-        times.append(time.perf_counter() - start)
+    times = multiple_iteration_timeit_from_trace(
+        compute_func=lambda: wrap_kv_cache_update(
+            new_value, cache, slices, page_size, update_slices_num, num_slices_per_block
+        ),
+        data_generator=lambda: (),
+        task="kv_cache_update_kernel",
+        tries=3,
+    )
+    avg_time = float(np.mean(times)) if times else float("nan")
 
-    return np.mean(times)
+    return avg_time
 
 
 def full_benchmark():
@@ -166,31 +172,52 @@ def full_benchmark():
 
 
 class TestPerformance(CustomTestCase):
-    def test_update_kv_cache_performance(self, floating_threshold: int = 0.15):
+    def test_update_kv_cache_performance(self, floating_threshold: int = 0.1):
         """
         Args:
             floating_threshold: the ratio of expected results
         """
         # Key: (head_num, max_cache_len, new_value_len, page_size, num_slices_per_block)
         # Value: expected cost-time (baseline) in ms
-        test_cases = {
-            (8, 640000, 1024, 64, 16): 2.1278466665535234,
-            (8, 640000, 1024, 64, 64): 2.143913333687427,
-            (8, 640000, 1024, 128, 16): 2.140323333151173,
-            (8, 640000, 1024, 128, 64): 2.1591999999751956,
-            (8, 640000, 9182, 64, 16): 2.190333333601302,
-            (8, 640000, 9182, 64, 64): 2.2030303334759083,
-            (8, 640000, 9182, 128, 16): 2.180196666813572,
-            (8, 640000, 9182, 128, 64): 2.179193333783284,
-            (16, 640000, 1024, 64, 16): 4.42100333354271,
-            (16, 640000, 1024, 64, 64): 4.387726666512511,
-            (16, 640000, 1024, 128, 16): 4.395476666710844,
-            (16, 640000, 1024, 128, 64): 4.4098866665081005,
-            (16, 640000, 9182, 64, 16): 4.446526666773328,
-            (16, 640000, 9182, 64, 64): 4.459499999938998,
-            (16, 640000, 9182, 128, 16): 4.431259999970886,
-            (16, 640000, 9182, 128, 64): 4.429160000048189,
+        test_cases_for_different_devices = {
+            "TPU v6e": {
+                (8, 640000, 1024, 64, 16): 0.00519875,
+                (8, 640000, 1024, 64, 64): 0.0067175,
+                (8, 640000, 1024, 128, 16): 0.002955,
+                (8, 640000, 1024, 128, 64): 0.00447,
+                (8, 640000, 9182, 64, 16): 0.0431404,
+                (8, 640000, 9182, 64, 64): 0.0420579,
+                (8, 640000, 9182, 128, 16): 0.0192362,
+                (8, 640000, 9182, 128, 64): 0.0195604,
+                (16, 640000, 1024, 64, 16): 0.00451792,
+                (16, 640000, 1024, 64, 64): 0.00604292,
+                (16, 640000, 1024, 128, 16): 0.00442875,
+                (16, 640000, 1024, 128, 64): 0.00597,
+                (16, 640000, 9182, 64, 16): 0.0380854,
+                (16, 640000, 9182, 64, 64): 0.0394483,
+                (16, 640000, 9182, 128, 16): 0.0348079,
+                (16, 640000, 9182, 128, 64): 0.0363438,
+            },
+            "TPU v7": {
+                (8, 640000, 1024, 64, 16): 0.00509484,
+                (8, 640000, 1024, 64, 64): 0.00654182,
+                (8, 640000, 1024, 128, 16): 0.00252581,
+                (8, 640000, 1024, 128, 64): 0.00401881,
+                (8, 640000, 9182, 64, 16): 0.0410556,
+                (8, 640000, 9182, 64, 64): 0.0389484,
+                (8, 640000, 9182, 128, 16): 0.0139916,
+                (8, 640000, 9182, 128, 64): 0.0135438,
+                (16, 640000, 1024, 64, 16): 0.00344858,
+                (16, 640000, 1024, 64, 64): 0.00488075,
+                (16, 640000, 1024, 128, 16): 0.00329052,
+                (16, 640000, 1024, 128, 64): 0.0047507,
+                (16, 640000, 9182, 64, 16): 0.0382229,
+                (16, 640000, 9182, 64, 64): 0.0280144,
+                (16, 640000, 9182, 128, 16): 0.0312153,
+                (16, 640000, 9182, 128, 64): 0.0268295,
+            },
         }
+        test_cases = test_cases_for_different_devices[get_device_name()]
         head_dim = 128
         for case, roofline in test_cases.items():
             head_num, max_cache_len, new_value_len, page_size, num_slices_per_block = case
@@ -214,9 +241,9 @@ class TestPerformance(CustomTestCase):
                 page_size=page_size,
             )
             expect_result = roofline * (1 + floating_threshold)
-            print(f"{case}, res={cost*1000}ms, {expect_result=}ms")
+            print(f"{case}, res={cost}ms, {expect_result=}ms")
             self.assertLess(
-                cost * 1000, expect_result, f"Run update_kv_cache performance test failed, {case=}"
+                cost, expect_result, f"Run update_kv_cache performance test failed, {case=}"
             )
 
 
