@@ -1661,21 +1661,15 @@ class ScheduleBatch:
         if self.forward_mode.is_extend():
             total_cache_loc_size = cache_loc_paddings[-1]  # Use largest padding
         else:
-            # FIX: Calculate the actual max tokens needed across all DP ranks
-            # instead of inferring it from batch size bucket.
-            max_tokens_needed = 0
-            for dp_rank in range(self.dp_size):
-                info = self.reqs_info[dp_rank]
-                if info.seq_lens is not None and len(info.seq_lens) > 0:
-                    # Calculate aligned length for each request
-                    aligned_lens = ((info.seq_lens + page_size - 1) // page_size) * page_size
-                    total_aligned_len = np.sum(aligned_lens)
-                    max_tokens_needed = max(max_tokens_needed, total_aligned_len)
-
-            # Find the appropriate bucket that fits the actual content
-            total_cache_loc_size, _ = find_padding_size(
-                max_tokens_needed * self.dp_size, cache_loc_paddings
-            )
+            # For decode mode, use the cache_loc_padding that corresponds to the bs bucket.
+            # This matches the precompile logic in tp_worker.precompile_decode() which uses:
+            #   aligned_cache_loc_size = (bs * max_req_len + page_size - 1) // page_size * page_size
+            # and precompile_cache_loc_paddings is defined as:
+            #   [bs * ((max_req_len + page_size - 1) // page_size * page_size) for bs in bs_paddings]
+            # We select cache_loc_padding based on bs bucket to match precompiled kernels.
+            total_bs = per_dp_bs_size * self.dp_size
+            _, bs_index = find_padding_size(total_bs, bs_paddings)
+            total_cache_loc_size = cache_loc_paddings[bs_index]
 
         per_dp_cache_loc_size = total_cache_loc_size // self.dp_size
         cache_loc_cpu = np.zeros(total_cache_loc_size, dtype=np.int32)

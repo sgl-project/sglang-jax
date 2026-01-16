@@ -306,13 +306,16 @@ class ModelWorker:
             self.precompile_bs_paddings,
         )
 
-        with tqdm(self.precompile_bs_paddings, desc="[DECODE] PRECOMPILE", leave=False) as pbar:
-            for bs in pbar:
+        with tqdm(
+            enumerate(self.precompile_bs_paddings),
+            desc="[DECODE] PRECOMPILE",
+            leave=False,
+            total=len(self.precompile_bs_paddings),
+        ) as pbar:
+            for i, bs in pbar:
                 pbar.set_postfix(bs=bs)
-                # use same page aligned with precompile cache_loc_paddings
-                aligned_cache_loc_size = (
-                    (bs * self.max_req_len + self.page_size - 1) // self.page_size * self.page_size
-                )
+                # use precompile_cache_loc_paddings directly to ensure consistency
+                aligned_cache_loc_size = self.precompile_cache_loc_paddings[i]
                 model_worker_batch = self.generate_model_worker_batch(
                     bs,
                     bs,
