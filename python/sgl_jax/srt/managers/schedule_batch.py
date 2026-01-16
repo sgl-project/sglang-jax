@@ -2193,8 +2193,8 @@ class ScheduleBatch:
                 swa_available_size = self.token_to_kv_pool_allocator.swa_available_size(
                     dp_rank=dp_rank
                 )
-                full_evictable_size = self.tree_cache.full_evictable_size()
-                swa_evictable_size = self.tree_cache.swa_evictable_size()
+                full_evictable_size = self.tree_cache.full_evictable_size(dp_rank=dp_rank)
+                swa_evictable_size = self.tree_cache.swa_evictable_size(dp_rank=dp_rank)
                 result_strs.append(
                     f"{prefix}Available full tokens: {full_available_size + full_evictable_size} ({full_available_size=} + {full_evictable_size=})\n"
                     f"{prefix}Available swa tokens: {swa_available_size + swa_evictable_size} ({swa_available_size=} + {swa_evictable_size=})\n"
@@ -2203,7 +2203,7 @@ class ScheduleBatch:
                 )
             else:
                 available_size = self.token_to_kv_pool_allocator.available_size(dp_rank=dp_rank)
-                evictable_size = self.tree_cache.evictable_size()
+                evictable_size = self.tree_cache.evictable_size(dp_rank=dp_rank)
                 result_strs.append(
                     f"{prefix}Available tokens: {available_size + evictable_size} ({available_size=} + {evictable_size=})\n"
                 )

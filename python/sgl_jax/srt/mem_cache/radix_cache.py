@@ -199,8 +199,9 @@ class RadixCache(BasePrefixCache):
         self.root_node.key = RadixKey(token_ids=[], extra_key=None, dp_rank=None)
         self.root_node.value = []
         self.root_node.lock_ref = 1
-        self.evictable_size_ = 0
-        self.protected_size_ = 0
+        # Track evictable and protected size per DP rank
+        self.evictable_size_ = defaultdict(int)
+        self.protected_size_ = defaultdict(int)
 
     def match_prefix(self, key: RadixKey | list[int], **kwargs) -> MatchResult:
         # Support both RadixKey and plain list for backward compatibility
@@ -392,8 +393,8 @@ class RadixCache(BasePrefixCache):
         print(f"\n[process {self.process_id}] Radix Tree structure:")
         self._print_helper(self.root_node, 0)
         print(f"total tokens: {self.total_size()}")
-        print(f"evictable size: {self.evictable_size_}")
-        print(f"protected size: {self.protected_size_}")
+        print(f"evictable size per dp_rank: {dict(self.evictable_size_)}")
+        print(f"protected size per dp_rank: {dict(self.protected_size_)}")
 
     def total_size(self):
         return self._total_size_helper()
@@ -435,8 +436,10 @@ class RadixCache(BasePrefixCache):
         delta = 0
         while node != self.root_node:
             if node.lock_ref == 0:
-                self.evictable_size_ -= len(node.value)
-                self.protected_size_ += len(node.value)
+                # Get dp_rank from node's key
+                node_dp_rank = node.key.dp_rank if node.key and node.key.dp_rank is not None else 0
+                self.evictable_size_[node_dp_rank] -= len(node.value)
+                self.protected_size_[node_dp_rank] += len(node.value)
                 delta -= len(node.value)
             node.lock_ref += 1
             node = node.parent
@@ -449,18 +452,20 @@ class RadixCache(BasePrefixCache):
         delta = 0
         while node != self.root_node:
             if node.lock_ref == 1:
-                self.evictable_size_ += len(node.value)
-                self.protected_size_ -= len(node.value)
+                # Get dp_rank from node's key
+                node_dp_rank = node.key.dp_rank if node.key and node.key.dp_rank is not None else 0
+                self.evictable_size_[node_dp_rank] += len(node.value)
+                self.protected_size_[node_dp_rank] -= len(node.value)
                 delta += len(node.value)
             node.lock_ref -= 1
             node = node.parent
         return delta
 
-    def evictable_size(self):
-        return self.evictable_size_
+    def evictable_size(self, dp_rank: int = 0):
+        return self.evictable_size_[dp_rank]
 
-    def protected_size(self):
-        return self.protected_size_
+    def protected_size(self, dp_rank: int = 0):
+        return self.protected_size_[dp_rank]
 
     def take_events(self):
         """Atomically takes all events and clears the queue."""
@@ -551,7 +556,9 @@ class RadixCache(BasePrefixCache):
             new_node.key = key
             new_node.value = value
             node.children[child_key] = new_node
-            self.evictable_size_ += len(value)
+            # Track evictable size per DP rank
+            node_dp_rank = key.dp_rank if key.dp_rank is not None else 0
+            self.evictable_size_[node_dp_rank] += len(value)
 
         return total_prefix_length
 
@@ -584,7 +591,9 @@ class RadixCache(BasePrefixCache):
             if v == node:
                 break
         del node.parent.children[k]
-        self.evictable_size_ -= len(node.key)
+        # Track evictable size per DP rank
+        node_dp_rank = node.key.dp_rank if node.key and node.key.dp_rank is not None else 0
+        self.evictable_size_[node_dp_rank] -= len(node.key)
 
     def _total_size_helper(self):
         total_size = 0

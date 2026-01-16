@@ -323,10 +323,11 @@ class SWARadixCache(BasePrefixCache):
         self.root_node.value = []
         self.root_node.full_lock_ref = 1
         self.root_node.swa_lock_ref = 1
-        self.full_evictable_size_ = 0
-        self.swa_evictable_size_ = 0
-        self.full_protected_size_ = 0
-        self.swa_protected_size_ = 0
+        # Track evictable and protected size per DP rank
+        self.full_evictable_size_ = defaultdict(int)
+        self.swa_evictable_size_ = defaultdict(int)
+        self.full_protected_size_ = defaultdict(int)
+        self.swa_protected_size_ = defaultdict(int)
         # LRU lists are used to maintain the order of eviction of the nodes in the tree
         self.full_lru_list = LRUList(swa=False)
         self.swa_lru_list = LRUList(swa=True)
@@ -515,7 +516,7 @@ class SWARadixCache(BasePrefixCache):
 
                 # 3. delete the leaf node
                 self._delete_leaf(x)
-                self.swa_evictable_size_ -= actual_swa_free
+                self.swa_evictable_size_[node_dp_rank] -= actual_swa_free
 
                 # 4. Iteratively delete tombstone leaves to maintain invariant that leaf nodes are not tombstone
                 x, leaf_full_num_evicted = self._iteratively_delete_tombstone_leaf(x)
@@ -559,7 +560,7 @@ class SWARadixCache(BasePrefixCache):
 
                     # 3. tombstone the node
                     self._tombstone_internal_node(x)
-                    self.swa_evictable_size_ -= actual_swa_free
+                    self.swa_evictable_size_[node_dp_rank] -= actual_swa_free
                 else:
                     assert (
                         x.full_lock_ref == 0
@@ -577,7 +578,7 @@ class SWARadixCache(BasePrefixCache):
 
                     # 3. delete the leaf node
                     self._delete_leaf(x)
-                    self.swa_evictable_size_ -= actual_swa_free
+                    self.swa_evictable_size_[node_dp_rank] -= actual_swa_free
 
                     # 4. Iteratively delete tombstone leaves to maintain invariant that leaf nodes are not tombstone
                     self._iteratively_delete_tombstone_leaf(x)
@@ -597,13 +598,16 @@ class SWARadixCache(BasePrefixCache):
         swa_lock_size = 0
         swa_uuid_for_lock = None
         while node != self.root_node:
+            # Get dp_rank from node's key
+            node_dp_rank = node.key.dp_rank if node.key and node.key.dp_rank is not None else 0
+
             # lock full from node to root
             assert (
                 node.full_lock_ref >= 0
             ), f"inc_lock_ref on node with {node.full_lock_ref=}, {node.id=}"
             if node.full_lock_ref == 0:
-                self.full_evictable_size_ -= len(node.value)
-                self.full_protected_size_ += len(node.value)
+                self.full_evictable_size_[node_dp_rank] -= len(node.value)
+                self.full_protected_size_[node_dp_rank] += len(node.value)
             node.full_lock_ref += 1
 
             # lock swa if we have not reached the sliding window size.
@@ -611,11 +615,10 @@ class SWARadixCache(BasePrefixCache):
             # caller needs to pass the swa_uuid_for_lock to dec_lock_ref
             if swa_lock_size < self.sliding_window_size:
                 assert not node.swa_tombstone, f"inc_lock_swa on swa_tombstone node, {node.id=}"
-                node_dp_rank = node.key.dp_rank if node.key and node.key.dp_rank is not None else 0
                 if node.swa_lock_ref == 0:
                     eff = self._swa_eff_len(node.value, dp_rank=node_dp_rank)
-                    self.swa_evictable_size_ -= eff
-                    self.swa_protected_size_ += eff
+                    self.swa_evictable_size_[node_dp_rank] -= eff
+                    self.swa_protected_size_[node_dp_rank] += eff
                 node.swa_lock_ref += 1
                 # Count effective SWA tokens towards sliding window
                 swa_lock_size += self._swa_eff_len(node.value, dp_rank=node_dp_rank)
@@ -638,12 +641,15 @@ class SWARadixCache(BasePrefixCache):
 
         dec_lock_swa = True
         while node != self.root_node:
+            # Get dp_rank from node's key
+            node_dp_rank = node.key.dp_rank if node.key and node.key.dp_rank is not None else 0
+
             assert (
                 node.full_lock_ref > 0
             ), f"dec_lock_ref on node with {node.full_lock_ref=}, {node.id=}"
             if node.full_lock_ref == 1:
-                self.full_evictable_size_ += len(node.value)
-                self.full_protected_size_ -= len(node.value)
+                self.full_evictable_size_[node_dp_rank] += len(node.value)
+                self.full_protected_size_[node_dp_rank] -= len(node.value)
             node.full_lock_ref -= 1
 
             if dec_lock_swa:
@@ -653,12 +659,9 @@ class SWARadixCache(BasePrefixCache):
                 ), f"dec_lock_ref on node with {node.swa_lock_ref=}, {node.id=}"
 
                 if node.swa_lock_ref == 1:
-                    node_dp_rank = (
-                        node.key.dp_rank if node.key and node.key.dp_rank is not None else 0
-                    )
                     eff = self._swa_eff_len(node.value, dp_rank=node_dp_rank)
-                    self.swa_evictable_size_ += eff
-                    self.swa_protected_size_ -= eff
+                    self.swa_evictable_size_[node_dp_rank] += eff
+                    self.swa_protected_size_[node_dp_rank] -= eff
                 node.swa_lock_ref -= 1
                 if swa_uuid_for_lock and node.swa_uuid == swa_uuid_for_lock:
                     dec_lock_swa = False
@@ -669,15 +672,15 @@ class SWARadixCache(BasePrefixCache):
         self.full_lru_list.sanity_check(self)
         self.swa_lru_list.sanity_check(self)
 
-    def evictable_size(self) -> tuple[int, int]:
+    def evictable_size(self, dp_rank: int = 0) -> tuple[int, int]:
         # Note: use full_evictable_size() and swa_evictable_size() instead.
         raise NotImplementedError
 
-    def full_evictable_size(self) -> int:
-        return self.full_evictable_size_
+    def full_evictable_size(self, dp_rank: int = 0) -> int:
+        return self.full_evictable_size_[dp_rank]
 
-    def swa_evictable_size(self) -> int:
-        return self.swa_evictable_size_
+    def swa_evictable_size(self, dp_rank: int = 0) -> int:
+        return self.swa_evictable_size_[dp_rank]
 
     # Note: this is expensive, only use for debug
     def full_lru_list_evictable_size(self) -> int:
@@ -701,17 +704,17 @@ class SWARadixCache(BasePrefixCache):
             x = self.swa_lru_list.get_prev_no_lock(x)
         return total
 
-    def protected_size(self) -> tuple[int, int]:
+    def protected_size(self, dp_rank: int = 0) -> tuple[int, int]:
         # Note: use full_protected_size() and swa_protected_size() instead.
         raise NotImplementedError
 
-    def full_protected_size(self) -> int:
+    def full_protected_size(self, dp_rank: int = 0) -> int:
         # protected size refers to the size of the full cache that is locked
-        return self.full_protected_size_
+        return self.full_protected_size_[dp_rank]
 
-    def swa_protected_size(self) -> int:
+    def swa_protected_size(self, dp_rank: int = 0) -> int:
         # protected size refers to the size of the swa cache that is locked
-        return self.swa_protected_size_
+        return self.swa_protected_size_[dp_rank]
 
     def all_values_flatten(self) -> jnp.Array:
         values = []
@@ -873,7 +876,9 @@ class SWARadixCache(BasePrefixCache):
                     # insert the node into the lru lists
                     self.swa_lru_list.insert_mru(node)
 
-                    self.swa_evictable_size_ += self._swa_eff_len(node.value, dp_rank=node_dp_rank)
+                    self.swa_evictable_size_[node_dp_rank] += self._swa_eff_len(
+                        node.value, dp_rank=node_dp_rank
+                    )
                 else:
                     # value_dp_rank from the key parameter passed into _insert_helper
                     value_dp_rank = key.dp_rank if key.dp_rank is not None else 0
@@ -896,9 +901,11 @@ class SWARadixCache(BasePrefixCache):
             self.full_lru_list.insert_mru(new_node)
             self.swa_lru_list.insert_mru(new_node)
             node.children[child_key] = new_node
-            self.full_evictable_size_ += len(value)
             new_node_dp_rank = key.dp_rank if key.dp_rank is not None else 0
-            self.swa_evictable_size_ += self._swa_eff_len(new_node.value, dp_rank=new_node_dp_rank)
+            self.full_evictable_size_[new_node_dp_rank] += len(value)
+            self.swa_evictable_size_[new_node_dp_rank] += self._swa_eff_len(
+                new_node.value, dp_rank=new_node_dp_rank
+            )
 
         return total_prefix_length
 
@@ -935,7 +942,9 @@ class SWARadixCache(BasePrefixCache):
             if v == node:
                 break
         del node.parent.children[k]
-        self.full_evictable_size_ -= len(node.value)
+        # Track evictable size per DP rank
+        node_dp_rank = node.key.dp_rank if node.key and node.key.dp_rank is not None else 0
+        self.full_evictable_size_[node_dp_rank] -= len(node.value)
 
     def _tombstone_internal_node(self, node: TreeNode) -> None:
         assert len(node.children) != 0, f"Cannot tombstone a leaf node, {node.id=}"
@@ -948,7 +957,9 @@ class SWARadixCache(BasePrefixCache):
             if v == node:
                 break
         del node.parent.children[k]
-        self.full_evictable_size_ -= len(node.key)
+        # Track evictable size per DP rank
+        node_dp_rank = node.key.dp_rank if node.key and node.key.dp_rank is not None else 0
+        self.full_evictable_size_[node_dp_rank] -= len(node.key)
 
     def _collect_leaves(self) -> list[TreeNode]:
         ret_list = []
