@@ -56,7 +56,6 @@ class ModelWorkerClient:
         )
         self.forward_thread.start()
         self.parent_process = psutil.Process().parent()
-        # self.async_gather_fn = jax.jit(multihost_utils.process_allgather)
         replicated_sharding = NamedSharding(mesh, PartitionSpec())
         self.async_gather_fn = jax.jit(lambda x: x, out_shardings=replicated_sharding)
 
