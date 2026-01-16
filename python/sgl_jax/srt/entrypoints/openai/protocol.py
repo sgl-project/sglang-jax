@@ -193,7 +193,7 @@ class CompletionResponseChoice(BaseModel):
     finish_reason: Literal["stop", "length", "content_filter", "abort"] | None = None
     matched_stop: None | int | str = None
     hidden_states: object | None = None
-    routed_experts: str | None = None
+    routed_experts: bytes | None = None
 
     # @model_serializer(mode="wrap")  # Not available in pydantic v1
     # def _serialize(self, handler):

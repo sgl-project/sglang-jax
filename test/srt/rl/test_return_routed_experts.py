@@ -11,9 +11,9 @@ from sgl_jax.srt.layers.routed_experts_capturer import (
 )
 from sgl_jax.srt.utils import kill_process_tree
 from sgl_jax.test.test_utils import (
-    DEFAULT_ENABLE_ROUTED_EXPERTS_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
+    QWEN3_MOE_30B,
     CustomTestCase,
     popen_launch_server,
 )
@@ -26,7 +26,7 @@ PROMPT3 = "Write a short story."
 class TestReturnRoutedExperts(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model_path = DEFAULT_ENABLE_ROUTED_EXPERTS_MODEL_NAME_FOR_TEST
+        cls.model_path = QWEN3_MOE_30B
         cls.model_num_hidden_layers = 2
         cls.model_num_experts_per_tok = 8
         cls.multi_prompts_prefill_baseline_file_name = (

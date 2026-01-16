@@ -125,9 +125,7 @@ class _RoutedExpertsCapturerReal(RoutedExpertsCapturer):
         seqlen: int,
         req_to_token_pool: ReqToTokenPool,
     ):
-        cache_pool_idx = jax.device_get(
-            req_to_token_pool.req_to_token[req_pool_idx][: seqlen - 1]
-        ).copy()
+        cache_pool_idx = req_to_token_pool.req_to_token[req_pool_idx][: seqlen - 1]
         return self.host_buffer[:, cache_pool_idx, :]
 
     def on_forward_end(self, topk_ids: list[jax.Array], model_worker_batch: ModelWorkerBatch):
