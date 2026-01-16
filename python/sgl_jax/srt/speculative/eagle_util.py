@@ -12,7 +12,8 @@ import jax.numpy as jnp
 import numpy
 import numpy as np
 from flax import nnx
-from jax.sharding import Mesh
+from jax.sharding import Mesh, NamedSharding
+from jax.sharding import PartitionSpec as P
 from jax.tree_util import register_pytree_node_class
 
 from sgl_jax.srt.layers.logits_processor import LogitsProcessorOutput
@@ -863,6 +864,10 @@ class EagleVerifyInput:
             rngs = jax.random.split(rng.params(), 3)
 
             draft_probs = jnp.zeros(target_probs.shape, dtype=jnp.float32)
+            if mesh is not None:
+                out_sharding = NamedSharding(mesh, P(None, None))
+                target_probs = jax.lax.with_sharding_constraint(target_probs, out_sharding)
+                draft_probs = jax.lax.with_sharding_constraint(draft_probs, out_sharding)
 
             # coins for rejection sampling
             coins = jax.random.uniform(rngs[1], candidates.shape, dtype=jnp.float32)
