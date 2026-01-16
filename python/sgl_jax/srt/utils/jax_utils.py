@@ -5,7 +5,7 @@ from typing import Any
 
 import jax
 import jax.numpy as jnp
-from jax.experimental import multihost_utils
+import numpy as np
 from jax.sharding import PartitionSpec
 
 GBYTES = 1024 * 1024 * 1024
@@ -170,17 +170,47 @@ def device_array(*data, sharding=None, **kwargs) -> jax.Array:
     return jax.device_put(*data, device=sharding, **kwargs)
 
 
-def device_get_global(x, tiled: bool = True):
+# def device_get_global(x, tiled: bool = True):
+#     if x is None:
+#         return None
+#     if jax.process_count() > 1 and hasattr(x, "addressable_shards"):
+#         try:
+#             if getattr(x, "is_fully_addressable", False):
+#                 return jax.device_get(x)
+#         except Exception:
+#             # Fall back to allgather for non-addressable arrays.
+#             pass
+#         x = multihost_utils.process_allgather(x, tiled=tiled)
+#     return jax.device_get(x)
+
+
+def device_get_global(x):
+    """
+    安全地获取当前进程可见的分片数据，并按逻辑顺序拼接。
+    解决了两个问题：
+    1. 避免 device_get_global 的强制同步导致多机死锁/崩溃。
+    2. 避免普通 device_get_local 导致的分片顺序错乱(乱码)。
+    """
     if x is None:
         return None
-    if jax.process_count() > 1 and hasattr(x, "addressable_shards"):
-        try:
-            if getattr(x, "is_fully_addressable", False):
-                return jax.device_get(x)
-        except Exception:
-            # Fall back to allgather for non-addressable arrays.
-            pass
-        x = multihost_utils.process_allgather(x, tiled=tiled)
+
+    # 如果是 JAX Array 且有分片信息
+    if hasattr(x, "addressable_shards"):
+        # 关键修正：必须根据 shard.index 排序！
+        # shard.index 通常是一个 tuple，例如 (0, 0)
+        sorted_shards = sorted(x.addressable_shards, key=lambda s: s.index)
+
+        # 提取数据
+        shards_data = [s.data for s in sorted_shards]
+
+        if not shards_data:
+            # 如果当前机器没有分片数据（极端情况），返回空
+            return np.array([])
+
+        # 拼接数据 (假设 batch 维度在 axis 0)
+        return np.concatenate([jax.device_get(s) for s in shards_data], axis=0)
+
+    # Fallback: 如果不是分布式 Array，直接获取
     return jax.device_get(x)
 
 
