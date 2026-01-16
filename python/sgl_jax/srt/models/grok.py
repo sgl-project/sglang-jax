@@ -912,7 +912,7 @@ class Grok1ForCausalLM(nnx.Module):
             prefix=prefix,
             target_prefix=target_prefix,
             num_experts=self.config.num_local_experts,
-            moe_path="block_sparse_moe",
+            moe_path="block_sparse_moe.experts",
             expert_type_map={
                 "w1": "wi_0",
                 "w3": "wi_1",
@@ -923,6 +923,7 @@ class Grok1ForCausalLM(nnx.Module):
                 "w3": 0,
                 "w2": -1,
             },
+            source_expert_pattern="{i}",
         )
         mappings.update(moe_mappings)
 
