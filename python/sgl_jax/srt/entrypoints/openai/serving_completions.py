@@ -81,6 +81,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
             lora_path=request.lora_path,
             extra_key=request.extra_key,
             rid=request.rid,
+            return_routed_experts=request.return_routed_experts,
         )
 
         return adapted_request, request

@@ -176,6 +176,8 @@ class CompletionRequest(BaseModel):
     # For request id
     rid: list[str] | str | None = None
 
+    return_routed_experts: list[bool] | bool | None = None
+
     @validator("max_tokens")
     @classmethod
     def validate_max_tokens_positive(cls, v):

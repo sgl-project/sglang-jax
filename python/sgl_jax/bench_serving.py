@@ -205,6 +205,7 @@ async def async_request_openai_completions(
             "stream": not args.disable_stream,
             "ignore_eos": not args.disable_ignore_eos,
             "lora_path": request_func_input.lora_name,
+            "return_routed_experts": args.return_routed_experts,
             **request_func_input.extra_request_body,
         }
         headers = get_auth_headers()
