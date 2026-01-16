@@ -455,7 +455,7 @@ class Qwen2ForCausalLM(nnx.Module):
             mappings.update(bias_mappings)
 
         return mappings
-        
+
     def get_embed_and_head(self):
         return (
             self.model.embed_tokens.embedding.value,
@@ -480,7 +480,7 @@ class Qwen2ForCausalLM(nnx.Module):
         # Set LM Head weight
         if head_weight is not None:
             self.lm_head.embedding.value = head_weight
-            
+
     def __call__(
         self,
         forward_batch: ForwardBatch,
