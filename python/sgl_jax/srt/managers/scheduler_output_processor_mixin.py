@@ -4,13 +4,12 @@ import logging
 import threading
 from typing import TYPE_CHECKING
 
-import jax
-
 from sgl_jax.srt.layers.logits_processor import LogitsProcessorOutput
 from sgl_jax.srt.managers.io_struct import AbortReq, BatchTokenIDOut
 from sgl_jax.srt.managers.schedule_batch import BaseFinishReason, Req, ScheduleBatch
 from sgl_jax.srt.precision_tracer import precision_tracer
 from sgl_jax.srt.utils.common_utils import cdiv
+from sgl_jax.srt.utils.jax_utils import device_get_global
 
 if TYPE_CHECKING:
     from sgl_jax.srt.managers.scheduler import (
@@ -59,17 +58,17 @@ class SchedulerOutputProcessorMixin:
         else:
             # Move next_token_ids and logprobs to cpu
             if batch.return_output_logprob_only and logits_output.next_token_logprobs is not None:
-                logits_output.next_token_logprobs = jax.device_get(
+                logits_output.next_token_logprobs = device_get_global(
                     logits_output.next_token_logprobs
                 ).astype(float)
             if batch.return_logprob:
                 if logits_output.next_token_logprobs is not None:
-                    logits_output.next_token_logprobs = jax.device_get(
+                    logits_output.next_token_logprobs = device_get_global(
                         logits_output.next_token_logprobs
                     ).astype(float)
                 if logits_output.input_token_logprobs is not None:
                     logits_output.input_token_logprobs = tuple(
-                        jax.device_get(logits_output.input_token_logprobs).astype(float)
+                        device_get_global(logits_output.input_token_logprobs).astype(float)
                     )
 
         per_dp_bs_size = batch.per_dp_bs_size
@@ -260,7 +259,7 @@ class SchedulerOutputProcessorMixin:
         else:
             # spec decoding handles output logprobs inside verify process.
             if batch.return_logprob or batch.return_output_logprob_only:
-                next_token_logprobs = jax.device_get(logits_output.next_token_logprobs).astype(
+                next_token_logprobs = device_get_global(logits_output.next_token_logprobs).astype(
                     float
                 )
 

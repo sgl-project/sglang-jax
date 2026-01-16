@@ -76,6 +76,7 @@ from sgl_jax.srt.utils.common_utils import (
     pyspy_dump_schedulers,
     set_random_seed,
 )
+from sgl_jax.srt.utils.jax_utils import device_get_global
 from sgl_jax.srt.utils.mesh_utils import create_device_mesh
 from sgl_jax.utils import TypeBasedDispatcher, get_exception_traceback
 
@@ -1439,7 +1440,7 @@ class Scheduler(
                         model_worker_batch, sampling_metadata=None
                     )
                 )
-                next_token_ids = np.array(jax.device_get(next_token_ids_device))
+                next_token_ids = np.array(device_get_global(next_token_ids_device))
                 self._extract_dp_output_ids(next_token_ids, model_worker_batch, batch)
         else:
             model_worker_batch = batch.get_spec_model_worker_batch(

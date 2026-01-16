@@ -5,6 +5,7 @@ from typing import Any
 
 import jax
 import jax.numpy as jnp
+from jax.experimental import multihost_utils
 from jax.sharding import PartitionSpec
 
 GBYTES = 1024 * 1024 * 1024
@@ -167,6 +168,20 @@ def get_available_device_memory(device, distributed=False, empty_cache=True):
 
 def device_array(*data, sharding=None, **kwargs) -> jax.Array:
     return jax.device_put(*data, device=sharding, **kwargs)
+
+
+def device_get_global(x, tiled: bool = True):
+    if x is None:
+        return None
+    if jax.process_count() > 1 and hasattr(x, "addressable_shards"):
+        try:
+            if getattr(x, "is_fully_addressable", False):
+                return jax.device_get(x)
+        except Exception:
+            # Fall back to allgather for non-addressable arrays.
+            pass
+        x = multihost_utils.process_allgather(x, tiled=tiled)
+    return jax.device_get(x)
 
 
 def is_tpu_runtime() -> bool:

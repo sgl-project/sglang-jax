@@ -18,6 +18,7 @@ from sgl_jax.srt.managers.utils import resolve_future_token_ids, set_future_toke
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
 from sgl_jax.srt.sampling.sampling_batch_info import SamplingMetadata
 from sgl_jax.srt.server_args import ServerArgs
+from sgl_jax.srt.utils.jax_utils import device_get_global
 from sgl_jax.utils import get_exception_traceback
 
 logger = logging.getLogger(__name__)
@@ -133,16 +134,16 @@ class ModelWorkerClient:
         """
         _, logits_output, next_token_ids, cache_miss_count = self.output_queue.get()
         if logits_output.next_token_logprobs is not None:
-            logits_output.next_token_logprobs = jax.device_get(
+            logits_output.next_token_logprobs = device_get_global(
                 logits_output.next_token_logprobs
             ).tolist()
         if logits_output.input_token_logprobs is not None:
-            logits_output.input_token_logprobs = jax.device_get(
+            logits_output.input_token_logprobs = device_get_global(
                 logits_output.input_token_logprobs
             ).tolist()
         if logits_output.hidden_states is not None:
-            logits_output.hidden_states = jax.device_get(logits_output.hidden_states)
-        next_token_ids = jax.device_get(next_token_ids).tolist()
+            logits_output.hidden_states = device_get_global(logits_output.hidden_states)
+        next_token_ids = device_get_global(next_token_ids).tolist()
 
         if launch_done is not None:
             launch_done.wait()
