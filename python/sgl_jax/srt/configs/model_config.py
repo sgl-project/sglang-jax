@@ -6,6 +6,7 @@ from enum import Enum, IntEnum, auto
 import jax.numpy as jnp
 from transformers import PretrainedConfig
 
+from sgl_jax.srt.configs.quantization_config import QuantizationConfig
 from sgl_jax.srt.hf_transformers_utils import (
     get_config,
     get_context_length,
@@ -52,6 +53,8 @@ class ModelConfig:
         self.model_impl = model_impl
         self.quantization = quantization
         self.quantization_config_path = quantization_config_path
+        # Create unified quantization config from path
+        self.quantization_config = QuantizationConfig.from_path(quantization_config_path)
         # if ep_size > 1, use ep moe, else use fused moe
         # TODO: support ep moe with ETP
         self.ep_size = 1
@@ -69,6 +72,9 @@ class ModelConfig:
             model_override_args=self.model_override_args,
             **kwargs,
         )
+
+        # Attach quantization config to hf_config so models can access it
+        self.hf_config.quantization_config = self.quantization_config
 
         self.hf_generation_config = get_generation_config(
             self.model_path,
