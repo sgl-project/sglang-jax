@@ -56,6 +56,8 @@ class ModelWorkerClient:
         )
         self.forward_thread.start()
         self.parent_process = psutil.Process().parent()
+        replicated_sharding = NamedSharding(mesh, PartitionSpec())
+        self.async_gather_fn = jax.jit(lambda x: x, out_shardings=replicated_sharding)
 
     def get_model_runner(self):
         return self.worker.get_model_runner()
@@ -116,7 +118,7 @@ class ModelWorkerClient:
                         forward_metadata=forward_metadata,
                     )
                 )
-
+            next_token_ids = self.async_gather_fn(next_token_ids)
             # Update the future token ids map
             self.future_token_ids_map = set_future_token_ids(
                 self.future_token_ids_map,
@@ -143,7 +145,6 @@ class ModelWorkerClient:
         if logits_output.hidden_states is not None:
             logits_output.hidden_states = jax.device_get(logits_output.hidden_states)
         next_token_ids = jax.device_get(next_token_ids).tolist()
-
         if launch_done is not None:
             launch_done.wait()
 
