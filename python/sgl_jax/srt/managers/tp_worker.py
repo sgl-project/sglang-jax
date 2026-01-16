@@ -3,12 +3,15 @@
 import itertools
 import logging
 import os
+import signal
 import threading
 import time
+from queue import Queue
 
 import jax
 import jax.numpy as jnp
 import numpy as np
+import psutil
 from flax import nnx
 from jax.experimental.multihost_utils import broadcast_one_to_all
 from tqdm import tqdm
@@ -35,6 +38,7 @@ from sgl_jax.srt.utils.common_utils import (
     PRECOMPILE_DEFAULT_BS_PADDINGS,
     PRECOMPILE_DEFAULT_TOKEN_PADDINGS,
 )
+from sgl_jax.utils import get_exception_traceback
 
 logger = logging.getLogger(__name__)
 
@@ -195,6 +199,27 @@ class ModelWorker:
             (item * self.max_req_len + self.page_size - 1) // self.page_size * self.page_size
             for item in self.precompile_bs_paddings
         ]
+
+        self.parent_process = psutil.Process().parent()
+        self.sync_queue = Queue()
+        self.sync_expert_ids_d2h_thread = threading.Thread(
+            target=self._sync_expert_ids_d2h_thread_func,
+            daemon=True,
+        )
+        self.sync_expert_ids_d2h_thread.start()
+
+    def _sync_expert_ids_d2h_thread_func(self):
+        try:
+            self._sync_experts_ids_d2h()
+        except Exception:
+            traceback = get_exception_traceback()
+            logger.error("ModelWorker sync thread hit an exception: %s", traceback)
+            self.parent_process.send_signal(signal.SIGQUIT)
+
+    def _sync_experts_ids_d2h(self):
+        while True:
+            layers_topk_ids, model_worker_batch = self.sync_queue.get()
+            get_global_experts_capturer().on_forward_end(layers_topk_ids, model_worker_batch)
 
     def normalize_token_paddings(self):
         normalized_token_paddings = []
@@ -500,12 +525,18 @@ class ModelWorker:
             forward_batch,
             logits_metadata=LogitsMetadata.from_model_worker_batch(model_worker_batch, self.mesh),
         )
-        get_global_experts_capturer().on_forward_end(layers_topk_ids, model_worker_batch)
 
         self.dump_topk_ids(layers_topk_ids, model_worker_batch)
 
         if launch_done is not None:
             launch_done.set()
+
+        self.sync_queue.put(
+            (
+                layers_topk_ids,
+                model_worker_batch,
+            )
+        )
 
         # SAVE last layer logits
         save_logits_file_info = os.getenv("DUMP_LAST_LAYER_LOGITS_FILENAMES", None)

@@ -46,6 +46,7 @@ from sgl_jax.srt.managers.schedule_batch import (
     FINISH_ABORT,
     Req,
     ScheduleBatch,
+    acc_global_bid,
     global_server_args_dict,
 )
 from sgl_jax.srt.managers.schedule_policy import (
@@ -1220,6 +1221,8 @@ class Scheduler(
             )
         else:
             new_batch.decoding_reqs = None
+
+        new_batch.bid = acc_global_bid()
 
         return new_batch
 

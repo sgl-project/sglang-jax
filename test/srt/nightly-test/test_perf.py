@@ -1032,7 +1032,6 @@ class TestModelPerf(CustomTestCase):
             "2",
             "--ep-size",
             "2",
-            "--enable-return-routed-experts",
         ]
         # launch server
         process = popen_launch_server(
@@ -1075,7 +1074,6 @@ class TestModelPerf(CustomTestCase):
                             random_range_ratio=1.0,
                             request_rate=float("inf"),
                             seed=42,
-                            return_routed_expert=True,
                         )
 
                         vars(args).update(static_config)
@@ -1565,6 +1563,266 @@ class TestModelPerf(CustomTestCase):
                 f"{r['concurrency']:<5} | {r['input']:<6} | {r['output']:<6} | {r['ttft_ms']:<10.2f} | {r['itl_ms']:<10.2f} | {r['out_tps']:<10.2f} | {r['in_tps']:<10.2f}| {r['model_name']:<20}"
             )
         print("=" * 100)
+
+    def test_qwen3_moe_performance_tp_2_ep_2(self):
+        import os
+
+        MOUNT_ROOT = os.getenv("CI_MOUNT_ROOT", "/models")
+        raw_model_id = QWEN3_MOE_30B
+        model_dir_name = "QWEN3_MOE_30B"
+        cached_model_path = os.path.join(MOUNT_ROOT, "model_scope", model_dir_name)
+
+        print(f"[CI Info] Checking Model Cache at: {cached_model_path}")
+        if os.path.exists(cached_model_path):
+            print(f"[CI Info] Hit Model Cache: {cached_model_path}")
+            model_path_for_server = cached_model_path
+        else:
+            print(f"[CI Info] Cache Miss, downloading: {raw_model_id}")
+            model_path_for_server = raw_model_id
+
+        base_url = DEFAULT_URL_FOR_TEST
+        allow_gap = 0.03
+
+        expected_performance_base = {
+            8: {
+                4096: {
+                    "ttft": 2513.40,
+                    "itl": 10.32,
+                    "input_throughput": 13010.00,
+                    "output_throughput": 634.30,
+                }
+            },
+            16: {
+                4096: {
+                    "ttft": 5012.80,
+                    "itl": 15.83,
+                    "input_throughput": 13019.39,
+                    "output_throughput": 770.87,
+                }
+            },
+            32: {
+                4096: {
+                    "ttft": 10025.43,
+                    "itl": 23.58,
+                    "input_throughput": 13029.70,
+                    "output_throughput": 958.84,
+                }
+            },
+            64: {
+                4096: {
+                    "ttft": 20063.09,
+                    "itl": 30.61,
+                    "input_throughput": 13047.41,
+                    "output_throughput": 947.27,
+                }
+            },
+            128: {
+                4096: {
+                    "ttft": 40078.79,
+                    "itl": 30.59,
+                    "input_throughput": 13055.81,
+                    "output_throughput": 952.47,
+                }
+            },
+            256: {
+                4096: {
+                    "ttft": 80091.45,
+                    "itl": 30.56,
+                    "input_throughput": 13073.10,
+                    "output_throughput": 960.60,
+                }
+            },
+        }
+        expected_performance_return_routed_experts = {
+            8: {
+                4096: {
+                    "ttft": 2521.16,
+                    "itl": 10.26,
+                    "input_throughput": 12968.14,
+                    "output_throughput": 631.16,
+                }
+            },
+            16: {
+                4096: {
+                    "ttft": 5029.84,
+                    "itl": 15.90,
+                    "input_throughput": 12963.54,
+                    "output_throughput": 753.00,
+                }
+            },
+            32: {
+                4096: {
+                    "ttft": 10059.17,
+                    "itl": 23.50,
+                    "input_throughput": 12980.47,
+                    "output_throughput": 945.56,
+                }
+            },
+            64: {
+                4096: {
+                    "ttft": 20131.72,
+                    "itl": 30.53,
+                    "input_throughput": 13001.69,
+                    "output_throughput": 943.58,
+                }
+            },
+            128: {
+                4096: {
+                    "ttft": 40219.69,
+                    "itl": 30.51,
+                    "input_throughput": 13010.02,
+                    "output_throughput": 949.56,
+                }
+            },
+            256: {
+                4096: {
+                    "ttft": 80361.53,
+                    "itl": 30.48,
+                    "input_throughput": 13025.94,
+                    "output_throughput": 957.38,
+                }
+            },
+        }
+
+        # define test parameters
+        # concurrency levels
+        concurrency_levels = [8, 16, 32, 64, 128, 256]
+        # input length levels (4k)
+        input_lengths = [4096]
+
+        output_lengths = [1, 1024]
+
+        def common_run(extra_args, expected_performance, file_suffix, return_routed_experts):
+            specific_args = self.BASIC_SERVER_ARGS + extra_args
+            # launch server
+            process = popen_launch_server(
+                model_path_for_server,
+                base_url,
+                timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+                device="tpu",
+                other_args=specific_args,
+                env={
+                    "JAX_COMPILATION_CACHE_DIR": "/tmp/jax_compilation_cache",
+                },
+            )
+
+            results_summary = []
+
+            try:
+                static_config = {
+                    "dataset_name": "random",
+                    "dataset_path": self.sharegpt_dataset_path,
+                    "warmup_requests": 0,
+                }
+                for concurrency in concurrency_levels:
+                    for in_len in input_lengths:
+                        for out_len in output_lengths:
+                            print(f"\n{'#'*60}")
+                            print(
+                                f"Testing Scenario: Concurrency={concurrency} | Input={in_len} | Output={out_len}"
+                            )
+                            print(f"{'#'*60}")
+
+                            current_num_prompts = concurrency * 3
+
+                            args = get_benchmark_args(
+                                base_url=base_url,
+                                tokenizer=model_path_for_server,
+                                num_prompts=current_num_prompts,
+                                max_concurrency=concurrency,
+                                random_input_len=in_len,
+                                random_output_len=out_len,
+                                random_range_ratio=1.0,
+                                request_rate=float("inf"),
+                                seed=42,
+                                return_routed_experts=return_routed_experts,
+                            )
+
+                            vars(args).update(static_config)
+
+                            metrics = run_benchmark(args)
+
+                            if out_len == 1:
+                                self.assertGreater(
+                                    metrics["input_throughput"],
+                                    expected_performance[concurrency][in_len]["input_throughput"]
+                                    * (1 - allow_gap),
+                                )
+                                self.assertLess(
+                                    metrics["median_ttft_ms"],
+                                    expected_performance[concurrency][in_len]["ttft"]
+                                    * (1 + allow_gap),
+                                )
+                            else:
+                                self.assertGreater(
+                                    metrics["output_throughput"],
+                                    expected_performance[concurrency][in_len]["output_throughput"]
+                                    * (1 - allow_gap),
+                                )
+                                self.assertLess(
+                                    metrics["median_itl_ms"],
+                                    expected_performance[concurrency][in_len]["itl"]
+                                    * (1 + allow_gap),
+                                )
+
+                            results_summary.append(
+                                {
+                                    "concurrency": concurrency,
+                                    "input": in_len,
+                                    "output": out_len,
+                                    "ttft_ms": metrics.get("median_ttft_ms", 0),
+                                    "itl_ms": metrics.get("median_itl_ms", 0),
+                                    "in_tps": metrics.get("input_throughput", 0),
+                                    "out_tps": metrics.get("output_throughput", 0),
+                                    "model_name": raw_model_id,
+                                    "tpu_size": 4,
+                                }
+                            )
+
+                            time.sleep(1)
+
+            finally:
+                process.terminate()
+                process.wait()
+
+            if results_summary:
+                import csv
+                import os
+
+                output_dir = os.getenv(
+                    "PERF_OUTPUT_DIR", "./test/nightly_test_output/perf/local_run"
+                )
+                os.makedirs(output_dir, exist_ok=True)
+                output_filename = os.path.join(
+                    output_dir, f"performance_results_{model_dir_name}_tp_2_ep_2_{file_suffix}.csv"
+                )
+                file_exists = os.path.exists(output_filename)
+                with open(output_filename, "a", newline="", encoding="utf-8") as csvfile:
+
+                    headers = results_summary[0].keys()
+                    writer = csv.DictWriter(csvfile, fieldnames=headers)
+
+                    if not file_exists:
+                        writer.writeheader()
+
+                    writer.writerows(results_summary)
+
+        print(f"Begin to test base performance case for qwen3_moe", flush=True)
+        common_run(
+            extra_args=["--tp-size", "2", "--ep-size", "2"],
+            expected_performance=expected_performance_base,
+            file_suffix="base",
+            return_routed_experts=False,
+        )
+        print(f"Complete testing base performance case for qwen3_moe", flush=True)
+        print(f"Begin to test return_routed_experts performance case for qwen3_moe", flush=True)
+        common_run(
+            extra_args=["--tp-size", "2", "--ep-size", "2", "--enable-return-routed-experts"],
+            expected_performance=expected_performance_return_routed_experts,
+            file_suffix="return_routed_experts",
+            return_routed_experts=True,
+        )
+        print(f"Complete testing return_routed_experts performance case for qwen3_moe", flush=True)
 
     def test_qwen_7b_performance_tp_1_low_concurrency(self):
         concurrency_levels = [8, 16, 32, 64, 128]
