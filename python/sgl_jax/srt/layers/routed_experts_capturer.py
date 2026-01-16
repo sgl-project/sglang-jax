@@ -10,6 +10,7 @@ from abc import ABC, abstractmethod
 import jax
 import numpy as np
 import pybase64
+import time
 
 from sgl_jax.srt.configs.model_config import ModelConfig
 from sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch
@@ -56,6 +57,7 @@ class RoutedExpertsCapturer(ABC):
         req_pool_idx: int,
         seqlen: int,
         req_to_token_pool: ReqToTokenPool,
+        bid: int,
     ):
         raise NotImplementedError
 
@@ -90,6 +92,7 @@ class _RoutedExpertsCapturerReal(RoutedExpertsCapturer):
         self.dummy_experts_ids = np.full(
             (self.max_padding, self.num_experts_per_tok), fill_value=-1, dtype=np.int32
         )
+        self.bid = None
 
         """Common logging and memory usage computation for captured experts buffers."""
         buffer_size_GB = self.get_buffer_size_bytes() / _GB
@@ -111,24 +114,27 @@ class _RoutedExpertsCapturerReal(RoutedExpertsCapturer):
         unpadded_input_len = model_worker_batch.get_original_input_len()
         valid_out_cache_loc_cpu = model_worker_batch.out_cache_loc[:unpadded_input_len]
         topk_ids_cpu = jax.device_get(topk_ids)
-
         for layer_idx, ids_cpu in enumerate(topk_ids_cpu):
             if ids_cpu is None:
                 valid_ids = self.dummy_experts_ids[:unpadded_input_len]
             else:
                 valid_ids = ids_cpu[:unpadded_input_len, : self.num_experts_per_tok]
             self.host_buffer[layer_idx, valid_out_cache_loc_cpu, :] = valid_ids
+        
+        self.bid = model_worker_batch.bid
 
     def get_routed_experts(
         self,
         req_pool_idx: int,
         seqlen: int,
         req_to_token_pool: ReqToTokenPool,
+        bid: int,
     ):
         cache_pool_idx = jax.device_get(
             req_to_token_pool.req_to_token[req_pool_idx][: seqlen - 1]
         ).copy()
-        return self.host_buffer[:, cache_pool_idx, :]
+        while self.bid >= bid:
+            return self.host_buffer[:, cache_pool_idx, :]
 
     def on_forward_end(self, topk_ids: list[jax.Array], model_worker_batch: ModelWorkerBatch):
         self._sync_fwd_experts_buffer_DtoH(
@@ -153,6 +159,7 @@ class _RoutedExpertsCapturerNoop(RoutedExpertsCapturer):
         req_pool_idx: int,
         seqlen: int,
         req_to_token_pool: ReqToTokenPool,
+        bid: int,
     ):
         pass
 

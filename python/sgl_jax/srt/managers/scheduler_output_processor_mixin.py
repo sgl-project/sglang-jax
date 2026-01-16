@@ -10,7 +10,7 @@ import numpy as np
 from sgl_jax.srt.layers.logits_processor import LogitsProcessorOutput
 from sgl_jax.srt.layers.routed_experts_capturer import get_global_experts_capturer
 from sgl_jax.srt.managers.io_struct import AbortReq, BatchTokenIDOut
-from sgl_jax.srt.managers.schedule_batch import BaseFinishReason, Req, ScheduleBatch
+from sgl_jax.srt.managers.schedule_batch import BaseFinishReason, Req, ScheduleBatch, get_global_bid
 from sgl_jax.srt.precision_tracer import precision_tracer
 from sgl_jax.srt.utils.common_utils import cdiv
 
@@ -41,6 +41,7 @@ class SchedulerOutputProcessorMixin:
             req_pool_idx=req.req_pool_idx,
             seqlen=req.seqlen,
             req_to_token_pool=self.req_to_token_pool,
+            bid=req.latest_bid,
         )
         req.routed_experts = np.transpose(tmp, (1, 0, 2))
 
@@ -50,6 +51,7 @@ class SchedulerOutputProcessorMixin:
         result: GenerationBatchResult,
         launch_done: threading.Event | None = None,
     ):
+        global_bid = get_global_bid()
         skip_stream_req = None
 
         assert self.is_generation
@@ -90,6 +92,8 @@ class SchedulerOutputProcessorMixin:
         for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
             if req.is_retracted:
                 continue
+
+            req.latest_bid = batch.bid
 
             if self.is_mixed_chunk and self.enable_overlap and req.finished():
                 j = len(batch.out_cache_loc) - len(batch.reqs) + i
@@ -224,6 +228,7 @@ class SchedulerOutputProcessorMixin:
         result: GenerationBatchResult,
         launch_done: threading.Event | None = None,
     ):
+        global_bid = get_global_bid()
         logits_output, next_token_ids, cache_miss_count = (
             result.logits_output,
             result.next_token_ids,
@@ -264,6 +269,8 @@ class SchedulerOutputProcessorMixin:
             req: Req
             if req.is_retracted:
                 continue
+
+            req.latest_bid = batch.bid
 
             indices_to_free = None
             if self.enable_overlap and req.finished():
