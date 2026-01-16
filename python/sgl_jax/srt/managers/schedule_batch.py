@@ -564,10 +564,6 @@ class ScheduleBatch:
     forward_mode: ForwardMode = None
     enable_overlap: bool = False
 
-    # Tell whether the current running batch is full globally (across all DP ranks)
-    # This is an optimization to reduce the overhead of the prefill check.
-    batch_is_full: bool = False
-
     # For processing logprobs (shared settings)
     return_logprob: bool = False
     return_output_logprob_only: bool = False
@@ -670,6 +666,10 @@ class ScheduleBatch:
             is_prefill_only=all(req.sampling_params.max_new_tokens == 0 for req in all_reqs),
             dp_size=dp_size,
         )
+
+    @property
+    def batch_is_full(self) -> bool:
+        return all(info.batch_is_full for info in self.reqs_info)
 
     def batch_size(self) -> int:
         """Get total number of requests across all DP ranks."""
@@ -1394,9 +1394,6 @@ class ScheduleBatch:
             self.return_output_logprob_only = False
             self.has_stream = False
             self.has_grammar = False
-
-        # Batch is full only if ALL DP ranks are full
-        self.batch_is_full = all(info.batch_is_full for info in self.reqs_info)
 
     def merge_batch(self, other: ScheduleBatch):
         """Merge another batch into this batch (unified for all dp_size >= 1).

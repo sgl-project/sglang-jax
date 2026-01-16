@@ -836,7 +836,7 @@ class Scheduler(
         # scheduling state
         ret["cur_batch_is_none"] = self.cur_batch is None
         ret["last_batch_is_none"] = self.last_batch is None
-        ret["chunked_req_is_none"] = self.chunked_req is None
+        ret["chunked_req_is_none"] = self.chunked_reqs is None
 
         # request cache stat
         if isinstance(self.tree_cache, ChunkCache):
@@ -1181,21 +1181,6 @@ class Scheduler(
 
         running_bs = self.running_batch.batch_size()
 
-        # Check per-DP batch full status
-        for dp_rank in range(self.dp_size):
-            info = self.running_batch.reqs_info[dp_rank]
-            running_reqs_count = len(info.reqs) if info.reqs else 0
-            if running_reqs_count >= self.per_dp_max_running_requests:
-                info.batch_is_full = True
-
-        # Update global batch_is_full
-        self.running_batch.batch_is_full = all(
-            info.batch_is_full for info in self.running_batch.reqs_info
-        )
-
-        if self.running_batch.batch_is_full:
-            return None
-
         # Get priority queue
         self.policy.calc_priority(self.waiting_queue)
 
@@ -1225,26 +1210,17 @@ class Scheduler(
                     if info.reqs:
                         lora_set.update([req.lora_id for req in info.reqs])
 
-        # Track which DP ranks are exhausted
-        dp_exhausted = [False] * self.dp_size
-
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
             # Get DP rank for this request
             dp_rank = req.dp_rank if req.dp_rank is not None else 0
 
-            # Skip if this DP rank is exhausted
-            if dp_exhausted[dp_rank]:
+            # Check whether dp is full load
+            if self.running_batch.reqs_info[dp_rank].batch_is_full or (
+                len(self.running_batch.reqs_info[dp_rank].reqs) + len(adder.can_run_list[dp_rank])
+                >= self.per_dp_max_running_requests
+            ):
                 continue
-
-            # Global checks (apply to all DP ranks)
-            total_can_run = sum(len(v) for v in adder.can_run_list.values())
-            if running_bs + total_can_run >= self.max_running_requests:
-                # Mark all DP ranks as full when global limit is reached
-                for info in self.running_batch.reqs_info:
-                    info.batch_is_full = True
-                self.running_batch.batch_is_full = True
-                break
 
             # Check LoRA constraint: ensure we don't exceed max_loras_per_batch
             # This is GLOBAL - must be same across all DP ranks
@@ -1265,14 +1241,10 @@ class Scheduler(
             if res != AddReqResult.CONTINUE:
                 if res == AddReqResult.NO_TOKEN:
                     # Mark this specific DP rank as exhausted
-                    dp_exhausted[dp_rank] = True
+                    self.running_batch.reqs_info[dp_rank].batch_is_full = True
 
                     # Check if all DP ranks are exhausted
-                    if all(dp_exhausted):
-                        # All DP ranks full, mark batch_is_full
-                        for info in self.running_batch.reqs_info:
-                            info.batch_is_full = True
-                        self.running_batch.batch_is_full = True
+                    if self.running_batch.batch_is_full:
                         break
 
                     # Continue to try requests from other DP ranks
@@ -1305,24 +1277,6 @@ class Scheduler(
 
         # Use self.chunked_reqs directly as chunked_reqs_per_dp
         chunked_reqs_per_dp = self.chunked_reqs.copy()
-
-        # Check batch_is_full per DP rank
-        for dp_rank in range(self.dp_size):
-            running_reqs_count = (
-                len(self.running_batch.reqs_info[dp_rank].reqs)
-                if self.running_batch.reqs_info[dp_rank].reqs
-                else 0
-            )
-            new_reqs_count = len(reqs_per_dp[dp_rank])
-            total_reqs = running_reqs_count + new_reqs_count
-
-            if total_reqs >= self.per_dp_max_running_requests:
-                self.running_batch.reqs_info[dp_rank].batch_is_full = True
-
-        # Update global batch_is_full: True only if all DP ranks are full
-        self.running_batch.batch_is_full = all(
-            info.batch_is_full for info in self.running_batch.reqs_info
-        )
 
         # Create a new batch
         new_batch = ScheduleBatch.init_new(
@@ -1357,7 +1311,6 @@ class Scheduler(
                     if running_info.reqs:
                         new_info.decoding_reqs = running_info.reqs
 
-            batch_is_full = self.running_batch.batch_is_full
             self.running_batch = ScheduleBatch.init_new(
                 reqs=[[] for _ in range(self.dp_size)],
                 req_to_token_pool=self.req_to_token_pool,
@@ -1369,7 +1322,6 @@ class Scheduler(
                 spec_algorithm=self.spec_algorithm,
                 mesh=self.mesh,
             )
-            self.running_batch.batch_is_full = batch_is_full
 
         return new_batch
 
@@ -1382,7 +1334,6 @@ class Scheduler(
             # Mark all DP ranks as not full when batch is empty
             for info in batch.reqs_info:
                 info.batch_is_full = False
-            batch.batch_is_full = False
             return batch
 
         # Check if decode out of memory
@@ -1416,8 +1367,6 @@ class Scheduler(
                 current_bs = len(info.reqs) if info.reqs else 0
                 if current_bs < self.per_dp_max_running_requests:
                     info.batch_is_full = False
-            # Update global batch_is_full
-            batch.batch_is_full = all(info.batch_is_full for info in batch.reqs_info)
 
         # Update batch arrays
         batch.prepare_for_decode()
@@ -1683,8 +1632,7 @@ class Scheduler(
                 for req in retracted_reqs:
                     self._add_request_to_queue(req)
 
-            self.running_batch.batch_is_full = False
-            self.chunked_req = None
+            self.chunked_reqs = None
             logger.info("Paused generation retracted")
         elif recv_req.mode == "in_place":
             logger.info("Paused generation in place")
