@@ -61,6 +61,8 @@ The feature is controlled by two flags:
 
 ## 2. User Story
 
+Note: For some MoE models like inclusionAI/Ling-mini-2.0, the first several layers of them are not MoE. In order to keep compatible, SGLangJax returns -1 for these layers.
+
 ### A. Engine Example
 
 ```python
@@ -96,43 +98,6 @@ print(f"Expert IDs shape (reshaped): {expert_ids.shape}")
 # Analyze expert utilization
 print(f"\nToken 0, Layer 0 experts: {expert_ids[0, 0, :]}")
 print(f"Token 0, Layer 47 experts: {expert_ids[0, 47, :]}")
-```
-
-### B. OpenAI-Compatible API Example
-
-```python
-import requests
-import numpy as np
-import pybase64
-
-# HTTP request
-response = requests.post(
-    "http://localhost:30000/v1/chat/completions",
-    json={
-        "model": "Qwen/Qwen3-30B-A3B",
-        "messages": [
-            {"role": "user", "content": "Explain MoE models"}
-        ],
-        "return_routed_experts": True,  # Enable expert capture
-        "max_tokens": 50,
-    },
-).json()
-
-# Extract expert IDs from response
-routed_experts_b64 = response["choices"][0]["meta_info"]["routed_experts"]
-
-# Decode
-expert_ids = np.frombuffer(
-    pybase64.b64decode(routed_experts_b64.encode("utf-8")),
-    dtype=np.int32
-)
-
-num_layers = 48  # For Qwen3-30B
-num_experts_per_tok = 8  # Topk experts
-
-# Reshape
-expert_ids = expert_ids.reshape(-1, num_layers, num_experts_per_tok)  # [seq_len, layers, topk]
-print(f"Captured expert IDs for {expert_ids.shape[0]} tokens")
 ```
 
 

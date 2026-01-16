@@ -1032,6 +1032,7 @@ class TestModelPerf(CustomTestCase):
             "2",
             "--ep-size",
             "2",
+            "--enable-return-routed-experts",
         ]
         # launch server
         process = popen_launch_server(
@@ -1074,6 +1075,7 @@ class TestModelPerf(CustomTestCase):
                             random_range_ratio=1.0,
                             request_rate=float("inf"),
                             seed=42,
+                            return_routed_expert=True,
                         )
 
                         vars(args).update(static_config)

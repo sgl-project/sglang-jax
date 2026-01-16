@@ -31,11 +31,13 @@ class RoutedExpertsCapturer(ABC):
         enable: bool,
         model_config: ModelConfig,
         num_tokens: int,
+        max_padding: int,
     ):
         if enable:
             return _RoutedExpertsCapturerReal(
                 model_config,
                 num_tokens=num_tokens,
+                max_padding=max_padding,
             )
         else:
             return _RoutedExpertsCapturerNoop()
@@ -69,10 +71,12 @@ class _RoutedExpertsCapturerReal(RoutedExpertsCapturer):
         self,
         model_config: ModelConfig,
         num_tokens: int,
+        max_padding: int,
     ):
         self.num_hidden_layers = model_config.hf_text_config.num_hidden_layers
         self.num_experts_per_tok = model_config.hf_text_config.num_experts_per_tok
         self.num_tokens = num_tokens
+        self.max_padding = max_padding
 
         self.host_buffer = np.zeros(
             (
@@ -81,6 +85,10 @@ class _RoutedExpertsCapturerReal(RoutedExpertsCapturer):
                 self.num_experts_per_tok,
             ),
             dtype=np.int32,
+        )
+        # Note: self.dummy_expert_ids is used to models whose some of layers are not MoE, like inclusionAI/Ling-mini-2.0
+        self.dummy_experts_ids = np.full(
+            (self.max_padding, self.num_experts_per_tok), fill_value=-1, dtype=np.int32
         )
 
         """Common logging and memory usage computation for captured experts buffers."""
@@ -105,7 +113,10 @@ class _RoutedExpertsCapturerReal(RoutedExpertsCapturer):
         topk_ids_cpu = jax.device_get(topk_ids)
 
         for layer_idx, ids_cpu in enumerate(topk_ids_cpu):
-            valid_ids = ids_cpu[:unpadded_input_len, : self.num_experts_per_tok]
+            if ids_cpu is None:
+                valid_ids = self.dummy_experts_ids[:unpadded_input_len]
+            else:
+                valid_ids = ids_cpu[:unpadded_input_len, : self.num_experts_per_tok]
             self.host_buffer[layer_idx, valid_out_cache_loc_cpu, :] = valid_ids
 
     def get_routed_experts(

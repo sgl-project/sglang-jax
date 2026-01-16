@@ -268,8 +268,6 @@ class DetokenizerManager:
 
         output_routed_experts = self._extract_routed_experts(recv_obj)
 
-        # print(f"[detokenizer_manager_handle_batch_token_id_out] {output_routed_experts=}, {recv_obj.output_routed_experts=}")
-
         return BatchStrOut(
             rids=recv_obj.rids,
             finished_reasons=recv_obj.finished_reasons,

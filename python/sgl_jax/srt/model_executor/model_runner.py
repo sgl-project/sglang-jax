@@ -76,6 +76,7 @@ class ModelRunner:
         req_to_token_pool: ReqToTokenPool | None = None,
         token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator | None = None,
         rngs: nnx.Rngs = None,
+        max_padding: int = 1,
     ):
         # Parse args
         self.is_draft_worker = is_draft_worker
@@ -103,6 +104,8 @@ class ModelRunner:
 
         # For sampling
         self.use_sort_for_toppk_minp = server_args.use_sort_for_toppk_minp
+
+        self.max_padding = max_padding
 
         # Global vars
         global_server_args_dict.update(
@@ -173,6 +176,7 @@ class ModelRunner:
                 enable=self.server_args.enable_return_routed_experts,
                 model_config=self.model_config,
                 num_tokens=self.max_total_num_tokens + self.page_size,
+                max_padding=self.max_padding,
             )
         )
 

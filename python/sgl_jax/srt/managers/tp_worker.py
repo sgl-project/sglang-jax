@@ -93,6 +93,9 @@ class ModelWorker:
         else:
             self.random_seed = server_args.random_seed
 
+        self.max_prefill_tokens = server_args.max_prefill_tokens
+        self.chunked_prefill_size = server_args.chunked_prefill_size
+
         # init model runner
         self.model_runner = ModelRunner(
             model_config=self.model_config,
@@ -103,6 +106,7 @@ class ModelWorker:
             is_draft_worker=is_draft_worker,
             req_to_token_pool=req_to_token_pool,
             rngs=nnx.Rngs(self.random_seed),
+            max_padding=max(self.max_prefill_tokens, self.chunked_prefill_size),
         )
 
         # set infer devices
@@ -110,8 +114,6 @@ class ModelWorker:
 
         # Profile number of tokens
         self.max_total_num_tokens = self.model_runner.max_total_num_tokens
-        self.max_prefill_tokens = server_args.max_prefill_tokens
-        self.chunked_prefill_size = server_args.chunked_prefill_size
 
         # Calculate max_running_requests from different constraints
         attn_backend_limit = self.model_runner.attn_backend.get_max_running_reqests(
