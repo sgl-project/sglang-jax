@@ -282,25 +282,28 @@ class EPMoE(nnx.Module):
         if self.quantized_dtype is None:
             return
 
+        # Replace original weights with quantized versions
         with jax.sharding.use_abstract_mesh(self.updated_mesh):
             # Quantize weights
             w0_value, w0_scale = quantize_tensor(
                 self.quantized_dtype,
                 self.wi_0.value,
                 axis=2,
+                pad_tensor=True,
             )
             w1_value, w1_scale = quantize_tensor(
                 self.quantized_dtype,
                 self.wi_1.value,
                 axis=2,
+                pad_tensor=True,
             )
             wo_value, wo_scale = quantize_tensor(
                 self.quantized_dtype,
                 self.wo.value,
                 axis=2,
+                pad_tensor=True,
             )
 
-            # Replace original weights with quantized versions
             self.wi_0 = nnx.Param(w0_value, out_sharding=P("expert", "tensor", None))
             self.wi_1 = nnx.Param(w1_value, out_sharding=P("expert", "tensor", None))
             self.wo = nnx.Param(wo_value, out_sharding=P("expert", None, "tensor"))
@@ -480,8 +483,8 @@ class EPMoE(nnx.Module):
             return empty_output
 
         m, k = x.shape[0], x.shape[1]
-        n_gate = w0_kernel.shape[2]
-        n_down = wo_kernel.shape[2]
+        n_gate = w0_kernel.shape[1]
+        n_down = wo_kernel.shape[1]
 
         default_tile_size = (512, 1024, 1024)
         tiling_gate = (
