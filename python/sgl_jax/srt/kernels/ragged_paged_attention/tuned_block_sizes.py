@@ -5,7 +5,8 @@ import jax.numpy as jnp
 from sgl_jax.srt.kernels.ragged_paged_attention.util import get_tpu_version
 from sgl_jax.srt.utils.common_utils import next_power_of_2
 from sgl_jax.srt.utils.jax_utils import get_device_name
-
+import logging
+logger = logging.getLogger(__name__)
 # key
 #   - device_name
 #     - q dtype
@@ -1242,10 +1243,10 @@ def get_tuned_block_sizes(
         if device_name in TUNED_BLOCK_SIZES and keys[1:] in TUNED_BLOCK_SIZES[device_name]:
             bkv_p, bq = TUNED_BLOCK_SIZES[device_name][keys[1:]]
         else:
-            print(
+            logger.debug(
                 f"Tuned RPA block sizes not found for {device_name}: {page_size=}, {actual_num_q_heads=}, {actual_num_kv_heads=}, {head_dim=}, {max_num_tokens=}, {pages_per_seq=}."
             )
-            print(f"Using default block size: {bkv_p=}, {bq=}.")
+            logger.debug(f"Using default block size: {bkv_p=}, {bq=}.")
 
     # if bkv_p != 16 or bq != 16:
     #     raise ValueError(
