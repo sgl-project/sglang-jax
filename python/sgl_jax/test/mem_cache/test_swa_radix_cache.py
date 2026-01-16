@@ -71,6 +71,26 @@ class TestSWARadixCache(unittest.TestCase):
             disable=False,
         )
 
+    def _create_swa_allocator(self, dp_size: int):
+        kv_pool = SWAKVPool(
+            size=128,
+            size_swa=128,
+            swa_attention_layer_ids=[0],
+            full_attention_layer_ids=[1],
+            token_to_kv_pool_class=MHATokenToKVPool,
+            page_size=1,
+            dtype=self.dtype,
+            head_num=self.kv_head_num,
+            head_dim=self.head_dim,
+            mesh=self.mesh,
+        )
+        return SWATokenToKVPoolAllocator(
+            size=128,
+            size_swa=128,
+            kvcache=kv_pool,
+            dp_size=dp_size,
+        )
+
     def _alloc_indices(self, n: int) -> np.ndarray:
         idx = self.allocator.alloc(n)
         self.assertIsNotNone(idx)
@@ -316,6 +336,158 @@ class TestSWARadixCache(unittest.TestCase):
         np.testing.assert_array_equal(
             np.asarray(match_plain.device_indices), np.asarray(match_radix.device_indices)
         )
+
+    def test_dp_rank_namespace_isolation(self):
+        """Test that same tokens with different dp_ranks don't share cache"""
+        key = [1, 2, 3, 4, 5]
+
+        # Insert with dp_rank=0
+        value_rank0 = self._alloc_indices(len(key))
+        self.cache.insert(RadixKey(key, None, 0), value=value_rank0, prev_prefix_len=0)
+
+        # Insert with dp_rank=1
+        value_rank1 = self._alloc_indices(len(key))
+        self.cache.insert(RadixKey(key, None, 1), value=value_rank1, prev_prefix_len=0)
+
+        # Match with dp_rank=0 should return value_rank0
+        match_rank0 = self.cache.match_prefix(RadixKey(key, None, 0))
+        np.testing.assert_array_equal(np.asarray(match_rank0.device_indices), value_rank0)
+
+        # Match with dp_rank=1 should return value_rank1
+        match_rank1 = self.cache.match_prefix(RadixKey(key, None, 1))
+        np.testing.assert_array_equal(np.asarray(match_rank1.device_indices), value_rank1)
+
+        # Verify values are different (different cache namespaces)
+        self.assertFalse(np.array_equal(value_rank0, value_rank1))
+
+    def test_dp_rank_none_shared_namespace(self):
+        """Test that dp_rank=None creates a shared namespace"""
+        key = [10, 20, 30]
+
+        # Insert with dp_rank=None
+        value_none = self._alloc_indices(len(key))
+        self.cache.insert(RadixKey(key, None, None), value=value_none, prev_prefix_len=0)
+
+        # Match with dp_rank=None should hit cache
+        match = self.cache.match_prefix(RadixKey(key, None, None))
+        np.testing.assert_array_equal(np.asarray(match.device_indices), value_none)
+
+        # Insert longer sequence with dp_rank=None should reuse prefix
+        longer_key = [10, 20, 30, 40, 50]
+        longer_value = self._alloc_indices(len(longer_key))
+        prefix_len = self.cache.insert(
+            RadixKey(longer_key, None, None), value=longer_value, prev_prefix_len=0
+        )
+        self.assertEqual(prefix_len, 3)  # Reused 3 tokens from cache
+
+    def test_dp_rank_none_vs_explicit_rank(self):
+        """Test that dp_rank=None and dp_rank=0 are different namespaces"""
+        key = [100, 200, 300]
+
+        # Insert with dp_rank=None
+        value_none = self._alloc_indices(len(key))
+        self.cache.insert(RadixKey(key, None, None), value=value_none, prev_prefix_len=0)
+
+        # Insert with dp_rank=0
+        value_rank0 = self._alloc_indices(len(key))
+        self.cache.insert(RadixKey(key, None, 0), value=value_rank0, prev_prefix_len=0)
+
+        # Match with None should return value_none
+        match_none = self.cache.match_prefix(RadixKey(key, None, None))
+        np.testing.assert_array_equal(np.asarray(match_none.device_indices), value_none)
+
+        # Match with 0 should return value_rank0
+        match_rank0 = self.cache.match_prefix(RadixKey(key, None, 0))
+        np.testing.assert_array_equal(np.asarray(match_rank0.device_indices), value_rank0)
+
+        # Verify they are different
+        self.assertFalse(np.array_equal(value_none, value_rank0))
+
+    def test_combined_extra_key_and_dp_rank(self):
+        """Test that extra_key and dp_rank work together for dual isolation"""
+        key = [7, 8, 9]
+
+        # Create 4 different cache namespaces
+        value_lora_a_rank0 = self._alloc_indices(len(key))
+        self.cache.insert(RadixKey(key, "lora_a", 0), value=value_lora_a_rank0, prev_prefix_len=0)
+
+        value_lora_a_rank1 = self._alloc_indices(len(key))
+        self.cache.insert(RadixKey(key, "lora_a", 1), value=value_lora_a_rank1, prev_prefix_len=0)
+
+        value_lora_b_rank0 = self._alloc_indices(len(key))
+        self.cache.insert(RadixKey(key, "lora_b", 0), value=value_lora_b_rank0, prev_prefix_len=0)
+
+        value_lora_b_rank1 = self._alloc_indices(len(key))
+        self.cache.insert(RadixKey(key, "lora_b", 1), value=value_lora_b_rank1, prev_prefix_len=0)
+
+        # Verify each combination returns its own value
+        match = self.cache.match_prefix(RadixKey(key, "lora_a", 0))
+        np.testing.assert_array_equal(np.asarray(match.device_indices), value_lora_a_rank0)
+
+        match = self.cache.match_prefix(RadixKey(key, "lora_a", 1))
+        np.testing.assert_array_equal(np.asarray(match.device_indices), value_lora_a_rank1)
+
+        match = self.cache.match_prefix(RadixKey(key, "lora_b", 0))
+        np.testing.assert_array_equal(np.asarray(match.device_indices), value_lora_b_rank0)
+
+        match = self.cache.match_prefix(RadixKey(key, "lora_b", 1))
+        np.testing.assert_array_equal(np.asarray(match.device_indices), value_lora_b_rank1)
+
+        # Verify all values are different
+        values = [value_lora_a_rank0, value_lora_a_rank1, value_lora_b_rank0, value_lora_b_rank1]
+        for i, v1 in enumerate(values):
+            for v2 in values[i + 1 :]:
+                self.assertFalse(np.array_equal(v1, v2))
+
+    def test_dp_rank_preserves_on_slicing(self):
+        """Test that RadixKey slicing preserves both extra_key and dp_rank"""
+        key = RadixKey([1, 2, 3, 4, 5], "test_key", 2)
+
+        # Test slicing
+        sliced = key[2:]
+        self.assertEqual(sliced.token_ids, [3, 4, 5])
+        self.assertEqual(sliced.extra_key, "test_key")
+        self.assertEqual(sliced.dp_rank, 2)
+
+        # Test single index access returns RadixKey with dp_rank
+        single = key[0]
+        self.assertEqual(single.token_ids, [1])
+        self.assertEqual(single.extra_key, "test_key")
+        self.assertEqual(single.dp_rank, 2)
+
+    def test_swa_free_group_batching_multi_rank(self):
+        """Test SWA allocator free_group batching for multiple DP ranks."""
+        dp_size = 2
+        allocator = self._create_swa_allocator(dp_size=dp_size)
+
+        initial_full = [allocator.full_available_size(dp_rank=r) for r in range(dp_size)]
+        initial_swa = [allocator.swa_available_size(dp_rank=r) for r in range(dp_size)]
+
+        alloc_size = 4
+        alloc_r0 = allocator.alloc(alloc_size, dp_rank=0)
+        alloc_r1 = allocator.alloc(alloc_size, dp_rank=1)
+        self.assertIsNotNone(alloc_r0)
+        self.assertIsNotNone(alloc_r1)
+
+        allocator.free_group_begin()
+        self.assertIsInstance(allocator.free_group, list)
+        self.assertEqual(len(allocator.free_group), dp_size)
+        for rank in range(dp_size):
+            self.assertEqual(allocator.free_group[rank], [])
+
+        allocator.free(alloc_r0, dp_rank=0)
+        allocator.free(alloc_r1, dp_rank=1)
+
+        self.assertEqual(allocator.full_available_size(dp_rank=0), initial_full[0] - alloc_size)
+        self.assertEqual(allocator.full_available_size(dp_rank=1), initial_full[1] - alloc_size)
+        self.assertEqual(allocator.swa_available_size(dp_rank=0), initial_swa[0] - alloc_size)
+        self.assertEqual(allocator.swa_available_size(dp_rank=1), initial_swa[1] - alloc_size)
+
+        allocator.free_group_end()
+        self.assertEqual(allocator.full_available_size(dp_rank=0), initial_full[0])
+        self.assertEqual(allocator.full_available_size(dp_rank=1), initial_full[1])
+        self.assertEqual(allocator.swa_available_size(dp_rank=0), initial_swa[0])
+        self.assertEqual(allocator.swa_available_size(dp_rank=1), initial_swa[1])
 
 
 if __name__ == "__main__":
