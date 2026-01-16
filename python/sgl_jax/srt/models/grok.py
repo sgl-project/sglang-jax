@@ -920,21 +920,21 @@ class Grok1ForCausalLM(nnx.Module):
             )
 
             sharding = (
-                ("expert", "tensor", None) if target_name == "wo" else ("expert", None, "tensor")
+                ("expert", None, "tensor") if target_name == "wo" else ("expert", "tensor", None)
             )
 
             if name == "w2":
                 # w2 (down_proj) -> wo: HF shape (8192, 2048), concat -> (8192, 16384), transpose -> (16384, 8192)
                 mappings[f"__MOE_EXPERTS__{prefix}.block_sparse_moe.experts.{target_name}"] = (
                     WeightMapping(
-                        target_path=target_path, sharding=sharding, transpose=True, concat_axis=-1
+                        target_path=target_path, sharding=sharding, transpose=False, concat_axis=-1
                     )
                 )
             else:
                 # w1/w3 (gate/up) -> wi_0/wi_1: HF shape (2048, 8192), concat -> (16384, 8192), transpose -> (8192, 16384)
                 mappings[f"__MOE_EXPERTS__{prefix}.block_sparse_moe.experts.{target_name}"] = (
                     WeightMapping(
-                        target_path=target_path, sharding=sharding, transpose=True, concat_axis=0
+                        target_path=target_path, sharding=sharding, transpose=False, concat_axis=0
                     )
                 )
 

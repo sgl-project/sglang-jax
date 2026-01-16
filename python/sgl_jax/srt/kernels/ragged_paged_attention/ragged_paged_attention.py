@@ -1483,7 +1483,7 @@ def ragged_paged_attention(
             actual_num_kv_heads,
             head_dim,
             page_size,
-            max_num_tokens,
+            8192,
             pages_per_seq,
             causal,
         )
