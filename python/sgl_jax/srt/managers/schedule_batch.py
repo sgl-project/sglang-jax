@@ -20,6 +20,7 @@ ScheduleBatch -> ModelWorkerBatch -> ForwardBatch
 import dataclasses
 import logging
 import threading
+from enum import Enum, auto
 from http import HTTPStatus
 from typing import TYPE_CHECKING, Any
 
@@ -51,6 +52,7 @@ from sgl_jax.srt.precision_tracer import (
 from sgl_jax.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sgl_jax.srt.sampling.sampling_params import DEFAULT_SAMPLING_SEED, SamplingParams
 from sgl_jax.srt.server_args import ServerArgs
+from sgl_jax.srt.utils import flatten_nested_list
 
 if TYPE_CHECKING:
     from sgl_jax.srt.speculative.eagle_util import EagleDraftInput, EagleVerifyInput
@@ -147,6 +149,265 @@ class FINISH_ABORT(BaseFinishReason):
         }
 
 
+class Modality(Enum):
+    IMAGE = auto()
+    MULTI_IMAGES = auto()
+    VIDEO = auto()
+    AUDIO = auto()
+
+    @staticmethod
+    def from_str(modality_str: str):
+        try:
+            return Modality[modality_str.upper()]
+        except KeyError as err:
+            raise ValueError(
+                f"Invalid modality string: {modality_str}. Valid modalities are: {[m.name for m in Modality]}"
+            ) from err
+
+    @staticmethod
+    def all():
+        return [Modality.IMAGE, Modality.VIDEO, Modality.AUDIO]
+
+
+@dataclasses.dataclass
+class MultimodalDataItem:
+    """
+    One MultimodalDataItem contains all inputs of one modality.
+    For example, if there are 3 images and 1 audio input, there will be 2 MultimodalDataItems: one for images, one for audio.
+
+    Common fields are placed at the front, model-specific fields are in model_specific_data.
+    """
+
+    modality: Modality
+    hash: int | None = None
+    pad_value: int | None = None
+    offsets: list | None = None
+
+    # Raw features returned by processor, e.g. pixel_values or audio_features
+    feature: jax.Array | np.ndarray | None = None
+    # Precomputed embeddings passed as final encoder embeddings
+    # Only one of feature and precomputed_embeddings is non-empty
+    precomputed_embeddings: jax.Array | np.ndarray | None = None
+
+    # Model-specific data stored in dictionary
+    model_specific_data: dict[str, Any] = dataclasses.field(default_factory=dict)
+
+    def __getattr__(self, name: str):
+        if "model_specific_data" in self.__dict__ and name in self.__dict__["model_specific_data"]:
+            return self.__dict__["model_specific_data"][name]
+        else:
+            raise AttributeError(f"'{self.__class__.__name__}' object has no attribute '{name}'")
+
+    def __setitem__(self, key: str, value: Any):
+        if key in self.__dict__:
+            self.__dict__[key] = value
+        else:
+            self.model_specific_data[key] = value
+
+    def set(self, key: str, value: Any):
+        self.__setitem__(key, value)
+
+    @staticmethod
+    def is_empty_list(lst):
+        if lst is None:
+            return True
+        return len([item for item in flatten_nested_list(lst) if item is not None]) == 0
+
+    def set_pad_value(self):
+        """
+        Set padding value after hashing the data first
+        """
+        from sgl_jax.srt.managers.mm_utils import hash_feature
+
+        if self.hash is None:
+            if self.feature is not None:
+                hashed_feature = self.feature
+            else:
+                hashed_feature = self.precomputed_embeddings
+            self.hash = hash_feature(hashed_feature)
+        assert self.hash is not None
+        # Use a smaller modulo to keep pad_value in a reasonable range
+        # The pad_value is used for radix cache differentiation, not for embedding lookup
+        # We use a 24-bit range which gives ~16M unique values, sufficient for cache keys
+        self.pad_value = self.hash % (1 << 24)
+
+    def is_modality(self, modality: Modality) -> bool:
+        return self.modality == modality
+
+    def is_audio(self):
+        return self.modality == Modality.AUDIO
+
+    def is_image(self):
+        return self.modality in [Modality.IMAGE, Modality.MULTI_IMAGES]
+
+    def is_video(self):
+        return self.modality == Modality.VIDEO
+
+    def is_valid(self) -> bool:
+        return self.is_image() or self.is_video() or self.is_audio()
+
+    def validate(self):
+        # TODO: Implement validation logic
+        pass
+
+    @staticmethod
+    def from_dict(obj: dict):
+        kwargs = dict(obj)
+        modality = kwargs.pop("modality")
+        if isinstance(modality, str):
+            modality = Modality[modality]
+        ret = MultimodalDataItem(modality=modality, **kwargs)
+        ret.validate()
+        return ret
+
+    def merge(self, other):
+        # Merge features (handle JAX arrays and NumPy arrays)
+        if self.feature is not None and other.feature is not None:
+            if isinstance(self.feature, jax.Array) and isinstance(other.feature, jax.Array):
+                self.feature = jnp.concatenate([self.feature, other.feature], axis=0)
+            elif isinstance(self.feature, np.ndarray) and isinstance(other.feature, np.ndarray):
+                self.feature = np.concatenate([self.feature, other.feature], axis=0)
+            else:
+                # Convert to JAX arrays for mixed types
+                self.feature = jnp.concatenate(
+                    [jax.device_put(self.feature), jax.device_put(other.feature)], axis=0
+                )
+
+        # Merge offsets
+        if self.offsets is not None and other.offsets is not None:
+            self.offsets += other.offsets
+
+        # Update hash
+        self.hash = hash((self.hash, other.hash))
+        self.set_pad_value()
+
+
+@dataclasses.dataclass
+class MultimodalInputs:
+    """Inputs related to multimodal data"""
+
+    # List of data items
+    mm_items: list[MultimodalDataItem]
+    image_pad_len: list | None = None
+    num_image_tokens: int | None = None
+
+    # Image-related
+    im_token_id: int | None = None
+    im_start_id: int | None = None
+    im_end_id: int | None = None
+    slice_start_id: int | None = None
+    slice_end_id: int | None = None
+
+    # Video-related
+    video_token_id: int | None = None
+
+    # Audio-related
+    audio_token_id: int | None = None
+    audio_start_id: int | None = None
+    audio_end_id: int | None = None
+
+    # QWen2-VL related
+    mrope_positions: jax.Array | None = None
+    mrope_position_delta: jax.Array | None = None
+
+    @staticmethod
+    def from_dict(obj: dict):
+        mm_items = []
+        for item_data in obj.get("mm_items", []):
+            if isinstance(item_data, dict):
+                mm_items.append(MultimodalDataItem.from_dict(item_data))
+            elif isinstance(item_data, MultimodalDataItem):
+                mm_items.append(item_data)
+
+        ret = MultimodalInputs(
+            mm_items=mm_items,
+        )
+
+        ret.mm_items = [item for item in ret.mm_items if item.is_valid()]
+        for item in ret.mm_items:
+            item.set_pad_value()
+
+        optional_args = [
+            "mrope_positions",
+            "mrope_position_delta",
+            "im_token_id",
+            "im_start_id",
+            "im_end_id",
+            "video_token_id",
+            "slice_start_id",
+            "slice_end_id",
+            "audio_start_id",
+            "audio_end_id",
+            "audio_token_id",
+            "image_pad_len",
+            "num_image_tokens",
+        ]
+        for arg in optional_args:
+            if arg in obj:
+                value = obj[arg]
+                if isinstance(value, (np.ndarray, jax.Array)):
+                    setattr(ret, arg, jax.device_put(value))
+                else:
+                    setattr(ret, arg, value)
+
+        return ret
+
+    def contains_image_inputs(self) -> bool:
+        return any(item.is_image() for item in self.mm_items)
+
+    def contains_video_inputs(self) -> bool:
+        return any(item.is_video() for item in self.mm_items)
+
+    def contains_audio_inputs(self) -> bool:
+        return any(item.is_audio() for item in self.mm_items)
+
+    def contains_mm_input(self) -> bool:
+        return any(True for item in self.mm_items if item.is_valid())
+
+    def merge(self, other: MultimodalInputs):
+        """
+        Merge multimodal inputs when merging requests
+        """
+        # Parameters to merge
+        if self.image_pad_len is not None and other.image_pad_len is not None:
+            self.image_pad_len += other.image_pad_len
+
+        # Merge mm_items
+        self.mm_items += other.mm_items
+
+        # Merge mrope_positions (JAX array handling)
+        if self.mrope_positions is not None:
+            if other.mrope_positions is not None:
+                self.mrope_positions = jnp.concatenate(
+                    [self.mrope_positions, other.mrope_positions], axis=1
+                )
+        else:
+            self.mrope_positions = other.mrope_positions
+
+        # Merge mrope_position_delta (JAX array handling)
+        if self.mrope_position_delta is not None:
+            if other.mrope_position_delta is not None:
+                self.mrope_position_delta = jnp.concatenate(
+                    [self.mrope_position_delta, other.mrope_position_delta], axis=0
+                )
+        else:
+            self.mrope_position_delta = other.mrope_position_delta
+
+        # Merge token id related parameters (keep non-None values)
+        for key in dir(self):
+            if "_id" in key and not key.startswith("__"):
+                self_val = getattr(self, key, None)
+                other_val = getattr(other, key, None)
+                if self_val is None and other_val is not None:
+                    setattr(self, key, other_val)
+
+        # Merge other numeric parameters
+        if self.num_image_tokens is not None and other.num_image_tokens is not None:
+            self.num_image_tokens += other.num_image_tokens
+        elif self.num_image_tokens is None:
+            self.num_image_tokens = other.num_image_tokens
+
+
 class Req:
     """The input and output status of a request."""
 
@@ -177,6 +438,10 @@ class Req:
             else origin_input_ids  # Before image padding
         )
         self.origin_input_ids = origin_input_ids
+        # Cache input IDs with hash-based values for multimodal placeholder tokens
+        # Used for radix cache matching to differentiate different images/videos
+        # If None, origin_input_ids is used for cache matching
+        self.cache_input_ids: list[int] | None = None
         # Each decode stage's output ids
         self.output_ids = []
         # fill_ids = origin_input_ids + output_ids. Updated if chunked.
@@ -372,6 +637,13 @@ class Req:
             max_prefix_len = min(max_prefix_len, self.logprob_start_len)
 
         max_prefix_len = max(max_prefix_len, 0)
+
+        # Use cache_input_ids for cache matching if available (multimodal requests)
+        # This contains hash-based values instead of placeholder tokens
+        cache_ids = getattr(self, "cache_input_ids", None)
+        if cache_ids is not None:
+            cache_fill_ids = cache_ids + self.output_ids
+            return cache_fill_ids[:max_prefix_len]
         return self.fill_ids[:max_prefix_len]
 
     # Based on https://github.com/vllm-project/vllm/blob/7a64d24aad69e4d2548aa0bf528d9fe63428ab01/vllm/transformers_utils/detokenizer.py#L194-L313
@@ -1354,6 +1626,52 @@ class ScheduleBatch:
         # Pad lora_ids to match seq_lens_cpu length (after bs padding)
         if bs_padding_size > 0:
             lora_ids = lora_ids + [None] * bs_padding_size
+        pixel_values = None
+        image_grid_thw = None
+        video_grid_thw = None
+        cached_vision_embeds = None
+        reqs_with_vision = []
+        if self.forward_mode == ForwardMode.EXTEND:
+            # Collect multimodal data from all requests in the batch
+            pixel_values_list = []
+            image_grid_thw_list = []
+            video_grid_thw_list = []
+            cached_vision_embeds_list = []
+            for req in self.reqs:
+                # Check for cached vision embeddings first (for chunked prefill)
+                if hasattr(req, "cached_vision_embeds") and req.cached_vision_embeds is not None:
+                    cached_vision_embeds_list.append(req.cached_vision_embeds)
+                    reqs_with_vision.append(req)
+                    # Still need grid info for embedding merge
+                    if hasattr(req, "image_grid_thw") and req.image_grid_thw is not None:
+                        for thw in req.image_grid_thw:
+                            image_grid_thw_list.append(thw)
+                    if hasattr(req, "video_grid_thw") and req.video_grid_thw is not None:
+                        for thw in req.video_grid_thw:
+                            video_grid_thw_list.append(thw)
+                elif hasattr(req, "pixel_values") and req.pixel_values is not None:
+                    pixel_values_list.append(req.pixel_values)
+                    reqs_with_vision.append(req)
+                    # Collect image grid data
+                    if hasattr(req, "image_grid_thw") and req.image_grid_thw is not None:
+                        # req.image_grid_thw is a tuple of (t, h, w) tuples, one per image
+                        # e.g., ((1, 98, 146), (1, 98, 146)) for 2 images
+                        for thw in req.image_grid_thw:
+                            image_grid_thw_list.append(thw)
+                    # Collect video grid data
+                    if hasattr(req, "video_grid_thw") and req.video_grid_thw is not None:
+                        # req.video_grid_thw is a tuple of (t, h, w) tuples, one per video
+                        # e.g., ((8, 98, 146),) for 1 video with 8 frames
+                        for thw in req.video_grid_thw:
+                            video_grid_thw_list.append(thw)
+
+            if pixel_values_list:
+                pixel_values = np.concatenate(pixel_values_list, axis=0)
+            if cached_vision_embeds_list:
+                cached_vision_embeds = np.concatenate(cached_vision_embeds_list, axis=0)
+            if image_grid_thw_list or video_grid_thw_list:
+                image_grid_thw = tuple(image_grid_thw_list) if image_grid_thw_list else None
+                video_grid_thw = tuple(video_grid_thw_list) if video_grid_thw_list else None
 
         return ModelWorkerBatch(
             bid=bid,
@@ -1385,6 +1703,12 @@ class ScheduleBatch:
             real_bs=real_bs,
             capture_hidden_mode=CaptureHiddenMode.NULL,
             launch_done=self.launch_done,
+            input_embeds=None,  # Will be computed in model forward pass
+            pixel_values=pixel_values,
+            image_grid_thw=image_grid_thw,
+            video_grid_thw=video_grid_thw,
+            cached_vision_embeds=cached_vision_embeds,
+            reqs_with_vision=reqs_with_vision if reqs_with_vision else None,
         )
 
     def get_spec_model_worker_batch(
@@ -1729,6 +2053,222 @@ class ModelWorkerBatch:
     capture_hidden_mode: CaptureHiddenMode = None
 
     tree_cache: BasePrefixCache = None
+
+    # The input Embeds
+    input_embeds: np.ndarray | None = None
+
+    # Multimodal data (for computing embeddings in forward pass)
+    pixel_values: np.ndarray | None = None
+    image_grid_thw: tuple | None = None
+    video_grid_thw: tuple | None = None
+    # Cached vision embeddings for chunked prefill (avoids re-running ViT)
+    cached_vision_embeds: np.ndarray | None = None
+    # List of requests with vision data (for caching embeddings back after computation)
+    reqs_with_vision: list | None = None
+
+    def padding_model_worker_batch(
+        self,
+        token_paddings: list,
+        bs_paddings: list,
+        cache_loc_paddings: list,
+    ):
+        if self.forward_mode.is_decode_or_idle():
+            token_paddings = bs_paddings
+        else:
+            bs_paddings = bs_paddings[-1:]
+            cache_loc_paddings = cache_loc_paddings[-1:]
+        # padding seq
+        # extend & decode: input_ids, positions, out_cache_loc, cache_loc
+        padding_size = 0
+        token_paddings.sort()
+        for size in token_paddings:
+            if size >= len(self.input_ids):
+                padding_size = size - len(self.input_ids)
+                break
+        if padding_size >= 0:
+            input_ids_cpu = np.concat(
+                [
+                    self.input_ids,
+                    np.array([0] * padding_size, dtype=self.input_ids.dtype),
+                ],
+                axis=0,
+            )
+        padded_input_ids_len = len(input_ids_cpu)
+        out_cache_loc_num_to_padding = padded_input_ids_len - len(self.out_cache_loc)
+        if out_cache_loc_num_to_padding >= 0:
+            out_cache_loc_cpu = np.concatenate(
+                [
+                    self.out_cache_loc,
+                    np.array(
+                        [-1] * out_cache_loc_num_to_padding,
+                        dtype=self.out_cache_loc.dtype,
+                    ),
+                ],
+                axis=0,
+            )
+        else:
+            # this maybe more than input_ids when eagle, but it will always be fix shape, so we should'd padding this
+            out_cache_loc_cpu = self.out_cache_loc
+        # todo padding position
+        seq_lens_cpu = self.seq_lens
+        bs_padding_size = 0
+        bs_paddings.sort()
+        select_bs_index = -1
+        for i, size in enumerate(bs_paddings):
+            if size >= len(seq_lens_cpu):
+                bs_padding_size = size - len(seq_lens_cpu)
+                select_bs_index = i
+                break
+        # offset = np.sum(seq_lens_cpu[seq_lens_cpu > 0]) if len(seq_lens_cpu) > 0 else 0
+
+        total_cache_loc_size = cache_loc_paddings[select_bs_index]
+        assert total_cache_loc_size >= len(self.cache_loc)
+
+        cache_loc_cpu = np.empty(total_cache_loc_size, dtype=np.int32)
+        if len(self.cache_loc) > 0:
+            cache_loc_cpu[: len(self.cache_loc)] = self.cache_loc
+        # Initialize padding area to ensure multiprocess consistency
+        if len(self.cache_loc) < total_cache_loc_size:
+            cache_loc_cpu[len(self.cache_loc) :] = 0
+        extend_start_loc = self.extend_start_loc
+        extend_prefix_lens = self.extend_prefix_lens
+        extend_seq_lens = self.extend_seq_lens
+        req_pool_indices_cpu = self.req_pool_indices
+        if bs_padding_size > 0:
+            invalid_req_pool_indices = np.array(
+                [-1] * bs_padding_size, dtype=self.req_pool_indices.dtype
+            )
+            req_pool_indices_cpu = np.concat(
+                [
+                    self.req_pool_indices,
+                    invalid_req_pool_indices,
+                ],
+                axis=0,
+            )
+            invalid_seq_lens = np.array([0] * bs_padding_size, dtype=seq_lens_cpu.dtype)
+            seq_lens_cpu = np.concat([seq_lens_cpu, invalid_seq_lens], axis=0)
+            if self.forward_mode.is_extend():
+                invalid_extend_start_loc = np.array(
+                    [self.extend_start_loc[-1] + self.extend_seq_lens[-1]] * bs_padding_size,
+                    dtype=(
+                        self.extend_start_loc.dtype
+                        if self.extend_start_loc is not None
+                        else np.int32
+                    ),
+                )
+                extend_start_loc = np.concat(
+                    [self.extend_start_loc, invalid_extend_start_loc], axis=0
+                )
+                invalid_extend_prefix_lens = np.array(
+                    [0] * bs_padding_size,
+                    dtype=np.int32,
+                )
+                extend_prefix_lens = (
+                    np.concat([self.extend_prefix_lens, invalid_extend_prefix_lens], axis=0)
+                    if self.extend_prefix_lens is not None
+                    and invalid_extend_prefix_lens.shape[0] > 0
+                    and self.extend_prefix_lens.shape[0] > 0
+                    else self.extend_prefix_lens
+                )
+                invalid_extend_seq_lens = np.array(
+                    [0] * bs_padding_size,
+                    dtype=(
+                        self.extend_seq_lens.dtype if self.extend_seq_lens is not None else np.int32
+                    ),
+                )
+                extend_seq_lens = (
+                    np.concat([self.extend_seq_lens, invalid_extend_seq_lens], axis=0)
+                    if self.extend_seq_lens is not None
+                    and invalid_extend_seq_lens.shape[0] > 0
+                    and self.extend_seq_lens.shape[0] > 0
+                    else self.extend_seq_lens
+                )
+            else:
+                invalid_extend_start_loc = np.array(
+                    [len(seq_lens_cpu)] * bs_padding_size,
+                    dtype=(
+                        self.extend_start_loc.dtype
+                        if self.extend_start_loc is not None
+                        else np.int32
+                    ),
+                )
+                extend_start_loc = np.concat(
+                    [self.extend_start_loc, invalid_extend_start_loc], axis=0
+                )
+                # padding
+        sampling_info = self.sampling_info
+        if self.sampling_info:
+            new_temperatures = np.concatenate(
+                [
+                    sampling_info.temperatures.reshape(sampling_info.temperatures.shape[0]),
+                    np.array([1.0] * bs_padding_size, dtype=sampling_info.temperatures.dtype),
+                ]
+            ).reshape(-1, 1)
+            new_top_ps = np.concatenate(
+                [
+                    sampling_info.top_ps,
+                    np.array([1.0] * bs_padding_size, dtype=sampling_info.top_ps.dtype),
+                ]
+            )
+            new_top_ks = np.concatenate(
+                [
+                    sampling_info.top_ks,
+                    np.array([1] * bs_padding_size, dtype=sampling_info.top_ks.dtype),
+                ]
+            )
+            new_min_ps = np.concatenate(
+                [
+                    sampling_info.min_ps,
+                    np.array([0.0] * bs_padding_size, dtype=sampling_info.min_ps.dtype),
+                ]
+            )
+            updates = {
+                "temperatures": new_temperatures,
+                "top_ps": new_top_ps,
+                "top_ks": new_top_ks,
+                "min_ps": new_min_ps,
+                # "grammars": ([req.grammar for req in self.reqs] if self.has_grammar else None),
+            }
+            if sampling_info.sampling_seeds is not None:
+                updates["sampling_seeds"] = np.concatenate(
+                    [
+                        sampling_info.sampling_seeds,
+                        np.array(
+                            [DEFAULT_SAMPLING_SEED] * bs_padding_size,
+                            dtype=sampling_info.sampling_seeds.dtype,
+                        ),
+                    ]
+                )
+            sampling_info = dataclasses.replace(sampling_info, **updates)
+        padding_size = 0
+        if (
+            self.forward_mode == ForwardMode.DRAFT_EXTEND
+            or self.forward_mode == ForwardMode.TARGET_VERIFY
+        ):
+            padding_size = len(input_ids_cpu) - len(self.positions)
+        elif self.forward_mode == ForwardMode.EXTEND or self.forward_mode == ForwardMode.MIXED:
+            total_tokens_before_padding = sum([extend_len for extend_len in extend_seq_lens])
+            padding_size = len(input_ids_cpu) - total_tokens_before_padding
+        elif not self.spec_algorithm.is_none() and self.forward_mode == ForwardMode.DECODE:
+            padding_size = len(input_ids_cpu) - len(self.positions)
+        else:
+            pass
+        if padding_size >= 0:
+            zeros_pad = np.zeros(padding_size, dtype=np.int32)
+            positions_cpu = np.concatenate([self.positions, zeros_pad], axis=0)
+        if len(positions_cpu) > len(input_ids_cpu):
+            positions_cpu = self.positions[: len(input_ids_cpu)]
+
+        self.seq_lens = seq_lens_cpu
+        self.extend_start_loc = extend_start_loc
+        self.extend_prefix_lens = extend_prefix_lens
+        self.extend_seq_lens = extend_seq_lens if self.forward_mode.is_extend() else None
+        self.cache_loc = cache_loc_cpu
+        self.input_ids = input_ids_cpu
+        self.out_cache_loc = out_cache_loc_cpu
+        self.req_pool_indices = req_pool_indices_cpu
+        self.positions = positions_cpu
+        self.sampling_info = sampling_info
 
 
 def get_last_loc(

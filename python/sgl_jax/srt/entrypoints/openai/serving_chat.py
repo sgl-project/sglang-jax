@@ -70,13 +70,19 @@ class OpenAIServingChat(OpenAIServingBase):
         )
 
         # Handle single vs multiple requests
-        if isinstance(processed_messages.prompt_ids, str):
-            prompt_kwargs = {"text": processed_messages.prompt_ids}
+        if is_multimodal:
+            prompt_kwargs = {"text": processed_messages.prompt}
         else:
-            prompt_kwargs = {"input_ids": processed_messages.prompt_ids}
+            if isinstance(processed_messages.prompt_ids, str):
+                prompt_kwargs = {"text": processed_messages.prompt_ids}
+            else:
+                prompt_kwargs = {"input_ids": processed_messages.prompt_ids}
 
         adapted_request = GenerateReqInput(
             **prompt_kwargs,
+            image_data=processed_messages.image_data,
+            video_data=processed_messages.video_data,
+            audio_data=processed_messages.audio_data,
             sampling_params=sampling_params,
             return_logprob=request.logprobs,
             logprob_start_len=-1,

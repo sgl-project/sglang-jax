@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 class WeightMapping:
     target_path: str | list[str]
     sharding: tuple | None = None
-    transpose: bool = False
+    transpose: bool | tuple = False  # False, True (for 2D), or tuple of axes for permutation
     reshape: tuple | None = None
     head_dim_padding: bool = False
     kv_head_padding: bool = False
@@ -522,9 +522,17 @@ class WeightLoader:
 
                 if can_optimize:
                     try:
-                        if mapping.transpose and len(mapping.sharding) == 2:
-                            # Swap: (dim0, dim1) -> (dim1, dim0)
-                            sharding_tuple = mapping.sharding[::-1]
+                        if mapping.transpose:
+                            if isinstance(mapping.transpose, tuple):
+                                # For multi-dimensional transpose (e.g., Conv layers),
+                                # we need to adjust sharding according to the permutation
+                                # For now, use the original sharding without adjustment
+                                sharding_tuple = mapping.sharding
+                            elif len(mapping.sharding) == 2:
+                                # For 2D transpose, swap the sharding dimensions
+                                sharding_tuple = mapping.sharding[::-1]
+                            else:
+                                sharding_tuple = mapping.sharding
                         else:
                             sharding_tuple = mapping.sharding
 
@@ -551,7 +559,12 @@ class WeightLoader:
                             lazy_weight = lazy_arrays[0]
 
                         if mapping.transpose:
-                            lazy_weight = jnp.transpose(lazy_weight, (1, 0))
+                            if isinstance(mapping.transpose, tuple):
+                                # Custom permutation (e.g., for Conv layers)
+                                lazy_weight = jnp.transpose(lazy_weight, mapping.transpose)
+                            else:
+                                # Standard 2D transpose
+                                lazy_weight = jnp.transpose(lazy_weight, (1, 0))
 
                         if "lm_head" in hf_key and hasattr(
                             self.model_config.hf_config, "output_multiplier_scale"
@@ -702,7 +715,12 @@ class WeightLoader:
                         )
 
                         if mapping.transpose:
-                            expert_weight = jnp.transpose(expert_weight, (1, 0))
+                            if isinstance(mapping.transpose, tuple):
+                                # Custom permutation (e.g., for Conv layers)
+                                expert_weight = jnp.transpose(expert_weight, mapping.transpose)
+                            else:
+                                # Standard 2D transpose
+                                expert_weight = jnp.transpose(expert_weight, (1, 0))
 
                         collected_experts.append(expert_weight)
 
@@ -724,6 +742,56 @@ class WeightLoader:
 
         nnx.update(self.model, params)
         logger.info("All weights loaded successfully.")
+
+    def _process_single_moe_group(
+        self,
+        params: nnx.State,
+        moe_key: str,
+        mapping: WeightMapping,
+        expert_weights_dict: dict[str, list[jax.Array]],
+    ):
+        target_path = mapping.target_path[0]
+        expected_hf_keys = mapping.target_path[1:]
+
+        collected_weights = []
+        for hf_key in expected_hf_keys:
+            weights = expert_weights_dict[hf_key]
+            # If TP-sharded (e.g., Grok-2), concatenate shards along concat_axis
+            if mapping.concat_axis is not None and len(weights) > 1:
+                weight = jnp.concatenate(weights, axis=mapping.concat_axis)
+            else:
+                # Non-TP-sharded (e.g., Qwen3-MoE), expect single weight
+                weight = weights[0]
+
+            if mapping.transpose and not hf_key.endswith(".bias"):
+                if isinstance(mapping.transpose, tuple):
+                    # Custom permutation (e.g., for Conv layers)
+                    weight = jnp.transpose(weight, mapping.transpose)
+                else:
+                    # Standard 2D transpose
+                    weight = jnp.transpose(weight, (1, 0))
+            collected_weights.append(weight)
+
+        stacked_weight = jnp.stack(collected_weights, axis=0)  # (num_experts, ...)
+
+        if "expert" in mapping.sharding:
+            ep_size = getattr(self.model_config.hf_config, "ep_size", 1)
+            world_size = self.mesh.shape.get("data", 1) * self.mesh.shape.get("tensor", 1)
+            tp_size = world_size // ep_size
+
+            devices = self.mesh.devices.flatten()
+            moe_mesh = jax.sharding.Mesh(
+                devices.reshape(ep_size, tp_size), axis_names=("expert", "tensor")
+            )
+
+            sharded_weight = self._shard_weight(stacked_weight, mapping.sharding, mesh=moe_mesh)
+        else:
+            sharded_weight = self._shard_weight(stacked_weight, mapping.sharding)
+
+        model_param = self._get_param(params, target_path)
+        model_param.value = sharded_weight.astype(model_param.value.dtype)
+
+        logger.debug("Assigned MoE group %s, shape: %s", moe_key, stacked_weight.shape)
 
     def _load_dummy_weights(
         self,
@@ -897,7 +965,12 @@ class WeightLoader:
         processed_weight = hf_weight
 
         if mapping.transpose and not hf_key.endswith(".bias"):
-            processed_weight = jnp.transpose(processed_weight, (1, 0))
+            if isinstance(mapping.transpose, tuple):
+                # Custom permutation (e.g., for Conv layers)
+                processed_weight = jnp.transpose(processed_weight, mapping.transpose)
+            else:
+                # Standard 2D transpose
+                processed_weight = jnp.transpose(processed_weight, (1, 0))
 
         if isinstance(mapping.target_path, list):
             self._handle_split_weight(params, hf_key, processed_weight, mapping)
@@ -1134,12 +1207,26 @@ class WeightLoader:
         return weight
 
     def _is_excluded_layer_weight(self, hf_key: str) -> bool:
-        if not hf_key.startswith("model.layers."):
+        # Handle model layers exclusion logic
+        if hf_key.startswith("model.layers."):
+            parts = hf_key.split(".")
+            if len(parts) >= 3 and parts[2].isdigit():
+                layer_num = int(parts[2])
+                return layer_num >= self.model_config.num_hidden_layers
+
+        # Handle visual components exclusion logic
+        if hf_key.startswith("visual."):
+            # Check for visual blocks with numeric indices - exclude if beyond layer limit
+            if hf_key.startswith("visual.blocks."):
+                parts = hf_key.split(".")
+                if len(parts) >= 3 and parts[2].isdigit():
+                    layer_num = int(parts[2])
+                    max_vision_layers = getattr(self.model_config, "num_vision_layers", 0)
+                    # Only exclude if max_vision_layers > 0 and layer exceeds limit
+                    if max_vision_layers > 0:
+                        return layer_num >= max_vision_layers
+            # Include all other visual components (patch_embed, merger, rotary_pos_emb, etc.)
+            # These are critical for the vision encoder to function correctly
             return False
 
-        parts = hf_key.split(".")
-        if len(parts) < 3 or not parts[2].isdigit():
-            return False
-
-        layer_num = int(parts[2])
-        return layer_num >= self.model_config.num_hidden_layers
+        return False

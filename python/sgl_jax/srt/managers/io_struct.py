@@ -3,9 +3,17 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 from sgl_jax.srt.managers.schedule_batch import BaseFinishReason
+from sgl_jax.srt.multimodal.mm_utils import has_valid_data
+from sgl_jax.srt.utils import ImageData
+
+# Handle serialization of Image for pydantic
+if TYPE_CHECKING:
+    from PIL import Image
+else:
+    Image = Any
 
 
 @dataclass
@@ -185,6 +193,19 @@ class FlushCacheReqOutput(BaseReq):
     error_msg: str = ""
 
 
+# Type definitions for multimodal input data
+# Individual data item types for each modality
+ImageDataInputItem = Image | str | ImageData | dict
+AudioDataInputItem = str | dict
+VideoDataInputItem = str | dict
+# Union type for any multimodal data item
+MultimodalDataInputItem = ImageDataInputItem | VideoDataInputItem | AudioDataInputItem
+# Format types supporting single items, lists, or nested lists for batch processing
+MultimodalDataInputFormat = (
+    list[list[MultimodalDataInputItem]] | list[MultimodalDataInputItem] | MultimodalDataInputItem
+)
+
+
 # Additional classes needed for engine.py imports
 @dataclass
 class EmbeddingReqInput:
@@ -192,6 +213,18 @@ class EmbeddingReqInput:
 
     rid: str = None
     text: str = ""
+    # The image input. It can be an image instance, file name, URL, or base64 encoded string.
+    # Can be formatted as:
+    # - Single image for a single request
+    # - List of images (one per request in a batch)
+    # - List of lists of images (multiple images per request)
+    # See also python/sglang/srt/utils.py:load_image for more details.
+    image_data: MultimodalDataInputFormat | None = None
+    # The video input. Like image data, it can be a file name, a url, or base64 encoded string.
+    video_data: MultimodalDataInputFormat | None = None
+    # The audio input. Like image data, it can be a file name, a url, or base64 encoded string.
+    audio_data: MultimodalDataInputFormat | None = None
+    # The token ids for text; one can either specify text or input_ids.
     input_ids: list[int] = None
     normalize: bool = True
     # Extra key for cache namespace isolation
@@ -208,6 +241,17 @@ class GenerateReqInput:
     input_ids: list[list[int]] | list[int] | None = None
     # The embeddings for input_ids; one can specify either text or input_ids or input_embeds.
     input_embeds: list[list[list[float]]] | list[list[float]] | None = None
+    # The image input. It can be an image instance, file name, URL, or base64 encoded string.
+    # Can be formatted as:
+    # - Single image for a single request
+    # - List of images (one per request in a batch)
+    # - List of lists of images (multiple images per request)
+    # See also python/sglang/srt/utils.py:load_image for more details.
+    image_data: MultimodalDataInputFormat | None = None
+    # The video input. Like image data, it can be a file name, a url, or base64 encoded string.
+    video_data: MultimodalDataInputFormat | None = None
+    # The audio input. Like image data, it can be a file name, a url, or base64 encoded string.
+    audio_data: MultimodalDataInputFormat | None = None
     sampling_params: Any | None = (
         None  # Using Any for now to avoid SamplingParams serialization issues
     )
@@ -231,6 +275,13 @@ class GenerateReqInput:
     # Extra key for cache namespace isolation (e.g., cache_salt)
     extra_key: list[str] | str | None = None
 
+    def contains_mm_input(self) -> bool:
+        return (
+            has_valid_data(self.image_data)
+            or has_valid_data(self.video_data)
+            or has_valid_data(self.audio_data)
+        )
+
     def _normalize_rid(self, num):
         """Normalize request IDs for batch processing."""
         if self.rid is None:
@@ -249,6 +300,14 @@ class GenerateReqInput:
             raise ValueError("The rid should be a string or a list of strings.")
 
     def normalize_batch_and_arguments(self):
+        # at least one of text, input_ids, or image should be provided
+        if self.text is None and self.input_ids is None and self.image_data is None:
+            raise ValueError("At least one of text, input_ids, or image should be provided")
+
+        # text and input_ids cannot be provided at the same time
+        if self.text is not None and self.input_ids is not None:
+            raise ValueError("text and input_ids cannot be provided at the same time")
+
         self._validate_inputs()
         self._determine_batch_size()
         self._handle_parallel_sampling()
@@ -316,6 +375,9 @@ class GenerateReqInput:
         # Expand input based on type
         self._expand_inputs(num)
         self._normalize_rid(num)
+        self._normalize_image_data(num)
+        self._normalize_video_data(num)
+        self._normalize_audio_data(num)
         self._normalize_sampling_params(num)
         self._normalize_logprob_params(num)
         self._normalize_lora_paths(num)
@@ -341,6 +403,64 @@ class GenerateReqInput:
             self.text is not None and self.input_ids is not None
         ):
             raise ValueError("Either text or input_ids should be provided.")
+
+    def _normalize_image_data(self, num):
+        """Normalize image data for batch processing."""
+        if self.image_data is None:
+            self.image_data = [None] * num
+        elif not isinstance(self.image_data, list):
+            # Single image, convert to list of single-image lists
+            self.image_data = [[self.image_data]] * num
+            self.modalities = ["image"] * num
+        elif isinstance(self.image_data, list):
+            # Handle empty list case - treat as no images
+            if len(self.image_data) == 0:
+                self.image_data = [None] * num
+                return
+
+            if len(self.image_data) != self.batch_size:
+                raise ValueError("The length of image_data should be equal to the batch size.")
+
+            self.modalities = []
+            if len(self.image_data) > 0 and isinstance(self.image_data[0], list):
+                # Already a list of lists, keep as is
+                for i in range(len(self.image_data)):
+                    if self.image_data[i] is None or self.image_data[i] == [None]:
+                        self.modalities.append(None)
+                    elif len(self.image_data[i]) == 1:
+                        self.modalities.append("image")
+                    elif len(self.image_data[i]) > 1:
+                        self.modalities.append("multi-images")
+                    else:
+                        # Ensure len(self.modalities) == len(self.image_data)
+                        self.modalities.append(None)
+                # Expand parallel_sample_num
+                self.image_data = self.image_data * self.parallel_sample_num
+                self.modalities = self.modalities * self.parallel_sample_num
+            else:
+                # List of images for a batch, wrap each in a list
+                wrapped_images = [[img] for img in self.image_data]
+                # Expand for parallel sampling
+                self.image_data = wrapped_images * self.parallel_sample_num
+                self.modalities = ["image"] * num
+
+    def _normalize_video_data(self, num):
+        """Normalize video data for batch processing."""
+        if self.video_data is None:
+            self.video_data = [None] * num
+        elif not isinstance(self.video_data, list):
+            self.video_data = [self.video_data] * num
+        elif isinstance(self.video_data, list):
+            self.video_data = self.video_data * self.parallel_sample_num
+
+    def _normalize_audio_data(self, num):
+        """Normalize audio data for batch processing."""
+        if self.audio_data is None:
+            self.audio_data = [None] * num
+        elif not isinstance(self.audio_data, list):
+            self.audio_data = [self.audio_data] * num
+        elif isinstance(self.audio_data, list):
+            self.audio_data = self.audio_data * self.parallel_sample_num
 
     def _normalize_sampling_params(self, num):
         """Normalize sampling parameters for batch processing."""

@@ -95,7 +95,45 @@ class DefaultModelLoader(BaseModelLoader):
         *,
         model_config: ModelConfig,
     ) -> Any:
-        pass
+        # prepare model file
+        hf_folder = self.download_model(model_config)
+        model_config.model_path = hf_folder
+        # Initialize JAX model
+        model = self._initialize_model(model_config)
+
+        # Load weights
+        jit_model = self._get_model(model, model_config)
+
+        return jit_model
+
+    def _initialize_model(self, model_config: ModelConfig) -> Any:
+        model_class, _ = get_model_architecture(model_config)
+
+        if not hasattr(model_class, "load_weights"):
+            raise ValueError(
+                f"Model class {model_class.__name__} does not support weights loading. "
+                "Please ensure you're using a JAX-compatible model and implement load_weights method."
+            )
+
+        return model_class
+
+    def _get_model(self, model_class: Any, model_config: ModelConfig) -> nnx.Module:
+        with jax.set_mesh(self.mesh):
+            # Create a fresh RNG inside eval_shape to avoid trace-level conflicts
+            # Extract the key value to recreate RNGs inside the lambda
+            rng_key = None if self.rng is None else self.rng.default.key.value
+
+            model = nnx.eval_shape(
+                lambda: model_class(
+                    model_config.hf_config,
+                    model_config.dtype,
+                    nnx.Rngs(rng_key) if rng_key is not None else None,
+                    self.mesh,
+                )
+            )
+
+        model.load_weights(model_config, rng_key)
+        return model
 
     def _maybe_download_from_modelscope(self, model: str, revision: str | None) -> str | None:
         if get_bool_env_var("SGLANG_USE_MODELSCOPE"):

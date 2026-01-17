@@ -25,7 +25,7 @@ class TemplateManager:
         pass
         self._chat_template_name: str | None = None
         self._completion_template_name: str | None = None
-        self._jinja_template_content_format: str | None = None
+        self._jinja_template_content_format: str | None = "openai"
 
     @property
     def chat_template_name(self) -> str | None:

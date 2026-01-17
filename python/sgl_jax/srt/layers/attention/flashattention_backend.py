@@ -9,17 +9,22 @@ from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 from jax.tree_util import register_pytree_node_class
 
-from sgl_jax.srt.kernels.ragged_paged_attention.ragged_paged_attention import (
-    ragged_paged_attention,
-)
 from sgl_jax.srt.layers.attention.base_attn_backend import AttentionBackend
-from sgl_jax.srt.layers.radix_attention import RadixAttention
+from sgl_jax.srt.layers.radix_attention import AttentionType, RadixAttention
 from sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch
 from sgl_jax.srt.mem_cache.memory_pool import KVCache
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sgl_jax.srt.speculative.eagle_util import EagleDraftInput
 from sgl_jax.srt.utils import cdiv
-from sgl_jax.srt.utils.jax_utils import device_array
+from sgl_jax.srt.utils.jax_utils import device_array, is_tpu_runtime
+
+# Conditional imports based on runtime
+if is_tpu_runtime():
+    from sgl_jax.srt.kernels.ragged_paged_attention.ragged_paged_attention import (
+        ragged_paged_attention,
+    )
+    from sgl_jax.srt.speculative.eagle_util import EagleDraftInput
+else:
+    from flash_attn_jax import flash_mha, flash_mha_varlen
 
 logger = logging.getLogger(__name__)
 
@@ -72,7 +77,10 @@ class FlashAttentionMetadata:
 
 @dataclass
 class FlashAttention(AttentionBackend):
-    """Native Attention layer for variable-length sequences using ForwardBatch."""
+    """Flash Attention layer for variable-length sequences using ForwardBatch.
+
+    Uses ragged_paged_attention on TPU and flash_attn_jax on GPU.
+    """
 
     def __init__(
         self,
@@ -95,11 +103,22 @@ class FlashAttention(AttentionBackend):
         self.kv_partition_axis = kv_partition_axis
         self.forward_metadata = nnx.data(FlashAttentionMetadata())
         self.mesh = mesh
+        self.kv_sharding = NamedSharding(self.mesh, P(None, "tensor", None))
 
     def get_forward_metadata(
         self,
         batch: ModelWorkerBatch,
     ):
+        # GPU backend doesn't need forward metadata
+        if not is_tpu_runtime():
+            return None
+
+        # NOTE: Removed undefined is_eagle, speculative_step_id, topk variables
+        # if is_eagle:
+        #     return self.get_eagle_forward_metadata(
+        #         batch, speculative_step_id=speculative_step_id, topk=topk
+        #     )
+
         """Return the metadata for a forward pass."""
         metadata = FlashAttentionMetadata()
 
@@ -399,6 +418,8 @@ class FlashAttention(AttentionBackend):
             "vmem_limit_bytes": self.vmem_limit_bytes,
             "head_dim": self.head_dim,
             "page_size": self.page_size,
+            "kv_partition_axis": self.kv_partition_axis,
+            "mesh": self.mesh,
         }
         return (children, aux_data)
 
@@ -410,6 +431,8 @@ class FlashAttention(AttentionBackend):
             aux_data["head_dim"],
             aux_data["vmem_limit_bytes"],
             aux_data["page_size"],
+            aux_data.get("kv_partition_axis", "tensor"),
+            aux_data.get("mesh", None),
         )
 
         obj.forward_metadata = children[0]
@@ -436,6 +459,24 @@ class FlashAttention(AttentionBackend):
         Returns:
             Output tensor of shape [total_tokens, hidden_size]
         """
+        if is_tpu_runtime():
+            return self._forward_tpu(
+                q, k, v, layer, forward_batch, token_to_kv_pool, attention_mask
+            )
+        else:
+            return self._forward_gpu(q, k, v, layer, forward_batch, token_to_kv_pool)
+
+    def _forward_tpu(
+        self,
+        q: jax.Array,
+        k: jax.Array,
+        v: jax.Array,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        token_to_kv_pool: KVCache,
+        attention_mask: jax.Array = None,
+    ):
+        """TPU forward pass using ragged_paged_attention."""
         kv_cache_fused = self._get_fused_kv_cache(forward_batch, token_to_kv_pool, layer.layer_id)
 
         scale = 1.0 / jnp.sqrt(layer.head_dim) if layer.scaling is None else layer.scaling
@@ -532,6 +573,68 @@ class FlashAttention(AttentionBackend):
             updated_kv_cache_fused,
         )
 
+    def _forward_gpu(
+        self,
+        q: jax.Array,
+        k: jax.Array,
+        v: jax.Array,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        token_to_kv_pool: KVCache,
+    ):
+        """GPU forward pass using flash_attn_jax."""
+        k_buffer, v_buffer, kv_fused = self._get_and_update_kv_cache_gpu(
+            k, v, forward_batch, token_to_kv_pool, self.kv_sharding, layer.layer_id
+        )
+
+        scale = 1.0 / jnp.sqrt(layer.head_dim) if layer.scaling is None else layer.scaling
+
+        is_causal = True
+        if (
+            forward_batch.forward_mode == ForwardMode.DECODE
+            or layer.attn_type == AttentionType.ENCODER_ONLY
+        ):
+            is_causal = False
+
+        attn_output = _forward_flash_attention_gpu(
+            q,
+            k_buffer,
+            v_buffer,
+            forward_batch.seq_lens,
+            forward_batch.cache_loc,
+            forward_batch.extend_prefix_lens,
+            forward_batch.extend_seq_lens,
+            layer.q_head_num,
+            layer.kv_head_num,
+            scale,
+            is_causal,
+            forward_batch.forward_mode,
+            self.kv_sharding,
+        )
+
+        return attn_output, kv_fused
+
+    def _get_and_update_kv_cache_gpu(
+        self,
+        k: jax.Array,
+        v: jax.Array,
+        forward_batch: ForwardBatch,
+        token_to_kv_pool: KVCache,
+        kv_sharding: jax.NamedSharding,
+        layer_id: int,
+    ) -> tuple[jax.Array, jax.Array, jax.Array]:
+        """Get the kv cache from the forward batch (GPU path)."""
+        updated_layer = token_to_kv_pool.set_kv_buffer_legacy(
+            layer_id, forward_batch.out_cache_loc, k, v
+        )
+        # Functional style: treat updated_layer as authoritative fused buffer for this layer in this step
+        # Derive K/V views for attention computation from fused buffer directly
+        k = updated_layer.at[:, ::2, :].get(out_sharding=kv_sharding, mode="fill", fill_value=0)
+        v = updated_layer.at[:, 1::2, :].get(out_sharding=kv_sharding, mode="fill", fill_value=0)
+        # Return fused buffer directly for persistence outside JIT
+        fused_return = updated_layer
+        return k, v, fused_return
+
     def _get_fused_kv_cache(
         self,
         forward_batch: ForwardBatch,
@@ -542,9 +645,190 @@ class FlashAttention(AttentionBackend):
 
     @staticmethod
     def get_max_running_reqests(max_context_len: int, page_size: int) -> int:
-        num_page_per_req = cdiv(max_context_len, page_size)
-        res = 1024 * 1024 // 2 // num_page_per_req // 4
-        assert (
-            res > 0
-        ), f"max running requests: {res} must larger than 0, please increase page size or decrease max context length"
-        return res
+        if is_tpu_runtime():
+            num_page_per_req = cdiv(max_context_len, page_size)
+            res = 1024 * 1024 // 2 // num_page_per_req // 4
+            assert (
+                res > 0
+            ), f"max running requests: {res} must larger than 0, please increase page size or decrease max context length"
+            return res
+        else:
+            # GPU flash attention backend doesn't care about max running requests
+            return 4096
+
+
+def _forward_flash_attention_gpu(
+    q: jax.Array,
+    k_cache: jax.Array,
+    v_cache: jax.Array,
+    seq_lengths: jax.Array,
+    loc: jax.Array,
+    extend_prefix_lens: jax.Array,
+    extend_seq_lens: jax.Array,
+    num_heads: int,
+    num_kv_heads: int,
+    scale: float = None,
+    is_causal: bool = True,
+    mode: ForwardMode = ForwardMode.DECODE,
+    kv_sharding=None,
+):
+    """
+    Forward pass using Flash Attention for variable-length sequences (GPU).
+
+    Args:
+        q: input tokens, shape (num_tokens, num_heads, head_dim) or (num_tokens, hidden_size)
+        k_cache: key cache, shape (cache_size, num_kv_heads, head_dim)
+        v_cache: value cache, shape (cache_size, num_kv_heads, head_dim)
+        seq_lengths: cumulative sequence lengths for each batch
+        loc: location of the key/value cache
+        extend_prefix_lens: prefix lengths of each batch in extend mode
+        extend_seq_lens: sequence lengths of each batch in extend mode
+        num_heads: number of query heads
+        num_kv_heads: number of key/value heads
+        scale: scale for the attention weights (softmax_scale)
+        is_causal: whether to apply causal masking
+        mode: forward mode (DECODE or EXTEND)
+        kv_sharding: sharding for KV cache
+
+    Returns:
+        Output tensor of shape [num_tokens, hidden_size]
+    """
+    cache_size = k_cache.shape[0]
+    safe_loc = jnp.where(loc > 0, loc, cache_size)
+    k_cache = k_cache.at[safe_loc].get(out_sharding=kv_sharding, mode="fill", fill_value=0)
+    v_cache = v_cache.at[safe_loc].get(out_sharding=kv_sharding, mode="fill", fill_value=0)
+
+    # Handle both 2D and 3D input formats for q
+    if len(q.shape) == 2:
+        # Traditional format: [num_tokens, hidden_size]
+        num_tokens, hidden_size = q.shape
+        head_dim = hidden_size // num_heads
+        q_heads = q.reshape(num_tokens, num_heads, head_dim)
+    else:
+        # Already in multi-head format: [num_tokens, num_heads, head_dim]
+        num_tokens, num_heads_input, head_dim = q.shape
+        assert num_heads_input == num_heads, f"Expected {num_heads} heads, got {num_heads_input}"
+        hidden_size = num_heads * head_dim
+        q_heads = q
+
+    # KV cache from get_kv_buffer is already in multi-head format: [cache_size, num_kv_heads, head_dim]
+    k_heads = k_cache
+    v_heads = v_cache
+
+    # flash_attn_jax expects:
+    # q: [total_tokens_q, num_heads_q, head_dim]
+    # k: [total_tokens_k, num_kv_heads, head_dim]
+    # v: [total_tokens_k, num_kv_heads, head_dim]
+    # seqlens_q: [batch_size + 1] cumulative sequence lengths
+    # seqlens_k: [batch_size + 1] cumulative sequence lengths
+
+    # Convert seq_lengths to cumulative format for flash_mha_varlen
+    # flash_attn_jax expects seqlens as cumulative (e.g., [0, len1, len1+len2, ...])
+    if mode == ForwardMode.EXTEND:
+        # In extend mode, use extend_seq_lens for query and seq_lengths for key
+        seqlens_q = jnp.concatenate(
+            [jnp.array([0], dtype=jnp.int32), jnp.cumsum(extend_seq_lens, dtype=jnp.int32)]
+        )
+        seqlens_k = jnp.concatenate(
+            [jnp.array([0], dtype=jnp.int32), jnp.cumsum(seq_lengths, dtype=jnp.int32)]
+        )
+    else:
+        # In decode mode, each query has length 1
+        batch_size = seq_lengths.shape[0]
+        seqlens_q = jnp.arange(batch_size + 1, dtype=jnp.int32)
+        seqlens_k = jnp.concatenate(
+            [jnp.array([0], dtype=jnp.int32), jnp.cumsum(seq_lengths, dtype=jnp.int32)]
+        )
+
+    # Ensure proper dtype for flash attention (bf16 or fp16)
+    original_dtype = q_heads.dtype
+    if q_heads.dtype not in [jnp.bfloat16, jnp.float16]:
+        q_heads = q_heads.astype(jnp.bfloat16)
+        k_heads = k_heads.astype(jnp.bfloat16)
+        v_heads = v_heads.astype(jnp.bfloat16)
+
+    # Call flash_mha_varlen from flash_attn_jax
+    # Use -1 for max_seqlen_q and max_seqlen_k to let flash_attn_jax infer from tensor shapes
+    # This avoids ConcretizationTypeError during JIT tracing
+    attn_output = flash_mha_varlen(
+        q_heads,
+        k_heads,
+        v_heads,
+        seqlens_q=seqlens_q,
+        seqlens_k=seqlens_k,
+        softmax_scale=scale,
+        is_causal=is_causal,
+    )
+
+    # Convert back to original dtype if needed
+    if attn_output.dtype != original_dtype:
+        attn_output = attn_output.astype(original_dtype)
+
+    # Reshape output back to [num_tokens, hidden_size]
+    return attn_output.reshape(num_tokens, hidden_size)
+
+
+def vision_attention(
+    q: jax.Array,
+    k: jax.Array,
+    v: jax.Array,
+    scale: float,
+    window_size: int = -1,
+) -> jax.Array:
+    """
+    Compute vision attention using flash attention on GPU or native attention on TPU.
+
+    This is a simple attention function for vision models (no KV cache, no causal masking).
+
+    Args:
+        q, k, v: Input tensors of shape [B, T, N, H] (batch, seq_len, num_heads, head_dim)
+        scale: Attention scale factor (1/sqrt(head_dim))
+        window_size: Window size for local attention. -1 means full attention.
+
+    Returns:
+        Output tensor of shape [B, T, N, H]
+    """
+    if not is_tpu_runtime():
+        # GPU: use flash_mha
+        original_dtype = q.dtype
+        if q.dtype not in [jnp.bfloat16, jnp.float16]:
+            q = q.astype(jnp.bfloat16)
+            k = k.astype(jnp.bfloat16)
+            v = v.astype(jnp.bfloat16)
+
+        if window_size > 0:
+            output = flash_mha(
+                q,
+                k,
+                v,
+                softmax_scale=scale,
+                is_causal=False,
+                window_size=(window_size, window_size),
+            )
+        else:
+            output = flash_mha(q, k, v, softmax_scale=scale, is_causal=False)
+
+        if output.dtype != original_dtype:
+            output = output.astype(original_dtype)
+        return output
+    else:
+        # TPU: native attention
+        B, T, N, H = q.shape
+        q = jnp.transpose(q, (0, 2, 1, 3))  # [B, N, T, H]
+        k = jnp.transpose(k, (0, 2, 1, 3))
+        v = jnp.transpose(v, (0, 2, 1, 3))
+
+        attn_weights = jnp.einsum("bnth,bnsh->bnts", q, k) * scale
+
+        if window_size > 0:
+            # Create window mask for local attention
+            positions = jnp.arange(T)
+            distance = jnp.abs(positions[:, None] - positions[None, :])
+            window_mask = distance > window_size
+            attn_weights = jnp.where(
+                window_mask[None, None, :, :], jnp.finfo(attn_weights.dtype).min, attn_weights
+            )
+
+        attn_weights = jax.nn.softmax(attn_weights, axis=-1)
+        output = jnp.einsum("bnts,bnsh->bnth", attn_weights, v)
+        return jnp.transpose(output, (0, 2, 1, 3))  # [B, T, N, H]

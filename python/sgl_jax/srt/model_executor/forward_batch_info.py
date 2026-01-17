@@ -155,6 +155,18 @@ class ForwardBatch:
 
     cache_loc: jax.Array = None
 
+    # For input embeddings
+    input_embeds: jax.Array | None = None
+
+    # For multimodal (pixel_values and grid dimensions)
+    pixel_values: jax.Array | None = None
+    image_grid_thw: tuple | None = None
+    video_grid_thw: tuple | None = None
+    # Cached vision embeddings (for chunked prefill)
+    cached_vision_embeds: jax.Array | None = None
+    # Requests with vision data (for caching embeddings back)
+    reqs_with_vision: list | None = None
+
     # For extend
     extend_prefix_lens: jax.Array | None = None
     extend_seq_lens: jax.Array | None = None
@@ -188,6 +200,9 @@ class ForwardBatch:
             self.lora_token_indices,
             self.lora_ranks,
             self.spec_info,
+            self.input_embeds,
+            self.pixel_values,
+            self.cached_vision_embeds,
         )
 
         aux_data = {
@@ -195,6 +210,9 @@ class ForwardBatch:
             "batch_size": self.batch_size,
             "spec_algorithm": self.spec_algorithm,
             "capture_hidden_mode": self.capture_hidden_mode,
+            "image_grid_thw": self.image_grid_thw,
+            "video_grid_thw": self.video_grid_thw,
+            "reqs_with_vision": self.reqs_with_vision,
         }
         return (children, aux_data)
 
@@ -206,6 +224,9 @@ class ForwardBatch:
         obj.batch_size = aux_data["batch_size"]
         obj.spec_algorithm = aux_data["spec_algorithm"]
         obj.capture_hidden_mode = aux_data["capture_hidden_mode"]
+        obj.image_grid_thw = aux_data.get("image_grid_thw")
+        obj.video_grid_thw = aux_data.get("video_grid_thw")
+        obj.reqs_with_vision = aux_data.get("reqs_with_vision")
         obj.trace_request_ids = None
         obj.trace_request_objects = None
 
@@ -223,6 +244,10 @@ class ForwardBatch:
         obj.lora_token_indices = children[11]
         obj.lora_ranks = children[12]
         obj.spec_info = children[13]
+        # obj.spec_info = children[10]
+        obj.input_embeds = children[14]
+        obj.pixel_values = children[15]
+        obj.cached_vision_embeds = children[16]
         return obj
 
     def __repr__(self) -> str:
@@ -307,6 +332,9 @@ class ForwardBatch:
                 batch.lora_token_indices,
                 batch.lora_ranks,
             )
+        # Keep pixel_values as-is (numpy array) to avoid sharding issues
+        # It will be converted to JAX inside the vision model where we can control sharding
+        pixel_values_jax = batch.pixel_values
 
         obj = cls(
             bid=batch.bid,
@@ -329,6 +357,12 @@ class ForwardBatch:
             spec_info=batch.spec_info,
             spec_algorithm=batch.spec_algorithm,
             capture_hidden_mode=batch.capture_hidden_mode,
+            input_embeds=batch.input_embeds,
+            pixel_values=pixel_values_jax,
+            image_grid_thw=batch.image_grid_thw,
+            video_grid_thw=batch.video_grid_thw,
+            cached_vision_embeds=batch.cached_vision_embeds,
+            reqs_with_vision=batch.reqs_with_vision,
         )
 
         return obj

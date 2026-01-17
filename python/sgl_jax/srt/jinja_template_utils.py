@@ -5,6 +5,8 @@ This is a stub implementation for the migration from sglang.
 
 import logging
 
+from sgl_jax.srt.utils import ImageData
+
 logger = logging.getLogger(__name__)
 
 
@@ -42,7 +44,12 @@ def process_content_for_template_format(
                 chunk_type = chunk.get("type")
 
                 if chunk_type == "image_url":
-                    image_data.append(chunk["image_url"]["url"])
+                    image_data.append(
+                        ImageData(
+                            url=chunk["image_url"]["url"],
+                            detail=chunk["image_url"].get("detail", "auto"),
+                        )
+                    )
                     if chunk.get("modalities"):
                         modalities.append(chunk.get("modalities"))
                     # Normalize to simple 'image' type for template compatibility

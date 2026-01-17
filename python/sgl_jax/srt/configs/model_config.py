@@ -38,6 +38,7 @@ class ModelConfig:
         context_length: int | None = None,
         model_override_args: str = "{}",
         is_embedding: bool | None = None,
+        enable_multimodal: bool | None = None,
         dtype: str = "auto",
         override_config_file: str | None = None,
         is_draft_model: bool = False,
@@ -77,6 +78,9 @@ class ModelConfig:
             **kwargs,
         )
 
+        if enable_multimodal is None:
+            enable_multimodal = False
+
         self.hf_text_config = get_hf_text_config(self.hf_config)
         self.sliding_window = getattr(self.hf_text_config, "sliding_window", None)
 
@@ -90,7 +94,7 @@ class ModelConfig:
             self.hf_config.architectures[0] = "MiMoMTPForCausalLM"
         # Check model type
         self.is_generation = is_generation_model(self.hf_config.architectures, is_embedding)
-        self.is_multimodal = False
+        self.is_multimodal = enable_multimodal and is_multimodal_model(self.hf_config.architectures)
         self.dtype = _get_and_verify_dtype(self.hf_text_config, dtype)
 
         # Derive context length
@@ -174,6 +178,7 @@ class ModelConfig:
             context_length=server_args.context_length,
             model_override_args=server_args.json_model_override_args,
             is_embedding=server_args.is_embedding,
+            enable_multimodal=server_args.enable_multimodal,
             dtype=server_args.dtype,
             quantization=server_args.quantization,
             quantization_config_path=server_args.quantization_config_path,
@@ -526,6 +531,12 @@ multimodal_model_archs = [
     "Phi4MMForCausalLM",
     "VILAForConditionalGeneration",
 ]
+
+
+def is_multimodal_model(model_architectures: list[str]):
+    return any(
+        multi_model_arch in model_architectures for multi_model_arch in multimodal_model_archs
+    )
 
 
 class MockModelConfig(ModelConfig):

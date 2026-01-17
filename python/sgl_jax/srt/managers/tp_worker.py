@@ -91,7 +91,6 @@ class ModelWorker:
                 self.random_seed = broadcast_one_to_all(seed_to_broadcast).item()
         else:
             self.random_seed = server_args.random_seed
-
         # init model runner
         self.model_runner = ModelRunner(
             model_config=self.model_config,

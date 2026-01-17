@@ -257,7 +257,9 @@ class RadixCache(BasePrefixCache):
     def cache_finished_req(self, req: Req):
         """Cache completed requests"""
         all_token_len = len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0)
+
         if self.disable:
+            # For disabled cache: just free memory without inserting to radix tree
             kv_indices = self.req_to_token_pool.read(
                 req.req_pool_idx,
                 all_token_len,
@@ -267,7 +269,23 @@ class RadixCache(BasePrefixCache):
             self.req_to_token_pool.free(req.req_pool_idx)
             return
 
-        token_ids = (req.origin_input_ids + req.output_ids)[:all_token_len]
+        # Use cache_input_ids if available (for multimodal requests with hash-based placeholders)
+        # This ensures different images/videos have unique cache keys
+        cache_ids = getattr(req, "cache_input_ids", None)
+        if cache_ids is not None:
+            # Ensure lengths match for consistency
+            assert len(cache_ids) == len(
+                req.origin_input_ids
+            ), f"Length mismatch: cache_ids={len(cache_ids)}, origin_input_ids={len(req.origin_input_ids)}"
+            token_ids = list(cache_ids) + list(req.output_ids)
+            token_ids = token_ids[:all_token_len]
+        else:
+            token_ids = (req.origin_input_ids + req.output_ids)[:all_token_len]
+
+        assert (
+            len(token_ids) == all_token_len
+        ), f"cache_finished_req token_ids length mismatch: {len(token_ids)} vs {all_token_len}"
+
         # For EAGLE radix cache, we will convert the key to bigram key, e.g. [1,2,3,4] -> [(1,2), (2,3), (3,4)], the length will -1. ((len([(1,2), (2,3), (3,4)]) = len([1,2,3,4]) - 1))
         # So for the corresponding kv length should also -1. Then we get the actual_kv_len, and use it to do later calculation and slicing.
         actual_kv_len = all_token_len - 1 if self.is_eagle else all_token_len
@@ -307,11 +325,36 @@ class RadixCache(BasePrefixCache):
         if self.disable:
             return
 
-        token_ids = req.fill_ids
-        all_token_len = len(token_ids)
+        # Use fill_ids for length/memory calculations (always in sync with actual sequence)
+        all_token_len = len(req.fill_ids)
+
+        cache_ids = getattr(req, "cache_input_ids", None)
+        # Use cache_input_ids if available for cache keys (multimodal requests with hash-based placeholders)
+        # This ensures different images/videos have unique cache keys
+        # Note: cache_input_ids may be longer than fill_ids during chunked prefill,
+        # so we need to slice it appropriately
+        if cache_ids is not None:
+            # Slice cache_input_ids to match origin_input_ids portion in fill_ids
+            # fill_ids = origin_input_ids[:processed_len] + output_ids
+            origin_len_in_fill = len(req.fill_ids) - len(req.output_ids)
+
+            # IMPORTANT: For cache keys, we should only use the INPUT portion (cache_ids)
+            # The output tokens should NOT be part of the cache key during chunked prefill
+            # because they will be regenerated and should match exactly.
+            # We use cache_ids for the full input length, not including output tokens.
+            # This ensures consistency with cache_finished_req which uses cache_ids + output_ids.
+            token_ids = list(cache_ids[:origin_len_in_fill]) + list(req.output_ids)
+        else:
+            token_ids = req.fill_ids
+
+        # For the radix cache, we only want to cache the INPUT tokens, not the output tokens
+        # during chunked prefill. The output tokens will be cached at the end in cache_finished_req.
+        # So we limit page_aligned_token_len to the input portion only.
+        input_token_len = len(req.fill_ids) - len(req.output_ids)
+
         # For EAGLE radix cache, we will convert the key to bigram key, e.g. [1,2,3,4] -> [(1,2), (2,3), (3,4)], the length will -1. ((len([(1,2), (2,3), (3,4)]) = len([1,2,3,4]) - 1))
         # So for the corresponding kv length should also -1. Then we get the actual_kv_len, and use it to do later calculation and slicing.
-        actual_kv_len = all_token_len - 1 if self.is_eagle else all_token_len
+        actual_kv_len = input_token_len - 1 if self.is_eagle else input_token_len
         kv_indices = self.req_to_token_pool.read(req.req_pool_idx, all_token_len)
 
         if self.page_size != 1:
@@ -319,7 +362,8 @@ class RadixCache(BasePrefixCache):
             page_aligned_kv_indices = kv_indices[:page_aligned_len].copy()
         else:
             page_aligned_len = actual_kv_len
-            page_aligned_kv_indices = kv_indices
+            # IMPORTANT: Slice kv_indices to match page_aligned_len, not the full array
+            page_aligned_kv_indices = kv_indices[:page_aligned_len]
 
         # For EAGLE, the page_aligned_len is for the bigram key, the normal key len should +1
         page_aligned_token_len = page_aligned_len + 1 if self.is_eagle else page_aligned_len
@@ -350,16 +394,23 @@ class RadixCache(BasePrefixCache):
         self.inc_lock_ref(new_last_node)
 
         # `req.prefix_indices` will be used later in `PrefillAdder::add_chunked_req`
+        # IMPORTANT: Only include indices for INPUT tokens, not output tokens.
+        # This ensures prefix_indices length matches what cache_finished_req expects.
         if self.page_size != 1:
-            # create array on CPU
-            req.prefix_indices = np.concat([new_indices, kv_indices[len(new_indices) :]])
+            # create array on CPU - only include up to input_token_len
+            req.prefix_indices = np.concat(
+                [new_indices, kv_indices[len(new_indices) : input_token_len]]
+            )
         else:
             req.prefix_indices = new_indices
             if self.is_eagle:
                 # Attach the kv index of the last token for EAGLE, it can be used in chunked prefill
-                req.prefix_indices = np.concatenate([new_indices, kv_indices[actual_kv_len:]])
+                req.prefix_indices = np.concatenate(
+                    [new_indices, kv_indices[actual_kv_len:input_token_len]]
+                )
             else:
                 req.prefix_indices = new_indices
+
         req.last_node = new_last_node
 
     def pretty_print(self):
@@ -488,6 +539,11 @@ class RadixCache(BasePrefixCache):
     def _insert_helper(self, node: TreeNode, key: RadixKey, value):
         if isinstance(value, jnp.ndarray):
             assert value.ndim == 1, "value must be a 1D array"
+
+        # Ensure key and value have matching lengths
+        assert len(key) == len(
+            value
+        ), f"_insert_helper: key and value length mismatch: key={len(key)}, value={len(value)}"
 
         node.last_access_time = time.monotonic()
         if len(key) == 0:

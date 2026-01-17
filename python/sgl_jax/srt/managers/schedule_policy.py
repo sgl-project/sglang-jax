@@ -372,6 +372,10 @@ class PrefillAdder:
 
     @contextmanager
     def _lock_node(self, last_node: TreeNode):
+        # Skip locking if last_node is None (e.g., for multimodal requests that skip cache)
+        if last_node is None:
+            yield None
+            return
         if self.is_hybrid:
             try:
                 swa_uuid_for_lock = self.tree_cache.inc_lock_ref(last_node)
@@ -492,11 +496,13 @@ class PrefillAdder:
             if self.rem_chunk_tokens is None or input_tokens <= self.rem_chunk_tokens:
                 # Non-chunked prefill
                 self.can_run_list.append(req)
-                if self.is_hybrid:
-                    swa_uuid_for_lock = self.tree_cache.inc_lock_ref(req.last_node)
-                    req.swa_uuid_for_lock = swa_uuid_for_lock
-                else:
-                    self.tree_cache.inc_lock_ref(req.last_node)
+                # Only lock node if it exists (not None for multimodal requests)
+                if req.last_node is not None:
+                    if self.is_hybrid:
+                        swa_uuid_for_lock = self.tree_cache.inc_lock_ref(req.last_node)
+                        req.swa_uuid_for_lock = swa_uuid_for_lock
+                    else:
+                        self.tree_cache.inc_lock_ref(req.last_node)
                 self._update_prefill_budget(
                     prefix_len,
                     input_tokens,
@@ -517,11 +523,13 @@ class PrefillAdder:
 
                 self.can_run_list.append(req)
                 self.new_chunked_req = req
-                if self.is_hybrid:
-                    swa_uuid_for_lock = self.tree_cache.inc_lock_ref(req.last_node)
-                    req.swa_uuid_for_lock = swa_uuid_for_lock
-                else:
-                    self.tree_cache.inc_lock_ref(req.last_node)
+                # Only lock node if it exists (not None for multimodal requests)
+                if req.last_node is not None:
+                    if self.is_hybrid:
+                        swa_uuid_for_lock = self.tree_cache.inc_lock_ref(req.last_node)
+                        req.swa_uuid_for_lock = swa_uuid_for_lock
+                    else:
+                        self.tree_cache.inc_lock_ref(req.last_node)
                 self._update_prefill_budget(prefix_len, trunc_len, 0)
 
         return self.budget_state()
