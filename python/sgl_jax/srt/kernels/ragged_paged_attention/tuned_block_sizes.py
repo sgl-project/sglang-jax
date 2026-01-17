@@ -1245,7 +1245,7 @@ def get_tuned_block_sizes(
         if device_name in TUNED_BLOCK_SIZES and keys[1:] in TUNED_BLOCK_SIZES[device_name]:
             bkv_p, bq = TUNED_BLOCK_SIZES[device_name][keys[1:]]
         else:
-            logger.debug(
+            logger.info(
                 "Tuned RPA block sizes not found for %s: page_size=%s, actual_num_q_heads=%s, "
                 "actual_num_kv_heads=%s, head_dim=%s, max_num_tokens=%s, pages_per_seq=%s.",
                 device_name,
@@ -1256,7 +1256,7 @@ def get_tuned_block_sizes(
                 max_num_tokens,
                 pages_per_seq,
             )
-            logger.debug("Using default block size: bkv_p=%s, bq=%s.", bkv_p, bq)
+            logger.info("Using default block size: bkv_p=%s, bq=%s.", bkv_p, bq)
 
     # if bkv_p != 16 or bq != 16:
     #     raise ValueError(
