@@ -407,9 +407,11 @@ class EAGLEWorker(ModelWorker):
         model_worker_batch.positions = np.empty(bs * self.topk, np.int32)
 
     def draft(self, model_worker_batch: ModelWorkerBatch):
-
         self.padding_for_decode(model_worker_batch)
         score_list, token_list, parents_list = self.draft_forward(model_worker_batch)
+        verified_seq_lens = model_worker_batch.seq_lens - 1
+        max_seq_len = int(np.max(verified_seq_lens)) if verified_seq_lens.size > 0 else 1
+        max_context_len = self._pick_context_len(max_seq_len)
         (
             tree_mask,
             position,
@@ -422,11 +424,11 @@ class EAGLEWorker(ModelWorker):
             score_list,
             token_list,
             parents_list,
-            model_worker_batch.seq_lens - 1,
-            np.sum(model_worker_batch.seq_lens - 1),
+            verified_seq_lens,
+            np.sum(verified_seq_lens),
             self.topk,
             self.speculative_num_draft_tokens,
-            int(self.req_to_token_pool.req_to_token.shape[1]),
+            max_context_len,
             model_worker_batch.seq_lens.shape[0],
             model_worker_batch.speculative_num_steps,
             self.mesh,
@@ -447,6 +449,14 @@ class EAGLEWorker(ModelWorker):
             seq_lens_cpu=model_worker_batch.seq_lens,
         )
         return model_worker_batch.spec_info
+
+    def _pick_context_len(self, max_seq_len: int) -> int:
+        max_seq_len = max(int(max_seq_len), 1)
+        if self.precompile_token_paddings:
+            for padding in self.precompile_token_paddings:
+                if padding >= max_seq_len:
+                    return padding
+        return 1 << (max_seq_len - 1).bit_length()
 
     def verify(self, model_worker_batch: ModelWorkerBatch, cur_allocate_lens: jax.Array):
         spec_info: EagleVerifyInput = model_worker_batch.spec_info

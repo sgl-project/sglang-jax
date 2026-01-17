@@ -87,7 +87,7 @@ class ModelConfig:
             self.hf_config.architectures[0] = "LlamaForCausalLMEagle3"
 
         if is_draft_model and self.hf_config.architectures[0] == "MiMoForCausalLM":
-            self.hf_config.architectures[0] = "MiMoMTP"
+            self.hf_config.architectures[0] = "MiMoMTPForCausalLM"
         # Check model type
         self.is_generation = is_generation_model(self.hf_config.architectures, is_embedding)
         self.is_multimodal = False

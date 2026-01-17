@@ -257,7 +257,11 @@ class ModelRunner:
         self.model = self.model_loader.load_model(
             model_config=self.model_config,
         )
-
+        if self.is_draft_worker:
+            # if draft model and target model share same safetensor files, we should hack here to avoid create redundant layer kv cache
+            self.model_config.num_hidden_layers = getattr(
+                self.model_config, "num_nextn_predict_layers", self.model_config.num_hidden_layers
+            )
         if self.model_config.quantization_config_path is not None:
             self.model = apply_qwix_quantization(self.model_config, self.model, self)
 
