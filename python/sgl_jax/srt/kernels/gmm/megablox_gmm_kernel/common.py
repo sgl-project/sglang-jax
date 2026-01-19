@@ -36,8 +36,14 @@ def supports_bfloat16_matmul() -> bool:
 
 
 def assert_is_supported_dtype(dtype: jnp.dtype) -> None:
-    if dtype not in (jnp.bfloat16, jnp.float32):
-        raise ValueError(f"Expected bfloat16 or float32 array but got {dtype}.")
+    if dtype not in [
+        jnp.bfloat16,
+        jnp.float32,
+        jnp.float8_e4m3fn,
+        jnp.float8_e5m2,
+        jnp.int8,
+    ]:
+        raise ValueError(f"No support for {dtype=}.")
 
 
 def select_input_dtype(lhs: jax.Array, rhs: jax.Array) -> jnp.dtype:

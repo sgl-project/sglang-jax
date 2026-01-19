@@ -648,9 +648,9 @@ class BailingMoEForCausalLM(nnx.Module):
                     ]
 
                     if expert_type == "down_proj":
-                        sharding = ("expert", "tensor", None)
-                    else:
                         sharding = ("expert", None, "tensor")
+                    else:
+                        sharding = ("expert", "tensor", None)
 
                     mappings[f"__MOE_EXPERTS__{prefix}.mlp.{target_name}"] = WeightMapping(
                         target_path=[f"{target_prefix}.mlp.{target_name}"] + expert_keys,
