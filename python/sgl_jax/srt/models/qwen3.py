@@ -15,6 +15,7 @@ from sgl_jax.srt.layers.radix_attention import RadixAttention
 from sgl_jax.srt.mem_cache.memory_pool import KVCache
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
 from sgl_jax.srt.precision_tracer import precision_tracer
+from sgl_jax.srt.utils.profiling_utils import named_scope
 from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
 
 logger = logging.getLogger(__name__)
@@ -49,14 +50,10 @@ class QWen3Attention(nnx.Module):
         self.scaling = self.head_dim**-0.5
 
         self.q_norm = RMSNorm(
-            self.head_dim,
-            epsilon=rms_norm_eps,
-            param_dtype=dtype,
+            self.head_dim, epsilon=rms_norm_eps, param_dtype=dtype, scope_name="q_norm"
         )
         self.k_norm = RMSNorm(
-            self.head_dim,
-            epsilon=rms_norm_eps,
-            param_dtype=dtype,
+            self.head_dim, epsilon=rms_norm_eps, param_dtype=dtype, scope_name="k_norm"
         )
 
         self.q_proj = LinearBase(
@@ -66,6 +63,7 @@ class QWen3Attention(nnx.Module):
             kernel_axes=(None, "tensor"),
             params_dtype=dtype,
             mesh=mesh,
+            scope_name="q_proj",
         )
         self.k_proj = LinearBase(
             input_size=hidden_size,
@@ -74,6 +72,7 @@ class QWen3Attention(nnx.Module):
             kernel_axes=(None, "tensor"),
             params_dtype=dtype,
             mesh=mesh,
+            scope_name="k_proj",
         )
         self.v_proj = LinearBase(
             input_size=hidden_size,
@@ -82,6 +81,7 @@ class QWen3Attention(nnx.Module):
             kernel_axes=(None, "tensor"),
             params_dtype=dtype,
             mesh=mesh,
+            scope_name="v_proj",
         )
         self.o_proj = LinearBase(
             input_size=num_heads * self.head_dim,
@@ -90,6 +90,7 @@ class QWen3Attention(nnx.Module):
             kernel_axes=("tensor", None),
             params_dtype=dtype,
             mesh=mesh,
+            scope_name="o_proj",
         )
         self.rotary_emb = RotaryEmbedding(
             head_size=self.head_dim,
@@ -108,6 +109,7 @@ class QWen3Attention(nnx.Module):
             layer_id=layer_id,
         )
 
+    @named_scope
     def __call__(
         self,
         positions: jax.Array,
@@ -151,6 +153,7 @@ class Qwen3MLP(nnx.Module):
             use_bias=False,
             params_dtype=dtype,
             mesh=mesh,
+            scope_name="gate_proj",
         )
 
         self.up_proj = LinearBase(
@@ -160,6 +163,7 @@ class Qwen3MLP(nnx.Module):
             use_bias=False,
             params_dtype=dtype,
             mesh=mesh,
+            scope_name="up_proj",
         )
 
         self.down_proj = LinearBase(
@@ -169,11 +173,13 @@ class Qwen3MLP(nnx.Module):
             use_bias=False,
             params_dtype=dtype,
             mesh=mesh,
+            scope_name="down_proj",
         )
 
         self.act_fn = jax.nn.silu
 
-    def __call__(self, hidden_states: jax.Array):
+    @named_scope
+    def __call__(self, hidden_states: jnp.ndarray):
         a1, _ = self.gate_proj(hidden_states)
         a2, _ = self.up_proj(hidden_states)
         intermediate_parallel = a2 * self.act_fn(a1)
@@ -221,11 +227,13 @@ class QWen3DecoderLayer(nnx.Module):
             config.hidden_size,
             epsilon=config.rms_norm_eps,
             param_dtype=dtype,
+            scope_name="input_layernorm",
         )
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size,
             epsilon=config.rms_norm_eps,
             param_dtype=dtype,
+            scope_name="post_attention_layernorm",
         )
 
     def __call__(
@@ -306,6 +314,7 @@ class QWen3Model(nnx.Module):
             config.hidden_size,
             epsilon=config.rms_norm_eps,
             param_dtype=dtype,
+            scope_name="norm",
         )
         # For EAGLE3 support
         self.layers_to_capture = []

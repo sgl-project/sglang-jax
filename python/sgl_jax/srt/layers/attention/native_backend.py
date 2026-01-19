@@ -9,6 +9,7 @@ from sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch
 from sgl_jax.srt.mem_cache.memory_pool import KVCache
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sgl_jax.srt.utils.jax_utils import is_tpu_runtime
+from sgl_jax.srt.utils.profiling_utils import named_scope
 
 
 class NativeAttention(AttentionBackend):
@@ -45,6 +46,7 @@ class NativeAttention(AttentionBackend):
         """Init the metadata for a forward pass and return it."""
         return None
 
+    @named_scope
     def __call__(
         self,
         q: jax.Array,

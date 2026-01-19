@@ -14,7 +14,7 @@ from pathlib import Path
 
 import requests
 
-PARENT_FOLDER = "/tmp/sglang-profile"
+PARENT_FOLDER = "/tmp/sgl-jax-profile"
 
 
 def _run_profile(

@@ -289,7 +289,7 @@ def get_target_cache_loc(
     accepted_mask = token_indices < copy_lens_accepted[:, None]
 
     # select accepted position with mask matrix
-    accepted_positions = jnp.where(accepted_mask, out_cache_loc[:, :max_accepted_len], -1)  # 填充值
+    accepted_positions = jnp.where(accepted_mask, out_cache_loc[:, :max_accepted_len], -1)
 
     # remove padding
     tgt_cache_loc = accepted_positions.flatten()

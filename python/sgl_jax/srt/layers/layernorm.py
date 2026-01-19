@@ -9,6 +9,8 @@ from flax.typing import Array, Axes, Dtype
 from jax import lax
 from jax.sharding import PartitionSpec as P
 
+from sgl_jax.srt.utils.profiling_utils import named_scope
+
 
 def _canonicalize_axes(rank: int, axes: Axes) -> tuple[int, ...]:
     """Returns a tuple of deduplicated, sorted, and positive axes."""
@@ -39,6 +41,7 @@ class RMSNorm(nnx.Module):
         axis_name: str | None = None,
         axis_index_groups: Any = None,
         use_fast_variance: bool = True,
+        scope_name: str = "rms_norm",
     ):
         feature_shape = (num_features,)
 
@@ -67,7 +70,9 @@ class RMSNorm(nnx.Module):
         self.axis_name = axis_name
         self.axis_index_groups = axis_index_groups
         self.use_fast_variance = use_fast_variance
+        self.name = scope_name
 
+    @named_scope
     def __call__(self, x, mask: jax.Array | None = None):
         mean, var = _compute_stats(
             x,
@@ -195,6 +200,7 @@ class GemmaRMSNorm(nnx.Module):
             )
         )
 
+    @named_scope
     def __call__(
         self, x: jax.Array, residual: jax.Array | None = None
     ) -> jax.Array | tuple[jax.Array, jax.Array]:

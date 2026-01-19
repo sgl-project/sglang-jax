@@ -26,6 +26,8 @@ from flax.typing import PromoteDtypeFn
 from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 
+from sgl_jax.srt.utils.profiling_utils import named_scope
+
 
 class Embed(nnx.Module):
     """A parameterized function from integers [0, n) to d-dimensional vectors.
@@ -81,6 +83,7 @@ class Embed(nnx.Module):
         self.promote_dtype = promote_dtype
         self.mesh = mesh
 
+    @named_scope
     def __call__(self, inputs: jax.Array) -> jax.Array:
         """Embeds the inputs along the last dimension.
 
@@ -208,6 +211,7 @@ class RotaryEmbedding:
         inv_freq_np = 1.0 / (base ** (np.arange(0, rotary_dim, 2, dtype=np.float32) / rotary_dim))
         self._inv_freq_np = inv_freq_np  # shape: (rotary_dim // 2,)
 
+    @named_scope
     def __call__(
         self,
         positions: jax.Array,
