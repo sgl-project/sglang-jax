@@ -388,170 +388,23 @@ suites = {
     ],
     "nightly-test-accuracy-text-models-tpu-v6e-1-daily": [
         TestFile(
-            "nightly-test/test_accuracy.py",
+            "nightly-test/test_accuracy_daily.py",
             estimated_time=300,
             test_methods=["TestModelAccuracy.test_qwen_7b_daily"],
-        ),
-        TestFile(
-            "nightly-test/test_accuracy.py",
-            estimated_time=312,
-            test_methods=["TestModelAccuracy.test_qwen3_8b_daily"],
-        ),
-        TestFile(
-            "nightly-test/test_accuracy.py",
-            estimated_time=171,
-            test_methods=["TestModelAccuracy.test_DEEPSEEK_R1_DISTILL_QWEN_1_5B_daily"],
-        ),
-        TestFile(
-            "nightly-test/test_accuracy.py",
-            estimated_time=200,
-            test_methods=["TestModelAccuracy.test_GEMMA2_2B_IT_daily"],
-        ),
-    ],
-    "nightly-test-accuracy-text-models-tpu-v6e-4-daily": [
-        TestFile(
-            "nightly-test/test_accuracy.py",
-            estimated_time=53,
-            test_methods=["TestModelAccuracy.test_qwen_7b_tp_4_daily"],
-        ),
-        TestFile(
-            "nightly-test/test_accuracy.py",
-            estimated_time=64,
-            test_methods=["TestModelAccuracy.test_qwen3_8b_tp_4_daily"],
-        ),
-        TestFile(
-            "nightly-test/test_accuracy.py",
-            estimated_time=50,
-            test_methods=["TestModelAccuracy.test_bailing_moe_tp_2_ep2_daily"],
-        ),
-        TestFile(
-            "nightly-test/test_accuracy.py",
-            estimated_time=90,
-            test_methods=["TestModelAccuracy.test_DEEPSEEK_R1_DISTILL_QWEN_1_5B_tp_4_daily"],
-        ),
-        TestFile(
-            "nightly-test/test_accuracy.py",
-            estimated_time=62,
-            test_methods=["TestModelAccuracy.test_QWEN3_30B_A3B_tp_2_ep_2_daily"],
-        ),
-        TestFile(
-            "nightly-test/test_accuracy.py",
-            estimated_time=2,
-            test_methods=["TestModelAccuracy.test_GEMMA2_2B_IT_tp_4_daily"],
         ),
     ],
     "nightly-test-perf-text-models-tpu-v6e-1-daily": [
         TestFile(
-            "nightly-test/test_pref.py",
+            "nightly-test/test_perf_daily.py",
             estimated_time=7,
-            test_methods=["TestModePerf.test_qwen_7b_performance_tp_1_daily"],
-        ),
-        TestFile(
-            "nightly-test/test_pref.py",
-            estimated_time=8,
-            test_methods=["TestModePerf.test_qwen3_8b_performance_tp_1_daily"],
-        ),
-        TestFile(
-            "nightly-test/test_pref.py",
-            estimated_time=2,
-            test_methods=["TestModePerf.test_GEMMA2_2B_IT_performance_tp_1_daily"],
-        ),
-        TestFile(
-            "nightly-test/test_pref.py",
-            estimated_time=2.5,
-            test_methods=["TestModePerf.test_QWEN2_5_7B_INSTRUCT_performance_tp_1_daily"],
-        ),
-    ],
-    "nightly-test-perf-text-models-tpu-v6e-4-daily": [
-        TestFile(
-            "nightly-test/test_pref.py",
-            estimated_time=7,
-            test_methods=["TestModePerf.test_qwen_7b_performance_tp_4_daily"],
-        ),
-        TestFile(
-            "nightly-test/test_pref.py",
-            estimated_time=8,
-            test_methods=["TestModePerf.test_qwen3_8b_performance_tp_4_daily"],
-        ),
-        TestFile(
-            "nightly-test/test_pref.py",
-            estimated_time=30,
-            test_methods=["TestModePerf.test_QWEN3_MOE_30B_performance_tp_2_ep_2_daily"],
-        ),
-        TestFile(
-            "nightly-test/test_pref.py",
-            estimated_time=2,
-            test_methods=["TestModePerf.test_GEMMA2_2B_IT_performance_tp_4_daily"],
-        ),
-        TestFile(
-            "nightly-test/test_pref.py",
-            estimated_time=20,
-            test_methods=["TestModePerf.test_bailing_moe_performance_tp_2_ep_2_daily"],
-        ),
-        TestFile(
-            "nightly-test/test_pref.py",
-            estimated_time=2.5,
-            test_methods=["TestModePerf.test_QWEN2_5_7B_INSTRUCT_performance_tp_4_daily"],
+            test_methods=["TestModelPerf.test_qwen_7b_performance_tp_1_daily"],
         ),
     ],
     "nightly-test-perf-trace-text-models-tpu-v6e-1-daily": [
         TestFile(
-            "nightly-test/test_perf_trace.py",
+            "nightly-test/test_perf_trace_daily.py",
             estimated_time=7,
             test_methods=["TestModelPerfTrace.test_qwen_7b_performance_trace_tp_1_daily"],
-        ),
-        TestFile(
-            "nightly-test/test_perf_trace.py",
-            estimated_time=2,
-            test_methods=["TestModelPerfTrace.test_qwen3_8b_performance_trace_tp_1_daily"],
-        ),
-        TestFile(
-            "nightly-test/test_perf_trace.py",
-            estimated_time=7,
-            test_methods=["TestModelPerfTrace.test_GEMMA2_2B_IT_performance_trace_tp_1_daily"],
-        ),
-        TestFile(
-            "nightly-test/test_perf_trace.py",
-            estimated_time=2,
-            test_methods=[
-                "TestModelPerfTrace.test_QWEN2_5_7B_INSTRUCT_performance_trace_tp_1_daily"
-            ],
-        ),
-    ],
-    "nightly-test-perf-trace-text-models-tpu-v6e-4-daily": [
-        TestFile(
-            "nightly-test/test_perf_trace.py",
-            estimated_time=7,
-            test_methods=["TestModelPerfTrace.test_qwen_7b_performance_trace_tp_4_daily"],
-        ),
-        TestFile(
-            "nightly-test/test_perf_trace.py",
-            estimated_time=8,
-            test_methods=["TestModelPerfTrace.test_qwen3_8b_performance_trace_tp_4_daily"],
-        ),
-        TestFile(
-            "nightly-test/test_perf_trace.py",
-            estimated_time=30,
-            test_methods=[
-                "TestModelPerfTrace.test_QWEN3_MOE_30B_performance_trace_tp_2_ep_2_daily"
-            ],
-        ),
-        TestFile(
-            "nightly-test/test_perf_trace.py",
-            estimated_time=2,
-            test_methods=["TestModelPerfTrace.test_GEMMA2_2B_IT_performance_trace_tp_4_daily"],
-        ),
-        TestFile(
-            "nightly-test/test_perf_trace.py",
-            estimated_time=20,
-            test_methods=["TestModelPerfTrace.test_bailing_moe_performance_trace_tp_2_ep_2_daily"],
-        ),
-        TestFile(
-            "nightly-test/test_perf_trace.py",
-            estimated_time=2.5,
-            test_methods=[
-                "TestModelPerfTrace.test_QWEN2_5_7B_INSTRUCT_performance_trace_tp_4_daily"
-            ],
         ),
     ],
     "sglang_dependency_test": [],
