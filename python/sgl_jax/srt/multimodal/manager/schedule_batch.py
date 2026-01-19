@@ -176,21 +176,37 @@ class Req:
 
     @staticmethod
     def from_stage(stage_result: Any, req_store: dict):
+        """Convert stage output to a Req object.
+
+        Args:
+            stage_result: Output from a stage (BatchTokenIDOut or Req).
+            req_store: Dictionary mapping rid to ReqTrackingState.
+
+        Returns:
+            The Req object, or None if not ready or if the request was aborted
+            (rid no longer in req_store).
+        """
         if type(stage_result) is BatchTokenIDOut:
             req = None
             for i, rid in enumerate(stage_result.rids):
                 if rid.endswith(NegativePromptSuffix):
                     rid = rid[: -len(NegativePromptSuffix)]
                     if rid not in req_store:
-                        raise RuntimeError(f"{rid} is not in req_store")
-                    req = req_store[rid]
+                        # Request was aborted, skip it
+                        return None
+                    # req_store now contains ReqTrackingState, access .req
+                    tracking_state = req_store[rid]
+                    req = tracking_state.req if hasattr(tracking_state, "req") else tracking_state
                     req.negative_prompt_embeds = stage_result.output_hidden_states_for_mm[i][0]
                 else:
                     if rid not in req_store:
-                        raise RuntimeError(f"{rid} is not in req_store")
-                    req = req_store[rid]
+                        # Request was aborted, skip it
+                        return None
+                    # req_store now contains ReqTrackingState, access .req
+                    tracking_state = req_store[rid]
+                    req = tracking_state.req if hasattr(tracking_state, "req") else tracking_state
                     req.prompt_embeds = stage_result.output_hidden_states_for_mm[i][0]
-            if req.prompt_embeds is None or req.negative_prompt_embeds is None:
+            if req is None or req.prompt_embeds is None or req.negative_prompt_embeds is None:
                 return None
             return req
         else:

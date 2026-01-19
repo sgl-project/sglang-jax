@@ -1,3 +1,5 @@
+from collections.abc import Callable
+
 import jax
 
 from sgl_jax.srt.multimodal.common.ServerArgs import MultimodalServerArgs
@@ -21,28 +23,21 @@ class DiffusionModelWorker:
         # init cache here if needed
         # init different attention backend if needed
 
-    def forward(self, batch: Req, mesh: jax.sharding.Mesh):
-        # Implement the diffusion model inference logic here
-        # latents: Array,
-        # text_embeds: Array,
-        # negative_embeds: Array,
-        # num_steps: int = 30,
-        # guidance_scale: float = 5.0,
-        # scheduler: Optional[FlaxUniPCMultistepScheduler] = None,
-        # scheduler_state: Optional[UniPCMultistepSchedulerState] = None,
-
-        """
-        Generate video from text embeddings using the diffusion model.
+    def forward(
+        self,
+        batch: Req,
+        mesh: jax.sharding.Mesh,
+        abort_checker: Callable[[], bool] | None = None,
+    ) -> bool:
+        """Generate video from text embeddings using the diffusion model.
 
         Args:
-            text_embeds: [B, seq_len, text_dim] text embeddings from UMT5
-            num_frames: Number of frames to generate
-            latent_size: Spatial size of latents
-            num_steps: Number of denoising steps
-            guidance_scale: Classifier-free guidance scale (5-6 recommended)
+            batch: Request batch containing text embeddings and parameters.
+            mesh: JAX device mesh for sharding.
+            abort_checker: Optional callback that returns True if the request
+                should be aborted. Called between diffusion steps.
 
         Returns:
-            latents: [B, T, H, W, C] generated video latents
+            True if the request was aborted, False otherwise.
         """
-
-        self.model_runner.forward(batch, mesh)
+        return self.model_runner.forward(batch, mesh, abort_checker=abort_checker)

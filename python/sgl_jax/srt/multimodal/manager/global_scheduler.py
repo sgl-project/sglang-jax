@@ -1,3 +1,4 @@
+import dataclasses
 import logging
 import os
 import queue
@@ -22,6 +23,21 @@ from sgl_jax.srt.utils.common_utils import get_zmq_socket
 from sgl_jax.utils import TypeBasedDispatcher, get_exception_traceback
 
 logger = logging.getLogger(__name__)
+
+
+@dataclasses.dataclass
+class ReqTrackingState:
+    """Tracks a request's state in the pipeline.
+
+    Attributes:
+        req: The request object.
+        current_stage: The stage index where the request is currently being
+            processed (0-indexed). A value of -1 indicates the request has
+            not yet entered the pipeline.
+    """
+
+    req: Req
+    current_stage: int = 0
 
 
 class GlobalScheduler:
@@ -114,20 +130,66 @@ class GlobalScheduler:
     def handle_abort_request(self, abort_req: AbortReq):
         """Handle a client abort request.
 
-        Currently this logs the abort request. In future the abort should be
-        propagated to stages to cancel in-flight work associated with the
-        request id (`rid`).
+        Aborts requests matching the given rid (or all requests if abort_all
+        is True). The abort is performed in two phases:
+
+        1. Remove matching requests from req_store and send abort notifications
+           only to stages where the request is currently at or will pass through
+           (current_stage and subsequent stages).
+        2. Send AbortReq back to detokenizer (which forwards to tokenizer) to
+           notify the client that the request has been aborted.
+
+        For requests that are already being processed by a stage, the stage
+        scheduler will check for abort status and skip remaining work.
         """
-        logger.info("Received abort request for rid=%s", abort_req.rid)
-        # For now, just log and return None
-        # TODO: Forward abort to stages if needed
+        logger.info(
+            "Received abort request for rid=%s, abort_all=%s",
+            abort_req.rid,
+            abort_req.abort_all,
+        )
+
+        # Find all requests to abort
+        rids_to_abort = []
+        if abort_req.abort_all:
+            rids_to_abort = list(self.req_store.keys())
+        else:
+            # Match requests whose rid starts with the given rid
+            for rid in list(self.req_store.keys()):
+                if rid.startswith(abort_req.rid):
+                    rids_to_abort.append(rid)
+
+        if not rids_to_abort:
+            logger.info("No matching requests found for abort request rid=%s", abort_req.rid)
+            return None
+
+        # Abort each matching request
+        for rid in rids_to_abort:
+            tracking_state = self.req_store.pop(rid, None)
+            if tracking_state is not None:
+                current_stage = tracking_state.current_stage
+                logger.info("Aborting request rid=%s at stage %d", rid, current_stage)
+
+                # Send abort signal only to current stage (subsequent stages won't
+                # receive the request because event_loop checks req_store)
+                stage_abort_req = AbortReq(
+                    rid=rid,
+                    aborted_message="Aborted by client request",
+                )
+                try:
+                    self.in_queues[current_stage].put_nowait(stage_abort_req)
+                except Exception as e:
+                    logger.warning("Failed to send abort to stage %d queue: %s", current_stage, e)
+
+                # Send AbortReq to detokenizer -> tokenizer to notify client
+                self.send_to_detokenizer.send_pyobj(stage_abort_req)
+
         return None
 
     def convert_request(self, input: TokenizedGenerateMMReqInput):
         """Convert a tokenized input into internal `Req`.
 
         Parses input size, constructs a `Req` object, ensures the request id
-        is unique in `req_store`, and stores the request for tracking.
+        is unique in `req_store`, and stores the request with tracking state.
         """
 
         size_str = input.size if input.size else "1024*1024"
@@ -145,7 +207,8 @@ class GlobalScheduler:
         )
         if req.rid in self.req_store:
             raise RuntimeError(f"{req.rid} is already in req_store")
-        self.req_store[req.rid] = req
+        # Store with tracking state, starting at stage 0
+        self.req_store[req.rid] = ReqTrackingState(req=req, current_stage=0)
         return req
 
     def start_stage(self):
@@ -218,16 +281,29 @@ class GlobalScheduler:
                         )
                     if stage_result is None:
                         continue
+
+                    # Check if request was aborted (rid no longer in req_store)
+                    if stage_result.rid not in self.req_store:
+                        logger.info(
+                            "Skipping aborted request rid=%s from stage-%d",
+                            stage_result.rid,
+                            i,
+                        )
+                        continue
+
+                    if self.stage_configs[i].final_output:
+                        self.send_to_detokenizer.send_pyobj(stage_result)
+                        del self.req_store[stage_result.rid]
                     else:
-                        if self.stage_configs[i].final_output:
-                            self.send_to_detokenizer.send_pyobj(stage_result)
-                            del self.req_store[stage_result.rid]
-                        else:
-                            stage_reqs = stage_result.to_stage_reqs(
-                                self.stage_configs[i + 1].scheduler
-                            )
-                            for stage_req in stage_reqs:
-                                self.in_queues[i + 1].put_nowait(stage_req)
+                        # Update tracking state to next stage before dispatching
+                        next_stage = i + 1
+                        self.req_store[stage_result.rid].current_stage = next_stage
+
+                        stage_reqs = stage_result.to_stage_reqs(
+                            self.stage_configs[next_stage].scheduler
+                        )
+                        for stage_req in stage_reqs:
+                            self.in_queues[next_stage].put_nowait(stage_req)
 
 
 def run_global_scheduler_process(

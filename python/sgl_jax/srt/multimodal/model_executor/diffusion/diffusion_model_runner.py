@@ -1,5 +1,6 @@
 import logging
 import time
+from collections.abc import Callable
 from functools import partial
 
 import jax
@@ -115,10 +116,23 @@ class DiffusionModelRunner(BaseModelRunner):
 
         self.jitted_forward = forward_wrapper
 
-    def forward(self, batch: Req, mesh: jax.sharding.Mesh):
-        # Implement the diffusion model inference logic here
-        # This might include steps like adding noise, denoising, etc.
+    def forward(
+        self,
+        batch: Req,
+        mesh: jax.sharding.Mesh,
+        abort_checker: Callable[[], bool] | None = None,
+    ) -> bool:
+        """Run diffusion inference with optional abort checking.
 
+        Args:
+            batch: Request batch containing embeddings and parameters.
+            mesh: JAX device mesh for sharding.
+            abort_checker: Optional callback that returns True if the request
+                should be aborted. Called between diffusion steps.
+
+        Returns:
+            True if the request was aborted, False otherwise.
+        """
         num_inference_steps = self.model_config.num_inference_steps
         guidance_scale = batch.guidance_scale
         do_classifier_free_guidance = guidance_scale > 1.0
@@ -170,6 +184,16 @@ class DiffusionModelRunner(BaseModelRunner):
         start_time = time.time()
 
         for step in tqdm(range(num_inference_steps), desc="Diffusion steps"):
+            # Check for abort between steps
+            if abort_checker is not None and abort_checker():
+                logger.info(
+                    "Diffusion aborted at step %d/%d for rid=%s",
+                    step,
+                    num_inference_steps,
+                    batch.rid,
+                )
+                return True  # Aborted
+
             t_scalar = jnp.array(self.solver.timesteps, dtype=jnp.int32)[step]
             if do_classifier_free_guidance:
                 latents = jnp.concatenate([latents] * 2, axis=0)
@@ -202,9 +226,9 @@ class DiffusionModelRunner(BaseModelRunner):
 
             latents = latents.transpose(0, 2, 3, 4, 1)  # back to channel-last
 
-        logging.info("Finished diffusion step %d in %.2f seconds", step, time.time() - start_time)
+        logger.info("Finished diffusion step %d in %.2f seconds", step, time.time() - start_time)
         batch.latents = jax.device_get(latents)
-        return batch
+        return False  # Not aborted
 
     def prepare_latents(self, batch: Req):
         if batch.latents is not None:
