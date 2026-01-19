@@ -56,7 +56,7 @@ SGL-JAX is designed for easy extension to new model architectures. It currently 
 -   **Llama**: Performance needs to improve.
 -   **Bailing MoE**: Performance needs to improve.
 -   **MiMo-7B**: Support Eagle's Speculative Decoding, Performance needs to improve.
--   **Wan 2.1**: Multimodal Model, [Multimodal Architecture Design](docs/mutlimodal/design/[RFC]multimodal_architechure.md), [Usage Guide](docs/mutlimodal/multimodal_usage.md)
+-   **Wan 2.1**: Multimodal Model. When launching this model, please refer to the [Usage Guide](docs/mutlimodal/multimodal_usage.md) and [Architecture Design](docs/mutlimodal/design/[RFC]multimodal_architechure.md).
 
 
 ## Performance and Benchmarking
