@@ -655,7 +655,7 @@ class BailingMoEForCausalLM(nnx.Module):
                     mappings[f"__MOE_EXPERTS__{prefix}.mlp.{target_name}"] = WeightMapping(
                         target_path=[f"{target_prefix}.mlp.{target_name}"] + expert_keys,
                         sharding=sharding,
-                        transpose=True,
+                        transpose=False,
                     )
 
                 if getattr(self.config, "num_shared_experts", 0) > 0:

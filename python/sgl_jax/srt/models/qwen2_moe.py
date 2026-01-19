@@ -598,7 +598,7 @@ class Qwen2MoeForCausalLM(nnx.Module):
             mappings[f"__MOE_EXPERTS__{prefix}.mlp.{target_name}"] = WeightMapping(
                 target_path=[f"{target_prefix}.mlp.{target_name}"] + expert_keys,
                 sharding=sharding,
-                transpose=True,
+                transpose=False,
             )
 
         return mappings
