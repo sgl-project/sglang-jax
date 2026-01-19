@@ -33,7 +33,7 @@ class TestCausalConv3d(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        from sgl_jax.srt.multimodal.models.wan2_1.vaes.wanvae import CausalConv3d
+        from sgl_jax.srt.multimodal.models.wan.vaes.wanvae import CausalConv3d
 
         cls.conv_class = CausalConv3d
 
@@ -130,7 +130,7 @@ class TestRMSNorm(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        from sgl_jax.srt.multimodal.models.wan2_1.vaes.wanvae import RMSNorm
+        from sgl_jax.srt.multimodal.models.wan.vaes.wanvae import RMSNorm
 
         cls.norm_class = RMSNorm
 
@@ -178,7 +178,7 @@ class TestResidualBlock(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        from sgl_jax.srt.multimodal.models.wan2_1.vaes.wanvae import ResidualBlock
+        from sgl_jax.srt.multimodal.models.wan.vaes.wanvae import ResidualBlock
 
         cls.block_class = ResidualBlock
 
@@ -224,7 +224,7 @@ class TestVAEEncodeDecode(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         from sgl_jax.srt.multimodal.configs.vaes.wan_vae_config import WanVAEConfig
-        from sgl_jax.srt.multimodal.models.wan2_1.vaes.wanvae import AutoencoderKLWan
+        from sgl_jax.srt.multimodal.models.wan.vaes.wanvae import AutoencoderKLWan
 
         cls.vae_class = AutoencoderKLWan
         cls.config_class = WanVAEConfig
@@ -399,7 +399,7 @@ class TestDiagonalGaussianDistribution(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        from sgl_jax.srt.multimodal.models.wan2_1.vaes.commons import (
+        from sgl_jax.srt.multimodal.models.wan.vaes.commons import (
             DiagonalGaussianDistribution,
         )
 
@@ -500,7 +500,7 @@ class TestUpDownSample(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        from sgl_jax.srt.multimodal.models.wan2_1.vaes.wanvae import (
+        from sgl_jax.srt.multimodal.models.wan.vaes.wanvae import (
             Downsample2d,
             Downsample3d,
             Upsample2d,

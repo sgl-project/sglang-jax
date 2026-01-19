@@ -16,9 +16,7 @@ from sgl_jax.srt.multimodal.manager.schedule_batch import Req
 from sgl_jax.srt.multimodal.model_executor.diffusion.diffusion_model_runner import (
     DiffusionModelRunner,
 )
-from sgl_jax.srt.multimodal.models.wan2_1.diffusion.wan2_1_dit import (
-    WanTransformer3DModel,
-)
+from sgl_jax.srt.multimodal.models.wan.diffusion.wan_dit import WanTransformer3DModel
 from sgl_jax.srt.utils.jax_utils import device_array
 
 
