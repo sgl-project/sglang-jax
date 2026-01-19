@@ -332,6 +332,8 @@ class Req:
         # capture routed experts
         self.return_routed_experts = return_routed_experts
         self.routed_experts: np.ndarray | None = None  # shape (seqlen, topk)
+        # latest_bid is used to improve return_routed_expert performance
+        self.latest_bid: int = None
 
     @property
     def seqlen(self):
@@ -486,6 +488,7 @@ class Req:
         self.req_pool_idx = None
         self.already_computed = 0
         self.routed_experts = None
+        self.latest_bid = None
 
     def set_finish_with_abort(self, error_msg: str):
         # set it to one token to skip the long prefill
@@ -506,12 +509,24 @@ class Req:
 bid = 0
 
 
+def get_global_bid():
+    global bid
+    return bid
+
+
+def acc_global_bid():
+    global bid
+    bid += 1
+    return bid
+
+
 @dataclasses.dataclass
 class ScheduleBatch:
     """Store all information of a batch on the scheduler."""
 
     # Request, memory pool, and cache
     reqs: list[Req]
+    bid: int = None
     req_to_token_pool: ReqToTokenPool = None
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator = None
     tree_cache: BasePrefixCache = None
@@ -1139,8 +1154,7 @@ class ScheduleBatch:
             cache_loc_paddings = cache_loc_paddings[-1:]
             extend_logprob_start_lens = self.extend_logprob_start_lens
 
-        global bid
-        bid += 1
+        bid = acc_global_bid()
 
         if self.input_ids is None:
             input_ids_cpu = np.empty(0, dtype=np.int32)
@@ -1415,8 +1429,7 @@ class ScheduleBatch:
             extend_prefix_lens = np.array(self.prefix_lens, dtype=np.int32)
             extend_logprob_start_lens = self.extend_logprob_start_lens
 
-        global bid
-        bid += 1
+        acc_global_bid()
 
         if self.input_ids is None:
             input_ids_cpu = np.empty(0, dtype=np.int32)
@@ -1614,6 +1627,7 @@ class ScheduleBatch:
             return_output_logprob_only=self.return_output_logprob_only,
             decoding_reqs=self.decoding_reqs,
             is_prefill_only=self.is_prefill_only,
+            bid=self.bid,
         )
 
     def _evict_tree_cache_if_needed(

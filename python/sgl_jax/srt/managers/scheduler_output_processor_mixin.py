@@ -41,6 +41,7 @@ class SchedulerOutputProcessorMixin:
             req_pool_idx=req.req_pool_idx,
             seqlen=req.seqlen,
             req_to_token_pool=self.req_to_token_pool,
+            bid=req.latest_bid,
         )
         req.routed_experts = np.transpose(tmp, (1, 0, 2))
 
@@ -91,6 +92,8 @@ class SchedulerOutputProcessorMixin:
         for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
             if req.is_retracted:
                 continue
+
+            req.latest_bid = batch.bid
 
             if self.is_mixed_chunk and self.enable_overlap and req.finished():
                 j = len(batch.out_cache_loc) - len(batch.reqs) + i
@@ -275,6 +278,8 @@ class SchedulerOutputProcessorMixin:
             req: Req
             if req.is_retracted:
                 continue
+
+            req.latest_bid = batch.bid
 
             indices_to_free = None
             if self.enable_overlap and req.finished():
