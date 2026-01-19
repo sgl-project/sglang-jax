@@ -48,6 +48,7 @@ class WeightMapping:
                 "k_proj",
                 "v_proj",
                 "w1",
+                "w3",
                 "w2",
                 "gate_proj",
                 "up_proj",
