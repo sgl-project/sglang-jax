@@ -71,7 +71,7 @@ class TestModelPerf(CustomTestCase):
 
         print(f"Dataset is ready at location: {cls.sharegpt_dataset_path}")
 
-    def _test_qwen_7b_performance_tp_1(self, concurrency_levels):
+    def test_qwen_7b_performance_tp_1_daily(self):
         import os
 
         MOUNT_ROOT = os.getenv("CI_MOUNT_ROOT", "/models")
@@ -93,8 +93,8 @@ class TestModelPerf(CustomTestCase):
         # concurrency levels
 
         # input length levels (1k, 4k, 8k)
-        input_lengths = [1024, 4096, 8192]
-        # concurrency_levels = [8]
+        input_lengths = [1024]
+        concurrency_levels = [8]
         # # input length levels (1k, 4k, 8k)
         # input_lengths = [1024]
 
@@ -180,7 +180,7 @@ class TestModelPerf(CustomTestCase):
             output_dir = os.getenv("PERF_OUTPUT_DIR", "./test/nightly_test_output/perf/local_run")
             os.makedirs(output_dir, exist_ok=True)
             concurrency_str = "_".join(map(str, concurrency_levels))
-            filename = f"performance_results_{model_dir_name}_c_{concurrency_str}.csv"
+            filename = f"performance_results_{model_dir_name}_tp_1.csv"
             output_filename = os.path.join(output_dir, filename)
             file_exists = os.path.exists(output_filename)
             with open(output_filename, "a", newline="", encoding="utf-8") as csvfile:
@@ -204,7 +204,7 @@ class TestModelPerf(CustomTestCase):
             )
         print("=" * 100)
 
-    def test_qwen_7b_performance_tp_4(self):
+    def test_qwen_7b_performance_tp_4_daily(self):
         import os
 
         MOUNT_ROOT = os.getenv("CI_MOUNT_ROOT", "/models")
@@ -224,9 +224,9 @@ class TestModelPerf(CustomTestCase):
 
         # define test parameters
         # concurrency levels
-        concurrency_levels = [8, 16, 32, 64, 128, 256]
+        concurrency_levels = [8]
         # input length levels (1k, 4k, 8k)
-        input_lengths = [1024, 4096, 8192]
+        input_lengths = [1024]
 
         # concurrency_levels = [8]
         # # input length levels (1k, 4k, 8k)
@@ -335,7 +335,7 @@ class TestModelPerf(CustomTestCase):
             )
         print("=" * 100)
 
-    def _test_qwen3_8b_performance_tp_1(self, concurrency_levels):
+    def test_qwen3_8b_performance_tp_1_daily(self):
         import os
 
         MOUNT_ROOT = os.getenv("CI_MOUNT_ROOT", "/models")
@@ -357,9 +357,9 @@ class TestModelPerf(CustomTestCase):
         # concurrency levels
 
         # input length levels (1k, 4k, 8k)
-        input_lengths = [1024, 4096, 8192]
+        input_lengths = [1024]
 
-        # concurrency_levels = [8]
+        concurrency_levels = [8]
         # # input length levels (1k, 4k, 8k)
         # input_lengths = [1024]
 
@@ -442,7 +442,7 @@ class TestModelPerf(CustomTestCase):
             output_dir = os.getenv("PERF_OUTPUT_DIR", "./test/nightly_test_output/perf/local_run")
             os.makedirs(output_dir, exist_ok=True)
             concurrency_str = "_".join(map(str, concurrency_levels))
-            filename = f"performance_results_{model_dir_name}_c_{concurrency_str}.csv"
+            filename = f"performance_results_{model_dir_name}_tp_1.csv"
             output_filename = os.path.join(output_dir, filename)
             file_exists = os.path.exists(output_filename)
             with open(output_filename, "a", newline="", encoding="utf-8") as csvfile:
@@ -466,7 +466,7 @@ class TestModelPerf(CustomTestCase):
             )
         print("=" * 100)
 
-    def test_qwen3_8b_performance_tp_4(self):
+    def test_qwen3_8b_performance_tp_4_daily(self):
         import os
 
         MOUNT_ROOT = os.getenv("CI_MOUNT_ROOT", "/models")
@@ -486,9 +486,9 @@ class TestModelPerf(CustomTestCase):
 
         # define test parameters
         # concurrency levels
-        concurrency_levels = [8, 16, 32, 64, 128, 256]
+        concurrency_levels = [8]
         # input length levels (1k, 4k, 8k)
-        input_lengths = [1024, 4096, 8192]
+        input_lengths = [1024]
 
         # concurrency_levels = [8]
         # # input length levels (1k, 4k, 8k)
@@ -597,7 +597,7 @@ class TestModelPerf(CustomTestCase):
             )
         print("=" * 100)
 
-    def test_QWEN3_MOE_30B_performance_tp_2_ep_2(self):
+    def test_QWEN3_MOE_30B_performance_tp_2_ep_2_daily(self):
         import os
 
         MOUNT_ROOT = os.getenv("CI_MOUNT_ROOT", "/models")
@@ -617,9 +617,9 @@ class TestModelPerf(CustomTestCase):
 
         # define test parameters
         # concurrency levels
-        concurrency_levels = [8, 16, 32, 64, 128, 256]
+        concurrency_levels = [8]
         # input length levels (1k, 4k, 8k)
-        input_lengths = [1024, 4096, 8192]
+        input_lengths = [1024]
 
         # concurrency_levels = [8]
         # # input length levels (1k, 4k, 8k)
@@ -730,7 +730,7 @@ class TestModelPerf(CustomTestCase):
             )
         print("=" * 100)
 
-    def _test_GEMMA2_2B_IT_performance_tp_1(self, concurrency_levels):
+    def test_GEMMA2_2B_IT_performance_tp_1_daily(self):
         import os
 
         MOUNT_ROOT = os.getenv("CI_MOUNT_ROOT", "/models")
@@ -752,8 +752,8 @@ class TestModelPerf(CustomTestCase):
         # concurrency levels
 
         # input length levels (1k, 4k, 8k)
-        input_lengths = [1024, 4096, 8192]
-        # concurrency_levels = [8]
+        input_lengths = [1024]
+        concurrency_levels = [8]
         # # input length levels (1k, 4k, 8k)
         # input_lengths = [1024]
 
@@ -838,7 +838,7 @@ class TestModelPerf(CustomTestCase):
             output_dir = os.getenv("PERF_OUTPUT_DIR", "./test/nightly_test_output/perf/local_run")
             os.makedirs(output_dir, exist_ok=True)
             concurrency_str = "_".join(map(str, concurrency_levels))
-            filename = f"performance_results_{model_dir_name}_c_{concurrency_str}.csv"
+            filename = f"performance_results_{model_dir_name}_tp_1.csv"
             output_filename = os.path.join(output_dir, filename)
             file_exists = os.path.exists(output_filename)
             with open(output_filename, "a", newline="", encoding="utf-8") as csvfile:
@@ -862,7 +862,7 @@ class TestModelPerf(CustomTestCase):
             )
         print("=" * 100)
 
-    def test_GEMMA2_2B_IT_performance_tp_4(self):
+    def test_GEMMA2_2B_IT_performance_tp_4_daily(self):
         import os
 
         MOUNT_ROOT = os.getenv("CI_MOUNT_ROOT", "/models")
@@ -882,9 +882,9 @@ class TestModelPerf(CustomTestCase):
 
         # define test parameters
         # concurrency levels
-        concurrency_levels = [8, 16, 32, 64, 128, 256]
+        concurrency_levels = [8]
         # input length levels (1k, 4k, 8k)
-        input_lengths = [1024, 4096, 8192]
+        input_lengths = [1024]
 
         # concurrency_levels = [8]
         # # input length levels (1k, 4k, 8k)
@@ -995,7 +995,7 @@ class TestModelPerf(CustomTestCase):
             )
         print("=" * 100)
 
-    def test_bailing_moe_performance_tp_2_ep_2(self):
+    def test_bailing_moe_performance_tp_2_ep_2_daily(self):
         import os
 
         MOUNT_ROOT = os.getenv("CI_MOUNT_ROOT", "/models")
@@ -1015,9 +1015,9 @@ class TestModelPerf(CustomTestCase):
 
         # define test parameters
         # concurrency levels
-        concurrency_levels = [8, 16, 32, 64, 128, 256]
+        concurrency_levels = [8]
         # input length levels (1k, 4k, 8k)
-        input_lengths = [1024, 4096, 8192]
+        input_lengths = [1024]
 
         # concurrency_levels = [8]
         # # input length levels (1k, 4k, 8k)
@@ -1029,6 +1029,7 @@ class TestModelPerf(CustomTestCase):
             "2",
             "--ep-size",
             "2",
+            "--enable-return-routed-experts",
         ]
         # launch server
         process = popen_launch_server(
@@ -1071,6 +1072,7 @@ class TestModelPerf(CustomTestCase):
                             random_range_ratio=1.0,
                             request_rate=float("inf"),
                             seed=42,
+                            return_routed_expert=True,
                         )
 
                         vars(args).update(static_config)
@@ -1117,7 +1119,7 @@ class TestModelPerf(CustomTestCase):
 
                 writer.writerows(results_summary)
 
-    def _test_QWEN2_5_7B_INSTRUCT_performance_tp_1(self, concurrency_levels):
+    def test_QWEN2_5_7B_INSTRUCT_performance_tp_1_daily(self):
         import os
 
         MOUNT_ROOT = os.getenv("CI_MOUNT_ROOT", "/models")
@@ -1139,8 +1141,8 @@ class TestModelPerf(CustomTestCase):
         # concurrency levels
 
         # input length levels (1k, 4k, 8k)
-        input_lengths = [1024, 4096, 8192]
-        # concurrency_levels = [8]
+        input_lengths = [1024]
+        concurrency_levels = [8]
         # # input length levels (1k, 4k, 8k)
         # input_lengths = [1024]
 
@@ -1222,7 +1224,7 @@ class TestModelPerf(CustomTestCase):
             output_dir = os.getenv("PERF_OUTPUT_DIR", "./test/nightly_test_output/perf/local_run")
             os.makedirs(output_dir, exist_ok=True)
             concurrency_str = "_".join(map(str, concurrency_levels))
-            filename = f"performance_results_{model_dir_name}_c_{concurrency_str}.csv"
+            filename = f"performance_results_{model_dir_name}_tp_1.csv"
             output_filename = os.path.join(output_dir, filename)
             file_exists = os.path.exists(output_filename)
             with open(output_filename, "a", newline="", encoding="utf-8") as csvfile:
@@ -1235,7 +1237,7 @@ class TestModelPerf(CustomTestCase):
 
                 writer.writerows(results_summary)
 
-    def test_QWEN2_5_7B_INSTRUCT_performance_tp_4(self):
+    def test_QWEN2_5_7B_INSTRUCT_performance_tp_4_daily(self):
         import os
 
         MOUNT_ROOT = os.getenv("CI_MOUNT_ROOT", "/models")
@@ -1255,9 +1257,9 @@ class TestModelPerf(CustomTestCase):
 
         # define test parameters
         # concurrency levels
-        concurrency_levels = [8, 16, 32, 64, 128, 256]
+        concurrency_levels = [8]
         # input length levels (1k, 4k, 8k)
-        input_lengths = [1024, 4096, 8192]
+        input_lengths = [1024]
 
         # concurrency_levels = [8]
         # # input length levels (1k, 4k, 8k)
@@ -1356,7 +1358,7 @@ class TestModelPerf(CustomTestCase):
 
                 writer.writerows(results_summary)
 
-    def test_qwen3_32B_lora_r32_performance_tp_4(self):
+    def test_qwen3_32B_lora_r32_performance_tp_4_daily(self):
         model = "Qwen/Qwen3-32B"
         lora_path = "flyfishxu/DeepNews-LoRA-Qwen3-32B"
         lora_name = ["DeepNews-LoRA-Qwen3-32B"]
@@ -1422,7 +1424,7 @@ class TestModelPerf(CustomTestCase):
 
         # define test parameters
         # concurrency levels
-        concurrency_levels = [8, 16, 32, 64, 128, 256]
+        concurrency_levels = [8]
         input_lengths = [4096]
 
         output_lengths = [1, 1024]
@@ -1560,298 +1562,6 @@ class TestModelPerf(CustomTestCase):
                 f"{r['concurrency']:<5} | {r['input']:<6} | {r['output']:<6} | {r['ttft_ms']:<10.2f} | {r['itl_ms']:<10.2f} | {r['out_tps']:<10.2f} | {r['in_tps']:<10.2f}| {r['model_name']:<20}"
             )
         print("=" * 100)
-
-    def test_qwen3_moe_performance_tp_2_ep_2(self):
-        import os
-
-        MOUNT_ROOT = os.getenv("CI_MOUNT_ROOT", "/models")
-        raw_model_id = QWEN3_MOE_30B
-        model_dir_name = "QWEN3_MOE_30B"
-        cached_model_path = os.path.join(MOUNT_ROOT, "model_scope", model_dir_name)
-
-        print(f"[CI Info] Checking Model Cache at: {cached_model_path}")
-        if os.path.exists(cached_model_path):
-            print(f"[CI Info] Hit Model Cache: {cached_model_path}")
-            model_path_for_server = cached_model_path
-        else:
-            print(f"[CI Info] Cache Miss, downloading: {raw_model_id}")
-            model_path_for_server = raw_model_id
-
-        base_url = DEFAULT_URL_FOR_TEST
-        allow_gap = 0.05
-
-        expected_performance_base = {
-            8: {
-                4096: {
-                    "ttft": 2529.57,
-                    "itl": 10.92,
-                    "input_throughput": 12891.69,
-                    "output_throughput": 596.39,
-                }
-            },
-            16: {
-                4096: {
-                    "ttft": 5054.32,
-                    "itl": 16.30,
-                    "input_throughput": 12931.20,
-                    "output_throughput": 752.73,
-                }
-            },
-            32: {
-                4096: {
-                    "ttft": 10092.03,
-                    "itl": 23.58,
-                    "input_throughput": 12972.17,
-                    "output_throughput": 956.89,
-                }
-            },
-            64: {
-                4096: {
-                    "ttft": 20094.59,
-                    "itl": 30.37,
-                    "input_throughput": 13009.71,
-                    "output_throughput": 952.92,
-                }
-            },
-            128: {
-                4096: {
-                    "ttft": 40190.43,
-                    "itl": 30.62,
-                    "input_throughput": 13003.40,
-                    "output_throughput": 952.21,
-                }
-            },
-            256: {
-                4096: {
-                    "ttft": 80436.38,
-                    "itl": 30.55,
-                    "input_throughput": 13015.35,
-                    "output_throughput": 958.24,
-                }
-            },
-        }
-        expected_performance_return_routed_experts = {
-            8: {
-                4096: {
-                    "ttft": 2528.74,
-                    "itl": 10.93,
-                    "input_throughput": 12830.98,
-                    "output_throughput": 584.16,
-                }
-            },
-            16: {
-                4096: {
-                    "ttft": 5052.94,
-                    "itl": 16.29,
-                    "input_throughput": 12904.23,
-                    "output_throughput": 733.05,
-                }
-            },
-            32: {
-                4096: {
-                    "ttft": 10091.63,
-                    "itl": 23.58,
-                    "input_throughput": 12957.48,
-                    "output_throughput": 925.76,
-                }
-            },
-            64: {
-                4096: {
-                    "ttft": 20095.98,
-                    "itl": 30.36,
-                    "input_throughput": 13001.42,
-                    "output_throughput": 944.56,
-                }
-            },
-            128: {
-                4096: {
-                    "ttft": 40189.88,
-                    "itl": 30.62,
-                    "input_throughput": 12999.18,
-                    "output_throughput": 947.85,
-                }
-            },
-            256: {
-                4096: {
-                    "ttft": 80447.77,
-                    "itl": 30.55,
-                    "input_throughput": 13013.66,
-                    "output_throughput": 953.50,
-                }
-            },
-        }
-
-        # define test parameters
-        # concurrency levels
-        concurrency_levels = [8, 16, 32, 64, 128, 256]
-        # input length levels (4k)
-        input_lengths = [4096]
-
-        output_lengths = [1, 1024]
-
-        def common_run(extra_args, expected_performance, file_suffix, return_routed_experts):
-            specific_args = self.BASIC_SERVER_ARGS + extra_args
-            # launch server
-            process = popen_launch_server(
-                model_path_for_server,
-                base_url,
-                timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-                device="tpu",
-                other_args=specific_args,
-                env={
-                    "JAX_COMPILATION_CACHE_DIR": "/tmp/jax_compilation_cache",
-                },
-            )
-
-            results_summary = []
-
-            try:
-                static_config = {
-                    "dataset_name": "random",
-                    "dataset_path": self.sharegpt_dataset_path,
-                    "warmup_requests": 0,
-                }
-                for concurrency in concurrency_levels:
-                    for in_len in input_lengths:
-                        for out_len in output_lengths:
-                            print(f"\n{'#'*60}")
-                            print(
-                                f"Testing Scenario: Concurrency={concurrency} | Input={in_len} | Output={out_len}"
-                            )
-                            print(f"{'#'*60}")
-
-                            current_num_prompts = concurrency * 3
-
-                            args = get_benchmark_args(
-                                base_url=base_url,
-                                tokenizer=model_path_for_server,
-                                num_prompts=current_num_prompts,
-                                max_concurrency=concurrency,
-                                random_input_len=in_len,
-                                random_output_len=out_len,
-                                random_range_ratio=1.0,
-                                request_rate=float("inf"),
-                                seed=42,
-                                return_routed_experts=return_routed_experts,
-                            )
-
-                            vars(args).update(static_config)
-
-                            metrics = run_benchmark(args)
-
-                            if out_len == 1:
-                                self.assertGreater(
-                                    metrics["input_throughput"],
-                                    expected_performance[concurrency][in_len]["input_throughput"]
-                                    * (1 - allow_gap),
-                                )
-                                self.assertLess(
-                                    metrics["median_ttft_ms"],
-                                    expected_performance[concurrency][in_len]["ttft"]
-                                    * (1 + allow_gap),
-                                )
-                            else:
-                                self.assertGreater(
-                                    metrics["output_throughput"],
-                                    expected_performance[concurrency][in_len]["output_throughput"]
-                                    * (1 - allow_gap),
-                                )
-                                self.assertLess(
-                                    metrics["median_itl_ms"],
-                                    expected_performance[concurrency][in_len]["itl"]
-                                    * (1 + allow_gap),
-                                )
-
-                            results_summary.append(
-                                {
-                                    "concurrency": concurrency,
-                                    "input": in_len,
-                                    "output": out_len,
-                                    "ttft_ms": metrics.get("median_ttft_ms", 0),
-                                    "itl_ms": metrics.get("median_itl_ms", 0),
-                                    "in_tps": metrics.get("input_throughput", 0),
-                                    "out_tps": metrics.get("output_throughput", 0),
-                                    "model_name": raw_model_id,
-                                    "tpu_size": 4,
-                                }
-                            )
-                            time.sleep(1)
-
-            finally:
-                process.terminate()
-                process.wait()
-
-            if results_summary:
-                import csv
-                import os
-
-                output_dir = os.getenv(
-                    "PERF_OUTPUT_DIR", "./test/nightly_test_output/perf/local_run"
-                )
-                os.makedirs(output_dir, exist_ok=True)
-                output_filename = os.path.join(
-                    output_dir, f"performance_results_{model_dir_name}_tp_2_ep_2_{file_suffix}.csv"
-                )
-                file_exists = os.path.exists(output_filename)
-                with open(output_filename, "a", newline="", encoding="utf-8") as csvfile:
-
-                    headers = results_summary[0].keys()
-                    writer = csv.DictWriter(csvfile, fieldnames=headers)
-
-                    if not file_exists:
-                        writer.writeheader()
-
-                    writer.writerows(results_summary)
-
-        print(f"Begin to test base performance case for qwen3_moe", flush=True)
-        common_run(
-            extra_args=["--tp-size", "2", "--ep-size", "2"],
-            expected_performance=expected_performance_base,
-            file_suffix="base",
-            return_routed_experts=False,
-        )
-        print(f"Complete testing base performance case for qwen3_moe", flush=True)
-        time.sleep(10)
-        print(f"Begin to test return_routed_experts performance case for qwen3_moe", flush=True)
-        common_run(
-            extra_args=["--tp-size", "2", "--ep-size", "2", "--enable-return-routed-experts"],
-            expected_performance=expected_performance_return_routed_experts,
-            file_suffix="return_routed_experts",
-            return_routed_experts=True,
-        )
-        print(f"Complete testing return_routed_experts performance case for qwen3_moe", flush=True)
-
-    def test_qwen_7b_performance_tp_1_low_concurrency(self):
-        concurrency_levels = [8, 16, 32, 64, 128]
-        self._test_qwen_7b_performance_tp_1(concurrency_levels)
-
-    def test_qwen_7b_performance_tp_1_high_concurrency(self):
-        concurrency_levels = [256]
-        self._test_qwen_7b_performance_tp_1(concurrency_levels)
-
-    def test_qwen3_8b_performance_tp_1_low_concurrency(self):
-        concurrency_levels = [8, 16, 32, 64, 128]
-        self._test_qwen3_8b_performance_tp_1(concurrency_levels)
-
-    def test_qwen3_8b_performance_tp_1_high_concurrency(self):
-        concurrency_levels = [256]
-        self._test_qwen3_8b_performance_tp_1(concurrency_levels)
-
-    def test_GEMMA2_2B_IT_performance_tp_1_low_concurrency(self):
-        concurrency_levels = [8, 16, 32, 64, 128]
-        self._test_GEMMA2_2B_IT_performance_tp_1(concurrency_levels)
-
-    def test_GEMMA2_2B_IT_performance_tp_1_high_concurrency(self):
-        concurrency_levels = [256]
-        self._test_GEMMA2_2B_IT_performance_tp_1(concurrency_levels)
-
-    def test_QWEN2_5_7B_INSTRUCT_performance_tp_1_low_concurrency(self):
-        concurrency_levels = [8, 16, 32, 64, 128]
-        self._test_QWEN2_5_7B_INSTRUCT_performance_tp_1(concurrency_levels)
-
-    def test_QWEN2_5_7B_INSTRUCT_performance_tp_1_high_concurrency(self):
-        concurrency_levels = [256]
-        self._test_QWEN2_5_7B_INSTRUCT_performance_tp_1(concurrency_levels)
 
 
 if __name__ == "__main__":
