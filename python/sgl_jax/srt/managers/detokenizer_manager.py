@@ -114,7 +114,7 @@ class DetokenizerManager:
         if recv_obj.output_routed_experts is not None:
             output_routed_experts = [
                 (
-                    pybase64.b64encode(output_routed_experts.tobytes())
+                    pybase64.b64encode(output_routed_experts.tobytes()).decode("utf-8")
                     if output_routed_experts is not None
                     else None
                 )

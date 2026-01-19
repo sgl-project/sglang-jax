@@ -186,6 +186,8 @@ def extract_routed_experts_from_meta_info(data):
     # See detokenizer_manager::_extract_routed_experts
     routed_experts_base64 = data["meta_info"].get("routed_experts", None)
     if routed_experts_base64 is not None:
-        routed_experts = np.frombuffer(pybase64.b64decode(routed_experts_base64), dtype=np.int32)
+        routed_experts = np.frombuffer(
+            pybase64.b64decode(routed_experts_base64.encode("utf-8")), dtype=np.int32
+        )
         return routed_experts
     return None
