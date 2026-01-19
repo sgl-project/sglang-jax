@@ -34,6 +34,120 @@ CACHE_T = 2
 logger = logging.getLogger(__name__)
 
 
+class AvgDown3D(nnx.Module):
+    """Average downsampling for Wan2.2 VAE residual blocks.
+
+    Performs spatial and/or temporal downsampling by reshaping and averaging.
+    """
+
+    def __init__(self, in_channels: int, out_channels: int, factor_t: int, factor_s: int = 1):
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.factor_t = factor_t
+        self.factor_s = factor_s
+        self.factor = factor_t * factor_s * factor_s
+
+        assert in_channels * self.factor % out_channels == 0
+        self.group_size = in_channels * self.factor // out_channels
+
+    def __call__(self, x: jax.Array) -> jax.Array:
+        # x: [B, T, H, W, C] (JAX channel-last format)
+        b, t, h, w, c = x.shape
+
+        # Pad temporal dimension if needed
+        pad_t = (self.factor_t - t % self.factor_t) % self.factor_t
+        if pad_t > 0:
+            x = jnp.pad(x, ((0, 0), (pad_t, 0), (0, 0), (0, 0), (0, 0)))
+            t = t + pad_t
+
+        # Reshape for downsampling
+        x = x.reshape(
+            b,
+            t // self.factor_t,
+            self.factor_t,
+            h // self.factor_s,
+            self.factor_s,
+            w // self.factor_s,
+            self.factor_s,
+            c,
+        )
+        # Permute: [B, T', factor_t, H', factor_s, W', factor_s, C]
+        #       -> [B, T', H', W', factor_t, factor_s, factor_s, C]
+        x = x.transpose(0, 1, 3, 5, 2, 4, 6, 7)
+        # Reshape to combine factors with channels
+        x = x.reshape(
+            b,
+            t // self.factor_t,
+            h // self.factor_s,
+            w // self.factor_s,
+            c * self.factor,
+        )
+        # Reshape for grouping and average
+        x = x.reshape(
+            b,
+            t // self.factor_t,
+            h // self.factor_s,
+            w // self.factor_s,
+            self.out_channels,
+            self.group_size,
+        )
+        x = x.mean(axis=-1)
+        return x
+
+
+class DupUp3D(nnx.Module):
+    """Duplicate upsampling for Wan2.2 VAE residual blocks.
+
+    Performs spatial and/or temporal upsampling by repeating and reshaping.
+    """
+
+    def __init__(self, in_channels: int, out_channels: int, factor_t: int, factor_s: int = 1):
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.factor_t = factor_t
+        self.factor_s = factor_s
+        self.factor = factor_t * factor_s * factor_s
+
+        assert out_channels * self.factor % in_channels == 0
+        self.repeats = out_channels * self.factor // in_channels
+
+    def __call__(self, x: jax.Array, first_chunk: bool = False) -> jax.Array:
+        # x: [B, T, H, W, C] (JAX channel-last format)
+        b, t, h, w, c = x.shape
+
+        # Repeat channels
+        x = jnp.repeat(x, self.repeats, axis=-1)  # [B, T, H, W, C*repeats]
+
+        # Reshape for upsampling
+        x = x.reshape(
+            b,
+            t,
+            h,
+            w,
+            self.out_channels,
+            self.factor_t,
+            self.factor_s,
+            self.factor_s,
+        )
+        # Permute: [B, T, H, W, C', factor_t, factor_s, factor_s]
+        #       -> [B, T, factor_t, H, factor_s, W, factor_s, C']
+        x = x.transpose(0, 1, 5, 2, 6, 3, 7, 4)
+        # Reshape to final shape
+        x = x.reshape(
+            b,
+            t * self.factor_t,
+            h * self.factor_s,
+            w * self.factor_s,
+            self.out_channels,
+        )
+
+        # Handle first chunk: remove first (factor_t - 1) frames
+        if first_chunk:
+            x = x[:, self.factor_t - 1 :, :, :, :]
+
+        return x
+
+
 class CausalConv3d(nnx.Module):
     """Causal 3D convolution that doesn't look into the future."""
 
@@ -352,6 +466,130 @@ class Downsample3d(nnx.Module):
         return x, cache_list
 
 
+class ResidualDownBlock(nnx.Module):
+    """Residual downsampling block for Wan2.2 VAE encoder.
+
+    Uses AvgDown3D for shortcut and residual blocks for main path.
+    """
+
+    def __init__(
+        self,
+        in_dim: int,
+        out_dim: int,
+        dropout: float,
+        num_res_blocks: int,
+        temperal_downsample: bool = False,
+        down_flag: bool = False,
+        *,
+        rngs: nnx.Rngs,
+    ):
+        # Shortcut path with downsample
+        self.avg_shortcut = AvgDown3D(
+            in_dim,
+            out_dim,
+            factor_t=2 if temperal_downsample else 1,
+            factor_s=2 if down_flag else 1,
+        )
+
+        # Main path with residual blocks
+        resnets = []
+        current_dim = in_dim
+        for _ in range(num_res_blocks):
+            resnets.append(ResidualBlock(current_dim, out_dim, dropout, rngs=rngs))
+            current_dim = out_dim
+        self.resnets = nnx.List(resnets)
+
+        # Add the final downsample block
+        self.downsampler = None
+        if down_flag:
+            if temperal_downsample:
+                self.downsampler = Downsample3d(out_dim, out_dim, rngs=rngs)
+            else:
+                self.downsampler = Downsample2d(out_dim, out_dim, rngs=rngs)
+
+    def __call__(
+        self, x: jax.Array, cache_list: tuple[Any, ...] = None, cache_idx: list[int] = None
+    ) -> tuple[jax.Array, tuple[Any, ...] | None]:
+        x_copy = x
+        for resnet in self.resnets:
+            x, cache_list = resnet(x, cache_list=cache_list, cache_idx=cache_idx)
+        if self.downsampler is not None:
+            x, cache_list = self.downsampler(x, cache_list=cache_list, cache_idx=cache_idx)
+
+        return x + self.avg_shortcut(x_copy), cache_list
+
+
+class ResidualUpBlock(nnx.Module):
+    """Residual upsampling block for Wan2.2 VAE decoder.
+
+    Uses DupUp3D for shortcut and residual blocks for main path.
+    """
+
+    def __init__(
+        self,
+        in_dim: int,
+        out_dim: int,
+        num_res_blocks: int,
+        dropout: float = 0.0,
+        temperal_upsample: bool = False,
+        up_flag: bool = False,
+        *,
+        rngs: nnx.Rngs,
+    ):
+        self.in_dim = in_dim
+        self.out_dim = out_dim
+        self.up_flag = up_flag
+        self.temperal_upsample = temperal_upsample
+
+        # Shortcut with DupUp3D (only if upsampling)
+        if up_flag:
+            self.avg_shortcut = DupUp3D(
+                in_dim,
+                out_dim,
+                factor_t=2 if temperal_upsample else 1,
+                factor_s=2,
+            )
+        else:
+            self.avg_shortcut = None
+
+        # Main path with residual blocks
+        resnets = []
+        current_dim = in_dim
+        for _ in range(num_res_blocks + 1):
+            resnets.append(ResidualBlock(current_dim, out_dim, dropout, rngs=rngs))
+            current_dim = out_dim
+        self.resnets = nnx.List(resnets)
+
+        # Upsampling layer
+        self.upsampler = None
+        if up_flag:
+            if temperal_upsample:
+                self.upsampler = Upsample3d(out_dim, out_dim, rngs=rngs)
+            else:
+                self.upsampler = Upsample2d(out_dim, out_dim, rngs=rngs)
+
+    def __call__(
+        self,
+        x: jax.Array,
+        cache_list: tuple[Any, ...] = None,
+        cache_idx: list[int] = None,
+        first_chunk: bool = False,
+    ) -> tuple[jax.Array, tuple[Any, ...] | None]:
+        if self.avg_shortcut is not None:
+            x_copy = x
+
+        for resnet in self.resnets:
+            x, cache_list = resnet(x, cache_list=cache_list, cache_idx=cache_idx)
+
+        if self.upsampler is not None:
+            x, cache_list = self.upsampler(x, cache_list=cache_list, cache_idx=cache_idx)
+
+        if self.avg_shortcut is not None:
+            x = x + self.avg_shortcut(x_copy, first_chunk=first_chunk)
+
+        return x, cache_list
+
+
 class AttentionBlock(nnx.Module):
     """Spatial attention block with batched frame processing."""
 
@@ -564,30 +802,35 @@ class Decoder3d(nnx.Module):
 
         self.mid_block = MidBlock(dims[0], dropout, num_layers=1, rngs=rngs)
         self.up_blocks = nnx.List([])
-        if is_residual:
-            raise RuntimeError("not implemented")
-        else:
-            # in : [384, 384, 384, 192]
-            # out: [384, 384, 192, 96]
-            for i, (in_dim, out_dim) in enumerate(zip(dims[:-1], dims[1:], strict=True)):
-                # 4
-                # residual (+attention) blocks
-                if i > 0 and not is_residual:
-                    # wan vae 2.1
-                    in_dim = in_dim // 2
+        self.is_residual = is_residual
 
-                # determine if we need upsampling
-                up_flag = i != len(dim_mult) - 1
-                # determine upsampling mode, if not upsampling, set to None
+        for i, (in_dim, out_dim) in enumerate(zip(dims[:-1], dims[1:], strict=True)):
+            # Adjust in_dim for non-residual path (Wan2.1)
+            if i > 0 and not is_residual:
+                in_dim = in_dim // 2
+
+            # determine if we need upsampling
+            up_flag = i != len(dim_mult) - 1
+
+            if is_residual:
+                # Wan2.2 VAE uses ResidualUpBlock
+                up_block = ResidualUpBlock(
+                    in_dim=in_dim,
+                    out_dim=out_dim,
+                    num_res_blocks=num_res_blocks,
+                    dropout=dropout,
+                    temperal_upsample=temperal_upsample[i] if up_flag else False,
+                    up_flag=up_flag,
+                    rngs=rngs,
+                )
+            else:
+                # Wan2.1 VAE uses UpBlock
                 upsample_mode = None
                 if up_flag and temperal_upsample[i]:
                     upsample_mode = "upsample3d"
                 elif up_flag:
                     upsample_mode = "upsample2d"
-                # 0 (384, 384)
-                # 1 (192, 384)
-                # 2 (192, 192)
-                # 3 (192, 96)
+
                 up_block = UpBlock(
                     in_dim=in_dim,
                     out_dim=out_dim,
@@ -596,7 +839,7 @@ class Decoder3d(nnx.Module):
                     upsample_mode=upsample_mode,
                     rngs=rngs,
                 )
-                self.up_blocks.append(up_block)
+            self.up_blocks.append(up_block)
         # output blocks
         self.norm_out = RMSNorm(out_dim, images=False, rngs=rngs)
         self.conv_out = CausalConv3d(out_dim, out_channels, (3, 3, 3), padding=(1, 1, 1), rngs=rngs)
@@ -681,11 +924,26 @@ class Encoder3d(nnx.Module):
 
         # downsample blocks
         self.down_blocks = nnx.List([])
+        self.is_residual = is_residual
+
         for i, (in_dim, out_dim) in enumerate(zip(dims[:-1], dims[1:])):
-            # residual (+attention) blocks
             if is_residual:
-                raise NotImplementedError
+                # Wan2.2 VAE uses ResidualDownBlock
+                self.down_blocks.append(
+                    ResidualDownBlock(
+                        in_dim,
+                        out_dim,
+                        dropout,
+                        num_res_blocks,
+                        temperal_downsample=(
+                            temperal_downsample[i] if i != len(dim_mult) - 1 else False
+                        ),
+                        down_flag=i != len(dim_mult) - 1,
+                        rngs=rngs,
+                    )
+                )
             else:
+                # Wan2.1 VAE uses individual ResidualBlock + Downsample
                 for _ in range(num_res_blocks):
                     self.down_blocks.append(ResidualBlock(in_dim, out_dim, dropout, rngs=rngs))
                     if scale in attn_scales:
