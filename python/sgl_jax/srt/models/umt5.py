@@ -469,7 +469,7 @@ class UMT5EncoderModel(nnx.Module):
         bs = forward_batch.seq_lens.shape[0]
         dummy = jnp.zeros((bs, self.config.vocab_size), dtype=self.dtype)
         dummy = jax.sharding.reshard(dummy, NamedSharding(self.mesh, P(None, "tensor")))
-        return LogitsProcessorOutput(next_token_logits=dummy, hidden_states=hidden), [], []
+        return LogitsProcessorOutput(next_token_logits=dummy, hidden_states=hidden), [], [], None
 
 
 class UMT5DecoderModel(nnx.Module):
