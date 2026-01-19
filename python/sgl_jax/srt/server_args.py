@@ -167,6 +167,8 @@ class ServerArgs:
     # For engine
     enable_engine_loop_run_forever_daemon: bool | None = None
 
+    enable_return_routed_experts: bool = False
+
     def __post_init__(self):
         # Set missing default values
         if self.tokenizer_path is None:
@@ -964,6 +966,11 @@ class ServerArgs:
             "--enable-engine-loop-run-forever-daemon",
             action="store_true",
             help="Run engine loop forever when engine.async_generate is called in other threads, this is used in Tunix",
+        )
+        parser.add_argument(
+            "--enable-return-routed-experts",
+            action="store_true",
+            help="Enable returning routed experts of each layer with responses.",
         )
 
     @classmethod

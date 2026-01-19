@@ -81,6 +81,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
             lora_path=request.lora_path,
             extra_key=request.extra_key,
             rid=request.rid,
+            return_routed_experts=request.return_routed_experts,
         )
 
         return adapted_request, request
@@ -322,6 +323,9 @@ class OpenAIServingCompletion(OpenAIServingBase):
                     output_token_logprobs=ret_item["meta_info"]["output_token_logprobs"],
                     output_top_logprobs=ret_item["meta_info"]["output_top_logprobs"],
                 )
+            routed_experts = None
+            if request.return_routed_experts:
+                routed_experts = ret_item["meta_info"]["routed_experts"]
 
             # Handle hidden states
             hidden_states = process_hidden_states_from_ret(ret_item, request)
@@ -339,6 +343,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
                     else None
                 ),
                 hidden_states=hidden_states,
+                routed_experts=routed_experts,
             )
             choices.append(choice_data)
 

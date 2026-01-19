@@ -5,8 +5,10 @@ import threading
 from typing import TYPE_CHECKING
 
 import jax
+import numpy as np
 
 from sgl_jax.srt.layers.logits_processor import LogitsProcessorOutput
+from sgl_jax.srt.layers.routed_experts_capturer import get_global_experts_capturer
 from sgl_jax.srt.managers.io_struct import AbortReq, BatchTokenIDOut
 from sgl_jax.srt.managers.schedule_batch import BaseFinishReason, Req, ScheduleBatch
 from sgl_jax.srt.precision_tracer import precision_tracer
@@ -29,6 +31,18 @@ class SchedulerOutputProcessorMixin:
     This class implements the output processing logic for Scheduler.
     We put them into a separate file to make the `scheduler.py` shorter.
     """
+
+    def maybe_collect_routed_experts(self: Scheduler, req: Req):
+        """Collect routed experts for a finished request."""
+        if not req.return_routed_experts:
+            return
+        # [layer_nums, seq_len, topk]
+        tmp = get_global_experts_capturer().get_routed_experts(
+            req_pool_idx=req.req_pool_idx,
+            seqlen=req.seqlen,
+            req_to_token_pool=self.req_to_token_pool,
+        )
+        req.routed_experts = np.transpose(tmp, (1, 0, 2))
 
     def process_batch_result_prefill(
         self: Scheduler,
@@ -88,6 +102,7 @@ class SchedulerOutputProcessorMixin:
                 req.check_finished()
 
                 if req.finished():
+                    self.maybe_collect_routed_experts(req)
                     if precision_tracer.get_trace_active():
                         precision_tracer.set_request_status_to_completed(req.rid)
                         precision_tracer.add_completed_requests_count()
@@ -270,6 +285,7 @@ class SchedulerOutputProcessorMixin:
 
             req.check_finished(new_accepted_len)
             if req.finished():
+                self.maybe_collect_routed_experts(req)
                 if batch.spec_algorithm is not None and batch.spec_algorithm.is_eagle():
                     cur_allocate_len = batch.spec_info.allocate_lens[i]
                     all_token_len = len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0)
@@ -553,6 +569,7 @@ class SchedulerOutputProcessorMixin:
         spec_verify_ct = []
         spec_accepted_tokens = []
         output_hidden_states = None
+        output_routed_experts = None
 
         if return_logprob:
             input_token_logprobs_val = []
@@ -692,6 +709,10 @@ class SchedulerOutputProcessorMixin:
                         output_token_ids_logprobs_val.append([])
                         output_token_ids_logprobs_idx.append([])
 
+                # if req.return_routed_experts:
+                if output_routed_experts is None:
+                    output_routed_experts = []
+                output_routed_experts.append(req.routed_experts)
         # Send to detokenizer
         if rids:
             out = BatchTokenIDOut(
@@ -721,5 +742,6 @@ class SchedulerOutputProcessorMixin:
                 output_token_ids_logprobs_idx,
                 output_hidden_states,
                 cache_miss_count,
+                output_routed_experts,
             )
             self.send_to_detokenizer.send_pyobj(out)

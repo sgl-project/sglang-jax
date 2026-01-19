@@ -308,7 +308,7 @@ class Qwen2MoeDecoderLayer(nnx.Module):
         mlp_output = self.mlp(hidden_states, topk_weights, topk_ids)
         hidden_states = mlp_output if shared_output is None else (mlp_output + shared_output)
 
-        return hidden_states, residual, kv_fused
+        return hidden_states, residual, kv_fused, topk_ids
 
 
 class Qwen2MoeModel(nnx.Module):
@@ -359,9 +359,10 @@ class Qwen2MoeModel(nnx.Module):
         residual = None
         hidden_states = self.embed_tokens(forward_batch.input_ids)
         layers_kv_fused = []
+        layers_topk_ids = []
 
         for layer in self.layers:
-            hidden_states, residual, kv_fused = layer(
+            hidden_states, residual, kv_fused, topk_ids = layer(
                 forward_batch.positions,
                 hidden_states,
                 forward_batch,
@@ -369,12 +370,13 @@ class Qwen2MoeModel(nnx.Module):
                 residual,
             )
             layers_kv_fused.append(kv_fused)
+            layers_topk_ids.append(topk_ids)
 
         if residual is not None:
             hidden_states += residual
         hidden_states = self.norm(hidden_states)
 
-        return hidden_states, layers_kv_fused
+        return hidden_states, layers_kv_fused, layers_topk_ids
 
 
 class Qwen2MoeForCausalLM(nnx.Module):
@@ -582,12 +584,14 @@ class Qwen2MoeForCausalLM(nnx.Module):
         token_to_kv_pool: KVCache,
         logits_metadata: LogitsMetadata,
     ):
-        hidden_states, layers_kv_fused = self.model(forward_batch, token_to_kv_pool)
+        hidden_states, layers_kv_fused, layers_topk_ids = self.model(
+            forward_batch, token_to_kv_pool
+        )
         if not getattr(self.config, "tie_word_embeddings", True):
             output = self.logits_processor(hidden_states, self.lm_head, logits_metadata)
         else:
             output = self.logits_processor(hidden_states, self.model.embed_tokens, logits_metadata)
-        return output, layers_kv_fused, True
+        return output, layers_kv_fused, True, layers_topk_ids
 
 
 EntryClass = Qwen2MoeForCausalLM

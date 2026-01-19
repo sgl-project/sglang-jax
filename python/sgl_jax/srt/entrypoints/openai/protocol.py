@@ -176,6 +176,8 @@ class CompletionRequest(BaseModel):
     # For request id
     rid: list[str] | str | None = None
 
+    return_routed_experts: list[bool] | bool | None = None
+
     @validator("max_tokens")
     @classmethod
     def validate_max_tokens_positive(cls, v):
@@ -191,6 +193,7 @@ class CompletionResponseChoice(BaseModel):
     finish_reason: Literal["stop", "length", "content_filter", "abort"] | None = None
     matched_stop: None | int | str = None
     hidden_states: object | None = None
+    routed_experts: bytes | None = None
 
     # @model_serializer(mode="wrap")  # Not available in pydantic v1
     # def _serialize(self, handler):
