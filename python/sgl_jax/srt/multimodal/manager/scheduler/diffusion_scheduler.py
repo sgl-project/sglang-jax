@@ -101,9 +101,7 @@ class DiffusionScheduler:
             try:
                 msg = self.communication_backend._in_queue.get_nowait()
                 if isinstance(msg, AbortReq):
-                    logger.info(
-                        "DiffusionScheduler received abort during step for rid=%s", msg.rid
-                    )
+                    logger.info("DiffusionScheduler received abort during step for rid=%s", msg.rid)
                     self.aborted_rids.add(msg.rid)
                 else:
                     # Put non-abort messages back (this is a simplification;
@@ -115,9 +113,7 @@ class DiffusionScheduler:
 
         # Check if current request is aborted
         if self._current_rid and self._current_rid in self.aborted_rids:
-            logger.info(
-                "DiffusionScheduler aborting current request rid=%s", self._current_rid
-            )
+            logger.info("DiffusionScheduler aborting current request rid=%s", self._current_rid)
             return True
         return False
 

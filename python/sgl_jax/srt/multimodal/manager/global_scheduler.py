@@ -167,9 +167,7 @@ class GlobalScheduler:
             tracking_state = self.req_store.pop(rid, None)
             if tracking_state is not None:
                 current_stage = tracking_state.current_stage
-                logger.info(
-                    "Aborting request rid=%s at stage %d", rid, current_stage
-                )
+                logger.info("Aborting request rid=%s at stage %d", rid, current_stage)
 
                 # Send abort signal only to current stage (subsequent stages won't
                 # receive the request because event_loop checks req_store)
@@ -180,9 +178,7 @@ class GlobalScheduler:
                 try:
                     self.in_queues[current_stage].put_nowait(stage_abort_req)
                 except Exception as e:
-                    logger.warning(
-                        "Failed to send abort to stage %d queue: %s", current_stage, e
-                    )
+                    logger.warning("Failed to send abort to stage %d queue: %s", current_stage, e)
 
                 # Send AbortReq to detokenizer -> tokenizer to notify client
                 self.send_to_detokenizer.send_pyobj(stage_abort_req)

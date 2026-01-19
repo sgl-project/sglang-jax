@@ -9,10 +9,10 @@ from fastapi import Request
 from fastapi.responses import ORJSONResponse, Response
 
 from sgl_jax.srt.entrypoints.http_server import _GlobalState, app, set_global_state
+from sgl_jax.srt.managers.io_struct import AbortReq
 from sgl_jax.srt.managers.template_manager import TemplateManager
 from sgl_jax.srt.multimodal.common.ServerArgs import MultimodalServerArgs
 from sgl_jax.srt.multimodal.manager.global_scheduler import run_global_scheduler_process
-from sgl_jax.srt.managers.io_struct import AbortReq
 from sgl_jax.srt.multimodal.manager.io_struct import (
     DataType,
     GenerateMMReqInput,
