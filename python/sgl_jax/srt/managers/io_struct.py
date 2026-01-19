@@ -102,7 +102,7 @@ class BatchTokenIDOut:
 
     # Hidden states
     output_hidden_states: list[list[float]]
-
+    output_hidden_states_for_mm: list[list[float]]
     # Cache miss count
     cache_miss_count: int = None
 
@@ -139,6 +139,8 @@ class TokenizedGenerateReqInput:
     extra_key: str | None = None
     # return_routed_experts decides whether return expert indices for every token for every layer
     return_routed_experts: list[bool] | bool | None = None
+    # whether to return hidden states
+    return_hidden_states: bool = False
 
 
 @dataclass

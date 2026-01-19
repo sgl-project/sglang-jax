@@ -17,11 +17,11 @@ from sgl_jax.srt.kernels.gmm.megablox_gmm_kernel import common
 
 def _validate_args(
     *,
-    lhs: jnp.ndarray,
-    rhs: jnp.ndarray,
-    group_sizes: jnp.ndarray,
+    lhs: jax.Array,
+    rhs: jax.Array,
+    group_sizes: jax.Array,
     expected_rhs_dims: int = 3,
-) -> tuple[jnp.ndarray, jnp.ndarray, jnp.dtype]:
+) -> tuple[jax.Array, jax.Array, jnp.dtype]:
     """Validates the arguments for the gmm function."""
     # Validate 'lhs'.
     if lhs.ndim != 2:
@@ -61,17 +61,17 @@ GroupMetadata = Any  # TODO: Clean this up and use a namedtuple
 
 def make_group_metadata(
     *,
-    group_sizes: jnp.ndarray,
+    group_sizes: jax.Array,
     m: int,
     tm: int,
-    start_group: jnp.ndarray,
+    start_group: jax.Array,
     num_nonzero_groups: int,
     visit_empty_groups: bool = True,
 ) -> GroupMetadata:
     """Create the metadata needed for grouped matmul computation.
 
     Args:
-        group_sizes: A 1d, jnp.ndarray with shape [num_groups] and jnp.int32 dtype.
+        group_sizes: A 1d, jax.Array with shape [num_groups] and jnp.int32 dtype.
         m: The number of rows in lhs.
         tm: The m-dimension tile size being used.
         start_group: The group in group sizes to start computing from. This is
@@ -84,13 +84,13 @@ def make_group_metadata(
 
     Returns:
         tuple of:
-          group_offsets: A 1d, jnp.ndarray with shape [num_groups+1] and jnp.int32
+          group_offsets: A 1d, jax.Array with shape [num_groups+1] and jnp.int32
             dtype. group_offsets[i] indicates the row at which group [i] starts in
             the lhs matrix and group_offsets[i-1] = m.
-          group_ids: A 1d, jnp.ndarray with shape [m_tiles + num_groups] and
+          group_ids: A 1d, jax.Array with shape [m_tiles + num_groups] and
             jnp.int32 dtype. group_ids[i] indicates which group grid index 'i' will
             work on.
-          m_tile_ids: A 1d, jnp.ndarray with shape [m_tiles + num_groups] and
+          m_tile_ids: A 1d, jax.Array with shape [m_tiles + num_groups] and
             jnp.int32. m_tile_ids[i] indicates which m-dimension tile grid index 'i'
             will work on.
         num_tiles: The number of m-dimension tiles to execute.
@@ -229,7 +229,7 @@ def make_group_metadata(
     return (group_offsets, group_ids, m_tile_ids), num_tiles
 
 
-def _get_group_size(*, grid_id: jnp.ndarray, group_metadata: GroupMetadata) -> jnp.ndarray:
+def _get_group_size(*, grid_id: jax.Array, group_metadata: GroupMetadata) -> jax.Array:
     """Calculate the number of rows in the current group."""
     group_offsets, group_ids = group_metadata[:2]
     group_id = group_ids[grid_id]
@@ -240,11 +240,11 @@ def _get_group_size(*, grid_id: jnp.ndarray, group_metadata: GroupMetadata) -> j
 
 def _get_store_mask(
     *,
-    grid_id: jnp.ndarray,
+    grid_id: jax.Array,
     group_metadata: GroupMetadata,
     tm: int,
     tn: int,
-) -> jnp.ndarray:
+) -> jax.Array:
     """Mask for rows that belong to the current group in the current tile."""
     group_offsets, group_ids, m_tile_ids = group_metadata[:3]
     group_id = group_ids[grid_id]
@@ -256,12 +256,12 @@ def _get_store_mask(
 
 
 def _zero_uninitialized_memory(
-    out: jnp.ndarray,
+    out: jax.Array,
     *,
-    start_group: jnp.ndarray,
+    start_group: jax.Array,
     num_nonzero_groups: int,
     group_metadata: GroupMetadata,
-) -> jnp.ndarray:
+) -> jax.Array:
     """Zero out uninitialized memory from output."""
     group_offsets = group_metadata[0]
     group_start = group_offsets[start_group]
@@ -284,22 +284,22 @@ LutFn = Callable[[int, int, int], tuple[int, int, int] | None]
     ],
 )
 def gmm(
-    lhs: jnp.ndarray,
-    rhs: jnp.ndarray,
-    group_sizes: jnp.ndarray,
+    lhs: jax.Array,
+    rhs: jax.Array,
+    group_sizes: jax.Array,
     preferred_element_type: jnp.dtype = jnp.float32,
     tiling: tuple[int, int, int] | LutFn | None = (128, 128, 128),
-    group_offset: jnp.ndarray | None = None,
-    existing_out: jnp.ndarray | None = None,
+    group_offset: jax.Array | None = None,
+    existing_out: jax.Array | None = None,
     transpose_rhs: bool = False,
     interpret: bool = False,
-) -> jnp.ndarray:
+) -> jax.Array:
     """Compute lhs[sizes[i-1]:sizes[i], :] @ rhs for each group 'i'.
 
     Args:
-        lhs: A 2d, jnp.ndarray with shape [m, k].
-        rhs: A 3d, jnp.ndarray with shape [num_groups, k, n].
-        group_sizes: A 1d, jnp.ndarray with shape [num_groups] and jnp.int32 dtype.
+        lhs: A 2d, jax.Array with shape [m, k].
+        rhs: A 3d, jax.Array with shape [num_groups, k, n].
+        group_sizes: A 1d, jax.Array with shape [num_groups] and jnp.int32 dtype.
         preferred_element_type: jnp.dtype, the element type for the output matrix.
         tiling: 3-tuple of ints. The m, k and n-dimension tile sizes.
         group_offset: The group in group sizes to start computing from. This is
@@ -310,7 +310,7 @@ def gmm(
           testing and debugging.
 
     Returns:
-        A 2d, jnp.ndarray with shape [m, n].
+        A 2d, jax.Array with shape [m, n].
     """
     if existing_out is not None:
         assert isinstance(existing_out, jax.Array)
