@@ -44,7 +44,8 @@ dependencies = [
     "pathwaysutils",
     "pybase64",
     "omegaconf",
-    "imageio[ffmpeg]"
+    "imageio[ffmpeg]",
+    "qwix",
 ]
 
 [project.optional-dependencies]

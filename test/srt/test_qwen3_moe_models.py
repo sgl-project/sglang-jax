@@ -109,6 +109,10 @@ class TestQwenModelForFusedMoE(CustomTestCase):
                 "16",
                 "--page-size",
                 "64",
+                "--ep-size",
+                "4",
+                "--moe-backend",
+                "fused",
             ],
             env={
                 "JAX_COMPILATION_CACHE_DIR": "/tmp/jax_compilation_cache",
