@@ -36,7 +36,7 @@ def download_from_hf(model_path: str, allow_patterns: list[str] | None = _UNSET)
         return model_path
 
     if allow_patterns is _UNSET:
-        allow_patterns = ["*.json", "*.bin", "*.model"]
+        allow_patterns = ["*.json", "*.bin", "*.model", "*.py", "*.tiktoken"]
     return snapshot_download(model_path, allow_patterns=allow_patterns)
 
 
