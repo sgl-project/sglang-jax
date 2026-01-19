@@ -635,6 +635,11 @@ class WanTransformer3DModel(nnx.Module):
         else:
             # batch_size, 6, inner_dim
             timestep_proj = timestep_proj.reshape(timestep_proj.shape[:1] + (6, -1))
+        if self.mesh is not None and getattr(self.mesh, "shape", None):
+            tensor_axis = self.mesh.shape.get("tensor", 1)
+            if tensor_axis > 1:
+                sharding = jax.sharding.NamedSharding(self.mesh, jax.sharding.PartitionSpec())
+                timestep_proj = jax.lax.with_sharding_constraint(timestep_proj, sharding)
 
         # Concatenate image and text embeddings if image embeddings exist
         if encoder_hidden_states_image is not None:
