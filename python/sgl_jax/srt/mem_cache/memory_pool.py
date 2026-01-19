@@ -178,11 +178,11 @@ class KVCache(abc.ABC):
         return obj
 
     @abc.abstractmethod
-    def get_fused_kv_buffer(self, layer_id: int) -> jnp.ndarray:
+    def get_fused_kv_buffer(self, layer_id: int) -> jax.Array:
         raise NotImplementedError()
 
     @abc.abstractmethod
-    def get_kv_buffer(self, layer_id: int) -> tuple[jnp.ndarray, jnp.ndarray]:
+    def get_kv_buffer(self, layer_id: int) -> tuple[jax.Array, jax.Array]:
         """Get separate K and V buffers for native attention.
 
         Returns:
@@ -194,15 +194,15 @@ class KVCache(abc.ABC):
     def set_kv_buffer(
         self,
         layer_id: int,
-        loc: jnp.ndarray,
-        cache_k: jnp.ndarray,
-        cache_v: jnp.ndarray,
+        loc: jax.Array,
+        cache_k: jax.Array,
+        cache_v: jax.Array,
         is_decode: bool,
     ) -> None:
         raise NotImplementedError()
 
     @abc.abstractmethod
-    def replace_kv_buffer(self, kv_buffer: list[jnp.ndarray]) -> None:
+    def replace_kv_buffer(self, kv_buffer: list[jax.Array]) -> None:
         """Replace the internal KV buffer with a new one.
 
         This method is essential for JAX jit compatibility since JAX functions
@@ -373,10 +373,10 @@ class MHATokenToKVPool(KVCache):
         v_size = fused_kv_size // 2
         return k_size, v_size
 
-    def get_fused_kv_buffer(self, layer_id: int) -> jnp.ndarray:
+    def get_fused_kv_buffer(self, layer_id: int) -> jax.Array:
         return self.kv_buffer[layer_id - self.start_layer]
 
-    def get_kv_buffer(self, layer_id: int) -> tuple[jnp.ndarray, jnp.ndarray]:
+    def get_kv_buffer(self, layer_id: int) -> tuple[jax.Array, jax.Array]:
         layer_idx = layer_id - self.start_layer
         fused_kv = self.kv_buffer[layer_idx]  # [cache_size, num_kv_heads * 2, head_dim]
 
@@ -420,7 +420,7 @@ class MHATokenToKVPool(KVCache):
             kv_partition_axis=self.kv_partition_axis,
         )
 
-    def replace_kv_buffer(self, fused_kv_buffer: list[jnp.ndarray]) -> None:
+    def replace_kv_buffer(self, fused_kv_buffer: list[jax.Array]) -> None:
         self.kv_buffer[self.start_layer : self.start_layer + len(fused_kv_buffer)] = fused_kv_buffer
 
     def get_cpu_copy(self, indices):
@@ -443,7 +443,7 @@ class MHATokenToKVPool(KVCache):
             fused_kv_device = jax.device_put(fused_kv_host, self.kv_sharding)
             self.kv_buffer[layer_id] = self.kv_buffer[layer_id].at[indices].set(fused_kv_device)
 
-    def clear_cache(self, indices: jnp.ndarray):
+    def clear_cache(self, indices: jax.Array):
         """Clear fused KV cache at specified indices"""
         for layer_id in range(self.layer_num):
             self.kv_buffer[layer_id] = self.kv_buffer[layer_id].at[indices].set(0)
@@ -451,9 +451,9 @@ class MHATokenToKVPool(KVCache):
     def set_kv_buffer_legacy(
         self,
         layer_id: int,
-        loc: jnp.ndarray,
-        cache_k: jnp.ndarray,
-        cache_v: jnp.ndarray,
+        loc: jax.Array,
+        cache_k: jax.Array,
+        cache_v: jax.Array,
     ) -> jax.Array:
         """
         Legacy interface for backward compatibility.
@@ -569,9 +569,9 @@ class SWAKVPool(KVCache):
     def set_kv_buffer(
         self,
         layer_id: int,
-        loc: jnp.ndarray,
-        cache_k: jnp.ndarray,
-        cache_v: jnp.ndarray,
+        loc: jax.Array,
+        cache_k: jax.Array,
+        cache_v: jax.Array,
         is_decode: bool = False,
     ):
         layer_id_pool, is_swa = self.layers_mapping[layer_id]
@@ -582,7 +582,7 @@ class SWAKVPool(KVCache):
         else:
             self.full_kv_pool.set_kv_buffer(layer_id_pool, loc, cache_k, cache_v, is_decode)
 
-    def replace_kv_buffer(self, kv_buffer: list[jnp.ndarray]):
+    def replace_kv_buffer(self, kv_buffer: list[jax.Array]):
         assert len(kv_buffer) == len(self.layers_mapping)
 
         full_kv_buffer = []
@@ -864,7 +864,7 @@ class MLATokenToKVPool(KVCache):
         )
         return kv_size
 
-    def get_fused_kv_buffer(self, layer_id: int) -> jnp.ndarray:
+    def get_fused_kv_buffer(self, layer_id: int) -> jax.Array:
         """Get fused buffer for MLA architecture.
 
         Note: MLA has different architecture than standard MHA,
@@ -872,7 +872,7 @@ class MLATokenToKVPool(KVCache):
         """
         return self.kv_buffer[layer_id - self.start_layer]
 
-    def get_kv_buffer(self, layer_id: int) -> tuple[jnp.ndarray, jnp.ndarray]:
+    def get_kv_buffer(self, layer_id: int) -> tuple[jax.Array, jax.Array]:
         """Get separate K and V buffers for native attention from MLA KV cache.
 
         Note: MLA architecture differs from standard MHA. For native attention compatibility,
@@ -895,9 +895,9 @@ class MLATokenToKVPool(KVCache):
     def set_kv_buffer(
         self,
         layer_id: int,
-        loc: jnp.ndarray,
-        cache_k: jnp.ndarray,
-        cache_v: jnp.ndarray,
+        loc: jax.Array,
+        cache_k: jax.Array,
+        cache_v: jax.Array,
         is_decode: bool = False,
     ) -> None:
         """Set KV cache data for MLA"""
@@ -907,9 +907,9 @@ class MLATokenToKVPool(KVCache):
     def set_mla_kv_buffer(
         self,
         layer_id: int,
-        loc: jnp.ndarray,
-        cache_k_nope: jnp.ndarray,
-        cache_k_rope: jnp.ndarray,
+        loc: jax.Array,
+        cache_k_nope: jax.Array,
+        cache_k_rope: jax.Array,
     ):
         """Set MLA KV buffer with separate nope and rope components"""
         layer_idx = layer_id - self.start_layer
