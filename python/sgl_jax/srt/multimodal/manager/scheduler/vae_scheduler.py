@@ -1,12 +1,17 @@
+import logging
+
 import jax.sharding
 from jax import NamedSharding
 from jax.sharding import PartitionSpec
 
 from sgl_jax.srt.managers.communication import CommunicationBackend
+from sgl_jax.srt.managers.io_struct import AbortReq
 from sgl_jax.srt.multimodal.common.ServerArgs import MultimodalServerArgs
 from sgl_jax.srt.multimodal.manager.schedule_batch import Req
 from sgl_jax.srt.multimodal.model_executor.vae.vae_model_worker import VaeModelWorker
 from sgl_jax.srt.utils.jax_utils import device_array
+
+logger = logging.getLogger(__name__)
 
 
 class VaeScheduler:
@@ -49,6 +54,8 @@ class VaeScheduler:
         )
         self.server_args = server_args
         self.model_config = model_class.get_config_class()()
+        # Track aborted request IDs to skip processing
+        self.aborted_rids: set[str] = set()
 
     def event_loop_normal(self):
         """Main blocking loop used in non-async environments.
@@ -56,19 +63,36 @@ class VaeScheduler:
         Repeatedly polls the `communication_backend` for requests, applies
         `preprocess`, shards `req.latents` onto `self.mesh` with a
         `NamedSharding(PartitionSpec())`, and then processes the batch via
-        `run_vae_batch`.
+        `run_vae_batch`. AbortReq messages are processed to track aborted
+        request IDs, and any Req whose rid matches an aborted ID is skipped.
         """
 
         while True:
             reqs = self._comm_backend.recv_requests()
             if len(reqs) > 0:
+                # Process abort requests first
+                valid_reqs = []
                 for req in reqs:
-                    assert req.latents is not None
-                    self.preprocess(req)
-                    req.latents = device_array(
-                        req.latents, sharding=NamedSharding(self.mesh, PartitionSpec())
-                    )
-                self.run_vae_batch(reqs)
+                    if isinstance(req, AbortReq):
+                        logger.info("VaeScheduler received abort for rid=%s", req.rid)
+                        self.aborted_rids.add(req.rid)
+                    elif isinstance(req, Req):
+                        # Check if this request was aborted
+                        if req.rid in self.aborted_rids:
+                            logger.info("VaeScheduler skipping aborted request rid=%s", req.rid)
+                            self.aborted_rids.discard(req.rid)
+                            continue
+                        assert req.latents is not None
+                        self.preprocess(req)
+                        req.latents = device_array(
+                            req.latents, sharding=NamedSharding(self.mesh, PartitionSpec())
+                        )
+                        valid_reqs.append(req)
+                    else:
+                        logger.warning("VaeScheduler received unknown request type: %s", type(req))
+
+                if valid_reqs:
+                    self.run_vae_batch(valid_reqs)
 
     def preprocess(self, req):
         """Apply model-specific preprocessing to a single `Req`.

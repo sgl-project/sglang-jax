@@ -7,6 +7,7 @@ import psutil
 import setproctitle
 
 from sgl_jax.srt.managers.detokenizer_manager import DetokenizerManager
+from sgl_jax.srt.managers.io_struct import AbortReq
 from sgl_jax.srt.multimodal.manager.io_struct import DataType
 from sgl_jax.srt.multimodal.manager.schedule_batch import Req
 from sgl_jax.srt.server_args import PortArgs, ServerArgs
@@ -43,8 +44,19 @@ class MultimodalDetokenizer(DetokenizerManager):
         self._request_dispatcher = TypeBasedDispatcher(
             [
                 (Req, self.save_result),
+                (AbortReq, self._handle_abort_req),
             ]
         )
+
+    def _handle_abort_req(self, abort_req: AbortReq):
+        """Forward an AbortReq to the tokenizer manager.
+
+        When the GlobalScheduler aborts a request, it sends an AbortReq to
+        the detokenizer. This method simply passes it through to the
+        tokenizer manager so it can notify the waiting client coroutine.
+        """
+        logger.info("Forwarding abort request for rid=%s to tokenizer", abort_req.rid)
+        return abort_req
 
     def save_result(self, req: Req):
         """Process and optionally save the `Req` output.

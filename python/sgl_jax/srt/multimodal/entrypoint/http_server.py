@@ -6,12 +6,13 @@ from http import HTTPStatus
 
 import uvicorn
 from fastapi import Request
-from fastapi.responses import ORJSONResponse
+from fastapi.responses import ORJSONResponse, Response
 
 from sgl_jax.srt.entrypoints.http_server import _GlobalState, app, set_global_state
 from sgl_jax.srt.managers.template_manager import TemplateManager
 from sgl_jax.srt.multimodal.common.ServerArgs import MultimodalServerArgs
 from sgl_jax.srt.multimodal.manager.global_scheduler import run_global_scheduler_process
+from sgl_jax.srt.managers.io_struct import AbortReq
 from sgl_jax.srt.multimodal.manager.io_struct import (
     DataType,
     GenerateMMReqInput,
@@ -78,6 +79,24 @@ async def videos_generation(obj: VideoGenerationsRequest, request: Request):
         return ret
     except ValueError as e:
         logger.error("[http_server] Error: %s", e)
+        return _create_error_response(e)
+
+
+@app.post("/abort_request")
+async def abort_request(obj: AbortReq, request: Request):
+    """Abort a multimodal generation request.
+
+    This endpoint allows clients to cancel in-flight multimodal generation
+    requests by their request id (rid). The abort is propagated through
+    the tokenizer, scheduler, and stages to cancel any associated work.
+    """
+    try:
+        from sgl_jax.srt.entrypoints.http_server import _global_state
+
+        _global_state.tokenizer_manager.abort_request(rid=obj.rid, abort_all=obj.abort_all)
+        return Response(status_code=200)
+    except Exception as e:
+        logger.error("[http_server] abort_request error: %s", e)
         return _create_error_response(e)
 
 
