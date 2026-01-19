@@ -36,7 +36,7 @@ jobs:
           source .venv/bin/activate
           pip install uv
           uv pip install -e "python[all]"
-          uv pip install evalscope==0.17.1
+          uv pip install evalscope==1.0.0
 
           export OUTPUT_DIR_NAME=$(date +'%Y-%m-%d')
           export BENCH_OUTPUT_DIR="$GITHUB_WORKSPACE/test/nightly_test_output/benchmark/$OUTPUT_DIR_NAME"
@@ -97,7 +97,7 @@ jobs:
           source .venv/bin/activate
           pip install uv
           uv pip install -e "python[all]"
-          uv pip install evalscope==0.17.1
+          uv pip install evalscope==1.0.0
 
 
           export OUTPUT_DIR_NAME=$(date +'%Y-%m-%d')
