@@ -12,6 +12,7 @@ import psutil
 import setproctitle
 from transformers import AutoImageProcessor
 
+from sgl_jax.srt.managers.io_struct import AbortReq
 from sgl_jax.srt.managers.tokenizer_manager import TokenizerManager
 from sgl_jax.srt.multimodal.manager.io_struct import (
     GenerateMMReqInput,
@@ -74,6 +75,10 @@ class MultimodalTokenizer(TokenizerManager):
                     (list),
                     self._handle_batch_output,
                 ),
+                (
+                    AbortReq,
+                    self._handle_abort_req,
+                ),
             ]
         )
 
@@ -97,6 +102,40 @@ class MultimodalTokenizer(TokenizerManager):
                     req.rid,
                     list(self.rid_to_state.keys()),
                 )
+
+    def _handle_abort_req(self, recv_obj: AbortReq):
+        """Handle an AbortReq returned from the scheduler.
+
+        When a request is aborted (e.g., removed from the scheduler's queue
+        before processing started), the scheduler sends an AbortReq back to
+        notify the tokenizer. This method marks the request as finished with
+        an abort status and wakes any waiting coroutines.
+        """
+        if recv_obj.rid not in self.rid_to_state:
+            logger.warning(
+                "Received abort for unknown request rid=%s. Known rids: %s",
+                recv_obj.rid,
+                list(self.rid_to_state.keys()),
+            )
+            return
+
+        state = self.rid_to_state[recv_obj.rid]
+        state.finished = True
+        state.out_list.append(
+            {
+                "success": False,
+                "meta_info": {
+                    "id": recv_obj.rid,
+                    "finish_reason": {
+                        "type": "abort",
+                        "message": recv_obj.aborted_message or "Request aborted",
+                        "status_code": HTTPStatus.BAD_REQUEST,
+                    },
+                },
+            }
+        )
+        state.event.set()
+        logger.info("Abort completed for rid=%s", recv_obj.rid)
 
     async def generate_request(
         self,
