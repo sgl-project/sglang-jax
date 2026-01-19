@@ -229,14 +229,14 @@ class RotaryEmbedding:
         query = query.reshape(num_tokens, -1, self.head_size)
         query_rot = query[..., : self.rotary_dim]
         query_pass = query[..., self.rotary_dim :]
-        query_rot = _apply_rotary_emb(query_rot, cos, sin, self.is_neox_style)
+        query_rot = apply_rotary_emb(query_rot, cos, sin, self.is_neox_style)
         query = jnp.concatenate((query_rot, query_pass), axis=-1).reshape(query_shape)
 
         key_shape = key.shape
         key = key.reshape(num_tokens, -1, self.head_size)
         key_rot = key[..., : self.rotary_dim]
         key_pass = key[..., self.rotary_dim :]
-        key_rot = _apply_rotary_emb(key_rot, cos, sin, self.is_neox_style)
+        key_rot = apply_rotary_emb(key_rot, cos, sin, self.is_neox_style)
         key = jnp.concatenate((key_rot, key_pass), axis=-1).reshape(key_shape)
 
         return query, key
@@ -322,20 +322,20 @@ def rotary_embedding_forward(
     query = query.reshape(num_tokens, -1, head_size)
     query_rot = query[..., :rotary_dim]
     query_pass = query[..., rotary_dim:]
-    query_rot = _apply_rotary_emb(query_rot, cos, sin, is_neox_style)
+    query_rot = apply_rotary_emb(query_rot, cos, sin, is_neox_style)
     query = jnp.concatenate((query_rot, query_pass), axis=-1).reshape(query_shape)
 
     key_shape = key.shape
     key = key.reshape(num_tokens, -1, head_size)
     key_rot = key[..., :rotary_dim]
     key_pass = key[..., rotary_dim:]
-    key_rot = _apply_rotary_emb(key_rot, cos, sin, is_neox_style)
+    key_rot = apply_rotary_emb(key_rot, cos, sin, is_neox_style)
     key = jnp.concatenate((key_rot, key_pass), axis=-1).reshape(key_shape)
     return query, key
 
 
 # @partial(jax.jit, static_argnames=["is_neox_style"])
-def _apply_rotary_emb(
+def apply_rotary_emb(
     x: jax.Array,
     cos: jax.Array,
     sin: jax.Array,

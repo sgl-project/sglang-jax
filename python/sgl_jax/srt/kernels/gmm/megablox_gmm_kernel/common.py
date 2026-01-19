@@ -40,7 +40,7 @@ def assert_is_supported_dtype(dtype: jnp.dtype) -> None:
         raise ValueError(f"Expected bfloat16 or float32 array but got {dtype}.")
 
 
-def select_input_dtype(lhs: jnp.ndarray, rhs: jnp.ndarray) -> jnp.dtype:
+def select_input_dtype(lhs: jax.Array, rhs: jax.Array) -> jnp.dtype:
     """A type to which both input should be adapted to before dot product."""
     # bf16xbf16 matmul is only supported since TPUv4 generation. In case of mixed
     # input precision, we need to convert bf16 argument to fp32 beforehand.

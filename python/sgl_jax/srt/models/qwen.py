@@ -61,7 +61,7 @@ class QWenMLP(nnx.Module):
 
         self.act_func = jax.nn.silu
 
-    def __call__(self, hidden_states: jnp.ndarray):
+    def __call__(self, hidden_states: jax.Array):
         a1, _ = self.w1(hidden_states)
         a2, _ = self.w2(hidden_states)
         intermediate_parallel = a1 * jax.nn.silu(a2)

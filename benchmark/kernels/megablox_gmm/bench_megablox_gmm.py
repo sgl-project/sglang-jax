@@ -14,7 +14,7 @@ def create_gmm_test_data(
     k: int,
     n: int,
     num_groups: int,
-    group_sizes: jnp.ndarray,
+    group_sizes: jax.Array,
     dtype: jnp.dtype = jnp.bfloat16,
     seed: int = 42,
 ):
@@ -33,7 +33,7 @@ def benchmark_backend(
     k: int,
     n: int,
     num_groups: int,
-    group_sizes: jnp.ndarray,
+    group_sizes: jax.Array,
     backend_type: str = "megablox",
     preferred_element_type: jnp.dtype = jnp.float32,
     tiling: tuple[int, int, int] = (128, 128, 128),
@@ -94,7 +94,7 @@ def benchmark_backend(
     return avg_time
 
 
-def create_uniform_group_sizes(num_groups: int, group_size: int) -> jnp.ndarray:
+def create_uniform_group_sizes(num_groups: int, group_size: int) -> jax.Array:
     """Create uniform group sizes array."""
     return jnp.array([group_size] * num_groups, dtype=jnp.int32)
 

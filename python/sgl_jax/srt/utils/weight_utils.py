@@ -1,7 +1,9 @@
+import copy
 import glob
 import logging
 import os
 import pickle
+import re
 from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -26,6 +28,9 @@ class WeightMapping:
     target_path: str | list[str]
     sharding: tuple | None = None
     transpose: bool = False
+    transpose_axes: tuple[int, ...] | None = (
+        None  # For multi-dimensional transpose (e.g., conv weights)
+    )
     reshape: tuple | None = None
     head_dim_padding: bool = False
     kv_head_padding: bool = False
@@ -103,17 +108,17 @@ class WeightLoader:
         self.mesh = mesh
         self.dtype = dtype
         self.dummy_mode = getattr(model_config, "_dummy_mode", False)
+        if hasattr(model_config, "num_attention_heads"):
+            self.num_heads = model_config.num_attention_heads
+            # Use original count for replication logic
+            self.num_kv_heads = model_config.get_total_num_kv_heads()
+            self.hidden_size = model_config.hidden_size
+            self.head_dim_original = getattr(
+                model_config, "head_dim", self.hidden_size // self.num_heads
+            )
 
-        self.num_heads = model_config.num_attention_heads
-        # Use original count for replication logic
-        self.num_kv_heads = model_config.get_total_num_kv_heads()
-        self.hidden_size = model_config.hidden_size
-        self.head_dim_original = getattr(
-            model_config, "head_dim", self.hidden_size // self.num_heads
-        )
-
-        self.head_dim_pad = (self.head_dim_original + 127) // 128 * 128 - self.head_dim_original
-        self.head_dim = self.head_dim_original
+            self.head_dim_pad = (self.head_dim_original + 127) // 128 * 128 - self.head_dim_original
+            self.head_dim = self.head_dim_original
         if hasattr(self.mesh, "shape") and "tensor" in self.mesh.shape:
             self.sharding_size = self.mesh.shape["tensor"]
         else:
@@ -483,10 +488,41 @@ class WeightLoader:
         moe_mappings = {}
 
         for key, mapping in weight_mappings.items():
-            if key.startswith("__MOE_EXPERTS__"):
-                moe_mappings[key] = mapping
+            if "*" not in key:
+                if key.startswith("__MOE_EXPERTS__"):
+                    moe_mappings[key] = mapping
+                else:
+                    regular_mappings[key] = mapping
             else:
-                regular_mappings[key] = mapping
+                key_as_regex = re.escape(key).replace(r"\*", r"(.*?)")
+                for weight_info_key, _ in weight_info.items():
+                    match = re.search(key_as_regex, weight_info_key)
+                    if match:
+                        matched_parts = match.groups()
+
+                        if isinstance(mapping, str):
+                            format_template = mapping.replace("*", "{}")
+                            replaced_mapping = format_template.format(*matched_parts)
+                        elif isinstance(mapping, list):
+                            format_template = mapping[0].replace("*", "{}")
+                            replaced_str = format_template.format(*matched_parts)
+                            replaced_mapping = [replaced_str, *mapping[1:]]
+                        elif isinstance(mapping, tuple):
+                            format_template = mapping[0].replace("*", "{}")
+                            replaced_str = format_template.format(*matched_parts)
+                            replaced_mapping = (replaced_str, *mapping[1:])
+                        elif isinstance(mapping, WeightMapping):
+                            format_template = mapping.target_path.replace("*", "{}")
+                            replaced_path = format_template.format(*matched_parts)
+                            replaced_mapping = copy.copy(mapping)
+                            replaced_mapping.target_path = replaced_path
+                        else:
+                            replaced_mapping = mapping
+
+                        if key.startswith("__MOE_EXPERTS__"):
+                            moe_mappings[weight_info_key] = replaced_mapping
+                        else:
+                            regular_mappings[weight_info_key] = replaced_mapping
 
         logger.info("Starting parallel weight loading via JAX Lazy Loader...")
 
@@ -550,7 +586,10 @@ class WeightLoader:
                             )
                             lazy_weight = lazy_arrays[0]
 
-                        if mapping.transpose:
+                        # Handle multi-dimensional transpose (transpose_axes) or 2D transpose
+                        if mapping.transpose_axes is not None:
+                            lazy_weight = jnp.transpose(lazy_weight, mapping.transpose_axes)
+                        elif mapping.transpose:
                             lazy_weight = jnp.transpose(lazy_weight, (1, 0))
 
                         if "lm_head" in hf_key and hasattr(
@@ -896,7 +935,10 @@ class WeightLoader:
     ):
         processed_weight = hf_weight
 
-        if mapping.transpose and not hf_key.endswith(".bias"):
+        # Handle multi-dimensional transpose (transpose_axes) or 2D transpose
+        if mapping.transpose_axes is not None and not hf_key.endswith(".bias"):
+            processed_weight = jnp.transpose(processed_weight, mapping.transpose_axes)
+        elif mapping.transpose and not hf_key.endswith(".bias"):
             processed_weight = jnp.transpose(processed_weight, (1, 0))
 
         if isinstance(mapping.target_path, list):

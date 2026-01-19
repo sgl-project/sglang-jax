@@ -84,7 +84,7 @@ class RMSNorm(nnx.Module):
             x,
             mean,
             var,
-            self.scale.value if self.scale else None,
+            self.scale[...] if self.scale else None,
             None,
             self.reduction_axes,
             self.feature_axes,
