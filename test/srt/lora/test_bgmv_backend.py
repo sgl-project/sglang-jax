@@ -362,7 +362,6 @@ class TestBgmvLoRABackend(CustomTestCase):
             req_pool_indices=np.arange(batch_size, dtype=jnp.int32),
             sampling_info=SamplingBatchInfo.generate_for_precompile(batch_size, 32000),
             positions=None,
-            extend_start_loc=None,
             cache_loc=None,
             return_logprob=False,
             return_output_logprob_only=False,
