@@ -2678,7 +2678,9 @@ def fused_ep_moe(
         if padded_num_experts != bias.shape[0]:
             bias = jnp.pad(bias, (0, padded_num_experts - bias.shape[0]), constant_values=0.0)
 
-    tokens = tokens.reshape(-1, t_packing, hidden_size // t_packing)
+    tokens = tokens.reshape(
+        -1, t_packing, hidden_size // t_packing, out_sharding=(dp_axis_name, None)
+    )
 
     hbm_block_spec = pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM)
     renorm_str = "-renorm_k" if renormalize_topk_logits else ""
