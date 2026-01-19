@@ -828,11 +828,11 @@ class WanDualTransformer3DModel(nnx.Module):
         # Get the timestep value for transformer selection
         # Use the first timestep in the batch (all should be the same in typical use)
 
-        t_value = float(timesteps) if timesteps.ndim == 0 else float(timesteps.flatten()[0])
+        t_value = jnp.ravel(timesteps)[0].astype(jnp.float32)
+        boundary = jnp.asarray(self.boundary_timestep, dtype=t_value.dtype)
+        use_primary = t_value >= boundary
 
-        # Select transformer based on timestep
-        if t_value >= self.boundary_timestep:
-            # High-noise stage: use primary transformer
+        def run_primary(_):
             return self.transformer(
                 hidden_states=hidden_states,
                 encoder_hidden_states=encoder_hidden_states,
@@ -842,8 +842,8 @@ class WanDualTransformer3DModel(nnx.Module):
                 req=req,
                 **kwargs,
             )
-        else:
-            # Low-noise stage: use secondary transformer
+
+        def run_secondary(_):
             return self.transformer_2(
                 hidden_states=hidden_states,
                 encoder_hidden_states=encoder_hidden_states,
@@ -853,6 +853,8 @@ class WanDualTransformer3DModel(nnx.Module):
                 req=req,
                 **kwargs,
             )
+
+        return jax.lax.cond(use_primary, run_primary, run_secondary, operand=None)
 
     def load_weights(self, model_path: str | WanModelConfig | None = None) -> None:
         """

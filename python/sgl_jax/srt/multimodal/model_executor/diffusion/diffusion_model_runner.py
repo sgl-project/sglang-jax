@@ -14,11 +14,11 @@ from sgl_jax.srt.configs.load_config import LoadConfig
 from sgl_jax.srt.model_executor.base_model_runner import BaseModelRunner
 from sgl_jax.srt.model_loader.loader import JAXModelLoader, get_model_loader
 from sgl_jax.srt.multimodal.common.ServerArgs import MultimodalServerArgs
+from sgl_jax.srt.multimodal.configs.config_registry import get_diffusion_config
 from sgl_jax.srt.multimodal.manager.schedule_batch import Req
 from sgl_jax.srt.multimodal.models.diffusion_solvers.flow_unipc_multistep_scheduler import (
     FlowUniPCMultistepScheduler,
 )
-from sgl_jax.srt.multimodal.configs.config_registry import get_diffusion_config
 from sgl_jax.srt.utils.jax_utils import device_array
 
 logger = logging.getLogger(__name__)
