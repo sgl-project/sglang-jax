@@ -35,28 +35,6 @@ The feature is controlled by two flags:
 - **Server-level**: `--enable-return-routed-experts` flag initializes the capture infrastructure
 - **Request-level**: `return_routed_experts` parameter in each request determines whether to capture and return expert data for that specific request
 
-
-**Response Format**:
-- The routed experts are included in response `meta_info` field:
-  ```python
-  {
-    "meta_info": {
-      "routed_experts": "<base64-encoded-string>"
-    }
-  }
-  ```
-
-**Client-side Decoding** (Optional):
-- Users can decode using `extract_routed_experts_from_meta_info(data)` at `routed_experts_capturer.py:281-289`:
-  ```python
-  routed_experts_base64 = data["meta_info"].get("routed_experts", None)
-  routed_experts = np.frombuffer(
-      pybase64.b64decode(routed_experts_base64.encode("utf-8")),
-      dtype=np.int32
-  )
-  # Reshape to [seq_len, num_layers, num_experts_per_tok]
-  ```
-
 ---
 
 ## 2. User Story
