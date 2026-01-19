@@ -146,6 +146,7 @@ class Engine(EngineBase):
         token_ids_logprob: list[list[int]] | list[int] | None = None,
         stream: bool = False,
         lora_path: list[str] | str | None = None,
+        return_routed_experts: list[bool] | bool | None = False,
     ) -> dict | Iterator[dict]:
         """
         The arguments of this function is the same as `sglang/srt/managers/io_struct.py::GenerateReqInput`.
@@ -165,6 +166,7 @@ class Engine(EngineBase):
             token_ids_logprob=token_ids_logprob,
             stream=stream,
             lora_path=lora_path,
+            return_routed_experts=return_routed_experts,
         )
         generator = self.tokenizer_manager.generate_request(obj, None)
 
@@ -194,6 +196,8 @@ class Engine(EngineBase):
         top_logprobs_num: list[int] | int | None = None,
         token_ids_logprob: list[list[int]] | list[int] | None = None,
         stream: bool = False,
+        lora_path: list[str] | str | None = None,
+        return_routed_experts: list[bool] | bool | None = False,
     ) -> dict | AsyncIterator[dict]:
         """
         The arguments of this function is the same as `sglang/srt/managers/io_struct.py::GenerateReqInput`.
@@ -212,6 +216,8 @@ class Engine(EngineBase):
             top_logprobs_num=top_logprobs_num,
             token_ids_logprob=token_ids_logprob,
             stream=stream,
+            lora_path=lora_path,
+            return_routed_experts=return_routed_experts,
         )
         generator = self.tokenizer_manager.generate_request(obj, None)
 

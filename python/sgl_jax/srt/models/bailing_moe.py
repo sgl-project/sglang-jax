@@ -345,8 +345,9 @@ class BailingMoEDecoderLayer(nnx.Module):
                 hidden_states = hidden_states + shared_output
         else:
             hidden_states = self.mlp(hidden_states)
+            topk_ids = None
 
-        return hidden_states, residual, kv_fused
+        return hidden_states, residual, kv_fused, topk_ids
 
 
 class BailingMoEModel(nnx.Module):
@@ -395,8 +396,9 @@ class BailingMoEModel(nnx.Module):
         hidden_states = self.embed_tokens(forward_batch.input_ids)
         residual = None
         layers_kv_fused = []
+        layers_topk_ids = []
         for layer in self.layers:
-            hidden_states, residual, kv_fused = layer(
+            hidden_states, residual, kv_fused, topk_ids = layer(
                 forward_batch.positions,
                 hidden_states,
                 forward_batch,
@@ -404,12 +406,13 @@ class BailingMoEModel(nnx.Module):
                 residual,
             )
             layers_kv_fused.append(kv_fused)
+            layers_topk_ids.append(topk_ids)
 
         if residual is not None:
             hidden_states += residual
 
         hidden_states = self.norm(hidden_states)
-        return hidden_states, layers_kv_fused
+        return hidden_states, layers_kv_fused, layers_topk_ids
 
 
 class BailingMoEForCausalLM(nnx.Module):
@@ -598,12 +601,14 @@ class BailingMoEForCausalLM(nnx.Module):
         token_to_kv_pool: KVCache,
         logits_metadata: LogitsMetadata,
     ):
-        hidden_states, layers_kv_fused = self.model(forward_batch, token_to_kv_pool)
+        hidden_states, layers_kv_fused, layers_topk_ids = self.model(
+            forward_batch, token_to_kv_pool
+        )
         if not getattr(self.config, "tie_word_embeddings", False):
             output = self.logits_processor(hidden_states, self.lm_head, logits_metadata)
         else:
             output = self.logits_processor(hidden_states, self.model.embed_tokens, logits_metadata)
-        return output, layers_kv_fused, True
+        return output, layers_kv_fused, True, layers_topk_ids
 
 
 class BailingMoeForCausalLM(BailingMoEForCausalLM):

@@ -15,6 +15,10 @@ from jax.sharding import PartitionSpec as P
 from sgl_jax.srt.configs.load_config import LoadConfig
 from sgl_jax.srt.configs.model_config import AttentionArch, MockModelConfig, ModelConfig
 from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessorOutput
+from sgl_jax.srt.layers.routed_experts_capturer import (
+    RoutedExpertsCapturer,
+    set_global_experts_capturer,
+)
 from sgl_jax.srt.layers.sampler import Sampler, compute_logprobs
 from sgl_jax.srt.lora.context_manager import LoraBatchContext
 from sgl_jax.srt.managers.schedule_batch import (
@@ -72,6 +76,7 @@ class ModelRunner:
         req_to_token_pool: ReqToTokenPool | None = None,
         token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator | None = None,
         rngs: nnx.Rngs = None,
+        max_padding: int = 1,
     ):
         # Parse args
         self.is_draft_worker = is_draft_worker
@@ -99,6 +104,8 @@ class ModelRunner:
 
         # For sampling
         self.use_sort_for_toppk_minp = server_args.use_sort_for_toppk_minp
+
+        self.max_padding = max_padding
 
         # Global vars
         global_server_args_dict.update(
@@ -158,6 +165,19 @@ class ModelRunner:
             server_args.max_running_requests,
             server_args.max_total_tokens,
             total_device_memory,
+        )
+
+        # Init routed experts capturer
+        self.init_routed_experts_capturer()
+
+    def init_routed_experts_capturer(self):
+        set_global_experts_capturer(
+            RoutedExpertsCapturer.create(
+                enable=self.server_args.enable_return_routed_experts,
+                model_config=self.model_config,
+                num_tokens=self.max_total_num_tokens + self.page_size,
+                max_padding=self.max_padding,
+            )
         )
 
     def initialize_jit(self):
@@ -501,11 +521,14 @@ class ModelRunner:
         import jax._src.test_util as jtu
 
         with jtu.count_pjit_cpp_cache_miss() as count:
-            output, layers_kv_fused, _ = self.jitted_run_model(forward_batch, logits_metadata)
+            output, layers_kv_fused, _, layers_topk_ids = self.jitted_run_model(
+                forward_batch, logits_metadata
+            )
             cache_miss_count = count()
         self._set_kv_cache_after_forward(layers_kv_fused)
 
-        return output, cache_miss_count
+        # layers_topk_ids required real_bs and original_input_len which could not be stored in ForwardBatch
+        return output, cache_miss_count, layers_topk_ids
 
     def _set_kv_cache_after_forward(self, layers_kv_fused):
         # Note: For tp_size == 1, we need to put the layers_kv_fused on the device with the target_sharding

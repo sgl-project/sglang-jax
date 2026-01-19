@@ -40,7 +40,6 @@ def run_curl(args):
 
         if response.status_code == 200:
             result = response.json()
-            # print(f"{json.dumps(result,indent=4, ensure_ascii=False)}")
             return result
         else:
             print(f"Error Response: {response.text}")

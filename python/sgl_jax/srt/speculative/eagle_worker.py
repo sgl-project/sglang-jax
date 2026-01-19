@@ -212,7 +212,7 @@ class EAGLEWorker(ModelWorker):
         forward_batch.forward_mode = ForwardMode.EXTEND
         # last_idx = np.cumsum(model_worker_batch.extend_seq_lens, axis=0) - 1
 
-        logits_output, _ = self.draft_model_runner.forward(
+        logits_output, _, _ = self.draft_model_runner.forward(
             forward_batch,
             logits_metadata=LogitsMetadata.from_model_worker_batch(model_worker_batch, self.mesh),
         )
@@ -600,7 +600,7 @@ class EAGLEWorker(ModelWorker):
         forward_batch = ForwardBatch.init_new(model_worker_batch, self.draft_model_runner)
         if forward_batch.input_ids.shape[0] <= 0:
             return
-        draft_logits_output, _ = self.draft_model_runner.forward(
+        draft_logits_output, _, _ = self.draft_model_runner.forward(
             forward_batch,
             logits_metadata=logits_meatadata,
         )
@@ -680,7 +680,7 @@ class EAGLEWorker(ModelWorker):
 
             # Run forward
             forward_batch.bid = model_worker_batch.bid
-            logits_output, _ = self.draft_model_runner.forward(
+            logits_output, _, _ = self.draft_model_runner.forward(
                 forward_batch,
                 logits_metadata=logits_metadata,
             )

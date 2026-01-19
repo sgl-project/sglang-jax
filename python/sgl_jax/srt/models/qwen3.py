@@ -561,7 +561,7 @@ class Qwen3ForCausalLM(nnx.Module):
                 aux_hidden_states=aux_hidden_states,
             )
 
-        return output, layers_kv_fused, layers_callback_flag
+        return output, layers_kv_fused, layers_callback_flag, None
 
 
 EntryClass = Qwen3ForCausalLM
