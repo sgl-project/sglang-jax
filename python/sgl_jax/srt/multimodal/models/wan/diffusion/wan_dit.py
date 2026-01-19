@@ -71,16 +71,32 @@ class WanTransformerBlock(nnx.Module):
         )
 
         self.to_q = LinearBase(
-            input_size=dim, output_size=dim, use_bias=True, mesh=mesh, kernel_axes=(None, None)
+            input_size=dim,
+            output_size=dim,
+            use_bias=True,
+            mesh=mesh,
+            kernel_axes=(None, "tensor"),
         )
         self.to_k = LinearBase(
-            input_size=dim, output_size=dim, use_bias=True, mesh=mesh, kernel_axes=(None, None)
+            input_size=dim,
+            output_size=dim,
+            use_bias=True,
+            mesh=mesh,
+            kernel_axes=(None, "tensor"),
         )
         self.to_v = LinearBase(
-            input_size=dim, output_size=dim, use_bias=True, mesh=mesh, kernel_axes=(None, None)
+            input_size=dim,
+            output_size=dim,
+            use_bias=True,
+            mesh=mesh,
+            kernel_axes=(None, "tensor"),
         )
         self.to_out = LinearBase(
-            input_size=dim, output_size=dim, use_bias=True, mesh=mesh, kernel_axes=(None, None)
+            input_size=dim,
+            output_size=dim,
+            use_bias=True,
+            mesh=mesh,
+            kernel_axes=("tensor", None),
         )
 
         # 1. Self-attention
@@ -263,16 +279,32 @@ class WanSelfAttention(nnx.Module):
 
         # layers
         self.to_q = LinearBase(
-            input_size=dim, output_size=dim, use_bias=True, mesh=mesh, kernel_axes=(None, None)
+            input_size=dim,
+            output_size=dim,
+            use_bias=True,
+            mesh=mesh,
+            kernel_axes=(None, "tensor"),
         )
         self.to_k = LinearBase(
-            input_size=dim, output_size=dim, use_bias=True, mesh=mesh, kernel_axes=(None, None)
+            input_size=dim,
+            output_size=dim,
+            use_bias=True,
+            mesh=mesh,
+            kernel_axes=(None, "tensor"),
         )
         self.to_v = LinearBase(
-            input_size=dim, output_size=dim, use_bias=True, mesh=mesh, kernel_axes=(None, None)
+            input_size=dim,
+            output_size=dim,
+            use_bias=True,
+            mesh=mesh,
+            kernel_axes=(None, "tensor"),
         )
         self.to_out = LinearBase(
-            input_size=dim, output_size=dim, use_bias=True, mesh=mesh, kernel_axes=(None, None)
+            input_size=dim,
+            output_size=dim,
+            use_bias=True,
+            mesh=mesh,
+            kernel_axes=("tensor", None),
         )
         self.norm_q = RMSNorm(dim, epsilon=self.epsilon)
         self.norm_k = RMSNorm(dim, epsilon=self.epsilon)
@@ -354,10 +386,18 @@ class WanI2VCrossAttention(WanSelfAttention):
         )
 
         self.add_k_proj = LinearBase(
-            input_size=dim, output_size=dim, use_bias=True, mesh=mesh, kernel_axes=(None, None)
+            input_size=dim,
+            output_size=dim,
+            use_bias=True,
+            mesh=mesh,
+            kernel_axes=(None, "tensor"),
         )
         self.add_v_proj = LinearBase(
-            input_size=dim, output_size=dim, use_bias=True, mesh=mesh, kernel_axes=(None, None)
+            input_size=dim,
+            output_size=dim,
+            use_bias=True,
+            mesh=mesh,
+            kernel_axes=(None, "tensor"),
         )
         self.norm_added_k = RMSNorm(dim, epsilon=epsilon)
         self.norm_added_q = RMSNorm(dim, epsilon=epsilon)

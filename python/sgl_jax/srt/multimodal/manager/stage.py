@@ -3,6 +3,7 @@ import signal
 from queue import Queue
 from typing import Any
 
+import jax
 import psutil
 
 from sgl_jax.srt.managers.communication import QueueBackend
@@ -55,12 +56,27 @@ class Stage:
         """
         self._in_queue = None
         self._out_queue = None
-        # this parallelism setting is accord to stage config
-        self.mesh = create_device_mesh(
-            ici_parallelism=[-1, stage_config.runtime.num_tpus],
-            dcn_parallelism=[1, 1],
-            device_indexes=device_manager.allocate(stage_config.runtime.num_tpus),
-        )
+        runtime = stage_config.runtime
+        device_kind = getattr(runtime, "device_kind", "tpu")
+        num_devices = runtime.num_tpus
+        if device_kind == "cpu":
+            cpu_devices = jax.devices("cpu")
+            if num_devices > len(cpu_devices):
+                raise RuntimeError(
+                    f"Requested {num_devices} CPU devices, but only {len(cpu_devices)} available."
+                )
+            self.mesh = create_device_mesh(
+                ici_parallelism=[-1, num_devices],
+                dcn_parallelism=[1, 1],
+                devices=cpu_devices[:num_devices],
+            )
+        else:
+            # this parallelism setting is accord to stage config
+            self.mesh = create_device_mesh(
+                ici_parallelism=[-1, num_devices],
+                dcn_parallelism=[1, 1],
+                device_indexes=device_manager.allocate(num_devices),
+            )
         self.stage_config = stage_config
         self.server_args = server_args
         self.stage_id = stage_config.stage_id

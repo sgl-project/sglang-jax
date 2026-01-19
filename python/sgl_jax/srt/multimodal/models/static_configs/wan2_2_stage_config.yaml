@@ -3,7 +3,8 @@ model_arch: Wan-AI/Wan2.2-T2V-A14B-Diffusers
 stage_args:
  - stage_id: 0
    runtime:
-     num_tpus: 2
+     num_tpus: 1
+     device_kind: cpu
      max_batch_size: 1
    scheduler: auto_regressive
    final_output: false
@@ -12,7 +13,7 @@ stage_args:
 
  - stage_id: 1
    runtime:
-     num_tpus: 1
+     num_tpus: 2
      max_batch_size: 1
    scheduler: diffusion
    scheduler_params: {}
