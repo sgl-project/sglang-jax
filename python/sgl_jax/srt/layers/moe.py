@@ -195,7 +195,7 @@ class EPMoE(nnx.Module):
         dtype: jnp.dtype = jnp.bfloat16,
         activation: str = "silu",
         layer_id: int = 0,
-        quantization_config = None,
+        quantization_config=None,
     ):
         self.num_experts = num_experts
         self.num_experts_per_tok = num_experts_per_tok
@@ -210,7 +210,9 @@ class EPMoE(nnx.Module):
         self.hidden_size = hidden_size
 
         # Get quantization settings from config
-        self.quantized_dtype = quantization_config.get_moe_weight_dtype() if quantization_config else None
+        self.quantized_dtype = (
+            quantization_config.get_moe_weight_dtype() if quantization_config else None
+        )
         self.activation_quantized_dtype = (
             quantization_config.get_moe_activation_dtype() if quantization_config else None
         )
@@ -875,6 +877,8 @@ class FusedEPMoE(nnx.Module):
 
         output = jax.sharding.reshard(output, NamedSharding(self.mesh, P(None, None)))
         return output
+
+
 # create_moe_weights_mapping is utility function to generate weight mapping for EPMoe layers
 def create_moe_weights_mapping(
     prefix: str,
