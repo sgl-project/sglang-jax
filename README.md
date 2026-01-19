@@ -55,6 +55,11 @@ SGL-JAX is designed for easy extension to new model architectures. It currently 
 -   **Qwen 3 MoE**: Apart from models like Qwen-coder3-480B with large parameters, these series have achieved our best performance.
 -   **Llama**: Performance needs to improve.
 -   **Bailing MoE**: Performance needs to improve.
+-   **MiMo-7B**: Support Eagle's Speculative Decoding, Performance needs to improve.
+
+Currently, SGL-JAX already supports MultiModal Models, and its usage is compatible with LLMs. The architecture has been adapted to support flexible multimodal model architectures.
+
+-   **Wan 2.1**: Multimodal Model. When launching this model, please refer to the [MutliModal Usage Guide](docs/mutlimodal/multimodal_usage.md) and [Architecture Design](docs/mutlimodal/design/[RFC]multimodal_architechure.md).
 
 
 ## Performance and Benchmarking
