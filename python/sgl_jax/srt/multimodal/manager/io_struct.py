@@ -18,6 +18,8 @@ class ImageGenerationsRequest(BaseModel):
     background: str | None = "auto"  # transparent | opaque | auto
     output_format: str | None = None  # png | jpeg | webp
     save_output: bool = True
+    num_inference_steps: int | None = None
+    # guidance_scale: float | None = 7.5
 
 
 class ImageResponse(BaseModel):
@@ -37,8 +39,8 @@ class VideoGenerationsRequest(BaseModel):
     size: str | None = "720x1280"
     fps: int | None = None
     num_frames: int | None = None
+    num_inference_steps: int | None = None
     save_output: bool = True
-    # num_steps: int | None = 30
     # guidance_scale: float | None = 5.0
     # text_embeds: np.ndarray | None = None
     # latents: np.ndarray | None = None
@@ -75,6 +77,7 @@ class GenerateMMReqInput:
     seconds: int | None = None
     fps: int | None = None
     num_frames: int | None = None
+    num_inference_steps: int | None = None
     save_output: bool = True
     output_format: str | None = None
     background: str | None = None
@@ -99,6 +102,7 @@ class TokenizedGenerateMMReqInput:
     seconds: int | None = None
     fps: int | None = None
     num_frames: int | None = None
+    num_inference_steps: int | None = None
     output_format: str | None = None
     save_output: bool = True
     background: str | None = None
