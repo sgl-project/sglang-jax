@@ -15,7 +15,12 @@ from sgl_jax.srt.layers.moe import EPMoE, FusedEPMoE, GateLogit, TopK
 from sgl_jax.srt.layers.radix_attention import RadixAttention
 from sgl_jax.srt.mem_cache.memory_pool import KVCache
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
-from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
+from sgl_jax.srt.utils.weight_utils import (
+    WeightLoader,
+    WeightMapping,
+    create_epmoe_weights_mapping,
+    create_fused_moe_weights_mapping,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -589,36 +594,13 @@ class BailingMoEForCausalLM(nnx.Module):
             use_fused = moe_backend == "fused"
 
             if use_fused:
-                # Fused MoE Mapping
-                # w1: gate_proj -> (num_experts, hidden, intermediate)
-                # w3: up_proj   -> (num_experts, hidden, intermediate)
-                # w2: down_proj -> (num_experts, intermediate, hidden)
-
-                def _add_expert_weight(
-                    *,
-                    target_name: str,
-                    hf_name: str,
-                    sharding: tuple[str | None, ...],
-                ) -> None:
-                    target_path = [f"{target_prefix}.mlp.{target_name}"]
-                    target_path.extend(
-                        [f"{prefix}.mlp.experts.{i}.{hf_name}.weight" for i in range(num_experts)]
-                    )
-                    mappings[f"__MOE_EXPERTS__{prefix}.mlp.{target_name}"] = WeightMapping(
-                        target_path=target_path,
-                        sharding=sharding,
-                        transpose=True,
-                    )
-
-                _add_expert_weight(
-                    target_name="w1", hf_name="gate_proj", sharding=("tensor", None, None)
+                moe_mappings = create_fused_moe_weights_mapping(
+                    prefix=prefix,
+                    target_prefix=target_prefix,
+                    num_experts=num_experts,
+                    moe_path="mlp",
                 )
-                _add_expert_weight(
-                    target_name="w3", hf_name="up_proj", sharding=("tensor", None, None)
-                )
-                _add_expert_weight(
-                    target_name="w2", hf_name="down_proj", sharding=("tensor", None, None)
-                )
+                mappings.update(moe_mappings)
 
                 if getattr(self.config, "num_shared_experts", 0) > 0:
                     mappings[f"{prefix}.mlp.shared_experts.gate_proj.weight"] = WeightMapping(
@@ -637,26 +619,13 @@ class BailingMoEForCausalLM(nnx.Module):
                         transpose=True,
                     )
             else:
-                for expert_type in ["gate_proj", "up_proj", "down_proj"]:
-                    target_name = {
-                        "gate_proj": "wi_0",
-                        "up_proj": "wi_1",
-                        "down_proj": "wo",
-                    }[expert_type]
-                    expert_keys = [
-                        f"{prefix}.mlp.experts.{i}.{expert_type}.weight" for i in range(num_experts)
-                    ]
-
-                    if expert_type == "down_proj":
-                        sharding = ("expert", None, "tensor")
-                    else:
-                        sharding = ("expert", "tensor", None)
-
-                    mappings[f"__MOE_EXPERTS__{prefix}.mlp.{target_name}"] = WeightMapping(
-                        target_path=[f"{target_prefix}.mlp.{target_name}"] + expert_keys,
-                        sharding=sharding,
-                        transpose=False,
-                    )
+                moe_mappings = create_epmoe_weights_mapping(
+                    prefix=prefix,
+                    target_prefix=target_prefix,
+                    num_experts=num_experts,
+                    moe_path="mlp",
+                )
+                mappings.update(moe_mappings)
 
                 if getattr(self.config, "num_shared_experts", 0) > 0:
                     shared_experts_mappings = {

@@ -17,7 +17,12 @@ from sgl_jax.srt.layers.radix_attention import RadixAttention
 from sgl_jax.srt.mem_cache.memory_pool import KVCache
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
 from sgl_jax.srt.models.qwen3 import Qwen3MLP
-from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
+from sgl_jax.srt.utils.weight_utils import (
+    WeightLoader,
+    WeightMapping,
+    create_epmoe_weights_mapping,
+    create_fused_moe_weights_mapping,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -512,57 +517,21 @@ class Qwen3MoeForCausalLM(nnx.Module):
             num_experts = getattr(self.config, "num_experts", 128)
 
             if use_fused:
-                # Fused MoE Mapping
-                # w1: gate_proj -> (num_experts, hidden, intermediate)
-                # w3: up_proj   -> (num_experts, hidden, intermediate)
-                # w2: down_proj -> (num_experts, intermediate, hidden)
-                w1_expert_keys = [
-                    f"{prefix}.mlp.experts.{i}.gate_proj.weight" for i in range(num_experts)
-                ]
-                mappings[f"__MOE_EXPERTS__{prefix}.mlp.w1"] = WeightMapping(
-                    target_path=[f"{target_prefix}.mlp.w1"] + w1_expert_keys,
-                    sharding=("tensor", None, None),  # (E, H, I)
-                    transpose=True,
+                moe_mappings = create_fused_moe_weights_mapping(
+                    prefix=prefix,
+                    target_prefix=target_prefix,
+                    num_experts=num_experts,
+                    moe_path="mlp",
                 )
-                w3_expert_keys = [
-                    f"{prefix}.mlp.experts.{i}.up_proj.weight" for i in range(num_experts)
-                ]
-                mappings[f"__MOE_EXPERTS__{prefix}.mlp.w3"] = WeightMapping(
-                    target_path=[f"{target_prefix}.mlp.w3"] + w3_expert_keys,
-                    sharding=("tensor", None, None),  # (E, H, I)
-                    transpose=True,
-                )
-                w2_expert_keys = [
-                    f"{prefix}.mlp.experts.{i}.down_proj.weight" for i in range(num_experts)
-                ]
-                mappings[f"__MOE_EXPERTS__{prefix}.mlp.w2"] = WeightMapping(
-                    target_path=[f"{target_prefix}.mlp.w2"] + w2_expert_keys,
-                    sharding=("tensor", None, None),  # (E, I, H)
-                    transpose=True,
-                )
+                mappings.update(moe_mappings)
             else:
-                # EPMoE mapping - always use expert sharding
-                for expert_type in ["gate_proj", "up_proj", "down_proj"]:
-                    target_name = {
-                        "gate_proj": "wi_0",
-                        "up_proj": "wi_1",
-                        "down_proj": "wo",
-                    }[expert_type]
-
-                    expert_keys = [
-                        f"{prefix}.mlp.experts.{i}.{expert_type}.weight" for i in range(num_experts)
-                    ]
-
-                    if expert_type == "down_proj":
-                        sharding = ("expert", None, "tensor")
-                    else:
-                        sharding = ("expert", "tensor", None)
-
-                    mappings[f"__MOE_EXPERTS__{prefix}.mlp.{target_name}"] = WeightMapping(
-                        target_path=[f"{target_prefix}.mlp.{target_name}"] + expert_keys,
-                        sharding=sharding,
-                        transpose=False,
-                    )
+                moe_mappings = create_epmoe_weights_mapping(
+                    prefix=prefix,
+                    target_prefix=target_prefix,
+                    num_experts=num_experts,
+                    moe_path="mlp",
+                )
+                mappings.update(moe_mappings)
 
         return mappings
 
