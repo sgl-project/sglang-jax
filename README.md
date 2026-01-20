@@ -82,4 +82,4 @@ Before contributing, please read our [Contribution Guide](https://github.com/sgl
  for setup instructions, coding standards, and contribution workflow.
 
 You can also join our community on Slack to discuss ideas, get help, or collaborate with other contributors:
-👉 Join the [SGL-JAX Slack](https://sgl-fru7574.slack.com/archives/C09EBE5HT5X)
+👉 Join the SGLang Slack workspace (https://slack.sglang.io/), then participate in discussions in the [SGL-JAX Slack Channel](https://sgl-fru7574.slack.com/archives/C09EBE5HT5X).
