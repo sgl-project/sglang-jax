@@ -313,6 +313,7 @@ class BailingMoEDecoderLayer(nnx.Module):
                     weight_dtype=dtype,
                     dtype=dtype,
                     layer_id=layer_id,
+                    quantization_config=getattr(config, "quantization_config", None),
                 )
 
             if num_shared_experts > 0 and not self.use_fused:

@@ -255,6 +255,7 @@ class Qwen2MoeDecoderLayer(nnx.Module):
                 weight_dtype=dtype,
                 dtype=dtype,
                 layer_id=layer_id,
+                quantization_config=getattr(config, "quantization_config", None),
             )
 
         # Optional shared expert path

@@ -275,6 +275,7 @@ class Grok1MoE(nnx.Module):
                 weight_dtype=dtype,
                 dtype=dtype,
                 layer_id=layer_id,
+                quantization_config=getattr(config, "quantization_config", None),
             )
 
     def __call__(self, hidden_states: jax.Array) -> tuple[jax.Array, jax.Array | None]:

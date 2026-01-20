@@ -225,6 +225,7 @@ class QWen3MoeDecoderLayer(nnx.Module):
                     weight_dtype=dtype,
                     dtype=dtype,
                     layer_id=layer_id,
+                    quantization_config=getattr(config, "quantization_config", None),
                 )
             self.is_moe_layer = True
 
