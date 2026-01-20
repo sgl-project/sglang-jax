@@ -48,6 +48,8 @@ from sgl_jax.srt.utils.jax_utils import get_available_device_memory
 from sgl_jax.srt.utils.quantization.quantization_utils import (
     apply_moe_quantization,
     apply_qwix_quantization,
+    calculate_model_weights_memory,
+    log_quantization_memory_savings,
 )
 
 logger = logging.getLogger(__name__)
@@ -277,6 +279,9 @@ class ModelRunner(BaseModelRunner):
 
         # Apply quantization if quantization config is set
         if self.model_config.quantization_config is not None:
+            # Calculate memory before quantization
+            memory_before = calculate_model_weights_memory(self.model)
+
             # Apply MoE quantization first (before QWIX, so scales are set when QWIX runs model)
             if self.model_config.quantization_config.has_moe_quantization():
                 self.model = apply_moe_quantization(self.model_config, self.model)
@@ -285,6 +290,10 @@ class ModelRunner(BaseModelRunner):
             qwix_rules = self.model_config.quantization_config.get_qwix_rules()
             if qwix_rules:
                 self.model = apply_qwix_quantization(self.model_config, self.model, self)
+
+            # Calculate memory after quantization and log savings
+            memory_after = calculate_model_weights_memory(self.model)
+            log_quantization_memory_savings(memory_before, memory_after)
 
         # Parse other args
         self.sliding_window_size = self.model_config.sliding_window
