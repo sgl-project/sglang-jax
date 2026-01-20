@@ -71,6 +71,8 @@ class TopK(nnx.Module):
 
     @named_scope
     def __call__(self, router_logits: jax.Array, correction_bias: jax.Array = None):
+        router_logits = router_logits.astype(jnp.float32)
+
         if self.num_expert_group > 0 or self.topk_group > 0:
             if correction_bias is not None:
                 topk_weights, topk_ids = self._biased_grouped_topk(router_logits, correction_bias)
@@ -87,7 +89,8 @@ class TopK(nnx.Module):
             if self.routed_scaling_factor is not None:
                 topk_weights *= self.routed_scaling_factor
 
-        topk_weights = topk_weights.astype(router_logits.dtype)
+        if topk_weights.dtype != jnp.float32:
+            topk_weights = topk_weights.astype(jnp.float32)
 
         return topk_weights, topk_ids
 
