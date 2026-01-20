@@ -184,32 +184,50 @@ class WanTransformerBlock(nnx.Module):
         if self.mesh is not None:
             no_shard = jax.sharding.NamedSharding(self.mesh, jax.sharding.PartitionSpec())
             scale_shift_table = jax.lax.with_sharding_constraint(scale_shift_table, no_shard)
+            # Keep temb unsharded as well; slicing small dims on sharded arrays fails.
+            temb = jax.lax.with_sharding_constraint(temb, no_shard)
 
         if temb.ndim == 4:
             # temb: [batch, seq_len, 6, inner_dim]
             e = scale_shift_table[None, None, :, :] + temb.astype(jnp.float32)
+            if self.mesh is not None:
+                e = jax.lax.with_sharding_constraint(e, no_shard)
 
-            # Use manual slicing instead of jnp.split to avoid sharding issues
-            # e shape: [batch, seq_len, 6, inner_dim]
-            shift_msa = e[:, :, 0, :]
-            scale_msa = e[:, :, 1, :]
-            gate_msa = e[:, :, 2, :]
-            c_shift_msa = e[:, :, 3, :]
-            c_scale_msa = e[:, :, 4, :]
-            c_gate_msa = e[:, :, 5, :]
+            # Flatten the last two dims to avoid slicing on a sharded axis.
+            # e shape: [batch, seq_len, 6, inner_dim] -> [batch, seq_len, 6 * inner_dim]
+            inner_dim = e.shape[-1]
+            e_flat = e.reshape(e.shape[0], e.shape[1], -1)
+            shift_msa = e_flat[:, :, 0:inner_dim]
+            scale_msa = e_flat[:, :, inner_dim : 2 * inner_dim]
+            gate_msa = e_flat[:, :, 2 * inner_dim : 3 * inner_dim]
+            c_shift_msa = e_flat[:, :, 3 * inner_dim : 4 * inner_dim]
+            c_scale_msa = e_flat[:, :, 4 * inner_dim : 5 * inner_dim]
+            c_gate_msa = e_flat[:, :, 5 * inner_dim : 6 * inner_dim]
 
         else:
             # temb: [batch, 6, inner_dim]
             e = scale_shift_table + temb.astype(jnp.float32)
+            if self.mesh is not None:
+                e = jax.lax.with_sharding_constraint(e, no_shard)
 
-            # Use manual slicing instead of jnp.split to avoid sharding issues
-            # e shape: [batch, 6, inner_dim]
-            shift_msa = e[:, 0, :]
-            scale_msa = e[:, 1, :]
-            gate_msa = e[:, 2, :]
-            c_shift_msa = e[:, 3, :]
-            c_scale_msa = e[:, 4, :]
-            c_gate_msa = e[:, 5, :]
+            # Flatten the last two dims to avoid slicing on a sharded axis.
+            # e shape: [batch, 6, inner_dim] -> [batch, 6 * inner_dim]
+            inner_dim = e.shape[-1]
+            e_flat = e.reshape(e.shape[0], -1)
+            shift_msa = e_flat[:, 0:inner_dim]
+            scale_msa = e_flat[:, inner_dim : 2 * inner_dim]
+            gate_msa = e_flat[:, 2 * inner_dim : 3 * inner_dim]
+            c_shift_msa = e_flat[:, 3 * inner_dim : 4 * inner_dim]
+            c_scale_msa = e_flat[:, 4 * inner_dim : 5 * inner_dim]
+            c_gate_msa = e_flat[:, 5 * inner_dim : 6 * inner_dim]
+
+            # Broadcast per-batch modulation across sequence length.
+            shift_msa = shift_msa[:, None, :]
+            scale_msa = scale_msa[:, None, :]
+            gate_msa = gate_msa[:, None, :]
+            c_shift_msa = c_shift_msa[:, None, :]
+            c_scale_msa = c_scale_msa[:, None, :]
+            c_gate_msa = c_gate_msa[:, None, :]
 
         assert shift_msa.dtype == jnp.float32
         # 1. Self-attention
@@ -688,6 +706,9 @@ class WanTransformer3DModel(nnx.Module):
             # Use manual slicing instead of jnp.split to avoid sharding issues
             shift = combined[:, 0, :]
             scale = combined[:, 1, :]
+            # Broadcast per-batch modulation across sequence length.
+            shift = shift[:, None, :]
+            scale = scale[:, None, :]
 
         hidden_states = self.norm_out(hidden_states, shift, scale)
         hidden_states = self.proj_out(hidden_states)
