@@ -36,7 +36,12 @@ class TestWan2_1Model(CustomTestCase):
             },
             multimodal=True,
         )
-        data = {"prompt": "A curious raccoon", "size": "480*832", "num_frames": 41, "num_inference_steps":5}
+        data = {
+            "prompt": "A curious raccoon",
+            "size": "480*832",
+            "num_frames": 41,
+            "num_inference_steps": 5,
+        }
         response = requests.post(
             DEFAULT_URL_FOR_TEST + "/api/v1/videos/generation",
             headers=headers,
