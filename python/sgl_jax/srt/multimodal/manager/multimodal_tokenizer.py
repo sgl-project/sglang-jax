@@ -221,7 +221,7 @@ class MultimodalTokenizer(TokenizerManager):
             negative_input_ids=neg_input_ids,
             size=getattr(obj, "size", None),
             num_frames=getattr(obj, "num_frames", None),
-            num_inference_steps=getattr(obj, "num_inference_steps", None),
+            num_inference_steps=getattr(obj, "num_inference_steps", 50),
             data_type=getattr(obj, "data_type", None),
             save_output=getattr(obj, "save_output", True),
         )
