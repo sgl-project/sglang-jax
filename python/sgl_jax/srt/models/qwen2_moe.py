@@ -326,6 +326,7 @@ class Qwen2MoeDecoderLayer(nnx.Module):
         router_logits = self.moe_gate(hidden_states)
         if self.use_fused:
             mlp_output = self.mlp(hidden_states, router_logits)
+            topk_ids = None
         else:
             topk_weights, topk_ids = self.topk(router_logits)
             mlp_output = self.mlp(hidden_states, topk_weights, topk_ids)
