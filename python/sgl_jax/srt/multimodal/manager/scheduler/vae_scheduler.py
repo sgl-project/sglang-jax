@@ -1,8 +1,8 @@
 import logging
 
 import jax
-import numpy as np
 import jax.sharding
+import numpy as np
 from jax import NamedSharding
 from jax.sharding import PartitionSpec
 
