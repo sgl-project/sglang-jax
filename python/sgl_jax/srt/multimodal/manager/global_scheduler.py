@@ -202,6 +202,9 @@ class GlobalScheduler:
             height=int(size_str.split("*")[0]),
             width=int(size_str.split("*")[1]),
             num_frames=input.num_frames,
+            num_inference_steps=(
+                input.num_inference_steps if input.num_inference_steps is not None else 50
+            ),
             data_type=input.data_type,
             save_output=input.save_output,
         )

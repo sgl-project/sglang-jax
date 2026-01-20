@@ -99,7 +99,7 @@ class Req:
     boundary_ratio: float | None = None
 
     # Scheduler parameters
-    num_inference_steps: int = 5
+    num_inference_steps: int = 50
     guidance_scale: float = 3.0
     guidance_scale_2: float | None = None
     guidance_rescale: float = 0.0
