@@ -165,6 +165,7 @@ class WanTransformerBlock(nnx.Module):
         self.scale_shift_table = nnx.Param(
             jax.random.normal(jax.random.key(0), (1, 6, dim)) / (dim**0.5)
         )
+        self.mesh = mesh
 
     def __call__(
         self,
@@ -178,24 +179,37 @@ class WanTransformerBlock(nnx.Module):
             hidden_states = hidden_states.squeeze(1)
         bs, seq_len, _ = hidden_states.shape
         origin_dtype = hidden_states.dtype
+        # Ensure scale_shift_table is not sharded to avoid issues with split
+        scale_shift_table = self.scale_shift_table.value
+        if self.mesh is not None:
+            no_shard = jax.sharding.NamedSharding(self.mesh, jax.sharding.PartitionSpec())
+            scale_shift_table = jax.lax.with_sharding_constraint(scale_shift_table, no_shard)
+
         if temb.ndim == 4:
             # temb: [batch, seq_len, 6, inner_dim]
-            e = self.scale_shift_table[None, None, :, :] + temb.astype(jnp.float32)
+            e = scale_shift_table[None, None, :, :] + temb.astype(jnp.float32)
 
-            # [batch, seq_len, 1, inner_dim]
-            chunks = jnp.split(e, 6, axis=2)
-
-            (shift_msa, scale_msa, gate_msa, c_shift_msa, c_scale_msa, c_gate_msa) = [
-                jnp.squeeze(x, 2) for x in chunks
-            ]
+            # Use manual slicing instead of jnp.split to avoid sharding issues
+            # e shape: [batch, seq_len, 6, inner_dim]
+            shift_msa = e[:, :, 0, :]
+            scale_msa = e[:, :, 1, :]
+            gate_msa = e[:, :, 2, :]
+            c_shift_msa = e[:, :, 3, :]
+            c_scale_msa = e[:, :, 4, :]
+            c_gate_msa = e[:, :, 5, :]
 
         else:
             # temb: [batch, 6, inner_dim]
-            e = self.scale_shift_table + temb.astype(jnp.float32)
+            e = scale_shift_table + temb.astype(jnp.float32)
 
-            (shift_msa, scale_msa, gate_msa, c_shift_msa, c_scale_msa, c_gate_msa) = jnp.split(
-                e, 6, axis=1
-            )
+            # Use manual slicing instead of jnp.split to avoid sharding issues
+            # e shape: [batch, 6, inner_dim]
+            shift_msa = e[:, 0, :]
+            scale_msa = e[:, 1, :]
+            gate_msa = e[:, 2, :]
+            c_shift_msa = e[:, 3, :]
+            c_scale_msa = e[:, 4, :]
+            c_gate_msa = e[:, 5, :]
 
         assert shift_msa.dtype == jnp.float32
         # 1. Self-attention
@@ -635,11 +649,10 @@ class WanTransformer3DModel(nnx.Module):
         else:
             # batch_size, 6, inner_dim
             timestep_proj = timestep_proj.reshape(timestep_proj.shape[:1] + (6, -1))
-        if self.mesh is not None and getattr(self.mesh, "shape", None):
-            tensor_axis = self.mesh.shape.get("tensor", 1)
-            if tensor_axis > 1:
-                sharding = jax.sharding.NamedSharding(self.mesh, jax.sharding.PartitionSpec())
-                timestep_proj = jax.lax.with_sharding_constraint(timestep_proj, sharding)
+        # Remove tensor sharding before passing to blocks to avoid "out dim not divisible by mesh axes" error in split
+        if self.mesh is not None:
+            sharding = jax.sharding.NamedSharding(self.mesh, jax.sharding.PartitionSpec())
+            timestep_proj = jax.lax.with_sharding_constraint(timestep_proj, sharding)
 
         # Concatenate image and text embeddings if image embeddings exist
         if encoder_hidden_states_image is not None:
@@ -655,17 +668,26 @@ class WanTransformer3DModel(nnx.Module):
             )
 
         # 5. Output norm, projection & unpatchify
+        # Ensure scale_shift_table is not sharded to avoid issues with split
+        scale_shift_table = self.scale_shift_table.value
+        if self.mesh is not None:
+            no_shard = jax.sharding.NamedSharding(self.mesh, jax.sharding.PartitionSpec())
+            scale_shift_table = jax.lax.with_sharding_constraint(scale_shift_table, no_shard)
+
         if temb.ndim == 3:
             # batch_size, seq_len, inner_dim (wan 2.2 ti2v)
-            combined = self.scale_shift_table[None, :, :, :] + temb[:, :, None, :]
-            # Split into shift and scale
-            shift, scale = jnp.split(combined, 2, axis=2)
-            shift = jnp.squeeze(shift, axis=2)
-            scale = jnp.squeeze(scale, axis=2)
+            # combined shape: [batch, seq_len, 2, inner_dim]
+            combined = scale_shift_table[None, :, :, :] + temb[:, :, None, :]
+            # Use manual slicing instead of jnp.split to avoid sharding issues
+            shift = combined[:, :, 0, :]
+            scale = combined[:, :, 1, :]
         else:
             # batch_size, inner_dim
-            combined = self.scale_shift_table + temb[:, None, :]
-            shift, scale = jnp.split(combined, 2, axis=1)
+            # combined shape: [batch, 2, inner_dim]
+            combined = scale_shift_table + temb[:, None, :]
+            # Use manual slicing instead of jnp.split to avoid sharding issues
+            shift = combined[:, 0, :]
+            scale = combined[:, 1, :]
 
         hidden_states = self.norm_out(hidden_states, shift, scale)
         hidden_states = self.proj_out(hidden_states)
