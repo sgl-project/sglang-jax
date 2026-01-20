@@ -18,6 +18,8 @@ class ImageGenerationsRequest(BaseModel):
     background: str | None = "auto"  # transparent | opaque | auto
     output_format: str | None = None  # png | jpeg | webp
     save_output: bool = True
+    num_inference_steps: int | None = None
+    # guidance_scale: float | None = 7.5
 
 
 class ImageResponse(BaseModel):

@@ -52,7 +52,7 @@ async def _convert_to_internal_request(obj: ImageGenerationsRequest | VideoGener
     if type(obj) is ImageGenerationsRequest:
         num_frames = 1
         data_type = DataType.IMAGE
-        num_inference_steps = 50
+        num_inference_steps = obj.num_inference_steps if obj.num_inference_steps is not None else 50
     elif type(obj) is VideoGenerationsRequest:
         num_frames = obj.num_frames
         data_type = DataType.VIDEO
