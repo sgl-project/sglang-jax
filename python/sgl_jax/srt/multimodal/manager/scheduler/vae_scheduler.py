@@ -1,5 +1,7 @@
 import logging
 
+import jax
+import numpy as np
 import jax.sharding
 from jax import NamedSharding
 from jax.sharding import PartitionSpec
@@ -50,7 +52,7 @@ class VaeScheduler:
         self._comm_backend = communication_backend
         self.mesh = mesh
         self.vae_worker = VaeModelWorker(
-            model_class=model_class, mesh=mesh, server_args=server_args
+            model_class=model_class, mesh=self.mesh, server_args=server_args
         )
         self.server_args = server_args
         self.model_config = model_class.get_config_class()()
@@ -106,6 +108,7 @@ class VaeScheduler:
             req.latents = req.latents / self.model_config.scaling_factor
         if hasattr(self.model_config, "shift_factor"):
             req.latents += self.model_config.shift_factor
+        req.latents = jax.device_get(req.latents)
 
     def run_vae_batch(self, batch: list[Req]):
         """Run the VAE forward pass for a batch of requests.

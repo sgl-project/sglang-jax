@@ -198,14 +198,14 @@ class VAEConfigRegistry:
         # Wan2.1 I2V 14B 720P
         "Wan2.1-I2V-14B-720P-Diffusers": lambda: WanVAEConfig(),
         # Wan2.2 T2V A14B (MoE)
-        "Wan-AI/Wan2.2-T2V-A14B-Diffusers": lambda: WanVAEConfig(is_residual=True),
-        "Wan2.2-T2V-A14B-Diffusers": lambda: WanVAEConfig(is_residual=True),
+        "Wan-AI/Wan2.2-T2V-A14B-Diffusers": lambda: WanVAEConfig(is_residual=False),
+        "Wan2.2-T2V-A14B-Diffusers": lambda: WanVAEConfig(is_residual=False),
     }
 
     # Keyword patterns for fallback matching (order matters - more specific first)
     _KEYWORD_PATTERNS: list[tuple[str, callable]] = [
         # Wan2.2 patterns
-        ("Wan2.2", lambda: WanVAEConfig(is_residual=True)),
+        ("Wan2.2", lambda: WanVAEConfig(is_residual=False)),
         # Wan2.1 patterns
         ("Wan2.1", lambda: WanVAEConfig()),
     ]
