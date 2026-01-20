@@ -89,8 +89,7 @@ class TopK(nnx.Module):
             if self.routed_scaling_factor is not None:
                 topk_weights *= self.routed_scaling_factor
 
-        if topk_weights.dtype != jnp.float32:
-            topk_weights = topk_weights.astype(jnp.float32)
+        topk_weights = topk_weights.astype(jnp.float32)
 
         return topk_weights, topk_ids
 
