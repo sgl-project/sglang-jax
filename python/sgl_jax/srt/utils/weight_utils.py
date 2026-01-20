@@ -251,7 +251,7 @@ class WeightLoader:
         else:
             self.sharding_size = 1
 
-        if hasattr(model_config, "ep_size"):
+        if hasattr(model_config, "ep_size") and model_config.ep_size > 1:
             world_size = self.mesh.shape.get("data", 1) * self.mesh.shape.get("tensor", 1)
             tp_size = world_size // model_config.ep_size
             ep_size = model_config.ep_size
