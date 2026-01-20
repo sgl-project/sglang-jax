@@ -166,12 +166,11 @@ class Req:
 
 ---
 
-##### B. `ModelWorkerBatch` Class
+##### B. `ScheduleBatch` Class
 
 ```python
 @dataclass
-class ModelWorkerBatch:
-    """Batch sent to model worker."""
+class ScheduleBatch:
     # ... existing fields ...
     return_routed_experts: bool = False  # NEW FIELD
     # ... remaining fields ...
@@ -211,7 +210,7 @@ class BatchStrOut:
     # ... remaining fields ...
 ```
 
-**Description**: List of base64-encoded strings, one per request. Each string encodes the expert IDs array as bytes for efficient serialization. Created by `DetokenizerManager._extract_routed_experts()`.
+**Description**: List of base64-encoded strings, one per request. Created by `DetokenizerManager._extract_routed_experts()`.
 
 **Encoding Process**:
 ```python
@@ -263,6 +262,7 @@ def create(
     enable: bool,
     model_config: ModelConfig,
     num_tokens: int,
+    max_padding: int,
 ) -> RoutedExpertsCapturer
 ```
 
@@ -270,6 +270,7 @@ def create(
 - `enable`: Whether to create real or no-op capturer (from `server_args.enable_return_routed_experts`)
 - `model_config`: Model configuration containing layer count and expert topology
 - `num_tokens`: Total size of token pool (determines host cache size)
+- `max_padding`: Maximum padding for prefill and decode
 
 #### 3.2.4 Real Capturer: `_RoutedExpertsCapturerReal`
 
@@ -281,6 +282,7 @@ class _RoutedExpertsCapturerReal(RoutedExpertsCapturer):
         self,
         model_config: ModelConfig,
         num_tokens: int,
+        max_padding: int,
     ):
         self.num_hidden_layers = model_config.hf_text_config.num_hidden_layers
         self.num_experts_per_tok = model_config.hf_text_config.num_experts_per_tok
@@ -309,6 +311,7 @@ Size: 131072 × 48 × 8 × 4 bytes = 192MB
 ```python
 def _sync_fwd_experts_buffer_DtoH(
     self,
+    topk_ids: list[jax.Array],
     model_worker_batch: ModelWorkerBatch,
 ):
     pass
@@ -317,7 +320,7 @@ def _sync_fwd_experts_buffer_DtoH(
 **Operation**:
 1. Retrieves `out_cache_loc` array mapping batch positions to token pool indices
 2. Performs indexed copy from device buffer to host buffer
-3. Synchronizes CPU and Device (blocking operation)
+3. Synchronizes CPU and Device (blocking operation). This synchronization are executed in another thread.
 
 ##### C. Retrieval Method
 
@@ -327,6 +330,7 @@ def get_routed_experts(
     req_pool_idx: int,
     seqlen: int,
     req_to_token_pool: ReqToTokenPool,
+    bid: int,
 ):
     pass
 ```
@@ -369,6 +373,7 @@ class _RoutedExpertsCapturerNoop(RoutedExpertsCapturer):
         req_pool_idx: int,
         seqlen: int,
         req_to_token_pool: ReqToTokenPool,
+        bid: int,
     ):
         pass
 
