@@ -45,7 +45,7 @@ Note: For some MoE models like inclusionAI/Ling-mini-2.0, the first several laye
 
 ```python
 from sgl_jax import Engine
-from sgl_jax.srt.layers.moe.routed_experts_capturer import extract_routed_experts_from_meta_info
+from sgl_jax.srt.layers.routed_experts_capturer import extract_routed_experts_from_meta_info
 import numpy as np
 
 # Initialize engine with routed experts feature enabled
