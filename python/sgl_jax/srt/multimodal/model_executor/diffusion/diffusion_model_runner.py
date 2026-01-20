@@ -133,7 +133,7 @@ class DiffusionModelRunner(BaseModelRunner):
         Returns:
             True if the request was aborted, False otherwise.
         """
-        num_inference_steps = self.model_config.num_inference_steps
+        num_inference_steps = batch.num_inference_steps
         guidance_scale = batch.guidance_scale
         do_classifier_free_guidance = guidance_scale > 1.0
 
