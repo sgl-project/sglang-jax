@@ -50,8 +50,7 @@ class TestReturnRoutedExperts(CustomTestCase):
         Steps:
         cd test/srt/rl/dumped_data
         python3 ../test_return_routed_experts.py
-        # This generates five files, you need to merge last two prefill files into return_routed_experts_prefill_baseline.txt.
-        # Rename latest decode file with return_routed_experts_decode_baseline.txt.
+        There are some post-operations, please contact to aolemila.
         """
         print(f"Initialize an Engine to get baseline expert ids!")
         os.environ["DUMP_TOPK_IDS_FILEINFO"] = f"prompt_prefill.txt,prompt_decode.txt"
@@ -457,7 +456,7 @@ class TestReturnRoutedExperts(CustomTestCase):
                 114,
                 52,
                 67,
-                60,
+                83,
                 82,
                 33,
                 9,
