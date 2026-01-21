@@ -265,7 +265,7 @@ class PrefillAdder:
         self.running_batch = running_batch
         self.new_token_ratio = new_token_ratio
         self.dp_size = dp_size
-        self.rem_input_tokens = rem_input_tokens - mixed_with_decode_tokens
+        self.rem_input_tokens = [rem_input_tokens - mixed_with_decode_tokens] * dp_size
         self.rem_chunk_tokens = rem_chunk_tokens
         if self.rem_chunk_tokens is not None:
             self.rem_chunk_tokens -= mixed_with_decode_tokens
@@ -369,11 +369,11 @@ class PrefillAdder:
     def align_page_size(self, size: int) -> int:
         return (size + self.page_size - 1) // self.page_size * self.page_size
 
-    def budget_state(self):
+    def budget_state(self, dp_rank: int):
         if self.rem_total_tokens <= 0 or self.cur_rem_tokens <= 0:
             return AddReqResult.NO_TOKEN
 
-        if self.rem_input_tokens <= 0 or (
+        if self.rem_input_tokens[dp_rank] <= 0 or (
             self.rem_chunk_tokens is not None and self.rem_chunk_tokens <= 0
         ):
             return AddReqResult.OTHER
@@ -418,7 +418,7 @@ class PrefillAdder:
 
         self.rem_total_token_offset[dp_rank] += extend_input_len + max_new_tokens
         self.cur_rem_token_offset[dp_rank] += extend_input_len
-        self.rem_input_tokens -= extend_input_len
+        self.rem_input_tokens[dp_rank] -= extend_input_len
         if self.rem_chunk_tokens_list is not None:
             self.rem_chunk_tokens_list[dp_rank] -= extend_input_len
 
@@ -520,7 +520,7 @@ class PrefillAdder:
             self.new_chunked_reqs[dp_rank] = req
             self._update_prefill_budget(0, trunc_len, 0, dp_rank)
 
-        return self.budget_state()
+        return self.budget_state(req.dp_rank)
 
     def add_one_req(self, req: Req):
         if req.sampling_params.ignore_eos and getattr(self.tree_cache, "disable", True):
@@ -540,7 +540,7 @@ class PrefillAdder:
             return AddReqResult.NO_TOKEN
 
         total_can_run = sum(len(v) for v in self.can_run_list.values())
-        if real_input_tokens >= self.rem_input_tokens and total_can_run != 0:
+        if real_input_tokens >= self.rem_input_tokens[dp_rank] and total_can_run != 0:
             return AddReqResult.OTHER
 
         with self._lock_node(req.last_node):
@@ -551,7 +551,7 @@ class PrefillAdder:
             input_tokens = self.ceil_paged_tokens(req.extend_input_len)
 
             total_can_run = sum(len(v) for v in self.can_run_list.values())
-            if input_tokens >= self.rem_input_tokens and total_can_run != 0:
+            if input_tokens >= self.rem_input_tokens[dp_rank] and total_can_run != 0:
                 return AddReqResult.OTHER
 
             if (
@@ -593,4 +593,4 @@ class PrefillAdder:
                     self.tree_cache.inc_lock_ref(req.last_node)
                 self._update_prefill_budget(prefix_len, trunc_len, 0, dp_rank)
 
-        return self.budget_state()
+        return self.budget_state(req.dp_rank)
