@@ -21,16 +21,22 @@ class StageConfigRegistry:
 
     # Model name -> YAML filename mapping
     _REGISTRY: dict[str, str] = {
-        # Wan2.1 series
+        # Wan2.1 series (single transformer)
         "Wan-AI/Wan2.1-T2V-1.3B-Diffusers": "wan2_1_stage_config.yaml",
         "Wan2.1-T2V-1.3B-Diffusers": "wan2_1_stage_config.yaml",
         "Wan2.1-T2V-14B-Diffusers": "wan2_1_stage_config.yaml",
         "Wan2.1-I2V-14B-480P-Diffusers": "wan2_1_stage_config.yaml",
         "Wan2.1-I2V-14B-720P-Diffusers": "wan2_1_stage_config.yaml",
+        # Wan2.2 series (MoE with dual transformers)
+        "Wan-AI/Wan2.2-T2V-A14B-Diffusers": "wan2_2_stage_config.yaml",
+        "Wan2.2-T2V-A14B-Diffusers": "wan2_2_stage_config.yaml",
+        "Wan-AI/Wan2.2-I2V-A14B-Diffusers": "wan2_2_stage_config.yaml",
+        "Wan2.2-I2V-A14B-Diffusers": "wan2_2_stage_config.yaml",
     }
 
     # Keyword patterns for fallback matching (order matters - more specific first)
     _KEYWORD_PATTERNS: list[tuple[str, str]] = [
+        ("Wan2.2", "wan2_2_stage_config.yaml"),
         ("Wan2.1", "wan2_1_stage_config.yaml"),
     ]
 

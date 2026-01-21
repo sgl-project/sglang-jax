@@ -13,7 +13,7 @@ from sgl_jax.srt.multimodal.common.ServerArgs import MultimodalServerArgs
 
 # import torch
 # from diffusers import AutoencoderKLWan as diffusersWan
-from sgl_jax.srt.multimodal.models.wan2_1.vaes.wanvae import AutoencoderKLWan
+from sgl_jax.srt.multimodal.models.wan.vaes.wanvae import AutoencoderKLWan
 
 
 class TestWanVaePrecision(unittest.TestCase):
