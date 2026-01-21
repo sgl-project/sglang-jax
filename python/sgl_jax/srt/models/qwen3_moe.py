@@ -12,17 +12,12 @@ from sgl_jax.srt.layers.fused_moe import FusedEPMoE
 from sgl_jax.srt.layers.layernorm import RMSNorm
 from sgl_jax.srt.layers.linear import LinearBase
 from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
-from sgl_jax.srt.layers.moe import EPMoE, GateLogit, TopK
+from sgl_jax.srt.layers.moe import EPMoE, GateLogit, TopK, create_moe_weights_mapping
 from sgl_jax.srt.layers.radix_attention import RadixAttention
 from sgl_jax.srt.mem_cache.memory_pool import KVCache
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
 from sgl_jax.srt.models.qwen3 import Qwen3MLP
-from sgl_jax.srt.utils.weight_utils import (
-    WeightLoader,
-    WeightMapping,
-    create_epmoe_weights_mapping,
-    create_fused_moe_weights_mapping,
-)
+from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
 
 logger = logging.getLogger(__name__)
 
@@ -514,25 +509,17 @@ class Qwen3MoeForCausalLM(nnx.Module):
             )
 
             moe_backend = getattr(self.config, "moe_backend", "epmoe")
-            use_fused = moe_backend == "fused"
             num_experts = getattr(self.config, "num_experts", 128)
 
-            if use_fused:
-                moe_mappings = create_fused_moe_weights_mapping(
-                    prefix=prefix,
-                    target_prefix=target_prefix,
-                    num_experts=num_experts,
-                    moe_path="mlp",
-                )
-                mappings.update(moe_mappings)
-            else:
-                moe_mappings = create_epmoe_weights_mapping(
-                    prefix=prefix,
-                    target_prefix=target_prefix,
-                    num_experts=num_experts,
-                    moe_path="mlp",
-                )
-                mappings.update(moe_mappings)
+            moe_mappings = create_moe_weights_mapping(
+                prefix=prefix,
+                target_prefix=target_prefix,
+                num_experts=num_experts,
+                moe_backend=moe_backend,
+                moe_path="mlp",
+                source_expert_pattern="experts.{i}",
+            )
+            mappings.update(moe_mappings)
 
         return mappings
 
