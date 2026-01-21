@@ -12,7 +12,6 @@ from fastapi import Request
 from fastapi.responses import ORJSONResponse, Response
 
 from sgl_jax.srt.entrypoints.http_server import _GlobalState, app, set_global_state
-from sgl_jax.utils import get_exception_traceback
 from sgl_jax.srt.managers.io_struct import AbortReq
 from sgl_jax.srt.managers.template_manager import TemplateManager
 from sgl_jax.srt.multimodal.common.ServerArgs import MultimodalServerArgs
@@ -29,6 +28,7 @@ from sgl_jax.srt.multimodal.manager.multimodal_detokenizer import (
 from sgl_jax.srt.multimodal.manager.multimodal_tokenizer import MultimodalTokenizer
 from sgl_jax.srt.server_args import PortArgs
 from sgl_jax.srt.utils import kill_process_tree, set_uvicorn_logging_configs
+from sgl_jax.utils import get_exception_traceback
 
 logger = logging.getLogger(__name__)
 
