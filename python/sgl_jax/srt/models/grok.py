@@ -25,16 +25,11 @@ from sgl_jax.srt.layers.logits_processor import (
     LogitsProcessor,
     LogitsProcessorOutput,
 )
-from sgl_jax.srt.layers.moe import EPMoE
+from sgl_jax.srt.layers.moe import EPMoE, create_moe_weights_mapping
 from sgl_jax.srt.layers.radix_attention import RadixAttention
 from sgl_jax.srt.mem_cache.memory_pool import KVCache
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
-from sgl_jax.srt.utils.weight_utils import (
-    WeightLoader,
-    WeightMapping,
-    create_epmoe_weights_mapping,
-    create_fused_moe_weights_mapping,
-)
+from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
 
 logger = logging.getLogger(__name__)
 
@@ -945,37 +940,21 @@ class Grok1ForCausalLM(nnx.Module):
         }
 
         moe_backend = getattr(self.config, "moe_backend", "epmoe")
-        use_fused = moe_backend == "fused"
 
-        # Grok uses w1, w3, w2 naming convention instead of gate_proj, up_proj, down_proj
-        grok_expert_type_map = {"w1": "w1", "w3": "w3", "w2": "w2"}
-        grok_epmoe_type_map = {"w1": "wi_0", "w3": "wi_1", "w2": "wo"}
         # Concat axes for TP-split weights
         grok_concat_axis_map = {"w1": 0, "w3": 0, "w2": -1}
 
-        if use_fused:
-            moe_mappings = create_fused_moe_weights_mapping(
-                prefix=prefix,
-                target_prefix=target_prefix,
-                num_experts=self.config.num_local_experts,
-                expert_type_map=grok_expert_type_map,
-                moe_path="block_sparse_moe.experts",
-                source_expert_pattern="{i}",
-                concat_axis_map=grok_concat_axis_map,
-            )
-            mappings.update(moe_mappings)
-        else:
-            moe_mappings = create_epmoe_weights_mapping(
-                prefix=prefix,
-                target_prefix=target_prefix,
-                num_experts=self.config.num_local_experts,
-                expert_type_map=grok_epmoe_type_map,
-                moe_path="block_sparse_moe.experts",
-                source_expert_pattern="{i}",
-                transpose=True,
-                concat_axis_map=grok_concat_axis_map,
-            )
-            mappings.update(moe_mappings)
+        moe_mappings = create_moe_weights_mapping(
+            prefix=prefix,
+            target_prefix=target_prefix,
+            num_experts=self.config.num_local_experts,
+            expert_type_names=("w1", "w3", "w2"),
+            moe_path="block_sparse_moe.experts",
+            source_expert_pattern="{i}",
+            moe_backend=moe_backend,
+            expert_concat_axis_map=grok_concat_axis_map,
+        )
+        mappings.update(moe_mappings)
 
         return mappings
 

@@ -879,30 +879,39 @@ class FusedEPMoE(nnx.Module):
         return output
 
 
-# create_moe_weights_mapping is utility function to generate weight mapping for EPMoe layers
+# create_moe_weights_mapping is utility function to generate weight mapping for MOE layers
 def create_moe_weights_mapping(
     prefix: str,
     target_prefix: str,
     num_experts: int,
-    expert_type_map: dict[
-        str, str
-    ] = None,  # Default mapping: HuggingFace weight name -> EPMoE internal variable name
+    expert_type_names: tuple[str, str, str] = (
+        "gate_proj",
+        "up_proj",
+        "down_proj",
+    ),  # expert source names [gate, up, down]
     expert_concat_axis_map: dict[
         str, int
-    ] = None,  # Map from source weight name to its concatenation axis (default is 0)
-    moe_path: str = "mlp",  # Path to the MoE module within a layer (e.g., "mlp" or "block_sparse_moe")
-    source_expert_pattern: str = "experts.{i}",  # Pattern for expert indexing in the source weight file
+    ] = None,  # Map from source weight name to its concatenation axis (default is None)
+    moe_backend: str = "epmoe",
+    moe_path: str = "mlp",
+    source_expert_pattern: str = "experts.{i}",
 ) -> dict:
-    """
-    Generate a unified mapping dictionary for MoE layer expert weights.
-    The sharding strategy is strictly aligned with the PartitionSpec defined in EPMoE.
-    """
-    if expert_type_map is None:
+    """Generate a unified mapping dictionary for MoE layer expert weights."""
+    if moe_backend == "epmoe":
         expert_type_map = {
-            "gate_proj": "wi_0",
-            "up_proj": "wi_1",
-            "down_proj": "wo",
+            expert_type_names[0]: "wi_0",
+            expert_type_names[1]: "wi_1",
+            expert_type_names[2]: "wo",
         }
+    elif moe_backend == "fused":
+        expert_type_map = {
+            expert_type_names[0]: "w1",
+            expert_type_names[1]: "w3",
+            expert_type_names[2]: "w2",
+        }
+    else:
+        raise ValueError(f"Unsupported MoE backend: {moe_backend}")
+
     if expert_concat_axis_map is None:
         expert_concat_axis_map = {}
 
@@ -917,10 +926,19 @@ def create_moe_weights_mapping(
             for i in range(num_experts)
         ]
 
-        # Sharding logic based on EPMoE PartitionSpec:
-        # wi_0/wi_1 (Input projections) use P("expert", "tensor", None)
-        # wo (Output projection) uses P("expert", None, "tensor")
-        sharding = ("expert", None, "tensor") if target_name == "wo" else ("expert", "tensor", None)
+        if moe_backend == "epmoe":
+            # Sharding logic based on EPMoE PartitionSpec:
+            # wi_0/wi_1 (Input projections) use P("expert", "tensor", None)
+            # wo (Output projection) uses P("expert", None, "tensor")
+            sharding = (
+                ("expert", None, "tensor") if target_name == "wo" else ("expert", "tensor", None)
+            )
+            transpose = False
+        elif moe_backend == "fused":
+            sharding = ("tensor", None, None)
+            transpose = True
+        else:
+            raise ValueError(f"Unsupported MoE backend: {moe_backend}")
 
         concat_axis = expert_concat_axis_map.get(source_name)
 
@@ -928,7 +946,7 @@ def create_moe_weights_mapping(
         mappings[f"__MOE_EXPERTS__{target_path_base}"] = WeightMapping(
             target_path=[target_path_base] + expert_keys,
             sharding=sharding,
-            transpose=False,
+            transpose=transpose,
             concat_axis=concat_axis,
         )
 

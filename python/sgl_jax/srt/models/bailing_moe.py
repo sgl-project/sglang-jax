@@ -11,16 +11,17 @@ from sgl_jax.srt.layers.embeddings import Embed, ParallelLMHead, RotaryEmbedding
 from sgl_jax.srt.layers.layernorm import RMSNorm
 from sgl_jax.srt.layers.linear import LinearBase
 from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
-from sgl_jax.srt.layers.moe import EPMoE, FusedEPMoE, GateLogit, TopK
+from sgl_jax.srt.layers.moe import (
+    EPMoE,
+    FusedEPMoE,
+    GateLogit,
+    TopK,
+    create_moe_weights_mapping,
+)
 from sgl_jax.srt.layers.radix_attention import RadixAttention
 from sgl_jax.srt.mem_cache.memory_pool import KVCache
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
-from sgl_jax.srt.utils.weight_utils import (
-    WeightLoader,
-    WeightMapping,
-    create_epmoe_weights_mapping,
-    create_fused_moe_weights_mapping,
-)
+from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
 
 logger = logging.getLogger(__name__)
 
@@ -592,61 +593,17 @@ class BailingMoEForCausalLM(nnx.Module):
 
             num_experts = getattr(self.config, "num_experts", 256)
             moe_backend = getattr(self.config, "moe_backend", "epmoe")
-            use_fused = moe_backend == "fused"
 
-            if use_fused:
-                moe_mappings = create_fused_moe_weights_mapping(
-                    prefix=prefix,
-                    target_prefix=target_prefix,
-                    num_experts=num_experts,
-                    moe_path="mlp",
-                )
-                mappings.update(moe_mappings)
-
-                if getattr(self.config, "num_shared_experts", 0) > 0:
-                    mappings[f"{prefix}.mlp.shared_experts.gate_proj.weight"] = WeightMapping(
-                        target_path=f"{target_prefix}.mlp.w1_shared",
-                        sharding=(None, None),
-                        transpose=True,
-                    )
-                    mappings[f"{prefix}.mlp.shared_experts.up_proj.weight"] = WeightMapping(
-                        target_path=f"{target_prefix}.mlp.w3_shared",
-                        sharding=(None, None),
-                        transpose=True,
-                    )
-                    mappings[f"{prefix}.mlp.shared_experts.down_proj.weight"] = WeightMapping(
-                        target_path=f"{target_prefix}.mlp.w2_shared",
-                        sharding=(None, None),
-                        transpose=True,
-                    )
-            else:
-                moe_mappings = create_epmoe_weights_mapping(
-                    prefix=prefix,
-                    target_prefix=target_prefix,
-                    num_experts=num_experts,
-                    moe_path="mlp",
-                )
-                mappings.update(moe_mappings)
-
-                if getattr(self.config, "num_shared_experts", 0) > 0:
-                    shared_experts_mappings = {
-                        f"{prefix}.mlp.shared_experts.gate_proj.weight": WeightMapping(
-                            target_path=f"{target_prefix}.shared_experts.gate_proj.weight",
-                            sharding=(None, "tensor"),
-                            transpose=True,
-                        ),
-                        f"{prefix}.mlp.shared_experts.up_proj.weight": WeightMapping(
-                            target_path=f"{target_prefix}.shared_experts.up_proj.weight",
-                            sharding=(None, "tensor"),
-                            transpose=True,
-                        ),
-                        f"{prefix}.mlp.shared_experts.down_proj.weight": WeightMapping(
-                            target_path=f"{target_prefix}.shared_experts.down_proj.weight",
-                            sharding=("tensor", None),
-                            transpose=True,
-                        ),
-                    }
-                    mappings.update(shared_experts_mappings)
+            moe_mappings = create_moe_weights_mapping(
+                prefix=prefix,
+                expert_type_names=("gate_proj", "up_proj", "down_proj"),
+                target_prefix=target_prefix,
+                num_experts=num_experts,
+                moe_backend=moe_backend,
+                moe_path="mlp",
+                source_expert_pattern="experts.{i}",
+            )
+            mappings.update(moe_mappings)
 
         return mappings
 
