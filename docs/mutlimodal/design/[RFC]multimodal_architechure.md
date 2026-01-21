@@ -19,7 +19,7 @@ We will provide a multimodal inference framework with native JAX implementation 
 # 3.Architecture Design
 
 <p align="center">
-  <img src="../../_static/image/old_architecture_for_ar.png" width="300">
+  <img src="../../_static/image/v1_architecture_for_ar.png" width="300">
 </p>
 
 This is our original architecture, which was designed for autoregressive LLM models. In this feature, we will refactor this architecture as shown below. Specifically, we will extend the tokenizer/detokenizer to support multimodal input/output, handling most input preprocessing and output postprocessing tasks on the CPU. From the user's perspective, we will add offline and online entry points for invoking multimodal generation.
@@ -29,7 +29,7 @@ Importantly, we will build this architecture on top of JAX, ensuring that `sgl-j
 On the engine side, `sgl-jax` will be constructed with an interface to serve as a threaded engine, and we will support Diffusion, Conv, and CLIP engines for multimodal-style models. All threads will run within a single main process to ensure compatibility with SPMD and to allow easy access by RL frameworks.
 
 <p align="center">
-  <img src="../../_static/image/new_architecture_for_multimodal.png" width="600">
+  <img src="../../_static/image/v2_architecture_for_multimodal.png" width="600">
 </p>
 
 ## 3.1 Concurrency Model: Thread-Based SPMD
