@@ -8,12 +8,18 @@ import psutil
 
 from sgl_jax.srt.managers.communication import QueueBackend
 from sgl_jax.srt.managers.scheduler import Scheduler as AutoRegressiveScheduler
+from sgl_jax.srt.models.qwen2 import Qwen2ForCausalLM
 from sgl_jax.srt.models.umt5 import UMT5EncoderModel
 from sgl_jax.srt.multimodal.manager.device_manager import DeviceManager
 from sgl_jax.srt.multimodal.manager.scheduler.diffusion_scheduler import (
     DiffusionScheduler,
 )
 from sgl_jax.srt.multimodal.manager.scheduler.vae_scheduler import VaeScheduler
+from sgl_jax.srt.multimodal.manager.scheduler.vit_scheduler import VitScheduler
+from sgl_jax.srt.multimodal.models.qwen2_5VL.qwen2_5_vit import Qwen2_5_VL_VisionModel
+from sgl_jax.srt.multimodal.models.qwen2_5VL.qwen2_5_vl_generation import (
+    Qwen2_5_VL_Generation,
+)
 from sgl_jax.srt.multimodal.models.wan.diffusion.wan_dit import (
     WanDualTransformer3DModel,
     WanTransformer3DModel,
@@ -115,11 +121,13 @@ class Stage:
             scheduler_class = get_scheduler_class(self.stage_config.scheduler)
             comm_backend = QueueBackend(in_queue=self._in_queue, out_queue=self._out_queue)
             model_class = get_model_class(self.stage_config.model_class)
+            stage_sub_dir = getattr(self.stage_config, "stage_sub_dir", None)
             self._stage_scheduler = scheduler_class(
                 communication_backend=comm_backend,
                 mesh=self.mesh,
                 server_args=self.server_args,
                 model_class=model_class,
+                stage_sub_dir=stage_sub_dir,
                 **self.stage_config.scheduler_params,
             )
             self._out_queue.put_nowait({"status": "ready"})
@@ -162,6 +170,8 @@ def get_scheduler_class(name: str):
     elif name == "vae":
         # TODO add eventloop for VAE scheduler
         return VaeScheduler
+    elif name == "vit":
+        return VitScheduler
     else:
         raise ValueError(f"Unknown scheduler name: {name}")
 
@@ -175,5 +185,11 @@ def get_model_class(name: str):
         return WanTransformer3DModel
     elif name == "WanDualTransformer3DModel":
         return WanDualTransformer3DModel
+    elif name == "Qwen2_5_VL_Generation":
+        return Qwen2_5_VL_Generation
+    elif name == "Qwen2_5_VL_VisionModel":
+        return Qwen2_5_VL_VisionModel
+    elif name == "Qwen2ForCausalLM":
+        return Qwen2ForCausalLM
     else:
         raise ValueError(f"Unknown model name: {name}")

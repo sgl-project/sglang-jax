@@ -12,13 +12,20 @@ from sgl_jax.srt.server_args import ServerArgs
 
 class VaeModelRunner(BaseModelRunner):
     def __init__(
-        self, server_args: ServerArgs = None, mesh: jax.sharding.Mesh = None, model_class=None
+        self,
+        server_args: ServerArgs = None,
+        mesh: jax.sharding.Mesh = None,
+        model_class=None,
+        stage_sub_dir: str | None = None,
     ):
         self.mesh = mesh
+        load_sub_dir = "vae" if stage_sub_dir is None else stage_sub_dir
+        if load_sub_dir == "":
+            load_sub_dir = None
         self.model_loader = get_model_loader(
             load_config=LoadConfig(
                 model_class=model_class,
-                sub_dir="vae",
+                sub_dir=load_sub_dir,
             ),
             mesh=self.mesh,
         )
