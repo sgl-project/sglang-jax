@@ -38,7 +38,7 @@ class MLP(nnx.Module):
             use_bias=bias,
             params_dtype=dtype,
             mesh=mesh,
-            kernel_axes=(None, None),
+            kernel_axes=(None, "tensor"),
         )
 
         self.act = get_act_fn(act_type)
@@ -50,7 +50,7 @@ class MLP(nnx.Module):
             use_bias=bias,
             params_dtype=dtype,
             mesh=mesh,
-            kernel_axes=(None, None),
+            kernel_axes=("tensor", None),
         )
 
     def __call__(self, x: jax.Array) -> jax.Array:

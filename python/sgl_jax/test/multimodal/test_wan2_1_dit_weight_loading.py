@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 
 def test_weight_loading():
     """Test loading weights into WanTransformer3DModel."""
-    from sgl_jax.srt.multimodal.models.wan2_1.diffusion.wan2_1_dit import (
+    from sgl_jax.srt.multimodal.models.wan.diffusion.wan_dit import (
         WanTransformer3DModel,
     )
 
@@ -156,7 +156,7 @@ def test_weight_loading():
 
 def test_forward_pass():
     """Test forward pass after loading weights."""
-    from sgl_jax.srt.multimodal.models.wan2_1.diffusion.wan2_1_dit import (
+    from sgl_jax.srt.multimodal.models.wan.diffusion.wan_dit import (
         WanTransformer3DModel,
     )
 

@@ -1,7 +1,3 @@
-from sgl_jax.srt.multimodal.models.static_configs.model_config_registry import (
-    ModelConfigRegistry,
-    get_model_config,
-)
 from sgl_jax.srt.multimodal.models.static_configs.yaml_registry import (
     StageConfigRegistry,
     get_stage_config_path,
@@ -10,6 +6,4 @@ from sgl_jax.srt.multimodal.models.static_configs.yaml_registry import (
 __all__ = [
     "StageConfigRegistry",
     "get_stage_config_path",
-    "ModelConfigRegistry",
-    "get_model_config",
 ]

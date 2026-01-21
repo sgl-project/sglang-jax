@@ -33,7 +33,7 @@ def to_mappings(num_layers: int = 30) -> dict[str, WeightMapping]:
     # Time Embedder (TimestepEmbedder -> MLP with 2 linear layers)
     mappings["condition_embedder.time_embedder.linear_1.weight"] = WeightMapping(
         target_path="condition_embedder.time_embedder.mlp.fc_in.weight",
-        sharding=(None, None),
+        sharding=(None, "tensor"),
         transpose=True,
     )
     mappings["condition_embedder.time_embedder.linear_1.bias"] = WeightMapping(
@@ -42,7 +42,7 @@ def to_mappings(num_layers: int = 30) -> dict[str, WeightMapping]:
     )
     mappings["condition_embedder.time_embedder.linear_2.weight"] = WeightMapping(
         target_path="condition_embedder.time_embedder.mlp.fc_out.weight",
-        sharding=(None, None),
+        sharding=("tensor", None),
         transpose=True,
     )
     mappings["condition_embedder.time_embedder.linear_2.bias"] = WeightMapping(
@@ -53,7 +53,7 @@ def to_mappings(num_layers: int = 30) -> dict[str, WeightMapping]:
     # Time Modulation (ModulateProjection -> linear)
     mappings["condition_embedder.time_proj.weight"] = WeightMapping(
         target_path="condition_embedder.time_modulation.linear.weight",
-        sharding=(None, None),
+        sharding=(None, "tensor"),
         transpose=True,
     )
     mappings["condition_embedder.time_proj.bias"] = WeightMapping(
@@ -64,7 +64,7 @@ def to_mappings(num_layers: int = 30) -> dict[str, WeightMapping]:
     # Text Embedder (MLP with 2 linear layers)
     mappings["condition_embedder.text_embedder.linear_1.weight"] = WeightMapping(
         target_path="condition_embedder.text_embedder.fc_in.weight",
-        sharding=(None, None),
+        sharding=(None, "tensor"),
         transpose=True,
     )
     mappings["condition_embedder.text_embedder.linear_1.bias"] = WeightMapping(
@@ -73,7 +73,7 @@ def to_mappings(num_layers: int = 30) -> dict[str, WeightMapping]:
     )
     mappings["condition_embedder.text_embedder.linear_2.weight"] = WeightMapping(
         target_path="condition_embedder.text_embedder.fc_out.weight",
-        sharding=(None, None),
+        sharding=("tensor", None),
         transpose=True,
     )
     mappings["condition_embedder.text_embedder.linear_2.bias"] = WeightMapping(
@@ -87,7 +87,7 @@ def to_mappings(num_layers: int = 30) -> dict[str, WeightMapping]:
     # Self-Attention (attn1 in HF -> to_q/to_k/to_v/to_out in JAX block)
     mappings["blocks.*.attn1.to_q.weight"] = WeightMapping(
         target_path="blocks.*.to_q.weight",
-        sharding=(None, None),
+        sharding=(None, "tensor"),
         transpose=True,
     )
     mappings["blocks.*.attn1.to_q.bias"] = WeightMapping(
@@ -96,7 +96,7 @@ def to_mappings(num_layers: int = 30) -> dict[str, WeightMapping]:
     )
     mappings["blocks.*.attn1.to_k.weight"] = WeightMapping(
         target_path="blocks.*.to_k.weight",
-        sharding=(None, None),
+        sharding=(None, "tensor"),
         transpose=True,
     )
     mappings["blocks.*.attn1.to_k.bias"] = WeightMapping(
@@ -105,7 +105,7 @@ def to_mappings(num_layers: int = 30) -> dict[str, WeightMapping]:
     )
     mappings["blocks.*.attn1.to_v.weight"] = WeightMapping(
         target_path="blocks.*.to_v.weight",
-        sharding=(None, None),
+        sharding=(None, "tensor"),
         transpose=True,
     )
     mappings["blocks.*.attn1.to_v.bias"] = WeightMapping(
@@ -115,7 +115,7 @@ def to_mappings(num_layers: int = 30) -> dict[str, WeightMapping]:
     # HF has to_out.0, JAX has to_out directly
     mappings["blocks.*.attn1.to_out.0.weight"] = WeightMapping(
         target_path="blocks.*.to_out.weight",
-        sharding=(None, None),
+        sharding=("tensor", None),
         transpose=True,
     )
     mappings["blocks.*.attn1.to_out.0.bias"] = WeightMapping(
@@ -136,7 +136,7 @@ def to_mappings(num_layers: int = 30) -> dict[str, WeightMapping]:
     # Cross-Attention (attn2 in HF -> attn2.to_q/to_k/to_v/to_out in JAX)
     mappings["blocks.*.attn2.to_q.weight"] = WeightMapping(
         target_path="blocks.*.attn2.to_q.weight",
-        sharding=(None, None),
+        sharding=(None, "tensor"),
         transpose=True,
     )
     mappings["blocks.*.attn2.to_q.bias"] = WeightMapping(
@@ -145,7 +145,7 @@ def to_mappings(num_layers: int = 30) -> dict[str, WeightMapping]:
     )
     mappings["blocks.*.attn2.to_k.weight"] = WeightMapping(
         target_path="blocks.*.attn2.to_k.weight",
-        sharding=(None, None),
+        sharding=(None, "tensor"),
         transpose=True,
     )
     mappings["blocks.*.attn2.to_k.bias"] = WeightMapping(
@@ -154,7 +154,7 @@ def to_mappings(num_layers: int = 30) -> dict[str, WeightMapping]:
     )
     mappings["blocks.*.attn2.to_v.weight"] = WeightMapping(
         target_path="blocks.*.attn2.to_v.weight",
-        sharding=(None, None),
+        sharding=(None, "tensor"),
         transpose=True,
     )
     mappings["blocks.*.attn2.to_v.bias"] = WeightMapping(
@@ -163,7 +163,7 @@ def to_mappings(num_layers: int = 30) -> dict[str, WeightMapping]:
     )
     mappings["blocks.*.attn2.to_out.0.weight"] = WeightMapping(
         target_path="blocks.*.attn2.to_out.weight",
-        sharding=(None, None),
+        sharding=("tensor", None),
         transpose=True,
     )
     mappings["blocks.*.attn2.to_out.0.bias"] = WeightMapping(
@@ -185,7 +185,7 @@ def to_mappings(num_layers: int = 30) -> dict[str, WeightMapping]:
     # HF: ffn.net.0.proj (GELU activation layer) -> JAX: ffn.fc_in
     mappings["blocks.*.ffn.net.0.proj.weight"] = WeightMapping(
         target_path="blocks.*.ffn.fc_in.weight",
-        sharding=(None, None),
+        sharding=(None, "tensor"),
         transpose=True,
     )
     mappings["blocks.*.ffn.net.0.proj.bias"] = WeightMapping(
@@ -195,7 +195,7 @@ def to_mappings(num_layers: int = 30) -> dict[str, WeightMapping]:
     # HF: ffn.net.2 (output linear) -> JAX: ffn.fc_out
     mappings["blocks.*.ffn.net.2.weight"] = WeightMapping(
         target_path="blocks.*.ffn.fc_out.weight",
-        sharding=(None, None),
+        sharding=("tensor", None),
         transpose=True,
     )
     mappings["blocks.*.ffn.net.2.bias"] = WeightMapping(
@@ -267,7 +267,7 @@ def to_i2v_mappings(num_layers: int = 30) -> dict[str, WeightMapping]:
     )
     mappings["condition_embedder.image_embedder.ff.fc_in.weight"] = WeightMapping(
         target_path="condition_embedder.image_embedder.ff.fc_in.weight",
-        sharding=(None, None),
+        sharding=(None, "tensor"),
         transpose=True,
     )
     mappings["condition_embedder.image_embedder.ff.fc_in.bias"] = WeightMapping(
@@ -276,7 +276,7 @@ def to_i2v_mappings(num_layers: int = 30) -> dict[str, WeightMapping]:
     )
     mappings["condition_embedder.image_embedder.ff.fc_out.weight"] = WeightMapping(
         target_path="condition_embedder.image_embedder.ff.fc_out.weight",
-        sharding=(None, None),
+        sharding=("tensor", None),
         transpose=True,
     )
     mappings["condition_embedder.image_embedder.ff.fc_out.bias"] = WeightMapping(
@@ -297,7 +297,7 @@ def to_i2v_mappings(num_layers: int = 30) -> dict[str, WeightMapping]:
     # ==========================================================================
     mappings["blocks.*.attn2.add_k_proj.weight"] = WeightMapping(
         target_path="blocks.*.attn2.add_k_proj.weight",
-        sharding=(None, None),
+        sharding=(None, "tensor"),
         transpose=True,
     )
     mappings["blocks.*.attn2.add_k_proj.bias"] = WeightMapping(
@@ -306,7 +306,7 @@ def to_i2v_mappings(num_layers: int = 30) -> dict[str, WeightMapping]:
     )
     mappings["blocks.*.attn2.add_v_proj.weight"] = WeightMapping(
         target_path="blocks.*.attn2.add_v_proj.weight",
-        sharding=(None, None),
+        sharding=(None, "tensor"),
         transpose=True,
     )
     mappings["blocks.*.attn2.add_v_proj.bias"] = WeightMapping(

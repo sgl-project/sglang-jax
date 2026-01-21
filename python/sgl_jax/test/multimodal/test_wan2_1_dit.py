@@ -8,9 +8,7 @@ from sgl_jax.srt.layers.attention.flashattention_backend import (
     FlashAttention,
     FlashAttentionMetadata,
 )
-from sgl_jax.srt.multimodal.models.wan2_1.diffusion.wan2_1_dit import (
-    WanTransformer3DModel,
-)
+from sgl_jax.srt.multimodal.models.wan.diffusion.wan_dit import WanTransformer3DModel
 
 # Ensure the python directory is in the path
 

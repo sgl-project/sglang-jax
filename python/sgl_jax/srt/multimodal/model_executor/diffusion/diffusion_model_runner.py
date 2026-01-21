@@ -14,12 +14,10 @@ from sgl_jax.srt.configs.load_config import LoadConfig
 from sgl_jax.srt.model_executor.base_model_runner import BaseModelRunner
 from sgl_jax.srt.model_loader.loader import JAXModelLoader, get_model_loader
 from sgl_jax.srt.multimodal.common.ServerArgs import MultimodalServerArgs
+from sgl_jax.srt.multimodal.configs.config_registry import get_diffusion_config
 from sgl_jax.srt.multimodal.manager.schedule_batch import Req
 from sgl_jax.srt.multimodal.models.diffusion_solvers.flow_unipc_multistep_scheduler import (
     FlowUniPCMultistepScheduler,
-)
-from sgl_jax.srt.multimodal.models.static_configs.model_config_registry import (
-    get_model_config,
 )
 from sgl_jax.srt.utils.jax_utils import device_array
 
@@ -48,7 +46,7 @@ class DiffusionModelRunner(BaseModelRunner):
         self._cached_num_steps = None
         self.model_class = model_class
         # TODO: load model_config from server_args based on model architecture
-        self.model_config = get_model_config(self.server_args.model_path)
+        self.model_config = get_diffusion_config(self.server_args.model_path)
         self.model_config.model_path = self.server_args.model_path
         self.model_config.model_class = self.model_class
         # Additional initialization for diffusion model if needed

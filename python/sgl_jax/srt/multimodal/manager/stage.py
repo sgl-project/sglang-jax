@@ -3,6 +3,7 @@ import signal
 from queue import Queue
 from typing import Any
 
+import jax
 import psutil
 
 from sgl_jax.srt.managers.communication import QueueBackend
@@ -13,10 +14,11 @@ from sgl_jax.srt.multimodal.manager.scheduler.diffusion_scheduler import (
     DiffusionScheduler,
 )
 from sgl_jax.srt.multimodal.manager.scheduler.vae_scheduler import VaeScheduler
-from sgl_jax.srt.multimodal.models.wan2_1.diffusion.wan2_1_dit import (
+from sgl_jax.srt.multimodal.models.wan.diffusion.wan_dit import (
+    WanDualTransformer3DModel,
     WanTransformer3DModel,
 )
-from sgl_jax.srt.multimodal.models.wan2_1.vaes.wanvae import AutoencoderKLWan
+from sgl_jax.srt.multimodal.models.wan.vaes.wanvae import AutoencoderKLWan
 from sgl_jax.srt.server_args import ServerArgs
 from sgl_jax.srt.utils.mesh_utils import create_device_mesh
 from sgl_jax.utils import get_exception_traceback
@@ -54,12 +56,27 @@ class Stage:
         """
         self._in_queue = None
         self._out_queue = None
-        # this parallelism setting is accord to stage config
-        self.mesh = create_device_mesh(
-            ici_parallelism=[-1, stage_config.runtime.num_tpus],
-            dcn_parallelism=[1, 1],
-            device_indexes=device_manager.allocate(stage_config.runtime.num_tpus),
-        )
+        runtime = stage_config.runtime
+        device_kind = getattr(runtime, "device_kind", "tpu")
+        num_devices = runtime.num_tpus
+        if device_kind == "cpu":
+            cpu_devices = jax.devices("cpu")
+            if num_devices > len(cpu_devices):
+                raise RuntimeError(
+                    f"Requested {num_devices} CPU devices, but only {len(cpu_devices)} available."
+                )
+            self.mesh = create_device_mesh(
+                ici_parallelism=[-1, num_devices],
+                dcn_parallelism=[1, 1],
+                devices=cpu_devices[:num_devices],
+            )
+        else:
+            # this parallelism setting is accord to stage config
+            self.mesh = create_device_mesh(
+                ici_parallelism=[-1, num_devices],
+                dcn_parallelism=[1, 1],
+                device_indexes=device_manager.allocate(num_devices),
+            )
         self.stage_config = stage_config
         self.server_args = server_args
         self.stage_id = stage_config.stage_id
@@ -156,5 +173,7 @@ def get_model_class(name: str):
         return UMT5EncoderModel
     elif name == "WanTransformer3DModel":
         return WanTransformer3DModel
+    elif name == "WanDualTransformer3DModel":
+        return WanDualTransformer3DModel
     else:
         raise ValueError(f"Unknown model name: {name}")

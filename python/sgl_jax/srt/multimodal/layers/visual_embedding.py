@@ -161,7 +161,7 @@ class ModulateProjection(nnx.Module):
             mesh=mesh,
             use_bias=True,
             params_dtype=dtype,
-            kernel_axes=(None, None),
+            kernel_axes=(None, "tensor"),
         )
         self.act = get_act_fn(act_layer)
 

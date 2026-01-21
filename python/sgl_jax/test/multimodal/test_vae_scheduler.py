@@ -9,7 +9,7 @@ from sgl_jax.srt.managers.communication import QueueBackend
 from sgl_jax.srt.multimodal.common.ServerArgs import MultimodalServerArgs
 from sgl_jax.srt.multimodal.manager.schedule_batch import Req
 from sgl_jax.srt.multimodal.manager.scheduler.vae_scheduler import VaeScheduler
-from sgl_jax.srt.multimodal.models.wan2_1.vaes.wanvae import AutoencoderKLWan
+from sgl_jax.srt.multimodal.models.wan.vaes.wanvae import AutoencoderKLWan
 
 
 class TestVaeScheduler(unittest.TestCase):

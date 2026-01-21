@@ -26,6 +26,7 @@ class WanModelConfig(MultiModalModelConfigs):
     epsilon: float = 1e-6
     added_kv_proj_dim: int | None = None  # None for T2V, set for I2V
     rope_max_seq_len: int = 1024
+    boundary_ratio: float | None = None  # For Wan2.2 MoE expert switching
 
     # Runtime/inference params (not in HF config)
     weights_dtype: jnp.dtype = jnp.bfloat16
