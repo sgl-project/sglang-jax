@@ -12,6 +12,8 @@ from fastapi import Request
 from fastapi.responses import ORJSONResponse, Response
 
 from sgl_jax.srt.entrypoints.http_server import _GlobalState, app, set_global_state
+from sgl_jax.srt.entrypoints.openai.protocol import ChatCompletionRequest
+from sgl_jax.srt.jinja_template_utils import process_content_for_template_format
 from sgl_jax.srt.managers.io_struct import AbortReq
 from sgl_jax.srt.managers.template_manager import TemplateManager
 from sgl_jax.srt.multimodal.common.ServerArgs import MultimodalServerArgs
@@ -31,6 +33,11 @@ from sgl_jax.srt.utils import kill_process_tree, set_uvicorn_logging_configs
 from sgl_jax.utils import get_exception_traceback
 
 logger = logging.getLogger(__name__)
+
+DEFAULT_CHAT_TEMPLATE = """{% for message in messages %}{% if message['role'] == 'system' %}{{ message['content'] }}{% elif message['role'] == 'user' %}User: {{ message['content'] }}{% elif message['role'] == 'assistant' %}Assistant: {{ message['content'] }}{% endif %}{% if not loop.last %}
+
+{% endif %}{% endfor %}{% if add_generation_prompt %}
+Assistant: {% endif %}"""
 
 
 def _create_error_response(e):
@@ -74,12 +81,124 @@ async def _convert_to_internal_request(obj: ImageGenerationsRequest | VideoGener
     )
 
 
+def _extract_openai_prompt(
+    request: ChatCompletionRequest,
+    tokenizer,
+) -> tuple[str, list[str] | None, list[str] | None]:
+    if tokenizer is None:
+        raise ValueError("Tokenizer is not initialized for chat completions.")
+    openai_messages = []
+    image_data = []
+    video_data = []
+    audio_data = []
+    modalities = []
+
+    for message in request.messages:
+        if message.content is None:
+            message.content = ""
+        msg_dict = message.model_dump()
+        processed_msg = process_content_for_template_format(
+            msg_dict,
+            "openai",
+            image_data,
+            video_data,
+            audio_data,
+            modalities,
+        )
+        openai_messages.append(processed_msg)
+
+    if audio_data:
+        raise ValueError("Audio inputs are not supported for this model.")
+
+    assistant_prefix = None
+    if (
+        openai_messages
+        and openai_messages[-1].get("role") == "assistant"
+        and request.continue_final_message
+    ):
+        assistant_prefix = openai_messages[-1].get("content")
+        openai_messages = openai_messages[:-1]
+
+    tools = None
+    if request.tools and request.tool_choice != "none":
+        if not isinstance(request.tool_choice, str):
+            tools = [
+                item.model_dump()
+                for item in request.tools
+                if item.function.name == request.tool_choice.function.name
+            ]
+        else:
+            tools = [item.model_dump() for item in request.tools]
+
+    chat_template_kwargs = request.chat_template_kwargs or {}
+    if (
+        not hasattr(tokenizer, "chat_template") or tokenizer.chat_template is None
+    ) and "chat_template" not in chat_template_kwargs:
+        chat_template_kwargs["chat_template"] = DEFAULT_CHAT_TEMPLATE
+
+    if not hasattr(tokenizer, "apply_chat_template"):
+        raise ValueError("Tokenizer does not support chat templates.")
+
+    try:
+        prompt = tokenizer.apply_chat_template(
+            openai_messages,
+            tokenize=False,
+            add_generation_prompt=True,
+            tools=tools,
+            **chat_template_kwargs,
+        )
+    except TypeError:
+        prompt = tokenizer.apply_chat_template(
+            openai_messages,
+            tokenize=False,
+            add_generation_prompt=True,
+            **chat_template_kwargs,
+        )
+
+    if isinstance(assistant_prefix, str):
+        prompt += assistant_prefix
+    elif isinstance(assistant_prefix, list):
+        text_parts = []
+        for part in assistant_prefix:
+            if isinstance(part, dict) and part.get("type") == "text":
+                text_parts.append(part.get("text", ""))
+        if text_parts:
+            prompt += "".join(text_parts)
+
+    return prompt, (image_data or None), (video_data or None)
+
+
 @app.api_route("/api/v1/videos/generation", methods=["POST", "PUT"])
 async def videos_generation(obj: VideoGenerationsRequest, request: Request):
     try:
         from sgl_jax.srt.entrypoints.http_server import _global_state
 
         internal_obj = await _convert_to_internal_request(obj)
+        ret = await _global_state.tokenizer_manager.generate_request(
+            internal_obj, request
+        ).__anext__()
+        return ret
+    except ValueError as e:
+        logger.error("[http_server] Error: %s", e)
+        return _create_error_response(e)
+
+
+@app.post("/v1/chat/completions")
+async def chat_completions(obj: ChatCompletionRequest, request: Request):
+    try:
+        from sgl_jax.srt.entrypoints.http_server import _global_state
+
+        prompt, image_data, video_data = _extract_openai_prompt(
+            obj, _global_state.tokenizer_manager.tokenizer
+        )
+        internal_obj = GenerateMMReqInput(
+            prompt=prompt,
+            image_data=image_data,
+            video_data=video_data,
+            stream=obj.stream,
+            n=obj.n,
+            rid=obj.rid if isinstance(obj.rid, str) else None,
+        )
         ret = await _global_state.tokenizer_manager.generate_request(
             internal_obj, request
         ).__anext__()

@@ -71,8 +71,11 @@ class GenerateMMReqInput:
         "blurry, low quality, inconsistent lighting, floating, disconnected from scene"
     )
     input_ids: list[int] | None = None
+    stream: bool = False
     n: int | None = 1
     input_reference: str | None = None
+    image_data: list[str] | str | None = None
+    video_data: list[str] | str | None = None
     size: str = None
     seconds: int | None = None
     fps: int | None = None
@@ -98,6 +101,7 @@ class TokenizedGenerateMMReqInput:
     n: int | None = 1
     input_reference: str | None = None
     preprocessed_image: np.ndarray | None = None
+    mm_inputs: "VLMMInputs | None" = None
     size: str = None
     seconds: int | None = None
     fps: int | None = None
@@ -107,3 +111,17 @@ class TokenizedGenerateMMReqInput:
     save_output: bool = True
     background: str | None = None
     response_format: str | None = None
+
+
+@dataclasses.dataclass
+class VLMMInputs:
+    pixel_values: np.ndarray | None = None
+    pixel_values_videos: np.ndarray | None = None
+    image_grid_thw: list[tuple[int, int, int]] | None = None
+    video_grid_thw: list[tuple[int, int, int]] | None = None
+    second_per_grid_ts: list[float] | None = None
+    mrope_positions: np.ndarray | None = None
+    mrope_position_delta: int | None = None
+    image_token_id: int | None = None
+    video_token_id: int | None = None
+    pad_values: list[int] | None = None

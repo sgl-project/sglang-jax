@@ -6,6 +6,7 @@ from typing import Any
 import jax
 import psutil
 
+from python.sgl_jax.srt.multimodal.models.qwen2_5VL.vit import Qwen2_5VLVisionModel
 from sgl_jax.srt.managers.communication import QueueBackend
 from sgl_jax.srt.managers.scheduler import Scheduler as AutoRegressiveScheduler
 from sgl_jax.srt.models.umt5 import UMT5EncoderModel
@@ -14,6 +15,7 @@ from sgl_jax.srt.multimodal.manager.scheduler.diffusion_scheduler import (
     DiffusionScheduler,
 )
 from sgl_jax.srt.multimodal.manager.scheduler.vae_scheduler import VaeScheduler
+from sgl_jax.srt.multimodal.manager.scheduler.vit_scheduler import VitScheduler
 from sgl_jax.srt.multimodal.models.wan.diffusion.wan_dit import (
     WanDualTransformer3DModel,
     WanTransformer3DModel,
@@ -162,6 +164,8 @@ def get_scheduler_class(name: str):
     elif name == "vae":
         # TODO add eventloop for VAE scheduler
         return VaeScheduler
+    elif name == "vit":
+        return VitScheduler
     else:
         raise ValueError(f"Unknown scheduler name: {name}")
 
@@ -175,5 +179,7 @@ def get_model_class(name: str):
         return WanTransformer3DModel
     elif name == "WanDualTransformer3DModel":
         return WanDualTransformer3DModel
+    elif name == "Qwen2_5VLVisionModel":
+        return Qwen2_5VLVisionModel
     else:
         raise ValueError(f"Unknown model name: {name}")

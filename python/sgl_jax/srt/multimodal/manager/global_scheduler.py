@@ -208,6 +208,8 @@ class GlobalScheduler:
             data_type=input.data_type,
             save_output=input.save_output,
         )
+        if input.mm_inputs is not None:
+            req.extra["mm_inputs"] = input.mm_inputs
         if req.rid in self.req_store:
             raise RuntimeError(f"{req.rid} is already in req_store")
         # Store with tracking state, starting at stage 0

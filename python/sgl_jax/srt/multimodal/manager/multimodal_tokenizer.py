@@ -1,23 +1,35 @@
 import asyncio
+import base64
 import dataclasses
+import hashlib
+import io
 import logging
+import os
 import signal
+import tempfile
 import time
 import uuid
 from http import HTTPStatus
 from typing import Any
 
 import fastapi
+import imageio.v3 as iio
+import numpy as np
 import psutil
+import requests
 import setproctitle
-from transformers import AutoImageProcessor
+from PIL import Image
+from transformers import AutoConfig, AutoProcessor
 
 from sgl_jax.srt.managers.io_struct import AbortReq
 from sgl_jax.srt.managers.tokenizer_manager import TokenizerManager
 from sgl_jax.srt.multimodal.manager.io_struct import (
+    DataType,
     GenerateMMReqInput,
     TokenizedGenerateMMReqInput,
+    VLMMInputs,
 )
+from sgl_jax.srt.multimodal.manager.mrope_utils import compute_mrope_positions
 from sgl_jax.srt.server_args import PortArgs, ServerArgs
 from sgl_jax.srt.utils import (
     configure_logger,
@@ -61,13 +73,19 @@ class MultimodalTokenizer(TokenizerManager):
         `_handle_batch_output`.
         """
         super().__init__(server_args, port_args)
-        # Use slow image processor to avoid torchvision dependency warning
+        self.mm_processor = None
+        self.mm_config = None
         try:
-            self.mm_processor = AutoImageProcessor.from_pretrained(
-                server_args.model_path, use_fast=False
+            self.mm_processor = AutoProcessor.from_pretrained(
+                server_args.model_path,
+                trust_remote_code=server_args.trust_remote_code,
+            )
+            self.mm_config = AutoConfig.from_pretrained(
+                server_args.model_path,
+                trust_remote_code=server_args.trust_remote_code,
             )
         except Exception:
-            logger.warning("Failed to load processor from %s", server_args.model_path)
+            logger.warning("Failed to load processor/config from %s", server_args.model_path)
         self.rid_to_state: dict[str, MMReqState] = {}
         self._result_dispatcher = TypeBasedDispatcher(
             [
@@ -179,6 +197,74 @@ class MultimodalTokenizer(TokenizerManager):
         neg_input_text = getattr(obj, "neg_prompt", None) or getattr(obj, "text", None)
         input_ids = getattr(obj, "input_ids", None)
         neg_input_ids = getattr(obj, "neg_input_ids", None)
+        mm_inputs = None
+
+        image_data = self._normalize_mm_list(getattr(obj, "image_data", None))
+        video_data = self._normalize_mm_list(getattr(obj, "video_data", None))
+        if not image_data and not video_data and getattr(obj, "input_reference", None) is not None:
+            if obj.data_type == DataType.IMAGE:
+                image_data = [obj.input_reference]
+            elif obj.data_type == DataType.VIDEO:
+                video_data = [obj.input_reference]
+
+        if (image_data or video_data) and self.mm_processor is not None:
+            images = [self._load_image_from_source(item) for item in image_data]
+            videos = [self._load_video_from_source(item) for item in video_data]
+            processor_out = self.mm_processor(
+                images=images or None,
+                videos=videos or None,
+                text=input_text or "",
+                return_tensors="np",
+            )
+            if "input_ids" in processor_out:
+                input_ids = processor_out["input_ids"][0].tolist()
+
+            image_grid_thw = self._to_grid_list(processor_out.get("image_grid_thw"))
+            video_grid_thw = self._to_grid_list(processor_out.get("video_grid_thw"))
+            second_per_grid_ts = processor_out.get("second_per_grid_ts")
+            pixel_values = self._strip_batch_dim(processor_out.get("pixel_values"))
+            pixel_values_videos = self._strip_batch_dim(processor_out.get("pixel_values_videos"))
+
+            mrope_positions = None
+            mrope_position_delta = None
+            if self.mm_config is not None and input_ids is not None:
+                vision_start_token_id = getattr(self.mm_config, "vision_start_token_id", None)
+                image_token_id = getattr(self.mm_config, "image_token_id", None)
+                video_token_id = getattr(self.mm_config, "video_token_id", None)
+                vision_config = getattr(self.mm_config, "vision_config", None)
+                spatial_merge_size = getattr(vision_config, "spatial_merge_size", None)
+                tokens_per_second = getattr(vision_config, "tokens_per_second", None)
+                if (
+                    vision_start_token_id is not None
+                    and image_token_id is not None
+                    and spatial_merge_size is not None
+                ):
+                    mrope_positions, mrope_position_delta = compute_mrope_positions(
+                        input_ids=input_ids,
+                        image_grid_thw=image_grid_thw,
+                        video_grid_thw=video_grid_thw,
+                        second_per_grid_ts=second_per_grid_ts,
+                        vision_start_token_id=vision_start_token_id,
+                        image_token_id=image_token_id,
+                        video_token_id=video_token_id,
+                        spatial_merge_size=spatial_merge_size,
+                        tokens_per_second=tokens_per_second,
+                    )
+
+            pad_values = self._hash_mm_items(images, videos)
+            mm_inputs = VLMMInputs(
+                pixel_values=pixel_values,
+                pixel_values_videos=pixel_values_videos,
+                image_grid_thw=image_grid_thw,
+                video_grid_thw=video_grid_thw,
+                second_per_grid_ts=second_per_grid_ts,
+                mrope_positions=mrope_positions,
+                mrope_position_delta=mrope_position_delta,
+                image_token_id=getattr(self.mm_config, "image_token_id", None),
+                video_token_id=getattr(self.mm_config, "video_token_id", None),
+                pad_values=pad_values,
+            )
+
         if input_ids is None and input_text is not None:
             if self.tokenizer is None:
                 raise ValueError(
@@ -193,13 +279,85 @@ class MultimodalTokenizer(TokenizerManager):
                 )
             encoded = self.tokenizer(neg_input_text)
             neg_input_ids = encoded["input_ids"]
-        if getattr(obj, "input_reference", None) is not None:
-            # TODO: Handle image preprocessing for multimodal inputs
-            pass
 
-        return self._create_tokenized_object(
+        tokenized_obj = self._create_tokenized_object(
             obj, input_text, input_ids, neg_input_text, neg_input_ids
         )
+        tokenized_obj.mm_inputs = mm_inputs
+        return tokenized_obj
+
+    def _normalize_mm_list(self, data: list[str] | str | None) -> list[str]:
+        if data is None:
+            return []
+        return data if isinstance(data, list) else [data]
+
+    def _load_image_from_source(self, source: str | bytes) -> Image.Image:
+        if isinstance(source, bytes):
+            return Image.open(io.BytesIO(source)).convert("RGB")
+        if os.path.exists(source):
+            return Image.open(source).convert("RGB")
+        if source.startswith(("http://", "https://")):
+            resp = requests.get(source, timeout=10)
+            resp.raise_for_status()
+            return Image.open(io.BytesIO(resp.content)).convert("RGB")
+        if source.startswith("data:") and "base64," in source:
+            payload = source.split("base64,", 1)[1]
+            return Image.open(io.BytesIO(base64.b64decode(payload))).convert("RGB")
+        try:
+            return Image.open(io.BytesIO(base64.b64decode(source, validate=True))).convert("RGB")
+        except Exception as exc:
+            raise ValueError("Unsupported image source format") from exc
+
+    def _load_video_from_source(self, source: str | bytes) -> np.ndarray:
+        if isinstance(source, bytes):
+            with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
+                tmp.write(source)
+                tmp_path = tmp.name
+            try:
+                return iio.imread(tmp_path, index=None)
+            finally:
+                os.unlink(tmp_path)
+        if os.path.exists(source):
+            return iio.imread(source, index=None)
+        if source.startswith(("http://", "https://")):
+            resp = requests.get(source, timeout=10)
+            resp.raise_for_status()
+            with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
+                tmp.write(resp.content)
+                tmp_path = tmp.name
+            try:
+                return iio.imread(tmp_path, index=None)
+            finally:
+                os.unlink(tmp_path)
+        raise ValueError("Unsupported video source format")
+
+    def _hash_payload(self, payload: bytes) -> int:
+        digest = hashlib.sha256(payload).digest()[:8]
+        return int.from_bytes(digest, byteorder="big", signed=False) % (1 << 31)
+
+    def _hash_mm_items(self, images: list[Image.Image], videos: list[np.ndarray]) -> list[int]:
+        pad_values = []
+        for image in images:
+            pad_values.append(self._hash_payload(image.tobytes()))
+        for video in videos:
+            pad_values.append(self._hash_payload(video.tobytes()))
+        return pad_values
+
+    def _to_grid_list(self, grid_thw: Any) -> list[tuple[int, int, int]] | None:
+        if grid_thw is None:
+            return None
+        grid = np.asarray(grid_thw)
+        if grid.size == 0:
+            return None
+        return [tuple(int(x) for x in row) for row in grid.tolist()]
+
+    def _strip_batch_dim(self, arr: Any) -> np.ndarray | None:
+        if arr is None:
+            return None
+        array = np.asarray(arr)
+        if array.ndim > 1 and array.shape[0] == 1:
+            return array[0]
+        return array
 
     def _create_tokenized_object(
         self, obj: GenerateMMReqInput, input_text, input_ids, neg_input_text, neg_input_ids
