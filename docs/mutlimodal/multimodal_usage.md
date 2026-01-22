@@ -14,6 +14,7 @@ For architecture details, see the [RFC: Multimodal Architecture Design](design/[
 |-------|-------------|
 | Wan-AI/Wan2.1-T2V-1.3B-Diffusers | Video generation model supporting text-to-video generation |
 | Wan-AI/Wan2.1-T2V-14B-Diffusers | Video generation model supporting text-to-video generation |
+| Wan-AI/Wan2.2-T2V-A14B-Diffusers | Video generation model supporting text-to-video generation |
 
 ## Quick Start
 
