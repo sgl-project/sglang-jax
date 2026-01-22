@@ -1527,6 +1527,7 @@ def ragged_paged_attention(
             bkv_p = 1
     bkv_p = align_to(bkv_p, kv_packing)
     bkv_sz = bkv_p * page_size
+    print(f"{bkv_p=} {bq_sz=}")
     if vmem_limit_bytes is None:
         vmem_limit_bytes = DEFAULT_VMEM_LIMIT_BYTES
 
