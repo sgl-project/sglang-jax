@@ -25,7 +25,6 @@ dependencies = [
     "pydantic~=2.11.7",
     "python-multipart>=0.0.20",
     "pyzmq~=27.0.1",
-    "qwix @ git+https://github.com/google/qwix",
     "requests~=2.32.4",
     "safetensors~=0.6.1",
     "setproctitle~=1.3.6",
