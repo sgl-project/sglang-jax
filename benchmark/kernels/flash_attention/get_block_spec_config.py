@@ -152,7 +152,8 @@ def main():
     print("Device count:", jax.device_count())
     print()
 
-    page_size_config = [128, 256]
+    # page_size_config = [128, 256]
+    page_size_config = [256]
     max_num_batched_tokens_config = [
         1,
         2,
@@ -169,32 +170,43 @@ def main():
         4096,
         8192,
     ]
-    q_head_num_config = [1, 2, 4, 8, 16, 32]
-    kv_head_num_config = [1, 2, 4, 8, 16, 32]
+    # q_head_num_config = [1, 2, 4, 8, 16, 32]
+    # kv_head_num_config = [1, 2, 4, 8, 16, 32]
+    q_head_num_config = [8]
+    kv_head_num_config = [1]
     head_dim_config = [128]
-    max_kv_cache_tokens_config = [600000]
+    max_kv_cache_tokens_config = [6000000]
     all_combinations = []
-    max_context_len = 40960
+    # max_context_lens = [1*1024, 2*1024, 4*1024, 8*1024, 16*1024, 32*1024, 64*1024, 128*1024, 256*1024]
+    max_context_lens = [32 * 1024]
     for q_head_num in q_head_num_config:
         for kv_head_num in kv_head_num_config:
             for head_dim in head_dim_config:
                 for page_size in page_size_config:
                     for max_kv_cache_tokens in max_kv_cache_tokens_config:
                         for max_num_batched_tokens in max_num_batched_tokens_config:
-                            if q_head_num < kv_head_num or q_head_num % kv_head_num != 0:
-                                continue
-                            all_combinations.append(
-                                (
-                                    page_size,
-                                    max_kv_cache_tokens,
-                                    max_num_batched_tokens,
-                                    q_head_num,
-                                    kv_head_num,
-                                    head_dim,
+                            for max_context_len in max_context_lens:
+                                if q_head_num < kv_head_num or q_head_num % kv_head_num != 0:
+                                    continue
+                                if (
+                                    max_num_batched_tokens > 256
+                                    and max_num_batched_tokens > max_context_len
+                                ):
+                                    # in prefill, max_num_batched_tokens <= max_context_len
+                                    continue
+                                all_combinations.append(
+                                    (
+                                        page_size,
+                                        max_kv_cache_tokens,
+                                        max_num_batched_tokens,
+                                        max_context_len,
+                                        q_head_num,
+                                        kv_head_num,
+                                        head_dim,
+                                    )
                                 )
-                            )
 
-    num_kv_pages_per_blk_config = [1, 2, 4, 8, 16, 32]
+    num_kv_pages_per_blk_config = [2, 4, 8, 16, 32, 64, 128]
     num_queries_per_block_config = [1, 2, 4, 8, 16, 32, 64, 128]
 
     prefill_only_block_spec_configs = []
@@ -210,6 +222,7 @@ def main():
         page_size,
         max_kv_cache_tokens,
         max_num_batched_tokens,
+        max_context_len,
         q_head_num,
         kv_head_num,
         head_dim,
@@ -246,7 +259,7 @@ def main():
                 pass
         if best_config:
             print(
-                f"('{q_dtype}', '{k_dtype}', {q_head_num}, {kv_head_num}, {head_dim}, {page_size}, {max_num_batched_tokens}): ({best_config[0]}, {best_config[1]}),"
+                f"('{q_dtype}', '{k_dtype}', {q_head_num}, {kv_head_num}, {head_dim}, {page_size}, {max_num_batched_tokens}, {max_context_len}): ({best_config[0]}, {best_config[1]}),"
             )
 
 

@@ -54,18 +54,14 @@ def create_prefill_uniform_data(
     dtype=jnp.bfloat16,
     seed=42,
 ):
-    if max_num_batched_tokens > 2048:
-        batch_size = cdiv(max_num_batched_tokens, 2048)
-        seq_lens_list = [2048] * (batch_size - 1) + [
-            max_num_batched_tokens - 2048 * (batch_size - 1)
-        ]
-    else:
-        batch_size = 1
-        seq_lens_list = [max_num_batched_tokens]
+    batch_size = 1
+    q_lens_list = [max_num_batched_tokens]
+    seq_lens_list = [max_context_len]
 
     seq_lens = jnp.array(seq_lens_list, dtype=jnp.int32)
+    q_lens = jnp.array(q_lens_list, dtype=jnp.int32)
     cu_q_lens = jnp.concatenate(
-        [jnp.array([0], dtype=jnp.int32), jnp.cumsum(seq_lens, dtype=jnp.int32)]
+        [jnp.array([0], dtype=jnp.int32), jnp.cumsum(q_lens, dtype=jnp.int32)]
     )
     cu_kv_lens = jnp.concatenate(
         [
@@ -123,9 +119,7 @@ def create_decode_uniform_data(
     seed=42,
 ):
     batch_size = max_num_batched_tokens
-    # hackly set prefix len to 2048-4096 for decode one seq in random
-    random_prefix_lens = jax.random.randint(jax.random.PRNGKey(42), (batch_size,), 1024, 2048)
-    seq_lens = random_prefix_lens + 1
+    seq_lens = jnp.full((batch_size,), max_context_len, dtype=jnp.int32)
     cu_q_lens = jnp.concatenate(
         [
             jnp.array([0], dtype=jnp.int32),
