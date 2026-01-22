@@ -103,7 +103,7 @@ class BaseW8Test(CustomTestCase):
 
 class TestW8Int8(BaseW8Test):
     model = "Qwen/Qwen3-32B"
-    quantization_config_path = "int8_all_modules_w_only.yaml"
+    quantization_config_path = "int8.yaml"
     gsm8k_accuracy_threshold = 0.95
     throughput_threshold = 100
     other_args = [
