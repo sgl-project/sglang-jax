@@ -1,9 +1,12 @@
 import logging
 import multiprocessing as mp
 import os
+import threading
+import time
 from collections.abc import Callable
 from http import HTTPStatus
 
+import requests
 import uvicorn
 from fastapi import Request
 from fastapi.responses import ORJSONResponse, Response
@@ -25,6 +28,7 @@ from sgl_jax.srt.multimodal.manager.multimodal_detokenizer import (
 from sgl_jax.srt.multimodal.manager.multimodal_tokenizer import MultimodalTokenizer
 from sgl_jax.srt.server_args import PortArgs
 from sgl_jax.srt.utils import kill_process_tree, set_uvicorn_logging_configs
+from sgl_jax.utils import get_exception_traceback
 
 logger = logging.getLogger(__name__)
 
@@ -184,6 +188,18 @@ def launch(
         )
     )
 
+    # Send a warmup request - we will create the thread and launch it
+    # in the lifespan after all other warmups have fired.
+    warmup_thread = threading.Thread(
+        target=_wait_and_warmup,
+        args=(
+            server_args,
+            pipe_finish_writer,
+            launch_callback,
+        ),
+    )
+    app.warmup_thread = warmup_thread
+
     try:
         # Update logging configs
         set_uvicorn_logging_configs()
@@ -198,7 +214,106 @@ def launch(
             loop="uvloop",
         )
     finally:
+        warmup_thread.join()
         for p in processes:
             if p.is_alive():
                 p.terminate()
         kill_process_tree(os.getpid())
+
+
+def _is_wan_model(model_path: str) -> bool:
+    """Check if the model is a Wan model based on model path."""
+    return "wan" in model_path.lower()
+
+
+def _execute_multimodal_server_warmup(
+    server_args: MultimodalServerArgs,
+    pipe_finish_writer: mp.connection.Connection | None,
+) -> bool:
+    """Execute warmup request for multimodal server.
+
+    For Wan models, sends an image generation request as warmup.
+    """
+    headers = {}
+    url = server_args.url()
+    if server_args.api_key:
+        headers["Authorization"] = f"Bearer {server_args.api_key}"
+
+    # Wait until the server is launched
+    success = False
+    last_traceback = None
+    for _ in range(120):
+        time.sleep(1)
+        try:
+            res = requests.get(url + "/health", timeout=5, headers=headers)
+            assert res.status_code == 200, f"{res=}, {res.text=}"
+            success = True
+            break
+        except (AssertionError, requests.exceptions.RequestException):
+            last_traceback = get_exception_traceback()
+
+    if not success:
+        if pipe_finish_writer is not None:
+            pipe_finish_writer.send(last_traceback)
+        logger.error("Initialization failed. warmup error: %s", last_traceback)
+        kill_process_tree(os.getpid())
+        return False
+
+    # Send a warmup request
+    # For Wan models, send an image generation request
+    if _is_wan_model(server_args.model_path):
+        request_endpoint = "/api/v1/images/generation"
+        json_data = {
+            "prompt": "warmup request",
+            "size": "480*832",
+            "num_inference_steps": 2,
+            "save_output": False,
+        }
+    else:
+        # Default to image generation for other multimodal models
+        request_endpoint = "/api/v1/images/generation"
+        json_data = {
+            "prompt": "warmup request",
+            "size": "480*832",
+            "num_inference_steps": 2,
+            "save_output": False,
+        }
+
+    try:
+        res = requests.post(
+            url + request_endpoint,
+            json=json_data,
+            headers=headers,
+            timeout=600,
+        )
+        assert res.status_code == 200, f"{res}"
+    except Exception:
+        last_traceback = get_exception_traceback()
+        if pipe_finish_writer is not None:
+            pipe_finish_writer.send(last_traceback)
+        logger.error("Initialization failed. warmup error: %s", last_traceback)
+        kill_process_tree(os.getpid())
+        return False
+
+    return True
+
+
+def _wait_and_warmup(
+    server_args: MultimodalServerArgs,
+    pipe_finish_writer: mp.connection.Connection | None,
+    launch_callback: Callable[[], None] | None = None,
+):
+    """Wait for server to start and execute warmup request."""
+    if not server_args.skip_server_warmup and not _execute_multimodal_server_warmup(
+        server_args,
+        pipe_finish_writer,
+    ):
+        return
+
+    logger.info("The server is fired up and ready to roll!")
+
+    if pipe_finish_writer is not None:
+        pipe_finish_writer.send("ready")
+
+    if launch_callback is not None:
+        launch_callback()
