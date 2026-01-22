@@ -21,6 +21,7 @@ from sgl_jax.srt.multimodal.manager.global_scheduler import run_global_scheduler
 from sgl_jax.srt.multimodal.manager.io_struct import (
     DataType,
     GenerateMMReqInput,
+    GenerateVLMReqInput,
     ImageGenerationsRequest,
     VideoGenerationsRequest,
 )
@@ -191,13 +192,27 @@ async def chat_completions(obj: ChatCompletionRequest, request: Request):
         prompt, image_data, video_data = _extract_openai_prompt(
             obj, _global_state.tokenizer_manager.tokenizer
         )
-        internal_obj = GenerateMMReqInput(
+        max_new_tokens = obj.max_completion_tokens or obj.max_tokens
+        sampling_params = {
+            "max_new_tokens": max_new_tokens,
+            "temperature": obj.temperature,
+            "top_p": obj.top_p,
+            "top_k": obj.top_k,
+            "min_p": obj.min_p,
+            "frequency_penalty": obj.frequency_penalty,
+            "presence_penalty": obj.presence_penalty,
+            "repetition_penalty": obj.repetition_penalty,
+            "stop": obj.stop,
+        }
+        internal_obj = GenerateVLMReqInput(
             prompt=prompt,
             image_data=image_data,
             video_data=video_data,
             stream=obj.stream,
             n=obj.n,
             rid=obj.rid if isinstance(obj.rid, str) else None,
+            sampling_params=sampling_params,
+            stop=obj.stop,
         )
         ret = await _global_state.tokenizer_manager.generate_request(
             internal_obj, request

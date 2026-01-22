@@ -91,6 +91,25 @@ class GenerateMMReqInput:
 
 
 @dataclasses.dataclass
+class GenerateVLMReqInput:
+    """Input request for VLM chat/completions."""
+
+    rid: str | None = None
+    prompt: str | None = None
+    input_ids: list[int] | None = None
+    image_data: list[str] | str | None = None
+    video_data: list[str] | str | None = None
+    stream: bool = False
+    n: int | None = 1
+    sampling_params: dict | None = None
+    stop: str | list[str] | None = None
+
+    def __post_init__(self):
+        if self.rid is None:
+            self.rid = uuid.uuid4().hex
+
+
+@dataclasses.dataclass
 class TokenizedGenerateMMReqInput:
     rid: str | None = None
     data_type: DataType | None = None
@@ -111,6 +130,18 @@ class TokenizedGenerateMMReqInput:
     save_output: bool = True
     background: str | None = None
     response_format: str | None = None
+
+
+@dataclasses.dataclass
+class TokenizedGenerateVLMReqInput:
+    rid: str | None = None
+    prompt: str | None = None
+    input_ids: list[int] | None = None
+    mm_inputs: "VLMMInputs | None" = None
+    stream: bool = False
+    n: int | None = 1
+    sampling_params: dict | None = None
+    stop: str | list[str] | None = None
 
 
 @dataclasses.dataclass

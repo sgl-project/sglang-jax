@@ -20,6 +20,7 @@ class VitScheduler:
         mesh: jax.sharding.Mesh,
         communication_backend: CommunicationBackend,
         model_class,
+        stage_sub_dir: str | None = None,
     ):
         self.communication_backend = communication_backend
         self.mesh = mesh
@@ -46,5 +47,9 @@ class VitScheduler:
 
     def run_vit_step(self, req: Req):
         """Placeholder: run ViT encoder and forward request to next stage."""
-        self.vit_worker.forward(req, self.mesh)
+        logger.info("VitScheduler processing request rid=%s", req.rid)
+        logger.info(req)
+        # if req.vlm_inputs is None:
+        #     logger.warning("VitScheduler received request without VLM inputs rid=%s", req.rid)
+        # self.vit_worker.forward(req, self.mesh)
         self.communication_backend.send_pyobj(req)

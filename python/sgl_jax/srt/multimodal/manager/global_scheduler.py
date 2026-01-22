@@ -12,7 +12,10 @@ import zmq
 
 from sgl_jax.srt.managers.io_struct import AbortReq
 from sgl_jax.srt.multimodal.manager.device_manager import DeviceManager
-from sgl_jax.srt.multimodal.manager.io_struct import TokenizedGenerateMMReqInput
+from sgl_jax.srt.multimodal.manager.io_struct import (
+    TokenizedGenerateMMReqInput,
+    TokenizedGenerateVLMReqInput,
+)
 from sgl_jax.srt.multimodal.manager.schedule_batch import Req
 from sgl_jax.srt.multimodal.manager.stage import Stage
 from sgl_jax.srt.multimodal.manager.utils import load_stage_configs_from_yaml
@@ -123,6 +126,7 @@ class GlobalScheduler:
         self._request_dispatcher = TypeBasedDispatcher(
             [
                 (TokenizedGenerateMMReqInput, self.convert_request),
+                (TokenizedGenerateVLMReqInput, self.convert_vlm_request),
                 (AbortReq, self.handle_abort_request),
             ]
         )
@@ -213,6 +217,24 @@ class GlobalScheduler:
         if req.rid in self.req_store:
             raise RuntimeError(f"{req.rid} is already in req_store")
         # Store with tracking state, starting at stage 0
+        self.req_store[req.rid] = ReqTrackingState(req=req, current_stage=0)
+        return req
+
+    def convert_vlm_request(self, input: TokenizedGenerateVLMReqInput):
+        """Convert a tokenized VLM input into internal Req."""
+        req = Req(
+            rid=input.rid,
+            prompt=input.prompt,
+            input_ids=input.input_ids,
+            data_type=None,
+        )
+        req.vlm_inputs = input.mm_inputs
+        if input.sampling_params is not None:
+            req.extra["sampling_params"] = input.sampling_params
+        if input.stop is not None:
+            req.extra["stop"] = input.stop
+        if req.rid in self.req_store:
+            raise RuntimeError(f"{req.rid} is already in req_store")
         self.req_store[req.rid] = ReqTrackingState(req=req, current_stage=0)
         return req
 

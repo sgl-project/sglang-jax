@@ -5,7 +5,7 @@ import jax
 import PIL.Image
 
 from sgl_jax.srt.managers.io_struct import BatchTokenIDOut, TokenizedGenerateReqInput
-from sgl_jax.srt.multimodal.manager.io_struct import DataType
+from sgl_jax.srt.multimodal.manager.io_struct import DataType, VLMMInputs
 from sgl_jax.srt.sampling.sampling_params import SamplingParams
 
 NegativePromptSuffix = "_negative"
@@ -62,6 +62,11 @@ class Req:
     max_sequence_length: int | None = None
     prompt_template: dict[str, Any] | None = None
     do_classifier_free_guidance: bool = False
+
+    # VLM inputs/outputs
+    vlm_inputs: VLMMInputs | None = None
+    vision_embeds: jax.Array | None = None
+    input_embeds: jax.Array | None = None
 
     # Batch info
     num_outputs_per_prompt: int = 1

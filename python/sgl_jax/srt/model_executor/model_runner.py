@@ -68,6 +68,7 @@ class ModelRunner(BaseModelRunner):
         token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator | None = None,
         rngs: nnx.Rngs = None,
         max_padding: int = 1,
+        model_class=None,
     ):
         # Parse args
         self.is_draft_worker = is_draft_worker
@@ -107,6 +108,7 @@ class ModelRunner(BaseModelRunner):
             load_config=LoadConfig(
                 load_format=server_args.load_format,
                 download_dir=server_args.download_dir,
+                model_class=model_class,
             ),
             mesh=self.mesh,
         )

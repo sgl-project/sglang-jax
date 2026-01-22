@@ -26,7 +26,9 @@ from sgl_jax.srt.managers.tokenizer_manager import TokenizerManager
 from sgl_jax.srt.multimodal.manager.io_struct import (
     DataType,
     GenerateMMReqInput,
+    GenerateVLMReqInput,
     TokenizedGenerateMMReqInput,
+    TokenizedGenerateVLMReqInput,
     VLMMInputs,
 )
 from sgl_jax.srt.multimodal.manager.mrope_utils import compute_mrope_positions
@@ -157,7 +159,7 @@ class MultimodalTokenizer(TokenizerManager):
 
     async def generate_request(
         self,
-        obj: GenerateMMReqInput,
+        obj: GenerateMMReqInput | GenerateVLMReqInput,
         request: fastapi.Request | None = None,
     ):
         """High level API: accept a generation request and stream responses.
@@ -186,7 +188,7 @@ class MultimodalTokenizer(TokenizerManager):
         async for response in self._wait_one_response(obj, state, request):
             yield response
 
-    async def _tokenize_one_request(self, obj: GenerateMMReqInput):
+    async def _tokenize_one_request(self, obj: GenerateMMReqInput | GenerateVLMReqInput):
         """
         Converts text fields to token ids using the configured tokenizer.
         Image preprocessing / references are noted as TODO; when provided
@@ -280,9 +282,12 @@ class MultimodalTokenizer(TokenizerManager):
             encoded = self.tokenizer(neg_input_text)
             neg_input_ids = encoded["input_ids"]
 
-        tokenized_obj = self._create_tokenized_object(
-            obj, input_text, input_ids, neg_input_text, neg_input_ids
-        )
+        if isinstance(obj, GenerateVLMReqInput):
+            tokenized_obj = self._create_tokenized_vlm_object(obj, input_text, input_ids)
+        else:
+            tokenized_obj = self._create_tokenized_object(
+                obj, input_text, input_ids, neg_input_text, neg_input_ids
+            )
         tokenized_obj.mm_inputs = mm_inputs
         return tokenized_obj
 
@@ -384,6 +389,23 @@ class MultimodalTokenizer(TokenizerManager):
             save_output=getattr(obj, "save_output", True),
         )
         return tokenized_obj
+
+    def _create_tokenized_vlm_object(
+        self, obj: GenerateVLMReqInput, input_text, input_ids
+    ) -> TokenizedGenerateVLMReqInput:
+        rid = getattr(obj, "rid", None)
+        if rid is None:
+            rid = uuid.uuid4().hex
+
+        return TokenizedGenerateVLMReqInput(
+            rid=rid,
+            prompt=input_text,
+            input_ids=input_ids,
+            stream=getattr(obj, "stream", False),
+            n=getattr(obj, "n", 1),
+            sampling_params=getattr(obj, "sampling_params", None),
+            stop=getattr(obj, "stop", None),
+        )
 
     def _send_one_request(
         self,
