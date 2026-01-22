@@ -1,13 +1,13 @@
 # Adapted from https://github.com/vllm-project/tpu-inference/blob/main/tpu_inference/models/jax/utils/qwix/qwix_utils.py
 
 import functools
-import os
+import itertools
+import logging
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import qwix
-import yaml
 from flax import nnx
 
 from sgl_jax.srt.configs.model_config import ModelConfig
@@ -21,9 +21,8 @@ from sgl_jax.srt.model_executor.forward_batch_info import (
 )
 from sgl_jax.srt.sampling.sampling_batch_info import SamplingBatchInfo
 
-# from sgl_jax.srt.model_executor.model_runner import ModelRunner
+logger = logging.getLogger(__name__)
 
-QUANTIZATION_CONFIG_PATH = os.path.join(os.path.dirname(__file__), "configs")
 DEFAULT_NUM_PAGES = 100
 
 
@@ -85,53 +84,29 @@ def qwix_quantize_nnx_model(
     return model
 
 
-def quantization_config_file_path_to_dict(quantization_config_file_path: str) -> dict:
-    """
-    Converts a quantization config YAML file path to a dictionary.
-
-    The expected format of the quantization config YAML file is as follows:
-    ```yaml
-        qwix:
-            # optional, defaults to False if not specified
-            use_abstract_model: True
-            rules:
-                # NOTE: each entry corresponds to a qwix.QuantizationRule
-                - module_path: '.*attn.*'
-                weight_qtype: 'int8'
-                - module_path: '.*'
-                weight_qtype: 'int8'
-                act_qtype: 'int8'
-    ```
-
-    Args:
-        quantization_config_file_path: the path to the quantization config YAML file
-
-    Returns:
-        a dictionary containing the quantization config
-    """
-    all_entries = os.listdir(QUANTIZATION_CONFIG_PATH)
-    for filename in all_entries:
-        if filename == quantization_config_file_path:
-            path = os.path.join(QUANTIZATION_CONFIG_PATH, filename)
-            with open(path) as f:
-                return yaml.safe_load(f)
-    raise ValueError(
-        f"Could not find quantization config file with name '{quantization_config_file_path}' in 'sgl_jax/srt/utils/quantization/configs."
-    )
-
-
 def apply_qwix_quantization(
     model_config: ModelConfig, model: nnx.Module, model_runner
 ) -> nnx.Module:
     """
     Will apply quantization if a valid quantization config with Qwix rules is provided.  See README
     for more details on Qwix.
-    """
 
-    qwix_config_dict = quantization_config_file_path_to_dict(
-        os.path.join(model_config.quantization_config_path)
-    )
-    qwix_config = qwix_config_dict.get("qwix").get("rules")
+    Uses the unified QuantizationConfig from model_config.quantization_config.
+    """
+    # Get qwix rules from the unified QuantizationConfig
+    quant_config = model_config.quantization_config
+    if quant_config is None:
+        raise ValueError(
+            "apply_qwix_quantization called but model_config.quantization_config is None. "
+            "Ensure --quantization-config-path is set."
+        )
+
+    qwix_config = quant_config.get_qwix_rules()
+    if not qwix_config:
+        raise ValueError(
+            "No qwix rules found in quantization config. "
+            "Check your quantization config YAML file."
+        )
 
     # prepare batch input
     forward_batch, token_to_kv_pool, logits_metadata = prepare_inputs_for_quantization(
@@ -152,6 +127,55 @@ def apply_qwix_quantization(
             logits_metadata=logits_metadata,
             model=model,
         )
+    return model
+
+
+def apply_moe_quantization(model_config: ModelConfig, model: nnx.Module) -> nnx.Module:
+    """
+    Quantize MoE weights in-place. Call this after apply_qwix_quantization.
+
+    This walks through the model and calls quantize_weights() on each EPMoE module,
+    which quantizes wi_0, wi_1, wo weights and stores the scales as separate parameters.
+
+    Uses the unified QuantizationConfig from model_config.quantization_config.
+    """
+    # Import here to avoid circular imports
+    from sgl_jax.srt.layers.moe import EPMoE
+
+    quant_config = model_config.quantization_config
+    if quant_config is None:
+        return model
+
+    if not quant_config.has_moe_quantization():
+        return model
+
+    # Walk through the model and quantize all EPMoE modules
+    # Models with MoE typically have: model.model.layers[i].block_sparse_moe.experts
+    # or similar structure. We recursively search for EPMoE instances.
+    def _quantize_moe_recursive(obj, visited=None):
+        if visited is None:
+            visited = set()
+
+        obj_id = id(obj)
+        if obj_id in visited:
+            return
+        visited.add(obj_id)
+
+        if isinstance(obj, EPMoE):
+            obj.quantize_weights()
+            return
+
+        # Try to iterate through attributes
+        if hasattr(obj, "__dict__"):
+            for attr_name, attr_value in obj.__dict__.items():
+                if isinstance(attr_value, nnx.Module):
+                    _quantize_moe_recursive(attr_value, visited)
+                elif isinstance(attr_value, (list, tuple)):
+                    for item in attr_value:
+                        if isinstance(item, nnx.Module):
+                            _quantize_moe_recursive(item, visited)
+
+    _quantize_moe_recursive(model)
     return model
 
 
@@ -197,6 +221,166 @@ def prepare_inputs_for_quantization(
     forward_batch = ForwardBatch.init_new(model_worker_batch, model_runner)
 
     return forward_batch, token_to_kv_pool, logits_metadata
+
+
+def quantize_tensor_simple(
+    x: jax.Array, dtype: jnp.dtype, dim: int = -1, out_dtype: jnp.dtype = jnp.float32
+):
+    if jnp.issubdtype(dtype, jnp.integer):
+        dtype_info = jnp.iinfo(dtype)
+        max_val = int(dtype_info.max)
+        min_val = int(dtype_info.min)
+    else:
+        dtype_info = jnp.finfo(dtype)
+        max_val = float(dtype_info.max)
+        min_val = float(dtype_info.min)
+
+    x_abs_max = jnp.max(jnp.abs(x), axis=dim, keepdims=True)
+    scale = x_abs_max / max_val
+    x_q = jnp.clip(x / scale, min_val, max_val).astype(dtype)
+    return x_q, scale.astype(out_dtype)
+
+
+def quantize_tensor(
+    dtype: jnp.dtype,
+    tensor: jax.Array,
+    axis: int | tuple | None = -1,
+    block_size: int | None = None,
+    pad_tensor: bool = False,
+) -> tuple[jax.Array, jax.Array]:
+    """Quantize tensor.
+
+    Args:
+        dtype: dtype to perform quantization.
+        tensor: Unquantized tensor
+        axis: Axis to perform quantization. None denotes per-tensor.
+        block_size: Specify block quantization size.
+        pad_tensor: Whether to pad the axis along block size.
+
+    Returns:
+        Tensor quantized to dtype.
+    """
+    if axis is None:
+        # Perform per-tensor quantization.
+        axis = [i for i in range(tensor.ndim)]
+    if isinstance(axis, int):
+        axis = [axis]
+
+    orig_shape = tensor.shape
+    mask = jnp.ones_like(tensor, jnp.int32)
+
+    if block_size is not None:
+        if isinstance(block_size, int):
+            block_size = [block_size] * len(axis)
+
+        blocked_shape = [[i] for i in orig_shape]
+        pad_width = [[0, 0] for _ in range(tensor.ndim)]
+        for i, block in zip(axis, block_size):
+            num_blocks = (tensor.shape[i] + block - 1) // block
+            padding_size = num_blocks * block - tensor.shape[i]
+            if padding_size and not pad_tensor:
+                raise ValueError(
+                    f"Unable to perform block quantization. axis={i} of "
+                    f"{tensor.shape=} is not divisible by {block=}"
+                )
+
+            # Pad the tensor to align with block size.
+            pad_width[i][1] = padding_size
+
+            blocked_shape[i] = (num_blocks, block)
+
+        # In order to avoid padded values affecting scale value, we pad it
+        # using edge value of the tensor.
+        tensor = jnp.pad(tensor, pad_width, "edge")
+        mask = jnp.pad(mask, pad_width)
+
+        orig_shape = tensor.shape
+        # Convert all axis into positive values.
+        axis = sorted([i % tensor.ndim for i in axis])
+        # Shift axis by 1 since its original position is now occupied by
+        # num_blocks dim. Also, if n axes before an axis was also quantized,
+        # shift its position by n.
+        axis = [1 + n + i for n, i in enumerate(axis)]
+
+        # Flatten list of lists that contains (num_blocks, block).
+        blocked_shape = list(itertools.chain(*blocked_shape))
+        tensor = tensor.reshape(blocked_shape)
+
+    dtype_info = jnp.iinfo(dtype) if jnp.issubdtype(dtype, jnp.integer) else jnp.finfo(dtype)
+
+    dtype_max = float(dtype_info.max)
+    dtype_min = float(dtype_info.min)
+
+    abs_max = jnp.max(jnp.abs(tensor), axis=axis, keepdims=True)
+    scale = abs_max / dtype_max
+
+    tensor_q = jnp.clip(tensor / scale, dtype_min, dtype_max)
+    tensor_q = tensor_q.reshape(orig_shape)
+    tensor_q = tensor_q.astype(dtype)
+
+    # To avoid padded values affecting output of quantized matmul, we mask them
+    # out with 0s.
+    tensor_q = jnp.where(mask, tensor_q, 0)
+
+    scale = jnp.squeeze(scale, axis).astype(jnp.float32)
+
+    return tensor_q, scale
+
+
+def dequantize_tensor(
+    tensor_q: jax.Array,
+    scale: jax.Array,
+    axis: int | None | tuple = -1,
+    out_dtype: jnp.dtype = jnp.bfloat16,
+) -> jax.Array:
+    """Dequantize a quantized tensor
+
+    Args:
+        tensor_q: Quantized tensor.
+        scale: Quantization scale.
+        axis: The axis tensor was quantized. None denotes per-tensor.
+        out_dtype: Dtype of the output.
+
+    Returns:
+        Dequantized tensor_q.
+    """
+    if axis is None:
+        # Perform per-tensor quantization.
+        axis = [i for i in range(tensor_q.ndim)]
+    if isinstance(axis, int):
+        axis = [axis]
+
+    orig_shape = tensor_q.shape
+    if tensor_q.ndim == scale.ndim:
+        # Indicates the tensor was block quantized.
+        blocked_shape = [[i] for i in orig_shape]
+        for i in axis:
+            num_blocks = scale.shape[i]
+            if tensor_q.shape[i] % num_blocks:
+                raise ValueError(
+                    f"Unable to perform block dequantization. axis={i} of "
+                    f"{tensor_q.shape=} is not divisible by {num_blocks=}",
+                )
+            block_size = tensor_q.shape[i] // num_blocks
+
+            blocked_shape[i] = (num_blocks, block_size)
+
+        # Convert all axis into positive values.
+        axis = sorted([(i + tensor_q.ndim) % tensor_q.ndim for i in axis])
+        # Shift axis by 1 since its original position is now occupied by
+        # num_blocks dim. Also, if n axes before an axis was also quantized,
+        # shift its position by n.
+        axis = [1 + n + i for n, i in enumerate(axis)]
+
+        # Flatten list of lists that contains (num_blocks, block).
+        blocked_shape = list(itertools.chain(*blocked_shape))
+        tensor_q = tensor_q.reshape(blocked_shape)
+
+    scale = jnp.expand_dims(scale, axis)
+
+    tensor = (tensor_q.astype(jnp.float32) * scale).astype(out_dtype)
+
+    return tensor.reshape(orig_shape)
 
 
 def generate_mock_model_worker_batch(

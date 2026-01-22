@@ -25,7 +25,7 @@ from sgl_jax.srt.layers.logits_processor import (
     LogitsProcessor,
     LogitsProcessorOutput,
 )
-from sgl_jax.srt.layers.moe import EPMoE
+from sgl_jax.srt.layers.moe import EPMoE, create_moe_weights_mapping
 from sgl_jax.srt.layers.radix_attention import RadixAttention
 from sgl_jax.srt.mem_cache.memory_pool import KVCache
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
@@ -270,6 +270,7 @@ class Grok1MoE(nnx.Module):
                 weight_dtype=dtype,
                 dtype=dtype,
                 layer_id=layer_id,
+                quantization_config=getattr(config, "quantization_config", None),
             )
 
     def __call__(self, hidden_states: jax.Array) -> tuple[jax.Array, jax.Array | None]:
@@ -549,18 +550,22 @@ class Grok1DecoderLayer(nnx.Module):
         self.pre_attn_norm = RMSNorm(
             config.hidden_size,
             epsilon=config.rms_norm_eps,
+            dtype=jnp.bfloat16,
         )
         self.post_attn_norm = RMSNorm(
             config.hidden_size,
             epsilon=config.rms_norm_eps,
+            dtype=jnp.bfloat16,
         )
         self.pre_moe_norm = RMSNorm(
             config.hidden_size,
             epsilon=config.rms_norm_eps,
+            dtype=jnp.bfloat16,
         )
         self.post_moe_norm = RMSNorm(
             config.hidden_size,
             epsilon=config.rms_norm_eps,
+            dtype=jnp.bfloat16,
         )
 
         # Setup FFN function based on configuration (matching PyTorch logic)
@@ -935,94 +940,21 @@ class Grok1ForCausalLM(nnx.Module):
         }
 
         moe_backend = getattr(self.config, "moe_backend", "epmoe")
-        use_fused = moe_backend == "fused"
 
-        if use_fused:
-            # Fused MoE Mapping
-            # w1: gate(w1) -> (num_experts, hidden, intermediate)
-            # w3: up(w3)   -> (num_experts, hidden, intermediate)
-            # w2: down(w2) -> (num_experts, intermediate, hidden)
+        # Concat axes for TP-split weights
+        grok_concat_axis_map = {"w1": 0, "w3": 0, "w2": -1}
 
-            target_path_w1 = [f"{target_prefix}.block_sparse_moe.experts.w1"]
-            target_path_w1.extend(
-                [
-                    f"{prefix}.block_sparse_moe.experts.{i}.w1.weight"
-                    for i in range(self.config.num_local_experts)
-                ]
-            )
-            mappings[f"__MOE_EXPERTS__{prefix}.block_sparse_moe.w1"] = WeightMapping(
-                target_path=target_path_w1,
-                sharding=("tensor", None, None),  # (E, H, I)
-                transpose=True,
-                concat_axis=0,
-            )
-
-            target_path_w3 = [f"{target_prefix}.block_sparse_moe.experts.w3"]
-            target_path_w3.extend(
-                [
-                    f"{prefix}.block_sparse_moe.experts.{i}.w3.weight"
-                    for i in range(self.config.num_local_experts)
-                ]
-            )
-            mappings[f"__MOE_EXPERTS__{prefix}.block_sparse_moe.w3"] = WeightMapping(
-                target_path=target_path_w3,
-                sharding=("tensor", None, None),  # (E, H, I)
-                transpose=True,
-                concat_axis=0,
-            )
-
-            target_path_w2 = [f"{target_prefix}.block_sparse_moe.experts.w2"]
-            target_path_w2.extend(
-                [
-                    f"{prefix}.block_sparse_moe.experts.{i}.w2.weight"
-                    for i in range(self.config.num_local_experts)
-                ]
-            )
-
-            mappings[f"__MOE_EXPERTS__{prefix}.block_sparse_moe.w2"] = WeightMapping(
-                target_path=target_path_w2,
-                sharding=("tensor", None, None),  # (E, I, H)
-                transpose=True,
-                concat_axis=-1,
-            )
-
-        else:
-            # Standard EPMoE Mapping
-            for name, target_name in [("w1", "wi_0"), ("w3", "wi_1"), ("w2", "wo")]:
-                target_path = [f"{target_prefix}.block_sparse_moe.experts.{target_name}"]
-                target_path.extend(
-                    [
-                        f"{prefix}.block_sparse_moe.experts.{i}.{name}.weight"
-                        for i in range(self.config.num_local_experts)
-                    ]
-                )
-
-                sharding = (
-                    ("expert", "tensor", None)
-                    if target_name == "wo"
-                    else ("expert", None, "tensor")
-                )
-
-                if name == "w2":
-                    # w2 (down_proj) -> wo
-                    mappings[f"__MOE_EXPERTS__{prefix}.block_sparse_moe.experts.{target_name}"] = (
-                        WeightMapping(
-                            target_path=target_path,
-                            sharding=sharding,
-                            transpose=True,
-                            concat_axis=-1,
-                        )
-                    )
-                else:
-                    # w1/w3 (gate/up) -> wi_0/wi_1
-                    mappings[f"__MOE_EXPERTS__{prefix}.block_sparse_moe.experts.{target_name}"] = (
-                        WeightMapping(
-                            target_path=target_path,
-                            sharding=sharding,
-                            transpose=True,
-                            concat_axis=0,
-                        )
-                    )
+        moe_mappings = create_moe_weights_mapping(
+            prefix=prefix,
+            target_prefix=target_prefix,
+            num_experts=self.config.num_local_experts,
+            expert_type_names=("w1", "w3", "w2"),
+            moe_path="block_sparse_moe.experts",
+            source_expert_pattern="{i}",
+            moe_backend=moe_backend,
+            expert_concat_axis_map=grok_concat_axis_map,
+        )
+        mappings.update(moe_mappings)
 
         return mappings
 
