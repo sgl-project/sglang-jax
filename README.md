@@ -59,7 +59,10 @@ SGL-JAX is designed for easy extension to new model architectures. It currently 
 
 Currently, SGL-JAX already supports MultiModal Models, and its usage is compatible with LLMs. The architecture has been adapted to support flexible multimodal model architectures.
 
--   **Wan 2.1**: Multimodal Model. When launching this model, please refer to the [MutliModal Usage Guide](docs/mutlimodal/multimodal_usage.md) and [Architecture Design](docs/mutlimodal/design/[RFC]multimodal_architechure.md).
+-   **Wan 2.1 T2V**: Text-to-Video generation model.
+-   **Wan 2.2 T2V**: Text-to-Video generation model. Uses different DiT models at different noise stages for denoising, achieving higher generation quality.
+
+For multimodal model usage, see the [Usage Guide](docs/mutlimodal/multimodal_usage.md) and [Architecture Design](docs/mutlimodal/design/[RFC]multimodal_architechure.md).
 
 
 ## Performance and Benchmarking
