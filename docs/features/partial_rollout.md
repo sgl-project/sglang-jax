@@ -119,32 +119,6 @@ def flush_cache(self):
 
 ---
 
-#### 3.1.2 Engine API (`engine.py`)
-
-**Class**: `Engine`
-
-```python
-def generate(
-    self,
-    # ... existing fields ...
-    return_routed_experts: bool = False,  # NEW FIELD
-) -> dict | Iterator[dict]:
-```
-
----
-
-**Method**: `async_generate()`
-
-```python
-async def async_generate(
-    self,
-    # ... existing fields ...
-    return_routed_experts: bool = False,  # NEW FIELD
-) -> dict | AsyncIterator[dict]:
-```
-
----
-
 #### 3.1.1 Request Input Structures (`io_struct.py`)
 
 ##### A. `PauseGenerationReqInput`
