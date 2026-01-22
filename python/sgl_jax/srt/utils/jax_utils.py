@@ -116,7 +116,7 @@ def get_available_device_memory(device, distributed=False, empty_cache=True):
             stats = dev.memory_stats()
             avail_mem.append(stats["bytes_limit"] - stats["bytes_in_use"])
         avail_mem = jnp.array([min(avail_mem) / (1 << 10)], dtype=jnp.float32)
-    elif device == "proxy":
+    elif "proxy" in device:
         devices = jax.devices()
         live_arrays = jax.live_arrays()
         pathways_hbm_used_mem = pathways_hbm_usage_gb(live_arrays, devices)
