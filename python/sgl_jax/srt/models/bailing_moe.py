@@ -6,12 +6,18 @@ from flax import nnx
 from jax import numpy as jnp
 from transformers import PretrainedConfig
 
-from sgl_jax.srt.configs.model_config import ModelConfig
+from sgl_jax.srt.configs.model_config import ModelConfig, MoEBackend
 from sgl_jax.srt.layers.embeddings import Embed, ParallelLMHead, RotaryEmbedding
 from sgl_jax.srt.layers.layernorm import RMSNorm
 from sgl_jax.srt.layers.linear import LinearBase
 from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
-from sgl_jax.srt.layers.moe import EPMoE, GateLogit, TopK
+from sgl_jax.srt.layers.moe import (
+    EPMoE,
+    FusedEPMoE,
+    GateLogit,
+    TopK,
+    create_moe_weights_mapping,
+)
 from sgl_jax.srt.layers.radix_attention import RadixAttention
 from sgl_jax.srt.mem_cache.memory_pool import KVCache
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
@@ -55,14 +61,10 @@ class BailingMoEAttention(nnx.Module):
 
         if use_qk_norm:
             self.q_norm = RMSNorm(
-                self.head_dim,
-                epsilon=rms_norm_eps,
-                param_dtype=dtype,
+                self.head_dim, epsilon=rms_norm_eps, param_dtype=dtype, scope_name="q_norm"
             )
             self.k_norm = RMSNorm(
-                self.head_dim,
-                epsilon=rms_norm_eps,
-                param_dtype=dtype,
+                self.head_dim, epsilon=rms_norm_eps, param_dtype=dtype, scope_name="k_norm"
             )
         else:
             self.q_norm = None
@@ -75,6 +77,7 @@ class BailingMoEAttention(nnx.Module):
             kernel_axes=(None, "tensor"),
             params_dtype=dtype,
             mesh=mesh,
+            scope_name="q_proj",
         )
         self.k_proj = LinearBase(
             input_size=hidden_size,
@@ -83,6 +86,7 @@ class BailingMoEAttention(nnx.Module):
             kernel_axes=(None, "tensor"),
             params_dtype=dtype,
             mesh=mesh,
+            scope_name="k_proj",
         )
         self.v_proj = LinearBase(
             input_size=hidden_size,
@@ -91,6 +95,7 @@ class BailingMoEAttention(nnx.Module):
             kernel_axes=(None, "tensor"),
             params_dtype=dtype,
             mesh=mesh,
+            scope_name="v_proj",
         )
         self.c_proj = LinearBase(
             input_size=num_heads * self.head_dim,
@@ -99,6 +104,7 @@ class BailingMoEAttention(nnx.Module):
             kernel_axes=("tensor", None),
             params_dtype=dtype,
             mesh=mesh,
+            scope_name="c_proj",
         )
         self.rotary_emb = RotaryEmbedding(
             head_size=self.head_dim,
@@ -162,6 +168,7 @@ class BailingMoEMLP(nnx.Module):
             use_bias=False,
             params_dtype=dtype,
             mesh=mesh,
+            scope_name="gate_proj",
         )
 
         self.up_proj = LinearBase(
@@ -171,6 +178,7 @@ class BailingMoEMLP(nnx.Module):
             use_bias=False,
             params_dtype=dtype,
             mesh=mesh,
+            scope_name="up_proj",
         )
 
         self.down_proj = LinearBase(
@@ -180,11 +188,12 @@ class BailingMoEMLP(nnx.Module):
             use_bias=False,
             params_dtype=dtype,
             mesh=mesh,
+            scope_name="down_proj",
         )
 
         self.act_fn = jax.nn.silu
 
-    def __call__(self, hidden_states: jnp.ndarray):
+    def __call__(self, hidden_states: jax.Array):
         a1, _ = self.gate_proj(hidden_states)
         a2, _ = self.up_proj(hidden_states)
         intermediate_parallel = a2 * self.act_fn(a1)
@@ -259,33 +268,59 @@ class BailingMoEDecoderLayer(nnx.Module):
                 weight_dtype=router_dtype,
                 score_func=getattr(config, "score_function", "sigmoid"),
             )
-            self.topk = TopK(
-                topk=config.num_experts_per_tok,
-                renormalize=config.norm_topk_prob,
-                num_expert_group=config.n_group,
-                topk_group=config.topk_group,
-                routed_scaling_factor=config.routed_scaling_factor,
+
+            self.moe_backend = getattr(config, "moe_backend", MoEBackend.EPMOE)
+            self.use_fused = self.moe_backend == MoEBackend.FUSED
+            moe_shared_expert_intermediate_size = getattr(
+                config,
+                "moe_shared_expert_intermediate_size",
+                config.moe_intermediate_size,
             )
-            self.mlp = EPMoE(
-                config=config,
-                num_experts=config.num_experts,
-                num_experts_per_tok=config.num_experts_per_tok,
-                intermediate_dim=config.moe_intermediate_size,
-                mesh=mesh,
-                ep_size=config.ep_size,
-                weight_dtype=dtype,
-                dtype=dtype,
-                layer_id=layer_id,
-            )
-            if num_shared_experts > 0:
+
+            if self.use_fused:
+                self.mlp = FusedEPMoE(
+                    hidden_size=config.hidden_size,
+                    num_experts=config.num_experts,
+                    num_experts_per_tok=config.num_experts_per_tok,
+                    intermediate_dim=config.moe_intermediate_size,
+                    mesh=mesh,
+                    ep_size=config.ep_size,
+                    weight_dtype=dtype,
+                    dtype=dtype,
+                    layer_id=layer_id,
+                    renormalize_topk_logits=config.norm_topk_prob,
+                    routed_scaling_factor=config.routed_scaling_factor,
+                    use_grouped_topk=config.n_group > 0,
+                    num_groups=config.n_group,
+                    top_k_groups=config.topk_group,
+                    num_shared_experts=num_shared_experts,
+                    moe_shared_expert_intermediate_size=moe_shared_expert_intermediate_size,
+                )
+            else:
+                self.topk = TopK(
+                    topk=config.num_experts_per_tok,
+                    renormalize=config.norm_topk_prob,
+                    num_expert_group=config.n_group,
+                    topk_group=config.topk_group,
+                    routed_scaling_factor=config.routed_scaling_factor,
+                )
+                self.mlp = EPMoE(
+                    hidden_size=config.hidden_size,
+                    num_experts=config.num_experts,
+                    num_experts_per_tok=config.num_experts_per_tok,
+                    intermediate_dim=config.moe_intermediate_size,
+                    mesh=mesh,
+                    ep_size=config.ep_size,
+                    weight_dtype=dtype,
+                    dtype=dtype,
+                    layer_id=layer_id,
+                    quantization_config=getattr(config, "quantization_config", None),
+                )
+
+            if num_shared_experts > 0 and not self.use_fused:
                 self.shared_experts = BailingMoEMLP(
                     hidden_size=config.hidden_size,
-                    intermediate_size=getattr(
-                        config,
-                        "moe_shared_expert_intermediate_size",
-                        config.moe_intermediate_size,
-                    )
-                    * num_shared_experts,
+                    intermediate_size=moe_shared_expert_intermediate_size * num_shared_experts,
                     layer_id=layer_id,
                     dtype=dtype,
                     mesh=mesh,
@@ -298,11 +333,13 @@ class BailingMoEDecoderLayer(nnx.Module):
             config.hidden_size,
             epsilon=config.rms_norm_eps,
             param_dtype=dtype,
+            scope_name="input_layernorm",
         )
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size,
             epsilon=config.rms_norm_eps,
             param_dtype=dtype,
+            scope_name="post_attention_layernorm",
         )
 
     def __call__(
@@ -339,14 +376,20 @@ class BailingMoEDecoderLayer(nnx.Module):
             router_logits = self.moe_gate(hidden_states)
 
             correction_bias = self.moe_gate.bias.value if self.moe_gate.bias is not None else None
-            topk_weights, topk_ids = self.topk(router_logits, correction_bias)
-            hidden_states = self.mlp(hidden_states, topk_weights, topk_ids)
+            if self.use_fused:
+                hidden_states = self.mlp(hidden_states, router_logits)
+                topk_ids = None
+            else:
+                topk_weights, topk_ids = self.topk(router_logits, correction_bias)
+                hidden_states = self.mlp(hidden_states, topk_weights, topk_ids)
+
             if shared_output is not None:
                 hidden_states = hidden_states + shared_output
         else:
             hidden_states = self.mlp(hidden_states)
+            topk_ids = None
 
-        return hidden_states, residual, kv_fused
+        return hidden_states, residual, kv_fused, topk_ids
 
 
 class BailingMoEModel(nnx.Module):
@@ -382,9 +425,7 @@ class BailingMoEModel(nnx.Module):
         )
 
         self.norm = RMSNorm(
-            config.hidden_size,
-            epsilon=config.rms_norm_eps,
-            param_dtype=dtype,
+            config.hidden_size, epsilon=config.rms_norm_eps, param_dtype=dtype, scope_name="norm"
         )
 
     def __call__(
@@ -395,8 +436,9 @@ class BailingMoEModel(nnx.Module):
         hidden_states = self.embed_tokens(forward_batch.input_ids)
         residual = None
         layers_kv_fused = []
+        layers_topk_ids = []
         for layer in self.layers:
-            hidden_states, residual, kv_fused = layer(
+            hidden_states, residual, kv_fused, topk_ids = layer(
                 forward_batch.positions,
                 hidden_states,
                 forward_batch,
@@ -404,12 +446,13 @@ class BailingMoEModel(nnx.Module):
                 residual,
             )
             layers_kv_fused.append(kv_fused)
+            layers_topk_ids.append(topk_ids)
 
         if residual is not None:
             hidden_states += residual
 
         hidden_states = self.norm(hidden_states)
-        return hidden_states, layers_kv_fused
+        return hidden_states, layers_kv_fused, layers_topk_ids
 
 
 class BailingMoEForCausalLM(nnx.Module):
@@ -548,47 +591,55 @@ class BailingMoEForCausalLM(nnx.Module):
                     transpose=False,
                 )
 
-            if getattr(self.config, "num_shared_experts", 0) > 0:
-                shared_experts_mappings = {
-                    f"{prefix}.mlp.shared_experts.gate_proj.weight": WeightMapping(
-                        target_path=f"{target_prefix}.shared_experts.gate_proj.weight",
-                        sharding=(None, "tensor"),
-                        transpose=True,
-                    ),
-                    f"{prefix}.mlp.shared_experts.up_proj.weight": WeightMapping(
-                        target_path=f"{target_prefix}.shared_experts.up_proj.weight",
-                        sharding=(None, "tensor"),
-                        transpose=True,
-                    ),
-                    f"{prefix}.mlp.shared_experts.down_proj.weight": WeightMapping(
-                        target_path=f"{target_prefix}.shared_experts.down_proj.weight",
-                        sharding=("tensor", None),
-                        transpose=True,
-                    ),
-                }
-                mappings.update(shared_experts_mappings)
-
             num_experts = getattr(self.config, "num_experts", 256)
-            for expert_type in ["gate_proj", "up_proj", "down_proj"]:
-                target_name = {
-                    "gate_proj": "wi_0",
-                    "up_proj": "wi_1",
-                    "down_proj": "wo",
-                }[expert_type]
-                expert_keys = [
-                    f"{prefix}.mlp.experts.{i}.{expert_type}.weight" for i in range(num_experts)
-                ]
+            moe_backend = getattr(self.config, "moe_backend", "epmoe")
+            use_fused = moe_backend == "fused"
 
-                if expert_type == "down_proj":
-                    sharding = ("expert", "tensor", None)
+            moe_mappings = create_moe_weights_mapping(
+                prefix=prefix,
+                target_prefix=target_prefix,
+                num_experts=num_experts,
+                expert_type_names=("gate_proj", "up_proj", "down_proj"),
+                moe_backend=moe_backend,
+            )
+            mappings.update(moe_mappings)
+
+            if getattr(self.config, "num_shared_experts", 0) > 0:
+                if use_fused:
+                    mappings[f"{prefix}.mlp.shared_experts.gate_proj.weight"] = WeightMapping(
+                        target_path=f"{target_prefix}.mlp.w1_shared",
+                        sharding=(None, None),
+                        transpose=True,
+                    )
+                    mappings[f"{prefix}.mlp.shared_experts.up_proj.weight"] = WeightMapping(
+                        target_path=f"{target_prefix}.mlp.w3_shared",
+                        sharding=(None, None),
+                        transpose=True,
+                    )
+                    mappings[f"{prefix}.mlp.shared_experts.down_proj.weight"] = WeightMapping(
+                        target_path=f"{target_prefix}.mlp.w2_shared",
+                        sharding=(None, None),
+                        transpose=True,
+                    )
                 else:
-                    sharding = ("expert", None, "tensor")
-
-                mappings[f"__MOE_EXPERTS__{prefix}.mlp.{target_name}"] = WeightMapping(
-                    target_path=[f"{target_prefix}.mlp.{target_name}"] + expert_keys,
-                    sharding=sharding,
-                    transpose=True,
-                )
+                    shared_experts_mappings = {
+                        f"{prefix}.mlp.shared_experts.gate_proj.weight": WeightMapping(
+                            target_path=f"{target_prefix}.shared_experts.gate_proj.weight",
+                            sharding=(None, "tensor"),
+                            transpose=True,
+                        ),
+                        f"{prefix}.mlp.shared_experts.up_proj.weight": WeightMapping(
+                            target_path=f"{target_prefix}.shared_experts.up_proj.weight",
+                            sharding=(None, "tensor"),
+                            transpose=True,
+                        ),
+                        f"{prefix}.mlp.shared_experts.down_proj.weight": WeightMapping(
+                            target_path=f"{target_prefix}.shared_experts.down_proj.weight",
+                            sharding=("tensor", None),
+                            transpose=True,
+                        ),
+                    }
+                    mappings.update(shared_experts_mappings)
 
         return mappings
 
@@ -598,12 +649,14 @@ class BailingMoEForCausalLM(nnx.Module):
         token_to_kv_pool: KVCache,
         logits_metadata: LogitsMetadata,
     ):
-        hidden_states, layers_kv_fused = self.model(forward_batch, token_to_kv_pool)
+        hidden_states, layers_kv_fused, layers_topk_ids = self.model(
+            forward_batch, token_to_kv_pool
+        )
         if not getattr(self.config, "tie_word_embeddings", False):
             output = self.logits_processor(hidden_states, self.lm_head, logits_metadata)
         else:
             output = self.logits_processor(hidden_states, self.model.embed_tokens, logits_metadata)
-        return output, layers_kv_fused, True
+        return output, layers_kv_fused, True, layers_topk_ids
 
 
 class BailingMoeForCausalLM(BailingMoEForCausalLM):

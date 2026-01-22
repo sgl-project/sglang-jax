@@ -28,6 +28,7 @@ from sgl_jax.srt.constrained.base_grammar_backend import (
 )
 from sgl_jax.srt.hf_transformers_utils import get_tokenizer
 from sgl_jax.srt.layers.logits_processor import LogitsProcessorOutput
+from sgl_jax.srt.managers.communication import CommunicationBackend
 from sgl_jax.srt.managers.io_struct import (
     AbortReq,
     ContinueGenerationReqInput,
@@ -45,6 +46,7 @@ from sgl_jax.srt.managers.schedule_batch import (
     FINISH_ABORT,
     Req,
     ScheduleBatch,
+    acc_global_bid,
     global_server_args_dict,
 )
 from sgl_jax.srt.managers.schedule_policy import (
@@ -127,7 +129,10 @@ class Scheduler(
     def __init__(
         self,
         server_args: ServerArgs,
-        port_args: PortArgs,
+        port_args: PortArgs = None,
+        communication_backend: CommunicationBackend = None,
+        mesh: jax.sharding.Mesh = None,
+        model_class: None = None,
     ):
         # set jit cache
         jit_cache_dir = os.getenv("JAX_COMPILATION_CACHE_DIR", None)
@@ -144,8 +149,9 @@ class Scheduler(
         self.server_args = server_args
         self.node_rank = server_args.node_rank
         self.nnodes = server_args.nnodes
-        self.pub_sub_addr = port_args.pub_sub_addr
-        self.pub_sub_sync_addr = port_args.pub_sub_sync_addr
+        if port_args is not None:
+            self.pub_sub_addr = port_args.pub_sub_addr
+            self.pub_sub_sync_addr = port_args.pub_sub_sync_addr
         self.tp_size = server_args.tp_size
         self.schedule_policy = server_args.schedule_policy
         self.skip_tokenizer_init = server_args.skip_tokenizer_init
@@ -153,6 +159,9 @@ class Scheduler(
         self.max_seq_len = server_args.max_seq_len
         self.page_size = server_args.page_size
         self.enable_overlap = not server_args.disable_overlap_schedule
+        if server_args.multimodal:
+            logger.info("Multimodal mode enabled, disabling overlap schedule")
+            self.enable_overlap = False
         self.spec_algorithm = SpeculativeAlgorithm.from_string(server_args.speculative_algorithm)
 
         # LoRA configurations
@@ -161,33 +170,40 @@ class Scheduler(
 
         # Init inter-process communication
         context = zmq.Context(2)
+        self._comm_backend = None
 
         if self.node_rank == 0:
-            self.recv_from_tokenizer = get_zmq_socket(
-                context, zmq.PULL, port_args.scheduler_input_ipc_name, False
-            )
-            self.send_to_tokenizer = get_zmq_socket(
-                context, zmq.PUSH, port_args.tokenizer_ipc_name, False
-            )
-
-            if server_args.skip_tokenizer_init:
-                # Directly send to the TokenizerManager
-                self.send_to_detokenizer = get_zmq_socket(
+            # todo: support multi host
+            if communication_backend is not None:
+                self._comm_backend = communication_backend
+            else:
+                self.recv_from_tokenizer = get_zmq_socket(
+                    context, zmq.PULL, port_args.scheduler_input_ipc_name, False
+                )
+                self.send_to_tokenizer = get_zmq_socket(
                     context, zmq.PUSH, port_args.tokenizer_ipc_name, False
                 )
-            else:
-                # Send to the DetokenizerManager
-                self.send_to_detokenizer = get_zmq_socket(
-                    context, zmq.PUSH, port_args.detokenizer_ipc_name, False
-                )
 
-            self.recv_from_rpc = get_zmq_socket(context, zmq.DEALER, port_args.rpc_ipc_name, False)
-            if self.nnodes > 1:
-                self.publisher = get_zmq_socket(context, zmq.PUB, self.pub_sub_addr, bind=True)
-                self.publisher_sync = get_zmq_socket(
-                    context, zmq.REP, self.pub_sub_sync_addr, bind=True
+                if server_args.skip_tokenizer_init:
+                    # Directly send to the TokenizerManager
+                    self.send_to_detokenizer = get_zmq_socket(
+                        context, zmq.PUSH, port_args.tokenizer_ipc_name, False
+                    )
+                else:
+                    # Send to the DetokenizerManager
+                    self.send_to_detokenizer = get_zmq_socket(
+                        context, zmq.PUSH, port_args.detokenizer_ipc_name, False
+                    )
+
+                self.recv_from_rpc = get_zmq_socket(
+                    context, zmq.DEALER, port_args.rpc_ipc_name, False
                 )
-                self.num_subscribers = self.nnodes - 1
+                if self.nnodes > 1:
+                    self.publisher = get_zmq_socket(context, zmq.PUB, self.pub_sub_addr, bind=True)
+                    self.publisher_sync = get_zmq_socket(
+                        context, zmq.REP, self.pub_sub_sync_addr, bind=True
+                    )
+                    self.num_subscribers = self.nnodes - 1
         else:
             self.recv_from_tokenizer = None
             self.recv_from_rpc = None
@@ -210,7 +226,7 @@ class Scheduler(
         # Init grammar backend for structured output
         self.grammar_backend = None
         self.grammar_queue: list[Req] = []  # Requests waiting for grammar compilation
-        if not server_args.skip_tokenizer_init:
+        if not server_args.skip_tokenizer_init and not server_args.multimodal:
             self.grammar_backend = create_grammar_backend(
                 server_args,
                 self.tokenizer,
@@ -231,11 +247,14 @@ class Scheduler(
         platform = os.getenv("JAX_PLATFORMS", None)
         if platform == "proxy":
             pathwaysutils.initialize()
-        self.mesh = create_device_mesh(
-            ici_parallelism=[-1, self.tp_size],
-            dcn_parallelism=[1, 1],
-            device_indexes=server_args.device_indexes,
-        )
+        if mesh is not None:
+            self.mesh = mesh
+        else:
+            self.mesh = create_device_mesh(
+                ici_parallelism=[-1, self.tp_size],
+                dcn_parallelism=[1, 1],
+                device_indexes=server_args.device_indexes,
+            )
 
         TpWorkerClass = ModelWorkerClient if self.enable_overlap else ModelWorker
 
@@ -432,6 +451,7 @@ class Scheduler(
                 tokenizer_mode=server_args.tokenizer_mode,
                 trust_remote_code=server_args.trust_remote_code,
                 revision=server_args.revision,
+                sub_dir="tokenizer" if server_args.multimodal else "",
             )
 
     def init_memory_pool_and_cache(self):
@@ -470,7 +490,11 @@ class Scheduler(
     def event_loop_normal(self):
         """A normal scheduler loop."""
         while True:
-            recv_reqs = self.recv_requests()
+            recv_reqs = (
+                self._comm_backend.recv_requests()
+                if self._comm_backend is not None
+                else self.recv_requests()
+            )
             self.process_input_requests(recv_reqs)
 
             # Skip batch processing when engine is paused
@@ -496,7 +520,11 @@ class Scheduler(
         self.result_queue = deque()
 
         while True:
-            recv_reqs = self.recv_requests()
+            recv_reqs = (
+                self._comm_backend.recv_requests()
+                if self._comm_backend is not None
+                else self.recv_requests()
+            )
             self.process_input_requests(recv_reqs)
 
             # Skip batch processing when engine is paused
@@ -635,6 +663,8 @@ class Scheduler(
             extra_key=recv_req.extra_key,
             eos_token_ids=self.model_config.hf_eos_token_id,
             vocab_size=self.model_config.vocab_size,
+            return_routed_experts=recv_req.return_routed_experts,
+            return_hidden_states=recv_req.return_hidden_states,
         )
         req.tokenizer = self.tokenizer
 
@@ -1191,6 +1221,8 @@ class Scheduler(
             )
         else:
             new_batch.decoding_reqs = None
+
+        new_batch.bid = acc_global_bid()
 
         return new_batch
 

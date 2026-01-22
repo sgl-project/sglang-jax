@@ -61,7 +61,7 @@ class QWenMLP(nnx.Module):
 
         self.act_func = jax.nn.silu
 
-    def __call__(self, hidden_states: jnp.ndarray):
+    def __call__(self, hidden_states: jax.Array):
         a1, _ = self.w1(hidden_states)
         a2, _ = self.w2(hidden_states)
         intermediate_parallel = a1 * jax.nn.silu(a2)
@@ -437,7 +437,7 @@ class QWenLMHeadModel(nnx.Module):
             output = self.logits_processor(hidden_states, self.lm_head, logits_metadata)
         else:
             output = self.logits_processor(hidden_states, self.model.embed_tokens, logits_metadata)
-        return output, layers_kv_fused, True
+        return output, layers_kv_fused, True, None
 
 
 EntryClass = QWenLMHeadModel

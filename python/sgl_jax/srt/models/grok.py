@@ -17,6 +17,7 @@ from sgl_jax.srt.layers.embeddings import (
     _yarn_find_correction_range,
     _yarn_get_mscale,
 )
+from sgl_jax.srt.layers.fused_moe import FusedEPMoE
 from sgl_jax.srt.layers.layernorm import RMSNorm, dual_rmsnorm_forward
 from sgl_jax.srt.layers.linear import LinearBase
 from sgl_jax.srt.layers.logits_processor import (
@@ -24,7 +25,7 @@ from sgl_jax.srt.layers.logits_processor import (
     LogitsProcessor,
     LogitsProcessorOutput,
 )
-from sgl_jax.srt.layers.moe import EPMoE
+from sgl_jax.srt.layers.moe import EPMoE, create_moe_weights_mapping
 from sgl_jax.srt.layers.radix_attention import RadixAttention
 from sgl_jax.srt.mem_cache.memory_pool import KVCache
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
@@ -206,6 +207,8 @@ class Grok1MoE(nnx.Module):
     kernel is used for the forward pass, with outputs reduced across ranks.
     """
 
+    experts: FusedEPMoE | EPMoE
+
     def __init__(
         self,
         config: PretrainedConfig,
@@ -237,20 +240,40 @@ class Grok1MoE(nnx.Module):
 
         self.router_logit_softcapping = getattr(config, "router_logit_softcapping", 30.0)
 
-        self.experts = EPMoE(
-            config=config,
-            num_experts=num_experts,
-            num_experts_per_tok=self.top_k,
-            intermediate_dim=intermediate_size,
-            mesh=mesh,
-            activation="gelu",
-            ep_size=config.ep_size,
-            weight_dtype=dtype,
-            dtype=dtype,
-            layer_id=layer_id,
-        )
+        # Select MoE backend based on config
+        self.moe_backend = getattr(config, "moe_backend", "epmoe")
+        self.use_fused = self.moe_backend == "fused"
 
-    def __call__(self, hidden_states: jax.Array) -> jax.Array:
+        if self.use_fused:
+            self.experts = FusedEPMoE(
+                hidden_size=hidden_size,
+                num_experts=num_experts,
+                num_experts_per_tok=self.top_k,
+                intermediate_dim=intermediate_size,
+                mesh=mesh,
+                activation="gelu",
+                ep_size=config.ep_size,
+                weight_dtype=dtype,
+                dtype=dtype,
+                layer_id=layer_id,
+                renormalize_topk_logits=False,  # Match sglang behavior
+            )
+        else:
+            self.experts = EPMoE(
+                hidden_size=config.hidden_size,
+                num_experts=num_experts,
+                num_experts_per_tok=self.top_k,
+                intermediate_dim=intermediate_size,
+                mesh=mesh,
+                activation="gelu",
+                ep_size=config.ep_size,
+                weight_dtype=dtype,
+                dtype=dtype,
+                layer_id=layer_id,
+                quantization_config=getattr(config, "quantization_config", None),
+            )
+
+    def __call__(self, hidden_states: jax.Array) -> tuple[jax.Array, jax.Array | None]:
         # Router computation with soft capping
         router_logits, _ = self.gate(hidden_states)
 
@@ -259,15 +282,21 @@ class Grok1MoE(nnx.Module):
             router_logits = router_logits / self.router_logit_softcapping
             router_logits = jax.nn.tanh(router_logits) * self.router_logit_softcapping
 
-        # Compute top-k routing weights using sglang-style approach:
-        # 1. Compute global softmax over ALL experts (not just top-k)
-        # 2. Select top-k experts based on logits
-        # 3. Extract corresponding weights (no renormalization)
-        top_k_weights, top_k_indices = self._custom_topk(
-            router_logits, self.top_k, renormalize=False
-        )
-
-        return self.experts(hidden_states, top_k_weights, top_k_indices)
+        if self.use_fused:
+            # Fused kernel: pass router_logits directly
+            # Top-K selection is handled internally by the kernel
+            assert isinstance(self.experts, FusedEPMoE)
+            return self.experts(hidden_states, router_logits), None
+        else:
+            # EPMoE: compute top-k routing weights using sglang-style approach:
+            # 1. Compute global softmax over ALL experts (not just top-k)
+            # 2. Select top-k experts based on logits
+            # 3. Extract corresponding weights (no renormalization)
+            assert isinstance(self.experts, EPMoE)
+            top_k_weights, top_k_indices = self._custom_topk(
+                router_logits, self.top_k, renormalize=False
+            )
+            return self.experts(hidden_states, top_k_weights, top_k_indices), top_k_indices
 
     def _custom_topk(
         self, router_logits: jax.Array, top_k: int, renormalize: bool = False
@@ -521,23 +550,27 @@ class Grok1DecoderLayer(nnx.Module):
         self.pre_attn_norm = RMSNorm(
             config.hidden_size,
             epsilon=config.rms_norm_eps,
+            dtype=jnp.bfloat16,
         )
         self.post_attn_norm = RMSNorm(
             config.hidden_size,
             epsilon=config.rms_norm_eps,
+            dtype=jnp.bfloat16,
         )
         self.pre_moe_norm = RMSNorm(
             config.hidden_size,
             epsilon=config.rms_norm_eps,
+            dtype=jnp.bfloat16,
         )
         self.post_moe_norm = RMSNorm(
             config.hidden_size,
             epsilon=config.rms_norm_eps,
+            dtype=jnp.bfloat16,
         )
 
         # Setup FFN function based on configuration (matching PyTorch logic)
         if self.num_experts > 0:
-            self.ffn: Callable[[jax.Array], jax.Array] | Grok1MoE
+            self.ffn: Callable[[jax.Array], tuple[jax.Array, jax.Array | None]] | Grok1MoE
             if self.residual_moe:
                 self.ffn = self.moe_with_rmoe
             else:
@@ -545,12 +578,12 @@ class Grok1DecoderLayer(nnx.Module):
         else:
             raise NotImplementedError()
 
-    def moe_with_rmoe(self, x: jax.Array) -> jax.Array:
+    def moe_with_rmoe(self, x: jax.Array) -> tuple[jax.Array, jax.Array | None]:
         """Combine MoE and residual MLP outputs (matches PyTorch implementation)."""
         mlp_result = self.mlp(x)
-        moe_result = self.block_sparse_moe(x)
+        moe_result, topk_ids = self.block_sparse_moe(x)
         # Scale factor from the paper: 1/sqrt(2)
-        return (mlp_result + moe_result) / 1.4142135623730951
+        return (mlp_result + moe_result) / 1.4142135623730951, topk_ids
 
     def __call__(
         self,
@@ -560,7 +593,7 @@ class Grok1DecoderLayer(nnx.Module):
         token_to_kv_pool: KVCache,
         residual: jax.Array | None = None,
         deferred_norm: RMSNorm | None = None,
-    ) -> tuple[jax.Array, jax.Array, RMSNorm, jax.Array]:
+    ) -> tuple[jax.Array, jax.Array, RMSNorm, jax.Array, jax.Array | None]:
 
         # Self Attention block (matching PyTorch logic exactly)
         if deferred_norm is not None:
@@ -600,12 +633,12 @@ class Grok1DecoderLayer(nnx.Module):
 
         # Feed-forward network
         if self.residual_moe:
-            hidden_states = self.moe_with_rmoe(hidden_states)
+            hidden_states, topk_ids = self.moe_with_rmoe(hidden_states)
         else:
-            hidden_states = self.block_sparse_moe(hidden_states)
+            hidden_states, topk_ids = self.block_sparse_moe(hidden_states)
 
         # Return with deferred post-MoE norm (matching PyTorch)
-        return hidden_states, residual, self.post_moe_norm, kv_fused
+        return hidden_states, residual, self.post_moe_norm, kv_fused, topk_ids
 
 
 class Grok1Model(nnx.Module):
@@ -654,7 +687,7 @@ class Grok1Model(nnx.Module):
         forward_batch: ForwardBatch,
         token_to_kv_pool: KVCache,
         input_embeds: jax.Array | None = None,
-    ) -> tuple[jax.Array, list[jax.Array]]:
+    ) -> tuple[jax.Array, list[jax.Array], list[jax.Array | None]]:
         # Get embeddings, hidden_states: [B, N, hidden_size]
         if input_embeds is None:
             hidden_states = self.embed_tokens(input_ids)
@@ -667,8 +700,9 @@ class Grok1Model(nnx.Module):
         # Process through transformer layers with deferred normalization
         residual, deferred_norm = None, None
         layers_kv_fused = []
+        layers_topk_ids = []
         for layer in self.layers:
-            hidden_states, residual, deferred_norm, kv_fused = layer(
+            hidden_states, residual, deferred_norm, kv_fused, topk_ids = layer(
                 positions,
                 hidden_states,
                 forward_batch,
@@ -677,6 +711,7 @@ class Grok1Model(nnx.Module):
                 deferred_norm,
             )
             layers_kv_fused.append(kv_fused)
+            layers_topk_ids.append(topk_ids)
         # Apply final normalization (matching PyTorch fused_dual_residual_rmsnorm)
         assert deferred_norm is not None
         assert residual is not None
@@ -690,7 +725,7 @@ class Grok1Model(nnx.Module):
             deferred_norm.epsilon,
         )
 
-        return hidden_states, layers_kv_fused
+        return hidden_states, layers_kv_fused, layers_topk_ids
 
 
 class Grok1ForCausalLM(nnx.Module):
@@ -779,16 +814,16 @@ class Grok1ForCausalLM(nnx.Module):
         forward_batch: ForwardBatch,
         token_to_kv_pool: KVCache,
         logits_metadata: LogitsMetadata,
-    ) -> tuple[LogitsProcessorOutput, list[jax.Array], bool]:
+    ) -> tuple[LogitsProcessorOutput, list[jax.Array], bool, list[jax.Array | None]]:
         """Forward pass through the model using unified forward_batch API."""
         input_ids = forward_batch.input_ids
         positions = forward_batch.positions
-        hidden_states, layers_kv_fused = self.model(
+        hidden_states, layers_kv_fused, layers_topk_ids = self.model(
             input_ids, positions, forward_batch, token_to_kv_pool, None
         )
         output = self.logits_processor(hidden_states, cast(Embed, self.lm_head), logits_metadata)
 
-        return output, layers_kv_fused, True
+        return output, layers_kv_fused, True, layers_topk_ids
 
     def load_weights(self, model_config: ModelConfig) -> None:
         loader = WeightLoader(
@@ -904,35 +939,22 @@ class Grok1ForCausalLM(nnx.Module):
             ),
         }
 
-        # CRITICAL: Correct MoE weight mapping
-        # w1 (gate_proj) -> wi_0, w3 (up_proj) -> wi_1, w2 (down_proj) -> wo
-        for name, target_name in [("w1", "wi_0"), ("w3", "wi_1"), ("w2", "wo")]:
-            target_path = [f"{target_prefix}.block_sparse_moe.experts.{target_name}"]
-            target_path.extend(
-                [
-                    f"{prefix}.block_sparse_moe.experts.{i}.{name}.weight"
-                    for i in range(self.config.num_local_experts)
-                ]
-            )
+        moe_backend = getattr(self.config, "moe_backend", "epmoe")
 
-            sharding = (
-                ("expert", "tensor", None) if target_name == "wo" else ("expert", None, "tensor")
-            )
+        # Concat axes for TP-split weights
+        grok_concat_axis_map = {"w1": 0, "w3": 0, "w2": -1}
 
-            if name == "w2":
-                # w2 (down_proj) -> wo: HF shape (8192, 2048), concat -> (8192, 16384), transpose -> (16384, 8192)
-                mappings[f"__MOE_EXPERTS__{prefix}.block_sparse_moe.experts.{target_name}"] = (
-                    WeightMapping(
-                        target_path=target_path, sharding=sharding, transpose=True, concat_axis=-1
-                    )
-                )
-            else:
-                # w1/w3 (gate/up) -> wi_0/wi_1: HF shape (2048, 8192), concat -> (16384, 8192), transpose -> (8192, 16384)
-                mappings[f"__MOE_EXPERTS__{prefix}.block_sparse_moe.experts.{target_name}"] = (
-                    WeightMapping(
-                        target_path=target_path, sharding=sharding, transpose=True, concat_axis=0
-                    )
-                )
+        moe_mappings = create_moe_weights_mapping(
+            prefix=prefix,
+            target_prefix=target_prefix,
+            num_experts=self.config.num_local_experts,
+            expert_type_names=("w1", "w3", "w2"),
+            moe_path="block_sparse_moe.experts",
+            source_expert_pattern="{i}",
+            moe_backend=moe_backend,
+            expert_concat_axis_map=grok_concat_axis_map,
+        )
+        mappings.update(moe_mappings)
 
         return mappings
 

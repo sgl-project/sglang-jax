@@ -128,12 +128,14 @@ class TokenizerManager:
         )
         self.crash_dump_folder = server_args.crash_dump_folder
         self.crash_dump_performed = False  # Flag to ensure dump is only called once
+        self.event_loop = None  # Store the event loop to use
 
         # Init inter-process communication
         context = zmq.asyncio.Context(2)
         self.recv_from_detokenizer = get_zmq_socket(
             context, zmq.PULL, port_args.tokenizer_ipc_name, True
         )
+
         self.send_to_scheduler = get_zmq_socket(
             context, zmq.PUSH, port_args.scheduler_input_ipc_name, True
         )
@@ -141,12 +143,17 @@ class TokenizerManager:
         # Read model args
         self.model_path = server_args.model_path
         self.served_model_name = server_args.served_model_name
-        self.model_config = ModelConfig.from_server_args(server_args)
-        self.is_generation = self.model_config.is_generation
-        self.context_len = self.model_config.context_len
-        self.image_token_id = self.model_config.image_token_id
+        if not server_args.multimodal:
+            self.model_config = ModelConfig.from_server_args(server_args)
+            self.is_generation = self.model_config.is_generation
+            self.context_len = self.model_config.context_len
+            self.image_token_id = self.model_config.image_token_id
+        else:
+            self.model_config = None
         self.is_pause = False
         self.is_pause_cond = asyncio.Condition()
+        self._updating = False
+        self._cond = asyncio.Condition()
 
         self.mm_processor = None
 
@@ -158,6 +165,7 @@ class TokenizerManager:
                 tokenizer_mode=server_args.tokenizer_mode,
                 trust_remote_code=server_args.trust_remote_code,
                 revision=server_args.revision,
+                sub_dir="tokenizer" if server_args.multimodal else "",
             )
 
         # Store states
@@ -362,6 +370,7 @@ class TokenizerManager:
             obj.stream,
             obj.lora_id,
             obj.extra_key,
+            obj.return_routed_experts,
         )
         # note: When only `return_logprob` is specified, we assume that only the output probability is required.
         if (
@@ -394,9 +403,7 @@ class TokenizerManager:
         tokenized_objs = []
         for i, req in enumerate(requests):
             # self._validate_token_len(obj[i], input_ids_list[i])
-            tokenized_objs.append(
-                self._create_tokenized_object(req, req.text, input_ids_list[i], None, None)
-            )
+            tokenized_objs.append(self._create_tokenized_object(req, req.text, input_ids_list[i]))
         logger.debug("Completed batch processing for %s requests", batch_size)
         return tokenized_objs
 
@@ -785,10 +792,19 @@ class TokenizerManager:
             return
 
         self.no_create_loop = True
-        loop = asyncio.get_event_loop()
-        self.asyncio_tasks.add(loop.create_task(print_exception_wrapper(self.handle_loop)))
+        # Use the provided event loop if available, otherwise get the current one
+        loop = self.event_loop if self.event_loop is not None else asyncio.get_event_loop()
 
-        self.event_loop = loop
+        try:
+            current_running_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            current_running_loop = None
+
+        if current_running_loop == loop:
+            task = loop.create_task(print_exception_wrapper(self.handle_loop))
+            self.asyncio_tasks.add(task)
+        else:
+            asyncio.run_coroutine_threadsafe(print_exception_wrapper(self.handle_loop), loop)
 
         # We cannot add signal handler when the tokenizer manager is not in
         # the main thread due to the CPython limitation.
@@ -943,6 +959,9 @@ class TokenizerManager:
 
             if getattr(recv_obj, "output_hidden_states", None):
                 meta_info["hidden_states"] = recv_obj.output_hidden_states[i]
+
+            if getattr(recv_obj, "output_routed_experts", None):
+                meta_info["routed_experts"] = recv_obj.output_routed_experts[i]
 
             if getattr(recv_obj, "cache_miss_count", None) is not None:
                 if (

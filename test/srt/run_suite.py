@@ -390,6 +390,7 @@ suites = {
     "unit-test-tpu-v6e-1": [
         TestFile("python/sgl_jax/test/test_flashattention.py", 20),
         TestFile("python/sgl_jax/test/test_moe_topk.py", 1),
+        TestFile("python/sgl_jax/test/kernels/fused_moe_v1_test.py", 10),
         TestFile("python/sgl_jax/test/test_sampler.py", 0.2),
         TestFile("python/sgl_jax/test/test_utils.py", 0.2),
         TestFile("python/sgl_jax/test/test_kernel_utils.py", 0.1),
@@ -398,6 +399,8 @@ suites = {
         TestFile("python/sgl_jax/test/mem_cache/test_swa_radix_cache.py", 0.2),
         TestFile("python/sgl_jax/test/speculative/test_eagle_tree_build.py", 1),
         TestFile("python/sgl_jax/test/speculative/test_eagle_utils.py", 1),
+        TestFile("python/sgl_jax/test/multimodal/test_wan_vae_precision.py", 1),
+        TestFile("python/sgl_jax/test/multimodal/test_vae_scheduler.py", 2),
         TestFile("test/srt/lora/test_bgmv_backend.py", 5),
         TestFile("test/srt/lora/test_align_lora_accuracy.py", 10),
     ],
@@ -455,6 +458,8 @@ suites = {
         TestFile("test/srt/test_engine_flush_cache.py", 3),
         TestFile("test/srt/test_engine_pause_continue.py", 3),
         TestFile("test/srt/test_server_pause_continue.py", 6),
+        TestFile("test/srt/rl/test_return_routed_experts.py", 5),
+        TestFile("test/srt/multimodal/test_wan2_1_models.py", 30),
     ],
 }
 

@@ -3,12 +3,15 @@
 import itertools
 import logging
 import os
+import signal
 import threading
 import time
+from queue import Queue
 
 import jax
 import jax.numpy as jnp
 import numpy as np
+import psutil
 from flax import nnx
 from jax.experimental.multihost_utils import broadcast_one_to_all
 from tqdm import tqdm
@@ -16,6 +19,7 @@ from tqdm import tqdm
 from sgl_jax.srt.configs.model_config import ModelConfig
 from sgl_jax.srt.constrained.bitmask_ops import allocate_token_bitmask
 from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessorOutput
+from sgl_jax.srt.layers.routed_experts_capturer import get_global_experts_capturer
 from sgl_jax.srt.managers.schedule_batch import (
     ModelWorkerBatch,
     global_server_args_dict,
@@ -34,6 +38,7 @@ from sgl_jax.srt.utils.common_utils import (
     PRECOMPILE_DEFAULT_BS_PADDINGS,
     PRECOMPILE_DEFAULT_TOKEN_PADDINGS,
 )
+from sgl_jax.utils import get_exception_traceback
 
 logger = logging.getLogger(__name__)
 
@@ -92,6 +97,9 @@ class ModelWorker:
         else:
             self.random_seed = server_args.random_seed
 
+        self.max_prefill_tokens = server_args.max_prefill_tokens
+        self.chunked_prefill_size = server_args.chunked_prefill_size
+
         # init model runner
         self.model_runner = ModelRunner(
             model_config=self.model_config,
@@ -102,6 +110,7 @@ class ModelWorker:
             is_draft_worker=is_draft_worker,
             req_to_token_pool=req_to_token_pool,
             rngs=nnx.Rngs(self.random_seed),
+            max_padding=max(self.max_prefill_tokens, self.chunked_prefill_size),
         )
 
         # set infer devices
@@ -109,8 +118,6 @@ class ModelWorker:
 
         # Profile number of tokens
         self.max_total_num_tokens = self.model_runner.max_total_num_tokens
-        self.max_prefill_tokens = server_args.max_prefill_tokens
-        self.chunked_prefill_size = server_args.chunked_prefill_size
 
         # Calculate max_running_requests from different constraints
         attn_backend_limit = self.model_runner.attn_backend.get_max_running_reqests(
@@ -175,7 +182,9 @@ class ModelWorker:
         )
         self.precompile_bs_paddings = []
         for bs in bs_padding_list:
-            if bs <= self.max_padded_batch_size:
+            if bs <= self.max_padded_batch_size and (
+                server_args.moe_backend != "fused" or bs >= self.tp_size * 2
+            ):
                 self.precompile_bs_paddings.append(bs)
         self.precompile_bs_paddings.sort()
         if (
@@ -190,6 +199,27 @@ class ModelWorker:
             (item * self.max_req_len + self.page_size - 1) // self.page_size * self.page_size
             for item in self.precompile_bs_paddings
         ]
+
+        self.parent_process = psutil.Process().parent()
+        self.sync_queue = Queue()
+        self.sync_expert_ids_d2h_thread = threading.Thread(
+            target=self._sync_expert_ids_d2h_thread_func,
+            daemon=True,
+        )
+        self.sync_expert_ids_d2h_thread.start()
+
+    def _sync_expert_ids_d2h_thread_func(self):
+        try:
+            self._sync_experts_ids_d2h()
+        except Exception:
+            traceback = get_exception_traceback()
+            logger.error("ModelWorker sync thread hit an exception: %s", traceback)
+            self.parent_process.send_signal(signal.SIGQUIT)
+
+    def _sync_experts_ids_d2h(self):
+        while True:
+            layers_topk_ids, model_worker_batch = self.sync_queue.get()
+            get_global_experts_capturer().on_forward_end(layers_topk_ids, model_worker_batch)
 
     def normalize_token_paddings(self):
         normalized_token_paddings = []
@@ -387,7 +417,9 @@ class ModelWorker:
             top_logprobs_nums=None,
             token_ids_logprobs=None,
             extend_logprob_start_lens=None,
-            capture_hidden_mode=CaptureHiddenMode.NULL,
+            capture_hidden_mode=(
+                CaptureHiddenMode.FULL if self.server_args.multimodal else CaptureHiddenMode.NULL
+            ),
             spec_algorithm=speculative_algotithm,
             lora_ids=lora_ids,  # Already set to [None] * bs above
         )
@@ -489,12 +521,22 @@ class ModelWorker:
             )
 
         self.model_runner.attn_backend.forward_metadata = forward_metadata
-        logits_output, cache_miss_count = self.model_runner.forward(
+        logits_output, cache_miss_count, layers_topk_ids = self.model_runner.forward(
             forward_batch,
             logits_metadata=LogitsMetadata.from_model_worker_batch(model_worker_batch, self.mesh),
         )
+
+        self.dump_topk_ids(layers_topk_ids, model_worker_batch)
+
         if launch_done is not None:
             launch_done.set()
+
+        self.sync_queue.put(
+            (
+                layers_topk_ids,
+                model_worker_batch,
+            )
+        )
 
         # SAVE last layer logits
         save_logits_file_info = os.getenv("DUMP_LAST_LAYER_LOGITS_FILENAMES", None)
@@ -558,6 +600,48 @@ class ModelWorker:
             next_token_ids_device,
             cache_miss_count,
         )
+
+    def dump_topk_ids(self, layers_topk_ids: list[jax.Array], model_worker_batch: ModelWorkerBatch):
+        enable = self.server_args.enable_return_routed_experts
+        dump_topk_ids_file_info = os.getenv("DUMP_TOPK_IDS_FILEINFO", None)
+        if not enable or dump_topk_ids_file_info is None:
+            return
+
+        # format: {prefill_file_name},{decode_file_name}
+        file_slice = dump_topk_ids_file_info.split(",")
+        if model_worker_batch.forward_mode.is_extend():
+            file_name = file_slice[0]
+        elif model_worker_batch.forward_mode.is_decode():
+            file_name = file_slice[1]
+        else:
+            raise ValueError(
+                f"Unsupported {model_worker_batch.forward_mode} to save topk_ids with txt"
+            )
+        import datetime
+
+        unpadded_input_len = model_worker_batch.get_original_input_len()
+        layers_topk_ids_cpu = jax.device_get(layers_topk_ids)
+
+        file_name = (
+            f"{datetime.datetime.now().strftime('%Y-%m-%d_%H_%M_%S')}_{unpadded_input_len}"
+            + file_name
+        )
+
+        valid_topk_ids = []
+        for ids_cpu in layers_topk_ids_cpu:
+            valid_ids = ids_cpu[
+                :unpadded_input_len, : self.model_config.hf_text_config.num_experts_per_tok
+            ]
+            valid_topk_ids.append(valid_ids)
+
+        # Stack to create (num_layers, seq_len, num_experts_per_tok)
+        valid_topk_ids_stacked = np.stack(valid_topk_ids, axis=0)
+
+        # Transpose to (seq_len, num_layers, num_experts_per_tok)
+        seq_layer_topk_cpu = np.transpose(valid_topk_ids_stacked, (1, 0, 2))
+
+        # os.makedirs(os.path.dirname(file_name), exist_ok=True)
+        np.savetxt(file_name, np.asarray(seq_layer_topk_cpu).flatten(), fmt="%d")
 
 
 class MockModelWorker:

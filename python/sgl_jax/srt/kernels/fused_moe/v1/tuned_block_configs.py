@@ -1,0 +1,174 @@
+"""Auto-tuned block configs for fused_moe.
+
+This module mirrors the approach used by
+`sgl_jax.srt.kernels.ragged_paged_attention.tuned_block_sizes`:
+
+- The "tuning" is expected to be done offline via benchmarking.
+- The results are stored as a maintained lookup table keyed by a simplified
+  (bucketed) shape signature and device kind.
+- Runtime uses the table when available, otherwise falls back to a fixed
+  baseline config (and callers may apply override/validation logic).
+"""
+
+# ruff: noqa: E501
+
+from __future__ import annotations
+
+import jax.numpy as jnp
+
+from sgl_jax.srt.utils.jax_utils import get_device_name
+
+from .kernel import FusedMoEBlockConfig
+
+# Key (without device_name):
+#   - dtype name
+#   - num_tokens
+#   - num_experts
+#   - top_k
+#   - hidden_size
+#   - intermediate_size
+#   - ep_size
+#   - use_shared_expert
+#   - use_grouped_topk
+#
+# Value (current):
+#   - (bt, bf, bd1, bd2, bts, btc, bfc, bd1c, bd2c, bse)
+# fmt: off
+TUNED_BLOCK_CONFIGS: dict[str, dict[tuple, tuple[int, ...]]] = {
+    # Populate per-device kind, e.g. "TPU v6e", "TPU v7".
+    "TPU v7": {
+        ('bfloat16', 64, 256, 8, 8192, 2048, 32, False, False): (2, 2048, 2048, 2048, 2, 2, 2048, 2048, 2048, 2048),
+        ('bfloat16', 128, 256, 8, 8192, 2048, 32, False, False): (4, 2048, 2048, 2048, 4, 4, 2048, 2048, 2048, 2048),
+        ('bfloat16', 256, 256, 8, 8192, 2048, 32, False, False): (8, 2048, 2048, 2048, 8, 8, 2048, 2048, 2048, 2048),
+        ('bfloat16', 512, 256, 8, 8192, 2048, 32, False, False): (16, 2048, 2048, 2048, 16, 16, 2048, 2048, 2048, 2048),
+        ('bfloat16', 1024, 256, 8, 8192, 2048, 32, False, False): (32, 512, 8192, 8192, 32, 32, 512, 8192, 8192, 512),
+        ('bfloat16', 2048, 256, 8, 8192, 2048, 32, False, False): (64, 1024, 2048, 2048, 64, 64, 1024, 2048, 2048, 1024),
+        ('bfloat16', 4096, 256, 8, 8192, 2048, 32, False, False): (128, 1024, 1024, 1024, 128, 128, 1024, 1024, 1024, 1024),
+
+        ('bfloat16', 64, 256, 8, 8192, 2048, 32, True, False): (2, 2048, 2048, 2048, 2, 2, 2048, 2048, 2048, 256),
+        ('bfloat16', 128, 256, 8, 8192, 2048, 32, True, False): (4, 2048, 2048, 2048, 4, 4, 2048, 2048, 2048, 256),
+        ('bfloat16', 256, 256, 8, 8192, 2048, 32, True, False): (8, 2048, 2048, 2048, 8, 8, 2048, 2048, 2048, 256),
+        ('bfloat16', 512, 256, 8, 8192, 2048, 32, True, False): (16, 2048, 1024, 1024, 16, 16, 2048, 1024, 1024, 2048),
+        ('bfloat16', 1024, 256, 8, 8192, 2048, 32, True, False): (32, 2048, 1024, 1024, 32, 32, 2048, 1024, 1024, 1024),
+        ('bfloat16', 2048, 256, 8, 8192, 2048, 32, True, False): (64, 1024, 2048, 2048, 64, 64, 1024, 2048, 2048, 512),
+        ('bfloat16', 4096, 256, 8, 8192, 2048, 32, True, False): (128, 1024, 1024, 1024, 128, 128, 1024, 1024, 1024, 512),
+
+        ('bfloat16', 64, 256, 8, 8192, 2048, 32, True, True): (2, 2048, 2048, 2048, 2, 2, 2048, 2048, 2048, 256),
+        ('bfloat16', 128, 256, 8, 8192, 2048, 32, True, True): (4, 2048, 2048, 2048, 4, 4, 2048, 2048, 2048, 256),
+        ('bfloat16', 256, 256, 8, 8192, 2048, 32, True, True): (8, 2048, 2048, 2048, 8, 8, 2048, 2048, 2048, 256),
+        ('bfloat16', 512, 256, 8, 8192, 2048, 32, True, True): (16, 2048, 1024, 1024, 16, 16, 2048, 1024, 1024, 2048),
+        ('bfloat16', 1024, 256, 8, 8192, 2048, 32, True, True): (32, 2048, 1024, 1024, 32, 32, 2048, 1024, 1024, 1024),
+        ('bfloat16', 2048, 256, 8, 8192, 2048, 32, True, True): (64, 1024, 2048, 2048, 64, 64, 1024, 2048, 2048, 512),
+        ('bfloat16', 4096, 256, 8, 8192, 2048, 32, True, True): (128, 1024, 1024, 1024, 128, 128, 1024, 1024, 1024, 512),
+    },
+    # Fallback for any device kind.
+    "*": {},
+}
+# fmt: on
+
+DEFAULT_FUSED_MOE_BLOCK_CONFIG = FusedMoEBlockConfig(
+    bt=32,
+    bf=512,
+    bd1=1024,
+    bd2=1024,
+    btc=32,
+    bfc=512,
+    bd1c=1024,
+    bd2c=1024,
+    bse=512,
+)
+
+
+def get_simplified_key(
+    *,
+    dtype: jnp.dtype,
+    num_tokens: int,
+    num_experts: int,
+    top_k: int,
+    hidden_size: int,
+    intermediate_size: int,
+    ep_size: int,
+    use_shared_expert: bool,
+    use_grouped_topk: bool,
+) -> tuple:
+    """Get a simplified key to reduce the number of tuned combinations."""
+    if ep_size <= 0:
+        raise ValueError(f"Expected {ep_size=} to be > 0.")
+    if num_tokens % ep_size != 0:
+        raise ValueError(f"Expected {num_tokens=} to be aligned to {ep_size=}.")
+
+    device = get_device_name()
+    dtype_name = jnp.dtype(dtype).name
+    return (
+        device,
+        dtype_name,
+        num_tokens,
+        num_experts,
+        top_k,
+        hidden_size,
+        intermediate_size,
+        ep_size,
+        bool(use_shared_expert),
+        bool(use_grouped_topk),
+    )
+
+
+def get_tuned_fused_moe_block_config(
+    *,
+    num_tokens: int,
+    num_experts: int,
+    top_k: int,
+    hidden_size: int,
+    intermediate_size: int,
+    dtype: jnp.dtype,
+    ep_size: int,
+    use_shared_expert: bool,
+    use_grouped_topk: bool,
+):
+    """Look up the best block config from the tuned table.
+
+    Raises:
+      KeyError: if not found and allow_fallback=False.
+    """
+
+    keys = get_simplified_key(
+        dtype=dtype,
+        num_tokens=num_tokens,
+        num_experts=num_experts,
+        top_k=top_k,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        ep_size=ep_size,
+        use_shared_expert=use_shared_expert,
+        use_grouped_topk=use_grouped_topk,
+    )
+    device_name = keys[0]
+    table_key = keys[1:]
+
+    cfg_tuple = None
+    if device_name in TUNED_BLOCK_CONFIGS:
+        cfg_tuple = TUNED_BLOCK_CONFIGS[device_name].get(table_key)
+    if cfg_tuple is None:
+        cfg_tuple = TUNED_BLOCK_CONFIGS.get("*", {}).get(table_key)
+
+    if cfg_tuple is None:
+        return DEFAULT_FUSED_MOE_BLOCK_CONFIG
+
+    if len(cfg_tuple) != 10:
+        raise ValueError(f"Unexpected tuned config tuple length: {len(cfg_tuple)}")
+
+    bt, bf, bd1, bd2, bts, btc, bfc, bd1c, bd2c, bse = cfg_tuple
+
+    cfg = FusedMoEBlockConfig(
+        bt=bt,
+        bf=bf,
+        bd1=bd1,
+        bd2=bd2,
+        btc=btc,
+        bfc=bfc,
+        bd1c=bd1c,
+        bd2c=bd2c,
+        bse=bse,
+        bts=bts,
+    )
+    return cfg

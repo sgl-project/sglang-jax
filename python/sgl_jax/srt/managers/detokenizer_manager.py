@@ -8,6 +8,7 @@ import threading
 from collections import OrderedDict
 
 import psutil
+import pybase64
 import setproctitle
 import zmq
 
@@ -70,6 +71,7 @@ class DetokenizerManager:
                 tokenizer_mode=server_args.tokenizer_mode,
                 trust_remote_code=server_args.trust_remote_code,
                 revision=server_args.revision,
+                sub_dir="tokenizer" if server_args.multimodal else "",
             )
 
         self.decode_status = LimitedCapacityDict(capacity=DETOKENIZER_MAX_STATES)
@@ -107,9 +109,18 @@ class DetokenizerManager:
             return output[:-1]
         return output
 
-    # def handle_batch_embedding_out(self, recv_obj: BatchEmbeddingOut):
-    #     # If it is embedding model, no detokenization is needed.
-    #     return recv_obj
+    def _extract_routed_experts(self, recv_obj: BatchTokenIDOut) -> list[str | None]:
+        output_routed_experts = None
+        if recv_obj.output_routed_experts is not None:
+            output_routed_experts = [
+                (
+                    pybase64.b64encode(output_routed_experts.tobytes()).decode("utf-8")
+                    if output_routed_experts is not None
+                    else None
+                )
+                for output_routed_experts in recv_obj.output_routed_experts
+            ]
+        return output_routed_experts
 
     def handle_batch_token_id_out(self, recv_obj: BatchTokenIDOut):
         bs = len(recv_obj.rids)
@@ -256,6 +267,8 @@ class DetokenizerManager:
             output_strs.append(incremental_output)
             output_ids_list.append(processed_new_token_ids)
 
+        output_routed_experts = self._extract_routed_experts(recv_obj)
+
         return BatchStrOut(
             rids=recv_obj.rids,
             finished_reasons=recv_obj.finished_reasons,
@@ -278,6 +291,7 @@ class DetokenizerManager:
             output_token_ids_logprobs_idx=recv_obj.output_token_ids_logprobs_idx,
             output_hidden_states=recv_obj.output_hidden_states,
             cache_miss_count=recv_obj.cache_miss_count,
+            output_routed_experts=output_routed_experts,
         )
 
 

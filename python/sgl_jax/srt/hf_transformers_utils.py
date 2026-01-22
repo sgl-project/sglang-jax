@@ -28,11 +28,16 @@ for name, cls in _CONFIG_REGISTRY.items():
         AutoConfig.register(name, cls)
 
 
-def download_from_hf(model_path: str):
+_UNSET = object()
+
+
+def download_from_hf(model_path: str, allow_patterns: list[str] | None = _UNSET):
     if os.path.exists(model_path):
         return model_path
 
-    return snapshot_download(model_path, allow_patterns=["*.json", "*.bin", "*.model"])
+    if allow_patterns is _UNSET:
+        allow_patterns = ["*.json", "*.bin", "*.model", "*.py", "*.tiktoken"]
+    return snapshot_download(model_path, allow_patterns=allow_patterns)
 
 
 def get_hf_text_config(config: PretrainedConfig):
@@ -168,6 +173,7 @@ def get_tokenizer(
     tokenizer_mode: str = "auto",
     trust_remote_code: bool = False,
     tokenizer_revision: str | None = None,
+    sub_dir: str = "",
     **kwargs,
 ) -> PreTrainedTokenizer | PreTrainedTokenizerFast | TiktokenTokenizer:
     """Gets a tokenizer for the given model name via Huggingface."""
@@ -192,7 +198,9 @@ def get_tokenizer(
             f"Remote URLs are not supported in JAX implementation. "
             f"Please use a local path or HuggingFace model name instead: {tokenizer_name}"
         )
-
+    tokenizer_name = download_from_hf(tokenizer_name)
+    if sub_dir:
+        tokenizer_name += "/" + sub_dir
     try:
         tokenizer = AutoTokenizer.from_pretrained(
             tokenizer_name,

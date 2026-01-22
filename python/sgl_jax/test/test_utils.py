@@ -44,6 +44,8 @@ DEEPSEEK_R1_DISTILL_QWEN_1_5B = "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"
 QWEN3_32B = "google/gemma-2-2b-it"
 QWEN3_32B_EAGLE3 = "AngelSlim/Qwen3-32B_eagle3"
 
+WAN2_1_T2V_1_3B = "Wan-AI/Wan2.1-T2V-1.3B-Diffusers"
+WAN2_1_T2V_14B = "Wan-AI/Wan2.1-T2V-14B-Diffusers"
 
 DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH = 600
 
@@ -165,6 +167,7 @@ def popen_launch_server(
     return_stdout_stderr: tuple | None = None,
     device: str = "tpu",
     check_cache_miss: bool = True,
+    multimodal: bool = False,
 ):
     """Launch a server process with automatic device detection.
 
@@ -235,7 +238,7 @@ def popen_launch_server(
                     "Authorization": f"Bearer {api_key}",
                 }
                 response = session.get(
-                    f"{base_url}/health_generate",
+                    f"{base_url}/health_generate?multimodal={multimodal}",
                     headers=headers,
                 )
                 if response.status_code == 200:
@@ -417,6 +420,7 @@ def get_benchmark_args(
     lora_name=None,
     backend="sgl-jax",
     warmup_requests=1,
+    return_routed_experts=False,
 ):
     return SimpleNamespace(
         backend=backend,
@@ -450,6 +454,7 @@ def get_benchmark_args(
         device=device,
         pd_separated=pd_separated,
         warmup_requests=warmup_requests,
+        return_routed_experts=return_routed_experts,
     )
 
 

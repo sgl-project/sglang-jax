@@ -27,7 +27,7 @@ from jax import lax
 from jax import numpy as jnp
 
 
-def int32_bsearch(batch_shape: Sequence[int], predicate: Callable[[jnp.ndarray], jnp.ndarray]):
+def int32_bsearch(batch_shape: Sequence[int], predicate: Callable[[jax.Array], jax.Array]):
     """Batched binary search over int32 values.
 
     For each element of the batch, search for the largest int32 (closest to
@@ -160,7 +160,7 @@ def float32_bsearch(batch_shape, predicate):
     return _monotonic_int32_to_float32(result)
 
 
-def topk_mask(x: jnp.ndarray, k: jax.Array, replace_val: float) -> jnp.ndarray:
+def topk_mask(x: jax.Array, k: jax.Array, replace_val: float) -> jax.Array:
     """Sets everything to replace_val, except the top k values per batch element.
 
     Sharding considerations: this function does 32 reductions over the vocab_size
@@ -223,7 +223,7 @@ def topk_mask(x: jnp.ndarray, k: jax.Array, replace_val: float) -> jnp.ndarray:
     return jnp.where(x >= cutoff, x, jnp.full_like(x, replace_val))
 
 
-def topp_mask(logits: jnp.ndarray, p: jax.Array, replace_val: float) -> jnp.ndarray:
+def topp_mask(logits: jax.Array, p: jax.Array, replace_val: float) -> jax.Array:
     """Applies top-p masking to logits.
 
     Masks logits down to the smallest set of choices, such that the total

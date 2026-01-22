@@ -15,6 +15,10 @@ from jax.sharding import PartitionSpec as P
 from sgl_jax.srt.configs.load_config import LoadConfig
 from sgl_jax.srt.configs.model_config import AttentionArch, MockModelConfig, ModelConfig
 from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessorOutput
+from sgl_jax.srt.layers.routed_experts_capturer import (
+    RoutedExpertsCapturer,
+    set_global_experts_capturer,
+)
 from sgl_jax.srt.layers.sampler import Sampler, compute_logprobs
 from sgl_jax.srt.lora.context_manager import LoraBatchContext
 from sgl_jax.srt.managers.schedule_batch import (
@@ -32,6 +36,7 @@ from sgl_jax.srt.mem_cache.memory_pool import (
     ReqToTokenPool,
     SWAKVPool,
 )
+from sgl_jax.srt.model_executor.base_model_runner import BaseModelRunner
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
 from sgl_jax.srt.model_loader.loader import get_model_loader
 from sgl_jax.srt.precision_tracer import precision_tracer
@@ -40,25 +45,15 @@ from sgl_jax.srt.server_args import ServerArgs
 from sgl_jax.srt.speculative.spec_info import SpeculativeAlgorithm
 from sgl_jax.srt.utils.common_utils import get_bool_env_var
 from sgl_jax.srt.utils.jax_utils import get_available_device_memory
-from sgl_jax.srt.utils.quantization.quantization_utils import apply_qwix_quantization
+from sgl_jax.srt.utils.quantization.quantization_utils import (
+    apply_moe_quantization,
+    apply_qwix_quantization,
+)
 
 logger = logging.getLogger(__name__)
 
 
-class RankZeroFilter(logging.Filter):
-    """Filter that only allows INFO level logs from rank 0, but allows all other levels from any rank."""
-
-    def __init__(self, is_rank_zero):
-        super().__init__()
-        self.is_rank_zero = is_rank_zero
-
-    def filter(self, record):
-        if record.levelno == logging.INFO:
-            return self.is_rank_zero
-        return True
-
-
-class ModelRunner:
+class ModelRunner(BaseModelRunner):
     """ModelRunner runs the forward passes of the models."""
 
     def __init__(
@@ -72,6 +67,7 @@ class ModelRunner:
         req_to_token_pool: ReqToTokenPool | None = None,
         token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator | None = None,
         rngs: nnx.Rngs = None,
+        max_padding: int = 1,
     ):
         # Parse args
         self.is_draft_worker = is_draft_worker
@@ -99,6 +95,8 @@ class ModelRunner:
 
         # For sampling
         self.use_sort_for_toppk_minp = server_args.use_sort_for_toppk_minp
+
+        self.max_padding = max_padding
 
         # Global vars
         global_server_args_dict.update(
@@ -158,6 +156,19 @@ class ModelRunner:
             server_args.max_running_requests,
             server_args.max_total_tokens,
             total_device_memory,
+        )
+
+        # Init routed experts capturer
+        self.init_routed_experts_capturer()
+
+    def init_routed_experts_capturer(self):
+        set_global_experts_capturer(
+            RoutedExpertsCapturer.create(
+                enable=self.server_args.enable_return_routed_experts,
+                model_config=self.model_config,
+                num_tokens=self.max_total_num_tokens + self.page_size,
+                max_padding=self.max_padding,
+            )
         )
 
     def initialize_jit(self):
@@ -253,13 +264,27 @@ class ModelRunner:
         self.model_config.configure_for_tensor_parallel(self.tp_size)
         self.model_config.log_kv_heads_info(self.tp_size)
         self.model_config.hf_config.ep_size = self.ep_size
+        self.model_config.hf_config.moe_backend = self.model_config.moe_backend.value
 
         self.model = self.model_loader.load_model(
             model_config=self.model_config,
         )
+        if self.is_draft_worker:
+            # if draft model and target model share same safetensor files, we should hack here to avoid create redundant layer kv cache
+            self.model_config.num_hidden_layers = getattr(
+                self.model_config, "num_nextn_predict_layers", self.model_config.num_hidden_layers
+            )
 
-        if self.model_config.quantization_config_path is not None:
-            self.model = apply_qwix_quantization(self.model_config, self.model, self)
+        # Apply quantization if quantization config is set
+        if self.model_config.quantization_config is not None:
+            # Apply MoE quantization first (before QWIX, so scales are set when QWIX runs model)
+            if self.model_config.quantization_config.has_moe_quantization():
+                self.model = apply_moe_quantization(self.model_config, self.model)
+
+            # Apply qwix quantization for dense layers
+            qwix_rules = self.model_config.quantization_config.get_qwix_rules()
+            if qwix_rules:
+                self.model = apply_qwix_quantization(self.model_config, self.model, self)
 
         # Parse other args
         self.sliding_window_size = self.model_config.sliding_window
@@ -497,11 +522,14 @@ class ModelRunner:
         import jax._src.test_util as jtu
 
         with jtu.count_pjit_cpp_cache_miss() as count:
-            output, layers_kv_fused, _ = self.jitted_run_model(forward_batch, logits_metadata)
+            output, layers_kv_fused, _, layers_topk_ids = self.jitted_run_model(
+                forward_batch, logits_metadata
+            )
             cache_miss_count = count()
         self._set_kv_cache_after_forward(layers_kv_fused)
 
-        return output, cache_miss_count
+        # layers_topk_ids required real_bs and original_input_len which could not be stored in ForwardBatch
+        return output, cache_miss_count, layers_topk_ids
 
     def _set_kv_cache_after_forward(self, layers_kv_fused):
         # Note: For tp_size == 1, we need to put the layers_kv_fused on the device with the target_sharding

@@ -5,8 +5,10 @@ import threading
 from typing import TYPE_CHECKING
 
 import jax
+import numpy as np
 
 from sgl_jax.srt.layers.logits_processor import LogitsProcessorOutput
+from sgl_jax.srt.layers.routed_experts_capturer import get_global_experts_capturer
 from sgl_jax.srt.managers.io_struct import AbortReq, BatchTokenIDOut
 from sgl_jax.srt.managers.schedule_batch import BaseFinishReason, Req, ScheduleBatch
 from sgl_jax.srt.precision_tracer import precision_tracer
@@ -29,6 +31,19 @@ class SchedulerOutputProcessorMixin:
     This class implements the output processing logic for Scheduler.
     We put them into a separate file to make the `scheduler.py` shorter.
     """
+
+    def maybe_collect_routed_experts(self: Scheduler, req: Req):
+        """Collect routed experts for a finished request."""
+        if not req.return_routed_experts:
+            return
+        # [layer_nums, seq_len, topk]
+        tmp = get_global_experts_capturer().get_routed_experts(
+            req_pool_idx=req.req_pool_idx,
+            seqlen=req.seqlen,
+            req_to_token_pool=self.req_to_token_pool,
+            bid=req.latest_bid,
+        )
+        req.routed_experts = np.transpose(tmp, (1, 0, 2))
 
     def process_batch_result_prefill(
         self: Scheduler,
@@ -71,11 +86,14 @@ class SchedulerOutputProcessorMixin:
                     logits_output.input_token_logprobs = tuple(
                         jax.device_get(logits_output.input_token_logprobs).astype(float)
                     )
+        hidden_state_offset = 0
         # Check finish conditions
         logprob_pt = 0
         for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
             if req.is_retracted:
                 continue
+
+            req.latest_bid = batch.bid
 
             if self.is_mixed_chunk and self.enable_overlap and req.finished():
                 j = len(batch.out_cache_loc) - len(batch.reqs) + i
@@ -88,6 +106,7 @@ class SchedulerOutputProcessorMixin:
                 req.check_finished()
 
                 if req.finished():
+                    self.maybe_collect_routed_experts(req)
                     if precision_tracer.get_trace_active():
                         precision_tracer.set_request_status_to_completed(req.rid)
                         precision_tracer.add_completed_requests_count()
@@ -127,7 +146,17 @@ class SchedulerOutputProcessorMixin:
                         logits_output,
                     )
                     logprob_pt += num_input_logprobs
-
+                if req.return_hidden_states and logits_output.hidden_states is not None:
+                    req.hidden_states.append(
+                        jax.device_get(
+                            logits_output.hidden_states[
+                                hidden_state_offset : (
+                                    hidden_state_offset := hidden_state_offset
+                                    + len(req.origin_input_ids)
+                                )
+                            ]
+                        ).astype(float)
+                    )
                 # Update grammar state after token sampling
                 if req.grammar is not None:
                     try:
@@ -250,6 +279,8 @@ class SchedulerOutputProcessorMixin:
             if req.is_retracted:
                 continue
 
+            req.latest_bid = batch.bid
+
             indices_to_free = None
             if self.enable_overlap and req.finished():
                 if self.page_size == 1:
@@ -270,6 +301,7 @@ class SchedulerOutputProcessorMixin:
 
             req.check_finished(new_accepted_len)
             if req.finished():
+                self.maybe_collect_routed_experts(req)
                 if batch.spec_algorithm is not None and batch.spec_algorithm.is_eagle():
                     cur_allocate_len = batch.spec_info.allocate_lens[i]
                     all_token_len = len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0)
@@ -553,7 +585,9 @@ class SchedulerOutputProcessorMixin:
         spec_verify_ct = []
         spec_accepted_tokens = []
         output_hidden_states = None
+        output_routed_experts = None
 
+        output_hidden_states_for_mm = None
         if return_logprob:
             input_token_logprobs_val = []
             input_token_logprobs_idx = []
@@ -691,7 +725,15 @@ class SchedulerOutputProcessorMixin:
                         output_top_logprobs_idx.append([])
                         output_token_ids_logprobs_val.append([])
                         output_token_ids_logprobs_idx.append([])
+                if req.return_hidden_states:
+                    if output_hidden_states_for_mm is None:
+                        output_hidden_states_for_mm = []
+                    output_hidden_states_for_mm.append(req.hidden_states)
 
+                # if req.return_routed_experts:
+                if output_routed_experts is None:
+                    output_routed_experts = []
+                output_routed_experts.append(req.routed_experts)
         # Send to detokenizer
         if rids:
             out = BatchTokenIDOut(
@@ -720,6 +762,11 @@ class SchedulerOutputProcessorMixin:
                 output_token_ids_logprobs_val,
                 output_token_ids_logprobs_idx,
                 output_hidden_states,
+                output_hidden_states_for_mm,
                 cache_miss_count,
+                output_routed_experts,
             )
-            self.send_to_detokenizer.send_pyobj(out)
+            if self._comm_backend is not None:
+                self._comm_backend.send_pyobj(out)
+            else:
+                self.send_to_detokenizer.send_pyobj(out)

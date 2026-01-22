@@ -79,7 +79,7 @@ class LlamaMLP(nnx.Module):
 
         self.act_fn = jax.nn.silu
 
-    def __call__(self, hidden_states: jnp.ndarray):
+    def __call__(self, hidden_states: jax.Array):
         a1, _ = self.gate_proj(hidden_states)
         a2, _ = self.up_proj(hidden_states)
         intermediate_parallel = a2 * self.act_fn(a1)
@@ -597,7 +597,7 @@ class LlamaForCausalLM(nnx.Module):
                 hidden_states, self.lm_head, logits_metadata, aux_hidden_states=aux_hidden_states
             )
 
-        return output, layers_kv_fused, layers_callback_flag
+        return output, layers_kv_fused, layers_callback_flag, None
 
 
 class Phi3ForCausalLM(LlamaForCausalLM):

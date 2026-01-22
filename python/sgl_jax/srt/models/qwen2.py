@@ -61,7 +61,7 @@ class Qwen2MLP(nnx.Module):
 
         self.act_fn = jax.nn.silu
 
-    def __call__(self, hidden_states: jnp.ndarray):
+    def __call__(self, hidden_states: jax.Array):
         a1, _ = self.gate_proj(hidden_states)
         a2, _ = self.up_proj(hidden_states)
         intermediate_parallel = a2 * self.act_fn(a1)
@@ -456,6 +456,31 @@ class Qwen2ForCausalLM(nnx.Module):
 
         return mappings
 
+    def get_embed_and_head(self):
+        return (
+            self.model.embed_tokens.embedding.value,
+            self.lm_head.embedding.value,
+        )
+
+    def set_embed_and_head(
+        self,
+        embed_weight: jax.Array | None = None,
+        head_weight: jax.Array | None = None,
+    ) -> None:
+        """Set word embedding and LM Head weights.
+        Args:
+            embed_weight: Embedding matrix with shape [vocab_size, hidden_size].
+            head_weight:  LM Head matrix with shape [vocab_size, hidden_size].
+        """
+
+        # Set embedding weight
+        if embed_weight is not None:
+            self.model.embed_tokens.embedding.value = embed_weight
+
+        # Set LM Head weight
+        if head_weight is not None:
+            self.lm_head.embedding.value = head_weight
+
     def __call__(
         self,
         forward_batch: ForwardBatch,
@@ -469,7 +494,7 @@ class Qwen2ForCausalLM(nnx.Module):
             output = self.logits_processor(hidden_states, self.lm_head, logits_metadata)
         else:
             output = self.logits_processor(hidden_states, self.model.embed_tokens, logits_metadata)
-        return output, layers_kv_fused, layers_callback_flag
+        return output, layers_kv_fused, layers_callback_flag, None
 
 
 EntryClass = Qwen2ForCausalLM

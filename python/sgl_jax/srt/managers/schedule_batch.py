@@ -167,6 +167,7 @@ class Req:
         eos_token_ids: set[int] | None = None,
         vocab_size: int | None = None,
         return_hidden_states: bool = False,
+        return_routed_experts: bool = False,
     ):
         # Input and output info
         self.rid = rid
@@ -328,6 +329,12 @@ class Req:
         self.grammar_key: tuple[str, str] | None = None  # Cache key for grammar
         self.grammar_wait_ct = 0  # Counter for grammar compilation wait time
 
+        # capture routed experts
+        self.return_routed_experts = return_routed_experts
+        self.routed_experts: np.ndarray | None = None  # shape (seqlen, topk)
+        # latest_bid is used to improve return_routed_expert performance
+        self.latest_bid: int = None
+
     @property
     def seqlen(self):
         return len(self.origin_input_ids) + len(self.output_ids)
@@ -480,6 +487,8 @@ class Req:
         self.is_chunked = 0
         self.req_pool_idx = None
         self.already_computed = 0
+        self.routed_experts = None
+        self.latest_bid = None
 
     def set_finish_with_abort(self, error_msg: str):
         # set it to one token to skip the long prefill
@@ -500,12 +509,24 @@ class Req:
 bid = 0
 
 
+def get_global_bid():
+    global bid
+    return bid
+
+
+def acc_global_bid():
+    global bid
+    bid += 1
+    return bid
+
+
 @dataclasses.dataclass
 class ScheduleBatch:
     """Store all information of a batch on the scheduler."""
 
     # Request, memory pool, and cache
     reqs: list[Req]
+    bid: int = None
     req_to_token_pool: ReqToTokenPool = None
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator = None
     tree_cache: BasePrefixCache = None
@@ -579,6 +600,9 @@ class ScheduleBatch:
     # Events
     launch_done: threading.Event | None = None
 
+    # Whether to return captured experts
+    return_routed_experts: bool = False
+
     @classmethod
     def init_new(
         cls,
@@ -615,9 +639,11 @@ class ScheduleBatch:
             has_stream=any(req.stream for req in reqs),
             has_grammar=any(req.grammar for req in reqs),
             chunked_req=chunked_req,
+            return_hidden_states=any(req.return_hidden_states for req in reqs),
             mesh=mesh,
             spec_algorithm=spec_algorithm,
             is_prefill_only=all(req.sampling_params.max_new_tokens == 0 for req in reqs),
+            return_routed_experts=any(req.return_routed_experts for req in reqs),
         )
 
     def batch_size(self):
@@ -1128,8 +1154,7 @@ class ScheduleBatch:
             cache_loc_paddings = cache_loc_paddings[-1:]
             extend_logprob_start_lens = self.extend_logprob_start_lens
 
-        global bid
-        bid += 1
+        bid = acc_global_bid()
 
         if self.input_ids is None:
             input_ids_cpu = np.empty(0, dtype=np.int32)
@@ -1383,7 +1408,9 @@ class ScheduleBatch:
                 else ["0"] * bs_paddings[select_bs_index]
             ),
             real_bs=real_bs,
-            capture_hidden_mode=CaptureHiddenMode.NULL,
+            capture_hidden_mode=(
+                CaptureHiddenMode.FULL if self.return_hidden_states else CaptureHiddenMode.NULL
+            ),
             launch_done=self.launch_done,
         )
 
@@ -1402,8 +1429,7 @@ class ScheduleBatch:
             extend_prefix_lens = np.array(self.prefix_lens, dtype=np.int32)
             extend_logprob_start_lens = self.extend_logprob_start_lens
 
-        global bid
-        bid += 1
+        acc_global_bid()
 
         if self.input_ids is None:
             input_ids_cpu = np.empty(0, dtype=np.int32)
@@ -1601,6 +1627,7 @@ class ScheduleBatch:
             return_output_logprob_only=self.return_output_logprob_only,
             decoding_reqs=self.decoding_reqs,
             is_prefill_only=self.is_prefill_only,
+            bid=self.bid,
         )
 
     def _evict_tree_cache_if_needed(
@@ -1729,6 +1756,17 @@ class ModelWorkerBatch:
     capture_hidden_mode: CaptureHiddenMode = None
 
     tree_cache: BasePrefixCache = None
+
+    def get_original_input_len(self):
+        """
+        return unpadded tokens number for prefill and real batch size for decode
+        """
+        if self.forward_mode.is_decode():
+            return self.real_bs
+        elif self.forward_mode.is_extend():
+            return self.real_input_ids_len
+        else:
+            raise ValueError(f"{self.forward_mode} is not support to get original token or bs num")
 
 
 def get_last_loc(

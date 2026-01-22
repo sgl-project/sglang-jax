@@ -10,7 +10,11 @@ import tempfile
 import jax
 
 from sgl_jax.srt.function_call.function_call_parser import FunctionCallParser
-from sgl_jax.srt.hf_transformers_utils import check_gguf_file, get_config
+from sgl_jax.srt.hf_transformers_utils import (
+    check_gguf_file,
+    download_from_hf,
+    get_config,
+)
 from sgl_jax.srt.reasoning_parser import ReasoningParser
 from sgl_jax.srt.utils.common_utils import (
     LORA_TARGET_ALL_MODULES,
@@ -125,6 +129,7 @@ class ServerArgs:
 
     # Kernel backend
     attention_backend: str | None = "fa"
+    moe_backend: str = "epmoe"
 
     grammar_backend: str | None = None
 
@@ -163,6 +168,14 @@ class ServerArgs:
     lora_eviction_policy: str = "lru"
     enable_static_lora: bool | None = None
     lora_scaling: float | None = None
+
+    # For engine
+    enable_engine_loop_run_forever_daemon: bool | None = None
+
+    # Multimodal
+    multimodal: bool = False
+
+    enable_return_routed_experts: bool = False
 
     def __post_init__(self):
         # Set missing default values
@@ -220,6 +233,11 @@ class ServerArgs:
             )
             self.chunked_prefill_size = -1
 
+        # Disable radix cache for multimodal mode (e.g., UMT5 Encoder without KV cache)
+        if self.multimodal and not self.disable_radix_cache:
+            logger.info("Multimodal mode enabled, disabling radix cache")
+            self.disable_radix_cache = True
+
         if self.grammar_backend is None:
             self.grammar_backend = "llguidance"
 
@@ -234,6 +252,8 @@ class ServerArgs:
         if self.nnodes > 1 and self.device_indexes is not None:
             logger.warning("In a multi-machine scenario, device_indexes will be set to None.")
             self.device_indexes = None
+        if self.multimodal:
+            self.model_path = download_from_hf(self.model_path, allow_patterns=None)
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
@@ -432,8 +452,10 @@ class ServerArgs:
         parser.add_argument(
             "--quantization-config-path",
             type=str,
-            default=None,
-            help="The config path for how to apply quantization to loaded model.",
+            default=ServerArgs.quantization_config_path,
+            help="Path to quantization config YAML file. Can be an absolute path, "
+            "relative path, or just a filename (will look up in built-in configs). "
+            "Built-in configs: int8.yaml, fp8.yaml, fp8_w8a8.yaml",
         )
         parser.add_argument(
             "--kv-cache-dtype",
@@ -816,6 +838,13 @@ class ServerArgs:
             default=ServerArgs.attention_backend,
             help="Choose the kernels for attention layers.",
         )
+        parser.add_argument(
+            "--moe-backend",
+            type=str,
+            choices=["epmoe", "fused", "auto"],
+            default=ServerArgs.moe_backend,
+            help="The backend to use for MoE models.",
+        )
 
         parser.add_argument(
             "--enable-nan-detection",
@@ -897,6 +926,12 @@ class ServerArgs:
             help="Use jnp.sort to deal with top_k, top_p and min_p, which improves the grades for math-500 but increase precompile time a lot",
         )
 
+        parser.add_argument(
+            "--multimodal",
+            action="store_true",
+            help="Enable multimodal HTTP server.",
+        )
+
         # LoRA
         parser.add_argument(
             "--enable-lora",
@@ -957,11 +992,26 @@ class ServerArgs:
             default=ServerArgs.lora_scaling,
             help="Lora scaling is required for static LoRA, scaling = alpha/rank",
         )
+        parser.add_argument(
+            "--enable-engine-loop-run-forever-daemon",
+            action="store_true",
+            help="Run engine loop forever when engine.async_generate is called in other threads, this is used in Tunix",
+        )
+        parser.add_argument(
+            "--enable-return-routed-experts",
+            action="store_true",
+            help="Enable returning routed experts of each layer with responses.",
+        )
 
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace):
         args.tp_size = args.tensor_parallel_size
         args.dp_size = args.data_parallel_size
+        if cls is ServerArgs and getattr(args, "multimodal", False):
+            from sgl_jax.srt.multimodal.common.ServerArgs import MultimodalServerArgs
+
+            return MultimodalServerArgs.from_cli_args(args)
+
         attrs = [attr.name for attr in dataclasses.fields(cls)]
         return cls(**{attr: getattr(args, attr) for attr in attrs})
 
@@ -980,6 +1030,9 @@ class ServerArgs:
 
         parser = argparse.ArgumentParser()
         cls.add_cli_args(parser)
+        from sgl_jax.srt.multimodal.common.ServerArgs import MultimodalServerArgs
+
+        MultimodalServerArgs.add_cli_args(parser)
         return cls.from_cli_args(parser.parse_args(argv or sys.argv[1:]))
 
     def url(self):

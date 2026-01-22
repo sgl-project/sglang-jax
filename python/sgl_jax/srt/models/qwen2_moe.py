@@ -11,7 +11,7 @@ from sgl_jax.srt.layers.embeddings import Embed, ParallelLMHead, RotaryEmbedding
 from sgl_jax.srt.layers.layernorm import RMSNorm
 from sgl_jax.srt.layers.linear import LinearBase
 from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
-from sgl_jax.srt.layers.moe import EPMoE, GateLogit, TopK
+from sgl_jax.srt.layers.moe import EPMoE, GateLogit, TopK, create_moe_weights_mapping
 from sgl_jax.srt.layers.radix_attention import RadixAttention
 from sgl_jax.srt.mem_cache.memory_pool import KVCache
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
@@ -65,7 +65,7 @@ class Qwen2MoeMLP(nnx.Module):
 
         self.act_fn = jax.nn.silu
 
-    def __call__(self, hidden_states: jnp.ndarray):
+    def __call__(self, hidden_states: jax.Array):
         a1, _ = self.gate_proj(hidden_states)
         a2, _ = self.up_proj(hidden_states)
         intermediate_parallel = a2 * self.act_fn(a1)
@@ -216,10 +216,43 @@ class Qwen2MoeDecoderLayer(nnx.Module):
             num_experts=num_experts,
             weight_dtype=dtype,
         )
-        self.topk = TopK(
-            topk=num_experts_per_tok,
-            renormalize=getattr(config, "norm_topk_prob", True),
-        )
+
+        self.moe_backend = getattr(config, "moe_backend", "epmoe")
+        self.use_fused = self.moe_backend == "fused"
+
+        if self.use_fused:
+            from sgl_jax.srt.layers.fused_moe import FusedEPMoE
+
+            self.mlp = FusedEPMoE(
+                hidden_size=config.hidden_size,
+                num_experts=num_experts,
+                num_experts_per_tok=num_experts_per_tok,
+                intermediate_dim=moe_intermediate_size,
+                mesh=mesh,
+                ep_size=config.ep_size,
+                weight_dtype=dtype,
+                dtype=dtype,
+                layer_id=layer_id,
+                renormalize_topk_logits=getattr(config, "norm_topk_prob", True),
+            )
+        else:
+            self.topk = TopK(
+                topk=num_experts_per_tok,
+                renormalize=getattr(config, "norm_topk_prob", True),
+            )
+            self.mlp = EPMoE(
+                hidden_size=config.hidden_size,
+                num_experts=num_experts,
+                num_experts_per_tok=num_experts_per_tok,
+                intermediate_dim=moe_intermediate_size,
+                mesh=mesh,
+                ep_size=config.ep_size,
+                weight_dtype=dtype,
+                dtype=dtype,
+                layer_id=layer_id,
+                quantization_config=getattr(config, "quantization_config", None),
+            )
+
         # Optional shared expert path
         shared_sz = getattr(config, "shared_expert_intermediate_size", 0)
         if shared_sz and shared_sz > 0:
@@ -242,18 +275,6 @@ class Qwen2MoeDecoderLayer(nnx.Module):
         else:
             self.shared_experts = None
             self.shared_expert_gate = None
-
-        self.mlp = EPMoE(
-            config=config,
-            num_experts=num_experts,
-            num_experts_per_tok=num_experts_per_tok,
-            intermediate_dim=moe_intermediate_size,
-            mesh=mesh,
-            ep_size=config.ep_size,
-            weight_dtype=dtype,
-            dtype=dtype,
-            layer_id=layer_id,
-        )
 
         self.input_layernorm = RMSNorm(
             config.hidden_size,
@@ -304,11 +325,16 @@ class Qwen2MoeDecoderLayer(nnx.Module):
             shared_output = None
 
         router_logits = self.moe_gate(hidden_states)
-        topk_weights, topk_ids = self.topk(router_logits)
-        mlp_output = self.mlp(hidden_states, topk_weights, topk_ids)
+        if self.use_fused:
+            mlp_output = self.mlp(hidden_states, router_logits)
+            topk_ids = None
+        else:
+            topk_weights, topk_ids = self.topk(router_logits)
+            mlp_output = self.mlp(hidden_states, topk_weights, topk_ids)
+
         hidden_states = mlp_output if shared_output is None else (mlp_output + shared_output)
 
-        return hidden_states, residual, kv_fused
+        return hidden_states, residual, kv_fused, topk_ids
 
 
 class Qwen2MoeModel(nnx.Module):
@@ -359,9 +385,10 @@ class Qwen2MoeModel(nnx.Module):
         residual = None
         hidden_states = self.embed_tokens(forward_batch.input_ids)
         layers_kv_fused = []
+        layers_topk_ids = []
 
         for layer in self.layers:
-            hidden_states, residual, kv_fused = layer(
+            hidden_states, residual, kv_fused, topk_ids = layer(
                 forward_batch.positions,
                 hidden_states,
                 forward_batch,
@@ -369,12 +396,13 @@ class Qwen2MoeModel(nnx.Module):
                 residual,
             )
             layers_kv_fused.append(kv_fused)
+            layers_topk_ids.append(topk_ids)
 
         if residual is not None:
             hidden_states += residual
         hidden_states = self.norm(hidden_states)
 
-        return hidden_states, layers_kv_fused
+        return hidden_states, layers_kv_fused, layers_topk_ids
 
 
 class Qwen2MoeForCausalLM(nnx.Module):
@@ -553,26 +581,17 @@ class Qwen2MoeForCausalLM(nnx.Module):
             mappings.update(shared_expert_mappings)
 
         num_experts = getattr(self.config, "num_experts", 8)
-        for expert_type in ["gate_proj", "up_proj", "down_proj"]:
-            target_name = {
-                "gate_proj": "wi_0",
-                "up_proj": "wi_1",
-                "down_proj": "wo",
-            }[expert_type]
-            expert_keys = [
-                f"{prefix}.mlp.experts.{i}.{expert_type}.weight" for i in range(num_experts)
-            ]
+        moe_backend = getattr(self.config, "moe_backend", "epmoe")
 
-            if expert_type == "down_proj":
-                sharding = ("expert", "tensor", None)
-            else:
-                sharding = ("expert", None, "tensor")
-
-            mappings[f"__MOE_EXPERTS__{prefix}.mlp.{target_name}"] = WeightMapping(
-                target_path=[f"{target_prefix}.mlp.{target_name}"] + expert_keys,
-                sharding=sharding,
-                transpose=True,
-            )
+        moe_mappings = create_moe_weights_mapping(
+            prefix=prefix,
+            target_prefix=target_prefix,
+            num_experts=num_experts,
+            moe_backend=moe_backend,
+            moe_path="mlp",
+            source_expert_pattern="experts.{i}",
+        )
+        mappings.update(moe_mappings)
 
         return mappings
 
@@ -582,12 +601,14 @@ class Qwen2MoeForCausalLM(nnx.Module):
         token_to_kv_pool: KVCache,
         logits_metadata: LogitsMetadata,
     ):
-        hidden_states, layers_kv_fused = self.model(forward_batch, token_to_kv_pool)
+        hidden_states, layers_kv_fused, layers_topk_ids = self.model(
+            forward_batch, token_to_kv_pool
+        )
         if not getattr(self.config, "tie_word_embeddings", True):
             output = self.logits_processor(hidden_states, self.lm_head, logits_metadata)
         else:
             output = self.logits_processor(hidden_states, self.model.embed_tokens, logits_metadata)
-        return output, layers_kv_fused, True
+        return output, layers_kv_fused, True, layers_topk_ids
 
 
 EntryClass = Qwen2MoeForCausalLM

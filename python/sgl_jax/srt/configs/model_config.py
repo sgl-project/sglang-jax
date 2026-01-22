@@ -6,7 +6,9 @@ from enum import Enum, IntEnum, auto
 import jax.numpy as jnp
 from transformers import PretrainedConfig
 
+from sgl_jax.srt.configs.quantization_config import QuantizationConfig
 from sgl_jax.srt.hf_transformers_utils import (
+    download_from_hf,
     get_config,
     get_context_length,
     get_generation_config,
@@ -29,6 +31,14 @@ class ModelImpl(str, Enum):
     TRANSFORMERS = "transformers"
 
 
+class MoEBackend(str, Enum):
+    """Backend for Mixture of Experts computation."""
+
+    EPMOE = "epmoe"  # Native Expert Parallel MoE (default)
+    FUSED = "fused"  # Fused Kernel (TPU-optimized)
+    AUTO = "auto"  # Automatically select based on ep_size
+
+
 class ModelConfig:
     def __init__(
         self,
@@ -45,6 +55,8 @@ class ModelConfig:
         quantization: str | None = None,
         quantization_config_path: str | None = None,
         model_layer_nums: int | None = None,
+        multimodal: bool = False,
+        moe_backend: str | MoEBackend = MoEBackend.AUTO,
     ) -> None:
 
         self.model_path = model_path
@@ -52,26 +64,42 @@ class ModelConfig:
         self.model_impl = model_impl
         self.quantization = quantization
         self.quantization_config_path = quantization_config_path
+        # Create unified quantization config from path
+        self.quantization_config = QuantizationConfig.from_path(quantization_config_path)
         # if ep_size > 1, use ep moe, else use fused moe
         # TODO: support ep moe with ETP
         self.ep_size = 1
+
+        # Process MoE backend selection
+        self.moe_backend = MoEBackend(moe_backend) if isinstance(moe_backend, str) else moe_backend
+
+        # Auto-select backend based on ep_size
+        if self.moe_backend == MoEBackend.AUTO:
+            # If ep_size > 1, use EPMoE (expert parallelism across devices)
+            # Otherwise use Fused kernel (single-device TPU optimization)
+            self.moe_backend = MoEBackend.EPMOE if self.ep_size > 1 else MoEBackend.FUSED
         # Parse args
         self.maybe_pull_model_tokenizer_from_remote()
         self.model_override_args = json.loads(model_override_args)
         kwargs = {}
         if override_config_file and override_config_file.strip():
             kwargs["_configuration_file"] = override_config_file.strip()
-
+        if multimodal:
+            self.model_path = download_from_hf(self.model_path, allow_patterns=None)
+        config_path = self.model_path + "/text_encoder" if multimodal else self.model_path
         self.hf_config = get_config(
-            self.model_path,
+            config_path,
             trust_remote_code=trust_remote_code,
             revision=revision,
             model_override_args=self.model_override_args,
             **kwargs,
         )
 
+        # Attach quantization config to hf_config so models can access it
+        self.hf_config.quantization_config = self.quantization_config
+
         self.hf_generation_config = get_generation_config(
-            self.model_path,
+            config_path,
             trust_remote_code=trust_remote_code,
             revision=revision,
             **kwargs,
@@ -87,7 +115,7 @@ class ModelConfig:
             self.hf_config.architectures[0] = "LlamaForCausalLMEagle3"
 
         if is_draft_model and self.hf_config.architectures[0] == "MiMoForCausalLM":
-            self.hf_config.architectures[0] = "MiMoMTP"
+            self.hf_config.architectures[0] = "MiMoMTPForCausalLM"
         # Check model type
         self.is_generation = is_generation_model(self.hf_config.architectures, is_embedding)
         self.is_multimodal = False
@@ -179,6 +207,8 @@ class ModelConfig:
             quantization_config_path=server_args.quantization_config_path,
             model_impl=server_args.model_impl,
             model_layer_nums=server_args.model_layer_nums,
+            multimodal=server_args.multimodal,
+            moe_backend=server_args.moe_backend,
             **kwargs,
         )
 
@@ -526,6 +556,50 @@ multimodal_model_archs = [
     "Phi4MMForCausalLM",
     "VILAForConditionalGeneration",
 ]
+
+
+# Models that require attention_mask for padding token handling
+# These are typically Encoder-only or Embedding models
+ENCODER_ONLY_MODELS = [
+    # UMT5 Encoder variants
+    "UMT5EncoderModel",
+    "T5EncoderModel",
+    # BERT family
+    "BertModel",
+    "BertForSequenceClassification",
+    "XLMRobertaModel",
+    "XLMRobertaForSequenceClassification",
+    # CLIP components
+    "CLIPTextModel",
+    "CLIPVisionModel",
+    # Other Encoders
+    "Contriever",
+    # Embedding models
+    "LlamaEmbeddingModel",
+    "MistralModel",
+    "LlamaForSequenceClassification",
+    "LlamaForSequenceClassificationWithNormal_Weights",
+    "InternLM2ForRewardModel",
+    "Qwen2ForRewardModel",
+    "Qwen2ForSequenceClassification",
+]
+
+
+def need_attention_mask(model_architectures: list[str], is_embedding: bool = False) -> bool:
+    """
+    Determine if a model needs attention_mask for handling padding tokens.
+
+    Args:
+        model_architectures: List of model architecture names from HF config
+        is_embedding: Whether --is-embedding flag is set
+
+    Returns:
+        True if the model needs attention_mask (Encoder-only or Embedding models)
+    """
+    if is_embedding:
+        return True
+
+    return any(arch in ENCODER_ONLY_MODELS for arch in model_architectures)
 
 
 class MockModelConfig(ModelConfig):
