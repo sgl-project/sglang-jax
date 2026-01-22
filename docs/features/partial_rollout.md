@@ -1,9 +1,9 @@
 # SGLang-Jax Interruptible Sampling
-      
+
 ## 1. Motivation
-The motivation for supporting pause generation and continue generation is to support interruptible sampling in RL framework, especially for google/Tunix. 	
+The motivation for supporting pause generation and continue generation is to support interruptible sampling in RL framework, especially for google/Tunix.
 Design
-Generally, the request flow for sglang-jax engine is: http request → tokenizer manager → scheduler. The http request contains requests of PauseGenerationReqInput or ContinueGenerationReqInput. Then, tokenizer manager will send the request to the scheduler through ZMQ. In the scheduler, the event loop will process the input request and invoke the handler based on the type of input request. 
+Generally, the request flow for sglang-jax engine is: http request → tokenizer manager → scheduler. The http request contains requests of PauseGenerationReqInput or ContinueGenerationReqInput. Then, tokenizer manager will send the request to the scheduler through ZMQ. In the scheduler, the event loop will process the input request and invoke the handler based on the type of input request.
 According to endpoints required in docs, SGLangJax needs to provide four APIs. They are /abort_request, /flush_cache, /pause_generation and /continue_generation. Besides APIs in http_server, we will add corresponding functions for class.Engine. Currently Tunix uses Engine.generate to get outputs.
 
 ## 2. Detailed Design
@@ -110,7 +110,7 @@ The `Engine.pause_generation()` method wraps the `TokenizerManager.pause_generat
 
 1. **Overlap Mode**: When `enable_overlap=True` and a `last_batch` exists, the scheduler finishes processing the in-flight batch result before pausing to avoid leaving computations in an inconsistent state.
 
-2. **`in_place` mode**: 
+2. **`in_place` mode**:
    - Pauses the scheduler without touching the KV cache
    - Requests stay in `running_batch` with their computed KV cache intact
    - Ideal for short pauses where you want to resume quickly
@@ -190,8 +190,8 @@ class PauseGenerationReqInput(BaseReq):
 
 
 `abort` Abort and return all requests currently being processed.
-`in_place` Pause the scheduler's event loop; requests stay in place with their KV cache preserved. 
-`retract` Pause the scheduler and retract all running requests back to the waiting queue. 
+`in_place` Pause the scheduler's event loop; requests stay in place with their KV cache preserved.
+`retract` Pause the scheduler and retract all running requests back to the waiting queue.
 
 ---
 
