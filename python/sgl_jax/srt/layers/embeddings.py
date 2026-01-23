@@ -262,6 +262,190 @@ class RotaryEmbedding:
         return cache
 
 
+def apply_interleaved_rope(x: jax.Array, mrope_section: list[int]) -> jax.Array:
+    """Apply interleaved MRoPE to 3D rotary embeddings in JAX.
+    Reorganizes frequency layout from chunked [TTT...HHH...WWW] to
+    interleaved [THTHWHTHW...TT].
+    Args:
+        x: Input tensor of shape [3, num_tokens, dim].
+           x[0] is Time freqs, x[1] is Height freqs, x[2] is Width freqs.
+        mrope_section: [t, h, w] section lengths.
+           e.g. [16, 24, 24] -> total 64.
+    Returns:
+        A single tensor of shape [num_tokens, dim] with interleaved frequencies.
+    """
+    # x shape: [3, num_tokens, dim]
+    # mrope_section example: [16, 24, 24] (sum=64)
+
+    # Initialize with Time frequencies (x[0])
+    # We will overwrite specific indices with Height and Width frequencies
+    x_t = x[0]  # [num_tokens, dim]
+
+    # Height indices: start at 1, end at h*3, step 3
+    # Corresponds to x[..., 1::3] in the target layout
+    # We take values from x[1] (Height) at the same slice
+    h_slice = slice(1, mrope_section[1] * 3, 3)
+    x_t = x_t.at[..., h_slice].set(x[1, ..., h_slice])
+
+    # Width indices: start at 2, end at w*3, step 3
+    # Corresponds to x[..., 2::3] in the target layout
+    # We take values from x[2] (Width) at the same slice
+    w_slice = slice(2, mrope_section[2] * 3, 3)
+    x_t = x_t.at[..., w_slice].set(x[2, ..., w_slice])
+
+    return x_t
+
+
+class MRotaryEmbedding(RotaryEmbedding):
+    """Rotary Embedding with Multimodal Sections for JAX."""
+
+    def __init__(
+        self,
+        head_size: int,
+        rotary_dim: int,
+        max_position_embeddings: int,
+        base: int,
+        is_neox_style: bool,
+        dtype: jnp.dtype,
+        mrope_section: list[int] | None = None,
+        mrope_interleaved: bool = False,
+    ) -> None:
+        super().__init__(head_size, rotary_dim, max_position_embeddings, base, is_neox_style, dtype)
+        self.mrope_section = mrope_section
+        self.mrope_interleaved = mrope_interleaved
+
+        # Validation and Auto-correction Logic adapted from PyTorch implementation
+        if self.mrope_section:
+            expected_sum = rotary_dim // 2
+            actual_sum = sum(self.mrope_section)
+            if actual_sum != expected_sum:
+                print(
+                    f"MRoPE section sum mismatch: expected {expected_sum}, got {actual_sum}. "
+                    f"Adjusting mrope_section to match rotary_dim // 2 = {expected_sum}"
+                )
+                # Auto-correct by scaling the mrope_section proportionally
+                if actual_sum > 0:
+                    scale_factor = expected_sum / actual_sum
+                    self.mrope_section = [
+                        max(1, int(section * scale_factor)) for section in self.mrope_section
+                    ]
+                    # Ensure the sum exactly matches by adjusting the last element
+                    current_sum = sum(self.mrope_section)
+                    if current_sum != expected_sum:
+                        self.mrope_section[-1] += expected_sum - current_sum
+                else:
+                    # Fallback for zero sum
+                    self.mrope_section = [expected_sum // len(self.mrope_section)] * len(
+                        self.mrope_section
+                    )
+                    # Handle remainder
+                    remainder = expected_sum % len(self.mrope_section)
+                    for i in range(remainder):
+                        self.mrope_section[i] += 1
+
+            # Pre-calculate split indices for jnp.split
+            # mrope_section is like [16, 24, 24], split indices should be [16, 40]
+            self.split_indices = np.cumsum(self.mrope_section)[:-1].tolist()
+
+    def __call__(
+        self,
+        positions: jax.Array,
+        query: jax.Array,
+        key: jax.Array,
+    ) -> tuple[jax.Array, jax.Array]:
+        """
+        Args:
+            positions: [num_tokens] (Text only) or
+                       [3, num_tokens] (Multimodal T/H/W positions)
+            query: [num_tokens, num_heads * head_size]
+            key: [num_tokens, num_kv_heads * head_size]
+        """
+        # Handle Multimodal 3D Positions
+        # If positions is 1D ([num_tokens]) or single-row ([1, num_tokens]),
+        # expand it to shape [3, num_tokens] by duplicating the row so that
+        # downstream multimodal MRoPE logic has three channels (T/H/W).
+        if positions.ndim == 1:
+            positions = jnp.tile(positions[None, :], (3, 1))  # [3, num_tokens]
+        elif positions.ndim == 2 and positions.shape[0] == 1:
+            positions = jnp.tile(positions, (3, 1))
+
+        if positions.ndim == 2 and positions.shape[0] == 3:
+            return self._forward_mrope(positions, query, key)
+
+        # Fallback to standard RoPE for 1D positions
+        return super().__call__(positions, query, key)
+
+    def _forward_mrope(
+        self,
+        positions: jax.Array,
+        query: jax.Array,
+        key: jax.Array,
+    ) -> tuple[jax.Array, jax.Array]:
+        # positions: [3, num_tokens]
+        num_tokens = positions.shape[-1]
+
+        # 1. Compute Cos/Sin for all 3 dimensions
+        inv_freq = jnp.asarray(self._inv_freq_np, dtype=self.dtype)
+
+        # freqs: [3, num_tokens, rotary_dim // 2]
+        freqs = jnp.einsum("cn,d->cnd", positions.astype(jnp.float32), inv_freq)
+
+        cos_all = jnp.cos(freqs).astype(self.dtype)
+        sin_all = jnp.sin(freqs).astype(self.dtype)
+
+        if self.mrope_interleaved:
+            # --- Interleaved Mode ---
+            # Direct manipulation on the [3, N, D] tensor
+            cos = apply_interleaved_rope(cos_all, self.mrope_section)
+            sin = apply_interleaved_rope(sin_all, self.mrope_section)
+        else:
+            # --- Chunked Mode (Existing Logic) ---
+            # 2. Split and Select based on mrope_section
+            cos_splits = jnp.split(cos_all, self.split_indices, axis=-1)
+            sin_splits = jnp.split(sin_all, self.split_indices, axis=-1)
+
+            # Select specific rows for specific sections
+            # section 0 uses row 0 (Time), section 1 uses row 1 (Height), section 2 uses row 2 (Width)
+            final_cos_list = []
+            final_sin_list = []
+
+            for i, split_tensor in enumerate(cos_splits):
+                # split_tensor shape: [3, num_tokens, section_dim]
+                # We take the i-th row: [num_tokens, section_dim]
+                final_cos_list.append(split_tensor[i])
+
+            for i, split_tensor in enumerate(sin_splits):
+                final_sin_list.append(split_tensor[i])
+
+            # Concatenate back: [num_tokens, rotary_dim // 2]
+            cos = jnp.concatenate(final_cos_list, axis=-1)
+            sin = jnp.concatenate(final_sin_list, axis=-1)
+
+        # 3. Apply RoPE
+        # Reshape query/key to [num_tokens, num_heads, head_size]
+        query_real = query[:num_tokens]
+        query_shape = query_real.shape
+        query_real = query_real.reshape(num_tokens, -1, self.head_size)
+        query_rot = query_real[..., : self.rotary_dim]
+        query_pass = query_real[..., self.rotary_dim :]
+
+        query_rot = apply_rotary_emb(query_rot, cos, sin, self.is_neox_style)
+        query_real = jnp.concatenate((query_rot, query_pass), axis=-1).reshape(query_shape)
+        query = query.at[:num_tokens].set(query_real)
+
+        key_real = key[:num_tokens]
+        key_shape = key_real.shape
+        key_real = key_real.reshape(num_tokens, -1, self.head_size)
+        key_rot = key_real[..., : self.rotary_dim]
+        key_pass = key_real[..., self.rotary_dim :]
+
+        key_rot = apply_rotary_emb(key_rot, cos, sin, self.is_neox_style)
+        key_real = jnp.concatenate((key_rot, key_pass), axis=-1).reshape(key_shape)
+        key = key.at[:num_tokens].set(key_real)
+
+        return query, key
+
+
 class Llama3RotaryEmbedding(RotaryEmbedding):
     def __init__(
         self,
