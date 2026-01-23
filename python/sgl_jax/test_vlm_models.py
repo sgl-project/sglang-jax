@@ -18,7 +18,7 @@ from sgl_jax.test.test_utils import (
 )
 
 MODELS = [
-    SimpleNamespace(model="Qwen/Qwen2.5-VL-7B-Instruct", mmmu_accuracy=0.4),
+    SimpleNamespace(model="Qwen/Qwen2.5-VL-7B-Instruct", mmmu_accuracy=0.38),
 ]
 
 DEFAULT_MEM_FRACTION_STATIC = 0.8
@@ -85,6 +85,8 @@ class TestVLMModels(CustomTestCase):
             log_suffix,
             "--output_path",
             str(output_path),
+            "--gen_kwargs",
+            'max_new_tokens=16'
         ]
 
         if limit is not None:

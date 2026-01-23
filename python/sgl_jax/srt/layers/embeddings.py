@@ -469,7 +469,7 @@ class MRotaryEmbedding(RotaryEmbedding):
         query_rot = query_real[..., : self.rotary_dim]
         query_pass = query_real[..., self.rotary_dim :]
 
-        query_rot = _apply_rotary_emb(query_rot, cos, sin, self.is_neox_style)
+        query_rot = apply_rotary_emb(query_rot, cos, sin, self.is_neox_style)
         query_real = jnp.concatenate((query_rot, query_pass), axis=-1).reshape(query_shape)
         query = query.at[:num_tokens].set(query_real)
 
@@ -479,7 +479,7 @@ class MRotaryEmbedding(RotaryEmbedding):
         key_rot = key_real[..., : self.rotary_dim]
         key_pass = key_real[..., self.rotary_dim :]
 
-        key_rot = _apply_rotary_emb(key_rot, cos, sin, self.is_neox_style)
+        key_rot = apply_rotary_emb(key_rot, cos, sin, self.is_neox_style)
         key_real = jnp.concatenate((key_rot, key_pass), axis=-1).reshape(key_shape)
         key = key.at[:num_tokens].set(key_real)
 

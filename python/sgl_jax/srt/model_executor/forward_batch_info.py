@@ -209,8 +209,6 @@ class ForwardBatch:
             "spec_algorithm": self.spec_algorithm,
             "capture_hidden_mode": self.capture_hidden_mode,
             "deterministic": self.deterministic,
-            "extend_prefix_lens_cpu": self.extend_prefix_lens_cpu,
-            "extend_seq_lens_cpu": self.extend_seq_lens_cpu,
         }
         return (children, aux_data)
 
@@ -223,8 +221,6 @@ class ForwardBatch:
         obj.spec_algorithm = aux_data["spec_algorithm"]
         obj.capture_hidden_mode = aux_data["capture_hidden_mode"]
         obj.deterministic = aux_data.get("deterministic", True)
-        obj.extend_prefix_lens_cpu = aux_data["extend_prefix_lens_cpu"]
-        obj.extend_seq_lens_cpu = aux_data["extend_seq_lens_cpu"]
         obj.trace_request_ids = None
         obj.trace_request_objects = None
 
