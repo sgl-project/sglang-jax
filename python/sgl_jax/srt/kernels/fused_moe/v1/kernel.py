@@ -264,6 +264,8 @@ def validate_fused_moe_block_config(
             )
         if bfc != subc_quant_wsz:
             raise ValueError(f"Expected {bfc=} to be {subc_quant_wsz=} when quantized.")
+        if bse % subc_quant_wsz != 0:
+            raise ValueError(f"Expected {bse=} to be divisible by {subc_quant_wsz=}.")
 
 
 def ref_moe(
@@ -2486,6 +2488,11 @@ def _validate_fused_ep_moe_args(
                 if w1_shared_scale.dtype != jnp.float32:
                     raise ValueError("w1_shared_scale must be float32")
 
+                if block_config.bse % subc_quant_wsz != 0:
+                    raise ValueError(
+                        f"Expected block_config.bse ({block_config.bse}) to be divisible by subc_quant_wsz ({subc_quant_wsz})"
+                    )
+
             if w3_shared_scale is not None:
                 expected_w3_shared_scale = (
                     hidden_size // subc_quant_wsz,
@@ -2579,6 +2586,7 @@ def fused_ep_moe(
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
             dtype=tokens.dtype,
+            weight_dtype=w1.dtype,
             ep_size=ep_size,
             use_shared_expert=(w1_shared is not None),
             use_grouped_topk=use_grouped_topk,

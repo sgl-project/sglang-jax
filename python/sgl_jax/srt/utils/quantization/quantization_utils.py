@@ -138,7 +138,7 @@ def apply_moe_quantization(model_config: ModelConfig, model: nnx.Module) -> nnx.
     Uses the unified QuantizationConfig from model_config.quantization_config.
     """
     # Import here to avoid circular imports
-    from sgl_jax.srt.layers.moe import EPMoE
+    from sgl_jax.srt.layers.moe import EPMoE, FusedEPMoE
 
     quant_config = model_config.quantization_config
     if quant_config is None:
@@ -147,9 +147,9 @@ def apply_moe_quantization(model_config: ModelConfig, model: nnx.Module) -> nnx.
     if not quant_config.has_moe_quantization():
         return model
 
-    # Walk through the model and quantize all EPMoE modules
+    # Walk through the model and quantize all EPMoE/FusedEPMoE modules
     # Models with MoE typically have: model.model.layers[i].block_sparse_moe.experts
-    # or similar structure. We recursively search for EPMoE instances.
+    # or similar structure. We recursively search for EPMoE/FusedEPMoE instances.
     def _quantize_moe_recursive(obj, visited=None):
         if visited is None:
             visited = set()
@@ -159,7 +159,7 @@ def apply_moe_quantization(model_config: ModelConfig, model: nnx.Module) -> nnx.
             return
         visited.add(obj_id)
 
-        if isinstance(obj, EPMoE):
+        if isinstance(obj, (EPMoE, FusedEPMoE)):
             obj.quantize_weights()
             return
 
@@ -246,8 +246,9 @@ def quantize_tensor(
 
         # In order to avoid padded values affecting scale value, we pad it
         # using edge value of the tensor.
-        tensor = jnp.pad(tensor, pad_width, "edge")
-        mask = jnp.pad(mask, pad_width)
+        if pad_tensor:
+            tensor = jnp.pad(tensor, pad_width, "edge")
+            mask = jnp.pad(mask, pad_width)
 
         orig_shape = tensor.shape
         # Convert all axis into positive values.
