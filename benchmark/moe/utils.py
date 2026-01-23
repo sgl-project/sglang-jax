@@ -56,11 +56,6 @@ def make_moe_cases(
     This is intentionally model-agnostic: callers specify MoE parameters, and
     the benchmark iterates over `num_tokens`.
     """
-    if (num_expert_group == 0) != (topk_group == 0):
-        raise ValueError(
-            "Expected num_expert_group and topk_group to be both 0 (disabled) or both > 0 (enabled). "
-            f"Got {num_expert_group=} and {topk_group=}."
-        )
     if num_expert_group < 0 or topk_group < 0:
         raise ValueError(f"Expected {num_expert_group=} and {topk_group=} to be >= 0.")
     if num_expert_group > 0 and topk_group > num_expert_group:
