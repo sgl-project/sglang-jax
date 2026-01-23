@@ -13,6 +13,8 @@ from sgl_jax.srt.utils.mesh_utils import create_device_mesh
 
 MARKER = "SGL_BENCH"
 
+DEFAULT_NUM_TOKENS: tuple[int, ...] = (16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192)
+
 
 @dataclasses.dataclass
 class MoEBenchmarkCase:
@@ -33,66 +35,67 @@ class MoEBenchmarkCase:
     tp_size: int | None = None
 
 
-# Bailing MoE defaults (matches the observed precompile shapes).
-BAILING_BASE = dict(
-    num_experts=256,
-    top_k=8,
-    hidden_size=8192,
-    intermediate_size=2048,
-    activation="silu",
-    renormalize_topk_logits=True,
-    num_expert_group=8,
-    topk_group=4,
-    ep_size=None,
-)
+def make_moe_cases(
+    *,
+    num_tokens: Iterable[int] = DEFAULT_NUM_TOKENS,
+    num_experts: int = 256,
+    top_k: int = 8,
+    hidden_size: int = 2048,
+    intermediate_size: int = 512,
+    activation: str = "silu",
+    renormalize_topk_logits: bool = True,
+    num_expert_group: int = 0,
+    topk_group: int = 0,
+    routed_scaling_factor: float | None = None,
+    ep_size: int | None = None,
+    tp_size: int | None = None,
+    name_prefix: str = "moe",
+) -> list[MoEBenchmarkCase]:
+    """Generate a list of benchmark cases from a single shape template.
 
-BAILING_MINI = dict(
-    num_experts=256,
-    top_k=8,
-    hidden_size=2048,
-    intermediate_size=512,
-    activation="silu",
-    renormalize_topk_logits=True,
-    num_expert_group=8,
-    topk_group=4,
-    ep_size=None,
-)
+    This is intentionally model-agnostic: callers specify MoE parameters, and
+    the benchmark iterates over `num_tokens`.
+    """
+    if (num_expert_group == 0) != (topk_group == 0):
+        raise ValueError(
+            "Expected num_expert_group and topk_group to be both 0 (disabled) or both > 0 (enabled). "
+            f"Got {num_expert_group=} and {topk_group=}."
+        )
+    if num_expert_group < 0 or topk_group < 0:
+        raise ValueError(f"Expected {num_expert_group=} and {topk_group=} to be >= 0.")
+    if num_expert_group > 0 and topk_group > num_expert_group:
+        raise ValueError(
+            f"Expected {topk_group=} to be <= {num_expert_group=} when grouped top-k is enabled."
+        )
 
-# Bailing MoE defaults (matches the observed precompile shapes).
-BAILING_MINI_BASE = dict(
-    num_experts=256,
-    top_k=8,
-    hidden_size=2048,
-    intermediate_size=512,
-    activation="silu",
-    renormalize_topk_logits=True,
-    num_expert_group=8,
-    topk_group=4,
-    # Let benchmarks pick ep_size based on available devices by default.
-    ep_size=None,
-)
+    suffix = ""
+    if num_expert_group or topk_group:
+        suffix += f"_g{num_expert_group}_kg{topk_group}"
+    if activation and activation != "silu":
+        suffix += f"_act{activation}"
+    if not renormalize_topk_logits:
+        suffix += "_norenorm"
 
-_NUM_TOKENS = (16, 32, 64, 128, 256, 512, 1024, 2048, 4096)
-
-BASE_CASES: Iterable[MoEBenchmarkCase] = tuple(
-    MoEBenchmarkCase(
-        name=f"bailing_nt{n}_ne256_tk8_h8192_i2048",
-        num_tokens=n,
-        **BAILING_BASE,
-    )
-    for n in _NUM_TOKENS
-)
-
-MINI_CASES: Iterable[MoEBenchmarkCase] = tuple(
-    MoEBenchmarkCase(
-        name=f"bailing_mini_nt{n}_ne256_tk8_h2048_i512",
-        num_tokens=n,
-        **BAILING_MINI,
-    )
-    for n in _NUM_TOKENS
-)
-
-GROUP_GEMM_CASES: Iterable[MoEBenchmarkCase] = BASE_CASES + MINI_CASES
+    cases: list[MoEBenchmarkCase] = []
+    for n in num_tokens:
+        cases.append(
+            MoEBenchmarkCase(
+                name=f"{name_prefix}_nt{n}_ne{num_experts}_tk{top_k}_h{hidden_size}_i{intermediate_size}{suffix}",
+                num_tokens=int(n),
+                num_experts=num_experts,
+                top_k=top_k,
+                hidden_size=hidden_size,
+                intermediate_size=intermediate_size,
+                activation=activation,
+                renormalize_topk_logits=renormalize_topk_logits,
+                num_expert_group=num_expert_group,
+                topk_group=topk_group,
+                routed_scaling_factor=routed_scaling_factor,
+                ep_size=ep_size,
+                tp_size=tp_size,
+            )
+        )
+    return cases
 
 
 def generate_router_logits(
@@ -301,7 +304,7 @@ def format_load_info(group_sizes: jax.Array) -> str:
 
 def select_cases(cases: Iterable[MoEBenchmarkCase] | None = None) -> Iterable[MoEBenchmarkCase]:
     num_devices = len(jax.devices())
-    raw_cases: Iterable[MoEBenchmarkCase] = GROUP_GEMM_CASES if cases is None else cases
+    raw_cases: Iterable[MoEBenchmarkCase] = make_moe_cases() if cases is None else cases
 
     def choose_parallelism(case: MoEBenchmarkCase) -> tuple[int, int]:
         """Pick (ep_size, tp_size) for benchmarks.
@@ -444,8 +447,8 @@ class MoEImbalanceSimulator:
 
             if token_fill_count[chosen_tokens[-1]] >= top_k:
                 raise ValueError(
-                    f"分配失败：专家 {e_id} 需要分配给 Token，但最空的 Token 也已经填满了。\n"
-                    f"这通常是因为 top_k ({top_k}) 相对于热点专家数过多导致的。"
+                    f"Assignment failed: expert {e_id} needs tokens, but even the least-filled token is full.\n"
+                    f"This usually means top_k ({top_k}) is too large relative to the number of hotspot experts."
                 )
 
             for t_id in chosen_tokens:
