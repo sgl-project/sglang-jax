@@ -380,12 +380,12 @@ def dataclass_to_string_truncated(data, max_length=2048, skip_names: set[str] | 
             + "}"
         )
     elif is_dataclass(data):
-        fields = fields(data)
+        obj_fields = fields(data)
         return (
             f"{data.__class__.__name__}("
             + ", ".join(
                 f"{f.name}={dataclass_to_string_truncated(getattr(data, f.name), max_length)}"
-                for f in fields
+                for f in obj_fields
                 if f.name not in skip_names
             )
             + ")"

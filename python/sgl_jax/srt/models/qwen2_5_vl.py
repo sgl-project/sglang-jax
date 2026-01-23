@@ -828,7 +828,7 @@ class Qwen2_5_VLForConditionalGeneration(nnx.Module):
             positions=positions
         )
         
-        return self.logits_processor(hidden_states, self.lm_head, logits_metadata), layers_kv_fused, layers_callback_flag
+        return self.logits_processor(hidden_states, self.lm_head, logits_metadata), layers_kv_fused, layers_callback_flag, None
 
     def load_weights(self, model_config):
         """Load weights for Qwen2.5-VL model.
@@ -907,7 +907,7 @@ class Qwen2_5_VLForConditionalGeneration(nnx.Module):
             target_path="visual.patch_embed.proj.kernel",
             sharding=(None, None, None, None, "tensor"),
             transpose=False,
-            transpose_dims=(2, 3, 4, 1, 0),
+            transpose_axes=(2, 3, 4, 1, 0),
         )
         
         # Note: In the model definition, use_bias=False is set for the proj Conv layer
