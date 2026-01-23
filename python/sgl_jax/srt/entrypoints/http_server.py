@@ -150,6 +150,7 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
     errors_str = str(exc.errors())
 
     message = f"{exc_str} {errors_str}" if errors_str and errors_str != exc_str else exc_str
+    logger.warning("Request validation error: %s", message)
 
     err = ErrorResponse(
         message=message,

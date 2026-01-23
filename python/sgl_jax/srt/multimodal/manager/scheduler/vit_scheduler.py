@@ -48,7 +48,8 @@ class VitScheduler:
     def run_vit_step(self, req: Req):
         """Placeholder: run ViT encoder and forward request to next stage."""
         logger.info("VitScheduler processing request rid=%s", req.rid)
-        logger.info(req)
+        logger.info(req.image_grid_thw)
+        logger.info(type(req))
         # if req.vlm_inputs is None:
         #     logger.warning("VitScheduler received request without VLM inputs rid=%s", req.rid)
         # self.vit_worker.forward(req, self.mesh)

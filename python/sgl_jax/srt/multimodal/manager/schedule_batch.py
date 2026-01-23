@@ -40,6 +40,8 @@ class Req:
     # Text inputs
     prompt: str | list[str] | None = None
     input_ids: list[int] | None = None
+    origin_input_text: str | list[str] | None = None
+    origin_input_ids: list[int] | None = None
     negative_prompt: str | list[str] | None = None
     negative_input_ids: list[int] | None = None
     prompt_path: str | None = None
@@ -67,6 +69,9 @@ class Req:
     vlm_inputs: VLMMInputs | None = None
     vision_embeds: jax.Array | None = None
     input_embeds: jax.Array | None = None
+    image_grid_thw: tuple | None = None
+    video_grid_thw: tuple | None = None
+    cache_input_ids: list[int] | None = None
 
     # Batch info
     num_outputs_per_prompt: int = 1
@@ -162,6 +167,31 @@ class Req:
 
     def to_stage_reqs(self, scheduler: str):
         if scheduler == "auto_regressive":
+            is_vlm_request = (
+                self.vlm_inputs is not None or self.extra.get("sampling_params") is not None
+            )
+            if is_vlm_request:
+                params = self.extra.get("sampling_params")
+                if isinstance(params, SamplingParams):
+                    sampling_params = params
+                elif isinstance(params, dict):
+                    params = dict(params)
+                    if self.extra.get("stop") and "stop" not in params:
+                        params["stop"] = self.extra["stop"]
+                    sampling_params = SamplingParams(**params)
+                else:
+                    sampling_params = SamplingParams(
+                        max_new_tokens=1,
+                        stop=self.extra.get("stop"),
+                    )
+                tokenized_req = TokenizedGenerateReqInput(
+                    rid=self.rid,
+                    input_ids=self.input_ids or self.origin_input_ids,
+                    sampling_params=sampling_params,
+                    stream=bool(self.extra.get("stream", False)),
+                )
+                tokenized_req.mm_inputs = self.vlm_inputs
+                return [tokenized_req]
             return [
                 TokenizedGenerateReqInput(
                     rid=self.rid,
@@ -192,6 +222,8 @@ class Req:
             (rid no longer in req_store).
         """
         if type(stage_result) is BatchTokenIDOut:
+            if not getattr(stage_result, "output_hidden_states_for_mm", None):
+                return stage_result
             req = None
             for i, rid in enumerate(stage_result.rids):
                 if rid.endswith(NegativePromptSuffix):

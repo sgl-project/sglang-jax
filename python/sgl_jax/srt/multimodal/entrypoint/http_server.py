@@ -85,6 +85,7 @@ async def _convert_to_internal_request(obj: ImageGenerationsRequest | VideoGener
 def _extract_openai_prompt(
     request: ChatCompletionRequest,
     tokenizer,
+    messages_override: list[dict] | None = None,
 ) -> tuple[str, list[str] | None, list[str] | None]:
     if tokenizer is None:
         raise ValueError("Tokenizer is not initialized for chat completions.")
@@ -94,10 +95,20 @@ def _extract_openai_prompt(
     audio_data = []
     modalities = []
 
-    for message in request.messages:
-        if message.content is None:
+    messages = messages_override if messages_override is not None else request.messages
+    for message in messages:
+        if message is None:
+            continue
+        if hasattr(message, "content") and message.content is None:
             message.content = ""
-        msg_dict = message.model_dump()
+        if hasattr(message, "model_dump"):
+            msg_dict = message.model_dump()
+        elif isinstance(message, dict):
+            msg_dict = {k: v for k, v in message.items() if v is not None}
+            if msg_dict.get("content") is None:
+                msg_dict["content"] = ""
+        else:
+            continue
         processed_msg = process_content_for_template_format(
             msg_dict,
             "openai",
@@ -192,6 +203,16 @@ async def chat_completions(obj: ChatCompletionRequest, request: Request):
         prompt, image_data, video_data = _extract_openai_prompt(
             obj, _global_state.tokenizer_manager.tokenizer
         )
+        if not image_data and not video_data:
+            try:
+                raw_body = await request.json()
+            except Exception:
+                raw_body = None
+            raw_messages = raw_body.get("messages") if isinstance(raw_body, dict) else None
+            if isinstance(raw_messages, list):
+                prompt, image_data, video_data = _extract_openai_prompt(
+                    obj, _global_state.tokenizer_manager.tokenizer, raw_messages
+                )
         max_new_tokens = obj.max_completion_tokens or obj.max_tokens
         sampling_params = {
             "max_new_tokens": max_new_tokens,

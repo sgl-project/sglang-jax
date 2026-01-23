@@ -23,13 +23,13 @@ from transformers import AutoConfig, AutoProcessor
 
 from sgl_jax.srt.managers.io_struct import AbortReq
 from sgl_jax.srt.managers.tokenizer_manager import TokenizerManager
+from sgl_jax.srt.multimodal.common.modality_enum import Modality, MultimodalDataItem
 from sgl_jax.srt.multimodal.manager.io_struct import (
     DataType,
     GenerateMMReqInput,
     GenerateVLMReqInput,
     TokenizedGenerateMMReqInput,
     TokenizedGenerateVLMReqInput,
-    VLMMInputs,
 )
 from sgl_jax.srt.multimodal.manager.mrope_utils import compute_mrope_positions
 from sgl_jax.srt.server_args import PortArgs, ServerArgs
@@ -77,17 +77,31 @@ class MultimodalTokenizer(TokenizerManager):
         super().__init__(server_args, port_args)
         self.mm_processor = None
         self.mm_config = None
-        try:
-            self.mm_processor = AutoProcessor.from_pretrained(
-                server_args.model_path,
-                trust_remote_code=server_args.trust_remote_code,
-            )
-            self.mm_config = AutoConfig.from_pretrained(
-                server_args.model_path,
-                trust_remote_code=server_args.trust_remote_code,
-            )
-        except Exception:
-            logger.warning("Failed to load processor/config from %s", server_args.model_path)
+        processor_candidates = [server_args.model_path]
+        model_basename = os.path.basename(server_args.model_path.rstrip("/"))
+        if model_basename in {
+            "text_encoder",
+            "vision_encoder",
+            "language_model",
+            "transformer",
+            "vae",
+            "tokenizer",
+        }:
+            processor_candidates.append(os.path.dirname(server_args.model_path.rstrip("/")))
+        trust_remote_code = server_args.trust_remote_code or server_args.multimodal
+        for candidate in processor_candidates:
+            try:
+                self.mm_processor = AutoProcessor.from_pretrained(
+                    candidate,
+                    trust_remote_code=trust_remote_code,
+                )
+                self.mm_config = AutoConfig.from_pretrained(
+                    candidate,
+                    trust_remote_code=trust_remote_code,
+                )
+                break
+            except Exception as exc:
+                logger.warning("Failed to load processor/config from %s: %s", candidate, exc)
         self.rid_to_state: dict[str, MMReqState] = {}
         self._result_dispatcher = TypeBasedDispatcher(
             [
@@ -182,7 +196,6 @@ class MultimodalTokenizer(TokenizerManager):
                 "Receive: obj=%s",
                 dataclass_to_string_truncated(obj, max_length, skip_names=skip_names),
             )
-
         tokenized_obj = await self._tokenize_one_request(obj)
         state = self._send_one_request(obj, tokenized_obj, created_time)
         async for response in self._wait_one_response(obj, state, request):
@@ -200,7 +213,6 @@ class MultimodalTokenizer(TokenizerManager):
         input_ids = getattr(obj, "input_ids", None)
         neg_input_ids = getattr(obj, "neg_input_ids", None)
         mm_inputs = None
-
         image_data = self._normalize_mm_list(getattr(obj, "image_data", None))
         video_data = self._normalize_mm_list(getattr(obj, "video_data", None))
         if not image_data and not video_data and getattr(obj, "input_reference", None) is not None:
@@ -208,15 +220,19 @@ class MultimodalTokenizer(TokenizerManager):
                 image_data = [obj.input_reference]
             elif obj.data_type == DataType.VIDEO:
                 video_data = [obj.input_reference]
-
-        if (image_data or video_data) and self.mm_processor is not None:
+        if (image_data or video_data) and self.mm_processor is None:
+            raise ValueError(
+                "Multimodal inputs provided but processor/config is not available. "
+                "Check model_path and trust_remote_code settings."
+            )
+        if image_data or video_data:
             images = [self._load_image_from_source(item) for item in image_data]
             videos = [self._load_video_from_source(item) for item in video_data]
             processor_out = self.mm_processor(
                 images=images or None,
                 videos=videos or None,
                 text=input_text or "",
-                return_tensors="np",
+                return_tensors="pt",
             )
             if "input_ids" in processor_out:
                 input_ids = processor_out["input_ids"][0].tolist()
@@ -253,20 +269,50 @@ class MultimodalTokenizer(TokenizerManager):
                         tokens_per_second=tokens_per_second,
                     )
 
-            pad_values = self._hash_mm_items(images, videos)
-            mm_inputs = VLMMInputs(
-                pixel_values=pixel_values,
-                pixel_values_videos=pixel_values_videos,
-                image_grid_thw=image_grid_thw,
-                video_grid_thw=video_grid_thw,
-                second_per_grid_ts=second_per_grid_ts,
-                mrope_positions=mrope_positions,
-                mrope_position_delta=mrope_position_delta,
-                image_token_id=getattr(self.mm_config, "image_token_id", None),
-                video_token_id=getattr(self.mm_config, "video_token_id", None),
-                pad_values=pad_values,
+            mm_items = []
+            if pixel_values is not None:
+                mm_items.append(
+                    MultimodalDataItem(
+                        modality=Modality.IMAGE,
+                        feature=np.asarray(pixel_values),
+                    )
+                )
+            if pixel_values_videos is not None:
+                mm_items.append(
+                    MultimodalDataItem(
+                        modality=Modality.VIDEO,
+                        feature=np.asarray(pixel_values_videos),
+                    )
+                )
+            audio_features = processor_out.get("audio_features") or processor_out.get(
+                "input_features"
             )
+            if audio_features is not None:
+                mm_items.append(
+                    MultimodalDataItem(
+                        modality=Modality.AUDIO,
+                        feature=np.asarray(audio_features),
+                    )
+                )
+            for item in mm_items:
+                item.set_pad_value()
 
+            if isinstance(second_per_grid_ts, np.ndarray):
+                second_per_grid_ts = second_per_grid_ts.tolist()
+
+            mm_inputs = {
+                "mm_items": mm_items,
+                "im_start_id": getattr(self.mm_config, "vision_start_token_id", None),
+                "im_end_id": getattr(self.mm_config, "vision_end_token_id", None),
+                "im_token_id": getattr(self.mm_config, "image_token_id", None),
+                "video_token_id": getattr(self.mm_config, "video_token_id", None),
+                "audio_token_id": getattr(self.mm_config, "audio_token_id", None),
+                "mrope_positions": mrope_positions,
+                "mrope_position_delta": mrope_position_delta,
+                "image_grid_thw": image_grid_thw,
+                "video_grid_thw": video_grid_thw,
+                "second_per_grid_ts": second_per_grid_ts,
+            }
         if input_ids is None and input_text is not None:
             if self.tokenizer is None:
                 raise ValueError(
@@ -282,7 +328,8 @@ class MultimodalTokenizer(TokenizerManager):
             encoded = self.tokenizer(neg_input_text)
             neg_input_ids = encoded["input_ids"]
 
-        if isinstance(obj, GenerateVLMReqInput):
+        is_vlm_req = isinstance(obj, GenerateVLMReqInput) or hasattr(obj, "sampling_params")
+        if is_vlm_req:
             tokenized_obj = self._create_tokenized_vlm_object(obj, input_text, input_ids)
         else:
             tokenized_obj = self._create_tokenized_object(
@@ -297,6 +344,10 @@ class MultimodalTokenizer(TokenizerManager):
         return data if isinstance(data, list) else [data]
 
     def _load_image_from_source(self, source: str | bytes) -> Image.Image:
+        if isinstance(source, dict) and "url" in source:
+            source = source["url"]
+        if hasattr(source, "url"):
+            source = source.url
         if isinstance(source, bytes):
             return Image.open(io.BytesIO(source)).convert("RGB")
         if os.path.exists(source):
@@ -314,6 +365,10 @@ class MultimodalTokenizer(TokenizerManager):
             raise ValueError("Unsupported image source format") from exc
 
     def _load_video_from_source(self, source: str | bytes) -> np.ndarray:
+        if isinstance(source, dict) and "url" in source:
+            source = source["url"]
+        if hasattr(source, "url"):
+            source = source.url
         if isinstance(source, bytes):
             with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
                 tmp.write(source)
