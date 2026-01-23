@@ -176,7 +176,7 @@ Note:
 - `repetition_penalty`, `temperature`, `top_p`, `top_k`, `min_p` and `max_tokens` will be set by `get_default_sampling_params()`.
 - `get_default_sampling_params()` will be supported in `Engine`.
 
-| Fields                        | vllm                          | tunix 设置 vllm               | sgl_jax                    |
+| Fields                        | vllm                          | tunix (vllm settings)         | sgl_jax                    |
 |------------------------------|-------------------------------|-------------------------------|-------------------------------|
 | n                            | 1                             | multi_sampling=1             | n:int = 1, to check                        |
 | best_of                      | 1                             |                              |         lack, not to support because tunix does not use it|

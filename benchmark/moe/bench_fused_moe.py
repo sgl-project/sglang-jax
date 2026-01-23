@@ -2,7 +2,7 @@
 Benchmark fused_moe kernel with grouped-GEMM-like MoE shapes.
 
 Usage:
-    python -m benchmark.moe.bench_fused_moe [--tune-block-config] --config-mode [base|mini|all] [--use-shared-expert]
+    python -m benchmark.moe.bench_fused_moe --use-shared-expert  --imbalance-mode sparse_hotspot --hotspot-ratio 1 --hotspot-count 48 --tune-block-config --num-experts 256 --topk 8 --hidden-size 8192 --intermediate-size 2048 --num-expert-group 8 --topk-group 4
 """
 
 from __future__ import annotations
@@ -21,13 +21,11 @@ from jax.experimental.compilation_cache import compilation_cache as _compilation
 from jax.sharding import PartitionSpec as P
 
 from benchmark.moe.utils import (
-    BAILING_BASE,
-    BASE_CASES,
-    GROUP_GEMM_CASES,
-    MINI_CASES,
+    DEFAULT_NUM_TOKENS,
     MoEBenchmarkCase,
     MoEImbalanceSimulator,
     build_mesh,
+    make_moe_cases,
     prepare_fused_moe_inputs,
     select_cases,
 )
@@ -459,11 +457,18 @@ def run_all(
     bd_candidates: list[int] | None = None,
     bse_candidates: list[int] | None = None,
     num_tokens: list[int] | None = None,
+    num_experts: int = 256,
+    top_k: int = 8,
+    hidden_size: int = 2048,
+    intermediate_size: int = 512,
+    activation: str = "silu",
+    renormalize_topk_logits: bool = True,
+    num_expert_group: int = 0,
+    topk_group: int = 0,
     tpu_vmem_budget_bytes: int = DEFAULT_TPU_VMEM_BUDGET_BYTES,
     max_configs: int = 9,
-    config_mode: str = "base",
     use_shared_expert: bool = False,
-    use_grouped_topk: bool = False,
+    use_grouped_topk: bool | None = None,
     imbalance_mode: str = None,
     alpha: float = None,
     zipf_s: float = None,
@@ -472,29 +477,26 @@ def run_all(
     zero_expert_count: int = None,
     non_hotspot_alpha: float = None,
 ) -> None:
-    raw_cases: list[MoEBenchmarkCase] | None = None
+    if use_grouped_topk is None:
+        use_grouped_topk = bool(num_expert_group or topk_group)
+
+    token_list = DEFAULT_NUM_TOKENS if num_tokens is None else num_tokens
+    raw_cases = make_moe_cases(
+        num_tokens=token_list,
+        num_experts=num_experts,
+        top_k=top_k,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        activation=activation,
+        renormalize_topk_logits=renormalize_topk_logits,
+        num_expert_group=num_expert_group,
+        topk_group=topk_group,
+        name_prefix="fused_moe",
+    )
+
     if num_tokens is not None:
-        # If num_tokens is explicit, use base config as template
-        raw_cases = [
-            MoEBenchmarkCase(
-                name=(
-                    f"custom_nt{n}_ne{BAILING_BASE['num_experts']}_tk{BAILING_BASE['top_k']}"
-                    f"_h{BAILING_BASE['hidden_size']}_i{BAILING_BASE['intermediate_size']}"
-                ),
-                num_tokens=n,
-                **BAILING_BASE,
-            )
-            for n in num_tokens
-        ]
-    else:
-        if config_mode == "base":
-            raw_cases = BASE_CASES
-        elif config_mode == "mini":
-            raw_cases = MINI_CASES
-        elif config_mode == "all":
-            raw_cases = GROUP_GEMM_CASES
-        else:
-            raise ValueError(f"Unknown config_mode: {config_mode}")
+        requested = set(num_tokens)
+        raw_cases = [case for case in raw_cases if case.num_tokens in requested]
 
     cases_all = list(select_cases(raw_cases))
     cases: list[MoEBenchmarkCase] = []
@@ -514,8 +516,13 @@ def run_all(
         from sgl_jax.srt.utils.jax_utils import get_device_name
 
     print(f"Running fused_moe benchmarks with dtype={dtype}")
-    print(f"  config_mode: {config_mode}")
     print(f"  features: shared_expert={use_shared_expert}, grouped_topk={use_grouped_topk}")
+    print(
+        "  shape: "
+        f"num_experts={num_experts}, top_k={top_k}, hidden_size={hidden_size}, intermediate_size={intermediate_size}, "
+        f"activation={activation}, renormalize_topk_logits={renormalize_topk_logits}, "
+        f"num_expert_group={num_expert_group}, topk_group={topk_group}"
+    )
 
     for case in cases:
         t_packing = _dtype_packing(dtype)
@@ -597,6 +604,7 @@ def run_all(
                 activation=case.activation,
                 layer_id=0,
                 renormalize_topk_logits=case.renormalize_topk_logits,
+                use_grouped_topk=use_grouped_topk,
                 num_groups=case.num_expert_group if use_grouped_topk else 1,
                 top_k_groups=case.topk_group if use_grouped_topk else 1,
                 num_shared_experts=1 if use_shared_expert else 0,
@@ -811,8 +819,21 @@ def parse_args() -> argparse.Namespace:
         type=int,
         nargs="+",
         default=None,
-        help="Override benchmark cases with custom num_tokens list (e.g. --num-tokens 8 16 256 4096).",
+        help="Token counts to benchmark (e.g. --num-tokens 128 512 4096). Default: a fixed ladder.",
     )
+    parser.add_argument("--num-experts", type=int, default=256)
+    parser.add_argument("--top-k", type=int, default=8)
+    parser.add_argument("--hidden-size", type=int, default=2048)
+    parser.add_argument("--intermediate-size", type=int, default=512)
+    parser.add_argument("--activation", type=str, default="silu")
+    parser.add_argument(
+        "--renormalize-topk-logits",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Renormalize top-k routing weights/logits.",
+    )
+    parser.add_argument("--num-expert-group", type=int, default=0)
+    parser.add_argument("--topk-group", type=int, default=0)
     parser.add_argument(
         "--tpu-vmem-budget-mb",
         type=int,
@@ -831,19 +852,7 @@ def parse_args() -> argparse.Namespace:
         default=9,
         help="Maximum number of block configs to benchmark per case when --tune-block-config is set.",
     )
-    # [New] Feature flags
-    parser.add_argument(
-        "--config-mode",
-        type=str,
-        default="base",
-        choices=["base", "mini", "all"],
-        help="Select which set of benchmark cases to run (default: base).",
-    )
-    parser.add_argument(
-        "--use-grouped-topk",
-        action="store_true",
-        help="Enable grouped top-k routing logic.",
-    )
+    # Feature flags
     parser.add_argument(
         "--use-shared-expert",
         action="store_true",
@@ -855,16 +864,24 @@ def parse_args() -> argparse.Namespace:
         type=str,
         choices=["balanced", "dirichlet", "zipf", "hotspot", "sparse_hotspot"],
         default="balanced",
-        help="All-to-All 不均衡负载模式",
+        help="All-to-all imbalance mode.",
     )
     parser.add_argument(
-        "--alpha", type=float, default=1.0, help="Dirichlet 分布因子 (越小越不均衡，如 0.1)"
+        "--alpha",
+        type=float,
+        default=1.0,
+        help="Dirichlet concentration (smaller => more imbalanced, e.g. 0.1).",
     )
-    parser.add_argument("--zipf-s", type=float, default=1.1, help="Zipf 分布因子 (越大越不均衡)")
     parser.add_argument(
-        "--hotspot-ratio", type=float, default=0.5, help="热点专家占据的 Token 总量比例 (0.0-1.0)"
+        "--zipf-s", type=float, default=1.1, help="Zipf exponent (larger => more imbalanced)."
     )
-    parser.add_argument("--hotspot-count", type=int, default=1, help="热点专家的数量")
+    parser.add_argument(
+        "--hotspot-ratio",
+        type=float,
+        default=0.5,
+        help="Fraction of tokens routed to hotspot experts (0.0-1.0).",
+    )
+    parser.add_argument("--hotspot-count", type=int, default=1, help="Number of hotspot experts.")
     parser.add_argument("--zero-expert-count", type=int, default=0)
     parser.add_argument("--non-hotspot-alpha", type=float, default=100.0)
     return parser.parse_args()
@@ -893,11 +910,18 @@ if __name__ == "__main__":
             bd_candidates=args.bd_candidates,
             bse_candidates=args.bse_candidates,
             num_tokens=args.num_tokens,
+            num_experts=args.num_experts,
+            top_k=args.top_k,
+            hidden_size=args.hidden_size,
+            intermediate_size=args.intermediate_size,
+            activation=args.activation,
+            renormalize_topk_logits=args.renormalize_topk_logits,
+            num_expert_group=args.num_expert_group,
+            topk_group=args.topk_group,
             tpu_vmem_budget_bytes=tpu_vmem_budget_bytes,
             max_configs=args.max_configs,
-            config_mode=args.config_mode,
             use_shared_expert=args.use_shared_expert,
-            use_grouped_topk=args.use_grouped_topk,
+            use_grouped_topk=None,
             imbalance_mode=args.imbalance_mode,
             alpha=args.alpha,
             zipf_s=args.zipf_s,
