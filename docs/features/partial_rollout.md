@@ -232,5 +232,107 @@ class FlushCacheReqOutput(BaseReq):
 ```
 
 ---
-## 4 `TestCases`
 
+## 4. Test Cases
+
+This section describes the test cases for verifying the interruptible sampling functionality.
+
+---
+
+### 4.1 `test_engine_pause_continue.py`
+
+This test file verifies that `pause_generation` and `continue_generation` APIs work correctly with different pause modes.
+
+**Test Cases:**
+
+1. **`test_1_pause_generation_retract_mode`**: Tests the `retract` mode behavior:
+   - Verifies running batch becomes empty after pause
+   - Verifies requests are moved from running batch to waiting queue
+   - Verifies KV cache is cleared (available tokens increase)
+   - Verifies requests complete successfully after `continue_generation`
+
+2. **`test_2_pause_generation_in_place_mode`**: Tests the `in_place` mode behavior:
+   - Verifies running batch size remains unchanged after pause
+   - Verifies same requests stay in running batch (by checking request IDs)
+   - Verifies waiting queue is unchanged
+   - Verifies KV cache is NOT cleared (available tokens remain same)
+   - Verifies requests complete successfully after `continue_generation`
+
+3. **`test_3_pause_continue_multiple_cycles`**: Tests multiple pause/continue cycles with alternating modes (retract and in_place).
+
+4. **`test_4_pause_generation_abort_mode`**: Tests the `abort` mode behavior:
+   - Verifies all requests are aborted (running batch and waiting queue become empty)
+   - Verifies requests return with `abort` finish reason
+
+---
+
+### 4.2 `test_engine_flush_cache.py`
+
+This test file verifies that `flush_cache` properly clears all cache components.
+
+**Verified Cache Components:**
+
+- `tree_cache` (radix/prefix cache)
+- `req_to_token_pool`
+- `token_to_kv_pool_allocator` (KV cache)
+
+**Test Cases:**
+
+1. **`test_1_flush_cache_after_generation`**: Tests that flush_cache restores all states after generation completes:
+   - Verifies KV cache is restored (`available_kv_tokens` returns to initial value)
+   - Verifies tree cache is cleared (`tree_cache_size` becomes 0)
+   - Verifies req_to_token_pool is cleared (`req_to_token_pool_used` becomes 0)
+   - Verifies `forward_ct_decode` counter is reset to 0
+   - Verifies `new_token_ratio` is reset to initial value
+
+2. **`test_2_flush_cache_clears_scheduling_state`**: Tests that flush_cache clears all scheduling state:
+   - Verifies `running_batch_size` becomes 0
+   - Verifies `waiting_queue_size` becomes 0
+   - Verifies `cur_batch` is None
+   - Verifies `last_batch` is None
+   - Verifies `chunked_req` is None
+
+3. **`test_3_generation_works_after_flush`**: Tests that generation still works correctly after flush_cache and produces deterministic results with `temperature=0`.
+
+4. **`test_4_multiple_flush_cycles`**: Tests multiple generate-flush cycles work correctly, verifying all states are properly restored after each flush.
+
+---
+
+### 4.3 `test_engine_determine_generation.py`
+
+This test file verifies **deterministic generation** behavior, specifically testing whether pause/continue operations produce the same results as uninterrupted generation when using `temperature=0`.
+
+**Key Question:** If a decode process is interrupted by `pause_generation` (retract mode) and then resumed via `continue_generation`, will the output be identical to an uninterrupted generation?
+
+**Test Cases:**
+
+1. **`test_1_single_request_retract_vs_no_pause`**: Tests single request determinism:
+   - Compares output from retract mode (pause → continue) vs baseline (no pause)
+   - Verifies outputs are identical with `temperature=0`
+
+2. **`test_2_single_request_abort_vs_no_pause`**: Tests single request abort behavior:
+   - Verifies partial text (before abort) is a prefix of baseline
+   - Verifies re-generated result after abort matches baseline
+
+3. **`test_3_multiple_requests_retract_vs_no_pause`**: Tests multiple concurrent requests determinism with retract mode.
+
+4. **`test_4_multiple_requests_abort_vs_no_pause`**: Tests multiple concurrent requests abort behavior and re-generation determinism.
+
+**Batch Invariant Issue:**
+
+During testing, we discovered a **batch invariant issue** where JAX operators (specifically `jax.lax.dot_general`) can produce slightly different results depending on batch size. This is a known JAX issue documented in [jax-ml/jax#34080](https://github.com/jax-ml/jax/issues/34080).
+
+**Workaround:** To ensure deterministic results, the test configures the engine with small padding values:
+
+```python
+cls.engine = Engine(
+    ...
+    chunked_prefill_size=4,
+    precompile_bs_paddings=[4],
+    precompile_token_paddings=[4],
+    page_size=4,
+    ...
+)
+```
+
+By setting `chunked_prefill_size`, `precompile_bs_paddings`, and `precompile_token_paddings` to small values (e.g., 4), we minimize the batch size variation and ensure consistent results across pause/continue cycles.
