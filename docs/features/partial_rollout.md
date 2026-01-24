@@ -168,10 +168,10 @@ Request structure for aborting one or all requests.
 ```python
 @dataclass
 class AbortReq(BaseReq):
-    rid: str = ""                              # Request ID to abort
-    abort_all: bool = False                    # Whether to abort all requests
-    finished_reason: dict[str, Any] | None = None  # Reason for abort (internal use)
-    aborted_message: str | None = None         # Optional abort message
+    # Whether to abort all requests
+    abort_all: bool = False
+    finished_reason: dict[str, Any] | None = None
+    aborted_message: str | None = None
 ```
 
 ---
