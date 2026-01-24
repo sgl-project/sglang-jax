@@ -2,7 +2,7 @@
 Benchmark ep_moe (reference path) for comparison with fused_moe.
 
 Usage:
-    python -m benchmark.moe.bench_fused_moe --use-shared-expert  --use-grouped-topk --num-tokens 128 --imbalance-mode sparse_hotspot --hotspot-ratio 1 --hotspot-count 48
+    python -m benchmark.moe.bench_ep_moe --scenario balanced --num-tokens 128 --num-experts 256 --top-k 8 --hidden-size 2048 --intermediate-size 512
 """
 
 from __future__ import annotations
@@ -16,12 +16,13 @@ from flax import nnx
 from jax.experimental.compilation_cache import compilation_cache as _compilation_cache
 
 from benchmark.moe.utils import (
-    BAILING_BASE,
+    DEFAULT_NUM_TOKENS,
     MoEBenchmarkCase,
     build_group_sizes,
     build_mesh,
     format_load_info,
     generate_router_logits,
+    make_moe_cases,
     select_cases,
 )
 from benchmark.utils import multiple_iteration_timeit_from_trace
@@ -61,20 +62,28 @@ def run_all(
     dtype: jnp.dtype = jnp.bfloat16,
     *,
     num_tokens: list[int] | None = None,
+    num_experts: int = 256,
+    top_k: int = 8,
+    hidden_size: int = 2048,
+    intermediate_size: int = 512,
+    activation: str = "silu",
+    renormalize_topk_logits: bool = True,
+    num_expert_group: int = 0,
+    topk_group: int = 0,
 ) -> None:
-    raw_cases: list[MoEBenchmarkCase] | None = None
-    if num_tokens is not None:
-        raw_cases = [
-            MoEBenchmarkCase(
-                name=(
-                    f"custom_nt{n}_ne{BAILING_BASE['num_experts']}_tk{BAILING_BASE['top_k']}"
-                    f"_h{BAILING_BASE['hidden_size']}_i{BAILING_BASE['intermediate_size']}"
-                ),
-                num_tokens=n,
-                **BAILING_BASE,
-            )
-            for n in num_tokens
-        ]
+    token_list = DEFAULT_NUM_TOKENS if num_tokens is None else num_tokens
+    raw_cases: list[MoEBenchmarkCase] = make_moe_cases(
+        num_tokens=token_list,
+        num_experts=num_experts,
+        top_k=top_k,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        activation=activation,
+        renormalize_topk_logits=renormalize_topk_logits,
+        num_expert_group=num_expert_group,
+        topk_group=topk_group,
+        name_prefix="ep_moe",
+    )
     cases = list(select_cases(raw_cases))
 
     print(f"Running ep_moe benchmarks with scenario='{scenario}', dtype={dtype}")
@@ -175,8 +184,21 @@ def parse_args() -> argparse.Namespace:
         type=int,
         nargs="+",
         default=None,
-        help="Override benchmark cases with custom num_tokens list (e.g. --num-tokens 8 16 256 4096).",
+        help="Token counts to benchmark (e.g. --num-tokens 128 512 4096). Default: a fixed ladder.",
     )
+    parser.add_argument("--num-experts", type=int, default=256)
+    parser.add_argument("--top-k", type=int, default=8)
+    parser.add_argument("--hidden-size", type=int, default=2048)
+    parser.add_argument("--intermediate-size", type=int, default=512)
+    parser.add_argument("--activation", type=str, default="silu")
+    parser.add_argument(
+        "--renormalize-topk-logits",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Renormalize top-k routing weights/logits.",
+    )
+    parser.add_argument("--num-expert-group", type=int, default=0)
+    parser.add_argument("--topk-group", type=int, default=0)
     parser.add_argument(
         "--compilation-cache-dir",
         type=str,
@@ -190,4 +212,16 @@ if __name__ == "__main__":
     args = parse_args()
     if args.compilation_cache_dir:
         _compilation_cache.set_cache_dir(args.compilation_cache_dir)
-    run_all(args.scenario, args.iters, num_tokens=args.num_tokens)
+    run_all(
+        args.scenario,
+        args.iters,
+        num_tokens=args.num_tokens,
+        num_experts=args.num_experts,
+        top_k=args.top_k,
+        hidden_size=args.hidden_size,
+        intermediate_size=args.intermediate_size,
+        activation=args.activation,
+        renormalize_topk_logits=args.renormalize_topk_logits,
+        num_expert_group=args.num_expert_group,
+        topk_group=args.topk_group,
+    )
