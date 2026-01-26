@@ -1,12 +1,13 @@
-# INT8 quantization config
+# INT8 weight-only quantization config
 # Works for both dense and MoE models
+# Uses per-channel weight quantization
 
 quantization:
-  # Qwix rules for dense layers (attention, MLP, embeddings)
-  qwix:
+  # Quantization rules for dense layers (attention, MLP, embeddings)
+  dense:
     rules:
       - module_path: '.*'
-        weight_qtype: 'int8'
+        weight_dtype: 'int8'
 
   # MoE-specific settings (experts weights)
   moe:
