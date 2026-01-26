@@ -52,5 +52,5 @@ class VitScheduler:
         logger.info(type(req))
         # if req.vlm_inputs is None:
         #     logger.warning("VitScheduler received request without VLM inputs rid=%s", req.rid)
-        # self.vit_worker.forward(req, self.mesh)
+        self.vit_worker.forward(req, self.mesh)
         self.communication_backend.send_pyobj(req)
