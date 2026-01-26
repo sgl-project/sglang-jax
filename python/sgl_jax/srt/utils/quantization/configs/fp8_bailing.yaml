@@ -10,7 +10,7 @@ quantization:
       # MoE gate: completely excluded (no weight, no activation quantization)
       # MoE experts unpermute: excluded from qwix
       # logits_processor: excluded for accuracy
-      - module_path: '^(?!.*(mlp\.gate|mlp|logits_processor)).*$'
+      - module_path: '^(?!.*(moe_gate|mlp|logits_processor)).*$'
         weight_qtype: 'float8_e4m3fn'
         act_qtype: 'float8_e4m3fn'
 

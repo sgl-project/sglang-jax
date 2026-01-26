@@ -1240,11 +1240,12 @@ def _fused_ep_moe_kernel(
             ).start()
 
             if w1_shared_scale_hbm is not None:
-                scale_offset = offset // subc_quant_wsz
-                scale_len = bd1_per_t_packing // subc_quant_wsz
                 pltpu.make_async_copy(
                     src_ref=w1_shared_scale_hbm.at[
-                        pl.ds(scale_offset, scale_len),
+                        pl.ds(
+                            offset // subc_quant_wsz,
+                            bd1_per_t_packing // subc_quant_wsz,
+                        ),
                         pl.ds(0, 1),
                         pl.ds(block_id * bse, bse),
                     ],
@@ -1287,11 +1288,12 @@ def _fused_ep_moe_kernel(
             ).start()
 
             if w3_shared_scale_hbm is not None:
-                scale_offset = offset // subc_quant_wsz
-                scale_len = bd1_per_t_packing // subc_quant_wsz
                 pltpu.make_async_copy(
                     src_ref=w3_shared_scale_hbm.at[
-                        pl.ds(scale_offset, scale_len),
+                        pl.ds(
+                            offset // subc_quant_wsz,
+                            bd1_per_t_packing // subc_quant_wsz,
+                        ),
                         pl.ds(0, 1),
                         pl.ds(block_id * bse, bse),
                     ],
@@ -1336,12 +1338,12 @@ def _fused_ep_moe_kernel(
             ).start()
 
             if w2_shared_scale_hbm is not None:
-                scale_inter_idx = (block_id * bse) // subc_quant_wsz
-                scale_inter_len = bse // subc_quant_wsz
-
                 pltpu.make_async_copy(
                     src_ref=w2_shared_scale_hbm.at[
-                        pl.ds(scale_inter_idx, scale_inter_len),
+                        pl.ds(
+                            block_id * bse // subc_quant_wsz,
+                            bse // subc_quant_wsz,
+                        ),
                         pl.ds(0, 1),
                         pl.ds(offset, bd2_per_t_packing),
                     ],
@@ -1728,7 +1730,9 @@ def _fused_ep_moe_kernel(
 
                         @pl.when((next_tile_id == num_token_tiles) & (bd1_id + 1 < num_bd1))
                         def _prefetch_bts0_tokens_for_next_bd():
-                            start_stage_a2a_s_tile_from_hbm(jnp.int32(0), bd1_id + 1, jnp.int32(0))
+                            start_stage_a2a_s_tile_from_hbm(
+                                jnp.int32(0), jnp.minimum(bd1_id + 1, num_bd1 - 1), jnp.int32(0)
+                            )
 
                         tile_sz = jnp.maximum(jnp.minimum(dyn_sz_i32 - tile_start, token_tile), 0)
                         dynamic_ffn1(
@@ -2017,16 +2021,6 @@ def _fused_ep_moe_kernel(
     sync_barrier()
     start_fetch_and_wait_bias()
 
-    def broadcast_quant_scale(scale, current_block_size, group_size):
-        if group_size is None or group_size <= 0:
-            return scale.squeeze(-2)
-        s = jnp.expand_dims(scale, axis=-3)
-        target_shape = scale.shape[:-2] + (group_size, 1, scale.shape[-1])
-        s = jnp.broadcast_to(s, target_shape)
-        final_shape = scale.shape[:-3] + (current_block_size, 1, scale.shape[-1])
-        s = s.reshape(final_shape)
-        return s.squeeze(-2)
-
     def run_shared_expert_slice(block_id, bt_id, bt_sem_id, out_buf_id):
         if w1_shared_hbm is None:
             return
@@ -2035,9 +2029,7 @@ def _fused_ep_moe_kernel(
         def _():
             bt_start = bt_id * bt
 
-            # `b_se_tokens_vmem` is a (2, 2, ...) ping-pong buffer that gets overwritten
-            # as we stream over `bd1_idx`. For correctness, restart the stream from
-            # `bd1_idx=0` for each shared-expert block beyond the first.
+            # 使用 pl.when 替换 Python if block_id != 0
             @pl.when(block_id != 0)
             def _():
                 start_fetch_se_tokens_slice(
@@ -2047,12 +2039,10 @@ def _fused_ep_moe_kernel(
                     buf_id=jnp.int32(0),
                 )
 
-            if num_bd1 > 0:
-
-                @pl.when(block_id == 0)
-                def _():
-                    start_fetch_se_w1(0, block_id, 0)
-                    start_fetch_se_w3(0, block_id, 0)
+            @pl.when(block_id == 0)
+            def _():
+                start_fetch_se_w1(0, block_id, 0)
+                start_fetch_se_w3(0, block_id, 0)
 
             init_val = jnp.zeros((bt, bse), dtype=jnp.float32)
 
@@ -2061,8 +2051,9 @@ def _fused_ep_moe_kernel(
                 curr_sem = bd1_idx % 2
                 next_sem = (bd1_idx + 1) % 2
                 next_bd1_idx = bd1_idx + 1
-                token_buf_id = bd1_idx & jnp.int32(1)
-                next_token_buf_id = token_buf_id ^ jnp.int32(1)
+                # 确保使用位运算而非逻辑运算
+                token_buf_id = bd1_idx & 1
+                next_token_buf_id = token_buf_id ^ 1
 
                 @pl.when(next_bd1_idx < num_bd1)
                 def _():
@@ -2079,6 +2070,7 @@ def _fused_ep_moe_kernel(
                 wait_fetch_se_w3(curr_sem)
                 wait_fetch_se_tokens_slice(bt_sem_id=bt_sem_id, buf_id=token_buf_id)
 
+                # 内部循环（如果 t_packing 是静态常量，可以使用 range）
                 for p_id in range(t_packing):
                     t = b_se_tokens_vmem[
                         bt_sem_id,
@@ -2089,26 +2081,49 @@ def _fused_ep_moe_kernel(
                     ]
                     t_f32 = t.astype(jnp.float32)
 
-                    # W1
+                    # --- W1 (Gate) ---
                     w1_gate = b_se_w1_x2_vmem[curr_sem, p_id]
                     if w1_shared_scale_hbm is not None:
-                        s_gate = b_se_w1_scale_x2_vmem[curr_sem, p_id]
-                        s_gate = broadcast_quant_scale(s_gate, bd1_per_t_packing, subc_quant_wsz)
-                        acc_gate_part = jnp.dot(t_f32, w1_gate.astype(jnp.float32) * s_gate)
-                    else:
-                        acc_gate_part = jnp.dot(t_f32, w1_gate.astype(jnp.float32))
+                        num_subc = bd1_per_t_packing // subc_quant_wsz
+                        for subc_id in range(num_subc):
+                            start, end = subc_id * subc_quant_wsz, (subc_id + 1) * subc_quant_wsz
+                            t_sub = t_f32[:, start:end]
+                            w_sub = w1_gate[start:end, :]
+                            acc_gate_part = jnp.dot(
+                                t_sub, w_sub.astype(jnp.float32), preferred_element_type=jnp.float32
+                            )
 
-                    # W3
+                            s_gate_slices = (curr_sem, p_id, subc_id, 0, pl.ds(0, bse))
+                            s_gate = jnp.broadcast_to(
+                                b_se_w1_scale_x2_vmem[*s_gate_slices], acc_gate_part.shape
+                            )
+                            act_gate_acc += acc_gate_part * s_gate
+                    else:
+                        act_gate_acc += jnp.dot(
+                            t_f32, w1_gate.astype(jnp.float32), preferred_element_type=jnp.float32
+                        )
+
+                    # --- W3 (Up) ---
                     w3_up = b_se_w3_x2_vmem[curr_sem, p_id]
                     if w3_shared_scale_hbm is not None:
-                        s_up = b_se_w3_scale_x2_vmem[curr_sem, p_id]
-                        s_up = broadcast_quant_scale(s_up, bd1_per_t_packing, subc_quant_wsz)
-                        acc_up_part = jnp.dot(t_f32, w3_up.astype(jnp.float32) * s_up)
-                    else:
-                        acc_up_part = jnp.dot(t_f32, w3_up.astype(jnp.float32))
+                        num_subc = bd1_per_t_packing // subc_quant_wsz
+                        for subc_id in range(num_subc):
+                            start, end = subc_id * subc_quant_wsz, (subc_id + 1) * subc_quant_wsz
+                            t_sub = t_f32[:, start:end]
+                            w_sub = w3_up[start:end, :]
+                            acc_up_part = jnp.dot(
+                                t_sub, w_sub.astype(jnp.float32), preferred_element_type=jnp.float32
+                            )
 
-                    act_gate_acc += acc_gate_part
-                    act_up_acc += acc_up_part
+                            s_up_slices = (curr_sem, p_id, subc_id, 0, pl.ds(0, bse))
+                            s_up = jnp.broadcast_to(
+                                b_se_w3_scale_x2_vmem[*s_up_slices], acc_up_part.shape
+                            )
+                            act_up_acc += acc_up_part * s_up
+                    else:
+                        act_up_acc += jnp.dot(
+                            t_f32, w3_up.astype(jnp.float32), preferred_element_type=jnp.float32
+                        )
 
                 return (act_gate_acc, act_up_acc)
 
@@ -2133,36 +2148,53 @@ def _fused_ep_moe_kernel(
 
                     @pl.when(next_block_id < se_total_blocks)
                     def _():
-                        if num_bd1 > 0:
-                            start_fetch_se_w1(0, next_block_id, 0)
-                            start_fetch_se_w3(0, next_block_id, 0)
+                        start_fetch_se_w1(0, next_block_id, 0)
+                        start_fetch_se_w3(0, next_block_id, 0)
 
                 wait_fetch_se_w2(curr_sem)
 
                 for p_id in range(t_packing):
                     w2_val = b_se_w2_x2_vmem[curr_sem, p_id]
-
-                    if w2_shared_scale_hbm is not None:
-                        s2 = b_se_w2_scale_x2_vmem[curr_sem, p_id]
-                        s2 = broadcast_quant_scale(s2, bse, subc_quant_wsz)
-                        acc_chunk = jnp.dot(act, w2_val.astype(jnp.float32) * s2)
-                    else:
-                        acc_chunk = jnp.dot(act, w2_val.astype(jnp.float32))
-
                     hidden_offset = p_id * h_per_t_packing + bd2_idx * bd2_per_t_packing
 
-                    out_slice = b_output_x2_vmem.at[
-                        out_buf_id, pl.ds(0, bt), pl.ds(hidden_offset, bd2_per_t_packing)
-                    ]
+                    # 累加器初始化
+                    acc_chunk = jnp.zeros((bt, bd2_per_t_packing), dtype=jnp.float32)
 
+                    if w2_shared_scale_hbm is not None:
+                        num_subc = bse // subc_quant_wsz
+                        for subc_id in range(num_subc):
+                            start, end = subc_id * subc_quant_wsz, (subc_id + 1) * subc_quant_wsz
+                            act_sub = act[:, start:end]
+                            w2_sub = w2_val[start:end, :]
+                            res_sub = jnp.dot(
+                                act_sub,
+                                w2_sub.astype(jnp.float32),
+                                preferred_element_type=jnp.float32,
+                            )
+
+                            s2_slices = (curr_sem, p_id, subc_id, 0, pl.ds(0, bd2_per_t_packing))
+                            s2 = jnp.broadcast_to(b_se_w2_scale_x2_vmem[*s2_slices], res_sub.shape)
+                            acc_chunk += res_sub * s2
+                    else:
+                        acc_chunk = jnp.dot(
+                            act, w2_val.astype(jnp.float32), preferred_element_type=jnp.float32
+                        )
+
+                    # --- 修复重点：使用 pl.when 替换 Python 的 if block_id == 0 ---
                     @pl.when(block_id == 0)
-                    def _(out_slice=out_slice, acc_chunk=acc_chunk):
-                        out_slice[...] = acc_chunk.astype(t_dtype)
+                    def _(h=hidden_offset, a=acc_chunk):
+                        b_output_x2_vmem[out_buf_id, pl.ds(0, bt), pl.ds(h, bd2_per_t_packing)] = (
+                            a.astype(t_dtype)
+                        )
 
-                    @pl.when(block_id > 0)
-                    def _(out_slice=out_slice, acc_chunk=acc_chunk):
-                        out_slice[...] = (out_slice[...].astype(jnp.float32) + acc_chunk).astype(
-                            t_dtype
+                    @pl.when(block_id != 0)
+                    def _(h=hidden_offset, a=acc_chunk):
+                        old_val = b_output_x2_vmem[
+                            out_buf_id, pl.ds(0, bt), pl.ds(h, bd2_per_t_packing)
+                        ]
+                        new_val = (old_val.astype(jnp.float32) + a).astype(t_dtype)
+                        b_output_x2_vmem[out_buf_id, pl.ds(0, bt), pl.ds(h, bd2_per_t_packing)] = (
+                            new_val
                         )
 
             lax.fori_loop(0, num_bd2, body_w2, None)

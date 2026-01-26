@@ -30,22 +30,28 @@ class GateLogit(nnx.Module):
         self.score_func = score_func
 
         self.kernel = nnx.Param(
-            nnx.with_partitioning(nnx.initializers.normal(), (None, None))(
-                jax.random.PRNGKey(0), (input_size, num_experts), self.weight_dtype
-            )
+            jax.random.normal(
+                jax.random.PRNGKey(0),
+                (input_size, num_experts),
+                dtype=self.weight_dtype,
+                out_sharding=P(None, None),
+            ),
         )
         if enable_expert_bias:
             self.bias = nnx.Param(
-                nnx.with_partitioning(nnx.initializers.zeros_init(), (None,))(
-                    jax.random.PRNGKey(0), (num_experts,), self.weight_dtype
-                )
+                jax.random.normal(
+                    jax.random.PRNGKey(0),
+                    (num_experts,),
+                    dtype=self.weight_dtype,
+                    out_sharding=P(None),
+                ),
             )
         else:
             self.bias = None
 
     @named_scope
     def __call__(self, hidden_states: jax.Array) -> tuple[jax.Array, jax.Array | None]:
-        logits = hidden_states.astype(self.weight_dtype) @ self.kernel.value
+        logits = jnp.dot(hidden_states, self.kernel.value)
 
         if self.score_func:
             if self.score_func == "softmax":
@@ -832,143 +838,142 @@ class FusedEPMoE(nnx.Module):
         self.w3_shared_scale = None
         self.w2_shared_scale = None
 
-        self.subc_quant_wsz = 256  # Use default sub channel quantization block size
+        self.subc_quant_wsz = None  # Use default sub channel quantization block size
 
     def quantize_weights(self):
         """Quantize MoE weights in-place. Call once after model loading."""
         if self.quantized_dtype is None:
             return
 
-        # Replace original weights with quantized versions
-        w1_value, w1_scale = quantize_tensor(
-            self.quantized_dtype,
-            self.w1.value,
-            axis=1,
-            block_size=self.subc_quant_wsz,
-        )
-        w3_value, w3_scale = quantize_tensor(
-            self.quantized_dtype,
-            self.w3.value,
-            axis=1,
-            block_size=self.subc_quant_wsz,
-        )
-        w2_value, w2_scale = quantize_tensor(
-            self.quantized_dtype,
-            self.w2.value,
-            axis=1,
-            block_size=self.subc_quant_wsz,
-        )
+        return
 
-        self.w1 = nnx.Param(w1_value, out_sharding=P("tensor", None, None))
-        self.w3 = nnx.Param(w3_value, out_sharding=P("tensor", None, None))
-        self.w2 = nnx.Param(w2_value, out_sharding=P("tensor", None, None))
+        if hasattr(self, "subc_quant_wsz"):
+            del self.subc_quant_wsz
+            self.subc_quant_wsz = 256
 
-        print(f"w1_scale shape: {w1_scale.shape}")
-        print(f"w3_scale shape: {w3_scale.shape}")
-        print(f"w2_scale shape: {w2_scale.shape}")
-
-        # Update scales (reshape to 4D for GMM kernel)
-        # Wrap with nnx.data() to override static attribute status
-        if hasattr(self, "w1_scale"):
-            del self.w1_scale
-        self.w1_scale = nnx.Param(
-            w1_scale.reshape(
-                w1_scale.shape[0],
-                w1_scale.shape[1],
-                1,
-                w1_scale.shape[2],
-                out_sharding=P("tensor", None, None, None),
-            ),
-            out_sharding=P("tensor", None, None, None),
-        )
-        if hasattr(self, "w3_scale"):
-            del self.w3_scale
-        self.w3_scale = nnx.Param(
-            w3_scale.reshape(
-                w3_scale.shape[0],
-                w3_scale.shape[1],
-                1,
-                w3_scale.shape[2],
-                out_sharding=P("tensor", None, None, None),
-            ),
-            out_sharding=P("tensor", None, None, None),
-        )
-        if hasattr(self, "w2_scale"):
-            del self.w2_scale
-        self.w2_scale = nnx.Param(
-            w2_scale.reshape(
-                w2_scale.shape[0],
-                w2_scale.shape[1],
-                1,
-                w2_scale.shape[2],
-                out_sharding=P("tensor", None, None, None),
-            ),
-            out_sharding=P("tensor", None, None, None),
-        )
-
-        if self.w1_shared is not None:
-            w1_shared_value, w1_shared_scale = quantize_tensor(
+        with jax.set_mesh(self.mesh):
+            # Replace original weights with quantized versions
+            w1_value, w1_scale = quantize_tensor(
                 self.quantized_dtype,
-                self.w1_shared.value,
-                axis=0,
+                self.w1.value,
+                axis=1,
                 block_size=self.subc_quant_wsz,
             )
-            w3_shared_value, w3_shared_scale = quantize_tensor(
+            w3_value, w3_scale = quantize_tensor(
                 self.quantized_dtype,
-                self.w3_shared.value,
-                axis=0,
+                self.w3.value,
+                axis=1,
                 block_size=self.subc_quant_wsz,
             )
-            w2_shared_value, w2_shared_scale = quantize_tensor(
+            w2_value, w2_scale = quantize_tensor(
                 self.quantized_dtype,
-                self.w2_shared.value,
-                axis=0,
+                self.w2.value,
+                axis=1,
                 block_size=self.subc_quant_wsz,
             )
 
-            print(f"shape of w1_shared_scale: {w1_shared_scale.shape}")
-            print(f"shape of w3_shared_scale: {w3_shared_scale.shape}")
-            print(f"shape of w2_shared_scale: {w2_shared_scale.shape}")
+            self.w1 = nnx.Param(w1_value, out_sharding=P("tensor", None, None))
+            self.w3 = nnx.Param(w3_value, out_sharding=P("tensor", None, None))
+            self.w2 = nnx.Param(w2_value, out_sharding=P("tensor", None, None))
 
-            self.w1_shared = nnx.Param(w1_shared_value, out_sharding=P(None, None))
-            self.w3_shared = nnx.Param(w3_shared_value, out_sharding=P(None, None))
-            self.w2_shared = nnx.Param(w2_shared_value, out_sharding=P(None, None))
-
-            if hasattr(self, "w1_shared_scale"):
-                del self.w1_shared_scale
-            self.w1_shared_scale = nnx.Param(
-                w1_shared_scale.reshape(
-                    w1_shared_scale.shape[0],
+            # Update scales (reshape to 4D for GMM kernel)
+            # Wrap with nnx.data() to override static attribute status
+            if hasattr(self, "w1_scale"):
+                del self.w1_scale
+            self.w1_scale = nnx.Param(
+                w1_scale.reshape(
+                    w1_scale.shape[0],
+                    w1_scale.shape[1],
                     1,
-                    w1_shared_scale.shape[1],
-                    out_sharding=P(None, None, None),
+                    w1_scale.shape[2],
+                    out_sharding=P("tensor", None, None, None),
                 ),
-                out_sharding=P(None, None, None),
+                out_sharding=P("tensor", None, None, None),
+            )
+            if hasattr(self, "w3_scale"):
+                del self.w3_scale
+            self.w3_scale = nnx.Param(
+                w3_scale.reshape(
+                    w3_scale.shape[0],
+                    w3_scale.shape[1],
+                    1,
+                    w3_scale.shape[2],
+                    out_sharding=P("tensor", None, None, None),
+                ),
+                out_sharding=P("tensor", None, None, None),
+            )
+            if hasattr(self, "w2_scale"):
+                del self.w2_scale
+            self.w2_scale = nnx.Param(
+                w2_scale.reshape(
+                    w2_scale.shape[0],
+                    w2_scale.shape[1],
+                    1,
+                    w2_scale.shape[2],
+                    out_sharding=P("tensor", None, None, None),
+                ),
+                out_sharding=P("tensor", None, None, None),
             )
 
-            if hasattr(self, "w3_shared_scale"):
-                del self.w3_shared_scale
-            self.w3_shared_scale = nnx.Param(
-                w3_shared_scale.reshape(
-                    w3_shared_scale.shape[0],
-                    1,
-                    w3_shared_scale.shape[1],
-                    out_sharding=P(None, None, None),
-                ),
-                out_sharding=P(None, None, None),
-            )
+            if self.w1_shared is not None:
+                w1_shared_value, w1_shared_scale = quantize_tensor(
+                    self.quantized_dtype,
+                    self.w1_shared.value,
+                    axis=0,
+                    block_size=self.subc_quant_wsz,
+                )
+                w3_shared_value, w3_shared_scale = quantize_tensor(
+                    self.quantized_dtype,
+                    self.w3_shared.value,
+                    axis=0,
+                    block_size=self.subc_quant_wsz,
+                )
+                w2_shared_value, w2_shared_scale = quantize_tensor(
+                    self.quantized_dtype,
+                    self.w2_shared.value,
+                    axis=0,
+                    block_size=self.subc_quant_wsz,
+                )
 
-            if hasattr(self, "w2_shared_scale"):
-                del self.w2_shared_scale
-            self.w2_shared_scale = nnx.Param(
-                w2_shared_scale.reshape(
-                    w2_shared_scale.shape[0],
-                    1,
-                    w2_shared_scale.shape[1],
+                self.w1_shared = nnx.Param(w1_shared_value, out_sharding=P(None, None))
+                self.w3_shared = nnx.Param(w3_shared_value, out_sharding=P(None, None))
+                self.w2_shared = nnx.Param(w2_shared_value, out_sharding=P(None, None))
+
+                if hasattr(self, "w1_shared_scale"):
+                    del self.w1_shared_scale
+                self.w1_shared_scale = nnx.Param(
+                    w1_shared_scale.reshape(
+                        w1_shared_scale.shape[0],
+                        1,
+                        w1_shared_scale.shape[1],
+                        out_sharding=P(None, None, None),
+                    ),
                     out_sharding=P(None, None, None),
-                ),
-                out_sharding=P(None, None, None),
-            )
+                )
+
+                if hasattr(self, "w3_shared_scale"):
+                    del self.w3_shared_scale
+                self.w3_shared_scale = nnx.Param(
+                    w3_shared_scale.reshape(
+                        w3_shared_scale.shape[0],
+                        1,
+                        w3_shared_scale.shape[1],
+                        out_sharding=P(None, None, None),
+                    ),
+                    out_sharding=P(None, None, None),
+                )
+
+                if hasattr(self, "w2_shared_scale"):
+                    del self.w2_shared_scale
+                self.w2_shared_scale = nnx.Param(
+                    w2_shared_scale.reshape(
+                        w2_shared_scale.shape[0],
+                        1,
+                        w2_shared_scale.shape[1],
+                        out_sharding=P(None, None, None),
+                    ),
+                    out_sharding=P(None, None, None),
+                )
 
     def __call__(
         self,
