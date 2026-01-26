@@ -21,8 +21,13 @@ import setproctitle
 from PIL import Image
 from transformers import AutoConfig, AutoProcessor
 
-from sgl_jax.srt.managers.io_struct import AbortReq
-from sgl_jax.srt.managers.tokenizer_manager import TokenizerManager
+from sgl_jax.srt.managers.io_struct import (
+    AbortReq,
+    BatchEmbeddingOut,
+    BatchStrOut,
+    BatchTokenIDOut,
+)
+from sgl_jax.srt.managers.tokenizer_manager import ReqState, TokenizerManager
 from sgl_jax.srt.multimodal.common.modality_enum import Modality, MultimodalDataItem
 from sgl_jax.srt.multimodal.manager.io_struct import (
     DataType,
@@ -44,15 +49,10 @@ logger = logging.getLogger(__name__)
 
 
 @dataclasses.dataclass
-class MMReqState:
-    """Store the state of a request."""
+class MMReqState(ReqState):
+    """Store the state of a multimodal request."""
 
-    rid: str
-    out_list: list[dict[Any, Any]]
-    finished: bool
-    event: asyncio.Event
-    obj: GenerateMMReqInput
-    created_time: float
+    rid: str = ""
 
 
 class MultimodalTokenizer(TokenizerManager):
@@ -106,7 +106,7 @@ class MultimodalTokenizer(TokenizerManager):
         self._result_dispatcher = TypeBasedDispatcher(
             [
                 (
-                    (list),
+                    (BatchStrOut, BatchEmbeddingOut, BatchTokenIDOut, list),
                     self._handle_batch_output,
                 ),
                 (
@@ -116,15 +116,18 @@ class MultimodalTokenizer(TokenizerManager):
             ]
         )
 
-    def _handle_batch_output(self, reqs: list):
+    def _handle_batch_output(self, reqs: list | BatchStrOut | BatchEmbeddingOut | BatchTokenIDOut):
         """Handle a batch of outputs returned from the pipeline.
 
         Marks the corresponding `MMReqState` as finished, sets its event to
         wake any waiters, and stores a simple success meta record. If a
         result arrives for an unknown `rid` it logs a warning.
         """
-        if len(reqs) > 0 and self.server_args.log_requests:
+        if hasattr(reqs, "__len__") and len(reqs) > 0 and self.server_args.log_requests:
             logger.info("handle_batch_output %s, self.rid_to_state %s", reqs, self.rid_to_state)
+        if isinstance(reqs, (BatchStrOut, BatchEmbeddingOut, BatchTokenIDOut)):
+            return super()._handle_batch_output(reqs)
+
         for req in reqs:
             if req.rid in self.rid_to_state:
                 self.rid_to_state[req.rid].finished = True

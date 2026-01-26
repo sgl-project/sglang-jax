@@ -475,12 +475,13 @@ class Req:
 
     def _check_str_based_finish(self):
         # Check stop strings
-        if len(self.sampling_params.stop_strs) > 0:
+        stop_strs = self.sampling_params.stop_strs or []
+        if len(stop_strs) > 0:
             tail_str = self.tokenizer.decode(
                 self.output_ids[-(self.sampling_params.stop_str_max_len + 1) :]
             )
 
-            for stop_str in self.sampling_params.stop_strs:
+            for stop_str in stop_strs:
                 if stop_str in tail_str or stop_str in self.decoded_text:
                     self.finished_reason = FINISH_MATCHED_STR(matched=stop_str)
                     return True

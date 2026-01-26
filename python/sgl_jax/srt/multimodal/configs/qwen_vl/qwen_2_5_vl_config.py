@@ -1,8 +1,5 @@
 import dataclasses
 
-import jax.numpy as jnp
-from jax.lax import Precision
-
 from sgl_jax.srt.multimodal.configs.multimodal_base_config import MultiModalModelConfigs
 
 

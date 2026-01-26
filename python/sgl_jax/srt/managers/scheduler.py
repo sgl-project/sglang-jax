@@ -684,6 +684,7 @@ class Scheduler(
             import jax.numpy as jnp
 
             mm_items = recv_req.mm_inputs.get("mm_items", [])
+            cached_vision_embeds = recv_req.mm_inputs.get("cached_vision_embeds")
 
             # Filter for image and video items
             from sgl_jax.srt.multimodal.common.modality_enum import MultimodalDataItem
@@ -777,6 +778,8 @@ class Scheduler(
             else:
                 if image_items or video_items:
                     logger.warning("No pixel_values found in mm_items for request %s", recv_req.rid)
+            if cached_vision_embeds is not None:
+                req.cached_vision_embeds = cached_vision_embeds
         # Validate prompt length
         error_msg = validate_input_length(
             req,
