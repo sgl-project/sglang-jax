@@ -1392,52 +1392,29 @@ class ScheduleBatch:
         # Pad lora_ids to match seq_lens_cpu length (after bs padding)
         if bs_padding_size > 0:
             lora_ids = lora_ids + [None] * bs_padding_size
-        pixel_values = None
-        image_grid_thw = None
-        video_grid_thw = None
-        cached_vision_embeds = None
-        reqs_with_vision = []
+        multimodal_embedding = None
         if self.forward_mode == ForwardMode.EXTEND:
-            # Collect multimodal data from all requests in the batch
-            pixel_values_list = []
-            image_grid_thw_list = []
-            video_grid_thw_list = []
-            cached_vision_embeds_list = []
-            for req in self.reqs:
+            multimodal_embedding_list = []
+            for req, prefix_len, extend_len in zip(self.reqs, self.prefix_lens, self.extend_lens):
                 # Check for cached vision embeddings first (for chunked prefill)
-                if hasattr(req, "cached_vision_embeds") and req.cached_vision_embeds is not None:
-                    cached_vision_embeds_list.append(req.cached_vision_embeds)
-                    reqs_with_vision.append(req)
-                    # Still need grid info for embedding merge
-                    if hasattr(req, "image_grid_thw") and req.image_grid_thw is not None:
-                        for thw in req.image_grid_thw:
-                            image_grid_thw_list.append(thw)
-                    if hasattr(req, "video_grid_thw") and req.video_grid_thw is not None:
-                        for thw in req.video_grid_thw:
-                            video_grid_thw_list.append(thw)
-                elif hasattr(req, "pixel_values") and req.pixel_values is not None:
-                    pixel_values_list.append(req.pixel_values)
-                    reqs_with_vision.append(req)
-                    # Collect image grid data
-                    if hasattr(req, "image_grid_thw") and req.image_grid_thw is not None:
-                        # req.image_grid_thw is a tuple of (t, h, w) tuples, one per image
-                        # e.g., ((1, 98, 146), (1, 98, 146)) for 2 images
-                        for thw in req.image_grid_thw:
-                            image_grid_thw_list.append(thw)
-                    # Collect video grid data
-                    if hasattr(req, "video_grid_thw") and req.video_grid_thw is not None:
-                        # req.video_grid_thw is a tuple of (t, h, w) tuples, one per video
-                        # e.g., ((8, 98, 146),) for 1 video with 8 frames
-                        for thw in req.video_grid_thw:
-                            video_grid_thw_list.append(thw)
-
-            if pixel_values_list:
-                pixel_values = np.concatenate(pixel_values_list, axis=0)
-            if cached_vision_embeds_list:
-                cached_vision_embeds = np.concatenate(cached_vision_embeds_list, axis=0)
-            if image_grid_thw_list or video_grid_thw_list:
-                image_grid_thw = tuple(image_grid_thw_list) if image_grid_thw_list else None
-                video_grid_thw = tuple(video_grid_thw_list) if video_grid_thw_list else None
+                if (
+                    hasattr(req, "multimodal_embedding")
+                    and req.mm_inputs is not None
+                    and req.multimodal_embedding is not None
+                ):
+                    mm_full = np.asarray(req.multimodal_embedding)
+                    start = int(prefix_len or 0)
+                    end = start + int(extend_len or 0)
+                    multimodal_embedding_list.append(mm_full[start:end])
+            if multimodal_embedding_list:
+                multimodal_embedding = np.concatenate(multimodal_embedding_list, axis=0)
+                if len(multimodal_embedding) < len(input_ids_cpu):
+                    pad_rows = len(input_ids_cpu) - len(multimodal_embedding)
+                    pad = np.zeros(
+                        (pad_rows, multimodal_embedding.shape[1]),
+                        dtype=multimodal_embedding.dtype,
+                    )
+                    multimodal_embedding = np.concatenate([multimodal_embedding, pad], axis=0)
         return ModelWorkerBatch(
             bid=bid,
             forward_mode=self.forward_mode,
@@ -1470,12 +1447,7 @@ class ScheduleBatch:
                 CaptureHiddenMode.FULL if self.return_hidden_states else CaptureHiddenMode.NULL
             ),
             launch_done=self.launch_done,
-            input_embeds=None,  # Will be computed in model forward pass
-            pixel_values=pixel_values,
-            image_grid_thw=image_grid_thw,
-            video_grid_thw=video_grid_thw,
-            cached_vision_embeds=cached_vision_embeds,
-            reqs_with_vision=reqs_with_vision if reqs_with_vision else None,
+            multimodal_embedding=multimodal_embedding,
         )
 
     def get_spec_model_worker_batch(
@@ -1820,17 +1792,8 @@ class ModelWorkerBatch:
     capture_hidden_mode: CaptureHiddenMode = None
 
     tree_cache: BasePrefixCache = None
-    # The input Embeds
-    input_embeds: np.ndarray | None = None
 
-    # Multimodal data (for computing embeddings in forward pass)
-    pixel_values: np.ndarray | None = None
-    image_grid_thw: tuple | None = None
-    video_grid_thw: tuple | None = None
-    # Cached vision embeddings for chunked prefill (avoids re-running ViT)
-    cached_vision_embeds: np.ndarray | None = None
-    # List of requests with vision data (for caching embeddings back after computation)
-    reqs_with_vision: list | None = None
+    multimodal_embedding: np.ndarray | None = None
 
     def get_original_input_len(self):
         """

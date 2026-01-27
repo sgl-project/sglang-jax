@@ -23,3 +23,5 @@ class QwenVLModelVitConfig(MultiModalModelConfigs):
     fullatt_block_indexes = [7, 15, 23, 31]
     initializer_range = 0.02
     rms_norm_eps = 1e-05
+    vocab_size = 151936
+    text_hidden_size = 2048

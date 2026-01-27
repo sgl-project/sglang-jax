@@ -72,7 +72,6 @@ class Req:
     image_grid_thw: tuple | None = None
     video_grid_thw: tuple | None = None
     cache_input_ids: list[int] | None = None
-    multimodal_embeddings: jax.Array | None = None
 
     # Batch info
     num_outputs_per_prompt: int = 1

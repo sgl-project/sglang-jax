@@ -178,7 +178,7 @@ class ForwardBatch:
     attention_mask: jax.Array | None = None
     deterministic: bool = True
     # Multimodal cached vision embeddings (prefill only)
-    cached_vision_embeds: jax.Array | None = None
+    multimodal_embedding: jax.Array | None = None
 
     def tree_flatten(self):
         children = (
@@ -197,7 +197,7 @@ class ForwardBatch:
             self.lora_ranks,
             self.spec_info,
             self.attention_mask,
-            self.cached_vision_embeds,
+            self.multimodal_embedding,
         )
 
         aux_data = {
@@ -238,7 +238,7 @@ class ForwardBatch:
 
         # Handle optional children for backward compatibility
         obj.attention_mask = children[14] if len(children) > 14 else None
-        obj.cached_vision_embeds = children[15] if len(children) > 15 else None
+        obj.multimodal_embedding = children[15] if len(children) > 15 else None
 
         return obj
 
@@ -300,10 +300,10 @@ class ForwardBatch:
                 else None
             ),
         )
-        cached_vision_embeds = None
-        if batch.cached_vision_embeds is not None:
-            (cached_vision_embeds,) = device_array(
-                (batch.cached_vision_embeds,),
+        multimodal_embedding = None
+        if batch.multimodal_embedding is not None:
+            (multimodal_embedding,) = device_array(
+                (batch.multimodal_embedding,),
                 sharding=(
                     NamedSharding(model_runner.mesh, PartitionSpec())
                     if jax.process_count() == 1
@@ -356,7 +356,7 @@ class ForwardBatch:
             spec_info=batch.spec_info,
             spec_algorithm=batch.spec_algorithm,
             capture_hidden_mode=batch.capture_hidden_mode,
-            cached_vision_embeds=cached_vision_embeds,
+            multimodal_embedding=multimodal_embedding,
         )
 
         # Auto-generate attention mask for Encoder-only models (e.g. UMT5Encoder, BERT)

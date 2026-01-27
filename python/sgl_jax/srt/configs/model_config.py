@@ -17,6 +17,12 @@ from sgl_jax.srt.hf_transformers_utils import (
 from sgl_jax.srt.server_args import ServerArgs
 from sgl_jax.srt.utils.common_utils import get_bool_env_var
 
+
+class _EmptyQuantizationConfig:
+    def to_dict(self):
+        return {}
+
+
 logger = logging.getLogger(__name__)
 
 
@@ -104,7 +110,11 @@ class ModelConfig:
         )
 
         # Attach quantization config to hf_config so models can access it
-        self.hf_config.quantization_config = self.quantization_config
+        if self.quantization_config is not None:
+            self.hf_config.quantization_config = self.quantization_config
+        elif getattr(self.hf_config, "quantization_config", None) is None:
+            # Ensure HF config repr/serialization doesn't crash when quantization is unset.
+            self.hf_config.quantization_config = _EmptyQuantizationConfig()
 
         self.hf_generation_config = get_generation_config(
             config_path,

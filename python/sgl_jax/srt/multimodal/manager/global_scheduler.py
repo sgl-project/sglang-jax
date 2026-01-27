@@ -372,13 +372,6 @@ class GlobalScheduler:
             else:
                 for i, stage in enumerate(self.stage_list):
                     stage_result = Req.from_stage(stage.try_collect(), self.req_store)
-                    if stage_result is not None and self.server_args.log_requests:
-                        logger.info(
-                            "stage-%d result_type=%s is_final=%s",
-                            i,
-                            type(stage_result),
-                            self.stage_configs[i].final_output,
-                        )
                     if stage_result is None:
                         continue
                     if isinstance(stage_result, BatchTokenIDOut):
