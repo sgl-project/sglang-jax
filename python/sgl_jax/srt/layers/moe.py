@@ -7,6 +7,7 @@ from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.kernels.fused_moe.v1.kernel import FusedMoEBlockConfig, fused_ep_moe
 from sgl_jax.srt.kernels.gmm.megablox_gmm_backend import gmm
+from sgl_jax.srt.utils.jax_utils import is_tpu_runtime
 from sgl_jax.srt.utils.profiling_utils import named_scope
 
 
@@ -366,6 +367,7 @@ class EPMoE(nnx.Module):
             preferred_element_type=self.dtype,
             tiling=tiling_gate,
             group_offset=group_offset,
+            interpret=not is_tpu_runtime(),
         )
 
         layer_w1 = gmm(
@@ -375,6 +377,7 @@ class EPMoE(nnx.Module):
             preferred_element_type=self.dtype,
             tiling=tiling_gate,
             group_offset=group_offset,
+            interpret=not is_tpu_runtime(),
         )
 
         if self.activation == "silu":
@@ -392,6 +395,7 @@ class EPMoE(nnx.Module):
             preferred_element_type=self.dtype,
             tiling=tiling_down,
             group_offset=group_offset,
+            interpret=not is_tpu_runtime(),
         )
 
         if self.tp_size > 1:
