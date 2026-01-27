@@ -1,11 +1,4 @@
-"""
-Qwen3OmniMoe Vision Encoder main implementation.
-
-Follows sglang-jax patterns:
-- No @jax.jit decorators (JIT applied externally)
-- Static shapes via padding
-- Mesh context managed externally
-"""
+"""Qwen3OmniMoe Vision Encoder main implementation."""
 
 import jax
 import jax.numpy as jnp
@@ -114,10 +107,9 @@ class Qwen3OmniMoeVisionEncoder(nnx.Module):
         Returns:
             pos_embeds: (total_patches, hidden_size)
         """
-        # Extract grid dimensions
-        grid_ts = grid_thw[:, 0]  # Temporal
-        grid_hs = grid_thw[:, 1]  # Height patches
-        grid_ws = grid_thw[:, 2]  # Width patches
+        grid_ts = grid_thw[:, 0]
+        grid_hs = grid_thw[:, 1]
+        grid_ws = grid_thw[:, 2]
 
         all_pos_embeds = []
 
@@ -163,34 +155,20 @@ class Qwen3OmniMoeVisionEncoder(nnx.Module):
             emb_bl = self.pos_embed(idx_bl)
             emb_br = self.pos_embed(idx_br)
 
-            # Compute weights using broadcasting (avoid jnp.repeat/tile for sharding compatibility)
-            # dh: (h_val,), dw: (w_val,)
-            dh_2d = dh[:, None]  # (h_val, 1)
-            dw_2d = dw[None, :]  # (1, w_val)
+            # Bilinear interpolation weights
+            dh_2d = dh[:, None]
+            dw_2d = dw[None, :]
+            w_tl = ((1 - dh_2d) * (1 - dw_2d)).reshape(-1, 1)
+            w_tr = ((1 - dh_2d) * dw_2d).reshape(-1, 1)
+            w_bl = (dh_2d * (1 - dw_2d)).reshape(-1, 1)
+            w_br = (dh_2d * dw_2d).reshape(-1, 1)
 
-            # Compute 2D weight grids, then flatten
-            w_tl_2d = (1 - dh_2d) * (1 - dw_2d)  # (h_val, w_val)
-            w_tr_2d = (1 - dh_2d) * dw_2d  # (h_val, w_val)
-            w_bl_2d = dh_2d * (1 - dw_2d)  # (h_val, w_val)
-            w_br_2d = dh_2d * dw_2d  # (h_val, w_val)
-
-            # Flatten and add dimension for broadcasting with embeddings
-            w_tl = w_tl_2d.reshape(-1, 1)  # (h*w, 1)
-            w_tr = w_tr_2d.reshape(-1, 1)
-            w_bl = w_bl_2d.reshape(-1, 1)
-            w_br = w_br_2d.reshape(-1, 1)
-
-            # Bilinear interpolation
             pos_embed = emb_tl * w_tl + emb_tr * w_tr + emb_bl * w_bl + emb_br * w_br
 
-            # Repeat for temporal dimension using broadcast_to (sharding compatible)
-            # (h*w, hidden_size) -> (t*h*w, hidden_size)
+            # Repeat for temporal and apply spatial-merge permutation
             pos_embed = jnp.broadcast_to(
                 pos_embed[None, :, :], (t_val, h_val * w_val, pos_embed.shape[-1])
-            )  # (t, h*w, hidden_size)
-
-            # Flatten to (t*h*w, hidden_size) with spatial-merge permutation
-            # Apply spatial merge: (t, h//m, m, w//m, m) -> (t, h//m, w//m, m, m) -> flatten
+            )
             merge_size = self.config.spatial_merge_size
             pos_embed = pos_embed.reshape(
                 t_val,
@@ -200,9 +178,7 @@ class Qwen3OmniMoeVisionEncoder(nnx.Module):
                 merge_size,
                 self.config.hidden_size,
             )
-            # Permute: (t, h//m, m_h, w//m, m_w, d) -> (t, h//m, w//m, m_h, m_w, d)
             pos_embed = jnp.transpose(pos_embed, (0, 1, 3, 2, 4, 5))
-            # Flatten: (t * (h//m) * (w//m) * m * m, hidden_size)
             pos_embed = pos_embed.reshape(-1, self.config.hidden_size)
 
             all_pos_embeds.append(pos_embed)
@@ -373,8 +349,6 @@ class Qwen3OmniMoeVisionEncoder(nnx.Module):
             mask = mask.at[offset : offset + seq_len, offset : offset + seq_len].set(0.0)
             offset += seq_len
 
-        # Return mask as (total_patches, total_patches) for broadcasting with
-        # attn_weights shape (num_heads, total_patches, total_patches)
         return mask
 
     def _validate_input_shapes(self, grid_thw: jax.Array):
@@ -458,10 +432,6 @@ class Qwen3OmniMoeVisionEncoder(nnx.Module):
         # 7. Final projection (merger)
         merged_hidden_states = self.merger(hidden_states)
 
-        # Match PyTorch's output structure:
-        # - last_hidden_state: pre-merger transformer output (for compatibility)
-        # - pooler_output: post-merger output (projected to LLM hidden size)
-        # - encoder_hidden_state: alias for pre-merger output (for clarity)
         return {
             "last_hidden_state": hidden_states,  # Pre-merger: (total_patches, hidden_size)
             "pooler_output": merged_hidden_states,  # Post-merger: (merged_patches, out_hidden_size)
@@ -478,58 +448,56 @@ class Qwen3OmniMoeVisionEncoder(nnx.Module):
 
         Note:
             Weight loading must be done within mesh context for proper TP sharding.
-            This method uses self.mesh which was set during initialization.
         """
         import glob
         import os
 
+        import numpy as np
+        from flax import nnx
         from safetensors import safe_open
 
         from .vision_weights_mapping import create_vision_encoder_weight_mappings
 
-        # Create weight mappings
-        weight_mappings = create_vision_encoder_weight_mappings(self.config)
-
-        # Scan safetensors files to find actual keys
+        # Scan safetensors files
         safetensor_files = glob.glob(os.path.join(model_path, "*.safetensors"))
         if not safetensor_files:
             return
 
         # Build key -> file mapping
-        all_keys = {}
+        key_to_file = {}
         for sf_file in safetensor_files:
             with safe_open(sf_file, framework="np") as f:
                 for key in f.keys():  # noqa: SIM118
-                    all_keys[key] = sf_file
+                    key_to_file[key] = sf_file
 
-        # Load weights with prefix detection
-        # IMPORTANT: Must be within mesh context for proper TP sharding
-        import jax.numpy as jnp
-        import numpy as np
-        from flax import nnx
+        # Possible HF prefixes
+        prefixes = ["", "thinker.visual.", "vision_encoder.", "model.vision_encoder."]
 
-        # Enter mesh context for weight loading (required for TP sharding)
+        def find_hf_key(key: str) -> str | None:
+            """Find actual HF key with prefix detection."""
+            for prefix in prefixes:
+                if prefix + key in key_to_file:
+                    return prefix + key
+            return None
+
+        def get_param(path: str):
+            """Navigate to parameter by dot-separated path."""
+            obj = self
+            for p in path.split("."):
+                obj = obj[int(p)] if p.isdigit() else getattr(obj, p)
+            return obj
+
+        # Load weights within mesh context for TP sharding
+        weight_mappings = create_vision_encoder_weight_mappings(self.config)
+
         with jax.set_mesh(self.mesh):
             for mapping_key, mapping in weight_mappings.items():
-                # Try to find the HF key (with or without prefix)
-                hf_key = None
-                for candidate in [
-                    mapping_key,
-                    f"thinker.visual.{mapping_key}",
-                    f"vision_encoder.{mapping_key}",
-                    f"model.vision_encoder.{mapping_key}",
-                ]:
-                    if candidate in all_keys:
-                        hf_key = candidate
-                        break
-
+                hf_key = find_hf_key(mapping_key)
                 if hf_key is None:
                     continue
 
-                # Load weight
                 try:
-                    sf_file = all_keys[hf_key]
-                    with safe_open(sf_file, framework="np") as f:
+                    with safe_open(key_to_file[hf_key], framework="np") as f:
                         weight = f.get_tensor(hf_key)
 
                     # Apply transformations
@@ -539,15 +507,8 @@ class Qwen3OmniMoeVisionEncoder(nnx.Module):
                         weight = np.transpose(weight)
 
                     # Set parameter
-                    target_path = mapping.target_path
-                    parts = target_path.split(".")
-                    param = self
-                    for p in parts:
-                        param = param[int(p)] if p.isdigit() else getattr(param, p)
-
+                    param = get_param(mapping.target_path)
                     if isinstance(param, nnx.Variable):
-                        # Use [...] syntax for Flax NNX 0.12.0+ compatibility
                         param[...] = jnp.array(weight, dtype=param[...].dtype)
-
                 except Exception:
                     pass
