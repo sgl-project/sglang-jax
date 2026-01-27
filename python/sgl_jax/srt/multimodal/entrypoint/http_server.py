@@ -19,10 +19,18 @@ from sgl_jax.srt.managers.template_manager import TemplateManager
 from sgl_jax.srt.multimodal.common.ServerArgs import MultimodalServerArgs
 from sgl_jax.srt.multimodal.manager.global_scheduler import run_global_scheduler_process
 from sgl_jax.srt.multimodal.manager.io_struct import (
+    AudioDecodeRequest,
+    AudioDecodeResponse,
+    AudioEncodeRequest,
+    AudioEncodeResponse,
+    AudioGenerationRequest,
+    AudioGenerationResponse,
     DataType,
     GenerateMMReqInput,
     GenerateVLMReqInput,
     ImageGenerationsRequest,
+    TTSRequest,
+    TTSResponse,
     VideoGenerationsRequest,
 )
 from sgl_jax.srt.multimodal.manager.multimodal_detokenizer import (
@@ -196,6 +204,55 @@ async def videos_generation(obj: VideoGenerationsRequest, request: Request):
         return ret
     except ValueError as e:
         logger.error("[http_server] Error: %s", e)
+        return _create_error_response(e)
+
+
+@app.api_route("/api/v1/audio/encode", methods=["POST"])
+async def audio_encode(obj: AudioEncodeRequest, request: Request):
+    try:
+        from sgl_jax.srt.entrypoints.http_server import _global_state
+
+        ret = await _global_state.tokenizer_manager.encode_audio(obj, request)
+        return ret
+    except ValueError as e:
+        logger.error("[http_server] audio_encode error: %s", e)
+        return _create_error_response(e)
+
+
+@app.api_route("/api/v1/audio/decode", methods=["POST"])
+async def audio_decode(obj: AudioDecodeRequest, request: Request):
+    try:
+        from sgl_jax.srt.entrypoints.http_server import _global_state
+
+        ret = await _global_state.tokenizer_manager.decode_audio(obj, request)
+        return ret
+    except ValueError as e:
+        logger.error("[http_server] audio_decode error: %s", e)
+        return _create_error_response(e)
+
+
+@app.api_route("/api/v1/audio/generation", methods=["POST"])
+async def audio_generation(obj: AudioGenerationRequest, request: Request):
+    try:
+        from sgl_jax.srt.entrypoints.http_server import _global_state
+
+        ret = await _global_state.tokenizer_manager.generate_audio(obj, request)
+        return ret
+    except ValueError as e:
+        logger.error("[http_server] audio_generation error: %s", e)
+        return _create_error_response(e)
+
+
+@app.api_route("/api/v1/audio/tts", methods=["POST"])
+async def text_to_speech(obj: TTSRequest, request: Request):
+    """Text-to-Speech endpoint."""
+    try:
+        from sgl_jax.srt.entrypoints.http_server import _global_state
+
+        ret = await _global_state.tokenizer_manager.tts(obj, request)
+        return ret
+    except ValueError as e:
+        logger.error("[http_server] tts error: %s", e)
         return _create_error_response(e)
 
 
@@ -386,6 +443,11 @@ def _is_wan_model(model_path: str) -> bool:
     return "wan" in model_path.lower()
 
 
+def _is_audio_model(model_path: str) -> bool:
+    """Check if the model is an audio model based on model path."""
+    return "mimo-audio" in model_path.lower() or "audio-tokenizer" in model_path.lower()
+
+
 def _execute_multimodal_server_warmup(
     server_args: MultimodalServerArgs,
     pipe_finish_writer: mp.connection.Connection | None,
@@ -447,6 +509,13 @@ def _execute_multimodal_server_warmup(
             "prompt": "warmup request",
             "size": "480*832",
             "num_inference_steps": 2,
+            "save_output": False,
+        }
+    elif _is_audio_model(server_args.model_path):
+        request_endpoint = "/api/v1/audio/generation"
+        json_data = {
+            "audio_data": "",
+            "sample_rate": 24000,
             "save_output": False,
         }
     else:

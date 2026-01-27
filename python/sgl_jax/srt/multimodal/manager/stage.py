@@ -11,10 +11,20 @@ from sgl_jax.srt.managers.scheduler import Scheduler as AutoRegressiveScheduler
 from sgl_jax.srt.models.qwen2 import Qwen2ForCausalLM
 from sgl_jax.srt.models.umt5 import UMT5EncoderModel
 from sgl_jax.srt.multimodal.manager.device_manager import DeviceManager
+from sgl_jax.srt.multimodal.manager.scheduler.audio_backbone_scheduler import (
+    AudioBackboneScheduler,
+)
+from sgl_jax.srt.multimodal.manager.scheduler.audio_scheduler import AudioScheduler
 from sgl_jax.srt.multimodal.manager.scheduler.diffusion_scheduler import (
     DiffusionScheduler,
 )
 from sgl_jax.srt.multimodal.manager.scheduler.vae_scheduler import VaeScheduler
+from sgl_jax.srt.multimodal.models.mimo_audio.mimo_audio_backbone import (
+    MiMoAudioForCausalLM,
+)
+from sgl_jax.srt.multimodal.models.mimo_audio.mimo_audio_tokenizer import (
+    FlaxMiMoAudioTokenizer,
+)
 from sgl_jax.srt.multimodal.manager.scheduler.vit_scheduler import VitScheduler
 from sgl_jax.srt.multimodal.models.qwen2_5VL.qwen2_5_vit import Qwen2_5_VL_VisionModel
 from sgl_jax.srt.multimodal.models.qwen2_5VL.qwen2_5_vl_generation import (
@@ -122,10 +132,23 @@ class Stage:
             comm_backend = QueueBackend(in_queue=self._in_queue, out_queue=self._out_queue)
             model_class = get_model_class(self.stage_config.model_class)
             stage_sub_dir = getattr(self.stage_config, "stage_sub_dir", None)
+
+            # Use per-stage model_path if available, otherwise fall back to server_args
+            stage_model_path = getattr(self.stage_config, "model_path", None)
+            if stage_model_path:
+                # Create a copy of server_args with the stage-specific model_path
+                import dataclasses
+
+                stage_server_args = dataclasses.replace(
+                    self.server_args, model_path=stage_model_path
+                )
+            else:
+                stage_server_args = self.server_args
+
             self._stage_scheduler = scheduler_class(
                 communication_backend=comm_backend,
                 mesh=self.mesh,
-                server_args=self.server_args,
+                server_args=stage_server_args,
                 model_class=model_class,
                 stage_sub_dir=stage_sub_dir,
                 **self.stage_config.scheduler_params,
@@ -165,11 +188,17 @@ def get_scheduler_class(name: str):
     if name == "diffusion":
         return DiffusionScheduler
     elif name == "auto_regressive":
-        # TODO add eventloop for auto regressive scheduler
         return AutoRegressiveScheduler
     elif name == "vae":
-        # TODO add eventloop for VAE scheduler
         return VaeScheduler
+    elif name == "audio":
+        return AudioScheduler
+    elif name == "audio_encoder":
+        return AudioScheduler
+    elif name == "audio_decoder":
+        return AudioScheduler
+    elif name == "audio_backbone":
+        return AudioBackboneScheduler
     elif name == "vit":
         return VitScheduler
     else:
@@ -191,5 +220,9 @@ def get_model_class(name: str):
         return Qwen2_5_VL_VisionModel
     elif name == "Qwen2ForCausalLM":
         return Qwen2ForCausalLM
+    elif name == "FlaxMiMoAudioTokenizer":
+        return FlaxMiMoAudioTokenizer
+    elif name == "MiMoAudioForCausalLM":
+        return MiMoAudioForCausalLM
     else:
         raise ValueError(f"Unknown model name: {name}")

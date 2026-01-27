@@ -74,20 +74,22 @@ class MultimodalDetokenizer(DetokenizerManager):
         expectations.
         """
 
-        if req.output is None or len(req.output) == 0:
+        logger.info("save_result...")
+        if req.output is None or (hasattr(req.output, '__len__') and len(req.output) == 0):
             logger.warning("No output to save for request id: %s", req.rid)
             return [req]
+
+        if req.data_type == DataType.AUDIO:
+            return [req]
+
         sample = req.output[0]
         if sample.ndim == 3:
-            # for images, dim t is missing
             sample = sample.unsqueeze(1)
         frames = []
         for x in sample:
             frames.append((np.clip(x / 2 + 0.5, 0, 1) * 255).astype(np.uint8))
 
-        # Save outputs if requested
         if req.save_output:
-            # if req.output_file_name:
             if req.data_type == DataType.VIDEO:
                 req.output_file_name = req.rid + ".mp4"
                 imageio.mimsave(
@@ -116,7 +118,6 @@ def run_multimodal_detokenizer_process(
     runs its event loop. On unhandled exceptions the parent process is
     signaled to terminate.
     """
-
     kill_itself_when_parent_died()
     setproctitle.setproctitle("sglang-jax::multimodal_detokenizer")
     configure_logger(server_args)

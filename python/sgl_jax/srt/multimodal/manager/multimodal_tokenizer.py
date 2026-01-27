@@ -6,7 +6,6 @@ import io
 import logging
 import os
 import signal
-import tempfile
 import time
 import uuid
 from http import HTTPStatus
@@ -30,10 +29,19 @@ from sgl_jax.srt.managers.io_struct import (
 from sgl_jax.srt.managers.tokenizer_manager import ReqState, TokenizerManager
 from sgl_jax.srt.multimodal.common.modality_enum import Modality, MultimodalDataItem
 from sgl_jax.srt.multimodal.manager.io_struct import (
+    AudioDecodeRequest,
+    AudioDecodeResponse,
+    AudioEncodeRequest,
+    AudioEncodeResponse,
+    AudioGenerationRequest,
+    AudioGenerationResponse,
+    DataType,
     DataType,
     GenerateMMReqInput,
     GenerateVLMReqInput,
     TokenizedGenerateMMReqInput,
+    TTSRequest,
+    TTSResponse,
     TokenizedGenerateVLMReqInput,
 )
 from sgl_jax.srt.multimodal.manager.mrope_utils import compute_mrope_positions
@@ -102,6 +110,10 @@ class MultimodalTokenizer(TokenizerManager):
                 break
             except Exception as exc:
                 logger.warning("Failed to load processor/config from %s: %s", candidate, exc)
+
+        # Initialize audio processor (WhisperFeatureExtractor) for audio models
+        self.audio_processor = None
+        self._init_audio_processor(server_args.model_path)
         self.rid_to_state: dict[str, MMReqState] = {}
         self._result_dispatcher = TypeBasedDispatcher(
             [
@@ -115,6 +127,119 @@ class MultimodalTokenizer(TokenizerManager):
                 ),
             ]
         )
+
+    def _init_audio_processor(self, model_path: str):
+        """Initialize audio processor for audio models using transformers FeatureExtractor.
+
+        This loads the audio config and initializes a WhisperFeatureExtractor-like processor
+        that uses numpy (not JAX) for mel spectrogram computation.
+        """
+        import json
+        import os
+
+        model_paths_to_try = [model_path]
+
+        # Load stage config to find audio encoder model path
+        try:
+            from sgl_jax.srt.multimodal.models.static_configs import get_stage_config_path
+            from sgl_jax.srt.multimodal.manager.utils import load_stage_configs_from_yaml
+
+            stage_config_path = get_stage_config_path(model_path)
+            stage_configs = load_stage_configs_from_yaml(stage_config_path)
+
+            for stage_cfg in stage_configs:
+                scheduler = getattr(stage_cfg, 'scheduler', None)
+                if scheduler == "audio_encoder":
+                    audio_model_path = getattr(stage_cfg, 'model_path', None)
+                    if audio_model_path and audio_model_path not in model_paths_to_try:
+                        model_paths_to_try.insert(0, audio_model_path)
+                    break
+        except Exception as e:
+            logger.warning("Could not load stage config: %s", e)
+
+        # Fallback for MiMo Audio models
+        if "mimo" in model_path.lower() and "audio" in model_path.lower():
+            if "XiaomiMiMo/MiMo-Audio-Tokenizer" not in model_paths_to_try:
+                model_paths_to_try.append("XiaomiMiMo/MiMo-Audio-Tokenizer")
+
+        logger.warning("Attempting to init audio processor from paths: %s", model_paths_to_try)
+
+        for try_path in model_paths_to_try:
+            try:
+                import huggingface_hub
+                if os.path.isdir(try_path):
+                    config_path = os.path.join(try_path, "config.json")
+                else:
+                    try:
+                        config_path = huggingface_hub.hf_hub_download(try_path, "config.json", local_files_only=True)
+                    except Exception:
+                        config_path = huggingface_hub.hf_hub_download(try_path, "config.json", local_files_only=False)
+
+                with open(config_path, "r") as f:
+                    config = json.load(f)
+
+                if "n_mels" in config and "sampling_rate" in config:
+                    # Use transformers WhisperFeatureExtractor (numpy-based, no JAX dependency)
+                    from transformers import WhisperFeatureExtractor
+
+                    self.audio_processor = WhisperFeatureExtractor(
+                        feature_size=config.get("n_mels", 128),
+                        sampling_rate=config.get("sampling_rate", 24000),
+                        hop_length=config.get("hop_length", 240),
+                        n_fft=config.get("nfft", 960),
+                        padding_value=0.0,
+                        return_attention_mask=False,
+                    )
+                    logger.warning("Initialized WhisperFeatureExtractor from %s", try_path)
+                    return
+            except Exception as e:
+                logger.warning("Failed to init audio processor from %s: %s", try_path, e)
+                import traceback
+                logger.warning("Traceback: %s", traceback.format_exc())
+
+        logger.warning("Could not initialize audio processor")
+
+    def _preprocess_audio_to_mel(self, audio_array: np.ndarray) -> tuple:
+        """Convert raw audio waveform to mel spectrogram using WhisperFeatureExtractor.
+
+        Args:
+            audio_array: Raw audio waveform as numpy array, shape (samples,).
+
+        Returns:
+            Tuple of (mel_spectrogram, input_lengths) as numpy arrays.
+            mel_spectrogram shape: [batch, time, n_mels]
+            Note: Returns numpy arrays to avoid JAX initialization in tokenizer process.
+        """
+        if self.audio_processor is None:
+            raise ValueError("Audio processor not initialized. Cannot preprocess audio.")
+
+        # WhisperFeatureExtractor expects 1D array or list of 1D arrays
+        if audio_array.ndim == 2:
+            audio_array = audio_array.squeeze(0)
+
+        # Extract mel features using WhisperFeatureExtractor
+        # IMPORTANT: Set padding=False to prevent automatic padding to 30 seconds
+        # Returns dict with 'input_features' key, shape [batch, n_mels, time]
+        features = self.audio_processor(
+            audio_array,
+            sampling_rate=self.audio_processor.sampling_rate,
+            return_tensors="np",
+            padding=False,  # Do not pad to fixed length
+        )
+        mels = features["input_features"]  # shape: [batch, n_mels, time]
+
+        # Transpose to [batch, time, n_mels] - stay in numpy, no JAX
+        mels = np.transpose(mels, (0, 2, 1))  # [batch, time, n_mels]
+        input_lens = np.array([mels.shape[1]])
+
+        logger.warning(
+            "Audio preprocessing: input_samples=%d, mel_shape=%s, input_lens=%s",
+            len(audio_array) if audio_array.ndim == 1 else audio_array.shape[-1],
+            mels.shape,
+            input_lens,
+        )
+
+        return mels, input_lens
 
     def _handle_batch_output(self, reqs: list | BatchStrOut | BatchEmbeddingOut | BatchTokenIDOut):
         """Handle a batch of outputs returned from the pipeline.
@@ -132,7 +257,15 @@ class MultimodalTokenizer(TokenizerManager):
             if req.rid in self.rid_to_state:
                 self.rid_to_state[req.rid].finished = True
                 self.rid_to_state[req.rid].event.set()
-                self.rid_to_state[req.rid].out_list = [{"success": True, "meta_info": {}}]
+
+                out_data = {"success": True, "meta_info": {}}
+                if hasattr(req, "audio_mode") and req.audio_mode is not None:
+                    if req.audio_mode == "encode" and req.output is not None:
+                        out_data["codes"] = req.output.tolist() if hasattr(req.output, "tolist") else req.output
+                    elif req.audio_mode == "decode" and req.output is not None:
+                        out_data["audio_data"] = req.output
+
+                self.rid_to_state[req.rid].out_list = [out_data]
             else:
                 logger.warning(
                     "Received result for unknown request rid=%s. Known rids: %s",
@@ -541,6 +674,299 @@ class MultimodalTokenizer(TokenizerManager):
                     raise ValueError(
                         f"Request is disconnected from the client side. Abort request rid={state.rid}"
                     )
+
+    async def encode_audio(
+        self,
+        obj: AudioEncodeRequest,
+        request: fastapi.Request | None = None,
+    ):
+        """Encode audio data to codes using the audio tokenizer.
+
+        Args:
+            obj: AudioEncodeRequest containing base64 encoded audio data.
+            request: FastAPI request object for disconnect handling.
+
+        Returns:
+            AudioEncodeResponse containing the encoded codes.
+        """
+        created_time = time.time()
+        async with self._cond:
+            await self._cond.wait_for(lambda: not self._updating)
+
+        self.auto_create_handle_loop()
+
+        rid = uuid.uuid4().hex
+
+        if obj.audio_data:
+            audio_bytes = base64.b64decode(obj.audio_data)
+            audio_array = np.frombuffer(audio_bytes, dtype=np.float32)
+        else:
+            audio_array = np.zeros((24000,), dtype=np.float32)
+
+        # Preprocess audio to mel spectrogram in tokenizer
+        mel_input, mel_input_lens = self._preprocess_audio_to_mel(audio_array)
+
+        from sgl_jax.srt.multimodal.manager.schedule_batch import Req
+
+        audio_req = Req(
+            rid=rid,
+            mel_input=mel_input,
+            mel_input_lens=mel_input_lens,
+            audio_mode="encode",
+            use_quantizer=obj.use_quantizer,
+            n_q=obj.n_q,
+            sample_rate=obj.sample_rate,
+            data_type=DataType.AUDIO,
+        )
+
+        state = MMReqState(
+            rid=rid,
+            out_list=[],
+            finished=False,
+            event=asyncio.Event(),
+            obj=obj,
+            created_time=created_time,
+        )
+        self.rid_to_state[rid] = state
+
+        self.send_to_scheduler.send_pyobj(audio_req)
+
+        try:
+            await asyncio.wait_for(state.event.wait(), timeout=self.wait_timeout)
+        except TimeoutError:
+            raise ValueError(f"Audio encode request timed out for rid={rid}") from None
+
+        del self.rid_to_state[rid]
+
+        out = state.out_list[-1] if state.out_list else {"success": True, "meta_info": {}}
+
+        return AudioEncodeResponse(
+            id=rid,
+            codes=out.get("codes"),
+            hidden_states_shape=out.get("hidden_states_shape"),
+        )
+
+    async def decode_audio(
+        self,
+        obj: AudioDecodeRequest,
+        request: fastapi.Request | None = None,
+    ):
+        """Decode codes to audio data using the audio tokenizer.
+
+        Args:
+            obj: AudioDecodeRequest containing the codes to decode.
+            request: FastAPI request object for disconnect handling.
+
+        Returns:
+            AudioDecodeResponse containing base64 encoded audio data.
+        """
+        created_time = time.time()
+        async with self._cond:
+            await self._cond.wait_for(lambda: not self._updating)
+
+        self.auto_create_handle_loop()
+
+        rid = uuid.uuid4().hex
+
+        codes_array = np.array(obj.codes, dtype=np.int32)
+
+        from sgl_jax.srt.multimodal.manager.schedule_batch import Req
+
+        audio_req = Req(
+            rid=rid,
+            codes=codes_array,
+            audio_mode="decode",
+            data_type=DataType.AUDIO,
+        )
+
+        state = MMReqState(
+            rid=rid,
+            out_list=[],
+            finished=False,
+            event=asyncio.Event(),
+            obj=obj,
+            created_time=created_time,
+        )
+        self.rid_to_state[rid] = state
+
+        self.send_to_scheduler.send_pyobj(audio_req)
+
+        try:
+            await asyncio.wait_for(state.event.wait(), timeout=self.wait_timeout)
+        except TimeoutError:
+            raise ValueError(f"Audio decode request timed out for rid={rid}") from None
+
+        del self.rid_to_state[rid]
+
+        out = state.out_list[-1] if state.out_list else {"success": True, "meta_info": {}}
+
+        audio_data_b64 = None
+        if out.get("audio_data") is not None:
+            audio_bytes = out["audio_data"].astype(np.float32).tobytes()
+            audio_data_b64 = base64.b64encode(audio_bytes).decode("utf-8")
+
+        return AudioDecodeResponse(
+            id=rid,
+            audio_data=audio_data_b64,
+            sample_rate=24000,
+        )
+
+    async def generate_audio(
+        self,
+        obj: AudioGenerationRequest,
+        request: fastapi.Request | None = None,
+    ):
+        created_time = time.time()
+        async with self._cond:
+            await self._cond.wait_for(lambda: not self._updating)
+
+        self.auto_create_handle_loop()
+
+        rid = uuid.uuid4().hex
+
+        if obj.audio_data:
+            audio_bytes = base64.b64decode(obj.audio_data)
+            audio_array = np.frombuffer(audio_bytes, dtype=np.float32)
+        else:
+            audio_array = np.zeros((24000,), dtype=np.float32)
+
+        # Preprocess audio to mel spectrogram in tokenizer
+        mel_input, mel_input_lens = self._preprocess_audio_to_mel(audio_array)
+
+        input_ids = None
+        if obj.prompt and self.tokenizer is not None:
+            encoded = self.tokenizer(obj.prompt)
+            input_ids = encoded["input_ids"]
+
+        from sgl_jax.srt.multimodal.manager.schedule_batch import Req
+
+        audio_req = Req(
+            rid=rid,
+            mel_input=mel_input,
+            mel_input_lens=mel_input_lens,
+            audio_mode="generation",
+            sample_rate=obj.sample_rate,
+            data_type=DataType.AUDIO,
+            save_output=obj.save_output,
+            prompt=obj.prompt,
+            input_ids=input_ids,
+            n_q=8,
+        )
+
+        state = MMReqState(
+            rid=rid,
+            out_list=[],
+            finished=False,
+            event=asyncio.Event(),
+            obj=obj,
+            created_time=created_time,
+        )
+        self.rid_to_state[rid] = state
+
+        self.send_to_scheduler.send_pyobj(audio_req)
+
+        try:
+            await asyncio.wait_for(state.event.wait(), timeout=self.wait_timeout)
+        except TimeoutError:
+            raise ValueError(f"Audio generation request timed out for rid={rid}") from None
+
+        del self.rid_to_state[rid]
+
+        out = state.out_list[-1] if state.out_list else {"success": True, "meta_info": {}}
+
+        audio_data_b64 = None
+        if out.get("audio_data") is not None:
+            audio_bytes = out["audio_data"].astype(np.float32).tobytes()
+            audio_data_b64 = base64.b64encode(audio_bytes).decode("utf-8")
+
+        return AudioGenerationResponse(
+            id=rid,
+            audio_data=audio_data_b64,
+            sample_rate=obj.sample_rate,
+        )
+
+    async def tts(
+        self,
+        obj: TTSRequest,
+        request: fastapi.Request | None = None,
+    ):
+        """Text-to-Speech: convert text to audio.
+
+        Args:
+            obj: TTSRequest containing text and optional voice prompt.
+            request: FastAPI request object for disconnect handling.
+
+        Returns:
+            TTSResponse containing the generated audio.
+        """
+        created_time = time.time()
+        async with self._cond:
+            await self._cond.wait_for(lambda: not self._updating)
+
+        self.auto_create_handle_loop()
+
+        rid = uuid.uuid4().hex
+
+        # Tokenize the text input
+        text_input_ids = None
+        if obj.text and self.tokenizer is not None:
+            encoded = self.tokenizer(obj.text)
+            text_input_ids = encoded["input_ids"]
+
+        # Tokenize the voice prompt if provided
+        prompt_input_ids = None
+        if obj.prompt and self.tokenizer is not None:
+            encoded = self.tokenizer(obj.prompt)
+            prompt_input_ids = encoded["input_ids"]
+
+        from sgl_jax.srt.multimodal.manager.schedule_batch import Req
+
+        tts_req = Req(
+            rid=rid,
+            audio_mode="tts",
+            text=obj.text,
+            text_input_ids=text_input_ids,
+            prompt=obj.prompt,
+            prompt_input_ids=prompt_input_ids,
+            data_type=DataType.AUDIO,
+            save_output=obj.save_output,
+        )
+
+        state = MMReqState(
+            rid=rid,
+            out_list=[],
+            finished=False,
+            event=asyncio.Event(),
+            obj=obj,
+            created_time=created_time,
+        )
+        self.rid_to_state[rid] = state
+
+        self.send_to_scheduler.send_pyobj(tts_req)
+
+        try:
+            await asyncio.wait_for(state.event.wait(), timeout=self.wait_timeout)
+        except TimeoutError:
+            raise ValueError(f"TTS request timed out for rid={rid}") from None
+
+        del self.rid_to_state[rid]
+
+        out = state.out_list[-1] if state.out_list else {"success": True, "meta_info": {}}
+
+        audio_data_b64 = None
+        url = None
+        if out.get("audio_data") is not None:
+            audio_bytes = out["audio_data"].astype(np.float32).tobytes()
+            audio_data_b64 = base64.b64encode(audio_bytes).decode("utf-8")
+        if out.get("url") is not None:
+            url = out["url"]
+
+        return TTSResponse(
+            id=rid,
+            audio_data=audio_data_b64,
+            url=url,
+            sample_rate=24000,
+        )
 
 
 def run_multimodal_tokenizer_process(
