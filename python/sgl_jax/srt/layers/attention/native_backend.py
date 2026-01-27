@@ -64,10 +64,32 @@ class NativeAttention(AttentionBackend):
         Returns:
             Tuple of (output tensor of shape [total_tokens, hidden_size], k, v)
         """
+        # DEBUG: Check input Q/K/V for NaN (Layer 0 only)
+        if layer.layer_id == 0:
+            jax.debug.print(
+                "NativeAttn0 input: q_nan={q_nan}, k_nan={k_nan}, v_nan={v_nan}, "
+                "cache_loc_len={cache_loc_len}, out_cache_loc_len={out_cache_loc_len}",
+                q_nan=jnp.any(jnp.isnan(q)),
+                k_nan=jnp.any(jnp.isnan(k)),
+                v_nan=jnp.any(jnp.isnan(v)),
+                cache_loc_len=forward_batch.cache_loc.shape[0],
+                out_cache_loc_len=forward_batch.out_cache_loc.shape[0],
+            )
+
         # TODO(pc) support tree based native attention backend
         k_buffer, v_buffer, kv_fused = self._get_and_update_kv_cache(
             k, v, forward_batch, token_to_kv_pool, self.kv_sharding, layer.layer_id
         )
+
+        # DEBUG: Check KV buffer after cache update (Layer 0 only)
+        if layer.layer_id == 0:
+            jax.debug.print(
+                "NativeAttn0 after_cache: k_buffer_nan={k_nan}, v_buffer_nan={v_nan}, "
+                "k_buffer_shape={k_shape}",
+                k_nan=jnp.any(jnp.isnan(k_buffer)),
+                v_nan=jnp.any(jnp.isnan(v_buffer)),
+                k_shape=k_buffer.shape,
+            )
 
         scale = 1.0 / jnp.sqrt(layer.head_dim) if layer.scaling is None else layer.scaling
 
@@ -96,7 +118,16 @@ class NativeAttention(AttentionBackend):
             forward_batch.forward_mode,
             self.kv_sharding,
             xai_temperature_len=xai_temp_len,
+            layer_id=layer.layer_id,  # Pass layer_id for debugging
         )
+
+        # DEBUG: Check attention output (Layer 0 only)
+        if layer.layer_id == 0:
+            jax.debug.print(
+                "NativeAttn0 output: attn_nan={attn_nan}, attn_inf={attn_inf}",
+                attn_nan=jnp.any(jnp.isnan(attn_output)),
+                attn_inf=jnp.any(jnp.isinf(attn_output)),
+            )
 
         # Return full fused KV buffer for this layer so that caller can persist it outside JIT
         return attn_output, kv_fused
@@ -113,6 +144,22 @@ class NativeAttention(AttentionBackend):
         """
         Get the kv cache from the forward batch.
         """
+        # DEBUG & PROTECTION: Check for NaN before writing to cache (Layer 0 only)
+        if layer_id == 0:
+            k_has_nan = jnp.any(jnp.isnan(k))
+            v_has_nan = jnp.any(jnp.isnan(v))
+            jax.debug.print(
+                "KV_CACHE_WRITE layer0: k_nan={k_nan}, v_nan={v_nan}, "
+                "out_cache_loc={out_cache_loc}",
+                k_nan=k_has_nan,
+                v_nan=v_has_nan,
+                out_cache_loc=forward_batch.out_cache_loc,
+            )
+
+        # Replace NaN with 0 to prevent cache pollution
+        k = jnp.where(jnp.isnan(k), 0.0, k)
+        v = jnp.where(jnp.isnan(v), 0.0, v)
+
         if is_tpu_runtime():
             if forward_batch.forward_mode.is_extend():
                 token_to_kv_pool.set_kv_buffer(
@@ -137,6 +184,19 @@ class NativeAttention(AttentionBackend):
             v = updated_layer.at[:, 1::2, :].get(out_sharding=kv_sharding)
             # Return fused buffer directly for persistence outside JIT
             fused_return = updated_layer
+
+        # DEBUG: Check for NaN after reading from cache (Layer 0 only)
+        if layer_id == 0:
+            jax.debug.print(
+                "KV_CACHE_READ layer0: k_nan={k_nan}, v_nan={v_nan}",
+                k_nan=jnp.any(jnp.isnan(k)),
+                v_nan=jnp.any(jnp.isnan(v)),
+            )
+
+        # PROTECTION: Replace NaN in cached K/V with 0 to prevent attention explosion
+        k = jnp.where(jnp.isnan(k), 0.0, k)
+        v = jnp.where(jnp.isnan(v), 0.0, v)
+
         return k, v, fused_return
 
     @staticmethod
@@ -161,6 +221,7 @@ def forward_attention(
     mode=ForwardMode.DECODE,
     kv_sharding=None,
     xai_temperature_len: float | None = None,
+    layer_id: int = -1,  # Added for debugging
 ):
     """
     Forward pass using native JAX implementation with block-diagonal attention.
@@ -186,8 +247,29 @@ def forward_attention(
 
     cache_size = k_cache.shape[0]
     safe_loc = jnp.where(loc > 0, loc, cache_size)
+
+    # DEBUG: Check loc for invalid values (Layer 0 only)
+    if layer_id == 0:
+        jax.debug.print(
+            "forward_attn0: loc_min={loc_min}, loc_max={loc_max}, loc_len={loc_len}, "
+            "num_zeros={num_zeros}, cache_size={cache_size}",
+            loc_min=jnp.min(loc),
+            loc_max=jnp.max(loc),
+            loc_len=loc.shape[0],
+            num_zeros=jnp.sum(loc == 0),
+            cache_size=cache_size,
+        )
+
     k_cache = k_cache.at[safe_loc].get(out_sharding=kv_sharding, mode="fill", fill_value=0)
     v_cache = v_cache.at[safe_loc].get(out_sharding=kv_sharding, mode="fill", fill_value=0)
+
+    # DEBUG: Check indexed KV cache for NaN (Layer 0 only)
+    if layer_id == 0:
+        jax.debug.print(
+            "forward_attn0 after_index: k_nan={k_nan}, v_nan={v_nan}",
+            k_nan=jnp.any(jnp.isnan(k_cache)),
+            v_nan=jnp.any(jnp.isnan(v_cache)),
+        )
 
     # Handle both 2D and 3D input formats for q
     if len(q.shape) == 2:
@@ -222,9 +304,28 @@ def forward_attention(
     k_t = jnp.transpose(k_heads, (1, 0, 2))
     v_t = jnp.transpose(v_heads, (1, 0, 2))
 
+    # DEBUG: Check Q/K value ranges before computing attention logits (Layer 0 only)
+    if layer_id == 0:
+        jax.debug.print(
+            "forward_attn0 QK_range: q_min={q_min}, q_max={q_max}, k_min={k_min}, k_max={k_max}",
+            q_min=jnp.min(q_t),
+            q_max=jnp.max(q_t),
+            k_min=jnp.min(k_t),
+            k_max=jnp.max(k_t),
+        )
+
     if scale is None:
         scale = 1.0 / jnp.sqrt(head_dim)
     attn_logits = jnp.einsum("hqd,hkd->hqk", q_t, k_t) * scale
+
+    # DEBUG: Check raw logits before masking (Layer 0 only)
+    if layer_id == 0:
+        jax.debug.print(
+            "forward_attn0 raw_logits: min={logits_min}, max={logits_max}",
+            logits_min=jnp.min(attn_logits),
+            logits_max=jnp.max(attn_logits),
+        )
+
     neg_inf = jnp.asarray(jnp.finfo(attn_logits.dtype).min, attn_logits.dtype)
     is_valid = loc > 0
     attn_logits = jnp.where(is_valid[jnp.newaxis, jnp.newaxis, :], attn_logits, neg_inf)
@@ -260,8 +361,38 @@ def forward_attention(
     else:
         attn_logits = _apply_decode_mask(attn_logits, seq_lengths)
 
+    # DEBUG: Check attention logits after masking (Layer 0 only)
+    if layer_id == 0:
+        # Check if any row has ALL -inf values (would cause NaN in softmax)
+        row_all_neg_inf = jnp.all(attn_logits == jnp.finfo(attn_logits.dtype).min, axis=-1)
+        # Check logits range (excluding -inf values)
+        finite_mask = attn_logits > jnp.finfo(attn_logits.dtype).min
+        finite_logits = jnp.where(finite_mask, attn_logits, 0.0)
+        logits_min = jnp.min(jnp.where(finite_mask, attn_logits, jnp.inf))
+        logits_max = jnp.max(finite_logits)
+        jax.debug.print(
+            "forward_attn0 after_mask: logits_nan={logits_nan}, logits_inf={logits_inf}, "
+            "any_row_all_masked={any_row_all_masked}, seq_lens={seq_lens}, "
+            "logits_min={logits_min}, logits_max={logits_max}",
+            logits_nan=jnp.any(jnp.isnan(attn_logits)),
+            logits_inf=jnp.any(jnp.isinf(attn_logits)),
+            any_row_all_masked=jnp.any(row_all_neg_inf),
+            seq_lens=seq_lengths,
+            logits_min=logits_min,
+            logits_max=logits_max,
+        )
+
     # Softmax
+    attn_logits = attn_logits - jnp.max(attn_logits, axis=-1, keepdims=True)
     attn_weights = jax.nn.softmax(attn_logits, axis=-1)
+
+    # DEBUG: Check attention weights after softmax (Layer 0 only)
+    if layer_id == 0:
+        jax.debug.print(
+            "forward_attn0 after_softmax: weights_nan={weights_nan}, weights_inf={weights_inf}",
+            weights_nan=jnp.any(jnp.isnan(attn_weights)),
+            weights_inf=jnp.any(jnp.isinf(attn_weights)),
+        )
 
     attn_output = jnp.matmul(attn_weights, v_t)
     attn_output = jnp.transpose(attn_output, (1, 0, 2))

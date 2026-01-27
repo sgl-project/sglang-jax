@@ -1,3 +1,4 @@
+import httpx
 import logging
 import multiprocessing as mp
 import os
@@ -8,7 +9,7 @@ from http import HTTPStatus
 
 import requests
 import uvicorn
-from fastapi import Request
+from fastapi import File, Form, Request, UploadFile
 from fastapi.responses import ORJSONResponse, Response
 
 from sgl_jax.srt.entrypoints.http_server import _GlobalState, app, set_global_state
@@ -19,8 +20,12 @@ from sgl_jax.srt.managers.template_manager import TemplateManager
 from sgl_jax.srt.multimodal.common.ServerArgs import MultimodalServerArgs
 from sgl_jax.srt.multimodal.manager.global_scheduler import run_global_scheduler_process
 from sgl_jax.srt.multimodal.manager.io_struct import (
+    AudioSpeechRequest,
+    AudioTranscriptionRequest,
+    AudioTranscriptionResponse,
     DataType,
     GenerateMMReqInput,
+    GenerateOpenAIAudioInput,
     GenerateVLMReqInput,
     ImageGenerationsRequest,
     VideoGenerationsRequest,
@@ -196,6 +201,115 @@ async def videos_generation(obj: VideoGenerationsRequest, request: Request):
         return ret
     except ValueError as e:
         logger.error("[http_server] Error: %s", e)
+        return _create_error_response(e)
+
+
+# === OpenAI Audio API Endpoints ===
+
+@app.post("/v1/audio/speech")
+async def create_speech(obj: AudioSpeechRequest, request: Request):
+    """OpenAI-compatible Text-to-Speech endpoint.
+
+    Returns binary audio data in the specified format.
+    """
+    try:
+        from sgl_jax.srt.entrypoints.http_server import _global_state
+
+        audio_data = await _global_state.tokenizer_manager.create_speech(obj, request)
+
+        # 返回二进制音频流
+        media_type = f"audio/{obj.response_format}"
+        return Response(content=audio_data, media_type=media_type)
+    except ValueError as e:
+        logger.error("[http_server] create_speech error: %s", e)
+        return _create_error_response(e)
+
+
+@app.post("/v1/audio/transcriptions")
+async def create_transcription(
+    request: Request,
+    file: UploadFile | None = File(None),
+    url: str | None = Form(None),
+    model: str = Form(...),
+    language: str | None = Form(None),
+    prompt: str | None = Form(None),
+    response_format: str = Form("json"),
+    temperature: float | None = Form(None),
+    timestamp_granularities: str | None = Form(None),  # JSON string
+    stream: bool = Form(False),
+):
+    """OpenAI-compatible Speech-to-Text (transcription) endpoint.
+
+    Supports two input methods:
+    1. File upload: multipart/form-data with file
+    2. URL: Provide 'url' parameter, server downloads the audio
+    """
+    try:
+        from sgl_jax.srt.entrypoints.http_server import _global_state
+
+        # 验证输入：file 和 url 必须提供其中之一
+        if file is None and url is None:
+            raise ValueError("Either 'file' or 'url' parameter is required")
+        if file is not None and url is not None:
+            raise ValueError("Cannot provide both 'file' and 'url' parameters")
+
+        audio_bytes = None
+        if file is not None:
+            # 文件上传方式
+            audio_bytes = await file.read()
+        elif url is not None:
+            # URL 下载方式
+            async with httpx.AsyncClient() as client:
+                response = await client.get(url, timeout=30.0)
+                response.raise_for_status()
+                audio_bytes = response.content
+
+        # 解析 timestamp_granularities（如果是 JSON string）
+        granularities = None
+        if timestamp_granularities:
+            import json
+            granularities = json.loads(timestamp_granularities)
+
+        obj = AudioTranscriptionRequest(
+            file=audio_bytes,
+            url=url,  # 保留 URL 用于日志
+            model=model,
+            language=language,
+            prompt=prompt,
+            response_format=response_format,
+            temperature=temperature,
+            timestamp_granularities=granularities,
+            stream=stream,
+        )
+
+        result = await _global_state.tokenizer_manager.create_transcription(obj, request)
+
+        # 根据 response_format 返回不同格式
+        if response_format == "text":
+            return Response(content=result, media_type="text/plain")
+        elif response_format in ("srt", "vtt"):
+            return Response(content=result, media_type="text/plain")
+        else:  # json, verbose_json, diarized_json
+            return result  # FastAPI 自动序列化为 JSON
+
+    except ValueError as e:
+        logger.error("[http_server] create_transcription error: %s", e)
+        return _create_error_response(e)
+    except httpx.HTTPError as e:
+        logger.error("[http_server] Failed to download audio from URL: %s", e)
+        return _create_error_response(ValueError(f"Failed to download audio: {e}"))
+
+
+@app.api_route("/api/v1/chat/completions", methods=["POST"])
+async def chat_completions(obj: GenerateOpenAIAudioInput, request: Request):
+    """OpenAI-compatible Chat Completions endpoint for multimodal audio."""
+    try:
+        from sgl_jax.srt.entrypoints.http_server import _global_state
+
+        ret = await _global_state.tokenizer_manager.chat_completion_audio(obj, request)
+        return ret
+    except ValueError as e:
+        logger.error("[http_server] chat_completions error: %s", e)
         return _create_error_response(e)
 
 
@@ -386,6 +500,11 @@ def _is_wan_model(model_path: str) -> bool:
     return "wan" in model_path.lower()
 
 
+def _is_audio_model(model_path: str) -> bool:
+    """Check if the model is an audio model based on model path."""
+    return "mimo-audio" in model_path.lower() or "audio-tokenizer" in model_path.lower()
+
+
 def _execute_multimodal_server_warmup(
     server_args: MultimodalServerArgs,
     pipe_finish_writer: mp.connection.Connection | None,
@@ -449,6 +568,32 @@ def _execute_multimodal_server_warmup(
             "num_inference_steps": 2,
             "save_output": False,
         }
+    elif _is_audio_model(server_args.model_path):
+        # 使用新的 OpenAI 端点进行 warmup
+        request_endpoint = "/v1/audio/transcriptions"
+        # 构造 multipart/form-data 请求
+        # 使用空 WAV 文件作为 warmup
+        files = {"file": ("warmup.wav", b"", "audio/wav")}
+        data = {"model": "whisper-1"}
+
+        try:
+            res = requests.post(
+                url + request_endpoint,
+                files=files,
+                data=data,
+                headers=headers,
+                timeout=600,
+            )
+            assert res.status_code == 200, f"{res}"
+        except Exception:
+            last_traceback = get_exception_traceback()
+            if pipe_finish_writer is not None:
+                pipe_finish_writer.send(last_traceback)
+            logger.error("Initialization failed. warmup error: %s", last_traceback)
+            kill_process_tree(os.getpid())
+            return False
+
+        return True
     else:
         # Default to image generation for other multimodal models
         request_endpoint = "/api/v1/images/generation"

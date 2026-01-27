@@ -39,6 +39,8 @@ class StageConfigRegistry:
         "Qwen2.5-VL-32B-Instruct": "qwen2_5_vl_stage_config_tp4.yaml",
         "Qwen/Qwen2.5-VL-72B-Instruct": "qwen2_5_vl_stage_config_tp4.yaml",
         "Qwen2.5-VL-72B-Instruct": "qwen2_5_vl_stage_config_tp4.yaml",
+        # MiMo Audio with actual HuggingFace repo names
+        "XiaomiMiMo/MiMo-Audio-7B-Instruct": "mimo_audio_stage_config.yaml",
     }
 
     # Keyword patterns for fallback matching (order matters - more specific first)
@@ -46,6 +48,7 @@ class StageConfigRegistry:
         ("Wan2.2", "wan2_2_stage_config.yaml"),
         ("Wan2.1", "wan2_1_stage_config.yaml"),
         ("Qwen2.5-VL", "qwen2_5_vl_stage_config.yaml"),
+        ("MiMo-Audio-7B-Instruct", "mimo_audio_stage_config.yaml"),
     ]
 
     @classmethod
