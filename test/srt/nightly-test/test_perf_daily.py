@@ -180,7 +180,7 @@ class TestModelPerf(CustomTestCase):
             output_dir = os.getenv("PERF_OUTPUT_DIR", "./test/nightly_test_output/perf/local_run")
             os.makedirs(output_dir, exist_ok=True)
             concurrency_str = "_".join(map(str, concurrency_levels))
-            filename = f"performance_results_{model_dir_name}_tp_1.csv"
+            filename = f"daily_performance_results_{model_dir_name}_tp_1.csv"
             output_filename = os.path.join(output_dir, filename)
             file_exists = os.path.exists(output_filename)
             with open(output_filename, "a", newline="", encoding="utf-8") as csvfile:

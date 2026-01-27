@@ -1,0 +1,135 @@
+name: CI Trend Summary
+
+on:
+  schedule:
+    - cron: '30 6 * * *'
+  push:
+    branches: [main, "epic/*"]
+    paths: ["python/**", "scripts/**", "test/**", ".github/workflows/pr-test.yml"]
+  pull_request:
+    branches: [main, "epic/*"]
+    paths: ["python/**", "scripts/**", "test/**", ".github/workflows/pr-test.yml"]
+  workflow_dispatch:
+    inputs:
+      limit:
+        description: 'Limit data points (days)'
+        required: false
+        default: '30'
+
+concurrency:
+  group: ci-trend-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+jobs:
+  generate-summary:
+    if: github.repository == 'sgl-project/sglang-jax'
+    runs-on: arc-runner-v6e-1
+    continue-on-error: true
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+
+      - name: Set current date
+        run: echo "DATE_DIR=$(date +'%Y-%m-%d')" >> $GITHUB_ENV
+
+      - name: Set up Python Environment
+        run: |
+          python3.12 -m venv .venv
+          source .venv/bin/activate
+          pip install uv
+          uv pip install requests pandas matplotlib seaborn
+
+
+      - name: Prepare Image Directory
+        run: mkdir -p "summary_images/${{ env.DATE_DIR }}"
+
+      - name: Generate Accuracy Trend Image
+        env:
+          GITHUB_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
+        run: |
+          source .venv/bin/activate
+          python scripts/ci/plot_acc.py \
+            --token $GITHUB_TOKEN \
+            --limit ${{ inputs.limit || '30' }} \
+            --output "summary_images/${{ env.DATE_DIR }}/accuracy_trend.png"
+
+      - name: Generate Performance Trend Image
+        env:
+          GITHUB_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
+        run: |
+          source .venv/bin/activate
+          python scripts/ci/plot_perf.py \
+            --token $GITHUB_TOKEN \
+            --limit ${{ inputs.limit || '30' }} \
+            --output_file "summary_images/${{ env.DATE_DIR }}/perf_trend.png"
+
+
+      - name: Upload Images to External Data Repo
+        env:
+          GITHUB_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+          GITHUB_RUN_NUMBER: ${{ github.run_number }}
+        run: |
+          # 假设 publish_trend.py 会同步整个 source-dir 下的结构到目标分支
+          python3 scripts/ci/publish_trend.py --source-dir ./summary_images
+
+
+      - name: Generate Dashboard Summary
+        env:
+          LIMIT: ${{ inputs.limit || '30' }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          DATE_DIR: ${{ env.DATE_DIR }}
+        run: |
+          source .venv/bin/activate
+          python -c '
+          import os
+
+          limit = os.environ.get("LIMIT", "30")
+          repo = os.environ["REPO"]
+          run_id = os.environ["RUN_ID"]
+          date_dir = os.environ["DATE_DIR"]
+
+          target_repo = "pathfinder-pf/sglang-jax-ci-data"
+          target_branch = "ci_images"
+
+
+          base_url = f"https://raw.githubusercontent.com/{target_repo}/{target_branch}/{date_dir}"
+
+          acc_img_url = f"{base_url}/accuracy_trend.png?v={run_id}"
+          perf_img_url = f"{base_url}/perf_trend.png?v={run_id}"
+
+          summary_content = f"""
+          # 📊 SGLang JAX Nightly Trend Report ({date_dir})
+
+          Here are the trends for the last **{limit} runs**.
+
+          ### 📈 Accuracy Trend
+          ![Accuracy Trend]({acc_img_url})
+
+          ### 🚀 Performance Trend
+          ![Performance Trend]({perf_img_url})
+
+          ---
+          > Data generated at date: **{date_dir}**
+          > Data generated at run [{run_id}](${{ github.server_url }}/{repo}/actions/runs/{run_id})
+          > Images stored in [{target_repo}/{date_dir}](${{ github.server_url }}/{target_repo}/tree/{target_branch}/{date_dir})
+          """
+
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
+              f.write(summary_content)
+          '
+
+      - name: Upload Trend Images Artifacts
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: trend-charts
+          path: summary_images/
+          retention-days: 7

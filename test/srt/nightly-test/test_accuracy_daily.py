@@ -71,7 +71,7 @@ class TestModelAccuracy(CustomTestCase):
         api_url_for_eval = f"{base_url}/v1"
         output_dir = os.getenv("BENCH_OUTPUT_DIR", "./test/nightly_test_output/benchmark/local_run")
         os.makedirs(output_dir, exist_ok=True)
-        csv_file_path = os.path.join(output_dir, "qwen_7b_benchmark_results.csv")
+        csv_file_path = os.path.join(output_dir, "daily_qwen_7b_benchmark_results.csv")
         specific_args = self.BASIC_SERVER_ARGS + [
             "--tp-size",
             "1",
