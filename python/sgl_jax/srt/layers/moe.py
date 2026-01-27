@@ -7,6 +7,7 @@ from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.kernels.fused_moe.v1.kernel import FusedMoEBlockConfig, fused_ep_moe
 from sgl_jax.srt.kernels.gmm.megablox_gmm_backend import gmm
+from sgl_jax.srt.utils.jax_utils import is_tpu_runtime
 from sgl_jax.srt.utils.profiling_utils import named_scope
 from sgl_jax.srt.utils.quantization.quantization_utils import (
     quantize_tensor,
@@ -527,6 +528,7 @@ class EPMoE(nnx.Module):
             rhs_bias=w0_kernel_bias,
             tiling=tiling_gate,
             group_offset=group_offset,
+            interpret=not is_tpu_runtime(),
         )
 
         layer_w1 = gmm(
@@ -538,6 +540,7 @@ class EPMoE(nnx.Module):
             rhs_bias=w1_kernel_bias,
             tiling=tiling_gate,
             group_offset=group_offset,
+            interpret=not is_tpu_runtime(),
         )
 
         # Dequantize GEMM1 output (apply LHS scale if quantized)
@@ -575,6 +578,7 @@ class EPMoE(nnx.Module):
             rhs_bias=wo_kernel_bias,
             tiling=tiling_down,
             group_offset=group_offset,
+            interpret=not is_tpu_runtime(),
         )
 
         # Dequantize GEMM2 output (apply LHS scale if quantized)
