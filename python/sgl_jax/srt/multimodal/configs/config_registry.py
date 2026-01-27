@@ -5,6 +5,8 @@ import json
 import logging
 import os
 
+from sgl_jax.srt.multimodal.configs.audio.mimo_audio_config import MiMoAudioConfig
+from sgl_jax.srt.multimodal.configs.audio.mimo_audio_backbone_config import MiMoAudioBackboneConfig
 from sgl_jax.srt.multimodal.configs.dits.wan_model_config import WanModelConfig
 from sgl_jax.srt.multimodal.configs.qwen_vl.qwen_2_5_vl_config import (
     QwenVLModelVitConfig,
@@ -459,3 +461,129 @@ def get_qwen_vl_config(model_path: str) -> QwenVLModelVitConfig:
         A VAE config instance configured for the specified model.
     """
     return QwenVLConfigRegistry.get_config(model_path)
+
+
+class AudioConfigRegistry:
+    """Registry that maps model names to their audio tokenizer configs."""
+
+    _REGISTRY: dict[str, callable] = {
+        "XiaoMi/MiMo-Audio-Tokenizer": lambda: MiMoAudioConfig(),
+        "MiMo-Audio-Tokenizer": lambda: MiMoAudioConfig(),
+    }
+
+    _KEYWORD_PATTERNS: list[tuple[str, callable]] = [
+        ("MiMo-Audio", lambda: MiMoAudioConfig()),
+        ("mimo-audio", lambda: MiMoAudioConfig()),
+    ]
+
+    @classmethod
+    def register(cls, model_name: str, config_factory: callable) -> None:
+        cls._REGISTRY[model_name] = config_factory
+        logger.info("Registered audio config '%s'", model_name)
+
+    @classmethod
+    def get_config(cls, model_path: str) -> MiMoAudioConfig:
+        model_name = cls._extract_model_name(model_path)
+
+        config_factory = cls._REGISTRY.get(model_name)
+        if config_factory:
+            logger.debug("Found exact audio config match for model '%s'", model_name)
+            return config_factory()
+
+        config_factory = cls._REGISTRY.get(model_path)
+        if config_factory:
+            logger.debug("Found audio config match for full model path '%s'", model_path)
+            return config_factory()
+
+        for keyword, factory in cls._KEYWORD_PATTERNS:
+            if keyword.lower() in model_name.lower() or keyword.lower() in model_path.lower():
+                logger.debug(
+                    "Found audio config keyword match '%s' for model '%s'", keyword, model_name
+                )
+                return factory()
+
+        available_models = list(cls._REGISTRY.keys())
+        raise ValueError(
+            f"No audio config found for model '{model_path}'. "
+            f"Available models: {available_models}. "
+            f"You can register new models using AudioConfigRegistry.register()."
+        )
+
+    @classmethod
+    def _extract_model_name(cls, model_path: str) -> str:
+        model_path = model_path.rstrip("/")
+        return os.path.basename(model_path)
+
+    @classmethod
+    def list_registered_models(cls) -> list[str]:
+        return list(cls._REGISTRY.keys())
+
+
+def get_audio_config(model_path: str) -> MiMoAudioConfig:
+    """Convenience function to get audio tokenizer config."""
+    return AudioConfigRegistry.get_config(model_path)
+
+
+class AudioBackboneConfigRegistry:
+    """Registry that maps model names to their audio backbone (LLM) configs."""
+
+    _REGISTRY: dict[str, callable] = {
+        "XiaomiMiMo/MiMo-Audio-7B-Instruct": lambda: MiMoAudioBackboneConfig(),
+        "MiMo-Audio-7B-Instruct": lambda: MiMoAudioBackboneConfig(),
+        "XiaomiMiMo/MiMo-Audio-7B-Base": lambda: MiMoAudioBackboneConfig(),
+        "MiMo-Audio-7B-Base": lambda: MiMoAudioBackboneConfig(),
+    }
+
+    _KEYWORD_PATTERNS: list[tuple[str, callable]] = [
+        ("MiMo-Audio-7B-Instruct", lambda: MiMoAudioBackboneConfig()),
+        ("MiMo-Audio-7B-Base", lambda: MiMoAudioBackboneConfig()),
+    ]
+
+    @classmethod
+    def register(cls, model_name: str, config_factory: callable) -> None:
+        cls._REGISTRY[model_name] = config_factory
+        logger.info("Registered audio backbone config '%s'", model_name)
+
+    @classmethod
+    def get_config(cls, model_path: str) -> MiMoAudioBackboneConfig:
+        model_name = cls._extract_model_name(model_path)
+
+        config_factory = cls._REGISTRY.get(model_name)
+        if config_factory:
+            logger.debug("Found exact audio backbone config match for model '%s'", model_name)
+            return config_factory()
+
+        config_factory = cls._REGISTRY.get(model_path)
+        if config_factory:
+            logger.debug("Found audio backbone config match for full model path '%s'", model_path)
+            return config_factory()
+
+        for keyword, factory in cls._KEYWORD_PATTERNS:
+            if keyword.lower() in model_name.lower() or keyword.lower() in model_path.lower():
+                logger.debug(
+                    "Found audio backbone config keyword match '%s' for model '%s'",
+                    keyword,
+                    model_name,
+                )
+                return factory()
+
+        available_models = list(cls._REGISTRY.keys())
+        raise ValueError(
+            f"No audio backbone config found for model '{model_path}'. "
+            f"Available models: {available_models}. "
+            f"You can register new models using AudioBackboneConfigRegistry.register()."
+        )
+
+    @classmethod
+    def _extract_model_name(cls, model_path: str) -> str:
+        model_path = model_path.rstrip("/")
+        return os.path.basename(model_path)
+
+    @classmethod
+    def list_registered_models(cls) -> list[str]:
+        return list(cls._REGISTRY.keys())
+
+
+def get_audio_backbone_config(model_path: str) -> MiMoAudioBackboneConfig:
+    """Convenience function to get audio backbone config."""
+    return AudioBackboneConfigRegistry.get_config(model_path)

@@ -43,7 +43,9 @@ dependencies = [
     "pathwaysutils",
     "omegaconf",
     "imageio[ffmpeg]",
+    "qwix",
     "librosa",
+    "soundfile",
 ]
 
 [project.optional-dependencies]
@@ -64,6 +66,7 @@ all = [
 multimodal = [
     "torch",
     "torchvision",
+    "torchaudio",
     "decord",
     "msgpack==1.0.0",
 ]

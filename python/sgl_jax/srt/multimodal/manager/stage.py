@@ -12,6 +12,10 @@ from sgl_jax.srt.managers.scheduler import Scheduler as AutoRegressiveScheduler
 from sgl_jax.srt.models.qwen2 import Qwen2ForCausalLM
 from sgl_jax.srt.models.umt5 import UMT5EncoderModel
 from sgl_jax.srt.multimodal.manager.device_manager import DeviceManager
+from sgl_jax.srt.multimodal.manager.scheduler.audio_backbone_scheduler import (
+    AudioBackboneScheduler,
+)
+from sgl_jax.srt.multimodal.manager.scheduler.audio_scheduler import AudioScheduler
 from sgl_jax.srt.multimodal.manager.scheduler.diffusion_scheduler import (
     DiffusionScheduler,
 )
@@ -27,6 +31,12 @@ from sgl_jax.srt.multimodal.models.qwen3_omni_moe.qwen3_omni_thinker import (
 )
 from sgl_jax.srt.multimodal.models.qwen3_omni_moe.qwen3_omni_thinker_embedding import (
     Qwen3OmniMoeThinkerEmbedding,
+)
+from sgl_jax.srt.multimodal.models.mimo_audio.mimo_audio_backbone import (
+    MiMoAudioForCausalLM,
+)
+from sgl_jax.srt.multimodal.models.mimo_audio.mimo_audio_tokenizer import (
+    MiMoAudioTokenizer,
 )
 from sgl_jax.srt.multimodal.models.wan.diffusion.wan_dit import (
     WanDualTransformer3DModel,
@@ -147,10 +157,21 @@ class Stage:
             model_class = get_model_class(self.stage_config.model_class)
             stage_sub_dir = getattr(self.stage_config, "stage_sub_dir", None)
             precompile_params = getattr(self.stage_config, "precompile_params", None)
+
+            stage_model_path = getattr(self.stage_config, "model_path", None)
+            if stage_model_path:
+                import dataclasses
+
+                stage_server_args = dataclasses.replace(
+                    self.server_args, model_path=stage_model_path
+                )
+            else:
+                stage_server_args = self.server_args
+
             self._stage_scheduler = scheduler_class(
                 communication_backend=comm_backend,
                 mesh=self.mesh,
-                server_args=self.server_args,
+                server_args=stage_server_args,
                 model_class=model_class,
                 stage_sub_dir=stage_sub_dir,
                 precompile_params=precompile_params,
@@ -200,6 +221,14 @@ def get_scheduler_class(name: str):
         return VitScheduler
     elif name == "embedding":
         return EmbedScheduler
+    elif name == "audio":
+        return AudioScheduler
+    elif name == "audio_encoder":
+        return AudioScheduler
+    elif name == "audio_decoder":
+        return AudioScheduler
+    elif name == "audio_backbone":
+        return AudioBackboneScheduler
     else:
         raise ValueError(f"Unknown scheduler name: {name}")
 
@@ -223,6 +252,9 @@ def get_model_class(name: str):
         return Qwen3OmniMoeThinkerEmbedding
     elif name == "Qwen3OmniMoeThinkerTextForConditionalGeneration":
         return Qwen3OmniMoeThinkerTextForConditionalGeneration
-
+    elif name == "MiMoAudioTokenizer":
+        return MiMoAudioTokenizer
+    elif name == "MiMoAudioForCausalLM":
+        return MiMoAudioForCausalLM
     else:
         raise ValueError(f"Unknown model name: {name}")
