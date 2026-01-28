@@ -1,3 +1,6 @@
+# Copyright 2026 SII Team
+# Licensed under the Apache License, Version 2.0
+
 """Qwen3OmniMoe Vision Encoder configuration."""
 
 from dataclasses import dataclass, field

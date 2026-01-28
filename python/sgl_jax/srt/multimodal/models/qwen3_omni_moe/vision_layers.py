@@ -1,3 +1,6 @@
+# Copyright 2026 SII Team
+# Licensed under the Apache License, Version 2.0
+
 """Vision layers for Qwen3OmniMoe Vision Encoder."""
 
 import jax
