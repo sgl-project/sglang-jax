@@ -180,7 +180,7 @@ class QuantizedLinear(nnx.Module):
             kernel_axes=linear.kernel_axes,
             skip_bias_add=linear.skip_bias_add,
             params_dtype=linear.params_dtype,
-            scope_name=linear.name,
+            scope_name=f"quantized_{linear.name}",
         )
 
     @named_scope
