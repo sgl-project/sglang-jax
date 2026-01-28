@@ -1,6 +1,4 @@
-"""
-Configuration class for Qwen3OmniMoe Vision Encoder.
-"""
+"""Qwen3OmniMoe Vision Encoder configuration."""
 
 from dataclasses import dataclass, field
 
