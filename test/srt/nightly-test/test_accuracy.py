@@ -51,6 +51,90 @@ class TestModelAccuracy(CustomTestCase):
         "--use-sort-for-toppk-minp",
     ]
 
+    def get_dataset_args(self, dataset_name):
+        dataset_configs = {
+            "gsm8k": {
+                "prompt_template": "Question: {query}\nLet's think step by step\nAnswer:",
+                "train_split": None,
+            },
+            "mmlu": {
+                "prompt_template": "Answer the following multiple choice question about {subset_name}. The last line of your response should be of the following format: 'Answer: $LETTER' (without quotes) where LETTER is one of ABCD. Think step by step before answering.\n\n{query}",
+            },
+            "mmlu_pro": {
+                "prompt_template": 'The following are multiple choice questions (with answers) about {subset_name}. Think step by step and then finish your answer with "the answer is (X)" where X is the correct letter choice.\n{query}',
+            },
+            "aime24": {
+                "prompt_template": "The following is a multiple choice question. Choose the correct answer.\n\nQuestion: {query}\nOptions:\nA. {option_a}\nB. {option_b}\nC. {option_c}\nD. {option_d}\n\nAnswer:",
+            },
+            "aime24": {
+                "prompt_template": "{query}\nPlease reason step by step, and put your final answer within \\boxed{{}}.",
+            },
+            "math500": {
+                "prompt_template": "{query}\nPlease reason step by step, and put your final answer within \\boxed{{}}.",
+            },
+        }
+
+        if dataset_name not in dataset_configs:
+            print(
+                f"Warning: No specific config for dataset '{dataset_name}', using default config."
+            )
+            return {
+                "prompt_template": "{query}",
+                "few_shot_num": 5,
+            }
+
+        return dataset_configs[dataset_name].copy()
+
+    def get_generation_config(self, model_name):
+        base_config = {
+            "max_tokens": 2048,
+            "temperature": 0.0,
+        }
+
+        model_configs = {
+            "QWEN_7B": {
+                "max_tokens": 512,
+                "temperature": 0.7,
+                "top_p": 0.8,
+                "top_k": 0,
+                "do_sample": True,
+            },
+            "QWEN3_8B": {
+                "temperature": 0.6,
+                "top_k": 20,
+                "top_p": 0.95,
+            },
+            "DEEPSEEK_R1_DISTILL_QWEN_1_5B": {
+                "do_sample": True,
+                "temperature": 0.6,
+                "top_p": 0.95,
+            },
+            "QWEN3_MOE_30B": {
+                "do_sample": True,
+                "top_p": 0.8,
+                "top_k": 20,
+                "temperature": 0.7,
+            },
+        }
+
+        if model_name in model_configs:
+            config = {**base_config, **model_configs[model_name]}
+        else:
+            config_found = False
+            for model_prefix, config_values in model_configs.items():
+                if model_name.lower().startswith(model_prefix):
+                    config = {**base_config, **config_values}
+                    config_found = True
+                    break
+
+            if not config_found:
+                print(
+                    f"Warning: No specific config for model '{model_name}', using general config."
+                )
+                config = {**base_config, **model_configs["general"]}
+
+        return config
+
     def test_qwen_7b(self):
         # args setting
         MOUNT_ROOT = os.getenv("CI_MOUNT_ROOT", "/models")
@@ -96,23 +180,27 @@ class TestModelAccuracy(CustomTestCase):
                 dataset_name = task["name"]
                 threshold = task["threshold"]
 
-                dataset_args = {}
+                # dataset_args = {}
+                dataset_args = {dataset_name: self.get_dataset_args(dataset_name)}
                 cached_dataset_path = os.path.join(MOUNT_ROOT, "dataset", dataset_name)
                 if os.path.exists(cached_dataset_path):
                     print(f"[CI Info] Hit Dataset Cache: {cached_dataset_path}")
 
-                    dataset_args = {dataset_name: {"local_path": cached_dataset_path}}
+                    dataset_args[dataset_name]["local_path"] = cached_dataset_path
                 else:
                     print(f"[CI Info] Dataset Cache Miss: {dataset_name}")
+
+                # generation_config = self.get_generation_config(raw_model_id)
 
                 config = TaskConfig(
                     model=raw_model_id,
                     api_url=api_url_for_eval,
                     api_key="EMPTY",
-                    eval_type="server",
+                    eval_type="openai_api",
                     datasets=[dataset_name],
                     dataset_args=dataset_args,
                     eval_batch_size=64,
+                    # generation_config=generation_config,
                 )
 
                 # Run the task and get results
@@ -217,23 +305,27 @@ class TestModelAccuracy(CustomTestCase):
                 dataset_name = task["name"]
                 threshold = task["threshold"]
 
-                dataset_args = {}
+                # dataset_args = {}
+                dataset_args = {dataset_name: self.get_dataset_args(dataset_name)}
                 cached_dataset_path = os.path.join(MOUNT_ROOT, "dataset", dataset_name)
                 if os.path.exists(cached_dataset_path):
                     print(f"[CI Info] Hit Dataset Cache: {cached_dataset_path}")
 
-                    dataset_args = {dataset_name: {"local_path": cached_dataset_path}}
+                    dataset_args[dataset_name]["local_path"] = cached_dataset_path
                 else:
                     print(f"[CI Info] Dataset Cache Miss: {dataset_name}")
+
+                # generation_config = self.get_generation_config(raw_model_id)
 
                 config = TaskConfig(
                     model=raw_model_id,
                     api_url=api_url_for_eval,
                     api_key="EMPTY",
-                    eval_type="server",
+                    eval_type="openai_api",
                     datasets=[dataset_name],
                     dataset_args=dataset_args,
                     eval_batch_size=64,
+                    # generation_config=generation_config,
                 )
 
                 # Run the task and get results
@@ -341,13 +433,14 @@ class TestModelAccuracy(CustomTestCase):
                 dataset_name = task["name"]
                 threshold = task["threshold"]
 
-                dataset_args = {}
+                # dataset_args = {}
+                dataset_args = {dataset_name: self.get_dataset_args(dataset_name)}
                 generation_config = {}
 
                 cached_dataset_path = os.path.join(MOUNT_ROOT, "dataset", dataset_name)
                 if os.path.exists(cached_dataset_path):
                     print(f"[CI Info] Hit Dataset Cache: {cached_dataset_path}")
-                    dataset_args = {dataset_name: {"local_path": cached_dataset_path}}
+                    dataset_args[dataset_name]["local_path"] = cached_dataset_path
                 else:
                     print(f"[CI Info] Dataset Cache Miss: {dataset_name}")
                     pass
@@ -360,12 +453,13 @@ class TestModelAccuracy(CustomTestCase):
                         "temperature": 0.6,
                         "top_p": 0.95,
                     }
+                # generation_config = self.get_generation_config(raw_model_id)
 
                 config = TaskConfig(
                     model=raw_model_id,
                     api_url=api_url_for_eval,
                     api_key="EMPTY",
-                    eval_type="server",
+                    eval_type="openai_api",
                     datasets=[dataset_name],
                     dataset_args=dataset_args,
                     generation_config=generation_config,
@@ -469,23 +563,26 @@ class TestModelAccuracy(CustomTestCase):
                 dataset_name = task["name"]
                 threshold = task["threshold"]
 
-                dataset_args = {}
+                # dataset_args = {}
+                dataset_args = {dataset_name: self.get_dataset_args(dataset_name)}
                 cached_dataset_path = os.path.join(MOUNT_ROOT, "dataset", dataset_name)
                 if os.path.exists(cached_dataset_path):
                     print(f"[CI Info] Hit Dataset Cache: {cached_dataset_path}")
 
-                    dataset_args = {dataset_name: {"local_path": cached_dataset_path}}
+                    dataset_args[dataset_name]["local_path"] = cached_dataset_path
                 else:
                     print(f"[CI Info] Dataset Cache Miss: {dataset_name}")
 
+                # generation_config = self.get_generation_config(raw_model_id)
                 config = TaskConfig(
                     model=raw_model_id,
                     api_url=api_url_for_eval,
                     api_key="EMPTY",
-                    eval_type="server",
+                    eval_type="openai_api",
                     datasets=[dataset_name],
                     dataset_args=dataset_args,
                     eval_batch_size=64,
+                    # generation_config=generation_config,
                 )
                 # Run the task and get results
                 print(f"{raw_model_id} Running eval for {task['name']}")
@@ -588,23 +685,26 @@ class TestModelAccuracy(CustomTestCase):
                 dataset_name = task["name"]
                 threshold = task["threshold"]
 
-                dataset_args = {}
+                # dataset_args = {}
+                dataset_args = {dataset_name: self.get_dataset_args(dataset_name)}
                 cached_dataset_path = os.path.join(MOUNT_ROOT, "dataset", dataset_name)
                 if os.path.exists(cached_dataset_path):
                     print(f"[CI Info] Hit Dataset Cache: {cached_dataset_path}")
 
-                    dataset_args = {dataset_name: {"local_path": cached_dataset_path}}
+                    dataset_args[dataset_name]["local_path"] = cached_dataset_path
                 else:
                     print(f"[CI Info] Dataset Cache Miss: {dataset_name}")
 
+                # generation_config = self.get_generation_config(raw_model_id)
                 config = TaskConfig(
                     model=raw_model_id,
                     api_url=api_url_for_eval,
                     api_key="EMPTY",
-                    eval_type="server",
+                    eval_type="openai_api",
                     datasets=[dataset_name],
                     dataset_args=dataset_args,
                     eval_batch_size=64,
+                    # generation_config=generation_config,
                 )
                 # Run the task and get results
                 print(f"{raw_model_id} Running eval for {task['name']}")
@@ -707,23 +807,27 @@ class TestModelAccuracy(CustomTestCase):
                 dataset_name = task["name"]
                 threshold = task["threshold"]
 
-                dataset_args = {}
+                # dataset_args = {}
+                dataset_args = {dataset_name: self.get_dataset_args(dataset_name)}
                 cached_dataset_path = os.path.join(MOUNT_ROOT, "dataset", dataset_name)
                 if os.path.exists(cached_dataset_path):
                     print(f"[CI Info] Hit Dataset Cache: {cached_dataset_path}")
 
-                    dataset_args = {dataset_name: {"local_path": cached_dataset_path}}
+                    dataset_args[dataset_name]["local_path"] = cached_dataset_path
                 else:
                     print(f"[CI Info] Dataset Cache Miss: {dataset_name}")
+
+                # generation_config = self.get_generation_config(raw_model_id)
 
                 config = TaskConfig(
                     model=raw_model_id,
                     api_url=api_url_for_eval,
                     api_key="EMPTY",
-                    eval_type="server",
+                    eval_type="openai_api",
                     datasets=[dataset_name],
                     dataset_args=dataset_args,
                     eval_batch_size=64,
+                    # generation_config=generation_config,
                 )
                 # Run the task and get results
                 print(f"{raw_model_id} Running eval for {task['name']}")
@@ -827,23 +931,26 @@ class TestModelAccuracy(CustomTestCase):
                 dataset_name = task["name"]
                 threshold = task["threshold"]
 
-                dataset_args = {}
+                # dataset_args = {}
+                dataset_args = {dataset_name: self.get_dataset_args(dataset_name)}
                 cached_dataset_path = os.path.join(MOUNT_ROOT, "dataset", dataset_name)
                 if os.path.exists(cached_dataset_path):
                     print(f"[CI Info] Hit Dataset Cache: {cached_dataset_path}")
 
-                    dataset_args = {dataset_name: {"local_path": cached_dataset_path}}
+                    dataset_args[dataset_name]["local_path"] = cached_dataset_path
                 else:
                     print(f"[CI Info] Dataset Cache Miss: {dataset_name}")
 
+                # generation_config = self.get_generation_config(raw_model_id)
                 config = TaskConfig(
                     model=raw_model_id,
                     api_url=api_url_for_eval,
                     api_key="EMPTY",
-                    eval_type="server",
+                    eval_type="openai_api",
                     datasets=[dataset_name],
                     dataset_args=dataset_args,
                     eval_batch_size=64,
+                    # generation_config=generation_config,
                 )
                 # Run the task and get results
                 print(f"{raw_model_id} Running eval for {task['name']}")
@@ -949,13 +1056,14 @@ class TestModelAccuracy(CustomTestCase):
                 dataset_name = task["name"]
                 threshold = task["threshold"]
 
-                dataset_args = {}
+                # dataset_args = {}
+                dataset_args = {dataset_name: self.get_dataset_args(dataset_name)}
                 generation_config = {}
 
                 cached_dataset_path = os.path.join(MOUNT_ROOT, "dataset", dataset_name)
                 if os.path.exists(cached_dataset_path):
                     print(f"[CI Info] Hit Dataset Cache: {cached_dataset_path}")
-                    dataset_args = {dataset_name: {"local_path": cached_dataset_path}}
+                    dataset_args[dataset_name]["local_path"] = cached_dataset_path
                 else:
                     print(f"[CI Info] Dataset Cache Miss: {dataset_name}")
                     pass
@@ -968,12 +1076,13 @@ class TestModelAccuracy(CustomTestCase):
                         "temperature": 0.6,
                         "top_p": 0.95,
                     }
+                # generation_config = self.get_generation_config(raw_model_id)
 
                 config = TaskConfig(
                     model=raw_model_id,
                     api_url=api_url_for_eval,
                     api_key="EMPTY",
-                    eval_type="server",
+                    eval_type="openai_api",
                     datasets=[dataset_name],
                     dataset_args=dataset_args,
                     generation_config=generation_config,
@@ -1077,13 +1186,14 @@ class TestModelAccuracy(CustomTestCase):
                 dataset_name = task["name"]
                 threshold = task["threshold"]
 
-                dataset_args = {}
+                # dataset_args = {}
+                dataset_args = {dataset_name: self.get_dataset_args(dataset_name)}
                 generation_config = {}
 
                 cached_dataset_path = os.path.join(MOUNT_ROOT, "dataset", dataset_name)
                 if os.path.exists(cached_dataset_path):
                     print(f"[CI Info] Hit Dataset Cache: {cached_dataset_path}")
-                    dataset_args = {dataset_name: {"local_path": cached_dataset_path}}
+                    dataset_args[dataset_name]["local_path"] = cached_dataset_path
                 else:
                     print(f"[CI Info] Dataset Cache Miss: {dataset_name}")
                     pass
@@ -1096,12 +1206,13 @@ class TestModelAccuracy(CustomTestCase):
                         "temperature": 0.6,
                         "top_p": 0.95,
                     }
+                # generation_config = self.get_generation_config(raw_model_id)
 
                 config = TaskConfig(
                     model=raw_model_id,
                     api_url=api_url_for_eval,
                     api_key="EMPTY",
-                    eval_type="server",
+                    eval_type="openai_api",
                     datasets=[dataset_name],
                     dataset_args=dataset_args,
                     generation_config=generation_config,
@@ -1223,23 +1334,26 @@ class TestModelAccuracy(CustomTestCase):
                 dataset_name = task["name"]
                 threshold = task["threshold"]
 
-                dataset_args = {}
+                # dataset_args = {}
+                dataset_args = {dataset_name: self.get_dataset_args(dataset_name)}
                 cached_dataset_path = os.path.join(MOUNT_ROOT, "dataset", dataset_name)
                 if os.path.exists(cached_dataset_path):
                     print(f"[CI Info] Hit Dataset Cache: {cached_dataset_path}")
 
-                    dataset_args = {dataset_name: {"local_path": cached_dataset_path}}
+                    dataset_args[dataset_name]["local_path"] = cached_dataset_path
                 else:
                     print(f"[CI Info] Dataset Cache Miss: {dataset_name}")
 
+                # generation_config = self.get_generation_config(raw_model_id)
                 config = TaskConfig(
                     model=raw_model_id,
                     api_url=api_url_for_eval,
                     api_key="EMPTY",
-                    eval_type="server",
+                    eval_type="openai_api",
                     datasets=[dataset_name],
                     dataset_args=dataset_args,
                     eval_batch_size=64,
+                    # generation_config=generation_config,
                 )
                 # Run the task and get results
                 print(f"{raw_model_id} Running eval for {task['name']}")

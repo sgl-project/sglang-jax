@@ -386,6 +386,27 @@ suites = {
             test_methods=["TestModelPerfTrace.test_QWEN2_5_7B_INSTRUCT_performance_trace_tp_4"],
         ),
     ],
+    "nightly-test-accuracy-text-models-tpu-v6e-1-daily": [
+        TestFile(
+            "nightly-test/test_accuracy_daily.py",
+            estimated_time=300,
+            test_methods=["TestModelAccuracy.test_qwen_7b_daily"],
+        ),
+    ],
+    "nightly-test-perf-text-models-tpu-v6e-1-daily": [
+        TestFile(
+            "nightly-test/test_perf_daily.py",
+            estimated_time=7,
+            test_methods=["TestModelPerf.test_qwen_7b_performance_tp_1_daily"],
+        ),
+    ],
+    "nightly-test-perf-trace-text-models-tpu-v6e-1-daily": [
+        TestFile(
+            "nightly-test/test_perf_trace_daily.py",
+            estimated_time=7,
+            test_methods=["TestModelPerfTrace.test_qwen_7b_performance_trace_tp_1_daily"],
+        ),
+    ],
     "sglang_dependency_test": [],
     "unit-test-tpu-v6e-1": [
         TestFile("python/sgl_jax/test/test_flashattention.py", 20),

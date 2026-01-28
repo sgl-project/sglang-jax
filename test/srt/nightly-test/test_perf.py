@@ -170,9 +170,6 @@ class TestModelPerf(CustomTestCase):
                         time.sleep(1)
 
         finally:
-            print("[CI Info] Waiting for traces to flush...")
-            time.sleep(5)
-
             process.terminate()
             process.wait()
 
