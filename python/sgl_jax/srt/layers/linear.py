@@ -1,13 +1,15 @@
 from collections.abc import Sequence
+from functools import partial
 
 import jax
 from flax import nnx
 from jax import lax
 from jax import numpy as jnp
+from jax import shard_map
 from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 
-from sgl_jax.srt.kernels.quantized_matmul.kernel import xla_quantized_matmul
+from sgl_jax.srt.kernels.quantized_matmul.kernel import xla_quantized_matmul_local
 from sgl_jax.srt.utils.profiling_utils import named_scope
 from sgl_jax.srt.utils.quantization.quantization_utils import quantize_tensor
 
@@ -124,6 +126,14 @@ class QuantizedLinear(nnx.Module):
         self.params_dtype = params_dtype
         self.name = scope_name
 
+        # Determine if we need tensor parallel reduction
+        # kernel_axes[0] is input axis, kernel_axes[1] is output axis
+        # For row-parallel (e.g., o_proj): kernel_axes = ("tensor", None)
+        #   -> input is sharded, need psum over "tensor"
+        # For column-parallel (e.g., q_proj): kernel_axes = (None, "tensor")
+        #   -> input is replicated, no psum needed
+        self.reduce_axis = kernel_axes[0]  # Axis to reduce over (or None)
+
     @classmethod
     def from_linear(
         cls,
@@ -194,17 +204,38 @@ class QuantizedLinear(nnx.Module):
         else:
             x_2d = x
 
-        # Call the native quantized matmul kernel
-        # xla_quantized_matmul expects:
-        #   x: [batch, n_input_features]
-        #   w_q: [n_output_features, n_input_features]
-        #   w_scale: [n_output_features]
-        output = xla_quantized_matmul(
-            x_2d,
-            self.weight_q.value,
-            self.weight_scale.value,
-            quantize_activation=quantize_activation,
+        # Use shard_map for local computation with single all-reduce
+        # kernel_axes[0] = input sharding axis (e.g., "tensor" for o_proj, None for q_proj)
+        # kernel_axes[1] = output sharding axis (e.g., None for o_proj, "tensor" for q_proj)
+        #
+        # Weight w_q has shape [output_size, input_size]
+        # After transpose from LinearBase, its sharding is P(kernel_axes[1], kernel_axes[0])
+        # e.g., for o_proj with kernel_axes=("tensor", None): w_q has P(None, "tensor")
+        input_axis = self.kernel_axes[0]
+        output_axis = self.kernel_axes[1]
+
+        # Input x sharding: for row-parallel, x is P(None, input_axis)
+        # Weight w_q sharding: P(output_axis, input_axis)
+        # Weight scale sharding: P(output_axis) - per output channel
+        # Output sharding: P(None, output_axis)
+        in_specs = (
+            P(None, input_axis),  # x
+            P(output_axis, input_axis),  # w_q
+            P(output_axis),  # w_scale
         )
+        out_specs = P(None, output_axis)
+
+        output = shard_map(
+            partial(
+                xla_quantized_matmul_local,
+                quantize_activation=quantize_activation,
+                reduce_axis=input_axis,  # psum over input axis (e.g., "tensor" for o_proj)
+            ),
+            mesh=self.mesh,
+            in_specs=in_specs,
+            out_specs=out_specs,
+            check_vma=False,
+        )(x_2d, self.weight_q.value, self.weight_scale.value)
 
         # Reshape back to original batch dimensions
         if x.ndim > 2:
