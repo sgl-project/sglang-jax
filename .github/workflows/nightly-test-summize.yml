@@ -2,23 +2,17 @@ name: CI Trend Summary
 
 on:
   schedule:
-    - cron: '30 6 * * *'
+    - cron: '30 22 * * 1'
   push:
-    branches: [main, "epic/*"]
-    paths: ["python/**", "scripts/**", "test/**", ".github/workflows/pr-test.yml"]
-  pull_request:
-    branches: [main, "epic/*"]
-    paths: ["python/**", "scripts/**", "test/**", ".github/workflows/pr-test.yml"]
+    branches:
+      - main
+    paths:
+      - "python/sgl_jax/version.py"
   workflow_dispatch:
-    inputs:
-      limit:
-        description: 'Limit data points (days)'
-        required: false
-        default: '30'
-
 concurrency:
-  group: ci-trend-${{ github.ref }}
+  group: nightly-test-${{ github.ref }}
   cancel-in-progress: true
+
 
 permissions:
   contents: write
