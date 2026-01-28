@@ -506,9 +506,9 @@ def _fused_ep_moe_kernel(
     b_se_w1_x2_vmem,  # <sew_sem_id> (2, t_packing, bd1 // t_packing, bf)
     b_se_w3_x2_vmem,  # <sew_sem_id> (2, t_packing, bd1 // t_packing, bf)
     b_se_w2_x2_vmem,  # <sew_sem_id> (2, t_packing, bf, bd2 // t_packing)
-    b_se_w1_scale_x2_vmem,  # None | <sew_sem_id> (2, t_packing, bd1 // t_packing // subc_quant_wsz, 1, bf)
-    b_se_w3_scale_x2_vmem,  # None | <sew_sem_id> (2, t_packing, bd1 // t_packing // subc_quant_wsz, 1, bf)
-    b_se_w2_scale_x2_vmem,  # None | <sew_sem_id> (2, t_packing, bf // subc_quant_wsz, 1, bd2 // t_packing)
+    b_se_w1_scale_all,  # None | <sew_sem_id> (1, 1, se_inter_size)
+    b_se_w3_scale_all,  # None | <sew_sem_id> (1, 1, se_inter_size)
+    b_se_w2_scale_all,  # None | <sew_sem_id> (1, 1, hidden_size)
     ### Semaphores:
     token_stage_x2_sems,  # DMA(2,): <token_buf_id>
     acc_stage_x3_sems,  # DMA(3,): <acc_buf_id>
@@ -963,6 +963,26 @@ def _fused_ep_moe_kernel(
             sem=a2a_gather_sem,
         ).wait()
 
+    def start_fetch_and_wait_se_scales():
+        if w1_shared_hbm is None:
+            return
+        if w1_shared_scale_hbm is not None:
+            pltpu.make_async_copy(
+                src_ref=w1_shared_scale_hbm, dst_ref=b_se_w1_scale_all, sem=local_sems.at[0, 0]
+            ).start()
+        if w3_shared_scale_hbm is not None:
+            pltpu.make_async_copy(
+                src_ref=w3_shared_scale_hbm, dst_ref=b_se_w3_scale_all, sem=local_sems.at[0, 0]
+            ).start()
+        if w2_shared_scale_hbm is not None:
+            pltpu.make_async_copy(
+                src_ref=w2_shared_scale_hbm, dst_ref=b_se_w2_scale_all, sem=local_sems.at[0, 0]
+            ).start()
+
+        pltpu.make_async_copy(
+            src_ref=b_se_w1_scale_all, dst_ref=b_se_w1_scale_all, sem=local_sems.at[0, 0]
+        ).wait()
+
     def start_fetch_and_wait_bias():
         if bias_hbm is not None:
             bias_copy = pltpu.make_async_copy(
@@ -1239,20 +1259,6 @@ def _fused_ep_moe_kernel(
                 sem=sem,
             ).start()
 
-            if w1_shared_scale_hbm is not None:
-                pltpu.make_async_copy(
-                    src_ref=w1_shared_scale_hbm.at[
-                        pl.ds(
-                            offset // subc_quant_wsz,
-                            bd1_per_t_packing // subc_quant_wsz,
-                        ),
-                        pl.ds(0, 1),
-                        pl.ds(block_id * bse, bse),
-                    ],
-                    dst_ref=b_se_w1_scale_x2_vmem.at[grp_sem_id, p],
-                    sem=sem,
-                ).start()
-
     def wait_fetch_se_w1(grp_sem_id):
         if w1_shared_hbm is None:
             return
@@ -1264,13 +1270,6 @@ def _fused_ep_moe_kernel(
             dst_ref=b_se_w1_x2_vmem.at[grp_sem_id],
             sem=sem,
         ).wait()
-
-        if w1_shared_scale_hbm is not None:
-            pltpu.make_async_copy(
-                src_ref=b_se_w1_scale_x2_vmem.at[grp_sem_id],
-                dst_ref=b_se_w1_scale_x2_vmem.at[grp_sem_id],
-                sem=sem,
-            ).wait()
 
     def start_fetch_se_w3(grp_sem_id, block_id, bd1_idx):
         if w3_shared_hbm is None:
@@ -1287,20 +1286,6 @@ def _fused_ep_moe_kernel(
                 sem=sem,
             ).start()
 
-            if w3_shared_scale_hbm is not None:
-                pltpu.make_async_copy(
-                    src_ref=w3_shared_scale_hbm.at[
-                        pl.ds(
-                            offset // subc_quant_wsz,
-                            bd1_per_t_packing // subc_quant_wsz,
-                        ),
-                        pl.ds(0, 1),
-                        pl.ds(block_id * bse, bse),
-                    ],
-                    dst_ref=b_se_w3_scale_x2_vmem.at[grp_sem_id, p],
-                    sem=sem,
-                ).start()
-
     def wait_fetch_se_w3(grp_sem_id):
         if w3_shared_hbm is None:
             return
@@ -1313,14 +1298,6 @@ def _fused_ep_moe_kernel(
             dst_ref=b_se_w3_x2_vmem.at[grp_sem_id],
             sem=sem,
         ).wait()
-
-        # Wait Scale
-        if w3_shared_scale_hbm is not None:
-            pltpu.make_async_copy(
-                src_ref=b_se_w3_scale_x2_vmem.at[grp_sem_id],
-                dst_ref=b_se_w3_scale_x2_vmem.at[grp_sem_id],
-                sem=sem,
-            ).wait()
 
     def start_fetch_se_w2(grp_sem_id, block_id, bd2_idx):
         if w2_shared_hbm is None:
@@ -1337,20 +1314,6 @@ def _fused_ep_moe_kernel(
                 sem=sem,
             ).start()
 
-            if w2_shared_scale_hbm is not None:
-                pltpu.make_async_copy(
-                    src_ref=w2_shared_scale_hbm.at[
-                        pl.ds(
-                            block_id * bse // subc_quant_wsz,
-                            bse // subc_quant_wsz,
-                        ),
-                        pl.ds(0, 1),
-                        pl.ds(offset, bd2_per_t_packing),
-                    ],
-                    dst_ref=b_se_w2_scale_x2_vmem.at[grp_sem_id, p],
-                    sem=sem,
-                ).start()
-
     def wait_fetch_se_w2(grp_sem_id):
         if w2_shared_hbm is None:
             return
@@ -1363,14 +1326,6 @@ def _fused_ep_moe_kernel(
             dst_ref=b_se_w2_x2_vmem.at[grp_sem_id],
             sem=sem,
         ).wait()
-
-        # Wait Scale
-        if w2_shared_scale_hbm is not None:
-            pltpu.make_async_copy(
-                src_ref=b_se_w2_scale_x2_vmem.at[grp_sem_id],
-                dst_ref=b_se_w2_scale_x2_vmem.at[grp_sem_id],
-                sem=sem,
-            ).wait()
 
     def dynamic_ffn1(
         t_vmem,
@@ -2019,9 +1974,11 @@ def _fused_ep_moe_kernel(
 
     ### ------- Kernel start ------- ###
     sync_barrier()
+    start_fetch_and_wait_se_scales()
     start_fetch_and_wait_bias()
 
     def run_shared_expert_slice(block_id, bt_id, bt_sem_id, out_buf_id):
+        """Executes the computation for a single shared expert block."""
         if w1_shared_hbm is None:
             return
 
@@ -2029,174 +1986,105 @@ def _fused_ep_moe_kernel(
         def _():
             bt_start = bt_id * bt
 
-            # 使用 pl.when 替换 Python if block_id != 0
-            @pl.when(block_id != 0)
-            def _():
-                start_fetch_se_tokens_slice(
-                    bt_start=bt_start,
-                    bt_sem_id=bt_sem_id,
-                    bd1_idx=jnp.int32(0),
-                    buf_id=jnp.int32(0),
-                )
-
+            # Prefetch W1 and W3 for the very first block
             @pl.when(block_id == 0)
             def _():
                 start_fetch_se_w1(0, block_id, 0)
                 start_fetch_se_w3(0, block_id, 0)
 
-            init_val = jnp.zeros((bt, bse), dtype=jnp.float32)
+            # 1. FFN1 Accumulation (bt, bse)
+            gate_acc = jnp.zeros((bt, bse), dtype=jnp.float32)
+            up_acc = jnp.zeros((bt, bse), dtype=jnp.float32)
 
             def body_w1w3(bd1_idx, carry):
-                act_gate_acc, act_up_acc = carry
+                g_acc, u_acc = carry
                 curr_sem = bd1_idx % 2
-                next_sem = (bd1_idx + 1) % 2
-                next_bd1_idx = bd1_idx + 1
-                # 确保使用位运算而非逻辑运算
                 token_buf_id = bd1_idx & 1
-                next_token_buf_id = token_buf_id ^ 1
 
-                @pl.when(next_bd1_idx < num_bd1)
+                # Stream load the next bd1 block and token slice
+                @pl.when(bd1_idx + 1 < num_bd1)
                 def _():
-                    start_fetch_se_w1(next_sem, block_id, next_bd1_idx)
-                    start_fetch_se_w3(next_sem, block_id, next_bd1_idx)
+                    start_fetch_se_w1((bd1_idx + 1) % 2, block_id, bd1_idx + 1)
+                    start_fetch_se_w3((bd1_idx + 1) % 2, block_id, bd1_idx + 1)
                     start_fetch_se_tokens_slice(
                         bt_start=bt_start,
                         bt_sem_id=bt_sem_id,
-                        bd1_idx=next_bd1_idx,
-                        buf_id=next_token_buf_id,
+                        bd1_idx=bd1_idx + 1,
+                        buf_id=token_buf_id ^ 1,
                     )
 
                 wait_fetch_se_w1(curr_sem)
                 wait_fetch_se_w3(curr_sem)
                 wait_fetch_se_tokens_slice(bt_sem_id=bt_sem_id, buf_id=token_buf_id)
 
-                # 内部循环（如果 t_packing 是静态常量，可以使用 range）
+                # Accumulate dot products across the packing dimension
                 for p_id in range(t_packing):
-                    t = b_se_tokens_vmem[
-                        bt_sem_id,
-                        token_buf_id,
-                        pl.ds(0, bt),
-                        p_id,
-                        pl.ds(0, bd1_per_t_packing),
-                    ]
-                    t_f32 = t.astype(jnp.float32)
+                    t_f32 = b_se_tokens_vmem[bt_sem_id, token_buf_id, :, p_id, :].astype(
+                        jnp.float32
+                    )
+                    g_acc += jnp.dot(t_f32, b_se_w1_x2_vmem[curr_sem, p_id].astype(jnp.float32))
+                    u_acc += jnp.dot(t_f32, b_se_w3_x2_vmem[curr_sem, p_id].astype(jnp.float32))
 
-                    # --- W1 (Gate) ---
-                    w1_gate = b_se_w1_x2_vmem[curr_sem, p_id]
-                    if w1_shared_scale_hbm is not None:
-                        num_subc = bd1_per_t_packing // subc_quant_wsz
-                        for subc_id in range(num_subc):
-                            start, end = subc_id * subc_quant_wsz, (subc_id + 1) * subc_quant_wsz
-                            t_sub = t_f32[:, start:end]
-                            w_sub = w1_gate[start:end, :]
-                            acc_gate_part = jnp.dot(
-                                t_sub, w_sub.astype(jnp.float32), preferred_element_type=jnp.float32
-                            )
+                return g_acc, u_acc
 
-                            s_gate_slices = (curr_sem, p_id, subc_id, 0, pl.ds(0, bse))
-                            s_gate = jnp.broadcast_to(
-                                b_se_w1_scale_x2_vmem[*s_gate_slices], acc_gate_part.shape
-                            )
-                            act_gate_acc += acc_gate_part * s_gate
-                    else:
-                        act_gate_acc += jnp.dot(
-                            t_f32, w1_gate.astype(jnp.float32), preferred_element_type=jnp.float32
-                        )
+            # Execute FFN1 loop across hidden dimension slices
+            gate_res, up_res = lax.fori_loop(0, num_bd1, body_w1w3, (gate_acc, up_acc))
 
-                    # --- W3 (Up) ---
-                    w3_up = b_se_w3_x2_vmem[curr_sem, p_id]
-                    if w3_shared_scale_hbm is not None:
-                        num_subc = bd1_per_t_packing // subc_quant_wsz
-                        for subc_id in range(num_subc):
-                            start, end = subc_id * subc_quant_wsz, (subc_id + 1) * subc_quant_wsz
-                            t_sub = t_f32[:, start:end]
-                            w_sub = w3_up[start:end, :]
-                            acc_up_part = jnp.dot(
-                                t_sub, w_sub.astype(jnp.float32), preferred_element_type=jnp.float32
-                            )
+            # --- FFN1 Channel-wise Scaling ---
+            # Apply scaling before activation if scales are provided
+            if b_se_w1_scale_all is not None and b_se_w3_scale_all is not None:
+                # Use pl.ds to handle the dynamic offset of block_id
+                s_gate = b_se_w1_scale_all[0, 0, pl.ds(block_id * bse, bse)]
+                s_up = b_se_w3_scale_all[0, 0, pl.ds(block_id * bse, bse)]
+                act = activation_fn(gate_res * s_gate, up_res * s_up, act_fn)
+            else:
+                act = activation_fn(gate_res, up_res, act_fn)
 
-                            s_up_slices = (curr_sem, p_id, subc_id, 0, pl.ds(0, bse))
-                            s_up = jnp.broadcast_to(
-                                b_se_w3_scale_x2_vmem[*s_up_slices], acc_up_part.shape
-                            )
-                            act_up_acc += acc_up_part * s_up
-                    else:
-                        act_up_acc += jnp.dot(
-                            t_f32, w3_up.astype(jnp.float32), preferred_element_type=jnp.float32
-                        )
-
-                return (act_gate_acc, act_up_acc)
-
-            act_gate, act_up = lax.fori_loop(0, num_bd1, body_w1w3, (init_val, init_val))
-            act = activation_fn(act_gate, act_up, act_fn)
-
+            # 2. FFN2 Computation and Output Staging
             if num_bd2 > 0:
                 start_fetch_se_w2(0, block_id, 0)
 
             def body_w2(bd2_idx, _):
                 curr_sem = bd2_idx % 2
-                next_sem = (bd2_idx + 1) % 2
-                next_bd2_idx = bd2_idx + 1
 
-                @pl.when(next_bd2_idx < num_bd2)
+                # Prefetch the next W2 block
+                @pl.when(bd2_idx + 1 < num_bd2)
                 def _():
-                    start_fetch_se_w2(next_sem, block_id, next_bd2_idx)
-
-                @pl.when(bd2_idx == 0)
-                def _():
-                    next_block_id = block_id + 1
-
-                    @pl.when(next_block_id < se_total_blocks)
-                    def _():
-                        start_fetch_se_w1(0, next_block_id, 0)
-                        start_fetch_se_w3(0, next_block_id, 0)
+                    start_fetch_se_w2((bd2_idx + 1) % 2, block_id, bd2_idx + 1)
 
                 wait_fetch_se_w2(curr_sem)
 
                 for p_id in range(t_packing):
-                    w2_val = b_se_w2_x2_vmem[curr_sem, p_id]
-                    hidden_offset = p_id * h_per_t_packing + bd2_idx * bd2_per_t_packing
+                    w2_val = b_se_w2_x2_vmem[curr_sem, p_id].astype(jnp.float32)
+                    res_chunk = jnp.dot(act, w2_val)  # Result shape: (bt, bd2_per_t_packing)
 
-                    # 累加器初始化
-                    acc_chunk = jnp.zeros((bt, bd2_per_t_packing), dtype=jnp.float32)
+                    # Calculate the output channel offset for this specific pack/slice
+                    h_offset = p_id * h_per_t_packing + bd2_idx * bd2_per_t_packing
 
-                    if w2_shared_scale_hbm is not None:
-                        num_subc = bse // subc_quant_wsz
-                        for subc_id in range(num_subc):
-                            start, end = subc_id * subc_quant_wsz, (subc_id + 1) * subc_quant_wsz
-                            act_sub = act[:, start:end]
-                            w2_sub = w2_val[start:end, :]
-                            res_sub = jnp.dot(
-                                act_sub,
-                                w2_sub.astype(jnp.float32),
-                                preferred_element_type=jnp.float32,
-                            )
+                    # --- FFN2 Channel-wise Scaling ---
+                    if b_se_w2_scale_all is not None:
+                        # Use pl.ds for dynamic h_offset to avoid Tracer errors
+                        s_down = b_se_w2_scale_all[0, 0, pl.ds(h_offset, bd2_per_t_packing)]
+                        res_chunk = res_chunk * s_down
 
-                            s2_slices = (curr_sem, p_id, subc_id, 0, pl.ds(0, bd2_per_t_packing))
-                            s2 = jnp.broadcast_to(b_se_w2_scale_x2_vmem[*s2_slices], res_sub.shape)
-                            acc_chunk += res_sub * s2
-                    else:
-                        acc_chunk = jnp.dot(
-                            act, w2_val.astype(jnp.float32), preferred_element_type=jnp.float32
-                        )
-
-                    # --- 修复重点：使用 pl.when 替换 Python 的 if block_id == 0 ---
+                    # Write results to the output buffer
+                    # Assign on the first expert block, accumulate on subsequent blocks
                     @pl.when(block_id == 0)
-                    def _(h=hidden_offset, a=acc_chunk):
-                        b_output_x2_vmem[out_buf_id, pl.ds(0, bt), pl.ds(h, bd2_per_t_packing)] = (
-                            a.astype(t_dtype)
+                    def _(h_offset=h_offset, res_chunk=res_chunk):
+                        b_output_x2_vmem[out_buf_id, :, pl.ds(h_offset, bd2_per_t_packing)] = (
+                            res_chunk.astype(t_dtype)
                         )
 
                     @pl.when(block_id != 0)
-                    def _(h=hidden_offset, a=acc_chunk):
+                    def _(h_offset=h_offset, res_chunk=res_chunk):
                         old_val = b_output_x2_vmem[
-                            out_buf_id, pl.ds(0, bt), pl.ds(h, bd2_per_t_packing)
+                            out_buf_id, :, pl.ds(h_offset, bd2_per_t_packing)
                         ]
-                        new_val = (old_val.astype(jnp.float32) + a).astype(t_dtype)
-                        b_output_x2_vmem[out_buf_id, pl.ds(0, bt), pl.ds(h, bd2_per_t_packing)] = (
-                            new_val
-                        )
+                        b_output_x2_vmem[out_buf_id, :, pl.ds(h_offset, bd2_per_t_packing)] = (
+                            old_val.astype(jnp.float32) + res_chunk
+                        ).astype(t_dtype)
 
+            # Execute FFN2 loop across output dimension slices
             lax.fori_loop(0, num_bd2, body_w2, None)
 
     if num_bt >= 1:
@@ -2509,7 +2397,7 @@ def _validate_fused_ep_moe_args(
         if subc_quant_wsz is not None:
             if w1_shared_scale is not None:
                 expected_w1_shared_scale = (
-                    hidden_size // subc_quant_wsz,
+                    1,
                     1,
                     se_intermediate_size,
                 )
@@ -2527,7 +2415,7 @@ def _validate_fused_ep_moe_args(
 
             if w3_shared_scale is not None:
                 expected_w3_shared_scale = (
-                    hidden_size // subc_quant_wsz,
+                    1,
                     1,
                     se_intermediate_size,
                 )
@@ -2539,7 +2427,7 @@ def _validate_fused_ep_moe_args(
                     raise ValueError("w3_shared_scale must be float32")
 
             if w2_shared_scale is not None:
-                expected_w2_shared_scale = (se_intermediate_size // subc_quant_wsz, 1, hidden_size)
+                expected_w2_shared_scale = (1, 1, hidden_size)
                 if w2_shared_scale.shape != expected_w2_shared_scale:
                     raise ValueError(
                         f"Expected {w2_shared_scale.shape=} to be {expected_w2_shared_scale}"
@@ -2663,6 +2551,7 @@ def fused_ep_moe(
 
     num_tokens, hidden_size = tokens.shape
     num_experts, intermediate_size, _ = w2.shape
+    se_inter_size = w2_shared.shape[0] if w2_shared is not None else 0
 
     local_num_tokens = num_tokens // ep_size
     bt = block_config.bt
@@ -2816,47 +2705,14 @@ def fused_ep_moe(
             )
         ),  # b_se_w2_x2_vmem
         (
-            None
-            if w1_shared_scale is None
-            else pltpu.VMEM(
-                (
-                    2,
-                    t_packing,
-                    block_config.bd1 // t_packing // subc_quant_wsz,
-                    1,
-                    block_config.bse,
-                ),
-                jnp.float32,
-            )
-        ),  # b_se_w1_scale_x2_vmem
+            None if w1_shared_scale is None else pltpu.VMEM((1, 1, se_inter_size), jnp.float32)
+        ),  # b_se_w1_scale_all
         (
-            None
-            if w3_shared_scale is None
-            else pltpu.VMEM(
-                (
-                    2,
-                    t_packing,
-                    block_config.bd1 // t_packing // subc_quant_wsz,
-                    1,
-                    block_config.bse,
-                ),
-                jnp.float32,
-            )
-        ),  # b_se_w3_scale_x2_vmem
+            None if w3_shared_scale is None else pltpu.VMEM((1, 1, se_inter_size), jnp.float32)
+        ),  # b_se_w3_scale_all
         (
-            None
-            if w2_shared_scale is None
-            else pltpu.VMEM(
-                (
-                    2,
-                    t_packing,
-                    block_config.bse // subc_quant_wsz,
-                    1,
-                    block_config.bd2 // t_packing,
-                ),
-                jnp.float32,
-            )
-        ),  # b_se_w2_scale_x2_vmem
+            None if w2_shared_scale is None else pltpu.VMEM((1, 1, hidden_size), jnp.float32)
+        ),  # b_se_w2_scale_all
         # Semaphores.
         pltpu.SemaphoreType.DMA((2,)),  # token_stage_x2_sems
         pltpu.SemaphoreType.DMA((3,)),  # acc_stage_x3_sems

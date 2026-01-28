@@ -14,11 +14,15 @@ This module mirrors the approach used by
 
 from __future__ import annotations
 
+import logging
+
 import jax.numpy as jnp
 
 from sgl_jax.srt.utils.jax_utils import get_device_name
 
 from .kernel import FusedMoEBlockConfig
+
+logger = logging.getLogger(__name__)
 
 # Key (without device_name):
 #   - tokens dtype name
@@ -38,6 +42,28 @@ from .kernel import FusedMoEBlockConfig
 TUNED_BLOCK_CONFIGS: dict[str, dict[tuple, tuple[int, ...]]] = {
     # Populate per-device kind, e.g. "TPU v6e", "TPU v7".
     "TPU v7": {
+        ('bfloat16', 'bfloat16', 16, 128, 8, 2048, 768, 8, False, False): (2, 256, 2048, 2048, 2, 2, 256, 2048, 2048, 256),
+        ('bfloat16', 'bfloat16', 32, 128, 8, 2048, 768, 8, False, False): (4, 256, 2048, 2048, 4, 4, 256, 2048, 2048, 256),
+        ('bfloat16', 'bfloat16', 64, 128, 8, 2048, 768, 8, False, False): (8, 256, 2048, 2048, 8, 8, 256, 2048, 2048, 256),
+        ('bfloat16', 'bfloat16', 128, 128, 8, 2048, 768, 8, False, False): (16, 256, 2048, 2048, 16, 16, 256, 2048, 2048, 256),
+        ('bfloat16', 'bfloat16', 256, 128, 8, 2048, 768, 8, False, False): (32, 256, 2048, 2048, 32, 32, 256, 2048, 2048, 256),
+        ('bfloat16', 'bfloat16', 512, 128, 8, 2048, 768, 8, False, False): (64, 256, 2048, 2048, 64, 64, 256, 2048, 2048, 256),
+        ('bfloat16', 'bfloat16', 1024, 128, 8, 2048, 768, 8, False, False): (128, 256, 2048, 2048, 128, 128, 256, 2048, 2048, 256),
+        ('bfloat16', 'bfloat16', 2048, 128, 8, 2048, 768, 8, False, False): (256, 256, 2048, 2048, 256, 256, 256, 2048, 2048, 256),
+        ('bfloat16', 'bfloat16', 4096, 128, 8, 2048, 768, 8, False, False): (512, 256, 2048, 2048, 512, 512, 256, 2048, 2048, 256),
+        ('bfloat16', 'bfloat16', 8192, 128, 8, 2048, 768, 8, False, False): (512, 256, 2048, 2048, 512, 512, 256, 2048, 2048, 256),
+
+        ('bfloat16', 'float8_e4m3fn', 16, 128, 8, 2048, 768, 8, False, False): (2, 256, 2048, 2048, 2, 2, 256, 2048, 2048, 256),
+        ('bfloat16', 'float8_e4m3fn', 32, 128, 8, 2048, 768, 8, False, False): (4, 256, 2048, 2048, 4, 4, 256, 2048, 2048, 256),
+        ('bfloat16', 'float8_e4m3fn', 64, 128, 8, 2048, 768, 8, False, False): (8, 256, 2048, 2048, 8, 8, 256, 2048, 2048, 256),
+        ('bfloat16', 'float8_e4m3fn', 128, 128, 8, 2048, 768, 8, False, False): (16, 256, 2048, 2048, 16, 16, 256, 2048, 2048, 256),
+        ('bfloat16', 'float8_e4m3fn', 256, 128, 8, 2048, 768, 8, False, False): (32, 256, 2048, 2048, 32, 32, 256, 2048, 2048, 256),
+        ('bfloat16', 'float8_e4m3fn', 512, 128, 8, 2048, 768, 8, False, False): (64, 256, 2048, 2048, 64, 64, 256, 2048, 2048, 256),
+        ('bfloat16', 'float8_e4m3fn', 1024, 128, 8, 2048, 768, 8, False, False): (128, 256, 2048, 2048, 128, 128, 256, 2048, 2048, 256),
+        ('bfloat16', 'float8_e4m3fn', 2048, 128, 8, 2048, 768, 8, False, False): (256, 256, 2048, 2048, 256, 256, 256, 2048, 2048, 256),
+        ('bfloat16', 'float8_e4m3fn', 4096, 128, 8, 2048, 768, 8, False, False): (512, 256, 2048, 2048, 512, 512, 256, 2048, 2048, 256),
+        ('bfloat16', 'float8_e4m3fn', 8192, 128, 8, 2048, 768, 8, False, False): (512, 256, 2048, 2048, 512, 512, 256, 2048, 2048, 256),
+
         ('bfloat16', 'bfloat16', 64, 256, 8, 8192, 2048, 32, False, False): (2, 2048, 2048, 2048, 2, 2, 2048, 2048, 2048, 2048),
         ('bfloat16', 'bfloat16', 128, 256, 8, 8192, 2048, 32, False, False): (4, 2048, 2048, 2048, 4, 4, 2048, 2048, 2048, 2048),
         ('bfloat16', 'bfloat16', 256, 256, 8, 8192, 2048, 32, False, False): (8, 2048, 2048, 2048, 8, 8, 2048, 2048, 2048, 2048),
@@ -184,6 +210,8 @@ def get_tuned_fused_moe_block_config(
 
     if len(cfg_tuple) != 10:
         raise ValueError(f"Unexpected tuned config tuple length: {len(cfg_tuple)}")
+
+    logger.info("Using tuned block config: %s", cfg_tuple)
 
     bt, bf, bd1, bd2, bts, btc, bfc, bd1c, bd2c, bse = cfg_tuple
 

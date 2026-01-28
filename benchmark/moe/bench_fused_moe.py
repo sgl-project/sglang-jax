@@ -672,7 +672,7 @@ def run_all(
                 bts_candidates=bts_candidates,
                 bf_candidates=bf_candidates or [128, 256, 512, 1024, 2048],
                 bd_candidates=bd_candidates or [256, 512, 1024, 2048, 4096, 8192],
-                bse_candidates=bse_candidates,
+                bse_candidates=bse_candidates or [128, 256, 512, 1024, 2048, 4096, 8192],
                 tpu_vmem_budget_bytes=tpu_vmem_budget_bytes,
                 max_configs=max_configs,
                 use_shared_expert=use_shared_expert,
