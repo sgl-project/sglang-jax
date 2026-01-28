@@ -14,6 +14,7 @@ stage_args:
  - stage_id: 1
    stage_sub_dir: ""
    runtime:
+  #  num_tpus should be 8 for qwen2.5 vl 72B
      num_tpus: 4
      max_batch_size: 1
    scheduler: auto_regressive
