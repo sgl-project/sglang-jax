@@ -189,6 +189,7 @@ class QWen3MoeDecoderLayer(nnx.Module):
             self.moe_gate = GateLogit(
                 input_size=config.hidden_size,
                 num_experts=num_experts,
+                weight_dtype=dtype,
             )
 
             if self.use_fused:
