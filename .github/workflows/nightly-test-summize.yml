@@ -47,7 +47,7 @@ jobs:
 
 
       - name: Prepare Image Directory
-        run: mkdir -p "summary_images/${{ env.DATE_DIR }}"
+        run: mkdir -p "summary_images/image_trend/${{ env.DATE_DIR }}"
 
       - name: Generate Accuracy Trend Image
         env:
@@ -57,7 +57,7 @@ jobs:
           python scripts/ci/plot_acc.py \
             --token $GITHUB_TOKEN \
             --limit ${{ inputs.limit || '30' }} \
-            --output "summary_images/${{ env.DATE_DIR }}/accuracy_trend.png"
+            --output "summary_images/image_trend/${{ env.DATE_DIR }}/accuracy_trend.png"
 
       - name: Generate Performance Trend Image
         env:
@@ -67,7 +67,7 @@ jobs:
           python scripts/ci/plot_perf.py \
             --token $GITHUB_TOKEN \
             --limit ${{ inputs.limit || '30' }} \
-            --output_file "summary_images/${{ env.DATE_DIR }}/perf_trend.png"
+            --output_file "summary_images/image_trend/${{ env.DATE_DIR }}/perf_trend.png"
 
 
       - name: Upload Images to External Data Repo
@@ -76,7 +76,6 @@ jobs:
           GITHUB_RUN_ID: ${{ github.run_id }}
           GITHUB_RUN_NUMBER: ${{ github.run_number }}
         run: |
-          # 假设 publish_trend.py 会同步整个 source-dir 下的结构到目标分支
           python3 scripts/ci/publish_trend.py --source-dir ./summary_images
 
 
@@ -97,10 +96,10 @@ jobs:
           date_dir = os.environ["DATE_DIR"]
 
           target_repo = "pathfinder-pf/sglang-jax-ci-data"
-          target_branch = "ci_images"
+          target_branch = "main"
 
 
-          base_url = f"https://raw.githubusercontent.com/{target_repo}/{target_branch}/{date_dir}"
+          base_url = f"https://raw.githubusercontent.com/{target_repo}/{target_branch}/image_trend/{date_dir}"
 
           acc_img_url = f"{base_url}/accuracy_trend.png?v={run_id}"
           perf_img_url = f"{base_url}/perf_trend.png?v={run_id}"
@@ -119,7 +118,6 @@ jobs:
           ---
           > Data generated at date: **{date_dir}**
           > Data generated at run [{run_id}](${{ github.server_url }}/{repo}/actions/runs/{run_id})
-          > Images stored in [{target_repo}/{date_dir}](${{ github.server_url }}/{target_repo}/tree/{target_branch}/{date_dir})
           """
 
           with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:

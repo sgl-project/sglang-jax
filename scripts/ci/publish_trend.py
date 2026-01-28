@@ -261,7 +261,7 @@ def publish_traces(traces_dir, run_id, run_number):
     # Repository configuration
     repo_owner = "pathfinder-pf"
     repo_name = "sglang-jax-ci-data"
-    branch = "ci_images"
+    branch = "main"
     target_base_path = ""
 
     # Copy trace files
