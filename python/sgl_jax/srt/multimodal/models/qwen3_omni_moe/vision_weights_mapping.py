@@ -4,12 +4,13 @@
 """Weight mappings for Qwen3OmniMoe Vision Encoder."""
 
 
-def create_vision_encoder_weight_mappings(config) -> dict:
+def create_vision_encoder_weight_mappings(config, prefix: str = "thinker.visual.") -> dict:
     """
     Create weight mappings for Qwen3OmniMoe Vision Encoder.
 
     Args:
         config: Qwen3OmniMoeVisionConfig instance
+        prefix: Prefix for weight keys (default: "thinker.visual.")
 
     Returns:
         Dictionary mapping HF keys to JAX paths with transformation specs
@@ -23,54 +24,54 @@ def create_vision_encoder_weight_mappings(config) -> dict:
         """Add linear layer mapping with optional TP sharding."""
         w_sharding = (None, "tensor") if tp_col else ("tensor", None) if tp_row else (None, None)
         b_sharding = ("tensor",) if tp_col else (None,)
-        mappings[f"{src}.weight"] = WeightMapping(
+        mappings[f"{prefix}{src}.weight"] = WeightMapping(
             target_path=f"{dst}.weight", sharding=w_sharding, transpose=True
         )
-        mappings[f"{src}.bias"] = WeightMapping(
+        mappings[f"{prefix}{src}.bias"] = WeightMapping(
             target_path=f"{dst}.bias", sharding=b_sharding, transpose=False
         )
 
     def add_layernorm(src: str, dst: str):
         """Add layernorm mapping."""
-        mappings[f"{src}.weight"] = WeightMapping(
+        mappings[f"{prefix}{src}.weight"] = WeightMapping(
             target_path=f"{dst}.scale", sharding=(None,), transpose=False
         )
-        mappings[f"{src}.bias"] = WeightMapping(
+        mappings[f"{prefix}{src}.bias"] = WeightMapping(
             target_path=f"{dst}.bias", sharding=(None,), transpose=False
         )
 
     # ==================== Patch Embedding ====================
     # Conv3d: PyTorch (out, in, T, H, W) -> JAX (T, H, W, in, out)
-    mappings["patch_embed.proj.weight"] = WeightMapping(
+    mappings[f"{prefix}patch_embed.proj.weight"] = WeightMapping(
         target_path="patch_embed.proj.kernel",
         sharding=(None, None, None, None, None),
         transpose=False,
         transpose_axes=(2, 3, 4, 1, 0),
     )
-    mappings["patch_embed.proj.bias"] = WeightMapping(
+    mappings[f"{prefix}patch_embed.proj.bias"] = WeightMapping(
         target_path="patch_embed.proj.bias", sharding=(None,), transpose=False
     )
 
     # ==================== Position Embedding ====================
-    mappings["pos_embed.weight"] = WeightMapping(
+    mappings[f"{prefix}pos_embed.weight"] = WeightMapping(
         target_path="pos_embed.embedding", sharding=(None, None), transpose=False
     )
 
     # ==================== Transformer Blocks ====================
     for i in range(config.depth):
-        prefix = f"blocks.{i}"
+        block = f"blocks.{i}"
 
         # LayerNorm
-        add_layernorm(f"{prefix}.norm1", f"{prefix}.norm1")
-        add_layernorm(f"{prefix}.norm2", f"{prefix}.norm2")
+        add_layernorm(f"{block}.norm1", f"{block}.norm1")
+        add_layernorm(f"{block}.norm2", f"{block}.norm2")
 
         # Attention: QKV (column-wise TP), Output (row-wise TP)
-        add_linear(f"{prefix}.attn.qkv", f"{prefix}.attn.qkv_proj", tp_col=True)
-        add_linear(f"{prefix}.attn.proj", f"{prefix}.attn.o_proj", tp_row=True)
+        add_linear(f"{block}.attn.qkv", f"{block}.attn.qkv_proj", tp_col=True)
+        add_linear(f"{block}.attn.proj", f"{block}.attn.o_proj", tp_row=True)
 
         # MLP: fc1 (column-wise TP), fc2 (row-wise TP)
-        add_linear(f"{prefix}.mlp.linear_fc1", f"{prefix}.mlp.fc1", tp_col=True)
-        add_linear(f"{prefix}.mlp.linear_fc2", f"{prefix}.mlp.fc2", tp_row=True)
+        add_linear(f"{block}.mlp.linear_fc1", f"{block}.mlp.fc1", tp_col=True)
+        add_linear(f"{block}.mlp.linear_fc2", f"{block}.mlp.fc2", tp_row=True)
 
     # ==================== Final Merger ====================
     add_layernorm("merger.ln_q", "merger.ln_q")

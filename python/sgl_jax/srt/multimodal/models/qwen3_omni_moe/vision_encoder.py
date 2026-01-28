@@ -7,7 +7,12 @@ import jax
 import jax.numpy as jnp
 from flax import nnx
 
-from .vision_config import Qwen3OmniMoeVisionConfig
+from sgl_jax.srt.layers.embeddings import Embed
+from sgl_jax.srt.multimodal.configs.qwen3_omni.qwen3_omni_vision_config import (
+    Qwen3OmniMoeVisionConfig,
+)
+from sgl_jax.srt.utils.weight_utils import WeightLoader
+
 from .vision_layers import Vision3DPatchEmbed, VisionPatchMerger, VisionTransformerBlock
 
 
@@ -50,10 +55,13 @@ class Qwen3OmniMoeVisionEncoder(nnx.Module):
         )
 
         # Learnable position embeddings
-        self.pos_embed = nnx.Embed(
+        self.pos_embed = Embed(
             num_embeddings=config.num_position_embeddings,
             features=config.hidden_size,
-            rngs=rngs,
+            dtype=dtype,
+            param_dtype=dtype,
+            mesh=mesh,
+            kernel_axes=(None, None),  # Position embeddings are replicated
         )
         self.num_grid_per_side = int(config.num_position_embeddings**0.5)
 
@@ -442,76 +450,42 @@ class Qwen3OmniMoeVisionEncoder(nnx.Module):
             "encoder_hidden_state": hidden_states,  # Alias for pre-merger output
         }
 
-    def load_weights(self, model_path: str):
+    def load_weights(self, model_path: str | None = None) -> None:
         """
-        Load weights from HuggingFace checkpoint.
+        Load weights from HuggingFace checkpoint using WeightLoader.
 
         Args:
-            model_path: Path to model checkpoint directory
+            model_path: Path to model checkpoint directory containing safetensors files,
+                       or a config object with a model_path field.
 
         Note:
             Weight loading must be done within mesh context for proper TP sharding.
         """
-        import glob
-        import os
-
-        import numpy as np
-        from flax import nnx
-        from safetensors import safe_open
-
         from .vision_weights_mapping import create_vision_encoder_weight_mappings
 
-        # Scan safetensors files
-        safetensor_files = glob.glob(os.path.join(model_path, "*.safetensors"))
-        if not safetensor_files:
-            return
+        # Resolve model_path from string or config object
+        resolved_model_path = None
+        if model_path is not None and not isinstance(model_path, str):
+            resolved_model_path = getattr(model_path, "model_path", None)
+        else:
+            resolved_model_path = model_path
 
-        # Build key -> file mapping
-        key_to_file = {}
-        for sf_file in safetensor_files:
-            with safe_open(sf_file, framework="np") as f:
-                for key in f.keys():  # noqa: SIM118
-                    key_to_file[key] = sf_file
+        if resolved_model_path is None:
+            raise ValueError("model_path must be provided")
 
-        # Possible HF prefixes
-        prefixes = ["", "thinker.visual.", "vision_encoder.", "model.vision_encoder."]
+        # Create a minimal config-like object for WeightLoader
+        class _MinimalModelConfig:
+            def __init__(self, path: str):
+                self.model_path = path
 
-        def find_hf_key(key: str) -> str | None:
-            """Find actual HF key with prefix detection."""
-            for prefix in prefixes:
-                if prefix + key in key_to_file:
-                    return prefix + key
-            return None
+        model_config = _MinimalModelConfig(resolved_model_path)
 
-        def get_param(path: str):
-            """Navigate to parameter by dot-separated path."""
-            obj = self
-            for p in path.split("."):
-                obj = obj[int(p)] if p.isdigit() else getattr(obj, p)
-            return obj
+        loader = WeightLoader(
+            model=self,
+            model_config=model_config,
+            mesh=self.mesh,
+            dtype=self.dtype,
+        )
 
-        # Load weights within mesh context for TP sharding
         weight_mappings = create_vision_encoder_weight_mappings(self.config)
-
-        with jax.set_mesh(self.mesh):
-            for mapping_key, mapping in weight_mappings.items():
-                hf_key = find_hf_key(mapping_key)
-                if hf_key is None:
-                    continue
-
-                try:
-                    with safe_open(key_to_file[hf_key], framework="np") as f:
-                        weight = f.get_tensor(hf_key)
-
-                    # Apply transformations
-                    if mapping.transpose_axes is not None:
-                        weight = np.transpose(weight, mapping.transpose_axes)
-                    elif mapping.transpose:
-                        weight = np.transpose(weight)
-
-                    # Set parameter
-                    param = get_param(mapping.target_path)
-                    if isinstance(param, nnx.Variable):
-                        param[...] = jnp.array(weight, dtype=param[...].dtype)
-                except Exception:
-                    pass
+        loader.load_weights_from_safetensors(weight_mappings)

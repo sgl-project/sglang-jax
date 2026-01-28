@@ -1189,7 +1189,7 @@ def test_tp_sharding(model_path, mesh, precision):
                 param = param[int(p)] if p.isdigit() else getattr(param, p)
 
             if isinstance(param, nnx.Variable):
-                value = param.value
+                value = param.get_value()
             else:
                 value = param
 
