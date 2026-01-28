@@ -845,8 +845,6 @@ class FusedEPMoE(nnx.Module):
         if self.quantized_dtype is None:
             return
 
-        return
-
         if hasattr(self, "subc_quant_wsz"):
             del self.subc_quant_wsz
             self.subc_quant_wsz = 256
@@ -920,19 +918,16 @@ class FusedEPMoE(nnx.Module):
                     self.quantized_dtype,
                     self.w1_shared.value,
                     axis=0,
-                    block_size=self.subc_quant_wsz,
                 )
                 w3_shared_value, w3_shared_scale = quantize_tensor(
                     self.quantized_dtype,
                     self.w3_shared.value,
                     axis=0,
-                    block_size=self.subc_quant_wsz,
                 )
                 w2_shared_value, w2_shared_scale = quantize_tensor(
                     self.quantized_dtype,
                     self.w2_shared.value,
                     axis=0,
-                    block_size=self.subc_quant_wsz,
                 )
 
                 self.w1_shared = nnx.Param(w1_shared_value, out_sharding=P(None, None))
@@ -943,9 +938,9 @@ class FusedEPMoE(nnx.Module):
                     del self.w1_shared_scale
                 self.w1_shared_scale = nnx.Param(
                     w1_shared_scale.reshape(
-                        w1_shared_scale.shape[0],
                         1,
-                        w1_shared_scale.shape[1],
+                        1,
+                        w1_shared_scale.shape[0],
                         out_sharding=P(None, None, None),
                     ),
                     out_sharding=P(None, None, None),
@@ -955,9 +950,9 @@ class FusedEPMoE(nnx.Module):
                     del self.w3_shared_scale
                 self.w3_shared_scale = nnx.Param(
                     w3_shared_scale.reshape(
-                        w3_shared_scale.shape[0],
                         1,
-                        w3_shared_scale.shape[1],
+                        1,
+                        w3_shared_scale.shape[0],
                         out_sharding=P(None, None, None),
                     ),
                     out_sharding=P(None, None, None),
@@ -967,9 +962,9 @@ class FusedEPMoE(nnx.Module):
                     del self.w2_shared_scale
                 self.w2_shared_scale = nnx.Param(
                     w2_shared_scale.reshape(
-                        w2_shared_scale.shape[0],
                         1,
-                        w2_shared_scale.shape[1],
+                        1,
+                        w2_shared_scale.shape[0],
                         out_sharding=P(None, None, None),
                     ),
                     out_sharding=P(None, None, None),
@@ -1003,6 +998,9 @@ class FusedEPMoE(nnx.Module):
         w1_shared_val = self.w1_shared.value if self.w1_shared is not None else None
         w3_shared_val = self.w3_shared.value if self.w3_shared is not None else None
         w2_shared_val = self.w2_shared.value if self.w2_shared is not None else None
+        # w1_shared_val = None
+        # w3_shared_val = None
+        # w2_shared_val = None
 
         w1_scale = self.w1_scale.value if self.w1_scale is not None else None
         w3_scale = self.w3_scale.value if self.w3_scale is not None else None
@@ -1010,7 +1008,10 @@ class FusedEPMoE(nnx.Module):
         w1_shared_scale = self.w1_shared_scale.value if self.w1_shared_scale is not None else None
         w3_shared_scale = self.w3_shared_scale.value if self.w3_shared_scale is not None else None
         w2_shared_scale = self.w2_shared_scale.value if self.w2_shared_scale is not None else None
-        subc_quant_wsz = 256 if self.subc_quant_wsz is not None else None
+        # w1_shared_scale = None
+        # w3_shared_scale = None
+        # w2_shared_scale = None
+        subc_quant_wsz = self.subc_quant_wsz if self.subc_quant_wsz is not None else None
 
         output = fused_ep_moe(
             mesh=self.mesh,
