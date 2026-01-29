@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import ctypes
-import dataclasses
+from dataclasses import dataclass, is_dataclass, fields
 import functools
 import ipaddress
 import itertools
@@ -19,6 +19,10 @@ import shutil
 import signal
 import subprocess
 import sys
+import requests
+from io import BytesIO
+from PIL import Image
+from typing import Union, Optional, Literal
 import threading
 import time
 import traceback
@@ -64,7 +68,143 @@ def set_random_seed(seed: int) -> None:
     random.seed(seed)
     np.random.seed(seed)
 
+@dataclass
+class ImageData:
+    url: str
+    detail: Optional[Literal["auto", "low", "high"]] = "auto"
 
+
+def load_image(
+    image_file: Union[Image.Image, str, ImageData, bytes],
+) -> tuple[Image.Image, tuple[int, int]]:
+    if isinstance(image_file, ImageData):
+        image_file = image_file.url
+
+    image = image_size = None
+    if isinstance(image_file, Image.Image):
+        image = image_file
+        image_size = (image.width, image.height)
+    elif isinstance(image_file, bytes):
+        image = Image.open(BytesIO(image_file))
+    elif image_file.startswith("http://") or image_file.startswith("https://"):
+        timeout = int(os.getenv("REQUEST_TIMEOUT", "3"))
+        response = requests.get(image_file, stream=True, timeout=timeout)
+        try:
+            response.raise_for_status()
+            image = Image.open(response.raw)
+            image.load()  # Force loading to avoid issues after closing the stream
+        finally:
+            response.close()
+    elif image_file.lower().endswith(("png", "jpg", "jpeg", "webp", "gif")):
+        image = Image.open(image_file)
+    elif image_file.startswith("data:"):
+        image_file = image_file.split(",")[1]
+        image = Image.open(BytesIO(pybase64.b64decode(image_file, validate=True)))
+    elif isinstance(image_file, str):
+        image = Image.open(BytesIO(pybase64.b64decode(image_file, validate=True)))
+    else:
+        raise ValueError(f"Invalid image: {image_file}")
+
+    return image, image_size
+
+
+def load_video(video_file: Union[str, bytes], use_gpu: bool = True):
+    # We import decord here to avoid a strange Segmentation fault (core dumped) issue.
+    from decord import VideoReader, cpu, gpu
+
+    try:
+        from decord.bridge import decord_bridge
+
+        ctx = gpu(0)
+        _ = decord_bridge.get_ctx_device(ctx)
+    except Exception:
+        ctx = cpu(0)
+
+    tmp_file = None
+    vr = None
+    try:
+        if isinstance(video_file, bytes):
+            tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
+            tmp_file.write(video_file)
+            tmp_file.close()
+            vr = VideoReader(tmp_file.name, ctx=ctx)
+        elif isinstance(video_file, str):
+            if video_file.startswith(("http://", "https://")):
+                timeout = int(os.getenv("REQUEST_TIMEOUT", "10"))
+                response = requests.get(video_file, stream=True, timeout=timeout)
+                response.raise_for_status()
+                tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
+                for chunk in response.iter_content(chunk_size=8192):
+                    tmp_file.write(chunk)
+                tmp_file.close()
+                vr = VideoReader(tmp_file.name, ctx=ctx)
+            elif video_file.startswith("data:"):
+                _, encoded = video_file.split(",", 1)
+                video_bytes = pybase64.b64decode(encoded, validate=True)
+                tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
+                tmp_file.write(video_bytes)
+                tmp_file.close()
+                vr = VideoReader(tmp_file.name, ctx=ctx)
+            # `urlparse` supports file:// paths, and so does VideoReader
+            elif os.path.isfile(urlparse(video_file).path):
+                vr = VideoReader(video_file, ctx=ctx)
+            else:
+                video_bytes = pybase64.b64decode(video_file, validate=True)
+                tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
+                tmp_file.write(video_bytes)
+                tmp_file.close()
+                vr = VideoReader(tmp_file.name, ctx=ctx)
+        else:
+            raise ValueError(f"Unsupported video input type: {type(video_file)}")
+
+        return vr
+
+    finally:
+        if tmp_file and os.path.exists(tmp_file.name):
+            os.unlink(tmp_file.name)
+
+def load_audio(
+    audio_file: str, sr: Optional[int] = None, mono: bool = True
+) -> np.ndarray:
+    # Use soundfile here, since librosa use it under the hood,
+    # and librosa will not support audio loading in the future
+    import soundfile as sf
+    from scipy.signal import resample
+
+    if sr is None:
+        sr = 16000
+
+    # Load audio data
+    if isinstance(audio_file, bytes):
+        audio, original_sr = sf.read(BytesIO(audio_file))
+    elif audio_file.startswith("data:"):
+        audio_file = audio_file.split(",")[1]
+        audio, original_sr = sf.read(
+            BytesIO(pybase64.b64decode(audio_file, validate=True))
+        )
+    elif audio_file.startswith("http://") or audio_file.startswith("https://"):
+        timeout = int(os.getenv("REQUEST_TIMEOUT", "5"))
+        response = requests.get(audio_file, stream=True, timeout=timeout)
+        audio_file = BytesIO(response.content)
+        response.close()
+        audio, original_sr = sf.read(audio_file)
+    elif isinstance(audio_file, str):
+        audio, original_sr = sf.read(audio_file)
+    else:
+        raise ValueError(f"Invalid audio format: {audio_file}")
+
+    # Resample audio if the original sample rate is different from the desired sample rate
+    if original_sr != sr:
+        num_samples = int(len(audio) * float(sr) / original_sr)
+        audio = resample(audio, num_samples)
+
+    # Convert to mono if requested and audio is stereo
+    if mono and len(audio.shape) > 1:
+        audio = np.mean(audio, axis=1)
+
+    return audio
+    
+                
 def kill_process_tree(parent_pid, include_parent: bool = True, skip_pid: int = None):
     """Kill the process and all its child processes."""
     # Remove sigchld handler to avoid spammy logs.
@@ -239,8 +379,8 @@ def dataclass_to_string_truncated(data, max_length=2048, skip_names: set[str] | 
             )
             + "}"
         )
-    elif dataclasses.is_dataclass(data):
-        fields = dataclasses.fields(data)
+    elif is_dataclass(data):
+        fields = fields(data)
         return (
             f"{data.__class__.__name__}("
             + ", ".join(
@@ -650,3 +790,15 @@ def get_or_create_loop():
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
     return loop
+def flatten_nested_list(nested_list):
+    if isinstance(nested_list, list):
+        return [
+            item for sublist in nested_list for item in flatten_nested_list(sublist)
+        ]
+    else:
+        return [nested_list]
+
+
+def print_warning_once(msg: str) -> None:
+    # Set the stacklevel to 2 to print the caller's line info
+    logger.warning(msg, stacklevel=2)

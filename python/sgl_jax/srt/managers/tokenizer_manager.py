@@ -16,7 +16,7 @@ import uuid
 from collections import deque
 from datetime import datetime
 from http import HTTPStatus
-from typing import Any
+from typing import Any, Optional, Dict
 
 import fastapi
 import jax
@@ -27,7 +27,7 @@ import zmq.asyncio
 from fastapi import BackgroundTasks
 
 from sgl_jax.srt.configs.model_config import ModelConfig
-from sgl_jax.srt.hf_transformers_utils import get_tokenizer
+from sgl_jax.srt.hf_transformers_utils import get_tokenizer, get_processor, get_tokenizer_from_processor
 from sgl_jax.srt.lora.lora_registry import LoRARegistry
 from sgl_jax.srt.managers.io_struct import (
     AbortReq,
@@ -59,6 +59,8 @@ from sgl_jax.srt.managers.io_struct import (
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
 )
+from sgl_jax.srt.managers.multimodal_processor import get_mm_processor, import_processors
+from sgl_jax.srt.managers.async_mm_data_processor import AsyncMMDataProcessor
 from sgl_jax.srt.sampling.sampling_params import SamplingParams
 from sgl_jax.srt.server_args import PortArgs, ServerArgs
 from sgl_jax.srt.utils import (
@@ -155,18 +157,64 @@ class TokenizerManager:
         self._updating = False
         self._cond = asyncio.Condition()
 
-        self.mm_processor = None
+        # Initialize tokenizer and processor
+        if self.model_config.is_multimodal:
+            import_processors("sgl_jax.srt.multimodal.processors")
+            try:
+                _processor = get_processor(
+                    server_args.tokenizer_path,
+                    tokenizer_mode=server_args.tokenizer_mode,
+                    trust_remote_code=server_args.trust_remote_code,
+                    revision=server_args.revision,
+                    use_fast=not server_args.disable_fast_image_processor,
+                )
+            except ValueError as e:
+                error_message = str(e)
+                if "does not have a slow version" in error_message:
+                    logger.info(
+                        f"Processor {server_args.tokenizer_path} does not have a slow version. Automatically use fast version"
+                    )
+                    _processor = get_processor(
+                        server_args.tokenizer_path,
+                        tokenizer_mode=server_args.tokenizer_mode,
+                        trust_remote_code=server_args.trust_remote_code,
+                        revision=server_args.revision,
+                        use_fast=True,
+                    )
+                else:
+                    raise e
+            transport_mode = "default"
 
-        if server_args.skip_tokenizer_init:
-            self.tokenizer = self.processor = None
-        else:
-            self.tokenizer = get_tokenizer(
-                server_args.tokenizer_path,
-                tokenizer_mode=server_args.tokenizer_mode,
-                trust_remote_code=server_args.trust_remote_code,
-                revision=server_args.revision,
-                sub_dir="tokenizer" if server_args.multimodal else "",
+            # We want to parallelize the image pre-processing so we create an executor for it
+            # We create mm_processor for any skip_tokenizer_init to make sure we still encode
+            # images even with skip_tokenizer_init=False.
+            self.mm_processor = get_mm_processor(
+                self.model_config.hf_config, server_args, _processor, transport_mode
             )
+            self.mm_data_processor = AsyncMMDataProcessor(
+                self.mm_processor,
+                max_concurrent_calls=self.server_args.mm_max_concurrent_calls,
+                timeout_s=self.server_args.mm_per_request_timeout,
+            )
+
+            if server_args.skip_tokenizer_init:
+                self.tokenizer = self.processor = None
+            else:
+                self.processor = _processor
+                self.tokenizer = get_tokenizer_from_processor(self.processor)
+                os.environ["TOKENIZERS_PARALLELISM"] = "false"
+        else:
+            self.mm_processor = self.processor = None
+
+            if server_args.skip_tokenizer_init:
+                self.tokenizer = None
+            else:
+                self.tokenizer = get_tokenizer(
+                    server_args.tokenizer_path,
+                    tokenizer_mode=server_args.tokenizer_mode,
+                    trust_remote_code=server_args.trust_remote_code,
+                    revision=server_args.revision,
+                )
 
         # Store states
         self.no_create_loop = False
@@ -302,8 +350,26 @@ class TokenizerManager:
                 )
             encoded = self.tokenizer(input_text)
             input_ids = encoded["input_ids"]
+        
+        if self.mm_processor and obj.contains_mm_input():
+            if obj.image_data is not None and not isinstance(obj.image_data, list):
+                obj.image_data = [obj.image_data]
+            if obj.audio_data is not None and not isinstance(obj.audio_data, list):
+                obj.audio_data = [obj.audio_data]
+            mm_inputs: Dict = await self.mm_data_processor.process(
+                image_data=obj.image_data,
+                audio_data=obj.audio_data,
+                input_text_or_ids=(input_text or input_ids),
+                request_obj=obj,
+                max_req_input_len=self.max_req_input_len,
+            )
+            if mm_inputs and "input_ids" in mm_inputs:
+                input_ids = mm_inputs["input_ids"]
+        else:
+            mm_inputs = None
+
         self._validate_one_request(obj, input_ids)
-        return self._create_tokenized_object(obj, input_text, input_ids)
+        return self._create_tokenized_object(obj, input_text, input_ids, mm_inputs)
 
     def _validate_one_request(
         self, obj: GenerateReqInput | EmbeddingReqInput, input_ids: list[int]
@@ -342,6 +408,7 @@ class TokenizerManager:
         obj: GenerateReqInput,
         input_text: str,
         input_ids: list[int],
+        mm_inputs: Optional[Dict] = None,
     ) -> TokenizedGenerateReqInput:
         """Create a tokenized request object from common parameters."""
         # Parse sampling parameters
@@ -361,6 +428,7 @@ class TokenizerManager:
             obj.rid,
             input_text,
             input_ids,
+            mm_inputs,
             sampling_params,
             obj.return_logprob,
             obj.return_output_logprob_only,

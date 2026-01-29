@@ -70,13 +70,20 @@ class OpenAIServingChat(OpenAIServingBase):
         )
 
         # Handle single vs multiple requests
-        if isinstance(processed_messages.prompt_ids, str):
-            prompt_kwargs = {"text": processed_messages.prompt_ids}
+        if is_multimodal:
+            prompt_kwargs = {"text": processed_messages.prompt}
         else:
-            prompt_kwargs = {"input_ids": processed_messages.prompt_ids}
+            if isinstance(processed_messages.prompt_ids, str):
+                prompt_kwargs = {"text": processed_messages.prompt_ids}
+            else:
+                prompt_kwargs = {"input_ids": processed_messages.prompt_ids}
 
         adapted_request = GenerateReqInput(
             **prompt_kwargs,
+            image_data=processed_messages.image_data,
+            video_data=processed_messages.video_data,
+            audio_data=processed_messages.audio_data,
+            modalities=processed_messages.modalities,
             sampling_params=sampling_params,
             return_logprob=request.logprobs,
             logprob_start_len=-1,
@@ -248,7 +255,7 @@ Assistant: {% endif %}"""
         """Apply conversation template"""
         prompt = ""
         prompt_ids = []
-        conv = generate_chat_conv(request, self.template_manager.chat_template_name)
+        conv = generate_chat_conv(request.messages, self.template_manager.chat_template_name)
 
         # If we should continue the final assistant message, adjust the conversation.
         if (

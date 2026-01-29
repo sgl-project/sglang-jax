@@ -21,6 +21,7 @@ from dataclasses import dataclass
 from enum import IntEnum, auto
 from functools import total_ordering
 from typing import TYPE_CHECKING
+import numpy as np
 
 import jax
 import jax.numpy as jnp
@@ -173,6 +174,9 @@ class ForwardBatch:
     spec_info: EagleVerifyInput | EagleDraftInput | None = None
     spec_algorithm: SpeculativeAlgorithm = None
     capture_hidden_mode: CaptureHiddenMode = None
+    # For multimodal
+    mm_inputs:  jax.Array[MultimodalInputs] | None = None
+    mrope_positions: jax.Array | None = None
 
     # Encoder-Decoder specific fields
     attention_mask: jax.Array | None = None
@@ -194,6 +198,8 @@ class ForwardBatch:
             self.lora_token_indices,
             self.lora_ranks,
             self.spec_info,
+            self.mrope_positions,
+            self.mm_inputs,
             self.attention_mask,
         )
 
@@ -232,10 +238,12 @@ class ForwardBatch:
         obj.lora_token_indices = children[11]
         obj.lora_ranks = children[12]
         obj.spec_info = children[13]
+        obj.mrope_positions = children[14]
+        obj.mm_inputs = children[15]
 
         # Handle optional children for backward compatibility
-        if len(children) > 14:
-            obj.attention_mask = children[14]
+        if len(children) > 16:
+            obj.attention_mask = children[16]
         else:
             obj.attention_mask = None
 
@@ -324,6 +332,20 @@ class ForwardBatch:
                 batch.lora_ranks,
             )
 
+        if batch.multimodal_inputs:
+            for mm_input in batch.multimodal_inputs:
+                if mm_input is not None:
+                    for item in mm_input.mm_items:
+                        if item.feature is not None:
+                            (item.feature,) = device_array(
+                                (item.feature,),
+                                sharding=(
+                                    NamedSharding(model_runner.mesh, PartitionSpec())
+                                    if jax.process_count() == 1
+                                    else None
+                                ),
+                            )
+        
         obj = cls(
             bid=batch.bid,
             forward_mode=batch.forward_mode,
@@ -331,6 +353,7 @@ class ForwardBatch:
             input_ids=input_ids,
             seq_lens=seq_lens,
             out_cache_loc=out_cache_loc,
+            mm_inputs=batch.multimodal_inputs,
             positions=positions,
             extend_start_loc=extend_start_loc,
             req_pool_indices=req_pool_indices,
@@ -361,5 +384,128 @@ class ForwardBatch:
 
             # Generate mask: 1 for valid tokens, 0 for padding
             obj.attention_mask = (obj.input_ids != pad_token_id).astype(jnp.int32)
+            
+        if batch.multimodal_inputs:
+            obj._compute_mrope_positions(model_runner, batch)
 
         return obj
+
+
+    def contains_image_inputs(self) -> bool:
+        if self.mm_inputs is None:
+            return False
+        return any(
+            mm_input is not None and mm_input.contains_image_inputs()
+            for mm_input in self.mm_inputs
+        )
+
+    def contains_audio_inputs(self) -> bool:
+        if self.mm_inputs is None:
+            return False
+        return any(
+            mm_input is not None and mm_input.contains_audio_inputs()
+            for mm_input in self.mm_inputs
+        )
+
+    def contains_video_inputs(self) -> bool:
+        if self.mm_inputs is None:
+            return False
+        return any(
+            mm_input is not None and mm_input.contains_video_inputs()
+            for mm_input in self.mm_inputs
+        )
+
+    def contains_mm_inputs(self) -> bool:
+        return (
+            self.contains_audio_inputs()
+            or self.contains_video_inputs()
+            or self.contains_image_inputs()
+        )
+
+    def _expand_mrope_from_input(
+        self,
+        mm_input: MultimodalInputs,
+        seq_len: int,
+    ) -> jax.Array:
+        """
+        Expand mrope positions from multimodal input for decode mode.
+        In JAX, device placement is handled automatically.
+        """
+        # Convert to JAX array if needed
+        if isinstance(mm_input.mrope_position_delta, np.ndarray):
+            mrope_position_delta = jnp.asarray(mm_input.mrope_position_delta)
+        else:
+            mrope_position_delta = mm_input.mrope_position_delta
+
+        mrope_position_deltas = mrope_position_delta.flatten()
+        # Add seq_len - 1 to deltas and repeat for 3 dimensions (T, H, W)
+        mrope_positions = jnp.tile(
+            (mrope_position_deltas + seq_len - 1)[jnp.newaxis, :], (3, 1)
+        )
+        return mrope_positions
+
+    def _compute_mrope_positions(
+        self, model_runner: ModelRunner, batch: ModelWorkerBatch
+    ):
+        # batch_size * [3 * seq_len]
+        batch_size = int(sum(self.seq_lens > 0))
+        mrope_positions_list = [[]] * batch_size
+        for batch_idx in range(batch_size):
+            mm_input = batch.multimodal_inputs[batch_idx]
+            if self.forward_mode.is_decode():
+                # 3 * N
+                if mm_input is None:
+                    mrope_positions_list[batch_idx] = jnp.full(
+                        (3, 1),
+                        self.seq_lens[batch_idx] - 1,
+                        dtype=jnp.int64,
+                    )
+                else:
+                    mrope_positions = self._expand_mrope_from_input(
+                        mm_input, self.seq_lens[batch_idx]
+                    )
+                    mrope_positions_list[batch_idx] = mrope_positions
+                    mm_input.mrope_positions = None
+            elif self.forward_mode.is_extend():
+                extend_seq_len, extend_prefix_len = (
+                    batch.extend_seq_lens[batch_idx],
+                    batch.extend_prefix_lens[batch_idx],
+                )
+                if mm_input is None:
+                    # text only
+                    mrope_positions = jnp.array(
+                        [
+                            [
+                                pos
+                                for pos in range(
+                                    extend_prefix_len,
+                                    extend_prefix_len + extend_seq_len,
+                                )
+                            ]
+                        ]
+                        * 3
+                    )
+                else:
+                    mrope_positions = mm_input.mrope_positions[
+                        :,
+                        extend_prefix_len : extend_prefix_len + extend_seq_len,
+                    ]
+                    if mrope_positions.size == 0:
+                        mrope_positions = self._expand_mrope_from_input(
+                            mm_input, self.seq_lens[batch_idx], model_runner.device
+                        )
+                    mm_input.mrope_positions = None
+                mrope_positions_list[batch_idx] = mrope_positions
+
+        self.mrope_positions = jnp.concatenate(
+            mrope_positions_list,
+            axis=1,
+        ).astype(jnp.int64)        # Pad with zeros until the shape matches self.input_ids
+        if self.mrope_positions.shape[1] < self.input_ids.shape[0]:
+            padding_needed = self.input_ids.shape[0] - self.mrope_positions.shape[1]
+            self.mrope_positions = jnp.pad(
+                self.mrope_positions,
+                ((0, 0), (0, padding_needed)),
+                mode='constant',
+                constant_values=0
+            )

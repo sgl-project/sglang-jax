@@ -21,12 +21,14 @@ import dataclasses
 import logging
 import threading
 from http import HTTPStatus
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Union, Optional
+from enum import Enum, auto
 
 import jax
 import numpy as np
 from jax import numpy as jnp
 from jax._src import mesh as mesh_lib
+from jax.tree_util import register_pytree_node_class
 
 from sgl_jax.global_config import global_config
 from sgl_jax.srt.configs.model_config import ModelConfig
@@ -146,7 +148,312 @@ class FINISH_ABORT(BaseFinishReason):
             "err_type": self.err_type,
         }
 
+class Modality(Enum):
+    IMAGE = auto()
+    MULTI_IMAGES = auto()
+    VIDEO = auto()
+    AUDIO = auto()
 
+    @staticmethod
+    def from_str(modality_str: str):
+        try:
+            return Modality[modality_str.upper()]
+        except KeyError:
+            raise ValueError(
+                f"Invalid modality string: {modality_str}. Valid modalities are: {[m.name for m in Modality]}"
+            )
+
+    @staticmethod
+    def all():
+        return [Modality.IMAGE, Modality.VIDEO, Modality.AUDIO]
+
+
+@register_pytree_node_class
+@dataclasses.dataclass
+class MultimodalDataItem:
+    """
+    One MultimodalDataItem contains all inputs for one modality.
+    For example, if there are 3 images and 1 audio inputs, there will be 2 MultimodalDataItem.
+    One for images and one for audio.
+
+    We put the common fields first and the model-specific fields in model_specific_data.
+    """
+
+    modality: Modality
+    hash: int = None
+    pad_value: int = None
+    offsets: Optional[list] = None
+
+    # the raw features returned by processor, e.g. pixel_values or audio_features
+    feature: Union[jax.Array, np.ndarray] = None
+    # the precomputed embeddings, passed as final encoder embeddings
+    # One and only one of the feature and precomputed_embeddings will be empty
+    precomputed_embeddings: Optional[Union[jax.Array, np.ndarray]] = None
+
+    # Model-specific data stored in a dictionary
+    model_specific_data: dict[str, Any] = dataclasses.field(default_factory=dict)
+
+    def __getattr__(self, name: str):
+        if (
+            "model_specific_data" in self.__dict__
+            and name in self.__dict__["model_specific_data"]
+        ):
+            return self.__dict__["model_specific_data"][name]
+        else:
+            raise AttributeError(
+                f"'{self.__class__.__name__}' object has no attribute '{name}'"
+            )
+
+    def __setitem__(self, key: str, value: Any):
+        if key in self.__dict__:
+            self.__dict__[key] = value
+        else:
+            self.model_specific_data[key] = value
+
+    def set(self, key: str, value: Any):
+        self.__setitem__(key, value)
+
+    @staticmethod
+    def is_empty_list(l):
+        if l is None:
+            return True
+        return len([item for item in flatten_nested_list(l) if item is not None]) == 0
+
+    def set_pad_value(self):
+        """
+        Set the pad value after first hashing the data
+        """
+        from sgl_jax.srt.multimodal.mm_utils import hash_feature
+
+        if self.hash is None:
+            if self.feature is not None:
+                hashed_feature = self.feature
+            else:
+                hashed_feature = self.precomputed_embeddings
+            self.hash = hash_feature(hashed_feature)
+        assert self.hash is not None
+        self.pad_value = self.hash % (1 << 30)
+
+    def is_modality(self, modality: Modality) -> bool:
+        return self.modality == modality
+
+    def is_audio(self):
+        return self.modality == Modality.AUDIO
+
+    def is_image(self):
+        return self.modality in [Modality.IMAGE, Modality.MULTI_IMAGES]
+
+    def is_video(self):
+        return self.modality == Modality.VIDEO
+
+    def is_valid(self) -> bool:
+        return self.is_image() or self.is_video() or self.is_audio()
+
+    def validate(self):
+        ...
+        # TODO
+
+    @staticmethod
+    def from_dict(obj: dict):
+        kwargs = dict(obj)
+        modality = kwargs.pop("modality")
+        if isinstance(modality, str):
+            modality = Modality[modality]
+        ret = MultimodalDataItem(modality=modality, **kwargs)
+        ret.validate()
+        return ret
+
+    def merge(self, other):
+        self.feature += other.feature
+        self.offsets += other.offsets
+        self.hash = hash((self.hash, other.hash))
+        self.set_pad_value()
+
+    def tree_flatten(self):
+        # Dynamic part: JAX arrays and other pytrees (like dicts of arrays).
+        children = (self.feature, self.precomputed_embeddings)
+
+        def make_hashable(value):
+            if isinstance(value, (list, tuple)):
+                return tuple(make_hashable(v) for v in value)
+            if isinstance(value, np.ndarray):
+                return tuple(make_hashable(v) for v in value.tolist())
+            if isinstance(value, dict):
+                return tuple(sorted((k, make_hashable(v)) for k, v in value.items()))
+            return value
+
+        # Static part: Metadata that doesn't change and isn't an array.
+        sanitized_model_data = tuple(sorted((k, make_hashable(v)) for k, v in self.model_specific_data.items()))
+        offsets_tuple = tuple(self.offsets) if self.offsets is not None else None
+        aux_data = (self.modality, self.hash, self.pad_value, offsets_tuple, sanitized_model_data)
+        return children, aux_data
+
+    @classmethod
+    def tree_unflatten(cls, aux_data, children):
+        (modality, hash_val, pad_value, offsets, sanitized_model_data) = aux_data
+        (feature, precomputed_embeddings) = children
+        model_specific_data = dict(sanitized_model_data)
+        return cls(
+            modality=modality,
+            hash=hash_val,
+            pad_value=pad_value,
+            offsets=list(offsets) if offsets is not None else None,
+            feature=feature,
+            precomputed_embeddings=precomputed_embeddings,
+            model_specific_data=model_specific_data,
+        )
+
+
+@register_pytree_node_class
+@dataclasses.dataclass
+class MultimodalInputs:
+    """The multimodal data related inputs."""
+
+    # items of data
+    mm_items: list[MultimodalDataItem]
+    image_pad_len: Optional[list] = None
+    num_image_tokens: Optional[int] = None
+
+    # image
+    im_token_id: Optional[int] = None
+    im_start_id: Optional[int] = None
+    im_end_id: Optional[int] = None
+    slice_start_id: Optional[int] = None
+    slice_end_id: Optional[int] = None
+
+    # video
+    video_token_id: Optional[int] = None
+
+    # audio
+    audio_token_id: Optional[int] = None
+    audio_start_id: Optional[int] = None
+    audio_end_id: Optional[int] = None
+
+    # QWen2-VL related
+    mrope_positions: Optional[jax.Array] = None
+    mrope_position_delta: Optional[jax.Array] = None
+
+    @staticmethod
+    def from_dict(obj: dict):
+        ret = MultimodalInputs(
+            mm_items=obj["mm_items"],
+        )
+
+        assert isinstance(ret.mm_items, list)
+        ret.mm_items = [item for item in ret.mm_items if item.is_valid()]
+        for item in ret.mm_items:
+            item.set_pad_value()
+
+        optional_args = [
+            "mrope_positions",
+            "mrope_position_delta",
+            "im_token_id",
+            "im_start_id",
+            "im_end_id",
+            "video_token_id",
+            "slice_start_id",
+            "slice_end_id",
+            "audio_start_id",
+            "audio_end_id",
+            "audio_token_id",
+        ]
+        for arg in optional_args:
+            if arg in obj:
+                setattr(ret, arg, obj[arg])
+
+        return ret
+
+    def contains_image_inputs(self) -> bool:
+        return any(item.is_image() for item in self.mm_items)
+
+    def contains_video_inputs(self) -> bool:
+        return any(item.is_video() for item in self.mm_items)
+
+    def contains_audio_inputs(self) -> bool:
+        return any(item.is_audio() for item in self.mm_items)
+
+    def contains_mm_input(self) -> bool:
+        return any(True for item in self.mm_items if item.is_valid())
+
+    def merge(self, other: MultimodalInputs):
+        """
+        merge image inputs when requests are being merged
+        """
+
+        # args needed to be merged
+        optional_args = [
+            "mm_items",
+            "image_pad_len",
+        ]
+        for arg in optional_args:
+            self_arg = getattr(self, arg, None)
+            if self_arg is not None:
+                setattr(self, arg, self_arg + getattr(other, arg))
+
+        mrope_positions = self.mrope_positions
+        if mrope_positions is not None:
+            if other.mrope_positions is None:
+                self.mrope_positions = mrope_positions
+            else:
+                self.mrope_positions = jnp.concatenate(
+                    [self.mrope_positions, other.mrope_positions], axis=1
+                )
+
+        mrope_position_delta = self.mrope_position_delta
+        if mrope_position_delta is not None:
+            if other.mrope_position_delta is None:
+                self.mrope_position_delta = mrope_position_delta
+            else:
+                self.mrope_position_delta = jnp.concatenate(
+                    [self.mrope_position_delta, other.mrope_position_delta], axis=0
+                )
+
+        for key, val in other.__dict__.items():
+            if "_id" in key:
+                # set token_ids
+                if getattr(self, key, None) is None:
+                    setattr(self, key, getattr(other, key, None))
+        # other args would be kept intact
+
+    def tree_flatten(self):
+        children = (self.mm_items, self.mrope_positions, self.mrope_position_delta)
+        aux_data = (
+            self.image_pad_len,
+            self.num_image_tokens,
+            self.im_token_id,
+            self.im_start_id,
+            self.im_end_id,
+            self.slice_start_id,
+            self.slice_end_id,
+            self.video_token_id,
+            self.audio_token_id,
+            self.audio_start_id,
+            self.audio_end_id,
+        )
+        return children, aux_data
+
+    @classmethod
+    def tree_unflatten(cls, aux_data, children):
+        obj = cls.__new__(cls)
+        # Set dynamic children
+        obj.mm_items, obj.mrope_positions, obj.mrope_position_delta = children
+        # Set static aux_data
+        (
+            obj.image_pad_len,
+            obj.num_image_tokens,
+            obj.im_token_id,
+            obj.im_start_id,
+            obj.im_end_id,
+            obj.slice_start_id,
+            obj.slice_end_id,
+            obj.video_token_id,
+            obj.audio_token_id,
+            obj.audio_start_id,
+            obj.audio_end_id,
+        ) = aux_data
+        return obj
+    
+        
 class Req:
     """The input and output status of a request."""
 
@@ -223,6 +530,9 @@ class Req:
         self.surr_offset = None  # Surrounding offset to defeat the cleanup algorithm
         self.read_offset = None
         self.decoded_text = ""
+
+        # For multimodal inputs
+        self.multimodal_inputs: Optional[MultimodalInputs] = None
 
         # Prefix info
         # The indices to kv cache for the shared prefix.
@@ -340,7 +650,10 @@ class Req:
         return len(self.origin_input_ids) + len(self.output_ids)
 
     def extend_image_inputs(self, image_inputs):
-        raise NotImplementedError()
+        if self.multimodal_inputs is None:
+            self.multimodal_inputs = image_inputs
+        else:
+            self.multimodal_inputs.merge(image_inputs)
 
     def finished(self) -> bool:
         # Whether request reached finished condition
@@ -491,6 +804,7 @@ class Req:
         self.latest_bid = None
 
     def set_finish_with_abort(self, error_msg: str):
+        self.multimodal_inputs = None
         # set it to one token to skip the long prefill
         self.origin_input_ids = [0]
         self.grammar = None
@@ -738,6 +1052,7 @@ class ScheduleBatch:
 
         # Copy prefix and do some basic check
         extend_input_logprob_token_ids = []
+        multimodal_inputs = []
 
         for i, (req, seq_len, pre_len) in enumerate(zip(reqs, seq_lens, prefix_lens)):
             req.req_pool_idx = req_pool_indices[i]
@@ -747,6 +1062,8 @@ class ScheduleBatch:
             if pre_len > 0:
                 # note: prefix_indices has to locate on device, or will meet Received incompatible devices for jitted computation
                 self.req_to_token_pool.write((req.req_pool_idx, slice(0, pre_len)), prefix_indices)
+
+            multimodal_inputs.append(req.multimodal_inputs)
 
             req.cached_tokens += pre_len - req.already_computed
             req.already_computed = seq_len
@@ -793,6 +1110,24 @@ class ScheduleBatch:
                     [0]
                     * (req.extend_input_len - req.extend_logprob_start_len - len(logprob_token_ids))
                 )
+
+        for mm_input in multimodal_inputs:
+            if mm_input is None:
+                continue
+            for mm_item in mm_input.mm_items:
+                pixel_values = getattr(mm_item, "feature", None)
+                # JAX arrays don't need explicit device transfer
+                # JAX automatically manages device placement
+                if isinstance(pixel_values, jax.Array):
+                    # Already a JAX array, no conversion needed
+                    mm_item.feature = pixel_values
+                elif isinstance(pixel_values, np.ndarray):
+                    # Convert numpy array to JAX array if needed
+                    mm_item.feature = jnp.asarray(pixel_values)
+                else:
+                    # For other types, try to convert to JAX array
+                    mm_item.feature = jnp.asarray(pixel_values)
+        self.multimodal_inputs = multimodal_inputs
 
         if self.return_logprob:
             extend_input_logprob_token_ids = np.array(extend_input_logprob_token_ids)
@@ -1058,6 +1393,8 @@ class ScheduleBatch:
             return
 
         self.reqs = [self.reqs[i] for i in keep_indices]
+        if self.multimodal_inputs is not None:
+            self.multimodal_inputs = [self.multimodal_inputs[i] for i in keep_indices]
         self.req_pool_indices = self.req_pool_indices[keep_indices]
         # TODO: uniform data type in scheduler batch
         if isinstance(self.seq_lens, jax.Array):
@@ -1126,6 +1463,8 @@ class ScheduleBatch:
             self.top_logprobs_nums = [0] * len(self.reqs) + other.top_logprobs_nums
             self.token_ids_logprobs = [None] * len(self.reqs) + other.token_ids_logprobs
         self.reqs.extend(other.reqs)
+        if self.multimodal_inputs is not None:
+            self.multimodal_inputs.extend(other.multimodal_inputs)
 
         self.return_logprob |= other.return_logprob
         self.return_output_logprob_only |= other.return_output_logprob_only
@@ -1400,6 +1739,7 @@ class ScheduleBatch:
                 extend_prefix_lens if self.forward_mode == ForwardMode.EXTEND else None
             ),
             extend_seq_lens=(extend_seq_lens if self.forward_mode == ForwardMode.EXTEND else None),
+            multimodal_inputs=self.multimodal_inputs,
             extend_logprob_start_lens=extend_logprob_start_lens,
             extend_input_logprob_token_ids=self.extend_input_logprob_token_ids,
             lora_ids=(
@@ -1724,6 +2064,9 @@ class ModelWorkerBatch:
     extend_logprob_start_lens: list[int] | None
     extend_input_logprob_token_ids: np.ndarray | None
 
+    # For multimodal
+    multimodal_inputs: Optional[list[MultimodalInputs]]
+    
     # For padding
     real_bs: int
 

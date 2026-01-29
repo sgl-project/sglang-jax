@@ -7,7 +7,7 @@ from flax import nnx
 from transformers import PretrainedConfig
 
 from sgl_jax.srt.configs.model_config import ModelConfig
-from sgl_jax.srt.layers.embeddings import Embed, ParallelLMHead, RotaryEmbedding
+from sgl_jax.srt.layers.embeddings import Embed, ParallelLMHead, get_rope
 from sgl_jax.srt.layers.layernorm import RMSNorm
 from sgl_jax.srt.layers.linear import LinearBase
 from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
@@ -127,12 +127,12 @@ class Qwen2Attention(nnx.Module):
             params_dtype=dtype,
             mesh=mesh,
         )
-        self.rotary_emb = RotaryEmbedding(
+        self.rotary_emb = get_rope(
             head_size=self.head_dim,
             rotary_dim=self.head_dim,
-            max_position_embeddings=max_position_embeddings,
+            max_position=max_position_embeddings,
             base=rope_theta,
-            is_neox_style=True,
+            rope_scaling=rope_scaling,
             dtype=dtype,
         )
 
@@ -277,18 +277,26 @@ class Qwen2Model(nnx.Module):
             param_dtype=dtype,
         )
 
+    def get_input_embeddings(self):
+        return self.embed_tokens
+
     def __call__(
         self,
         forward_batch: ForwardBatch,
         token_to_kv_pool: KVCache,
+        positions: jax.Array,
+        input_embeds: jax.Array = None,
     ):
         residual = None
-        hidden_states = self.embed_tokens(forward_batch.input_ids)
+        if input_embeds is None:
+            hidden_states = self.embed_tokens(forward_batch.input_ids)
+        else:
+            hidden_states = input_embeds
         layers_kv_fused = []
         layers_callback_flag = []
         for layer in self.layers:
             hidden_states, residual, kv_fused, callback_flag = layer(
-                forward_batch.positions,
+                positions,
                 hidden_states,
                 forward_batch,
                 token_to_kv_pool,
@@ -488,7 +496,7 @@ class Qwen2ForCausalLM(nnx.Module):
         logits_metadata: LogitsMetadata,
     ):
         hidden_states, layers_kv_fused, layers_callback_flag = self.model(
-            forward_batch, token_to_kv_pool
+            forward_batch, token_to_kv_pool, forward_batch.positions
         )
         if not getattr(self.config, "tie_word_embeddings", False):
             output = self.logits_processor(hidden_states, self.lm_head, logits_metadata)

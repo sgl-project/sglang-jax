@@ -420,6 +420,7 @@ class ModelWorker:
             capture_hidden_mode=(
                 CaptureHiddenMode.FULL if self.server_args.multimodal else CaptureHiddenMode.NULL
             ),
+            multimodal_inputs=None,
             spec_algorithm=speculative_algotithm,
             lora_ids=lora_ids,  # Already set to [None] * bs above
         )

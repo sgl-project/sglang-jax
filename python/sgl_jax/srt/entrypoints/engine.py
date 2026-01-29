@@ -45,6 +45,7 @@ from sgl_jax.srt.managers.io_struct import (
     PauseGenerationReqInput,
     ReleaseMemoryOccupationReqInput,
     ResumeMemoryOccupationReqInput,
+    MultimodalDataInputFormat,
 )
 from sgl_jax.srt.managers.scheduler import (
     run_scheduler_loop_thread_after_create,
@@ -148,6 +149,7 @@ class Engine(EngineBase):
         sampling_params: list[dict] | dict | None = None,
         # The token ids for text; one can either specify text or input_ids.
         input_ids: list[list[int]] | list[int] | None = None,
+        image_data: list[MultimodalDataInputFormat] | None = None,
         return_logprob: list[bool] | bool | None = False,
         logprob_start_len: list[int] | int | None = None,
         top_logprobs_num: list[int] | int | None = None,
@@ -167,6 +169,7 @@ class Engine(EngineBase):
         obj = GenerateReqInput(
             text=prompt,
             input_ids=input_ids,
+            image_data=image_data,
             sampling_params=sampling_params,
             return_logprob=return_logprob,
             logprob_start_len=logprob_start_len,
@@ -621,7 +624,9 @@ def _launch_subprocesses(
     # Initialize templates
     template_manager = TemplateManager()
     template_manager.initialize_templates(
+        tokenizer_manager=tokenizer_manager,
         model_path=server_args.model_path,
+        chat_template=server_args.chat_template,
     )
 
     # Wait for the model to finish loading
@@ -711,7 +716,9 @@ def _launch_threads(
     # Initialize templates
     template_manager = TemplateManager()
     template_manager.initialize_templates(
+        tokenizer_manager=tokenizer_manager,
         model_path=server_args.model_path,
+        chat_template=server_args.chat_template,
     )
 
     # Wait for the model to finish loading
