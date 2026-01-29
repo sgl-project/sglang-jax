@@ -773,6 +773,20 @@ class Scheduler(
             self.grammar_queue.append(req)
         else:
             self._add_request_to_queue(req)
+        # if recv_req.input_embeds is not None:
+        #     req.input_embeds = np.array(recv_req.input_embeds)
+        # else:
+        #     req.input_embeds = np.random.randn(14, 2048).astype(np.float32)
+        # if recv_req.deepstack_visual_embeds is not None:
+        #     req.apply_for_deepstack = True
+        #     req.deepstack_visual_embeds = np.array(recv_req.deepstack_visual_embeds)
+        # else:
+        #     req.apply_for_deepstack = True
+        #     req.deepstack_visual_embeds = np.random.randn(3, 2, 2048).astype(np.float32)
+        # if recv_req.deepstack_visual_pos_mask is not None:
+        #     req.deepstack_visual_pos_mask = np.array(recv_req.deepstack_visual_pos_mask)
+        # else:
+        #     req.deepstack_visual_pos_mask = np.array([1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])
 
     def move_ready_grammar_requests(self):
         """Poll grammar futures and move ready requests to waiting queue."""
