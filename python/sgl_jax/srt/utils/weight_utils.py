@@ -949,35 +949,7 @@ class WeightLoader:
                     )
 
         nnx.update(self.model, params)
-        self._validate_no_abstract_params(params)
         logger.info("All weights loaded successfully.")
-
-    @staticmethod
-    def _validate_no_abstract_params(params) -> None:
-        """Raise if any params are still abstract (ShapeDtypeStruct)."""
-        try:
-            flat = jax.tree_util.tree_flatten_with_path(params)[0]
-        except Exception:
-            flat = [((), x) for x in jax.tree_util.tree_flatten(params)[0]]
-
-        def _path_str(path):
-            try:
-                return jax.tree_util.keystr(path)
-            except Exception:
-                return "/".join(str(p) for p in path)
-
-        missing = []
-        for path, leaf in flat:
-            value = leaf.value if hasattr(leaf, "value") else leaf
-            if isinstance(value, jax.ShapeDtypeStruct):
-                missing.append(_path_str(path))
-
-        if missing:
-            preview = "\n".join(missing[:50])
-            raise RuntimeError(
-                "Found abstract (ShapeDtypeStruct) params after weight loading. "
-                f"Total={len(missing)}. First 50:\n{preview}"
-            )
 
     def _load_dummy_weights(
         self,

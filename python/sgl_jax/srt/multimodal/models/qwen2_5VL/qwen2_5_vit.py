@@ -18,8 +18,15 @@ from sgl_jax.srt.multimodal.configs.qwen_vl.qwen_2_5_vl_config import (
 from sgl_jax.srt.utils.jax_utils import is_tpu_runtime
 from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
 
-if not is_tpu_runtime():
-    from flash_attn_jax import flash_mha
+_FLASH_MHA = None
+
+
+def _get_flash_mha():
+    global _FLASH_MHA
+    if _FLASH_MHA is None:
+        from flash_attn_jax import flash_mha as _FLASH_MHA
+    return _FLASH_MHA
+
 
 init_fn = nnx.initializers.uniform()
 logger = logging.getLogger(__name__)
@@ -81,8 +88,8 @@ def vision_attention(
         Output tensor of shape [B, T, N, H]
     """
     if not is_tpu_runtime():
-
         # GPU: use flash_mha
+        flash_mha = _get_flash_mha()
         original_dtype = q.dtype
         if q.dtype not in [jnp.bfloat16, jnp.float16]:
             q = q.astype(jnp.bfloat16)
