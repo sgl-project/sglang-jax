@@ -357,7 +357,7 @@ class GenerateReqInput:
                 self.lora_path = self.lora_path[0]
             elif len(self.lora_path) > 1:
                 raise ValueError("Single request cannot have multiple lora_paths")
-        if self.return_routed_experts is None:
+        if not hasattr(self, "return_routed_experts") or self.return_routed_experts is None:
             self.return_routed_experts = False
 
     def _handle_parallel_sampling(self):
