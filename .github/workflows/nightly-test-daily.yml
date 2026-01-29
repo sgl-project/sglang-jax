@@ -35,7 +35,7 @@ jobs:
           uv pip install evalscope==1.0.0
 
           export OUTPUT_DIR_NAME=$(date +'%Y-%m-%d')
-          export BENCH_OUTPUT_DIR="$GITHUB_WORKSPACE/test/nightly_test_output/bench/$OUTPUT_DIR_NAME"
+          export BENCH_OUTPUT_DIR="$GITHUB_WORKSPACE/test/nightly_test_output/benchmark/$OUTPUT_DIR_NAME"
           echo "BENCH_OUTPUT_DIR=$BENCH_OUTPUT_DIR" >> $GITHUB_ENV
           mkdir -p $BENCH_OUTPUT_DIR
 
@@ -73,9 +73,9 @@ jobs:
           uv pip install -e "python[all]"
 
           export OUTPUT_DIR_NAME=$(date +'%Y-%m-%d')
-          export PREF_OUTPUT_DIR="$GITHUB_WORKSPACE/test/nightly_test_output/pref/$OUTPUT_DIR_NAME"
-          echo "PREF_OUTPUT_DIR=$PREF_OUTPUT_DIR" >> $GITHUB_ENV
-          mkdir -p $PREF_OUTPUT_DIR
+          export PERF_OUTPUT_DIR="$GITHUB_WORKSPACE/test/nightly_test_output/perf/$OUTPUT_DIR_NAME"
+          echo "PERF_OUTPUT_DIR=$PERF_OUTPUT_DIR" >> $GITHUB_ENV
+          mkdir -p $PERF_OUTPUT_DIR
 
 
 
