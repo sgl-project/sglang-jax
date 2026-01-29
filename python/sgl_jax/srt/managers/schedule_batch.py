@@ -1392,29 +1392,24 @@ class ScheduleBatch:
         # Pad lora_ids to match seq_lens_cpu length (after bs padding)
         if bs_padding_size > 0:
             lora_ids = lora_ids + [None] * bs_padding_size
-        multimodal_embedding = None
+        input_embedding = None
         if self.forward_mode == ForwardMode.EXTEND:
-            multimodal_embedding_list = []
+            input_embedding_list = []
             for req, prefix_len, extend_len in zip(self.reqs, self.prefix_lens, self.extend_lens):
-                # Check for cached vision embeddings first (for chunked prefill)
-                if (
-                    hasattr(req, "multimodal_embedding")
-                    and req.mm_inputs is not None
-                    and req.multimodal_embedding is not None
-                ):
+                if hasattr(req, "multimodal_embedding") and req.multimodal_embedding is not None:
                     mm_full = np.asarray(req.multimodal_embedding)
                     start = int(prefix_len or 0)
                     end = start + int(extend_len or 0)
-                    multimodal_embedding_list.append(mm_full[start:end])
-            if multimodal_embedding_list:
-                multimodal_embedding = np.concatenate(multimodal_embedding_list, axis=0)
-                if len(multimodal_embedding) < len(input_ids_cpu):
-                    pad_rows = len(input_ids_cpu) - len(multimodal_embedding)
+                    input_embedding_list.append(mm_full[start:end])
+            if input_embedding_list:
+                input_embedding = np.concatenate(input_embedding_list, axis=0)
+                if len(input_embedding) < len(input_ids_cpu):
+                    pad_rows = len(input_ids_cpu) - len(input_embedding)
                     pad = np.zeros(
-                        (pad_rows, multimodal_embedding.shape[1]),
-                        dtype=multimodal_embedding.dtype,
+                        (pad_rows, input_embedding.shape[1]),
+                        dtype=input_embedding.dtype,
                     )
-                    multimodal_embedding = np.concatenate([multimodal_embedding, pad], axis=0)
+                    input_embedding = np.concatenate([input_embedding, pad], axis=0)
         return ModelWorkerBatch(
             bid=bid,
             forward_mode=self.forward_mode,
@@ -1447,7 +1442,7 @@ class ScheduleBatch:
                 CaptureHiddenMode.FULL if self.return_hidden_states else CaptureHiddenMode.NULL
             ),
             launch_done=self.launch_done,
-            multimodal_embedding=multimodal_embedding,
+            input_embedding=input_embedding,
         )
 
     def get_spec_model_worker_batch(
@@ -1793,7 +1788,7 @@ class ModelWorkerBatch:
 
     tree_cache: BasePrefixCache = None
 
-    multimodal_embedding: np.ndarray | None = None
+    input_embedding: np.ndarray | None = None
 
     def get_original_input_len(self):
         """

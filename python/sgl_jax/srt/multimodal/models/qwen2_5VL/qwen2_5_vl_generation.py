@@ -203,13 +203,8 @@ class Qwen2_5_VL_Generation(nnx.Module):
         token_to_kv_pool: KVCache,
         logits_metadata: LogitsMetadata,
     ):
-        input_embeds = (
-            forward_batch.multimodal_embedding
-            if forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
-            else None
-        )
         hidden_states, layers_kv_fused, layers_callback_flag = self.model(
-            forward_batch, token_to_kv_pool, input_embeds=input_embeds
+            forward_batch, token_to_kv_pool
         )
         if not getattr(self.text_config, "tie_word_embeddings", False):
             output = self.logits_processor(hidden_states, self.lm_head, logits_metadata)
