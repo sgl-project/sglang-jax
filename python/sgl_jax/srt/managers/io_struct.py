@@ -296,6 +296,8 @@ class GenerateReqInput:
     # Extra key for cache namespace isolation (e.g., cache_salt)
     extra_key: list[str] | str | None = None
 
+    return_routed_experts: list[bool] | bool | None = None
+
     def contains_mm_input(self) -> bool:
         return (
             has_valid_data(self.image_data)
@@ -357,7 +359,7 @@ class GenerateReqInput:
                 self.lora_path = self.lora_path[0]
             elif len(self.lora_path) > 1:
                 raise ValueError("Single request cannot have multiple lora_paths")
-        if not hasattr(self, "return_routed_experts") or self.return_routed_experts is None:
+        if self.return_routed_experts is None:
             self.return_routed_experts = False
 
     def _handle_parallel_sampling(self):
