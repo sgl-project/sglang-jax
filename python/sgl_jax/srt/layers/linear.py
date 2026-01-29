@@ -199,10 +199,7 @@ class QuantizedLinear(nnx.Module):
 
         # Handle batched inputs by reshaping to 2D
         orig_shape = x.shape
-        if x.ndim > 2:
-            x_2d = x.reshape(-1, x.shape[-1])
-        else:
-            x_2d = x
+        x_2d = x.reshape(-1, x.shape[-1]) if x.ndim > 2 else x
 
         # Use shard_map for local computation with single all-reduce
         # kernel_axes[0] = input sharding axis (e.g., "tensor" for o_proj, None for q_proj)
