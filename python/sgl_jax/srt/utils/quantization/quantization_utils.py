@@ -14,9 +14,7 @@ from sgl_jax.srt.configs.quantization_config import DTYPE_MAP
 logger = logging.getLogger(__name__)
 
 
-def apply_linear_quantization(
-    model_config: ModelConfig, model: nnx.Module
-) -> nnx.Module:
+def apply_linear_quantization(model_config: ModelConfig, model: nnx.Module) -> nnx.Module:
     """Apply quantization to linear layers based on regex rules.
 
     This walks through the model and replaces LinearBase layers with QuantizedLinear
@@ -60,15 +58,15 @@ def apply_linear_quantization(
         activation_dtype = DTYPE_MAP.get(activation_dtype_str)
 
         if weight_dtype is None:
-            raise ValueError(
-                f"weight_dtype is required in rule but got: {weight_dtype_str}"
-            )
+            raise ValueError(f"weight_dtype is required in rule but got: {weight_dtype_str}")
 
-        compiled_rules.append({
-            "pattern": pattern,
-            "weight_dtype": weight_dtype,
-            "activation_dtype": activation_dtype,
-        })
+        compiled_rules.append(
+            {
+                "pattern": pattern,
+                "weight_dtype": weight_dtype,
+                "activation_dtype": activation_dtype,
+            }
+        )
 
     def _find_matching_rule(path: str):
         """Find the first rule that matches the given module path."""
@@ -97,8 +95,10 @@ def apply_linear_quantization(
                     rule = _find_matching_rule(child_path)
                     if rule is not None:
                         logger.debug(
-                            f"Quantizing {child_path} with weight_dtype={rule['weight_dtype']}, "
-                            f"activation_dtype={rule['activation_dtype']}"
+                            "Quantizing %s with weight_dtype=%s, activation_dtype=%s",
+                            child_path,
+                            rule["weight_dtype"],
+                            rule["activation_dtype"],
                         )
                         # Convert to QuantizedLinear
                         quantized_linear = QuantizedLinear.from_linear(
@@ -110,7 +110,7 @@ def apply_linear_quantization(
                         setattr(obj, attr_name, quantized_linear)
                         del attr_value
                     else:
-                        logger.debug(f"Skipping {child_path} - no matching rule")
+                        logger.debug("Skipping %s - no matching rule", child_path)
 
                 elif isinstance(attr_value, nnx.Module):
                     _replace_linear_recursive(attr_value, child_path, visited)
