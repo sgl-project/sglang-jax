@@ -918,16 +918,19 @@ class FusedEPMoE(nnx.Module):
                     self.quantized_dtype,
                     self.w1_shared.value,
                     axis=0,
+                    block_size=256,
                 )
                 w3_shared_value, w3_shared_scale = quantize_tensor(
                     self.quantized_dtype,
                     self.w3_shared.value,
                     axis=0,
+                    block_size=256,
                 )
                 w2_shared_value, w2_shared_scale = quantize_tensor(
                     self.quantized_dtype,
                     self.w2_shared.value,
                     axis=0,
+                    block_size=256,
                 )
 
                 self.w1_shared = nnx.Param(w1_shared_value, out_sharding=P(None, None))
@@ -938,9 +941,9 @@ class FusedEPMoE(nnx.Module):
                     del self.w1_shared_scale
                 self.w1_shared_scale = nnx.Param(
                     w1_shared_scale.reshape(
-                        1,
-                        1,
                         w1_shared_scale.shape[0],
+                        1,
+                        w1_shared_scale.shape[1],
                         out_sharding=P(None, None, None),
                     ),
                     out_sharding=P(None, None, None),
@@ -950,9 +953,9 @@ class FusedEPMoE(nnx.Module):
                     del self.w3_shared_scale
                 self.w3_shared_scale = nnx.Param(
                     w3_shared_scale.reshape(
-                        1,
-                        1,
                         w3_shared_scale.shape[0],
+                        1,
+                        w3_shared_scale.shape[1],
                         out_sharding=P(None, None, None),
                     ),
                     out_sharding=P(None, None, None),
@@ -962,13 +965,16 @@ class FusedEPMoE(nnx.Module):
                     del self.w2_shared_scale
                 self.w2_shared_scale = nnx.Param(
                     w2_shared_scale.reshape(
-                        1,
-                        1,
                         w2_shared_scale.shape[0],
+                        1,
+                        w2_shared_scale.shape[1],
                         out_sharding=P(None, None, None),
                     ),
                     out_sharding=P(None, None, None),
                 )
+                jax.debug.print("{w1_shared_scale}", w1_shared_scale=w1_shared_scale)
+                jax.debug.print("{w2_shared_scale}", w2_shared_scale=w2_shared_scale)
+                jax.debug.print("{w3_shared_scale}", w3_shared_scale=w3_shared_scale)
 
     def __call__(
         self,
