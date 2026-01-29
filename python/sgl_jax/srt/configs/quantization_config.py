@@ -1,8 +1,8 @@
 """Unified quantization configuration.
 
 Quantization settings are explicit - no fallbacks between components.
-Config files should specify both qwix (for dense layers) and moe sections.
-Dense models will use qwix rules only; MoE models will use both.
+Config files should specify both linear (for linear layers) and moe sections.
+Linear models will use linear rules only; MoE models will use both.
 """
 
 import os
@@ -60,12 +60,12 @@ class QuantizationConfig:
     """Quantization configuration with explicit settings (no fallbacks).
 
     Attributes:
-        qwix_rules: List of qwix quantization rules for dense layers
+        linear_rules: List of quantization rules for linear layers
         moe_weight_dtype: Dtype for MoE weight quantization (None = no quantization)
         moe_activation_dtype: Dtype for MoE activation quantization (None = no quantization)
     """
 
-    qwix_rules: list[dict] | None = None
+    linear_rules: list[dict] | None = None
     moe_weight_dtype: jnp.dtype | None = None
     moe_activation_dtype: jnp.dtype | None = None
 
@@ -76,11 +76,12 @@ class QuantizationConfig:
         Expected YAML format:
         ```yaml
         quantization:
-          qwix:
+          linear:
             rules:
               - module_path: '.*'
-                weight_qtype: 'int8'
-                # act_qtype: 'int8'  # optional
+                weight_dtype: 'int8'
+                activation_dtype: 'int8'  # optional, null for weight-only
+                scale_policy: 'per_channel'  # optional, default per_channel
 
           moe:
             weight_dtype: 'int8'
@@ -100,13 +101,13 @@ class QuantizationConfig:
 
         quant = cfg["quantization"]
 
-        # Parse qwix rules (required)
-        qwix_section = quant.get("qwix", {})
-        qwix_rules = qwix_section.get("rules")
-        if not qwix_rules:
+        # Parse linear rules (required)
+        linear_section = quant.get("linear", {})
+        linear_rules = linear_section.get("rules")
+        if not linear_rules:
             raise ValueError(
-                f"No qwix rules found in {resolved_path}. "
-                "The 'quantization.qwix.rules' section is required."
+                f"No linear rules found in {resolved_path}. "
+                "The 'quantization.linear.rules' section is required."
             )
 
         # Parse MoE settings (required)
@@ -120,7 +121,7 @@ class QuantizationConfig:
         moe_activation_dtype = _str_to_dtype(moe_section.get("activation_dtype"))
 
         return cls(
-            qwix_rules=qwix_rules,
+            linear_rules=linear_rules,
             moe_weight_dtype=moe_weight_dtype,
             moe_activation_dtype=moe_activation_dtype,
         )
@@ -147,10 +148,14 @@ class QuantizationConfig:
         """Get the dtype for MoE activation quantization."""
         return self.moe_activation_dtype
 
-    def get_qwix_rules(self) -> list[dict]:
-        """Get the qwix rules for dense layer quantization."""
-        return self.qwix_rules or []
+    def get_linear_rules(self) -> list[dict]:
+        """Get the quantization rules for linear layer quantization."""
+        return self.linear_rules or []
 
     def has_moe_quantization(self) -> bool:
         """Check if MoE quantization is configured."""
         return self.moe_weight_dtype is not None or self.moe_activation_dtype is not None
+
+    def has_linear_quantization(self) -> bool:
+        """Check if linear layer quantization is configured."""
+        return bool(self.linear_rules)

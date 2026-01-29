@@ -6,10 +6,8 @@ sglang-jax supports post-training quantization (PTQ) for reducing memory footpri
 
 The quantization system consists of two components:
 
-1. **QWIX** - For dense layers (attention, MLP, embeddings, etc.)
+1. **Linear Quantization** - For dense layers (attention, MLP, embeddings, etc.)
 2. **MoE Quantization** - For Mixture-of-Experts layers (expert weights and activations)
-
-For QWIX implementation details, see: https://github.com/google/qwix
 
 ## Supported Features
 
@@ -21,10 +19,9 @@ For QWIX implementation details, see: https://github.com/google/qwix
 - `int8` - 8-bit integer quantization
 - `float8_e4m3fn` - 8-bit floating point (4 exponent bits, 3 mantissa bits, finite values + NaN)
 
-### Quantization Granularity (QWIX)
-- Per-channel
-- Per-matrix
-- Per-tile
+### Quantization Strategy
+- **Weights**: Per-channel quantization (computed once at load time)
+- **Activations**: Dynamic per-token quantization (computed at runtime)
 
 ## Configuration
 
@@ -32,17 +29,17 @@ Quantization behavior is defined through YAML configuration files with two secti
 
 ```yaml
 quantization:
-  # QWIX rules for dense layers
-  qwix:
+  # Quantization rules for dense layers
+  dense:
     rules:
       - module_path: '<regex pattern>'
-        weight_qtype: '<dtype>'      # Optional: weight quantization type
-        act_qtype: '<dtype>'         # Optional: activation quantization type
+        weight_dtype: '<dtype>'        # Required: weight quantization type
+        activation_dtype: '<dtype>'    # Optional: activation quantization type (null for weight-only)
 
   # MoE-specific settings (for MoE models only)
   moe:
-    weight_dtype: '<dtype>'          # Expert weight quantization
-    activation_dtype: '<dtype>'      # Expert activation quantization (null to disable)
+    weight_dtype: '<dtype>'            # Expert weight quantization
+    activation_dtype: '<dtype>'        # Expert activation quantization (null to disable)
 ```
 
 ### Available Configuration File Examples
