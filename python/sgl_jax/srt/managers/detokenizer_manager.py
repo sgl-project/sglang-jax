@@ -95,8 +95,6 @@ class DetokenizerManager:
         while True:
             recv_obj = self.recv_from_scheduler.recv_pyobj()
             output = self._request_dispatcher(recv_obj)
-            if self.server_args.log_requests and isinstance(output, BatchStrOut):
-                logger.info("detokenizer result_type=%s", type(output))
             self.send_to_tokenizer.send_pyobj(output)
 
     def trim_matched_stop(self, output: str | list[int], finished_reason: dict, no_stop_trim: bool):
