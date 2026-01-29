@@ -180,6 +180,12 @@ class ForwardBatch:
     # Multimodal cached vision embeddings (prefill only)
     input_embedding: jax.Array | None = None
 
+    ## for deepstack
+    input_embeds: jax.Array | None = None
+    apply_for_deepstack: bool = False
+    deepstack_visual_pos_mask: jax.Array | None = None
+    deepstack_visual_embeds: jax.Array | None = None
+
     def tree_flatten(self):
         children = (
             self.input_ids,
@@ -198,6 +204,9 @@ class ForwardBatch:
             self.spec_info,
             self.attention_mask,
             self.input_embedding,
+            self.apply_for_deepstack,
+            self.deepstack_visual_pos_mask,
+            self.deepstack_visual_embeds,
         )
 
         aux_data = {
@@ -237,9 +246,20 @@ class ForwardBatch:
         obj.spec_info = children[13]
 
         # Handle optional children for backward compatibility
+<<<<<<< HEAD
         obj.attention_mask = children[14] if len(children) > 14 else None
         obj.input_embedding = children[15] if len(children) > 15 else None
 
+=======
+        if len(children) > 14:
+            obj.attention_mask = children[14]
+        else:
+            obj.attention_mask = None
+        obj.input_embeds = children[15]
+        obj.apply_for_deepstack = children[16]
+        obj.deepstack_visual_pos_mask = children[17]
+        obj.deepstack_visual_embeds = children[18]
+>>>>>>> add qwen3_omni_text (#737)
         return obj
 
     def __repr__(self) -> str:
@@ -335,6 +355,26 @@ class ForwardBatch:
                 batch.lora_ranks,
             )
 
+        input_embeds = None
+        deepstack_visual_embeds = None
+        # deepstack_visual_pos_mask = None
+        if batch.apply_for_deepstack:
+            (
+                input_embeds,
+                deepstack_visual_embeds,
+                # deepstack_visual_pos_mask
+            ) = device_array(
+                (
+                    batch.input_embeds,
+                    batch.deepstack_visual_embeds,
+                    # batch.deepstack_visual_pos_mask
+                ),
+                sharding=(
+                    NamedSharding(model_runner.mesh, PartitionSpec())
+                    if jax.process_count() == 1
+                    else None
+                ),
+            )
         obj = cls(
             bid=batch.bid,
             forward_mode=batch.forward_mode,
@@ -356,7 +396,14 @@ class ForwardBatch:
             spec_info=batch.spec_info,
             spec_algorithm=batch.spec_algorithm,
             capture_hidden_mode=batch.capture_hidden_mode,
+<<<<<<< HEAD
             input_embedding=input_embedding,
+=======
+            apply_for_deepstack=batch.apply_for_deepstack,
+            input_embeds=input_embeds,
+            deepstack_visual_embeds=deepstack_visual_embeds,
+            # deepstack_visual_pos_mask=deepstack_visual_pos_mask,
+>>>>>>> add qwen3_omni_text (#737)
         )
 
         # Auto-generate attention mask for Encoder-only models (e.g. UMT5Encoder, BERT)
