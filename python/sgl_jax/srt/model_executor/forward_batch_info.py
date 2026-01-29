@@ -178,6 +178,12 @@ class ForwardBatch:
     attention_mask: jax.Array | None = None
     deterministic: bool = True
 
+    ## for deepstack
+    input_embeds: jax.Array | None = None
+    apply_for_deepstack: bool = False
+    deepstack_visual_pos_mask: jax.Array | None = None
+    deepstack_visual_embeds: jax.Array | None = None
+
     def tree_flatten(self):
         children = (
             self.input_ids,
@@ -195,6 +201,10 @@ class ForwardBatch:
             self.lora_ranks,
             self.spec_info,
             self.attention_mask,
+            self.input_embeds,
+            self.apply_for_deepstack,
+            self.deepstack_visual_pos_mask,
+            self.deepstack_visual_embeds,
         )
 
         aux_data = {
@@ -238,7 +248,10 @@ class ForwardBatch:
             obj.attention_mask = children[14]
         else:
             obj.attention_mask = None
-
+        obj.input_embeds = children[15]
+        obj.apply_for_deepstack = children[16]
+        obj.deepstack_visual_pos_mask = children[17]
+        obj.deepstack_visual_embeds = children[18]
         return obj
 
     def __repr__(self) -> str:
@@ -324,6 +337,26 @@ class ForwardBatch:
                 batch.lora_ranks,
             )
 
+        input_embeds = None
+        deepstack_visual_embeds = None
+        # deepstack_visual_pos_mask = None
+        if batch.apply_for_deepstack:
+            (
+                input_embeds,
+                deepstack_visual_embeds,
+                # deepstack_visual_pos_mask
+            ) = device_array(
+                (
+                    batch.input_embeds,
+                    batch.deepstack_visual_embeds,
+                    # batch.deepstack_visual_pos_mask
+                ),
+                sharding=(
+                    NamedSharding(model_runner.mesh, PartitionSpec())
+                    if jax.process_count() == 1
+                    else None
+                ),
+            )
         obj = cls(
             bid=batch.bid,
             forward_mode=batch.forward_mode,
@@ -345,6 +378,10 @@ class ForwardBatch:
             spec_info=batch.spec_info,
             spec_algorithm=batch.spec_algorithm,
             capture_hidden_mode=batch.capture_hidden_mode,
+            apply_for_deepstack=batch.apply_for_deepstack,
+            input_embeds=input_embeds,
+            deepstack_visual_embeds=deepstack_visual_embeds,
+            # deepstack_visual_pos_mask=deepstack_visual_pos_mask,
         )
 
         # Auto-generate attention mask for Encoder-only models (e.g. UMT5Encoder, BERT)
