@@ -177,6 +177,8 @@ class ForwardBatch:
     # Encoder-Decoder specific fields
     attention_mask: jax.Array | None = None
     deterministic: bool = True
+    # Multimodal cached vision embeddings (prefill only)
+    multimodal_embedding: jax.Array | None = None
 
     def tree_flatten(self):
         children = (
@@ -195,6 +197,7 @@ class ForwardBatch:
             self.lora_ranks,
             self.spec_info,
             self.attention_mask,
+            self.multimodal_embedding,
         )
 
         aux_data = {
@@ -234,10 +237,8 @@ class ForwardBatch:
         obj.spec_info = children[13]
 
         # Handle optional children for backward compatibility
-        if len(children) > 14:
-            obj.attention_mask = children[14]
-        else:
-            obj.attention_mask = None
+        obj.attention_mask = children[14] if len(children) > 14 else None
+        obj.multimodal_embedding = children[15] if len(children) > 15 else None
 
         return obj
 
@@ -299,6 +300,16 @@ class ForwardBatch:
                 else None
             ),
         )
+        multimodal_embedding = None
+        if batch.multimodal_embedding is not None:
+            (multimodal_embedding,) = device_array(
+                (batch.multimodal_embedding,),
+                sharding=(
+                    NamedSharding(model_runner.mesh, PartitionSpec())
+                    if jax.process_count() == 1
+                    else None
+                ),
+            )
 
         if batch.lora_scalings is not None:
             (
@@ -345,6 +356,7 @@ class ForwardBatch:
             spec_info=batch.spec_info,
             spec_algorithm=batch.spec_algorithm,
             capture_hidden_mode=batch.capture_hidden_mode,
+            multimodal_embedding=multimodal_embedding,
         )
 
         # Auto-generate attention mask for Encoder-only models (e.g. UMT5Encoder, BERT)

@@ -178,6 +178,12 @@ class Req:
             else origin_input_ids  # Before image padding
         )
         self.origin_input_ids = origin_input_ids
+
+        # Cache input IDs with hash-based values for multimodal placeholder tokens
+        # Used for radix cache matching to differentiate different images/videos
+        # If None, origin_input_ids is used for cache matching
+        self.cache_input_ids: list[int] | None = None
+
         # Each decode stage's output ids
         self.output_ids = []
         # fill_ids = origin_input_ids + output_ids. Updated if chunked.
@@ -379,6 +385,12 @@ class Req:
             max_prefix_len = min(max_prefix_len, self.logprob_start_len)
 
         max_prefix_len = max(max_prefix_len, 0)
+        # Use cache_input_ids for cache matching if available (multimodal requests)
+        # This contains hash-based values instead of placeholder tokens
+        cache_ids = getattr(self, "cache_input_ids", None)
+        if cache_ids is not None:
+            cache_fill_ids = cache_ids + self.output_ids
+            return cache_fill_ids[:max_prefix_len]
         return self.fill_ids[:max_prefix_len]
 
     # Based on https://github.com/vllm-project/vllm/blob/7a64d24aad69e4d2548aa0bf528d9fe63428ab01/vllm/transformers_utils/detokenizer.py#L194-L313
@@ -463,12 +475,13 @@ class Req:
 
     def _check_str_based_finish(self):
         # Check stop strings
-        if len(self.sampling_params.stop_strs) > 0:
+        stop_strs = self.sampling_params.stop_strs or []
+        if len(stop_strs) > 0:
             tail_str = self.tokenizer.decode(
                 self.output_ids[-(self.sampling_params.stop_str_max_len + 1) :]
             )
 
-            for stop_str in self.sampling_params.stop_strs:
+            for stop_str in stop_strs:
                 if stop_str in tail_str or stop_str in self.decoded_text:
                     self.finished_reason = FINISH_MATCHED_STR(matched=stop_str)
                     return True
@@ -1379,7 +1392,29 @@ class ScheduleBatch:
         # Pad lora_ids to match seq_lens_cpu length (after bs padding)
         if bs_padding_size > 0:
             lora_ids = lora_ids + [None] * bs_padding_size
-
+        multimodal_embedding = None
+        if self.forward_mode == ForwardMode.EXTEND:
+            multimodal_embedding_list = []
+            for req, prefix_len, extend_len in zip(self.reqs, self.prefix_lens, self.extend_lens):
+                # Check for cached vision embeddings first (for chunked prefill)
+                if (
+                    hasattr(req, "multimodal_embedding")
+                    and req.mm_inputs is not None
+                    and req.multimodal_embedding is not None
+                ):
+                    mm_full = np.asarray(req.multimodal_embedding)
+                    start = int(prefix_len or 0)
+                    end = start + int(extend_len or 0)
+                    multimodal_embedding_list.append(mm_full[start:end])
+            if multimodal_embedding_list:
+                multimodal_embedding = np.concatenate(multimodal_embedding_list, axis=0)
+                if len(multimodal_embedding) < len(input_ids_cpu):
+                    pad_rows = len(input_ids_cpu) - len(multimodal_embedding)
+                    pad = np.zeros(
+                        (pad_rows, multimodal_embedding.shape[1]),
+                        dtype=multimodal_embedding.dtype,
+                    )
+                    multimodal_embedding = np.concatenate([multimodal_embedding, pad], axis=0)
         return ModelWorkerBatch(
             bid=bid,
             forward_mode=self.forward_mode,
@@ -1412,6 +1447,7 @@ class ScheduleBatch:
                 CaptureHiddenMode.FULL if self.return_hidden_states else CaptureHiddenMode.NULL
             ),
             launch_done=self.launch_done,
+            multimodal_embedding=multimodal_embedding,
         )
 
     def get_spec_model_worker_batch(
@@ -1756,6 +1792,8 @@ class ModelWorkerBatch:
     capture_hidden_mode: CaptureHiddenMode = None
 
     tree_cache: BasePrefixCache = None
+
+    multimodal_embedding: np.ndarray | None = None
 
     def get_original_input_len(self):
         """

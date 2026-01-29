@@ -52,6 +52,7 @@ class ModelWorker:
         mesh: jax.sharding.Mesh,
         req_to_token_pool: ReqToTokenPool | None = None,
         is_draft_worker: bool = False,
+        model_class=None,
     ):
         # Parse args
         self.tp_size = server_args.tp_size
@@ -111,6 +112,7 @@ class ModelWorker:
             req_to_token_pool=req_to_token_pool,
             rngs=nnx.Rngs(self.random_seed),
             max_padding=max(self.max_prefill_tokens, self.chunked_prefill_size),
+            model_class=model_class,
         )
 
         # set infer devices

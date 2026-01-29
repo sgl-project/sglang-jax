@@ -71,8 +71,11 @@ class GenerateMMReqInput:
         "blurry, low quality, inconsistent lighting, floating, disconnected from scene"
     )
     input_ids: list[int] | None = None
+    stream: bool = False
     n: int | None = 1
     input_reference: str | None = None
+    image_data: list[str] | str | None = None
+    video_data: list[str] | str | None = None
     size: str = None
     seconds: int | None = None
     fps: int | None = None
@@ -88,6 +91,25 @@ class GenerateMMReqInput:
 
 
 @dataclasses.dataclass
+class GenerateVLMReqInput:
+    """Input request for VLM chat/completions."""
+
+    rid: str | None = None
+    prompt: str | None = None
+    input_ids: list[int] | None = None
+    image_data: list[str] | str | None = None
+    video_data: list[str] | str | None = None
+    stream: bool = False
+    n: int | None = 1
+    sampling_params: dict | None = None
+    stop: str | list[str] | None = None
+
+    def __post_init__(self):
+        if self.rid is None:
+            self.rid = uuid.uuid4().hex
+
+
+@dataclasses.dataclass
 class TokenizedGenerateMMReqInput:
     rid: str | None = None
     data_type: DataType | None = None
@@ -98,6 +120,7 @@ class TokenizedGenerateMMReqInput:
     n: int | None = 1
     input_reference: str | None = None
     preprocessed_image: np.ndarray | None = None
+    mm_inputs: "VLMMInputs | None" = None
     size: str = None
     seconds: int | None = None
     fps: int | None = None
@@ -107,3 +130,30 @@ class TokenizedGenerateMMReqInput:
     save_output: bool = True
     background: str | None = None
     response_format: str | None = None
+
+
+@dataclasses.dataclass
+class TokenizedGenerateVLMReqInput:
+    rid: str | None = None
+    prompt: str | None = None
+    input_ids: list[int] | None = None
+    mm_inputs: "VLMMInputs | None" = None
+    stream: bool = False
+    n: int | None = 1
+    sampling_params: dict | None = None
+    stop: str | list[str] | None = None
+
+
+@dataclasses.dataclass
+class VLMMInputs:
+    pixel_values: np.ndarray | None = None
+    pixel_values_videos: np.ndarray | None = None
+    image_grid_thw: list[tuple[int, int, int]] | None = None
+    video_grid_thw: list[tuple[int, int, int]] | None = None
+    second_per_grid_ts: list[float] | None = None
+    mrope_positions: np.ndarray | None = None
+    mrope_position_delta: int | None = None
+    image_token_id: int | None = None
+    video_token_id: int | None = None
+    pad_values: list[int] | None = None
+    multimodal_embeddings: np.ndarray | None = None

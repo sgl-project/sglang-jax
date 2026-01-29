@@ -59,6 +59,7 @@ from sgl_jax.srt.managers.io_struct import (
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
 )
+from sgl_jax.srt.multimodal.tokenizer_utils import resolve_tokenizer_subdir
 from sgl_jax.srt.sampling.sampling_params import SamplingParams
 from sgl_jax.srt.server_args import PortArgs, ServerArgs
 from sgl_jax.srt.utils import (
@@ -160,12 +161,17 @@ class TokenizerManager:
         if server_args.skip_tokenizer_init:
             self.tokenizer = self.processor = None
         else:
+            tokenizer_subdir = ""
+            if server_args.multimodal:
+                tokenizer_subdir = resolve_tokenizer_subdir(
+                    server_args.model_path, server_args.tokenizer_path
+                )
             self.tokenizer = get_tokenizer(
                 server_args.tokenizer_path,
                 tokenizer_mode=server_args.tokenizer_mode,
                 trust_remote_code=server_args.trust_remote_code,
                 revision=server_args.revision,
-                sub_dir="tokenizer" if server_args.multimodal else "",
+                sub_dir=tokenizer_subdir,
             )
 
         # Store states
@@ -913,7 +919,15 @@ class TokenizerManager:
         """The event loop that handles requests"""
         while True:
             recv_obj = await self.recv_from_detokenizer.recv_pyobj()
-            self._result_dispatcher(recv_obj)
+            try:
+                self._result_dispatcher(recv_obj)
+            except ValueError:
+                # Fallback for cross-process type identity mismatch
+                cls_name = recv_obj.__class__.__name__
+                if cls_name in ("BatchStrOut", "BatchEmbeddingOut", "BatchTokenIDOut"):
+                    self._handle_batch_output(recv_obj)
+                else:
+                    raise
             self.last_receive_tstamp = time.perf_counter()
 
     def _handle_batch_output(
