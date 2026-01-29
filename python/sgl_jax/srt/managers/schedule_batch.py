@@ -385,12 +385,6 @@ class Req:
             max_prefix_len = min(max_prefix_len, self.logprob_start_len)
 
         max_prefix_len = max(max_prefix_len, 0)
-        # Use cache_input_ids for cache matching if available (multimodal requests)
-        # This contains hash-based values instead of placeholder tokens
-        cache_ids = getattr(self, "cache_input_ids", None)
-        if cache_ids is not None:
-            cache_fill_ids = cache_ids + self.output_ids
-            return cache_fill_ids[:max_prefix_len]
         return self.fill_ids[:max_prefix_len]
 
     # Based on https://github.com/vllm-project/vllm/blob/7a64d24aad69e4d2548aa0bf528d9fe63428ab01/vllm/transformers_utils/detokenizer.py#L194-L313

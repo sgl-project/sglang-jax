@@ -119,12 +119,6 @@ class OpenAIServingBase(ABC):
         param: str | None = None,
     ) -> ORJSONResponse:
         """Create an error response"""
-        logger.warning(
-            "OpenAI request error: status=%s type=%s message=%s",
-            status_code,
-            err_type,
-            message,
-        )
         error = ErrorResponse(
             object="error",
             message=message,

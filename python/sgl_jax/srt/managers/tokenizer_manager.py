@@ -919,15 +919,7 @@ class TokenizerManager:
         """The event loop that handles requests"""
         while True:
             recv_obj = await self.recv_from_detokenizer.recv_pyobj()
-            try:
-                self._result_dispatcher(recv_obj)
-            except ValueError:
-                # Fallback for cross-process type identity mismatch
-                cls_name = recv_obj.__class__.__name__
-                if cls_name in ("BatchStrOut", "BatchEmbeddingOut", "BatchTokenIDOut"):
-                    self._handle_batch_output(recv_obj)
-                else:
-                    raise
+            self._result_dispatcher(recv_obj)
             self.last_receive_tstamp = time.perf_counter()
 
     def _handle_batch_output(

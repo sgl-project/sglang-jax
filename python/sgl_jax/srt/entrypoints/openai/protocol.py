@@ -297,7 +297,7 @@ class ToolCall(BaseModel):
 
 class ChatCompletionMessageGenericParam(BaseModel):
     role: Literal["system", "assistant", "tool"]
-    content: list[ChatCompletionMessageContentTextPart] | str | None
+    content: str | list[ChatCompletionMessageContentTextPart] | None
     tool_call_id: str | None = None
     name: str | None = None
     reasoning_content: str | None = None
@@ -318,7 +318,7 @@ class ChatCompletionMessageGenericParam(BaseModel):
 
 class ChatCompletionMessageUserParam(BaseModel):
     role: Literal["user"]
-    content: list[ChatCompletionMessageContentPart] | str
+    content: str | list[ChatCompletionMessageContentPart]
 
 
 ChatCompletionMessageParam = ChatCompletionMessageGenericParam | ChatCompletionMessageUserParam
