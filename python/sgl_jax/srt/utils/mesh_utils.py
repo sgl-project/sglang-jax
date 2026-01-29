@@ -25,9 +25,6 @@ def create_device_mesh(
         devices = jax.devices()
 
     if device_indexes is not None:
-        max_index = max(device_indexes)
-        if max_index >= len(devices):
-            raise RuntimeError("Device index out of range")
         devices_dict = {device.id: device for device in devices}
         devices = [devices_dict.get(i) for i in list(set(device_indexes))]
 
