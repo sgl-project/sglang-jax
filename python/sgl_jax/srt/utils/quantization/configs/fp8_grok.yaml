@@ -5,8 +5,8 @@
 # - Reference: https://arxiv.org/pdf/2101.03961
 
 quantization:
-  # Quantization rules for dense layers
-  dense:
+  # Quantization rules for linear layers
+  linear:
     rules:
       # All layers EXCEPT MoE gate, experts, and logits_processor
       - module_path: '^(?!.*(block_sparse_moe/gate|block_sparse_moe/experts|logits_processor)).*$'

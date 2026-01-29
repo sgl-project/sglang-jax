@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 def apply_linear_quantization(
     model_config: ModelConfig, model: nnx.Module
 ) -> nnx.Module:
-    """Apply quantization to dense layers based on regex rules.
+    """Apply quantization to linear layers based on regex rules.
 
     This walks through the model and replaces LinearBase layers with QuantizedLinear
     layers based on the regex rules in the quantization config.
@@ -41,16 +41,16 @@ def apply_linear_quantization(
             "Ensure --quantization-config-path is set."
         )
 
-    dense_rules = quant_config.get_dense_rules()
-    if not dense_rules:
+    linear_rules = quant_config.get_linear_rules()
+    if not linear_rules:
         raise ValueError(
-            "No dense rules found in quantization config. "
+            "No linear rules found in quantization config. "
             "Check your quantization config YAML file."
         )
 
     # Compile regex patterns from rules
     compiled_rules = []
-    for rule in dense_rules:
+    for rule in linear_rules:
         pattern = re.compile(rule["module_path"])
         weight_dtype_str = rule.get("weight_dtype")
         activation_dtype_str = rule.get("activation_dtype")
@@ -121,7 +121,7 @@ def apply_linear_quantization(
                             item_path = f"{child_path}[{idx}]"
                             _replace_linear_recursive(item, item_path, visited)
 
-    logger.info("Applying quantization to dense layers...")
+    logger.info("Applying quantization to linear layers...")
     _replace_linear_recursive(model)
     logger.info("Quantization complete.")
 

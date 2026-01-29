@@ -1,10 +1,10 @@
 # FP8 weight and activation quantization config
-# Works for both dense and MoE models
+# Works for both linear and MoE models
 # Uses per-channel weight quantization + dynamic per-token activation quantization
 
 quantization:
-  # Quantization rules for dense layers (attention, MLP, embeddings)
-  dense:
+  # Quantization rules for linear layers (attention, MLP, embeddings)
+  linear:
     rules:
       - module_path: '.*'
         weight_dtype: 'float8_e4m3fn'

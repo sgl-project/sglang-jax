@@ -277,13 +277,13 @@ class ModelRunner(BaseModelRunner):
 
         # Apply quantization if quantization config is set
         if self.model_config.quantization_config is not None:
-            # Apply MoE quantization first (before dense quantization)
+            # Apply MoE quantization first (before linear quantization)
             if self.model_config.quantization_config.has_moe_quantization():
                 self.model = apply_moe_quantization(self.model_config, self.model)
 
-            # Apply quantization for dense layers
-            dense_rules = self.model_config.quantization_config.get_dense_rules()
-            if dense_rules:
+            # Apply quantization for linear layers
+            linear_rules = self.model_config.quantization_config.get_linear_rules()
+            if linear_rules:
                 self.model = apply_linear_quantization(self.model_config, self.model)
 
         # Parse other args
