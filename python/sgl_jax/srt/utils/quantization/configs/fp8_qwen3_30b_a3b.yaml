@@ -2,16 +2,18 @@
 # - MoE gate (router) is NOT quantized for numerical stability
 # - MoE experts: FP8 weights only, NO activation quantization
 # - All other layers (attention, embeddings): FP8 W8A8
+# - Uses per-channel weight quantization + dynamic per-token activation quantization
 # - logits_processor: excluded for accuracy
 
 quantization:
-  qwix:
+  # Quantization rules for linear layers
+  linear:
     rules:
       # All layers EXCEPT MoE gate, MoE experts (mlp in MoE layers), and logits_processor
       # Note: Qwen3 MoE uses 'moe_gate' for router and 'mlp' (EPMoE/FusedEPMoE) for experts
       - module_path: '^(?!.*(moe_gate|layers\.\d+\.mlp|logits_processor)).*$'
-        weight_qtype: 'float8_e4m3fn'
-        act_qtype: 'float8_e4m3fn'
+        weight_dtype: 'float8_e4m3fn'
+        activation_dtype: 'float8_e4m3fn'
 
   # MoE experts: FP8 weights only, NO activation quantization
   moe:

@@ -44,7 +44,6 @@ dependencies = [
     "pybase64",
     "omegaconf",
     "imageio[ffmpeg]",
-    "qwix",
 ]
 
 [project.optional-dependencies]
