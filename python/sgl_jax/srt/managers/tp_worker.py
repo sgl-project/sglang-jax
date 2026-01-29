@@ -429,6 +429,13 @@ class ModelWorker:
             ),
             spec_algorithm=speculative_algotithm,
             lora_ids=lora_ids,  # Already set to [None] * bs above
+            # apply_for_deepstack=mode == ForwardMode.EXTEND,
+            # input_embeds=np.zeros(
+            # (num_tokens, self.model_config.hidden_size)
+            # ),  # todo: set input_embeds only for the embeds input for ar stage
+            # deepstack_visual_embeds=np.zeros(
+            # (3, num_tokens, self.model_config.hidden_size)
+            # ),  # todo: set deepstack_visual_embeds only for need deepstak_visual_embed
         )
 
     def get_model_runner(self):

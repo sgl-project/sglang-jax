@@ -182,6 +182,12 @@ class ForwardBatch:
     # MRoPE positions [3, total_tokens] for Qwen2.5-VL
     mrope_positions: jax.Array | None = None
 
+    ## for deepstack
+    input_embeds: jax.Array | None = None
+    apply_for_deepstack: bool = False
+    deepstack_visual_pos_mask: jax.Array | None = None
+    deepstack_visual_embeds: jax.Array | None = None
+
     def tree_flatten(self):
         children = (
             self.input_ids,
@@ -201,6 +207,9 @@ class ForwardBatch:
             self.attention_mask,
             self.input_embedding,
             self.mrope_positions,
+            self.apply_for_deepstack,
+            self.deepstack_visual_pos_mask,
+            self.deepstack_visual_embeds,
         )
 
         aux_data = {
@@ -238,10 +247,14 @@ class ForwardBatch:
         obj.lora_token_indices = children[11]
         obj.lora_ranks = children[12]
         obj.spec_info = children[13]
+        # Handle optional children for backward compatibility
         obj.attention_mask = children[14] if len(children) > 14 else None
         obj.input_embedding = children[15] if len(children) > 15 else None
         obj.mrope_positions = children[16] if len(children) > 16 else None
 
+        obj.apply_for_deepstack = children[17]
+        obj.deepstack_visual_pos_mask = children[18]
+        obj.deepstack_visual_embeds = children[19]
         return obj
 
     def __repr__(self) -> str:
@@ -361,6 +374,26 @@ class ForwardBatch:
                 batch.lora_ranks,
             )
 
+        input_embeds = None
+        deepstack_visual_embeds = None
+        # deepstack_visual_pos_mask = None
+        if batch.apply_for_deepstack:
+            (
+                input_embeds,
+                deepstack_visual_embeds,
+                # deepstack_visual_pos_mask
+            ) = device_array(
+                (
+                    batch.input_embeds,
+                    batch.deepstack_visual_embeds,
+                    # batch.deepstack_visual_pos_mask
+                ),
+                sharding=(
+                    NamedSharding(model_runner.mesh, PartitionSpec())
+                    if jax.process_count() == 1
+                    else None
+                ),
+            )
         obj = cls(
             bid=batch.bid,
             forward_mode=batch.forward_mode,
@@ -384,6 +417,9 @@ class ForwardBatch:
             spec_algorithm=batch.spec_algorithm,
             capture_hidden_mode=batch.capture_hidden_mode,
             input_embedding=input_embedding,
+            apply_for_deepstack=batch.apply_for_deepstack,
+            deepstack_visual_embeds=deepstack_visual_embeds,
+            # deepstack_visual_pos_mask=deepstack_visual_pos_mask,
         )
 
         # Auto-generate attention mask for Encoder-only models (e.g. UMT5Encoder, BERT)
