@@ -27,22 +27,14 @@ logger = logging.getLogger(__name__)
 # DiffusionModelRunner is responsible for running denoising steps within diffusion model inference
 class DiffusionModelRunner(BaseModelRunner):
     def __init__(
-        self,
-        server_args: MultimodalServerArgs,
-        mesh: jax.sharding.Mesh = None,
-        model_class=None,
-        stage_sub_dir: str | None = None,
+        self, server_args: MultimodalServerArgs, mesh: jax.sharding.Mesh = None, model_class=None
     ):
         self.server_args = server_args
         self.mesh = mesh
-        load_sub_dir = "transformer" if stage_sub_dir is None else stage_sub_dir
-        if load_sub_dir == "":
-            load_sub_dir = None
-        self.load_sub_dir = load_sub_dir
         load_config = LoadConfig(
             load_format=server_args.load_format,
             download_dir=server_args.download_dir,
-            sub_dir=load_sub_dir,
+            sub_dir="transformer",
         )
         self.model_loader = JAXModelLoader(load_config, mesh)
 
@@ -63,9 +55,8 @@ class DiffusionModelRunner(BaseModelRunner):
 
     def initialize(self):
         # self.model = self.model_loader.load_model(model_config=self.model_config)
-        load_sub_dir = self.load_sub_dir
         self.model_loader = get_model_loader(
-            mesh=self.mesh, load_config=LoadConfig(sub_dir=load_sub_dir)
+            mesh=self.mesh, load_config=LoadConfig(sub_dir="transformer")
         )
         self.model = self.model_loader.load_model(model_config=self.model_config)
         self.solver: FlowUniPCMultistepScheduler = FlowUniPCMultistepScheduler(

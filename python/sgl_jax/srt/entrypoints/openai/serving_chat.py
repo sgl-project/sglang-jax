@@ -38,7 +38,6 @@ from sgl_jax.srt.jinja_template_utils import process_content_for_template_format
 from sgl_jax.srt.managers.io_struct import GenerateReqInput
 from sgl_jax.srt.managers.template_manager import TemplateManager
 from sgl_jax.srt.managers.tokenizer_manager import TokenizerManager
-from sgl_jax.srt.multimodal.manager.io_struct import GenerateVLMReqInput
 from sgl_jax.srt.reasoning_parser import ReasoningParser
 from sgl_jax.utils import convert_json_schema_to_str
 
@@ -58,14 +57,9 @@ class OpenAIServingChat(OpenAIServingBase):
     def _convert_to_internal_request(
         self,
         request: ChatCompletionRequest,
-    ) -> tuple[GenerateReqInput | GenerateVLMReqInput, ChatCompletionRequest]:
+    ) -> tuple[GenerateReqInput, ChatCompletionRequest]:
         """Convert OpenAI chat completion request to internal format"""
-        model_config = getattr(self.tokenizer_manager, "model_config", None)
-        is_multimodal = (
-            model_config.is_multimodal
-            if model_config is not None
-            else self.tokenizer_manager.server_args.multimodal
-        )
+        is_multimodal = self.tokenizer_manager.model_config.is_multimodal
 
         # Process messages and apply chat template
         processed_messages = self._process_messages(request, is_multimodal)
@@ -75,20 +69,14 @@ class OpenAIServingChat(OpenAIServingBase):
             request, processed_messages.stop, processed_messages.tool_call_constraint
         )
 
-        if is_multimodal:
-            prompt_kwargs = {"text": processed_messages.prompt}
+        # Handle single vs multiple requests
+        if isinstance(processed_messages.prompt_ids, str):
+            prompt_kwargs = {"text": processed_messages.prompt_ids}
         else:
-            # Handle single vs multiple requests
-            if isinstance(processed_messages.prompt_ids, str):
-                prompt_kwargs = {"text": processed_messages.prompt_ids}
-            else:
-                prompt_kwargs = {"input_ids": processed_messages.prompt_ids}
+            prompt_kwargs = {"input_ids": processed_messages.prompt_ids}
 
         adapted_request = GenerateReqInput(
             **prompt_kwargs,
-            image_data=processed_messages.image_data,
-            video_data=processed_messages.video_data,
-            audio_data=processed_messages.audio_data,
             sampling_params=sampling_params,
             return_logprob=request.logprobs,
             logprob_start_len=-1,

@@ -36,7 +36,6 @@ class VaeScheduler:
         communication_backend: CommunicationBackend,
         mesh: jax.sharding.Mesh,
         model_class,
-        stage_sub_dir: str | None = None,
         **kwargs,
     ):
         """Initialize the VaeScheduler.
@@ -52,10 +51,7 @@ class VaeScheduler:
         self._comm_backend = communication_backend
         self.mesh = mesh
         self.vae_worker = VaeModelWorker(
-            model_class=model_class,
-            mesh=self.mesh,
-            server_args=server_args,
-            stage_sub_dir=stage_sub_dir,
+            model_class=model_class, mesh=self.mesh, server_args=server_args
         )
         self.server_args = server_args
         self.model_config = model_class.get_config_class()()

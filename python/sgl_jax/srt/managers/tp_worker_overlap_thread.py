@@ -30,7 +30,6 @@ class ModelWorkerClient:
         self,
         server_args: ServerArgs,
         mesh: jax.sharding.Mesh,
-        model_class=None,
     ):
         # Load the model
         self.worker = ModelWorker(server_args, mesh=mesh)

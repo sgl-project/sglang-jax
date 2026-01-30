@@ -2,7 +2,6 @@ model_arch: Wan-AI/Wan2.2-T2V-A14B-Diffusers
 # Wan2.2 MoE model with dual transformers (high-noise + low-noise experts)
 stage_args:
  - stage_id: 0
-   stage_sub_dir: text_encoder
    runtime:
      num_tpus: 1
      device_kind: cpu
@@ -13,7 +12,6 @@ stage_args:
    model_class: UMT5EncoderModel
 
  - stage_id: 1
-   stage_sub_dir: transformer
    runtime:
      num_tpus: 2
      max_batch_size: 1
@@ -23,7 +21,6 @@ stage_args:
    final_output: false
 
  - stage_id: 2
-   stage_sub_dir: vae
    runtime:
      num_tpus: 1
      max_batch_size: 1
