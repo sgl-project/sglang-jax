@@ -3,11 +3,28 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 import numpy as np
 
 from sgl_jax.srt.managers.schedule_batch import BaseFinishReason
+from sgl_jax.srt.multimodal.common.modality_enum import flatten_nested_list
+from sgl_jax.srt.multimodal.common.multimodal_util import ImageData
+
+# Handle serialization of Image for pydantic
+if TYPE_CHECKING:
+    from PIL import Image
+else:
+    Image = Any
+
+
+def has_valid_data(data) -> bool:
+    """Check if data contains any valid content."""
+    if data is None:
+        return False
+    if isinstance(data, list):
+        return any(has_valid_data(item) for item in flatten_nested_list(data))
+    return True
 
 
 @dataclass
@@ -197,6 +214,19 @@ class FlushCacheReqOutput(BaseReq):
     error_msg: str = ""
 
 
+# Type definitions for multimodal input data
+# Individual data item types for each modality
+ImageDataInputItem = Image | str | ImageData | dict
+AudioDataInputItem = str | dict
+VideoDataInputItem = str | dict
+# Union type for any multimodal data item
+MultimodalDataInputItem = ImageDataInputItem | VideoDataInputItem | AudioDataInputItem
+# Format types supporting single items, lists, or nested lists for batch processing
+MultimodalDataInputFormat = (
+    list[list[MultimodalDataInputItem]] | list[MultimodalDataInputItem] | MultimodalDataInputItem
+)
+
+
 # Additional classes needed for engine.py imports
 @dataclass
 class EmbeddingReqInput:
@@ -204,6 +234,18 @@ class EmbeddingReqInput:
 
     rid: str = None
     text: str = ""
+    # The image input. It can be an image instance, file name, URL, or base64 encoded string.
+    # Can be formatted as:
+    # - Single image for a single request
+    # - List of images (one per request in a batch)
+    # - List of lists of images (multiple images per request)
+    # See also python/sglang/srt/utils.py:load_image for more details.
+    image_data: MultimodalDataInputFormat | None = None
+    # The video input. Like image data, it can be a file name, a url, or base64 encoded string.
+    video_data: MultimodalDataInputFormat | None = None
+    # The audio input. Like image data, it can be a file name, a url, or base64 encoded string.
+    audio_data: MultimodalDataInputFormat | None = None
+    # The token ids for text; one can either specify text or input_ids.
     input_ids: list[int] = None
     normalize: bool = True
     # Extra key for cache namespace isolation
@@ -220,6 +262,17 @@ class GenerateReqInput:
     input_ids: list[list[int]] | list[int] | None = None
     # The embeddings for input_ids; one can specify either text or input_ids or input_embeds.
     input_embeds: list[list[list[float]]] | list[list[float]] | None = None
+    # The image input. It can be an image instance, file name, URL, or base64 encoded string.
+    # Can be formatted as:
+    # - Single image for a single request
+    # - List of images (one per request in a batch)
+    # - List of lists of images (multiple images per request)
+    # See also python/sglang/srt/utils.py:load_image for more details.
+    image_data: MultimodalDataInputFormat | None = None
+    # The video input. Like image data, it can be a file name, a url, or base64 encoded string.
+    video_data: MultimodalDataInputFormat | None = None
+    # The audio input. Like image data, it can be a file name, a url, or base64 encoded string.
+    audio_data: MultimodalDataInputFormat | None = None
     sampling_params: Any | None = (
         None  # Using Any for now to avoid SamplingParams serialization issues
     )
@@ -245,6 +298,13 @@ class GenerateReqInput:
 
     return_routed_experts: list[bool] | bool | None = None
 
+    def contains_mm_input(self) -> bool:
+        return (
+            has_valid_data(self.image_data)
+            or has_valid_data(self.video_data)
+            or has_valid_data(self.audio_data)
+        )
+
     def _normalize_rid(self, num):
         """Normalize request IDs for batch processing."""
         if self.rid is None:
@@ -263,6 +323,14 @@ class GenerateReqInput:
             raise ValueError("The rid should be a string or a list of strings.")
 
     def normalize_batch_and_arguments(self):
+        # at least one of text, input_ids, or image should be provided
+        if self.text is None and self.input_ids is None and self.image_data is None:
+            raise ValueError("At least one of text, input_ids, or image should be provided")
+
+        # text and input_ids cannot be provided at the same time
+        if self.text is not None and self.input_ids is not None:
+            raise ValueError("text and input_ids cannot be provided at the same time")
+
         self._validate_inputs()
         self._determine_batch_size()
         self._handle_parallel_sampling()
