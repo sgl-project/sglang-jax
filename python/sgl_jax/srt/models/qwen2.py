@@ -281,7 +281,6 @@ class Qwen2Model(nnx.Module):
         self,
         forward_batch: ForwardBatch,
         token_to_kv_pool: KVCache,
-        input_embeds: jax.Array | None = None,
     ):
         residual = None
         input_embeds = (
