@@ -297,9 +297,11 @@ def ref_moe(
     w1_shared: jax.Array | None = None,  # (hidden_size, se_intermediate_size) [Gate]
     w2_shared: jax.Array | None = None,  # (se_intermediate_size, hidden_size) [Down]
     w3_shared: jax.Array | None = None,  # (hidden_size, se_intermediate_size) [Up]
-    w1_shared_scale: jax.Array | None = None,  # (hidden_size // subc, 1, se_inter)
-    w2_shared_scale: jax.Array | None = None,  # (se_inter // subc, 1, hidden_size)
-    w3_shared_scale: jax.Array | None = None,  # (hidden_size // subc, 1, se_inter)
+    # NOTE: Shared-expert weights use per-column scaling (axis=0 quantization in
+    # `quantize_tensor`), so these scales are (1, 1, out_features).
+    w1_shared_scale: jax.Array | None = None,  # (1, 1, se_inter)
+    w2_shared_scale: jax.Array | None = None,  # (1, 1, hidden_size)
+    w3_shared_scale: jax.Array | None = None,  # (1, 1, se_inter)
 ):
     n_tokens = tokens.shape[0]  # num_tokens
     num_experts = gating_output.shape[-1]
@@ -414,12 +416,12 @@ def ref_moe(
         se_w1_up = w3_shared.astype(jnp.float32)
 
         if w1_shared_scale is not None:
-            s_gate = jnp.repeat(w1_shared_scale[:, 0, :], subc_quant_wsz, axis=0)[:hidden_size]
-            se_w1_gate *= s_gate
+            assert w1_shared_scale.shape == (1, 1, w1_shared.shape[1]), w1_shared_scale.shape
+            se_w1_gate *= w1_shared_scale[0, 0, :][None, :]
 
         if w3_shared_scale is not None:
-            s_up = jnp.repeat(w3_shared_scale[:, 0, :], subc_quant_wsz, axis=0)[:hidden_size]
-            se_w1_up *= s_up
+            assert w3_shared_scale.shape == (1, 1, w3_shared.shape[1]), w3_shared_scale.shape
+            se_w1_up *= w3_shared_scale[0, 0, :][None, :]
 
         gate_out = tokens.astype(jnp.float32) @ se_w1_gate
         up_out = tokens.astype(jnp.float32) @ se_w1_up
@@ -428,9 +430,8 @@ def ref_moe(
 
         se_w2 = w2_shared.astype(jnp.float32)
         if w2_shared_scale is not None:
-            se_inter_size = w2_shared.shape[0]
-            s_down = jnp.repeat(w2_shared_scale[:, 0, :], subc_quant_wsz, axis=0)[:se_inter_size]
-            se_w2 *= s_down
+            assert w2_shared_scale.shape == (1, 1, w2_shared.shape[1]), w2_shared_scale.shape
+            se_w2 *= w2_shared_scale[0, 0, :][None, :]
 
         se_output = act @ se_w2
 
@@ -469,9 +470,9 @@ def _fused_ep_moe_kernel(
     w1_shared_hbm,  # None | (hidden_size, se_intermediate_size)
     w3_shared_hbm,  # None | (hidden_size, se_intermediate_size)
     w2_shared_hbm,  # None | (se_intermediate_size, hidden_size)
-    w1_shared_scale_hbm,  # None | (hidden_size // subc, 1, se_inter)
-    w3_shared_scale_hbm,  # None | (hidden_size // subc, 1, se_inter)
-    w2_shared_scale_hbm,  # None | (se_inter // subc, 1, hidden_size)
+    w1_shared_scale_hbm,  # None | (1, 1, se_inter)
+    w3_shared_scale_hbm,  # None | (1, 1, se_inter)
+    w2_shared_scale_hbm,  # None | (1, 1, hidden_size)
     # Output
     output_hbm,  # (local_num_tokens, hidden_size)
     # Scratch
@@ -2048,10 +2049,12 @@ def _fused_ep_moe_kernel(
 
             if b_se_w1_scale_all is not None:
                 s_gate = b_se_w1_scale_all[0, 0, pl.ds(block_id * bse, bse)]
-                s_up = b_se_w3_scale_all[0, 0, pl.ds(block_id * bse, bse)]
                 s_gate = jnp.broadcast_to(s_gate, gate_res.shape)
-                s_up = jnp.broadcast_to(s_up, up_res.shape)
                 gate_res = gate_res * s_gate
+
+            if b_se_w3_scale_all is not None:
+                s_up = b_se_w3_scale_all[0, 0, pl.ds(block_id * bse, bse)]
+                s_up = jnp.broadcast_to(s_up, up_res.shape)
                 up_res = up_res * s_up
 
             act = activation_fn(gate_res, up_res, act_fn)
@@ -2431,11 +2434,6 @@ def _validate_fused_ep_moe_args(
                     )
                 if w1_shared_scale.dtype != jnp.float32:
                     raise ValueError("w1_shared_scale must be float32")
-
-                if block_config.bse % subc_quant_wsz != 0:
-                    raise ValueError(
-                        f"Expected block_config.bse ({block_config.bse}) to be divisible by subc_quant_wsz ({subc_quant_wsz})"
-                    )
 
             if w3_shared_scale is not None:
                 expected_w3_shared_scale = (

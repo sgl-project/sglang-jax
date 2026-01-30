@@ -1,5 +1,8 @@
 # Adapted from https://github.com/vllm-project/tpu-inference/blob/main/tests/kernels/fused_moe_v1_test.py
 # Copyright 2025 The tpu-inference Authors. All rights reserved.
+import glob
+import os
+import re
 from typing import cast
 
 import jax
@@ -15,6 +18,8 @@ from sgl_jax.srt.kernels.fused_moe.v1.kernel import (
     fused_ep_moe,
     ref_moe,
 )
+from sgl_jax.srt.layers.moe import create_moe_weights_mapping
+from sgl_jax.srt.utils.quantization.quantization_utils import quantize_tensor
 from sgl_jax.test.test_utils import create_device_mesh
 
 jax.config.parse_flags_with_absl()
@@ -184,20 +189,32 @@ class MoEKernelTest(jtu.JaxTestCase):
         if w_dtype is not None:
             if subc_quant_wsz is None:
                 subc_quant_wsz = 256
-            w1, w1_scale = sub_channel_quantize(w1, w_dtype, subc_quant_wsz)
-            w2, w2_scale = sub_channel_quantize(w2, w_dtype, subc_quant_wsz)
-            w3, w3_scale = sub_channel_quantize(w3, w_dtype, subc_quant_wsz)
+            # Match FusedEPMoE's quantization path: block-quantize along axis=1.
+            w1, w1_scale_3d = quantize_tensor(w_dtype, w1, axis=1, block_size=subc_quant_wsz)
+            w3, w3_scale_3d = quantize_tensor(w_dtype, w3, axis=1, block_size=subc_quant_wsz)
+            w2, w2_scale_3d = quantize_tensor(w_dtype, w2, axis=1, block_size=subc_quant_wsz)
+
+            # Reshape scales to the 4D layout expected by the kernel.
+            w1_scale = w1_scale_3d.reshape(
+                w1_scale_3d.shape[0], w1_scale_3d.shape[1], 1, w1_scale_3d.shape[2]
+            )
+            w3_scale = w3_scale_3d.reshape(
+                w3_scale_3d.shape[0], w3_scale_3d.shape[1], 1, w3_scale_3d.shape[2]
+            )
+            w2_scale = w2_scale_3d.reshape(
+                w2_scale_3d.shape[0], w2_scale_3d.shape[1], 1, w2_scale_3d.shape[2]
+            )
 
             if has_shared_expert:
-                w1_shared, w1_shared_scale = sub_channel_quantize(
-                    w1_shared, w_dtype, subc_quant_wsz
-                )
-                w2_shared, w2_shared_scale = sub_channel_quantize(
-                    w2_shared, w_dtype, subc_quant_wsz
-                )
-                w3_shared, w3_shared_scale = sub_channel_quantize(
-                    w3_shared, w_dtype, subc_quant_wsz
-                )
+                # Shared-expert weights use per-column scaling (axis=0) to keep
+                # scale tensors compact and avoid sub-channel tiling issues.
+                w1_shared, w1_se_scale_1d = quantize_tensor(w_dtype, w1_shared, axis=0)
+                w3_shared, w3_se_scale_1d = quantize_tensor(w_dtype, w3_shared, axis=0)
+                w2_shared, w2_se_scale_1d = quantize_tensor(w_dtype, w2_shared, axis=0)
+
+                w1_shared_scale = w1_se_scale_1d.reshape(1, 1, w1_se_scale_1d.shape[0])
+                w3_shared_scale = w3_se_scale_1d.reshape(1, 1, w3_se_scale_1d.shape[0])
+                w2_shared_scale = w2_se_scale_1d.reshape(1, 1, w2_se_scale_1d.shape[0])
 
         block_config = None
         block_params = (bt, bf, bd1, bd2, btc, bfc, bd1c, bd2c, bse)
@@ -471,10 +488,11 @@ class MoEKernelTest(jtu.JaxTestCase):
         )
 
     @parameterized.product(
-        w_dtype=[jnp.int8, jnp.float8_e5m2, jnp.float4_e2m1fn],
+        w_dtype=[jnp.int8, jnp.float8_e4m3fn, jnp.float8_e5m2, jnp.float4_e2m1fn],
     )
     def test_sub_channel_quantization(self, w_dtype):
         if w_dtype in (
+            jnp.float8_e4m3fn,
             jnp.float8_e5m2,
             jnp.float4_e2m1fn,
         ) and not jtu.is_device_tpu_at_least(version=7):
@@ -508,9 +526,15 @@ class MoEKernelTest(jtu.JaxTestCase):
         )
 
     @parameterized.product(
-        w_dtype=[jnp.int8],
+        w_dtype=[jnp.int8, jnp.float8_e4m3fn, jnp.float8_e5m2, jnp.float4_e2m1fn],
     )
     def test_shared_expert_quantized(self, w_dtype):
+        if w_dtype in (
+            jnp.float8_e4m3fn,
+            jnp.float8_e5m2,
+            jnp.float4_e2m1fn,
+        ) and not jtu.is_device_tpu_at_least(version=7):
+            self.skipTest("Expect TPUv7+")
         dtype = jnp.bfloat16
         top_k = 8
         num_experts = 128
@@ -538,6 +562,185 @@ class MoEKernelTest(jtu.JaxTestCase):
             bd1c=256,
             bd2c=256,
             bse=512,
+        )
+
+    def test_fused_moe_weight_mapping_shards_experts_across_ep_mesh(self):
+        # This guards an easy-to-miss end-to-end correctness issue: the fused
+        # kernel shards experts across EP=(data*tensor), so weight loading must
+        # shard expert dim (axis=0) across ("data","tensor"), not just "tensor".
+        mappings = create_moe_weights_mapping(
+            prefix="model.layers.0",
+            target_prefix="model.layers.0",
+            num_experts=8,
+            moe_backend="fused",
+            moe_path="mlp",
+            source_expert_pattern="experts.{i}",
+        )
+        for m in mappings.values():
+            # All fused expert weights are 3D and should shard axis0 across EP mesh.
+            self.assertEqual(m.sharding, (("data", "tensor"), None, None))
+
+    def test_real_model_ling_mini_fused_moe_smoke(self):
+        # Optional slow integration test: load a small subset of real MoE weights
+        # from a local HF-style safetensors directory and compare fused_ep_moe vs
+        # ref_moe on a tiny problem.
+        #
+        # Usage (example):
+        #   SGLANG_RUN_SLOW_TESTS=1 \
+        #   SGLANG_TEST_MODEL_DIR=/path/to/inclusionAI/Ling-mini-2.0 \
+        #   python3 -m unittest fused_moe_v1_test.MoEKernelTest.test_real_model_ling_mini_fused_moe_smoke
+        if os.getenv("SGLANG_RUN_SLOW_TESTS", "0") != "1":
+            self.skipTest("Set SGLANG_RUN_SLOW_TESTS=1 to enable.")
+
+        model_dir = os.getenv("SGLANG_TEST_MODEL_DIR")
+        if not model_dir:
+            self.skipTest("Set SGLANG_TEST_MODEL_DIR to a local model directory.")
+
+        try:
+            from safetensors import safe_open  # type: ignore[import-not-found]
+        except Exception as e:
+            self.skipTest(f"safetensors is required for this test: {e}")
+
+        if not jtu.is_device_tpu_at_least(version=7):
+            self.skipTest("Expect TPUv7+ for fused MoE kernel.")
+
+        layer_idx = int(os.getenv("SGLANG_TEST_LAYER_IDX", "0"))
+        num_experts = int(os.getenv("SGLANG_TEST_NUM_EXPERTS", "8"))
+        top_k = int(os.getenv("SGLANG_TEST_TOPK", "2"))
+        num_tokens = int(os.getenv("SGLANG_TEST_NUM_TOKENS", "32"))
+
+        # Find expert weights in safetensors.
+        st_files = sorted(glob.glob(os.path.join(model_dir, "*.safetensors")))
+        if not st_files:
+            raise RuntimeError(f"No *.safetensors files found under {model_dir}")
+
+        # Patterns for HF checkpoints.
+        # gate/up: (intermediate, hidden) in PT -> transpose to (hidden, intermediate)
+        # down:    (hidden, intermediate) in PT -> transpose to (intermediate, hidden)
+        base = rf"model\\.layers\\.{layer_idx}\\.mlp\\.experts\\.(\\d+)\\."
+        gate_re = re.compile(base + r"gate_proj\\.weight$")
+        up_re = re.compile(base + r"up_proj\\.weight$")
+        down_re = re.compile(base + r"down_proj\\.weight$")
+
+        se_gate_key = f"model.layers.{layer_idx}.mlp.shared_experts.gate_proj.weight"
+        se_up_key = f"model.layers.{layer_idx}.mlp.shared_experts.up_proj.weight"
+        se_down_key = f"model.layers.{layer_idx}.mlp.shared_experts.down_proj.weight"
+
+        key_to_file: dict[str, str] = {}
+        available_experts: set[int] = set()
+        has_shared = False
+
+        for st in st_files:
+            with safe_open(st, framework="np", device="cpu") as f:
+                for k in f.keys():  # noqa: SIM118
+                    if k in (se_gate_key, se_up_key, se_down_key):
+                        key_to_file[k] = st
+                        has_shared = True
+                        continue
+
+                    m = gate_re.match(k) or up_re.match(k) or down_re.match(k)
+                    if m:
+                        e = int(m.group(1))
+                        if e < num_experts:
+                            key_to_file[k] = st
+                            available_experts.add(e)
+
+        if len(available_experts) < num_experts:
+            raise RuntimeError(
+                f"Found only {len(available_experts)} experts (<{num_experts}) for layer {layer_idx} under {model_dir}"
+            )
+
+        def _load(k: str) -> np.ndarray:
+            st = key_to_file[k]
+            with safe_open(st, framework="np", device="cpu") as f:
+                return f.get_tensor(k)
+
+        # Load and stack expert weights.
+        w1_list, w2_list, w3_list = [], [], []
+        for e in range(num_experts):
+            gate_k = f"model.layers.{layer_idx}.mlp.experts.{e}.gate_proj.weight"
+            up_k = f"model.layers.{layer_idx}.mlp.experts.{e}.up_proj.weight"
+            down_k = f"model.layers.{layer_idx}.mlp.experts.{e}.down_proj.weight"
+
+            w_gate = _load(gate_k).astype(np.float32).T  # (hidden, inter)
+            w_up = _load(up_k).astype(np.float32).T  # (hidden, inter)
+            w_down = _load(down_k).astype(np.float32).T  # (inter, hidden)
+
+            w1_list.append(w_gate)
+            w3_list.append(w_up)
+            w2_list.append(w_down)
+
+        w1 = jnp.asarray(np.stack(w1_list, axis=0), dtype=jnp.bfloat16)
+        w3 = jnp.asarray(np.stack(w3_list, axis=0), dtype=jnp.bfloat16)
+        w2 = jnp.asarray(np.stack(w2_list, axis=0), dtype=jnp.bfloat16)
+
+        hidden_size = int(w1.shape[1])
+        _ = int(w2.shape[1])
+
+        # Optional shared expert.
+        w1_shared = w2_shared = w3_shared = None
+        if has_shared:
+            w1_shared = jnp.asarray(_load(se_gate_key).astype(np.float32).T, dtype=jnp.bfloat16)
+            w3_shared = jnp.asarray(_load(se_up_key).astype(np.float32).T, dtype=jnp.bfloat16)
+            w2_shared = jnp.asarray(_load(se_down_key).astype(np.float32).T, dtype=jnp.bfloat16)
+
+        # Random inputs + deterministic top-k.
+        key = jax.random.key(0)
+        tokens = (jax.random.normal(key, (num_tokens, hidden_size), dtype=jnp.float32) / 10).astype(
+            jnp.bfloat16
+        )
+        router_logits = jax.random.normal(key, (num_tokens, num_experts), dtype=jnp.float32)
+        topk_ids = jax.vmap(lambda kk: jax.random.permutation(kk, num_experts)[:top_k])(
+            jax.random.split(jax.random.key(1), num_tokens)
+        ).astype(jnp.int32)
+        boosts = (30.0 - jnp.arange(top_k, dtype=jnp.float32)).reshape(1, top_k)
+        one_hot = jnp.sum(
+            jax.nn.one_hot(topk_ids, num_experts, dtype=jnp.float32) * boosts[..., None],
+            axis=1,
+        )
+        router_logits = (router_logits + one_hot).astype(jnp.bfloat16)
+
+        # Use a 1D EP mesh for this smoke test (data = all devices, tensor = 1)
+        mesh = create_device_mesh(ici_parallelism=[-1, 1], dcn_parallelism=[1, 1])
+        ep_size = mesh.shape["data"] * mesh.shape["tensor"]
+        if num_tokens % ep_size != 0:
+            self.skipTest(f"num_tokens ({num_tokens}) must be divisible by ep_size ({ep_size}).")
+
+        actual = fused_ep_moe(
+            mesh=mesh,
+            tokens=tokens,
+            w1=w1,
+            w2=w2,
+            w3=w3,
+            gating_output=router_logits,
+            top_k=top_k,
+            renormalize_topk_logits=False,
+            act_fn="silu",
+            w1_shared=w1_shared,
+            w2_shared=w2_shared,
+            w3_shared=w3_shared,
+            tp_axis_name="tensor",
+        )
+        expected = ref_moe(
+            tokens,
+            w1,
+            w2,
+            w3,
+            router_logits,
+            top_k,
+            renormalize_topk_logits=False,
+            act_fn="silu",
+            w1_shared=w1_shared,
+            w2_shared=w2_shared,
+            w3_shared=w3_shared,
+        )
+
+        # Bring both to host for comparison (single-host smoke).
+        self.assertAllClose(
+            np.asarray(jax.device_get(actual)),
+            np.asarray(jax.device_get(expected)),
+            atol=3e-1,
+            rtol=3e-1,
         )
 
     def test_bias(self):

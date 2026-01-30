@@ -226,7 +226,7 @@ def quantize_tensor(
         axis = [axis]
 
     orig_shape = tensor.shape
-    mask = jnp.ones_like(tensor, jnp.int32)
+    mask = None
 
     if block_size is not None:
         if isinstance(block_size, int):
@@ -234,6 +234,7 @@ def quantize_tensor(
 
         blocked_shape = [[i] for i in orig_shape]
         pad_width = [[0, 0] for _ in range(tensor.ndim)]
+        has_padding = False
         for i, block in zip(axis, block_size):
             num_blocks = (tensor.shape[i] + block - 1) // block
             padding_size = num_blocks * block - tensor.shape[i]
@@ -245,12 +246,14 @@ def quantize_tensor(
 
             # Pad the tensor to align with block size.
             pad_width[i][1] = padding_size
+            has_padding = has_padding or padding_size != 0
 
             blocked_shape[i] = (num_blocks, block)
 
         # In order to avoid padded values affecting scale value, we pad it
         # using edge value of the tensor.
-        if pad_tensor:
+        if pad_tensor and has_padding:
+            mask = jnp.ones_like(tensor, jnp.int32)
             tensor = jnp.pad(tensor, pad_width, "edge")
             mask = jnp.pad(mask, pad_width)
 
@@ -271,16 +274,19 @@ def quantize_tensor(
     dtype_max = float(dtype_info.max)
     dtype_min = float(dtype_info.min)
 
-    abs_max = jnp.max(jnp.abs(tensor), axis=axis, keepdims=True)
+    abs_max = jnp.max(jnp.abs(tensor.astype(jnp.float32)), axis=axis, keepdims=True)
     scale = abs_max / dtype_max
 
-    tensor_q = jnp.clip(tensor / scale, dtype_min, dtype_max)
+    # Guard all-zero blocks/tensors: scale==0 would produce 0/0 -> NaN.
+    scale_safe = scale + (scale == 0).astype(scale.dtype)
+    tensor_q = jnp.clip(tensor / scale_safe, dtype_min, dtype_max)
     tensor_q = tensor_q.reshape(orig_shape)
     tensor_q = tensor_q.astype(dtype)
 
     # To avoid padded values affecting output of quantized matmul, we mask them
     # out with 0s.
-    tensor_q = jnp.where(mask, tensor_q, 0)
+    if mask is not None:
+        tensor_q = jnp.where(mask.astype(jnp.bool_), tensor_q, 0)
 
     scale = jnp.squeeze(scale, axis).astype(jnp.float32)
 
