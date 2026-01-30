@@ -57,11 +57,9 @@ class ModelConfig:
         model_layer_nums: int | None = None,
         multimodal: bool = False,
         moe_backend: str | MoEBackend = MoEBackend.AUTO,
-        model_sub_dir: str | None = None,
     ) -> None:
 
         self.model_path = model_path
-        self.model_sub_dir = model_sub_dir
         self.revision = revision
         self.model_impl = model_impl
         self.quantization = quantization
@@ -88,13 +86,7 @@ class ModelConfig:
             kwargs["_configuration_file"] = override_config_file.strip()
         if multimodal:
             self.model_path = download_from_hf(self.model_path, allow_patterns=None)
-        if multimodal and self.model_sub_dir is not None:
-            if self.model_sub_dir:
-                self.model_path = os.path.join(self.model_path, self.model_sub_dir)
-            config_path = self.model_path
-
-        config_path = self.model_path
-
+        config_path = self.model_path + "/text_encoder" if multimodal else self.model_path
         self.hf_config = get_config(
             config_path,
             trust_remote_code=trust_remote_code,
@@ -104,8 +96,7 @@ class ModelConfig:
         )
 
         # Attach quantization config to hf_config so models can access it
-        if self.quantization_config is not None:
-            self.hf_config.quantization_config = self.quantization_config
+        self.hf_config.quantization_config = self.quantization_config
 
         self.hf_generation_config = get_generation_config(
             config_path,
@@ -204,7 +195,6 @@ class ModelConfig:
         model_revision: str = None,
         **kwargs,
     ):
-        model_sub_dir = getattr(server_args, "model_sub_dir", None)
         return ModelConfig(
             model_path=model_path or server_args.model_path,
             trust_remote_code=server_args.trust_remote_code,
@@ -219,7 +209,6 @@ class ModelConfig:
             model_layer_nums=server_args.model_layer_nums,
             multimodal=server_args.multimodal,
             moe_backend=server_args.moe_backend,
-            model_sub_dir=model_sub_dir,
             **kwargs,
         )
 

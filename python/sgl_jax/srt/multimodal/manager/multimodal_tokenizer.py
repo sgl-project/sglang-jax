@@ -1,42 +1,23 @@
 import asyncio
-import base64
 import dataclasses
-import hashlib
-import io
 import logging
-import os
 import signal
-import tempfile
 import time
 import uuid
 from http import HTTPStatus
 from typing import Any
 
 import fastapi
-import imageio.v3 as iio
-import numpy as np
 import psutil
-import requests
 import setproctitle
-from PIL import Image
-from transformers import AutoConfig, AutoProcessor
+from transformers import AutoImageProcessor
 
-from sgl_jax.srt.managers.io_struct import (
-    AbortReq,
-    BatchEmbeddingOut,
-    BatchStrOut,
-    BatchTokenIDOut,
-)
-from sgl_jax.srt.managers.tokenizer_manager import ReqState, TokenizerManager
-from sgl_jax.srt.multimodal.common.modality_enum import Modality, MultimodalDataItem
+from sgl_jax.srt.managers.io_struct import AbortReq
+from sgl_jax.srt.managers.tokenizer_manager import TokenizerManager
 from sgl_jax.srt.multimodal.manager.io_struct import (
-    DataType,
     GenerateMMReqInput,
-    GenerateVLMReqInput,
     TokenizedGenerateMMReqInput,
-    TokenizedGenerateVLMReqInput,
 )
-from sgl_jax.srt.multimodal.manager.mrope_utils import compute_mrope_positions
 from sgl_jax.srt.server_args import PortArgs, ServerArgs
 from sgl_jax.srt.utils import (
     configure_logger,
@@ -49,10 +30,15 @@ logger = logging.getLogger(__name__)
 
 
 @dataclasses.dataclass
-class MMReqState(ReqState):
-    """Store the state of a multimodal request."""
+class MMReqState:
+    """Store the state of a request."""
 
-    rid: str = ""
+    rid: str
+    out_list: list[dict[Any, Any]]
+    finished: bool
+    event: asyncio.Event
+    obj: GenerateMMReqInput
+    created_time: float
 
 
 class MultimodalTokenizer(TokenizerManager):
@@ -75,38 +61,18 @@ class MultimodalTokenizer(TokenizerManager):
         `_handle_batch_output`.
         """
         super().__init__(server_args, port_args)
-        self.mm_processor = None
-        self.mm_config = None
-        processor_candidates = [server_args.model_path]
-        model_basename = os.path.basename(server_args.model_path.rstrip("/"))
-        if model_basename in {
-            "text_encoder",
-            "vision_encoder",
-            "language_model",
-            "transformer",
-            "vae",
-            "tokenizer",
-        }:
-            processor_candidates.append(os.path.dirname(server_args.model_path.rstrip("/")))
-        trust_remote_code = server_args.trust_remote_code or server_args.multimodal
-        for candidate in processor_candidates:
-            try:
-                self.mm_processor = AutoProcessor.from_pretrained(
-                    candidate,
-                    trust_remote_code=trust_remote_code,
-                )
-                self.mm_config = AutoConfig.from_pretrained(
-                    candidate,
-                    trust_remote_code=trust_remote_code,
-                )
-                break
-            except Exception as exc:
-                logger.warning("Failed to load processor/config from %s: %s", candidate, exc)
+        # Use slow image processor to avoid torchvision dependency warning
+        try:
+            self.mm_processor = AutoImageProcessor.from_pretrained(
+                server_args.model_path, use_fast=False
+            )
+        except Exception:
+            logger.warning("Failed to load processor from %s", server_args.model_path)
         self.rid_to_state: dict[str, MMReqState] = {}
         self._result_dispatcher = TypeBasedDispatcher(
             [
                 (
-                    (BatchStrOut, BatchEmbeddingOut, BatchTokenIDOut, list),
+                    (list),
                     self._handle_batch_output,
                 ),
                 (
@@ -116,18 +82,15 @@ class MultimodalTokenizer(TokenizerManager):
             ]
         )
 
-    def _handle_batch_output(self, reqs: list | BatchStrOut | BatchEmbeddingOut | BatchTokenIDOut):
+    def _handle_batch_output(self, reqs: list):
         """Handle a batch of outputs returned from the pipeline.
 
         Marks the corresponding `MMReqState` as finished, sets its event to
         wake any waiters, and stores a simple success meta record. If a
         result arrives for an unknown `rid` it logs a warning.
         """
-        if hasattr(reqs, "__len__") and len(reqs) > 0 and self.server_args.log_requests:
+        if len(reqs) > 0 and self.server_args.log_requests:
             logger.info("handle_batch_output %s, self.rid_to_state %s", reqs, self.rid_to_state)
-        if isinstance(reqs, (BatchStrOut, BatchEmbeddingOut, BatchTokenIDOut)):
-            return super()._handle_batch_output(reqs)
-
         for req in reqs:
             if req.rid in self.rid_to_state:
                 self.rid_to_state[req.rid].finished = True
@@ -176,7 +139,7 @@ class MultimodalTokenizer(TokenizerManager):
 
     async def generate_request(
         self,
-        obj: GenerateMMReqInput | GenerateVLMReqInput,
+        obj: GenerateMMReqInput,
         request: fastapi.Request | None = None,
     ):
         """High level API: accept a generation request and stream responses.
@@ -199,12 +162,13 @@ class MultimodalTokenizer(TokenizerManager):
                 "Receive: obj=%s",
                 dataclass_to_string_truncated(obj, max_length, skip_names=skip_names),
             )
+
         tokenized_obj = await self._tokenize_one_request(obj)
         state = self._send_one_request(obj, tokenized_obj, created_time)
         async for response in self._wait_one_response(obj, state, request):
             yield response
 
-    async def _tokenize_one_request(self, obj: GenerateMMReqInput | GenerateVLMReqInput):
+    async def _tokenize_one_request(self, obj: GenerateMMReqInput):
         """
         Converts text fields to token ids using the configured tokenizer.
         Image preprocessing / references are noted as TODO; when provided
@@ -215,107 +179,6 @@ class MultimodalTokenizer(TokenizerManager):
         neg_input_text = getattr(obj, "neg_prompt", None) or getattr(obj, "text", None)
         input_ids = getattr(obj, "input_ids", None)
         neg_input_ids = getattr(obj, "neg_input_ids", None)
-        mm_inputs = None
-        image_data = self._normalize_mm_list(getattr(obj, "image_data", None))
-        video_data = self._normalize_mm_list(getattr(obj, "video_data", None))
-        if not image_data and not video_data and getattr(obj, "input_reference", None) is not None:
-            if obj.data_type == DataType.IMAGE:
-                image_data = [obj.input_reference]
-            elif obj.data_type == DataType.VIDEO:
-                video_data = [obj.input_reference]
-        if (image_data or video_data) and self.mm_processor is None:
-            raise ValueError(
-                "Multimodal inputs provided but processor/config is not available. "
-                "Check model_path and trust_remote_code settings."
-            )
-        if image_data or video_data:
-            images = [self._load_image_from_source(item) for item in image_data]
-            videos = [self._load_video_from_source(item) for item in video_data]
-            processor_out = self.mm_processor(
-                images=images or None,
-                videos=videos or None,
-                text=input_text or "",
-                return_tensors="pt",
-            )
-            if "input_ids" in processor_out:
-                input_ids = processor_out["input_ids"][0].tolist()
-
-            image_grid_thw = self._to_grid_list(processor_out.get("image_grid_thw"))
-            video_grid_thw = self._to_grid_list(processor_out.get("video_grid_thw"))
-            second_per_grid_ts = processor_out.get("second_per_grid_ts")
-            pixel_values = self._strip_batch_dim(processor_out.get("pixel_values"))
-            pixel_values_videos = self._strip_batch_dim(processor_out.get("pixel_values_videos"))
-
-            mrope_positions = None
-            mrope_position_delta = None
-            if self.mm_config is not None and input_ids is not None:
-                vision_start_token_id = getattr(self.mm_config, "vision_start_token_id", None)
-                image_token_id = getattr(self.mm_config, "image_token_id", None)
-                video_token_id = getattr(self.mm_config, "video_token_id", None)
-                vision_config = getattr(self.mm_config, "vision_config", None)
-                spatial_merge_size = getattr(vision_config, "spatial_merge_size", None)
-                tokens_per_second = getattr(vision_config, "tokens_per_second", None)
-                if (
-                    vision_start_token_id is not None
-                    and image_token_id is not None
-                    and spatial_merge_size is not None
-                ):
-                    mrope_positions, mrope_position_delta = compute_mrope_positions(
-                        input_ids=input_ids,
-                        image_grid_thw=image_grid_thw,
-                        video_grid_thw=video_grid_thw,
-                        second_per_grid_ts=second_per_grid_ts,
-                        vision_start_token_id=vision_start_token_id,
-                        image_token_id=image_token_id,
-                        video_token_id=video_token_id,
-                        spatial_merge_size=spatial_merge_size,
-                        tokens_per_second=tokens_per_second,
-                    )
-
-            mm_items = []
-            if pixel_values is not None:
-                mm_items.append(
-                    MultimodalDataItem(
-                        modality=Modality.IMAGE,
-                        feature=np.asarray(pixel_values),
-                    )
-                )
-            if pixel_values_videos is not None:
-                mm_items.append(
-                    MultimodalDataItem(
-                        modality=Modality.VIDEO,
-                        feature=np.asarray(pixel_values_videos),
-                    )
-                )
-            audio_features = processor_out.get("audio_features") or processor_out.get(
-                "input_features"
-            )
-            if audio_features is not None:
-                mm_items.append(
-                    MultimodalDataItem(
-                        modality=Modality.AUDIO,
-                        feature=np.asarray(audio_features),
-                    )
-                )
-            for item in mm_items:
-                item.set_pad_value()
-
-            if isinstance(second_per_grid_ts, np.ndarray):
-                second_per_grid_ts = second_per_grid_ts.tolist()
-
-            mm_inputs = {
-                "mm_items": mm_items,
-                "im_start_id": getattr(self.mm_config, "vision_start_token_id", None),
-                "im_end_id": getattr(self.mm_config, "vision_end_token_id", None),
-                "im_token_id": getattr(self.mm_config, "image_token_id", None),
-                "video_token_id": getattr(self.mm_config, "video_token_id", None),
-                "audio_token_id": getattr(self.mm_config, "audio_token_id", None),
-                "mrope_positions": mrope_positions,
-                "mrope_position_delta": mrope_position_delta,
-                "image_grid_thw": image_grid_thw,
-                "video_grid_thw": video_grid_thw,
-                "second_per_grid_ts": second_per_grid_ts,
-            }
         if input_ids is None and input_text is not None:
             if self.tokenizer is None:
                 raise ValueError(
@@ -330,97 +193,13 @@ class MultimodalTokenizer(TokenizerManager):
                 )
             encoded = self.tokenizer(neg_input_text)
             neg_input_ids = encoded["input_ids"]
+        if getattr(obj, "input_reference", None) is not None:
+            # TODO: Handle image preprocessing for multimodal inputs
+            pass
 
-        is_vlm_req = isinstance(obj, GenerateVLMReqInput) or hasattr(obj, "sampling_params")
-        if is_vlm_req:
-            tokenized_obj = self._create_tokenized_vlm_object(obj, input_text, input_ids)
-        else:
-            tokenized_obj = self._create_tokenized_object(
-                obj, input_text, input_ids, neg_input_text, neg_input_ids
-            )
-        tokenized_obj.mm_inputs = mm_inputs
-        return tokenized_obj
-
-    def _normalize_mm_list(self, data: list[str] | str | None) -> list[str]:
-        if data is None:
-            return []
-        return data if isinstance(data, list) else [data]
-
-    def _load_image_from_source(self, source: str | bytes) -> Image.Image:
-        if isinstance(source, dict) and "url" in source:
-            source = source["url"]
-        if hasattr(source, "url"):
-            source = source.url
-        if isinstance(source, bytes):
-            return Image.open(io.BytesIO(source)).convert("RGB")
-        if os.path.exists(source):
-            return Image.open(source).convert("RGB")
-        if source.startswith(("http://", "https://")):
-            resp = requests.get(source, timeout=10)
-            resp.raise_for_status()
-            return Image.open(io.BytesIO(resp.content)).convert("RGB")
-        if source.startswith("data:") and "base64," in source:
-            payload = source.split("base64,", 1)[1]
-            return Image.open(io.BytesIO(base64.b64decode(payload))).convert("RGB")
-        try:
-            return Image.open(io.BytesIO(base64.b64decode(source, validate=True))).convert("RGB")
-        except Exception as exc:
-            raise ValueError("Unsupported image source format") from exc
-
-    def _load_video_from_source(self, source: str | bytes) -> np.ndarray:
-        if isinstance(source, dict) and "url" in source:
-            source = source["url"]
-        if hasattr(source, "url"):
-            source = source.url
-        if isinstance(source, bytes):
-            with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
-                tmp.write(source)
-                tmp_path = tmp.name
-            try:
-                return iio.imread(tmp_path, index=None)
-            finally:
-                os.unlink(tmp_path)
-        if os.path.exists(source):
-            return iio.imread(source, index=None)
-        if source.startswith(("http://", "https://")):
-            resp = requests.get(source, timeout=10)
-            resp.raise_for_status()
-            with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
-                tmp.write(resp.content)
-                tmp_path = tmp.name
-            try:
-                return iio.imread(tmp_path, index=None)
-            finally:
-                os.unlink(tmp_path)
-        raise ValueError("Unsupported video source format")
-
-    def _hash_payload(self, payload: bytes) -> int:
-        digest = hashlib.sha256(payload).digest()[:8]
-        return int.from_bytes(digest, byteorder="big", signed=False) % (1 << 31)
-
-    def _hash_mm_items(self, images: list[Image.Image], videos: list[np.ndarray]) -> list[int]:
-        pad_values = []
-        for image in images:
-            pad_values.append(self._hash_payload(image.tobytes()))
-        for video in videos:
-            pad_values.append(self._hash_payload(video.tobytes()))
-        return pad_values
-
-    def _to_grid_list(self, grid_thw: Any) -> list[tuple[int, int, int]] | None:
-        if grid_thw is None:
-            return None
-        grid = np.asarray(grid_thw)
-        if grid.size == 0:
-            return None
-        return [tuple(int(x) for x in row) for row in grid.tolist()]
-
-    def _strip_batch_dim(self, arr: Any) -> np.ndarray | None:
-        if arr is None:
-            return None
-        array = np.asarray(arr)
-        if array.ndim > 1 and array.shape[0] == 1:
-            return array[0]
-        return array
+        return self._create_tokenized_object(
+            obj, input_text, input_ids, neg_input_text, neg_input_ids
+        )
 
     def _create_tokenized_object(
         self, obj: GenerateMMReqInput, input_text, input_ids, neg_input_text, neg_input_ids
@@ -447,23 +226,6 @@ class MultimodalTokenizer(TokenizerManager):
             save_output=getattr(obj, "save_output", True),
         )
         return tokenized_obj
-
-    def _create_tokenized_vlm_object(
-        self, obj: GenerateVLMReqInput, input_text, input_ids
-    ) -> TokenizedGenerateVLMReqInput:
-        rid = getattr(obj, "rid", None)
-        if rid is None:
-            rid = uuid.uuid4().hex
-
-        return TokenizedGenerateVLMReqInput(
-            rid=rid,
-            prompt=input_text,
-            input_ids=input_ids,
-            stream=getattr(obj, "stream", False),
-            n=getattr(obj, "n", 1),
-            sampling_params=getattr(obj, "sampling_params", None),
-            stop=getattr(obj, "stop", None),
-        )
 
     def _send_one_request(
         self,

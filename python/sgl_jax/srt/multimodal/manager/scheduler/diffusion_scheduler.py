@@ -34,7 +34,6 @@ class DiffusionScheduler:
         mesh: jax.sharding.Mesh,
         communication_backend: CommunicationBackend,
         model_class,
-        stage_sub_dir: str | None = None,
     ):
         """Initialize the DiffusionScheduler.
 
@@ -49,7 +48,7 @@ class DiffusionScheduler:
         self.communication_backend = communication_backend
         self.mesh = mesh
         self.diffusion_worker = DiffusionModelWorker(
-            server_args, mesh=mesh, model_class=model_class, stage_sub_dir=stage_sub_dir
+            server_args, mesh=mesh, model_class=model_class
         )
         # Track aborted request IDs to skip processing
         self.aborted_rids: set[str] = set()
