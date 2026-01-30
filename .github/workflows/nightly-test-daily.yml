@@ -2,7 +2,7 @@ name: Nightly Test Daily
 
 on:
   schedule:
-    - cron: '0 16 * * *'
+    - cron: '0 0 * * *'
   push:
     branches:
       - main
@@ -19,6 +19,8 @@ jobs:
     if: github.repository == 'sgl-project/sglang-jax'
     runs-on: arc-runner-v6e-1
     continue-on-error: true
+    env:
+      TZ: Asia/Shanghai
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -55,6 +57,8 @@ jobs:
     if: github.repository == 'sgl-project/sglang-jax'
     runs-on: arc-runner-v6e-1
     continue-on-error: true
+    env:
+      TZ: Asia/Shanghai
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -97,6 +101,8 @@ jobs:
     if: github.repository == 'sgl-project/sglang-jax'
     runs-on: arc-runner-v6e-1
     continue-on-error: true
+    env:
+      TZ: Asia/Shanghai
     steps:
       - name: Checkout code
         uses: actions/checkout@v4

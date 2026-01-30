@@ -29,7 +29,7 @@ def get_args():
     parser.add_argument(
         "--file",
         type=str,
-        default="bailing_moe_benchmark_tp_2_ep_2_results.csv",
+        default="daily_qwen_7b_benchmark_results.csv",
         help="Target CSV filename",
     )
     parser.add_argument(

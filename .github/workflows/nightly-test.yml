@@ -2,7 +2,7 @@ name: Nightly Test
 
 on:
   schedule:
-    - cron: '0 16 * * 1'
+    - cron: '0 0 * * 1'
   push:
     branches:
       - main
@@ -23,6 +23,8 @@ jobs:
       matrix:
         part: [0, 1 , 2, 3]
     continue-on-error: true
+    env:
+      TZ: Asia/Shanghai
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -76,6 +78,7 @@ jobs:
           echo "CSV line added: $SHA, $AUTHOR, $MSG"
           python3 scripts/ci/publish_bench_and_perf.py --source-dir ./meta
 
+
   nightly-test-accuracy-text-models-4-tpu:
     if: github.repository == 'sgl-project/sglang-jax'
     runs-on: arc-runner-v6e-4
@@ -84,6 +87,8 @@ jobs:
       matrix:
         part: [0, 1 , 2, 3 , 4, 5]
     continue-on-error: true
+    env:
+      TZ: Asia/Shanghai
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -125,6 +130,8 @@ jobs:
       matrix:
         part: [0, 1 , 2, 3, 4, 5, 6, 7]
     continue-on-error: true
+    env:
+      TZ: Asia/Shanghai
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -167,6 +174,8 @@ jobs:
     if: github.repository == 'sgl-project/sglang-jax'
     runs-on: arc-runner-v6e-4
     continue-on-error: true
+    env:
+      TZ: Asia/Shanghai
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -231,6 +240,8 @@ jobs:
       if: github.repository == 'sgl-project/sglang-jax'
       runs-on: arc-runner-v6e-4
       continue-on-error: true
+      env:
+        TZ: Asia/Shanghai
       steps:
         - name: Checkout code
           uses: actions/checkout@v4
@@ -273,6 +284,8 @@ jobs:
         if: github.repository == 'sgl-project/sglang-jax'
         runs-on: arc-runner-v6e-4
         continue-on-error: true
+        env:
+          TZ: Asia/Shanghai
         steps:
           - name: Checkout code
             uses: actions/checkout@v4
@@ -319,6 +332,8 @@ jobs:
       matrix:
         part: [0, 1 , 2, 3, 4, 5, 6, 7]
     continue-on-error: true
+    env:
+      TZ: Asia/Shanghai
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -360,6 +375,8 @@ jobs:
     if: github.repository == 'sgl-project/sglang-jax'
     runs-on: arc-runner-v6e-4
     continue-on-error: true
+    env:
+      TZ: Asia/Shanghai
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -402,6 +419,8 @@ jobs:
       if: github.repository == 'sgl-project/sglang-jax'
       runs-on: arc-runner-v6e-4
       continue-on-error: true
+      env:
+        TZ: Asia/Shanghai
       steps:
         - name: Checkout code
           uses: actions/checkout@v4
