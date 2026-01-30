@@ -515,7 +515,10 @@ def _set_envs_and_config(server_args):
     set_ulimit()
 
     def sigchld_handler(signum, frame):
-        pid, exitcode = os.waitpid(0, os.WNOHANG)
+        try:
+            pid, exitcode = os.waitpid(0, os.WNOHANG)
+        except ChildProcessError:
+            return  # child process could already be reaped, ignore if no child process exists
         if exitcode != 0:
             logger.warning(
                 "Child process unexpectedly failed with exitcode=%s. pid=%s",
