@@ -7,7 +7,7 @@ import psutil
 import setproctitle
 
 from sgl_jax.srt.managers.detokenizer_manager import DetokenizerManager
-from sgl_jax.srt.managers.io_struct import AbortReq
+from sgl_jax.srt.managers.io_struct import AbortReq, BatchTokenIDOut
 from sgl_jax.srt.multimodal.manager.io_struct import DataType
 from sgl_jax.srt.multimodal.manager.schedule_batch import Req
 from sgl_jax.srt.server_args import PortArgs, ServerArgs
@@ -43,6 +43,7 @@ class MultimodalDetokenizer(DetokenizerManager):
         super().__init__(server_args, port_args)
         self._request_dispatcher = TypeBasedDispatcher(
             [
+                (BatchTokenIDOut, self.handle_batch_token_id_out),
                 (Req, self.save_result),
                 (AbortReq, self._handle_abort_req),
             ]
@@ -73,7 +74,6 @@ class MultimodalDetokenizer(DetokenizerManager):
         expectations.
         """
 
-        logger.info("save_result...")
         if req.output is None or len(req.output) == 0:
             logger.warning("No output to save for request id: %s", req.rid)
             return [req]

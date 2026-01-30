@@ -44,6 +44,9 @@ dependencies = [
     "pybase64",
     "omegaconf",
     "imageio[ffmpeg]",
+    # add torch and torchvision CPU version for multimodal's IMAGE/VIDEO/AUDIO processor within multimodal_tokenizer
+    "torch",
+    "torchvision",
 ]
 
 [project.optional-dependencies]
@@ -153,3 +156,12 @@ disable_error_code = [
     "name-defined",
     "annotation-unchecked"
 ]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cpu" }
+torchvision = { index = "pytorch-cpu" }
