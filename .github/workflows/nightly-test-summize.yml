@@ -2,7 +2,7 @@ name: CI Trend Summary
 
 on:
   schedule:
-    - cron: '30 6 * * *'
+    - cron: '30 22 * * *'
   push:
     branches:
       - main
