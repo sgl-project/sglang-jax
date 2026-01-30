@@ -15,15 +15,15 @@ import jax.numpy as jnp
 import numpy as np
 import torch
 from flax import nnx
+from transformers import Qwen3OmniMoeThinkerConfig
+from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import Qwen3OmniMoeVisionEncoderConfig
+
+from sgl_jax.srt.configs.model_config import _get_and_verify_dtype
+from sgl_jax.srt.multimodal.models.qwen3_omni_moe.qwen3_omni_moe_encoder import Qwen3OmniMoeThinkerEmbedding
 
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../python"))
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
-
-from sgl_jax.srt.multimodal.models.qwen3_omni_moe import (  # noqa: E402
-    Qwen3OmniMoeVisionConfig,
-    Qwen3OmniMoeVisionEncoder,
-)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
@@ -199,34 +199,6 @@ def set_param(model, path, val):
     param[...] = jnp.array(val, dtype=param[...].dtype)
 
 
-def manual_load_weights(jax_model, hf_model):
-    """Fallback manual weight loading from HF model."""
-    from sgl_jax.srt.multimodal.models.qwen3_omni_moe.vision_weights_mapping import (
-        create_vision_encoder_weight_mappings,
-    )
-
-    mappings = create_vision_encoder_weight_mappings(jax_model.config)
-    pt_state = hf_model.state_dict()
-
-    loaded = 0
-    for hf_key, mapping in mappings.items():
-        if hf_key in pt_state:
-            try:
-                w = to_numpy(pt_state[hf_key])
-                if mapping.transpose:
-                    w = w.T
-                elif mapping.transpose_axes:
-                    w = np.transpose(w, mapping.transpose_axes)
-                set_param(jax_model, mapping.target_path, w)
-                loaded += 1
-            except Exception as e:
-                logger.warning("Failed to load %s: %s", hf_key, e)
-
-    logger.info("Loaded %d/%d weights", loaded, len(mappings))
-    if loaded < len(mappings) * 0.5:
-        raise RuntimeError(f"Weight loading failed: only {loaded}/{len(mappings)} weights loaded")
-
-
 def load_pytorch_model(model_path, precision):
     """Load PyTorch vision encoder model."""
     pt_dtype = DTYPE[precision][0]
@@ -308,7 +280,8 @@ def load_pytorch_model(model_path, precision):
 
 def load_jax_model(pt_config, model_path, mesh, precision):
     """Load JAX vision encoder model."""
-    jax_config = Qwen3OmniMoeVisionConfig(
+
+    vision_config = Qwen3OmniMoeVisionEncoderConfig(
         depth=pt_config.depth,
         hidden_size=pt_config.hidden_size,
         hidden_act=getattr(pt_config, "hidden_act", "gelu"),
@@ -321,21 +294,28 @@ def load_jax_model(pt_config, model_path, mesh, precision):
         out_hidden_size=pt_config.out_hidden_size,
         num_position_embeddings=pt_config.num_position_embeddings,
         deepstack_visual_indexes=list(pt_config.deepstack_visual_indexes),
-        rope_theta=getattr(pt_config, "rope_theta", 10000.0),
-        layer_norm_eps=getattr(pt_config, "layer_norm_eps", 1e-6),
-        dtype=precision,
     )
+    jax_config = Qwen3OmniMoeThinkerConfig(vision_config=vision_config)
+
+    # Convert string precision to JAX dtype
+    jax_dtype = _get_and_verify_dtype(jax_config, precision)
+    jax_config.model_path = model_path
+    jax_config.revision = None
+    jax_config.dtype = jax_dtype
+    jax_config.model_class = Qwen3OmniMoeThinkerEmbedding
 
     with jax.set_mesh(mesh):
-        jax_model = Qwen3OmniMoeVisionEncoder(config=jax_config, mesh=mesh, rngs=nnx.Rngs(0))
+        jax_model = Qwen3OmniMoeThinkerEmbedding(
+            config=jax_config,
+            mesh=mesh,
+            rngs=nnx.Rngs(0),
+            dtype=jax_dtype
+        )
 
-    try:
-        jax_model.load_weights(model_path)
-        logger.info("✅ Loaded JAX weights from %s", model_path)
-    except Exception as e:
-        logger.warning("Failed to load JAX weights: %s", e)
+    jax_model.load_weights(jax_config)
+    logger.info("✅ Loaded JAX weights from %s", model_path)
 
-    return jax_model
+    return jax_model.visual
 
 
 def load_models(model_path, mesh, precision):
