@@ -169,16 +169,23 @@ def device_array(*data, sharding=None, **kwargs) -> jax.Array:
     return jax.device_put(*data, device=sharding, **kwargs)
 
 
+_IS_TPU_RUNTIME_CACHED: bool | None = None
+
+
 def is_tpu_runtime() -> bool:
     """Return True if the current JAX runtime is on TPU devices.
 
     Prefer checking actual devices; fall back to default backend if necessary.
     """
+    global _IS_TPU_RUNTIME_CACHED
+    if _IS_TPU_RUNTIME_CACHED is not None:
+        return _IS_TPU_RUNTIME_CACHED
     try:
         devs = jax.devices()
-        return len(devs) > 0 and all(d.platform == "tpu" for d in devs)
+        _IS_TPU_RUNTIME_CACHED = len(devs) > 0 and all(d.platform == "tpu" for d in devs)
     except Exception:
-        return jax.default_backend() == "tpu"
+        _IS_TPU_RUNTIME_CACHED = jax.default_backend() == "tpu"
+    return _IS_TPU_RUNTIME_CACHED
 
 
 def print_memory(stage_name):

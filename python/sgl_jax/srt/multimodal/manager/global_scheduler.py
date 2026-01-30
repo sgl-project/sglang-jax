@@ -6,13 +6,21 @@ import signal
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
 
+import numpy as np
 import psutil
 import setproctitle
 import zmq
 
-from sgl_jax.srt.managers.io_struct import AbortReq
+from sgl_jax.srt.managers.io_struct import AbortReq, BatchStrOut, BatchTokenIDOut
+from sgl_jax.srt.multimodal.common.modality_enum import (
+    MultimodalDataItem,
+    pad_input_tokens,
+)
 from sgl_jax.srt.multimodal.manager.device_manager import DeviceManager
-from sgl_jax.srt.multimodal.manager.io_struct import TokenizedGenerateMMReqInput
+from sgl_jax.srt.multimodal.manager.io_struct import (
+    TokenizedGenerateMMReqInput,
+    TokenizedGenerateVLMReqInput,
+)
 from sgl_jax.srt.multimodal.manager.schedule_batch import Req
 from sgl_jax.srt.multimodal.manager.stage import Stage
 from sgl_jax.srt.multimodal.manager.utils import load_stage_configs_from_yaml
@@ -123,6 +131,7 @@ class GlobalScheduler:
         self._request_dispatcher = TypeBasedDispatcher(
             [
                 (TokenizedGenerateMMReqInput, self.convert_request),
+                (TokenizedGenerateVLMReqInput, self.convert_vlm_request),
                 (AbortReq, self.handle_abort_request),
             ]
         )
@@ -208,9 +217,94 @@ class GlobalScheduler:
             data_type=input.data_type,
             save_output=input.save_output,
         )
+        if input.mm_inputs is not None:
+            req.extra["mm_inputs"] = input.mm_inputs
         if req.rid in self.req_store:
             raise RuntimeError(f"{req.rid} is already in req_store")
         # Store with tracking state, starting at stage 0
+        self.req_store[req.rid] = ReqTrackingState(req=req, current_stage=0)
+        return req
+
+    def convert_vlm_request(self, input: TokenizedGenerateVLMReqInput):
+        """Convert a tokenized VLM input into internal Req."""
+        req = Req(
+            rid=input.rid,
+            prompt=input.prompt,
+            input_ids=input.input_ids,
+            data_type=None,
+        )
+        req.origin_input_text = input.prompt
+        req.origin_input_ids = input.input_ids
+        req.vlm_inputs = input.mm_inputs
+        if input.mm_inputs:
+            mm_items = input.mm_inputs.get("mm_items", [])
+            image_items = []
+            video_items = []
+            all_mm_items = []
+            for item in mm_items:
+                if isinstance(item, MultimodalDataItem):
+                    all_mm_items.append(item)
+                    if item.is_image():
+                        image_items.append(item)
+                    elif item.is_video():
+                        video_items.append(item)
+                elif isinstance(item, dict):
+                    item_obj = MultimodalDataItem.from_dict(item)
+                    all_mm_items.append(item_obj)
+                    if item_obj.is_image():
+                        image_items.append(item_obj)
+                    elif item_obj.is_video():
+                        video_items.append(item_obj)
+
+            pixel_values_list = []
+            for item in image_items:
+                if item.feature is not None:
+                    pixel_values_list.append(np.asarray(item.feature))
+            for item in video_items:
+                if item.feature is not None:
+                    pixel_values_list.append(np.asarray(item.feature))
+
+            if pixel_values_list:
+                req.pixel_values = np.concatenate(pixel_values_list, axis=0)
+
+            image_grid_thw = input.mm_inputs.get("image_grid_thw")
+            if image_grid_thw is not None:
+                if isinstance(image_grid_thw, np.ndarray):
+                    image_grid_thw = tuple(map(tuple, image_grid_thw.tolist()))
+                elif isinstance(image_grid_thw, list):
+                    image_grid_thw = tuple(
+                        tuple(x) if isinstance(x, list) else x for x in image_grid_thw
+                    )
+            req.image_grid_thw = image_grid_thw
+
+            video_grid_thw = input.mm_inputs.get("video_grid_thw")
+            if video_grid_thw is not None:
+                if isinstance(video_grid_thw, np.ndarray):
+                    video_grid_thw = tuple(map(tuple, video_grid_thw.tolist()))
+                elif isinstance(video_grid_thw, list):
+                    video_grid_thw = tuple(
+                        tuple(x) if isinstance(x, list) else x for x in video_grid_thw
+                    )
+            req.video_grid_thw = video_grid_thw
+
+            im_token_id = input.mm_inputs.get("im_token_id")
+            video_token_id = input.mm_inputs.get("video_token_id")
+            audio_token_id = input.mm_inputs.get("audio_token_id")
+            if req.input_ids:
+                req.cache_input_ids = pad_input_tokens(
+                    input_ids=list(req.input_ids),
+                    mm_items=all_mm_items,
+                    im_token_id=im_token_id,
+                    video_token_id=video_token_id,
+                    audio_token_id=audio_token_id,
+                )
+        if input.sampling_params is not None:
+            req.extra["sampling_params"] = input.sampling_params
+        req.extra["stream"] = bool(getattr(input, "stream", False))
+        if input.stop is not None:
+            req.extra["stop"] = input.stop
+        if req.rid in self.req_store:
+            raise RuntimeError(f"{req.rid} is already in req_store")
         self.req_store[req.rid] = ReqTrackingState(req=req, current_stage=0)
         return req
 
@@ -263,8 +357,11 @@ class GlobalScheduler:
 
         while True:
             reqs = self.recv_request()
-            if len(reqs) > 0 and self.server_args.log_requests:
-                logger.info("recv_reqs from tokenizer %s", reqs)
+            if self.server_args.log_requests and (
+                (hasattr(reqs, "__len__") and len(reqs) > 0)
+                or isinstance(reqs, (AbortReq, BatchStrOut))
+            ):
+                logger.info("recv_reqs from tokenizer %d", len(reqs))
             if reqs:
                 for req in reqs:
                     dispatched_req = self._request_dispatcher(req)
@@ -275,14 +372,19 @@ class GlobalScheduler:
             else:
                 for i, stage in enumerate(self.stage_list):
                     stage_result = Req.from_stage(stage.try_collect(), self.req_store)
-                    if stage_result is not None and self.server_args.log_requests:
-                        logger.info(
-                            "stage-%d result_type=%s is_final=%s",
-                            i,
-                            type(stage_result),
-                            self.stage_configs[i].final_output,
-                        )
                     if stage_result is None:
+                        continue
+                    if isinstance(stage_result, BatchTokenIDOut):
+                        if self.stage_configs[i].final_output:
+                            self.send_to_detokenizer.send_pyobj(stage_result)
+                            for rid in stage_result.rids:
+                                if rid in self.req_store:
+                                    del self.req_store[rid]
+                        else:
+                            logger.warning(
+                                "Received BatchTokenIDOut from non-final stage-%d; skipping.",
+                                i,
+                            )
                         continue
 
                     # Check if request was aborted (rid no longer in req_store)

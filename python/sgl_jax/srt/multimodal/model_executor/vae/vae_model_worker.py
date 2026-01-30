@@ -4,9 +4,17 @@ from sgl_jax.srt.server_args import ServerArgs
 
 
 class VaeModelWorker:
-    def __init__(self, server_args: ServerArgs = None, mesh=None, model_class=None):
+    def __init__(
+        self,
+        server_args: ServerArgs = None,
+        mesh=None,
+        model_class=None,
+        stage_sub_dir: str | None = None,
+    ):
         self.mesh = mesh
-        self.model_runner = VaeModelRunner(server_args, mesh, model_class=model_class)
+        self.model_runner = VaeModelRunner(
+            server_args, mesh, model_class=model_class, stage_sub_dir=stage_sub_dir
+        )
         # Initialize model here based on model_config
 
     def forward(self, batch: Req):
