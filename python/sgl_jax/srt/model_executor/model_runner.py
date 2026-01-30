@@ -184,6 +184,7 @@ class ModelRunner(BaseModelRunner):
             jax.jit,
             donate_argnames=["token_to_kv_pool"],  # just donate KV cache
             static_argnames=["model_state_def"],
+            compiler_options={"xla_tpu_enable_log_recorder": "true"},
         )
         def jitted_run_model(
             model_def,
