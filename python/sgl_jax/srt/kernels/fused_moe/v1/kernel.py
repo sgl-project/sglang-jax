@@ -2014,8 +2014,8 @@ def _fused_ep_moe_kernel(
                 curr_sem = bd1_idx % 2
                 next_sem = (bd1_idx + 1) % 2
                 next_bd1_idx = bd1_idx + 1
-                token_buf_id = bd1_idx & jnp.int32(1)
-                next_token_buf_id = token_buf_id ^ jnp.int32(1)
+                token_buf_id = bd1_idx & 1
+                next_token_buf_id = token_buf_id ^ 1
 
                 # Double-buffering prefetch for the next hidden slice
                 @pl.when(next_bd1_idx < num_bd1)
@@ -2034,13 +2034,18 @@ def _fused_ep_moe_kernel(
                 wait_fetch_se_tokens_slice(bt_sem_id=bt_sem_id, buf_id=token_buf_id)
 
                 for p_id in range(t_packing):
-                    t_f32 = b_se_tokens_vmem[
+                    t = b_se_tokens_vmem[
                         bt_sem_id, token_buf_id, pl.ds(0, bt), p_id, pl.ds(0, bd1_per_t_packing)
                     ]
+                    t_f32 = t.astype(jnp.float32)
                     w1_gate = b_se_w1_x2_vmem[curr_sem, p_id]
                     w3_up = b_se_w3_x2_vmem[curr_sem, p_id]
-                    act_gate_acc += jnp.dot(t_f32, w1_gate, preferred_element_type=jnp.float32)
-                    act_up_acc += jnp.dot(t_f32, w3_up, preferred_element_type=jnp.float32)
+                    act_gate_acc += jnp.dot(
+                        t_f32, w1_gate.astype(jnp.float32), preferred_element_type=jnp.float32
+                    )
+                    act_up_acc += jnp.dot(
+                        t_f32, w3_up.astype(jnp.float32), preferred_element_type=jnp.float32
+                    )
 
                 return (act_gate_acc, act_up_acc)
 
@@ -2086,7 +2091,9 @@ def _fused_ep_moe_kernel(
                 for p_id in range(t_packing):
                     w2_val = b_se_w2_x2_vmem[curr_sem, p_id]
 
-                    acc_chunk = jnp.dot(act, w2_val, preferred_element_type=jnp.float32)
+                    acc_chunk = jnp.dot(
+                        act, w2_val.astype(jnp.float32), preferred_element_type=jnp.float32
+                    )
 
                     hidden_offset = p_id * h_per_t_packing + bd2_idx * bd2_per_t_packing
 
@@ -2101,6 +2108,7 @@ def _fused_ep_moe_kernel(
 
                     @pl.when(block_id == 0)
                     def _(out_slice=out_slice, acc_chunk=acc_chunk):
+                        pl.debug_print("SE W2: acc_chunk = {}", acc_chunk[...])
                         out_slice[...] = acc_chunk.astype(t_dtype)
 
                     @pl.when(block_id > 0)
@@ -2108,6 +2116,7 @@ def _fused_ep_moe_kernel(
                         out_slice[...] = (out_slice[...].astype(jnp.float32) + acc_chunk).astype(
                             t_dtype
                         )
+                        pl.debug_print("SE W2: out_slice = {}", out_slice[...])
 
             lax.fori_loop(0, num_bd2, body_w2, None)
 
