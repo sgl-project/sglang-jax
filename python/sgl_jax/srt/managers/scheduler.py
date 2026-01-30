@@ -1,7 +1,6 @@
 """A scheduler that manages a tensor parallel TPU worker."""
 
 import concurrent.futures as futures
-import dataclasses
 import faulthandler
 import logging
 import os
@@ -67,7 +66,6 @@ from sgl_jax.srt.mem_cache.chunk_cache import ChunkCache
 from sgl_jax.srt.mem_cache.radix_cache import RadixCache
 from sgl_jax.srt.mem_cache.swa_radix_cache import SWARadixCache
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
-from sgl_jax.srt.multimodal.tokenizer_utils import resolve_tokenizer_subdir
 from sgl_jax.srt.precision_tracer import precision_tracer
 from sgl_jax.srt.server_args import PortArgs, ServerArgs
 from sgl_jax.srt.speculative.eagle_util import EagleDraftInput
@@ -135,11 +133,7 @@ class Scheduler(
         communication_backend: CommunicationBackend = None,
         mesh: jax.sharding.Mesh = None,
         model_class: None = None,
-        stage_sub_dir: str | None = None,
     ):
-        if stage_sub_dir is not None:
-            server_args = dataclasses.replace(server_args)
-            server_args.model_sub_dir = stage_sub_dir
         # set jit cache
         jit_cache_dir = os.getenv("JAX_COMPILATION_CACHE_DIR", None)
         if jit_cache_dir is not None:
@@ -267,7 +261,6 @@ class Scheduler(
         self.tp_worker = TpWorkerClass(
             server_args=server_args,
             mesh=self.mesh,
-            model_class=model_class,
         )
 
         # launch draft worker
@@ -453,17 +446,12 @@ class Scheduler(
         if server_args.skip_tokenizer_init:
             self.tokenizer = self.processor = None
         else:
-            tokenizer_subdir = ""
-            if server_args.multimodal:
-                tokenizer_subdir = resolve_tokenizer_subdir(
-                    server_args.model_path, server_args.tokenizer_path
-                )
             self.tokenizer = get_tokenizer(
                 server_args.tokenizer_path,
                 tokenizer_mode=server_args.tokenizer_mode,
                 trust_remote_code=server_args.trust_remote_code,
                 revision=server_args.revision,
-                sub_dir=tokenizer_subdir,
+                sub_dir="tokenizer" if server_args.multimodal else "",
             )
 
     def init_memory_pool_and_cache(self):
@@ -680,9 +668,6 @@ class Scheduler(
         )
         req.tokenizer = self.tokenizer
 
-        if hasattr(recv_req, "mm_inputs") and recv_req.mm_inputs:
-            multimodal_embedding = recv_req.mm_inputs.get("multimodal_embedding")
-            req.multimodal_embedding = multimodal_embedding
         # Validate prompt length
         error_msg = validate_input_length(
             req,

@@ -32,20 +32,12 @@ class StageConfigRegistry:
         "Wan2.2-T2V-A14B-Diffusers": "wan2_2_stage_config.yaml",
         "Wan-AI/Wan2.2-I2V-A14B-Diffusers": "wan2_2_stage_config.yaml",
         "Wan2.2-I2V-A14B-Diffusers": "wan2_2_stage_config.yaml",
-        # Qwen2.5-VL series
-        "Qwen/Qwen2.5-VL-7B-Instruct": "qwen2_5_vl_stage_config.yaml",
-        "Qwen2.5-VL-7B-Instruct": "qwen2_5_vl_stage_config.yaml",
-        "Qwen/Qwen2.5-VL-32B-Instruct": "qwen2_5_vl_stage_config_tp4.yaml",
-        "Qwen2.5-VL-32B-Instruct": "qwen2_5_vl_stage_config_tp4.yaml",
-        "Qwen/Qwen2.5-VL-72B-Instruct": "qwen2_5_vl_stage_config_tp4.yaml",
-        "Qwen2.5-VL-72B-Instruct": "qwen2_5_vl_stage_config_tp4.yaml",
     }
 
     # Keyword patterns for fallback matching (order matters - more specific first)
     _KEYWORD_PATTERNS: list[tuple[str, str]] = [
         ("Wan2.2", "wan2_2_stage_config.yaml"),
         ("Wan2.1", "wan2_1_stage_config.yaml"),
-        ("Qwen2.5-VL", "qwen2_5_vl_stage_config.yaml"),
     ]
 
     @classmethod

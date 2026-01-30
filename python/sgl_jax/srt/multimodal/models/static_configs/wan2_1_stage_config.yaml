@@ -2,7 +2,6 @@ model_arch: Wan-AI/Wan2.1-T2V-1.3B-Diffusers
 # how can we mapping model name to stage config yaml and impl class
 stage_args:
  - stage_id: 0
-   stage_sub_dir: text_encoder
    runtime:
      num_tpus: 2
      max_batch_size: 1
@@ -12,7 +11,6 @@ stage_args:
    model_class: UMT5EncoderModel
 
  - stage_id: 1
-   stage_sub_dir: transformer
    runtime:
      num_tpus: 1
      max_batch_size: 1
@@ -22,7 +20,6 @@ stage_args:
    final_output: false
 
  - stage_id: 2
-   stage_sub_dir: vae
    runtime:
      num_tpus: 1
      max_batch_size: 1

@@ -11,16 +11,10 @@ from sgl_jax.srt.multimodal.model_executor.diffusion.diffusion_model_runner impo
 
 class DiffusionModelWorker:
     def __init__(
-        self,
-        server_args: MultimodalServerArgs,
-        mesh: jax.sharding.Mesh = None,
-        model_class=None,
-        stage_sub_dir: str | None = None,
+        self, server_args: MultimodalServerArgs, mesh: jax.sharding.Mesh = None, model_class=None
     ):
         self.mesh = mesh
-        self.model_runner = DiffusionModelRunner(
-            server_args, self.mesh, model_class=model_class, stage_sub_dir=stage_sub_dir
-        )
+        self.model_runner = DiffusionModelRunner(server_args, self.mesh, model_class=model_class)
         self.initialize()
 
     def initialize(self):

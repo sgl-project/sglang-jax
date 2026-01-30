@@ -207,12 +207,8 @@ class JAXModelLoader(DefaultModelLoader):
         return jit_model
 
     def _initialize_model(self, model_config: ModelConfig) -> Any:
-        if not isinstance(model_config, ModelConfig) or self.load_config.model_class is not None:
-            model_class = (
-                model_config.model_class
-                if hasattr(model_config, "model_class") and model_config.model_class is not None
-                else self.load_config.model_class
-            )
+        if not isinstance(model_config, ModelConfig):
+            model_class = model_config.model_class
         else:
             model_class, _ = get_model_architecture(model_config)
 
