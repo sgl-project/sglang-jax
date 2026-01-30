@@ -61,6 +61,7 @@ Currently, SGL-JAX already supports MultiModal Models, and its usage is compatib
 
 -   **Wan 2.1 T2V**: Text-to-Video generation model.
 -   **Wan 2.2 T2V**: Text-to-Video generation model. Uses different DiT models at different noise stages for denoising, achieving higher generation quality.
+-   **Qwen2.5-VL**: Vision-language model series based on Qwen2.5.
 
 For multimodal model usage, see the [Usage Guide](docs/mutlimodal/multimodal_usage.md) and [Architecture Design](docs/mutlimodal/design/[RFC]multimodal_architechure.md).
 
