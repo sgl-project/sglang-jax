@@ -246,20 +246,12 @@ class ForwardBatch:
         obj.spec_info = children[13]
 
         # Handle optional children for backward compatibility
-<<<<<<< HEAD
         obj.attention_mask = children[14] if len(children) > 14 else None
         obj.input_embedding = children[15] if len(children) > 15 else None
 
-=======
-        if len(children) > 14:
-            obj.attention_mask = children[14]
-        else:
-            obj.attention_mask = None
-        obj.input_embeds = children[15]
         obj.apply_for_deepstack = children[16]
         obj.deepstack_visual_pos_mask = children[17]
         obj.deepstack_visual_embeds = children[18]
->>>>>>> add qwen3_omni_text (#737)
         return obj
 
     def __repr__(self) -> str:
@@ -396,14 +388,10 @@ class ForwardBatch:
             spec_info=batch.spec_info,
             spec_algorithm=batch.spec_algorithm,
             capture_hidden_mode=batch.capture_hidden_mode,
-<<<<<<< HEAD
             input_embedding=input_embedding,
-=======
             apply_for_deepstack=batch.apply_for_deepstack,
-            input_embeds=input_embeds,
             deepstack_visual_embeds=deepstack_visual_embeds,
             # deepstack_visual_pos_mask=deepstack_visual_pos_mask,
->>>>>>> add qwen3_omni_text (#737)
         )
 
         # Auto-generate attention mask for Encoder-only models (e.g. UMT5Encoder, BERT)

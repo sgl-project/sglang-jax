@@ -6,11 +6,11 @@ import logging
 import os
 
 from sgl_jax.srt.multimodal.configs.dits.wan_model_config import WanModelConfig
-from sgl_jax.srt.multimodal.configs.qwen_vl.qwen_2_5_vl_config import (
-    QwenVLModelVitConfig,
-)
 from sgl_jax.srt.multimodal.configs.qwen3_omni.qwen3_omni_vision_config import (
     Qwen3OmniMoeVisionConfig,
+)
+from sgl_jax.srt.multimodal.configs.qwen_vl.qwen_2_5_vl_config import (
+    QwenVLModelVitConfig,
 )
 from sgl_jax.srt.multimodal.configs.vaes.wan_vae_config import WanVAEConfig
 
@@ -453,10 +453,17 @@ def get_vae_config(model_path: str) -> WanVAEConfig:
     return VAEConfigRegistry.get_config(model_path)
 
 
-<<<<<<< HEAD
 def get_qwen_vl_config(model_path: str) -> QwenVLModelVitConfig:
     """Convenience function to get Qwen vl config.
-=======
+    Args:
+        model_path: The model path from server args.
+
+    Returns:
+        A VAE config instance configured for the specified model.
+    """
+    return QwenVLConfigRegistry.get_config(model_path)
+
+
 class VisionEncoderConfigRegistry:
     """Registry that maps model names to their Vision Encoder configs.
 
@@ -537,18 +544,6 @@ class VisionEncoderConfigRegistry:
 
 def get_vision_encoder_config(model_path: str) -> Qwen3OmniMoeVisionConfig:
     """Convenience function to get Vision Encoder config.
->>>>>>> Feature/vision encoder (#733)
-
-    Args:
-        model_path: The model path from server args.
-
-    Returns:
-<<<<<<< HEAD
-        A VAE config instance configured for the specified model.
-    """
-    return QwenVLConfigRegistry.get_config(model_path)
-=======
-        A Vision Encoder config instance configured for the specified model.
+    A Vision Encoder config instance configured for the specified model.
     """
     return VisionEncoderConfigRegistry.get_config(model_path)
->>>>>>> Feature/vision encoder (#733)

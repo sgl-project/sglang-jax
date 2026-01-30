@@ -1447,7 +1447,6 @@ class ScheduleBatch:
         # Pad lora_ids to match seq_lens_cpu length (after bs padding)
         if bs_padding_size > 0:
             lora_ids = lora_ids + [None] * bs_padding_size
-<<<<<<< HEAD
         input_embedding = None
         if self.forward_mode == ForwardMode.EXTEND:
             input_embedding_list = []
@@ -1466,8 +1465,7 @@ class ScheduleBatch:
                         dtype=input_embedding.dtype,
                     )
                     input_embedding = np.concatenate([input_embedding, pad], axis=0)
-=======
->>>>>>> add qwen3_omni_text (#737)
+
         return ModelWorkerBatch(
             bid=bid,
             forward_mode=self.forward_mode,
@@ -1849,14 +1847,10 @@ class ModelWorkerBatch:
 
     tree_cache: BasePrefixCache = None
 
-<<<<<<< HEAD
     input_embedding: np.ndarray | None = None
-=======
     apply_for_deepstack: bool = False
-    input_embeds: np.ndarray | None = None
     deepstack_visual_embeds: np.ndarray | None = None
     # deepstack_visual_pos_mask: np.ndarray | None = None
->>>>>>> add qwen3_omni_text (#737)
 
     def get_original_input_len(self):
         """
