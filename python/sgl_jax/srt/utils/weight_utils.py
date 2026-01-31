@@ -385,13 +385,6 @@ class WeightLoader:
     ) -> jax.Array:
         """
         Lazy loader for TP-Split MOE weights (e.g., Grok MOE).
-        Instead of loading ALL shards on EVERY host, it calculates overlap
-        and only reads the specific file(s) containing the requested slice.
-
-        For each expert (0 -> num_experts-1):
-          1. Build file intervals for TP-split files
-          2. Load slices using smart stitching (similar to _smart_load_slice)
-        Then stack all experts together using np.stack.
         """
         num_experts = len(expected_hf_keys)
 
@@ -571,7 +564,7 @@ class WeightLoader:
         target_sharding: jax.sharding.NamedSharding = None,
     ) -> jax.Array:
         """
-        Lazy oader for MoE weights:
+        Lazy loader for MoE weights:
         1. Global Loading: Directly shards data to avoid redundant I/O.
         2. CPU Transpose: Performs transpose on CPU to reduce TPU memory peak.
         3. Pre-allocation: Uses np.empty instead of np.stack to save memory.
@@ -817,7 +810,11 @@ class WeightLoader:
 
                         target_path = mapping.target_path
                         model_param = self._get_param(params, target_path)
-                        model_param.value = lazy_weight.astype(model_param.value.dtype)
+
+                        if lazy_weight.dtype in [jnp.float8_e4m3fn, jnp.float8_e5m2]:
+                            model_param.value = lazy_weight
+                        else:
+                            model_param.value = lazy_weight.astype(model_param.value.dtype)
 
                         mode_str = "Split-Stitch" if is_split_weight else "Direct"
                         logger.debug(
@@ -937,7 +934,11 @@ class WeightLoader:
                     # 3. Direct assignment
                     target_path = mapping.target_path[0]
                     model_param = self._get_param(params, target_path)
-                    model_param.value = stacked_weight.astype(model_param.value.dtype)
+
+                    if stacked_weight.dtype in [jnp.float8_e4m3fn, jnp.float8_e5m2]:
+                        model_param.value = stacked_weight
+                    else:
+                        model_param.value = stacked_weight.astype(model_param.value.dtype)
 
                     logger.debug(
                         "Assigned MoE group %s, shape: %s",
@@ -983,7 +984,11 @@ class WeightLoader:
 
                     target_path = mapping.target_path[0]
                     model_param = self._get_param(params, target_path)
-                    model_param.value = expert_weights.astype(model_param.value.dtype)
+
+                    if expert_weights.dtype in [jnp.float8_e4m3fn, jnp.float8_e5m2]:
+                        model_param.value = expert_weights
+                    else:
+                        model_param.value = expert_weights.astype(model_param.value.dtype)
 
                     logger.info(
                         "Assigned MoE group %s (Grok Split-Stitch), shape: %s",
@@ -1213,7 +1218,10 @@ class WeightLoader:
                 processed_weight.shape,
                 mapping.transpose,
             )
-            model_param.value = sharded_weight.astype(model_param.value.dtype)
+            if sharded_weight.dtype in [jnp.float8_e4m3fn, jnp.float8_e5m2]:
+                model_param.value = sharded_weight
+            else:
+                model_param.value = sharded_weight.astype(model_param.value.dtype)
         except Exception as e:
             logger.error("Failed to load %s -> %s: %s", hf_key, jax_path, str(e))
             raise
@@ -1330,7 +1338,12 @@ class WeightLoader:
             sharded_weight = self._shard_weight(processed_weight, mapping.sharding)
 
             model_param = self._get_param(params, jax_path)
-            model_param.value = sharded_weight.astype(model_param.value.dtype)
+
+            if sharded_weight.dtype in [jnp.float8_e4m3fn, jnp.float8_e5m2]:
+                model_param.value = sharded_weight
+            else:
+                model_param.value = sharded_weight.astype(model_param.value.dtype)
+
             logger.debug("Split %s -> %s, shape: %s", hf_key, jax_path, processed_weight.shape)
 
     def _shard_weight(
