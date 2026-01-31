@@ -140,6 +140,7 @@ class QuantizedLinear(nnx.Module):
         linear: "LinearBase",
         weight_dtype: jnp.dtype,
         activation_dtype: jnp.dtype | None = None,
+        is_static_input: bool = False,
     ) -> "QuantizedLinear":
         """Convert a LinearBase layer to a QuantizedLinear layer.
 
@@ -153,23 +154,30 @@ class QuantizedLinear(nnx.Module):
         Returns:
             A new QuantizedLinear layer with quantized weights
         """
-        # LinearBase weight shape: [input_size, output_size]
-        # xla_quantized_matmul expects w_q: [output_size, input_size]
-        # So we need to transpose the weight before quantizing
-        weight = linear.weight.value
-        weight_t = weight.T  # [output_size, input_size]
+        if is_static_input:
+            w_shape = linear.weight.shape
+            input_size, output_size = w_shape[0], w_shape[1]
+            weight_q = jnp.zeros((output_size, input_size), dtype=weight_dtype)
+            weight_scale = jnp.zeros((output_size,), dtype=jnp.float32)
+            bias = linear.bias.value if linear.bias is not None else None
+        else:
+            # LinearBase weight shape: [input_size, output_size]
+            # xla_quantized_matmul expects w_q: [output_size, input_size]
+            # So we need to transpose the weight before quantizing
+            weight = linear.weight.value
+            weight_t = weight.T  # [output_size, input_size]
 
-        # Per-channel quantization along output dimension
-        # After transpose, output_size is axis 0, input_size is axis 1
-        # We want per-output-channel, so reduce along axis 1 (input features)
-        weight_q, weight_scale = quantize_tensor(
-            dtype=weight_dtype,
-            tensor=weight_t,
-            axis=1,
-        )
+            # Per-channel quantization along output dimension
+            # After transpose, output_size is axis 0, input_size is axis 1
+            # We want per-output-channel, so reduce along axis 1 (input features)
+            weight_q, weight_scale = quantize_tensor(
+                dtype=weight_dtype,
+                tensor=weight_t,
+                axis=1,
+            )
 
-        # Get bias if it exists
-        bias = linear.bias.value if linear.bias is not None else None
+            # Get bias if it exists
+            bias = linear.bias.value if linear.bias is not None else None
 
         return cls(
             weight_q=weight_q,
@@ -201,6 +209,9 @@ class QuantizedLinear(nnx.Module):
         orig_shape = x.shape
         x_2d = x.reshape(-1, x.shape[-1]) if x.ndim > 2 else x
 
+        scale_val = self.weight_scale.value
+        if scale_val.ndim == 2 and scale_val.shape[1] == 1:
+            scale_val = jnp.squeeze(scale_val, axis=1)
         # Use shard_map for local computation with single all-reduce
         # kernel_axes[0] = input sharding axis (e.g., "tensor" for o_proj, None for q_proj)
         # kernel_axes[1] = output sharding axis (e.g., None for o_proj, "tensor" for q_proj)
@@ -232,7 +243,7 @@ class QuantizedLinear(nnx.Module):
             in_specs=in_specs,
             out_specs=out_specs,
             check_vma=False,
-        )(x_2d, self.weight_q.value, self.weight_scale.value)
+        )(x_2d, self.weight_q.value, scale_val)
 
         # Reshape back to original batch dimensions
         if x.ndim > 2:

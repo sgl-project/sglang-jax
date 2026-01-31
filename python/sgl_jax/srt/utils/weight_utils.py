@@ -10,6 +10,7 @@ from dataclasses import dataclass
 
 import jax
 import jax.numpy as jnp
+import ml_dtypes
 import numpy as np
 from flax import nnx
 from jax.experimental import multihost_utils
@@ -22,6 +23,20 @@ from sgl_jax.srt.configs.model_config import ModelConfig
 
 logger = logging.getLogger(__name__)
 
+if not hasattr(np, "float8_e4m3fn"):
+    np.float8_e4m3fn = ml_dtypes.float8_e4m3fn
+if not hasattr(np, "float8_e5m2"):
+    np.float8_e5m2 = ml_dtypes.float8_e5m2
+
+
+def _view_as_fp8_if_needed(data: np.ndarray, target_dtype: jnp.dtype) -> np.ndarray:
+    if data.dtype == np.uint8:
+        if target_dtype == jnp.float8_e4m3fn:
+            return data.view(ml_dtypes.float8_e4m3fn)
+        elif target_dtype == jnp.float8_e5m2:
+            return data.view(ml_dtypes.float8_e5m2)
+    return data
+
 
 @dataclass
 class WeightMapping:
@@ -32,6 +47,7 @@ class WeightMapping:
         None  # For multi-dimensional transpose (e.g., conv weights)
     )
     reshape: tuple | None = None
+    repeat: tuple[int, int] | None = None
     head_dim_padding: bool = False
     kv_head_padding: bool = False
     concat_axis: int | None = None
@@ -228,6 +244,8 @@ class WeightLoader:
                 "I64": jnp.int64,
                 "I32": jnp.int32,
                 "BOOL": jnp.bool_,
+                "F8_E4M3": jnp.float8_e4m3fn,
+                "F8_E5M2": jnp.float8_e5m2,
             }
             target_dtype = dtype_map.get(st_dtype, jnp.float32)
 
@@ -240,11 +258,11 @@ class WeightLoader:
                 # Fallback: Load full tensor on every host (Replicated)
                 sharding = jax.sharding.NamedSharding(self.mesh, P())
 
-            def _make_load_slice(fname=filename, fm=file_manager):
+            def _make_load_slice(fname=filename, fm=file_manager, target_dtype=target_dtype):
                 def _load_slice(index):
-                    # index is the slice required by the current host based on 'sharding'
                     f = fm.get_handle(fname)
-                    return f.get_slice(hf_key)[index]
+                    data = f.get_slice(hf_key)[index]
+                    return _view_as_fp8_if_needed(data, target_dtype)
 
                 return _load_slice
 
@@ -300,6 +318,8 @@ class WeightLoader:
             "I64": jnp.int64,
             "I32": jnp.int32,
             "BOOL": jnp.bool_,
+            "F8_E4M3": jnp.float8_e4m3fn,
+            "F8_E5M2": jnp.float8_e5m2,
         }
         target_dtype = dtype_map.get(st_dtype, jnp.float32)
 
@@ -340,14 +360,15 @@ class WeightLoader:
                     collected_chunks.append(chunk)
 
             if not collected_chunks:
-                return np.zeros((0,) * len(global_shape), dtype=np.float32)
+                return np.zeros((0,) * len(global_shape), dtype=target_dtype)
 
             if len(collected_chunks) == 1:
                 # Perfect match (1-to-1 mapping), no copy needed
-                return collected_chunks[0]
+                result = collected_chunks[0]
             else:
                 # Cross-file boundary (rare if TP matches), needs stitching
-                return np.concatenate(collected_chunks, axis=concat_axis)
+                result = np.concatenate(collected_chunks, axis=concat_axis)
+            return _view_as_fp8_if_needed(result, target_dtype)
 
         return jax.make_array_from_callback(global_shape, sharding, _smart_load_slice).astype(
             target_dtype
@@ -391,6 +412,8 @@ class WeightLoader:
             "I64": jnp.int64,
             "I32": jnp.int32,
             "BOOL": jnp.bool_,
+            "F8_E4M3": jnp.float8_e4m3fn,
+            "F8_E5M2": jnp.float8_e5m2,
         }
         target_dtype = dtype_map.get(st_dtype, jnp.float32)
 
@@ -485,13 +508,15 @@ class WeightLoader:
                     collected_chunks.append(chunk)
 
             if not collected_chunks:
-                return np.zeros((0,) * len(expert_shape), dtype=np.float32)
+                return np.zeros((0,) * len(expert_shape), dtype=target_dtype)
 
             if len(collected_chunks) == 1:
                 result = collected_chunks[0]
             else:
                 # Cross-file boundary, needs stitching
                 result = np.concatenate(collected_chunks, axis=effective_concat_axis)
+
+            result = _view_as_fp8_if_needed(result, target_dtype)
 
             # Apply transpose if needed
             if do_transpose:
@@ -509,7 +534,7 @@ class WeightLoader:
             sliced_num_experts = len(expert_indices)
 
             if sliced_num_experts == 0:
-                return np.zeros((0, *[1] * len(inner_slice)), dtype=np.float32)
+                return np.zeros((0, *[1] * len(inner_slice)), dtype=target_dtype)
 
             # Load each expert sequentially (expert 0 -> expert_num - 1)
             expert_slices = []
@@ -568,6 +593,8 @@ class WeightLoader:
             "I64": jnp.int64,
             "I32": jnp.int32,
             "BOOL": jnp.bool_,
+            "F8_E4M3": jnp.float8_e4m3fn,
+            "F8_E5M2": jnp.float8_e5m2,
         }
         target_dtype = dtype_map.get(st_dtype, jnp.float32)
 
@@ -605,7 +632,7 @@ class WeightLoader:
             sliced_num_experts = len(expert_indices)
 
             if sliced_num_experts == 0:
-                return np.zeros((0, *[1] * len(inner_slice)), dtype=np.float32)
+                return np.zeros((0, *[1] * len(inner_slice)), dtype=target_dtype)
 
             first_idx = expert_indices[0]
             first_hf_key = expected_hf_keys[first_idx]
@@ -635,6 +662,8 @@ class WeightLoader:
                 f = file_manager.get_handle(fname)
 
                 data = f.get_slice(hf_key)[:]
+                data = _view_as_fp8_if_needed(data, target_dtype)
+
                 if do_transpose:
                     data = np.transpose(data)
                 out_array[i] = data[inner_slice]
@@ -735,6 +764,7 @@ class WeightLoader:
                 can_optimize = (
                     isinstance(mapping.target_path, str)
                     and mapping.reshape is None
+                    and mapping.repeat is None  # Check repeat here too!
                     and not mapping.kv_head_padding
                     and not mapping.head_dim_padding
                     and mapping.sharding is not None
@@ -824,6 +854,7 @@ class WeightLoader:
                     continue
 
                 self._process_and_assign_weight(params, hf_key, lazy_weight, mapping)
+
             # 3. Process MoE Weights (Lazy Pull)
             for moe_key, mapping in tqdm(moe_mappings.items(), desc="Loading MoE Weights"):
                 expected_hf_keys = mapping.target_path[1:]
@@ -896,6 +927,13 @@ class WeightLoader:
                         target_sharding=final_sharding,  # Global loading
                     )
 
+                    if mapping.reshape is not None:
+                        stacked_weight = jnp.reshape(stacked_weight, mapping.reshape)
+
+                    if mapping.repeat is not None:
+                        axis, times = mapping.repeat
+                        stacked_weight = jnp.repeat(stacked_weight, times, axis=axis)
+
                     # 3. Direct assignment
                     target_path = mapping.target_path[0]
                     model_param = self._get_param(params, target_path)
@@ -924,9 +962,7 @@ class WeightLoader:
                         )
                         # Use regular mesh for loading individual expert weights (TP sharding only)
                         final_sharding = jax.sharding.NamedSharding(moe_mesh, P(*mapping.sharding))
-                        final_sharding = jax.sharding.NamedSharding(moe_mesh, P(*mapping.sharding))
                     else:
-                        final_sharding = jax.sharding.NamedSharding(self.mesh, P(*mapping.sharding))
                         final_sharding = jax.sharding.NamedSharding(self.mesh, P(*mapping.sharding))
 
                     expert_weights = self._create_stacked_split_moe_lazy_tensor(
@@ -937,6 +973,13 @@ class WeightLoader:
                         do_transpose=mapping.transpose,
                         target_sharding=final_sharding,
                     )
+
+                    if mapping.reshape is not None:
+                        expert_weights = jnp.reshape(expert_weights, mapping.reshape)
+
+                    if mapping.repeat is not None:
+                        axis, times = mapping.repeat
+                        expert_weights = jnp.repeat(expert_weights, times, axis=axis)
 
                     target_path = mapping.target_path[0]
                     model_param = self._get_param(params, target_path)
@@ -1153,7 +1196,9 @@ class WeightLoader:
 
         if mapping.reshape is not None:
             processed_weight = jnp.reshape(processed_weight, mapping.reshape)
-
+        if mapping.repeat is not None:
+            axis, times = mapping.repeat
+            processed_weight = jnp.repeat(processed_weight, times, axis=axis)
         if mapping.kv_head_padding:
             processed_weight = self._apply_kv_head_padding(processed_weight, hf_key)
 
@@ -1318,48 +1363,75 @@ class WeightLoader:
         return current_level
 
     def _apply_kv_head_padding(self, weight: jax.Array, hf_key: str) -> jax.Array:
-        """Apply KV head padding/replication when tp_size > total_kv_heads."""
-        if any(
-            proj in hf_key for proj in ["k_proj", "v_proj"]
-        ) and self.model_config.needs_kv_head_replication(self.sharding_size):
-            total_kv_heads = self.model_config.get_total_num_kv_heads()
-            num_replicas = self.model_config.get_num_kv_head_replicas(self.sharding_size)
-            padding_strategy = self.model_config.get_kv_padding_strategy()
+        """Apply KV head padding/replication when tp_size > total_kv_heads.
 
-            if padding_strategy == "replicate":
-                if hf_key.endswith(".bias"):
-                    replicated_bias_parts = []
-                    for original_head_id in range(total_kv_heads):
-                        start_idx = original_head_id * self.head_dim
-                        end_idx = (original_head_id + 1) * self.head_dim
-                        original_head_bias = weight[start_idx:end_idx]
-                        for _ in range(num_replicas):
-                            replicated_bias_parts.append(original_head_bias)
-                    weight = jnp.concatenate(replicated_bias_parts, axis=0)
-                else:
-                    replicated_weight_parts = []
-                    for original_head_id in range(total_kv_heads):
-                        start_idx = original_head_id * self.head_dim
-                        end_idx = (original_head_id + 1) * self.head_dim
-                        original_head_weight = weight[:, start_idx:end_idx]
-                        for _ in range(num_replicas):
-                            replicated_weight_parts.append(original_head_weight)
-                    weight = jnp.concatenate(replicated_weight_parts, axis=1)
-            elif padding_strategy == "zero":
-                target_heads = total_kv_heads * num_replicas
-                target_size = target_heads * self.head_dim
-                if hf_key.endswith(".bias"):
-                    current_size = weight.shape[0]
-                    padding_size = target_size - current_size
-                    if padding_size > 0:
-                        padding = jnp.zeros((padding_size,), dtype=weight.dtype)
-                        weight = jnp.concatenate([weight, padding], axis=0)
-                else:
-                    current_size = weight.shape[1]
-                    padding_size = target_size - current_size
-                    if padding_size > 0:
-                        padding = jnp.zeros((weight.shape[0], padding_size), dtype=weight.dtype)
-                        weight = jnp.concatenate([weight, padding], axis=1)
+        Handles:
+        1. Bias/Scale (1D or 2D with shape[0]=heads) -> Pad Axis 0
+        2. Standard Weight (2D with shape[1]=heads*dim) -> Pad Axis 1
+        3. Static Quant Weight (2D with shape[0]=heads*dim) -> Pad Axis 0
+        """
+        if not (
+            any(proj in hf_key for proj in ["k_proj", "v_proj"])
+            and self.model_config.needs_kv_head_replication(self.sharding_size)
+        ):
+            return weight
+
+        total_kv_heads = self.model_config.get_total_num_kv_heads()
+        num_replicas = self.model_config.get_num_kv_head_replicas(self.sharding_size)
+        padding_strategy = self.model_config.get_kv_padding_strategy()
+
+        target_axis = -1
+        step_size = -1
+
+        dim0 = weight.shape[0]
+        if dim0 == total_kv_heads:
+            target_axis = 0
+            step_size = 1
+        elif dim0 == total_kv_heads * self.head_dim:
+            target_axis = 0
+            step_size = self.head_dim
+
+        if target_axis == -1 and weight.ndim > 1:
+            dim1 = weight.shape[1]
+            if dim1 == total_kv_heads * self.head_dim:
+                target_axis = 1
+                step_size = self.head_dim
+
+        if target_axis == -1:
+            return weight
+
+        if padding_strategy == "replicate":
+            replicated_parts = []
+
+            for original_head_id in range(total_kv_heads):
+                start = original_head_id * step_size
+                end = (original_head_id + 1) * step_size
+
+                part = weight[start:end] if target_axis == 0 else weight[:, start:end]
+
+                for _ in range(num_replicas):
+                    replicated_parts.append(part)
+
+            weight = jnp.concatenate(replicated_parts, axis=target_axis)
+
+        elif padding_strategy == "zero":
+            target_heads_total = total_kv_heads * num_replicas
+
+            if step_size == 1:
+                target_len = target_heads_total
+            else:
+                target_len = target_heads_total * self.head_dim
+
+            current_len = weight.shape[target_axis]
+            padding_len = target_len - current_len
+
+            if padding_len > 0:
+                pad_shape = list(weight.shape)
+                pad_shape[target_axis] = padding_len
+
+                padding = jnp.zeros(tuple(pad_shape), dtype=weight.dtype)
+                weight = jnp.concatenate([weight, padding], axis=target_axis)
+
         return weight
 
     def _is_excluded_layer_weight(self, hf_key: str) -> bool:
