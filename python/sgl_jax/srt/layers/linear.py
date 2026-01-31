@@ -216,11 +216,11 @@ class QuantizedLinear(nnx.Module):
         # Weight scale sharding: P(output_axis) - per output channel
         # Output sharding: P(None, output_axis)
         in_specs = (
-            P(None, input_axis),  # x
+            P("data", input_axis),  # x
             P(output_axis, input_axis),  # w_q
             P(output_axis),  # w_scale
         )
-        out_specs = P(None, output_axis)
+        out_specs = P("data", output_axis)
 
         output = shard_map(
             partial(

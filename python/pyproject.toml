@@ -45,8 +45,8 @@ dependencies = [
     "omegaconf",
     "imageio[ffmpeg]",
     # add torch and torchvision CPU version for multimodal's IMAGE/VIDEO/AUDIO processor within multimodal_tokenizer
-    "torch",
-    "torchvision",
+    #"torch",
+    #"torchvision",
 ]
 
 [project.optional-dependencies]
