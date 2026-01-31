@@ -416,7 +416,27 @@ def _execute_multimodal_server_warmup(
 
     # Send a warmup request
     # For Wan models, send an image generation request
-    if _is_wan_model(server_args.model_path):
+    if "Qwen2.5-VL" in server_args.model_path:
+        request_endpoint = "/v1/chat/completions"
+        json_data = {
+            "model": "Qwen/Qwen2.5-VL",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "What can you see in this image?"},
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": "https://github.com/IS-Model-Framework/sglang-jax/blob/dev/vl/test/srt/example_image.png?raw=true"
+                            },
+                        },
+                    ],
+                }
+            ],
+            "max_tokens": 3,
+        }
+    elif _is_wan_model(server_args.model_path):
         request_endpoint = "/api/v1/images/generation"
         json_data = {
             "prompt": "warmup request",
@@ -433,7 +453,6 @@ def _execute_multimodal_server_warmup(
             "num_inference_steps": 2,
             "save_output": False,
         }
-
     try:
         res = requests.post(
             url + request_endpoint,

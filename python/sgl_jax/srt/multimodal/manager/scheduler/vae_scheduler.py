@@ -98,6 +98,8 @@ class VaeScheduler:
 
                 if valid_reqs:
                     self.run_vae_batch(valid_reqs)
+            else:
+                self._comm_backend.wait_for_new_requests(0.001)
 
     def preprocess(self, req):
         """Apply model-specific preprocessing to a single `Req`.

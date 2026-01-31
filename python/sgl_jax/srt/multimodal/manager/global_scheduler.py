@@ -90,6 +90,9 @@ class GlobalScheduler:
             context, zmq.PUSH, port_args.detokenizer_ipc_name, False
         )
 
+        self.poller = zmq.Poller()
+        self.poller.register(self.recv_from_tokenizer, zmq.POLLIN)
+
         stage_config_path = get_stage_config_path(server_args.model_path)
         logger.info("Loading stage config from: %s", stage_config_path)
         self.stage_configs = load_stage_configs_from_yaml(stage_config_path)
@@ -356,7 +359,11 @@ class GlobalScheduler:
         """
 
         while True:
-            reqs = self.recv_request()
+            # Poll sockets for 1ms
+            socks = dict(self.poller.poll(1))
+            reqs = []
+            if self.recv_from_tokenizer in socks:
+                reqs = self.recv_request()
             if self.server_args.log_requests and (
                 (hasattr(reqs, "__len__") and len(reqs) > 0)
                 or isinstance(reqs, (AbortReq, BatchStrOut))
