@@ -1534,6 +1534,8 @@ def ragged_paged_attention(
                 pages_per_seq,
                 causal,
             )
+    logger.info("Using tuned block sizes: bkv_p=%s, bq=%s", bkv_p, bq_sz)
+
     kv_packing = get_dtype_packing(kv_cache_fused_processed.dtype)
     if page_size == 1:
         bkv_p = bkv_p // 2
