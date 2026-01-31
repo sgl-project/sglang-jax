@@ -230,6 +230,7 @@ def _estimate_vmem_bytes(
             se_w1_scale = intermediate_size * 4
             se_w3_scale = intermediate_size * 4
             se_w2_scale = hidden_size * 4
+            total_bytes += se_w1_scale + se_w3_scale + se_w2_scale
 
     if verbose:
 

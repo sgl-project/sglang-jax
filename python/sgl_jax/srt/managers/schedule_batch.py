@@ -534,6 +534,7 @@ def acc_global_bid():
 @dataclasses.dataclass
 class ScheduleReqsInfo:
     """Store per-DP information for a batch of requests."""
+
     # Requests assigned to this DP rank
     reqs: list[Req] = None
     chunked_req: Req | None = None
@@ -580,6 +581,7 @@ class ScheduleBatch:
 
     # Per-DP request information (list of length dp_size)
     reqs_info: list[ScheduleReqsInfo] = None
+    bid: int = None
 
     # Memory pool and cache (shared across all DP ranks)
     req_to_token_pool: ReqToTokenPool = None
@@ -1181,9 +1183,12 @@ class ScheduleBatch:
         req.reset_for_retract()
 
     def retract_all(self, server_args: ServerArgs):
-        retracted_reqs = self.reqs
-        for idx in range(len(self.reqs)):
-            self.release_req(idx, len(self.reqs) - idx, server_args)
+        retracted_reqs = [
+            req for info in self.reqs_info for req in (info.reqs if info.reqs else [])
+        ]
+        for dp_rank, dp_reqs in enumerate(self.reqs_info):
+            for idx, _ in enumerate(dp_reqs.reqs):
+                self.release_req(idx, dp_rank, len(dp_reqs.reqs) - 1, server_args)
 
         self.filter_batch(retracted_reqs)
         return retracted_reqs
@@ -1876,6 +1881,8 @@ class ScheduleBatch:
             lora_ids = [req.lora_id for req in all_reqs[:real_bs]]
             # Pad to total_bs
             lora_ids = lora_ids + ["0"] * (total_bs - real_bs)
+
+        input_embedding = None
 
         return ModelWorkerBatch(
             bid=bid,
