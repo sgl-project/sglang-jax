@@ -295,6 +295,7 @@ class BailingMoEDecoderLayer(nnx.Module):
                     top_k_groups=config.topk_group,
                     num_shared_experts=num_shared_experts,
                     moe_shared_expert_intermediate_size=moe_shared_expert_intermediate_size,
+                    quantization_config=getattr(config, "quantization_config", None),
                 )
             else:
                 self.topk = TopK(
@@ -377,7 +378,7 @@ class BailingMoEDecoderLayer(nnx.Module):
 
             correction_bias = self.moe_gate.bias.value if self.moe_gate.bias is not None else None
             if self.use_fused:
-                hidden_states = self.mlp(hidden_states, router_logits)
+                hidden_states = self.mlp(hidden_states, router_logits, router_bias=correction_bias)
                 topk_ids = None
             else:
                 topk_weights, topk_ids = self.topk(router_logits, correction_bias)

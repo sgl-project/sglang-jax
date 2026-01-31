@@ -257,6 +257,7 @@ class Grok1MoE(nnx.Module):
                 dtype=dtype,
                 layer_id=layer_id,
                 renormalize_topk_logits=False,  # Match sglang behavior
+                quantization_config=getattr(config, "quantization_config", None),
             )
         else:
             self.experts = EPMoE(

@@ -30,22 +30,28 @@ class GateLogit(nnx.Module):
         self.score_func = score_func
 
         self.kernel = nnx.Param(
-            nnx.with_partitioning(nnx.initializers.normal(), (None, None))(
-                jax.random.PRNGKey(0), (input_size, num_experts), self.weight_dtype
-            )
+            jax.random.normal(
+                jax.random.PRNGKey(0),
+                (input_size, num_experts),
+                dtype=self.weight_dtype,
+                out_sharding=P(None, None),
+            ),
         )
         if enable_expert_bias:
             self.bias = nnx.Param(
-                nnx.with_partitioning(nnx.initializers.zeros_init(), (None,))(
-                    jax.random.PRNGKey(0), (num_experts,), self.weight_dtype
-                )
+                jax.random.normal(
+                    jax.random.PRNGKey(0),
+                    (num_experts,),
+                    dtype=self.weight_dtype,
+                    out_sharding=P(None),
+                ),
             )
         else:
             self.bias = None
 
     @named_scope
     def __call__(self, hidden_states: jax.Array) -> tuple[jax.Array, jax.Array | None]:
-        logits = hidden_states.astype(self.weight_dtype) @ self.kernel.value
+        logits = jnp.dot(hidden_states, self.kernel.value)
 
         if self.score_func:
             if self.score_func == "softmax":
@@ -298,19 +304,16 @@ class EPMoE(nnx.Module):
                 self.quantized_dtype,
                 self.wi_0.value,
                 axis=2,
-                pad_tensor=True,
             )
             w1_value, w1_scale = quantize_tensor(
                 self.quantized_dtype,
                 self.wi_1.value,
                 axis=2,
-                pad_tensor=True,
             )
             wo_value, wo_scale = quantize_tensor(
                 self.quantized_dtype,
                 self.wo.value,
                 axis=2,
-                pad_tensor=True,
             )
 
             self.wi_0 = nnx.Param(w0_value, out_sharding=P("expert", "tensor", None))
@@ -322,40 +325,22 @@ class EPMoE(nnx.Module):
             if hasattr(self, "wi_0_scale"):
                 del self.wi_0_scale
             self.wi_0_scale = nnx.Param(
-                w0_scale.reshape(
-                    w0_scale.shape[0],
-                    1,
-                    1,
-                    w0_scale.shape[1],
-                    out_sharding=P("expert", None, None, "tensor"),
-                ),
+                w0_scale.reshape(w0_scale.shape[0], 1, 1, w0_scale.shape[1]),
                 out_sharding=P("expert", None, None, "tensor"),
             )
 
             if hasattr(self, "wi_1_scale"):
                 del self.wi_1_scale
             self.wi_1_scale = nnx.Param(
-                w1_scale.reshape(
-                    w1_scale.shape[0],
-                    1,
-                    1,
-                    w1_scale.shape[1],
-                    out_sharding=P("expert", None, None, "tensor"),
-                ),
+                w1_scale.reshape(w1_scale.shape[0], 1, 1, w1_scale.shape[1]),
                 out_sharding=P("expert", None, None, "tensor"),
             )
 
             if hasattr(self, "wo_scale"):
                 del self.wo_scale
             self.wo_scale = nnx.Param(
-                wo_scale.reshape(
-                    wo_scale.shape[0],
-                    1,
-                    1,
-                    wo_scale.shape[1],
-                    out_sharding=P("expert", None, None, "tensor"),
-                ),
-                out_sharding=P("expert", None, None, None),
+                wo_scale.reshape(wo_scale.shape[0], 1, 1, wo_scale.shape[1]),
+                out_sharding=P("expert", None, None, "tensor"),
             )
 
     @named_scope
@@ -732,6 +717,7 @@ class FusedEPMoE(nnx.Module):
         routed_scaling_factor: float | None = None,
         num_shared_experts: int = 0,
         moe_shared_expert_intermediate_size: int | None = None,
+        quantization_config=None,
     ):
         self.hidden_size = hidden_size
         self.num_experts = num_experts
@@ -758,13 +744,20 @@ class FusedEPMoE(nnx.Module):
                 f"num_experts({num_experts}) must be divisible by ep_size ({self.ep_size})"
             )
 
+        self.quantized_dtype = (
+            quantization_config.get_moe_weight_dtype() if quantization_config else None
+        )
+        self.activation_quantized_dtype = (
+            quantization_config.get_moe_activation_dtype() if quantization_config else None
+        )
+
         # Initialize weights.
         self.w1 = nnx.Param(
             jax.random.normal(
                 jax.random.key(0),
                 (num_experts, hidden_size, intermediate_dim),
                 dtype=weight_dtype,
-                out_sharding=P("tensor", None, None),
+                out_sharding=P(("data", "tensor"), None, None),
             )
         )
         self.w3 = nnx.Param(
@@ -772,7 +765,7 @@ class FusedEPMoE(nnx.Module):
                 jax.random.key(1),
                 (num_experts, hidden_size, intermediate_dim),
                 dtype=weight_dtype,
-                out_sharding=P("tensor", None, None),
+                out_sharding=P(("data", "tensor"), None, None),
             )
         )
 
@@ -781,9 +774,13 @@ class FusedEPMoE(nnx.Module):
                 jax.random.key(0),
                 (num_experts, intermediate_dim, hidden_size),
                 dtype=weight_dtype,
-                out_sharding=P("tensor", None, None),
+                out_sharding=P(("data", "tensor"), None, None),
             )
         )
+
+        self.w1_scale = None
+        self.w3_scale = None
+        self.w2_scale = None
 
         if self.num_shared_experts > 0:
             se_inter_dim = self.moe_shared_expert_intermediate_size * self.num_shared_experts
@@ -819,6 +816,125 @@ class FusedEPMoE(nnx.Module):
             self.w3_shared = None
             self.w2_shared = None
 
+        self.w1_shared_scale = None
+        self.w3_shared_scale = None
+        self.w2_shared_scale = None
+
+        self.subc_quant_wsz = None  # Use default sub channel quantization block size
+
+    def quantize_weights(self):
+        """Quantize MoE weights in-place. Call once after model loading."""
+        if self.quantized_dtype is None:
+            return
+
+        if hasattr(self, "subc_quant_wsz"):
+            del self.subc_quant_wsz
+            self.subc_quant_wsz = 256
+
+        with jax.set_mesh(self.mesh):
+            # Replace original weights with quantized versions
+            w1_value, w1_scale = quantize_tensor(
+                self.quantized_dtype,
+                self.w1.value,
+                axis=1,
+                block_size=self.subc_quant_wsz,
+            )
+            w3_value, w3_scale = quantize_tensor(
+                self.quantized_dtype,
+                self.w3.value,
+                axis=1,
+                block_size=self.subc_quant_wsz,
+            )
+            w2_value, w2_scale = quantize_tensor(
+                self.quantized_dtype,
+                self.w2.value,
+                axis=1,
+                block_size=self.subc_quant_wsz,
+            )
+
+            # NOTE: Fused MoE shards the expert dimension across EP=(data*tensor).
+            ep_sharding = P(("data", "tensor"), None, None)
+            ep_scale_sharding = P(("data", "tensor"), None, None, None)
+
+            self.w1 = nnx.Param(w1_value, out_sharding=ep_sharding)
+            self.w3 = nnx.Param(w3_value, out_sharding=ep_sharding)
+            self.w2 = nnx.Param(w2_value, out_sharding=ep_sharding)
+
+            # Update scales (reshape to 4D for GMM kernel)
+            # Wrap with nnx.data() to override static attribute status
+            if hasattr(self, "w1_scale"):
+                del self.w1_scale
+            self.w1_scale = nnx.Param(
+                w1_scale.reshape(w1_scale.shape[0], w1_scale.shape[1], 1, w1_scale.shape[2]),
+                out_sharding=ep_scale_sharding,
+            )
+            if hasattr(self, "w3_scale"):
+                del self.w3_scale
+            self.w3_scale = nnx.Param(
+                w3_scale.reshape(w3_scale.shape[0], w3_scale.shape[1], 1, w3_scale.shape[2]),
+                out_sharding=ep_scale_sharding,
+            )
+            if hasattr(self, "w2_scale"):
+                del self.w2_scale
+            self.w2_scale = nnx.Param(
+                w2_scale.reshape(w2_scale.shape[0], w2_scale.shape[1], 1, w2_scale.shape[2]),
+                out_sharding=ep_scale_sharding,
+            )
+
+            if self.w1_shared is not None:
+                w1_shared_value, w1_shared_scale = quantize_tensor(
+                    self.quantized_dtype,
+                    self.w1_shared.value,
+                    axis=0,
+                )
+                w3_shared_value, w3_shared_scale = quantize_tensor(
+                    self.quantized_dtype,
+                    self.w3_shared.value,
+                    axis=0,
+                )
+                w2_shared_value, w2_shared_scale = quantize_tensor(
+                    self.quantized_dtype,
+                    self.w2_shared.value,
+                    axis=0,
+                )
+
+                self.w1_shared = nnx.Param(w1_shared_value, out_sharding=P(None, None))
+                self.w3_shared = nnx.Param(w3_shared_value, out_sharding=P(None, None))
+                self.w2_shared = nnx.Param(w2_shared_value, out_sharding=P(None, None))
+
+                if hasattr(self, "w1_shared_scale"):
+                    del self.w1_shared_scale
+                self.w1_shared_scale = nnx.Param(
+                    w1_shared_scale.reshape(
+                        1,
+                        1,
+                        w1_shared_scale.shape[0],
+                    ),
+                    out_sharding=P(None, None, None),
+                )
+
+                if hasattr(self, "w3_shared_scale"):
+                    del self.w3_shared_scale
+                self.w3_shared_scale = nnx.Param(
+                    w3_shared_scale.reshape(
+                        1,
+                        1,
+                        w3_shared_scale.shape[0],
+                    ),
+                    out_sharding=P(None, None, None),
+                )
+
+                if hasattr(self, "w2_shared_scale"):
+                    del self.w2_shared_scale
+                self.w2_shared_scale = nnx.Param(
+                    w2_shared_scale.reshape(
+                        1,
+                        1,
+                        w2_shared_scale.shape[0],
+                    ),
+                    out_sharding=P(None, None, None),
+                )
+
     def __call__(
         self,
         hidden_states: jax.Array,
@@ -847,6 +963,20 @@ class FusedEPMoE(nnx.Module):
         w1_shared_val = self.w1_shared.value if self.w1_shared is not None else None
         w3_shared_val = self.w3_shared.value if self.w3_shared is not None else None
         w2_shared_val = self.w2_shared.value if self.w2_shared is not None else None
+        # w1_shared_val = None
+        # w3_shared_val = None
+        # w2_shared_val = None
+
+        w1_scale = self.w1_scale.value if self.w1_scale is not None else None
+        w3_scale = self.w3_scale.value if self.w3_scale is not None else None
+        w2_scale = self.w2_scale.value if self.w2_scale is not None else None
+        w1_shared_scale = self.w1_shared_scale.value if self.w1_shared_scale is not None else None
+        w3_shared_scale = self.w3_shared_scale.value if self.w3_shared_scale is not None else None
+        w2_shared_scale = self.w2_shared_scale.value if self.w2_shared_scale is not None else None
+        # w1_shared_scale = None
+        # w3_shared_scale = None
+        # w2_shared_scale = None
+        subc_quant_wsz = self.subc_quant_wsz if self.subc_quant_wsz is not None else None
 
         output = fused_ep_moe(
             mesh=self.mesh,
@@ -865,13 +995,16 @@ class FusedEPMoE(nnx.Module):
             act_fn=self.activation,
             block_config=block_config,
             # Optional parameters (not used in basic case)
-            subc_quant_wsz=None,
-            w1_scale=None,
-            w2_scale=None,
-            w3_scale=None,
+            subc_quant_wsz=subc_quant_wsz,
+            w1_scale=w1_scale,
+            w2_scale=w2_scale,
+            w3_scale=w3_scale,
             w1_shared=w1_shared_val,
             w2_shared=w2_shared_val,
             w3_shared=w3_shared_val,
+            w1_shared_scale=w1_shared_scale,
+            w2_shared_scale=w2_shared_scale,
+            w3_shared_scale=w3_shared_scale,
             b1=None,
             b2=None,
             b3=None,
@@ -939,7 +1072,10 @@ def create_moe_weights_mapping(
             )
             transpose = False
         elif moe_backend == "fused":
-            sharding = ("tensor", None, None)
+            # Fused MoE kernel shards experts across the full EP mesh, i.e. the
+            # product of ("data", "tensor"). Shard expert dim (axis=0) across
+            # both mesh axes so each device owns a disjoint expert slice.
+            sharding = (("data", "tensor"), None, None)
             transpose = True
         else:
             raise ValueError(f"Unsupported MoE backend: {moe_backend}")

@@ -176,7 +176,7 @@ def prepare_gmm_inputs(
 
 def prepare_fused_moe_inputs(
     case: MoEBenchmarkCase,
-    dtype: jnp.dtype = jnp.bfloat16,
+    weight_dtype: jnp.dtype = jnp.bfloat16,
     mesh: jax.sharding.Mesh | None = None,
     *,
     ep_axis_name: str = "tensor",
@@ -185,28 +185,34 @@ def prepare_fused_moe_inputs(
     se_intermediate_size: int | None = None,
 ) -> Dict[str, jax.Array]:
     if mesh is None:
-        tokens = jnp.empty((case.num_tokens, case.hidden_size), dtype=dtype)
+        tokens = jnp.empty((case.num_tokens, case.hidden_size), dtype=jnp.bfloat16)
         out: dict[str, jax.Array] = {"tokens": tokens}
         if include_weights:
             out["w1"] = jnp.empty(
-                (case.num_experts, case.hidden_size, case.intermediate_size), dtype=dtype
+                (case.num_experts, case.hidden_size, case.intermediate_size), dtype=weight_dtype
             )
             out["w3"] = jnp.empty(
-                (case.num_experts, case.hidden_size, case.intermediate_size), dtype=dtype
+                (case.num_experts, case.hidden_size, case.intermediate_size), dtype=weight_dtype
             )
             out["w2"] = jnp.empty(
                 (case.num_experts, case.intermediate_size, case.hidden_size),
-                dtype=dtype,
+                dtype=weight_dtype,
             )
             if include_shared_expert:
                 if se_intermediate_size is None:
                     se_intermediate_size = case.intermediate_size
-                out["w1_shared"] = jnp.empty((case.hidden_size, se_intermediate_size), dtype=dtype)
-                out["w3_shared"] = jnp.empty((case.hidden_size, se_intermediate_size), dtype=dtype)
-                out["w2_shared"] = jnp.empty((se_intermediate_size, case.hidden_size), dtype=dtype)
+                out["w1_shared"] = jnp.empty(
+                    (case.hidden_size, se_intermediate_size), dtype=weight_dtype
+                )
+                out["w3_shared"] = jnp.empty(
+                    (case.hidden_size, se_intermediate_size), dtype=weight_dtype
+                )
+                out["w2_shared"] = jnp.empty(
+                    (se_intermediate_size, case.hidden_size), dtype=weight_dtype
+                )
 
         # Placeholder router logits (benchmarks may overwrite with custom distributions).
-        router_logits = jnp.zeros((case.num_tokens, case.num_experts), dtype=dtype)
+        router_logits = jnp.zeros((case.num_tokens, case.num_experts), dtype=jnp.bfloat16)
         out["router_logits"] = router_logits
         return out
 
@@ -234,7 +240,7 @@ def prepare_fused_moe_inputs(
     # on multi-host runs it may trigger a cross-host equality check (allgather)
     # of the entire unsharded array and OOM device memory.
     tokens = jax.jit(
-        lambda: jnp.zeros((case.num_tokens, case.hidden_size), dtype=dtype),
+        lambda: jnp.zeros((case.num_tokens, case.hidden_size), dtype=jnp.bfloat16),
         out_shardings=tokens_sharding,
     )()
     out: dict[str, jax.Array] = {"tokens": tokens}
@@ -242,21 +248,21 @@ def prepare_fused_moe_inputs(
         out["w1"] = jax.jit(
             lambda: jnp.zeros(
                 (case.num_experts, case.hidden_size, case.intermediate_size),
-                dtype=dtype,
+                dtype=weight_dtype,
             ),
             out_shardings=w1_sharding,
         )()
         out["w3"] = jax.jit(
             lambda: jnp.zeros(
                 (case.num_experts, case.hidden_size, case.intermediate_size),
-                dtype=dtype,
+                dtype=weight_dtype,
             ),
             out_shardings=w3_sharding,
         )()
         out["w2"] = jax.jit(
             lambda: jnp.zeros(
                 (case.num_experts, case.intermediate_size, case.hidden_size),
-                dtype=dtype,
+                dtype=weight_dtype,
             ),
             out_shardings=w2_sharding,
         )()
@@ -267,28 +273,28 @@ def prepare_fused_moe_inputs(
             out["w1_shared"] = jax.jit(
                 lambda: jnp.zeros(
                     (case.hidden_size, se_intermediate_size),
-                    dtype=dtype,
+                    dtype=weight_dtype,
                 ),
                 out_shardings=se_w1_sharding,
             )()
             out["w3_shared"] = jax.jit(
                 lambda: jnp.zeros(
                     (case.hidden_size, se_intermediate_size),
-                    dtype=dtype,
+                    dtype=weight_dtype,
                 ),
                 out_shardings=se_w3_sharding,
             )()
             out["w2_shared"] = jax.jit(
                 lambda: jnp.zeros(
                     (se_intermediate_size, case.hidden_size),
-                    dtype=dtype,
+                    dtype=weight_dtype,
                 ),
                 out_shardings=se_w2_sharding,
             )()
 
     # Placeholder router logits (benchmarks may overwrite with custom distributions).
     router_logits = jax.jit(
-        lambda: jnp.zeros((case.num_tokens, case.num_experts), dtype=dtype),
+        lambda: jnp.zeros((case.num_tokens, case.num_experts), dtype=jnp.bfloat16),
         out_shardings=logits_sharding,
     )()
     out["router_logits"] = router_logits

@@ -30,6 +30,7 @@ from benchmark.moe.utils import (
     select_cases,
 )
 from benchmark.utils import multiple_iteration_timeit_from_trace
+from sgl_jax.srt.configs.quantization_config import QuantizationConfig
 from sgl_jax.srt.kernels.fused_moe.v1.kernel import (
     FusedMoEBlockConfig,
     validate_fused_moe_block_config,
@@ -52,9 +53,11 @@ def _dtype_packing(dtype: jnp.dtype) -> int:
 def _estimate_vmem_bytes(
     case: MoEBenchmarkCase,
     dtype: jnp.dtype,
+    weight_dtype: jnp.dtype,
     router_dtype: jnp.dtype,
     cfg: FusedMoEBlockConfig,
     use_shared_expert: bool = False,
+    subc_quant_wsz: int | None = None,
     verbose: bool = False,
 ) -> int:
     """Rough VMEM estimate to avoid compile-time OOM (TPU VMEM is 64MB/core).
@@ -62,6 +65,10 @@ def _estimate_vmem_bytes(
     Note: this intentionally overestimates a bit because the fused_moe kernel
     materializes several routing/top-k temporaries (see `get_top_k` in the
     pallas kernel body), which are not part of the explicit scratch buffers.
+
+    Args:
+        subc_quant_wsz: Sub-channel quantization block size for weight scales.
+            When set, adds VMEM for scale scratch buffers.
     """
     bt = cfg.bt
     bts = bt if cfg.bts is None else int(cfg.bts)
@@ -73,7 +80,7 @@ def _estimate_vmem_bytes(
     hidden = case.hidden_size
 
     token_bytes = jnp.dtype(dtype).itemsize
-    weight_bytes = token_bytes
+    weight_bytes = jnp.dtype(weight_dtype).itemsize
     router_bytes = jnp.dtype(router_dtype).itemsize
 
     t_packing = _dtype_packing(dtype)
@@ -101,6 +108,20 @@ def _estimate_vmem_bytes(
     w1 = 2 * bd1 * bf * weight_bytes
     w3 = 2 * bd1 * bf * weight_bytes
     w2 = 2 * bf * bd2 * weight_bytes
+
+    # Scale scratch buffers for quantized weights (F32).
+    # b_w1_scale_x2_vmem: (2, t_packing, bd1 // t_packing // subc_quant_wsz, 1, bf)
+    # b_w3_scale_x2_vmem: (2, t_packing, bd1 // t_packing // subc_quant_wsz, 1, bf)
+    # b_w2_scale_x2_vmem: (2, t_packing, bf // subc_quant_wsz, 1, bd2 // t_packing)
+    w1_scale = 0
+    w3_scale = 0
+    w2_scale = 0
+    if subc_quant_wsz is not None:
+        bd1_per_pack = bd1 // t_packing
+        bd2_per_pack = bd2 // t_packing
+        w1_scale = 2 * t_packing * (bd1_per_pack // subc_quant_wsz) * 1 * bf * 4
+        w3_scale = 2 * t_packing * (bd1_per_pack // subc_quant_wsz) * 1 * bf * 4
+        w2_scale = 2 * t_packing * (bf // subc_quant_wsz) * 1 * bd2_per_pack * 4
 
     # b_acc_vmem is F32(2, a2a_max_tokens, 1, bf)
     b_acc = 2 * a2a_max_tokens * bf * 4
@@ -144,20 +165,44 @@ def _estimate_vmem_bytes(
         + w1
         + w3
         + w2
+        + w1_scale
+        + w3_scale
+        + w2_scale
         + b_acc
         + t_stage_b32
         + a2a_s_acc_stage_b32
         + routing_temporaries
     )
 
+    # Shared expert scratch buffers.
+    se_w1 = 0
+    se_w3 = 0
+    se_w2 = 0
+    se_tokens = 0
+    se_w1_scale = 0
+    se_w3_scale = 0
+    se_w2_scale = 0
     if use_shared_expert:
-        se_w1 = 2 * bd1 * cfg.bse * weight_bytes  # (2, t_packing, bd/pack, bse)
-        se_w3 = 2 * bd1 * cfg.bse * weight_bytes
-        se_w2 = 2 * cfg.bse * bd2 * weight_bytes
+        bse = cfg.bse
+        se_w1 = 2 * bd1 * bse * weight_bytes  # (2, t_packing, bd/pack, bse)
+        se_w3 = 2 * bd1 * bse * weight_bytes
+        se_w2 = 2 * bse * bd2 * weight_bytes
         # Matches fused_moe kernel scratch shape (bt ping-pong x bd1-slice ping-pong):
         # (2, 2, bt, t_packing, bd1_per_pack) => 4 * bt * bd1 elements.
         se_tokens = 4 * bt * bd1 * token_bytes
         total_bytes += se_w1 + se_w3 + se_w2 + se_tokens
+
+        # Shared expert scale scratch buffers (F32).
+        # b_se_w1_scale_x2_vmem: (2, t_packing, bd1 // t_packing // subc_quant_wsz, 1, bse)
+        # b_se_w3_scale_x2_vmem: (2, t_packing, bd1 // t_packing // subc_quant_wsz, 1, bse)
+        # b_se_w2_scale_x2_vmem: (2, t_packing, bse // subc_quant_wsz, 1, bd2 // t_packing)
+        if subc_quant_wsz is not None:
+            bd1_per_pack = bd1 // t_packing
+            bd2_per_pack = bd2 // t_packing
+            se_w1_scale = 2 * t_packing * (bd1_per_pack // subc_quant_wsz) * 1 * bse * 4
+            se_w3_scale = 2 * t_packing * (bd1_per_pack // subc_quant_wsz) * 1 * bse * 4
+            se_w2_scale = 2 * t_packing * (bse // subc_quant_wsz) * 1 * bd2_per_pack * 4
+            total_bytes += se_w1_scale + se_w3_scale + se_w2_scale
 
     if verbose:
 
@@ -174,6 +219,21 @@ def _estimate_vmem_bytes(
         print(
             f"      b_w2_x2_vmem:           {_mb(w2)} MB  (2, {t_packing}, {bf}, {bd2 // t_packing})"
         )
+        if subc_quant_wsz is not None:
+            bd1_per_pack = bd1 // t_packing
+            bd2_per_pack = bd2 // t_packing
+            print(
+                f"      b_w1_scale_x2_vmem:     {_mb(w1_scale)} MB  "
+                f"(2, {t_packing}, {bd1_per_pack // subc_quant_wsz}, 1, {bf}) f32"
+            )
+            print(
+                f"      b_w3_scale_x2_vmem:     {_mb(w3_scale)} MB  "
+                f"(2, {t_packing}, {bd1_per_pack // subc_quant_wsz}, 1, {bf}) f32"
+            )
+            print(
+                f"      b_w2_scale_x2_vmem:     {_mb(w2_scale)} MB  "
+                f"(2, {t_packing}, {bf // subc_quant_wsz}, 1, {bd2_per_pack}) f32"
+            )
         print(f"      b_acc_vmem:             {_mb(b_acc)} MB  (2, {a2a_max_tokens}, 1, {bf}) f32")
         print(f"      b_output_x2_vmem:       {_mb(b_output)} MB  (2, {bt}, {hidden})")
         print(
@@ -188,18 +248,34 @@ def _estimate_vmem_bytes(
         print(f"      b_gating_x2_vmem:       {_mb(b_gating)} MB  (2, {bt}, {padded_num_experts})")
         print(f"      routing_temporaries:    {_mb(routing_temporaries)} MB")
         if use_shared_expert:
+            bse = cfg.bse
             print(
-                f"      b_se_w1_x2_vmem:        {_mb(se_w1)} MB  (2, {t_packing}, {bd1 // t_packing}, {bf})"
+                f"      b_se_w1_x2_vmem:        {_mb(se_w1)} MB  (2, {t_packing}, {bd1 // t_packing}, {bse})"
             )
             print(
-                f"      b_se_w3_x2_vmem:        {_mb(se_w3)} MB  (2, {t_packing}, {bd1 // t_packing}, {bf})"
+                f"      b_se_w3_x2_vmem:        {_mb(se_w3)} MB  (2, {t_packing}, {bd1 // t_packing}, {bse})"
             )
             print(
-                f"      b_se_w2_x2_vmem:        {_mb(se_w2)} MB  (2, {t_packing}, {bf}, {bd2 // t_packing})"
+                f"      b_se_w2_x2_vmem:        {_mb(se_w2)} MB  (2, {t_packing}, {bse}, {bd2 // t_packing})"
             )
             print(
                 f"      b_se_tokens_vmem:       {_mb(se_tokens)} MB  (2, 2, {bt}, {t_packing}, {bd1 // t_packing})"
             )
+            if subc_quant_wsz is not None:
+                bd1_per_pack = bd1 // t_packing
+                bd2_per_pack = bd2 // t_packing
+                print(
+                    f"      b_se_w1_scale_x2_vmem:  {_mb(se_w1_scale)} MB  "
+                    f"(2, {t_packing}, {bd1_per_pack // subc_quant_wsz}, 1, {bse}) f32"
+                )
+                print(
+                    f"      b_se_w3_scale_x2_vmem:  {_mb(se_w3_scale)} MB  "
+                    f"(2, {t_packing}, {bd1_per_pack // subc_quant_wsz}, 1, {bse}) f32"
+                )
+                print(
+                    f"      b_se_w2_scale_x2_vmem:  {_mb(se_w2_scale)} MB  "
+                    f"(2, {t_packing}, {bse // subc_quant_wsz}, 1, {bd2_per_pack}) f32"
+                )
         print("      ----------------------------")
         print(f"      Total:                  {_mb(total_bytes)} MB")
 
@@ -209,6 +285,7 @@ def _estimate_vmem_bytes(
 def select_block_configs(
     case: MoEBenchmarkCase,
     dtype: jnp.dtype,
+    weight_dtype: jnp.dtype,
     router_dtype: jnp.dtype,
     *,
     bt_candidates: list[int],
@@ -219,6 +296,7 @@ def select_block_configs(
     tpu_vmem_budget_bytes: int,
     max_configs: int,
     use_shared_expert: bool = False,
+    subc_quant_wsz: int | None = None,
 ) -> list[FusedMoEBlockConfig]:
     """Enumerate block configs from the explicit candidate lists."""
     t_packing = _dtype_packing(dtype)
@@ -312,7 +390,13 @@ def select_block_configs(
 
         # Pass use_shared_expert to estimate correct VMEM
         est = _estimate_vmem_bytes(
-            case, dtype, router_dtype, cfg, use_shared_expert=use_shared_expert
+            case,
+            dtype,
+            weight_dtype,
+            router_dtype,
+            cfg,
+            use_shared_expert=use_shared_expert,
+            subc_quant_wsz=subc_quant_wsz,
         )
         if est > tpu_vmem_budget_bytes:
             return (
@@ -448,6 +532,7 @@ def select_block_configs(
 def run_all(
     iters: int,
     dtype: jnp.dtype = jnp.bfloat16,
+    weight_dtype: jnp.dtype = jnp.bfloat16,  # Quantize the weight dtype, the activation's dtype always is bfloat16
     *,
     warmup_iters: int = 1,
     tune_block_config: bool = False,
@@ -515,7 +600,7 @@ def run_all(
     if tune_block_config:
         from sgl_jax.srt.utils.jax_utils import get_device_name
 
-    print(f"Running fused_moe benchmarks with dtype={dtype}")
+    print(f"Running fused_moe benchmarks with weight_dtype={weight_dtype}")
     print(f"  features: shared_expert={use_shared_expert}, grouped_topk={use_grouped_topk}")
     print(
         "  shape: "
@@ -525,7 +610,7 @@ def run_all(
     )
 
     for case in cases:
-        t_packing = _dtype_packing(dtype)
+        t_packing = _dtype_packing(jnp.bfloat16)
         mesh = build_mesh(ep_size=case.ep_size, tp_size=case.tp_size)
         mesh_ep = mesh.shape["tensor"]
         if mesh_ep != case.ep_size:
@@ -547,7 +632,7 @@ def run_all(
         )
         data = prepare_fused_moe_inputs(
             case,
-            dtype=dtype,
+            weight_dtype=weight_dtype,
             mesh=mesh,
             include_weights=False,
             include_shared_expert=use_shared_expert,
@@ -573,23 +658,36 @@ def run_all(
         data["router_logits"] = jax.device_put(
             custom_logits, jax.sharding.NamedSharding(mesh, P("tensor", None))
         )
+        # Determine subc_quant_wsz for FP8 quantization
+        subc_quant_wsz = 256 if weight_dtype == jnp.float8_e4m3fn else None
+
         block_cfgs: list[FusedMoEBlockConfig | None]
         if tune_block_config:
             block_cfgs = select_block_configs(
                 case,
                 dtype,
+                weight_dtype=weight_dtype,
                 router_dtype=data["router_logits"].dtype,
                 bt_candidates=bt_candidates or [2, 4, 8, 16, 32, 64, 128, 256, 512],
                 bts_candidates=bts_candidates,
                 bf_candidates=bf_candidates or [128, 256, 512, 1024, 2048],
                 bd_candidates=bd_candidates or [256, 512, 1024, 2048, 4096, 8192],
-                bse_candidates=bse_candidates,
+                bse_candidates=bse_candidates or [128, 256, 512, 1024, 2048, 4096, 8192],
                 tpu_vmem_budget_bytes=tpu_vmem_budget_bytes,
                 max_configs=max_configs,
                 use_shared_expert=use_shared_expert,
+                subc_quant_wsz=subc_quant_wsz,
             )
         else:
             block_cfgs = [None]
+
+        if weight_dtype == jnp.float8_e4m3fn:
+            quantization_config = QuantizationConfig(
+                moe_weight_dtype=weight_dtype,
+                moe_activation_dtype=None,  # activation is bfloat16
+            )
+        else:
+            quantization_config = None
 
         with jax.set_mesh(mesh):
             fused_layer = FusedEPMoE(
@@ -599,8 +697,8 @@ def run_all(
                 ep_size=case.ep_size,
                 mesh=mesh,
                 intermediate_dim=case.intermediate_size,
-                weight_dtype=dtype,
-                dtype=dtype,
+                weight_dtype=jnp.bfloat16,
+                dtype=jnp.bfloat16,
                 activation=case.activation,
                 layer_id=0,
                 renormalize_topk_logits=case.renormalize_topk_logits,
@@ -611,7 +709,10 @@ def run_all(
                 moe_shared_expert_intermediate_size=(
                     case.intermediate_size if use_shared_expert else None
                 ),
+                quantization_config=quantization_config,
             )
+            if quantization_config is not None:
+                fused_layer.quantize_weights()
 
             moe_def, moe_state = nnx.split(fused_layer)
             moe_state_leaves, moe_state_def = jax.tree_util.tree_flatten(moe_state)
@@ -633,10 +734,12 @@ def run_all(
                     )
                     vmem_bytes = _estimate_vmem_bytes(
                         case,
-                        dtype,
+                        jnp.bfloat16,
+                        weight_dtype,
                         data["router_logits"].dtype,
                         block_cfg,
                         use_shared_expert=use_shared_expert,
+                        subc_quant_wsz=subc_quant_wsz,
                         verbose=True,
                     )
                     vmem_mb = vmem_bytes / (1024 * 1024)
@@ -717,6 +820,7 @@ def run_all(
                     device_name = get_device_name()
                     table_key = (
                         jnp.dtype(dtype).name,
+                        jnp.dtype(weight_dtype).name,
                         case.num_tokens,
                         case.num_experts,
                         case.top_k,
@@ -769,6 +873,13 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=1,
         help="Number of warmup iterations before profiling (per case / block_config).",
+    )
+    parser.add_argument(
+        "--weight-dtype",
+        type=str,
+        default="bfloat16",
+        help="Data type to benchmark.",
+        choices=["bfloat16", "float8_e4m3fn"],
     )
     parser.add_argument(
         "--tune-block-config",
@@ -895,6 +1006,19 @@ if __name__ == "__main__":
     except Exception:
         pass
     args = parse_args()
+    DTYPE_MAP = {
+        "int8": jnp.int8,
+        "float8_e4m3fn": jnp.float8_e4m3fn,
+        "float8_e5m2": jnp.float8_e5m2,
+        "bfloat16": jnp.bfloat16,
+        "float32": jnp.float32,
+        None: None,
+    }
+    if args.weight_dtype not in DTYPE_MAP:
+        raise ValueError(
+            f"Unsupported dtype: {args.weight_dtype}. Supported: {list(DTYPE_MAP.keys())}"
+        )
+    weight_dtype = DTYPE_MAP[args.weight_dtype]
     if args.compilation_cache_dir:
         _compilation_cache.set_cache_dir(args.compilation_cache_dir)
     tpu_vmem_budget_bytes = int(args.tpu_vmem_budget_mb) * 1024 * 1024
@@ -902,6 +1026,7 @@ if __name__ == "__main__":
     try:
         run_all(
             args.iters,
+            weight_dtype=weight_dtype,
             warmup_iters=args.warmup_iters,
             tune_block_config=args.tune_block_config,
             bt_candidates=args.bt_candidates,
