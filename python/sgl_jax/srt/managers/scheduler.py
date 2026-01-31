@@ -262,6 +262,19 @@ class Scheduler(
                 device_indexes=server_args.device_indexes,
             )
 
+        if server_args.moe_backend == "fused":
+            mesh_ep_size = self.mesh.shape.get("data", 1) * self.mesh.shape.get("tensor", 1)
+            if server_args.ep_size != mesh_ep_size:
+                logger.warning(
+                    "moe_backend='fused' uses EP size = mesh(data*tensor)=%d, but --ep-size=%d. "
+                    "If you expected separate EP and TP (e.g. ep_size=%d, tp_size=%d), note that the "
+                    "fused MoE kernel currently treats the full 2D mesh as its EP group.",
+                    mesh_ep_size,
+                    server_args.ep_size,
+                    server_args.ep_size,
+                    server_args.tp_size,
+                )
+
         TpWorkerClass = ModelWorkerClient if self.enable_overlap else ModelWorker
 
         self.tp_worker = TpWorkerClass(
