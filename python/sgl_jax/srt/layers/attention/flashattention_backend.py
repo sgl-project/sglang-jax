@@ -510,6 +510,8 @@ class FlashAttention(AttentionBackend):
         if hasattr(token_to_kv_pool, "remap_cache_loc") and self.page_size == 1:
             page_indices_arg = token_to_kv_pool.remap_cache_loc(page_indices_arg, layer.layer_id)
 
+        decode_mode = 1 if forward_batch.forward_mode == ForwardMode.DECODE else 0
+
         in_specs = (
             P(self.attention_data_partition_axis, self.kv_partition_axis),  # queries
             P(self.attention_data_partition_axis, self.kv_partition_axis),  # keys (new tokens)
@@ -543,6 +545,7 @@ class FlashAttention(AttentionBackend):
                 kv_cache_fused,
                 *other_args,
                 causal=causal,
+                decode_mode=decode_mode,
                 sm_scale=scale,
                 sliding_window=layer.sliding_window_size,
                 soft_cap=layer.logit_cap,

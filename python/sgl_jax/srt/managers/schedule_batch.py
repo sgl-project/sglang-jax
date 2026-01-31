@@ -532,6 +532,7 @@ def acc_global_bid():
 @dataclasses.dataclass
 class ScheduleReqsInfo:
     """Store per-DP information for a batch of requests."""
+
     # Requests assigned to this DP rank
     reqs: list[Req] = None
     chunked_req: Req | None = None
@@ -578,6 +579,7 @@ class ScheduleBatch:
 
     # Per-DP request information (list of length dp_size)
     reqs_info: list[ScheduleReqsInfo] = None
+    bid: int = None
 
     # Memory pool and cache (shared across all DP ranks)
     req_to_token_pool: ReqToTokenPool = None
@@ -1179,9 +1181,12 @@ class ScheduleBatch:
         req.reset_for_retract()
 
     def retract_all(self, server_args: ServerArgs):
-        retracted_reqs = self.reqs
-        for idx in range(len(self.reqs)):
-            self.release_req(idx, len(self.reqs) - idx, server_args)
+        retracted_reqs = [
+            req for info in self.reqs_info for req in (info.reqs if info.reqs else [])
+        ]
+        for dp_rank, dp_reqs in enumerate(self.reqs_info):
+            for idx, _ in enumerate(dp_reqs.reqs):
+                self.release_req(idx, dp_rank, len(dp_reqs.reqs) - 1, server_args)
 
         self.filter_batch(retracted_reqs)
         return retracted_reqs
@@ -1862,31 +1867,6 @@ class ScheduleBatch:
         if precision_tracer.get_trace_active():
             self._generate_trace_info(real_bs, bid)
 
-<<<<<<< HEAD
-        # Extract lora_ids from requests
-        lora_ids = [req.lora_id for req in self.reqs]
-        # Pad lora_ids to match seq_lens_cpu length (after bs padding)
-        if bs_padding_size > 0:
-            lora_ids = lora_ids + [None] * bs_padding_size
-        input_embedding = None
-        if self.forward_mode == ForwardMode.EXTEND:
-            input_embedding_list = []
-            for req, prefix_len, extend_len in zip(self.reqs, self.prefix_lens, self.extend_lens):
-                if hasattr(req, "multimodal_embedding") and req.multimodal_embedding is not None:
-                    mm_full = np.asarray(req.multimodal_embedding)
-                    start = int(prefix_len or 0)
-                    end = start + int(extend_len or 0)
-                    input_embedding_list.append(mm_full[start:end])
-            if input_embedding_list:
-                input_embedding = np.concatenate(input_embedding_list, axis=0)
-                if len(input_embedding) < len(input_ids_cpu):
-                    pad_rows = len(input_ids_cpu) - len(input_embedding)
-                    pad = np.zeros(
-                        (pad_rows, input_embedding.shape[1]),
-                        dtype=input_embedding.dtype,
-                    )
-                    input_embedding = np.concatenate([input_embedding, pad], axis=0)
-=======
         # Step 7: Collect lora_ids from all requests
         all_reqs = []
         for info in self.reqs_info:
@@ -1900,7 +1880,25 @@ class ScheduleBatch:
             # Pad to total_bs
             lora_ids = lora_ids + ["0"] * (total_bs - real_bs)
 
->>>>>>> a165a76c (feat: allocator with dp (#591))
+        input_embedding = None
+        # if self.forward_mode == ForwardMode.EXTEND:
+        #     input_embedding_list = []
+        #     for req, prefix_len, extend_len in zip(all_reqs, self.prefix_lens, self.extend_lens):
+        #         if hasattr(req, "multimodal_embedding") and req.multimodal_embedding is not None:
+        #             mm_full = np.asarray(req.multimodal_embedding)
+        #             start = int(prefix_len or 0)
+        #             end = start + int(extend_len or 0)
+        #             input_embedding_list.append(mm_full[start:end])
+        #     if input_embedding_list:
+        #         input_embedding = np.concatenate(input_embedding_list, axis=0)
+        #         if len(input_embedding) < len(input_ids_cpu):
+        #             pad_rows = len(input_ids_cpu) - len(input_embedding)
+        #             pad = np.zeros(
+        #                 (pad_rows, input_embedding.shape[1]),
+        #                 dtype=input_embedding.dtype,
+        #             )
+        #             input_embedding = np.concatenate([input_embedding, pad], axis=0)
+
         return ModelWorkerBatch(
             bid=bid,
             forward_mode=self.forward_mode,
@@ -2165,12 +2163,9 @@ class ScheduleBatch:
             return_logprob=self.return_logprob,
             return_output_logprob_only=self.return_output_logprob_only,
             is_prefill_only=self.is_prefill_only,
-<<<<<<< HEAD
             bid=self.bid,
-=======
             dp_size=self.dp_size,
             per_dp_bs_size=self.per_dp_bs_size,
->>>>>>> a165a76c (feat: allocator with dp (#591))
         )
 
     def _evict_tree_cache_if_needed(self, num_tokens_per_dp: dict[int, int]) -> None:
