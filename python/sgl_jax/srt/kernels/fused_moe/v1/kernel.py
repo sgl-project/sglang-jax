@@ -508,6 +508,7 @@ def _fused_ep_moe_kernel(
     b_se_w1_scale_all,  # None | <sew_sem_id> (1, 1, se_inter_size)
     b_se_w3_scale_all,  # None | <sew_sem_id> (1, 1, se_inter_size)
     b_se_w2_scale_all,  # None | <sew_sem_id> (1, 1, hidden_size)
+    b_se_acc_vmem,  # None | F32(2, bt, hidden_size)
     ### Semaphores:
     token_stage_x2_sems,  # DMA(2,): <token_buf_id>
     acc_stage_x3_sems,  # DMA(3,): <acc_buf_id>
@@ -1916,18 +1917,18 @@ def _fused_ep_moe_kernel(
                 output_tile += acc_tile * logits
 
             out_offset = pl.multiple_of(out_offset, 16)
+
+            # Add SE result (F32) directly - no dtype conversion needed
+            if w1_shared_hbm is not None:
+                se_tile = b_se_acc_vmem[
+                    out_buf_id, pl.ds(out_offset, acc_bt), pl.ds(0, hidden_size)
+                ]
+                output_tile = output_tile.reshape(acc_bt, hidden_size) + se_tile
+
             target_slice = b_output_x2_vmem.at[
                 out_buf_id, pl.ds(out_offset, acc_bt), pl.ds(0, hidden_size)
             ]
-
-            if w1_shared_hbm is not None:
-                current_val = target_slice[...].astype(jnp.float32)
-                new_val = current_val + output_tile.reshape(acc_bt, hidden_size)
-                target_slice[...] = new_val.astype(output_hbm.dtype)
-            else:
-                target_slice[...] = output_tile.reshape(acc_bt, hidden_size).astype(
-                    output_hbm.dtype
-                )
+            target_slice[...] = output_tile.reshape(acc_bt, hidden_size).astype(output_hbm.dtype)
 
         start_load_acc_bt(tile_start=0, buf_id=0)
 
@@ -2098,19 +2099,18 @@ def _fused_ep_moe_kernel(
                         s_down = jnp.broadcast_to(s_down, acc_chunk.shape)
                         acc_chunk *= s_down
 
-                    out_slice = b_output_x2_vmem.at[
+                    # Write to F32 accumulator buffer - no dtype conversion needed
+                    out_slice = b_se_acc_vmem.at[
                         out_buf_id, pl.ds(0, bt), pl.ds(hidden_offset, bd2_per_t_packing)
                     ]
 
                     @pl.when(block_id == 0)
                     def _(out_slice=out_slice, acc_chunk=acc_chunk):
-                        out_slice[...] = acc_chunk.astype(t_dtype)
+                        out_slice[...] = acc_chunk
 
                     @pl.when(block_id > 0)
                     def _(out_slice=out_slice, acc_chunk=acc_chunk):
-                        out_slice[...] = (out_slice[...].astype(jnp.float32) + acc_chunk).astype(
-                            t_dtype
-                        )
+                        out_slice[...] = out_slice[...] + acc_chunk
 
             lax.fori_loop(0, num_bd2, body_w2, None)
 
@@ -2735,6 +2735,9 @@ def fused_ep_moe(
         (
             None if w2_shared_scale is None else pltpu.VMEM((1, 1, hidden_size), jnp.float32)
         ),  # b_se_w2_scale_all
+        (
+            None if w1_shared is None else pltpu.VMEM((2, bt, hidden_size), jnp.float32)
+        ),  # b_se_acc_vmem
         # Semaphores.
         pltpu.SemaphoreType.DMA((2,)),  # token_stage_x2_sems
         pltpu.SemaphoreType.DMA((3,)),  # acc_stage_x3_sems

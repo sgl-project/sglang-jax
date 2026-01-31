@@ -484,11 +484,11 @@ class BailingMoEForCausalLM(nnx.Module):
             mesh=self.mesh,
             dtype=self.dtype,
         )
-        weight_mappings = self._create_bailing_moe_weight_mappings()
+        weight_mappings = self._create_bailing_moe_weight_mappings(model_config)
         loader.load_weights_from_safetensors(weight_mappings)
         logger.info("Weights loaded successfully!")
 
-    def _create_bailing_moe_weight_mappings(self) -> dict:
+    def _create_bailing_moe_weight_mappings(self, model_config: ModelConfig) -> dict:
         mappings = {
             "model.word_embeddings.weight": WeightMapping(
                 target_path="model.embed_tokens.embedding",
@@ -508,15 +508,20 @@ class BailingMoEForCausalLM(nnx.Module):
         num_layers = self.config.num_hidden_layers
         first_k_dense_replace = self.config.first_k_dense_replace
 
+        quant_config = getattr(model_config, "quantization_config", None)
+        is_static_quant = quant_config is not None and quant_config.is_static_checkpoint
+
         for layer_idx in range(num_layers):
             layer_mappings = self._create_moe_layer_mappings(
-                layer_idx, layer_idx < first_k_dense_replace
+                layer_idx, layer_idx < first_k_dense_replace, is_static_quant=is_static_quant
             )
             mappings.update(layer_mappings)
 
         return mappings
 
-    def _create_moe_layer_mappings(self, layer_idx: int, is_mlp_layer: bool) -> dict:
+    def _create_moe_layer_mappings(
+        self, layer_idx: int, is_mlp_layer: bool, is_static_quant: bool = False
+    ) -> dict:
         prefix = f"model.layers.{layer_idx}"
         target_prefix = f"model.layers.{layer_idx}"
 
@@ -531,7 +536,44 @@ class BailingMoEForCausalLM(nnx.Module):
                 sharding=(None,),
                 transpose=False,
             ),
-            f"{prefix}.attention.query_key_value.weight": WeightMapping(
+        }
+
+        if is_static_quant:
+            # QKV
+            mappings[f"{prefix}.attention.query_key_value.weight"] = WeightMapping(
+                target_path=[
+                    f"{target_prefix}.self_attn.q_proj.weight_q",
+                    f"{target_prefix}.self_attn.k_proj.weight_q",
+                    f"{target_prefix}.self_attn.v_proj.weight_q",
+                ],
+                sharding=("tensor", None),
+                transpose=False,
+                kv_head_padding=True,
+            )
+            mappings[f"{prefix}.attention.query_key_value.weight_scale"] = WeightMapping(
+                target_path=[
+                    f"{target_prefix}.self_attn.q_proj.weight_scale",
+                    f"{target_prefix}.self_attn.k_proj.weight_scale",
+                    f"{target_prefix}.self_attn.v_proj.weight_scale",
+                ],
+                sharding=("tensor", None),
+                transpose=False,
+                kv_head_padding=True,
+            )
+
+            # Dense
+            mappings[f"{prefix}.attention.dense.weight"] = WeightMapping(
+                target_path=f"{target_prefix}.self_attn.c_proj.weight_q",
+                sharding=(None, "tensor"),
+                transpose=False,
+            )
+            mappings[f"{prefix}.attention.dense.weight_scale"] = WeightMapping(
+                target_path=f"{target_prefix}.self_attn.c_proj.weight_scale",
+                sharding=(None, None),
+                transpose=False,
+            )
+        else:
+            mappings[f"{prefix}.attention.query_key_value.weight"] = WeightMapping(
                 target_path=[
                     f"{target_prefix}.self_attn.q_proj.weight",
                     f"{target_prefix}.self_attn.k_proj.weight",
@@ -540,45 +582,60 @@ class BailingMoEForCausalLM(nnx.Module):
                 sharding=(None, "tensor"),
                 transpose=True,
                 kv_head_padding=True,
-            ),
-            f"{prefix}.attention.dense.weight": WeightMapping(
+            )
+            mappings[f"{prefix}.attention.dense.weight"] = WeightMapping(
                 target_path=f"{target_prefix}.self_attn.c_proj.weight",
                 sharding=("tensor", None),
                 transpose=True,
-            ),
-        }
+            )
 
+        # QK Norm
         if getattr(self.config, "use_qk_norm", True):
             mappings[f"{prefix}.attention.query_layernorm.weight"] = WeightMapping(
-                target_path=f"{target_prefix}.self_attn.q_norm.scale",
-                sharding=(None,),
-                transpose=False,
+                target_path=f"{target_prefix}.self_attn.q_norm.scale", sharding=(None,)
             )
             mappings[f"{prefix}.attention.key_layernorm.weight"] = WeightMapping(
-                target_path=f"{target_prefix}.self_attn.k_norm.scale",
-                sharding=(None,),
-                transpose=False,
+                target_path=f"{target_prefix}.self_attn.k_norm.scale", sharding=(None,)
             )
 
         if is_mlp_layer:
-            mlp_mappings = {
-                f"{prefix}.mlp.gate_proj.weight": WeightMapping(
-                    target_path=f"{target_prefix}.mlp.gate_proj.weight",
-                    sharding=(None, "tensor"),
-                    transpose=True,
-                ),
-                f"{prefix}.mlp.up_proj.weight": WeightMapping(
-                    target_path=f"{target_prefix}.mlp.up_proj.weight",
-                    sharding=(None, "tensor"),
-                    transpose=True,
-                ),
-                f"{prefix}.mlp.down_proj.weight": WeightMapping(
-                    target_path=f"{target_prefix}.mlp.down_proj.weight",
-                    sharding=("tensor", None),
-                    transpose=True,
-                ),
-            }
-            mappings.update(mlp_mappings)
+
+            def add_mlp_mapping(hf_name, target_name, sharding_std):
+                full_hf_key = f"{prefix}.mlp.{hf_name}.weight"
+                if is_static_quant:
+                    sharding_quant = (
+                        (sharding_std[1], sharding_std[0])
+                        if len(sharding_std) == 2
+                        else sharding_std
+                    )
+
+                    mappings[full_hf_key] = WeightMapping(
+                        target_path=f"{target_prefix}.mlp.{target_name}.weight_q",
+                        sharding=sharding_quant,
+                        transpose=False,
+                    )
+
+                    scale_key = f"{prefix}.mlp.{hf_name}.weight_scale"
+                    scale_sharding = (sharding_quant[0],)
+                    if target_name == "down_proj":
+                        scale_sharding = (None,)
+
+                    mappings[scale_key] = WeightMapping(
+                        target_path=f"{target_prefix}.mlp.{target_name}.weight_scale",
+                        sharding=scale_sharding,
+                        transpose=False,
+                    )
+                else:
+                    mappings[full_hf_key] = WeightMapping(
+                        target_path=f"{target_prefix}.mlp.{target_name}.weight",
+                        sharding=sharding_std,
+                        transpose=True,
+                    )
+
+            add_mlp_mapping("gate_proj", "gate_proj", (None, "tensor"))
+            add_mlp_mapping("up_proj", "up_proj", (None, "tensor"))
+            add_mlp_mapping("down_proj", "down_proj", ("tensor", None))
+
         else:
             mappings[f"{prefix}.mlp.gate.weight"] = WeightMapping(
                 target_path=f"{target_prefix}.moe_gate.kernel",
@@ -587,14 +644,16 @@ class BailingMoEForCausalLM(nnx.Module):
             )
             if getattr(self.config, "moe_router_enable_expert_bias", False):
                 mappings[f"{prefix}.mlp.gate.expert_bias"] = WeightMapping(
-                    target_path=f"{target_prefix}.moe_gate.bias",
-                    sharding=(None,),
-                    transpose=False,
+                    target_path=f"{target_prefix}.moe_gate.bias", sharding=(None,)
                 )
 
             num_experts = getattr(self.config, "num_experts", 256)
             moe_backend = getattr(self.config, "moe_backend", "epmoe")
             use_fused = moe_backend == "fused"
+
+            BLOCK_SIZE = 256
+            hidden_size = self.config.hidden_size
+            inter_size = getattr(self.config, "moe_intermediate_size", 2048)
 
             moe_mappings = create_moe_weights_mapping(
                 prefix=prefix,
@@ -603,44 +662,159 @@ class BailingMoEForCausalLM(nnx.Module):
                 expert_type_names=("gate_proj", "up_proj", "down_proj"),
                 moe_backend=moe_backend,
             )
-            mappings.update(moe_mappings)
 
-            if getattr(self.config, "num_shared_experts", 0) > 0:
+            if is_static_quant:
+                new_moe_mappings = {}
+                for key, mapping in moe_mappings.items():
+                    target_param = mapping.target_path[0]
+                    src_paths = mapping.target_path[1:]
+
+                    new_moe_mappings[key] = WeightMapping(
+                        target_path=[target_param] + src_paths,
+                        sharding=mapping.sharding,
+                        transpose=mapping.transpose,
+                        concat_axis=mapping.concat_axis,
+                    )
+
+                    scale_key = key + "_scale"
+                    target_scale_param = target_param + "_scale"
+                    scale_src_paths = [p.replace(".weight", ".weight_scale") for p in src_paths]
+
+                    is_w2 = target_param.endswith("w2") or target_param.endswith("wo")
+                    out_dim = hidden_size if is_w2 else inter_size
+
+                    if use_fused:
+                        in_dim = inter_size if is_w2 else hidden_size
+                        num_blocks = in_dim // BLOCK_SIZE
+                        scale_reshape = (num_experts, 1, 1, out_dim)
+                        scale_repeat = (1, num_blocks)
+
+                        scale_sharding = None
+                        if mapping.sharding:
+                            scale_sharding = (
+                                mapping.sharding[0],
+                                mapping.sharding[1],
+                                None,
+                                mapping.sharding[2],
+                            )
+
+                        new_moe_mappings[scale_key] = WeightMapping(
+                            target_path=[target_scale_param] + scale_src_paths,
+                            sharding=scale_sharding,
+                            transpose=False,
+                            reshape=scale_reshape,
+                            repeat=scale_repeat,
+                            concat_axis=mapping.concat_axis,
+                        )
+
+                    else:
+                        scale_reshape = (num_experts, 1, 1, out_dim)
+                        scale_repeat = None
+                        scale_sharding = None
+                        if mapping.sharding:
+                            target_dim_sharding = None
+                            if is_w2 and len(mapping.sharding) > 2:
+                                target_dim_sharding = mapping.sharding[2]
+                            elif not is_w2 and len(mapping.sharding) > 1:
+                                target_dim_sharding = mapping.sharding[1]
+                            scale_sharding = (mapping.sharding[0], target_dim_sharding, None)
+
+                        new_moe_mappings[scale_key] = WeightMapping(
+                            target_path=[target_scale_param] + scale_src_paths,
+                            sharding=scale_sharding,
+                            transpose=False,
+                            reshape=scale_reshape,
+                            repeat=scale_repeat,
+                            concat_axis=mapping.concat_axis,
+                        )
+
+                mappings.update(new_moe_mappings)
+            else:
+                mappings.update(moe_mappings)
+
+            num_shared = getattr(self.config, "num_shared_experts", 0)
+            if num_shared > 0:
                 if use_fused:
-                    mappings[f"{prefix}.mlp.shared_experts.gate_proj.weight"] = WeightMapping(
-                        target_path=f"{target_prefix}.mlp.w1_shared",
-                        sharding=(None, None),
-                        transpose=True,
-                    )
-                    mappings[f"{prefix}.mlp.shared_experts.up_proj.weight"] = WeightMapping(
-                        target_path=f"{target_prefix}.mlp.w3_shared",
-                        sharding=(None, None),
-                        transpose=True,
-                    )
-                    mappings[f"{prefix}.mlp.shared_experts.down_proj.weight"] = WeightMapping(
-                        target_path=f"{target_prefix}.mlp.w2_shared",
-                        sharding=(None, None),
-                        transpose=True,
-                    )
+                    shared_map = [
+                        ("gate_proj", "w1_shared"),
+                        ("up_proj", "w3_shared"),
+                        ("down_proj", "w2_shared"),
+                    ]
+
+                    for hf_name, target_name in shared_map:
+                        full_hf_key = f"{prefix}.mlp.shared_experts.{hf_name}.weight"
+                        target_path = f"{target_prefix}.mlp.{target_name}"
+
+                        if is_static_quant:
+                            mappings[full_hf_key] = WeightMapping(
+                                target_path=target_path,
+                                sharding=(None, None),
+                                transpose=True,
+                            )
+                            scale_key = f"{prefix}.mlp.shared_experts.{hf_name}.weight_scale"
+
+                            is_w2 = "down_proj" in hf_name
+                            se_inter = (
+                                getattr(self.config, "moe_shared_expert_intermediate_size", 2048)
+                                * num_shared
+                            )
+                            out_dim = hidden_size if is_w2 else se_inter
+
+                            scale_reshape = (1, 1, out_dim)
+
+                            mappings[scale_key] = WeightMapping(
+                                target_path=target_path + "_scale",
+                                sharding=(None, None, None),
+                                reshape=scale_reshape,
+                                transpose=False,
+                            )
+                        else:
+                            mappings[full_hf_key] = WeightMapping(
+                                target_path=target_path,
+                                sharding=(None, None),
+                                transpose=True,
+                            )
                 else:
-                    shared_experts_mappings = {
-                        f"{prefix}.mlp.shared_experts.gate_proj.weight": WeightMapping(
-                            target_path=f"{target_prefix}.shared_experts.gate_proj.weight",
-                            sharding=(None, "tensor"),
-                            transpose=True,
-                        ),
-                        f"{prefix}.mlp.shared_experts.up_proj.weight": WeightMapping(
-                            target_path=f"{target_prefix}.shared_experts.up_proj.weight",
-                            sharding=(None, "tensor"),
-                            transpose=True,
-                        ),
-                        f"{prefix}.mlp.shared_experts.down_proj.weight": WeightMapping(
-                            target_path=f"{target_prefix}.shared_experts.down_proj.weight",
-                            sharding=("tensor", None),
-                            transpose=True,
-                        ),
-                    }
-                    mappings.update(shared_experts_mappings)
+
+                    def add_shared_expert_mapping(hf_name, target_name, sharding_std):
+                        full_hf_key = f"{prefix}.mlp.shared_experts.{hf_name}.weight"
+
+                        target_base = f"{target_prefix}.shared_experts.{target_name}"
+
+                        if is_static_quant:
+                            sharding_quant = (
+                                (sharding_std[1], sharding_std[0])
+                                if len(sharding_std) == 2
+                                else sharding_std
+                            )
+
+                            mappings[full_hf_key] = WeightMapping(
+                                target_path=f"{target_base}.weight_q",
+                                sharding=sharding_quant,
+                                transpose=False,
+                            )
+
+                            scale_key = f"{prefix}.mlp.shared_experts.{hf_name}.weight_scale"
+
+                            scale_sharding = (sharding_quant[0],)
+                            if target_name == "down_proj":
+                                scale_sharding = (None,)
+
+                            mappings[scale_key] = WeightMapping(
+                                target_path=f"{target_base}.weight_scale",
+                                sharding=scale_sharding,
+                                transpose=False,
+                            )
+                        else:
+                            mappings[full_hf_key] = WeightMapping(
+                                target_path=f"{target_base}.weight",
+                                sharding=sharding_std,
+                                transpose=True,
+                            )
+
+                    add_shared_expert_mapping("gate_proj", "gate_proj", (None, "tensor"))
+                    add_shared_expert_mapping("up_proj", "up_proj", (None, "tensor"))
+                    add_shared_expert_mapping("down_proj", "down_proj", ("tensor", None))
 
         return mappings
 

@@ -181,6 +181,7 @@ def _estimate_vmem_bytes(
     se_w3 = 0
     se_w2 = 0
     se_tokens = 0
+    se_acc = 0
     se_w1_scale = 0
     se_w3_scale = 0
     se_w2_scale = 0
@@ -192,7 +193,9 @@ def _estimate_vmem_bytes(
         # Matches fused_moe kernel scratch shape (bt ping-pong x bd1-slice ping-pong):
         # (2, 2, bt, t_packing, bd1_per_pack) => 4 * bt * bd1 elements.
         se_tokens = 4 * bt * bd1 * token_bytes
-        total_bytes += se_w1 + se_w3 + se_w2 + se_tokens
+        # b_se_acc_vmem: F32(2, bt, hidden_size) - accumulator for SE to avoid bf16 precision loss
+        se_acc = 2 * bt * hidden * 4
+        total_bytes += se_w1 + se_w3 + se_w2 + se_tokens + se_acc
 
         # Shared expert scale scratch buffers (F32).
         # b_se_w1_scale_x2_vmem: (2, t_packing, bd1 // t_packing // subc_quant_wsz, 1, bse)
@@ -260,6 +263,7 @@ def _estimate_vmem_bytes(
             print(
                 f"      b_se_tokens_vmem:       {_mb(se_tokens)} MB  (2, 2, {bt}, {t_packing}, {bd1 // t_packing})"
             )
+            print(f"      b_se_acc_vmem:          {_mb(se_acc)} MB  (2, {bt}, {hidden}) f32")
             if subc_quant_wsz is not None:
                 print(
                     f"      b_se_w1_scale_x2_vmem:  {_mb(se_w1_scale)} MB  "
