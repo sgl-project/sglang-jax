@@ -68,6 +68,7 @@ from sgl_jax.srt.utils import (
     kill_process_tree,
 )
 from sgl_jax.utils import TypeBasedDispatcher, get_exception_traceback
+from sgl_jax.srt.validation import ValidationError, validate_score_request
 
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
@@ -1219,16 +1220,16 @@ class TokenizerManager:
         """
         See Engine.score() for more details.
         """
-        if label_token_ids is None:
-            raise ValueError("label_token_ids must be provided")
-
-        if self.tokenizer is not None:
-            vocab_size = self.tokenizer.vocab_size
-            for token_id in label_token_ids:
-                if token_id >= vocab_size:
-                    raise ValueError(
-                        f"Token ID {token_id} is out of vocabulary (vocab size: {vocab_size})"
-                    )
+        # Comprehensive validation per RFC-006
+        vocab_size = self.tokenizer.vocab_size if self.tokenizer is not None else None
+        validate_score_request(
+            query=query,
+            items=items,
+            label_token_ids=label_token_ids,
+            apply_softmax=apply_softmax,
+            item_first=item_first,
+            vocab_size=vocab_size,
+        )
 
         # Handle string or tokenized query/items
         if isinstance(query, str) and (
