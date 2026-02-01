@@ -1293,3 +1293,195 @@ def get_simplified_key(
         next_power_of_2(page_size),
         next_power_of_2(max_num_tokens),
     )
+
+
+TUNED_KV_PAGES_FOR_DECODE = {
+    # key
+    #   - device_name
+    #     - q dtype
+    #     - kv dtype
+    #     - q head number
+    #     - kv head number
+    #     - head dim
+    #     - page_size
+    # value:
+    #   - num_kv_pages_per_block
+    "TPU v6e": {
+        ("bfloat16", "bfloat16", 1, 1, 128, 128): 256,
+        ("bfloat16", "bfloat16", 2, 1, 128, 128): 256,
+        ("bfloat16", "bfloat16", 4, 1, 128, 128): 256,
+        ("bfloat16", "bfloat16", 8, 1, 128, 128): 256,
+        ("bfloat16", "bfloat16", 16, 1, 128, 128): 256,
+        ("bfloat16", "bfloat16", 2, 2, 128, 128): 128,
+        ("bfloat16", "bfloat16", 4, 2, 128, 128): 128,
+        ("bfloat16", "bfloat16", 8, 2, 128, 128): 128,
+        ("bfloat16", "bfloat16", 16, 2, 128, 128): 128,
+        ("bfloat16", "bfloat16", 32, 2, 128, 128): 128,
+        ("bfloat16", "bfloat16", 4, 4, 128, 128): 64,
+        ("bfloat16", "bfloat16", 8, 4, 128, 128): 64,
+        ("bfloat16", "bfloat16", 16, 4, 128, 128): 64,
+        ("bfloat16", "bfloat16", 32, 4, 128, 128): 64,
+        ("bfloat16", "bfloat16", 8, 8, 128, 128): 32,
+        ("bfloat16", "bfloat16", 16, 8, 128, 128): 32,
+        ("bfloat16", "bfloat16", 32, 8, 128, 128): 32,
+        ("bfloat16", "bfloat16", 64, 8, 128, 128): 32,
+        ("bfloat16", "bfloat16", 16, 16, 128, 128): 16,
+        ("bfloat16", "bfloat16", 32, 16, 128, 128): 16,
+        ("bfloat16", "bfloat16", 64, 16, 128, 128): 16,
+        ("bfloat16", "bfloat16", 128, 16, 128, 128): 16,
+        ("bfloat16", "bfloat16", 1, 1, 128, 256): 128,
+        ("bfloat16", "bfloat16", 2, 1, 128, 256): 128,
+        ("bfloat16", "bfloat16", 4, 1, 128, 256): 128,
+        ("bfloat16", "bfloat16", 8, 1, 128, 256): 128,
+        ("bfloat16", "bfloat16", 16, 1, 128, 256): 128,
+        ("bfloat16", "bfloat16", 2, 2, 128, 256): 64,
+        ("bfloat16", "bfloat16", 4, 2, 128, 256): 64,
+        ("bfloat16", "bfloat16", 8, 2, 128, 256): 64,
+        ("bfloat16", "bfloat16", 16, 2, 128, 256): 64,
+        ("bfloat16", "bfloat16", 4, 4, 128, 256): 32,
+        ("bfloat16", "bfloat16", 8, 4, 128, 256): 32,
+        ("bfloat16", "bfloat16", 16, 4, 128, 256): 32,
+        ("bfloat16", "bfloat16", 32, 4, 128, 256): 32,
+        ("bfloat16", "bfloat16", 8, 8, 128, 256): 16,
+        ("bfloat16", "bfloat16", 16, 8, 128, 256): 16,
+        ("bfloat16", "bfloat16", 32, 8, 128, 256): 16,
+        ("bfloat16", "bfloat16", 64, 8, 128, 256): 16,
+        ("bfloat16", "bfloat16", 16, 16, 128, 256): 8,
+        ("bfloat16", "bfloat16", 32, 16, 128, 256): 8,
+        ("bfloat16", "bfloat16", 64, 16, 128, 256): 8,
+        ("bfloat16", "bfloat16", 128, 16, 128, 256): 8,
+        ("bfloat16", "bfloat16", 256, 16, 128, 256): 8,
+        ("bfloat16", "bfloat16", 512, 16, 128, 256): 8,
+    },
+    "TPU v7": {
+        ("bfloat16", "bfloat16", 1, 1, 128, 128): 256,
+        ("bfloat16", "bfloat16", 2, 1, 128, 128): 256,
+        ("bfloat16", "bfloat16", 4, 1, 128, 128): 256,
+        ("bfloat16", "bfloat16", 8, 1, 128, 128): 256,
+        ("bfloat16", "bfloat16", 16, 1, 128, 128): 256,
+        ("bfloat16", "bfloat16", 2, 2, 128, 128): 128,
+        ("bfloat16", "bfloat16", 4, 2, 128, 128): 128,
+        ("bfloat16", "bfloat16", 8, 2, 128, 128): 128,
+        ("bfloat16", "bfloat16", 16, 2, 128, 128): 128,
+        ("bfloat16", "bfloat16", 32, 2, 128, 128): 128,
+        ("bfloat16", "bfloat16", 4, 4, 128, 128): 64,
+        ("bfloat16", "bfloat16", 8, 4, 128, 128): 64,
+        ("bfloat16", "bfloat16", 16, 4, 128, 128): 64,
+        ("bfloat16", "bfloat16", 32, 4, 128, 128): 64,
+        ("bfloat16", "bfloat16", 8, 8, 128, 128): 32,
+        ("bfloat16", "bfloat16", 16, 8, 128, 128): 32,
+        ("bfloat16", "bfloat16", 32, 8, 128, 128): 32,
+        ("bfloat16", "bfloat16", 64, 8, 128, 128): 32,
+        ("bfloat16", "bfloat16", 16, 16, 128, 128): 16,
+        ("bfloat16", "bfloat16", 32, 16, 128, 128): 16,
+        ("bfloat16", "bfloat16", 64, 16, 128, 128): 16,
+        ("bfloat16", "bfloat16", 128, 16, 128, 128): 16,
+        ("bfloat16", "bfloat16", 1, 1, 128, 256): 128,
+        ("bfloat16", "bfloat16", 2, 1, 128, 256): 128,
+        ("bfloat16", "bfloat16", 4, 1, 128, 256): 128,
+        ("bfloat16", "bfloat16", 8, 1, 128, 256): 128,
+        ("bfloat16", "bfloat16", 16, 1, 128, 256): 128,
+        ("bfloat16", "bfloat16", 2, 2, 128, 256): 64,
+        ("bfloat16", "bfloat16", 4, 2, 128, 256): 64,
+        ("bfloat16", "bfloat16", 8, 2, 128, 256): 64,
+        ("bfloat16", "bfloat16", 16, 2, 128, 256): 64,
+        ("bfloat16", "bfloat16", 4, 4, 128, 256): 32,
+        ("bfloat16", "bfloat16", 8, 4, 128, 256): 32,
+        ("bfloat16", "bfloat16", 16, 4, 128, 256): 32,
+        ("bfloat16", "bfloat16", 32, 4, 128, 256): 32,
+        ("bfloat16", "bfloat16", 8, 8, 128, 256): 16,
+        ("bfloat16", "bfloat16", 16, 8, 128, 256): 16,
+        ("bfloat16", "bfloat16", 32, 8, 128, 256): 16,
+        ("bfloat16", "bfloat16", 64, 8, 128, 256): 16,
+        ("bfloat16", "bfloat16", 16, 16, 128, 256): 8,
+        ("bfloat16", "bfloat16", 32, 16, 128, 256): 8,
+        ("bfloat16", "bfloat16", 64, 16, 128, 256): 8,
+        ("bfloat16", "bfloat16", 128, 16, 128, 256): 8,
+        ("bfloat16", "bfloat16", 256, 16, 128, 256): 8,
+        ("bfloat16", "bfloat16", 512, 16, 128, 256): 8,
+    },
+}
+
+
+def get_kv_pages_for_decode(
+    q_dtype,
+    kv_dtype,
+    actual_num_q_heads,
+    actual_num_kv_heads,
+    head_dim,
+    page_size,
+    pages_per_seq,
+    causal=True,
+) -> int:
+    if not causal:
+        # FIXME(pc) hack this to avoid oom when precompile, currently, we still have no better choice for non-causal's mask
+        # this should be optimied future
+        return 4
+    """Look up for the best num_kv_pages_per_blk from auto-tuned table."""
+    tpu_version = get_tpu_version()
+
+    if tpu_version < 4:
+        raise NotImplementedError("TPU version must be 4 or higher.")
+    keys = get_simplified_key_for_decode(
+        page_size,
+        q_dtype,
+        kv_dtype,
+        actual_num_q_heads,
+        actual_num_kv_heads,
+        head_dim,
+    )
+
+    device_name = keys[0]
+
+    # Default block sizes.
+    bkv_p = 1024 // page_size
+    if tpu_version == 4:
+        # TPUv4 has much smaller VMEM size so we pick fixed block sizes.
+        bkv_p = 512 // page_size
+    else:
+        if (
+            device_name in TUNED_KV_PAGES_FOR_DECODE
+            and keys[1:] in TUNED_KV_PAGES_FOR_DECODE[device_name]
+        ):
+            bkv_p = TUNED_KV_PAGES_FOR_DECODE[device_name][keys[1:]]
+        else:
+            logger.info(
+                "Tuned RPA kv page not found for %s: page_size=%s, actual_num_q_heads=%s, "
+                "actual_num_kv_heads=%s, head_dim=%s, pages_per_seq=%s.",
+                device_name,
+                page_size,
+                actual_num_q_heads,
+                actual_num_kv_heads,
+                head_dim,
+                pages_per_seq,
+            )
+            logger.info("Using default block size: bkv_p=%s.", bkv_p)
+
+    return min(pages_per_seq, bkv_p)
+
+
+def get_simplified_key_for_decode(
+    page_size,
+    q_dtype,
+    kv_dtype,
+    num_q_heads,
+    num_kv_heads,
+    head_dim,
+):
+    """Get the simplified key to reduce the number of combinations."""
+    assert num_q_heads % num_kv_heads == 0
+    device = get_device_name()
+    q_dtype_name = jnp.dtype(q_dtype).name
+    kv_dtype_name = jnp.dtype(kv_dtype).name
+    num_q_heads = next_power_of_2(num_q_heads)
+    num_kv_heads = next_power_of_2(num_kv_heads)
+
+    return (
+        device,
+        q_dtype_name,
+        kv_dtype_name,
+        num_q_heads,
+        num_kv_heads,
+        (head_dim + 127) // 128 * 128,
+        next_power_of_2(page_size),
+    )

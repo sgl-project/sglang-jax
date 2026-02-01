@@ -42,7 +42,12 @@ class BatchedPenalizerOrchestrator:
             self._batch_ref = weakref.ref(value)
 
     def reqs(self):
-        return self.batch.reqs
+        """Get all requests from all DP ranks."""
+        all_reqs = []
+        for info in self.batch.reqs_info:
+            if info.reqs:
+                all_reqs.extend(info.reqs)
+        return all_reqs
 
     def cumulate_output_tokens(self, output_ids: np.ndarray):
         """

@@ -106,7 +106,7 @@ class ReceiveDataError(Exception):
 @dataclass
 class GenerationBatchResult:
     logits_output: LogitsProcessorOutput | None
-    next_token_ids: list[int] | None  # on device
+    next_token_ids: list[int] | None
     extend_input_len_per_req: list[int]
     extend_logprob_start_len_per_req: list[int]
     bid: int
@@ -158,6 +158,8 @@ class Scheduler(
         if port_args is not None:
             self.pub_sub_addr = port_args.pub_sub_addr
             self.pub_sub_sync_addr = port_args.pub_sub_sync_addr
+
+        self.dp_size = server_args.dp_size
         self.tp_size = server_args.tp_size
         self.schedule_policy = server_args.schedule_policy
         self.skip_tokenizer_init = server_args.skip_tokenizer_init
@@ -253,11 +255,12 @@ class Scheduler(
         platform = os.getenv("JAX_PLATFORMS", None)
         if platform == "proxy":
             pathwaysutils.initialize()
+
         if mesh is not None:
             self.mesh = mesh
         else:
             self.mesh = create_device_mesh(
-                ici_parallelism=[-1, self.tp_size],
+                ici_parallelism=[self.dp_size, self.tp_size // self.dp_size],
                 dcn_parallelism=[1, 1],
                 device_indexes=server_args.device_indexes,
             )
@@ -310,6 +313,11 @@ class Scheduler(
         global_server_args_dict.update(worker_global_server_args_dict)
         set_random_seed(self.random_seed)
 
+        # Adjust max_running_requests to be divisible by dp_size
+        if self.max_running_requests % self.dp_size != 0:
+            self.max_running_requests = (self.max_running_requests // self.dp_size) * self.dp_size
+        self.per_dp_max_running_requests = self.max_running_requests // self.dp_size
+
         self.is_hybrid = self.tp_worker.is_hybrid
         if self.is_hybrid:
             self.sliding_window_size = self.tp_worker.sliding_window_size
@@ -325,7 +333,17 @@ class Scheduler(
         # The aborted requests
         self.aborted_reqs: dict[str, Req] = {}
         # The running decoding batch for continuous batching
-        self.running_batch: ScheduleBatch = ScheduleBatch(reqs=[], batch_is_full=False)
+        self.running_batch: ScheduleBatch = ScheduleBatch.init_new(
+            reqs=[[] for _ in range(self.dp_size)],  # Empty list for each DP rank
+            req_to_token_pool=self.req_to_token_pool,
+            token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+            tree_cache=self.tree_cache,
+            model_config=self.model_config,
+            enable_overlap=self.enable_overlap,
+            dp_size=self.dp_size,
+            spec_algorithm=self.spec_algorithm,
+            mesh=self.mesh,
+        )
         # The current forward batch
         self.cur_batch: ScheduleBatch | None = None
         # The last forward batch
@@ -345,7 +363,7 @@ class Scheduler(
         self.chunked_prefill_size = server_args.chunked_prefill_size
         if self.chunked_prefill_size <= 0:  # -1 means disable
             self.chunked_prefill_size = None
-        self.chunked_req = None
+        self.chunked_reqs = [None] * self.dp_size  # Per-DP chunked requests
         self.is_mixed_chunk = (
             self.chunked_prefill_size is not None and server_args.enable_mixed_chunk
         )
@@ -381,6 +399,9 @@ class Scheduler(
         self.init_profier()
 
         self.init_metrics()
+
+        # Initialize DP scheduling state
+        self.dp_round_robin_counter = 0
 
         # Init request dispatcher
         self._request_dispatcher = TypeBasedDispatcher(
@@ -512,6 +533,28 @@ class Scheduler(
 
         self.decode_mem_cache_buf_multiplier = 1
 
+    def select_dp_for_request(self, recv_reqs: list[Req]) -> None:
+        """Assign dp_rank to request using round-robin strategy."""
+        if self.dp_size == 1:
+            for req in recv_reqs:
+                # Only assign dp_rank to TokenizedGenerateReqInput
+                if isinstance(req, TokenizedGenerateReqInput):
+                    req.dp_rank = 0
+            return
+
+        for req in recv_reqs:
+            # Only assign dp_rank to TokenizedGenerateReqInput
+            if not isinstance(req, TokenizedGenerateReqInput):
+                continue
+
+            # Skip if dp_rank already set (e.g., sticky sessions)
+            if req.dp_rank is not None:
+                continue
+
+            # Round-robin assignment
+            req.dp_rank = self.dp_round_robin_counter % self.dp_size
+            self.dp_round_robin_counter += 1
+
     def event_loop_normal(self):
         """A normal scheduler loop."""
         while True:
@@ -520,6 +563,8 @@ class Scheduler(
                 if self._comm_backend is not None
                 else self.recv_requests()
             )
+            # Assign DP rank to incoming requests
+            self.select_dp_for_request(recv_reqs)
             self.process_input_requests(recv_reqs)
 
             # Skip batch processing when engine is paused
@@ -550,6 +595,8 @@ class Scheduler(
                 if self._comm_backend is not None
                 else self.recv_requests()
             )
+            # Assign DP rank to incoming requests
+            self.select_dp_for_request(recv_reqs)
             self.process_input_requests(recv_reqs)
 
             # Skip batch processing when engine is paused
@@ -568,11 +615,19 @@ class Scheduler(
                 if self.last_batch is None:
                     # Create a dummy first batch to start the pipeline for overlap schedule.
                     # It is now used for triggering the sampling_info_done event.
-                    tmp_batch = ScheduleBatch(
-                        reqs=None,
-                        forward_mode=ForwardMode.DUMMY_FIRST,
-                        next_batch_sampling_info=self.tp_worker.cur_sampling_info,
+                    tmp_batch = ScheduleBatch.init_new(
+                        reqs=[[] for _ in range(self.dp_size)],
+                        req_to_token_pool=self.req_to_token_pool,
+                        token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                        tree_cache=self.tree_cache,
+                        model_config=self.model_config,
+                        enable_overlap=self.enable_overlap,
+                        dp_size=self.dp_size,
+                        spec_algorithm=self.spec_algorithm,
+                        mesh=self.mesh,
                     )
+                    tmp_batch.forward_mode = ForwardMode.DUMMY_FIRST
+                    tmp_batch.next_batch_sampling_info = self.tp_worker.cur_sampling_info
                     with jax.profiler.TraceAnnotation("process_batch_result"):
                         self.process_batch_result(tmp_batch, None, batch.launch_done)
 
@@ -686,6 +741,7 @@ class Scheduler(
             stream=recv_req.stream,
             lora_id=recv_req.lora_id,
             extra_key=recv_req.extra_key,
+            dp_rank=recv_req.dp_rank,
             eos_token_ids=self.model_config.hf_eos_token_id,
             vocab_size=self.model_config.vocab_size,
             return_routed_experts=recv_req.return_routed_experts,
@@ -827,7 +883,7 @@ class Scheduler(
         ret["engine_paused"] = self._engine_paused
         ret["waiting_queue_size"] = len(self.waiting_queue)
         ret["running_batch_size"] = (
-            0 if self.running_batch.is_empty() else len(self.running_batch.reqs)
+            0 if self.running_batch.is_empty() else self.running_batch.batch_size()
         )
         ret["prefill_decode_size"] = ret["waiting_queue_size"] + ret["running_batch_size"]
         ret["waiting_queue_rids"] = [req.rid for req in self.waiting_queue]
@@ -840,7 +896,7 @@ class Scheduler(
         # scheduling state
         ret["cur_batch_is_none"] = self.cur_batch is None
         ret["last_batch_is_none"] = self.last_batch is None
-        ret["chunked_req_is_none"] = self.chunked_req is None
+        ret["chunked_req_is_none"] = self.chunked_reqs is None
 
         # request cache stat
         if isinstance(self.tree_cache, ChunkCache):
@@ -952,7 +1008,7 @@ class Scheduler(
         running_reqs = _batch_size(self.running_batch)
         current_batch_reqs = _batch_size(self.cur_batch)
         last_batch_reqs = _batch_size(self.last_batch)
-        chunked_pending = self.chunked_req is not None
+        chunked_pending = any(req is not None for req in self.chunked_reqs)
         pending_results = len(getattr(self, "result_queue", ())) if self.enable_overlap else 0
 
         has_pending = (
@@ -984,8 +1040,18 @@ class Scheduler(
         # Reset scheduling state
         self.cur_batch = None
         self.last_batch = None
-        self.running_batch = ScheduleBatch(reqs=[], batch_is_full=False)
-        self.chunked_req = None
+        self.running_batch = ScheduleBatch.init_new(
+            reqs=[[] for _ in range(self.dp_size)],
+            req_to_token_pool=self.req_to_token_pool,
+            token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+            tree_cache=self.tree_cache,
+            model_config=self.model_config,
+            enable_overlap=self.enable_overlap,
+            dp_size=self.dp_size,
+            spec_algorithm=self.spec_algorithm,
+            mesh=self.mesh,
+        )
+        self.chunked_reqs = [None] * self.dp_size
         if self.enable_overlap:
             self.result_queue = deque()
 
@@ -1064,17 +1130,30 @@ class Scheduler(
             self.tree_cache.sanity_check()
 
     def _get_token_info(self):
-        available_size = self.token_to_kv_pool_allocator.available_size()
-        evictable_size = self.tree_cache.evictable_size()
+        available_size = sum(
+            [self.token_to_kv_pool_allocator.available_size(dp) for dp in range(self.dp_size)]
+        )
+        # Sum evictable size across all DP ranks
+        evictable_size = sum(
+            [self.tree_cache.evictable_size(dp_rank=dp) for dp in range(self.dp_size)]
+        )
         num_used = self.max_total_num_tokens - (available_size + evictable_size)
         token_usage = num_used / self.max_total_num_tokens
         return num_used, token_usage, available_size, evictable_size
 
     def _get_swa_token_info(self):
-        full_available_size = self.token_to_kv_pool_allocator.full_available_size()
-        full_evictable_size = self.tree_cache.full_evictable_size()
-        swa_available_size = self.token_to_kv_pool_allocator.swa_available_size()
-        swa_evictable_size = self.tree_cache.swa_evictable_size()
+        full_available_size = sum(
+            [self.token_to_kv_pool_allocator.full_available_size(dp) for dp in range(self.dp_size)]
+        )
+        full_evictable_size = sum(
+            [self.tree_cache.full_evictable_size(dp_rank=dp) for dp in range(self.dp_size)]
+        )
+        swa_available_size = sum(
+            [self.token_to_kv_pool_allocator.swa_available_size(dp) for dp in range(self.dp_size)]
+        )
+        swa_evictable_size = sum(
+            [self.tree_cache.swa_evictable_size(dp_rank=dp) for dp in range(self.dp_size)]
+        )
         full_num_used = self.full_tokens_per_layer - (full_available_size + full_evictable_size)
         swa_num_used = self.swa_tokens_per_layer - (swa_available_size + swa_evictable_size)
         full_token_usage = full_num_used / self.full_tokens_per_layer
@@ -1091,25 +1170,49 @@ class Scheduler(
         )
 
     def get_next_batch_to_run(self) -> ScheduleBatch | None:
-        chunked_req_to_exclude = set()
-        if self.chunked_req:
-            # Move the chunked request out of the batch so that we can merge
-            # only finished requests to running_batch.
-            chunked_req_to_exclude.add(self.chunked_req)
-            self.tree_cache.cache_unfinished_req(self.chunked_req)
-            # chunked request keeps its rid but will get a new req_pool_idx
-            self.req_to_token_pool.free(self.chunked_req.req_pool_idx)
+        # Process chunked requests for each DP rank
+        chunked_req_to_exclude = {}
+        for dp_rank in range(self.dp_size):
+            if self.chunked_reqs[dp_rank] is not None:
+                # Move the chunked request out of the batch so that we can merge
+                # only finished requests to running_batch.
+                chunked_req_to_exclude[dp_rank] = self.chunked_reqs[dp_rank]
+                self.tree_cache.cache_unfinished_req(self.chunked_reqs[dp_rank])
+                # chunked request keeps its rid but will get a new req_pool_idx
+                self.req_to_token_pool.free(self.chunked_reqs[dp_rank].req_pool_idx)
 
         # Merge the prefill batch into the running batch
         if self.last_batch and self.last_batch.forward_mode.is_extend():
-            if self.last_batch.chunked_req is not None:
-                chunked_req_to_exclude.add(self.last_batch.chunked_req)
+            # Consistency check: each last_batch.reqs_info[dp_rank].chunked_req should match
+            # what's in chunked_req_to_exclude (since self.chunked_reqs should contain the same requests)
+            for dp_rank in range(self.dp_size):
+                info = self.last_batch.reqs_info[dp_rank]
+                if info.chunked_req is not None:
+                    # Verify consistency: info.chunked_req should match self.chunked_reqs[dp_rank]
+                    if dp_rank in chunked_req_to_exclude:
+                        assert (
+                            chunked_req_to_exclude[dp_rank] is info.chunked_req
+                        ), f"Chunked request mismatch for DP rank {dp_rank}"
+                    else:
+                        # This shouldn't happen, but handle it gracefully
+                        chunked_req_to_exclude[dp_rank] = info.chunked_req
 
             # Filter batch
-            last_bs = self.last_batch.batch_size()
-            self.last_batch.filter_batch(chunked_req_to_exclude=list(chunked_req_to_exclude))
-            if self.last_batch.batch_size() < last_bs:
-                self.running_batch.batch_is_full = False
+            # Track per-DP batch sizes before filtering
+            last_bs_per_dp = [
+                len(info.reqs) if info.reqs else 0 for info in self.last_batch.reqs_info
+            ]
+
+            self.last_batch.filter_batch(chunked_req_to_exclude=chunked_req_to_exclude)
+
+            # Update batch_is_full per DP rank
+            for dp_rank in range(self.dp_size):
+                info = self.last_batch.reqs_info[dp_rank]
+                current_bs = len(info.reqs) if info.reqs else 0
+                if current_bs < last_bs_per_dp[dp_rank]:
+                    # Batch size decreased for this DP rank, mark as not full
+                    info.batch_is_full = False
+                    self.running_batch.reqs_info[dp_rank].batch_is_full = False
 
             # Merge the new batch into the running batch
             if not self.last_batch.is_empty() and not self.last_batch.is_prefill_only:
@@ -1140,15 +1243,13 @@ class Scheduler(
             self.move_ready_grammar_requests()
 
         # Handle the cases where prefill is not allowed
+        has_chunked_reqs = any(req is not None for req in self.chunked_reqs)
         if (
             self.running_batch.batch_is_full or len(self.waiting_queue) == 0
-        ) and self.chunked_req is None:
+        ) and not has_chunked_reqs:
             return None
 
-        running_bs = len(self.running_batch.reqs)
-        if running_bs >= self.max_running_requests:
-            self.running_batch.batch_is_full = True
-            return None
+        running_bs = self.running_batch.batch_size()
 
         # Get priority queue
         self.policy.calc_priority(self.waiting_queue)
@@ -1162,31 +1263,43 @@ class Scheduler(
             self.max_prefill_tokens,
             self.chunked_prefill_size,
             running_bs if self.is_mixed_chunk else 0,
+            dp_size=self.dp_size,
         )
 
-        if self.chunked_req is not None:
-            self.chunked_req.init_next_round_input()
-            self.chunked_req = adder.add_chunked_req(self.chunked_req)
+        # Process existing chunked requests for each DP rank
+        for dp_rank in range(self.dp_size):
+            if self.chunked_reqs[dp_rank] is not None:
+                self.chunked_reqs[dp_rank].init_next_round_input()
+                self.chunked_reqs[dp_rank] = adder.add_chunked_req(self.chunked_reqs[dp_rank])
 
         # Collect existing LoRA IDs in the running batch if LoRA is enabled
         if self.lora_paths is not None:
-            lora_set = (
-                set([req.lora_id for req in self.running_batch.reqs])
-                if self.running_batch is not None
-                else set([])
-            )
+            lora_set = set()
+            if self.running_batch is not None:
+                for info in self.running_batch.reqs_info:
+                    if info.reqs:
+                        lora_set.update([req.lora_id for req in info.reqs])
 
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
-            if running_bs + len(adder.can_run_list) >= self.max_running_requests:
-                self.running_batch.batch_is_full = True
-                break
+            # Get DP rank for this request
+            dp_rank = req.dp_rank if req.dp_rank is not None else 0
+
+            # Check whether dp is full load
+            if self.running_batch.reqs_info[dp_rank].batch_is_full or (
+                len(self.running_batch.reqs_info[dp_rank].reqs) + len(adder.can_run_list[dp_rank])
+                >= self.per_dp_max_running_requests
+            ):
+                continue
 
             # Check LoRA constraint: ensure we don't exceed max_loras_per_batch
+            # This is GLOBAL - must be same across all DP ranks
             if (
                 self.lora_paths is not None
                 and len(
-                    lora_set | set([req.lora_id for req in adder.can_run_list]) | set([req.lora_id])
+                    lora_set
+                    | set([req.lora_id for reqs in adder.can_run_list.values() for req in reqs])
+                    | set([req.lora_id])
                 )
                 > self.max_loras_per_batch
             ):
@@ -1197,35 +1310,55 @@ class Scheduler(
 
             if res != AddReqResult.CONTINUE:
                 if res == AddReqResult.NO_TOKEN:
-                    self.running_batch.batch_is_full = True
-                break
+                    # Mark this specific DP rank as exhausted
+                    self.running_batch.reqs_info[dp_rank].batch_is_full = True
+
+                    # Check if all DP ranks are exhausted
+                    if self.running_batch.batch_is_full:
+                        break
+
+                    # Continue to try requests from other DP ranks
+                    continue
+                else:
+                    # OTHER: Global budget exhausted, stop entirely
+                    break
 
         # Update waiting queue
-        can_run_list: list[Req] = adder.can_run_list
-        if len(can_run_list) == 0:
+        # Flatten can_run_list for operations that need all requests
+        all_can_run_reqs = [req for reqs in adder.can_run_list.values() for req in reqs]
+        if len(all_can_run_reqs) == 0:
             return None
 
-        self.waiting_queue = [x for x in self.waiting_queue if x not in set(can_run_list)]
+        self.waiting_queue = [x for x in self.waiting_queue if x not in set(all_can_run_reqs)]
 
-        if adder.new_chunked_req is not None:
-            assert self.chunked_req is None
-            self.chunked_req = adder.new_chunked_req
+        # Update chunked requests for each DP rank
+        for dp_rank in range(self.dp_size):
+            if adder.new_chunked_reqs[dp_rank] is not None:
+                assert (
+                    self.chunked_reqs[dp_rank] is None
+                ), f"Chunked request already exists for DP rank {dp_rank} when adding new chunked req"
+                self.chunked_reqs[dp_rank] = adder.new_chunked_reqs[dp_rank]
+                self.chunked_reqs[dp_rank].is_chunked += 1
 
-        if self.chunked_req:
-            self.chunked_req.is_chunked += 1
+        self.log_prefill_stats(adder, all_can_run_reqs, running_bs)
 
-        self.log_prefill_stats(adder, can_run_list, running_bs)
+        # Use adder.can_run_list directly as reqs_per_dp (already grouped by DP rank)
+        reqs_per_dp = [adder.can_run_list.get(i, []) for i in range(self.dp_size)]
+
+        # Use self.chunked_reqs directly as chunked_reqs_per_dp
+        chunked_reqs_per_dp = self.chunked_reqs.copy()
 
         # Create a new batch
         new_batch = ScheduleBatch.init_new(
-            can_run_list,
+            reqs_per_dp,
             self.req_to_token_pool,
             self.token_to_kv_pool_allocator,
             self.tree_cache,
             self.model_config,
             self.enable_overlap,
+            self.dp_size,
             enable_custom_logit_processor=False,
-            chunked_req=self.chunked_req,
+            chunked_reqs=chunked_reqs_per_dp,
             mesh=self.mesh,
             spec_algorithm=self.spec_algorithm,
         )
@@ -1242,13 +1375,23 @@ class Scheduler(
             if not self.running_batch.is_empty():
                 self.running_batch.prepare_for_decode()
                 new_batch.mix_with_running(self.running_batch)
-                new_batch.decoding_reqs = self.running_batch.reqs
+                for dp_rank in range(self.dp_size):
+                    running_info = self.running_batch.reqs_info[dp_rank]
+                    new_info = new_batch.reqs_info[dp_rank]
+                    if running_info.reqs:
+                        new_info.decoding_reqs = running_info.reqs
 
-            self.running_batch = ScheduleBatch(
-                reqs=[], batch_is_full=self.running_batch.batch_is_full, mesh=self.mesh
+            self.running_batch = ScheduleBatch.init_new(
+                reqs=[[] for _ in range(self.dp_size)],
+                req_to_token_pool=self.req_to_token_pool,
+                token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                tree_cache=self.tree_cache,
+                model_config=self.model_config,
+                enable_overlap=self.enable_overlap,
+                dp_size=self.dp_size,
+                spec_algorithm=self.spec_algorithm,
+                mesh=self.mesh,
             )
-        else:
-            new_batch.decoding_reqs = None
 
         new_batch.bid = acc_global_bid()
 
@@ -1260,7 +1403,9 @@ class Scheduler(
 
         batch.filter_batch()
         if batch.is_empty():
-            batch.batch_is_full = False
+            # Mark all DP ranks as not full when batch is empty
+            for info in batch.reqs_info:
+                info.batch_is_full = False
             return batch
 
         # Check if decode out of memory
@@ -1288,11 +1433,43 @@ class Scheduler(
             )
 
         if batch.batch_size() < initial_bs:
-            batch.batch_is_full = False
+            # Re-check per-DP batch_is_full status after filtering
+            for dp_rank in range(self.dp_size):
+                info = batch.reqs_info[dp_rank]
+                current_bs = len(info.reqs) if info.reqs else 0
+                if current_bs < self.per_dp_max_running_requests:
+                    info.batch_is_full = False
 
         # Update batch arrays
         batch.prepare_for_decode()
         return batch
+
+    def _extract_dp_output_ids(
+        self,
+        next_token_ids_flat: np.ndarray,
+        model_worker_batch,
+        batch: ScheduleBatch,
+    ):
+        """Extract output IDs from DP-formatted array and assign to reqs_info.
+
+        Args:
+            next_token_ids_flat: np.ndarray with format [dp0_tokens..., dp1_tokens..., ...]
+                                 where each DP section has per_dp_bs_size tokens (including padding)
+            model_worker_batch: ModelWorkerBatch with per_dp_bs_size and dp_size
+            batch: ScheduleBatch to update reqs_info[*].output_ids
+        """
+        per_dp_bs_size = model_worker_batch.per_dp_bs_size
+
+        for dp_rank in range(batch.dp_size):
+            info = batch.reqs_info[dp_rank]
+            num_real_reqs = len(info.reqs) if info.reqs else 0
+
+            if num_real_reqs == 0:
+                info.output_ids = np.array([], dtype=np.int32)
+            else:
+                info.output_ids = next_token_ids_flat[
+                    dp_rank * per_dp_bs_size : dp_rank * per_dp_bs_size + num_real_reqs
+                ]
 
     def run_batch(self, batch: ScheduleBatch) -> GenerationBatchResult:
         """Run a batch."""
@@ -1327,16 +1504,15 @@ class Scheduler(
                             model_worker_batch, sampling_metadata=None
                         )
                     )
-                next_token_ids = next_token_ids[: model_worker_batch.real_bs]
+                self._extract_dp_output_ids(next_token_ids, model_worker_batch, batch)
             else:
                 logits_output, next_token_ids_device, cache_miss_count = (
                     self.tp_worker.forward_batch_generation(
                         model_worker_batch, sampling_metadata=None
                     )
                 )
-                next_token_ids = np.array(jax.device_get(next_token_ids_device))[
-                    : model_worker_batch.real_bs
-                ]
+                next_token_ids = np.array(jax.device_get(next_token_ids_device))
+                self._extract_dp_output_ids(next_token_ids, model_worker_batch, batch)
         else:
             model_worker_batch = batch.get_spec_model_worker_batch(
                 precompile_token_paddings,
@@ -1356,20 +1532,30 @@ class Scheduler(
                 batch.seq_lens = batch.seq_lens + 1
             batch.spec_info = batch_output.next_draft_input
             next_token_ids = batch_output.next_token_ids
+            self._extract_dp_output_ids(next_token_ids, model_worker_batch, batch)
             logits_output = batch_output.logits_output
             cache_miss_count = batch_output.cache_miss_count
         bid = model_worker_batch.bid
-        batch.output_ids = next_token_ids
 
         # These 2 values are needed for processing the output, but the values can be
         # modified by overlap schedule. So we have to copy them here so that
         # we can use the correct values in output processing.
         if batch.return_logprob:
-            extend_input_len_per_req = [req.extend_input_len for req in batch.reqs]
+            # Collect extend_input_len from all DP ranks
+            extend_input_len_per_req = []
+            for info in batch.reqs_info:
+                if info.reqs:
+                    extend_input_len_per_req.extend([req.extend_input_len for req in info.reqs])
         else:
             extend_input_len_per_req = None
         if batch.return_logprob:
-            extend_logprob_start_len_per_req = [req.extend_logprob_start_len for req in batch.reqs]
+            # Collect extend_logprob_start_len from all DP ranks
+            extend_logprob_start_len_per_req = []
+            for info in batch.reqs_info:
+                if info.reqs:
+                    extend_logprob_start_len_per_req.extend(
+                        [req.extend_logprob_start_len for req in info.reqs]
+                    )
         else:
             extend_logprob_start_len_per_req = None
 
@@ -1406,16 +1592,21 @@ class Scheduler(
             self.set_next_batch_sampling_info_done(batch)
 
     def get_idle_batch(self):
+        # Create empty request lists for each DP rank
+        reqs_per_dp = [[] for _ in range(self.dp_size)]
+
         idle_batch = ScheduleBatch.init_new(
-            [],
+            reqs_per_dp,
             self.req_to_token_pool,
             self.token_to_kv_pool_allocator,
             self.tree_cache,
             self.model_config,
             self.enable_overlap,
-            self.server_args.enable_custom_logit_processor,
-            self.mesh,
+            self.dp_size,
             spec_algorithm=self.spec_algorithm,
+            enable_custom_logit_processor=self.server_args.enable_custom_logit_processor,
+            chunked_reqs=None,
+            mesh=self.mesh,
         )
         idle_batch.prepare_for_idle()
         return idle_batch
@@ -1477,10 +1668,15 @@ class Scheduler(
                 req.set_finish_with_abort("Aborted by AbortReq.")
 
         # Delete requests in the running batch
-        if self.cur_batch is self.running_batch or self.cur_batch is None:
-            reqs = self.running_batch.reqs
-        else:
-            reqs = self.running_batch.reqs + self.cur_batch.reqs
+        reqs = []
+        for info in self.running_batch.reqs_info:
+            if info.reqs:
+                reqs.extend(info.reqs)
+
+        if self.cur_batch is not None and self.cur_batch is not self.running_batch:
+            for info in self.cur_batch.reqs_info:
+                if info.reqs:
+                    reqs.extend(info.reqs)
 
         for req in reqs:
             if not req.finished() and (recv_req.abort_all or req.rid.startswith(recv_req.rid)):
@@ -1508,8 +1704,7 @@ class Scheduler(
                 for req in retracted_reqs:
                     self._add_request_to_queue(req)
 
-            self.running_batch.batch_is_full = False
-            self.chunked_req = None
+            self.chunked_reqs = None
             logger.info("Paused generation retracted")
         elif recv_req.mode == "in_place":
             logger.info("Paused generation in place")

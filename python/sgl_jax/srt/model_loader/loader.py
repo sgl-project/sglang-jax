@@ -195,7 +195,9 @@ class JAXModelLoader(DefaultModelLoader):
         # if sub_dir is specified, use it
         if self.load_config.sub_dir is not None:
             hf_folder = os.path.join(hf_folder, self.load_config.sub_dir)
+            logger.info("Before copy - quantization_config: %s", model_config.quantization_config)
             model_config = copy.copy(model_config)
+            logger.info("After copy - quantization_config: %s", model_config.quantization_config)
 
         model_config.model_path = hf_folder
         # Initialize JAX model
@@ -229,10 +231,33 @@ class JAXModelLoader(DefaultModelLoader):
             config = model_config
         else:
             config = model_config.hf_config
+
         with jax.set_mesh(self.mesh):
             model = nnx.eval_shape(
                 lambda: model_class(config, dtype=model_config.dtype, mesh=self.mesh)
             )
+
+        # Quantization config is already unified in model_config
+        # No need for any conversion logic here
+        if model_config.quantization_config is not None:
+            is_static = model_config.quantization_config.is_static_checkpoint
+
+            if is_static:
+                logger.info("Applying STATIC quantization structure preparation...")
+                from sgl_jax.srt.utils.quantization.quantization_utils import (
+                    apply_linear_quantization,
+                    apply_moe_quantization,
+                )
+
+                if model_config.quantization_config.has_moe_quantization():
+                    model = apply_moe_quantization(model_config, model, is_static_input=True)
+
+                if model_config.quantization_config.get_linear_rules():
+                    model = apply_linear_quantization(model_config, model, is_static_input=True)
+            else:
+                logger.info("Dynamic quantization detected. Skipping structure change in loader.")
+        else:
+            logger.info("No quantization config found. Skipping quantization.")
         model.load_weights(model_config)
         return model
 
