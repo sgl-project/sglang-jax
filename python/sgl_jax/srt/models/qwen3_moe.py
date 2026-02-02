@@ -303,7 +303,10 @@ class QWen3MoeDecoderLayer(nnx.Module):
             router_logits = self.moe_gate(hidden_states)
 
             if self.use_fused:
-                hidden_states = self.mlp(hidden_states, router_logits)
+                token_valid_mask = forward_batch.get_token_valid_mask(hidden_states.shape[0])
+                hidden_states = self.mlp(
+                    hidden_states, router_logits, token_valid_mask=token_valid_mask
+                )
                 topk_ids = None
             else:
                 topk_weights, topk_ids = self.topk(router_logits)
