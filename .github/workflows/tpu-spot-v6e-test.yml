@@ -1,0 +1,66 @@
+name: TPU v6e Spot Test
+
+on:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - "python/**"
+      - "scripts/**"
+      - "test/**"
+      - ".github/workflows/tpu-spot-v6e-test.yml"
+
+concurrency:
+  group: tpu-spot-v6e-test-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # =============================================== check changes ====================================================
+  check-changes:
+    runs-on: ubuntu-latest
+    outputs:
+      main_package: ${{ steps.filter.outputs.main_package }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Fail if the PR is a draft
+        if: github.event_name == 'pull_request' && github.event.pull_request.draft == true
+        run: |
+          echo "This pull request is a draft. Failing the workflow."
+          exit 1
+
+      - name: Detect file changes
+        id: filter
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            main_package:
+              - "python/sgl_jax/**"
+              - "python/*.toml"
+              - "scripts/**"
+              - "test/**"
+              - ".github/workflows/tpu-spot-v6e-test.yml"
+
+  # =============================================== unit-test ====================================================
+  unit-test-tpu-v6e-1:
+    needs: [check-changes]
+    if: github.event.pull_request.draft == false && needs.check-changes.outputs.main_package == 'true'
+    runs-on: tpu-runner
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Run unit test
+        timeout-minutes: 60
+        shell: bash
+        env:
+          SGLANG_JAX_IS_IN_CI: true
+        run: |
+          python3.12 -m venv .venv
+          source .venv/bin/activate
+          pip install uv
+          uv pip install -e "python[all]"
+          
+          # Run the TPU v6e-1 suite
+          python test/srt/run_suite.py --suite unit-test-tpu-v6e-1
