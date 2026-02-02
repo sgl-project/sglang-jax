@@ -64,6 +64,8 @@ all = [
 multimodal = [
     "torch",
     "torchvision",
+    "librosa",
+    "msgpack==1.0.0"
 ]
 
 [tool.setuptools.packages.find]
