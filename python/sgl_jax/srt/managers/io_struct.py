@@ -158,6 +158,8 @@ class TokenizedGenerateReqInput:
     return_routed_experts: list[bool] | bool | None = None
     # whether to return hidden states
     return_hidden_states: bool = False
+    # The data parallel rank for this request
+    dp_rank: int | None = None
 
 
 @dataclass

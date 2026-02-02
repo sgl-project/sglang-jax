@@ -14,7 +14,9 @@ from sgl_jax.srt.configs.quantization_config import DTYPE_MAP
 logger = logging.getLogger(__name__)
 
 
-def apply_linear_quantization(model_config: ModelConfig, model: nnx.Module) -> nnx.Module:
+def apply_linear_quantization(
+    model_config: ModelConfig, model: nnx.Module, is_static_input: bool = False
+) -> nnx.Module:
     """Apply quantization to linear layers based on regex rules.
 
     This walks through the model and replaces LinearBase layers with QuantizedLinear
@@ -94,7 +96,7 @@ def apply_linear_quantization(model_config: ModelConfig, model: nnx.Module) -> n
                     # Check if this path matches any rule
                     rule = _find_matching_rule(child_path)
                     if rule is not None:
-                        logger.info(
+                        logger.debug(
                             "Quantizing %s with weight_dtype=%s, activation_dtype=%s",
                             child_path,
                             rule["weight_dtype"],
@@ -105,6 +107,7 @@ def apply_linear_quantization(model_config: ModelConfig, model: nnx.Module) -> n
                             attr_value,
                             weight_dtype=rule["weight_dtype"],
                             activation_dtype=rule["activation_dtype"],
+                            is_static_input=is_static_input,
                         )
                         # Replace the attribute and free old weights
                         setattr(obj, attr_name, quantized_linear)
@@ -128,7 +131,9 @@ def apply_linear_quantization(model_config: ModelConfig, model: nnx.Module) -> n
     return model
 
 
-def apply_moe_quantization(model_config: ModelConfig, model: nnx.Module) -> nnx.Module:
+def apply_moe_quantization(
+    model_config: ModelConfig, model: nnx.Module, is_static_input: bool = False
+) -> nnx.Module:
     """
     Quantize MoE weights in-place.
 
@@ -161,8 +166,8 @@ def apply_moe_quantization(model_config: ModelConfig, model: nnx.Module) -> nnx.
 
         if isinstance(obj, (EPMoE, FusedEPMoE)):
             log_path = path or obj.name
-            logger.info("Quantizing MoE weights path=%s", log_path)
-            obj.quantize_weights()
+            logger.debug("Quantizing MoE weights path=%s", log_path)
+            obj.quantize_weights(is_static=is_static_input)
             return
 
         # Try to iterate through attributes
