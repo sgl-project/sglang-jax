@@ -15,11 +15,18 @@ from sgl_jax.srt.multimodal.manager.device_manager import DeviceManager
 from sgl_jax.srt.multimodal.manager.scheduler.diffusion_scheduler import (
     DiffusionScheduler,
 )
+from sgl_jax.srt.multimodal.manager.scheduler.embed_scheduler import EmbedScheduler
 from sgl_jax.srt.multimodal.manager.scheduler.vae_scheduler import VaeScheduler
 from sgl_jax.srt.multimodal.manager.scheduler.vit_scheduler import VitScheduler
 from sgl_jax.srt.multimodal.models.qwen2_5VL.qwen2_5_vit import Qwen2_5_VL_VisionModel
 from sgl_jax.srt.multimodal.models.qwen2_5VL.qwen2_5_vl_generation import (
     Qwen2_5_VL_Generation,
+)
+from sgl_jax.srt.multimodal.models.qwen3_omni_moe.qwen3_embedding import (
+    Qwen3OmniEmbedding,
+)
+from sgl_jax.srt.multimodal.models.qwen3_omni_moe.qwen3_omni_thinker import (
+    Qwen3OmniMoeTinkerTextForConditionalGeneration,
 )
 from sgl_jax.srt.multimodal.models.wan.diffusion.wan_dit import (
     WanDualTransformer3DModel,
@@ -189,6 +196,8 @@ def get_scheduler_class(name: str):
         return VaeScheduler
     elif name == "vit":
         return VitScheduler
+    elif name == "embedding":
+        return EmbedScheduler
     else:
         raise ValueError(f"Unknown scheduler name: {name}")
 
@@ -208,5 +217,10 @@ def get_model_class(name: str):
         return Qwen2_5_VL_VisionModel
     elif name == "Qwen2ForCausalLM":
         return Qwen2ForCausalLM
+    elif name == "Qwen3OmniEmbedding":
+        return Qwen3OmniEmbedding
+    elif name == "Qwen3OmniMoeTinkerTextForConditionalGeneration":
+        return Qwen3OmniMoeTinkerTextForConditionalGeneration
+
     else:
         raise ValueError(f"Unknown model name: {name}")
