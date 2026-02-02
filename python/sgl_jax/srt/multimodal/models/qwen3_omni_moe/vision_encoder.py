@@ -42,18 +42,20 @@ class Vision3DPatchEmbed(nnx.Module):
     def __call__(self, x: jax.Array) -> jax.Array:
         """
         Args:
-            x: (B, T, H, W, C) video/image tensor
+            x: (B, C * T * H * W) video/image tensor
 
         Returns:
             patches: (total_patches, embed_dim)
         """
-        # x shape: (B, T, H, W, C)
+        # x shape: (B, C * T * H * W)
         # Need to merge batch and temporal for conv
-        B, T, H, W, C = x.shape
 
+        # x is (B, C * T * H * W)
         # Reshape for 3D conv: combine examples into batch
+        x = x.reshape(-1, self.in_channels, self.temporal_patch_size, self.patch_size, self.patch_size)  # (B, C, T, H, W)
+
         # JAX Conv expects: (batch, spatial_dims..., channels)
-        x = x.reshape(-1, T, H, W, C)  # (B, T, H, W, C)
+        x = jnp.transpose(x, (0, 2, 3, 4, 1))
 
         # Apply 3D convolution
         patches = self.proj(x)  # (B, T', H', W', embed_dim)
@@ -790,14 +792,14 @@ class Qwen3OmniMoeVisionEncoder(nnx.Module):
 
     def __call__(
         self,
-        pixel_values: jax.Array,  # (B, T, H, W, C)
+        pixel_values: jax.Array,  # (B, C * T * H * W)
         grid_thw: jax.Array,  # (B, 3) - [T, H_patches, W_patches]
     ) -> dict[str, jax.Array]:
         """
         Forward pass of vision encoder.
 
         Args:
-            pixel_values: (B, T, H, W, C) video/image tensor
+            pixel_values: (B, C * T * H * W) video/image tensor
             grid_thw: (B, 3) containing [T, H_patches, W_patches] for each input
 
         Returns:

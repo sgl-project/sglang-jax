@@ -250,9 +250,111 @@ class Qwen3OmniMoeThinkerEmbedding(nnx.Module):
 
         return mappings
 
+    def get_placeholder_mask(
+        self,
+        input_ids: jnp.ndarray,
+        input_embeds: jnp.ndarray,
+        image_features: jnp.ndarray | None = None,
+        video_features: jnp.ndarray | None = None,
+    ):
+        """
+        Obtains multimodal placeholder mask from `input_ids` or `input_embeds`, and checks that the placeholder token count is
+        equal to the length of multimodal features. If the lengths are different, an error is raised.
+        """
+        special_image_mask = input_ids == self.config.image_token_id
+        special_video_mask = input_ids == self.config.video_token_id
+        special_audio_mask = input_ids == self.config.audio_token_id
+
+        special_image_mask = jnp.broadcast_to(jnp.expand_dims(special_image_mask, axis=-1), input_embeds.shape)
+        if image_features is not None:
+            n_image_tokens = jnp.sum(special_image_mask)
+            if input_embeds[special_image_mask].size != image_features.size:
+                raise ValueError(
+                    f"Image features and image tokens do not match: tokens: {n_image_tokens}, features {image_features.shape[0]}"
+                )
+
+        special_video_mask = jnp.broadcast_to(jnp.expand_dims(special_video_mask, axis=-1), input_embeds.shape)
+        if video_features is not None:
+            n_video_tokens = jnp.sum(special_video_mask)
+            if input_embeds[special_video_mask].size != video_features.size:
+                raise ValueError(
+                    f"Videos features and video tokens do not match: tokens: {n_video_tokens}, features {video_features.shape[0]}"
+                )
+
+        special_audio_mask = jnp.broadcast_to(jnp.expand_dims(special_audio_mask, axis=-1), input_embeds.shape)
+
+        return special_image_mask, special_video_mask, special_audio_mask
+
     def __call__(
         self,
         forward_batch: ForwardBatch,
+        input_features=None,
+        audio_feature_lengths=None,
+        pixel_values=None,
+        pixel_values_videos=None,
+        image_grid_thw=None,
+        video_grid_thw=None,
     ):
-        # 1. Extract the input embeddings
-        inputs_embeds = self.text_embed_tokens(forward_batch.input_ids)
+        """
+        Encodes audios into continuous embeddings that can be forwarded to the language model.
+
+        Args:
+            input_features (`torch.FloatTensor`):
+                The tensors corresponding to the input audios.
+            audio_feature_lengths (`torch.LongTensor` of shape `(num_audios)`, *optional*):
+                The length of feature shape of each audio in LLM.
+        """
+
+        input_embeds = forward_batch.input_embeds
+        if input_embeds is None:
+            # 1. Extract the input embeddings
+            input_embeds = self.text_embed_tokens(forward_batch.input_ids)
+
+        visual_embeds_multiscale = None
+        visual_pos_masks = None
+
+        audio_embeds = None
+        image_embeds = None
+        video_embeds = None
+
+        # Merge text , audios , image and video
+        if input_features is not None:
+            audio_embeds = self.audio_tower(
+                input_features,
+                feature_lens=audio_feature_lengths,
+            )
+
+        if pixel_values is not None:
+            image_features = self.visual(pixel_values, image_grid_thw)
+            image_embeds, image_embeds_multiscale = image_features.last_hidden_state, image_features.deepstack_features
+            visual_embeds_multiscale = image_embeds_multiscale
+
+        if pixel_values_videos is not None:
+            video_features = self.visual(pixel_values_videos, video_grid_thw)
+            video_embeds, video_embeds_multiscale = video_features.last_hidden_state, video_features.deepstack_features
+            if visual_embeds_multiscale is None:
+                visual_embeds_multiscale = video_embeds_multiscale
+
+        image_mask, video_mask, audio_mask = self.get_placeholder_mask(
+            forward_batch.input_ids, input_embeds=input_embeds, image_features=image_embeds, video_features=video_embeds
+        )
+        input_embeds = input_embeds.at[audio_mask].set(audio_embeds)
+        input_embeds = input_embeds.at[image_mask].set(image_embeds)
+        input_embeds = input_embeds.at[video_mask].set(video_embeds)
+
+        visual_pos_masks = image_mask if image_mask is not None else video_mask
+
+        # for image and video mask
+        if pixel_values is not None and pixel_values_videos is not None:
+            visual_pos_masks = video_mask | image_mask
+            visual_embeds_multiscale_joint = ()
+            image_mask_joint = image_mask[visual_pos_masks]
+            video_mask_joint = video_mask[visual_pos_masks]
+            for img_embed, vid_embed in zip(visual_embeds_multiscale, video_embeds_multiscale):
+                embed_joint = img_embed.new_zeros(visual_pos_masks.sum(), img_embed.shape[-1])
+                embed_joint[image_mask_joint, :] = img_embed
+                embed_joint[video_mask_joint, :] = vid_embed
+                visual_embeds_multiscale_joint = visual_embeds_multiscale_joint + (embed_joint,)
+            visual_embeds_multiscale = visual_embeds_multiscale_joint
+
+        return input_embeds, visual_embeds_multiscale, visual_pos_masks
