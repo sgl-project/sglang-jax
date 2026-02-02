@@ -51,13 +51,19 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v5
 
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
       - name: Run unit test
         timeout-minutes: 60
         shell: bash
         env:
           SGLANG_JAX_IS_IN_CI: true
         run: |
-          python3.12 -m venv .venv
+          # Create venv using the setup-python python
+          python -m venv .venv
           source .venv/bin/activate
           pip install uv
           uv pip install -e "python[all]"
