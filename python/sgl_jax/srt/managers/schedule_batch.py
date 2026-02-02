@@ -1159,7 +1159,7 @@ class ScheduleBatch:
             extend_prefix_lens = np.array(self.prefix_lens, dtype=np.int32)
             bs_paddings = bs_paddings[-1:]
             cache_loc_paddings = cache_loc_paddings[-1:]
-            extend_logprob_start_lens = self.extend_logprob_start_lens
+            extend_logprob_start_lens = np.array(self.extend_logprob_start_lens, dtype=np.int32) 
 
         bid = acc_global_bid()
 
