@@ -180,10 +180,23 @@ class ModelRunner(BaseModelRunner):
         sampler_def, sampler_state = nnx.split(self.sampler)
         sampler_state_leaves, sampler_state_def = jax.tree_util.tree_flatten(sampler_state)
 
+        enable_tpu_log_recorder = jax.default_backend() == "tpu" and (
+            get_bool_env_var("SGLANG_JAX_ENABLE_KERNEL_LOG_RECORDER")
+        )
+        jit_compiler_options = (
+            {"xla_tpu_enable_log_recorder": "true"} if enable_tpu_log_recorder else None
+        )
+        if enable_tpu_log_recorder:
+            logger.info(
+                "Enabling TPU log recorder for JIT compilation "
+                "(compiler_options: xla_tpu_enable_log_recorder=true)."
+            )
+
         @partial(
             jax.jit,
             donate_argnames=["token_to_kv_pool"],  # just donate KV cache
             static_argnames=["model_state_def"],
+            compiler_options=jit_compiler_options,
         )
         def jitted_run_model(
             model_def,
