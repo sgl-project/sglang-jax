@@ -198,23 +198,36 @@ class OpenAIServingChat(OpenAIServingBase):
 
             # If tokenizer doesn't have a chat_template and no chat_template is provided in kwargs
             if (
-                not hasattr(self.tokenizer_manager.tokenizer, "chat_template")
-                or self.tokenizer_manager.tokenizer.chat_template is None
-            ) and "chat_template" not in chat_template_kwargs:
+                (
+                    not hasattr(self.tokenizer_manager.tokenizer, "chat_template")
+                    or self.tokenizer_manager.tokenizer.chat_template is None
+                )
+                and "chat_template" not in chat_template_kwargs
+                and self.tokenizer_manager.mm_processor is None
+            ):
                 # Use a simple default chat template
                 default_template = """{% for message in messages %}{% if message['role'] == 'system' %}{{ message['content'] }}{% elif message['role'] == 'user' %}User: {{ message['content'] }}{% elif message['role'] == 'assistant' %}Assistant: {{ message['content'] }}{% endif %}{% if not loop.last %}
 
 {% endif %}{% endfor %}{% if add_generation_prompt %}
 Assistant: {% endif %}"""
                 chat_template_kwargs["chat_template"] = default_template
-
-            prompt_ids = self.tokenizer_manager.tokenizer.apply_chat_template(
-                openai_compatible_messages,
-                tokenize=True,
-                add_generation_prompt=True,
-                tools=tools,
-                **chat_template_kwargs,
-            )
+            if self.tokenizer_manager.mm_processor is not None:
+                prompt = self.tokenizer_manager.mm_processor.apply_chat_template(
+                    openai_compatible_messages,
+                    tokenize=False,  # can't use tokenize=True, it will occur error
+                    add_generation_prompt=True,
+                    tools=tools,
+                    **chat_template_kwargs,
+                )
+                prompt_ids = self.tokenizer_manager.tokenizer.encode(prompt)
+            else:
+                prompt_ids = self.tokenizer_manager.tokenizer.apply_chat_template(
+                    openai_compatible_messages,
+                    tokenize=True,
+                    add_generation_prompt=True,
+                    tools=tools,
+                    **chat_template_kwargs,
+                )
         except Exception:
             #  This except branch will be triggered when the chosen model
             #  has a different tools input format that is not compatible
