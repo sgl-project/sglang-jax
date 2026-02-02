@@ -70,3 +70,32 @@ jobs:
           
           # Run the TPU v6e-1 suite
           python test/srt/run_suite.py --suite unit-test-tpu-v6e-1
+
+  # =============================================== unit-test (standard) ====================================================
+  unit-test-tpu-v6e-1-standard:
+    needs: [check-changes]
+    if: github.event.pull_request.draft == false && needs.check-changes.outputs.main_package == 'true'
+    runs-on: tpu-runner-2
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Run unit test
+        timeout-minutes: 60
+        shell: bash
+        env:
+          SGLANG_JAX_IS_IN_CI: true
+        run: |
+          # Create venv using the setup-python python
+          python -m venv .venv
+          source .venv/bin/activate
+          pip install uv
+          uv pip install -e "python[all]"
+          
+          # Run the TPU v6e-1 suite
+          python test/srt/run_suite.py --suite unit-test-tpu-v6e-1
