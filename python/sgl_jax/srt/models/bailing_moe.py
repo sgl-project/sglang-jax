@@ -414,7 +414,13 @@ class BailingMoEDecoderLayer(nnx.Module):
 
             correction_bias = self.moe_gate.bias.value if self.moe_gate.bias is not None else None
             if self.use_fused:
-                hidden_states = self.mlp(hidden_states, router_logits, router_bias=correction_bias)
+                token_valid_mask = forward_batch.get_token_valid_mask(hidden_states.shape[0])
+                hidden_states = self.mlp(
+                    hidden_states,
+                    router_logits,
+                    router_bias=correction_bias,
+                    token_valid_mask=token_valid_mask,
+                )
                 topk_ids = None
             else:
                 topk_weights, topk_ids = self.topk(router_logits, correction_bias)

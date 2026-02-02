@@ -260,6 +260,19 @@ class ForwardBatch:
         jax_arrays_str = ", ".join(jax_array_fields)
         return f"ForwardBatch(forward_mode={self.forward_mode}, batch_size={self.batch_size}, {jax_arrays_str})"
 
+    def get_token_valid_mask(self, num_tokens: int) -> jax.Array | None:
+        """Return a per-token validity mask for padded batches.
+
+        Prefer using `out_cache_loc` when available because it aligns with the
+        token dimension in both decode and extend: padded tokens are marked as
+        `-1` in `out_cache_loc`.
+        """
+        if self.out_cache_loc is not None and self.out_cache_loc.shape == (num_tokens,):
+            return self.out_cache_loc > 0
+        if self.seq_lens is None or self.seq_lens.ndim != 1 or num_tokens != self.seq_lens.shape[0]:
+            return None
+        return self.seq_lens > 0
+
     @classmethod
     def init_new(
         cls,

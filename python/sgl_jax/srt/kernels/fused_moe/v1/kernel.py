@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import functools
 import math
+import os
 from dataclasses import dataclass
 
 import jax
@@ -17,6 +18,8 @@ from jax.experimental.pallas import tpu as pltpu
 P = jax.sharding.PartitionSpec
 
 cdiv = pl.cdiv
+
+FUSED_MOE_DEBUG = int(os.getenv("SGL_FUSED_MOE_DEBUG", "0"))
 
 
 @jax.tree_util.register_pytree_node_class
@@ -540,6 +543,8 @@ def _fused_ep_moe_kernel(
     bd2c: int,  # Compute size of block hidden_size.
     bse: int,  # Block size for SE intermediate_size.
 ):
+    if FUSED_MOE_DEBUG >= 1:
+        pl.debug_print("[fused_moe] start...")
     dp_rank = lax.axis_index(dp_axis_name)
     tp_rank = lax.axis_index(tp_axis_name)
     tp_size = lax.axis_size(tp_axis_name)
@@ -557,6 +562,18 @@ def _fused_ep_moe_kernel(
     padded_top_k = t2e_routing_x2_smem.shape[-1]
     assert padded_num_experts == align_to(num_experts, 128)
     assert padded_top_k == align_to(top_k, 128)
+
+    if FUSED_MOE_DEBUG >= 1:
+
+        @pl.when(my_id == 0)
+        def _():
+            pl.debug_print(
+                "[fused_moe] local_num_tokens={} bt={} num_bt={} num_devices={}",
+                local_num_tokens,
+                bt,
+                num_bt,
+                num_devices,
+            )
 
     t_dtype = tokens_hbm.dtype
     t_packing = get_dtype_packing(t_dtype)
@@ -645,9 +662,20 @@ def _fused_ep_moe_kernel(
             sem=b_gating_sem,
         ).wait()
 
-    def get_top_k(input_logits, top_k, renormalize_topk_logits, *, out_top_k_logits_vmem):
+    def get_top_k(
+        input_logits,
+        top_k,
+        renormalize_topk_logits,
+        *,
+        out_top_k_logits_vmem,
+    ):
         input_logits = input_logits.astype(jnp.float32)
         num_tokens = input_logits.shape[0]
+        # Derive validity from gating logits: invalid tokens are pre-masked to
+        # all -inf (outside pallas), which keeps routing/comm fully well-defined
+        # without needing a separate per-token mask DMA.
+        max_logits = jnp.max(input_logits[:, :num_experts], axis=1, keepdims=True)
+        valid_col = jnp.isfinite(max_logits).astype(jnp.int32)
 
         if b_bias_vmem is not None:
             # b_bias_vmem (padded_num_experts,)
@@ -680,23 +708,25 @@ def _fused_ep_moe_kernel(
                 group_scores_list.append(g_score)
 
             group_scores = jnp.concatenate(group_scores_list, axis=1)
-            group_mask_accum = jnp.zeros((num_tokens, num_groups), dtype=jnp.bool_)
+            # Use int32 masks to avoid TPU Mosaic limitations around reshaping i1/bool vectors.
+            group_mask_accum = jnp.zeros((num_tokens, num_groups), dtype=jnp.int32)
             temp_group_scores = group_scores
             group_iota = jax.lax.broadcasted_iota(jnp.int32, (num_tokens, num_groups), 1)
 
             for _ in range(top_k_groups):
                 curr_max_group_idx = jnp.argmax(temp_group_scores, axis=1, keepdims=True)
                 curr_mask = group_iota == curr_max_group_idx
-                group_mask_accum = jnp.logical_or(group_mask_accum, curr_mask)
+                group_mask_accum = jnp.maximum(group_mask_accum, curr_mask.astype(jnp.int32))
                 temp_group_scores = jnp.where(curr_mask, -jnp.float32(jnp.inf), temp_group_scores)
 
             masked_routing_slices = []
             for g in range(num_groups):
-                g_mask = group_mask_accum[:, g : g + 1]
+                g_mask = group_mask_accum[:, g]
                 start = g * experts_per_group
                 end = start + experts_per_group
                 inp_slice = routing_scores[:, start:end]
-                masked_slice = jnp.where(g_mask, inp_slice, -jnp.float32(jnp.inf))
+                g_mask_bcast = jnp.broadcast_to(g_mask[:, None], inp_slice.shape)
+                masked_slice = jnp.where(g_mask_bcast != 0, inp_slice, -jnp.float32(jnp.inf))
                 masked_routing_slices.append(masked_slice)
             curr_scores = jnp.concatenate(masked_routing_slices, axis=1)
         else:
@@ -714,6 +744,9 @@ def _fused_ep_moe_kernel(
             # Select expert from current scores (masked/biased)
             curr_indices = jnp.argmax(curr_scores[:, :num_experts], axis=1, keepdims=True)
             top_k_indices = jnp.broadcast_to(curr_indices, padded_k_shape)
+            # Encode padding by setting expert id to -1. This avoids needing a
+            # separate per-token mask in later scalar code paths (scatter/output).
+            top_k_indices = top_k_indices * valid_col + (-jnp.int32(1)) * (jnp.int32(1) - valid_col)
 
             selection_mask = iota == broadcast_minor(top_k_indices, curr_scores.shape)
 
@@ -857,29 +890,45 @@ def _fused_ep_moe_kernel(
             src_t_id = bt_start + t_id
             for k_id in range(top_k):
                 e_id = t2e_routing_x2_smem[bt_sem_id, t_id, k_id]
-                is_active_expert = e_id % local_num_experts == local_e_id
-                recv_id = e_id // local_num_experts
-                offset = expert_offsets_x2_smem[bt_sem_id, 0, e_id]
+                is_valid = e_id >= 0
+                e_id_safe = lax.select(is_valid, e_id, jnp.int32(0))
+                is_active_expert = is_valid & (e_id_safe % local_num_experts == local_e_id)
+                recv_id = e_id_safe // local_num_experts
+                offset = expert_offsets_x2_smem[bt_sem_id, 0, e_id_safe]
                 sz = lax.select(is_active_expert, jnp.int32(1), jnp.int32(0))
                 is_local = recv_id == my_id
                 local_sz = lax.select(is_local, sz, jnp.int32(0))
                 remote_sz = lax.select(is_local, jnp.int32(0), sz)
                 send_sz += remote_sz
-                expert_offsets_x2_smem[bt_sem_id, 0, e_id] = offset + local_sz + remote_sz
-                start = expert_starts_x2_smem[bt_sem_id, 0, e_id] + offset
-                pltpu.make_async_copy(
-                    src_ref=tokens_hbm.at[pl.ds(src_t_id, local_sz)],
-                    dst_ref=a2a_s_x2_hbm.at[e_sem_id, pl.ds(start, local_sz)],
-                    sem=recv_x2_sems.at[e_sem_id],
-                ).start()
-                pltpu.make_async_remote_copy(
-                    src_ref=tokens_hbm.at[pl.ds(src_t_id, remote_sz)],
-                    dst_ref=a2a_s_x2_hbm.at[e_sem_id, pl.ds(start, remote_sz)],
-                    send_sem=send_x2_sems.at[e_sem_id],
-                    recv_sem=recv_x2_sems.at[e_sem_id],
-                    device_id=get_mesh_device_id(recv_id),
-                    device_id_type=pltpu.DeviceIdType.MESH,
-                ).start()
+                expert_offsets_x2_smem[bt_sem_id, 0, e_id_safe] = offset + local_sz + remote_sz
+                start = expert_starts_x2_smem[bt_sem_id, 0, e_id_safe] + offset
+
+                @pl.when(local_sz != 0)
+                def _local_copy(
+                    src_t_id=src_t_id, start=start, local_sz=local_sz, e_sem_id=e_sem_id
+                ):
+                    pltpu.make_async_copy(
+                        src_ref=tokens_hbm.at[pl.ds(src_t_id, local_sz)],
+                        dst_ref=a2a_s_x2_hbm.at[e_sem_id, pl.ds(start, local_sz)],
+                        sem=recv_x2_sems.at[e_sem_id],
+                    ).start()
+
+                @pl.when(remote_sz != 0)
+                def _remote_copy(
+                    src_t_id=src_t_id,
+                    start=start,
+                    remote_sz=remote_sz,
+                    e_sem_id=e_sem_id,
+                    recv_id=recv_id,
+                ):
+                    pltpu.make_async_remote_copy(
+                        src_ref=tokens_hbm.at[pl.ds(src_t_id, remote_sz)],
+                        dst_ref=a2a_s_x2_hbm.at[e_sem_id, pl.ds(start, remote_sz)],
+                        send_sem=send_x2_sems.at[e_sem_id],
+                        recv_sem=recv_x2_sems.at[e_sem_id],
+                        device_id=get_mesh_device_id(recv_id),
+                        device_id_type=pltpu.DeviceIdType.MESH,
+                    ).start()
 
             return send_sz
 
@@ -895,19 +944,45 @@ def _fused_ep_moe_kernel(
     def wait_a2a_scatter_recv(*, bt_sem_id, e_sem_id, local_e_id):
         e_id = my_id * local_num_experts + local_e_id
         sz = expert_sizes_x2_smem[bt_sem_id, 0, e_id]
-        pltpu.make_async_copy(
-            src_ref=a2a_s_x2_hbm.at[e_sem_id, pl.ds(0, sz)],
-            dst_ref=a2a_s_x2_hbm.at[e_sem_id, pl.ds(0, sz)],
-            sem=recv_x2_sems.at[e_sem_id],
-        ).wait()
 
-    def wait_a2a_scatter_send(e_sem_id):
-        sz = a2a_s_sends_x2_smem[e_sem_id]
-        pltpu.make_async_copy(
-            src_ref=a2a_s_x2_hbm.at[e_sem_id, pl.ds(0, sz)],
-            dst_ref=a2a_s_x2_hbm.at[e_sem_id, pl.ds(0, sz)],
-            sem=send_x2_sems.at[e_sem_id],
-        ).wait()
+        @pl.when(sz != 0)
+        def _():
+            # Wait via an aligned, fixed-size slice to avoid edge cases when sz==0
+            # and TPU Mosaic tiling constraints on tiny (e.g. 1) slices.
+            ref = a2a_s_x2_hbm.at[e_sem_id, pl.ds(0, bts)]
+            pltpu.make_async_copy(
+                src_ref=ref,
+                dst_ref=ref,
+                sem=recv_x2_sems.at[e_sem_id],
+            ).wait()
+
+    def wait_a2a_scatter_send(*, bt_sem_id, e_sem_id, local_e_id):
+        # `send_x2_sems[e_sem_id]` is shared by:
+        #   - scatter remote copies (tokens -> a2a_s_x2_hbm)
+        #   - gather remote copies (a2a_s_acc_x2_hbm -> a2a_g_hbm)
+        # We must wait iff either phase posted at least one remote send.
+        my_e_id = my_id * local_num_experts + local_e_id
+        scatter_send_sz = a2a_s_sends_x2_smem[e_sem_id]
+        gather_sz = expert_sizes_x2_smem[bt_sem_id, 0, my_e_id]
+        gather_local_sz = d2e_count_x2_smem[bt_sem_id, my_id, 0, my_e_id]
+        gather_remote_sz = gather_sz - gather_local_sz
+        gather_remote_sz = lax.select(
+            jnp.logical_and(local_e_id >= 0, local_e_id < local_num_experts),
+            gather_remote_sz,
+            0,
+        )
+        should_wait = (scatter_send_sz + gather_remote_sz) != 0
+
+        @pl.when(should_wait)
+        def _():
+            # Wait via `a2a_g_hbm` so reads from `a2a_g_hbm` can't be reordered
+            # before the gather completes. Slice length uses `bt` to satisfy tiling.
+            ref = a2a_g_hbm.at[0, pl.ds(0, bt)]
+            pltpu.make_async_copy(
+                src_ref=ref,
+                dst_ref=ref,
+                sem=send_x2_sems.at[e_sem_id],
+            ).wait()
 
     def start_a2a_gather(*, bt_sem_id, e_sem_id, local_e_id):
         my_e_id = my_id * local_num_experts + local_e_id
@@ -918,19 +993,36 @@ def _fused_ep_moe_kernel(
             is_local = recv_id == my_id
             local_sz = lax.select(is_local, sz, 0)
             remote_sz = lax.select(is_local, 0, sz)
-            pltpu.make_async_copy(
-                src_ref=src_ref.at[e_sem_id, pl.ds(start, local_sz)],
-                dst_ref=a2a_g_hbm.at[my_e_id, pl.ds(0, local_sz)],
-                sem=a2a_gather_sem,
-            ).start()
-            pltpu.make_async_remote_copy(
-                src_ref=src_ref.at[e_sem_id, pl.ds(start, remote_sz)],
-                dst_ref=a2a_g_hbm.at[my_e_id, pl.ds(0, remote_sz)],
-                send_sem=send_x2_sems.at[e_sem_id],
-                recv_sem=a2a_gather_sem,
-                device_id=get_mesh_device_id(recv_id),
-                device_id_type=pltpu.DeviceIdType.MESH,
-            ).start()
+
+            @pl.when(local_sz != 0)
+            def _local_copy(
+                start=start,
+                local_sz=local_sz,
+                my_e_id=my_e_id,
+                e_sem_id=e_sem_id,
+            ):
+                pltpu.make_async_copy(
+                    src_ref=src_ref.at[e_sem_id, pl.ds(start, local_sz)],
+                    dst_ref=a2a_g_hbm.at[my_e_id, pl.ds(0, local_sz)],
+                    sem=a2a_gather_sem,
+                ).start()
+
+            @pl.when(remote_sz != 0)
+            def _remote_copy(
+                start=start,
+                remote_sz=remote_sz,
+                my_e_id=my_e_id,
+                e_sem_id=e_sem_id,
+                recv_id=recv_id,
+            ):
+                pltpu.make_async_remote_copy(
+                    src_ref=src_ref.at[e_sem_id, pl.ds(start, remote_sz)],
+                    dst_ref=a2a_g_hbm.at[my_e_id, pl.ds(0, remote_sz)],
+                    send_sem=send_x2_sems.at[e_sem_id],
+                    recv_sem=a2a_gather_sem,
+                    device_id=get_mesh_device_id(recv_id),
+                    device_id_type=pltpu.DeviceIdType.MESH,
+                ).start()
 
             start += sz
 
@@ -942,25 +1034,32 @@ def _fused_ep_moe_kernel(
         is_valid = jnp.logical_and(local_e_id >= 0, local_e_id < local_num_experts)
         remote_sz = lax.select(is_valid, remote_sz, 0)
 
-        # Important: wait via `a2a_g_hbm` itself (matches f5b4) so reads from
-        # `a2a_g_hbm` can't be reordered before the gather completes.
-        ref = a2a_g_hbm.at[0, pl.ds(0, remote_sz)]
-        pltpu.make_async_copy(
-            src_ref=ref,
-            dst_ref=ref,
-            sem=send_x2_sems.at[e_sem_id],
-        ).wait()
+        @pl.when(remote_sz != 0)
+        def _():
+            # Wait via `a2a_g_hbm` so reads from `a2a_g_hbm` can't be reordered
+            # before the gather completes. Slice length uses `bt` to satisfy tiling.
+            ref = a2a_g_hbm.at[0, pl.ds(0, bt)]
+            pltpu.make_async_copy(
+                src_ref=ref,
+                dst_ref=ref,
+                sem=send_x2_sems.at[e_sem_id],
+            ).wait()
 
-    def wait_a2a_gather_recv_all(*, bt_size):
-        # Align to f5b4: wait using a flat slice into `a2a_g_hbm` sized to the
-        # total gathered token vectors for this bt tile (`top_k * bt_size`).
-        sz = jnp.int32(bt_size * top_k)
-        ref = a2a_g_hbm.at[0, pl.ds(0, sz)]
-        pltpu.make_async_copy(
-            src_ref=ref,
-            dst_ref=ref,
-            sem=a2a_gather_sem,
-        ).wait()
+    def wait_a2a_gather_recv_all(*, bt_sem_id):
+        def _sum_one(t_id, acc):
+            token_e0 = t2e_routing_x2_smem[bt_sem_id, t_id, 0]
+            return acc + (token_e0 >= 0).astype(jnp.int32)
+
+        num_valid = lax.fori_loop(0, bt, _sum_one, jnp.int32(0), unroll=False)
+
+        @pl.when(num_valid != 0)
+        def _():
+            ref = a2a_g_hbm.at[0, pl.ds(0, bt)]
+            pltpu.make_async_copy(
+                src_ref=ref,
+                dst_ref=ref,
+                sem=a2a_gather_sem,
+            ).wait()
 
     def start_fetch_and_wait_se_scales():
         if w1_shared_hbm is None:
@@ -1884,25 +1983,56 @@ def _fused_ep_moe_kernel(
         def start_load_acc_bt(*, tile_start, buf_id):
             def _load_one(t_i, _):
                 t_id = tile_start + t_i
-                for k_id in range(top_k):
-                    e_id = t2e_routing_x2_smem[bt_sem_id, t_id, k_id]
-                    offset = expert_offsets_x2_smem[bt_sem_id, 1, e_id]
-                    expert_offsets_x2_smem[bt_sem_id, 1, e_id] = offset + 1
-                    pltpu.make_async_copy(
-                        src_ref=a2a_g_hbm.at[e_id, pl.ds(offset, 1)],
-                        dst_ref=a2a_g_acc_vmem.at[buf_id, k_id, pl.ds(t_i, 1)],
-                        sem=a2a_acc_sems.at[0],
-                    ).start()
+                # Use the routing sentinel (-1) to identify padding tokens.
+                token_e0 = t2e_routing_x2_smem[bt_sem_id, t_id, 0]
+                is_valid_token = token_e0 >= 0
+
+                @pl.when(is_valid_token)
+                def _():
+                    for k_id in range(top_k):
+                        e_id = t2e_routing_x2_smem[bt_sem_id, t_id, k_id]
+                        offset = expert_offsets_x2_smem[bt_sem_id, 1, e_id]
+                        expert_offsets_x2_smem[bt_sem_id, 1, e_id] = offset + 1
+                        pltpu.make_async_copy(
+                            src_ref=a2a_g_hbm.at[e_id, pl.ds(offset, 1)],
+                            dst_ref=a2a_g_acc_vmem.at[buf_id, k_id, pl.ds(t_i, 1)],
+                            sem=a2a_acc_sems.at[0],
+                        ).start()
+
+                @pl.when(jnp.logical_not(is_valid_token))
+                def _():
+                    zeros = jnp.zeros((1, t_packing, h_per_t_packing), dtype=a2a_g_acc_vmem.dtype)
+                    for k_id in range(top_k):
+                        a2a_g_acc_vmem.at[buf_id, k_id, pl.ds(t_i, 1)][...] = zeros
+
                 return None
 
             lax.fori_loop(0, acc_bt, _load_one, None, unroll=False)
 
-        def wait_load_acc_bt(*, buf_id):
-            pltpu.make_async_copy(
-                src_ref=a2a_g_acc_vmem.at[buf_id],
-                dst_ref=a2a_g_acc_vmem.at[buf_id],
-                sem=a2a_acc_sems.at[0],
-            ).wait()
+        def wait_load_acc_bt(*, buf_id, tile_start):
+            # If this acc tile contains zero valid tokens, `start_load_acc_bt` does not
+            # launch any HBM->VMEM async copies (it just writes zeros into VMEM).
+            # Waiting on `a2a_acc_sems` in that case can hang because the semaphore
+            # is never signaled.
+            def _count_valid(t_i, acc):
+                token_e0 = t2e_routing_x2_smem[bt_sem_id, tile_start + t_i, 0]
+                return acc + (token_e0 >= 0).astype(jnp.int32)
+
+            num_valid = lax.fori_loop(
+                0,
+                acc_bt,
+                _count_valid,
+                jnp.int32(0),
+                unroll=False,
+            )
+
+            @pl.when(num_valid != 0)
+            def _():
+                pltpu.make_async_copy(
+                    src_ref=a2a_g_acc_vmem.at[buf_id],
+                    dst_ref=a2a_g_acc_vmem.at[buf_id],
+                    sem=a2a_acc_sems.at[0],
+                ).wait()
 
         def acc_gather_to_output(*, tile_start, out_offset, buf_id):
             output_tile = jnp.zeros((acc_bt, t_packing, h_per_t_packing), dtype=jnp.float32)
@@ -1943,7 +2073,7 @@ def _fused_ep_moe_kernel(
             def _():
                 start_load_acc_bt(tile_start=next_tile_start, buf_id=next_buf_id)
 
-            wait_load_acc_bt(buf_id=curr_buf_id)
+            wait_load_acc_bt(buf_id=curr_buf_id, tile_start=curr_tile_start)
 
             acc_gather_to_output(
                 tile_start=curr_tile_start, out_offset=out_offset, buf_id=curr_buf_id
@@ -1965,13 +2095,22 @@ def _fused_ep_moe_kernel(
 
     def wait_store_output(*, bt_id):
         is_valid = jnp.logical_and(bt_id >= 0, bt_id < num_bt)
-        sz = pl.multiple_of(lax.select(is_valid, bt, 0), bt)
-        bt_sem_id = (bt_id + 2) & 1
-        pltpu.make_async_copy(
-            src_ref=output_hbm.at[pl.ds(0, sz)],
-            dst_ref=output_hbm.at[pl.ds(0, sz)],
-            sem=local_sems.at[bt_sem_id, 4],
-        ).wait()
+        bt_sem_id = bt_id & 1
+
+        # Avoid zero-size DMA waits: if this `bt_id` was never sent, the semaphore
+        # will never be signaled and an unconditional `.wait()` can hang.
+        @pl.when(is_valid)
+        def _():
+            bt_start = bt_id * bt
+            ref = output_hbm.at[pl.ds(bt_start, bt)]
+            pltpu.make_async_copy(
+                src_ref=ref,
+                dst_ref=ref,
+                sem=local_sems.at[bt_sem_id, 4],
+            ).wait()
+
+        if FUSED_MOE_DEBUG >= 2:
+            pl.debug_print("[fused_moe] dev={} bt_id={} after wait_store_output", my_id, bt_id)
 
     ### ------- Kernel start ------- ###
     sync_barrier()
@@ -2124,6 +2263,9 @@ def _fused_ep_moe_kernel(
         next_bt_id = bt_id + jnp.int32(1)
         out_buf_id = bt_id & jnp.int32(1)
 
+        if FUSED_MOE_DEBUG >= 1:
+            pl.debug_print("[fused_moe] dev={} bt_id={} enter e_sem={}", my_id, bt_id, e_sem_id)
+
         @pl.when(next_bt_id < num_bt)
         def _():
             start_fetch_b_gating(bt_id=next_bt_id)
@@ -2138,6 +2280,13 @@ def _fused_ep_moe_kernel(
             renormalize_topk_logits,
             out_top_k_logits_vmem=top_k_logits_vmem,
         )
+        if FUSED_MOE_DEBUG >= 3:
+
+            @pl.when(jnp.logical_and(bt_id == 0, my_id == 0))
+            def _():
+                pl.debug_print("expert_sizes: {}", expert_sizes)
+                pl.debug_print("t2e_routing: {}", t2e_routing)
+
         all_reduce_metadata(
             bt_sem_id=bt_sem_id,
             t2e_routing=t2e_routing,
@@ -2145,6 +2294,9 @@ def _fused_ep_moe_kernel(
             sizes=expert_sizes,
         )
         sync_barrier()
+
+        if FUSED_MOE_DEBUG >= 1:
+            pl.debug_print("[fused_moe] dev={} bt_id={} after all_reduce/barrier", my_id, bt_id)
 
         wait_store_output(bt_id=bt_id - 2)
 
@@ -2191,7 +2343,11 @@ def _fused_ep_moe_kernel(
             run_shared_expert_slice(curr_se_block, bt_id, bt_sem_id, out_buf_id)
             curr_se_block += 1
 
-            wait_a2a_scatter_send(curr_e_sem_id)
+            wait_a2a_scatter_send(
+                bt_sem_id=bt_sem_id,
+                e_sem_id=curr_e_sem_id,
+                local_e_id=local_e_id,
+            )
             sync_barrier()
             return (next_e_sem_id, curr_se_block)
 
@@ -2206,24 +2362,83 @@ def _fused_ep_moe_kernel(
 
         lax.fori_loop(final_se_block, se_total_blocks, cleanup_body, None)
 
-        wait_a2a_gather_recv_all(bt_size=bt)
+        wait_a2a_gather_recv_all(bt_sem_id=bt_sem_id)
         sync_barrier()
 
+        if FUSED_MOE_DEBUG >= 1:
+            pl.debug_print("[fused_moe] dev={} bt_id={} after gather_recv/barrier", my_id, bt_id)
+
+        if FUSED_MOE_DEBUG >= 2:
+
+            @pl.when(bt_id == 0)
+            def _():
+                pl.debug_print(
+                    "[fused_moe] dev={} bt_id={} before acc_and_store_output", my_id, bt_id
+                )
+
         acc_and_store_output(bt_sem_id=bt_sem_id, out_buf_id=out_buf_id)
+        if FUSED_MOE_DEBUG >= 2:
+
+            @pl.when(bt_id == 0)
+            def _():
+                pl.debug_print(
+                    "[fused_moe] dev={} bt_id={} after acc_and_store_output", my_id, bt_id
+                )
+
+        if FUSED_MOE_DEBUG >= 2:
+
+            @pl.when(bt_id == 0)
+            def _():
+                pl.debug_print("[fused_moe] dev={} bt_id={} before start_send_bo", my_id, bt_id)
 
         start_send_bo(bt_id=bt_id)
+        if FUSED_MOE_DEBUG >= 2:
 
-        wait_a2a_gather_send(
+            @pl.when(bt_id == 0)
+            def _():
+                pl.debug_print("[fused_moe] dev={} bt_id={} after start_send_bo", my_id, bt_id)
+
+        if FUSED_MOE_DEBUG >= 2:
+
+            @pl.when(bt_id == 0)
+            def _():
+                pl.debug_print(
+                    "[fused_moe] dev={} bt_id={} before final send_sem waits", my_id, bt_id
+                )
+
+        wait_a2a_scatter_send(
             bt_sem_id=bt_sem_id,
             e_sem_id=final_e_sem_id,
             local_e_id=local_num_experts - 2,
         )
-        wait_a2a_gather_send(
+        wait_a2a_scatter_send(
             bt_sem_id=bt_sem_id,
             e_sem_id=lax.select(final_e_sem_id == 0, 1, 0),
             local_e_id=local_num_experts - 1,
         )
+        if FUSED_MOE_DEBUG >= 2:
+
+            @pl.when(bt_id == 0)
+            def _():
+                pl.debug_print(
+                    "[fused_moe] dev={} bt_id={} after final send_sem waits", my_id, bt_id
+                )
+
+        if FUSED_MOE_DEBUG >= 2:
+
+            @pl.when(bt_id == 0)
+            def _():
+                pl.debug_print("[fused_moe] dev={} bt_id={} before final barrier", my_id, bt_id)
+
         sync_barrier()
+        if FUSED_MOE_DEBUG >= 2:
+
+            @pl.when(bt_id == 0)
+            def _():
+                pl.debug_print("[fused_moe] dev={} bt_id={} after final barrier", my_id, bt_id)
+
+        if FUSED_MOE_DEBUG >= 1:
+            pl.debug_print("[fused_moe] dev={} bt_id={} done", my_id, bt_id)
         return final_e_sem_id
 
     lax.fori_loop(0, num_bt, run_bt, jnp.int32(0), unroll=False)
@@ -2242,6 +2457,7 @@ def _validate_fused_ep_moe_args(
     w2: jax.Array,
     w3: jax.Array,
     gating_output: jax.Array,
+    token_valid_mask: jax.Array | None,
     top_k: int,
     use_grouped_topk: bool,
     num_groups: int,
@@ -2288,6 +2504,9 @@ def _validate_fused_ep_moe_args(
 
     if gating_output.shape != (num_tokens, num_experts):
         raise ValueError(f"Expected {gating_output.shape=} to be {(num_tokens, num_experts)}.")
+
+    if token_valid_mask is not None and token_valid_mask.shape != (num_tokens,):
+        raise ValueError(f"Expected {token_valid_mask.shape=} to be {(num_tokens,)}.")
 
     validate_fused_moe_block_config(
         num_tokens=num_tokens,
@@ -2484,6 +2703,7 @@ def fused_ep_moe(
     gating_output: jax.Array,  # (num_tokens, num_experts)
     top_k: int,
     *,
+    token_valid_mask: jax.Array | None = None,  # (num_tokens,)
     use_grouped_topk: bool = False,
     num_groups: int = 1,
     top_k_groups: int = 1,
@@ -2516,6 +2736,7 @@ def fused_ep_moe(
 ):
 
     ep_size = get_ep_size(mesh, dp_axis_name, tp_axis_name)
+
     if block_config is None:
         from .tuned_block_configs import get_tuned_fused_moe_block_config
 
@@ -2546,6 +2767,7 @@ def fused_ep_moe(
         w2=w2,
         w3=w3,
         gating_output=gating_output,
+        token_valid_mask=token_valid_mask,
         top_k=top_k,
         use_grouped_topk=use_grouped_topk,
         num_groups=num_groups,
@@ -2628,6 +2850,13 @@ def fused_ep_moe(
             bias = bias.astype(jnp.float32)
         if padded_num_experts != bias.shape[0]:
             bias = jnp.pad(bias, (0, padded_num_experts - bias.shape[0]), constant_values=0.0)
+
+    if token_valid_mask is not None:
+        token_valid_mask = token_valid_mask.astype(jnp.int32)
+        # Pre-mask invalid tokens in the router logits. This avoids having to DMA
+        # a 1D validity vector into VMEM (HBM->VMEM vector copies require 128-aligned
+        # lengths), and lets the kernel derive validity from `-inf` logits.
+        gating_output = jnp.where(token_valid_mask[:, None] != 0, gating_output, -jnp.inf)
 
     tokens = tokens.reshape(-1, t_packing, hidden_size // t_packing)
 
@@ -2738,7 +2967,7 @@ def fused_ep_moe(
         # Semaphores.
         pltpu.SemaphoreType.DMA((2,)),  # token_stage_x2_sems
         pltpu.SemaphoreType.DMA((3,)),  # acc_stage_x3_sems
-        pltpu.SemaphoreType.DMA((2, 13 if w1_shared is not None else 5)),  # local_sems
+        pltpu.SemaphoreType.DMA((2, 14)),  # local_sems
         pltpu.SemaphoreType.DMA((2,)),  # send_x2_sems
         pltpu.SemaphoreType.DMA((2,)),  # recv_x2_sems
         pltpu.SemaphoreType.DMA,  # a2a_gather_sem

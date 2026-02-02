@@ -10,8 +10,10 @@ from __future__ import annotations
 import argparse
 import faulthandler
 import math
+import os
 import sys
 import traceback
+from functools import partial
 
 import jax
 import jax.numpy as jnp
@@ -40,6 +42,14 @@ from sgl_jax.srt.layers.moe import FusedEPMoE
 # Leave headroom for compiler padding/alignment and any unmodeled VMEM usage.
 DEFAULT_TPU_VMEM_BUDGET_MB = 60
 DEFAULT_TPU_VMEM_BUDGET_BYTES = DEFAULT_TPU_VMEM_BUDGET_MB * 1024 * 1024
+
+
+def _tpu_log_recorder_compiler_options() -> dict[str, str] | None:
+    enable = os.getenv("SGL_TPU_ENABLE_LOG_RECORDER", "0") in ("1", "true", "True")
+    enable = enable or (os.getenv("SGL_FUSED_MOE_DEBUG", "0") in ("1", "true", "True"))
+    if enable and jax.default_backend() == "tpu":
+        return {"xla_tpu_enable_log_recorder": "true"}
+    return None
 
 
 def _dtype_packing(dtype: jnp.dtype) -> int:
@@ -717,7 +727,11 @@ def run_all(
             moe_def, moe_state = nnx.split(fused_layer)
             moe_state_leaves, moe_state_def = jax.tree_util.tree_flatten(moe_state)
 
-            @jax.jit(static_argnames=("moe_state_def", "block_config"))
+            @partial(
+                jax.jit,
+                static_argnames=("moe_state_def", "block_config"),
+                compiler_options=_tpu_log_recorder_compiler_options(),
+            )
             def run(tokens, router_logits, *, moe_state_def, moe_state_leaves, block_config):
                 moe_state = jax.tree_util.tree_unflatten(moe_state_def, moe_state_leaves)
                 moe = nnx.merge(moe_def, moe_state)
