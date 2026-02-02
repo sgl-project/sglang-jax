@@ -468,7 +468,7 @@ class LogitsProcessor(nnx.Module):
         if logits_metadata.top_p_normalized_logprobs and (logits_metadata.top_p != 1.0).any():
             from sgl_jax.srt.layers.sampler import top_p_normalize_probs_jax
 
-            probs = jnp.softmax(last_logits, axis=-1)
+            probs = nn.softmax(last_logits, axis=-1)
             del last_logits
             probs = top_p_normalize_probs_jax(probs, logits_metadata.top_p, self.mesh)
             return jnp.log(probs)
