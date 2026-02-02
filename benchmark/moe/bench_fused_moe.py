@@ -56,6 +56,8 @@ def _estimate_vmem_bytes(
     weight_dtype: jnp.dtype,
     router_dtype: jnp.dtype,
     cfg: FusedMoEBlockConfig,
+    intermediate_size: int,
+    hidden_size: int,
     use_shared_expert: bool = False,
     subc_quant_wsz: int | None = None,
     verbose: bool = False,
@@ -197,12 +199,9 @@ def _estimate_vmem_bytes(
         # b_se_w3_scale_x2_vmem: (2, t_packing, bd1 // t_packing // subc_quant_wsz, 1, bse)
         # b_se_w2_scale_x2_vmem: (2, t_packing, bse // subc_quant_wsz, 1, bd2 // t_packing)
         if subc_quant_wsz is not None:
-            bd1_per_pack = bd1 // t_packing
-            bd2_per_pack = bd2 // t_packing
-            se_w1_scale = 2 * t_packing * (bd1_per_pack // subc_quant_wsz) * 1 * bse * 4
-            se_w3_scale = 2 * t_packing * (bd1_per_pack // subc_quant_wsz) * 1 * bse * 4
-            se_w2_scale = 2 * t_packing * (bse // subc_quant_wsz) * 1 * bd2_per_pack * 4
-            total_bytes += se_w1_scale + se_w3_scale + se_w2_scale
+            se_w1_scale = intermediate_size * 4
+            se_w3_scale = intermediate_size * 4
+            se_w2_scale = hidden_size * 4
 
     if verbose:
 
@@ -262,19 +261,17 @@ def _estimate_vmem_bytes(
                 f"      b_se_tokens_vmem:       {_mb(se_tokens)} MB  (2, 2, {bt}, {t_packing}, {bd1 // t_packing})"
             )
             if subc_quant_wsz is not None:
-                bd1_per_pack = bd1 // t_packing
-                bd2_per_pack = bd2 // t_packing
                 print(
                     f"      b_se_w1_scale_x2_vmem:  {_mb(se_w1_scale)} MB  "
-                    f"(2, {t_packing}, {bd1_per_pack // subc_quant_wsz}, 1, {bse}) f32"
+                    f"(1, 1, {intermediate_size}) f32"
                 )
                 print(
                     f"      b_se_w3_scale_x2_vmem:  {_mb(se_w3_scale)} MB  "
-                    f"(2, {t_packing}, {bd1_per_pack // subc_quant_wsz}, 1, {bse}) f32"
+                    f"(1, 1, {intermediate_size}) f32"
                 )
                 print(
                     f"      b_se_w2_scale_x2_vmem:  {_mb(se_w2_scale)} MB  "
-                    f"(2, {t_packing}, {bse // subc_quant_wsz}, 1, {bd2_per_pack}) f32"
+                    f"(1, 1, {hidden_size}) f32"
                 )
         print("      ----------------------------")
         print(f"      Total:                  {_mb(total_bytes)} MB")
@@ -395,6 +392,8 @@ def select_block_configs(
             weight_dtype,
             router_dtype,
             cfg,
+            intermediate_size=case.intermediate_size,
+            hidden_size=case.hidden_size,
             use_shared_expert=use_shared_expert,
             subc_quant_wsz=subc_quant_wsz,
         )
@@ -672,7 +671,7 @@ def run_all(
                 bts_candidates=bts_candidates,
                 bf_candidates=bf_candidates or [128, 256, 512, 1024, 2048],
                 bd_candidates=bd_candidates or [256, 512, 1024, 2048, 4096, 8192],
-                bse_candidates=bse_candidates or [128, 256, 512, 1024, 2048, 4096, 8192],
+                bse_candidates=bse_candidates,
                 tpu_vmem_budget_bytes=tpu_vmem_budget_bytes,
                 max_configs=max_configs,
                 use_shared_expert=use_shared_expert,
@@ -738,6 +737,8 @@ def run_all(
                         weight_dtype,
                         data["router_logits"].dtype,
                         block_cfg,
+                        intermediate_size=case.intermediate_size,
+                        hidden_size=case.hidden_size,
                         use_shared_expert=use_shared_expert,
                         subc_quant_wsz=subc_quant_wsz,
                         verbose=True,
