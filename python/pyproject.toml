@@ -47,6 +47,8 @@ dependencies = [
     # add torch and torchvision CPU version for multimodal's IMAGE/VIDEO/AUDIO processor within multimodal_tokenizer
     "torch",
     "torchvision",
+    "librosa",
+    "msgpack==1.0.0"
 ]
 
 [project.optional-dependencies]

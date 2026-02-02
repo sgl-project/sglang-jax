@@ -5,10 +5,10 @@ stage_args:
    runtime:
      num_tpus: 1
      max_batch_size: 1
-   scheduler: vit
+   scheduler: embedding
    final_output: false
    scheduler_params: {}
-  #  model_class: Qwen2_5_VL_VisionModel
+   model_class: Qwen3OmniEmbedding
 
  - stage_id: 1
    stage_sub_dir: ""

@@ -10,10 +10,13 @@ import tempfile
 import time
 import uuid
 from http import HTTPStatus
+from io import BytesIO
 from typing import Any
+from urllib.request import urlopen
 
 import fastapi
 import imageio.v3 as iio
+import librosa
 import numpy as np
 import psutil
 import requests
@@ -218,6 +221,8 @@ class MultimodalTokenizer(TokenizerManager):
         mm_inputs = None
         image_data = self._normalize_mm_list(getattr(obj, "image_data", None))
         video_data = self._normalize_mm_list(getattr(obj, "video_data", None))
+        audio_data = self._normalize_mm_list(getattr(obj, "audio_data", None))
+
         if not image_data and not video_data and getattr(obj, "input_reference", None) is not None:
             if obj.data_type == DataType.IMAGE:
                 image_data = [obj.input_reference]
@@ -228,12 +233,16 @@ class MultimodalTokenizer(TokenizerManager):
                 "Multimodal inputs provided but processor/config is not available. "
                 "Check model_path and trust_remote_code settings."
             )
-        if image_data or video_data:
-            images = [self._load_image_from_source(item) for item in image_data]
+        if image_data or video_data or audio_data:
+            images = [
+                self._load_image_from_source(item) for item in image_data
+            ]  # note: We did not perform a resize operation
             videos = [self._load_video_from_source(item) for item in video_data]
+            audios = [self._load_audio_from_source(item) for item in audio_data]
             processor_out = self.mm_processor(
                 images=images or None,
                 videos=videos or None,
+                audio=audios or None,
                 text=input_text or "",
                 return_tensors="pt",
             )
@@ -249,6 +258,9 @@ class MultimodalTokenizer(TokenizerManager):
             mrope_positions = None
             mrope_position_delta = None
             if self.mm_config is not None and input_ids is not None:
+                if hasattr(self.mm_config, "thinker_config"):
+                    # for qwen3-omni
+                    self.mm_config = self.mm_config.thinker_config
                 vision_start_token_id = getattr(self.mm_config, "vision_start_token_id", None)
                 image_token_id = getattr(self.mm_config, "image_token_id", None)
                 video_token_id = getattr(self.mm_config, "video_token_id", None)
@@ -392,6 +404,37 @@ class MultimodalTokenizer(TokenizerManager):
                 return iio.imread(tmp_path, index=None)
             finally:
                 os.unlink(tmp_path)
+        raise ValueError("Unsupported video source format")
+
+    def _load_audio_from_source(self, source: str | bytes) -> np.ndarray:
+        if not hasattr(self.mm_processor, "feature_extractor"):
+            return None
+        if isinstance(source, dict) and "url" in source:
+            source = source["url"]
+        if hasattr(source, "url"):
+            source = source.url
+        if isinstance(source, bytes):
+            with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tmp:
+                tmp.write(source)
+                tmp_path = tmp.name
+            try:
+                audio_data, _ = librosa.load(
+                    tmp_path, self.mm_processor.feature_extractor.sampling_rate
+                )
+                return audio_data
+            finally:
+                os.unlink(tmp_path)
+        if os.path.exists(source):
+            return iio.imread(source, index=None)
+        if source.startswith(("http://", "https://")):
+            try:
+                audio_data, _ = librosa.load(
+                    BytesIO(urlopen(source).read()),
+                    sr=self.mm_processor.feature_extractor.sampling_rate,
+                )
+                return audio_data
+            finally:
+                pass
         raise ValueError("Unsupported video source format")
 
     def _hash_payload(self, payload: bytes) -> int:
