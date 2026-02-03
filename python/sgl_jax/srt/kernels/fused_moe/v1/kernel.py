@@ -2389,12 +2389,21 @@ def _fused_ep_moe_kernel(
             e_sem_id=final_e_sem_id,
             local_e_id=local_num_experts - 2,
         )
+        pl.debug_print(
+            "[fused_moe] dev={} bt_id={} after final send_sem waits(local_num_experts - 2)",
+            my_id,
+            bt_id,
+        )
         wait_a2a_scatter_send(
             bt_sem_id=bt_sem_id,
             e_sem_id=lax.select(final_e_sem_id == 0, 1, 0),
             local_e_id=local_num_experts - 1,
         )
-        pl.debug_print("[fused_moe] dev={} bt_id={} after final send_sem waits", my_id, bt_id)
+        pl.debug_print(
+            "[fused_moe] dev={} bt_id={} after final send_sem waits(local_num_experts - 1)",
+            my_id,
+            bt_id,
+        )
 
         sync_barrier()
 
