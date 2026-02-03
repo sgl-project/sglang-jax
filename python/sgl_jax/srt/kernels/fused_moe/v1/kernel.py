@@ -961,27 +961,15 @@ def _fused_ep_moe_kernel(
         )
 
     def wait_a2a_scatter_send(*, bt_sem_id, e_sem_id, local_e_id):
-        # `send_x2_sems[e_sem_id]` is shared by:
-        #   - scatter remote copies (tokens -> a2a_s_x2_hbm)
-        #   - gather remote copies (a2a_s_acc_x2_hbm -> a2a_g_hbm)
-        # We must wait iff either phase posted at least one remote send.
-        my_e_id = my_id * local_num_experts + local_e_id
         scatter_send_sz = a2a_s_sends_x2_smem[e_sem_id]
-        gather_sz = expert_sizes_x2_smem[bt_sem_id, 0, my_e_id]
-        gather_local_sz = d2e_count_x2_smem[bt_sem_id, my_id, 0, my_e_id]
-        gather_remote_sz = gather_sz - gather_local_sz
-        gather_remote_sz = lax.select(
-            jnp.logical_and(local_e_id >= 0, local_e_id < local_num_experts),
-            gather_remote_sz,
-            0,
-        )
-        should_wait = (scatter_send_sz + gather_remote_sz) != 0
+        should_wait = scatter_send_sz != 0
 
         @pl.when(should_wait)
         def _():
-            # Wait via `a2a_g_hbm` so reads from `a2a_g_hbm` can't be reordered
-            # before the gather completes. Slice length uses `bt` to satisfy tiling.
-            ref = a2a_g_hbm.at[0, pl.ds(0, bt)]
+            # Wait via an aligned, fixed-size slice to avoid tiling constraints on
+            # tiny slices. This is purely a semaphore drain; the chosen ref is an
+            # ordering anchor for the compiler.
+            ref = a2a_s_x2_hbm.at[e_sem_id, pl.ds(0, bts)]
             pltpu.make_async_copy(
                 src_ref=ref,
                 dst_ref=ref,
@@ -2294,8 +2282,12 @@ def _fused_ep_moe_kernel(
             renormalize_topk_logits,
             out_top_k_logits_vmem=top_k_logits_vmem,
         )
-        pl.debug_print("expert_sizes: {}", expert_sizes)
-        pl.debug_print("t2e_routing: {}", t2e_routing)
+        if FUSED_MOE_DEBUG >= 3:
+
+            @pl.when(jnp.logical_and(my_id == 0, bt_id == 0))
+            def _():
+                pl.debug_print("expert_sizes: {}", expert_sizes)
+                pl.debug_print("t2e_routing: {}", t2e_routing)
 
         all_reduce_metadata(
             bt_sem_id=bt_sem_id,
