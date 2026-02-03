@@ -363,8 +363,8 @@ class Qwen3OmniMoeThinkerTextModel(nnx.Module):
         forward_batch: ForwardBatch,
         token_to_kv_pool: KVCache,
     ) -> tuple[jax.Array, list[jax.Array]]:
-        if forward_batch.input_embeds is not None:
-            hidden_states = forward_batch.input_embeds
+        if forward_batch.input_embedding is not None:
+            hidden_states = forward_batch.input_embedding
         else:
             hidden_states = self.embed_tokens(forward_batch.input_ids)
         residual = None
@@ -382,8 +382,8 @@ class Qwen3OmniMoeThinkerTextModel(nnx.Module):
             # Avoid Python `in range(...)` with Tracers — build a JAX-safe predicate.
             has_deepstack = getattr(forward_batch, "apply_for_deepstack", False)
             n_visual = (
-                jnp.shape(forward_batch.deepstack_visual_embeds)[0]
-                if forward_batch.deepstack_visual_embeds is not None
+                jnp.shape(forward_batch.deepstack_visual_embedding)[0]
+                if forward_batch.deepstack_visual_embedding is not None
                 else 0
             )
             predicate = jnp.logical_and(has_deepstack, jnp.less(layer_id, n_visual))
@@ -392,8 +392,8 @@ class Qwen3OmniMoeThinkerTextModel(nnx.Module):
                 predicate,
                 lambda args: (
                     args[0] + 0
-                    if forward_batch.deepstack_visual_embeds is None
-                    else forward_batch.deepstack_visual_embeds[args[1]].astype(args[0].dtype)
+                    if forward_batch.deepstack_visual_embedding is None
+                    else forward_batch.deepstack_visual_embedding[args[1]].astype(args[0].dtype)
                 ),
                 lambda args: args[0],
                 (hidden_states, layer_id),

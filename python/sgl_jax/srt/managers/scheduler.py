@@ -696,9 +696,19 @@ class Scheduler(
             return_hidden_states=recv_req.return_hidden_states,
         )
         req.tokenizer = self.tokenizer
-
         if hasattr(recv_req, "mm_inputs") and recv_req.mm_inputs:
             req.mm_inputs = recv_req.mm_inputs
+            multimodal_embedding = recv_req.mm_inputs.get("multimodal_embedding")
+            req.multimodal_embedding = multimodal_embedding
+            if (
+                recv_req.mm_inputs.get("deepstack_visual_pos_mask") is not None
+                and recv_req.mm_inputs.get("deepstack_visual_embedding") is not None
+            ):
+                req.apply_for_deepstack = True
+                req.deepstack_visual_pos_mask = recv_req.mm_inputs.get("deepstack_visual_pos_mask")
+                req.deepstack_visual_embedding = recv_req.mm_inputs.get(
+                    "deepstack_visual_embedding"
+                )
         # Validate prompt length
         error_msg = validate_input_length(
             req,
@@ -770,20 +780,6 @@ class Scheduler(
             self.grammar_queue.append(req)
         else:
             self._add_request_to_queue(req)
-        # if recv_req.input_embeds is not None:
-        #     req.input_embeds = np.array(recv_req.input_embeds)
-        # else:
-        #     req.input_embeds = np.random.randn(14, 2048).astype(np.float32)
-        # if recv_req.deepstack_visual_embeds is not None:
-        #     req.apply_for_deepstack = True
-        #     req.deepstack_visual_embeds = np.array(recv_req.deepstack_visual_embeds)
-        # else:
-        #     req.apply_for_deepstack = True
-        #     req.deepstack_visual_embeds = np.random.randn(3, 2, 2048).astype(np.float32)
-        # if recv_req.deepstack_visual_pos_mask is not None:
-        #     req.deepstack_visual_pos_mask = np.array(recv_req.deepstack_visual_pos_mask)
-        # else:
-        #     req.deepstack_visual_pos_mask = np.array([1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])
 
     def move_ready_grammar_requests(self):
         """Poll grammar futures and move ready requests to waiting queue."""

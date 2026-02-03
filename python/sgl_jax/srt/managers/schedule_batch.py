@@ -168,8 +168,8 @@ class Req:
         vocab_size: int | None = None,
         return_hidden_states: bool = False,
         return_routed_experts: bool = False,
-        input_embeds: list[list[float]] | None = None,
-        deepstack_visual_embeds: list[list[float]] | None = None,
+        multimodal_embedding: list[list[float]] | None = None,
+        deepstack_visual_embedding: list[list[float]] | None = None,
         deepstack_visual_pos_mask: list[int] | None = None,
     ):
         # Input and output info
@@ -347,10 +347,10 @@ class Req:
         self.latest_bid: int = None
 
         # For deepstack
-        self.input_embeds = input_embeds
+        self.multimodal_embedding = multimodal_embedding
         self.apply_for_deepstack = False
         self.deepstack_visual_pos_mask = deepstack_visual_pos_mask
-        self.deepstack_visual_embeds = deepstack_visual_embeds
+        self.deepstack_visual_embedding = deepstack_visual_embedding
 
     @property
     def seqlen(self):
@@ -623,9 +623,9 @@ class ScheduleBatch:
 
     # Deepstack
     apply_for_deepstack: bool = False
-    input_embeds: list[list[list[float]]] | None = None
-    deepstack_visual_embeds: list[list[list[float]]] | None = None
-    # deepstack_visual_pos_mask: list[list[int]] | None = None
+    input_embedding: list[list[list[float]]] | None = None
+    deepstack_visual_embedding: list[list[list[float]]] | None = None
+    deepstack_visual_pos_mask: list[list[int]] | None = None
 
     @classmethod
     def init_new(
@@ -858,12 +858,12 @@ class ScheduleBatch:
         self.extend_lens = extend_lens
         self.extend_input_logprob_token_ids = extend_input_logprob_token_ids
         if self.apply_for_deepstack:
-            self.input_embeds = np.concat(
-                [r.input_embeds for r in reqs if r.input_embeds is not None], axis=0
+            self.input_embedding = np.concat(
+                [r.multimodal_embedding for r in reqs if r.multimodal_embedding is not None], axis=0
             )
             ## the first dimession is layer
-            self.deepstack_visual_embeds = np.concat(
-                [r.deepstack_visual_embeds for r in reqs if r.apply_for_deepstack], axis=1
+            self.deepstack_visual_embedding = np.concat(
+                [r.deepstack_visual_embedding for r in reqs if r.apply_for_deepstack], axis=1
             )
             self.deepstack_visual_pos_mask = np.concat(
                 np.array([r.deepstack_visual_pos_mask for r in reqs if r.apply_for_deepstack]),
@@ -1135,8 +1135,8 @@ class ScheduleBatch:
                 new_indices=keep_indices, has_been_filtered=has_been_filtered
             )
         if self.apply_for_deepstack:
-            self.input_embeds = self.input_embeds[keep_indices]
-            self.deepstack_visual_embeds = self.deepstack_visual_embeds[keep_indices]
+            self.input_embedding = self.input_embedding[keep_indices]
+            self.deepstack_visual_embedding = self.deepstack_visual_embedding[keep_indices]
             self.deepstack_visual_pos_mask = self.deepstack_visual_pos_mask[keep_indices]
 
     def merge_batch(self, other: ScheduleBatch):
@@ -1174,12 +1174,12 @@ class ScheduleBatch:
         self.return_hidden_states |= other.return_hidden_states
 
         if self.apply_for_deepstack and other.apply_for_deepstack:
-            self.input_embeds.extend(other.input_embeds)
-            self.deepstack_visual_embeds.extend(other.deepstack_visual_embeds)
+            self.input_embedding.extend(other.input_embedding)
+            self.deepstack_visual_embedding.extend(other.deepstack_visual_embedding)
             self.deepstack_visual_pos_mask.extend(other.deepstack_visual_pos_mask)
         elif other.apply_for_deepstack:
-            self.input_embeds = other.input_embeds
-            self.deepstack_visual_embeds = other.deepstack_visual_embeds
+            self.input_embedding = other.input_embedding
+            self.deepstack_visual_embedding = other.deepstack_visual_embedding
             self.deepstack_visual_pos_mask = other.deepstack_visual_pos_mask
 
         if self.spec_info:
@@ -1234,28 +1234,6 @@ class ScheduleBatch:
                 ],
                 axis=0,
             )
-
-        if self.apply_for_deepstack and self.forward_mode.is_prefill():
-            self.input_embeds = np.concat(
-                [self.input_embeds, np.zeros((padding_size, self.input_embeds.shape[1]))], axis=0
-            )
-            self.deepstack_visual_embeds_tmp = np.zeros(
-                (
-                    self.deepstack_visual_embeds.shape[0],
-                    self.input_embeds.shape[0],
-                    self.input_embeds.shape[1],
-                )
-            )
-            indexes = np.where(self.deepstack_visual_pos_mask)
-            for layer in range(self.deepstack_visual_embeds.shape[0]):
-                self.deepstack_visual_embeds_tmp[layer][indexes, :] = self.deepstack_visual_embeds[
-                    layer
-                ]
-            self.deepstack_visual_embeds = self.deepstack_visual_embeds_tmp
-        else:
-            self.apply_for_deepstack = False
-            self.input_embeds = None
-            self.deepstack_visual_embeds = None
 
         padded_input_ids_len = len(input_ids_cpu)
         out_cache_loc_num_to_padding = padded_input_ids_len - len(out_cache_loc_cpu)
@@ -1461,13 +1439,23 @@ class ScheduleBatch:
         input_embedding = None
         if self.forward_mode == ForwardMode.EXTEND:
             input_embedding_list = []
+            deepstack_visual_embedding_list = []
+            deepstack_visual_pos_mask_list = []
             for req, prefix_len, extend_len in zip(self.reqs, self.prefix_lens, self.extend_lens):
                 mm_embedding = req.mm_inputs.get("multimodal_embedding") if req.mm_inputs else None
                 if mm_embedding is not None:
                     mm_full = np.asarray(mm_embedding)
-                    start = int(prefix_len or 0)
+                    start = int(prefix_len or 0) # todo: when multi request, this maybe wrong.
                     end = start + int(extend_len or 0)
                     input_embedding_list.append(mm_full[start:end])
+                if req.apply_for_deepstack:
+                    start = int(prefix_len or 0)  # todo: when multi request, this maybe wrong.
+                    end = start + int(extend_len or 0)
+                    deepstack_visual_embedding_list.append(
+                        req.deepstack_visual_embedding[:, start:end, :]
+                    )
+                    deepstack_visual_pos_mask_list.append(req.deepstack_visual_pos_mask[start:end])
+
             if input_embedding_list:
                 input_embedding = np.concatenate(input_embedding_list, axis=0)
                 if len(input_embedding) < len(input_ids_cpu):
@@ -1477,6 +1465,23 @@ class ScheduleBatch:
                         dtype=input_embedding.dtype,
                     )
                     input_embedding = np.concatenate([input_embedding, pad], axis=0)
+                if self.apply_for_deepstack:
+                    self.deepstack_visual_embedding_tmp = np.zeros(
+                        (
+                            self.deepstack_visual_embedding.shape[0],
+                            input_embedding.shape[0],
+                            input_embedding.shape[1],
+                        )
+                    )
+                    indexes = np.where(np.array(deepstack_visual_pos_mask_list))
+                    for layer in range(self.deepstack_visual_embedding.shape[0]):
+                        self.deepstack_visual_embedding_tmp[layer][indexes, :] = (
+                            self.deepstack_visual_embedding[layer]
+                        )
+                    self.deepstack_visual_embedding = self.deepstack_visual_embedding_tmp
+        else:
+            self.apply_for_deepstack = False
+            self.deepstack_visual_embedding = None
 
         return ModelWorkerBatch(
             bid=bid,
@@ -1513,8 +1518,7 @@ class ScheduleBatch:
             launch_done=self.launch_done,
             input_embedding=input_embedding,
             apply_for_deepstack=self.apply_for_deepstack,
-            deepstack_visual_embeds=self.deepstack_visual_embeds,
-            # deepstack_visual_pos_mask=self.deepstack_visual_pos_mask,
+            deepstack_visual_embedding=self.deepstack_visual_embedding,
         )
 
     def get_spec_model_worker_batch(
@@ -1969,7 +1973,7 @@ class ModelWorkerBatch:
 
     input_embedding: np.ndarray | None = None
     apply_for_deepstack: bool = False
-    deepstack_visual_embeds: np.ndarray | None = None
+    deepstack_visual_embedding: np.ndarray | None = None
     # deepstack_visual_pos_mask: np.ndarray | None = None
 
     # MRoPE position information [3, total_tokens]
