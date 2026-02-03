@@ -82,7 +82,7 @@ class TestQwen3OmniMoeThinkerTextPrecision(unittest.TestCase):
         # output=thinker(input_ids=input_ids)
         # np.savetxt("torch_output.txt", output.logits[0,-1,:].to(torch.float32).detach().numpy().flatten(), fmt="%.15f")
         current_dir = str(Path(__file__).resolve().parent)
-        return np.loadtxt(current_dir + "/data/qwen3_omni_moe_thinker_text_prefill.txt")
+        return np.loadtxt(current_dir + "/data/qwen3_omni/qwen3_omni_moe_thinker_text_prefill.txt")
 
     def _get_jax_output(self):
         data = {
