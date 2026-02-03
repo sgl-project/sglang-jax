@@ -1073,7 +1073,7 @@ def _fused_ep_moe_kernel(
                 sem=a2a_gather_sem,
             ).wait()
 
-        pl.debug_print("[fused_moe] dev={} local_e_id={} after wait_a2a_gather_recv_all", my_id)
+        pl.debug_print("[fused_moe] dev={} after wait_a2a_gather_recv_all", my_id)
 
     def start_fetch_and_wait_se_scales():
         if w1_shared_hbm is None:
