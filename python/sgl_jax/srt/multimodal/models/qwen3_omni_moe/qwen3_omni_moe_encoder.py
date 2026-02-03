@@ -4,15 +4,21 @@ import jax
 from flax import nnx
 from jax import numpy as jnp
 from transformers import Qwen3OmniMoeThinkerConfig
-from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import Qwen3OmniMoeAudioEncoderConfig, \
-    Qwen3OmniMoeVisionEncoderConfig
+from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import (
+    Qwen3OmniMoeAudioEncoderConfig,
+    Qwen3OmniMoeVisionEncoderConfig,
+)
 
 from sgl_jax.srt.configs.model_config import ModelConfig
-from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
-from sgl_jax.srt.multimodal.models.qwen3_omni_moe.audio_encoder import Qwen3OmniMoeAudioEncoder
-from sgl_jax.srt.multimodal.models.qwen3_omni_moe.vision_encoder import Qwen3OmniMoeVisionEncoder
-from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
 from sgl_jax.srt.layers.embeddings import Embed
+from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
+from sgl_jax.srt.multimodal.models.qwen3_omni_moe.audio_encoder import (
+    Qwen3OmniMoeAudioEncoder,
+)
+from sgl_jax.srt.multimodal.models.qwen3_omni_moe.vision_encoder import (
+    Qwen3OmniMoeVisionEncoder,
+)
+from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
 
 logger = logging.getLogger(__name__)
 
@@ -32,8 +38,12 @@ class Qwen3OmniMoeThinkerEmbedding(nnx.Module):
         self.mesh = mesh
         self.dtype = dtype
         self.config = config
-        self.audio_tower = Qwen3OmniMoeAudioEncoder(config.audio_config, mesh=mesh, dtype=dtype, rngs=rngs)
-        self.visual = Qwen3OmniMoeVisionEncoder(config.vision_config, mesh=mesh, dtype=dtype, rngs=rngs)
+        self.audio_tower = Qwen3OmniMoeAudioEncoder(
+            config.audio_config, mesh=mesh, dtype=dtype, rngs=rngs
+        )
+        self.visual = Qwen3OmniMoeVisionEncoder(
+            config.vision_config, mesh=mesh, dtype=dtype, rngs=rngs
+        )
         self.text_embed_tokens = Embed(
             num_embeddings=config.text_config.vocab_size,
             features=config.text_config.hidden_size,
@@ -168,7 +178,9 @@ class Qwen3OmniMoeThinkerEmbedding(nnx.Module):
         # Helper functions to reduce repetition
         def add_linear(src: str, dst: str, tp_col: bool = False, tp_row: bool = False):
             """Add linear layer mapping with optional TP sharding."""
-            w_sharding = (None, "tensor") if tp_col else ("tensor", None) if tp_row else (None, None)
+            w_sharding = (
+                (None, "tensor") if tp_col else ("tensor", None) if tp_row else (None, None)
+            )
             b_sharding = ("tensor",) if tp_col else (None,)
             mappings[f"{prefix}{src}.weight"] = WeightMapping(
                 target_path=f"{target_prefix}{dst}.weight", sharding=w_sharding, transpose=True
@@ -200,7 +212,9 @@ class Qwen3OmniMoeThinkerEmbedding(nnx.Module):
 
         # ==================== Position Embedding ====================
         mappings[f"{prefix}pos_embed.weight"] = WeightMapping(
-            target_path=f"{target_prefix}pos_embed.embedding", sharding=(None, None), transpose=False
+            target_path=f"{target_prefix}pos_embed.embedding",
+            sharding=(None, None),
+            transpose=False,
         )
 
         # ==================== Transformer Blocks ====================
@@ -265,7 +279,9 @@ class Qwen3OmniMoeThinkerEmbedding(nnx.Module):
         special_video_mask = input_ids == self.config.video_token_id
         special_audio_mask = input_ids == self.config.audio_token_id
 
-        special_image_mask = jnp.broadcast_to(jnp.expand_dims(special_image_mask, axis=-1), input_embeds.shape)
+        special_image_mask = jnp.broadcast_to(
+            jnp.expand_dims(special_image_mask, axis=-1), input_embeds.shape
+        )
         if image_features is not None:
             n_image_tokens = jnp.sum(special_image_mask)
             if input_embeds[special_image_mask].size != image_features.size:
@@ -273,7 +289,9 @@ class Qwen3OmniMoeThinkerEmbedding(nnx.Module):
                     f"Image features and image tokens do not match: tokens: {n_image_tokens}, features {image_features.shape[0]}"
                 )
 
-        special_video_mask = jnp.broadcast_to(jnp.expand_dims(special_video_mask, axis=-1), input_embeds.shape)
+        special_video_mask = jnp.broadcast_to(
+            jnp.expand_dims(special_video_mask, axis=-1), input_embeds.shape
+        )
         if video_features is not None:
             n_video_tokens = jnp.sum(special_video_mask)
             if input_embeds[special_video_mask].size != video_features.size:
@@ -281,7 +299,9 @@ class Qwen3OmniMoeThinkerEmbedding(nnx.Module):
                     f"Videos features and video tokens do not match: tokens: {n_video_tokens}, features {video_features.shape[0]}"
                 )
 
-        special_audio_mask = jnp.broadcast_to(jnp.expand_dims(special_audio_mask, axis=-1), input_embeds.shape)
+        special_audio_mask = jnp.broadcast_to(
+            jnp.expand_dims(special_audio_mask, axis=-1), input_embeds.shape
+        )
 
         return special_image_mask, special_video_mask, special_audio_mask
 
@@ -326,21 +346,33 @@ class Qwen3OmniMoeThinkerEmbedding(nnx.Module):
 
         if pixel_values is not None:
             image_features = self.visual(pixel_values, image_grid_thw)
-            image_embeds, image_embeds_multiscale = image_features.last_hidden_state, image_features.deepstack_features
+            image_embeds, image_embeds_multiscale = (
+                image_features.last_hidden_state,
+                image_features.deepstack_features,
+            )
             visual_embeds_multiscale = image_embeds_multiscale
 
         if pixel_values_videos is not None:
             video_features = self.visual(pixel_values_videos, video_grid_thw)
-            video_embeds, video_embeds_multiscale = video_features.last_hidden_state, video_features.deepstack_features
+            video_embeds, video_embeds_multiscale = (
+                video_features.last_hidden_state,
+                video_features.deepstack_features,
+            )
             if visual_embeds_multiscale is None:
                 visual_embeds_multiscale = video_embeds_multiscale
 
         image_mask, video_mask, audio_mask = self.get_placeholder_mask(
-            forward_batch.input_ids, input_embeds=input_embeds, image_features=image_embeds, video_features=video_embeds
+            forward_batch.input_ids,
+            input_embeds=input_embeds,
+            image_features=image_embeds,
+            video_features=video_embeds,
         )
-        input_embeds = input_embeds.at[audio_mask].set(audio_embeds)
-        input_embeds = input_embeds.at[image_mask].set(image_embeds)
-        input_embeds = input_embeds.at[video_mask].set(video_embeds)
+        if audio_embeds is not None:
+            input_embeds = input_embeds.at[audio_mask].set(jnp.ravel(audio_embeds))
+        if image_embeds is not None:
+            input_embeds = input_embeds.at[image_mask].set(jnp.ravel(image_embeds))
+        if video_embeds is not None:
+            input_embeds = input_embeds.at[video_mask].set(jnp.ravel(video_embeds))
 
         visual_pos_masks = image_mask if image_mask is not None else video_mask
 
