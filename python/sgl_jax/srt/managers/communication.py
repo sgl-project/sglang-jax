@@ -1,5 +1,4 @@
 import logging
-import select
 import time
 from abc import ABC, abstractmethod
 from queue import Empty, Queue
@@ -28,15 +27,6 @@ class QueueBackend(CommunicationBackend):
     def __init__(self, in_queue: Queue, out_queue: Queue):
         self._in_queue = in_queue
         self._out_queue = out_queue
-        self._read_fd = -1
-        try:
-            self._read_fd = self._in_queue._reader.fileno()
-        except Exception:
-            logger.warning(
-                "QueueBackend could not get fileno from in_queue; "
-                "falling back to sleep-based waiting."
-            )
-            pass
 
     def recv_requests(self) -> list[Any]:
         reqs = []
@@ -49,15 +39,7 @@ class QueueBackend(CommunicationBackend):
         return reqs
 
     def wait_for_new_requests(self, timeout: float = 0.0):
-        if self._read_fd != -1:
-            try:
-                # Wait until the queue's file descriptor is ready to be read.
-                select.select([self._read_fd], [], [], timeout)
-            except Exception:
-                time.sleep(timeout)  # Fallback
-        else:
-            # Fallback for systems where fileno is not available
-            time.sleep(timeout)
+        time.sleep(timeout)
 
     def send_pyobj(self, result: Any) -> None:
         self._out_queue.put(result)
