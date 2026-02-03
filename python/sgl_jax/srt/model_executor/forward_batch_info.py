@@ -181,10 +181,9 @@ class ForwardBatch:
     input_embedding: jax.Array | None = None
 
     ## for deepstack
-    input_embeds: jax.Array | None = None
     apply_for_deepstack: bool = False
     deepstack_visual_pos_mask: jax.Array | None = None
-    deepstack_visual_embeds: jax.Array | None = None
+    deepstack_visual_embedding: jax.Array | None = None
 
     def tree_flatten(self):
         children = (
@@ -206,7 +205,7 @@ class ForwardBatch:
             self.input_embedding,
             self.apply_for_deepstack,
             self.deepstack_visual_pos_mask,
-            self.deepstack_visual_embeds,
+            self.deepstack_visual_embedding,
         )
 
         aux_data = {
@@ -251,7 +250,7 @@ class ForwardBatch:
 
         obj.apply_for_deepstack = children[16]
         obj.deepstack_visual_pos_mask = children[17]
-        obj.deepstack_visual_embeds = children[18]
+        obj.deepstack_visual_embedding = children[18]
         return obj
 
     def __repr__(self) -> str:
@@ -347,18 +346,15 @@ class ForwardBatch:
                 batch.lora_ranks,
             )
 
-        input_embeds = None
-        deepstack_visual_embeds = None
+        deepstack_visual_embedding = None
         # deepstack_visual_pos_mask = None
         if batch.apply_for_deepstack:
             (
-                input_embeds,
-                deepstack_visual_embeds,
+                deepstack_visual_embedding,
                 # deepstack_visual_pos_mask
             ) = device_array(
                 (
-                    batch.input_embeds,
-                    batch.deepstack_visual_embeds,
+                    batch.deepstack_visual_embedding,
                     # batch.deepstack_visual_pos_mask
                 ),
                 sharding=(
@@ -390,7 +386,7 @@ class ForwardBatch:
             capture_hidden_mode=batch.capture_hidden_mode,
             input_embedding=input_embedding,
             apply_for_deepstack=batch.apply_for_deepstack,
-            deepstack_visual_embeds=deepstack_visual_embeds,
+            deepstack_visual_embedding=deepstack_visual_embedding,
             # deepstack_visual_pos_mask=deepstack_visual_pos_mask,
         )
 
