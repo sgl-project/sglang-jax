@@ -30,7 +30,11 @@ from sgl_jax.srt.multimodal.manager.multimodal_detokenizer import (
 )
 from sgl_jax.srt.multimodal.manager.multimodal_tokenizer import MultimodalTokenizer
 from sgl_jax.srt.server_args import PortArgs
-from sgl_jax.srt.utils import kill_process_tree, set_uvicorn_logging_configs
+from sgl_jax.srt.utils import (
+    configure_logger,
+    kill_process_tree,
+    set_uvicorn_logging_configs,
+)
 from sgl_jax.utils import get_exception_traceback
 
 logger = logging.getLogger(__name__)
@@ -357,6 +361,7 @@ def launch(
 
     try:
         # Update logging configs
+        configure_logger(server_args)
         set_uvicorn_logging_configs()
         app.server_args = server_args
         # Listen for HTTP requests
@@ -484,10 +489,10 @@ def _wait_and_warmup(
     ):
         return
 
-    logger.info("The server is fired up and ready to roll!")
-
     if pipe_finish_writer is not None:
         pipe_finish_writer.send("ready")
+
+    logger.info("The server is fired up and ready to roll!")
 
     if launch_callback is not None:
         launch_callback()

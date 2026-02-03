@@ -368,7 +368,7 @@ class GlobalScheduler:
                 (hasattr(reqs, "__len__") and len(reqs) > 0)
                 or isinstance(reqs, (AbortReq, BatchStrOut))
             ):
-                logger.info("recv_reqs from tokenizer %d", len(reqs))
+                logger.info("GlobalScheduler recv_reqs from tokenizer %d", len(reqs))
             if reqs:
                 for req in reqs:
                     dispatched_req = self._request_dispatcher(req)
