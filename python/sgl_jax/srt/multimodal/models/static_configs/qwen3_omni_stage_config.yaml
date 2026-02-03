@@ -4,6 +4,7 @@ stage_args:
    stage_sub_dir: ""
    runtime:
      num_tpus: 1
+     device_kind: cpu
      max_batch_size: 1
    scheduler: embedding
    final_output: false
@@ -13,7 +14,7 @@ stage_args:
  - stage_id: 1
    stage_sub_dir: ""
    runtime:
-     num_tpus: 1
+     num_tpus: 4
      max_batch_size: 1
    scheduler: auto_regressive
    scheduler_params: {}

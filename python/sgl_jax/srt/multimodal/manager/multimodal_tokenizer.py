@@ -440,7 +440,7 @@ class MultimodalTokenizer(TokenizerManager):
                 return audio_data
             finally:
                 pass
-        raise ValueError("Unsupported video source format")
+        raise ValueError("Unsupported audio source format")
 
     def _hash_payload(self, payload: bytes) -> int:
         digest = hashlib.sha256(payload).digest()[:8]

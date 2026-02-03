@@ -157,3 +157,5 @@ class VLMMInputs:
     video_token_id: int | None = None
     pad_values: list[int] | None = None
     multimodal_embeddings: np.ndarray | None = None
+    deepstack_visual_embedding: np.ndarray | None = None
+    deepstack_visual_pos_mask: np.ndarray | None = None
