@@ -15,7 +15,8 @@ class Vision3DPatchEmbed(nnx.Module):
     """
     3D Convolutional Patch Embedding for video/image input.
 
-    Converts input (B, T, H, W, C) into patches (N_patches, embed_dim).
+    Converts flattened input (B, C*T*H*W) into patches (N_patches, embed_dim).
+    Input is assumed to be flattened in C-first order: (B, C, T, H, W) -> (B, C*T*H*W).
     """
 
     def __init__(
@@ -44,28 +45,26 @@ class Vision3DPatchEmbed(nnx.Module):
     def __call__(self, x: jax.Array) -> jax.Array:
         """
         Args:
-            x: (B, C * T * H * W) video/image tensor
+            x: (B, C*T*H*W) flattened video/image tensor in C-first order
 
         Returns:
             patches: (total_patches, embed_dim)
         """
-        # x shape: (B, C * T * H * W)
-        # Need to merge batch and temporal for conv
-
-        # x is (B, C * T * H * W)
-        # Reshape for 3D conv: combine examples into batch
+        # x shape: (B, C*T*H*W)
+        # Reshape to patch blocks: (B*N_patches, C, t_patch, p, p)
+        # where N_patches = (T/t_patch) * (H/p) * (W/p)
         x = x.reshape(
             -1, self.in_channels, self.temporal_patch_size, self.patch_size, self.patch_size
-        )  # (B, C, T, H, W)
+        )
 
         # JAX Conv expects: (batch, spatial_dims..., channels)
-        x = jnp.transpose(x, (0, 2, 3, 4, 1))
+        x = jnp.transpose(x, (0, 2, 3, 4, 1))  # (B*N_patches, t_patch, p, p, C)
 
-        # Apply 3D convolution
-        patches = self.proj(x)  # (B, T', H', W', embed_dim)
+        # Apply 3D convolution (outputs 1x1x1 per patch)
+        patches = self.proj(x)  # (B*N_patches, 1, 1, 1, embed_dim)
 
         # Flatten all spatial dimensions
-        patches = patches.reshape(-1, self.embed_dim)  # (B*T'*H'*W', embed_dim)
+        patches = patches.reshape(-1, self.embed_dim)  # (B*N_patches, embed_dim)
 
         return patches
 
@@ -796,15 +795,16 @@ class Qwen3OmniMoeVisionEncoder(nnx.Module):
 
     def __call__(
         self,
-        pixel_values: jax.Array,  # (B, C * T * H * W)
-        grid_thw: jax.Array,  # (B, 3) - [T, H_patches, W_patches]
+        pixel_values: jax.Array,  # (B, C*T*H*W)
+        grid_thw: jax.Array,  # (B, 3) - [T_out, H_patches, W_patches]
     ) -> dict[str, jax.Array]:
         """
         Forward pass of vision encoder.
 
         Args:
-            pixel_values: (B, C * T * H * W) video/image tensor
-            grid_thw: (B, 3) containing [T, H_patches, W_patches] for each input
+            pixel_values: (B, C*T*H*W) flattened video/image tensor in C-first order
+            grid_thw: (B, 3) containing [T_out, H_patches, W_patches] for each input
+                where T_out = T / temporal_patch_size
 
         Returns:
             Dictionary containing:
@@ -818,7 +818,7 @@ class Qwen3OmniMoeVisionEncoder(nnx.Module):
         # 0. Validate input shapes
         self._validate_input_shapes(grid_thw)
 
-        # 1. Patch Embedding
+        # 1. Patch Embedding (handles flattened input internally)
         hidden_states = self.patch_embed(pixel_values)  # (total_patches, hidden_size)
 
         # 2. Apply spatial merge permutation to match PyTorch order

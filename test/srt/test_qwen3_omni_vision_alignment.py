@@ -186,6 +186,31 @@ def prepare_pytorch_input(pixel_values, config, dtype):
     return pt_input.reshape(-1, C, temporal_patch_size, patch_size, patch_size)
 
 
+def prepare_jax_input(pixel_values, config):
+    """Flatten to (B, C*T*H*W) so reshape(-1, C, t, p, p) preserves patch order."""
+    B, T, H, W, C = pixel_values.shape
+    t_patch = config.temporal_patch_size
+    p = config.patch_size
+    t_out, h_patches, w_patches = T // t_patch, H // p, W // p
+
+    # (B, T, H, W, C) -> (B, C, T, H, W)
+    patches = np.transpose(pixel_values, (0, 4, 1, 2, 3))
+    # (B, C, T, H, W) -> (B, C, T_out, t, H_patches, p, W_patches, p)
+    patches = patches.reshape(
+        B,
+        C,
+        t_out,
+        t_patch,
+        h_patches,
+        p,
+        w_patches,
+        p,
+    )
+    # (B, T_out, H_patches, W_patches, C, t, p, p)
+    patches = np.transpose(patches, (0, 2, 4, 6, 1, 3, 5, 7))
+    return patches.reshape(B, -1)
+
+
 # =============================================================================
 # Model Loading
 # =============================================================================
@@ -402,7 +427,7 @@ class JAXForwardContext:
     def __init__(self, jax_model, pixel_values, grid_thw, mesh):
         self.model = jax_model
         self.mesh = mesh
-        self.pixel_values = jnp.array(pixel_values)
+        self.pixel_values = jnp.array(prepare_jax_input(pixel_values, jax_model.config))
         self.grid = jnp.array(grid_thw)
 
         # Pre-computed values (lazy init)
@@ -1034,7 +1059,7 @@ def test_batch_images(model_path, mesh, precision):
     with jax.set_mesh(mesh):
         jax_outputs = [
             jax_model(
-                pixel_values=jnp.array(pixel_values[i : i + 1]),
+                pixel_values=jnp.array(prepare_jax_input(pixel_values[i : i + 1], config)),
                 grid_thw=jnp.array(grid_thw[i : i + 1]),
             )["pooler_output"]
             for i in range(2)
@@ -1233,7 +1258,10 @@ def test_tp_output_consistency(model_path, mesh, precision):
 
     # Run JAX forward
     with jax.set_mesh(mesh):
-        jax_output = jax_model(pixel_values=jnp.array(pixel_values), grid_thw=jnp.array(grid_thw))
+        jax_output = jax_model(
+            pixel_values=jnp.array(prepare_jax_input(pixel_values, config)),
+            grid_thw=jnp.array(grid_thw),
+        )
 
     jax_pooler = jax_output["pooler_output"]
 
