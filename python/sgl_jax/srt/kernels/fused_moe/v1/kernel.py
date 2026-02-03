@@ -947,9 +947,8 @@ def _fused_ep_moe_kernel(
 
         @pl.when(sz != 0)
         def _():
-            # Wait via an aligned, fixed-size slice to avoid edge cases when sz==0
-            # and TPU Mosaic tiling constraints on tiny (e.g. 1) slices.
-            ref = a2a_s_x2_hbm.at[e_sem_id, pl.ds(0, bts)]
+            # Dummy wait using the dynamic receive size.
+            ref = a2a_s_x2_hbm.at[e_sem_id, pl.ds(0, sz)]
             pltpu.make_async_copy(
                 src_ref=ref,
                 dst_ref=ref,
@@ -966,10 +965,8 @@ def _fused_ep_moe_kernel(
 
         @pl.when(should_wait)
         def _():
-            # Wait via an aligned, fixed-size slice to avoid tiling constraints on
-            # tiny slices. This is purely a semaphore drain; the chosen ref is an
-            # ordering anchor for the compiler.
-            ref = a2a_s_x2_hbm.at[e_sem_id, pl.ds(0, bts)]
+            # Dummy wait using the dynamic send size.
+            ref = a2a_s_x2_hbm.at[e_sem_id, pl.ds(0, scatter_send_sz)]
             pltpu.make_async_copy(
                 src_ref=ref,
                 dst_ref=ref,
@@ -1032,9 +1029,8 @@ def _fused_ep_moe_kernel(
 
         @pl.when(remote_sz != 0)
         def _():
-            # Wait via `a2a_g_hbm` so reads from `a2a_g_hbm` can't be reordered
-            # before the gather completes. Slice length uses `bt` to satisfy tiling.
-            ref = a2a_g_hbm.at[0, pl.ds(0, bt)]
+            # Dummy wait using the dynamic remote send size.
+            ref = a2a_s_acc_x2_hbm.at[e_sem_id, pl.ds(0, remote_sz)]
             pltpu.make_async_copy(
                 src_ref=ref,
                 dst_ref=ref,
@@ -1054,7 +1050,8 @@ def _fused_ep_moe_kernel(
 
         @pl.when(num_valid != 0)
         def _():
-            ref = a2a_g_hbm.at[0, pl.ds(0, bt)]
+            # Dummy wait using the dynamic number of valid local tokens.
+            ref = a2a_g_hbm.at[0, pl.ds(0, num_valid)]
             pltpu.make_async_copy(
                 src_ref=ref,
                 dst_ref=ref,
