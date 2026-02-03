@@ -158,10 +158,8 @@ class TokenizedGenerateReqInput:
     return_routed_experts: list[bool] | bool | None = None
     # whether to return hidden states
     return_hidden_states: bool = False
-    # The embeddings for input_ids; one can specify either text or input_ids or input_embeds.
-    input_embeds: list[list[list[float]]] | None = None
-    deepstack_visual_embeds: list[list[list[float]]] | None = None
-    deepstack_visual_pos_mask: list[list[int]] | None = None
+    # multimodal input
+    mm_inputs: dict | None = None
 
 
 @dataclass
