@@ -16,10 +16,14 @@ import numpy as np
 import torch
 from flax import nnx
 from transformers import Qwen3OmniMoeThinkerConfig
-from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import Qwen3OmniMoeVisionEncoderConfig
+from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import (
+    Qwen3OmniMoeVisionEncoderConfig,
+)
 
 from sgl_jax.srt.configs.model_config import _get_and_verify_dtype
-from sgl_jax.srt.multimodal.models.qwen3_omni_moe.qwen3_omni_moe_encoder import Qwen3OmniMoeThinkerEmbedding
+from sgl_jax.srt.multimodal.models.qwen3_omni_moe.qwen3_omni_moe_encoder import (
+    Qwen3OmniMoeThinkerEmbedding,
+)
 
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../python"))
 if project_root not in sys.path:
@@ -306,10 +310,7 @@ def load_jax_model(pt_config, model_path, mesh, precision):
 
     with jax.set_mesh(mesh):
         jax_model = Qwen3OmniMoeThinkerEmbedding(
-            config=jax_config,
-            mesh=mesh,
-            rngs=nnx.Rngs(0),
-            dtype=jax_dtype
+            config=jax_config, mesh=mesh, rngs=nnx.Rngs(0), dtype=jax_dtype
         )
 
     jax_model.load_weights(jax_config)

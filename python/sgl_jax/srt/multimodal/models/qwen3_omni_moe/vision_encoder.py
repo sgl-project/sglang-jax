@@ -1,12 +1,14 @@
 import jax
 import jax.numpy as jnp
 from flax import nnx
-from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import Qwen3OmniMoeVisionEncoderConfig
+from jax.sharding import NamedSharding
+from jax.sharding import PartitionSpec as P
+from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import (
+    Qwen3OmniMoeVisionEncoderConfig,
+)
 
 from sgl_jax.srt.layers.embeddings import Embed
 from sgl_jax.srt.layers.linear import LinearBase
-from jax.sharding import NamedSharding
-from jax.sharding import PartitionSpec as P
 
 
 class Vision3DPatchEmbed(nnx.Module):
@@ -52,7 +54,9 @@ class Vision3DPatchEmbed(nnx.Module):
 
         # x is (B, C * T * H * W)
         # Reshape for 3D conv: combine examples into batch
-        x = x.reshape(-1, self.in_channels, self.temporal_patch_size, self.patch_size, self.patch_size)  # (B, C, T, H, W)
+        x = x.reshape(
+            -1, self.in_channels, self.temporal_patch_size, self.patch_size, self.patch_size
+        )  # (B, C, T, H, W)
 
         # JAX Conv expects: (batch, spatial_dims..., channels)
         x = jnp.transpose(x, (0, 2, 3, 4, 1))
@@ -144,7 +148,7 @@ class VisionAttention(nnx.Module):
         self.hidden_size = hidden_size
         self.num_heads = num_heads
         self.head_dim = hidden_size // num_heads
-        self.scaling = self.head_dim ** -0.5
+        self.scaling = self.head_dim**-0.5
         self.mesh = mesh
 
         self.qkv_proj = LinearBase(
@@ -376,7 +380,7 @@ class VisionPatchMerger(nnx.Module):
         self.out_hidden_size = config.out_hidden_size
         self.use_postshuffle_norm = use_postshuffle_norm
 
-        merged_hidden_size = config.hidden_size * (config.spatial_merge_size ** 2)
+        merged_hidden_size = config.hidden_size * (config.spatial_merge_size**2)
         norm_size = merged_hidden_size if use_postshuffle_norm else config.hidden_size
         self.ln_q = nnx.LayerNorm(
             num_features=norm_size,
@@ -412,7 +416,7 @@ class VisionPatchMerger(nnx.Module):
         Returns:
             output: (seq_len, out_hidden_size)
         """
-        merged_hidden_size = self.hidden_size * (self.spatial_merge_size ** 2)
+        merged_hidden_size = self.hidden_size * (self.spatial_merge_size**2)
 
         if self.use_postshuffle_norm:
             hidden_states = hidden_states.reshape(-1, merged_hidden_size)
@@ -472,7 +476,7 @@ class Qwen3OmniMoeVisionEncoder(nnx.Module):
             mesh=mesh,
             kernel_axes=(None, None),  # Position embeddings are replicated
         )
-        self.num_grid_per_side = int(config.num_position_embeddings ** 0.5)
+        self.num_grid_per_side = int(config.num_position_embeddings**0.5)
 
         # Transformer blocks - use nnx.List for Flax NNX 0.12.0+ compatibility
         self.blocks = nnx.List(
@@ -694,7 +698,7 @@ class Qwen3OmniMoeVisionEncoder(nnx.Module):
             width_val = int(width)
 
             num_patches = num_frames_val * height_val * width_val
-            patches = hidden_states[offset: offset + num_patches]  # (t*h*w, hidden_size)
+            patches = hidden_states[offset : offset + num_patches]  # (t*h*w, hidden_size)
 
             # Reshape to (t, h, w, hidden_size)
             patches = patches.reshape(num_frames_val, height_val, width_val, -1)
@@ -766,7 +770,7 @@ class Qwen3OmniMoeVisionEncoder(nnx.Module):
         offset = 0
         for seq_len in all_seq_lens:
             # Allow attention within the same sequence (set to 0.0)
-            mask = mask.at[offset: offset + seq_len, offset: offset + seq_len].set(0.0)
+            mask = mask.at[offset : offset + seq_len, offset : offset + seq_len].set(0.0)
             offset += seq_len
 
         return mask
