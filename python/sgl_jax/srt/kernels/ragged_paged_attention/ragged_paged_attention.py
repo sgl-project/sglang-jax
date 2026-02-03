@@ -18,6 +18,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 from sgl_jax.srt.kernels.ragged_paged_attention.tuned_block_sizes import (
+    get_kv_pages_for_decode,
     get_tuned_block_sizes,
 )
 from sgl_jax.srt.kernels.ragged_paged_attention.util import (
@@ -1348,6 +1349,7 @@ def get_kernel_scope_name(bq_size, bkv_p, page_size):
     jax.jit,
     static_argnames=(
         "causal",
+        "decode_mode",
         "sm_scale",
         "sliding_window",
         "soft_cap",
@@ -1376,6 +1378,7 @@ def ragged_paged_attention(
     custom_mask: jax.Array,  # if causal is True, custom_mask shape is [patten_total_kv_len], else [0]
     *,
     causal: int = 1,  # 1: True, 0: False
+    decode_mode: int = 0,
     sm_scale: float = 1.0,
     sliding_window: int | None = None,
     soft_cap: float | None = None,
@@ -1476,17 +1479,29 @@ def ragged_paged_attention(
     bkv_p = num_kv_pages_per_block
     bq_sz = num_queries_per_block
     if bq_sz is None or bkv_p is None:
-        bkv_p, bq_sz = get_tuned_block_sizes(
-            q.dtype,
-            kv_cache_fused_processed.dtype,
-            actual_num_q_heads,
-            actual_num_kv_heads,
-            head_dim,
-            page_size,
-            max_num_tokens,
-            pages_per_seq,
-            causal,
-        )
+        if decode_mode == 1:
+            bkv_p = get_kv_pages_for_decode(
+                q.dtype,
+                kv_cache_fused_processed.dtype,
+                actual_num_q_heads,
+                actual_num_kv_heads,
+                head_dim,
+                page_size,
+                pages_per_seq,
+            )
+            bq_sz = 1
+        else:
+            bkv_p, bq_sz = get_tuned_block_sizes(
+                q.dtype,
+                kv_cache_fused_processed.dtype,
+                actual_num_q_heads,
+                actual_num_kv_heads,
+                head_dim,
+                page_size,
+                max_num_tokens,
+                pages_per_seq,
+                causal,
+            )
     kv_packing = get_dtype_packing(kv_cache_fused_processed.dtype)
     if page_size == 1:
         bkv_p = bkv_p // 2
