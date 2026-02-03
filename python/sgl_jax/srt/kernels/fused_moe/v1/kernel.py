@@ -956,6 +956,10 @@ def _fused_ep_moe_kernel(
                 sem=recv_x2_sems.at[e_sem_id],
             ).wait()
 
+        pl.debug_print(
+            "[fused_moe] dev={} local_e_id={} after wait_a2a_scatter_recv", my_id, local_e_id
+        )
+
     def wait_a2a_scatter_send(*, bt_sem_id, e_sem_id, local_e_id):
         # `send_x2_sems[e_sem_id]` is shared by:
         #   - scatter remote copies (tokens -> a2a_s_x2_hbm)
@@ -983,6 +987,10 @@ def _fused_ep_moe_kernel(
                 dst_ref=ref,
                 sem=send_x2_sems.at[e_sem_id],
             ).wait()
+
+        pl.debug_print(
+            "[fused_moe] dev={} local_e_id={} after wait_a2a_scatter_send", my_id, local_e_id
+        )
 
     def start_a2a_gather(*, bt_sem_id, e_sem_id, local_e_id):
         my_e_id = my_id * local_num_experts + local_e_id
@@ -1045,6 +1053,10 @@ def _fused_ep_moe_kernel(
                 sem=send_x2_sems.at[e_sem_id],
             ).wait()
 
+        pl.debug_print(
+            "[fused_moe] dev={} local_e_id={} after wait_a2a_gather_send", my_id, local_e_id
+        )
+
     def wait_a2a_gather_recv_all(*, bt_sem_id):
         def _sum_one(t_id, acc):
             token_e0 = t2e_routing_x2_smem[bt_sem_id, t_id, 0]
@@ -1060,6 +1072,8 @@ def _fused_ep_moe_kernel(
                 dst_ref=ref,
                 sem=a2a_gather_sem,
             ).wait()
+
+        pl.debug_print("[fused_moe] dev={} local_e_id={} after wait_a2a_gather_recv_all", my_id)
 
     def start_fetch_and_wait_se_scales():
         if w1_shared_hbm is None:
@@ -2280,12 +2294,8 @@ def _fused_ep_moe_kernel(
             renormalize_topk_logits,
             out_top_k_logits_vmem=top_k_logits_vmem,
         )
-        if FUSED_MOE_DEBUG >= 3:
-
-            @pl.when(jnp.logical_and(bt_id == 0, my_id == 0))
-            def _():
-                pl.debug_print("expert_sizes: {}", expert_sizes)
-                pl.debug_print("t2e_routing: {}", t2e_routing)
+        pl.debug_print("expert_sizes: {}", expert_sizes)
+        pl.debug_print("t2e_routing: {}", t2e_routing)
 
         all_reduce_metadata(
             bt_sem_id=bt_sem_id,
@@ -2295,8 +2305,7 @@ def _fused_ep_moe_kernel(
         )
         sync_barrier()
 
-        if FUSED_MOE_DEBUG >= 1:
-            pl.debug_print("[fused_moe] dev={} bt_id={} after all_reduce/barrier", my_id, bt_id)
+        pl.debug_print("[fused_moe] dev={} bt_id={} after all_reduce/barrier", my_id, bt_id)
 
         wait_store_output(bt_id=bt_id - 2)
 
@@ -2365,46 +2374,15 @@ def _fused_ep_moe_kernel(
         wait_a2a_gather_recv_all(bt_sem_id=bt_sem_id)
         sync_barrier()
 
-        if FUSED_MOE_DEBUG >= 1:
-            pl.debug_print("[fused_moe] dev={} bt_id={} after gather_recv/barrier", my_id, bt_id)
-
-        if FUSED_MOE_DEBUG >= 2:
-
-            @pl.when(bt_id == 0)
-            def _():
-                pl.debug_print(
-                    "[fused_moe] dev={} bt_id={} before acc_and_store_output", my_id, bt_id
-                )
+        pl.debug_print("[fused_moe] dev={} bt_id={} after gather_recv/barrier", my_id, bt_id)
 
         acc_and_store_output(bt_sem_id=bt_sem_id, out_buf_id=out_buf_id)
-        if FUSED_MOE_DEBUG >= 2:
+        pl.debug_print("[fused_moe] dev={} bt_id={} after acc_and_store_output", my_id, bt_id)
 
-            @pl.when(bt_id == 0)
-            def _():
-                pl.debug_print(
-                    "[fused_moe] dev={} bt_id={} after acc_and_store_output", my_id, bt_id
-                )
-
-        if FUSED_MOE_DEBUG >= 2:
-
-            @pl.when(bt_id == 0)
-            def _():
-                pl.debug_print("[fused_moe] dev={} bt_id={} before start_send_bo", my_id, bt_id)
+        pl.debug_print("[fused_moe] dev={} bt_id={} before start_send_bo", my_id, bt_id)
 
         start_send_bo(bt_id=bt_id)
-        if FUSED_MOE_DEBUG >= 2:
-
-            @pl.when(bt_id == 0)
-            def _():
-                pl.debug_print("[fused_moe] dev={} bt_id={} after start_send_bo", my_id, bt_id)
-
-        if FUSED_MOE_DEBUG >= 2:
-
-            @pl.when(bt_id == 0)
-            def _():
-                pl.debug_print(
-                    "[fused_moe] dev={} bt_id={} before final send_sem waits", my_id, bt_id
-                )
+        pl.debug_print("[fused_moe] dev={} bt_id={} after start_send_bo", my_id, bt_id)
 
         wait_a2a_scatter_send(
             bt_sem_id=bt_sem_id,
@@ -2416,29 +2394,11 @@ def _fused_ep_moe_kernel(
             e_sem_id=lax.select(final_e_sem_id == 0, 1, 0),
             local_e_id=local_num_experts - 1,
         )
-        if FUSED_MOE_DEBUG >= 2:
-
-            @pl.when(bt_id == 0)
-            def _():
-                pl.debug_print(
-                    "[fused_moe] dev={} bt_id={} after final send_sem waits", my_id, bt_id
-                )
-
-        if FUSED_MOE_DEBUG >= 2:
-
-            @pl.when(bt_id == 0)
-            def _():
-                pl.debug_print("[fused_moe] dev={} bt_id={} before final barrier", my_id, bt_id)
+        pl.debug_print("[fused_moe] dev={} bt_id={} after final send_sem waits", my_id, bt_id)
 
         sync_barrier()
-        if FUSED_MOE_DEBUG >= 2:
 
-            @pl.when(bt_id == 0)
-            def _():
-                pl.debug_print("[fused_moe] dev={} bt_id={} after final barrier", my_id, bt_id)
-
-        if FUSED_MOE_DEBUG >= 1:
-            pl.debug_print("[fused_moe] dev={} bt_id={} done", my_id, bt_id)
+        pl.debug_print("[fused_moe] dev={} bt_id={} done", my_id, bt_id)
         return final_e_sem_id
 
     lax.fori_loop(0, num_bt, run_bt, jnp.int32(0), unroll=False)
