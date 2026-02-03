@@ -64,7 +64,6 @@ class DiffusionScheduler:
         inference. AbortReq messages are processed to track aborted request
         IDs, and any Req whose rid matches an aborted ID is skipped.
         """
-
         while True:
             reqs = self.communication_backend.recv_requests()
             if reqs is not None and len(reqs) > 0:
@@ -86,6 +85,8 @@ class DiffusionScheduler:
                         logger.warning(
                             "DiffusionScheduler received unknown request type: %s", type(req)
                         )
+            else:
+                self.communication_backend.wait_for_new_requests(0.001)
 
     def check_abort(self) -> bool:
         """Check if current request should be aborted.

@@ -1,6 +1,10 @@
+import logging
+import time
 from abc import ABC, abstractmethod
 from queue import Empty, Queue
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 
 class CommunicationBackend(ABC):
@@ -33,6 +37,9 @@ class QueueBackend(CommunicationBackend):
             except Empty:
                 break
         return reqs
+
+    def wait_for_new_requests(self, timeout: float = 0.0):
+        time.sleep(timeout)
 
     def send_pyobj(self, result: Any) -> None:
         self._out_queue.put(result)

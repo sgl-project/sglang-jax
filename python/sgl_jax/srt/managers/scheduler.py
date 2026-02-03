@@ -538,6 +538,10 @@ class Scheduler(
                 self.check_tree_cache()
                 self.new_token_ratio = self.init_new_token_ratio
 
+                # Elegant wait if idle
+                if self._comm_backend is not None:
+                    self._comm_backend.wait_for_new_requests(0.001)
+
             self.last_batch = batch
 
     def event_loop_overlap(self):
