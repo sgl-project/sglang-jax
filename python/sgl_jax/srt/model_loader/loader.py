@@ -195,9 +195,7 @@ class JAXModelLoader(DefaultModelLoader):
         # if sub_dir is specified, use it
         if self.load_config.sub_dir is not None:
             hf_folder = os.path.join(hf_folder, self.load_config.sub_dir)
-            logger.info("Before copy - quantization_config: %s", model_config.quantization_config)
             model_config = copy.copy(model_config)
-            logger.info("After copy - quantization_config: %s", model_config.quantization_config)
 
         model_config.model_path = hf_folder
         # Initialize JAX model
