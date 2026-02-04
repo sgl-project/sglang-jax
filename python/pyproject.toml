@@ -19,6 +19,7 @@ dependencies = [
     "modelscope~=1.28.2",
     "msgpack-python~=0.5.6",
     "numpy~=2.2.6",
+    "scipy>=1.11.0",
     "orjson~=3.11.1",
     "pillow~=11.3.0",
     "psutil~=7.0.0",

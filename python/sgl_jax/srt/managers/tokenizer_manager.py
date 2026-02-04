@@ -19,12 +19,11 @@ from http import HTTPStatus
 from typing import Any
 
 import fastapi
-import jax
-import jax.numpy as jnp
 import uvloop
 import zmq
 import zmq.asyncio
 from fastapi import BackgroundTasks
+from scipy.special import softmax
 
 from sgl_jax.srt.configs.model_config import ModelConfig
 from sgl_jax.srt.hf_transformers_utils import get_tokenizer
@@ -1294,7 +1293,9 @@ class TokenizerManager:
 
             # Apply softmax to logprobs if needed
             if apply_softmax:
-                score_list = jax.nn.softmax(jnp.asarray(score_list), axis=0).tolist()
+                # Use scipy softmax to keep TokenizerManager device-agnostic (ADR-001)
+                # Matches PyTorch sglang: torch.softmax(torch.tensor(score_list), dim=0)
+                score_list = softmax(score_list).tolist()
             else:
                 # Convert logprobs to probabilities if not using softmax
                 score_list = [math.exp(x) if x != float("-inf") else 0.0 for x in score_list]
