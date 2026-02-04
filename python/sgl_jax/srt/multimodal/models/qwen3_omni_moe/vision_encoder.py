@@ -80,11 +80,6 @@ class Vision2DRotaryEmbedding(nnx.Module):
         self.dim = dim  # head_dim // 2
         self.theta = theta
 
-        # Compute inverse frequencies for dim // 2 positions
-        # inv_freq shape: (dim // 2,) = (head_dim // 4,)
-        inv_freq = 1.0 / (theta ** (jnp.arange(0, dim, 2, dtype=jnp.float32) / dim))
-        self.inv_freq = inv_freq
-
     def __call__(
         self,
         position_ids: jax.Array,  # (seq_len, 2) - [h_pos, w_pos]
@@ -101,12 +96,12 @@ class Vision2DRotaryEmbedding(nnx.Module):
             freqs: (seq_len, dim) with CONCATENATED [h..., w...] structure
                    where dim = head_dim // 2
         """
+        inv_freq = 1.0 / (self.theta ** (jnp.arange(0, self.dim, 2, dtype=jnp.float32) / self.dim))
         h_pos = position_ids[:, 0]
         w_pos = position_ids[:, 1]
-        h_freqs = jnp.outer(h_pos, self.inv_freq)
-        w_freqs = jnp.outer(w_pos, self.inv_freq)
+        h_freqs = jnp.outer(h_pos, inv_freq)
+        w_freqs = jnp.outer(w_pos, inv_freq)
         freqs = jnp.concatenate([h_freqs, w_freqs], axis=-1)
-
         return freqs
 
 
