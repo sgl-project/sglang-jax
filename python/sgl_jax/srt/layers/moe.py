@@ -292,13 +292,34 @@ class EPMoE(nnx.Module):
         except Exception as _:
             return False, "cpu"
 
-    def quantize_weights(self):
-        """Quantize MoE weights in-place. Call once after model loading."""
+    def quantize_weights(self, is_static: bool = False):
+        """Quantize MoE weights in-place or initialize params for static loading."""
         if self.quantized_dtype is None:
             return
 
-        # Replace original weights with quantized versions
         with jax.sharding.use_abstract_mesh(self.updated_mesh):
+            if is_static:
+                scale_sharding = P("expert", None, None, None)
+
+                if hasattr(self, "wi_0_scale"):
+                    del self.wi_0_scale
+                self.wi_0_scale = nnx.Param(
+                    jnp.zeros((1,), dtype=jnp.float32), out_sharding=scale_sharding
+                )
+
+                if hasattr(self, "wi_1_scale"):
+                    del self.wi_1_scale
+                self.wi_1_scale = nnx.Param(
+                    jnp.zeros((1,), dtype=jnp.float32), out_sharding=scale_sharding
+                )
+
+                if hasattr(self, "wo_scale"):
+                    del self.wo_scale
+                self.wo_scale = nnx.Param(
+                    jnp.zeros((1,), dtype=jnp.float32), out_sharding=scale_sharding
+                )
+                return
+
             # Quantize weights
             w0_value, w0_scale = quantize_tensor(
                 self.quantized_dtype,
@@ -320,8 +341,6 @@ class EPMoE(nnx.Module):
             self.wi_1 = nnx.Param(w1_value, out_sharding=P("expert", "tensor", None))
             self.wo = nnx.Param(wo_value, out_sharding=P("expert", None, "tensor"))
 
-            # Update scales (reshape to 4D for GMM kernel)
-            # Wrap with nnx.data() to override static attribute status
             if hasattr(self, "wi_0_scale"):
                 del self.wi_0_scale
             self.wi_0_scale = nnx.Param(
@@ -822,7 +841,7 @@ class FusedEPMoE(nnx.Module):
 
         self.subc_quant_wsz = None  # Use default sub channel quantization block size
 
-    def quantize_weights(self):
+    def quantize_weights(self, is_static: bool = False):
         """Quantize MoE weights in-place. Call once after model loading."""
         if self.quantized_dtype is None:
             return
@@ -832,6 +851,50 @@ class FusedEPMoE(nnx.Module):
             self.subc_quant_wsz = 256
 
         with jax.set_mesh(self.mesh):
+            if is_static:
+                ep_scale_sharding = P(("data", "tensor"), None, None, None)
+
+                if hasattr(self, "w1_scale"):
+                    del self.w1_scale
+                self.w1_scale = nnx.Param(
+                    jnp.zeros((1,), dtype=jnp.float32), out_sharding=ep_scale_sharding
+                )
+
+                if hasattr(self, "w3_scale"):
+                    del self.w3_scale
+                self.w3_scale = nnx.Param(
+                    jnp.zeros((1,), dtype=jnp.float32), out_sharding=ep_scale_sharding
+                )
+
+                if hasattr(self, "w2_scale"):
+                    del self.w2_scale
+                self.w2_scale = nnx.Param(
+                    jnp.zeros((1,), dtype=jnp.float32), out_sharding=ep_scale_sharding
+                )
+
+                if self.num_shared_experts > 0:
+                    shared_scale_sharding = P(None, None, None)
+
+                    if hasattr(self, "w1_shared_scale"):
+                        del self.w1_shared_scale
+                    self.w1_shared_scale = nnx.Param(
+                        jnp.zeros((1,), dtype=jnp.float32), out_sharding=shared_scale_sharding
+                    )
+
+                    if hasattr(self, "w3_shared_scale"):
+                        del self.w3_shared_scale
+                    self.w3_shared_scale = nnx.Param(
+                        jnp.zeros((1,), dtype=jnp.float32), out_sharding=shared_scale_sharding
+                    )
+
+                    if hasattr(self, "w2_shared_scale"):
+                        del self.w2_shared_scale
+                    self.w2_shared_scale = nnx.Param(
+                        jnp.zeros((1,), dtype=jnp.float32), out_sharding=shared_scale_sharding
+                    )
+
+                return
+
             # Replace original weights with quantized versions
             w1_value, w1_scale = quantize_tensor(
                 self.quantized_dtype,
@@ -861,7 +924,6 @@ class FusedEPMoE(nnx.Module):
             self.w2 = nnx.Param(w2_value, out_sharding=ep_sharding)
 
             # Update scales (reshape to 4D for GMM kernel)
-            # Wrap with nnx.data() to override static attribute status
             if hasattr(self, "w1_scale"):
                 del self.w1_scale
             self.w1_scale = nnx.Param(
@@ -940,6 +1002,7 @@ class FusedEPMoE(nnx.Module):
         hidden_states: jax.Array,
         router_logits: jax.Array,
         router_bias: jax.Array | None = None,
+        token_valid_mask: jax.Array | None = None,
         *,
         block_config: FusedMoEBlockConfig | None = None,
     ) -> jax.Array:
@@ -994,6 +1057,7 @@ class FusedEPMoE(nnx.Module):
             routed_scaling_factor=self.routed_scaling_factor,
             act_fn=self.activation,
             block_config=block_config,
+            token_valid_mask=token_valid_mask,
             # Optional parameters (not used in basic case)
             subc_quant_wsz=subc_quant_wsz,
             w1_scale=w1_scale,
