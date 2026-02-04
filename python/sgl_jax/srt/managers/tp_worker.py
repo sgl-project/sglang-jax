@@ -439,7 +439,11 @@ class ModelWorker:
     ) -> ModelWorkerBatch:
         valid_input_ids = np.array([1] * bs, dtype=jnp.int32)
         invalid_input_ids = np.array([0] * (num_tokens - bs), dtype=jnp.int32)
-        valid_out_cache_loc = np.arange(bs, dtype=jnp.int32)
+        # TokenToKVPoolAllocator uses 1..N indices (0 is reserved as a "dummy" slot).
+        # Keep precompile batches consistent with the real allocator so that
+        # per-token validity masks (out_cache_loc > 0) and KV updates behave as
+        # expected, especially for small bs (e.g. bs=1).
+        valid_out_cache_loc = np.arange(1, bs + 1, dtype=jnp.int32)
         invalid_out_cache_loc = np.array([-1] * (num_tokens - bs), dtype=jnp.int32)
         valid_positions = np.array([0] * bs, dtype=jnp.int32)
         invalid_positions = np.array([0] * (num_tokens - bs), dtype=jnp.int32)
