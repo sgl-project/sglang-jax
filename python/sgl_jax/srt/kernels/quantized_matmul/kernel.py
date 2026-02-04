@@ -14,6 +14,7 @@ def xla_quantized_matmul_local(
     w_scale: jax.Array,
     quantize_activation: bool = True,
     reduce_axis: str | None = None,
+    compute_dtype: jnp.dtype | None = None,
 ) -> jax.Array:
     """
     Local quantized matmul for use inside shard_map.
@@ -32,6 +33,7 @@ def xla_quantized_matmul_local(
         Output of the quantized matmul.
     """
     out_dtype = x.dtype
+    compute_dtype = out_dtype if compute_dtype is None else compute_dtype
 
     if quantize_activation:
         # Local quantization - each device uses its local max
@@ -42,23 +44,27 @@ def xla_quantized_matmul_local(
             x_q,
             w_q,
             dimension_numbers=(((1,), (1,)), ((), ())),
-            preferred_element_type=out_dtype,
+            preferred_element_type=compute_dtype,
         )
 
         # Local dequantization
-        out = out * x_scale.astype(out_dtype) * jnp.expand_dims(w_scale, 0).astype(out_dtype)
+        out = out.astype(compute_dtype)
+        out = (
+            out * x_scale.astype(compute_dtype) * jnp.expand_dims(w_scale, 0).astype(compute_dtype)
+        )
     else:
         # Local matmul without activation quantization
         out = lax.dot_general(
             x,
             w_q,
             dimension_numbers=(((1,), (1,)), ((), ())),
-            preferred_element_type=out_dtype,
+            preferred_element_type=compute_dtype,
         )
-        out = out * jnp.expand_dims(w_scale, 0).astype(out_dtype)
+        out = out.astype(compute_dtype)
+        out = out * jnp.expand_dims(w_scale, 0).astype(compute_dtype)
 
     # Sum partial results across devices (single all-reduce)
     if reduce_axis is not None:
         out = lax.psum(out, reduce_axis)
 
-    return out
+    return out.astype(out_dtype)
