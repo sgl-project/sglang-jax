@@ -279,25 +279,29 @@ class Qwen3OmniMoeThinkerEmbedding(nnx.Module):
         special_video_mask = input_ids == self.config.video_token_id
         special_audio_mask = input_ids == self.config.audio_token_id
 
+        n_image_tokens = jnp.sum(special_image_mask)
         special_image_mask = jnp.broadcast_to(
             jnp.expand_dims(special_image_mask, axis=-1), input_embeds.shape
         )
-        if image_features is not None:
-            n_image_tokens = jnp.sum(special_image_mask)
-            if input_embeds[special_image_mask].size != image_features.size:
-                raise ValueError(
-                    f"Image features and image tokens do not match: tokens: {n_image_tokens}, features {image_features.shape[0]}"
-                )
+        if (
+            image_features is not None
+            and input_embeds[special_image_mask].size != image_features.size
+        ):
+            raise ValueError(
+                f"Image features and image tokens do not match: tokens: {n_image_tokens}, features {image_features.shape[0]}"
+            )
 
+        n_video_tokens = jnp.sum(special_video_mask)
         special_video_mask = jnp.broadcast_to(
             jnp.expand_dims(special_video_mask, axis=-1), input_embeds.shape
         )
-        if video_features is not None:
-            n_video_tokens = jnp.sum(special_video_mask)
-            if input_embeds[special_video_mask].size != video_features.size:
-                raise ValueError(
-                    f"Videos features and video tokens do not match: tokens: {n_video_tokens}, features {video_features.shape[0]}"
-                )
+        if (
+            video_features is not None
+            and input_embeds[special_video_mask].size != video_features.size
+        ):
+            raise ValueError(
+                f"Videos features and video tokens do not match: tokens: {n_video_tokens}, features {video_features.shape[0]}"
+            )
 
         special_audio_mask = jnp.broadcast_to(
             jnp.expand_dims(special_audio_mask, axis=-1), input_embeds.shape
@@ -347,16 +351,16 @@ class Qwen3OmniMoeThinkerEmbedding(nnx.Module):
         if pixel_values is not None:
             image_features = self.visual(pixel_values, image_grid_thw)
             image_embeds, image_embeds_multiscale = (
-                image_features.last_hidden_state,
-                image_features.deepstack_features,
+                image_features["pooler_output"],
+                image_features["deepstack_features"],
             )
             visual_embeds_multiscale = image_embeds_multiscale
 
         if pixel_values_videos is not None:
             video_features = self.visual(pixel_values_videos, video_grid_thw)
             video_embeds, video_embeds_multiscale = (
-                video_features.last_hidden_state,
-                video_features.deepstack_features,
+                video_features["pooler_output"],
+                video_features["deepstack_features"],
             )
             if visual_embeds_multiscale is None:
                 visual_embeds_multiscale = video_embeds_multiscale
@@ -374,19 +378,27 @@ class Qwen3OmniMoeThinkerEmbedding(nnx.Module):
         if video_embeds is not None:
             input_embeds = input_embeds.at[video_mask].set(jnp.ravel(video_embeds))
 
-        visual_pos_masks = image_mask if image_mask is not None else video_mask
-
         # for image and video mask
         if pixel_values is not None and pixel_values_videos is not None:
+            image_mask = image_mask[..., 0]
+            video_mask = video_mask[..., 0]
             visual_pos_masks = video_mask | image_mask
             visual_embeds_multiscale_joint = ()
             image_mask_joint = image_mask[visual_pos_masks]
             video_mask_joint = video_mask[visual_pos_masks]
             for img_embed, vid_embed in zip(visual_embeds_multiscale, video_embeds_multiscale):
-                embed_joint = img_embed.new_zeros(visual_pos_masks.sum(), img_embed.shape[-1])
-                embed_joint[image_mask_joint, :] = img_embed
-                embed_joint[video_mask_joint, :] = vid_embed
+                embed_joint = jnp.zeros(
+                    (visual_pos_masks.sum(), img_embed.shape[-1]), dtype=img_embed.dtype
+                )
+                embed_joint = embed_joint.at[image_mask_joint, :].set(img_embed)
+                embed_joint = embed_joint.at[video_mask_joint, :].set(vid_embed)
                 visual_embeds_multiscale_joint = visual_embeds_multiscale_joint + (embed_joint,)
             visual_embeds_multiscale = visual_embeds_multiscale_joint
+        elif image_mask is not None:
+            image_mask = image_mask[..., 0]
+            visual_pos_masks = image_mask
+        elif video_mask is not None:
+            video_mask = video_mask[..., 0]
+            visual_pos_masks = video_mask
 
         return input_embeds, visual_embeds_multiscale, visual_pos_masks

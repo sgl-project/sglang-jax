@@ -253,9 +253,8 @@ class TestQwen3OmniMoeThinkerEmbeddingPrecision(unittest.TestCase):
                     atol=1e-5,
                 )
 
-    #
-    # def test_omni_modal_input(self):
-    #     self._test_model("/models/npy_data/qwen3_omni/omni_encoder_ref.npz")
+    def test_omni_modal_input(self):
+        self._test_model("/models/npz_data/qwen3_omni/omni_encoder_ref.npz")
 
     def test_audio_modal_input(self):
         self._test_model("/models/npz_data/qwen3_omni/audio_encoder_ref.npz")
