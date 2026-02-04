@@ -3,6 +3,7 @@ import dataclasses
 import jax.numpy as jnp
 from jax.lax import Precision
 
+from sgl_jax.srt.configs.quantization_config import QuantizationConfig
 from sgl_jax.srt.multimodal.configs.multimodal_base_config import MultiModalModelConfigs
 
 
@@ -43,6 +44,7 @@ class WanModelConfig(MultiModalModelConfigs):
     scale_factor_temporal: int = 4
     scale_factor_spatial: int = 8
     model_class: None = None  # To be set to the model class
+    quantization_config: QuantizationConfig | None = None
 
     def get_total_num_kv_heads(self) -> int:
         return self.num_attention_heads

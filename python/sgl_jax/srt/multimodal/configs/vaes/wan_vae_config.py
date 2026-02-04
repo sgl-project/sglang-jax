@@ -5,6 +5,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from sgl_jax.srt.configs.quantization_config import QuantizationConfig
 from sgl_jax.srt.multimodal.configs.vaes.vae_base_config import VAEConfig
 
 
@@ -15,6 +16,7 @@ class WanVAEConfig(VAEConfig):
     use_temporal_tiling: bool = False
     use_parallel_tiling: bool = False
     model_class: None = None
+    quantization_config: QuantizationConfig | None = None
     base_dim: int = 96  # The base number of channels in the first layer.
     decoder_base_dim: int | None = None
     z_dim: int = 16  # The dimensionality of the latent space.

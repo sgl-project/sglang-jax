@@ -45,10 +45,6 @@ from sgl_jax.srt.server_args import ServerArgs
 from sgl_jax.srt.speculative.spec_info import SpeculativeAlgorithm
 from sgl_jax.srt.utils.common_utils import get_bool_env_var
 from sgl_jax.srt.utils.jax_utils import get_available_device_memory
-from sgl_jax.srt.utils.quantization.quantization_utils import (
-    apply_linear_quantization,
-    apply_moe_quantization,
-)
 
 logger = logging.getLogger(__name__)
 
@@ -280,7 +276,6 @@ class ModelRunner(BaseModelRunner):
         self.model_config.log_kv_heads_info(self.tp_size)
         self.model_config.hf_config.ep_size = self.ep_size
         self.model_config.hf_config.moe_backend = self.model_config.moe_backend.value
-
         self.model = self.model_loader.load_model(
             model_config=self.model_config,
         )
@@ -292,15 +287,29 @@ class ModelRunner(BaseModelRunner):
 
         # Apply quantization if quantization config is set
         if self.model_config.quantization_config is not None:
-            # Apply MoE quantization first (before linear quantization)
-            if self.model_config.quantization_config.has_moe_quantization():
-                self.model = apply_moe_quantization(self.model_config, self.model)
+            is_static = self.model_config.quantization_config.is_static_checkpoint
 
-            # Apply quantization for linear layers
-            linear_rules = self.model_config.quantization_config.get_linear_rules()
-            if linear_rules:
-                self.model = apply_linear_quantization(self.model_config, self.model)
+            if not is_static:
+                logger.info("Applying DYNAMIC (online) quantization...")
+                from sgl_jax.srt.utils.quantization.quantization_utils import (
+                    apply_linear_quantization,
+                    apply_moe_quantization,
+                )
 
+                # Apply MoE quantization first
+                if self.model_config.quantization_config.has_moe_quantization():
+                    self.model = apply_moe_quantization(
+                        self.model_config, self.model, is_static_input=False
+                    )
+
+                # Apply quantization for linear layers
+                linear_rules = self.model_config.quantization_config.get_linear_rules()
+                if linear_rules:
+                    self.model = apply_linear_quantization(
+                        self.model_config, self.model, is_static_input=False
+                    )
+            else:
+                logger.info("Static quantization detected. Skipping online requantization.")
         # Parse other args
         self.sliding_window_size = self.model_config.sliding_window
         self.dtype = self.model_config.dtype

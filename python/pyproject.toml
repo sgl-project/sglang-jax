@@ -44,9 +44,6 @@ dependencies = [
     "pybase64",
     "omegaconf",
     "imageio[ffmpeg]",
-    # add torch and torchvision CPU version for multimodal's IMAGE/VIDEO/AUDIO processor within multimodal_tokenizer
-    "torch",
-    "torchvision",
 ]
 
 [project.optional-dependencies]
@@ -63,6 +60,10 @@ cpu = [
 ]
 all = [
     "jax[tpu]==0.8.1",
+]
+multimodal = [
+    "torch",
+    "torchvision",
 ]
 
 [tool.setuptools.packages.find]
