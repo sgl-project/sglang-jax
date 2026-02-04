@@ -15,15 +15,19 @@ import jax.numpy as jnp
 import numpy as np
 import torch
 from flax import nnx
+from transformers import Qwen3OmniMoeThinkerConfig
+from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import (
+    Qwen3OmniMoeVisionEncoderConfig,
+)
+
+from sgl_jax.srt.configs.model_config import _get_and_verify_dtype
+from sgl_jax.srt.multimodal.models.qwen3_omni_moe.qwen3_omni_moe_encoder import (
+    Qwen3OmniMoeThinkerEmbedding,
+)
 
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../python"))
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
-
-from sgl_jax.srt.multimodal.models.qwen3_omni_moe import (  # noqa: E402
-    Qwen3OmniMoeVisionConfig,
-    Qwen3OmniMoeVisionEncoder,
-)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
@@ -182,6 +186,31 @@ def prepare_pytorch_input(pixel_values, config, dtype):
     return pt_input.reshape(-1, C, temporal_patch_size, patch_size, patch_size)
 
 
+def prepare_jax_input(pixel_values, config):
+    """Flatten to (B, C*T*H*W) so reshape(-1, C, t, p, p) preserves patch order."""
+    B, T, H, W, C = pixel_values.shape
+    t_patch = config.temporal_patch_size
+    p = config.patch_size
+    t_out, h_patches, w_patches = T // t_patch, H // p, W // p
+
+    # (B, T, H, W, C) -> (B, C, T, H, W)
+    patches = np.transpose(pixel_values, (0, 4, 1, 2, 3))
+    # (B, C, T, H, W) -> (B, C, T_out, t, H_patches, p, W_patches, p)
+    patches = patches.reshape(
+        B,
+        C,
+        t_out,
+        t_patch,
+        h_patches,
+        p,
+        w_patches,
+        p,
+    )
+    # (B, T_out, H_patches, W_patches, C, t, p, p)
+    patches = np.transpose(patches, (0, 2, 4, 6, 1, 3, 5, 7))
+    return patches.reshape(B, -1)
+
+
 # =============================================================================
 # Model Loading
 # =============================================================================
@@ -197,34 +226,6 @@ def set_param(model, path, val):
     if not isinstance(param, nnx.Variable):
         raise ValueError(f"Expected nnx.Variable at {path}, got {type(param)}")
     param[...] = jnp.array(val, dtype=param[...].dtype)
-
-
-def manual_load_weights(jax_model, hf_model):
-    """Fallback manual weight loading from HF model."""
-    from sgl_jax.srt.multimodal.models.qwen3_omni_moe.vision_weights_mapping import (
-        create_vision_encoder_weight_mappings,
-    )
-
-    mappings = create_vision_encoder_weight_mappings(jax_model.config)
-    pt_state = hf_model.state_dict()
-
-    loaded = 0
-    for hf_key, mapping in mappings.items():
-        if hf_key in pt_state:
-            try:
-                w = to_numpy(pt_state[hf_key])
-                if mapping.transpose:
-                    w = w.T
-                elif mapping.transpose_axes:
-                    w = np.transpose(w, mapping.transpose_axes)
-                set_param(jax_model, mapping.target_path, w)
-                loaded += 1
-            except Exception as e:
-                logger.warning("Failed to load %s: %s", hf_key, e)
-
-    logger.info("Loaded %d/%d weights", loaded, len(mappings))
-    if loaded < len(mappings) * 0.5:
-        raise RuntimeError(f"Weight loading failed: only {loaded}/{len(mappings)} weights loaded")
 
 
 def load_pytorch_model(model_path, precision):
@@ -308,7 +309,8 @@ def load_pytorch_model(model_path, precision):
 
 def load_jax_model(pt_config, model_path, mesh, precision):
     """Load JAX vision encoder model."""
-    jax_config = Qwen3OmniMoeVisionConfig(
+
+    vision_config = Qwen3OmniMoeVisionEncoderConfig(
         depth=pt_config.depth,
         hidden_size=pt_config.hidden_size,
         hidden_act=getattr(pt_config, "hidden_act", "gelu"),
@@ -321,21 +323,25 @@ def load_jax_model(pt_config, model_path, mesh, precision):
         out_hidden_size=pt_config.out_hidden_size,
         num_position_embeddings=pt_config.num_position_embeddings,
         deepstack_visual_indexes=list(pt_config.deepstack_visual_indexes),
-        rope_theta=getattr(pt_config, "rope_theta", 10000.0),
-        layer_norm_eps=getattr(pt_config, "layer_norm_eps", 1e-6),
-        dtype=precision,
     )
+    jax_config = Qwen3OmniMoeThinkerConfig(vision_config=vision_config)
+
+    # Convert string precision to JAX dtype
+    jax_dtype = _get_and_verify_dtype(jax_config, precision)
+    jax_config.model_path = model_path
+    jax_config.revision = None
+    jax_config.dtype = jax_dtype
+    jax_config.model_class = Qwen3OmniMoeThinkerEmbedding
 
     with jax.set_mesh(mesh):
-        jax_model = Qwen3OmniMoeVisionEncoder(config=jax_config, mesh=mesh, rngs=nnx.Rngs(0))
+        jax_model = Qwen3OmniMoeThinkerEmbedding(
+            config=jax_config, mesh=mesh, rngs=nnx.Rngs(0), dtype=jax_dtype
+        )
 
-    try:
-        jax_model.load_weights(model_path)
-        logger.info("✅ Loaded JAX weights from %s", model_path)
-    except Exception as e:
-        logger.warning("Failed to load JAX weights: %s", e)
+    jax_model.load_weights(jax_config)
+    logger.info("✅ Loaded JAX weights from %s", model_path)
 
-    return jax_model
+    return jax_model.visual
 
 
 def load_models(model_path, mesh, precision):
@@ -421,7 +427,7 @@ class JAXForwardContext:
     def __init__(self, jax_model, pixel_values, grid_thw, mesh):
         self.model = jax_model
         self.mesh = mesh
-        self.pixel_values = jnp.array(pixel_values)
+        self.pixel_values = jnp.array(prepare_jax_input(pixel_values, jax_model.config))
         self.grid = jnp.array(grid_thw)
 
         # Pre-computed values (lazy init)
@@ -1053,7 +1059,7 @@ def test_batch_images(model_path, mesh, precision):
     with jax.set_mesh(mesh):
         jax_outputs = [
             jax_model(
-                pixel_values=jnp.array(pixel_values[i : i + 1]),
+                pixel_values=jnp.array(prepare_jax_input(pixel_values[i : i + 1], config)),
                 grid_thw=jnp.array(grid_thw[i : i + 1]),
             )["pooler_output"]
             for i in range(2)
@@ -1252,7 +1258,10 @@ def test_tp_output_consistency(model_path, mesh, precision):
 
     # Run JAX forward
     with jax.set_mesh(mesh):
-        jax_output = jax_model(pixel_values=jnp.array(pixel_values), grid_thw=jnp.array(grid_thw))
+        jax_output = jax_model(
+            pixel_values=jnp.array(prepare_jax_input(pixel_values, config)),
+            grid_thw=jnp.array(grid_thw),
+        )
 
     jax_pooler = jax_output["pooler_output"]
 
