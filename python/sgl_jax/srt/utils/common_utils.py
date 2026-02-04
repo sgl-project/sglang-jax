@@ -161,13 +161,13 @@ def configure_logger(server_args, prefix: str = ""):
         logging.config.dictConfig(custom_config)
         return
     format = f"[%(asctime)s{prefix}] %(message)s"
-    # format = f"[%(asctime)s.%(msecs)03d{prefix}] %(message)s"
-    logging.basicConfig(
-        level=getattr(logging, server_args.log_level.upper()),
-        format=format,
-        datefmt="%Y-%m-%d %H:%M:%S",
-        force=False,  # honor user-defined handlers if already exists
-    )
+
+    root_logger = logging.getLogger()
+    h = logging.StreamHandler()
+    fmt = logging.Formatter(format, "%Y-%m-%d %H:%M:%S", "%")
+    h.setFormatter(fmt)
+    root_logger.addHandler(h)
+    root_logger.setLevel(server_args.log_level.upper())
 
 
 def get_zmq_socket(context: zmq.Context, socket_type: zmq.SocketType, endpoint: str, bind: bool):
